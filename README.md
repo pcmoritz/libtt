@@ -17,6 +17,14 @@ Device discovery is intentionally minimal right now: the library scans
 `/dev/tenstorrent` and exposes one PJRT device per device node it finds.
 If the path does not exist, the client reports zero devices.
 
+The discovery path now feeds an internal device abstraction modeled on
+`blackhole-py`'s `device.py`, including board selection (`p100`/`p150`),
+worker-core layout, command-queue core coordinates, and harvested DRAM-bank
+metadata. Until direct hardware probing lands, that metadata can be supplied
+through environment variables such as `TT_BOARD`, `TT_TENSIX_CORES`,
+`TT_GDDR_ENABLED`, or the per-device forms `TT_DEVICE_<n>_BOARD`,
+`TT_DEVICE_<n>_TENSIX_CORES`, and `TT_DEVICE_<n>_GDDR_ENABLED`.
+
 ## Build
 
 ```bash
