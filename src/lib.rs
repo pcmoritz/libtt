@@ -74,6 +74,7 @@ pub struct PJRT_Memory {
     kind: CString,
     debug_string: CString,
     to_string: CString,
+    device_ptrs: Vec<*mut PJRT_Device>,
 }
 
 #[repr(C)]
@@ -83,6 +84,7 @@ pub struct PJRT_Device {
     description: *mut PJRT_DeviceDescription,
     addressable: bool,
     default_memory: *mut PJRT_Memory,
+    memory_ptrs: Vec<*mut PJRT_Memory>,
 }
 
 #[repr(C)]
@@ -95,6 +97,7 @@ pub struct PJRT_Client {
     devices: Vec<Box<PJRT_Device>>,
     device_ptrs: Vec<*mut PJRT_Device>,
     addressable_device_ptrs: Vec<*mut PJRT_Device>,
+    memory_ptrs: Vec<*mut PJRT_Memory>,
 }
 
 #[repr(C)]
@@ -498,6 +501,7 @@ impl PJRT_Client {
                 kind: cstring_lossy("device"),
                 debug_string: cstring_lossy(format!("Tenstorrent memory {index}")),
                 to_string: cstring_lossy(format!("tt:memory:{index}")),
+                device_ptrs: Vec::with_capacity(1),
             }));
         }
 
@@ -516,6 +520,7 @@ impl PJRT_Client {
                 description,
                 addressable: true,
                 default_memory,
+                memory_ptrs: vec![default_memory],
             }));
         }
 
@@ -524,6 +529,9 @@ impl PJRT_Client {
             device_ptrs.push(&mut **device as *mut PJRT_Device);
         }
         let addressable_device_ptrs = device_ptrs.clone();
+        for (index, memory) in memories.iter_mut().enumerate() {
+            memory.device_ptrs.push(device_ptrs[index]);
+        }
 
         let topology = PJRT_TopologyDescription {
             platform_name: cstring_lossy("tt"),
@@ -543,6 +551,7 @@ impl PJRT_Client {
             devices,
             device_ptrs,
             addressable_device_ptrs,
+            memory_ptrs,
         }
     }
 }
@@ -561,10 +570,6 @@ fn pjrt_error(message: impl AsRef<str>, code: PJRT_Error_Code) -> *mut PJRT_Erro
 
 fn invalid_argument(message: impl AsRef<str>) -> *mut PJRT_Error {
     pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INVALID_ARGUMENT)
-}
-
-fn unimplemented(message: impl AsRef<str>) -> *mut PJRT_Error {
-    pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED)
 }
 
 unsafe fn checked_mut<'a, T>(ptr: *mut T, name: &str) -> Result<&'a mut T, *mut PJRT_Error> {
@@ -833,10 +838,19 @@ pub unsafe extern "C" fn TT_Client_LookupAddressableDevice(
 pub unsafe extern "C" fn TT_Client_AddressableMemories(
     args: *mut PJRT_Client_AddressableMemories_Args,
 ) -> *mut PJRT_Error {
-    let Ok(_args) = (unsafe { checked_mut(args, "args") }) else {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    unimplemented("PJRT_Client_AddressableMemories is not implemented")
+    let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
+        return invalid_argument("client must not be null");
+    };
+    args.addressable_memories = if client.memory_ptrs.is_empty() {
+        ptr::null()
+    } else {
+        client.memory_ptrs.as_ptr().cast::<*mut c_void>()
+    };
+    args.num_addressable_memories = client.memory_ptrs.len();
+    ptr::null_mut()
 }
 
 #[unsafe(no_mangle)]
@@ -978,10 +992,19 @@ pub unsafe extern "C" fn TT_Device_LocalHardwareId(
 pub unsafe extern "C" fn TT_Device_AddressableMemories(
     args: *mut PJRT_Device_AddressableMemories_Args,
 ) -> *mut PJRT_Error {
-    let Ok(_args) = (unsafe { checked_mut(args, "args") }) else {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    unimplemented("PJRT_Device_AddressableMemories is not implemented")
+    let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
+        return invalid_argument("device must not be null");
+    };
+    args.memories = if device.memory_ptrs.is_empty() {
+        ptr::null()
+    } else {
+        device.memory_ptrs.as_ptr()
+    };
+    args.num_memories = device.memory_ptrs.len();
+    ptr::null_mut()
 }
 
 #[unsafe(no_mangle)]
@@ -1057,10 +1080,19 @@ pub unsafe extern "C" fn TT_Memory_ToString(
 pub unsafe extern "C" fn TT_Memory_AddressableByDevices(
     args: *mut PJRT_Memory_AddressableByDevices_Args,
 ) -> *mut PJRT_Error {
-    let Ok(_args) = (unsafe { checked_mut(args, "args") }) else {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    unimplemented("PJRT_Memory_AddressableByDevices is not implemented")
+    let Ok(memory) = (unsafe { checked_ref(args.memory, "memory") }) else {
+        return invalid_argument("memory must not be null");
+    };
+    args.devices = if memory.device_ptrs.is_empty() {
+        ptr::null()
+    } else {
+        memory.device_ptrs.as_ptr()
+    };
+    args.num_devices = memory.device_ptrs.len();
+    ptr::null_mut()
 }
 
 #[unsafe(no_mangle)]
