@@ -589,21 +589,9 @@ fn discover_devices() -> Vec<PathBuf> {
         for entry in entries.flatten() {
             paths.push(entry.path());
         }
-    } else if let Ok(entries) = fs::read_dir(Path::new("/dev")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if name.starts_with("tenstorrent") {
-                paths.push(path);
-            }
-        }
     }
 
     paths.sort();
-    paths.dedup();
-
     paths
 }
 

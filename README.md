@@ -14,9 +14,8 @@ const PJRT_Api* GetPjrtApi(void);
 - Device description, topology, and minimal memory queries needed for JAX startup
 
 Device discovery is intentionally minimal right now: the library scans
-`/dev/tenstorrent`, then falls back to `/dev/tenstorrent*`, and exposes one
-PJRT device per device node it finds. If neither path exists, the client
-reports zero devices.
+`/dev/tenstorrent` and exposes one PJRT device per device node it finds.
+If the path does not exist, the client reports zero devices.
 
 ## Build
 
