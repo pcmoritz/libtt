@@ -521,7 +521,7 @@ impl PJRT_Client {
             let default_memory = memory_ptrs[index];
             devices.push(Box::new(PJRT_Device {
                 id: info.id as i32,
-                local_hardware_id: info.id as i32,
+                local_hardware_id: info.local_hardware_id as i32,
                 description,
                 addressable: true,
                 default_memory,
@@ -1399,8 +1399,10 @@ mod tests {
     fn device_abstraction_surfaces_board_metadata_through_pjrt_objects() {
         let device = DeviceInfo::from_probe(
             0,
+            3,
             PathBuf::from("/dev/tenstorrent/3"),
             Some(ProbeInfo {
+                arch: "p100".to_owned(),
                 tensix_enabled_col_mask: 0x0fff,
                 gddr_enabled_mask: 0x7f,
             }),
@@ -1437,6 +1439,6 @@ mod tests {
         assert!(memory_debug.contains("tiles=21"));
 
         let device = &client.devices[0];
-        assert_eq!(device.local_hardware_id, 0);
+        assert_eq!(device.local_hardware_id, 3);
     }
 }
