@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 #[path = "device/linux.rs"]
@@ -242,10 +243,18 @@ fn discover_with(root: &Path) -> Vec<DeviceInfo> {
     }
 
     paths.sort();
+    log(format!(
+        "device discovery root={} entries={}",
+        root.display(),
+        paths.len()
+    ));
     paths
         .into_iter()
         .enumerate()
-        .map(|(id, path)| DeviceInfo::from_path(id, path))
+        .map(|(id, path)| {
+            log(format!("device[{id}] node={}", path.display()));
+            DeviceInfo::from_path(id, path)
+        })
         .collect()
 }
 
@@ -297,6 +306,23 @@ fn dram_tiles(harvested_dram_banks: &[usize]) -> Vec<DramTile> {
 
 fn dram_bank_x(bank: usize) -> u8 {
     if bank < 4 { 0 } else { 9 }
+}
+
+pub(super) fn log(message: impl AsRef<str>) {
+    if log_enabled() {
+        eprintln!("[libtt] {}", message.as_ref());
+    }
+}
+
+fn log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("LIBTT_LOG") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !normalized.is_empty() && normalized != "0" && normalized != "false" && normalized != "off"
+        }
+        Err(_) => false,
+    })
 }
 
 #[cfg(test)]

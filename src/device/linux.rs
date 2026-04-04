@@ -1,4 +1,4 @@
-use super::{ARC_DEFAULT_TENSIX_ENABLED, CoreCoord, ProbeInfo};
+use super::{log, ARC_DEFAULT_TENSIX_ENABLED, CoreCoord, ProbeInfo};
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -24,16 +24,39 @@ const TLB_REG_SIZE: u64 = 12;
 const TLB_STRIDE_OFFSET: u64 = 210 * TLB_REG_SIZE;
 
 pub(super) fn detect_probe_info(index: usize) -> Option<ProbeInfo> {
-    probe_info_for_index(index).ok().flatten()
+    match probe_info_for_index(index) {
+        Ok(probe) => {
+            if probe.is_none() {
+                log(format!("linux probe index={index} no matching blackhole PCI device"));
+            }
+            probe
+        }
+        Err(err) => {
+            log(format!("linux probe index={index} failed: {err}"));
+            None
+        }
+    }
 }
 
 fn probe_info_for_index(index: usize) -> io::Result<Option<ProbeInfo>> {
-    let Some(sysfs_path) = blackhole_sysfs_paths()?.into_iter().nth(index) else {
+    let sysfs_paths = blackhole_sysfs_paths()?;
+    log(format!(
+        "linux probe available_blackhole_pci_devices={}",
+        sysfs_paths.len()
+    ));
+    let Some(sysfs_path) = sysfs_paths.into_iter().nth(index) else {
         return Ok(None);
     };
 
+    log(format!(
+        "linux probe index={index} sysfs_path={}",
+        sysfs_path.display()
+    ));
     let probe = ProbeDevice::open(&sysfs_path)?;
     let (gddr_enabled_mask, tensix_enabled_col_mask) = probe.read_arc_enabled_masks()?;
+    log(format!(
+        "linux probe index={index} tensix_enabled_col_mask=0x{tensix_enabled_col_mask:08x} gddr_enabled_mask=0x{gddr_enabled_mask:08x}"
+    ));
     Ok(Some(ProbeInfo {
         tensix_enabled_col_mask,
         gddr_enabled_mask,
@@ -85,6 +108,10 @@ impl ProbeDevice {
 
         let probe = Self { config, bar0 };
         probe.enable_memory_and_bus_mastering()?;
+        log(format!(
+            "linux probe opened config/bar0 for {}",
+            sysfs_path.display()
+        ));
         Ok(probe)
     }
 
@@ -99,6 +126,9 @@ impl ProbeDevice {
     fn read_arc_enabled_masks(&self) -> io::Result<(u32, u32)> {
         let table_base = self.read_arc_apb32(SCRATCH_RAM_13)? as u64;
         let data_base = self.read_arc_apb32(SCRATCH_RAM_12)? as u64;
+        log(format!(
+            "linux probe telemetry pointers table=0x{table_base:x} data=0x{data_base:x}"
+        ));
 
         if !is_arc_csm_addr(table_base, 4) || !is_arc_csm_addr(data_base, 4) {
             return Err(io::Error::other(format!(
@@ -107,6 +137,7 @@ impl ProbeDevice {
         }
 
         let entry_count = self.read_arc_noc32(table_base + 4)? as usize;
+        log(format!("linux probe telemetry entry_count={entry_count}"));
         if entry_count == 0 || entry_count > 4096 {
             return Err(io::Error::other(format!(
                 "invalid ARC telemetry entry_count 0x{entry_count:x} at 0x{table_base:x}"
