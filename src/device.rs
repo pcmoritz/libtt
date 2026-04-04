@@ -6,7 +6,6 @@ const DEFAULT_ROOT: &str = "/dev/tenstorrent";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceInfo {
     pub(crate) id: usize,
-    pub(crate) local_hardware_id: i32,
     pub(crate) path: PathBuf,
     pub(crate) arch: String,
     pub(crate) tensix_core_count: Option<usize>,
@@ -22,7 +21,6 @@ impl DeviceInfo {
     pub(crate) fn from_path(id: usize, path: PathBuf) -> Self {
         Self {
             id,
-            local_hardware_id: parse_local_hardware_id(&path).unwrap_or(id as i32),
             path,
             arch: "unknown".to_owned(),
             tensix_core_count: None,
@@ -90,10 +88,6 @@ fn discover_with(root: &Path) -> Vec<DeviceInfo> {
         .collect()
 }
 
-fn parse_local_hardware_id(path: &Path) -> Option<i32> {
-    path.file_name()?.to_str()?.parse().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,7 +95,6 @@ mod tests {
     #[test]
     fn builds_minimal_device_metadata_from_path() {
         let device = DeviceInfo::from_path(2, PathBuf::from("/dev/tenstorrent/7"));
-        assert_eq!(device.local_hardware_id, 7);
         assert_eq!(device.arch, "unknown");
         assert_eq!(device.tensix_core_count, None);
         assert!(device.harvested_dram_banks.is_empty());

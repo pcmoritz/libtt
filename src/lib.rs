@@ -521,7 +521,7 @@ impl PJRT_Client {
             let default_memory = memory_ptrs[index];
             devices.push(Box::new(PJRT_Device {
                 id: info.id as i32,
-                local_hardware_id: info.local_hardware_id,
+                local_hardware_id: info.id as i32,
                 description,
                 addressable: true,
                 default_memory,
@@ -1421,6 +1421,6 @@ mod tests {
         );
 
         let device = &client.devices[0];
-        assert_eq!(device.local_hardware_id, 3);
+        assert_eq!(device.local_hardware_id, 0);
     }
 }
