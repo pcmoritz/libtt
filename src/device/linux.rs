@@ -217,7 +217,7 @@ impl ProbeDevice {
 struct TlbWindow<'a> {
     file: &'a std::fs::File,
     id: u32,
-    mapping: MappedRegion,
+    mapping: Option<MappedRegion>,
 }
 
 impl<'a> TlbWindow<'a> {
@@ -234,7 +234,11 @@ impl<'a> TlbWindow<'a> {
         let id = unsafe { ptr::addr_of!(alloc.output.id).read_unaligned() };
         let mmap_offset_uc = unsafe { ptr::addr_of!(alloc.output.mmap_offset_uc).read_unaligned() };
         let mapping = MappedRegion::map(file.as_raw_fd(), TLB_SIZE_2M as usize, mmap_offset_uc)?;
-        let mut window = Self { file, id, mapping };
+        let mut window = Self {
+            file,
+            id,
+            mapping: Some(mapping),
+        };
         window.target(start, None, addr)?;
         Ok(window)
     }
@@ -263,12 +267,16 @@ impl<'a> TlbWindow<'a> {
     }
 
     fn read32(&self, offset: usize) -> io::Result<u32> {
-        self.mapping.read32(offset)
+        self.mapping
+            .as_ref()
+            .expect("TLB mapping should exist while window is alive")
+            .read32(offset)
     }
 }
 
 impl Drop for TlbWindow<'_> {
     fn drop(&mut self) {
+        drop(self.mapping.take());
         let mut free = FreeIn { id: self.id };
         if let Err(err) = ioctl_call(self.file.as_raw_fd(), TT_IOCTL_FREE_TLB, &mut free) {
             log(format!("linux probe free_tlb ioctl failed: {err}"));
