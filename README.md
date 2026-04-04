@@ -43,12 +43,3 @@ Load the shared library, resolve `GetPjrtApi`, and use the official
 
 const PJRT_Api* api = GetPjrtApi();
 ```
-
-To dump the PJRT device and memory debug strings directly from the plugin:
-
-```bash
-python examples/pjrt_debug_dump.py target/release/libtt.so
-```
-
-To trace device discovery and Linux probing, set `LIBTT_LOG=1` before loading the
-plugin. Logs are written to stderr.
