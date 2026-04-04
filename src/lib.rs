@@ -1,9 +1,10 @@
 #![allow(non_camel_case_types, non_snake_case)]
 
+mod device;
+
+use device::DeviceInfo;
 use std::ffi::{CString, c_char, c_void};
-use std::fs;
 use std::mem::size_of;
-use std::path::{Path, PathBuf};
 use std::ptr;
 
 const PJRT_API_MAJOR: i32 = 0;
@@ -481,26 +482,29 @@ unsafe impl Sync for PJRT_Api {}
 
 impl PJRT_Client {
     fn new() -> Self {
-        let discovered = discover_devices();
+        Self::new_with_devices(DeviceInfo::discover())
+    }
+
+    fn new_with_devices(discovered: Vec<DeviceInfo>) -> Self {
         let mut device_descriptions = Vec::with_capacity(discovered.len());
 
-        for (id, _) in discovered.iter().enumerate() {
+        for info in &discovered {
             device_descriptions.push(Box::new(PJRT_DeviceDescription {
-                id: id as i32,
+                id: info.id as i32,
                 process_index: 0,
-                device_kind: cstring_lossy("Tenstorrent"),
-                debug_string: cstring_lossy(format!("Tenstorrent device {id}")),
-                to_string: cstring_lossy(format!("tt:{id}")),
+                device_kind: cstring_lossy(info.device_kind()),
+                debug_string: cstring_lossy(info.device_debug_string()),
+                to_string: cstring_lossy(info.device_to_string()),
             }));
         }
 
         let mut memories = Vec::with_capacity(discovered.len());
-        for (index, _) in discovered.iter().enumerate() {
+        for info in &discovered {
             memories.push(Box::new(PJRT_Memory {
-                id: index as i32,
-                kind: cstring_lossy("device"),
-                debug_string: cstring_lossy(format!("Tenstorrent memory {index}")),
-                to_string: cstring_lossy(format!("tt:memory:{index}")),
+                id: info.id as i32,
+                kind: cstring_lossy("dram"),
+                debug_string: cstring_lossy(info.memory_debug_string()),
+                to_string: cstring_lossy(info.memory_to_string()),
                 device_ptrs: Vec::with_capacity(1),
             }));
         }
@@ -511,12 +515,13 @@ impl PJRT_Client {
         }
 
         let mut devices = Vec::with_capacity(discovered.len());
-        for (index, _) in discovered.iter().enumerate() {
+        for info in &discovered {
+            let index = info.id;
             let description = &mut *device_descriptions[index] as *mut PJRT_DeviceDescription;
             let default_memory = memory_ptrs[index];
             devices.push(Box::new(PJRT_Device {
-                id: index as i32,
-                local_hardware_id: index as i32,
+                id: info.id as i32,
+                local_hardware_id: info.id as i32,
                 description,
                 addressable: true,
                 default_memory,
@@ -580,19 +585,6 @@ unsafe fn checked_mut<'a, T>(ptr: *mut T, name: &str) -> Result<&'a mut T, *mut 
 unsafe fn checked_ref<'a, T>(ptr: *const T, name: &str) -> Result<&'a T, *mut PJRT_Error> {
     // SAFETY: caller guarantees `ptr` originates from the C ABI.
     unsafe { ptr.as_ref() }.ok_or_else(|| invalid_argument(format!("{name} must not be null")))
-}
-
-fn discover_devices() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(Path::new("/dev/tenstorrent")) {
-        for entry in entries.flatten() {
-            paths.push(entry.path());
-        }
-    }
-
-    paths.sort();
-    paths
 }
 
 #[unsafe(no_mangle)]
@@ -1212,6 +1204,8 @@ pub extern "C" fn GetPjrtApi() -> *const PJRT_Api {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::{DeviceInfo, ProbeInfo};
+    use std::path::PathBuf;
 
     fn check_ok(api: &PJRT_Api, error: *mut PJRT_Error) {
         if error.is_null() {
@@ -1399,5 +1393,50 @@ mod tests {
                     error,
                 });
         }
+    }
+
+    #[test]
+    fn device_abstraction_surfaces_board_metadata_through_pjrt_objects() {
+        let device = DeviceInfo::from_probe(
+            0,
+            PathBuf::from("/dev/tenstorrent/3"),
+            Some(ProbeInfo {
+                tensix_enabled_col_mask: 0x0fff,
+                gddr_enabled_mask: 0x7f,
+            }),
+        );
+        let client = PJRT_Client::new_with_devices(vec![device]);
+
+        let description = &client.device_descriptions[0];
+        assert_eq!(description.device_kind.as_bytes(), b"Tenstorrent p100");
+        let description_debug = std::str::from_utf8(description.debug_string.as_bytes())
+            .expect("device debug string should be utf-8");
+        assert!(
+            description_debug.contains("board=p100"),
+            "expected board marker in {description_debug}"
+        );
+        assert!(
+            description_debug.contains("workers=118"),
+            "expected worker count in {description_debug}"
+        );
+        assert!(
+            description_debug.contains("cq=14,2/14,3"),
+            "expected cq cores in {description_debug}"
+        );
+        assert!(
+            description_debug.contains("path=/dev/tenstorrent/3"),
+            "expected path marker in {description_debug}"
+        );
+
+        let memory = &client.memories[0];
+        assert_eq!(memory.kind.as_bytes(), b"dram");
+        let memory_debug = std::str::from_utf8(memory.debug_string.as_bytes())
+            .expect("memory debug string should be utf-8");
+        assert!(memory_debug.contains("dram_banks=7"));
+        assert!(memory_debug.contains("harvested=[7]"));
+        assert!(memory_debug.contains("tiles=21"));
+
+        let device = &client.devices[0];
+        assert_eq!(device.local_hardware_id, 0);
     }
 }
