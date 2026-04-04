@@ -1402,7 +1402,6 @@ mod tests {
             3,
             PathBuf::from("/dev/tenstorrent/3"),
             Some(ProbeInfo {
-                arch: "p100".to_owned(),
                 tensix_enabled_col_mask: 0x0fff,
                 gddr_enabled_mask: 0x7f,
             }),

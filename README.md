@@ -21,9 +21,8 @@ The discovery path now feeds an internal device abstraction modeled on
 `blackhole-py`'s `device.py`, including board selection (`p100`/`p150`),
 worker-core layout, command-queue core coordinates, and harvested DRAM-bank
 metadata. On Linux, probing now follows the older `blackhole-py` driver path:
-it opens `/dev/tenstorrent/<n>`, reads the card type from
-`/sys/class/tenstorrent/.../tt_card_type`, and uses the Tenstorrent driver
-ioctls to read ARC telemetry through a temporary TLB mapping.
+it opens `/dev/tenstorrent/<n>` and uses the Tenstorrent driver ioctls to read
+ARC telemetry through a temporary TLB mapping.
 
 ## Build
 

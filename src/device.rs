@@ -85,21 +85,16 @@ impl BoardKind {
     }
 
     fn from_tensix_core_count(core_count: usize) -> Option<Self> {
-        if core_count == 0 {
-            None
-        } else if core_count <= 120 {
-            Some(Self::P100)
-        } else if core_count <= 140 {
-            Some(Self::P150)
-        } else {
-            None
+        match core_count {
+            120 => Some(Self::P100),
+            140 => Some(Self::P150),
+            _ => None,
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ProbeInfo {
-    pub(crate) arch: String,
     pub(crate) tensix_enabled_col_mask: u32,
     pub(crate) gddr_enabled_mask: u32,
 }
@@ -127,12 +122,7 @@ impl DeviceInfo {
 
     pub(crate) fn from_path(id: usize, path: PathBuf) -> Self {
         let local_hardware_id = local_hardware_id_from_path(&path).unwrap_or(id);
-        Self::from_probe(
-            id,
-            local_hardware_id,
-            path.clone(),
-            detect_probe_info(local_hardware_id, &path),
-        )
+        Self::from_probe(id, local_hardware_id, path.clone(), detect_probe_info(&path))
     }
 
     pub(crate) fn from_probe(
@@ -158,15 +148,12 @@ impl DeviceInfo {
 
         if let Some(probe) = probe {
             let tensix_core_count = active_tensix_core_count(probe.tensix_enabled_col_mask);
-            let board = select_core_layout(&probe.arch, tensix_core_count);
+            let board = BoardKind::from_tensix_core_count(tensix_core_count);
             let harvested_dram_banks = harvested_dram_banks(probe.gddr_enabled_mask);
 
-            info.arch = if probe.arch.is_empty() {
-                board.map(|board| board.config().name.to_owned())
-                    .unwrap_or_else(|| "unknown".to_owned())
-            } else {
-                probe.arch
-            };
+            info.arch = board
+                .map(|board| board.config().name.to_owned())
+                .unwrap_or_else(|| "unknown".to_owned());
             info.board = board;
             info.tensix_core_count = Some(tensix_core_count);
             info.active_dram_banks = active_dram_banks(probe.gddr_enabled_mask);
@@ -246,8 +233,8 @@ impl DeviceInfo {
     }
 }
 
-fn detect_probe_info(local_hardware_id: usize, path: &Path) -> Option<ProbeInfo> {
-    probe_impl::detect_probe_info(local_hardware_id, path)
+fn detect_probe_info(path: &Path) -> Option<ProbeInfo> {
+    probe_impl::detect_probe_info(path)
 }
 
 fn discover_with(root: &Path) -> Vec<DeviceInfo> {
@@ -293,23 +280,6 @@ fn active_tensix_core_count(enabled_col_mask: u32) -> usize {
 
 fn local_hardware_id_from_path(path: &Path) -> Option<usize> {
     path.file_name()?.to_str()?.parse().ok()
-}
-
-fn select_core_layout(arch: &str, tensix_core_count: usize) -> Option<BoardKind> {
-    let normalized = arch.to_ascii_lowercase();
-    if normalized.starts_with("p100") {
-        Some(BoardKind::P100)
-    } else if normalized.starts_with("p150") {
-        if tensix_core_count == 120 {
-            Some(BoardKind::P100)
-        } else if tensix_core_count == 140 {
-            Some(BoardKind::P150)
-        } else {
-            None
-        }
-    } else {
-        BoardKind::from_tensix_core_count(tensix_core_count)
-    }
 }
 
 fn active_dram_banks(gddr_enabled_mask: u32) -> usize {
@@ -387,7 +357,6 @@ mod tests {
             0,
             PathBuf::from("/dev/tenstorrent/0"),
             Some(ProbeInfo {
-                arch: "p100".to_owned(),
                 tensix_enabled_col_mask: 0x0fff,
                 gddr_enabled_mask: 0x7f,
             }),
@@ -414,7 +383,6 @@ mod tests {
             1,
             PathBuf::from("/dev/tenstorrent/1"),
             Some(ProbeInfo {
-                arch: "p150".to_owned(),
                 tensix_enabled_col_mask: 0x3fff,
                 gddr_enabled_mask: 0xff,
             }),
@@ -427,25 +395,6 @@ mod tests {
         assert_eq!(device.active_dram_banks, 8);
         assert!(device.harvested_dram_banks.is_empty());
         assert_eq!(device.dram_tiles.len(), 24);
-    }
-
-    #[test]
-    fn derives_p100_layout_for_harvested_p150() {
-        let device = DeviceInfo::from_probe(
-            0,
-            0,
-            PathBuf::from("/dev/tenstorrent/0"),
-            Some(ProbeInfo {
-                arch: "p150".to_owned(),
-                tensix_enabled_col_mask: 0x0fff,
-                gddr_enabled_mask: 0x7f,
-            }),
-        );
-
-        assert_eq!(device.arch, "p150");
-        assert_eq!(device.board, Some(BoardKind::P100));
-        assert_eq!(device.prefetch_core, Some(CoreCoord { x: 14, y: 2 }));
-        assert_eq!(device.dispatch_core, Some(CoreCoord { x: 14, y: 3 }));
     }
 
     #[test]

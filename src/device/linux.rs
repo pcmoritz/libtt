@@ -1,9 +1,9 @@
 use super::{CoreCoord, ProbeInfo, log};
 use std::ffi::{c_int, c_ulong, c_void};
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 
 const DEFAULT_TENSIX_ENABLED: u32 = 0x3fff;
@@ -18,7 +18,6 @@ const TT_IOCTL_BASE: c_ulong = 0xFA << 8;
 const TT_IOCTL_ALLOC_TLB: c_ulong = TT_IOCTL_BASE | 11;
 const TT_IOCTL_FREE_TLB: c_ulong = TT_IOCTL_BASE | 12;
 const TT_IOCTL_CONFIG_TLB: c_ulong = TT_IOCTL_BASE | 13;
-const TT_IOCTL_SET_POWER_STATE: c_ulong = TT_IOCTL_BASE | 15;
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x01;
@@ -91,127 +90,79 @@ struct ConfigIn {
     config: NocTlbConfig,
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
-struct PowerStateIn {
-    argsz: u32,
-    flags: u32,
-    reserved0: u8,
-    validity: u8,
-    power_flags: u16,
-    power_settings: [u16; 14],
-}
-
-pub(super) fn detect_probe_info(local_hardware_id: usize, path: &Path) -> Option<ProbeInfo> {
-    match probe_info_for_device(local_hardware_id, path) {
-        Ok(probe) => probe,
+pub(super) fn detect_probe_info(path: &Path) -> Option<ProbeInfo> {
+    match probe_info_for_device(path) {
+        Ok(probe) => Some(probe),
         Err(err) => {
-            log(format!(
-                "linux probe local_hardware_id={local_hardware_id} failed: {err}"
-            ));
+            log(format!("linux probe path={} failed: {err}", path.display()));
             None
         }
     }
 }
 
-fn probe_info_for_device(local_hardware_id: usize, path: &Path) -> io::Result<Option<ProbeInfo>> {
-    let card_type = read_card_type(local_hardware_id)?;
+fn probe_info_for_device(path: &Path) -> io::Result<ProbeInfo> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|err| io::Error::new(err.kind(), format!("open {}: {err}", path.display())))?;
+    log(format!("linux probe opened {}", path.display()));
+
+    let (gddr_enabled_mask, tensix_enabled_col_mask) = read_arc_enabled_masks(&file)?;
     log(format!(
-        "linux probe local_hardware_id={local_hardware_id} path={} card_type={card_type}",
+        "linux probe path={} tensix_enabled_col_mask=0x{tensix_enabled_col_mask:08x} gddr_enabled_mask=0x{gddr_enabled_mask:08x}",
         path.display()
     ));
 
-    let probe = ProbeDevice::open(path)?;
-    let (gddr_enabled_mask, tensix_enabled_col_mask) = probe.read_arc_enabled_masks()?;
-    log(format!(
-        "linux probe local_hardware_id={local_hardware_id} tensix_enabled_col_mask=0x{tensix_enabled_col_mask:08x} gddr_enabled_mask=0x{gddr_enabled_mask:08x}"
-    ));
-
-    Ok(Some(ProbeInfo {
-        arch: card_type,
+    Ok(ProbeInfo {
         tensix_enabled_col_mask,
         gddr_enabled_mask,
-    }))
+    })
 }
 
-fn read_card_type(local_hardware_id: usize) -> io::Result<String> {
-    let path = PathBuf::from(format!(
-        "/sys/class/tenstorrent/tenstorrent!{local_hardware_id}/tt_card_type"
+fn read_arc_enabled_masks(file: &std::fs::File) -> io::Result<(u32, u32)> {
+    let mut arc = TlbWindow::new(file, ARC_TILE, ARC_NOC_BASE)?;
+    let telemetry_ptr = arc.read32(ARC_SCRATCH_RAM_13)? as u64;
+    let (csm_base, csm_offset) = align_down(telemetry_ptr, TLB_SIZE_2M);
+    log(format!(
+        "linux probe telemetry_ptr=0x{telemetry_ptr:x} csm_base=0x{csm_base:x} csm_offset=0x{csm_offset:x}"
     ));
-    let card_type = fs::read_to_string(&path)
-        .map_err(|err| io::Error::new(err.kind(), format!("read {}: {err}", path.display())))?;
-    Ok(card_type.trim().to_owned())
-}
+    arc.target(ARC_TILE, None, csm_base)?;
 
-struct ProbeDevice {
-    file: std::fs::File,
-}
-
-impl ProbeDevice {
-    fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|err| io::Error::new(err.kind(), format!("open {}: {err}", path.display())))?;
-        log(format!("linux probe opened {}", path.display()));
-        Ok(Self { file })
+    let entry_count = arc.read32((csm_offset + 4) as usize)? as usize;
+    log(format!("linux probe telemetry entry_count={entry_count}"));
+    if entry_count == 0 || entry_count > 4096 {
+        return Err(io::Error::other(format!(
+            "invalid ARC telemetry entry_count {entry_count}"
+        )));
     }
 
-    fn read_arc_enabled_masks(&self) -> io::Result<(u32, u32)> {
-        let mut power_state = PowerStateIn {
-            argsz: std::mem::size_of::<PowerStateIn>() as u32,
-            validity: 1,
-            power_flags: 1,
-            ..PowerStateIn::default()
-        };
-        if let Err(err) = ioctl_call(self.file.as_raw_fd(), TT_IOCTL_SET_POWER_STATE, &mut power_state) {
-            log(format!("linux probe set_power_state ioctl failed: {err}"));
+    let tags_base = csm_offset + 8;
+    let data_base = tags_base + (entry_count as u64) * 4;
+    let mut tensix_data_offset = None;
+    let mut gddr_data_offset = None;
+
+    for index in 0..entry_count {
+        let tag_offset = arc.read32((tags_base + (index as u64) * 4) as usize)?;
+        let tag = (tag_offset & 0xffff) as u16;
+        let data_offset_words = (tag_offset >> 16) & 0xffff;
+
+        if tag == TAG_TENSIX_ENABLED_COL {
+            tensix_data_offset = Some(data_offset_words);
+        } else if tag == TAG_GDDR_ENABLED {
+            gddr_data_offset = Some(data_offset_words);
         }
-
-        let mut arc = TlbWindow::new(&self.file, ARC_TILE, ARC_NOC_BASE)?;
-        let telemetry_ptr = arc.read32(ARC_SCRATCH_RAM_13)? as u64;
-        let (csm_base, csm_offset) = align_down(telemetry_ptr, TLB_SIZE_2M);
-        log(format!(
-            "linux probe telemetry_ptr=0x{telemetry_ptr:x} csm_base=0x{csm_base:x} csm_offset=0x{csm_offset:x}"
-        ));
-        arc.target(ARC_TILE, None, csm_base)?;
-
-        let entry_count = arc.read32((csm_offset + 4) as usize)? as usize;
-        log(format!("linux probe telemetry entry_count={entry_count}"));
-        if entry_count == 0 || entry_count > 4096 {
-            return Err(io::Error::other(format!(
-                "invalid ARC telemetry entry_count {entry_count}"
-            )));
-        }
-
-        let tags_base = csm_offset + 8;
-        let data_base = tags_base + (entry_count as u64) * 4;
-        let mut tensix_data_offset = None;
-        let mut gddr_data_offset = None;
-
-        for index in 0..entry_count {
-            let tag_offset = arc.read32((tags_base + (index as u64) * 4) as usize)?;
-            let tag = (tag_offset & 0xffff) as u16;
-            let data_offset_words = (tag_offset >> 16) & 0xffff;
-
-            if tag == TAG_TENSIX_ENABLED_COL {
-                tensix_data_offset = Some(data_offset_words);
-            } else if tag == TAG_GDDR_ENABLED {
-                gddr_data_offset = Some(data_offset_words);
-            }
-        }
-
-        let tensix_enabled_col_mask = match tensix_data_offset {
-            Some(offset_words) => arc.read32((data_base + (offset_words as u64) * 4) as usize)?,
-            None => DEFAULT_TENSIX_ENABLED,
-        };
-        let gddr_enabled_mask = match gddr_data_offset {
-            Some(offset_words) => arc.read32((data_base + (offset_words as u64) * 4) as usize)?,
-            None => DEFAULT_GDDR_ENABLED,
-        };
-        Ok((gddr_enabled_mask, tensix_enabled_col_mask))
     }
+
+    let tensix_enabled_col_mask = match tensix_data_offset {
+        Some(offset_words) => arc.read32((data_base + (offset_words as u64) * 4) as usize)?,
+        None => DEFAULT_TENSIX_ENABLED,
+    };
+    let gddr_enabled_mask = match gddr_data_offset {
+        Some(offset_words) => arc.read32((data_base + (offset_words as u64) * 4) as usize)?,
+        None => DEFAULT_GDDR_ENABLED,
+    };
+    Ok((gddr_enabled_mask, tensix_enabled_col_mask))
 }
 
 struct TlbWindow<'a> {
