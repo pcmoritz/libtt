@@ -277,7 +277,9 @@ impl MappedRegion {
         }
 
         let bytes = unsafe { std::slice::from_raw_parts(self.addr.add(offset), 4) };
-        Ok(u32::from_le_bytes(bytes.try_into().expect("slice length is fixed")))
+        Ok(u32::from_le_bytes(
+            bytes.try_into().expect("slice length is fixed"),
+        ))
     }
 }
 

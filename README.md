@@ -24,6 +24,35 @@ metadata. On Linux, probing now follows the older `blackhole-py` driver path:
 it opens `/dev/tenstorrent/<n>` and uses the Tenstorrent driver ioctls to read
 ARC telemetry through a temporary TLB mapping.
 
+## DRAM Helpers
+
+The crate now also exposes Linux-only DRAM helpers modeled on
+`blackhole-py`'s `dram.py`:
+
+- `device::Device::open(local_hardware_id)` opens `/dev/tenstorrent/<n>` and
+  exposes board metadata together with DRAM allocation helpers.
+- `dram::Allocator` performs DRAM allocation and raw tiled page reads/writes.
+- `device::Device::alloc_write(...)` accepts an untiled tensor payload, tilizes
+  it into Blackhole tile order, writes it to DRAM, and returns a `DramBuffer`.
+
+Example:
+
+```rust
+use libtt::device::Device;
+use libtt::dram::DType;
+
+let mut device = Device::open(0)?;
+let rows = 32usize;
+let cols = 64usize;
+let data = vec![0u16; rows * cols]
+    .into_iter()
+    .flat_map(|value| value.to_le_bytes())
+    .collect::<Vec<_>>();
+let buffer = device.alloc_write(&data, DType::Float16, &[rows, cols], "weights")?;
+let roundtrip = device.dram_read(&buffer)?;
+assert_eq!(roundtrip, data);
+```
+
 ## Build
 
 ```bash

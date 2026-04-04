@@ -1,4 +1,6 @@
+use crate::dram::{Allocator, DType, DramBuffer, Shape};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -99,8 +101,7 @@ pub(crate) struct ProbeInfo {
     pub(crate) gddr_enabled_mask: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DeviceInfo {
+pub struct Device {
     pub(crate) id: usize,
     pub(crate) local_hardware_id: usize,
     pub(crate) path: PathBuf,
@@ -113,9 +114,10 @@ pub(crate) struct DeviceInfo {
     pub(crate) harvested_dram_banks: Vec<usize>,
     pub(crate) active_dram_banks: usize,
     pub(crate) dram_tiles: Vec<DramTile>,
+    allocator: Option<Allocator>,
 }
 
-impl DeviceInfo {
+impl Device {
     pub(crate) fn discover() -> Vec<Self> {
         discover_with(Path::new(DEFAULT_ROOT))
     }
@@ -149,6 +151,7 @@ impl DeviceInfo {
             harvested_dram_banks: Vec::new(),
             active_dram_banks: 0,
             dram_tiles: Vec::new(),
+            allocator: None,
         };
 
         if let Some(probe) = probe {
@@ -236,9 +239,89 @@ impl DeviceInfo {
     pub(crate) fn memory_to_string(&self) -> String {
         format!("tt:{}:memory:{}", self.arch, self.id)
     }
+
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn local_hardware_id(&self) -> usize {
+        self.local_hardware_id
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn arch(&self) -> &str {
+        &self.arch
+    }
+
+    pub fn harvested_dram_banks(&self) -> &[usize] {
+        &self.harvested_dram_banks
+    }
+
+    pub fn active_dram_banks(&self) -> usize {
+        self.active_dram_banks
+    }
+
+    pub fn open(local_hardware_id: usize) -> io::Result<Self> {
+        Ok(load_device(local_hardware_id).1)
+    }
+
+    pub fn alloc(
+        &mut self,
+        num_tiles: usize,
+        dtype: DType,
+        name: impl Into<String>,
+        shape: Option<Shape>,
+    ) -> io::Result<DramBuffer> {
+        self.allocator_mut()?.alloc(num_tiles, dtype, name, shape)
+    }
+
+    pub fn alloc_write(
+        &mut self,
+        data: &[u8],
+        dtype: DType,
+        shape: &[usize],
+        name: impl Into<String>,
+    ) -> io::Result<DramBuffer> {
+        let shape = shape.to_vec();
+        let buffer = self
+            .allocator_mut()?
+            .alloc_for_host_data(data, dtype, shape, name)?;
+        self.dram_write(&buffer, data)?;
+        Ok(buffer)
+    }
+
+    pub fn dram_write(&mut self, buf: &DramBuffer, data: &[u8]) -> io::Result<()> {
+        self.allocator_mut()?.write_host_data(buf, data)
+    }
+
+    pub fn dram_read(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
+        self.allocator_mut()?.read_host_data(buf)
+    }
+
+    pub fn dram_read_raw_bank_pages(&mut self, addr: u64, page_size: usize) -> io::Result<Vec<u8>> {
+        self.allocator_mut()?.read_raw_bank_pages(addr, page_size)
+    }
+
+    fn allocator_mut(&mut self) -> io::Result<&mut Allocator> {
+        if self.allocator.is_none() {
+            self.allocator = Some(Allocator::from_device(self)?);
+        }
+        self.allocator
+            .as_mut()
+            .ok_or_else(|| io::Error::other("device allocator initialization failed"))
+    }
 }
 
-fn discover_with(root: &Path) -> Vec<DeviceInfo> {
+pub(crate) fn load_device(local_hardware_id: usize) -> (PathBuf, Device) {
+    let path = PathBuf::from(format!("/dev/tenstorrent/{local_hardware_id}"));
+    let info = Device::from_path(local_hardware_id, path.clone());
+    (path, info)
+}
+
+fn discover_with(root: &Path) -> Vec<Device> {
     let mut paths = Vec::new();
 
     if let Ok(entries) = fs::read_dir(root) {
@@ -258,7 +341,7 @@ fn discover_with(root: &Path) -> Vec<DeviceInfo> {
         .enumerate()
         .map(|(id, path)| {
             log(format!("device[{id}] node={}", path.display()));
-            DeviceInfo::from_path(id, path)
+            Device::from_path(id, path)
         })
         .collect()
 }
@@ -296,7 +379,10 @@ fn harvested_dram_banks(gddr_enabled_mask: u32) -> Vec<usize> {
 }
 
 fn dram_tiles(harvested_dram_banks: &[usize]) -> Vec<DramTile> {
-    let harvested = harvested_dram_banks.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    let harvested = harvested_dram_banks
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
     let mut tiles = Vec::new();
 
     for bank in 0..DRAM_BANK_COUNT {
@@ -328,7 +414,10 @@ fn log_enabled() -> bool {
     *ENABLED.get_or_init(|| match std::env::var("LIBTT_LOG") {
         Ok(value) => {
             let normalized = value.trim().to_ascii_lowercase();
-            !normalized.is_empty() && normalized != "0" && normalized != "false" && normalized != "off"
+            !normalized.is_empty()
+                && normalized != "0"
+                && normalized != "false"
+                && normalized != "off"
         }
         Err(_) => false,
     })
@@ -340,7 +429,7 @@ mod tests {
 
     #[test]
     fn builds_minimal_device_metadata_from_path() {
-        let device = DeviceInfo::from_path(2, PathBuf::from("/dev/tenstorrent/7"));
+        let device = Device::from_path(2, PathBuf::from("/dev/tenstorrent/7"));
         assert_eq!(device.local_hardware_id, 7);
         assert_eq!(device.arch, "unknown");
         assert_eq!(device.board, None);
@@ -353,7 +442,7 @@ mod tests {
 
     #[test]
     fn derives_blackhole_style_topology_from_probe_info() {
-        let device = DeviceInfo::from_probe(
+        let device = Device::from_probe(
             0,
             0,
             PathBuf::from("/dev/tenstorrent/0"),
@@ -379,7 +468,7 @@ mod tests {
 
     #[test]
     fn derives_p150_worker_layout_from_probe_info() {
-        let device = DeviceInfo::from_probe(
+        let device = Device::from_probe(
             1,
             1,
             PathBuf::from("/dev/tenstorrent/1"),
