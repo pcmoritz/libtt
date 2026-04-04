@@ -1204,7 +1204,7 @@ pub extern "C" fn GetPjrtApi() -> *const PJRT_Api {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::DeviceInfo;
+    use crate::device::{DeviceInfo, ProbeInfo};
     use std::path::PathBuf;
 
     fn check_ok(api: &PJRT_Api, error: *mut PJRT_Error) {
@@ -1397,16 +1397,31 @@ mod tests {
 
     #[test]
     fn device_abstraction_surfaces_board_metadata_through_pjrt_objects() {
-        let device = DeviceInfo::from_path(0, PathBuf::from("/dev/tenstorrent/3"));
+        let device = DeviceInfo::from_probe(
+            0,
+            PathBuf::from("/dev/tenstorrent/3"),
+            Some(ProbeInfo {
+                tensix_enabled_col_mask: 0x0fff,
+                gddr_enabled_mask: 0x7f,
+            }),
+        );
         let client = PJRT_Client::new_with_devices(vec![device]);
 
         let description = &client.device_descriptions[0];
-        assert_eq!(description.device_kind.as_bytes(), b"Tenstorrent");
+        assert_eq!(description.device_kind.as_bytes(), b"Tenstorrent p100");
         let description_debug = std::str::from_utf8(description.debug_string.as_bytes())
             .expect("device debug string should be utf-8");
         assert!(
-            description_debug.contains("board=unknown"),
+            description_debug.contains("board=p100"),
             "expected board marker in {description_debug}"
+        );
+        assert!(
+            description_debug.contains("workers=118"),
+            "expected worker count in {description_debug}"
+        );
+        assert!(
+            description_debug.contains("cq=14,2/14,3"),
+            "expected cq cores in {description_debug}"
         );
         assert!(
             description_debug.contains("path=/dev/tenstorrent/3"),
@@ -1415,10 +1430,11 @@ mod tests {
 
         let memory = &client.memories[0];
         assert_eq!(memory.kind.as_bytes(), b"dram");
-        assert_eq!(
-            memory.debug_string.as_bytes(),
-            b"Tenstorrent DRAM (device=0)"
-        );
+        let memory_debug = std::str::from_utf8(memory.debug_string.as_bytes())
+            .expect("memory debug string should be utf-8");
+        assert!(memory_debug.contains("dram_banks=7"));
+        assert!(memory_debug.contains("harvested=[7]"));
+        assert!(memory_debug.contains("tiles=21"));
 
         let device = &client.devices[0];
         assert_eq!(device.local_hardware_id, 0);
