@@ -184,12 +184,16 @@ impl<'a> TlbWindow<'a> {
 
         let id = unsafe { ptr::addr_of!(alloc.output.id).read_unaligned() };
         let mmap_offset_uc = unsafe { ptr::addr_of!(alloc.output.mmap_offset_uc).read_unaligned() };
-        let mapping = MappedRegion::map(file.as_raw_fd(), TLB_SIZE_2M as usize, mmap_offset_uc)?;
         let mut window = Self {
             file,
             id,
-            mapping: Some(mapping),
+            mapping: None,
         };
+        window.mapping = Some(MappedRegion::map(
+            file.as_raw_fd(),
+            TLB_SIZE_2M as usize,
+            mmap_offset_uc,
+        )?);
         window.target(start, None, addr)?;
         Ok(window)
     }
