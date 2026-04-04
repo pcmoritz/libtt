@@ -1196,7 +1196,7 @@ pub extern "C" fn GetPjrtApi() -> *const PJRT_Api {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{DeviceInfo, DeviceOverrides};
+    use crate::device::DeviceInfo;
     use std::path::PathBuf;
 
     fn check_ok(api: &PJRT_Api, error: *mut PJRT_Error) {
@@ -1402,42 +1402,27 @@ mod tests {
 
     #[test]
     fn device_abstraction_surfaces_board_metadata_through_pjrt_objects() {
-        let device = DeviceInfo::from_path(
-            0,
-            PathBuf::from("/dev/tenstorrent/3"),
-            DeviceOverrides {
-                board: Some("p100".to_owned()),
-                tensix_core_count: Some(120),
-                gddr_enabled_mask: Some(0x7f),
-            },
-        );
+        let device = DeviceInfo::from_path(0, PathBuf::from("/dev/tenstorrent/3"));
         let client = PJRT_Client::new_with_devices(vec![device]);
 
         let description = &client.device_descriptions[0];
-        assert_eq!(description.device_kind.as_bytes(), b"Tenstorrent p100");
+        assert_eq!(description.device_kind.as_bytes(), b"Tenstorrent");
+        let description_debug = std::str::from_utf8(description.debug_string.as_bytes())
+            .expect("device debug string should be utf-8");
         assert!(
-            description
-                .debug_string
-                .as_bytes()
-                .windows(10)
-                .any(|w| w == b"board=p100")
+            description_debug.contains("board=unknown"),
+            "expected board marker in {description_debug}"
         );
         assert!(
-            description
-                .debug_string
-                .as_bytes()
-                .windows(12)
-                .any(|w| w == b"dram_banks=7")
+            description_debug.contains("path=/dev/tenstorrent/3"),
+            "expected path marker in {description_debug}"
         );
 
         let memory = &client.memories[0];
         assert_eq!(memory.kind.as_bytes(), b"dram");
-        assert!(
-            memory
-                .debug_string
-                .as_bytes()
-                .windows(13)
-                .any(|w| w == b"harvested=[7]")
+        assert_eq!(
+            memory.debug_string.as_bytes(),
+            b"Tenstorrent DRAM (device=0)"
         );
 
         let device = &client.devices[0];
