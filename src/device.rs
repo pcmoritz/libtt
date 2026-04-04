@@ -1,5 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+#[cfg(target_os = "linux")]
+#[path = "device/linux.rs"]
+mod probe_impl;
+#[cfg(not(target_os = "linux"))]
+#[path = "device/stub.rs"]
+mod probe_impl;
 
 const DEFAULT_ROOT: &str = "/dev/tenstorrent";
 const ARC_DEFAULT_TENSIX_ENABLED: u32 = 0x3fff;
@@ -77,14 +85,10 @@ impl BoardKind {
     }
 
     fn from_tensix_core_count(core_count: usize) -> Option<Self> {
-        if core_count == 0 {
-            None
-        } else if core_count <= 120 {
-            Some(Self::P100)
-        } else if core_count <= 140 {
-            Some(Self::P150)
-        } else {
-            None
+        match core_count {
+            120 => Some(Self::P100),
+            140 => Some(Self::P150),
+            _ => None,
         }
     }
 }
@@ -98,6 +102,7 @@ pub(crate) struct ProbeInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceInfo {
     pub(crate) id: usize,
+    pub(crate) local_hardware_id: usize,
     pub(crate) path: PathBuf,
     pub(crate) board: Option<BoardKind>,
     pub(crate) arch: String,
@@ -116,12 +121,24 @@ impl DeviceInfo {
     }
 
     pub(crate) fn from_path(id: usize, path: PathBuf) -> Self {
-        Self::from_probe(id, path, None)
+        let local_hardware_id = local_hardware_id_from_path(&path).unwrap_or(id);
+        Self::from_probe(
+            id,
+            local_hardware_id,
+            path.clone(),
+            probe_impl::detect_probe_info(&path),
+        )
     }
 
-    pub(crate) fn from_probe(id: usize, path: PathBuf, probe: Option<ProbeInfo>) -> Self {
+    pub(crate) fn from_probe(
+        id: usize,
+        local_hardware_id: usize,
+        path: PathBuf,
+        probe: Option<ProbeInfo>,
+    ) -> Self {
         let mut info = Self {
             id,
+            local_hardware_id,
             path,
             board: None,
             arch: "unknown".to_owned(),
@@ -231,10 +248,18 @@ fn discover_with(root: &Path) -> Vec<DeviceInfo> {
     }
 
     paths.sort();
+    log(format!(
+        "device discovery root={} entries={}",
+        root.display(),
+        paths.len()
+    ));
     paths
         .into_iter()
         .enumerate()
-        .map(|(id, path)| DeviceInfo::from_path(id, path))
+        .map(|(id, path)| {
+            log(format!("device[{id}] node={}", path.display()));
+            DeviceInfo::from_path(id, path)
+        })
         .collect()
 }
 
@@ -252,6 +277,10 @@ fn worker_cores(tensix_x: &[u8]) -> Vec<CoreCoord> {
 
 fn active_tensix_core_count(enabled_col_mask: u32) -> usize {
     (enabled_col_mask & ARC_DEFAULT_TENSIX_ENABLED).count_ones() as usize * 10
+}
+
+fn local_hardware_id_from_path(path: &Path) -> Option<usize> {
+    path.file_name()?.to_str()?.parse().ok()
 }
 
 fn active_dram_banks(gddr_enabled_mask: u32) -> usize {
@@ -288,6 +317,23 @@ fn dram_bank_x(bank: usize) -> u8 {
     if bank < 4 { 0 } else { 9 }
 }
 
+pub(super) fn log(message: impl AsRef<str>) {
+    if log_enabled() {
+        eprintln!("[libtt] {}", message.as_ref());
+    }
+}
+
+fn log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("LIBTT_LOG") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !normalized.is_empty() && normalized != "0" && normalized != "false" && normalized != "off"
+        }
+        Err(_) => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +341,7 @@ mod tests {
     #[test]
     fn builds_minimal_device_metadata_from_path() {
         let device = DeviceInfo::from_path(2, PathBuf::from("/dev/tenstorrent/7"));
+        assert_eq!(device.local_hardware_id, 7);
         assert_eq!(device.arch, "unknown");
         assert_eq!(device.board, None);
         assert_eq!(device.tensix_core_count, None);
@@ -307,6 +354,7 @@ mod tests {
     #[test]
     fn derives_blackhole_style_topology_from_probe_info() {
         let device = DeviceInfo::from_probe(
+            0,
             0,
             PathBuf::from("/dev/tenstorrent/0"),
             Some(ProbeInfo {
@@ -332,6 +380,7 @@ mod tests {
     #[test]
     fn derives_p150_worker_layout_from_probe_info() {
         let device = DeviceInfo::from_probe(
+            1,
             1,
             PathBuf::from("/dev/tenstorrent/1"),
             Some(ProbeInfo {
