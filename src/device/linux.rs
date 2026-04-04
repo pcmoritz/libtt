@@ -97,14 +97,18 @@ struct ProbeDevice {
 
 impl ProbeDevice {
     fn open(sysfs_path: &Path) -> io::Result<Self> {
+        ensure_pci_device_enabled(sysfs_path)?;
+
         let config = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(sysfs_path.join("config"))?;
+            .open(sysfs_path.join("config"))
+            .map_err(|err| io::Error::new(err.kind(), format!("open config: {err}")))?;
         let bar0 = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(sysfs_path.join("resource0"))?;
+            .open(sysfs_path.join("resource0"))
+            .map_err(|err| io::Error::new(err.kind(), format!("open resource0: {err}")))?;
 
         let probe = Self { config, bar0 };
         probe.enable_memory_and_bus_mastering()?;
@@ -117,9 +121,11 @@ impl ProbeDevice {
 
     fn enable_memory_and_bus_mastering(&self) -> io::Result<()> {
         let mut cmd = [0u8; 2];
-        read_exact_at(&self.config, &mut cmd, PCI_COMMAND)?;
+        read_exact_at(&self.config, &mut cmd, PCI_COMMAND)
+            .map_err(|err| io::Error::new(err.kind(), format!("read PCI_COMMAND: {err}")))?;
         let value = u16::from_le_bytes(cmd) | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
-        write_all_at(&self.config, &value.to_le_bytes(), PCI_COMMAND)?;
+        write_all_at(&self.config, &value.to_le_bytes(), PCI_COMMAND)
+            .map_err(|err| io::Error::new(err.kind(), format!("write PCI_COMMAND: {err}")))?;
         Ok(())
     }
 
@@ -208,6 +214,28 @@ impl ProbeDevice {
 
         Ok(())
     }
+}
+
+fn ensure_pci_device_enabled(sysfs_path: &Path) -> io::Result<()> {
+    let enable_path = sysfs_path.join("enable");
+    let current = fs::read_to_string(&enable_path)
+        .map_err(|err| io::Error::new(err.kind(), format!("read enable: {err}")))?;
+
+    if current.trim() == "1" {
+        log(format!(
+            "linux probe pci device already enabled: {}",
+            enable_path.display()
+        ));
+        return Ok(());
+    }
+
+    log(format!(
+        "linux probe enabling pci device via {}",
+        enable_path.display()
+    ));
+    fs::write(&enable_path, "1")
+        .map_err(|err| io::Error::new(err.kind(), format!("write enable: {err}")))?;
+    Ok(())
 }
 
 fn is_arc_csm_addr(addr: u64, length: u64) -> bool {
