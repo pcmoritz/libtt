@@ -1,6 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+#[path = "device/linux.rs"]
+mod probe_impl;
+#[cfg(not(target_os = "linux"))]
+#[path = "device/stub.rs"]
+mod probe_impl;
+
 const DEFAULT_ROOT: &str = "/dev/tenstorrent";
 const ARC_DEFAULT_TENSIX_ENABLED: u32 = 0x3fff;
 const DRAM_BANK_COUNT: usize = 8;
@@ -116,7 +123,7 @@ impl DeviceInfo {
     }
 
     pub(crate) fn from_path(id: usize, path: PathBuf) -> Self {
-        Self::from_probe(id, path, None)
+        Self::from_probe(id, path, detect_probe_info(id))
     }
 
     pub(crate) fn from_probe(id: usize, path: PathBuf, probe: Option<ProbeInfo>) -> Self {
@@ -219,6 +226,10 @@ impl DeviceInfo {
     pub(crate) fn memory_to_string(&self) -> String {
         format!("tt:{}:memory:{}", self.arch, self.id)
     }
+}
+
+fn detect_probe_info(id: usize) -> Option<ProbeInfo> {
+    probe_impl::detect_probe_info(id)
 }
 
 fn discover_with(root: &Path) -> Vec<DeviceInfo> {
