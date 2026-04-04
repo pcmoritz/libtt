@@ -122,7 +122,12 @@ impl DeviceInfo {
 
     pub(crate) fn from_path(id: usize, path: PathBuf) -> Self {
         let local_hardware_id = local_hardware_id_from_path(&path).unwrap_or(id);
-        Self::from_probe(id, local_hardware_id, path.clone(), detect_probe_info(&path))
+        Self::from_probe(
+            id,
+            local_hardware_id,
+            path.clone(),
+            probe_impl::detect_probe_info(&path),
+        )
     }
 
     pub(crate) fn from_probe(
@@ -231,10 +236,6 @@ impl DeviceInfo {
     pub(crate) fn memory_to_string(&self) -> String {
         format!("tt:{}:memory:{}", self.arch, self.id)
     }
-}
-
-fn detect_probe_info(path: &Path) -> Option<ProbeInfo> {
-    probe_impl::detect_probe_info(path)
 }
 
 fn discover_with(root: &Path) -> Vec<DeviceInfo> {
