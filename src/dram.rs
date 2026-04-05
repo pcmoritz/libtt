@@ -79,7 +79,15 @@ impl Allocator {
     }
 
     fn from_device_with_path(path: PathBuf, device: &Device) -> io::Result<Self> {
-        let bank_tiles = allocator_bank_tiles(&device.dram_tiles)?;
+        let bank_tiles = device
+            .dram_tiles
+            .iter()
+            .step_by(DRAM_TILES_PER_BANK)
+            .copied()
+            .collect::<Vec<_>>();
+        if bank_tiles.is_empty() {
+            return Err(io::Error::other("no active DRAM bank tiles discovered"));
+        }
         let first = bank_tiles
             .first()
             .copied()
@@ -347,19 +355,6 @@ pub(crate) fn untilize(data: &[u8], dtype: DType, shape: &[usize]) -> io::Result
     Ok(out)
 }
 
-fn allocator_bank_tiles(dram_tiles: &[DramTile]) -> io::Result<Vec<DramTile>> {
-    let bank_tiles = dram_tiles
-        .iter()
-        .step_by(DRAM_TILES_PER_BANK)
-        .copied()
-        .collect::<Vec<_>>();
-    if bank_tiles.is_empty() {
-        Err(io::Error::other("no active DRAM bank tiles discovered"))
-    } else {
-        Ok(bank_tiles)
-    }
-}
-
 fn collect_bank_data(
     data: &[u8],
     page_size: usize,
@@ -544,47 +539,6 @@ mod tests {
 
         assert_eq!(buffer.page_size(), 2048);
         assert_eq!(buffer.size(), 6144);
-    }
-
-    #[test]
-    fn allocator_bank_tiles_picks_one_tile_per_bank() {
-        let tiles = vec![
-            DramTile {
-                bank: 0,
-                x: 0,
-                y: 0,
-            },
-            DramTile {
-                bank: 0,
-                x: 0,
-                y: 1,
-            },
-            DramTile {
-                bank: 0,
-                x: 0,
-                y: 2,
-            },
-            DramTile {
-                bank: 1,
-                x: 9,
-                y: 0,
-            },
-            DramTile {
-                bank: 1,
-                x: 9,
-                y: 1,
-            },
-            DramTile {
-                bank: 1,
-                x: 9,
-                y: 2,
-            },
-        ];
-
-        let bank_tiles = allocator_bank_tiles(&tiles).expect("bank tiles should exist");
-        assert_eq!(bank_tiles.len(), 2);
-        assert_eq!(bank_tiles[0].bank, 0);
-        assert_eq!(bank_tiles[1].bank, 1);
     }
 
     #[test]
