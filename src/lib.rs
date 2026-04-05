@@ -1,8 +1,10 @@
 #![allow(non_camel_case_types, non_snake_case)]
 
-mod device;
+pub mod device;
+pub mod dram;
+mod linux;
 
-use device::DeviceInfo;
+use device::Device;
 use std::ffi::{CString, c_char, c_void};
 use std::mem::size_of;
 use std::ptr;
@@ -482,10 +484,10 @@ unsafe impl Sync for PJRT_Api {}
 
 impl PJRT_Client {
     fn new() -> Self {
-        Self::new_with_devices(DeviceInfo::discover())
+        Self::new_with_devices(Device::discover())
     }
 
-    fn new_with_devices(discovered: Vec<DeviceInfo>) -> Self {
+    fn new_with_devices(discovered: Vec<Device>) -> Self {
         let mut device_descriptions = Vec::with_capacity(discovered.len());
 
         for info in &discovered {
@@ -1204,7 +1206,7 @@ pub extern "C" fn GetPjrtApi() -> *const PJRT_Api {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{DeviceInfo, ProbeInfo};
+    use crate::device::{Device, ProbeInfo};
     use std::path::PathBuf;
 
     fn check_ok(api: &PJRT_Api, error: *mut PJRT_Error) {
@@ -1397,7 +1399,7 @@ mod tests {
 
     #[test]
     fn device_abstraction_surfaces_board_metadata_through_pjrt_objects() {
-        let device = DeviceInfo::from_probe(
+        let device = Device::from_probe(
             0,
             3,
             PathBuf::from("/dev/tenstorrent/3"),
