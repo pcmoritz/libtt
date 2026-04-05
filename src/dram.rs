@@ -14,7 +14,7 @@ const TLB_SIZE_4G: u64 = 1 << 32;
 const DRAM_BARRIER_BASE: usize = 0;
 const DRAM_BARRIER_FLAGS: [u32; 2] = [0xaa, 0xbb];
 
-pub type Shape = Vec<usize>;
+type Shape = Vec<usize>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DType {
@@ -29,7 +29,7 @@ pub enum DType {
 }
 
 impl DType {
-    pub fn bytes_per_element(self) -> usize {
+    pub(crate) fn bytes_per_element(self) -> usize {
         match self {
             Self::Float32 | Self::Int32 | Self::UInt32 => 4,
             Self::Float16 | Self::Float16B | Self::UInt16 => 2,
@@ -37,7 +37,7 @@ impl DType {
         }
     }
 
-    pub fn tile_size(self) -> usize {
+    pub(crate) fn tile_size(self) -> usize {
         TILE_R * TILE_C * self.bytes_per_element()
     }
 }
@@ -52,11 +52,11 @@ pub struct DramBuffer {
 }
 
 impl DramBuffer {
-    pub fn page_size(&self) -> usize {
+    pub(crate) fn page_size(&self) -> usize {
         self.dtype.tile_size()
     }
 
-    pub fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.num_tiles * self.page_size()
     }
 }
@@ -285,7 +285,7 @@ impl Allocator {
     }
 }
 
-pub fn tilize(data: &[u8], dtype: DType, shape: &[usize]) -> io::Result<Vec<u8>> {
+pub(crate) fn tilize(data: &[u8], dtype: DType, shape: &[usize]) -> io::Result<Vec<u8>> {
     let Layout {
         batch,
         rows,
@@ -326,7 +326,7 @@ pub fn tilize(data: &[u8], dtype: DType, shape: &[usize]) -> io::Result<Vec<u8>>
     Ok(out)
 }
 
-pub fn untilize(data: &[u8], dtype: DType, shape: &[usize]) -> io::Result<Vec<u8>> {
+pub(crate) fn untilize(data: &[u8], dtype: DType, shape: &[usize]) -> io::Result<Vec<u8>> {
     let Layout {
         batch,
         rows,

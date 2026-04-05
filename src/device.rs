@@ -1,4 +1,4 @@
-use crate::dram::{Allocator, DType, DramBuffer, Shape};
+use crate::dram::{Allocator, DType, DramBuffer};
 use crate::linux::{NocOrdering, TlbWindow};
 use std::fs;
 use std::io;
@@ -249,20 +249,8 @@ impl Device {
         self.local_hardware_id
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn arch(&self) -> &str {
         &self.arch
-    }
-
-    pub fn harvested_dram_banks(&self) -> &[usize] {
-        &self.harvested_dram_banks
-    }
-
-    pub fn active_dram_banks(&self) -> usize {
-        self.active_dram_banks
     }
 
     pub fn open(local_hardware_id: usize) -> io::Result<Self> {
@@ -274,7 +262,7 @@ impl Device {
         num_tiles: usize,
         dtype: DType,
         name: impl Into<String>,
-        shape: Option<Shape>,
+        shape: Option<Vec<usize>>,
     ) -> io::Result<DramBuffer> {
         self.allocator_mut()?.alloc(num_tiles, dtype, name, shape)
     }
@@ -300,10 +288,6 @@ impl Device {
 
     pub fn dram_read(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
         self.allocator_mut()?.read_host_data(buf)
-    }
-
-    pub fn dram_read_raw_bank_pages(&mut self, addr: u64, page_size: usize) -> io::Result<Vec<u8>> {
-        self.allocator_mut()?.read_raw_bank_pages(addr, page_size)
     }
 
     fn allocator_mut(&mut self) -> io::Result<&mut Allocator> {
