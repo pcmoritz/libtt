@@ -257,16 +257,6 @@ impl Device {
         Ok(load_device(local_hardware_id).1)
     }
 
-    pub fn alloc(
-        &mut self,
-        num_tiles: usize,
-        dtype: DType,
-        name: impl Into<String>,
-        shape: Option<Vec<usize>>,
-    ) -> io::Result<DramBuffer> {
-        self.allocator_mut()?.alloc(num_tiles, dtype, name, shape)
-    }
-
     pub fn alloc_write(
         &mut self,
         data: &[u8],
