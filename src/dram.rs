@@ -10,6 +10,7 @@ const FACE_R: usize = 16;
 const FACE_C: usize = 16;
 const DRAM_TILES_PER_BANK: usize = 3;
 const DRAM_ALIGNMENT: usize = 64;
+const DRAM_ALLOC_BASE: u64 = 0x40;
 const TLB_SIZE_4G: u64 = 1 << 32;
 const DRAM_BARRIER_BASE: usize = 0;
 const DRAM_BARRIER_FLAGS: [u32; 2] = [0xaa, 0xbb];
@@ -106,7 +107,7 @@ impl Allocator {
         Ok(Self {
             window,
             bank_tiles,
-            next: 0x40,
+            next: DRAM_ALLOC_BASE,
             bank_count,
         })
     }
@@ -118,16 +119,9 @@ impl Allocator {
         name: impl Into<String>,
         shape: Option<Shape>,
     ) -> io::Result<DramBuffer> {
-        if self.bank_count == 0 {
-            return Err(io::Error::other("allocator has no active DRAM banks"));
-        }
-
-        let pages_per_bank = num_tiles.div_ceil(self.bank_count);
-        let addr = self.next;
-        self.next = align_up(
-            addr + (pages_per_bank as u64) * (dtype.tile_size() as u64),
-            DRAM_ALIGNMENT as u64,
-        );
+        let (addr, next) =
+            next_allocation_range(self.next, num_tiles, dtype, self.bank_count)?;
+        self.next = next;
         Ok(DramBuffer {
             name: name.into(),
             addr,
@@ -405,6 +399,28 @@ fn validate_tile_multiple(len: usize, dtype: DType) -> io::Result<()> {
     }
 }
 
+fn next_allocation_range(
+    next: u64,
+    num_tiles: usize,
+    dtype: DType,
+    bank_count: usize,
+) -> io::Result<(u64, u64)> {
+    let pages_per_bank = num_tiles.div_ceil(bank_count);
+    let allocation_size = (pages_per_bank as u64)
+        .checked_mul(dtype.tile_size() as u64)
+        .ok_or_else(|| io::Error::other("dram allocation size overflow"))?;
+    let end = next
+        .checked_add(allocation_size)
+        .ok_or_else(|| io::Error::other("dram allocation address overflow"))?;
+    let aligned_end = align_up(end, DRAM_ALIGNMENT as u64);
+    if aligned_end > TLB_SIZE_4G {
+        return Err(io::Error::other(format!(
+            "dram allocation exceeds per-bank address space: end=0x{aligned_end:x} limit=0x{TLB_SIZE_4G:x}"
+        )));
+    }
+    Ok((next, aligned_end))
+}
+
 fn align_up(value: u64, align: u64) -> u64 {
     value.div_ceil(align) * align
 }
@@ -531,7 +547,7 @@ mod tests {
     fn buffer_size_matches_tile_count() {
         let buffer = DramBuffer {
             name: "weights".to_owned(),
-            addr: 0x40,
+            addr: DRAM_ALLOC_BASE,
             num_tiles: 3,
             dtype: DType::Float16,
             shape: Some(vec![32, 96]),
@@ -554,5 +570,12 @@ mod tests {
         scatter_bank_data(&mut out, 2, 0, 2, &[0, 1, 4, 5, 8, 9]);
         scatter_bank_data(&mut out, 2, 1, 2, &[2, 3, 6, 7]);
         assert_eq!(out, (0u8..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn allocation_range_errors_when_capacity_is_exceeded() {
+        let err = next_allocation_range(TLB_SIZE_4G, 1, DType::Float16, 1)
+            .expect_err("allocation should exceed the per-bank address space");
+        assert!(err.to_string().contains("exceeds per-bank address space"));
     }
 }
