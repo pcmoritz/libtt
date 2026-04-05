@@ -330,17 +330,6 @@ pub struct PJRT_Client_AddressableMemories_Args {
 }
 
 #[repr(C)]
-pub struct PJRT_Client_Compile_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub program: *const c_void,
-    pub compile_options: *const c_char,
-    pub compile_options_size: usize,
-    pub executable: *mut c_void,
-}
-
-#[repr(C)]
 pub struct PJRT_Client_DefaultDeviceAssignment_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -550,14 +539,6 @@ pub struct PJRT_Buffer_DynamicDimensionIndices_Args {
 }
 
 #[repr(C)]
-pub struct PJRT_Buffer_GetMemoryLayout_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub layout: *mut PJRT_Buffer_MemoryLayout,
-}
-
-#[repr(C)]
 pub struct PJRT_Buffer_OnDeviceSizeInBytes_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -597,15 +578,6 @@ pub struct PJRT_Buffer_IsDeleted_Args {
 }
 
 #[repr(C)]
-pub struct PJRT_Buffer_CopyToDevice_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub dst_device: *mut PJRT_Device,
-    pub dst_buffer: *mut PJRT_Buffer,
-}
-
-#[repr(C)]
 pub struct PJRT_Buffer_ToHostBuffer_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -633,14 +605,6 @@ pub struct PJRT_Buffer_ReadyEvent_Args {
 }
 
 #[repr(C)]
-pub struct PJRT_Buffer_UnsafePointer_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub buffer_pointer: usize,
-}
-
-#[repr(C)]
 pub struct PJRT_Buffer_IncreaseExternalReferenceCount_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -654,15 +618,6 @@ pub struct PJRT_Buffer_DecreaseExternalReferenceCount_Args {
     pub buffer: *mut PJRT_Buffer,
 }
 
-#[repr(C)]
-pub struct PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub device_memory_ptr: *mut c_void,
-}
-
-#[repr(C)]
 pub struct PJRT_TopologyDescription_PlatformName_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -724,7 +679,7 @@ pub struct PJRT_Api {
     pub PJRT_Client_LookupAddressableDevice:
         PjrtResultFn<PJRT_Client_LookupAddressableDevice_Args>,
     pub PJRT_Client_AddressableMemories: PjrtResultFn<PJRT_Client_AddressableMemories_Args>,
-    pub PJRT_Client_Compile: PjrtResultFn<PJRT_Client_Compile_Args>,
+    pub PJRT_Client_Compile: PjrtOpaqueFn,
     pub PJRT_Client_DefaultDeviceAssignment:
         PjrtResultFn<PJRT_Client_DefaultDeviceAssignment_Args>,
     pub PJRT_Client_BufferFromHostBuffer: PjrtResultFn<PJRT_Client_BufferFromHostBuffer_Args>,
@@ -753,23 +708,22 @@ pub struct PJRT_Api {
     pub PJRT_Buffer_UnpaddedDimensions: PjrtResultFn<PJRT_Buffer_UnpaddedDimensions_Args>,
     pub PJRT_Buffer_DynamicDimensionIndices:
         PjrtResultFn<PJRT_Buffer_DynamicDimensionIndices_Args>,
-    pub PJRT_Buffer_GetMemoryLayout: PjrtResultFn<PJRT_Buffer_GetMemoryLayout_Args>,
+    pub PJRT_Buffer_GetMemoryLayout: PjrtOpaqueFn,
     pub PJRT_Buffer_OnDeviceSizeInBytes: PjrtResultFn<PJRT_Buffer_OnDeviceSizeInBytes_Args>,
     pub PJRT_Buffer_Device: PjrtResultFn<PJRT_Buffer_Device_Args>,
     pub PJRT_Buffer_Memory: PjrtResultFn<PJRT_Buffer_Memory_Args>,
     pub PJRT_Buffer_Delete: PjrtResultFn<PJRT_Buffer_Delete_Args>,
     pub PJRT_Buffer_IsDeleted: PjrtResultFn<PJRT_Buffer_IsDeleted_Args>,
-    pub PJRT_Buffer_CopyToDevice: PjrtResultFn<PJRT_Buffer_CopyToDevice_Args>,
+    pub PJRT_Buffer_CopyToDevice: PjrtOpaqueFn,
     pub PJRT_Buffer_ToHostBuffer: PjrtResultFn<PJRT_Buffer_ToHostBuffer_Args>,
     pub PJRT_Buffer_IsOnCpu: PjrtResultFn<PJRT_Buffer_IsOnCpu_Args>,
     pub PJRT_Buffer_ReadyEvent: PjrtResultFn<PJRT_Buffer_ReadyEvent_Args>,
-    pub PJRT_Buffer_UnsafePointer: PjrtResultFn<PJRT_Buffer_UnsafePointer_Args>,
+    pub PJRT_Buffer_UnsafePointer: PjrtOpaqueFn,
     pub PJRT_Buffer_IncreaseExternalReferenceCount:
         PjrtResultFn<PJRT_Buffer_IncreaseExternalReferenceCount_Args>,
     pub PJRT_Buffer_DecreaseExternalReferenceCount:
         PjrtResultFn<PJRT_Buffer_DecreaseExternalReferenceCount_Args>,
-    pub PJRT_Buffer_OpaqueDeviceMemoryDataPointer:
-        PjrtResultFn<PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args>,
+    pub PJRT_Buffer_OpaqueDeviceMemoryDataPointer: PjrtOpaqueFn,
     unused_copy_to_device_stream: [PjrtOpaqueFn; 5],
     unused_topology_create_destroy: [PjrtOpaqueFn; 2],
     pub PJRT_TopologyDescription_PlatformName:
