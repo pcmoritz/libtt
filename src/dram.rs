@@ -573,6 +573,21 @@ mod tests {
     }
 
     #[test]
+    fn collect_and_scatter_bank_data_roundtrip() {
+        let input = (0u8..17).collect::<Vec<_>>();
+        let page_size = 3;
+        let bank_count = 3;
+        let mut out = vec![0u8; input.len()];
+
+        for bank_index in 0..bank_count {
+            let bank_data = collect_bank_data(&input, page_size, bank_index, bank_count);
+            scatter_bank_data(&mut out, page_size, bank_index, bank_count, &bank_data);
+        }
+
+        assert_eq!(out, input);
+    }
+
+    #[test]
     fn allocation_range_errors_when_capacity_is_exceeded() {
         let err = next_allocation_range(TLB_SIZE_4G, 1, DType::Float16, 1)
             .expect_err("allocation should exceed the per-bank address space");
