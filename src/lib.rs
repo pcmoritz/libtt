@@ -3,15 +3,16 @@
 pub mod device;
 pub mod dram;
 mod linux;
+mod log;
 
 use device::Device;
 use dram::{DType, DramBuffer};
+use log::log;
 use std::ffi::{CString, c_char, c_void};
 use std::io;
 use std::mem::size_of;
 use std::ptr;
 use std::slice;
-use std::sync::OnceLock;
 
 const PJRT_API_MAJOR: i32 = 0;
 const PJRT_API_MINOR: i32 = 96;
@@ -893,21 +894,6 @@ fn resource_exhausted(message: impl AsRef<str>) -> *mut PJRT_Error {
     pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_RESOURCE_EXHAUSTED)
 }
 
-fn lib_log_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("LIBTT_LOG")
-            .map(|value| !value.is_empty() && value != "0")
-            .unwrap_or(false)
-    })
-}
-
-fn lib_log(message: impl std::fmt::Display) {
-    if lib_log_enabled() {
-        eprintln!("[libtt] {message}");
-    }
-}
-
 fn io_error(err: io::Error) -> *mut PJRT_Error {
     let code = match err.kind() {
         io::ErrorKind::InvalidInput => PJRT_Error_Code::PJRT_Error_Code_INVALID_ARGUMENT,
@@ -1416,7 +1402,7 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    lib_log("pjrt buffer_from_host_buffer entered");
+    log("pjrt buffer_from_host_buffer entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -1485,7 +1471,7 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         Ok(device) => device.local_hardware_id as usize,
         Err(err) => return err,
     };
-    lib_log(format!(
+    log(format!(
         "pjrt buffer_from_host_buffer type={} dims={:?} local_hardware_id={}",
         args.type_, dims_i64, local_hardware_id
     ));
@@ -1500,12 +1486,12 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         Ok(device) => device,
         Err(err) => return io_error(err),
     };
-    lib_log("pjrt buffer_from_host_buffer device opened");
+    log("pjrt buffer_from_host_buffer device opened");
     let dram_buffer = match device.alloc_write(data, dtype, &shape, "pjrt") {
         Ok(buffer) => buffer,
         Err(err) => return io_error(err),
     };
-    lib_log(format!(
+    log(format!(
         "pjrt buffer_from_host_buffer allocated addr=0x{:x} tiles={}",
         dram_buffer.addr, dram_buffer.num_tiles
     ));
@@ -1950,7 +1936,7 @@ pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    lib_log("pjrt buffer_to_host_buffer entered");
+    log("pjrt buffer_to_host_buffer entered");
     let Ok(buffer) = (unsafe { checked_ref(args.src, "src") }) else {
         return invalid_argument("src must not be null");
     };
