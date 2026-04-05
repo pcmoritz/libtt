@@ -241,10 +241,6 @@ impl Device {
         format!("tt:{}:memory:{}", self.arch, self.id)
     }
 
-    pub fn id(&self) -> usize {
-        self.id
-    }
-
     pub fn local_hardware_id(&self) -> usize {
         self.local_hardware_id
     }

@@ -244,27 +244,6 @@ impl Allocator {
         }
     }
 
-    pub fn read_raw_bank_pages(&mut self, addr: u64, page_size: usize) -> io::Result<Vec<u8>> {
-        let mut result = vec![0u8; page_size * self.bank_tiles.len()];
-
-        for (bank_index, tile) in self.bank_tiles.iter().enumerate() {
-            self.window.target(
-                CoreCoord {
-                    x: tile.x,
-                    y: tile.y,
-                },
-                None,
-                0,
-                NocOrdering::Relaxed,
-            )?;
-            let bank_data = self.window.read(addr as usize, page_size)?;
-            let offset = bank_index * page_size;
-            result[offset..offset + page_size].copy_from_slice(&bank_data);
-        }
-
-        Ok(result)
-    }
-
     fn barrier(&mut self) -> io::Result<()> {
         for flag in DRAM_BARRIER_FLAGS {
             for tile in &self.bank_tiles {
