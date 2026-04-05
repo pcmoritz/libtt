@@ -1,21 +1,39 @@
-#![allow(non_camel_case_types, non_snake_case)]
+#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
 pub mod device;
 pub mod dram;
 mod linux;
 
 use device::Device;
+use dram::{DType, DramBuffer};
 use std::ffi::{CString, c_char, c_void};
+use std::io;
 use std::mem::size_of;
 use std::ptr;
+use std::slice;
 
 const PJRT_API_MAJOR: i32 = 0;
 const PJRT_API_MINOR: i32 = 96;
 const PJRT_API_UNUSED_TAIL_SLOTS: usize = 35;
+const PJRT_Buffer_Type_INVALID: i32 = 0;
+const PJRT_Buffer_Type_S8: i32 = 2;
+const PJRT_Buffer_Type_S32: i32 = 4;
+const PJRT_Buffer_Type_U8: i32 = 6;
+const PJRT_Buffer_Type_U16: i32 = 7;
+const PJRT_Buffer_Type_U32: i32 = 8;
+const PJRT_Buffer_Type_F16: i32 = 10;
+const PJRT_Buffer_Type_F32: i32 = 11;
+const PJRT_Buffer_Type_BF16: i32 = 13;
+const PJRT_HostBufferSemantics_kImmutableOnlyDuringCall: i32 = 0;
+const PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes: i32 = 1;
+const PJRT_HostBufferSemantics_kImmutableZeroCopy: i32 = 2;
+const PJRT_HostBufferSemantics_kMutableZeroCopy: i32 = 3;
 
 type PjrtOpaqueFn = Option<unsafe extern "C" fn()>;
 type PjrtResultFn<Args> = Option<unsafe extern "C" fn(args: *mut Args) -> *mut PJRT_Error>;
 type PjrtVoidFn<Args> = Option<unsafe extern "C" fn(args: *mut Args)>;
+type PjrtEventOnReadyCallback =
+    Option<unsafe extern "C" fn(error: *mut PJRT_Error, user_arg: *mut c_void)>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +109,27 @@ pub struct PJRT_Device {
 }
 
 #[repr(C)]
+pub struct PJRT_Event {
+    error: Option<(PJRT_Error_Code, String)>,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_MemoryLayout {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer {
+    buffer_type: i32,
+    dims: Vec<i64>,
+    device: *mut PJRT_Device,
+    memory: *mut PJRT_Memory,
+    local_hardware_id: usize,
+    dram_buffer: Option<DramBuffer>,
+    deleted: bool,
+}
+
+#[repr(C)]
 pub struct PJRT_Client {
     platform_name: CString,
     platform_version: CString,
@@ -147,6 +186,44 @@ pub struct PJRT_Plugin_Attributes_Args {
     pub extension_start: *mut PJRT_Extension_Base,
     pub attributes: *const PJRT_NamedValue,
     pub num_attributes: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Event_Destroy_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub event: *mut PJRT_Event,
+}
+
+#[repr(C)]
+pub struct PJRT_Event_IsReady_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub event: *mut PJRT_Event,
+    pub is_ready: bool,
+}
+
+#[repr(C)]
+pub struct PJRT_Event_Error_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub event: *mut PJRT_Event,
+}
+
+#[repr(C)]
+pub struct PJRT_Event_Await_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub event: *mut PJRT_Event,
+}
+
+#[repr(C)]
+pub struct PJRT_Event_OnReady_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub event: *mut PJRT_Event,
+    pub callback: PjrtEventOnReadyCallback,
+    pub user_arg: *mut c_void,
 }
 
 #[repr(C)]
@@ -248,6 +325,47 @@ pub struct PJRT_Client_AddressableMemories_Args {
     pub client: *mut PJRT_Client,
     pub addressable_memories: *const *mut c_void,
     pub num_addressable_memories: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Client_Compile_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub client: *mut PJRT_Client,
+    pub program: *const c_void,
+    pub compile_options: *const c_char,
+    pub compile_options_size: usize,
+    pub executable: *mut c_void,
+}
+
+#[repr(C)]
+pub struct PJRT_Client_DefaultDeviceAssignment_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub client: *mut PJRT_Client,
+    pub num_replicas: i32,
+    pub num_partitions: i32,
+    pub default_assignment_size: usize,
+    pub default_assignment: *mut i32,
+}
+
+#[repr(C)]
+pub struct PJRT_Client_BufferFromHostBuffer_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub client: *mut PJRT_Client,
+    pub data: *const c_void,
+    pub type_: i32,
+    pub dims: *const i64,
+    pub num_dims: usize,
+    pub byte_strides: *const i64,
+    pub num_byte_strides: usize,
+    pub host_buffer_semantics: i32,
+    pub device: *mut PJRT_Device,
+    pub memory: *mut PJRT_Memory,
+    pub device_layout: *mut PJRT_Buffer_MemoryLayout,
+    pub done_with_host_buffer: *mut PJRT_Event,
+    pub buffer: *mut PJRT_Buffer,
 }
 
 #[repr(C)]
@@ -388,6 +506,161 @@ pub struct PJRT_Memory_AddressableByDevices_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_Buffer_Destroy_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_ElementType_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub type_: i32,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_Dimensions_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub dims: *const i64,
+    pub num_dims: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_UnpaddedDimensions_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub dims: *const i64,
+    pub num_dims: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_DynamicDimensionIndices_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub dynamic_dimension_indices: *const bool,
+    pub num_dynamic_dimension_indices: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_GetMemoryLayout_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub layout: *mut PJRT_Buffer_MemoryLayout,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_OnDeviceSizeInBytes_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub on_device_size_in_bytes: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_Device_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub device: *mut PJRT_Device,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_Memory_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub memory: *mut PJRT_Memory,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_Delete_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_IsDeleted_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub is_deleted: bool,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_CopyToDevice_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub dst_device: *mut PJRT_Device,
+    pub dst_buffer: *mut PJRT_Buffer,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_ToHostBuffer_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub src: *mut PJRT_Buffer,
+    pub host_layout: *mut PJRT_Buffer_MemoryLayout,
+    pub dst: *mut c_void,
+    pub dst_size: usize,
+    pub event: *mut PJRT_Event,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_IsOnCpu_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub is_on_cpu: bool,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_ReadyEvent_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub event: *mut PJRT_Event,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_UnsafePointer_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub buffer_pointer: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_IncreaseExternalReferenceCount_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_DecreaseExternalReferenceCount_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub device_memory_ptr: *mut c_void,
+}
+
+#[repr(C)]
 pub struct PJRT_TopologyDescription_PlatformName_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -433,7 +706,11 @@ pub struct PJRT_Api {
     pub PJRT_Error_GetCode: PjrtResultFn<PJRT_Error_GetCode_Args>,
     pub PJRT_Plugin_Initialize: PjrtResultFn<PJRT_Plugin_Initialize_Args>,
     pub PJRT_Plugin_Attributes: PjrtResultFn<PJRT_Plugin_Attributes_Args>,
-    unused_events: [PjrtOpaqueFn; 5],
+    pub PJRT_Event_Destroy: PjrtResultFn<PJRT_Event_Destroy_Args>,
+    pub PJRT_Event_IsReady: PjrtResultFn<PJRT_Event_IsReady_Args>,
+    pub PJRT_Event_Error: PjrtResultFn<PJRT_Event_Error_Args>,
+    pub PJRT_Event_Await: PjrtResultFn<PJRT_Event_Await_Args>,
+    pub PJRT_Event_OnReady: PjrtResultFn<PJRT_Event_OnReady_Args>,
     pub PJRT_Client_Create: PjrtResultFn<PJRT_Client_Create_Args>,
     pub PJRT_Client_Destroy: PjrtResultFn<PJRT_Client_Destroy_Args>,
     pub PJRT_Client_PlatformName: PjrtResultFn<PJRT_Client_PlatformName_Args>,
@@ -445,7 +722,10 @@ pub struct PJRT_Api {
     pub PJRT_Client_LookupAddressableDevice:
         PjrtResultFn<PJRT_Client_LookupAddressableDevice_Args>,
     pub PJRT_Client_AddressableMemories: PjrtResultFn<PJRT_Client_AddressableMemories_Args>,
-    unused_client_rest: [PjrtOpaqueFn; 3],
+    pub PJRT_Client_Compile: PjrtResultFn<PJRT_Client_Compile_Args>,
+    pub PJRT_Client_DefaultDeviceAssignment:
+        PjrtResultFn<PJRT_Client_DefaultDeviceAssignment_Args>,
+    pub PJRT_Client_BufferFromHostBuffer: PjrtResultFn<PJRT_Client_BufferFromHostBuffer_Args>,
     pub PJRT_DeviceDescription_Id: PjrtResultFn<PJRT_DeviceDescription_Id_Args>,
     pub PJRT_DeviceDescription_ProcessIndex: PjrtResultFn<PJRT_DeviceDescription_ProcessIndex_Args>,
     pub PJRT_DeviceDescription_Attributes: PjrtResultFn<PJRT_DeviceDescription_Attributes_Args>,
@@ -463,7 +743,32 @@ pub struct PJRT_Api {
     pub PJRT_Memory_DebugString: PjrtResultFn<PJRT_Memory_DebugString_Args>,
     pub PJRT_Memory_ToString: PjrtResultFn<PJRT_Memory_ToString_Args>,
     pub PJRT_Memory_AddressableByDevices: PjrtResultFn<PJRT_Memory_AddressableByDevices_Args>,
-    unused_before_topology: [PjrtOpaqueFn; 42],
+    unused_executable: [PjrtOpaqueFn; 10],
+    unused_loaded_executable: [PjrtOpaqueFn; 8],
+    pub PJRT_Buffer_Destroy: PjrtResultFn<PJRT_Buffer_Destroy_Args>,
+    pub PJRT_Buffer_ElementType: PjrtResultFn<PJRT_Buffer_ElementType_Args>,
+    pub PJRT_Buffer_Dimensions: PjrtResultFn<PJRT_Buffer_Dimensions_Args>,
+    pub PJRT_Buffer_UnpaddedDimensions: PjrtResultFn<PJRT_Buffer_UnpaddedDimensions_Args>,
+    pub PJRT_Buffer_DynamicDimensionIndices:
+        PjrtResultFn<PJRT_Buffer_DynamicDimensionIndices_Args>,
+    pub PJRT_Buffer_GetMemoryLayout: PjrtResultFn<PJRT_Buffer_GetMemoryLayout_Args>,
+    pub PJRT_Buffer_OnDeviceSizeInBytes: PjrtResultFn<PJRT_Buffer_OnDeviceSizeInBytes_Args>,
+    pub PJRT_Buffer_Device: PjrtResultFn<PJRT_Buffer_Device_Args>,
+    pub PJRT_Buffer_Memory: PjrtResultFn<PJRT_Buffer_Memory_Args>,
+    pub PJRT_Buffer_Delete: PjrtResultFn<PJRT_Buffer_Delete_Args>,
+    pub PJRT_Buffer_IsDeleted: PjrtResultFn<PJRT_Buffer_IsDeleted_Args>,
+    pub PJRT_Buffer_CopyToDevice: PjrtResultFn<PJRT_Buffer_CopyToDevice_Args>,
+    pub PJRT_Buffer_ToHostBuffer: PjrtResultFn<PJRT_Buffer_ToHostBuffer_Args>,
+    pub PJRT_Buffer_IsOnCpu: PjrtResultFn<PJRT_Buffer_IsOnCpu_Args>,
+    pub PJRT_Buffer_ReadyEvent: PjrtResultFn<PJRT_Buffer_ReadyEvent_Args>,
+    pub PJRT_Buffer_UnsafePointer: PjrtResultFn<PJRT_Buffer_UnsafePointer_Args>,
+    pub PJRT_Buffer_IncreaseExternalReferenceCount:
+        PjrtResultFn<PJRT_Buffer_IncreaseExternalReferenceCount_Args>,
+    pub PJRT_Buffer_DecreaseExternalReferenceCount:
+        PjrtResultFn<PJRT_Buffer_DecreaseExternalReferenceCount_Args>,
+    pub PJRT_Buffer_OpaqueDeviceMemoryDataPointer:
+        PjrtResultFn<PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args>,
+    unused_copy_to_device_stream: [PjrtOpaqueFn; 5],
     unused_topology_create_destroy: [PjrtOpaqueFn; 2],
     pub PJRT_TopologyDescription_PlatformName:
         PjrtResultFn<PJRT_TopologyDescription_PlatformName_Args>,
@@ -579,6 +884,40 @@ fn invalid_argument(message: impl AsRef<str>) -> *mut PJRT_Error {
     pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INVALID_ARGUMENT)
 }
 
+fn unimplemented(message: impl AsRef<str>) -> *mut PJRT_Error {
+    pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED)
+}
+
+fn resource_exhausted(message: impl AsRef<str>) -> *mut PJRT_Error {
+    pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_RESOURCE_EXHAUSTED)
+}
+
+fn io_error(err: io::Error) -> *mut PJRT_Error {
+    let code = match err.kind() {
+        io::ErrorKind::InvalidInput => PJRT_Error_Code::PJRT_Error_Code_INVALID_ARGUMENT,
+        io::ErrorKind::OutOfMemory => PJRT_Error_Code::PJRT_Error_Code_RESOURCE_EXHAUSTED,
+        _ => PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
+    };
+    pjrt_error(err.to_string(), code)
+}
+
+fn ready_event() -> *mut PJRT_Event {
+    Box::into_raw(Box::new(PJRT_Event { error: None }))
+}
+
+fn event_with_error(code: PJRT_Error_Code, message: impl Into<String>) -> *mut PJRT_Event {
+    Box::into_raw(Box::new(PJRT_Event {
+        error: Some((code, message.into())),
+    }))
+}
+
+fn cloned_event_error(event: &PJRT_Event) -> *mut PJRT_Error {
+    match &event.error {
+        Some((code, message)) => pjrt_error(message, *code),
+        None => ptr::null_mut(),
+    }
+}
+
 unsafe fn checked_mut<'a, T>(ptr: *mut T, name: &str) -> Result<&'a mut T, *mut PJRT_Error> {
     // SAFETY: caller guarantees `ptr` originates from the C ABI.
     unsafe { ptr.as_mut() }.ok_or_else(|| invalid_argument(format!("{name} must not be null")))
@@ -587,6 +926,102 @@ unsafe fn checked_mut<'a, T>(ptr: *mut T, name: &str) -> Result<&'a mut T, *mut 
 unsafe fn checked_ref<'a, T>(ptr: *const T, name: &str) -> Result<&'a T, *mut PJRT_Error> {
     // SAFETY: caller guarantees `ptr` originates from the C ABI.
     unsafe { ptr.as_ref() }.ok_or_else(|| invalid_argument(format!("{name} must not be null")))
+}
+
+fn pjrt_buffer_type_to_dtype(buffer_type: i32) -> Result<DType, *mut PJRT_Error> {
+    match buffer_type {
+        PJRT_Buffer_Type_S8 => Ok(DType::Int8),
+        PJRT_Buffer_Type_S32 => Ok(DType::Int32),
+        PJRT_Buffer_Type_U8 => Ok(DType::UInt8),
+        PJRT_Buffer_Type_U16 => Ok(DType::UInt16),
+        PJRT_Buffer_Type_U32 => Ok(DType::UInt32),
+        PJRT_Buffer_Type_F16 => Ok(DType::Float16),
+        PJRT_Buffer_Type_F32 => Ok(DType::Float32),
+        PJRT_Buffer_Type_BF16 => Ok(DType::Float16B),
+        PJRT_Buffer_Type_INVALID => Err(invalid_argument("invalid PJRT buffer type")),
+        _ => Err(unimplemented(format!(
+            "unsupported PJRT buffer type {buffer_type}"
+        ))),
+    }
+}
+
+fn dtype_to_pjrt_buffer_type(dtype: DType) -> i32 {
+    match dtype {
+        DType::Int8 => PJRT_Buffer_Type_S8,
+        DType::Int32 => PJRT_Buffer_Type_S32,
+        DType::UInt8 => PJRT_Buffer_Type_U8,
+        DType::UInt16 => PJRT_Buffer_Type_U16,
+        DType::UInt32 => PJRT_Buffer_Type_U32,
+        DType::Float16 => PJRT_Buffer_Type_F16,
+        DType::Float32 => PJRT_Buffer_Type_F32,
+        DType::Float16B => PJRT_Buffer_Type_BF16,
+    }
+}
+
+fn dims_i64_to_usize(dims: &[i64]) -> Result<Vec<usize>, *mut PJRT_Error> {
+    dims.iter()
+        .map(|&dim| {
+            usize::try_from(dim).map_err(|_| invalid_argument("shape dimensions must be >= 0"))
+        })
+        .collect()
+}
+
+fn checked_dims(ptr: *const i64, len: usize) -> Result<&'static [i64], *mut PJRT_Error> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err(invalid_argument("dims must not be null when num_dims > 0"));
+    }
+    // SAFETY: caller owns `ptr` for `len` elements during the call.
+    Ok(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+fn host_byte_size(dtype: DType, dims: &[usize]) -> Result<usize, *mut PJRT_Error> {
+    dims.iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .and_then(|elements| elements.checked_mul(dtype.bytes_per_element()))
+        .ok_or_else(|| resource_exhausted("host buffer size overflow"))
+}
+
+fn validate_dense_row_major_strides(
+    dtype: DType,
+    dims: &[usize],
+    byte_strides: *const i64,
+    num_byte_strides: usize,
+) -> Result<(), *mut PJRT_Error> {
+    if byte_strides.is_null() && num_byte_strides == 0 {
+        return Ok(());
+    }
+    if num_byte_strides != dims.len() {
+        return Err(invalid_argument(
+            "num_byte_strides must match num_dims for strided host buffers",
+        ));
+    }
+    let strides = checked_dims(byte_strides, num_byte_strides)?;
+    let mut expected = dtype.bytes_per_element();
+    for (&dim, &stride) in dims.iter().rev().zip(strides.iter().rev()) {
+        let stride = usize::try_from(stride)
+            .map_err(|_| invalid_argument("byte strides must be >= 0"))?;
+        if stride != expected {
+            return Err(unimplemented("only dense row-major host buffers are supported"));
+        }
+        expected = expected
+            .checked_mul(dim.max(1))
+            .ok_or_else(|| resource_exhausted("byte stride overflow"))?;
+    }
+    Ok(())
+}
+
+fn event_for_buffer(buffer: &PJRT_Buffer) -> *mut PJRT_Event {
+    if buffer.deleted {
+        event_with_error(
+            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+            "buffer has been deleted",
+        )
+    } else {
+        ready_event()
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -648,6 +1083,77 @@ pub unsafe extern "C" fn TT_Plugin_Attributes(
     };
     args.attributes = ptr::null();
     args.num_attributes = 0;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Event_Destroy(args: *mut PJRT_Event_Destroy_Args) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if !args.event.is_null() {
+        // SAFETY: `event` is allocated by `ready_event` or `event_with_error`.
+        unsafe {
+            drop(Box::from_raw(args.event));
+        }
+        args.event = ptr::null_mut();
+    }
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Event_IsReady(
+    args: *mut PJRT_Event_IsReady_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(_event) = (unsafe { checked_ref(args.event, "event") }) else {
+        return invalid_argument("event must not be null");
+    };
+    args.is_ready = true;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Event_Error(args: *mut PJRT_Event_Error_Args) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(event) = (unsafe { checked_ref(args.event, "event") }) else {
+        return invalid_argument("event must not be null");
+    };
+    cloned_event_error(event)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Event_Await(args: *mut PJRT_Event_Await_Args) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(event) = (unsafe { checked_ref(args.event, "event") }) else {
+        return invalid_argument("event must not be null");
+    };
+    cloned_event_error(event)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Event_OnReady(
+    args: *mut PJRT_Event_OnReady_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(event) = (unsafe { checked_ref(args.event, "event") }) else {
+        return invalid_argument("event must not be null");
+    };
+    let Some(callback) = args.callback else {
+        return invalid_argument("callback must not be null");
+    };
+    // SAFETY: `callback` originates from the caller and accepts ownership of the error.
+    unsafe {
+        callback(cloned_event_error(event), args.user_arg);
+    }
     ptr::null_mut()
 }
 
@@ -832,6 +1338,162 @@ pub unsafe extern "C" fn TT_Client_AddressableMemories(
         client.memory_ptrs.as_ptr().cast::<*mut c_void>()
     };
     args.num_addressable_memories = client.memory_ptrs.len();
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Client_Compile(
+    args: *mut PJRT_Client_Compile_Args,
+) -> *mut PJRT_Error {
+    if args.is_null() {
+        return invalid_argument("args must not be null");
+    }
+    unimplemented("PJRT_Client_Compile is not implemented")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Client_DefaultDeviceAssignment(
+    args: *mut PJRT_Client_DefaultDeviceAssignment_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
+        return invalid_argument("client must not be null");
+    };
+    if args.num_replicas < 0 || args.num_partitions < 0 {
+        return invalid_argument("num_replicas and num_partitions must be >= 0");
+    }
+    let required = usize::try_from(args.num_replicas)
+        .ok()
+        .and_then(|replicas| {
+            usize::try_from(args.num_partitions)
+                .ok()
+                .and_then(|partitions| replicas.checked_mul(partitions))
+        })
+        .ok_or_else(|| invalid_argument("default device assignment is too large"));
+    let Ok(required) = required else {
+        return invalid_argument("default device assignment is too large");
+    };
+    if args.default_assignment_size < required {
+        return invalid_argument("default_assignment buffer is too small");
+    }
+    if required > 0 && args.default_assignment.is_null() {
+        return invalid_argument("default_assignment must not be null");
+    }
+    if required > client.device_ptrs.len() {
+        return invalid_argument("not enough devices for requested assignment");
+    }
+    for index in 0..required {
+        // SAFETY: caller owns `default_assignment` for `default_assignment_size` entries.
+        unsafe {
+            *args.default_assignment.add(index) = index as i32;
+        }
+    }
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
+    args: *mut PJRT_Client_BufferFromHostBuffer_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
+        return invalid_argument("client must not be null");
+    };
+    if !args.device_layout.is_null() {
+        return unimplemented("custom device layouts are not supported");
+    }
+    match args.host_buffer_semantics {
+        PJRT_HostBufferSemantics_kImmutableOnlyDuringCall
+        | PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes
+        | PJRT_HostBufferSemantics_kImmutableZeroCopy
+        | PJRT_HostBufferSemantics_kMutableZeroCopy => {}
+        _ => return invalid_argument("unknown host buffer semantics"),
+    }
+
+    let dtype = match pjrt_buffer_type_to_dtype(args.type_) {
+        Ok(dtype) => dtype,
+        Err(err) => return err,
+    };
+    let dims_i64 = match checked_dims(args.dims, args.num_dims) {
+        Ok(dims) => dims,
+        Err(err) => return err,
+    };
+    let shape = match dims_i64_to_usize(dims_i64) {
+        Ok(shape) => shape,
+        Err(err) => return err,
+    };
+    if let Err(err) =
+        validate_dense_row_major_strides(dtype, &shape, args.byte_strides, args.num_byte_strides)
+    {
+        return err;
+    }
+    let byte_size = match host_byte_size(dtype, &shape) {
+        Ok(size) => size,
+        Err(err) => return err,
+    };
+    if byte_size > 0 && args.data.is_null() {
+        return invalid_argument("data must not be null");
+    }
+
+    let target_device = if !args.device.is_null() {
+        args.device
+    } else if !args.memory.is_null() {
+        match unsafe { checked_ref(args.memory, "memory") } {
+            Ok(memory) => memory.device_ptrs.first().copied().unwrap_or(ptr::null_mut()),
+            Err(err) => return err,
+        }
+    } else {
+        client
+            .addressable_device_ptrs
+            .first()
+            .copied()
+            .unwrap_or(ptr::null_mut())
+    };
+    if target_device.is_null() {
+        return invalid_argument("no target device available");
+    }
+    let target_memory = if !args.memory.is_null() {
+        args.memory
+    } else {
+        match unsafe { checked_ref(target_device, "device") } {
+            Ok(device) => device.default_memory,
+            Err(err) => return err,
+        }
+    };
+    let local_hardware_id = match unsafe { checked_ref(target_device, "device") } {
+        Ok(device) => device.local_hardware_id as usize,
+        Err(err) => return err,
+    };
+
+    let data = if byte_size == 0 {
+        &[]
+    } else {
+        // SAFETY: caller owns `data` for `byte_size` bytes during the call.
+        unsafe { slice::from_raw_parts(args.data.cast::<u8>(), byte_size) }
+    };
+    let mut device = match Device::open(local_hardware_id) {
+        Ok(device) => device,
+        Err(err) => return io_error(err),
+    };
+    let dram_buffer = match device.alloc_write(data, dtype, &shape, "pjrt") {
+        Ok(buffer) => buffer,
+        Err(err) => return io_error(err),
+    };
+
+    args.done_with_host_buffer = ready_event();
+    args.buffer = Box::into_raw(Box::new(PJRT_Buffer {
+        buffer_type: dtype_to_pjrt_buffer_type(dram_buffer.dtype),
+        dims: dims_i64.to_vec(),
+        device: target_device,
+        memory: target_memory,
+        local_hardware_id,
+        dram_buffer: Some(dram_buffer),
+        deleted: false,
+    }));
     ptr::null_mut()
 }
 
@@ -1078,6 +1740,303 @@ pub unsafe extern "C" fn TT_Memory_AddressableByDevices(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_Destroy(
+    args: *mut PJRT_Buffer_Destroy_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if !args.buffer.is_null() {
+        // SAFETY: `buffer` is allocated by `TT_Client_BufferFromHostBuffer`.
+        unsafe {
+            drop(Box::from_raw(args.buffer));
+        }
+        args.buffer = ptr::null_mut();
+    }
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_ElementType(
+    args: *mut PJRT_Buffer_ElementType_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    args.type_ = buffer.buffer_type;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_Dimensions(
+    args: *mut PJRT_Buffer_Dimensions_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    args.dims = if buffer.dims.is_empty() {
+        ptr::null()
+    } else {
+        buffer.dims.as_ptr()
+    };
+    args.num_dims = buffer.dims.len();
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_UnpaddedDimensions(
+    args: *mut PJRT_Buffer_UnpaddedDimensions_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    args.dims = if buffer.dims.is_empty() {
+        ptr::null()
+    } else {
+        buffer.dims.as_ptr()
+    };
+    args.num_dims = buffer.dims.len();
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_DynamicDimensionIndices(
+    args: *mut PJRT_Buffer_DynamicDimensionIndices_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(_buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    args.dynamic_dimension_indices = ptr::null();
+    args.num_dynamic_dimension_indices = 0;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_GetMemoryLayout(
+    args: *mut PJRT_Buffer_GetMemoryLayout_Args,
+) -> *mut PJRT_Error {
+    if args.is_null() {
+        return invalid_argument("args must not be null");
+    }
+    unimplemented("PJRT_Buffer_GetMemoryLayout is not implemented")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_OnDeviceSizeInBytes(
+    args: *mut PJRT_Buffer_OnDeviceSizeInBytes_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+        return invalid_argument("buffer has been deleted");
+    };
+    args.on_device_size_in_bytes = dram_buffer.size();
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_Device(
+    args: *mut PJRT_Buffer_Device_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    args.device = buffer.device;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_Memory(
+    args: *mut PJRT_Buffer_Memory_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    args.memory = buffer.memory;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_Delete(
+    args: *mut PJRT_Buffer_Delete_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_mut(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    buffer.deleted = true;
+    buffer.dram_buffer = None;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_IsDeleted(
+    args: *mut PJRT_Buffer_IsDeleted_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    args.is_deleted = buffer.deleted;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_CopyToDevice(
+    args: *mut PJRT_Buffer_CopyToDevice_Args,
+) -> *mut PJRT_Error {
+    if args.is_null() {
+        return invalid_argument("args must not be null");
+    }
+    unimplemented("PJRT_Buffer_CopyToDevice is not implemented")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
+    args: *mut PJRT_Buffer_ToHostBuffer_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_ref(args.src, "src") }) else {
+        return invalid_argument("src must not be null");
+    };
+    if !args.host_layout.is_null() {
+        return unimplemented("custom host layouts are not supported");
+    }
+    let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+        return invalid_argument("buffer has been deleted");
+    };
+    let mut device = match Device::open(buffer.local_hardware_id) {
+        Ok(device) => device,
+        Err(err) => return io_error(err),
+    };
+    let data = match device.dram_read(dram_buffer) {
+        Ok(data) => data,
+        Err(err) => return io_error(err),
+    };
+    if args.dst.is_null() {
+        args.dst_size = data.len();
+        args.event = ready_event();
+        return ptr::null_mut();
+    }
+    if args.dst_size < data.len() {
+        return invalid_argument("dst buffer is too small");
+    }
+    // SAFETY: caller owns `dst` for at least `data.len()` bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(data.as_ptr(), args.dst.cast::<u8>(), data.len());
+    }
+    args.dst_size = data.len();
+    args.event = ready_event();
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_IsOnCpu(
+    args: *mut PJRT_Buffer_IsOnCpu_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(_buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    args.is_on_cpu = false;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_ReadyEvent(
+    args: *mut PJRT_Buffer_ReadyEvent_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    args.event = event_for_buffer(buffer);
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_UnsafePointer(
+    args: *mut PJRT_Buffer_UnsafePointer_Args,
+) -> *mut PJRT_Error {
+    if args.is_null() {
+        return invalid_argument("args must not be null");
+    }
+    unimplemented("PJRT_Buffer_UnsafePointer is not implemented")
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_IncreaseExternalReferenceCount(
+    args: *mut PJRT_Buffer_IncreaseExternalReferenceCount_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if args.buffer.is_null() {
+        return invalid_argument("buffer must not be null");
+    }
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_DecreaseExternalReferenceCount(
+    args: *mut PJRT_Buffer_DecreaseExternalReferenceCount_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if args.buffer.is_null() {
+        return invalid_argument("buffer must not be null");
+    }
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_OpaqueDeviceMemoryDataPointer(
+    args: *mut PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if args.buffer.is_null() {
+        return invalid_argument("buffer must not be null");
+    }
+    args.device_memory_ptr = ptr::null_mut();
+    unimplemented("PJRT_Buffer_OpaqueDeviceMemoryDataPointer is not implemented")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_TopologyDescription_PlatformName(
     args: *mut PJRT_TopologyDescription_PlatformName_Args,
 ) -> *mut PJRT_Error {
@@ -1155,7 +2114,11 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Error_GetCode: Some(TT_Error_GetCode),
     PJRT_Plugin_Initialize: Some(TT_Plugin_Initialize),
     PJRT_Plugin_Attributes: Some(TT_Plugin_Attributes),
-    unused_events: [None; 5],
+    PJRT_Event_Destroy: Some(TT_Event_Destroy),
+    PJRT_Event_IsReady: Some(TT_Event_IsReady),
+    PJRT_Event_Error: Some(TT_Event_Error),
+    PJRT_Event_Await: Some(TT_Event_Await),
+    PJRT_Event_OnReady: Some(TT_Event_OnReady),
     PJRT_Client_Create: Some(TT_Client_Create),
     PJRT_Client_Destroy: Some(TT_Client_Destroy),
     PJRT_Client_PlatformName: Some(TT_Client_PlatformName),
@@ -1166,7 +2129,9 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Client_LookupDevice: Some(TT_Client_LookupDevice),
     PJRT_Client_LookupAddressableDevice: Some(TT_Client_LookupAddressableDevice),
     PJRT_Client_AddressableMemories: Some(TT_Client_AddressableMemories),
-    unused_client_rest: [None; 3],
+    PJRT_Client_Compile: Some(TT_Client_Compile),
+    PJRT_Client_DefaultDeviceAssignment: Some(TT_Client_DefaultDeviceAssignment),
+    PJRT_Client_BufferFromHostBuffer: Some(TT_Client_BufferFromHostBuffer),
     PJRT_DeviceDescription_Id: Some(TT_DeviceDescription_Id),
     PJRT_DeviceDescription_ProcessIndex: Some(TT_DeviceDescription_ProcessIndex),
     PJRT_DeviceDescription_Attributes: Some(TT_DeviceDescription_Attributes),
@@ -1184,7 +2149,34 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Memory_DebugString: Some(TT_Memory_DebugString),
     PJRT_Memory_ToString: Some(TT_Memory_ToString),
     PJRT_Memory_AddressableByDevices: Some(TT_Memory_AddressableByDevices),
-    unused_before_topology: [None; 42],
+    unused_executable: [None; 10],
+    unused_loaded_executable: [None; 8],
+    PJRT_Buffer_Destroy: Some(TT_Buffer_Destroy),
+    PJRT_Buffer_ElementType: Some(TT_Buffer_ElementType),
+    PJRT_Buffer_Dimensions: Some(TT_Buffer_Dimensions),
+    PJRT_Buffer_UnpaddedDimensions: Some(TT_Buffer_UnpaddedDimensions),
+    PJRT_Buffer_DynamicDimensionIndices: Some(TT_Buffer_DynamicDimensionIndices),
+    PJRT_Buffer_GetMemoryLayout: Some(TT_Buffer_GetMemoryLayout),
+    PJRT_Buffer_OnDeviceSizeInBytes: Some(TT_Buffer_OnDeviceSizeInBytes),
+    PJRT_Buffer_Device: Some(TT_Buffer_Device),
+    PJRT_Buffer_Memory: Some(TT_Buffer_Memory),
+    PJRT_Buffer_Delete: Some(TT_Buffer_Delete),
+    PJRT_Buffer_IsDeleted: Some(TT_Buffer_IsDeleted),
+    PJRT_Buffer_CopyToDevice: Some(TT_Buffer_CopyToDevice),
+    PJRT_Buffer_ToHostBuffer: Some(TT_Buffer_ToHostBuffer),
+    PJRT_Buffer_IsOnCpu: Some(TT_Buffer_IsOnCpu),
+    PJRT_Buffer_ReadyEvent: Some(TT_Buffer_ReadyEvent),
+    PJRT_Buffer_UnsafePointer: Some(TT_Buffer_UnsafePointer),
+    PJRT_Buffer_IncreaseExternalReferenceCount: Some(
+        TT_Buffer_IncreaseExternalReferenceCount,
+    ),
+    PJRT_Buffer_DecreaseExternalReferenceCount: Some(
+        TT_Buffer_DecreaseExternalReferenceCount,
+    ),
+    PJRT_Buffer_OpaqueDeviceMemoryDataPointer: Some(
+        TT_Buffer_OpaqueDeviceMemoryDataPointer,
+    ),
+    unused_copy_to_device_stream: [None; 5],
     unused_topology_create_destroy: [None; 2],
     PJRT_TopologyDescription_PlatformName: Some(TT_TopologyDescription_PlatformName),
     PJRT_TopologyDescription_PlatformVersion: Some(TT_TopologyDescription_PlatformVersion),
