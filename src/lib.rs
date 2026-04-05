@@ -442,7 +442,8 @@ pub struct PJRT_Api {
     pub PJRT_Client_Devices: PjrtResultFn<PJRT_Client_Devices_Args>,
     pub PJRT_Client_AddressableDevices: PjrtResultFn<PJRT_Client_AddressableDevices_Args>,
     pub PJRT_Client_LookupDevice: PjrtResultFn<PJRT_Client_LookupDevice_Args>,
-    pub PJRT_Client_LookupAddressableDevice: PjrtResultFn<PJRT_Client_LookupAddressableDevice_Args>,
+    pub PJRT_Client_LookupAddressableDevice:
+        PjrtResultFn<PJRT_Client_LookupAddressableDevice_Args>,
     pub PJRT_Client_AddressableMemories: PjrtResultFn<PJRT_Client_AddressableMemories_Args>,
     unused_client_rest: [PjrtOpaqueFn; 3],
     pub PJRT_DeviceDescription_Id: PjrtResultFn<PJRT_DeviceDescription_Id_Args>,
@@ -471,7 +472,8 @@ pub struct PJRT_Api {
     pub PJRT_TopologyDescription_GetDeviceDescriptions:
         PjrtResultFn<PJRT_TopologyDescription_GetDeviceDescriptions_Args>,
     unused_topology_serialize: [PjrtOpaqueFn; 1],
-    pub PJRT_TopologyDescription_Attributes: PjrtResultFn<PJRT_TopologyDescription_Attributes_Args>,
+    pub PJRT_TopologyDescription_Attributes:
+        PjrtResultFn<PJRT_TopologyDescription_Attributes_Args>,
     unused_before_client_topology: [PjrtOpaqueFn; 6],
     pub PJRT_Client_TopologyDescription: PjrtResultFn<PJRT_Client_TopologyDescription_Args>,
     unused_tail: [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_SLOTS],
@@ -615,7 +617,9 @@ pub unsafe extern "C" fn TT_Error_Message(args: *mut PJRT_Error_Message_Args) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Error_GetCode(args: *mut PJRT_Error_GetCode_Args) -> *mut PJRT_Error {
+pub unsafe extern "C" fn TT_Error_GetCode(
+    args: *mut PJRT_Error_GetCode_Args,
+) -> *mut PJRT_Error {
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -659,7 +663,9 @@ pub unsafe extern "C" fn TT_Client_Create(args: *mut PJRT_Client_Create_Args) ->
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Client_Destroy(args: *mut PJRT_Client_Destroy_Args) -> *mut PJRT_Error {
+pub unsafe extern "C" fn TT_Client_Destroy(
+    args: *mut PJRT_Client_Destroy_Args,
+) -> *mut PJRT_Error {
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -732,7 +738,9 @@ pub unsafe extern "C" fn TT_Client_TopologyDescription(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Client_Devices(args: *mut PJRT_Client_Devices_Args) -> *mut PJRT_Error {
+pub unsafe extern "C" fn TT_Client_Devices(
+    args: *mut PJRT_Client_Devices_Args,
+) -> *mut PJRT_Error {
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -1295,9 +1303,7 @@ mod tests {
         check_ok(api, unsafe { client_devices(&mut devices_args) });
 
         if devices_args.num_devices > 0 {
-            let devices = unsafe {
-                std::slice::from_raw_parts(devices_args.devices, devices_args.num_devices)
-            };
+            let devices = unsafe { std::slice::from_raw_parts(devices_args.devices, devices_args.num_devices) };
             let first_device = devices[0];
             assert!(!first_device.is_null());
 
@@ -1310,9 +1316,7 @@ mod tests {
                 device: first_device,
                 device_description: ptr::null_mut(),
             };
-            check_ok(api, unsafe {
-                device_get_description(&mut get_description_args)
-            });
+            check_ok(api, unsafe { device_get_description(&mut get_description_args) });
             assert!(!get_description_args.device_description.is_null());
 
             let description_id = api
@@ -1339,10 +1343,7 @@ mod tests {
             };
             check_ok(api, unsafe { description_kind(&mut kind_args) });
             let kind = unsafe {
-                std::slice::from_raw_parts(
-                    kind_args.device_kind.cast::<u8>(),
-                    kind_args.device_kind_size,
-                )
+                std::slice::from_raw_parts(kind_args.device_kind.cast::<u8>(), kind_args.device_kind_size)
             };
             assert_eq!(kind, b"Tenstorrent");
         } else {
@@ -1383,22 +1384,16 @@ mod tests {
             error,
             code: PJRT_Error_Code::PJRT_Error_Code_UNKNOWN,
         };
-        check_ok(api, unsafe {
-            api.PJRT_Error_GetCode.expect("error get code must exist")(&mut code_args)
-        });
-        assert_eq!(
-            code_args.code,
-            PJRT_Error_Code::PJRT_Error_Code_INVALID_ARGUMENT
-        );
+        check_ok(api, unsafe { api.PJRT_Error_GetCode.expect("error get code must exist")(&mut code_args) });
+        assert_eq!(code_args.code, PJRT_Error_Code::PJRT_Error_Code_INVALID_ARGUMENT);
 
         unsafe {
-            api.PJRT_Error_Destroy.expect("error destroy must exist")(
-                &mut PJRT_Error_Destroy_Args {
+            api.PJRT_Error_Destroy
+                .expect("error destroy must exist")(&mut PJRT_Error_Destroy_Args {
                     struct_size: size_of::<PJRT_Error_Destroy_Args>(),
                     extension_start: ptr::null_mut(),
                     error,
-                },
-            );
+                });
         }
     }
 

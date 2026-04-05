@@ -424,10 +424,7 @@ fn harvested_dram_banks(gddr_enabled_mask: u32) -> Vec<usize> {
 }
 
 fn dram_tiles(harvested_dram_banks: &[usize]) -> Vec<DramTile> {
-    let harvested = harvested_dram_banks
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
+    let harvested = harvested_dram_banks.iter().copied().collect::<std::collections::BTreeSet<_>>();
     let mut tiles = Vec::new();
 
     for bank in 0..DRAM_BANK_COUNT {
@@ -459,10 +456,7 @@ fn log_enabled() -> bool {
     *ENABLED.get_or_init(|| match std::env::var("LIBTT_LOG") {
         Ok(value) => {
             let normalized = value.trim().to_ascii_lowercase();
-            !normalized.is_empty()
-                && normalized != "0"
-                && normalized != "false"
-                && normalized != "off"
+            !normalized.is_empty() && normalized != "0" && normalized != "false" && normalized != "off"
         }
         Err(_) => false,
     })
