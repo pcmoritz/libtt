@@ -1,9 +1,9 @@
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::linux::{NocOrdering, TlbWindow};
+use crate::log::log;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 const DEFAULT_ROOT: &str = "/dev/tenstorrent";
 const ARC_DEFAULT_TENSIX_ENABLED: u32 = 0x3fff;
@@ -443,23 +443,6 @@ fn dram_tiles(harvested_dram_banks: &[usize]) -> Vec<DramTile> {
 
 fn dram_bank_x(bank: usize) -> u8 {
     if bank < 4 { 0 } else { 9 }
-}
-
-pub(super) fn log(message: impl AsRef<str>) {
-    if log_enabled() {
-        eprintln!("[libtt] {}", message.as_ref());
-    }
-}
-
-fn log_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("LIBTT_LOG") {
-        Ok(value) => {
-            let normalized = value.trim().to_ascii_lowercase();
-            !normalized.is_empty() && normalized != "0" && normalized != "false" && normalized != "off"
-        }
-        Err(_) => false,
-    })
 }
 
 #[cfg(test)]
