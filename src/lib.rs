@@ -1316,10 +1316,11 @@ pub unsafe extern "C" fn TT_Client_DefaultDeviceAssignment(
             usize::try_from(args.num_partitions)
                 .ok()
                 .and_then(|partitions| replicas.checked_mul(partitions))
-        })
-        .ok_or_else(|| invalid_argument("default device assignment is too large"));
-    let Ok(required) = required else {
-        return invalid_argument("default device assignment is too large");
+        });
+    let Some(required) = required else {
+        return invalid_argument(
+            "default device assignment size overflowed num_replicas * num_partitions",
+        );
     };
     if args.default_assignment_size < required {
         return invalid_argument("default_assignment buffer is too small");
