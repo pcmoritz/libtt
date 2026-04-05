@@ -2,6 +2,7 @@
 
 pub mod device;
 pub mod dram;
+mod linux;
 
 use device::Device;
 use std::ffi::{CString, c_char, c_void};

@@ -1,13 +1,8 @@
-use crate::device::{load_device, Device, DramTile};
+use crate::device::CoreCoord;
+use crate::device::{Device, DramTile, load_device};
+use crate::linux::{NocOrdering, TlbWindow};
 use std::io;
-use std::path::PathBuf;
-
-#[cfg(target_os = "linux")]
-#[path = "dram/linux.rs"]
-mod backend;
-#[cfg(not(target_os = "linux"))]
-#[path = "dram/stub.rs"]
-mod backend;
+use std::path::{Path, PathBuf};
 
 const TILE_R: usize = 32;
 const TILE_C: usize = 32;
@@ -15,6 +10,9 @@ const FACE_R: usize = 16;
 const FACE_C: usize = 16;
 const DRAM_TILES_PER_BANK: usize = 3;
 const DRAM_ALIGNMENT: usize = 64;
+const TLB_SIZE_4G: u64 = 1 << 32;
+const DRAM_BARRIER_BASE: usize = 0;
+const DRAM_BARRIER_FLAGS: [u32; 2] = [0xaa, 0xbb];
 
 pub type Shape = Vec<usize>;
 
@@ -64,7 +62,7 @@ impl DramBuffer {
 }
 
 pub struct Allocator {
-    backend: backend::AllocatorBackend,
+    backend: AllocatorBackend,
     next: u64,
     bank_count: usize,
 }
@@ -82,7 +80,7 @@ impl Allocator {
     fn from_device_with_path(path: PathBuf, device: &Device) -> io::Result<Self> {
         let bank_tiles = allocator_bank_tiles(&device.dram_tiles)?;
         let bank_count = bank_tiles.len();
-        let backend = backend::AllocatorBackend::open(path, bank_tiles)?;
+        let backend = AllocatorBackend::open(path.as_path(), bank_tiles)?;
         Ok(Self {
             backend,
             next: 0x40,
@@ -180,6 +178,132 @@ impl Allocator {
     }
 }
 
+struct AllocatorBackend {
+    window: TlbWindow,
+    bank_tiles: Vec<DramTile>,
+}
+
+impl AllocatorBackend {
+    fn open(path: &Path, bank_tiles: Vec<DramTile>) -> io::Result<Self> {
+        let first = bank_tiles
+            .first()
+            .copied()
+            .ok_or_else(|| io::Error::other("no active DRAM bank tiles discovered"))?;
+        let window = TlbWindow::open(
+            path,
+            CoreCoord {
+                x: first.x,
+                y: first.y,
+            },
+            0,
+            TLB_SIZE_4G,
+            true,
+        )?;
+        Ok(Self { window, bank_tiles })
+    }
+
+    fn write(&mut self, addr: u64, page_size: usize, data: &[u8]) -> io::Result<()> {
+        let page_count = data.len().div_ceil(page_size);
+
+        for (bank_index, tile) in self.bank_tiles.iter().enumerate() {
+            let bank_data = collect_bank_data(data, page_size, bank_index, self.bank_tiles.len());
+            if bank_data.is_empty() {
+                continue;
+            }
+
+            self.window.target(
+                CoreCoord {
+                    x: tile.x,
+                    y: tile.y,
+                },
+                None,
+                0,
+                NocOrdering::Posted,
+            )?;
+            self.window.write(addr as usize, &bank_data)?;
+        }
+
+        if page_count > 0 {
+            self.barrier()?;
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, addr: u64, page_size: usize, size: usize) -> io::Result<Vec<u8>> {
+        let mut result = vec![0u8; size];
+        let page_count = size.div_ceil(page_size);
+
+        for (bank_index, tile) in self.bank_tiles.iter().enumerate() {
+            let bank_pages = (bank_index..page_count)
+                .step_by(self.bank_tiles.len())
+                .count();
+            if bank_pages == 0 {
+                continue;
+            }
+
+            self.window.target(
+                CoreCoord {
+                    x: tile.x,
+                    y: tile.y,
+                },
+                None,
+                0,
+                NocOrdering::Relaxed,
+            )?;
+            let bank_data = self.window.read(addr as usize, bank_pages * page_size)?;
+            scatter_bank_data(
+                &mut result,
+                page_size,
+                bank_index,
+                self.bank_tiles.len(),
+                &bank_data,
+            );
+        }
+
+        Ok(result)
+    }
+
+    fn read_raw_bank_pages(&mut self, addr: u64, page_size: usize) -> io::Result<Vec<u8>> {
+        let mut result = vec![0u8; page_size * self.bank_tiles.len()];
+
+        for (bank_index, tile) in self.bank_tiles.iter().enumerate() {
+            self.window.target(
+                CoreCoord {
+                    x: tile.x,
+                    y: tile.y,
+                },
+                None,
+                0,
+                NocOrdering::Relaxed,
+            )?;
+            let bank_data = self.window.read(addr as usize, page_size)?;
+            let offset = bank_index * page_size;
+            result[offset..offset + page_size].copy_from_slice(&bank_data);
+        }
+
+        Ok(result)
+    }
+
+    fn barrier(&mut self) -> io::Result<()> {
+        for flag in DRAM_BARRIER_FLAGS {
+            for tile in &self.bank_tiles {
+                self.window.target(
+                    CoreCoord {
+                        x: tile.x,
+                        y: tile.y,
+                    },
+                    None,
+                    0,
+                    NocOrdering::Strict,
+                )?;
+                self.window.write32(DRAM_BARRIER_BASE, flag)?;
+                while self.window.read32(DRAM_BARRIER_BASE)? != flag {}
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn tilize(data: &[u8], dtype: DType, shape: &[usize]) -> io::Result<Vec<u8>> {
     let Layout {
         batch,
@@ -273,6 +397,41 @@ fn allocator_bank_tiles(dram_tiles: &[DramTile]) -> io::Result<Vec<DramTile>> {
         Err(io::Error::other("no active DRAM bank tiles discovered"))
     } else {
         Ok(bank_tiles)
+    }
+}
+
+fn collect_bank_data(
+    data: &[u8],
+    page_size: usize,
+    bank_index: usize,
+    bank_count: usize,
+) -> Vec<u8> {
+    let page_count = data.len().div_ceil(page_size);
+    let mut out = Vec::new();
+
+    for page in (bank_index..page_count).step_by(bank_count) {
+        let start = page * page_size;
+        let end = data.len().min(start + page_size);
+        out.extend_from_slice(&data[start..end]);
+    }
+
+    out
+}
+
+fn scatter_bank_data(
+    out: &mut [u8],
+    page_size: usize,
+    bank_index: usize,
+    bank_count: usize,
+    bank_data: &[u8],
+) {
+    let page_count = out.len().div_ceil(page_size);
+
+    for (slot, page) in (bank_index..page_count).step_by(bank_count).enumerate() {
+        let out_start = page * page_size;
+        let len = (out.len() - out_start).min(page_size);
+        let bank_start = slot * page_size;
+        out[out_start..out_start + len].copy_from_slice(&bank_data[bank_start..bank_start + len]);
     }
 }
 
@@ -466,5 +625,20 @@ mod tests {
         assert_eq!(bank_tiles.len(), 2);
         assert_eq!(bank_tiles[0].bank, 0);
         assert_eq!(bank_tiles[1].bank, 1);
+    }
+
+    #[test]
+    fn collect_bank_data_interleaves_pages() {
+        let data = (0u8..10).collect::<Vec<_>>();
+        assert_eq!(collect_bank_data(&data, 2, 0, 2), vec![0, 1, 4, 5, 8, 9]);
+        assert_eq!(collect_bank_data(&data, 2, 1, 2), vec![2, 3, 6, 7]);
+    }
+
+    #[test]
+    fn scatter_bank_data_restores_page_order() {
+        let mut out = vec![0u8; 10];
+        scatter_bank_data(&mut out, 2, 0, 2, &[0, 1, 4, 5, 8, 9]);
+        scatter_bank_data(&mut out, 2, 1, 2, &[2, 3, 6, 7]);
+        assert_eq!(out, (0u8..10).collect::<Vec<_>>());
     }
 }
