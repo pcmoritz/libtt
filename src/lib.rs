@@ -1344,16 +1344,6 @@ pub unsafe extern "C" fn TT_Client_AddressableMemories(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Client_Compile(
-    args: *mut PJRT_Client_Compile_Args,
-) -> *mut PJRT_Error {
-    if args.is_null() {
-        return invalid_argument("args must not be null");
-    }
-    unimplemented("PJRT_Client_Compile is not implemented")
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Client_DefaultDeviceAssignment(
     args: *mut PJRT_Client_DefaultDeviceAssignment_Args,
 ) -> *mut PJRT_Error {
@@ -1836,16 +1826,6 @@ pub unsafe extern "C" fn TT_Buffer_DynamicDimensionIndices(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Buffer_GetMemoryLayout(
-    args: *mut PJRT_Buffer_GetMemoryLayout_Args,
-) -> *mut PJRT_Error {
-    if args.is_null() {
-        return invalid_argument("args must not be null");
-    }
-    unimplemented("PJRT_Buffer_GetMemoryLayout is not implemented")
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Buffer_OnDeviceSizeInBytes(
     args: *mut PJRT_Buffer_OnDeviceSizeInBytes_Args,
 ) -> *mut PJRT_Error {
@@ -1920,16 +1900,6 @@ pub unsafe extern "C" fn TT_Buffer_IsDeleted(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Buffer_CopyToDevice(
-    args: *mut PJRT_Buffer_CopyToDevice_Args,
-) -> *mut PJRT_Error {
-    if args.is_null() {
-        return invalid_argument("args must not be null");
-    }
-    unimplemented("PJRT_Buffer_CopyToDevice is not implemented")
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
     args: *mut PJRT_Buffer_ToHostBuffer_Args,
 ) -> *mut PJRT_Error {
@@ -2000,16 +1970,6 @@ pub unsafe extern "C" fn TT_Buffer_ReadyEvent(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Buffer_UnsafePointer(
-    args: *mut PJRT_Buffer_UnsafePointer_Args,
-) -> *mut PJRT_Error {
-    if args.is_null() {
-        return invalid_argument("args must not be null");
-    }
-    unimplemented("PJRT_Buffer_UnsafePointer is not implemented")
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Buffer_IncreaseExternalReferenceCount(
     args: *mut PJRT_Buffer_IncreaseExternalReferenceCount_Args,
 ) -> *mut PJRT_Error {
@@ -2033,20 +1993,6 @@ pub unsafe extern "C" fn TT_Buffer_DecreaseExternalReferenceCount(
         return invalid_argument("buffer must not be null");
     }
     ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Buffer_OpaqueDeviceMemoryDataPointer(
-    args: *mut PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args,
-) -> *mut PJRT_Error {
-    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
-        return invalid_argument("args must not be null");
-    };
-    if args.buffer.is_null() {
-        return invalid_argument("buffer must not be null");
-    }
-    args.device_memory_ptr = ptr::null_mut();
-    unimplemented("PJRT_Buffer_OpaqueDeviceMemoryDataPointer is not implemented")
 }
 
 #[unsafe(no_mangle)]
@@ -2142,7 +2088,7 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Client_LookupDevice: Some(TT_Client_LookupDevice),
     PJRT_Client_LookupAddressableDevice: Some(TT_Client_LookupAddressableDevice),
     PJRT_Client_AddressableMemories: Some(TT_Client_AddressableMemories),
-    PJRT_Client_Compile: Some(TT_Client_Compile),
+    PJRT_Client_Compile: None,
     PJRT_Client_DefaultDeviceAssignment: Some(TT_Client_DefaultDeviceAssignment),
     PJRT_Client_BufferFromHostBuffer: Some(TT_Client_BufferFromHostBuffer),
     PJRT_DeviceDescription_Id: Some(TT_DeviceDescription_Id),
@@ -2169,26 +2115,24 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Buffer_Dimensions: Some(TT_Buffer_Dimensions),
     PJRT_Buffer_UnpaddedDimensions: Some(TT_Buffer_UnpaddedDimensions),
     PJRT_Buffer_DynamicDimensionIndices: Some(TT_Buffer_DynamicDimensionIndices),
-    PJRT_Buffer_GetMemoryLayout: Some(TT_Buffer_GetMemoryLayout),
+    PJRT_Buffer_GetMemoryLayout: None,
     PJRT_Buffer_OnDeviceSizeInBytes: Some(TT_Buffer_OnDeviceSizeInBytes),
     PJRT_Buffer_Device: Some(TT_Buffer_Device),
     PJRT_Buffer_Memory: Some(TT_Buffer_Memory),
     PJRT_Buffer_Delete: Some(TT_Buffer_Delete),
     PJRT_Buffer_IsDeleted: Some(TT_Buffer_IsDeleted),
-    PJRT_Buffer_CopyToDevice: Some(TT_Buffer_CopyToDevice),
+    PJRT_Buffer_CopyToDevice: None,
     PJRT_Buffer_ToHostBuffer: Some(TT_Buffer_ToHostBuffer),
     PJRT_Buffer_IsOnCpu: Some(TT_Buffer_IsOnCpu),
     PJRT_Buffer_ReadyEvent: Some(TT_Buffer_ReadyEvent),
-    PJRT_Buffer_UnsafePointer: Some(TT_Buffer_UnsafePointer),
+    PJRT_Buffer_UnsafePointer: None,
     PJRT_Buffer_IncreaseExternalReferenceCount: Some(
         TT_Buffer_IncreaseExternalReferenceCount,
     ),
     PJRT_Buffer_DecreaseExternalReferenceCount: Some(
         TT_Buffer_DecreaseExternalReferenceCount,
     ),
-    PJRT_Buffer_OpaqueDeviceMemoryDataPointer: Some(
-        TT_Buffer_OpaqueDeviceMemoryDataPointer,
-    ),
+    PJRT_Buffer_OpaqueDeviceMemoryDataPointer: None,
     unused_copy_to_device_stream: [None; 5],
     unused_topology_create_destroy: [None; 2],
     PJRT_TopologyDescription_PlatformName: Some(TT_TopologyDescription_PlatformName),
