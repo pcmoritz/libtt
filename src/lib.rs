@@ -578,17 +578,6 @@ pub struct PJRT_Buffer_IsDeleted_Args {
 }
 
 #[repr(C)]
-pub struct PJRT_Buffer_ToHostBuffer_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub src: *mut PJRT_Buffer,
-    pub host_layout: *mut PJRT_Buffer_MemoryLayout,
-    pub dst: *mut c_void,
-    pub dst_size: usize,
-    pub event: *mut PJRT_Event,
-}
-
-#[repr(C)]
 pub struct PJRT_Buffer_IsOnCpu_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -715,7 +704,7 @@ pub struct PJRT_Api {
     pub PJRT_Buffer_Delete: PjrtResultFn<PJRT_Buffer_Delete_Args>,
     pub PJRT_Buffer_IsDeleted: PjrtResultFn<PJRT_Buffer_IsDeleted_Args>,
     pub PJRT_Buffer_CopyToDevice: PjrtOpaqueFn,
-    pub PJRT_Buffer_ToHostBuffer: PjrtResultFn<PJRT_Buffer_ToHostBuffer_Args>,
+    pub PJRT_Buffer_ToHostBuffer: PjrtOpaqueFn,
     pub PJRT_Buffer_IsOnCpu: PjrtResultFn<PJRT_Buffer_IsOnCpu_Args>,
     pub PJRT_Buffer_ReadyEvent: PjrtResultFn<PJRT_Buffer_ReadyEvent_Args>,
     pub PJRT_Buffer_UnsafePointer: PjrtOpaqueFn,
@@ -1855,48 +1844,6 @@ pub unsafe extern "C" fn TT_Buffer_IsDeleted(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
-    args: *mut PJRT_Buffer_ToHostBuffer_Args,
-) -> *mut PJRT_Error {
-    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
-        return invalid_argument("args must not be null");
-    };
-    log("pjrt buffer_to_host_buffer entered");
-    let Ok(buffer) = (unsafe { checked_ref(args.src, "src") }) else {
-        return invalid_argument("src must not be null");
-    };
-    if !args.host_layout.is_null() {
-        return unimplemented("custom host layouts are not supported");
-    }
-    let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-        return invalid_argument("buffer has been deleted");
-    };
-    let mut device = match Device::open(buffer.local_hardware_id) {
-        Ok(device) => device,
-        Err(err) => return io_error(err),
-    };
-    let data = match device.dram_read(dram_buffer) {
-        Ok(data) => data,
-        Err(err) => return io_error(err),
-    };
-    if args.dst.is_null() {
-        args.dst_size = data.len();
-        args.event = ready_event();
-        return ptr::null_mut();
-    }
-    if args.dst_size < data.len() {
-        return invalid_argument("dst buffer is too small");
-    }
-    // SAFETY: caller owns `dst` for at least `data.len()` bytes.
-    unsafe {
-        ptr::copy_nonoverlapping(data.as_ptr(), args.dst.cast::<u8>(), data.len());
-    }
-    args.dst_size = data.len();
-    args.event = ready_event();
-    ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Buffer_IsOnCpu(
     args: *mut PJRT_Buffer_IsOnCpu_Args,
 ) -> *mut PJRT_Error {
@@ -2077,7 +2024,7 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Buffer_Delete: Some(TT_Buffer_Delete),
     PJRT_Buffer_IsDeleted: Some(TT_Buffer_IsDeleted),
     PJRT_Buffer_CopyToDevice: None,
-    PJRT_Buffer_ToHostBuffer: Some(TT_Buffer_ToHostBuffer),
+    PJRT_Buffer_ToHostBuffer: None,
     PJRT_Buffer_IsOnCpu: Some(TT_Buffer_IsOnCpu),
     PJRT_Buffer_ReadyEvent: Some(TT_Buffer_ReadyEvent),
     PJRT_Buffer_UnsafePointer: None,
