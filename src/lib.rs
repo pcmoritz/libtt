@@ -34,6 +34,8 @@ const PJRT_HostBufferSemantics_kMutableZeroCopy: i32 = 3;
 type PjrtOpaqueFn = Option<unsafe extern "C" fn()>;
 type PjrtResultFn<Args> = Option<unsafe extern "C" fn(args: *mut Args) -> *mut PJRT_Error>;
 type PjrtVoidFn<Args> = Option<unsafe extern "C" fn(args: *mut Args)>;
+type PjrtEventOnReadyCallback =
+    Option<unsafe extern "C" fn(error: *mut PJRT_Error, user_arg: *mut c_void)>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +210,22 @@ pub struct PJRT_Event_Error_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
     pub event: *mut PJRT_Event,
+}
+
+#[repr(C)]
+pub struct PJRT_Event_Await_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub event: *mut PJRT_Event,
+}
+
+#[repr(C)]
+pub struct PJRT_Event_OnReady_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub event: *mut PJRT_Event,
+    pub callback: PjrtEventOnReadyCallback,
+    pub user_arg: *mut c_void,
 }
 
 #[repr(C)]
@@ -647,9 +665,9 @@ pub struct PJRT_Api {
     pub PJRT_Plugin_Attributes: PjrtResultFn<PJRT_Plugin_Attributes_Args>,
     pub PJRT_Event_Destroy: PjrtResultFn<PJRT_Event_Destroy_Args>,
     pub PJRT_Event_IsReady: PjrtResultFn<PJRT_Event_IsReady_Args>,
-    pub PJRT_Event_Error: PjrtOpaqueFn,
-    pub PJRT_Event_Await: PjrtResultFn<PJRT_Event_Error_Args>,
-    pub PJRT_Event_OnReady: PjrtOpaqueFn,
+    pub PJRT_Event_Error: PjrtResultFn<PJRT_Event_Error_Args>,
+    pub PJRT_Event_Await: PjrtResultFn<PJRT_Event_Await_Args>,
+    pub PJRT_Event_OnReady: PjrtResultFn<PJRT_Event_OnReady_Args>,
     pub PJRT_Client_Create: PjrtResultFn<PJRT_Client_Create_Args>,
     pub PJRT_Client_Destroy: PjrtResultFn<PJRT_Client_Destroy_Args>,
     pub PJRT_Client_PlatformName: PjrtResultFn<PJRT_Client_PlatformName_Args>,
@@ -1054,7 +1072,7 @@ pub unsafe extern "C" fn TT_Event_IsReady(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Event_Await(args: *mut PJRT_Event_Error_Args) -> *mut PJRT_Error {
+pub unsafe extern "C" fn TT_Event_Error(args: *mut PJRT_Event_Error_Args) -> *mut PJRT_Error {
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -1062,6 +1080,37 @@ pub unsafe extern "C" fn TT_Event_Await(args: *mut PJRT_Event_Error_Args) -> *mu
         return invalid_argument("event must not be null");
     };
     cloned_event_error(event)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Event_Await(args: *mut PJRT_Event_Await_Args) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(event) = (unsafe { checked_ref(args.event, "event") }) else {
+        return invalid_argument("event must not be null");
+    };
+    cloned_event_error(event)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Event_OnReady(
+    args: *mut PJRT_Event_OnReady_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(event) = (unsafe { checked_ref(args.event, "event") }) else {
+        return invalid_argument("event must not be null");
+    };
+    let Some(callback) = args.callback else {
+        return invalid_argument("callback must not be null");
+    };
+    // SAFETY: `callback` originates from the caller and accepts ownership of the error.
+    unsafe {
+        callback(cloned_event_error(event), args.user_arg);
+    }
+    ptr::null_mut()
 }
 
 #[unsafe(no_mangle)]
@@ -1980,9 +2029,9 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Plugin_Attributes: Some(TT_Plugin_Attributes),
     PJRT_Event_Destroy: Some(TT_Event_Destroy),
     PJRT_Event_IsReady: Some(TT_Event_IsReady),
-    PJRT_Event_Error: None,
+    PJRT_Event_Error: Some(TT_Event_Error),
     PJRT_Event_Await: Some(TT_Event_Await),
-    PJRT_Event_OnReady: None,
+    PJRT_Event_OnReady: Some(TT_Event_OnReady),
     PJRT_Client_Create: Some(TT_Client_Create),
     PJRT_Client_Destroy: Some(TT_Client_Destroy),
     PJRT_Client_PlatformName: Some(TT_Client_PlatformName),
