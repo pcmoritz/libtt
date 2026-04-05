@@ -2,7 +2,7 @@ use crate::device::CoreCoord;
 use crate::device::{Device, DramTile, load_device};
 use crate::linux::{NocOrdering, TlbWindow};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const TILE_R: usize = 32;
 const TILE_C: usize = 32;
@@ -62,7 +62,8 @@ impl DramBuffer {
 }
 
 pub struct Allocator {
-    backend: AllocatorBackend,
+    window: TlbWindow,
+    bank_tiles: Vec<DramTile>,
     next: u64,
     bank_count: usize,
 }
@@ -79,10 +80,24 @@ impl Allocator {
 
     fn from_device_with_path(path: PathBuf, device: &Device) -> io::Result<Self> {
         let bank_tiles = allocator_bank_tiles(&device.dram_tiles)?;
+        let first = bank_tiles
+            .first()
+            .copied()
+            .ok_or_else(|| io::Error::other("no active DRAM bank tiles discovered"))?;
         let bank_count = bank_tiles.len();
-        let backend = AllocatorBackend::open(path.as_path(), bank_tiles)?;
+        let window = TlbWindow::open(
+            path.as_path(),
+            CoreCoord {
+                x: first.x,
+                y: first.y,
+            },
+            0,
+            TLB_SIZE_4G,
+            true,
+        )?;
         Ok(Self {
-            backend,
+            window,
+            bank_tiles,
             next: 0x40,
             bank_count,
         })
@@ -150,63 +165,11 @@ impl Allocator {
                 ),
             ));
         }
-        self.backend.write(buf.addr, buf.page_size(), data)
-    }
-
-    pub(crate) fn write_host_data(&mut self, buf: &DramBuffer, data: &[u8]) -> io::Result<()> {
-        let payload = match &buf.shape {
-            Some(shape) => tilize(data, buf.dtype, shape)?,
-            None => data.to_vec(),
-        };
-        self.write(buf, &payload)
-    }
-
-    pub fn read(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
-        self.backend.read(buf.addr, buf.page_size(), buf.size())
-    }
-
-    pub(crate) fn read_host_data(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
-        let payload = self.read(buf)?;
-        match &buf.shape {
-            Some(shape) => untilize(&payload, buf.dtype, shape),
-            None => Ok(payload),
-        }
-    }
-
-    pub fn read_raw_bank_pages(&mut self, addr: u64, page_size: usize) -> io::Result<Vec<u8>> {
-        self.backend.read_raw_bank_pages(addr, page_size)
-    }
-}
-
-struct AllocatorBackend {
-    window: TlbWindow,
-    bank_tiles: Vec<DramTile>,
-}
-
-impl AllocatorBackend {
-    fn open(path: &Path, bank_tiles: Vec<DramTile>) -> io::Result<Self> {
-        let first = bank_tiles
-            .first()
-            .copied()
-            .ok_or_else(|| io::Error::other("no active DRAM bank tiles discovered"))?;
-        let window = TlbWindow::open(
-            path,
-            CoreCoord {
-                x: first.x,
-                y: first.y,
-            },
-            0,
-            TLB_SIZE_4G,
-            true,
-        )?;
-        Ok(Self { window, bank_tiles })
-    }
-
-    fn write(&mut self, addr: u64, page_size: usize, data: &[u8]) -> io::Result<()> {
-        let page_count = data.len().div_ceil(page_size);
+        let page_count = data.len().div_ceil(buf.page_size());
 
         for (bank_index, tile) in self.bank_tiles.iter().enumerate() {
-            let bank_data = collect_bank_data(data, page_size, bank_index, self.bank_tiles.len());
+            let bank_data =
+                collect_bank_data(data, buf.page_size(), bank_index, self.bank_tiles.len());
             if bank_data.is_empty() {
                 continue;
             }
@@ -220,7 +183,7 @@ impl AllocatorBackend {
                 0,
                 NocOrdering::Posted,
             )?;
-            self.window.write(addr as usize, &bank_data)?;
+            self.window.write(buf.addr as usize, &bank_data)?;
         }
 
         if page_count > 0 {
@@ -229,9 +192,17 @@ impl AllocatorBackend {
         Ok(())
     }
 
-    fn read(&mut self, addr: u64, page_size: usize, size: usize) -> io::Result<Vec<u8>> {
-        let mut result = vec![0u8; size];
-        let page_count = size.div_ceil(page_size);
+    pub(crate) fn write_host_data(&mut self, buf: &DramBuffer, data: &[u8]) -> io::Result<()> {
+        let payload = match &buf.shape {
+            Some(shape) => tilize(data, buf.dtype, shape)?,
+            None => data.to_vec(),
+        };
+        self.write(buf, &payload)
+    }
+
+    pub fn read(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
+        let mut result = vec![0u8; buf.size()];
+        let page_count = buf.size().div_ceil(buf.page_size());
 
         for (bank_index, tile) in self.bank_tiles.iter().enumerate() {
             let bank_pages = (bank_index..page_count)
@@ -250,10 +221,12 @@ impl AllocatorBackend {
                 0,
                 NocOrdering::Relaxed,
             )?;
-            let bank_data = self.window.read(addr as usize, bank_pages * page_size)?;
+            let bank_data = self
+                .window
+                .read(buf.addr as usize, bank_pages * buf.page_size())?;
             scatter_bank_data(
                 &mut result,
-                page_size,
+                buf.page_size(),
                 bank_index,
                 self.bank_tiles.len(),
                 &bank_data,
@@ -263,7 +236,15 @@ impl AllocatorBackend {
         Ok(result)
     }
 
-    fn read_raw_bank_pages(&mut self, addr: u64, page_size: usize) -> io::Result<Vec<u8>> {
+    pub(crate) fn read_host_data(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
+        let payload = self.read(buf)?;
+        match &buf.shape {
+            Some(shape) => untilize(&payload, buf.dtype, shape),
+            None => Ok(payload),
+        }
+    }
+
+    pub fn read_raw_bank_pages(&mut self, addr: u64, page_size: usize) -> io::Result<Vec<u8>> {
         let mut result = vec![0u8; page_size * self.bank_tiles.len()];
 
         for (bank_index, tile) in self.bank_tiles.iter().enumerate() {
