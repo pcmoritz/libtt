@@ -389,6 +389,10 @@ impl Compiler {
             .unwrap_or_default()
     }
 
+    pub fn firmware(&self) -> &HashMap<String, CompiledFirmware> {
+        &self.firmware
+    }
+
     pub fn compile_dataflow(
         &self,
         src: &str,

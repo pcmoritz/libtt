@@ -12,7 +12,10 @@ fn log_enabled() -> bool {
     *ENABLED.get_or_init(|| match std::env::var("LIBTT_LOG") {
         Ok(value) => {
             let normalized = value.trim().to_ascii_lowercase();
-            !normalized.is_empty() && normalized != "0" && normalized != "false" && normalized != "off"
+            !normalized.is_empty()
+                && normalized != "0"
+                && normalized != "false"
+                && normalized != "off"
         }
         Err(_) => false,
     })

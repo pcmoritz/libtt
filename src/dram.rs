@@ -119,8 +119,7 @@ impl Allocator {
         name: impl Into<String>,
         shape: Option<Shape>,
     ) -> io::Result<DramBuffer> {
-        let (addr, next) =
-            next_allocation_range(self.next, num_tiles, dtype, self.bank_count)?;
+        let (addr, next) = next_allocation_range(self.next, num_tiles, dtype, self.bank_count)?;
         self.next = next;
         Ok(DramBuffer {
             name: name.into(),

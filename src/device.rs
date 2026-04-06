@@ -2,9 +2,12 @@ use crate::compiler::Compiler;
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const DEFAULT_ROOT: &str = "/dev/tenstorrent";
 const ARC_DEFAULT_TENSIX_ENABLED: u32 = 0x3fff;
@@ -18,6 +21,31 @@ const ARC_SCRATCH_RAM_13: usize = 0x30434;
 const TAG_TENSIX_ENABLED_COL: u16 = 34;
 const TAG_GDDR_ENABLED: u16 = 36;
 const TLB_SIZE_2M: u64 = 1 << 21;
+const RUN_MSG_INIT: u8 = 0x40;
+const RUN_MSG_DONE: u8 = 0x00;
+const TENSIX_L1_SIZE: u32 = 0x180000;
+const TENSIX_L1_GO_MSG: usize = 0x000370;
+const TENSIX_L1_BRISC_FIRMWARE_BASE: u32 = 0x003840;
+const TENSIX_L1_MEM_BANK_TO_NOC_SCRATCH: usize = 0x0116B0;
+const TENSIX_MMIO_LOCAL_RAM_START: u32 = 0xFFB00000;
+const TENSIX_MMIO_LOCAL_RAM_END: u32 = 0xFFB01FFF;
+const TENSIX_MMIO_RISCV_DEBUG_REG_SOFT_RESET_0: u64 = 0xFFB121B0;
+const TENSIX_MMIO_RISCV_DEBUG_REG_TRISC0_RESET_PC: u64 = 0xFFB12228;
+const TENSIX_MMIO_RISCV_DEBUG_REG_TRISC1_RESET_PC: u64 = 0xFFB1222C;
+const TENSIX_MMIO_RISCV_DEBUG_REG_TRISC2_RESET_PC: u64 = 0xFFB12230;
+const TENSIX_MMIO_RISCV_DEBUG_REG_NCRISC_RESET_PC: u64 = 0xFFB12238;
+const TENSIX_MMIO_SOFT_RESET_ALL: u32 = 0x47800;
+const TENSIX_MMIO_SOFT_RESET_BRISC_ONLY_RUN: u32 = 0x47000;
+const BANK_PORT: [[u8; 2]; DRAM_BANK_COUNT] = [
+    [2, 1],
+    [0, 1],
+    [0, 1],
+    [0, 1],
+    [2, 1],
+    [2, 1],
+    [2, 1],
+    [2, 1],
+];
 
 const P100_TENSIX_X: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14];
 const P150_TENSIX_X: [u8; 14] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16];
@@ -33,7 +61,7 @@ const DRAM_BANK_TILE_YS: [[u8; 3]; DRAM_BANK_COUNT] = [
     [5, 6, 7],
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct CoreCoord {
     pub(crate) x: u8,
     pub(crate) y: u8,
@@ -310,6 +338,9 @@ impl Device {
                     "device {} compiler initialized for {}",
                     self.id, self.arch
                 ));
+                if let Err(err) = self.upload_firmware() {
+                    log(format!("device {} firmware upload skipped: {err}", self.id));
+                }
             }
             Err(err) => {
                 log(format!(
@@ -318,6 +349,147 @@ impl Device {
                 ));
             }
         }
+    }
+
+    pub fn upload_firmware(&mut self) -> io::Result<()> {
+        let compiler = self
+            .compiler
+            .as_ref()
+            .ok_or_else(|| io::Error::other("compiler has not been initialized"))?;
+        let firmware = compiler.firmware();
+        let all_cores = self.all_worker_cores.clone();
+        if all_cores.is_empty() {
+            return Err(io::Error::other("no worker cores discovered"));
+        }
+
+        let mmio_base = align_down(TENSIX_MMIO_RISCV_DEBUG_REG_SOFT_RESET_0, TLB_SIZE_2M).0;
+        let reset_off = (TENSIX_MMIO_RISCV_DEBUG_REG_SOFT_RESET_0 - mmio_base) as usize;
+        let mut staged = HashMap::<&str, Vec<(usize, Vec<u8>)>>::new();
+        for name in ["brisc", "ncrisc", "trisc0", "trisc1", "trisc2"] {
+            let compiled = firmware.get(name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("missing firmware image {name}"),
+                )
+            })?;
+            let mut spans = Vec::new();
+            for segment in &compiled.segments {
+                if segment.data.is_empty() && segment.memsz == 0 {
+                    continue;
+                }
+                let mut data = segment.data.clone();
+                if segment.memsz as usize > data.len() {
+                    data.resize(segment.memsz as usize, 0);
+                }
+                let mut addr = segment.paddr;
+                if (TENSIX_MMIO_LOCAL_RAM_START..=TENSIX_MMIO_LOCAL_RAM_END).contains(&addr) {
+                    addr = compiled.scratch_base + (addr - TENSIX_MMIO_LOCAL_RAM_START);
+                }
+                if addr >= TENSIX_L1_SIZE {
+                    return Err(io::Error::other(format!(
+                        "{name}: bad paddr 0x{:x} -> 0x{addr:x}",
+                        segment.paddr
+                    )));
+                }
+                spans.push((addr as usize, data));
+            }
+            staged.insert(name, spans);
+        }
+
+        let jal = encode_jal_zero(TENSIX_L1_BRISC_FIRMWARE_BASE);
+        let go_init = [0u8, 0u8, 0u8, RUN_MSG_INIT];
+        let bank_table = build_bank_noc_table(&self.harvested_dram_banks, &all_cores)?;
+        let rects = mcast_rects(&all_cores);
+
+        let mut uc = TlbWindow::open(self.path.as_path(), all_cores[0], 0, TLB_SIZE_2M, false)?;
+        let mut wc = TlbWindow::open(self.path.as_path(), all_cores[0], 0, TLB_SIZE_2M, true)?;
+
+        for &(start, end) in &rects {
+            uc.target(start, Some(end), mmio_base, NocOrdering::Strict)?;
+            uc.write32(reset_off, TENSIX_MMIO_SOFT_RESET_ALL)?;
+        }
+
+        for &(start, end) in &rects {
+            wc.target(start, Some(end), 0, NocOrdering::Strict)?;
+            for name in ["brisc", "ncrisc", "trisc0", "trisc1", "trisc2"] {
+                for (addr, data) in staged.get(name).ok_or_else(|| {
+                    io::Error::other(format!("missing staged firmware for {name}"))
+                })? {
+                    wc.write(*addr, data)?;
+                }
+            }
+            wc.write(0, &jal)?;
+            wc.write(TENSIX_L1_GO_MSG, &go_init)?;
+            wc.write(TENSIX_L1_MEM_BANK_TO_NOC_SCRATCH, &bank_table)?;
+        }
+
+        let _ = wc.read32(0)?;
+
+        let subordinate_reset_pcs = [
+            (
+                TENSIX_MMIO_RISCV_DEBUG_REG_NCRISC_RESET_PC,
+                firmware
+                    .get("ncrisc")
+                    .and_then(|fw| fw.text_base())
+                    .ok_or_else(|| io::Error::other("ncrisc firmware missing text segment"))?,
+            ),
+            (
+                TENSIX_MMIO_RISCV_DEBUG_REG_TRISC0_RESET_PC,
+                firmware
+                    .get("trisc0")
+                    .and_then(|fw| fw.text_base())
+                    .ok_or_else(|| io::Error::other("trisc0 firmware missing text segment"))?,
+            ),
+            (
+                TENSIX_MMIO_RISCV_DEBUG_REG_TRISC1_RESET_PC,
+                firmware
+                    .get("trisc1")
+                    .and_then(|fw| fw.text_base())
+                    .ok_or_else(|| io::Error::other("trisc1 firmware missing text segment"))?,
+            ),
+            (
+                TENSIX_MMIO_RISCV_DEBUG_REG_TRISC2_RESET_PC,
+                firmware
+                    .get("trisc2")
+                    .and_then(|fw| fw.text_base())
+                    .ok_or_else(|| io::Error::other("trisc2 firmware missing text segment"))?,
+            ),
+        ];
+
+        for &(start, end) in &rects {
+            uc.target(start, Some(end), mmio_base, NocOrdering::Strict)?;
+            for (reg, text_base) in subordinate_reset_pcs {
+                uc.write32((reg - mmio_base) as usize, text_base)?;
+            }
+        }
+
+        for &(start, end) in &rects {
+            uc.target(start, Some(end), mmio_base, NocOrdering::Strict)?;
+            uc.write32(reset_off, TENSIX_MMIO_SOFT_RESET_BRISC_ONLY_RUN)?;
+        }
+
+        let probe = if all_cores.contains(&CoreCoord { x: 1, y: 2 }) {
+            CoreCoord { x: 1, y: 2 }
+        } else {
+            all_cores[0]
+        };
+        uc.target(probe, None, 0, NocOrdering::Strict)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if uc.read(TENSIX_L1_GO_MSG + 3, 1)?[0] == RUN_MSG_DONE {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("firmware not ready on {probe}"),
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        log(format!("device {} firmware uploaded", self.id));
+        Ok(())
     }
 }
 
@@ -399,6 +571,11 @@ fn read_arc_enabled_masks(path: &Path) -> io::Result<(u32, u32)> {
 fn align_down(value: u64, alignment: u64) -> (u64, u64) {
     let base = value & !(alignment - 1);
     (base, value - base)
+}
+
+fn encode_jal_zero(target: u32) -> [u8; 4] {
+    (((target & 0xFF000) | ((target & 0x800) << 9) | ((target & 0x7FE) << 20) | 0x6F) as u32)
+        .to_le_bytes()
 }
 
 fn discover_with(root: &Path) -> Vec<Device> {
@@ -483,6 +660,133 @@ fn dram_bank_x(bank: usize) -> u8 {
     if bank < 4 { 0 } else { 9 }
 }
 
+fn mcast_rects(cores: &[CoreCoord]) -> Vec<(CoreCoord, CoreCoord)> {
+    if cores.is_empty() {
+        return Vec::new();
+    }
+
+    let mut remaining = cores.iter().copied().collect::<BTreeSet<_>>();
+    let mut rects = Vec::new();
+
+    while let Some(&start) = remaining.iter().next() {
+        let x0 = start.x;
+        let y0 = start.y;
+        let mut x1 = x0;
+        while remaining.contains(&CoreCoord { x: x1 + 1, y: y0 }) {
+            x1 += 1;
+        }
+
+        let mut y1 = y0;
+        loop {
+            let next_y = y1 + 1;
+            let full_row = (x0..=x1).all(|x| remaining.contains(&CoreCoord { x, y: next_y }));
+            if !full_row {
+                break;
+            }
+            y1 = next_y;
+        }
+
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                remaining.remove(&CoreCoord { x, y });
+            }
+        }
+
+        rects.push((CoreCoord { x: x0, y: y0 }, CoreCoord { x: x1, y: y1 }));
+    }
+
+    rects
+}
+
+fn noc_xy(x: u8, y: u8) -> u16 {
+    (((y as u16) << 6) | x as u16) & 0xFFFF
+}
+
+fn build_bank_noc_table(
+    harvested_dram_banks: &[usize],
+    worker_cores: &[CoreCoord],
+) -> io::Result<Vec<u8>> {
+    let num_dram_banks = DRAM_BANK_COUNT - harvested_dram_banks.len();
+    let num_l1_banks = worker_cores.len();
+
+    let mut bank_xy = HashMap::<usize, (u8, u8)>::new();
+    match harvested_dram_banks.len() {
+        0 => {
+            for bank in 0..DRAM_BANK_COUNT {
+                let x = if bank < 4 { 17 } else { 18 };
+                bank_xy.insert(bank, (x, 12 + (bank % 4) as u8 * 3));
+            }
+        }
+        1 => {
+            let harvested = harvested_dram_banks[0];
+            let half = 4usize;
+            let mirror = if harvested < half {
+                harvested + half - 1
+            } else {
+                harvested - half
+            };
+
+            let (left, right): (Vec<usize>, Vec<usize>) = if harvested < half {
+                (
+                    (half - 1..DRAM_BANK_COUNT - 1)
+                        .filter(|bank| *bank != mirror)
+                        .chain(std::iter::once(mirror))
+                        .collect(),
+                    (0..half - 1).collect(),
+                )
+            } else {
+                (
+                    (0..half)
+                        .filter(|bank| *bank != mirror)
+                        .chain(std::iter::once(mirror))
+                        .collect(),
+                    (half..DRAM_BANK_COUNT - 1).collect(),
+                )
+            };
+
+            for (index, bank) in right.into_iter().enumerate() {
+                bank_xy.insert(bank, (18, 12 + index as u8 * 3));
+            }
+            for (index, bank) in left.into_iter().enumerate() {
+                bank_xy.insert(bank, (17, 12 + index as u8 * 3));
+            }
+        }
+        count => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported harvested DRAM bank count: {count}"),
+            ));
+        }
+    }
+
+    let mut bytes = Vec::new();
+    for noc in 0..2usize {
+        for bank in 0..num_dram_banks {
+            let (x, y0) = bank_xy.get(&bank).copied().ok_or_else(|| {
+                io::Error::other(format!("missing NOC mapping for logical DRAM bank {bank}"))
+            })?;
+            bytes.extend_from_slice(&noc_xy(x, y0 + BANK_PORT[bank][noc]).to_le_bytes());
+        }
+    }
+
+    let mut cols = worker_cores.iter().map(|core| core.x).collect::<Vec<_>>();
+    cols.sort_unstable();
+    cols.dedup();
+    for _ in 0..2usize {
+        for index in 0..num_l1_banks {
+            let x = cols[index % cols.len()];
+            let y = 2 + ((index / cols.len()) % 10) as u8;
+            bytes.extend_from_slice(&noc_xy(x, y).to_le_bytes());
+        }
+    }
+
+    for _ in 0..(num_dram_banks + num_l1_banks) {
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+    }
+
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +855,36 @@ mod tests {
     fn discovery_returns_empty_for_missing_root() {
         let devices = discover_with(Path::new("/tmp/does-not-exist"));
         assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn mcast_rects_groups_worker_cores_into_rectangles() {
+        let rects = mcast_rects(&[
+            CoreCoord { x: 1, y: 2 },
+            CoreCoord { x: 2, y: 2 },
+            CoreCoord { x: 1, y: 3 },
+            CoreCoord { x: 2, y: 3 },
+            CoreCoord { x: 4, y: 2 },
+        ]);
+
+        assert_eq!(
+            rects,
+            vec![
+                (CoreCoord { x: 1, y: 2 }, CoreCoord { x: 2, y: 3 }),
+                (CoreCoord { x: 4, y: 2 }, CoreCoord { x: 4, y: 2 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn bank_table_matches_expected_size_for_p100_layout() {
+        let worker_cores = worker_cores(&P100_TENSIX_X);
+        let table = build_bank_noc_table(&[7], &worker_cores).expect("bank table");
+        let num_dram_banks = DRAM_BANK_COUNT - 1;
+        let num_l1_banks = worker_cores.len();
+        let expected = 2 * num_dram_banks * size_of::<u16>()
+            + 2 * num_l1_banks * size_of::<u16>()
+            + (num_dram_banks + num_l1_banks) * size_of::<i32>();
+        assert_eq!(table.len(), expected);
     }
 }
