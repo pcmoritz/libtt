@@ -1,3 +1,4 @@
+use crate::compiler::Compiler;
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
@@ -116,6 +117,7 @@ pub struct Device {
     pub(crate) active_dram_banks: usize,
     pub(crate) dram_tiles: Vec<DramTile>,
     allocator: Option<Allocator>,
+    compiler: Option<Compiler>,
 }
 
 impl Device {
@@ -153,6 +155,7 @@ impl Device {
             active_dram_banks: 0,
             dram_tiles: Vec::new(),
             allocator: None,
+            compiler: None,
         };
 
         if let Some(probe) = probe {
@@ -177,6 +180,7 @@ impl Device {
             }
         }
 
+        info.initialize_compiler();
         info
     }
 
@@ -253,6 +257,10 @@ impl Device {
         Ok(load_device(local_hardware_id).1)
     }
 
+    pub fn compiler(&self) -> Option<&Compiler> {
+        self.compiler.as_ref()
+    }
+
     pub fn alloc_write(
         &mut self,
         data: &[u8],
@@ -283,6 +291,33 @@ impl Device {
         self.allocator
             .as_mut()
             .ok_or_else(|| io::Error::other("device allocator initialization failed"))
+    }
+
+    fn initialize_compiler(&mut self) {
+        if self.compiler.is_some()
+            || self.active_dram_banks == 0
+            || self.all_worker_cores.is_empty()
+            || self.prefetch_core.is_none()
+            || self.dispatch_core.is_none()
+        {
+            return;
+        }
+
+        match Compiler::for_device(self) {
+            Ok(compiler) => {
+                self.compiler = Some(compiler);
+                log(format!(
+                    "device {} compiler initialized for {}",
+                    self.id, self.arch
+                ));
+            }
+            Err(err) => {
+                log(format!(
+                    "device {} compiler initialization skipped: {err}",
+                    self.id
+                ));
+            }
+        }
     }
 }
 
@@ -424,7 +459,10 @@ fn harvested_dram_banks(gddr_enabled_mask: u32) -> Vec<usize> {
 }
 
 fn dram_tiles(harvested_dram_banks: &[usize]) -> Vec<DramTile> {
-    let harvested = harvested_dram_banks.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    let harvested = harvested_dram_banks
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
     let mut tiles = Vec::new();
 
     for bank in 0..DRAM_BANK_COUNT {
