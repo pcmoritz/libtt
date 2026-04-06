@@ -1,5 +1,6 @@
 use crate::device::Device;
 use crate::dram::DType;
+use crate::log::log;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::ffi::OsStr;
@@ -1308,6 +1309,11 @@ pub fn pack_xip_elf(elf: &[u8], xip_relocate: bool) -> io::Result<(Vec<u8>, usiz
 }
 
 fn run_command(exe: &Path, args: &[String], cwd: &Path, parse_profiler: bool) -> io::Result<()> {
+    log(format!(
+        "compiler exec cwd={} cmd={}",
+        cwd.display(),
+        render_command(exe, args)
+    ));
     let output = Command::new(exe).args(args).current_dir(cwd).output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
@@ -1320,6 +1326,24 @@ fn run_command(exe: &Path, args: &[String], cwd: &Path, parse_profiler: bool) ->
         parse_profiler_messages(&String::from_utf8_lossy(&output.stderr));
     }
     Ok(())
+}
+
+fn render_command(exe: &Path, args: &[String]) -> String {
+    std::iter::once(exe.display().to_string())
+        .chain(args.iter().map(|arg| shell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .bytes()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'=' | b':' | b',' | b'+'))
+    {
+        return arg.to_owned();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 fn compile_and_link<P, L>(
