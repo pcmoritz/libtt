@@ -1862,9 +1862,6 @@ pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
         return invalid_argument("args must not be null");
     };
     log("pjrt buffer_to_host_buffer entered");
-    if !args.host_layout.is_null() {
-        return unimplemented("custom host layouts are not supported");
-    }
     let Ok(buffer) = (unsafe { checked_ref(args.src, "src") }) else {
         return invalid_argument("src must not be null");
     };
@@ -2357,11 +2354,12 @@ mod tests {
     }
 
     #[test]
-    fn buffer_to_host_buffer_reports_deleted_buffer_without_touching_device() {
+    fn buffer_to_host_buffer_accepts_host_layout_before_deleted_check() {
         let api = unsafe { &*GetPjrtApi() };
         let to_host = api
             .PJRT_Buffer_ToHostBuffer
             .expect("PJRT_Buffer_ToHostBuffer must be exported");
+        let mut host_layout = PJRT_Buffer_MemoryLayout { _private: [] };
         let mut buffer = PJRT_Buffer {
             buffer_type: PJRT_Buffer_Type_F16,
             dims: vec![32, 32],
@@ -2376,7 +2374,7 @@ mod tests {
             struct_size: size_of::<PJRT_Buffer_ToHostBuffer_Args>(),
             extension_start: ptr::null_mut(),
             src: &mut buffer,
-            host_layout: ptr::null_mut(),
+            host_layout: &mut host_layout,
             dst: dst.as_mut_ptr().cast::<c_void>(),
             dst_size: dst.len(),
             event: ptr::null_mut(),
