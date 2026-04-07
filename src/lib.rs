@@ -578,6 +578,17 @@ pub struct PJRT_Buffer_IsDeleted_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_Buffer_ToHostBuffer_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub src: *mut PJRT_Buffer,
+    pub host_layout: *mut PJRT_Buffer_MemoryLayout,
+    pub dst: *mut c_void,
+    pub dst_size: usize,
+    pub event: *mut PJRT_Event,
+}
+
+#[repr(C)]
 pub struct PJRT_Buffer_IsOnCpu_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -704,7 +715,7 @@ pub struct PJRT_Api {
     pub PJRT_Buffer_Delete: PjrtResultFn<PJRT_Buffer_Delete_Args>,
     pub PJRT_Buffer_IsDeleted: PjrtResultFn<PJRT_Buffer_IsDeleted_Args>,
     pub PJRT_Buffer_CopyToDevice: PjrtOpaqueFn,
-    pub PJRT_Buffer_ToHostBuffer: PjrtOpaqueFn,
+    pub PJRT_Buffer_ToHostBuffer: PjrtResultFn<PJRT_Buffer_ToHostBuffer_Args>,
     pub PJRT_Buffer_IsOnCpu: PjrtResultFn<PJRT_Buffer_IsOnCpu_Args>,
     pub PJRT_Buffer_ReadyEvent: PjrtResultFn<PJRT_Buffer_ReadyEvent_Args>,
     pub PJRT_Buffer_UnsafePointer: PjrtOpaqueFn,
@@ -1844,6 +1855,73 @@ pub unsafe extern "C" fn TT_Buffer_IsDeleted(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
+    args: *mut PJRT_Buffer_ToHostBuffer_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    log("pjrt buffer_to_host_buffer entered");
+    if !args.host_layout.is_null() {
+        return unimplemented("custom host layouts are not supported");
+    }
+    let Ok(buffer) = (unsafe { checked_ref(args.src, "src") }) else {
+        return invalid_argument("src must not be null");
+    };
+    let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+        return pjrt_error(
+            "buffer has been deleted",
+            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+        );
+    };
+    let dtype = match pjrt_buffer_type_to_dtype(buffer.buffer_type) {
+        Ok(dtype) => dtype,
+        Err(err) => return err,
+    };
+    let dims = match dims_i64_to_usize(&buffer.dims) {
+        Ok(dims) => dims,
+        Err(err) => return err,
+    };
+    let byte_size = match host_byte_size(dtype, &dims) {
+        Ok(size) => size,
+        Err(err) => return err,
+    };
+    if args.dst_size < byte_size {
+        return invalid_argument("dst buffer is too small");
+    }
+    if byte_size > 0 && args.dst.is_null() {
+        return invalid_argument("dst must not be null for non-empty buffers");
+    }
+
+    let mut device = match Device::open(buffer.local_hardware_id) {
+        Ok(device) => device,
+        Err(err) => return io_error(err),
+    };
+    let data = match device.dram_read(dram_buffer) {
+        Ok(data) => data,
+        Err(err) => return io_error(err),
+    };
+    if data.len() != byte_size {
+        return pjrt_error(
+            format!(
+                "readback byte size {} does not match buffer byte size {}",
+                data.len(),
+                byte_size
+            ),
+            PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
+        );
+    }
+    if byte_size > 0 {
+        // SAFETY: caller owns `dst` for at least `dst_size` bytes and we checked capacity.
+        unsafe {
+            ptr::copy_nonoverlapping(data.as_ptr(), args.dst.cast::<u8>(), data.len());
+        }
+    }
+    args.event = ready_event();
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Buffer_IsOnCpu(
     args: *mut PJRT_Buffer_IsOnCpu_Args,
 ) -> *mut PJRT_Error {
@@ -2024,7 +2102,7 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Buffer_Delete: Some(TT_Buffer_Delete),
     PJRT_Buffer_IsDeleted: Some(TT_Buffer_IsDeleted),
     PJRT_Buffer_CopyToDevice: None,
-    PJRT_Buffer_ToHostBuffer: None,
+    PJRT_Buffer_ToHostBuffer: Some(TT_Buffer_ToHostBuffer),
     PJRT_Buffer_IsOnCpu: Some(TT_Buffer_IsOnCpu),
     PJRT_Buffer_ReadyEvent: Some(TT_Buffer_ReadyEvent),
     PJRT_Buffer_UnsafePointer: None,
@@ -2107,11 +2185,41 @@ mod tests {
         panic!("unexpected PJRT error {:?}: {detail}", code_args.code);
     }
 
+    fn take_error_code(api: &PJRT_Api, error: *mut PJRT_Error) -> PJRT_Error_Code {
+        assert!(!error.is_null());
+
+        let mut code_args = PJRT_Error_GetCode_Args {
+            struct_size: size_of::<PJRT_Error_GetCode_Args>(),
+            extension_start: ptr::null_mut(),
+            error,
+            code: PJRT_Error_Code::PJRT_Error_Code_UNKNOWN,
+        };
+        let get_code = api.PJRT_Error_GetCode.expect("error get code must exist");
+        let status = unsafe { get_code(&mut code_args) };
+        assert!(status.is_null(), "error inspection should not fail");
+
+        unsafe {
+            api.PJRT_Error_Destroy.expect("error destroy must exist")(
+                &mut PJRT_Error_Destroy_Args {
+                    struct_size: size_of::<PJRT_Error_Destroy_Args>(),
+                    extension_start: ptr::null_mut(),
+                    error,
+                },
+            );
+        }
+
+        code_args.code
+    }
+
     #[test]
     fn get_pjrt_api_exposes_minimal_client_and_device_interface() {
         let api = unsafe { &*GetPjrtApi() };
         assert_eq!(api.pjrt_api_version.major_version, PJRT_API_MAJOR);
         assert_eq!(api.pjrt_api_version.minor_version, PJRT_API_MINOR);
+        assert!(
+            api.PJRT_Buffer_ToHostBuffer.is_some(),
+            "PJRT_Buffer_ToHostBuffer must be exported"
+        );
 
         let plugin_init = api
             .PJRT_Plugin_Initialize
@@ -2246,6 +2354,41 @@ mod tests {
                     error,
                 });
         }
+    }
+
+    #[test]
+    fn buffer_to_host_buffer_reports_deleted_buffer_without_touching_device() {
+        let api = unsafe { &*GetPjrtApi() };
+        let to_host = api
+            .PJRT_Buffer_ToHostBuffer
+            .expect("PJRT_Buffer_ToHostBuffer must be exported");
+        let mut buffer = PJRT_Buffer {
+            buffer_type: PJRT_Buffer_Type_F16,
+            dims: vec![32, 32],
+            device: ptr::null_mut(),
+            memory: ptr::null_mut(),
+            local_hardware_id: 0,
+            dram_buffer: None,
+            deleted: true,
+        };
+        let mut dst = vec![0u8; 32 * 32 * 2];
+        let mut args = PJRT_Buffer_ToHostBuffer_Args {
+            struct_size: size_of::<PJRT_Buffer_ToHostBuffer_Args>(),
+            extension_start: ptr::null_mut(),
+            src: &mut buffer,
+            host_layout: ptr::null_mut(),
+            dst: dst.as_mut_ptr().cast::<c_void>(),
+            dst_size: dst.len(),
+            event: ptr::null_mut(),
+        };
+
+        let error = unsafe { to_host(&mut args) };
+
+        assert_eq!(
+            take_error_code(api, error),
+            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION
+        );
+        assert!(args.event.is_null());
     }
 
     #[test]
