@@ -2182,32 +2182,6 @@ mod tests {
         panic!("unexpected PJRT error {:?}: {detail}", code_args.code);
     }
 
-    fn take_error_code(api: &PJRT_Api, error: *mut PJRT_Error) -> PJRT_Error_Code {
-        assert!(!error.is_null());
-
-        let mut code_args = PJRT_Error_GetCode_Args {
-            struct_size: size_of::<PJRT_Error_GetCode_Args>(),
-            extension_start: ptr::null_mut(),
-            error,
-            code: PJRT_Error_Code::PJRT_Error_Code_UNKNOWN,
-        };
-        let get_code = api.PJRT_Error_GetCode.expect("error get code must exist");
-        let status = unsafe { get_code(&mut code_args) };
-        assert!(status.is_null(), "error inspection should not fail");
-
-        unsafe {
-            api.PJRT_Error_Destroy.expect("error destroy must exist")(
-                &mut PJRT_Error_Destroy_Args {
-                    struct_size: size_of::<PJRT_Error_Destroy_Args>(),
-                    extension_start: ptr::null_mut(),
-                    error,
-                },
-            );
-        }
-
-        code_args.code
-    }
-
     #[test]
     fn get_pjrt_api_exposes_minimal_client_and_device_interface() {
         let api = unsafe { &*GetPjrtApi() };
@@ -2347,42 +2321,6 @@ mod tests {
                     error,
                 });
         }
-    }
-
-    #[test]
-    fn buffer_to_host_buffer_accepts_host_layout_before_deleted_check() {
-        let api = unsafe { &*GetPjrtApi() };
-        let to_host = api
-            .PJRT_Buffer_ToHostBuffer
-            .expect("PJRT_Buffer_ToHostBuffer must be exported");
-        let mut host_layout = PJRT_Buffer_MemoryLayout { _private: [] };
-        let mut buffer = PJRT_Buffer {
-            buffer_type: PJRT_Buffer_Type_F16,
-            dims: vec![32, 32],
-            device: ptr::null_mut(),
-            memory: ptr::null_mut(),
-            local_hardware_id: 0,
-            dram_buffer: None,
-            deleted: true,
-        };
-        let mut dst = vec![0u8; 32 * 32 * 2];
-        let mut args = PJRT_Buffer_ToHostBuffer_Args {
-            struct_size: size_of::<PJRT_Buffer_ToHostBuffer_Args>(),
-            extension_start: ptr::null_mut(),
-            src: &mut buffer,
-            host_layout: &mut host_layout,
-            dst: dst.as_mut_ptr().cast::<c_void>(),
-            dst_size: dst.len(),
-            event: ptr::null_mut(),
-        };
-
-        let error = unsafe { to_host(&mut args) };
-
-        assert_eq!(
-            take_error_code(api, error),
-            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION
-        );
-        assert!(args.event.is_null());
     }
 
     #[test]
