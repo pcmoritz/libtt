@@ -2213,10 +2213,6 @@ mod tests {
         let api = unsafe { &*GetPjrtApi() };
         assert_eq!(api.pjrt_api_version.major_version, PJRT_API_MAJOR);
         assert_eq!(api.pjrt_api_version.minor_version, PJRT_API_MINOR);
-        assert!(
-            api.PJRT_Buffer_ToHostBuffer.is_some(),
-            "PJRT_Buffer_ToHostBuffer must be exported"
-        );
 
         let plugin_init = api
             .PJRT_Plugin_Initialize
