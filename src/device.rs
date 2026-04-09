@@ -1,4 +1,10 @@
 use crate::dram::{Allocator, DType, DramBuffer};
+use crate::hw::{
+    ARC_DEFAULT_TENSIX_ENABLED, ARC_NOC_BASE, ARC_SCRATCH_RAM_13, ARC_TILE, CoreCoord,
+    DEFAULT_GDDR_ENABLED, DramTile, TAG_GDDR_ENABLED, TAG_TENSIX_ENABLED_COL, TLB_SIZE_2M,
+    active_dram_banks, active_tensix_core_count, align_down, build_bank_noc_table, dram_tiles,
+    harvested_dram_banks, worker_cores,
+};
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
 use std::fs;
@@ -6,50 +12,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_ROOT: &str = "/dev/tenstorrent";
-const ARC_DEFAULT_TENSIX_ENABLED: u32 = 0x3fff;
-const DEFAULT_GDDR_ENABLED: u32 = 0xff;
-const DRAM_BANK_COUNT: usize = 8;
-const WORKER_Y_START: u8 = 2;
-const WORKER_Y_END: u8 = 12;
-const ARC_TILE: CoreCoord = CoreCoord { x: 8, y: 0 };
-const ARC_NOC_BASE: u64 = 0x8000_0000;
-const ARC_SCRATCH_RAM_13: usize = 0x30434;
-const TAG_TENSIX_ENABLED_COL: u16 = 34;
-const TAG_GDDR_ENABLED: u16 = 36;
-const TLB_SIZE_2M: u64 = 1 << 21;
 
 const P100_TENSIX_X: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14];
 const P150_TENSIX_X: [u8; 14] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16];
-
-const DRAM_BANK_TILE_YS: [[u8; 3]; DRAM_BANK_COUNT] = [
-    [0, 1, 11],
-    [2, 3, 10],
-    [4, 8, 9],
-    [5, 6, 7],
-    [0, 1, 11],
-    [2, 3, 10],
-    [4, 8, 9],
-    [5, 6, 7],
-];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct CoreCoord {
-    pub(crate) x: u8,
-    pub(crate) y: u8,
-}
-
-impl std::fmt::Display for CoreCoord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{},{}", self.x, self.y)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DramTile {
-    pub(crate) bank: usize,
-    pub(crate) x: u8,
-    pub(crate) y: u8,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BoardConfig {
@@ -276,6 +241,10 @@ impl Device {
         self.allocator_mut()?.read_host_data(buf)
     }
 
+    pub fn bank_noc_table(&self) -> io::Result<Vec<u8>> {
+        build_bank_noc_table(&self.harvested_dram_banks, &self.all_worker_cores)
+    }
+
     fn allocator_mut(&mut self) -> io::Result<&mut Allocator> {
         if self.allocator.is_none() {
             self.allocator = Some(Allocator::from_device(self)?);
@@ -361,11 +330,6 @@ fn read_arc_enabled_masks(path: &Path) -> io::Result<(u32, u32)> {
     Ok((gddr_enabled_mask, tensix_enabled_col_mask))
 }
 
-fn align_down(value: u64, alignment: u64) -> (u64, u64) {
-    let base = value & !(alignment - 1);
-    (base, value - base)
-}
-
 fn discover_with(root: &Path) -> Vec<Device> {
     let mut paths = Vec::new();
 
@@ -391,58 +355,8 @@ fn discover_with(root: &Path) -> Vec<Device> {
         .collect()
 }
 
-fn worker_cores(tensix_x: &[u8]) -> Vec<CoreCoord> {
-    let mut cores = Vec::with_capacity(tensix_x.len() * (WORKER_Y_END - WORKER_Y_START) as usize);
-
-    for &x in tensix_x {
-        for y in WORKER_Y_START..WORKER_Y_END {
-            cores.push(CoreCoord { x, y });
-        }
-    }
-
-    cores
-}
-
-fn active_tensix_core_count(enabled_col_mask: u32) -> usize {
-    (enabled_col_mask & ARC_DEFAULT_TENSIX_ENABLED).count_ones() as usize * 10
-}
-
 fn local_hardware_id_from_path(path: &Path) -> Option<usize> {
     path.file_name()?.to_str()?.parse().ok()
-}
-
-fn active_dram_banks(gddr_enabled_mask: u32) -> usize {
-    (0..DRAM_BANK_COUNT)
-        .filter(|bank| ((gddr_enabled_mask >> bank) & 1) != 0)
-        .count()
-}
-
-fn harvested_dram_banks(gddr_enabled_mask: u32) -> Vec<usize> {
-    (0..DRAM_BANK_COUNT)
-        .filter(|bank| ((gddr_enabled_mask >> bank) & 1) == 0)
-        .collect()
-}
-
-fn dram_tiles(harvested_dram_banks: &[usize]) -> Vec<DramTile> {
-    let harvested = harvested_dram_banks.iter().copied().collect::<std::collections::BTreeSet<_>>();
-    let mut tiles = Vec::new();
-
-    for bank in 0..DRAM_BANK_COUNT {
-        if harvested.contains(&bank) {
-            continue;
-        }
-
-        let x = dram_bank_x(bank);
-        for &y in &DRAM_BANK_TILE_YS[bank] {
-            tiles.push(DramTile { bank, x, y });
-        }
-    }
-
-    tiles
-}
-
-fn dram_bank_x(bank: usize) -> u8 {
-    if bank < 4 { 0 } else { 9 }
 }
 
 #[cfg(test)]
@@ -513,5 +427,23 @@ mod tests {
     fn discovery_returns_empty_for_missing_root() {
         let devices = discover_with(Path::new("/tmp/does-not-exist"));
         assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn builds_bank_noc_table_from_device_topology() {
+        let device = Device::from_probe(
+            0,
+            0,
+            PathBuf::from("/dev/tenstorrent/0"),
+            Some(ProbeInfo {
+                tensix_enabled_col_mask: 0x0fff,
+                gddr_enabled_mask: 0x7f,
+            }),
+        );
+
+        let table = device
+            .bank_noc_table()
+            .expect("bank noc table should build");
+        assert_eq!(table.len(), (7 + 120) * 8);
     }
 }

@@ -1,5 +1,8 @@
-use crate::device::CoreCoord;
-use crate::device::{Device, DramTile, load_device};
+use crate::device::{Device, load_device};
+use crate::hw::{
+    CoreCoord, DRAM_ALIGNMENT, DRAM_BARRIER_BASE, DRAM_BARRIER_FLAGS, DRAM_TILES_PER_BANK,
+    DRAM_WRITE_OFFSET, DramTile, TLB_SIZE_4G, align_up,
+};
 use crate::linux::{NocOrdering, TlbWindow};
 use std::io;
 use std::path::PathBuf;
@@ -8,13 +11,6 @@ const TILE_R: usize = 32;
 const TILE_C: usize = 32;
 const FACE_R: usize = 16;
 const FACE_C: usize = 16;
-const DRAM_TILES_PER_BANK: usize = 3;
-const DRAM_ALIGNMENT: usize = 64;
-const DRAM_ALLOC_BASE: u64 = 0x40;
-const TLB_SIZE_4G: u64 = 1 << 32;
-const DRAM_BARRIER_BASE: usize = 0;
-const DRAM_BARRIER_FLAGS: [u32; 2] = [0xaa, 0xbb];
-
 type Shape = Vec<usize>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,7 +103,7 @@ impl Allocator {
         Ok(Self {
             window,
             bank_tiles,
-            next: DRAM_ALLOC_BASE,
+            next: DRAM_WRITE_OFFSET,
             bank_count,
         })
     }
@@ -119,8 +115,7 @@ impl Allocator {
         name: impl Into<String>,
         shape: Option<Shape>,
     ) -> io::Result<DramBuffer> {
-        let (addr, next) =
-            next_allocation_range(self.next, num_tiles, dtype, self.bank_count)?;
+        let (addr, next) = next_allocation_range(self.next, num_tiles, dtype, self.bank_count)?;
         self.next = next;
         Ok(DramBuffer {
             name: name.into(),
@@ -421,10 +416,6 @@ fn next_allocation_range(
     Ok((next, aligned_end))
 }
 
-fn align_up(value: u64, align: u64) -> u64 {
-    value.div_ceil(align) * align
-}
-
 fn element_offset(
     batch_index: usize,
     row: usize,
@@ -547,7 +538,7 @@ mod tests {
     fn buffer_size_matches_tile_count() {
         let buffer = DramBuffer {
             name: "weights".to_owned(),
-            addr: DRAM_ALLOC_BASE,
+            addr: DRAM_WRITE_OFFSET,
             num_tiles: 3,
             dtype: DType::Float16,
             shape: Some(vec![32, 96]),

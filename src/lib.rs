@@ -2,6 +2,7 @@
 
 pub mod device;
 pub mod dram;
+mod hw;
 mod linux;
 mod log;
 
