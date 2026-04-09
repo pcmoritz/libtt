@@ -7,16 +7,6 @@ const BANK_NOCS: usize = 2;
 const BANK_PORT_STRIDE: u8 = 3;
 const DRAM_NOC_LEFT_X: u8 = 17;
 const DRAM_NOC_RIGHT_X: u8 = 18;
-const BANK_PORTS: [[u8; BANK_NOCS]; Dram::BANK_COUNT] = [
-    [2, 1],
-    [0, 1],
-    [0, 1],
-    [0, 1],
-    [2, 1],
-    [2, 1],
-    [2, 1],
-    [2, 1],
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CoreCoord {
@@ -112,6 +102,7 @@ impl Dram {
         harvested_dram_banks: &[usize],
         worker_cores: &[CoreCoord],
     ) -> io::Result<Vec<u8>> {
+        let bank_ports = [[2, 1], [0, 1], [0, 1], [0, 1], [2, 1], [2, 1], [2, 1], [2, 1]];
         let num_dram_banks = Self::BANK_COUNT
             .checked_sub(harvested_dram_banks.len())
             .ok_or_else(|| {
@@ -127,7 +118,7 @@ impl Dram {
         for noc in 0..BANK_NOCS {
             for bank in 0..num_dram_banks {
                 let (x, y0) = bank_xy[bank];
-                out.extend_from_slice(&noc_xy(x, y0 + BANK_PORTS[bank][noc]).to_le_bytes());
+                out.extend_from_slice(&noc_xy(x, y0 + bank_ports[bank][noc]).to_le_bytes());
             }
         }
 
