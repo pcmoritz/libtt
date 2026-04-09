@@ -1,30 +1,13 @@
 use std::collections::BTreeSet;
 use std::io;
 
-pub(crate) const ARC_TILE: CoreCoord = CoreCoord { x: 8, y: 0 };
-pub(crate) const ARC_NOC_BASE: u64 = 0x8000_0000;
-pub(crate) const ARC_SCRATCH_RAM_13: usize = 0x30434;
-pub(crate) const ARC_DEFAULT_TENSIX_ENABLED: u32 = 0x3fff;
-pub(crate) const TAG_TENSIX_ENABLED_COL: u16 = 34;
-pub(crate) const TAG_GDDR_ENABLED: u16 = 36;
-pub(crate) const DEFAULT_GDDR_ENABLED: u32 = 0xff;
-pub(crate) const TLB_SIZE_2M: u64 = 1 << 21;
-pub(crate) const TLB_SIZE_4G: u64 = 1 << 32;
-
-pub(crate) const DRAM_BANK_COUNT: usize = 8;
-pub(crate) const DRAM_TILES_PER_BANK: usize = 3;
-pub(crate) const DRAM_WRITE_OFFSET: u64 = 0x40;
-pub(crate) const DRAM_BARRIER_BASE: usize = 0;
-pub(crate) const DRAM_ALIGNMENT: usize = 64;
-pub(crate) const DRAM_BARRIER_FLAGS: [u32; 2] = [0xaa, 0xbb];
-
 const WORKER_Y_START: u8 = 2;
 const WORKER_Y_END: u8 = 12;
 const BANK_NOCS: usize = 2;
 const BANK_PORT_STRIDE: u8 = 3;
 const DRAM_NOC_LEFT_X: u8 = 17;
 const DRAM_NOC_RIGHT_X: u8 = 18;
-const BANK_PORTS: [[u8; BANK_NOCS]; DRAM_BANK_COUNT] = [
+const BANK_PORTS: [[u8; BANK_NOCS]; Dram::BANK_COUNT] = [
     [2, 1],
     [0, 1],
     [0, 1],
@@ -33,17 +16,6 @@ const BANK_PORTS: [[u8; BANK_NOCS]; DRAM_BANK_COUNT] = [
     [2, 1],
     [2, 1],
     [2, 1],
-];
-
-const DRAM_BANK_TILE_YS: [[u8; 3]; DRAM_BANK_COUNT] = [
-    [0, 1, 11],
-    [2, 3, 10],
-    [4, 8, 9],
-    [5, 6, 7],
-    [0, 1, 11],
-    [2, 3, 10],
-    [4, 8, 9],
-    [5, 6, 7],
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -63,6 +35,191 @@ pub(crate) struct DramTile {
     pub(crate) bank: usize,
     pub(crate) x: u8,
     pub(crate) y: u8,
+}
+
+pub(crate) struct Arc;
+
+impl Arc {
+    pub(crate) const TILE: CoreCoord = CoreCoord { x: 8, y: 0 };
+    pub(crate) const NOC_BASE: u64 = 0x8000_0000;
+    pub(crate) const SCRATCH_RAM_13: usize = 0x30434;
+    pub(crate) const DEFAULT_TENSIX_ENABLED: u32 = 0x3fff;
+    pub(crate) const TAG_TENSIX_ENABLED_COL: u16 = 34;
+    pub(crate) const TAG_GDDR_ENABLED: u16 = 36;
+    pub(crate) const DEFAULT_GDDR_ENABLED: u32 = 0xff;
+    pub(crate) const TLB_SIZE_2M: u64 = 1 << 21;
+
+    pub(crate) fn active_tensix_core_count(enabled_col_mask: u32) -> usize {
+        (enabled_col_mask & Self::DEFAULT_TENSIX_ENABLED).count_ones() as usize * 10
+    }
+}
+
+pub(crate) struct Dram;
+
+impl Dram {
+    pub(crate) const BANK_COUNT: usize = 8;
+    pub(crate) const TILES_PER_BANK: usize = 3;
+    pub(crate) const WRITE_OFFSET: u64 = 0x40;
+    pub(crate) const BARRIER_BASE: usize = 0;
+    pub(crate) const ALIGNMENT: usize = 64;
+    pub(crate) const BARRIER_FLAGS: [u32; 2] = [0xaa, 0xbb];
+    pub(crate) const TLB_SIZE_4G: u64 = 1 << 32;
+    pub(crate) const BANK_TILE_YS: [[u8; 3]; Self::BANK_COUNT] = [
+        [0, 1, 11],
+        [2, 3, 10],
+        [4, 8, 9],
+        [5, 6, 7],
+        [0, 1, 11],
+        [2, 3, 10],
+        [4, 8, 9],
+        [5, 6, 7],
+    ];
+
+    pub(crate) fn active_banks(gddr_enabled_mask: u32) -> usize {
+        (0..Self::BANK_COUNT)
+            .filter(|bank| ((gddr_enabled_mask >> bank) & 1) != 0)
+            .count()
+    }
+
+    pub(crate) fn harvested_banks(gddr_enabled_mask: u32) -> Vec<usize> {
+        (0..Self::BANK_COUNT)
+            .filter(|bank| ((gddr_enabled_mask >> bank) & 1) == 0)
+            .collect()
+    }
+
+    pub(crate) fn tiles(harvested_dram_banks: &[usize]) -> Vec<DramTile> {
+        let harvested = harvested_dram_banks
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut tiles = Vec::new();
+
+        for bank in 0..Self::BANK_COUNT {
+            if harvested.contains(&bank) {
+                continue;
+            }
+
+            let x = Self::bank_x(bank);
+            for &y in &Self::BANK_TILE_YS[bank] {
+                tiles.push(DramTile { bank, x, y });
+            }
+        }
+
+        tiles
+    }
+
+    pub(crate) fn build_bank_noc_table(
+        harvested_dram_banks: &[usize],
+        worker_cores: &[CoreCoord],
+    ) -> io::Result<Vec<u8>> {
+        let num_dram_banks = Self::BANK_COUNT
+            .checked_sub(harvested_dram_banks.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "too many harvested DRAM banks")
+            })?;
+        let bank_xy = Self::logical_bank_xy(harvested_dram_banks)?;
+
+        let mut out = Vec::with_capacity(
+            (BANK_NOCS * (num_dram_banks + worker_cores.len())) * 2
+                + (num_dram_banks + worker_cores.len()) * 4,
+        );
+
+        for noc in 0..BANK_NOCS {
+            for bank in 0..num_dram_banks {
+                let (x, y0) = bank_xy[bank];
+                out.extend_from_slice(&noc_xy(x, y0 + BANK_PORTS[bank][noc]).to_le_bytes());
+            }
+        }
+
+        let cols = worker_cores
+            .iter()
+            .map(|core| core.x)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if cols.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker core list must not be empty",
+            ));
+        }
+
+        for _ in 0..BANK_NOCS {
+            for index in 0..worker_cores.len() {
+                let x = cols[index % cols.len()];
+                let y = WORKER_Y_START
+                    + ((index / cols.len()) % (WORKER_Y_END - WORKER_Y_START) as usize) as u8;
+                out.extend_from_slice(&noc_xy(x, y).to_le_bytes());
+            }
+        }
+
+        for _ in 0..(num_dram_banks + worker_cores.len()) {
+            out.extend_from_slice(&0i32.to_le_bytes());
+        }
+
+        Ok(out)
+    }
+
+    fn logical_bank_xy(harvested_dram_banks: &[usize]) -> io::Result<Vec<(u8, u8)>> {
+        match harvested_dram_banks {
+            [] => Ok((0..Self::BANK_COUNT)
+                .map(|bank| {
+                    let x = if bank < Self::BANK_COUNT / 2 {
+                        DRAM_NOC_LEFT_X
+                    } else {
+                        DRAM_NOC_RIGHT_X
+                    };
+                    let y = 12 + (bank % (Self::BANK_COUNT / 2)) as u8 * BANK_PORT_STRIDE;
+                    (x, y)
+                })
+                .collect()),
+            [harvested_bank] => {
+                let half = Self::BANK_COUNT / 2;
+                let mirror = if *harvested_bank < half {
+                    harvested_bank + half - 1
+                } else {
+                    harvested_bank - half
+                };
+
+                let right = if *harvested_bank < half {
+                    (0..(half - 1)).collect::<Vec<_>>()
+                } else {
+                    (half..(Self::BANK_COUNT - 1)).collect::<Vec<_>>()
+                };
+                let left = if *harvested_bank < half {
+                    ((half - 1)..(Self::BANK_COUNT - 1))
+                        .filter(|bank| *bank != mirror)
+                        .chain(std::iter::once(mirror))
+                        .collect::<Vec<_>>()
+                } else {
+                    (0..half)
+                        .filter(|bank| *bank != mirror)
+                        .chain(std::iter::once(mirror))
+                        .collect::<Vec<_>>()
+                };
+
+                let mut bank_xy = vec![(0, 0); Self::BANK_COUNT - 1];
+                for (index, bank) in right.into_iter().enumerate() {
+                    bank_xy[bank] = (DRAM_NOC_RIGHT_X, 12 + index as u8 * BANK_PORT_STRIDE);
+                }
+                for (index, bank) in left.into_iter().enumerate() {
+                    bank_xy[bank] = (DRAM_NOC_LEFT_X, 12 + index as u8 * BANK_PORT_STRIDE);
+                }
+                Ok(bank_xy)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unsupported harvested DRAM bank count: {}",
+                    harvested_dram_banks.len()
+                ),
+            )),
+        }
+    }
+
+    fn bank_x(bank: usize) -> u8 {
+        if bank < 4 { 0 } else { 9 }
+    }
 }
 
 pub(crate) fn align_up(value: u64, align: u64) -> u64 {
@@ -88,156 +245,6 @@ pub(crate) fn worker_cores(tensix_x: &[u8]) -> Vec<CoreCoord> {
     cores
 }
 
-pub(crate) fn active_tensix_core_count(enabled_col_mask: u32) -> usize {
-    (enabled_col_mask & ARC_DEFAULT_TENSIX_ENABLED).count_ones() as usize * 10
-}
-
-pub(crate) fn active_dram_banks(gddr_enabled_mask: u32) -> usize {
-    (0..DRAM_BANK_COUNT)
-        .filter(|bank| ((gddr_enabled_mask >> bank) & 1) != 0)
-        .count()
-}
-
-pub(crate) fn harvested_dram_banks(gddr_enabled_mask: u32) -> Vec<usize> {
-    (0..DRAM_BANK_COUNT)
-        .filter(|bank| ((gddr_enabled_mask >> bank) & 1) == 0)
-        .collect()
-}
-
-pub(crate) fn dram_tiles(harvested_dram_banks: &[usize]) -> Vec<DramTile> {
-    let harvested = harvested_dram_banks
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let mut tiles = Vec::new();
-
-    for bank in 0..DRAM_BANK_COUNT {
-        if harvested.contains(&bank) {
-            continue;
-        }
-
-        let x = dram_bank_x(bank);
-        for &y in &DRAM_BANK_TILE_YS[bank] {
-            tiles.push(DramTile { bank, x, y });
-        }
-    }
-
-    tiles
-}
-
-pub(crate) fn build_bank_noc_table(
-    harvested_dram_banks: &[usize],
-    worker_cores: &[CoreCoord],
-) -> io::Result<Vec<u8>> {
-    let num_dram_banks = DRAM_BANK_COUNT
-        .checked_sub(harvested_dram_banks.len())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "too many harvested DRAM banks")
-        })?;
-    let bank_xy = logical_bank_xy(harvested_dram_banks)?;
-
-    let mut out = Vec::with_capacity(
-        (BANK_NOCS * (num_dram_banks + worker_cores.len())) * 2
-            + (num_dram_banks + worker_cores.len()) * 4,
-    );
-
-    for noc in 0..BANK_NOCS {
-        for bank in 0..num_dram_banks {
-            let (x, y0) = bank_xy[bank];
-            out.extend_from_slice(&noc_xy(x, y0 + BANK_PORTS[bank][noc]).to_le_bytes());
-        }
-    }
-
-    let cols = worker_cores
-        .iter()
-        .map(|core| core.x)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if cols.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "worker core list must not be empty",
-        ));
-    }
-
-    for _ in 0..BANK_NOCS {
-        for index in 0..worker_cores.len() {
-            let x = cols[index % cols.len()];
-            let y = WORKER_Y_START
-                + ((index / cols.len()) % (WORKER_Y_END - WORKER_Y_START) as usize) as u8;
-            out.extend_from_slice(&noc_xy(x, y).to_le_bytes());
-        }
-    }
-
-    for _ in 0..(num_dram_banks + worker_cores.len()) {
-        out.extend_from_slice(&0i32.to_le_bytes());
-    }
-
-    Ok(out)
-}
-
-fn logical_bank_xy(harvested_dram_banks: &[usize]) -> io::Result<Vec<(u8, u8)>> {
-    match harvested_dram_banks {
-        [] => Ok((0..DRAM_BANK_COUNT)
-            .map(|bank| {
-                let x = if bank < DRAM_BANK_COUNT / 2 {
-                    DRAM_NOC_LEFT_X
-                } else {
-                    DRAM_NOC_RIGHT_X
-                };
-                let y = 12 + (bank % (DRAM_BANK_COUNT / 2)) as u8 * BANK_PORT_STRIDE;
-                (x, y)
-            })
-            .collect()),
-        [harvested_bank] => {
-            let half = DRAM_BANK_COUNT / 2;
-            let mirror = if *harvested_bank < half {
-                harvested_bank + half - 1
-            } else {
-                harvested_bank - half
-            };
-
-            let right = if *harvested_bank < half {
-                (0..(half - 1)).collect::<Vec<_>>()
-            } else {
-                (half..(DRAM_BANK_COUNT - 1)).collect::<Vec<_>>()
-            };
-            let left = if *harvested_bank < half {
-                ((half - 1)..(DRAM_BANK_COUNT - 1))
-                    .filter(|bank| *bank != mirror)
-                    .chain(std::iter::once(mirror))
-                    .collect::<Vec<_>>()
-            } else {
-                (0..half)
-                    .filter(|bank| *bank != mirror)
-                    .chain(std::iter::once(mirror))
-                    .collect::<Vec<_>>()
-            };
-
-            let mut bank_xy = vec![(0, 0); DRAM_BANK_COUNT - 1];
-            for (index, bank) in right.into_iter().enumerate() {
-                bank_xy[bank] = (DRAM_NOC_RIGHT_X, 12 + index as u8 * BANK_PORT_STRIDE);
-            }
-            for (index, bank) in left.into_iter().enumerate() {
-                bank_xy[bank] = (DRAM_NOC_LEFT_X, 12 + index as u8 * BANK_PORT_STRIDE);
-            }
-            Ok(bank_xy)
-        }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "unsupported harvested DRAM bank count: {}",
-                harvested_dram_banks.len()
-            ),
-        )),
-    }
-}
-
-fn dram_bank_x(bank: usize) -> u8 {
-    if bank < 4 { 0 } else { 9 }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,7 +262,7 @@ mod tests {
     #[test]
     fn build_bank_noc_table_matches_p100_layout() {
         let workers = worker_cores(&P100_TENSIX_X);
-        let table = build_bank_noc_table(&[7], &workers).expect("table should build");
+        let table = Dram::build_bank_noc_table(&[7], &workers).expect("table should build");
         let entries = decode_u16s(&table, (7 + workers.len()) * BANK_NOCS);
 
         assert_eq!(table.len(), (7 + workers.len()) * 8);
@@ -267,7 +274,7 @@ mod tests {
     #[test]
     fn build_bank_noc_table_matches_p150_layout() {
         let workers = worker_cores(&P150_TENSIX_X);
-        let table = build_bank_noc_table(&[], &workers).expect("table should build");
+        let table = Dram::build_bank_noc_table(&[], &workers).expect("table should build");
         let entries = decode_u16s(&table, (8 + workers.len()) * BANK_NOCS);
 
         assert_eq!(table.len(), (8 + workers.len()) * 8);
@@ -285,7 +292,7 @@ mod tests {
     #[test]
     fn build_bank_noc_table_rejects_multiple_harvested_banks() {
         let workers = worker_cores(&P100_TENSIX_X);
-        let err = build_bank_noc_table(&[0, 7], &workers).expect_err("layout should fail");
+        let err = Dram::build_bank_noc_table(&[0, 7], &workers).expect_err("layout should fail");
         assert!(
             err.to_string()
                 .contains("unsupported harvested DRAM bank count")

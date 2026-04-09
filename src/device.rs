@@ -1,10 +1,5 @@
 use crate::dram::{Allocator, DType, DramBuffer};
-use crate::hw::{
-    ARC_DEFAULT_TENSIX_ENABLED, ARC_NOC_BASE, ARC_SCRATCH_RAM_13, ARC_TILE, CoreCoord,
-    DEFAULT_GDDR_ENABLED, DramTile, TAG_GDDR_ENABLED, TAG_TENSIX_ENABLED_COL, TLB_SIZE_2M,
-    active_dram_banks, active_tensix_core_count, align_down, build_bank_noc_table, dram_tiles,
-    harvested_dram_banks, worker_cores,
-};
+use crate::hw::{Arc, CoreCoord, Dram, DramTile, align_down, worker_cores};
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
 use std::fs;
@@ -121,18 +116,18 @@ impl Device {
         };
 
         if let Some(probe) = probe {
-            let tensix_core_count = active_tensix_core_count(probe.tensix_enabled_col_mask);
+            let tensix_core_count = Arc::active_tensix_core_count(probe.tensix_enabled_col_mask);
             let board = BoardKind::from_tensix_core_count(tensix_core_count);
-            let harvested_dram_banks = harvested_dram_banks(probe.gddr_enabled_mask);
+            let harvested_dram_banks = Dram::harvested_banks(probe.gddr_enabled_mask);
 
             info.arch = board
                 .map(|board| board.config().name.to_owned())
                 .unwrap_or_else(|| "unknown".to_owned());
             info.board = board;
             info.tensix_core_count = Some(tensix_core_count);
-            info.active_dram_banks = active_dram_banks(probe.gddr_enabled_mask);
+            info.active_dram_banks = Dram::active_banks(probe.gddr_enabled_mask);
             info.harvested_dram_banks = harvested_dram_banks.clone();
-            info.dram_tiles = dram_tiles(&harvested_dram_banks);
+            info.dram_tiles = Dram::tiles(&harvested_dram_banks);
 
             if let Some(board) = board {
                 let config = board.config();
@@ -242,7 +237,7 @@ impl Device {
     }
 
     pub fn bank_noc_table(&self) -> io::Result<Vec<u8>> {
-        build_bank_noc_table(&self.harvested_dram_banks, &self.all_worker_cores)
+        Dram::build_bank_noc_table(&self.harvested_dram_banks, &self.all_worker_cores)
     }
 
     fn allocator_mut(&mut self) -> io::Result<&mut Allocator> {
@@ -285,14 +280,14 @@ fn probe_info_for_device(path: &Path) -> io::Result<ProbeInfo> {
 }
 
 fn read_arc_enabled_masks(path: &Path) -> io::Result<(u32, u32)> {
-    let mut arc = TlbWindow::open(path, ARC_TILE, ARC_NOC_BASE, TLB_SIZE_2M, false)?;
+    let mut arc = TlbWindow::open(path, Arc::TILE, Arc::NOC_BASE, Arc::TLB_SIZE_2M, false)?;
     log(format!("linux probe opened {}", path.display()));
-    let telemetry_ptr = arc.read32(ARC_SCRATCH_RAM_13)? as u64;
-    let (csm_base, csm_offset) = align_down(telemetry_ptr, TLB_SIZE_2M);
+    let telemetry_ptr = arc.read32(Arc::SCRATCH_RAM_13)? as u64;
+    let (csm_base, csm_offset) = align_down(telemetry_ptr, Arc::TLB_SIZE_2M);
     log(format!(
         "linux probe telemetry_ptr=0x{telemetry_ptr:x} csm_base=0x{csm_base:x} csm_offset=0x{csm_offset:x}"
     ));
-    arc.target(ARC_TILE, None, csm_base, NocOrdering::Strict)?;
+    arc.target(Arc::TILE, None, csm_base, NocOrdering::Strict)?;
 
     let entry_count = arc.read32((csm_offset + 4) as usize)? as usize;
     log(format!("linux probe telemetry entry_count={entry_count}"));
@@ -312,20 +307,20 @@ fn read_arc_enabled_masks(path: &Path) -> io::Result<(u32, u32)> {
         let tag = (tag_offset & 0xffff) as u16;
         let data_offset_words = (tag_offset >> 16) & 0xffff;
 
-        if tag == TAG_TENSIX_ENABLED_COL {
+        if tag == Arc::TAG_TENSIX_ENABLED_COL {
             tensix_data_offset = Some(data_offset_words);
-        } else if tag == TAG_GDDR_ENABLED {
+        } else if tag == Arc::TAG_GDDR_ENABLED {
             gddr_data_offset = Some(data_offset_words);
         }
     }
 
     let tensix_enabled_col_mask = match tensix_data_offset {
         Some(offset_words) => arc.read32((data_base + (offset_words as u64) * 4) as usize)?,
-        None => ARC_DEFAULT_TENSIX_ENABLED,
+        None => Arc::DEFAULT_TENSIX_ENABLED,
     };
     let gddr_enabled_mask = match gddr_data_offset {
         Some(offset_words) => arc.read32((data_base + (offset_words as u64) * 4) as usize)?,
-        None => DEFAULT_GDDR_ENABLED,
+        None => Arc::DEFAULT_GDDR_ENABLED,
     };
     Ok((gddr_enabled_mask, tensix_enabled_col_mask))
 }
