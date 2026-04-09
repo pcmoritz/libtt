@@ -119,6 +119,7 @@ impl Device {
             let tensix_core_count = Arc::active_tensix_core_count(probe.tensix_enabled_col_mask);
             let board = BoardKind::from_tensix_core_count(tensix_core_count);
             let harvested_dram_banks = Dram::harvested_banks(probe.gddr_enabled_mask);
+            let dram_tiles = Dram::tiles(&harvested_dram_banks);
 
             info.arch = board
                 .map(|board| board.config().name.to_owned())
@@ -126,8 +127,8 @@ impl Device {
             info.board = board;
             info.tensix_core_count = Some(tensix_core_count);
             info.active_dram_banks = Dram::active_banks(probe.gddr_enabled_mask);
-            info.harvested_dram_banks = harvested_dram_banks.clone();
-            info.dram_tiles = Dram::tiles(&harvested_dram_banks);
+            info.harvested_dram_banks = harvested_dram_banks;
+            info.dram_tiles = dram_tiles;
 
             if let Some(board) = board {
                 let config = board.config();
