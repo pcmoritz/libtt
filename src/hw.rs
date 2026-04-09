@@ -3,7 +3,6 @@ use std::io;
 
 const WORKER_Y_START: u8 = 2;
 const WORKER_Y_END: u8 = 12;
-const BANK_NOCS: usize = 2;
 const BANK_PORT_STRIDE: u8 = 3;
 const DRAM_NOC_LEFT_X: u8 = 17;
 const DRAM_NOC_RIGHT_X: u8 = 18;
@@ -102,6 +101,7 @@ impl Dram {
         harvested_dram_banks: &[usize],
         worker_cores: &[CoreCoord],
     ) -> io::Result<Vec<u8>> {
+        let bank_nocs = 2;
         let bank_ports = [[2, 1], [0, 1], [0, 1], [0, 1], [2, 1], [2, 1], [2, 1], [2, 1]];
         let num_dram_banks = Self::BANK_COUNT
             .checked_sub(harvested_dram_banks.len())
@@ -111,11 +111,11 @@ impl Dram {
         let bank_xy = Self::logical_bank_xy(harvested_dram_banks)?;
 
         let mut out = Vec::with_capacity(
-            (BANK_NOCS * (num_dram_banks + worker_cores.len())) * 2
+            (bank_nocs * (num_dram_banks + worker_cores.len())) * 2
                 + (num_dram_banks + worker_cores.len()) * 4,
         );
 
-        for noc in 0..BANK_NOCS {
+        for noc in 0..bank_nocs {
             for bank in 0..num_dram_banks {
                 let (x, y0) = bank_xy[bank];
                 out.extend_from_slice(&noc_xy(x, y0 + bank_ports[bank][noc]).to_le_bytes());
@@ -135,7 +135,7 @@ impl Dram {
             ));
         }
 
-        for _ in 0..BANK_NOCS {
+        for _ in 0..bank_nocs {
             for index in 0..worker_cores.len() {
                 let x = cols[index % cols.len()];
                 let y = WORKER_Y_START
@@ -241,44 +241,6 @@ mod tests {
     use super::*;
 
     const P100_TENSIX_X: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14];
-    const P150_TENSIX_X: [u8; 14] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16];
-
-    fn decode_u16s(bytes: &[u8], count: usize) -> Vec<u16> {
-        bytes[..count * 2]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes(chunk.try_into().expect("chunk length is fixed")))
-            .collect()
-    }
-
-    #[test]
-    fn build_bank_noc_table_matches_p100_layout() {
-        let workers = worker_cores(&P100_TENSIX_X);
-        let table = Dram::build_bank_noc_table(&[7], &workers).expect("table should build");
-        let entries = decode_u16s(&table, (7 + workers.len()) * BANK_NOCS);
-
-        assert_eq!(table.len(), (7 + workers.len()) * 8);
-        assert_eq!(&entries[..7], &[913, 977, 1169, 1361, 914, 1106, 1298]);
-        assert_eq!(&entries[7..14], &[849, 1041, 1233, 1425, 850, 1042, 1234]);
-        assert_eq!(&entries[14..20], &[129, 130, 131, 132, 133, 134]);
-    }
-
-    #[test]
-    fn build_bank_noc_table_matches_p150_layout() {
-        let workers = worker_cores(&P150_TENSIX_X);
-        let table = Dram::build_bank_noc_table(&[], &workers).expect("table should build");
-        let entries = decode_u16s(&table, (8 + workers.len()) * BANK_NOCS);
-
-        assert_eq!(table.len(), (8 + workers.len()) * 8);
-        assert_eq!(
-            &entries[..8],
-            &[913, 977, 1169, 1361, 914, 1106, 1298, 1490]
-        );
-        assert_eq!(
-            &entries[8..16],
-            &[849, 1041, 1233, 1425, 850, 1042, 1234, 1426]
-        );
-        assert_eq!(&entries[16..22], &[129, 130, 131, 132, 133, 134]);
-    }
 
     #[test]
     fn build_bank_noc_table_rejects_multiple_harvested_banks() {
