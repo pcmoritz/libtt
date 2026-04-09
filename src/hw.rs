@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CoreCoord {
     pub(crate) x: u8,
@@ -70,14 +68,10 @@ impl Dram {
     }
 
     pub(crate) fn tiles(harvested_dram_banks: &[usize]) -> Vec<DramTile> {
-        let harvested = harvested_dram_banks
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
         let mut tiles = Vec::new();
 
         for bank in 0..Self::BANK_COUNT {
-            if harvested.contains(&bank) {
+            if harvested_dram_banks.contains(&bank) {
                 continue;
             }
 
