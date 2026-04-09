@@ -236,10 +236,6 @@ impl Device {
         self.allocator_mut()?.read_host_data(buf)
     }
 
-    pub fn bank_noc_table(&self) -> io::Result<Vec<u8>> {
-        Dram::build_bank_noc_table(&self.harvested_dram_banks, &self.all_worker_cores)
-    }
-
     fn allocator_mut(&mut self) -> io::Result<&mut Allocator> {
         if self.allocator.is_none() {
             self.allocator = Some(Allocator::from_device(self)?);
@@ -422,23 +418,5 @@ mod tests {
     fn discovery_returns_empty_for_missing_root() {
         let devices = discover_with(Path::new("/tmp/does-not-exist"));
         assert!(devices.is_empty());
-    }
-
-    #[test]
-    fn builds_bank_noc_table_from_device_topology() {
-        let device = Device::from_probe(
-            0,
-            0,
-            PathBuf::from("/dev/tenstorrent/0"),
-            Some(ProbeInfo {
-                tensix_enabled_col_mask: 0x0fff,
-                gddr_enabled_mask: 0x7f,
-            }),
-        );
-
-        let table = device
-            .bank_noc_table()
-            .expect("bank noc table should build");
-        assert_eq!(table.len(), (7 + 120) * 8);
     }
 }
