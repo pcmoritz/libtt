@@ -1,8 +1,5 @@
 use std::collections::BTreeSet;
 
-const WORKER_Y_START: u8 = 2;
-const WORKER_Y_END: u8 = 12;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CoreCoord {
     pub(crate) x: u8,
@@ -108,9 +105,9 @@ pub(crate) fn align_down(value: u64, alignment: u64) -> (u64, u64) {
 }
 
 pub(crate) fn worker_cores(tensix_x: &[u8]) -> Vec<CoreCoord> {
-    let mut cores = Vec::with_capacity(tensix_x.len() * (WORKER_Y_END - WORKER_Y_START) as usize);
+    let mut cores = Vec::with_capacity(tensix_x.len() * 10);
     for &x in tensix_x {
-        for y in WORKER_Y_START..WORKER_Y_END {
+        for y in 2..12 {
             cores.push(CoreCoord { x, y });
         }
     }
