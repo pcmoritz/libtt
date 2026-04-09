@@ -1,4 +1,5 @@
 use crate::dram::{Allocator, DType, DramBuffer};
+use crate::hw::{Arc, CoreCoord, Dram, DramTile, align_down, worker_cores};
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
 use std::fs;
@@ -6,50 +7,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_ROOT: &str = "/dev/tenstorrent";
-const ARC_DEFAULT_TENSIX_ENABLED: u32 = 0x3fff;
-const DEFAULT_GDDR_ENABLED: u32 = 0xff;
-const DRAM_BANK_COUNT: usize = 8;
-const WORKER_Y_START: u8 = 2;
-const WORKER_Y_END: u8 = 12;
-const ARC_TILE: CoreCoord = CoreCoord { x: 8, y: 0 };
-const ARC_NOC_BASE: u64 = 0x8000_0000;
-const ARC_SCRATCH_RAM_13: usize = 0x30434;
-const TAG_TENSIX_ENABLED_COL: u16 = 34;
-const TAG_GDDR_ENABLED: u16 = 36;
-const TLB_SIZE_2M: u64 = 1 << 21;
 
 const P100_TENSIX_X: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14];
 const P150_TENSIX_X: [u8; 14] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16];
-
-const DRAM_BANK_TILE_YS: [[u8; 3]; DRAM_BANK_COUNT] = [
-    [0, 1, 11],
-    [2, 3, 10],
-    [4, 8, 9],
-    [5, 6, 7],
-    [0, 1, 11],
-    [2, 3, 10],
-    [4, 8, 9],
-    [5, 6, 7],
-];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct CoreCoord {
-    pub(crate) x: u8,
-    pub(crate) y: u8,
-}
-
-impl std::fmt::Display for CoreCoord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{},{}", self.x, self.y)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DramTile {
-    pub(crate) bank: usize,
-    pub(crate) x: u8,
-    pub(crate) y: u8,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BoardConfig {
@@ -156,18 +116,19 @@ impl Device {
         };
 
         if let Some(probe) = probe {
-            let tensix_core_count = active_tensix_core_count(probe.tensix_enabled_col_mask);
+            let tensix_core_count = Arc::active_tensix_core_count(probe.tensix_enabled_col_mask);
             let board = BoardKind::from_tensix_core_count(tensix_core_count);
-            let harvested_dram_banks = harvested_dram_banks(probe.gddr_enabled_mask);
+            let harvested_dram_banks = Dram::harvested_banks(probe.gddr_enabled_mask);
+            let dram_tiles = Dram::tiles(&harvested_dram_banks);
 
             info.arch = board
                 .map(|board| board.config().name.to_owned())
                 .unwrap_or_else(|| "unknown".to_owned());
             info.board = board;
             info.tensix_core_count = Some(tensix_core_count);
-            info.active_dram_banks = active_dram_banks(probe.gddr_enabled_mask);
-            info.harvested_dram_banks = harvested_dram_banks.clone();
-            info.dram_tiles = dram_tiles(&harvested_dram_banks);
+            info.active_dram_banks = Dram::active_banks(probe.gddr_enabled_mask);
+            info.harvested_dram_banks = harvested_dram_banks;
+            info.dram_tiles = dram_tiles;
 
             if let Some(board) = board {
                 let config = board.config();
@@ -316,14 +277,14 @@ fn probe_info_for_device(path: &Path) -> io::Result<ProbeInfo> {
 }
 
 fn read_arc_enabled_masks(path: &Path) -> io::Result<(u32, u32)> {
-    let mut arc = TlbWindow::open(path, ARC_TILE, ARC_NOC_BASE, TLB_SIZE_2M, false)?;
+    let mut arc = TlbWindow::open(path, Arc::TILE, Arc::NOC_BASE, Arc::TLB_SIZE_2M, false)?;
     log(format!("linux probe opened {}", path.display()));
-    let telemetry_ptr = arc.read32(ARC_SCRATCH_RAM_13)? as u64;
-    let (csm_base, csm_offset) = align_down(telemetry_ptr, TLB_SIZE_2M);
+    let telemetry_ptr = arc.read32(Arc::SCRATCH_RAM_13)? as u64;
+    let (csm_base, csm_offset) = align_down(telemetry_ptr, Arc::TLB_SIZE_2M);
     log(format!(
         "linux probe telemetry_ptr=0x{telemetry_ptr:x} csm_base=0x{csm_base:x} csm_offset=0x{csm_offset:x}"
     ));
-    arc.target(ARC_TILE, None, csm_base, NocOrdering::Strict)?;
+    arc.target(Arc::TILE, None, csm_base, NocOrdering::Strict)?;
 
     let entry_count = arc.read32((csm_offset + 4) as usize)? as usize;
     log(format!("linux probe telemetry entry_count={entry_count}"));
@@ -343,27 +304,22 @@ fn read_arc_enabled_masks(path: &Path) -> io::Result<(u32, u32)> {
         let tag = (tag_offset & 0xffff) as u16;
         let data_offset_words = (tag_offset >> 16) & 0xffff;
 
-        if tag == TAG_TENSIX_ENABLED_COL {
+        if tag == Arc::TAG_TENSIX_ENABLED_COL {
             tensix_data_offset = Some(data_offset_words);
-        } else if tag == TAG_GDDR_ENABLED {
+        } else if tag == Arc::TAG_GDDR_ENABLED {
             gddr_data_offset = Some(data_offset_words);
         }
     }
 
     let tensix_enabled_col_mask = match tensix_data_offset {
         Some(offset_words) => arc.read32((data_base + (offset_words as u64) * 4) as usize)?,
-        None => ARC_DEFAULT_TENSIX_ENABLED,
+        None => Arc::DEFAULT_TENSIX_ENABLED,
     };
     let gddr_enabled_mask = match gddr_data_offset {
         Some(offset_words) => arc.read32((data_base + (offset_words as u64) * 4) as usize)?,
-        None => DEFAULT_GDDR_ENABLED,
+        None => Arc::DEFAULT_GDDR_ENABLED,
     };
     Ok((gddr_enabled_mask, tensix_enabled_col_mask))
-}
-
-fn align_down(value: u64, alignment: u64) -> (u64, u64) {
-    let base = value & !(alignment - 1);
-    (base, value - base)
 }
 
 fn discover_with(root: &Path) -> Vec<Device> {
@@ -391,58 +347,8 @@ fn discover_with(root: &Path) -> Vec<Device> {
         .collect()
 }
 
-fn worker_cores(tensix_x: &[u8]) -> Vec<CoreCoord> {
-    let mut cores = Vec::with_capacity(tensix_x.len() * (WORKER_Y_END - WORKER_Y_START) as usize);
-
-    for &x in tensix_x {
-        for y in WORKER_Y_START..WORKER_Y_END {
-            cores.push(CoreCoord { x, y });
-        }
-    }
-
-    cores
-}
-
-fn active_tensix_core_count(enabled_col_mask: u32) -> usize {
-    (enabled_col_mask & ARC_DEFAULT_TENSIX_ENABLED).count_ones() as usize * 10
-}
-
 fn local_hardware_id_from_path(path: &Path) -> Option<usize> {
     path.file_name()?.to_str()?.parse().ok()
-}
-
-fn active_dram_banks(gddr_enabled_mask: u32) -> usize {
-    (0..DRAM_BANK_COUNT)
-        .filter(|bank| ((gddr_enabled_mask >> bank) & 1) != 0)
-        .count()
-}
-
-fn harvested_dram_banks(gddr_enabled_mask: u32) -> Vec<usize> {
-    (0..DRAM_BANK_COUNT)
-        .filter(|bank| ((gddr_enabled_mask >> bank) & 1) == 0)
-        .collect()
-}
-
-fn dram_tiles(harvested_dram_banks: &[usize]) -> Vec<DramTile> {
-    let harvested = harvested_dram_banks.iter().copied().collect::<std::collections::BTreeSet<_>>();
-    let mut tiles = Vec::new();
-
-    for bank in 0..DRAM_BANK_COUNT {
-        if harvested.contains(&bank) {
-            continue;
-        }
-
-        let x = dram_bank_x(bank);
-        for &y in &DRAM_BANK_TILE_YS[bank] {
-            tiles.push(DramTile { bank, x, y });
-        }
-    }
-
-    tiles
-}
-
-fn dram_bank_x(bank: usize) -> u8 {
-    if bank < 4 { 0 } else { 9 }
 }
 
 #[cfg(test)]
