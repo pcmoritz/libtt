@@ -10,6 +10,7 @@ pub(crate) enum NocOrdering {
 }
 
 pub(crate) struct TlbWindow;
+pub(crate) struct Sysmem;
 
 impl TlbWindow {
     pub(crate) fn open(
@@ -50,6 +51,57 @@ impl TlbWindow {
             io::ErrorKind::Unsupported,
             "Tenstorrent Linux backend is only available on Linux",
         ))
+    }
+
+    pub(crate) fn write(&mut self, _offset: usize, _data: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Tenstorrent Linux backend is only available on Linux",
+        ))
+    }
+
+    pub(crate) fn read(&self, _offset: usize, _len: usize) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Tenstorrent Linux backend is only available on Linux",
+        ))
+    }
+}
+
+impl Sysmem {
+    pub(crate) fn open(_path: &Path, _size: usize) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Tenstorrent Linux backend is only available on Linux",
+        ))
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        0
+    }
+
+    pub(crate) fn physical_address(&self) -> u64 {
+        0
+    }
+
+    pub(crate) fn noc_address(&self) -> u64 {
+        0
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        std::ptr::null()
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &[]
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut []
     }
 
     pub(crate) fn write(&mut self, _offset: usize, _data: &[u8]) -> io::Result<()> {
