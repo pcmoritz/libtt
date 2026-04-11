@@ -2,17 +2,24 @@ use crate::hw::CoreCoord;
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::mem::size_of;
 use std::os::fd::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 const TT_IOCTL_BASE: c_ulong = 0xFA << 8;
+const TT_IOCTL_PIN_PAGES: c_ulong = TT_IOCTL_BASE | 7;
+const TT_IOCTL_UNPIN_PAGES: c_ulong = TT_IOCTL_BASE | 10;
 const TT_IOCTL_ALLOC_TLB: c_ulong = TT_IOCTL_BASE | 11;
 const TT_IOCTL_FREE_TLB: c_ulong = TT_IOCTL_BASE | 12;
 const TT_IOCTL_CONFIG_TLB: c_ulong = TT_IOCTL_BASE | 13;
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x01;
+const MAP_PRIVATE: c_int = 0x02;
+const MAP_ANONYMOUS: c_int = 0x20;
+const PAGE_SIZE: usize = 4096;
+const PIN_NOC_DMA: u32 = 2;
 
 unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
@@ -82,6 +89,37 @@ struct ConfigIn {
     config: NocTlbConfig,
 }
 
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct PinIn {
+    output_size_bytes: u32,
+    flags: u32,
+    virtual_address: u64,
+    size: u64,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct PinOut {
+    physical_address: u64,
+    noc_address: u64,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct PinPagesIo {
+    input: PinIn,
+    output: PinOut,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct UnpinIn {
+    virtual_address: u64,
+    size: u64,
+    reserved: u64,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum NocOrdering {
     Relaxed = 0,
@@ -133,7 +171,7 @@ impl TlbWindow {
             id,
             mapping: None,
         };
-        window.mapping = Some(MappedRegion::map(window.file.as_raw_fd(), len, offset)?);
+        window.mapping = Some(MappedRegion::map(Some(window.file.as_raw_fd()), len, offset)?);
         window.target(start, None, addr, NocOrdering::Strict)?;
         Ok(window)
     }
@@ -204,21 +242,130 @@ impl Drop for TlbWindow {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) struct Sysmem {
+    file: File,
+    mapping: MappedRegion,
+    physical_address: u64,
+    noc_address: u64,
+}
+
+#[allow(dead_code)]
+impl Sysmem {
+    pub(crate) const DEFAULT_SIZE: usize = 1 << 30;
+    pub(crate) const PCIE_NOC_XY: u16 = (24 << 6) | 19;
+
+    pub(crate) fn open(local_hardware_id: usize) -> io::Result<Self> {
+        Self::with_size(local_hardware_id, Self::DEFAULT_SIZE)
+    }
+
+    pub(crate) fn with_size(local_hardware_id: usize, size: usize) -> io::Result<Self> {
+        let path = PathBuf::from(format!("/dev/tenstorrent/{local_hardware_id}"));
+        Self::open_path(path.as_path(), size)
+    }
+
+    fn open_path(path: &Path, size: usize) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|err| io::Error::new(err.kind(), format!("open {}: {err}", path.display())))?;
+        Self::new(file, size)
+    }
+
+    fn new(file: File, size: usize) -> io::Result<Self> {
+        let len = align_up_size(size, PAGE_SIZE)?;
+        let mapping = MappedRegion::map(None, len, 0)?;
+        let virtual_address = mapping.addr as u64;
+        let size = len as u64;
+        let mut pin = PinPagesIo {
+            input: PinIn {
+                output_size_bytes: size_of::<PinOut>() as u32,
+                flags: PIN_NOC_DMA,
+                virtual_address,
+                size,
+            },
+            output: PinOut::default(),
+        };
+        ioctl_call(file.as_raw_fd(), TT_IOCTL_PIN_PAGES, &mut pin)?;
+
+        Ok(Self {
+            file,
+            mapping,
+            physical_address: unsafe {
+                ptr::addr_of!(pin.output.physical_address).read_unaligned()
+            },
+            noc_address: unsafe { ptr::addr_of!(pin.output.noc_address).read_unaligned() },
+        })
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.mapping.len
+    }
+
+    pub(crate) fn physical_address(&self) -> u64 {
+        self.physical_address
+    }
+
+    pub(crate) fn noc_addr(&self) -> u64 {
+        self.noc_address
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.mapping.addr.cast_const()
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.mapping.addr
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.mapping.addr.cast_const(), self.mapping.len) }
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.mapping.addr, self.mapping.len) }
+    }
+
+    pub(crate) fn write(&mut self, offset: usize, data: &[u8]) -> io::Result<()> {
+        self.mapping.write(offset, data)
+    }
+
+    pub(crate) fn read(&self, offset: usize, len: usize) -> io::Result<Vec<u8>> {
+        self.mapping.read(offset, len)
+    }
+}
+
+impl Drop for Sysmem {
+    fn drop(&mut self) {
+        let mut unpin = UnpinIn {
+            virtual_address: self.mapping.addr as u64,
+            size: self.mapping.len as u64,
+            reserved: 0,
+        };
+        let _ = ioctl_call(self.file.as_raw_fd(), TT_IOCTL_UNPIN_PAGES, &mut unpin);
+    }
+}
+
 struct MappedRegion {
     addr: *mut u8,
     len: usize,
 }
 
 impl MappedRegion {
-    fn map(fd: c_int, len: usize, offset: u64) -> io::Result<Self> {
+    fn map(fd: Option<c_int>, len: usize, offset: u64) -> io::Result<Self> {
+        let (flags, fd, offset) = match fd {
+            Some(fd) => (MAP_SHARED, fd, offset as i64),
+            None => (MAP_PRIVATE | MAP_ANONYMOUS, -1, 0),
+        };
         let addr = unsafe {
             mmap(
                 ptr::null_mut(),
                 len,
                 PROT_READ | PROT_WRITE,
-                MAP_SHARED,
+                flags,
                 fd,
-                offset as i64,
+                offset,
             )
         };
         if addr as isize == -1 {
@@ -279,4 +426,17 @@ fn ioctl_call<T>(fd: c_int, request: c_ulong, data: &mut T) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn align_up_size(value: usize, align: usize) -> io::Result<usize> {
+    if value == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sysmem size must be greater than zero",
+        ));
+    }
+    value
+        .checked_add(align - 1)
+        .map(|rounded| rounded / align * align)
+        .ok_or_else(|| io::Error::other(format!("size 0x{value:x} overflows page alignment")))
 }
