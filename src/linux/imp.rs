@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 const TT_IOCTL_BASE: c_ulong = 0xFA << 8;
@@ -242,6 +242,7 @@ impl Drop for TlbWindow {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) struct Sysmem {
     file: File,
     mapping: MappedRegion,
@@ -249,8 +250,21 @@ pub(crate) struct Sysmem {
     noc_address: u64,
 }
 
+#[allow(dead_code)]
 impl Sysmem {
-    pub(crate) fn open(path: &Path, size: usize) -> io::Result<Self> {
+    pub(crate) const DEFAULT_SIZE: usize = 1 << 30;
+    pub(crate) const PCIE_NOC_XY: u16 = (24 << 6) | 19;
+
+    pub(crate) fn open(local_hardware_id: usize) -> io::Result<Self> {
+        Self::with_size(local_hardware_id, Self::DEFAULT_SIZE)
+    }
+
+    pub(crate) fn with_size(local_hardware_id: usize, size: usize) -> io::Result<Self> {
+        let path = PathBuf::from(format!("/dev/tenstorrent/{local_hardware_id}"));
+        Self::open_path(path.as_path(), size)
+    }
+
+    fn open_path(path: &Path, size: usize) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -293,7 +307,7 @@ impl Sysmem {
         self.physical_address
     }
 
-    pub(crate) fn noc_address(&self) -> u64 {
+    pub(crate) fn noc_addr(&self) -> u64 {
         self.noc_address
     }
 

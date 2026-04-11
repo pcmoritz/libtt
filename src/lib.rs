@@ -5,7 +5,6 @@ pub mod dram;
 mod hw;
 mod linux;
 mod log;
-pub mod sysmem;
 
 use device::Device;
 use dram::{DType, DramBuffer};

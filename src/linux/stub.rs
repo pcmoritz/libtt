@@ -10,6 +10,7 @@ pub(crate) enum NocOrdering {
 }
 
 pub(crate) struct TlbWindow;
+#[allow(dead_code)]
 pub(crate) struct Sysmem;
 
 impl TlbWindow {
@@ -68,8 +69,19 @@ impl TlbWindow {
     }
 }
 
+#[allow(dead_code)]
 impl Sysmem {
-    pub(crate) fn open(_path: &Path, _size: usize) -> io::Result<Self> {
+    pub(crate) const DEFAULT_SIZE: usize = 1 << 30;
+    pub(crate) const PCIE_NOC_XY: u16 = (24 << 6) | 19;
+
+    pub(crate) fn open(_local_hardware_id: usize) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Tenstorrent Linux backend is only available on Linux",
+        ))
+    }
+
+    pub(crate) fn with_size(_local_hardware_id: usize, _size: usize) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Tenstorrent Linux backend is only available on Linux",
@@ -84,7 +96,7 @@ impl Sysmem {
         0
     }
 
-    pub(crate) fn noc_address(&self) -> u64 {
+    pub(crate) fn noc_addr(&self) -> u64 {
         0
     }
 

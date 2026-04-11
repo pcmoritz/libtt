@@ -4,6 +4,6 @@ mod imp;
 mod stub;
 
 #[cfg(target_os = "linux")]
-pub(crate) use imp::{NocOrdering, Sysmem, TlbWindow};
+pub(crate) use imp::{NocOrdering, TlbWindow};
 #[cfg(not(target_os = "linux"))]
-pub(crate) use stub::{NocOrdering, Sysmem, TlbWindow};
+pub(crate) use stub::{NocOrdering, TlbWindow};

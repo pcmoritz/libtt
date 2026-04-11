@@ -53,20 +53,6 @@ let roundtrip = device.dram_read(&buffer)?;
 assert_eq!(roundtrip, data);
 ```
 
-## Sysmem
-
-The crate also exposes Linux-only pinned host memory modeled on
-`blackhole-py`'s `hw.py::Sysmem`:
-
-```rust
-use libtt::sysmem::Sysmem;
-
-let mut sysmem = Sysmem::with_size(0, 1 << 20)?;
-sysmem.write(0, &[1, 2, 3, 4])?;
-assert_eq!(&sysmem.as_slice()[..4], &[1, 2, 3, 4]);
-println!("sysmem noc_addr=0x{:x}", sysmem.noc_addr());
-```
-
 ## Build
 
 ```bash
