@@ -171,7 +171,7 @@ impl TlbWindow {
             id,
             mapping: None,
         };
-        window.mapping = Some(MappedRegion::map(window.file.as_raw_fd(), len, offset)?);
+        window.mapping = Some(MappedRegion::map(Some(window.file.as_raw_fd()), len, offset)?);
         window.target(start, None, addr, NocOrdering::Strict)?;
         Ok(window)
     }
@@ -261,7 +261,7 @@ impl Sysmem {
 
     fn new(file: File, size: usize) -> io::Result<Self> {
         let len = align_up_size(size, PAGE_SIZE)?;
-        let mapping = MappedRegion::map_anonymous(len)?;
+        let mapping = MappedRegion::map(None, len, 0)?;
         let virtual_address = mapping.addr as u64;
         let size = len as u64;
         let mut pin = PinPagesIo {
@@ -339,35 +339,19 @@ struct MappedRegion {
 }
 
 impl MappedRegion {
-    fn map(fd: c_int, len: usize, offset: u64) -> io::Result<Self> {
-        let addr = unsafe {
-            mmap(
-                ptr::null_mut(),
-                len,
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED,
-                fd,
-                offset as i64,
-            )
+    fn map(fd: Option<c_int>, len: usize, offset: u64) -> io::Result<Self> {
+        let (flags, fd, offset) = match fd {
+            Some(fd) => (MAP_SHARED, fd, offset as i64),
+            None => (MAP_PRIVATE | MAP_ANONYMOUS, -1, 0),
         };
-        if addr as isize == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self {
-            addr: addr.cast::<u8>(),
-            len,
-        })
-    }
-
-    fn map_anonymous(len: usize) -> io::Result<Self> {
         let addr = unsafe {
             mmap(
                 ptr::null_mut(),
                 len,
                 PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS,
-                -1,
-                0,
+                flags,
+                fd,
+                offset,
             )
         };
         if addr as isize == -1 {
