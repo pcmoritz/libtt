@@ -38,7 +38,8 @@ const PJRT_HostBufferSemantics_kMutableZeroCopy: i32 = 3;
 type PjrtOpaqueFn = Option<unsafe extern "C" fn()>;
 type PjrtResultFn<Args> = Option<unsafe extern "C" fn(args: *mut Args) -> *mut PJRT_Error>;
 type PjrtVoidFn<Args> = Option<unsafe extern "C" fn(args: *mut Args)>;
-type PjrtNamedValueDeleter = Option<unsafe extern "C" fn(attributes: *const PJRT_NamedValue)>;
+type PjrtDeviceAttributesDeleter =
+    Option<unsafe extern "C" fn(device_attributes: *mut PJRT_Device_Attributes)>;
 type PjrtEventOnReadyCallback =
     Option<unsafe extern "C" fn(error: *mut PJRT_Error, user_arg: *mut c_void)>;
 
@@ -71,6 +72,11 @@ pub struct PJRT_Extension_Base {
 
 #[repr(C)]
 pub struct PJRT_NamedValue {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct PJRT_Device_Attributes {
     _private: [u8; 0],
 }
 
@@ -458,7 +464,6 @@ pub struct PJRT_DeviceDescription_Attributes_Args {
     pub device_description: *mut PJRT_DeviceDescription,
     pub attributes: *const PJRT_NamedValue,
     pub num_attributes: usize,
-    pub attributes_deleter: PjrtNamedValueDeleter,
 }
 
 #[repr(C)]
@@ -536,7 +541,8 @@ pub struct PJRT_Device_GetAttributes_Args {
     pub device: *mut PJRT_Device,
     pub attributes: *const PJRT_NamedValue,
     pub num_attributes: usize,
-    pub attributes_deleter: PjrtNamedValueDeleter,
+    pub device_attributes: *mut PJRT_Device_Attributes,
+    pub attributes_deleter: PjrtDeviceAttributesDeleter,
 }
 
 #[repr(C)]
@@ -1110,7 +1116,15 @@ fn ready_event() -> *mut PJRT_Event {
     Box::into_raw(Box::new(PJRT_Event { error: None }))
 }
 
-unsafe extern "C" fn noop_named_value_deleter(_attributes: *const PJRT_NamedValue) {}
+unsafe extern "C" fn noop_device_attributes_deleter(
+    device_attributes: *mut PJRT_Device_Attributes,
+) {
+    if !device_attributes.is_null() {
+        unsafe {
+            drop(Box::from_raw(device_attributes));
+        }
+    }
+}
 
 fn event_with_error(code: PJRT_Error_Code, message: impl Into<String>) -> *mut PJRT_Event {
     Box::into_raw(Box::new(PJRT_Event {
@@ -2291,7 +2305,6 @@ pub unsafe extern "C" fn TT_DeviceDescription_Attributes(
     }
     args.attributes = ptr::null();
     args.num_attributes = 0;
-    args.attributes_deleter = Some(noop_named_value_deleter);
     ptr::null_mut()
 }
 
@@ -2439,7 +2452,8 @@ pub unsafe extern "C" fn TT_Device_GetAttributes(
     }
     args.attributes = ptr::null();
     args.num_attributes = 0;
-    args.attributes_deleter = Some(noop_named_value_deleter);
+    args.device_attributes = Box::into_raw(Box::new(PJRT_Device_Attributes { _private: [] }));
+    args.attributes_deleter = Some(noop_device_attributes_deleter);
     ptr::null_mut()
 }
 
@@ -3138,6 +3152,7 @@ mod tests {
                 device: first_device,
                 attributes: ptr::null(),
                 num_attributes: usize::MAX,
+                device_attributes: ptr::null_mut(),
                 attributes_deleter: None,
             };
             check_ok(api, unsafe {
@@ -3145,6 +3160,11 @@ mod tests {
             });
             assert!(device_get_attributes_args.attributes.is_null());
             assert_eq!(device_get_attributes_args.num_attributes, 0);
+            assert!(!device_get_attributes_args.device_attributes.is_null());
+            let deleter = device_get_attributes_args
+                .attributes_deleter
+                .expect("attributes deleter must be returned");
+            unsafe { deleter(device_get_attributes_args.device_attributes) };
         } else {
             assert!(devices_args.devices.is_null());
         }
