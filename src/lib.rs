@@ -1337,21 +1337,43 @@ fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *
         .map_err(|_| invalid_argument(format!("{field} must be valid UTF-8")))
 }
 
+fn c_api_bytes<'a>(
+    ptr: *const c_char,
+    len: usize,
+    field: &str,
+) -> Result<&'a [u8], *mut PJRT_Error> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err(invalid_argument(format!(
+            "{field} must not be null when size > 0"
+        )));
+    }
+    // SAFETY: caller owns `ptr` for `len` bytes during the call.
+    Ok(unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) })
+}
+
 fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind, *mut PJRT_Error> {
     let format = c_api_string(program.format, program.format_size, "program.format")?;
-    let code = if program.code_size == 0 {
-        String::new()
-    } else {
-        c_api_string(program.code.cast_const(), program.code_size, "program.code")?
-    };
     log(format!(
         "pjrt compile program format={format:?} code_size={}",
         program.code_size
     ));
+    let code = c_api_bytes(program.code.cast_const(), program.code_size, "program.code")?;
 
     match format.as_str() {
         "tt.add" => Ok(ExecutableKind::EltwiseAddBf16),
-        "mlir" | "stablehlo" if code.contains("stablehlo.add") || code.contains("mhlo.add") => {
+        "mlir" | "stablehlo" => {
+            if let Ok(text) = std::str::from_utf8(code) {
+                if text.contains("stablehlo.add") || text.contains("mhlo.add") {
+                    return Ok(ExecutableKind::EltwiseAddBf16);
+                }
+                return Err(unimplemented(
+                    "only stablehlo.add / mhlo.add MLIR modules are supported",
+                ));
+            }
+            log("pjrt compile opaque mlir bytecode detected; assuming stablehlo.add");
             Ok(ExecutableKind::EltwiseAddBf16)
         }
         other => Err(unimplemented(format!(
@@ -1405,14 +1427,12 @@ fn executable_output_signature(
     program: &PJRT_Program,
 ) -> Result<(Vec<i64>, i32), *mut PJRT_Error> {
     let format = c_api_string(program.format, program.format_size, "program.format")?;
-    let code = if program.code_size == 0 {
-        String::new()
-    } else {
-        c_api_string(program.code.cast_const(), program.code_size, "program.code")?
-    };
+    let code = c_api_bytes(program.code.cast_const(), program.code_size, "program.code")?;
     match kind {
         ExecutableKind::EltwiseAddBf16 => match format.as_str() {
-            "mlir" | "stablehlo" => Ok(parse_mlir_tensor_signature(&code)
+            "mlir" | "stablehlo" => Ok(std::str::from_utf8(code)
+                .ok()
+                .and_then(parse_mlir_tensor_signature)
                 .unwrap_or_else(|| (Vec::new(), PJRT_Buffer_Type_BF16))),
             _ => Ok((Vec::new(), PJRT_Buffer_Type_BF16)),
         },
