@@ -19,7 +19,7 @@ use std::slice;
 
 const PJRT_API_MAJOR: i32 = 0;
 const PJRT_API_MINOR: i32 = 96;
-const PJRT_API_UNUSED_TAIL_SLOTS: usize = 32;
+const PJRT_API_UNUSED_TAIL_SLOTS: usize = 30;
 const PJRT_Buffer_Type_INVALID: i32 = 0;
 const PJRT_Buffer_Type_S8: i32 = 2;
 const PJRT_Buffer_Type_S32: i32 = 4;
@@ -544,6 +544,14 @@ pub struct PJRT_Memory_Kind_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_Memory_Kind_Id_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub memory: *mut PJRT_Memory,
+    pub kind_id: i32,
+}
+
+#[repr(C)]
 pub struct PJRT_Memory_DebugString_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -951,6 +959,8 @@ pub struct PJRT_Api {
     pub PJRT_Executable_OutputDimensions: PjrtResultFn<PJRT_Executable_OutputDimensions_Args>,
     unused_before_client_topology: [PjrtOpaqueFn; 3],
     pub PJRT_Client_TopologyDescription: PjrtResultFn<PJRT_Client_TopologyDescription_Args>,
+    unused_compiled_memory_stats: [PjrtOpaqueFn; 1],
+    pub PJRT_Memory_Kind_Id: PjrtResultFn<PJRT_Memory_Kind_Id_Args>,
     unused_tail: [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_SLOTS],
 }
 
@@ -2407,6 +2417,20 @@ pub unsafe extern "C" fn TT_Memory_Kind(args: *mut PJRT_Memory_Kind_Args) -> *mu
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Memory_Kind_Id(
+    args: *mut PJRT_Memory_Kind_Id_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(memory) = (unsafe { checked_ref(args.memory, "memory") }) else {
+        return invalid_argument("memory must not be null");
+    };
+    args.kind_id = memory.id;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Memory_DebugString(
     args: *mut PJRT_Memory_DebugString_Args,
 ) -> *mut PJRT_Error {
@@ -2885,6 +2909,8 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Executable_OutputDimensions: Some(TT_Executable_OutputDimensions),
     unused_before_client_topology: [None; 3],
     PJRT_Client_TopologyDescription: Some(TT_Client_TopologyDescription),
+    unused_compiled_memory_stats: [None; 1],
+    PJRT_Memory_Kind_Id: Some(TT_Memory_Kind_Id),
     unused_tail: [None; PJRT_API_UNUSED_TAIL_SLOTS],
 };
 
