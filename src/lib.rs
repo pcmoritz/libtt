@@ -201,6 +201,36 @@ pub struct PJRT_Layouts_MemoryLayout_Serialize_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_Layouts_PJRT_Buffer_MemoryLayout_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub layout: *mut PJRT_Layouts_MemoryLayout,
+}
+
+#[repr(C)]
+pub struct PJRT_Layouts_PJRT_Client_GetDefaultLayout_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub client: *mut PJRT_Client,
+    pub type_: i32,
+    pub dims: *const i64,
+    pub num_dims: usize,
+    pub layout: *mut PJRT_Layouts_MemoryLayout,
+}
+
+#[repr(C)]
+pub struct PJRT_Layouts_PJRT_Topology_GetDefaultLayout_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub topology_description: *mut PJRT_TopologyDescription,
+    pub type_: i32,
+    pub dims: *const i64,
+    pub num_dims: usize,
+    pub layout: *mut PJRT_Layouts_MemoryLayout,
+}
+
+#[repr(C)]
 pub struct PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -216,9 +246,12 @@ pub struct PJRT_Layouts_Extension {
         PjrtResultFn<PJRT_Layouts_MemoryLayout_Destroy_Args>,
     pub PJRT_Layouts_MemoryLayout_Serialize:
         PjrtResultFn<PJRT_Layouts_MemoryLayout_Serialize_Args>,
-    pub PJRT_Layouts_PJRT_Client_GetDefaultLayout: PjrtOpaqueFn,
-    pub PJRT_Layouts_PJRT_Buffer_MemoryLayout: PjrtOpaqueFn,
-    pub PJRT_Layouts_PJRT_Topology_GetDefaultLayout: PjrtOpaqueFn,
+    pub PJRT_Layouts_PJRT_Client_GetDefaultLayout:
+        PjrtResultFn<PJRT_Layouts_PJRT_Client_GetDefaultLayout_Args>,
+    pub PJRT_Layouts_PJRT_Buffer_MemoryLayout:
+        PjrtResultFn<PJRT_Layouts_PJRT_Buffer_MemoryLayout_Args>,
+    pub PJRT_Layouts_PJRT_Topology_GetDefaultLayout:
+        PjrtResultFn<PJRT_Layouts_PJRT_Topology_GetDefaultLayout_Args>,
     pub PJRT_Layouts_PJRT_Executable_GetOutputLayouts:
         PjrtResultFn<PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args>,
 }
@@ -1701,6 +1734,12 @@ fn row_major_layout_string(rank: usize) -> CString {
     cstring_lossy(format!("{{{major_to_minor}}}"))
 }
 
+fn heap_row_major_layout(rank: usize) -> *mut PJRT_Layouts_MemoryLayout {
+    Box::into_raw(Box::new(PJRT_Layouts_MemoryLayout {
+        serialized: row_major_layout_string(rank),
+    }))
+}
+
 fn executable_tensor_spec(executable: &PJRT_Executable) -> String {
     let dims = executable
         .output_dims
@@ -2432,6 +2471,56 @@ pub unsafe extern "C" fn TT_Layouts_MemoryLayout_Serialize(
     args.serialized_bytes_size = serialized_layout.serialized.as_bytes().len();
     args.serialized_layout = Box::into_raw(serialized_layout);
     args.serialized_layout_deleter = Some(TT_Layouts_SerializedLayout_Destroy);
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_Buffer_MemoryLayout(
+    args: *mut PJRT_Layouts_PJRT_Buffer_MemoryLayout_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    args.layout = heap_row_major_layout(buffer.dims.len());
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_Client_GetDefaultLayout(
+    args: *mut PJRT_Layouts_PJRT_Client_GetDefaultLayout_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if args.client.is_null() {
+        return invalid_argument("client must not be null");
+    }
+    let Ok(dims) = checked_dims(args.dims, args.num_dims) else {
+        return invalid_argument("dims must be valid");
+    };
+    let _ = dims;
+    args.layout = heap_row_major_layout(args.num_dims);
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_Topology_GetDefaultLayout(
+    args: *mut PJRT_Layouts_PJRT_Topology_GetDefaultLayout_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if args.topology_description.is_null() {
+        return invalid_argument("topology_description must not be null");
+    }
+    let Ok(dims) = checked_dims(args.dims, args.num_dims) else {
+        return invalid_argument("dims must be valid");
+    };
+    let _ = dims;
+    args.layout = heap_row_major_layout(args.num_dims);
     ptr::null_mut()
 }
 
@@ -3672,9 +3761,9 @@ static PJRT_LAYOUTS_EXTENSION: PJRT_Layouts_Extension = PJRT_Layouts_Extension {
     },
     PJRT_Layouts_MemoryLayout_Destroy: Some(TT_Layouts_MemoryLayout_Destroy),
     PJRT_Layouts_MemoryLayout_Serialize: Some(TT_Layouts_MemoryLayout_Serialize),
-    PJRT_Layouts_PJRT_Client_GetDefaultLayout: None,
-    PJRT_Layouts_PJRT_Buffer_MemoryLayout: None,
-    PJRT_Layouts_PJRT_Topology_GetDefaultLayout: None,
+    PJRT_Layouts_PJRT_Client_GetDefaultLayout: Some(TT_Layouts_Client_GetDefaultLayout),
+    PJRT_Layouts_PJRT_Buffer_MemoryLayout: Some(TT_Layouts_Buffer_MemoryLayout),
+    PJRT_Layouts_PJRT_Topology_GetDefaultLayout: Some(TT_Layouts_Topology_GetDefaultLayout),
     PJRT_Layouts_PJRT_Executable_GetOutputLayouts: Some(TT_Layouts_Executable_GetOutputLayouts),
 };
 
@@ -4231,6 +4320,161 @@ mod tests {
         };
         check_ok(api, unsafe { loaded_destroy(&mut loaded_destroy_args) });
         assert!(loaded_destroy_args.executable.is_null());
+
+        unsafe {
+            drop(Box::from_raw(client));
+        }
+    }
+
+    #[test]
+    fn optimized_program_and_layout_extension_expose_row_major_metadata() {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"mlir".to_vec();
+        let mut code = b"module {\n  func.func public @main(%arg0: tensor<32x32xbf16>, %arg1: tensor<32x32xbf16>) -> tensor<32x32xbf16> {\n    %0 = stablehlo.add %arg0, %arg1 : tensor<32x32xbf16>\n    return %0 : tensor<32x32xbf16>\n  }\n}\n".to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: code.as_mut_ptr().cast::<c_char>(),
+            code_size: code.len(),
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { compile(&mut compile_args) });
+
+        let get_executable = api
+            .PJRT_LoadedExecutable_GetExecutable
+            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
+        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
+            extension_start: ptr::null_mut(),
+            loaded_executable: compile_args.executable,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+        let executable = get_executable_args.executable;
+
+        let optimized_program = api
+            .PJRT_Executable_OptimizedProgram
+            .expect("PJRT_Executable_OptimizedProgram must be exported");
+        let mut program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: ptr::null_mut(),
+            code_size: 0,
+            format: ptr::null(),
+            format_size: 0,
+        };
+        let mut optimized_program_args = PJRT_Executable_OptimizedProgram_Args {
+            struct_size: size_of::<PJRT_Executable_OptimizedProgram_Args>(),
+            extension_start: ptr::null_mut(),
+            executable,
+            program: &mut program,
+        };
+        check_ok(api, unsafe { optimized_program(&mut optimized_program_args) });
+        assert_eq!(program.format_size, 4);
+        let format = unsafe {
+            std::slice::from_raw_parts(program.format.cast::<u8>(), program.format_size)
+        };
+        assert_eq!(format, b"mlir");
+        assert!(program.code_size > 0);
+
+        let mut optimized_code = vec![0u8; program.code_size];
+        let mut program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: optimized_code.as_mut_ptr().cast::<c_char>(),
+            code_size: optimized_code.len(),
+            format: ptr::null(),
+            format_size: 0,
+        };
+        let mut optimized_program_args = PJRT_Executable_OptimizedProgram_Args {
+            struct_size: size_of::<PJRT_Executable_OptimizedProgram_Args>(),
+            extension_start: ptr::null_mut(),
+            executable,
+            program: &mut program,
+        };
+        check_ok(api, unsafe { optimized_program(&mut optimized_program_args) });
+        let mlir =
+            String::from_utf8(optimized_code).expect("optimized program should be utf-8");
+        assert!(mlir.contains("stablehlo.add"));
+
+        let layouts_extension = unsafe {
+            &*(api.extension_start.cast::<PJRT_Layouts_Extension>())
+        };
+        let get_output_layouts = layouts_extension
+            .PJRT_Layouts_PJRT_Executable_GetOutputLayouts
+            .expect("layouts extension must expose executable output layouts");
+        let mut output_layout_args = PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args {
+            struct_size: size_of::<PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args>(),
+            extension_start: ptr::null_mut(),
+            executable,
+            num_outputs: 0,
+            layouts: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_output_layouts(&mut output_layout_args) });
+        assert_eq!(output_layout_args.num_outputs, 1);
+        assert!(!output_layout_args.layouts.is_null());
+
+        let serialize_layout = layouts_extension
+            .PJRT_Layouts_MemoryLayout_Serialize
+            .expect("layouts extension must serialize memory layouts");
+        let first_layout = unsafe { *output_layout_args.layouts };
+        let mut serialize_args = PJRT_Layouts_MemoryLayout_Serialize_Args {
+            struct_size: size_of::<PJRT_Layouts_MemoryLayout_Serialize_Args>(),
+            extension_start: ptr::null_mut(),
+            layout: first_layout,
+            serialized_bytes: ptr::null(),
+            serialized_bytes_size: 0,
+            serialized_layout: ptr::null_mut(),
+            serialized_layout_deleter: None,
+        };
+        check_ok(api, unsafe { serialize_layout(&mut serialize_args) });
+        let layout = unsafe {
+            std::slice::from_raw_parts(
+                serialize_args.serialized_bytes.cast::<u8>(),
+                serialize_args.serialized_bytes_size,
+            )
+        };
+        assert_eq!(layout, b"{1,0}");
+        unsafe {
+            serialize_args
+                .serialized_layout_deleter
+                .expect("serialized layout deleter must exist")(serialize_args.serialized_layout);
+        }
+
+        let executable_destroy = api
+            .PJRT_Executable_Destroy
+            .expect("PJRT_Executable_Destroy must be exported");
+        let mut executable_destroy_args = PJRT_Executable_Destroy_Args {
+            struct_size: size_of::<PJRT_Executable_Destroy_Args>(),
+            extension_start: ptr::null_mut(),
+            executable,
+        };
+        check_ok(api, unsafe { executable_destroy(&mut executable_destroy_args) });
+
+        let loaded_destroy = api
+            .PJRT_LoadedExecutable_Destroy
+            .expect("PJRT_LoadedExecutable_Destroy must be exported");
+        let mut loaded_destroy_args = PJRT_LoadedExecutable_Destroy_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_Destroy_Args>(),
+            extension_start: ptr::null_mut(),
+            executable: compile_args.executable,
+        };
+        check_ok(api, unsafe { loaded_destroy(&mut loaded_destroy_args) });
 
         unsafe {
             drop(Box::from_raw(client));
