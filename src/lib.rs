@@ -536,6 +536,34 @@ pub struct PJRT_Device_DefaultMemory_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_Device_MemoryStats_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub device: *mut PJRT_Device,
+    pub bytes_in_use: i64,
+    pub peak_bytes_in_use: i64,
+    pub peak_bytes_in_use_is_set: bool,
+    pub num_allocs: i64,
+    pub num_allocs_is_set: bool,
+    pub largest_alloc_size: i64,
+    pub largest_alloc_size_is_set: bool,
+    pub bytes_limit: i64,
+    pub bytes_limit_is_set: bool,
+    pub bytes_reserved: i64,
+    pub bytes_reserved_is_set: bool,
+    pub peak_bytes_reserved: i64,
+    pub peak_bytes_reserved_is_set: bool,
+    pub bytes_reservable_limit: i64,
+    pub bytes_reservable_limit_is_set: bool,
+    pub largest_free_block_bytes: i64,
+    pub largest_free_block_bytes_is_set: bool,
+    pub pool_bytes: i64,
+    pub pool_bytes_is_set: bool,
+    pub peak_pool_bytes: i64,
+    pub peak_pool_bytes_is_set: bool,
+}
+
+#[repr(C)]
 pub struct PJRT_Device_GetAttributes_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -931,7 +959,7 @@ pub struct PJRT_Api {
     pub PJRT_Device_LocalHardwareId: PjrtResultFn<PJRT_Device_LocalHardwareId_Args>,
     pub PJRT_Device_AddressableMemories: PjrtResultFn<PJRT_Device_AddressableMemories_Args>,
     pub PJRT_Device_DefaultMemory: PjrtResultFn<PJRT_Device_DefaultMemory_Args>,
-    unused_device_memory_stats: [PjrtOpaqueFn; 1],
+    pub PJRT_Device_MemoryStats: PjrtResultFn<PJRT_Device_MemoryStats_Args>,
     pub PJRT_Memory_Id: PjrtResultFn<PJRT_Memory_Id_Args>,
     pub PJRT_Memory_Kind: PjrtResultFn<PJRT_Memory_Kind_Args>,
     pub PJRT_Memory_DebugString: PjrtResultFn<PJRT_Memory_DebugString_Args>,
@@ -2494,6 +2522,20 @@ pub unsafe extern "C" fn TT_Device_DefaultMemory(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Device_MemoryStats(
+    args: *mut PJRT_Device_MemoryStats_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    log("pjrt device_memory_stats entered");
+    if args.device.is_null() {
+        return invalid_argument("device must not be null");
+    }
+    unimplemented("device memory stats are not implemented")
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Device_GetAttributes(
     args: *mut PJRT_Device_GetAttributes_Args,
 ) -> *mut PJRT_Error {
@@ -3129,7 +3171,7 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Device_LocalHardwareId: Some(TT_Device_LocalHardwareId),
     PJRT_Device_AddressableMemories: Some(TT_Device_AddressableMemories),
     PJRT_Device_DefaultMemory: Some(TT_Device_DefaultMemory),
-    unused_device_memory_stats: [None; 1],
+    PJRT_Device_MemoryStats: Some(TT_Device_MemoryStats),
     PJRT_Memory_Id: Some(TT_Memory_Id),
     PJRT_Memory_Kind: Some(TT_Memory_Kind),
     PJRT_Memory_DebugString: Some(TT_Memory_DebugString),
