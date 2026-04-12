@@ -174,6 +174,7 @@ enum ExecutableKind {
 pub struct PJRT_Executable {
     kind: ExecutableKind,
     name: CString,
+    fingerprint: CString,
     num_outputs: usize,
     output_types: Vec<i32>,
     output_dims: Vec<i64>,
@@ -187,6 +188,7 @@ pub struct PJRT_Executable {
 pub struct PJRT_LoadedExecutable {
     kind: ExecutableKind,
     name: CString,
+    fingerprint: CString,
     num_outputs: usize,
     output_types: Vec<i32>,
     output_dims: Vec<i64>,
@@ -709,6 +711,15 @@ pub struct PJRT_Executable_OptimizedProgram_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_Executable_Fingerprint_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+    pub executable_fingerprint: *const c_char,
+    pub executable_fingerprint_size: usize,
+}
+
+#[repr(C)]
 pub struct PJRT_LoadedExecutable_Delete_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -735,6 +746,15 @@ pub struct PJRT_LoadedExecutable_Execute_Args {
     pub output_lists: *mut *mut *mut PJRT_Buffer,
     pub device_complete_events: *mut *mut PJRT_Event,
     pub execute_device: *mut PJRT_Device,
+}
+
+#[repr(C)]
+pub struct PJRT_LoadedExecutable_Fingerprint_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_LoadedExecutable,
+    pub executable_fingerprint: *const c_char,
+    pub executable_fingerprint_size: usize,
 }
 
 #[repr(C)]
@@ -1010,7 +1030,8 @@ pub struct PJRT_Api {
     pub PJRT_LoadedExecutable_IsDeleted: PjrtResultFn<PJRT_LoadedExecutable_IsDeleted_Args>,
     pub PJRT_LoadedExecutable_Execute: PjrtResultFn<PJRT_LoadedExecutable_Execute_Args>,
     pub PJRT_Executable_DeserializeAndLoad: PjrtOpaqueFn,
-    pub PJRT_LoadedExecutable_Fingerprint: PjrtOpaqueFn,
+    pub PJRT_LoadedExecutable_Fingerprint:
+        PjrtResultFn<PJRT_LoadedExecutable_Fingerprint_Args>,
     pub PJRT_Buffer_Destroy: PjrtResultFn<PJRT_Buffer_Destroy_Args>,
     pub PJRT_Buffer_ElementType: PjrtResultFn<PJRT_Buffer_ElementType_Args>,
     pub PJRT_Buffer_Dimensions: PjrtResultFn<PJRT_Buffer_Dimensions_Args>,
@@ -1045,7 +1066,8 @@ pub struct PJRT_Api {
     pub PJRT_Compile: PjrtResultFn<PJRT_Compile_Args>,
     pub PJRT_Executable_OutputElementTypes: PjrtResultFn<PJRT_Executable_OutputElementTypes_Args>,
     pub PJRT_Executable_OutputDimensions: PjrtResultFn<PJRT_Executable_OutputDimensions_Args>,
-    unused_before_client_topology: [PjrtOpaqueFn; 3],
+    unused_before_executable_fingerprint: [PjrtOpaqueFn; 2],
+    pub PJRT_Executable_Fingerprint: PjrtResultFn<PJRT_Executable_Fingerprint_Args>,
     pub PJRT_Client_TopologyDescription: PjrtResultFn<PJRT_Client_TopologyDescription_Args>,
     unused_compiled_memory_stats: [PjrtOpaqueFn; 1],
     pub PJRT_Memory_Kind_Id: PjrtResultFn<PJRT_Memory_Kind_Id_Args>,
@@ -1488,9 +1510,11 @@ fn make_executable(
         .map(|kind| kind.as_bytes().len())
         .collect::<Vec<_>>();
     let output_dim_sizes = vec![dims.len()];
+    let fingerprint = executable_fingerprint_string(kind, name, &dims, output_type);
     PJRT_Executable {
         kind,
         name: cstring_lossy(name),
+        fingerprint,
         num_outputs: 1,
         output_types: vec![output_type],
         output_dims: dims,
@@ -1512,6 +1536,7 @@ fn make_loaded_executable(
     PJRT_LoadedExecutable {
         kind: executable.kind,
         name: executable.name,
+        fingerprint: executable.fingerprint,
         num_outputs: executable.num_outputs,
         output_types: executable.output_types,
         output_dims: executable.output_dims,
@@ -1533,6 +1558,7 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
     PJRT_Executable {
         kind: executable.kind,
         name: executable.name.clone(),
+        fingerprint: executable.fingerprint.clone(),
         num_outputs: executable.num_outputs,
         output_types: executable.output_types.clone(),
         output_dims: executable.output_dims.clone(),
@@ -1577,6 +1603,25 @@ fn executable_optimized_mlir(executable: &PJRT_Executable) -> String {
             )
         }
     }
+}
+
+fn executable_fingerprint_string(
+    kind: ExecutableKind,
+    name: &str,
+    dims: &[i64],
+    output_type: i32,
+) -> CString {
+    let kind_name = match kind {
+        ExecutableKind::EltwiseAddBf16 => "eltwise_add_bf16",
+    };
+    let dims = dims
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join("x");
+    cstring_lossy(&format!(
+        "tt:{kind_name}:name={name}:dims={dims}:type={output_type}:v1"
+    ))
 }
 
 #[unsafe(no_mangle)]
@@ -2114,6 +2159,26 @@ pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Executable_Fingerprint(
+    args: *mut PJRT_Executable_Fingerprint_Args,
+) -> *mut PJRT_Error {
+    log("pjrt executable_fingerprint entered");
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.executable_fingerprint = executable.fingerprint.as_ptr();
+    args.executable_fingerprint_size = executable.fingerprint.as_bytes().len();
+    log(format!(
+        "pjrt executable_fingerprint returning {} bytes",
+        args.executable_fingerprint_size
+    ));
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Executable_NumOutputs(
     args: *mut PJRT_Executable_NumOutputs_Args,
 ) -> *mut PJRT_Error {
@@ -2288,6 +2353,26 @@ pub unsafe extern "C" fn TT_LoadedExecutable_IsDeleted(
         return invalid_argument("executable must not be null");
     };
     args.is_deleted = executable.deleted;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_LoadedExecutable_Fingerprint(
+    args: *mut PJRT_LoadedExecutable_Fingerprint_Args,
+) -> *mut PJRT_Error {
+    log("pjrt loaded_executable_fingerprint entered");
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.executable_fingerprint = executable.fingerprint.as_ptr();
+    args.executable_fingerprint_size = executable.fingerprint.as_bytes().len();
+    log(format!(
+        "pjrt loaded_executable_fingerprint returning {} bytes",
+        args.executable_fingerprint_size
+    ));
     ptr::null_mut()
 }
 
@@ -3390,7 +3475,7 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_LoadedExecutable_IsDeleted: Some(TT_LoadedExecutable_IsDeleted),
     PJRT_LoadedExecutable_Execute: Some(TT_LoadedExecutable_Execute),
     PJRT_Executable_DeserializeAndLoad: None,
-    PJRT_LoadedExecutable_Fingerprint: None,
+    PJRT_LoadedExecutable_Fingerprint: Some(TT_LoadedExecutable_Fingerprint),
     PJRT_Buffer_Destroy: Some(TT_Buffer_Destroy),
     PJRT_Buffer_ElementType: Some(TT_Buffer_ElementType),
     PJRT_Buffer_Dimensions: Some(TT_Buffer_Dimensions),
@@ -3422,7 +3507,8 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Compile: Some(TT_Compile),
     PJRT_Executable_OutputElementTypes: Some(TT_Executable_OutputElementTypes),
     PJRT_Executable_OutputDimensions: Some(TT_Executable_OutputDimensions),
-    unused_before_client_topology: [None; 3],
+    unused_before_executable_fingerprint: [None; 2],
+    PJRT_Executable_Fingerprint: Some(TT_Executable_Fingerprint),
     PJRT_Client_TopologyDescription: Some(TT_Client_TopologyDescription),
     unused_compiled_memory_stats: [None; 1],
     PJRT_Memory_Kind_Id: Some(TT_Memory_Kind_Id),
