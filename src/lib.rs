@@ -38,6 +38,7 @@ const PJRT_HostBufferSemantics_kMutableZeroCopy: i32 = 3;
 type PjrtOpaqueFn = Option<unsafe extern "C" fn()>;
 type PjrtResultFn<Args> = Option<unsafe extern "C" fn(args: *mut Args) -> *mut PJRT_Error>;
 type PjrtVoidFn<Args> = Option<unsafe extern "C" fn(args: *mut Args)>;
+type PjrtNamedValueDeleter = Option<unsafe extern "C" fn(attributes: *const PJRT_NamedValue)>;
 type PjrtEventOnReadyCallback =
     Option<unsafe extern "C" fn(error: *mut PJRT_Error, user_arg: *mut c_void)>;
 
@@ -457,6 +458,7 @@ pub struct PJRT_DeviceDescription_Attributes_Args {
     pub device_description: *mut PJRT_DeviceDescription,
     pub attributes: *const PJRT_NamedValue,
     pub num_attributes: usize,
+    pub attributes_deleter: PjrtNamedValueDeleter,
 }
 
 #[repr(C)]
@@ -534,6 +536,7 @@ pub struct PJRT_Device_GetAttributes_Args {
     pub device: *mut PJRT_Device,
     pub attributes: *const PJRT_NamedValue,
     pub num_attributes: usize,
+    pub attributes_deleter: PjrtNamedValueDeleter,
 }
 
 #[repr(C)]
@@ -1106,6 +1109,8 @@ fn failed_precondition(message: impl AsRef<str>) -> *mut PJRT_Error {
 fn ready_event() -> *mut PJRT_Event {
     Box::into_raw(Box::new(PJRT_Event { error: None }))
 }
+
+unsafe extern "C" fn noop_named_value_deleter(_attributes: *const PJRT_NamedValue) {}
 
 fn event_with_error(code: PJRT_Error_Code, message: impl Into<String>) -> *mut PJRT_Event {
     Box::into_raw(Box::new(PJRT_Event {
@@ -2286,6 +2291,7 @@ pub unsafe extern "C" fn TT_DeviceDescription_Attributes(
     }
     args.attributes = ptr::null();
     args.num_attributes = 0;
+    args.attributes_deleter = Some(noop_named_value_deleter);
     ptr::null_mut()
 }
 
@@ -2433,6 +2439,7 @@ pub unsafe extern "C" fn TT_Device_GetAttributes(
     }
     args.attributes = ptr::null();
     args.num_attributes = 0;
+    args.attributes_deleter = Some(noop_named_value_deleter);
     ptr::null_mut()
 }
 
@@ -3131,6 +3138,7 @@ mod tests {
                 device: first_device,
                 attributes: ptr::null(),
                 num_attributes: usize::MAX,
+                attributes_deleter: None,
             };
             check_ok(api, unsafe {
                 device_get_attributes(&mut device_get_attributes_args)
