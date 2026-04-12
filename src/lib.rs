@@ -1169,6 +1169,10 @@ fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind
     } else {
         c_api_string(program.code.cast_const(), program.code_size, "program.code")?
     };
+    log(format!(
+        "pjrt compile program format={format:?} code_size={}",
+        program.code_size
+    ));
 
     match format.as_str() {
         "tt.add" => Ok(ExecutableKind::EltwiseAddBf16),
@@ -1501,6 +1505,7 @@ pub unsafe extern "C" fn TT_Client_Compile(args: *mut PJRT_Client_Compile_Args) 
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_compile entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -1725,6 +1730,10 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log(format!(
+        "pjrt loaded_executable_execute entered num_devices={} num_args={}",
+        args.num_devices, args.num_args
+    ));
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };

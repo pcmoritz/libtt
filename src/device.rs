@@ -733,7 +733,10 @@ fn discover_with(root: &Path) -> Vec<Device> {
 
     if let Ok(entries) = fs::read_dir(root) {
         for entry in entries.flatten() {
-            paths.push(entry.path());
+            let path = entry.path();
+            if local_hardware_id_from_path(&path).is_some() {
+                paths.push(path);
+            }
         }
     }
 
