@@ -45,6 +45,8 @@ type PjrtSerializedDeviceAssignmentDeleter =
     Option<unsafe extern "C" fn(device_assignment: *mut PJRT_DeviceAssignmentSerialized)>;
 type PjrtEventOnReadyCallback =
     Option<unsafe extern "C" fn(error: *mut PJRT_Error, user_arg: *mut c_void)>;
+type PjrtSerializedLayoutDeleter =
+    Option<unsafe extern "C" fn(serialized_layout: *mut PJRT_Layouts_SerializedLayout)>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,9 +71,19 @@ pub enum PJRT_Error_Code {
 }
 
 #[repr(C)]
-pub struct PJRT_Extension_Base {
-    _private: [u8; 0],
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PJRT_Extension_Type {
+    PJRT_Extension_Type_Layouts = 4,
 }
+
+#[repr(C)]
+pub struct PJRT_Extension_Base {
+    pub struct_size: usize,
+    pub type_: PJRT_Extension_Type,
+    pub next: *mut PJRT_Extension_Base,
+}
+
+unsafe impl Sync for PJRT_Extension_Base {}
 
 #[repr(C)]
 pub struct PJRT_NamedValue {
@@ -161,6 +173,59 @@ pub struct PJRT_Program {
 }
 
 #[repr(C)]
+pub struct PJRT_Layouts_MemoryLayout {
+    serialized: CString,
+}
+
+#[repr(C)]
+pub struct PJRT_Layouts_SerializedLayout {
+    serialized: CString,
+}
+
+#[repr(C)]
+pub struct PJRT_Layouts_MemoryLayout_Destroy_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub layout: *mut PJRT_Layouts_MemoryLayout,
+}
+
+#[repr(C)]
+pub struct PJRT_Layouts_MemoryLayout_Serialize_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub layout: *mut PJRT_Layouts_MemoryLayout,
+    pub serialized_bytes: *const c_char,
+    pub serialized_bytes_size: usize,
+    pub serialized_layout: *mut PJRT_Layouts_SerializedLayout,
+    pub serialized_layout_deleter: PjrtSerializedLayoutDeleter,
+}
+
+#[repr(C)]
+pub struct PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+    pub num_outputs: usize,
+    pub layouts: *mut *mut PJRT_Layouts_MemoryLayout,
+}
+
+#[repr(C)]
+pub struct PJRT_Layouts_Extension {
+    pub base: PJRT_Extension_Base,
+    pub PJRT_Layouts_MemoryLayout_Destroy:
+        PjrtResultFn<PJRT_Layouts_MemoryLayout_Destroy_Args>,
+    pub PJRT_Layouts_MemoryLayout_Serialize:
+        PjrtResultFn<PJRT_Layouts_MemoryLayout_Serialize_Args>,
+    pub PJRT_Layouts_PJRT_Client_GetDefaultLayout: PjrtOpaqueFn,
+    pub PJRT_Layouts_PJRT_Buffer_MemoryLayout: PjrtOpaqueFn,
+    pub PJRT_Layouts_PJRT_Topology_GetDefaultLayout: PjrtOpaqueFn,
+    pub PJRT_Layouts_PJRT_Executable_GetOutputLayouts:
+        PjrtResultFn<PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args>,
+}
+
+unsafe impl Sync for PJRT_Layouts_Extension {}
+
+#[repr(C)]
 pub struct PJRT_ExecuteOptions {
     _private: [u8; 0],
 }
@@ -184,6 +249,8 @@ pub struct PJRT_Executable {
     output_types: Vec<i32>,
     output_dims: Vec<i64>,
     output_dim_sizes: Vec<usize>,
+    output_layouts: Vec<PJRT_Layouts_MemoryLayout>,
+    output_layout_ptrs: Vec<*mut PJRT_Layouts_MemoryLayout>,
     output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
@@ -198,6 +265,8 @@ pub struct PJRT_LoadedExecutable {
     output_types: Vec<i32>,
     output_dims: Vec<i64>,
     output_dim_sizes: Vec<usize>,
+    output_layouts: Vec<PJRT_Layouts_MemoryLayout>,
+    output_layout_ptrs: Vec<*mut PJRT_Layouts_MemoryLayout>,
     output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
@@ -1530,6 +1599,13 @@ fn make_executable(
     dims: Vec<i64>,
     output_type: i32,
 ) -> PJRT_Executable {
+    let output_layouts = vec![PJRT_Layouts_MemoryLayout {
+        serialized: row_major_layout_string(dims.len()),
+    }];
+    let output_layout_ptrs = output_layouts
+        .iter()
+        .map(|layout| (layout as *const PJRT_Layouts_MemoryLayout).cast_mut())
+        .collect::<Vec<_>>();
     let output_memory_kinds = vec![cstring_lossy("dram")];
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
@@ -1549,6 +1625,8 @@ fn make_executable(
         output_types: vec![output_type],
         output_dims: dims,
         output_dim_sizes,
+        output_layouts,
+        output_layout_ptrs,
         output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
@@ -1571,6 +1649,8 @@ fn make_loaded_executable(
         output_types: executable.output_types,
         output_dims: executable.output_dims,
         output_dim_sizes: executable.output_dim_sizes,
+        output_layouts: executable.output_layouts,
+        output_layout_ptrs: executable.output_layout_ptrs,
         output_memory_kinds: executable.output_memory_kinds,
         output_memory_kind_ptrs: executable.output_memory_kind_ptrs,
         output_memory_kind_sizes: executable.output_memory_kind_sizes,
@@ -1580,6 +1660,17 @@ fn make_loaded_executable(
 }
 
 fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
+    let output_layouts = executable
+        .output_layouts
+        .iter()
+        .map(|layout| PJRT_Layouts_MemoryLayout {
+            serialized: layout.serialized.clone(),
+        })
+        .collect::<Vec<_>>();
+    let output_layout_ptrs = output_layouts
+        .iter()
+        .map(|layout| (layout as *const PJRT_Layouts_MemoryLayout).cast_mut())
+        .collect::<Vec<_>>();
     let output_memory_kinds = executable.output_memory_kinds.clone();
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
@@ -1593,10 +1684,21 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
         output_types: executable.output_types.clone(),
         output_dims: executable.output_dims.clone(),
         output_dim_sizes: executable.output_dim_sizes.clone(),
+        output_layouts,
+        output_layout_ptrs,
         output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes: executable.output_memory_kind_sizes.clone(),
     }
+}
+
+fn row_major_layout_string(rank: usize) -> CString {
+    let major_to_minor = (0..rank)
+        .rev()
+        .map(|dim| dim.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    cstring_lossy(format!("{{{major_to_minor}}}"))
 }
 
 fn executable_tensor_spec(executable: &PJRT_Executable) -> String {
@@ -2148,10 +2250,42 @@ pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
     args: *mut PJRT_Executable_OptimizedProgram_Args,
 ) -> *mut PJRT_Error {
     log("pjrt executable_optimized_program entered");
-    let Ok(_args) = (unsafe { checked_mut(args, "args") }) else {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    unimplemented("pjrt executable_optimized_program is not implemented")
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    let Ok(program) = (unsafe { checked_mut(args.program, "program") }) else {
+        return invalid_argument("program must not be null");
+    };
+
+    static MLIR_FORMAT: &[u8] = b"mlir";
+    let mlir = executable_optimized_mlir(executable);
+    program.format = MLIR_FORMAT.as_ptr().cast::<c_char>();
+    program.format_size = MLIR_FORMAT.len();
+
+    if program.code.is_null() {
+        program.code_size = mlir.len();
+        log(format!(
+            "pjrt executable_optimized_program size query returning {} bytes",
+            program.code_size
+        ));
+        return ptr::null_mut();
+    }
+    if program.code_size < mlir.len() {
+        return invalid_argument("program code buffer is too small");
+    }
+
+    unsafe {
+        ptr::copy_nonoverlapping(mlir.as_ptr().cast::<c_char>(), program.code, mlir.len());
+    }
+    program.code_size = mlir.len();
+    log(format!(
+        "pjrt executable_optimized_program wrote {} bytes",
+        program.code_size
+    ));
+    ptr::null_mut()
 }
 
 #[unsafe(no_mangle)]
@@ -2252,6 +2386,67 @@ pub unsafe extern "C" fn TT_Executable_OutputMemoryKinds(
         "pjrt executable_output_memory_kinds returning {}",
         args.num_outputs
     ));
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_MemoryLayout_Destroy(
+    args: *mut PJRT_Layouts_MemoryLayout_Destroy_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if !args.layout.is_null() {
+        unsafe {
+            drop(Box::from_raw(args.layout));
+        }
+        args.layout = ptr::null_mut();
+    }
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn TT_Layouts_SerializedLayout_Destroy(
+    serialized_layout: *mut PJRT_Layouts_SerializedLayout,
+) {
+    if !serialized_layout.is_null() {
+        unsafe {
+            drop(Box::from_raw(serialized_layout));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_MemoryLayout_Serialize(
+    args: *mut PJRT_Layouts_MemoryLayout_Serialize_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(layout) = (unsafe { checked_ref(args.layout, "layout") }) else {
+        return invalid_argument("layout must not be null");
+    };
+    let serialized_layout = Box::new(PJRT_Layouts_SerializedLayout {
+        serialized: layout.serialized.clone(),
+    });
+    args.serialized_bytes = serialized_layout.serialized.as_ptr();
+    args.serialized_bytes_size = serialized_layout.serialized.as_bytes().len();
+    args.serialized_layout = Box::into_raw(serialized_layout);
+    args.serialized_layout_deleter = Some(TT_Layouts_SerializedLayout_Destroy);
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_Executable_GetOutputLayouts(
+    args: *mut PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.num_outputs = executable.output_layout_ptrs.len();
+    args.layouts = executable.output_layout_ptrs.as_ptr().cast_mut();
     ptr::null_mut()
 }
 
@@ -3469,9 +3664,23 @@ define_unimplemented_generic_pjrt_fn!(
 define_unimplemented_generic_pjrt_fn!(TT_Event_Create, "pjrt event_create");
 define_unimplemented_generic_pjrt_fn!(TT_Event_Set, "pjrt event_set");
 
+static PJRT_LAYOUTS_EXTENSION: PJRT_Layouts_Extension = PJRT_Layouts_Extension {
+    base: PJRT_Extension_Base {
+        struct_size: size_of::<PJRT_Layouts_Extension>(),
+        type_: PJRT_Extension_Type::PJRT_Extension_Type_Layouts,
+        next: ptr::null_mut(),
+    },
+    PJRT_Layouts_MemoryLayout_Destroy: Some(TT_Layouts_MemoryLayout_Destroy),
+    PJRT_Layouts_MemoryLayout_Serialize: Some(TT_Layouts_MemoryLayout_Serialize),
+    PJRT_Layouts_PJRT_Client_GetDefaultLayout: None,
+    PJRT_Layouts_PJRT_Buffer_MemoryLayout: None,
+    PJRT_Layouts_PJRT_Topology_GetDefaultLayout: None,
+    PJRT_Layouts_PJRT_Executable_GetOutputLayouts: Some(TT_Layouts_Executable_GetOutputLayouts),
+};
+
 static PJRT_API: PJRT_Api = PJRT_Api {
     struct_size: size_of::<PJRT_Api>(),
-    extension_start: ptr::null_mut(),
+    extension_start: (&PJRT_LAYOUTS_EXTENSION.base as *const PJRT_Extension_Base).cast_mut(),
     pjrt_api_version: PJRT_Api_Version {
         struct_size: size_of::<PJRT_Api_Version>(),
         extension_start: ptr::null_mut(),
