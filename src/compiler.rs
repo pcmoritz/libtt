@@ -932,21 +932,21 @@ fn device_defines(
 }
 
 fn ckernel_headers(program: &Program) -> BTreeMap<String, String> {
-    let mut formats = vec![DType::Float16B as i32; 32];
+    let mut formats = vec![DType::Float16B; 32];
     for cb in &program.cbs {
         if cb.index < formats.len() {
-            formats[cb.index] = cb.dtype as i32;
+            formats[cb.index] = cb.dtype;
         }
     }
     let tile_sizes = formats
         .iter()
-        .map(|format| dtype_from_i32(*format).tile_size())
+        .map(|format| format.tile_size())
         .collect::<Vec<_>>();
 
-    let join = |values: &[i32]| -> String {
+    let join = |values: &[DType]| -> String {
         values
             .iter()
-            .map(i32::to_string)
+            .map(|value| (*value as i32).to_string())
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -1027,20 +1027,6 @@ fn ckernel_headers(program: &Program) -> BTreeMap<String, String> {
             ),
         ),
     ])
-}
-
-fn dtype_from_i32(value: i32) -> DType {
-    match value {
-        0 => DType::Float32,
-        1 => DType::Float16,
-        5 => DType::Float16B,
-        8 => DType::Int32,
-        9 => DType::UInt16,
-        14 => DType::Int8,
-        24 => DType::UInt32,
-        30 => DType::UInt8,
-        _ => DType::Float16B,
-    }
 }
 
 fn iter_pt_load(elf: &[u8]) -> io::Result<Vec<PTLoad>> {
