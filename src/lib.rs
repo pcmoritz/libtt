@@ -165,6 +165,11 @@ pub struct PJRT_ExecuteOptions {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct PJRT_ExecuteContext {
+    _private: [u8; 0],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecutableKind {
     EltwiseAddBf16,
@@ -959,6 +964,31 @@ pub struct PJRT_Generic_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_ExecuteContext_Create_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub context: *mut PJRT_ExecuteContext,
+}
+
+#[repr(C)]
+pub struct PJRT_ExecuteContext_Destroy_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub context: *mut PJRT_ExecuteContext,
+}
+
+#[repr(C)]
+pub struct PJRT_Buffer_CopyRawToHost_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub buffer: *mut PJRT_Buffer,
+    pub dst: *mut c_void,
+    pub offset: i64,
+    pub transfer_size: i64,
+    pub event: *mut PJRT_Event,
+}
+
+#[repr(C)]
 pub struct PJRT_TopologyDescription_Fingerprint_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -1071,9 +1101,9 @@ pub struct PJRT_Api {
     pub PJRT_Client_TopologyDescription: PjrtResultFn<PJRT_Client_TopologyDescription_Args>,
     unused_compiled_memory_stats: [PjrtOpaqueFn; 1],
     pub PJRT_Memory_Kind_Id: PjrtResultFn<PJRT_Memory_Kind_Id_Args>,
-    pub PJRT_ExecuteContext_Create: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_ExecuteContext_Destroy: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Buffer_CopyRawToHost: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_ExecuteContext_Create: PjrtResultFn<PJRT_ExecuteContext_Create_Args>,
+    pub PJRT_ExecuteContext_Destroy: PjrtResultFn<PJRT_ExecuteContext_Destroy_Args>,
+    pub PJRT_Buffer_CopyRawToHost: PjrtResultFn<PJRT_Buffer_CopyRawToHost_Args>,
     pub PJRT_AsyncHostToDeviceTransferManager_Destroy: PjrtResultFn<PJRT_Generic_Args>,
     pub PJRT_AsyncHostToDeviceTransferManager_TransferData: PjrtResultFn<PJRT_Generic_Args>,
     pub PJRT_Client_CreateBuffersForAsyncHostToDevice: PjrtResultFn<PJRT_Generic_Args>,
@@ -3170,6 +3200,82 @@ pub unsafe extern "C" fn TT_Buffer_ReadyEvent(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_ExecuteContext_Create(
+    args: *mut PJRT_ExecuteContext_Create_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    log("pjrt execute_context_create entered");
+    args.context = Box::into_raw(Box::new(PJRT_ExecuteContext { _private: [] }));
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_ExecuteContext_Destroy(
+    args: *mut PJRT_ExecuteContext_Destroy_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    log("pjrt execute_context_destroy entered");
+    if !args.context.is_null() {
+        unsafe {
+            drop(Box::from_raw(args.context));
+        }
+        args.context = ptr::null_mut();
+    }
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Buffer_CopyRawToHost(
+    args: *mut PJRT_Buffer_CopyRawToHost_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    log("pjrt buffer_copy_raw_to_host entered");
+    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+        return pjrt_error(
+            "buffer has been deleted",
+            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+        );
+    };
+    if args.offset < 0 || args.transfer_size < 0 {
+        return invalid_argument("offset and transfer_size must be non-negative");
+    }
+    let offset = args.offset as usize;
+    let transfer_size = args.transfer_size as usize;
+    if transfer_size > 0 && args.dst.is_null() {
+        return invalid_argument("dst must not be null for non-empty transfers");
+    }
+
+    let mut device = match Device::open(buffer.local_hardware_id) {
+        Ok(device) => device,
+        Err(err) => return io_error(err),
+    };
+    let data = match device.dram_read(dram_buffer) {
+        Ok(data) => data,
+        Err(err) => return io_error(err),
+    };
+    let end = match offset.checked_add(transfer_size) {
+        Some(end) if end <= data.len() => end,
+        _ => return invalid_argument("offset + transfer_size exceeds buffer size"),
+    };
+    if transfer_size > 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(data[offset..end].as_ptr(), args.dst.cast::<u8>(), transfer_size);
+        }
+    }
+    args.event = ready_event();
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Buffer_IncreaseExternalReferenceCount(
     args: *mut PJRT_Buffer_IncreaseExternalReferenceCount_Args,
 ) -> *mut PJRT_Error {
@@ -3304,18 +3410,6 @@ macro_rules! define_unimplemented_generic_pjrt_fn {
     };
 }
 
-define_unimplemented_generic_pjrt_fn!(
-    TT_ExecuteContext_Create,
-    "pjrt execute_context_create"
-);
-define_unimplemented_generic_pjrt_fn!(
-    TT_ExecuteContext_Destroy,
-    "pjrt execute_context_destroy"
-);
-define_unimplemented_generic_pjrt_fn!(
-    TT_Buffer_CopyRawToHost,
-    "pjrt buffer_copy_raw_to_host"
-);
 define_unimplemented_generic_pjrt_fn!(
     TT_AsyncHostToDeviceTransferManager_Destroy,
     "pjrt async_h2d_transfer_manager_destroy"
