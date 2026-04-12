@@ -1514,6 +1514,7 @@ pub unsafe extern "C" fn TT_Client_Create(args: *mut PJRT_Client_Create_Args) ->
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_create entered");
     let client = Box::new(PJRT_Client::new());
     let client_ptr = Box::into_raw(client);
     args.client = client_ptr;
@@ -1598,6 +1599,7 @@ pub unsafe extern "C" fn TT_Client_Devices(args: *mut PJRT_Client_Devices_Args) 
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_devices entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -1617,6 +1619,7 @@ pub unsafe extern "C" fn TT_Client_AddressableDevices(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_addressable_devices entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2231,6 +2234,7 @@ pub unsafe extern "C" fn TT_DeviceDescription_Id(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt device_description_id entered");
     let Ok(description) = (unsafe { checked_ref(args.device_description, "device_description") })
     else {
         return invalid_argument("device_description must not be null");
@@ -2276,6 +2280,7 @@ pub unsafe extern "C" fn TT_DeviceDescription_Kind(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt device_description_kind entered");
     let Ok(description) = (unsafe { checked_ref(args.device_description, "device_description") })
     else {
         return invalid_argument("device_description must not be null");
@@ -2292,6 +2297,7 @@ pub unsafe extern "C" fn TT_DeviceDescription_DebugString(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt device_description_debug_string entered");
     let Ok(description) = (unsafe { checked_ref(args.device_description, "device_description") })
     else {
         return invalid_argument("device_description must not be null");
@@ -2308,6 +2314,7 @@ pub unsafe extern "C" fn TT_DeviceDescription_ToString(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt device_description_to_string entered");
     let Ok(description) = (unsafe { checked_ref(args.device_description, "device_description") })
     else {
         return invalid_argument("device_description must not be null");
@@ -2324,6 +2331,7 @@ pub unsafe extern "C" fn TT_Device_GetDescription(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt device_get_description entered");
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
@@ -2338,6 +2346,7 @@ pub unsafe extern "C" fn TT_Device_IsAddressable(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt device_is_addressable entered");
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
@@ -2352,6 +2361,7 @@ pub unsafe extern "C" fn TT_Device_LocalHardwareId(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt device_local_hardware_id entered");
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
