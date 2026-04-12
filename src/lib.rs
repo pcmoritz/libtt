@@ -18,8 +18,9 @@ use std::ptr;
 use std::slice;
 
 const PJRT_API_MAJOR: i32 = 0;
-const PJRT_API_MINOR: i32 = 96;
-const PJRT_API_UNUSED_TAIL_SLOTS: usize = 30;
+const PJRT_API_MINOR: i32 = 103;
+const PJRT_API_UNUSED_TAIL_BEFORE_DEVICE_GET_ATTRIBUTES: usize = 30;
+const PJRT_API_UNUSED_TAIL_AFTER_DEVICE_GET_ATTRIBUTES: usize = 6;
 const PJRT_Buffer_Type_INVALID: i32 = 0;
 const PJRT_Buffer_Type_S8: i32 = 2;
 const PJRT_Buffer_Type_S32: i32 = 4;
@@ -454,8 +455,8 @@ pub struct PJRT_DeviceDescription_Attributes_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
     pub device_description: *mut PJRT_DeviceDescription,
-    pub num_attributes: usize,
     pub attributes: *const PJRT_NamedValue,
+    pub num_attributes: usize,
 }
 
 #[repr(C)]
@@ -524,6 +525,15 @@ pub struct PJRT_Device_DefaultMemory_Args {
     pub extension_start: *mut PJRT_Extension_Base,
     pub device: *mut PJRT_Device,
     pub default_memory: *mut PJRT_Memory,
+}
+
+#[repr(C)]
+pub struct PJRT_Device_GetAttributes_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub device: *mut PJRT_Device,
+    pub attributes: *const PJRT_NamedValue,
+    pub num_attributes: usize,
 }
 
 #[repr(C)]
@@ -961,7 +971,11 @@ pub struct PJRT_Api {
     pub PJRT_Client_TopologyDescription: PjrtResultFn<PJRT_Client_TopologyDescription_Args>,
     unused_compiled_memory_stats: [PjrtOpaqueFn; 1],
     pub PJRT_Memory_Kind_Id: PjrtResultFn<PJRT_Memory_Kind_Id_Args>,
-    unused_tail: [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_SLOTS],
+    unused_tail_before_device_get_attributes:
+        [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_BEFORE_DEVICE_GET_ATTRIBUTES],
+    pub PJRT_Device_GetAttributes: PjrtResultFn<PJRT_Device_GetAttributes_Args>,
+    unused_tail_after_device_get_attributes:
+        [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_AFTER_DEVICE_GET_ATTRIBUTES],
 }
 
 // The API table is immutable process-global data.
@@ -2407,6 +2421,22 @@ pub unsafe extern "C" fn TT_Device_DefaultMemory(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Device_GetAttributes(
+    args: *mut PJRT_Device_GetAttributes_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    log("pjrt device_get_attributes entered");
+    if args.device.is_null() {
+        return invalid_argument("device must not be null");
+    }
+    args.attributes = ptr::null();
+    args.num_attributes = 0;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Memory_Id(args: *mut PJRT_Memory_Id_Args) -> *mut PJRT_Error {
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
@@ -2929,7 +2959,11 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Client_TopologyDescription: Some(TT_Client_TopologyDescription),
     unused_compiled_memory_stats: [None; 1],
     PJRT_Memory_Kind_Id: Some(TT_Memory_Kind_Id),
-    unused_tail: [None; PJRT_API_UNUSED_TAIL_SLOTS],
+    unused_tail_before_device_get_attributes:
+        [None; PJRT_API_UNUSED_TAIL_BEFORE_DEVICE_GET_ATTRIBUTES],
+    PJRT_Device_GetAttributes: Some(TT_Device_GetAttributes),
+    unused_tail_after_device_get_attributes:
+        [None; PJRT_API_UNUSED_TAIL_AFTER_DEVICE_GET_ATTRIBUTES],
 };
 
 #[unsafe(no_mangle)]
@@ -3087,6 +3121,22 @@ mod tests {
                 )
             };
             assert_eq!(kind, b"Tenstorrent");
+
+            let device_get_attributes = api
+                .PJRT_Device_GetAttributes
+                .expect("PJRT_Device_GetAttributes must be exported");
+            let mut device_get_attributes_args = PJRT_Device_GetAttributes_Args {
+                struct_size: size_of::<PJRT_Device_GetAttributes_Args>(),
+                extension_start: ptr::null_mut(),
+                device: first_device,
+                attributes: ptr::null(),
+                num_attributes: usize::MAX,
+            };
+            check_ok(api, unsafe {
+                device_get_attributes(&mut device_get_attributes_args)
+            });
+            assert!(device_get_attributes_args.attributes.is_null());
+            assert_eq!(device_get_attributes_args.num_attributes, 0);
         } else {
             assert!(devices_args.devices.is_null());
         }
