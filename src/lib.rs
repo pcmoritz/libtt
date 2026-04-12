@@ -2148,44 +2148,10 @@ pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
     args: *mut PJRT_Executable_OptimizedProgram_Args,
 ) -> *mut PJRT_Error {
     log("pjrt executable_optimized_program entered");
-    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+    let Ok(_args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
-        return invalid_argument("executable must not be null");
-    };
-    let Ok(program) = (unsafe { checked_mut(args.program, "program") }) else {
-        return invalid_argument("program must not be null");
-    };
-
-    static MLIR_FORMAT: &[u8] = b"mlir";
-    let code = executable_optimized_mlir(executable);
-    program.format = MLIR_FORMAT.as_ptr().cast::<c_char>();
-    program.format_size = MLIR_FORMAT.len();
-    program.code_size = code.len();
-
-    if program.code.is_null() {
-        log(format!(
-            "pjrt executable_optimized_program size query returning {} bytes",
-            program.code_size
-        ));
-        return ptr::null_mut();
-    }
-
-    if program.code_size < code.len() {
-        return invalid_argument("program.code buffer too small for optimized program");
-    }
-
-    // SAFETY: caller provides writable buffer of at least `code.len()` bytes.
-    unsafe {
-        ptr::copy_nonoverlapping(code.as_ptr().cast::<c_char>(), program.code, code.len());
-    }
-    program.code_size = code.len();
-    log(format!(
-        "pjrt executable_optimized_program wrote {} bytes",
-        program.code_size
-    ));
-    ptr::null_mut()
+    unimplemented("pjrt executable_optimized_program is not implemented")
 }
 
 #[unsafe(no_mangle)]
