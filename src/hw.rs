@@ -34,6 +34,20 @@ impl Arc {
     }
 }
 
+pub(crate) struct TensixMMIO;
+
+impl TensixMMIO {
+    pub(crate) const LOCAL_RAM_START: u32 = 0xFFB00000;
+    pub(crate) const LOCAL_RAM_END: u32 = 0xFFB01FFF;
+    pub(crate) const RISCV_DEBUG_REG_SOFT_RESET_0: u64 = 0xFFB121B0;
+    pub(crate) const RISCV_DEBUG_REG_TRISC0_RESET_PC: u64 = 0xFFB12228;
+    pub(crate) const RISCV_DEBUG_REG_TRISC1_RESET_PC: u64 = 0xFFB1222C;
+    pub(crate) const RISCV_DEBUG_REG_TRISC2_RESET_PC: u64 = 0xFFB12230;
+    pub(crate) const RISCV_DEBUG_REG_NCRISC_RESET_PC: u64 = 0xFFB12238;
+    pub(crate) const SOFT_RESET_ALL: u32 = 0x47800;
+    pub(crate) const SOFT_RESET_BRISC_ONLY_RUN: u32 = 0x47000;
+}
+
 pub(crate) struct Dram;
 
 impl Dram {

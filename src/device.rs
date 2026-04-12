@@ -1,6 +1,6 @@
 use crate::compiler::Compiler;
 use crate::dram::{Allocator, DType, DramBuffer};
-use crate::hw::{Arc, CoreCoord, Dram, DramTile, align_down, worker_cores};
+use crate::hw::{Arc, CoreCoord, Dram, DramTile, TensixMMIO, align_down, worker_cores};
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
 use std::collections::{BTreeSet, HashMap};
@@ -17,15 +17,6 @@ const TENSIX_L1_SIZE: u32 = 0x180000;
 const TENSIX_L1_GO_MSG: usize = 0x000370;
 const TENSIX_L1_BRISC_FIRMWARE_BASE: u32 = 0x003840;
 const TENSIX_L1_MEM_BANK_TO_NOC_SCRATCH: usize = 0x0116B0;
-const TENSIX_MMIO_LOCAL_RAM_START: u32 = 0xFFB00000;
-const TENSIX_MMIO_LOCAL_RAM_END: u32 = 0xFFB01FFF;
-const TENSIX_MMIO_RISCV_DEBUG_REG_SOFT_RESET_0: u64 = 0xFFB121B0;
-const TENSIX_MMIO_RISCV_DEBUG_REG_TRISC0_RESET_PC: u64 = 0xFFB12228;
-const TENSIX_MMIO_RISCV_DEBUG_REG_TRISC1_RESET_PC: u64 = 0xFFB1222C;
-const TENSIX_MMIO_RISCV_DEBUG_REG_TRISC2_RESET_PC: u64 = 0xFFB12230;
-const TENSIX_MMIO_RISCV_DEBUG_REG_NCRISC_RESET_PC: u64 = 0xFFB12238;
-const TENSIX_MMIO_SOFT_RESET_ALL: u32 = 0x47800;
-const TENSIX_MMIO_SOFT_RESET_BRISC_ONLY_RUN: u32 = 0x47000;
 const BANK_PORT: [[u8; 2]; Dram::BANK_COUNT] = [
     [2, 1],
     [0, 1],
@@ -322,8 +313,9 @@ impl Device {
             return Err(io::Error::other("no worker cores discovered"));
         }
 
-        let mmio_base = align_down(TENSIX_MMIO_RISCV_DEBUG_REG_SOFT_RESET_0, Arc::TLB_SIZE_2M).0;
-        let reset_off = (TENSIX_MMIO_RISCV_DEBUG_REG_SOFT_RESET_0 - mmio_base) as usize;
+        let mmio_base =
+            align_down(TensixMMIO::RISCV_DEBUG_REG_SOFT_RESET_0, Arc::TLB_SIZE_2M).0;
+        let reset_off = (TensixMMIO::RISCV_DEBUG_REG_SOFT_RESET_0 - mmio_base) as usize;
         let mut staged = HashMap::<&str, Vec<(usize, Vec<u8>)>>::new();
         for name in ["brisc", "ncrisc", "trisc0", "trisc1", "trisc2"] {
             let compiled = firmware.get(name).ok_or_else(|| {
@@ -342,8 +334,8 @@ impl Device {
                     data.resize(segment.memsz as usize, 0);
                 }
                 let mut addr = segment.paddr;
-                if (TENSIX_MMIO_LOCAL_RAM_START..=TENSIX_MMIO_LOCAL_RAM_END).contains(&addr) {
-                    addr = compiled.scratch_base + (addr - TENSIX_MMIO_LOCAL_RAM_START);
+                if (TensixMMIO::LOCAL_RAM_START..=TensixMMIO::LOCAL_RAM_END).contains(&addr) {
+                    addr = compiled.scratch_base + (addr - TensixMMIO::LOCAL_RAM_START);
                 }
                 if addr >= TENSIX_L1_SIZE {
                     return Err(io::Error::other(format!(
@@ -368,7 +360,7 @@ impl Device {
 
         for &(start, end) in &rects {
             uc.target(start, Some(end), mmio_base, NocOrdering::Strict)?;
-            uc.write32(reset_off, TENSIX_MMIO_SOFT_RESET_ALL)?;
+            uc.write32(reset_off, TensixMMIO::SOFT_RESET_ALL)?;
         }
 
         for &(start, end) in &rects {
@@ -389,28 +381,28 @@ impl Device {
 
         let subordinate_reset_pcs = [
             (
-                TENSIX_MMIO_RISCV_DEBUG_REG_NCRISC_RESET_PC,
+                TensixMMIO::RISCV_DEBUG_REG_NCRISC_RESET_PC,
                 firmware
                     .get("ncrisc")
                     .and_then(|fw| fw.text_base())
                     .ok_or_else(|| io::Error::other("ncrisc firmware missing text segment"))?,
             ),
             (
-                TENSIX_MMIO_RISCV_DEBUG_REG_TRISC0_RESET_PC,
+                TensixMMIO::RISCV_DEBUG_REG_TRISC0_RESET_PC,
                 firmware
                     .get("trisc0")
                     .and_then(|fw| fw.text_base())
                     .ok_or_else(|| io::Error::other("trisc0 firmware missing text segment"))?,
             ),
             (
-                TENSIX_MMIO_RISCV_DEBUG_REG_TRISC1_RESET_PC,
+                TensixMMIO::RISCV_DEBUG_REG_TRISC1_RESET_PC,
                 firmware
                     .get("trisc1")
                     .and_then(|fw| fw.text_base())
                     .ok_or_else(|| io::Error::other("trisc1 firmware missing text segment"))?,
             ),
             (
-                TENSIX_MMIO_RISCV_DEBUG_REG_TRISC2_RESET_PC,
+                TensixMMIO::RISCV_DEBUG_REG_TRISC2_RESET_PC,
                 firmware
                     .get("trisc2")
                     .and_then(|fw| fw.text_base())
@@ -427,7 +419,7 @@ impl Device {
 
         for &(start, end) in &rects {
             uc.target(start, Some(end), mmio_base, NocOrdering::Strict)?;
-            uc.write32(reset_off, TENSIX_MMIO_SOFT_RESET_BRISC_ONLY_RUN)?;
+            uc.write32(reset_off, TensixMMIO::SOFT_RESET_BRISC_ONLY_RUN)?;
         }
 
         let probe = if all_cores.contains(&CoreCoord { x: 1, y: 2 }) {
