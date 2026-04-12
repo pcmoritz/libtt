@@ -20,7 +20,8 @@ use std::slice;
 const PJRT_API_MAJOR: i32 = 0;
 const PJRT_API_MINOR: i32 = 103;
 const PJRT_API_UNUSED_TAIL_BEFORE_DEVICE_GET_ATTRIBUTES: usize = 30;
-const PJRT_API_UNUSED_TAIL_AFTER_DEVICE_GET_ATTRIBUTES: usize = 6;
+const PJRT_API_UNUSED_TAIL_BEFORE_TOPOLOGY_DESCRIPTION_FINGERPRINT: usize = 4;
+const PJRT_API_UNUSED_TAIL_AFTER_TOPOLOGY_DESCRIPTION_FINGERPRINT: usize = 1;
 const PJRT_Buffer_Type_INVALID: i32 = 0;
 const PJRT_Buffer_Type_S8: i32 = 2;
 const PJRT_Buffer_Type_S32: i32 = 4;
@@ -878,6 +879,14 @@ pub struct PJRT_TopologyDescription_Attributes_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_TopologyDescription_Fingerprint_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub topology: *const PJRT_TopologyDescription,
+    pub fingerprint: u64,
+}
+
+#[repr(C)]
 pub struct PJRT_Api {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -983,8 +992,12 @@ pub struct PJRT_Api {
     unused_tail_before_device_get_attributes:
         [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_BEFORE_DEVICE_GET_ATTRIBUTES],
     pub PJRT_Device_GetAttributes: PjrtResultFn<PJRT_Device_GetAttributes_Args>,
-    unused_tail_after_device_get_attributes:
-        [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_AFTER_DEVICE_GET_ATTRIBUTES],
+    unused_tail_before_topology_description_fingerprint:
+        [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_BEFORE_TOPOLOGY_DESCRIPTION_FINGERPRINT],
+    pub PJRT_TopologyDescription_Fingerprint:
+        PjrtResultFn<PJRT_TopologyDescription_Fingerprint_Args>,
+    unused_tail_after_topology_description_fingerprint:
+        [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_AFTER_TOPOLOGY_DESCRIPTION_FINGERPRINT],
 }
 
 // The API table is immutable process-global data.
@@ -2878,6 +2891,34 @@ pub unsafe extern "C" fn TT_TopologyDescription_Attributes(
     ptr::null_mut()
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_TopologyDescription_Fingerprint(
+    args: *mut PJRT_TopologyDescription_Fingerprint_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    log("pjrt topology_description_fingerprint entered");
+    let Ok(topology) = (unsafe { checked_ref(args.topology, "topology") }) else {
+        return invalid_argument("topology must not be null");
+    };
+
+    let mut fingerprint = 0xcbf29ce484222325u64;
+    for byte in topology.platform_name.as_bytes() {
+        fingerprint ^= u64::from(*byte);
+        fingerprint = fingerprint.wrapping_mul(0x100000001b3);
+    }
+    for byte in topology.platform_version.as_bytes() {
+        fingerprint ^= u64::from(*byte);
+        fingerprint = fingerprint.wrapping_mul(0x100000001b3);
+    }
+    fingerprint ^= topology.device_description_ptrs.len() as u64;
+    fingerprint = fingerprint.wrapping_mul(0x100000001b3);
+
+    args.fingerprint = fingerprint;
+    ptr::null_mut()
+}
+
 static PJRT_API: PJRT_Api = PJRT_Api {
     struct_size: size_of::<PJRT_Api>(),
     extension_start: ptr::null_mut(),
@@ -2983,8 +3024,11 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     unused_tail_before_device_get_attributes:
         [None; PJRT_API_UNUSED_TAIL_BEFORE_DEVICE_GET_ATTRIBUTES],
     PJRT_Device_GetAttributes: Some(TT_Device_GetAttributes),
-    unused_tail_after_device_get_attributes:
-        [None; PJRT_API_UNUSED_TAIL_AFTER_DEVICE_GET_ATTRIBUTES],
+    unused_tail_before_topology_description_fingerprint:
+        [None; PJRT_API_UNUSED_TAIL_BEFORE_TOPOLOGY_DESCRIPTION_FINGERPRINT],
+    PJRT_TopologyDescription_Fingerprint: Some(TT_TopologyDescription_Fingerprint),
+    unused_tail_after_topology_description_fingerprint:
+        [None; PJRT_API_UNUSED_TAIL_AFTER_TOPOLOGY_DESCRIPTION_FINGERPRINT],
 };
 
 #[unsafe(no_mangle)]
