@@ -1785,7 +1785,7 @@ fn executable_optimized_mlir(executable: &PJRT_Executable) -> String {
             let tensor = executable_tensor_spec(executable);
             let layout = executable_layout_attr(executable);
             format!(
-                "module @entry attributes {{\n  mhlo.xla_entry_computation_parameter_layouts = [\n    {layout},\n    {layout}\n  ],\n  mhlo.xla_entry_computation_result_layout = [{layout}]\n}} {{\n  func.func public @main(%arg0: {tensor}, %arg1: {tensor}) -> {tensor} {{\n    %0 = stablehlo.add %arg0, %arg1 : {tensor}\n    return %0 : {tensor}\n  }}\n}}\n"
+                "module @entry attributes {{\n  mhlo.xla_entry_computation_parameter_layouts = [\n    {layout},\n    {layout}\n  ],\n  mhlo.xla_entry_computation_result_layout = [{layout}]\n}} {{\n  func.func @main(%arg0: {tensor}, %arg1: {tensor}) -> {tensor} {{\n    %0 = mhlo.add %arg0, %arg1 : {tensor}\n    return %0 : {tensor}\n  }}\n}}\n"
             )
         }
     }
@@ -4425,7 +4425,7 @@ mod tests {
         check_ok(api, unsafe { optimized_program(&mut optimized_program_args) });
         let mlir =
             String::from_utf8(optimized_code).expect("optimized program should be utf-8");
-        assert!(mlir.contains("stablehlo.add"));
+        assert!(mlir.contains("mhlo.add"));
         assert!(mlir.contains("mhlo.xla_entry_computation_parameter_layouts"));
         assert!(mlir.contains("mhlo.xla_entry_computation_result_layout"));
         assert!(mlir.contains("dense<[1, 0]> : tensor<2xindex>"));
