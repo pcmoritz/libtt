@@ -879,6 +879,12 @@ pub struct PJRT_TopologyDescription_Attributes_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_Generic_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+}
+
+#[repr(C)]
 pub struct PJRT_TopologyDescription_Fingerprint_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -989,8 +995,36 @@ pub struct PJRT_Api {
     pub PJRT_Client_TopologyDescription: PjrtResultFn<PJRT_Client_TopologyDescription_Args>,
     unused_compiled_memory_stats: [PjrtOpaqueFn; 1],
     pub PJRT_Memory_Kind_Id: PjrtResultFn<PJRT_Memory_Kind_Id_Args>,
-    unused_tail_before_device_get_attributes:
-        [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_BEFORE_DEVICE_GET_ATTRIBUTES],
+    pub PJRT_ExecuteContext_Create: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_ExecuteContext_Destroy: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Buffer_CopyRawToHost: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_AsyncHostToDeviceTransferManager_Destroy: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_AsyncHostToDeviceTransferManager_TransferData: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Client_CreateBuffersForAsyncHostToDevice: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_AsyncHostToDeviceTransferManager_Device: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_AsyncHostToDeviceTransferManager_BufferCount: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_AsyncHostToDeviceTransferManager_BufferSize: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_AsyncHostToDeviceTransferManager_SetBufferError: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_AsyncHostToDeviceTransferManager_AddMetadata: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Client_DmaMap: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Client_DmaUnmap: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Client_CreateUninitializedBuffer: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Client_UpdateGlobalProcessInfo: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_TopologyDescription_Deserialize: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Client_CreateAliasBuffer: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Client_FulfillAliasBuffer: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_LoadedExecutable_GetDeviceAssignment: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Client_CreateErrorBuffer: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_AsyncHostToDeviceTransferManager_TransferLiteral: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Buffer_CopyRawToHostFuture: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Device_PoisonExecution: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Device_CreateAsyncTrackingEvent: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_AsyncTrackingEvent_Destroy: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Executable_GetCompileOptions: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Buffer_DonateWithControlDependency: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Event_Create: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_Event_Set: PjrtResultFn<PJRT_Generic_Args>,
     pub PJRT_Device_GetAttributes: PjrtResultFn<PJRT_Device_GetAttributes_Args>,
     unused_tail_before_topology_description_fingerprint:
         [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_BEFORE_TOPOLOGY_DESCRIPTION_FINGERPRINT],
@@ -2930,6 +2964,128 @@ pub unsafe extern "C" fn TT_TopologyDescription_Fingerprint(
     ptr::null_mut()
 }
 
+macro_rules! define_unimplemented_generic_pjrt_fn {
+    ($name:ident, $label:literal) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(args: *mut PJRT_Generic_Args) -> *mut PJRT_Error {
+            let Ok(_args) = (unsafe { checked_mut(args, "args") }) else {
+                return invalid_argument("args must not be null");
+            };
+            log(concat!($label, " entered"));
+            unimplemented(concat!($label, " is not implemented"))
+        }
+    };
+}
+
+define_unimplemented_generic_pjrt_fn!(
+    TT_ExecuteContext_Create,
+    "pjrt execute_context_create"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_ExecuteContext_Destroy,
+    "pjrt execute_context_destroy"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_Buffer_CopyRawToHost,
+    "pjrt buffer_copy_raw_to_host"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_AsyncHostToDeviceTransferManager_Destroy,
+    "pjrt async_h2d_transfer_manager_destroy"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_AsyncHostToDeviceTransferManager_TransferData,
+    "pjrt async_h2d_transfer_manager_transfer_data"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_Client_CreateBuffersForAsyncHostToDevice,
+    "pjrt client_create_buffers_for_async_h2d"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_AsyncHostToDeviceTransferManager_RetrieveBuffer,
+    "pjrt async_h2d_transfer_manager_retrieve_buffer"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_AsyncHostToDeviceTransferManager_Device,
+    "pjrt async_h2d_transfer_manager_device"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_AsyncHostToDeviceTransferManager_BufferCount,
+    "pjrt async_h2d_transfer_manager_buffer_count"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_AsyncHostToDeviceTransferManager_BufferSize,
+    "pjrt async_h2d_transfer_manager_buffer_size"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_AsyncHostToDeviceTransferManager_SetBufferError,
+    "pjrt async_h2d_transfer_manager_set_buffer_error"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_AsyncHostToDeviceTransferManager_AddMetadata,
+    "pjrt async_h2d_transfer_manager_add_metadata"
+);
+define_unimplemented_generic_pjrt_fn!(TT_Client_DmaMap, "pjrt client_dma_map");
+define_unimplemented_generic_pjrt_fn!(TT_Client_DmaUnmap, "pjrt client_dma_unmap");
+define_unimplemented_generic_pjrt_fn!(
+    TT_Client_CreateUninitializedBuffer,
+    "pjrt client_create_uninitialized_buffer"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_Client_UpdateGlobalProcessInfo,
+    "pjrt client_update_global_process_info"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_TopologyDescription_Deserialize,
+    "pjrt topology_description_deserialize"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_Client_CreateAliasBuffer,
+    "pjrt client_create_alias_buffer"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_Client_FulfillAliasBuffer,
+    "pjrt client_fulfill_alias_buffer"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_LoadedExecutable_GetDeviceAssignment,
+    "pjrt loaded_executable_get_device_assignment"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_Client_CreateErrorBuffer,
+    "pjrt client_create_error_buffer"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_AsyncHostToDeviceTransferManager_TransferLiteral,
+    "pjrt async_h2d_transfer_manager_transfer_literal"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_Buffer_CopyRawToHostFuture,
+    "pjrt buffer_copy_raw_to_host_future"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_Device_PoisonExecution,
+    "pjrt device_poison_execution"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_Device_CreateAsyncTrackingEvent,
+    "pjrt device_create_async_tracking_event"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_AsyncTrackingEvent_Destroy,
+    "pjrt async_tracking_event_destroy"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_Executable_GetCompileOptions,
+    "pjrt executable_get_compile_options"
+);
+define_unimplemented_generic_pjrt_fn!(
+    TT_Buffer_DonateWithControlDependency,
+    "pjrt buffer_donate_with_control_dependency"
+);
+define_unimplemented_generic_pjrt_fn!(TT_Event_Create, "pjrt event_create");
+define_unimplemented_generic_pjrt_fn!(TT_Event_Set, "pjrt event_set");
+
 static PJRT_API: PJRT_Api = PJRT_Api {
     struct_size: size_of::<PJRT_Api>(),
     extension_start: ptr::null_mut(),
@@ -3032,8 +3188,56 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Client_TopologyDescription: Some(TT_Client_TopologyDescription),
     unused_compiled_memory_stats: [None; 1],
     PJRT_Memory_Kind_Id: Some(TT_Memory_Kind_Id),
-    unused_tail_before_device_get_attributes:
-        [None; PJRT_API_UNUSED_TAIL_BEFORE_DEVICE_GET_ATTRIBUTES],
+    PJRT_ExecuteContext_Create: Some(TT_ExecuteContext_Create),
+    PJRT_ExecuteContext_Destroy: Some(TT_ExecuteContext_Destroy),
+    PJRT_Buffer_CopyRawToHost: Some(TT_Buffer_CopyRawToHost),
+    PJRT_AsyncHostToDeviceTransferManager_Destroy: Some(
+        TT_AsyncHostToDeviceTransferManager_Destroy,
+    ),
+    PJRT_AsyncHostToDeviceTransferManager_TransferData: Some(
+        TT_AsyncHostToDeviceTransferManager_TransferData,
+    ),
+    PJRT_Client_CreateBuffersForAsyncHostToDevice: Some(
+        TT_Client_CreateBuffersForAsyncHostToDevice,
+    ),
+    PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer: Some(
+        TT_AsyncHostToDeviceTransferManager_RetrieveBuffer,
+    ),
+    PJRT_AsyncHostToDeviceTransferManager_Device: Some(
+        TT_AsyncHostToDeviceTransferManager_Device,
+    ),
+    PJRT_AsyncHostToDeviceTransferManager_BufferCount: Some(
+        TT_AsyncHostToDeviceTransferManager_BufferCount,
+    ),
+    PJRT_AsyncHostToDeviceTransferManager_BufferSize: Some(
+        TT_AsyncHostToDeviceTransferManager_BufferSize,
+    ),
+    PJRT_AsyncHostToDeviceTransferManager_SetBufferError: Some(
+        TT_AsyncHostToDeviceTransferManager_SetBufferError,
+    ),
+    PJRT_AsyncHostToDeviceTransferManager_AddMetadata: Some(
+        TT_AsyncHostToDeviceTransferManager_AddMetadata,
+    ),
+    PJRT_Client_DmaMap: Some(TT_Client_DmaMap),
+    PJRT_Client_DmaUnmap: Some(TT_Client_DmaUnmap),
+    PJRT_Client_CreateUninitializedBuffer: Some(TT_Client_CreateUninitializedBuffer),
+    PJRT_Client_UpdateGlobalProcessInfo: Some(TT_Client_UpdateGlobalProcessInfo),
+    PJRT_TopologyDescription_Deserialize: Some(TT_TopologyDescription_Deserialize),
+    PJRT_Client_CreateAliasBuffer: Some(TT_Client_CreateAliasBuffer),
+    PJRT_Client_FulfillAliasBuffer: Some(TT_Client_FulfillAliasBuffer),
+    PJRT_LoadedExecutable_GetDeviceAssignment: Some(TT_LoadedExecutable_GetDeviceAssignment),
+    PJRT_Client_CreateErrorBuffer: Some(TT_Client_CreateErrorBuffer),
+    PJRT_AsyncHostToDeviceTransferManager_TransferLiteral: Some(
+        TT_AsyncHostToDeviceTransferManager_TransferLiteral,
+    ),
+    PJRT_Buffer_CopyRawToHostFuture: Some(TT_Buffer_CopyRawToHostFuture),
+    PJRT_Device_PoisonExecution: Some(TT_Device_PoisonExecution),
+    PJRT_Device_CreateAsyncTrackingEvent: Some(TT_Device_CreateAsyncTrackingEvent),
+    PJRT_AsyncTrackingEvent_Destroy: Some(TT_AsyncTrackingEvent_Destroy),
+    PJRT_Executable_GetCompileOptions: Some(TT_Executable_GetCompileOptions),
+    PJRT_Buffer_DonateWithControlDependency: Some(TT_Buffer_DonateWithControlDependency),
+    PJRT_Event_Create: Some(TT_Event_Create),
+    PJRT_Event_Set: Some(TT_Event_Set),
     PJRT_Device_GetAttributes: Some(TT_Device_GetAttributes),
     unused_tail_before_topology_description_fingerprint:
         [None; PJRT_API_UNUSED_TAIL_BEFORE_TOPOLOGY_DESCRIPTION_FINGERPRINT],
