@@ -1,5 +1,5 @@
-use crate::device::CoreCoord;
-use crate::device::{Device, DramTile, load_device};
+use crate::device::{Device, load_device};
+use crate::hw::{CoreCoord, Dram, DramTile, align_up};
 use crate::linux::{NocOrdering, TlbWindow};
 use std::io;
 use std::path::PathBuf;
@@ -8,13 +8,6 @@ const TILE_R: usize = 32;
 const TILE_C: usize = 32;
 const FACE_R: usize = 16;
 const FACE_C: usize = 16;
-const DRAM_TILES_PER_BANK: usize = 3;
-const DRAM_ALIGNMENT: usize = 64;
-const DRAM_ALLOC_BASE: u64 = 0x40;
-const TLB_SIZE_4G: u64 = 1 << 32;
-const DRAM_BARRIER_BASE: usize = 0;
-const DRAM_BARRIER_FLAGS: [u32; 2] = [0xaa, 0xbb];
-
 type Shape = Vec<usize>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,7 +76,7 @@ impl Allocator {
         let bank_tiles = device
             .dram_tiles
             .iter()
-            .step_by(DRAM_TILES_PER_BANK)
+            .step_by(Dram::TILES_PER_BANK)
             .copied()
             .collect::<Vec<_>>();
         if bank_tiles.is_empty() {
@@ -101,13 +94,13 @@ impl Allocator {
                 y: first.y,
             },
             0,
-            TLB_SIZE_4G,
+            Dram::TLB_SIZE_4G,
             true,
         )?;
         Ok(Self {
             window,
             bank_tiles,
-            next: DRAM_ALLOC_BASE,
+            next: Dram::WRITE_OFFSET,
             bank_count,
         })
     }
@@ -246,7 +239,7 @@ impl Allocator {
     }
 
     fn barrier(&mut self) -> io::Result<()> {
-        for flag in DRAM_BARRIER_FLAGS {
+        for flag in Dram::BARRIER_FLAGS {
             for tile in &self.bank_tiles {
                 self.window.target(
                     CoreCoord {
@@ -257,8 +250,8 @@ impl Allocator {
                     0,
                     NocOrdering::Strict,
                 )?;
-                self.window.write32(DRAM_BARRIER_BASE, flag)?;
-                while self.window.read32(DRAM_BARRIER_BASE)? != flag {}
+                self.window.write32(Dram::BARRIER_BASE, flag)?;
+                while self.window.read32(Dram::BARRIER_BASE)? != flag {}
             }
         }
         Ok(())
@@ -411,17 +404,14 @@ fn next_allocation_range(
     let end = next
         .checked_add(allocation_size)
         .ok_or_else(|| io::Error::other("dram allocation address overflow"))?;
-    let aligned_end = align_up(end, DRAM_ALIGNMENT as u64);
-    if aligned_end > TLB_SIZE_4G {
+    let aligned_end = align_up(end, Dram::ALIGNMENT as u64);
+    if aligned_end > Dram::TLB_SIZE_4G {
         return Err(io::Error::other(format!(
-            "dram allocation exceeds per-bank address space: end=0x{aligned_end:x} limit=0x{TLB_SIZE_4G:x}"
+            "dram allocation exceeds per-bank address space: end=0x{aligned_end:x} limit=0x{:x}",
+            Dram::TLB_SIZE_4G
         )));
     }
     Ok((next, aligned_end))
-}
-
-fn align_up(value: u64, align: u64) -> u64 {
-    value.div_ceil(align) * align
 }
 
 fn element_offset(
@@ -546,7 +536,7 @@ mod tests {
     fn buffer_size_matches_tile_count() {
         let buffer = DramBuffer {
             name: "weights".to_owned(),
-            addr: DRAM_ALLOC_BASE,
+            addr: Dram::WRITE_OFFSET,
             num_tiles: 3,
             dtype: DType::Float16,
             shape: Some(vec![32, 96]),
@@ -588,7 +578,7 @@ mod tests {
 
     #[test]
     fn allocation_range_errors_when_capacity_is_exceeded() {
-        let err = next_allocation_range(TLB_SIZE_4G, 1, DType::Float16, 1)
+        let err = next_allocation_range(Dram::TLB_SIZE_4G, 1, DType::Float16, 1)
             .expect_err("allocation should exceed the per-bank address space");
         assert!(err.to_string().contains("exceeds per-bank address space"));
     }

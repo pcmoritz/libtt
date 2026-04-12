@@ -1,4 +1,4 @@
-use crate::device::CoreCoord;
+use crate::hw::CoreCoord;
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fs::{File, OpenOptions};
 use std::io;

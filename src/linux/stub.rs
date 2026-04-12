@@ -1,4 +1,4 @@
-use crate::device::CoreCoord;
+use crate::hw::CoreCoord;
 use std::io;
 use std::path::Path;
 
