@@ -1677,6 +1677,7 @@ pub unsafe extern "C" fn TT_Client_AddressableMemories(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_addressable_memories entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2365,6 +2366,7 @@ pub unsafe extern "C" fn TT_Device_AddressableMemories(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt device_addressable_memories entered");
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
@@ -2384,6 +2386,7 @@ pub unsafe extern "C" fn TT_Device_DefaultMemory(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt device_default_memory entered");
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
@@ -2408,6 +2411,7 @@ pub unsafe extern "C" fn TT_Memory_Kind(args: *mut PJRT_Memory_Kind_Args) -> *mu
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt memory_kind entered");
     let Ok(memory) = (unsafe { checked_ref(args.memory, "memory") }) else {
         return invalid_argument("memory must not be null");
     };
@@ -2423,6 +2427,7 @@ pub unsafe extern "C" fn TT_Memory_Kind_Id(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt memory_kind_id entered");
     let Ok(memory) = (unsafe { checked_ref(args.memory, "memory") }) else {
         return invalid_argument("memory must not be null");
     };
@@ -2467,6 +2472,7 @@ pub unsafe extern "C" fn TT_Memory_AddressableByDevices(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt memory_addressable_by_devices entered");
     let Ok(memory) = (unsafe { checked_ref(args.memory, "memory") }) else {
         return invalid_argument("memory must not be null");
     };
