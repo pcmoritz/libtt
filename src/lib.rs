@@ -2532,7 +2532,28 @@ pub unsafe extern "C" fn TT_Device_MemoryStats(
     if args.device.is_null() {
         return invalid_argument("device must not be null");
     }
-    unimplemented("device memory stats are not implemented")
+    args.bytes_in_use = 0;
+    args.peak_bytes_in_use = 0;
+    args.peak_bytes_in_use_is_set = false;
+    args.num_allocs = 0;
+    args.num_allocs_is_set = false;
+    args.largest_alloc_size = 0;
+    args.largest_alloc_size_is_set = false;
+    args.bytes_limit = 0;
+    args.bytes_limit_is_set = false;
+    args.bytes_reserved = 0;
+    args.bytes_reserved_is_set = false;
+    args.peak_bytes_reserved = 0;
+    args.peak_bytes_reserved_is_set = false;
+    args.bytes_reservable_limit = 0;
+    args.bytes_reservable_limit_is_set = false;
+    args.largest_free_block_bytes = 0;
+    args.largest_free_block_bytes_is_set = false;
+    args.pool_bytes = 0;
+    args.pool_bytes_is_set = false;
+    args.peak_pool_bytes = 0;
+    args.peak_pool_bytes_is_set = false;
+    ptr::null_mut()
 }
 
 #[unsafe(no_mangle)]
