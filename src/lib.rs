@@ -1589,6 +1589,7 @@ pub unsafe extern "C" fn TT_Client_PlatformName(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_platform_name entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -1604,6 +1605,7 @@ pub unsafe extern "C" fn TT_Client_ProcessIndex(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_process_index entered");
     if args.client.is_null() {
         return invalid_argument("client must not be null");
     }
@@ -1618,6 +1620,7 @@ pub unsafe extern "C" fn TT_Client_PlatformVersion(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_platform_version entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -1633,6 +1636,7 @@ pub unsafe extern "C" fn TT_Client_TopologyDescription(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_topology_description entered");
     let Ok(client) = (unsafe { checked_mut(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -1685,6 +1689,7 @@ pub unsafe extern "C" fn TT_Client_LookupDevice(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_lookup_device entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -1704,6 +1709,7 @@ pub unsafe extern "C" fn TT_Client_LookupAddressableDevice(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_lookup_addressable_device entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -1810,6 +1816,7 @@ pub unsafe extern "C" fn TT_Client_DefaultDeviceAssignment(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt client_default_device_assignment entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2834,6 +2841,7 @@ pub unsafe extern "C" fn TT_TopologyDescription_PlatformName(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt topology_description_platform_name entered");
     let Ok(topology) = (unsafe { checked_ref(args.topology, "topology") }) else {
         return invalid_argument("topology must not be null");
     };
@@ -2849,6 +2857,7 @@ pub unsafe extern "C" fn TT_TopologyDescription_PlatformVersion(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt topology_description_platform_version entered");
     let Ok(topology) = (unsafe { checked_ref(args.topology, "topology") }) else {
         return invalid_argument("topology must not be null");
     };
@@ -2864,6 +2873,7 @@ pub unsafe extern "C" fn TT_TopologyDescription_GetDeviceDescriptions(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt topology_description_get_device_descriptions entered");
     let Ok(topology) = (unsafe { checked_ref(args.topology, "topology") }) else {
         return invalid_argument("topology must not be null");
     };
@@ -2883,6 +2893,7 @@ pub unsafe extern "C" fn TT_TopologyDescription_Attributes(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt topology_description_attributes entered");
     if args.topology.is_null() {
         return invalid_argument("topology must not be null");
     }
