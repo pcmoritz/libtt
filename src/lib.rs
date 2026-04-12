@@ -19,7 +19,7 @@ use std::slice;
 
 const PJRT_API_MAJOR: i32 = 0;
 const PJRT_API_MINOR: i32 = 96;
-const PJRT_API_UNUSED_TAIL_SLOTS: usize = 35;
+const PJRT_API_UNUSED_TAIL_SLOTS: usize = 32;
 const PJRT_Buffer_Type_INVALID: i32 = 0;
 const PJRT_Buffer_Type_S8: i32 = 2;
 const PJRT_Buffer_Type_S32: i32 = 4;
@@ -159,6 +159,12 @@ pub struct PJRT_Executable {
     kind: ExecutableKind,
     name: CString,
     num_outputs: usize,
+    output_types: Vec<i32>,
+    output_dims: Vec<i64>,
+    output_dim_sizes: Vec<usize>,
+    output_memory_kinds: Vec<CString>,
+    output_memory_kind_ptrs: Vec<*const c_char>,
+    output_memory_kind_sizes: Vec<usize>,
 }
 
 #[repr(C)]
@@ -166,6 +172,12 @@ pub struct PJRT_LoadedExecutable {
     kind: ExecutableKind,
     name: CString,
     num_outputs: usize,
+    output_types: Vec<i32>,
+    output_dims: Vec<i64>,
+    output_dim_sizes: Vec<usize>,
+    output_memory_kinds: Vec<CString>,
+    output_memory_kind_ptrs: Vec<*const c_char>,
+    output_memory_kind_sizes: Vec<usize>,
     addressable_devices: Vec<*mut PJRT_Device>,
     deleted: bool,
 }
@@ -388,6 +400,18 @@ pub struct PJRT_Client_Compile_Args {
     pub compile_options: *const c_char,
     pub compile_options_size: usize,
     pub executable: *mut PJRT_LoadedExecutable,
+}
+
+#[repr(C)]
+pub struct PJRT_Compile_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub topology: *const PJRT_TopologyDescription,
+    pub program: *const PJRT_Program,
+    pub compile_options: *const c_char,
+    pub compile_options_size: usize,
+    pub client: *mut PJRT_Client,
+    pub executable: *mut PJRT_Executable,
 }
 
 #[repr(C)]
@@ -640,6 +664,35 @@ pub struct PJRT_Executable_NumOutputs_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_Executable_OutputElementTypes_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+    pub output_types: *const i32,
+    pub num_output_types: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Executable_OutputDimensions_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+    pub dims: *const i64,
+    pub dim_sizes: *const usize,
+    pub num_outputs: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Executable_OutputMemoryKinds_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+    pub memory_kinds: *const *const c_char,
+    pub memory_kind_sizes: *const usize,
+    pub num_outputs: usize,
+}
+
+#[repr(C)]
 pub struct PJRT_Buffer_Destroy_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -761,6 +814,7 @@ pub struct PJRT_Buffer_DecreaseExternalReferenceCount_Args {
     pub buffer: *mut PJRT_Buffer,
 }
 
+#[repr(C)]
 pub struct PJRT_TopologyDescription_PlatformName_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -848,7 +902,7 @@ pub struct PJRT_Api {
     pub PJRT_Executable_NumOutputs: PjrtResultFn<PJRT_Executable_NumOutputs_Args>,
     pub PJRT_Executable_SizeOfGeneratedCodeInBytes: PjrtOpaqueFn,
     pub PJRT_Executable_GetCostAnalysis: PjrtOpaqueFn,
-    pub PJRT_Executable_OutputMemoryKinds: PjrtOpaqueFn,
+    pub PJRT_Executable_OutputMemoryKinds: PjrtResultFn<PJRT_Executable_OutputMemoryKinds_Args>,
     pub PJRT_Executable_OptimizedProgram: PjrtOpaqueFn,
     pub PJRT_Executable_Serialize: PjrtOpaqueFn,
     pub PJRT_LoadedExecutable_Destroy: PjrtResultFn<PJRT_LoadedExecutable_Destroy_Args>,
@@ -892,7 +946,10 @@ pub struct PJRT_Api {
         PjrtResultFn<PJRT_TopologyDescription_GetDeviceDescriptions_Args>,
     unused_topology_serialize: [PjrtOpaqueFn; 1],
     pub PJRT_TopologyDescription_Attributes: PjrtResultFn<PJRT_TopologyDescription_Attributes_Args>,
-    unused_before_client_topology: [PjrtOpaqueFn; 6],
+    pub PJRT_Compile: PjrtResultFn<PJRT_Compile_Args>,
+    pub PJRT_Executable_OutputElementTypes: PjrtResultFn<PJRT_Executable_OutputElementTypes_Args>,
+    pub PJRT_Executable_OutputDimensions: PjrtResultFn<PJRT_Executable_OutputDimensions_Args>,
+    unused_before_client_topology: [PjrtOpaqueFn; 3],
     pub PJRT_Client_TopologyDescription: PjrtResultFn<PJRT_Client_TopologyDescription_Args>,
     unused_tail: [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_SLOTS],
 }
@@ -1185,11 +1242,133 @@ fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind
     }
 }
 
+fn parse_mlir_tensor_signature(code: &str) -> Option<(Vec<i64>, i32)> {
+    let start = code.find("tensor<")? + "tensor<".len();
+    let rest = &code[start..];
+    let end = rest.find('>')?;
+    let spec = &rest[..end];
+    let dtype = if spec.ends_with("xbf16") {
+        PJRT_Buffer_Type_BF16
+    } else if spec.ends_with("xf16") {
+        PJRT_Buffer_Type_F16
+    } else if spec.ends_with("xf32") {
+        PJRT_Buffer_Type_F32
+    } else if spec.ends_with("xu32") {
+        PJRT_Buffer_Type_U32
+    } else if spec.ends_with("xu16") {
+        PJRT_Buffer_Type_U16
+    } else if spec.ends_with("xu8") {
+        PJRT_Buffer_Type_U8
+    } else if spec.ends_with("xs32") {
+        PJRT_Buffer_Type_S32
+    } else if spec.ends_with("xs8") {
+        PJRT_Buffer_Type_S8
+    } else {
+        return None;
+    };
+    let shape_spec = spec.rsplit_once('x').map(|(dims, _)| dims).unwrap_or("");
+    let dims = if shape_spec.is_empty() {
+        Vec::new()
+    } else {
+        let mut dims = Vec::new();
+        for dim in shape_spec.split('x') {
+            if dim == "?" {
+                return None;
+            }
+            dims.push(dim.parse().ok()?);
+        }
+        dims
+    };
+    Some((dims, dtype))
+}
+
+fn executable_output_signature(
+    kind: ExecutableKind,
+    program: &PJRT_Program,
+) -> Result<(Vec<i64>, i32), *mut PJRT_Error> {
+    let format = c_api_string(program.format, program.format_size, "program.format")?;
+    let code = if program.code_size == 0 {
+        String::new()
+    } else {
+        c_api_string(program.code.cast_const(), program.code_size, "program.code")?
+    };
+    match kind {
+        ExecutableKind::EltwiseAddBf16 => match format.as_str() {
+            "mlir" | "stablehlo" => Ok(parse_mlir_tensor_signature(&code)
+                .unwrap_or_else(|| (Vec::new(), PJRT_Buffer_Type_BF16))),
+            _ => Ok((Vec::new(), PJRT_Buffer_Type_BF16)),
+        },
+    }
+}
+
+fn make_executable(
+    kind: ExecutableKind,
+    name: &str,
+    dims: Vec<i64>,
+    output_type: i32,
+) -> PJRT_Executable {
+    let output_memory_kinds = vec![cstring_lossy("dram")];
+    let output_memory_kind_ptrs = output_memory_kinds
+        .iter()
+        .map(|kind| kind.as_ptr())
+        .collect::<Vec<_>>();
+    let output_memory_kind_sizes = output_memory_kinds
+        .iter()
+        .map(|kind| kind.as_bytes().len())
+        .collect::<Vec<_>>();
+    let output_dim_sizes = vec![dims.len()];
+    PJRT_Executable {
+        kind,
+        name: cstring_lossy(name),
+        num_outputs: 1,
+        output_types: vec![output_type],
+        output_dims: dims,
+        output_dim_sizes,
+        output_memory_kinds,
+        output_memory_kind_ptrs,
+        output_memory_kind_sizes,
+    }
+}
+
+fn make_loaded_executable(
+    kind: ExecutableKind,
+    name: &str,
+    dims: Vec<i64>,
+    output_type: i32,
+    addressable_devices: Vec<*mut PJRT_Device>,
+) -> PJRT_LoadedExecutable {
+    let executable = make_executable(kind, name, dims, output_type);
+    PJRT_LoadedExecutable {
+        kind: executable.kind,
+        name: executable.name,
+        num_outputs: executable.num_outputs,
+        output_types: executable.output_types,
+        output_dims: executable.output_dims,
+        output_dim_sizes: executable.output_dim_sizes,
+        output_memory_kinds: executable.output_memory_kinds,
+        output_memory_kind_ptrs: executable.output_memory_kind_ptrs,
+        output_memory_kind_sizes: executable.output_memory_kind_sizes,
+        addressable_devices,
+        deleted: false,
+    }
+}
+
 fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
+    let output_memory_kinds = executable.output_memory_kinds.clone();
+    let output_memory_kind_ptrs = output_memory_kinds
+        .iter()
+        .map(|kind| kind.as_ptr())
+        .collect::<Vec<_>>();
     PJRT_Executable {
         kind: executable.kind,
         name: executable.name.clone(),
         num_outputs: executable.num_outputs,
+        output_types: executable.output_types.clone(),
+        output_dims: executable.output_dims.clone(),
+        output_dim_sizes: executable.output_dim_sizes.clone(),
+        output_memory_kinds,
+        output_memory_kind_ptrs,
+        output_memory_kind_sizes: executable.output_memory_kind_sizes.clone(),
     }
 }
 
@@ -1516,17 +1695,51 @@ pub unsafe extern "C" fn TT_Client_Compile(args: *mut PJRT_Client_Compile_Args) 
         Ok(kind) => kind,
         Err(err) => return err,
     };
+    let (output_dims, output_type) = match executable_output_signature(kind, program) {
+        Ok(signature) => signature,
+        Err(err) => return err,
+    };
 
     let name = match kind {
         ExecutableKind::EltwiseAddBf16 => "tt.add.bf16",
     };
-    args.executable = Box::into_raw(Box::new(PJRT_LoadedExecutable {
+    args.executable = Box::into_raw(Box::new(make_loaded_executable(
         kind,
-        name: cstring_lossy(name),
-        num_outputs: 1,
-        addressable_devices: client.addressable_device_ptrs.clone(),
-        deleted: false,
-    }));
+        name,
+        output_dims,
+        output_type,
+        client.addressable_device_ptrs.clone(),
+    )));
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Compile(args: *mut PJRT_Compile_Args) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    log("pjrt compile entered");
+    let Ok(program) = (unsafe { checked_ref(args.program, "program") }) else {
+        return invalid_argument("program must not be null");
+    };
+    let kind = match executable_kind_from_program(program) {
+        Ok(kind) => kind,
+        Err(err) => return err,
+    };
+    let (output_dims, output_type) = match executable_output_signature(kind, program) {
+        Ok(signature) => signature,
+        Err(err) => return err,
+    };
+
+    let name = match kind {
+        ExecutableKind::EltwiseAddBf16 => "tt.add.bf16",
+    };
+    args.executable = Box::into_raw(Box::new(make_executable(
+        kind,
+        name,
+        output_dims,
+        output_type,
+    )));
     ptr::null_mut()
 }
 
@@ -1643,6 +1856,53 @@ pub unsafe extern "C" fn TT_Executable_NumOutputs(
         return invalid_argument("executable must not be null");
     };
     args.num_outputs = executable.num_outputs;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Executable_OutputElementTypes(
+    args: *mut PJRT_Executable_OutputElementTypes_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.output_types = executable.output_types.as_ptr();
+    args.num_output_types = executable.output_types.len();
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Executable_OutputDimensions(
+    args: *mut PJRT_Executable_OutputDimensions_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.dims = executable.output_dims.as_ptr();
+    args.dim_sizes = executable.output_dim_sizes.as_ptr();
+    args.num_outputs = executable.output_dim_sizes.len();
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Executable_OutputMemoryKinds(
+    args: *mut PJRT_Executable_OutputMemoryKinds_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.memory_kinds = executable.output_memory_kind_ptrs.as_ptr();
+    args.memory_kind_sizes = executable.output_memory_kind_sizes.as_ptr();
+    args.num_outputs = executable.output_memory_kind_ptrs.len();
     ptr::null_mut()
 }
 
@@ -2581,7 +2841,7 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Executable_NumOutputs: Some(TT_Executable_NumOutputs),
     PJRT_Executable_SizeOfGeneratedCodeInBytes: None,
     PJRT_Executable_GetCostAnalysis: None,
-    PJRT_Executable_OutputMemoryKinds: None,
+    PJRT_Executable_OutputMemoryKinds: Some(TT_Executable_OutputMemoryKinds),
     PJRT_Executable_OptimizedProgram: None,
     PJRT_Executable_Serialize: None,
     PJRT_LoadedExecutable_Destroy: Some(TT_LoadedExecutable_Destroy),
@@ -2620,7 +2880,10 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     ),
     unused_topology_serialize: [None; 1],
     PJRT_TopologyDescription_Attributes: Some(TT_TopologyDescription_Attributes),
-    unused_before_client_topology: [None; 6],
+    PJRT_Compile: Some(TT_Compile),
+    PJRT_Executable_OutputElementTypes: Some(TT_Executable_OutputElementTypes),
+    PJRT_Executable_OutputDimensions: Some(TT_Executable_OutputDimensions),
+    unused_before_client_topology: [None; 3],
     PJRT_Client_TopologyDescription: Some(TT_Client_TopologyDescription),
     unused_tail: [None; PJRT_API_UNUSED_TAIL_SLOTS],
 };
