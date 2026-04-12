@@ -41,6 +41,8 @@ type PjrtResultFn<Args> = Option<unsafe extern "C" fn(args: *mut Args) -> *mut P
 type PjrtVoidFn<Args> = Option<unsafe extern "C" fn(args: *mut Args)>;
 type PjrtDeviceAttributesDeleter =
     Option<unsafe extern "C" fn(device_attributes: *mut PJRT_Device_Attributes)>;
+type PjrtSerializedDeviceAssignmentDeleter =
+    Option<unsafe extern "C" fn(device_assignment: *mut PJRT_DeviceAssignmentSerialized)>;
 type PjrtEventOnReadyCallback =
     Option<unsafe extern "C" fn(error: *mut PJRT_Error, user_arg: *mut c_void)>;
 
@@ -129,6 +131,11 @@ pub struct PJRT_Event {
 
 #[repr(C)]
 pub struct PJRT_Buffer_MemoryLayout {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct PJRT_DeviceAssignmentSerialized {
     _private: [u8; 0],
 }
 
@@ -649,6 +656,17 @@ pub struct PJRT_LoadedExecutable_GetExecutable_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_LoadedExecutable_GetDeviceAssignment_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_LoadedExecutable,
+    pub serialized_bytes: *const c_char,
+    pub serialized_bytes_size: usize,
+    pub serialized_device_assignment: *mut PJRT_DeviceAssignmentSerialized,
+    pub serialized_device_assignment_deleter: PjrtSerializedDeviceAssignmentDeleter,
+}
+
+#[repr(C)]
 pub struct PJRT_Executable_Name_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -1042,7 +1060,8 @@ pub struct PJRT_Api {
     pub PJRT_TopologyDescription_Deserialize: PjrtResultFn<PJRT_Generic_Args>,
     pub PJRT_Client_CreateAliasBuffer: PjrtResultFn<PJRT_Generic_Args>,
     pub PJRT_Client_FulfillAliasBuffer: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_LoadedExecutable_GetDeviceAssignment: PjrtResultFn<PJRT_Generic_Args>,
+    pub PJRT_LoadedExecutable_GetDeviceAssignment:
+        PjrtResultFn<PJRT_LoadedExecutable_GetDeviceAssignment_Args>,
     pub PJRT_Client_CreateErrorBuffer: PjrtResultFn<PJRT_Generic_Args>,
     pub PJRT_AsyncHostToDeviceTransferManager_TransferLiteral: PjrtResultFn<PJRT_Generic_Args>,
     pub PJRT_Buffer_CopyRawToHostFuture: PjrtResultFn<PJRT_Generic_Args>,
@@ -1199,6 +1218,11 @@ unsafe extern "C" fn noop_device_attributes_deleter(
             drop(Box::from_raw(device_attributes));
         }
     }
+}
+
+unsafe extern "C" fn noop_serialized_device_assignment_deleter(
+    _device_assignment: *mut PJRT_DeviceAssignmentSerialized,
+) {
 }
 
 fn event_with_error(code: PJRT_Error_Code, message: impl Into<String>) -> *mut PJRT_Event {
@@ -2082,6 +2106,24 @@ pub unsafe extern "C" fn TT_LoadedExecutable_GetExecutable(
         return invalid_argument("loaded_executable must not be null");
     };
     args.executable = Box::into_raw(Box::new(cloned_executable(loaded)));
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_LoadedExecutable_GetDeviceAssignment(
+    args: *mut PJRT_LoadedExecutable_GetDeviceAssignment_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    log("pjrt loaded_executable_get_device_assignment entered");
+    if args.executable.is_null() {
+        return invalid_argument("executable must not be null");
+    }
+    args.serialized_bytes = ptr::null();
+    args.serialized_bytes_size = 0;
+    args.serialized_device_assignment = ptr::null_mut();
+    args.serialized_device_assignment_deleter = Some(noop_serialized_device_assignment_deleter);
     ptr::null_mut()
 }
 
@@ -3129,10 +3171,6 @@ define_unimplemented_generic_pjrt_fn!(
 define_unimplemented_generic_pjrt_fn!(
     TT_Client_FulfillAliasBuffer,
     "pjrt client_fulfill_alias_buffer"
-);
-define_unimplemented_generic_pjrt_fn!(
-    TT_LoadedExecutable_GetDeviceAssignment,
-    "pjrt loaded_executable_get_device_assignment"
 );
 define_unimplemented_generic_pjrt_fn!(
     TT_Client_CreateErrorBuffer,
