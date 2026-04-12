@@ -2,6 +2,7 @@
 
 pub mod compiler;
 pub mod device;
+pub mod dispatch;
 pub mod dram;
 mod hw;
 mod linux;
@@ -130,6 +131,42 @@ pub struct PJRT_Buffer {
     memory: *mut PJRT_Memory,
     local_hardware_id: usize,
     dram_buffer: Option<DramBuffer>,
+    deleted: bool,
+}
+
+#[repr(C)]
+pub struct PJRT_Program {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub code: *mut c_char,
+    pub code_size: usize,
+    pub format: *const c_char,
+    pub format_size: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_ExecuteOptions {
+    _private: [u8; 0],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutableKind {
+    EltwiseAddBf16,
+}
+
+#[repr(C)]
+pub struct PJRT_Executable {
+    kind: ExecutableKind,
+    name: CString,
+    num_outputs: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_LoadedExecutable {
+    kind: ExecutableKind,
+    name: CString,
+    num_outputs: usize,
+    addressable_devices: Vec<*mut PJRT_Device>,
     deleted: bool,
 }
 
@@ -343,6 +380,17 @@ pub struct PJRT_Client_DefaultDeviceAssignment_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_Client_Compile_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub client: *mut PJRT_Client,
+    pub program: *const PJRT_Program,
+    pub compile_options: *const c_char,
+    pub compile_options_size: usize,
+    pub executable: *mut PJRT_LoadedExecutable,
+}
+
+#[repr(C)]
 pub struct PJRT_Client_BufferFromHostBuffer_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -496,6 +544,99 @@ pub struct PJRT_Memory_AddressableByDevices_Args {
     pub memory: *mut PJRT_Memory,
     pub devices: *const *mut PJRT_Device,
     pub num_devices: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Executable_Destroy_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+}
+
+#[repr(C)]
+pub struct PJRT_LoadedExecutable_Destroy_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_LoadedExecutable,
+}
+
+#[repr(C)]
+pub struct PJRT_LoadedExecutable_GetExecutable_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub loaded_executable: *mut PJRT_LoadedExecutable,
+    pub executable: *mut PJRT_Executable,
+}
+
+#[repr(C)]
+pub struct PJRT_Executable_Name_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+    pub executable_name: *const c_char,
+    pub executable_name_size: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Executable_NumReplicas_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+    pub num_replicas: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_Executable_NumPartitions_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+    pub num_partitions: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_LoadedExecutable_AddressableDevices_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_LoadedExecutable,
+    pub addressable_devices: *const *mut PJRT_Device,
+    pub num_addressable_devices: usize,
+}
+
+#[repr(C)]
+pub struct PJRT_LoadedExecutable_Delete_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_LoadedExecutable,
+}
+
+#[repr(C)]
+pub struct PJRT_LoadedExecutable_IsDeleted_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_LoadedExecutable,
+    pub is_deleted: bool,
+}
+
+#[repr(C)]
+pub struct PJRT_LoadedExecutable_Execute_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_LoadedExecutable,
+    pub options: *mut PJRT_ExecuteOptions,
+    pub argument_lists: *const *const *mut PJRT_Buffer,
+    pub num_devices: usize,
+    pub num_args: usize,
+    pub output_lists: *mut *mut *mut PJRT_Buffer,
+    pub device_complete_events: *mut *mut PJRT_Event,
+    pub execute_device: *mut PJRT_Device,
+}
+
+#[repr(C)]
+pub struct PJRT_Executable_NumOutputs_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+    pub num_outputs: usize,
 }
 
 #[repr(C)]
@@ -680,7 +821,7 @@ pub struct PJRT_Api {
     pub PJRT_Client_LookupDevice: PjrtResultFn<PJRT_Client_LookupDevice_Args>,
     pub PJRT_Client_LookupAddressableDevice: PjrtResultFn<PJRT_Client_LookupAddressableDevice_Args>,
     pub PJRT_Client_AddressableMemories: PjrtResultFn<PJRT_Client_AddressableMemories_Args>,
-    pub PJRT_Client_Compile: PjrtOpaqueFn,
+    pub PJRT_Client_Compile: PjrtResultFn<PJRT_Client_Compile_Args>,
     pub PJRT_Client_DefaultDeviceAssignment: PjrtResultFn<PJRT_Client_DefaultDeviceAssignment_Args>,
     pub PJRT_Client_BufferFromHostBuffer: PjrtResultFn<PJRT_Client_BufferFromHostBuffer_Args>,
     pub PJRT_DeviceDescription_Id: PjrtResultFn<PJRT_DeviceDescription_Id_Args>,
@@ -700,8 +841,26 @@ pub struct PJRT_Api {
     pub PJRT_Memory_DebugString: PjrtResultFn<PJRT_Memory_DebugString_Args>,
     pub PJRT_Memory_ToString: PjrtResultFn<PJRT_Memory_ToString_Args>,
     pub PJRT_Memory_AddressableByDevices: PjrtResultFn<PJRT_Memory_AddressableByDevices_Args>,
-    unused_executable: [PjrtOpaqueFn; 10],
-    unused_loaded_executable: [PjrtOpaqueFn; 8],
+    pub PJRT_Executable_Destroy: PjrtResultFn<PJRT_Executable_Destroy_Args>,
+    pub PJRT_Executable_Name: PjrtResultFn<PJRT_Executable_Name_Args>,
+    pub PJRT_Executable_NumReplicas: PjrtResultFn<PJRT_Executable_NumReplicas_Args>,
+    pub PJRT_Executable_NumPartitions: PjrtResultFn<PJRT_Executable_NumPartitions_Args>,
+    pub PJRT_Executable_NumOutputs: PjrtResultFn<PJRT_Executable_NumOutputs_Args>,
+    pub PJRT_Executable_SizeOfGeneratedCodeInBytes: PjrtOpaqueFn,
+    pub PJRT_Executable_GetCostAnalysis: PjrtOpaqueFn,
+    pub PJRT_Executable_OutputMemoryKinds: PjrtOpaqueFn,
+    pub PJRT_Executable_OptimizedProgram: PjrtOpaqueFn,
+    pub PJRT_Executable_Serialize: PjrtOpaqueFn,
+    pub PJRT_LoadedExecutable_Destroy: PjrtResultFn<PJRT_LoadedExecutable_Destroy_Args>,
+    pub PJRT_LoadedExecutable_GetExecutable:
+        PjrtResultFn<PJRT_LoadedExecutable_GetExecutable_Args>,
+    pub PJRT_LoadedExecutable_AddressableDevices:
+        PjrtResultFn<PJRT_LoadedExecutable_AddressableDevices_Args>,
+    pub PJRT_LoadedExecutable_Delete: PjrtResultFn<PJRT_LoadedExecutable_Delete_Args>,
+    pub PJRT_LoadedExecutable_IsDeleted: PjrtResultFn<PJRT_LoadedExecutable_IsDeleted_Args>,
+    pub PJRT_LoadedExecutable_Execute: PjrtResultFn<PJRT_LoadedExecutable_Execute_Args>,
+    pub PJRT_Executable_DeserializeAndLoad: PjrtOpaqueFn,
+    pub PJRT_LoadedExecutable_Fingerprint: PjrtOpaqueFn,
     pub PJRT_Buffer_Destroy: PjrtResultFn<PJRT_Buffer_Destroy_Args>,
     pub PJRT_Buffer_ElementType: PjrtResultFn<PJRT_Buffer_ElementType_Args>,
     pub PJRT_Buffer_Dimensions: PjrtResultFn<PJRT_Buffer_Dimensions_Args>,
@@ -849,10 +1008,18 @@ fn resource_exhausted(message: impl AsRef<str>) -> *mut PJRT_Error {
 fn io_error(err: io::Error) -> *mut PJRT_Error {
     let code = match err.kind() {
         io::ErrorKind::InvalidInput => PJRT_Error_Code::PJRT_Error_Code_INVALID_ARGUMENT,
+        io::ErrorKind::TimedOut => PJRT_Error_Code::PJRT_Error_Code_DEADLINE_EXCEEDED,
         io::ErrorKind::OutOfMemory => PJRT_Error_Code::PJRT_Error_Code_RESOURCE_EXHAUSTED,
         _ => PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
     };
     pjrt_error(err.to_string(), code)
+}
+
+fn failed_precondition(message: impl AsRef<str>) -> *mut PJRT_Error {
+    pjrt_error(
+        message,
+        PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+    )
 }
 
 fn ready_event() -> *mut PJRT_Event {
@@ -977,6 +1144,48 @@ fn event_for_buffer(buffer: &PJRT_Buffer) -> *mut PJRT_Event {
         )
     } else {
         ready_event()
+    }
+}
+
+fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *mut PJRT_Error> {
+    if len == 0 {
+        return Ok(String::new());
+    }
+    if ptr.is_null() {
+        return Err(invalid_argument(format!(
+            "{field} must not be null when size > 0"
+        )));
+    }
+    // SAFETY: caller owns `ptr` for `len` bytes during the call.
+    let bytes = unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| invalid_argument(format!("{field} must be valid UTF-8")))
+}
+
+fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind, *mut PJRT_Error> {
+    let format = c_api_string(program.format, program.format_size, "program.format")?;
+    let code = if program.code_size == 0 {
+        String::new()
+    } else {
+        c_api_string(program.code.cast_const(), program.code_size, "program.code")?
+    };
+
+    match format.as_str() {
+        "tt.add" => Ok(ExecutableKind::EltwiseAddBf16),
+        "mlir" | "stablehlo" if code.contains("stablehlo.add") || code.contains("mhlo.add") => {
+            Ok(ExecutableKind::EltwiseAddBf16)
+        }
+        other => Err(unimplemented(format!(
+            "unsupported program format {other:?}; supported formats are \"tt.add\" and MLIR containing stablehlo.add"
+        ))),
+    }
+}
+
+fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
+    PJRT_Executable {
+        kind: executable.kind,
+        name: executable.name.clone(),
+        num_outputs: executable.num_outputs,
     }
 }
 
@@ -1288,6 +1497,35 @@ pub unsafe extern "C" fn TT_Client_AddressableMemories(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Client_Compile(args: *mut PJRT_Client_Compile_Args) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
+        return invalid_argument("client must not be null");
+    };
+    let Ok(program) = (unsafe { checked_ref(args.program, "program") }) else {
+        return invalid_argument("program must not be null");
+    };
+    let kind = match executable_kind_from_program(program) {
+        Ok(kind) => kind,
+        Err(err) => return err,
+    };
+
+    let name = match kind {
+        ExecutableKind::EltwiseAddBf16 => "tt.add.bf16",
+    };
+    args.executable = Box::into_raw(Box::new(PJRT_LoadedExecutable {
+        kind,
+        name: cstring_lossy(name),
+        num_outputs: 1,
+        addressable_devices: client.addressable_device_ptrs.clone(),
+        deleted: false,
+    }));
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Client_DefaultDeviceAssignment(
     args: *mut PJRT_Client_DefaultDeviceAssignment_Args,
 ) -> *mut PJRT_Error {
@@ -1325,6 +1563,264 @@ pub unsafe extern "C" fn TT_Client_DefaultDeviceAssignment(
         // SAFETY: caller owns `default_assignment` for `default_assignment_size` entries.
         unsafe {
             *args.default_assignment.add(index) = index as i32;
+        }
+    }
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Executable_Destroy(
+    args: *mut PJRT_Executable_Destroy_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if !args.executable.is_null() {
+        unsafe {
+            drop(Box::from_raw(args.executable));
+        }
+        args.executable = ptr::null_mut();
+    }
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Executable_Name(
+    args: *mut PJRT_Executable_Name_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.executable_name = executable.name.as_ptr();
+    args.executable_name_size = executable.name.as_bytes().len();
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Executable_NumReplicas(
+    args: *mut PJRT_Executable_NumReplicas_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if args.executable.is_null() {
+        return invalid_argument("executable must not be null");
+    }
+    args.num_replicas = 1;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Executable_NumPartitions(
+    args: *mut PJRT_Executable_NumPartitions_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if args.executable.is_null() {
+        return invalid_argument("executable must not be null");
+    }
+    args.num_partitions = 1;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Executable_NumOutputs(
+    args: *mut PJRT_Executable_NumOutputs_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.num_outputs = executable.num_outputs;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_LoadedExecutable_Destroy(
+    args: *mut PJRT_LoadedExecutable_Destroy_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if !args.executable.is_null() {
+        unsafe {
+            drop(Box::from_raw(args.executable));
+        }
+        args.executable = ptr::null_mut();
+    }
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_LoadedExecutable_GetExecutable(
+    args: *mut PJRT_LoadedExecutable_GetExecutable_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(loaded) = (unsafe { checked_ref(args.loaded_executable, "loaded_executable") }) else {
+        return invalid_argument("loaded_executable must not be null");
+    };
+    args.executable = Box::into_raw(Box::new(cloned_executable(loaded)));
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_LoadedExecutable_AddressableDevices(
+    args: *mut PJRT_LoadedExecutable_AddressableDevices_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.addressable_devices = if executable.addressable_devices.is_empty() {
+        ptr::null()
+    } else {
+        executable.addressable_devices.as_ptr()
+    };
+    args.num_addressable_devices = executable.addressable_devices.len();
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_LoadedExecutable_Delete(
+    args: *mut PJRT_LoadedExecutable_Delete_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_mut(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    executable.deleted = true;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_LoadedExecutable_IsDeleted(
+    args: *mut PJRT_LoadedExecutable_IsDeleted_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.is_deleted = executable.deleted;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
+    args: *mut PJRT_LoadedExecutable_Execute_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    if executable.deleted {
+        return failed_precondition("executable has been deleted");
+    }
+    if args.num_devices != 1 {
+        return unimplemented("only single-device execution is supported");
+    }
+    if args.num_args != 2 {
+        return invalid_argument("tt.add expects exactly two arguments");
+    }
+    if args.argument_lists.is_null() || args.output_lists.is_null() {
+        return invalid_argument("argument_lists and output_lists must not be null");
+    }
+
+    let execute_device = if !args.execute_device.is_null() {
+        args.execute_device
+    } else {
+        executable
+            .addressable_devices
+            .first()
+            .copied()
+            .unwrap_or(ptr::null_mut())
+    };
+    if execute_device.is_null() {
+        return invalid_argument("no execute device available");
+    }
+    let Ok(target_device) = (unsafe { checked_ref(execute_device, "execute_device") }) else {
+        return invalid_argument("execute_device must not be null");
+    };
+
+    let device_args = unsafe { *args.argument_lists };
+    if device_args.is_null() {
+        return invalid_argument("argument_lists[0] must not be null");
+    }
+    let lhs_ptr = unsafe { *device_args.add(0) };
+    let rhs_ptr = unsafe { *device_args.add(1) };
+    let Ok(lhs) = (unsafe { checked_ref(lhs_ptr, "argument_lists[0][0]") }) else {
+        return invalid_argument("lhs buffer must not be null");
+    };
+    let Ok(rhs) = (unsafe { checked_ref(rhs_ptr, "argument_lists[0][1]") }) else {
+        return invalid_argument("rhs buffer must not be null");
+    };
+    if lhs.deleted || rhs.deleted {
+        return failed_precondition("input buffers must not be deleted");
+    }
+    if lhs.local_hardware_id != target_device.local_hardware_id as usize
+        || rhs.local_hardware_id != target_device.local_hardware_id as usize
+    {
+        return invalid_argument("all buffers and execute_device must be on the same device");
+    }
+    if lhs.buffer_type != PJRT_Buffer_Type_BF16 || rhs.buffer_type != PJRT_Buffer_Type_BF16 {
+        return unimplemented("tt.add currently only supports bf16 buffers");
+    }
+    if lhs.dims != rhs.dims {
+        return invalid_argument("tt.add input buffer shapes must match");
+    }
+    let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+        return failed_precondition("lhs buffer has no device allocation");
+    };
+    let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+        return failed_precondition("rhs buffer has no device allocation");
+    };
+
+    let mut device = match Device::open(target_device.local_hardware_id as usize) {
+        Ok(device) => device,
+        Err(err) => return io_error(err),
+    };
+    let output = match executable.kind {
+        ExecutableKind::EltwiseAddBf16 => device.eltwise_add_bf16(lhs_dram, rhs_dram, "pjrt_add"),
+    };
+    let output = match output {
+        Ok(buffer) => buffer,
+        Err(err) => return io_error(err),
+    };
+
+    let device_outputs = unsafe { *args.output_lists };
+    if device_outputs.is_null() {
+        return invalid_argument("output_lists[0] must not be null");
+    }
+    let output_ptr = Box::into_raw(Box::new(PJRT_Buffer {
+        buffer_type: PJRT_Buffer_Type_BF16,
+        dims: lhs.dims.clone(),
+        device: execute_device,
+        memory: target_device.default_memory,
+        local_hardware_id: target_device.local_hardware_id as usize,
+        dram_buffer: Some(output),
+        deleted: false,
+    }));
+    unsafe {
+        *device_outputs.add(0) = output_ptr;
+    }
+    if !args.device_complete_events.is_null() {
+        unsafe {
+            *args.device_complete_events.add(0) = ready_event();
         }
     }
     ptr::null_mut()
@@ -2049,7 +2545,7 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Client_LookupDevice: Some(TT_Client_LookupDevice),
     PJRT_Client_LookupAddressableDevice: Some(TT_Client_LookupAddressableDevice),
     PJRT_Client_AddressableMemories: Some(TT_Client_AddressableMemories),
-    PJRT_Client_Compile: None,
+    PJRT_Client_Compile: Some(TT_Client_Compile),
     PJRT_Client_DefaultDeviceAssignment: Some(TT_Client_DefaultDeviceAssignment),
     PJRT_Client_BufferFromHostBuffer: Some(TT_Client_BufferFromHostBuffer),
     PJRT_DeviceDescription_Id: Some(TT_DeviceDescription_Id),
@@ -2069,8 +2565,24 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Memory_DebugString: Some(TT_Memory_DebugString),
     PJRT_Memory_ToString: Some(TT_Memory_ToString),
     PJRT_Memory_AddressableByDevices: Some(TT_Memory_AddressableByDevices),
-    unused_executable: [None; 10],
-    unused_loaded_executable: [None; 8],
+    PJRT_Executable_Destroy: Some(TT_Executable_Destroy),
+    PJRT_Executable_Name: Some(TT_Executable_Name),
+    PJRT_Executable_NumReplicas: Some(TT_Executable_NumReplicas),
+    PJRT_Executable_NumPartitions: Some(TT_Executable_NumPartitions),
+    PJRT_Executable_NumOutputs: Some(TT_Executable_NumOutputs),
+    PJRT_Executable_SizeOfGeneratedCodeInBytes: None,
+    PJRT_Executable_GetCostAnalysis: None,
+    PJRT_Executable_OutputMemoryKinds: None,
+    PJRT_Executable_OptimizedProgram: None,
+    PJRT_Executable_Serialize: None,
+    PJRT_LoadedExecutable_Destroy: Some(TT_LoadedExecutable_Destroy),
+    PJRT_LoadedExecutable_GetExecutable: Some(TT_LoadedExecutable_GetExecutable),
+    PJRT_LoadedExecutable_AddressableDevices: Some(TT_LoadedExecutable_AddressableDevices),
+    PJRT_LoadedExecutable_Delete: Some(TT_LoadedExecutable_Delete),
+    PJRT_LoadedExecutable_IsDeleted: Some(TT_LoadedExecutable_IsDeleted),
+    PJRT_LoadedExecutable_Execute: Some(TT_LoadedExecutable_Execute),
+    PJRT_Executable_DeserializeAndLoad: None,
+    PJRT_LoadedExecutable_Fingerprint: None,
     PJRT_Buffer_Destroy: Some(TT_Buffer_Destroy),
     PJRT_Buffer_ElementType: Some(TT_Buffer_ElementType),
     PJRT_Buffer_Dimensions: Some(TT_Buffer_Dimensions),
@@ -2360,5 +2872,122 @@ mod tests {
 
         let device = &client.devices[0];
         assert_eq!(device.local_hardware_id, 3);
+    }
+
+    #[test]
+    fn pjrt_compile_exposes_minimal_add_executable_metadata() {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"tt.add".to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: ptr::null_mut(),
+            code_size: 0,
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { compile(&mut compile_args) });
+        assert!(!compile_args.executable.is_null());
+
+        let loaded_addressable_devices = api
+            .PJRT_LoadedExecutable_AddressableDevices
+            .expect("PJRT_LoadedExecutable_AddressableDevices must be exported");
+        let mut loaded_addressable_devices_args = PJRT_LoadedExecutable_AddressableDevices_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_AddressableDevices_Args>(),
+            extension_start: ptr::null_mut(),
+            executable: compile_args.executable,
+            addressable_devices: ptr::null(),
+            num_addressable_devices: usize::MAX,
+        };
+        check_ok(api, unsafe {
+            loaded_addressable_devices(&mut loaded_addressable_devices_args)
+        });
+        assert_eq!(loaded_addressable_devices_args.num_addressable_devices, 0);
+        assert!(loaded_addressable_devices_args.addressable_devices.is_null());
+
+        let get_executable = api
+            .PJRT_LoadedExecutable_GetExecutable
+            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
+        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
+            extension_start: ptr::null_mut(),
+            loaded_executable: compile_args.executable,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+        assert!(!get_executable_args.executable.is_null());
+
+        let executable_name = api
+            .PJRT_Executable_Name
+            .expect("PJRT_Executable_Name must be exported");
+        let mut executable_name_args = PJRT_Executable_Name_Args {
+            struct_size: size_of::<PJRT_Executable_Name_Args>(),
+            extension_start: ptr::null_mut(),
+            executable: get_executable_args.executable,
+            executable_name: ptr::null(),
+            executable_name_size: 0,
+        };
+        check_ok(api, unsafe { executable_name(&mut executable_name_args) });
+        let name = unsafe {
+            std::slice::from_raw_parts(
+                executable_name_args.executable_name.cast::<u8>(),
+                executable_name_args.executable_name_size,
+            )
+        };
+        assert_eq!(name, b"tt.add.bf16");
+
+        let executable_num_outputs = api
+            .PJRT_Executable_NumOutputs
+            .expect("PJRT_Executable_NumOutputs must be exported");
+        let mut executable_num_outputs_args = PJRT_Executable_NumOutputs_Args {
+            struct_size: size_of::<PJRT_Executable_NumOutputs_Args>(),
+            extension_start: ptr::null_mut(),
+            executable: get_executable_args.executable,
+            num_outputs: 0,
+        };
+        check_ok(api, unsafe {
+            executable_num_outputs(&mut executable_num_outputs_args)
+        });
+        assert_eq!(executable_num_outputs_args.num_outputs, 1);
+
+        let executable_destroy = api
+            .PJRT_Executable_Destroy
+            .expect("PJRT_Executable_Destroy must be exported");
+        let mut executable_destroy_args = PJRT_Executable_Destroy_Args {
+            struct_size: size_of::<PJRT_Executable_Destroy_Args>(),
+            extension_start: ptr::null_mut(),
+            executable: get_executable_args.executable,
+        };
+        check_ok(api, unsafe { executable_destroy(&mut executable_destroy_args) });
+        assert!(executable_destroy_args.executable.is_null());
+
+        let loaded_destroy = api
+            .PJRT_LoadedExecutable_Destroy
+            .expect("PJRT_LoadedExecutable_Destroy must be exported");
+        let mut loaded_destroy_args = PJRT_LoadedExecutable_Destroy_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_Destroy_Args>(),
+            extension_start: ptr::null_mut(),
+            executable: compile_args.executable,
+        };
+        check_ok(api, unsafe { loaded_destroy(&mut loaded_destroy_args) });
+        assert!(loaded_destroy_args.executable.is_null());
+
+        unsafe {
+            drop(Box::from_raw(client));
+        }
     }
 }

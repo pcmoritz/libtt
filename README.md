@@ -53,6 +53,35 @@ let roundtrip = device.dram_read(&buffer)?;
 assert_eq!(roundtrip, data);
 ```
 
+## Slow Dispatch
+
+The crate now includes a slow-dispatch path modeled on `blackhole-py`'s
+`dispatch.py`. `Device::run_program(...)` compiles the requested dataflow and
+compute kernels, stages the launch payload into worker-core L1, sends the
+firmware `GO` message, and waits until the selected cores report completion.
+
+Example:
+
+```rust
+use libtt::compiler::{CoreSelection, Program};
+use libtt::device::Device;
+
+let mut device = Device::open(0)?;
+let program = Program {
+    cores: CoreSelection::Count(1),
+    writer_kernel: r#"
+void kernel_main() {
+}
+"#
+    .to_owned(),
+    ..Program::default()
+};
+device.run_program(&program)?;
+```
+
+This path still depends on the Blackhole firmware/toolchain assets under
+`tt-metal-deps/`, just like the existing compiler support.
+
 ## Build
 
 ```bash
