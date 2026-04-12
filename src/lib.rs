@@ -2004,6 +2004,7 @@ pub unsafe extern "C" fn TT_Executable_NumReplicas(
         return invalid_argument("executable must not be null");
     }
     args.num_replicas = 1;
+    log("pjrt executable_num_replicas returning 1");
     ptr::null_mut()
 }
 
@@ -2019,6 +2020,7 @@ pub unsafe extern "C" fn TT_Executable_NumPartitions(
         return invalid_argument("executable must not be null");
     }
     args.num_partitions = 1;
+    log("pjrt executable_num_partitions returning 1");
     ptr::null_mut()
 }
 
@@ -2034,6 +2036,10 @@ pub unsafe extern "C" fn TT_Executable_NumOutputs(
         return invalid_argument("executable must not be null");
     };
     args.num_outputs = executable.num_outputs;
+    log(format!(
+        "pjrt executable_num_outputs returning {}",
+        args.num_outputs
+    ));
     ptr::null_mut()
 }
 
@@ -2050,6 +2056,10 @@ pub unsafe extern "C" fn TT_Executable_OutputElementTypes(
     };
     args.output_types = executable.output_types.as_ptr();
     args.num_output_types = executable.output_types.len();
+    log(format!(
+        "pjrt executable_output_element_types returning {}",
+        args.num_output_types
+    ));
     ptr::null_mut()
 }
 
@@ -2067,6 +2077,10 @@ pub unsafe extern "C" fn TT_Executable_OutputDimensions(
     args.dims = executable.output_dims.as_ptr();
     args.dim_sizes = executable.output_dim_sizes.as_ptr();
     args.num_outputs = executable.output_dim_sizes.len();
+    log(format!(
+        "pjrt executable_output_dimensions returning {}",
+        args.num_outputs
+    ));
     ptr::null_mut()
 }
 
@@ -2084,6 +2098,10 @@ pub unsafe extern "C" fn TT_Executable_OutputMemoryKinds(
     args.memory_kinds = executable.output_memory_kind_ptrs.as_ptr();
     args.memory_kind_sizes = executable.output_memory_kind_sizes.as_ptr();
     args.num_outputs = executable.output_memory_kind_ptrs.len();
+    log(format!(
+        "pjrt executable_output_memory_kinds returning {}",
+        args.num_outputs
+    ));
     ptr::null_mut()
 }
 
