@@ -1223,6 +1223,7 @@ unsafe extern "C" fn noop_device_attributes_deleter(
 unsafe extern "C" fn noop_serialized_device_assignment_deleter(
     _device_assignment: *mut PJRT_DeviceAssignmentSerialized,
 ) {
+    log("pjrt loaded_executable_get_device_assignment deleter entered");
 }
 
 fn event_with_error(code: PJRT_Error_Code, message: impl Into<String>) -> *mut PJRT_Event {
@@ -1979,6 +1980,7 @@ pub unsafe extern "C" fn TT_Executable_Destroy(
 pub unsafe extern "C" fn TT_Executable_Name(
     args: *mut PJRT_Executable_Name_Args,
 ) -> *mut PJRT_Error {
+    log("pjrt executable_name entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -1994,6 +1996,7 @@ pub unsafe extern "C" fn TT_Executable_Name(
 pub unsafe extern "C" fn TT_Executable_NumReplicas(
     args: *mut PJRT_Executable_NumReplicas_Args,
 ) -> *mut PJRT_Error {
+    log("pjrt executable_num_replicas entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2008,6 +2011,7 @@ pub unsafe extern "C" fn TT_Executable_NumReplicas(
 pub unsafe extern "C" fn TT_Executable_NumPartitions(
     args: *mut PJRT_Executable_NumPartitions_Args,
 ) -> *mut PJRT_Error {
+    log("pjrt executable_num_partitions entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2022,6 +2026,7 @@ pub unsafe extern "C" fn TT_Executable_NumPartitions(
 pub unsafe extern "C" fn TT_Executable_NumOutputs(
     args: *mut PJRT_Executable_NumOutputs_Args,
 ) -> *mut PJRT_Error {
+    log("pjrt executable_num_outputs entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2036,6 +2041,7 @@ pub unsafe extern "C" fn TT_Executable_NumOutputs(
 pub unsafe extern "C" fn TT_Executable_OutputElementTypes(
     args: *mut PJRT_Executable_OutputElementTypes_Args,
 ) -> *mut PJRT_Error {
+    log("pjrt executable_output_element_types entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2051,6 +2057,7 @@ pub unsafe extern "C" fn TT_Executable_OutputElementTypes(
 pub unsafe extern "C" fn TT_Executable_OutputDimensions(
     args: *mut PJRT_Executable_OutputDimensions_Args,
 ) -> *mut PJRT_Error {
+    log("pjrt executable_output_dimensions entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2067,6 +2074,7 @@ pub unsafe extern "C" fn TT_Executable_OutputDimensions(
 pub unsafe extern "C" fn TT_Executable_OutputMemoryKinds(
     args: *mut PJRT_Executable_OutputMemoryKinds_Args,
 ) -> *mut PJRT_Error {
+    log("pjrt executable_output_memory_kinds entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2099,6 +2107,7 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Destroy(
 pub unsafe extern "C" fn TT_LoadedExecutable_GetExecutable(
     args: *mut PJRT_LoadedExecutable_GetExecutable_Args,
 ) -> *mut PJRT_Error {
+    log("pjrt loaded_executable_get_executable entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2124,6 +2133,7 @@ pub unsafe extern "C" fn TT_LoadedExecutable_GetDeviceAssignment(
     args.serialized_bytes_size = 0;
     args.serialized_device_assignment = ptr::null_mut();
     args.serialized_device_assignment_deleter = Some(noop_serialized_device_assignment_deleter);
+    log("pjrt loaded_executable_get_device_assignment returning portable executable");
     ptr::null_mut()
 }
 
