@@ -701,6 +701,14 @@ pub struct PJRT_LoadedExecutable_AddressableDevices_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_Executable_OptimizedProgram_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+    pub program: *mut PJRT_Program,
+}
+
+#[repr(C)]
 pub struct PJRT_LoadedExecutable_Delete_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -991,7 +999,7 @@ pub struct PJRT_Api {
     pub PJRT_Executable_SizeOfGeneratedCodeInBytes: PjrtOpaqueFn,
     pub PJRT_Executable_GetCostAnalysis: PjrtOpaqueFn,
     pub PJRT_Executable_OutputMemoryKinds: PjrtResultFn<PJRT_Executable_OutputMemoryKinds_Args>,
-    pub PJRT_Executable_OptimizedProgram: PjrtOpaqueFn,
+    pub PJRT_Executable_OptimizedProgram: PjrtResultFn<PJRT_Executable_OptimizedProgram_Args>,
     pub PJRT_Executable_Serialize: PjrtOpaqueFn,
     pub PJRT_LoadedExecutable_Destroy: PjrtResultFn<PJRT_LoadedExecutable_Destroy_Args>,
     pub PJRT_LoadedExecutable_GetExecutable:
@@ -1535,6 +1543,42 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
     }
 }
 
+fn executable_tensor_spec(executable: &PJRT_Executable) -> String {
+    let dims = executable
+        .output_dims
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>();
+    let shape = if dims.is_empty() {
+        String::new()
+    } else {
+        format!("{}x", dims.join("x"))
+    };
+    let element = match executable.output_types.first().copied() {
+        Some(PJRT_Buffer_Type_BF16) | None => "bf16",
+        Some(PJRT_Buffer_Type_F32) => "f32",
+        Some(PJRT_Buffer_Type_F16) => "f16",
+        Some(PJRT_Buffer_Type_S32) => "i32",
+        Some(PJRT_Buffer_Type_U32) => "ui32",
+        Some(PJRT_Buffer_Type_S8) => "i8",
+        Some(PJRT_Buffer_Type_U8) => "ui8",
+        Some(PJRT_Buffer_Type_U16) => "ui16",
+        Some(_) => "bf16",
+    };
+    format!("tensor<{shape}{element}>")
+}
+
+fn executable_optimized_mlir(executable: &PJRT_Executable) -> String {
+    match executable.kind {
+        ExecutableKind::EltwiseAddBf16 => {
+            let tensor = executable_tensor_spec(executable);
+            format!(
+                "module {{\n  func.func public @main(%arg0: {tensor}, %arg1: {tensor}) -> {tensor} {{\n    %0 = stablehlo.add %arg0, %arg1 : {tensor}\n    return %0 : {tensor}\n  }}\n}}\n"
+            )
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Error_Destroy(args: *mut PJRT_Error_Destroy_Args) {
     let Some(args) = (unsafe { args.as_mut() }) else {
@@ -2021,6 +2065,51 @@ pub unsafe extern "C" fn TT_Executable_NumPartitions(
     }
     args.num_partitions = 1;
     log("pjrt executable_num_partitions returning 1");
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
+    args: *mut PJRT_Executable_OptimizedProgram_Args,
+) -> *mut PJRT_Error {
+    log("pjrt executable_optimized_program entered");
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    let Ok(program) = (unsafe { checked_mut(args.program, "program") }) else {
+        return invalid_argument("program must not be null");
+    };
+
+    static MLIR_FORMAT: &[u8] = b"mlir";
+    let code = executable_optimized_mlir(executable);
+    program.format = MLIR_FORMAT.as_ptr().cast::<c_char>();
+    program.format_size = MLIR_FORMAT.len();
+    program.code_size = code.len();
+
+    if program.code.is_null() {
+        log(format!(
+            "pjrt executable_optimized_program size query returning {} bytes",
+            program.code_size
+        ));
+        return ptr::null_mut();
+    }
+
+    if program.code_size < code.len() {
+        return invalid_argument("program.code buffer too small for optimized program");
+    }
+
+    // SAFETY: caller provides writable buffer of at least `code.len()` bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(code.as_ptr().cast::<c_char>(), program.code, code.len());
+    }
+    program.code_size = code.len();
+    log(format!(
+        "pjrt executable_optimized_program wrote {} bytes",
+        program.code_size
+    ));
     ptr::null_mut()
 }
 
@@ -3292,7 +3381,7 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     PJRT_Executable_SizeOfGeneratedCodeInBytes: None,
     PJRT_Executable_GetCostAnalysis: None,
     PJRT_Executable_OutputMemoryKinds: Some(TT_Executable_OutputMemoryKinds),
-    PJRT_Executable_OptimizedProgram: None,
+    PJRT_Executable_OptimizedProgram: Some(TT_Executable_OptimizedProgram),
     PJRT_Executable_Serialize: None,
     PJRT_LoadedExecutable_Destroy: Some(TT_LoadedExecutable_Destroy),
     PJRT_LoadedExecutable_GetExecutable: Some(TT_LoadedExecutable_GetExecutable),
