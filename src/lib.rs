@@ -2250,6 +2250,7 @@ pub unsafe extern "C" fn TT_DeviceDescription_ProcessIndex(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt device_description_process_index entered");
     let Ok(description) = (unsafe { checked_ref(args.device_description, "device_description") })
     else {
         return invalid_argument("device_description must not be null");
@@ -2265,6 +2266,7 @@ pub unsafe extern "C" fn TT_DeviceDescription_Attributes(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
+    log("pjrt device_description_attributes entered");
     if args.device_description.is_null() {
         return invalid_argument("device_description must not be null");
     }
