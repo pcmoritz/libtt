@@ -759,9 +759,9 @@ pub struct PJRT_Executable_OutputDimensions_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
     pub executable: *mut PJRT_Executable,
+    pub num_outputs: usize,
     pub dims: *const i64,
     pub dim_sizes: *const usize,
-    pub num_outputs: usize,
 }
 
 #[repr(C)]
@@ -769,9 +769,9 @@ pub struct PJRT_Executable_OutputMemoryKinds_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
     pub executable: *mut PJRT_Executable,
+    pub num_outputs: usize,
     pub memory_kinds: *const *const c_char,
     pub memory_kind_sizes: *const usize,
-    pub num_outputs: usize,
 }
 
 #[repr(C)]
