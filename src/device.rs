@@ -755,6 +755,8 @@ fn noc_xy(x: u8, y: u8) -> u16 {
     (((y as u16) << 6) | x as u16) & 0xFFFF
 }
 
+// Builds the scratch table firmware uses to map DRAM and worker-L1 banks to
+// NoC endpoints for each NoC direction.
 fn build_bank_noc_table(
     harvested_dram_banks: &[usize],
     worker_cores: &[CoreCoord],
