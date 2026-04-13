@@ -1765,17 +1765,17 @@ fn executable_tensor_spec(executable: &PJRT_Executable) -> String {
     format!("tensor<{shape}{element}>")
 }
 
-fn executable_layout_attr(executable: &PJRT_Executable) -> String {
+fn executable_layout_mode(executable: &PJRT_Executable) -> String {
     let rank = executable.output_dims.len();
     if rank == 0 {
-        "dense<> : tensor<0xindex>".to_string()
+        "default".to_string()
     } else {
         let minor_to_major = (0..rank)
             .rev()
             .map(|dim| dim.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        format!("dense<[{minor_to_major}]> : tensor<{rank}xindex>")
+        format!("{{{minor_to_major}}}")
     }
 }
 
@@ -1783,9 +1783,9 @@ fn executable_optimized_mlir(executable: &PJRT_Executable) -> String {
     match executable.kind {
         ExecutableKind::EltwiseAddBf16 => {
             let tensor = executable_tensor_spec(executable);
-            let layout = executable_layout_attr(executable);
+            let layout = executable_layout_mode(executable);
             format!(
-                "module @entry attributes {{\n  mhlo.xla_entry_computation_parameter_layouts = [\n    {layout},\n    {layout}\n  ],\n  mhlo.xla_entry_computation_result_layout = [{layout}]\n}} {{\n  func.func @main(%arg0: {tensor}, %arg1: {tensor}) -> {tensor} {{\n    %0 = mhlo.add %arg0, %arg1 : {tensor}\n    return %0 : {tensor}\n  }}\n}}\n"
+                "module @entry attributes {{mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32}} {{\n  func.func public @main(%arg0: {tensor} {{mhlo.layout_mode = \"{layout}\"}}, %arg1: {tensor} {{mhlo.layout_mode = \"{layout}\"}}) -> ({tensor} {{jax.result_info = \"\", mhlo.layout_mode = \"{layout}\"}}) {{\n    %0 = stablehlo.add %arg0, %arg1 : {tensor}\n    return %0 : {tensor}\n  }}\n}}\n"
             )
         }
     }
@@ -4425,10 +4425,11 @@ mod tests {
         check_ok(api, unsafe { optimized_program(&mut optimized_program_args) });
         let mlir =
             String::from_utf8(optimized_code).expect("optimized program should be utf-8");
-        assert!(mlir.contains("mhlo.add"));
-        assert!(mlir.contains("mhlo.xla_entry_computation_parameter_layouts"));
-        assert!(mlir.contains("mhlo.xla_entry_computation_result_layout"));
-        assert!(mlir.contains("dense<[1, 0]> : tensor<2xindex>"));
+        assert!(mlir.contains("mhlo.num_partitions = 1 : i32"));
+        assert!(mlir.contains("mhlo.num_replicas = 1 : i32"));
+        assert!(mlir.contains("stablehlo.add"));
+        assert!(mlir.contains("mhlo.layout_mode = \"{1, 0}\""));
+        assert!(mlir.contains("jax.result_info = \"\""));
 
         let layouts_extension = unsafe {
             &*(api.extension_start.cast::<PJRT_Layouts_Extension>())
