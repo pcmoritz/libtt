@@ -1,4 +1,5 @@
 use crate::device::Device;
+use crate::dispatch::{MathFidelity, Program};
 use crate::dram::DType;
 use crate::hw::TensixL1;
 use crate::log::log;
@@ -128,80 +129,6 @@ type ZoneMap = HashMap<u16, (String, String, u32)>;
 static ZONE_MAP: OnceLock<Mutex<ZoneMap>> = OnceLock::new();
 static FIRMWARE_CACHE: OnceLock<Mutex<HashMap<String, FirmwareCacheEntry>>> = OnceLock::new();
 static KERNEL_CACHE: OnceLock<Mutex<HashMap<String, KernelCacheEntry>>> = OnceLock::new();
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MathFidelity {
-    LoFi = 0,
-    HiFi2 = 2,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CoreSelection {
-    Count(usize),
-    All,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CBConfig {
-    pub index: usize,
-    pub dtype: DType,
-    pub tiles: usize,
-}
-
-impl CBConfig {
-    pub fn new(index: usize, dtype: DType) -> Self {
-        Self {
-            index,
-            dtype,
-            tiles: 2,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Program {
-    pub cores: CoreSelection,
-    pub reader_kernel: String,
-    pub compute_kernel: String,
-    pub writer_kernel: String,
-    pub cbs: Vec<CBConfig>,
-    pub name: String,
-    pub reader_args: Vec<u32>,
-    pub writer_args: Vec<u32>,
-    pub compute_args: Vec<u32>,
-    pub semaphores: usize,
-    pub math_fidelity: MathFidelity,
-    pub approx: bool,
-    pub dst_accum_mode: bool,
-    pub dst_full_sync: bool,
-    pub reader_recv_kernel: String,
-    pub writer_recv_kernel: String,
-    pub grid: Option<(Vec<u8>, Vec<u8>)>,
-}
-
-impl Default for Program {
-    fn default() -> Self {
-        Self {
-            cores: CoreSelection::Count(1),
-            reader_kernel: String::new(),
-            compute_kernel: String::new(),
-            writer_kernel: String::new(),
-            cbs: Vec::new(),
-            name: String::new(),
-            reader_args: Vec::new(),
-            writer_args: Vec::new(),
-            compute_args: Vec::new(),
-            semaphores: 0,
-            math_fidelity: MathFidelity::HiFi2,
-            approx: false,
-            dst_accum_mode: false,
-            dst_full_sync: false,
-            reader_recv_kernel: String::new(),
-            writer_recv_kernel: String::new(),
-            grid: None,
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PTLoad {
@@ -1663,6 +1590,7 @@ fn merge_zones(zones: ZoneMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::CBConfig;
 
     #[test]
     fn hash16_matches_python_reference() {

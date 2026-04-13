@@ -1,4 +1,5 @@
-use crate::compiler::{CompiledKernel, Compiler, CoreSelection, Program};
+use crate::compiler::{CompiledKernel, Compiler};
+use crate::dram::DType;
 use crate::hw::{Arc, CoreCoord, TensixL1, align_up};
 use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::{BTreeSet, HashMap};
@@ -14,6 +15,80 @@ const DISPATCH_MODE_HOST: u8 = 1;
 const FAST_CQ_NUM_CIRCULAR_BUFFERS: u8 = 32;
 const L1_ALIGN: u32 = 16;
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MathFidelity {
+    LoFi = 0,
+    HiFi2 = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreSelection {
+    Count(usize),
+    All,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CBConfig {
+    pub index: usize,
+    pub dtype: DType,
+    pub tiles: usize,
+}
+
+impl CBConfig {
+    pub fn new(index: usize, dtype: DType) -> Self {
+        Self {
+            index,
+            dtype,
+            tiles: 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Program {
+    pub cores: CoreSelection,
+    pub reader_kernel: String,
+    pub compute_kernel: String,
+    pub writer_kernel: String,
+    pub cbs: Vec<CBConfig>,
+    pub name: String,
+    pub reader_args: Vec<u32>,
+    pub writer_args: Vec<u32>,
+    pub compute_args: Vec<u32>,
+    pub semaphores: usize,
+    pub math_fidelity: MathFidelity,
+    pub approx: bool,
+    pub dst_accum_mode: bool,
+    pub dst_full_sync: bool,
+    pub reader_recv_kernel: String,
+    pub writer_recv_kernel: String,
+    pub grid: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Default for Program {
+    fn default() -> Self {
+        Self {
+            cores: CoreSelection::Count(1),
+            reader_kernel: String::new(),
+            compute_kernel: String::new(),
+            writer_kernel: String::new(),
+            cbs: Vec::new(),
+            name: String::new(),
+            reader_args: Vec::new(),
+            writer_args: Vec::new(),
+            compute_args: Vec::new(),
+            semaphores: 0,
+            math_fidelity: MathFidelity::HiFi2,
+            approx: false,
+            dst_accum_mode: false,
+            dst_full_sync: false,
+            reader_recv_kernel: String::new(),
+            writer_recv_kernel: String::new(),
+            grid: None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DispatchCommand {
@@ -543,7 +618,6 @@ pub(crate) fn mcast_rects(cores: &[CoreCoord]) -> Vec<(CoreCoord, CoreCoord)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::{CBConfig, MathFidelity};
     use crate::dram::DType;
 
     fn dummy_kernel(fill: u8, len: usize) -> CompiledKernel {

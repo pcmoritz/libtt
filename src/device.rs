@@ -1,6 +1,7 @@
-use crate::compiler::{Compiler, Program};
-use crate::compiler::{CBConfig, CoreSelection};
-use crate::dispatch::{build_dispatch_plan, execute_slow_dispatch, mcast_rects};
+use crate::compiler::Compiler;
+use crate::dispatch::{
+    CBConfig, CoreSelection, Program, build_dispatch_plan, execute_slow_dispatch, mcast_rects,
+};
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO, align_down, worker_cores};
 use crate::linux::{NocOrdering, TlbWindow};
