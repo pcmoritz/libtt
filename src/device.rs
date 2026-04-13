@@ -1,11 +1,11 @@
 use crate::compiler::{Compiler, Program};
 use crate::compiler::{CBConfig, CoreSelection};
-use crate::dispatch::{build_dispatch_plan, execute_slow_dispatch};
+use crate::dispatch::{build_dispatch_plan, execute_slow_dispatch, mcast_rects};
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{Arc, CoreCoord, Dram, DramTile, TensixMMIO, align_down, worker_cores};
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -758,44 +758,6 @@ fn discover_with(root: &Path) -> Vec<Device> {
 
 fn local_hardware_id_from_path(path: &Path) -> Option<usize> {
     path.file_name()?.to_str()?.parse().ok()
-}
-
-fn mcast_rects(cores: &[CoreCoord]) -> Vec<(CoreCoord, CoreCoord)> {
-    if cores.is_empty() {
-        return Vec::new();
-    }
-
-    let mut remaining = cores.iter().copied().collect::<BTreeSet<_>>();
-    let mut rects = Vec::new();
-
-    while let Some(&start) = remaining.iter().next() {
-        let x0 = start.x;
-        let y0 = start.y;
-        let mut x1 = x0;
-        while remaining.contains(&CoreCoord { x: x1 + 1, y: y0 }) {
-            x1 += 1;
-        }
-
-        let mut y1 = y0;
-        loop {
-            let next_y = y1 + 1;
-            let full_row = (x0..=x1).all(|x| remaining.contains(&CoreCoord { x, y: next_y }));
-            if !full_row {
-                break;
-            }
-            y1 = next_y;
-        }
-
-        for x in x0..=x1 {
-            for y in y0..=y1 {
-                remaining.remove(&CoreCoord { x, y });
-            }
-        }
-
-        rects.push((CoreCoord { x: x0, y: y0 }, CoreCoord { x: x1, y: y1 }));
-    }
-
-    rects
 }
 
 fn noc_xy(x: u8, y: u8) -> u16 {

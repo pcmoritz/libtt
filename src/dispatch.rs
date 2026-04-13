@@ -525,7 +525,7 @@ fn to_u32(value: usize, label: &str) -> io::Result<u32> {
     })
 }
 
-fn mcast_rects(cores: &[CoreCoord]) -> Vec<(CoreCoord, CoreCoord)> {
+pub(crate) fn mcast_rects(cores: &[CoreCoord]) -> Vec<(CoreCoord, CoreCoord)> {
     if cores.is_empty() {
         return Vec::new();
     }
