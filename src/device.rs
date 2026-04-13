@@ -2,7 +2,7 @@ use crate::compiler::{Compiler, Program};
 use crate::compiler::{CBConfig, CoreSelection};
 use crate::dispatch::{build_dispatch_plan, execute_slow_dispatch, mcast_rects};
 use crate::dram::{Allocator, DType, DramBuffer};
-use crate::hw::{Arc, CoreCoord, Dram, DramTile, TensixMMIO, align_down, worker_cores};
+use crate::hw::{Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO, align_down, worker_cores};
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
 use std::collections::HashMap;
@@ -15,10 +15,6 @@ use std::time::{Duration, Instant};
 const DEFAULT_ROOT: &str = "/dev/tenstorrent";
 const RUN_MSG_INIT: u8 = 0x40;
 const RUN_MSG_DONE: u8 = 0x00;
-const TENSIX_L1_SIZE: u32 = 0x180000;
-const TENSIX_L1_GO_MSG: usize = 0x000370;
-const TENSIX_L1_BRISC_FIRMWARE_BASE: u32 = 0x003840;
-const TENSIX_L1_MEM_BANK_TO_NOC_SCRATCH: usize = 0x0116B0;
 const BANK_PORT: [[u8; 2]; Dram::BANK_COUNT] = [
     [2, 1],
     [0, 1],
@@ -535,7 +531,7 @@ impl Device {
                 if (TensixMMIO::LOCAL_RAM_START..=TensixMMIO::LOCAL_RAM_END).contains(&addr) {
                     addr = compiled.scratch_base + (addr - TensixMMIO::LOCAL_RAM_START);
                 }
-                if addr >= TENSIX_L1_SIZE {
+                if addr >= TensixL1::SIZE {
                     return Err(io::Error::other(format!(
                         "{name}: bad paddr 0x{:x} -> 0x{addr:x}",
                         segment.paddr
@@ -546,7 +542,7 @@ impl Device {
             staged.insert(name, spans);
         }
 
-        let jal = encode_jal_zero(TENSIX_L1_BRISC_FIRMWARE_BASE);
+        let jal = encode_jal_zero(TensixL1::BRISC_FIRMWARE_BASE);
         let go_init = [0u8, 0u8, 0u8, RUN_MSG_INIT];
         let bank_table = build_bank_noc_table(&self.harvested_dram_banks, &all_cores)?;
         let rects = mcast_rects(&all_cores);
@@ -575,8 +571,8 @@ impl Device {
                 }
             }
             wc.write(0, &jal)?;
-            wc.write(TENSIX_L1_GO_MSG, &go_init)?;
-            wc.write(TENSIX_L1_MEM_BANK_TO_NOC_SCRATCH, &bank_table)?;
+            wc.write(TensixL1::GO_MSG as usize, &go_init)?;
+            wc.write(TensixL1::MEM_BANK_TO_NOC_SCRATCH as usize, &bank_table)?;
         }
 
         let _ = wc.read32(0)?;
@@ -632,7 +628,7 @@ impl Device {
         uc.target(probe, None, 0, NocOrdering::Strict)?;
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if uc.read(TENSIX_L1_GO_MSG + 3, 1)?[0] == RUN_MSG_DONE {
+            if uc.read(TensixL1::GO_MSG as usize + 3, 1)?[0] == RUN_MSG_DONE {
                 break;
             }
             if Instant::now() > deadline {

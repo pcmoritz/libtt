@@ -1,5 +1,5 @@
 use crate::compiler::{CompiledKernel, Compiler, CoreSelection, Program};
-use crate::hw::{Arc, CoreCoord, align_up};
+use crate::hw::{Arc, CoreCoord, TensixL1, align_up};
 use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -14,12 +14,6 @@ const DISPATCH_MODE_HOST: u8 = 1;
 const FAST_CQ_NUM_CIRCULAR_BUFFERS: u8 = 32;
 const L1_ALIGN: u32 = 16;
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
-
-const TENSIX_L1_LAUNCH: usize = 0x000070;
-const TENSIX_L1_GO_MSG: usize = 0x000370;
-const TENSIX_L1_GO_MSG_INDEX: usize = 0x0003A0;
-const TENSIX_L1_KERNEL_CONFIG_BASE: u32 = 0x0086B0;
-const TENSIX_L1_DATA_BUFFER_SPACE_BASE: u32 = 0x037000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DispatchCommand {
@@ -93,12 +87,12 @@ pub(crate) fn build_dispatch_plan(
     let mut commands = vec![
         DispatchCommand::Write {
             cores: all_cores.clone(),
-            addr: TENSIX_L1_GO_MSG,
+            addr: TensixL1::GO_MSG as usize,
             data: vec![0, 0, 0, RUN_MSG_RESET_READ_PTR_FROM_HOST],
         },
         DispatchCommand::Write {
             cores: all_cores.clone(),
-            addr: TENSIX_L1_GO_MSG_INDEX,
+            addr: TensixL1::GO_MSG_INDEX as usize,
             data: vec![0; size_of::<u32>()],
         },
     ];
@@ -106,7 +100,7 @@ pub(crate) fn build_dispatch_plan(
     if !rta_blob.is_empty() {
         commands.push(DispatchCommand::Write {
             cores: all_cores.clone(),
-            addr: TENSIX_L1_KERNEL_CONFIG_BASE as usize,
+            addr: TensixL1::KERNEL_CONFIG_BASE as usize,
             data: rta_blob,
         });
     }
@@ -123,7 +117,7 @@ pub(crate) fn build_dispatch_plan(
         )?;
         commands.push(DispatchCommand::Write {
             cores: role.cores.clone(),
-            addr: TENSIX_L1_LAUNCH,
+            addr: TensixL1::LAUNCH as usize,
             data: launch_blob,
         });
         if !shared_blob.is_empty() {
@@ -166,14 +160,14 @@ pub(crate) fn execute_slow_dispatch(path: &Path, plan: &DispatchPlan) -> io::Res
                 let go_blob = [0u8, 0u8, 0u8, RUN_MSG_GO];
                 for (start, end) in mcast_rects(cores) {
                     win.target(start, Some(end), 0, NocOrdering::Strict)?;
-                    win.write(TENSIX_L1_GO_MSG, &go_blob)?;
+                    win.write(TensixL1::GO_MSG as usize, &go_blob)?;
                 }
 
                 for core in cores {
                     win.target(*core, None, 0, NocOrdering::Strict)?;
                     let deadline = Instant::now() + LAUNCH_TIMEOUT;
                     loop {
-                        if win.read(TENSIX_L1_GO_MSG + 3, 1)?[0] == RUN_MSG_DONE {
+                        if win.read(TensixL1::GO_MSG as usize + 3, 1)?[0] == RUN_MSG_DONE {
                             break;
                         }
                         if Instant::now() > deadline {
@@ -386,7 +380,7 @@ fn build_payload(
         shared[start..end].copy_from_slice(&kernel.xip);
     }
 
-    let shared_addr = TENSIX_L1_KERNEL_CONFIG_BASE
+    let shared_addr = TensixL1::KERNEL_CONFIG_BASE
         .checked_add(to_u32(local_cb_off, "shared payload address")?)
         .ok_or_else(|| io::Error::other("shared payload address overflow"))?;
     let launch_blob = serialize_launch(
@@ -420,7 +414,7 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
 
     let entries = (u32::BITS - mask.leading_zeros()) as usize;
     let mut blob = vec![0u8; entries * 16];
-    let mut next_addr = TENSIX_L1_DATA_BUFFER_SPACE_BASE;
+    let mut next_addr = TensixL1::DATA_BUFFER_SPACE_BASE;
     let mut shared_addrs = HashMap::<usize, u32>::new();
 
     for cb in &program.cbs {
@@ -471,7 +465,7 @@ fn serialize_launch(
 
     let mut out = Vec::with_capacity(96);
     for _ in 0..3 {
-        out.extend_from_slice(&TENSIX_L1_KERNEL_CONFIG_BASE.to_le_bytes());
+        out.extend_from_slice(&TensixL1::KERNEL_CONFIG_BASE.to_le_bytes());
     }
     for _ in 0..3 {
         out.extend_from_slice(&sem_off.to_le_bytes());
@@ -612,7 +606,7 @@ mod tests {
         let (mask, blob) = build_cb_blob(&program).expect("cb blob");
         assert_eq!(mask, (1 << 0) | (1 << 16) | (1 << 24));
         assert_eq!(blob.len(), 25 * 16);
-        assert_eq!(read_u32(&blob, 0), TENSIX_L1_DATA_BUFFER_SPACE_BASE);
+        assert_eq!(read_u32(&blob, 0), TensixL1::DATA_BUFFER_SPACE_BASE);
         assert_eq!(read_u32(&blob, 16 * 16), read_u32(&blob, 24 * 16));
     }
 
@@ -652,7 +646,7 @@ mod tests {
         .expect("payload");
 
         assert_eq!(launch.len(), 96);
-        assert_eq!(read_u32(&launch, 0), TENSIX_L1_KERNEL_CONFIG_BASE);
+        assert_eq!(read_u32(&launch, 0), TensixL1::KERNEL_CONFIG_BASE);
         assert_eq!(read_u16(&launch, 12), sem_off as u16);
         assert_eq!(read_u16(&launch, 18), 64);
         assert_eq!(read_u16(&launch, 20), 80);
@@ -667,7 +661,7 @@ mod tests {
         assert_eq!(launch[70], FAST_CQ_NUM_CIRCULAR_BUFFERS);
         assert_eq!(read_u32(&launch, 72), 7);
         assert_eq!(read_u32(&launch, 76), 0b1_1111);
-        assert_eq!(shared_addr, TENSIX_L1_KERNEL_CONFIG_BASE + 64);
+        assert_eq!(shared_addr, TensixL1::KERNEL_CONFIG_BASE + 64);
         assert_eq!(shared.len(), 176);
         assert_eq!(&shared[0..16], &build_cb_blob(&program).unwrap().1);
         assert_eq!(&shared[16..47], &writer.xip);

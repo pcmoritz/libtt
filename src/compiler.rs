@@ -1,5 +1,6 @@
 use crate::device::Device;
 use crate::dram::DType;
+use crate::hw::TensixL1;
 use crate::log::log;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -13,13 +14,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const PCIE_NOC_X: u8 = 19;
 const PCIE_NOC_Y: u8 = 24;
-
-struct TensixL1;
-
-impl TensixL1 {
-    const SIZE: u32 = 0x180000;
-    const KERNEL_CONFIG_BASE: u32 = 0x0086B0;
-}
 
 const INCLUDE_PATHS: &[&str] = &[
     "tt_metal/hw/inc",
@@ -50,11 +44,6 @@ const LFLAGS: &[&str] = &[
     "-Wl,-z,max-page-size=16",
     "-Wl,-z,common-page-size=16",
     "-nostartfiles",
-];
-
-const PROFILE_DEFINES: &[&str] = &[
-    "-DPROFILE_KERNEL=1",
-    "-DPROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC=65536",
 ];
 
 const PERF_COUNTER_DEFINES: &[&str] = &["-DPROFILE_PERF_COUNTERS=0x3f"];
@@ -486,7 +475,7 @@ impl Compiler {
         defines.push("-DNOC_MODE=0".to_owned());
         defines.extend(extra_defines.iter().cloned());
         if self.profile && profiler {
-            defines.extend(PROFILE_DEFINES.iter().map(|value| (*value).to_owned()));
+            append_profile_defines(&mut defines);
         }
         let extra_objs = if target == "brisc" {
             vec![
@@ -526,7 +515,7 @@ impl Compiler {
         defines.push(format!("-DUCK_CHLKC_{}", stage.to_uppercase()));
         defines.push(format!("-DNAMESPACE=chlkc_{stage}"));
         if self.profile {
-            defines.extend(PROFILE_DEFINES.iter().map(|value| (*value).to_owned()));
+            append_profile_defines(&mut defines);
         }
         self.build(
             src,
@@ -813,7 +802,7 @@ fn compile_firmware(
         dispatch_core,
     ));
     if profile {
-        common_defines.extend(PROFILE_DEFINES.iter().map(|value| (*value).to_owned()));
+        append_profile_defines(&mut common_defines);
     }
 
     let lib_dir = deps_root().join("lib").join("blackhole");
@@ -1373,6 +1362,14 @@ where
 
 fn profiler_enabled() -> bool {
     matches!(env::var("PROFILE").as_deref(), Ok("1"))
+}
+
+fn append_profile_defines(defines: &mut Vec<String>) {
+    defines.push("-DPROFILE_KERNEL=1".to_owned());
+    defines.push(format!(
+        "-DPROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC={}",
+        TensixL1::PROFILER_HOST_BUFFER_BYTES_PER_RISC
+    ));
 }
 
 fn repo_root() -> &'static Path {
