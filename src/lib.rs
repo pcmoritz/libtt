@@ -4199,11 +4199,12 @@ mod tests {
             0,
             3,
             PathBuf::from("/dev/tenstorrent/3"),
-            Some(ProbeInfo {
+            ProbeInfo {
                 tensix_enabled_col_mask: 0x0fff,
                 gddr_enabled_mask: 0x7f,
-            }),
-        );
+            },
+        )
+        .expect("device");
         let client = PJRT_Client::new_with_devices(vec![device]);
 
         let description = &client.device_descriptions[0];

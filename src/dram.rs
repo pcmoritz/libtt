@@ -64,7 +64,7 @@ pub struct Allocator {
 
 impl Allocator {
     pub fn open(local_hardware_id: usize) -> io::Result<Self> {
-        let (path, info) = load_device(local_hardware_id);
+        let (path, info) = load_device(local_hardware_id)?;
         Self::from_device_with_path(path, &info)
     }
 

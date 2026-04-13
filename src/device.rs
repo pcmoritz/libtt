@@ -170,12 +170,12 @@ pub struct Device {
     pub(crate) id: usize,
     pub(crate) local_hardware_id: usize,
     pub(crate) path: PathBuf,
-    pub(crate) board: Option<BoardKind>,
+    pub(crate) board: BoardKind,
     pub(crate) arch: String,
-    pub(crate) tensix_core_count: Option<usize>,
+    pub(crate) tensix_core_count: usize,
     pub(crate) all_worker_cores: Vec<CoreCoord>,
-    pub(crate) prefetch_core: Option<CoreCoord>,
-    pub(crate) dispatch_core: Option<CoreCoord>,
+    pub(crate) prefetch_core: CoreCoord,
+    pub(crate) dispatch_core: CoreCoord,
     pub(crate) harvested_dram_banks: Vec<usize>,
     pub(crate) active_dram_banks: usize,
     pub(crate) dram_tiles: Vec<DramTile>,
@@ -188,13 +188,13 @@ impl Device {
         discover_with(Path::new(DEFAULT_ROOT))
     }
 
-    pub(crate) fn from_path(id: usize, path: PathBuf) -> Self {
+    pub(crate) fn from_path(id: usize, path: PathBuf) -> io::Result<Self> {
         let local_hardware_id = local_hardware_id_from_path(&path).unwrap_or(id);
         Self::from_probe(
             id,
             local_hardware_id,
             path.clone(),
-            detect_probe_info(&path),
+            probe_info_for_device(&path)?,
         )
     }
 
@@ -202,81 +202,62 @@ impl Device {
         id: usize,
         local_hardware_id: usize,
         path: PathBuf,
-        probe: Option<ProbeInfo>,
-    ) -> Self {
+        probe: ProbeInfo,
+    ) -> io::Result<Self> {
+        let tensix_core_count = Arc::active_tensix_core_count(probe.tensix_enabled_col_mask);
+        let board = BoardKind::from_tensix_core_count(tensix_core_count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("unsupported tensix core count: {tensix_core_count}"),
+            )
+        })?;
+        let harvested_dram_banks = Dram::harvested_banks(probe.gddr_enabled_mask);
+        let dram_tiles = Dram::tiles(&harvested_dram_banks);
+        let config = board.config();
+
         let mut info = Self {
             id,
             local_hardware_id,
             path,
-            board: None,
-            arch: "unknown".to_owned(),
-            tensix_core_count: None,
-            all_worker_cores: Vec::new(),
-            prefetch_core: None,
-            dispatch_core: None,
-            harvested_dram_banks: Vec::new(),
-            active_dram_banks: 0,
-            dram_tiles: Vec::new(),
+            board,
+            arch: config.name.to_owned(),
+            tensix_core_count,
+            all_worker_cores: worker_cores(config.tensix_x),
+            prefetch_core: config.prefetch,
+            dispatch_core: config.dispatch,
+            harvested_dram_banks,
+            active_dram_banks: Dram::active_banks(probe.gddr_enabled_mask),
+            dram_tiles,
             allocator: None,
             compiler: None,
         };
 
-        if let Some(probe) = probe {
-            let tensix_core_count = Arc::active_tensix_core_count(probe.tensix_enabled_col_mask);
-            let board = BoardKind::from_tensix_core_count(tensix_core_count);
-            let harvested_dram_banks = Dram::harvested_banks(probe.gddr_enabled_mask);
-            let dram_tiles = Dram::tiles(&harvested_dram_banks);
-
-            info.arch = board
-                .map(|board| board.config().name.to_owned())
-                .unwrap_or_else(|| "unknown".to_owned());
-            info.board = board;
-            info.tensix_core_count = Some(tensix_core_count);
-            info.active_dram_banks = Dram::active_banks(probe.gddr_enabled_mask);
-            info.harvested_dram_banks = harvested_dram_banks;
-            info.dram_tiles = dram_tiles;
-
-            if let Some(board) = board {
-                let config = board.config();
-                info.all_worker_cores = worker_cores(config.tensix_x);
-                info.prefetch_core = Some(config.prefetch);
-                info.dispatch_core = Some(config.dispatch);
-            }
-        }
-
         info.initialize_compiler();
-        info
+        Ok(info)
     }
 
     pub(crate) fn cores(&self) -> Vec<CoreCoord> {
         self.all_worker_cores
             .iter()
             .copied()
-            .filter(|core| Some(*core) != self.prefetch_core && Some(*core) != self.dispatch_core)
+            .filter(|core| *core != self.prefetch_core && *core != self.dispatch_core)
             .collect()
     }
 
     pub(crate) fn device_kind(&self) -> String {
-        match self.board {
-            Some(board) => format!("Tenstorrent {}", board.config().name),
-            None => "Tenstorrent".to_owned(),
-        }
+        format!("Tenstorrent {}", self.board.config().name)
     }
 
     pub(crate) fn device_debug_string(&self) -> String {
         let mut parts = vec![format!("board={}", self.arch)];
-        if let Some(core_count) = self.tensix_core_count {
-            parts.push(format!("cores={core_count}"));
-        }
+        parts.push(format!("cores={}", self.tensix_core_count));
         if !self.all_worker_cores.is_empty() {
             parts.push(format!("workers={}", self.cores().len()));
         }
         if self.active_dram_banks > 0 {
             parts.push(format!("dram_banks={}", self.active_dram_banks));
         }
-        if let (Some(prefetch), Some(dispatch)) = (self.prefetch_core, self.dispatch_core) {
-            parts.push(format!("cq={prefetch}/{dispatch}"));
-        }
+        parts.push(format!("cq={}/{}", self.prefetch_core, self.dispatch_core));
         parts.push(format!("path={}", self.path.display()));
         format!("Tenstorrent device {} ({})", self.id, parts.join(", "))
     }
@@ -318,7 +299,7 @@ impl Device {
     }
 
     pub fn open(local_hardware_id: usize) -> io::Result<Self> {
-        Ok(load_device(local_hardware_id).1)
+        load_device(local_hardware_id).map(|(_, device)| device)
     }
 
     pub fn compiler(&self) -> Option<&Compiler> {
@@ -469,12 +450,7 @@ impl Device {
     }
 
     fn initialize_compiler(&mut self) {
-        if self.compiler.is_some()
-            || self.active_dram_banks == 0
-            || self.all_worker_cores.is_empty()
-            || self.prefetch_core.is_none()
-            || self.dispatch_core.is_none()
-        {
+        if self.compiler.is_some() || self.active_dram_banks == 0 || self.all_worker_cores.is_empty() {
             return;
         }
 
@@ -640,20 +616,10 @@ impl Device {
     }
 }
 
-pub(crate) fn load_device(local_hardware_id: usize) -> (PathBuf, Device) {
+pub(crate) fn load_device(local_hardware_id: usize) -> io::Result<(PathBuf, Device)> {
     let path = PathBuf::from(format!("/dev/tenstorrent/{local_hardware_id}"));
-    let info = Device::from_path(local_hardware_id, path.clone());
-    (path, info)
-}
-
-fn detect_probe_info(path: &Path) -> Option<ProbeInfo> {
-    match probe_info_for_device(path) {
-        Ok(probe) => Some(probe),
-        Err(err) => {
-            log(format!("linux probe path={} failed: {err}", path.display()));
-            None
-        }
-    }
+    let info = Device::from_path(local_hardware_id, path.clone())?;
+    Ok((path, info))
 }
 
 fn probe_info_for_device(path: &Path) -> io::Result<ProbeInfo> {
@@ -741,9 +707,15 @@ fn discover_with(root: &Path) -> Vec<Device> {
     paths
         .into_iter()
         .enumerate()
-        .map(|(id, path)| {
+        .filter_map(|(id, path)| {
             log(format!("device[{id}] node={}", path.display()));
-            Device::from_path(id, path)
+            match Device::from_path(id, path.clone()) {
+                Ok(device) => Some(device),
+                Err(err) => {
+                    log(format!("device[{id}] skipped path={} err={err}", path.display()));
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -848,16 +820,14 @@ mod tests {
     use std::mem::size_of;
 
     #[test]
-    fn builds_minimal_device_metadata_from_path() {
-        let device = Device::from_path(2, PathBuf::from("/dev/tenstorrent/7"));
-        assert_eq!(device.local_hardware_id, 7);
-        assert_eq!(device.arch, "unknown");
-        assert_eq!(device.board, None);
-        assert_eq!(device.tensix_core_count, None);
-        assert!(device.all_worker_cores.is_empty());
-        assert!(device.harvested_dram_banks.is_empty());
-        assert_eq!(device.active_dram_banks, 0);
-        assert!(device.dram_tiles.is_empty());
+    fn from_path_requires_successful_probe() {
+        match Device::from_path(2, PathBuf::from("/dev/tenstorrent/7")) {
+            Ok(_) => panic!("expected probe to fail"),
+            Err(err) => assert!(matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::Unsupported
+            )),
+        }
     }
 
     #[test]
@@ -866,19 +836,20 @@ mod tests {
             0,
             0,
             PathBuf::from("/dev/tenstorrent/0"),
-            Some(ProbeInfo {
+            ProbeInfo {
                 tensix_enabled_col_mask: 0x0fff,
                 gddr_enabled_mask: 0x7f,
-            }),
-        );
+            },
+        )
+        .expect("device");
 
-        assert_eq!(device.board, Some(BoardKind::P100));
+        assert_eq!(device.board, BoardKind::P100);
         assert_eq!(device.arch, "p100");
-        assert_eq!(device.tensix_core_count, Some(120));
+        assert_eq!(device.tensix_core_count, 120);
         assert_eq!(device.all_worker_cores.len(), 120);
         assert_eq!(device.cores().len(), 118);
-        assert_eq!(device.prefetch_core, Some(CoreCoord { x: 14, y: 2 }));
-        assert_eq!(device.dispatch_core, Some(CoreCoord { x: 14, y: 3 }));
+        assert_eq!(device.prefetch_core, CoreCoord { x: 14, y: 2 });
+        assert_eq!(device.dispatch_core, CoreCoord { x: 14, y: 3 });
         assert_eq!(device.harvested_dram_banks, vec![7]);
         assert_eq!(device.active_dram_banks, 7);
         assert_eq!(device.dram_tiles.len(), 21);
@@ -892,14 +863,15 @@ mod tests {
             1,
             1,
             PathBuf::from("/dev/tenstorrent/1"),
-            Some(ProbeInfo {
+            ProbeInfo {
                 tensix_enabled_col_mask: 0x3fff,
                 gddr_enabled_mask: 0xff,
-            }),
-        );
+            },
+        )
+        .expect("device");
 
-        assert_eq!(device.board, Some(BoardKind::P150));
-        assert_eq!(device.tensix_core_count, Some(140));
+        assert_eq!(device.board, BoardKind::P150);
+        assert_eq!(device.tensix_core_count, 140);
         assert_eq!(device.all_worker_cores.len(), 140);
         assert_eq!(device.cores().len(), 138);
         assert_eq!(device.active_dram_banks, 8);

@@ -261,18 +261,6 @@ impl Compiler {
     }
 
     pub fn for_device(device: &Device) -> io::Result<Self> {
-        let prefetch = device.prefetch_core.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("device {} is missing prefetch core metadata", device.id),
-            )
-        })?;
-        let dispatch = device.dispatch_core.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("device {} is missing dispatch core metadata", device.id),
-            )
-        })?;
         if device.active_dram_banks == 0 || device.all_worker_cores.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -285,8 +273,8 @@ impl Compiler {
         Self::new(
             device.active_dram_banks,
             device.all_worker_cores.len(),
-            (prefetch.x, prefetch.y),
-            (dispatch.x, dispatch.y),
+            (device.prefetch_core.x, device.prefetch_core.y),
+            (device.dispatch_core.x, device.dispatch_core.y),
         )
     }
 
