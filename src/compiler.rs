@@ -124,9 +124,6 @@ const FW_TARGETS: &[FwTarget] = &[
     },
 ];
 
-type ZoneMap = HashMap<u16, (String, String, u32)>;
-
-static ZONE_MAP: OnceLock<Mutex<ZoneMap>> = OnceLock::new();
 static FIRMWARE_CACHE: OnceLock<Mutex<HashMap<String, FirmwareCacheEntry>>> = OnceLock::new();
 static KERNEL_CACHE: OnceLock<Mutex<HashMap<String, KernelCacheEntry>>> = OnceLock::new();
 
@@ -162,13 +159,11 @@ impl CompiledFirmware {
 #[derive(Clone)]
 struct FirmwareCacheEntry {
     result: HashMap<String, CompiledFirmware>,
-    zones: ZoneMap,
 }
 
 #[derive(Clone)]
 struct KernelCacheEntry {
     result: CompiledKernel,
-    zones: ZoneMap,
 }
 
 #[derive(Clone, Copy)]
@@ -502,11 +497,9 @@ impl Compiler {
             .get(&key)
             .cloned()
         {
-            merge_zones(entry.zones);
             return Ok(entry.result);
         }
 
-        let zones_before = zone_snapshot();
         let mut mcpu = if trisc {
             vec![
                 "-mcpu=tt-bh-tensix".to_owned(),
@@ -606,7 +599,6 @@ impl Compiler {
             disassembly: self.disassemble_elf(&elf),
             elf_bytes: Some(elf),
         };
-        let new_zones = zones_added_since(&zones_before);
         kernel_cache()
             .lock()
             .expect("kernel cache poisoned")
@@ -614,7 +606,6 @@ impl Compiler {
                 key,
                 KernelCacheEntry {
                     result: result.clone(),
-                    zones: new_zones,
                 },
             );
         Ok(result)
@@ -633,7 +624,6 @@ impl Compiler {
                 out.display().to_string(),
             ],
             build,
-            false,
         )?;
         Ok(out)
     }
@@ -664,18 +654,6 @@ impl Compiler {
         }
         normalize_objdump_addresses(&String::from_utf8_lossy(&output.stdout))
     }
-}
-
-pub fn zone_map_snapshot() -> ZoneMap {
-    zone_snapshot()
-}
-
-pub fn hash16(input: &str) -> u16 {
-    let mut h = 0x811c_9dc5u32;
-    for byte in input.as_bytes() {
-        h = ((h ^ u32::from(*byte)).wrapping_mul(0x0100_0193)) & 0xffff_ffff;
-    }
-    ((h >> 16) ^ (h & 0xffff)) as u16
 }
 
 fn compile_firmware(
@@ -711,11 +689,9 @@ fn compile_firmware(
         .get(&key)
         .cloned()
     {
-        merge_zones(entry.zones);
         return Ok(entry.result);
     }
 
-    let zones_before = zone_snapshot();
     let mut common_defines = vec![
         "-DTENSIX_FIRMWARE".to_owned(),
         "-DFW_BUILD".to_owned(),
@@ -784,7 +760,6 @@ fn compile_firmware(
         );
     }
 
-    let new_zones = zones_added_since(&zones_before);
     firmware_cache()
         .lock()
         .expect("firmware cache poisoned")
@@ -792,7 +767,6 @@ fn compile_firmware(
             key,
             FirmwareCacheEntry {
                 result: result.clone(),
-                zones: new_zones,
             },
         );
     Ok(result)
@@ -1215,7 +1189,7 @@ pub fn pack_xip_elf(elf: &[u8], xip_relocate: bool) -> io::Result<(Vec<u8>, usiz
     Ok((out, text.data.len()))
 }
 
-fn run_command(exe: &Path, args: &[String], cwd: &Path, parse_profiler: bool) -> io::Result<()> {
+fn run_command(exe: &Path, args: &[String], cwd: &Path) -> io::Result<()> {
     log(format!(
         "compiler exec cwd={} cmd={}",
         cwd.display(),
@@ -1228,9 +1202,6 @@ fn run_command(exe: &Path, args: &[String], cwd: &Path, parse_profiler: bool) ->
             exe.file_name().and_then(OsStr::to_str).unwrap_or("command"),
             String::from_utf8_lossy(&output.stderr)
         )));
-    }
-    if parse_profiler {
-        parse_profiler_messages(&String::from_utf8_lossy(&output.stderr));
     }
     Ok(())
 }
@@ -1276,12 +1247,12 @@ where
         compile.push("-o".to_owned());
         compile.push("out.o".to_owned());
         compile.push(src.display().to_string());
-        run_command(cc, &compile, &build, true)?;
+        run_command(cc, &compile, &build)?;
 
         let mut link = link_args(&build);
         link.push("-o".to_owned());
         link.push("out.elf".to_owned());
-        run_command(cc, &link, &build, false)?;
+        run_command(cc, &link, &build)?;
         fs::read(build.join("out.elf"))
     })();
     let _ = fs::remove_dir_all(&build);
@@ -1323,45 +1294,6 @@ fn init_scratch(target: &str) -> u32 {
         "trisc1" => base + 0x5000,
         "trisc2" => base + 0x6000,
         _ => base,
-    }
-}
-
-fn parse_profiler_messages(stderr: &str) {
-    for line in stderr.lines() {
-        if !line.contains("KERNEL_PROFILER") || !line.contains("#pragma message:") {
-            continue;
-        }
-        let Some((_, raw)) = line.split_once("#pragma message:") else {
-            continue;
-        };
-        let raw = raw.trim();
-        let msg = raw
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            .or_else(|| {
-                raw.strip_prefix('\'')
-                    .and_then(|value| value.strip_suffix('\''))
-            })
-            .unwrap_or(raw)
-            .trim();
-        if !msg.ends_with("KERNEL_PROFILER") {
-            continue;
-        }
-        let parts = msg.rsplitn(4, ',').collect::<Vec<_>>();
-        if parts.len() != 4 || parts[0].trim() != "KERNEL_PROFILER" {
-            continue;
-        }
-        let Ok(line_number) = parts[1].trim().parse::<u32>() else {
-            continue;
-        };
-        zone_map().lock().expect("zone map poisoned").insert(
-            hash16(msg),
-            (
-                parts[3].trim().to_owned(),
-                parts[2].trim().to_owned(),
-                line_number,
-            ),
-        );
     }
 }
 
@@ -1557,10 +1489,6 @@ fn normalize_objdump_addresses(disassembly: &str) -> String {
     lines.join("\n")
 }
 
-fn zone_map() -> &'static Mutex<ZoneMap> {
-    ZONE_MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn firmware_cache() -> &'static Mutex<HashMap<String, FirmwareCacheEntry>> {
     FIRMWARE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -1569,36 +1497,10 @@ fn kernel_cache() -> &'static Mutex<HashMap<String, KernelCacheEntry>> {
     KERNEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn zone_snapshot() -> ZoneMap {
-    zone_map().lock().expect("zone map poisoned").clone()
-}
-
-fn zones_added_since(before: &ZoneMap) -> ZoneMap {
-    zone_map()
-        .lock()
-        .expect("zone map poisoned")
-        .iter()
-        .filter(|(key, _)| !before.contains_key(*key))
-        .map(|(key, value)| (*key, value.clone()))
-        .collect()
-}
-
-fn merge_zones(zones: ZoneMap) {
-    zone_map().lock().expect("zone map poisoned").extend(zones);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dispatch::CBConfig;
-
-    #[test]
-    fn hash16_matches_python_reference() {
-        assert_eq!(hash16(""), 7385);
-        assert_eq!(hash16("abc"), 62284);
-        assert_eq!(hash16("KERNEL_PROFILER"), 5094);
-        assert_eq!(hash16("reader,foo.cpp,42,KERNEL_PROFILER"), 49536);
-    }
 
     #[test]
     fn device_defines_match_blackhole_shapes() {
