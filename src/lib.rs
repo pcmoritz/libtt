@@ -1417,7 +1417,6 @@ unsafe extern "C" fn noop_device_attributes_deleter(
 unsafe extern "C" fn noop_serialized_device_assignment_deleter(
     _device_assignment: *mut PJRT_DeviceAssignmentSerialized,
 ) {
-    log("pjrt loaded_executable_get_device_assignment deleter entered");
 }
 
 fn event_with_error(code: PJRT_Error_Code, message: impl Into<String>) -> *mut PJRT_Event {
@@ -2002,7 +2001,6 @@ pub unsafe extern "C" fn TT_Client_Create(args: *mut PJRT_Client_Create_Args) ->
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_create entered");
     let client = Box::new(PJRT_Client::new());
     let client_ptr = Box::into_raw(client);
     args.client = client_ptr;
@@ -2031,7 +2029,6 @@ pub unsafe extern "C" fn TT_Client_PlatformName(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_platform_name entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2047,7 +2044,6 @@ pub unsafe extern "C" fn TT_Client_ProcessIndex(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_process_index entered");
     if args.client.is_null() {
         return invalid_argument("client must not be null");
     }
@@ -2062,7 +2058,6 @@ pub unsafe extern "C" fn TT_Client_PlatformVersion(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_platform_version entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2078,7 +2073,6 @@ pub unsafe extern "C" fn TT_Client_TopologyDescription(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_topology_description entered");
     let Ok(client) = (unsafe { checked_mut(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2091,7 +2085,6 @@ pub unsafe extern "C" fn TT_Client_Devices(args: *mut PJRT_Client_Devices_Args) 
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_devices entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2111,7 +2104,6 @@ pub unsafe extern "C" fn TT_Client_AddressableDevices(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_addressable_devices entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2131,7 +2123,6 @@ pub unsafe extern "C" fn TT_Client_LookupDevice(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_lookup_device entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2151,7 +2142,6 @@ pub unsafe extern "C" fn TT_Client_LookupAddressableDevice(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_lookup_addressable_device entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2174,7 +2164,6 @@ pub unsafe extern "C" fn TT_Client_AddressableMemories(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_addressable_memories entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2192,7 +2181,6 @@ pub unsafe extern "C" fn TT_Client_Compile(args: *mut PJRT_Client_Compile_Args) 
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_compile entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2226,7 +2214,6 @@ pub unsafe extern "C" fn TT_Compile(args: *mut PJRT_Compile_Args) -> *mut PJRT_E
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt compile entered");
     let Ok(program) = (unsafe { checked_ref(args.program, "program") }) else {
         return invalid_argument("program must not be null");
     };
@@ -2258,7 +2245,6 @@ pub unsafe extern "C" fn TT_Client_DefaultDeviceAssignment(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt client_default_device_assignment entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2315,7 +2301,6 @@ pub unsafe extern "C" fn TT_Executable_Destroy(
 pub unsafe extern "C" fn TT_Executable_Name(
     args: *mut PJRT_Executable_Name_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt executable_name entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2331,7 +2316,6 @@ pub unsafe extern "C" fn TT_Executable_Name(
 pub unsafe extern "C" fn TT_Executable_NumReplicas(
     args: *mut PJRT_Executable_NumReplicas_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt executable_num_replicas entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2339,7 +2323,6 @@ pub unsafe extern "C" fn TT_Executable_NumReplicas(
         return invalid_argument("executable must not be null");
     }
     args.num_replicas = 1;
-    log("pjrt executable_num_replicas returning 1");
     ptr::null_mut()
 }
 
@@ -2347,7 +2330,6 @@ pub unsafe extern "C" fn TT_Executable_NumReplicas(
 pub unsafe extern "C" fn TT_Executable_NumPartitions(
     args: *mut PJRT_Executable_NumPartitions_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt executable_num_partitions entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2355,7 +2337,6 @@ pub unsafe extern "C" fn TT_Executable_NumPartitions(
         return invalid_argument("executable must not be null");
     }
     args.num_partitions = 1;
-    log("pjrt executable_num_partitions returning 1");
     ptr::null_mut()
 }
 
@@ -2363,7 +2344,6 @@ pub unsafe extern "C" fn TT_Executable_NumPartitions(
 pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
     args: *mut PJRT_Executable_OptimizedProgram_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt executable_optimized_program entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2381,10 +2361,6 @@ pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
 
     if program.code.is_null() {
         program.code_size = mlir.len();
-        log(format!(
-            "pjrt executable_optimized_program size query returning {} bytes",
-            program.code_size
-        ));
         return ptr::null_mut();
     }
     if program.code_size < mlir.len() {
@@ -2395,10 +2371,6 @@ pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
         ptr::copy_nonoverlapping(mlir.as_ptr().cast::<c_char>(), program.code, mlir.len());
     }
     program.code_size = mlir.len();
-    log(format!(
-        "pjrt executable_optimized_program wrote {} bytes",
-        program.code_size
-    ));
     ptr::null_mut()
 }
 
@@ -2406,7 +2378,6 @@ pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
 pub unsafe extern "C" fn TT_Executable_Fingerprint(
     args: *mut PJRT_Executable_Fingerprint_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt executable_fingerprint entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2415,10 +2386,6 @@ pub unsafe extern "C" fn TT_Executable_Fingerprint(
     };
     args.executable_fingerprint = executable.fingerprint.as_ptr();
     args.executable_fingerprint_size = executable.fingerprint.as_bytes().len();
-    log(format!(
-        "pjrt executable_fingerprint returning {} bytes",
-        args.executable_fingerprint_size
-    ));
     ptr::null_mut()
 }
 
@@ -2426,7 +2393,6 @@ pub unsafe extern "C" fn TT_Executable_Fingerprint(
 pub unsafe extern "C" fn TT_Executable_GetCompiledMemoryStats(
     args: *mut PJRT_Executable_GetCompiledMemoryStats_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt executable_get_compiled_memory_stats entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2450,7 +2416,6 @@ pub unsafe extern "C" fn TT_Executable_GetCompiledMemoryStats(
 pub unsafe extern "C" fn TT_Executable_NumOutputs(
     args: *mut PJRT_Executable_NumOutputs_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt executable_num_outputs entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2458,10 +2423,6 @@ pub unsafe extern "C" fn TT_Executable_NumOutputs(
         return invalid_argument("executable must not be null");
     };
     args.num_outputs = executable.num_outputs;
-    log(format!(
-        "pjrt executable_num_outputs returning {}",
-        args.num_outputs
-    ));
     ptr::null_mut()
 }
 
@@ -2469,7 +2430,6 @@ pub unsafe extern "C" fn TT_Executable_NumOutputs(
 pub unsafe extern "C" fn TT_Executable_OutputElementTypes(
     args: *mut PJRT_Executable_OutputElementTypes_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt executable_output_element_types entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2478,10 +2438,6 @@ pub unsafe extern "C" fn TT_Executable_OutputElementTypes(
     };
     args.output_types = executable.output_types.as_ptr();
     args.num_output_types = executable.output_types.len();
-    log(format!(
-        "pjrt executable_output_element_types returning {}",
-        args.num_output_types
-    ));
     ptr::null_mut()
 }
 
@@ -2489,7 +2445,6 @@ pub unsafe extern "C" fn TT_Executable_OutputElementTypes(
 pub unsafe extern "C" fn TT_Executable_OutputDimensions(
     args: *mut PJRT_Executable_OutputDimensions_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt executable_output_dimensions entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2499,10 +2454,6 @@ pub unsafe extern "C" fn TT_Executable_OutputDimensions(
     args.dims = executable.output_dims.as_ptr();
     args.dim_sizes = executable.output_dim_sizes.as_ptr();
     args.num_outputs = executable.output_dim_sizes.len();
-    log(format!(
-        "pjrt executable_output_dimensions returning {}",
-        args.num_outputs
-    ));
     ptr::null_mut()
 }
 
@@ -2510,7 +2461,6 @@ pub unsafe extern "C" fn TT_Executable_OutputDimensions(
 pub unsafe extern "C" fn TT_Executable_OutputMemoryKinds(
     args: *mut PJRT_Executable_OutputMemoryKinds_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt executable_output_memory_kinds entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2520,10 +2470,6 @@ pub unsafe extern "C" fn TT_Executable_OutputMemoryKinds(
     args.memory_kinds = executable.output_memory_kind_ptrs.as_ptr();
     args.memory_kind_sizes = executable.output_memory_kind_sizes.as_ptr();
     args.num_outputs = executable.output_memory_kind_ptrs.len();
-    log(format!(
-        "pjrt executable_output_memory_kinds returning {}",
-        args.num_outputs
-    ));
     ptr::null_mut()
 }
 
@@ -2658,7 +2604,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Destroy(
 pub unsafe extern "C" fn TT_LoadedExecutable_GetExecutable(
     args: *mut PJRT_LoadedExecutable_GetExecutable_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt loaded_executable_get_executable entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2676,7 +2621,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_GetDeviceAssignment(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt loaded_executable_get_device_assignment entered");
     if args.executable.is_null() {
         return invalid_argument("executable must not be null");
     }
@@ -2684,7 +2628,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_GetDeviceAssignment(
     args.serialized_bytes_size = 0;
     args.serialized_device_assignment = ptr::null_mut();
     args.serialized_device_assignment_deleter = Some(noop_serialized_device_assignment_deleter);
-    log("pjrt loaded_executable_get_device_assignment returning portable executable");
     ptr::null_mut()
 }
 
@@ -2739,7 +2682,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_IsDeleted(
 pub unsafe extern "C" fn TT_LoadedExecutable_Fingerprint(
     args: *mut PJRT_LoadedExecutable_Fingerprint_Args,
 ) -> *mut PJRT_Error {
-    log("pjrt loaded_executable_fingerprint entered");
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -2748,10 +2690,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Fingerprint(
     };
     args.executable_fingerprint = executable.fingerprint.as_ptr();
     args.executable_fingerprint_size = executable.fingerprint.as_bytes().len();
-    log(format!(
-        "pjrt loaded_executable_fingerprint returning {} bytes",
-        args.executable_fingerprint_size
-    ));
     ptr::null_mut()
 }
 
@@ -2847,10 +2785,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
                     Ok(buffer) => buffer,
                     Err(err) => return io_error(err),
                 };
-                log(format!(
-                    "pjrt loaded_executable_execute kernel complete out_addr=0x{:x} tiles={}",
-                    output.addr, output.num_tiles
-                ));
                 match device.dram_read(&output) {
                     Ok(data) => data,
                     Err(err) => return io_error(err),
@@ -2876,13 +2810,11 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     unsafe {
         *device_outputs.add(0) = output_ptr;
     }
-    log("pjrt loaded_executable_execute output published");
     if !args.device_complete_events.is_null() {
         unsafe {
             *args.device_complete_events.add(0) = ready_event();
         }
     }
-    log("pjrt loaded_executable_execute returning success");
     ptr::null_mut()
 }
 
@@ -2893,7 +2825,6 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt buffer_from_host_buffer entered");
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
@@ -2981,15 +2912,10 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         Ok(device) => device,
         Err(err) => return io_error(err),
     };
-    log("pjrt buffer_from_host_buffer device opened");
     let dram_buffer = match device.alloc_write(data, dtype, &shape, "pjrt") {
         Ok(buffer) => buffer,
         Err(err) => return io_error(err),
     };
-    log(format!(
-        "pjrt buffer_from_host_buffer allocated addr=0x{:x} tiles={}",
-        dram_buffer.addr, dram_buffer.num_tiles
-    ));
 
     args.done_with_host_buffer = ready_event();
     args.buffer = Box::into_raw(Box::new(PJRT_Buffer {
@@ -3012,7 +2938,6 @@ pub unsafe extern "C" fn TT_DeviceDescription_Id(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_description_id entered");
     let Ok(description) = (unsafe { checked_ref(args.device_description, "device_description") })
     else {
         return invalid_argument("device_description must not be null");
@@ -3028,7 +2953,6 @@ pub unsafe extern "C" fn TT_DeviceDescription_ProcessIndex(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_description_process_index entered");
     let Ok(description) = (unsafe { checked_ref(args.device_description, "device_description") })
     else {
         return invalid_argument("device_description must not be null");
@@ -3044,7 +2968,6 @@ pub unsafe extern "C" fn TT_DeviceDescription_Attributes(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_description_attributes entered");
     if args.device_description.is_null() {
         return invalid_argument("device_description must not be null");
     }
@@ -3060,7 +2983,6 @@ pub unsafe extern "C" fn TT_DeviceDescription_Kind(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_description_kind entered");
     let Ok(description) = (unsafe { checked_ref(args.device_description, "device_description") })
     else {
         return invalid_argument("device_description must not be null");
@@ -3077,7 +2999,6 @@ pub unsafe extern "C" fn TT_DeviceDescription_DebugString(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_description_debug_string entered");
     let Ok(description) = (unsafe { checked_ref(args.device_description, "device_description") })
     else {
         return invalid_argument("device_description must not be null");
@@ -3094,7 +3015,6 @@ pub unsafe extern "C" fn TT_DeviceDescription_ToString(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_description_to_string entered");
     let Ok(description) = (unsafe { checked_ref(args.device_description, "device_description") })
     else {
         return invalid_argument("device_description must not be null");
@@ -3111,7 +3031,6 @@ pub unsafe extern "C" fn TT_Device_GetDescription(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_get_description entered");
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
@@ -3126,7 +3045,6 @@ pub unsafe extern "C" fn TT_Device_IsAddressable(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_is_addressable entered");
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
@@ -3141,7 +3059,6 @@ pub unsafe extern "C" fn TT_Device_LocalHardwareId(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_local_hardware_id entered");
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
@@ -3156,7 +3073,6 @@ pub unsafe extern "C" fn TT_Device_AddressableMemories(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_addressable_memories entered");
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
@@ -3176,7 +3092,6 @@ pub unsafe extern "C" fn TT_Device_DefaultMemory(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_default_memory entered");
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
@@ -3191,7 +3106,6 @@ pub unsafe extern "C" fn TT_Device_MemoryStats(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_memory_stats entered");
     if args.device.is_null() {
         return invalid_argument("device must not be null");
     }
@@ -3226,7 +3140,6 @@ pub unsafe extern "C" fn TT_Device_GetAttributes(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt device_get_attributes entered");
     if args.device.is_null() {
         return invalid_argument("device must not be null");
     }
@@ -3254,7 +3167,6 @@ pub unsafe extern "C" fn TT_Memory_Kind(args: *mut PJRT_Memory_Kind_Args) -> *mu
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt memory_kind entered");
     let Ok(memory) = (unsafe { checked_ref(args.memory, "memory") }) else {
         return invalid_argument("memory must not be null");
     };
@@ -3270,7 +3182,6 @@ pub unsafe extern "C" fn TT_Memory_Kind_Id(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt memory_kind_id entered");
     let Ok(memory) = (unsafe { checked_ref(args.memory, "memory") }) else {
         return invalid_argument("memory must not be null");
     };
@@ -3315,7 +3226,6 @@ pub unsafe extern "C" fn TT_Memory_AddressableByDevices(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt memory_addressable_by_devices entered");
     let Ok(memory) = (unsafe { checked_ref(args.memory, "memory") }) else {
         return invalid_argument("memory must not be null");
     };
@@ -3487,7 +3397,6 @@ pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt buffer_to_host_buffer entered");
     let Ok(buffer) = (unsafe { checked_ref(args.src, "src") }) else {
         return invalid_argument("src must not be null");
     };
@@ -3581,7 +3490,6 @@ pub unsafe extern "C" fn TT_ExecuteContext_Create(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt execute_context_create entered");
     args.context = Box::into_raw(Box::new(PJRT_ExecuteContext { _private: [] }));
     ptr::null_mut()
 }
@@ -3593,7 +3501,6 @@ pub unsafe extern "C" fn TT_ExecuteContext_Destroy(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt execute_context_destroy entered");
     if !args.context.is_null() {
         unsafe {
             drop(Box::from_raw(args.context));
@@ -3610,7 +3517,6 @@ pub unsafe extern "C" fn TT_Buffer_CopyRawToHost(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt buffer_copy_raw_to_host entered");
     let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
         return invalid_argument("buffer must not be null");
     };
@@ -3687,7 +3593,6 @@ pub unsafe extern "C" fn TT_TopologyDescription_PlatformName(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt topology_description_platform_name entered");
     let Ok(topology) = (unsafe { checked_ref(args.topology, "topology") }) else {
         return invalid_argument("topology must not be null");
     };
@@ -3703,7 +3608,6 @@ pub unsafe extern "C" fn TT_TopologyDescription_PlatformVersion(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt topology_description_platform_version entered");
     let Ok(topology) = (unsafe { checked_ref(args.topology, "topology") }) else {
         return invalid_argument("topology must not be null");
     };
@@ -3719,7 +3623,6 @@ pub unsafe extern "C" fn TT_TopologyDescription_GetDeviceDescriptions(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt topology_description_get_device_descriptions entered");
     let Ok(topology) = (unsafe { checked_ref(args.topology, "topology") }) else {
         return invalid_argument("topology must not be null");
     };
@@ -3739,7 +3642,6 @@ pub unsafe extern "C" fn TT_TopologyDescription_Attributes(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt topology_description_attributes entered");
     if args.topology.is_null() {
         return invalid_argument("topology must not be null");
     }
@@ -3755,7 +3657,6 @@ pub unsafe extern "C" fn TT_TopologyDescription_Fingerprint(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    log("pjrt topology_description_fingerprint entered");
     let Ok(topology) = (unsafe { checked_ref(args.topology, "topology") }) else {
         return invalid_argument("topology must not be null");
     };
