@@ -504,6 +504,8 @@ fn to_u32(value: usize, label: &str) -> io::Result<u32> {
     })
 }
 
+// Packs a set of cores into non-overlapping axis-aligned rectangles so multicast
+// writes can target each rectangle with a single TLB configuration.
 pub(crate) fn mcast_rects(cores: &[CoreCoord]) -> Vec<(CoreCoord, CoreCoord)> {
     if cores.is_empty() {
         return Vec::new();
