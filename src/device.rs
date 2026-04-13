@@ -334,8 +334,19 @@ impl Device {
             .as_ref()
             .ok_or_else(|| io::Error::other("compiler has not been initialized"))?;
         let worker_cores = self.cores();
+        log(format!(
+            "device run_program start name={} cores={}",
+            program.name,
+            worker_cores.len()
+        ));
         let plan = build_dispatch_plan(compiler, &worker_cores, program)?;
+        log(format!(
+            "device run_program dispatch_ready name={} launches={}",
+            program.name,
+            plan.cores.len()
+        ));
         execute_slow_dispatch(self.path.as_path(), &plan)?;
+        log(format!("device run_program done name={}", program.name));
         Ok(())
     }
 
@@ -435,7 +446,11 @@ impl Device {
             compute_args: vec![tile_count],
             ..Program::default()
         };
+        log(format!(
+            "device eltwise_add_bf16 dispatch lhs=0x{lhs_addr:x} rhs=0x{rhs_addr:x} out=0x{output_addr:x} tiles={tile_count}"
+        ));
         self.run_program(&program)?;
+        log("device eltwise_add_bf16 dispatch complete");
         Ok(output)
     }
 

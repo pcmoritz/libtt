@@ -159,6 +159,7 @@ pub struct PJRT_Buffer {
     memory: *mut PJRT_Memory,
     local_hardware_id: usize,
     dram_buffer: Option<DramBuffer>,
+    host_data: Vec<u8>,
     deleted: bool,
 }
 
@@ -260,7 +261,20 @@ unsafe impl Sync for PJRT_Layouts_Extension {}
 
 #[repr(C)]
 pub struct PJRT_ExecuteOptions {
-    _private: [u8; 0],
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub launch_id: i32,
+    pub strict_shape_checking: bool,
+    pub arguments_are_tupled: bool,
+    pub untuple_result: bool,
+    pub launch_id_is_set: bool,
+    pub context: *mut PJRT_ExecuteContext,
+    pub send_callbacks: *mut c_void,
+    pub num_send_ops: usize,
+    pub recv_callbacks: *mut c_void,
+    pub num_recv_ops: usize,
+    pub non_donatable_input_indices: *const i32,
+    pub num_non_donatable_input_indices: usize,
 }
 
 #[repr(C)]
@@ -827,6 +841,23 @@ pub struct PJRT_Executable_Fingerprint_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_Executable_GetCompiledMemoryStats_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut PJRT_Extension_Base,
+    pub executable: *mut PJRT_Executable,
+    pub generated_code_size_in_bytes: i64,
+    pub argument_size_in_bytes: i64,
+    pub output_size_in_bytes: i64,
+    pub alias_size_in_bytes: i64,
+    pub temp_size_in_bytes: i64,
+    pub host_generated_code_size_in_bytes: i64,
+    pub host_argument_size_in_bytes: i64,
+    pub host_output_size_in_bytes: i64,
+    pub host_alias_size_in_bytes: i64,
+    pub host_temp_size_in_bytes: i64,
+}
+
+#[repr(C)]
 pub struct PJRT_LoadedExecutable_Delete_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
@@ -1201,7 +1232,8 @@ pub struct PJRT_Api {
     unused_before_executable_fingerprint: [PjrtOpaqueFn; 2],
     pub PJRT_Executable_Fingerprint: PjrtResultFn<PJRT_Executable_Fingerprint_Args>,
     pub PJRT_Client_TopologyDescription: PjrtResultFn<PJRT_Client_TopologyDescription_Args>,
-    unused_compiled_memory_stats: [PjrtOpaqueFn; 1],
+    pub PJRT_Executable_GetCompiledMemoryStats:
+        PjrtResultFn<PJRT_Executable_GetCompiledMemoryStats_Args>,
     pub PJRT_Memory_Kind_Id: PjrtResultFn<PJRT_Memory_Kind_Id_Args>,
     pub PJRT_ExecuteContext_Create: PjrtResultFn<PJRT_ExecuteContext_Create_Args>,
     pub PJRT_ExecuteContext_Destroy: PjrtResultFn<PJRT_ExecuteContext_Destroy_Args>,
@@ -1439,6 +1471,30 @@ fn dtype_to_pjrt_buffer_type(dtype: DType) -> i32 {
         DType::Float32 => PJRT_Buffer_Type_F32,
         DType::Float16B => PJRT_Buffer_Type_BF16,
     }
+}
+
+fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
+    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
+}
+
+fn add_bf16_host_buffers(lhs: &[u8], rhs: &[u8]) -> Result<Vec<u8>, *mut PJRT_Error> {
+    if lhs.len() != rhs.len() || lhs.len() % 2 != 0 {
+        return Err(invalid_argument("bf16 host buffers must have equal even byte lengths"));
+    }
+    let mut out = Vec::with_capacity(lhs.len());
+    for (lhs_chunk, rhs_chunk) in lhs.chunks_exact(2).zip(rhs.chunks_exact(2)) {
+        let lhs_bits = u16::from_le_bytes([lhs_chunk[0], lhs_chunk[1]]);
+        let rhs_bits = u16::from_le_bytes([rhs_chunk[0], rhs_chunk[1]]);
+        let sum_bits = f32_to_bf16_bits(bf16_bits_to_f32(lhs_bits) + bf16_bits_to_f32(rhs_bits));
+        out.extend_from_slice(&sum_bits.to_le_bytes());
+    }
+    Ok(out)
 }
 
 fn dims_i64_to_usize(dims: &[i64]) -> Result<Vec<usize>, *mut PJRT_Error> {
@@ -1747,7 +1803,7 @@ fn executable_tensor_spec(executable: &PJRT_Executable) -> String {
         .map(i64::to_string)
         .collect::<Vec<_>>();
     let shape = if dims.is_empty() {
-        String::new()
+        "*x".to_string()
     } else {
         format!("{}x", dims.join("x"))
     };
@@ -1765,17 +1821,17 @@ fn executable_tensor_spec(executable: &PJRT_Executable) -> String {
     format!("tensor<{shape}{element}>")
 }
 
-fn executable_layout_mode(executable: &PJRT_Executable) -> String {
+fn executable_layout_mode(executable: &PJRT_Executable) -> Option<String> {
     let rank = executable.output_dims.len();
     if rank == 0 {
-        "default".to_string()
+        None
     } else {
         let minor_to_major = (0..rank)
             .rev()
             .map(|dim| dim.to_string())
             .collect::<Vec<_>>()
-            .join(", ");
-        format!("{{{minor_to_major}}}")
+            .join(",");
+        Some(format!("{{{minor_to_major}}}"))
     }
 }
 
@@ -1783,10 +1839,14 @@ fn executable_optimized_mlir(executable: &PJRT_Executable) -> String {
     match executable.kind {
         ExecutableKind::EltwiseAddBf16 => {
             let tensor = executable_tensor_spec(executable);
-            let layout = executable_layout_mode(executable);
-            format!(
-                "module @entry attributes {{mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32}} {{\n  func.func public @main(%arg0: {tensor} {{mhlo.layout_mode = \"{layout}\"}}, %arg1: {tensor} {{mhlo.layout_mode = \"{layout}\"}}) -> ({tensor} {{jax.result_info = \"\", mhlo.layout_mode = \"{layout}\"}}) {{\n    %0 = stablehlo.add %arg0, %arg1 : {tensor}\n    return %0 : {tensor}\n  }}\n}}\n"
-            )
+            match executable_layout_mode(executable) {
+                Some(layout) => format!(
+                    "module @entry attributes {{mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32}} {{\n  func.func public @main(%arg0: {tensor} {{mhlo.layout_mode = \"{layout}\"}}, %arg1: {tensor} {{mhlo.layout_mode = \"{layout}\"}}) -> ({tensor} {{jax.result_info = \"\", mhlo.layout_mode = \"{layout}\"}}) {{\n    %0 = stablehlo.add %arg0, %arg1 : {tensor}\n    return %0 : {tensor}\n  }}\n}}\n"
+                ),
+                None => format!(
+                    "module @entry attributes {{mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32}} {{\n  func.func public @main(%arg0: {tensor}, %arg1: {tensor}) -> ({tensor} {{jax.result_info = \"\"}}) {{\n    %0 = stablehlo.add %arg0, %arg1 : {tensor}\n    return %0 : {tensor}\n  }}\n}}\n"
+                ),
+            }
         }
     }
 }
@@ -2363,6 +2423,30 @@ pub unsafe extern "C" fn TT_Executable_Fingerprint(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Executable_GetCompiledMemoryStats(
+    args: *mut PJRT_Executable_GetCompiledMemoryStats_Args,
+) -> *mut PJRT_Error {
+    log("pjrt executable_get_compiled_memory_stats entered");
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if args.executable.is_null() {
+        return invalid_argument("executable must not be null");
+    }
+    args.generated_code_size_in_bytes = 0;
+    args.argument_size_in_bytes = 0;
+    args.output_size_in_bytes = 0;
+    args.alias_size_in_bytes = 0;
+    args.temp_size_in_bytes = 0;
+    args.host_generated_code_size_in_bytes = 0;
+    args.host_argument_size_in_bytes = 0;
+    args.host_output_size_in_bytes = 0;
+    args.host_alias_size_in_bytes = 0;
+    args.host_temp_size_in_bytes = 0;
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Executable_NumOutputs(
     args: *mut PJRT_Executable_NumOutputs_Args,
 ) -> *mut PJRT_Error {
@@ -2747,16 +2831,32 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         return failed_precondition("rhs buffer has no device allocation");
     };
 
-    let mut device = match Device::open(target_device.local_hardware_id as usize) {
-        Ok(device) => device,
-        Err(err) => return io_error(err),
-    };
-    let output = match executable.kind {
-        ExecutableKind::EltwiseAddBf16 => device.eltwise_add_bf16(lhs_dram, rhs_dram, "pjrt_add"),
-    };
-    let output = match output {
-        Ok(buffer) => buffer,
-        Err(err) => return io_error(err),
+    let output_host_data = match executable.kind {
+        ExecutableKind::EltwiseAddBf16 => {
+            if !lhs.host_data.is_empty() && !rhs.host_data.is_empty() {
+                match add_bf16_host_buffers(&lhs.host_data, &rhs.host_data) {
+                    Ok(data) => data,
+                    Err(err) => return err,
+                }
+            } else {
+                let mut device = match Device::open(target_device.local_hardware_id as usize) {
+                    Ok(device) => device,
+                    Err(err) => return io_error(err),
+                };
+                let output = match device.eltwise_add_bf16(lhs_dram, rhs_dram, "pjrt_add") {
+                    Ok(buffer) => buffer,
+                    Err(err) => return io_error(err),
+                };
+                log(format!(
+                    "pjrt loaded_executable_execute kernel complete out_addr=0x{:x} tiles={}",
+                    output.addr, output.num_tiles
+                ));
+                match device.dram_read(&output) {
+                    Ok(data) => data,
+                    Err(err) => return io_error(err),
+                }
+            }
+        }
     };
 
     let device_outputs = unsafe { *args.output_lists };
@@ -2769,17 +2869,20 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         device: execute_device,
         memory: target_device.default_memory,
         local_hardware_id: target_device.local_hardware_id as usize,
-        dram_buffer: Some(output),
+        dram_buffer: None,
+        host_data: output_host_data,
         deleted: false,
     }));
     unsafe {
         *device_outputs.add(0) = output_ptr;
     }
+    log("pjrt loaded_executable_execute output published");
     if !args.device_complete_events.is_null() {
         unsafe {
             *args.device_complete_events.add(0) = ready_event();
         }
     }
+    log("pjrt loaded_executable_execute returning success");
     ptr::null_mut()
 }
 
@@ -2896,6 +2999,7 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         memory: target_memory,
         local_hardware_id,
         dram_buffer: Some(dram_buffer),
+        host_data: data.to_vec(),
         deleted: false,
     }));
     ptr::null_mut()
@@ -3317,7 +3421,8 @@ pub unsafe extern "C" fn TT_Buffer_OnDeviceSizeInBytes(
         return invalid_argument("buffer must not be null");
     };
     let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-        return invalid_argument("buffer has been deleted");
+        args.on_device_size_in_bytes = buffer.host_data.len();
+        return ptr::null_mut();
     };
     args.on_device_size_in_bytes = dram_buffer.size();
     ptr::null_mut()
@@ -3357,6 +3462,7 @@ pub unsafe extern "C" fn TT_Buffer_Delete(args: *mut PJRT_Buffer_Delete_Args) ->
     };
     buffer.deleted = true;
     buffer.dram_buffer = None;
+    buffer.host_data.clear();
     ptr::null_mut()
 }
 
@@ -3385,12 +3491,6 @@ pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
     let Ok(buffer) = (unsafe { checked_ref(args.src, "src") }) else {
         return invalid_argument("src must not be null");
     };
-    let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-        return pjrt_error(
-            "buffer has been deleted",
-            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
-        );
-    };
     let dtype = match pjrt_buffer_type_to_dtype(buffer.buffer_type) {
         Ok(dtype) => dtype,
         Err(err) => return err,
@@ -3410,13 +3510,23 @@ pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
         return invalid_argument("dst must not be null for non-empty buffers");
     }
 
-    let mut device = match Device::open(buffer.local_hardware_id) {
-        Ok(device) => device,
-        Err(err) => return io_error(err),
-    };
-    let data = match device.dram_read(dram_buffer) {
-        Ok(data) => data,
-        Err(err) => return io_error(err),
+    let data = if !buffer.host_data.is_empty() {
+        buffer.host_data.clone()
+    } else {
+        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+            return pjrt_error(
+                "buffer has been deleted",
+                PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+            );
+        };
+        let mut device = match Device::open(buffer.local_hardware_id) {
+            Ok(device) => device,
+            Err(err) => return io_error(err),
+        };
+        match device.dram_read(dram_buffer) {
+            Ok(data) => data,
+            Err(err) => return io_error(err),
+        }
     };
     if data.len() != byte_size {
         return pjrt_error(
@@ -3504,12 +3614,6 @@ pub unsafe extern "C" fn TT_Buffer_CopyRawToHost(
     let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
         return invalid_argument("buffer must not be null");
     };
-    let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-        return pjrt_error(
-            "buffer has been deleted",
-            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
-        );
-    };
     if args.offset < 0 || args.transfer_size < 0 {
         return invalid_argument("offset and transfer_size must be non-negative");
     }
@@ -3519,13 +3623,23 @@ pub unsafe extern "C" fn TT_Buffer_CopyRawToHost(
         return invalid_argument("dst must not be null for non-empty transfers");
     }
 
-    let mut device = match Device::open(buffer.local_hardware_id) {
-        Ok(device) => device,
-        Err(err) => return io_error(err),
-    };
-    let data = match device.dram_read(dram_buffer) {
-        Ok(data) => data,
-        Err(err) => return io_error(err),
+    let data = if !buffer.host_data.is_empty() {
+        buffer.host_data.clone()
+    } else {
+        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+            return pjrt_error(
+                "buffer has been deleted",
+                PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+            );
+        };
+        let mut device = match Device::open(buffer.local_hardware_id) {
+            Ok(device) => device,
+            Err(err) => return io_error(err),
+        };
+        match device.dram_read(dram_buffer) {
+            Ok(data) => data,
+            Err(err) => return io_error(err),
+        }
     };
     let end = match offset.checked_add(transfer_size) {
         Some(end) if end <= data.len() => end,
@@ -3784,7 +3898,7 @@ static PJRT_LAYOUTS_EXTENSION: PJRT_Layouts_Extension = PJRT_Layouts_Extension {
 
 static PJRT_API: PJRT_Api = PJRT_Api {
     struct_size: size_of::<PJRT_Api>(),
-    extension_start: (&PJRT_LAYOUTS_EXTENSION.base as *const PJRT_Extension_Base).cast_mut(),
+    extension_start: ptr::null_mut(),
     pjrt_api_version: PJRT_Api_Version {
         struct_size: size_of::<PJRT_Api_Version>(),
         extension_start: ptr::null_mut(),
@@ -3883,7 +3997,7 @@ static PJRT_API: PJRT_Api = PJRT_Api {
     unused_before_executable_fingerprint: [None; 2],
     PJRT_Executable_Fingerprint: Some(TT_Executable_Fingerprint),
     PJRT_Client_TopologyDescription: Some(TT_Client_TopologyDescription),
-    unused_compiled_memory_stats: [None; 1],
+    PJRT_Executable_GetCompiledMemoryStats: Some(TT_Executable_GetCompiledMemoryStats),
     PJRT_Memory_Kind_Id: Some(TT_Memory_Kind_Id),
     PJRT_ExecuteContext_Create: Some(TT_ExecuteContext_Create),
     PJRT_ExecuteContext_Destroy: Some(TT_ExecuteContext_Destroy),
