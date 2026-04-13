@@ -28,12 +28,6 @@ pub(crate) enum DispatchCommand {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DispatchPlan {
-    pub(crate) commands: Vec<DispatchCommand>,
-    pub(crate) cores: Vec<CoreCoord>,
-}
-
-#[derive(Clone)]
 struct Role {
     cores: Vec<CoreCoord>,
     reader: Option<CompiledKernel>,
@@ -44,7 +38,7 @@ pub(crate) fn build_dispatch_plan(
     compiler: &Compiler,
     available_cores: &[CoreCoord],
     program: &Program,
-) -> io::Result<DispatchPlan> {
+) -> io::Result<Vec<DispatchCommand>> {
     let writer = if program.writer_kernel.is_empty() {
         None
     } else {
@@ -133,22 +127,13 @@ pub(crate) fn build_dispatch_plan(
         cores: all_cores.clone(),
     });
 
-    Ok(DispatchPlan {
-        commands,
-        cores: all_cores,
-    })
+    Ok(commands)
 }
 
-pub(crate) fn execute_slow_dispatch(path: &Path, plan: &DispatchPlan) -> io::Result<()> {
-    let first = *plan.cores.first().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cannot execute an empty dispatch plan",
-        )
-    })?;
-    let mut win = TlbWindow::open(path, first, 0, Arc::TLB_SIZE_2M, false)?;
+pub(crate) fn execute_slow_dispatch(path: &Path, commands: &[DispatchCommand]) -> io::Result<()> {
+    let mut win = TlbWindow::open(path, Arc::TLB_SIZE_2M, false)?;
 
-    for command in &plan.commands {
+    for command in commands {
         match command {
             DispatchCommand::Write { cores, addr, data } => {
                 for (start, end) in mcast_rects(cores) {

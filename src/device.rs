@@ -330,8 +330,8 @@ impl Device {
             .as_ref()
             .ok_or_else(|| io::Error::other("compiler has not been initialized"))?;
         let worker_cores = self.cores();
-        let plan = build_dispatch_plan(compiler, &worker_cores, program)?;
-        execute_slow_dispatch(self.path.as_path(), &plan)?;
+        let commands = build_dispatch_plan(compiler, &worker_cores, program)?;
+        execute_slow_dispatch(self.path.as_path(), &commands)?;
         Ok(())
     }
 
@@ -547,14 +547,8 @@ impl Device {
         let bank_table = build_bank_noc_table(&self.harvested_dram_banks, &all_cores)?;
         let rects = mcast_rects(&all_cores);
 
-        let mut uc = TlbWindow::open(
-            self.path.as_path(),
-            all_cores[0],
-            0,
-            Arc::TLB_SIZE_2M,
-            false,
-        )?;
-        let mut wc = TlbWindow::open(self.path.as_path(), all_cores[0], 0, Arc::TLB_SIZE_2M, true)?;
+        let mut uc = TlbWindow::open(self.path.as_path(), Arc::TLB_SIZE_2M, false)?;
+        let mut wc = TlbWindow::open(self.path.as_path(), Arc::TLB_SIZE_2M, true)?;
 
         for &(start, end) in &rects {
             uc.target(start, Some(end), mmio_base, NocOrdering::Strict)?;
@@ -675,7 +669,8 @@ fn probe_info_for_device(path: &Path) -> io::Result<ProbeInfo> {
 }
 
 fn read_arc_enabled_masks(path: &Path) -> io::Result<(u32, u32)> {
-    let mut arc = TlbWindow::open(path, Arc::TILE, Arc::NOC_BASE, Arc::TLB_SIZE_2M, false)?;
+    let mut arc = TlbWindow::open(path, Arc::TLB_SIZE_2M, false)?;
+    arc.target(Arc::TILE, None, Arc::NOC_BASE, NocOrdering::Strict)?;
     log(format!("linux probe opened {}", path.display()));
     let telemetry_ptr = arc.read32(Arc::SCRATCH_RAM_13)? as u64;
     let (csm_base, csm_offset) = align_down(telemetry_ptr, Arc::TLB_SIZE_2M);

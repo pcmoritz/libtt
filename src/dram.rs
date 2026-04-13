@@ -87,15 +87,15 @@ impl Allocator {
             .copied()
             .ok_or_else(|| io::Error::other("no active DRAM bank tiles discovered"))?;
         let bank_count = bank_tiles.len();
-        let window = TlbWindow::open(
-            path.as_path(),
+        let mut window = TlbWindow::open(path.as_path(), Dram::TLB_SIZE_4G, true)?;
+        window.target(
             CoreCoord {
                 x: first.x,
                 y: first.y,
             },
+            None,
             0,
-            Dram::TLB_SIZE_4G,
-            true,
+            NocOrdering::Strict,
         )?;
         Ok(Self {
             window,

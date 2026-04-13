@@ -12,13 +12,7 @@ pub(crate) enum NocOrdering {
 pub(crate) struct TlbWindow;
 
 impl TlbWindow {
-    pub(crate) fn open(
-        _path: &Path,
-        _start: CoreCoord,
-        _addr: u64,
-        _size: u64,
-        _wc: bool,
-    ) -> io::Result<Self> {
+    pub(crate) fn open(_path: &Path, _size: u64, _wc: bool) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Tenstorrent Linux backend is only available on Linux",
