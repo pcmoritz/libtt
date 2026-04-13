@@ -2,10 +2,11 @@ use crate::device::Device;
 use crate::dram::DType;
 use crate::hw::TensixL1;
 use crate::log::log;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1499,21 +1500,19 @@ fn firmware_cache_key(
     fw_src_dir: &Path,
     unique_srcs: &[&str],
 ) -> io::Result<String> {
-    let mut hasher = StableHasher::new();
-    hasher.feed_str("fw-v3");
-    hasher.feed_bool(profile);
-    hasher.feed_usize(num_dram_banks);
-    hasher.feed_usize(num_l1_banks);
-    hasher.feed_usize(prefetch_core.0 as usize);
-    hasher.feed_usize(prefetch_core.1 as usize);
-    hasher.feed_usize(dispatch_core.0 as usize);
-    hasher.feed_usize(dispatch_core.1 as usize);
-    hasher.feed_usize(unique_srcs.len());
+    let mut hasher = DefaultHasher::new();
+    "fw-v3".hash(&mut hasher);
+    profile.hash(&mut hasher);
+    num_dram_banks.hash(&mut hasher);
+    num_l1_banks.hash(&mut hasher);
+    prefetch_core.hash(&mut hasher);
+    dispatch_core.hash(&mut hasher);
+    unique_srcs.hash(&mut hasher);
     for src in unique_srcs {
-        hasher.feed_str(src);
-        hasher.feed_bytes(&fs::read(fw_src_dir.join(src))?);
+        src.hash(&mut hasher);
+        fs::read(fw_src_dir.join(src))?.hash(&mut hasher);
     }
-    Ok(hasher.finish_hex())
+    Ok(format!("{:016x}", hasher.finish()))
 }
 
 fn kernel_cache_key(
@@ -1527,25 +1526,22 @@ fn kernel_cache_key(
     fw_elf: &[u8],
     include_content: &[u8],
 ) -> String {
-    let mut hasher = StableHasher::new();
-    hasher.feed_str("kern-v3");
-    hasher.feed_str(kernel_source);
-    hasher.feed_str(target);
-    hasher.feed_usize(defines.len());
-    for define in defines {
-        hasher.feed_str(define);
-    }
-    hasher.feed_str(opt);
-    hasher.feed_bool(trisc);
-    hasher.feed_bool(xip_relocate);
-    hasher.feed_usize(headers.len());
+    let mut hasher = DefaultHasher::new();
+    "kern-v3".hash(&mut hasher);
+    kernel_source.hash(&mut hasher);
+    target.hash(&mut hasher);
+    defines.hash(&mut hasher);
+    opt.hash(&mut hasher);
+    trisc.hash(&mut hasher);
+    xip_relocate.hash(&mut hasher);
+    headers.len().hash(&mut hasher);
     for (name, content) in headers {
-        hasher.feed_str(name);
-        hasher.feed_str(content);
+        name.hash(&mut hasher);
+        content.hash(&mut hasher);
     }
-    hasher.feed_bytes(fw_elf);
-    hasher.feed_bytes(include_content);
-    hasher.finish_hex()
+    fw_elf.hash(&mut hasher);
+    include_content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn read_u16(data: &[u8], offset: usize) -> io::Result<u16> {
@@ -1662,47 +1658,6 @@ fn zones_added_since(before: &ZoneMap) -> ZoneMap {
 
 fn merge_zones(zones: ZoneMap) {
     zone_map().lock().expect("zone map poisoned").extend(zones);
-}
-
-struct StableHasher {
-    state: u64,
-}
-
-impl StableHasher {
-    fn new() -> Self {
-        Self {
-            state: 0xcbf2_9ce4_8422_2325,
-        }
-    }
-
-    fn feed_bytes(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= u64::from(*byte);
-            self.state = self.state.wrapping_mul(0x100_0000_01b3);
-        }
-        self.feed_separator();
-    }
-
-    fn feed_str(&mut self, value: &str) {
-        self.feed_bytes(value.as_bytes());
-    }
-
-    fn feed_bool(&mut self, value: bool) {
-        self.feed_bytes(&[u8::from(value)]);
-    }
-
-    fn feed_usize(&mut self, value: usize) {
-        self.feed_bytes(value.to_string().as_bytes());
-    }
-
-    fn feed_separator(&mut self) {
-        self.state ^= 0xff;
-        self.state = self.state.wrapping_mul(0x100_0000_01b3);
-    }
-
-    fn finish_hex(self) -> String {
-        format!("{:016x}", self.state)
-    }
 }
 
 #[cfg(test)]
