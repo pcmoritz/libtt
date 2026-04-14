@@ -57,6 +57,15 @@ struct KernelConfigMsg {
     preload: u8,
 }
 
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct CircularBufferConfigMsg {
+    addr: u32,
+    size: u32,
+    tiles: u32,
+    page_size: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MathFidelity {
     LoFi = 0,
@@ -516,7 +525,7 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
     }
 
     let entries = (u32::BITS - mask.leading_zeros()) as usize;
-    let mut blob = vec![0u8; entries * 16];
+    let mut configs = vec![CircularBufferConfigMsg::default(); entries];
     let mut next_addr = TensixL1::DATA_BUFFER_SPACE_BASE;
     let mut shared_addrs = HashMap::<usize, u32>::new();
 
@@ -538,15 +547,15 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
         }
         shared_addrs.insert(cb.index, addr);
 
-        let off = cb.index * 16;
-        blob[off..off + 4].copy_from_slice(&addr.to_le_bytes());
-        blob[off + 4..off + 8].copy_from_slice(&size.to_le_bytes());
-        blob[off + 8..off + 12]
-            .copy_from_slice(&to_u32(cb.tiles, "circular buffer tiles")?.to_le_bytes());
-        blob[off + 12..off + 16].copy_from_slice(&page_size.to_le_bytes());
+        configs[cb.index] = CircularBufferConfigMsg {
+            addr,
+            size,
+            tiles: to_u32(cb.tiles, "circular buffer tiles")?,
+            page_size,
+        };
     }
 
-    Ok((mask, blob))
+    Ok((mask, as_bytes(configs.as_slice())))
 }
 
 fn serialize_launch(
@@ -614,8 +623,8 @@ fn serialize_launch(
     Ok(out)
 }
 
-fn as_bytes<T>(value: &T) -> Vec<u8> {
-    let len = size_of::<T>();
+fn as_bytes<T: ?Sized>(value: &T) -> Vec<u8> {
+    let len = std::mem::size_of_val(value);
     let ptr = std::ptr::from_ref(value).cast::<u8>();
     // SAFETY: `value` is a valid reference to `T`, and we read exactly its
     // byte representation for the duration of this call.
