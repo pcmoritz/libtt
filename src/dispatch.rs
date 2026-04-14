@@ -513,18 +513,19 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
         return Ok((0, Vec::new()));
     }
 
+    const MAX_CIRCULAR_BUFFERS: usize = u32::BITS as usize;
     let mut mask = 0u32;
+    let mut entries = 0usize;
     for cb in &program.cbs {
-        if cb.index >= 32 {
+        if cb.index >= MAX_CIRCULAR_BUFFERS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("circular buffer index {} is out of range", cb.index),
             ));
         }
         mask |= 1u32 << cb.index;
+        entries = entries.max(cb.index + 1);
     }
-
-    let entries = (u32::BITS - mask.leading_zeros()) as usize;
     let mut configs = vec![CircularBufferConfigMsg::default(); entries];
     let mut next_addr = TensixL1::DATA_BUFFER_SPACE_BASE;
     let mut shared_addrs = HashMap::<usize, u32>::new();
