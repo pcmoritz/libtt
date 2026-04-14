@@ -1,6 +1,7 @@
 use crate::compiler::Compiler;
 use crate::dispatch::{
-    CBConfig, CoreSelection, Program, build_dispatch_plan, execute_slow_dispatch, mcast_rects,
+    CBConfig, CoreSelection, DevMsgs, Program, build_dispatch_plan, execute_slow_dispatch,
+    mcast_rects,
 };
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO, align_down, worker_cores};
@@ -14,8 +15,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_ROOT: &str = "/dev/tenstorrent";
-const RUN_MSG_INIT: u8 = 0x40;
-const RUN_MSG_DONE: u8 = 0x00;
 const BANK_PORT: [[u8; 2]; Dram::BANK_COUNT] = [
     [2, 1],
     [0, 1],
@@ -211,6 +210,13 @@ impl Device {
                 format!("unsupported tensix core count: {tensix_core_count}"),
             )
         })?;
+        let active_dram_banks = Dram::active_banks(probe.gddr_enabled_mask);
+        if active_dram_banks == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "device probe reported zero active DRAM banks",
+            ));
+        }
         let harvested_dram_banks = Dram::harvested_banks(probe.gddr_enabled_mask);
         let dram_tiles = Dram::tiles(&harvested_dram_banks);
         let config = board.config();
@@ -226,7 +232,7 @@ impl Device {
             prefetch_core: config.prefetch,
             dispatch_core: config.dispatch,
             harvested_dram_banks,
-            active_dram_banks: Dram::active_banks(probe.gddr_enabled_mask),
+            active_dram_banks,
             dram_tiles,
             allocator: None,
             compiler: None,
@@ -450,7 +456,7 @@ impl Device {
     }
 
     fn initialize_compiler(&mut self) {
-        if self.compiler.is_some() || self.active_dram_banks == 0 || self.all_worker_cores.is_empty() {
+        if self.compiler.is_some() || self.all_worker_cores.is_empty() {
             return;
         }
 
@@ -520,7 +526,7 @@ impl Device {
         }
 
         let jal = encode_jal_zero(TensixL1::BRISC_FIRMWARE_BASE);
-        let go_init = [0u8, 0u8, 0u8, RUN_MSG_INIT];
+        let go_init = [0u8, 0u8, 0u8, DevMsgs::RUN_MSG_INIT];
         let bank_table = build_bank_noc_table(&self.harvested_dram_banks, &all_cores)?;
         let rects = mcast_rects(&all_cores);
 
@@ -599,7 +605,7 @@ impl Device {
         uc.target(probe, None, 0, NocOrdering::Strict)?;
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if uc.read(TensixL1::GO_MSG as usize + 3, 1)?[0] == RUN_MSG_DONE {
+            if uc.read(TensixL1::GO_MSG as usize + 3, 1)?[0] == DevMsgs::RUN_MSG_DONE {
                 break;
             }
             if Instant::now() > deadline {

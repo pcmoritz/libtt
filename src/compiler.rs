@@ -261,7 +261,7 @@ impl Compiler {
     }
 
     pub fn for_device(device: &Device) -> io::Result<Self> {
-        if device.active_dram_banks == 0 || device.all_worker_cores.is_empty() {
+        if device.all_worker_cores.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(

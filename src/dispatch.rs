@@ -8,13 +8,54 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const RUN_MSG_GO: u8 = 0x80;
-const RUN_MSG_RESET_READ_PTR_FROM_HOST: u8 = 0xE0;
-const RUN_MSG_DONE: u8 = 0x00;
-const DISPATCH_MODE_HOST: u8 = 1;
 const FAST_CQ_NUM_CIRCULAR_BUFFERS: u8 = 32;
 const L1_ALIGN: u32 = 16;
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) struct DevMsgs;
+
+impl DevMsgs {
+    pub(crate) const RUN_MSG_INIT: u8 = 0x40;
+    pub(crate) const RUN_MSG_GO: u8 = 0x80;
+    pub(crate) const RUN_MSG_RESET_READ_PTR_FROM_HOST: u8 = 0xE0;
+    pub(crate) const RUN_MSG_DONE: u8 = 0x00;
+    pub(crate) const DISPATCH_MODE_HOST: u8 = 1;
+    pub(crate) const PROGRAMMABLE_CORE_TYPE_COUNT: usize = 3;
+    pub(crate) const MAX_PROCESSORS_PER_CORE_TYPE: usize = 5;
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct RtaOffset {
+    rta_offset: u16,
+    crta_offset: u16,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct KernelConfigMsg {
+    kernel_config_base: [u32; DevMsgs::PROGRAMMABLE_CORE_TYPE_COUNT],
+    sem_offset: [u16; DevMsgs::PROGRAMMABLE_CORE_TYPE_COUNT],
+    local_cb_offset: u16,
+    remote_cb_offset: u16,
+    rta_offset: [RtaOffset; DevMsgs::MAX_PROCESSORS_PER_CORE_TYPE],
+    mode: u8,
+    pad2: u8,
+    kernel_text_offset: [u32; DevMsgs::MAX_PROCESSORS_PER_CORE_TYPE],
+    local_cb_mask: u32,
+    brisc_noc_id: u8,
+    brisc_noc_mode: u8,
+    min_remote_cb_start_index: u8,
+    exit_erisc_kernel: u8,
+    host_assigned_id: u32,
+    enables: u32,
+    watcher_kernel_ids: [u16; DevMsgs::MAX_PROCESSORS_PER_CORE_TYPE],
+    ncrisc_kernel_size16: u16,
+    sub_device_origin_x: u8,
+    sub_device_origin_y: u8,
+    pad3: [u8; 1],
+    preload: u8,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MathFidelity {
@@ -157,7 +198,7 @@ pub(crate) fn build_dispatch_plan(
         DispatchCommand::Write {
             cores: all_cores.clone(),
             addr: TensixL1::GO_MSG as usize,
-            data: vec![0, 0, 0, RUN_MSG_RESET_READ_PTR_FROM_HOST],
+            data: vec![0, 0, 0, DevMsgs::RUN_MSG_RESET_READ_PTR_FROM_HOST],
         },
         DispatchCommand::Write {
             cores: all_cores.clone(),
@@ -217,7 +258,7 @@ pub(crate) fn execute_slow_dispatch(path: &Path, commands: &[DispatchCommand]) -
                 }
             }
             DispatchCommand::Launch { cores } => {
-                let go_blob = [0u8, 0u8, 0u8, RUN_MSG_GO];
+                let go_blob = [0u8, 0u8, 0u8, DevMsgs::RUN_MSG_GO];
                 for (start, end) in mcast_rects(cores) {
                     win.target(start, Some(end), 0, NocOrdering::Strict)?;
                     win.write(TensixL1::GO_MSG as usize, &go_blob)?;
@@ -227,7 +268,9 @@ pub(crate) fn execute_slow_dispatch(path: &Path, commands: &[DispatchCommand]) -
                     win.target(*core, None, 0, NocOrdering::Strict)?;
                     let deadline = Instant::now() + LAUNCH_TIMEOUT;
                     loop {
-                        if win.read(TensixL1::GO_MSG as usize + 3, 1)?[0] == RUN_MSG_DONE {
+                        if win.read(TensixL1::GO_MSG as usize + 3, 1)?[0]
+                            == DevMsgs::RUN_MSG_DONE
+                        {
                             break;
                         }
                         if Instant::now() > deadline {
@@ -522,43 +565,61 @@ fn serialize_launch(
     let writer_rta_off = to_u16(rta_offsets[0], "writer rta offset")?;
     let reader_rta_off = to_u16(rta_offsets[1], "reader rta offset")?;
     let compute_rta_off = to_u16(rta_offsets[2], "compute rta offset")?;
-
-    let mut out = Vec::with_capacity(96);
-    for _ in 0..3 {
-        out.extend_from_slice(&TensixL1::KERNEL_CONFIG_BASE.to_le_bytes());
-    }
-    for _ in 0..3 {
-        out.extend_from_slice(&sem_off.to_le_bytes());
-    }
-    out.extend_from_slice(&local_cb_off.to_le_bytes());
-    out.extend_from_slice(&remote_cb_off.to_le_bytes());
-    out.extend_from_slice(&writer_rta_off.to_le_bytes());
-    out.extend_from_slice(&local_cb_off.to_le_bytes());
-    out.extend_from_slice(&reader_rta_off.to_le_bytes());
-    out.extend_from_slice(&local_cb_off.to_le_bytes());
-    for _ in 0..3 {
-        out.extend_from_slice(&compute_rta_off.to_le_bytes());
-        out.extend_from_slice(&local_cb_off.to_le_bytes());
-    }
-    out.push(DISPATCH_MODE_HOST);
-    out.push(0);
-    for offset in kernel_text_offsets {
-        out.extend_from_slice(&offset.to_le_bytes());
-    }
-    out.extend_from_slice(&local_cb_mask.to_le_bytes());
-    out.push(1);
-    out.push(0);
-    out.push(FAST_CQ_NUM_CIRCULAR_BUFFERS);
-    out.push(0);
-    out.extend_from_slice(&host_assigned_id.to_le_bytes());
-    out.extend_from_slice(&enables.to_le_bytes());
-    for _ in 0..5 {
-        out.extend_from_slice(&0u16.to_le_bytes());
-    }
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&[0, 0, 0, 0]);
+    let launch = KernelConfigMsg {
+        kernel_config_base: [TensixL1::KERNEL_CONFIG_BASE; DevMsgs::PROGRAMMABLE_CORE_TYPE_COUNT],
+        sem_offset: [sem_off; DevMsgs::PROGRAMMABLE_CORE_TYPE_COUNT],
+        local_cb_offset: local_cb_off,
+        remote_cb_offset: remote_cb_off,
+        rta_offset: [
+            RtaOffset {
+                rta_offset: writer_rta_off,
+                crta_offset: local_cb_off,
+            },
+            RtaOffset {
+                rta_offset: reader_rta_off,
+                crta_offset: local_cb_off,
+            },
+            RtaOffset {
+                rta_offset: compute_rta_off,
+                crta_offset: local_cb_off,
+            },
+            RtaOffset {
+                rta_offset: compute_rta_off,
+                crta_offset: local_cb_off,
+            },
+            RtaOffset {
+                rta_offset: compute_rta_off,
+                crta_offset: local_cb_off,
+            },
+        ],
+        mode: DevMsgs::DISPATCH_MODE_HOST,
+        pad2: 0,
+        kernel_text_offset: kernel_text_offsets,
+        local_cb_mask,
+        brisc_noc_id: 1,
+        brisc_noc_mode: 0,
+        min_remote_cb_start_index: FAST_CQ_NUM_CIRCULAR_BUFFERS,
+        exit_erisc_kernel: 0,
+        host_assigned_id,
+        enables,
+        watcher_kernel_ids: [0; DevMsgs::MAX_PROCESSORS_PER_CORE_TYPE],
+        ncrisc_kernel_size16: 0,
+        sub_device_origin_x: 0,
+        sub_device_origin_y: 0,
+        pad3: [0],
+        preload: 0,
+    };
+    let out = as_bytes(&launch);
     debug_assert_eq!(out.len(), 96);
     Ok(out)
+}
+
+fn as_bytes<T>(value: &T) -> Vec<u8> {
+    let len = size_of::<T>();
+    let ptr = std::ptr::from_ref(value).cast::<u8>();
+    // SAFETY: `value` is a valid reference to `T`, and we read exactly its
+    // byte representation for the duration of this call.
+    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
 }
 
 fn to_u16(value: usize, label: &str) -> io::Result<u16> {
@@ -707,7 +768,7 @@ mod tests {
         assert_eq!(read_u16(&launch, 12), sem_off as u16);
         assert_eq!(read_u16(&launch, 18), 64);
         assert_eq!(read_u16(&launch, 20), 80);
-        assert_eq!(launch[42], DISPATCH_MODE_HOST);
+        assert_eq!(launch[42], DevMsgs::DISPATCH_MODE_HOST);
         assert_eq!(read_u32(&launch, 44), 80);
         assert_eq!(read_u32(&launch, 48), 112);
         assert_eq!(read_u32(&launch, 52), 144);
