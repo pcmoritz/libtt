@@ -2,7 +2,7 @@ use crate::compiler::{CompiledKernel, Compiler};
 use crate::dram::DType;
 use crate::hw::{Arc, CoreCoord, TensixL1, align_up};
 use crate::linux::{NocOrdering, TlbWindow};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 use std::thread;
@@ -528,25 +528,16 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
     }
     let mut configs = vec![CircularBufferConfigMsg::default(); entries];
     let mut next_addr = TensixL1::DATA_BUFFER_SPACE_BASE;
-    let mut shared_addrs = HashMap::<usize, u32>::new();
 
     for cb in &program.cbs {
         let page_size = to_u32(cb.dtype.tile_size(), "circular buffer page size")?;
         let size = page_size
             .checked_mul(to_u32(cb.tiles, "circular buffer tile count")?)
             .ok_or_else(|| io::Error::other("circular buffer size overflow"))?;
-        let shared_with = match cb.index {
-            16 => shared_addrs.get(&24).copied(),
-            24 => shared_addrs.get(&16).copied(),
-            _ => None,
-        };
-        let addr = shared_with.unwrap_or(next_addr);
-        if shared_with.is_none() {
-            next_addr = next_addr
-                .checked_add(size)
-                .ok_or_else(|| io::Error::other("circular buffer address overflow"))?;
-        }
-        shared_addrs.insert(cb.index, addr);
+        let addr = next_addr;
+        next_addr = next_addr
+            .checked_add(size)
+            .ok_or_else(|| io::Error::other("circular buffer address overflow"))?;
 
         configs[cb.index] = CircularBufferConfigMsg {
             addr,
@@ -709,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn build_cb_blob_packs_and_shares_buffers() {
+    fn build_cb_blob_packs_buffers() {
         let program = Program {
             cbs: vec![
                 CBConfig {
@@ -732,10 +723,16 @@ mod tests {
         };
 
         let (mask, blob) = build_cb_blob(&program).expect("cb blob");
+        let cb0_size = (DType::Float16.tile_size() * 2) as u32;
+        let cb16_size = DType::Float16B.tile_size() as u32;
         assert_eq!(mask, (1 << 0) | (1 << 16) | (1 << 24));
         assert_eq!(blob.len(), 25 * 16);
         assert_eq!(read_u32(&blob, 0), TensixL1::DATA_BUFFER_SPACE_BASE);
-        assert_eq!(read_u32(&blob, 16 * 16), read_u32(&blob, 24 * 16));
+        assert_eq!(read_u32(&blob, 16 * 16), TensixL1::DATA_BUFFER_SPACE_BASE + cb0_size);
+        assert_eq!(
+            read_u32(&blob, 24 * 16),
+            TensixL1::DATA_BUFFER_SPACE_BASE + cb0_size + cb16_size
+        );
     }
 
     #[test]
