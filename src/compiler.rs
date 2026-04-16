@@ -1185,10 +1185,19 @@ fn run_command(exe: &Path, args: &[String], cwd: &Path) -> io::Result<()> {
     ));
     let output = Command::new(exe).args(args).current_dir(cwd).output()?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !stderr.is_empty() {
+            log(format!(
+                "compiler exec failed cwd={} cmd={} stderr:\n{}",
+                cwd.display(),
+                render_command(exe, args),
+                stderr
+            ));
+        }
         return Err(io::Error::other(format!(
             "{} failed:\n{}",
             exe.file_name().and_then(OsStr::to_str).unwrap_or("command"),
-            String::from_utf8_lossy(&output.stderr)
+            stderr
         )));
     }
     Ok(())
@@ -1243,7 +1252,14 @@ where
         run_command(cc, &link, &build)?;
         fs::read(build.join("out.elf"))
     })();
-    let _ = fs::remove_dir_all(&build);
+    if result.is_err() {
+        log(format!(
+            "preserving failed compiler temp dir {}",
+            build.display()
+        ));
+    } else {
+        let _ = fs::remove_dir_all(&build);
+    }
     result
 }
 

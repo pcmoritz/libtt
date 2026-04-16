@@ -297,7 +297,6 @@ pub struct PJRT_Executable {
     output_dims: Vec<i64>,
     output_dim_sizes: Vec<usize>,
     output_layouts: Vec<PJRT_Layouts_MemoryLayout>,
-    output_layout_ptrs: Vec<*mut PJRT_Layouts_MemoryLayout>,
     output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
@@ -313,7 +312,6 @@ pub struct PJRT_LoadedExecutable {
     output_dims: Vec<i64>,
     output_dim_sizes: Vec<usize>,
     output_layouts: Vec<PJRT_Layouts_MemoryLayout>,
-    output_layout_ptrs: Vec<*mut PJRT_Layouts_MemoryLayout>,
     output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
@@ -1472,30 +1470,6 @@ fn dtype_to_pjrt_buffer_type(dtype: DType) -> i32 {
     }
 }
 
-fn bf16_bits_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
-}
-
-fn f32_to_bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
-}
-
-fn add_bf16_host_buffers(lhs: &[u8], rhs: &[u8]) -> Result<Vec<u8>, *mut PJRT_Error> {
-    if lhs.len() != rhs.len() || lhs.len() % 2 != 0 {
-        return Err(invalid_argument("bf16 host buffers must have equal even byte lengths"));
-    }
-    let mut out = Vec::with_capacity(lhs.len());
-    for (lhs_chunk, rhs_chunk) in lhs.chunks_exact(2).zip(rhs.chunks_exact(2)) {
-        let lhs_bits = u16::from_le_bytes([lhs_chunk[0], lhs_chunk[1]]);
-        let rhs_bits = u16::from_le_bytes([rhs_chunk[0], rhs_chunk[1]]);
-        let sum_bits = f32_to_bf16_bits(bf16_bits_to_f32(lhs_bits) + bf16_bits_to_f32(rhs_bits));
-        out.extend_from_slice(&sum_bits.to_le_bytes());
-    }
-    Ok(out)
-}
-
 fn dims_i64_to_usize(dims: &[i64]) -> Result<Vec<usize>, *mut PJRT_Error> {
     dims.iter()
         .map(|&dim| {
@@ -1690,10 +1664,6 @@ fn make_executable(
     let output_layouts = vec![PJRT_Layouts_MemoryLayout {
         serialized: row_major_layout_string(dims.len()),
     }];
-    let output_layout_ptrs = output_layouts
-        .iter()
-        .map(|layout| (layout as *const PJRT_Layouts_MemoryLayout).cast_mut())
-        .collect::<Vec<_>>();
     let output_memory_kinds = vec![cstring_lossy("dram")];
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
@@ -1714,7 +1684,6 @@ fn make_executable(
         output_dims: dims,
         output_dim_sizes,
         output_layouts,
-        output_layout_ptrs,
         output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
@@ -1738,7 +1707,6 @@ fn make_loaded_executable(
         output_dims: executable.output_dims,
         output_dim_sizes: executable.output_dim_sizes,
         output_layouts: executable.output_layouts,
-        output_layout_ptrs: executable.output_layout_ptrs,
         output_memory_kinds: executable.output_memory_kinds,
         output_memory_kind_ptrs: executable.output_memory_kind_ptrs,
         output_memory_kind_sizes: executable.output_memory_kind_sizes,
@@ -1755,10 +1723,6 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
             serialized: layout.serialized.clone(),
         })
         .collect::<Vec<_>>();
-    let output_layout_ptrs = output_layouts
-        .iter()
-        .map(|layout| (layout as *const PJRT_Layouts_MemoryLayout).cast_mut())
-        .collect::<Vec<_>>();
     let output_memory_kinds = executable.output_memory_kinds.clone();
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
@@ -1773,7 +1737,6 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
         output_dims: executable.output_dims.clone(),
         output_dim_sizes: executable.output_dim_sizes.clone(),
         output_layouts,
-        output_layout_ptrs,
         output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes: executable.output_memory_kind_sizes.clone(),
@@ -2579,8 +2542,16 @@ pub unsafe extern "C" fn TT_Layouts_Executable_GetOutputLayouts(
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };
-    args.num_outputs = executable.output_layout_ptrs.len();
-    args.layouts = executable.output_layout_ptrs.as_ptr().cast_mut();
+    args.num_outputs = executable.output_layouts.len();
+    args.layouts = if executable.output_layouts.is_empty() {
+        ptr::null_mut()
+    } else {
+        executable
+            .output_layouts
+            .as_ptr()
+            .cast::<*mut PJRT_Layouts_MemoryLayout>()
+            .cast_mut()
+    };
     ptr::null_mut()
 }
 
@@ -2769,26 +2740,15 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         return failed_precondition("rhs buffer has no device allocation");
     };
 
-    let output_host_data = match executable.kind {
+    let output_dram_buffer = match executable.kind {
         ExecutableKind::EltwiseAddBf16 => {
-            if !lhs.host_data.is_empty() && !rhs.host_data.is_empty() {
-                match add_bf16_host_buffers(&lhs.host_data, &rhs.host_data) {
-                    Ok(data) => data,
-                    Err(err) => return err,
-                }
-            } else {
-                let mut device = match Device::open(target_device.local_hardware_id as usize) {
-                    Ok(device) => device,
-                    Err(err) => return io_error(err),
-                };
-                let output = match device.eltwise_add_bf16(lhs_dram, rhs_dram, "pjrt_add") {
-                    Ok(buffer) => buffer,
-                    Err(err) => return io_error(err),
-                };
-                match device.dram_read(&output) {
-                    Ok(data) => data,
-                    Err(err) => return io_error(err),
-                }
+            let mut device = match Device::open(target_device.local_hardware_id as usize) {
+                Ok(device) => device,
+                Err(err) => return io_error(err),
+            };
+            match device.eltwise_add_bf16(lhs_dram, rhs_dram, "pjrt_add") {
+                Ok(buffer) => buffer,
+                Err(err) => return io_error(err),
             }
         }
     };
@@ -2803,8 +2763,8 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         device: execute_device,
         memory: target_device.default_memory,
         local_hardware_id: target_device.local_hardware_id as usize,
-        dram_buffer: None,
-        host_data: output_host_data,
+        dram_buffer: Some(output_dram_buffer),
+        host_data: Vec::new(),
         deleted: false,
     }));
     unsafe {
