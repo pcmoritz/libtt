@@ -2738,7 +2738,9 @@ fn build_pjrt_api() -> PJRT_Api {
     let mut api: PJRT_Api = unsafe { std::mem::zeroed() };
 
     api.struct_size = size_of::<PJRT_Api>();
-    api.extension_start = ptr::addr_of!(PJRT_LAYOUTS_EXTENSION.base).cast_mut();
+    // Do not advertise the layouts extension until the serialized layout payloads
+    // match what jaxlib expects for PjRtLayout construction.
+    api.extension_start = ptr::null_mut();
     api.pjrt_api_version = PJRT_Api_Version {
         struct_size: size_of::<PJRT_Api_Version>(),
         extension_start: ptr::null_mut(),
@@ -3245,7 +3247,7 @@ mod tests {
     }
 
     #[test]
-    fn optimized_program_and_layout_extension_expose_row_major_metadata() {
+    fn optimized_program_exposes_row_major_metadata_without_layout_extension() {
         let api = unsafe { &*GetPjrtApi() };
         let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
         let mut format = b"mlir".to_vec();
@@ -3333,50 +3335,7 @@ mod tests {
         assert!(mlir.contains("stablehlo.add"));
         assert!(mlir.contains("mhlo.layout_mode = \"{1, 0}\""));
         assert!(mlir.contains("jax.result_info = \"\""));
-
-        let layouts_extension = unsafe {
-            &*(api.extension_start.cast::<PJRT_Layouts_Extension>())
-        };
-        let get_output_layouts = layouts_extension
-            .PJRT_Layouts_PJRT_Executable_GetOutputLayouts
-            .expect("layouts extension must expose executable output layouts");
-        let mut output_layout_args = PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args {
-            struct_size: size_of::<PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args>(),
-            extension_start: ptr::null_mut(),
-            executable,
-            num_outputs: 0,
-            layouts: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_output_layouts(&mut output_layout_args) });
-        assert_eq!(output_layout_args.num_outputs, 1);
-        assert!(!output_layout_args.layouts.is_null());
-
-        let serialize_layout = layouts_extension
-            .PJRT_Layouts_MemoryLayout_Serialize
-            .expect("layouts extension must serialize memory layouts");
-        let first_layout = unsafe { *output_layout_args.layouts };
-        let mut serialize_args = PJRT_Layouts_MemoryLayout_Serialize_Args {
-            struct_size: size_of::<PJRT_Layouts_MemoryLayout_Serialize_Args>(),
-            extension_start: ptr::null_mut(),
-            layout: first_layout,
-            serialized_bytes: ptr::null(),
-            serialized_bytes_size: 0,
-            serialized_layout: ptr::null_mut(),
-            serialized_layout_deleter: None,
-        };
-        check_ok(api, unsafe { serialize_layout(&mut serialize_args) });
-        let layout = unsafe {
-            std::slice::from_raw_parts(
-                serialize_args.serialized_bytes.cast::<u8>(),
-                serialize_args.serialized_bytes_size,
-            )
-        };
-        assert_eq!(layout, b"{1,0}");
-        unsafe {
-            serialize_args
-                .serialized_layout_deleter
-                .expect("serialized layout deleter must exist")(serialize_args.serialized_layout);
-        }
+        assert!(api.extension_start.is_null());
 
         let executable_destroy = api
             .PJRT_Executable_Destroy
