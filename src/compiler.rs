@@ -1,5 +1,5 @@
 use crate::device::Device;
-use crate::dispatch::{MathFidelity, Program};
+use crate::dispatch::Program;
 use crate::dram::DType;
 use crate::hw::TensixL1;
 use crate::log::log;
@@ -1504,7 +1504,7 @@ fn kernel_cache() -> &'static Mutex<HashMap<String, KernelCacheEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::CBConfig;
+    use crate::dispatch::{CBConfig, MathFidelity};
 
     #[test]
     fn device_defines_match_blackhole_shapes() {

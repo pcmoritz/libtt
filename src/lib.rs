@@ -11,89 +11,31 @@ mod log;
 use device::Device;
 use dram::{DType, DramBuffer};
 use log::log;
-use std::ffi::{CString, c_char, c_void};
+use crate::PJRT_Buffer_Type::{
+    PJRT_Buffer_Type_BF16, PJRT_Buffer_Type_F16, PJRT_Buffer_Type_F32,
+    PJRT_Buffer_Type_INVALID, PJRT_Buffer_Type_S32, PJRT_Buffer_Type_S8,
+    PJRT_Buffer_Type_U16, PJRT_Buffer_Type_U32, PJRT_Buffer_Type_U8,
+};
+use crate::PJRT_HostBufferSemantics::{
+    PJRT_HostBufferSemantics_kImmutableOnlyDuringCall,
+    PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes,
+    PJRT_HostBufferSemantics_kImmutableZeroCopy,
+    PJRT_HostBufferSemantics_kMutableZeroCopy,
+};
+use std::ffi::{CString, c_char};
 use std::io;
 use std::mem::size_of;
 use std::ptr;
 use std::slice;
+use std::sync::Once;
 
-const PJRT_API_MAJOR: i32 = 0;
-const PJRT_API_MINOR: i32 = 103;
-const PJRT_API_UNUSED_TAIL_BEFORE_DEVICE_GET_ATTRIBUTES: usize = 30;
-const PJRT_API_UNUSED_TAIL_BEFORE_TOPOLOGY_DESCRIPTION_FINGERPRINT: usize = 4;
-const PJRT_API_UNUSED_TAIL_AFTER_TOPOLOGY_DESCRIPTION_FINGERPRINT: usize = 1;
-const PJRT_Buffer_Type_INVALID: i32 = 0;
-const PJRT_Buffer_Type_S8: i32 = 2;
-const PJRT_Buffer_Type_S32: i32 = 4;
-const PJRT_Buffer_Type_U8: i32 = 6;
-const PJRT_Buffer_Type_U16: i32 = 7;
-const PJRT_Buffer_Type_U32: i32 = 8;
-const PJRT_Buffer_Type_F16: i32 = 10;
-const PJRT_Buffer_Type_F32: i32 = 11;
-const PJRT_Buffer_Type_BF16: i32 = 13;
-const PJRT_HostBufferSemantics_kImmutableOnlyDuringCall: i32 = 0;
-const PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes: i32 = 1;
-const PJRT_HostBufferSemantics_kImmutableZeroCopy: i32 = 2;
-const PJRT_HostBufferSemantics_kMutableZeroCopy: i32 = 3;
+include!("pjrt_bindings.rs");
 
-type PjrtOpaqueFn = Option<unsafe extern "C" fn()>;
 type PjrtResultFn<Args> = Option<unsafe extern "C" fn(args: *mut Args) -> *mut PJRT_Error>;
-type PjrtVoidFn<Args> = Option<unsafe extern "C" fn(args: *mut Args)>;
-type PjrtDeviceAttributesDeleter =
-    Option<unsafe extern "C" fn(device_attributes: *mut PJRT_Device_Attributes)>;
-type PjrtSerializedDeviceAssignmentDeleter =
-    Option<unsafe extern "C" fn(device_assignment: *mut PJRT_DeviceAssignmentSerialized)>;
-type PjrtEventOnReadyCallback =
-    Option<unsafe extern "C" fn(error: *mut PJRT_Error, user_arg: *mut c_void)>;
 type PjrtSerializedLayoutDeleter =
     Option<unsafe extern "C" fn(serialized_layout: *mut PJRT_Layouts_SerializedLayout)>;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PJRT_Error_Code {
-    PJRT_Error_Code_OK = 0,
-    PJRT_Error_Code_CANCELLED = 1,
-    PJRT_Error_Code_UNKNOWN = 2,
-    PJRT_Error_Code_INVALID_ARGUMENT = 3,
-    PJRT_Error_Code_DEADLINE_EXCEEDED = 4,
-    PJRT_Error_Code_NOT_FOUND = 5,
-    PJRT_Error_Code_ALREADY_EXISTS = 6,
-    PJRT_Error_Code_PERMISSION_DENIED = 7,
-    PJRT_Error_Code_RESOURCE_EXHAUSTED = 8,
-    PJRT_Error_Code_FAILED_PRECONDITION = 9,
-    PJRT_Error_Code_ABORTED = 10,
-    PJRT_Error_Code_OUT_OF_RANGE = 11,
-    PJRT_Error_Code_UNIMPLEMENTED = 12,
-    PJRT_Error_Code_INTERNAL = 13,
-    PJRT_Error_Code_UNAVAILABLE = 14,
-    PJRT_Error_Code_DATA_LOSS = 15,
-    PJRT_Error_Code_UNAUTHENTICATED = 16,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PJRT_Extension_Type {
-    PJRT_Extension_Type_Layouts = 4,
-}
-
-#[repr(C)]
-pub struct PJRT_Extension_Base {
-    pub struct_size: usize,
-    pub type_: PJRT_Extension_Type,
-    pub next: *mut PJRT_Extension_Base,
-}
-
 unsafe impl Sync for PJRT_Extension_Base {}
-
-#[repr(C)]
-pub struct PJRT_NamedValue {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
-pub struct PJRT_Device_Attributes {
-    _private: [u8; 0],
-}
 
 #[repr(C)]
 pub struct PJRT_Error {
@@ -142,18 +84,8 @@ pub struct PJRT_Event {
 }
 
 #[repr(C)]
-pub struct PJRT_Buffer_MemoryLayout {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
-pub struct PJRT_DeviceAssignmentSerialized {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
 pub struct PJRT_Buffer {
-    buffer_type: i32,
+    buffer_type: PJRT_Buffer_Type,
     dims: Vec<i64>,
     device: *mut PJRT_Device,
     memory: *mut PJRT_Memory,
@@ -161,16 +93,6 @@ pub struct PJRT_Buffer {
     dram_buffer: Option<DramBuffer>,
     host_data: Vec<u8>,
     deleted: bool,
-}
-
-#[repr(C)]
-pub struct PJRT_Program {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub code: *mut c_char,
-    pub code_size: usize,
-    pub format: *const c_char,
-    pub format_size: usize,
 }
 
 #[repr(C)]
@@ -214,7 +136,7 @@ pub struct PJRT_Layouts_PJRT_Client_GetDefaultLayout_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
     pub client: *mut PJRT_Client,
-    pub type_: i32,
+    pub type_: PJRT_Buffer_Type,
     pub dims: *const i64,
     pub num_dims: usize,
     pub layout: *mut PJRT_Layouts_MemoryLayout,
@@ -225,7 +147,7 @@ pub struct PJRT_Layouts_PJRT_Topology_GetDefaultLayout_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
     pub topology_description: *mut PJRT_TopologyDescription,
-    pub type_: i32,
+    pub type_: PJRT_Buffer_Type,
     pub dims: *const i64,
     pub num_dims: usize,
     pub layout: *mut PJRT_Layouts_MemoryLayout,
@@ -260,26 +182,9 @@ pub struct PJRT_Layouts_Extension {
 unsafe impl Sync for PJRT_Layouts_Extension {}
 
 #[repr(C)]
-pub struct PJRT_ExecuteOptions {
+pub struct PJRT_Generic_Args {
     pub struct_size: usize,
     pub extension_start: *mut PJRT_Extension_Base,
-    pub launch_id: i32,
-    pub strict_shape_checking: bool,
-    pub arguments_are_tupled: bool,
-    pub untuple_result: bool,
-    pub launch_id_is_set: bool,
-    pub context: *mut PJRT_ExecuteContext,
-    pub send_callbacks: *mut c_void,
-    pub num_send_ops: usize,
-    pub recv_callbacks: *mut c_void,
-    pub num_recv_ops: usize,
-    pub non_donatable_input_indices: *const i32,
-    pub num_non_donatable_input_indices: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_ExecuteContext {
-    _private: [u8; 0],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,10 +198,11 @@ pub struct PJRT_Executable {
     name: CString,
     fingerprint: CString,
     num_outputs: usize,
-    output_types: Vec<i32>,
+    output_types: Vec<PJRT_Buffer_Type>,
     output_dims: Vec<i64>,
     output_dim_sizes: Vec<usize>,
     output_layouts: Vec<PJRT_Layouts_MemoryLayout>,
+    output_layout_ptrs: Vec<*mut PJRT_Layouts_MemoryLayout>,
     output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
@@ -308,10 +214,11 @@ pub struct PJRT_LoadedExecutable {
     name: CString,
     fingerprint: CString,
     num_outputs: usize,
-    output_types: Vec<i32>,
+    output_types: Vec<PJRT_Buffer_Type>,
     output_dims: Vec<i64>,
     output_dim_sizes: Vec<usize>,
     output_layouts: Vec<PJRT_Layouts_MemoryLayout>,
+    output_layout_ptrs: Vec<*mut PJRT_Layouts_MemoryLayout>,
     output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
@@ -332,948 +239,6 @@ pub struct PJRT_Client {
     memory_ptrs: Vec<*mut PJRT_Memory>,
 }
 
-#[repr(C)]
-pub struct PJRT_Api_Version {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub major_version: i32,
-    pub minor_version: i32,
-}
-
-#[repr(C)]
-pub struct PJRT_Error_Destroy_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub error: *mut PJRT_Error,
-}
-
-#[repr(C)]
-pub struct PJRT_Error_Message_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub error: *const PJRT_Error,
-    pub message: *const c_char,
-    pub message_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Error_GetCode_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub error: *const PJRT_Error,
-    pub code: PJRT_Error_Code,
-}
-
-#[repr(C)]
-pub struct PJRT_Plugin_Initialize_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-}
-
-#[repr(C)]
-pub struct PJRT_Plugin_Attributes_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub attributes: *const PJRT_NamedValue,
-    pub num_attributes: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Event_Destroy_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub event: *mut PJRT_Event,
-}
-
-#[repr(C)]
-pub struct PJRT_Event_IsReady_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub event: *mut PJRT_Event,
-    pub is_ready: bool,
-}
-
-#[repr(C)]
-pub struct PJRT_Event_Error_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub event: *mut PJRT_Event,
-}
-
-#[repr(C)]
-pub struct PJRT_Event_Await_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub event: *mut PJRT_Event,
-}
-
-#[repr(C)]
-pub struct PJRT_Event_OnReady_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub event: *mut PJRT_Event,
-    pub callback: PjrtEventOnReadyCallback,
-    pub user_arg: *mut c_void,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_Create_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub create_options: *const PJRT_NamedValue,
-    pub num_options: usize,
-    pub kv_get_callback: PjrtOpaqueFn,
-    pub kv_get_user_arg: *mut c_void,
-    pub kv_put_callback: PjrtOpaqueFn,
-    pub kv_put_user_arg: *mut c_void,
-    pub client: *mut PJRT_Client,
-    pub kv_try_get_callback: PjrtOpaqueFn,
-    pub kv_try_get_user_arg: *mut c_void,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_Destroy_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_PlatformName_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub platform_name: *const c_char,
-    pub platform_name_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_ProcessIndex_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub process_index: i32,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_PlatformVersion_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub platform_version: *const c_char,
-    pub platform_version_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_TopologyDescription_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub topology: *mut PJRT_TopologyDescription,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_Devices_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub devices: *const *mut PJRT_Device,
-    pub num_devices: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_AddressableDevices_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub addressable_devices: *const *mut PJRT_Device,
-    pub num_addressable_devices: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_LookupDevice_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub id: i32,
-    pub device: *mut PJRT_Device,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_LookupAddressableDevice_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub local_hardware_id: i32,
-    pub addressable_device: *mut PJRT_Device,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_AddressableMemories_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub addressable_memories: *const *mut c_void,
-    pub num_addressable_memories: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_DefaultDeviceAssignment_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub num_replicas: i32,
-    pub num_partitions: i32,
-    pub default_assignment_size: usize,
-    pub default_assignment: *mut i32,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_Compile_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub program: *const PJRT_Program,
-    pub compile_options: *const c_char,
-    pub compile_options_size: usize,
-    pub executable: *mut PJRT_LoadedExecutable,
-}
-
-#[repr(C)]
-pub struct PJRT_Compile_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub topology: *const PJRT_TopologyDescription,
-    pub program: *const PJRT_Program,
-    pub compile_options: *const c_char,
-    pub compile_options_size: usize,
-    pub client: *mut PJRT_Client,
-    pub executable: *mut PJRT_Executable,
-}
-
-#[repr(C)]
-pub struct PJRT_Client_BufferFromHostBuffer_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub client: *mut PJRT_Client,
-    pub data: *const c_void,
-    pub type_: i32,
-    pub dims: *const i64,
-    pub num_dims: usize,
-    pub byte_strides: *const i64,
-    pub num_byte_strides: usize,
-    pub host_buffer_semantics: i32,
-    pub device: *mut PJRT_Device,
-    pub memory: *mut PJRT_Memory,
-    pub device_layout: *mut PJRT_Buffer_MemoryLayout,
-    pub done_with_host_buffer: *mut PJRT_Event,
-    pub buffer: *mut PJRT_Buffer,
-}
-
-#[repr(C)]
-pub struct PJRT_DeviceDescription_Id_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device_description: *mut PJRT_DeviceDescription,
-    pub id: i32,
-}
-
-#[repr(C)]
-pub struct PJRT_DeviceDescription_ProcessIndex_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device_description: *mut PJRT_DeviceDescription,
-    pub process_index: i32,
-}
-
-#[repr(C)]
-pub struct PJRT_DeviceDescription_Attributes_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device_description: *mut PJRT_DeviceDescription,
-    pub attributes: *const PJRT_NamedValue,
-    pub num_attributes: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_DeviceDescription_Kind_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device_description: *mut PJRT_DeviceDescription,
-    pub device_kind: *const c_char,
-    pub device_kind_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_DeviceDescription_DebugString_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device_description: *mut PJRT_DeviceDescription,
-    pub debug_string: *const c_char,
-    pub debug_string_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_DeviceDescription_ToString_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device_description: *mut PJRT_DeviceDescription,
-    pub to_string: *const c_char,
-    pub to_string_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Device_GetDescription_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device: *mut PJRT_Device,
-    pub device_description: *mut PJRT_DeviceDescription,
-}
-
-#[repr(C)]
-pub struct PJRT_Device_IsAddressable_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device: *mut PJRT_Device,
-    pub is_addressable: bool,
-}
-
-#[repr(C)]
-pub struct PJRT_Device_LocalHardwareId_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device: *mut PJRT_Device,
-    pub local_hardware_id: i32,
-}
-
-#[repr(C)]
-pub struct PJRT_Device_AddressableMemories_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device: *mut PJRT_Device,
-    pub memories: *const *mut PJRT_Memory,
-    pub num_memories: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Device_DefaultMemory_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device: *mut PJRT_Device,
-    pub default_memory: *mut PJRT_Memory,
-}
-
-#[repr(C)]
-pub struct PJRT_Device_MemoryStats_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device: *mut PJRT_Device,
-    pub bytes_in_use: i64,
-    pub peak_bytes_in_use: i64,
-    pub peak_bytes_in_use_is_set: bool,
-    pub num_allocs: i64,
-    pub num_allocs_is_set: bool,
-    pub largest_alloc_size: i64,
-    pub largest_alloc_size_is_set: bool,
-    pub bytes_limit: i64,
-    pub bytes_limit_is_set: bool,
-    pub bytes_reserved: i64,
-    pub bytes_reserved_is_set: bool,
-    pub peak_bytes_reserved: i64,
-    pub peak_bytes_reserved_is_set: bool,
-    pub bytes_reservable_limit: i64,
-    pub bytes_reservable_limit_is_set: bool,
-    pub largest_free_block_bytes: i64,
-    pub largest_free_block_bytes_is_set: bool,
-    pub pool_bytes: i64,
-    pub pool_bytes_is_set: bool,
-    pub peak_pool_bytes: i64,
-    pub peak_pool_bytes_is_set: bool,
-}
-
-#[repr(C)]
-pub struct PJRT_Device_GetAttributes_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub device: *mut PJRT_Device,
-    pub attributes: *const PJRT_NamedValue,
-    pub num_attributes: usize,
-    pub device_attributes: *mut PJRT_Device_Attributes,
-    pub attributes_deleter: PjrtDeviceAttributesDeleter,
-}
-
-#[repr(C)]
-pub struct PJRT_Memory_Id_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub memory: *mut PJRT_Memory,
-    pub id: i32,
-}
-
-#[repr(C)]
-pub struct PJRT_Memory_Kind_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub memory: *mut PJRT_Memory,
-    pub kind: *const c_char,
-    pub kind_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Memory_Kind_Id_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub memory: *mut PJRT_Memory,
-    pub kind_id: i32,
-}
-
-#[repr(C)]
-pub struct PJRT_Memory_DebugString_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub memory: *mut PJRT_Memory,
-    pub debug_string: *const c_char,
-    pub debug_string_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Memory_ToString_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub memory: *mut PJRT_Memory,
-    pub to_string: *const c_char,
-    pub to_string_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Memory_AddressableByDevices_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub memory: *mut PJRT_Memory,
-    pub devices: *const *mut PJRT_Device,
-    pub num_devices: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Executable_Destroy_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_Executable,
-}
-
-#[repr(C)]
-pub struct PJRT_LoadedExecutable_Destroy_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_LoadedExecutable,
-}
-
-#[repr(C)]
-pub struct PJRT_LoadedExecutable_GetExecutable_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub loaded_executable: *mut PJRT_LoadedExecutable,
-    pub executable: *mut PJRT_Executable,
-}
-
-#[repr(C)]
-pub struct PJRT_LoadedExecutable_GetDeviceAssignment_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_LoadedExecutable,
-    pub serialized_bytes: *const c_char,
-    pub serialized_bytes_size: usize,
-    pub serialized_device_assignment: *mut PJRT_DeviceAssignmentSerialized,
-    pub serialized_device_assignment_deleter: PjrtSerializedDeviceAssignmentDeleter,
-}
-
-#[repr(C)]
-pub struct PJRT_Executable_Name_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_Executable,
-    pub executable_name: *const c_char,
-    pub executable_name_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Executable_NumReplicas_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_Executable,
-    pub num_replicas: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Executable_NumPartitions_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_Executable,
-    pub num_partitions: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_LoadedExecutable_AddressableDevices_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_LoadedExecutable,
-    pub addressable_devices: *const *mut PJRT_Device,
-    pub num_addressable_devices: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Executable_OptimizedProgram_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_Executable,
-    pub program: *mut PJRT_Program,
-}
-
-#[repr(C)]
-pub struct PJRT_Executable_Fingerprint_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_Executable,
-    pub executable_fingerprint: *const c_char,
-    pub executable_fingerprint_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Executable_GetCompiledMemoryStats_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_Executable,
-    pub generated_code_size_in_bytes: i64,
-    pub argument_size_in_bytes: i64,
-    pub output_size_in_bytes: i64,
-    pub alias_size_in_bytes: i64,
-    pub temp_size_in_bytes: i64,
-    pub host_generated_code_size_in_bytes: i64,
-    pub host_argument_size_in_bytes: i64,
-    pub host_output_size_in_bytes: i64,
-    pub host_alias_size_in_bytes: i64,
-    pub host_temp_size_in_bytes: i64,
-}
-
-#[repr(C)]
-pub struct PJRT_LoadedExecutable_Delete_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_LoadedExecutable,
-}
-
-#[repr(C)]
-pub struct PJRT_LoadedExecutable_IsDeleted_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_LoadedExecutable,
-    pub is_deleted: bool,
-}
-
-#[repr(C)]
-pub struct PJRT_LoadedExecutable_Execute_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_LoadedExecutable,
-    pub options: *mut PJRT_ExecuteOptions,
-    pub argument_lists: *const *const *mut PJRT_Buffer,
-    pub num_devices: usize,
-    pub num_args: usize,
-    pub output_lists: *mut *mut *mut PJRT_Buffer,
-    pub device_complete_events: *mut *mut PJRT_Event,
-    pub execute_device: *mut PJRT_Device,
-}
-
-#[repr(C)]
-pub struct PJRT_LoadedExecutable_Fingerprint_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_LoadedExecutable,
-    pub executable_fingerprint: *const c_char,
-    pub executable_fingerprint_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Executable_NumOutputs_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_Executable,
-    pub num_outputs: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Executable_OutputElementTypes_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_Executable,
-    pub output_types: *const i32,
-    pub num_output_types: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Executable_OutputDimensions_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_Executable,
-    pub num_outputs: usize,
-    pub dims: *const i64,
-    pub dim_sizes: *const usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Executable_OutputMemoryKinds_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub executable: *mut PJRT_Executable,
-    pub num_outputs: usize,
-    pub memory_kinds: *const *const c_char,
-    pub memory_kind_sizes: *const usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_Destroy_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_ElementType_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub type_: i32,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_Dimensions_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub dims: *const i64,
-    pub num_dims: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_UnpaddedDimensions_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub dims: *const i64,
-    pub num_dims: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_DynamicDimensionIndices_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub dynamic_dimension_indices: *const bool,
-    pub num_dynamic_dimension_indices: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_OnDeviceSizeInBytes_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub on_device_size_in_bytes: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_Device_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub device: *mut PJRT_Device,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_Memory_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub memory: *mut PJRT_Memory,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_Delete_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_IsDeleted_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub is_deleted: bool,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_ToHostBuffer_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub src: *mut PJRT_Buffer,
-    pub host_layout: *mut PJRT_Buffer_MemoryLayout,
-    pub dst: *mut c_void,
-    pub dst_size: usize,
-    pub event: *mut PJRT_Event,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_IsOnCpu_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub is_on_cpu: bool,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_ReadyEvent_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub event: *mut PJRT_Event,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_IncreaseExternalReferenceCount_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_DecreaseExternalReferenceCount_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-}
-
-#[repr(C)]
-pub struct PJRT_TopologyDescription_PlatformName_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub topology: *const PJRT_TopologyDescription,
-    pub platform_name: *const c_char,
-    pub platform_name_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_TopologyDescription_PlatformVersion_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub topology: *mut PJRT_TopologyDescription,
-    pub platform_version: *const c_char,
-    pub platform_version_size: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_TopologyDescription_GetDeviceDescriptions_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub topology: *const PJRT_TopologyDescription,
-    pub descriptions: *const *mut PJRT_DeviceDescription,
-    pub num_descriptions: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_TopologyDescription_Attributes_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub topology: *mut PJRT_TopologyDescription,
-    pub attributes: *const PJRT_NamedValue,
-    pub num_attributes: usize,
-}
-
-#[repr(C)]
-pub struct PJRT_Generic_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-}
-
-#[repr(C)]
-pub struct PJRT_ExecuteContext_Create_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub context: *mut PJRT_ExecuteContext,
-}
-
-#[repr(C)]
-pub struct PJRT_ExecuteContext_Destroy_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub context: *mut PJRT_ExecuteContext,
-}
-
-#[repr(C)]
-pub struct PJRT_Buffer_CopyRawToHost_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub buffer: *mut PJRT_Buffer,
-    pub dst: *mut c_void,
-    pub offset: i64,
-    pub transfer_size: i64,
-    pub event: *mut PJRT_Event,
-}
-
-#[repr(C)]
-pub struct PJRT_TopologyDescription_Fingerprint_Args {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub topology: *const PJRT_TopologyDescription,
-    pub fingerprint: u64,
-}
-
-#[repr(C)]
-pub struct PJRT_Api {
-    pub struct_size: usize,
-    pub extension_start: *mut PJRT_Extension_Base,
-    pub pjrt_api_version: PJRT_Api_Version,
-    pub PJRT_Error_Destroy: PjrtVoidFn<PJRT_Error_Destroy_Args>,
-    pub PJRT_Error_Message: PjrtVoidFn<PJRT_Error_Message_Args>,
-    pub PJRT_Error_GetCode: PjrtResultFn<PJRT_Error_GetCode_Args>,
-    pub PJRT_Plugin_Initialize: PjrtResultFn<PJRT_Plugin_Initialize_Args>,
-    pub PJRT_Plugin_Attributes: PjrtResultFn<PJRT_Plugin_Attributes_Args>,
-    pub PJRT_Event_Destroy: PjrtResultFn<PJRT_Event_Destroy_Args>,
-    pub PJRT_Event_IsReady: PjrtResultFn<PJRT_Event_IsReady_Args>,
-    pub PJRT_Event_Error: PjrtResultFn<PJRT_Event_Error_Args>,
-    pub PJRT_Event_Await: PjrtResultFn<PJRT_Event_Await_Args>,
-    pub PJRT_Event_OnReady: PjrtResultFn<PJRT_Event_OnReady_Args>,
-    pub PJRT_Client_Create: PjrtResultFn<PJRT_Client_Create_Args>,
-    pub PJRT_Client_Destroy: PjrtResultFn<PJRT_Client_Destroy_Args>,
-    pub PJRT_Client_PlatformName: PjrtResultFn<PJRT_Client_PlatformName_Args>,
-    pub PJRT_Client_ProcessIndex: PjrtResultFn<PJRT_Client_ProcessIndex_Args>,
-    pub PJRT_Client_PlatformVersion: PjrtResultFn<PJRT_Client_PlatformVersion_Args>,
-    pub PJRT_Client_Devices: PjrtResultFn<PJRT_Client_Devices_Args>,
-    pub PJRT_Client_AddressableDevices: PjrtResultFn<PJRT_Client_AddressableDevices_Args>,
-    pub PJRT_Client_LookupDevice: PjrtResultFn<PJRT_Client_LookupDevice_Args>,
-    pub PJRT_Client_LookupAddressableDevice: PjrtResultFn<PJRT_Client_LookupAddressableDevice_Args>,
-    pub PJRT_Client_AddressableMemories: PjrtResultFn<PJRT_Client_AddressableMemories_Args>,
-    pub PJRT_Client_Compile: PjrtResultFn<PJRT_Client_Compile_Args>,
-    pub PJRT_Client_DefaultDeviceAssignment: PjrtResultFn<PJRT_Client_DefaultDeviceAssignment_Args>,
-    pub PJRT_Client_BufferFromHostBuffer: PjrtResultFn<PJRT_Client_BufferFromHostBuffer_Args>,
-    pub PJRT_DeviceDescription_Id: PjrtResultFn<PJRT_DeviceDescription_Id_Args>,
-    pub PJRT_DeviceDescription_ProcessIndex: PjrtResultFn<PJRT_DeviceDescription_ProcessIndex_Args>,
-    pub PJRT_DeviceDescription_Attributes: PjrtResultFn<PJRT_DeviceDescription_Attributes_Args>,
-    pub PJRT_DeviceDescription_Kind: PjrtResultFn<PJRT_DeviceDescription_Kind_Args>,
-    pub PJRT_DeviceDescription_DebugString: PjrtResultFn<PJRT_DeviceDescription_DebugString_Args>,
-    pub PJRT_DeviceDescription_ToString: PjrtResultFn<PJRT_DeviceDescription_ToString_Args>,
-    pub PJRT_Device_GetDescription: PjrtResultFn<PJRT_Device_GetDescription_Args>,
-    pub PJRT_Device_IsAddressable: PjrtResultFn<PJRT_Device_IsAddressable_Args>,
-    pub PJRT_Device_LocalHardwareId: PjrtResultFn<PJRT_Device_LocalHardwareId_Args>,
-    pub PJRT_Device_AddressableMemories: PjrtResultFn<PJRT_Device_AddressableMemories_Args>,
-    pub PJRT_Device_DefaultMemory: PjrtResultFn<PJRT_Device_DefaultMemory_Args>,
-    pub PJRT_Device_MemoryStats: PjrtResultFn<PJRT_Device_MemoryStats_Args>,
-    pub PJRT_Memory_Id: PjrtResultFn<PJRT_Memory_Id_Args>,
-    pub PJRT_Memory_Kind: PjrtResultFn<PJRT_Memory_Kind_Args>,
-    pub PJRT_Memory_DebugString: PjrtResultFn<PJRT_Memory_DebugString_Args>,
-    pub PJRT_Memory_ToString: PjrtResultFn<PJRT_Memory_ToString_Args>,
-    pub PJRT_Memory_AddressableByDevices: PjrtResultFn<PJRT_Memory_AddressableByDevices_Args>,
-    pub PJRT_Executable_Destroy: PjrtResultFn<PJRT_Executable_Destroy_Args>,
-    pub PJRT_Executable_Name: PjrtResultFn<PJRT_Executable_Name_Args>,
-    pub PJRT_Executable_NumReplicas: PjrtResultFn<PJRT_Executable_NumReplicas_Args>,
-    pub PJRT_Executable_NumPartitions: PjrtResultFn<PJRT_Executable_NumPartitions_Args>,
-    pub PJRT_Executable_NumOutputs: PjrtResultFn<PJRT_Executable_NumOutputs_Args>,
-    pub PJRT_Executable_SizeOfGeneratedCodeInBytes: PjrtOpaqueFn,
-    pub PJRT_Executable_GetCostAnalysis: PjrtOpaqueFn,
-    pub PJRT_Executable_OutputMemoryKinds: PjrtResultFn<PJRT_Executable_OutputMemoryKinds_Args>,
-    pub PJRT_Executable_OptimizedProgram: PjrtResultFn<PJRT_Executable_OptimizedProgram_Args>,
-    pub PJRT_Executable_Serialize: PjrtOpaqueFn,
-    pub PJRT_LoadedExecutable_Destroy: PjrtResultFn<PJRT_LoadedExecutable_Destroy_Args>,
-    pub PJRT_LoadedExecutable_GetExecutable:
-        PjrtResultFn<PJRT_LoadedExecutable_GetExecutable_Args>,
-    pub PJRT_LoadedExecutable_AddressableDevices:
-        PjrtResultFn<PJRT_LoadedExecutable_AddressableDevices_Args>,
-    pub PJRT_LoadedExecutable_Delete: PjrtResultFn<PJRT_LoadedExecutable_Delete_Args>,
-    pub PJRT_LoadedExecutable_IsDeleted: PjrtResultFn<PJRT_LoadedExecutable_IsDeleted_Args>,
-    pub PJRT_LoadedExecutable_Execute: PjrtResultFn<PJRT_LoadedExecutable_Execute_Args>,
-    pub PJRT_Executable_DeserializeAndLoad: PjrtOpaqueFn,
-    pub PJRT_LoadedExecutable_Fingerprint:
-        PjrtResultFn<PJRT_LoadedExecutable_Fingerprint_Args>,
-    pub PJRT_Buffer_Destroy: PjrtResultFn<PJRT_Buffer_Destroy_Args>,
-    pub PJRT_Buffer_ElementType: PjrtResultFn<PJRT_Buffer_ElementType_Args>,
-    pub PJRT_Buffer_Dimensions: PjrtResultFn<PJRT_Buffer_Dimensions_Args>,
-    pub PJRT_Buffer_UnpaddedDimensions: PjrtResultFn<PJRT_Buffer_UnpaddedDimensions_Args>,
-    pub PJRT_Buffer_DynamicDimensionIndices: PjrtResultFn<PJRT_Buffer_DynamicDimensionIndices_Args>,
-    pub PJRT_Buffer_GetMemoryLayout: PjrtOpaqueFn,
-    pub PJRT_Buffer_OnDeviceSizeInBytes: PjrtResultFn<PJRT_Buffer_OnDeviceSizeInBytes_Args>,
-    pub PJRT_Buffer_Device: PjrtResultFn<PJRT_Buffer_Device_Args>,
-    pub PJRT_Buffer_Memory: PjrtResultFn<PJRT_Buffer_Memory_Args>,
-    pub PJRT_Buffer_Delete: PjrtResultFn<PJRT_Buffer_Delete_Args>,
-    pub PJRT_Buffer_IsDeleted: PjrtResultFn<PJRT_Buffer_IsDeleted_Args>,
-    pub PJRT_Buffer_CopyToDevice: PjrtOpaqueFn,
-    pub PJRT_Buffer_ToHostBuffer: PjrtResultFn<PJRT_Buffer_ToHostBuffer_Args>,
-    pub PJRT_Buffer_IsOnCpu: PjrtResultFn<PJRT_Buffer_IsOnCpu_Args>,
-    pub PJRT_Buffer_ReadyEvent: PjrtResultFn<PJRT_Buffer_ReadyEvent_Args>,
-    pub PJRT_Buffer_UnsafePointer: PjrtOpaqueFn,
-    pub PJRT_Buffer_IncreaseExternalReferenceCount:
-        PjrtResultFn<PJRT_Buffer_IncreaseExternalReferenceCount_Args>,
-    pub PJRT_Buffer_DecreaseExternalReferenceCount:
-        PjrtResultFn<PJRT_Buffer_DecreaseExternalReferenceCount_Args>,
-    pub PJRT_Buffer_OpaqueDeviceMemoryDataPointer: PjrtOpaqueFn,
-    unused_copy_to_device_stream: [PjrtOpaqueFn; 5],
-    unused_topology_create_destroy: [PjrtOpaqueFn; 2],
-    pub PJRT_TopologyDescription_PlatformName:
-        PjrtResultFn<PJRT_TopologyDescription_PlatformName_Args>,
-    pub PJRT_TopologyDescription_PlatformVersion:
-        PjrtResultFn<PJRT_TopologyDescription_PlatformVersion_Args>,
-    pub PJRT_TopologyDescription_GetDeviceDescriptions:
-        PjrtResultFn<PJRT_TopologyDescription_GetDeviceDescriptions_Args>,
-    unused_topology_serialize: [PjrtOpaqueFn; 1],
-    pub PJRT_TopologyDescription_Attributes: PjrtResultFn<PJRT_TopologyDescription_Attributes_Args>,
-    pub PJRT_Compile: PjrtResultFn<PJRT_Compile_Args>,
-    pub PJRT_Executable_OutputElementTypes: PjrtResultFn<PJRT_Executable_OutputElementTypes_Args>,
-    pub PJRT_Executable_OutputDimensions: PjrtResultFn<PJRT_Executable_OutputDimensions_Args>,
-    unused_before_executable_fingerprint: [PjrtOpaqueFn; 2],
-    pub PJRT_Executable_Fingerprint: PjrtResultFn<PJRT_Executable_Fingerprint_Args>,
-    pub PJRT_Client_TopologyDescription: PjrtResultFn<PJRT_Client_TopologyDescription_Args>,
-    pub PJRT_Executable_GetCompiledMemoryStats:
-        PjrtResultFn<PJRT_Executable_GetCompiledMemoryStats_Args>,
-    pub PJRT_Memory_Kind_Id: PjrtResultFn<PJRT_Memory_Kind_Id_Args>,
-    pub PJRT_ExecuteContext_Create: PjrtResultFn<PJRT_ExecuteContext_Create_Args>,
-    pub PJRT_ExecuteContext_Destroy: PjrtResultFn<PJRT_ExecuteContext_Destroy_Args>,
-    pub PJRT_Buffer_CopyRawToHost: PjrtResultFn<PJRT_Buffer_CopyRawToHost_Args>,
-    pub PJRT_AsyncHostToDeviceTransferManager_Destroy: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_AsyncHostToDeviceTransferManager_TransferData: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Client_CreateBuffersForAsyncHostToDevice: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_AsyncHostToDeviceTransferManager_Device: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_AsyncHostToDeviceTransferManager_BufferCount: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_AsyncHostToDeviceTransferManager_BufferSize: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_AsyncHostToDeviceTransferManager_SetBufferError: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_AsyncHostToDeviceTransferManager_AddMetadata: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Client_DmaMap: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Client_DmaUnmap: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Client_CreateUninitializedBuffer: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Client_UpdateGlobalProcessInfo: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_TopologyDescription_Deserialize: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Client_CreateAliasBuffer: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Client_FulfillAliasBuffer: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_LoadedExecutable_GetDeviceAssignment:
-        PjrtResultFn<PJRT_LoadedExecutable_GetDeviceAssignment_Args>,
-    pub PJRT_Client_CreateErrorBuffer: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_AsyncHostToDeviceTransferManager_TransferLiteral: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Buffer_CopyRawToHostFuture: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Device_PoisonExecution: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Device_CreateAsyncTrackingEvent: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_AsyncTrackingEvent_Destroy: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Executable_GetCompileOptions: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Buffer_DonateWithControlDependency: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Event_Create: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Event_Set: PjrtResultFn<PJRT_Generic_Args>,
-    pub PJRT_Device_GetAttributes: PjrtResultFn<PJRT_Device_GetAttributes_Args>,
-    unused_tail_before_topology_description_fingerprint:
-        [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_BEFORE_TOPOLOGY_DESCRIPTION_FINGERPRINT],
-    pub PJRT_TopologyDescription_Fingerprint:
-        PjrtResultFn<PJRT_TopologyDescription_Fingerprint_Args>,
-    unused_tail_after_topology_description_fingerprint:
-        [PjrtOpaqueFn; PJRT_API_UNUSED_TAIL_AFTER_TOPOLOGY_DESCRIPTION_FINGERPRINT],
-}
-
-// The API table is immutable process-global data.
 unsafe impl Sync for PJRT_Api {}
 
 impl PJRT_Client {
@@ -1440,7 +405,7 @@ unsafe fn checked_ref<'a, T>(ptr: *const T, name: &str) -> Result<&'a T, *mut PJ
     unsafe { ptr.as_ref() }.ok_or_else(|| invalid_argument(format!("{name} must not be null")))
 }
 
-fn pjrt_buffer_type_to_dtype(buffer_type: i32) -> Result<DType, *mut PJRT_Error> {
+fn pjrt_buffer_type_to_dtype(buffer_type: PJRT_Buffer_Type) -> Result<DType, *mut PJRT_Error> {
     match buffer_type {
         PJRT_Buffer_Type_S8 => Ok(DType::Int8),
         PJRT_Buffer_Type_S32 => Ok(DType::Int32),
@@ -1452,12 +417,12 @@ fn pjrt_buffer_type_to_dtype(buffer_type: i32) -> Result<DType, *mut PJRT_Error>
         PJRT_Buffer_Type_BF16 => Ok(DType::Float16B),
         PJRT_Buffer_Type_INVALID => Err(invalid_argument("invalid PJRT buffer type")),
         _ => Err(unimplemented(format!(
-            "unsupported PJRT buffer type {buffer_type}"
+            "unsupported PJRT buffer type {buffer_type:?}"
         ))),
     }
 }
 
-fn dtype_to_pjrt_buffer_type(dtype: DType) -> i32 {
+fn dtype_to_pjrt_buffer_type(dtype: DType) -> PJRT_Buffer_Type {
     match dtype {
         DType::Int8 => PJRT_Buffer_Type_S8,
         DType::Int32 => PJRT_Buffer_Type_S32,
@@ -1598,7 +563,7 @@ fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind
     }
 }
 
-fn parse_mlir_tensor_signature(code: &str) -> Option<(Vec<i64>, i32)> {
+fn parse_mlir_tensor_signature(code: &str) -> Option<(Vec<i64>, PJRT_Buffer_Type)> {
     let start = code.find("tensor<")? + "tensor<".len();
     let rest = &code[start..];
     let end = rest.find('>')?;
@@ -1641,7 +606,7 @@ fn parse_mlir_tensor_signature(code: &str) -> Option<(Vec<i64>, i32)> {
 fn executable_output_signature(
     kind: ExecutableKind,
     program: &PJRT_Program,
-) -> Result<(Vec<i64>, i32), *mut PJRT_Error> {
+) -> Result<(Vec<i64>, PJRT_Buffer_Type), *mut PJRT_Error> {
     let format = c_api_string(program.format, program.format_size, "program.format")?;
     let code = c_api_bytes(program.code.cast_const(), program.code_size, "program.code")?;
     match kind {
@@ -1659,11 +624,15 @@ fn make_executable(
     kind: ExecutableKind,
     name: &str,
     dims: Vec<i64>,
-    output_type: i32,
+    output_type: PJRT_Buffer_Type,
 ) -> PJRT_Executable {
-    let output_layouts = vec![PJRT_Layouts_MemoryLayout {
+    let mut output_layouts = vec![PJRT_Layouts_MemoryLayout {
         serialized: row_major_layout_string(dims.len()),
     }];
+    let output_layout_ptrs = output_layouts
+        .iter_mut()
+        .map(|layout| layout as *mut PJRT_Layouts_MemoryLayout)
+        .collect::<Vec<_>>();
     let output_memory_kinds = vec![cstring_lossy("dram")];
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
@@ -1684,6 +653,7 @@ fn make_executable(
         output_dims: dims,
         output_dim_sizes,
         output_layouts,
+        output_layout_ptrs,
         output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
@@ -1694,10 +664,15 @@ fn make_loaded_executable(
     kind: ExecutableKind,
     name: &str,
     dims: Vec<i64>,
-    output_type: i32,
+    output_type: PJRT_Buffer_Type,
     addressable_devices: Vec<*mut PJRT_Device>,
 ) -> PJRT_LoadedExecutable {
     let executable = make_executable(kind, name, dims, output_type);
+    let mut output_layouts = executable.output_layouts;
+    let output_layout_ptrs = output_layouts
+        .iter_mut()
+        .map(|layout| layout as *mut PJRT_Layouts_MemoryLayout)
+        .collect::<Vec<_>>();
     PJRT_LoadedExecutable {
         kind: executable.kind,
         name: executable.name,
@@ -1706,7 +681,8 @@ fn make_loaded_executable(
         output_types: executable.output_types,
         output_dims: executable.output_dims,
         output_dim_sizes: executable.output_dim_sizes,
-        output_layouts: executable.output_layouts,
+        output_layouts,
+        output_layout_ptrs,
         output_memory_kinds: executable.output_memory_kinds,
         output_memory_kind_ptrs: executable.output_memory_kind_ptrs,
         output_memory_kind_sizes: executable.output_memory_kind_sizes,
@@ -1716,12 +692,16 @@ fn make_loaded_executable(
 }
 
 fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
-    let output_layouts = executable
+    let mut output_layouts = executable
         .output_layouts
         .iter()
         .map(|layout| PJRT_Layouts_MemoryLayout {
             serialized: layout.serialized.clone(),
         })
+        .collect::<Vec<_>>();
+    let output_layout_ptrs = output_layouts
+        .iter_mut()
+        .map(|layout| layout as *mut PJRT_Layouts_MemoryLayout)
         .collect::<Vec<_>>();
     let output_memory_kinds = executable.output_memory_kinds.clone();
     let output_memory_kind_ptrs = output_memory_kinds
@@ -1737,6 +717,7 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
         output_dims: executable.output_dims.clone(),
         output_dim_sizes: executable.output_dim_sizes.clone(),
         output_layouts,
+        output_layout_ptrs,
         output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes: executable.output_memory_kind_sizes.clone(),
@@ -1792,7 +773,7 @@ fn executable_layout_mode(executable: &PJRT_Executable) -> Option<String> {
             .rev()
             .map(|dim| dim.to_string())
             .collect::<Vec<_>>()
-            .join(",");
+            .join(", ");
         Some(format!("{{{minor_to_major}}}"))
     }
 }
@@ -1817,7 +798,7 @@ fn executable_fingerprint_string(
     kind: ExecutableKind,
     name: &str,
     dims: &[i64],
-    output_type: i32,
+    output_type: PJRT_Buffer_Type,
 ) -> CString {
     let kind_name = match kind {
         ExecutableKind::EltwiseAddBf16 => "eltwise_add_bf16",
@@ -1828,7 +809,8 @@ fn executable_fingerprint_string(
         .collect::<Vec<_>>()
         .join("x");
     cstring_lossy(&format!(
-        "tt:{kind_name}:name={name}:dims={dims}:type={output_type}:v1"
+        "tt:{kind_name}:name={name}:dims={dims}:type={}:v1",
+        output_type as u32
     ))
 }
 
@@ -2133,7 +1115,7 @@ pub unsafe extern "C" fn TT_Client_AddressableMemories(
     args.addressable_memories = if client.memory_ptrs.is_empty() {
         ptr::null()
     } else {
-        client.memory_ptrs.as_ptr().cast::<*mut c_void>()
+        client.memory_ptrs.as_ptr()
     };
     args.num_addressable_memories = client.memory_ptrs.len();
     ptr::null_mut()
@@ -2399,7 +1381,7 @@ pub unsafe extern "C" fn TT_Executable_OutputElementTypes(
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };
-    args.output_types = executable.output_types.as_ptr();
+    args.output_types = executable.output_types.as_ptr().cast_mut();
     args.num_output_types = executable.output_types.len();
     ptr::null_mut()
 }
@@ -2542,15 +1524,11 @@ pub unsafe extern "C" fn TT_Layouts_Executable_GetOutputLayouts(
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };
-    args.num_outputs = executable.output_layouts.len();
-    args.layouts = if executable.output_layouts.is_empty() {
+    args.num_outputs = executable.output_layout_ptrs.len();
+    args.layouts = if executable.output_layout_ptrs.is_empty() {
         ptr::null_mut()
     } else {
-        executable
-            .output_layouts
-            .as_ptr()
-            .cast::<*mut PJRT_Layouts_MemoryLayout>()
-            .cast_mut()
+        executable.output_layout_ptrs.as_ptr().cast_mut()
     };
     ptr::null_mut()
 }
@@ -2796,7 +1774,6 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         | PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes
         | PJRT_HostBufferSemantics_kImmutableZeroCopy
         | PJRT_HostBufferSemantics_kMutableZeroCopy => {}
-        _ => return invalid_argument("unknown host buffer semantics"),
     }
 
     let dtype = match pjrt_buffer_type_to_dtype(args.type_) {
@@ -2858,7 +1835,7 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         Err(err) => return err,
     };
     log(format!(
-        "pjrt buffer_from_host_buffer type={} dims={:?} local_hardware_id={}",
+        "pjrt buffer_from_host_buffer type={:?} dims={:?} local_hardware_id={}",
         args.type_, dims_i64, local_hardware_id
     ));
 
@@ -3055,7 +2032,7 @@ pub unsafe extern "C" fn TT_Device_DefaultMemory(
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
-    args.default_memory = device.default_memory;
+    args.memory = device.default_memory;
     ptr::null_mut()
 }
 
@@ -3105,7 +2082,7 @@ pub unsafe extern "C" fn TT_Device_GetAttributes(
     }
     args.attributes = ptr::null();
     args.num_attributes = 0;
-    args.device_attributes = Box::into_raw(Box::new(PJRT_Device_Attributes { _private: [] }));
+    args.device_attributes = Box::into_raw(Box::new(PJRT_Device_Attributes { _unused: [] }));
     args.attributes_deleter = Some(noop_device_attributes_deleter);
     ptr::null_mut()
 }
@@ -3256,7 +2233,7 @@ pub unsafe extern "C" fn TT_Buffer_UnpaddedDimensions(
     let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
         return invalid_argument("buffer must not be null");
     };
-    args.dims = if buffer.dims.is_empty() {
+    args.unpadded_dims = if buffer.dims.is_empty() {
         ptr::null()
     } else {
         buffer.dims.as_ptr()
@@ -3275,8 +2252,8 @@ pub unsafe extern "C" fn TT_Buffer_DynamicDimensionIndices(
     let Ok(_buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
         return invalid_argument("buffer must not be null");
     };
-    args.dynamic_dimension_indices = ptr::null();
-    args.num_dynamic_dimension_indices = 0;
+    args.dynamic_dim_indices = ptr::null();
+    args.num_dynamic_dims = 0;
     ptr::null_mut()
 }
 
@@ -3450,7 +2427,7 @@ pub unsafe extern "C" fn TT_ExecuteContext_Create(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    args.context = Box::into_raw(Box::new(PJRT_ExecuteContext { _private: [] }));
+    args.context = Box::into_raw(Box::new(PJRT_ExecuteContext { _unused: [] }));
     ptr::null_mut()
 }
 
@@ -3757,170 +2734,120 @@ static PJRT_LAYOUTS_EXTENSION: PJRT_Layouts_Extension = PJRT_Layouts_Extension {
     PJRT_Layouts_PJRT_Executable_GetOutputLayouts: Some(TT_Layouts_Executable_GetOutputLayouts),
 };
 
-static PJRT_API: PJRT_Api = PJRT_Api {
-    struct_size: size_of::<PJRT_Api>(),
-    extension_start: ptr::null_mut(),
-    pjrt_api_version: PJRT_Api_Version {
+fn build_pjrt_api() -> PJRT_Api {
+    let mut api: PJRT_Api = unsafe { std::mem::zeroed() };
+
+    api.struct_size = size_of::<PJRT_Api>();
+    api.extension_start = ptr::addr_of!(PJRT_LAYOUTS_EXTENSION.base).cast_mut();
+    api.pjrt_api_version = PJRT_Api_Version {
         struct_size: size_of::<PJRT_Api_Version>(),
         extension_start: ptr::null_mut(),
-        major_version: PJRT_API_MAJOR,
-        minor_version: PJRT_API_MINOR,
-    },
-    PJRT_Error_Destroy: Some(TT_Error_Destroy),
-    PJRT_Error_Message: Some(TT_Error_Message),
-    PJRT_Error_GetCode: Some(TT_Error_GetCode),
-    PJRT_Plugin_Initialize: Some(TT_Plugin_Initialize),
-    PJRT_Plugin_Attributes: Some(TT_Plugin_Attributes),
-    PJRT_Event_Destroy: Some(TT_Event_Destroy),
-    PJRT_Event_IsReady: Some(TT_Event_IsReady),
-    PJRT_Event_Error: Some(TT_Event_Error),
-    PJRT_Event_Await: Some(TT_Event_Await),
-    PJRT_Event_OnReady: Some(TT_Event_OnReady),
-    PJRT_Client_Create: Some(TT_Client_Create),
-    PJRT_Client_Destroy: Some(TT_Client_Destroy),
-    PJRT_Client_PlatformName: Some(TT_Client_PlatformName),
-    PJRT_Client_ProcessIndex: Some(TT_Client_ProcessIndex),
-    PJRT_Client_PlatformVersion: Some(TT_Client_PlatformVersion),
-    PJRT_Client_Devices: Some(TT_Client_Devices),
-    PJRT_Client_AddressableDevices: Some(TT_Client_AddressableDevices),
-    PJRT_Client_LookupDevice: Some(TT_Client_LookupDevice),
-    PJRT_Client_LookupAddressableDevice: Some(TT_Client_LookupAddressableDevice),
-    PJRT_Client_AddressableMemories: Some(TT_Client_AddressableMemories),
-    PJRT_Client_Compile: Some(TT_Client_Compile),
-    PJRT_Client_DefaultDeviceAssignment: Some(TT_Client_DefaultDeviceAssignment),
-    PJRT_Client_BufferFromHostBuffer: Some(TT_Client_BufferFromHostBuffer),
-    PJRT_DeviceDescription_Id: Some(TT_DeviceDescription_Id),
-    PJRT_DeviceDescription_ProcessIndex: Some(TT_DeviceDescription_ProcessIndex),
-    PJRT_DeviceDescription_Attributes: Some(TT_DeviceDescription_Attributes),
-    PJRT_DeviceDescription_Kind: Some(TT_DeviceDescription_Kind),
-    PJRT_DeviceDescription_DebugString: Some(TT_DeviceDescription_DebugString),
-    PJRT_DeviceDescription_ToString: Some(TT_DeviceDescription_ToString),
-    PJRT_Device_GetDescription: Some(TT_Device_GetDescription),
-    PJRT_Device_IsAddressable: Some(TT_Device_IsAddressable),
-    PJRT_Device_LocalHardwareId: Some(TT_Device_LocalHardwareId),
-    PJRT_Device_AddressableMemories: Some(TT_Device_AddressableMemories),
-    PJRT_Device_DefaultMemory: Some(TT_Device_DefaultMemory),
-    PJRT_Device_MemoryStats: Some(TT_Device_MemoryStats),
-    PJRT_Memory_Id: Some(TT_Memory_Id),
-    PJRT_Memory_Kind: Some(TT_Memory_Kind),
-    PJRT_Memory_DebugString: Some(TT_Memory_DebugString),
-    PJRT_Memory_ToString: Some(TT_Memory_ToString),
-    PJRT_Memory_AddressableByDevices: Some(TT_Memory_AddressableByDevices),
-    PJRT_Executable_Destroy: Some(TT_Executable_Destroy),
-    PJRT_Executable_Name: Some(TT_Executable_Name),
-    PJRT_Executable_NumReplicas: Some(TT_Executable_NumReplicas),
-    PJRT_Executable_NumPartitions: Some(TT_Executable_NumPartitions),
-    PJRT_Executable_NumOutputs: Some(TT_Executable_NumOutputs),
-    PJRT_Executable_SizeOfGeneratedCodeInBytes: None,
-    PJRT_Executable_GetCostAnalysis: None,
-    PJRT_Executable_OutputMemoryKinds: Some(TT_Executable_OutputMemoryKinds),
-    PJRT_Executable_OptimizedProgram: Some(TT_Executable_OptimizedProgram),
-    PJRT_Executable_Serialize: None,
-    PJRT_LoadedExecutable_Destroy: Some(TT_LoadedExecutable_Destroy),
-    PJRT_LoadedExecutable_GetExecutable: Some(TT_LoadedExecutable_GetExecutable),
-    PJRT_LoadedExecutable_AddressableDevices: Some(TT_LoadedExecutable_AddressableDevices),
-    PJRT_LoadedExecutable_Delete: Some(TT_LoadedExecutable_Delete),
-    PJRT_LoadedExecutable_IsDeleted: Some(TT_LoadedExecutable_IsDeleted),
-    PJRT_LoadedExecutable_Execute: Some(TT_LoadedExecutable_Execute),
-    PJRT_Executable_DeserializeAndLoad: None,
-    PJRT_LoadedExecutable_Fingerprint: Some(TT_LoadedExecutable_Fingerprint),
-    PJRT_Buffer_Destroy: Some(TT_Buffer_Destroy),
-    PJRT_Buffer_ElementType: Some(TT_Buffer_ElementType),
-    PJRT_Buffer_Dimensions: Some(TT_Buffer_Dimensions),
-    PJRT_Buffer_UnpaddedDimensions: Some(TT_Buffer_UnpaddedDimensions),
-    PJRT_Buffer_DynamicDimensionIndices: Some(TT_Buffer_DynamicDimensionIndices),
-    PJRT_Buffer_GetMemoryLayout: None,
-    PJRT_Buffer_OnDeviceSizeInBytes: Some(TT_Buffer_OnDeviceSizeInBytes),
-    PJRT_Buffer_Device: Some(TT_Buffer_Device),
-    PJRT_Buffer_Memory: Some(TT_Buffer_Memory),
-    PJRT_Buffer_Delete: Some(TT_Buffer_Delete),
-    PJRT_Buffer_IsDeleted: Some(TT_Buffer_IsDeleted),
-    PJRT_Buffer_CopyToDevice: None,
-    PJRT_Buffer_ToHostBuffer: Some(TT_Buffer_ToHostBuffer),
-    PJRT_Buffer_IsOnCpu: Some(TT_Buffer_IsOnCpu),
-    PJRT_Buffer_ReadyEvent: Some(TT_Buffer_ReadyEvent),
-    PJRT_Buffer_UnsafePointer: None,
-    PJRT_Buffer_IncreaseExternalReferenceCount: Some(TT_Buffer_IncreaseExternalReferenceCount),
-    PJRT_Buffer_DecreaseExternalReferenceCount: Some(TT_Buffer_DecreaseExternalReferenceCount),
-    PJRT_Buffer_OpaqueDeviceMemoryDataPointer: None,
-    unused_copy_to_device_stream: [None; 5],
-    unused_topology_create_destroy: [None; 2],
-    PJRT_TopologyDescription_PlatformName: Some(TT_TopologyDescription_PlatformName),
-    PJRT_TopologyDescription_PlatformVersion: Some(TT_TopologyDescription_PlatformVersion),
-    PJRT_TopologyDescription_GetDeviceDescriptions: Some(
-        TT_TopologyDescription_GetDeviceDescriptions,
-    ),
-    unused_topology_serialize: [None; 1],
-    PJRT_TopologyDescription_Attributes: Some(TT_TopologyDescription_Attributes),
-    PJRT_Compile: Some(TT_Compile),
-    PJRT_Executable_OutputElementTypes: Some(TT_Executable_OutputElementTypes),
-    PJRT_Executable_OutputDimensions: Some(TT_Executable_OutputDimensions),
-    unused_before_executable_fingerprint: [None; 2],
-    PJRT_Executable_Fingerprint: Some(TT_Executable_Fingerprint),
-    PJRT_Client_TopologyDescription: Some(TT_Client_TopologyDescription),
-    PJRT_Executable_GetCompiledMemoryStats: Some(TT_Executable_GetCompiledMemoryStats),
-    PJRT_Memory_Kind_Id: Some(TT_Memory_Kind_Id),
-    PJRT_ExecuteContext_Create: Some(TT_ExecuteContext_Create),
-    PJRT_ExecuteContext_Destroy: Some(TT_ExecuteContext_Destroy),
-    PJRT_Buffer_CopyRawToHost: Some(TT_Buffer_CopyRawToHost),
-    PJRT_AsyncHostToDeviceTransferManager_Destroy: Some(
-        TT_AsyncHostToDeviceTransferManager_Destroy,
-    ),
-    PJRT_AsyncHostToDeviceTransferManager_TransferData: Some(
-        TT_AsyncHostToDeviceTransferManager_TransferData,
-    ),
-    PJRT_Client_CreateBuffersForAsyncHostToDevice: Some(
-        TT_Client_CreateBuffersForAsyncHostToDevice,
-    ),
-    PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer: Some(
-        TT_AsyncHostToDeviceTransferManager_RetrieveBuffer,
-    ),
-    PJRT_AsyncHostToDeviceTransferManager_Device: Some(
-        TT_AsyncHostToDeviceTransferManager_Device,
-    ),
-    PJRT_AsyncHostToDeviceTransferManager_BufferCount: Some(
-        TT_AsyncHostToDeviceTransferManager_BufferCount,
-    ),
-    PJRT_AsyncHostToDeviceTransferManager_BufferSize: Some(
-        TT_AsyncHostToDeviceTransferManager_BufferSize,
-    ),
-    PJRT_AsyncHostToDeviceTransferManager_SetBufferError: Some(
-        TT_AsyncHostToDeviceTransferManager_SetBufferError,
-    ),
-    PJRT_AsyncHostToDeviceTransferManager_AddMetadata: Some(
-        TT_AsyncHostToDeviceTransferManager_AddMetadata,
-    ),
-    PJRT_Client_DmaMap: Some(TT_Client_DmaMap),
-    PJRT_Client_DmaUnmap: Some(TT_Client_DmaUnmap),
-    PJRT_Client_CreateUninitializedBuffer: Some(TT_Client_CreateUninitializedBuffer),
-    PJRT_Client_UpdateGlobalProcessInfo: Some(TT_Client_UpdateGlobalProcessInfo),
-    PJRT_TopologyDescription_Deserialize: Some(TT_TopologyDescription_Deserialize),
-    PJRT_Client_CreateAliasBuffer: Some(TT_Client_CreateAliasBuffer),
-    PJRT_Client_FulfillAliasBuffer: Some(TT_Client_FulfillAliasBuffer),
-    PJRT_LoadedExecutable_GetDeviceAssignment: Some(TT_LoadedExecutable_GetDeviceAssignment),
-    PJRT_Client_CreateErrorBuffer: Some(TT_Client_CreateErrorBuffer),
-    PJRT_AsyncHostToDeviceTransferManager_TransferLiteral: Some(
-        TT_AsyncHostToDeviceTransferManager_TransferLiteral,
-    ),
-    PJRT_Buffer_CopyRawToHostFuture: Some(TT_Buffer_CopyRawToHostFuture),
-    PJRT_Device_PoisonExecution: Some(TT_Device_PoisonExecution),
-    PJRT_Device_CreateAsyncTrackingEvent: Some(TT_Device_CreateAsyncTrackingEvent),
-    PJRT_AsyncTrackingEvent_Destroy: Some(TT_AsyncTrackingEvent_Destroy),
-    PJRT_Executable_GetCompileOptions: Some(TT_Executable_GetCompileOptions),
-    PJRT_Buffer_DonateWithControlDependency: Some(TT_Buffer_DonateWithControlDependency),
-    PJRT_Event_Create: Some(TT_Event_Create),
-    PJRT_Event_Set: Some(TT_Event_Set),
-    PJRT_Device_GetAttributes: Some(TT_Device_GetAttributes),
-    unused_tail_before_topology_description_fingerprint:
-        [None; PJRT_API_UNUSED_TAIL_BEFORE_TOPOLOGY_DESCRIPTION_FINGERPRINT],
-    PJRT_TopologyDescription_Fingerprint: Some(TT_TopologyDescription_Fingerprint),
-    unused_tail_after_topology_description_fingerprint:
-        [None; PJRT_API_UNUSED_TAIL_AFTER_TOPOLOGY_DESCRIPTION_FINGERPRINT],
-};
+        major_version: PJRT_API_MAJOR as _,
+        minor_version: PJRT_API_MINOR as _,
+    };
+
+    api.PJRT_Error_Destroy = Some(TT_Error_Destroy);
+    api.PJRT_Error_Message = Some(TT_Error_Message);
+    api.PJRT_Error_GetCode = Some(TT_Error_GetCode);
+    api.PJRT_Plugin_Initialize = Some(TT_Plugin_Initialize);
+    api.PJRT_Plugin_Attributes = Some(TT_Plugin_Attributes);
+    api.PJRT_Event_Destroy = Some(TT_Event_Destroy);
+    api.PJRT_Event_IsReady = Some(TT_Event_IsReady);
+    api.PJRT_Event_Error = Some(TT_Event_Error);
+    api.PJRT_Event_Await = Some(TT_Event_Await);
+    api.PJRT_Event_OnReady = Some(TT_Event_OnReady);
+    api.PJRT_Client_Create = Some(TT_Client_Create);
+    api.PJRT_Client_Destroy = Some(TT_Client_Destroy);
+    api.PJRT_Client_PlatformName = Some(TT_Client_PlatformName);
+    api.PJRT_Client_ProcessIndex = Some(TT_Client_ProcessIndex);
+    api.PJRT_Client_PlatformVersion = Some(TT_Client_PlatformVersion);
+    api.PJRT_Client_Devices = Some(TT_Client_Devices);
+    api.PJRT_Client_AddressableDevices = Some(TT_Client_AddressableDevices);
+    api.PJRT_Client_LookupDevice = Some(TT_Client_LookupDevice);
+    api.PJRT_Client_LookupAddressableDevice = Some(TT_Client_LookupAddressableDevice);
+    api.PJRT_Client_AddressableMemories = Some(TT_Client_AddressableMemories);
+    api.PJRT_Client_Compile = Some(TT_Client_Compile);
+    api.PJRT_Client_DefaultDeviceAssignment = Some(TT_Client_DefaultDeviceAssignment);
+    api.PJRT_Client_BufferFromHostBuffer = Some(TT_Client_BufferFromHostBuffer);
+    api.PJRT_DeviceDescription_Id = Some(TT_DeviceDescription_Id);
+    api.PJRT_DeviceDescription_ProcessIndex = Some(TT_DeviceDescription_ProcessIndex);
+    api.PJRT_DeviceDescription_Attributes = Some(TT_DeviceDescription_Attributes);
+    api.PJRT_DeviceDescription_Kind = Some(TT_DeviceDescription_Kind);
+    api.PJRT_DeviceDescription_DebugString = Some(TT_DeviceDescription_DebugString);
+    api.PJRT_DeviceDescription_ToString = Some(TT_DeviceDescription_ToString);
+    api.PJRT_Device_GetDescription = Some(TT_Device_GetDescription);
+    api.PJRT_Device_IsAddressable = Some(TT_Device_IsAddressable);
+    api.PJRT_Device_LocalHardwareId = Some(TT_Device_LocalHardwareId);
+    api.PJRT_Device_AddressableMemories = Some(TT_Device_AddressableMemories);
+    api.PJRT_Device_DefaultMemory = Some(TT_Device_DefaultMemory);
+    api.PJRT_Device_MemoryStats = Some(TT_Device_MemoryStats);
+    api.PJRT_Memory_Id = Some(TT_Memory_Id);
+    api.PJRT_Memory_Kind = Some(TT_Memory_Kind);
+    api.PJRT_Memory_DebugString = Some(TT_Memory_DebugString);
+    api.PJRT_Memory_ToString = Some(TT_Memory_ToString);
+    api.PJRT_Memory_AddressableByDevices = Some(TT_Memory_AddressableByDevices);
+    api.PJRT_Executable_Destroy = Some(TT_Executable_Destroy);
+    api.PJRT_Executable_Name = Some(TT_Executable_Name);
+    api.PJRT_Executable_NumReplicas = Some(TT_Executable_NumReplicas);
+    api.PJRT_Executable_NumPartitions = Some(TT_Executable_NumPartitions);
+    api.PJRT_Executable_NumOutputs = Some(TT_Executable_NumOutputs);
+    api.PJRT_Executable_OutputMemoryKinds = Some(TT_Executable_OutputMemoryKinds);
+    api.PJRT_Executable_OptimizedProgram = Some(TT_Executable_OptimizedProgram);
+    api.PJRT_LoadedExecutable_Destroy = Some(TT_LoadedExecutable_Destroy);
+    api.PJRT_LoadedExecutable_GetExecutable = Some(TT_LoadedExecutable_GetExecutable);
+    api.PJRT_LoadedExecutable_AddressableDevices = Some(TT_LoadedExecutable_AddressableDevices);
+    api.PJRT_LoadedExecutable_Delete = Some(TT_LoadedExecutable_Delete);
+    api.PJRT_LoadedExecutable_IsDeleted = Some(TT_LoadedExecutable_IsDeleted);
+    api.PJRT_LoadedExecutable_Execute = Some(TT_LoadedExecutable_Execute);
+    api.PJRT_LoadedExecutable_Fingerprint = Some(TT_LoadedExecutable_Fingerprint);
+    api.PJRT_Buffer_Destroy = Some(TT_Buffer_Destroy);
+    api.PJRT_Buffer_ElementType = Some(TT_Buffer_ElementType);
+    api.PJRT_Buffer_Dimensions = Some(TT_Buffer_Dimensions);
+    api.PJRT_Buffer_UnpaddedDimensions = Some(TT_Buffer_UnpaddedDimensions);
+    api.PJRT_Buffer_DynamicDimensionIndices = Some(TT_Buffer_DynamicDimensionIndices);
+    api.PJRT_Buffer_OnDeviceSizeInBytes = Some(TT_Buffer_OnDeviceSizeInBytes);
+    api.PJRT_Buffer_Device = Some(TT_Buffer_Device);
+    api.PJRT_Buffer_Memory = Some(TT_Buffer_Memory);
+    api.PJRT_Buffer_Delete = Some(TT_Buffer_Delete);
+    api.PJRT_Buffer_IsDeleted = Some(TT_Buffer_IsDeleted);
+    api.PJRT_Buffer_ToHostBuffer = Some(TT_Buffer_ToHostBuffer);
+    api.PJRT_Buffer_IsOnCpu = Some(TT_Buffer_IsOnCpu);
+    api.PJRT_Buffer_ReadyEvent = Some(TT_Buffer_ReadyEvent);
+    api.PJRT_Buffer_IncreaseExternalReferenceCount = Some(TT_Buffer_IncreaseExternalReferenceCount);
+    api.PJRT_Buffer_DecreaseExternalReferenceCount = Some(TT_Buffer_DecreaseExternalReferenceCount);
+    api.PJRT_TopologyDescription_PlatformName = Some(TT_TopologyDescription_PlatformName);
+    api.PJRT_TopologyDescription_PlatformVersion = Some(TT_TopologyDescription_PlatformVersion);
+    api.PJRT_TopologyDescription_GetDeviceDescriptions = Some(TT_TopologyDescription_GetDeviceDescriptions);
+    api.PJRT_TopologyDescription_Attributes = Some(TT_TopologyDescription_Attributes);
+    api.PJRT_Compile = Some(TT_Compile);
+    api.PJRT_Executable_OutputElementTypes = Some(TT_Executable_OutputElementTypes);
+    api.PJRT_Executable_OutputDimensions = Some(TT_Executable_OutputDimensions);
+    api.PJRT_Executable_Fingerprint = Some(TT_Executable_Fingerprint);
+    api.PJRT_Client_TopologyDescription = Some(TT_Client_TopologyDescription);
+    api.PJRT_Executable_GetCompiledMemoryStats = Some(TT_Executable_GetCompiledMemoryStats);
+    api.PJRT_Memory_Kind_Id = Some(TT_Memory_Kind_Id);
+    api.PJRT_ExecuteContext_Create = Some(TT_ExecuteContext_Create);
+    api.PJRT_ExecuteContext_Destroy = Some(TT_ExecuteContext_Destroy);
+    api.PJRT_Buffer_CopyRawToHost = Some(TT_Buffer_CopyRawToHost);
+    api.PJRT_LoadedExecutable_GetDeviceAssignment = Some(TT_LoadedExecutable_GetDeviceAssignment);
+    api.PJRT_Device_GetAttributes = Some(TT_Device_GetAttributes);
+    api.PJRT_TopologyDescription_Fingerprint = Some(TT_TopologyDescription_Fingerprint);
+
+    api
+}
+
+static INIT_PJRT_API: Once = Once::new();
+static mut PJRT_API: std::mem::MaybeUninit<PJRT_Api> = std::mem::MaybeUninit::uninit();
 
 #[unsafe(no_mangle)]
 pub extern "C" fn GetPjrtApi() -> *const PJRT_Api {
-    &PJRT_API
+    INIT_PJRT_API.call_once(|| unsafe {
+        std::ptr::write(
+            std::ptr::addr_of_mut!(PJRT_API),
+            std::mem::MaybeUninit::new(build_pjrt_api()),
+        );
+    });
+    std::ptr::addr_of!(PJRT_API).cast::<PJRT_Api>()
 }
 
 #[cfg(test)]
@@ -3979,8 +2906,8 @@ mod tests {
     #[test]
     fn get_pjrt_api_exposes_minimal_client_and_device_interface() {
         let api = unsafe { &*GetPjrtApi() };
-        assert_eq!(api.pjrt_api_version.major_version, PJRT_API_MAJOR);
-        assert_eq!(api.pjrt_api_version.minor_version, PJRT_API_MINOR);
+        assert_eq!(api.pjrt_api_version.major_version, PJRT_API_MAJOR as i32);
+        assert_eq!(api.pjrt_api_version.minor_version, PJRT_API_MINOR as i32);
 
         let plugin_init = api
             .PJRT_Plugin_Initialize

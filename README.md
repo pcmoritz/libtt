@@ -91,6 +91,30 @@ cargo build --release
 On Linux the shared library will be written to `target/release/libtt.so`. On
 macOS the corresponding artifact is `target/release/libtt.dylib`.
 
+## Regenerating PJRT Bindings
+
+The checked-in Rust bindings live in `src/pjrt_bindings.rs` and are generated
+from the vendored OpenXLA header at:
+
+```text
+third_party/openxla/xla/pjrt/c/pjrt_c_api.h
+```
+
+To regenerate them after updating that header, run:
+
+```bash
+cargo run --manifest-path xtask/Cargo.toml -- update-pjrt-bindings
+```
+
+Notes:
+
+- This uses the standalone `xtask` helper crate, so the main crate does not
+  depend on `bindgen`.
+- The regeneration helper has its own lockfile at `xtask/Cargo.lock`.
+- You will need a working `libclang`/`clang` installation for `bindgen`.
+- After regenerating, review the diff in `src/pjrt_bindings.rs` and run
+  `cargo test`.
+
 ## Using It
 
 Load the shared library, resolve `GetPjrtApi`, and use the official
