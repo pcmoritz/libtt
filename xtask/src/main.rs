@@ -1,7 +1,7 @@
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn main() {
     if let Err(err) = run() {
@@ -39,14 +39,23 @@ fn update_pjrt_bindings() -> Result<(), Box<dyn Error>> {
         .to_path_buf();
 
     let header = repo_root.join("third_party/openxla/xla/pjrt/c/pjrt_c_api.h");
+    let layouts_header =
+        repo_root.join("third_party/openxla/xla/pjrt/c/pjrt_c_api_layouts_extension.h");
     let output = repo_root.join("src/pjrt_bindings.rs");
 
     if !header.is_file() {
         return Err(format!("missing PJRT header: {}", header.display()).into());
     }
+    if !layouts_header.is_file() {
+        return Err(format!("missing PJRT layouts header: {}", layouts_header.display()).into());
+    }
 
     let bindings = bindgen::Builder::default()
-        .header(path_to_string(&header)?)
+        .header_contents(
+            "pjrt_bindings_wrapper.h",
+            "#include \"xla/pjrt/c/pjrt_c_api.h\"\n\
+             #include \"xla/pjrt/c/pjrt_c_api_layouts_extension.h\"\n",
+        )
         .clang_arg(format!("-I{}", repo_root.join("third_party/openxla").display()))
         .blocklist_type("PJRT_Error")
         .blocklist_type("PJRT_DeviceDescription")
@@ -56,6 +65,10 @@ fn update_pjrt_bindings() -> Result<(), Box<dyn Error>> {
         .blocklist_type("PJRT_Event")
         .blocklist_type("PJRT_Buffer")
         .blocklist_type("PJRT_Client")
+        .blocklist_type("PJRT_Executable")
+        .blocklist_type("PJRT_LoadedExecutable")
+        .blocklist_type("PJRT_Layouts_MemoryLayout")
+        .blocklist_type("PJRT_Layouts_SerializedLayout")
         .allowlist_item("PJRT_.*")
         .default_enum_style(bindgen::EnumVariation::Rust {
             non_exhaustive: false,
@@ -65,7 +78,8 @@ fn update_pjrt_bindings() -> Result<(), Box<dyn Error>> {
         .map_err(|_| "failed to generate PJRT bindings")?;
 
     let mut contents = String::from(
-        "// Generated from third_party/openxla/xla/pjrt/c/pjrt_c_api.h.\n\
+        "// Generated from third_party/openxla/xla/pjrt/c/pjrt_c_api.h and\n\
+         // third_party/openxla/xla/pjrt/c/pjrt_c_api_layouts_extension.h.\n\
          // Regenerate with `cargo run -p xtask -- update-pjrt-bindings`.\n\n",
     );
     contents.push_str(&bindings.to_string());
@@ -73,10 +87,4 @@ fn update_pjrt_bindings() -> Result<(), Box<dyn Error>> {
     fs::write(&output, contents)?;
     println!("updated {}", output.display());
     Ok(())
-}
-
-fn path_to_string(path: &Path) -> Result<String, Box<dyn Error>> {
-    path.to_str()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()).into())
 }

@@ -277,9 +277,7 @@ pub(crate) fn execute_slow_dispatch(path: &Path, commands: &[DispatchCommand]) -
                     win.target(*core, None, 0, NocOrdering::Strict)?;
                     let deadline = Instant::now() + LAUNCH_TIMEOUT;
                     loop {
-                        if win.read(TensixL1::GO_MSG as usize + 3, 1)?[0]
-                            == DevMsgs::RUN_MSG_DONE
-                        {
+                        if win.read(TensixL1::GO_MSG as usize + 3, 1)?[0] == DevMsgs::RUN_MSG_DONE {
                             break;
                         }
                         if Instant::now() > deadline {
@@ -728,7 +726,10 @@ mod tests {
         assert_eq!(mask, (1 << 0) | (1 << 16) | (1 << 24));
         assert_eq!(blob.len(), 25 * 16);
         assert_eq!(read_u32(&blob, 0), TensixL1::DATA_BUFFER_SPACE_BASE);
-        assert_eq!(read_u32(&blob, 16 * 16), TensixL1::DATA_BUFFER_SPACE_BASE + cb0_size);
+        assert_eq!(
+            read_u32(&blob, 16 * 16),
+            TensixL1::DATA_BUFFER_SPACE_BASE + cb0_size
+        );
         assert_eq!(
             read_u32(&blob, 24 * 16),
             TensixL1::DATA_BUFFER_SPACE_BASE + cb0_size + cb16_size

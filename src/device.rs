@@ -361,7 +361,10 @@ impl Device {
         if lhs.shape != rhs.shape {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("input shapes must match, got {:?} and {:?}", lhs.shape, rhs.shape),
+                format!(
+                    "input shapes must match, got {:?} and {:?}",
+                    lhs.shape, rhs.shape
+                ),
             ));
         }
 
@@ -718,7 +721,10 @@ fn discover_with(root: &Path) -> Vec<Device> {
             match Device::from_path(id, path.clone()) {
                 Ok(device) => Some(device),
                 Err(err) => {
-                    log(format!("device[{id}] skipped path={} err={err}", path.display()));
+                    log(format!(
+                        "device[{id}] skipped path={} err={err}",
+                        path.display()
+                    ));
                     None
                 }
             }
