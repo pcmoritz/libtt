@@ -56,11 +56,15 @@ assert_eq!(roundtrip, data);
 ## Build
 
 ```bash
-cargo build --release
+bazel build //:tt_pjrt_plugin
 ```
 
-On Linux the shared library will be written to `target/release/libtt.so`. On
-macOS the corresponding artifact is `target/release/libtt.dylib`.
+The Bazel target builds a C++ PJRT plugin against the official upstream
+`xla/pjrt/c/pjrt_c_api.h` header vendored under `third_party/openxla/`, and
+links it with a Rust static library built from the existing `src/device.rs`,
+`src/dram.rs`, `src/hw.rs`, `src/linux/*`, and `src/log.rs` sources.
+
+The shared library artifact is written under `bazel-bin/`.
 
 ## Regenerating PJRT Bindings
 

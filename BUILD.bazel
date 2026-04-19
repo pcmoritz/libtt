@@ -1,0 +1,57 @@
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
+
+rust_static_library(
+    name = "tt_rust_bridge",
+    srcs = [
+        "src/bazel_bridge.rs",
+        "src/device.rs",
+        "src/dram.rs",
+        "src/hw.rs",
+        "src/linux/imp.rs",
+        "src/linux/mod.rs",
+        "src/linux/stub.rs",
+        "src/log.rs",
+    ],
+    crate_name = "tt_rust_bridge",
+    crate_root = "src/bazel_bridge.rs",
+    edition = "2024",
+)
+
+cc_library(
+    name = "tt_pjrt",
+    srcs = ["cpp/libtt_pjrt.cc"],
+    hdrs = [
+        "cpp/libtt_pjrt.h",
+        "cpp/libtt_rust_ffi.h",
+        "third_party/openxla/xla/pjrt/c/pjrt_c_api.h",
+    ],
+    copts = ["-std=c++20"],
+    includes = ["third_party/openxla"],
+    visibility = ["//visibility:public"],
+    deps = [":tt_rust_bridge"],
+)
+
+cc_binary(
+    name = "tt_pjrt_plugin",
+    copts = ["-std=c++20"],
+    additional_linker_inputs = ["pjrt_exports.lds"],
+    linkopts = select({
+        "@bazel_tools//src/conditions:darwin": [
+            "-Wl,-exported_symbol,_GetPjrtApi",
+            "-Wl,-undefined,error",
+        ],
+        "//conditions:default": [
+            "-Wl,--version-script,$(location pjrt_exports.lds)",
+            "-Wl,--no-undefined",
+        ],
+    }),
+    linkshared = True,
+    deps = [":tt_pjrt"],
+)
+
+cc_test(
+    name = "tt_pjrt_smoke_test",
+    srcs = ["cpp/libtt_pjrt_test.cc"],
+    copts = ["-std=c++20"],
+    deps = [":tt_pjrt"],
+)
