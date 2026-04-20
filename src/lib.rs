@@ -20,8 +20,6 @@ use std::sync::Once;
 
 include!("pjrt_bindings.rs");
 
-unsafe impl Sync for PJRT_Extension_Base {}
-
 #[repr(C)]
 pub struct PJRT_Error {
     code: PJRT_Error_Code,
@@ -104,8 +102,6 @@ pub struct PJRT_Executable {
     output_types: Vec<PJRT_Buffer_Type>,
     output_dims: Vec<i64>,
     output_dim_sizes: Vec<usize>,
-    output_layouts: Vec<PJRT_Layouts_MemoryLayout>,
-    output_layout_ptrs: Vec<*mut PJRT_Layouts_MemoryLayout>,
     output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
@@ -120,8 +116,6 @@ pub struct PJRT_LoadedExecutable {
     output_types: Vec<PJRT_Buffer_Type>,
     output_dims: Vec<i64>,
     output_dim_sizes: Vec<usize>,
-    output_layouts: Vec<PJRT_Layouts_MemoryLayout>,
-    output_layout_ptrs: Vec<*mut PJRT_Layouts_MemoryLayout>,
     output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
@@ -531,13 +525,6 @@ fn make_executable(
     dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
 ) -> PJRT_Executable {
-    let mut output_layouts = vec![PJRT_Layouts_MemoryLayout {
-        serialized: row_major_layout_string(dims.len()),
-    }];
-    let output_layout_ptrs = output_layouts
-        .iter_mut()
-        .map(|layout| layout as *mut PJRT_Layouts_MemoryLayout)
-        .collect::<Vec<_>>();
     let output_memory_kinds = vec![cstring_lossy("dram")];
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
@@ -557,8 +544,6 @@ fn make_executable(
         output_types: vec![output_type],
         output_dims: dims,
         output_dim_sizes,
-        output_layouts,
-        output_layout_ptrs,
         output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
@@ -573,11 +558,6 @@ fn make_loaded_executable(
     addressable_devices: Vec<*mut PJRT_Device>,
 ) -> PJRT_LoadedExecutable {
     let executable = make_executable(kind, name, dims, output_type);
-    let mut output_layouts = executable.output_layouts;
-    let output_layout_ptrs = output_layouts
-        .iter_mut()
-        .map(|layout| layout as *mut PJRT_Layouts_MemoryLayout)
-        .collect::<Vec<_>>();
     PJRT_LoadedExecutable {
         kind: executable.kind,
         name: executable.name,
@@ -586,8 +566,6 @@ fn make_loaded_executable(
         output_types: executable.output_types,
         output_dims: executable.output_dims,
         output_dim_sizes: executable.output_dim_sizes,
-        output_layouts,
-        output_layout_ptrs,
         output_memory_kinds: executable.output_memory_kinds,
         output_memory_kind_ptrs: executable.output_memory_kind_ptrs,
         output_memory_kind_sizes: executable.output_memory_kind_sizes,
@@ -597,17 +575,6 @@ fn make_loaded_executable(
 }
 
 fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
-    let mut output_layouts = executable
-        .output_layouts
-        .iter()
-        .map(|layout| PJRT_Layouts_MemoryLayout {
-            serialized: layout.serialized.clone(),
-        })
-        .collect::<Vec<_>>();
-    let output_layout_ptrs = output_layouts
-        .iter_mut()
-        .map(|layout| layout as *mut PJRT_Layouts_MemoryLayout)
-        .collect::<Vec<_>>();
     let output_memory_kinds = executable.output_memory_kinds.clone();
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
@@ -621,27 +588,10 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
         output_types: executable.output_types.clone(),
         output_dims: executable.output_dims.clone(),
         output_dim_sizes: executable.output_dim_sizes.clone(),
-        output_layouts,
-        output_layout_ptrs,
         output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes: executable.output_memory_kind_sizes.clone(),
     }
-}
-
-fn row_major_layout_string(rank: usize) -> CString {
-    let major_to_minor = (0..rank)
-        .rev()
-        .map(|dim| dim.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    cstring_lossy(format!("{{{major_to_minor}}}"))
-}
-
-fn heap_row_major_layout(rank: usize) -> *mut PJRT_Layouts_MemoryLayout {
-    Box::into_raw(Box::new(PJRT_Layouts_MemoryLayout {
-        serialized: row_major_layout_string(rank),
-    }))
 }
 
 fn executable_fingerprint_string(
@@ -1262,121 +1212,6 @@ pub unsafe extern "C" fn TT_Executable_OutputMemoryKinds(
     args.memory_kinds = executable.output_memory_kind_ptrs.as_ptr();
     args.memory_kind_sizes = executable.output_memory_kind_sizes.as_ptr();
     args.num_outputs = executable.output_memory_kind_ptrs.len();
-    ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Layouts_MemoryLayout_Destroy(
-    args: *mut PJRT_Layouts_MemoryLayout_Destroy_Args,
-) -> *mut PJRT_Error {
-    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
-        return invalid_argument("args must not be null");
-    };
-    if !args.layout.is_null() {
-        unsafe {
-            drop(Box::from_raw(args.layout));
-        }
-        args.layout = ptr::null_mut();
-    }
-    ptr::null_mut()
-}
-
-unsafe extern "C" fn TT_Layouts_SerializedLayout_Destroy(
-    serialized_layout: *mut PJRT_Layouts_SerializedLayout,
-) {
-    if !serialized_layout.is_null() {
-        unsafe {
-            drop(Box::from_raw(serialized_layout));
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Layouts_MemoryLayout_Serialize(
-    args: *mut PJRT_Layouts_MemoryLayout_Serialize_Args,
-) -> *mut PJRT_Error {
-    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
-        return invalid_argument("args must not be null");
-    };
-    let Ok(layout) = (unsafe { checked_ref(args.layout, "layout") }) else {
-        return invalid_argument("layout must not be null");
-    };
-    let serialized_layout = Box::new(PJRT_Layouts_SerializedLayout {
-        serialized: layout.serialized.clone(),
-    });
-    args.serialized_bytes = serialized_layout.serialized.as_ptr();
-    args.serialized_bytes_size = serialized_layout.serialized.as_bytes().len();
-    args.serialized_layout = Box::into_raw(serialized_layout);
-    args.serialized_layout_deleter = Some(TT_Layouts_SerializedLayout_Destroy);
-    ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Layouts_Buffer_MemoryLayout(
-    args: *mut PJRT_Layouts_PJRT_Buffer_MemoryLayout_Args,
-) -> *mut PJRT_Error {
-    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
-        return invalid_argument("args must not be null");
-    };
-    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
-        return invalid_argument("buffer must not be null");
-    };
-    args.layout = heap_row_major_layout(buffer.dims.len());
-    ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Layouts_Client_GetDefaultLayout(
-    args: *mut PJRT_Layouts_PJRT_Client_GetDefaultLayout_Args,
-) -> *mut PJRT_Error {
-    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
-        return invalid_argument("args must not be null");
-    };
-    if args.client.is_null() {
-        return invalid_argument("client must not be null");
-    }
-    let Ok(dims) = checked_dims(args.dims, args.num_dims) else {
-        return invalid_argument("dims must be valid");
-    };
-    let _ = dims;
-    args.layout = heap_row_major_layout(args.num_dims);
-    ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Layouts_Topology_GetDefaultLayout(
-    args: *mut PJRT_Layouts_PJRT_Topology_GetDefaultLayout_Args,
-) -> *mut PJRT_Error {
-    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
-        return invalid_argument("args must not be null");
-    };
-    if args.topology_description.is_null() {
-        return invalid_argument("topology_description must not be null");
-    }
-    let Ok(dims) = checked_dims(args.dims, args.num_dims) else {
-        return invalid_argument("dims must be valid");
-    };
-    let _ = dims;
-    args.layout = heap_row_major_layout(args.num_dims);
-    ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn TT_Layouts_Executable_GetOutputLayouts(
-    args: *mut PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args,
-) -> *mut PJRT_Error {
-    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
-        return invalid_argument("args must not be null");
-    };
-    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
-        return invalid_argument("executable must not be null");
-    };
-    args.num_outputs = executable.output_layout_ptrs.len();
-    args.layouts = if executable.output_layout_ptrs.is_empty() {
-        ptr::null_mut()
-    } else {
-        executable.output_layout_ptrs.as_ptr().cast_mut()
-    };
     ptr::null_mut()
 }
 
@@ -2465,163 +2300,10 @@ pub unsafe extern "C" fn TT_TopologyDescription_Fingerprint(
     ptr::null_mut()
 }
 
-macro_rules! define_unimplemented_pjrt_fn {
-    ($name:ident, $args_ty:ty, $label:literal) => {
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $name(args: *mut $args_ty) -> *mut PJRT_Error {
-            let Ok(_args) = (unsafe { checked_mut(args, "args") }) else {
-                return invalid_argument("args must not be null");
-            };
-            log(concat!($label, " entered"));
-            unimplemented(concat!($label, " is not implemented"))
-        }
-    };
-}
-
-define_unimplemented_pjrt_fn!(
-    TT_AsyncHostToDeviceTransferManager_Destroy,
-    PJRT_AsyncHostToDeviceTransferManager_Destroy_Args,
-    "pjrt async_h2d_transfer_manager_destroy"
-);
-define_unimplemented_pjrt_fn!(
-    TT_AsyncHostToDeviceTransferManager_TransferData,
-    PJRT_AsyncHostToDeviceTransferManager_TransferData_Args,
-    "pjrt async_h2d_transfer_manager_transfer_data"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Client_CreateBuffersForAsyncHostToDevice,
-    PJRT_Client_CreateBuffersForAsyncHostToDevice_Args,
-    "pjrt client_create_buffers_for_async_h2d"
-);
-define_unimplemented_pjrt_fn!(
-    TT_AsyncHostToDeviceTransferManager_RetrieveBuffer,
-    PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args,
-    "pjrt async_h2d_transfer_manager_retrieve_buffer"
-);
-define_unimplemented_pjrt_fn!(
-    TT_AsyncHostToDeviceTransferManager_Device,
-    PJRT_AsyncHostToDeviceTransferManager_Device_Args,
-    "pjrt async_h2d_transfer_manager_device"
-);
-define_unimplemented_pjrt_fn!(
-    TT_AsyncHostToDeviceTransferManager_BufferCount,
-    PJRT_AsyncHostToDeviceTransferManager_BufferCount_Args,
-    "pjrt async_h2d_transfer_manager_buffer_count"
-);
-define_unimplemented_pjrt_fn!(
-    TT_AsyncHostToDeviceTransferManager_BufferSize,
-    PJRT_AsyncHostToDeviceTransferManager_BufferSize_Args,
-    "pjrt async_h2d_transfer_manager_buffer_size"
-);
-define_unimplemented_pjrt_fn!(
-    TT_AsyncHostToDeviceTransferManager_SetBufferError,
-    PJRT_AsyncHostToDeviceTransferManager_SetBufferError_Args,
-    "pjrt async_h2d_transfer_manager_set_buffer_error"
-);
-define_unimplemented_pjrt_fn!(
-    TT_AsyncHostToDeviceTransferManager_AddMetadata,
-    PJRT_AsyncHostToDeviceTransferManager_AddMetadata_Args,
-    "pjrt async_h2d_transfer_manager_add_metadata"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Client_DmaMap,
-    PJRT_Client_DmaMap_Args,
-    "pjrt client_dma_map"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Client_DmaUnmap,
-    PJRT_Client_DmaUnmap_Args,
-    "pjrt client_dma_unmap"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Client_CreateUninitializedBuffer,
-    PJRT_Client_CreateUninitializedBuffer_Args,
-    "pjrt client_create_uninitialized_buffer"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Client_UpdateGlobalProcessInfo,
-    PJRT_Client_UpdateGlobalProcessInfo_Args,
-    "pjrt client_update_global_process_info"
-);
-define_unimplemented_pjrt_fn!(
-    TT_TopologyDescription_Deserialize,
-    PJRT_TopologyDescription_Deserialize_Args,
-    "pjrt topology_description_deserialize"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Client_CreateAliasBuffer,
-    PJRT_Client_CreateAliasBuffer_Args,
-    "pjrt client_create_alias_buffer"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Client_FulfillAliasBuffer,
-    PJRT_Client_FulfillAliasBuffer_Args,
-    "pjrt client_fulfill_alias_buffer"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Client_CreateErrorBuffer,
-    PJRT_Client_CreateErrorBuffer_Args,
-    "pjrt client_create_error_buffer"
-);
-define_unimplemented_pjrt_fn!(
-    TT_AsyncHostToDeviceTransferManager_TransferLiteral,
-    PJRT_AsyncHostToDeviceTransferManager_TransferLiteral_Args,
-    "pjrt async_h2d_transfer_manager_transfer_literal"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Buffer_CopyRawToHostFuture,
-    PJRT_Buffer_CopyRawToHostFuture_Args,
-    "pjrt buffer_copy_raw_to_host_future"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Device_PoisonExecution,
-    PJRT_Device_PoisonExecution_Args,
-    "pjrt device_poison_execution"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Device_CreateAsyncTrackingEvent,
-    PJRT_Device_CreateAsyncTrackingEvent_Args,
-    "pjrt device_create_async_tracking_event"
-);
-define_unimplemented_pjrt_fn!(
-    TT_AsyncTrackingEvent_Destroy,
-    PJRT_AsyncTrackingEvent_Destroy_Args,
-    "pjrt async_tracking_event_destroy"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Executable_GetCompileOptions,
-    PJRT_Executable_GetCompileOptions_Args,
-    "pjrt executable_get_compile_options"
-);
-define_unimplemented_pjrt_fn!(
-    TT_Buffer_DonateWithControlDependency,
-    PJRT_Buffer_DonateWithControlDependency_Args,
-    "pjrt buffer_donate_with_control_dependency"
-);
-define_unimplemented_pjrt_fn!(TT_Event_Create, PJRT_Event_Create_Args, "pjrt event_create");
-define_unimplemented_pjrt_fn!(TT_Event_Set, PJRT_Event_Set_Args, "pjrt event_set");
-
-static PJRT_LAYOUTS_EXTENSION: PJRT_Layouts_Extension = PJRT_Layouts_Extension {
-    base: PJRT_Extension_Base {
-        struct_size: size_of::<PJRT_Layouts_Extension>(),
-        type_: PJRT_Extension_Type::PJRT_Extension_Type_Layouts,
-        next: ptr::null_mut(),
-    },
-    PJRT_Layouts_MemoryLayout_Destroy: Some(TT_Layouts_MemoryLayout_Destroy),
-    PJRT_Layouts_MemoryLayout_Serialize: Some(TT_Layouts_MemoryLayout_Serialize),
-    PJRT_Layouts_PJRT_Client_GetDefaultLayout: Some(TT_Layouts_Client_GetDefaultLayout),
-    PJRT_Layouts_PJRT_Buffer_MemoryLayout: Some(TT_Layouts_Buffer_MemoryLayout),
-    PJRT_Layouts_PJRT_Topology_GetDefaultLayout: Some(TT_Layouts_Topology_GetDefaultLayout),
-    PJRT_Layouts_PJRT_Executable_GetOutputLayouts: Some(TT_Layouts_Executable_GetOutputLayouts),
-    PJRT_Layouts_PJRT_Executable_GetParameterLayouts: None,
-};
-
 fn build_pjrt_api() -> PJRT_Api {
     let mut api: PJRT_Api = unsafe { std::mem::zeroed() };
 
     api.struct_size = size_of::<PJRT_Api>();
-    // Do not advertise the layouts extension until the serialized layout payloads
-    // match what jaxlib expects for PjRtLayout construction.
     api.extension_start = ptr::null_mut();
     api.pjrt_api_version = PJRT_Api_Version {
         struct_size: size_of::<PJRT_Api_Version>(),
