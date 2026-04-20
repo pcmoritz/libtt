@@ -644,61 +644,6 @@ fn heap_row_major_layout(rank: usize) -> *mut PJRT_Layouts_MemoryLayout {
     }))
 }
 
-fn executable_tensor_spec(executable: &PJRT_Executable) -> String {
-    let dims = executable
-        .output_dims
-        .iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>();
-    let shape = if dims.is_empty() {
-        "*x".to_string()
-    } else {
-        format!("{}x", dims.join("x"))
-    };
-    let element = match executable.output_types.first().copied() {
-        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_BF16) | None => "bf16",
-        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_F32) => "f32",
-        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_F16) => "f16",
-        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_S32) => "i32",
-        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_U32) => "ui32",
-        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_S8) => "i8",
-        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_U8) => "ui8",
-        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_U16) => "ui16",
-        Some(_) => "bf16",
-    };
-    format!("tensor<{shape}{element}>")
-}
-
-fn executable_layout_mode(executable: &PJRT_Executable) -> Option<String> {
-    let rank = executable.output_dims.len();
-    if rank == 0 {
-        None
-    } else {
-        let minor_to_major = (0..rank)
-            .rev()
-            .map(|dim| dim.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        Some(format!("{{{minor_to_major}}}"))
-    }
-}
-
-fn executable_optimized_mlir(executable: &PJRT_Executable) -> String {
-    match executable.kind {
-        ExecutableKind::EltwiseAddBf16 => {
-            let tensor = executable_tensor_spec(executable);
-            match executable_layout_mode(executable) {
-                Some(layout) => format!(
-                    "module @entry attributes {{mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32}} {{\n  func.func public @main(%arg0: {tensor} {{mhlo.layout_mode = \"{layout}\"}}, %arg1: {tensor} {{mhlo.layout_mode = \"{layout}\"}}) -> ({tensor} {{jax.result_info = \"\", mhlo.layout_mode = \"{layout}\"}}) {{\n    %0 = stablehlo.add %arg0, %arg1 : {tensor}\n    return %0 : {tensor}\n  }}\n}}\n"
-                ),
-                None => format!(
-                    "module @entry attributes {{mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32}} {{\n  func.func public @main(%arg0: {tensor}, %arg1: {tensor}) -> ({tensor} {{jax.result_info = \"\"}}) {{\n    %0 = stablehlo.add %arg0, %arg1 : {tensor}\n    return %0 : {tensor}\n  }}\n}}\n"
-                ),
-            }
-        }
-    }
-}
-
 fn executable_fingerprint_string(
     kind: ExecutableKind,
     name: &str,
@@ -754,6 +699,17 @@ pub unsafe extern "C" fn TT_Error_GetCode(args: *mut PJRT_Error_GetCode_Args) ->
     args.code = unsafe { args.error.as_ref() }
         .map(|error| error.code)
         .unwrap_or(PJRT_Error_Code::PJRT_Error_Code_OK);
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Error_ForEachPayload(
+    args: *mut PJRT_Error_ForEachPayload_Args,
+) -> *mut PJRT_Error {
+    let Ok(_args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    // libtt does not attach structured error payloads.
     ptr::null_mut()
 }
 
@@ -1197,31 +1153,17 @@ pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+    if args.executable.is_null() {
         return invalid_argument("executable must not be null");
-    };
+    }
     let Ok(program) = (unsafe { checked_mut(args.program, "program") }) else {
         return invalid_argument("program must not be null");
     };
-
-    static MLIR_FORMAT: &[u8] = b"mlir";
-    let mlir = executable_optimized_mlir(executable);
-    program.format = MLIR_FORMAT.as_ptr().cast::<c_char>();
-    program.format_size = MLIR_FORMAT.len();
-
-    if program.code.is_null() {
-        program.code_size = mlir.len();
-        return ptr::null_mut();
-    }
-    if program.code_size < mlir.len() {
-        return invalid_argument("program code buffer is too small");
-    }
-
-    unsafe {
-        ptr::copy_nonoverlapping(mlir.as_ptr().cast::<c_char>(), program.code, mlir.len());
-    }
-    program.code_size = mlir.len();
-    ptr::null_mut()
+    let _ = program;
+    pjrt_error(
+        "PJRT_Executable_OptimizedProgram is not implemented",
+        PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -2691,6 +2633,7 @@ fn build_pjrt_api() -> PJRT_Api {
     api.PJRT_Error_Destroy = Some(TT_Error_Destroy);
     api.PJRT_Error_Message = Some(TT_Error_Message);
     api.PJRT_Error_GetCode = Some(TT_Error_GetCode);
+    api.PJRT_Error_ForEachPayload = Some(TT_Error_ForEachPayload);
     api.PJRT_Plugin_Initialize = Some(TT_Plugin_Initialize);
     api.PJRT_Plugin_Attributes = Some(TT_Plugin_Attributes);
     api.PJRT_Event_Destroy = Some(TT_Event_Destroy);
@@ -3193,123 +3136,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn optimized_program_exposes_row_major_metadata_without_layout_extension() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = b"module {\n  func.func public @main(%arg0: tensor<32x32xbf16>, %arg1: tensor<32x32xbf16>) -> tensor<32x32xbf16> {\n    %0 = stablehlo.add %arg0, %arg1 : tensor<32x32xbf16>\n    return %0 : tensor<32x32xbf16>\n  }\n}\n".to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-        let executable = get_executable_args.executable;
-
-        let optimized_program = api
-            .PJRT_Executable_OptimizedProgram
-            .expect("PJRT_Executable_OptimizedProgram must be exported");
-        let mut program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: ptr::null_mut(),
-            code_size: 0,
-            format: ptr::null(),
-            format_size: 0,
-        };
-        let mut optimized_program_args = PJRT_Executable_OptimizedProgram_Args {
-            struct_size: size_of::<PJRT_Executable_OptimizedProgram_Args>(),
-            extension_start: ptr::null_mut(),
-            executable,
-            program: &mut program,
-        };
-        check_ok(api, unsafe {
-            optimized_program(&mut optimized_program_args)
-        });
-        assert_eq!(program.format_size, 4);
-        let format =
-            unsafe { std::slice::from_raw_parts(program.format.cast::<u8>(), program.format_size) };
-        assert_eq!(format, b"mlir");
-        assert!(program.code_size > 0);
-
-        let mut optimized_code = vec![0u8; program.code_size];
-        let mut program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: optimized_code.as_mut_ptr().cast::<c_char>(),
-            code_size: optimized_code.len(),
-            format: ptr::null(),
-            format_size: 0,
-        };
-        let mut optimized_program_args = PJRT_Executable_OptimizedProgram_Args {
-            struct_size: size_of::<PJRT_Executable_OptimizedProgram_Args>(),
-            extension_start: ptr::null_mut(),
-            executable,
-            program: &mut program,
-        };
-        check_ok(api, unsafe {
-            optimized_program(&mut optimized_program_args)
-        });
-        let mlir = String::from_utf8(optimized_code).expect("optimized program should be utf-8");
-        assert!(mlir.contains("mhlo.num_partitions = 1 : i32"));
-        assert!(mlir.contains("mhlo.num_replicas = 1 : i32"));
-        assert!(mlir.contains("stablehlo.add"));
-        assert!(mlir.contains("mhlo.layout_mode = \"{1, 0}\""));
-        assert!(mlir.contains("jax.result_info = \"\""));
-        assert!(api.extension_start.is_null());
-
-        let executable_destroy = api
-            .PJRT_Executable_Destroy
-            .expect("PJRT_Executable_Destroy must be exported");
-        let mut executable_destroy_args = PJRT_Executable_Destroy_Args {
-            struct_size: size_of::<PJRT_Executable_Destroy_Args>(),
-            extension_start: ptr::null_mut(),
-            executable,
-        };
-        check_ok(api, unsafe {
-            executable_destroy(&mut executable_destroy_args)
-        });
-
-        let loaded_destroy = api
-            .PJRT_LoadedExecutable_Destroy
-            .expect("PJRT_LoadedExecutable_Destroy must be exported");
-        let mut loaded_destroy_args = PJRT_LoadedExecutable_Destroy_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_Destroy_Args>(),
-            extension_start: ptr::null_mut(),
-            executable: compile_args.executable,
-        };
-        check_ok(api, unsafe { loaded_destroy(&mut loaded_destroy_args) });
-
-        unsafe {
-            drop(Box::from_raw(client));
-        }
-    }
 }
