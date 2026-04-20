@@ -10,6 +10,7 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Bytecode/BytecodeReader.h"
+#include "mlir/Dialect/Func/Extensions/AllExtensions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -75,6 +76,7 @@ using mlir::func::FuncOp;
 void registerDialects(mlir::MLIRContext& context) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::func::FuncDialect>();
+    mlir::func::registerAllExtensions(registry);
     registry.insert<mlir::stablehlo::StablehloDialect>();
     registry.insert<mlir::vhlo::VhloDialect>();
     registry.insert<mlir::chlo::ChloDialect>();

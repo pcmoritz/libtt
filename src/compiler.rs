@@ -1277,8 +1277,35 @@ fn append_profile_defines(defines: &mut Vec<String>) {
 
 fn repo_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    ROOT.get_or_init(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-        .as_path()
+    ROOT.get_or_init(resolve_repo_root).as_path()
+}
+
+fn resolve_repo_root() -> PathBuf {
+    if let Some(path) = env::var_os("LIBTT_REPO_ROOT").filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+
+    let manifest_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if manifest_root.join("tt-metal-deps").is_dir() {
+        return manifest_root;
+    }
+
+    if let Ok(current_dir) = env::current_dir() {
+        if let Some(root) = find_repo_root_from(&current_dir) {
+            return root;
+        }
+    }
+
+    manifest_root
+}
+
+fn find_repo_root_from(start: &Path) -> Option<PathBuf> {
+    for candidate in start.ancestors() {
+        if candidate.join("tt-metal-deps").is_dir() && candidate.join("firmware").is_dir() {
+            return Some(candidate.to_path_buf());
+        }
+    }
+    None
 }
 
 fn deps_root() -> PathBuf {
