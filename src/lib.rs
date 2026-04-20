@@ -8,16 +8,6 @@ mod hw;
 mod linux;
 mod log;
 
-use crate::PJRT_Buffer_Type::{
-    PJRT_Buffer_Type_BF16, PJRT_Buffer_Type_F16, PJRT_Buffer_Type_F32, PJRT_Buffer_Type_INVALID,
-    PJRT_Buffer_Type_S8, PJRT_Buffer_Type_S32, PJRT_Buffer_Type_U8, PJRT_Buffer_Type_U16,
-    PJRT_Buffer_Type_U32,
-};
-use crate::PJRT_HostBufferSemantics::{
-    PJRT_HostBufferSemantics_kImmutableOnlyDuringCall,
-    PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes,
-    PJRT_HostBufferSemantics_kImmutableZeroCopy, PJRT_HostBufferSemantics_kMutableZeroCopy,
-};
 use device::Device;
 use dram::{DType, DramBuffer};
 use log::log;
@@ -320,15 +310,17 @@ unsafe fn checked_ref<'a, T>(ptr: *const T, name: &str) -> Result<&'a T, *mut PJ
 
 fn pjrt_buffer_type_to_dtype(buffer_type: PJRT_Buffer_Type) -> Result<DType, *mut PJRT_Error> {
     match buffer_type {
-        PJRT_Buffer_Type_S8 => Ok(DType::Int8),
-        PJRT_Buffer_Type_S32 => Ok(DType::Int32),
-        PJRT_Buffer_Type_U8 => Ok(DType::UInt8),
-        PJRT_Buffer_Type_U16 => Ok(DType::UInt16),
-        PJRT_Buffer_Type_U32 => Ok(DType::UInt32),
-        PJRT_Buffer_Type_F16 => Ok(DType::Float16),
-        PJRT_Buffer_Type_F32 => Ok(DType::Float32),
-        PJRT_Buffer_Type_BF16 => Ok(DType::Float16B),
-        PJRT_Buffer_Type_INVALID => Err(invalid_argument("invalid PJRT buffer type")),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S8 => Ok(DType::Int8),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Ok(DType::Int32),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 => Ok(DType::UInt8),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Ok(DType::UInt16),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => Ok(DType::UInt32),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F16 => Ok(DType::Float16),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 => Ok(DType::Float32),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => Ok(DType::Float16B),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_INVALID => {
+            Err(invalid_argument("invalid PJRT buffer type"))
+        }
         _ => Err(unimplemented(format!(
             "unsupported PJRT buffer type {buffer_type:?}"
         ))),
@@ -337,14 +329,14 @@ fn pjrt_buffer_type_to_dtype(buffer_type: PJRT_Buffer_Type) -> Result<DType, *mu
 
 fn dtype_to_pjrt_buffer_type(dtype: DType) -> PJRT_Buffer_Type {
     match dtype {
-        DType::Int8 => PJRT_Buffer_Type_S8,
-        DType::Int32 => PJRT_Buffer_Type_S32,
-        DType::UInt8 => PJRT_Buffer_Type_U8,
-        DType::UInt16 => PJRT_Buffer_Type_U16,
-        DType::UInt32 => PJRT_Buffer_Type_U32,
-        DType::Float16 => PJRT_Buffer_Type_F16,
-        DType::Float32 => PJRT_Buffer_Type_F32,
-        DType::Float16B => PJRT_Buffer_Type_BF16,
+        DType::Int8 => PJRT_Buffer_Type::PJRT_Buffer_Type_S8,
+        DType::Int32 => PJRT_Buffer_Type::PJRT_Buffer_Type_S32,
+        DType::UInt8 => PJRT_Buffer_Type::PJRT_Buffer_Type_U8,
+        DType::UInt16 => PJRT_Buffer_Type::PJRT_Buffer_Type_U16,
+        DType::UInt32 => PJRT_Buffer_Type::PJRT_Buffer_Type_U32,
+        DType::Float16 => PJRT_Buffer_Type::PJRT_Buffer_Type_F16,
+        DType::Float32 => PJRT_Buffer_Type::PJRT_Buffer_Type_F32,
+        DType::Float16B => PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
     }
 }
 
@@ -482,21 +474,21 @@ fn parse_mlir_tensor_signature(code: &str) -> Option<(Vec<i64>, PJRT_Buffer_Type
     let end = rest.find('>')?;
     let spec = &rest[..end];
     let dtype = if spec.ends_with("xbf16") {
-        PJRT_Buffer_Type_BF16
+        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
     } else if spec.ends_with("xf16") {
-        PJRT_Buffer_Type_F16
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F16
     } else if spec.ends_with("xf32") {
-        PJRT_Buffer_Type_F32
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32
     } else if spec.ends_with("xu32") {
-        PJRT_Buffer_Type_U32
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U32
     } else if spec.ends_with("xu16") {
-        PJRT_Buffer_Type_U16
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U16
     } else if spec.ends_with("xu8") {
-        PJRT_Buffer_Type_U8
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U8
     } else if spec.ends_with("xs32") {
-        PJRT_Buffer_Type_S32
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S32
     } else if spec.ends_with("xs8") {
-        PJRT_Buffer_Type_S8
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S8
     } else {
         return None;
     };
@@ -527,8 +519,8 @@ fn executable_output_signature(
             "mlir" | "stablehlo" => Ok(std::str::from_utf8(code)
                 .ok()
                 .and_then(parse_mlir_tensor_signature)
-                .unwrap_or_else(|| (Vec::new(), PJRT_Buffer_Type_BF16))),
-            _ => Ok((Vec::new(), PJRT_Buffer_Type_BF16)),
+                .unwrap_or_else(|| (Vec::new(), PJRT_Buffer_Type::PJRT_Buffer_Type_BF16))),
+            _ => Ok((Vec::new(), PJRT_Buffer_Type::PJRT_Buffer_Type_BF16)),
         },
     }
 }
@@ -664,14 +656,14 @@ fn executable_tensor_spec(executable: &PJRT_Executable) -> String {
         format!("{}x", dims.join("x"))
     };
     let element = match executable.output_types.first().copied() {
-        Some(PJRT_Buffer_Type_BF16) | None => "bf16",
-        Some(PJRT_Buffer_Type_F32) => "f32",
-        Some(PJRT_Buffer_Type_F16) => "f16",
-        Some(PJRT_Buffer_Type_S32) => "i32",
-        Some(PJRT_Buffer_Type_U32) => "ui32",
-        Some(PJRT_Buffer_Type_S8) => "i8",
-        Some(PJRT_Buffer_Type_U8) => "ui8",
-        Some(PJRT_Buffer_Type_U16) => "ui16",
+        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_BF16) | None => "bf16",
+        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_F32) => "f32",
+        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_F16) => "f16",
+        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_S32) => "i32",
+        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_U32) => "ui32",
+        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_S8) => "i8",
+        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_U8) => "ui8",
+        Some(PJRT_Buffer_Type::PJRT_Buffer_Type_U16) => "ui16",
         Some(_) => "bf16",
     };
     format!("tensor<{shape}{element}>")
@@ -1618,7 +1610,9 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     {
         return invalid_argument("all buffers and execute_device must be on the same device");
     }
-    if lhs.buffer_type != PJRT_Buffer_Type_BF16 || rhs.buffer_type != PJRT_Buffer_Type_BF16 {
+    if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+    {
         return unimplemented("tt.add currently only supports bf16 buffers");
     }
     if lhs.dims != rhs.dims {
@@ -1649,7 +1643,7 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         return invalid_argument("output_lists[0] must not be null");
     }
     let output_ptr = Box::into_raw(Box::new(PJRT_Buffer {
-        buffer_type: PJRT_Buffer_Type_BF16,
+        buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
         dims: lhs.dims.clone(),
         device: execute_device,
         memory: target_device.default_memory,
@@ -1683,10 +1677,10 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         return unimplemented("custom device layouts are not supported");
     }
     match args.host_buffer_semantics {
-        PJRT_HostBufferSemantics_kImmutableOnlyDuringCall
-        | PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes
-        | PJRT_HostBufferSemantics_kImmutableZeroCopy
-        | PJRT_HostBufferSemantics_kMutableZeroCopy => {}
+        PJRT_HostBufferSemantics::PJRT_HostBufferSemantics_kImmutableOnlyDuringCall
+        | PJRT_HostBufferSemantics::PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes
+        | PJRT_HostBufferSemantics::PJRT_HostBufferSemantics_kImmutableZeroCopy
+        | PJRT_HostBufferSemantics::PJRT_HostBufferSemantics_kMutableZeroCopy => {}
     }
 
     let dtype = match pjrt_buffer_type_to_dtype(args.type_) {
