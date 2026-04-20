@@ -1,3 +1,5 @@
 /target
 /.codex
 /tt-metal-deps
+/bazel-*
+/MODULE.bazel.lock

@@ -2,9 +2,14 @@
 name = "tt_pjrt_capi"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [lib]
 name = "tt"
 crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+mlir-frontend = []
 
 [dependencies]

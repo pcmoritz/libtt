@@ -1,0 +1,68 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library")
+load("@rules_rust//rust:defs.bzl", "rust_static_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+RUST_SRCS = glob(
+    ["src/**/*.rs"],
+)
+
+rust_static_library(
+    name = "tt_rust",
+    srcs = RUST_SRCS,
+    crate_name = "tt",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+)
+
+rust_static_library(
+    name = "tt_rust_mlir",
+    srcs = RUST_SRCS,
+    crate_name = "tt",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    rustc_flags = ["--cfg=libtt_mlir_frontend"],
+    version = "0.1.0",
+)
+
+rust_test(
+    name = "tt_test",
+    crate = ":tt_rust",
+)
+
+cc_library(
+    name = "tt_mlir_frontend",
+    srcs = ["mlir/tt_mlir_frontend.cc"],
+    copts = ["-std=c++17"],
+    deps = [
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Parser",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:Transforms",
+        "@stablehlo//:chlo_ops",
+        "@stablehlo//:stablehlo_ops",
+        "@stablehlo//:stablehlo_serialization",
+        "@stablehlo//:vhlo_ops",
+    ],
+)
+
+cc_shared_library(
+    name = "tt_shared",
+    deps = [
+        ":tt_mlir_frontend",
+        ":tt_rust_mlir",
+    ],
+    shared_lib_name = select({
+        "@platforms//os:macos": "libtt.dylib",
+        "//conditions:default": "libtt.so",
+    }),
+)
+
+alias(
+    name = "tt",
+    actual = ":tt_shared",
+)

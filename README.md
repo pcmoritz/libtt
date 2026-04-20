@@ -85,11 +85,50 @@ This path still depends on the Blackhole firmware/toolchain assets under
 ## Build
 
 ```bash
-cargo build --release
+bazel build //:tt
 ```
 
-On Linux the shared library will be written to `target/release/libtt.so`. On
-macOS the corresponding artifact is `target/release/libtt.dylib`.
+This produces a single shared library containing the Rust PJRT implementation
+and, for the Bazel `//:tt` target, the C++ MLIR frontend as well.
+
+On Linux the output is `libtt.so`; on macOS it is `libtt.dylib`.
+
+The default Rust unit tests run with:
+
+```bash
+bazel test //:tt_test
+```
+
+## Optional MLIR Frontend
+
+The PJRT layer can analyze StableHLO/MLIR programs through a C++ frontend while
+keeping the Rust PJRT interface and TT runtime unchanged.
+
+The Bazel build now pulls the pinned StableHLO and LLVM/MLIR sources into the
+Bazel dependency graph directly. It does not depend on the full `xla` Bazel
+module.
+
+The easiest path is:
+
+```bash
+bazel build //:tt
+```
+
+The current lowering is still intentionally small, but StableHLO parsing,
+bytecode deserialization, and MLIR pass plumbing live on the C++ side rather
+than as Rust string matching.
+
+The first Bazel build is expected to download and analyze a large upstream
+dependency graph because LLVM/MLIR and StableHLO are now built through Bazel
+instead of a preinstalled local prefix.
+
+## Cargo
+
+The Cargo build remains available as a fallback for direct Rust development:
+
+```bash
+cargo build --release
+```
 
 ## Regenerating PJRT Bindings
 

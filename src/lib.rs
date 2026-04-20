@@ -7,6 +7,7 @@ pub mod dram;
 mod hw;
 mod linux;
 mod log;
+mod mlir_frontend;
 
 use device::Device;
 use dram::{DType, DramBuffer};
@@ -93,6 +94,19 @@ enum ExecutableKind {
     EltwiseAddBf16,
 }
 
+#[derive(Clone)]
+struct OptimizedProgram {
+    format: CString,
+    code: Vec<u8>,
+}
+
+struct CompiledProgram {
+    kind: ExecutableKind,
+    output_dims: Vec<i64>,
+    output_type: PJRT_Buffer_Type,
+    optimized_program: Option<OptimizedProgram>,
+}
+
 #[repr(C)]
 pub struct PJRT_Executable {
     kind: ExecutableKind,
@@ -105,6 +119,7 @@ pub struct PJRT_Executable {
     output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
+    optimized_program: Option<OptimizedProgram>,
 }
 
 #[repr(C)]
@@ -120,6 +135,7 @@ pub struct PJRT_LoadedExecutable {
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
     addressable_devices: Vec<*mut PJRT_Device>,
+    optimized_program: Option<OptimizedProgram>,
     deleted: bool,
 }
 
@@ -462,6 +478,13 @@ fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind
     }
 }
 
+fn optimized_program_from_text(text: &[u8]) -> OptimizedProgram {
+    OptimizedProgram {
+        format: cstring_lossy("mlir"),
+        code: text.to_vec(),
+    }
+}
+
 fn parse_mlir_tensor_signature(code: &str) -> Option<(Vec<i64>, PJRT_Buffer_Type)> {
     let start = code.find("tensor<")? + "tensor<".len();
     let rest = &code[start..];
@@ -519,11 +542,124 @@ fn executable_output_signature(
     }
 }
 
+#[cfg(libtt_mlir_frontend)]
+fn map_mlir_element_type(element_type: i32) -> Result<PJRT_Buffer_Type, *mut PJRT_Error> {
+    match element_type {
+        mlir_frontend::ELEMENT_TYPE_BF16 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_BF16),
+        mlir_frontend::ELEMENT_TYPE_F16 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_F16),
+        mlir_frontend::ELEMENT_TYPE_F32 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_F32),
+        mlir_frontend::ELEMENT_TYPE_U32 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_U32),
+        mlir_frontend::ELEMENT_TYPE_U16 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_U16),
+        mlir_frontend::ELEMENT_TYPE_U8 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_U8),
+        mlir_frontend::ELEMENT_TYPE_S32 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_S32),
+        mlir_frontend::ELEMENT_TYPE_S8 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_S8),
+        _ => Err(unimplemented("unsupported MLIR output element type")),
+    }
+}
+
+fn compiled_program_from_program(
+    program: &PJRT_Program,
+) -> Result<CompiledProgram, *mut PJRT_Error> {
+    let format = c_api_string(program.format, program.format_size, "program.format")?;
+    if format == "tt.add" {
+        return Ok(CompiledProgram {
+            kind: ExecutableKind::EltwiseAddBf16,
+            output_dims: Vec::new(),
+            output_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+            optimized_program: None,
+        });
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    if format == "mlir" || format == "stablehlo" {
+        let code = c_api_bytes(program.code.cast_const(), program.code_size, "program.code")?;
+        if let Some(analysis) = mlir_frontend::AnalysisHandle::analyze(
+            program.format,
+            program.format_size,
+            program.code.cast_const(),
+            program.code_size,
+        ) {
+            let analysis = analysis.analysis();
+            if !analysis.error_message.is_null() {
+                let message = unsafe {
+                    std::ffi::CStr::from_ptr(analysis.error_message)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                return Err(match analysis.status {
+                    mlir_frontend::STATUS_PARSE_ERROR => invalid_argument(message),
+                    mlir_frontend::STATUS_UNSUPPORTED => unimplemented(message),
+                    _ => pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INTERNAL),
+                });
+            }
+
+            let kind = match analysis.executable_kind {
+                mlir_frontend::EXECUTABLE_KIND_ELTWISE_ADD_BF16 => ExecutableKind::EltwiseAddBf16,
+                _ => return Err(unimplemented("unsupported MLIR executable kind")),
+            };
+            let output_dims = if analysis.num_output_dims == 0 {
+                Vec::new()
+            } else {
+                unsafe {
+                    slice::from_raw_parts(
+                        analysis.output_dims.cast_const(),
+                        analysis.num_output_dims,
+                    )
+                }
+                .to_vec()
+            };
+            let optimized_program = if analysis.optimized_program.is_null() {
+                None
+            } else {
+                Some(optimized_program_from_text(unsafe {
+                    slice::from_raw_parts(
+                        analysis.optimized_program.cast::<u8>(),
+                        analysis.optimized_program_size,
+                    )
+                }))
+            };
+            return Ok(CompiledProgram {
+                kind,
+                output_dims,
+                output_type: map_mlir_element_type(analysis.output_type)?,
+                optimized_program,
+            });
+        }
+
+        if std::str::from_utf8(code).is_err() {
+            log("pjrt compile MLIR frontend unavailable; falling back to opaque add heuristic");
+            return Ok(CompiledProgram {
+                kind: ExecutableKind::EltwiseAddBf16,
+                output_dims: Vec::new(),
+                output_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+                optimized_program: None,
+            });
+        }
+    }
+
+    let kind = executable_kind_from_program(program)?;
+    let (output_dims, output_type) = executable_output_signature(kind, program)?;
+    let optimized_program = if format == "mlir" || format == "stablehlo" {
+        c_api_bytes(program.code.cast_const(), program.code_size, "program.code")
+            .ok()
+            .map(optimized_program_from_text)
+    } else {
+        None
+    };
+    Ok(CompiledProgram {
+        kind,
+        output_dims,
+        output_type,
+        optimized_program,
+    })
+}
+
 fn make_executable(
     kind: ExecutableKind,
     name: &str,
     dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
+    optimized_program: Option<OptimizedProgram>,
 ) -> PJRT_Executable {
     let output_memory_kinds = vec![cstring_lossy("dram")];
     let output_memory_kind_ptrs = output_memory_kinds
@@ -547,6 +683,7 @@ fn make_executable(
         output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
+        optimized_program,
     }
 }
 
@@ -555,9 +692,10 @@ fn make_loaded_executable(
     name: &str,
     dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
+    optimized_program: Option<OptimizedProgram>,
     addressable_devices: Vec<*mut PJRT_Device>,
 ) -> PJRT_LoadedExecutable {
-    let executable = make_executable(kind, name, dims, output_type);
+    let executable = make_executable(kind, name, dims, output_type, optimized_program);
     PJRT_LoadedExecutable {
         kind: executable.kind,
         name: executable.name,
@@ -570,6 +708,7 @@ fn make_loaded_executable(
         output_memory_kind_ptrs: executable.output_memory_kind_ptrs,
         output_memory_kind_sizes: executable.output_memory_kind_sizes,
         addressable_devices,
+        optimized_program: executable.optimized_program,
         deleted: false,
     }
 }
@@ -591,6 +730,7 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
         output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes: executable.output_memory_kind_sizes.clone(),
+        optimized_program: executable.optimized_program.clone(),
     }
 }
 
@@ -943,23 +1083,20 @@ pub unsafe extern "C" fn TT_Client_Compile(args: *mut PJRT_Client_Compile_Args) 
     let Ok(program) = (unsafe { checked_ref(args.program, "program") }) else {
         return invalid_argument("program must not be null");
     };
-    let kind = match executable_kind_from_program(program) {
-        Ok(kind) => kind,
-        Err(err) => return err,
-    };
-    let (output_dims, output_type) = match executable_output_signature(kind, program) {
-        Ok(signature) => signature,
+    let compiled = match compiled_program_from_program(program) {
+        Ok(compiled) => compiled,
         Err(err) => return err,
     };
 
-    let name = match kind {
+    let name = match compiled.kind {
         ExecutableKind::EltwiseAddBf16 => "tt.add.bf16",
     };
     args.executable = Box::into_raw(Box::new(make_loaded_executable(
-        kind,
+        compiled.kind,
         name,
-        output_dims,
-        output_type,
+        compiled.output_dims,
+        compiled.output_type,
+        compiled.optimized_program,
         client.addressable_device_ptrs.clone(),
     )));
     ptr::null_mut()
@@ -973,23 +1110,20 @@ pub unsafe extern "C" fn TT_Compile(args: *mut PJRT_Compile_Args) -> *mut PJRT_E
     let Ok(program) = (unsafe { checked_ref(args.program, "program") }) else {
         return invalid_argument("program must not be null");
     };
-    let kind = match executable_kind_from_program(program) {
-        Ok(kind) => kind,
-        Err(err) => return err,
-    };
-    let (output_dims, output_type) = match executable_output_signature(kind, program) {
-        Ok(signature) => signature,
+    let compiled = match compiled_program_from_program(program) {
+        Ok(compiled) => compiled,
         Err(err) => return err,
     };
 
-    let name = match kind {
+    let name = match compiled.kind {
         ExecutableKind::EltwiseAddBf16 => "tt.add.bf16",
     };
     args.executable = Box::into_raw(Box::new(make_executable(
-        kind,
+        compiled.kind,
         name,
-        output_dims,
-        output_type,
+        compiled.output_dims,
+        compiled.output_type,
+        compiled.optimized_program,
     )));
     ptr::null_mut()
 }
@@ -1103,17 +1237,25 @@ pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    if args.executable.is_null() {
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
-    }
+    };
     let Ok(program) = (unsafe { checked_mut(args.program, "program") }) else {
         return invalid_argument("program must not be null");
     };
-    let _ = program;
-    pjrt_error(
-        "PJRT_Executable_OptimizedProgram is not implemented",
-        PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED,
-    )
+    let Some(optimized_program) = executable.optimized_program.as_ref() else {
+        return pjrt_error(
+            "optimized program is not available for this executable",
+            PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED,
+        );
+    };
+    program.struct_size = size_of::<PJRT_Program>();
+    program.extension_start = ptr::null_mut();
+    program.code = optimized_program.code.as_ptr().cast::<c_char>().cast_mut();
+    program.code_size = optimized_program.code.len();
+    program.format = optimized_program.format.as_ptr().cast_mut();
+    program.format_size = optimized_program.format.as_bytes().len();
+    ptr::null_mut()
 }
 
 #[unsafe(no_mangle)]
@@ -2818,4 +2960,83 @@ mod tests {
         }
     }
 
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_uses_mlir_frontend_for_generic_stablehlo_add() {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"mlir".to_vec();
+        let mut code = br#"module {
+  func.func @main(%arg0: tensor<2x2xbf16>, %arg1: tensor<2x2xbf16>) -> tensor<2x2xbf16> {
+    %0 = "stablehlo.add"(%arg0, %arg1) : (tensor<2x2xbf16>, tensor<2x2xbf16>) -> tensor<2x2xbf16>
+    return %0 : tensor<2x2xbf16>
+  }
+}
+"#
+        .to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: code.as_mut_ptr().cast::<c_char>(),
+            code_size: code.len(),
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { compile(&mut compile_args) });
+        assert!(!compile_args.executable.is_null());
+
+        let get_executable = api
+            .PJRT_LoadedExecutable_GetExecutable
+            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
+        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
+            extension_start: ptr::null_mut(),
+            loaded_executable: compile_args.executable,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+
+        let optimized_program = api
+            .PJRT_Executable_OptimizedProgram
+            .expect("PJRT_Executable_OptimizedProgram must be exported");
+        let mut optimized = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: ptr::null_mut(),
+            code_size: 0,
+            format: ptr::null_mut(),
+            format_size: 0,
+        };
+        let mut optimized_args = PJRT_Executable_OptimizedProgram_Args {
+            struct_size: size_of::<PJRT_Executable_OptimizedProgram_Args>(),
+            extension_start: ptr::null_mut(),
+            executable: get_executable_args.executable,
+            program: &mut optimized,
+        };
+        check_ok(api, unsafe { optimized_program(&mut optimized_args) });
+        assert_eq!(optimized.format_size, 4);
+        let optimized_text =
+            unsafe { std::slice::from_raw_parts(optimized.code.cast::<u8>(), optimized.code_size) };
+        let optimized_text = std::str::from_utf8(optimized_text).expect("optimized program utf-8");
+        assert!(optimized_text.contains("stablehlo.add"));
+
+        unsafe {
+            drop(Box::from_raw(get_executable_args.executable));
+            drop(Box::from_raw(compile_args.executable));
+            drop(Box::from_raw(client));
+        }
+    }
 }

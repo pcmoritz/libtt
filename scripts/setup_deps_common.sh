@@ -1,0 +1,32 @@
+#!/bin/bash
+# Common setup for libtt MLIR dependency scripts.
+# Source this file from component scripts; do not execute directly.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+PREFIX="${PREFIX:-$HOME/.local/libtt-deps}"
+JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
+BUILD_DIR="${BUILD_DIR:-/tmp/libtt-deps-build}"
+FORCE_REBUILD=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --prefix) PREFIX="$2"; shift 2 ;;
+        --jobs) JOBS="$2"; shift 2 ;;
+        --force) FORCE_REBUILD=true; shift ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+mkdir -p "$PREFIX" "$BUILD_DIR"
+
+for tool in cmake ninja git curl; do
+    if ! command -v "$tool" &> /dev/null; then
+        echo "Error: $tool is required but not installed"
+        echo "On macOS: brew install cmake ninja"
+        exit 1
+    fi
+done
