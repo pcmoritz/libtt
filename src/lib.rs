@@ -93,7 +93,6 @@ pub struct PJRT_Layouts_SerializedLayout {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecutableKind {
-    EltwiseAddBf16,
     TtExecutableV1,
 }
 
@@ -439,115 +438,26 @@ fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *
         .map_err(|_| invalid_argument(format!("{field} must be valid UTF-8")))
 }
 
-fn c_api_bytes<'a>(
-    ptr: *const c_char,
-    len: usize,
-    field: &str,
-) -> Result<&'a [u8], *mut PJRT_Error> {
-    if len == 0 {
-        return Ok(&[]);
-    }
-    if ptr.is_null() {
-        return Err(invalid_argument(format!(
-            "{field} must not be null when size > 0"
-        )));
-    }
-    // SAFETY: caller owns `ptr` for `len` bytes during the call.
-    Ok(unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) })
-}
-
 fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind, *mut PJRT_Error> {
     let format = c_api_string(program.format, program.format_size, "program.format")?;
     log(format!(
         "pjrt compile program format={format:?} code_size={}",
         program.code_size
     ));
-    let code = c_api_bytes(program.code.cast_const(), program.code_size, "program.code")?;
 
     match format.as_str() {
-        "tt.add" => Ok(ExecutableKind::EltwiseAddBf16),
-        "mlir" | "stablehlo" => {
-            if let Ok(text) = std::str::from_utf8(code) {
-                if text.contains("stablehlo.add") || text.contains("mhlo.add") {
-                    return Ok(ExecutableKind::EltwiseAddBf16);
-                }
-                return Err(unimplemented(
-                    "only stablehlo.add / mhlo.add MLIR modules are supported",
-                ));
-            }
-            log("pjrt compile opaque mlir bytecode detected; assuming stablehlo.add");
-            Ok(ExecutableKind::EltwiseAddBf16)
-        }
+        "mlir" | "stablehlo" => Ok(ExecutableKind::TtExecutableV1),
         other => Err(unimplemented(format!(
-            "unsupported program format {other:?}; supported formats are \"tt.add\" and MLIR containing stablehlo.add"
+            "unsupported program format {other:?}; supported formats are \"mlir\" and \"stablehlo\""
         ))),
     }
 }
 
+#[cfg(libtt_mlir_frontend)]
 fn optimized_program(format: &str, code: &[u8]) -> OptimizedProgram {
     OptimizedProgram {
         format: cstring_lossy(format),
         code: code.to_vec(),
-    }
-}
-
-fn parse_mlir_tensor_signature(code: &str) -> Option<(Vec<i64>, PJRT_Buffer_Type)> {
-    let start = code.find("tensor<")? + "tensor<".len();
-    let rest = &code[start..];
-    let end = rest.find('>')?;
-    let spec = &rest[..end];
-    let dtype = if spec.ends_with("xbf16") {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-    } else if spec.ends_with("xf16") {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F16
-    } else if spec.ends_with("xf32") {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F32
-    } else if spec.ends_with("xu32") {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U32
-    } else if spec.ends_with("xu16") {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U16
-    } else if spec.ends_with("xu8") {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U8
-    } else if spec.ends_with("xs32") {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S32
-    } else if spec.ends_with("xs8") {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S8
-    } else {
-        return None;
-    };
-    let shape_spec = spec.rsplit_once('x').map(|(dims, _)| dims).unwrap_or("");
-    let dims = if shape_spec.is_empty() {
-        Vec::new()
-    } else {
-        let mut dims = Vec::new();
-        for dim in shape_spec.split('x') {
-            if dim == "?" {
-                return None;
-            }
-            dims.push(dim.parse().ok()?);
-        }
-        dims
-    };
-    Some((dims, dtype))
-}
-
-fn executable_output_signature(
-    kind: ExecutableKind,
-    program: &PJRT_Program,
-) -> Result<(Vec<i64>, PJRT_Buffer_Type), *mut PJRT_Error> {
-    let format = c_api_string(program.format, program.format_size, "program.format")?;
-    let code = c_api_bytes(program.code.cast_const(), program.code_size, "program.code")?;
-    match kind {
-        ExecutableKind::EltwiseAddBf16 => match format.as_str() {
-            "mlir" | "stablehlo" => Ok(std::str::from_utf8(code)
-                .ok()
-                .and_then(parse_mlir_tensor_signature)
-                .unwrap_or_else(|| (Vec::new(), PJRT_Buffer_Type::PJRT_Buffer_Type_BF16))),
-            _ => Ok((Vec::new(), PJRT_Buffer_Type::PJRT_Buffer_Type_BF16)),
-        },
-        ExecutableKind::TtExecutableV1 => Err(unimplemented(
-            "TT executable output signatures must come from the MLIR frontend analysis",
-        )),
     }
 }
 
@@ -569,108 +479,76 @@ fn map_mlir_element_type(element_type: i32) -> Result<PJRT_Buffer_Type, *mut PJR
 fn compiled_program_from_program(
     program: &PJRT_Program,
 ) -> Result<CompiledProgram, *mut PJRT_Error> {
-    let format = c_api_string(program.format, program.format_size, "program.format")?;
-    if format == "tt.add" {
-        return Ok(CompiledProgram {
-            kind: ExecutableKind::EltwiseAddBf16,
-            output_dims: Vec::new(),
-            output_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
-            optimized_program: None,
-            tt_executable: None,
-        });
-    }
-
     #[cfg(libtt_mlir_frontend)]
-    if format == "mlir" || format == "stablehlo" {
-        let code = c_api_bytes(program.code.cast_const(), program.code_size, "program.code")?;
-        if let Some(analysis) = mlir_frontend::AnalysisHandle::analyze(
-            program.format,
-            program.format_size,
-            program.code.cast_const(),
-            program.code_size,
-        ) {
-            let analysis = analysis.analysis();
-            if !analysis.error_message.is_null() {
-                let message = unsafe {
-                    std::ffi::CStr::from_ptr(analysis.error_message)
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                return Err(match analysis.status {
-                    mlir_frontend::STATUS_PARSE_ERROR => invalid_argument(message),
-                    mlir_frontend::STATUS_UNSUPPORTED => unimplemented(message),
-                    _ => pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INTERNAL),
-                });
-            }
-
-            let output_dims = if analysis.num_output_dims == 0 {
-                Vec::new()
-            } else {
-                unsafe {
-                    slice::from_raw_parts(
-                        analysis.output_dims.cast_const(),
-                        analysis.num_output_dims,
-                    )
+    {
+        let format = c_api_string(program.format, program.format_size, "program.format")?;
+        if format == "mlir" || format == "stablehlo" {
+            if let Some(analysis) = mlir_frontend::AnalysisHandle::analyze(
+                program.format,
+                program.format_size,
+                program.code.cast_const(),
+                program.code_size,
+            ) {
+                let analysis = analysis.analysis();
+                if !analysis.error_message.is_null() {
+                    let message = unsafe {
+                        std::ffi::CStr::from_ptr(analysis.error_message)
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    return Err(match analysis.status {
+                        mlir_frontend::STATUS_PARSE_ERROR => invalid_argument(message),
+                        mlir_frontend::STATUS_UNSUPPORTED => unimplemented(message),
+                        _ => pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INTERNAL),
+                    });
                 }
-                .to_vec()
-            };
-            let optimized_program_bytes = if analysis.optimized_program.is_null() {
-                None
-            } else {
-                Some(
+
+                let output_dims = if analysis.num_output_dims == 0 {
+                    Vec::new()
+                } else {
                     unsafe {
                         slice::from_raw_parts(
-                            analysis.optimized_program.cast::<u8>(),
-                            analysis.optimized_program_size,
+                            analysis.output_dims.cast_const(),
+                            analysis.num_output_dims,
                         )
                     }
-                    .to_vec(),
-                )
-            };
-            let tt_executable = optimized_program_bytes
-                .as_deref()
-                .map(tt_executable::parse)
-                .transpose()
-                .map_err(unimplemented)?;
-            return Ok(CompiledProgram {
-                kind: ExecutableKind::TtExecutableV1,
-                output_dims,
-                output_type: map_mlir_element_type(analysis.output_type)?,
-                optimized_program: optimized_program_bytes
+                    .to_vec()
+                };
+                let optimized_program_bytes = if analysis.optimized_program.is_null() {
+                    None
+                } else {
+                    Some(
+                        unsafe {
+                            slice::from_raw_parts(
+                                analysis.optimized_program.cast::<u8>(),
+                                analysis.optimized_program_size,
+                            )
+                        }
+                        .to_vec(),
+                    )
+                };
+                let tt_executable = optimized_program_bytes
                     .as_deref()
-                    .map(|bytes| optimized_program("tt-executable-v1", bytes)),
-                tt_executable,
-            });
-        }
-
-        if std::str::from_utf8(code).is_err() {
-            log("pjrt compile MLIR frontend unavailable; falling back to opaque add heuristic");
-            return Ok(CompiledProgram {
-                kind: ExecutableKind::EltwiseAddBf16,
-                output_dims: Vec::new(),
-                output_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
-                optimized_program: None,
-                tt_executable: None,
-            });
+                    .map(tt_executable::parse)
+                    .transpose()
+                    .map_err(unimplemented)?;
+                return Ok(CompiledProgram {
+                    kind: ExecutableKind::TtExecutableV1,
+                    output_dims,
+                    output_type: map_mlir_element_type(analysis.output_type)?,
+                    optimized_program: optimized_program_bytes
+                        .as_deref()
+                        .map(|bytes| optimized_program("tt-executable-v1", bytes)),
+                    tt_executable,
+                });
+            }
         }
     }
 
-    let kind = executable_kind_from_program(program)?;
-    let (output_dims, output_type) = executable_output_signature(kind, program)?;
-    let optimized_program = if format == "mlir" || format == "stablehlo" {
-        c_api_bytes(program.code.cast_const(), program.code_size, "program.code")
-            .ok()
-            .map(|bytes| optimized_program("mlir", bytes))
-    } else {
-        None
-    };
-    Ok(CompiledProgram {
-        kind,
-        output_dims,
-        output_type,
-        optimized_program,
-        tt_executable: None,
-    })
+    let _ = executable_kind_from_program(program)?;
+    Err(unimplemented(
+        "MLIR compilation requires the libtt MLIR frontend build",
+    ))
 }
 
 fn make_executable(
@@ -772,7 +650,6 @@ fn executable_fingerprint_string(
     output_type: PJRT_Buffer_Type,
 ) -> CString {
     let kind_name = match kind {
-        ExecutableKind::EltwiseAddBf16 => "eltwise_add_bf16",
         ExecutableKind::TtExecutableV1 => "tt_executable_v1",
     };
     let dims = dims
@@ -1120,10 +997,7 @@ pub unsafe extern "C" fn TT_Client_Compile(args: *mut PJRT_Client_Compile_Args) 
         Err(err) => return err,
     };
 
-    let name = match compiled.kind {
-        ExecutableKind::EltwiseAddBf16 => "tt.add.bf16",
-        ExecutableKind::TtExecutableV1 => "tt.executable.v1",
-    };
+    let name = "tt.executable.v1";
     args.executable = Box::into_raw(Box::new(make_loaded_executable(
         compiled.kind,
         name,
@@ -1149,10 +1023,7 @@ pub unsafe extern "C" fn TT_Compile(args: *mut PJRT_Compile_Args) -> *mut PJRT_E
         Err(err) => return err,
     };
 
-    let name = match compiled.kind {
-        ExecutableKind::EltwiseAddBf16 => "tt.add.bf16",
-        ExecutableKind::TtExecutableV1 => "tt.executable.v1",
-    };
+    let name = "tt.executable.v1";
     args.executable = Box::into_raw(Box::new(make_executable(
         compiled.kind,
         name,
@@ -1690,71 +1561,11 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     } else {
         unsafe { slice::from_raw_parts(device_args, args.num_args) }
     };
-    let output_buffer = match executable.kind {
-        ExecutableKind::EltwiseAddBf16 => {
-            if args.num_args != 2 {
-                return invalid_argument("tt.add expects exactly two arguments");
-            }
-
-            let lhs_ptr = input_ptrs[0];
-            let rhs_ptr = input_ptrs[1];
-            let Ok(lhs) = (unsafe { checked_ref(lhs_ptr, "argument_lists[0][0]") }) else {
-                return invalid_argument("lhs buffer must not be null");
-            };
-            let Ok(rhs) = (unsafe { checked_ref(rhs_ptr, "argument_lists[0][1]") }) else {
-                return invalid_argument("rhs buffer must not be null");
-            };
-            if lhs.deleted || rhs.deleted {
-                return failed_precondition("input buffers must not be deleted");
-            }
-            if lhs.local_hardware_id != target_device.local_hardware_id as usize
-                || rhs.local_hardware_id != target_device.local_hardware_id as usize
-            {
-                return invalid_argument(
-                    "all buffers and execute_device must be on the same device",
-                );
-            }
-            if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-            {
-                return unimplemented("tt.add currently only supports bf16 buffers");
-            }
-            if lhs.dims != rhs.dims {
-                return invalid_argument("tt.add input buffer shapes must match");
-            }
-            let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
-                return failed_precondition("lhs buffer has no device allocation");
-            };
-            let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
-                return failed_precondition("rhs buffer has no device allocation");
-            };
-
-            let mut device = match Device::open(target_device.local_hardware_id as usize) {
-                Ok(device) => device,
-                Err(err) => return io_error(err),
-            };
-            let output_dram_buffer = match device.eltwise_add_bf16(lhs_dram, rhs_dram, "pjrt_add") {
-                Ok(buffer) => buffer,
-                Err(err) => return io_error(err),
-            };
-            PJRT_Buffer {
-                buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
-                dims: lhs.dims.clone(),
-                device: execute_device,
-                memory: target_device.default_memory,
-                local_hardware_id: target_device.local_hardware_id as usize,
-                dram_buffer: Some(output_dram_buffer),
-                host_data: Vec::new(),
-                deleted: false,
-            }
-        }
-        ExecutableKind::TtExecutableV1 => {
-            match execute_tt_executable_v1(executable, execute_device, target_device, input_ptrs) {
-                Ok(output) => output,
-                Err(err) => return err,
-            }
-        }
-    };
+    let output_buffer =
+        match execute_tt_executable_v1(executable, execute_device, target_device, input_ptrs) {
+            Ok(output) => output,
+            Err(err) => return err,
+        };
 
     let device_outputs = unsafe { *args.output_lists };
     if device_outputs.is_null() {
@@ -3025,129 +2836,6 @@ mod tests {
 
         let device = &client.devices[0];
         assert_eq!(device.local_hardware_id, 3);
-    }
-
-    #[test]
-    fn pjrt_compile_exposes_minimal_add_executable_metadata() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"tt.add".to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: ptr::null_mut(),
-            code_size: 0,
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-        assert!(!compile_args.executable.is_null());
-
-        let loaded_addressable_devices = api
-            .PJRT_LoadedExecutable_AddressableDevices
-            .expect("PJRT_LoadedExecutable_AddressableDevices must be exported");
-        let mut loaded_addressable_devices_args = PJRT_LoadedExecutable_AddressableDevices_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_AddressableDevices_Args>(),
-            extension_start: ptr::null_mut(),
-            executable: compile_args.executable,
-            addressable_devices: ptr::null(),
-            num_addressable_devices: usize::MAX,
-        };
-        check_ok(api, unsafe {
-            loaded_addressable_devices(&mut loaded_addressable_devices_args)
-        });
-        assert_eq!(loaded_addressable_devices_args.num_addressable_devices, 0);
-        assert!(
-            loaded_addressable_devices_args
-                .addressable_devices
-                .is_null()
-        );
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-        assert!(!get_executable_args.executable.is_null());
-
-        let executable_name = api
-            .PJRT_Executable_Name
-            .expect("PJRT_Executable_Name must be exported");
-        let mut executable_name_args = PJRT_Executable_Name_Args {
-            struct_size: size_of::<PJRT_Executable_Name_Args>(),
-            extension_start: ptr::null_mut(),
-            executable: get_executable_args.executable,
-            executable_name: ptr::null(),
-            executable_name_size: 0,
-        };
-        check_ok(api, unsafe { executable_name(&mut executable_name_args) });
-        let name = unsafe {
-            std::slice::from_raw_parts(
-                executable_name_args.executable_name.cast::<u8>(),
-                executable_name_args.executable_name_size,
-            )
-        };
-        assert_eq!(name, b"tt.add.bf16");
-
-        let executable_num_outputs = api
-            .PJRT_Executable_NumOutputs
-            .expect("PJRT_Executable_NumOutputs must be exported");
-        let mut executable_num_outputs_args = PJRT_Executable_NumOutputs_Args {
-            struct_size: size_of::<PJRT_Executable_NumOutputs_Args>(),
-            extension_start: ptr::null_mut(),
-            executable: get_executable_args.executable,
-            num_outputs: 0,
-        };
-        check_ok(api, unsafe {
-            executable_num_outputs(&mut executable_num_outputs_args)
-        });
-        assert_eq!(executable_num_outputs_args.num_outputs, 1);
-
-        let executable_destroy = api
-            .PJRT_Executable_Destroy
-            .expect("PJRT_Executable_Destroy must be exported");
-        let mut executable_destroy_args = PJRT_Executable_Destroy_Args {
-            struct_size: size_of::<PJRT_Executable_Destroy_Args>(),
-            extension_start: ptr::null_mut(),
-            executable: get_executable_args.executable,
-        };
-        check_ok(api, unsafe {
-            executable_destroy(&mut executable_destroy_args)
-        });
-        assert!(executable_destroy_args.executable.is_null());
-
-        let loaded_destroy = api
-            .PJRT_LoadedExecutable_Destroy
-            .expect("PJRT_LoadedExecutable_Destroy must be exported");
-        let mut loaded_destroy_args = PJRT_LoadedExecutable_Destroy_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_Destroy_Args>(),
-            extension_start: ptr::null_mut(),
-            executable: compile_args.executable,
-        };
-        check_ok(api, unsafe { loaded_destroy(&mut loaded_destroy_args) });
-        assert!(loaded_destroy_args.executable.is_null());
-
-        unsafe {
-            drop(Box::from_raw(client));
-        }
     }
 
     #[cfg(libtt_mlir_frontend)]

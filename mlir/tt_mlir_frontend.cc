@@ -35,8 +35,7 @@ enum TT_MlirAnalysisStatus : int32_t {
 
 enum TT_MlirExecutableKind : int32_t {
     TT_MLIR_EXECUTABLE_KIND_UNKNOWN = 0,
-    TT_MLIR_EXECUTABLE_KIND_ELTWISE_ADD_BF16 = 1,
-    TT_MLIR_EXECUTABLE_KIND_TT_EXECUTABLE_V1 = 2,
+    TT_MLIR_EXECUTABLE_KIND_TT_EXECUTABLE_V1 = 1,
 };
 
 enum TT_MlirElementType : int32_t {

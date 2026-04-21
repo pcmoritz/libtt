@@ -29,8 +29,6 @@ unsafe extern "C" {
 pub(crate) const STATUS_PARSE_ERROR: i32 = 1;
 #[cfg(libtt_mlir_frontend)]
 pub(crate) const STATUS_UNSUPPORTED: i32 = 2;
-#[cfg(libtt_mlir_frontend)]
-pub(crate) const EXECUTABLE_KIND_ELTWISE_ADD_BF16: i32 = 1;
 
 #[cfg(libtt_mlir_frontend)]
 pub(crate) const ELEMENT_TYPE_BF16: i32 = 1;
