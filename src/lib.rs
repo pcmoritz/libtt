@@ -91,11 +91,6 @@ pub struct PJRT_Layouts_SerializedLayout {
     serialized: CString,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExecutableKind {
-    TtExecutableV1,
-}
-
 #[derive(Clone)]
 struct OptimizedProgram {
     format: CString,
@@ -103,7 +98,6 @@ struct OptimizedProgram {
 }
 
 struct CompiledProgram {
-    kind: ExecutableKind,
     output_dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
     optimized_program: Option<OptimizedProgram>,
@@ -112,7 +106,6 @@ struct CompiledProgram {
 
 #[repr(C)]
 pub struct PJRT_Executable {
-    kind: ExecutableKind,
     name: CString,
     fingerprint: CString,
     num_outputs: usize,
@@ -128,7 +121,6 @@ pub struct PJRT_Executable {
 
 #[repr(C)]
 pub struct PJRT_LoadedExecutable {
-    kind: ExecutableKind,
     name: CString,
     fingerprint: CString,
     num_outputs: usize,
@@ -438,7 +430,7 @@ fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *
         .map_err(|_| invalid_argument(format!("{field} must be valid UTF-8")))
 }
 
-fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind, *mut PJRT_Error> {
+fn validate_program_format(program: &PJRT_Program) -> Result<(), *mut PJRT_Error> {
     let format = c_api_string(program.format, program.format_size, "program.format")?;
     log(format!(
         "pjrt compile program format={format:?} code_size={}",
@@ -446,7 +438,7 @@ fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind
     ));
 
     match format.as_str() {
-        "mlir" | "stablehlo" => Ok(ExecutableKind::TtExecutableV1),
+        "mlir" | "stablehlo" => Ok(()),
         other => Err(unimplemented(format!(
             "unsupported program format {other:?}; supported formats are \"mlir\" and \"stablehlo\""
         ))),
@@ -533,7 +525,6 @@ fn compiled_program_from_program(
                     .transpose()
                     .map_err(unimplemented)?;
                 return Ok(CompiledProgram {
-                    kind: ExecutableKind::TtExecutableV1,
                     output_dims,
                     output_type: map_mlir_element_type(analysis.output_type)?,
                     optimized_program: optimized_program_bytes
@@ -545,14 +536,13 @@ fn compiled_program_from_program(
         }
     }
 
-    let _ = executable_kind_from_program(program)?;
+    validate_program_format(program)?;
     Err(unimplemented(
         "MLIR compilation requires the libtt MLIR frontend build",
     ))
 }
 
 fn make_executable(
-    kind: ExecutableKind,
     name: &str,
     dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
@@ -569,9 +559,8 @@ fn make_executable(
         .map(|kind| kind.as_bytes().len())
         .collect::<Vec<_>>();
     let output_dim_sizes = vec![dims.len()];
-    let fingerprint = executable_fingerprint_string(kind, name, &dims, output_type);
+    let fingerprint = executable_fingerprint_string(name, &dims, output_type);
     PJRT_Executable {
-        kind,
         name: cstring_lossy(name),
         fingerprint,
         num_outputs: 1,
@@ -587,7 +576,6 @@ fn make_executable(
 }
 
 fn make_loaded_executable(
-    kind: ExecutableKind,
     name: &str,
     dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
@@ -595,16 +583,8 @@ fn make_loaded_executable(
     tt_executable: Option<tt_executable::Executable>,
     addressable_devices: Vec<*mut PJRT_Device>,
 ) -> PJRT_LoadedExecutable {
-    let executable = make_executable(
-        kind,
-        name,
-        dims,
-        output_type,
-        optimized_program,
-        tt_executable,
-    );
+    let executable = make_executable(name, dims, output_type, optimized_program, tt_executable);
     PJRT_LoadedExecutable {
-        kind: executable.kind,
         name: executable.name,
         fingerprint: executable.fingerprint,
         num_outputs: executable.num_outputs,
@@ -628,7 +608,6 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
         .map(|kind| kind.as_ptr())
         .collect::<Vec<_>>();
     PJRT_Executable {
-        kind: executable.kind,
         name: executable.name.clone(),
         fingerprint: executable.fingerprint.clone(),
         num_outputs: executable.num_outputs,
@@ -644,21 +623,17 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
 }
 
 fn executable_fingerprint_string(
-    kind: ExecutableKind,
     name: &str,
     dims: &[i64],
     output_type: PJRT_Buffer_Type,
 ) -> CString {
-    let kind_name = match kind {
-        ExecutableKind::TtExecutableV1 => "tt_executable_v1",
-    };
     let dims = dims
         .iter()
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join("x");
     cstring_lossy(&format!(
-        "tt:{kind_name}:name={name}:dims={dims}:type={}:v1",
+        "tt:tt_executable_v1:name={name}:dims={dims}:type={}:v1",
         output_type as u32
     ))
 }
@@ -999,7 +974,6 @@ pub unsafe extern "C" fn TT_Client_Compile(args: *mut PJRT_Client_Compile_Args) 
 
     let name = "tt.executable.v1";
     args.executable = Box::into_raw(Box::new(make_loaded_executable(
-        compiled.kind,
         name,
         compiled.output_dims,
         compiled.output_type,
@@ -1025,7 +999,6 @@ pub unsafe extern "C" fn TT_Compile(args: *mut PJRT_Compile_Args) -> *mut PJRT_E
 
     let name = "tt.executable.v1";
     args.executable = Box::into_raw(Box::new(make_executable(
-        compiled.kind,
         name,
         compiled.output_dims,
         compiled.output_type,
