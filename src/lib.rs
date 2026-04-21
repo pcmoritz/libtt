@@ -77,7 +77,6 @@ pub struct PJRT_Buffer {
     memory: *mut PJRT_Memory,
     local_hardware_id: usize,
     dram_buffer: Option<DramBuffer>,
-    host_data: Vec<u8>,
     deleted: bool,
 }
 
@@ -408,6 +407,17 @@ fn event_for_buffer(buffer: &PJRT_Buffer) -> *mut PJRT_Event {
     } else {
         ready_event()
     }
+}
+
+fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
+    let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+        return Err(pjrt_error(
+            "buffer has been deleted",
+            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+        ));
+    };
+    let mut device = Device::open(buffer.local_hardware_id).map_err(io_error)?;
+    device.dram_read(dram_buffer).map_err(io_error)
 }
 
 fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *mut PJRT_Error> {
@@ -1456,7 +1466,6 @@ fn execute_tt_executable_v1(
                     memory: target_device.default_memory,
                     local_hardware_id: target_device.local_hardware_id as usize,
                     dram_buffer: Some(output_dram),
-                    host_data: Vec::new(),
                     deleted: false,
                 });
             }
@@ -1644,7 +1653,6 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         memory: target_memory,
         local_hardware_id,
         dram_buffer: Some(dram_buffer),
-        host_data: data.to_vec(),
         deleted: false,
     }));
     ptr::null_mut()
@@ -2048,8 +2056,10 @@ pub unsafe extern "C" fn TT_Buffer_OnDeviceSizeInBytes(
         return invalid_argument("buffer must not be null");
     };
     let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-        args.on_device_size_in_bytes = buffer.host_data.len();
-        return ptr::null_mut();
+        return pjrt_error(
+            "buffer has been deleted",
+            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+        );
     };
     args.on_device_size_in_bytes = dram_buffer.size();
     ptr::null_mut()
@@ -2089,7 +2099,6 @@ pub unsafe extern "C" fn TT_Buffer_Delete(args: *mut PJRT_Buffer_Delete_Args) ->
     };
     buffer.deleted = true;
     buffer.dram_buffer = None;
-    buffer.host_data.clear();
     ptr::null_mut()
 }
 
@@ -2136,23 +2145,9 @@ pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
         return invalid_argument("dst must not be null for non-empty buffers");
     }
 
-    let data = if !buffer.host_data.is_empty() {
-        buffer.host_data.clone()
-    } else {
-        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-            return pjrt_error(
-                "buffer has been deleted",
-                PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
-            );
-        };
-        let mut device = match Device::open(buffer.local_hardware_id) {
-            Ok(device) => device,
-            Err(err) => return io_error(err),
-        };
-        match device.dram_read(dram_buffer) {
-            Ok(data) => data,
-            Err(err) => return io_error(err),
-        }
+    let data = match read_buffer_bytes(buffer) {
+        Ok(data) => data,
+        Err(err) => return err,
     };
     if data.len() != byte_size {
         return pjrt_error(
@@ -2246,23 +2241,9 @@ pub unsafe extern "C" fn TT_Buffer_CopyRawToHost(
         return invalid_argument("dst must not be null for non-empty transfers");
     }
 
-    let data = if !buffer.host_data.is_empty() {
-        buffer.host_data.clone()
-    } else {
-        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-            return pjrt_error(
-                "buffer has been deleted",
-                PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
-            );
-        };
-        let mut device = match Device::open(buffer.local_hardware_id) {
-            Ok(device) => device,
-            Err(err) => return io_error(err),
-        };
-        match device.dram_read(dram_buffer) {
-            Ok(data) => data,
-            Err(err) => return io_error(err),
-        }
+    let data = match read_buffer_bytes(buffer) {
+        Ok(data) => data,
+        Err(err) => return err,
     };
     let end = match offset.checked_add(transfer_size) {
         Some(end) if end <= data.len() => end,
