@@ -111,13 +111,6 @@ struct ExecutableMetadata {
     tt_executable: Option<tt_executable::Executable>,
 }
 
-struct CompiledProgram {
-    output_dims: Vec<i64>,
-    output_type: PJRT_Buffer_Type,
-    optimized_program: Option<OptimizedProgram>,
-    tt_executable: Option<tt_executable::Executable>,
-}
-
 #[repr(C)]
 pub struct PJRT_Executable {
     metadata: ExecutableMetadata,
@@ -144,6 +137,8 @@ pub struct PJRT_Client {
 }
 
 unsafe impl Sync for PJRT_Api {}
+
+const EXECUTABLE_NAME: &str = "tt.executable.v1";
 
 impl PJRT_Client {
     fn new() -> Self {
@@ -473,9 +468,9 @@ fn map_mlir_element_type(element_type: i32) -> Result<PJRT_Buffer_Type, *mut PJR
     }
 }
 
-fn compiled_program_from_program(
+fn executable_metadata_from_program(
     program: &PJRT_Program,
-) -> Result<CompiledProgram, *mut PJRT_Error> {
+) -> Result<ExecutableMetadata, *mut PJRT_Error> {
     #[cfg(libtt_mlir_frontend)]
     {
         let format = c_api_string(program.format, program.format_size, "program.format")?;
@@ -529,14 +524,15 @@ fn compiled_program_from_program(
                     .map(tt_executable::parse)
                     .transpose()
                     .map_err(unimplemented)?;
-                return Ok(CompiledProgram {
+                return Ok(make_executable_metadata(
+                    EXECUTABLE_NAME,
                     output_dims,
-                    output_type: map_mlir_element_type(analysis.output_type)?,
-                    optimized_program: optimized_program_bytes
+                    map_mlir_element_type(analysis.output_type)?,
+                    optimized_program_bytes
                         .as_deref()
                         .map(|bytes| optimized_program("tt-executable-v1", bytes)),
                     tt_executable,
-                });
+                ));
             }
         }
     }
@@ -581,27 +577,17 @@ fn make_executable_metadata(
 }
 
 fn make_executable(
-    name: &str,
-    dims: Vec<i64>,
-    output_type: PJRT_Buffer_Type,
-    optimized_program: Option<OptimizedProgram>,
-    tt_executable: Option<tt_executable::Executable>,
+    metadata: ExecutableMetadata,
 ) -> PJRT_Executable {
-    PJRT_Executable {
-        metadata: make_executable_metadata(name, dims, output_type, optimized_program, tt_executable),
-    }
+    PJRT_Executable { metadata }
 }
 
 fn make_loaded_executable(
-    name: &str,
-    dims: Vec<i64>,
-    output_type: PJRT_Buffer_Type,
-    optimized_program: Option<OptimizedProgram>,
-    tt_executable: Option<tt_executable::Executable>,
+    metadata: ExecutableMetadata,
     addressable_devices: Vec<*mut PJRT_Device>,
 ) -> PJRT_LoadedExecutable {
     PJRT_LoadedExecutable {
-        metadata: make_executable_metadata(name, dims, output_type, optimized_program, tt_executable),
+        metadata,
         addressable_devices,
         deleted: false,
     }
@@ -958,18 +944,12 @@ pub unsafe extern "C" fn TT_Client_Compile(args: *mut PJRT_Client_Compile_Args) 
     let Ok(program) = (unsafe { checked_ref(args.program, "program") }) else {
         return invalid_argument("program must not be null");
     };
-    let compiled = match compiled_program_from_program(program) {
+    let metadata = match executable_metadata_from_program(program) {
         Ok(compiled) => compiled,
         Err(err) => return err,
     };
-
-    let name = "tt.executable.v1";
     args.executable = Box::into_raw(Box::new(make_loaded_executable(
-        name,
-        compiled.output_dims,
-        compiled.output_type,
-        compiled.optimized_program,
-        compiled.tt_executable,
+        metadata,
         client.addressable_device_ptrs.clone(),
     )));
     ptr::null_mut()
@@ -983,19 +963,11 @@ pub unsafe extern "C" fn TT_Compile(args: *mut PJRT_Compile_Args) -> *mut PJRT_E
     let Ok(program) = (unsafe { checked_ref(args.program, "program") }) else {
         return invalid_argument("program must not be null");
     };
-    let compiled = match compiled_program_from_program(program) {
+    let metadata = match executable_metadata_from_program(program) {
         Ok(compiled) => compiled,
         Err(err) => return err,
     };
-
-    let name = "tt.executable.v1";
-    args.executable = Box::into_raw(Box::new(make_executable(
-        name,
-        compiled.output_dims,
-        compiled.output_type,
-        compiled.optimized_program,
-        compiled.tt_executable,
-    )));
+    args.executable = Box::into_raw(Box::new(make_executable(metadata)));
     ptr::null_mut()
 }
 
