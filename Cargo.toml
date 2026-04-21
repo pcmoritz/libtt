@@ -8,8 +8,4 @@ build = "build.rs"
 name = "tt"
 crate-type = ["cdylib", "rlib"]
 
-[features]
-default = []
-mlir-frontend = []
-
 [dependencies]
