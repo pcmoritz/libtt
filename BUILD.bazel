@@ -1,5 +1,8 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library")
-load("@rules_rust//rust:defs.bzl", "rust_static_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library_group", "rust_static_library", "rust_test")
+load("@rules_rust_prost//:defs.bzl", "rust_prost_library", "rust_prost_toolchain")
+load("@com_google_protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
+load("@com_google_protobuf//bazel:proto_library.bzl", "proto_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -19,8 +22,12 @@ rust_static_library(
 rust_static_library(
     name = "tt_rust_mlir",
     srcs = RUST_SRCS,
-    crate_name = "tt",
+    crate_name = "tt_mlir",
     crate_root = "src/lib.rs",
+    deps = [
+        ":tt_executable_rust",
+        "@prost_crates//:prost",
+    ],
     edition = "2024",
     rustc_flags = ["--cfg=libtt_mlir_frontend"],
     version = "0.1.0",
@@ -31,11 +38,52 @@ rust_test(
     crate = ":tt_rust",
 )
 
+rust_test(
+    name = "tt_mlir_test",
+    crate = ":tt_rust_mlir",
+)
+
+proto_library(
+    name = "tt_executable_proto",
+    srcs = ["mlir/tt_executable.proto"],
+)
+
+cc_proto_library(
+    name = "tt_executable_cc_proto",
+    deps = [":tt_executable_proto"],
+)
+
+rust_library_group(
+    name = "prost_runtime",
+    deps = ["@prost_crates//:prost"],
+)
+
+rust_prost_toolchain(
+    name = "prost_toolchain_impl",
+    prost_plugin = "@prost_crates//:protoc-gen-prost__protoc-gen-prost",
+    prost_runtime = ":prost_runtime",
+    prost_types = "@prost_crates//:prost-types",
+    tonic_plugin_flag = "",
+)
+
+toolchain(
+    name = "prost_toolchain",
+    toolchain = ":prost_toolchain_impl",
+    toolchain_type = "@rules_rust_prost//:toolchain_type",
+)
+
+rust_prost_library(
+    name = "tt_executable_rust",
+    proto = ":tt_executable_proto",
+)
+
 cc_library(
     name = "tt_mlir_frontend",
     srcs = ["mlir/tt_mlir_frontend.cc"],
     copts = ["-std=c++17"],
     deps = [
+        ":tt_executable_cc_proto",
+        "@com_google_protobuf//:protobuf_lite",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:FuncExtensions",
         "@llvm-project//mlir:FuncDialect",

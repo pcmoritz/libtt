@@ -8,6 +8,7 @@ mod hw;
 mod linux;
 mod log;
 mod mlir_frontend;
+mod tt_executable;
 
 use device::Device;
 use dram::{DType, DramBuffer};
@@ -67,6 +68,7 @@ pub struct PJRT_Event {
     error: Option<(PJRT_Error_Code, String)>,
 }
 
+#[derive(Clone)]
 #[repr(C)]
 pub struct PJRT_Buffer {
     buffer_type: PJRT_Buffer_Type,
@@ -92,6 +94,7 @@ pub struct PJRT_Layouts_SerializedLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecutableKind {
     EltwiseAddBf16,
+    TtExecutableV1,
 }
 
 #[derive(Clone)]
@@ -105,6 +108,7 @@ struct CompiledProgram {
     output_dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
     optimized_program: Option<OptimizedProgram>,
+    tt_executable: Option<tt_executable::Executable>,
 }
 
 #[repr(C)]
@@ -120,6 +124,7 @@ pub struct PJRT_Executable {
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
     optimized_program: Option<OptimizedProgram>,
+    tt_executable: Option<tt_executable::Executable>,
 }
 
 #[repr(C)]
@@ -136,6 +141,7 @@ pub struct PJRT_LoadedExecutable {
     output_memory_kind_sizes: Vec<usize>,
     addressable_devices: Vec<*mut PJRT_Device>,
     optimized_program: Option<OptimizedProgram>,
+    tt_executable: Option<tt_executable::Executable>,
     deleted: bool,
 }
 
@@ -478,10 +484,10 @@ fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind
     }
 }
 
-fn optimized_program_from_text(text: &[u8]) -> OptimizedProgram {
+fn optimized_program(format: &str, code: &[u8]) -> OptimizedProgram {
     OptimizedProgram {
-        format: cstring_lossy("mlir"),
-        code: text.to_vec(),
+        format: cstring_lossy(format),
+        code: code.to_vec(),
     }
 }
 
@@ -539,6 +545,9 @@ fn executable_output_signature(
                 .unwrap_or_else(|| (Vec::new(), PJRT_Buffer_Type::PJRT_Buffer_Type_BF16))),
             _ => Ok((Vec::new(), PJRT_Buffer_Type::PJRT_Buffer_Type_BF16)),
         },
+        ExecutableKind::TtExecutableV1 => Err(unimplemented(
+            "TT executable output signatures must come from the MLIR frontend analysis",
+        )),
     }
 }
 
@@ -567,6 +576,7 @@ fn compiled_program_from_program(
             output_dims: Vec::new(),
             output_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
             optimized_program: None,
+            tt_executable: None,
         });
     }
 
@@ -593,10 +603,6 @@ fn compiled_program_from_program(
                 });
             }
 
-            let kind = match analysis.executable_kind {
-                mlir_frontend::EXECUTABLE_KIND_ELTWISE_ADD_BF16 => ExecutableKind::EltwiseAddBf16,
-                _ => return Err(unimplemented("unsupported MLIR executable kind")),
-            };
             let output_dims = if analysis.num_output_dims == 0 {
                 Vec::new()
             } else {
@@ -608,21 +614,32 @@ fn compiled_program_from_program(
                 }
                 .to_vec()
             };
-            let optimized_program = if analysis.optimized_program.is_null() {
+            let optimized_program_bytes = if analysis.optimized_program.is_null() {
                 None
             } else {
-                Some(optimized_program_from_text(unsafe {
-                    slice::from_raw_parts(
-                        analysis.optimized_program.cast::<u8>(),
-                        analysis.optimized_program_size,
-                    )
-                }))
+                Some(
+                    unsafe {
+                        slice::from_raw_parts(
+                            analysis.optimized_program.cast::<u8>(),
+                            analysis.optimized_program_size,
+                        )
+                    }
+                    .to_vec(),
+                )
             };
+            let tt_executable = optimized_program_bytes
+                .as_deref()
+                .map(tt_executable::parse)
+                .transpose()
+                .map_err(unimplemented)?;
             return Ok(CompiledProgram {
-                kind,
+                kind: ExecutableKind::TtExecutableV1,
                 output_dims,
                 output_type: map_mlir_element_type(analysis.output_type)?,
-                optimized_program,
+                optimized_program: optimized_program_bytes
+                    .as_deref()
+                    .map(|bytes| optimized_program("tt-executable-v1", bytes)),
+                tt_executable,
             });
         }
 
@@ -633,6 +650,7 @@ fn compiled_program_from_program(
                 output_dims: Vec::new(),
                 output_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
                 optimized_program: None,
+                tt_executable: None,
             });
         }
     }
@@ -642,7 +660,7 @@ fn compiled_program_from_program(
     let optimized_program = if format == "mlir" || format == "stablehlo" {
         c_api_bytes(program.code.cast_const(), program.code_size, "program.code")
             .ok()
-            .map(optimized_program_from_text)
+            .map(|bytes| optimized_program("mlir", bytes))
     } else {
         None
     };
@@ -651,6 +669,7 @@ fn compiled_program_from_program(
         output_dims,
         output_type,
         optimized_program,
+        tt_executable: None,
     })
 }
 
@@ -660,6 +679,7 @@ fn make_executable(
     dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
     optimized_program: Option<OptimizedProgram>,
+    tt_executable: Option<tt_executable::Executable>,
 ) -> PJRT_Executable {
     let output_memory_kinds = vec![cstring_lossy("dram")];
     let output_memory_kind_ptrs = output_memory_kinds
@@ -684,6 +704,7 @@ fn make_executable(
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
         optimized_program,
+        tt_executable,
     }
 }
 
@@ -693,9 +714,17 @@ fn make_loaded_executable(
     dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
     optimized_program: Option<OptimizedProgram>,
+    tt_executable: Option<tt_executable::Executable>,
     addressable_devices: Vec<*mut PJRT_Device>,
 ) -> PJRT_LoadedExecutable {
-    let executable = make_executable(kind, name, dims, output_type, optimized_program);
+    let executable = make_executable(
+        kind,
+        name,
+        dims,
+        output_type,
+        optimized_program,
+        tt_executable,
+    );
     PJRT_LoadedExecutable {
         kind: executable.kind,
         name: executable.name,
@@ -709,6 +738,7 @@ fn make_loaded_executable(
         output_memory_kind_sizes: executable.output_memory_kind_sizes,
         addressable_devices,
         optimized_program: executable.optimized_program,
+        tt_executable: executable.tt_executable,
         deleted: false,
     }
 }
@@ -731,6 +761,7 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
         output_memory_kind_ptrs,
         output_memory_kind_sizes: executable.output_memory_kind_sizes.clone(),
         optimized_program: executable.optimized_program.clone(),
+        tt_executable: executable.tt_executable.clone(),
     }
 }
 
@@ -742,6 +773,7 @@ fn executable_fingerprint_string(
 ) -> CString {
     let kind_name = match kind {
         ExecutableKind::EltwiseAddBf16 => "eltwise_add_bf16",
+        ExecutableKind::TtExecutableV1 => "tt_executable_v1",
     };
     let dims = dims
         .iter()
@@ -1090,6 +1122,7 @@ pub unsafe extern "C" fn TT_Client_Compile(args: *mut PJRT_Client_Compile_Args) 
 
     let name = match compiled.kind {
         ExecutableKind::EltwiseAddBf16 => "tt.add.bf16",
+        ExecutableKind::TtExecutableV1 => "tt.executable.v1",
     };
     args.executable = Box::into_raw(Box::new(make_loaded_executable(
         compiled.kind,
@@ -1097,6 +1130,7 @@ pub unsafe extern "C" fn TT_Client_Compile(args: *mut PJRT_Client_Compile_Args) 
         compiled.output_dims,
         compiled.output_type,
         compiled.optimized_program,
+        compiled.tt_executable,
         client.addressable_device_ptrs.clone(),
     )));
     ptr::null_mut()
@@ -1117,6 +1151,7 @@ pub unsafe extern "C" fn TT_Compile(args: *mut PJRT_Compile_Args) -> *mut PJRT_E
 
     let name = match compiled.kind {
         ExecutableKind::EltwiseAddBf16 => "tt.add.bf16",
+        ExecutableKind::TtExecutableV1 => "tt.executable.v1",
     };
     args.executable = Box::into_raw(Box::new(make_executable(
         compiled.kind,
@@ -1124,6 +1159,7 @@ pub unsafe extern "C" fn TT_Compile(args: *mut PJRT_Compile_Args) -> *mut PJRT_E
         compiled.output_dims,
         compiled.output_type,
         compiled.optimized_program,
+        compiled.tt_executable,
     )));
     ptr::null_mut()
 }
@@ -1466,6 +1502,145 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Fingerprint(
     ptr::null_mut()
 }
 
+fn device_buffer_for_value<'a>(
+    values: &'a [Option<PJRT_Buffer>],
+    value_id: u32,
+    field: &str,
+) -> Result<&'a PJRT_Buffer, *mut PJRT_Error> {
+    let index = usize::try_from(value_id)
+        .map_err(|_| invalid_argument(format!("{field} value id does not fit in usize")))?;
+    values
+        .get(index)
+        .and_then(|value| value.as_ref())
+        .ok_or_else(|| invalid_argument(format!("{field} value id {value_id} is not available")))
+}
+
+fn execute_tt_executable_v1(
+    executable: &PJRT_LoadedExecutable,
+    execute_device: *mut PJRT_Device,
+    target_device: &PJRT_Device,
+    inputs: &[*mut PJRT_Buffer],
+) -> Result<PJRT_Buffer, *mut PJRT_Error> {
+    let plan = executable
+        .tt_executable
+        .as_ref()
+        .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
+    let mut values = vec![None; plan.values.len()];
+    let mut device = Device::open(target_device.local_hardware_id as usize).map_err(io_error)?;
+
+    for op in &plan.ops {
+        match *op {
+            tt_executable::Op::Parameter {
+                parameter_index,
+                output_id,
+            } => {
+                let input_ptr = inputs.get(parameter_index).copied().ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable parameter index {parameter_index} is out of range"
+                    ))
+                })?;
+                let input = unsafe { checked_ref(input_ptr, "argument_lists[0][*]") }?;
+                if input.deleted {
+                    return Err(failed_precondition("input buffers must not be deleted"));
+                }
+                if input.local_hardware_id != target_device.local_hardware_id as usize {
+                    return Err(invalid_argument(
+                        "all input buffers and execute_device must be on the same device",
+                    ));
+                }
+
+                let output_index = usize::try_from(output_id).map_err(|_| {
+                    invalid_argument("TT executable parameter output id does not fit in usize")
+                })?;
+                let expected = plan.values.get(output_index).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable parameter output id {output_id} is out of bounds"
+                    ))
+                })?;
+                if input.buffer_type != expected.element_type {
+                    return Err(unimplemented(format!(
+                        "TT executable parameter {parameter_index} expected {:?}, got {:?}",
+                        expected.element_type, input.buffer_type
+                    )));
+                }
+                if input.dims != expected.dims {
+                    return Err(invalid_argument(format!(
+                        "TT executable parameter {parameter_index} shape mismatch: expected {:?}, got {:?}",
+                        expected.dims, input.dims
+                    )));
+                }
+                values[output_index] = Some(input.clone());
+            }
+            tt_executable::Op::Add {
+                input_ids,
+                output_id,
+            } => {
+                let lhs = device_buffer_for_value(&values, input_ids[0], "add.lhs")?;
+                let rhs = device_buffer_for_value(&values, input_ids[1], "add.rhs")?;
+                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                {
+                    return Err(unimplemented(
+                        "TT executable add currently only supports bf16 buffers",
+                    ));
+                }
+                if lhs.dims != rhs.dims {
+                    return Err(invalid_argument(
+                        "TT executable add input shapes must match",
+                    ));
+                }
+
+                let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable lhs buffer has no device allocation",
+                    ));
+                };
+                let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable rhs buffer has no device allocation",
+                    ));
+                };
+
+                let output_dram = device
+                    .eltwise_add_bf16(lhs_dram, rhs_dram, "pjrt_add")
+                    .map_err(io_error)?;
+                let output_index = usize::try_from(output_id).map_err(|_| {
+                    invalid_argument("TT executable add output id does not fit in usize")
+                })?;
+                let expected = plan.values.get(output_index).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable add output id {output_id} is out of bounds"
+                    ))
+                })?;
+                if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+                    return Err(unimplemented(
+                        "TT executable add currently only supports bf16 outputs",
+                    ));
+                }
+                if expected.dims != lhs.dims {
+                    return Err(invalid_argument(format!(
+                        "TT executable add output shape mismatch: expected {:?}, got {:?}",
+                        expected.dims, lhs.dims
+                    )));
+                }
+                values[output_index] = Some(PJRT_Buffer {
+                    buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+                    dims: lhs.dims.clone(),
+                    device: execute_device,
+                    memory: target_device.default_memory,
+                    local_hardware_id: target_device.local_hardware_id as usize,
+                    dram_buffer: Some(output_dram),
+                    host_data: Vec::new(),
+                    deleted: false,
+                });
+            }
+        }
+    }
+
+    let output = device_buffer_for_value(&values, plan.output_ids[0], "output")?;
+    Ok(output.clone())
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     args: *mut PJRT_LoadedExecutable_Execute_Args,
@@ -1485,9 +1660,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     }
     if args.num_devices != 1 {
         return unimplemented("only single-device execution is supported");
-    }
-    if args.num_args != 2 {
-        return invalid_argument("tt.add expects exactly two arguments");
     }
     if args.argument_lists.is_null() || args.output_lists.is_null() {
         return invalid_argument("argument_lists and output_lists must not be null");
@@ -1513,46 +1685,73 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     if device_args.is_null() {
         return invalid_argument("argument_lists[0] must not be null");
     }
-    let lhs_ptr = unsafe { *device_args.add(0) };
-    let rhs_ptr = unsafe { *device_args.add(1) };
-    let Ok(lhs) = (unsafe { checked_ref(lhs_ptr, "argument_lists[0][0]") }) else {
-        return invalid_argument("lhs buffer must not be null");
+    let input_ptrs = if args.num_args == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(device_args, args.num_args) }
     };
-    let Ok(rhs) = (unsafe { checked_ref(rhs_ptr, "argument_lists[0][1]") }) else {
-        return invalid_argument("rhs buffer must not be null");
-    };
-    if lhs.deleted || rhs.deleted {
-        return failed_precondition("input buffers must not be deleted");
-    }
-    if lhs.local_hardware_id != target_device.local_hardware_id as usize
-        || rhs.local_hardware_id != target_device.local_hardware_id as usize
-    {
-        return invalid_argument("all buffers and execute_device must be on the same device");
-    }
-    if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-    {
-        return unimplemented("tt.add currently only supports bf16 buffers");
-    }
-    if lhs.dims != rhs.dims {
-        return invalid_argument("tt.add input buffer shapes must match");
-    }
-    let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
-        return failed_precondition("lhs buffer has no device allocation");
-    };
-    let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
-        return failed_precondition("rhs buffer has no device allocation");
-    };
-
-    let output_dram_buffer = match executable.kind {
+    let output_buffer = match executable.kind {
         ExecutableKind::EltwiseAddBf16 => {
+            if args.num_args != 2 {
+                return invalid_argument("tt.add expects exactly two arguments");
+            }
+
+            let lhs_ptr = input_ptrs[0];
+            let rhs_ptr = input_ptrs[1];
+            let Ok(lhs) = (unsafe { checked_ref(lhs_ptr, "argument_lists[0][0]") }) else {
+                return invalid_argument("lhs buffer must not be null");
+            };
+            let Ok(rhs) = (unsafe { checked_ref(rhs_ptr, "argument_lists[0][1]") }) else {
+                return invalid_argument("rhs buffer must not be null");
+            };
+            if lhs.deleted || rhs.deleted {
+                return failed_precondition("input buffers must not be deleted");
+            }
+            if lhs.local_hardware_id != target_device.local_hardware_id as usize
+                || rhs.local_hardware_id != target_device.local_hardware_id as usize
+            {
+                return invalid_argument(
+                    "all buffers and execute_device must be on the same device",
+                );
+            }
+            if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+            {
+                return unimplemented("tt.add currently only supports bf16 buffers");
+            }
+            if lhs.dims != rhs.dims {
+                return invalid_argument("tt.add input buffer shapes must match");
+            }
+            let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+                return failed_precondition("lhs buffer has no device allocation");
+            };
+            let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+                return failed_precondition("rhs buffer has no device allocation");
+            };
+
             let mut device = match Device::open(target_device.local_hardware_id as usize) {
                 Ok(device) => device,
                 Err(err) => return io_error(err),
             };
-            match device.eltwise_add_bf16(lhs_dram, rhs_dram, "pjrt_add") {
+            let output_dram_buffer = match device.eltwise_add_bf16(lhs_dram, rhs_dram, "pjrt_add") {
                 Ok(buffer) => buffer,
                 Err(err) => return io_error(err),
+            };
+            PJRT_Buffer {
+                buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+                dims: lhs.dims.clone(),
+                device: execute_device,
+                memory: target_device.default_memory,
+                local_hardware_id: target_device.local_hardware_id as usize,
+                dram_buffer: Some(output_dram_buffer),
+                host_data: Vec::new(),
+                deleted: false,
+            }
+        }
+        ExecutableKind::TtExecutableV1 => {
+            match execute_tt_executable_v1(executable, execute_device, target_device, input_ptrs) {
+                Ok(output) => output,
+                Err(err) => return err,
             }
         }
     };
@@ -1561,16 +1760,7 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     if device_outputs.is_null() {
         return invalid_argument("output_lists[0] must not be null");
     }
-    let output_ptr = Box::into_raw(Box::new(PJRT_Buffer {
-        buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
-        dims: lhs.dims.clone(),
-        device: execute_device,
-        memory: target_device.default_memory,
-        local_hardware_id: target_device.local_hardware_id as usize,
-        dram_buffer: Some(output_dram_buffer),
-        host_data: Vec::new(),
-        deleted: false,
-    }));
+    let output_ptr = Box::into_raw(Box::new(output_buffer));
     unsafe {
         *device_outputs.add(0) = output_ptr;
     }
@@ -3027,11 +3217,98 @@ mod tests {
             program: &mut optimized,
         };
         check_ok(api, unsafe { optimized_program(&mut optimized_args) });
-        assert_eq!(optimized.format_size, 4);
-        let optimized_text =
+        let optimized_format = unsafe {
+            std::slice::from_raw_parts(optimized.format.cast::<u8>(), optimized.format_size)
+        };
+        assert_eq!(optimized_format, b"tt-executable-v1");
+        let optimized_bytes =
             unsafe { std::slice::from_raw_parts(optimized.code.cast::<u8>(), optimized.code_size) };
-        let optimized_text = std::str::from_utf8(optimized_text).expect("optimized program utf-8");
-        assert!(optimized_text.contains("stablehlo.add"));
+        let executable = tt_executable::parse(optimized_bytes).expect("parse TT executable");
+        assert_eq!(executable.values.len(), 3);
+        assert_eq!(executable.ops.len(), 3);
+        assert_eq!(executable.output_ids, vec![2]);
+
+        unsafe {
+            drop(Box::from_raw(get_executable_args.executable));
+            drop(Box::from_raw(compile_args.executable));
+            drop(Box::from_raw(client));
+        }
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_multi_op_stablehlo_add_chain() {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"mlir".to_vec();
+        let mut code = br#"module {
+  func.func @main(%arg0: tensor<2x2xbf16>, %arg1: tensor<2x2xbf16>, %arg2: tensor<2x2xbf16>) -> tensor<2x2xbf16> {
+    %0 = "stablehlo.add"(%arg0, %arg1) : (tensor<2x2xbf16>, tensor<2x2xbf16>) -> tensor<2x2xbf16>
+    %1 = "stablehlo.add"(%0, %arg2) : (tensor<2x2xbf16>, tensor<2x2xbf16>) -> tensor<2x2xbf16>
+    return %1 : tensor<2x2xbf16>
+  }
+}
+"#
+        .to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: code.as_mut_ptr().cast::<c_char>(),
+            code_size: code.len(),
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { compile(&mut compile_args) });
+
+        let get_executable = api
+            .PJRT_LoadedExecutable_GetExecutable
+            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
+        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
+            extension_start: ptr::null_mut(),
+            loaded_executable: compile_args.executable,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+
+        let optimized_program = api
+            .PJRT_Executable_OptimizedProgram
+            .expect("PJRT_Executable_OptimizedProgram must be exported");
+        let mut optimized = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: ptr::null_mut(),
+            code_size: 0,
+            format: ptr::null_mut(),
+            format_size: 0,
+        };
+        let mut optimized_args = PJRT_Executable_OptimizedProgram_Args {
+            struct_size: size_of::<PJRT_Executable_OptimizedProgram_Args>(),
+            extension_start: ptr::null_mut(),
+            executable: get_executable_args.executable,
+            program: &mut optimized,
+        };
+        check_ok(api, unsafe { optimized_program(&mut optimized_args) });
+
+        let optimized_bytes =
+            unsafe { std::slice::from_raw_parts(optimized.code.cast::<u8>(), optimized.code_size) };
+        let executable = tt_executable::parse(optimized_bytes).expect("parse TT executable");
+        assert_eq!(executable.values.len(), 5);
+        assert_eq!(executable.ops.len(), 5);
+        assert_eq!(executable.output_ids, vec![4]);
 
         unsafe {
             drop(Box::from_raw(get_executable_args.executable));

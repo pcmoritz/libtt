@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package tt;
+
+option optimize_for = LITE_RUNTIME;
+
+message TensorDesc {
+  enum ElementType {
+    ELEMENT_TYPE_UNKNOWN = 0;
+    ELEMENT_TYPE_BF16 = 1;
+    ELEMENT_TYPE_F16 = 2;
+    ELEMENT_TYPE_F32 = 3;
+    ELEMENT_TYPE_U32 = 4;
+    ELEMENT_TYPE_U16 = 5;
+    ELEMENT_TYPE_U8 = 6;
+    ELEMENT_TYPE_S32 = 7;
+    ELEMENT_TYPE_S8 = 8;
+  }
+
+  repeated int64 dims = 1;
+  ElementType element_type = 2;
+}
+
+message ValueDesc {
+  TensorDesc tensor = 1;
+}
+
+message Op {
+  enum Opcode {
+    OPCODE_UNKNOWN = 0;
+    OPCODE_PARAMETER = 1;
+    OPCODE_ADD = 2;
+  }
+
+  Opcode opcode = 1;
+  uint32 output_id = 2;
+  uint32 parameter_index = 3;
+  repeated uint32 input_ids = 4;
+}
+
+message TTExecutableV1 {
+  repeated ValueDesc values = 1;
+  repeated Op ops = 2;
+  repeated uint32 output_ids = 3;
+}
