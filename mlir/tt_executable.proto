@@ -33,13 +33,20 @@ message Op {
   }
 
   Opcode opcode = 1;
+  // Index into TTExecutableV1.values for the value produced by this op.
   uint32 output_id = 2;
+  // For OPCODE_PARAMETER, the zero-based entry-function argument index bound to
+  // output_id. Unused for other opcodes.
   uint32 parameter_index = 3;
+  // Indices into TTExecutableV1.values for this op's operands, in opcode-
+  // specific order. For OPCODE_ADD this is [lhs, rhs].
   repeated uint32 input_ids = 4;
 }
 
 message TTExecutableV1 {
   repeated ValueDesc values = 1;
   repeated Op ops = 2;
+  // Indices into values for the program results, in entry-function result
+  // order. The current lowering emits exactly one output.
   repeated uint32 output_ids = 3;
 }
