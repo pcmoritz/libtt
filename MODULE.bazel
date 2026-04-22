@@ -76,5 +76,4 @@ llvm_configure = use_repo_rule("//:bazel/llvm_configure_repo.bzl", "llvm_configu
 
 llvm_configure(
     name = "llvm-project",
-    llvm_raw_repo = "llvm-raw",
 )

@@ -1,7 +1,7 @@
-# Derived from llvm-project's utils/bazel/configure.bzl to let this repo
-# materialize @llvm-project directly from the pinned llvm archive.
+# Derived from llvm-project's utils/bazel/configure.bzl to materialize
+# @llvm-project directly from this repo's pinned llvm archive.
 
-DEFAULT_TARGETS = [
+LLVM_TARGETS = [
     "AArch64",
     "X86",
 ]
@@ -9,9 +9,7 @@ DEFAULT_TARGETS = [
 MAX_TRAVERSAL_STEPS = 1000000
 
 def _overlay_directories(repository_ctx):
-    src_root = repository_ctx.path(
-        Label("@{}//:WORKSPACE".format(repository_ctx.attr.llvm_raw_repo)),
-    ).dirname
+    src_root = repository_ctx.path(Label("@llvm-raw//:WORKSPACE")).dirname
     overlay_root = src_root.get_child("utils/bazel/llvm-project-overlay")
     target_root = repository_ctx.path(".")
 
@@ -74,21 +72,10 @@ def _extract_cmake_settings(repository_ctx, llvm_cmake):
 
         values[key] = kv[sep:].strip().partition(")")[0].partition(" ")[0]
 
-    values["LLVM_VERSION"] = "{}.{}.{}".format(
-        values["LLVM_VERSION_MAJOR"],
-        values["LLVM_VERSION_MINOR"],
-        values["LLVM_VERSION_PATCH"],
-    )
-    values["PACKAGE_VERSION"] = "{}.{}.{}{}".format(
-        values["LLVM_VERSION_MAJOR"],
-        values["LLVM_VERSION_MINOR"],
-        values["LLVM_VERSION_PATCH"],
-        values["LLVM_VERSION_SUFFIX"],
-    )
     return values
 
-def _write_dict_to_file(repository_ctx, filepath, header, values):
-    content = header + "\n"
+def _vars_bzl_content(values):
+    content = "# Generated from pinned llvm-project sources.\n\n"
     for key, value in values.items():
         content += '{} = "{}"\n'.format(key, value)
 
@@ -96,8 +83,11 @@ def _write_dict_to_file(repository_ctx, filepath, header, values):
     for key, value in values.items():
         content += '    "{}": "{}",\n'.format(key, value)
     content += "}\n"
+    return content
 
-    repository_ctx.file(filepath, content = content)
+def _targets_bzl(name, values):
+    return "{} = {}".format(name, values)
+
 
 def _llvm_configure_impl(repository_ctx):
     _overlay_directories(repository_ctx)
@@ -105,33 +95,27 @@ def _llvm_configure_impl(repository_ctx):
     vars = _extract_cmake_settings(repository_ctx, "llvm/CMakeLists.txt")
     version = _extract_cmake_settings(repository_ctx, "cmake/Modules/LLVMVersion.cmake")
     vars.update({key: value for key, value in version.items() if value != None})
-
-    _write_dict_to_file(
-        repository_ctx,
-        filepath = "vars.bzl",
-        header = "# Generated from llvm/CMakeLists.txt\n",
-        values = vars,
+    vars["LLVM_VERSION"] = "{}.{}.{}".format(
+        vars["LLVM_VERSION_MAJOR"],
+        vars["LLVM_VERSION_MINOR"],
+        vars["LLVM_VERSION_PATCH"],
+    )
+    vars["PACKAGE_VERSION"] = "{}.{}.{}{}".format(
+        vars["LLVM_VERSION_MAJOR"],
+        vars["LLVM_VERSION_MINOR"],
+        vars["LLVM_VERSION_PATCH"],
+        vars["LLVM_VERSION_SUFFIX"],
     )
 
-    repository_ctx.file(
-        "llvm/targets.bzl",
-        content = "llvm_targets = " + str(repository_ctx.attr.targets),
-        executable = False,
-    )
+    repository_ctx.file("vars.bzl", content = _vars_bzl_content(vars))
 
-    bolt_targets = [target for target in repository_ctx.attr.targets if target in ["AArch64", "RISCV", "X86"]]
-    repository_ctx.file(
-        "bolt/targets.bzl",
-        content = "bolt_targets = " + str(bolt_targets),
-        executable = False,
-    )
+    repository_ctx.file("llvm/targets.bzl", content = _targets_bzl("llvm_targets", LLVM_TARGETS))
+
+    bolt_targets = [target for target in LLVM_TARGETS if target in ["AArch64", "RISCV", "X86"]]
+    repository_ctx.file("bolt/targets.bzl", content = _targets_bzl("bolt_targets", bolt_targets))
 
 llvm_configure = repository_rule(
     implementation = _llvm_configure_impl,
     local = True,
     configure = True,
-    attrs = {
-        "llvm_raw_repo": attr.string(default = "llvm-raw"),
-        "targets": attr.string_list(default = DEFAULT_TARGETS),
-    },
 )
