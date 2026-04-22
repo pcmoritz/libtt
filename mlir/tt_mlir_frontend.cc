@@ -33,11 +33,6 @@ enum TT_MlirAnalysisStatus : int32_t {
     TT_MLIR_ANALYSIS_STATUS_INTERNAL_ERROR = 3,
 };
 
-enum TT_MlirExecutableKind : int32_t {
-    TT_MLIR_EXECUTABLE_KIND_UNKNOWN = 0,
-    TT_MLIR_EXECUTABLE_KIND_TT_EXECUTABLE_V1 = 1,
-};
-
 enum TT_MlirElementType : int32_t {
     TT_MLIR_ELEMENT_TYPE_UNKNOWN = 0,
     TT_MLIR_ELEMENT_TYPE_BF16 = 1,
@@ -52,7 +47,6 @@ enum TT_MlirElementType : int32_t {
 
 struct TT_MlirAnalysis {
     int32_t status;
-    int32_t executable_kind;
     int32_t output_type;
     size_t num_output_dims;
     int64_t* output_dims;
@@ -351,7 +345,6 @@ bool lowerToExecutable(FuncOp func, TT_MlirAnalysis& analysis, std::string& erro
         return false;
     }
 
-    analysis.executable_kind = TT_MLIR_EXECUTABLE_KIND_TT_EXECUTABLE_V1;
     setProgramBytes(analysis, bytes);
     return analysis.optimized_program != nullptr || bytes.empty();
 }
@@ -359,7 +352,6 @@ bool lowerToExecutable(FuncOp func, TT_MlirAnalysis& analysis, std::string& erro
 TT_MlirAnalysis* makeAnalysis() {
     auto* analysis = new TT_MlirAnalysis();
     analysis->status = TT_MLIR_ANALYSIS_STATUS_INTERNAL_ERROR;
-    analysis->executable_kind = TT_MLIR_EXECUTABLE_KIND_UNKNOWN;
     analysis->output_type = TT_MLIR_ELEMENT_TYPE_UNKNOWN;
     analysis->num_output_dims = 0;
     analysis->output_dims = nullptr;

@@ -5,7 +5,6 @@ use std::ffi::c_char;
 #[repr(C)]
 pub(crate) struct TT_MlirAnalysis {
     pub(crate) status: i32,
-    pub(crate) executable_kind: i32,
     pub(crate) output_type: i32,
     pub(crate) num_output_dims: usize,
     pub(crate) output_dims: *mut i64,
