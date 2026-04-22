@@ -77,7 +77,6 @@ pub struct PJRT_Buffer {
     memory: *mut PJRT_Memory,
     local_hardware_id: usize,
     dram_buffer: Option<DramBuffer>,
-    host_data: Vec<u8>,
     deleted: bool,
 }
 
@@ -91,56 +90,36 @@ pub struct PJRT_Layouts_SerializedLayout {
     serialized: CString,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExecutableKind {
-    TtExecutableV1,
-}
-
 #[derive(Clone)]
 struct OptimizedProgram {
     format: CString,
     code: Vec<u8>,
 }
 
-struct CompiledProgram {
-    kind: ExecutableKind,
+#[derive(Clone)]
+struct ExecutableMetadata {
+    name: CString,
+    fingerprint: CString,
+    num_outputs: usize,
+    output_types: Vec<PJRT_Buffer_Type>,
     output_dims: Vec<i64>,
-    output_type: PJRT_Buffer_Type,
+    output_dim_sizes: Vec<usize>,
+    output_memory_kinds: Vec<CString>,
+    output_memory_kind_ptrs: Vec<*const c_char>,
+    output_memory_kind_sizes: Vec<usize>,
     optimized_program: Option<OptimizedProgram>,
     tt_executable: Option<tt_executable::Executable>,
 }
 
 #[repr(C)]
 pub struct PJRT_Executable {
-    kind: ExecutableKind,
-    name: CString,
-    fingerprint: CString,
-    num_outputs: usize,
-    output_types: Vec<PJRT_Buffer_Type>,
-    output_dims: Vec<i64>,
-    output_dim_sizes: Vec<usize>,
-    output_memory_kinds: Vec<CString>,
-    output_memory_kind_ptrs: Vec<*const c_char>,
-    output_memory_kind_sizes: Vec<usize>,
-    optimized_program: Option<OptimizedProgram>,
-    tt_executable: Option<tt_executable::Executable>,
+    metadata: ExecutableMetadata,
 }
 
 #[repr(C)]
 pub struct PJRT_LoadedExecutable {
-    kind: ExecutableKind,
-    name: CString,
-    fingerprint: CString,
-    num_outputs: usize,
-    output_types: Vec<PJRT_Buffer_Type>,
-    output_dims: Vec<i64>,
-    output_dim_sizes: Vec<usize>,
-    output_memory_kinds: Vec<CString>,
-    output_memory_kind_ptrs: Vec<*const c_char>,
-    output_memory_kind_sizes: Vec<usize>,
+    metadata: ExecutableMetadata,
     addressable_devices: Vec<*mut PJRT_Device>,
-    optimized_program: Option<OptimizedProgram>,
-    tt_executable: Option<tt_executable::Executable>,
     deleted: bool,
 }
 
@@ -158,6 +137,8 @@ pub struct PJRT_Client {
 }
 
 unsafe impl Sync for PJRT_Api {}
+
+const EXECUTABLE_NAME: &str = "tt.executable.v1";
 
 impl PJRT_Client {
     fn new() -> Self {
@@ -423,6 +404,17 @@ fn event_for_buffer(buffer: &PJRT_Buffer) -> *mut PJRT_Event {
     }
 }
 
+fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
+    let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+        return Err(pjrt_error(
+            "buffer has been deleted",
+            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+        ));
+    };
+    let mut device = Device::open(buffer.local_hardware_id).map_err(io_error)?;
+    device.dram_read(dram_buffer).map_err(io_error)
+}
+
 fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *mut PJRT_Error> {
     if len == 0 {
         return Ok(String::new());
@@ -438,7 +430,7 @@ fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *
         .map_err(|_| invalid_argument(format!("{field} must be valid UTF-8")))
 }
 
-fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind, *mut PJRT_Error> {
+fn validate_program_format(program: &PJRT_Program) -> Result<(), *mut PJRT_Error> {
     let format = c_api_string(program.format, program.format_size, "program.format")?;
     log(format!(
         "pjrt compile program format={format:?} code_size={}",
@@ -446,7 +438,7 @@ fn executable_kind_from_program(program: &PJRT_Program) -> Result<ExecutableKind
     ));
 
     match format.as_str() {
-        "mlir" | "stablehlo" => Ok(ExecutableKind::TtExecutableV1),
+        "mlir" | "stablehlo" => Ok(()),
         other => Err(unimplemented(format!(
             "unsupported program format {other:?}; supported formats are \"mlir\" and \"stablehlo\""
         ))),
@@ -476,9 +468,9 @@ fn map_mlir_element_type(element_type: i32) -> Result<PJRT_Buffer_Type, *mut PJR
     }
 }
 
-fn compiled_program_from_program(
+fn executable_metadata_from_program(
     program: &PJRT_Program,
-) -> Result<CompiledProgram, *mut PJRT_Error> {
+) -> Result<ExecutableMetadata, *mut PJRT_Error> {
     #[cfg(libtt_mlir_frontend)]
     {
         let format = c_api_string(program.format, program.format_size, "program.format")?;
@@ -532,33 +524,32 @@ fn compiled_program_from_program(
                     .map(tt_executable::parse)
                     .transpose()
                     .map_err(unimplemented)?;
-                return Ok(CompiledProgram {
-                    kind: ExecutableKind::TtExecutableV1,
+                return Ok(make_executable_metadata(
+                    EXECUTABLE_NAME,
                     output_dims,
-                    output_type: map_mlir_element_type(analysis.output_type)?,
-                    optimized_program: optimized_program_bytes
+                    map_mlir_element_type(analysis.output_type)?,
+                    optimized_program_bytes
                         .as_deref()
                         .map(|bytes| optimized_program("tt-executable-v1", bytes)),
                     tt_executable,
-                });
+                ));
             }
         }
     }
 
-    let _ = executable_kind_from_program(program)?;
+    validate_program_format(program)?;
     Err(unimplemented(
         "MLIR compilation requires the libtt MLIR frontend build",
     ))
 }
 
-fn make_executable(
-    kind: ExecutableKind,
+fn make_executable_metadata(
     name: &str,
     dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
     optimized_program: Option<OptimizedProgram>,
     tt_executable: Option<tt_executable::Executable>,
-) -> PJRT_Executable {
+) -> ExecutableMetadata {
     let output_memory_kinds = vec![cstring_lossy("dram")];
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
@@ -569,9 +560,8 @@ fn make_executable(
         .map(|kind| kind.as_bytes().len())
         .collect::<Vec<_>>();
     let output_dim_sizes = vec![dims.len()];
-    let fingerprint = executable_fingerprint_string(kind, name, &dims, output_type);
-    PJRT_Executable {
-        kind,
+    let fingerprint = executable_fingerprint_string(name, &dims, output_type);
+    ExecutableMetadata {
         name: cstring_lossy(name),
         fingerprint,
         num_outputs: 1,
@@ -586,79 +576,41 @@ fn make_executable(
     }
 }
 
+fn make_executable(
+    metadata: ExecutableMetadata,
+) -> PJRT_Executable {
+    PJRT_Executable { metadata }
+}
+
 fn make_loaded_executable(
-    kind: ExecutableKind,
-    name: &str,
-    dims: Vec<i64>,
-    output_type: PJRT_Buffer_Type,
-    optimized_program: Option<OptimizedProgram>,
-    tt_executable: Option<tt_executable::Executable>,
+    metadata: ExecutableMetadata,
     addressable_devices: Vec<*mut PJRT_Device>,
 ) -> PJRT_LoadedExecutable {
-    let executable = make_executable(
-        kind,
-        name,
-        dims,
-        output_type,
-        optimized_program,
-        tt_executable,
-    );
     PJRT_LoadedExecutable {
-        kind: executable.kind,
-        name: executable.name,
-        fingerprint: executable.fingerprint,
-        num_outputs: executable.num_outputs,
-        output_types: executable.output_types,
-        output_dims: executable.output_dims,
-        output_dim_sizes: executable.output_dim_sizes,
-        output_memory_kinds: executable.output_memory_kinds,
-        output_memory_kind_ptrs: executable.output_memory_kind_ptrs,
-        output_memory_kind_sizes: executable.output_memory_kind_sizes,
+        metadata,
         addressable_devices,
-        optimized_program: executable.optimized_program,
-        tt_executable: executable.tt_executable,
         deleted: false,
     }
 }
 
 fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
-    let output_memory_kinds = executable.output_memory_kinds.clone();
-    let output_memory_kind_ptrs = output_memory_kinds
-        .iter()
-        .map(|kind| kind.as_ptr())
-        .collect::<Vec<_>>();
     PJRT_Executable {
-        kind: executable.kind,
-        name: executable.name.clone(),
-        fingerprint: executable.fingerprint.clone(),
-        num_outputs: executable.num_outputs,
-        output_types: executable.output_types.clone(),
-        output_dims: executable.output_dims.clone(),
-        output_dim_sizes: executable.output_dim_sizes.clone(),
-        output_memory_kinds,
-        output_memory_kind_ptrs,
-        output_memory_kind_sizes: executable.output_memory_kind_sizes.clone(),
-        optimized_program: executable.optimized_program.clone(),
-        tt_executable: executable.tt_executable.clone(),
+        metadata: executable.metadata.clone(),
     }
 }
 
 fn executable_fingerprint_string(
-    kind: ExecutableKind,
     name: &str,
     dims: &[i64],
     output_type: PJRT_Buffer_Type,
 ) -> CString {
-    let kind_name = match kind {
-        ExecutableKind::TtExecutableV1 => "tt_executable_v1",
-    };
     let dims = dims
         .iter()
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join("x");
     cstring_lossy(&format!(
-        "tt:{kind_name}:name={name}:dims={dims}:type={}:v1",
+        "tt:tt_executable_v1:name={name}:dims={dims}:type={}:v1",
         output_type as u32
     ))
 }
@@ -992,19 +944,12 @@ pub unsafe extern "C" fn TT_Client_Compile(args: *mut PJRT_Client_Compile_Args) 
     let Ok(program) = (unsafe { checked_ref(args.program, "program") }) else {
         return invalid_argument("program must not be null");
     };
-    let compiled = match compiled_program_from_program(program) {
+    let metadata = match executable_metadata_from_program(program) {
         Ok(compiled) => compiled,
         Err(err) => return err,
     };
-
-    let name = "tt.executable.v1";
     args.executable = Box::into_raw(Box::new(make_loaded_executable(
-        compiled.kind,
-        name,
-        compiled.output_dims,
-        compiled.output_type,
-        compiled.optimized_program,
-        compiled.tt_executable,
+        metadata,
         client.addressable_device_ptrs.clone(),
     )));
     ptr::null_mut()
@@ -1018,20 +963,11 @@ pub unsafe extern "C" fn TT_Compile(args: *mut PJRT_Compile_Args) -> *mut PJRT_E
     let Ok(program) = (unsafe { checked_ref(args.program, "program") }) else {
         return invalid_argument("program must not be null");
     };
-    let compiled = match compiled_program_from_program(program) {
+    let metadata = match executable_metadata_from_program(program) {
         Ok(compiled) => compiled,
         Err(err) => return err,
     };
-
-    let name = "tt.executable.v1";
-    args.executable = Box::into_raw(Box::new(make_executable(
-        compiled.kind,
-        name,
-        compiled.output_dims,
-        compiled.output_type,
-        compiled.optimized_program,
-        compiled.tt_executable,
-    )));
+    args.executable = Box::into_raw(Box::new(make_executable(metadata)));
     ptr::null_mut()
 }
 
@@ -1104,8 +1040,8 @@ pub unsafe extern "C" fn TT_Executable_Name(
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };
-    args.executable_name = executable.name.as_ptr();
-    args.executable_name_size = executable.name.as_bytes().len();
+    args.executable_name = executable.metadata.name.as_ptr();
+    args.executable_name_size = executable.metadata.name.as_bytes().len();
     ptr::null_mut()
 }
 
@@ -1150,7 +1086,7 @@ pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
     let Ok(program) = (unsafe { checked_mut(args.program, "program") }) else {
         return invalid_argument("program must not be null");
     };
-    let Some(optimized_program) = executable.optimized_program.as_ref() else {
+    let Some(optimized_program) = executable.metadata.optimized_program.as_ref() else {
         return pjrt_error(
             "optimized program is not available for this executable",
             PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED,
@@ -1175,8 +1111,8 @@ pub unsafe extern "C" fn TT_Executable_Fingerprint(
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };
-    args.executable_fingerprint = executable.fingerprint.as_ptr();
-    args.executable_fingerprint_size = executable.fingerprint.as_bytes().len();
+    args.executable_fingerprint = executable.metadata.fingerprint.as_ptr();
+    args.executable_fingerprint_size = executable.metadata.fingerprint.as_bytes().len();
     ptr::null_mut()
 }
 
@@ -1213,7 +1149,7 @@ pub unsafe extern "C" fn TT_Executable_NumOutputs(
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };
-    args.num_outputs = executable.num_outputs;
+    args.num_outputs = executable.metadata.num_outputs;
     ptr::null_mut()
 }
 
@@ -1227,8 +1163,8 @@ pub unsafe extern "C" fn TT_Executable_OutputElementTypes(
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };
-    args.output_types = executable.output_types.as_ptr().cast_mut();
-    args.num_output_types = executable.output_types.len();
+    args.output_types = executable.metadata.output_types.as_ptr().cast_mut();
+    args.num_output_types = executable.metadata.output_types.len();
     ptr::null_mut()
 }
 
@@ -1242,9 +1178,9 @@ pub unsafe extern "C" fn TT_Executable_OutputDimensions(
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };
-    args.dims = executable.output_dims.as_ptr();
-    args.dim_sizes = executable.output_dim_sizes.as_ptr();
-    args.num_outputs = executable.output_dim_sizes.len();
+    args.dims = executable.metadata.output_dims.as_ptr();
+    args.dim_sizes = executable.metadata.output_dim_sizes.as_ptr();
+    args.num_outputs = executable.metadata.output_dim_sizes.len();
     ptr::null_mut()
 }
 
@@ -1258,9 +1194,9 @@ pub unsafe extern "C" fn TT_Executable_OutputMemoryKinds(
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };
-    args.memory_kinds = executable.output_memory_kind_ptrs.as_ptr();
-    args.memory_kind_sizes = executable.output_memory_kind_sizes.as_ptr();
-    args.num_outputs = executable.output_memory_kind_ptrs.len();
+    args.memory_kinds = executable.metadata.output_memory_kind_ptrs.as_ptr();
+    args.memory_kind_sizes = executable.metadata.output_memory_kind_sizes.as_ptr();
+    args.num_outputs = executable.metadata.output_memory_kind_ptrs.len();
     ptr::null_mut()
 }
 
@@ -1368,8 +1304,8 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Fingerprint(
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };
-    args.executable_fingerprint = executable.fingerprint.as_ptr();
-    args.executable_fingerprint_size = executable.fingerprint.as_bytes().len();
+    args.executable_fingerprint = executable.metadata.fingerprint.as_ptr();
+    args.executable_fingerprint_size = executable.metadata.fingerprint.as_bytes().len();
     ptr::null_mut()
 }
 
@@ -1393,6 +1329,7 @@ fn execute_tt_executable_v1(
     inputs: &[*mut PJRT_Buffer],
 ) -> Result<PJRT_Buffer, *mut PJRT_Error> {
     let plan = executable
+        .metadata
         .tt_executable
         .as_ref()
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
@@ -1501,7 +1438,6 @@ fn execute_tt_executable_v1(
                     memory: target_device.default_memory,
                     local_hardware_id: target_device.local_hardware_id as usize,
                     dram_buffer: Some(output_dram),
-                    host_data: Vec::new(),
                     deleted: false,
                 });
             }
@@ -1689,7 +1625,6 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         memory: target_memory,
         local_hardware_id,
         dram_buffer: Some(dram_buffer),
-        host_data: data.to_vec(),
         deleted: false,
     }));
     ptr::null_mut()
@@ -2093,8 +2028,10 @@ pub unsafe extern "C" fn TT_Buffer_OnDeviceSizeInBytes(
         return invalid_argument("buffer must not be null");
     };
     let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-        args.on_device_size_in_bytes = buffer.host_data.len();
-        return ptr::null_mut();
+        return pjrt_error(
+            "buffer has been deleted",
+            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+        );
     };
     args.on_device_size_in_bytes = dram_buffer.size();
     ptr::null_mut()
@@ -2134,7 +2071,6 @@ pub unsafe extern "C" fn TT_Buffer_Delete(args: *mut PJRT_Buffer_Delete_Args) ->
     };
     buffer.deleted = true;
     buffer.dram_buffer = None;
-    buffer.host_data.clear();
     ptr::null_mut()
 }
 
@@ -2181,23 +2117,9 @@ pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
         return invalid_argument("dst must not be null for non-empty buffers");
     }
 
-    let data = if !buffer.host_data.is_empty() {
-        buffer.host_data.clone()
-    } else {
-        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-            return pjrt_error(
-                "buffer has been deleted",
-                PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
-            );
-        };
-        let mut device = match Device::open(buffer.local_hardware_id) {
-            Ok(device) => device,
-            Err(err) => return io_error(err),
-        };
-        match device.dram_read(dram_buffer) {
-            Ok(data) => data,
-            Err(err) => return io_error(err),
-        }
+    let data = match read_buffer_bytes(buffer) {
+        Ok(data) => data,
+        Err(err) => return err,
     };
     if data.len() != byte_size {
         return pjrt_error(
@@ -2291,23 +2213,9 @@ pub unsafe extern "C" fn TT_Buffer_CopyRawToHost(
         return invalid_argument("dst must not be null for non-empty transfers");
     }
 
-    let data = if !buffer.host_data.is_empty() {
-        buffer.host_data.clone()
-    } else {
-        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-            return pjrt_error(
-                "buffer has been deleted",
-                PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
-            );
-        };
-        let mut device = match Device::open(buffer.local_hardware_id) {
-            Ok(device) => device,
-            Err(err) => return io_error(err),
-        };
-        match device.dram_read(dram_buffer) {
-            Ok(data) => data,
-            Err(err) => return io_error(err),
-        }
+    let data = match read_buffer_bytes(buffer) {
+        Ok(data) => data,
+        Err(err) => return err,
     };
     let end = match offset.checked_add(transfer_size) {
         Some(end) if end <= data.len() => end,
