@@ -72,5 +72,4 @@ message AnalysisResult {
 
   // Lowered executable payload. Present when status == STATUS_OK.
   Executable executable = 5;
-  string executable_format = 6;
 }

@@ -48,8 +48,6 @@ pub(crate) struct Analysis {
     pub(crate) status: Status,
     pub(crate) error_message: String,
     pub(crate) outputs: Vec<ValueDesc>,
-    pub(crate) executable_format: String,
-    pub(crate) executable_bytes: Vec<u8>,
     pub(crate) executable: Option<Executable>,
 }
 
@@ -126,13 +124,6 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
 }
 
 #[cfg(libtt_mlir_frontend)]
-pub(crate) fn parse(bytes: &[u8]) -> Result<Executable, String> {
-    let executable = ProtoExecutable::decode(bytes)
-        .map_err(|err| format!("failed to parse TT executable: {err}"))?;
-    parse_proto(executable)
-}
-
-#[cfg(libtt_mlir_frontend)]
 pub(crate) fn parse_analysis(bytes: &[u8]) -> Result<Analysis, String> {
     let analysis = AnalysisResult::decode(bytes)
         .map_err(|err| format!("failed to parse TT MLIR analysis result: {err}"))?;
@@ -144,29 +135,16 @@ pub(crate) fn parse_analysis(bytes: &[u8]) -> Result<Analysis, String> {
         .map(parse_tensor_desc)
         .collect::<Result<Vec<_>, String>>()?;
 
-    let executable_format = if analysis.executable_format.is_empty() {
-        "tt-executable-v1".to_owned()
+    let executable = if let Some(executable_proto) = analysis.executable {
+        Some(parse_proto(executable_proto)?)
     } else {
-        analysis.executable_format
-    };
-
-    let (executable_bytes, executable) = if let Some(executable_proto) = analysis.executable {
-        let mut bytes = Vec::new();
-        executable_proto
-            .encode(&mut bytes)
-            .map_err(|err| format!("failed to serialize TT executable: {err}"))?;
-        let executable = parse_proto(executable_proto)?;
-        (bytes, Some(executable))
-    } else {
-        (Vec::new(), None)
+        None
     };
 
     Ok(Analysis {
         status,
         error_message: analysis.error_message,
         outputs,
-        executable_format,
-        executable_bytes,
         executable,
     })
 }

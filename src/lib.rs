@@ -98,12 +98,6 @@ pub struct PJRT_Layouts_SerializedLayout {
 }
 
 #[derive(Clone)]
-struct OptimizedProgram {
-    format: CString,
-    code: Vec<u8>,
-}
-
-#[derive(Clone)]
 struct ExecutableMetadata {
     name: CString,
     fingerprint: CString,
@@ -114,7 +108,6 @@ struct ExecutableMetadata {
     _output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
-    optimized_program: Option<OptimizedProgram>,
     tt_executable: Option<tt_executable::Executable>,
 }
 
@@ -458,14 +451,6 @@ fn validate_program_format(program: &PJRT_Program) -> Result<(), *mut PJRT_Error
     }
 }
 
-#[cfg(libtt_mlir_frontend)]
-fn optimized_program(format: &str, code: &[u8]) -> OptimizedProgram {
-    OptimizedProgram {
-        format: cstring_lossy(format),
-        code: code.to_vec(),
-    }
-}
-
 fn executable_metadata_from_program(
     program: &PJRT_Program,
 ) -> Result<ExecutableMetadata, *mut PJRT_Error> {
@@ -506,14 +491,10 @@ fn executable_metadata_from_program(
                     .outputs
                     .first()
                     .expect("analysis output length was checked");
-                let optimized_program = (!analysis.executable_bytes.is_empty()).then(|| {
-                    optimized_program(&analysis.executable_format, &analysis.executable_bytes)
-                });
                 return Ok(make_executable_metadata(
                     EXECUTABLE_NAME,
                     output.dims.clone(),
                     output.element_type,
-                    optimized_program,
                     analysis.executable,
                 ));
             }
@@ -531,7 +512,6 @@ fn make_executable_metadata(
     name: &str,
     dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
-    optimized_program: Option<OptimizedProgram>,
     tt_executable: Option<tt_executable::Executable>,
 ) -> ExecutableMetadata {
     let output_memory_kinds = vec![cstring_lossy("dram")];
@@ -555,7 +535,6 @@ fn make_executable_metadata(
         _output_memory_kinds: output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
-        optimized_program,
         tt_executable,
     }
 }
@@ -1066,22 +1045,19 @@ pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };
-    let Ok(program) = (unsafe { checked_mut(args.program, "program") }) else {
+    if unsafe { checked_mut(args.program, "program") }.is_err() {
         return invalid_argument("program must not be null");
-    };
-    let Some(optimized_program) = executable.metadata.optimized_program.as_ref() else {
+    }
+    if executable.metadata.tt_executable.is_some() {
         return pjrt_error(
-            "optimized program is not available for this executable",
+            "optimized program serialization is not exposed",
             PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED,
         );
-    };
-    program.struct_size = size_of::<PJRT_Program>();
-    program.extension_start = ptr::null_mut();
-    program.code = optimized_program.code.as_ptr().cast::<c_char>().cast_mut();
-    program.code_size = optimized_program.code.len();
-    program.format = optimized_program.format.as_ptr().cast_mut();
-    program.format_size = optimized_program.format.as_bytes().len();
-    ptr::null_mut()
+    }
+    pjrt_error(
+        "optimized program is not available for this executable",
+        PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -2780,31 +2756,11 @@ mod tests {
         };
         check_ok(api, unsafe { get_executable(&mut get_executable_args) });
 
-        let optimized_program = api
-            .PJRT_Executable_OptimizedProgram
-            .expect("PJRT_Executable_OptimizedProgram must be exported");
-        let mut optimized = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: ptr::null_mut(),
-            code_size: 0,
-            format: ptr::null_mut(),
-            format_size: 0,
-        };
-        let mut optimized_args = PJRT_Executable_OptimizedProgram_Args {
-            struct_size: size_of::<PJRT_Executable_OptimizedProgram_Args>(),
-            extension_start: ptr::null_mut(),
-            executable: get_executable_args.executable,
-            program: &mut optimized,
-        };
-        check_ok(api, unsafe { optimized_program(&mut optimized_args) });
-        let optimized_format = unsafe {
-            std::slice::from_raw_parts(optimized.format.cast::<u8>(), optimized.format_size)
-        };
-        assert_eq!(optimized_format, b"tt-executable-v1");
-        let optimized_bytes =
-            unsafe { std::slice::from_raw_parts(optimized.code.cast::<u8>(), optimized.code_size) };
-        let executable = tt_executable::parse(optimized_bytes).expect("parse TT executable");
+        let executable = unsafe { &*get_executable_args.executable }
+            .metadata
+            .tt_executable
+            .as_ref()
+            .expect("compiled executable should contain a TT executable");
         assert_eq!(executable.values.len(), 3);
         assert_eq!(executable.ops.len(), 3);
         assert_eq!(executable.output_ids, vec![2]);
@@ -2865,28 +2821,11 @@ mod tests {
         };
         check_ok(api, unsafe { get_executable(&mut get_executable_args) });
 
-        let optimized_program = api
-            .PJRT_Executable_OptimizedProgram
-            .expect("PJRT_Executable_OptimizedProgram must be exported");
-        let mut optimized = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: ptr::null_mut(),
-            code_size: 0,
-            format: ptr::null_mut(),
-            format_size: 0,
-        };
-        let mut optimized_args = PJRT_Executable_OptimizedProgram_Args {
-            struct_size: size_of::<PJRT_Executable_OptimizedProgram_Args>(),
-            extension_start: ptr::null_mut(),
-            executable: get_executable_args.executable,
-            program: &mut optimized,
-        };
-        check_ok(api, unsafe { optimized_program(&mut optimized_args) });
-
-        let optimized_bytes =
-            unsafe { std::slice::from_raw_parts(optimized.code.cast::<u8>(), optimized.code_size) };
-        let executable = tt_executable::parse(optimized_bytes).expect("parse TT executable");
+        let executable = unsafe { &*get_executable_args.executable }
+            .metadata
+            .tt_executable
+            .as_ref()
+            .expect("compiled executable should contain a TT executable");
         assert_eq!(executable.values.len(), 5);
         assert_eq!(executable.ops.len(), 5);
         assert_eq!(executable.output_ids, vec![4]);

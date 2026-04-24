@@ -317,7 +317,6 @@ extern "C" bool TT_MlirAnalyzeProgram(
 
     tt::AnalysisResult result;
     result.set_status(tt::AnalysisResult::STATUS_OK);
-    result.set_executable_format("tt-executable-v1");
 
     std::string error;
     if (!fillProgramSignature(*entry, result, error)) {
