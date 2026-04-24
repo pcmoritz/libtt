@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -26,41 +27,15 @@
 
 extern "C" {
 
-enum TT_MlirAnalysisStatus : int32_t {
-    TT_MLIR_ANALYSIS_STATUS_OK = 0,
-    TT_MLIR_ANALYSIS_STATUS_PARSE_ERROR = 1,
-    TT_MLIR_ANALYSIS_STATUS_UNSUPPORTED = 2,
-    TT_MLIR_ANALYSIS_STATUS_INTERNAL_ERROR = 3,
-};
+using TT_MlirAllocOutput = char* (*)(size_t size, void* user_data);
 
-enum TT_MlirElementType : int32_t {
-    TT_MLIR_ELEMENT_TYPE_UNKNOWN = 0,
-    TT_MLIR_ELEMENT_TYPE_BF16 = 1,
-    TT_MLIR_ELEMENT_TYPE_F16 = 2,
-    TT_MLIR_ELEMENT_TYPE_F32 = 3,
-    TT_MLIR_ELEMENT_TYPE_U32 = 4,
-    TT_MLIR_ELEMENT_TYPE_U16 = 5,
-    TT_MLIR_ELEMENT_TYPE_U8 = 6,
-    TT_MLIR_ELEMENT_TYPE_S32 = 7,
-    TT_MLIR_ELEMENT_TYPE_S8 = 8,
-};
-
-struct TT_MlirAnalysis {
-    int32_t status;
-    int32_t output_type;
-    size_t num_output_dims;
-    int64_t* output_dims;
-    char* optimized_program;
-    size_t optimized_program_size;
-    char* error_message;
-};
-
-TT_MlirAnalysis* TT_MlirAnalyzeProgram(
+bool TT_MlirAnalyzeProgram(
     const char* format,
     size_t format_size,
     const char* code,
-    size_t code_size);
-void TT_MlirAnalysisDestroy(TT_MlirAnalysis* analysis);
+    size_t code_size,
+    TT_MlirAllocOutput alloc_output,
+    void* user_data);
 }
 
 namespace {
@@ -140,30 +115,6 @@ tt::TensorDesc::ElementType mapProtoElementType(mlir::Type element_type) {
     return tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
 }
 
-int32_t mapElementType(mlir::Type element_type) {
-    switch (mapProtoElementType(element_type)) {
-        case tt::TensorDesc::ELEMENT_TYPE_BF16:
-            return TT_MLIR_ELEMENT_TYPE_BF16;
-        case tt::TensorDesc::ELEMENT_TYPE_F16:
-            return TT_MLIR_ELEMENT_TYPE_F16;
-        case tt::TensorDesc::ELEMENT_TYPE_F32:
-            return TT_MLIR_ELEMENT_TYPE_F32;
-        case tt::TensorDesc::ELEMENT_TYPE_U32:
-            return TT_MLIR_ELEMENT_TYPE_U32;
-        case tt::TensorDesc::ELEMENT_TYPE_U16:
-            return TT_MLIR_ELEMENT_TYPE_U16;
-        case tt::TensorDesc::ELEMENT_TYPE_U8:
-            return TT_MLIR_ELEMENT_TYPE_U8;
-        case tt::TensorDesc::ELEMENT_TYPE_S32:
-            return TT_MLIR_ELEMENT_TYPE_S32;
-        case tt::TensorDesc::ELEMENT_TYPE_S8:
-            return TT_MLIR_ELEMENT_TYPE_S8;
-        case tt::TensorDesc::ELEMENT_TYPE_UNKNOWN:
-            return TT_MLIR_ELEMENT_TYPE_UNKNOWN;
-    }
-    return TT_MLIR_ELEMENT_TYPE_UNKNOWN;
-}
-
 bool fillTensorDesc(mlir::Type type, tt::TensorDesc& tensor_desc, std::string& error) {
     auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
     if (!tensor) {
@@ -191,7 +142,7 @@ bool fillTensorDesc(mlir::Type type, tt::TensorDesc& tensor_desc, std::string& e
 
 bool addValueDesc(
     mlir::Value value,
-    tt::TTExecutableV1& executable,
+    tt::Executable& executable,
     llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
     std::string& error,
     uint32_t& id_out) {
@@ -212,69 +163,30 @@ bool addValueDesc(
     return true;
 }
 
-bool fillOutputSignature(FuncOp func, TT_MlirAnalysis& analysis, std::string& error) {
+bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& error) {
     auto type = func.getFunctionType();
-    if (type.getNumResults() != 1) {
-        error = "only single-result functions are currently supported";
-        return false;
+
+    result.clear_inputs();
+    for (auto input_type : type.getInputs()) {
+        auto* input = result.add_inputs();
+        if (!fillTensorDesc(input_type, *input, error)) {
+            error = "unsupported entry input: " + error;
+            return false;
+        }
     }
 
-    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type.getResult(0));
-    if (!tensor) {
-        error = "entry function result must be a ranked tensor";
-        return false;
-    }
-
-    if (!tensor.hasStaticShape()) {
-        error = "dynamic result shapes are not currently supported";
-        return false;
-    }
-
-    analysis.output_type = mapElementType(tensor.getElementType());
-    if (analysis.output_type == TT_MLIR_ELEMENT_TYPE_UNKNOWN) {
-        error = "unsupported result element type";
-        return false;
-    }
-
-    analysis.num_output_dims = tensor.getRank();
-    if (analysis.num_output_dims == 0) {
-        analysis.output_dims = nullptr;
-        return true;
-    }
-
-    analysis.output_dims = static_cast<int64_t*>(
-        std::malloc(sizeof(int64_t) * analysis.num_output_dims));
-    if (!analysis.output_dims) {
-        error = "failed to allocate output shape";
-        return false;
-    }
-
-    for (size_t i = 0; i < analysis.num_output_dims; ++i) {
-        analysis.output_dims[i] = tensor.getShape()[i];
+    result.clear_outputs();
+    for (auto output_type : type.getResults()) {
+        auto* output = result.add_outputs();
+        if (!fillTensorDesc(output_type, *output, error)) {
+            error = "unsupported entry output: " + error;
+            return false;
+        }
     }
     return true;
 }
 
-void setCString(char*& out, const std::string& value) {
-    out = static_cast<char*>(std::malloc(value.size() + 1));
-    if (!out) {
-        return;
-    }
-    std::memcpy(out, value.data(), value.size());
-    out[value.size()] = '\0';
-}
-
-void setProgramBytes(TT_MlirAnalysis& analysis, const std::string& bytes) {
-    analysis.optimized_program = static_cast<char*>(std::malloc(bytes.size()));
-    if (!analysis.optimized_program) {
-        analysis.optimized_program_size = 0;
-        return;
-    }
-    analysis.optimized_program_size = bytes.size();
-    std::memcpy(analysis.optimized_program, bytes.data(), bytes.size());
-}
-
-bool lowerToExecutable(FuncOp func, TT_MlirAnalysis& analysis, std::string& error) {
+bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
         return false;
@@ -284,7 +196,6 @@ bool lowerToExecutable(FuncOp func, TT_MlirAnalysis& analysis, std::string& erro
         return false;
     }
 
-    tt::TTExecutableV1 executable;
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
@@ -337,40 +248,48 @@ bool lowerToExecutable(FuncOp func, TT_MlirAnalysis& analysis, std::string& erro
         return false;
     }
 
-    std::string bytes;
-    if (!executable.SerializeToString(&bytes)) {
-        error = "failed to serialize TT executable";
+    return true;
+}
+
+tt::AnalysisResult makeResult(tt::AnalysisResult::Status status, const std::string& error = "") {
+    tt::AnalysisResult result;
+    result.set_status(status);
+    result.set_error_message(error);
+    return result;
+}
+
+bool emitResult(
+    const tt::AnalysisResult& result,
+    TT_MlirAllocOutput alloc_output,
+    void* user_data) {
+    if (!alloc_output) {
         return false;
     }
 
-    setProgramBytes(analysis, bytes);
-    return analysis.optimized_program != nullptr || bytes.empty();
-}
-
-TT_MlirAnalysis* makeAnalysis() {
-    auto* analysis = new TT_MlirAnalysis();
-    analysis->status = TT_MLIR_ANALYSIS_STATUS_INTERNAL_ERROR;
-    analysis->output_type = TT_MLIR_ELEMENT_TYPE_UNKNOWN;
-    analysis->num_output_dims = 0;
-    analysis->output_dims = nullptr;
-    analysis->optimized_program = nullptr;
-    analysis->optimized_program_size = 0;
-    analysis->error_message = nullptr;
-    return analysis;
+    size_t size = result.ByteSizeLong();
+    if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+    char* data = alloc_output(size, user_data);
+    if (!data && size != 0) {
+        return false;
+    }
+    return result.SerializeToArray(data, static_cast<int>(size));
 }
 
 }  // namespace
 
-extern "C" TT_MlirAnalysis* TT_MlirAnalyzeProgram(
+extern "C" bool TT_MlirAnalyzeProgram(
     const char* format,
     size_t format_size,
     const char* code,
-    size_t code_size) {
-    auto* analysis = makeAnalysis();
+    size_t code_size,
+    TT_MlirAllocOutput alloc_output,
+    void* user_data) {
     if (!format || !code) {
-        setCString(analysis->error_message, "program format and code must not be null");
-        analysis->status = TT_MLIR_ANALYSIS_STATUS_PARSE_ERROR;
-        return analysis;
+        return emitResult(makeResult(
+            tt::AnalysisResult::STATUS_PARSE_ERROR,
+            "program format and code must not be null"), alloc_output, user_data);
     }
 
     mlir::MLIRContext context;
@@ -378,47 +297,42 @@ extern "C" TT_MlirAnalysis* TT_MlirAnalyzeProgram(
 
     auto module = parseModule(context, llvm::StringRef(format, format_size), code, code_size);
     if (!module) {
-        setCString(analysis->error_message, "failed to parse StableHLO/MLIR program");
-        analysis->status = TT_MLIR_ANALYSIS_STATUS_PARSE_ERROR;
-        return analysis;
+        return emitResult(makeResult(
+            tt::AnalysisResult::STATUS_PARSE_ERROR,
+            "failed to parse StableHLO/MLIR program"), alloc_output, user_data);
     }
 
     if (!runCleanupPasses(context, *module)) {
-        setCString(analysis->error_message, "failed to run MLIR cleanup passes");
-        analysis->status = TT_MLIR_ANALYSIS_STATUS_INTERNAL_ERROR;
-        return analysis;
+        return emitResult(makeResult(
+            tt::AnalysisResult::STATUS_INTERNAL_ERROR,
+            "failed to run MLIR cleanup passes"), alloc_output, user_data);
     }
 
     auto entry = findEntryFunction(*module);
     if (!entry.has_value()) {
-        setCString(analysis->error_message, "module does not contain a function");
-        analysis->status = TT_MLIR_ANALYSIS_STATUS_PARSE_ERROR;
-        return analysis;
+        return emitResult(makeResult(
+            tt::AnalysisResult::STATUS_PARSE_ERROR,
+            "module does not contain a function"), alloc_output, user_data);
     }
+
+    tt::AnalysisResult result;
+    result.set_status(tt::AnalysisResult::STATUS_OK);
+    result.set_executable_format("tt-executable-v1");
 
     std::string error;
-    if (!fillOutputSignature(*entry, *analysis, error)) {
-        setCString(analysis->error_message, error);
-        analysis->status = TT_MLIR_ANALYSIS_STATUS_UNSUPPORTED;
-        return analysis;
+    if (!fillProgramSignature(*entry, result, error)) {
+        return emitResult(
+            makeResult(tt::AnalysisResult::STATUS_UNSUPPORTED, error),
+            alloc_output,
+            user_data);
     }
 
-    if (!lowerToExecutable(*entry, *analysis, error)) {
-        setCString(analysis->error_message, error);
-        analysis->status = TT_MLIR_ANALYSIS_STATUS_UNSUPPORTED;
-        return analysis;
+    if (!lowerToExecutable(*entry, *result.mutable_executable(), error)) {
+        return emitResult(
+            makeResult(tt::AnalysisResult::STATUS_UNSUPPORTED, error),
+            alloc_output,
+            user_data);
     }
 
-    analysis->status = TT_MLIR_ANALYSIS_STATUS_OK;
-    return analysis;
-}
-
-extern "C" void TT_MlirAnalysisDestroy(TT_MlirAnalysis* analysis) {
-    if (!analysis) {
-        return;
-    }
-    std::free(analysis->output_dims);
-    std::free(analysis->optimized_program);
-    std::free(analysis->error_message);
-    delete analysis;
+    return emitResult(result, alloc_output, user_data);
 }

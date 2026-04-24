@@ -3,7 +3,13 @@ use crate::PJRT_Buffer_Type;
 #[cfg(libtt_mlir_frontend)]
 use prost::Message;
 #[cfg(libtt_mlir_frontend)]
-use tt_executable_proto::tt::TtExecutableV1;
+use tt_executable_proto::tt::AnalysisResult;
+#[cfg(libtt_mlir_frontend)]
+use tt_executable_proto::tt::Executable as ProtoExecutable;
+#[cfg(libtt_mlir_frontend)]
+use tt_executable_proto::tt::TensorDesc as ProtoTensorDesc;
+#[cfg(libtt_mlir_frontend)]
+use tt_executable_proto::tt::analysis_result::Status;
 #[cfg(libtt_mlir_frontend)]
 use tt_executable_proto::tt::op::Kind;
 #[cfg(libtt_mlir_frontend)]
@@ -38,10 +44,42 @@ pub(crate) enum Op {
 }
 
 #[cfg(libtt_mlir_frontend)]
-pub(crate) fn parse(bytes: &[u8]) -> Result<Executable, String> {
-    let executable = TtExecutableV1::decode(bytes)
-        .map_err(|err| format!("failed to parse TT executable: {err}"))?;
+pub(crate) struct Analysis {
+    pub(crate) status: Status,
+    pub(crate) error_message: String,
+    pub(crate) outputs: Vec<ValueDesc>,
+    pub(crate) executable_format: String,
+    pub(crate) executable_bytes: Vec<u8>,
+    pub(crate) executable: Option<Executable>,
+}
 
+#[cfg(libtt_mlir_frontend)]
+fn map_element_type(element_type: i32) -> Result<PJRT_Buffer_Type, String> {
+    match ElementType::try_from(element_type)
+        .map_err(|_| "TT executable contains an invalid tensor element type".to_owned())?
+    {
+        ElementType::Unknown => Err("TT executable contains an unknown tensor element type".into()),
+        ElementType::Bf16 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_BF16),
+        ElementType::F16 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_F16),
+        ElementType::F32 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_F32),
+        ElementType::U32 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_U32),
+        ElementType::U16 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_U16),
+        ElementType::U8 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_U8),
+        ElementType::S32 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_S32),
+        ElementType::S8 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_S8),
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn parse_tensor_desc(tensor: ProtoTensorDesc) -> Result<ValueDesc, String> {
+    Ok(ValueDesc {
+        dims: tensor.dims,
+        element_type: map_element_type(tensor.element_type)?,
+    })
+}
+
+#[cfg(libtt_mlir_frontend)]
+pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, String> {
     let values = executable
         .values
         .into_iter()
@@ -49,25 +87,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Executable, String> {
             let tensor = value
                 .tensor
                 .ok_or_else(|| "TT executable value is missing tensor metadata".to_owned())?;
-            let element_type = match ElementType::try_from(tensor.element_type)
-                .map_err(|_| "TT executable contains an invalid tensor element type".to_owned())?
-            {
-                ElementType::Unknown => {
-                    return Err("TT executable contains an unknown tensor element type".into());
-                }
-                ElementType::Bf16 => PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
-                ElementType::F16 => PJRT_Buffer_Type::PJRT_Buffer_Type_F16,
-                ElementType::F32 => PJRT_Buffer_Type::PJRT_Buffer_Type_F32,
-                ElementType::U32 => PJRT_Buffer_Type::PJRT_Buffer_Type_U32,
-                ElementType::U16 => PJRT_Buffer_Type::PJRT_Buffer_Type_U16,
-                ElementType::U8 => PJRT_Buffer_Type::PJRT_Buffer_Type_U8,
-                ElementType::S32 => PJRT_Buffer_Type::PJRT_Buffer_Type_S32,
-                ElementType::S8 => PJRT_Buffer_Type::PJRT_Buffer_Type_S8,
-            };
-            Ok(ValueDesc {
-                dims: tensor.dims,
-                element_type,
-            })
+            parse_tensor_desc(tensor)
         })
         .collect::<Result<Vec<_>, String>>()?;
 
@@ -102,6 +122,52 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Executable, String> {
         values,
         ops,
         output_ids: executable.output_ids,
+    })
+}
+
+#[cfg(libtt_mlir_frontend)]
+pub(crate) fn parse(bytes: &[u8]) -> Result<Executable, String> {
+    let executable = ProtoExecutable::decode(bytes)
+        .map_err(|err| format!("failed to parse TT executable: {err}"))?;
+    parse_proto(executable)
+}
+
+#[cfg(libtt_mlir_frontend)]
+pub(crate) fn parse_analysis(bytes: &[u8]) -> Result<Analysis, String> {
+    let analysis = AnalysisResult::decode(bytes)
+        .map_err(|err| format!("failed to parse TT MLIR analysis result: {err}"))?;
+    let status = Status::try_from(analysis.status)
+        .map_err(|_| "TT MLIR analysis result contains an invalid status".to_owned())?;
+    let outputs = analysis
+        .outputs
+        .into_iter()
+        .map(parse_tensor_desc)
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let executable_format = if analysis.executable_format.is_empty() {
+        "tt-executable-v1".to_owned()
+    } else {
+        analysis.executable_format
+    };
+
+    let (executable_bytes, executable) = if let Some(executable_proto) = analysis.executable {
+        let mut bytes = Vec::new();
+        executable_proto
+            .encode(&mut bytes)
+            .map_err(|err| format!("failed to serialize TT executable: {err}"))?;
+        let executable = parse_proto(executable_proto)?;
+        (bytes, Some(executable))
+    } else {
+        (Vec::new(), None)
+    };
+
+    Ok(Analysis {
+        status,
+        error_message: analysis.error_message,
+        outputs,
+        executable_format,
+        executable_bytes,
+        executable,
     })
 }
 

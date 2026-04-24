@@ -24,6 +24,8 @@ use std::mem::size_of;
 use std::ptr;
 use std::slice;
 use std::sync::Once;
+#[cfg(libtt_mlir_frontend)]
+use tt_executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 
 include!("pjrt_bindings.rs");
 
@@ -464,21 +466,6 @@ fn optimized_program(format: &str, code: &[u8]) -> OptimizedProgram {
     }
 }
 
-#[cfg(libtt_mlir_frontend)]
-fn map_mlir_element_type(element_type: i32) -> Result<PJRT_Buffer_Type, *mut PJRT_Error> {
-    match element_type {
-        mlir_frontend::ELEMENT_TYPE_BF16 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_BF16),
-        mlir_frontend::ELEMENT_TYPE_F16 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_F16),
-        mlir_frontend::ELEMENT_TYPE_F32 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_F32),
-        mlir_frontend::ELEMENT_TYPE_U32 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_U32),
-        mlir_frontend::ELEMENT_TYPE_U16 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_U16),
-        mlir_frontend::ELEMENT_TYPE_U8 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_U8),
-        mlir_frontend::ELEMENT_TYPE_S32 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_S32),
-        mlir_frontend::ELEMENT_TYPE_S8 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_S8),
-        _ => Err(unimplemented("unsupported MLIR output element type")),
-    }
-}
-
 fn executable_metadata_from_program(
     program: &PJRT_Program,
 ) -> Result<ExecutableMetadata, *mut PJRT_Error> {
@@ -492,57 +479,42 @@ fn executable_metadata_from_program(
                 program.code.cast_const(),
                 program.code_size,
             ) {
-                let analysis = analysis.analysis();
-                if !analysis.error_message.is_null() {
-                    let message = unsafe {
-                        std::ffi::CStr::from_ptr(analysis.error_message)
-                            .to_string_lossy()
-                            .into_owned()
+                let analysis =
+                    tt_executable::parse_analysis(analysis.bytes()).map_err(|message| {
+                        pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INTERNAL)
+                    })?;
+                if analysis.status != MlirAnalysisStatus::Ok {
+                    let message = if analysis.error_message.is_empty() {
+                        format!("MLIR analysis failed with status {:?}", analysis.status)
+                    } else {
+                        analysis.error_message
                     };
                     return Err(match analysis.status {
-                        mlir_frontend::STATUS_PARSE_ERROR => invalid_argument(message),
-                        mlir_frontend::STATUS_UNSUPPORTED => unimplemented(message),
+                        MlirAnalysisStatus::ParseError => invalid_argument(message),
+                        MlirAnalysisStatus::Unsupported => unimplemented(message),
                         _ => pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INTERNAL),
                     });
                 }
 
-                let output_dims = if analysis.num_output_dims == 0 {
-                    Vec::new()
-                } else {
-                    unsafe {
-                        slice::from_raw_parts(
-                            analysis.output_dims.cast_const(),
-                            analysis.num_output_dims,
-                        )
-                    }
-                    .to_vec()
-                };
-                let optimized_program_bytes = if analysis.optimized_program.is_null() {
-                    None
-                } else {
-                    Some(
-                        unsafe {
-                            slice::from_raw_parts(
-                                analysis.optimized_program.cast::<u8>(),
-                                analysis.optimized_program_size,
-                            )
-                        }
-                        .to_vec(),
-                    )
-                };
-                let tt_executable = optimized_program_bytes
-                    .as_deref()
-                    .map(tt_executable::parse)
-                    .transpose()
-                    .map_err(unimplemented)?;
+                if analysis.outputs.len() != 1 {
+                    return Err(unimplemented(format!(
+                        "TT executable must contain exactly one output, got {}",
+                        analysis.outputs.len()
+                    )));
+                }
+                let output = analysis
+                    .outputs
+                    .first()
+                    .expect("analysis output length was checked");
+                let optimized_program = (!analysis.executable_bytes.is_empty()).then(|| {
+                    optimized_program(&analysis.executable_format, &analysis.executable_bytes)
+                });
                 return Ok(make_executable_metadata(
                     EXECUTABLE_NAME,
-                    output_dims,
-                    map_mlir_element_type(analysis.output_type)?,
-                    optimized_program_bytes
-                        .as_deref()
-                        .map(|bytes| optimized_program("tt-executable-v1", bytes)),
-                    tt_executable,
+                    output.dims.clone(),
+                    output.element_type,
+                    optimized_program,
+                    analysis.executable,
                 ));
             }
         }

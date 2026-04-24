@@ -1,17 +1,7 @@
 #[cfg(libtt_mlir_frontend)]
-use std::ffi::c_char;
-
+use std::ffi::{c_char, c_void};
 #[cfg(libtt_mlir_frontend)]
-#[repr(C)]
-pub(crate) struct TT_MlirAnalysis {
-    pub(crate) status: i32,
-    pub(crate) output_type: i32,
-    pub(crate) num_output_dims: usize,
-    pub(crate) output_dims: *mut i64,
-    pub(crate) optimized_program: *mut c_char,
-    pub(crate) optimized_program_size: usize,
-    pub(crate) error_message: *mut c_char,
-}
+use std::ptr;
 
 #[cfg(libtt_mlir_frontend)]
 unsafe extern "C" {
@@ -20,35 +10,28 @@ unsafe extern "C" {
         format_size: usize,
         code: *const c_char,
         code_size: usize,
-    ) -> *mut TT_MlirAnalysis;
-    fn TT_MlirAnalysisDestroy(analysis: *mut TT_MlirAnalysis);
+        alloc_output: unsafe extern "C" fn(usize, *mut c_void) -> *mut c_char,
+        user_data: *mut c_void,
+    ) -> bool;
 }
 
 #[cfg(libtt_mlir_frontend)]
-pub(crate) const STATUS_PARSE_ERROR: i32 = 1;
-#[cfg(libtt_mlir_frontend)]
-pub(crate) const STATUS_UNSUPPORTED: i32 = 2;
-
-#[cfg(libtt_mlir_frontend)]
-pub(crate) const ELEMENT_TYPE_BF16: i32 = 1;
-#[cfg(libtt_mlir_frontend)]
-pub(crate) const ELEMENT_TYPE_F16: i32 = 2;
-#[cfg(libtt_mlir_frontend)]
-pub(crate) const ELEMENT_TYPE_F32: i32 = 3;
-#[cfg(libtt_mlir_frontend)]
-pub(crate) const ELEMENT_TYPE_U32: i32 = 4;
-#[cfg(libtt_mlir_frontend)]
-pub(crate) const ELEMENT_TYPE_U16: i32 = 5;
-#[cfg(libtt_mlir_frontend)]
-pub(crate) const ELEMENT_TYPE_U8: i32 = 6;
-#[cfg(libtt_mlir_frontend)]
-pub(crate) const ELEMENT_TYPE_S32: i32 = 7;
-#[cfg(libtt_mlir_frontend)]
-pub(crate) const ELEMENT_TYPE_S8: i32 = 8;
-
-#[cfg(libtt_mlir_frontend)]
 pub(crate) struct AnalysisHandle {
-    raw: *mut TT_MlirAnalysis,
+    data: Vec<u8>,
+}
+
+#[cfg(libtt_mlir_frontend)]
+unsafe extern "C" fn alloc_output(size: usize, user_data: *mut c_void) -> *mut c_char {
+    if user_data.is_null() {
+        return ptr::null_mut();
+    }
+    let data = unsafe { &mut *user_data.cast::<Vec<u8>>() };
+    data.clear();
+    if data.try_reserve_exact(size).is_err() {
+        return ptr::null_mut();
+    }
+    data.resize(size, 0);
+    data.as_mut_ptr().cast()
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -59,20 +42,21 @@ impl AnalysisHandle {
         code: *const c_char,
         code_size: usize,
     ) -> Option<Self> {
-        let raw = unsafe { TT_MlirAnalyzeProgram(format, format_size, code, code_size) };
-        (!raw.is_null()).then_some(Self { raw })
+        let mut data = Vec::new();
+        let ok = unsafe {
+            TT_MlirAnalyzeProgram(
+                format,
+                format_size,
+                code,
+                code_size,
+                alloc_output,
+                (&mut data as *mut Vec<u8>).cast(),
+            )
+        };
+        ok.then_some(Self { data })
     }
 
-    pub(crate) fn analysis(&self) -> &TT_MlirAnalysis {
-        unsafe { &*self.raw }
-    }
-}
-
-#[cfg(libtt_mlir_frontend)]
-impl Drop for AnalysisHandle {
-    fn drop(&mut self) {
-        unsafe {
-            TT_MlirAnalysisDestroy(self.raw);
-        }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.data
     }
 }
