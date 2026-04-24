@@ -50,12 +50,6 @@ const LFLAGS: &[&str] = &[
 
 const PERF_COUNTER_DEFINES: &[&str] = &["-DPROFILE_PERF_COUNTERS=0x3f"];
 
-const CQ_SOURCES: &[(&str, &str, u8)] = &[
-    ("prefetch_brisc", "cq_prefetch.cpp", 0),
-    ("dispatch_brisc", "cq_dispatch.cpp", 1),
-    ("dispatch_s_ncrisc", "cq_dispatch_subordinate.cpp", 1),
-];
-
 const FW_TARGETS: &[FwTarget] = &[
     FwTarget {
         src_name: "brisc.cc",
@@ -300,24 +294,12 @@ impl Compiler {
         noc_index: Option<u8>,
     ) -> io::Result<CompiledKernel> {
         match processor {
-            "brisc" => self.compile_dataflow_inner(
-                src,
-                "brisc",
-                noc_index.unwrap_or(1),
-                &[],
-                &[],
-                false,
-                true,
-            ),
-            "ncrisc" => self.compile_dataflow_inner(
-                src,
-                "ncrisc",
-                noc_index.unwrap_or(0),
-                &[],
-                &[],
-                false,
-                true,
-            ),
+            "brisc" => {
+                self.compile_dataflow_inner(src, "brisc", noc_index.unwrap_or(1), &[], false, true)
+            }
+            "ncrisc" => {
+                self.compile_dataflow_inner(src, "ncrisc", noc_index.unwrap_or(0), &[], false, true)
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("processor must be 'brisc' or 'ncrisc', got: {other}"),
@@ -337,42 +319,12 @@ impl Compiler {
         ))
     }
 
-    pub fn compile_cq_kernels(&self) -> io::Result<BTreeMap<String, CompiledKernel>> {
-        let cq_dir = repo_root().join("firmware").join("cq");
-        let cq_includes = vec![
-            cq_dir.display().to_string(),
-            cq_dir.join("includes").display().to_string(),
-        ];
-
-        let mut kernels = BTreeMap::new();
-        for &(name, src_name, noc_index) in CQ_SOURCES {
-            let source = fs::read_to_string(cq_dir.join(src_name))?;
-            let processor = if name.contains("ncrisc") {
-                "ncrisc"
-            } else {
-                "brisc"
-            };
-            let kernel = self.compile_dataflow_inner(
-                &source,
-                processor,
-                noc_index,
-                &[],
-                &cq_includes,
-                true,
-                false,
-            )?;
-            kernels.insert(name.to_owned(), kernel);
-        }
-        Ok(kernels)
-    }
-
     fn compile_dataflow_inner(
         &self,
         src: &str,
         target: &str,
         noc_index: u8,
         extra_defines: &[String],
-        extra_includes: &[String],
         xip_relocate: bool,
         profiler: bool,
     ) -> io::Result<CompiledKernel> {
@@ -407,7 +359,6 @@ impl Compiler {
             &extra_objs,
             "-O2",
             false,
-            extra_includes,
             xip_relocate,
             &Program::default(),
         )
@@ -435,7 +386,6 @@ impl Compiler {
             &[],
             "-O3",
             true,
-            &[],
             false,
             program,
         )
@@ -449,17 +399,10 @@ impl Compiler {
         extra_objs: &[String],
         opt: &str,
         trisc: bool,
-        extra_includes: &[String],
         xip_relocate: bool,
         program: &Program,
     ) -> io::Result<CompiledKernel> {
         let headers = ckernel_headers(program);
-        let mut include_content = Vec::new();
-        for dir in extra_includes {
-            for file in sorted_files_recursive(Path::new(dir))? {
-                include_content.extend(fs::read(file)?);
-            }
-        }
 
         let fw = self.firmware.get(target).ok_or_else(|| {
             io::Error::new(
@@ -477,7 +420,6 @@ impl Compiler {
             xip_relocate,
             &headers,
             &fw.elf_bytes,
-            &include_content,
         );
         if let Some(entry) = kernel_cache()
             .lock()
@@ -507,8 +449,7 @@ impl Compiler {
             format!("{target}k.cc")
         });
 
-        let mut includes = self.includes.clone();
-        includes.extend(extra_includes.iter().map(|dir| format!("-I{dir}")));
+        let includes = self.includes.clone();
         let (effective_opt, cflags, debug_flags) = kernel_build_flags(opt);
 
         let mut compile_args = Vec::new();
@@ -1349,38 +1290,6 @@ fn unique_temp_dir(prefix: &str) -> io::Result<PathBuf> {
     ))
 }
 
-fn sorted_files_recursive(root: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    if !root.exists() {
-        return Ok(files);
-    }
-    collect_files_recursive(root, &mut files)?;
-    files.sort();
-    Ok(files)
-}
-
-fn collect_files_recursive(root: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
-    if root.is_file() {
-        files.push(root.to_path_buf());
-        return Ok(());
-    }
-
-    let mut entries = fs::read_dir(root)?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
-            collect_files_recursive(&path, files)?;
-        } else if path.is_file() {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
 fn firmware_cache_key(
     profile: bool,
     num_dram_banks: usize,
@@ -1414,7 +1323,6 @@ fn kernel_cache_key(
     xip_relocate: bool,
     headers: &BTreeMap<String, String>,
     fw_elf: &[u8],
-    include_content: &[u8],
 ) -> String {
     let mut hasher = DefaultHasher::new();
     "kern-v3".hash(&mut hasher);
@@ -1430,7 +1338,6 @@ fn kernel_cache_key(
         content.hash(&mut hasher);
     }
     fw_elf.hash(&mut hasher);
-    include_content.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 

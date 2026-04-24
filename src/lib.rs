@@ -104,7 +104,7 @@ struct ExecutableMetadata {
     output_types: Vec<PJRT_Buffer_Type>,
     output_dims: Vec<i64>,
     output_dim_sizes: Vec<usize>,
-    output_memory_kinds: Vec<CString>,
+    _output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
     optimized_program: Option<OptimizedProgram>,
@@ -138,6 +138,7 @@ pub struct PJRT_Client {
 
 unsafe impl Sync for PJRT_Api {}
 
+#[cfg(libtt_mlir_frontend)]
 const EXECUTABLE_NAME: &str = "tt.executable.v1";
 
 impl PJRT_Client {
@@ -175,8 +176,7 @@ impl PJRT_Client {
         }
 
         let mut devices = Vec::with_capacity(discovered.len());
-        for info in &discovered {
-            let index = info.id;
+        for (index, info) in discovered.iter().enumerate() {
             let description = &mut *device_descriptions[index] as *mut PJRT_DeviceDescription;
             let default_memory = memory_ptrs[index];
             devices.push(Box::new(PJRT_Device {
@@ -344,12 +344,18 @@ fn dims_i64_to_usize(dims: &[i64]) -> Result<Vec<usize>, *mut PJRT_Error> {
         .collect()
 }
 
-fn checked_dims(ptr: *const i64, len: usize) -> Result<&'static [i64], *mut PJRT_Error> {
+unsafe fn checked_i64_slice<'a>(
+    ptr: *const i64,
+    len: usize,
+    field: &str,
+) -> Result<&'a [i64], *mut PJRT_Error> {
     if len == 0 {
         return Ok(&[]);
     }
     if ptr.is_null() {
-        return Err(invalid_argument("dims must not be null when num_dims > 0"));
+        return Err(invalid_argument(format!(
+            "{field} must not be null when length > 0"
+        )));
     }
     // SAFETY: caller owns `ptr` for `len` elements during the call.
     Ok(unsafe { slice::from_raw_parts(ptr, len) })
@@ -376,7 +382,7 @@ fn validate_dense_row_major_strides(
             "num_byte_strides must match num_dims for strided host buffers",
         ));
     }
-    let strides = checked_dims(byte_strides, num_byte_strides)?;
+    let strides = unsafe { checked_i64_slice(byte_strides, num_byte_strides, "byte_strides") }?;
     let mut expected = dtype.bytes_per_element();
     for (&dim, &stride) in dims.iter().rev().zip(strides.iter().rev()) {
         let stride =
@@ -543,6 +549,7 @@ fn executable_metadata_from_program(
     ))
 }
 
+#[cfg(libtt_mlir_frontend)]
 fn make_executable_metadata(
     name: &str,
     dims: Vec<i64>,
@@ -568,7 +575,7 @@ fn make_executable_metadata(
         output_types: vec![output_type],
         output_dims: dims,
         output_dim_sizes,
-        output_memory_kinds,
+        _output_memory_kinds: output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
         optimized_program,
@@ -576,9 +583,7 @@ fn make_executable_metadata(
     }
 }
 
-fn make_executable(
-    metadata: ExecutableMetadata,
-) -> PJRT_Executable {
+fn make_executable(metadata: ExecutableMetadata) -> PJRT_Executable {
     PJRT_Executable { metadata }
 }
 
@@ -599,6 +604,7 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
     }
 }
 
+#[cfg(libtt_mlir_frontend)]
 fn executable_fingerprint_string(
     name: &str,
     dims: &[i64],
@@ -1543,7 +1549,7 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         Ok(dtype) => dtype,
         Err(err) => return err,
     };
-    let dims_i64 = match checked_dims(args.dims, args.num_dims) {
+    let dims_i64 = match unsafe { checked_i64_slice(args.dims, args.num_dims, "dims") } {
         Ok(dims) => dims,
         Err(err) => return err,
     };
@@ -2702,7 +2708,7 @@ mod tests {
     #[test]
     fn device_abstraction_surfaces_board_metadata_through_pjrt_objects() {
         let device = Device::from_probe(
-            0,
+            7,
             3,
             PathBuf::from("/dev/tenstorrent/3"),
             ProbeInfo {
@@ -2714,6 +2720,7 @@ mod tests {
         let client = PJRT_Client::new_with_devices(vec![device]);
 
         let description = &client.device_descriptions[0];
+        assert_eq!(description.id, 7);
         assert_eq!(description.device_kind.as_bytes(), b"Tenstorrent p100");
         let description_debug = std::str::from_utf8(description.debug_string.as_bytes())
             .expect("device debug string should be utf-8");
@@ -2743,6 +2750,7 @@ mod tests {
         assert!(memory_debug.contains("tiles=21"));
 
         let device = &client.devices[0];
+        assert_eq!(device.id, 7);
         assert_eq!(device.local_hardware_id, 3);
     }
 

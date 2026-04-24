@@ -58,7 +58,6 @@ impl TensixL1 {
     pub(crate) const KERNEL_CONFIG_BASE: u32 = 0x0086B0;
     pub(crate) const BRISC_FIRMWARE_BASE: u32 = 0x003840;
     pub(crate) const DATA_BUFFER_SPACE_BASE: u32 = 0x037000;
-    pub(crate) const PROFILER_CONTROL: u32 = 0x0009C0; // 32 x u32 = 128 bytes
     pub(crate) const PROFILER_HOST_BUFFER_BYTES_PER_RISC: u32 = 65536;
     pub(crate) const MEM_BANK_TO_NOC_SCRATCH: u32 = 0x0116B0;
 }
