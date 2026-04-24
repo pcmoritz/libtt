@@ -9,14 +9,16 @@ pub mod compiler;
 pub mod device;
 pub mod dispatch;
 pub mod dram;
+mod executable;
 mod hw;
 mod linux;
 mod log;
 mod mlir_frontend;
-mod tt_executable;
 
 use device::Device;
 use dram::{DType, DramBuffer};
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
 use std::ffi::{CString, c_char};
 use std::io;
@@ -24,8 +26,6 @@ use std::mem::size_of;
 use std::ptr;
 use std::slice;
 use std::sync::Once;
-#[cfg(libtt_mlir_frontend)]
-use tt_executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 
 include!("pjrt_bindings.rs");
 
@@ -108,7 +108,7 @@ struct ExecutableMetadata {
     _output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
-    tt_executable: Option<tt_executable::Executable>,
+    executable: Option<executable::Executable>,
 }
 
 #[repr(C)]
@@ -464,10 +464,9 @@ fn executable_metadata_from_program(
                 program.code.cast_const(),
                 program.code_size,
             ) {
-                let analysis =
-                    tt_executable::parse_analysis(analysis.bytes()).map_err(|message| {
-                        pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INTERNAL)
-                    })?;
+                let analysis = executable::parse_analysis(analysis.bytes()).map_err(|message| {
+                    pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INTERNAL)
+                })?;
                 if analysis.status != MlirAnalysisStatus::Ok {
                     let message = if analysis.error_message.is_empty() {
                         format!("MLIR analysis failed with status {:?}", analysis.status)
@@ -512,7 +511,7 @@ fn make_executable_metadata(
     name: &str,
     dims: Vec<i64>,
     output_type: PJRT_Buffer_Type,
-    tt_executable: Option<tt_executable::Executable>,
+    executable: Option<executable::Executable>,
 ) -> ExecutableMetadata {
     let output_memory_kinds = vec![cstring_lossy("dram")];
     let output_memory_kind_ptrs = output_memory_kinds
@@ -535,7 +534,7 @@ fn make_executable_metadata(
         _output_memory_kinds: output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
-        tt_executable,
+        executable,
     }
 }
 
@@ -572,7 +571,7 @@ fn executable_fingerprint_string(
         .collect::<Vec<_>>()
         .join("x");
     cstring_lossy(&format!(
-        "tt:tt_executable_v1:name={name}:dims={dims}:type={}:v1",
+        "tt:executable_v1:name={name}:dims={dims}:type={}:v1",
         output_type as u32
     ))
 }
@@ -1048,7 +1047,7 @@ pub unsafe extern "C" fn TT_Executable_OptimizedProgram(
     if unsafe { checked_mut(args.program, "program") }.is_err() {
         return invalid_argument("program must not be null");
     }
-    if executable.metadata.tt_executable.is_some() {
+    if executable.metadata.executable.is_some() {
         return pjrt_error(
             "optimized program serialization is not exposed",
             PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED,
@@ -1281,7 +1280,7 @@ fn device_buffer_for_value<'a>(
         .ok_or_else(|| invalid_argument(format!("{field} value id {value_id} is not available")))
 }
 
-fn execute_tt_executable_v1(
+fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
     target_device: &PJRT_Device,
@@ -1289,7 +1288,7 @@ fn execute_tt_executable_v1(
 ) -> Result<PJRT_Buffer, *mut PJRT_Error> {
     let plan = executable
         .metadata
-        .tt_executable
+        .executable
         .as_ref()
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
     let mut values = vec![None; plan.values.len()];
@@ -1297,7 +1296,7 @@ fn execute_tt_executable_v1(
 
     for op in &plan.ops {
         match *op {
-            tt_executable::Op::Parameter {
+            executable::Op::Parameter {
                 parameter_index,
                 output_id,
             } => {
@@ -1338,7 +1337,7 @@ fn execute_tt_executable_v1(
                 }
                 values[output_index] = Some(input.clone());
             }
-            tt_executable::Op::Add {
+            executable::Op::Add {
                 input_ids,
                 output_id,
             } => {
@@ -1457,7 +1456,7 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         unsafe { slice::from_raw_parts(device_args, args.num_args) }
     };
     let output_buffer =
-        match execute_tt_executable_v1(executable, execute_device, target_device, input_ptrs) {
+        match execute_executable_v1(executable, execute_device, target_device, input_ptrs) {
             Ok(output) => output,
             Err(err) => return err,
         };
@@ -2758,7 +2757,7 @@ mod tests {
 
         let executable = unsafe { &*get_executable_args.executable }
             .metadata
-            .tt_executable
+            .executable
             .as_ref()
             .expect("compiled executable should contain a TT executable");
         assert_eq!(executable.values.len(), 3);
@@ -2823,7 +2822,7 @@ mod tests {
 
         let executable = unsafe { &*get_executable_args.executable }
             .metadata
-            .tt_executable
+            .executable
             .as_ref()
             .expect("compiled executable should contain a TT executable");
         assert_eq!(executable.values.len(), 5);

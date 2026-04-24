@@ -25,7 +25,7 @@ rust_static_library(
     crate_name = "tt_mlir",
     crate_root = "src/lib.rs",
     deps = [
-        ":tt_executable_rust",
+        ":executable_rust",
         "@prost_crates//:prost",
     ],
     edition = "2024",
@@ -44,13 +44,13 @@ rust_test(
 )
 
 proto_library(
-    name = "tt_executable_proto",
-    srcs = ["mlir/tt_executable.proto"],
+    name = "executable_proto",
+    srcs = ["mlir/executable.proto"],
 )
 
 cc_proto_library(
-    name = "tt_executable_cc_proto",
-    deps = [":tt_executable_proto"],
+    name = "executable_cc_proto",
+    deps = [":executable_proto"],
 )
 
 rust_library_group(
@@ -73,16 +73,16 @@ toolchain(
 )
 
 rust_prost_library(
-    name = "tt_executable_rust",
-    proto = ":tt_executable_proto",
+    name = "executable_rust",
+    proto = ":executable_proto",
 )
 
 cc_library(
-    name = "tt_mlir_frontend",
-    srcs = ["mlir/tt_mlir_frontend.cc"],
+    name = "mlir_frontend",
+    srcs = ["mlir/mlir_frontend.cc"],
     copts = ["-std=c++17"],
     deps = [
-        ":tt_executable_cc_proto",
+        ":executable_cc_proto",
         "@com_google_protobuf//:protobuf_lite",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:FuncExtensions",
@@ -102,7 +102,7 @@ cc_library(
 cc_shared_library(
     name = "tt_shared",
     deps = [
-        ":tt_mlir_frontend",
+        ":mlir_frontend",
         ":tt_rust_mlir",
     ],
     shared_lib_name = select({

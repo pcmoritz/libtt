@@ -1,19 +1,19 @@
 #[cfg(libtt_mlir_frontend)]
 use crate::PJRT_Buffer_Type;
 #[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::AnalysisResult;
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::Executable as ProtoExecutable;
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::TensorDesc as ProtoTensorDesc;
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::analysis_result::Status;
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::op::Kind;
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::tensor_desc::ElementType;
+#[cfg(libtt_mlir_frontend)]
 use prost::Message;
-#[cfg(libtt_mlir_frontend)]
-use tt_executable_proto::tt::AnalysisResult;
-#[cfg(libtt_mlir_frontend)]
-use tt_executable_proto::tt::Executable as ProtoExecutable;
-#[cfg(libtt_mlir_frontend)]
-use tt_executable_proto::tt::TensorDesc as ProtoTensorDesc;
-#[cfg(libtt_mlir_frontend)]
-use tt_executable_proto::tt::analysis_result::Status;
-#[cfg(libtt_mlir_frontend)]
-use tt_executable_proto::tt::op::Kind;
-#[cfg(libtt_mlir_frontend)]
-use tt_executable_proto::tt::tensor_desc::ElementType;
 
 #[cfg(libtt_mlir_frontend)]
 #[derive(Clone)]

@@ -19,7 +19,7 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
-#include "mlir/tt_executable.pb.h"
+#include "mlir/executable.pb.h"
 #include "stablehlo/dialect/ChloOps.h"
 #include "stablehlo/dialect/Serialization.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -63,7 +63,7 @@ mlir::OwningOpRef<mlir::ModuleOp> parseModule(
 
     auto buffer = llvm::MemoryBuffer::getMemBuffer(
         code,
-        "tt_mlir_program",
+        "mlir_program",
         false);
     if (auto module = mlir::stablehlo::deserializePortableArtifact(buffer->getBuffer(), &context)) {
         return module;
