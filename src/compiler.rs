@@ -1245,10 +1245,10 @@ fn resolve_repo_root() -> PathBuf {
         return manifest_root;
     }
 
-    if let Ok(current_dir) = env::current_dir()
-        && let Some(root) = find_repo_root_from(&current_dir)
-    {
-        return root;
+    if let Ok(current_dir) = env::current_dir() {
+        if let Some(root) = find_repo_root_from(&current_dir) {
+            return root;
+        }
     }
 
     manifest_root
