@@ -56,14 +56,13 @@ void registerDialects(mlir::MLIRContext& context) {
 mlir::OwningOpRef<mlir::ModuleOp> parseModule(
     mlir::MLIRContext& context,
     llvm::StringRef format,
-    const char* code,
-    size_t code_size) {
+    llvm::StringRef code) {
     if (format != "mlir" && format != "stablehlo") {
         return nullptr;
     }
 
     auto buffer = llvm::MemoryBuffer::getMemBuffer(
-        llvm::StringRef(code, code_size),
+        code,
         "tt_mlir_program",
         false);
     if (auto module = mlir::stablehlo::deserializePortableArtifact(buffer->getBuffer(), &context)) {
@@ -71,7 +70,7 @@ mlir::OwningOpRef<mlir::ModuleOp> parseModule(
     }
 
     return mlir::parseSourceString<mlir::ModuleOp>(
-        llvm::StringRef(code, code_size),
+        code,
         &context);
 }
 
@@ -295,7 +294,10 @@ extern "C" bool TT_MlirAnalyzeProgram(
     mlir::MLIRContext context;
     registerDialects(context);
 
-    auto module = parseModule(context, llvm::StringRef(format, format_size), code, code_size);
+    auto module = parseModule(
+        context,
+        llvm::StringRef(format, format_size),
+        llvm::StringRef(code, code_size));
     if (!module) {
         return emitResult(makeResult(
             tt::AnalysisResult::STATUS_PARSE_ERROR,
