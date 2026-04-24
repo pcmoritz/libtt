@@ -170,6 +170,28 @@ struct FwTarget {
     extra_objs: &'static [&'static str],
 }
 
+struct BuildRequest<'a> {
+    kernel_source: &'a str,
+    target: &'a str,
+    defines: &'a [String],
+    extra_objs: &'a [String],
+    opt: &'a str,
+    trisc: bool,
+    xip_relocate: bool,
+    program: &'a Program,
+}
+
+struct KernelCacheInput<'a> {
+    kernel_source: &'a str,
+    target: &'a str,
+    defines: &'a [String],
+    opt: &'a str,
+    trisc: bool,
+    xip_relocate: bool,
+    headers: &'a BTreeMap<String, String>,
+    fw_elf: &'a [u8],
+}
+
 #[derive(Clone, Copy)]
 struct SectionHeader {
     sh_type: u32,
@@ -352,16 +374,17 @@ impl Compiler {
         } else {
             Vec::new()
         };
-        self.build(
-            src,
+        let program = Program::default();
+        self.build(BuildRequest {
+            kernel_source: src,
             target,
-            &defines,
-            &extra_objs,
-            "-O2",
-            false,
+            defines: &defines,
+            extra_objs: &extra_objs,
+            opt: "-O2",
+            trisc: false,
             xip_relocate,
-            &Program::default(),
-        )
+            program: &program,
+        })
     }
 
     fn compile_trisc(
@@ -379,48 +402,39 @@ impl Compiler {
         if self.profile {
             append_profile_defines(&mut defines);
         }
-        self.build(
-            src,
-            &format!("trisc{trisc_id}"),
-            &defines,
-            &[],
-            "-O3",
-            true,
-            false,
+        let target = format!("trisc{trisc_id}");
+        self.build(BuildRequest {
+            kernel_source: src,
+            target: &target,
+            defines: &defines,
+            extra_objs: &[],
+            opt: "-O3",
+            trisc: true,
+            xip_relocate: false,
             program,
-        )
+        })
     }
 
-    fn build(
-        &self,
-        kernel_source: &str,
-        target: &str,
-        defines: &[String],
-        extra_objs: &[String],
-        opt: &str,
-        trisc: bool,
-        xip_relocate: bool,
-        program: &Program,
-    ) -> io::Result<CompiledKernel> {
-        let headers = ckernel_headers(program);
+    fn build(&self, request: BuildRequest<'_>) -> io::Result<CompiledKernel> {
+        let headers = ckernel_headers(request.program);
 
-        let fw = self.firmware.get(target).ok_or_else(|| {
+        let fw = self.firmware.get(request.target).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("missing compiled firmware for {target}"),
+                format!("missing compiled firmware for {}", request.target),
             )
         })?;
 
-        let key = kernel_cache_key(
-            kernel_source,
-            target,
-            defines,
-            opt,
-            trisc,
-            xip_relocate,
-            &headers,
-            &fw.elf_bytes,
-        );
+        let key = kernel_cache_key(KernelCacheInput {
+            kernel_source: request.kernel_source,
+            target: request.target,
+            defines: request.defines,
+            opt: request.opt,
+            trisc: request.trisc,
+            xip_relocate: request.xip_relocate,
+            headers: &headers,
+            fw_elf: &fw.elf_bytes,
+        });
         if let Some(entry) = kernel_cache()
             .lock()
             .expect("kernel cache poisoned")
@@ -430,7 +444,7 @@ impl Compiler {
             return Ok(entry.result);
         }
 
-        let mut mcpu = if trisc {
+        let mut mcpu = if request.trisc {
             vec![
                 "-mcpu=tt-bh-tensix".to_owned(),
                 "-mno-tt-tensix-optimize-replay".to_owned(),
@@ -443,14 +457,14 @@ impl Compiler {
             ]
         };
 
-        let fw_src = deps_root().join("firmware-src").join(if trisc {
+        let fw_src = deps_root().join("firmware-src").join(if request.trisc {
             "trisck.cc".to_owned()
         } else {
-            format!("{target}k.cc")
+            format!("{}k.cc", request.target)
         });
 
         let includes = self.includes.clone();
-        let (effective_opt, cflags, debug_flags) = kernel_build_flags(opt);
+        let (effective_opt, cflags, debug_flags) = kernel_build_flags(request.opt);
 
         let mut compile_args = Vec::new();
         compile_args.push(effective_opt.clone());
@@ -459,7 +473,7 @@ impl Compiler {
         compile_args.push("-MMD".to_owned());
         compile_args.append(&mut mcpu.clone());
         compile_args.extend(includes);
-        compile_args.extend(defines.iter().cloned());
+        compile_args.extend(request.defines.iter().cloned());
 
         let fw_link_elf = std::cell::RefCell::new(None::<PathBuf>);
         let elf = compile_and_link(
@@ -470,7 +484,7 @@ impl Compiler {
                 let linker_script = deps_root()
                     .join("toolchain")
                     .join("blackhole")
-                    .join(format!("kernel_{target}.ld"));
+                    .join(format!("kernel_{}.ld", request.target));
                 let mut args = vec![effective_opt.clone()];
                 args.extend(cflags.clone());
                 args.extend(LFLAGS.iter().map(|value| (*value).to_owned()));
@@ -486,7 +500,7 @@ impl Compiler {
                         .display()
                 ));
                 args.push("out.o".to_owned());
-                args.extend(extra_objs.iter().cloned());
+                args.extend(request.extra_objs.iter().cloned());
                 args.push(
                     deps_root()
                         .join("lib")
@@ -497,14 +511,14 @@ impl Compiler {
                 );
                 args
             },
-            &format!("tt-{target}-"),
+            &format!("tt-{}-", request.target),
             Some(|build: &Path| {
                 *fw_link_elf.borrow_mut() = Some(self.weaken_fw_symbols(build, &fw.elf_bytes)?);
-                fs::write(build.join("kernel_includes.hpp"), kernel_source)?;
+                fs::write(build.join("kernel_includes.hpp"), request.kernel_source)?;
                 for (name, content) in &headers {
                     fs::write(build.join(name), content)?;
                 }
-                if trisc {
+                if request.trisc {
                     fs::write(build.join("defines_generated.h"), "")?;
                     for (stage, macro_name) in [
                         ("unpack", "TRISC_UNPACK"),
@@ -521,7 +535,7 @@ impl Compiler {
             }),
         )?;
 
-        let (xip, xip_text_bytes) = pack_xip_elf(&elf, xip_relocate)?;
+        let (xip, xip_text_bytes) = pack_xip_elf(&elf, request.xip_relocate)?;
         let result = CompiledKernel {
             xip,
             xip_text_bytes,
@@ -1231,10 +1245,10 @@ fn resolve_repo_root() -> PathBuf {
         return manifest_root;
     }
 
-    if let Ok(current_dir) = env::current_dir() {
-        if let Some(root) = find_repo_root_from(&current_dir) {
-            return root;
-        }
+    if let Ok(current_dir) = env::current_dir()
+        && let Some(root) = find_repo_root_from(&current_dir)
+    {
+        return root;
     }
 
     manifest_root
@@ -1314,30 +1328,21 @@ fn firmware_cache_key(
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-fn kernel_cache_key(
-    kernel_source: &str,
-    target: &str,
-    defines: &[String],
-    opt: &str,
-    trisc: bool,
-    xip_relocate: bool,
-    headers: &BTreeMap<String, String>,
-    fw_elf: &[u8],
-) -> String {
+fn kernel_cache_key(input: KernelCacheInput<'_>) -> String {
     let mut hasher = DefaultHasher::new();
     "kern-v3".hash(&mut hasher);
-    kernel_source.hash(&mut hasher);
-    target.hash(&mut hasher);
-    defines.hash(&mut hasher);
-    opt.hash(&mut hasher);
-    trisc.hash(&mut hasher);
-    xip_relocate.hash(&mut hasher);
-    headers.len().hash(&mut hasher);
-    for (name, content) in headers {
+    input.kernel_source.hash(&mut hasher);
+    input.target.hash(&mut hasher);
+    input.defines.hash(&mut hasher);
+    input.opt.hash(&mut hasher);
+    input.trisc.hash(&mut hasher);
+    input.xip_relocate.hash(&mut hasher);
+    input.headers.len().hash(&mut hasher);
+    for (name, content) in input.headers {
         name.hash(&mut hasher);
         content.hash(&mut hasher);
     }
-    fw_elf.hash(&mut hasher);
+    input.fw_elf.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 

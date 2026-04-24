@@ -1,4 +1,9 @@
-#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
+#![allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    clippy::missing_safety_doc
+)]
 
 pub mod compiler;
 pub mod device;
@@ -128,9 +133,9 @@ pub struct PJRT_Client {
     platform_name: CString,
     platform_version: CString,
     topology: PJRT_TopologyDescription,
-    device_descriptions: Vec<Box<PJRT_DeviceDescription>>,
-    memories: Vec<Box<PJRT_Memory>>,
-    devices: Vec<Box<PJRT_Device>>,
+    device_descriptions: Vec<PJRT_DeviceDescription>,
+    memories: Vec<PJRT_Memory>,
+    devices: Vec<PJRT_Device>,
     device_ptrs: Vec<*mut PJRT_Device>,
     addressable_device_ptrs: Vec<*mut PJRT_Device>,
     memory_ptrs: Vec<*mut PJRT_Memory>,
@@ -150,48 +155,48 @@ impl PJRT_Client {
         let mut device_descriptions = Vec::with_capacity(discovered.len());
 
         for info in &discovered {
-            device_descriptions.push(Box::new(PJRT_DeviceDescription {
+            device_descriptions.push(PJRT_DeviceDescription {
                 id: info.id as i32,
                 process_index: 0,
                 device_kind: cstring_lossy(info.device_kind()),
                 debug_string: cstring_lossy(info.device_debug_string()),
                 to_string: cstring_lossy(info.device_to_string()),
-            }));
+            });
         }
 
         let mut memories = Vec::with_capacity(discovered.len());
         for info in &discovered {
-            memories.push(Box::new(PJRT_Memory {
+            memories.push(PJRT_Memory {
                 id: info.id as i32,
                 kind: cstring_lossy("dram"),
                 debug_string: cstring_lossy(info.memory_debug_string()),
                 to_string: cstring_lossy(info.memory_to_string()),
                 device_ptrs: Vec::with_capacity(1),
-            }));
+            });
         }
 
         let mut memory_ptrs = Vec::with_capacity(memories.len());
         for memory in &mut memories {
-            memory_ptrs.push(&mut **memory as *mut PJRT_Memory);
+            memory_ptrs.push(memory as *mut PJRT_Memory);
         }
 
         let mut devices = Vec::with_capacity(discovered.len());
         for (index, info) in discovered.iter().enumerate() {
-            let description = &mut *device_descriptions[index] as *mut PJRT_DeviceDescription;
+            let description = &mut device_descriptions[index] as *mut PJRT_DeviceDescription;
             let default_memory = memory_ptrs[index];
-            devices.push(Box::new(PJRT_Device {
+            devices.push(PJRT_Device {
                 id: info.id as i32,
                 local_hardware_id: info.local_hardware_id as i32,
                 description,
                 addressable: true,
                 default_memory,
                 memory_ptrs: vec![default_memory],
-            }));
+            });
         }
 
         let mut device_ptrs = Vec::with_capacity(devices.len());
         for device in &mut devices {
-            device_ptrs.push(&mut **device as *mut PJRT_Device);
+            device_ptrs.push(device as *mut PJRT_Device);
         }
         let addressable_device_ptrs = device_ptrs.clone();
         for (index, memory) in memories.iter_mut().enumerate() {
@@ -203,7 +208,7 @@ impl PJRT_Client {
             platform_version: cstring_lossy(format!("libtt {}", env!("CARGO_PKG_VERSION"))),
             device_description_ptrs: device_descriptions
                 .iter_mut()
-                .map(|description| &mut **description as *mut PJRT_DeviceDescription)
+                .map(|description| description as *mut PJRT_DeviceDescription)
                 .collect(),
         };
 

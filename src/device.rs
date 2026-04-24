@@ -692,8 +692,7 @@ fn read_arc_enabled_masks(path: &Path) -> io::Result<(u32, u32)> {
 }
 
 fn encode_jal_zero(target: u32) -> [u8; 4] {
-    (((target & 0xFF000) | ((target & 0x800) << 9) | ((target & 0x7FE) << 20) | 0x6F) as u32)
-        .to_le_bytes()
+    ((target & 0xFF000) | ((target & 0x800) << 9) | ((target & 0x7FE) << 20) | 0x6F).to_le_bytes()
 }
 fn discover_with(root: &Path) -> Vec<Device> {
     let mut paths = Vec::new();
@@ -737,7 +736,7 @@ fn local_hardware_id_from_path(path: &Path) -> Option<usize> {
 }
 
 fn noc_xy(x: u8, y: u8) -> u16 {
-    (((y as u16) << 6) | x as u16) & 0xFFFF
+    ((y as u16) << 6) | x as u16
 }
 
 // Builds the scratch table firmware uses to map DRAM and worker-L1 banks to
@@ -800,12 +799,12 @@ fn build_bank_noc_table(
     }
 
     let mut bytes = Vec::new();
-    for noc in 0..2usize {
-        for bank in 0..num_dram_banks {
+    for noc in 0..2 {
+        for (bank, bank_ports) in BANK_PORT.iter().enumerate().take(num_dram_banks) {
             let (x, y0) = bank_xy.get(&bank).copied().ok_or_else(|| {
                 io::Error::other(format!("missing NOC mapping for logical DRAM bank {bank}"))
             })?;
-            bytes.extend_from_slice(&noc_xy(x, y0 + BANK_PORT[bank][noc]).to_le_bytes());
+            bytes.extend_from_slice(&noc_xy(x, y0 + bank_ports[noc]).to_le_bytes());
         }
     }
 

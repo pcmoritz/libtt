@@ -130,6 +130,7 @@ pub(crate) struct ValueDesc {
 
 #[cfg(not(libtt_mlir_frontend))]
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(crate) enum Op {
     Parameter {
         parameter_index: usize,

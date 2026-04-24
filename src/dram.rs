@@ -397,7 +397,7 @@ fn scatter_bank_data(
 }
 
 fn validate_tile_multiple(len: usize, dtype: DType) -> io::Result<()> {
-    if len % dtype.tile_size() == 0 {
+    if len.is_multiple_of(dtype.tile_size()) {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -480,7 +480,7 @@ fn validate_tiled_shape(
 
     let rows = shape[shape.len() - 2];
     let cols = shape[shape.len() - 1];
-    if rows % TILE_R != 0 || cols % TILE_C != 0 {
+    if !rows.is_multiple_of(TILE_R) || !cols.is_multiple_of(TILE_C) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("shape rows/cols must be multiples of {TILE_R}x{TILE_C}"),

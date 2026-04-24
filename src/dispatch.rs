@@ -159,6 +159,17 @@ struct Role {
     writer: Option<CompiledKernel>,
 }
 
+struct LaunchLayout {
+    sem_off: usize,
+    local_cb_off: usize,
+    remote_cb_off: usize,
+    rta_offsets: [usize; 3],
+    kernel_text_offsets: [u32; 5],
+    local_cb_mask: u32,
+    enables: u32,
+    host_assigned_id: u32,
+}
+
 pub(crate) fn build_dispatch_plan(
     compiler: &Compiler,
     available_cores: &[CoreCoord],
@@ -493,7 +504,7 @@ fn build_payload(
     let shared_addr = TensixL1::KERNEL_CONFIG_BASE
         .checked_add(to_u32(local_cb_off, "shared payload address")?)
         .ok_or_else(|| io::Error::other("shared payload address overflow"))?;
-    let launch_blob = serialize_launch(
+    let launch_blob = serialize_launch(LaunchLayout {
         sem_off,
         local_cb_off,
         remote_cb_off,
@@ -502,7 +513,7 @@ fn build_payload(
         local_cb_mask,
         enables,
         host_assigned_id,
-    )?;
+    })?;
     Ok((shared_addr, shared, launch_blob))
 }
 
@@ -548,22 +559,13 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
     Ok((mask, as_bytes(configs.as_slice())))
 }
 
-fn serialize_launch(
-    sem_off: usize,
-    local_cb_off: usize,
-    remote_cb_off: usize,
-    rta_offsets: [usize; 3],
-    kernel_text_offsets: [u32; 5],
-    local_cb_mask: u32,
-    enables: u32,
-    host_assigned_id: u32,
-) -> io::Result<Vec<u8>> {
-    let sem_off = to_u16(sem_off, "sem_offset")?;
-    let local_cb_off = to_u16(local_cb_off, "local_cb_offset")?;
-    let remote_cb_off = to_u16(remote_cb_off, "remote_cb_offset")?;
-    let writer_rta_off = to_u16(rta_offsets[0], "writer rta offset")?;
-    let reader_rta_off = to_u16(rta_offsets[1], "reader rta offset")?;
-    let compute_rta_off = to_u16(rta_offsets[2], "compute rta offset")?;
+fn serialize_launch(layout: LaunchLayout) -> io::Result<Vec<u8>> {
+    let sem_off = to_u16(layout.sem_off, "sem_offset")?;
+    let local_cb_off = to_u16(layout.local_cb_off, "local_cb_offset")?;
+    let remote_cb_off = to_u16(layout.remote_cb_off, "remote_cb_offset")?;
+    let writer_rta_off = to_u16(layout.rta_offsets[0], "writer rta offset")?;
+    let reader_rta_off = to_u16(layout.rta_offsets[1], "reader rta offset")?;
+    let compute_rta_off = to_u16(layout.rta_offsets[2], "compute rta offset")?;
     let launch = KernelConfigMsg {
         kernel_config_base: [TensixL1::KERNEL_CONFIG_BASE; DevMsgs::PROGRAMMABLE_CORE_TYPE_COUNT],
         sem_offset: [sem_off; DevMsgs::PROGRAMMABLE_CORE_TYPE_COUNT],
@@ -593,14 +595,14 @@ fn serialize_launch(
         ],
         mode: DevMsgs::DISPATCH_MODE_HOST,
         pad2: 0,
-        kernel_text_offset: kernel_text_offsets,
-        local_cb_mask,
+        kernel_text_offset: layout.kernel_text_offsets,
+        local_cb_mask: layout.local_cb_mask,
         brisc_noc_id: 1,
         brisc_noc_mode: 0,
         min_remote_cb_start_index: FAST_CQ_NUM_CIRCULAR_BUFFERS,
         exit_erisc_kernel: 0,
-        host_assigned_id,
-        enables,
+        host_assigned_id: layout.host_assigned_id,
+        enables: layout.enables,
         watcher_kernel_ids: [0; DevMsgs::MAX_PROCESSORS_PER_CORE_TYPE],
         ncrisc_kernel_size16: 0,
         sub_device_origin_x: 0,
