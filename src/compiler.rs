@@ -133,7 +133,6 @@ pub struct PTLoad {
 pub struct CompiledKernel {
     pub xip: Vec<u8>,
     pub xip_text_bytes: usize,
-    pub disassembly: String,
     pub elf_bytes: Option<Vec<u8>>,
 }
 
@@ -292,17 +291,6 @@ impl Compiler {
             (device.prefetch_core.x, device.prefetch_core.y),
             (device.dispatch_core.x, device.dispatch_core.y),
         )
-    }
-
-    pub fn disassemble(&self, kernel: &CompiledKernel) -> String {
-        if !kernel.disassembly.is_empty() {
-            return kernel.disassembly.clone();
-        }
-        kernel
-            .elf_bytes
-            .as_deref()
-            .map(|elf| self.disassemble_elf(elf))
-            .unwrap_or_default()
     }
 
     pub fn firmware(&self) -> &HashMap<String, CompiledFirmware> {
@@ -539,7 +527,6 @@ impl Compiler {
         let result = CompiledKernel {
             xip,
             xip_text_bytes,
-            disassembly: self.disassemble_elf(&elf),
             elf_bytes: Some(elf),
         };
         kernel_cache()
@@ -569,33 +556,6 @@ impl Compiler {
             build,
         )?;
         Ok(out)
-    }
-
-    fn disassemble_elf(&self, elf: &[u8]) -> String {
-        let objdump = sfpi_dir().join("riscv-tt-elf-objdump");
-        if !objdump.is_file() {
-            return String::new();
-        }
-
-        let build = match unique_temp_dir("tt-disasm-") {
-            Ok(dir) => dir,
-            Err(_) => return String::new(),
-        };
-        let path = build.join("out.elf");
-        if fs::write(&path, elf).is_err() {
-            let _ = fs::remove_dir_all(&build);
-            return String::new();
-        }
-
-        let output = Command::new(&objdump).arg("-d").arg(&path).output();
-        let _ = fs::remove_dir_all(&build);
-        let Ok(output) = output else {
-            return String::new();
-        };
-        if !output.status.success() {
-            return String::new();
-        }
-        normalize_objdump_addresses(&String::from_utf8_lossy(&output.stdout))
     }
 }
 
@@ -1412,25 +1372,6 @@ fn symbol(
 fn section_file_offset(section: SectionHeader, addr: u32) -> Option<usize> {
     let rel = addr.checked_sub(section.sh_addr)?;
     usize::try_from(section.sh_offset.checked_add(rel)?).ok()
-}
-
-fn normalize_objdump_addresses(disassembly: &str) -> String {
-    let mut lines = Vec::new();
-    for line in disassembly.lines() {
-        if let Some((prefix, suffix)) = line.split_once(':') {
-            let trimmed = prefix.trim_start();
-            if !trimmed.is_empty() && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
-                let indent_len = prefix.len() - trimmed.len();
-                let indent = &prefix[..indent_len];
-                let addr = trimmed.trim_start_matches('0');
-                let addr = if addr.is_empty() { "0" } else { addr };
-                lines.push(format!("{indent}{addr}:{suffix}"));
-                continue;
-            }
-        }
-        lines.push(line.to_owned());
-    }
-    lines.join("\n")
 }
 
 fn firmware_cache() -> &'static Mutex<HashMap<String, FirmwareCacheEntry>> {

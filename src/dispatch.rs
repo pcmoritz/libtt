@@ -686,7 +686,6 @@ mod tests {
         CompiledKernel {
             xip: vec![fill; len],
             xip_text_bytes: len,
-            disassembly: String::new(),
             elf_bytes: None,
         }
     }
