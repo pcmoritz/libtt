@@ -293,9 +293,8 @@ bool lowerToExecutable(FuncOp func, TT_MlirAnalysis& analysis, std::string& erro
             return false;
         }
         auto* parameter = executable.add_ops();
-        parameter->set_opcode(tt::Op::OPCODE_PARAMETER);
-        parameter->set_parameter_index(index);
         parameter->set_output_id(output_id);
+        parameter->mutable_parameter()->set_parameter_index(index);
     }
 
     for (mlir::Operation& op : func.front()) {
@@ -323,10 +322,9 @@ bool lowerToExecutable(FuncOp func, TT_MlirAnalysis& analysis, std::string& erro
             }
 
             auto* add = executable.add_ops();
-            add->set_opcode(tt::Op::OPCODE_ADD);
             add->set_output_id(output_id);
-            add->add_input_ids(lhs_id);
-            add->add_input_ids(rhs_id);
+            add->mutable_add()->set_lhs_id(lhs_id);
+            add->mutable_add()->set_rhs_id(rhs_id);
             continue;
         }
 

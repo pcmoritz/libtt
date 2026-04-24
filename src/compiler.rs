@@ -1235,6 +1235,7 @@ fn repo_root() -> &'static Path {
     ROOT.get_or_init(resolve_repo_root).as_path()
 }
 
+#[allow(clippy::collapsible_if)]
 fn resolve_repo_root() -> PathBuf {
     if let Some(path) = env::var_os("LIBTT_REPO_ROOT").filter(|value| !value.is_empty()) {
         return PathBuf::from(path);

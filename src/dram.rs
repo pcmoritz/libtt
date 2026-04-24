@@ -396,6 +396,7 @@ fn scatter_bank_data(
     }
 }
 
+#[allow(clippy::manual_is_multiple_of)]
 fn validate_tile_multiple(len: usize, dtype: DType) -> io::Result<()> {
     if len % dtype.tile_size() == 0 {
         Ok(())
@@ -466,6 +467,7 @@ impl Layout {
     }
 }
 
+#[allow(clippy::manual_is_multiple_of)]
 fn validate_tiled_shape(
     data: &[u8],
     dtype: DType,

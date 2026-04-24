@@ -25,22 +25,25 @@ message ValueDesc {
   TensorDesc tensor = 1;
 }
 
-message Op {
-  enum Opcode {
-    OPCODE_UNKNOWN = 0;
-    OPCODE_PARAMETER = 1;
-    OPCODE_ADD = 2;
-  }
+message ParameterOp {
+  // Zero-based entry-function argument index bound to Op.output_id.
+  uint32 parameter_index = 1;
+}
 
-  Opcode opcode = 1;
+message AddOp {
+  // Indices into TTExecutableV1.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+}
+
+message Op {
   // Index into TTExecutableV1.values for the value produced by this op.
-  uint32 output_id = 2;
-  // For OPCODE_PARAMETER, the zero-based entry-function argument index bound to
-  // output_id. Unused for other opcodes.
-  uint32 parameter_index = 3;
-  // Indices into TTExecutableV1.values for this op's operands, in opcode-
-  // specific order. For OPCODE_ADD this is [lhs, rhs].
-  repeated uint32 input_ids = 4;
+  uint32 output_id = 1;
+
+  oneof kind {
+    ParameterOp parameter = 2;
+    AddOp add = 3;
+  }
 }
 
 message TTExecutableV1 {

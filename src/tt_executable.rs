@@ -5,7 +5,7 @@ use prost::Message;
 #[cfg(libtt_mlir_frontend)]
 use tt_executable_proto::tt::TtExecutableV1;
 #[cfg(libtt_mlir_frontend)]
-use tt_executable_proto::tt::op::Opcode;
+use tt_executable_proto::tt::op::Kind;
 #[cfg(libtt_mlir_frontend)]
 use tt_executable_proto::tt::tensor_desc::ElementType;
 
@@ -75,26 +75,18 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Executable, String> {
         .ops
         .into_iter()
         .map(|op_desc| {
-            match Opcode::try_from(op_desc.opcode)
-                .map_err(|_| "TT executable contains an invalid opcode".to_owned())?
+            match op_desc
+                .kind
+                .ok_or_else(|| "TT executable op is missing kind".to_owned())?
             {
-                Opcode::Unknown => Err("TT executable contains an unknown opcode".into()),
-                Opcode::Parameter => Ok(Op::Parameter {
-                    parameter_index: op_desc.parameter_index as usize,
+                Kind::Parameter(parameter) => Ok(Op::Parameter {
+                    parameter_index: parameter.parameter_index as usize,
                     output_id: op_desc.output_id,
                 }),
-                Opcode::Add => {
-                    if op_desc.input_ids.len() != 2 {
-                        return Err(format!(
-                            "TT executable add op expects 2 inputs, got {}",
-                            op_desc.input_ids.len()
-                        ));
-                    }
-                    Ok(Op::Add {
-                        input_ids: [op_desc.input_ids[0], op_desc.input_ids[1]],
-                        output_id: op_desc.output_id,
-                    })
-                }
+                Kind::Add(add) => Ok(Op::Add {
+                    input_ids: [add.lhs_id, add.rhs_id],
+                    output_id: op_desc.output_id,
+                }),
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
