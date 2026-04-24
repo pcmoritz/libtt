@@ -452,12 +452,14 @@ impl Compiler {
         });
 
         let includes = self.includes.clone();
-        let (effective_opt, cflags, debug_flags) = kernel_build_flags(request.opt);
+        let cflags = CFLAGS
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
 
         let mut compile_args = Vec::new();
-        compile_args.push(effective_opt.clone());
+        compile_args.push(request.opt.to_owned());
         compile_args.extend(cflags.clone());
-        compile_args.extend(debug_flags);
         compile_args.push("-MMD".to_owned());
         compile_args.append(&mut mcpu.clone());
         compile_args.extend(includes);
@@ -473,7 +475,7 @@ impl Compiler {
                     .join("toolchain")
                     .join("blackhole")
                     .join(format!("kernel_{}.ld", request.target));
-                let mut args = vec![effective_opt.clone()];
+                let mut args = vec![request.opt.to_owned()];
                 args.extend(cflags.clone());
                 args.extend(LFLAGS.iter().map(|value| (*value).to_owned()));
                 args.append(&mut mcpu);
@@ -690,14 +692,6 @@ fn includes_with_dot() -> Vec<String> {
     let mut includes = vec!["-I.".to_owned()];
     includes.extend(includes_without_dot());
     includes
-}
-
-fn kernel_build_flags(opt: &str) -> (String, Vec<String>, Vec<String>) {
-    (
-        opt.to_owned(),
-        CFLAGS.iter().map(|value| (*value).to_owned()).collect(),
-        Vec::new(),
-    )
 }
 
 fn device_defines(
