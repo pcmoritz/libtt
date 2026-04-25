@@ -10,8 +10,13 @@ RUST_SRCS = glob(
     ["src/**/*.rs"],
 )
 
+KERNEL_SRCS = glob(
+    ["kernels/**/*.cc"],
+)
+
 rust_static_library(
     name = "tt_rust",
+    compile_data = KERNEL_SRCS,
     srcs = RUST_SRCS,
     crate_name = "tt",
     crate_root = "src/lib.rs",
@@ -21,6 +26,7 @@ rust_static_library(
 
 rust_static_library(
     name = "tt_rust_mlir",
+    compile_data = KERNEL_SRCS,
     srcs = RUST_SRCS,
     crate_name = "tt_mlir",
     crate_root = "src/lib.rs",

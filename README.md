@@ -122,14 +122,6 @@ The first Bazel build is expected to download and analyze a large upstream
 dependency graph because LLVM/MLIR and StableHLO are now built through Bazel
 instead of a preinstalled local prefix.
 
-## Cargo
-
-The Cargo build remains available as a fallback for direct Rust development:
-
-```bash
-cargo build --release
-```
-
 ## Regenerating PJRT Bindings
 
 The checked-in Rust bindings live in `src/pjrt_bindings.rs` and are generated
@@ -147,12 +139,12 @@ cargo run --manifest-path xtask/Cargo.toml -- update-pjrt-bindings
 
 Notes:
 
-- This uses the standalone `xtask` helper crate, so the main crate does not
-  depend on `bindgen`.
+- This uses the standalone `xtask` helper crate, so the library build does not
+  depend on Cargo or `bindgen`.
 - The regeneration helper has its own lockfile at `xtask/Cargo.lock`.
 - You will need a working `libclang`/`clang` installation for `bindgen`.
 - After regenerating, review the diff in `src/pjrt_bindings.rs` and run
-  `cargo test`.
+  `bazel test //:tt_test //:tt_mlir_test`.
 
 ## Using It
 

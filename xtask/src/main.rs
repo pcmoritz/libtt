@@ -56,7 +56,10 @@ fn update_pjrt_bindings() -> Result<(), Box<dyn Error>> {
             "#include \"xla/pjrt/c/pjrt_c_api.h\"\n\
              #include \"xla/pjrt/c/pjrt_c_api_layouts_extension.h\"\n",
         )
-        .clang_arg(format!("-I{}", repo_root.join("third_party/openxla").display()))
+        .clang_arg(format!(
+            "-I{}",
+            repo_root.join("third_party/openxla").display()
+        ))
         .blocklist_type("PJRT_Error")
         .blocklist_type("PJRT_DeviceDescription")
         .blocklist_type("PJRT_TopologyDescription")
@@ -80,7 +83,7 @@ fn update_pjrt_bindings() -> Result<(), Box<dyn Error>> {
     let mut contents = String::from(
         "// Generated from third_party/openxla/xla/pjrt/c/pjrt_c_api.h and\n\
          // third_party/openxla/xla/pjrt/c/pjrt_c_api_layouts_extension.h.\n\
-         // Regenerate with `cargo run -p xtask -- update-pjrt-bindings`.\n\n",
+         // Regenerate with `cargo run --manifest-path xtask/Cargo.toml -- update-pjrt-bindings`.\n\n",
     );
     contents.push_str(&bindings.to_string());
 
