@@ -2,7 +2,6 @@ use crate::compiler::Compiler;
 use crate::dispatch::{DevMsgs, Program, build_dispatch_plan, execute_slow_dispatch, mcast_rects};
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO, align_down, worker_cores};
-use crate::kernels::add;
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
 use std::collections::HashMap;
@@ -244,71 +243,6 @@ impl Device {
     ) -> io::Result<DramBuffer> {
         self.allocator_mut()?
             .alloc(num_tiles, dtype, name, shape.map(|dims| dims.to_vec()))
-    }
-
-    pub fn eltwise_add_bf16(
-        &mut self,
-        lhs: &DramBuffer,
-        rhs: &DramBuffer,
-        name: impl Into<String>,
-    ) -> io::Result<DramBuffer> {
-        if lhs.dtype != DType::Float16B || rhs.dtype != DType::Float16B {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "eltwise_add_bf16 requires bf16 inputs, got {:?} and {:?}",
-                    lhs.dtype, rhs.dtype
-                ),
-            ));
-        }
-        if lhs.num_tiles != rhs.num_tiles {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "input tile counts must match, got {} and {}",
-                    lhs.num_tiles, rhs.num_tiles
-                ),
-            ));
-        }
-        if lhs.shape != rhs.shape {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "input shapes must match, got {:?} and {:?}",
-                    lhs.shape, rhs.shape
-                ),
-            ));
-        }
-
-        let lhs_addr = u32::try_from(lhs.addr).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("lhs address does not fit in u32: 0x{:x}", lhs.addr),
-            )
-        })?;
-        let rhs_addr = u32::try_from(rhs.addr).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("rhs address does not fit in u32: 0x{:x}", rhs.addr),
-            )
-        })?;
-        let tile_count = u32::try_from(lhs.num_tiles).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("tile count does not fit in u32: {}", lhs.num_tiles),
-            )
-        })?;
-        let output = self.alloc(lhs.num_tiles, DType::Float16B, lhs.shape.as_deref(), name)?;
-        let output_addr = u32::try_from(output.addr).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("output address does not fit in u32: 0x{:x}", output.addr),
-            )
-        })?;
-
-        let program = add::bf16_program(lhs_addr, rhs_addr, output_addr, tile_count);
-        self.run_program(&program)?;
-        Ok(output)
     }
 
     pub fn alloc_write(

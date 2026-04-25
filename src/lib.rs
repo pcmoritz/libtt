@@ -1368,9 +1368,9 @@ fn execute_executable_v1(
                     ));
                 };
 
-                let output_dram = device
-                    .eltwise_add_bf16(lhs_dram, rhs_dram, "pjrt_add")
-                    .map_err(io_error)?;
+                let output_dram =
+                    kernels::add::eltwise_add_bf16(&mut device, lhs_dram, rhs_dram, "pjrt_add")
+                        .map_err(io_error)?;
                 let output_index = usize::try_from(output_id).map_err(|_| {
                     invalid_argument("TT executable add output id does not fit in usize")
                 })?;
