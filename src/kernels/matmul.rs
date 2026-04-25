@@ -119,52 +119,6 @@ pub(crate) fn matmul_bf16(
     let logical_mt = m / 32;
     let logical_nt = n / 32;
     let cores = device.cores();
-    if let Some(split) = plan_split_matmul(m, k, n, &cores)? {
-        log(format!(
-            "matmul_bf16 split plan: west Nt={} offset={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} subblock={}x{}; east Nt={} offset={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} subblock={}x{}",
-            split.west.logical_nt,
-            split.west.col_offset_tiles,
-            split.west.plan.rows.len(),
-            split.west.plan.cols.len(),
-            split.west.plan.per_core_m,
-            split.west.plan.per_core_n,
-            split.west.plan.in0_block_w,
-            split.west.plan.out_subblock_h,
-            split.west.plan.out_subblock_w,
-            split.east.logical_nt,
-            split.east.col_offset_tiles,
-            split.east.plan.rows.len(),
-            split.east.plan.cols.len(),
-            split.east.plan.per_core_m,
-            split.east.plan.per_core_n,
-            split.east.plan.in0_block_w,
-            split.east.plan.out_subblock_h,
-            split.east.plan.out_subblock_w
-        ));
-
-        let zero_tile = cached_zero_tile(device)?;
-        let output = device.alloc(
-            logical_mt * logical_nt,
-            DType::Float16B,
-            Some(&[m, n]),
-            output_name,
-        )?;
-        for chunk in [&split.west, &split.east] {
-            let program = bf16_program_for_columns(
-                &chunk.plan,
-                lhs,
-                rhs,
-                &output,
-                &zero_tile,
-                logical_mt,
-                logical_nt,
-                chunk.col_offset_tiles,
-            )?;
-            device.run_program(&program)?;
-        }
-        return Ok(output);
-    }
-
     let plan = plan_matmul(m, k, n, &cores)?;
     log(format!(
         "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
