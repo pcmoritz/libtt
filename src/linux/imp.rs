@@ -16,8 +16,8 @@ const TT_IOCTL_UNPIN_PAGES: c_ulong = TT_IOCTL_BASE | 10;
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x01;
+const MAP_PRIVATE: c_int = 0x02;
 const MAP_ANONYMOUS: c_int = 0x20;
-const MAP_POPULATE: c_int = 0x8000;
 const PAGE_SIZE: usize = 4096;
 const PIN_NOC_DMA: u32 = 2;
 
@@ -404,7 +404,7 @@ impl AnonymousMapping {
                 ptr::null_mut(),
                 len,
                 PROT_READ | PROT_WRITE,
-                MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
                 -1,
                 0,
             )
