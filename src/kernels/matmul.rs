@@ -3,7 +3,9 @@ use crate::dispatch::{CBConfig, CoreSelection, MathFidelity, Program};
 use crate::dram::{DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
 use crate::log::log;
+use std::collections::HashMap;
 use std::io;
+use std::sync::{Mutex, OnceLock};
 
 const BF16_READER_SENDER: &str = include_str!("../../kernels/matmul_reader_sender.cc");
 const BF16_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
@@ -11,6 +13,9 @@ const BF16_WRITER_SENDER: &str = include_str!("../../kernels/matmul_writer_sende
 const BF16_WRITER_RECV: &str = include_str!("../../kernels/matmul_writer_recv.cc");
 const BF16_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
+const SPLIT_N_STEP_TILES: usize = 8;
+
+static ZERO_TILE_BY_DEVICE: OnceLock<Mutex<HashMap<usize, DramBuffer>>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MatmulPlan {
@@ -24,6 +29,19 @@ struct MatmulPlan {
     in0_block_w: usize,
     out_subblock_h: usize,
     out_subblock_w: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MatmulChunkPlan {
+    plan: MatmulPlan,
+    col_offset_tiles: usize,
+    logical_nt: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SplitMatmulPlan {
+    west: MatmulChunkPlan,
+    east: MatmulChunkPlan,
 }
 
 impl MatmulPlan {
@@ -101,6 +119,52 @@ pub(crate) fn matmul_bf16(
     let logical_mt = m / 32;
     let logical_nt = n / 32;
     let cores = device.cores();
+    if let Some(split) = plan_split_matmul(m, k, n, &cores)? {
+        log(format!(
+            "matmul_bf16 split plan: west Nt={} offset={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} subblock={}x{}; east Nt={} offset={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} subblock={}x{}",
+            split.west.logical_nt,
+            split.west.col_offset_tiles,
+            split.west.plan.rows.len(),
+            split.west.plan.cols.len(),
+            split.west.plan.per_core_m,
+            split.west.plan.per_core_n,
+            split.west.plan.in0_block_w,
+            split.west.plan.out_subblock_h,
+            split.west.plan.out_subblock_w,
+            split.east.logical_nt,
+            split.east.col_offset_tiles,
+            split.east.plan.rows.len(),
+            split.east.plan.cols.len(),
+            split.east.plan.per_core_m,
+            split.east.plan.per_core_n,
+            split.east.plan.in0_block_w,
+            split.east.plan.out_subblock_h,
+            split.east.plan.out_subblock_w
+        ));
+
+        let zero_tile = cached_zero_tile(device)?;
+        let output = device.alloc(
+            logical_mt * logical_nt,
+            DType::Float16B,
+            Some(&[m, n]),
+            output_name,
+        )?;
+        for chunk in [&split.west, &split.east] {
+            let program = bf16_program_for_columns(
+                &chunk.plan,
+                lhs,
+                rhs,
+                &output,
+                &zero_tile,
+                logical_mt,
+                logical_nt,
+                chunk.col_offset_tiles,
+            )?;
+            device.run_program(&program)?;
+        }
+        return Ok(output);
+    }
+
     let plan = plan_matmul(m, k, n, &cores)?;
     log(format!(
         "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
@@ -117,12 +181,7 @@ pub(crate) fn matmul_bf16(
         plan.out_subblock_w
     ));
 
-    let zero_tile = device.alloc_write(
-        &vec![0u8; DType::Float16B.tile_size()],
-        DType::Float16B,
-        &[32, 32],
-        "matmul_zero_tile",
-    )?;
+    let zero_tile = cached_zero_tile(device)?;
     let output = device.alloc(
         logical_mt * logical_nt,
         DType::Float16B,
@@ -132,6 +191,30 @@ pub(crate) fn matmul_bf16(
     let program = bf16_program(&plan, lhs, rhs, &output, &zero_tile, logical_mt, logical_nt)?;
     device.run_program(&program)?;
     Ok(output)
+}
+
+fn cached_zero_tile(device: &mut Device) -> io::Result<DramBuffer> {
+    let cache = ZERO_TILE_BY_DEVICE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(buffer) = cache
+        .lock()
+        .map_err(|_| io::Error::other("zero tile cache is poisoned"))?
+        .get(&device.local_hardware_id())
+        .cloned()
+    {
+        return Ok(buffer);
+    }
+
+    let buffer = device.alloc_write(
+        &vec![0u8; DType::Float16B.tile_size()],
+        DType::Float16B,
+        &[32, 32],
+        "matmul_zero_tile",
+    )?;
+    cache
+        .lock()
+        .map_err(|_| io::Error::other("zero tile cache is poisoned"))?
+        .insert(device.local_hardware_id(), buffer.clone());
+    Ok(buffer)
 }
 
 fn shape_2d(buffer: &DramBuffer, name: &str) -> io::Result<(usize, usize)> {
@@ -179,6 +262,86 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
         }
     }
     Ok(plan)
+}
+
+fn plan_split_matmul(
+    m: usize,
+    k: usize,
+    n: usize,
+    cores: &[CoreCoord],
+) -> io::Result<Option<SplitMatmulPlan>> {
+    let full_plan = plan_matmul_for_cores(m, k, n, cores)?;
+    if !crosses_column_gap(&full_plan) {
+        return Ok(None);
+    }
+
+    let logical_nt = n / 32;
+    if logical_nt < 2 * SPLIT_N_STEP_TILES {
+        return Ok(None);
+    }
+
+    let west_cores = cores
+        .iter()
+        .copied()
+        .filter(|core| core.x < 8)
+        .collect::<Vec<_>>();
+    let east_cores = cores
+        .iter()
+        .copied()
+        .filter(|core| core.x >= 10)
+        .collect::<Vec<_>>();
+    if west_cores.is_empty() || east_cores.is_empty() {
+        return Ok(None);
+    }
+
+    let mut best = None;
+    let mut best_score = f64::INFINITY;
+    for west_nt in (SPLIT_N_STEP_TILES..logical_nt).step_by(SPLIT_N_STEP_TILES) {
+        let east_nt = logical_nt - west_nt;
+        if east_nt < SPLIT_N_STEP_TILES {
+            continue;
+        }
+        let Ok(west_plan) =
+            plan_matmul_for_cores_with_min_subblock(m, k, west_nt * 32, &west_cores, 2, 2)
+        else {
+            continue;
+        };
+        let Ok(east_plan) =
+            plan_matmul_for_cores_with_min_subblock(m, k, east_nt * 32, &east_cores, 2, 2)
+        else {
+            continue;
+        };
+        if crosses_column_gap(&west_plan) || crosses_column_gap(&east_plan) {
+            continue;
+        }
+
+        let score = chunk_time_score(west_nt, &west_plan) + chunk_time_score(east_nt, &east_plan);
+        if score < best_score {
+            best_score = score;
+            best = Some(SplitMatmulPlan {
+                west: MatmulChunkPlan {
+                    plan: west_plan,
+                    col_offset_tiles: 0,
+                    logical_nt: west_nt,
+                },
+                east: MatmulChunkPlan {
+                    plan: east_plan,
+                    col_offset_tiles: west_nt,
+                    logical_nt: east_nt,
+                },
+            });
+        }
+    }
+
+    Ok(best)
+}
+
+fn chunk_time_score(logical_nt: usize, plan: &MatmulPlan) -> f64 {
+    let active_cores = plan.rows.len() * plan.cols.len();
+    let out_tiles = plan.per_core_m * plan.per_core_n;
+    let bias = out_tiles.min(16);
+    let throughput = active_cores * plan.in0_block_w * bias * bias;
+    logical_nt as f64 / throughput as f64
 }
 
 fn plan_matmul_for_cores(
@@ -376,6 +539,19 @@ fn bf16_program(
     logical_mt: usize,
     logical_nt: usize,
 ) -> io::Result<Program> {
+    bf16_program_for_columns(plan, lhs, rhs, output, zero_tile, logical_mt, logical_nt, 0)
+}
+
+fn bf16_program_for_columns(
+    plan: &MatmulPlan,
+    lhs: &DramBuffer,
+    rhs: &DramBuffer,
+    output: &DramBuffer,
+    zero_tile: &DramBuffer,
+    logical_mt: usize,
+    logical_nt: usize,
+    col_offset_tiles: usize,
+) -> io::Result<Program> {
     let lhs_addr = u32_arg(lhs.addr, "lhs address")?;
     let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
     let output_addr = u32_arg(output.addr, "output address")?;
@@ -405,6 +581,7 @@ fn bf16_program(
                     zero_addr,
                     logical_mt,
                     logical_nt,
+                    col_offset_tiles,
                 )?,
             ));
         }
@@ -498,11 +675,18 @@ fn reader_args(
         &west_cols
             .iter()
             .copied()
-            .filter(|&x| x != plan.cols[0])
+            .filter(|&x| x != core.x)
             .collect::<Vec<_>>(),
         core.y,
     );
-    let e_rect = mcast_rect_args(&east_cols, core.y);
+    let e_rect = mcast_rect_args(
+        &east_cols
+            .iter()
+            .copied()
+            .filter(|&x| x != core.x)
+            .collect::<Vec<_>>(),
+        core.y,
+    );
     let sender = grid[row_index][0];
     Ok(vec![
         lhs_addr,
@@ -544,6 +728,7 @@ fn writer_args(
     zero_addr: u32,
     logical_mt: usize,
     logical_nt: usize,
+    col_offset_tiles: usize,
 ) -> io::Result<Vec<u32>> {
     let recv_ys = plan.rows.iter().copied().skip(1).collect::<Vec<_>>();
     let mcast = if recv_ys.is_empty() {
@@ -558,8 +743,8 @@ fn writer_args(
         ]
     };
     let sender = grid[0][col_index];
-    let column_start = col_index * plan.per_core_n;
-    let out_start = row_index * plan.per_core_m * plan.nt + column_start;
+    let column_start = col_offset_tiles + col_index * plan.per_core_n;
+    let out_start = row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n;
     Ok(vec![
         rhs_addr,
         u32_value(column_start, "rhs block offset")?,
@@ -593,6 +778,7 @@ fn writer_args(
         u32_value(logical_mt, "logical M tiles")?,
         u32_value(logical_nt, "logical N tiles")?,
         zero_addr,
+        u32_value(col_offset_tiles, "output column offset")?,
     ])
 }
 
@@ -707,6 +893,40 @@ mod tests {
         assert_eq!(plan.in0_block_w, 4);
         assert_eq!(plan.out_subblock_h, 1);
         assert_eq!(plan.out_subblock_w, 2);
+    }
+
+    #[test]
+    fn split_planner_uses_both_sides_without_cross_gap_multicast() {
+        let split = plan_split_matmul(4096, 8192, 4096, &p100_worker_cores()).expect("split plan");
+        let split = split.expect("large p100 matmul should split across the column gap");
+
+        assert_eq!(split.west.col_offset_tiles, 0);
+        assert_eq!(split.east.col_offset_tiles, split.west.logical_nt);
+        assert_eq!(split.west.logical_nt + split.east.logical_nt, 128);
+        assert!(split.west.plan.cols.iter().all(|&x| x < 8));
+        assert!(split.east.plan.cols.iter().all(|&x| x >= 10));
+        assert!(!crosses_column_gap(&split.west.plan));
+        assert!(!crosses_column_gap(&split.east.plan));
+        assert!(split.west.plan.in0_block_w >= 4);
+        assert!(split.east.plan.in0_block_w >= 4);
+    }
+
+    #[test]
+    fn reader_args_exclude_east_sender_from_multicast_receivers() {
+        let plan = plan_matmul_for_cores(
+            4096,
+            8192,
+            1536,
+            &p100_worker_cores()
+                .into_iter()
+                .filter(|core| core.x >= 10)
+                .collect::<Vec<_>>(),
+        )
+        .expect("east plan");
+        let grid = plan_grid(&plan);
+        let sender = grid[0][0];
+        let args = reader_args(&plan, 1, 2, &grid, 0, sender, 128).expect("reader args");
+        assert_eq!(args[18] as usize, plan.cols.len() - 1);
     }
 
     #[test]

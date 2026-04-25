@@ -21,6 +21,7 @@ void kernel_main() {
   const uint32_t out_num_sb_h = A(28);
   const uint32_t logical_mt = A(29);
   const uint32_t logical_nt = A(30);
+  const uint32_t out_col_offset = A(32);
   volatile tt_l1_ptr uint32_t *recv_sem = SEM(17);
 
   const InterleavedAddrGenFast<true> out_gen = {
@@ -49,7 +50,7 @@ void kernel_main() {
         uint32_t tile_id = row_start;
         for (uint32_t w = 0; w < out_sb_w; w++) {
           const uint32_t out_row = tile_id / padded_nt;
-          const uint32_t out_col = tile_id - out_row * padded_nt;
+          const uint32_t out_col = out_col_offset + tile_id - out_row * padded_nt;
           if (out_row < logical_mt && out_col < logical_nt) {
             noc_async_write_tile(out_row * logical_nt + out_col, out_gen, l1_addr);
           }
