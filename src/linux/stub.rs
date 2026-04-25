@@ -11,6 +11,8 @@ pub(crate) enum NocOrdering {
 
 pub(crate) struct TlbWindow;
 
+pub(crate) struct PinnedMemory;
+
 impl TlbWindow {
     pub(crate) fn open(_path: &Path, _size: u64, _wc: bool) -> io::Result<Self> {
         Err(io::Error::new(
@@ -58,5 +60,26 @@ impl TlbWindow {
             io::ErrorKind::Unsupported,
             "Tenstorrent Linux backend is only available on Linux",
         ))
+    }
+}
+
+impl PinnedMemory {
+    pub(crate) fn new(_path: &Path, _size: usize) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Tenstorrent Linux backend is only available on Linux",
+        ))
+    }
+
+    pub(crate) fn noc_addr(&self) -> u64 {
+        0
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &[]
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut []
     }
 }

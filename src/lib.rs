@@ -6,6 +6,7 @@
 )]
 
 pub mod compiler;
+mod cq;
 pub mod device;
 pub mod dispatch;
 pub mod dram;

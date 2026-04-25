@@ -1,10 +1,12 @@
 use crate::compiler::Compiler;
-use crate::dispatch::{DevMsgs, Program, build_dispatch_plan, execute_slow_dispatch, mcast_rects};
+use crate::cq::FastDispatcher;
+use crate::dispatch::{build_dispatch_plan, execute_slow_dispatch, mcast_rects, DevMsgs, Program};
 use crate::dram::{Allocator, DType, DramBuffer};
-use crate::hw::{Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO, align_down, worker_cores};
+use crate::hw::{align_down, worker_cores, Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO};
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -91,6 +93,7 @@ pub struct Device {
     pub(crate) dram_tiles: Vec<DramTile>,
     allocator: Option<Allocator>,
     compiler: Option<Compiler>,
+    fast_dispatch: Option<FastDispatcher>,
 }
 
 impl Device {
@@ -147,6 +150,7 @@ impl Device {
             dram_tiles,
             allocator: None,
             compiler: None,
+            fast_dispatch: None,
         };
 
         info.initialize_compiler();
@@ -229,8 +233,30 @@ impl Device {
             .as_ref()
             .ok_or_else(|| io::Error::other("compiler has not been initialized"))?;
         let worker_cores = self.cores();
-        let commands = build_dispatch_plan(compiler, &worker_cores, program)?;
-        execute_slow_dispatch(self.path.as_path(), &commands)?;
+        if use_fast_dispatch() {
+            let commands =
+                build_dispatch_plan(compiler, &worker_cores, program, DevMsgs::DISPATCH_MODE_DEV)?;
+            if self.fast_dispatch.is_none() {
+                self.fast_dispatch = Some(FastDispatcher::new(
+                    self.path.as_path(),
+                    self.prefetch_core,
+                    self.dispatch_core,
+                    compiler,
+                )?);
+            }
+            self.fast_dispatch
+                .as_mut()
+                .ok_or_else(|| io::Error::other("fast dispatcher initialization failed"))?
+                .execute(&commands)?;
+        } else {
+            let commands = build_dispatch_plan(
+                compiler,
+                &worker_cores,
+                program,
+                DevMsgs::DISPATCH_MODE_HOST,
+            )?;
+            execute_slow_dispatch(self.path.as_path(), &commands)?;
+        }
         Ok(())
     }
 
@@ -513,6 +539,12 @@ fn read_arc_enabled_masks(path: &Path) -> io::Result<(u32, u32)> {
 fn encode_jal_zero(target: u32) -> [u8; 4] {
     ((target & 0xFF000) | ((target & 0x800) << 9) | ((target & 0x7FE) << 20) | 0x6F).to_le_bytes()
 }
+
+fn use_fast_dispatch() -> bool {
+    !matches!(env::var("TT_USB").as_deref(), Ok("1"))
+        && !matches!(env::var("TT_FAST_DISPATCH").as_deref(), Ok("0"))
+}
+
 fn discover_with(root: &Path) -> Vec<Device> {
     let mut paths = Vec::new();
 

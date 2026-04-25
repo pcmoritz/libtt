@@ -1,6 +1,6 @@
 use crate::compiler::{CompiledKernel, Compiler};
 use crate::dram::DType;
-use crate::hw::{Arc, CoreCoord, TensixL1, align_up};
+use crate::hw::{align_up, Arc, CoreCoord, TensixL1};
 use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::BTreeSet;
 use std::io;
@@ -19,6 +19,7 @@ impl DevMsgs {
     pub(crate) const RUN_MSG_GO: u8 = 0x80;
     pub(crate) const RUN_MSG_RESET_READ_PTR_FROM_HOST: u8 = 0xE0;
     pub(crate) const RUN_MSG_DONE: u8 = 0x00;
+    pub(crate) const DISPATCH_MODE_DEV: u8 = 0;
     pub(crate) const DISPATCH_MODE_HOST: u8 = 1;
     pub(crate) const PROGRAMMABLE_CORE_TYPE_COUNT: usize = 3;
     pub(crate) const MAX_PROCESSORS_PER_CORE_TYPE: usize = 5;
@@ -168,12 +169,14 @@ struct LaunchLayout {
     local_cb_mask: u32,
     enables: u32,
     host_assigned_id: u32,
+    dispatch_mode: u8,
 }
 
 pub(crate) fn build_dispatch_plan(
     compiler: &Compiler,
     available_cores: &[CoreCoord],
     program: &Program,
+    dispatch_mode: u8,
 ) -> io::Result<Vec<DispatchCommand>> {
     let writer = if program.writer_kernel.is_empty() {
         None
@@ -244,6 +247,7 @@ pub(crate) fn build_dispatch_plan(
             rta_sizes,
             sem_off,
             0,
+            dispatch_mode,
         )?;
         commands.push(DispatchCommand::Write {
             cores: role.cores.clone(),
@@ -449,6 +453,7 @@ fn build_payload(
     rta_sizes: (usize, usize, usize),
     sem_off: usize,
     host_assigned_id: u32,
+    dispatch_mode: u8,
 ) -> io::Result<(u32, Vec<u8>, Vec<u8>)> {
     let rta_offsets = [0usize, rta_sizes.0, rta_sizes.0 + rta_sizes.1];
     let local_cb_off = align_up(
@@ -513,6 +518,7 @@ fn build_payload(
         local_cb_mask,
         enables,
         host_assigned_id,
+        dispatch_mode,
     })?;
     Ok((shared_addr, shared, launch_blob))
 }
@@ -593,7 +599,7 @@ fn serialize_launch(layout: LaunchLayout) -> io::Result<Vec<u8>> {
                 crta_offset: local_cb_off,
             },
         ],
-        mode: DevMsgs::DISPATCH_MODE_HOST,
+        mode: layout.dispatch_mode,
         pad2: 0,
         kernel_text_offset: layout.kernel_text_offsets,
         local_cb_mask: layout.local_cb_mask,
@@ -613,6 +619,59 @@ fn serialize_launch(layout: LaunchLayout) -> io::Result<Vec<u8>> {
     let out = as_bytes(&launch);
     debug_assert_eq!(out.len(), 96);
     Ok(out)
+}
+
+pub(crate) fn build_cq_launch(
+    brisc_text_off: u32,
+    ncrisc_text_off: u32,
+    sem_off: usize,
+) -> io::Result<Vec<u8>> {
+    let sem_off = to_u16(sem_off, "cq sem_offset")?;
+    let launch = KernelConfigMsg {
+        kernel_config_base: [TensixL1::KERNEL_CONFIG_BASE; DevMsgs::PROGRAMMABLE_CORE_TYPE_COUNT],
+        sem_offset: [sem_off, 0, 0],
+        local_cb_offset: 0,
+        remote_cb_offset: 0,
+        rta_offset: [
+            RtaOffset {
+                rta_offset: 0,
+                crta_offset: L1_ALIGN as u16,
+            },
+            RtaOffset {
+                rta_offset: 0,
+                crta_offset: 0,
+            },
+            RtaOffset {
+                rta_offset: 0,
+                crta_offset: 0,
+            },
+            RtaOffset {
+                rta_offset: 0,
+                crta_offset: 0,
+            },
+            RtaOffset {
+                rta_offset: 0,
+                crta_offset: 0,
+            },
+        ],
+        mode: DevMsgs::DISPATCH_MODE_HOST,
+        pad2: 0,
+        kernel_text_offset: [brisc_text_off, ncrisc_text_off, 0, 0, 0],
+        local_cb_mask: 0,
+        brisc_noc_id: 0,
+        brisc_noc_mode: 0,
+        min_remote_cb_start_index: FAST_CQ_NUM_CIRCULAR_BUFFERS,
+        exit_erisc_kernel: 0,
+        host_assigned_id: 0,
+        enables: 1 | if ncrisc_text_off != 0 { 2 } else { 0 },
+        watcher_kernel_ids: [0; DevMsgs::MAX_PROCESSORS_PER_CORE_TYPE],
+        ncrisc_kernel_size16: 0,
+        sub_device_origin_x: 0,
+        sub_device_origin_y: 0,
+        pad3: [0],
+        preload: 0,
+    };
+    Ok(as_bytes(&launch))
 }
 
 fn as_bytes<T: ?Sized>(value: &T) -> Vec<u8> {
@@ -769,6 +828,7 @@ mod tests {
             rta_sizes,
             sem_off,
             7,
+            DevMsgs::DISPATCH_MODE_HOST,
         )
         .expect("payload");
 

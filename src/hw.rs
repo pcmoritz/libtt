@@ -135,3 +135,7 @@ pub(crate) fn worker_cores(tensix_x: &[u8]) -> Vec<CoreCoord> {
     }
     cores
 }
+
+pub(crate) fn noc_xy(x: u8, y: u8) -> u32 {
+    (((y as u32) << 6) | x as u32) & 0xffff
+}
