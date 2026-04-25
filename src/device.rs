@@ -1,10 +1,8 @@
 use crate::compiler::Compiler;
-use crate::dispatch::{
-    CBConfig, CoreSelection, DevMsgs, Program, build_dispatch_plan, execute_slow_dispatch,
-    mcast_rects,
-};
+use crate::dispatch::{DevMsgs, Program, build_dispatch_plan, execute_slow_dispatch, mcast_rects};
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO, align_down, worker_cores};
+use crate::kernels::add;
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
 use std::collections::HashMap;
@@ -25,92 +23,6 @@ const BANK_PORT: [[u8; 2]; Dram::BANK_COUNT] = [
     [2, 1],
     [2, 1],
 ];
-
-const BF16_ADD_READER_KERNEL: &str = r#"
-#include <cstdint>
-void kernel_main() {
-  uint32_t lhs_addr = get_arg_val<uint32_t>(0);
-  uint32_t rhs_addr = get_arg_val<uint32_t>(1);
-  uint32_t offset = get_arg_val<uint32_t>(2);
-  uint32_t n_tiles = get_arg_val<uint32_t>(3);
-
-  constexpr uint32_t cb_lhs = tt::CBIndex::c_0;
-  constexpr uint32_t cb_rhs = tt::CBIndex::c_1;
-  const InterleavedAddrGenFast<true> lhs = {
-    .bank_base_address = lhs_addr, .page_size = get_tile_size(cb_lhs), .data_format = DataFormat::Float16_b,
-  };
-  const InterleavedAddrGenFast<true> rhs = {
-    .bank_base_address = rhs_addr, .page_size = get_tile_size(cb_rhs), .data_format = DataFormat::Float16_b,
-  };
-
-  for (uint32_t i = 0; i < n_tiles; ++i) {
-    cb_reserve_back(cb_lhs, 1);
-    cb_reserve_back(cb_rhs, 1);
-    noc_async_read_tile(offset + i, lhs, get_write_ptr(cb_lhs));
-    noc_async_read_tile(offset + i, rhs, get_write_ptr(cb_rhs));
-    noc_async_read_barrier();
-    cb_push_back(cb_lhs, 1);
-    cb_push_back(cb_rhs, 1);
-  }
-}
-"#;
-
-const BF16_ADD_WRITER_KERNEL: &str = r#"
-#include <cstdint>
-void kernel_main() {
-  uint32_t out_addr = get_arg_val<uint32_t>(0);
-  uint32_t offset = get_arg_val<uint32_t>(1);
-  uint32_t n_tiles = get_arg_val<uint32_t>(2);
-
-  constexpr uint32_t cb_out = tt::CBIndex::c_16;
-  const InterleavedAddrGenFast<true> out = {
-    .bank_base_address = out_addr, .page_size = get_tile_size(cb_out), .data_format = DataFormat::Float16_b,
-  };
-
-  for (uint32_t i = 0; i < n_tiles; ++i) {
-    cb_wait_front(cb_out, 1);
-    noc_async_write_tile(offset + i, out, get_read_ptr(cb_out));
-    noc_async_write_barrier();
-    cb_pop_front(cb_out, 1);
-  }
-}
-"#;
-
-const BF16_ADD_COMPUTE_KERNEL: &str = r#"
-#include <cstdint>
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api.h"
-
-namespace NAMESPACE {
-void MAIN {
-  uint32_t n_tiles = get_arg_val<uint32_t>(0);
-  constexpr uint32_t cb_lhs = tt::CBIndex::c_0;
-  constexpr uint32_t cb_rhs = tt::CBIndex::c_1;
-  constexpr uint32_t cb_out = tt::CBIndex::c_16;
-  constexpr uint32_t dst_reg_idx = 0;
-
-  binary_op_init_common(cb_lhs, cb_rhs, cb_out);
-  add_tiles_init(cb_lhs, cb_rhs);
-
-  for (uint32_t i = 0; i < n_tiles; ++i) {
-    cb_wait_front(cb_lhs, 1);
-    cb_wait_front(cb_rhs, 1);
-    tile_regs_acquire();
-    add_tiles(cb_lhs, cb_rhs, 0, 0, dst_reg_idx);
-    cb_pop_front(cb_lhs, 1);
-    cb_pop_front(cb_rhs, 1);
-    tile_regs_commit();
-    tile_regs_wait();
-    cb_reserve_back(cb_out, 1);
-    pack_tile(dst_reg_idx, cb_out);
-    cb_push_back(cb_out, 1);
-    tile_regs_release();
-  }
-}
-}  // namespace NAMESPACE
-"#;
 
 const P100_TENSIX_X: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14];
 const P150_TENSIX_X: [u8; 14] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16];
@@ -394,34 +306,7 @@ impl Device {
             )
         })?;
 
-        let program = Program {
-            cores: CoreSelection::Count(1),
-            reader_kernel: BF16_ADD_READER_KERNEL.to_owned(),
-            compute_kernel: BF16_ADD_COMPUTE_KERNEL.to_owned(),
-            writer_kernel: BF16_ADD_WRITER_KERNEL.to_owned(),
-            cbs: vec![
-                CBConfig {
-                    index: 0,
-                    dtype: DType::Float16B,
-                    tiles: 2,
-                },
-                CBConfig {
-                    index: 1,
-                    dtype: DType::Float16B,
-                    tiles: 2,
-                },
-                CBConfig {
-                    index: 16,
-                    dtype: DType::Float16B,
-                    tiles: 2,
-                },
-            ],
-            name: "eltwise_add_bf16".to_owned(),
-            reader_args: vec![lhs_addr, rhs_addr, 0, tile_count],
-            writer_args: vec![output_addr, 0, tile_count],
-            compute_args: vec![tile_count],
-            ..Program::default()
-        };
+        let program = add::bf16_program(lhs_addr, rhs_addr, output_addr, tile_count);
         self.run_program(&program)?;
         Ok(output)
     }

@@ -11,6 +11,7 @@ pub mod dispatch;
 pub mod dram;
 mod executable;
 mod hw;
+mod kernels;
 mod linux;
 mod log;
 mod mlir_frontend;
