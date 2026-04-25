@@ -619,6 +619,7 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
     const MAX_CIRCULAR_BUFFERS: usize = u32::BITS as usize;
     let mut mask = 0u32;
     let mut entries = 0usize;
+    let mut group_sizes = [0u32; MAX_CIRCULAR_BUFFERS];
     for cb in &program.cbs {
         if cb.index >= MAX_CIRCULAR_BUFFERS {
             return Err(io::Error::new(
@@ -626,31 +627,57 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
                 format!("circular buffer index {} is out of range", cb.index),
             ));
         }
+        let size = cb_size(cb)?;
+        let group = cb_allocation_group(cb.index);
+        group_sizes[group] = group_sizes[group].max(size);
         mask |= 1u32 << cb.index;
         entries = entries.max(cb.index + 1);
     }
     let mut configs = vec![CircularBufferConfigMsg::default(); entries];
     let mut next_addr = TensixL1::DATA_BUFFER_SPACE_BASE;
+    let mut group_addrs = [None; MAX_CIRCULAR_BUFFERS];
 
     for cb in &program.cbs {
         let page_size = to_u32(cb.dtype.tile_size(), "circular buffer page size")?;
+        let tiles = to_u32(cb.tiles, "circular buffer tiles")?;
         let size = page_size
-            .checked_mul(to_u32(cb.tiles, "circular buffer tile count")?)
+            .checked_mul(tiles)
             .ok_or_else(|| io::Error::other("circular buffer size overflow"))?;
-        let addr = next_addr;
-        next_addr = next_addr
-            .checked_add(size)
-            .ok_or_else(|| io::Error::other("circular buffer address overflow"))?;
+        let group = cb_allocation_group(cb.index);
+        let addr = match group_addrs[group] {
+            Some(addr) => addr,
+            None => {
+                let addr = next_addr;
+                next_addr = next_addr
+                    .checked_add(group_sizes[group])
+                    .ok_or_else(|| io::Error::other("circular buffer address overflow"))?;
+                group_addrs[group] = Some(addr);
+                addr
+            }
+        };
 
         configs[cb.index] = CircularBufferConfigMsg {
             addr,
             size,
-            tiles: to_u32(cb.tiles, "circular buffer tiles")?,
+            tiles,
             page_size,
         };
     }
 
     Ok((mask, as_bytes(configs.as_slice())))
+}
+
+fn cb_size(cb: &CBConfig) -> io::Result<u32> {
+    to_u32(cb.dtype.tile_size(), "circular buffer page size")?
+        .checked_mul(to_u32(cb.tiles, "circular buffer tile count")?)
+        .ok_or_else(|| io::Error::other("circular buffer size overflow"))
+}
+
+fn cb_allocation_group(index: usize) -> usize {
+    match index {
+        16 | 24 => 16,
+        _ => index,
+    }
 }
 
 fn serialize_launch(layout: LaunchLayout) -> io::Result<Vec<u8>> {
@@ -880,8 +907,9 @@ mod tests {
         );
         assert_eq!(
             read_u32(&blob, 24 * 16),
-            TensixL1::DATA_BUFFER_SPACE_BASE + cb0_size + cb16_size
+            TensixL1::DATA_BUFFER_SPACE_BASE + cb0_size
         );
+        assert_eq!(read_u32(&blob, 24 * 16 + 4), cb16_size);
     }
 
     #[test]

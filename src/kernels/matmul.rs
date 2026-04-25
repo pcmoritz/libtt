@@ -256,9 +256,8 @@ fn fits_l1(
 ) -> bool {
     let cb0 = 2 * per_core_m * in0_block_w * tile_bytes;
     let cb1 = 2 * per_core_n * in0_block_w * tile_bytes;
-    let cb16 = per_core_m * per_core_n * tile_bytes;
-    let cb24 = per_core_m * per_core_n * tile_bytes;
-    cb0 + cb1 + cb16 + cb24 <= l1_data_bytes
+    let cb_out = per_core_m * per_core_n * tile_bytes;
+    cb0 + cb1 + cb_out <= l1_data_bytes
 }
 
 fn divisors(n: usize) -> Vec<usize> {
