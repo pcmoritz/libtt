@@ -30,6 +30,12 @@ const HOST_ISSUE_BASE: usize = 4 * PCIE_ALIGN;
 const HOST_ISSUE_SIZE: usize = 64 * 1024 * 1024;
 const HOST_COMPLETION_BASE: usize = HOST_ISSUE_BASE + HOST_ISSUE_SIZE;
 const HOST_COMPLETION_SIZE: usize = 32 * 1024 * 1024;
+const HOST_TIMESTAMP_BASE: usize = HOST_COMPLETION_BASE + HOST_COMPLETION_SIZE;
+const HOST_TIMESTAMP_STRIDE: usize = 16;
+const HOST_TIMESTAMP_SLOTS: usize = 4096;
+const HOST_TIMESTAMP_SIZE: usize =
+    align_up_usize(HOST_TIMESTAMP_SLOTS * HOST_TIMESTAMP_STRIDE, PCIE_ALIGN);
+const HOST_PROFILER_BASE: usize = HOST_TIMESTAMP_BASE + HOST_TIMESTAMP_SIZE;
 const HOST_CQ_WR_OFF: usize = 2 * PCIE_ALIGN;
 const HOST_CQ_RD_OFF: usize = 3 * PCIE_ALIGN;
 
@@ -237,11 +243,16 @@ struct CqSysmem {
 
 impl CqSysmem {
     fn new(path: &Path, prefetch_core: CoreCoord, dispatch_core: CoreCoord) -> io::Result<Self> {
-        let size = align_up(
-            (HOST_COMPLETION_BASE + HOST_COMPLETION_SIZE) as u64,
-            PAGE_SIZE as u64,
-        ) as usize;
-        let sysmem = PinnedMemory::new(path, size)?;
+        let size = host_sysmem_size();
+        let sysmem = PinnedMemory::new(path, size).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "initialize CQ sysmem failed for {} size=0x{size:x}: {err}",
+                    path.display()
+                ),
+            )
+        })?;
         if (sysmem.noc_addr() & PCIE_NOC_BASE) != PCIE_NOC_BASE {
             return Err(io::Error::other(format!(
                 "bad CQ sysmem NOC address: 0x{:x}",
@@ -385,6 +396,14 @@ impl CqSysmem {
     fn sysmem_write32(&mut self, offset: usize, value: u32) {
         self.sysmem.as_mut_slice()[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
+}
+
+const fn align_up_usize(value: usize, align: usize) -> usize {
+    ((value + align - 1) / align) * align
+}
+
+fn host_sysmem_size() -> usize {
+    align_up(HOST_PROFILER_BASE as u64, PAGE_SIZE as u64) as usize
 }
 
 fn lower_ir(commands: &[DispatchCommand], go_word: u32) -> Vec<CqCommand> {

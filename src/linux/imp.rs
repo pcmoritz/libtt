@@ -18,6 +18,7 @@ const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x01;
 const MAP_ANONYMOUS: c_int = 0x20;
 const MAP_POPULATE: c_int = 0x8000;
+const PAGE_SIZE: usize = 4096;
 const PIN_NOC_DMA: u32 = 2;
 
 unsafe extern "C" {
@@ -249,8 +250,21 @@ impl PinnedMemory {
             .write(true)
             .open(path)
             .map_err(|err| io::Error::new(err.kind(), format!("open {}: {err}", path.display())))?;
-        let mapping = AnonymousMapping::map(size)?;
+        let mapping = AnonymousMapping::map(size).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("map pinned memory size=0x{size:x}: {err}"),
+            )
+        })?;
         let virtual_address = mapping.addr as u64;
+        if virtual_address % PAGE_SIZE as u64 != 0 || size % PAGE_SIZE != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "pinned memory must be page-aligned and page-sized: va=0x{virtual_address:x} size=0x{size:x}"
+                ),
+            ));
+        }
         let mut pin = PinIo {
             input: PinIn {
                 output_size_bytes: size_of::<PinOut>() as u32,
@@ -260,7 +274,15 @@ impl PinnedMemory {
             },
             output: PinOut::default(),
         };
-        ioctl_call(file.as_raw_fd(), TT_IOCTL_PIN_PAGES, &mut pin)?;
+        ioctl_call(file.as_raw_fd(), TT_IOCTL_PIN_PAGES, &mut pin).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "pin NOC DMA pages failed for {}: va=0x{virtual_address:x} size=0x{size:x} flags={PIN_NOC_DMA}: {err}",
+                    path.display()
+                ),
+            )
+        })?;
         let noc_addr = unsafe { ptr::addr_of!(pin.output.noc_address).read_unaligned() };
         Ok(Self {
             file,
@@ -388,7 +410,11 @@ impl AnonymousMapping {
             )
         };
         if addr as isize == -1 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            return Err(io::Error::new(
+                err.kind(),
+                format!("anonymous mmap failed len=0x{len:x}: {err}"),
+            ));
         }
         Ok(Self {
             addr: addr.cast::<u8>(),
