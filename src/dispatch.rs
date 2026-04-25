@@ -115,6 +115,8 @@ pub struct Program {
     pub reader_recv_kernel: String,
     pub writer_recv_kernel: String,
     pub grid: Option<(Vec<u8>, Vec<u8>)>,
+    pub per_core_reader_args: Vec<((u8, u8), Vec<u32>)>,
+    pub per_core_writer_args: Vec<((u8, u8), Vec<u32>)>,
 }
 
 impl Default for Program {
@@ -137,6 +139,8 @@ impl Default for Program {
             reader_recv_kernel: String::new(),
             writer_recv_kernel: String::new(),
             grid: None,
+            per_core_reader_args: Vec::new(),
+            per_core_writer_args: Vec::new(),
         }
     }
 }
@@ -262,7 +266,7 @@ pub(crate) fn build_dispatch_plan(
     );
     let rta_total = rta_sizes.0 + rta_sizes.1 + rta_sizes.2;
     let sem_off = align_up(rta_total as u64, L1_ALIGN as u64) as usize;
-    let rta_blob = pack_rta(
+    let common_rta_blob = pack_rta(
         &program.writer_args,
         &program.reader_args,
         &program.compute_args,
@@ -283,11 +287,42 @@ pub(crate) fn build_dispatch_plan(
         },
     ];
 
-    if !rta_blob.is_empty() {
+    if has_per_core_args(program) {
+        for core in &all_cores {
+            let writer_args = args_for_core(
+                &program.writer_args,
+                &program.per_core_writer_args,
+                *core,
+                "writer",
+            )?;
+            let reader_args = args_for_core(
+                &program.reader_args,
+                &program.per_core_reader_args,
+                *core,
+                "reader",
+            )?;
+            validate_core_arg_len(writer_args, program.writer_args.len(), *core, "writer")?;
+            validate_core_arg_len(reader_args, program.reader_args.len(), *core, "reader")?;
+            let rta_blob = pack_rta(
+                writer_args,
+                reader_args,
+                &program.compute_args,
+                program.semaphores,
+                sem_off,
+            );
+            if !rta_blob.is_empty() {
+                commands.push(DispatchCommand::Write {
+                    cores: vec![*core],
+                    addr: TensixL1::KERNEL_CONFIG_BASE as usize,
+                    data: rta_blob,
+                });
+            }
+        }
+    } else if !common_rta_blob.is_empty() {
         commands.push(DispatchCommand::Write {
             cores: all_cores.clone(),
             addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-            data: rta_blob,
+            data: common_rta_blob,
         });
     }
 
@@ -455,6 +490,47 @@ fn pack_rta(
     }
 
     data
+}
+
+fn has_per_core_args(program: &Program) -> bool {
+    !program.per_core_reader_args.is_empty() || !program.per_core_writer_args.is_empty()
+}
+
+fn args_for_core<'a>(
+    default: &'a [u32],
+    per_core: &'a [((u8, u8), Vec<u32>)],
+    core: CoreCoord,
+    role: &str,
+) -> io::Result<&'a [u32]> {
+    let mut matches = per_core
+        .iter()
+        .filter(|((x, y), _)| *x == core.x && *y == core.y);
+    let args = matches.next().map(|(_, args)| args.as_slice());
+    if matches.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("duplicate per-core {role} args for core {core}"),
+        ));
+    }
+    Ok(args.unwrap_or(default))
+}
+
+fn validate_core_arg_len(
+    args: &[u32],
+    expected: usize,
+    core: CoreCoord,
+    role: &str,
+) -> io::Result<()> {
+    if args.len() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "per-core {role} args for core {core} have length {}, expected {expected}",
+                args.len()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn build_payload(

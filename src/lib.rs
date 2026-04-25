@@ -22,7 +22,7 @@ use dram::{DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
-use std::ffi::{CString, c_char};
+use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
 use std::ptr;
@@ -1394,6 +1394,75 @@ fn execute_executable_v1(
                 values[output_index] = Some(PJRT_Buffer {
                     buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
                     dims: lhs.dims.clone(),
+                    device: execute_device,
+                    memory: target_device.default_memory,
+                    local_hardware_id: target_device.local_hardware_id as usize,
+                    dram_buffer: Some(output_dram),
+                    deleted: false,
+                });
+            }
+            executable::Op::Matmul {
+                input_ids,
+                output_id,
+            } => {
+                let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
+                let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
+                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                {
+                    return Err(unimplemented(
+                        "TT executable matmul currently only supports bf16 buffers",
+                    ));
+                }
+                if lhs.dims.len() != 2 || rhs.dims.len() != 2 {
+                    return Err(unimplemented(
+                        "TT executable matmul currently only supports rank-2 buffers",
+                    ));
+                }
+                if lhs.dims[1] != rhs.dims[0] {
+                    return Err(invalid_argument(format!(
+                        "TT executable matmul shape mismatch: lhs {:?}, rhs {:?}",
+                        lhs.dims, rhs.dims
+                    )));
+                }
+
+                let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable matmul lhs buffer has no device allocation",
+                    ));
+                };
+                let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable matmul rhs buffer has no device allocation",
+                    ));
+                };
+
+                let output_dram =
+                    kernels::matmul::matmul_bf16(&mut device, lhs_dram, rhs_dram, "pjrt_matmul")
+                        .map_err(io_error)?;
+                let output_index = usize::try_from(output_id).map_err(|_| {
+                    invalid_argument("TT executable matmul output id does not fit in usize")
+                })?;
+                let expected = plan.values.get(output_index).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable matmul output id {output_id} is out of bounds"
+                    ))
+                })?;
+                if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+                    return Err(unimplemented(
+                        "TT executable matmul currently only supports bf16 outputs",
+                    ));
+                }
+                let expected_dims = vec![lhs.dims[0], rhs.dims[1]];
+                if expected.dims != expected_dims {
+                    return Err(invalid_argument(format!(
+                        "TT executable matmul output shape mismatch: expected {:?}, got {:?}",
+                        expected_dims, expected.dims
+                    )));
+                }
+                values[output_index] = Some(PJRT_Buffer {
+                    buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+                    dims: expected.dims.clone(),
                     device: execute_device,
                     memory: target_device.default_memory,
                     local_hardware_id: target_device.local_hardware_id as usize,
