@@ -302,12 +302,12 @@ fn plan_split_matmul(
             continue;
         }
         let Ok(west_plan) =
-            plan_matmul_for_cores_with_min_subblock(m, k, west_nt * 32, &west_cores, 2, 2)
+            plan_matmul_for_cores_with_limits(m, k, west_nt * 32, &west_cores, 2, 2, 4)
         else {
             continue;
         };
         let Ok(east_plan) =
-            plan_matmul_for_cores_with_min_subblock(m, k, east_nt * 32, &east_cores, 2, 2)
+            plan_matmul_for_cores_with_limits(m, k, east_nt * 32, &east_cores, 2, 2, 4)
         else {
             continue;
         };
@@ -360,6 +360,26 @@ fn plan_matmul_for_cores_with_min_subblock(
     cores: &[CoreCoord],
     min_out_subblock_num_tiles: usize,
     min_out_subblock_w: usize,
+) -> io::Result<MatmulPlan> {
+    plan_matmul_for_cores_with_limits(
+        m,
+        k,
+        n,
+        cores,
+        min_out_subblock_num_tiles,
+        min_out_subblock_w,
+        usize::MAX,
+    )
+}
+
+fn plan_matmul_for_cores_with_limits(
+    m: usize,
+    k: usize,
+    n: usize,
+    cores: &[CoreCoord],
+    min_out_subblock_num_tiles: usize,
+    min_out_subblock_w: usize,
+    max_in0_block_w: usize,
 ) -> io::Result<MatmulPlan> {
     let mt_base = m / 32;
     let kt = k / 32;
@@ -425,6 +445,7 @@ fn plan_matmul_for_cores_with_min_subblock(
                         }
                         for &in0_block_w in &kt_divs {
                             if in0_block_w > bw_cap
+                                || in0_block_w > max_in0_block_w
                                 || !fits_l1(
                                     per_core_m,
                                     per_core_n,
@@ -907,8 +928,8 @@ mod tests {
         assert!(split.east.plan.cols.iter().all(|&x| x >= 10));
         assert!(!crosses_column_gap(&split.west.plan));
         assert!(!crosses_column_gap(&split.east.plan));
-        assert!(split.west.plan.in0_block_w >= 4);
-        assert!(split.east.plan.in0_block_w >= 4);
+        assert_eq!(split.west.plan.in0_block_w, 4);
+        assert_eq!(split.east.plan.in0_block_w, 4);
     }
 
     #[test]
