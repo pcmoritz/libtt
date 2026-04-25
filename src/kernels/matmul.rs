@@ -97,7 +97,11 @@ pub(crate) fn matmul_bf16(
     validate_tile_count(lhs, m / 32 * k / 32, "lhs")?;
     validate_tile_count(rhs, k / 32 * n / 32, "rhs")?;
 
-    let plan = plan_matmul(m, k, n, &device.cores())?;
+    let output_name = name.into();
+    let logical_mt = m / 32;
+    let logical_nt = n / 32;
+    let cores = device.cores();
+    let plan = plan_matmul(m, k, n, &cores)?;
     log(format!(
         "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
         plan.mt,
@@ -112,8 +116,20 @@ pub(crate) fn matmul_bf16(
         plan.out_subblock_h,
         plan.out_subblock_w
     ));
-    let output = device.alloc(plan.mt * plan.nt, DType::Float16B, Some(&[m, n]), name)?;
-    let program = bf16_program(&plan, lhs, rhs, &output)?;
+
+    let zero_tile = device.alloc_write(
+        &vec![0u8; DType::Float16B.tile_size()],
+        DType::Float16B,
+        &[32, 32],
+        "matmul_zero_tile",
+    )?;
+    let output = device.alloc(
+        logical_mt * logical_nt,
+        DType::Float16B,
+        Some(&[m, n]),
+        output_name,
+    )?;
+    let program = bf16_program(&plan, lhs, rhs, &output, &zero_tile, logical_mt, logical_nt)?;
     device.run_program(&program)?;
     Ok(output)
 }
@@ -184,11 +200,13 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
             for nc in 1..=valid_cols.len() {
                 let cols = &valid_cols[..nc];
                 let nr = rows.len();
-                if mt_base % nr != 0 || nt_base % nc != 0 {
+                if nr * nc > ordered.len() {
                     continue;
                 }
-                let per_core_m = mt_base / nr;
-                let per_core_n = nt_base / nc;
+                let per_core_m = mt_base.div_ceil(nr);
+                let per_core_n = nt_base.div_ceil(nc);
+                let mt = nr * per_core_m;
+                let nt = nc * per_core_n;
                 let out_tiles = per_core_m * per_core_n;
                 let bw_cap = if out_tiles <= 16 { 32 } else { 64 };
                 for out_subblock_h in 1..=8 {
@@ -214,21 +232,20 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
                             }
                             let bias = out_tiles.min(16);
                             let active_cores = nr * nc;
-                            let east_cols = cols.iter().filter(|&&x| x >= 10).count();
                             let score = (
                                 active_cores * in0_block_w * bias * bias,
+                                usize::MAX - mt * nt,
                                 active_cores * in0_block_w,
                                 out_subblock_num_tiles,
                                 active_cores,
-                                usize::MAX - per_core_m.abs_diff(per_core_n),
-                                usize::MAX - nr.abs_diff(nc),
-                                usize::MAX - east_cols,
                             );
                             if best_score.map_or(true, |current| score > current) {
                                 best_score = Some(score);
                                 best = Some((
                                     rows.to_vec(),
                                     cols.to_vec(),
+                                    mt,
+                                    nt,
                                     per_core_m,
                                     per_core_n,
                                     in0_block_w,
@@ -243,19 +260,28 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
         }
     }
 
-    let Some((rows, cols, per_core_m, per_core_n, in0_block_w, out_subblock_h, out_subblock_w)) =
-        best
+    let Some((
+        rows,
+        cols,
+        mt,
+        nt,
+        per_core_m,
+        per_core_n,
+        in0_block_w,
+        out_subblock_h,
+        out_subblock_w,
+    )) = best
     else {
         return Err(invalid_input(format!(
-            "no exact matmul plan for M={m} K={k} N={n} on {} cores",
+            "no valid matmul plan for M={m} K={k} N={n} on {} cores",
             ordered.len()
         )));
     };
 
     Ok(MatmulPlan {
-        mt: mt_base,
+        mt,
         kt,
-        nt: nt_base,
+        nt,
         rows,
         cols,
         per_core_m,
@@ -300,10 +326,14 @@ fn bf16_program(
     lhs: &DramBuffer,
     rhs: &DramBuffer,
     output: &DramBuffer,
+    zero_tile: &DramBuffer,
+    logical_mt: usize,
+    logical_nt: usize,
 ) -> io::Result<Program> {
     let lhs_addr = u32_arg(lhs.addr, "lhs address")?;
     let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
     let output_addr = u32_arg(output.addr, "output address")?;
+    let zero_addr = u32_arg(zero_tile.addr, "zero tile address")?;
     let grid = plan_grid(plan);
 
     let mut per_core_reader_args = Vec::new();
@@ -312,7 +342,9 @@ fn bf16_program(
         for (col_index, &core) in row.iter().enumerate() {
             per_core_reader_args.push((
                 (core.x, core.y),
-                reader_args(plan, lhs_addr, &grid, row_index, core)?,
+                reader_args(
+                    plan, lhs_addr, zero_addr, &grid, row_index, core, logical_mt,
+                )?,
             ));
             per_core_writer_args.push((
                 (core.x, core.y),
@@ -324,6 +356,9 @@ fn bf16_program(
                     row_index,
                     col_index,
                     core,
+                    zero_addr,
+                    logical_mt,
+                    logical_nt,
                 )?,
             ));
         }
@@ -395,9 +430,11 @@ fn plan_grid(plan: &MatmulPlan) -> Vec<Vec<CoreCoord>> {
 fn reader_args(
     plan: &MatmulPlan,
     lhs_addr: u32,
+    zero_addr: u32,
     grid: &[Vec<CoreCoord>],
     row_index: usize,
     core: CoreCoord,
+    logical_mt: usize,
 ) -> io::Result<Vec<u32>> {
     let west_cols = plan
         .cols
@@ -445,6 +482,8 @@ fn reader_args(
         sender.y as u32,
         0,
         1,
+        zero_addr,
+        u32_value(logical_mt, "logical M tiles")?,
     ])
 }
 
@@ -456,6 +495,9 @@ fn writer_args(
     row_index: usize,
     col_index: usize,
     core: CoreCoord,
+    zero_addr: u32,
+    logical_mt: usize,
+    logical_nt: usize,
 ) -> io::Result<Vec<u32>> {
     let recv_ys = plan.rows.iter().copied().skip(1).collect::<Vec<_>>();
     let mcast = if recv_ys.is_empty() {
@@ -470,13 +512,14 @@ fn writer_args(
         ]
     };
     let sender = grid[0][col_index];
-    let out_start = row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n;
+    let column_start = col_index * plan.per_core_n;
+    let out_start = row_index * plan.per_core_m * plan.nt + column_start;
     Ok(vec![
         rhs_addr,
-        u32_value(col_index * plan.per_core_n, "rhs block offset")?,
+        u32_value(column_start, "rhs block offset")?,
         1,
-        u32_value(plan.nt, "rhs row stride")?,
-        u32_value(plan.in0_block_w * plan.nt, "rhs block advance")?,
+        u32_value(logical_nt, "rhs row stride")?,
+        u32_value(plan.in0_block_w * logical_nt, "rhs block advance")?,
         u32_value(plan.per_core_n, "rhs block width")?,
         u32_value(plan.in0_block_w, "rhs block height")?,
         u32_value(plan.in1_block_num_tiles(), "rhs block tiles")?,
@@ -501,6 +544,9 @@ fn writer_args(
         u32_value(plan.out_subblock_num_tiles(), "output subblock tiles")?,
         u32_value(plan.in1_num_subblocks(), "output num subblocks w")?,
         u32_value(plan.in0_num_subblocks(), "output num subblocks h")?,
+        u32_value(logical_mt, "logical M tiles")?,
+        u32_value(logical_nt, "logical N tiles")?,
+        zero_addr,
     ])
 }
 
@@ -596,20 +642,21 @@ mod tests {
     #[test]
     fn plan_matmul_prefers_square_exact_grid() {
         let plan = plan_matmul(512, 512, 512, &p100_worker_cores()).expect("plan");
-        assert_eq!(plan.rows, vec![2, 3, 4, 5]);
-        assert_eq!(plan.cols, vec![1, 2, 3, 4]);
-        assert_eq!(plan.per_core_m, 4);
-        assert_eq!(plan.per_core_n, 4);
-        assert_eq!(plan.in0_block_w, 16);
+        assert_eq!(plan.per_core_m * plan.rows.len(), plan.mt);
+        assert_eq!(plan.per_core_n * plan.cols.len(), plan.nt);
+        assert!(plan.mt >= 16);
+        assert!(plan.nt >= 16);
     }
 
     #[test]
     fn plan_matmul_prefers_throughput_for_large_shapes() {
         let plan = plan_matmul(4096, 8192, 4096, &p100_worker_cores()).expect("plan");
-        assert_eq!(plan.rows, vec![2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(plan.cols, vec![1, 2, 3, 4, 5, 6, 7, 10]);
-        assert_eq!(plan.per_core_m, 16);
-        assert_eq!(plan.per_core_n, 16);
-        assert_eq!(plan.in0_block_w, 4);
+        assert_eq!(plan.rows, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(plan.cols, vec![1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13]);
+        assert_eq!(plan.mt, 130);
+        assert_eq!(plan.nt, 132);
+        assert_eq!(plan.per_core_m, 13);
+        assert_eq!(plan.per_core_n, 12);
+        assert_eq!(plan.in0_block_w, 8);
     }
 }

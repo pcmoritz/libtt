@@ -1,5 +1,5 @@
-use crate::device::{Device, load_device};
-use crate::hw::{CoreCoord, Dram, DramTile, align_up};
+use crate::device::{load_device, Device};
+use crate::hw::{align_up, CoreCoord, Dram, DramTile};
 use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::HashMap;
 use std::io;

@@ -19,6 +19,8 @@ void kernel_main() {
   const uint32_t out_sb_tiles = A(26);
   const uint32_t out_num_sb_w = A(27);
   const uint32_t out_num_sb_h = A(28);
+  const uint32_t logical_mt = A(29);
+  const uint32_t logical_nt = A(30);
   volatile tt_l1_ptr uint32_t *recv_sem = SEM(17);
 
   const InterleavedAddrGenFast<true> out_gen = {
@@ -35,6 +37,7 @@ void kernel_main() {
     cb_push_back(cb_in1, block_tiles);
   }
 
+  const uint32_t padded_nt = out_next_sb_h / out_sb_h;
   uint32_t sbh_start = out_start;
   for (uint32_t sbh = 0; sbh < out_num_sb_h; sbh++) {
     uint32_t sbw_start = sbh_start;
@@ -45,7 +48,11 @@ void kernel_main() {
       for (uint32_t h = 0; h < out_sb_h; h++) {
         uint32_t tile_id = row_start;
         for (uint32_t w = 0; w < out_sb_w; w++) {
-          noc_async_write_tile(tile_id, out_gen, l1_addr);
+          const uint32_t out_row = tile_id / padded_nt;
+          const uint32_t out_col = tile_id - out_row * padded_nt;
+          if (out_row < logical_mt && out_col < logical_nt) {
+            noc_async_write_tile(out_row * logical_nt + out_col, out_gen, l1_addr);
+          }
           l1_addr += tile_bytes;
           tile_id += out_stride_w;
         }
