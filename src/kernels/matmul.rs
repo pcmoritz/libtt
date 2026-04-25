@@ -327,10 +327,26 @@ fn bf16_program(
         reader_recv_kernel: BF16_READER_RECV.to_owned(),
         writer_recv_kernel: BF16_WRITER_RECV.to_owned(),
         cbs: vec![
-            cb_config(0, DType::Float16B, plan.cb0_pages()),
-            cb_config(1, DType::Float16B, plan.cb1_pages()),
-            cb_config(16, DType::Float16B, plan.out_block_num_tiles()),
-            cb_config(24, DType::Float16B, plan.out_block_num_tiles()),
+            CBConfig {
+                index: 0,
+                dtype: DType::Float16B,
+                tiles: plan.cb0_pages(),
+            },
+            CBConfig {
+                index: 1,
+                dtype: DType::Float16B,
+                tiles: plan.cb1_pages(),
+            },
+            CBConfig {
+                index: 16,
+                dtype: DType::Float16B,
+                tiles: plan.out_block_num_tiles(),
+            },
+            CBConfig {
+                index: 24,
+                dtype: DType::Float16B,
+                tiles: plan.out_block_num_tiles(),
+            },
         ],
         name: format!(
             "matmul_bf16_{}x{}x{}",
@@ -348,14 +364,6 @@ fn bf16_program(
         per_core_writer_args,
         ..Program::default()
     })
-}
-
-fn cb_config(index: usize, dtype: DType, tiles: usize) -> CBConfig {
-    CBConfig {
-        index,
-        dtype,
-        tiles,
-    }
 }
 
 fn plan_grid(plan: &MatmulPlan) -> Vec<Vec<CoreCoord>> {
