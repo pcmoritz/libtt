@@ -53,14 +53,74 @@ let roundtrip = device.dram_read(&buffer)?;
 assert_eq!(roundtrip, data);
 ```
 
+## Slow Dispatch
+
+The crate now includes a slow-dispatch path modeled on `blackhole-py`'s
+`dispatch.py`. `Device::run_program(...)` compiles the requested dataflow and
+compute kernels, stages the launch payload into worker-core L1, sends the
+firmware `GO` message, and waits until the selected cores report completion.
+
+Example:
+
+```rust
+use libtt::compiler::{CoreSelection, Program};
+use libtt::device::Device;
+
+let mut device = Device::open(0)?;
+let program = Program {
+    cores: CoreSelection::Count(1),
+    writer_kernel: r#"
+void kernel_main() {
+}
+"#
+    .to_owned(),
+    ..Program::default()
+};
+device.run_program(&program)?;
+```
+
+This path still depends on the Blackhole firmware/toolchain assets under
+`tt-metal-deps/`, just like the existing compiler support.
+
 ## Build
 
 ```bash
-cargo build --release
+bazel build //:tt
 ```
 
-On Linux the shared library will be written to `target/release/libtt.so`. On
-macOS the corresponding artifact is `target/release/libtt.dylib`.
+This produces a single shared library containing the Rust PJRT implementation
+and, for the Bazel `//:tt` target, the C++ MLIR frontend as well.
+
+On Linux the output is `libtt.so`; on macOS it is `libtt.dylib`.
+
+The default Rust unit tests run with:
+
+```bash
+bazel test //:tt_test
+```
+
+## Optional MLIR Frontend
+
+The PJRT layer can analyze StableHLO/MLIR programs through a C++ frontend while
+keeping the Rust PJRT interface and TT runtime unchanged.
+
+The Bazel build now pulls the pinned StableHLO and LLVM/MLIR sources into the
+Bazel dependency graph directly. It does not depend on the full `xla` Bazel
+module.
+
+The easiest path is:
+
+```bash
+bazel build //:tt
+```
+
+The current lowering is still intentionally small, but StableHLO parsing,
+bytecode deserialization, and MLIR pass plumbing live on the C++ side rather
+than as Rust string matching.
+
+The first Bazel build is expected to download and analyze a large upstream
+dependency graph because LLVM/MLIR and StableHLO are now built through Bazel
+instead of a preinstalled local prefix.
 
 ## Regenerating PJRT Bindings
 
@@ -79,12 +139,12 @@ cargo run --manifest-path xtask/Cargo.toml -- update-pjrt-bindings
 
 Notes:
 
-- This uses the standalone `xtask` helper crate, so the main crate does not
-  depend on `bindgen`.
+- This uses the standalone `xtask` helper crate, so the library build does not
+  depend on Cargo or `bindgen`.
 - The regeneration helper has its own lockfile at `xtask/Cargo.lock`.
 - You will need a working `libclang`/`clang` installation for `bindgen`.
 - After regenerating, review the diff in `src/pjrt_bindings.rs` and run
-  `cargo test`.
+  `bazel test //:tt_test //:tt_mlir_test`.
 
 ## Using It
 

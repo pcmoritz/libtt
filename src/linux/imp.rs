@@ -96,22 +96,16 @@ pub(crate) struct TlbWindow {
 }
 
 impl TlbWindow {
-    pub(crate) fn open(
-        path: &Path,
-        start: CoreCoord,
-        addr: u64,
-        size: u64,
-        wc: bool,
-    ) -> io::Result<Self> {
+    pub(crate) fn open(path: &Path, size: u64, wc: bool) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(|err| io::Error::new(err.kind(), format!("open {}: {err}", path.display())))?;
-        Self::new(file, start, addr, size, wc)
+        Self::new(file, size, wc)
     }
 
-    fn new(file: File, start: CoreCoord, addr: u64, size: u64, wc: bool) -> io::Result<Self> {
+    fn new(file: File, size: u64, wc: bool) -> io::Result<Self> {
         let len = usize::try_from(size)
             .map_err(|_| io::Error::other(format!("TLB size {size} does not fit in usize")))?;
 
@@ -134,7 +128,6 @@ impl TlbWindow {
             mapping: None,
         };
         window.mapping = Some(MappedRegion::map(window.file.as_raw_fd(), len, offset)?);
-        window.target(start, None, addr, NocOrdering::Strict)?;
         Ok(window)
     }
 

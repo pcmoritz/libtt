@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package tt;
+
+option optimize_for = LITE_RUNTIME;
+
+message TensorDesc {
+  enum ElementType {
+    ELEMENT_TYPE_UNKNOWN = 0;
+    ELEMENT_TYPE_BF16 = 1;
+    ELEMENT_TYPE_F16 = 2;
+    ELEMENT_TYPE_F32 = 3;
+    ELEMENT_TYPE_U32 = 4;
+    ELEMENT_TYPE_U16 = 5;
+    ELEMENT_TYPE_U8 = 6;
+    ELEMENT_TYPE_S32 = 7;
+    ELEMENT_TYPE_S8 = 8;
+  }
+
+  repeated int64 dims = 1;
+  ElementType element_type = 2;
+}
+
+message ValueDesc {
+  TensorDesc tensor = 1;
+}
+
+message ParameterOp {
+  // Zero-based entry-function argument index bound to Op.output_id.
+  uint32 parameter_index = 1;
+}
+
+message AddOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+}
+
+message Op {
+  // Index into Executable.values for the value produced by this op.
+  uint32 output_id = 1;
+
+  oneof kind {
+    ParameterOp parameter = 2;
+    AddOp add = 3;
+  }
+}
+
+message Executable {
+  repeated ValueDesc values = 1;
+  repeated Op ops = 2;
+  // Indices into values for the program results, in entry-function result
+  // order. The current lowering emits exactly one output.
+  repeated uint32 output_ids = 3;
+}
+
+message AnalysisResult {
+  enum Status {
+    STATUS_UNKNOWN = 0;
+    STATUS_OK = 1;
+    STATUS_PARSE_ERROR = 2;
+    STATUS_UNSUPPORTED = 3;
+    STATUS_INTERNAL_ERROR = 4;
+  }
+
+  Status status = 1;
+  string error_message = 2;
+
+  // Entry-function argument/result metadata, in signature order.
+  repeated TensorDesc inputs = 3;
+  repeated TensorDesc outputs = 4;
+
+  // Lowered executable payload. Present when status == STATUS_OK.
+  Executable executable = 5;
+}

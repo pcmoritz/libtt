@@ -1,4 +1,4 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct CoreCoord {
     pub(crate) x: u8,
     pub(crate) y: u8,
@@ -32,6 +32,34 @@ impl Arc {
     pub(crate) fn active_tensix_core_count(enabled_col_mask: u32) -> usize {
         (enabled_col_mask & Self::DEFAULT_TENSIX_ENABLED).count_ones() as usize * 10
     }
+}
+
+pub(crate) struct TensixMMIO;
+
+impl TensixMMIO {
+    pub(crate) const LOCAL_RAM_START: u32 = 0xFFB00000;
+    pub(crate) const LOCAL_RAM_END: u32 = 0xFFB01FFF;
+    pub(crate) const RISCV_DEBUG_REG_SOFT_RESET_0: u64 = 0xFFB121B0;
+    pub(crate) const RISCV_DEBUG_REG_TRISC0_RESET_PC: u64 = 0xFFB12228;
+    pub(crate) const RISCV_DEBUG_REG_TRISC1_RESET_PC: u64 = 0xFFB1222C;
+    pub(crate) const RISCV_DEBUG_REG_TRISC2_RESET_PC: u64 = 0xFFB12230;
+    pub(crate) const RISCV_DEBUG_REG_NCRISC_RESET_PC: u64 = 0xFFB12238;
+    pub(crate) const SOFT_RESET_ALL: u32 = 0x47800;
+    pub(crate) const SOFT_RESET_BRISC_ONLY_RUN: u32 = 0x47000;
+}
+
+pub(crate) struct TensixL1;
+
+impl TensixL1 {
+    pub(crate) const SIZE: u32 = 0x180000;
+    pub(crate) const LAUNCH: u32 = 0x000070; // mailbox_base(0x60) + 0x10
+    pub(crate) const GO_MSG: u32 = 0x000370; // mailbox_base + 0x310
+    pub(crate) const GO_MSG_INDEX: u32 = 0x0003A0; // mailbox_base + 0x340
+    pub(crate) const KERNEL_CONFIG_BASE: u32 = 0x0086B0;
+    pub(crate) const BRISC_FIRMWARE_BASE: u32 = 0x003840;
+    pub(crate) const DATA_BUFFER_SPACE_BASE: u32 = 0x037000;
+    pub(crate) const PROFILER_HOST_BUFFER_BYTES_PER_RISC: u32 = 65536;
+    pub(crate) const MEM_BANK_TO_NOC_SCRATCH: u32 = 0x0116B0;
 }
 
 pub(crate) struct Dram;

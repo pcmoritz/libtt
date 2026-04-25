@@ -1,8 +1,10 @@
 use crate::device::{Device, load_device};
 use crate::hw::{CoreCoord, Dram, DramTile, align_up};
 use crate::linux::{NocOrdering, TlbWindow};
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 const TILE_R: usize = 32;
 const TILE_C: usize = 32;
@@ -58,13 +60,16 @@ impl DramBuffer {
 pub struct Allocator {
     window: TlbWindow,
     bank_tiles: Vec<DramTile>,
+    local_hardware_id: usize,
     next: u64,
     bank_count: usize,
 }
 
+static ALLOCATOR_NEXT_BY_DEVICE: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
+
 impl Allocator {
     pub fn open(local_hardware_id: usize) -> io::Result<Self> {
-        let (path, info) = load_device(local_hardware_id);
+        let (path, info) = load_device(local_hardware_id)?;
         Self::from_device_with_path(path, &info)
     }
 
@@ -87,20 +92,22 @@ impl Allocator {
             .copied()
             .ok_or_else(|| io::Error::other("no active DRAM bank tiles discovered"))?;
         let bank_count = bank_tiles.len();
-        let window = TlbWindow::open(
-            path.as_path(),
+        let mut window = TlbWindow::open(path.as_path(), Dram::TLB_SIZE_4G, true)?;
+        window.target(
             CoreCoord {
                 x: first.x,
                 y: first.y,
             },
+            None,
             0,
-            Dram::TLB_SIZE_4G,
-            true,
+            NocOrdering::Strict,
         )?;
+        let next = allocator_next(device.local_hardware_id);
         Ok(Self {
             window,
             bank_tiles,
-            next: Dram::WRITE_OFFSET,
+            local_hardware_id: device.local_hardware_id,
+            next,
             bank_count,
         })
     }
@@ -114,6 +121,7 @@ impl Allocator {
     ) -> io::Result<DramBuffer> {
         let (addr, next) = next_allocation_range(self.next, num_tiles, dtype, self.bank_count)?;
         self.next = next;
+        set_allocator_next(self.local_hardware_id, next);
         Ok(DramBuffer {
             name: name.into(),
             addr,
@@ -258,6 +266,18 @@ impl Allocator {
     }
 }
 
+fn allocator_next(local_hardware_id: usize) -> u64 {
+    let state = ALLOCATOR_NEXT_BY_DEVICE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut state = state.lock().expect("allocator state lock poisoned");
+    *state.entry(local_hardware_id).or_insert(Dram::WRITE_OFFSET)
+}
+
+fn set_allocator_next(local_hardware_id: usize, next: u64) {
+    let state = ALLOCATOR_NEXT_BY_DEVICE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut state = state.lock().expect("allocator state lock poisoned");
+    state.insert(local_hardware_id, next);
+}
+
 pub(crate) fn tilize(data: &[u8], dtype: DType, shape: &[usize]) -> io::Result<Vec<u8>> {
     let Layout {
         batch,
@@ -376,6 +396,7 @@ fn scatter_bank_data(
     }
 }
 
+#[allow(clippy::manual_is_multiple_of)]
 fn validate_tile_multiple(len: usize, dtype: DType) -> io::Result<()> {
     if len % dtype.tile_size() == 0 {
         Ok(())
@@ -446,6 +467,7 @@ impl Layout {
     }
 }
 
+#[allow(clippy::manual_is_multiple_of)]
 fn validate_tiled_shape(
     data: &[u8],
     dtype: DType,

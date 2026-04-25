@@ -1,0 +1,123 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library")
+load("@rules_rust//rust:defs.bzl", "rust_library_group", "rust_static_library", "rust_test")
+load("@rules_rust_prost//:defs.bzl", "rust_prost_library", "rust_prost_toolchain")
+load("@com_google_protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
+load("@com_google_protobuf//bazel:proto_library.bzl", "proto_library")
+
+package(default_visibility = ["//visibility:public"])
+
+RUST_SRCS = glob(
+    ["src/**/*.rs"],
+)
+
+KERNEL_SRCS = glob(
+    ["kernels/**/*.cc"],
+)
+
+rust_static_library(
+    name = "tt_rust",
+    compile_data = KERNEL_SRCS,
+    srcs = RUST_SRCS,
+    crate_name = "tt",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.1.0",
+)
+
+rust_static_library(
+    name = "tt_rust_mlir",
+    compile_data = KERNEL_SRCS,
+    srcs = RUST_SRCS,
+    crate_name = "tt_mlir",
+    crate_root = "src/lib.rs",
+    deps = [
+        ":executable_rust",
+        "@prost_crates//:prost",
+    ],
+    edition = "2024",
+    rustc_flags = ["--cfg=libtt_mlir_frontend"],
+    version = "0.1.0",
+)
+
+rust_test(
+    name = "tt_test",
+    crate = ":tt_rust",
+)
+
+rust_test(
+    name = "tt_mlir_test",
+    crate = ":tt_rust_mlir",
+)
+
+proto_library(
+    name = "executable_proto",
+    srcs = ["mlir/executable.proto"],
+)
+
+cc_proto_library(
+    name = "executable_cc_proto",
+    deps = [":executable_proto"],
+)
+
+rust_library_group(
+    name = "prost_runtime",
+    deps = ["@prost_crates//:prost"],
+)
+
+rust_prost_toolchain(
+    name = "prost_toolchain_impl",
+    prost_plugin = "@prost_crates//:protoc-gen-prost__protoc-gen-prost",
+    prost_runtime = ":prost_runtime",
+    prost_types = "@prost_crates//:prost-types",
+    tonic_plugin_flag = "",
+)
+
+toolchain(
+    name = "prost_toolchain",
+    toolchain = ":prost_toolchain_impl",
+    toolchain_type = "@rules_rust_prost//:toolchain_type",
+)
+
+rust_prost_library(
+    name = "executable_rust",
+    proto = ":executable_proto",
+)
+
+cc_library(
+    name = "mlir_frontend",
+    srcs = ["mlir/mlir_frontend.cc"],
+    copts = ["-std=c++17"],
+    deps = [
+        ":executable_cc_proto",
+        "@com_google_protobuf//:protobuf_lite",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FuncExtensions",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Parser",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:Transforms",
+        "@stablehlo//:chlo_ops",
+        "@stablehlo//:stablehlo_ops",
+        "@stablehlo//:stablehlo_serialization",
+        "@stablehlo//:vhlo_ops",
+    ],
+)
+
+cc_shared_library(
+    name = "tt_shared",
+    deps = [
+        ":mlir_frontend",
+        ":tt_rust_mlir",
+    ],
+    shared_lib_name = select({
+        "@platforms//os:macos": "libtt.dylib",
+        "//conditions:default": "libtt.so",
+    }),
+)
+
+alias(
+    name = "tt",
+    actual = ":tt_shared",
+)
