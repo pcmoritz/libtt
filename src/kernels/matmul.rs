@@ -13,7 +13,6 @@ const BF16_WRITER_SENDER: &str = include_str!("../../kernels/matmul_writer_sende
 const BF16_WRITER_RECV: &str = include_str!("../../kernels/matmul_writer_recv.cc");
 const BF16_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
-const SPLIT_N_STEP_TILES: usize = 8;
 
 static ZERO_TILE_BY_DEVICE: OnceLock<Mutex<HashMap<usize, DramBuffer>>> = OnceLock::new();
 
@@ -29,19 +28,6 @@ struct MatmulPlan {
     in0_block_w: usize,
     out_subblock_h: usize,
     out_subblock_w: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct MatmulChunkPlan {
-    plan: MatmulPlan,
-    col_offset_tiles: usize,
-    logical_nt: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SplitMatmulPlan {
-    west: MatmulChunkPlan,
-    east: MatmulChunkPlan,
 }
 
 impl MatmulPlan {
@@ -218,86 +204,6 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
     Ok(plan)
 }
 
-fn plan_split_matmul(
-    m: usize,
-    k: usize,
-    n: usize,
-    cores: &[CoreCoord],
-) -> io::Result<Option<SplitMatmulPlan>> {
-    let full_plan = plan_matmul_for_cores(m, k, n, cores)?;
-    if !crosses_column_gap(&full_plan) {
-        return Ok(None);
-    }
-
-    let logical_nt = n / 32;
-    if logical_nt < 2 * SPLIT_N_STEP_TILES {
-        return Ok(None);
-    }
-
-    let west_cores = cores
-        .iter()
-        .copied()
-        .filter(|core| core.x < 7)
-        .collect::<Vec<_>>();
-    let east_cores = cores
-        .iter()
-        .copied()
-        .filter(|core| core.x >= 10)
-        .collect::<Vec<_>>();
-    if west_cores.is_empty() || east_cores.is_empty() {
-        return Ok(None);
-    }
-
-    let mut best = None;
-    let mut best_score = f64::INFINITY;
-    for west_nt in (SPLIT_N_STEP_TILES..logical_nt).step_by(SPLIT_N_STEP_TILES) {
-        let east_nt = logical_nt - west_nt;
-        if east_nt < SPLIT_N_STEP_TILES {
-            continue;
-        }
-        let Ok(west_plan) =
-            plan_matmul_for_cores_with_limits(m, k, west_nt * 32, &west_cores, 2, 2, 4)
-        else {
-            continue;
-        };
-        let Ok(east_plan) =
-            plan_matmul_for_cores_with_limits(m, k, east_nt * 32, &east_cores, 2, 2, 4)
-        else {
-            continue;
-        };
-        if crosses_column_gap(&west_plan) || crosses_column_gap(&east_plan) {
-            continue;
-        }
-
-        let score = chunk_time_score(west_nt, &west_plan) + chunk_time_score(east_nt, &east_plan);
-        if score < best_score {
-            best_score = score;
-            best = Some(SplitMatmulPlan {
-                west: MatmulChunkPlan {
-                    plan: west_plan,
-                    col_offset_tiles: 0,
-                    logical_nt: west_nt,
-                },
-                east: MatmulChunkPlan {
-                    plan: east_plan,
-                    col_offset_tiles: west_nt,
-                    logical_nt: east_nt,
-                },
-            });
-        }
-    }
-
-    Ok(best)
-}
-
-fn chunk_time_score(logical_nt: usize, plan: &MatmulPlan) -> f64 {
-    let active_cores = plan.rows.len() * plan.cols.len();
-    let out_tiles = plan.per_core_m * plan.per_core_n;
-    let bias = out_tiles.min(16);
-    let throughput = active_cores * plan.in0_block_w * bias * bias;
-    logical_nt as f64 / throughput as f64
-}
-
 fn plan_matmul_for_cores(
     m: usize,
     k: usize,
@@ -314,26 +220,6 @@ fn plan_matmul_for_cores_with_min_subblock(
     cores: &[CoreCoord],
     min_out_subblock_num_tiles: usize,
     min_out_subblock_w: usize,
-) -> io::Result<MatmulPlan> {
-    plan_matmul_for_cores_with_limits(
-        m,
-        k,
-        n,
-        cores,
-        min_out_subblock_num_tiles,
-        min_out_subblock_w,
-        usize::MAX,
-    )
-}
-
-fn plan_matmul_for_cores_with_limits(
-    m: usize,
-    k: usize,
-    n: usize,
-    cores: &[CoreCoord],
-    min_out_subblock_num_tiles: usize,
-    min_out_subblock_w: usize,
-    max_in0_block_w: usize,
 ) -> io::Result<MatmulPlan> {
     let mt_base = m / 32;
     let kt = k / 32;
@@ -399,7 +285,6 @@ fn plan_matmul_for_cores_with_limits(
                         }
                         for &in0_block_w in &kt_divs {
                             if in0_block_w > bw_cap
-                                || in0_block_w > max_in0_block_w
                                 || !fits_l1(
                                     per_core_m,
                                     per_core_n,
@@ -868,22 +753,6 @@ mod tests {
         assert_eq!(plan.in0_block_w, 4);
         assert_eq!(plan.out_subblock_h, 1);
         assert_eq!(plan.out_subblock_w, 2);
-    }
-
-    #[test]
-    fn split_planner_uses_both_sides_without_cross_gap_multicast() {
-        let split = plan_split_matmul(4096, 8192, 4096, &p100_worker_cores()).expect("split plan");
-        let split = split.expect("large p100 matmul should split across the column gap");
-
-        assert_eq!(split.west.col_offset_tiles, 0);
-        assert_eq!(split.east.col_offset_tiles, split.west.logical_nt);
-        assert_eq!(split.west.logical_nt + split.east.logical_nt, 128);
-        assert!(split.west.plan.cols.iter().all(|&x| x < 7));
-        assert!(split.east.plan.cols.iter().all(|&x| x >= 10));
-        assert!(!crosses_column_gap(&split.west.plan));
-        assert!(!crosses_column_gap(&split.east.plan));
-        assert_eq!(split.west.plan.in0_block_w, 4);
-        assert_eq!(split.east.plan.in0_block_w, 4);
     }
 
     #[test]
