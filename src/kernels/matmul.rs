@@ -158,6 +158,33 @@ fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::
 }
 
 fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
+    let plan = plan_matmul_for_cores(m, k, n, cores)?;
+    if crosses_column_gap(&plan) {
+        let west_cores = cores
+            .iter()
+            .copied()
+            .filter(|core| core.x < 8)
+            .collect::<Vec<_>>();
+        if let Ok(west_plan) = plan_matmul_for_cores(m, k, n, &west_cores) {
+            log(format!(
+                "matmul_bf16 avoiding cross-gap multicast: full grid={}x{} fallback grid={}x{}",
+                plan.rows.len(),
+                plan.cols.len(),
+                west_plan.rows.len(),
+                west_plan.cols.len()
+            ));
+            return Ok(west_plan);
+        }
+    }
+    Ok(plan)
+}
+
+fn plan_matmul_for_cores(
+    m: usize,
+    k: usize,
+    n: usize,
+    cores: &[CoreCoord],
+) -> io::Result<MatmulPlan> {
     let mt_base = m / 32;
     let kt = k / 32;
     let nt_base = n / 32;
@@ -290,6 +317,10 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
         out_subblock_h,
         out_subblock_w,
     })
+}
+
+fn crosses_column_gap(plan: &MatmulPlan) -> bool {
+    plan.cols.iter().any(|&x| x < 8) && plan.cols.iter().any(|&x| x >= 10)
 }
 
 fn fits_l1(
@@ -651,6 +682,19 @@ mod tests {
     #[test]
     fn plan_matmul_prefers_throughput_for_large_shapes() {
         let plan = plan_matmul(4096, 8192, 4096, &p100_worker_cores()).expect("plan");
+        assert!(!crosses_column_gap(&plan));
+        assert_eq!(plan.rows, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(plan.cols, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(plan.mt, 130);
+        assert_eq!(plan.nt, 133);
+        assert_eq!(plan.per_core_m, 13);
+        assert_eq!(plan.per_core_n, 19);
+        assert_eq!(plan.in0_block_w, 4);
+    }
+
+    #[test]
+    fn unrestricted_planner_matches_blackhole_large_shape() {
+        let plan = plan_matmul_for_cores(4096, 8192, 4096, &p100_worker_cores()).expect("plan");
         assert_eq!(plan.rows, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         assert_eq!(plan.cols, vec![1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13]);
         assert_eq!(plan.mt, 130);
