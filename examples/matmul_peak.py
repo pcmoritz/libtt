@@ -10,9 +10,9 @@ import numpy as np
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run a bf16 JAX matmul on libtt and report TFLOP/s.")
-    parser.add_argument("--m", type=int, default=1024)
-    parser.add_argument("--k", type=int, default=1024)
-    parser.add_argument("--n", type=int, default=1024)
+    parser.add_argument("--m", type=int, default=512)
+    parser.add_argument("--k", type=int, default=512)
+    parser.add_argument("--n", type=int, default=512)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--validate", action=argparse.BooleanOptionalAction, default=True)
@@ -62,10 +62,14 @@ def main():
     ops = 2 * args.m * args.k * args.n
     best = min(times)
     median = statistics.median(times)
+    peak_tflops = ops / best / 1e12
+    median_tflops = ops / median / 1e12
     print(f"best_ms: {best * 1e3:.3f}")
     print(f"median_ms: {median * 1e3:.3f}")
-    print(f"peak_tflops: {ops / best / 1e12:.3f}")
-    print(f"median_tflops: {ops / median / 1e12:.3f}")
+    print(f"peak_tflops: {peak_tflops:.6f}")
+    print(f"median_tflops: {median_tflops:.6f}")
+    print(f"peak_gflops: {peak_tflops * 1e3:.3f}")
+    print(f"median_gflops: {median_tflops * 1e3:.3f}")
 
 
 if __name__ == "__main__":
