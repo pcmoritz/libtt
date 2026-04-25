@@ -2,6 +2,7 @@ use crate::device::Device;
 use crate::dispatch::{CBConfig, CoreSelection, MathFidelity, Program};
 use crate::dram::{DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
+use crate::log::log;
 use std::io;
 
 const BF16_READER_SENDER: &str = include_str!("../../kernels/matmul_reader_sender.cc");
@@ -97,6 +98,20 @@ pub(crate) fn matmul_bf16(
     validate_tile_count(rhs, k / 32 * n / 32, "rhs")?;
 
     let plan = plan_matmul(m, k, n, &device.cores())?;
+    log(format!(
+        "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
+        plan.mt,
+        plan.kt,
+        plan.nt,
+        plan.rows.len(),
+        plan.cols.len(),
+        plan.per_core_m,
+        plan.per_core_n,
+        plan.in0_block_w,
+        plan.num_blocks(),
+        plan.out_subblock_h,
+        plan.out_subblock_w
+    ));
     let output = device.alloc(plan.mt * plan.nt, DType::Float16B, Some(&[m, n]), name)?;
     let program = bf16_program(&plan, lhs, rhs, &output)?;
     device.run_program(&program)?;
@@ -199,11 +214,15 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
                             }
                             let bias = out_tiles.min(16);
                             let active_cores = nr * nc;
+                            let east_cols = cols.iter().filter(|&&x| x >= 10).count();
                             let score = (
                                 active_cores * in0_block_w * bias * bias,
                                 active_cores * in0_block_w,
                                 out_subblock_num_tiles,
                                 active_cores,
+                                usize::MAX - per_core_m.abs_diff(per_core_n),
+                                usize::MAX - nr.abs_diff(nc),
+                                usize::MAX - east_cols,
                             );
                             if best_score.map_or(true, |current| score > current) {
                                 best_score = Some(score);
@@ -545,6 +564,17 @@ mod tests {
             .collect()
     }
 
+    fn p100_worker_cores() -> Vec<CoreCoord> {
+        cores(
+            &[1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14],
+            &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        )
+        .into_iter()
+        .filter(|core| *core != CoreCoord { x: 14, y: 2 })
+        .filter(|core| *core != CoreCoord { x: 14, y: 3 })
+        .collect()
+    }
+
     #[test]
     fn plan_matmul_uses_exact_tiling() {
         let plan = plan_matmul(64, 64, 64, &cores(&[1, 2], &[2, 3])).expect("plan");
@@ -561,5 +591,15 @@ mod tests {
         let source = compute_src(&plan);
         assert!(source.contains("constexpr uint32_t in0_block_w = 2;"));
         assert!(source.contains("#include \"compute_kernel_api/matmul.h\""));
+    }
+
+    #[test]
+    fn plan_matmul_prefers_square_exact_grid() {
+        let plan = plan_matmul(512, 512, 512, &p100_worker_cores()).expect("plan");
+        assert_eq!(plan.rows, vec![2, 3, 4, 5]);
+        assert_eq!(plan.cols, vec![1, 2, 3, 4]);
+        assert_eq!(plan.per_core_m, 4);
+        assert_eq!(plan.per_core_n, 4);
+        assert_eq!(plan.in0_block_w, 16);
     }
 }
