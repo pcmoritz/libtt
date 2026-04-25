@@ -16,9 +16,11 @@ const TT_IOCTL_UNPIN_PAGES: c_ulong = TT_IOCTL_BASE | 10;
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x01;
-const MAP_PRIVATE: c_int = 0x02;
 const MAP_ANONYMOUS: c_int = 0x20;
+const MAP_HUGETLB: c_int = 0x40000;
+const MAP_HUGE_1GB: c_int = 30 << 26;
 const PAGE_SIZE: usize = 4096;
+const HUGE_PAGE_SIZE: usize = 1 << 30;
 const PIN_NOC_DMA: u32 = 2;
 
 unsafe extern "C" {
@@ -399,12 +401,15 @@ struct AnonymousMapping {
 
 impl AnonymousMapping {
     fn map(len: usize) -> io::Result<Self> {
+        let alloc_len = len.checked_add(HUGE_PAGE_SIZE - 1).ok_or_else(|| {
+            io::Error::other(format!("hugepage mmap length overflow: len=0x{len:x}"))
+        })? & !(HUGE_PAGE_SIZE - 1);
         let addr = unsafe {
             mmap(
                 ptr::null_mut(),
-                len,
+                alloc_len,
                 PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS,
+                MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB,
                 -1,
                 0,
             )
@@ -413,12 +418,12 @@ impl AnonymousMapping {
             let err = io::Error::last_os_error();
             return Err(io::Error::new(
                 err.kind(),
-                format!("anonymous mmap failed len=0x{len:x}: {err}"),
+                format!("1GB hugepage mmap failed len=0x{len:x} alloc_len=0x{alloc_len:x}: {err}"),
             ));
         }
         Ok(Self {
             addr: addr.cast::<u8>(),
-            len,
+            len: alloc_len,
         })
     }
 
