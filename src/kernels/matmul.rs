@@ -283,7 +283,7 @@ fn plan_split_matmul(
     let west_cores = cores
         .iter()
         .copied()
-        .filter(|core| core.x < 8)
+        .filter(|core| core.x < 7)
         .collect::<Vec<_>>();
     let east_cores = cores
         .iter()
@@ -903,7 +903,7 @@ mod tests {
         assert_eq!(split.west.col_offset_tiles, 0);
         assert_eq!(split.east.col_offset_tiles, split.west.logical_nt);
         assert_eq!(split.west.logical_nt + split.east.logical_nt, 128);
-        assert!(split.west.plan.cols.iter().all(|&x| x < 8));
+        assert!(split.west.plan.cols.iter().all(|&x| x < 7));
         assert!(split.east.plan.cols.iter().all(|&x| x >= 10));
         assert!(!crosses_column_gap(&split.west.plan));
         assert!(!crosses_column_gap(&split.east.plan));
