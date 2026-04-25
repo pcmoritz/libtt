@@ -322,8 +322,28 @@ impl Compiler {
             format!("-DNOC_INDEX={noc_index}"),
             "-DNOC_MODE=0".to_owned(),
         ];
+        let extra_objs = if target == "brisc" {
+            vec![
+                deps_root()
+                    .join("lib")
+                    .join("blackhole")
+                    .join("noc.o")
+                    .display()
+                    .to_string(),
+            ]
+        } else {
+            Vec::new()
+        };
         let program = Program::default();
-        self.compile_kernel(src, target, target_defines, "-O2", false, &program)
+        self.compile_kernel(
+            src,
+            target,
+            target_defines,
+            &extra_objs,
+            "-O2",
+            false,
+            &program,
+        )
     }
 
     pub fn compile_compute(
@@ -355,6 +375,7 @@ impl Compiler {
                 format!("-DUCK_CHLKC_{}", stage.to_uppercase()),
                 format!("-DNAMESPACE=chlkc_{stage}"),
             ],
+            &[],
             "-O3",
             true,
             program,
@@ -366,6 +387,7 @@ impl Compiler {
         src: &str,
         target: &str,
         target_defines: Vec<String>,
+        extra_objs: &[String],
         opt: &str,
         trisc: bool,
         program: &Program,
@@ -375,23 +397,11 @@ impl Compiler {
         if self.profile {
             append_profile_defines(&mut defines);
         }
-        let extra_objs = if target == "brisc" {
-            vec![
-                deps_root()
-                    .join("lib")
-                    .join("blackhole")
-                    .join("noc.o")
-                    .display()
-                    .to_string(),
-            ]
-        } else {
-            Vec::new()
-        };
         self.build(BuildRequest {
             kernel_source: src,
             target,
             defines: &defines,
-            extra_objs: &extra_objs,
+            extra_objs,
             opt,
             trisc,
             xip_relocate: false,
