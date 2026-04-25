@@ -303,18 +303,27 @@ impl Compiler {
         processor: &str,
         noc_index: Option<u8>,
     ) -> io::Result<CompiledKernel> {
-        match processor {
-            "brisc" => {
-                self.compile_dataflow_inner(src, "brisc", noc_index.unwrap_or(1), &[], false, true)
+        let (target, noc_index) = match processor {
+            "brisc" => ("brisc", noc_index.unwrap_or(1)),
+            "ncrisc" => ("ncrisc", noc_index.unwrap_or(0)),
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("processor must be 'brisc' or 'ncrisc', got: {other}"),
+                ));
             }
-            "ncrisc" => {
-                self.compile_dataflow_inner(src, "ncrisc", noc_index.unwrap_or(0), &[], false, true)
-            }
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("processor must be 'brisc' or 'ncrisc', got: {other}"),
-            )),
-        }
+        };
+        let target_defines = vec![
+            format!("-DCOMPILE_FOR_{}", target.to_uppercase()),
+            format!(
+                "-DPROCESSOR_INDEX={}",
+                if target == "brisc" { 0 } else { 1 }
+            ),
+            format!("-DNOC_INDEX={noc_index}"),
+            "-DNOC_MODE=0".to_owned(),
+        ];
+        let program = Program::default();
+        self.compile_kernel(src, target, target_defines, "-O2", false, &program)
     }
 
     pub fn compile_compute(
@@ -329,25 +338,41 @@ impl Compiler {
         ))
     }
 
-    fn compile_dataflow_inner(
+    fn compile_trisc(
+        &self,
+        src: &str,
+        trisc_id: usize,
+        program: &Program,
+    ) -> io::Result<CompiledKernel> {
+        let stage = ["unpack", "math", "pack"][trisc_id];
+        let target = format!("trisc{trisc_id}");
+        self.compile_kernel(
+            src,
+            &target,
+            vec![
+                format!("-DCOMPILE_FOR_TRISC={trisc_id}"),
+                format!("-DPROCESSOR_INDEX={}", trisc_id + 2),
+                format!("-DUCK_CHLKC_{}", stage.to_uppercase()),
+                format!("-DNAMESPACE=chlkc_{stage}"),
+            ],
+            "-O3",
+            true,
+            program,
+        )
+    }
+
+    fn compile_kernel(
         &self,
         src: &str,
         target: &str,
-        noc_index: u8,
-        extra_defines: &[String],
-        xip_relocate: bool,
-        profiler: bool,
+        target_defines: Vec<String>,
+        opt: &str,
+        trisc: bool,
+        program: &Program,
     ) -> io::Result<CompiledKernel> {
         let mut defines = self.kernel_defines.clone();
-        defines.push(format!("-DCOMPILE_FOR_{}", target.to_uppercase()));
-        defines.push(format!(
-            "-DPROCESSOR_INDEX={}",
-            if target == "brisc" { 0 } else { 1 }
-        ));
-        defines.push(format!("-DNOC_INDEX={noc_index}"));
-        defines.push("-DNOC_MODE=0".to_owned());
-        defines.extend(extra_defines.iter().cloned());
-        if self.profile && profiler {
+        defines.extend(target_defines);
+        if self.profile {
             append_profile_defines(&mut defines);
         }
         let extra_objs = if target == "brisc" {
@@ -362,42 +387,13 @@ impl Compiler {
         } else {
             Vec::new()
         };
-        let program = Program::default();
         self.build(BuildRequest {
             kernel_source: src,
             target,
             defines: &defines,
             extra_objs: &extra_objs,
-            opt: "-O2",
-            trisc: false,
-            xip_relocate,
-            program: &program,
-        })
-    }
-
-    fn compile_trisc(
-        &self,
-        src: &str,
-        trisc_id: usize,
-        program: &Program,
-    ) -> io::Result<CompiledKernel> {
-        let stage = ["unpack", "math", "pack"][trisc_id];
-        let mut defines = self.kernel_defines.clone();
-        defines.push(format!("-DCOMPILE_FOR_TRISC={trisc_id}"));
-        defines.push(format!("-DPROCESSOR_INDEX={}", trisc_id + 2));
-        defines.push(format!("-DUCK_CHLKC_{}", stage.to_uppercase()));
-        defines.push(format!("-DNAMESPACE=chlkc_{stage}"));
-        if self.profile {
-            append_profile_defines(&mut defines);
-        }
-        let target = format!("trisc{trisc_id}");
-        self.build(BuildRequest {
-            kernel_source: src,
-            target: &target,
-            defines: &defines,
-            extra_objs: &[],
-            opt: "-O3",
-            trisc: true,
+            opt,
+            trisc,
             xip_relocate: false,
             program,
         })
