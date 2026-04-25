@@ -216,6 +216,7 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
                             let active_cores = nr * nc;
                             let east_cols = cols.iter().filter(|&&x| x >= 10).count();
                             let score = (
+                                usize::from(east_cols == 0),
                                 active_cores * in0_block_w * bias * bias,
                                 active_cores * in0_block_w,
                                 out_subblock_num_tiles,
@@ -601,5 +602,15 @@ mod tests {
         assert_eq!(plan.per_core_m, 4);
         assert_eq!(plan.per_core_n, 4);
         assert_eq!(plan.in0_block_w, 16);
+    }
+
+    #[test]
+    fn plan_matmul_prefers_single_west_rectangle() {
+        let plan = plan_matmul(512, 1024, 1024, &p100_worker_cores()).expect("plan");
+        assert_eq!(plan.rows, vec![2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(plan.cols, vec![1, 2, 3, 4]);
+        assert_eq!(plan.per_core_m, 2);
+        assert_eq!(plan.per_core_n, 8);
+        assert_eq!(plan.in0_block_w, 32);
     }
 }
