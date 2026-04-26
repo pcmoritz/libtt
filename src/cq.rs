@@ -2,6 +2,7 @@ use crate::compiler::Compiler;
 use crate::dispatch::{build_cq_launch, mcast_rects, DevMsgs, DispatchCommand};
 use crate::hw::{align_down, align_up, noc_xy, Arc, CoreCoord, TensixL1, TensixMMIO};
 use crate::linux::{NocOrdering, PinnedMemory, TlbWindow};
+use crate::log::log;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -38,6 +39,7 @@ const HOST_TIMESTAMP_SIZE: usize =
 const HOST_PROFILER_BASE: usize = HOST_TIMESTAMP_BASE + HOST_TIMESTAMP_SIZE;
 const HOST_CQ_WR_OFF: usize = 2 * PCIE_ALIGN;
 const HOST_CQ_RD_OFF: usize = 3 * PCIE_ALIGN;
+const PCIE_BASE_GUARD_SIZE: usize = 1 << 30;
 
 const RELAY_INLINE: u8 = 5;
 const WRITE_LINEAR_HOST: u8 = 3;
@@ -53,6 +55,7 @@ pub(crate) struct FastDispatcher {
     path: PathBuf,
     prefetch_core: CoreCoord,
     dispatch_core: CoreCoord,
+    _pcie_base_guard: PinnedMemory,
     cq_hw: CqSysmem,
     event_id: u32,
 }
@@ -64,12 +67,18 @@ impl FastDispatcher {
         dispatch_core: CoreCoord,
         compiler: &Compiler,
     ) -> io::Result<Self> {
+        // Match blackhole-py's fast-dispatch setup: reserve the base PCIe
+        // sysmem window before allocating CQ sysmem, so CQ queues get a
+        // nonzero local NOC offset.
+        let pcie_base_guard =
+            new_sysmem(path, PCIE_BASE_GUARD_SIZE, "reserve base PCIe sysmem window")?;
         let mut cq_hw = CqSysmem::new(path, prefetch_core, dispatch_core)?;
         start_dispatch_cores(&mut cq_hw, prefetch_core, dispatch_core, compiler)?;
         Ok(Self {
             path: path.to_path_buf(),
             prefetch_core,
             dispatch_core,
+            _pcie_base_guard: pcie_base_guard,
             cq_hw,
             event_id: 0,
         })
@@ -243,16 +252,7 @@ struct CqSysmem {
 
 impl CqSysmem {
     fn new(path: &Path, prefetch_core: CoreCoord, dispatch_core: CoreCoord) -> io::Result<Self> {
-        let size = host_sysmem_size();
-        let sysmem = PinnedMemory::new(path, size).map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!(
-                    "initialize CQ sysmem failed for {} size=0x{size:x}: {err}",
-                    path.display()
-                ),
-            )
-        })?;
+        let sysmem = new_sysmem(path, host_sysmem_size(), "initialize CQ sysmem")?;
         if (sysmem.noc_addr() & PCIE_NOC_BASE) != PCIE_NOC_BASE {
             return Err(io::Error::other(format!(
                 "bad CQ sysmem NOC address: 0x{:x}",
@@ -260,6 +260,11 @@ impl CqSysmem {
             )));
         }
         let noc_local = sysmem.noc_addr() - PCIE_NOC_BASE;
+        if noc_local == 0 {
+            return Err(io::Error::other(
+                "CQ sysmem unexpectedly allocated at base PCIe NOC offset",
+            ));
+        }
         if noc_local > u64::from(u32::MAX) {
             return Err(io::Error::other(format!(
                 "CQ sysmem NOC offset too large: 0x{noc_local:x}"
@@ -342,6 +347,12 @@ impl CqSysmem {
                 return Ok(());
             }
             if Instant::now() > deadline {
+                let host_wr = self.sysmem_read32(HOST_CQ_WR_OFF);
+                let host_rd = self.sysmem_read32(HOST_CQ_RD_OFF);
+                let pref_pcie = self.prefetch_win.read32(CQ_PREFETCH_Q_PCIE_RD).unwrap_or(0);
+                log(format!(
+                    "CQ timeout event={event_id} cq_wr=0x{host_wr:08x} cq_rd=0x{host_rd:08x} pref_pcie=0x{pref_pcie:08x}"
+                ));
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("timeout waiting for CQ completion event {event_id}"),
@@ -404,6 +415,15 @@ const fn align_up_usize(value: usize, align: usize) -> usize {
 
 fn host_sysmem_size() -> usize {
     align_up(HOST_PROFILER_BASE as u64, PAGE_SIZE as u64) as usize
+}
+
+fn new_sysmem(path: &Path, size: usize, label: &str) -> io::Result<PinnedMemory> {
+    PinnedMemory::new(path, size).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("{label} failed for {} size=0x{size:x}: {err}", path.display()),
+        )
+    })
 }
 
 fn lower_ir(commands: &[DispatchCommand], go_word: u32) -> Vec<CqCommand> {
