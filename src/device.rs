@@ -541,8 +541,7 @@ fn encode_jal_zero(target: u32) -> [u8; 4] {
 }
 
 fn use_fast_dispatch() -> bool {
-    !matches!(env::var("TT_USB").as_deref(), Ok("1"))
-        && !matches!(env::var("TT_FAST_DISPATCH").as_deref(), Ok("0"))
+    !matches!(env::var("LIBTT_FAST_DISPATCH").as_deref(), Ok("0"))
 }
 
 fn discover_with(root: &Path) -> Vec<Device> {
