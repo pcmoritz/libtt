@@ -179,6 +179,7 @@ impl Device {
             config.name
         ));
         let dispatcher: Box<dyn Dispatcher> = if use_fast_dispatch() {
+            log("using fast dispatch");
             Box::new(FastDispatcher::new(
                 path.clone(),
                 config.prefetch,
@@ -186,6 +187,7 @@ impl Device {
                 &compiler,
             )?)
         } else {
+            log("using slow dispatch");
             Box::new(SlowDispatcher::new(path.clone()))
         };
 
@@ -285,15 +287,13 @@ impl Device {
 
     pub fn run_program(&mut self, program: &Program) -> io::Result<()> {
         let worker_cores = self.cores();
-        let dispatch_mode = self.dispatcher.dispatch_mode();
-        log(if dispatch_mode == DevMsgs::DISPATCH_MODE_DEV {
-            "using fast dispatch"
-        } else {
-            "using slow dispatch"
-        });
-        let commands = build_dispatch_plan(&self.compiler, &worker_cores, program, dispatch_mode)?;
-        self.dispatcher.execute(&commands)?;
-        Ok(())
+        let commands = build_dispatch_plan(
+            &self.compiler,
+            &worker_cores,
+            program,
+            self.dispatcher.dispatch_mode(),
+        )?;
+        self.dispatcher.execute(&commands)
     }
 
     pub fn alloc(
