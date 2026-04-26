@@ -4,7 +4,7 @@ use crate::hw::{align_up, Arc, CoreCoord, TensixL1};
 use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::BTreeSet;
 use std::io;
-use std::path::PathBuf;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -154,16 +154,14 @@ pub(crate) enum DispatchCommand {
 }
 
 pub(crate) struct SlowDispatcher {
-    path: PathBuf,
-    win: Option<TlbWindow>,
+    win: TlbWindow,
 }
 
 impl SlowDispatcher {
-    pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            win: None,
-        }
+    pub(crate) fn new(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            win: TlbWindow::open(path, Arc::TLB_SIZE_2M, false)?,
+        })
     }
 
     pub(crate) fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
@@ -171,25 +169,22 @@ impl SlowDispatcher {
             match command {
                 DispatchCommand::Write { cores, addr, data } => {
                     for (start, end) in mcast_rects(cores) {
-                        let win = self.win_mut()?;
-                        win.target(start, Some(end), 0, NocOrdering::Strict)?;
-                        win.write(*addr, data)?;
+                        self.win.target(start, Some(end), 0, NocOrdering::Strict)?;
+                        self.win.write(*addr, data)?;
                     }
                 }
                 DispatchCommand::Launch { cores } => {
                     let go_blob = [0u8, 0u8, 0u8, DevMsgs::RUN_MSG_GO];
                     for (start, end) in mcast_rects(cores) {
-                        let win = self.win_mut()?;
-                        win.target(start, Some(end), 0, NocOrdering::Strict)?;
-                        win.write(TensixL1::GO_MSG as usize, &go_blob)?;
+                        self.win.target(start, Some(end), 0, NocOrdering::Strict)?;
+                        self.win.write(TensixL1::GO_MSG as usize, &go_blob)?;
                     }
 
                     for core in cores {
-                        let win = self.win_mut()?;
-                        win.target(*core, None, 0, NocOrdering::Strict)?;
+                        self.win.target(*core, None, 0, NocOrdering::Strict)?;
                         let deadline = Instant::now() + LAUNCH_TIMEOUT;
                         loop {
-                            if win.read(TensixL1::GO_MSG as usize + 3, 1)?[0]
+                            if self.win.read(TensixL1::GO_MSG as usize + 3, 1)?[0]
                                 == DevMsgs::RUN_MSG_DONE
                             {
                                 break;
@@ -208,15 +203,6 @@ impl SlowDispatcher {
         }
 
         Ok(())
-    }
-
-    fn win_mut(&mut self) -> io::Result<&mut TlbWindow> {
-        if self.win.is_none() {
-            self.win = Some(TlbWindow::open(&self.path, Arc::TLB_SIZE_2M, false)?);
-        }
-        self.win
-            .as_mut()
-            .ok_or_else(|| io::Error::other("slow dispatcher TLB window initialization failed"))
     }
 }
 

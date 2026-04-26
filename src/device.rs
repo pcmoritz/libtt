@@ -188,7 +188,7 @@ impl Device {
             )?)
         } else {
             log("using slow dispatch");
-            Box::new(SlowDispatcher::new(path.clone()))
+            Box::new(SlowDispatcher::new(path.as_path())?)
         };
 
         let mut info = Self {
