@@ -234,6 +234,7 @@ impl Device {
             .ok_or_else(|| io::Error::other("compiler has not been initialized"))?;
         let worker_cores = self.cores();
         if use_fast_dispatch() {
+            log("using fast dispatch");
             let commands =
                 build_dispatch_plan(compiler, &worker_cores, program, DevMsgs::DISPATCH_MODE_DEV)?;
             if self.fast_dispatch.is_none() {
@@ -249,6 +250,7 @@ impl Device {
                 .ok_or_else(|| io::Error::other("fast dispatcher initialization failed"))?
                 .execute(&commands)?;
         } else {
+            log("using slow dispatch");
             let commands = build_dispatch_plan(
                 compiler,
                 &worker_cores,
