@@ -239,7 +239,7 @@ impl Drop for TlbWindow {
 
 pub(crate) struct PinnedMemory {
     file: File,
-    mapping: Option<AnonymousMapping>,
+    mapping: AnonymousMapping,
     virtual_address: u64,
     size: usize,
     noc_addr: u64,
@@ -288,7 +288,7 @@ impl PinnedMemory {
         let noc_addr = unsafe { ptr::addr_of!(pin.output.noc_address).read_unaligned() };
         Ok(Self {
             file,
-            mapping: Some(mapping),
+            mapping,
             virtual_address,
             size,
             noc_addr,
@@ -300,17 +300,11 @@ impl PinnedMemory {
     }
 
     pub(crate) fn as_slice(&self) -> &[u8] {
-        self.mapping
-            .as_ref()
-            .expect("pinned mapping should exist while memory is alive")
-            .as_slice()
+        self.mapping.as_slice()
     }
 
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.mapping
-            .as_mut()
-            .expect("pinned mapping should exist while memory is alive")
-            .as_mut_slice()
+        self.mapping.as_mut_slice()
     }
 }
 
@@ -322,7 +316,6 @@ impl Drop for PinnedMemory {
             reserved: 0,
         };
         let _ = ioctl_call(self.file.as_raw_fd(), TT_IOCTL_UNPIN_PAGES, &mut unpin);
-        drop(self.mapping.take());
     }
 }
 
