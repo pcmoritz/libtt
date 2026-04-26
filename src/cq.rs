@@ -62,7 +62,7 @@ pub(crate) struct FastDispatcher {
 
 impl FastDispatcher {
     pub(crate) fn new(
-        path: &Path,
+        path: impl Into<PathBuf>,
         prefetch_core: CoreCoord,
         dispatch_core: CoreCoord,
         compiler: &Compiler,
@@ -70,12 +70,16 @@ impl FastDispatcher {
         // Match blackhole-py's fast-dispatch setup: reserve the base PCIe
         // sysmem window before allocating CQ sysmem, so CQ queues get a
         // nonzero local NOC offset.
-        let pcie_base_guard =
-            new_sysmem(path, PCIE_BASE_GUARD_SIZE, "reserve base PCIe sysmem window")?;
-        let mut cq_hw = CqSysmem::new(path, prefetch_core, dispatch_core)?;
+        let path = path.into();
+        let pcie_base_guard = new_sysmem(
+            path.as_path(),
+            PCIE_BASE_GUARD_SIZE,
+            "reserve base PCIe sysmem window",
+        )?;
+        let mut cq_hw = CqSysmem::new(path.as_path(), prefetch_core, dispatch_core)?;
         start_dispatch_cores(&mut cq_hw, prefetch_core, dispatch_core, compiler)?;
         Ok(Self {
-            path: path.to_path_buf(),
+            path,
             prefetch_core,
             dispatch_core,
             _pcie_base_guard: pcie_base_guard,
@@ -421,7 +425,10 @@ fn new_sysmem(path: &Path, size: usize, label: &str) -> io::Result<PinnedMemory>
     PinnedMemory::new(path, size).map_err(|err| {
         io::Error::new(
             err.kind(),
-            format!("{label} failed for {} size=0x{size:x}: {err}", path.display()),
+            format!(
+                "{label} failed for {} size=0x{size:x}: {err}",
+                path.display()
+            ),
         )
     })
 }

@@ -4,7 +4,7 @@ use crate::hw::{align_up, Arc, CoreCoord, TensixL1};
 use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::BTreeSet;
 use std::io;
-use std::path::Path;
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -153,6 +153,73 @@ pub(crate) enum DispatchCommand {
     },
 }
 
+pub(crate) struct SlowDispatcher {
+    path: PathBuf,
+    win: Option<TlbWindow>,
+}
+
+impl SlowDispatcher {
+    pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            win: None,
+        }
+    }
+
+    pub(crate) fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
+        for command in commands {
+            match command {
+                DispatchCommand::Write { cores, addr, data } => {
+                    for (start, end) in mcast_rects(cores) {
+                        let win = self.win_mut()?;
+                        win.target(start, Some(end), 0, NocOrdering::Strict)?;
+                        win.write(*addr, data)?;
+                    }
+                }
+                DispatchCommand::Launch { cores } => {
+                    let go_blob = [0u8, 0u8, 0u8, DevMsgs::RUN_MSG_GO];
+                    for (start, end) in mcast_rects(cores) {
+                        let win = self.win_mut()?;
+                        win.target(start, Some(end), 0, NocOrdering::Strict)?;
+                        win.write(TensixL1::GO_MSG as usize, &go_blob)?;
+                    }
+
+                    for core in cores {
+                        let win = self.win_mut()?;
+                        win.target(*core, None, 0, NocOrdering::Strict)?;
+                        let deadline = Instant::now() + LAUNCH_TIMEOUT;
+                        loop {
+                            if win.read(TensixL1::GO_MSG as usize + 3, 1)?[0]
+                                == DevMsgs::RUN_MSG_DONE
+                            {
+                                break;
+                            }
+                            if Instant::now() > deadline {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    format!("timeout waiting for core {core}"),
+                                ));
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn win_mut(&mut self) -> io::Result<&mut TlbWindow> {
+        if self.win.is_none() {
+            self.win = Some(TlbWindow::open(&self.path, Arc::TLB_SIZE_2M, false)?);
+        }
+        self.win
+            .as_mut()
+            .ok_or_else(|| io::Error::other("slow dispatcher TLB window initialization failed"))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Role {
     cores: Vec<CoreCoord>,
@@ -268,47 +335,6 @@ pub(crate) fn build_dispatch_plan(
     });
 
     Ok(commands)
-}
-
-pub(crate) fn execute_slow_dispatch(path: &Path, commands: &[DispatchCommand]) -> io::Result<()> {
-    let mut win = TlbWindow::open(path, Arc::TLB_SIZE_2M, false)?;
-
-    for command in commands {
-        match command {
-            DispatchCommand::Write { cores, addr, data } => {
-                for (start, end) in mcast_rects(cores) {
-                    win.target(start, Some(end), 0, NocOrdering::Strict)?;
-                    win.write(*addr, data)?;
-                }
-            }
-            DispatchCommand::Launch { cores } => {
-                let go_blob = [0u8, 0u8, 0u8, DevMsgs::RUN_MSG_GO];
-                for (start, end) in mcast_rects(cores) {
-                    win.target(start, Some(end), 0, NocOrdering::Strict)?;
-                    win.write(TensixL1::GO_MSG as usize, &go_blob)?;
-                }
-
-                for core in cores {
-                    win.target(*core, None, 0, NocOrdering::Strict)?;
-                    let deadline = Instant::now() + LAUNCH_TIMEOUT;
-                    loop {
-                        if win.read(TensixL1::GO_MSG as usize + 3, 1)?[0] == DevMsgs::RUN_MSG_DONE {
-                            break;
-                        }
-                        if Instant::now() > deadline {
-                            return Err(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                format!("timeout waiting for core {core}"),
-                            ));
-                        }
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn build_roles(
