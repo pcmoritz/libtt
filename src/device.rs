@@ -178,18 +178,8 @@ impl Device {
             "device {id} compiler initialized for {}",
             config.name
         ));
-        let dispatcher: Box<dyn Dispatcher> = if use_fast_dispatch() {
-            log("using fast dispatch");
-            Box::new(FastDispatcher::new(
-                path.clone(),
-                config.prefetch,
-                config.dispatch,
-                &compiler,
-            )?)
-        } else {
-            log("using slow dispatch");
-            Box::new(SlowDispatcher::new(path.as_path())?)
-        };
+
+        let dispatcher: Box<dyn Dispatcher> = Box::new(SlowDispatcher::new(path.as_path())?);
 
         let mut info = Self {
             id,
@@ -212,6 +202,20 @@ impl Device {
         if let Err(err) = info.upload_firmware() {
             log(format!("device {} firmware upload skipped: {err}", info.id));
         }
+
+        info.dispatcher = if use_fast_dispatch() {
+            log("using fast dispatch");
+            Box::new(FastDispatcher::new(
+                info.path.clone(),
+                info.prefetch_core,
+                info.dispatch_core,
+                &info.compiler,
+            )?)
+        } else {
+            log("using slow dispatch");
+            Box::new(SlowDispatcher::new(info.path.as_path())?)
+        };
+
         Ok(info)
     }
 
@@ -287,11 +291,12 @@ impl Device {
 
     pub fn run_program(&mut self, program: &Program) -> io::Result<()> {
         let worker_cores = self.cores();
+        let dispatch_mode = self.dispatcher.dispatch_mode();
         let commands = build_dispatch_plan(
             &self.compiler,
             &worker_cores,
             program,
-            self.dispatcher.dispatch_mode(),
+            dispatch_mode,
         )?;
         self.dispatcher.execute(&commands)
     }
