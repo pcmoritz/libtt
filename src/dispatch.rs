@@ -115,6 +115,8 @@ pub struct Program {
     pub reader_recv_kernel: String,
     pub writer_recv_kernel: String,
     pub grid: Option<(Vec<u8>, Vec<u8>)>,
+    pub per_core_reader_args: Vec<((u8, u8), Vec<u32>)>,
+    pub per_core_writer_args: Vec<((u8, u8), Vec<u32>)>,
 }
 
 impl Default for Program {
@@ -137,6 +139,8 @@ impl Default for Program {
             reader_recv_kernel: String::new(),
             writer_recv_kernel: String::new(),
             grid: None,
+            per_core_reader_args: Vec::new(),
+            per_core_writer_args: Vec::new(),
         }
     }
 }
@@ -262,7 +266,7 @@ pub(crate) fn build_dispatch_plan(
     );
     let rta_total = rta_sizes.0 + rta_sizes.1 + rta_sizes.2;
     let sem_off = align_up(rta_total as u64, L1_ALIGN as u64) as usize;
-    let rta_blob = pack_rta(
+    let common_rta_blob = pack_rta(
         &program.writer_args,
         &program.reader_args,
         &program.compute_args,
@@ -283,11 +287,42 @@ pub(crate) fn build_dispatch_plan(
         },
     ];
 
-    if !rta_blob.is_empty() {
+    if has_per_core_args(program) {
+        for core in &all_cores {
+            let writer_args = args_for_core(
+                &program.writer_args,
+                &program.per_core_writer_args,
+                *core,
+                "writer",
+            )?;
+            let reader_args = args_for_core(
+                &program.reader_args,
+                &program.per_core_reader_args,
+                *core,
+                "reader",
+            )?;
+            validate_core_arg_len(writer_args, program.writer_args.len(), *core, "writer")?;
+            validate_core_arg_len(reader_args, program.reader_args.len(), *core, "reader")?;
+            let rta_blob = pack_rta(
+                writer_args,
+                reader_args,
+                &program.compute_args,
+                program.semaphores,
+                sem_off,
+            );
+            if !rta_blob.is_empty() {
+                commands.push(DispatchCommand::Write {
+                    cores: vec![*core],
+                    addr: TensixL1::KERNEL_CONFIG_BASE as usize,
+                    data: rta_blob,
+                });
+            }
+        }
+    } else if !common_rta_blob.is_empty() {
         commands.push(DispatchCommand::Write {
             cores: all_cores.clone(),
             addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-            data: rta_blob,
+            data: common_rta_blob,
         });
     }
 
@@ -457,6 +492,47 @@ fn pack_rta(
     data
 }
 
+fn has_per_core_args(program: &Program) -> bool {
+    !program.per_core_reader_args.is_empty() || !program.per_core_writer_args.is_empty()
+}
+
+fn args_for_core<'a>(
+    default: &'a [u32],
+    per_core: &'a [((u8, u8), Vec<u32>)],
+    core: CoreCoord,
+    role: &str,
+) -> io::Result<&'a [u32]> {
+    let mut matches = per_core
+        .iter()
+        .filter(|((x, y), _)| *x == core.x && *y == core.y);
+    let args = matches.next().map(|(_, args)| args.as_slice());
+    if matches.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("duplicate per-core {role} args for core {core}"),
+        ));
+    }
+    Ok(args.unwrap_or(default))
+}
+
+fn validate_core_arg_len(
+    args: &[u32],
+    expected: usize,
+    core: CoreCoord,
+    role: &str,
+) -> io::Result<()> {
+    if args.len() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "per-core {role} args for core {core} have length {}, expected {expected}",
+                args.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn build_payload(
     program: &Program,
     reader: Option<&CompiledKernel>,
@@ -543,6 +619,7 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
     const MAX_CIRCULAR_BUFFERS: usize = u32::BITS as usize;
     let mut mask = 0u32;
     let mut entries = 0usize;
+    let mut group_sizes = [0u32; MAX_CIRCULAR_BUFFERS];
     for cb in &program.cbs {
         if cb.index >= MAX_CIRCULAR_BUFFERS {
             return Err(io::Error::new(
@@ -550,31 +627,57 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
                 format!("circular buffer index {} is out of range", cb.index),
             ));
         }
+        let size = cb_size(cb)?;
+        let group = cb_allocation_group(cb.index);
+        group_sizes[group] = group_sizes[group].max(size);
         mask |= 1u32 << cb.index;
         entries = entries.max(cb.index + 1);
     }
     let mut configs = vec![CircularBufferConfigMsg::default(); entries];
     let mut next_addr = TensixL1::DATA_BUFFER_SPACE_BASE;
+    let mut group_addrs = [None; MAX_CIRCULAR_BUFFERS];
 
     for cb in &program.cbs {
         let page_size = to_u32(cb.dtype.tile_size(), "circular buffer page size")?;
+        let tiles = to_u32(cb.tiles, "circular buffer tiles")?;
         let size = page_size
-            .checked_mul(to_u32(cb.tiles, "circular buffer tile count")?)
+            .checked_mul(tiles)
             .ok_or_else(|| io::Error::other("circular buffer size overflow"))?;
-        let addr = next_addr;
-        next_addr = next_addr
-            .checked_add(size)
-            .ok_or_else(|| io::Error::other("circular buffer address overflow"))?;
+        let group = cb_allocation_group(cb.index);
+        let addr = match group_addrs[group] {
+            Some(addr) => addr,
+            None => {
+                let addr = next_addr;
+                next_addr = next_addr
+                    .checked_add(group_sizes[group])
+                    .ok_or_else(|| io::Error::other("circular buffer address overflow"))?;
+                group_addrs[group] = Some(addr);
+                addr
+            }
+        };
 
         configs[cb.index] = CircularBufferConfigMsg {
             addr,
             size,
-            tiles: to_u32(cb.tiles, "circular buffer tiles")?,
+            tiles,
             page_size,
         };
     }
 
     Ok((mask, as_bytes(configs.as_slice())))
+}
+
+fn cb_size(cb: &CBConfig) -> io::Result<u32> {
+    to_u32(cb.dtype.tile_size(), "circular buffer page size")?
+        .checked_mul(to_u32(cb.tiles, "circular buffer tile count")?)
+        .ok_or_else(|| io::Error::other("circular buffer size overflow"))
+}
+
+fn cb_allocation_group(index: usize) -> usize {
+    match index {
+        16 | 24 => 16,
+        _ => index,
+    }
 }
 
 fn serialize_launch(layout: LaunchLayout) -> io::Result<Vec<u8>> {
@@ -804,8 +907,9 @@ mod tests {
         );
         assert_eq!(
             read_u32(&blob, 24 * 16),
-            TensixL1::DATA_BUFFER_SPACE_BASE + cb0_size + cb16_size
+            TensixL1::DATA_BUFFER_SPACE_BASE + cb0_size
         );
+        assert_eq!(read_u32(&blob, 24 * 16 + 4), cb16_size);
     }
 
     #[test]

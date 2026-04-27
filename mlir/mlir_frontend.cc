@@ -238,6 +238,34 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto dot_op = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op)) {
+            auto dims = dot_op.getDotDimensionNumbers();
+            if (!dims.getLhsBatchingDimensions().empty() ||
+                !dims.getRhsBatchingDimensions().empty() ||
+                dims.getLhsContractingDimensions().size() != 1 ||
+                dims.getRhsContractingDimensions().size() != 1 ||
+                dims.getLhsContractingDimensions()[0] != 1 ||
+                dims.getRhsContractingDimensions()[0] != 0) {
+                error = "only rank-2 standard matrix multiplication dot_general is currently supported";
+                return false;
+            }
+
+            uint32_t lhs_id = 0;
+            uint32_t rhs_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(dot_op.getLhs(), executable, value_ids, error, lhs_id) ||
+                !addValueDesc(dot_op.getRhs(), executable, value_ids, error, rhs_id) ||
+                !addValueDesc(dot_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* matmul = executable.add_ops();
+            matmul->set_output_id(output_id);
+            matmul->mutable_matmul()->set_lhs_id(lhs_id);
+            matmul->mutable_matmul()->set_rhs_id(rhs_id);
+            continue;
+        }
+
         error = "unsupported entry op: " + op.getName().getStringRef().str();
         return false;
     }
