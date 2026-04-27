@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[allow(dead_code)]
+include!("cq_bindings.rs");
+
 const CQ_L1: usize = 0x196C0;
 const CQ_PREFETCH_Q_RD_PTR: usize = CQ_L1;
 const CQ_PREFETCH_Q_PCIE_RD: usize = CQ_L1 + 0x04;
@@ -43,31 +46,10 @@ const HOST_CQ_WR_OFF: usize = 2 * PCIE_ALIGN;
 const HOST_CQ_RD_OFF: usize = 3 * PCIE_ALIGN;
 const PCIE_BASE_GUARD_SIZE: usize = 1 << 30;
 
-#[repr(u8)]
-#[derive(Clone, Copy)]
-enum CqPrefetchCmdId {
-    RelayInline = 5,
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy)]
-enum CqDispatchCmdId {
-    WriteLinearHost = 3,
-    WritePackedLarge = 6,
-    Wait = 7,
-    SendGoSignal = 14,
-    SetGoSignalNocData = 17,
-}
-
-const CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK: u8 = 0x01;
-const CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_TYPE_PROGRAM_BINARIES: u8 = 2;
-const CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM: u8 = 0x08;
-const CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM: u8 = 0x10;
-const CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET: u8 = 0xff;
 const CQ_DISPATCH_CMD_WRITE_LINEAR_HOST_IS_EVENT: u8 = 1;
 
-const CQ_CMD_SIZE: usize = 16;
-const DONE_STREAM: u16 = 48;
+const CQ_CMD_SIZE: usize = CQ_DISPATCH_CMD_SIZE as usize;
+const DONE_STREAM: u16 = FIRST_STREAM_USED as u16;
 
 pub(crate) struct FastDispatcher {
     path: PathBuf,
@@ -154,7 +136,8 @@ impl CqCommand {
             Self::WritePackedLarge { rects, addr, data } => {
                 let padded = pad_to(data, L1_ALIGN);
                 let mut records = Vec::new();
-                for batch in rects.chunks(35) {
+                for batch in rects.chunks(CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS as usize)
+                {
                     let mut record = cq_hdr_write_packed_large(batch.len())?;
                     for &(start, end) in batch {
                         let (xy, count) = noc_mcast_xy(start, end);
@@ -171,7 +154,10 @@ impl CqCommand {
                             .map_err(|_| io::Error::other("CQ write payload too large"))?,
                         );
                         put_u8(&mut record, count);
-                        put_u8(&mut record, CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK);
+                        put_u8(
+                            &mut record,
+                            CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK as u8,
+                        );
                     }
                     let padded_len = align_up(record.len() as u64, L1_ALIGN as u64) as usize;
                     pad_vec_to(&mut record, padded_len);
@@ -184,7 +170,7 @@ impl CqCommand {
             }
             Self::SetGoSignalNocData { cores } => {
                 let mut record = cq_hdr();
-                record[0] = CqDispatchCmdId::SetGoSignalNocData as u8;
+                record[0] = CQDispatchCmdId::CQ_DISPATCH_SET_GO_SIGNAL_NOC_DATA as u8;
                 put_u32_at(&mut record, 4, cores.len() as u32);
                 for core in cores {
                     put_u32(&mut record, noc_xy(core.x, core.y));
@@ -198,7 +184,7 @@ impl CqCommand {
                 num_unicast,
             } => {
                 let mut record = cq_hdr();
-                record[0] = CqDispatchCmdId::SendGoSignal as u8;
+                record[0] = CQDispatchCmdId::CQ_DISPATCH_CMD_SEND_GO_SIGNAL as u8;
                 put_u32_at(&mut record, 1, *go_word);
                 record[5] = CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET;
                 record[6] = *num_unicast;
@@ -213,13 +199,13 @@ impl CqCommand {
                 clear,
             } => {
                 let mut record = cq_hdr();
-                record[0] = CqDispatchCmdId::Wait as u8;
-                record[1] = CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM
+                record[0] = CQDispatchCmdId::CQ_DISPATCH_CMD_WAIT as u8;
+                record[1] = (CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM
                     | if *clear {
                         CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM
                     } else {
                         0
-                    };
+                    }) as u8;
                 put_u16_at(&mut record, 2, *stream);
                 put_u32_at(&mut record, 8, *count);
                 Ok(vec![record])
@@ -229,7 +215,7 @@ impl CqCommand {
                 put_u32(&mut payload, *event_id);
                 pad_vec_to(&mut payload, L1_ALIGN);
                 let mut record = cq_hdr();
-                record[0] = CqDispatchCmdId::WriteLinearHost as u8;
+                record[0] = CQDispatchCmdId::CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST as u8;
                 record[1] = CQ_DISPATCH_CMD_WRITE_LINEAR_HOST_IS_EVENT;
                 put_u64_at(&mut record, 8, (CQ_CMD_SIZE + payload.len()) as u64);
                 record.extend_from_slice(&payload);
@@ -586,7 +572,7 @@ fn noc_mcast_xy(start: CoreCoord, end: CoreCoord) -> (u32, u8) {
 fn relay_inline(payload: &[u8]) -> Vec<u8> {
     let stride = align_up((CQ_CMD_SIZE + payload.len()) as u64, PCIE_ALIGN as u64) as usize;
     let mut record = cq_hdr();
-    record[0] = CqPrefetchCmdId::RelayInline as u8;
+    record[0] = CQPrefetchCmdId::CQ_PREFETCH_CMD_RELAY_INLINE as u8;
     put_u32_at(&mut record, 4, payload.len() as u32);
     put_u32_at(&mut record, 8, stride as u32);
     record.extend_from_slice(payload);
@@ -596,8 +582,10 @@ fn relay_inline(payload: &[u8]) -> Vec<u8> {
 
 fn cq_hdr_write_packed_large(count: usize) -> io::Result<Vec<u8>> {
     let mut record = cq_hdr();
-    record[0] = CqDispatchCmdId::WritePackedLarge as u8;
-    record[1] = CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_TYPE_PROGRAM_BINARIES;
+    record[0] = CQDispatchCmdId::CQ_DISPATCH_CMD_WRITE_PACKED_LARGE as u8;
+    record[1] =
+        CQDispatchCmdPackedWriteLargeType::CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_TYPE_PROGRAM_BINARIES
+            as u8;
     put_u16_at(
         &mut record,
         2,

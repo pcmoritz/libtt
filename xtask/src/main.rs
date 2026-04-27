@@ -19,6 +19,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             update_pjrt_bindings()
         }
+        Some("update-cq-bindings") => {
+            if let Some(extra) = args.next() {
+                return Err(format!("unexpected argument: {extra}").into());
+            }
+            update_cq_bindings()
+        }
         Some("help") | None => {
             print_help();
             Ok(())
@@ -29,14 +35,20 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn print_help() {
     println!("Available commands:");
+    println!("  cargo run --manifest-path xtask/Cargo.toml -- update-cq-bindings");
     println!("  cargo run --manifest-path xtask/Cargo.toml -- update-pjrt-bindings");
 }
 
-fn update_pjrt_bindings() -> Result<(), Box<dyn Error>> {
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn repo_root() -> Result<PathBuf, Box<dyn Error>> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("xtask manifest should live under the repo root")?
         .to_path_buf();
+    Ok(root)
+}
+
+fn update_pjrt_bindings() -> Result<(), Box<dyn Error>> {
+    let repo_root = repo_root()?;
 
     let header = repo_root.join("third_party/openxla/xla/pjrt/c/pjrt_c_api.h");
     let layouts_header =
@@ -84,6 +96,55 @@ fn update_pjrt_bindings() -> Result<(), Box<dyn Error>> {
         "// Generated from third_party/openxla/xla/pjrt/c/pjrt_c_api.h and\n\
          // third_party/openxla/xla/pjrt/c/pjrt_c_api_layouts_extension.h.\n\
          // Regenerate with `cargo run --manifest-path xtask/Cargo.toml -- update-pjrt-bindings`.\n\n",
+    );
+    contents.push_str(&bindings.to_string());
+
+    fs::write(&output, contents)?;
+    println!("updated {}", output.display());
+    Ok(())
+}
+
+fn update_cq_bindings() -> Result<(), Box<dyn Error>> {
+    let repo_root = repo_root()?;
+    let header = repo_root.join("firmware/cq/cq_commands.hpp");
+    let output = repo_root.join("src/cq_bindings.rs");
+
+    if !header.is_file() {
+        return Err(format!("missing CQ header: {}", header.display()).into());
+    }
+
+    let bindings = bindgen::Builder::default()
+        .header_contents(
+            "cq_bindings_wrapper.hpp",
+            "#define COMPILE_FOR_BRISC 1\n\
+             #define NOC_INDEX 1\n\
+             #include \"firmware/cq/cq_commands.hpp\"\n\
+             #include \"firmware/cq/cq_fixed_config.hpp\"\n",
+        )
+        .clang_arg("-x")
+        .clang_arg("c++")
+        .clang_arg("-std=c++17")
+        .clang_arg(format!("-I{}", repo_root.display()))
+        .allowlist_type("CQPrefetchCmdId")
+        .allowlist_type("CQDispatchCmdId")
+        .allowlist_type("CQDispatchCmdPackedWriteLargeType")
+        .allowlist_var("CQ_DISPATCH_CMD_SIZE")
+        .allowlist_var("CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK")
+        .allowlist_var("CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS")
+        .allowlist_var("CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM")
+        .allowlist_var("CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM")
+        .allowlist_var("CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET")
+        .allowlist_var("FIRST_STREAM_USED")
+        .default_enum_style(bindgen::EnumVariation::Rust {
+            non_exhaustive: false,
+        })
+        .layout_tests(false)
+        .generate()
+        .map_err(|_| "failed to generate CQ bindings")?;
+
+    let mut contents = String::from(
+        "// Generated from firmware/cq/cq_commands.hpp and firmware/cq/cq_fixed_config.hpp.\n\
+         // Regenerate with `cargo run --manifest-path xtask/Cargo.toml -- update-cq-bindings`.\n\n",
     );
     contents.push_str(&bindings.to_string());
 
