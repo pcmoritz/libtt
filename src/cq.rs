@@ -279,7 +279,11 @@ struct CqSysmem {
 
 impl CqSysmem {
     fn new(path: &Path, prefetch_core: CoreCoord, dispatch_core: CoreCoord) -> io::Result<Self> {
-        let sysmem = new_sysmem(path, host_sysmem_size(), "initialize CQ sysmem")?;
+        let sysmem = new_sysmem(
+            path,
+            align_up(HOST_PROFILER_BASE as u64, PAGE_SIZE as u64) as usize,
+            "initialize CQ sysmem",
+        )?;
         if (sysmem.noc_addr() & PCIE_NOC_BASE) != PCIE_NOC_BASE {
             return Err(io::Error::other(format!(
                 "bad CQ sysmem NOC address: 0x{:x}",
@@ -425,10 +429,6 @@ impl CqSysmem {
             thread::sleep(Duration::from_micros(50));
         }
     }
-}
-
-fn host_sysmem_size() -> usize {
-    align_up(HOST_PROFILER_BASE as u64, PAGE_SIZE as u64) as usize
 }
 
 fn new_sysmem(path: &Path, size: usize, label: &str) -> io::Result<PinnedMemory> {
