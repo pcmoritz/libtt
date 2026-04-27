@@ -105,10 +105,14 @@ fn update_pjrt_bindings() -> Result<(), Box<dyn Error>> {
 fn update_cq_bindings() -> Result<(), Box<dyn Error>> {
     let repo_root = repo_root()?;
     let header = repo_root.join("firmware/cq/cq_commands.hpp");
+    let fixed_config = repo_root.join("firmware/cq/cq_fixed_config.hpp");
     let output = repo_root.join("src/cq_bindings.rs");
 
     if !header.is_file() {
         return Err(format!("missing CQ header: {}", header.display()).into());
+    }
+    if !fixed_config.is_file() {
+        return Err(format!("missing CQ fixed config: {}", fixed_config.display()).into());
     }
 
     let bindings = bindgen::Builder::default()
@@ -140,6 +144,12 @@ fn update_cq_bindings() -> Result<(), Box<dyn Error>> {
         .allowlist_var("CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM")
         .allowlist_var("CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET")
         .allowlist_var("FIRST_STREAM_USED")
+        .allowlist_var("DISPATCH_CB_PAGES")
+        .allowlist_var("COMPLETION_QUEUE_SIZE")
+        .allowlist_var("HOST_COMPLETION_Q_WR_PTR")
+        .allowlist_var("DEV_COMPLETION_Q_WR_PTR")
+        .allowlist_var("DEV_COMPLETION_Q_RD_PTR")
+        .allowlist_var("DISPATCH_S_SYNC_SEM_BASE_ADDR")
         .default_enum_style(bindgen::EnumVariation::Rust {
             non_exhaustive: false,
         })
@@ -147,11 +157,31 @@ fn update_cq_bindings() -> Result<(), Box<dyn Error>> {
         .generate()
         .map_err(|_| "failed to generate CQ bindings")?;
 
+    let prefetch_bindings = bindgen::Builder::default()
+        .header_contents(
+            "cq_prefetch_fixed_config_wrapper.hpp",
+            "#define COMPILE_FOR_BRISC 1\n\
+             #define NOC_INDEX 0\n\
+             #include \"firmware/cq/cq_fixed_config.hpp\"\n",
+        )
+        .clang_arg("-x")
+        .clang_arg("c++")
+        .clang_arg("-std=c++17")
+        .clang_arg(format!("-I{}", repo_root.display()))
+        .allowlist_var("PREFETCH_Q_BASE")
+        .allowlist_var("PREFETCH_Q_SIZE")
+        .allowlist_var("PREFETCH_Q_RD_PTR_ADDR")
+        .allowlist_var("PREFETCH_Q_PCIE_RD_PTR_ADDR")
+        .generate()
+        .map_err(|_| "failed to generate CQ prefetch fixed config bindings")?;
+
     let mut contents = String::from(
         "// Generated from firmware/cq/cq_commands.hpp and firmware/cq/cq_fixed_config.hpp.\n\
          // Regenerate with `cargo run --manifest-path xtask/Cargo.toml -- update-cq-bindings`.\n\n",
     );
     contents.push_str(&bindings.to_string());
+    contents.push_str("\n// Constants generated from the prefetch BRISC fixed config.\n");
+    contents.push_str(&prefetch_bindings.to_string());
 
     fs::write(&output, contents)?;
     println!("updated {}", output.display());

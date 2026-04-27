@@ -4,6 +4,7 @@ use crate::hw::{align_down, align_up, noc_xy, Arc, CoreCoord, TensixL1, TensixMM
 use crate::linux::{NocOrdering, PinnedMemory, TlbWindow};
 use crate::log::log;
 use std::io;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,19 +16,18 @@ mod cq_bindings {
 
 use cq_bindings::*;
 
-const CQ_L1: usize = 0x196C0;
-const CQ_PREFETCH_Q_RD_PTR: usize = CQ_L1;
-const CQ_PREFETCH_Q_PCIE_RD: usize = CQ_L1 + 0x04;
-const CQ_COMPLETION_WR_PTR: usize = CQ_L1 + 0x10;
-const CQ_COMPLETION_RD_PTR: usize = CQ_L1 + 0x20;
-const CQ_COMPLETION_Q0_EVENT: usize = CQ_L1 + 0x30;
-const CQ_COMPLETION_Q1_EVENT: usize = CQ_L1 + 0x40;
-const CQ_DISPATCH_SYNC_SEM: usize = CQ_L1 + 0x50;
-const CQ_PREFETCH_Q_BASE: usize = CQ_L1 + 0x180;
-const CQ_PREFETCH_Q_ENTRIES: usize = 1534;
-const CQ_PREFETCH_Q_ENTRY_SIZE: usize = 2;
-const CQ_PREFETCH_Q_SIZE: usize = CQ_PREFETCH_Q_ENTRIES * CQ_PREFETCH_Q_ENTRY_SIZE;
-const CQ_DISPATCH_CB_PAGES: u32 = (512 * 1024) >> 12;
+const CQ_PREFETCH_Q_RD_PTR: usize = PREFETCH_Q_RD_PTR_ADDR as usize;
+const CQ_PREFETCH_Q_PCIE_RD: usize = PREFETCH_Q_PCIE_RD_PTR_ADDR as usize;
+const CQ_COMPLETION_WR_PTR: usize = DEV_COMPLETION_Q_WR_PTR as usize;
+const CQ_COMPLETION_RD_PTR: usize = DEV_COMPLETION_Q_RD_PTR as usize;
+const CQ_COMPLETION_Q0_EVENT: usize = DEV_COMPLETION_Q_WR_PTR as usize + 0x20;
+const CQ_COMPLETION_Q1_EVENT: usize = DEV_COMPLETION_Q_WR_PTR as usize + 0x30;
+const CQ_DISPATCH_SYNC_SEM: usize = DISPATCH_S_SYNC_SEM_BASE_ADDR as usize;
+const CQ_PREFETCH_Q_BASE: usize = PREFETCH_Q_BASE as usize;
+const CQ_PREFETCH_Q_ENTRY_SIZE: usize = size_of::<u16>();
+const CQ_PREFETCH_Q_SIZE: usize = PREFETCH_Q_SIZE as usize;
+const CQ_PREFETCH_Q_ENTRIES: usize = CQ_PREFETCH_Q_SIZE / CQ_PREFETCH_Q_ENTRY_SIZE;
+const CQ_DISPATCH_CB_PAGES: u32 = DISPATCH_CB_PAGES;
 
 const PCIE_NOC_BASE: u64 = 1 << 60;
 const PCIE_ALIGN: usize = 64;
@@ -37,7 +37,7 @@ const PAGE_SIZE: usize = 4096;
 const HOST_ISSUE_BASE: usize = 4 * PCIE_ALIGN;
 const HOST_ISSUE_SIZE: usize = 64 * 1024 * 1024;
 const HOST_COMPLETION_BASE: usize = HOST_ISSUE_BASE + HOST_ISSUE_SIZE;
-const HOST_COMPLETION_SIZE: usize = 32 * 1024 * 1024;
+const HOST_COMPLETION_SIZE: usize = COMPLETION_QUEUE_SIZE as usize;
 const HOST_TIMESTAMP_BASE: usize = HOST_COMPLETION_BASE + HOST_COMPLETION_SIZE;
 const HOST_TIMESTAMP_STRIDE: usize = 16;
 const HOST_TIMESTAMP_SLOTS: usize = 4096;
@@ -46,7 +46,7 @@ const HOST_TIMESTAMP_SIZE: usize = align_up(
     PCIE_ALIGN as u64,
 ) as usize;
 const HOST_PROFILER_BASE: usize = HOST_TIMESTAMP_BASE + HOST_TIMESTAMP_SIZE;
-const HOST_CQ_WR_OFF: usize = 2 * PCIE_ALIGN;
+const HOST_CQ_WR_OFF: usize = HOST_COMPLETION_Q_WR_PTR as usize;
 const HOST_CQ_RD_OFF: usize = 3 * PCIE_ALIGN;
 const PCIE_BASE_GUARD_SIZE: usize = 1 << 30;
 
