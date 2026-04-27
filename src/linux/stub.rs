@@ -75,10 +75,6 @@ impl PinnedMemory {
         0
     }
 
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        &[]
-    }
-
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut []
     }

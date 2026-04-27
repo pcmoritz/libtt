@@ -310,10 +310,6 @@ impl PinnedMemory {
         self.noc_addr
     }
 
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        self.mapping.as_slice()
-    }
-
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         self.mapping.as_mut_slice()
     }
@@ -374,10 +370,6 @@ impl MappedRegion {
         self.check_range(offset, len)?;
         let bytes = unsafe { std::slice::from_raw_parts(self.addr.add(offset), len) };
         Ok(bytes.to_vec())
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.addr, self.len) }
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
