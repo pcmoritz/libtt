@@ -240,8 +240,6 @@ impl Drop for TlbWindow {
 pub(crate) struct PinnedMemory {
     file: File,
     mapping: AnonymousMapping,
-    virtual_address: u64,
-    size: usize,
     noc_addr: u64,
 }
 
@@ -259,6 +257,7 @@ impl PinnedMemory {
             )
         })?;
         let virtual_address = mapping.addr as u64;
+        let size = mapping.len;
         if virtual_address % PAGE_SIZE as u64 != 0 || size % PAGE_SIZE != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -289,8 +288,6 @@ impl PinnedMemory {
         Ok(Self {
             file,
             mapping,
-            virtual_address,
-            size,
             noc_addr,
         })
     }
@@ -311,8 +308,8 @@ impl PinnedMemory {
 impl Drop for PinnedMemory {
     fn drop(&mut self) {
         let mut unpin = UnpinIn {
-            virtual_address: self.virtual_address,
-            size: self.size as u64,
+            virtual_address: self.mapping.addr as u64,
+            size: self.mapping.len as u64,
             reserved: 0,
         };
         let _ = ioctl_call(self.file.as_raw_fd(), TT_IOCTL_UNPIN_PAGES, &mut unpin);
