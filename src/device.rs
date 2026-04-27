@@ -179,6 +179,7 @@ impl Device {
             config.name
         ));
 
+        // Use the slow dispatcher to bootstrap the device before switching to the fast dispatcher.
         let dispatcher: Box<dyn Dispatcher> = Box::new(SlowDispatcher::new(path.as_path())?);
 
         let mut info = Self {
