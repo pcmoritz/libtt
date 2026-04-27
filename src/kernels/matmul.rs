@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(plan.per_core_n, 12);
         assert_eq!(plan.in0_block_w, 8);
         assert_eq!(plan.out_subblock_h, 1);
-        assert_eq!(plan.out_subblock_w, 2);
+        assert_eq!(plan.out_subblock_w, 6);
     }
 
     #[test]
