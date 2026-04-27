@@ -1,4 +1,4 @@
-use crate::hw::CoreCoord;
+use crate::hw::{align_up, CoreCoord};
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -256,9 +256,7 @@ impl PinnedMemory {
             .write(true)
             .open(path)
             .map_err(|err| io::Error::new(err.kind(), format!("open {}: {err}", path.display())))?;
-        let len = size.checked_add(HUGE_PAGE_SIZE - 1).ok_or_else(|| {
-            io::Error::other(format!("hugepage mmap length overflow: len=0x{size:x}"))
-        })? & !(HUGE_PAGE_SIZE - 1);
+        let len = align_up(size as u64, HUGE_PAGE_SIZE as u64) as usize;
         let mapping = MappedRegion::map(
             len,
             PROT_READ | PROT_WRITE,
