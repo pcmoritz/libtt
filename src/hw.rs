@@ -117,7 +117,7 @@ impl Dram {
     }
 }
 
-pub(crate) fn align_up(value: u64, align: u64) -> u64 {
+pub(crate) const fn align_up(value: u64, align: u64) -> u64 {
     value.div_ceil(align) * align
 }
 
@@ -134,4 +134,8 @@ pub(crate) fn worker_cores(tensix_x: &[u8]) -> Vec<CoreCoord> {
         }
     }
     cores
+}
+
+pub(crate) fn noc_xy(x: u8, y: u8) -> u32 {
+    (((y as u32) << 6) | x as u32) & 0xffff
 }

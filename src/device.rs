@@ -1,10 +1,14 @@
 use crate::compiler::Compiler;
-use crate::dispatch::{DevMsgs, Program, build_dispatch_plan, execute_slow_dispatch, mcast_rects};
+use crate::cq::FastDispatcher;
+use crate::dispatch::{
+    build_dispatch_plan, mcast_rects, DevMsgs, DispatchCommand, Program, SlowDispatcher,
+};
 use crate::dram::{Allocator, DType, DramBuffer};
-use crate::hw::{Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO, align_down, worker_cores};
+use crate::hw::{align_down, worker_cores, Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO};
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -90,7 +94,33 @@ pub struct Device {
     pub(crate) active_dram_banks: usize,
     pub(crate) dram_tiles: Vec<DramTile>,
     allocator: Option<Allocator>,
-    compiler: Option<Compiler>,
+    compiler: Compiler,
+    dispatcher: Box<dyn Dispatcher>,
+}
+
+trait Dispatcher {
+    fn dispatch_mode(&self) -> u8;
+    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()>;
+}
+
+impl Dispatcher for FastDispatcher {
+    fn dispatch_mode(&self) -> u8 {
+        DevMsgs::DISPATCH_MODE_DEV
+    }
+
+    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
+        FastDispatcher::execute(self, commands)
+    }
+}
+
+impl Dispatcher for SlowDispatcher {
+    fn dispatch_mode(&self) -> u8 {
+        DevMsgs::DISPATCH_MODE_HOST
+    }
+
+    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
+        SlowDispatcher::execute(self, commands)
+    }
 }
 
 impl Device {
@@ -131,6 +161,26 @@ impl Device {
         let harvested_dram_banks = Dram::harvested_banks(probe.gddr_enabled_mask);
         let dram_tiles = Dram::tiles(&harvested_dram_banks);
         let config = board.config();
+        let all_worker_cores = worker_cores(config.tensix_x);
+        if all_worker_cores.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("device {id} is missing Blackhole topology metadata"),
+            ));
+        }
+        let compiler = Compiler::new(
+            active_dram_banks,
+            all_worker_cores.len(),
+            (config.prefetch.x, config.prefetch.y),
+            (config.dispatch.x, config.dispatch.y),
+        )?;
+        log(format!(
+            "device {id} compiler initialized for {}",
+            config.name
+        ));
+
+        // Use the slow dispatcher to bootstrap the device before switching to the fast dispatcher.
+        let dispatcher: Box<dyn Dispatcher> = Box::new(SlowDispatcher::new(path.as_path())?);
 
         let mut info = Self {
             id,
@@ -139,17 +189,34 @@ impl Device {
             board,
             arch: config.name.to_owned(),
             tensix_core_count,
-            all_worker_cores: worker_cores(config.tensix_x),
+            all_worker_cores,
             prefetch_core: config.prefetch,
             dispatch_core: config.dispatch,
             harvested_dram_banks,
             active_dram_banks,
             dram_tiles,
             allocator: None,
-            compiler: None,
+            compiler,
+            dispatcher,
         };
 
-        info.initialize_compiler();
+        if let Err(err) = info.upload_firmware() {
+            log(format!("device {} firmware upload skipped: {err}", info.id));
+        }
+
+        info.dispatcher = if use_fast_dispatch() {
+            log("using fast dispatch");
+            Box::new(FastDispatcher::new(
+                info.path.clone(),
+                info.prefetch_core,
+                info.dispatch_core,
+                &info.compiler,
+            )?)
+        } else {
+            log("using slow dispatch");
+            Box::new(SlowDispatcher::new(info.path.as_path())?)
+        };
+
         Ok(info)
     }
 
@@ -219,19 +286,20 @@ impl Device {
         load_device(local_hardware_id).map(|(_, device)| device)
     }
 
-    pub fn compiler(&self) -> Option<&Compiler> {
-        self.compiler.as_ref()
+    pub fn compiler(&self) -> &Compiler {
+        &self.compiler
     }
 
     pub fn run_program(&mut self, program: &Program) -> io::Result<()> {
-        let compiler = self
-            .compiler
-            .as_ref()
-            .ok_or_else(|| io::Error::other("compiler has not been initialized"))?;
         let worker_cores = self.cores();
-        let commands = build_dispatch_plan(compiler, &worker_cores, program)?;
-        execute_slow_dispatch(self.path.as_path(), &commands)?;
-        Ok(())
+        let dispatch_mode = self.dispatcher.dispatch_mode();
+        let commands = build_dispatch_plan(
+            &self.compiler,
+            &worker_cores,
+            program,
+            dispatch_mode,
+        )?;
+        self.dispatcher.execute(&commands)
     }
 
     pub fn alloc(
@@ -277,37 +345,8 @@ impl Device {
             .ok_or_else(|| io::Error::other("device allocator initialization failed"))
     }
 
-    fn initialize_compiler(&mut self) {
-        if self.compiler.is_some() || self.all_worker_cores.is_empty() {
-            return;
-        }
-
-        match Compiler::for_device(self) {
-            Ok(compiler) => {
-                self.compiler = Some(compiler);
-                log(format!(
-                    "device {} compiler initialized for {}",
-                    self.id, self.arch
-                ));
-                if let Err(err) = self.upload_firmware() {
-                    log(format!("device {} firmware upload skipped: {err}", self.id));
-                }
-            }
-            Err(err) => {
-                log(format!(
-                    "device {} compiler initialization skipped: {err}",
-                    self.id
-                ));
-            }
-        }
-    }
-
     pub fn upload_firmware(&mut self) -> io::Result<()> {
-        let compiler = self
-            .compiler
-            .as_ref()
-            .ok_or_else(|| io::Error::other("compiler has not been initialized"))?;
-        let firmware = compiler.firmware();
+        let firmware = self.compiler.firmware();
         let all_cores = self.all_worker_cores.clone();
         if all_cores.is_empty() {
             return Err(io::Error::other("no worker cores discovered"));
@@ -513,6 +552,11 @@ fn read_arc_enabled_masks(path: &Path) -> io::Result<(u32, u32)> {
 fn encode_jal_zero(target: u32) -> [u8; 4] {
     ((target & 0xFF000) | ((target & 0x800) << 9) | ((target & 0x7FE) << 20) | 0x6F).to_le_bytes()
 }
+
+fn use_fast_dispatch() -> bool {
+    !matches!(env::var("LIBTT_FAST_DISPATCH").as_deref(), Ok("0"))
+}
+
 fn discover_with(root: &Path) -> Vec<Device> {
     let mut paths = Vec::new();
 

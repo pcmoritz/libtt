@@ -3,7 +3,7 @@ use crate::dispatch::Program;
 use crate::dram::DType;
 use crate::hw::TensixL1;
 use crate::log::log;
-use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -174,6 +174,7 @@ struct BuildRequest<'a> {
     target: &'a str,
     defines: &'a [String],
     extra_objs: &'a [String],
+    extra_includes: &'a [String],
     opt: &'a str,
     trisc: bool,
     xip_relocate: bool,
@@ -188,6 +189,7 @@ struct KernelCacheInput<'a> {
     trisc: bool,
     xip_relocate: bool,
     headers: &'a BTreeMap<String, String>,
+    extra_include_files: &'a [(PathBuf, Vec<u8>)],
     fw_elf: &'a [u8],
 }
 
@@ -297,6 +299,30 @@ impl Compiler {
         &self.firmware
     }
 
+    pub(crate) fn compile_cq_kernels(&self) -> io::Result<HashMap<String, CompiledKernel>> {
+        let cq_src_dir = repo_root().join("firmware").join("cq");
+        let cq_includes = vec![cq_src_dir.display().to_string()];
+        let compile = |name: &str, src_name: &str, processor: &str, noc_index: u8| {
+            self.compile_dataflow_for_cq(
+                &fs::read_to_string(cq_src_dir.join(src_name))?,
+                processor,
+                noc_index,
+                &cq_includes,
+            )
+            .map(|kernel| (name.to_owned(), kernel))
+        };
+        Ok(HashMap::from([
+            compile("prefetch_brisc", "cq_prefetch.cpp", "brisc", 0)?,
+            compile("dispatch_brisc", "cq_dispatch.cpp", "brisc", 1)?,
+            compile(
+                "dispatch_s_ncrisc",
+                "cq_dispatch_subordinate.cpp",
+                "ncrisc",
+                1,
+            )?,
+        ]))
+    }
+
     pub fn compile_dataflow(
         &self,
         src: &str,
@@ -323,14 +349,12 @@ impl Compiler {
             "-DNOC_MODE=0".to_owned(),
         ];
         let extra_objs = if target == "brisc" {
-            vec![
-                deps_root()
-                    .join("lib")
-                    .join("blackhole")
-                    .join("noc.o")
-                    .display()
-                    .to_string(),
-            ]
+            vec![deps_root()
+                .join("lib")
+                .join("blackhole")
+                .join("noc.o")
+                .display()
+                .to_string()]
         } else {
             Vec::new()
         };
@@ -340,10 +364,59 @@ impl Compiler {
             target,
             target_defines,
             &extra_objs,
+            &[],
             "-O2",
             false,
             &program,
         )
+    }
+
+    fn compile_dataflow_for_cq(
+        &self,
+        src: &str,
+        processor: &str,
+        noc_index: u8,
+        extra_includes: &[String],
+    ) -> io::Result<CompiledKernel> {
+        let (target, processor_index) = match processor {
+            "brisc" => ("brisc", 0),
+            "ncrisc" => ("ncrisc", 1),
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("processor must be 'brisc' or 'ncrisc', got: {other}"),
+                ));
+            }
+        };
+        let mut defines = self.kernel_defines.clone();
+        defines.extend([
+            format!("-DCOMPILE_FOR_{}", target.to_uppercase()),
+            format!("-DPROCESSOR_INDEX={processor_index}"),
+            format!("-DNOC_INDEX={noc_index}"),
+            "-DNOC_MODE=0".to_owned(),
+        ]);
+        let extra_objs = if target == "brisc" {
+            vec![deps_root()
+                .join("lib")
+                .join("blackhole")
+                .join("noc.o")
+                .display()
+                .to_string()]
+        } else {
+            Vec::new()
+        };
+        let program = Program::default();
+        self.build(BuildRequest {
+            kernel_source: src,
+            target,
+            defines: &defines,
+            extra_objs: &extra_objs,
+            extra_includes,
+            opt: "-O2",
+            trisc: false,
+            xip_relocate: true,
+            program: &program,
+        })
     }
 
     pub fn compile_compute(
@@ -376,6 +449,7 @@ impl Compiler {
                 format!("-DNAMESPACE=chlkc_{stage}"),
             ],
             &[],
+            &[],
             "-O3",
             true,
             program,
@@ -388,6 +462,7 @@ impl Compiler {
         target: &str,
         target_defines: Vec<String>,
         extra_objs: &[String],
+        extra_includes: &[String],
         opt: &str,
         trisc: bool,
         program: &Program,
@@ -402,6 +477,7 @@ impl Compiler {
             target,
             defines: &defines,
             extra_objs,
+            extra_includes,
             opt,
             trisc,
             xip_relocate: false,
@@ -411,6 +487,7 @@ impl Compiler {
 
     fn build(&self, request: BuildRequest<'_>) -> io::Result<CompiledKernel> {
         let headers = ckernel_headers(request.program);
+        let extra_include_files = include_file_inputs(request.extra_includes)?;
 
         let fw = self.firmware.get(request.target).ok_or_else(|| {
             io::Error::new(
@@ -427,6 +504,7 @@ impl Compiler {
             trisc: request.trisc,
             xip_relocate: request.xip_relocate,
             headers: &headers,
+            extra_include_files: &extra_include_files,
             fw_elf: &fw.elf_bytes,
         });
         if let Some(entry) = kernel_cache()
@@ -457,7 +535,13 @@ impl Compiler {
             format!("{}k.cc", request.target)
         });
 
-        let includes = self.includes.clone();
+        let mut includes = self.includes.clone();
+        includes.extend(
+            request
+                .extra_includes
+                .iter()
+                .map(|include| format!("-I{include}")),
+        );
         let cflags = CFLAGS
             .iter()
             .map(|value| (*value).to_owned())
@@ -1303,8 +1387,40 @@ fn kernel_cache_key(input: KernelCacheInput<'_>) -> String {
         name.hash(&mut hasher);
         content.hash(&mut hasher);
     }
+    input.extra_include_files.len().hash(&mut hasher);
+    for (path, content) in input.extra_include_files {
+        path.hash(&mut hasher);
+        content.hash(&mut hasher);
+    }
     input.fw_elf.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn include_file_inputs(include_dirs: &[String]) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
+    let mut files = Vec::new();
+    for dir in include_dirs {
+        collect_include_files(Path::new(dir), Path::new(dir), &mut files)?;
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+fn collect_include_files(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<(PathBuf, Vec<u8>)>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_include_files(root, &path, files)?;
+        } else if path.is_file() {
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            files.push((rel, fs::read(path)?));
+        }
+    }
+    Ok(())
 }
 
 fn read_u16(data: &[u8], offset: usize) -> io::Result<u16> {

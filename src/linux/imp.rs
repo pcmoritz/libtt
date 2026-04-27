@@ -1,7 +1,8 @@
-use crate::hw::CoreCoord;
+use crate::hw::{align_up, CoreCoord};
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::ptr;
@@ -10,9 +11,17 @@ const TT_IOCTL_BASE: c_ulong = 0xFA << 8;
 const TT_IOCTL_ALLOC_TLB: c_ulong = TT_IOCTL_BASE | 11;
 const TT_IOCTL_FREE_TLB: c_ulong = TT_IOCTL_BASE | 12;
 const TT_IOCTL_CONFIG_TLB: c_ulong = TT_IOCTL_BASE | 13;
+const TT_IOCTL_PIN_PAGES: c_ulong = TT_IOCTL_BASE | 7;
+const TT_IOCTL_UNPIN_PAGES: c_ulong = TT_IOCTL_BASE | 10;
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x01;
+const MAP_ANONYMOUS: c_int = 0x20;
+const MAP_HUGETLB: c_int = 0x40000;
+const MAP_HUGE_1GB: c_int = 30 << 26;
+const PAGE_SIZE: usize = 4096;
+const HUGE_PAGE_SIZE: usize = 1 << 30;
+const PIN_NOC_DMA: u32 = 2;
 
 unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
@@ -82,6 +91,37 @@ struct ConfigIn {
     config: NocTlbConfig,
 }
 
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct PinIn {
+    output_size_bytes: u32,
+    flags: u32,
+    virtual_address: u64,
+    size: u64,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct PinOut {
+    physical_address: u64,
+    noc_address: u64,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct PinIo {
+    input: PinIn,
+    output: PinOut,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct UnpinIn {
+    virtual_address: u64,
+    size: u64,
+    reserved: u64,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum NocOrdering {
     Relaxed = 0,
@@ -127,7 +167,13 @@ impl TlbWindow {
             id,
             mapping: None,
         };
-        window.mapping = Some(MappedRegion::map(window.file.as_raw_fd(), len, offset)?);
+        window.mapping = Some(MappedRegion::map(
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            window.file.as_raw_fd(),
+            offset,
+        )?);
         Ok(window)
     }
 
@@ -197,23 +243,105 @@ impl Drop for TlbWindow {
     }
 }
 
+pub(crate) struct PinnedMemory {
+    file: File,
+    mapping: MappedRegion,
+    noc_addr: u64,
+}
+
+impl PinnedMemory {
+    pub(crate) fn new(path: &Path, size: usize) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|err| io::Error::new(err.kind(), format!("open {}: {err}", path.display())))?;
+        let len = align_up(size as u64, HUGE_PAGE_SIZE as u64) as usize;
+        let mapping = MappedRegion::map(
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB,
+            -1,
+            0,
+        )
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("map pinned memory size=0x{size:x} len=0x{len:x}: {err}"),
+            )
+        })?;
+        let virtual_address = mapping.addr as u64;
+        let size = mapping.len;
+        if virtual_address % PAGE_SIZE as u64 != 0 || size % PAGE_SIZE != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "pinned memory must be page-aligned and page-sized: va=0x{virtual_address:x} size=0x{size:x}"
+                ),
+            ));
+        }
+        let mut pin = PinIo {
+            input: PinIn {
+                output_size_bytes: size_of::<PinOut>() as u32,
+                flags: PIN_NOC_DMA,
+                virtual_address,
+                size: size as u64,
+            },
+            output: PinOut::default(),
+        };
+        ioctl_call(file.as_raw_fd(), TT_IOCTL_PIN_PAGES, &mut pin).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "pin NOC DMA pages failed for {}: va=0x{virtual_address:x} size=0x{size:x} flags={PIN_NOC_DMA}: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        let noc_addr = unsafe { ptr::addr_of!(pin.output.noc_address).read_unaligned() };
+        Ok(Self {
+            file,
+            mapping,
+            noc_addr,
+        })
+    }
+
+    pub(crate) fn noc_addr(&self) -> u64 {
+        self.noc_addr
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.mapping.as_mut_slice()
+    }
+
+    pub(crate) fn read32(&self, offset: usize) -> io::Result<u32> {
+        self.mapping.read32(offset)
+    }
+
+    pub(crate) fn write32(&mut self, offset: usize, value: u32) -> io::Result<()> {
+        self.mapping.write(offset, &value.to_le_bytes())
+    }
+}
+
+impl Drop for PinnedMemory {
+    fn drop(&mut self) {
+        let mut unpin = UnpinIn {
+            virtual_address: self.mapping.addr as u64,
+            size: self.mapping.len as u64,
+            reserved: 0,
+        };
+        let _ = ioctl_call(self.file.as_raw_fd(), TT_IOCTL_UNPIN_PAGES, &mut unpin);
+    }
+}
+
 struct MappedRegion {
     addr: *mut u8,
     len: usize,
 }
 
 impl MappedRegion {
-    fn map(fd: c_int, len: usize, offset: u64) -> io::Result<Self> {
-        let addr = unsafe {
-            mmap(
-                ptr::null_mut(),
-                len,
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED,
-                fd,
-                offset as i64,
-            )
-        };
+    fn map(len: usize, prot: c_int, flags: c_int, fd: c_int, offset: u64) -> io::Result<Self> {
+        let addr = unsafe { mmap(ptr::null_mut(), len, prot, flags, fd, offset as i64) };
         if addr as isize == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -244,13 +372,17 @@ impl MappedRegion {
         Ok(bytes.to_vec())
     }
 
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.addr, self.len) }
+    }
+
     fn check_range(&self, offset: usize, len: usize) -> io::Result<()> {
         let end = offset
             .checked_add(len)
-            .ok_or_else(|| io::Error::other("TLB access overflow"))?;
+            .ok_or_else(|| io::Error::other("mapping access overflow"))?;
         if end > self.len {
             Err(io::Error::other(format!(
-                "TLB access out of range: offset=0x{offset:x} len=0x{len:x} mapping_len=0x{:x}",
+                "mapping access out of range: offset=0x{offset:x} len=0x{len:x} mapping_len=0x{:x}",
                 self.len
             )))
         } else {
