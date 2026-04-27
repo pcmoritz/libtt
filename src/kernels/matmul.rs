@@ -181,27 +181,7 @@ fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::
 }
 
 fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
-    let plan = plan_matmul_for_cores(m, k, n, cores)?;
-    if crosses_column_gap(&plan) {
-        let west_cores = cores
-            .iter()
-            .copied()
-            .filter(|core| core.x < 8)
-            .collect::<Vec<_>>();
-        if let Ok(west_plan) = plan_matmul_for_cores_with_min_subblock(m, k, n, &west_cores, 2, 2)
-            .or_else(|_| plan_matmul_for_cores(m, k, n, &west_cores))
-        {
-            log(format!(
-                "matmul_bf16 avoiding cross-gap multicast: full grid={}x{} fallback grid={}x{}",
-                plan.rows.len(),
-                plan.cols.len(),
-                west_plan.rows.len(),
-                west_plan.cols.len()
-            ));
-            return Ok(west_plan);
-        }
-    }
-    Ok(plan)
+    plan_matmul_for_cores(m, k, n, cores)
 }
 
 fn plan_matmul_for_cores(
@@ -210,20 +190,9 @@ fn plan_matmul_for_cores(
     n: usize,
     cores: &[CoreCoord],
 ) -> io::Result<MatmulPlan> {
-    plan_matmul_for_cores_with_min_subblock(m, k, n, cores, 1, 1)
-}
-
-fn plan_matmul_for_cores_with_min_subblock(
-    m: usize,
-    k: usize,
-    n: usize,
-    cores: &[CoreCoord],
-    min_out_subblock_num_tiles: usize,
-    min_out_subblock_w: usize,
-) -> io::Result<MatmulPlan> {
-    let mt_base = m / 32;
-    let kt = k / 32;
-    let nt_base = n / 32;
+    let mt_base = ceil32(m) / 32;
+    let kt = ceil32(k) / 32;
+    let nt_base = (ceil32(n) / 32).max(1);
     let tile_bytes = DType::Float16B.tile_size();
     let l1_data_bytes = TensixL1::SIZE as usize - TensixL1::DATA_BUFFER_SPACE_BASE as usize;
 
@@ -276,8 +245,6 @@ fn plan_matmul_for_cores_with_min_subblock(
                     for out_subblock_w in 1..=8 {
                         let out_subblock_num_tiles = out_subblock_h * out_subblock_w;
                         if out_subblock_num_tiles > 8
-                            || out_subblock_num_tiles < min_out_subblock_num_tiles
-                            || out_subblock_w < min_out_subblock_w
                             || per_core_m % out_subblock_h != 0
                             || per_core_n % out_subblock_w != 0
                         {
@@ -357,10 +324,6 @@ fn plan_matmul_for_cores_with_min_subblock(
     })
 }
 
-fn crosses_column_gap(plan: &MatmulPlan) -> bool {
-    plan.cols.iter().any(|&x| x < 8) && plan.cols.iter().any(|&x| x >= 10)
-}
-
 fn fits_l1(
     per_core_m: usize,
     per_core_n: usize,
@@ -372,6 +335,10 @@ fn fits_l1(
     let cb1 = 2 * per_core_n * in0_block_w * tile_bytes;
     let cb_out = per_core_m * per_core_n * tile_bytes;
     cb0 + cb1 + cb_out <= l1_data_bytes
+}
+
+fn ceil32(value: usize) -> usize {
+    (value + 31) & !31
 }
 
 fn divisors(n: usize) -> Vec<usize> {
@@ -495,7 +462,7 @@ fn bf16_program_for_columns(
         writer_args,
         compute_args: Vec::new(),
         semaphores: NUM_SEMAPHORES,
-        math_fidelity: MathFidelity::LoFi,
+        math_fidelity: MathFidelity::HiFi2,
         grid: Some((plan.rows.clone(), plan.cols.clone())),
         per_core_reader_args,
         per_core_writer_args,
@@ -743,16 +710,23 @@ mod tests {
     #[test]
     fn plan_matmul_prefers_throughput_for_large_shapes() {
         let plan = plan_matmul(4096, 8192, 4096, &p100_worker_cores()).expect("plan");
-        assert!(!crosses_column_gap(&plan));
         assert_eq!(plan.rows, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        assert_eq!(plan.cols, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(plan.cols, vec![1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13]);
         assert_eq!(plan.mt, 130);
         assert_eq!(plan.nt, 132);
         assert_eq!(plan.per_core_m, 13);
-        assert_eq!(plan.per_core_n, 22);
-        assert_eq!(plan.in0_block_w, 4);
+        assert_eq!(plan.per_core_n, 12);
+        assert_eq!(plan.in0_block_w, 8);
         assert_eq!(plan.out_subblock_h, 1);
         assert_eq!(plan.out_subblock_w, 2);
+    }
+
+    #[test]
+    fn plan_matmul_uses_ceiled_tile_shape() {
+        let plan = plan_matmul_for_cores(33, 65, 1, &cores(&[1], &[2])).expect("plan");
+        assert_eq!(plan.mt, 2);
+        assert_eq!(plan.kt, 3);
+        assert_eq!(plan.nt, 1);
     }
 
     #[test]
@@ -771,17 +745,5 @@ mod tests {
         let sender = grid[0][0];
         let args = reader_args(&plan, 1, 2, &grid, 0, sender, 128).expect("reader args");
         assert_eq!(args[18] as usize, plan.cols.len() - 1);
-    }
-
-    #[test]
-    fn unrestricted_planner_matches_blackhole_large_shape() {
-        let plan = plan_matmul_for_cores(4096, 8192, 4096, &p100_worker_cores()).expect("plan");
-        assert_eq!(plan.rows, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        assert_eq!(plan.cols, vec![1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13]);
-        assert_eq!(plan.mt, 130);
-        assert_eq!(plan.nt, 132);
-        assert_eq!(plan.per_core_m, 13);
-        assert_eq!(plan.per_core_n, 12);
-        assert_eq!(plan.in0_block_w, 8);
     }
 }
