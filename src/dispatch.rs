@@ -67,19 +67,19 @@ struct CircularBufferConfigMsg {
     page_size: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum MathFidelity {
     LoFi = 0,
     HiFi2 = 2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum CoreSelection {
     Count(usize),
     All,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct CBConfig {
     pub index: usize,
     pub dtype: DType,
@@ -97,7 +97,14 @@ impl CBConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeArgs {
+    pub(crate) cores: Vec<CoreCoord>,
+    pub(crate) blobs: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
+    pub static_key: Option<u64>,
     pub cores: CoreSelection,
     pub reader_kernel: String,
     pub compute_kernel: String,
@@ -115,6 +122,7 @@ pub struct Program {
     pub reader_recv_kernel: String,
     pub writer_recv_kernel: String,
     pub grid: Option<(Vec<u8>, Vec<u8>)>,
+    pub(crate) runtime_args: Option<RuntimeArgs>,
     pub per_core_reader_args: Vec<((u8, u8), Vec<u32>)>,
     pub per_core_writer_args: Vec<((u8, u8), Vec<u32>)>,
 }
@@ -122,6 +130,7 @@ pub struct Program {
 impl Default for Program {
     fn default() -> Self {
         Self {
+            static_key: None,
             cores: CoreSelection::Count(1),
             reader_kernel: String::new(),
             compute_kernel: String::new(),
@@ -139,6 +148,7 @@ impl Default for Program {
             reader_recv_kernel: String::new(),
             writer_recv_kernel: String::new(),
             grid: None,
+            runtime_args: None,
             per_core_reader_args: Vec::new(),
             per_core_writer_args: Vec::new(),
         }
@@ -151,6 +161,11 @@ pub(crate) enum DispatchCommand {
         cores: Vec<CoreCoord>,
         addr: usize,
         data: Vec<u8>,
+    },
+    WritePacked {
+        cores: Vec<CoreCoord>,
+        addr: usize,
+        data: Vec<Vec<u8>>,
     },
     Launch {
         cores: Vec<CoreCoord>,
@@ -174,6 +189,22 @@ impl SlowDispatcher {
                 DispatchCommand::Write { cores, addr, data } => {
                     for (start, end) in mcast_rects(cores) {
                         self.win.target(start, Some(end), 0, NocOrdering::Strict)?;
+                        self.win.write(*addr, data)?;
+                    }
+                }
+                DispatchCommand::WritePacked { cores, addr, data } => {
+                    if cores.len() != data.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "packed write core/data length mismatch: {} != {}",
+                                cores.len(),
+                                data.len()
+                            ),
+                        ));
+                    }
+                    for (core, data) in cores.iter().zip(data) {
+                        self.win.target(*core, None, 0, NocOrdering::Strict)?;
                         self.win.write(*addr, data)?;
                     }
                 }
@@ -287,7 +318,17 @@ pub(crate) fn build_dispatch_plan(
         },
     ];
 
-    if has_per_core_args(program) {
+    if let Some(runtime_args) = &program.runtime_args {
+        validate_runtime_args(runtime_args)?;
+        if runtime_args.blobs.iter().any(|blob| !blob.is_empty()) {
+            commands.push(DispatchCommand::WritePacked {
+                cores: runtime_args.cores.clone(),
+                addr: TensixL1::KERNEL_CONFIG_BASE as usize,
+                data: runtime_args.blobs.clone(),
+            });
+        }
+    } else if has_per_core_args(program) {
+        let mut rta_blobs = Vec::with_capacity(all_cores.len());
         for core in &all_cores {
             let writer_args = args_for_core(
                 &program.writer_args,
@@ -310,13 +351,14 @@ pub(crate) fn build_dispatch_plan(
                 program.semaphores,
                 sem_off,
             );
-            if !rta_blob.is_empty() {
-                commands.push(DispatchCommand::Write {
-                    cores: vec![*core],
-                    addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-                    data: rta_blob,
-                });
-            }
+            rta_blobs.push(rta_blob);
+        }
+        if rta_blobs.iter().any(|blob| !blob.is_empty()) {
+            commands.push(DispatchCommand::WritePacked {
+                cores: all_cores.clone(),
+                addr: TensixL1::KERNEL_CONFIG_BASE as usize,
+                data: rta_blobs,
+            });
         }
     } else if !common_rta_blob.is_empty() {
         commands.push(DispatchCommand::Write {
@@ -356,6 +398,140 @@ pub(crate) fn build_dispatch_plan(
     });
 
     Ok(commands)
+}
+
+pub(crate) fn build_dispatch_runtime_plan(
+    available_cores: &[CoreCoord],
+    program: &Program,
+) -> io::Result<Vec<DispatchCommand>> {
+    let all_cores = if let Some(runtime_args) = &program.runtime_args {
+        validate_runtime_args(runtime_args)?;
+        runtime_args.cores.clone()
+    } else {
+        selected_cores(available_cores, program)?
+    };
+    if all_cores.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no worker cores selected for dispatch",
+        ));
+    }
+
+    let rta_sizes = (
+        program.writer_args.len() * size_of::<u32>(),
+        program.reader_args.len() * size_of::<u32>(),
+        program.compute_args.len() * size_of::<u32>(),
+    );
+    let rta_total = rta_sizes.0 + rta_sizes.1 + rta_sizes.2;
+    let sem_off = align_up(rta_total as u64, L1_ALIGN as u64) as usize;
+    let common_rta_blob = pack_rta(
+        &program.writer_args,
+        &program.reader_args,
+        &program.compute_args,
+        program.semaphores,
+        sem_off,
+    );
+
+    let mut commands = vec![
+        DispatchCommand::Write {
+            cores: all_cores.clone(),
+            addr: TensixL1::GO_MSG as usize,
+            data: vec![0, 0, 0, DevMsgs::RUN_MSG_RESET_READ_PTR_FROM_HOST],
+        },
+        DispatchCommand::Write {
+            cores: all_cores.clone(),
+            addr: TensixL1::GO_MSG_INDEX as usize,
+            data: vec![0; size_of::<u32>()],
+        },
+    ];
+
+    if let Some(runtime_args) = &program.runtime_args {
+        if runtime_args.blobs.iter().any(|blob| !blob.is_empty()) {
+            commands.push(DispatchCommand::WritePacked {
+                cores: runtime_args.cores.clone(),
+                addr: TensixL1::KERNEL_CONFIG_BASE as usize,
+                data: runtime_args.blobs.clone(),
+            });
+        }
+    } else if has_per_core_args(program) {
+        let mut rta_blobs = Vec::with_capacity(all_cores.len());
+        for core in &all_cores {
+            let writer_args = args_for_core(
+                &program.writer_args,
+                &program.per_core_writer_args,
+                *core,
+                "writer",
+            )?;
+            let reader_args = args_for_core(
+                &program.reader_args,
+                &program.per_core_reader_args,
+                *core,
+                "reader",
+            )?;
+            validate_core_arg_len(writer_args, program.writer_args.len(), *core, "writer")?;
+            validate_core_arg_len(reader_args, program.reader_args.len(), *core, "reader")?;
+            let rta_blob = pack_rta(
+                writer_args,
+                reader_args,
+                &program.compute_args,
+                program.semaphores,
+                sem_off,
+            );
+            rta_blobs.push(rta_blob);
+        }
+        if rta_blobs.iter().any(|blob| !blob.is_empty()) {
+            commands.push(DispatchCommand::WritePacked {
+                cores: all_cores.clone(),
+                addr: TensixL1::KERNEL_CONFIG_BASE as usize,
+                data: rta_blobs,
+            });
+        }
+    } else if !common_rta_blob.is_empty() {
+        commands.push(DispatchCommand::Write {
+            cores: all_cores.clone(),
+            addr: TensixL1::KERNEL_CONFIG_BASE as usize,
+            data: common_rta_blob,
+        });
+    }
+
+    commands.push(DispatchCommand::Launch {
+        cores: all_cores.clone(),
+    });
+
+    Ok(commands)
+}
+
+fn selected_cores(available_cores: &[CoreCoord], program: &Program) -> io::Result<Vec<CoreCoord>> {
+    if let Some((rows, cols)) = &program.grid {
+        if rows.is_empty() || cols.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "program grid must contain at least one row and one column",
+            ));
+        }
+
+        let available = available_cores.iter().copied().collect::<BTreeSet<_>>();
+        let mut all_cores = Vec::with_capacity(rows.len() * cols.len());
+        for &x in cols {
+            for &y in rows {
+                let core = CoreCoord { x, y };
+                if !available.contains(&core) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("grid core {core} is not available on this device"),
+                    ));
+                }
+                all_cores.push(core);
+            }
+        }
+        all_cores.sort_unstable();
+        Ok(all_cores)
+    } else {
+        Ok(match program.cores {
+            CoreSelection::Count(count) => available_cores.iter().copied().take(count).collect(),
+            CoreSelection::All => available_cores.to_vec(),
+        })
+    }
 }
 
 fn build_roles(
@@ -464,7 +640,7 @@ fn build_roles(
     }
 }
 
-fn pack_rta(
+pub(crate) fn pack_rta(
     writer_args: &[u32],
     reader_args: &[u32],
     compute_args: &[u32],
@@ -490,6 +666,20 @@ fn pack_rta(
     }
 
     data
+}
+
+fn validate_runtime_args(runtime_args: &RuntimeArgs) -> io::Result<()> {
+    if runtime_args.cores.len() != runtime_args.blobs.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "runtime arg core/blob length mismatch: {} != {}",
+                runtime_args.cores.len(),
+                runtime_args.blobs.len()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn has_per_core_args(program: &Program) -> bool {

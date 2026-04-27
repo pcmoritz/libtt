@@ -1,9 +1,12 @@
 use crate::device::Device;
-use crate::dispatch::{CBConfig, CoreSelection, MathFidelity, Program};
+use crate::dispatch::{pack_rta, CBConfig, CoreSelection, MathFidelity, Program, RuntimeArgs};
 use crate::dram::{DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
-use crate::log::log;
+use crate::log::{enabled as log_enabled, log, profile, profile_enabled};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::env;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::{Mutex, OnceLock};
 
@@ -13,8 +16,40 @@ const BF16_WRITER_SENDER: &str = include_str!("../../kernels/matmul_writer_sende
 const BF16_WRITER_RECV: &str = include_str!("../../kernels/matmul_writer_recv.cc");
 const BF16_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
+const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
 
 static ZERO_TILE_BY_DEVICE: OnceLock<Mutex<HashMap<usize, DramBuffer>>> = OnceLock::new();
+static PLAN_CACHE: OnceLock<Mutex<HashMap<MatmulPlanKey, MatmulPlan>>> = OnceLock::new();
+static RUNTIME_TEMPLATE_CACHE: OnceLock<
+    Mutex<HashMap<MatmulRuntimeTemplateKey, MatmulRuntimeTemplate>>,
+> = OnceLock::new();
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct MatmulPlanKey {
+    m: usize,
+    k: usize,
+    n: usize,
+    cores: Vec<CoreCoord>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct MatmulRuntimeTemplateKey {
+    static_key: u64,
+    lhs_addr: u32,
+    rhs_addr: u32,
+    zero_addr: u32,
+    logical_mt: usize,
+    logical_nt: usize,
+    col_offset_tiles: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MatmulRuntimeTemplate {
+    cores: Vec<CoreCoord>,
+    blobs: Vec<Vec<u8>>,
+    reader_args: Vec<u32>,
+    writer_args: Vec<u32>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MatmulPlan {
@@ -101,35 +136,83 @@ pub(crate) fn matmul_bf16(
     validate_tile_count(lhs, m / 32 * k / 32, "lhs")?;
     validate_tile_count(rhs, k / 32 * n / 32, "rhs")?;
 
+    let timing = profile_enabled().then(std::time::Instant::now);
     let output_name = name.into();
     let logical_mt = m / 32;
     let logical_nt = n / 32;
+    let math_fidelity = matmul_math_fidelity()?;
     let cores = device.cores();
-    let plan = plan_matmul(m, k, n, &cores)?;
-    log(format!(
-        "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
-        plan.mt,
-        plan.kt,
-        plan.nt,
-        plan.rows.len(),
-        plan.cols.len(),
-        plan.per_core_m,
-        plan.per_core_n,
-        plan.in0_block_w,
-        plan.num_blocks(),
-        plan.out_subblock_h,
-        plan.out_subblock_w
-    ));
-
+    let plan = cached_plan_matmul(m, k, n, &cores)?;
+    let plan_done = timing.map(|start| (start, std::time::Instant::now()));
+    let static_key = matmul_static_key(&plan, math_fidelity);
+    if log_enabled() {
+        log(format!(
+            "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
+            plan.mt,
+            plan.kt,
+            plan.nt,
+            plan.rows.len(),
+            plan.cols.len(),
+            plan.per_core_m,
+            plan.per_core_n,
+            plan.in0_block_w,
+            plan.num_blocks(),
+            plan.out_subblock_h,
+            plan.out_subblock_w
+        ));
+    }
     let zero_tile = cached_zero_tile(device)?;
+    let zero_done = timing.map(|start| (start, std::time::Instant::now()));
     let output = device.alloc(
         logical_mt * logical_nt,
         DType::Float16B,
         Some(&[m, n]),
         output_name,
     )?;
-    let program = bf16_program(&plan, lhs, rhs, &output, &zero_tile, logical_mt, logical_nt)?;
+    let alloc_done = timing.map(|start| (start, std::time::Instant::now()));
+    let program = bf16_program(
+        &plan,
+        lhs,
+        rhs,
+        &output,
+        &zero_tile,
+        logical_mt,
+        logical_nt,
+        static_key,
+        math_fidelity,
+    )?;
+    let program_done = timing.map(|start| (start, std::time::Instant::now()));
     device.run_program(&program)?;
+    if let Some(start) = timing {
+        let done = std::time::Instant::now();
+        let plan = plan_done
+            .map(|(_, end)| end.duration_since(start))
+            .unwrap_or_default();
+        let zero = zero_done
+            .zip(plan_done)
+            .map(|((_, end), (_, prev))| end.duration_since(prev))
+            .unwrap_or_default();
+        let alloc = alloc_done
+            .zip(zero_done)
+            .map(|((_, end), (_, prev))| end.duration_since(prev))
+            .unwrap_or_default();
+        let program = program_done
+            .zip(alloc_done)
+            .map(|((_, end), (_, prev))| end.duration_since(prev))
+            .unwrap_or_default();
+        let run = program_done
+            .map(|(_, prev)| done.duration_since(prev))
+            .unwrap_or_default();
+        profile(format!(
+            "matmul_bf16 plan_us={:.1} zero_us={:.1} alloc_us={:.1} program_us={:.1} run_us={:.1} total_us={:.1}",
+            plan.as_secs_f64() * 1e6,
+            zero.as_secs_f64() * 1e6,
+            alloc.as_secs_f64() * 1e6,
+            program.as_secs_f64() * 1e6,
+            run.as_secs_f64() * 1e6,
+            done.duration_since(start).as_secs_f64() * 1e6,
+        ));
+    }
     Ok(output)
 }
 
@@ -182,6 +265,34 @@ fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::
 
 fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
     plan_matmul_for_cores(m, k, n, cores)
+}
+
+fn cached_plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
+    let mut ordered = cores.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+    let key = MatmulPlanKey {
+        m,
+        k,
+        n,
+        cores: ordered,
+    };
+    let cache = PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(plan) = cache
+        .lock()
+        .map_err(|_| io::Error::other("matmul plan cache is poisoned"))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(plan);
+    }
+
+    let plan = plan_matmul(m, k, n, cores)?;
+    cache
+        .lock()
+        .map_err(|_| io::Error::other("matmul plan cache is poisoned"))?
+        .insert(key, plan.clone());
+    Ok(plan)
 }
 
 fn plan_matmul_for_cores(
@@ -365,8 +476,21 @@ fn bf16_program(
     zero_tile: &DramBuffer,
     logical_mt: usize,
     logical_nt: usize,
+    static_key: u64,
+    math_fidelity: MathFidelity,
 ) -> io::Result<Program> {
-    bf16_program_for_columns(plan, lhs, rhs, output, zero_tile, logical_mt, logical_nt, 0)
+    bf16_program_for_columns(
+        plan,
+        lhs,
+        rhs,
+        output,
+        zero_tile,
+        logical_mt,
+        logical_nt,
+        0,
+        static_key,
+        math_fidelity,
+    )
 }
 
 fn bf16_program_for_columns(
@@ -378,80 +502,69 @@ fn bf16_program_for_columns(
     logical_mt: usize,
     logical_nt: usize,
     col_offset_tiles: usize,
+    static_key: u64,
+    math_fidelity: MathFidelity,
 ) -> io::Result<Program> {
     let lhs_addr = u32_arg(lhs.addr, "lhs address")?;
     let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
     let output_addr = u32_arg(output.addr, "output address")?;
     let zero_addr = u32_arg(zero_tile.addr, "zero tile address")?;
-    let grid = plan_grid(plan);
-
-    let mut per_core_reader_args = Vec::new();
-    let mut per_core_writer_args = Vec::new();
-    for (row_index, row) in grid.iter().enumerate() {
-        for (col_index, &core) in row.iter().enumerate() {
-            per_core_reader_args.push((
-                (core.x, core.y),
-                reader_args(
-                    plan, lhs_addr, zero_addr, &grid, row_index, core, logical_mt,
-                )?,
-            ));
-            per_core_writer_args.push((
-                (core.x, core.y),
-                writer_args(
-                    plan,
-                    rhs_addr,
-                    output_addr,
-                    &grid,
-                    row_index,
-                    col_index,
-                    core,
-                    zero_addr,
-                    logical_mt,
-                    logical_nt,
-                    col_offset_tiles,
-                )?,
-            ));
-        }
+    let runtime_template = cached_runtime_template(
+        plan,
+        static_key,
+        lhs_addr,
+        rhs_addr,
+        zero_addr,
+        logical_mt,
+        logical_nt,
+        col_offset_tiles,
+    )?;
+    let reader_args = runtime_template.reader_args.clone();
+    let mut writer_args = runtime_template.writer_args.clone();
+    if writer_args.len() > WRITER_OUTPUT_ADDR_INDEX {
+        writer_args[WRITER_OUTPUT_ADDR_INDEX] = output_addr;
+    }
+    let mut runtime_blobs = runtime_template.blobs.clone();
+    for blob in &mut runtime_blobs {
+        patch_u32(
+            blob,
+            WRITER_OUTPUT_ADDR_INDEX * std::mem::size_of::<u32>(),
+            output_addr,
+        )?;
     }
 
-    let reader_args = per_core_reader_args
-        .first()
-        .map(|(_, args)| args.clone())
-        .unwrap_or_default();
-    let writer_args = per_core_writer_args
-        .first()
-        .map(|(_, args)| args.clone())
-        .unwrap_or_default();
+    let cbs = vec![
+        CBConfig {
+            index: 0,
+            dtype: DType::Float16B,
+            tiles: plan.cb0_pages(),
+        },
+        CBConfig {
+            index: 1,
+            dtype: DType::Float16B,
+            tiles: plan.cb1_pages(),
+        },
+        CBConfig {
+            index: 16,
+            dtype: DType::Float16B,
+            tiles: plan.out_block_num_tiles(),
+        },
+        CBConfig {
+            index: 24,
+            dtype: DType::Float16B,
+            tiles: plan.out_block_num_tiles(),
+        },
+    ];
 
     Ok(Program {
+        static_key: Some(static_key),
         cores: CoreSelection::All,
         reader_kernel: BF16_READER_SENDER.to_owned(),
         writer_kernel: BF16_WRITER_SENDER.to_owned(),
         compute_kernel: compute_src(plan),
         reader_recv_kernel: BF16_READER_RECV.to_owned(),
         writer_recv_kernel: BF16_WRITER_RECV.to_owned(),
-        cbs: vec![
-            CBConfig {
-                index: 0,
-                dtype: DType::Float16B,
-                tiles: plan.cb0_pages(),
-            },
-            CBConfig {
-                index: 1,
-                dtype: DType::Float16B,
-                tiles: plan.cb1_pages(),
-            },
-            CBConfig {
-                index: 16,
-                dtype: DType::Float16B,
-                tiles: plan.out_block_num_tiles(),
-            },
-            CBConfig {
-                index: 24,
-                dtype: DType::Float16B,
-                tiles: plan.out_block_num_tiles(),
-            },
-        ],
+        cbs,
         name: format!(
             "matmul_bf16_{}x{}x{}",
             plan.mt * 32,
@@ -462,12 +575,171 @@ fn bf16_program_for_columns(
         writer_args,
         compute_args: Vec::new(),
         semaphores: NUM_SEMAPHORES,
-        math_fidelity: MathFidelity::HiFi2,
+        math_fidelity,
         grid: Some((plan.rows.clone(), plan.cols.clone())),
-        per_core_reader_args,
-        per_core_writer_args,
+        runtime_args: Some(RuntimeArgs {
+            cores: runtime_template.cores,
+            blobs: runtime_blobs,
+        }),
+        per_core_reader_args: Vec::new(),
+        per_core_writer_args: Vec::new(),
         ..Program::default()
     })
+}
+
+fn rta_sem_off(writer_args: usize, reader_args: usize, compute_args: usize) -> usize {
+    ((writer_args + reader_args + compute_args) * std::mem::size_of::<u32>() + 15) & !15
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cached_runtime_template(
+    plan: &MatmulPlan,
+    static_key: u64,
+    lhs_addr: u32,
+    rhs_addr: u32,
+    zero_addr: u32,
+    logical_mt: usize,
+    logical_nt: usize,
+    col_offset_tiles: usize,
+) -> io::Result<MatmulRuntimeTemplate> {
+    let key = MatmulRuntimeTemplateKey {
+        static_key,
+        lhs_addr,
+        rhs_addr,
+        zero_addr,
+        logical_mt,
+        logical_nt,
+        col_offset_tiles,
+    };
+    let cache = RUNTIME_TEMPLATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(template) = cache
+        .lock()
+        .map_err(|_| io::Error::other("matmul runtime template cache is poisoned"))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(template);
+    }
+
+    let template = build_runtime_template(
+        plan,
+        lhs_addr,
+        rhs_addr,
+        zero_addr,
+        logical_mt,
+        logical_nt,
+        col_offset_tiles,
+    )?;
+    cache
+        .lock()
+        .map_err(|_| io::Error::other("matmul runtime template cache is poisoned"))?
+        .insert(key, template.clone());
+    Ok(template)
+}
+
+fn build_runtime_template(
+    plan: &MatmulPlan,
+    lhs_addr: u32,
+    rhs_addr: u32,
+    zero_addr: u32,
+    logical_mt: usize,
+    logical_nt: usize,
+    col_offset_tiles: usize,
+) -> io::Result<MatmulRuntimeTemplate> {
+    let grid = plan_grid(plan);
+    let mut runtime_args = Vec::new();
+    let mut reader_args_first = None;
+    let mut writer_args_first = None;
+    for (row_index, row) in grid.iter().enumerate() {
+        for (col_index, &core) in row.iter().enumerate() {
+            let reader = reader_args(
+                plan, lhs_addr, zero_addr, &grid, row_index, core, logical_mt,
+            )?;
+            let writer = writer_args(
+                plan,
+                rhs_addr,
+                0,
+                &grid,
+                row_index,
+                col_index,
+                core,
+                zero_addr,
+                logical_mt,
+                logical_nt,
+                col_offset_tiles,
+            )?;
+            if reader_args_first.is_none() {
+                reader_args_first = Some(reader.clone());
+            }
+            if writer_args_first.is_none() {
+                writer_args_first = Some(writer.clone());
+            }
+            if writer.len() <= WRITER_OUTPUT_ADDR_INDEX {
+                return Err(invalid_input(format!(
+                    "matmul writer args missing output address at index {WRITER_OUTPUT_ADDR_INDEX}"
+                )));
+            }
+            let sem_off = rta_sem_off(writer.len(), reader.len(), 0);
+            runtime_args.push((
+                core,
+                pack_rta(&writer, &reader, &[], NUM_SEMAPHORES, sem_off),
+            ));
+        }
+    }
+    runtime_args.sort_unstable_by_key(|(core, _)| *core);
+    let (cores, blobs): (Vec<_>, Vec<_>) = runtime_args.into_iter().unzip();
+    Ok(MatmulRuntimeTemplate {
+        cores,
+        blobs,
+        reader_args: reader_args_first.unwrap_or_default(),
+        writer_args: writer_args_first.unwrap_or_default(),
+    })
+}
+
+fn patch_u32(blob: &mut [u8], offset: usize, value: u32) -> io::Result<()> {
+    let end = offset + std::mem::size_of::<u32>();
+    let blob_len = blob.len();
+    let bytes = blob.get_mut(offset..end).ok_or_else(|| {
+        invalid_input(format!(
+            "runtime arg patch offset {offset} exceeds blob size {}",
+            blob_len
+        ))
+    })?;
+    bytes.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn matmul_static_key(plan: &MatmulPlan, math_fidelity: MathFidelity) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    "matmul_bf16_v2".hash(&mut hasher);
+    plan.rows.hash(&mut hasher);
+    plan.cols.hash(&mut hasher);
+    plan.mt.hash(&mut hasher);
+    plan.kt.hash(&mut hasher);
+    plan.nt.hash(&mut hasher);
+    plan.per_core_m.hash(&mut hasher);
+    plan.per_core_n.hash(&mut hasher);
+    plan.in0_block_w.hash(&mut hasher);
+    plan.out_subblock_h.hash(&mut hasher);
+    plan.out_subblock_w.hash(&mut hasher);
+    math_fidelity.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn matmul_math_fidelity() -> io::Result<MathFidelity> {
+    match env::var("LIBTT_MATMUL_FIDELITY") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "" | "lofi" | "lo" | "0" => Ok(MathFidelity::LoFi),
+            "hifi2" | "hi2" | "2" => Ok(MathFidelity::HiFi2),
+            other => Err(invalid_input(format!(
+                "invalid LIBTT_MATMUL_FIDELITY={other:?}; expected lofi or hifi2"
+            ))),
+        },
+        Err(env::VarError::NotPresent) => Ok(MathFidelity::LoFi),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(invalid_input("LIBTT_MATMUL_FIDELITY must be valid Unicode"))
+        }
+    }
 }
 
 fn plan_grid(plan: &MatmulPlan) -> Vec<Vec<CoreCoord>> {
