@@ -117,7 +117,7 @@ impl Dram {
     }
 }
 
-pub(crate) fn align_up(value: u64, align: u64) -> u64 {
+pub(crate) const fn align_up(value: u64, align: u64) -> u64 {
     value.div_ceil(align) * align
 }
 

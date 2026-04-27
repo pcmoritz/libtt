@@ -35,7 +35,7 @@ const HOST_TIMESTAMP_BASE: usize = HOST_COMPLETION_BASE + HOST_COMPLETION_SIZE;
 const HOST_TIMESTAMP_STRIDE: usize = 16;
 const HOST_TIMESTAMP_SLOTS: usize = 4096;
 const HOST_TIMESTAMP_SIZE: usize =
-    align_up_usize(HOST_TIMESTAMP_SLOTS * HOST_TIMESTAMP_STRIDE, PCIE_ALIGN);
+    align_up((HOST_TIMESTAMP_SLOTS * HOST_TIMESTAMP_STRIDE) as u64, PCIE_ALIGN as u64) as usize;
 const HOST_PROFILER_BASE: usize = HOST_TIMESTAMP_BASE + HOST_TIMESTAMP_SIZE;
 const HOST_CQ_WR_OFF: usize = 2 * PCIE_ALIGN;
 const HOST_CQ_RD_OFF: usize = 3 * PCIE_ALIGN;
@@ -411,10 +411,6 @@ impl CqSysmem {
     fn sysmem_write32(&mut self, offset: usize, value: u32) {
         self.sysmem.as_mut_slice()[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
-}
-
-const fn align_up_usize(value: usize, align: usize) -> usize {
-    ((value + align - 1) / align) * align
 }
 
 fn host_sysmem_size() -> usize {
