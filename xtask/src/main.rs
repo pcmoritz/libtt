@@ -85,9 +85,7 @@ fn update_pjrt_bindings() -> Result<(), Box<dyn Error>> {
         .blocklist_type("PJRT_Layouts_MemoryLayout")
         .blocklist_type("PJRT_Layouts_SerializedLayout")
         .allowlist_item("PJRT_.*")
-        .default_enum_style(bindgen::EnumVariation::Rust {
-            non_exhaustive: false,
-        })
+        .default_enum_style(bindgen::EnumVariation::Consts)
         .layout_tests(false)
         .generate()
         .map_err(|_| "failed to generate PJRT bindings")?;
@@ -128,6 +126,13 @@ fn update_cq_bindings() -> Result<(), Box<dyn Error>> {
         .allowlist_type("CQPrefetchCmdId")
         .allowlist_type("CQDispatchCmdId")
         .allowlist_type("CQDispatchCmdPackedWriteLargeType")
+        .allowlist_type("CQPrefetchRelayInlineCmd")
+        .allowlist_type("CQDispatchWriteHostCmd")
+        .allowlist_type("CQDispatchWritePackedLargeCmd")
+        .allowlist_type("CQDispatchWritePackedLargeSubCmd")
+        .allowlist_type("CQDispatchWaitCmd")
+        .allowlist_type("CQDispatchGoSignalMcastCmd")
+        .allowlist_type("CQDispatchSetGoSignalNocDataCmd")
         .allowlist_var("CQ_DISPATCH_CMD_SIZE")
         .allowlist_var("CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK")
         .allowlist_var("CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS")

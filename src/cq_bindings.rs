@@ -49,7 +49,32 @@ pub enum CQDispatchCmdId {
     CQ_DISPATCH_CMD_TIMESTAMP = 18,
     CQ_DISPATCH_CMD_MAX_COUNT = 19,
 }
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct CQPrefetchRelayInlineCmd {
+    pub dispatcher_type: u8,
+    pub pad: u16,
+    pub length: u32,
+    pub stride: u32,
+}
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct CQDispatchWriteHostCmd {
+    pub is_event: u8,
+    pub pad1: u16,
+    pub pad2: u32,
+    pub length: u64,
+}
 pub const CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK: u32 = 1;
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct CQDispatchWritePackedLargeSubCmd {
+    pub noc_xy_addr: u32,
+    pub addr: u32,
+    pub length_minus1: u16,
+    pub num_mcast_dests: u8,
+    pub flags: u8,
+}
 pub const CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS: u32 = 35;
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -58,6 +83,39 @@ pub enum CQDispatchCmdPackedWriteLargeType {
     CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_TYPE_CBS_SEMS_CRTAS = 1,
     CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_TYPE_PROGRAM_BINARIES = 2,
 }
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct CQDispatchWritePackedLargeCmd {
+    pub type_: u8,
+    pub count: u16,
+    pub alignment: u16,
+    pub write_offset_index: u16,
+}
 pub const CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM: u32 = 8;
 pub const CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM: u32 = 16;
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct CQDispatchWaitCmd {
+    pub flags: u8,
+    pub stream: u16,
+    pub addr: u32,
+    pub count: u32,
+}
 pub const CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET: u8 = 255;
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct CQDispatchGoSignalMcastCmd {
+    pub go_signal: u32,
+    pub multicast_go_offset: u8,
+    pub num_unicast_txns: u8,
+    pub noc_data_start_index: u8,
+    pub wait_count: u32,
+    pub wait_stream: u32,
+}
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct CQDispatchSetGoSignalNocDataCmd {
+    pub pad1: u8,
+    pub pad2: u16,
+    pub num_words: u32,
+}
