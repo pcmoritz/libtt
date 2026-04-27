@@ -113,11 +113,7 @@ impl Dram {
     }
 
     fn bank_x(bank: usize) -> u8 {
-        if bank < 4 {
-            0
-        } else {
-            9
-        }
+        if bank < 4 { 0 } else { 9 }
     }
 }
 

@@ -297,8 +297,11 @@ impl Device {
         let worker_cores = self.cores();
         let dispatch_mode = self.dispatcher.dispatch_mode();
         let program_key = staged_program_key(program, dispatch_mode);
-        let commands = if program_key.is_some() && self.staged_program_key == program_key {
-            build_dispatch_runtime_plan(&worker_cores, program)?
+        let commands = if program_key.is_some()
+            && program.runtime_args.is_some()
+            && self.staged_program_key == program_key
+        {
+            build_dispatch_runtime_plan(program)?
         } else {
             build_dispatch_plan(&self.compiler, &worker_cores, program, dispatch_mode)?
         };

@@ -328,7 +328,6 @@ pub(crate) fn build_dispatch_plan(
             });
         }
     } else if has_per_core_args(program) {
-        let mut rta_blobs = Vec::with_capacity(all_cores.len());
         for core in &all_cores {
             let writer_args = args_for_core(
                 &program.writer_args,
@@ -351,14 +350,13 @@ pub(crate) fn build_dispatch_plan(
                 program.semaphores,
                 sem_off,
             );
-            rta_blobs.push(rta_blob);
-        }
-        if rta_blobs.iter().any(|blob| !blob.is_empty()) {
-            commands.push(DispatchCommand::WritePacked {
-                cores: all_cores.clone(),
-                addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-                data: rta_blobs,
-            });
+            if !rta_blob.is_empty() {
+                commands.push(DispatchCommand::Write {
+                    cores: vec![*core],
+                    addr: TensixL1::KERNEL_CONFIG_BASE as usize,
+                    data: rta_blob,
+                });
+            }
         }
     } else if !common_rta_blob.is_empty() {
         commands.push(DispatchCommand::Write {
@@ -400,37 +398,19 @@ pub(crate) fn build_dispatch_plan(
     Ok(commands)
 }
 
-pub(crate) fn build_dispatch_runtime_plan(
-    available_cores: &[CoreCoord],
-    program: &Program,
-) -> io::Result<Vec<DispatchCommand>> {
-    let all_cores = if let Some(runtime_args) = &program.runtime_args {
-        validate_runtime_args(runtime_args)?;
-        runtime_args.cores.clone()
-    } else {
-        selected_cores(available_cores, program)?
-    };
+pub(crate) fn build_dispatch_runtime_plan(program: &Program) -> io::Result<Vec<DispatchCommand>> {
+    let runtime_args = program
+        .runtime_args
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing runtime args"))?;
+    validate_runtime_args(runtime_args)?;
+    let all_cores = runtime_args.cores.clone();
     if all_cores.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "no worker cores selected for dispatch",
         ));
     }
-
-    let rta_sizes = (
-        program.writer_args.len() * size_of::<u32>(),
-        program.reader_args.len() * size_of::<u32>(),
-        program.compute_args.len() * size_of::<u32>(),
-    );
-    let rta_total = rta_sizes.0 + rta_sizes.1 + rta_sizes.2;
-    let sem_off = align_up(rta_total as u64, L1_ALIGN as u64) as usize;
-    let common_rta_blob = pack_rta(
-        &program.writer_args,
-        &program.reader_args,
-        &program.compute_args,
-        program.semaphores,
-        sem_off,
-    );
 
     let mut commands = vec![
         DispatchCommand::Write {
@@ -445,52 +425,11 @@ pub(crate) fn build_dispatch_runtime_plan(
         },
     ];
 
-    if let Some(runtime_args) = &program.runtime_args {
-        if runtime_args.blobs.iter().any(|blob| !blob.is_empty()) {
-            commands.push(DispatchCommand::WritePacked {
-                cores: runtime_args.cores.clone(),
-                addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-                data: runtime_args.blobs.clone(),
-            });
-        }
-    } else if has_per_core_args(program) {
-        let mut rta_blobs = Vec::with_capacity(all_cores.len());
-        for core in &all_cores {
-            let writer_args = args_for_core(
-                &program.writer_args,
-                &program.per_core_writer_args,
-                *core,
-                "writer",
-            )?;
-            let reader_args = args_for_core(
-                &program.reader_args,
-                &program.per_core_reader_args,
-                *core,
-                "reader",
-            )?;
-            validate_core_arg_len(writer_args, program.writer_args.len(), *core, "writer")?;
-            validate_core_arg_len(reader_args, program.reader_args.len(), *core, "reader")?;
-            let rta_blob = pack_rta(
-                writer_args,
-                reader_args,
-                &program.compute_args,
-                program.semaphores,
-                sem_off,
-            );
-            rta_blobs.push(rta_blob);
-        }
-        if rta_blobs.iter().any(|blob| !blob.is_empty()) {
-            commands.push(DispatchCommand::WritePacked {
-                cores: all_cores.clone(),
-                addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-                data: rta_blobs,
-            });
-        }
-    } else if !common_rta_blob.is_empty() {
-        commands.push(DispatchCommand::Write {
-            cores: all_cores.clone(),
+    if runtime_args.blobs.iter().any(|blob| !blob.is_empty()) {
+        commands.push(DispatchCommand::WritePacked {
+            cores: runtime_args.cores.clone(),
             addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-            data: common_rta_blob,
+            data: runtime_args.blobs.clone(),
         });
     }
 
@@ -499,39 +438,6 @@ pub(crate) fn build_dispatch_runtime_plan(
     });
 
     Ok(commands)
-}
-
-fn selected_cores(available_cores: &[CoreCoord], program: &Program) -> io::Result<Vec<CoreCoord>> {
-    if let Some((rows, cols)) = &program.grid {
-        if rows.is_empty() || cols.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "program grid must contain at least one row and one column",
-            ));
-        }
-
-        let available = available_cores.iter().copied().collect::<BTreeSet<_>>();
-        let mut all_cores = Vec::with_capacity(rows.len() * cols.len());
-        for &x in cols {
-            for &y in rows {
-                let core = CoreCoord { x, y };
-                if !available.contains(&core) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("grid core {core} is not available on this device"),
-                    ));
-                }
-                all_cores.push(core);
-            }
-        }
-        all_cores.sort_unstable();
-        Ok(all_cores)
-    } else {
-        Ok(match program.cores {
-            CoreSelection::Count(count) => available_cores.iter().copied().take(count).collect(),
-            CoreSelection::All => available_cores.to_vec(),
-        })
-    }
 }
 
 fn build_roles(

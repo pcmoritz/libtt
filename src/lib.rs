@@ -1654,12 +1654,10 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         Ok(device) => device.local_hardware_id as usize,
         Err(err) => return err,
     };
-    if log_enabled() {
-        log(format!(
-            "pjrt buffer_from_host_buffer type={:?} dims={:?} local_hardware_id={}",
-            args.type_, dims_i64, local_hardware_id
-        ));
-    }
+    log(format!(
+        "pjrt buffer_from_host_buffer type={:?} dims={:?} local_hardware_id={}",
+        args.type_, dims_i64, local_hardware_id
+    ));
 
     let data = if byte_size == 0 {
         &[]
