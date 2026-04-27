@@ -82,4 +82,18 @@ impl PinnedMemory {
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut []
     }
+
+    pub(crate) fn read32(&self, _offset: usize) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Tenstorrent Linux backend is only available on Linux",
+        ))
+    }
+
+    pub(crate) fn write32(&mut self, _offset: usize, _value: u32) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Tenstorrent Linux backend is only available on Linux",
+        ))
+    }
 }

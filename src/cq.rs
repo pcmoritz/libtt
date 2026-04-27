@@ -307,8 +307,8 @@ impl CqSysmem {
             completion_rd_16b: completion_base_16b,
             completion_rd_toggle: 0,
         };
-        cq.sysmem_write32(HOST_CQ_WR_OFF, completion_base_16b);
-        cq.sysmem_write32(HOST_CQ_RD_OFF, completion_base_16b);
+        cq.sysmem.write32(HOST_CQ_WR_OFF, completion_base_16b)?;
+        cq.sysmem.write32(HOST_CQ_RD_OFF, completion_base_16b)?;
         Ok(cq)
     }
 
@@ -325,7 +325,7 @@ impl CqSysmem {
     fn wait_completion(&mut self, event_id: u32, timeout: Duration) -> io::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            let wr_raw = self.sysmem_read32(HOST_CQ_WR_OFF);
+            let wr_raw = self.sysmem.read32(HOST_CQ_WR_OFF)?;
             let wr_16b = wr_raw & 0x7fff_ffff;
             let wr_toggle = wr_raw >> 31;
             if wr_16b != self.completion_rd_16b || wr_toggle != self.completion_rd_toggle {
@@ -333,7 +333,7 @@ impl CqSysmem {
                     .checked_sub(self.noc_local)
                     .ok_or_else(|| io::Error::other("CQ completion pointer underflow"))?
                     as usize;
-                let got = self.sysmem_read32(off + CQ_CMD_SIZE);
+                let got = self.sysmem.read32(off + CQ_CMD_SIZE)?;
                 self.completion_rd_16b += self.completion_page_16b;
                 if self.completion_rd_16b >= self.completion_end_16b {
                     self.completion_rd_16b = self.completion_base_16b;
@@ -342,7 +342,7 @@ impl CqSysmem {
                 let raw =
                     (self.completion_rd_16b & 0x7fff_ffff) | (self.completion_rd_toggle << 31);
                 self.dispatch_win.write32(CQ_COMPLETION_RD_PTR, raw)?;
-                self.sysmem_write32(HOST_CQ_RD_OFF, raw);
+                self.sysmem.write32(HOST_CQ_RD_OFF, raw)?;
                 if got != event_id {
                     return Err(io::Error::other(format!(
                         "CQ completion event mismatch: got {got}, expected {event_id}"
@@ -351,8 +351,8 @@ impl CqSysmem {
                 return Ok(());
             }
             if Instant::now() > deadline {
-                let host_wr = self.sysmem_read32(HOST_CQ_WR_OFF);
-                let host_rd = self.sysmem_read32(HOST_CQ_RD_OFF);
+                let host_wr = self.sysmem.read32(HOST_CQ_WR_OFF)?;
+                let host_rd = self.sysmem.read32(HOST_CQ_RD_OFF)?;
                 let pref_pcie = self.prefetch_win.read32(CQ_PREFETCH_Q_PCIE_RD).unwrap_or(0);
                 log(format!(
                     "CQ timeout event={event_id} cq_wr=0x{host_wr:08x} cq_rd=0x{host_rd:08x} pref_pcie=0x{pref_pcie:08x}"
@@ -403,14 +403,6 @@ impl CqSysmem {
         }
     }
 
-    fn sysmem_read32(&self, offset: usize) -> u32 {
-        let bytes = &self.sysmem.as_slice()[offset..offset + 4];
-        u32::from_le_bytes(bytes.try_into().expect("slice length is fixed"))
-    }
-
-    fn sysmem_write32(&mut self, offset: usize, value: u32) {
-        self.sysmem.as_mut_slice()[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    }
 }
 
 fn host_sysmem_size() -> usize {

@@ -317,6 +317,14 @@ impl PinnedMemory {
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         self.mapping.as_mut_slice()
     }
+
+    pub(crate) fn read32(&self, offset: usize) -> io::Result<u32> {
+        self.mapping.read32(offset)
+    }
+
+    pub(crate) fn write32(&mut self, offset: usize, value: u32) -> io::Result<()> {
+        self.mapping.write(offset, &value.to_le_bytes())
+    }
 }
 
 impl Drop for PinnedMemory {
