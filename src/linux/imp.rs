@@ -167,7 +167,13 @@ impl TlbWindow {
             id,
             mapping: None,
         };
-        window.mapping = Some(MappedRegion::map(window.file.as_raw_fd(), len, offset)?);
+        window.mapping = Some(MappedRegion::map(
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            window.file.as_raw_fd(),
+            offset,
+        )?);
         Ok(window)
     }
 
@@ -239,7 +245,7 @@ impl Drop for TlbWindow {
 
 pub(crate) struct PinnedMemory {
     file: File,
-    mapping: AnonymousMapping,
+    mapping: MappedRegion,
     noc_addr: u64,
 }
 
@@ -250,10 +256,20 @@ impl PinnedMemory {
             .write(true)
             .open(path)
             .map_err(|err| io::Error::new(err.kind(), format!("open {}: {err}", path.display())))?;
-        let mapping = AnonymousMapping::map(size).map_err(|err| {
+        let len = size.checked_add(HUGE_PAGE_SIZE - 1).ok_or_else(|| {
+            io::Error::other(format!("hugepage mmap length overflow: len=0x{size:x}"))
+        })? & !(HUGE_PAGE_SIZE - 1);
+        let mapping = MappedRegion::map(
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB,
+            -1,
+            0,
+        )
+        .map_err(|err| {
             io::Error::new(
                 err.kind(),
-                format!("map pinned memory size=0x{size:x}: {err}"),
+                format!("map pinned memory size=0x{size:x} len=0x{len:x}: {err}"),
             )
         })?;
         let virtual_address = mapping.addr as u64;
@@ -322,17 +338,8 @@ struct MappedRegion {
 }
 
 impl MappedRegion {
-    fn map(fd: c_int, len: usize, offset: u64) -> io::Result<Self> {
-        let addr = unsafe {
-            mmap(
-                ptr::null_mut(),
-                len,
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED,
-                fd,
-                offset as i64,
-            )
-        };
+    fn map(len: usize, prot: c_int, flags: c_int, fd: c_int, offset: u64) -> io::Result<Self> {
+        let addr = unsafe { mmap(ptr::null_mut(), len, prot, flags, fd, offset as i64) };
         if addr as isize == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -363,13 +370,21 @@ impl MappedRegion {
         Ok(bytes.to_vec())
     }
 
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.addr, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.addr, self.len) }
+    }
+
     fn check_range(&self, offset: usize, len: usize) -> io::Result<()> {
         let end = offset
             .checked_add(len)
-            .ok_or_else(|| io::Error::other("TLB access overflow"))?;
+            .ok_or_else(|| io::Error::other("mapping access overflow"))?;
         if end > self.len {
             Err(io::Error::other(format!(
-                "TLB access out of range: offset=0x{offset:x} len=0x{len:x} mapping_len=0x{:x}",
+                "mapping access out of range: offset=0x{offset:x} len=0x{len:x} mapping_len=0x{:x}",
                 self.len
             )))
         } else {
@@ -381,56 +396,6 @@ impl MappedRegion {
 impl Drop for MappedRegion {
     fn drop(&mut self) {
         let _ = unsafe { munmap(self.addr.cast::<c_void>(), self.len) };
-    }
-}
-
-struct AnonymousMapping {
-    addr: *mut u8,
-    len: usize,
-}
-
-impl AnonymousMapping {
-    fn map(len: usize) -> io::Result<Self> {
-        let alloc_len = len.checked_add(HUGE_PAGE_SIZE - 1).ok_or_else(|| {
-            io::Error::other(format!("hugepage mmap length overflow: len=0x{len:x}"))
-        })? & !(HUGE_PAGE_SIZE - 1);
-        let addr = unsafe {
-            mmap(
-                ptr::null_mut(),
-                alloc_len,
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB,
-                -1,
-                0,
-            )
-        };
-        if addr as isize == -1 {
-            let err = io::Error::last_os_error();
-            return Err(io::Error::new(
-                err.kind(),
-                format!("1GB hugepage mmap failed len=0x{len:x} alloc_len=0x{alloc_len:x}: {err}"),
-            ));
-        }
-        Ok(Self {
-            addr: addr.cast::<u8>(),
-            len: alloc_len,
-        })
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.addr, self.len) }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.addr, self.len) }
-    }
-}
-
-impl Drop for AnonymousMapping {
-    fn drop(&mut self) {
-        unsafe {
-            munmap(self.addr.cast::<c_void>(), self.len);
-        }
     }
 }
 
