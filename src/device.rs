@@ -7,12 +7,10 @@ use crate::dispatch::{
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{align_down, worker_cores, Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO};
 use crate::linux::{NocOrdering, TlbWindow};
-use crate::log::{log, profile, profile_enabled};
-use std::collections::hash_map::DefaultHasher;
+use crate::log::log;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -296,41 +294,16 @@ impl Device {
     }
 
     pub fn run_program(&mut self, program: &Program) -> io::Result<()> {
-        let timing = profile_enabled().then(Instant::now);
         let worker_cores = self.cores();
         let dispatch_mode = self.dispatcher.dispatch_mode();
         let program_key = staged_program_key(program, dispatch_mode);
-        let key_done = timing.map(|start| (start, Instant::now()));
-        let commands = if self.staged_program_key == Some(program_key) {
+        let commands = if program_key.is_some() && self.staged_program_key == program_key {
             build_dispatch_runtime_plan(&worker_cores, program)?
         } else {
             build_dispatch_plan(&self.compiler, &worker_cores, program, dispatch_mode)?
         };
-        let plan_done = timing.map(|start| (start, Instant::now()));
         self.dispatcher.execute(&commands)?;
-        let execute_done = timing.map(|start| (start, Instant::now()));
-        self.staged_program_key = Some(program_key);
-        if let Some(start) = timing {
-            let done = Instant::now();
-            let key = key_done
-                .map(|(_, end)| end.duration_since(start))
-                .unwrap_or_default();
-            let plan = plan_done
-                .zip(key_done)
-                .map(|((_, end), (_, prev))| end.duration_since(prev))
-                .unwrap_or_default();
-            let execute = execute_done
-                .zip(plan_done)
-                .map(|((_, end), (_, prev))| end.duration_since(prev))
-                .unwrap_or_default();
-            profile(format!(
-                "run_program key_us={:.1} plan_us={:.1} execute_us={:.1} total_us={:.1}",
-                key.as_secs_f64() * 1e6,
-                plan.as_secs_f64() * 1e6,
-                execute.as_secs_f64() * 1e6,
-                done.duration_since(start).as_secs_f64() * 1e6,
-            ));
-        }
+        self.staged_program_key = program_key;
         Ok(())
     }
 
@@ -521,39 +494,14 @@ pub(crate) fn load_device(local_hardware_id: usize) -> io::Result<(PathBuf, Devi
     Ok((path, info))
 }
 
-fn staged_program_key(program: &Program, dispatch_mode: u8) -> u64 {
-    if let Some(static_key) = program.static_key {
-        return staged_key_from_static(static_key, dispatch_mode);
-    }
-
-    let mut hasher = DefaultHasher::new();
-    dispatch_mode.hash(&mut hasher);
-    program.cores.hash(&mut hasher);
-    program.reader_kernel.hash(&mut hasher);
-    program.compute_kernel.hash(&mut hasher);
-    program.writer_kernel.hash(&mut hasher);
-    program.cbs.hash(&mut hasher);
-    program.reader_args.len().hash(&mut hasher);
-    program.writer_args.len().hash(&mut hasher);
-    program.compute_args.len().hash(&mut hasher);
-    program.semaphores.hash(&mut hasher);
-    program.math_fidelity.hash(&mut hasher);
-    program.approx.hash(&mut hasher);
-    program.dst_accum_mode.hash(&mut hasher);
-    program.dst_full_sync.hash(&mut hasher);
-    program.reader_recv_kernel.hash(&mut hasher);
-    program.writer_recv_kernel.hash(&mut hasher);
-    program.grid.hash(&mut hasher);
-    program.per_core_reader_args.len().hash(&mut hasher);
-    program.per_core_writer_args.len().hash(&mut hasher);
-    hasher.finish()
+fn staged_program_key(program: &Program, dispatch_mode: u8) -> Option<u64> {
+    program
+        .static_key
+        .map(|static_key| staged_key_from_static(static_key, dispatch_mode))
 }
 
 fn staged_key_from_static(static_key: u64, dispatch_mode: u8) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    dispatch_mode.hash(&mut hasher);
-    static_key.hash(&mut hasher);
-    hasher.finish()
+    static_key ^ (u64::from(dispatch_mode) << 56)
 }
 
 fn probe_info_for_device(path: &Path) -> io::Result<ProbeInfo> {

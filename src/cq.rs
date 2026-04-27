@@ -2,7 +2,7 @@ use crate::compiler::Compiler;
 use crate::dispatch::{build_cq_launch, mcast_rects, DevMsgs, DispatchCommand};
 use crate::hw::{align_down, align_up, noc_xy, Arc, CoreCoord, TensixL1, TensixMMIO};
 use crate::linux::{NocOrdering, PinnedMemory, TlbWindow};
-use crate::log::{log, profile, profile_enabled};
+use crate::log::log;
 use std::io;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -103,51 +103,14 @@ impl FastDispatcher {
     }
 
     pub(crate) fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
-        let timing = profile_enabled().then(Instant::now);
         let cq_commands = lower_ir(commands, go_word(self.dispatch_core));
-        let lower_done = timing.map(|start| (start, Instant::now()));
         let mut queue = CommandQueue::default();
         queue.extend(cq_commands)?;
-        let encode_done = timing.map(|start| (start, Instant::now()));
         self.event_id = self.event_id.wrapping_add(1);
         queue.append(CqCommand::HostEvent(self.event_id))?;
-        let event_done = timing.map(|start| (start, Instant::now()));
         self.cq_hw.flush(&queue)?;
-        let flush_done = timing.map(|start| (start, Instant::now()));
-        let result = self
-            .cq_hw
-            .wait_completion(self.event_id, Duration::from_secs(10));
-        if let Some(start) = timing {
-            let done = Instant::now();
-            let lower = lower_done
-                .map(|(_, end)| end.duration_since(start))
-                .unwrap_or_default();
-            let encode = encode_done
-                .zip(lower_done)
-                .map(|((_, end), (_, prev))| end.duration_since(prev))
-                .unwrap_or_default();
-            let event = event_done
-                .zip(encode_done)
-                .map(|((_, end), (_, prev))| end.duration_since(prev))
-                .unwrap_or_default();
-            let flush = flush_done
-                .zip(event_done)
-                .map(|((_, end), (_, prev))| end.duration_since(prev))
-                .unwrap_or_default();
-            let wait = flush_done
-                .map(|(_, prev)| done.duration_since(prev))
-                .unwrap_or_default();
-            profile(format!(
-                "fast_dispatch lower_us={:.1} encode_us={:.1} event_us={:.1} flush_us={:.1} wait_us={:.1} total_us={:.1}",
-                lower.as_secs_f64() * 1e6,
-                encode.as_secs_f64() * 1e6,
-                event.as_secs_f64() * 1e6,
-                flush.as_secs_f64() * 1e6,
-                wait.as_secs_f64() * 1e6,
-                done.duration_since(start).as_secs_f64() * 1e6,
-            ));
-        }
-        result
+        self.cq_hw
+            .wait_completion(self.event_id, Duration::from_secs(10))
     }
 }
 

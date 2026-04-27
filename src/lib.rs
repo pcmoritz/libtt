@@ -21,7 +21,7 @@ use device::Device;
 use dram::{DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
-use log::{enabled as log_enabled, log, profile, profile_enabled};
+use log::{enabled as log_enabled, log};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CString};
@@ -1507,7 +1507,6 @@ fn execute_executable_v1(
 pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     args: *mut PJRT_LoadedExecutable_Execute_Args,
 ) -> *mut PJRT_Error {
-    let timing = profile_enabled().then(std::time::Instant::now);
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
@@ -1560,7 +1559,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
             Ok(output) => output,
             Err(err) => return err,
         };
-    let execute_done = timing.map(|start| (start, std::time::Instant::now()));
 
     let device_outputs = unsafe { *args.output_lists };
     if device_outputs.is_null() {
@@ -1574,20 +1572,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         unsafe {
             *args.device_complete_events.add(0) = ready_event();
         }
-    }
-    if let Some(start) = timing {
-        let done = std::time::Instant::now();
-        let execute = execute_done
-            .map(|(_, end)| end.duration_since(start))
-            .unwrap_or_default();
-        profile(format!(
-            "pjrt_execute execute_us={:.1} return_us={:.1} total_us={:.1}",
-            execute.as_secs_f64() * 1e6,
-            done.duration_since(execute_done.map(|(_, end)| end).unwrap_or(start))
-                .as_secs_f64()
-                * 1e6,
-            done.duration_since(start).as_secs_f64() * 1e6,
-        ));
     }
     ptr::null_mut()
 }

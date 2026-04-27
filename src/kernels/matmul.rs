@@ -2,7 +2,7 @@ use crate::device::Device;
 use crate::dispatch::{pack_rta, CBConfig, CoreSelection, MathFidelity, Program, RuntimeArgs};
 use crate::dram::{DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
-use crate::log::{enabled as log_enabled, log, profile, profile_enabled};
+use crate::log::{enabled as log_enabled, log};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::env;
@@ -136,14 +136,12 @@ pub(crate) fn matmul_bf16(
     validate_tile_count(lhs, m / 32 * k / 32, "lhs")?;
     validate_tile_count(rhs, k / 32 * n / 32, "rhs")?;
 
-    let timing = profile_enabled().then(std::time::Instant::now);
     let output_name = name.into();
     let logical_mt = m / 32;
     let logical_nt = n / 32;
     let math_fidelity = matmul_math_fidelity()?;
     let cores = device.cores();
     let plan = cached_plan_matmul(m, k, n, &cores)?;
-    let plan_done = timing.map(|start| (start, std::time::Instant::now()));
     let static_key = matmul_static_key(&plan, math_fidelity);
     if log_enabled() {
         log(format!(
@@ -162,14 +160,12 @@ pub(crate) fn matmul_bf16(
         ));
     }
     let zero_tile = cached_zero_tile(device)?;
-    let zero_done = timing.map(|start| (start, std::time::Instant::now()));
     let output = device.alloc(
         logical_mt * logical_nt,
         DType::Float16B,
         Some(&[m, n]),
         output_name,
     )?;
-    let alloc_done = timing.map(|start| (start, std::time::Instant::now()));
     let program = bf16_program(
         &plan,
         lhs,
@@ -181,38 +177,7 @@ pub(crate) fn matmul_bf16(
         static_key,
         math_fidelity,
     )?;
-    let program_done = timing.map(|start| (start, std::time::Instant::now()));
     device.run_program(&program)?;
-    if let Some(start) = timing {
-        let done = std::time::Instant::now();
-        let plan = plan_done
-            .map(|(_, end)| end.duration_since(start))
-            .unwrap_or_default();
-        let zero = zero_done
-            .zip(plan_done)
-            .map(|((_, end), (_, prev))| end.duration_since(prev))
-            .unwrap_or_default();
-        let alloc = alloc_done
-            .zip(zero_done)
-            .map(|((_, end), (_, prev))| end.duration_since(prev))
-            .unwrap_or_default();
-        let program = program_done
-            .zip(alloc_done)
-            .map(|((_, end), (_, prev))| end.duration_since(prev))
-            .unwrap_or_default();
-        let run = program_done
-            .map(|(_, prev)| done.duration_since(prev))
-            .unwrap_or_default();
-        profile(format!(
-            "matmul_bf16 plan_us={:.1} zero_us={:.1} alloc_us={:.1} program_us={:.1} run_us={:.1} total_us={:.1}",
-            plan.as_secs_f64() * 1e6,
-            zero.as_secs_f64() * 1e6,
-            alloc.as_secs_f64() * 1e6,
-            program.as_secs_f64() * 1e6,
-            run.as_secs_f64() * 1e6,
-            done.duration_since(start).as_secs_f64() * 1e6,
-        ));
-    }
     Ok(output)
 }
 

@@ -73,13 +73,13 @@ pub enum MathFidelity {
     HiFi2 = 2,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreSelection {
     Count(usize),
     All,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CBConfig {
     pub index: usize,
     pub dtype: DType,

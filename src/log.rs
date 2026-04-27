@@ -7,29 +7,9 @@ pub(crate) fn log(message: impl Display) {
     }
 }
 
-pub(crate) fn profile(message: impl Display) {
-    if profile_enabled() {
-        eprintln!("[libtt-profile] {message}");
-    }
-}
-
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("LIBTT_LOG") {
-        Ok(value) => {
-            let normalized = value.trim().to_ascii_lowercase();
-            !normalized.is_empty()
-                && normalized != "0"
-                && normalized != "false"
-                && normalized != "off"
-        }
-        Err(_) => false,
-    })
-}
-
-pub(crate) fn profile_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("LIBTT_PROFILE") {
         Ok(value) => {
             let normalized = value.trim().to_ascii_lowercase();
             !normalized.is_empty()
