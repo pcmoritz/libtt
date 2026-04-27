@@ -71,6 +71,16 @@ pub struct CQDispatchWriteHostCmd {
     pub pad2: u32,
     pub length: u64,
 }
+pub const CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NONE: u32 = 0;
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct CQDispatchWritePackedCmd {
+    pub flags: u8,
+    pub count: u16,
+    pub write_offset_index: u16,
+    pub size: u16,
+    pub addr: u32,
+}
 pub const CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK: u32 = 1;
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]

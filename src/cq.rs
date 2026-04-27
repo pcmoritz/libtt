@@ -54,16 +54,6 @@ const CQ_DISPATCH_CMD_WRITE_LINEAR_HOST_IS_EVENT: u8 = 1;
 
 const CQ_CMD_SIZE: usize = CQ_DISPATCH_CMD_SIZE as usize;
 const DONE_STREAM: u16 = FIRST_STREAM_USED as u16;
-const CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NONE: u8 = 0;
-
-#[derive(Clone, Copy)]
-struct CQDispatchWritePackedCmd {
-    flags: u8,
-    count: u16,
-    write_offset_index: u16,
-    size: u16,
-    addr: u32,
-}
 
 pub(crate) struct FastDispatcher {
     path: PathBuf,
@@ -209,7 +199,7 @@ impl CqCommand {
                 let mut record = cq_record(
                     CQDispatchCmdId::CQ_DISPATCH_CMD_WRITE_PACKED as u8,
                     CQDispatchWritePackedCmd {
-                        flags: CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NONE,
+                        flags: CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NONE as u8,
                         count: u16::try_from(cores.len())
                             .map_err(|_| io::Error::other("too many CQ packed writes"))?,
                         write_offset_index: 0,
