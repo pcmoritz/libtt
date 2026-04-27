@@ -588,9 +588,10 @@ trait CqEncode {
 }
 
 fn cq_record(cmd_id: u8, body: impl CqEncode) -> Vec<u8> {
-    let mut record = cq_hdr();
-    record[0] = cmd_id;
+    let mut record = Vec::with_capacity(CQ_CMD_SIZE);
+    record.push(cmd_id);
     body.encode(&mut record);
+    pad_vec_to(&mut record, CQ_CMD_SIZE);
     record
 }
 
@@ -685,10 +686,6 @@ fn cq_hdr_write_packed_large(count: usize) -> io::Result<Vec<u8>> {
             write_offset_index: 0,
         },
     ))
-}
-
-fn cq_hdr() -> Vec<u8> {
-    vec![0; CQ_CMD_SIZE]
 }
 
 fn pad_to(data: &[u8], align: usize) -> Vec<u8> {
