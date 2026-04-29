@@ -1,5 +1,7 @@
 use crate::compiler::Compiler;
-use crate::dispatch::{build_cq_launch, mcast_rects, DevMsgs, DispatchCommand};
+use crate::dispatch::{
+    build_cq_launch, mcast_rects, DevMsgs, DispatchCommand, RuntimeArgPatch, RuntimeArgs,
+};
 use crate::hw::{align_down, align_up, noc_xy, Arc, CoreCoord, TensixL1, TensixMMIO};
 use crate::linux::{NocOrdering, PinnedMemory, TlbWindow};
 use crate::log::log;
@@ -61,6 +63,8 @@ pub(crate) struct FastDispatcher {
     dispatch_core: CoreCoord,
     _pcie_base_guard: PinnedMemory,
     cq_hw: CqSysmem,
+    queue: CommandQueue,
+    runtime_queue: Option<RuntimeQueueTemplate>,
     event_id: u32,
 }
 
@@ -88,19 +92,137 @@ impl FastDispatcher {
             dispatch_core,
             _pcie_base_guard: pcie_base_guard,
             cq_hw,
+            queue: CommandQueue::default(),
+            runtime_queue: None,
             event_id: 0,
         })
     }
 
-    pub(crate) fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
+    pub(crate) fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
         let cq_commands = lower_ir(commands, go_word(self.dispatch_core));
-        let mut queue = CommandQueue::default();
-        queue.extend(cq_commands)?;
+        self.queue.clear();
+        self.queue.extend(cq_commands)?;
         self.event_id = self.event_id.wrapping_add(1);
-        queue.append(CqCommand::HostEvent(self.event_id))?;
-        self.cq_hw.flush(&queue)?;
+        self.queue.append(CqCommand::HostEvent(self.event_id))?;
+        self.cq_hw.flush(&self.queue)?;
         self.cq_hw
             .wait_completion(self.event_id, Duration::from_secs(10))
+    }
+
+    pub(crate) fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
+        let cores = runtime_args.cores.as_slice();
+        if cores.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no worker cores selected for dispatch",
+            ));
+        }
+        if cores.len() != runtime_args.blobs().len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "runtime arg core/blob length mismatch: {} != {}",
+                    cores.len(),
+                    runtime_args.blobs().len()
+                ),
+            ));
+        }
+
+        let key = RuntimeQueueKey::new(runtime_args);
+        if self
+            .runtime_queue
+            .as_ref()
+            .map_or(true, |template| template.key != key)
+        {
+            self.runtime_queue = Some(RuntimeQueueTemplate::build(
+                key,
+                runtime_args,
+                go_word(self.dispatch_core),
+            )?);
+        }
+        self.event_id = self.event_id.wrapping_add(1);
+        let template = self
+            .runtime_queue
+            .as_mut()
+            .expect("runtime queue template was just initialized");
+        template.patch(runtime_args.patch_u32.as_ref(), self.event_id);
+        self.cq_hw.flush(&template.queue)?;
+        self.cq_hw
+            .wait_completion(self.event_id, Duration::from_secs(10))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeQueueKey {
+    cores: Vec<CoreCoord>,
+    blobs_ptr: usize,
+    patch_offset: Option<usize>,
+}
+
+impl RuntimeQueueKey {
+    fn new(runtime_args: &RuntimeArgs) -> Self {
+        Self {
+            cores: runtime_args.cores.clone(),
+            blobs_ptr: std::sync::Arc::as_ptr(&runtime_args.blobs) as usize,
+            patch_offset: runtime_args.patch_u32.as_ref().map(|patch| patch.offset),
+        }
+    }
+}
+
+struct RuntimeQueueTemplate {
+    key: RuntimeQueueKey,
+    queue: CommandQueue,
+    patch_offsets: Vec<usize>,
+    event_offset: usize,
+}
+
+impl RuntimeQueueTemplate {
+    fn build(key: RuntimeQueueKey, runtime_args: &RuntimeArgs, go_word: u32) -> io::Result<Self> {
+        let cores = runtime_args.cores.as_slice();
+        let mut queue = CommandQueue::default();
+        let rects = mcast_rects(cores);
+        queue.append_write_packed_large(
+            &rects,
+            TensixL1::GO_MSG as usize,
+            &[0, 0, 0, DevMsgs::RUN_MSG_RESET_READ_PTR_FROM_HOST],
+        )?;
+        queue.append_write_packed_large(
+            &rects,
+            TensixL1::GO_MSG_INDEX as usize,
+            &[0; size_of::<u32>()],
+        )?;
+        let patch_offsets = if runtime_args.blobs().iter().any(|blob| !blob.is_empty()) {
+            queue.append_write_packed_template(
+                cores,
+                TensixL1::KERNEL_CONFIG_BASE as usize,
+                runtime_args.blobs(),
+                key.patch_offset,
+            )?
+        } else {
+            Vec::new()
+        };
+        queue.append_set_go_signal_noc_data(cores)?;
+        queue.append_wait_stream(DONE_STREAM, 0, true)?;
+        queue.append_send_go_signal(go_word, DONE_STREAM, 0, cores.len() as u8)?;
+        queue.append_wait_stream(DONE_STREAM, cores.len() as u32, true)?;
+        let event_offset = queue.append_host_event_template()?;
+        Ok(Self {
+            key,
+            queue,
+            patch_offsets,
+            event_offset,
+        })
+    }
+
+    fn patch(&mut self, runtime_patch: Option<&RuntimeArgPatch>, event_id: u32) {
+        if let Some(runtime_patch) = runtime_patch {
+            let value = runtime_patch.value.to_le_bytes();
+            for &offset in &self.patch_offsets {
+                self.queue.stream[offset..offset + size_of::<u32>()].copy_from_slice(&value);
+            }
+        }
+        self.queue.stream[self.event_offset..self.event_offset + size_of::<u32>()]
+            .copy_from_slice(&event_id.to_le_bytes());
     }
 }
 
@@ -143,148 +265,29 @@ impl CqCommand {
     fn to_records(&self) -> io::Result<Vec<Vec<u8>>> {
         match self {
             Self::WritePackedLarge { rects, addr, data } => {
-                let padded = pad_to(data, L1_ALIGN);
-                let mut records = Vec::new();
-                for batch in rects.chunks(CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS as usize)
-                {
-                    let mut record = cq_hdr_write_packed_large(batch.len())?;
-                    for &(start, end) in batch {
-                        let (xy, count) = noc_mcast_xy(start, end);
-                        CQDispatchWritePackedLargeSubCmd {
-                            noc_xy_addr: xy,
-                            addr: to_u32(*addr, "CQ write address")?,
-                            length_minus1: u16::try_from(data.len().checked_sub(1).ok_or_else(
-                                || {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidInput,
-                                        "CQ write data must not be empty",
-                                    )
-                                },
-                            )?)
-                            .map_err(|_| io::Error::other("CQ write payload too large"))?,
-                            num_mcast_dests: count,
-                            flags: CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK as u8,
-                        }
-                        .encode(&mut record);
-                    }
-                    let padded_len = align_up(record.len() as u64, L1_ALIGN as u64) as usize;
-                    pad_vec_to(&mut record, padded_len);
-                    for _ in batch {
-                        record.extend_from_slice(&padded);
-                    }
-                    records.push(record);
-                }
-                Ok(records)
+                records_write_packed_large(rects, *addr, data)
             }
             Self::WritePacked { cores, addr, data } => {
-                if cores.len() != data.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "packed write core/data length mismatch: {} != {}",
-                            cores.len(),
-                            data.len()
-                        ),
-                    ));
-                }
-                let Some(size) = data.first().map(Vec::len) else {
-                    return Ok(vec![]);
-                };
-                if data.iter().any(|blob| blob.len() != size) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "packed write blobs must have a uniform size",
-                    ));
-                }
-                let mut record = cq_record(
-                    CQDispatchCmdId::CQ_DISPATCH_CMD_WRITE_PACKED as u8,
-                    CQDispatchWritePackedCmd {
-                        flags: CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NONE as u8,
-                        count: u16::try_from(cores.len())
-                            .map_err(|_| io::Error::other("too many CQ packed writes"))?,
-                        write_offset_index: 0,
-                        size: u16::try_from(size)
-                            .map_err(|_| io::Error::other("CQ packed write payload too large"))?,
-                        addr: to_u32(*addr, "CQ packed write address")?,
-                    },
-                );
-                for core in cores {
-                    put_u32(&mut record, noc_xy(core.x, core.y));
-                }
-                let noc_len = CQ_CMD_SIZE + cores.len() * size_of::<u32>();
-                let body_start = align_up(noc_len as u64, L1_ALIGN as u64) as usize;
-                pad_vec_to(&mut record, body_start);
-                let stride = align_up(size as u64, L1_ALIGN as u64) as usize;
-                for (index, blob) in data.iter().enumerate() {
-                    record.extend_from_slice(blob);
-                    pad_vec_to(&mut record, body_start + stride * (index + 1));
-                }
-                Ok(vec![record])
+                records_write_packed(cores, *addr, data, None)
             }
-            Self::SetGoSignalNocData { cores } => {
-                let mut record = cq_record(
-                    CQDispatchCmdId::CQ_DISPATCH_SET_GO_SIGNAL_NOC_DATA as u8,
-                    CQDispatchSetGoSignalNocDataCmd {
-                        pad1: 0,
-                        pad2: 0,
-                        num_words: cores.len() as u32,
-                    },
-                );
-                for core in cores {
-                    put_u32(&mut record, noc_xy(core.x, core.y));
-                }
-                Ok(vec![record])
-            }
+            Self::SetGoSignalNocData { cores } => Ok(vec![record_set_go_signal_noc_data(cores)]),
             Self::SendGoSignal {
                 go_word,
                 stream,
                 count,
                 num_unicast,
-            } => Ok(vec![cq_record(
-                CQDispatchCmdId::CQ_DISPATCH_CMD_SEND_GO_SIGNAL as u8,
-                CQDispatchGoSignalMcastCmd {
-                    go_signal: *go_word,
-                    multicast_go_offset: CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET,
-                    num_unicast_txns: *num_unicast,
-                    noc_data_start_index: 0,
-                    wait_count: *count,
-                    wait_stream: u32::from(*stream),
-                },
+            } => Ok(vec![record_send_go_signal(
+                *go_word,
+                *stream,
+                *count,
+                *num_unicast,
             )]),
             Self::WaitStream {
                 stream,
                 count,
                 clear,
-            } => Ok(vec![cq_record(
-                CQDispatchCmdId::CQ_DISPATCH_CMD_WAIT as u8,
-                CQDispatchWaitCmd {
-                    flags: (CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM
-                        | if *clear {
-                            CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM
-                        } else {
-                            0
-                        }) as u8,
-                    stream: *stream,
-                    addr: 0,
-                    count: *count,
-                },
-            )]),
-            Self::HostEvent(event_id) => {
-                let mut payload = Vec::new();
-                put_u32(&mut payload, *event_id);
-                pad_vec_to(&mut payload, L1_ALIGN);
-                let mut record = cq_record(
-                    CQDispatchCmdId::CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST as u8,
-                    CQDispatchWriteHostCmd {
-                        is_event: CQ_DISPATCH_CMD_WRITE_LINEAR_HOST_IS_EVENT,
-                        pad1: 0,
-                        pad2: 0,
-                        length: (CQ_CMD_SIZE + payload.len()) as u64,
-                    },
-                );
-                record.extend_from_slice(&payload);
-                Ok(vec![record])
-            }
+            } => Ok(vec![record_wait_stream(*stream, *count, *clear)]),
+            Self::HostEvent(event_id) => Ok(vec![record_host_event(*event_id)]),
         }
     }
 }
@@ -296,11 +299,20 @@ struct CommandQueue {
 }
 
 impl CommandQueue {
+    fn clear(&mut self) {
+        self.stream.clear();
+        self.sizes_16b.clear();
+    }
+
+    fn append_payload(&mut self, payload: &[u8]) {
+        let record = relay_inline(payload);
+        self.sizes_16b.push(record.len() / CQ_CMD_SIZE);
+        self.stream.extend_from_slice(&record);
+    }
+
     fn append(&mut self, cmd: CqCommand) -> io::Result<()> {
         for payload in cmd.to_records()? {
-            let record = relay_inline(&payload);
-            self.sizes_16b.push(record.len() / CQ_CMD_SIZE);
-            self.stream.extend_from_slice(&record);
+            self.append_payload(&payload);
         }
         Ok(())
     }
@@ -310,6 +322,78 @@ impl CommandQueue {
             self.append(cmd)?;
         }
         Ok(())
+    }
+
+    fn append_write_packed_large(
+        &mut self,
+        rects: &[(CoreCoord, CoreCoord)],
+        addr: usize,
+        data: &[u8],
+    ) -> io::Result<()> {
+        for payload in records_write_packed_large(rects, addr, data)? {
+            self.append_payload(&payload);
+        }
+        Ok(())
+    }
+
+    fn append_write_packed_template(
+        &mut self,
+        cores: &[CoreCoord],
+        addr: usize,
+        data: &[Vec<u8>],
+        patch_offset: Option<usize>,
+    ) -> io::Result<Vec<usize>> {
+        let Some(size) = data.first().map(Vec::len) else {
+            return Ok(vec![]);
+        };
+        if let Some(offset) = patch_offset {
+            if offset + size_of::<u32>() > size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("runtime arg patch offset {offset} exceeds blob size {size}"),
+                ));
+            }
+        }
+        let stream_start = self.stream.len();
+        for payload in records_write_packed(cores, addr, data, None)? {
+            self.append_payload(&payload);
+        }
+        let Some(offset) = patch_offset else {
+            return Ok(vec![]);
+        };
+        let noc_len = CQ_CMD_SIZE + cores.len() * size_of::<u32>();
+        let body_start = align_up(noc_len as u64, L1_ALIGN as u64) as usize;
+        let stride = align_up(size as u64, L1_ALIGN as u64) as usize;
+        Ok((0..data.len())
+            .map(|index| stream_start + CQ_CMD_SIZE + body_start + stride * index + offset)
+            .collect())
+    }
+
+    fn append_set_go_signal_noc_data(&mut self, cores: &[CoreCoord]) -> io::Result<()> {
+        self.append_payload(&record_set_go_signal_noc_data(cores));
+        Ok(())
+    }
+
+    fn append_send_go_signal(
+        &mut self,
+        go_word: u32,
+        stream: u16,
+        count: u32,
+        num_unicast: u8,
+    ) -> io::Result<()> {
+        self.append_payload(&record_send_go_signal(go_word, stream, count, num_unicast));
+        Ok(())
+    }
+
+    fn append_wait_stream(&mut self, stream: u16, count: u32, clear: bool) -> io::Result<()> {
+        self.append_payload(&record_wait_stream(stream, count, clear));
+        Ok(())
+    }
+
+    fn append_host_event_template(&mut self) -> io::Result<usize> {
+        let stream_start = self.stream.len();
+        self.append_payload(&record_host_event(0));
+        Ok(stream_start + CQ_CMD_SIZE + CQ_CMD_SIZE)
     }
 }
 
@@ -493,28 +577,23 @@ fn new_sysmem(path: &Path, size: usize, label: &str) -> io::Result<PinnedMemory>
     })
 }
 
-fn lower_ir(commands: &[DispatchCommand], go_word: u32) -> Vec<CqCommand> {
+fn lower_ir(commands: Vec<DispatchCommand>, go_word: u32) -> Vec<CqCommand> {
     let mut result = Vec::new();
     for command in commands {
         match command {
             DispatchCommand::Write { cores, addr, data } => {
                 result.push(CqCommand::WritePackedLarge {
-                    rects: mcast_rects(cores),
-                    addr: *addr,
-                    data: data.clone(),
+                    rects: mcast_rects(&cores),
+                    addr,
+                    data,
                 });
             }
             DispatchCommand::WritePacked { cores, addr, data } => {
-                result.push(CqCommand::WritePacked {
-                    cores: cores.clone(),
-                    addr: *addr,
-                    data: data.clone(),
-                });
+                result.push(CqCommand::WritePacked { cores, addr, data });
             }
             DispatchCommand::Launch { cores } => {
-                result.push(CqCommand::SetGoSignalNocData {
-                    cores: cores.clone(),
-                });
+                let core_count = cores.len();
+                result.push(CqCommand::SetGoSignalNocData { cores });
                 result.push(CqCommand::WaitStream {
                     stream: DONE_STREAM,
                     count: 0,
@@ -524,17 +603,202 @@ fn lower_ir(commands: &[DispatchCommand], go_word: u32) -> Vec<CqCommand> {
                     go_word,
                     stream: DONE_STREAM,
                     count: 0,
-                    num_unicast: cores.len() as u8,
+                    num_unicast: core_count as u8,
                 });
                 result.push(CqCommand::WaitStream {
                     stream: DONE_STREAM,
-                    count: cores.len() as u32,
+                    count: core_count as u32,
                     clear: true,
                 });
             }
         }
     }
     result
+}
+
+fn records_write_packed_large(
+    rects: &[(CoreCoord, CoreCoord)],
+    addr: usize,
+    data: &[u8],
+) -> io::Result<Vec<Vec<u8>>> {
+    let padded = pad_to(data, L1_ALIGN);
+    let mut records = Vec::new();
+    for batch in rects.chunks(CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS as usize) {
+        let mut record = cq_hdr_write_packed_large(batch.len())?;
+        for &(start, end) in batch {
+            let (xy, count) = noc_mcast_xy(start, end);
+            CQDispatchWritePackedLargeSubCmd {
+                noc_xy_addr: xy,
+                addr: to_u32(addr, "CQ write address")?,
+                length_minus1: u16::try_from(data.len().checked_sub(1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "CQ write data must not be empty",
+                    )
+                })?)
+                .map_err(|_| io::Error::other("CQ write payload too large"))?,
+                num_mcast_dests: count,
+                flags: CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK as u8,
+            }
+            .encode(&mut record);
+        }
+        let padded_len = align_up(record.len() as u64, L1_ALIGN as u64) as usize;
+        pad_vec_to(&mut record, padded_len);
+        for _ in batch {
+            record.extend_from_slice(&padded);
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn records_write_packed(
+    cores: &[CoreCoord],
+    addr: usize,
+    data: &[Vec<u8>],
+    patch: Option<&RuntimeArgPatch>,
+) -> io::Result<Vec<Vec<u8>>> {
+    if cores.len() != data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "packed write core/data length mismatch: {} != {}",
+                cores.len(),
+                data.len()
+            ),
+        ));
+    }
+    let Some(size) = data.first().map(Vec::len) else {
+        return Ok(vec![]);
+    };
+    if data.iter().any(|blob| blob.len() != size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "packed write blobs must have a uniform size",
+        ));
+    }
+    if let Some(patch) = patch {
+        let patch_end = patch.offset + size_of::<u32>();
+        if patch_end > size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "runtime arg patch offset {} exceeds blob size {}",
+                    patch.offset, size
+                ),
+            ));
+        }
+    }
+    let mut record = cq_record(
+        CQDispatchCmdId::CQ_DISPATCH_CMD_WRITE_PACKED as u8,
+        CQDispatchWritePackedCmd {
+            flags: CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NONE as u8,
+            count: u16::try_from(cores.len())
+                .map_err(|_| io::Error::other("too many CQ packed writes"))?,
+            write_offset_index: 0,
+            size: u16::try_from(size)
+                .map_err(|_| io::Error::other("CQ packed write payload too large"))?,
+            addr: to_u32(addr, "CQ packed write address")?,
+        },
+    );
+    for core in cores {
+        put_u32(&mut record, noc_xy(core.x, core.y));
+    }
+    let noc_len = CQ_CMD_SIZE + cores.len() * size_of::<u32>();
+    let body_start = align_up(noc_len as u64, L1_ALIGN as u64) as usize;
+    pad_vec_to(&mut record, body_start);
+    let stride = align_up(size as u64, L1_ALIGN as u64) as usize;
+    for (index, blob) in data.iter().enumerate() {
+        if let Some(patch) = patch {
+            let start = record.len();
+            record.extend_from_slice(blob);
+            record[start + patch.offset..start + patch.offset + size_of::<u32>()]
+                .copy_from_slice(&patch.value.to_le_bytes());
+        } else {
+            record.extend_from_slice(blob);
+        }
+        pad_vec_to(&mut record, body_start + stride * (index + 1));
+    }
+    Ok(vec![record])
+}
+
+fn record_set_go_signal_noc_data(cores: &[CoreCoord]) -> Vec<u8> {
+    let mut record = cq_record(
+        CQDispatchCmdId::CQ_DISPATCH_SET_GO_SIGNAL_NOC_DATA as u8,
+        CQDispatchSetGoSignalNocDataCmd {
+            pad1: 0,
+            pad2: 0,
+            num_words: cores.len() as u32,
+        },
+    );
+    for core in cores {
+        put_u32(&mut record, noc_xy(core.x, core.y));
+    }
+    record
+}
+
+fn record_send_go_signal(go_word: u32, stream: u16, count: u32, num_unicast: u8) -> Vec<u8> {
+    cq_record(
+        CQDispatchCmdId::CQ_DISPATCH_CMD_SEND_GO_SIGNAL as u8,
+        CQDispatchGoSignalMcastCmd {
+            go_signal: go_word,
+            multicast_go_offset: CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET,
+            num_unicast_txns: num_unicast,
+            noc_data_start_index: 0,
+            wait_count: count,
+            wait_stream: u32::from(stream),
+        },
+    )
+}
+
+fn record_wait_stream(stream: u16, count: u32, clear: bool) -> Vec<u8> {
+    cq_record(
+        CQDispatchCmdId::CQ_DISPATCH_CMD_WAIT as u8,
+        CQDispatchWaitCmd {
+            flags: (CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM
+                | if clear {
+                    CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM
+                } else {
+                    0
+                }) as u8,
+            stream,
+            addr: 0,
+            count,
+        },
+    )
+}
+
+fn record_host_event(event_id: u32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    put_u32(&mut payload, event_id);
+    pad_vec_to(&mut payload, L1_ALIGN);
+    let mut record = cq_record(
+        CQDispatchCmdId::CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST as u8,
+        CQDispatchWriteHostCmd {
+            is_event: CQ_DISPATCH_CMD_WRITE_LINEAR_HOST_IS_EVENT,
+            pad1: 0,
+            pad2: 0,
+            length: (CQ_CMD_SIZE + payload.len()) as u64,
+        },
+    );
+    record.extend_from_slice(&payload);
+    record
+}
+
+fn relay_inline(payload: &[u8]) -> Vec<u8> {
+    let stride = align_up((CQ_CMD_SIZE + payload.len()) as u64, PCIE_ALIGN as u64) as usize;
+    let mut record = cq_record(
+        CQPrefetchCmdId::CQ_PREFETCH_CMD_RELAY_INLINE as u8,
+        CQPrefetchRelayInlineCmd {
+            dispatcher_type: 0,
+            pad: 0,
+            length: payload.len() as u32,
+            stride: stride as u32,
+        },
+    );
+    record.extend_from_slice(payload);
+    record.resize(stride, 0);
+    record
 }
 
 fn start_dispatch_cores(
@@ -725,22 +989,6 @@ impl CqEncode for CQDispatchSetGoSignalNocDataCmd {
         put_u16(out, self.pad2);
         put_u32(out, self.num_words);
     }
-}
-
-fn relay_inline(payload: &[u8]) -> Vec<u8> {
-    let stride = align_up((CQ_CMD_SIZE + payload.len()) as u64, PCIE_ALIGN as u64) as usize;
-    let mut record = cq_record(
-        CQPrefetchCmdId::CQ_PREFETCH_CMD_RELAY_INLINE as u8,
-        CQPrefetchRelayInlineCmd {
-            dispatcher_type: 0,
-            pad: 0,
-            length: payload.len() as u32,
-            stride: stride as u32,
-        },
-    );
-    record.extend_from_slice(payload);
-    record.resize(stride, 0);
-    record
 }
 
 fn cq_hdr_write_packed_large(count: usize) -> io::Result<Vec<u8>> {

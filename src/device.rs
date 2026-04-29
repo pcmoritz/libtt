@@ -1,8 +1,8 @@
 use crate::compiler::Compiler;
 use crate::cq::FastDispatcher;
 use crate::dispatch::{
-    build_dispatch_plan, build_dispatch_runtime_plan, mcast_rects, DevMsgs, DispatchCommand,
-    Program, SlowDispatcher,
+    build_dispatch_plan, mcast_rects, DevMsgs, DispatchCommand, Program, RuntimeArgs,
+    SlowDispatcher,
 };
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{align_down, worker_cores, Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO};
@@ -102,7 +102,8 @@ pub struct Device {
 
 trait Dispatcher {
     fn dispatch_mode(&self) -> u8;
-    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()>;
+    fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()>;
+    fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()>;
 }
 
 impl Dispatcher for FastDispatcher {
@@ -110,8 +111,12 @@ impl Dispatcher for FastDispatcher {
         DevMsgs::DISPATCH_MODE_DEV
     }
 
-    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
+    fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
         FastDispatcher::execute(self, commands)
+    }
+
+    fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
+        FastDispatcher::execute_runtime(self, runtime_args)
     }
 }
 
@@ -120,8 +125,12 @@ impl Dispatcher for SlowDispatcher {
         DevMsgs::DISPATCH_MODE_HOST
     }
 
-    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
+    fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
         SlowDispatcher::execute(self, commands)
+    }
+
+    fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
+        SlowDispatcher::execute_runtime(self, runtime_args)
     }
 }
 
@@ -297,15 +306,17 @@ impl Device {
         let worker_cores = self.cores();
         let dispatch_mode = self.dispatcher.dispatch_mode();
         let program_key = staged_program_key(program, dispatch_mode);
-        let commands = if program_key.is_some()
+        if program_key.is_some()
             && program.runtime_args.is_some()
             && self.staged_program_key == program_key
         {
-            build_dispatch_runtime_plan(program)?
+            let runtime_args = program.runtime_args.as_ref().expect("runtime args checked");
+            self.dispatcher.execute_runtime(runtime_args)?;
         } else {
-            build_dispatch_plan(&self.compiler, &worker_cores, program, dispatch_mode)?
-        };
-        self.dispatcher.execute(&commands)?;
+            let commands =
+                build_dispatch_plan(&self.compiler, &worker_cores, program, dispatch_mode)?;
+            self.dispatcher.execute(commands)?;
+        }
         self.staged_program_key = program_key;
         Ok(())
     }

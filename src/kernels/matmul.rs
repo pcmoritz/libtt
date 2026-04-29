@@ -1,14 +1,15 @@
 use crate::device::Device;
-use crate::dispatch::{pack_rta, CBConfig, CoreSelection, MathFidelity, Program, RuntimeArgs};
+use crate::dispatch::{
+    pack_rta, CBConfig, CoreSelection, MathFidelity, Program, RuntimeArgPatch, RuntimeArgs,
+};
 use crate::dram::{DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
-use crate::log::{enabled as log_enabled, log};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::env;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const BF16_READER_SENDER: &str = include_str!("../../kernels/matmul_reader_sender.cc");
 const BF16_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
@@ -21,7 +22,7 @@ const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
 static ZERO_TILE_BY_DEVICE: OnceLock<Mutex<HashMap<usize, DramBuffer>>> = OnceLock::new();
 static PLAN_CACHE: OnceLock<Mutex<HashMap<MatmulPlanKey, MatmulPlan>>> = OnceLock::new();
 static RUNTIME_TEMPLATE_CACHE: OnceLock<
-    Mutex<HashMap<MatmulRuntimeTemplateKey, MatmulRuntimeTemplate>>,
+    Mutex<HashMap<MatmulRuntimeTemplateKey, Arc<MatmulRuntimeTemplate>>>,
 > = OnceLock::new();
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -46,7 +47,7 @@ struct MatmulRuntimeTemplateKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MatmulRuntimeTemplate {
     cores: Vec<CoreCoord>,
-    blobs: Vec<Vec<u8>>,
+    blobs: Arc<Vec<Vec<u8>>>,
     reader_args: Vec<u32>,
     writer_args: Vec<u32>,
 }
@@ -143,22 +144,6 @@ pub(crate) fn matmul_bf16(
     let cores = device.cores();
     let plan = cached_plan_matmul(m, k, n, &cores)?;
     let static_key = matmul_static_key(&plan, math_fidelity);
-    if log_enabled() {
-        log(format!(
-            "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
-            plan.mt,
-            plan.kt,
-            plan.nt,
-            plan.rows.len(),
-            plan.cols.len(),
-            plan.per_core_m,
-            plan.per_core_n,
-            plan.in0_block_w,
-            plan.num_blocks(),
-            plan.out_subblock_h,
-            plan.out_subblock_w
-        ));
-    }
     let zero_tile = cached_zero_tile(device)?;
     let output = device.alloc(
         logical_mt * logical_nt,
@@ -489,15 +474,6 @@ fn bf16_program_for_columns(
     if writer_args.len() > WRITER_OUTPUT_ADDR_INDEX {
         writer_args[WRITER_OUTPUT_ADDR_INDEX] = output_addr;
     }
-    let mut runtime_blobs = runtime_template.blobs.clone();
-    for blob in &mut runtime_blobs {
-        patch_u32(
-            blob,
-            WRITER_OUTPUT_ADDR_INDEX * std::mem::size_of::<u32>(),
-            output_addr,
-        )?;
-    }
-
     let cbs = vec![
         CBConfig {
             index: 0,
@@ -543,8 +519,12 @@ fn bf16_program_for_columns(
         math_fidelity,
         grid: Some((plan.rows.clone(), plan.cols.clone())),
         runtime_args: Some(RuntimeArgs {
-            cores: runtime_template.cores,
-            blobs: runtime_blobs,
+            cores: runtime_template.cores.clone(),
+            blobs: Arc::clone(&runtime_template.blobs),
+            patch_u32: Some(RuntimeArgPatch {
+                offset: WRITER_OUTPUT_ADDR_INDEX * std::mem::size_of::<u32>(),
+                value: output_addr,
+            }),
         }),
         per_core_reader_args: Vec::new(),
         per_core_writer_args: Vec::new(),
@@ -566,7 +546,7 @@ fn cached_runtime_template(
     logical_mt: usize,
     logical_nt: usize,
     col_offset_tiles: usize,
-) -> io::Result<MatmulRuntimeTemplate> {
+) -> io::Result<Arc<MatmulRuntimeTemplate>> {
     let key = MatmulRuntimeTemplateKey {
         static_key,
         lhs_addr,
@@ -581,12 +561,12 @@ fn cached_runtime_template(
         .lock()
         .map_err(|_| io::Error::other("matmul runtime template cache is poisoned"))?
         .get(&key)
-        .cloned()
+        .map(Arc::clone)
     {
         return Ok(template);
     }
 
-    let template = build_runtime_template(
+    let template = Arc::new(build_runtime_template(
         plan,
         lhs_addr,
         rhs_addr,
@@ -594,11 +574,11 @@ fn cached_runtime_template(
         logical_mt,
         logical_nt,
         col_offset_tiles,
-    )?;
+    )?);
     cache
         .lock()
         .map_err(|_| io::Error::other("matmul runtime template cache is poisoned"))?
-        .insert(key, template.clone());
+        .insert(key, Arc::clone(&template));
     Ok(template)
 }
 
@@ -655,23 +635,10 @@ fn build_runtime_template(
     let (cores, blobs): (Vec<_>, Vec<_>) = runtime_args.into_iter().unzip();
     Ok(MatmulRuntimeTemplate {
         cores,
-        blobs,
+        blobs: Arc::new(blobs),
         reader_args: reader_args_first.unwrap_or_default(),
         writer_args: writer_args_first.unwrap_or_default(),
     })
-}
-
-fn patch_u32(blob: &mut [u8], offset: usize, value: u32) -> io::Result<()> {
-    let end = offset + std::mem::size_of::<u32>();
-    let blob_len = blob.len();
-    let bytes = blob.get_mut(offset..end).ok_or_else(|| {
-        invalid_input(format!(
-            "runtime arg patch offset {offset} exceeds blob size {}",
-            blob_len
-        ))
-    })?;
-    bytes.copy_from_slice(&value.to_le_bytes());
-    Ok(())
 }
 
 fn matmul_static_key(plan: &MatmulPlan, math_fidelity: MathFidelity) -> u64 {
