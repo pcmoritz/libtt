@@ -1,6 +1,7 @@
 use crate::compiler::{CompiledKernel, Compiler};
 use crate::dram::DType;
 use crate::hw::{align_up, Arc, CoreCoord, TensixL1};
+use crate::kernels::cache::RuntimeArgPatchGroup;
 use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::BTreeSet;
 use std::io;
@@ -100,6 +101,9 @@ impl CBConfig {
 pub(crate) struct RuntimeArgs {
     pub(crate) cores: Vec<CoreCoord>,
     pub(crate) blobs: Vec<Vec<u8>>,
+    pub(crate) writer_patches: Vec<RuntimeArgPatchGroup>,
+    pub(crate) reader_patches: Vec<RuntimeArgPatchGroup>,
+    pub(crate) compute_patches: Vec<RuntimeArgPatchGroup>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

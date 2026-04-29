@@ -1,7 +1,9 @@
 use crate::device::Device;
-use crate::dispatch::{pack_rta, CBConfig, CoreSelection, MathFidelity, Program, RuntimeArgs};
+use crate::dispatch::{CBConfig, CoreSelection, MathFidelity, Program};
 use crate::dram::{DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
+use crate::kernels::cache::{PerCoreRuntimeArgs, ProgramCache, RuntimeArgList};
+use crate::kernels::kernel::Kernel;
 use crate::log::{enabled as log_enabled, log};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -16,13 +18,15 @@ const BF16_WRITER_SENDER: &str = include_str!("../../kernels/matmul_writer_sende
 const BF16_WRITER_RECV: &str = include_str!("../../kernels/matmul_writer_recv.cc");
 const BF16_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
+const READER_LHS_ADDR_INDEX: usize = 0;
+const READER_ZERO_ADDR_INDEX: usize = 23;
+const WRITER_RHS_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
+const WRITER_ZERO_ADDR_INDEX: usize = 31;
 
 static ZERO_TILE_BY_DEVICE: OnceLock<Mutex<HashMap<usize, DramBuffer>>> = OnceLock::new();
 static PLAN_CACHE: OnceLock<Mutex<HashMap<MatmulPlanKey, MatmulPlan>>> = OnceLock::new();
-static RUNTIME_TEMPLATE_CACHE: OnceLock<
-    Mutex<HashMap<MatmulRuntimeTemplateKey, MatmulRuntimeTemplate>>,
-> = OnceLock::new();
+static PROGRAM_CACHE: ProgramCache<MatmulProgramKey> = ProgramCache::new("matmul program");
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct MatmulPlanKey {
@@ -33,22 +37,11 @@ struct MatmulPlanKey {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct MatmulRuntimeTemplateKey {
+struct MatmulProgramKey {
     static_key: u64,
-    lhs_addr: u32,
-    rhs_addr: u32,
-    zero_addr: u32,
     logical_mt: usize,
     logical_nt: usize,
     col_offset_tiles: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct MatmulRuntimeTemplate {
-    cores: Vec<CoreCoord>,
-    blobs: Vec<Vec<u8>>,
-    reader_args: Vec<u32>,
-    writer_args: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +100,62 @@ impl MatmulPlan {
     }
 }
 
+struct MatmulBf16Kernel<'a> {
+    lhs: &'a DramBuffer,
+    rhs: &'a DramBuffer,
+    output: &'a DramBuffer,
+    zero_tile: &'a DramBuffer,
+    logical_mt: usize,
+    logical_nt: usize,
+    math_fidelity: MathFidelity,
+}
+
+impl Kernel for MatmulBf16Kernel<'_> {
+    fn program(&self, device: &Device) -> io::Result<Program> {
+        let cores = device.cores();
+        let m = self.logical_mt * 32;
+        let k = self.lhs.shape.as_ref().expect("validated lhs shape")[1];
+        let n = self.logical_nt * 32;
+        let plan = cached_plan_matmul(m, k, n, &cores)?;
+        log_matmul_plan(&plan);
+        let static_key = matmul_static_key(&plan, self.math_fidelity);
+        let key = MatmulProgramKey {
+            static_key,
+            logical_mt: self.logical_mt,
+            logical_nt: self.logical_nt,
+            col_offset_tiles: 0,
+        };
+        let base_program = PROGRAM_CACHE.get_or_insert_with(key, || {
+            bf16_program(
+                &plan,
+                self.logical_mt,
+                self.logical_nt,
+                0,
+                static_key,
+                self.math_fidelity,
+            )
+        })?;
+        base_program.update_runtime_args_from_kernel(self)
+    }
+
+    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> io::Result<Option<u32>> {
+        match index {
+            READER_LHS_ADDR_INDEX => Ok(Some(u32_arg(self.lhs.addr, "lhs address")?)),
+            READER_ZERO_ADDR_INDEX => Ok(Some(u32_arg(self.zero_tile.addr, "zero tile address")?)),
+            _ => Ok(None),
+        }
+    }
+
+    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> io::Result<Option<u32>> {
+        match index {
+            WRITER_RHS_ADDR_INDEX => Ok(Some(u32_arg(self.rhs.addr, "rhs address")?)),
+            WRITER_OUTPUT_ADDR_INDEX => Ok(Some(u32_arg(self.output.addr, "output address")?)),
+            WRITER_ZERO_ADDR_INDEX => Ok(Some(u32_arg(self.zero_tile.addr, "zero tile address")?)),
+            _ => Ok(None),
+        }
+    }
+}
+
 pub(crate) fn matmul_bf16(
     device: &mut Device,
     lhs: &DramBuffer,
@@ -140,9 +189,28 @@ pub(crate) fn matmul_bf16(
     let logical_mt = m / 32;
     let logical_nt = n / 32;
     let math_fidelity = matmul_math_fidelity()?;
-    let cores = device.cores();
-    let plan = cached_plan_matmul(m, k, n, &cores)?;
-    let static_key = matmul_static_key(&plan, math_fidelity);
+    let zero_tile = cached_zero_tile(device)?;
+    let output = device.alloc(
+        logical_mt * logical_nt,
+        DType::Float16B,
+        Some(&[m, n]),
+        output_name,
+    )?;
+    let kernel = MatmulBf16Kernel {
+        lhs,
+        rhs,
+        output: &output,
+        zero_tile: &zero_tile,
+        logical_mt,
+        logical_nt,
+        math_fidelity,
+    };
+    let program = kernel.program(device)?;
+    device.run_program(&program)?;
+    Ok(output)
+}
+
+fn log_matmul_plan(plan: &MatmulPlan) {
     if log_enabled() {
         log(format!(
             "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
@@ -159,26 +227,6 @@ pub(crate) fn matmul_bf16(
             plan.out_subblock_w
         ));
     }
-    let zero_tile = cached_zero_tile(device)?;
-    let output = device.alloc(
-        logical_mt * logical_nt,
-        DType::Float16B,
-        Some(&[m, n]),
-        output_name,
-    )?;
-    let program = bf16_program(
-        &plan,
-        lhs,
-        rhs,
-        &output,
-        &zero_tile,
-        logical_mt,
-        logical_nt,
-        static_key,
-        math_fidelity,
-    )?;
-    device.run_program(&program)?;
-    Ok(output)
 }
 
 fn cached_zero_tile(device: &mut Device) -> io::Result<DramBuffer> {
@@ -435,69 +483,12 @@ fn divisors(n: usize) -> Vec<usize> {
 
 fn bf16_program(
     plan: &MatmulPlan,
-    lhs: &DramBuffer,
-    rhs: &DramBuffer,
-    output: &DramBuffer,
-    zero_tile: &DramBuffer,
-    logical_mt: usize,
-    logical_nt: usize,
-    static_key: u64,
-    math_fidelity: MathFidelity,
-) -> io::Result<Program> {
-    bf16_program_for_columns(
-        plan,
-        lhs,
-        rhs,
-        output,
-        zero_tile,
-        logical_mt,
-        logical_nt,
-        0,
-        static_key,
-        math_fidelity,
-    )
-}
-
-fn bf16_program_for_columns(
-    plan: &MatmulPlan,
-    lhs: &DramBuffer,
-    rhs: &DramBuffer,
-    output: &DramBuffer,
-    zero_tile: &DramBuffer,
     logical_mt: usize,
     logical_nt: usize,
     col_offset_tiles: usize,
     static_key: u64,
     math_fidelity: MathFidelity,
 ) -> io::Result<Program> {
-    let lhs_addr = u32_arg(lhs.addr, "lhs address")?;
-    let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
-    let output_addr = u32_arg(output.addr, "output address")?;
-    let zero_addr = u32_arg(zero_tile.addr, "zero tile address")?;
-    let runtime_template = cached_runtime_template(
-        plan,
-        static_key,
-        lhs_addr,
-        rhs_addr,
-        zero_addr,
-        logical_mt,
-        logical_nt,
-        col_offset_tiles,
-    )?;
-    let reader_args = runtime_template.reader_args.clone();
-    let mut writer_args = runtime_template.writer_args.clone();
-    if writer_args.len() > WRITER_OUTPUT_ADDR_INDEX {
-        writer_args[WRITER_OUTPUT_ADDR_INDEX] = output_addr;
-    }
-    let mut runtime_blobs = runtime_template.blobs.clone();
-    for blob in &mut runtime_blobs {
-        patch_u32(
-            blob,
-            WRITER_OUTPUT_ADDR_INDEX * std::mem::size_of::<u32>(),
-            output_addr,
-        )?;
-    }
-
     let cbs = vec![
         CBConfig {
             index: 0,
@@ -520,6 +511,7 @@ fn bf16_program_for_columns(
             tiles: plan.out_block_num_tiles(),
         },
     ];
+    let runtime = lower_runtime_args(plan, logical_mt, logical_nt, col_offset_tiles)?;
 
     Ok(Program {
         static_key: Some(static_key),
@@ -536,142 +528,49 @@ fn bf16_program_for_columns(
             plan.kt * 32,
             plan.nt * 32
         ),
-        reader_args,
-        writer_args,
-        compute_args: Vec::new(),
+        reader_args: runtime.reader_args,
+        writer_args: runtime.writer_args,
+        compute_args: runtime.compute_args,
         semaphores: NUM_SEMAPHORES,
         math_fidelity,
         grid: Some((plan.rows.clone(), plan.cols.clone())),
-        runtime_args: Some(RuntimeArgs {
-            cores: runtime_template.cores,
-            blobs: runtime_blobs,
-        }),
+        runtime_args: Some(runtime.runtime_args),
         per_core_reader_args: Vec::new(),
         per_core_writer_args: Vec::new(),
         ..Program::default()
     })
 }
 
-fn rta_sem_off(writer_args: usize, reader_args: usize, compute_args: usize) -> usize {
-    ((writer_args + reader_args + compute_args) * std::mem::size_of::<u32>() + 15) & !15
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cached_runtime_template(
+fn lower_runtime_args(
     plan: &MatmulPlan,
-    static_key: u64,
-    lhs_addr: u32,
-    rhs_addr: u32,
-    zero_addr: u32,
     logical_mt: usize,
     logical_nt: usize,
     col_offset_tiles: usize,
-) -> io::Result<MatmulRuntimeTemplate> {
-    let key = MatmulRuntimeTemplateKey {
-        static_key,
-        lhs_addr,
-        rhs_addr,
-        zero_addr,
-        logical_mt,
-        logical_nt,
-        col_offset_tiles,
-    };
-    let cache = RUNTIME_TEMPLATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(template) = cache
-        .lock()
-        .map_err(|_| io::Error::other("matmul runtime template cache is poisoned"))?
-        .get(&key)
-        .cloned()
-    {
-        return Ok(template);
-    }
-
-    let template = build_runtime_template(
-        plan,
-        lhs_addr,
-        rhs_addr,
-        zero_addr,
-        logical_mt,
-        logical_nt,
-        col_offset_tiles,
-    )?;
-    cache
-        .lock()
-        .map_err(|_| io::Error::other("matmul runtime template cache is poisoned"))?
-        .insert(key, template.clone());
-    Ok(template)
-}
-
-fn build_runtime_template(
-    plan: &MatmulPlan,
-    lhs_addr: u32,
-    rhs_addr: u32,
-    zero_addr: u32,
-    logical_mt: usize,
-    logical_nt: usize,
-    col_offset_tiles: usize,
-) -> io::Result<MatmulRuntimeTemplate> {
+) -> io::Result<crate::kernels::cache::PackedRuntimeArgs> {
     let grid = plan_grid(plan);
     let mut runtime_args = Vec::new();
-    let mut reader_args_first = None;
-    let mut writer_args_first = None;
     for (row_index, row) in grid.iter().enumerate() {
         for (col_index, &core) in row.iter().enumerate() {
-            let reader = reader_args(
-                plan, lhs_addr, zero_addr, &grid, row_index, core, logical_mt,
-            )?;
+            let reader = reader_args(plan, &grid, row_index, core, logical_mt)?;
             let writer = writer_args(
                 plan,
-                rhs_addr,
-                0,
                 &grid,
                 row_index,
                 col_index,
                 core,
-                zero_addr,
                 logical_mt,
                 logical_nt,
                 col_offset_tiles,
             )?;
-            if reader_args_first.is_none() {
-                reader_args_first = Some(reader.clone());
-            }
-            if writer_args_first.is_none() {
-                writer_args_first = Some(writer.clone());
-            }
-            if writer.len() <= WRITER_OUTPUT_ADDR_INDEX {
-                return Err(invalid_input(format!(
-                    "matmul writer args missing output address at index {WRITER_OUTPUT_ADDR_INDEX}"
-                )));
-            }
-            let sem_off = rta_sem_off(writer.len(), reader.len(), 0);
-            runtime_args.push((
+            runtime_args.push(PerCoreRuntimeArgs {
                 core,
-                pack_rta(&writer, &reader, &[], NUM_SEMAPHORES, sem_off),
-            ));
+                writer,
+                reader,
+                compute: RuntimeArgList::new(),
+            });
         }
     }
-    runtime_args.sort_unstable_by_key(|(core, _)| *core);
-    let (cores, blobs): (Vec<_>, Vec<_>) = runtime_args.into_iter().unzip();
-    Ok(MatmulRuntimeTemplate {
-        cores,
-        blobs,
-        reader_args: reader_args_first.unwrap_or_default(),
-        writer_args: writer_args_first.unwrap_or_default(),
-    })
-}
-
-fn patch_u32(blob: &mut [u8], offset: usize, value: u32) -> io::Result<()> {
-    let end = offset + std::mem::size_of::<u32>();
-    let blob_len = blob.len();
-    let bytes = blob.get_mut(offset..end).ok_or_else(|| {
-        invalid_input(format!(
-            "runtime arg patch offset {offset} exceeds blob size {}",
-            blob_len
-        ))
-    })?;
-    bytes.copy_from_slice(&value.to_le_bytes());
-    Ok(())
+    crate::dispatch::RuntimeArgs::from_per_core(runtime_args, NUM_SEMAPHORES)
 }
 
 fn matmul_static_key(plan: &MatmulPlan, math_fidelity: MathFidelity) -> u64 {
@@ -716,13 +615,11 @@ fn plan_grid(plan: &MatmulPlan) -> Vec<Vec<CoreCoord>> {
 
 fn reader_args(
     plan: &MatmulPlan,
-    lhs_addr: u32,
-    zero_addr: u32,
     grid: &[Vec<CoreCoord>],
     row_index: usize,
     core: CoreCoord,
     logical_mt: usize,
-) -> io::Result<Vec<u32>> {
+) -> io::Result<RuntimeArgList> {
     let west_cols = plan
         .cols
         .iter()
@@ -752,48 +649,44 @@ fn reader_args(
         core.y,
     );
     let sender = grid[row_index][0];
-    Ok(vec![
-        lhs_addr,
-        u32_value(row_index * plan.per_core_m * plan.kt, "lhs block offset")?,
-        1,
-        u32_value(plan.kt, "lhs row stride")?,
-        u32_value(plan.in0_block_w, "lhs block advance")?,
-        u32_value(plan.in0_block_w, "lhs block width")?,
-        u32_value(plan.per_core_m, "lhs block height")?,
-        u32_value(plan.in0_block_num_tiles(), "lhs block tiles")?,
-        u32_value(plan.num_blocks(), "num blocks")?,
-        w_rect[0],
-        w_rect[1],
-        w_rect[2],
-        w_rect[3],
-        w_rect[4],
-        e_rect[0],
-        e_rect[1],
-        e_rect[2],
-        e_rect[3],
-        e_rect[4],
-        sender.x as u32,
-        sender.y as u32,
-        0,
-        1,
-        zero_addr,
-        u32_value(logical_mt, "logical M tiles")?,
-    ])
+    let mut args = RuntimeArgList::new();
+    args.push_dynamic();
+    args.push(u32_value(
+        row_index * plan.per_core_m * plan.kt,
+        "lhs block offset",
+    )?);
+    args.push(1);
+    args.push(u32_value(plan.kt, "lhs row stride")?);
+    args.push(u32_value(plan.in0_block_w, "lhs block advance")?);
+    args.push(u32_value(plan.in0_block_w, "lhs block width")?);
+    args.push(u32_value(plan.per_core_m, "lhs block height")?);
+    args.push(u32_value(plan.in0_block_num_tiles(), "lhs block tiles")?);
+    args.push(u32_value(plan.num_blocks(), "num blocks")?);
+    for value in w_rect {
+        args.push(value);
+    }
+    for value in e_rect {
+        args.push(value);
+    }
+    args.push(sender.x as u32);
+    args.push(sender.y as u32);
+    args.push(0);
+    args.push(1);
+    args.push_dynamic();
+    args.push(u32_value(logical_mt, "logical M tiles")?);
+    Ok(args)
 }
 
 fn writer_args(
     plan: &MatmulPlan,
-    rhs_addr: u32,
-    output_addr: u32,
     grid: &[Vec<CoreCoord>],
     row_index: usize,
     col_index: usize,
     core: CoreCoord,
-    zero_addr: u32,
     logical_mt: usize,
     logical_nt: usize,
     col_offset_tiles: usize,
-) -> io::Result<Vec<u32>> {
+) -> io::Result<RuntimeArgList> {
     let recv_ys = plan.rows.iter().copied().skip(1).collect::<Vec<_>>();
     let mcast = if recv_ys.is_empty() {
         [0, 0, 0, 0, 0]
@@ -809,41 +702,57 @@ fn writer_args(
     let sender = grid[0][col_index];
     let column_start = col_offset_tiles + col_index * plan.per_core_n;
     let out_start = row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n;
-    Ok(vec![
-        rhs_addr,
-        u32_value(column_start, "rhs block offset")?,
-        1,
-        u32_value(logical_nt, "rhs row stride")?,
-        u32_value(plan.in0_block_w * logical_nt, "rhs block advance")?,
-        u32_value(plan.per_core_n, "rhs block width")?,
-        u32_value(plan.in0_block_w, "rhs block height")?,
-        u32_value(plan.in1_block_num_tiles(), "rhs block tiles")?,
-        u32_value(plan.num_blocks(), "num blocks")?,
-        mcast[0],
-        mcast[1],
-        mcast[2],
-        mcast[3],
-        mcast[4],
-        sender.x as u32,
-        sender.y as u32,
-        2,
-        3,
-        output_addr,
-        u32_value(out_start, "output tile offset")?,
-        1,
-        u32_value(plan.nt, "output row stride")?,
-        u32_value(plan.out_subblock_w, "output next subblock w")?,
-        u32_value(plan.out_subblock_h * plan.nt, "output next subblock h")?,
-        u32_value(plan.out_subblock_w, "output subblock width")?,
-        u32_value(plan.out_subblock_h, "output subblock height")?,
-        u32_value(plan.out_subblock_num_tiles(), "output subblock tiles")?,
-        u32_value(plan.in1_num_subblocks(), "output num subblocks w")?,
-        u32_value(plan.in0_num_subblocks(), "output num subblocks h")?,
-        u32_value(logical_mt, "logical M tiles")?,
-        u32_value(logical_nt, "logical N tiles")?,
-        zero_addr,
-        u32_value(col_offset_tiles, "output column offset")?,
-    ])
+    let mut args = RuntimeArgList::new();
+    args.push_dynamic();
+    args.push(u32_value(column_start, "rhs block offset")?);
+    args.push(1);
+    args.push(u32_value(logical_nt, "rhs row stride")?);
+    args.push(u32_value(
+        plan.in0_block_w * logical_nt,
+        "rhs block advance",
+    )?);
+    args.push(u32_value(plan.per_core_n, "rhs block width")?);
+    args.push(u32_value(plan.in0_block_w, "rhs block height")?);
+    args.push(u32_value(plan.in1_block_num_tiles(), "rhs block tiles")?);
+    args.push(u32_value(plan.num_blocks(), "num blocks")?);
+    for value in mcast {
+        args.push(value);
+    }
+    args.push(sender.x as u32);
+    args.push(sender.y as u32);
+    args.push(2);
+    args.push(3);
+    args.push_dynamic();
+    args.push(u32_value(out_start, "output tile offset")?);
+    args.push(1);
+    args.push(u32_value(plan.nt, "output row stride")?);
+    args.push(u32_value(
+        plan.out_subblock_w,
+        "output next subblock w",
+    )?);
+    args.push(u32_value(
+        plan.out_subblock_h * plan.nt,
+        "output next subblock h",
+    )?);
+    args.push(u32_value(plan.out_subblock_w, "output subblock width")?);
+    args.push(u32_value(plan.out_subblock_h, "output subblock height")?);
+    args.push(u32_value(
+        plan.out_subblock_num_tiles(),
+        "output subblock tiles",
+    )?);
+    args.push(u32_value(
+        plan.in1_num_subblocks(),
+        "output num subblocks w",
+    )?);
+    args.push(u32_value(
+        plan.in0_num_subblocks(),
+        "output num subblocks h",
+    )?);
+    args.push(u32_value(logical_mt, "logical M tiles")?);
+    args.push(u32_value(logical_nt, "logical N tiles")?);
+    args.push_dynamic();
+    args.push(u32_value(col_offset_tiles, "output column offset")?);
+    Ok(args)
 }
 
 fn mcast_rect_args(cols: &[u8], y: u8) -> [u32; 5] {
@@ -980,7 +889,7 @@ mod tests {
         .expect("east plan");
         let grid = plan_grid(&plan);
         let sender = grid[0][0];
-        let args = reader_args(&plan, 1, 2, &grid, 0, sender, 128).expect("reader args");
-        assert_eq!(args[18] as usize, plan.cols.len() - 1);
+        let args = reader_args(&plan, &grid, 0, sender, 128).expect("reader args");
+        assert_eq!(args.values()[18] as usize, plan.cols.len() - 1);
     }
 }
