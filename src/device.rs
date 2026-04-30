@@ -1,8 +1,8 @@
 use crate::compiler::Compiler;
 use crate::cq::FastDispatcher;
 use crate::dispatch::{
-    build_dispatch_plan, build_dispatch_runtime_plan, mcast_rects, DevMsgs, DispatchCommand,
-    Program, SlowDispatcher,
+    build_dispatch_plan, build_dispatch_runtime_args_plan, mcast_rects, DevMsgs, DispatchCommand,
+    Program, RuntimeArgs, SlowDispatcher,
 };
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{align_down, worker_cores, Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO};
@@ -13,6 +13,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc as StdArc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -89,6 +90,7 @@ pub struct Device {
     pub(crate) arch: String,
     pub(crate) tensix_core_count: usize,
     pub(crate) all_worker_cores: Vec<CoreCoord>,
+    worker_cores: StdArc<[CoreCoord]>,
     pub(crate) prefetch_core: CoreCoord,
     pub(crate) dispatch_core: CoreCoord,
     pub(crate) harvested_dram_banks: Vec<usize>,
@@ -98,11 +100,15 @@ pub struct Device {
     compiler: Compiler,
     dispatcher: Box<dyn Dispatcher>,
     staged_program_key: Option<u64>,
+    staged_runtime_args: Option<RuntimeArgs>,
 }
 
 trait Dispatcher {
     fn dispatch_mode(&self) -> u8;
-    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()>;
+    fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()>;
+    fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
+        self.execute(build_dispatch_runtime_args_plan(runtime_args)?)
+    }
 }
 
 impl Dispatcher for FastDispatcher {
@@ -110,8 +116,12 @@ impl Dispatcher for FastDispatcher {
         DevMsgs::DISPATCH_MODE_DEV
     }
 
-    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
+    fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
         FastDispatcher::execute(self, commands)
+    }
+
+    fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
+        FastDispatcher::execute_runtime(self, runtime_args)
     }
 }
 
@@ -120,7 +130,7 @@ impl Dispatcher for SlowDispatcher {
         DevMsgs::DISPATCH_MODE_HOST
     }
 
-    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
+    fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
         SlowDispatcher::execute(self, commands)
     }
 }
@@ -176,6 +186,13 @@ impl Device {
             (config.prefetch.x, config.prefetch.y),
             (config.dispatch.x, config.dispatch.y),
         )?;
+        let mut active_worker_cores = all_worker_cores
+            .iter()
+            .copied()
+            .filter(|core| *core != config.prefetch && *core != config.dispatch)
+            .collect::<Vec<_>>();
+        active_worker_cores.sort_unstable();
+        active_worker_cores.dedup();
         log(format!(
             "device {id} compiler initialized for {}",
             config.name
@@ -192,6 +209,7 @@ impl Device {
             arch: config.name.to_owned(),
             tensix_core_count,
             all_worker_cores,
+            worker_cores: active_worker_cores.into(),
             prefetch_core: config.prefetch,
             dispatch_core: config.dispatch,
             harvested_dram_banks,
@@ -201,6 +219,7 @@ impl Device {
             compiler,
             dispatcher,
             staged_program_key: None,
+            staged_runtime_args: None,
         };
 
         if let Err(err) = info.upload_firmware() {
@@ -223,12 +242,12 @@ impl Device {
         Ok(info)
     }
 
-    pub(crate) fn cores(&self) -> Vec<CoreCoord> {
-        self.all_worker_cores
-            .iter()
-            .copied()
-            .filter(|core| *core != self.prefetch_core && *core != self.dispatch_core)
-            .collect()
+    pub(crate) fn cores_ref(&self) -> &[CoreCoord] {
+        &self.worker_cores
+    }
+
+    pub(crate) fn cores_arc(&self) -> StdArc<[CoreCoord]> {
+        StdArc::clone(&self.worker_cores)
     }
 
     pub(crate) fn device_kind(&self) -> String {
@@ -239,7 +258,7 @@ impl Device {
         let mut parts = vec![format!("board={}", self.arch)];
         parts.push(format!("cores={}", self.tensix_core_count));
         if !self.all_worker_cores.is_empty() {
-            parts.push(format!("workers={}", self.cores().len()));
+            parts.push(format!("workers={}", self.cores_ref().len()));
         }
         if self.active_dram_banks > 0 {
             parts.push(format!("dram_banks={}", self.active_dram_banks));
@@ -294,18 +313,66 @@ impl Device {
     }
 
     pub fn run_program(&mut self, program: &Program) -> io::Result<()> {
-        let worker_cores = self.cores();
         let dispatch_mode = self.dispatcher.dispatch_mode();
         let program_key = staged_program_key(program, dispatch_mode);
-        let commands = if program_key.is_some()
+        if program_key.is_some()
             && program.runtime_args.is_some()
             && self.staged_program_key == program_key
         {
-            build_dispatch_runtime_plan(program)?
-        } else {
-            build_dispatch_plan(&self.compiler, &worker_cores, program, dispatch_mode)?
-        };
-        self.dispatcher.execute(&commands)?;
+            let runtime_args = program.runtime_args.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing runtime args")
+            })?;
+            return self.execute_runtime_args(runtime_args, program_key);
+        }
+        let commands =
+            build_dispatch_plan(&self.compiler, self.cores_ref(), program, dispatch_mode)?;
+        self.dispatcher.execute(commands)?;
+        self.staged_program_key = program_key;
+        self.staged_runtime_args = program.runtime_args.clone();
+        Ok(())
+    }
+
+    pub(crate) fn run_cached_program(
+        &mut self,
+        program: StdArc<Program>,
+        update_runtime_args: impl FnOnce(&mut RuntimeArgs) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let dispatch_mode = self.dispatcher.dispatch_mode();
+        let program_key = staged_program_key(&program, dispatch_mode);
+        if program_key.is_some()
+            && program.runtime_args.is_some()
+            && self.staged_program_key == program_key
+        {
+            if self.staged_runtime_args.is_none() {
+                self.staged_runtime_args = program.runtime_args.clone();
+            }
+            let mut runtime_args = self.staged_runtime_args.take().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing staged runtime args")
+            })?;
+            let result = update_runtime_args(&mut runtime_args)
+                .and_then(|()| self.execute_runtime_args(&runtime_args, program_key));
+            self.staged_runtime_args = Some(runtime_args);
+            return result;
+        }
+
+        let mut program = program.as_ref().clone();
+        if let Some(runtime_args) = &mut program.runtime_args {
+            update_runtime_args(runtime_args)?;
+        }
+        let commands =
+            build_dispatch_plan(&self.compiler, self.cores_ref(), &program, dispatch_mode)?;
+        self.dispatcher.execute(commands)?;
+        self.staged_program_key = program_key;
+        self.staged_runtime_args = program.runtime_args;
+        Ok(())
+    }
+
+    fn execute_runtime_args(
+        &mut self,
+        runtime_args: &RuntimeArgs,
+        program_key: Option<u64>,
+    ) -> io::Result<()> {
+        self.dispatcher.execute_runtime(runtime_args)?;
         self.staged_program_key = program_key;
         Ok(())
     }
@@ -739,14 +806,14 @@ mod tests {
         assert_eq!(device.arch, "p100");
         assert_eq!(device.tensix_core_count, 120);
         assert_eq!(device.all_worker_cores.len(), 120);
-        assert_eq!(device.cores().len(), 118);
+        assert_eq!(device.cores_ref().len(), 118);
         assert_eq!(device.prefetch_core, CoreCoord { x: 14, y: 2 });
         assert_eq!(device.dispatch_core, CoreCoord { x: 14, y: 3 });
         assert_eq!(device.harvested_dram_banks, vec![7]);
         assert_eq!(device.active_dram_banks, 7);
         assert_eq!(device.dram_tiles.len(), 21);
-        assert!(!device.cores().contains(&CoreCoord { x: 14, y: 2 }));
-        assert!(!device.cores().contains(&CoreCoord { x: 14, y: 3 }));
+        assert!(!device.cores_ref().contains(&CoreCoord { x: 14, y: 2 }));
+        assert!(!device.cores_ref().contains(&CoreCoord { x: 14, y: 3 }));
     }
 
     #[test]
@@ -765,7 +832,7 @@ mod tests {
         assert_eq!(device.board, BoardKind::P150);
         assert_eq!(device.tensix_core_count, 140);
         assert_eq!(device.all_worker_cores.len(), 140);
-        assert_eq!(device.cores().len(), 138);
+        assert_eq!(device.cores_ref().len(), 138);
         assert_eq!(device.active_dram_banks, 8);
         assert!(device.harvested_dram_banks.is_empty());
         assert_eq!(device.dram_tiles.len(), 24);

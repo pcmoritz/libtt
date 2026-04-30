@@ -1,11 +1,11 @@
-use crate::dispatch::{pack_rta, Program, RuntimeArgs};
+use crate::dispatch::{pack_rta, Program, RuntimeArgLayout, RuntimeArgs};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::Kernel;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::io;
 use std::mem::size_of;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RuntimeArgList {
@@ -61,7 +61,7 @@ pub(crate) struct PackedRuntimeArgs {
 
 pub(crate) struct ProgramCache<K> {
     name: &'static str,
-    entries: OnceLock<Mutex<HashMap<K, Program>>>,
+    entries: OnceLock<Mutex<HashMap<K, Arc<Program>>>>,
 }
 
 impl<K> ProgramCache<K>
@@ -79,22 +79,22 @@ where
         &self,
         key: K,
         build: impl FnOnce() -> io::Result<Program>,
-    ) -> io::Result<Program> {
+    ) -> io::Result<Arc<Program>> {
         let entries = self.entries.get_or_init(|| Mutex::new(HashMap::new()));
         if let Some(program) = entries
             .lock()
             .map_err(|_| io::Error::other(format!("{} cache is poisoned", self.name)))?
             .get(&key)
-            .cloned()
+            .map(Arc::clone)
         {
             return Ok(program);
         }
 
-        let program = build()?;
+        let program = Arc::new(build()?);
         entries
             .lock()
             .map_err(|_| io::Error::other(format!("{} cache is poisoned", self.name)))?
-            .insert(key, program.clone());
+            .insert(key, Arc::clone(&program));
         Ok(program)
     }
 }
@@ -133,10 +133,7 @@ impl RuntimeArgs {
 
             writer_patches.push(section_patches(&args.writer, 0));
             reader_patches.push(section_patches(&args.reader, writer_bytes));
-            compute_patches.push(section_patches(
-                &args.compute,
-                writer_bytes + reader_bytes,
-            ));
+            compute_patches.push(section_patches(&args.compute, writer_bytes + reader_bytes));
             cores.push(args.core);
             blobs.push(pack_rta(
                 args.writer.values(),
@@ -148,11 +145,13 @@ impl RuntimeArgs {
         }
 
         let runtime_args = RuntimeArgs {
-            cores,
+            layout: Arc::new(RuntimeArgLayout {
+                cores,
+                writer_patches: patch_groups(writer_patches),
+                reader_patches: patch_groups(reader_patches),
+                compute_patches: patch_groups(compute_patches),
+            }),
             blobs,
-            writer_patches: patch_groups(writer_patches),
-            reader_patches: patch_groups(reader_patches),
-            compute_patches: patch_groups(compute_patches),
         };
 
         Ok(PackedRuntimeArgs {
@@ -163,40 +162,28 @@ impl RuntimeArgs {
         })
     }
 
-    pub(crate) fn update_from_kernel(&self, kernel: &impl Kernel) -> io::Result<Self> {
-        let mut next = self.clone();
+    #[inline]
+    pub(crate) fn update_from_kernel(&mut self, kernel: &impl Kernel) -> io::Result<()> {
+        let layout = &self.layout;
         patch_section(
-            &mut next.blobs,
-            &self.cores,
-            &self.reader_patches,
+            &mut self.blobs,
+            &layout.cores,
+            &layout.reader_patches,
             |core, index| kernel.reader_runtime_arg(core, index),
         )?;
         patch_section(
-            &mut next.blobs,
-            &self.cores,
-            &self.writer_patches,
+            &mut self.blobs,
+            &layout.cores,
+            &layout.writer_patches,
             |core, index| kernel.writer_runtime_arg(core, index),
         )?;
         patch_section(
-            &mut next.blobs,
-            &self.cores,
-            &self.compute_patches,
+            &mut self.blobs,
+            &layout.cores,
+            &layout.compute_patches,
             |core, index| kernel.compute_runtime_arg(core, index),
         )?;
-        Ok(next)
-    }
-}
-
-impl Program {
-    pub(crate) fn update_runtime_args_from_kernel(
-        &self,
-        kernel: &impl Kernel,
-    ) -> io::Result<Self> {
-        let mut program = self.clone();
-        if let Some(runtime_args) = &self.runtime_args {
-            program.runtime_args = Some(runtime_args.update_from_kernel(kernel)?);
-        }
-        Ok(program)
+        Ok(())
     }
 }
 
@@ -212,8 +199,9 @@ fn patch_groups(per_core: Vec<Vec<(usize, usize)>>) -> Vec<RuntimeArgPatchGroup>
     let mut groups = BTreeMap::<usize, Vec<Option<usize>>>::new();
     for (core_index, patches) in per_core.into_iter().enumerate() {
         for (index, offset) in patches {
-            groups.entry(index).or_insert_with(|| vec![None; core_count])[core_index] =
-                Some(offset);
+            groups
+                .entry(index)
+                .or_insert_with(|| vec![None; core_count])[core_index] = Some(offset);
         }
     }
     groups
@@ -229,14 +217,14 @@ fn patch_section(
     blobs: &mut [Vec<u8>],
     cores: &[CoreCoord],
     groups: &[RuntimeArgPatchGroup],
-    value: impl Fn(CoreCoord, usize) -> io::Result<Option<u32>>,
+    value: impl Fn(CoreCoord, usize) -> Option<u32>,
 ) -> io::Result<()> {
     for group in groups {
         for (core_index, offset) in group.offsets_by_core.iter().enumerate() {
             let Some(offset) = offset else {
                 continue;
             };
-            let value = value(cores[core_index], group.index)?.ok_or_else(|| {
+            let value = value(cores[core_index], group.index).ok_or_else(|| {
                 invalid_input(format!(
                     "missing dynamic runtime arg value for index {} on core {}",
                     group.index, cores[core_index]
@@ -248,6 +236,7 @@ fn patch_section(
     Ok(())
 }
 
+#[inline]
 fn patch_u32(blob: &mut [u8], offset: usize, value: u32) -> io::Result<()> {
     let end = offset + size_of::<u32>();
     let blob_len = blob.len();
@@ -271,21 +260,16 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::Device;
 
     struct TestKernel;
 
     impl Kernel for TestKernel {
-        fn program(&self, _device: &Device) -> io::Result<Program> {
-            Ok(Program::default())
+        fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+            (index == 0).then_some(0x2222)
         }
 
-        fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> io::Result<Option<u32>> {
-            Ok((index == 0).then_some(0x2222))
-        }
-
-        fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> io::Result<Option<u32>> {
-            Ok((index == 1).then_some(0x1111))
+        fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+            (index == 1).then_some(0x1111)
         }
     }
 
@@ -298,7 +282,7 @@ mod tests {
         reader.push_dynamic();
         reader.push(9);
 
-        let packed = RuntimeArgs::from_per_core(
+        let mut packed = RuntimeArgs::from_per_core(
             vec![PerCoreRuntimeArgs {
                 core: CoreCoord { x: 1, y: 2 },
                 writer,
@@ -309,12 +293,19 @@ mod tests {
         )
         .expect("lower");
 
-        let updated = packed
+        packed
             .runtime_args
             .update_from_kernel(&TestKernel)
             .expect("update");
 
-        assert_eq!(&updated.blobs[0][4..8], &0x1111u32.to_le_bytes());
-        assert_eq!(&updated.blobs[0][8..12], &0x2222u32.to_le_bytes());
+        assert_eq!(
+            &packed.runtime_args.blobs[0][4..8],
+            &0x1111u32.to_le_bytes()
+        );
+        assert_eq!(
+            &packed.runtime_args.blobs[0][8..12],
+            &0x2222u32.to_le_bytes()
+        );
     }
+
 }

@@ -6,6 +6,7 @@ use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
+use std::sync::Arc as StdArc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -98,12 +99,17 @@ impl CBConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RuntimeArgs {
+pub(crate) struct RuntimeArgLayout {
     pub(crate) cores: Vec<CoreCoord>,
-    pub(crate) blobs: Vec<Vec<u8>>,
     pub(crate) writer_patches: Vec<RuntimeArgPatchGroup>,
     pub(crate) reader_patches: Vec<RuntimeArgPatchGroup>,
     pub(crate) compute_patches: Vec<RuntimeArgPatchGroup>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeArgs {
+    pub(crate) layout: StdArc<RuntimeArgLayout>,
+    pub(crate) blobs: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,13 +193,13 @@ impl SlowDispatcher {
         })
     }
 
-    pub(crate) fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
+    pub(crate) fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
         for command in commands {
             match command {
                 DispatchCommand::Write { cores, addr, data } => {
-                    for (start, end) in mcast_rects(cores) {
+                    for (start, end) in mcast_rects(&cores) {
                         self.win.target(start, Some(end), 0, NocOrdering::Strict)?;
-                        self.win.write(*addr, data)?;
+                        self.win.write(addr, &data)?;
                     }
                 }
                 DispatchCommand::WritePacked { cores, addr, data } => {
@@ -207,19 +213,19 @@ impl SlowDispatcher {
                             ),
                         ));
                     }
-                    for (core, data) in cores.iter().zip(data) {
+                    for (core, data) in cores.iter().zip(&data) {
                         self.win.target(*core, None, 0, NocOrdering::Strict)?;
-                        self.win.write(*addr, data)?;
+                        self.win.write(addr, data)?;
                     }
                 }
                 DispatchCommand::Launch { cores } => {
                     let go_blob = [0u8, 0u8, 0u8, DevMsgs::RUN_MSG_GO];
-                    for (start, end) in mcast_rects(cores) {
+                    for (start, end) in mcast_rects(&cores) {
                         self.win.target(start, Some(end), 0, NocOrdering::Strict)?;
                         self.win.write(TensixL1::GO_MSG as usize, &go_blob)?;
                     }
 
-                    for core in cores {
+                    for core in &cores {
                         self.win.target(*core, None, 0, NocOrdering::Strict)?;
                         let deadline = Instant::now() + LAUNCH_TIMEOUT;
                         loop {
@@ -326,7 +332,7 @@ pub(crate) fn build_dispatch_plan(
         validate_runtime_args(runtime_args)?;
         if runtime_args.blobs.iter().any(|blob| !blob.is_empty()) {
             commands.push(DispatchCommand::WritePacked {
-                cores: runtime_args.cores.clone(),
+                cores: runtime_args.layout.cores.clone(),
                 addr: TensixL1::KERNEL_CONFIG_BASE as usize,
                 data: runtime_args.blobs.clone(),
             });
@@ -402,13 +408,11 @@ pub(crate) fn build_dispatch_plan(
     Ok(commands)
 }
 
-pub(crate) fn build_dispatch_runtime_plan(program: &Program) -> io::Result<Vec<DispatchCommand>> {
-    let runtime_args = program
-        .runtime_args
-        .as_ref()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing runtime args"))?;
+pub(crate) fn build_dispatch_runtime_args_plan(
+    runtime_args: &RuntimeArgs,
+) -> io::Result<Vec<DispatchCommand>> {
     validate_runtime_args(runtime_args)?;
-    let all_cores = runtime_args.cores.clone();
+    let all_cores = runtime_args.layout.cores.clone();
     if all_cores.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -431,15 +435,13 @@ pub(crate) fn build_dispatch_runtime_plan(program: &Program) -> io::Result<Vec<D
 
     if runtime_args.blobs.iter().any(|blob| !blob.is_empty()) {
         commands.push(DispatchCommand::WritePacked {
-            cores: runtime_args.cores.clone(),
+            cores: runtime_args.layout.cores.clone(),
             addr: TensixL1::KERNEL_CONFIG_BASE as usize,
             data: runtime_args.blobs.clone(),
         });
     }
 
-    commands.push(DispatchCommand::Launch {
-        cores: all_cores.clone(),
-    });
+    commands.push(DispatchCommand::Launch { cores: all_cores });
 
     Ok(commands)
 }
@@ -579,12 +581,12 @@ pub(crate) fn pack_rta(
 }
 
 fn validate_runtime_args(runtime_args: &RuntimeArgs) -> io::Result<()> {
-    if runtime_args.cores.len() != runtime_args.blobs.len() {
+    if runtime_args.layout.cores.len() != runtime_args.blobs.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "runtime arg core/blob length mismatch: {} != {}",
-                runtime_args.cores.len(),
+                runtime_args.layout.cores.len(),
                 runtime_args.blobs.len()
             ),
         ));

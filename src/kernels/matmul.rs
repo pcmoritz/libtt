@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::env;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc as StdArc, Mutex, OnceLock};
 
 const BF16_READER_SENDER: &str = include_str!("../../kernels/matmul_reader_sender.cc");
 const BF16_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
@@ -33,7 +33,7 @@ struct MatmulPlanKey {
     m: usize,
     k: usize,
     n: usize,
-    cores: Vec<CoreCoord>,
+    cores: StdArc<[CoreCoord]>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -102,21 +102,21 @@ impl MatmulPlan {
 
 struct MatmulBf16Kernel<'a> {
     lhs: &'a DramBuffer,
-    rhs: &'a DramBuffer,
-    output: &'a DramBuffer,
-    zero_tile: &'a DramBuffer,
+    lhs_addr: u32,
+    rhs_addr: u32,
+    output_addr: u32,
+    zero_addr: u32,
     logical_mt: usize,
     logical_nt: usize,
     math_fidelity: MathFidelity,
 }
 
-impl Kernel for MatmulBf16Kernel<'_> {
-    fn program(&self, device: &Device) -> io::Result<Program> {
-        let cores = device.cores();
+impl MatmulBf16Kernel<'_> {
+    fn cached_program(&self, device: &Device) -> io::Result<StdArc<Program>> {
         let m = self.logical_mt * 32;
         let k = self.lhs.shape.as_ref().expect("validated lhs shape")[1];
         let n = self.logical_nt * 32;
-        let plan = cached_plan_matmul(m, k, n, &cores)?;
+        let plan = cached_plan_matmul(m, k, n, device.cores_arc())?;
         log_matmul_plan(&plan);
         let static_key = matmul_static_key(&plan, self.math_fidelity);
         let key = MatmulProgramKey {
@@ -125,7 +125,7 @@ impl Kernel for MatmulBf16Kernel<'_> {
             logical_nt: self.logical_nt,
             col_offset_tiles: 0,
         };
-        let base_program = PROGRAM_CACHE.get_or_insert_with(key, || {
+        PROGRAM_CACHE.get_or_insert_with(key, || {
             bf16_program(
                 &plan,
                 self.logical_mt,
@@ -134,24 +134,27 @@ impl Kernel for MatmulBf16Kernel<'_> {
                 static_key,
                 self.math_fidelity,
             )
-        })?;
-        base_program.update_runtime_args_from_kernel(self)
+        })
     }
+}
 
-    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> io::Result<Option<u32>> {
+impl Kernel for MatmulBf16Kernel<'_> {
+    #[inline]
+    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
         match index {
-            READER_LHS_ADDR_INDEX => Ok(Some(u32_arg(self.lhs.addr, "lhs address")?)),
-            READER_ZERO_ADDR_INDEX => Ok(Some(u32_arg(self.zero_tile.addr, "zero tile address")?)),
-            _ => Ok(None),
+            READER_LHS_ADDR_INDEX => Some(self.lhs_addr),
+            READER_ZERO_ADDR_INDEX => Some(self.zero_addr),
+            _ => None,
         }
     }
 
-    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> io::Result<Option<u32>> {
+    #[inline]
+    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
         match index {
-            WRITER_RHS_ADDR_INDEX => Ok(Some(u32_arg(self.rhs.addr, "rhs address")?)),
-            WRITER_OUTPUT_ADDR_INDEX => Ok(Some(u32_arg(self.output.addr, "output address")?)),
-            WRITER_ZERO_ADDR_INDEX => Ok(Some(u32_arg(self.zero_tile.addr, "zero tile address")?)),
-            _ => Ok(None),
+            WRITER_RHS_ADDR_INDEX => Some(self.rhs_addr),
+            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
+            WRITER_ZERO_ADDR_INDEX => Some(self.zero_addr),
+            _ => None,
         }
     }
 }
@@ -198,15 +201,18 @@ pub(crate) fn matmul_bf16(
     )?;
     let kernel = MatmulBf16Kernel {
         lhs,
-        rhs,
-        output: &output,
-        zero_tile: &zero_tile,
+        lhs_addr: u32_arg(lhs.addr, "lhs address")?,
+        rhs_addr: u32_arg(rhs.addr, "rhs address")?,
+        output_addr: u32_arg(output.addr, "output address")?,
+        zero_addr: u32_arg(zero_tile.addr, "zero tile address")?,
         logical_mt,
         logical_nt,
         math_fidelity,
     };
-    let program = kernel.program(device)?;
-    device.run_program(&program)?;
+    let program = kernel.cached_program(device)?;
+    device.run_cached_program(program, |runtime_args| {
+        runtime_args.update_from_kernel(&kernel)
+    })?;
     Ok(output)
 }
 
@@ -280,15 +286,17 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
     plan_matmul_for_cores(m, k, n, cores)
 }
 
-fn cached_plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
-    let mut ordered = cores.to_vec();
-    ordered.sort_unstable();
-    ordered.dedup();
+fn cached_plan_matmul(
+    m: usize,
+    k: usize,
+    n: usize,
+    cores: StdArc<[CoreCoord]>,
+) -> io::Result<MatmulPlan> {
     let key = MatmulPlanKey {
         m,
         k,
         n,
-        cores: ordered,
+        cores: StdArc::clone(&cores),
     };
     let cache = PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(plan) = cache
@@ -300,7 +308,7 @@ fn cached_plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::
         return Ok(plan);
     }
 
-    let plan = plan_matmul(m, k, n, cores)?;
+    let plan = plan_matmul(m, k, n, &cores)?;
     cache
         .lock()
         .map_err(|_| io::Error::other("matmul plan cache is poisoned"))?
@@ -726,10 +734,7 @@ fn writer_args(
     args.push(u32_value(out_start, "output tile offset")?);
     args.push(1);
     args.push(u32_value(plan.nt, "output row stride")?);
-    args.push(u32_value(
-        plan.out_subblock_w,
-        "output next subblock w",
-    )?);
+    args.push(u32_value(plan.out_subblock_w, "output next subblock w")?);
     args.push(u32_value(
         plan.out_subblock_h * plan.nt,
         "output next subblock h",
