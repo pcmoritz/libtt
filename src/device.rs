@@ -2,10 +2,11 @@ use crate::compiler::Compiler;
 use crate::cq::FastDispatcher;
 use crate::dispatch::{
     build_dispatch_plan, build_dispatch_runtime_args_plan, mcast_rects, DevMsgs, DispatchCommand,
-    Program, RuntimeArgs, SlowDispatcher,
+    Program, SlowDispatcher,
 };
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{align_down, worker_cores, Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO};
+use crate::kernels::kernel::RuntimeArgs;
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
 use std::collections::HashMap;

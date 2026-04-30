@@ -1,12 +1,11 @@
 use crate::compiler::{CompiledKernel, Compiler};
 use crate::dram::DType;
 use crate::hw::{align_up, Arc, CoreCoord, TensixL1};
-use crate::kernels::cache::RuntimeArgPatchGroup;
+use crate::kernels::kernel::RuntimeArgs;
 use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
-use std::sync::Arc as StdArc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -96,20 +95,6 @@ impl CBConfig {
             tiles: 2,
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RuntimeArgLayout {
-    pub(crate) cores: Vec<CoreCoord>,
-    pub(crate) writer_patches: Vec<RuntimeArgPatchGroup>,
-    pub(crate) reader_patches: Vec<RuntimeArgPatchGroup>,
-    pub(crate) compute_patches: Vec<RuntimeArgPatchGroup>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RuntimeArgs {
-    pub(crate) layout: StdArc<RuntimeArgLayout>,
-    pub(crate) blobs: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,11 +315,11 @@ pub(crate) fn build_dispatch_plan(
 
     if let Some(runtime_args) = &program.runtime_args {
         validate_runtime_args(runtime_args)?;
-        if runtime_args.blobs.iter().any(|blob| !blob.is_empty()) {
+        if runtime_args.blobs().iter().any(|blob| !blob.is_empty()) {
             commands.push(DispatchCommand::WritePacked {
-                cores: runtime_args.layout.cores.clone(),
+                cores: runtime_args.cores().to_vec(),
                 addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-                data: runtime_args.blobs.clone(),
+                data: runtime_args.blobs().to_vec(),
             });
         }
     } else if has_per_core_args(program) {
@@ -412,7 +397,7 @@ pub(crate) fn build_dispatch_runtime_args_plan(
     runtime_args: &RuntimeArgs,
 ) -> io::Result<Vec<DispatchCommand>> {
     validate_runtime_args(runtime_args)?;
-    let all_cores = runtime_args.layout.cores.clone();
+    let all_cores = runtime_args.cores().to_vec();
     if all_cores.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -433,11 +418,11 @@ pub(crate) fn build_dispatch_runtime_args_plan(
         },
     ];
 
-    if runtime_args.blobs.iter().any(|blob| !blob.is_empty()) {
+    if runtime_args.blobs().iter().any(|blob| !blob.is_empty()) {
         commands.push(DispatchCommand::WritePacked {
-            cores: runtime_args.layout.cores.clone(),
+            cores: runtime_args.cores().to_vec(),
             addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-            data: runtime_args.blobs.clone(),
+            data: runtime_args.blobs().to_vec(),
         });
     }
 
@@ -581,13 +566,13 @@ pub(crate) fn pack_rta(
 }
 
 fn validate_runtime_args(runtime_args: &RuntimeArgs) -> io::Result<()> {
-    if runtime_args.layout.cores.len() != runtime_args.blobs.len() {
+    if runtime_args.cores().len() != runtime_args.blobs().len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "runtime arg core/blob length mismatch: {} != {}",
-                runtime_args.layout.cores.len(),
-                runtime_args.blobs.len()
+                runtime_args.cores().len(),
+                runtime_args.blobs().len()
             ),
         ));
     }

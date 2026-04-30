@@ -1,9 +1,9 @@
 use crate::compiler::Compiler;
 use crate::dispatch::{
     build_cq_launch, build_dispatch_runtime_args_plan, mcast_rects, DevMsgs, DispatchCommand,
-    RuntimeArgs,
 };
 use crate::hw::{align_down, align_up, noc_xy, Arc, CoreCoord, TensixL1, TensixMMIO};
+use crate::kernels::kernel::RuntimeArgs;
 use crate::linux::{NocOrdering, PinnedMemory, TlbWindow};
 use crate::log::log;
 use std::io;
@@ -109,7 +109,7 @@ impl FastDispatcher {
     }
 
     pub(crate) fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
-        let Some(blob_size) = uniform_blob_size(&runtime_args.blobs)? else {
+        let Some(blob_size) = uniform_blob_size(runtime_args.blobs())? else {
             return self.execute(build_dispatch_runtime_args_plan(runtime_args)?);
         };
 
@@ -129,7 +129,7 @@ impl FastDispatcher {
             .as_ref()
             .expect("runtime template was just initialized");
         let mut runtime_record = template.runtime_record.clone();
-        template.patch_runtime_blobs(&mut runtime_record, &runtime_args.blobs)?;
+        template.patch_runtime_blobs(&mut runtime_record, runtime_args.blobs())?;
 
         self.event_id = self.event_id.wrapping_add(1);
         for record in &template.records_before_runtime {
@@ -141,8 +141,7 @@ impl FastDispatcher {
         }
         let event_record = host_event_record(self.event_id)?;
         self.cq_hw.issue_write(&event_record)?;
-        self
-            .cq_hw
+        self.cq_hw
             .wait_completion(self.event_id, Duration::from_secs(10))
     }
 }
@@ -160,7 +159,7 @@ struct RuntimeCqTemplate {
 
 impl RuntimeCqTemplate {
     fn new(runtime_args: &RuntimeArgs, blob_size: usize, go_word: u32) -> io::Result<Self> {
-        let cores = runtime_args.layout.cores.clone();
+        let cores = runtime_args.cores().to_vec();
         let records_before_runtime = relayed_command_records([
             CqCommand::WritePackedLarge {
                 rects: mcast_rects(&cores),
@@ -214,7 +213,7 @@ impl RuntimeCqTemplate {
     }
 
     fn matches(&self, runtime_args: &RuntimeArgs, blob_size: usize) -> bool {
-        self.blob_size == blob_size && self.cores == runtime_args.layout.cores
+        self.blob_size == blob_size && self.cores == runtime_args.cores()
     }
 
     fn patch_runtime_blobs(&self, record: &mut [u8], blobs: &[Vec<u8>]) -> io::Result<()> {
