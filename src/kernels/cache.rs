@@ -18,10 +18,12 @@ impl RuntimeArgList {
         Self::default()
     }
 
+    // Static runtime args are fixed when the cached program is built.
     pub(crate) fn push(&mut self, value: u32) {
         self.values.push(value);
     }
 
+    // Dynamic runtime args reserve a slot that is patched per launch.
     pub(crate) fn push_dynamic(&mut self) {
         let index = self.values.len();
         self.values.push(0);
