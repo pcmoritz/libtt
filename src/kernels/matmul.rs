@@ -100,21 +100,21 @@ impl MatmulPlan {
     }
 }
 
-struct MatmulBf16Kernel<'a> {
-    lhs: &'a DramBuffer,
+struct MatmulBf16Kernel {
     lhs_addr: u32,
     rhs_addr: u32,
     output_addr: u32,
     zero_addr: u32,
     logical_mt: usize,
+    logical_kt: usize,
     logical_nt: usize,
     math_fidelity: MathFidelity,
 }
 
-impl MatmulBf16Kernel<'_> {
+impl MatmulBf16Kernel {
     fn cached_program(&self, device: &Device) -> io::Result<StdArc<Program>> {
         let m = self.logical_mt * 32;
-        let k = self.lhs.shape.as_ref().expect("validated lhs shape")[1];
+        let k = self.logical_kt * 32;
         let n = self.logical_nt * 32;
         let plan = cached_plan_matmul(m, k, n, device.cores_arc())?;
         log_matmul_plan(&plan);
@@ -138,7 +138,7 @@ impl MatmulBf16Kernel<'_> {
     }
 }
 
-impl Kernel for MatmulBf16Kernel<'_> {
+impl Kernel for MatmulBf16Kernel {
     #[inline]
     fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
         match index {
@@ -190,6 +190,7 @@ pub(crate) fn matmul_bf16(
 
     let output_name = name.into();
     let logical_mt = m / 32;
+    let logical_kt = k / 32;
     let logical_nt = n / 32;
     let math_fidelity = matmul_math_fidelity()?;
     let zero_tile = cached_zero_tile(device)?;
@@ -200,12 +201,12 @@ pub(crate) fn matmul_bf16(
         output_name,
     )?;
     let kernel = MatmulBf16Kernel {
-        lhs,
         lhs_addr: u32_arg(lhs.addr, "lhs address")?,
         rhs_addr: u32_arg(rhs.addr, "rhs address")?,
         output_addr: u32_arg(output.addr, "output address")?,
         zero_addr: u32_arg(zero_tile.addr, "zero tile address")?,
         logical_mt,
+        logical_kt,
         logical_nt,
         math_fidelity,
     };
@@ -283,45 +284,6 @@ fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::
 }
 
 fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
-    plan_matmul_for_cores(m, k, n, cores)
-}
-
-fn cached_plan_matmul(
-    m: usize,
-    k: usize,
-    n: usize,
-    cores: StdArc<[CoreCoord]>,
-) -> io::Result<MatmulPlan> {
-    let key = MatmulPlanKey {
-        m,
-        k,
-        n,
-        cores: StdArc::clone(&cores),
-    };
-    let cache = PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(plan) = cache
-        .lock()
-        .map_err(|_| io::Error::other("matmul plan cache is poisoned"))?
-        .get(&key)
-        .cloned()
-    {
-        return Ok(plan);
-    }
-
-    let plan = plan_matmul(m, k, n, &cores)?;
-    cache
-        .lock()
-        .map_err(|_| io::Error::other("matmul plan cache is poisoned"))?
-        .insert(key, plan.clone());
-    Ok(plan)
-}
-
-fn plan_matmul_for_cores(
-    m: usize,
-    k: usize,
-    n: usize,
-    cores: &[CoreCoord],
-) -> io::Result<MatmulPlan> {
     let mt_base = ceil32(m) / 32;
     let kt = ceil32(k) / 32;
     let nt_base = (ceil32(n) / 32).max(1);
@@ -454,6 +416,36 @@ fn plan_matmul_for_cores(
         out_subblock_h,
         out_subblock_w,
     })
+}
+
+fn cached_plan_matmul(
+    m: usize,
+    k: usize,
+    n: usize,
+    cores: StdArc<[CoreCoord]>,
+) -> io::Result<MatmulPlan> {
+    let key = MatmulPlanKey {
+        m,
+        k,
+        n,
+        cores: StdArc::clone(&cores),
+    };
+    let cache = PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(plan) = cache
+        .lock()
+        .map_err(|_| io::Error::other("matmul plan cache is poisoned"))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(plan);
+    }
+
+    let plan = plan_matmul(m, k, n, &cores)?;
+    cache
+        .lock()
+        .map_err(|_| io::Error::other("matmul plan cache is poisoned"))?
+        .insert(key, plan.clone());
+    Ok(plan)
 }
 
 fn fits_l1(
@@ -863,7 +855,7 @@ mod tests {
 
     #[test]
     fn plan_matmul_uses_ceiled_tile_shape() {
-        let plan = plan_matmul_for_cores(33, 65, 1, &cores(&[1], &[2])).expect("plan");
+        let plan = plan_matmul(33, 65, 1, &cores(&[1], &[2])).expect("plan");
         assert_eq!(plan.mt, 2);
         assert_eq!(plan.kt, 3);
         assert_eq!(plan.nt, 1);
@@ -871,7 +863,7 @@ mod tests {
 
     #[test]
     fn reader_args_exclude_east_sender_from_multicast_receivers() {
-        let plan = plan_matmul_for_cores(
+        let plan = plan_matmul(
             4096,
             8192,
             1536,
