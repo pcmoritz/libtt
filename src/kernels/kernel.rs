@@ -101,31 +101,42 @@ impl RuntimeArgsBuilder {
     }
 
     fn lower(self) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>)> {
+        let core_count = self.per_core.len();
         let mut cores = Vec::with_capacity(self.per_core.len());
         let mut blobs = Vec::with_capacity(self.per_core.len());
-        let mut writer_patches = Vec::with_capacity(self.per_core.len());
-        let mut reader_patches = Vec::with_capacity(self.per_core.len());
-        let mut compute_patches = Vec::with_capacity(self.per_core.len());
+        let mut writer_patches = BTreeMap::<usize, RuntimeArgPatchGroup>::new();
+        let mut reader_patches = BTreeMap::<usize, RuntimeArgPatchGroup>::new();
+        let mut compute_patches = BTreeMap::<usize, RuntimeArgPatchGroup>::new();
         let mut writer_args = None;
         let mut reader_args = None;
         let mut compute_args = None;
 
-        for (core, args) in self.per_core {
+        for (core_index, (core, args)) in self.per_core.into_iter().enumerate() {
             let writer_bytes = args.writer.len() * size_of::<u32>();
             let reader_bytes = args.reader.len() * size_of::<u32>();
             let compute_bytes = args.compute.len() * size_of::<u32>();
             let sem_off = align16(writer_bytes + reader_bytes + compute_bytes);
 
-            let (writer, patches) = lower_section(&args.writer, 0);
-            writer_patches.push(patches);
+            let writer =
+                lower_section(&args.writer, 0, core_index, core_count, &mut writer_patches);
             writer_args.get_or_insert_with(|| writer.clone());
 
-            let (reader, patches) = lower_section(&args.reader, writer_bytes);
-            reader_patches.push(patches);
+            let reader = lower_section(
+                &args.reader,
+                writer_bytes,
+                core_index,
+                core_count,
+                &mut reader_patches,
+            );
             reader_args.get_or_insert_with(|| reader.clone());
 
-            let (compute, patches) = lower_section(&args.compute, writer_bytes + reader_bytes);
-            compute_patches.push(patches);
+            let compute = lower_section(
+                &args.compute,
+                writer_bytes + reader_bytes,
+                core_index,
+                core_count,
+                &mut compute_patches,
+            );
             compute_args.get_or_insert_with(|| compute.clone());
 
             cores.push(core);
@@ -140,9 +151,9 @@ impl RuntimeArgsBuilder {
 
         let runtime_args = RuntimeArgs {
             cores: cores.into(),
-            writer_patches: patch_groups(writer_patches).into(),
-            reader_patches: patch_groups(reader_patches).into(),
-            compute_patches: patch_groups(compute_patches).into(),
+            writer_patches: writer_patches.into_values().collect(),
+            reader_patches: reader_patches.into_values().collect(),
+            compute_patches: compute_patches.into_values().collect(),
             blobs,
         };
 
@@ -161,6 +172,15 @@ struct RuntimeArgPatchGroup {
     offsets_by_core: Vec<Option<usize>>,
 }
 
+impl RuntimeArgPatchGroup {
+    fn new(index: usize, core_count: usize) -> Self {
+        Self {
+            index,
+            offsets_by_core: vec![None; core_count],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PerCoreRuntimeArgs {
     writer: Vec<Option<u32>>,
@@ -168,38 +188,27 @@ struct PerCoreRuntimeArgs {
     compute: Vec<Option<u32>>,
 }
 
-fn lower_section(args: &[Option<u32>], base_offset: usize) -> (Vec<u32>, Vec<(usize, usize)>) {
+fn lower_section(
+    args: &[Option<u32>],
+    base_offset: usize,
+    core_index: usize,
+    core_count: usize,
+    patches: &mut BTreeMap<usize, RuntimeArgPatchGroup>,
+) -> Vec<u32> {
     let mut values = Vec::with_capacity(args.len());
-    let mut patches = Vec::new();
     for (index, arg) in args.iter().enumerate() {
         match arg {
             Some(value) => values.push(*value),
             None => {
                 values.push(0);
-                patches.push((index, base_offset + index * size_of::<u32>()));
+                patches
+                    .entry(index)
+                    .or_insert_with(|| RuntimeArgPatchGroup::new(index, core_count))
+                    .offsets_by_core[core_index] = Some(base_offset + index * size_of::<u32>());
             }
         }
     }
-    (values, patches)
-}
-
-fn patch_groups(per_core: Vec<Vec<(usize, usize)>>) -> Vec<RuntimeArgPatchGroup> {
-    let core_count = per_core.len();
-    let mut groups = BTreeMap::<usize, Vec<Option<usize>>>::new();
-    for (core_index, patches) in per_core.into_iter().enumerate() {
-        for (index, offset) in patches {
-            groups
-                .entry(index)
-                .or_insert_with(|| vec![None; core_count])[core_index] = Some(offset);
-        }
-    }
-    groups
-        .into_iter()
-        .map(|(index, offsets_by_core)| RuntimeArgPatchGroup {
-            index,
-            offsets_by_core,
-        })
-        .collect()
+    values
 }
 
 fn patch_section(
