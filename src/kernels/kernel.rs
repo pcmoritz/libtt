@@ -77,9 +77,9 @@ impl RuntimeArgsBuilder {
         self.per_core.insert(
             core,
             PerCoreRuntimeArgs {
-                writer: RuntimeArgSection::from_args(writer),
-                reader: RuntimeArgSection::from_args(reader),
-                compute: RuntimeArgSection::from_args(compute),
+                writer,
+                reader,
+                compute,
             },
         );
         Ok(())
@@ -101,30 +101,14 @@ impl RuntimeArgsBuilder {
     }
 
     fn lower(self) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>)> {
-        let writer_args = self
-            .per_core
-            .values()
-            .next()
-            .map(|args| args.writer.values.clone())
-            .unwrap_or_default();
-        let reader_args = self
-            .per_core
-            .values()
-            .next()
-            .map(|args| args.reader.values.clone())
-            .unwrap_or_default();
-        let compute_args = self
-            .per_core
-            .values()
-            .next()
-            .map(|args| args.compute.values.clone())
-            .unwrap_or_default();
-
         let mut cores = Vec::with_capacity(self.per_core.len());
         let mut blobs = Vec::with_capacity(self.per_core.len());
         let mut writer_patches = Vec::with_capacity(self.per_core.len());
         let mut reader_patches = Vec::with_capacity(self.per_core.len());
         let mut compute_patches = Vec::with_capacity(self.per_core.len());
+        let mut writer_args = None;
+        let mut reader_args = None;
+        let mut compute_args = None;
 
         for (core, args) in self.per_core {
             let writer_bytes = args.writer.len() * size_of::<u32>();
@@ -132,14 +116,23 @@ impl RuntimeArgsBuilder {
             let compute_bytes = args.compute.len() * size_of::<u32>();
             let sem_off = align16(writer_bytes + reader_bytes + compute_bytes);
 
-            writer_patches.push(section_patches(&args.writer, 0));
-            reader_patches.push(section_patches(&args.reader, writer_bytes));
-            compute_patches.push(section_patches(&args.compute, writer_bytes + reader_bytes));
+            let (writer, patches) = lower_section(&args.writer, 0);
+            writer_patches.push(patches);
+            writer_args.get_or_insert_with(|| writer.clone());
+
+            let (reader, patches) = lower_section(&args.reader, writer_bytes);
+            reader_patches.push(patches);
+            reader_args.get_or_insert_with(|| reader.clone());
+
+            let (compute, patches) = lower_section(&args.compute, writer_bytes + reader_bytes);
+            compute_patches.push(patches);
+            compute_args.get_or_insert_with(|| compute.clone());
+
             cores.push(core);
             blobs.push(pack_rta(
-                &args.writer.values,
-                &args.reader.values,
-                &args.compute.values,
+                &writer,
+                &reader,
+                &compute,
                 self.semaphores,
                 sem_off,
             ));
@@ -153,7 +146,12 @@ impl RuntimeArgsBuilder {
             blobs,
         };
 
-        Ok((runtime_args, writer_args, reader_args, compute_args))
+        Ok((
+            runtime_args,
+            writer_args.unwrap_or_default(),
+            reader_args.unwrap_or_default(),
+            compute_args.unwrap_or_default(),
+        ))
     }
 }
 
@@ -165,51 +163,24 @@ struct RuntimeArgPatchGroup {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PerCoreRuntimeArgs {
-    writer: RuntimeArgSection,
-    reader: RuntimeArgSection,
-    compute: RuntimeArgSection,
+    writer: Vec<Option<u32>>,
+    reader: Vec<Option<u32>>,
+    compute: Vec<Option<u32>>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct RuntimeArgSection {
-    values: Vec<u32>,
-    dynamic_indices: Vec<usize>,
-}
-
-impl RuntimeArgSection {
-    fn from_args(args: Vec<Option<u32>>) -> Self {
-        let mut section = Self::default();
-        for arg in args {
-            match arg {
-                Some(value) => section.push(value),
-                None => section.push_dynamic(),
+fn lower_section(args: &[Option<u32>], base_offset: usize) -> (Vec<u32>, Vec<(usize, usize)>) {
+    let mut values = Vec::with_capacity(args.len());
+    let mut patches = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        match arg {
+            Some(value) => values.push(*value),
+            None => {
+                values.push(0);
+                patches.push((index, base_offset + index * size_of::<u32>()));
             }
         }
-        section
     }
-
-    fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    // Static runtime args are fixed when the cached program is built.
-    fn push(&mut self, value: u32) {
-        self.values.push(value);
-    }
-
-    // Dynamic runtime args reserve a slot that is patched per launch.
-    fn push_dynamic(&mut self) {
-        let index = self.values.len();
-        self.values.push(0);
-        self.dynamic_indices.push(index);
-    }
-}
-
-fn section_patches(args: &RuntimeArgSection, base_offset: usize) -> Vec<(usize, usize)> {
-    args.dynamic_indices
-        .iter()
-        .map(|&index| (index, base_offset + index * size_of::<u32>()))
-        .collect()
+    (values, patches)
 }
 
 fn patch_groups(per_core: Vec<Vec<(usize, usize)>>) -> Vec<RuntimeArgPatchGroup> {
