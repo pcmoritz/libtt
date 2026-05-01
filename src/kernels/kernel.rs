@@ -101,44 +101,32 @@ impl RuntimeArgsBuilder {
     }
 
     fn lower(self) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>)> {
-        let core_count = self.per_core.len();
+        let Some(layout) = self.per_core.values().next().cloned() else {
+            return Ok((RuntimeArgs::empty(), Vec::new(), Vec::new(), Vec::new()));
+        };
+        let writer_args = lower_values(&layout.writer);
+        let reader_args = lower_values(&layout.reader);
+        let compute_args = lower_values(&layout.compute);
+        let writer_bytes = layout.writer.len() * size_of::<u32>();
+        let reader_bytes = layout.reader.len() * size_of::<u32>();
+        let compute_bytes = layout.compute.len() * size_of::<u32>();
+        let sem_off = align16(writer_bytes + reader_bytes + compute_bytes);
+
+        let writer_patches = section_patches(&layout.writer, 0);
+        let reader_patches = section_patches(&layout.reader, writer_bytes);
+        let compute_patches = section_patches(&layout.compute, writer_bytes + reader_bytes);
+
         let mut cores = Vec::with_capacity(self.per_core.len());
         let mut blobs = Vec::with_capacity(self.per_core.len());
-        let mut writer_patches = BTreeMap::<usize, RuntimeArgPatchGroup>::new();
-        let mut reader_patches = BTreeMap::<usize, RuntimeArgPatchGroup>::new();
-        let mut compute_patches = BTreeMap::<usize, RuntimeArgPatchGroup>::new();
-        let mut writer_args = None;
-        let mut reader_args = None;
-        let mut compute_args = None;
 
-        for (core_index, (core, args)) in self.per_core.into_iter().enumerate() {
-            let writer_bytes = args.writer.len() * size_of::<u32>();
-            let reader_bytes = args.reader.len() * size_of::<u32>();
-            let compute_bytes = args.compute.len() * size_of::<u32>();
-            let sem_off = align16(writer_bytes + reader_bytes + compute_bytes);
+        for (core, args) in self.per_core {
+            validate_section_layout(&layout.writer, &args.writer, "writer")?;
+            validate_section_layout(&layout.reader, &args.reader, "reader")?;
+            validate_section_layout(&layout.compute, &args.compute, "compute")?;
 
-            let writer =
-                lower_section(&args.writer, 0, core_index, core_count, &mut writer_patches);
-            writer_args.get_or_insert_with(|| writer.clone());
-
-            let reader = lower_section(
-                &args.reader,
-                writer_bytes,
-                core_index,
-                core_count,
-                &mut reader_patches,
-            );
-            reader_args.get_or_insert_with(|| reader.clone());
-
-            let compute = lower_section(
-                &args.compute,
-                writer_bytes + reader_bytes,
-                core_index,
-                core_count,
-                &mut compute_patches,
-            );
-            compute_args.get_or_insert_with(|| compute.clone());
-
+            let writer = lower_values(&args.writer);
+            let reader = lower_values(&args.reader);
+            let compute = lower_values(&args.compute);
             cores.push(core);
             blobs.push(pack_rta(
                 &writer,
@@ -151,34 +139,32 @@ impl RuntimeArgsBuilder {
 
         let runtime_args = RuntimeArgs {
             cores: cores.into(),
-            writer_patches: writer_patches.into_values().collect(),
-            reader_patches: reader_patches.into_values().collect(),
-            compute_patches: compute_patches.into_values().collect(),
+            writer_patches: writer_patches.into(),
+            reader_patches: reader_patches.into(),
+            compute_patches: compute_patches.into(),
             blobs,
         };
 
-        Ok((
-            runtime_args,
-            writer_args.unwrap_or_default(),
-            reader_args.unwrap_or_default(),
-            compute_args.unwrap_or_default(),
-        ))
+        Ok((runtime_args, writer_args, reader_args, compute_args))
+    }
+}
+
+impl RuntimeArgs {
+    fn empty() -> Self {
+        Self {
+            cores: Arc::from([]),
+            writer_patches: Arc::from([]),
+            reader_patches: Arc::from([]),
+            compute_patches: Arc::from([]),
+            blobs: Vec::new(),
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimeArgPatchGroup {
     index: usize,
-    offsets_by_core: Vec<Option<usize>>,
-}
-
-impl RuntimeArgPatchGroup {
-    fn new(index: usize, core_count: usize) -> Self {
-        Self {
-            index,
-            offsets_by_core: vec![None; core_count],
-        }
-    }
+    offset: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -188,27 +174,46 @@ struct PerCoreRuntimeArgs {
     compute: Vec<Option<u32>>,
 }
 
-fn lower_section(
-    args: &[Option<u32>],
-    base_offset: usize,
-    core_index: usize,
-    core_count: usize,
-    patches: &mut BTreeMap<usize, RuntimeArgPatchGroup>,
-) -> Vec<u32> {
+fn lower_values(args: &[Option<u32>]) -> Vec<u32> {
     let mut values = Vec::with_capacity(args.len());
-    for (index, arg) in args.iter().enumerate() {
+    for arg in args {
         match arg {
             Some(value) => values.push(*value),
-            None => {
-                values.push(0);
-                patches
-                    .entry(index)
-                    .or_insert_with(|| RuntimeArgPatchGroup::new(index, core_count))
-                    .offsets_by_core[core_index] = Some(base_offset + index * size_of::<u32>());
-            }
+            None => values.push(0),
         }
     }
     values
+}
+
+fn section_patches(args: &[Option<u32>], base_offset: usize) -> Vec<RuntimeArgPatchGroup> {
+    args.iter()
+        .enumerate()
+        .filter_map(|(index, arg)| {
+            arg.is_none().then_some(RuntimeArgPatchGroup {
+                index,
+                offset: base_offset + index * size_of::<u32>(),
+            })
+        })
+        .collect()
+}
+
+fn validate_section_layout(
+    expected: &[Option<u32>],
+    actual: &[Option<u32>],
+    section: &str,
+) -> io::Result<()> {
+    let matches = expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual)
+            .all(|(expected, actual)| expected.is_none() == actual.is_none());
+    if matches {
+        Ok(())
+    } else {
+        Err(invalid_input(format!(
+            "{section} runtime arg layout differs across cores"
+        )))
+    }
 }
 
 fn patch_section(
@@ -218,17 +223,14 @@ fn patch_section(
     value: impl Fn(CoreCoord, usize) -> Option<u32>,
 ) -> io::Result<()> {
     for group in groups {
-        for (core_index, offset) in group.offsets_by_core.iter().enumerate() {
-            let Some(offset) = offset else {
-                continue;
-            };
+        for (core_index, blob) in blobs.iter_mut().enumerate() {
             let value = value(cores[core_index], group.index).ok_or_else(|| {
                 invalid_input(format!(
                     "missing dynamic runtime arg value for index {} on core {}",
                     group.index, cores[core_index]
                 ))
             })?;
-            patch_u32(&mut blobs[core_index], *offset, value)?;
+            patch_u32(blob, group.offset, value)?;
         }
     }
     Ok(())
