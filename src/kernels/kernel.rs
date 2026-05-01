@@ -113,7 +113,7 @@ impl RuntimeArgsBuilder {
 
     fn lower(self) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>)> {
         let Some(layout) = self.per_core.values().next().cloned() else {
-            return Ok((RuntimeArgs::empty(), Vec::new(), Vec::new(), Vec::new()));
+            return Err(invalid_input("runtime args require at least one core"));
         };
         let writer_args = layout.writer.clone();
         let reader_args = layout.reader.clone();
@@ -151,18 +151,6 @@ impl RuntimeArgsBuilder {
         };
 
         Ok((runtime_args, writer_args, reader_args, compute_args))
-    }
-}
-
-impl RuntimeArgs {
-    fn empty() -> Self {
-        Self {
-            cores: Arc::from([]),
-            writer_patches: Arc::from([]),
-            reader_patches: Arc::from([]),
-            compute_patches: Arc::from([]),
-            blobs: Vec::new(),
-        }
     }
 }
 

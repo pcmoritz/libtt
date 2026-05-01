@@ -126,16 +126,15 @@ impl FastDispatcher {
         }
         let template = self
             .runtime_template
-            .as_ref()
+            .as_mut()
             .expect("runtime template was just initialized");
-        let mut runtime_record = template.runtime_record.clone();
-        template.patch_runtime_blobs(&mut runtime_record, runtime_args.blobs())?;
+        template.patch_runtime_blobs(runtime_args.blobs())?;
 
         self.event_id = self.event_id.wrapping_add(1);
         for record in &template.records_before_runtime {
             self.cq_hw.issue_write(record)?;
         }
-        self.cq_hw.issue_write(&runtime_record)?;
+        self.cq_hw.issue_write(&template.runtime_record)?;
         for record in &template.records_after_runtime {
             self.cq_hw.issue_write(record)?;
         }
@@ -216,7 +215,7 @@ impl RuntimeCqTemplate {
         self.blob_size == blob_size && self.cores == runtime_args.cores()
     }
 
-    fn patch_runtime_blobs(&self, record: &mut [u8], blobs: &[Vec<u8>]) -> io::Result<()> {
+    fn patch_runtime_blobs(&mut self, blobs: &[Vec<u8>]) -> io::Result<()> {
         if blobs.len() != self.cores.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -235,7 +234,7 @@ impl RuntimeCqTemplate {
                 ));
             }
             let start = self.runtime_blob_start + self.runtime_blob_stride * index;
-            record[start..start + self.blob_size].copy_from_slice(blob);
+            self.runtime_record[start..start + self.blob_size].copy_from_slice(blob);
         }
         Ok(())
     }
