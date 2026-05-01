@@ -553,7 +553,16 @@ fn lower_runtime_args(
     program: &mut Program,
 ) -> io::Result<()> {
     let grid = plan_grid(plan);
-    let mut runtime_args = RuntimeArgsBuilder::new(NUM_SEMAPHORES);
+    let mut runtime_args = RuntimeArgsBuilder::new(
+        NUM_SEMAPHORES,
+        vec![
+            WRITER_RHS_ADDR_INDEX,
+            WRITER_OUTPUT_ADDR_INDEX,
+            WRITER_ZERO_ADDR_INDEX,
+        ],
+        vec![READER_LHS_ADDR_INDEX, READER_ZERO_ADDR_INDEX],
+        Vec::new(),
+    );
     for (row_index, row) in grid.iter().enumerate() {
         for (col_index, &core) in row.iter().enumerate() {
             let reader = reader_args(plan, &grid, row_index, core, logical_mt)?;
@@ -619,7 +628,7 @@ fn reader_args(
     row_index: usize,
     core: CoreCoord,
     logical_mt: usize,
-) -> io::Result<Vec<Option<u32>>> {
+) -> io::Result<Vec<u32>> {
     let west_cols = plan
         .cols
         .iter()
@@ -650,32 +659,29 @@ fn reader_args(
     );
     let sender = grid[row_index][0];
     let mut args = vec![
-        None,
-        Some(u32_value(
-            row_index * plan.per_core_m * plan.kt,
-            "lhs block offset",
-        )?),
-        Some(1),
-        Some(u32_value(plan.kt, "lhs row stride")?),
-        Some(u32_value(plan.in0_block_w, "lhs block advance")?),
-        Some(u32_value(plan.in0_block_w, "lhs block width")?),
-        Some(u32_value(plan.per_core_m, "lhs block height")?),
-        Some(u32_value(plan.in0_block_num_tiles(), "lhs block tiles")?),
-        Some(u32_value(plan.num_blocks(), "num blocks")?),
+        0,
+        u32_value(row_index * plan.per_core_m * plan.kt, "lhs block offset")?,
+        1,
+        u32_value(plan.kt, "lhs row stride")?,
+        u32_value(plan.in0_block_w, "lhs block advance")?,
+        u32_value(plan.in0_block_w, "lhs block width")?,
+        u32_value(plan.per_core_m, "lhs block height")?,
+        u32_value(plan.in0_block_num_tiles(), "lhs block tiles")?,
+        u32_value(plan.num_blocks(), "num blocks")?,
     ];
     for value in w_rect {
-        args.push(Some(value));
+        args.push(value);
     }
     for value in e_rect {
-        args.push(Some(value));
+        args.push(value);
     }
     args.extend([
-        Some(sender.x as u32),
-        Some(sender.y as u32),
-        Some(0),
-        Some(1),
-        None,
-        Some(u32_value(logical_mt, "logical M tiles")?),
+        sender.x as u32,
+        sender.y as u32,
+        0,
+        1,
+        0,
+        u32_value(logical_mt, "logical M tiles")?,
     ]);
     Ok(args)
 }
@@ -689,7 +695,7 @@ fn writer_args(
     logical_mt: usize,
     logical_nt: usize,
     col_offset_tiles: usize,
-) -> io::Result<Vec<Option<u32>>> {
+) -> io::Result<Vec<u32>> {
     let recv_ys = plan.rows.iter().copied().skip(1).collect::<Vec<_>>();
     let mcast = if recv_ys.is_empty() {
         [0, 0, 0, 0, 0]
@@ -706,54 +712,39 @@ fn writer_args(
     let column_start = col_offset_tiles + col_index * plan.per_core_n;
     let out_start = row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n;
     let mut args = vec![
-        None,
-        Some(u32_value(column_start, "rhs block offset")?),
-        Some(1),
-        Some(u32_value(logical_nt, "rhs row stride")?),
-        Some(u32_value(
-            plan.in0_block_w * logical_nt,
-            "rhs block advance",
-        )?),
-        Some(u32_value(plan.per_core_n, "rhs block width")?),
-        Some(u32_value(plan.in0_block_w, "rhs block height")?),
-        Some(u32_value(plan.in1_block_num_tiles(), "rhs block tiles")?),
-        Some(u32_value(plan.num_blocks(), "num blocks")?),
+        0,
+        u32_value(column_start, "rhs block offset")?,
+        1,
+        u32_value(logical_nt, "rhs row stride")?,
+        u32_value(plan.in0_block_w * logical_nt, "rhs block advance")?,
+        u32_value(plan.per_core_n, "rhs block width")?,
+        u32_value(plan.in0_block_w, "rhs block height")?,
+        u32_value(plan.in1_block_num_tiles(), "rhs block tiles")?,
+        u32_value(plan.num_blocks(), "num blocks")?,
     ];
     for value in mcast {
-        args.push(Some(value));
+        args.push(value);
     }
     args.extend([
-        Some(sender.x as u32),
-        Some(sender.y as u32),
-        Some(2),
-        Some(3),
-        None,
-        Some(u32_value(out_start, "output tile offset")?),
-        Some(1),
-        Some(u32_value(plan.nt, "output row stride")?),
-        Some(u32_value(plan.out_subblock_w, "output next subblock w")?),
-        Some(u32_value(
-            plan.out_subblock_h * plan.nt,
-            "output next subblock h",
-        )?),
-        Some(u32_value(plan.out_subblock_w, "output subblock width")?),
-        Some(u32_value(plan.out_subblock_h, "output subblock height")?),
-        Some(u32_value(
-            plan.out_subblock_num_tiles(),
-            "output subblock tiles",
-        )?),
-        Some(u32_value(
-            plan.in1_num_subblocks(),
-            "output num subblocks w",
-        )?),
-        Some(u32_value(
-            plan.in0_num_subblocks(),
-            "output num subblocks h",
-        )?),
-        Some(u32_value(logical_mt, "logical M tiles")?),
-        Some(u32_value(logical_nt, "logical N tiles")?),
-        None,
-        Some(u32_value(col_offset_tiles, "output column offset")?),
+        sender.x as u32,
+        sender.y as u32,
+        2,
+        3,
+        0,
+        u32_value(out_start, "output tile offset")?,
+        1,
+        u32_value(plan.nt, "output row stride")?,
+        u32_value(plan.out_subblock_w, "output next subblock w")?,
+        u32_value(plan.out_subblock_h * plan.nt, "output next subblock h")?,
+        u32_value(plan.out_subblock_w, "output subblock width")?,
+        u32_value(plan.out_subblock_h, "output subblock height")?,
+        u32_value(plan.out_subblock_num_tiles(), "output subblock tiles")?,
+        u32_value(plan.in1_num_subblocks(), "output num subblocks w")?,
+        u32_value(plan.in0_num_subblocks(), "output num subblocks h")?,
+        u32_value(logical_mt, "logical M tiles")?,
+        u32_value(logical_nt, "logical N tiles")?,
+        0,
+        u32_value(col_offset_tiles, "output column offset")?,
     ]);
     Ok(args)
 }
@@ -892,7 +883,8 @@ mod tests {
         .expect("east plan");
         let grid = plan_grid(&plan);
         let sender = grid[0][0];
-        let mut builder = RuntimeArgsBuilder::new(0);
+        let mut builder =
+            RuntimeArgsBuilder::new(0, Vec::new(), vec![READER_ZERO_ADDR_INDEX], Vec::new());
         let reader = reader_args(&plan, &grid, 0, sender, 128).expect("reader args");
         builder
             .add_core(sender, Vec::new(), reader, Vec::new())
