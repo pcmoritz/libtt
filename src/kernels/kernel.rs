@@ -49,16 +49,14 @@ impl RuntimeArgs {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeArgsBuilder {
-    per_core: Vec<PerCoreRuntimeArgs>,
-    current_core: Option<usize>,
+    per_core: BTreeMap<CoreCoord, PerCoreRuntimeArgs>,
     semaphores: usize,
 }
 
 impl RuntimeArgsBuilder {
     pub(crate) fn new(semaphores: usize) -> Self {
         Self {
-            per_core: Vec::new(),
-            current_core: None,
+            per_core: BTreeMap::new(),
             semaphores,
         }
     }
@@ -66,45 +64,25 @@ impl RuntimeArgsBuilder {
     pub(crate) fn add_core(
         &mut self,
         core: CoreCoord,
-        build: impl FnOnce(&mut Self) -> io::Result<()>,
+        writer: Vec<Option<u32>>,
+        reader: Vec<Option<u32>>,
+        compute: Vec<Option<u32>>,
     ) -> io::Result<()> {
-        if self.current_core.is_some() {
-            return Err(invalid_input("runtime arg cores cannot be nested"));
+        if self.per_core.contains_key(&core) {
+            return Err(invalid_input(format!(
+                "duplicate runtime args for core {core}"
+            )));
         }
 
-        let index = self.per_core.len();
-        self.per_core.push(PerCoreRuntimeArgs::new(core));
-        self.current_core = Some(index);
-        let result = build(self);
-        self.current_core = None;
-        if result.is_err() {
-            self.per_core.pop();
-        }
-        result
-    }
-
-    pub(crate) fn reader_arg(&mut self, value: u32) {
-        self.current_core_mut().reader.push(value);
-    }
-
-    pub(crate) fn reader_dynamic_arg(&mut self) {
-        self.current_core_mut().reader.push_dynamic();
-    }
-
-    pub(crate) fn writer_arg(&mut self, value: u32) {
-        self.current_core_mut().writer.push(value);
-    }
-
-    pub(crate) fn writer_dynamic_arg(&mut self) {
-        self.current_core_mut().writer.push_dynamic();
-    }
-
-    pub(crate) fn compute_arg(&mut self, value: u32) {
-        self.current_core_mut().compute.push(value);
-    }
-
-    pub(crate) fn compute_dynamic_arg(&mut self) {
-        self.current_core_mut().compute.push_dynamic();
+        self.per_core.insert(
+            core,
+            PerCoreRuntimeArgs {
+                writer: RuntimeArgSection::from_args(writer),
+                reader: RuntimeArgSection::from_args(reader),
+                compute: RuntimeArgSection::from_args(compute),
+            },
+        );
+        Ok(())
     }
 
     pub(crate) fn build(self) -> io::Result<RuntimeArgs> {
@@ -122,29 +100,23 @@ impl RuntimeArgsBuilder {
         Ok(())
     }
 
-    fn current_core_mut(&mut self) -> &mut PerCoreRuntimeArgs {
-        let core_index = self
-            .current_core
-            .expect("runtime args must be added from RuntimeArgsBuilder::add_core");
-        &mut self.per_core[core_index]
-    }
-
-    fn lower(mut self) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>)> {
-        self.per_core.sort_unstable_by_key(|args| args.core);
-
+    fn lower(self) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>)> {
         let writer_args = self
             .per_core
-            .first()
+            .values()
+            .next()
             .map(|args| args.writer.values.clone())
             .unwrap_or_default();
         let reader_args = self
             .per_core
-            .first()
+            .values()
+            .next()
             .map(|args| args.reader.values.clone())
             .unwrap_or_default();
         let compute_args = self
             .per_core
-            .first()
+            .values()
+            .next()
             .map(|args| args.compute.values.clone())
             .unwrap_or_default();
 
@@ -154,7 +126,7 @@ impl RuntimeArgsBuilder {
         let mut reader_patches = Vec::with_capacity(self.per_core.len());
         let mut compute_patches = Vec::with_capacity(self.per_core.len());
 
-        for args in self.per_core {
+        for (core, args) in self.per_core {
             let writer_bytes = args.writer.len() * size_of::<u32>();
             let reader_bytes = args.reader.len() * size_of::<u32>();
             let compute_bytes = args.compute.len() * size_of::<u32>();
@@ -163,7 +135,7 @@ impl RuntimeArgsBuilder {
             writer_patches.push(section_patches(&args.writer, 0));
             reader_patches.push(section_patches(&args.reader, writer_bytes));
             compute_patches.push(section_patches(&args.compute, writer_bytes + reader_bytes));
-            cores.push(args.core);
+            cores.push(core);
             blobs.push(pack_rta(
                 &args.writer.values,
                 &args.reader.values,
@@ -185,25 +157,17 @@ impl RuntimeArgsBuilder {
     }
 }
 
-type RuntimeArgPatchGroup = (usize, Vec<Option<usize>>);
-
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeArgPatchGroup {
+    index: usize,
+    offsets_by_core: Vec<Option<usize>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PerCoreRuntimeArgs {
-    core: CoreCoord,
     writer: RuntimeArgSection,
     reader: RuntimeArgSection,
     compute: RuntimeArgSection,
-}
-
-impl PerCoreRuntimeArgs {
-    fn new(core: CoreCoord) -> Self {
-        Self {
-            core,
-            writer: RuntimeArgSection::default(),
-            reader: RuntimeArgSection::default(),
-            compute: RuntimeArgSection::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -213,6 +177,17 @@ struct RuntimeArgSection {
 }
 
 impl RuntimeArgSection {
+    fn from_args(args: Vec<Option<u32>>) -> Self {
+        let mut section = Self::default();
+        for arg in args {
+            match arg {
+                Some(value) => section.push(value),
+                None => section.push_dynamic(),
+            }
+        }
+        section
+    }
+
     fn len(&self) -> usize {
         self.values.len()
     }
@@ -247,7 +222,13 @@ fn patch_groups(per_core: Vec<Vec<(usize, usize)>>) -> Vec<RuntimeArgPatchGroup>
                 .or_insert_with(|| vec![None; core_count])[core_index] = Some(offset);
         }
     }
-    groups.into_iter().collect()
+    groups
+        .into_iter()
+        .map(|(index, offsets_by_core)| RuntimeArgPatchGroup {
+            index,
+            offsets_by_core,
+        })
+        .collect()
 }
 
 fn patch_section(
@@ -257,14 +238,14 @@ fn patch_section(
     value: impl Fn(CoreCoord, usize) -> Option<u32>,
 ) -> io::Result<()> {
     for group in groups {
-        for (core_index, offset) in group.1.iter().enumerate() {
+        for (core_index, offset) in group.offsets_by_core.iter().enumerate() {
             let Some(offset) = offset else {
                 continue;
             };
-            let value = value(cores[core_index], group.0).ok_or_else(|| {
+            let value = value(cores[core_index], group.index).ok_or_else(|| {
                 invalid_input(format!(
                     "missing dynamic runtime arg value for index {} on core {}",
-                    group.0, cores[core_index]
+                    group.index, cores[core_index]
                 ))
             })?;
             patch_u32(&mut blobs[core_index], *offset, value)?;
@@ -331,13 +312,12 @@ mod tests {
     fn runtime_args_update_patches_blobs_by_section_and_index() {
         let mut builder = RuntimeArgsBuilder::new(0);
         builder
-            .add_core(CoreCoord { x: 1, y: 2 }, |args| {
-                args.writer_arg(7);
-                args.writer_dynamic_arg();
-                args.reader_dynamic_arg();
-                args.reader_arg(9);
-                Ok(())
-            })
+            .add_core(
+                CoreCoord { x: 1, y: 2 },
+                vec![Some(7), None],
+                vec![None, Some(9)],
+                Vec::new(),
+            )
             .expect("add core");
 
         let mut runtime_args = builder.build().expect("lower");
