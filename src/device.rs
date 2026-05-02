@@ -104,6 +104,8 @@ pub struct Device {
 
 trait Dispatcher {
     fn dispatch_mode(&self) -> u8;
+    // Non-empty setup commands mean a new program was staged; an empty setup
+    // means the previously staged program is launching with patched runtime args.
     fn launch(&mut self, setup: Vec<DispatchCommand>, runtime_args: &RuntimeArgs)
         -> io::Result<()>;
 }

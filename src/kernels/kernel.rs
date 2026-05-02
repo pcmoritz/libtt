@@ -140,6 +140,14 @@ impl RuntimeArgsBuilder {
         let mut blobs = Vec::with_capacity(self.per_core.len());
 
         for (core, args) in self.per_core {
+            if args.writer.len() != writer_args.len()
+                || args.reader.len() != reader_args.len()
+                || args.compute.len() != compute_args.len()
+            {
+                return Err(invalid_input(format!(
+                    "runtime arg section lengths for core {core} do not match the first core"
+                )));
+            }
             cores.push(core);
             blobs.push(pack_rta(
                 &args.writer,
@@ -148,6 +156,10 @@ impl RuntimeArgsBuilder {
                 self.semaphores,
                 sem_off,
             ));
+        }
+        let blob_size = blobs[0].len();
+        if blobs.iter().any(|blob| blob.len() != blob_size) {
+            return Err(invalid_input("runtime arg blobs must have a uniform size"));
         }
 
         let runtime_args = RuntimeArgs {

@@ -100,27 +100,23 @@ impl FastDispatcher {
         setup: Vec<DispatchCommand>,
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
-        let blob_size = uniform_blob_size(runtime_args.blobs())?;
-
-        let template_matches = self
-            .runtime_template
-            .as_ref()
-            .is_some_and(|template| template.matches(runtime_args, blob_size));
-        if !template_matches {
+        let setup_records = if setup.is_empty() {
+            Vec::new()
+        } else {
             self.runtime_template = Some(RuntimeCqTemplate::new(
                 runtime_args,
-                blob_size,
                 go_word(self.dispatch_core),
             )?);
-        }
+            relayed_command_records(lower_ir(setup))?
+        };
         let template = self
             .runtime_template
             .as_mut()
-            .expect("runtime template was just initialized");
-        template.patch_runtime_blobs(runtime_args.blobs())?;
+            .ok_or_else(|| io::Error::other("fast runtime template is not staged"))?;
+        template.patch_runtime_blobs(runtime_args.blobs());
 
         self.event_id = self.event_id.wrapping_add(1);
-        for record in relayed_command_records(lower_ir(setup))? {
+        for record in setup_records {
             self.cq_hw.issue_write(&record)?;
         }
         for record in &template.records_before_runtime {
@@ -139,7 +135,6 @@ impl FastDispatcher {
 
 #[derive(Clone, Debug)]
 struct RuntimeCqTemplate {
-    cores: Vec<CoreCoord>,
     blob_size: usize,
     runtime_blob_start: usize,
     runtime_blob_stride: usize,
@@ -149,8 +144,9 @@ struct RuntimeCqTemplate {
 }
 
 impl RuntimeCqTemplate {
-    fn new(runtime_args: &RuntimeArgs, blob_size: usize, go_word: u32) -> io::Result<Self> {
+    fn new(runtime_args: &RuntimeArgs, go_word: u32) -> io::Result<Self> {
         let cores = runtime_args.cores().to_vec();
+        let blob_size = runtime_args.blobs()[0].len();
         let records_before_runtime = relayed_command_records([
             CqCommand::WritePackedLarge {
                 rects: mcast_rects(&cores),
@@ -193,7 +189,6 @@ impl RuntimeCqTemplate {
         ])?;
 
         Ok(Self {
-            cores,
             blob_size,
             runtime_blob_start,
             runtime_blob_stride: stride,
@@ -203,32 +198,11 @@ impl RuntimeCqTemplate {
         })
     }
 
-    fn matches(&self, runtime_args: &RuntimeArgs, blob_size: usize) -> bool {
-        self.blob_size == blob_size && self.cores == runtime_args.cores()
-    }
-
-    fn patch_runtime_blobs(&mut self, blobs: &[Vec<u8>]) -> io::Result<()> {
-        if blobs.len() != self.cores.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "packed write core/data length mismatch: {} != {}",
-                    self.cores.len(),
-                    blobs.len()
-                ),
-            ));
-        }
+    fn patch_runtime_blobs(&mut self, blobs: &[Vec<u8>]) {
         for (index, blob) in blobs.iter().enumerate() {
-            if blob.len() != self.blob_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "packed write blobs must have a uniform size",
-                ));
-            }
             let start = self.runtime_blob_start + self.runtime_blob_stride * index;
             self.runtime_record[start..start + self.blob_size].copy_from_slice(blob);
         }
-        Ok(())
     }
 }
 
@@ -810,20 +784,6 @@ fn write_packed_payload_header(
     pad_vec_to(&mut record, body_start);
     let stride = align_up(blob_size as u64, L1_ALIGN as u64) as usize;
     Ok((record, body_start, stride))
-}
-
-fn uniform_blob_size(blobs: &[Vec<u8>]) -> io::Result<usize> {
-    let size = blobs
-        .first()
-        .map(Vec::len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "runtime args are empty"))?;
-    if blobs.iter().any(|blob| blob.len() != size) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "packed write blobs must have a uniform size",
-        ));
-    }
-    Ok(size)
 }
 
 fn cq_hdr_write_packed_large(count: usize) -> io::Result<Vec<u8>> {
