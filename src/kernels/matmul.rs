@@ -487,8 +487,6 @@ fn bf16_program(
         semaphores: NUM_SEMAPHORES,
         math_fidelity,
         grid: Some((plan.rows.clone(), plan.cols.clone())),
-        per_core_reader_args: Vec::new(),
-        per_core_writer_args: Vec::new(),
         ..Program::default()
     };
     lower_runtime_args(plan, logical_mt, logical_nt, col_offset_tiles, &mut program)?;
