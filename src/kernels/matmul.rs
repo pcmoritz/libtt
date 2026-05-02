@@ -2,14 +2,13 @@ use crate::device::Device;
 use crate::dispatch::{CBConfig, CoreSelection, MathFidelity, Program};
 use crate::dram::{DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
-use crate::kernels::cache::ProgramCache;
 use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
 use crate::log::{enabled as log_enabled, log};
 use std::collections::HashMap;
 use std::env;
 use std::hash::Hash;
 use std::io;
-use std::sync::{Arc as StdArc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const BF16_READER_SENDER: &str = include_str!("../../kernels/matmul_reader_sender.cc");
 const BF16_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
@@ -24,16 +23,14 @@ const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
 const WRITER_ZERO_ADDR_INDEX: usize = 31;
 
 static ZERO_TILE_BY_DEVICE: OnceLock<Mutex<HashMap<usize, DramBuffer>>> = OnceLock::new();
-static PROGRAM_CACHE: ProgramCache<MatmulProgramKey> = ProgramCache::new("matmul program");
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct MatmulProgramKey {
     logical_mt: usize,
     logical_kt: usize,
     logical_nt: usize,
-    cores: StdArc<[CoreCoord]>,
+    cores: Arc<[CoreCoord]>,
     math_fidelity: MathFidelity,
-    col_offset_tiles: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,41 +94,30 @@ struct MatmulBf16Kernel {
     rhs_addr: u32,
     output_addr: u32,
     zero_addr: u32,
-    logical_mt: usize,
-    logical_kt: usize,
-    logical_nt: usize,
-    math_fidelity: MathFidelity,
+    key: MatmulProgramKey,
 }
 
-impl MatmulBf16Kernel {
-    fn cached_program(&self, device: &Device) -> io::Result<StdArc<Program>> {
-        let m = self.logical_mt * 32;
-        let k = self.logical_kt * 32;
-        let n = self.logical_nt * 32;
-        let cores = device.cores_arc();
-        let key = MatmulProgramKey {
-            logical_mt: self.logical_mt,
-            logical_kt: self.logical_kt,
-            logical_nt: self.logical_nt,
-            cores: StdArc::clone(&cores),
-            math_fidelity: self.math_fidelity,
-            col_offset_tiles: 0,
-        };
-        PROGRAM_CACHE.get_or_insert_with(key, || {
-            let plan = plan_matmul(m, k, n, &cores)?;
-            log_matmul_plan(&plan);
-            bf16_program(
-                &plan,
-                self.logical_mt,
-                self.logical_nt,
-                0,
-                self.math_fidelity,
-            )
-        })
+impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
+    fn program_key(&self) -> Option<MatmulProgramKey> {
+        Some(self.key.clone())
     }
-}
 
-impl Kernel for MatmulBf16Kernel {
+    fn build_program(&self) -> io::Result<Program> {
+        let plan = plan_matmul(
+            self.key.logical_mt * 32,
+            self.key.logical_kt * 32,
+            self.key.logical_nt * 32,
+            &self.key.cores,
+        )?;
+        log_matmul_plan(&plan);
+        bf16_program(
+            &plan,
+            self.key.logical_mt,
+            self.key.logical_nt,
+            self.key.math_fidelity,
+        )
+    }
+
     #[inline]
     fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
         match index {
@@ -187,26 +173,28 @@ pub(crate) fn matmul_bf16(
     let logical_nt = n / 32;
     let math_fidelity = matmul_math_fidelity()?;
     let zero_tile = cached_zero_tile(device)?;
+    let cores = device.cores_arc();
     let output = device.alloc(
         logical_mt * logical_nt,
         DType::Float16B,
         &[m, n],
         output_name,
     )?;
+    let key = MatmulProgramKey {
+        logical_mt,
+        logical_kt,
+        logical_nt,
+        cores,
+        math_fidelity,
+    };
     let kernel = MatmulBf16Kernel {
         lhs_addr: u32_arg(lhs.addr, "lhs address")?,
         rhs_addr: u32_arg(rhs.addr, "rhs address")?,
         output_addr: u32_arg(output.addr, "output address")?,
         zero_addr: u32_arg(zero_tile.addr, "zero tile address")?,
-        logical_mt,
-        logical_kt,
-        logical_nt,
-        math_fidelity,
+        key,
     };
-    let program = kernel.cached_program(device)?;
-    device.run_cached_program(program, |runtime_args| {
-        runtime_args.update_from_kernel(&kernel)
-    })?;
+    kernel.run(device)?;
     Ok(output)
 }
 
@@ -445,7 +433,6 @@ fn bf16_program(
     plan: &MatmulPlan,
     logical_mt: usize,
     logical_nt: usize,
-    col_offset_tiles: usize,
     math_fidelity: MathFidelity,
 ) -> io::Result<Program> {
     let cbs = vec![
@@ -489,7 +476,7 @@ fn bf16_program(
         grid: Some((plan.rows.clone(), plan.cols.clone())),
         ..Program::default()
     };
-    lower_runtime_args(plan, logical_mt, logical_nt, col_offset_tiles, &mut program)?;
+    lower_runtime_args(plan, logical_mt, logical_nt, &mut program)?;
     Ok(program)
 }
 
@@ -497,7 +484,6 @@ fn lower_runtime_args(
     plan: &MatmulPlan,
     logical_mt: usize,
     logical_nt: usize,
-    col_offset_tiles: usize,
     program: &mut Program,
 ) -> io::Result<()> {
     let grid = plan_grid(plan);
@@ -515,14 +501,7 @@ fn lower_runtime_args(
         for (col_index, &core) in row.iter().enumerate() {
             let reader = reader_args(plan, &grid, row_index, core, logical_mt)?;
             let writer = writer_args(
-                plan,
-                &grid,
-                row_index,
-                col_index,
-                core,
-                logical_mt,
-                logical_nt,
-                col_offset_tiles,
+                plan, &grid, row_index, col_index, core, logical_mt, logical_nt,
             )?;
             runtime_args.add_core(core, writer, reader, Vec::new())?;
         }
@@ -625,7 +604,6 @@ fn writer_args(
     core: CoreCoord,
     logical_mt: usize,
     logical_nt: usize,
-    col_offset_tiles: usize,
 ) -> io::Result<Vec<u32>> {
     let recv_ys = &plan.rows[1..];
     let mcast = if recv_ys.is_empty() {
@@ -640,7 +618,7 @@ fn writer_args(
         ]
     };
     let sender = grid[0][col_index];
-    let column_start = col_offset_tiles + col_index * plan.per_core_n;
+    let column_start = col_index * plan.per_core_n;
     let out_start = row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n;
     let mut args = vec![
         0,
@@ -675,7 +653,7 @@ fn writer_args(
         u32_value(logical_mt, "logical M tiles")?,
         u32_value(logical_nt, "logical N tiles")?,
         0,
-        u32_value(col_offset_tiles, "output column offset")?,
+        0,
     ]);
     Ok(args)
 }

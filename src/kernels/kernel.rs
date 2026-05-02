@@ -1,9 +1,15 @@
+use crate::device::Device;
 use crate::dispatch::{pack_rta, Program};
 use crate::hw::CoreCoord;
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::any::{Any, TypeId};
+use std::collections::{btree_map::Entry, BTreeMap, HashMap};
+use std::hash::Hash;
 use std::io;
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+
+static PROGRAM_CACHE: OnceLock<Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>> =
+    OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeArgs {
@@ -24,7 +30,7 @@ impl RuntimeArgs {
     }
 
     #[inline]
-    pub(crate) fn update_from_kernel(&mut self, kernel: &impl Kernel) -> io::Result<()> {
+    pub(crate) fn update_from_kernel<K>(&mut self, kernel: &impl Kernel<K>) -> io::Result<()> {
         patch_section(
             &mut self.blobs,
             &self.cores,
@@ -217,7 +223,54 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-pub(crate) trait Kernel {
+pub(crate) trait Kernel<K = ()> {
+    fn program_key(&self) -> Option<K> {
+        None
+    }
+
+    fn build_program(&self) -> io::Result<Program> {
+        Err(invalid_input("kernel does not define a cached program"))
+    }
+
+    fn run(&self, device: &mut Device) -> io::Result<()>
+    where
+        Self: Sized + 'static,
+        K: Eq + Hash + Send + Sync + 'static,
+    {
+        let key = self
+            .program_key()
+            .ok_or_else(|| invalid_input("kernel does not define a cached program key"))?;
+        let caches = PROGRAM_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut caches = caches.lock().map_err(|_| {
+            io::Error::other(format!(
+                "{} cache is poisoned",
+                std::any::type_name::<Self>()
+            ))
+        })?;
+        let cache = caches
+            .entry(TypeId::of::<Self>())
+            .or_insert_with(|| Box::new(HashMap::<K, Arc<Program>>::new()));
+        let cache = cache
+            .downcast_mut::<HashMap<K, Arc<Program>>>()
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "{} cache key type changed",
+                    std::any::type_name::<Self>()
+                ))
+            })?;
+
+        let program = if let Some(program) = cache.get(&key).map(Arc::clone) {
+            program
+        } else {
+            let program = Arc::new(self.build_program()?);
+            cache.insert(key, Arc::clone(&program));
+            program
+        };
+        device.run_cached_program(program, |runtime_args| {
+            runtime_args.update_from_kernel(self)
+        })
+    }
+
     #[inline]
     fn reader_runtime_arg(&self, _core: CoreCoord, _index: usize) -> Option<u32> {
         None
