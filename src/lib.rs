@@ -22,6 +22,7 @@ use dram::{DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::{enabled as log_enabled, log};
+use std::cell::RefCell;
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
@@ -70,6 +71,7 @@ pub struct PJRT_Device {
     addressable: bool,
     default_memory: *mut PJRT_Memory,
     memory_ptrs: Vec<*mut PJRT_Memory>,
+    runtime: RefCell<Device>,
 }
 
 #[repr(C)]
@@ -178,7 +180,7 @@ impl PJRT_Client {
         }
 
         let mut devices = Vec::with_capacity(discovered.len());
-        for (index, info) in discovered.iter().enumerate() {
+        for (index, info) in discovered.into_iter().enumerate() {
             let description = &mut device_descriptions[index] as *mut PJRT_DeviceDescription;
             let default_memory = memory_ptrs[index];
             devices.push(PJRT_Device {
@@ -188,6 +190,7 @@ impl PJRT_Client {
                 addressable: true,
                 default_memory,
                 memory_ptrs: vec![default_memory],
+                runtime: RefCell::new(info),
             });
         }
 
@@ -419,8 +422,28 @@ fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
             PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
         ));
     };
-    let mut device = Device::open(buffer.local_hardware_id).map_err(io_error)?;
-    device.dram_read(dram_buffer).map_err(io_error)
+    with_device_ptr(buffer.device, |device| {
+        device.dram_read(dram_buffer).map_err(io_error)
+    })
+}
+
+fn with_device<T>(
+    pjrt_device: &PJRT_Device,
+    f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
+) -> Result<T, *mut PJRT_Error> {
+    let mut device = pjrt_device
+        .runtime
+        .try_borrow_mut()
+        .map_err(|_| failed_precondition("device is already in use"))?;
+    f(&mut device)
+}
+
+fn with_device_ptr<T>(
+    pjrt_device: *mut PJRT_Device,
+    f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
+) -> Result<T, *mut PJRT_Error> {
+    let pjrt_device = unsafe { checked_ref(pjrt_device, "device") }?;
+    with_device(pjrt_device, f)
 }
 
 fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *mut PJRT_Error> {
@@ -1294,7 +1317,10 @@ fn execute_executable_v1(
         .as_ref()
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
     let mut values = vec![None; plan.values.len()];
-    let mut device = Device::open(target_device.local_hardware_id as usize).map_err(io_error)?;
+    let mut device = target_device
+        .runtime
+        .try_borrow_mut()
+        .map_err(|_| failed_precondition("device is already in use"))?;
 
     for op in &plan.ops {
         match *op {
@@ -1370,7 +1396,7 @@ fn execute_executable_v1(
                 };
 
                 let output_dram =
-                    kernels::add::eltwise_add_bf16(&mut device, lhs_dram, rhs_dram, "pjrt_add")
+                    kernels::add::eltwise_add_bf16(&mut *device, lhs_dram, rhs_dram, "pjrt_add")
                         .map_err(io_error)?;
                 let output_index = usize::try_from(output_id).map_err(|_| {
                     invalid_argument("TT executable add output id does not fit in usize")
@@ -1438,7 +1464,7 @@ fn execute_executable_v1(
                 };
 
                 let output_dram =
-                    kernels::matmul::matmul_bf16(&mut device, lhs_dram, rhs_dram, "pjrt_matmul")
+                    kernels::matmul::matmul_bf16(&mut *device, lhs_dram, rhs_dram, "pjrt_matmul")
                         .map_err(io_error)?;
                 let output_index = usize::try_from(output_id).map_err(|_| {
                     invalid_argument("TT executable matmul output id does not fit in usize")
@@ -1624,10 +1650,11 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
             Err(err) => return err,
         }
     };
-    let local_hardware_id = match unsafe { checked_ref(target_device, "device") } {
-        Ok(device) => device.local_hardware_id as usize,
+    let target_device_ref = match unsafe { checked_ref(target_device, "device") } {
+        Ok(device) => device,
         Err(err) => return err,
     };
+    let local_hardware_id = target_device_ref.local_hardware_id as usize;
     log(format!(
         "pjrt buffer_from_host_buffer type={:?} dims={:?} local_hardware_id={}",
         args.type_, dims_i64, local_hardware_id
@@ -1639,13 +1666,13 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         // SAFETY: caller owns `data` for `byte_size` bytes during the call.
         unsafe { slice::from_raw_parts(args.data.cast::<u8>(), byte_size) }
     };
-    let mut device = match Device::open(local_hardware_id) {
-        Ok(device) => device,
-        Err(err) => return io_error(err),
-    };
-    let dram_buffer = match device.alloc_write(data, dtype, &shape, "pjrt") {
+    let dram_buffer = match with_device(target_device_ref, |device| {
+        device
+            .alloc_write(data, dtype, &shape, "pjrt")
+            .map_err(io_error)
+    }) {
         Ok(buffer) => buffer,
-        Err(err) => return io_error(err),
+        Err(err) => return err,
     };
 
     args.done_with_host_buffer = ready_event();
