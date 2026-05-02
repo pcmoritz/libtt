@@ -100,7 +100,7 @@ pub struct Device {
     allocator: Option<Allocator>,
     compiler: Compiler,
     dispatcher: Box<dyn Dispatcher>,
-    staged_program_key: Option<u64>,
+    staged_cached_program: Option<StdArc<Program>>,
     staged_runtime_args: Option<RuntimeArgs>,
 }
 
@@ -219,7 +219,7 @@ impl Device {
             allocator: None,
             compiler,
             dispatcher,
-            staged_program_key: None,
+            staged_cached_program: None,
             staged_runtime_args: None,
         };
 
@@ -315,21 +315,11 @@ impl Device {
 
     pub fn run_program(&mut self, program: &Program) -> io::Result<()> {
         let dispatch_mode = self.dispatcher.dispatch_mode();
-        let program_key = staged_program_key(program, dispatch_mode);
-        if program_key.is_some()
-            && program.runtime_args.is_some()
-            && self.staged_program_key == program_key
-        {
-            let runtime_args = program.runtime_args.as_ref().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing runtime args")
-            })?;
-            return self.execute_runtime_args(runtime_args, program_key);
-        }
         let commands =
             build_dispatch_plan(&self.compiler, self.cores_ref(), program, dispatch_mode)?;
         self.dispatcher.execute(commands)?;
-        self.staged_program_key = program_key;
-        self.staged_runtime_args = program.runtime_args.clone();
+        self.staged_cached_program = None;
+        self.staged_runtime_args = None;
         Ok(())
     }
 
@@ -339,10 +329,11 @@ impl Device {
         update_runtime_args: impl FnOnce(&mut RuntimeArgs) -> io::Result<()>,
     ) -> io::Result<()> {
         let dispatch_mode = self.dispatcher.dispatch_mode();
-        let program_key = staged_program_key(&program, dispatch_mode);
-        if program_key.is_some()
-            && program.runtime_args.is_some()
-            && self.staged_program_key == program_key
+        if program.runtime_args.is_some()
+            && self
+                .staged_cached_program
+                .as_ref()
+                .is_some_and(|staged| StdArc::ptr_eq(staged, &program))
         {
             if self.staged_runtime_args.is_none() {
                 self.staged_runtime_args = program.runtime_args.clone();
@@ -351,30 +342,29 @@ impl Device {
                 io::Error::new(io::ErrorKind::InvalidInput, "missing staged runtime args")
             })?;
             let result = update_runtime_args(&mut runtime_args)
-                .and_then(|()| self.execute_runtime_args(&runtime_args, program_key));
+                .and_then(|()| self.execute_runtime_args(&runtime_args));
             self.staged_runtime_args = Some(runtime_args);
             return result;
         }
 
-        let mut program = program.as_ref().clone();
-        if let Some(runtime_args) = &mut program.runtime_args {
+        let mut staged_program = program.as_ref().clone();
+        if let Some(runtime_args) = &mut staged_program.runtime_args {
             update_runtime_args(runtime_args)?;
         }
-        let commands =
-            build_dispatch_plan(&self.compiler, self.cores_ref(), &program, dispatch_mode)?;
+        let commands = build_dispatch_plan(
+            &self.compiler,
+            self.cores_ref(),
+            &staged_program,
+            dispatch_mode,
+        )?;
         self.dispatcher.execute(commands)?;
-        self.staged_program_key = program_key;
-        self.staged_runtime_args = program.runtime_args;
+        self.staged_cached_program = Some(program);
+        self.staged_runtime_args = staged_program.runtime_args;
         Ok(())
     }
 
-    fn execute_runtime_args(
-        &mut self,
-        runtime_args: &RuntimeArgs,
-        program_key: Option<u64>,
-    ) -> io::Result<()> {
+    fn execute_runtime_args(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
         self.dispatcher.execute_runtime(runtime_args)?;
-        self.staged_program_key = program_key;
         Ok(())
     }
 
@@ -563,16 +553,6 @@ pub(crate) fn load_device(local_hardware_id: usize) -> io::Result<(PathBuf, Devi
     let path = PathBuf::from(format!("/dev/tenstorrent/{local_hardware_id}"));
     let info = Device::from_path(local_hardware_id, path.clone())?;
     Ok((path, info))
-}
-
-fn staged_program_key(program: &Program, dispatch_mode: u8) -> Option<u64> {
-    program
-        .static_key
-        .map(|static_key| staged_key_from_static(static_key, dispatch_mode))
-}
-
-fn staged_key_from_static(static_key: u64, dispatch_mode: u8) -> u64 {
-    static_key ^ (u64::from(dispatch_mode) << 56)
 }
 
 fn probe_info_for_device(path: &Path) -> io::Result<ProbeInfo> {

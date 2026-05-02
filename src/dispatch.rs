@@ -99,7 +99,6 @@ impl CBConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
-    pub static_key: Option<u64>,
     pub cores: CoreSelection,
     pub reader_kernel: String,
     pub compute_kernel: String,
@@ -125,7 +124,6 @@ pub struct Program {
 impl Default for Program {
     fn default() -> Self {
         Self {
-            static_key: None,
             cores: CoreSelection::Count(1),
             reader_kernel: String::new(),
             compute_kernel: String::new(),

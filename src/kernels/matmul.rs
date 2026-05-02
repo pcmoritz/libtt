@@ -5,10 +5,9 @@ use crate::hw::{CoreCoord, TensixL1};
 use crate::kernels::cache::ProgramCache;
 use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
 use crate::log::{enabled as log_enabled, log};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::env;
-use std::hash::{BuildHasher, BuildHasherDefault, Hash};
+use std::hash::Hash;
 use std::io;
 use std::sync::{Arc as StdArc, Mutex, OnceLock};
 
@@ -37,7 +36,7 @@ struct MatmulProgramKey {
     col_offset_tiles: usize,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MatmulPlan {
     rows: Vec<u8>,
     cols: Vec<u8>,
@@ -121,17 +120,11 @@ impl MatmulBf16Kernel {
         PROGRAM_CACHE.get_or_insert_with(key, || {
             let plan = plan_matmul(m, k, n, &cores)?;
             log_matmul_plan(&plan);
-            let static_key = BuildHasherDefault::<DefaultHasher>::default().hash_one((
-                "matmul_bf16_v2",
-                &plan,
-                self.math_fidelity,
-            ));
             bf16_program(
                 &plan,
                 self.logical_mt,
                 self.logical_nt,
                 0,
-                static_key,
                 self.math_fidelity,
             )
         })
@@ -456,7 +449,6 @@ fn bf16_program(
     logical_mt: usize,
     logical_nt: usize,
     col_offset_tiles: usize,
-    static_key: u64,
     math_fidelity: MathFidelity,
 ) -> io::Result<Program> {
     let cbs = vec![
@@ -482,7 +474,6 @@ fn bf16_program(
         },
     ];
     let mut program = Program {
-        static_key: Some(static_key),
         cores: CoreSelection::All,
         reader_kernel: BF16_READER_SENDER.to_owned(),
         writer_kernel: BF16_WRITER_SENDER.to_owned(),
