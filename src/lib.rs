@@ -22,8 +22,6 @@ use dram::{DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::{enabled as log_enabled, log};
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
@@ -421,32 +419,8 @@ fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
             PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
         ));
     };
-    with_cached_device(buffer.local_hardware_id, |device| {
-        device.dram_read(dram_buffer).map_err(io_error)
-    })
-}
-
-thread_local! {
-    static DEVICE_CACHE: RefCell<HashMap<usize, Device>> = RefCell::new(HashMap::new());
-}
-
-fn with_cached_device<T>(
-    local_hardware_id: usize,
-    f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
-) -> Result<T, *mut PJRT_Error> {
-    DEVICE_CACHE.with(|cache| {
-        let mut devices = cache.borrow_mut();
-        if !devices.contains_key(&local_hardware_id) {
-            devices.insert(
-                local_hardware_id,
-                Device::open(local_hardware_id).map_err(io_error)?,
-            );
-        }
-        let device = devices
-            .get_mut(&local_hardware_id)
-            .ok_or_else(|| failed_precondition("cached device is unavailable"))?;
-        f(device)
-    })
+    let mut device = Device::open(buffer.local_hardware_id).map_err(io_error)?;
+    device.dram_read(dram_buffer).map_err(io_error)
 }
 
 fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *mut PJRT_Error> {
@@ -1320,187 +1294,187 @@ fn execute_executable_v1(
         .as_ref()
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
     let mut values = vec![None; plan.values.len()];
-    with_cached_device(target_device.local_hardware_id as usize, |device| {
-        for op in &plan.ops {
-            match *op {
-                executable::Op::Parameter {
-                    parameter_index,
-                    output_id,
-                } => {
-                    let input_ptr = inputs.get(parameter_index).copied().ok_or_else(|| {
-                        invalid_argument(format!(
-                            "TT executable parameter index {parameter_index} is out of range"
-                        ))
-                    })?;
-                    let input = unsafe { checked_ref(input_ptr, "argument_lists[0][*]") }?;
-                    if input.deleted {
-                        return Err(failed_precondition("input buffers must not be deleted"));
-                    }
-                    if input.local_hardware_id != target_device.local_hardware_id as usize {
-                        return Err(invalid_argument(
-                            "all input buffers and execute_device must be on the same device",
-                        ));
-                    }
+    let mut device = Device::open(target_device.local_hardware_id as usize).map_err(io_error)?;
 
-                    let output_index = usize::try_from(output_id).map_err(|_| {
-                        invalid_argument("TT executable parameter output id does not fit in usize")
-                    })?;
-                    let expected = plan.values.get(output_index).ok_or_else(|| {
-                        invalid_argument(format!(
-                            "TT executable parameter output id {output_id} is out of bounds"
-                        ))
-                    })?;
-                    if input.buffer_type != expected.element_type {
-                        return Err(unimplemented(format!(
-                            "TT executable parameter {parameter_index} expected {:?}, got {:?}",
-                            expected.element_type, input.buffer_type
-                        )));
-                    }
-                    if input.dims != expected.dims {
-                        return Err(invalid_argument(format!(
+    for op in &plan.ops {
+        match *op {
+            executable::Op::Parameter {
+                parameter_index,
+                output_id,
+            } => {
+                let input_ptr = inputs.get(parameter_index).copied().ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable parameter index {parameter_index} is out of range"
+                    ))
+                })?;
+                let input = unsafe { checked_ref(input_ptr, "argument_lists[0][*]") }?;
+                if input.deleted {
+                    return Err(failed_precondition("input buffers must not be deleted"));
+                }
+                if input.local_hardware_id != target_device.local_hardware_id as usize {
+                    return Err(invalid_argument(
+                        "all input buffers and execute_device must be on the same device",
+                    ));
+                }
+
+                let output_index = usize::try_from(output_id).map_err(|_| {
+                    invalid_argument("TT executable parameter output id does not fit in usize")
+                })?;
+                let expected = plan.values.get(output_index).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable parameter output id {output_id} is out of bounds"
+                    ))
+                })?;
+                if input.buffer_type != expected.element_type {
+                    return Err(unimplemented(format!(
+                        "TT executable parameter {parameter_index} expected {:?}, got {:?}",
+                        expected.element_type, input.buffer_type
+                    )));
+                }
+                if input.dims != expected.dims {
+                    return Err(invalid_argument(format!(
                             "TT executable parameter {parameter_index} shape mismatch: expected {:?}, got {:?}",
                             expected.dims, input.dims
                         )));
-                    }
-                    values[output_index] = Some(input.clone());
                 }
-                executable::Op::Add {
-                    input_ids,
-                    output_id,
-                } => {
-                    let lhs = device_buffer_for_value(&values, input_ids[0], "add.lhs")?;
-                    let rhs = device_buffer_for_value(&values, input_ids[1], "add.rhs")?;
-                    if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                        || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                    {
-                        return Err(unimplemented(
-                            "TT executable add currently only supports bf16 buffers",
-                        ));
-                    }
-                    if lhs.dims != rhs.dims {
-                        return Err(invalid_argument(
-                            "TT executable add input shapes must match",
-                        ));
-                    }
-
-                    let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
-                        return Err(failed_precondition(
-                            "TT executable lhs buffer has no device allocation",
-                        ));
-                    };
-                    let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
-                        return Err(failed_precondition(
-                            "TT executable rhs buffer has no device allocation",
-                        ));
-                    };
-
-                    let output_dram =
-                        kernels::add::eltwise_add_bf16(device, lhs_dram, rhs_dram, "pjrt_add")
-                            .map_err(io_error)?;
-                    let output_index = usize::try_from(output_id).map_err(|_| {
-                        invalid_argument("TT executable add output id does not fit in usize")
-                    })?;
-                    let expected = plan.values.get(output_index).ok_or_else(|| {
-                        invalid_argument(format!(
-                            "TT executable add output id {output_id} is out of bounds"
-                        ))
-                    })?;
-                    if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
-                        return Err(unimplemented(
-                            "TT executable add currently only supports bf16 outputs",
-                        ));
-                    }
-                    if expected.dims != lhs.dims {
-                        return Err(invalid_argument(format!(
-                            "TT executable add output shape mismatch: expected {:?}, got {:?}",
-                            expected.dims, lhs.dims
-                        )));
-                    }
-                    values[output_index] = Some(PJRT_Buffer {
-                        buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
-                        dims: lhs.dims.clone(),
-                        device: execute_device,
-                        memory: target_device.default_memory,
-                        local_hardware_id: target_device.local_hardware_id as usize,
-                        dram_buffer: Some(output_dram),
-                        deleted: false,
-                    });
+                values[output_index] = Some(input.clone());
+            }
+            executable::Op::Add {
+                input_ids,
+                output_id,
+            } => {
+                let lhs = device_buffer_for_value(&values, input_ids[0], "add.lhs")?;
+                let rhs = device_buffer_for_value(&values, input_ids[1], "add.rhs")?;
+                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                {
+                    return Err(unimplemented(
+                        "TT executable add currently only supports bf16 buffers",
+                    ));
                 }
-                executable::Op::Matmul {
-                    input_ids,
-                    output_id,
-                } => {
-                    let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
-                    let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
-                    if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                        || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                    {
-                        return Err(unimplemented(
-                            "TT executable matmul currently only supports bf16 buffers",
-                        ));
-                    }
-                    if lhs.dims.len() != 2 || rhs.dims.len() != 2 {
-                        return Err(unimplemented(
-                            "TT executable matmul currently only supports rank-2 buffers",
-                        ));
-                    }
-                    if lhs.dims[1] != rhs.dims[0] {
-                        return Err(invalid_argument(format!(
-                            "TT executable matmul shape mismatch: lhs {:?}, rhs {:?}",
-                            lhs.dims, rhs.dims
-                        )));
-                    }
-
-                    let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
-                        return Err(failed_precondition(
-                            "TT executable matmul lhs buffer has no device allocation",
-                        ));
-                    };
-                    let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
-                        return Err(failed_precondition(
-                            "TT executable matmul rhs buffer has no device allocation",
-                        ));
-                    };
-
-                    let output_dram =
-                        kernels::matmul::matmul_bf16(device, lhs_dram, rhs_dram, "pjrt_matmul")
-                            .map_err(io_error)?;
-                    let output_index = usize::try_from(output_id).map_err(|_| {
-                        invalid_argument("TT executable matmul output id does not fit in usize")
-                    })?;
-                    let expected = plan.values.get(output_index).ok_or_else(|| {
-                        invalid_argument(format!(
-                            "TT executable matmul output id {output_id} is out of bounds"
-                        ))
-                    })?;
-                    if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
-                        return Err(unimplemented(
-                            "TT executable matmul currently only supports bf16 outputs",
-                        ));
-                    }
-                    let expected_dims = vec![lhs.dims[0], rhs.dims[1]];
-                    if expected.dims != expected_dims {
-                        return Err(invalid_argument(format!(
-                            "TT executable matmul output shape mismatch: expected {:?}, got {:?}",
-                            expected_dims, expected.dims
-                        )));
-                    }
-                    values[output_index] = Some(PJRT_Buffer {
-                        buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
-                        dims: expected.dims.clone(),
-                        device: execute_device,
-                        memory: target_device.default_memory,
-                        local_hardware_id: target_device.local_hardware_id as usize,
-                        dram_buffer: Some(output_dram),
-                        deleted: false,
-                    });
+                if lhs.dims != rhs.dims {
+                    return Err(invalid_argument(
+                        "TT executable add input shapes must match",
+                    ));
                 }
+
+                let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable lhs buffer has no device allocation",
+                    ));
+                };
+                let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable rhs buffer has no device allocation",
+                    ));
+                };
+
+                let output_dram =
+                    kernels::add::eltwise_add_bf16(&mut device, lhs_dram, rhs_dram, "pjrt_add")
+                        .map_err(io_error)?;
+                let output_index = usize::try_from(output_id).map_err(|_| {
+                    invalid_argument("TT executable add output id does not fit in usize")
+                })?;
+                let expected = plan.values.get(output_index).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable add output id {output_id} is out of bounds"
+                    ))
+                })?;
+                if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+                    return Err(unimplemented(
+                        "TT executable add currently only supports bf16 outputs",
+                    ));
+                }
+                if expected.dims != lhs.dims {
+                    return Err(invalid_argument(format!(
+                        "TT executable add output shape mismatch: expected {:?}, got {:?}",
+                        expected.dims, lhs.dims
+                    )));
+                }
+                values[output_index] = Some(PJRT_Buffer {
+                    buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+                    dims: lhs.dims.clone(),
+                    device: execute_device,
+                    memory: target_device.default_memory,
+                    local_hardware_id: target_device.local_hardware_id as usize,
+                    dram_buffer: Some(output_dram),
+                    deleted: false,
+                });
+            }
+            executable::Op::Matmul {
+                input_ids,
+                output_id,
+            } => {
+                let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
+                let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
+                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                {
+                    return Err(unimplemented(
+                        "TT executable matmul currently only supports bf16 buffers",
+                    ));
+                }
+                if lhs.dims.len() != 2 || rhs.dims.len() != 2 {
+                    return Err(unimplemented(
+                        "TT executable matmul currently only supports rank-2 buffers",
+                    ));
+                }
+                if lhs.dims[1] != rhs.dims[0] {
+                    return Err(invalid_argument(format!(
+                        "TT executable matmul shape mismatch: lhs {:?}, rhs {:?}",
+                        lhs.dims, rhs.dims
+                    )));
+                }
+
+                let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable matmul lhs buffer has no device allocation",
+                    ));
+                };
+                let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable matmul rhs buffer has no device allocation",
+                    ));
+                };
+
+                let output_dram =
+                    kernels::matmul::matmul_bf16(&mut device, lhs_dram, rhs_dram, "pjrt_matmul")
+                        .map_err(io_error)?;
+                let output_index = usize::try_from(output_id).map_err(|_| {
+                    invalid_argument("TT executable matmul output id does not fit in usize")
+                })?;
+                let expected = plan.values.get(output_index).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable matmul output id {output_id} is out of bounds"
+                    ))
+                })?;
+                if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+                    return Err(unimplemented(
+                        "TT executable matmul currently only supports bf16 outputs",
+                    ));
+                }
+                let expected_dims = vec![lhs.dims[0], rhs.dims[1]];
+                if expected.dims != expected_dims {
+                    return Err(invalid_argument(format!(
+                        "TT executable matmul output shape mismatch: expected {:?}, got {:?}",
+                        expected_dims, expected.dims
+                    )));
+                }
+                values[output_index] = Some(PJRT_Buffer {
+                    buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+                    dims: expected.dims.clone(),
+                    device: execute_device,
+                    memory: target_device.default_memory,
+                    local_hardware_id: target_device.local_hardware_id as usize,
+                    dram_buffer: Some(output_dram),
+                    deleted: false,
+                });
             }
         }
+    }
 
-        let output = device_buffer_for_value(&values, plan.output_ids[0], "output")?;
-        Ok(output.clone())
-    })
+    let output = device_buffer_for_value(&values, plan.output_ids[0], "output")?;
+    Ok(output.clone())
 }
 
 #[unsafe(no_mangle)]
@@ -1665,13 +1639,13 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         // SAFETY: caller owns `data` for `byte_size` bytes during the call.
         unsafe { slice::from_raw_parts(args.data.cast::<u8>(), byte_size) }
     };
-    let dram_buffer = match with_cached_device(local_hardware_id, |device| {
-        device
-            .alloc_write(data, dtype, &shape, "pjrt")
-            .map_err(io_error)
-    }) {
+    let mut device = match Device::open(local_hardware_id) {
+        Ok(device) => device,
+        Err(err) => return io_error(err),
+    };
+    let dram_buffer = match device.alloc_write(data, dtype, &shape, "pjrt") {
         Ok(buffer) => buffer,
-        Err(err) => return err,
+        Err(err) => return io_error(err),
     };
 
     args.done_with_host_buffer = ready_event();
