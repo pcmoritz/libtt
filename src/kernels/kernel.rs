@@ -1,6 +1,6 @@
 use crate::dispatch::{pack_rta, Program};
 use crate::hw::CoreCoord;
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 use std::io;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -79,21 +79,20 @@ impl RuntimeArgsBuilder {
         reader: Vec<u32>,
         compute: Vec<u32>,
     ) -> io::Result<()> {
-        if self.per_core.contains_key(&core) {
-            return Err(invalid_input(format!(
-                "duplicate runtime args for core {core}"
-            )));
+        match self.per_core.entry(core) {
+            Entry::Vacant(entry) => {
+                entry.insert(PerCoreRuntimeArgs {
+                    writer,
+                    reader,
+                    compute,
+                });
+                Ok(())
+            }
+            Entry::Occupied(entry) => Err(invalid_input(format!(
+                "duplicate runtime args for core {}",
+                entry.key()
+            ))),
         }
-
-        self.per_core.insert(
-            core,
-            PerCoreRuntimeArgs {
-                writer,
-                reader,
-                compute,
-            },
-        );
-        Ok(())
     }
 
     pub(crate) fn build(self) -> io::Result<RuntimeArgs> {

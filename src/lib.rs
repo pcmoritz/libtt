@@ -1300,6 +1300,54 @@ fn device_buffer_for_value<'a>(
         .ok_or_else(|| invalid_argument(format!("{field} value id {value_id} is not available")))
 }
 
+struct OutputContext {
+    device: *mut PJRT_Device,
+    memory: *mut PJRT_Memory,
+    local_hardware_id: usize,
+}
+
+fn store_output_buffer(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    output_id: u32,
+    expected_dims: Vec<i64>,
+    dram_buffer: DramBuffer,
+    context: &OutputContext,
+    op: &str,
+) -> Result<(), *mut PJRT_Error> {
+    let output_index = usize::try_from(output_id).map_err(|_| {
+        invalid_argument(format!(
+            "TT executable {op} output id does not fit in usize"
+        ))
+    })?;
+    let expected = plan.values.get(output_index).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable {op} output id {output_id} is out of bounds"
+        ))
+    })?;
+    if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+        return Err(unimplemented(format!(
+            "TT executable {op} currently only supports bf16 outputs"
+        )));
+    }
+    if expected.dims != expected_dims {
+        return Err(invalid_argument(format!(
+            "TT executable {op} output shape mismatch: expected {:?}, got {:?}",
+            expected.dims, expected_dims
+        )));
+    }
+    values[output_index] = Some(PJRT_Buffer {
+        buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+        dims: expected.dims.clone(),
+        device: context.device,
+        memory: context.memory,
+        local_hardware_id: context.local_hardware_id,
+        dram_buffer: Some(dram_buffer),
+        deleted: false,
+    });
+    Ok(())
+}
+
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
@@ -1313,7 +1361,11 @@ fn execute_executable_v1(
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
     let mut values = vec![None; plan.values.len()];
     let target_local_hardware_id = target_device.local_hardware_id as usize;
-    let target_default_memory = target_device.default_memory;
+    let output_context = OutputContext {
+        device: execute_device,
+        memory: target_device.default_memory,
+        local_hardware_id: target_local_hardware_id,
+    };
     let device = &mut target_device.runtime;
 
     for op in &plan.ops {
@@ -1389,37 +1441,19 @@ fn execute_executable_v1(
                     ));
                 };
 
+                let output_dims = lhs.dims.clone();
                 let output_dram =
                     kernels::add::eltwise_add_bf16(device, lhs_dram, rhs_dram, "pjrt_add")
                         .map_err(io_error)?;
-                let output_index = usize::try_from(output_id).map_err(|_| {
-                    invalid_argument("TT executable add output id does not fit in usize")
-                })?;
-                let expected = plan.values.get(output_index).ok_or_else(|| {
-                    invalid_argument(format!(
-                        "TT executable add output id {output_id} is out of bounds"
-                    ))
-                })?;
-                if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
-                    return Err(unimplemented(
-                        "TT executable add currently only supports bf16 outputs",
-                    ));
-                }
-                if expected.dims != lhs.dims {
-                    return Err(invalid_argument(format!(
-                        "TT executable add output shape mismatch: expected {:?}, got {:?}",
-                        expected.dims, lhs.dims
-                    )));
-                }
-                values[output_index] = Some(PJRT_Buffer {
-                    buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
-                    dims: lhs.dims.clone(),
-                    device: execute_device,
-                    memory: target_default_memory,
-                    local_hardware_id: target_local_hardware_id,
-                    dram_buffer: Some(output_dram),
-                    deleted: false,
-                });
+                store_output_buffer(
+                    &mut values,
+                    plan,
+                    output_id,
+                    output_dims,
+                    output_dram,
+                    &output_context,
+                    "add",
+                )?;
             }
             executable::Op::Matmul {
                 input_ids,
@@ -1460,35 +1494,16 @@ fn execute_executable_v1(
                 let output_dram =
                     kernels::matmul::matmul_bf16(device, lhs_dram, rhs_dram, "pjrt_matmul")
                         .map_err(io_error)?;
-                let output_index = usize::try_from(output_id).map_err(|_| {
-                    invalid_argument("TT executable matmul output id does not fit in usize")
-                })?;
-                let expected = plan.values.get(output_index).ok_or_else(|| {
-                    invalid_argument(format!(
-                        "TT executable matmul output id {output_id} is out of bounds"
-                    ))
-                })?;
-                if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
-                    return Err(unimplemented(
-                        "TT executable matmul currently only supports bf16 outputs",
-                    ));
-                }
                 let expected_dims = vec![lhs.dims[0], rhs.dims[1]];
-                if expected.dims != expected_dims {
-                    return Err(invalid_argument(format!(
-                        "TT executable matmul output shape mismatch: expected {:?}, got {:?}",
-                        expected_dims, expected.dims
-                    )));
-                }
-                values[output_index] = Some(PJRT_Buffer {
-                    buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
-                    dims: expected.dims.clone(),
-                    device: execute_device,
-                    memory: target_default_memory,
-                    local_hardware_id: target_local_hardware_id,
-                    dram_buffer: Some(output_dram),
-                    deleted: false,
-                });
+                store_output_buffer(
+                    &mut values,
+                    plan,
+                    output_id,
+                    expected_dims,
+                    output_dram,
+                    &output_context,
+                    "matmul",
+                )?;
             }
         }
     }

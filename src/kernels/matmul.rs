@@ -627,15 +627,15 @@ fn writer_args(
     logical_nt: usize,
     col_offset_tiles: usize,
 ) -> io::Result<Vec<u32>> {
-    let recv_ys = plan.rows.iter().copied().skip(1).collect::<Vec<_>>();
+    let recv_ys = &plan.rows[1..];
     let mcast = if recv_ys.is_empty() {
         [0, 0, 0, 0, 0]
     } else {
         [
             core.x as u32,
-            *recv_ys.iter().max().expect("recv_ys is non-empty") as u32,
+            *recv_ys.last().expect("recv_ys is non-empty") as u32,
             core.x as u32,
-            *recv_ys.iter().min().expect("recv_ys is non-empty") as u32,
+            recv_ys[0] as u32,
             recv_ys.len() as u32,
         ]
     };
