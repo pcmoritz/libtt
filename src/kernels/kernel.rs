@@ -227,9 +227,7 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 }
 
 pub(crate) trait Kernel<K = ()> {
-    fn program_key(&self) -> Option<K> {
-        None
-    }
+    fn program_key(&self) -> K;
 
     fn build_program(&self) -> io::Result<Program> {
         Err(invalid_input("kernel does not define a cached program"))
@@ -240,9 +238,7 @@ pub(crate) trait Kernel<K = ()> {
         Self: Sized + 'static,
         K: Eq + Hash + Send + Sync + 'static,
     {
-        let key = self
-            .program_key()
-            .ok_or_else(|| invalid_input("kernel does not define a cached program key"))?;
+        let key = self.program_key();
         let caches = PROGRAM_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         let mut caches = caches.lock().map_err(|_| {
             io::Error::other(format!(
@@ -297,6 +293,8 @@ mod tests {
     struct TestKernel;
 
     impl Kernel for TestKernel {
+        fn program_key(&self) {}
+
         fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
             (index == 0).then_some(0x2222)
         }

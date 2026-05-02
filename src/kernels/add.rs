@@ -26,8 +26,8 @@ struct AddBf16Kernel {
 }
 
 impl Kernel<AddProgramKey> for AddBf16Kernel {
-    fn program_key(&self) -> Option<AddProgramKey> {
-        Some(self.key)
+    fn program_key(&self) -> AddProgramKey {
+        self.key
     }
 
     fn build_program(&self) -> io::Result<Program> {

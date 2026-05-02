@@ -97,8 +97,8 @@ struct MatmulBf16Kernel {
 }
 
 impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
-    fn program_key(&self) -> Option<MatmulProgramKey> {
-        Some(self.key.clone())
+    fn program_key(&self) -> MatmulProgramKey {
+        self.key.clone()
     }
 
     fn build_program(&self) -> io::Result<Program> {
