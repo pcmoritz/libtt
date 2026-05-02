@@ -103,43 +103,56 @@ pub struct Program {
     pub reader_kernel: String,
     pub compute_kernel: String,
     pub writer_kernel: String,
-    pub cbs: Vec<CBConfig>,
     pub name: String,
     pub reader_args: Vec<u32>,
     pub writer_args: Vec<u32>,
     pub compute_args: Vec<u32>,
     pub semaphores: usize,
+    pub compile: CompileConfig,
+    pub reader_recv_kernel: String,
+    pub writer_recv_kernel: String,
+    pub grid: Option<(Vec<u8>, Vec<u8>)>,
+    pub(crate) runtime_args: RuntimeArgs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompileConfig {
+    pub cbs: Vec<CBConfig>,
     pub math_fidelity: MathFidelity,
     pub approx: bool,
     pub dst_accum_mode: bool,
     pub dst_full_sync: bool,
-    pub reader_recv_kernel: String,
-    pub writer_recv_kernel: String,
-    pub grid: Option<(Vec<u8>, Vec<u8>)>,
-    pub(crate) runtime_args: Option<RuntimeArgs>,
 }
 
-impl Default for Program {
+impl Default for CompileConfig {
     fn default() -> Self {
+        Self {
+            cbs: Vec::new(),
+            math_fidelity: MathFidelity::HiFi2,
+            approx: false,
+            dst_accum_mode: false,
+            dst_full_sync: false,
+        }
+    }
+}
+
+impl Program {
+    pub(crate) fn new(runtime_args: RuntimeArgs) -> Self {
         Self {
             cores: CoreSelection::Count(1),
             reader_kernel: String::new(),
             compute_kernel: String::new(),
             writer_kernel: String::new(),
-            cbs: Vec::new(),
             name: String::new(),
             reader_args: Vec::new(),
             writer_args: Vec::new(),
             compute_args: Vec::new(),
             semaphores: 0,
-            math_fidelity: MathFidelity::HiFi2,
-            approx: false,
-            dst_accum_mode: false,
-            dst_full_sync: false,
+            compile: CompileConfig::default(),
             reader_recv_kernel: String::new(),
             writer_recv_kernel: String::new(),
             grid: None,
-            runtime_args: None,
+            runtime_args,
         }
     }
 }
@@ -150,14 +163,6 @@ pub(crate) enum DispatchCommand {
         cores: Vec<CoreCoord>,
         addr: usize,
         data: Vec<u8>,
-    },
-    WritePacked {
-        cores: Vec<CoreCoord>,
-        addr: usize,
-        data: Vec<Vec<u8>>,
-    },
-    Launch {
-        cores: Vec<CoreCoord>,
     },
 }
 
@@ -178,12 +183,6 @@ impl SlowDispatcher {
                 DispatchCommand::Write { cores, addr, data } => {
                     self.write_mcast(&cores, addr, &data)?;
                 }
-                DispatchCommand::WritePacked { cores, addr, data } => {
-                    self.write_packed(&cores, addr, &data)?;
-                }
-                DispatchCommand::Launch { cores } => {
-                    self.launch(&cores)?;
-                }
             }
         }
 
@@ -191,15 +190,7 @@ impl SlowDispatcher {
     }
 
     pub(crate) fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
-        validate_runtime_args(runtime_args)?;
         let cores = runtime_args.cores();
-        if cores.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no worker cores selected for dispatch",
-            ));
-        }
-
         self.write_mcast(
             cores,
             TensixL1::GO_MSG as usize,
@@ -294,7 +285,7 @@ struct LaunchLayout {
     dispatch_mode: u8,
 }
 
-pub(crate) fn build_dispatch_plan(
+pub(crate) fn build_dispatch_setup_plan(
     compiler: &Compiler,
     available_cores: &[CoreCoord],
     program: &Program,
@@ -331,44 +322,7 @@ pub(crate) fn build_dispatch_plan(
     );
     let rta_total = rta_sizes.0 + rta_sizes.1 + rta_sizes.2;
     let sem_off = align_up(rta_total as u64, L1_ALIGN as u64) as usize;
-    let common_rta_blob = pack_rta(
-        &program.writer_args,
-        &program.reader_args,
-        &program.compute_args,
-        program.semaphores,
-        sem_off,
-    );
-
-    let mut commands = vec![
-        DispatchCommand::Write {
-            cores: all_cores.clone(),
-            addr: TensixL1::GO_MSG as usize,
-            data: vec![0, 0, 0, DevMsgs::RUN_MSG_RESET_READ_PTR_FROM_HOST],
-        },
-        DispatchCommand::Write {
-            cores: all_cores.clone(),
-            addr: TensixL1::GO_MSG_INDEX as usize,
-            data: vec![0; size_of::<u32>()],
-        },
-    ];
-
-    if let Some(runtime_args) = &program.runtime_args {
-        validate_runtime_args(runtime_args)?;
-        if runtime_args.blobs().iter().any(|blob| !blob.is_empty()) {
-            commands.push(DispatchCommand::WritePacked {
-                cores: runtime_args.cores().to_vec(),
-                addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-                data: runtime_args.blobs().to_vec(),
-            });
-        }
-    } else if !common_rta_blob.is_empty() {
-        commands.push(DispatchCommand::Write {
-            cores: all_cores.clone(),
-            addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-            data: common_rta_blob,
-        });
-    }
-
+    let mut commands = Vec::new();
     for role in roles {
         let (shared_addr, shared_blob, launch_blob) = build_payload(
             program,
@@ -393,10 +347,6 @@ pub(crate) fn build_dispatch_plan(
             });
         }
     }
-
-    commands.push(DispatchCommand::Launch {
-        cores: all_cores.clone(),
-    });
 
     Ok(commands)
 }
@@ -535,20 +485,6 @@ pub(crate) fn pack_rta(
     data
 }
 
-fn validate_runtime_args(runtime_args: &RuntimeArgs) -> io::Result<()> {
-    if runtime_args.cores().len() != runtime_args.blobs().len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "runtime arg core/blob length mismatch: {} != {}",
-                runtime_args.cores().len(),
-                runtime_args.blobs().len()
-            ),
-        ));
-    }
-    Ok(())
-}
-
 fn build_payload(
     program: &Program,
     reader: Option<&CompiledKernel>,
@@ -566,7 +502,7 @@ fn build_payload(
             .ok_or_else(|| io::Error::other("local CB offset overflow"))? as u64,
         L1_ALIGN as u64,
     ) as usize;
-    let (local_cb_mask, cb_blob) = build_cb_blob(program)?;
+    let (local_cb_mask, cb_blob) = build_cb_blob(&program.compile)?;
     let remote_cb_off = local_cb_off
         .checked_add(cb_blob.len())
         .ok_or_else(|| io::Error::other("remote CB offset overflow"))?;
@@ -627,8 +563,8 @@ fn build_payload(
     Ok((shared_addr, shared, launch_blob))
 }
 
-fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
-    if program.cbs.is_empty() {
+fn build_cb_blob(config: &CompileConfig) -> io::Result<(u32, Vec<u8>)> {
+    if config.cbs.is_empty() {
         return Ok((0, Vec::new()));
     }
 
@@ -636,7 +572,7 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
     let mut mask = 0u32;
     let mut entries = 0usize;
     let mut group_sizes = [0u32; MAX_CIRCULAR_BUFFERS];
-    for cb in &program.cbs {
+    for cb in &config.cbs {
         if cb.index >= MAX_CIRCULAR_BUFFERS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -653,7 +589,7 @@ fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
     let mut next_addr = TensixL1::DATA_BUFFER_SPACE_BASE;
     let mut group_addrs = [None; MAX_CIRCULAR_BUFFERS];
 
-    for cb in &program.cbs {
+    for cb in &config.cbs {
         let page_size = to_u32(cb.dtype.tile_size(), "circular buffer page size")?;
         let tiles = to_u32(cb.tiles, "circular buffer tiles")?;
         let size = page_size
@@ -871,6 +807,15 @@ pub(crate) fn mcast_rects(cores: &[CoreCoord]) -> Vec<(CoreCoord, CoreCoord)> {
 mod tests {
     use super::*;
     use crate::dram::DType;
+    use crate::kernels::kernel::RuntimeArgsBuilder;
+
+    fn test_program_defaults() -> Program {
+        let mut runtime_args = RuntimeArgsBuilder::new(0, Vec::new(), Vec::new(), Vec::new());
+        runtime_args
+            .add_core(CoreCoord { x: 1, y: 2 }, Vec::new(), Vec::new(), Vec::new())
+            .expect("add core");
+        Program::new(runtime_args.build().expect("runtime args"))
+    }
 
     fn dummy_kernel(fill: u8, len: usize) -> CompiledKernel {
         CompiledKernel {
@@ -890,7 +835,7 @@ mod tests {
 
     #[test]
     fn build_cb_blob_packs_buffers() {
-        let program = Program {
+        let config = CompileConfig {
             cbs: vec![
                 CBConfig {
                     index: 0,
@@ -908,10 +853,10 @@ mod tests {
                     tiles: 1,
                 },
             ],
-            ..Program::default()
+            ..CompileConfig::default()
         };
 
-        let (mask, blob) = build_cb_blob(&program).expect("cb blob");
+        let (mask, blob) = build_cb_blob(&config).expect("cb blob");
         let cb0_size = (DType::Float16.tile_size() * 2) as u32;
         let cb16_size = DType::Float16B.tile_size() as u32;
         assert_eq!(mask, (1 << 0) | (1 << 16) | (1 << 24));
@@ -938,13 +883,16 @@ mod tests {
             dummy_kernel(0x55, 20),
         );
         let program = Program {
-            cbs: vec![CBConfig::new(0, DType::Float16B)],
             writer_args: vec![1, 2],
             reader_args: vec![3],
             compute_args: vec![4, 5, 6],
             semaphores: 2,
-            math_fidelity: MathFidelity::HiFi2,
-            ..Program::default()
+            compile: CompileConfig {
+                cbs: vec![CBConfig::new(0, DType::Float16B)],
+                math_fidelity: MathFidelity::HiFi2,
+                ..CompileConfig::default()
+            },
+            ..test_program_defaults()
         };
         let rta_sizes = (8, 4, 12);
         let sem_off = align_up(
@@ -982,7 +930,7 @@ mod tests {
         assert_eq!(read_u32(&launch, 76), 0b1_1111);
         assert_eq!(shared_addr, TensixL1::KERNEL_CONFIG_BASE + 64);
         assert_eq!(shared.len(), 176);
-        assert_eq!(&shared[0..16], &build_cb_blob(&program).unwrap().1);
+        assert_eq!(&shared[0..16], &build_cb_blob(&program.compile).unwrap().1);
         assert_eq!(&shared[16..47], &writer.xip);
         assert_eq!(&shared[48..67], &reader.xip);
     }

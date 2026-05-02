@@ -1,12 +1,11 @@
 use crate::device::Device;
-use crate::dispatch::{CBConfig, CoreSelection, MathFidelity, Program};
+use crate::dispatch::{CBConfig, CompileConfig, CoreSelection, MathFidelity, Program};
 use crate::dram::{DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
-use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{Kernel, RuntimeArgs, RuntimeArgsBuilder};
 use crate::log::{enabled as log_enabled, log};
 use std::collections::HashMap;
 use std::env;
-use std::hash::Hash;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -457,35 +456,40 @@ fn bf16_program(
             tiles: plan.out_block_num_tiles(),
         },
     ];
-    let mut program = Program {
+    let (runtime_args, writer_args, reader_args, compute_args, semaphores) =
+        lower_runtime_args(plan, logical_mt, logical_nt)?;
+    Ok(Program {
         cores: CoreSelection::All,
         reader_kernel: BF16_READER_SENDER.to_owned(),
         writer_kernel: BF16_WRITER_SENDER.to_owned(),
         compute_kernel: compute_src(plan),
         reader_recv_kernel: BF16_READER_RECV.to_owned(),
         writer_recv_kernel: BF16_WRITER_RECV.to_owned(),
-        cbs,
         name: format!(
             "matmul_bf16_{}x{}x{}",
             plan.mt * 32,
             plan.kt * 32,
             plan.nt * 32
         ),
-        semaphores: NUM_SEMAPHORES,
-        math_fidelity,
+        reader_args,
+        writer_args,
+        compute_args,
+        semaphores,
+        compile: CompileConfig {
+            cbs,
+            math_fidelity,
+            ..CompileConfig::default()
+        },
         grid: Some((plan.rows.clone(), plan.cols.clone())),
-        ..Program::default()
-    };
-    lower_runtime_args(plan, logical_mt, logical_nt, &mut program)?;
-    Ok(program)
+        ..Program::new(runtime_args)
+    })
 }
 
 fn lower_runtime_args(
     plan: &MatmulPlan,
     logical_mt: usize,
     logical_nt: usize,
-    program: &mut Program,
-) -> io::Result<()> {
+) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>, usize)> {
     let grid = plan_grid(plan);
     let mut runtime_args = RuntimeArgsBuilder::new(
         NUM_SEMAPHORES,
@@ -506,7 +510,7 @@ fn lower_runtime_args(
             runtime_args.add_core(core, writer, reader, Vec::new())?;
         }
     }
-    runtime_args.apply_to_program(program)
+    runtime_args.into_program_parts()
 }
 
 fn matmul_math_fidelity() -> io::Result<MathFidelity> {

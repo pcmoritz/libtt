@@ -1,7 +1,7 @@
 use crate::compiler::Compiler;
 use crate::cq::FastDispatcher;
 use crate::dispatch::{
-    build_dispatch_plan, mcast_rects, DevMsgs, DispatchCommand, Program, SlowDispatcher,
+    build_dispatch_setup_plan, mcast_rects, DevMsgs, DispatchCommand, Program, SlowDispatcher,
 };
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{align_down, worker_cores, Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO};
@@ -99,8 +99,7 @@ pub struct Device {
     allocator: Option<Allocator>,
     compiler: Compiler,
     dispatcher: Box<dyn Dispatcher>,
-    staged_cached_program: Option<StdArc<Program>>,
-    staged_runtime_args: Option<RuntimeArgs>,
+    staged_cached_program: Option<(StdArc<Program>, RuntimeArgs)>,
 }
 
 trait Dispatcher {
@@ -221,7 +220,6 @@ impl Device {
             compiler,
             dispatcher,
             staged_cached_program: None,
-            staged_runtime_args: None,
         };
 
         if let Err(err) = info.upload_firmware() {
@@ -314,58 +312,26 @@ impl Device {
         &self.compiler
     }
 
-    pub fn run_program(&mut self, program: &Program) -> io::Result<()> {
-        let dispatch_mode = self.dispatcher.dispatch_mode();
-        let commands =
-            build_dispatch_plan(&self.compiler, self.cores_ref(), program, dispatch_mode)?;
-        self.dispatcher.execute(commands)?;
-        self.staged_cached_program = None;
-        self.staged_runtime_args = None;
-        Ok(())
-    }
-
     pub(crate) fn run_cached_program(
         &mut self,
         program: StdArc<Program>,
         update_runtime_args: impl FnOnce(&mut RuntimeArgs) -> io::Result<()>,
     ) -> io::Result<()> {
         let dispatch_mode = self.dispatcher.dispatch_mode();
-        if program.runtime_args.is_some()
-            && self
-                .staged_cached_program
-                .as_ref()
-                .is_some_and(|staged| StdArc::ptr_eq(staged, &program))
-        {
-            if self.staged_runtime_args.is_none() {
-                self.staged_runtime_args = program.runtime_args.clone();
+        if let Some((staged_program, staged_runtime_args)) = &mut self.staged_cached_program {
+            if StdArc::ptr_eq(staged_program, &program) {
+                update_runtime_args(staged_runtime_args)?;
+                return self.dispatcher.execute_runtime(staged_runtime_args);
             }
-            let mut runtime_args = self.staged_runtime_args.take().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing staged runtime args")
-            })?;
-            let result = update_runtime_args(&mut runtime_args)
-                .and_then(|()| self.execute_runtime_args(&runtime_args));
-            self.staged_runtime_args = Some(runtime_args);
-            return result;
         }
 
-        let mut staged_program = program.as_ref().clone();
-        if let Some(runtime_args) = &mut staged_program.runtime_args {
-            update_runtime_args(runtime_args)?;
-        }
-        let commands = build_dispatch_plan(
-            &self.compiler,
-            self.cores_ref(),
-            &staged_program,
-            dispatch_mode,
-        )?;
+        let mut runtime_args = program.runtime_args.clone();
+        update_runtime_args(&mut runtime_args)?;
+        let commands =
+            build_dispatch_setup_plan(&self.compiler, self.cores_ref(), &program, dispatch_mode)?;
         self.dispatcher.execute(commands)?;
-        self.staged_cached_program = Some(program);
-        self.staged_runtime_args = staged_program.runtime_args;
-        Ok(())
-    }
-
-    fn execute_runtime_args(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
-        self.dispatcher.execute_runtime(runtime_args)?;
+        self.dispatcher.execute_runtime(&runtime_args)?;
+        self.staged_cached_program = Some((program, runtime_args));
         Ok(())
     }
 

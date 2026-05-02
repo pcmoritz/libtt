@@ -102,18 +102,21 @@ impl RuntimeArgsBuilder {
     }
 
     pub(crate) fn build(self) -> io::Result<RuntimeArgs> {
-        Ok(self.lower()?.0)
+        Ok(self.into_program_parts()?.0)
     }
 
-    pub(crate) fn apply_to_program(self, program: &mut Program) -> io::Result<()> {
+    pub(crate) fn into_program_parts(
+        self,
+    ) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>, usize)> {
         let semaphores = self.semaphores;
         let (runtime_args, writer_args, reader_args, compute_args) = self.lower()?;
-        program.writer_args = writer_args;
-        program.reader_args = reader_args;
-        program.compute_args = compute_args;
-        program.semaphores = semaphores;
-        program.runtime_args = Some(runtime_args);
-        Ok(())
+        Ok((
+            runtime_args,
+            writer_args,
+            reader_args,
+            compute_args,
+            semaphores,
+        ))
     }
 
     fn lower(self) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>)> {

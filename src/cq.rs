@@ -96,7 +96,7 @@ impl FastDispatcher {
     }
 
     pub(crate) fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
-        let cq_commands = lower_ir(commands, go_word(self.dispatch_core));
+        let cq_commands = lower_ir(commands);
         let mut queue = CommandQueue::default();
         queue.extend(cq_commands)?;
         self.event_id = self.event_id.wrapping_add(1);
@@ -249,11 +249,6 @@ enum CqCommand {
         addr: usize,
         data: Vec<u8>,
     },
-    WritePacked {
-        cores: Vec<CoreCoord>,
-        addr: usize,
-        data: Vec<Vec<u8>>,
-    },
     SetGoSignalNocData {
         cores: Vec<CoreCoord>,
     },
@@ -307,34 +302,6 @@ impl CqCommand {
                     records.push(record);
                 }
                 Ok(records)
-            }
-            Self::WritePacked { cores, addr, data } => {
-                if cores.len() != data.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "packed write core/data length mismatch: {} != {}",
-                            cores.len(),
-                            data.len()
-                        ),
-                    ));
-                }
-                let Some(size) = data.first().map(Vec::len) else {
-                    return Ok(vec![]);
-                };
-                if data.iter().any(|blob| blob.len() != size) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "packed write blobs must have a uniform size",
-                    ));
-                }
-                let (mut record, body_start, stride) =
-                    write_packed_payload_header(cores, *addr, size)?;
-                for (index, blob) in data.iter().enumerate() {
-                    record.extend_from_slice(blob);
-                    pad_vec_to(&mut record, body_start + stride * (index + 1));
-                }
-                Ok(vec![record])
             }
             Self::SetGoSignalNocData { cores } => {
                 let mut record = cq_record(
@@ -607,7 +574,7 @@ fn new_sysmem(path: &Path, size: usize, label: &str) -> io::Result<PinnedMemory>
     })
 }
 
-fn lower_ir(commands: Vec<DispatchCommand>, go_word: u32) -> Vec<CqCommand> {
+fn lower_ir(commands: Vec<DispatchCommand>) -> Vec<CqCommand> {
     let mut result = Vec::new();
     for command in commands {
         match command {
@@ -616,29 +583,6 @@ fn lower_ir(commands: Vec<DispatchCommand>, go_word: u32) -> Vec<CqCommand> {
                     rects: mcast_rects(&cores),
                     addr,
                     data,
-                });
-            }
-            DispatchCommand::WritePacked { cores, addr, data } => {
-                result.push(CqCommand::WritePacked { cores, addr, data });
-            }
-            DispatchCommand::Launch { cores } => {
-                let core_count = cores.len();
-                result.push(CqCommand::SetGoSignalNocData { cores });
-                result.push(CqCommand::WaitStream {
-                    stream: DONE_STREAM,
-                    count: 0,
-                    clear: true,
-                });
-                result.push(CqCommand::SendGoSignal {
-                    go_word,
-                    stream: DONE_STREAM,
-                    count: 0,
-                    num_unicast: core_count as u8,
-                });
-                result.push(CqCommand::WaitStream {
-                    stream: DONE_STREAM,
-                    count: core_count as u32,
-                    clear: true,
                 });
             }
         }
