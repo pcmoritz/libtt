@@ -22,7 +22,6 @@ use dram::{DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::{enabled as log_enabled, log};
-use std::cell::RefCell;
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
@@ -71,7 +70,7 @@ pub struct PJRT_Device {
     addressable: bool,
     default_memory: *mut PJRT_Memory,
     memory_ptrs: Vec<*mut PJRT_Memory>,
-    runtime: RefCell<Device>,
+    runtime: Device,
 }
 
 #[repr(C)]
@@ -190,7 +189,7 @@ impl PJRT_Client {
                 addressable: true,
                 default_memory,
                 memory_ptrs: vec![default_memory],
-                runtime: RefCell::new(info),
+                runtime: info,
             });
         }
 
@@ -428,21 +427,17 @@ fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
 }
 
 fn with_device<T>(
-    pjrt_device: &PJRT_Device,
+    pjrt_device: &mut PJRT_Device,
     f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
 ) -> Result<T, *mut PJRT_Error> {
-    let mut device = pjrt_device
-        .runtime
-        .try_borrow_mut()
-        .map_err(|_| failed_precondition("device is already in use"))?;
-    f(&mut device)
+    f(&mut pjrt_device.runtime)
 }
 
 fn with_device_ptr<T>(
     pjrt_device: *mut PJRT_Device,
     f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
 ) -> Result<T, *mut PJRT_Error> {
-    let pjrt_device = unsafe { checked_ref(pjrt_device, "device") }?;
+    let pjrt_device = unsafe { checked_mut(pjrt_device, "device") }?;
     with_device(pjrt_device, f)
 }
 
@@ -1308,7 +1303,7 @@ fn device_buffer_for_value<'a>(
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
-    target_device: &PJRT_Device,
+    target_device: &mut PJRT_Device,
     inputs: &[*mut PJRT_Buffer],
 ) -> Result<PJRT_Buffer, *mut PJRT_Error> {
     let plan = executable
@@ -1317,10 +1312,9 @@ fn execute_executable_v1(
         .as_ref()
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
     let mut values = vec![None; plan.values.len()];
-    let mut device = target_device
-        .runtime
-        .try_borrow_mut()
-        .map_err(|_| failed_precondition("device is already in use"))?;
+    let target_local_hardware_id = target_device.local_hardware_id as usize;
+    let target_default_memory = target_device.default_memory;
+    let device = &mut target_device.runtime;
 
     for op in &plan.ops {
         match *op {
@@ -1337,7 +1331,7 @@ fn execute_executable_v1(
                 if input.deleted {
                     return Err(failed_precondition("input buffers must not be deleted"));
                 }
-                if input.local_hardware_id != target_device.local_hardware_id as usize {
+                if input.local_hardware_id != target_local_hardware_id {
                     return Err(invalid_argument(
                         "all input buffers and execute_device must be on the same device",
                     ));
@@ -1396,7 +1390,7 @@ fn execute_executable_v1(
                 };
 
                 let output_dram =
-                    kernels::add::eltwise_add_bf16(&mut *device, lhs_dram, rhs_dram, "pjrt_add")
+                    kernels::add::eltwise_add_bf16(device, lhs_dram, rhs_dram, "pjrt_add")
                         .map_err(io_error)?;
                 let output_index = usize::try_from(output_id).map_err(|_| {
                     invalid_argument("TT executable add output id does not fit in usize")
@@ -1421,8 +1415,8 @@ fn execute_executable_v1(
                     buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
                     dims: lhs.dims.clone(),
                     device: execute_device,
-                    memory: target_device.default_memory,
-                    local_hardware_id: target_device.local_hardware_id as usize,
+                    memory: target_default_memory,
+                    local_hardware_id: target_local_hardware_id,
                     dram_buffer: Some(output_dram),
                     deleted: false,
                 });
@@ -1464,7 +1458,7 @@ fn execute_executable_v1(
                 };
 
                 let output_dram =
-                    kernels::matmul::matmul_bf16(&mut *device, lhs_dram, rhs_dram, "pjrt_matmul")
+                    kernels::matmul::matmul_bf16(device, lhs_dram, rhs_dram, "pjrt_matmul")
                         .map_err(io_error)?;
                 let output_index = usize::try_from(output_id).map_err(|_| {
                     invalid_argument("TT executable matmul output id does not fit in usize")
@@ -1490,8 +1484,8 @@ fn execute_executable_v1(
                     buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
                     dims: expected.dims.clone(),
                     device: execute_device,
-                    memory: target_device.default_memory,
-                    local_hardware_id: target_device.local_hardware_id as usize,
+                    memory: target_default_memory,
+                    local_hardware_id: target_local_hardware_id,
                     dram_buffer: Some(output_dram),
                     deleted: false,
                 });
@@ -1541,7 +1535,7 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     if execute_device.is_null() {
         return invalid_argument("no execute device available");
     }
-    let Ok(target_device) = (unsafe { checked_ref(execute_device, "execute_device") }) else {
+    let Ok(target_device) = (unsafe { checked_mut(execute_device, "execute_device") }) else {
         return invalid_argument("execute_device must not be null");
     };
 
@@ -1642,17 +1636,14 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
     if target_device.is_null() {
         return invalid_argument("no target device available");
     }
+    let target_device_ref = match unsafe { checked_mut(target_device, "device") } {
+        Ok(device) => device,
+        Err(err) => return err,
+    };
     let target_memory = if !args.memory.is_null() {
         args.memory
     } else {
-        match unsafe { checked_ref(target_device, "device") } {
-            Ok(device) => device.default_memory,
-            Err(err) => return err,
-        }
-    };
-    let target_device_ref = match unsafe { checked_ref(target_device, "device") } {
-        Ok(device) => device,
-        Err(err) => return err,
+        target_device_ref.default_memory
     };
     let local_hardware_id = target_device_ref.local_hardware_id as usize;
     log(format!(
