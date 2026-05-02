@@ -104,8 +104,8 @@ pub struct Device {
 
 trait Dispatcher {
     fn dispatch_mode(&self) -> u8;
-    fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()>;
-    fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()>;
+    fn launch(&mut self, setup: Vec<DispatchCommand>, runtime_args: &RuntimeArgs)
+        -> io::Result<()>;
 }
 
 impl Dispatcher for FastDispatcher {
@@ -113,12 +113,12 @@ impl Dispatcher for FastDispatcher {
         DevMsgs::DISPATCH_MODE_DEV
     }
 
-    fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
-        FastDispatcher::execute(self, commands)
-    }
-
-    fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
-        FastDispatcher::execute_runtime(self, runtime_args)
+    fn launch(
+        &mut self,
+        setup: Vec<DispatchCommand>,
+        runtime_args: &RuntimeArgs,
+    ) -> io::Result<()> {
+        FastDispatcher::launch(self, setup, runtime_args)
     }
 }
 
@@ -127,12 +127,12 @@ impl Dispatcher for SlowDispatcher {
         DevMsgs::DISPATCH_MODE_HOST
     }
 
-    fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
-        SlowDispatcher::execute(self, commands)
-    }
-
-    fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
-        SlowDispatcher::execute_runtime(self, runtime_args)
+    fn launch(
+        &mut self,
+        setup: Vec<DispatchCommand>,
+        runtime_args: &RuntimeArgs,
+    ) -> io::Result<()> {
+        SlowDispatcher::launch(self, setup, runtime_args)
     }
 }
 
@@ -321,7 +321,7 @@ impl Device {
         if let Some((staged_program, staged_runtime_args)) = &mut self.staged_cached_program {
             if StdArc::ptr_eq(staged_program, &program) {
                 update_runtime_args(staged_runtime_args)?;
-                return self.dispatcher.execute_runtime(staged_runtime_args);
+                return self.dispatcher.launch(Vec::new(), staged_runtime_args);
             }
         }
 
@@ -329,8 +329,7 @@ impl Device {
         update_runtime_args(&mut runtime_args)?;
         let commands =
             build_dispatch_setup_plan(&self.compiler, self.cores_ref(), &program, dispatch_mode)?;
-        self.dispatcher.execute(commands)?;
-        self.dispatcher.execute_runtime(&runtime_args)?;
+        self.dispatcher.launch(commands, &runtime_args)?;
         self.staged_cached_program = Some((program, runtime_args));
         Ok(())
     }

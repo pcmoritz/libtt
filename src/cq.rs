@@ -95,18 +95,11 @@ impl FastDispatcher {
         })
     }
 
-    pub(crate) fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
-        let cq_commands = lower_ir(commands);
-        let mut queue = CommandQueue::default();
-        queue.extend(cq_commands)?;
-        self.event_id = self.event_id.wrapping_add(1);
-        queue.append(CqCommand::HostEvent(self.event_id))?;
-        self.cq_hw.flush(&queue)?;
-        self.cq_hw
-            .wait_completion(self.event_id, Duration::from_secs(10))
-    }
-
-    pub(crate) fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
+    pub(crate) fn launch(
+        &mut self,
+        setup: Vec<DispatchCommand>,
+        runtime_args: &RuntimeArgs,
+    ) -> io::Result<()> {
         let blob_size = uniform_blob_size(runtime_args.blobs())?;
 
         let template_matches = self
@@ -127,6 +120,9 @@ impl FastDispatcher {
         template.patch_runtime_blobs(runtime_args.blobs())?;
 
         self.event_id = self.event_id.wrapping_add(1);
+        for record in relayed_command_records(lower_ir(setup))? {
+            self.cq_hw.issue_write(&record)?;
+        }
         for record in &template.records_before_runtime {
             self.cq_hw.issue_write(record)?;
         }
@@ -371,29 +367,6 @@ impl CqCommand {
     }
 }
 
-#[derive(Default)]
-struct CommandQueue {
-    stream: Vec<u8>,
-    sizes_16b: Vec<usize>,
-}
-
-impl CommandQueue {
-    fn append(&mut self, cmd: CqCommand) -> io::Result<()> {
-        for record in relayed_records(cmd)? {
-            self.sizes_16b.push(record.len() / CQ_CMD_SIZE);
-            self.stream.extend_from_slice(&record);
-        }
-        Ok(())
-    }
-
-    fn extend(&mut self, cmds: Vec<CqCommand>) -> io::Result<()> {
-        for cmd in cmds {
-            self.append(cmd)?;
-        }
-        Ok(())
-    }
-}
-
 struct CqSysmem {
     sysmem: PinnedMemory,
     noc_local: u64,
@@ -468,16 +441,6 @@ impl CqSysmem {
         cq.sysmem.write32(HOST_CQ_WR_OFF, completion_base_16b)?;
         cq.sysmem.write32(HOST_CQ_RD_OFF, completion_base_16b)?;
         Ok(cq)
-    }
-
-    fn flush(&mut self, queue: &CommandQueue) -> io::Result<()> {
-        let mut offset = 0usize;
-        for &size_16b in &queue.sizes_16b {
-            let size = size_16b * CQ_CMD_SIZE;
-            self.issue_write(&queue.stream[offset..offset + size])?;
-            offset += size;
-        }
-        Ok(())
     }
 
     fn wait_completion(&mut self, event_id: u32, timeout: Duration) -> io::Result<()> {

@@ -177,7 +177,16 @@ impl SlowDispatcher {
         })
     }
 
-    pub(crate) fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
+    pub(crate) fn launch(
+        &mut self,
+        setup: Vec<DispatchCommand>,
+        runtime_args: &RuntimeArgs,
+    ) -> io::Result<()> {
+        self.execute_setup(setup)?;
+        self.write_runtime_and_launch(runtime_args)
+    }
+
+    fn execute_setup(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
         for command in commands {
             match command {
                 DispatchCommand::Write { cores, addr, data } => {
@@ -189,7 +198,7 @@ impl SlowDispatcher {
         Ok(())
     }
 
-    pub(crate) fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
+    fn write_runtime_and_launch(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
         let cores = runtime_args.cores();
         self.write_mcast(
             cores,
@@ -208,7 +217,7 @@ impl SlowDispatcher {
                 runtime_args.blobs(),
             )?;
         }
-        self.launch(cores)
+        self.launch_cores(cores)
     }
 
     fn write_mcast(&mut self, cores: &[CoreCoord], addr: usize, data: &[u8]) -> io::Result<()> {
@@ -242,7 +251,7 @@ impl SlowDispatcher {
         Ok(())
     }
 
-    fn launch(&mut self, cores: &[CoreCoord]) -> io::Result<()> {
+    fn launch_cores(&mut self, cores: &[CoreCoord]) -> io::Result<()> {
         let go_blob = [0u8, 0u8, 0u8, DevMsgs::RUN_MSG_GO];
         self.write_mcast(cores, TensixL1::GO_MSG as usize, &go_blob)?;
 
