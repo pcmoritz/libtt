@@ -1353,9 +1353,9 @@ fn execute_executable_v1(
                 }
                 if input.dims != expected.dims {
                     return Err(invalid_argument(format!(
-                            "TT executable parameter {parameter_index} shape mismatch: expected {:?}, got {:?}",
-                            expected.dims, input.dims
-                        )));
+                        "TT executable parameter {parameter_index} shape mismatch: expected {:?}, got {:?}",
+                        expected.dims, input.dims
+                    )));
                 }
                 values[output_index] = Some(input.clone());
             }
