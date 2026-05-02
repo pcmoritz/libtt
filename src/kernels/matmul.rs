@@ -190,7 +190,7 @@ pub(crate) fn matmul_bf16(
     let output = device.alloc(
         logical_mt * logical_nt,
         DType::Float16B,
-        Some(&[m, n]),
+        &[m, n],
         output_name,
     )?;
     let kernel = MatmulBf16Kernel {
@@ -254,10 +254,7 @@ fn cached_zero_tile(device: &mut Device) -> io::Result<DramBuffer> {
 }
 
 fn shape_2d(buffer: &DramBuffer, name: &str) -> io::Result<(usize, usize)> {
-    let shape = buffer
-        .shape
-        .as_ref()
-        .ok_or_else(|| invalid_input(format!("{name} buffer is missing shape metadata")))?;
+    let shape = &buffer.shape;
     if shape.len() != 2 {
         return Err(invalid_input(format!(
             "matmul_bf16 requires rank-2 {name} input, got shape {shape:?}"

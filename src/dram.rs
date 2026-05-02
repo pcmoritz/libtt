@@ -44,7 +44,7 @@ pub struct DramBuffer {
     pub addr: u64,
     pub num_tiles: usize,
     pub dtype: DType,
-    pub shape: Option<Shape>,
+    pub shape: Shape,
 }
 
 impl DramBuffer {
@@ -117,7 +117,7 @@ impl Allocator {
         num_tiles: usize,
         dtype: DType,
         name: impl Into<String>,
-        shape: Option<Shape>,
+        shape: Shape,
     ) -> io::Result<DramBuffer> {
         let (addr, next) = next_allocation_range(self.next, num_tiles, dtype, self.bank_count)?;
         self.next = next;
@@ -139,7 +139,7 @@ impl Allocator {
         name: impl Into<String>,
     ) -> io::Result<DramBuffer> {
         validate_tile_multiple(data.len(), dtype)?;
-        let buf = self.alloc(data.len() / dtype.tile_size(), dtype, name, Some(shape))?;
+        let buf = self.alloc(data.len() / dtype.tile_size(), dtype, name, shape)?;
         self.write(&buf, data)?;
         Ok(buf)
     }
@@ -153,7 +153,7 @@ impl Allocator {
     ) -> io::Result<DramBuffer> {
         validate_tiled_shape(data, dtype, &shape)?;
         let num_tiles = data.len() / dtype.tile_size();
-        self.alloc(num_tiles, dtype, name, Some(shape))
+        self.alloc(num_tiles, dtype, name, shape)
     }
 
     pub fn write(&mut self, buf: &DramBuffer, data: &[u8]) -> io::Result<()> {
@@ -195,10 +195,7 @@ impl Allocator {
     }
 
     pub(crate) fn write_host_data(&mut self, buf: &DramBuffer, data: &[u8]) -> io::Result<()> {
-        let payload = match &buf.shape {
-            Some(shape) => tilize(data, buf.dtype, shape)?,
-            None => data.to_vec(),
-        };
+        let payload = tilize(data, buf.dtype, &buf.shape)?;
         self.write(buf, &payload)
     }
 
@@ -240,10 +237,7 @@ impl Allocator {
 
     pub(crate) fn read_host_data(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
         let payload = self.read(buf)?;
-        match &buf.shape {
-            Some(shape) => untilize(&payload, buf.dtype, shape),
-            None => Ok(payload),
-        }
+        untilize(&payload, buf.dtype, &buf.shape)
     }
 
     fn barrier(&mut self) -> io::Result<()> {
@@ -561,7 +555,7 @@ mod tests {
             addr: Dram::WRITE_OFFSET,
             num_tiles: 3,
             dtype: DType::Float16,
-            shape: Some(vec![32, 96]),
+            shape: vec![32, 96],
         };
 
         assert_eq!(buffer.page_size(), 2048);

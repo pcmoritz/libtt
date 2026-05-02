@@ -36,7 +36,7 @@ pub(crate) fn eltwise_add_bf16(
     let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
     let tile_count = u32::try_from(lhs.num_tiles)
         .map_err(|_| invalid_input(format!("tile count does not fit in u32: {}", lhs.num_tiles)))?;
-    let output = device.alloc(lhs.num_tiles, DType::Float16B, lhs.shape.as_deref(), name)?;
+    let output = device.alloc(lhs.num_tiles, DType::Float16B, &lhs.shape, name)?;
     let output_addr = u32_arg(output.addr, "output address")?;
 
     let program = bf16_program(lhs_addr, rhs_addr, output_addr, tile_count);

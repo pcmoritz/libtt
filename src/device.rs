@@ -372,11 +372,11 @@ impl Device {
         &mut self,
         num_tiles: usize,
         dtype: DType,
-        shape: Option<&[usize]>,
+        shape: &[usize],
         name: impl Into<String>,
     ) -> io::Result<DramBuffer> {
         self.allocator_mut()?
-            .alloc(num_tiles, dtype, name, shape.map(|dims| dims.to_vec()))
+            .alloc(num_tiles, dtype, name, shape.to_vec())
     }
 
     pub fn alloc_write(
