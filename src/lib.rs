@@ -1292,8 +1292,7 @@ fn device_buffer_for_value<'a>(
     value_id: u32,
     field: &str,
 ) -> Result<&'a PJRT_Buffer, *mut PJRT_Error> {
-    let index = usize::try_from(value_id)
-        .map_err(|_| invalid_argument(format!("{field} value id does not fit in usize")))?;
+    let index = value_id as usize;
     values
         .get(index)
         .and_then(|value| value.as_ref())
@@ -1315,11 +1314,7 @@ fn store_output_buffer(
     context: &OutputContext,
     op: &str,
 ) -> Result<(), *mut PJRT_Error> {
-    let output_index = usize::try_from(output_id).map_err(|_| {
-        invalid_argument(format!(
-            "TT executable {op} output id does not fit in usize"
-        ))
-    })?;
+    let output_index = output_id as usize;
     let expected = plan.values.get(output_index).ok_or_else(|| {
         invalid_argument(format!(
             "TT executable {op} output id {output_id} is out of bounds"
@@ -1389,9 +1384,7 @@ fn execute_executable_v1(
                     ));
                 }
 
-                let output_index = usize::try_from(output_id).map_err(|_| {
-                    invalid_argument("TT executable parameter output id does not fit in usize")
-                })?;
+                let output_index = output_id as usize;
                 let expected = plan.values.get(output_index).ok_or_else(|| {
                     invalid_argument(format!(
                         "TT executable parameter output id {output_id} is out of bounds"
