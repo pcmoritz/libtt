@@ -8,7 +8,7 @@ use crate::log::{enabled as log_enabled, log};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::env;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::io;
 use std::sync::{Arc as StdArc, Mutex, OnceLock};
 
@@ -25,26 +25,19 @@ const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
 const WRITER_ZERO_ADDR_INDEX: usize = 31;
 
 static ZERO_TILE_BY_DEVICE: OnceLock<Mutex<HashMap<usize, DramBuffer>>> = OnceLock::new();
-static PLAN_CACHE: OnceLock<Mutex<HashMap<MatmulPlanKey, MatmulPlan>>> = OnceLock::new();
 static PROGRAM_CACHE: ProgramCache<MatmulProgramKey> = ProgramCache::new("matmul program");
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct MatmulPlanKey {
-    m: usize,
-    k: usize,
-    n: usize,
-    cores: StdArc<[CoreCoord]>,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct MatmulProgramKey {
-    static_key: u64,
     logical_mt: usize,
+    logical_kt: usize,
     logical_nt: usize,
+    cores: StdArc<[CoreCoord]>,
+    math_fidelity: MathFidelity,
     col_offset_tiles: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct MatmulPlan {
     rows: Vec<u8>,
     cols: Vec<u8>,
@@ -116,16 +109,23 @@ impl MatmulBf16Kernel {
         let m = self.logical_mt * 32;
         let k = self.logical_kt * 32;
         let n = self.logical_nt * 32;
-        let plan = cached_plan_matmul(m, k, n, device.cores_arc())?;
-        log_matmul_plan(&plan);
-        let static_key = matmul_static_key(&plan, self.math_fidelity);
+        let cores = device.cores_arc();
         let key = MatmulProgramKey {
-            static_key,
             logical_mt: self.logical_mt,
+            logical_kt: self.logical_kt,
             logical_nt: self.logical_nt,
+            cores: StdArc::clone(&cores),
+            math_fidelity: self.math_fidelity,
             col_offset_tiles: 0,
         };
         PROGRAM_CACHE.get_or_insert_with(key, || {
+            let plan = plan_matmul(m, k, n, &cores)?;
+            log_matmul_plan(&plan);
+            let static_key = BuildHasherDefault::<DefaultHasher>::default().hash_one((
+                "matmul_bf16_v2",
+                &plan,
+                self.math_fidelity,
+            ));
             bf16_program(
                 &plan,
                 self.logical_mt,
@@ -418,36 +418,6 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
     })
 }
 
-fn cached_plan_matmul(
-    m: usize,
-    k: usize,
-    n: usize,
-    cores: StdArc<[CoreCoord]>,
-) -> io::Result<MatmulPlan> {
-    let key = MatmulPlanKey {
-        m,
-        k,
-        n,
-        cores: StdArc::clone(&cores),
-    };
-    let cache = PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(plan) = cache
-        .lock()
-        .map_err(|_| io::Error::other("matmul plan cache is poisoned"))?
-        .get(&key)
-        .cloned()
-    {
-        return Ok(plan);
-    }
-
-    let plan = plan_matmul(m, k, n, &cores)?;
-    cache
-        .lock()
-        .map_err(|_| io::Error::other("matmul plan cache is poisoned"))?
-        .insert(key, plan.clone());
-    Ok(plan)
-}
-
 fn fits_l1(
     per_core_m: usize,
     per_core_n: usize,
@@ -572,23 +542,6 @@ fn lower_runtime_args(
         }
     }
     runtime_args.apply_to_program(program)
-}
-
-fn matmul_static_key(plan: &MatmulPlan, math_fidelity: MathFidelity) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    "matmul_bf16_v2".hash(&mut hasher);
-    plan.rows.hash(&mut hasher);
-    plan.cols.hash(&mut hasher);
-    plan.mt.hash(&mut hasher);
-    plan.kt.hash(&mut hasher);
-    plan.nt.hash(&mut hasher);
-    plan.per_core_m.hash(&mut hasher);
-    plan.per_core_n.hash(&mut hasher);
-    plan.in0_block_w.hash(&mut hasher);
-    plan.out_subblock_h.hash(&mut hasher);
-    plan.out_subblock_w.hash(&mut hasher);
-    math_fidelity.hash(&mut hasher);
-    hasher.finish()
 }
 
 fn matmul_math_fidelity() -> io::Result<MathFidelity> {
