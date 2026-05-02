@@ -1,8 +1,7 @@
 use crate::compiler::Compiler;
 use crate::cq::FastDispatcher;
 use crate::dispatch::{
-    build_dispatch_plan, build_dispatch_runtime_args_plan, mcast_rects, DevMsgs, DispatchCommand,
-    Program, SlowDispatcher,
+    build_dispatch_plan, mcast_rects, DevMsgs, DispatchCommand, Program, SlowDispatcher,
 };
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{align_down, worker_cores, Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO};
@@ -107,9 +106,7 @@ pub struct Device {
 trait Dispatcher {
     fn dispatch_mode(&self) -> u8;
     fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()>;
-    fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
-        self.execute(build_dispatch_runtime_args_plan(runtime_args)?)
-    }
+    fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()>;
 }
 
 impl Dispatcher for FastDispatcher {
@@ -133,6 +130,10 @@ impl Dispatcher for SlowDispatcher {
 
     fn execute(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
         SlowDispatcher::execute(self, commands)
+    }
+
+    fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
+        SlowDispatcher::execute_runtime(self, runtime_args)
     }
 }
 

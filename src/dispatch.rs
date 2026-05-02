@@ -176,56 +176,101 @@ impl SlowDispatcher {
         for command in commands {
             match command {
                 DispatchCommand::Write { cores, addr, data } => {
-                    for (start, end) in mcast_rects(&cores) {
-                        self.win.target(start, Some(end), 0, NocOrdering::Strict)?;
-                        self.win.write(addr, &data)?;
-                    }
+                    self.write_mcast(&cores, addr, &data)?;
                 }
                 DispatchCommand::WritePacked { cores, addr, data } => {
-                    if cores.len() != data.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "packed write core/data length mismatch: {} != {}",
-                                cores.len(),
-                                data.len()
-                            ),
-                        ));
-                    }
-                    for (core, data) in cores.iter().zip(&data) {
-                        self.win.target(*core, None, 0, NocOrdering::Strict)?;
-                        self.win.write(addr, data)?;
-                    }
+                    self.write_packed(&cores, addr, &data)?;
                 }
                 DispatchCommand::Launch { cores } => {
-                    let go_blob = [0u8, 0u8, 0u8, DevMsgs::RUN_MSG_GO];
-                    for (start, end) in mcast_rects(&cores) {
-                        self.win.target(start, Some(end), 0, NocOrdering::Strict)?;
-                        self.win.write(TensixL1::GO_MSG as usize, &go_blob)?;
-                    }
-
-                    for core in &cores {
-                        self.win.target(*core, None, 0, NocOrdering::Strict)?;
-                        let deadline = Instant::now() + LAUNCH_TIMEOUT;
-                        loop {
-                            if self.win.read(TensixL1::GO_MSG as usize + 3, 1)?[0]
-                                == DevMsgs::RUN_MSG_DONE
-                            {
-                                break;
-                            }
-                            if Instant::now() > deadline {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::TimedOut,
-                                    format!("timeout waiting for core {core}"),
-                                ));
-                            }
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                    }
+                    self.launch(&cores)?;
                 }
             }
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
+        validate_runtime_args(runtime_args)?;
+        let cores = runtime_args.cores();
+        if cores.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no worker cores selected for dispatch",
+            ));
+        }
+
+        self.write_mcast(
+            cores,
+            TensixL1::GO_MSG as usize,
+            &[0, 0, 0, DevMsgs::RUN_MSG_RESET_READ_PTR_FROM_HOST],
+        )?;
+        self.write_mcast(
+            cores,
+            TensixL1::GO_MSG_INDEX as usize,
+            &[0; size_of::<u32>()],
+        )?;
+        if runtime_args.blobs().iter().any(|blob| !blob.is_empty()) {
+            self.write_packed(
+                cores,
+                TensixL1::KERNEL_CONFIG_BASE as usize,
+                runtime_args.blobs(),
+            )?;
+        }
+        self.launch(cores)
+    }
+
+    fn write_mcast(&mut self, cores: &[CoreCoord], addr: usize, data: &[u8]) -> io::Result<()> {
+        for (start, end) in mcast_rects(cores) {
+            self.win.target(start, Some(end), 0, NocOrdering::Strict)?;
+            self.win.write(addr, data)?;
+        }
+        Ok(())
+    }
+
+    fn write_packed(
+        &mut self,
+        cores: &[CoreCoord],
+        addr: usize,
+        data: &[Vec<u8>],
+    ) -> io::Result<()> {
+        if cores.len() != data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "packed write core/data length mismatch: {} != {}",
+                    cores.len(),
+                    data.len()
+                ),
+            ));
+        }
+        for (core, data) in cores.iter().zip(data) {
+            self.win.target(*core, None, 0, NocOrdering::Strict)?;
+            self.win.write(addr, data)?;
+        }
+        Ok(())
+    }
+
+    fn launch(&mut self, cores: &[CoreCoord]) -> io::Result<()> {
+        let go_blob = [0u8, 0u8, 0u8, DevMsgs::RUN_MSG_GO];
+        self.write_mcast(cores, TensixL1::GO_MSG as usize, &go_blob)?;
+
+        for core in cores {
+            self.win.target(*core, None, 0, NocOrdering::Strict)?;
+            let deadline = Instant::now() + LAUNCH_TIMEOUT;
+            loop {
+                if self.win.read(TensixL1::GO_MSG as usize + 3, 1)?[0] == DevMsgs::RUN_MSG_DONE {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("timeout waiting for core {core}"),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
         Ok(())
     }
 }
@@ -352,44 +397,6 @@ pub(crate) fn build_dispatch_plan(
     commands.push(DispatchCommand::Launch {
         cores: all_cores.clone(),
     });
-
-    Ok(commands)
-}
-
-pub(crate) fn build_dispatch_runtime_args_plan(
-    runtime_args: &RuntimeArgs,
-) -> io::Result<Vec<DispatchCommand>> {
-    validate_runtime_args(runtime_args)?;
-    let all_cores = runtime_args.cores().to_vec();
-    if all_cores.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "no worker cores selected for dispatch",
-        ));
-    }
-
-    let mut commands = vec![
-        DispatchCommand::Write {
-            cores: all_cores.clone(),
-            addr: TensixL1::GO_MSG as usize,
-            data: vec![0, 0, 0, DevMsgs::RUN_MSG_RESET_READ_PTR_FROM_HOST],
-        },
-        DispatchCommand::Write {
-            cores: all_cores.clone(),
-            addr: TensixL1::GO_MSG_INDEX as usize,
-            data: vec![0; size_of::<u32>()],
-        },
-    ];
-
-    if runtime_args.blobs().iter().any(|blob| !blob.is_empty()) {
-        commands.push(DispatchCommand::WritePacked {
-            cores: runtime_args.cores().to_vec(),
-            addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-            data: runtime_args.blobs().to_vec(),
-        });
-    }
-
-    commands.push(DispatchCommand::Launch { cores: all_cores });
 
     Ok(commands)
 }

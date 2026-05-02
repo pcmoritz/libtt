@@ -1,7 +1,5 @@
 use crate::compiler::Compiler;
-use crate::dispatch::{
-    build_cq_launch, build_dispatch_runtime_args_plan, mcast_rects, DevMsgs, DispatchCommand,
-};
+use crate::dispatch::{build_cq_launch, mcast_rects, DevMsgs, DispatchCommand};
 use crate::hw::{align_down, align_up, noc_xy, Arc, CoreCoord, TensixL1, TensixMMIO};
 use crate::kernels::kernel::RuntimeArgs;
 use crate::linux::{NocOrdering, PinnedMemory, TlbWindow};
@@ -109,9 +107,7 @@ impl FastDispatcher {
     }
 
     pub(crate) fn execute_runtime(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
-        let Some(blob_size) = uniform_blob_size(runtime_args.blobs())? else {
-            return self.execute(build_dispatch_runtime_args_plan(runtime_args)?);
-        };
+        let blob_size = uniform_blob_size(runtime_args.blobs())?;
 
         let template_matches = self
             .runtime_template
@@ -909,17 +905,18 @@ fn write_packed_payload_header(
     Ok((record, body_start, stride))
 }
 
-fn uniform_blob_size(blobs: &[Vec<u8>]) -> io::Result<Option<usize>> {
-    let Some(size) = blobs.first().map(Vec::len) else {
-        return Ok(None);
-    };
+fn uniform_blob_size(blobs: &[Vec<u8>]) -> io::Result<usize> {
+    let size = blobs
+        .first()
+        .map(Vec::len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "runtime args are empty"))?;
     if blobs.iter().any(|blob| blob.len() != size) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "packed write blobs must have a uniform size",
         ));
     }
-    Ok(Some(size))
+    Ok(size)
 }
 
 fn cq_hdr_write_packed_large(count: usize) -> io::Result<Vec<u8>> {
