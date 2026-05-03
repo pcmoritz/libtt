@@ -105,17 +105,16 @@ pub struct Device {
 
 struct CachedProgramLaunch {
     setup: Vec<DispatchCommand>,
+    launch_setup: Vec<DispatchCommand>,
     runtime_args: RuntimeArgs,
 }
 
 trait Dispatcher {
     fn dispatch_mode(&self) -> u8;
-    // Some(setup) stages or restages the program; None launches the currently
-    // staged program with updated runtime args.
     fn launch(
         &mut self,
         program: &Program,
-        setup: Option<&[DispatchCommand]>,
+        setup: &[DispatchCommand],
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()>;
 }
@@ -128,10 +127,10 @@ impl Dispatcher for FastDispatcher {
     fn launch(
         &mut self,
         program: &Program,
-        setup: Option<&[DispatchCommand]>,
+        setup: &[DispatchCommand],
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
-        FastDispatcher::launch(self, program, setup.unwrap_or_default(), runtime_args)
+        FastDispatcher::launch(self, program, setup, runtime_args)
     }
 }
 
@@ -143,11 +142,24 @@ impl Dispatcher for SlowDispatcher {
     fn launch(
         &mut self,
         _program: &Program,
-        setup: Option<&[DispatchCommand]>,
+        setup: &[DispatchCommand],
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
-        SlowDispatcher::launch(self, setup.unwrap_or_default(), runtime_args)
+        SlowDispatcher::launch(self, setup, runtime_args)
     }
+}
+
+fn launch_descriptor_setup(setup: &[DispatchCommand]) -> Vec<DispatchCommand> {
+    setup
+        .iter()
+        .filter(|command| {
+            matches!(
+                command,
+                DispatchCommand::Write { addr, .. } if *addr == TensixL1::LAUNCH as usize
+            )
+        })
+        .cloned()
+        .collect()
 }
 
 impl Device {
@@ -342,10 +354,12 @@ impl Device {
                 &program,
                 self.dispatcher.dispatch_mode(),
             )?;
+            let launch_setup = launch_descriptor_setup(&setup);
             self.cached_program_launches.insert(
                 program_id,
                 CachedProgramLaunch {
                     setup,
+                    launch_setup,
                     runtime_args: program.runtime_args.clone(),
                 },
             );
@@ -356,7 +370,11 @@ impl Device {
             .get_mut(&program_id)
             .expect("cached program launch was just inserted");
         update_runtime_args(&mut launch.runtime_args)?;
-        let setup = (!is_staged).then_some(launch.setup.as_slice());
+        let setup = if is_staged {
+            launch.launch_setup.as_slice()
+        } else {
+            launch.setup.as_slice()
+        };
         self.dispatcher
             .launch(&program, setup, &launch.runtime_args)?;
         self.staged_cached_program = Some(program_id);
