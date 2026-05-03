@@ -1,17 +1,17 @@
 #[cfg(libtt_mlir_frontend)]
 use crate::PJRT_Buffer_Type;
 #[cfg(libtt_mlir_frontend)]
-use executable_proto::tt::AnalysisResult;
-#[cfg(libtt_mlir_frontend)]
-use executable_proto::tt::Executable as ProtoExecutable;
-#[cfg(libtt_mlir_frontend)]
-use executable_proto::tt::TensorDesc as ProtoTensorDesc;
-#[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::op::Kind;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::tensor_desc::ElementType;
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::AnalysisResult;
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::Executable as ProtoExecutable;
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::TensorDesc as ProtoTensorDesc;
 #[cfg(libtt_mlir_frontend)]
 use prost::Message;
 
@@ -38,6 +38,10 @@ pub(crate) enum Op {
         output_id: u32,
     },
     Add {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Matmul {
         input_ids: [u32; 2],
         output_id: u32,
     },
@@ -103,6 +107,10 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                 }),
                 Kind::Add(add) => Ok(Op::Add {
                     input_ids: [add.lhs_id, add.rhs_id],
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Matmul(matmul) => Ok(Op::Matmul {
+                    input_ids: [matmul.lhs_id, matmul.rhs_id],
                     output_id: op_desc.output_id,
                 }),
             }
@@ -173,6 +181,10 @@ pub(crate) enum Op {
         output_id: u32,
     },
     Add {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Matmul {
         input_ids: [u32; 2],
         output_id: u32,
     },

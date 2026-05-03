@@ -22,7 +22,7 @@ use dram::{DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
-use std::ffi::{CString, c_char};
+use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
 use std::ptr;
@@ -70,6 +70,7 @@ pub struct PJRT_Device {
     addressable: bool,
     default_memory: *mut PJRT_Memory,
     memory_ptrs: Vec<*mut PJRT_Memory>,
+    runtime: Device,
 }
 
 #[repr(C)]
@@ -178,7 +179,7 @@ impl PJRT_Client {
         }
 
         let mut devices = Vec::with_capacity(discovered.len());
-        for (index, info) in discovered.iter().enumerate() {
+        for (index, info) in discovered.into_iter().enumerate() {
             let description = &mut device_descriptions[index] as *mut PJRT_DeviceDescription;
             let default_memory = memory_ptrs[index];
             devices.push(PJRT_Device {
@@ -188,6 +189,7 @@ impl PJRT_Client {
                 addressable: true,
                 default_memory,
                 memory_ptrs: vec![default_memory],
+                runtime: info,
             });
         }
 
@@ -419,8 +421,24 @@ fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
             PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
         ));
     };
-    let mut device = Device::open(buffer.local_hardware_id).map_err(io_error)?;
-    device.dram_read(dram_buffer).map_err(io_error)
+    with_device_ptr(buffer.device, |device| {
+        device.dram_read(dram_buffer).map_err(io_error)
+    })
+}
+
+fn with_device<T>(
+    pjrt_device: &mut PJRT_Device,
+    f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
+) -> Result<T, *mut PJRT_Error> {
+    f(&mut pjrt_device.runtime)
+}
+
+fn with_device_ptr<T>(
+    pjrt_device: *mut PJRT_Device,
+    f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
+) -> Result<T, *mut PJRT_Error> {
+    let pjrt_device = unsafe { checked_mut(pjrt_device, "device") }?;
+    with_device(pjrt_device, f)
 }
 
 fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *mut PJRT_Error> {
@@ -1274,18 +1292,61 @@ fn device_buffer_for_value<'a>(
     value_id: u32,
     field: &str,
 ) -> Result<&'a PJRT_Buffer, *mut PJRT_Error> {
-    let index = usize::try_from(value_id)
-        .map_err(|_| invalid_argument(format!("{field} value id does not fit in usize")))?;
+    let index = value_id as usize;
     values
         .get(index)
         .and_then(|value| value.as_ref())
         .ok_or_else(|| invalid_argument(format!("{field} value id {value_id} is not available")))
 }
 
+struct OutputContext {
+    device: *mut PJRT_Device,
+    memory: *mut PJRT_Memory,
+    local_hardware_id: usize,
+}
+
+fn store_output_buffer(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    output_id: u32,
+    expected_dims: Vec<i64>,
+    dram_buffer: DramBuffer,
+    context: &OutputContext,
+    op: &str,
+) -> Result<(), *mut PJRT_Error> {
+    let output_index = output_id as usize;
+    let expected = plan.values.get(output_index).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable {op} output id {output_id} is out of bounds"
+        ))
+    })?;
+    if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+        return Err(unimplemented(format!(
+            "TT executable {op} currently only supports bf16 outputs"
+        )));
+    }
+    if expected.dims != expected_dims {
+        return Err(invalid_argument(format!(
+            "TT executable {op} output shape mismatch: expected {:?}, got {:?}",
+            expected.dims, expected_dims
+        )));
+    }
+    values[output_index] = Some(PJRT_Buffer {
+        buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+        dims: expected.dims.clone(),
+        device: context.device,
+        memory: context.memory,
+        local_hardware_id: context.local_hardware_id,
+        dram_buffer: Some(dram_buffer),
+        deleted: false,
+    });
+    Ok(())
+}
+
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
-    target_device: &PJRT_Device,
+    target_device: &mut PJRT_Device,
     inputs: &[*mut PJRT_Buffer],
 ) -> Result<PJRT_Buffer, *mut PJRT_Error> {
     let plan = executable
@@ -1294,7 +1355,13 @@ fn execute_executable_v1(
         .as_ref()
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
     let mut values = vec![None; plan.values.len()];
-    let mut device = Device::open(target_device.local_hardware_id as usize).map_err(io_error)?;
+    let target_local_hardware_id = target_device.local_hardware_id as usize;
+    let output_context = OutputContext {
+        device: execute_device,
+        memory: target_device.default_memory,
+        local_hardware_id: target_local_hardware_id,
+    };
+    let device = &mut target_device.runtime;
 
     for op in &plan.ops {
         match *op {
@@ -1311,15 +1378,13 @@ fn execute_executable_v1(
                 if input.deleted {
                     return Err(failed_precondition("input buffers must not be deleted"));
                 }
-                if input.local_hardware_id != target_device.local_hardware_id as usize {
+                if input.local_hardware_id != target_local_hardware_id {
                     return Err(invalid_argument(
                         "all input buffers and execute_device must be on the same device",
                     ));
                 }
 
-                let output_index = usize::try_from(output_id).map_err(|_| {
-                    invalid_argument("TT executable parameter output id does not fit in usize")
-                })?;
+                let output_index = output_id as usize;
                 let expected = plan.values.get(output_index).ok_or_else(|| {
                     invalid_argument(format!(
                         "TT executable parameter output id {output_id} is out of bounds"
@@ -1369,37 +1434,69 @@ fn execute_executable_v1(
                     ));
                 };
 
+                let output_dims = lhs.dims.clone();
                 let output_dram =
-                    kernels::add::eltwise_add_bf16(&mut device, lhs_dram, rhs_dram, "pjrt_add")
+                    kernels::add::eltwise_add_bf16(device, lhs_dram, rhs_dram, "pjrt_add")
                         .map_err(io_error)?;
-                let output_index = usize::try_from(output_id).map_err(|_| {
-                    invalid_argument("TT executable add output id does not fit in usize")
-                })?;
-                let expected = plan.values.get(output_index).ok_or_else(|| {
-                    invalid_argument(format!(
-                        "TT executable add output id {output_id} is out of bounds"
-                    ))
-                })?;
-                if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+                store_output_buffer(
+                    &mut values,
+                    plan,
+                    output_id,
+                    output_dims,
+                    output_dram,
+                    &output_context,
+                    "add",
+                )?;
+            }
+            executable::Op::Matmul {
+                input_ids,
+                output_id,
+            } => {
+                let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
+                let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
+                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                {
                     return Err(unimplemented(
-                        "TT executable add currently only supports bf16 outputs",
+                        "TT executable matmul currently only supports bf16 buffers",
                     ));
                 }
-                if expected.dims != lhs.dims {
+                if lhs.dims.len() != 2 || rhs.dims.len() != 2 {
+                    return Err(unimplemented(
+                        "TT executable matmul currently only supports rank-2 buffers",
+                    ));
+                }
+                if lhs.dims[1] != rhs.dims[0] {
                     return Err(invalid_argument(format!(
-                        "TT executable add output shape mismatch: expected {:?}, got {:?}",
-                        expected.dims, lhs.dims
+                        "TT executable matmul shape mismatch: lhs {:?}, rhs {:?}",
+                        lhs.dims, rhs.dims
                     )));
                 }
-                values[output_index] = Some(PJRT_Buffer {
-                    buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
-                    dims: lhs.dims.clone(),
-                    device: execute_device,
-                    memory: target_device.default_memory,
-                    local_hardware_id: target_device.local_hardware_id as usize,
-                    dram_buffer: Some(output_dram),
-                    deleted: false,
-                });
+
+                let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable matmul lhs buffer has no device allocation",
+                    ));
+                };
+                let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable matmul rhs buffer has no device allocation",
+                    ));
+                };
+
+                let output_dram =
+                    kernels::matmul::matmul_bf16(device, lhs_dram, rhs_dram, "pjrt_matmul")
+                        .map_err(io_error)?;
+                let expected_dims = vec![lhs.dims[0], rhs.dims[1]];
+                store_output_buffer(
+                    &mut values,
+                    plan,
+                    output_id,
+                    expected_dims,
+                    output_dram,
+                    &output_context,
+                    "matmul",
+                )?;
             }
         }
     }
@@ -1444,7 +1541,7 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     if execute_device.is_null() {
         return invalid_argument("no execute device available");
     }
-    let Ok(target_device) = (unsafe { checked_ref(execute_device, "execute_device") }) else {
+    let Ok(target_device) = (unsafe { checked_mut(execute_device, "execute_device") }) else {
         return invalid_argument("execute_device must not be null");
     };
 
@@ -1545,18 +1642,16 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
     if target_device.is_null() {
         return invalid_argument("no target device available");
     }
+    let target_device_ref = match unsafe { checked_mut(target_device, "device") } {
+        Ok(device) => device,
+        Err(err) => return err,
+    };
     let target_memory = if !args.memory.is_null() {
         args.memory
     } else {
-        match unsafe { checked_ref(target_device, "device") } {
-            Ok(device) => device.default_memory,
-            Err(err) => return err,
-        }
+        target_device_ref.default_memory
     };
-    let local_hardware_id = match unsafe { checked_ref(target_device, "device") } {
-        Ok(device) => device.local_hardware_id as usize,
-        Err(err) => return err,
-    };
+    let local_hardware_id = target_device_ref.local_hardware_id as usize;
     log(format!(
         "pjrt buffer_from_host_buffer type={:?} dims={:?} local_hardware_id={}",
         args.type_, dims_i64, local_hardware_id
@@ -1568,13 +1663,13 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         // SAFETY: caller owns `data` for `byte_size` bytes during the call.
         unsafe { slice::from_raw_parts(args.data.cast::<u8>(), byte_size) }
     };
-    let mut device = match Device::open(local_hardware_id) {
-        Ok(device) => device,
-        Err(err) => return io_error(err),
-    };
-    let dram_buffer = match device.alloc_write(data, dtype, &shape, "pjrt") {
+    let dram_buffer = match with_device(target_device_ref, |device| {
+        device
+            .alloc_write(data, dtype, &shape, "pjrt")
+            .map_err(io_error)
+    }) {
         Ok(buffer) => buffer,
-        Err(err) => return io_error(err),
+        Err(err) => return err,
     };
 
     args.done_with_host_buffer = ready_event();

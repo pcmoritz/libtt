@@ -1,8 +1,10 @@
 use crate::compiler::Compiler;
-use crate::dispatch::{build_cq_launch, mcast_rects, DevMsgs, DispatchCommand};
+use crate::dispatch::{build_cq_launch, mcast_rects, DevMsgs, DispatchCommand, Program};
 use crate::hw::{align_down, align_up, noc_xy, Arc, CoreCoord, TensixL1, TensixMMIO};
+use crate::kernels::kernel::RuntimeArgs;
 use crate::linux::{NocOrdering, PinnedMemory, TlbWindow};
 use crate::log::log;
+use std::collections::HashMap;
 use std::io;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -62,6 +64,7 @@ pub(crate) struct FastDispatcher {
     _pcie_base_guard: PinnedMemory,
     cq_hw: CqSysmem,
     event_id: u32,
+    runtime_templates: HashMap<usize, RuntimeCqTemplate>,
 }
 
 impl FastDispatcher {
@@ -89,18 +92,115 @@ impl FastDispatcher {
             _pcie_base_guard: pcie_base_guard,
             cq_hw,
             event_id: 0,
+            runtime_templates: HashMap::new(),
         })
     }
 
-    pub(crate) fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
-        let cq_commands = lower_ir(commands, go_word(self.dispatch_core));
-        let mut queue = CommandQueue::default();
-        queue.extend(cq_commands)?;
+    pub(crate) fn launch(
+        &mut self,
+        program: &Program,
+        setup: &[DispatchCommand],
+        runtime_args: &RuntimeArgs,
+    ) -> io::Result<()> {
+        let setup_records = relayed_command_records(lower_ir(setup))?;
+        let dispatch_core = self.dispatch_core;
+        let template = match self
+            .runtime_templates
+            .entry(program as *const Program as usize)
+        {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                RuntimeCqTemplate::new(runtime_args, go_word(dispatch_core))?,
+            ),
+        };
+        template.patch_runtime_blobs(runtime_args.blobs());
+
         self.event_id = self.event_id.wrapping_add(1);
-        queue.append(CqCommand::HostEvent(self.event_id))?;
-        self.cq_hw.flush(&queue)?;
+        for record in setup_records {
+            self.cq_hw.issue_write(&record)?;
+        }
+        for record in &template.records_before_runtime {
+            self.cq_hw.issue_write(record)?;
+        }
+        self.cq_hw.issue_write(&template.runtime_record)?;
+        for record in &template.records_after_runtime {
+            self.cq_hw.issue_write(record)?;
+        }
+        let event_record = host_event_record(self.event_id)?;
+        self.cq_hw.issue_write(&event_record)?;
         self.cq_hw
             .wait_completion(self.event_id, Duration::from_secs(10))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeCqTemplate {
+    runtime_blob_start: usize,
+    runtime_blob_stride: usize,
+    records_before_runtime: Vec<Vec<u8>>,
+    runtime_record: Vec<u8>,
+    records_after_runtime: Vec<Vec<u8>>,
+}
+
+impl RuntimeCqTemplate {
+    fn new(runtime_args: &RuntimeArgs, go_word: u32) -> io::Result<Self> {
+        let cores = runtime_args.cores().to_vec();
+        let blob_size = runtime_args.blobs()[0].len();
+        let records_before_runtime = relayed_command_records([
+            CqCommand::WritePackedLarge {
+                rects: mcast_rects(&cores),
+                addr: TensixL1::GO_MSG as usize,
+                data: vec![0, 0, 0, DevMsgs::RUN_MSG_RESET_READ_PTR_FROM_HOST],
+            },
+            CqCommand::WritePackedLarge {
+                rects: mcast_rects(&cores),
+                addr: TensixL1::GO_MSG_INDEX as usize,
+                data: vec![0; size_of::<u32>()],
+            },
+        ])?;
+
+        let (mut runtime_payload, body_start, stride) =
+            write_packed_payload_header(&cores, TensixL1::KERNEL_CONFIG_BASE as usize, blob_size)?;
+        runtime_payload.resize(body_start + stride * cores.len(), 0);
+        let runtime_record = relay_inline(&runtime_payload);
+        let runtime_blob_start = CQ_CMD_SIZE + body_start;
+
+        let records_after_runtime = relayed_command_records([
+            CqCommand::SetGoSignalNocData {
+                cores: cores.clone(),
+            },
+            CqCommand::WaitStream {
+                stream: DONE_STREAM,
+                count: 0,
+                clear: true,
+            },
+            CqCommand::SendGoSignal {
+                go_word,
+                stream: DONE_STREAM,
+                count: 0,
+                num_unicast: cores.len() as u8,
+            },
+            CqCommand::WaitStream {
+                stream: DONE_STREAM,
+                count: cores.len() as u32,
+                clear: true,
+            },
+        ])?;
+
+        Ok(Self {
+            runtime_blob_start,
+            runtime_blob_stride: stride,
+            records_before_runtime,
+            runtime_record,
+            records_after_runtime,
+        })
+    }
+
+    fn patch_runtime_blobs(&mut self, blobs: &[Vec<u8>]) {
+        for (index, blob) in blobs.iter().enumerate() {
+            let start = self.runtime_blob_start + self.runtime_blob_stride * index;
+            self.runtime_record[start..start + blob.len()].copy_from_slice(blob);
+        }
     }
 }
 
@@ -239,30 +339,6 @@ impl CqCommand {
     }
 }
 
-#[derive(Default)]
-struct CommandQueue {
-    stream: Vec<u8>,
-    sizes_16b: Vec<usize>,
-}
-
-impl CommandQueue {
-    fn append(&mut self, cmd: CqCommand) -> io::Result<()> {
-        for payload in cmd.to_records()? {
-            let record = relay_inline(&payload);
-            self.sizes_16b.push(record.len() / CQ_CMD_SIZE);
-            self.stream.extend_from_slice(&record);
-        }
-        Ok(())
-    }
-
-    fn extend(&mut self, cmds: Vec<CqCommand>) -> io::Result<()> {
-        for cmd in cmds {
-            self.append(cmd)?;
-        }
-        Ok(())
-    }
-}
-
 struct CqSysmem {
     sysmem: PinnedMemory,
     noc_local: u64,
@@ -337,16 +413,6 @@ impl CqSysmem {
         cq.sysmem.write32(HOST_CQ_WR_OFF, completion_base_16b)?;
         cq.sysmem.write32(HOST_CQ_RD_OFF, completion_base_16b)?;
         Ok(cq)
-    }
-
-    fn flush(&mut self, queue: &CommandQueue) -> io::Result<()> {
-        let mut offset = 0usize;
-        for &size_16b in &queue.sizes_16b {
-            let size = size_16b * CQ_CMD_SIZE;
-            self.issue_write(&queue.stream[offset..offset + size])?;
-            offset += size;
-        }
-        Ok(())
     }
 
     fn wait_completion(&mut self, event_id: u32, timeout: Duration) -> io::Result<()> {
@@ -443,7 +509,7 @@ fn new_sysmem(path: &Path, size: usize, label: &str) -> io::Result<PinnedMemory>
     })
 }
 
-fn lower_ir(commands: &[DispatchCommand], go_word: u32) -> Vec<CqCommand> {
+fn lower_ir(commands: &[DispatchCommand]) -> Vec<CqCommand> {
     let mut result = Vec::new();
     for command in commands {
         match command {
@@ -452,27 +518,6 @@ fn lower_ir(commands: &[DispatchCommand], go_word: u32) -> Vec<CqCommand> {
                     rects: mcast_rects(cores),
                     addr: *addr,
                     data: data.clone(),
-                });
-            }
-            DispatchCommand::Launch { cores } => {
-                result.push(CqCommand::SetGoSignalNocData {
-                    cores: cores.clone(),
-                });
-                result.push(CqCommand::WaitStream {
-                    stream: DONE_STREAM,
-                    count: 0,
-                    clear: true,
-                });
-                result.push(CqCommand::SendGoSignal {
-                    go_word,
-                    stream: DONE_STREAM,
-                    count: 0,
-                    num_unicast: cores.len() as u8,
-                });
-                result.push(CqCommand::WaitStream {
-                    stream: DONE_STREAM,
-                    count: cores.len() as u32,
-                    clear: true,
                 });
             }
         }
@@ -623,6 +668,16 @@ impl CqEncode for CQDispatchWritePackedLargeSubCmd {
     }
 }
 
+impl CqEncode for CQDispatchWritePackedCmd {
+    fn encode(self, out: &mut Vec<u8>) {
+        put_u8(out, self.flags);
+        put_u16(out, self.count);
+        put_u16(out, self.write_offset_index);
+        put_u16(out, self.size);
+        put_u32(out, self.addr);
+    }
+}
+
 impl CqEncode for CQDispatchWritePackedLargeCmd {
     fn encode(self, out: &mut Vec<u8>) {
         put_u8(out, self.type_);
@@ -674,6 +729,59 @@ fn relay_inline(payload: &[u8]) -> Vec<u8> {
     record.extend_from_slice(payload);
     record.resize(stride, 0);
     record
+}
+
+fn relayed_records(cmd: CqCommand) -> io::Result<Vec<Vec<u8>>> {
+    cmd.to_records().map(|records| {
+        records
+            .into_iter()
+            .map(|payload| relay_inline(&payload))
+            .collect()
+    })
+}
+
+fn relayed_command_records(
+    commands: impl IntoIterator<Item = CqCommand>,
+) -> io::Result<Vec<Vec<u8>>> {
+    let mut records = Vec::new();
+    for command in commands {
+        records.extend(relayed_records(command)?);
+    }
+    Ok(records)
+}
+
+fn host_event_record(event_id: u32) -> io::Result<Vec<u8>> {
+    let mut records = relayed_records(CqCommand::HostEvent(event_id))?;
+    records
+        .pop()
+        .ok_or_else(|| io::Error::other("host event did not produce a CQ record"))
+}
+
+fn write_packed_payload_header(
+    cores: &[CoreCoord],
+    addr: usize,
+    blob_size: usize,
+) -> io::Result<(Vec<u8>, usize, usize)> {
+    let mut record = cq_record(
+        CQDispatchCmdId::CQ_DISPATCH_CMD_WRITE_PACKED as u8,
+        CQDispatchWritePackedCmd {
+            flags: CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_NONE as u8,
+            count: u16::try_from(cores.len())
+                .map_err(|_| io::Error::other("too many CQ packed writes"))?,
+            write_offset_index: 0,
+            size: u16::try_from(blob_size)
+                .map_err(|_| io::Error::other("CQ packed write payload too large"))?,
+            addr: to_u32(addr, "CQ packed write address")?,
+        },
+    );
+    for core in cores {
+        put_u32(&mut record, noc_xy(core.x, core.y));
+    }
+    let noc_len = CQ_CMD_SIZE + cores.len() * size_of::<u32>();
+    let body_start = align_up(noc_len as u64, L1_ALIGN as u64) as usize;
+    pad_vec_to(&mut record, body_start);
+    let stride = align_up(blob_size as u64, L1_ALIGN as u64) as usize;
+    Ok((record, body_start, stride))
 }
 
 fn cq_hdr_write_packed_large(count: usize) -> io::Result<Vec<u8>> {

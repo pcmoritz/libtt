@@ -1,6 +1,7 @@
 use crate::compiler::{CompiledKernel, Compiler};
 use crate::dram::DType;
 use crate::hw::{align_up, Arc, CoreCoord, TensixL1};
+use crate::kernels::kernel::RuntimeArgs;
 use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::BTreeSet;
 use std::io;
@@ -67,16 +68,10 @@ struct CircularBufferConfigMsg {
     page_size: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum MathFidelity {
     LoFi = 0,
     HiFi2 = 2,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CoreSelection {
-    Count(usize),
-    All,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,45 +93,50 @@ impl CBConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
-    pub cores: CoreSelection,
     pub reader_kernel: String,
     pub compute_kernel: String,
     pub writer_kernel: String,
-    pub cbs: Vec<CBConfig>,
     pub name: String,
-    pub reader_args: Vec<u32>,
-    pub writer_args: Vec<u32>,
-    pub compute_args: Vec<u32>,
-    pub semaphores: usize,
+    pub compile: CompileConfig,
+    pub reader_recv_kernel: String,
+    pub writer_recv_kernel: String,
+    pub grid: Option<(Vec<u8>, Vec<u8>)>,
+    pub(crate) runtime_args: RuntimeArgs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompileConfig {
+    pub cbs: Vec<CBConfig>,
     pub math_fidelity: MathFidelity,
     pub approx: bool,
     pub dst_accum_mode: bool,
     pub dst_full_sync: bool,
-    pub reader_recv_kernel: String,
-    pub writer_recv_kernel: String,
-    pub grid: Option<(Vec<u8>, Vec<u8>)>,
 }
 
-impl Default for Program {
+impl Default for CompileConfig {
     fn default() -> Self {
         Self {
-            cores: CoreSelection::Count(1),
-            reader_kernel: String::new(),
-            compute_kernel: String::new(),
-            writer_kernel: String::new(),
             cbs: Vec::new(),
-            name: String::new(),
-            reader_args: Vec::new(),
-            writer_args: Vec::new(),
-            compute_args: Vec::new(),
-            semaphores: 0,
             math_fidelity: MathFidelity::HiFi2,
             approx: false,
             dst_accum_mode: false,
             dst_full_sync: false,
+        }
+    }
+}
+
+impl Program {
+    pub(crate) fn new(runtime_args: RuntimeArgs) -> Self {
+        Self {
+            reader_kernel: String::new(),
+            compute_kernel: String::new(),
+            writer_kernel: String::new(),
+            name: String::new(),
+            compile: CompileConfig::default(),
             reader_recv_kernel: String::new(),
             writer_recv_kernel: String::new(),
             grid: None,
+            runtime_args,
         }
     }
 }
@@ -147,9 +147,6 @@ pub(crate) enum DispatchCommand {
         cores: Vec<CoreCoord>,
         addr: usize,
         data: Vec<u8>,
-    },
-    Launch {
-        cores: Vec<CoreCoord>,
     },
 }
 
@@ -164,44 +161,100 @@ impl SlowDispatcher {
         })
     }
 
-    pub(crate) fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
+    pub(crate) fn launch(
+        &mut self,
+        setup: &[DispatchCommand],
+        runtime_args: &RuntimeArgs,
+    ) -> io::Result<()> {
+        self.execute_setup(setup)?;
+        self.write_runtime_and_launch(runtime_args)
+    }
+
+    fn execute_setup(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
         for command in commands {
             match command {
                 DispatchCommand::Write { cores, addr, data } => {
-                    for (start, end) in mcast_rects(cores) {
-                        self.win.target(start, Some(end), 0, NocOrdering::Strict)?;
-                        self.win.write(*addr, data)?;
-                    }
-                }
-                DispatchCommand::Launch { cores } => {
-                    let go_blob = [0u8, 0u8, 0u8, DevMsgs::RUN_MSG_GO];
-                    for (start, end) in mcast_rects(cores) {
-                        self.win.target(start, Some(end), 0, NocOrdering::Strict)?;
-                        self.win.write(TensixL1::GO_MSG as usize, &go_blob)?;
-                    }
-
-                    for core in cores {
-                        self.win.target(*core, None, 0, NocOrdering::Strict)?;
-                        let deadline = Instant::now() + LAUNCH_TIMEOUT;
-                        loop {
-                            if self.win.read(TensixL1::GO_MSG as usize + 3, 1)?[0]
-                                == DevMsgs::RUN_MSG_DONE
-                            {
-                                break;
-                            }
-                            if Instant::now() > deadline {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::TimedOut,
-                                    format!("timeout waiting for core {core}"),
-                                ));
-                            }
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                    }
+                    self.write_mcast(cores, *addr, data)?;
                 }
             }
         }
 
+        Ok(())
+    }
+
+    fn write_runtime_and_launch(&mut self, runtime_args: &RuntimeArgs) -> io::Result<()> {
+        let cores = runtime_args.cores();
+        self.write_mcast(
+            cores,
+            TensixL1::GO_MSG as usize,
+            &[0, 0, 0, DevMsgs::RUN_MSG_RESET_READ_PTR_FROM_HOST],
+        )?;
+        self.write_mcast(
+            cores,
+            TensixL1::GO_MSG_INDEX as usize,
+            &[0; size_of::<u32>()],
+        )?;
+        if runtime_args.blobs().iter().any(|blob| !blob.is_empty()) {
+            self.write_packed(
+                cores,
+                TensixL1::KERNEL_CONFIG_BASE as usize,
+                runtime_args.blobs(),
+            )?;
+        }
+        self.launch_cores(cores)
+    }
+
+    fn write_mcast(&mut self, cores: &[CoreCoord], addr: usize, data: &[u8]) -> io::Result<()> {
+        for (start, end) in mcast_rects(cores) {
+            self.win.target(start, Some(end), 0, NocOrdering::Strict)?;
+            self.win.write(addr, data)?;
+        }
+        Ok(())
+    }
+
+    fn write_packed(
+        &mut self,
+        cores: &[CoreCoord],
+        addr: usize,
+        data: &[Vec<u8>],
+    ) -> io::Result<()> {
+        if cores.len() != data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "packed write core/data length mismatch: {} != {}",
+                    cores.len(),
+                    data.len()
+                ),
+            ));
+        }
+        for (core, data) in cores.iter().zip(data) {
+            self.win.target(*core, None, 0, NocOrdering::Strict)?;
+            self.win.write(addr, data)?;
+        }
+        Ok(())
+    }
+
+    fn launch_cores(&mut self, cores: &[CoreCoord]) -> io::Result<()> {
+        let go_blob = [0u8, 0u8, 0u8, DevMsgs::RUN_MSG_GO];
+        self.write_mcast(cores, TensixL1::GO_MSG as usize, &go_blob)?;
+
+        for core in cores {
+            self.win.target(*core, None, 0, NocOrdering::Strict)?;
+            let deadline = Instant::now() + LAUNCH_TIMEOUT;
+            loop {
+                if self.win.read(TensixL1::GO_MSG as usize + 3, 1)?[0] == DevMsgs::RUN_MSG_DONE {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("timeout waiting for core {core}"),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
         Ok(())
     }
 }
@@ -225,7 +278,7 @@ struct LaunchLayout {
     dispatch_mode: u8,
 }
 
-pub(crate) fn build_dispatch_plan(
+pub(crate) fn build_dispatch_setup_plan(
     compiler: &Compiler,
     available_cores: &[CoreCoord],
     program: &Program,
@@ -255,42 +308,9 @@ pub(crate) fn build_dispatch_plan(
         ));
     }
 
-    let rta_sizes = (
-        program.writer_args.len() * size_of::<u32>(),
-        program.reader_args.len() * size_of::<u32>(),
-        program.compute_args.len() * size_of::<u32>(),
-    );
-    let rta_total = rta_sizes.0 + rta_sizes.1 + rta_sizes.2;
-    let sem_off = align_up(rta_total as u64, L1_ALIGN as u64) as usize;
-    let rta_blob = pack_rta(
-        &program.writer_args,
-        &program.reader_args,
-        &program.compute_args,
-        program.semaphores,
-        sem_off,
-    );
-
-    let mut commands = vec![
-        DispatchCommand::Write {
-            cores: all_cores.clone(),
-            addr: TensixL1::GO_MSG as usize,
-            data: vec![0, 0, 0, DevMsgs::RUN_MSG_RESET_READ_PTR_FROM_HOST],
-        },
-        DispatchCommand::Write {
-            cores: all_cores.clone(),
-            addr: TensixL1::GO_MSG_INDEX as usize,
-            data: vec![0; size_of::<u32>()],
-        },
-    ];
-
-    if !rta_blob.is_empty() {
-        commands.push(DispatchCommand::Write {
-            cores: all_cores.clone(),
-            addr: TensixL1::KERNEL_CONFIG_BASE as usize,
-            data: rta_blob,
-        });
-    }
-
+    let rta_sizes = program.runtime_args.section_sizes();
+    let sem_off = program.runtime_args.sem_offset();
+    let mut commands = Vec::new();
     for role in roles {
         let (shared_addr, shared_blob, launch_blob) = build_payload(
             program,
@@ -315,10 +335,6 @@ pub(crate) fn build_dispatch_plan(
             });
         }
     }
-
-    commands.push(DispatchCommand::Launch {
-        cores: all_cores.clone(),
-    });
 
     Ok(commands)
 }
@@ -414,10 +430,16 @@ fn build_roles(
 
         Ok((all_cores, roles))
     } else {
-        let all_cores = match program.cores {
-            CoreSelection::Count(count) => available_cores.iter().copied().take(count).collect(),
-            CoreSelection::All => available_cores.to_vec(),
-        };
+        let available = available_cores.iter().copied().collect::<BTreeSet<_>>();
+        let all_cores = program.runtime_args.cores().to_vec();
+        for core in &all_cores {
+            if !available.contains(core) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("runtime args core {core} is not available on this device"),
+                ));
+            }
+        }
         Ok((
             all_cores.clone(),
             vec![Role {
@@ -429,7 +451,7 @@ fn build_roles(
     }
 }
 
-fn pack_rta(
+pub(crate) fn pack_rta(
     writer_args: &[u32],
     reader_args: &[u32],
     compute_args: &[u32],
@@ -470,11 +492,11 @@ fn build_payload(
     let rta_offsets = [0usize, rta_sizes.0, rta_sizes.0 + rta_sizes.1];
     let local_cb_off = align_up(
         sem_off
-            .checked_add(program.semaphores * L1_ALIGN as usize)
+            .checked_add(program.runtime_args.semaphores() * L1_ALIGN as usize)
             .ok_or_else(|| io::Error::other("local CB offset overflow"))? as u64,
         L1_ALIGN as u64,
     ) as usize;
-    let (local_cb_mask, cb_blob) = build_cb_blob(program)?;
+    let (local_cb_mask, cb_blob) = build_cb_blob(&program.compile)?;
     let remote_cb_off = local_cb_off
         .checked_add(cb_blob.len())
         .ok_or_else(|| io::Error::other("remote CB offset overflow"))?;
@@ -535,46 +557,73 @@ fn build_payload(
     Ok((shared_addr, shared, launch_blob))
 }
 
-fn build_cb_blob(program: &Program) -> io::Result<(u32, Vec<u8>)> {
-    if program.cbs.is_empty() {
+fn build_cb_blob(config: &CompileConfig) -> io::Result<(u32, Vec<u8>)> {
+    if config.cbs.is_empty() {
         return Ok((0, Vec::new()));
     }
 
     const MAX_CIRCULAR_BUFFERS: usize = u32::BITS as usize;
     let mut mask = 0u32;
     let mut entries = 0usize;
-    for cb in &program.cbs {
+    let mut group_sizes = [0u32; MAX_CIRCULAR_BUFFERS];
+    for cb in &config.cbs {
         if cb.index >= MAX_CIRCULAR_BUFFERS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("circular buffer index {} is out of range", cb.index),
             ));
         }
+        let size = cb_size(cb)?;
+        let group = cb_allocation_group(cb.index);
+        group_sizes[group] = group_sizes[group].max(size);
         mask |= 1u32 << cb.index;
         entries = entries.max(cb.index + 1);
     }
     let mut configs = vec![CircularBufferConfigMsg::default(); entries];
     let mut next_addr = TensixL1::DATA_BUFFER_SPACE_BASE;
+    let mut group_addrs = [None; MAX_CIRCULAR_BUFFERS];
 
-    for cb in &program.cbs {
+    for cb in &config.cbs {
         let page_size = to_u32(cb.dtype.tile_size(), "circular buffer page size")?;
+        let tiles = to_u32(cb.tiles, "circular buffer tiles")?;
         let size = page_size
-            .checked_mul(to_u32(cb.tiles, "circular buffer tile count")?)
+            .checked_mul(tiles)
             .ok_or_else(|| io::Error::other("circular buffer size overflow"))?;
-        let addr = next_addr;
-        next_addr = next_addr
-            .checked_add(size)
-            .ok_or_else(|| io::Error::other("circular buffer address overflow"))?;
+        let group = cb_allocation_group(cb.index);
+        let addr = match group_addrs[group] {
+            Some(addr) => addr,
+            None => {
+                let addr = next_addr;
+                next_addr = next_addr
+                    .checked_add(group_sizes[group])
+                    .ok_or_else(|| io::Error::other("circular buffer address overflow"))?;
+                group_addrs[group] = Some(addr);
+                addr
+            }
+        };
 
         configs[cb.index] = CircularBufferConfigMsg {
             addr,
             size,
-            tiles: to_u32(cb.tiles, "circular buffer tiles")?,
+            tiles,
             page_size,
         };
     }
 
     Ok((mask, as_bytes(configs.as_slice())))
+}
+
+fn cb_size(cb: &CBConfig) -> io::Result<u32> {
+    to_u32(cb.dtype.tile_size(), "circular buffer page size")?
+        .checked_mul(to_u32(cb.tiles, "circular buffer tile count")?)
+        .ok_or_else(|| io::Error::other("circular buffer size overflow"))
+}
+
+fn cb_allocation_group(index: usize) -> usize {
+    match index {
+        16 | 24 => 16,
+        _ => index,
+    }
 }
 
 fn serialize_launch(layout: LaunchLayout) -> io::Result<Vec<u8>> {
@@ -752,6 +801,7 @@ pub(crate) fn mcast_rects(cores: &[CoreCoord]) -> Vec<(CoreCoord, CoreCoord)> {
 mod tests {
     use super::*;
     use crate::dram::DType;
+    use crate::kernels::kernel::RuntimeArgsBuilder;
 
     fn dummy_kernel(fill: u8, len: usize) -> CompiledKernel {
         CompiledKernel {
@@ -771,7 +821,7 @@ mod tests {
 
     #[test]
     fn build_cb_blob_packs_buffers() {
-        let program = Program {
+        let config = CompileConfig {
             cbs: vec![
                 CBConfig {
                     index: 0,
@@ -789,10 +839,10 @@ mod tests {
                     tiles: 1,
                 },
             ],
-            ..Program::default()
+            ..CompileConfig::default()
         };
 
-        let (mask, blob) = build_cb_blob(&program).expect("cb blob");
+        let (mask, blob) = build_cb_blob(&config).expect("cb blob");
         let cb0_size = (DType::Float16.tile_size() * 2) as u32;
         let cb16_size = DType::Float16B.tile_size() as u32;
         assert_eq!(mask, (1 << 0) | (1 << 16) | (1 << 24));
@@ -804,8 +854,9 @@ mod tests {
         );
         assert_eq!(
             read_u32(&blob, 24 * 16),
-            TensixL1::DATA_BUFFER_SPACE_BASE + cb0_size + cb16_size
+            TensixL1::DATA_BUFFER_SPACE_BASE + cb0_size
         );
+        assert_eq!(read_u32(&blob, 24 * 16 + 4), cb16_size);
     }
 
     #[test]
@@ -817,20 +868,20 @@ mod tests {
             dummy_kernel(0x44, 18),
             dummy_kernel(0x55, 20),
         );
+        let mut runtime_args = RuntimeArgsBuilder::new(2, Vec::new(), Vec::new(), Vec::new());
+        runtime_args
+            .add_core(CoreCoord { x: 1, y: 2 }, vec![1, 2], vec![3], vec![4, 5, 6])
+            .expect("add core");
         let program = Program {
-            cbs: vec![CBConfig::new(0, DType::Float16B)],
-            writer_args: vec![1, 2],
-            reader_args: vec![3],
-            compute_args: vec![4, 5, 6],
-            semaphores: 2,
-            math_fidelity: MathFidelity::HiFi2,
-            ..Program::default()
+            compile: CompileConfig {
+                cbs: vec![CBConfig::new(0, DType::Float16B)],
+                math_fidelity: MathFidelity::HiFi2,
+                ..CompileConfig::default()
+            },
+            ..Program::new(runtime_args.build().expect("runtime args"))
         };
-        let rta_sizes = (8, 4, 12);
-        let sem_off = align_up(
-            (rta_sizes.0 + rta_sizes.1 + rta_sizes.2) as u64,
-            L1_ALIGN as u64,
-        ) as usize;
+        let rta_sizes = program.runtime_args.section_sizes();
+        let sem_off = program.runtime_args.sem_offset();
 
         let (shared_addr, shared, launch) = build_payload(
             &program,
@@ -862,7 +913,7 @@ mod tests {
         assert_eq!(read_u32(&launch, 76), 0b1_1111);
         assert_eq!(shared_addr, TensixL1::KERNEL_CONFIG_BASE + 64);
         assert_eq!(shared.len(), 176);
-        assert_eq!(&shared[0..16], &build_cb_blob(&program).unwrap().1);
+        assert_eq!(&shared[0..16], &build_cb_blob(&program.compile).unwrap().1);
         assert_eq!(&shared[16..47], &writer.xip);
         assert_eq!(&shared[48..67], &reader.xip);
     }

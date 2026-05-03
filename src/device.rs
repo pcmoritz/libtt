@@ -1,10 +1,11 @@
 use crate::compiler::Compiler;
 use crate::cq::FastDispatcher;
 use crate::dispatch::{
-    build_dispatch_plan, mcast_rects, DevMsgs, DispatchCommand, Program, SlowDispatcher,
+    build_dispatch_setup_plan, mcast_rects, DevMsgs, DispatchCommand, Program, SlowDispatcher,
 };
 use crate::dram::{Allocator, DType, DramBuffer};
 use crate::hw::{align_down, worker_cores, Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO};
+use crate::kernels::kernel::RuntimeArgs;
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
 use std::collections::HashMap;
@@ -12,6 +13,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc as StdArc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -88,6 +90,7 @@ pub struct Device {
     pub(crate) arch: String,
     pub(crate) tensix_core_count: usize,
     pub(crate) all_worker_cores: Vec<CoreCoord>,
+    worker_cores: StdArc<[CoreCoord]>,
     pub(crate) prefetch_core: CoreCoord,
     pub(crate) dispatch_core: CoreCoord,
     pub(crate) harvested_dram_banks: Vec<usize>,
@@ -96,11 +99,24 @@ pub struct Device {
     allocator: Option<Allocator>,
     compiler: Compiler,
     dispatcher: Box<dyn Dispatcher>,
+    cached_program_launches: HashMap<usize, CachedProgramLaunch>,
+    staged_cached_program: Option<usize>,
+}
+
+struct CachedProgramLaunch {
+    setup: Vec<DispatchCommand>,
+    launch_setup: Vec<DispatchCommand>,
+    runtime_args: RuntimeArgs,
 }
 
 trait Dispatcher {
     fn dispatch_mode(&self) -> u8;
-    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()>;
+    fn launch(
+        &mut self,
+        program: &Program,
+        setup: &[DispatchCommand],
+        runtime_args: &RuntimeArgs,
+    ) -> io::Result<()>;
 }
 
 impl Dispatcher for FastDispatcher {
@@ -108,8 +124,13 @@ impl Dispatcher for FastDispatcher {
         DevMsgs::DISPATCH_MODE_DEV
     }
 
-    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
-        FastDispatcher::execute(self, commands)
+    fn launch(
+        &mut self,
+        program: &Program,
+        setup: &[DispatchCommand],
+        runtime_args: &RuntimeArgs,
+    ) -> io::Result<()> {
+        FastDispatcher::launch(self, program, setup, runtime_args)
     }
 }
 
@@ -118,9 +139,27 @@ impl Dispatcher for SlowDispatcher {
         DevMsgs::DISPATCH_MODE_HOST
     }
 
-    fn execute(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
-        SlowDispatcher::execute(self, commands)
+    fn launch(
+        &mut self,
+        _program: &Program,
+        setup: &[DispatchCommand],
+        runtime_args: &RuntimeArgs,
+    ) -> io::Result<()> {
+        SlowDispatcher::launch(self, setup, runtime_args)
     }
+}
+
+fn launch_descriptor_setup(setup: &[DispatchCommand]) -> Vec<DispatchCommand> {
+    setup
+        .iter()
+        .filter(|command| {
+            matches!(
+                command,
+                DispatchCommand::Write { addr, .. } if *addr == TensixL1::LAUNCH as usize
+            )
+        })
+        .cloned()
+        .collect()
 }
 
 impl Device {
@@ -174,6 +213,13 @@ impl Device {
             (config.prefetch.x, config.prefetch.y),
             (config.dispatch.x, config.dispatch.y),
         )?;
+        let mut active_worker_cores = all_worker_cores
+            .iter()
+            .copied()
+            .filter(|core| *core != config.prefetch && *core != config.dispatch)
+            .collect::<Vec<_>>();
+        active_worker_cores.sort_unstable();
+        active_worker_cores.dedup();
         log(format!(
             "device {id} compiler initialized for {}",
             config.name
@@ -190,6 +236,7 @@ impl Device {
             arch: config.name.to_owned(),
             tensix_core_count,
             all_worker_cores,
+            worker_cores: active_worker_cores.into(),
             prefetch_core: config.prefetch,
             dispatch_core: config.dispatch,
             harvested_dram_banks,
@@ -198,6 +245,8 @@ impl Device {
             allocator: None,
             compiler,
             dispatcher,
+            cached_program_launches: HashMap::new(),
+            staged_cached_program: None,
         };
 
         if let Err(err) = info.upload_firmware() {
@@ -220,12 +269,12 @@ impl Device {
         Ok(info)
     }
 
-    pub(crate) fn cores(&self) -> Vec<CoreCoord> {
-        self.all_worker_cores
-            .iter()
-            .copied()
-            .filter(|core| *core != self.prefetch_core && *core != self.dispatch_core)
-            .collect()
+    pub(crate) fn cores_ref(&self) -> &[CoreCoord] {
+        &self.worker_cores
+    }
+
+    pub(crate) fn cores_arc(&self) -> StdArc<[CoreCoord]> {
+        StdArc::clone(&self.worker_cores)
     }
 
     pub(crate) fn device_kind(&self) -> String {
@@ -236,7 +285,7 @@ impl Device {
         let mut parts = vec![format!("board={}", self.arch)];
         parts.push(format!("cores={}", self.tensix_core_count));
         if !self.all_worker_cores.is_empty() {
-            parts.push(format!("workers={}", self.cores().len()));
+            parts.push(format!("workers={}", self.cores_ref().len()));
         }
         if self.active_dram_banks > 0 {
             parts.push(format!("dram_banks={}", self.active_dram_banks));
@@ -290,27 +339,57 @@ impl Device {
         &self.compiler
     }
 
-    pub fn run_program(&mut self, program: &Program) -> io::Result<()> {
-        let worker_cores = self.cores();
-        let dispatch_mode = self.dispatcher.dispatch_mode();
-        let commands = build_dispatch_plan(
-            &self.compiler,
-            &worker_cores,
-            program,
-            dispatch_mode,
-        )?;
-        self.dispatcher.execute(&commands)
+    pub(crate) fn run_cached_program(
+        &mut self,
+        program: StdArc<Program>,
+        update_runtime_args: impl FnOnce(&mut RuntimeArgs) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let program_id = StdArc::as_ptr(&program) as usize;
+        let is_staged = self.staged_cached_program == Some(program_id);
+
+        if !self.cached_program_launches.contains_key(&program_id) {
+            let setup = build_dispatch_setup_plan(
+                &self.compiler,
+                self.cores_ref(),
+                &program,
+                self.dispatcher.dispatch_mode(),
+            )?;
+            let launch_setup = launch_descriptor_setup(&setup);
+            self.cached_program_launches.insert(
+                program_id,
+                CachedProgramLaunch {
+                    setup,
+                    launch_setup,
+                    runtime_args: program.runtime_args.clone(),
+                },
+            );
+        }
+
+        let launch = self
+            .cached_program_launches
+            .get_mut(&program_id)
+            .expect("cached program launch was just inserted");
+        update_runtime_args(&mut launch.runtime_args)?;
+        let setup = if is_staged {
+            launch.launch_setup.as_slice()
+        } else {
+            launch.setup.as_slice()
+        };
+        self.dispatcher
+            .launch(&program, setup, &launch.runtime_args)?;
+        self.staged_cached_program = Some(program_id);
+        Ok(())
     }
 
     pub fn alloc(
         &mut self,
         num_tiles: usize,
         dtype: DType,
-        shape: Option<&[usize]>,
+        shape: &[usize],
         name: impl Into<String>,
     ) -> io::Result<DramBuffer> {
         self.allocator_mut()?
-            .alloc(num_tiles, dtype, name, shape.map(|dims| dims.to_vec()))
+            .alloc(num_tiles, dtype, name, shape.to_vec())
     }
 
     pub fn alloc_write(
@@ -721,14 +800,14 @@ mod tests {
         assert_eq!(device.arch, "p100");
         assert_eq!(device.tensix_core_count, 120);
         assert_eq!(device.all_worker_cores.len(), 120);
-        assert_eq!(device.cores().len(), 118);
+        assert_eq!(device.cores_ref().len(), 118);
         assert_eq!(device.prefetch_core, CoreCoord { x: 14, y: 2 });
         assert_eq!(device.dispatch_core, CoreCoord { x: 14, y: 3 });
         assert_eq!(device.harvested_dram_banks, vec![7]);
         assert_eq!(device.active_dram_banks, 7);
         assert_eq!(device.dram_tiles.len(), 21);
-        assert!(!device.cores().contains(&CoreCoord { x: 14, y: 2 }));
-        assert!(!device.cores().contains(&CoreCoord { x: 14, y: 3 }));
+        assert!(!device.cores_ref().contains(&CoreCoord { x: 14, y: 2 }));
+        assert!(!device.cores_ref().contains(&CoreCoord { x: 14, y: 3 }));
     }
 
     #[test]
@@ -747,7 +826,7 @@ mod tests {
         assert_eq!(device.board, BoardKind::P150);
         assert_eq!(device.tensix_core_count, 140);
         assert_eq!(device.all_worker_cores.len(), 140);
-        assert_eq!(device.cores().len(), 138);
+        assert_eq!(device.cores_ref().len(), 138);
         assert_eq!(device.active_dram_banks, 8);
         assert!(device.harvested_dram_banks.is_empty());
         assert_eq!(device.dram_tiles.len(), 24);

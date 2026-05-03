@@ -1,5 +1,5 @@
 use crate::device::Device;
-use crate::dispatch::Program;
+use crate::dispatch::{CompileConfig, Program};
 use crate::dram::DType;
 use crate::hw::TensixL1;
 use crate::log::log;
@@ -178,7 +178,7 @@ struct BuildRequest<'a> {
     opt: &'a str,
     trisc: bool,
     xip_relocate: bool,
-    program: &'a Program,
+    compile: &'a CompileConfig,
 }
 
 struct KernelCacheInput<'a> {
@@ -358,7 +358,6 @@ impl Compiler {
         } else {
             Vec::new()
         };
-        let program = Program::default();
         self.compile_kernel(
             src,
             target,
@@ -367,7 +366,7 @@ impl Compiler {
             &[],
             "-O2",
             false,
-            &program,
+            &CompileConfig::default(),
         )
     }
 
@@ -405,7 +404,6 @@ impl Compiler {
         } else {
             Vec::new()
         };
-        let program = Program::default();
         self.build(BuildRequest {
             kernel_source: src,
             target,
@@ -415,7 +413,7 @@ impl Compiler {
             opt: "-O2",
             trisc: false,
             xip_relocate: true,
-            program: &program,
+            compile: &CompileConfig::default(),
         })
     }
 
@@ -452,7 +450,7 @@ impl Compiler {
             &[],
             "-O3",
             true,
-            program,
+            &program.compile,
         )
     }
 
@@ -465,7 +463,7 @@ impl Compiler {
         extra_includes: &[String],
         opt: &str,
         trisc: bool,
-        program: &Program,
+        compile: &CompileConfig,
     ) -> io::Result<CompiledKernel> {
         let mut defines = self.kernel_defines.clone();
         defines.extend(target_defines);
@@ -481,12 +479,12 @@ impl Compiler {
             opt,
             trisc,
             xip_relocate: false,
-            program,
+            compile,
         })
     }
 
     fn build(&self, request: BuildRequest<'_>) -> io::Result<CompiledKernel> {
-        let headers = ckernel_headers(request.program);
+        let headers = ckernel_headers(request.compile);
         let extra_include_files = include_file_inputs(request.extra_includes)?;
 
         let fw = self.firmware.get(request.target).ok_or_else(|| {
@@ -809,9 +807,9 @@ fn device_defines(
     defs
 }
 
-fn ckernel_headers(program: &Program) -> BTreeMap<String, String> {
+fn ckernel_headers(config: &CompileConfig) -> BTreeMap<String, String> {
     let mut formats = vec![DType::Float16B; 32];
-    for cb in &program.cbs {
+    for cb in &config.cbs {
         if cb.index < formats.len() {
             formats[cb.index] = cb.dtype;
         }
@@ -842,7 +840,7 @@ fn ckernel_headers(program: &Program) -> BTreeMap<String, String> {
             .join(", ")
     };
     let cbool = |value: bool| if value { "true" } else { "false" };
-    let dst_sync = if program.dst_full_sync {
+    let dst_sync = if config.dst_full_sync {
         "DstSync::SyncFull"
     } else {
         "DstSync::SyncHalf"
@@ -883,7 +881,7 @@ fn ckernel_headers(program: &Program) -> BTreeMap<String, String> {
             "chlkc_dst_accum_mode.h".to_owned(),
             format!(
                 "#pragma once\nconstexpr bool DST_ACCUM_MODE = {};\n",
-                cbool(program.dst_accum_mode)
+                cbool(config.dst_accum_mode)
             ),
         ),
         (
@@ -894,14 +892,14 @@ fn ckernel_headers(program: &Program) -> BTreeMap<String, String> {
             "chlkc_math_fidelity.h".to_owned(),
             format!(
                 "#pragma once\n#include <cstdint>\nconstexpr std::int32_t MATH_FIDELITY = {};\n",
-                program.math_fidelity as i32
+                config.math_fidelity as i32
             ),
         ),
         (
             "chlkc_math_approx_mode.h".to_owned(),
             format!(
                 "#pragma once\nconstexpr bool APPROX = {};\n",
-                cbool(program.approx)
+                cbool(config.approx)
             ),
         ),
     ])
@@ -1516,7 +1514,7 @@ mod tests {
 
     #[test]
     fn ckernel_headers_reflect_program_formats() {
-        let program = Program {
+        let config = CompileConfig {
             cbs: vec![CBConfig {
                 index: 1,
                 dtype: DType::UInt8,
@@ -1526,10 +1524,10 @@ mod tests {
             dst_accum_mode: true,
             dst_full_sync: true,
             math_fidelity: MathFidelity::LoFi,
-            ..Program::default()
+            ..CompileConfig::default()
         };
 
-        let headers = ckernel_headers(&program);
+        let headers = ckernel_headers(&config);
         assert!(headers["chlkc_unpack_data_format.h"].contains("30"));
         assert!(headers["chlkc_dst_accum_mode.h"].contains("true"));
         assert!(headers["chlkc_dst_sync_mode.h"].contains("DstSync::SyncFull"));
