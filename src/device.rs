@@ -104,10 +104,11 @@ pub struct Device {
 
 trait Dispatcher {
     fn dispatch_mode(&self) -> u8;
-    // Non-empty setup commands mean a new program was staged; an empty setup
-    // means the previously staged program is launching with patched runtime args.
-    // The program identity is stable across the program cache and lets dispatchers
-    // cache generated command templates per program.
+    // Non-empty setup commands stage this program on the device; an empty setup
+    // means this exact Program is already staged and only runtime args changed.
+    // Program identity comes from the kernel program cache, so fast dispatch can
+    // reuse generated runtime command templates when a cached Program is launched
+    // again, even if another program was staged in between.
     fn launch(
         &mut self,
         program: &Program,
