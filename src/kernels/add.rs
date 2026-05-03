@@ -1,5 +1,5 @@
 use crate::device::Device;
-use crate::dispatch::{CBConfig, CompileConfig, CoreSelection, Program};
+use crate::dispatch::{CBConfig, CompileConfig, Program};
 use crate::dram::{DType, DramBuffer};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
@@ -123,7 +123,6 @@ fn bf16_program(key: AddProgramKey) -> io::Result<Program> {
     )?;
     let runtime_args = runtime_args.build()?;
     Ok(Program {
-        cores: CoreSelection::Count(1),
         reader_kernel: BF16_READER.to_owned(),
         compute_kernel: BF16_COMPUTE.to_owned(),
         writer_kernel: BF16_WRITER.to_owned(),

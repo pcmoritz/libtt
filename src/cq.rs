@@ -135,7 +135,6 @@ impl FastDispatcher {
 
 #[derive(Clone, Debug)]
 struct RuntimeCqTemplate {
-    blob_size: usize,
     runtime_blob_start: usize,
     runtime_blob_stride: usize,
     records_before_runtime: Vec<Vec<u8>>,
@@ -189,7 +188,6 @@ impl RuntimeCqTemplate {
         ])?;
 
         Ok(Self {
-            blob_size,
             runtime_blob_start,
             runtime_blob_stride: stride,
             records_before_runtime,
@@ -201,7 +199,7 @@ impl RuntimeCqTemplate {
     fn patch_runtime_blobs(&mut self, blobs: &[Vec<u8>]) {
         for (index, blob) in blobs.iter().enumerate() {
             let start = self.runtime_blob_start + self.runtime_blob_stride * index;
-            self.runtime_record[start..start + self.blob_size].copy_from_slice(blob);
+            self.runtime_record[start..start + blob.len()].copy_from_slice(blob);
         }
     }
 }

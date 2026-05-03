@@ -74,12 +74,6 @@ pub enum MathFidelity {
     HiFi2 = 2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CoreSelection {
-    Count(usize),
-    All,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CBConfig {
     pub index: usize,
@@ -99,7 +93,6 @@ impl CBConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
-    pub cores: CoreSelection,
     pub reader_kernel: String,
     pub compute_kernel: String,
     pub writer_kernel: String,
@@ -135,7 +128,6 @@ impl Default for CompileConfig {
 impl Program {
     pub(crate) fn new(runtime_args: RuntimeArgs) -> Self {
         Self {
-            cores: CoreSelection::Count(1),
             reader_kernel: String::new(),
             compute_kernel: String::new(),
             writer_kernel: String::new(),
@@ -438,10 +430,16 @@ fn build_roles(
 
         Ok((all_cores, roles))
     } else {
-        let all_cores = match program.cores {
-            CoreSelection::Count(count) => available_cores.iter().copied().take(count).collect(),
-            CoreSelection::All => available_cores.to_vec(),
-        };
+        let available = available_cores.iter().copied().collect::<BTreeSet<_>>();
+        let all_cores = program.runtime_args.cores().to_vec();
+        for core in &all_cores {
+            if !available.contains(core) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("runtime args core {core} is not available on this device"),
+                ));
+            }
+        }
         Ok((
             all_cores.clone(),
             vec![Role {

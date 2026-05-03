@@ -1,5 +1,5 @@
 use crate::device::Device;
-use crate::dispatch::{CBConfig, CompileConfig, CoreSelection, MathFidelity, Program};
+use crate::dispatch::{CBConfig, CompileConfig, MathFidelity, Program};
 use crate::dram::{DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
 use crate::kernels::kernel::{Kernel, RuntimeArgs, RuntimeArgsBuilder};
@@ -424,7 +424,6 @@ fn bf16_program(
     ];
     let runtime_args = lower_runtime_args(plan, logical_mt, logical_nt)?;
     Ok(Program {
-        cores: CoreSelection::All,
         reader_kernel: BF16_READER_SENDER.to_owned(),
         writer_kernel: BF16_WRITER_SENDER.to_owned(),
         compute_kernel: compute_src(plan),

@@ -119,7 +119,7 @@ impl RuntimeArgsBuilder {
     }
 
     pub(crate) fn build(self) -> io::Result<RuntimeArgs> {
-        let Some(layout) = self.per_core.values().next().cloned() else {
+        let Some(layout) = self.per_core.values().next() else {
             return Err(invalid_input("runtime args require at least one core"));
         };
         let semaphores = self.semaphores;
@@ -154,11 +154,6 @@ impl RuntimeArgsBuilder {
                 sem_offset,
             ));
         }
-        let blob_size = blobs[0].len();
-        if blobs.iter().any(|blob| blob.len() != blob_size) {
-            return Err(invalid_input("runtime arg blobs must have a uniform size"));
-        }
-
         Ok(RuntimeArgs {
             cores: cores.into(),
             writer_bytes,
