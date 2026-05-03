@@ -99,20 +99,23 @@ pub struct Device {
     allocator: Option<Allocator>,
     compiler: Compiler,
     dispatcher: Box<dyn Dispatcher>,
-    staged_cached_program: Option<(StdArc<Program>, RuntimeArgs)>,
+    cached_program_launches: HashMap<usize, CachedProgramLaunch>,
+    staged_cached_program: Option<usize>,
+}
+
+struct CachedProgramLaunch {
+    setup: Vec<DispatchCommand>,
+    runtime_args: RuntimeArgs,
 }
 
 trait Dispatcher {
     fn dispatch_mode(&self) -> u8;
-    // Non-empty setup commands stage this program on the device; an empty setup
-    // means this exact Program is already staged and only runtime args changed.
-    // Program identity comes from the kernel program cache, so fast dispatch can
-    // reuse generated runtime command templates when a cached Program is launched
-    // again, even if another program was staged in between.
+    // Some(setup) stages or restages the program; None launches the currently
+    // staged program with updated runtime args.
     fn launch(
         &mut self,
         program: &Program,
-        setup: Vec<DispatchCommand>,
+        setup: Option<Vec<DispatchCommand>>,
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()>;
 }
@@ -125,10 +128,10 @@ impl Dispatcher for FastDispatcher {
     fn launch(
         &mut self,
         program: &Program,
-        setup: Vec<DispatchCommand>,
+        setup: Option<Vec<DispatchCommand>>,
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
-        FastDispatcher::launch(self, program, setup, runtime_args)
+        FastDispatcher::launch(self, program, setup.unwrap_or_default(), runtime_args)
     }
 }
 
@@ -140,10 +143,10 @@ impl Dispatcher for SlowDispatcher {
     fn launch(
         &mut self,
         _program: &Program,
-        setup: Vec<DispatchCommand>,
+        setup: Option<Vec<DispatchCommand>>,
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
-        SlowDispatcher::launch(self, setup, runtime_args)
+        SlowDispatcher::launch(self, setup.unwrap_or_default(), runtime_args)
     }
 }
 
@@ -230,6 +233,7 @@ impl Device {
             allocator: None,
             compiler,
             dispatcher,
+            cached_program_launches: HashMap::new(),
             staged_cached_program: None,
         };
 
@@ -328,22 +332,34 @@ impl Device {
         program: StdArc<Program>,
         update_runtime_args: impl FnOnce(&mut RuntimeArgs) -> io::Result<()>,
     ) -> io::Result<()> {
-        let dispatch_mode = self.dispatcher.dispatch_mode();
-        if let Some((staged_program, staged_runtime_args)) = &mut self.staged_cached_program {
-            if StdArc::ptr_eq(staged_program, &program) {
-                update_runtime_args(staged_runtime_args)?;
-                return self
-                    .dispatcher
-                    .launch(&program, Vec::new(), staged_runtime_args);
-            }
+        let program_id = StdArc::as_ptr(&program) as usize;
+        let is_staged = self.staged_cached_program == Some(program_id);
+
+        if !self.cached_program_launches.contains_key(&program_id) {
+            let setup = build_dispatch_setup_plan(
+                &self.compiler,
+                self.cores_ref(),
+                &program,
+                self.dispatcher.dispatch_mode(),
+            )?;
+            self.cached_program_launches.insert(
+                program_id,
+                CachedProgramLaunch {
+                    setup,
+                    runtime_args: program.runtime_args.clone(),
+                },
+            );
         }
 
-        let mut runtime_args = program.runtime_args.clone();
-        update_runtime_args(&mut runtime_args)?;
-        let commands =
-            build_dispatch_setup_plan(&self.compiler, self.cores_ref(), &program, dispatch_mode)?;
-        self.dispatcher.launch(&program, commands, &runtime_args)?;
-        self.staged_cached_program = Some((program, runtime_args));
+        let launch = self
+            .cached_program_launches
+            .get_mut(&program_id)
+            .expect("cached program launch was just inserted");
+        update_runtime_args(&mut launch.runtime_args)?;
+        let setup = (!is_staged).then(|| launch.setup.clone());
+        self.dispatcher
+            .launch(&program, setup, &launch.runtime_args)?;
+        self.staged_cached_program = Some(program_id);
         Ok(())
     }
 
