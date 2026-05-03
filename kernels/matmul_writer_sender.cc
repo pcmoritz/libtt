@@ -24,18 +24,13 @@ void kernel_main() {
   const uint32_t out_num_sb_h = A(28);
   const uint32_t logical_mt = A(29);
   const uint32_t logical_nt = A(30);
-  const uint32_t out_col_offset = A(32);
+  const uint32_t out_col_offset = A(31);
   volatile tt_l1_ptr uint32_t *sender_sem = SEM(16);
   volatile tt_l1_ptr uint32_t *recv_sem = SEM(17);
   *recv_sem = VALID;
 
   const InterleavedAddrGenFast<true> in1_gen = {
       .bank_base_address = A(0),
-      .page_size = tile_bytes,
-      .data_format = DataFormat::Float16_b,
-  };
-  const InterleavedAddrGenFast<true> zero_gen = {
-      .bank_base_address = A(31),
       .page_size = tile_bytes,
       .data_format = DataFormat::Float16_b,
   };
@@ -55,10 +50,9 @@ void kernel_main() {
     for (uint32_t h = 0; h < block_h; h++) {
       uint32_t tile_id = row;
       for (uint32_t w = 0; w < block_w; w++) {
+        // Padded columns only feed padded outputs, so avoid the out-of-bounds DRAM read.
         if (A(1) + w < logical_nt) {
           noc_async_read_tile(tile_id, in1_gen, l1_addr);
-        } else {
-          noc_async_read_tile(0, zero_gen, l1_addr);
         }
         l1_addr += tile_bytes;
         tile_id += A(2);

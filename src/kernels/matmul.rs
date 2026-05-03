@@ -4,10 +4,9 @@ use crate::dram::{DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
 use crate::kernels::kernel::{Kernel, RuntimeArgs, RuntimeArgsBuilder};
 use crate::log::{enabled as log_enabled, log};
-use std::collections::HashMap;
 use std::env;
 use std::io;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 const BF16_READER_SENDER: &str = include_str!("../../kernels/matmul_reader_sender.cc");
 const BF16_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
@@ -16,12 +15,8 @@ const BF16_WRITER_RECV: &str = include_str!("../../kernels/matmul_writer_recv.cc
 const BF16_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
 const READER_LHS_ADDR_INDEX: usize = 0;
-const READER_ZERO_ADDR_INDEX: usize = 23;
 const WRITER_RHS_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
-const WRITER_ZERO_ADDR_INDEX: usize = 31;
-
-static ZERO_TILE_BY_DEVICE: OnceLock<Mutex<HashMap<usize, DramBuffer>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct MatmulProgramKey {
@@ -92,7 +87,6 @@ struct MatmulBf16Kernel {
     lhs_addr: u32,
     rhs_addr: u32,
     output_addr: u32,
-    zero_addr: u32,
     key: MatmulProgramKey,
 }
 
@@ -121,7 +115,6 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
     fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
         match index {
             READER_LHS_ADDR_INDEX => Some(self.lhs_addr),
-            READER_ZERO_ADDR_INDEX => Some(self.zero_addr),
             _ => None,
         }
     }
@@ -131,7 +124,6 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
         match index {
             WRITER_RHS_ADDR_INDEX => Some(self.rhs_addr),
             WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            WRITER_ZERO_ADDR_INDEX => Some(self.zero_addr),
             _ => None,
         }
     }
@@ -171,7 +163,6 @@ pub(crate) fn matmul_bf16(
     let logical_kt = k / 32;
     let logical_nt = n / 32;
     let math_fidelity = matmul_math_fidelity()?;
-    let zero_tile = cached_zero_tile(device)?;
     let cores = device.cores_arc();
     let output = device.alloc(
         logical_mt * logical_nt,
@@ -190,7 +181,6 @@ pub(crate) fn matmul_bf16(
         lhs_addr: u32_arg(lhs.addr, "lhs address")?,
         rhs_addr: u32_arg(rhs.addr, "rhs address")?,
         output_addr: u32_arg(output.addr, "output address")?,
-        zero_addr: u32_arg(zero_tile.addr, "zero tile address")?,
         key,
     };
     kernel.run(device)?;
@@ -214,30 +204,6 @@ fn log_matmul_plan(plan: &MatmulPlan) {
             plan.out_subblock_w
         ));
     }
-}
-
-fn cached_zero_tile(device: &mut Device) -> io::Result<DramBuffer> {
-    let cache = ZERO_TILE_BY_DEVICE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(buffer) = cache
-        .lock()
-        .map_err(|_| io::Error::other("zero tile cache is poisoned"))?
-        .get(&device.local_hardware_id())
-        .cloned()
-    {
-        return Ok(buffer);
-    }
-
-    let buffer = device.alloc_write(
-        &vec![0u8; DType::Float16B.tile_size()],
-        DType::Float16B,
-        &[32, 32],
-        "matmul_zero_tile",
-    )?;
-    cache
-        .lock()
-        .map_err(|_| io::Error::other("zero tile cache is poisoned"))?
-        .insert(device.local_hardware_id(), buffer.clone());
-    Ok(buffer)
 }
 
 fn shape_2d(buffer: &DramBuffer, name: &str) -> io::Result<(usize, usize)> {
@@ -493,12 +459,8 @@ fn lower_runtime_args(
     let grid = plan_grid(plan);
     let mut runtime_args = RuntimeArgsBuilder::new(
         NUM_SEMAPHORES,
-        vec![
-            WRITER_RHS_ADDR_INDEX,
-            WRITER_OUTPUT_ADDR_INDEX,
-            WRITER_ZERO_ADDR_INDEX,
-        ],
-        vec![READER_LHS_ADDR_INDEX, READER_ZERO_ADDR_INDEX],
+        vec![WRITER_RHS_ADDR_INDEX, WRITER_OUTPUT_ADDR_INDEX],
+        vec![READER_LHS_ADDR_INDEX],
         Vec::new(),
     );
     for (row_index, row) in grid.iter().enumerate() {
@@ -594,7 +556,6 @@ fn reader_args(
         sender.y as u32,
         0,
         1,
-        0,
         u32_value(logical_mt, "logical M tiles")?,
     ]);
     Ok(args)
@@ -656,7 +617,6 @@ fn writer_args(
         u32_value(plan.in0_num_subblocks(), "output num subblocks h")?,
         u32_value(logical_mt, "logical M tiles")?,
         u32_value(logical_nt, "logical N tiles")?,
-        0,
         0,
     ]);
     Ok(args)
@@ -796,8 +756,7 @@ mod tests {
         .expect("east plan");
         let grid = plan_grid(&plan);
         let sender = grid[0][0];
-        let mut builder =
-            RuntimeArgsBuilder::new(0, Vec::new(), vec![READER_ZERO_ADDR_INDEX], Vec::new());
+        let mut builder = RuntimeArgsBuilder::new(0, Vec::new(), Vec::new(), Vec::new());
         let reader = reader_args(&plan, &grid, 0, sender, 128).expect("reader args");
         builder
             .add_core(sender, Vec::new(), reader, Vec::new())
