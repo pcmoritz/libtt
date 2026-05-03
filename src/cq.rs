@@ -1,9 +1,10 @@
 use crate::compiler::Compiler;
-use crate::dispatch::{build_cq_launch, mcast_rects, DevMsgs, DispatchCommand};
+use crate::dispatch::{build_cq_launch, mcast_rects, DevMsgs, DispatchCommand, Program};
 use crate::hw::{align_down, align_up, noc_xy, Arc, CoreCoord, TensixL1, TensixMMIO};
 use crate::kernels::kernel::RuntimeArgs;
 use crate::linux::{NocOrdering, PinnedMemory, TlbWindow};
 use crate::log::log;
+use std::collections::HashMap;
 use std::io;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -63,7 +64,7 @@ pub(crate) struct FastDispatcher {
     _pcie_base_guard: PinnedMemory,
     cq_hw: CqSysmem,
     event_id: u32,
-    runtime_template: Option<RuntimeCqTemplate>,
+    runtime_templates: HashMap<usize, RuntimeCqTemplate>,
 }
 
 impl FastDispatcher {
@@ -91,28 +92,27 @@ impl FastDispatcher {
             _pcie_base_guard: pcie_base_guard,
             cq_hw,
             event_id: 0,
-            runtime_template: None,
+            runtime_templates: HashMap::new(),
         })
     }
 
     pub(crate) fn launch(
         &mut self,
+        program: &Program,
         setup: Vec<DispatchCommand>,
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
-        let setup_records = if setup.is_empty() {
-            Vec::new()
-        } else {
-            self.runtime_template = Some(RuntimeCqTemplate::new(
-                runtime_args,
-                go_word(self.dispatch_core),
-            )?);
-            relayed_command_records(lower_ir(setup))?
+        let setup_records = relayed_command_records(lower_ir(setup))?;
+        let dispatch_core = self.dispatch_core;
+        let template = match self
+            .runtime_templates
+            .entry(program as *const Program as usize)
+        {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                RuntimeCqTemplate::new(runtime_args, go_word(dispatch_core))?,
+            ),
         };
-        let template = self
-            .runtime_template
-            .as_mut()
-            .ok_or_else(|| io::Error::other("fast runtime template is not staged"))?;
         template.patch_runtime_blobs(runtime_args.blobs());
 
         self.event_id = self.event_id.wrapping_add(1);

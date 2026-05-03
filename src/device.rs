@@ -106,8 +106,14 @@ trait Dispatcher {
     fn dispatch_mode(&self) -> u8;
     // Non-empty setup commands mean a new program was staged; an empty setup
     // means the previously staged program is launching with patched runtime args.
-    fn launch(&mut self, setup: Vec<DispatchCommand>, runtime_args: &RuntimeArgs)
-        -> io::Result<()>;
+    // The program identity is stable across the program cache and lets dispatchers
+    // cache generated command templates per program.
+    fn launch(
+        &mut self,
+        program: &Program,
+        setup: Vec<DispatchCommand>,
+        runtime_args: &RuntimeArgs,
+    ) -> io::Result<()>;
 }
 
 impl Dispatcher for FastDispatcher {
@@ -117,10 +123,11 @@ impl Dispatcher for FastDispatcher {
 
     fn launch(
         &mut self,
+        program: &Program,
         setup: Vec<DispatchCommand>,
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
-        FastDispatcher::launch(self, setup, runtime_args)
+        FastDispatcher::launch(self, program, setup, runtime_args)
     }
 }
 
@@ -131,6 +138,7 @@ impl Dispatcher for SlowDispatcher {
 
     fn launch(
         &mut self,
+        _program: &Program,
         setup: Vec<DispatchCommand>,
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
@@ -323,7 +331,9 @@ impl Device {
         if let Some((staged_program, staged_runtime_args)) = &mut self.staged_cached_program {
             if StdArc::ptr_eq(staged_program, &program) {
                 update_runtime_args(staged_runtime_args)?;
-                return self.dispatcher.launch(Vec::new(), staged_runtime_args);
+                return self
+                    .dispatcher
+                    .launch(&program, Vec::new(), staged_runtime_args);
             }
         }
 
@@ -331,7 +341,7 @@ impl Device {
         update_runtime_args(&mut runtime_args)?;
         let commands =
             build_dispatch_setup_plan(&self.compiler, self.cores_ref(), &program, dispatch_mode)?;
-        self.dispatcher.launch(commands, &runtime_args)?;
+        self.dispatcher.launch(&program, commands, &runtime_args)?;
         self.staged_cached_program = Some((program, runtime_args));
         Ok(())
     }
