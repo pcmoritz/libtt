@@ -42,6 +42,16 @@ message MatmulOp {
   uint32 rhs_id = 2;
 }
 
+message MaxOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+}
+
+message ZeroOp {
+  // Materializes a zero-filled tensor with Op.output_id's metadata.
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -50,6 +60,8 @@ message Op {
     ParameterOp parameter = 2;
     AddOp add = 3;
     MatmulOp matmul = 4;
+    MaxOp max = 5;
+    ZeroOp zero = 6;
   }
 }
 

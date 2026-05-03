@@ -1343,6 +1343,30 @@ fn store_output_buffer(
     Ok(())
 }
 
+fn materialize_zero_buffer(
+    device: &mut Device,
+    value: &executable::ValueDesc,
+    name: impl Into<String>,
+) -> Result<DramBuffer, *mut PJRT_Error> {
+    if value.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+        return Err(unimplemented(
+            "TT executable zero currently only supports bf16 tensors",
+        ));
+    }
+    let shape = dims_i64_to_usize(&value.dims)?;
+    let element_count = shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| invalid_argument("zero tensor shape is too large"))?;
+    let byte_count = element_count
+        .checked_mul(DType::Float16B.bytes_per_element())
+        .ok_or_else(|| invalid_argument("zero tensor byte size is too large"))?;
+    let data = vec![0u8; byte_count];
+    device
+        .alloc_write(&data, DType::Float16B, &shape, name)
+        .map_err(io_error)
+}
+
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
@@ -1448,6 +1472,50 @@ fn execute_executable_v1(
                     "add",
                 )?;
             }
+            executable::Op::Max {
+                input_ids,
+                output_id,
+            } => {
+                let lhs = device_buffer_for_value(&values, input_ids[0], "max.lhs")?;
+                let rhs = device_buffer_for_value(&values, input_ids[1], "max.rhs")?;
+                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                {
+                    return Err(unimplemented(
+                        "TT executable max currently only supports bf16 buffers",
+                    ));
+                }
+                if lhs.dims != rhs.dims {
+                    return Err(invalid_argument(
+                        "TT executable max input shapes must match",
+                    ));
+                }
+
+                let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable max lhs buffer has no device allocation",
+                    ));
+                };
+                let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable max rhs buffer has no device allocation",
+                    ));
+                };
+
+                let output_dims = lhs.dims.clone();
+                let output_dram =
+                    kernels::max::eltwise_max_bf16(device, lhs_dram, rhs_dram, "pjrt_max")
+                        .map_err(io_error)?;
+                store_output_buffer(
+                    &mut values,
+                    plan,
+                    output_id,
+                    output_dims,
+                    output_dram,
+                    &output_context,
+                    "max",
+                )?;
+            }
             executable::Op::Matmul {
                 input_ids,
                 output_id,
@@ -1497,6 +1565,24 @@ fn execute_executable_v1(
                     &output_context,
                     "matmul",
                 )?;
+            }
+            executable::Op::Zero { output_id } => {
+                let output_index = output_id as usize;
+                let expected = plan.values.get(output_index).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable zero output id {output_id} is out of bounds"
+                    ))
+                })?;
+                let output_dram = materialize_zero_buffer(device, expected, "pjrt_zero")?;
+                values[output_index] = Some(PJRT_Buffer {
+                    buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+                    dims: expected.dims.clone(),
+                    device: output_context.device,
+                    memory: output_context.memory,
+                    local_hardware_id: output_context.local_hardware_id,
+                    dram_buffer: Some(output_dram),
+                    deleted: false,
+                });
             }
         }
     }
@@ -2925,6 +3011,77 @@ mod tests {
         assert_eq!(executable.values.len(), 5);
         assert_eq!(executable.ops.len(), 5);
         assert_eq!(executable.output_ids, vec![4]);
+
+        unsafe {
+            drop(Box::from_raw(get_executable_args.executable));
+            drop(Box::from_raw(compile_args.executable));
+            drop(Box::from_raw(client));
+        }
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_feedforward_with_maximum_relu_pattern() {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"mlir".to_vec();
+        let mut code = br#"module {
+  func.func public @main(%arg0: tensor<32x32xbf16>, %arg1: tensor<32x64xbf16>, %arg2: tensor<64x32xbf16>) -> tensor<32x32xbf16> {
+    %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<32x32xbf16>, tensor<32x64xbf16>) -> tensor<32x64xbf16>
+    %cst = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
+    %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<bf16>) -> tensor<32x64xbf16>
+    %2 = stablehlo.maximum %0, %1 : tensor<32x64xbf16>
+    %3 = stablehlo.dot_general %2, %arg2, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<32x64xbf16>, tensor<64x32xbf16>) -> tensor<32x32xbf16>
+    return %3 : tensor<32x32xbf16>
+  }
+}
+"#
+        .to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: code.as_mut_ptr().cast::<c_char>(),
+            code_size: code.len(),
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { compile(&mut compile_args) });
+
+        let get_executable = api
+            .PJRT_LoadedExecutable_GetExecutable
+            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
+        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
+            extension_start: ptr::null_mut(),
+            loaded_executable: compile_args.executable,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+
+        let executable = unsafe { &*get_executable_args.executable }
+            .metadata
+            .executable
+            .as_ref()
+            .expect("compiled executable should contain a TT executable");
+        assert_eq!(executable.output_ids, vec![7]);
+        assert_eq!(executable.ops.len(), 7);
+        assert!(matches!(executable.ops[3], executable::Op::Matmul { .. }));
+        assert!(matches!(executable.ops[4], executable::Op::Zero { .. }));
+        assert!(matches!(executable.ops[5], executable::Op::Max { .. }));
+        assert!(matches!(executable.ops[6], executable::Op::Matmul { .. }));
 
         unsafe {
             drop(Box::from_raw(get_executable_args.executable));

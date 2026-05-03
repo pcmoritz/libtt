@@ -6,9 +6,13 @@
 #include <vector>
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Dialect/Func/Extensions/AllExtensions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -185,6 +189,22 @@ bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& 
     return true;
 }
 
+bool isZeroSplat(mlir::stablehlo::ConstantOp constant_op) {
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
+    if (!dense || !dense.isSplat()) {
+        return false;
+    }
+
+    auto element_type = mlir::cast<mlir::ShapedType>(dense.getType()).getElementType();
+    if (mlir::isa<mlir::FloatType>(element_type)) {
+        return dense.getSplatValue<llvm::APFloat>().isZero();
+    }
+    if (mlir::isa<mlir::IntegerType>(element_type)) {
+        return dense.getSplatValue<llvm::APInt>().isZero();
+    }
+    return false;
+}
+
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -196,6 +216,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     }
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
+    llvm::DenseSet<mlir::Value> zero_values;
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
         uint32_t output_id = 0;
@@ -221,6 +242,36 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto constant_op = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(op)) {
+            uint32_t output_id = 0;
+            if (!addValueDesc(constant_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+            if (!isZeroSplat(constant_op)) {
+                error = "only zero constants are currently supported";
+                return false;
+            }
+            zero_values.insert(constant_op.getResult());
+            continue;
+        }
+
+        if (auto broadcast_op = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(op)) {
+            uint32_t output_id = 0;
+            if (!addValueDesc(broadcast_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+            if (zero_values.contains(broadcast_op.getOperand())) {
+                auto* zero = executable.add_ops();
+                zero->set_output_id(output_id);
+                zero->mutable_zero();
+                zero_values.insert(broadcast_op.getResult());
+            } else {
+                error = "only broadcast_in_dim of zero constants is currently supported";
+                return false;
+            }
+            continue;
+        }
+
         if (auto add_op = mlir::dyn_cast<mlir::stablehlo::AddOp>(op)) {
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;
@@ -235,6 +286,23 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             add->set_output_id(output_id);
             add->mutable_add()->set_lhs_id(lhs_id);
             add->mutable_add()->set_rhs_id(rhs_id);
+            continue;
+        }
+
+        if (auto max_op = mlir::dyn_cast<mlir::stablehlo::MaxOp>(op)) {
+            uint32_t lhs_id = 0;
+            uint32_t rhs_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(max_op.getLhs(), executable, value_ids, error, lhs_id) ||
+                !addValueDesc(max_op.getRhs(), executable, value_ids, error, rhs_id) ||
+                !addValueDesc(max_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* max = executable.add_ops();
+            max->set_output_id(output_id);
+            max->mutable_max()->set_lhs_id(lhs_id);
+            max->mutable_max()->set_rhs_id(rhs_id);
             continue;
         }
 
