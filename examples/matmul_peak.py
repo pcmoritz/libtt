@@ -16,6 +16,8 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--validate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--rtol", type=float, default=0.05)
+    parser.add_argument("--atol", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -33,6 +35,17 @@ def make_inputs(m, k, n):
     col_pattern = (np.arange(n, dtype=np.float32) % 19 - 9).reshape(1, n)
     b_host = (k_pattern - col_pattern) / np.float32(16.0)
     return a_host.astype(np.float32), b_host.astype(np.float32)
+
+
+def validate_output(name, out, expected, rtol, atol):
+    if not np.allclose(out, expected, rtol=rtol, atol=atol):
+        diff = np.abs(out - expected)
+        max_index = np.unravel_index(np.argmax(np.nan_to_num(diff, nan=np.inf)), diff.shape)
+        raise SystemExit(
+            f"{name} validation failed: "
+            f"max_abs={float(diff[max_index])} at {max_index}, "
+            f"got={float(out[max_index])}, expected={float(expected[max_index])}"
+        )
 
 
 def main():
@@ -64,18 +77,18 @@ def main():
 
     if args.validate:
         out = np.asarray(result, dtype=np.float32)
-        expected = np.asarray(
-            jnp.asarray(a_host, dtype=jnp.bfloat16) @ jnp.asarray(b_host, dtype=jnp.bfloat16),
-            dtype=np.float32,
+        expected = a_host @ b_host
+        validate_output("timed result", out, expected, args.rtol, args.atol)
+
+        a_check = jnp.asarray(-a_host, dtype=jnp.bfloat16)
+        check = matmul(a_check, b).block_until_ready()
+        validate_output(
+            "fresh result",
+            np.asarray(check, dtype=np.float32),
+            -expected,
+            args.rtol,
+            args.atol,
         )
-        if not np.allclose(out, expected, rtol=0.02, atol=0.5):
-            diff = np.abs(out - expected)
-            max_index = np.unravel_index(np.argmax(diff), diff.shape)
-            raise SystemExit(
-                "validation failed: "
-                f"max_abs={float(diff[max_index])} at {max_index}, "
-                f"got={float(out[max_index])}, expected={float(expected[max_index])}"
-            )
 
     ops = 2 * args.m * args.k * args.n
     best = min(times)

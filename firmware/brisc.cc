@@ -404,8 +404,6 @@ int main() {
             mailboxes->go_messages[go_message_index].signal = RUN_MSG_DONE;
 
             if (launch_msg_address->kernel_config.mode == DISPATCH_MODE_DEV) {
-                launch_msg_address->kernel_config.enables = 0;
-                launch_msg_address->kernel_config.preload = 0;
                 uint64_t dispatch_addr = calculate_dispatch_addr(&mailboxes->go_messages[go_message_index]);
                 DEBUG_SANITIZE_NOC_ADDR(noc_index, dispatch_addr, 4);
                 CLEAR_PREVIOUS_LAUNCH_MESSAGE_ENTRY_FOR_WATCHER();
