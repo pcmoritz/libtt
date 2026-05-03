@@ -14,6 +14,11 @@ static PROGRAM_CACHE: OnceLock<Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeArgs {
     cores: Arc<[CoreCoord]>,
+    writer_bytes: usize,
+    reader_bytes: usize,
+    compute_bytes: usize,
+    semaphores: usize,
+    sem_offset: usize,
     writer_patches: Arc<[RuntimeArgPatchGroup]>,
     reader_patches: Arc<[RuntimeArgPatchGroup]>,
     compute_patches: Arc<[RuntimeArgPatchGroup]>,
@@ -27,6 +32,18 @@ impl RuntimeArgs {
 
     pub(crate) fn blobs(&self) -> &[Vec<u8>] {
         &self.blobs
+    }
+
+    pub(crate) fn section_sizes(&self) -> (usize, usize, usize) {
+        (self.writer_bytes, self.reader_bytes, self.compute_bytes)
+    }
+
+    pub(crate) fn semaphores(&self) -> usize {
+        self.semaphores
+    }
+
+    pub(crate) fn sem_offset(&self) -> usize {
+        self.sem_offset
     }
 
     #[inline]
@@ -101,18 +118,15 @@ impl RuntimeArgsBuilder {
         }
     }
 
-    pub(crate) fn build(self) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>, usize)> {
+    pub(crate) fn build(self) -> io::Result<RuntimeArgs> {
         let Some(layout) = self.per_core.values().next().cloned() else {
             return Err(invalid_input("runtime args require at least one core"));
         };
         let semaphores = self.semaphores;
-        let writer_args = layout.writer.clone();
-        let reader_args = layout.reader.clone();
-        let compute_args = layout.compute.clone();
         let writer_bytes = layout.writer.len() * size_of::<u32>();
         let reader_bytes = layout.reader.len() * size_of::<u32>();
         let compute_bytes = layout.compute.len() * size_of::<u32>();
-        let sem_off = align16(writer_bytes + reader_bytes + compute_bytes);
+        let sem_offset = align16(writer_bytes + reader_bytes + compute_bytes);
 
         let writer_patches = section_patches(&self.writer_dynamic_indices, 0);
         let reader_patches = section_patches(&self.reader_dynamic_indices, writer_bytes);
@@ -123,9 +137,9 @@ impl RuntimeArgsBuilder {
         let mut blobs = Vec::with_capacity(self.per_core.len());
 
         for (core, args) in self.per_core {
-            if args.writer.len() != writer_args.len()
-                || args.reader.len() != reader_args.len()
-                || args.compute.len() != compute_args.len()
+            if args.writer.len() * size_of::<u32>() != writer_bytes
+                || args.reader.len() * size_of::<u32>() != reader_bytes
+                || args.compute.len() * size_of::<u32>() != compute_bytes
             {
                 return Err(invalid_input(format!(
                     "runtime arg section lengths for core {core} do not match the first core"
@@ -137,7 +151,7 @@ impl RuntimeArgsBuilder {
                 &args.reader,
                 &args.compute,
                 semaphores,
-                sem_off,
+                sem_offset,
             ));
         }
         let blob_size = blobs[0].len();
@@ -145,21 +159,18 @@ impl RuntimeArgsBuilder {
             return Err(invalid_input("runtime arg blobs must have a uniform size"));
         }
 
-        let runtime_args = RuntimeArgs {
+        Ok(RuntimeArgs {
             cores: cores.into(),
+            writer_bytes,
+            reader_bytes,
+            compute_bytes,
+            semaphores,
+            sem_offset,
             writer_patches: writer_patches.into(),
             reader_patches: reader_patches.into(),
             compute_patches: compute_patches.into(),
             blobs,
-        };
-
-        Ok((
-            runtime_args,
-            writer_args,
-            reader_args,
-            compute_args,
-            semaphores,
-        ))
+        })
     }
 }
 
@@ -312,7 +323,7 @@ mod tests {
             .add_core(CoreCoord { x: 1, y: 2 }, vec![7, 0], vec![0, 9], Vec::new())
             .expect("add core");
 
-        let mut runtime_args = builder.build().expect("lower").0;
+        let mut runtime_args = builder.build().expect("lower");
         runtime_args
             .update_from_kernel(&TestKernel)
             .expect("update");

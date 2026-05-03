@@ -422,8 +422,7 @@ fn bf16_program(
             tiles: plan.out_block_num_tiles(),
         },
     ];
-    let (runtime_args, writer_args, reader_args, compute_args, semaphores) =
-        lower_runtime_args(plan, logical_mt, logical_nt)?;
+    let runtime_args = lower_runtime_args(plan, logical_mt, logical_nt)?;
     Ok(Program {
         cores: CoreSelection::All,
         reader_kernel: BF16_READER_SENDER.to_owned(),
@@ -437,10 +436,6 @@ fn bf16_program(
             plan.kt * 32,
             plan.nt * 32
         ),
-        reader_args,
-        writer_args,
-        compute_args,
-        semaphores,
         compile: CompileConfig {
             cbs,
             math_fidelity,
@@ -455,7 +450,7 @@ fn lower_runtime_args(
     plan: &MatmulPlan,
     logical_mt: usize,
     logical_nt: usize,
-) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>, usize)> {
+) -> io::Result<RuntimeArgs> {
     let grid = plan_grid(plan);
     let mut runtime_args = RuntimeArgsBuilder::new(
         NUM_SEMAPHORES,
@@ -761,7 +756,7 @@ mod tests {
         builder
             .add_core(sender, Vec::new(), reader, Vec::new())
             .expect("add core");
-        let runtime_args = builder.build().expect("lower runtime args").0;
+        let runtime_args = builder.build().expect("lower runtime args");
         let offset = 18 * 4;
         let value = u32::from_le_bytes(
             runtime_args.blobs()[0][offset..offset + 4]

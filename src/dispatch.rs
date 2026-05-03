@@ -104,10 +104,6 @@ pub struct Program {
     pub compute_kernel: String,
     pub writer_kernel: String,
     pub name: String,
-    pub reader_args: Vec<u32>,
-    pub writer_args: Vec<u32>,
-    pub compute_args: Vec<u32>,
-    pub semaphores: usize,
     pub compile: CompileConfig,
     pub reader_recv_kernel: String,
     pub writer_recv_kernel: String,
@@ -144,10 +140,6 @@ impl Program {
             compute_kernel: String::new(),
             writer_kernel: String::new(),
             name: String::new(),
-            reader_args: Vec::new(),
-            writer_args: Vec::new(),
-            compute_args: Vec::new(),
-            semaphores: 0,
             compile: CompileConfig::default(),
             reader_recv_kernel: String::new(),
             writer_recv_kernel: String::new(),
@@ -324,13 +316,8 @@ pub(crate) fn build_dispatch_setup_plan(
         ));
     }
 
-    let rta_sizes = (
-        program.writer_args.len() * size_of::<u32>(),
-        program.reader_args.len() * size_of::<u32>(),
-        program.compute_args.len() * size_of::<u32>(),
-    );
-    let rta_total = rta_sizes.0 + rta_sizes.1 + rta_sizes.2;
-    let sem_off = align_up(rta_total as u64, L1_ALIGN as u64) as usize;
+    let rta_sizes = program.runtime_args.section_sizes();
+    let sem_off = program.runtime_args.sem_offset();
     let mut commands = Vec::new();
     for role in roles {
         let (shared_addr, shared_blob, launch_blob) = build_payload(
@@ -507,7 +494,7 @@ fn build_payload(
     let rta_offsets = [0usize, rta_sizes.0, rta_sizes.0 + rta_sizes.1];
     let local_cb_off = align_up(
         sem_off
-            .checked_add(program.semaphores * L1_ALIGN as usize)
+            .checked_add(program.runtime_args.semaphores() * L1_ALIGN as usize)
             .ok_or_else(|| io::Error::other("local CB offset overflow"))? as u64,
         L1_ALIGN as u64,
     ) as usize;
@@ -818,14 +805,6 @@ mod tests {
     use crate::dram::DType;
     use crate::kernels::kernel::RuntimeArgsBuilder;
 
-    fn test_program_defaults() -> Program {
-        let mut runtime_args = RuntimeArgsBuilder::new(0, Vec::new(), Vec::new(), Vec::new());
-        runtime_args
-            .add_core(CoreCoord { x: 1, y: 2 }, Vec::new(), Vec::new(), Vec::new())
-            .expect("add core");
-        Program::new(runtime_args.build().expect("runtime args").0)
-    }
-
     fn dummy_kernel(fill: u8, len: usize) -> CompiledKernel {
         CompiledKernel {
             xip: vec![fill; len],
@@ -891,23 +870,20 @@ mod tests {
             dummy_kernel(0x44, 18),
             dummy_kernel(0x55, 20),
         );
+        let mut runtime_args = RuntimeArgsBuilder::new(2, Vec::new(), Vec::new(), Vec::new());
+        runtime_args
+            .add_core(CoreCoord { x: 1, y: 2 }, vec![1, 2], vec![3], vec![4, 5, 6])
+            .expect("add core");
         let program = Program {
-            writer_args: vec![1, 2],
-            reader_args: vec![3],
-            compute_args: vec![4, 5, 6],
-            semaphores: 2,
             compile: CompileConfig {
                 cbs: vec![CBConfig::new(0, DType::Float16B)],
                 math_fidelity: MathFidelity::HiFi2,
                 ..CompileConfig::default()
             },
-            ..test_program_defaults()
+            ..Program::new(runtime_args.build().expect("runtime args"))
         };
-        let rta_sizes = (8, 4, 12);
-        let sem_off = align_up(
-            (rta_sizes.0 + rta_sizes.1 + rta_sizes.2) as u64,
-            L1_ALIGN as u64,
-        ) as usize;
+        let rta_sizes = program.runtime_args.section_sizes();
+        let sem_off = program.runtime_args.sem_offset();
 
         let (shared_addr, shared, launch) = build_payload(
             &program,

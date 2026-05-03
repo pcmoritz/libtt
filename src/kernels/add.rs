@@ -121,8 +121,7 @@ fn bf16_program(key: AddProgramKey) -> io::Result<Program> {
         vec![0, 0, 0, key.tile_count],
         vec![key.tile_count],
     )?;
-    let (runtime_args, writer_args, reader_args, compute_args, semaphores) =
-        runtime_args.build()?;
+    let runtime_args = runtime_args.build()?;
     Ok(Program {
         cores: CoreSelection::Count(1),
         reader_kernel: BF16_READER.to_owned(),
@@ -137,10 +136,6 @@ fn bf16_program(key: AddProgramKey) -> io::Result<Program> {
             ..CompileConfig::default()
         },
         name: "eltwise_add_bf16".to_owned(),
-        reader_args,
-        writer_args,
-        compute_args,
-        semaphores,
         ..Program::new(runtime_args)
     })
 }
