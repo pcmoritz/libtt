@@ -5,8 +5,8 @@ use crate::hw::CoreCoord;
 use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
 use std::io;
 
-const BF16_READER: &str = include_str!("../../kernels/add_reader.cc");
-const BF16_WRITER: &str = include_str!("../../kernels/add_writer.cc");
+const BF16_READER: &str = include_str!("../../kernels/binary_eltwise_reader.cc");
+const BF16_WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
 const BF16_COMPUTE: &str = include_str!("../../kernels/add_compute.cc");
 const READER_LHS_ADDR_INDEX: usize = 0;
 const READER_RHS_ADDR_INDEX: usize = 1;
