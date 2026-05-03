@@ -99,7 +99,7 @@ impl FastDispatcher {
     pub(crate) fn launch(
         &mut self,
         program: &Program,
-        setup: Vec<DispatchCommand>,
+        setup: &[DispatchCommand],
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
         let setup_records = relayed_command_records(lower_ir(setup))?;
@@ -511,15 +511,15 @@ fn new_sysmem(path: &Path, size: usize, label: &str) -> io::Result<PinnedMemory>
     })
 }
 
-fn lower_ir(commands: Vec<DispatchCommand>) -> Vec<CqCommand> {
+fn lower_ir(commands: &[DispatchCommand]) -> Vec<CqCommand> {
     let mut result = Vec::new();
     for command in commands {
         match command {
             DispatchCommand::Write { cores, addr, data } => {
                 result.push(CqCommand::WritePackedLarge {
-                    rects: mcast_rects(&cores),
-                    addr,
-                    data,
+                    rects: mcast_rects(cores),
+                    addr: *addr,
+                    data: data.clone(),
                 });
             }
         }

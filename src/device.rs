@@ -115,7 +115,7 @@ trait Dispatcher {
     fn launch(
         &mut self,
         program: &Program,
-        setup: Option<Vec<DispatchCommand>>,
+        setup: Option<&[DispatchCommand]>,
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()>;
 }
@@ -128,7 +128,7 @@ impl Dispatcher for FastDispatcher {
     fn launch(
         &mut self,
         program: &Program,
-        setup: Option<Vec<DispatchCommand>>,
+        setup: Option<&[DispatchCommand]>,
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
         FastDispatcher::launch(self, program, setup.unwrap_or_default(), runtime_args)
@@ -143,7 +143,7 @@ impl Dispatcher for SlowDispatcher {
     fn launch(
         &mut self,
         _program: &Program,
-        setup: Option<Vec<DispatchCommand>>,
+        setup: Option<&[DispatchCommand]>,
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
         SlowDispatcher::launch(self, setup.unwrap_or_default(), runtime_args)
@@ -356,7 +356,7 @@ impl Device {
             .get_mut(&program_id)
             .expect("cached program launch was just inserted");
         update_runtime_args(&mut launch.runtime_args)?;
-        let setup = (!is_staged).then(|| launch.setup.clone());
+        let setup = (!is_staged).then_some(launch.setup.as_slice());
         self.dispatcher
             .launch(&program, setup, &launch.runtime_args)?;
         self.staged_cached_program = Some(program_id);

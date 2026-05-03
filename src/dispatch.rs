@@ -179,18 +179,18 @@ impl SlowDispatcher {
 
     pub(crate) fn launch(
         &mut self,
-        setup: Vec<DispatchCommand>,
+        setup: &[DispatchCommand],
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
         self.execute_setup(setup)?;
         self.write_runtime_and_launch(runtime_args)
     }
 
-    fn execute_setup(&mut self, commands: Vec<DispatchCommand>) -> io::Result<()> {
+    fn execute_setup(&mut self, commands: &[DispatchCommand]) -> io::Result<()> {
         for command in commands {
             match command {
                 DispatchCommand::Write { cores, addr, data } => {
-                    self.write_mcast(&cores, addr, &data)?;
+                    self.write_mcast(cores, *addr, data)?;
                 }
             }
         }
