@@ -101,28 +101,11 @@ impl RuntimeArgsBuilder {
         }
     }
 
-    pub(crate) fn build(self) -> io::Result<RuntimeArgs> {
-        Ok(self.into_program_parts()?.0)
-    }
-
-    pub(crate) fn into_program_parts(
-        self,
-    ) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>, usize)> {
-        let semaphores = self.semaphores;
-        let (runtime_args, writer_args, reader_args, compute_args) = self.lower()?;
-        Ok((
-            runtime_args,
-            writer_args,
-            reader_args,
-            compute_args,
-            semaphores,
-        ))
-    }
-
-    fn lower(self) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>)> {
+    pub(crate) fn build(self) -> io::Result<(RuntimeArgs, Vec<u32>, Vec<u32>, Vec<u32>, usize)> {
         let Some(layout) = self.per_core.values().next().cloned() else {
             return Err(invalid_input("runtime args require at least one core"));
         };
+        let semaphores = self.semaphores;
         let writer_args = layout.writer.clone();
         let reader_args = layout.reader.clone();
         let compute_args = layout.compute.clone();
@@ -153,7 +136,7 @@ impl RuntimeArgsBuilder {
                 &args.writer,
                 &args.reader,
                 &args.compute,
-                self.semaphores,
+                semaphores,
                 sem_off,
             ));
         }
@@ -170,7 +153,13 @@ impl RuntimeArgsBuilder {
             blobs,
         };
 
-        Ok((runtime_args, writer_args, reader_args, compute_args))
+        Ok((
+            runtime_args,
+            writer_args,
+            reader_args,
+            compute_args,
+            semaphores,
+        ))
     }
 }
 
@@ -323,7 +312,7 @@ mod tests {
             .add_core(CoreCoord { x: 1, y: 2 }, vec![7, 0], vec![0, 9], Vec::new())
             .expect("add core");
 
-        let mut runtime_args = builder.build().expect("lower");
+        let mut runtime_args = builder.build().expect("lower").0;
         runtime_args
             .update_from_kernel(&TestKernel)
             .expect("update");

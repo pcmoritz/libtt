@@ -823,7 +823,7 @@ mod tests {
         runtime_args
             .add_core(CoreCoord { x: 1, y: 2 }, Vec::new(), Vec::new(), Vec::new())
             .expect("add core");
-        Program::new(runtime_args.build().expect("runtime args"))
+        Program::new(runtime_args.build().expect("runtime args").0)
     }
 
     fn dummy_kernel(fill: u8, len: usize) -> CompiledKernel {

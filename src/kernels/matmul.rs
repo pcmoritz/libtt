@@ -510,7 +510,7 @@ fn lower_runtime_args(
             runtime_args.add_core(core, writer, reader, Vec::new())?;
         }
     }
-    runtime_args.into_program_parts()
+    runtime_args.build()
 }
 
 fn matmul_math_fidelity() -> io::Result<MathFidelity> {
@@ -802,7 +802,7 @@ mod tests {
         builder
             .add_core(sender, Vec::new(), reader, Vec::new())
             .expect("add core");
-        let runtime_args = builder.build().expect("lower runtime args");
+        let runtime_args = builder.build().expect("lower runtime args").0;
         let offset = 18 * 4;
         let value = u32::from_le_bytes(
             runtime_args.blobs()[0][offset..offset + 4]

@@ -122,7 +122,7 @@ fn bf16_program(key: AddProgramKey) -> io::Result<Program> {
         vec![key.tile_count],
     )?;
     let (runtime_args, writer_args, reader_args, compute_args, semaphores) =
-        runtime_args.into_program_parts()?;
+        runtime_args.build()?;
     Ok(Program {
         cores: CoreSelection::Count(1),
         reader_kernel: BF16_READER.to_owned(),
