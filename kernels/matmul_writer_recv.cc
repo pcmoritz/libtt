@@ -21,7 +21,7 @@ void kernel_main() {
   const uint32_t out_num_sb_h = A(28);
   const uint32_t logical_mt = A(29);
   const uint32_t logical_nt = A(30);
-  const uint32_t out_col_offset = A(32);
+  const uint32_t out_col_offset = A(31);
   volatile tt_l1_ptr uint32_t *recv_sem = SEM(17);
 
   const InterleavedAddrGenFast<true> out_gen = {

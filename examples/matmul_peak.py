@@ -24,6 +24,17 @@ def require_tiled(name, value):
         raise SystemExit(f"{name} must be a multiple of 32, got {value}")
 
 
+def make_inputs(m, k, n):
+    row_pattern = (np.arange(m, dtype=np.float32) % 13 - 6).reshape(m, 1)
+    k_pattern = (np.arange(k, dtype=np.float32) % 17 - 8).reshape(1, k)
+    a_host = (row_pattern + k_pattern) / np.float32(16.0)
+
+    k_pattern = (np.arange(k, dtype=np.float32) % 11 - 5).reshape(k, 1)
+    col_pattern = (np.arange(n, dtype=np.float32) % 19 - 9).reshape(1, n)
+    b_host = (k_pattern - col_pattern) / np.float32(16.0)
+    return a_host.astype(np.float32), b_host.astype(np.float32)
+
+
 def main():
     args = parse_args()
     require_tiled("M", args.m)
@@ -36,8 +47,7 @@ def main():
     print(f"device: {devices[0]}")
     print(f"shape: ({args.m}, {args.k}) @ ({args.k}, {args.n}) -> ({args.m}, {args.n})")
 
-    a_host = np.ones((args.m, args.k), dtype=np.float32)
-    b_host = np.ones((args.k, args.n), dtype=np.float32)
+    a_host, b_host = make_inputs(args.m, args.k, args.n)
     a = jnp.asarray(a_host, dtype=jnp.bfloat16)
     b = jnp.asarray(b_host, dtype=jnp.bfloat16)
 
@@ -54,10 +64,18 @@ def main():
 
     if args.validate:
         out = np.asarray(result, dtype=np.float32)
-        expected = np.float32(args.k)
-        if not np.all(out == expected):
-            max_abs = float(np.max(np.abs(out - expected)))
-            raise SystemExit(f"validation failed: expected all {expected}, max_abs={max_abs}")
+        expected = np.asarray(
+            jnp.asarray(a_host, dtype=jnp.bfloat16) @ jnp.asarray(b_host, dtype=jnp.bfloat16),
+            dtype=np.float32,
+        )
+        if not np.allclose(out, expected, rtol=0.02, atol=0.5):
+            diff = np.abs(out - expected)
+            max_index = np.unravel_index(np.argmax(diff), diff.shape)
+            raise SystemExit(
+                "validation failed: "
+                f"max_abs={float(diff[max_index])} at {max_index}, "
+                f"got={float(out[max_index])}, expected={float(expected[max_index])}"
+            )
 
     ops = 2 * args.m * args.k * args.n
     best = min(times)
