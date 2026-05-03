@@ -21,7 +21,7 @@ use device::Device;
 use dram::{DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
-use log::{enabled as log_enabled, log};
+use log::log;
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
@@ -1512,12 +1512,10 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
         return invalid_argument("args must not be null");
     };
-    if log_enabled() {
-        log(format!(
-            "pjrt loaded_executable_execute entered num_devices={} num_args={}",
-            args.num_devices, args.num_args
-        ));
-    }
+    log(format!(
+        "pjrt loaded_executable_execute entered num_devices={} num_args={}",
+        args.num_devices, args.num_args
+    ));
     let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
         return invalid_argument("executable must not be null");
     };

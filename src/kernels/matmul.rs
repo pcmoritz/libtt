@@ -3,7 +3,7 @@ use crate::dispatch::{CBConfig, CompileConfig, MathFidelity, Program};
 use crate::dram::{DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
 use crate::kernels::kernel::{Kernel, RuntimeArgs, RuntimeArgsBuilder};
-use crate::log::{enabled as log_enabled, log};
+use crate::log::log;
 use std::env;
 use std::io;
 use std::sync::Arc;
@@ -188,22 +188,20 @@ pub(crate) fn matmul_bf16(
 }
 
 fn log_matmul_plan(plan: &MatmulPlan) {
-    if log_enabled() {
-        log(format!(
-            "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
-            plan.mt,
-            plan.kt,
-            plan.nt,
-            plan.rows.len(),
-            plan.cols.len(),
-            plan.per_core_m,
-            plan.per_core_n,
-            plan.in0_block_w,
-            plan.num_blocks(),
-            plan.out_subblock_h,
-            plan.out_subblock_w
-        ));
-    }
+    log(format!(
+        "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
+        plan.mt,
+        plan.kt,
+        plan.nt,
+        plan.rows.len(),
+        plan.cols.len(),
+        plan.per_core_m,
+        plan.per_core_n,
+        plan.in0_block_w,
+        plan.num_blocks(),
+        plan.out_subblock_h,
+        plan.out_subblock_w
+    ));
 }
 
 fn shape_2d(buffer: &DramBuffer, name: &str) -> io::Result<(usize, usize)> {

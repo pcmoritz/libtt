@@ -2,12 +2,12 @@ use std::fmt::Display;
 use std::sync::OnceLock;
 
 pub(crate) fn log(message: impl Display) {
-    if enabled() {
+    if log_enabled() {
         eprintln!("[libtt] {message}");
     }
 }
 
-pub(crate) fn enabled() -> bool {
+fn log_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("LIBTT_LOG") {
         Ok(value) => {
