@@ -55,6 +55,28 @@ impl DramBuffer {
     pub(crate) fn size(&self) -> usize {
         self.num_tiles * self.page_size()
     }
+
+    pub(crate) fn logical_size(&self) -> io::Result<usize> {
+        shape_byte_size(self.dtype, &self.shape)
+    }
+
+    pub(crate) fn logical_tiles(&self) -> io::Result<usize> {
+        shape_tile_count(&self.shape)
+    }
+
+    pub(crate) fn validate_single_or_logical_tile_count(&self, name: &str) -> io::Result<usize> {
+        let logical_tiles = self.logical_tiles()?;
+        if self.num_tiles == 1 || self.num_tiles == logical_tiles {
+            return Ok(logical_tiles);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{name} tile count must be 1 or {logical_tiles}, got {}",
+                self.num_tiles
+            ),
+        ))
+    }
 }
 
 pub struct Allocator {
@@ -236,7 +258,16 @@ impl Allocator {
     }
 
     pub(crate) fn read_host_data(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
-        let payload = self.read(buf)?;
+        let mut payload = self.read(buf)?;
+        let logical_len = buf.logical_size()?;
+        if payload.len() == buf.page_size() && logical_len > payload.len() {
+            let tile_count = logical_len / buf.page_size();
+            let tile = payload;
+            payload = Vec::with_capacity(logical_len);
+            for _ in 0..tile_count {
+                payload.extend_from_slice(&tile);
+            }
+        }
         untilize(&payload, buf.dtype, &buf.shape)
     }
 
@@ -467,35 +498,15 @@ fn validate_tiled_shape(
     dtype: DType,
     shape: &[usize],
 ) -> io::Result<(usize, usize, usize, usize)> {
-    if shape.len() < 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "shape must have at least two dimensions",
-        ));
-    }
+    shape_tile_count(shape)?;
 
     let rows = shape[shape.len() - 2];
     let cols = shape[shape.len() - 1];
-    if rows % TILE_R != 0 || cols % TILE_C != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("shape rows/cols must be multiples of {TILE_R}x{TILE_C}"),
-        ));
-    }
-
     let batch = shape[..shape.len() - 2]
         .iter()
         .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "shape is too large"))?;
-    let element_count = shape
-        .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "shape is too large"))?;
-    let expected_len = element_count
-        .checked_mul(dtype.bytes_per_element())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "shape byte size is too large")
-        })?;
+    let expected_len = shape_byte_size(dtype, shape)?;
 
     if data.len() != expected_len {
         return Err(io::Error::new(
@@ -509,6 +520,39 @@ fn validate_tiled_shape(
     }
 
     Ok((batch, rows, cols, expected_len))
+}
+
+fn shape_byte_size(dtype: DType, shape: &[usize]) -> io::Result<usize> {
+    shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .and_then(|elements| elements.checked_mul(dtype.bytes_per_element()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "shape byte size is too large"))
+}
+
+#[allow(clippy::manual_is_multiple_of)]
+fn shape_tile_count(shape: &[usize]) -> io::Result<usize> {
+    if shape.len() < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shape must have at least two dimensions",
+        ));
+    }
+    let rows = shape[shape.len() - 2];
+    let cols = shape[shape.len() - 1];
+    if rows % TILE_R != 0 || cols % TILE_C != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("shape rows/cols must be multiples of {TILE_R}x{TILE_C}"),
+        ));
+    }
+    let tiles_per_batch = (rows / TILE_R).checked_mul(cols / TILE_C).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "shape tile count is too large")
+    })?;
+    shape[..shape.len() - 2]
+        .iter()
+        .try_fold(tiles_per_batch, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "shape tile count is too large"))
 }
 
 #[cfg(test)]

@@ -49,7 +49,8 @@ pub(crate) enum Op {
         input_ids: [u32; 2],
         output_id: u32,
     },
-    Zero {
+    Constant {
+        tile: Vec<u8>,
         output_id: u32,
     },
 }
@@ -124,7 +125,8 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     input_ids: [max.lhs_id, max.rhs_id],
                     output_id: op_desc.output_id,
                 }),
-                Kind::Zero(_) => Ok(Op::Zero {
+                Kind::Constant(constant) => Ok(Op::Constant {
+                    tile: constant.tile,
                     output_id: op_desc.output_id,
                 }),
             }
@@ -206,7 +208,8 @@ pub(crate) enum Op {
         input_ids: [u32; 2],
         output_id: u32,
     },
-    Zero {
+    Constant {
+        tile: Vec<u8>,
         output_id: u32,
     },
 }

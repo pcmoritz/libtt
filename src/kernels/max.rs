@@ -10,6 +10,8 @@ const BF16_WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc")
 const BF16_COMPUTE: &str = include_str!("../../kernels/max_compute.cc");
 const READER_LHS_ADDR_INDEX: usize = 0;
 const READER_RHS_ADDR_INDEX: usize = 1;
+const READER_LHS_SINGLE_TILE_INDEX: usize = 4;
+const READER_RHS_SINGLE_TILE_INDEX: usize = 5;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -21,6 +23,8 @@ struct MaxProgramKey {
 struct MaxBf16Kernel {
     lhs_addr: u32,
     rhs_addr: u32,
+    lhs_single_tile: bool,
+    rhs_single_tile: bool,
     output_addr: u32,
     key: MaxProgramKey,
 }
@@ -39,6 +43,8 @@ impl Kernel<MaxProgramKey> for MaxBf16Kernel {
         match index {
             READER_LHS_ADDR_INDEX => Some(self.lhs_addr),
             READER_RHS_ADDR_INDEX => Some(self.rhs_addr),
+            READER_LHS_SINGLE_TILE_INDEX => Some(u32::from(self.lhs_single_tile)),
+            READER_RHS_SINGLE_TILE_INDEX => Some(u32::from(self.rhs_single_tile)),
             _ => None,
         }
     }
@@ -64,34 +70,32 @@ pub(crate) fn eltwise_max_bf16(
             lhs.dtype, rhs.dtype
         )));
     }
-    if lhs.num_tiles != rhs.num_tiles {
-        return Err(invalid_input(format!(
-            "input tile counts must match, got {} and {}",
-            lhs.num_tiles, rhs.num_tiles
-        )));
-    }
     if lhs.shape != rhs.shape {
         return Err(invalid_input(format!(
             "input shapes must match, got {:?} and {:?}",
             lhs.shape, rhs.shape
         )));
     }
+    let output_tiles = lhs.validate_single_or_logical_tile_count("lhs")?;
+    rhs.validate_single_or_logical_tile_count("rhs")?;
 
     let lhs_addr = u32_arg(lhs.addr, "lhs address")?;
     let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
-    let tile_count = u32::try_from(lhs.num_tiles)
-        .map_err(|_| invalid_input(format!("tile count does not fit in u32: {}", lhs.num_tiles)))?;
+    let tile_count = u32::try_from(output_tiles)
+        .map_err(|_| invalid_input(format!("tile count does not fit in u32: {output_tiles}")))?;
     let core = device
         .cores_ref()
         .first()
         .copied()
         .ok_or_else(|| invalid_input("no worker cores are available"))?;
-    let output = device.alloc(lhs.num_tiles, DType::Float16B, &lhs.shape, name)?;
+    let output = device.alloc(output_tiles, DType::Float16B, &lhs.shape, name)?;
     let output_addr = u32_arg(output.addr, "output address")?;
 
     let kernel = MaxBf16Kernel {
         lhs_addr,
         rhs_addr,
+        lhs_single_tile: lhs.num_tiles == 1,
+        rhs_single_tile: rhs.num_tiles == 1,
         output_addr,
         key: MaxProgramKey { core, tile_count },
     };
@@ -112,13 +116,18 @@ fn bf16_program(key: MaxProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
         vec![WRITER_OUTPUT_ADDR_INDEX],
-        vec![READER_LHS_ADDR_INDEX, READER_RHS_ADDR_INDEX],
+        vec![
+            READER_LHS_ADDR_INDEX,
+            READER_RHS_ADDR_INDEX,
+            READER_LHS_SINGLE_TILE_INDEX,
+            READER_RHS_SINGLE_TILE_INDEX,
+        ],
         Vec::new(),
     );
     runtime_args.add_core(
         key.core,
         vec![0, 0, key.tile_count],
-        vec![0, 0, 0, key.tile_count],
+        vec![0, 0, 0, key.tile_count, 0, 0],
         vec![key.tile_count],
     )?;
     let runtime_args = runtime_args.build()?;

@@ -1343,27 +1343,36 @@ fn store_output_buffer(
     Ok(())
 }
 
-fn materialize_zero_buffer(
+fn materialize_constant_buffer(
     device: &mut Device,
     value: &executable::ValueDesc,
+    tile: &[u8],
     name: impl Into<String>,
 ) -> Result<DramBuffer, *mut PJRT_Error> {
-    if value.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
-        return Err(unimplemented(
-            "TT executable zero currently only supports bf16 tensors",
+    let dtype = pjrt_buffer_type_to_dtype(value.element_type)?;
+    let shape = dims_i64_to_usize(&value.dims)?;
+    if shape.len() < 2 {
+        return Err(invalid_argument(
+            "TT executable constant tensors must have rank >= 2",
         ));
     }
-    let shape = dims_i64_to_usize(&value.dims)?;
-    let element_count = shape
-        .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-        .ok_or_else(|| invalid_argument("zero tensor shape is too large"))?;
-    let byte_count = element_count
-        .checked_mul(DType::Float16B.bytes_per_element())
-        .ok_or_else(|| invalid_argument("zero tensor byte size is too large"))?;
-    let data = vec![0u8; byte_count];
+    let rows = shape[shape.len() - 2];
+    let cols = shape[shape.len() - 1];
+    if rows % 32 != 0 || cols % 32 != 0 {
+        return Err(invalid_argument(
+            "TT executable constant tensor rows/cols must be multiples of 32",
+        ));
+    }
+    if tile.len() != dtype.tile_size() {
+        return Err(invalid_argument(format!(
+            "TT executable constant tile has {} bytes, expected {}",
+            tile.len(),
+            dtype.tile_size()
+        )));
+    }
     device
-        .alloc_write(&data, DType::Float16B, &shape, name)
+        .allocator_mut()
+        .and_then(|allocator| allocator.alloc_write(tile, dtype, shape, name))
         .map_err(io_error)
 }
 
@@ -1388,11 +1397,13 @@ fn execute_executable_v1(
     let device = &mut target_device.runtime;
 
     for op in &plan.ops {
-        match *op {
+        match op {
             executable::Op::Parameter {
                 parameter_index,
                 output_id,
             } => {
+                let parameter_index = *parameter_index;
+                let output_id = *output_id;
                 let input_ptr = inputs.get(parameter_index).copied().ok_or_else(|| {
                     invalid_argument(format!(
                         "TT executable parameter index {parameter_index} is out of range"
@@ -1432,6 +1443,7 @@ fn execute_executable_v1(
                 input_ids,
                 output_id,
             } => {
+                let output_id = *output_id;
                 let lhs = device_buffer_for_value(&values, input_ids[0], "add.lhs")?;
                 let rhs = device_buffer_for_value(&values, input_ids[1], "add.rhs")?;
                 if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
@@ -1476,6 +1488,7 @@ fn execute_executable_v1(
                 input_ids,
                 output_id,
             } => {
+                let output_id = *output_id;
                 let lhs = device_buffer_for_value(&values, input_ids[0], "max.lhs")?;
                 let rhs = device_buffer_for_value(&values, input_ids[1], "max.rhs")?;
                 if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
@@ -1520,6 +1533,7 @@ fn execute_executable_v1(
                 input_ids,
                 output_id,
             } => {
+                let output_id = *output_id;
                 let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
                 let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
                 if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
@@ -1566,16 +1580,22 @@ fn execute_executable_v1(
                     "matmul",
                 )?;
             }
-            executable::Op::Zero { output_id } => {
+            executable::Op::Constant { tile, output_id } => {
+                let output_id = *output_id;
                 let output_index = output_id as usize;
                 let expected = plan.values.get(output_index).ok_or_else(|| {
                     invalid_argument(format!(
-                        "TT executable zero output id {output_id} is out of bounds"
+                        "TT executable constant output id {output_id} is out of bounds"
                     ))
                 })?;
-                let output_dram = materialize_zero_buffer(device, expected, "pjrt_zero")?;
+                let output_dram = materialize_constant_buffer(
+                    device,
+                    expected,
+                    tile.as_slice(),
+                    "pjrt_constant",
+                )?;
                 values[output_index] = Some(PJRT_Buffer {
-                    buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+                    buffer_type: expected.element_type,
                     dims: expected.dims.clone(),
                     device: output_context.device,
                     memory: output_context.memory,
@@ -3079,9 +3099,79 @@ mod tests {
         assert_eq!(executable.output_ids, vec![7]);
         assert_eq!(executable.ops.len(), 7);
         assert!(matches!(executable.ops[3], executable::Op::Matmul { .. }));
-        assert!(matches!(executable.ops[4], executable::Op::Zero { .. }));
+        assert!(matches!(executable.ops[4], executable::Op::Constant { .. }));
         assert!(matches!(executable.ops[5], executable::Op::Max { .. }));
         assert!(matches!(executable.ops[6], executable::Op::Matmul { .. }));
+
+        unsafe {
+            drop(Box::from_raw(get_executable_args.executable));
+            drop(Box::from_raw(compile_args.executable));
+            drop(Box::from_raw(client));
+        }
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_nonzero_broadcast_constant() {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"mlir".to_vec();
+        let mut code = br#"module {
+  func.func public @main() -> tensor<32x32xbf16> {
+    %cst = stablehlo.constant dense<1.000000e+00> : tensor<bf16>
+    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<bf16>) -> tensor<32x32xbf16>
+    return %0 : tensor<32x32xbf16>
+  }
+}
+"#
+        .to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: code.as_mut_ptr().cast::<c_char>(),
+            code_size: code.len(),
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { compile(&mut compile_args) });
+
+        let get_executable = api
+            .PJRT_LoadedExecutable_GetExecutable
+            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
+        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
+            extension_start: ptr::null_mut(),
+            loaded_executable: compile_args.executable,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+
+        let executable = unsafe { &*get_executable_args.executable }
+            .metadata
+            .executable
+            .as_ref()
+            .expect("compiled executable should contain a TT executable");
+        assert_eq!(executable.output_ids, vec![1]);
+        assert_eq!(executable.ops.len(), 1);
+        let executable::Op::Constant { tile, output_id } = &executable.ops[0] else {
+            panic!("broadcasted constant should lower to Constant");
+        };
+        assert_eq!(*output_id, 1);
+        assert_eq!(tile.len(), DType::Float16B.tile_size());
+        assert_eq!(&tile[..2], &[0x80, 0x3f]);
 
         unsafe {
             drop(Box::from_raw(get_executable_args.executable));

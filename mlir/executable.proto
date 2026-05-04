@@ -48,8 +48,10 @@ message MaxOp {
   uint32 rhs_id = 2;
 }
 
-message ZeroOp {
-  // Materializes a zero-filled tensor with Op.output_id's metadata.
+message ConstantOp {
+  // One 32x32 tile in device tile order. Execution repeats this tile to fill
+  // Op.output_id's tensor.
+  bytes tile = 1;
 }
 
 message Op {
@@ -61,7 +63,7 @@ message Op {
     AddOp add = 3;
     MatmulOp matmul = 4;
     MaxOp max = 5;
-    ZeroOp zero = 6;
+    ConstantOp constant = 6;
   }
 }
 

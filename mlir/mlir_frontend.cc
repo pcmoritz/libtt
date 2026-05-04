@@ -6,7 +6,6 @@
 #include <vector>
 
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
@@ -189,20 +188,77 @@ bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& 
     return true;
 }
 
-bool isZeroSplat(mlir::stablehlo::ConstantOp constant_op) {
+constexpr size_t kTileElements = 32 * 32;
+
+std::optional<size_t> elementByteWidth(mlir::Type element_type) {
+    if (element_type.isBF16() || element_type.isF16()) return 2;
+    if (element_type.isF32()) return 4;
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
+        switch (integer.getWidth()) {
+            case 8:
+                return 1;
+            case 16:
+                if (integer.isUnsigned()) return 2;
+                return std::nullopt;
+            case 32:
+                return 4;
+            default:
+                return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+void appendLittleEndian(llvm::APInt bits, size_t byte_width, std::string& out) {
+    for (size_t index = 0; index < byte_width; ++index) {
+        out.push_back(static_cast<char>(bits.extractBitsAsZExtValue(8, index * 8)));
+    }
+}
+
+std::optional<std::string> constantTile(
+    mlir::stablehlo::ConstantOp constant_op,
+    std::string& error) {
     auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
     if (!dense || !dense.isSplat()) {
-        return false;
+        error = "only splat constants are currently supported";
+        return std::nullopt;
     }
 
     auto element_type = mlir::cast<mlir::ShapedType>(dense.getType()).getElementType();
+    auto byte_width = elementByteWidth(element_type);
+    if (!byte_width) {
+        error = "unsupported constant element type";
+        return std::nullopt;
+    }
+
+    std::string element;
+    element.reserve(*byte_width);
     if (mlir::isa<mlir::FloatType>(element_type)) {
-        return dense.getSplatValue<llvm::APFloat>().isZero();
+        appendLittleEndian(
+            dense.getSplatValue<llvm::APFloat>().bitcastToAPInt(),
+            *byte_width,
+            element);
+    } else {
+        appendLittleEndian(dense.getSplatValue<llvm::APInt>(), *byte_width, element);
     }
-    if (mlir::isa<mlir::IntegerType>(element_type)) {
-        return dense.getSplatValue<llvm::APInt>().isZero();
+
+    std::string tile;
+    tile.reserve(element.size() * kTileElements);
+    for (size_t index = 0; index < kTileElements; ++index) {
+        tile.append(element);
     }
-    return false;
+    return tile;
+}
+
+bool hasTileShape(mlir::Value value) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    return tensor && tensor.getRank() >= 2;
+}
+
+void addConstantOp(tt::Executable& executable, uint32_t output_id, const std::string& tile) {
+    auto* constant = executable.add_ops();
+    constant->set_output_id(output_id);
+    constant->mutable_constant()->set_tile(tile);
 }
 
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
@@ -216,7 +272,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     }
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
-    llvm::DenseSet<mlir::Value> zero_values;
+    llvm::DenseMap<mlir::Value, std::string> constant_tiles;
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
         uint32_t output_id = 0;
@@ -247,11 +303,14 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(constant_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            if (!isZeroSplat(constant_op)) {
-                error = "only zero constants are currently supported";
+            auto tile = constantTile(constant_op, error);
+            if (!tile) {
                 return false;
             }
-            zero_values.insert(constant_op.getResult());
+            constant_tiles.try_emplace(constant_op.getResult(), *tile);
+            if (hasTileShape(constant_op.getResult())) {
+                addConstantOp(executable, output_id, *tile);
+            }
             continue;
         }
 
@@ -260,13 +319,12 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(broadcast_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            if (zero_values.contains(broadcast_op.getOperand())) {
-                auto* zero = executable.add_ops();
-                zero->set_output_id(output_id);
-                zero->mutable_zero();
-                zero_values.insert(broadcast_op.getResult());
+            auto constant = constant_tiles.find(broadcast_op.getOperand());
+            if (constant != constant_tiles.end()) {
+                addConstantOp(executable, output_id, constant->second);
+                constant_tiles.try_emplace(broadcast_op.getResult(), constant->second);
             } else {
-                error = "only broadcast_in_dim of zero constants is currently supported";
+                error = "only broadcast_in_dim of constants is currently supported";
                 return false;
             }
             continue;
