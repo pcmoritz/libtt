@@ -16,7 +16,7 @@ const READER_RHS_SINGLE_TILE_INDEX: usize = 5;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum BinaryEltwiseOp {
+pub(crate) enum BinaryEltwiseOp {
     Add,
     Max,
 }
@@ -82,25 +82,7 @@ impl Kernel<BinaryEltwiseProgramKey> for BinaryEltwiseBf16Kernel {
     }
 }
 
-pub(crate) fn eltwise_add_bf16(
-    device: &mut Device,
-    lhs: &DramBuffer,
-    rhs: &DramBuffer,
-    name: impl Into<String>,
-) -> io::Result<DramBuffer> {
-    eltwise_bf16(device, BinaryEltwiseOp::Add, lhs, rhs, name)
-}
-
-pub(crate) fn eltwise_max_bf16(
-    device: &mut Device,
-    lhs: &DramBuffer,
-    rhs: &DramBuffer,
-    name: impl Into<String>,
-) -> io::Result<DramBuffer> {
-    eltwise_bf16(device, BinaryEltwiseOp::Max, lhs, rhs, name)
-}
-
-fn eltwise_bf16(
+pub(crate) fn eltwise_bf16(
     device: &mut Device,
     op: BinaryEltwiseOp,
     lhs: &DramBuffer,
