@@ -190,25 +190,6 @@ bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& 
 
 constexpr size_t kTileElements = 32 * 32;
 
-std::optional<size_t> elementByteWidth(mlir::Type element_type) {
-    if (element_type.isBF16() || element_type.isF16()) return 2;
-    if (element_type.isF32()) return 4;
-    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
-        switch (integer.getWidth()) {
-            case 8:
-                return 1;
-            case 16:
-                if (integer.isUnsigned()) return 2;
-                return std::nullopt;
-            case 32:
-                return 4;
-            default:
-                return std::nullopt;
-        }
-    }
-    return std::nullopt;
-}
-
 void appendLittleEndian(llvm::APInt bits, size_t byte_width, std::string& out) {
     for (size_t index = 0; index < byte_width; ++index) {
         out.push_back(static_cast<char>(bits.extractBitsAsZExtValue(8, index * 8)));
@@ -225,21 +206,22 @@ std::optional<std::string> constantTile(
     }
 
     auto element_type = mlir::cast<mlir::ShapedType>(dense.getType()).getElementType();
-    auto byte_width = elementByteWidth(element_type);
-    if (!byte_width) {
-        error = "unsupported constant element type";
+    auto bit_width = element_type.getIntOrFloatBitWidth();
+    if (bit_width % 8 != 0) {
+        error = "constant element bit width must be a whole number of bytes";
         return std::nullopt;
     }
+    size_t byte_width = bit_width / 8;
 
     std::string element;
-    element.reserve(*byte_width);
+    element.reserve(byte_width);
     if (mlir::isa<mlir::FloatType>(element_type)) {
         appendLittleEndian(
             dense.getSplatValue<llvm::APFloat>().bitcastToAPInt(),
-            *byte_width,
+            byte_width,
             element);
     } else {
-        appendLittleEndian(dense.getSplatValue<llvm::APInt>(), *byte_width, element);
+        appendLittleEndian(dense.getSplatValue<llvm::APInt>(), byte_width, element);
     }
 
     std::string tile;
