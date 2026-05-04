@@ -213,21 +213,14 @@ std::optional<std::string> constantTile(
     }
     size_t byte_width = bit_width / 8;
 
-    std::string element;
-    element.reserve(byte_width);
-    if (mlir::isa<mlir::FloatType>(element_type)) {
-        appendLittleEndian(
-            dense.getSplatValue<llvm::APFloat>().bitcastToAPInt(),
-            byte_width,
-            element);
-    } else {
-        appendLittleEndian(dense.getSplatValue<llvm::APInt>(), byte_width, element);
-    }
+    auto bits = mlir::isa<mlir::FloatType>(element_type)
+                    ? dense.getSplatValue<llvm::APFloat>().bitcastToAPInt()
+                    : dense.getSplatValue<llvm::APInt>();
 
     std::string tile;
-    tile.reserve(element.size() * kTileElements);
+    tile.reserve(byte_width * kTileElements);
     for (size_t index = 0; index < kTileElements; ++index) {
-        tile.append(element);
+        appendLittleEndian(bits, byte_width, tile);
     }
     return tile;
 }
