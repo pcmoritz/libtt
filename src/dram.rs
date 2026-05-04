@@ -56,16 +56,8 @@ impl DramBuffer {
         self.num_tiles * self.page_size()
     }
 
-    pub(crate) fn logical_size(&self) -> io::Result<usize> {
-        shape_byte_size(self.dtype, &self.shape)
-    }
-
-    pub(crate) fn logical_tiles(&self) -> io::Result<usize> {
-        shape_tile_count(&self.shape)
-    }
-
     pub(crate) fn validate_single_or_logical_tile_count(&self, name: &str) -> io::Result<usize> {
-        let logical_tiles = self.logical_tiles()?;
+        let logical_tiles = shape_tile_count(&self.shape)?;
         if self.num_tiles == 1 || self.num_tiles == logical_tiles {
             return Ok(logical_tiles);
         }
@@ -259,7 +251,7 @@ impl Allocator {
 
     pub(crate) fn read_host_data(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
         let mut payload = self.read(buf)?;
-        let logical_len = buf.logical_size()?;
+        let logical_len = shape_byte_size(buf.dtype, &buf.shape)?;
         if payload.len() == buf.page_size() && logical_len > payload.len() {
             let tile_count = logical_len / buf.page_size();
             let tile = payload;
