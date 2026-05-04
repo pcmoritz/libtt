@@ -7,7 +7,8 @@ use std::io;
 
 const BF16_READER: &str = include_str!("../../kernels/binary_eltwise_reader.cc");
 const BF16_WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
-const BF16_COMPUTE: &str = include_str!("../../kernels/add_compute.cc");
+const ADD_BF16_COMPUTE: &str = include_str!("../../kernels/add_compute.cc");
+const MAX_BF16_COMPUTE: &str = include_str!("../../kernels/max_compute.cc");
 const READER_LHS_ADDR_INDEX: usize = 0;
 const READER_RHS_ADDR_INDEX: usize = 1;
 const READER_LHS_SINGLE_TILE_INDEX: usize = 4;
@@ -15,22 +16,45 @@ const READER_RHS_SINGLE_TILE_INDEX: usize = 5;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-struct AddProgramKey {
+enum BinaryEltwiseOp {
+    Add,
+    Max,
+}
+
+impl BinaryEltwiseOp {
+    fn compute_source(self) -> &'static str {
+        match self {
+            Self::Add => ADD_BF16_COMPUTE,
+            Self::Max => MAX_BF16_COMPUTE,
+        }
+    }
+
+    fn kernel_name(self) -> &'static str {
+        match self {
+            Self::Add => "eltwise_add_bf16",
+            Self::Max => "eltwise_max_bf16",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct BinaryEltwiseProgramKey {
+    op: BinaryEltwiseOp,
     core: CoreCoord,
     tile_count: u32,
 }
 
-struct AddBf16Kernel {
+struct BinaryEltwiseBf16Kernel {
     lhs_addr: u32,
     rhs_addr: u32,
     lhs_single_tile: bool,
     rhs_single_tile: bool,
     output_addr: u32,
-    key: AddProgramKey,
+    key: BinaryEltwiseProgramKey,
 }
 
-impl Kernel<AddProgramKey> for AddBf16Kernel {
-    fn program_key(&self) -> AddProgramKey {
+impl Kernel<BinaryEltwiseProgramKey> for BinaryEltwiseBf16Kernel {
+    fn program_key(&self) -> BinaryEltwiseProgramKey {
         self.key
     }
 
@@ -64,10 +88,31 @@ pub(crate) fn eltwise_add_bf16(
     rhs: &DramBuffer,
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
+    eltwise_bf16(device, BinaryEltwiseOp::Add, lhs, rhs, name)
+}
+
+pub(crate) fn eltwise_max_bf16(
+    device: &mut Device,
+    lhs: &DramBuffer,
+    rhs: &DramBuffer,
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
+    eltwise_bf16(device, BinaryEltwiseOp::Max, lhs, rhs, name)
+}
+
+fn eltwise_bf16(
+    device: &mut Device,
+    op: BinaryEltwiseOp,
+    lhs: &DramBuffer,
+    rhs: &DramBuffer,
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
     if lhs.dtype != DType::Float16B || rhs.dtype != DType::Float16B {
         return Err(invalid_input(format!(
-            "eltwise_add_bf16 requires bf16 inputs, got {:?} and {:?}",
-            lhs.dtype, rhs.dtype
+            "{} requires bf16 inputs, got {:?} and {:?}",
+            op.kernel_name(),
+            lhs.dtype,
+            rhs.dtype
         )));
     }
     if lhs.shape != rhs.shape {
@@ -91,13 +136,17 @@ pub(crate) fn eltwise_add_bf16(
     let output = device.alloc(output_tiles, DType::Float16B, &lhs.shape, name)?;
     let output_addr = u32_arg(output.addr, "output address")?;
 
-    let kernel = AddBf16Kernel {
+    let kernel = BinaryEltwiseBf16Kernel {
         lhs_addr,
         rhs_addr,
         lhs_single_tile: lhs.num_tiles == 1,
         rhs_single_tile: rhs.num_tiles == 1,
         output_addr,
-        key: AddProgramKey { core, tile_count },
+        key: BinaryEltwiseProgramKey {
+            op,
+            core,
+            tile_count,
+        },
     };
     kernel.run(device)?;
     Ok(output)
@@ -112,7 +161,7 @@ fn u32_arg(value: u64, name: &str) -> io::Result<u32> {
         .map_err(|_| invalid_input(format!("{name} does not fit in u32: 0x{value:x}")))
 }
 
-fn bf16_program(key: AddProgramKey) -> io::Result<Program> {
+fn bf16_program(key: BinaryEltwiseProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
         vec![WRITER_OUTPUT_ADDR_INDEX],
@@ -133,7 +182,7 @@ fn bf16_program(key: AddProgramKey) -> io::Result<Program> {
     let runtime_args = runtime_args.build()?;
     Ok(Program {
         reader_kernel: BF16_READER.to_owned(),
-        compute_kernel: BF16_COMPUTE.to_owned(),
+        compute_kernel: key.op.compute_source().to_owned(),
         writer_kernel: BF16_WRITER.to_owned(),
         compile: CompileConfig {
             cbs: vec![
@@ -143,7 +192,7 @@ fn bf16_program(key: AddProgramKey) -> io::Result<Program> {
             ],
             ..CompileConfig::default()
         },
-        name: "eltwise_add_bf16".to_owned(),
+        name: key.op.kernel_name().to_owned(),
         ..Program::new(runtime_args)
     })
 }

@@ -1471,9 +1471,10 @@ fn execute_executable_v1(
                 };
 
                 let output_dims = lhs.dims.clone();
-                let output_dram =
-                    kernels::add::eltwise_add_bf16(device, lhs_dram, rhs_dram, "pjrt_add")
-                        .map_err(io_error)?;
+                let output_dram = kernels::binary_eltwise::eltwise_add_bf16(
+                    device, lhs_dram, rhs_dram, "pjrt_add",
+                )
+                .map_err(io_error)?;
                 store_output_buffer(
                     &mut values,
                     plan,
@@ -1516,9 +1517,10 @@ fn execute_executable_v1(
                 };
 
                 let output_dims = lhs.dims.clone();
-                let output_dram =
-                    kernels::max::eltwise_max_bf16(device, lhs_dram, rhs_dram, "pjrt_max")
-                        .map_err(io_error)?;
+                let output_dram = kernels::binary_eltwise::eltwise_max_bf16(
+                    device, lhs_dram, rhs_dram, "pjrt_max",
+                )
+                .map_err(io_error)?;
                 store_output_buffer(
                     &mut values,
                     plan,
