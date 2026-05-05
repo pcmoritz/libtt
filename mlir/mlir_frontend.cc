@@ -188,15 +188,13 @@ bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& 
     return true;
 }
 
-constexpr size_t kTileElements = 32 * 32;
-
 void appendLittleEndian(llvm::APInt bits, size_t byte_width, std::string& out) {
     for (size_t index = 0; index < byte_width; ++index) {
         out.push_back(static_cast<char>(bits.extractBitsAsZExtValue(8, index * 8)));
     }
 }
 
-std::optional<std::string> constantTile(
+std::optional<std::string> constantValue(
     mlir::stablehlo::ConstantOp constant_op,
     std::string& error) {
     auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
@@ -217,23 +215,21 @@ std::optional<std::string> constantTile(
                     ? dense.getSplatValue<llvm::APFloat>().bitcastToAPInt()
                     : dense.getSplatValue<llvm::APInt>();
 
-    std::string tile;
-    tile.reserve(byte_width * kTileElements);
-    for (size_t index = 0; index < kTileElements; ++index) {
-        appendLittleEndian(bits, byte_width, tile);
-    }
-    return tile;
+    std::string value;
+    value.reserve(byte_width);
+    appendLittleEndian(bits, byte_width, value);
+    return value;
 }
 
-bool hasTileShape(mlir::Value value) {
+bool hasTensorShape(mlir::Value value) {
     auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
     return tensor && tensor.getRank() >= 2;
 }
 
-void addConstantOp(tt::Executable& executable, uint32_t output_id, const std::string& tile) {
+void addConstantOp(tt::Executable& executable, uint32_t output_id, const std::string& value) {
     auto* constant = executable.add_ops();
     constant->set_output_id(output_id);
-    constant->mutable_constant()->set_tile(tile);
+    constant->mutable_constant()->set_value(value);
 }
 
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
@@ -247,7 +243,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     }
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
-    llvm::DenseMap<mlir::Value, std::string> constant_tiles;
+    llvm::DenseMap<mlir::Value, std::string> constant_values;
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
         uint32_t output_id = 0;
@@ -278,13 +274,13 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(constant_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            auto tile = constantTile(constant_op, error);
-            if (!tile) {
+            auto value = constantValue(constant_op, error);
+            if (!value) {
                 return false;
             }
-            constant_tiles.try_emplace(constant_op.getResult(), *tile);
-            if (hasTileShape(constant_op.getResult())) {
-                addConstantOp(executable, output_id, *tile);
+            constant_values.try_emplace(constant_op.getResult(), *value);
+            if (hasTensorShape(constant_op.getResult())) {
+                addConstantOp(executable, output_id, *value);
             }
             continue;
         }
@@ -294,10 +290,10 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(broadcast_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            auto constant = constant_tiles.find(broadcast_op.getOperand());
-            if (constant != constant_tiles.end()) {
+            auto constant = constant_values.find(broadcast_op.getOperand());
+            if (constant != constant_values.end()) {
                 addConstantOp(executable, output_id, constant->second);
-                constant_tiles.try_emplace(broadcast_op.getResult(), constant->second);
+                constant_values.try_emplace(broadcast_op.getResult(), constant->second);
             } else {
                 error = "only broadcast_in_dim of constants is currently supported";
                 return false;

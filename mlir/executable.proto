@@ -49,9 +49,9 @@ message MaxOp {
 }
 
 message ConstantOp {
-  // One 32x32 tile in device tile order. Op.output_id keeps the logical tensor
-  // shape, but the backing DRAM allocation contains only this tile.
-  bytes tile = 1;
+  // Splat scalar value in little-endian element byte order. Op.output_id keeps
+  // the logical tensor shape.
+  bytes value = 1;
 }
 
 message Op {

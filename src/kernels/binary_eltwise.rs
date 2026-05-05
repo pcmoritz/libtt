@@ -11,9 +11,11 @@ const ADD_BF16_COMPUTE: &str = include_str!("../../kernels/add_compute.cc");
 const MAX_BF16_COMPUTE: &str = include_str!("../../kernels/max_compute.cc");
 const READER_LHS_ADDR_INDEX: usize = 0;
 const READER_RHS_ADDR_INDEX: usize = 1;
-const READER_LHS_SINGLE_TILE_INDEX: usize = 4;
-const READER_RHS_SINGLE_TILE_INDEX: usize = 5;
+const READER_LHS_CONSTANT_INDEX: usize = 4;
+const READER_RHS_CONSTANT_INDEX: usize = 5;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
+const TILE_R: usize = 32;
+const TILE_C: usize = 32;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum BinaryEltwiseOp {
@@ -47,8 +49,8 @@ struct BinaryEltwiseProgramKey {
 struct BinaryEltwiseBf16Kernel {
     lhs_addr: u32,
     rhs_addr: u32,
-    lhs_single_tile: bool,
-    rhs_single_tile: bool,
+    lhs_constant: Option<u32>,
+    rhs_constant: Option<u32>,
     output_addr: u32,
     key: BinaryEltwiseProgramKey,
 }
@@ -67,8 +69,8 @@ impl Kernel<BinaryEltwiseProgramKey> for BinaryEltwiseBf16Kernel {
         match index {
             READER_LHS_ADDR_INDEX => Some(self.lhs_addr),
             READER_RHS_ADDR_INDEX => Some(self.rhs_addr),
-            READER_LHS_SINGLE_TILE_INDEX => Some(u32::from(self.lhs_single_tile)),
-            READER_RHS_SINGLE_TILE_INDEX => Some(u32::from(self.rhs_single_tile)),
+            READER_LHS_CONSTANT_INDEX => Some(self.lhs_constant.unwrap_or(0)),
+            READER_RHS_CONSTANT_INDEX => Some(self.rhs_constant.unwrap_or(0)),
             _ => None,
         }
     }
@@ -82,32 +84,26 @@ impl Kernel<BinaryEltwiseProgramKey> for BinaryEltwiseBf16Kernel {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Bf16EltwiseInput<'a> {
+    Dram(&'a DramBuffer),
+    Constant(u32),
+}
+
 pub(crate) fn eltwise_bf16(
     device: &mut Device,
     op: BinaryEltwiseOp,
-    lhs: &DramBuffer,
-    rhs: &DramBuffer,
+    lhs: Bf16EltwiseInput<'_>,
+    rhs: Bf16EltwiseInput<'_>,
+    shape: &[usize],
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
-    if lhs.dtype != DType::Float16B || rhs.dtype != DType::Float16B {
-        return Err(invalid_input(format!(
-            "{} requires bf16 inputs, got {:?} and {:?}",
-            op.kernel_name(),
-            lhs.dtype,
-            rhs.dtype
-        )));
-    }
-    if lhs.shape != rhs.shape {
-        return Err(invalid_input(format!(
-            "input shapes must match, got {:?} and {:?}",
-            lhs.shape, rhs.shape
-        )));
-    }
-    let output_tiles = lhs.validate_single_or_logical_tile_count("lhs")?;
-    rhs.validate_single_or_logical_tile_count("rhs")?;
+    let output_tiles = shape_tile_count(shape)?;
+    validate_input(lhs, shape, output_tiles, "lhs")?;
+    validate_input(rhs, shape, output_tiles, "rhs")?;
 
-    let lhs_addr = u32_arg(lhs.addr, "lhs address")?;
-    let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
+    let lhs_addr = input_addr(lhs, "lhs address")?;
+    let rhs_addr = input_addr(rhs, "rhs address")?;
     let tile_count = u32::try_from(output_tiles)
         .map_err(|_| invalid_input(format!("tile count does not fit in u32: {output_tiles}")))?;
     let core = device
@@ -115,14 +111,14 @@ pub(crate) fn eltwise_bf16(
         .first()
         .copied()
         .ok_or_else(|| invalid_input("no worker cores are available"))?;
-    let output = device.alloc(output_tiles, DType::Float16B, &lhs.shape, name)?;
+    let output = device.alloc(output_tiles, DType::Float16B, shape, name)?;
     let output_addr = u32_arg(output.addr, "output address")?;
 
     let kernel = BinaryEltwiseBf16Kernel {
         lhs_addr,
         rhs_addr,
-        lhs_single_tile: lhs.num_tiles == 1,
-        rhs_single_tile: rhs.num_tiles == 1,
+        lhs_constant: input_constant(lhs),
+        rhs_constant: input_constant(rhs),
         output_addr,
         key: BinaryEltwiseProgramKey {
             op,
@@ -132,6 +128,71 @@ pub(crate) fn eltwise_bf16(
     };
     kernel.run(device)?;
     Ok(output)
+}
+
+fn validate_input(
+    input: Bf16EltwiseInput<'_>,
+    shape: &[usize],
+    expected_tiles: usize,
+    name: &str,
+) -> io::Result<()> {
+    let Bf16EltwiseInput::Dram(buffer) = input else {
+        return Ok(());
+    };
+    if buffer.dtype != DType::Float16B {
+        return Err(invalid_input(format!(
+            "{name} requires bf16 input, got {:?}",
+            buffer.dtype
+        )));
+    }
+    if buffer.shape != shape {
+        return Err(invalid_input(format!(
+            "{name} shape mismatch: got {:?}, expected {:?}",
+            buffer.shape, shape
+        )));
+    }
+    if buffer.num_tiles != expected_tiles {
+        return Err(invalid_input(format!(
+            "{name} tile count mismatch: got {}, expected {expected_tiles}",
+            buffer.num_tiles
+        )));
+    }
+    Ok(())
+}
+
+fn input_addr(input: Bf16EltwiseInput<'_>, name: &str) -> io::Result<u32> {
+    match input {
+        Bf16EltwiseInput::Dram(buffer) => u32_arg(buffer.addr, name),
+        Bf16EltwiseInput::Constant(_) => Ok(0),
+    }
+}
+
+fn input_constant(input: Bf16EltwiseInput<'_>) -> Option<u32> {
+    match input {
+        Bf16EltwiseInput::Dram(_) => None,
+        Bf16EltwiseInput::Constant(value) => Some(value),
+    }
+}
+
+#[allow(clippy::manual_is_multiple_of)]
+fn shape_tile_count(shape: &[usize]) -> io::Result<usize> {
+    if shape.len() < 2 {
+        return Err(invalid_input("shape must have at least two dimensions"));
+    }
+    let rows = shape[shape.len() - 2];
+    let cols = shape[shape.len() - 1];
+    if rows % TILE_R != 0 || cols % TILE_C != 0 {
+        return Err(invalid_input(format!(
+            "shape rows/cols must be multiples of {TILE_R}x{TILE_C}"
+        )));
+    }
+    let tiles_per_batch = (rows / TILE_R)
+        .checked_mul(cols / TILE_C)
+        .ok_or_else(|| invalid_input("shape tile count is too large"))?;
+    shape[..shape.len() - 2]
+        .iter()
+        .try_fold(tiles_per_batch, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| invalid_input("shape tile count is too large"))
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -150,8 +211,8 @@ fn bf16_program(key: BinaryEltwiseProgramKey) -> io::Result<Program> {
         vec![
             READER_LHS_ADDR_INDEX,
             READER_RHS_ADDR_INDEX,
-            READER_LHS_SINGLE_TILE_INDEX,
-            READER_RHS_SINGLE_TILE_INDEX,
+            READER_LHS_CONSTANT_INDEX,
+            READER_RHS_CONSTANT_INDEX,
         ],
         Vec::new(),
     );

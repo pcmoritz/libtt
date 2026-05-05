@@ -415,7 +415,7 @@ impl Device {
         self.allocator_mut()?.read_host_data(buf)
     }
 
-    pub(crate) fn allocator_mut(&mut self) -> io::Result<&mut Allocator> {
+    fn allocator_mut(&mut self) -> io::Result<&mut Allocator> {
         if self.allocator.is_none() {
             self.allocator = Some(Allocator::from_device(self)?);
         }
