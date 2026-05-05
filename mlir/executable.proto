@@ -49,9 +49,9 @@ message MaxOp {
 }
 
 message ConstantOp {
-  // Splat scalar value in little-endian element byte order. Op.output_id keeps
+  // Splat bf16 scalar duplicated into both u32 halfwords. Op.output_id keeps
   // the logical tensor shape.
-  bytes value = 1;
+  uint32 packed_value = 1;
 }
 
 message Op {

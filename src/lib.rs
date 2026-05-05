@@ -426,18 +426,6 @@ fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
     })
 }
 
-fn packed_bf16_constant(value: &[u8], field: &str) -> Result<u32, *mut PJRT_Error> {
-    if value.len() != DType::Float16B.bytes_per_element() {
-        return Err(invalid_argument(format!(
-            "{field} constant has {} bytes, expected {}",
-            value.len(),
-            DType::Float16B.bytes_per_element()
-        )));
-    }
-    let value = u16::from_le_bytes([value[0], value[1]]);
-    Ok(u32::from(value) | (u32::from(value) << 16))
-}
-
 fn with_device<T>(
     pjrt_device: &mut PJRT_Device,
     f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
@@ -1327,10 +1315,14 @@ fn bf16_eltwise_input<'a>(
         return Ok(kernels::binary_eltwise::Bf16EltwiseInput::Dram(dram_buffer));
     }
     for op in &plan.ops {
-        if let executable::Op::Constant { value, output_id } = op {
+        if let executable::Op::Constant {
+            packed_value,
+            output_id,
+        } = op
+        {
             if *output_id == value_id {
                 return Ok(kernels::binary_eltwise::Bf16EltwiseInput::Constant(
-                    packed_bf16_constant(value, field)?,
+                    *packed_value,
                 ));
             }
         }
@@ -3079,12 +3071,15 @@ mod tests {
             .expect("compiled executable should contain a TT executable");
         assert_eq!(executable.output_ids, vec![3]);
         assert_eq!(executable.ops.len(), 3);
-        let executable::Op::Constant { value, output_id } = &executable.ops[1] else {
+        let executable::Op::Constant {
+            packed_value,
+            output_id,
+        } = &executable.ops[1]
+        else {
             panic!("broadcasted constant should lower to Constant");
         };
         assert_eq!(*output_id, 2);
-        assert_eq!(value.len(), DType::Float16B.bytes_per_element());
-        assert_eq!(value, &[0x80, 0x3f]);
+        assert_eq!(*packed_value, 0x3f80_3f80);
         assert!(matches!(executable.ops[2], executable::Op::Max { .. }));
 
         unsafe {

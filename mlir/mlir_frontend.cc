@@ -7,7 +7,6 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APFloat.h"
-#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -188,13 +187,7 @@ bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& 
     return true;
 }
 
-void appendLittleEndian(llvm::APInt bits, size_t byte_width, std::string& out) {
-    for (size_t index = 0; index < byte_width; ++index) {
-        out.push_back(static_cast<char>(bits.extractBitsAsZExtValue(8, index * 8)));
-    }
-}
-
-std::optional<std::string> constantValue(
+std::optional<uint32_t> packedBf16ConstantValue(
     mlir::stablehlo::ConstantOp constant_op,
     std::string& error) {
     auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
@@ -204,21 +197,14 @@ std::optional<std::string> constantValue(
     }
 
     auto element_type = mlir::cast<mlir::ShapedType>(dense.getType()).getElementType();
-    auto bit_width = element_type.getIntOrFloatBitWidth();
-    if (bit_width % 8 != 0) {
-        error = "constant element bit width must be a whole number of bytes";
+    if (!element_type.isBF16()) {
+        error = "only bf16 constants are currently supported";
         return std::nullopt;
     }
-    size_t byte_width = bit_width / 8;
 
-    auto bits = mlir::isa<mlir::FloatType>(element_type)
-                    ? dense.getSplatValue<llvm::APFloat>().bitcastToAPInt()
-                    : dense.getSplatValue<llvm::APInt>();
-
-    std::string value;
-    value.reserve(byte_width);
-    appendLittleEndian(bits, byte_width, value);
-    return value;
+    auto bits = dense.getSplatValue<llvm::APFloat>().bitcastToAPInt();
+    uint32_t bf16 = bits.extractBitsAsZExtValue(16, 0);
+    return bf16 | (bf16 << 16);
 }
 
 bool hasTensorShape(mlir::Value value) {
@@ -226,10 +212,10 @@ bool hasTensorShape(mlir::Value value) {
     return tensor && tensor.getRank() >= 2;
 }
 
-void addConstantOp(tt::Executable& executable, uint32_t output_id, const std::string& value) {
+void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value) {
     auto* constant = executable.add_ops();
     constant->set_output_id(output_id);
-    constant->mutable_constant()->set_value(value);
+    constant->mutable_constant()->set_packed_value(packed_value);
 }
 
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
@@ -243,7 +229,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     }
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
-    llvm::DenseMap<mlir::Value, std::string> constant_values;
+    llvm::DenseMap<mlir::Value, uint32_t> constant_values;
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
         uint32_t output_id = 0;
@@ -274,13 +260,13 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(constant_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            auto value = constantValue(constant_op, error);
-            if (!value) {
+            auto packed_value = packedBf16ConstantValue(constant_op, error);
+            if (!packed_value) {
                 return false;
             }
-            constant_values.try_emplace(constant_op.getResult(), *value);
+            constant_values.try_emplace(constant_op.getResult(), *packed_value);
             if (hasTensorShape(constant_op.getResult())) {
-                addConstantOp(executable, output_id, *value);
+                addConstantOp(executable, output_id, *packed_value);
             }
             continue;
         }
