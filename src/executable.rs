@@ -79,6 +79,13 @@ pub(crate) enum Op {
         input_id: u32,
         output_id: u32,
     },
+    Slice {
+        input_id: u32,
+        output_id: u32,
+        start_indices: Vec<i64>,
+        limit_indices: Vec<i64>,
+        strides: Vec<i64>,
+    },
     Convert {
         input_id: u32,
         output_id: u32,
@@ -280,6 +287,13 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     input_id: reshape.operand_id,
                     output_id: op_desc.output_id,
                 }),
+                Kind::Slice(slice) => Ok(Op::Slice {
+                    input_id: slice.operand_id,
+                    output_id: op_desc.output_id,
+                    start_indices: slice.start_indices,
+                    limit_indices: slice.limit_indices,
+                    strides: slice.strides,
+                }),
                 Kind::Convert(convert) => Ok(Op::Convert {
                     input_id: convert.operand_id,
                     output_id: op_desc.output_id,
@@ -438,6 +452,13 @@ pub(crate) enum Op {
     Reshape {
         input_id: u32,
         output_id: u32,
+    },
+    Slice {
+        input_id: u32,
+        output_id: u32,
+        start_indices: Vec<i64>,
+        limit_indices: Vec<i64>,
+        strides: Vec<i64>,
     },
     Convert {
         input_id: u32,

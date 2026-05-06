@@ -81,6 +81,14 @@ message ReshapeOp {
   uint32 operand_id = 1;
 }
 
+message SliceOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+  repeated int64 start_indices = 2;
+  repeated int64 limit_indices = 3;
+  repeated int64 strides = 4;
+}
+
 message ConvertOp {
   // Index into Executable.values for this op's operand.
   uint32 operand_id = 1;
@@ -192,6 +200,7 @@ message Op {
     ReduceOp reduce = 19;
     RsqrtOp rsqrt = 20;
     ReshapeOp reshape = 21;
+    SliceOp slice = 22;
   }
 }
 
