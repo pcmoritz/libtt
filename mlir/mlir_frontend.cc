@@ -403,6 +403,7 @@ extern "C" bool TT_MlirAnalyzeProgram(
 
     mlir::MLIRContext context;
     registerDialects(context);
+    context.allowUnregisteredDialects();
 
     auto module = parseModule(
         context,
