@@ -15,6 +15,7 @@ message TensorDesc {
     ELEMENT_TYPE_U8 = 6;
     ELEMENT_TYPE_S32 = 7;
     ELEMENT_TYPE_S8 = 8;
+    ELEMENT_TYPE_PRED = 9;
   }
 
   repeated int64 dims = 1;
@@ -49,8 +50,9 @@ message MaxOp {
 }
 
 message ConstantOp {
-  // Splat bf16 scalar duplicated into both u32 halfwords. Op.output_id keeps
-  // the logical tensor shape.
+  // Splat scalar packed according to Op.output_id's logical element type.
+  // 16-bit values are duplicated into both u32 halfwords; 32-bit and narrower
+  // integer/predicate values use their raw low bits.
   uint32 packed_value = 1;
 }
 

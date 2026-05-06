@@ -1380,6 +1380,17 @@ fn bf16_eltwise_input<'a>(
         } = op
         {
             if *output_id == value_id {
+                let desc = plan.values.get(index).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "{field} constant value id {value_id} is out of bounds"
+                    ))
+                })?;
+                if desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+                    return Err(unimplemented(format!(
+                        "{field} constant value id {value_id} has type {:?}; bf16 eltwise constants currently require bf16",
+                        desc.element_type
+                    )));
+                }
                 return Ok(kernels::binary_eltwise::Bf16EltwiseInput::Constant(
                     *packed_value,
                 ));
@@ -2679,11 +2690,8 @@ mod tests {
     use crate::device::{Device, ProbeInfo};
     use std::path::PathBuf;
 
-    fn check_ok(api: &PJRT_Api, error: *mut PJRT_Error) {
-        if error.is_null() {
-            return;
-        }
-
+    fn take_error_detail(api: &PJRT_Api, error: *mut PJRT_Error) -> (PJRT_Error_Code, String) {
+        assert!(!error.is_null(), "expected PJRT error");
         let mut code_args = PJRT_Error_GetCode_Args {
             struct_size: size_of::<PJRT_Error_GetCode_Args>(),
             extension_start: ptr::null_mut(),
@@ -2723,7 +2731,16 @@ mod tests {
                 error,
             });
         }
-        panic!("unexpected PJRT error {:?}: {detail}", code_args.code);
+        (code_args.code, detail)
+    }
+
+    fn check_ok(api: &PJRT_Api, error: *mut PJRT_Error) {
+        if error.is_null() {
+            return;
+        }
+
+        let (code, detail) = take_error_detail(api, error);
+        panic!("unexpected PJRT error {code:?}: {detail}");
     }
 
     #[test]
@@ -3183,6 +3200,53 @@ mod tests {
         unsafe {
             drop(Box::from_raw(get_executable_args.executable));
             drop(Box::from_raw(compile_args.executable));
+            drop(Box::from_raw(client));
+        }
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_packs_integer_broadcast_constant() {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"mlir".to_vec();
+        let mut code = br#"module {
+  func.func public @main(%arg0: tensor<2xi32>) -> tensor<2xi1> {
+    %c = stablehlo.constant dense<0> : tensor<i32>
+    %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<2xi32>
+    %1 = stablehlo.compare LT, %arg0, %0, SIGNED : (tensor<2xi32>, tensor<2xi32>) -> tensor<2xi1>
+    return %1 : tensor<2xi1>
+  }
+}
+"#
+        .to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: code.as_mut_ptr().cast::<c_char>(),
+            code_size: code.len(),
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        let error = unsafe { compile(&mut compile_args) };
+        let (code, detail) = take_error_detail(api, error);
+        assert_eq!(code, PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED);
+        assert_eq!(detail, "unsupported entry op: stablehlo.compare");
+
+        unsafe {
             drop(Box::from_raw(client));
         }
     }
