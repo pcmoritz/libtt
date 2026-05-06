@@ -1,11 +1,11 @@
 #include <cstdlib>
-#include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -100,6 +100,8 @@ tt::TensorDesc::ElementType mapProtoElementType(mlir::Type element_type) {
     if (element_type.isF32()) return tt::TensorDesc::ELEMENT_TYPE_F32;
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
         switch (integer.getWidth()) {
+            case 1:
+                return tt::TensorDesc::ELEMENT_TYPE_PRED;
             case 8:
                 return integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U8
                                             : tt::TensorDesc::ELEMENT_TYPE_S8;
@@ -187,7 +189,7 @@ bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& 
     return true;
 }
 
-std::optional<uint32_t> packedBf16ConstantValue(mlir::Value value, std::string& error) {
+std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& error) {
     while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
         value = broadcast_op.getOperand();
     }
@@ -205,14 +207,23 @@ std::optional<uint32_t> packedBf16ConstantValue(mlir::Value value, std::string& 
     }
 
     auto element_type = mlir::cast<mlir::ShapedType>(dense.getType()).getElementType();
-    if (!element_type.isBF16()) {
-        error = "only bf16 constants are currently supported";
-        return std::nullopt;
+    if (element_type.isBF16() || element_type.isF16()) {
+        auto bits = dense.getSplatValue<llvm::APFloat>().bitcastToAPInt();
+        uint32_t value16 = bits.extractBitsAsZExtValue(16, 0);
+        return value16 | (value16 << 16);
     }
-
-    auto bits = dense.getSplatValue<llvm::APFloat>().bitcastToAPInt();
-    uint32_t bf16 = bits.extractBitsAsZExtValue(16, 0);
-    return bf16 | (bf16 << 16);
+    if (element_type.isF32()) {
+        auto bits = dense.getSplatValue<llvm::APFloat>().bitcastToAPInt();
+        return bits.extractBitsAsZExtValue(32, 0);
+    }
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
+        if (integer.getWidth() <= 32) {
+            auto bits = dense.getSplatValue<llvm::APInt>();
+            return bits.extractBitsAsZExtValue(32, 0);
+        }
+    }
+    error = "only bf16/f16/f32 and <=32-bit integer splat constants are currently supported";
+    return std::nullopt;
 }
 
 void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value) {
@@ -262,12 +273,12 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(constant_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            auto packed_value = packedBf16ConstantValue(constant_op.getResult(), error);
-            if (!packed_value) {
-                return false;
-            }
             auto tensor = mlir::cast<mlir::RankedTensorType>(constant_op.getResult().getType());
             if (tensor.getRank() >= 2) {
+                auto packed_value = packedConstantValue(constant_op.getResult(), error);
+                if (!packed_value) {
+                    return false;
+                }
                 addConstantOp(executable, output_id, *packed_value);
             }
             continue;
@@ -278,7 +289,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(broadcast_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            auto packed_value = packedBf16ConstantValue(broadcast_op.getOperand(), error);
+            auto packed_value = packedConstantValue(broadcast_op.getOperand(), error);
             if (!packed_value) {
                 return false;
             }
@@ -403,6 +414,7 @@ extern "C" bool TT_MlirAnalyzeProgram(
 
     mlir::MLIRContext context;
     registerDialects(context);
+    context.allowUnregisteredDialects();
 
     auto module = parseModule(
         context,

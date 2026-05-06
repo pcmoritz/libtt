@@ -143,6 +143,7 @@ unsafe impl Sync for PJRT_Api {}
 
 #[cfg(libtt_mlir_frontend)]
 const EXECUTABLE_NAME: &str = "tt.executable.v1";
+const TILED_BUFFER_DIM: usize = 32;
 
 impl PJRT_Client {
     fn new() -> Self {
@@ -372,6 +373,42 @@ fn host_byte_size(dtype: DType, dims: &[usize]) -> Result<usize, *mut PJRT_Error
         .ok_or_else(|| resource_exhausted("host buffer size overflow"))
 }
 
+fn round_up_to_tiled_dim(dim: usize) -> Result<usize, *mut PJRT_Error> {
+    dim.max(1)
+        .checked_add(TILED_BUFFER_DIM - 1)
+        .map(|value| value / TILED_BUFFER_DIM * TILED_BUFFER_DIM)
+        .ok_or_else(|| resource_exhausted("shape dimension overflow"))
+}
+
+fn tiled_allocation_shape(shape: &[usize]) -> Result<Vec<usize>, *mut PJRT_Error> {
+    match shape.len() {
+        0 => Ok(vec![TILED_BUFFER_DIM, TILED_BUFFER_DIM]),
+        1 => Ok(vec![TILED_BUFFER_DIM, round_up_to_tiled_dim(shape[0])?]),
+        _ => Ok(shape.to_vec()),
+    }
+}
+
+fn padded_host_data(
+    data: &[u8],
+    dtype: DType,
+    logical_shape: &[usize],
+    allocation_shape: &[usize],
+) -> Result<Option<Vec<u8>>, *mut PJRT_Error> {
+    if logical_shape == allocation_shape {
+        return Ok(None);
+    }
+
+    let allocation_size = host_byte_size(dtype, allocation_shape)?;
+    if data.len() > allocation_size {
+        return Err(invalid_argument(
+            "logical buffer is larger than allocation buffer",
+        ));
+    }
+    let mut padded = vec![0u8; allocation_size];
+    padded[..data.len()].copy_from_slice(data);
+    Ok(Some(padded))
+}
+
 fn validate_dense_row_major_strides(
     dtype: DType,
     dims: &[usize],
@@ -424,6 +461,28 @@ fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
     with_device_ptr(buffer.device, |device| {
         device.dram_read(dram_buffer).map_err(io_error)
     })
+}
+
+fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
+    let dtype = pjrt_buffer_type_to_dtype(buffer.buffer_type)?;
+    let dims = dims_i64_to_usize(&buffer.dims)?;
+    let byte_size = host_byte_size(dtype, &dims)?;
+    let mut data = read_buffer_bytes(buffer)?;
+    if data.len() == byte_size {
+        return Ok(data);
+    }
+    if buffer.dims.len() < 2 && data.len() >= byte_size {
+        data.truncate(byte_size);
+        return Ok(data);
+    }
+    Err(pjrt_error(
+        format!(
+            "readback byte size {} does not match buffer byte size {}",
+            data.len(),
+            byte_size
+        ),
+        PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
+    ))
 }
 
 fn with_device<T>(
@@ -1321,6 +1380,17 @@ fn bf16_eltwise_input<'a>(
         } = op
         {
             if *output_id == value_id {
+                let desc = plan.values.get(index).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "{field} constant value id {value_id} is out of bounds"
+                    ))
+                })?;
+                if desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+                    return Err(unimplemented(format!(
+                        "{field} constant value id {value_id} has type {:?}; bf16 eltwise constants currently require bf16",
+                        desc.element_type
+                    )));
+                }
                 return Ok(kernels::binary_eltwise::Bf16EltwiseInput::Constant(
                     *packed_value,
                 ));
@@ -1744,9 +1814,18 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         // SAFETY: caller owns `data` for `byte_size` bytes during the call.
         unsafe { slice::from_raw_parts(args.data.cast::<u8>(), byte_size) }
     };
+    let allocation_shape = match tiled_allocation_shape(&shape) {
+        Ok(shape) => shape,
+        Err(err) => return err,
+    };
+    let padded_data = match padded_host_data(data, dtype, &shape, &allocation_shape) {
+        Ok(data) => data,
+        Err(err) => return err,
+    };
+    let allocation_data = padded_data.as_deref().unwrap_or(data);
     let dram_buffer = match with_device(target_device_ref, |device| {
         device
-            .alloc_write(data, dtype, &shape, "pjrt")
+            .alloc_write(allocation_data, dtype, &allocation_shape, "pjrt")
             .map_err(io_error)
     }) {
         Ok(buffer) => buffer,
@@ -2253,7 +2332,7 @@ pub unsafe extern "C" fn TT_Buffer_ToHostBuffer(
         return invalid_argument("dst must not be null for non-empty buffers");
     }
 
-    let data = match read_buffer_bytes(buffer) {
+    let data = match read_buffer_logical_bytes(buffer) {
         Ok(data) => data,
         Err(err) => return err,
     };
@@ -2349,7 +2428,7 @@ pub unsafe extern "C" fn TT_Buffer_CopyRawToHost(
         return invalid_argument("dst must not be null for non-empty transfers");
     }
 
-    let data = match read_buffer_bytes(buffer) {
+    let data = match read_buffer_logical_bytes(buffer) {
         Ok(data) => data,
         Err(err) => return err,
     };
@@ -2611,11 +2690,8 @@ mod tests {
     use crate::device::{Device, ProbeInfo};
     use std::path::PathBuf;
 
-    fn check_ok(api: &PJRT_Api, error: *mut PJRT_Error) {
-        if error.is_null() {
-            return;
-        }
-
+    fn take_error_detail(api: &PJRT_Api, error: *mut PJRT_Error) -> (PJRT_Error_Code, String) {
+        assert!(!error.is_null(), "expected PJRT error");
         let mut code_args = PJRT_Error_GetCode_Args {
             struct_size: size_of::<PJRT_Error_GetCode_Args>(),
             extension_start: ptr::null_mut(),
@@ -2655,7 +2731,46 @@ mod tests {
                 error,
             });
         }
-        panic!("unexpected PJRT error {:?}: {detail}", code_args.code);
+        (code_args.code, detail)
+    }
+
+    fn check_ok(api: &PJRT_Api, error: *mut PJRT_Error) {
+        if error.is_null() {
+            return;
+        }
+
+        let (code, detail) = take_error_detail(api, error);
+        panic!("unexpected PJRT error {code:?}: {detail}");
+    }
+
+    #[test]
+    fn tiled_allocation_shape_pads_scalar_and_vector_buffers() {
+        assert_eq!(
+            tiled_allocation_shape(&[]).expect("scalar shape should pad"),
+            vec![32, 32]
+        );
+        assert_eq!(
+            tiled_allocation_shape(&[5]).expect("vector shape should pad"),
+            vec![32, 32]
+        );
+        assert_eq!(
+            tiled_allocation_shape(&[128]).expect("aligned vector shape should pad rank"),
+            vec![32, 128]
+        );
+        assert_eq!(
+            tiled_allocation_shape(&[32, 64]).expect("rank-2 shape should be preserved"),
+            vec![32, 64]
+        );
+    }
+
+    #[test]
+    fn padded_host_data_places_logical_payload_at_start() {
+        let data = [1u8, 0, 2, 0, 3, 0];
+        let padded = padded_host_data(&data, DType::UInt16, &[3], &[32, 32])
+            .expect("vector payload should pad")
+            .expect("padding should be required");
+        assert_eq!(&padded[..data.len()], data);
+        assert!(padded[data.len()..].iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -3085,6 +3200,53 @@ mod tests {
         unsafe {
             drop(Box::from_raw(get_executable_args.executable));
             drop(Box::from_raw(compile_args.executable));
+            drop(Box::from_raw(client));
+        }
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_packs_integer_broadcast_constant() {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"mlir".to_vec();
+        let mut code = br#"module {
+  func.func public @main(%arg0: tensor<2xi32>) -> tensor<2xi1> {
+    %c = stablehlo.constant dense<0> : tensor<i32>
+    %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<2xi32>
+    %1 = stablehlo.compare LT, %arg0, %0, SIGNED : (tensor<2xi32>, tensor<2xi32>) -> tensor<2xi1>
+    return %1 : tensor<2xi1>
+  }
+}
+"#
+        .to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: code.as_mut_ptr().cast::<c_char>(),
+            code_size: code.len(),
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        let error = unsafe { compile(&mut compile_args) };
+        let (code, detail) = take_error_detail(api, error);
+        assert_eq!(code, PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED);
+        assert_eq!(detail, "unsupported entry op: stablehlo.compare");
+
+        unsafe {
             drop(Box::from_raw(client));
         }
     }

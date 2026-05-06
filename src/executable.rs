@@ -77,6 +77,7 @@ fn map_element_type(element_type: i32) -> Result<PJRT_Buffer_Type, String> {
         ElementType::U8 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_U8),
         ElementType::S32 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_S32),
         ElementType::S8 => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_S8),
+        ElementType::Pred => Ok(PJRT_Buffer_Type::PJRT_Buffer_Type_PRED),
     }
 }
 
