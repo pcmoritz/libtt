@@ -5,10 +5,12 @@
 #include <string>
 #include <vector>
 
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Dialect/Func/Extensions/AllExtensions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -185,6 +187,40 @@ bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& 
     return true;
 }
 
+std::optional<uint32_t> packedBf16ConstantValue(mlir::Value value, std::string& error) {
+    while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
+        value = broadcast_op.getOperand();
+    }
+
+    auto constant_op = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
+    if (!constant_op) {
+        error = "only broadcast_in_dim of constants is currently supported";
+        return std::nullopt;
+    }
+
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
+    if (!dense || !dense.isSplat()) {
+        error = "only splat constants are currently supported";
+        return std::nullopt;
+    }
+
+    auto element_type = mlir::cast<mlir::ShapedType>(dense.getType()).getElementType();
+    if (!element_type.isBF16()) {
+        error = "only bf16 constants are currently supported";
+        return std::nullopt;
+    }
+
+    auto bits = dense.getSplatValue<llvm::APFloat>().bitcastToAPInt();
+    uint32_t bf16 = bits.extractBitsAsZExtValue(16, 0);
+    return bf16 | (bf16 << 16);
+}
+
+void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value) {
+    auto* constant = executable.add_ops();
+    constant->set_output_id(output_id);
+    constant->mutable_constant()->set_packed_value(packed_value);
+}
+
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -221,6 +257,35 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto constant_op = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(op)) {
+            uint32_t output_id = 0;
+            if (!addValueDesc(constant_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+            auto packed_value = packedBf16ConstantValue(constant_op.getResult(), error);
+            if (!packed_value) {
+                return false;
+            }
+            auto tensor = mlir::cast<mlir::RankedTensorType>(constant_op.getResult().getType());
+            if (tensor.getRank() >= 2) {
+                addConstantOp(executable, output_id, *packed_value);
+            }
+            continue;
+        }
+
+        if (auto broadcast_op = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(op)) {
+            uint32_t output_id = 0;
+            if (!addValueDesc(broadcast_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+            auto packed_value = packedBf16ConstantValue(broadcast_op.getOperand(), error);
+            if (!packed_value) {
+                return false;
+            }
+            addConstantOp(executable, output_id, *packed_value);
+            continue;
+        }
+
         if (auto add_op = mlir::dyn_cast<mlir::stablehlo::AddOp>(op)) {
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;
@@ -235,6 +300,23 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             add->set_output_id(output_id);
             add->mutable_add()->set_lhs_id(lhs_id);
             add->mutable_add()->set_rhs_id(rhs_id);
+            continue;
+        }
+
+        if (auto max_op = mlir::dyn_cast<mlir::stablehlo::MaxOp>(op)) {
+            uint32_t lhs_id = 0;
+            uint32_t rhs_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(max_op.getLhs(), executable, value_ids, error, lhs_id) ||
+                !addValueDesc(max_op.getRhs(), executable, value_ids, error, rhs_id) ||
+                !addValueDesc(max_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* max = executable.add_ops();
+            max->set_output_id(output_id);
+            max->mutable_max()->set_lhs_id(lhs_id);
+            max->mutable_max()->set_rhs_id(rhs_id);
             continue;
         }
 

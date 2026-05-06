@@ -45,6 +45,14 @@ pub(crate) enum Op {
         input_ids: [u32; 2],
         output_id: u32,
     },
+    Max {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Constant {
+        packed_value: u32,
+        output_id: u32,
+    },
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -111,6 +119,14 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                 }),
                 Kind::Matmul(matmul) => Ok(Op::Matmul {
                     input_ids: [matmul.lhs_id, matmul.rhs_id],
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Max(max) => Ok(Op::Max {
+                    input_ids: [max.lhs_id, max.rhs_id],
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Constant(constant) => Ok(Op::Constant {
+                    packed_value: constant.packed_value,
                     output_id: op_desc.output_id,
                 }),
             }
@@ -186,6 +202,14 @@ pub(crate) enum Op {
     },
     Matmul {
         input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Max {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Constant {
+        packed_value: u32,
         output_id: u32,
     },
 }

@@ -1299,6 +1299,39 @@ fn device_buffer_for_value<'a>(
         .ok_or_else(|| invalid_argument(format!("{field} value id {value_id} is not available")))
 }
 
+fn bf16_eltwise_input<'a>(
+    values: &'a [Option<PJRT_Buffer>],
+    plan: &'a executable::Executable,
+    value_id: u32,
+    field: &str,
+) -> Result<kernels::binary_eltwise::Bf16EltwiseInput<'a>, *mut PJRT_Error> {
+    let index = value_id as usize;
+    if let Some(buffer) = values.get(index).and_then(|value| value.as_ref()) {
+        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable {field} buffer has no device allocation"
+            )));
+        };
+        return Ok(kernels::binary_eltwise::Bf16EltwiseInput::Dram(dram_buffer));
+    }
+    for op in &plan.ops {
+        if let executable::Op::Constant {
+            packed_value,
+            output_id,
+        } = op
+        {
+            if *output_id == value_id {
+                return Ok(kernels::binary_eltwise::Bf16EltwiseInput::Constant(
+                    *packed_value,
+                ));
+            }
+        }
+    }
+    Err(invalid_argument(format!(
+        "{field} value id {value_id} is not available"
+    )))
+}
+
 struct OutputContext {
     device: *mut PJRT_Device,
     memory: *mut PJRT_Memory,
@@ -1343,6 +1376,64 @@ fn store_output_buffer(
     Ok(())
 }
 
+fn execute_binary_eltwise(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    op: kernels::binary_eltwise::BinaryEltwiseOp,
+    input_ids: [u32; 2],
+    output_id: u32,
+    op_name: &str,
+) -> Result<(), *mut PJRT_Error> {
+    let lhs_field = format!("{op_name}.lhs");
+    let rhs_field = format!("{op_name}.rhs");
+    let lhs_desc = plan
+        .values
+        .get(input_ids[0] as usize)
+        .ok_or_else(|| invalid_argument(format!("{lhs_field} value id is out of bounds")))?;
+    let rhs_desc = plan
+        .values
+        .get(input_ids[1] as usize)
+        .ok_or_else(|| invalid_argument(format!("{rhs_field} value id is out of bounds")))?;
+    if lhs_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || rhs_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+    {
+        return Err(unimplemented(format!(
+            "TT executable {op_name} currently only supports bf16 buffers"
+        )));
+    }
+    if lhs_desc.dims != rhs_desc.dims {
+        return Err(invalid_argument(format!(
+            "TT executable {op_name} input shapes must match"
+        )));
+    }
+
+    let output_dims = lhs_desc.dims.clone();
+    let shape = dims_i64_to_usize(&output_dims)?;
+    let lhs_input = bf16_eltwise_input(values, plan, input_ids[0], &lhs_field)?;
+    let rhs_input = bf16_eltwise_input(values, plan, input_ids[1], &rhs_field)?;
+    let output_name = format!("pjrt_{op_name}");
+    let output_dram = kernels::binary_eltwise::eltwise_bf16(
+        device,
+        op,
+        lhs_input,
+        rhs_input,
+        &shape,
+        output_name,
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_dims,
+        output_dram,
+        context,
+        op_name,
+    )
+}
+
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
@@ -1364,11 +1455,13 @@ fn execute_executable_v1(
     let device = &mut target_device.runtime;
 
     for op in &plan.ops {
-        match *op {
+        match op {
             executable::Op::Parameter {
                 parameter_index,
                 output_id,
             } => {
+                let parameter_index = *parameter_index;
+                let output_id = *output_id;
                 let input_ptr = inputs.get(parameter_index).copied().ok_or_else(|| {
                     invalid_argument(format!(
                         "TT executable parameter index {parameter_index} is out of range"
@@ -1408,50 +1501,37 @@ fn execute_executable_v1(
                 input_ids,
                 output_id,
             } => {
-                let lhs = device_buffer_for_value(&values, input_ids[0], "add.lhs")?;
-                let rhs = device_buffer_for_value(&values, input_ids[1], "add.rhs")?;
-                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                {
-                    return Err(unimplemented(
-                        "TT executable add currently only supports bf16 buffers",
-                    ));
-                }
-                if lhs.dims != rhs.dims {
-                    return Err(invalid_argument(
-                        "TT executable add input shapes must match",
-                    ));
-                }
-
-                let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
-                    return Err(failed_precondition(
-                        "TT executable lhs buffer has no device allocation",
-                    ));
-                };
-                let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
-                    return Err(failed_precondition(
-                        "TT executable rhs buffer has no device allocation",
-                    ));
-                };
-
-                let output_dims = lhs.dims.clone();
-                let output_dram =
-                    kernels::add::eltwise_add_bf16(device, lhs_dram, rhs_dram, "pjrt_add")
-                        .map_err(io_error)?;
-                store_output_buffer(
+                execute_binary_eltwise(
                     &mut values,
                     plan,
-                    output_id,
-                    output_dims,
-                    output_dram,
+                    device,
                     &output_context,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Add,
+                    *input_ids,
+                    *output_id,
                     "add",
+                )?;
+            }
+            executable::Op::Max {
+                input_ids,
+                output_id,
+            } => {
+                execute_binary_eltwise(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Max,
+                    *input_ids,
+                    *output_id,
+                    "max",
                 )?;
             }
             executable::Op::Matmul {
                 input_ids,
                 output_id,
             } => {
+                let output_id = *output_id;
                 let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
                 let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
                 if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
@@ -1498,6 +1578,7 @@ fn execute_executable_v1(
                     "matmul",
                 )?;
             }
+            executable::Op::Constant { .. } => {}
         }
     }
 
@@ -2925,6 +3006,81 @@ mod tests {
         assert_eq!(executable.values.len(), 5);
         assert_eq!(executable.ops.len(), 5);
         assert_eq!(executable.output_ids, vec![4]);
+
+        unsafe {
+            drop(Box::from_raw(get_executable_args.executable));
+            drop(Box::from_raw(compile_args.executable));
+            drop(Box::from_raw(client));
+        }
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_maximum_with_broadcast_constant() {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"mlir".to_vec();
+        let mut code = br#"module {
+  func.func public @main(%arg0: tensor<32x32xbf16>) -> tensor<32x32xbf16> {
+    %cst = stablehlo.constant dense<1.000000e+00> : tensor<bf16>
+    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<bf16>) -> tensor<32x32xbf16>
+    %1 = stablehlo.maximum %arg0, %0 : tensor<32x32xbf16>
+    return %1 : tensor<32x32xbf16>
+  }
+}
+"#
+        .to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: code.as_mut_ptr().cast::<c_char>(),
+            code_size: code.len(),
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { compile(&mut compile_args) });
+
+        let get_executable = api
+            .PJRT_LoadedExecutable_GetExecutable
+            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
+        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
+            extension_start: ptr::null_mut(),
+            loaded_executable: compile_args.executable,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+
+        let executable = unsafe { &*get_executable_args.executable }
+            .metadata
+            .executable
+            .as_ref()
+            .expect("compiled executable should contain a TT executable");
+        assert_eq!(executable.output_ids, vec![3]);
+        assert_eq!(executable.ops.len(), 3);
+        let executable::Op::Constant {
+            packed_value,
+            output_id,
+        } = &executable.ops[1]
+        else {
+            panic!("broadcasted constant should lower to Constant");
+        };
+        assert_eq!(*output_id, 2);
+        assert_eq!(*packed_value, 0x3f80_3f80);
+        assert!(matches!(executable.ops[2], executable::Op::Max { .. }));
 
         unsafe {
             drop(Box::from_raw(get_executable_args.executable));
