@@ -1510,19 +1510,6 @@ fn execute_binary_eltwise(
     )
 }
 
-fn compare_direction_to_eltwise_op(
-    direction: executable::CompareDirection,
-) -> kernels::binary_eltwise::BinaryEltwiseOp {
-    match direction {
-        executable::CompareDirection::Eq => kernels::binary_eltwise::BinaryEltwiseOp::CompareEq,
-        executable::CompareDirection::Ne => kernels::binary_eltwise::BinaryEltwiseOp::CompareNe,
-        executable::CompareDirection::Ge => kernels::binary_eltwise::BinaryEltwiseOp::CompareGe,
-        executable::CompareDirection::Gt => kernels::binary_eltwise::BinaryEltwiseOp::CompareGt,
-        executable::CompareDirection::Le => kernels::binary_eltwise::BinaryEltwiseOp::CompareLe,
-        executable::CompareDirection::Lt => kernels::binary_eltwise::BinaryEltwiseOp::CompareLt,
-    }
-}
-
 fn execute_compare(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -1576,7 +1563,7 @@ fn execute_compare(
     let rhs_input = eltwise_input(values, plan, input_ids[1], input_dtype, "compare.rhs")?;
     let output_dram = kernels::binary_eltwise::eltwise(
         device,
-        compare_direction_to_eltwise_op(direction),
+        kernels::binary_eltwise::BinaryEltwiseOp::Compare(direction),
         lhs_input,
         rhs_input,
         input_dtype,

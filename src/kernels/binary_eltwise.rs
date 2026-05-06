@@ -1,6 +1,7 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
 use crate::dram::{DType, DramBuffer};
+use crate::executable::CompareDirection;
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
 use std::io;
@@ -22,12 +23,7 @@ const TILE_C: usize = 32;
 pub(crate) enum BinaryEltwiseOp {
     Add,
     Max,
-    CompareEq,
-    CompareNe,
-    CompareGe,
-    CompareGt,
-    CompareLe,
-    CompareLt,
+    Compare(CompareDirection),
 }
 
 impl BinaryEltwiseOp {
@@ -35,12 +31,7 @@ impl BinaryEltwiseOp {
         match self {
             Self::Add => Ok(ADD_BF16_COMPUTE.to_owned()),
             Self::Max => Ok(MAX_BF16_COMPUTE.to_owned()),
-            Self::CompareEq
-            | Self::CompareNe
-            | Self::CompareGe
-            | Self::CompareGt
-            | Self::CompareLe
-            | Self::CompareLt => compare_compute_source(input_dtype, self),
+            Self::Compare(direction) => compare_compute_source(input_dtype, direction),
         }
     }
 
@@ -48,60 +39,51 @@ impl BinaryEltwiseOp {
         match self {
             Self::Add => "eltwise_add_bf16".to_owned(),
             Self::Max => "eltwise_max_bf16".to_owned(),
-            Self::CompareEq => format!("eltwise_compare_eq_{input_dtype:?}_{output_dtype:?}"),
-            Self::CompareNe => format!("eltwise_compare_ne_{input_dtype:?}_{output_dtype:?}"),
-            Self::CompareGe => format!("eltwise_compare_ge_{input_dtype:?}_{output_dtype:?}"),
-            Self::CompareGt => format!("eltwise_compare_gt_{input_dtype:?}_{output_dtype:?}"),
-            Self::CompareLe => format!("eltwise_compare_le_{input_dtype:?}_{output_dtype:?}"),
-            Self::CompareLt => format!("eltwise_compare_lt_{input_dtype:?}_{output_dtype:?}"),
+            Self::Compare(direction) => {
+                format!("eltwise_compare_{direction:?}_{input_dtype:?}_{output_dtype:?}")
+            }
         }
     }
 
     fn output_dtype(self) -> DType {
         match self {
             Self::Add | Self::Max => DType::Float16B,
-            Self::CompareEq
-            | Self::CompareNe
-            | Self::CompareGe
-            | Self::CompareGt
-            | Self::CompareLe
-            | Self::CompareLt => DType::UInt8,
+            Self::Compare(_) => DType::UInt8,
         }
     }
 
-    fn compare_zero_op(self) -> io::Result<CompareZeroOp> {
-        match self {
-            Self::CompareEq => Ok(CompareZeroOp {
+    fn compare_zero_op(direction: CompareDirection) -> CompareZeroOp {
+        match direction {
+            CompareDirection::Eq => CompareZeroOp {
                 init: "eqz_tile_init",
                 float_tile: "eqz_tile",
                 int32_tile: "eqz_tile_int32",
-            }),
-            Self::CompareNe => Ok(CompareZeroOp {
+            },
+            CompareDirection::Ne => CompareZeroOp {
                 init: "nez_tile_init",
                 float_tile: "nez_tile",
                 int32_tile: "nez_tile_int32",
-            }),
-            Self::CompareGe => Ok(CompareZeroOp {
+            },
+            CompareDirection::Ge => CompareZeroOp {
                 init: "gez_tile_init",
                 float_tile: "gez_tile",
                 int32_tile: "gez_tile_int32",
-            }),
-            Self::CompareGt => Ok(CompareZeroOp {
+            },
+            CompareDirection::Gt => CompareZeroOp {
                 init: "gtz_tile_init",
                 float_tile: "gtz_tile",
                 int32_tile: "gtz_tile_int32",
-            }),
-            Self::CompareLe => Ok(CompareZeroOp {
+            },
+            CompareDirection::Le => CompareZeroOp {
                 init: "lez_tile_init",
                 float_tile: "lez_tile",
                 int32_tile: "lez_tile_int32",
-            }),
-            Self::CompareLt => Ok(CompareZeroOp {
+            },
+            CompareDirection::Lt => CompareZeroOp {
                 init: "ltz_tile_init",
                 float_tile: "ltz_tile",
                 int32_tile: "ltz_tile_int32",
-            }),
-            Self::Add | Self::Max => Err(invalid_input("op is not a compare")),
+            },
         }
     }
 }
@@ -354,8 +336,8 @@ fn writer_source(dtype: DType) -> io::Result<String> {
     Ok(BF16_WRITER.replace("DataFormat::Float16_b", data_format(dtype)?))
 }
 
-fn compare_compute_source(dtype: DType, op: BinaryEltwiseOp) -> io::Result<String> {
-    let zero_op = op.compare_zero_op()?;
+fn compare_compute_source(dtype: DType, direction: CompareDirection) -> io::Result<String> {
+    let zero_op = BinaryEltwiseOp::compare_zero_op(direction);
     let substitutions = match dtype {
         DType::Float16B | DType::Float32 => CompareComputeFns {
             sub_init: "sub_binary_tile_init",
