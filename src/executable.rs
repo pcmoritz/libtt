@@ -71,6 +71,10 @@ pub(crate) enum Op {
         input_id: u32,
         output_id: u32,
     },
+    Rsqrt {
+        input_id: u32,
+        output_id: u32,
+    },
     Convert {
         input_id: u32,
         output_id: u32,
@@ -264,6 +268,10 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     input_id: sine.operand_id,
                     output_id: op_desc.output_id,
                 }),
+                Kind::Rsqrt(rsqrt) => Ok(Op::Rsqrt {
+                    input_id: rsqrt.operand_id,
+                    output_id: op_desc.output_id,
+                }),
                 Kind::Convert(convert) => Ok(Op::Convert {
                     input_id: convert.operand_id,
                     output_id: op_desc.output_id,
@@ -412,6 +420,10 @@ pub(crate) enum Op {
         output_id: u32,
     },
     Sine {
+        input_id: u32,
+        output_id: u32,
+    },
+    Rsqrt {
         input_id: u32,
         output_id: u32,
     },

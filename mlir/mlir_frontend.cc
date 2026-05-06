@@ -541,6 +541,20 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto rsqrt_op = mlir::dyn_cast<mlir::stablehlo::RsqrtOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(rsqrt_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(rsqrt_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* rsqrt = executable.add_ops();
+            rsqrt->set_output_id(output_id);
+            rsqrt->mutable_rsqrt()->set_operand_id(operand_id);
+            continue;
+        }
+
         if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
             uint32_t operand_id = 0;
             uint32_t output_id = 0;

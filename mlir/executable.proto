@@ -71,6 +71,11 @@ message SineOp {
   uint32 operand_id = 1;
 }
 
+message RsqrtOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+}
+
 message ConvertOp {
   // Index into Executable.values for this op's operand.
   uint32 operand_id = 1;
@@ -180,6 +185,7 @@ message Op {
     SineOp sine = 17;
     ConvertOp convert = 18;
     ReduceOp reduce = 19;
+    RsqrtOp rsqrt = 20;
   }
 }
 
