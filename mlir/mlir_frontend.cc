@@ -232,6 +232,81 @@ void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t pack
     constant->mutable_constant()->set_packed_value(packed_value);
 }
 
+tt::CompareOp::Direction mapCompareDirection(
+    mlir::stablehlo::ComparisonDirection direction) {
+    switch (direction) {
+        case mlir::stablehlo::ComparisonDirection::EQ:
+            return tt::CompareOp::DIRECTION_EQ;
+        case mlir::stablehlo::ComparisonDirection::NE:
+            return tt::CompareOp::DIRECTION_NE;
+        case mlir::stablehlo::ComparisonDirection::GE:
+            return tt::CompareOp::DIRECTION_GE;
+        case mlir::stablehlo::ComparisonDirection::GT:
+            return tt::CompareOp::DIRECTION_GT;
+        case mlir::stablehlo::ComparisonDirection::LE:
+            return tt::CompareOp::DIRECTION_LE;
+        case mlir::stablehlo::ComparisonDirection::LT:
+            return tt::CompareOp::DIRECTION_LT;
+    }
+    return tt::CompareOp::DIRECTION_EQ;
+}
+
+std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
+    mlir::stablehlo::ReduceOp reduce_op,
+    std::string& error) {
+    if (reduce_op.getInputs().size() != 1 ||
+        reduce_op.getInitValues().size() != 1 ||
+        reduce_op->getNumResults() != 1) {
+        error = "only single-input single-result reduce ops are currently supported";
+        return std::nullopt;
+    }
+
+    auto& body = reduce_op.getBody();
+    if (body.empty() || body.getBlocks().size() != 1) {
+        error = "reduce bodies must contain exactly one block";
+        return std::nullopt;
+    }
+
+    mlir::Operation* reducer_op = nullptr;
+    mlir::Operation* return_operation = nullptr;
+    for (mlir::Operation& body_op : body.front()) {
+        if (mlir::isa<mlir::stablehlo::ReturnOp>(body_op)) {
+            return_operation = &body_op;
+            continue;
+        }
+        if (reducer_op) {
+            error = "only single-op reduce bodies are currently supported";
+            return std::nullopt;
+        }
+        reducer_op = &body_op;
+    }
+
+    if (!reducer_op || !return_operation) {
+        error = "reduce body must contain a reducer op and stablehlo.return";
+        return std::nullopt;
+    }
+
+    auto return_op = mlir::cast<mlir::stablehlo::ReturnOp>(return_operation);
+    if (return_op.getNumOperands() != 1 ||
+        return_op.getOperand(0).getDefiningOp() != reducer_op) {
+        error = "reduce body must return the reducer op result";
+        return std::nullopt;
+    }
+
+    if (mlir::isa<mlir::stablehlo::AddOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_ADD;
+    }
+    if (mlir::isa<mlir::stablehlo::MaxOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_MAX;
+    }
+    if (mlir::isa<mlir::stablehlo::MulOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_MUL;
+    }
+
+    error = "unsupported reduce reducer: " + reducer_op->getName().getStringRef().str();
+    return std::nullopt;
+}
+
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -289,11 +364,65 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(broadcast_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            auto packed_value = packedConstantValue(broadcast_op.getOperand(), error);
-            if (!packed_value) {
+
+            if (broadcast_op.getOperand().getDefiningOp<mlir::stablehlo::ConstantOp>()) {
+                auto packed_value = packedConstantValue(broadcast_op.getOperand(), error);
+                if (!packed_value) {
+                    return false;
+                }
+                addConstantOp(executable, output_id, *packed_value);
+                continue;
+            }
+
+            uint32_t operand_id = 0;
+            if (!addValueDesc(broadcast_op.getOperand(), executable, value_ids, error, operand_id)) {
                 return false;
             }
-            addConstantOp(executable, output_id, *packed_value);
+            auto* broadcast = executable.add_ops();
+            broadcast->set_output_id(output_id);
+            broadcast->mutable_broadcast_in_dim()->set_operand_id(operand_id);
+            for (int64_t dim : broadcast_op.getBroadcastDimensions()) {
+                broadcast->mutable_broadcast_in_dim()->add_broadcast_dimensions(dim);
+            }
+            continue;
+        }
+
+        if (auto compare_op = mlir::dyn_cast<mlir::stablehlo::CompareOp>(op)) {
+            uint32_t lhs_id = 0;
+            uint32_t rhs_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(compare_op.getLhs(), executable, value_ids, error, lhs_id) ||
+                !addValueDesc(compare_op.getRhs(), executable, value_ids, error, rhs_id) ||
+                !addValueDesc(compare_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* compare = executable.add_ops();
+            compare->set_output_id(output_id);
+            compare->mutable_compare()->set_lhs_id(lhs_id);
+            compare->mutable_compare()->set_rhs_id(rhs_id);
+            compare->mutable_compare()->set_direction(
+                mapCompareDirection(compare_op.getComparisonDirection()));
+            continue;
+        }
+
+        if (auto select_op = mlir::dyn_cast<mlir::stablehlo::SelectOp>(op)) {
+            uint32_t pred_id = 0;
+            uint32_t on_true_id = 0;
+            uint32_t on_false_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(select_op.getPred(), executable, value_ids, error, pred_id) ||
+                !addValueDesc(select_op.getOnTrue(), executable, value_ids, error, on_true_id) ||
+                !addValueDesc(select_op.getOnFalse(), executable, value_ids, error, on_false_id) ||
+                !addValueDesc(select_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* select = executable.add_ops();
+            select->set_output_id(output_id);
+            select->mutable_select()->set_pred_id(pred_id);
+            select->mutable_select()->set_on_true_id(on_true_id);
+            select->mutable_select()->set_on_false_id(on_false_id);
             continue;
         }
 
@@ -314,6 +443,209 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto mul_op = mlir::dyn_cast<mlir::stablehlo::MulOp>(op)) {
+            uint32_t lhs_id = 0;
+            uint32_t rhs_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(mul_op.getLhs(), executable, value_ids, error, lhs_id) ||
+                !addValueDesc(mul_op.getRhs(), executable, value_ids, error, rhs_id) ||
+                !addValueDesc(mul_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* multiply = executable.add_ops();
+            multiply->set_output_id(output_id);
+            multiply->mutable_multiply()->set_lhs_id(lhs_id);
+            multiply->mutable_multiply()->set_rhs_id(rhs_id);
+            continue;
+        }
+
+        if (auto div_op = mlir::dyn_cast<mlir::stablehlo::DivOp>(op)) {
+            uint32_t lhs_id = 0;
+            uint32_t rhs_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(div_op.getLhs(), executable, value_ids, error, lhs_id) ||
+                !addValueDesc(div_op.getRhs(), executable, value_ids, error, rhs_id) ||
+                !addValueDesc(div_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* divide = executable.add_ops();
+            divide->set_output_id(output_id);
+            divide->mutable_divide()->set_lhs_id(lhs_id);
+            divide->mutable_divide()->set_rhs_id(rhs_id);
+            continue;
+        }
+
+        if (auto pow_op = mlir::dyn_cast<mlir::stablehlo::PowOp>(op)) {
+            uint32_t lhs_id = 0;
+            uint32_t rhs_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(pow_op.getLhs(), executable, value_ids, error, lhs_id) ||
+                !addValueDesc(pow_op.getRhs(), executable, value_ids, error, rhs_id) ||
+                !addValueDesc(pow_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* power = executable.add_ops();
+            power->set_output_id(output_id);
+            power->mutable_power()->set_lhs_id(lhs_id);
+            power->mutable_power()->set_rhs_id(rhs_id);
+            continue;
+        }
+
+        if (auto concatenate_op = mlir::dyn_cast<mlir::stablehlo::ConcatenateOp>(op)) {
+            uint32_t output_id = 0;
+            if (!addValueDesc(concatenate_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* concatenate = executable.add_ops();
+            concatenate->set_output_id(output_id);
+            for (mlir::Value input : concatenate_op.getInputs()) {
+                uint32_t input_id = 0;
+                if (!addValueDesc(input, executable, value_ids, error, input_id)) {
+                    return false;
+                }
+                concatenate->mutable_concatenate()->add_input_ids(input_id);
+            }
+            concatenate->mutable_concatenate()->set_dimension(concatenate_op.getDimension());
+            continue;
+        }
+
+        if (auto cosine_op = mlir::dyn_cast<mlir::stablehlo::CosineOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(cosine_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(cosine_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* cosine = executable.add_ops();
+            cosine->set_output_id(output_id);
+            cosine->mutable_cosine()->set_operand_id(operand_id);
+            continue;
+        }
+
+        if (auto sine_op = mlir::dyn_cast<mlir::stablehlo::SineOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(sine_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(sine_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* sine = executable.add_ops();
+            sine->set_output_id(output_id);
+            sine->mutable_sine()->set_operand_id(operand_id);
+            continue;
+        }
+
+        if (auto rsqrt_op = mlir::dyn_cast<mlir::stablehlo::RsqrtOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(rsqrt_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(rsqrt_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* rsqrt = executable.add_ops();
+            rsqrt->set_output_id(output_id);
+            rsqrt->mutable_rsqrt()->set_operand_id(operand_id);
+            continue;
+        }
+
+        if (auto reshape_op = mlir::dyn_cast<mlir::stablehlo::ReshapeOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(reshape_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(reshape_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* reshape = executable.add_ops();
+            reshape->set_output_id(output_id);
+            reshape->mutable_reshape()->set_operand_id(operand_id);
+            continue;
+        }
+
+        if (auto slice_op = mlir::dyn_cast<mlir::stablehlo::SliceOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(slice_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(slice_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* slice = executable.add_ops();
+            slice->set_output_id(output_id);
+            slice->mutable_slice()->set_operand_id(operand_id);
+            for (int64_t start : slice_op.getStartIndices()) {
+                slice->mutable_slice()->add_start_indices(start);
+            }
+            for (int64_t limit : slice_op.getLimitIndices()) {
+                slice->mutable_slice()->add_limit_indices(limit);
+            }
+            for (int64_t stride : slice_op.getStrides()) {
+                slice->mutable_slice()->add_strides(stride);
+            }
+            continue;
+        }
+
+        if (auto negate_op = mlir::dyn_cast<mlir::stablehlo::NegOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(negate_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(negate_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* negate = executable.add_ops();
+            negate->set_output_id(output_id);
+            negate->mutable_negate()->set_operand_id(operand_id);
+            continue;
+        }
+
+        if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(convert_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(convert_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* convert = executable.add_ops();
+            convert->set_output_id(output_id);
+            convert->mutable_convert()->set_operand_id(operand_id);
+            continue;
+        }
+
+        if (auto reduce_op = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(op)) {
+            auto reducer = mapReduceReducer(reduce_op, error);
+            if (!reducer) {
+                return false;
+            }
+
+            uint32_t input_id = 0;
+            uint32_t init_value_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(*reduce_op.getInputs().begin(), executable, value_ids, error, input_id) ||
+                !addValueDesc(*reduce_op.getInitValues().begin(), executable, value_ids, error, init_value_id) ||
+                !addValueDesc(reduce_op->getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* reduce = executable.add_ops();
+            reduce->set_output_id(output_id);
+            reduce->mutable_reduce()->add_input_ids(input_id);
+            reduce->mutable_reduce()->add_init_value_ids(init_value_id);
+            for (int64_t dim : reduce_op.getDimensions()) {
+                reduce->mutable_reduce()->add_dimensions(dim);
+            }
+            reduce->mutable_reduce()->set_reducer(*reducer);
+            continue;
+        }
+
         if (auto max_op = mlir::dyn_cast<mlir::stablehlo::MaxOp>(op)) {
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;
@@ -328,6 +660,18 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             max->set_output_id(output_id);
             max->mutable_max()->set_lhs_id(lhs_id);
             max->mutable_max()->set_rhs_id(rhs_id);
+            continue;
+        }
+
+        if (auto iota_op = mlir::dyn_cast<mlir::stablehlo::IotaOp>(op)) {
+            uint32_t output_id = 0;
+            if (!addValueDesc(iota_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* iota = executable.add_ops();
+            iota->set_output_id(output_id);
+            iota->mutable_iota()->set_iota_dimension(iota_op.getIotaDimension());
             continue;
         }
 
@@ -356,6 +700,44 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             matmul->set_output_id(output_id);
             matmul->mutable_matmul()->set_lhs_id(lhs_id);
             matmul->mutable_matmul()->set_rhs_id(rhs_id);
+            continue;
+        }
+
+        if (auto gather_op = mlir::dyn_cast<mlir::stablehlo::GatherOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t start_indices_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(gather_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(gather_op.getStartIndices(), executable, value_ids, error, start_indices_id) ||
+                !addValueDesc(gather_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto dims = gather_op.getDimensionNumbers();
+            auto* gather = executable.add_ops();
+            gather->set_output_id(output_id);
+            gather->mutable_gather()->set_operand_id(operand_id);
+            gather->mutable_gather()->set_start_indices_id(start_indices_id);
+            for (int64_t dim : dims.getOffsetDims()) {
+                gather->mutable_gather()->add_offset_dims(dim);
+            }
+            for (int64_t dim : dims.getCollapsedSliceDims()) {
+                gather->mutable_gather()->add_collapsed_slice_dims(dim);
+            }
+            for (int64_t dim : dims.getOperandBatchingDims()) {
+                gather->mutable_gather()->add_operand_batching_dims(dim);
+            }
+            for (int64_t dim : dims.getStartIndicesBatchingDims()) {
+                gather->mutable_gather()->add_start_indices_batching_dims(dim);
+            }
+            for (int64_t dim : dims.getStartIndexMap()) {
+                gather->mutable_gather()->add_start_index_map(dim);
+            }
+            gather->mutable_gather()->set_index_vector_dim(dims.getIndexVectorDim());
+            for (int64_t size : gather_op.getSliceSizes()) {
+                gather->mutable_gather()->add_slice_sizes(size);
+            }
+            gather->mutable_gather()->set_indices_are_sorted(gather_op.getIndicesAreSorted());
             continue;
         }
 

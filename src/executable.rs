@@ -3,7 +3,11 @@ use crate::PJRT_Buffer_Type;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status;
 #[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::compare_op::Direction as ProtoCompareDirection;
+#[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::op::Kind;
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::reduce_op::Reducer as ProtoReduceReducer;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::tensor_desc::ElementType;
 #[cfg(libtt_mlir_frontend)]
@@ -32,6 +36,7 @@ pub(crate) struct ValueDesc {
 
 #[cfg(libtt_mlir_frontend)]
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(crate) enum Op {
     Parameter {
         parameter_index: usize,
@@ -40,6 +45,61 @@ pub(crate) enum Op {
     Add {
         input_ids: [u32; 2],
         output_id: u32,
+    },
+    Multiply {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Divide {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Power {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Concatenate {
+        input_ids: Vec<u32>,
+        output_id: u32,
+        dimension: u64,
+    },
+    Cosine {
+        input_id: u32,
+        output_id: u32,
+    },
+    Sine {
+        input_id: u32,
+        output_id: u32,
+    },
+    Rsqrt {
+        input_id: u32,
+        output_id: u32,
+    },
+    Reshape {
+        input_id: u32,
+        output_id: u32,
+    },
+    Slice {
+        input_id: u32,
+        output_id: u32,
+        start_indices: Vec<i64>,
+        limit_indices: Vec<i64>,
+        strides: Vec<i64>,
+    },
+    Negate {
+        input_id: u32,
+        output_id: u32,
+    },
+    Convert {
+        input_id: u32,
+        output_id: u32,
+    },
+    Reduce {
+        input_ids: Vec<u32>,
+        init_value_ids: Vec<u32>,
+        output_id: u32,
+        dimensions: Vec<i64>,
+        reducer: ReduceReducer,
     },
     Matmul {
         input_ids: [u32; 2],
@@ -53,6 +113,61 @@ pub(crate) enum Op {
         packed_value: u32,
         output_id: u32,
     },
+    Compare {
+        input_ids: [u32; 2],
+        output_id: u32,
+        direction: CompareDirection,
+    },
+    Select {
+        input_ids: [u32; 3],
+        output_id: u32,
+    },
+    BroadcastInDim {
+        input_id: u32,
+        output_id: u32,
+        broadcast_dimensions: Vec<i64>,
+    },
+    Gather {
+        input_ids: [u32; 2],
+        output_id: u32,
+        dimension_numbers: GatherDimensionNumbers,
+        slice_sizes: Vec<i64>,
+        indices_are_sorted: bool,
+    },
+    Iota {
+        output_id: u32,
+        iota_dimension: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum CompareDirection {
+    Eq,
+    Ne,
+    Ge,
+    Gt,
+    Le,
+    Lt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ReduceReducer {
+    Add,
+    Max,
+    Mul,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct GatherDimensionNumbers {
+    pub(crate) offset_dims: Vec<i64>,
+    pub(crate) collapsed_slice_dims: Vec<i64>,
+    pub(crate) operand_batching_dims: Vec<i64>,
+    pub(crate) start_indices_batching_dims: Vec<i64>,
+    pub(crate) start_index_map: Vec<i64>,
+    pub(crate) index_vector_dim: i64,
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -90,6 +205,31 @@ fn parse_tensor_desc(tensor: ProtoTensorDesc) -> Result<ValueDesc, String> {
 }
 
 #[cfg(libtt_mlir_frontend)]
+fn parse_compare_direction(direction: i32) -> Result<CompareDirection, String> {
+    match ProtoCompareDirection::try_from(direction)
+        .map_err(|_| "TT executable compare op contains an invalid direction".to_owned())?
+    {
+        ProtoCompareDirection::Eq => Ok(CompareDirection::Eq),
+        ProtoCompareDirection::Ne => Ok(CompareDirection::Ne),
+        ProtoCompareDirection::Ge => Ok(CompareDirection::Ge),
+        ProtoCompareDirection::Gt => Ok(CompareDirection::Gt),
+        ProtoCompareDirection::Le => Ok(CompareDirection::Le),
+        ProtoCompareDirection::Lt => Ok(CompareDirection::Lt),
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn parse_reduce_reducer(reducer: i32) -> Result<ReduceReducer, String> {
+    match ProtoReduceReducer::try_from(reducer)
+        .map_err(|_| "TT executable reduce op contains an invalid reducer".to_owned())?
+    {
+        ProtoReduceReducer::Add => Ok(ReduceReducer::Add),
+        ProtoReduceReducer::Max => Ok(ReduceReducer::Max),
+        ProtoReduceReducer::Mul => Ok(ReduceReducer::Mul),
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
 pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, String> {
     let values = executable
         .values
@@ -118,6 +258,61 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     input_ids: [add.lhs_id, add.rhs_id],
                     output_id: op_desc.output_id,
                 }),
+                Kind::Multiply(multiply) => Ok(Op::Multiply {
+                    input_ids: [multiply.lhs_id, multiply.rhs_id],
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Divide(divide) => Ok(Op::Divide {
+                    input_ids: [divide.lhs_id, divide.rhs_id],
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Power(power) => Ok(Op::Power {
+                    input_ids: [power.lhs_id, power.rhs_id],
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Concatenate(concatenate) => Ok(Op::Concatenate {
+                    input_ids: concatenate.input_ids,
+                    output_id: op_desc.output_id,
+                    dimension: concatenate.dimension,
+                }),
+                Kind::Cosine(cosine) => Ok(Op::Cosine {
+                    input_id: cosine.operand_id,
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Sine(sine) => Ok(Op::Sine {
+                    input_id: sine.operand_id,
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Rsqrt(rsqrt) => Ok(Op::Rsqrt {
+                    input_id: rsqrt.operand_id,
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Reshape(reshape) => Ok(Op::Reshape {
+                    input_id: reshape.operand_id,
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Slice(slice) => Ok(Op::Slice {
+                    input_id: slice.operand_id,
+                    output_id: op_desc.output_id,
+                    start_indices: slice.start_indices,
+                    limit_indices: slice.limit_indices,
+                    strides: slice.strides,
+                }),
+                Kind::Negate(negate) => Ok(Op::Negate {
+                    input_id: negate.operand_id,
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Convert(convert) => Ok(Op::Convert {
+                    input_id: convert.operand_id,
+                    output_id: op_desc.output_id,
+                }),
+                Kind::Reduce(reduce) => Ok(Op::Reduce {
+                    input_ids: reduce.input_ids,
+                    init_value_ids: reduce.init_value_ids,
+                    output_id: op_desc.output_id,
+                    dimensions: reduce.dimensions,
+                    reducer: parse_reduce_reducer(reduce.reducer)?,
+                }),
                 Kind::Matmul(matmul) => Ok(Op::Matmul {
                     input_ids: [matmul.lhs_id, matmul.rhs_id],
                     output_id: op_desc.output_id,
@@ -129,6 +324,38 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                 Kind::Constant(constant) => Ok(Op::Constant {
                     packed_value: constant.packed_value,
                     output_id: op_desc.output_id,
+                }),
+                Kind::Compare(compare) => Ok(Op::Compare {
+                    input_ids: [compare.lhs_id, compare.rhs_id],
+                    output_id: op_desc.output_id,
+                    direction: parse_compare_direction(compare.direction)?,
+                }),
+                Kind::Select(select) => Ok(Op::Select {
+                    input_ids: [select.pred_id, select.on_true_id, select.on_false_id],
+                    output_id: op_desc.output_id,
+                }),
+                Kind::BroadcastInDim(broadcast) => Ok(Op::BroadcastInDim {
+                    input_id: broadcast.operand_id,
+                    output_id: op_desc.output_id,
+                    broadcast_dimensions: broadcast.broadcast_dimensions,
+                }),
+                Kind::Gather(gather) => Ok(Op::Gather {
+                    input_ids: [gather.operand_id, gather.start_indices_id],
+                    output_id: op_desc.output_id,
+                    dimension_numbers: GatherDimensionNumbers {
+                        offset_dims: gather.offset_dims,
+                        collapsed_slice_dims: gather.collapsed_slice_dims,
+                        operand_batching_dims: gather.operand_batching_dims,
+                        start_indices_batching_dims: gather.start_indices_batching_dims,
+                        start_index_map: gather.start_index_map,
+                        index_vector_dim: gather.index_vector_dim,
+                    },
+                    slice_sizes: gather.slice_sizes,
+                    indices_are_sorted: gather.indices_are_sorted,
+                }),
+                Kind::Iota(iota) => Ok(Op::Iota {
+                    output_id: op_desc.output_id,
+                    iota_dimension: iota.iota_dimension,
                 }),
             }
         })
@@ -201,6 +428,61 @@ pub(crate) enum Op {
         input_ids: [u32; 2],
         output_id: u32,
     },
+    Multiply {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Divide {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Power {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Concatenate {
+        input_ids: Vec<u32>,
+        output_id: u32,
+        dimension: u64,
+    },
+    Cosine {
+        input_id: u32,
+        output_id: u32,
+    },
+    Sine {
+        input_id: u32,
+        output_id: u32,
+    },
+    Rsqrt {
+        input_id: u32,
+        output_id: u32,
+    },
+    Reshape {
+        input_id: u32,
+        output_id: u32,
+    },
+    Slice {
+        input_id: u32,
+        output_id: u32,
+        start_indices: Vec<i64>,
+        limit_indices: Vec<i64>,
+        strides: Vec<i64>,
+    },
+    Negate {
+        input_id: u32,
+        output_id: u32,
+    },
+    Convert {
+        input_id: u32,
+        output_id: u32,
+    },
+    Reduce {
+        input_ids: Vec<u32>,
+        init_value_ids: Vec<u32>,
+        output_id: u32,
+        dimensions: Vec<i64>,
+        reducer: ReduceReducer,
+    },
     Matmul {
         input_ids: [u32; 2],
         output_id: u32,
@@ -212,5 +494,30 @@ pub(crate) enum Op {
     Constant {
         packed_value: u32,
         output_id: u32,
+    },
+    Compare {
+        input_ids: [u32; 2],
+        output_id: u32,
+        direction: CompareDirection,
+    },
+    Select {
+        input_ids: [u32; 3],
+        output_id: u32,
+    },
+    BroadcastInDim {
+        input_id: u32,
+        output_id: u32,
+        broadcast_dimensions: Vec<i64>,
+    },
+    Gather {
+        input_ids: [u32; 2],
+        output_id: u32,
+        dimension_numbers: GatherDimensionNumbers,
+        slice_sizes: Vec<i64>,
+        indices_are_sorted: bool,
+    },
+    Iota {
+        output_id: u32,
+        iota_dimension: u64,
     },
 }

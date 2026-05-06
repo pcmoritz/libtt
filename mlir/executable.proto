@@ -37,6 +37,82 @@ message AddOp {
   uint32 rhs_id = 2;
 }
 
+message MultiplyOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+}
+
+message DivideOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+}
+
+message PowerOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+}
+
+message ConcatenateOp {
+  // Indices into Executable.values for this op's operands.
+  repeated uint32 input_ids = 1;
+  uint64 dimension = 2;
+}
+
+message CosineOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+}
+
+message SineOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+}
+
+message RsqrtOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+}
+
+message ReshapeOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+}
+
+message SliceOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+  repeated int64 start_indices = 2;
+  repeated int64 limit_indices = 3;
+  repeated int64 strides = 4;
+}
+
+message NegateOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+}
+
+message ConvertOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+}
+
+message ReduceOp {
+  enum Reducer {
+    REDUCER_ADD = 0;
+    REDUCER_MAX = 1;
+    REDUCER_MUL = 2;
+  }
+
+  // Indices into Executable.values for this op's operands.
+  repeated uint32 input_ids = 1;
+  repeated uint32 init_value_ids = 2;
+  repeated int64 dimensions = 3;
+  Reducer reducer = 4;
+}
+
 message MatmulOp {
   // Indices into Executable.values for this op's operands.
   uint32 lhs_id = 1;
@@ -56,6 +132,54 @@ message ConstantOp {
   uint32 packed_value = 1;
 }
 
+message CompareOp {
+  enum Direction {
+    DIRECTION_EQ = 0;
+    DIRECTION_NE = 1;
+    DIRECTION_GE = 2;
+    DIRECTION_GT = 3;
+    DIRECTION_LE = 4;
+    DIRECTION_LT = 5;
+  }
+
+  // Indices into Executable.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+  Direction direction = 3;
+}
+
+message SelectOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 pred_id = 1;
+  uint32 on_true_id = 2;
+  uint32 on_false_id = 3;
+}
+
+message BroadcastInDimOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+  repeated int64 broadcast_dimensions = 2;
+}
+
+message GatherOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 operand_id = 1;
+  uint32 start_indices_id = 2;
+
+  repeated int64 offset_dims = 3;
+  repeated int64 collapsed_slice_dims = 4;
+  repeated int64 operand_batching_dims = 5;
+  repeated int64 start_indices_batching_dims = 6;
+  repeated int64 start_index_map = 7;
+  int64 index_vector_dim = 8;
+  repeated int64 slice_sizes = 9;
+  bool indices_are_sorted = 10;
+}
+
+message IotaOp {
+  uint64 iota_dimension = 1;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -66,6 +190,23 @@ message Op {
     MatmulOp matmul = 4;
     MaxOp max = 5;
     ConstantOp constant = 6;
+    CompareOp compare = 7;
+    SelectOp select = 8;
+    BroadcastInDimOp broadcast_in_dim = 9;
+    GatherOp gather = 10;
+    IotaOp iota = 11;
+    MultiplyOp multiply = 12;
+    DivideOp divide = 13;
+    PowerOp power = 14;
+    ConcatenateOp concatenate = 15;
+    CosineOp cosine = 16;
+    SineOp sine = 17;
+    ConvertOp convert = 18;
+    ReduceOp reduce = 19;
+    RsqrtOp rsqrt = 20;
+    ReshapeOp reshape = 21;
+    SliceOp slice = 22;
+    NegateOp negate = 23;
   }
 }
 
