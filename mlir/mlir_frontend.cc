@@ -308,11 +308,26 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(broadcast_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            auto packed_value = packedConstantValue(broadcast_op.getOperand(), error);
-            if (!packed_value) {
+
+            if (broadcast_op.getOperand().getDefiningOp<mlir::stablehlo::ConstantOp>()) {
+                auto packed_value = packedConstantValue(broadcast_op.getOperand(), error);
+                if (!packed_value) {
+                    return false;
+                }
+                addConstantOp(executable, output_id, *packed_value);
+                continue;
+            }
+
+            uint32_t operand_id = 0;
+            if (!addValueDesc(broadcast_op.getOperand(), executable, value_ids, error, operand_id)) {
                 return false;
             }
-            addConstantOp(executable, output_id, *packed_value);
+            auto* broadcast = executable.add_ops();
+            broadcast->set_output_id(output_id);
+            broadcast->mutable_broadcast_in_dim()->set_operand_id(operand_id);
+            for (int64_t dim : broadcast_op.getBroadcastDimensions()) {
+                broadcast->mutable_broadcast_in_dim()->add_broadcast_dimensions(dim);
+            }
             continue;
         }
 

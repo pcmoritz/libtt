@@ -79,6 +79,12 @@ message SelectOp {
   uint32 on_false_id = 3;
 }
 
+message BroadcastInDimOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+  repeated int64 broadcast_dimensions = 2;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -91,6 +97,7 @@ message Op {
     ConstantOp constant = 6;
     CompareOp compare = 7;
     SelectOp select = 8;
+    BroadcastInDimOp broadcast_in_dim = 9;
   }
 }
 

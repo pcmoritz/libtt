@@ -65,6 +65,11 @@ pub(crate) enum Op {
         input_ids: [u32; 3],
         output_id: u32,
     },
+    BroadcastInDim {
+        input_id: u32,
+        output_id: u32,
+        broadcast_dimensions: Vec<i64>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +181,11 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     input_ids: [select.pred_id, select.on_true_id, select.on_false_id],
                     output_id: op_desc.output_id,
                 }),
+                Kind::BroadcastInDim(broadcast) => Ok(Op::BroadcastInDim {
+                    input_id: broadcast.operand_id,
+                    output_id: op_desc.output_id,
+                    broadcast_dimensions: broadcast.broadcast_dimensions,
+                }),
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -267,5 +277,10 @@ pub(crate) enum Op {
     Select {
         input_ids: [u32; 3],
         output_id: u32,
+    },
+    BroadcastInDim {
+        input_id: u32,
+        output_id: u32,
+        broadcast_dimensions: Vec<i64>,
     },
 }
