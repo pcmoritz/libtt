@@ -654,6 +654,33 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto custom_call_op = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
+            if (custom_call_op->getNumResults() != 1) {
+                error = "only single-result custom_call ops are currently supported";
+                return false;
+            }
+
+            uint32_t output_id = 0;
+            if (!addValueDesc(custom_call_op->getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* custom_call = executable.add_ops();
+            custom_call->set_output_id(output_id);
+            custom_call->mutable_custom_call()->set_call_target_name(
+                custom_call_op.getCallTargetName().str());
+            custom_call->mutable_custom_call()->set_has_side_effect(
+                custom_call_op.getHasSideEffect());
+            for (mlir::Value input : custom_call_op.getInputs()) {
+                uint32_t input_id = 0;
+                if (!addValueDesc(input, executable, value_ids, error, input_id)) {
+                    return false;
+                }
+                custom_call->mutable_custom_call()->add_input_ids(input_id);
+            }
+            continue;
+        }
+
         if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
             uint32_t operand_id = 0;
             uint32_t output_id = 0;

@@ -103,6 +103,12 @@ pub(crate) enum Op {
         output_id: u32,
         permutation: Vec<i64>,
     },
+    CustomCall {
+        input_ids: Vec<u32>,
+        output_id: u32,
+        call_target_name: String,
+        has_side_effect: bool,
+    },
     Convert {
         input_id: u32,
         output_id: u32,
@@ -338,6 +344,12 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     output_id: op_desc.output_id,
                     permutation: transpose.permutation,
                 }),
+                Kind::CustomCall(custom_call) => Ok(Op::CustomCall {
+                    input_ids: custom_call.input_ids,
+                    output_id: op_desc.output_id,
+                    call_target_name: custom_call.call_target_name,
+                    has_side_effect: custom_call.has_side_effect,
+                }),
                 Kind::Convert(convert) => Ok(Op::Convert {
                     input_id: convert.operand_id,
                     output_id: op_desc.output_id,
@@ -526,6 +538,12 @@ pub(crate) enum Op {
         input_id: u32,
         output_id: u32,
         permutation: Vec<i64>,
+    },
+    CustomCall {
+        input_ids: Vec<u32>,
+        output_id: u32,
+        call_target_name: String,
+        has_side_effect: bool,
     },
     Convert {
         input_id: u32,

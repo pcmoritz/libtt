@@ -1647,6 +1647,13 @@ fn execute_executable_v1(
                     "TT executable transpose execution is not currently supported",
                 ));
             }
+            executable::Op::CustomCall {
+                call_target_name, ..
+            } => {
+                return Err(unimplemented(format!(
+                    "TT executable custom_call {call_target_name:?} execution is not currently supported"
+                )));
+            }
             executable::Op::Convert { .. } => {
                 return Err(unimplemented(
                     "TT executable convert execution is not currently supported",
@@ -3749,6 +3756,39 @@ mod tests {
                 assert_eq!(*input_id, 0);
                 assert_eq!(*output_id, 1);
                 assert_eq!(permutation, &vec![2, 0, 1]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_custom_call() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %0 = stablehlo.custom_call @foo(%arg0) {
+      has_side_effect = false
+    } : (tensor<2x2xf32>) -> tensor<2x2xf32>
+    return %0 : tensor<2x2xf32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![1]);
+                assert_eq!(executable.ops.len(), 2);
+                let executable::Op::CustomCall {
+                    input_ids,
+                    output_id,
+                    call_target_name,
+                    has_side_effect,
+                } = &executable.ops[1]
+                else {
+                    panic!("custom_call should lower to CustomCall");
+                };
+                assert_eq!(input_ids, &vec![0]);
+                assert_eq!(*output_id, 1);
+                assert_eq!(call_target_name, "foo");
+                assert!(!has_side_effect);
             },
         );
     }
