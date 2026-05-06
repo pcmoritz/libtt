@@ -438,6 +438,25 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto concatenate_op = mlir::dyn_cast<mlir::stablehlo::ConcatenateOp>(op)) {
+            uint32_t output_id = 0;
+            if (!addValueDesc(concatenate_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* concatenate = executable.add_ops();
+            concatenate->set_output_id(output_id);
+            for (mlir::Value input : concatenate_op.getInputs()) {
+                uint32_t input_id = 0;
+                if (!addValueDesc(input, executable, value_ids, error, input_id)) {
+                    return false;
+                }
+                concatenate->mutable_concatenate()->add_input_ids(input_id);
+            }
+            concatenate->mutable_concatenate()->set_dimension(concatenate_op.getDimension());
+            continue;
+        }
+
         if (auto max_op = mlir::dyn_cast<mlir::stablehlo::MaxOp>(op)) {
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;

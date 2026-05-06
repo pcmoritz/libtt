@@ -55,6 +55,12 @@ message PowerOp {
   uint32 rhs_id = 2;
 }
 
+message ConcatenateOp {
+  // Indices into Executable.values for this op's operands.
+  repeated uint32 input_ids = 1;
+  uint64 dimension = 2;
+}
+
 message MatmulOp {
   // Indices into Executable.values for this op's operands.
   uint32 lhs_id = 1;
@@ -140,6 +146,7 @@ message Op {
     MultiplyOp multiply = 12;
     DivideOp divide = 13;
     PowerOp power = 14;
+    ConcatenateOp concatenate = 15;
   }
 }
 
