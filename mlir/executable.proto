@@ -100,6 +100,10 @@ message GatherOp {
   bool indices_are_sorted = 10;
 }
 
+message IotaOp {
+  uint64 iota_dimension = 1;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -114,6 +118,7 @@ message Op {
     SelectOp select = 8;
     BroadcastInDimOp broadcast_in_dim = 9;
     GatherOp gather = 10;
+    IotaOp iota = 11;
   }
 }
 

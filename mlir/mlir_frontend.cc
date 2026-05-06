@@ -404,6 +404,18 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto iota_op = mlir::dyn_cast<mlir::stablehlo::IotaOp>(op)) {
+            uint32_t output_id = 0;
+            if (!addValueDesc(iota_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* iota = executable.add_ops();
+            iota->set_output_id(output_id);
+            iota->mutable_iota()->set_iota_dimension(iota_op.getIotaDimension());
+            continue;
+        }
+
         if (auto dot_op = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op)) {
             auto dims = dot_op.getDotDimensionNumbers();
             if (!dims.getLhsBatchingDimensions().empty() ||

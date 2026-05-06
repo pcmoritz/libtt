@@ -77,6 +77,10 @@ pub(crate) enum Op {
         slice_sizes: Vec<i64>,
         indices_are_sorted: bool,
     },
+    Iota {
+        output_id: u32,
+        iota_dimension: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +222,10 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     slice_sizes: gather.slice_sizes,
                     indices_are_sorted: gather.indices_are_sorted,
                 }),
+                Kind::Iota(iota) => Ok(Op::Iota {
+                    output_id: op_desc.output_id,
+                    iota_dimension: iota.iota_dimension,
+                }),
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -321,5 +329,9 @@ pub(crate) enum Op {
         dimension_numbers: GatherDimensionNumbers,
         slice_sizes: Vec<i64>,
         indices_are_sorted: bool,
+    },
+    Iota {
+        output_id: u32,
+        iota_dimension: u64,
     },
 }
