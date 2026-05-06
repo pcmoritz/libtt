@@ -37,6 +37,12 @@ message AddOp {
   uint32 rhs_id = 2;
 }
 
+message SubtractOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+}
+
 message MultiplyOp {
   // Indices into Executable.values for this op's operands.
   uint32 lhs_id = 1;
@@ -94,6 +100,24 @@ message NegateOp {
   uint32 operand_id = 1;
 }
 
+message ExponentialOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+}
+
+message TransposeOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+  repeated int64 permutation = 2;
+}
+
+message CustomCallOp {
+  // Indices into Executable.values for this op's operands.
+  repeated uint32 input_ids = 1;
+  string call_target_name = 2;
+  bool has_side_effect = 3;
+}
+
 message ConvertOp {
   // Index into Executable.values for this op's operand.
   uint32 operand_id = 1;
@@ -117,6 +141,10 @@ message MatmulOp {
   // Indices into Executable.values for this op's operands.
   uint32 lhs_id = 1;
   uint32 rhs_id = 2;
+  repeated int64 lhs_batching_dimensions = 3;
+  repeated int64 rhs_batching_dimensions = 4;
+  repeated int64 lhs_contracting_dimensions = 5;
+  repeated int64 rhs_contracting_dimensions = 6;
 }
 
 message MaxOp {
@@ -207,6 +235,10 @@ message Op {
     ReshapeOp reshape = 21;
     SliceOp slice = 22;
     NegateOp negate = 23;
+    SubtractOp subtract = 24;
+    ExponentialOp exponential = 25;
+    TransposeOp transpose = 26;
+    CustomCallOp custom_call = 27;
   }
 }
 

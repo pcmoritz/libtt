@@ -1582,6 +1582,11 @@ fn execute_executable_v1(
                     "add",
                 )?;
             }
+            executable::Op::Subtract { .. } => {
+                return Err(unimplemented(
+                    "TT executable subtract execution is not currently supported",
+                ));
+            }
             executable::Op::Multiply { .. } => {
                 return Err(unimplemented(
                     "TT executable multiply execution is not currently supported",
@@ -1632,6 +1637,23 @@ fn execute_executable_v1(
                     "TT executable negate execution is not currently supported",
                 ));
             }
+            executable::Op::Exponential { .. } => {
+                return Err(unimplemented(
+                    "TT executable exponential execution is not currently supported",
+                ));
+            }
+            executable::Op::Transpose { .. } => {
+                return Err(unimplemented(
+                    "TT executable transpose execution is not currently supported",
+                ));
+            }
+            executable::Op::CustomCall {
+                call_target_name, ..
+            } => {
+                return Err(unimplemented(format!(
+                    "TT executable custom_call {call_target_name:?} execution is not currently supported"
+                )));
+            }
             executable::Op::Convert { .. } => {
                 return Err(unimplemented(
                     "TT executable convert execution is not currently supported",
@@ -1660,6 +1682,7 @@ fn execute_executable_v1(
             executable::Op::Matmul {
                 input_ids,
                 output_id,
+                dimension_numbers,
             } => {
                 let output_id = *output_id;
                 let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
@@ -1669,6 +1692,15 @@ fn execute_executable_v1(
                 {
                     return Err(unimplemented(
                         "TT executable matmul currently only supports bf16 buffers",
+                    ));
+                }
+                if !dimension_numbers.lhs_batching_dimensions.is_empty()
+                    || !dimension_numbers.rhs_batching_dimensions.is_empty()
+                    || dimension_numbers.lhs_contracting_dimensions != vec![1]
+                    || dimension_numbers.rhs_contracting_dimensions != vec![0]
+                {
+                    return Err(unimplemented(
+                        "TT executable dot_general execution currently only supports rank-2 standard matrix multiplication",
                     ));
                 }
                 if lhs.dims.len() != 2 || rhs.dims.len() != 2 {
@@ -3143,6 +3175,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum BinaryOpKind {
         Add,
+        Subtract,
         Multiply,
         Divide,
         Power,
@@ -3154,6 +3187,13 @@ mod tests {
             (
                 BinaryOpKind::Add,
                 executable::Op::Add {
+                    input_ids,
+                    output_id,
+                },
+            )
+            | (
+                BinaryOpKind::Subtract,
+                executable::Op::Subtract {
                     input_ids,
                     output_id,
                 },
@@ -3193,6 +3233,7 @@ mod tests {
         Sine,
         Rsqrt,
         Negate,
+        Exponential,
     }
 
     #[cfg(libtt_mlir_frontend)]
@@ -3222,6 +3263,13 @@ mod tests {
             | (
                 UnaryOpKind::Negate,
                 executable::Op::Negate {
+                    input_id,
+                    output_id,
+                },
+            )
+            | (
+                UnaryOpKind::Exponential,
+                executable::Op::Exponential {
                     input_id,
                     output_id,
                 },
@@ -3255,6 +3303,12 @@ mod tests {
                 op_name: "multiply",
                 ty: "bf16",
                 expected: BinaryOpKind::Multiply,
+            },
+            Case {
+                name: "subtract",
+                op_name: "subtract",
+                ty: "bf16",
+                expected: BinaryOpKind::Subtract,
             },
             Case {
                 name: "divide",
@@ -3338,6 +3392,33 @@ mod tests {
                 assert_eq!(*output_id, 2);
                 assert_eq!(*packed_value, 0x3f80_3f80);
                 assert!(matches!(executable.ops[2], executable::Op::Max { .. }));
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_small_integer_splat_constant() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main() -> tensor<2x2xi1> {
+    %0 = stablehlo.constant dense<true> : tensor<2x2xi1>
+    return %0 : tensor<2x2xi1>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![0]);
+                assert_eq!(executable.ops.len(), 1);
+                let executable::Op::Constant {
+                    packed_value,
+                    output_id,
+                } = &executable.ops[0]
+                else {
+                    panic!("predicate splat constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 0);
+                assert_eq!(*packed_value, 1);
             },
         );
     }
@@ -3556,6 +3637,11 @@ mod tests {
                 op_name: "negate",
                 expected: UnaryOpKind::Negate,
             },
+            Case {
+                name: "exponential",
+                op_name: "exponential",
+                expected: UnaryOpKind::Exponential,
+            },
         ];
 
         for case in cases {
@@ -3640,6 +3726,104 @@ mod tests {
                 assert_eq!(start_indices, &vec![0, 1]);
                 assert_eq!(limit_indices, &vec![4, 3]);
                 assert_eq!(strides, &vec![2, 1]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_transpose() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
+    %0 = stablehlo.transpose %arg0, dims = [2, 0, 1] : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
+    return %0 : tensor<4x2x3xf32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![1]);
+                assert_eq!(executable.ops.len(), 2);
+                assert_eq!(executable.values[1].dims, vec![4, 2, 3]);
+                let executable::Op::Transpose {
+                    input_id,
+                    output_id,
+                    permutation,
+                } = &executable.ops[1]
+                else {
+                    panic!("transpose should lower to Transpose");
+                };
+                assert_eq!(*input_id, 0);
+                assert_eq!(*output_id, 1);
+                assert_eq!(permutation, &vec![2, 0, 1]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_custom_call() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %0 = stablehlo.custom_call @foo(%arg0) {
+      has_side_effect = false
+    } : (tensor<2x2xf32>) -> tensor<2x2xf32>
+    return %0 : tensor<2x2xf32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![1]);
+                assert_eq!(executable.ops.len(), 2);
+                let executable::Op::CustomCall {
+                    input_ids,
+                    output_id,
+                    call_target_name,
+                    has_side_effect,
+                } = &executable.ops[1]
+                else {
+                    panic!("custom_call should lower to CustomCall");
+                };
+                assert_eq!(input_ids, &vec![0]);
+                assert_eq!(*output_id, 1);
+                assert_eq!(call_target_name, "foo");
+                assert!(!has_side_effect);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_batched_dot_general() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x3x4xf32>, %arg1: tensor<5x3x4xf32>) -> tensor<3x2x5xf32> {
+    %0 = stablehlo.dot_general %arg0, %arg1,
+      batching_dims = [1] x [1],
+      contracting_dims = [2] x [2]
+      : (tensor<2x3x4xf32>, tensor<5x3x4xf32>) -> tensor<3x2x5xf32>
+    return %0 : tensor<3x2x5xf32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![2]);
+                assert_eq!(executable.ops.len(), 3);
+                let executable::Op::Matmul {
+                    input_ids,
+                    output_id,
+                    dimension_numbers,
+                } = &executable.ops[2]
+                else {
+                    panic!("dot_general should lower to Matmul");
+                };
+                assert_eq!(*input_ids, [0, 1]);
+                assert_eq!(*output_id, 2);
+                assert_eq!(dimension_numbers.lhs_batching_dimensions, vec![1]);
+                assert_eq!(dimension_numbers.rhs_batching_dimensions, vec![1]);
+                assert_eq!(dimension_numbers.lhs_contracting_dimensions, vec![2]);
+                assert_eq!(dimension_numbers.rhs_contracting_dimensions, vec![2]);
             },
         );
     }

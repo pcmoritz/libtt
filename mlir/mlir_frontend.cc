@@ -219,7 +219,7 @@ std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& erro
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
         if (integer.getWidth() <= 32) {
             auto bits = dense.getSplatValue<llvm::APInt>();
-            return bits.extractBitsAsZExtValue(32, 0);
+            return static_cast<uint32_t>(bits.getZExtValue());
         }
     }
     error = "only bf16/f16/f32 and <=32-bit integer splat constants are currently supported";
@@ -443,6 +443,23 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto subtract_op = mlir::dyn_cast<mlir::stablehlo::SubtractOp>(op)) {
+            uint32_t lhs_id = 0;
+            uint32_t rhs_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(subtract_op.getLhs(), executable, value_ids, error, lhs_id) ||
+                !addValueDesc(subtract_op.getRhs(), executable, value_ids, error, rhs_id) ||
+                !addValueDesc(subtract_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* subtract = executable.add_ops();
+            subtract->set_output_id(output_id);
+            subtract->mutable_subtract()->set_lhs_id(lhs_id);
+            subtract->mutable_subtract()->set_rhs_id(rhs_id);
+            continue;
+        }
+
         if (auto mul_op = mlir::dyn_cast<mlir::stablehlo::MulOp>(op)) {
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;
@@ -606,6 +623,64 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto exponential_op = mlir::dyn_cast<mlir::stablehlo::ExpOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(exponential_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(exponential_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* exponential = executable.add_ops();
+            exponential->set_output_id(output_id);
+            exponential->mutable_exponential()->set_operand_id(operand_id);
+            continue;
+        }
+
+        if (auto transpose_op = mlir::dyn_cast<mlir::stablehlo::TransposeOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(transpose_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(transpose_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* transpose = executable.add_ops();
+            transpose->set_output_id(output_id);
+            transpose->mutable_transpose()->set_operand_id(operand_id);
+            for (int64_t dim : transpose_op.getPermutation()) {
+                transpose->mutable_transpose()->add_permutation(dim);
+            }
+            continue;
+        }
+
+        if (auto custom_call_op = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
+            if (custom_call_op->getNumResults() != 1) {
+                error = "only single-result custom_call ops are currently supported";
+                return false;
+            }
+
+            uint32_t output_id = 0;
+            if (!addValueDesc(custom_call_op->getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* custom_call = executable.add_ops();
+            custom_call->set_output_id(output_id);
+            custom_call->mutable_custom_call()->set_call_target_name(
+                custom_call_op.getCallTargetName().str());
+            custom_call->mutable_custom_call()->set_has_side_effect(
+                custom_call_op.getHasSideEffect());
+            for (mlir::Value input : custom_call_op.getInputs()) {
+                uint32_t input_id = 0;
+                if (!addValueDesc(input, executable, value_ids, error, input_id)) {
+                    return false;
+                }
+                custom_call->mutable_custom_call()->add_input_ids(input_id);
+            }
+            continue;
+        }
+
         if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
             uint32_t operand_id = 0;
             uint32_t output_id = 0;
@@ -677,16 +752,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
 
         if (auto dot_op = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op)) {
             auto dims = dot_op.getDotDimensionNumbers();
-            if (!dims.getLhsBatchingDimensions().empty() ||
-                !dims.getRhsBatchingDimensions().empty() ||
-                dims.getLhsContractingDimensions().size() != 1 ||
-                dims.getRhsContractingDimensions().size() != 1 ||
-                dims.getLhsContractingDimensions()[0] != 1 ||
-                dims.getRhsContractingDimensions()[0] != 0) {
-                error = "only rank-2 standard matrix multiplication dot_general is currently supported";
-                return false;
-            }
-
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;
             uint32_t output_id = 0;
@@ -700,6 +765,18 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             matmul->set_output_id(output_id);
             matmul->mutable_matmul()->set_lhs_id(lhs_id);
             matmul->mutable_matmul()->set_rhs_id(rhs_id);
+            for (int64_t dim : dims.getLhsBatchingDimensions()) {
+                matmul->mutable_matmul()->add_lhs_batching_dimensions(dim);
+            }
+            for (int64_t dim : dims.getRhsBatchingDimensions()) {
+                matmul->mutable_matmul()->add_rhs_batching_dimensions(dim);
+            }
+            for (int64_t dim : dims.getLhsContractingDimensions()) {
+                matmul->mutable_matmul()->add_lhs_contracting_dimensions(dim);
+            }
+            for (int64_t dim : dims.getRhsContractingDimensions()) {
+                matmul->mutable_matmul()->add_rhs_contracting_dimensions(dim);
+            }
             continue;
         }
 
