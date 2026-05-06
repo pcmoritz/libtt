@@ -5,8 +5,8 @@
 #include <string>
 #include <vector>
 
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -187,9 +187,17 @@ bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& 
     return true;
 }
 
-std::optional<uint32_t> packedBf16ConstantValue(
-    mlir::stablehlo::ConstantOp constant_op,
-    std::string& error) {
+std::optional<uint32_t> packedBf16ConstantValue(mlir::Value value, std::string& error) {
+    while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
+        value = broadcast_op.getOperand();
+    }
+
+    auto constant_op = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
+    if (!constant_op) {
+        error = "only broadcast_in_dim of constants is currently supported";
+        return std::nullopt;
+    }
+
     auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
     if (!dense || !dense.isSplat()) {
         error = "only splat constants are currently supported";
@@ -205,11 +213,6 @@ std::optional<uint32_t> packedBf16ConstantValue(
     auto bits = dense.getSplatValue<llvm::APFloat>().bitcastToAPInt();
     uint32_t bf16 = bits.extractBitsAsZExtValue(16, 0);
     return bf16 | (bf16 << 16);
-}
-
-bool hasTensorShape(mlir::Value value) {
-    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
-    return tensor && tensor.getRank() >= 2;
 }
 
 void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value) {
@@ -229,7 +232,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     }
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
-    llvm::DenseMap<mlir::Value, uint32_t> constant_values;
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
         uint32_t output_id = 0;
@@ -260,12 +262,12 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(constant_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            auto packed_value = packedBf16ConstantValue(constant_op, error);
+            auto packed_value = packedBf16ConstantValue(constant_op.getResult(), error);
             if (!packed_value) {
                 return false;
             }
-            constant_values.try_emplace(constant_op.getResult(), *packed_value);
-            if (hasTensorShape(constant_op.getResult())) {
+            auto tensor = mlir::cast<mlir::RankedTensorType>(constant_op.getResult().getType());
+            if (tensor.getRank() >= 2) {
                 addConstantOp(executable, output_id, *packed_value);
             }
             continue;
@@ -276,14 +278,11 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(broadcast_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            auto constant = constant_values.find(broadcast_op.getOperand());
-            if (constant != constant_values.end()) {
-                addConstantOp(executable, output_id, constant->second);
-                constant_values.try_emplace(broadcast_op.getResult(), constant->second);
-            } else {
-                error = "only broadcast_in_dim of constants is currently supported";
+            auto packed_value = packedBf16ConstantValue(broadcast_op.getOperand(), error);
+            if (!packed_value) {
                 return false;
             }
+            addConstantOp(executable, output_id, *packed_value);
             continue;
         }
 
