@@ -9,8 +9,7 @@ const BF16_READER: &str = include_str!("../../kernels/binary_eltwise_reader.cc")
 const BF16_WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
 const ADD_BF16_COMPUTE: &str = include_str!("../../kernels/add_compute.cc");
 const MAX_BF16_COMPUTE: &str = include_str!("../../kernels/max_compute.cc");
-const COMPARE_FLOAT_COMPUTE: &str = include_str!("../../kernels/compare_float_compute.cc");
-const COMPARE_INT32_COMPUTE: &str = include_str!("../../kernels/compare_int32_compute.cc");
+const COMPARE_COMPUTE: &str = include_str!("../../kernels/compare_compute.cc");
 const READER_LHS_ADDR_INDEX: usize = 0;
 const READER_RHS_ADDR_INDEX: usize = 1;
 const READER_LHS_CONSTANT_INDEX: usize = 4;
@@ -70,14 +69,38 @@ impl BinaryEltwiseOp {
         }
     }
 
-    fn compare_direction(self) -> io::Result<&'static str> {
+    fn compare_zero_op(self) -> io::Result<CompareZeroOp> {
         match self {
-            Self::CompareEq => Ok("0"),
-            Self::CompareNe => Ok("1"),
-            Self::CompareGe => Ok("2"),
-            Self::CompareGt => Ok("3"),
-            Self::CompareLe => Ok("4"),
-            Self::CompareLt => Ok("5"),
+            Self::CompareEq => Ok(CompareZeroOp {
+                init: "eqz_tile_init",
+                float_tile: "eqz_tile",
+                int32_tile: "eqz_tile_int32",
+            }),
+            Self::CompareNe => Ok(CompareZeroOp {
+                init: "nez_tile_init",
+                float_tile: "nez_tile",
+                int32_tile: "nez_tile_int32",
+            }),
+            Self::CompareGe => Ok(CompareZeroOp {
+                init: "gez_tile_init",
+                float_tile: "gez_tile",
+                int32_tile: "gez_tile_int32",
+            }),
+            Self::CompareGt => Ok(CompareZeroOp {
+                init: "gtz_tile_init",
+                float_tile: "gtz_tile",
+                int32_tile: "gtz_tile_int32",
+            }),
+            Self::CompareLe => Ok(CompareZeroOp {
+                init: "lez_tile_init",
+                float_tile: "lez_tile",
+                int32_tile: "lez_tile_int32",
+            }),
+            Self::CompareLt => Ok(CompareZeroOp {
+                init: "ltz_tile_init",
+                float_tile: "ltz_tile",
+                int32_tile: "ltz_tile_int32",
+            }),
             Self::Add | Self::Max => Err(invalid_input("op is not a compare")),
         }
     }
@@ -366,16 +389,41 @@ fn writer_source(dtype: DType) -> io::Result<String> {
 }
 
 fn compare_compute_source(dtype: DType, op: BinaryEltwiseOp) -> io::Result<String> {
-    let source = match dtype {
-        DType::Float16B | DType::Float32 => COMPARE_FLOAT_COMPUTE,
-        DType::Int32 => COMPARE_INT32_COMPUTE,
+    let zero_op = op.compare_zero_op()?;
+    let substitutions = match dtype {
+        DType::Float16B | DType::Float32 => CompareComputeFns {
+            sub_init: "sub_binary_tile_init",
+            sub_tile: "sub_binary_tile",
+            zero_tile: zero_op.float_tile,
+        },
+        DType::Int32 => CompareComputeFns {
+            sub_init: "sub_int_tile_init",
+            sub_tile: "sub_int32_tile",
+            zero_tile: zero_op.int32_tile,
+        },
         _ => {
             return Err(invalid_input(format!(
                 "compare currently supports Float16B, Float32, and Int32 inputs, got {dtype:?}"
             )))
         }
     };
-    Ok(source.replace("COMPARE_DIRECTION_PLACEHOLDER", op.compare_direction()?))
+    Ok(COMPARE_COMPUTE
+        .replace("COMPARE_SUB_INIT", substitutions.sub_init)
+        .replace("COMPARE_SUB_TILE", substitutions.sub_tile)
+        .replace("COMPARE_ZERO_INIT", zero_op.init)
+        .replace("COMPARE_ZERO_TILE", substitutions.zero_tile))
+}
+
+struct CompareComputeFns {
+    sub_init: &'static str,
+    sub_tile: &'static str,
+    zero_tile: &'static str,
+}
+
+struct CompareZeroOp {
+    init: &'static str,
+    float_tile: &'static str,
+    int32_tile: &'static str,
 }
 
 fn data_format(dtype: DType) -> io::Result<&'static str> {

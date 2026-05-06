@@ -3,6 +3,7 @@
 #include "compute_kernel_api/tile_move_copy.h"
 #include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
 #include "compute_kernel_api/eltwise_binary_sfpu.h"
+#include "compute_kernel_api/sub_int_sfpu.h"
 #include "compute_kernel_api/eltwise_unary/comp.h"
 #include "compute_kernel_api.h"
 
@@ -14,21 +15,8 @@ void MAIN {
   constexpr uint32_t cb_out = tt::CBIndex::c_16;
 
   unary_op_init_common(cb_lhs, cb_out);
-  sub_binary_tile_init();
-
-#if COMPARE_DIRECTION_PLACEHOLDER == 0
-  eqz_tile_init();
-#elif COMPARE_DIRECTION_PLACEHOLDER == 1
-  nez_tile_init();
-#elif COMPARE_DIRECTION_PLACEHOLDER == 2
-  gez_tile_init();
-#elif COMPARE_DIRECTION_PLACEHOLDER == 3
-  gtz_tile_init();
-#elif COMPARE_DIRECTION_PLACEHOLDER == 4
-  lez_tile_init();
-#elif COMPARE_DIRECTION_PLACEHOLDER == 5
-  ltz_tile_init();
-#endif
+  COMPARE_SUB_INIT();
+  COMPARE_ZERO_INIT();
 
   for (uint32_t i = 0; i < n_tiles; ++i) {
     cb_wait_front(cb_lhs, 1);
@@ -40,21 +28,8 @@ void MAIN {
     copy_tile(cb_lhs, 0, 0);
     copy_tile_to_dst_init_short_with_dt(cb_lhs, cb_rhs);
     copy_tile(cb_rhs, 0, 1);
-    sub_binary_tile(0, 1, 0);
-
-#if COMPARE_DIRECTION_PLACEHOLDER == 0
-    eqz_tile(0);
-#elif COMPARE_DIRECTION_PLACEHOLDER == 1
-    nez_tile(0);
-#elif COMPARE_DIRECTION_PLACEHOLDER == 2
-    gez_tile(0);
-#elif COMPARE_DIRECTION_PLACEHOLDER == 3
-    gtz_tile(0);
-#elif COMPARE_DIRECTION_PLACEHOLDER == 4
-    lez_tile(0);
-#elif COMPARE_DIRECTION_PLACEHOLDER == 5
-    ltz_tile(0);
-#endif
+    COMPARE_SUB_TILE(0, 1, 0);
+    COMPARE_ZERO_TILE(0);
 
     tile_regs_commit();
 
