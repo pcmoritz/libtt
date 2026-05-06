@@ -2828,6 +2828,61 @@ mod tests {
         panic!("unexpected PJRT error {code:?}: {detail}");
     }
 
+    #[cfg(libtt_mlir_frontend)]
+    fn with_compiled_mlir_executable(code: &str, check: impl FnOnce(&executable::Executable)) {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"mlir".to_vec();
+        let mut code = code.as_bytes().to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: code.as_mut_ptr().cast::<c_char>(),
+            code_size: code.len(),
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { compile(&mut compile_args) });
+        assert!(!compile_args.executable.is_null());
+
+        let get_executable = api
+            .PJRT_LoadedExecutable_GetExecutable
+            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
+        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
+            extension_start: ptr::null_mut(),
+            loaded_executable: compile_args.executable,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+
+        let executable = unsafe { &*get_executable_args.executable }
+            .metadata
+            .executable
+            .as_ref()
+            .expect("compiled executable should contain a TT executable");
+        check(executable);
+
+        unsafe {
+            drop(Box::from_raw(get_executable_args.executable));
+            drop(Box::from_raw(compile_args.executable));
+            drop(Box::from_raw(client));
+        }
+    }
+
     #[test]
     fn tiled_allocation_shape_pads_scalar_and_vector_buffers() {
         assert_eq!(
@@ -3085,142 +3140,183 @@ mod tests {
     }
 
     #[cfg(libtt_mlir_frontend)]
+    #[derive(Clone, Copy, Debug)]
+    enum BinaryOpKind {
+        Add,
+        Multiply,
+        Divide,
+        Power,
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    fn assert_binary_op(op: &executable::Op, expected: BinaryOpKind) {
+        match (expected, op) {
+            (
+                BinaryOpKind::Add,
+                executable::Op::Add {
+                    input_ids,
+                    output_id,
+                },
+            )
+            | (
+                BinaryOpKind::Multiply,
+                executable::Op::Multiply {
+                    input_ids,
+                    output_id,
+                },
+            )
+            | (
+                BinaryOpKind::Divide,
+                executable::Op::Divide {
+                    input_ids,
+                    output_id,
+                },
+            )
+            | (
+                BinaryOpKind::Power,
+                executable::Op::Power {
+                    input_ids,
+                    output_id,
+                },
+            ) => {
+                assert_eq!(*input_ids, [0, 1]);
+                assert_eq!(*output_id, 2);
+            }
+            _ => panic!("expected {expected:?} op"),
+        }
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[derive(Clone, Copy, Debug)]
+    enum UnaryOpKind {
+        Cosine,
+        Sine,
+        Rsqrt,
+        Negate,
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    fn assert_unary_op(op: &executable::Op, expected: UnaryOpKind) {
+        match (expected, op) {
+            (
+                UnaryOpKind::Cosine,
+                executable::Op::Cosine {
+                    input_id,
+                    output_id,
+                },
+            )
+            | (
+                UnaryOpKind::Sine,
+                executable::Op::Sine {
+                    input_id,
+                    output_id,
+                },
+            )
+            | (
+                UnaryOpKind::Rsqrt,
+                executable::Op::Rsqrt {
+                    input_id,
+                    output_id,
+                },
+            )
+            | (
+                UnaryOpKind::Negate,
+                executable::Op::Negate {
+                    input_id,
+                    output_id,
+                },
+            ) => {
+                assert_eq!(*input_id, 0);
+                assert_eq!(*output_id, 1);
+            }
+            _ => panic!("expected {expected:?} op"),
+        }
+    }
+
+    #[cfg(libtt_mlir_frontend)]
     #[test]
-    fn pjrt_compile_uses_mlir_frontend_for_generic_stablehlo_add() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
-  func.func @main(%arg0: tensor<2x2xbf16>, %arg1: tensor<2x2xbf16>) -> tensor<2x2xbf16> {
-    %0 = "stablehlo.add"(%arg0, %arg1) : (tensor<2x2xbf16>, tensor<2x2xbf16>) -> tensor<2x2xbf16>
-    return %0 : tensor<2x2xbf16>
-  }
-}
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
+    fn pjrt_compile_lowers_simple_binary_ops() {
+        struct Case {
+            name: &'static str,
+            op_name: &'static str,
+            ty: &'static str,
+            expected: BinaryOpKind,
+        }
 
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-        assert!(!compile_args.executable.is_null());
+        let cases = [
+            Case {
+                name: "add",
+                op_name: "add",
+                ty: "bf16",
+                expected: BinaryOpKind::Add,
+            },
+            Case {
+                name: "multiply",
+                op_name: "multiply",
+                ty: "bf16",
+                expected: BinaryOpKind::Multiply,
+            },
+            Case {
+                name: "divide",
+                op_name: "divide",
+                ty: "bf16",
+                expected: BinaryOpKind::Divide,
+            },
+            Case {
+                name: "power",
+                op_name: "power",
+                ty: "f32",
+                expected: BinaryOpKind::Power,
+            },
+        ];
 
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+        for case in cases {
+            let code = format!(
+                r#"module {{
+  func.func public @main(%arg0: tensor<2x2x{ty}>, %arg1: tensor<2x2x{ty}>) -> tensor<2x2x{ty}> {{
+    %0 = stablehlo.{op_name} %arg0, %arg1 : tensor<2x2x{ty}>
+    return %0 : tensor<2x2x{ty}>
+  }}
+}}
+"#,
+                ty = case.ty,
+                op_name = case.op_name
+            );
 
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.values.len(), 3);
-        assert_eq!(executable.ops.len(), 3);
-        assert_eq!(executable.output_ids, vec![2]);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
+            with_compiled_mlir_executable(&code, |executable| {
+                assert_eq!(executable.values.len(), 3, "{} values", case.name);
+                assert_eq!(executable.output_ids, vec![2], "{} outputs", case.name);
+                assert_eq!(executable.ops.len(), 3, "{} ops", case.name);
+                assert_binary_op(&executable.ops[2], case.expected);
+            });
         }
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_multi_op_stablehlo_add_chain() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
+        with_compiled_mlir_executable(
+            r#"module {
   func.func @main(%arg0: tensor<2x2xbf16>, %arg1: tensor<2x2xbf16>, %arg2: tensor<2x2xbf16>) -> tensor<2x2xbf16> {
     %0 = "stablehlo.add"(%arg0, %arg1) : (tensor<2x2xbf16>, tensor<2x2xbf16>) -> tensor<2x2xbf16>
     %1 = "stablehlo.add"(%0, %arg2) : (tensor<2x2xbf16>, tensor<2x2xbf16>) -> tensor<2x2xbf16>
     return %1 : tensor<2x2xbf16>
   }
 }
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.values.len(), 5);
-        assert_eq!(executable.ops.len(), 5);
-        assert_eq!(executable.output_ids, vec![4]);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
+"#,
+            |executable| {
+                assert_eq!(executable.values.len(), 5);
+                assert_eq!(executable.ops.len(), 5);
+                assert_eq!(executable.output_ids, vec![4]);
+            },
+        );
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_maximum_with_broadcast_constant() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
+        with_compiled_mlir_executable(
+            r#"module {
   func.func public @main(%arg0: tensor<32x32xbf16>) -> tensor<32x32xbf16> {
     %cst = stablehlo.constant dense<1.000000e+00> : tensor<bf16>
     %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<bf16>) -> tensor<32x32xbf16>
@@ -3228,74 +3324,29 @@ mod tests {
     return %1 : tensor<32x32xbf16>
   }
 }
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![3]);
-        assert_eq!(executable.ops.len(), 3);
-        let executable::Op::Constant {
-            packed_value,
-            output_id,
-        } = &executable.ops[1]
-        else {
-            panic!("broadcasted constant should lower to Constant");
-        };
-        assert_eq!(*output_id, 2);
-        assert_eq!(*packed_value, 0x3f80_3f80);
-        assert!(matches!(executable.ops[2], executable::Op::Max { .. }));
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![3]);
+                assert_eq!(executable.ops.len(), 3);
+                let executable::Op::Constant {
+                    packed_value,
+                    output_id,
+                } = &executable.ops[1]
+                else {
+                    panic!("broadcasted constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 2);
+                assert_eq!(*packed_value, 0x3f80_3f80);
+                assert!(matches!(executable.ops[2], executable::Op::Max { .. }));
+            },
+        );
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_integer_compare_and_select() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
+        with_compiled_mlir_executable(
+            r#"module {
   func.func public @main(%arg0: tensor<2xi32>) -> tensor<2xi32> {
     %c = stablehlo.constant dense<0> : tensor<i32>
     %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<2xi32>
@@ -3307,909 +3358,259 @@ mod tests {
     return %4 : tensor<2xi32>
   }
 }
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![7]);
-        assert_eq!(executable.ops.len(), 6);
-        let executable::Op::Constant { output_id, .. } = &executable.ops[1] else {
-            panic!("broadcasted constant should lower to Constant");
-        };
-        assert_eq!(*output_id, 2);
-        let executable::Op::Compare {
-            input_ids,
-            output_id,
-            direction,
-        } = &executable.ops[2]
-        else {
-            panic!("compare should lower to Compare");
-        };
-        assert_eq!(*input_ids, [0, 2]);
-        assert_eq!(*output_id, 3);
-        assert_eq!(*direction, executable::CompareDirection::Lt);
-        let executable::Op::Constant { output_id, .. } = &executable.ops[3] else {
-            panic!("second broadcasted constant should lower to Constant");
-        };
-        assert_eq!(*output_id, 5);
-        let executable::Op::Add {
-            input_ids,
-            output_id,
-        } = &executable.ops[4]
-        else {
-            panic!("add should lower to Add");
-        };
-        assert_eq!(*input_ids, [0, 5]);
-        assert_eq!(*output_id, 6);
-        let executable::Op::Select {
-            input_ids,
-            output_id,
-        } = &executable.ops[5]
-        else {
-            panic!("select should lower to Select");
-        };
-        assert_eq!(*input_ids, [3, 6, 0]);
-        assert_eq!(*output_id, 7);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![7]);
+                assert_eq!(executable.ops.len(), 6);
+                let executable::Op::Constant { output_id, .. } = &executable.ops[1] else {
+                    panic!("broadcasted constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 2);
+                let executable::Op::Compare {
+                    input_ids,
+                    output_id,
+                    direction,
+                } = &executable.ops[2]
+                else {
+                    panic!("compare should lower to Compare");
+                };
+                assert_eq!(*input_ids, [0, 2]);
+                assert_eq!(*output_id, 3);
+                assert_eq!(*direction, executable::CompareDirection::Lt);
+                let executable::Op::Constant { output_id, .. } = &executable.ops[3] else {
+                    panic!("second broadcasted constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 5);
+                let executable::Op::Add {
+                    input_ids,
+                    output_id,
+                } = &executable.ops[4]
+                else {
+                    panic!("add should lower to Add");
+                };
+                assert_eq!(*input_ids, [0, 5]);
+                assert_eq!(*output_id, 6);
+                let executable::Op::Select {
+                    input_ids,
+                    output_id,
+                } = &executable.ops[5]
+                else {
+                    panic!("select should lower to Select");
+                };
+                assert_eq!(*input_ids, [3, 6, 0]);
+                assert_eq!(*output_id, 7);
+            },
+        );
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_nonconstant_broadcast_in_dim() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
+        with_compiled_mlir_executable(
+            r#"module {
   func.func public @main(%arg0: tensor<2xi32>) -> tensor<2x1xi32> {
     %0 = stablehlo.broadcast_in_dim %arg0, dims = [0] : (tensor<2xi32>) -> tensor<2x1xi32>
     return %0 : tensor<2x1xi32>
   }
 }
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![1]);
-        assert_eq!(executable.ops.len(), 2);
-        let executable::Op::BroadcastInDim {
-            input_id,
-            output_id,
-            broadcast_dimensions,
-        } = &executable.ops[1]
-        else {
-            panic!("nonconstant broadcast should lower to BroadcastInDim");
-        };
-        assert_eq!(*input_id, 0);
-        assert_eq!(*output_id, 1);
-        assert_eq!(*broadcast_dimensions, vec![0]);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![1]);
+                assert_eq!(executable.ops.len(), 2);
+                let executable::Op::BroadcastInDim {
+                    input_id,
+                    output_id,
+                    broadcast_dimensions,
+                } = &executable.ops[1]
+                else {
+                    panic!("nonconstant broadcast should lower to BroadcastInDim");
+                };
+                assert_eq!(*input_id, 0);
+                assert_eq!(*output_id, 1);
+                assert_eq!(*broadcast_dimensions, vec![0]);
+            },
+        );
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_gather() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
+        with_compiled_mlir_executable(
+            r#"module {
   func.func public @main(%arg0: tensor<4x8xbf16>, %arg1: tensor<2x1xi32>) -> tensor<2x8xbf16> {
     %0 = "stablehlo.gather"(%arg0, %arg1) <{dimension_numbers = #stablehlo.gather<offset_dims = [1], collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1, 8>}> : (tensor<4x8xbf16>, tensor<2x1xi32>) -> tensor<2x8xbf16>
     return %0 : tensor<2x8xbf16>
   }
 }
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![2]);
-        assert_eq!(executable.ops.len(), 3);
-        let executable::Op::Gather {
-            input_ids,
-            output_id,
-            dimension_numbers,
-            slice_sizes,
-            indices_are_sorted,
-        } = &executable.ops[2]
-        else {
-            panic!("gather should lower to Gather");
-        };
-        assert_eq!(*input_ids, [0, 1]);
-        assert_eq!(*output_id, 2);
-        assert_eq!(dimension_numbers.offset_dims, vec![1]);
-        assert_eq!(dimension_numbers.collapsed_slice_dims, vec![0]);
-        assert!(dimension_numbers.operand_batching_dims.is_empty());
-        assert!(dimension_numbers.start_indices_batching_dims.is_empty());
-        assert_eq!(dimension_numbers.start_index_map, vec![0]);
-        assert_eq!(dimension_numbers.index_vector_dim, 1);
-        assert_eq!(*slice_sizes, vec![1, 8]);
-        assert!(!indices_are_sorted);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![2]);
+                assert_eq!(executable.ops.len(), 3);
+                let executable::Op::Gather {
+                    input_ids,
+                    output_id,
+                    dimension_numbers,
+                    slice_sizes,
+                    indices_are_sorted,
+                } = &executable.ops[2]
+                else {
+                    panic!("gather should lower to Gather");
+                };
+                assert_eq!(*input_ids, [0, 1]);
+                assert_eq!(*output_id, 2);
+                assert_eq!(dimension_numbers.offset_dims, vec![1]);
+                assert_eq!(dimension_numbers.collapsed_slice_dims, vec![0]);
+                assert!(dimension_numbers.operand_batching_dims.is_empty());
+                assert!(dimension_numbers.start_indices_batching_dims.is_empty());
+                assert_eq!(dimension_numbers.start_index_map, vec![0]);
+                assert_eq!(dimension_numbers.index_vector_dim, 1);
+                assert_eq!(*slice_sizes, vec![1, 8]);
+                assert!(!indices_are_sorted);
+            },
+        );
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_iota() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
+        with_compiled_mlir_executable(
+            r#"module {
   func.func public @main() -> tensor<2x3xi32> {
     %0 = stablehlo.iota dim = 1 : tensor<2x3xi32>
     return %0 : tensor<2x3xi32>
   }
 }
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![0]);
-        assert_eq!(executable.ops.len(), 1);
-        let executable::Op::Iota {
-            output_id,
-            iota_dimension,
-        } = &executable.ops[0]
-        else {
-            panic!("iota should lower to Iota");
-        };
-        assert_eq!(*output_id, 0);
-        assert_eq!(*iota_dimension, 1);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
-    }
-
-    #[cfg(libtt_mlir_frontend)]
-    #[test]
-    fn pjrt_compile_lowers_multiply() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
-  func.func public @main(%arg0: tensor<2x2xbf16>, %arg1: tensor<2x2xbf16>) -> tensor<2x2xbf16> {
-    %0 = stablehlo.multiply %arg0, %arg1 : tensor<2x2xbf16>
-    return %0 : tensor<2x2xbf16>
-  }
-}
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![2]);
-        assert_eq!(executable.ops.len(), 3);
-        let executable::Op::Multiply {
-            input_ids,
-            output_id,
-        } = &executable.ops[2]
-        else {
-            panic!("multiply should lower to Multiply");
-        };
-        assert_eq!(*input_ids, [0, 1]);
-        assert_eq!(*output_id, 2);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
-    }
-
-    #[cfg(libtt_mlir_frontend)]
-    #[test]
-    fn pjrt_compile_lowers_divide() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
-  func.func public @main(%arg0: tensor<2x2xbf16>, %arg1: tensor<2x2xbf16>) -> tensor<2x2xbf16> {
-    %0 = stablehlo.divide %arg0, %arg1 : tensor<2x2xbf16>
-    return %0 : tensor<2x2xbf16>
-  }
-}
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![2]);
-        assert_eq!(executable.ops.len(), 3);
-        let executable::Op::Divide {
-            input_ids,
-            output_id,
-        } = &executable.ops[2]
-        else {
-            panic!("divide should lower to Divide");
-        };
-        assert_eq!(*input_ids, [0, 1]);
-        assert_eq!(*output_id, 2);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
-    }
-
-    #[cfg(libtt_mlir_frontend)]
-    #[test]
-    fn pjrt_compile_lowers_power() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
-  func.func public @main(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>) -> tensor<2x2xf32> {
-    %0 = stablehlo.power %arg0, %arg1 : tensor<2x2xf32>
-    return %0 : tensor<2x2xf32>
-  }
-}
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![2]);
-        assert_eq!(executable.ops.len(), 3);
-        let executable::Op::Power {
-            input_ids,
-            output_id,
-        } = &executable.ops[2]
-        else {
-            panic!("power should lower to Power");
-        };
-        assert_eq!(*input_ids, [0, 1]);
-        assert_eq!(*output_id, 2);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![0]);
+                assert_eq!(executable.ops.len(), 1);
+                let executable::Op::Iota {
+                    output_id,
+                    iota_dimension,
+                } = &executable.ops[0]
+                else {
+                    panic!("iota should lower to Iota");
+                };
+                assert_eq!(*output_id, 0);
+                assert_eq!(*iota_dimension, 1);
+            },
+        );
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_concatenate() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
+        with_compiled_mlir_executable(
+            r#"module {
   func.func public @main(%arg0: tensor<2x4xbf16>, %arg1: tensor<3x4xbf16>) -> tensor<5x4xbf16> {
     %0 = stablehlo.concatenate %arg0, %arg1, dim = 0 : (tensor<2x4xbf16>, tensor<3x4xbf16>) -> tensor<5x4xbf16>
     return %0 : tensor<5x4xbf16>
   }
 }
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![2]);
-        assert_eq!(executable.ops.len(), 3);
-        let executable::Op::Concatenate {
-            input_ids,
-            output_id,
-            dimension,
-        } = &executable.ops[2]
-        else {
-            panic!("concatenate should lower to Concatenate");
-        };
-        assert_eq!(*input_ids, vec![0, 1]);
-        assert_eq!(*output_id, 2);
-        assert_eq!(*dimension, 0);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![2]);
+                assert_eq!(executable.ops.len(), 3);
+                let executable::Op::Concatenate {
+                    input_ids,
+                    output_id,
+                    dimension,
+                } = &executable.ops[2]
+                else {
+                    panic!("concatenate should lower to Concatenate");
+                };
+                assert_eq!(input_ids.as_slice(), [0, 1]);
+                assert_eq!(*output_id, 2);
+                assert_eq!(*dimension, 0);
+            },
+        );
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
-    fn pjrt_compile_lowers_cosine() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
-  func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
-    %0 = stablehlo.cosine %arg0 : tensor<2x2xf32>
-    return %0 : tensor<2x2xf32>
-  }
-}
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![1]);
-        assert_eq!(executable.ops.len(), 2);
-        let executable::Op::Cosine {
-            input_id,
-            output_id,
-        } = &executable.ops[1]
-        else {
-            panic!("cosine should lower to Cosine");
-        };
-        assert_eq!(*input_id, 0);
-        assert_eq!(*output_id, 1);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
+    fn pjrt_compile_lowers_simple_unary_ops() {
+        struct Case {
+            name: &'static str,
+            op_name: &'static str,
+            expected: UnaryOpKind,
         }
-    }
 
-    #[cfg(libtt_mlir_frontend)]
-    #[test]
-    fn pjrt_compile_lowers_sine() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
-  func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
-    %0 = stablehlo.sine %arg0 : tensor<2x2xf32>
+        let cases = [
+            Case {
+                name: "cosine",
+                op_name: "cosine",
+                expected: UnaryOpKind::Cosine,
+            },
+            Case {
+                name: "sine",
+                op_name: "sine",
+                expected: UnaryOpKind::Sine,
+            },
+            Case {
+                name: "rsqrt",
+                op_name: "rsqrt",
+                expected: UnaryOpKind::Rsqrt,
+            },
+            Case {
+                name: "negate",
+                op_name: "negate",
+                expected: UnaryOpKind::Negate,
+            },
+        ];
+
+        for case in cases {
+            let code = format!(
+                r#"module {{
+  func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {{
+    %0 = stablehlo.{op_name} %arg0 : tensor<2x2xf32>
     return %0 : tensor<2x2xf32>
-  }
-}
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
+  }}
+}}
+"#,
+                op_name = case.op_name
+            );
 
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![1]);
-        assert_eq!(executable.ops.len(), 2);
-        let executable::Op::Sine {
-            input_id,
-            output_id,
-        } = &executable.ops[1]
-        else {
-            panic!("sine should lower to Sine");
-        };
-        assert_eq!(*input_id, 0);
-        assert_eq!(*output_id, 1);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
-    }
-
-    #[cfg(libtt_mlir_frontend)]
-    #[test]
-    fn pjrt_compile_lowers_rsqrt() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
-  func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
-    %0 = stablehlo.rsqrt %arg0 : tensor<2x2xf32>
-    return %0 : tensor<2x2xf32>
-  }
-}
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![1]);
-        assert_eq!(executable.ops.len(), 2);
-        let executable::Op::Rsqrt {
-            input_id,
-            output_id,
-        } = &executable.ops[1]
-        else {
-            panic!("rsqrt should lower to Rsqrt");
-        };
-        assert_eq!(*input_id, 0);
-        assert_eq!(*output_id, 1);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
+            with_compiled_mlir_executable(&code, |executable| {
+                assert_eq!(executable.output_ids, vec![1], "{} outputs", case.name);
+                assert_eq!(executable.ops.len(), 2, "{} ops", case.name);
+                assert_unary_op(&executable.ops[1], case.expected);
+            });
         }
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_reshape() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
+        with_compiled_mlir_executable(
+            r#"module {
   func.func public @main(%arg0: tensor<2x3xf32>) -> tensor<3x2xf32> {
     %0 = stablehlo.reshape %arg0 : (tensor<2x3xf32>) -> tensor<3x2xf32>
     return %0 : tensor<3x2xf32>
   }
 }
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![1]);
-        assert_eq!(executable.ops.len(), 2);
-        assert_eq!(executable.values[1].dims, vec![3, 2]);
-        let executable::Op::Reshape {
-            input_id,
-            output_id,
-        } = &executable.ops[1]
-        else {
-            panic!("reshape should lower to Reshape");
-        };
-        assert_eq!(*input_id, 0);
-        assert_eq!(*output_id, 1);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![1]);
+                assert_eq!(executable.ops.len(), 2);
+                assert_eq!(executable.values[1].dims, vec![3, 2]);
+                let executable::Op::Reshape {
+                    input_id,
+                    output_id,
+                } = &executable.ops[1]
+                else {
+                    panic!("reshape should lower to Reshape");
+                };
+                assert_eq!(*input_id, 0);
+                assert_eq!(*output_id, 1);
+            },
+        );
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_slice() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
+        with_compiled_mlir_executable(
+            r#"module {
   func.func public @main(%arg0: tensor<4x4xf32>) -> tensor<2x2xf32> {
     %0 = "stablehlo.slice"(%arg0) {
       start_indices = array<i64: 0, 1>,
@@ -4219,224 +3620,62 @@ mod tests {
     return %0 : tensor<2x2xf32>
   }
 }
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![1]);
-        assert_eq!(executable.ops.len(), 2);
-        assert_eq!(executable.values[1].dims, vec![2, 2]);
-        let executable::Op::Slice {
-            input_id,
-            output_id,
-            start_indices,
-            limit_indices,
-            strides,
-        } = &executable.ops[1]
-        else {
-            panic!("slice should lower to Slice");
-        };
-        assert_eq!(*input_id, 0);
-        assert_eq!(*output_id, 1);
-        assert_eq!(start_indices, &vec![0, 1]);
-        assert_eq!(limit_indices, &vec![4, 3]);
-        assert_eq!(strides, &vec![2, 1]);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
-    }
-
-    #[cfg(libtt_mlir_frontend)]
-    #[test]
-    fn pjrt_compile_lowers_negate() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
-  func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
-    %0 = stablehlo.negate %arg0 : tensor<2x2xf32>
-    return %0 : tensor<2x2xf32>
-  }
-}
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![1]);
-        assert_eq!(executable.ops.len(), 2);
-        let executable::Op::Negate {
-            input_id,
-            output_id,
-        } = &executable.ops[1]
-        else {
-            panic!("negate should lower to Negate");
-        };
-        assert_eq!(*input_id, 0);
-        assert_eq!(*output_id, 1);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![1]);
+                assert_eq!(executable.ops.len(), 2);
+                assert_eq!(executable.values[1].dims, vec![2, 2]);
+                let executable::Op::Slice {
+                    input_id,
+                    output_id,
+                    start_indices,
+                    limit_indices,
+                    strides,
+                } = &executable.ops[1]
+                else {
+                    panic!("slice should lower to Slice");
+                };
+                assert_eq!(*input_id, 0);
+                assert_eq!(*output_id, 1);
+                assert_eq!(start_indices, &vec![0, 1]);
+                assert_eq!(limit_indices, &vec![4, 3]);
+                assert_eq!(strides, &vec![2, 1]);
+            },
+        );
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_convert() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
+        with_compiled_mlir_executable(
+            r#"module {
   func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xbf16> {
     %0 = stablehlo.convert %arg0 : (tensor<2x2xf32>) -> tensor<2x2xbf16>
     return %0 : tensor<2x2xbf16>
   }
 }
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![1]);
-        assert_eq!(executable.ops.len(), 2);
-        let executable::Op::Convert {
-            input_id,
-            output_id,
-        } = &executable.ops[1]
-        else {
-            panic!("convert should lower to Convert");
-        };
-        assert_eq!(*input_id, 0);
-        assert_eq!(*output_id, 1);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![1]);
+                assert_eq!(executable.ops.len(), 2);
+                let executable::Op::Convert {
+                    input_id,
+                    output_id,
+                } = &executable.ops[1]
+                else {
+                    panic!("convert should lower to Convert");
+                };
+                assert_eq!(*input_id, 0);
+                assert_eq!(*output_id, 1);
+            },
+        );
     }
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_reduce() {
-        let api = unsafe { &*GetPjrtApi() };
-        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
-        let mut format = b"mlir".to_vec();
-        let mut code = br#"module {
+        with_compiled_mlir_executable(
+            r#"module {
   func.func public @main(%arg0: tensor<2x3xf32>) -> tensor<2xf32> {
     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
     %0 = "stablehlo.reduce"(%arg0, %cst) ({
@@ -4449,69 +3688,26 @@ mod tests {
     return %0 : tensor<2xf32>
   }
 }
-"#
-        .to_vec();
-        let program = PJRT_Program {
-            struct_size: size_of::<PJRT_Program>(),
-            extension_start: ptr::null_mut(),
-            code: code.as_mut_ptr().cast::<c_char>(),
-            code_size: code.len(),
-            format: format.as_mut_ptr().cast::<c_char>(),
-            format_size: format.len(),
-        };
-
-        let compile = api
-            .PJRT_Client_Compile
-            .expect("PJRT_Client_Compile must be exported");
-        let mut compile_args = PJRT_Client_Compile_Args {
-            struct_size: size_of::<PJRT_Client_Compile_Args>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: ptr::null(),
-            compile_options_size: 0,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { compile(&mut compile_args) });
-
-        let get_executable = api
-            .PJRT_LoadedExecutable_GetExecutable
-            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
-        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
-            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
-            extension_start: ptr::null_mut(),
-            loaded_executable: compile_args.executable,
-            executable: ptr::null_mut(),
-        };
-        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
-
-        let executable = unsafe { &*get_executable_args.executable }
-            .metadata
-            .executable
-            .as_ref()
-            .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![2]);
-        assert_eq!(executable.ops.len(), 2);
-        let executable::Op::Reduce {
-            input_ids,
-            init_value_ids,
-            output_id,
-            dimensions,
-            reducer,
-        } = &executable.ops[1]
-        else {
-            panic!("reduce should lower to Reduce");
-        };
-        assert_eq!(input_ids, &vec![0]);
-        assert_eq!(init_value_ids, &vec![1]);
-        assert_eq!(*output_id, 2);
-        assert_eq!(dimensions, &vec![1]);
-        assert_eq!(*reducer, executable::ReduceReducer::Add);
-
-        unsafe {
-            drop(Box::from_raw(get_executable_args.executable));
-            drop(Box::from_raw(compile_args.executable));
-            drop(Box::from_raw(client));
-        }
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![2]);
+                assert_eq!(executable.ops.len(), 2);
+                let executable::Op::Reduce {
+                    input_ids,
+                    init_value_ids,
+                    output_id,
+                    dimensions,
+                    reducer,
+                } = &executable.ops[1]
+                else {
+                    panic!("reduce should lower to Reduce");
+                };
+                assert_eq!(input_ids, &vec![0]);
+                assert_eq!(init_value_ids, &vec![1]);
+                assert_eq!(*output_id, 2);
+                assert_eq!(dimensions, &vec![1]);
+                assert_eq!(*reducer, executable::ReduceReducer::Add);
+            },
+        );
     }
 }
