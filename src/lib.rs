@@ -342,10 +342,6 @@ fn dtype_to_pjrt_buffer_type(dtype: DType) -> PJRT_Buffer_Type {
     }
 }
 
-fn pjrt_buffer_type_device_dtype(buffer_type: PJRT_Buffer_Type) -> Result<DType, *mut PJRT_Error> {
-    pjrt_buffer_type_to_dtype(buffer_type)
-}
-
 fn dims_i64_to_usize(dims: &[i64]) -> Result<Vec<usize>, *mut PJRT_Error> {
     dims.iter()
         .map(|&dim| {
@@ -1391,7 +1387,7 @@ fn eltwise_input<'a>(
                         "{field} constant value id {value_id} is out of bounds"
                     ))
                 })?;
-                let dtype = pjrt_buffer_type_device_dtype(desc.element_type)?;
+                let dtype = pjrt_buffer_type_to_dtype(desc.element_type)?;
                 if dtype != expected_dtype {
                     return Err(unimplemented(format!(
                         "{field} constant value id {value_id} has type {:?}; expected {expected_dtype:?}",
@@ -1436,7 +1432,7 @@ fn store_output_buffer(
             expected.dims, expected_dims
         )));
     }
-    let expected_dtype = pjrt_buffer_type_device_dtype(expected.element_type)?;
+    let expected_dtype = pjrt_buffer_type_to_dtype(expected.element_type)?;
     if dram_buffer.dtype != expected_dtype {
         return Err(invalid_argument(format!(
             "TT executable {op} output dtype mismatch: expected {:?}, got {:?}",
@@ -1566,7 +1562,7 @@ fn execute_compare(
         )));
     }
 
-    let input_dtype = pjrt_buffer_type_device_dtype(lhs_desc.element_type)?;
+    let input_dtype = pjrt_buffer_type_to_dtype(lhs_desc.element_type)?;
     if !matches!(input_dtype, DType::Float16B | DType::Float32 | DType::Int32) {
         return Err(unimplemented(format!(
             "TT executable compare currently supports bf16, f32, and s32 inputs, got {:?}",
