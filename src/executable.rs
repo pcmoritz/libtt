@@ -48,6 +48,10 @@ pub(crate) enum Op {
         input_ids: [u32; 2],
         output_id: u32,
     },
+    Divide {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
     Matmul {
         input_ids: [u32; 2],
         output_id: u32,
@@ -190,6 +194,10 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     input_ids: [multiply.lhs_id, multiply.rhs_id],
                     output_id: op_desc.output_id,
                 }),
+                Kind::Divide(divide) => Ok(Op::Divide {
+                    input_ids: [divide.lhs_id, divide.rhs_id],
+                    output_id: op_desc.output_id,
+                }),
                 Kind::Matmul(matmul) => Ok(Op::Matmul {
                     input_ids: [matmul.lhs_id, matmul.rhs_id],
                     output_id: op_desc.output_id,
@@ -306,6 +314,10 @@ pub(crate) enum Op {
         output_id: u32,
     },
     Multiply {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Divide {
         input_ids: [u32; 2],
         output_id: u32,
     },

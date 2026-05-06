@@ -43,6 +43,12 @@ message MultiplyOp {
   uint32 rhs_id = 2;
 }
 
+message DivideOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+}
+
 message MatmulOp {
   // Indices into Executable.values for this op's operands.
   uint32 lhs_id = 1;
@@ -126,6 +132,7 @@ message Op {
     GatherOp gather = 10;
     IotaOp iota = 11;
     MultiplyOp multiply = 12;
+    DivideOp divide = 13;
   }
 }
 
