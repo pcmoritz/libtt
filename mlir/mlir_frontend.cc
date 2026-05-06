@@ -421,6 +421,23 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto pow_op = mlir::dyn_cast<mlir::stablehlo::PowOp>(op)) {
+            uint32_t lhs_id = 0;
+            uint32_t rhs_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(pow_op.getLhs(), executable, value_ids, error, lhs_id) ||
+                !addValueDesc(pow_op.getRhs(), executable, value_ids, error, rhs_id) ||
+                !addValueDesc(pow_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* power = executable.add_ops();
+            power->set_output_id(output_id);
+            power->mutable_power()->set_lhs_id(lhs_id);
+            power->mutable_power()->set_rhs_id(rhs_id);
+            continue;
+        }
+
         if (auto max_op = mlir::dyn_cast<mlir::stablehlo::MaxOp>(op)) {
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;
