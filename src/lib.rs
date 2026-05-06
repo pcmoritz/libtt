@@ -1471,11 +1471,9 @@ fn execute_binary_eltwise(
         .values
         .get(input_ids[1] as usize)
         .ok_or_else(|| invalid_argument(format!("{rhs_field} value id is out of bounds")))?;
-    if lhs_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || rhs_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-    {
-        return Err(unimplemented(format!(
-            "TT executable {op_name} currently only supports bf16 buffers"
+    if lhs_desc.element_type != rhs_desc.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable {op_name} input element types must match"
         )));
     }
     if lhs_desc.dims != rhs_desc.dims {
@@ -1483,18 +1481,50 @@ fn execute_binary_eltwise(
             "TT executable {op_name} input shapes must match"
         )));
     }
+    let input_dtype = pjrt_buffer_type_to_dtype(lhs_desc.element_type)?;
+    let expected_output_type = match op {
+        kernels::binary_eltwise::BinaryEltwiseOp::Add
+        | kernels::binary_eltwise::BinaryEltwiseOp::Max => {
+            if input_dtype != DType::Float16B {
+                return Err(unimplemented(format!(
+                    "TT executable {op_name} currently only supports bf16 buffers"
+                )));
+            }
+            PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        }
+        kernels::binary_eltwise::BinaryEltwiseOp::Compare(_) => {
+            if !matches!(input_dtype, DType::Float16B | DType::Float32 | DType::Int32) {
+                return Err(unimplemented(format!(
+                    "TT executable compare currently supports bf16, f32, and s32 inputs, got {:?}",
+                    lhs_desc.element_type
+                )));
+            }
+            PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
+        }
+    };
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable {op_name} output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != expected_output_type {
+        return Err(invalid_argument(format!(
+            "TT executable {op_name} output must be {:?}, got {:?}",
+            expected_output_type, output_desc.element_type
+        )));
+    }
 
     let output_dims = lhs_desc.dims.clone();
     let shape = dims_i64_to_usize(&output_dims)?;
-    let lhs_input = eltwise_input(values, plan, input_ids[0], DType::Float16B, &lhs_field)?;
-    let rhs_input = eltwise_input(values, plan, input_ids[1], DType::Float16B, &rhs_field)?;
+    let lhs_input = eltwise_input(values, plan, input_ids[0], input_dtype, &lhs_field)?;
+    let rhs_input = eltwise_input(values, plan, input_ids[1], input_dtype, &rhs_field)?;
     let output_name = format!("pjrt_{op_name}");
     let output_dram = kernels::binary_eltwise::eltwise(
         device,
         op,
         lhs_input,
         rhs_input,
-        DType::Float16B,
+        input_dtype,
         &shape,
         output_name,
     )
@@ -1507,78 +1537,6 @@ fn execute_binary_eltwise(
         output_dram,
         context,
         op_name,
-    )
-}
-
-fn execute_compare(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    device: &mut Device,
-    context: &OutputContext,
-    input_ids: [u32; 2],
-    output_id: u32,
-    direction: executable::CompareDirection,
-) -> Result<(), *mut PJRT_Error> {
-    let lhs_desc = plan
-        .values
-        .get(input_ids[0] as usize)
-        .ok_or_else(|| invalid_argument("compare.lhs value id is out of bounds"))?;
-    let rhs_desc = plan
-        .values
-        .get(input_ids[1] as usize)
-        .ok_or_else(|| invalid_argument("compare.rhs value id is out of bounds"))?;
-    if lhs_desc.element_type != rhs_desc.element_type {
-        return Err(invalid_argument(
-            "TT executable compare input element types must match",
-        ));
-    }
-    if lhs_desc.dims != rhs_desc.dims {
-        return Err(invalid_argument(
-            "TT executable compare input shapes must match",
-        ));
-    }
-    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable compare output id {output_id} is out of bounds"
-        ))
-    })?;
-    if output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_PRED {
-        return Err(invalid_argument(format!(
-            "TT executable compare output must be PRED, got {:?}",
-            output_desc.element_type
-        )));
-    }
-
-    let input_dtype = pjrt_buffer_type_to_dtype(lhs_desc.element_type)?;
-    if !matches!(input_dtype, DType::Float16B | DType::Float32 | DType::Int32) {
-        return Err(unimplemented(format!(
-            "TT executable compare currently supports bf16, f32, and s32 inputs, got {:?}",
-            lhs_desc.element_type
-        )));
-    }
-
-    let output_dims = lhs_desc.dims.clone();
-    let shape = dims_i64_to_usize(&output_dims)?;
-    let lhs_input = eltwise_input(values, plan, input_ids[0], input_dtype, "compare.lhs")?;
-    let rhs_input = eltwise_input(values, plan, input_ids[1], input_dtype, "compare.rhs")?;
-    let output_dram = kernels::binary_eltwise::eltwise(
-        device,
-        kernels::binary_eltwise::BinaryEltwiseOp::Compare(direction),
-        lhs_input,
-        rhs_input,
-        input_dtype,
-        &shape,
-        "pjrt_compare",
-    )
-    .map_err(io_error)?;
-    store_output_buffer(
-        values,
-        plan,
-        output_id,
-        output_dims,
-        output_dram,
-        context,
-        "compare",
     )
 }
 
@@ -1824,14 +1782,15 @@ fn execute_executable_v1(
                 output_id,
                 direction,
             } => {
-                execute_compare(
+                execute_binary_eltwise(
                     &mut values,
                     plan,
                     device,
                     &output_context,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Compare(*direction),
                     *input_ids,
                     *output_id,
-                    *direction,
+                    "compare",
                 )?;
             }
             executable::Op::Select { .. } => {
