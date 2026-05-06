@@ -9,6 +9,8 @@ const BF16_READER: &str = include_str!("../../kernels/binary_eltwise_reader.cc")
 const BF16_WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
 const ADD_BF16_COMPUTE: &str = include_str!("../../kernels/add_compute.cc");
 const MAX_BF16_COMPUTE: &str = include_str!("../../kernels/max_compute.cc");
+const COMPARE_FLOAT_COMPUTE: &str = include_str!("../../kernels/compare_float_compute.cc");
+const COMPARE_INT32_COMPUTE: &str = include_str!("../../kernels/compare_int32_compute.cc");
 const READER_LHS_ADDR_INDEX: usize = 0;
 const READER_RHS_ADDR_INDEX: usize = 1;
 const READER_LHS_CONSTANT_INDEX: usize = 4;
@@ -21,20 +23,62 @@ const TILE_C: usize = 32;
 pub(crate) enum BinaryEltwiseOp {
     Add,
     Max,
+    CompareEq,
+    CompareNe,
+    CompareGe,
+    CompareGt,
+    CompareLe,
+    CompareLt,
 }
 
 impl BinaryEltwiseOp {
-    fn compute_source(self) -> &'static str {
+    fn compute_source(self, input_dtype: DType) -> io::Result<String> {
         match self {
-            Self::Add => ADD_BF16_COMPUTE,
-            Self::Max => MAX_BF16_COMPUTE,
+            Self::Add => Ok(ADD_BF16_COMPUTE.to_owned()),
+            Self::Max => Ok(MAX_BF16_COMPUTE.to_owned()),
+            Self::CompareEq
+            | Self::CompareNe
+            | Self::CompareGe
+            | Self::CompareGt
+            | Self::CompareLe
+            | Self::CompareLt => compare_compute_source(input_dtype, self),
         }
     }
 
-    fn kernel_name(self) -> &'static str {
+    fn kernel_name(self, input_dtype: DType, output_dtype: DType) -> String {
         match self {
-            Self::Add => "eltwise_add_bf16",
-            Self::Max => "eltwise_max_bf16",
+            Self::Add => "eltwise_add_bf16".to_owned(),
+            Self::Max => "eltwise_max_bf16".to_owned(),
+            Self::CompareEq => format!("eltwise_compare_eq_{input_dtype:?}_{output_dtype:?}"),
+            Self::CompareNe => format!("eltwise_compare_ne_{input_dtype:?}_{output_dtype:?}"),
+            Self::CompareGe => format!("eltwise_compare_ge_{input_dtype:?}_{output_dtype:?}"),
+            Self::CompareGt => format!("eltwise_compare_gt_{input_dtype:?}_{output_dtype:?}"),
+            Self::CompareLe => format!("eltwise_compare_le_{input_dtype:?}_{output_dtype:?}"),
+            Self::CompareLt => format!("eltwise_compare_lt_{input_dtype:?}_{output_dtype:?}"),
+        }
+    }
+
+    fn output_dtype(self) -> DType {
+        match self {
+            Self::Add | Self::Max => DType::Float16B,
+            Self::CompareEq
+            | Self::CompareNe
+            | Self::CompareGe
+            | Self::CompareGt
+            | Self::CompareLe
+            | Self::CompareLt => DType::UInt8,
+        }
+    }
+
+    fn compare_direction(self) -> io::Result<&'static str> {
+        match self {
+            Self::CompareEq => Ok("0"),
+            Self::CompareNe => Ok("1"),
+            Self::CompareGe => Ok("2"),
+            Self::CompareGt => Ok("3"),
+            Self::CompareLe => Ok("4"),
+            Self::CompareLt => Ok("5"),
+            Self::Add | Self::Max => Err(invalid_input("op is not a compare")),
         }
     }
 }
@@ -44,9 +88,11 @@ struct BinaryEltwiseProgramKey {
     op: BinaryEltwiseOp,
     core: CoreCoord,
     tile_count: u32,
+    input_dtype: DType,
+    output_dtype: DType,
 }
 
-struct BinaryEltwiseBf16Kernel {
+struct BinaryEltwiseKernel {
     lhs_addr: u32,
     rhs_addr: u32,
     lhs_constant: Option<u32>,
@@ -55,13 +101,13 @@ struct BinaryEltwiseBf16Kernel {
     key: BinaryEltwiseProgramKey,
 }
 
-impl Kernel<BinaryEltwiseProgramKey> for BinaryEltwiseBf16Kernel {
+impl Kernel<BinaryEltwiseProgramKey> for BinaryEltwiseKernel {
     fn program_key(&self) -> BinaryEltwiseProgramKey {
         self.key
     }
 
     fn build_program(&self) -> io::Result<Program> {
-        bf16_program(self.key)
+        eltwise_program(self.key)
     }
 
     #[inline]
@@ -90,6 +136,12 @@ pub(crate) enum Bf16EltwiseInput<'a> {
     Constant(u32),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum EltwiseInput<'a> {
+    Dram(&'a DramBuffer),
+    Constant(u32),
+}
+
 pub(crate) fn eltwise_bf16(
     device: &mut Device,
     op: BinaryEltwiseOp,
@@ -98,9 +150,29 @@ pub(crate) fn eltwise_bf16(
     shape: &[usize],
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
+    eltwise(
+        device,
+        op,
+        EltwiseInput::from(lhs),
+        EltwiseInput::from(rhs),
+        DType::Float16B,
+        shape,
+        name,
+    )
+}
+
+pub(crate) fn eltwise(
+    device: &mut Device,
+    op: BinaryEltwiseOp,
+    lhs: EltwiseInput<'_>,
+    rhs: EltwiseInput<'_>,
+    input_dtype: DType,
+    shape: &[usize],
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
     let output_tiles = shape_tile_count(shape)?;
-    validate_input(lhs, shape, output_tiles, "lhs")?;
-    validate_input(rhs, shape, output_tiles, "rhs")?;
+    validate_input(lhs, input_dtype, shape, output_tiles, "lhs")?;
+    validate_input(rhs, input_dtype, shape, output_tiles, "rhs")?;
 
     let lhs_addr = input_addr(lhs, "lhs address")?;
     let rhs_addr = input_addr(rhs, "rhs address")?;
@@ -111,10 +183,12 @@ pub(crate) fn eltwise_bf16(
         .first()
         .copied()
         .ok_or_else(|| invalid_input("no worker cores are available"))?;
-    let output = device.alloc(output_tiles, DType::Float16B, shape, name)?;
+    let output_dtype = op.output_dtype();
+    let output_shape = allocation_shape(shape)?;
+    let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
     let output_addr = u32_arg(output.addr, "output address")?;
 
-    let kernel = BinaryEltwiseBf16Kernel {
+    let kernel = BinaryEltwiseKernel {
         lhs_addr,
         rhs_addr,
         lhs_constant: input_constant(lhs),
@@ -124,28 +198,40 @@ pub(crate) fn eltwise_bf16(
             op,
             core,
             tile_count,
+            input_dtype,
+            output_dtype,
         },
     };
     kernel.run(device)?;
     Ok(output)
 }
 
+impl<'a> From<Bf16EltwiseInput<'a>> for EltwiseInput<'a> {
+    fn from(input: Bf16EltwiseInput<'a>) -> Self {
+        match input {
+            Bf16EltwiseInput::Dram(buffer) => Self::Dram(buffer),
+            Bf16EltwiseInput::Constant(value) => Self::Constant(value),
+        }
+    }
+}
+
 fn validate_input(
-    input: Bf16EltwiseInput<'_>,
+    input: EltwiseInput<'_>,
+    dtype: DType,
     shape: &[usize],
     expected_tiles: usize,
     name: &str,
 ) -> io::Result<()> {
-    let Bf16EltwiseInput::Dram(buffer) = input else {
+    let EltwiseInput::Dram(buffer) = input else {
         return Ok(());
     };
-    if buffer.dtype != DType::Float16B {
+    if buffer.dtype != dtype {
         return Err(invalid_input(format!(
-            "{name} requires bf16 input, got {:?}",
-            buffer.dtype
+            "{name} requires {:?} input, got {:?}",
+            dtype, buffer.dtype
         )));
     }
-    if buffer.shape != shape {
+    if !buffer_shape_matches(&buffer.shape, shape)? {
         return Err(invalid_input(format!(
             "{name} shape mismatch: got {:?}, expected {:?}",
             buffer.shape, shape
@@ -160,24 +246,49 @@ fn validate_input(
     Ok(())
 }
 
-fn input_addr(input: Bf16EltwiseInput<'_>, name: &str) -> io::Result<u32> {
-    match input {
-        Bf16EltwiseInput::Dram(buffer) => u32_arg(buffer.addr, name),
-        Bf16EltwiseInput::Constant(_) => Ok(0),
+fn buffer_shape_matches(buffer_shape: &[usize], logical_shape: &[usize]) -> io::Result<bool> {
+    if buffer_shape == logical_shape {
+        return Ok(true);
+    }
+    Ok(buffer_shape == allocation_shape(logical_shape)?.as_slice())
+}
+
+fn allocation_shape(shape: &[usize]) -> io::Result<Vec<usize>> {
+    match shape.len() {
+        0 => Ok(vec![TILE_R, TILE_C]),
+        1 => Ok(vec![TILE_R, round_up_to_tile_dim(shape[0])?]),
+        _ => Ok(shape.to_vec()),
     }
 }
 
-fn input_constant(input: Bf16EltwiseInput<'_>) -> Option<u32> {
+fn round_up_to_tile_dim(dim: usize) -> io::Result<usize> {
+    dim.max(1)
+        .checked_add(TILE_C - 1)
+        .map(|value| value / TILE_C * TILE_C)
+        .ok_or_else(|| invalid_input("shape dimension overflow"))
+}
+
+fn input_addr(input: EltwiseInput<'_>, name: &str) -> io::Result<u32> {
     match input {
-        Bf16EltwiseInput::Dram(_) => None,
-        Bf16EltwiseInput::Constant(value) => Some(value),
+        EltwiseInput::Dram(buffer) => u32_arg(buffer.addr, name),
+        EltwiseInput::Constant(_) => Ok(0),
+    }
+}
+
+fn input_constant(input: EltwiseInput<'_>) -> Option<u32> {
+    match input {
+        EltwiseInput::Dram(_) => None,
+        EltwiseInput::Constant(value) => Some(value),
     }
 }
 
 #[allow(clippy::manual_is_multiple_of)]
 fn shape_tile_count(shape: &[usize]) -> io::Result<usize> {
-    if shape.len() < 2 {
-        return Err(invalid_input("shape must have at least two dimensions"));
+    if shape.is_empty() {
+        return Ok(1);
+    }
+    if shape.len() == 1 {
+        return Ok(shape[0].div_ceil(TILE_C));
     }
     let rows = shape[shape.len() - 2];
     let cols = shape[shape.len() - 1];
@@ -204,7 +315,7 @@ fn u32_arg(value: u64, name: &str) -> io::Result<u32> {
         .map_err(|_| invalid_input(format!("{name} does not fit in u32: 0x{value:x}")))
 }
 
-fn bf16_program(key: BinaryEltwiseProgramKey) -> io::Result<Program> {
+fn eltwise_program(key: BinaryEltwiseProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
         vec![WRITER_OUTPUT_ADDR_INDEX],
@@ -224,18 +335,58 @@ fn bf16_program(key: BinaryEltwiseProgramKey) -> io::Result<Program> {
     )?;
     let runtime_args = runtime_args.build()?;
     Ok(Program {
-        reader_kernel: BF16_READER.to_owned(),
-        compute_kernel: key.op.compute_source().to_owned(),
-        writer_kernel: BF16_WRITER.to_owned(),
+        reader_kernel: reader_source(key.input_dtype)?,
+        compute_kernel: key.op.compute_source(key.input_dtype)?,
+        writer_kernel: writer_source(key.output_dtype)?,
         compile: CompileConfig {
             cbs: vec![
-                CBConfig::new(0, DType::Float16B),
-                CBConfig::new(1, DType::Float16B),
-                CBConfig::new(16, DType::Float16B),
+                CBConfig::new(0, key.input_dtype),
+                CBConfig::new(1, key.input_dtype),
+                CBConfig::new(16, key.output_dtype),
             ],
+            dst_accum_mode: matches!(
+                key.input_dtype,
+                DType::Int32 | DType::UInt32 | DType::Float32
+            ),
             ..CompileConfig::default()
         },
-        name: key.op.kernel_name().to_owned(),
+        name: key.op.kernel_name(key.input_dtype, key.output_dtype),
         ..Program::new(runtime_args)
     })
+}
+
+fn reader_source(dtype: DType) -> io::Result<String> {
+    Ok(BF16_READER
+        .replace("DataFormat::Float16_b", data_format(dtype)?)
+        .replace("packed_bf16", "packed_value"))
+}
+
+fn writer_source(dtype: DType) -> io::Result<String> {
+    Ok(BF16_WRITER.replace("DataFormat::Float16_b", data_format(dtype)?))
+}
+
+fn compare_compute_source(dtype: DType, op: BinaryEltwiseOp) -> io::Result<String> {
+    let source = match dtype {
+        DType::Float16B | DType::Float32 => COMPARE_FLOAT_COMPUTE,
+        DType::Int32 => COMPARE_INT32_COMPUTE,
+        _ => {
+            return Err(invalid_input(format!(
+                "compare currently supports Float16B, Float32, and Int32 inputs, got {dtype:?}"
+            )))
+        }
+    };
+    Ok(source.replace("COMPARE_DIRECTION_PLACEHOLDER", op.compare_direction()?))
+}
+
+fn data_format(dtype: DType) -> io::Result<&'static str> {
+    match dtype {
+        DType::Float32 => Ok("DataFormat::Float32"),
+        DType::Float16 => Ok("DataFormat::Float16"),
+        DType::Float16B => Ok("DataFormat::Float16_b"),
+        DType::Int32 => Ok("DataFormat::Int32"),
+        DType::UInt16 => Ok("DataFormat::UInt16"),
+        DType::Int8 => Ok("DataFormat::Int8"),
+        DType::UInt32 => Ok("DataFormat::UInt32"),
+        DType::UInt8 => Ok("DataFormat::UInt8"),
+    }
 }

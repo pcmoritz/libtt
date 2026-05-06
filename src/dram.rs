@@ -12,7 +12,7 @@ const FACE_R: usize = 16;
 const FACE_C: usize = 16;
 type Shape = Vec<usize>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum DType {
     Float32 = 0,
     Float16 = 1,

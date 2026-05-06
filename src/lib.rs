@@ -312,6 +312,7 @@ unsafe fn checked_ref<'a, T>(ptr: *const T, name: &str) -> Result<&'a T, *mut PJ
 fn pjrt_buffer_type_to_dtype(buffer_type: PJRT_Buffer_Type) -> Result<DType, *mut PJRT_Error> {
     match buffer_type {
         PJRT_Buffer_Type::PJRT_Buffer_Type_S8 => Ok(DType::Int8),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => Ok(DType::UInt8),
         PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Ok(DType::Int32),
         PJRT_Buffer_Type::PJRT_Buffer_Type_U8 => Ok(DType::UInt8),
         PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Ok(DType::UInt16),
@@ -339,6 +340,10 @@ fn dtype_to_pjrt_buffer_type(dtype: DType) -> PJRT_Buffer_Type {
         DType::Float32 => PJRT_Buffer_Type::PJRT_Buffer_Type_F32,
         DType::Float16B => PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
     }
+}
+
+fn pjrt_buffer_type_device_dtype(buffer_type: PJRT_Buffer_Type) -> Result<DType, *mut PJRT_Error> {
+    pjrt_buffer_type_to_dtype(buffer_type)
 }
 
 fn dims_i64_to_usize(dims: &[i64]) -> Result<Vec<usize>, *mut PJRT_Error> {
@@ -1402,6 +1407,52 @@ fn bf16_eltwise_input<'a>(
     )))
 }
 
+fn eltwise_input<'a>(
+    values: &'a [Option<PJRT_Buffer>],
+    plan: &'a executable::Executable,
+    value_id: u32,
+    expected_dtype: DType,
+    field: &str,
+) -> Result<kernels::binary_eltwise::EltwiseInput<'a>, *mut PJRT_Error> {
+    let index = value_id as usize;
+    if let Some(buffer) = values.get(index).and_then(|value| value.as_ref()) {
+        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable {field} buffer has no device allocation"
+            )));
+        };
+        return Ok(kernels::binary_eltwise::EltwiseInput::Dram(dram_buffer));
+    }
+    for op in &plan.ops {
+        if let executable::Op::Constant {
+            packed_value,
+            output_id,
+        } = op
+        {
+            if *output_id == value_id {
+                let desc = plan.values.get(index).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "{field} constant value id {value_id} is out of bounds"
+                    ))
+                })?;
+                let dtype = pjrt_buffer_type_device_dtype(desc.element_type)?;
+                if dtype != expected_dtype {
+                    return Err(unimplemented(format!(
+                        "{field} constant value id {value_id} has type {:?}; expected {expected_dtype:?}",
+                        desc.element_type
+                    )));
+                }
+                return Ok(kernels::binary_eltwise::EltwiseInput::Constant(
+                    *packed_value,
+                ));
+            }
+        }
+    }
+    Err(invalid_argument(format!(
+        "{field} value id {value_id} is not available"
+    )))
+}
+
 struct OutputContext {
     device: *mut PJRT_Device,
     memory: *mut PJRT_Memory,
@@ -1423,19 +1474,21 @@ fn store_output_buffer(
             "TT executable {op} output id {output_id} is out of bounds"
         ))
     })?;
-    if expected.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
-        return Err(unimplemented(format!(
-            "TT executable {op} currently only supports bf16 outputs"
-        )));
-    }
     if expected.dims != expected_dims {
         return Err(invalid_argument(format!(
             "TT executable {op} output shape mismatch: expected {:?}, got {:?}",
             expected.dims, expected_dims
         )));
     }
+    let expected_dtype = pjrt_buffer_type_device_dtype(expected.element_type)?;
+    if dram_buffer.dtype != expected_dtype {
+        return Err(invalid_argument(format!(
+            "TT executable {op} output dtype mismatch: expected {:?}, got {:?}",
+            expected.element_type, dram_buffer.dtype
+        )));
+    }
     values[output_index] = Some(PJRT_Buffer {
-        buffer_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+        buffer_type: expected.element_type,
         dims: expected.dims.clone(),
         device: context.device,
         memory: context.memory,
@@ -1501,6 +1554,91 @@ fn execute_binary_eltwise(
         output_dram,
         context,
         op_name,
+    )
+}
+
+fn compare_direction_to_eltwise_op(
+    direction: executable::CompareDirection,
+) -> kernels::binary_eltwise::BinaryEltwiseOp {
+    match direction {
+        executable::CompareDirection::Eq => kernels::binary_eltwise::BinaryEltwiseOp::CompareEq,
+        executable::CompareDirection::Ne => kernels::binary_eltwise::BinaryEltwiseOp::CompareNe,
+        executable::CompareDirection::Ge => kernels::binary_eltwise::BinaryEltwiseOp::CompareGe,
+        executable::CompareDirection::Gt => kernels::binary_eltwise::BinaryEltwiseOp::CompareGt,
+        executable::CompareDirection::Le => kernels::binary_eltwise::BinaryEltwiseOp::CompareLe,
+        executable::CompareDirection::Lt => kernels::binary_eltwise::BinaryEltwiseOp::CompareLt,
+    }
+}
+
+fn execute_compare(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: [u32; 2],
+    output_id: u32,
+    direction: executable::CompareDirection,
+) -> Result<(), *mut PJRT_Error> {
+    let lhs_desc = plan
+        .values
+        .get(input_ids[0] as usize)
+        .ok_or_else(|| invalid_argument("compare.lhs value id is out of bounds"))?;
+    let rhs_desc = plan
+        .values
+        .get(input_ids[1] as usize)
+        .ok_or_else(|| invalid_argument("compare.rhs value id is out of bounds"))?;
+    if lhs_desc.element_type != rhs_desc.element_type {
+        return Err(invalid_argument(
+            "TT executable compare input element types must match",
+        ));
+    }
+    if lhs_desc.dims != rhs_desc.dims {
+        return Err(invalid_argument(
+            "TT executable compare input shapes must match",
+        ));
+    }
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable compare output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_PRED {
+        return Err(invalid_argument(format!(
+            "TT executable compare output must be PRED, got {:?}",
+            output_desc.element_type
+        )));
+    }
+
+    let input_dtype = pjrt_buffer_type_device_dtype(lhs_desc.element_type)?;
+    if !matches!(input_dtype, DType::Float16B | DType::Float32 | DType::Int32) {
+        return Err(unimplemented(format!(
+            "TT executable compare currently supports bf16, f32, and s32 inputs, got {:?}",
+            lhs_desc.element_type
+        )));
+    }
+
+    let output_dims = lhs_desc.dims.clone();
+    let shape = dims_i64_to_usize(&output_dims)?;
+    let lhs_input = eltwise_input(values, plan, input_ids[0], input_dtype, "compare.lhs")?;
+    let rhs_input = eltwise_input(values, plan, input_ids[1], input_dtype, "compare.rhs")?;
+    let output_dram = kernels::binary_eltwise::eltwise(
+        device,
+        compare_direction_to_eltwise_op(direction),
+        lhs_input,
+        rhs_input,
+        input_dtype,
+        &shape,
+        "pjrt_compare",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_dims,
+        output_dram,
+        context,
+        "compare",
     )
 }
 
@@ -1741,10 +1879,20 @@ fn execute_executable_v1(
                 )?;
             }
             executable::Op::Constant { .. } => {}
-            executable::Op::Compare { .. } => {
-                return Err(unimplemented(
-                    "TT executable compare execution is not currently supported",
-                ));
+            executable::Op::Compare {
+                input_ids,
+                output_id,
+                direction,
+            } => {
+                execute_compare(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    *input_ids,
+                    *output_id,
+                    *direction,
+                )?;
             }
             executable::Op::Select { .. } => {
                 return Err(unimplemented(
