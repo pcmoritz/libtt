@@ -1582,6 +1582,11 @@ fn execute_executable_v1(
                     "add",
                 )?;
             }
+            executable::Op::Subtract { .. } => {
+                return Err(unimplemented(
+                    "TT executable subtract execution is not currently supported",
+                ));
+            }
             executable::Op::Multiply { .. } => {
                 return Err(unimplemented(
                     "TT executable multiply execution is not currently supported",
@@ -3153,6 +3158,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum BinaryOpKind {
         Add,
+        Subtract,
         Multiply,
         Divide,
         Power,
@@ -3164,6 +3170,13 @@ mod tests {
             (
                 BinaryOpKind::Add,
                 executable::Op::Add {
+                    input_ids,
+                    output_id,
+                },
+            )
+            | (
+                BinaryOpKind::Subtract,
+                executable::Op::Subtract {
                     input_ids,
                     output_id,
                 },
@@ -3265,6 +3278,12 @@ mod tests {
                 op_name: "multiply",
                 ty: "bf16",
                 expected: BinaryOpKind::Multiply,
+            },
+            Case {
+                name: "subtract",
+                op_name: "subtract",
+                ty: "bf16",
+                expected: BinaryOpKind::Subtract,
             },
             Case {
                 name: "divide",

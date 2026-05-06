@@ -37,6 +37,12 @@ message AddOp {
   uint32 rhs_id = 2;
 }
 
+message SubtractOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+}
+
 message MultiplyOp {
   // Indices into Executable.values for this op's operands.
   uint32 lhs_id = 1;
@@ -211,6 +217,7 @@ message Op {
     ReshapeOp reshape = 21;
     SliceOp slice = 22;
     NegateOp negate = 23;
+    SubtractOp subtract = 24;
   }
 }
 

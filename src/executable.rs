@@ -46,6 +46,10 @@ pub(crate) enum Op {
         input_ids: [u32; 2],
         output_id: u32,
     },
+    Subtract {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
     Multiply {
         input_ids: [u32; 2],
         output_id: u32,
@@ -268,6 +272,10 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     input_ids: [add.lhs_id, add.rhs_id],
                     output_id: op_desc.output_id,
                 }),
+                Kind::Subtract(subtract) => Ok(Op::Subtract {
+                    input_ids: [subtract.lhs_id, subtract.rhs_id],
+                    output_id: op_desc.output_id,
+                }),
                 Kind::Multiply(multiply) => Ok(Op::Multiply {
                     input_ids: [multiply.lhs_id, multiply.rhs_id],
                     output_id: op_desc.output_id,
@@ -441,6 +449,10 @@ pub(crate) enum Op {
         output_id: u32,
     },
     Add {
+        input_ids: [u32; 2],
+        output_id: u32,
+    },
+    Subtract {
         input_ids: [u32; 2],
         output_id: u32,
     },

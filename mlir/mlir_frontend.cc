@@ -443,6 +443,23 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto subtract_op = mlir::dyn_cast<mlir::stablehlo::SubtractOp>(op)) {
+            uint32_t lhs_id = 0;
+            uint32_t rhs_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(subtract_op.getLhs(), executable, value_ids, error, lhs_id) ||
+                !addValueDesc(subtract_op.getRhs(), executable, value_ids, error, rhs_id) ||
+                !addValueDesc(subtract_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* subtract = executable.add_ops();
+            subtract->set_output_id(output_id);
+            subtract->mutable_subtract()->set_lhs_id(lhs_id);
+            subtract->mutable_subtract()->set_rhs_id(rhs_id);
+            continue;
+        }
+
         if (auto mul_op = mlir::dyn_cast<mlir::stablehlo::MulOp>(op)) {
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;
