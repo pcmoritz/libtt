@@ -1654,6 +1654,11 @@ fn execute_executable_v1(
                     "TT executable compare execution is not currently supported",
                 ));
             }
+            executable::Op::Select { .. } => {
+                return Err(unimplemented(
+                    "TT executable select execution is not currently supported",
+                ));
+            }
         }
     }
 
@@ -3211,16 +3216,20 @@ mod tests {
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
-    fn pjrt_compile_lowers_integer_compare() {
+    fn pjrt_compile_lowers_integer_compare_and_select() {
         let api = unsafe { &*GetPjrtApi() };
         let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
         let mut format = b"mlir".to_vec();
         let mut code = br#"module {
-  func.func public @main(%arg0: tensor<2xi32>) -> tensor<2xi1> {
+  func.func public @main(%arg0: tensor<2xi32>) -> tensor<2xi32> {
     %c = stablehlo.constant dense<0> : tensor<i32>
     %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<2xi32>
     %1 = stablehlo.compare LT, %arg0, %0, SIGNED : (tensor<2xi32>, tensor<2xi32>) -> tensor<2xi1>
-    return %1 : tensor<2xi1>
+    %c_0 = stablehlo.constant dense<288> : tensor<i32>
+    %2 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<i32>) -> tensor<2xi32>
+    %3 = stablehlo.add %arg0, %2 : tensor<2xi32>
+    %4 = stablehlo.select %1, %3, %arg0 : tensor<2xi1>, tensor<2xi32>
+    return %4 : tensor<2xi32>
   }
 }
 "#
@@ -3264,8 +3273,8 @@ mod tests {
             .executable
             .as_ref()
             .expect("compiled executable should contain a TT executable");
-        assert_eq!(executable.output_ids, vec![3]);
-        assert_eq!(executable.ops.len(), 3);
+        assert_eq!(executable.output_ids, vec![7]);
+        assert_eq!(executable.ops.len(), 6);
         let executable::Op::Constant { output_id, .. } = &executable.ops[1] else {
             panic!("broadcasted constant should lower to Constant");
         };
@@ -3281,6 +3290,28 @@ mod tests {
         assert_eq!(*input_ids, [0, 2]);
         assert_eq!(*output_id, 3);
         assert_eq!(*direction, executable::CompareDirection::Lt);
+        let executable::Op::Constant { output_id, .. } = &executable.ops[3] else {
+            panic!("second broadcasted constant should lower to Constant");
+        };
+        assert_eq!(*output_id, 5);
+        let executable::Op::Add {
+            input_ids,
+            output_id,
+        } = &executable.ops[4]
+        else {
+            panic!("add should lower to Add");
+        };
+        assert_eq!(*input_ids, [0, 5]);
+        assert_eq!(*output_id, 6);
+        let executable::Op::Select {
+            input_ids,
+            output_id,
+        } = &executable.ops[5]
+        else {
+            panic!("select should lower to Select");
+        };
+        assert_eq!(*input_ids, [3, 6, 0]);
+        assert_eq!(*output_id, 7);
 
         unsafe {
             drop(Box::from_raw(get_executable_args.executable));

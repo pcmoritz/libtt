@@ -335,6 +335,26 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto select_op = mlir::dyn_cast<mlir::stablehlo::SelectOp>(op)) {
+            uint32_t pred_id = 0;
+            uint32_t on_true_id = 0;
+            uint32_t on_false_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(select_op.getPred(), executable, value_ids, error, pred_id) ||
+                !addValueDesc(select_op.getOnTrue(), executable, value_ids, error, on_true_id) ||
+                !addValueDesc(select_op.getOnFalse(), executable, value_ids, error, on_false_id) ||
+                !addValueDesc(select_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* select = executable.add_ops();
+            select->set_output_id(output_id);
+            select->mutable_select()->set_pred_id(pred_id);
+            select->mutable_select()->set_on_true_id(on_true_id);
+            select->mutable_select()->set_on_false_id(on_false_id);
+            continue;
+        }
+
         if (auto add_op = mlir::dyn_cast<mlir::stablehlo::AddOp>(op)) {
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;

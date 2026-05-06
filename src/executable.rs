@@ -61,6 +61,10 @@ pub(crate) enum Op {
         output_id: u32,
         direction: CompareDirection,
     },
+    Select {
+        input_ids: [u32; 3],
+        output_id: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +172,10 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     output_id: op_desc.output_id,
                     direction: parse_compare_direction(compare.direction)?,
                 }),
+                Kind::Select(select) => Ok(Op::Select {
+                    input_ids: [select.pred_id, select.on_true_id, select.on_false_id],
+                    output_id: op_desc.output_id,
+                }),
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -255,5 +263,9 @@ pub(crate) enum Op {
         input_ids: [u32; 2],
         output_id: u32,
         direction: CompareDirection,
+    },
+    Select {
+        input_ids: [u32; 3],
+        output_id: u32,
     },
 }
