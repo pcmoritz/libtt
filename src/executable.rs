@@ -104,6 +104,7 @@ pub(crate) enum Op {
     Matmul {
         input_ids: [u32; 2],
         output_id: u32,
+        dimension_numbers: DotGeneralDimensionNumbers,
     },
     Max {
         input_ids: [u32; 2],
@@ -168,6 +169,15 @@ pub(crate) struct GatherDimensionNumbers {
     pub(crate) start_indices_batching_dims: Vec<i64>,
     pub(crate) start_index_map: Vec<i64>,
     pub(crate) index_vector_dim: i64,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct DotGeneralDimensionNumbers {
+    pub(crate) lhs_batching_dimensions: Vec<i64>,
+    pub(crate) rhs_batching_dimensions: Vec<i64>,
+    pub(crate) lhs_contracting_dimensions: Vec<i64>,
+    pub(crate) rhs_contracting_dimensions: Vec<i64>,
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -316,6 +326,12 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                 Kind::Matmul(matmul) => Ok(Op::Matmul {
                     input_ids: [matmul.lhs_id, matmul.rhs_id],
                     output_id: op_desc.output_id,
+                    dimension_numbers: DotGeneralDimensionNumbers {
+                        lhs_batching_dimensions: matmul.lhs_batching_dimensions,
+                        rhs_batching_dimensions: matmul.rhs_batching_dimensions,
+                        lhs_contracting_dimensions: matmul.lhs_contracting_dimensions,
+                        rhs_contracting_dimensions: matmul.rhs_contracting_dimensions,
+                    },
                 }),
                 Kind::Max(max) => Ok(Op::Max {
                     input_ids: [max.lhs_id, max.rhs_id],
@@ -486,6 +502,7 @@ pub(crate) enum Op {
     Matmul {
         input_ids: [u32; 2],
         output_id: u32,
+        dimension_numbers: DotGeneralDimensionNumbers,
     },
     Max {
         input_ids: [u32; 2],

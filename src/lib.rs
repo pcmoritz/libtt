@@ -1660,6 +1660,7 @@ fn execute_executable_v1(
             executable::Op::Matmul {
                 input_ids,
                 output_id,
+                dimension_numbers,
             } => {
                 let output_id = *output_id;
                 let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
@@ -1669,6 +1670,15 @@ fn execute_executable_v1(
                 {
                     return Err(unimplemented(
                         "TT executable matmul currently only supports bf16 buffers",
+                    ));
+                }
+                if !dimension_numbers.lhs_batching_dimensions.is_empty()
+                    || !dimension_numbers.rhs_batching_dimensions.is_empty()
+                    || dimension_numbers.lhs_contracting_dimensions != vec![1]
+                    || dimension_numbers.rhs_contracting_dimensions != vec![0]
+                {
+                    return Err(unimplemented(
+                        "TT executable dot_general execution currently only supports rank-2 standard matrix multiplication",
                     ));
                 }
                 if lhs.dims.len() != 2 || rhs.dims.len() != 2 {
@@ -3344,6 +3354,33 @@ mod tests {
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
+    fn pjrt_compile_lowers_small_integer_splat_constant() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main() -> tensor<2x2xi1> {
+    %0 = stablehlo.constant dense<true> : tensor<2x2xi1>
+    return %0 : tensor<2x2xi1>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![0]);
+                assert_eq!(executable.ops.len(), 1);
+                let executable::Op::Constant {
+                    packed_value,
+                    output_id,
+                } = &executable.ops[0]
+                else {
+                    panic!("predicate splat constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 0);
+                assert_eq!(*packed_value, 1);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
     fn pjrt_compile_lowers_integer_compare_and_select() {
         with_compiled_mlir_executable(
             r#"module {
@@ -3640,6 +3677,41 @@ mod tests {
                 assert_eq!(start_indices, &vec![0, 1]);
                 assert_eq!(limit_indices, &vec![4, 3]);
                 assert_eq!(strides, &vec![2, 1]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_batched_dot_general() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x3x4xf32>, %arg1: tensor<5x3x4xf32>) -> tensor<3x2x5xf32> {
+    %0 = stablehlo.dot_general %arg0, %arg1,
+      batching_dims = [1] x [1],
+      contracting_dims = [2] x [2]
+      : (tensor<2x3x4xf32>, tensor<5x3x4xf32>) -> tensor<3x2x5xf32>
+    return %0 : tensor<3x2x5xf32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![2]);
+                assert_eq!(executable.ops.len(), 3);
+                let executable::Op::Matmul {
+                    input_ids,
+                    output_id,
+                    dimension_numbers,
+                } = &executable.ops[2]
+                else {
+                    panic!("dot_general should lower to Matmul");
+                };
+                assert_eq!(*input_ids, [0, 1]);
+                assert_eq!(*output_id, 2);
+                assert_eq!(dimension_numbers.lhs_batching_dimensions, vec![1]);
+                assert_eq!(dimension_numbers.rhs_batching_dimensions, vec![1]);
+                assert_eq!(dimension_numbers.lhs_contracting_dimensions, vec![2]);
+                assert_eq!(dimension_numbers.rhs_contracting_dimensions, vec![2]);
             },
         );
     }

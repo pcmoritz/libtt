@@ -219,7 +219,7 @@ std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& erro
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
         if (integer.getWidth() <= 32) {
             auto bits = dense.getSplatValue<llvm::APInt>();
-            return bits.extractBitsAsZExtValue(32, 0);
+            return static_cast<uint32_t>(bits.getZExtValue());
         }
     }
     error = "only bf16/f16/f32 and <=32-bit integer splat constants are currently supported";
@@ -677,16 +677,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
 
         if (auto dot_op = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op)) {
             auto dims = dot_op.getDotDimensionNumbers();
-            if (!dims.getLhsBatchingDimensions().empty() ||
-                !dims.getRhsBatchingDimensions().empty() ||
-                dims.getLhsContractingDimensions().size() != 1 ||
-                dims.getRhsContractingDimensions().size() != 1 ||
-                dims.getLhsContractingDimensions()[0] != 1 ||
-                dims.getRhsContractingDimensions()[0] != 0) {
-                error = "only rank-2 standard matrix multiplication dot_general is currently supported";
-                return false;
-            }
-
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;
             uint32_t output_id = 0;
@@ -700,6 +690,18 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             matmul->set_output_id(output_id);
             matmul->mutable_matmul()->set_lhs_id(lhs_id);
             matmul->mutable_matmul()->set_rhs_id(rhs_id);
+            for (int64_t dim : dims.getLhsBatchingDimensions()) {
+                matmul->mutable_matmul()->add_lhs_batching_dimensions(dim);
+            }
+            for (int64_t dim : dims.getRhsBatchingDimensions()) {
+                matmul->mutable_matmul()->add_rhs_batching_dimensions(dim);
+            }
+            for (int64_t dim : dims.getLhsContractingDimensions()) {
+                matmul->mutable_matmul()->add_lhs_contracting_dimensions(dim);
+            }
+            for (int64_t dim : dims.getRhsContractingDimensions()) {
+                matmul->mutable_matmul()->add_rhs_contracting_dimensions(dim);
+            }
             continue;
         }
 
