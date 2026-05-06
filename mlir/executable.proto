@@ -37,6 +37,12 @@ message AddOp {
   uint32 rhs_id = 2;
 }
 
+message MultiplyOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+}
+
 message MatmulOp {
   // Indices into Executable.values for this op's operands.
   uint32 lhs_id = 1;
@@ -119,6 +125,7 @@ message Op {
     BroadcastInDimOp broadcast_in_dim = 9;
     GatherOp gather = 10;
     IotaOp iota = 11;
+    MultiplyOp multiply = 12;
   }
 }
 
