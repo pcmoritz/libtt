@@ -56,6 +56,22 @@ message ConstantOp {
   uint32 packed_value = 1;
 }
 
+message CompareOp {
+  enum Direction {
+    DIRECTION_EQ = 0;
+    DIRECTION_NE = 1;
+    DIRECTION_GE = 2;
+    DIRECTION_GT = 3;
+    DIRECTION_LE = 4;
+    DIRECTION_LT = 5;
+  }
+
+  // Indices into Executable.values for this op's operands.
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+  Direction direction = 3;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -66,6 +82,7 @@ message Op {
     MatmulOp matmul = 4;
     MaxOp max = 5;
     ConstantOp constant = 6;
+    CompareOp compare = 7;
   }
 }
 

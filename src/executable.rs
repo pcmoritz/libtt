@@ -3,6 +3,8 @@ use crate::PJRT_Buffer_Type;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status;
 #[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::compare_op::Direction as ProtoCompareDirection;
+#[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::op::Kind;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::tensor_desc::ElementType;
@@ -32,6 +34,7 @@ pub(crate) struct ValueDesc {
 
 #[cfg(libtt_mlir_frontend)]
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(crate) enum Op {
     Parameter {
         parameter_index: usize,
@@ -53,6 +56,22 @@ pub(crate) enum Op {
         packed_value: u32,
         output_id: u32,
     },
+    Compare {
+        input_ids: [u32; 2],
+        output_id: u32,
+        direction: CompareDirection,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum CompareDirection {
+    Eq,
+    Ne,
+    Ge,
+    Gt,
+    Le,
+    Lt,
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -87,6 +106,20 @@ fn parse_tensor_desc(tensor: ProtoTensorDesc) -> Result<ValueDesc, String> {
         dims: tensor.dims,
         element_type: map_element_type(tensor.element_type)?,
     })
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn parse_compare_direction(direction: i32) -> Result<CompareDirection, String> {
+    match ProtoCompareDirection::try_from(direction)
+        .map_err(|_| "TT executable compare op contains an invalid direction".to_owned())?
+    {
+        ProtoCompareDirection::Eq => Ok(CompareDirection::Eq),
+        ProtoCompareDirection::Ne => Ok(CompareDirection::Ne),
+        ProtoCompareDirection::Ge => Ok(CompareDirection::Ge),
+        ProtoCompareDirection::Gt => Ok(CompareDirection::Gt),
+        ProtoCompareDirection::Le => Ok(CompareDirection::Le),
+        ProtoCompareDirection::Lt => Ok(CompareDirection::Lt),
+    }
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -129,6 +162,11 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                 Kind::Constant(constant) => Ok(Op::Constant {
                     packed_value: constant.packed_value,
                     output_id: op_desc.output_id,
+                }),
+                Kind::Compare(compare) => Ok(Op::Compare {
+                    input_ids: [compare.lhs_id, compare.rhs_id],
+                    output_id: op_desc.output_id,
+                    direction: parse_compare_direction(compare.direction)?,
                 }),
             }
         })
@@ -212,5 +250,10 @@ pub(crate) enum Op {
     Constant {
         packed_value: u32,
         output_id: u32,
+    },
+    Compare {
+        input_ids: [u32; 2],
+        output_id: u32,
+        direction: CompareDirection,
     },
 }

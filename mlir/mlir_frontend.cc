@@ -232,6 +232,25 @@ void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t pack
     constant->mutable_constant()->set_packed_value(packed_value);
 }
 
+tt::CompareOp::Direction mapCompareDirection(
+    mlir::stablehlo::ComparisonDirection direction) {
+    switch (direction) {
+        case mlir::stablehlo::ComparisonDirection::EQ:
+            return tt::CompareOp::DIRECTION_EQ;
+        case mlir::stablehlo::ComparisonDirection::NE:
+            return tt::CompareOp::DIRECTION_NE;
+        case mlir::stablehlo::ComparisonDirection::GE:
+            return tt::CompareOp::DIRECTION_GE;
+        case mlir::stablehlo::ComparisonDirection::GT:
+            return tt::CompareOp::DIRECTION_GT;
+        case mlir::stablehlo::ComparisonDirection::LE:
+            return tt::CompareOp::DIRECTION_LE;
+        case mlir::stablehlo::ComparisonDirection::LT:
+            return tt::CompareOp::DIRECTION_LT;
+    }
+    return tt::CompareOp::DIRECTION_EQ;
+}
+
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -294,6 +313,25 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 return false;
             }
             addConstantOp(executable, output_id, *packed_value);
+            continue;
+        }
+
+        if (auto compare_op = mlir::dyn_cast<mlir::stablehlo::CompareOp>(op)) {
+            uint32_t lhs_id = 0;
+            uint32_t rhs_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(compare_op.getLhs(), executable, value_ids, error, lhs_id) ||
+                !addValueDesc(compare_op.getRhs(), executable, value_ids, error, rhs_id) ||
+                !addValueDesc(compare_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* compare = executable.add_ops();
+            compare->set_output_id(output_id);
+            compare->mutable_compare()->set_lhs_id(lhs_id);
+            compare->mutable_compare()->set_rhs_id(rhs_id);
+            compare->mutable_compare()->set_direction(
+                mapCompareDirection(compare_op.getComparisonDirection()));
             continue;
         }
 

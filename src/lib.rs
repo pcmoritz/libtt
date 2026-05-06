@@ -1649,6 +1649,11 @@ fn execute_executable_v1(
                 )?;
             }
             executable::Op::Constant { .. } => {}
+            executable::Op::Compare { .. } => {
+                return Err(unimplemented(
+                    "TT executable compare execution is not currently supported",
+                ));
+            }
         }
     }
 
@@ -3206,7 +3211,7 @@ mod tests {
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
-    fn pjrt_compile_packs_integer_broadcast_constant() {
+    fn pjrt_compile_lowers_integer_compare() {
         let api = unsafe { &*GetPjrtApi() };
         let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
         let mut format = b"mlir".to_vec();
@@ -3241,12 +3246,45 @@ mod tests {
             compile_options_size: 0,
             executable: ptr::null_mut(),
         };
-        let error = unsafe { compile(&mut compile_args) };
-        let (code, detail) = take_error_detail(api, error);
-        assert_eq!(code, PJRT_Error_Code::PJRT_Error_Code_UNIMPLEMENTED);
-        assert_eq!(detail, "unsupported entry op: stablehlo.compare");
+        check_ok(api, unsafe { compile(&mut compile_args) });
+
+        let get_executable = api
+            .PJRT_LoadedExecutable_GetExecutable
+            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
+        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
+            extension_start: ptr::null_mut(),
+            loaded_executable: compile_args.executable,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+
+        let executable = unsafe { &*get_executable_args.executable }
+            .metadata
+            .executable
+            .as_ref()
+            .expect("compiled executable should contain a TT executable");
+        assert_eq!(executable.output_ids, vec![3]);
+        assert_eq!(executable.ops.len(), 3);
+        let executable::Op::Constant { output_id, .. } = &executable.ops[1] else {
+            panic!("broadcasted constant should lower to Constant");
+        };
+        assert_eq!(*output_id, 2);
+        let executable::Op::Compare {
+            input_ids,
+            output_id,
+            direction,
+        } = &executable.ops[2]
+        else {
+            panic!("compare should lower to Compare");
+        };
+        assert_eq!(*input_ids, [0, 2]);
+        assert_eq!(*output_id, 3);
+        assert_eq!(*direction, executable::CompareDirection::Lt);
 
         unsafe {
+            drop(Box::from_raw(get_executable_args.executable));
+            drop(Box::from_raw(compile_args.executable));
             drop(Box::from_raw(client));
         }
     }
