@@ -76,6 +76,20 @@ message ConvertOp {
   uint32 operand_id = 1;
 }
 
+message ReduceOp {
+  enum Reducer {
+    REDUCER_ADD = 0;
+    REDUCER_MAX = 1;
+    REDUCER_MUL = 2;
+  }
+
+  // Indices into Executable.values for this op's operands.
+  repeated uint32 input_ids = 1;
+  repeated uint32 init_value_ids = 2;
+  repeated int64 dimensions = 3;
+  Reducer reducer = 4;
+}
+
 message MatmulOp {
   // Indices into Executable.values for this op's operands.
   uint32 lhs_id = 1;
@@ -165,6 +179,7 @@ message Op {
     CosineOp cosine = 16;
     SineOp sine = 17;
     ConvertOp convert = 18;
+    ReduceOp reduce = 19;
   }
 }
 

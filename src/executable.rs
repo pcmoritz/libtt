@@ -7,6 +7,8 @@ use executable_proto::tt::compare_op::Direction as ProtoCompareDirection;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::op::Kind;
 #[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::reduce_op::Reducer as ProtoReduceReducer;
+#[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::tensor_desc::ElementType;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::AnalysisResult;
@@ -73,6 +75,13 @@ pub(crate) enum Op {
         input_id: u32,
         output_id: u32,
     },
+    Reduce {
+        input_ids: Vec<u32>,
+        init_value_ids: Vec<u32>,
+        output_id: u32,
+        dimensions: Vec<i64>,
+        reducer: ReduceReducer,
+    },
     Matmul {
         input_ids: [u32; 2],
         output_id: u32,
@@ -121,6 +130,14 @@ pub(crate) enum CompareDirection {
     Gt,
     Le,
     Lt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ReduceReducer {
+    Add,
+    Max,
+    Mul,
 }
 
 #[derive(Clone)]
@@ -183,6 +200,17 @@ fn parse_compare_direction(direction: i32) -> Result<CompareDirection, String> {
 }
 
 #[cfg(libtt_mlir_frontend)]
+fn parse_reduce_reducer(reducer: i32) -> Result<ReduceReducer, String> {
+    match ProtoReduceReducer::try_from(reducer)
+        .map_err(|_| "TT executable reduce op contains an invalid reducer".to_owned())?
+    {
+        ProtoReduceReducer::Add => Ok(ReduceReducer::Add),
+        ProtoReduceReducer::Max => Ok(ReduceReducer::Max),
+        ProtoReduceReducer::Mul => Ok(ReduceReducer::Mul),
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
 pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, String> {
     let values = executable
         .values
@@ -239,6 +267,13 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                 Kind::Convert(convert) => Ok(Op::Convert {
                     input_id: convert.operand_id,
                     output_id: op_desc.output_id,
+                }),
+                Kind::Reduce(reduce) => Ok(Op::Reduce {
+                    input_ids: reduce.input_ids,
+                    init_value_ids: reduce.init_value_ids,
+                    output_id: op_desc.output_id,
+                    dimensions: reduce.dimensions,
+                    reducer: parse_reduce_reducer(reduce.reducer)?,
                 }),
                 Kind::Matmul(matmul) => Ok(Op::Matmul {
                     input_ids: [matmul.lhs_id, matmul.rhs_id],
@@ -383,6 +418,13 @@ pub(crate) enum Op {
     Convert {
         input_id: u32,
         output_id: u32,
+    },
+    Reduce {
+        input_ids: Vec<u32>,
+        init_value_ids: Vec<u32>,
+        output_id: u32,
+        dimensions: Vec<i64>,
+        reducer: ReduceReducer,
     },
     Matmul {
         input_ids: [u32; 2],

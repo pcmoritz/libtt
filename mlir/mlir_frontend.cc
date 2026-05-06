@@ -251,6 +251,62 @@ tt::CompareOp::Direction mapCompareDirection(
     return tt::CompareOp::DIRECTION_EQ;
 }
 
+std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
+    mlir::stablehlo::ReduceOp reduce_op,
+    std::string& error) {
+    if (reduce_op.getInputs().size() != 1 ||
+        reduce_op.getInitValues().size() != 1 ||
+        reduce_op->getNumResults() != 1) {
+        error = "only single-input single-result reduce ops are currently supported";
+        return std::nullopt;
+    }
+
+    auto& body = reduce_op.getBody();
+    if (body.empty() || body.getBlocks().size() != 1) {
+        error = "reduce bodies must contain exactly one block";
+        return std::nullopt;
+    }
+
+    mlir::Operation* reducer_op = nullptr;
+    mlir::Operation* return_operation = nullptr;
+    for (mlir::Operation& body_op : body.front()) {
+        if (mlir::isa<mlir::stablehlo::ReturnOp>(body_op)) {
+            return_operation = &body_op;
+            continue;
+        }
+        if (reducer_op) {
+            error = "only single-op reduce bodies are currently supported";
+            return std::nullopt;
+        }
+        reducer_op = &body_op;
+    }
+
+    if (!reducer_op || !return_operation) {
+        error = "reduce body must contain a reducer op and stablehlo.return";
+        return std::nullopt;
+    }
+
+    auto return_op = mlir::cast<mlir::stablehlo::ReturnOp>(return_operation);
+    if (return_op.getNumOperands() != 1 ||
+        return_op.getOperand(0).getDefiningOp() != reducer_op) {
+        error = "reduce body must return the reducer op result";
+        return std::nullopt;
+    }
+
+    if (mlir::isa<mlir::stablehlo::AddOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_ADD;
+    }
+    if (mlir::isa<mlir::stablehlo::MaxOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_MAX;
+    }
+    if (mlir::isa<mlir::stablehlo::MulOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_MUL;
+    }
+
+    error = "unsupported reduce reducer: " + reducer_op->getName().getStringRef().str();
+    return std::nullopt;
+}
+
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -496,6 +552,32 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             auto* convert = executable.add_ops();
             convert->set_output_id(output_id);
             convert->mutable_convert()->set_operand_id(operand_id);
+            continue;
+        }
+
+        if (auto reduce_op = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(op)) {
+            auto reducer = mapReduceReducer(reduce_op, error);
+            if (!reducer) {
+                return false;
+            }
+
+            uint32_t input_id = 0;
+            uint32_t init_value_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(*reduce_op.getInputs().begin(), executable, value_ids, error, input_id) ||
+                !addValueDesc(*reduce_op.getInitValues().begin(), executable, value_ids, error, init_value_id) ||
+                !addValueDesc(reduce_op->getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* reduce = executable.add_ops();
+            reduce->set_output_id(output_id);
+            reduce->mutable_reduce()->add_input_ids(input_id);
+            reduce->mutable_reduce()->add_init_value_ids(init_value_id);
+            for (int64_t dim : reduce_op.getDimensions()) {
+                reduce->mutable_reduce()->add_dimensions(dim);
+            }
+            reduce->mutable_reduce()->set_reducer(*reducer);
             continue;
         }
 
