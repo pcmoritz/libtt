@@ -70,6 +70,13 @@ pub(crate) enum Op {
         output_id: u32,
         broadcast_dimensions: Vec<i64>,
     },
+    Gather {
+        input_ids: [u32; 2],
+        output_id: u32,
+        dimension_numbers: GatherDimensionNumbers,
+        slice_sizes: Vec<i64>,
+        indices_are_sorted: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +88,17 @@ pub(crate) enum CompareDirection {
     Gt,
     Le,
     Lt,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct GatherDimensionNumbers {
+    pub(crate) offset_dims: Vec<i64>,
+    pub(crate) collapsed_slice_dims: Vec<i64>,
+    pub(crate) operand_batching_dims: Vec<i64>,
+    pub(crate) start_indices_batching_dims: Vec<i64>,
+    pub(crate) start_index_map: Vec<i64>,
+    pub(crate) index_vector_dim: i64,
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -186,6 +204,20 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     output_id: op_desc.output_id,
                     broadcast_dimensions: broadcast.broadcast_dimensions,
                 }),
+                Kind::Gather(gather) => Ok(Op::Gather {
+                    input_ids: [gather.operand_id, gather.start_indices_id],
+                    output_id: op_desc.output_id,
+                    dimension_numbers: GatherDimensionNumbers {
+                        offset_dims: gather.offset_dims,
+                        collapsed_slice_dims: gather.collapsed_slice_dims,
+                        operand_batching_dims: gather.operand_batching_dims,
+                        start_indices_batching_dims: gather.start_indices_batching_dims,
+                        start_index_map: gather.start_index_map,
+                        index_vector_dim: gather.index_vector_dim,
+                    },
+                    slice_sizes: gather.slice_sizes,
+                    indices_are_sorted: gather.indices_are_sorted,
+                }),
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -282,5 +314,12 @@ pub(crate) enum Op {
         input_id: u32,
         output_id: u32,
         broadcast_dimensions: Vec<i64>,
+    },
+    Gather {
+        input_ids: [u32; 2],
+        output_id: u32,
+        dimension_numbers: GatherDimensionNumbers,
+        slice_sizes: Vec<i64>,
+        indices_are_sorted: bool,
     },
 }

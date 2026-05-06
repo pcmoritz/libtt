@@ -85,6 +85,21 @@ message BroadcastInDimOp {
   repeated int64 broadcast_dimensions = 2;
 }
 
+message GatherOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 operand_id = 1;
+  uint32 start_indices_id = 2;
+
+  repeated int64 offset_dims = 3;
+  repeated int64 collapsed_slice_dims = 4;
+  repeated int64 operand_batching_dims = 5;
+  repeated int64 start_indices_batching_dims = 6;
+  repeated int64 start_index_map = 7;
+  int64 index_vector_dim = 8;
+  repeated int64 slice_sizes = 9;
+  bool indices_are_sorted = 10;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -98,6 +113,7 @@ message Op {
     CompareOp compare = 7;
     SelectOp select = 8;
     BroadcastInDimOp broadcast_in_dim = 9;
+    GatherOp gather = 10;
   }
 }
 

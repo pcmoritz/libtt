@@ -1664,6 +1664,11 @@ fn execute_executable_v1(
                     "TT executable broadcast_in_dim execution is not currently supported",
                 ));
             }
+            executable::Op::Gather { .. } => {
+                return Err(unimplemented(
+                    "TT executable gather execution is not currently supported",
+                ));
+            }
         }
     }
 
@@ -3391,6 +3396,89 @@ mod tests {
         assert_eq!(*input_id, 0);
         assert_eq!(*output_id, 1);
         assert_eq!(*broadcast_dimensions, vec![0]);
+
+        unsafe {
+            drop(Box::from_raw(get_executable_args.executable));
+            drop(Box::from_raw(compile_args.executable));
+            drop(Box::from_raw(client));
+        }
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_gather() {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"mlir".to_vec();
+        let mut code = br#"module {
+  func.func public @main(%arg0: tensor<4x8xbf16>, %arg1: tensor<2x1xi32>) -> tensor<2x8xbf16> {
+    %0 = "stablehlo.gather"(%arg0, %arg1) <{dimension_numbers = #stablehlo.gather<offset_dims = [1], collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1, 8>}> : (tensor<4x8xbf16>, tensor<2x1xi32>) -> tensor<2x8xbf16>
+    return %0 : tensor<2x8xbf16>
+  }
+}
+"#
+        .to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: code.as_mut_ptr().cast::<c_char>(),
+            code_size: code.len(),
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { compile(&mut compile_args) });
+
+        let get_executable = api
+            .PJRT_LoadedExecutable_GetExecutable
+            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
+        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
+            extension_start: ptr::null_mut(),
+            loaded_executable: compile_args.executable,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+
+        let executable = unsafe { &*get_executable_args.executable }
+            .metadata
+            .executable
+            .as_ref()
+            .expect("compiled executable should contain a TT executable");
+        assert_eq!(executable.output_ids, vec![2]);
+        assert_eq!(executable.ops.len(), 3);
+        let executable::Op::Gather {
+            input_ids,
+            output_id,
+            dimension_numbers,
+            slice_sizes,
+            indices_are_sorted,
+        } = &executable.ops[2]
+        else {
+            panic!("gather should lower to Gather");
+        };
+        assert_eq!(*input_ids, [0, 1]);
+        assert_eq!(*output_id, 2);
+        assert_eq!(dimension_numbers.offset_dims, vec![1]);
+        assert_eq!(dimension_numbers.collapsed_slice_dims, vec![0]);
+        assert!(dimension_numbers.operand_batching_dims.is_empty());
+        assert!(dimension_numbers.start_indices_batching_dims.is_empty());
+        assert_eq!(dimension_numbers.start_index_map, vec![0]);
+        assert_eq!(dimension_numbers.index_vector_dim, 1);
+        assert_eq!(*slice_sizes, vec![1, 8]);
+        assert!(!indices_are_sorted);
 
         unsafe {
             drop(Box::from_raw(get_executable_args.executable));

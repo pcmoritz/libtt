@@ -432,6 +432,44 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto gather_op = mlir::dyn_cast<mlir::stablehlo::GatherOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t start_indices_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(gather_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(gather_op.getStartIndices(), executable, value_ids, error, start_indices_id) ||
+                !addValueDesc(gather_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto dims = gather_op.getDimensionNumbers();
+            auto* gather = executable.add_ops();
+            gather->set_output_id(output_id);
+            gather->mutable_gather()->set_operand_id(operand_id);
+            gather->mutable_gather()->set_start_indices_id(start_indices_id);
+            for (int64_t dim : dims.getOffsetDims()) {
+                gather->mutable_gather()->add_offset_dims(dim);
+            }
+            for (int64_t dim : dims.getCollapsedSliceDims()) {
+                gather->mutable_gather()->add_collapsed_slice_dims(dim);
+            }
+            for (int64_t dim : dims.getOperandBatchingDims()) {
+                gather->mutable_gather()->add_operand_batching_dims(dim);
+            }
+            for (int64_t dim : dims.getStartIndicesBatchingDims()) {
+                gather->mutable_gather()->add_start_indices_batching_dims(dim);
+            }
+            for (int64_t dim : dims.getStartIndexMap()) {
+                gather->mutable_gather()->add_start_index_map(dim);
+            }
+            gather->mutable_gather()->set_index_vector_dim(dims.getIndexVectorDim());
+            for (int64_t size : gather_op.getSliceSizes()) {
+                gather->mutable_gather()->add_slice_sizes(size);
+            }
+            gather->mutable_gather()->set_indices_are_sorted(gather_op.getIndicesAreSorted());
+            continue;
+        }
+
         error = "unsupported entry op: " + op.getName().getStringRef().str();
         return false;
     }
