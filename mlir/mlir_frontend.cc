@@ -471,6 +471,20 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto sine_op = mlir::dyn_cast<mlir::stablehlo::SineOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(sine_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(sine_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* sine = executable.add_ops();
+            sine->set_output_id(output_id);
+            sine->mutable_sine()->set_operand_id(operand_id);
+            continue;
+        }
+
         if (auto max_op = mlir::dyn_cast<mlir::stablehlo::MaxOp>(op)) {
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;
