@@ -94,6 +94,10 @@ pub(crate) enum Op {
         input_id: u32,
         output_id: u32,
     },
+    Exponential {
+        input_id: u32,
+        output_id: u32,
+    },
     Convert {
         input_id: u32,
         output_id: u32,
@@ -320,6 +324,10 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     input_id: negate.operand_id,
                     output_id: op_desc.output_id,
                 }),
+                Kind::Exponential(exponential) => Ok(Op::Exponential {
+                    input_id: exponential.operand_id,
+                    output_id: op_desc.output_id,
+                }),
                 Kind::Convert(convert) => Ok(Op::Convert {
                     input_id: convert.operand_id,
                     output_id: op_desc.output_id,
@@ -497,6 +505,10 @@ pub(crate) enum Op {
         strides: Vec<i64>,
     },
     Negate {
+        input_id: u32,
+        output_id: u32,
+    },
+    Exponential {
         input_id: u32,
         output_id: u32,
     },

@@ -1637,6 +1637,11 @@ fn execute_executable_v1(
                     "TT executable negate execution is not currently supported",
                 ));
             }
+            executable::Op::Exponential { .. } => {
+                return Err(unimplemented(
+                    "TT executable exponential execution is not currently supported",
+                ));
+            }
             executable::Op::Convert { .. } => {
                 return Err(unimplemented(
                     "TT executable convert execution is not currently supported",
@@ -3216,6 +3221,7 @@ mod tests {
         Sine,
         Rsqrt,
         Negate,
+        Exponential,
     }
 
     #[cfg(libtt_mlir_frontend)]
@@ -3245,6 +3251,13 @@ mod tests {
             | (
                 UnaryOpKind::Negate,
                 executable::Op::Negate {
+                    input_id,
+                    output_id,
+                },
+            )
+            | (
+                UnaryOpKind::Exponential,
+                executable::Op::Exponential {
                     input_id,
                     output_id,
                 },
@@ -3611,6 +3624,11 @@ mod tests {
                 name: "negate",
                 op_name: "negate",
                 expected: UnaryOpKind::Negate,
+            },
+            Case {
+                name: "exponential",
+                op_name: "exponential",
+                expected: UnaryOpKind::Exponential,
             },
         ];
 
