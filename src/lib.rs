@@ -1642,6 +1642,11 @@ fn execute_executable_v1(
                     "TT executable exponential execution is not currently supported",
                 ));
             }
+            executable::Op::Transpose { .. } => {
+                return Err(unimplemented(
+                    "TT executable transpose execution is not currently supported",
+                ));
+            }
             executable::Op::Convert { .. } => {
                 return Err(unimplemented(
                     "TT executable convert execution is not currently supported",
@@ -3714,6 +3719,36 @@ mod tests {
                 assert_eq!(start_indices, &vec![0, 1]);
                 assert_eq!(limit_indices, &vec![4, 3]);
                 assert_eq!(strides, &vec![2, 1]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_transpose() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
+    %0 = stablehlo.transpose %arg0, dims = [2, 0, 1] : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
+    return %0 : tensor<4x2x3xf32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![1]);
+                assert_eq!(executable.ops.len(), 2);
+                assert_eq!(executable.values[1].dims, vec![4, 2, 3]);
+                let executable::Op::Transpose {
+                    input_id,
+                    output_id,
+                    permutation,
+                } = &executable.ops[1]
+                else {
+                    panic!("transpose should lower to Transpose");
+                };
+                assert_eq!(*input_id, 0);
+                assert_eq!(*output_id, 1);
+                assert_eq!(permutation, &vec![2, 0, 1]);
             },
         );
     }

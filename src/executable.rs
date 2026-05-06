@@ -98,6 +98,11 @@ pub(crate) enum Op {
         input_id: u32,
         output_id: u32,
     },
+    Transpose {
+        input_id: u32,
+        output_id: u32,
+        permutation: Vec<i64>,
+    },
     Convert {
         input_id: u32,
         output_id: u32,
@@ -328,6 +333,11 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     input_id: exponential.operand_id,
                     output_id: op_desc.output_id,
                 }),
+                Kind::Transpose(transpose) => Ok(Op::Transpose {
+                    input_id: transpose.operand_id,
+                    output_id: op_desc.output_id,
+                    permutation: transpose.permutation,
+                }),
                 Kind::Convert(convert) => Ok(Op::Convert {
                     input_id: convert.operand_id,
                     output_id: op_desc.output_id,
@@ -511,6 +521,11 @@ pub(crate) enum Op {
     Exponential {
         input_id: u32,
         output_id: u32,
+    },
+    Transpose {
+        input_id: u32,
+        output_id: u32,
+        permutation: Vec<i64>,
     },
     Convert {
         input_id: u32,

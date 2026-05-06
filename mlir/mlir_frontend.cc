@@ -637,6 +637,23 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto transpose_op = mlir::dyn_cast<mlir::stablehlo::TransposeOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(transpose_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(transpose_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* transpose = executable.add_ops();
+            transpose->set_output_id(output_id);
+            transpose->mutable_transpose()->set_operand_id(operand_id);
+            for (int64_t dim : transpose_op.getPermutation()) {
+                transpose->mutable_transpose()->add_permutation(dim);
+            }
+            continue;
+        }
+
         if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
             uint32_t operand_id = 0;
             uint32_t output_id = 0;
