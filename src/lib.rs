@@ -1627,6 +1627,11 @@ fn execute_executable_v1(
                     "TT executable slice execution is not currently supported",
                 ));
             }
+            executable::Op::Negate { .. } => {
+                return Err(unimplemented(
+                    "TT executable negate execution is not currently supported",
+                ));
+            }
             executable::Op::Convert { .. } => {
                 return Err(unimplemented(
                     "TT executable convert execution is not currently supported",
@@ -4273,6 +4278,78 @@ mod tests {
         assert_eq!(start_indices, &vec![0, 1]);
         assert_eq!(limit_indices, &vec![4, 3]);
         assert_eq!(strides, &vec![2, 1]);
+
+        unsafe {
+            drop(Box::from_raw(get_executable_args.executable));
+            drop(Box::from_raw(compile_args.executable));
+            drop(Box::from_raw(client));
+        }
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_negate() {
+        let api = unsafe { &*GetPjrtApi() };
+        let client = Box::into_raw(Box::new(PJRT_Client::new_with_devices(Vec::new())));
+        let mut format = b"mlir".to_vec();
+        let mut code = br#"module {
+  func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %0 = stablehlo.negate %arg0 : tensor<2x2xf32>
+    return %0 : tensor<2x2xf32>
+  }
+}
+"#
+        .to_vec();
+        let program = PJRT_Program {
+            struct_size: size_of::<PJRT_Program>(),
+            extension_start: ptr::null_mut(),
+            code: code.as_mut_ptr().cast::<c_char>(),
+            code_size: code.len(),
+            format: format.as_mut_ptr().cast::<c_char>(),
+            format_size: format.len(),
+        };
+
+        let compile = api
+            .PJRT_Client_Compile
+            .expect("PJRT_Client_Compile must be exported");
+        let mut compile_args = PJRT_Client_Compile_Args {
+            struct_size: size_of::<PJRT_Client_Compile_Args>(),
+            extension_start: ptr::null_mut(),
+            client,
+            program: &program,
+            compile_options: ptr::null(),
+            compile_options_size: 0,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { compile(&mut compile_args) });
+
+        let get_executable = api
+            .PJRT_LoadedExecutable_GetExecutable
+            .expect("PJRT_LoadedExecutable_GetExecutable must be exported");
+        let mut get_executable_args = PJRT_LoadedExecutable_GetExecutable_Args {
+            struct_size: size_of::<PJRT_LoadedExecutable_GetExecutable_Args>(),
+            extension_start: ptr::null_mut(),
+            loaded_executable: compile_args.executable,
+            executable: ptr::null_mut(),
+        };
+        check_ok(api, unsafe { get_executable(&mut get_executable_args) });
+
+        let executable = unsafe { &*get_executable_args.executable }
+            .metadata
+            .executable
+            .as_ref()
+            .expect("compiled executable should contain a TT executable");
+        assert_eq!(executable.output_ids, vec![1]);
+        assert_eq!(executable.ops.len(), 2);
+        let executable::Op::Negate {
+            input_id,
+            output_id,
+        } = &executable.ops[1]
+        else {
+            panic!("negate should lower to Negate");
+        };
+        assert_eq!(*input_id, 0);
+        assert_eq!(*output_id, 1);
 
         unsafe {
             drop(Box::from_raw(get_executable_args.executable));

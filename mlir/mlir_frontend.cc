@@ -592,6 +592,20 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto negate_op = mlir::dyn_cast<mlir::stablehlo::NegOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(negate_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(negate_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* negate = executable.add_ops();
+            negate->set_output_id(output_id);
+            negate->mutable_negate()->set_operand_id(operand_id);
+            continue;
+        }
+
         if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
             uint32_t operand_id = 0;
             uint32_t output_id = 0;

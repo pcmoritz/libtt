@@ -89,6 +89,11 @@ message SliceOp {
   repeated int64 strides = 4;
 }
 
+message NegateOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+}
+
 message ConvertOp {
   // Index into Executable.values for this op's operand.
   uint32 operand_id = 1;
@@ -201,6 +206,7 @@ message Op {
     RsqrtOp rsqrt = 20;
     ReshapeOp reshape = 21;
     SliceOp slice = 22;
+    NegateOp negate = 23;
   }
 }
 

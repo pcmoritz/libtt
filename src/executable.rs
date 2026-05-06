@@ -86,6 +86,10 @@ pub(crate) enum Op {
         limit_indices: Vec<i64>,
         strides: Vec<i64>,
     },
+    Negate {
+        input_id: u32,
+        output_id: u32,
+    },
     Convert {
         input_id: u32,
         output_id: u32,
@@ -294,6 +298,10 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     limit_indices: slice.limit_indices,
                     strides: slice.strides,
                 }),
+                Kind::Negate(negate) => Ok(Op::Negate {
+                    input_id: negate.operand_id,
+                    output_id: op_desc.output_id,
+                }),
                 Kind::Convert(convert) => Ok(Op::Convert {
                     input_id: convert.operand_id,
                     output_id: op_desc.output_id,
@@ -459,6 +467,10 @@ pub(crate) enum Op {
         start_indices: Vec<i64>,
         limit_indices: Vec<i64>,
         strides: Vec<i64>,
+    },
+    Negate {
+        input_id: u32,
+        output_id: u32,
     },
     Convert {
         input_id: u32,
