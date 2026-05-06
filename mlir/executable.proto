@@ -76,6 +76,11 @@ message RsqrtOp {
   uint32 operand_id = 1;
 }
 
+message ReshapeOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+}
+
 message ConvertOp {
   // Index into Executable.values for this op's operand.
   uint32 operand_id = 1;
@@ -186,6 +191,7 @@ message Op {
     ConvertOp convert = 18;
     ReduceOp reduce = 19;
     RsqrtOp rsqrt = 20;
+    ReshapeOp reshape = 21;
   }
 }
 

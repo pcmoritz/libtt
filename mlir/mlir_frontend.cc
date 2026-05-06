@@ -555,6 +555,20 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto reshape_op = mlir::dyn_cast<mlir::stablehlo::ReshapeOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(reshape_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(reshape_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* reshape = executable.add_ops();
+            reshape->set_output_id(output_id);
+            reshape->mutable_reshape()->set_operand_id(operand_id);
+            continue;
+        }
+
         if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
             uint32_t operand_id = 0;
             uint32_t output_id = 0;
