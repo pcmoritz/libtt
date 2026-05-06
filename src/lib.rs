@@ -1363,50 +1363,6 @@ fn device_buffer_for_value<'a>(
         .ok_or_else(|| invalid_argument(format!("{field} value id {value_id} is not available")))
 }
 
-fn bf16_eltwise_input<'a>(
-    values: &'a [Option<PJRT_Buffer>],
-    plan: &'a executable::Executable,
-    value_id: u32,
-    field: &str,
-) -> Result<kernels::binary_eltwise::Bf16EltwiseInput<'a>, *mut PJRT_Error> {
-    let index = value_id as usize;
-    if let Some(buffer) = values.get(index).and_then(|value| value.as_ref()) {
-        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-            return Err(failed_precondition(format!(
-                "TT executable {field} buffer has no device allocation"
-            )));
-        };
-        return Ok(kernels::binary_eltwise::Bf16EltwiseInput::Dram(dram_buffer));
-    }
-    for op in &plan.ops {
-        if let executable::Op::Constant {
-            packed_value,
-            output_id,
-        } = op
-        {
-            if *output_id == value_id {
-                let desc = plan.values.get(index).ok_or_else(|| {
-                    invalid_argument(format!(
-                        "{field} constant value id {value_id} is out of bounds"
-                    ))
-                })?;
-                if desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
-                    return Err(unimplemented(format!(
-                        "{field} constant value id {value_id} has type {:?}; bf16 eltwise constants currently require bf16",
-                        desc.element_type
-                    )));
-                }
-                return Ok(kernels::binary_eltwise::Bf16EltwiseInput::Constant(
-                    *packed_value,
-                ));
-            }
-        }
-    }
-    Err(invalid_argument(format!(
-        "{field} value id {value_id} is not available"
-    )))
-}
-
 fn eltwise_input<'a>(
     values: &'a [Option<PJRT_Buffer>],
     plan: &'a executable::Executable,
@@ -1534,14 +1490,15 @@ fn execute_binary_eltwise(
 
     let output_dims = lhs_desc.dims.clone();
     let shape = dims_i64_to_usize(&output_dims)?;
-    let lhs_input = bf16_eltwise_input(values, plan, input_ids[0], &lhs_field)?;
-    let rhs_input = bf16_eltwise_input(values, plan, input_ids[1], &rhs_field)?;
+    let lhs_input = eltwise_input(values, plan, input_ids[0], DType::Float16B, &lhs_field)?;
+    let rhs_input = eltwise_input(values, plan, input_ids[1], DType::Float16B, &rhs_field)?;
     let output_name = format!("pjrt_{op_name}");
-    let output_dram = kernels::binary_eltwise::eltwise_bf16(
+    let output_dram = kernels::binary_eltwise::eltwise(
         device,
         op,
         lhs_input,
         rhs_input,
+        DType::Float16B,
         &shape,
         output_name,
     )

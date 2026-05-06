@@ -154,34 +154,9 @@ impl Kernel<BinaryEltwiseProgramKey> for BinaryEltwiseKernel {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum Bf16EltwiseInput<'a> {
-    Dram(&'a DramBuffer),
-    Constant(u32),
-}
-
-#[derive(Clone, Copy)]
 pub(crate) enum EltwiseInput<'a> {
     Dram(&'a DramBuffer),
     Constant(u32),
-}
-
-pub(crate) fn eltwise_bf16(
-    device: &mut Device,
-    op: BinaryEltwiseOp,
-    lhs: Bf16EltwiseInput<'_>,
-    rhs: Bf16EltwiseInput<'_>,
-    shape: &[usize],
-    name: impl Into<String>,
-) -> io::Result<DramBuffer> {
-    eltwise(
-        device,
-        op,
-        EltwiseInput::from(lhs),
-        EltwiseInput::from(rhs),
-        DType::Float16B,
-        shape,
-        name,
-    )
 }
 
 pub(crate) fn eltwise(
@@ -227,15 +202,6 @@ pub(crate) fn eltwise(
     };
     kernel.run(device)?;
     Ok(output)
-}
-
-impl<'a> From<Bf16EltwiseInput<'a>> for EltwiseInput<'a> {
-    fn from(input: Bf16EltwiseInput<'a>) -> Self {
-        match input {
-            Bf16EltwiseInput::Dram(buffer) => Self::Dram(buffer),
-            Bf16EltwiseInput::Constant(value) => Self::Constant(value),
-        }
-    }
 }
 
 fn validate_input(
