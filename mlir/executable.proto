@@ -61,6 +61,11 @@ message ConcatenateOp {
   uint64 dimension = 2;
 }
 
+message CosineOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+}
+
 message MatmulOp {
   // Indices into Executable.values for this op's operands.
   uint32 lhs_id = 1;
@@ -147,6 +152,7 @@ message Op {
     DivideOp divide = 13;
     PowerOp power = 14;
     ConcatenateOp concatenate = 15;
+    CosineOp cosine = 16;
   }
 }
 

@@ -457,6 +457,20 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto cosine_op = mlir::dyn_cast<mlir::stablehlo::CosineOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(cosine_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(cosine_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* cosine = executable.add_ops();
+            cosine->set_output_id(output_id);
+            cosine->mutable_cosine()->set_operand_id(operand_id);
+            continue;
+        }
+
         if (auto max_op = mlir::dyn_cast<mlir::stablehlo::MaxOp>(op)) {
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;
