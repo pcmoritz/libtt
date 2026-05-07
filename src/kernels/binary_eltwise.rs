@@ -227,16 +227,15 @@ fn buffer_shape_matches(buffer_shape: &[usize], logical_shape: &[usize]) -> io::
 fn allocation_shape(shape: &[usize]) -> io::Result<Vec<usize>> {
     match shape.len() {
         0 => Ok(vec![TILE_R, TILE_C]),
-        1 => Ok(vec![TILE_R, round_up_to_tile_dim(shape[0])?]),
+        1 => Ok(vec![
+            TILE_R,
+            shape[0]
+                .max(1)
+                .checked_next_multiple_of(TILE_C)
+                .ok_or_else(|| invalid_input("shape dimension overflow"))?,
+        ]),
         _ => Ok(shape.to_vec()),
     }
-}
-
-fn round_up_to_tile_dim(dim: usize) -> io::Result<usize> {
-    dim.max(1)
-        .checked_add(TILE_C - 1)
-        .map(|value| value / TILE_C * TILE_C)
-        .ok_or_else(|| invalid_input("shape dimension overflow"))
 }
 
 fn input_addr(input: EltwiseInput<'_>, name: &str) -> io::Result<u32> {
