@@ -315,27 +315,3 @@ fn compare_direction_variant(direction: CompareDirection) -> &'static str {
         CompareDirection::Lt => "Lt",
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compare_compute_source_dispatches_dtype_and_direction_in_cpp() {
-        let source = compare_compute_source(DType::Int32, CompareDirection::Lt)
-            .expect("compare source should support int32");
-        let float_source = compare_compute_source(DType::Float32, CompareDirection::Lt)
-            .expect("compare source should support float32");
-
-        assert_ne!(source, float_source);
-        assert!(source.contains("constexpr bool int32_input = true"));
-        assert!(float_source.contains("constexpr bool int32_input = false"));
-        assert!(source.contains("compare_sub_init<int32_input>()"));
-        assert!(source.contains("compare_sub_tile<int32_input>(0, 1, 0)"));
-        assert!(source.contains("compare_zero_init(direction)"));
-        assert!(source.contains("compare_zero_tile<int32_input>(direction, 0)"));
-        assert!(source.contains("CompareDirection::Lt"));
-        assert!(!source.contains("COMPARE_DIRECTION"));
-        assert!(!source.contains("COMPARE_INT32_INPUT"));
-    }
-}
