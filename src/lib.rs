@@ -1483,8 +1483,8 @@ fn execute_binary_eltwise(
     }
     let input_dtype = pjrt_buffer_type_to_dtype(lhs_desc.element_type)?;
     let expected_output_type = match op {
-        kernels::binary_eltwise::BinaryEltwiseOp::Add
-        | kernels::binary_eltwise::BinaryEltwiseOp::Max => {
+        kernels::binary_eltwise::BinaryEltwiseOp::Add => lhs_desc.element_type,
+        kernels::binary_eltwise::BinaryEltwiseOp::Max => {
             if input_dtype != DType::Float16B {
                 return Err(unimplemented(format!(
                     "TT executable {op_name} currently only supports bf16 buffers"

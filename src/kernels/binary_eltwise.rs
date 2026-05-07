@@ -29,7 +29,7 @@ pub(crate) enum BinaryEltwiseOp {
 impl BinaryEltwiseOp {
     fn compute_source(self, input_dtype: DType) -> io::Result<String> {
         match self {
-            Self::Add => Ok(ADD_BF16_COMPUTE.to_owned()),
+            Self::Add => add_compute_source(input_dtype),
             Self::Max => Ok(MAX_BF16_COMPUTE.to_owned()),
             Self::Compare(direction) => compare_compute_source(input_dtype, direction),
         }
@@ -37,7 +37,7 @@ impl BinaryEltwiseOp {
 
     fn kernel_name(self, input_dtype: DType, output_dtype: DType) -> String {
         match self {
-            Self::Add => "eltwise_add_bf16".to_owned(),
+            Self::Add => format!("eltwise_add_{input_dtype:?}_{output_dtype:?}"),
             Self::Max => "eltwise_max_bf16".to_owned(),
             Self::Compare(direction) => {
                 format!("eltwise_compare_{direction:?}_{input_dtype:?}_{output_dtype:?}")
@@ -45,9 +45,10 @@ impl BinaryEltwiseOp {
         }
     }
 
-    fn output_dtype(self) -> DType {
+    fn output_dtype(self, input_dtype: DType) -> DType {
         match self {
-            Self::Add | Self::Max => DType::Float16B,
+            Self::Add => input_dtype,
+            Self::Max => DType::Float16B,
             Self::Compare(_) => DType::UInt8,
         }
     }
@@ -128,7 +129,7 @@ pub(crate) fn eltwise(
         .first()
         .copied()
         .ok_or_else(|| invalid_input("no worker cores are available"))?;
-    let output_dtype = op.output_dtype();
+    let output_dtype = op.output_dtype(input_dtype);
     let output_shape = allocation_shape(shape)?;
     let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
     let output_addr = u32_arg(output.addr, "output address")?;
@@ -303,6 +304,22 @@ fn compare_compute_source(dtype: DType, direction: CompareDirection) -> io::Resu
     Ok(COMPARE_COMPUTE
         .replace("COMPARE_INT32_INPUT", int32_input)
         .replace("COMPARE_DIRECTION", compare_direction_variant(direction)))
+}
+
+fn add_compute_source(dtype: DType) -> io::Result<String> {
+    Ok(ADD_BF16_COMPUTE.replace("ADD_INPUT_KIND", add_input_kind(dtype)?))
+}
+
+fn add_input_kind(dtype: DType) -> io::Result<&'static str> {
+    match dtype {
+        DType::Float16 | DType::Float16B | DType::Float32 => Ok("Float"),
+        DType::Int32 => Ok("Int32"),
+        DType::UInt32 => Ok("UInt32"),
+        DType::UInt16 => Ok("UInt16"),
+        DType::Int8 | DType::UInt8 => Err(invalid_input(format!(
+            "add currently supports Float16, Float16B, Float32, Int32, UInt32, and UInt16 inputs, got {dtype:?}"
+        ))),
+    }
 }
 
 fn compare_direction_variant(direction: CompareDirection) -> &'static str {
