@@ -6,8 +6,8 @@ use crate::hw::CoreCoord;
 use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
 use std::io;
 
-const BF16_READER: &str = include_str!("../../kernels/binary_eltwise_reader.cc");
-const BF16_WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
+const READER: &str = include_str!("../../kernels/binary_eltwise_reader.cc");
+const WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
 const ADD_BF16_COMPUTE: &str = include_str!("../../kernels/add_compute.cc");
 const MAX_BF16_COMPUTE: &str = include_str!("../../kernels/max_compute.cc");
 const COMPARE_COMPUTE: &str = include_str!("../../kernels/compare_compute.cc");
@@ -270,9 +270,9 @@ fn eltwise_program(key: BinaryEltwiseProgramKey) -> io::Result<Program> {
     )?;
     let runtime_args = runtime_args.build()?;
     Ok(Program {
-        reader_kernel: reader_source(key.input_dtype)?,
+        reader_kernel: READER.to_owned(),
         compute_kernel: key.op.compute_source(key.input_dtype)?,
-        writer_kernel: writer_source(key.output_dtype)?,
+        writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
             cbs: vec![
                 CBConfig::new(0, key.input_dtype),
@@ -288,16 +288,6 @@ fn eltwise_program(key: BinaryEltwiseProgramKey) -> io::Result<Program> {
         name: key.op.kernel_name(key.input_dtype, key.output_dtype),
         ..Program::new(runtime_args)
     })
-}
-
-fn reader_source(dtype: DType) -> io::Result<String> {
-    Ok(BF16_READER
-        .replace("DataFormat::Float16_b", data_format(dtype)?)
-        .replace("packed_bf16", "packed_value"))
-}
-
-fn writer_source(dtype: DType) -> io::Result<String> {
-    Ok(BF16_WRITER.replace("DataFormat::Float16_b", data_format(dtype)?))
 }
 
 fn compare_compute_source(dtype: DType, direction: CompareDirection) -> io::Result<String> {
@@ -323,19 +313,6 @@ fn compare_direction_variant(direction: CompareDirection) -> &'static str {
         CompareDirection::Gt => "Gt",
         CompareDirection::Le => "Le",
         CompareDirection::Lt => "Lt",
-    }
-}
-
-fn data_format(dtype: DType) -> io::Result<&'static str> {
-    match dtype {
-        DType::Float32 => Ok("DataFormat::Float32"),
-        DType::Float16 => Ok("DataFormat::Float16"),
-        DType::Float16B => Ok("DataFormat::Float16_b"),
-        DType::Int32 => Ok("DataFormat::Int32"),
-        DType::UInt16 => Ok("DataFormat::UInt16"),
-        DType::Int8 => Ok("DataFormat::Int8"),
-        DType::UInt32 => Ok("DataFormat::UInt32"),
-        DType::UInt8 => Ok("DataFormat::UInt8"),
     }
 }
 

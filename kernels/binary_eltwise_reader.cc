@@ -2,12 +2,12 @@
 
 namespace {
 
-void fill_tile(uint32_t cb, uint32_t packed_bf16) {
+void fill_tile(uint32_t cb, uint32_t packed_value) {
   uint32_t l1_addr = get_write_ptr(cb);
   volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(l1_addr);
   uint32_t words = get_tile_size(cb) / sizeof(uint32_t);
   for (uint32_t i = 0; i < words; ++i) {
-    ptr[i] = packed_bf16;
+    ptr[i] = packed_value;
   }
 }
 
@@ -24,10 +24,10 @@ void kernel_main() {
   constexpr uint32_t cb_lhs = tt::CBIndex::c_0;
   constexpr uint32_t cb_rhs = tt::CBIndex::c_1;
   const InterleavedAddrGenFast<true> lhs = {
-    .bank_base_address = lhs_addr, .page_size = get_tile_size(cb_lhs), .data_format = DataFormat::Float16_b,
+    .bank_base_address = lhs_addr, .page_size = get_tile_size(cb_lhs), .data_format = get_dataformat(cb_lhs),
   };
   const InterleavedAddrGenFast<true> rhs = {
-    .bank_base_address = rhs_addr, .page_size = get_tile_size(cb_rhs), .data_format = DataFormat::Float16_b,
+    .bank_base_address = rhs_addr, .page_size = get_tile_size(cb_rhs), .data_format = get_dataformat(cb_rhs),
   };
 
   for (uint32_t i = 0; i < n_tiles; ++i) {

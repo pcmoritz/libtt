@@ -287,12 +287,12 @@ pub(crate) fn build_dispatch_setup_plan(
     let writer = if program.writer_kernel.is_empty() {
         None
     } else {
-        Some(compiler.compile_dataflow(&program.writer_kernel, "brisc", None)?)
+        Some(compiler.compile_dataflow(&program.writer_kernel, "brisc", None, &program.compile)?)
     };
     let reader = if program.reader_kernel.is_empty() {
         None
     } else {
-        Some(compiler.compile_dataflow(&program.reader_kernel, "ncrisc", None)?)
+        Some(compiler.compile_dataflow(&program.reader_kernel, "ncrisc", None, &program.compile)?)
     };
     let compute = if program.compute_kernel.is_empty() {
         None
@@ -373,12 +373,22 @@ fn build_roles(
         let reader_recv = if program.reader_recv_kernel.is_empty() {
             reader.clone()
         } else {
-            Some(compiler.compile_dataflow(&program.reader_recv_kernel, "ncrisc", None)?)
+            Some(compiler.compile_dataflow(
+                &program.reader_recv_kernel,
+                "ncrisc",
+                None,
+                &program.compile,
+            )?)
         };
         let writer_recv = if program.writer_recv_kernel.is_empty() {
             writer.clone()
         } else {
-            Some(compiler.compile_dataflow(&program.writer_recv_kernel, "brisc", None)?)
+            Some(compiler.compile_dataflow(
+                &program.writer_recv_kernel,
+                "brisc",
+                None,
+                &program.compile,
+            )?)
         };
 
         let top_left = vec![CoreCoord {

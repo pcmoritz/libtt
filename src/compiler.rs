@@ -328,6 +328,7 @@ impl Compiler {
         src: &str,
         processor: &str,
         noc_index: Option<u8>,
+        compile: &CompileConfig,
     ) -> io::Result<CompiledKernel> {
         let (target, noc_index) = match processor {
             "brisc" => ("brisc", noc_index.unwrap_or(1)),
@@ -366,7 +367,7 @@ impl Compiler {
             &[],
             "-O2",
             false,
-            &CompileConfig::default(),
+            compile,
         )
     }
 
