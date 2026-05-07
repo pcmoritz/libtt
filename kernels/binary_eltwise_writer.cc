@@ -6,7 +6,7 @@ void kernel_main() {
 
   constexpr uint32_t cb_out = tt::CBIndex::c_16;
   const InterleavedAddrGenFast<true> out = {
-    .bank_base_address = out_addr, .page_size = get_tile_size(cb_out), .data_format = DataFormat::Float16_b,
+    .bank_base_address = out_addr, .page_size = get_tile_size(cb_out), .data_format = get_dataformat(cb_out),
   };
 
   for (uint32_t i = 0; i < n_tiles; ++i) {
