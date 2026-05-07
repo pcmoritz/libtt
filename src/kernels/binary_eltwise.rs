@@ -51,41 +51,6 @@ impl BinaryEltwiseOp {
             Self::Compare(_) => DType::UInt8,
         }
     }
-
-    fn compare_zero_op(direction: CompareDirection) -> CompareZeroOp {
-        match direction {
-            CompareDirection::Eq => CompareZeroOp {
-                init: "eqz_tile_init",
-                float_tile: "eqz_tile",
-                int32_tile: "eqz_tile_int32",
-            },
-            CompareDirection::Ne => CompareZeroOp {
-                init: "nez_tile_init",
-                float_tile: "nez_tile",
-                int32_tile: "nez_tile_int32",
-            },
-            CompareDirection::Ge => CompareZeroOp {
-                init: "gez_tile_init",
-                float_tile: "gez_tile",
-                int32_tile: "gez_tile_int32",
-            },
-            CompareDirection::Gt => CompareZeroOp {
-                init: "gtz_tile_init",
-                float_tile: "gtz_tile",
-                int32_tile: "gtz_tile_int32",
-            },
-            CompareDirection::Le => CompareZeroOp {
-                init: "lez_tile_init",
-                float_tile: "lez_tile",
-                int32_tile: "lez_tile_int32",
-            },
-            CompareDirection::Lt => CompareZeroOp {
-                init: "ltz_tile_init",
-                float_tile: "ltz_tile",
-                int32_tile: "ltz_tile_int32",
-            },
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -336,18 +301,9 @@ fn writer_source(dtype: DType) -> io::Result<String> {
 }
 
 fn compare_compute_source(dtype: DType, direction: CompareDirection) -> io::Result<String> {
-    let zero_op = BinaryEltwiseOp::compare_zero_op(direction);
-    let substitutions = match dtype {
-        DType::Float16B | DType::Float32 => CompareComputeFns {
-            sub_init: "sub_binary_tile_init",
-            sub_tile: "sub_binary_tile",
-            zero_tile: zero_op.float_tile,
-        },
-        DType::Int32 => CompareComputeFns {
-            sub_init: "sub_int_tile_init",
-            sub_tile: "sub_int32_tile",
-            zero_tile: zero_op.int32_tile,
-        },
+    let int32_input = match dtype {
+        DType::Int32 => "true",
+        DType::Float16B | DType::Float32 => "false",
         _ => {
             return Err(invalid_input(format!(
                 "compare currently supports Float16B, Float32, and Int32 inputs, got {dtype:?}"
@@ -355,22 +311,19 @@ fn compare_compute_source(dtype: DType, direction: CompareDirection) -> io::Resu
         }
     };
     Ok(COMPARE_COMPUTE
-        .replace("COMPARE_SUB_INIT", substitutions.sub_init)
-        .replace("COMPARE_SUB_TILE", substitutions.sub_tile)
-        .replace("COMPARE_ZERO_INIT", zero_op.init)
-        .replace("COMPARE_ZERO_TILE", substitutions.zero_tile))
+        .replace("COMPARE_INT32_INPUT", int32_input)
+        .replace("COMPARE_DIRECTION", compare_direction_variant(direction)))
 }
 
-struct CompareComputeFns {
-    sub_init: &'static str,
-    sub_tile: &'static str,
-    zero_tile: &'static str,
-}
-
-struct CompareZeroOp {
-    init: &'static str,
-    float_tile: &'static str,
-    int32_tile: &'static str,
+fn compare_direction_variant(direction: CompareDirection) -> &'static str {
+    match direction {
+        CompareDirection::Eq => "Eq",
+        CompareDirection::Ne => "Ne",
+        CompareDirection::Ge => "Ge",
+        CompareDirection::Gt => "Gt",
+        CompareDirection::Le => "Le",
+        CompareDirection::Lt => "Lt",
+    }
 }
 
 fn data_format(dtype: DType) -> io::Result<&'static str> {
@@ -383,5 +336,29 @@ fn data_format(dtype: DType) -> io::Result<&'static str> {
         DType::Int8 => Ok("DataFormat::Int8"),
         DType::UInt32 => Ok("DataFormat::UInt32"),
         DType::UInt8 => Ok("DataFormat::UInt8"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compare_compute_source_dispatches_dtype_and_direction_in_cpp() {
+        let source = compare_compute_source(DType::Int32, CompareDirection::Lt)
+            .expect("compare source should support int32");
+        let float_source = compare_compute_source(DType::Float32, CompareDirection::Lt)
+            .expect("compare source should support float32");
+
+        assert_ne!(source, float_source);
+        assert!(source.contains("constexpr bool int32_input = true"));
+        assert!(float_source.contains("constexpr bool int32_input = false"));
+        assert!(source.contains("compare_sub_init<int32_input>()"));
+        assert!(source.contains("compare_sub_tile<int32_input>(0, 1, 0)"));
+        assert!(source.contains("compare_zero_init(direction)"));
+        assert!(source.contains("compare_zero_tile<int32_input>(direction, 0)"));
+        assert!(source.contains("CompareDirection::Lt"));
+        assert!(!source.contains("COMPARE_DIRECTION"));
+        assert!(!source.contains("COMPARE_INT32_INPUT"));
     }
 }
