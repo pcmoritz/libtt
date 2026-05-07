@@ -29,7 +29,7 @@ pub(crate) enum BinaryEltwiseOp {
 impl BinaryEltwiseOp {
     fn compute_source(self, input_dtype: DType) -> io::Result<String> {
         match self {
-            Self::Add => add_compute_source(input_dtype),
+            Self::Add => Ok(ADD_BF16_COMPUTE.to_owned()),
             Self::Max => Ok(MAX_BF16_COMPUTE.to_owned()),
             Self::Compare(direction) => compare_compute_source(input_dtype, direction),
         }
@@ -304,22 +304,6 @@ fn compare_compute_source(dtype: DType, direction: CompareDirection) -> io::Resu
     Ok(COMPARE_COMPUTE
         .replace("COMPARE_INT32_INPUT", int32_input)
         .replace("COMPARE_DIRECTION", compare_direction_variant(direction)))
-}
-
-fn add_compute_source(dtype: DType) -> io::Result<String> {
-    Ok(ADD_BF16_COMPUTE.replace("ADD_INPUT_KIND", add_input_kind(dtype)?))
-}
-
-fn add_input_kind(dtype: DType) -> io::Result<&'static str> {
-    match dtype {
-        DType::Float16 | DType::Float16B | DType::Float32 => Ok("Float"),
-        DType::Int32 => Ok("Int32"),
-        DType::UInt32 => Ok("UInt32"),
-        DType::UInt16 => Ok("UInt16"),
-        DType::Int8 | DType::UInt8 => Err(invalid_input(format!(
-            "add currently supports Float16, Float16B, Float32, Int32, UInt32, and UInt16 inputs, got {dtype:?}"
-        ))),
-    }
 }
 
 fn compare_direction_variant(direction: CompareDirection) -> &'static str {
