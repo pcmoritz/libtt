@@ -37,7 +37,7 @@ impl BinaryEltwiseOp {
 
     fn kernel_name(self, input_dtype: DType, output_dtype: DType) -> String {
         match self {
-            Self::Add => "eltwise_add_bf16".to_owned(),
+            Self::Add => format!("eltwise_add_{input_dtype:?}_{output_dtype:?}"),
             Self::Max => "eltwise_max_bf16".to_owned(),
             Self::Compare(direction) => {
                 format!("eltwise_compare_{direction:?}_{input_dtype:?}_{output_dtype:?}")
@@ -45,9 +45,10 @@ impl BinaryEltwiseOp {
         }
     }
 
-    fn output_dtype(self) -> DType {
+    fn output_dtype(self, input_dtype: DType) -> DType {
         match self {
-            Self::Add | Self::Max => DType::Float16B,
+            Self::Add => input_dtype,
+            Self::Max => DType::Float16B,
             Self::Compare(_) => DType::UInt8,
         }
     }
@@ -128,7 +129,7 @@ pub(crate) fn eltwise(
         .first()
         .copied()
         .ok_or_else(|| invalid_input("no worker cores are available"))?;
-    let output_dtype = op.output_dtype();
+    let output_dtype = op.output_dtype(input_dtype);
     let output_shape = allocation_shape(shape)?;
     let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
     let output_addr = u32_arg(output.addr, "output address")?;
