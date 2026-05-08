@@ -1647,6 +1647,61 @@ fn execute_select(
     )
 }
 
+fn execute_broadcast_in_dim(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_id: u32,
+    output_id: u32,
+    broadcast_dimensions: &[i64],
+) -> Result<(), *mut PJRT_Error> {
+    let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable broadcast operand value id is out of bounds")
+    })?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable broadcast output value id is out of bounds")
+    })?;
+    if input_desc.element_type != output_desc.element_type {
+        return Err(invalid_argument(
+            "TT executable broadcast input and output element types must match",
+        ));
+    }
+    if !(input_desc.dims.len() == 1
+        && output_desc.dims.len() == 2
+        && broadcast_dimensions == [0_i64]
+        && output_desc.dims[0] == input_desc.dims[0]
+        && output_desc.dims[1] == 1)
+    {
+        return Err(unimplemented(format!(
+            "TT executable broadcast_in_dim currently supports vector-to-column broadcasts only, got input {:?}, output {:?}, dims {:?}",
+            input_desc.dims, output_desc.dims, broadcast_dimensions
+        )));
+    }
+
+    let input = device_buffer_for_value(values, input_id, "broadcast_in_dim.operand")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable broadcast_in_dim operand buffer has no device allocation",
+        ));
+    };
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let rows = dims_i64_to_usize(&[output_desc.dims[0]])?[0];
+    let output_dims = output_desc.dims.clone();
+    let output_dram =
+        kernels::broadcast::vector_to_column(device, input_dram, rows, dtype, "pjrt_broadcast")
+            .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_dims,
+        output_dram,
+        context,
+        "broadcast_in_dim",
+    )
+}
+
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
@@ -1913,10 +1968,20 @@ fn execute_executable_v1(
                     *output_id,
                 )?;
             }
-            executable::Op::BroadcastInDim { .. } => {
-                return Err(unimplemented(
-                    "TT executable broadcast_in_dim execution is not currently supported",
-                ));
+            executable::Op::BroadcastInDim {
+                input_id,
+                output_id,
+                broadcast_dimensions,
+            } => {
+                execute_broadcast_in_dim(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    *input_id,
+                    *output_id,
+                    broadcast_dimensions,
+                )?;
             }
             executable::Op::Gather { .. } => {
                 return Err(unimplemented(
