@@ -112,11 +112,11 @@ fn validate_pred(pred: &DramBuffer, shape: &[usize], expected_tiles: usize) -> i
 }
 
 fn validate_value_dtype(dtype: DType) -> io::Result<()> {
-    if matches!(dtype, DType::Float16B | DType::Float32) {
+    if matches!(dtype, DType::Float16B | DType::Float32 | DType::Int32) {
         Ok(())
     } else {
         Err(invalid_input(format!(
-            "select currently supports Float16B and Float32 values, got {dtype:?}"
+            "select currently supports Float16B, Float32, and Int32 values, got {dtype:?}"
         )))
     }
 }
