@@ -1412,41 +1412,14 @@ fn select_value_input<'a>(
     expected_dtype: DType,
     field: &str,
 ) -> Result<kernels::select::SelectInput<'a>, *mut PJRT_Error> {
-    let index = value_id as usize;
-    if let Some(buffer) = values.get(index).and_then(|value| value.as_ref()) {
-        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-            return Err(failed_precondition(format!(
-                "TT executable {field} buffer has no device allocation"
-            )));
-        };
-        return Ok(kernels::select::SelectInput::Dram(dram_buffer));
-    }
-    for op in &plan.ops {
-        if let executable::Op::Constant {
-            packed_value,
-            output_id,
-        } = op
-        {
-            if *output_id == value_id {
-                let desc = plan.values.get(index).ok_or_else(|| {
-                    invalid_argument(format!(
-                        "{field} constant value id {value_id} is out of bounds"
-                    ))
-                })?;
-                let dtype = pjrt_buffer_type_to_dtype(desc.element_type)?;
-                if dtype != expected_dtype {
-                    return Err(unimplemented(format!(
-                        "{field} constant value id {value_id} has type {:?}; expected {expected_dtype:?}",
-                        desc.element_type
-                    )));
-                }
-                return Ok(kernels::select::SelectInput::Constant(*packed_value));
-            }
+    match eltwise_input(values, plan, value_id, expected_dtype, field)? {
+        kernels::binary_eltwise::EltwiseInput::Dram(buffer) => {
+            Ok(kernels::select::SelectInput::Dram(buffer))
+        }
+        kernels::binary_eltwise::EltwiseInput::Constant(value) => {
+            Ok(kernels::select::SelectInput::Constant(value))
         }
     }
-    Err(invalid_argument(format!(
-        "{field} value id {value_id} is not available"
-    )))
 }
 
 struct OutputContext {
@@ -1581,6 +1554,96 @@ fn execute_binary_eltwise(
         output_dram,
         context,
         op_name,
+    )
+}
+
+fn execute_select(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: [u32; 3],
+    output_id: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let [pred_id, true_id, false_id] = input_ids;
+    let pred_desc = plan
+        .values
+        .get(pred_id as usize)
+        .ok_or_else(|| invalid_argument("TT executable select.pred value id is out of bounds"))?;
+    let true_desc = plan.values.get(true_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable select.on_true value id is out of bounds")
+    })?;
+    let false_desc = plan.values.get(false_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable select.on_false value id is out of bounds")
+    })?;
+    if pred_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_PRED {
+        return Err(invalid_argument(format!(
+            "TT executable select predicate must be PRED, got {:?}",
+            pred_desc.element_type
+        )));
+    }
+    if true_desc.element_type != false_desc.element_type {
+        return Err(invalid_argument(
+            "TT executable select value element types must match",
+        ));
+    }
+    if pred_desc.dims != true_desc.dims || true_desc.dims != false_desc.dims {
+        return Err(unimplemented(
+            "TT executable select currently only supports equal-shaped operands",
+        ));
+    }
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable select output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != true_desc.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable select output must be {:?}, got {:?}",
+            true_desc.element_type, output_desc.element_type
+        )));
+    }
+    if output_desc.dims != true_desc.dims {
+        return Err(invalid_argument(format!(
+            "TT executable select output shape mismatch: expected {:?}, got {:?}",
+            true_desc.dims, output_desc.dims
+        )));
+    }
+    let value_dtype = pjrt_buffer_type_to_dtype(true_desc.element_type)?;
+    if !matches!(value_dtype, DType::Float16B | DType::Float32) {
+        return Err(unimplemented(format!(
+            "TT executable select currently supports bf16 and f32 values, got {:?}",
+            true_desc.element_type
+        )));
+    }
+    let pred = device_buffer_for_value(values, pred_id, "select.pred")?;
+    let Some(pred_dram) = pred.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable select predicate buffer has no device allocation",
+        ));
+    };
+    let true_input = select_value_input(values, plan, true_id, value_dtype, "select.on_true")?;
+    let false_input = select_value_input(values, plan, false_id, value_dtype, "select.on_false")?;
+    let expected_dims = true_desc.dims.clone();
+    let shape = dims_i64_to_usize(&expected_dims)?;
+    let output_dram = kernels::select::select(
+        device,
+        pred_dram,
+        true_input,
+        false_input,
+        value_dtype,
+        &shape,
+        "pjrt_select",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        expected_dims,
+        output_dram,
+        context,
+        "select",
     )
 }
 
@@ -1841,91 +1904,13 @@ fn execute_executable_v1(
                 input_ids,
                 output_id,
             } => {
-                let pred_desc = plan.values.get(input_ids[0] as usize).ok_or_else(|| {
-                    invalid_argument("TT executable select.pred value id is out of bounds")
-                })?;
-                let true_desc = plan.values.get(input_ids[1] as usize).ok_or_else(|| {
-                    invalid_argument("TT executable select.on_true value id is out of bounds")
-                })?;
-                let false_desc = plan.values.get(input_ids[2] as usize).ok_or_else(|| {
-                    invalid_argument("TT executable select.on_false value id is out of bounds")
-                })?;
-                if pred_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_PRED {
-                    return Err(invalid_argument(format!(
-                        "TT executable select predicate must be PRED, got {:?}",
-                        pred_desc.element_type
-                    )));
-                }
-                if true_desc.element_type != false_desc.element_type {
-                    return Err(invalid_argument(
-                        "TT executable select value element types must match",
-                    ));
-                }
-                if pred_desc.dims != true_desc.dims || true_desc.dims != false_desc.dims {
-                    return Err(unimplemented(
-                        "TT executable select currently only supports equal-shaped operands",
-                    ));
-                }
-                let output_id = *output_id;
-                let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-                    invalid_argument(format!(
-                        "TT executable select output id {output_id} is out of bounds"
-                    ))
-                })?;
-                if output_desc.element_type != true_desc.element_type {
-                    return Err(invalid_argument(format!(
-                        "TT executable select output must be {:?}, got {:?}",
-                        true_desc.element_type, output_desc.element_type
-                    )));
-                }
-                if output_desc.dims != true_desc.dims {
-                    return Err(invalid_argument(format!(
-                        "TT executable select output shape mismatch: expected {:?}, got {:?}",
-                        true_desc.dims, output_desc.dims
-                    )));
-                }
-                let value_dtype = pjrt_buffer_type_to_dtype(true_desc.element_type)?;
-                if !matches!(value_dtype, DType::Float16B | DType::Float32) {
-                    return Err(unimplemented(format!(
-                        "TT executable select currently supports bf16 and f32 values, got {:?}",
-                        true_desc.element_type
-                    )));
-                }
-                let pred = device_buffer_for_value(&values, input_ids[0], "select.pred")?;
-                let Some(pred_dram) = pred.dram_buffer.as_ref() else {
-                    return Err(failed_precondition(
-                        "TT executable select predicate buffer has no device allocation",
-                    ));
-                };
-                let true_input =
-                    select_value_input(&values, plan, input_ids[1], value_dtype, "select.on_true")?;
-                let false_input = select_value_input(
-                    &values,
-                    plan,
-                    input_ids[2],
-                    value_dtype,
-                    "select.on_false",
-                )?;
-                let expected_dims = true_desc.dims.clone();
-                let shape = dims_i64_to_usize(&expected_dims)?;
-                let output_dram = kernels::select::select(
-                    device,
-                    pred_dram,
-                    true_input,
-                    false_input,
-                    value_dtype,
-                    &shape,
-                    "pjrt_select",
-                )
-                .map_err(io_error)?;
-                store_output_buffer(
+                execute_select(
                     &mut values,
                     plan,
-                    output_id,
-                    expected_dims,
-                    output_dram,
+                    device,
                     &output_context,
-                    "select",
+                    *input_ids,
+                    *output_id,
                 )?;
             }
             executable::Op::BroadcastInDim { .. } => {
