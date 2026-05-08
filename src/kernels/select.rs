@@ -81,9 +81,13 @@ pub(crate) fn select(
 ) -> io::Result<DramBuffer> {
     validate_value_dtype(value_dtype)?;
     let output_tiles = shape_tile_count(shape)?;
-    validate_pred(pred, shape, output_tiles)?;
-    validate_value(on_true, value_dtype, shape, output_tiles, "on_true")?;
-    validate_value(on_false, value_dtype, shape, output_tiles, "on_false")?;
+    validate_buffer(pred, DType::UInt8, shape, output_tiles, "predicate")?;
+    if let SelectInput::Dram(buffer) = on_true {
+        validate_buffer(buffer, value_dtype, shape, output_tiles, "on_true")?;
+    }
+    if let SelectInput::Dram(buffer) = on_false {
+        validate_buffer(buffer, value_dtype, shape, output_tiles, "on_false")?;
+    }
 
     let tile_count = u32::try_from(output_tiles)
         .map_err(|_| invalid_input(format!("tile count does not fit in u32: {output_tiles}")))?;
@@ -107,10 +111,6 @@ pub(crate) fn select(
     Ok(output)
 }
 
-fn validate_pred(pred: &DramBuffer, shape: &[usize], expected_tiles: usize) -> io::Result<()> {
-    validate_buffer(pred, DType::UInt8, shape, expected_tiles, "predicate")
-}
-
 fn validate_value_dtype(dtype: DType) -> io::Result<()> {
     if matches!(dtype, DType::Float16B | DType::Float32 | DType::Int32) {
         Ok(())
@@ -119,19 +119,6 @@ fn validate_value_dtype(dtype: DType) -> io::Result<()> {
             "select currently supports Float16B, Float32, and Int32 values, got {dtype:?}"
         )))
     }
-}
-
-fn validate_value(
-    input: SelectInput<'_>,
-    dtype: DType,
-    shape: &[usize],
-    expected_tiles: usize,
-    name: &str,
-) -> io::Result<()> {
-    let SelectInput::Dram(buffer) = input else {
-        return Ok(());
-    };
-    validate_buffer(buffer, dtype, shape, expected_tiles, name)
 }
 
 fn validate_buffer(
