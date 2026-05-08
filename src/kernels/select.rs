@@ -6,8 +6,9 @@ use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
 use std::io;
 
 const READER: &str = include_str!("../../kernels/select_reader.cc");
+const SCALAR_READER: &str = include_str!("../../kernels/select_scalar_reader.cc");
 const COMPUTE: &str = include_str!("../../kernels/select_compute.cc");
-const WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
+const WRITER: &str = include_str!("../../kernels/select_writer.cc");
 const READER_PRED_ADDR_INDEX: usize = 0;
 const READER_TRUE_ADDR_INDEX: usize = 1;
 const READER_FALSE_ADDR_INDEX: usize = 2;
@@ -23,10 +24,10 @@ pub(crate) enum SelectInput<'a> {
     Constant(u32),
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct SelectProgramKey {
-    core: CoreCoord,
     tile_count: u32,
+    cores: Vec<CoreCoord>,
     value_dtype: DType,
 }
 
@@ -42,11 +43,11 @@ struct SelectKernel {
 
 impl Kernel<SelectProgramKey> for SelectKernel {
     fn program_key(&self) -> SelectProgramKey {
-        self.key
+        self.key.clone()
     }
 
     fn build_program(&self) -> io::Result<Program> {
-        select_program(self.key)
+        select_program(self.key.clone())
     }
 
     #[inline]
@@ -86,11 +87,7 @@ pub(crate) fn select(
 
     let tile_count = u32::try_from(output_tiles)
         .map_err(|_| invalid_input(format!("tile count does not fit in u32: {output_tiles}")))?;
-    let core = device
-        .cores_ref()
-        .first()
-        .copied()
-        .ok_or_else(|| invalid_input("no worker cores are available"))?;
+    let cores = select_cores(device.cores_ref(), output_tiles)?;
     let output_shape = allocation_shape(shape)?;
     let output = device.alloc(output_tiles, value_dtype, &output_shape, name)?;
     let kernel = SelectKernel {
@@ -101,8 +98,8 @@ pub(crate) fn select(
         false_constant: input_constant(on_false),
         output_addr: u32_arg(output.addr, "output address")?,
         key: SelectProgramKey {
-            core,
             tile_count,
+            cores,
             value_dtype,
         },
     };
@@ -198,6 +195,32 @@ fn input_constant(input: SelectInput<'_>) -> Option<u32> {
     }
 }
 
+fn select_cores(available: &[CoreCoord], tile_count: usize) -> io::Result<Vec<CoreCoord>> {
+    let n_cores = available.len().min(tile_count.max(1)).max(1);
+    available
+        .get(..n_cores)
+        .map(|cores| cores.to_vec())
+        .ok_or_else(|| invalid_input("no worker cores are available"))
+}
+
+fn tile_range(tile_count: u32, core_index: usize, n_cores: usize) -> io::Result<(u32, u32)> {
+    let tile_count = usize::try_from(tile_count)
+        .map_err(|_| invalid_input(format!("tile count does not fit in usize: {tile_count}")))?;
+    let base = tile_count / n_cores;
+    let remainder = tile_count % n_cores;
+    let count = base + usize::from(core_index < remainder);
+    let offset = core_index
+        .checked_mul(base)
+        .and_then(|value| value.checked_add(core_index.min(remainder)))
+        .ok_or_else(|| invalid_input("tile range offset overflow"))?;
+    Ok((
+        u32::try_from(offset)
+            .map_err(|_| invalid_input(format!("tile offset does not fit in u32: {offset}")))?,
+        u32::try_from(count)
+            .map_err(|_| invalid_input(format!("tile count does not fit in u32: {count}")))?,
+    ))
+}
+
 #[allow(clippy::manual_is_multiple_of)]
 fn shape_tile_count(shape: &[usize]) -> io::Result<usize> {
     if shape.is_empty() {
@@ -223,6 +246,7 @@ fn shape_tile_count(shape: &[usize]) -> io::Result<usize> {
 }
 
 fn select_program(key: SelectProgramKey) -> io::Result<Program> {
+    let compute_select = uses_compute_select(key.value_dtype);
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
         vec![WRITER_OUTPUT_ADDR_INDEX],
@@ -235,34 +259,56 @@ fn select_program(key: SelectProgramKey) -> io::Result<Program> {
         ],
         Vec::new(),
     );
-    runtime_args.add_core(
-        key.core,
-        vec![0, 0, key.tile_count],
-        vec![0, 0, 0, 0, key.tile_count, 0, 0],
-        vec![key.tile_count],
-    )?;
+    for (core_index, &core) in key.cores.iter().enumerate() {
+        let (offset, n_tiles) = tile_range(key.tile_count, core_index, key.cores.len())?;
+        runtime_args.add_core(
+            core,
+            vec![0, offset, n_tiles],
+            vec![0, 0, 0, offset, n_tiles, 0, 0],
+            if compute_select {
+                vec![n_tiles]
+            } else {
+                Vec::new()
+            },
+        )?;
+    }
     let runtime_args = runtime_args.build()?;
+    let mut cbs = vec![
+        CBConfig::new(1, key.value_dtype),
+        CBConfig::new(2, key.value_dtype),
+        CBConfig::new(16, key.value_dtype),
+    ];
+    if compute_select {
+        cbs.push(CBConfig::new(0, DType::UInt8));
+    }
     Ok(Program {
-        reader_kernel: READER.to_owned(),
-        compute_kernel: COMPUTE.to_owned(),
+        reader_kernel: if compute_select {
+            READER.to_owned()
+        } else {
+            SCALAR_READER.to_owned()
+        },
+        compute_kernel: if compute_select {
+            COMPUTE.to_owned()
+        } else {
+            String::new()
+        },
         writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
-            cbs: vec![
-                CBConfig::new(1, key.value_dtype),
-                CBConfig::new(2, key.value_dtype),
-                CBConfig::new(3, key.value_dtype),
-                CBConfig::new(4, key.value_dtype),
-                CBConfig::new(16, key.value_dtype),
-            ],
-            dst_accum_mode: matches!(
-                key.value_dtype,
-                DType::Int32 | DType::UInt32 | DType::Float32
-            ),
+            cbs,
+            dst_accum_mode: compute_select
+                || matches!(
+                    key.value_dtype,
+                    DType::Int32 | DType::UInt32 | DType::Float32
+                ),
             ..CompileConfig::default()
         },
         name: format!("select_{:?}", key.value_dtype),
         ..Program::new(runtime_args)
     })
+}
+
+fn uses_compute_select(dtype: DType) -> bool {
+    matches!(dtype, DType::Float16B | DType::Float32)
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
