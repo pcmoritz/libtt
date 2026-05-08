@@ -6,7 +6,6 @@ use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
 use std::io;
 
 const READER: &str = include_str!("../../kernels/select_reader.cc");
-const SCALAR_READER: &str = include_str!("../../kernels/select_scalar_reader.cc");
 const COMPUTE: &str = include_str!("../../kernels/select_compute.cc");
 const WRITER: &str = include_str!("../../kernels/select_writer.cc");
 const READER_PRED_ADDR_INDEX: usize = 0;
@@ -80,6 +79,7 @@ pub(crate) fn select(
     shape: &[usize],
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
+    validate_value_dtype(value_dtype)?;
     let output_tiles = shape_tile_count(shape)?;
     validate_pred(pred, shape, output_tiles)?;
     validate_value(on_true, value_dtype, shape, output_tiles, "on_true")?;
@@ -108,25 +108,17 @@ pub(crate) fn select(
 }
 
 fn validate_pred(pred: &DramBuffer, shape: &[usize], expected_tiles: usize) -> io::Result<()> {
-    if pred.dtype != DType::UInt8 {
-        return Err(invalid_input(format!(
-            "predicate requires UInt8 input, got {:?}",
-            pred.dtype
-        )));
+    validate_buffer(pred, DType::UInt8, shape, expected_tiles, "predicate")
+}
+
+fn validate_value_dtype(dtype: DType) -> io::Result<()> {
+    if matches!(dtype, DType::Float16B | DType::Float32) {
+        Ok(())
+    } else {
+        Err(invalid_input(format!(
+            "select currently supports Float16B and Float32 values, got {dtype:?}"
+        )))
     }
-    if !buffer_shape_matches(&pred.shape, shape)? {
-        return Err(invalid_input(format!(
-            "predicate shape mismatch: got {:?}, expected {:?}",
-            pred.shape, shape
-        )));
-    }
-    if pred.num_tiles != expected_tiles {
-        return Err(invalid_input(format!(
-            "predicate tile count mismatch: got {}, expected {expected_tiles}",
-            pred.num_tiles
-        )));
-    }
-    Ok(())
 }
 
 fn validate_value(
@@ -139,6 +131,16 @@ fn validate_value(
     let SelectInput::Dram(buffer) = input else {
         return Ok(());
     };
+    validate_buffer(buffer, dtype, shape, expected_tiles, name)
+}
+
+fn validate_buffer(
+    buffer: &DramBuffer,
+    dtype: DType,
+    shape: &[usize],
+    expected_tiles: usize,
+    name: &str,
+) -> io::Result<()> {
     if buffer.dtype != dtype {
         return Err(invalid_input(format!(
             "{name} requires {:?} input, got {:?}",
@@ -196,11 +198,11 @@ fn input_constant(input: SelectInput<'_>) -> Option<u32> {
 }
 
 fn select_cores(available: &[CoreCoord], tile_count: usize) -> io::Result<Vec<CoreCoord>> {
-    let n_cores = available.len().min(tile_count.max(1)).max(1);
-    available
-        .get(..n_cores)
-        .map(|cores| cores.to_vec())
-        .ok_or_else(|| invalid_input("no worker cores are available"))
+    if available.is_empty() {
+        return Err(invalid_input("no worker cores are available"));
+    }
+    let n_cores = available.len().min(tile_count.max(1));
+    Ok(available[..n_cores].to_vec())
 }
 
 fn tile_range(tile_count: u32, core_index: usize, n_cores: usize) -> io::Result<(u32, u32)> {
@@ -246,7 +248,6 @@ fn shape_tile_count(shape: &[usize]) -> io::Result<usize> {
 }
 
 fn select_program(key: SelectProgramKey) -> io::Result<Program> {
-    let compute_select = uses_compute_select(key.value_dtype);
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
         vec![WRITER_OUTPUT_ADDR_INDEX],
@@ -265,50 +266,27 @@ fn select_program(key: SelectProgramKey) -> io::Result<Program> {
             core,
             vec![0, offset, n_tiles],
             vec![0, 0, 0, offset, n_tiles, 0, 0],
-            if compute_select {
-                vec![n_tiles]
-            } else {
-                Vec::new()
-            },
+            vec![n_tiles],
         )?;
     }
     let runtime_args = runtime_args.build()?;
-    let mut cbs = vec![
-        CBConfig::new(1, key.value_dtype),
-        CBConfig::new(2, key.value_dtype),
-        CBConfig::new(16, key.value_dtype),
-    ];
-    if compute_select {
-        cbs.push(CBConfig::new(0, DType::UInt8));
-    }
     Ok(Program {
-        reader_kernel: if compute_select {
-            READER.to_owned()
-        } else {
-            SCALAR_READER.to_owned()
-        },
-        compute_kernel: if compute_select {
-            COMPUTE.to_owned()
-        } else {
-            String::new()
-        },
+        reader_kernel: READER.to_owned(),
+        compute_kernel: COMPUTE.to_owned(),
         writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
-            cbs,
-            dst_accum_mode: compute_select
-                || matches!(
-                    key.value_dtype,
-                    DType::Int32 | DType::UInt32 | DType::Float32
-                ),
+            cbs: vec![
+                CBConfig::new(0, DType::UInt8),
+                CBConfig::new(1, key.value_dtype),
+                CBConfig::new(2, key.value_dtype),
+                CBConfig::new(16, key.value_dtype),
+            ],
+            dst_accum_mode: true,
             ..CompileConfig::default()
         },
         name: format!("select_{:?}", key.value_dtype),
         ..Program::new(runtime_args)
     })
-}
-
-fn uses_compute_select(dtype: DType) -> bool {
-    matches!(dtype, DType::Float16B | DType::Float32)
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {

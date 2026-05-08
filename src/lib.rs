@@ -1885,12 +1885,9 @@ fn execute_executable_v1(
                     )));
                 }
                 let value_dtype = pjrt_buffer_type_to_dtype(true_desc.element_type)?;
-                if !matches!(
-                    value_dtype,
-                    DType::Float16B | DType::Float32 | DType::Int32 | DType::UInt32
-                ) {
+                if !matches!(value_dtype, DType::Float16B | DType::Float32) {
                     return Err(unimplemented(format!(
-                        "TT executable select currently supports bf16, f32, s32, and u32 values, got {:?}",
+                        "TT executable select currently supports bf16 and f32 values, got {:?}",
                         true_desc.element_type
                     )));
                 }
