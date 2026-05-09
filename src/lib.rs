@@ -373,10 +373,6 @@ fn host_byte_size(dtype: DType, dims: &[usize]) -> Result<usize, *mut PJRT_Error
         .ok_or_else(|| resource_exhausted("host buffer size overflow"))
 }
 
-fn tiled_allocation_shape(shape: &[usize]) -> Result<Vec<usize>, *mut PJRT_Error> {
-    dram::tiled_allocation_shape(shape).map_err(io_error)
-}
-
 fn padded_host_data(
     data: &[u8],
     dtype: DType,
@@ -1578,7 +1574,7 @@ fn store_output_buffer(
         )));
     }
     let logical_shape = dims_i64_to_usize(&expected.dims)?;
-    let allocation_shape = tiled_allocation_shape(&logical_shape)?;
+    let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
     if dram_buffer.shape != allocation_shape {
         return Err(invalid_argument(format!(
             "TT executable {op} output allocation shape mismatch: expected {:?}, got {:?}",
@@ -2288,7 +2284,7 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         // SAFETY: caller owns `data` for `byte_size` bytes during the call.
         unsafe { slice::from_raw_parts(args.data.cast::<u8>(), byte_size) }
     };
-    let allocation_shape = match tiled_allocation_shape(&shape) {
+    let allocation_shape = match dram::tiled_allocation_shape(&shape).map_err(io_error) {
         Ok(shape) => shape,
         Err(err) => return err,
     };
@@ -3275,27 +3271,29 @@ mod tests {
     #[test]
     fn tiled_allocation_shape_pads_scalar_and_vector_buffers() {
         assert_eq!(
-            tiled_allocation_shape(&[]).expect("scalar shape should pad"),
+            dram::tiled_allocation_shape(&[]).expect("scalar shape should pad"),
             vec![32, 32]
         );
         assert_eq!(
-            tiled_allocation_shape(&[5]).expect("vector shape should pad"),
+            dram::tiled_allocation_shape(&[5]).expect("vector shape should pad"),
             vec![32, 32]
         );
         assert_eq!(
-            tiled_allocation_shape(&[128]).expect("aligned vector shape should pad rank"),
+            dram::tiled_allocation_shape(&[128]).expect("aligned vector shape should pad rank"),
             vec![32, 128]
         );
         assert_eq!(
-            tiled_allocation_shape(&[32, 64]).expect("aligned rank-2 shape should be preserved"),
+            dram::tiled_allocation_shape(&[32, 64])
+                .expect("aligned rank-2 shape should be preserved"),
             vec![32, 64]
         );
         assert_eq!(
-            tiled_allocation_shape(&[32, 1]).expect("rank-2 shape should pad columns"),
+            dram::tiled_allocation_shape(&[32, 1]).expect("rank-2 shape should pad columns"),
             vec![32, 32]
         );
         assert_eq!(
-            tiled_allocation_shape(&[33, 33]).expect("rank-2 shape should pad rows and columns"),
+            dram::tiled_allocation_shape(&[33, 33])
+                .expect("rank-2 shape should pad rows and columns"),
             vec![64, 64]
         );
     }
