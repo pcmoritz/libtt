@@ -6,8 +6,8 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-const TILE_R: usize = 32;
-const TILE_C: usize = 32;
+pub(crate) const TILE_R: usize = 32;
+pub(crate) const TILE_C: usize = 32;
 const FACE_R: usize = 16;
 const FACE_C: usize = 16;
 type Shape = Vec<usize>;
@@ -36,6 +36,52 @@ impl DType {
     pub(crate) fn tile_size(self) -> usize {
         TILE_R * TILE_C * self.bytes_per_element()
     }
+}
+
+pub(crate) fn tiled_allocation_shape(shape: &[usize]) -> io::Result<Vec<usize>> {
+    match shape.len() {
+        0 => Ok(vec![TILE_R, TILE_C]),
+        1 => Ok(vec![TILE_R, round_up_to_tile_dim(shape[0])?]),
+        _ => {
+            let mut allocation_shape = shape.to_vec();
+            let rank = allocation_shape.len();
+            allocation_shape[rank - 2] = round_up_to_tile_dim(allocation_shape[rank - 2])?;
+            allocation_shape[rank - 1] = round_up_to_tile_dim(allocation_shape[rank - 1])?;
+            Ok(allocation_shape)
+        }
+    }
+}
+
+pub(crate) fn tiled_shape_tile_count(shape: &[usize]) -> io::Result<usize> {
+    let allocation_shape = tiled_allocation_shape(shape)?;
+    let rows = allocation_shape[allocation_shape.len() - 2];
+    let cols = allocation_shape[allocation_shape.len() - 1];
+    let tiles_per_batch = (rows / TILE_R)
+        .checked_mul(cols / TILE_C)
+        .ok_or_else(|| invalid_input("shape tile count is too large"))?;
+    allocation_shape[..allocation_shape.len() - 2]
+        .iter()
+        .try_fold(tiles_per_batch, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| invalid_input("shape tile count is too large"))
+}
+
+pub(crate) fn buffer_shape_matches(
+    buffer_shape: &[usize],
+    logical_shape: &[usize],
+) -> io::Result<bool> {
+    Ok(buffer_shape == logical_shape
+        || buffer_shape == tiled_allocation_shape(logical_shape)?.as_slice())
+}
+
+fn round_up_to_tile_dim(value: usize) -> io::Result<usize> {
+    value
+        .max(1)
+        .checked_next_multiple_of(TILE_C)
+        .ok_or_else(|| invalid_input("shape dimension overflow"))
+}
+
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

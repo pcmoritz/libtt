@@ -1,6 +1,8 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{DType, DramBuffer};
+use crate::dram::{
+    buffer_shape_matches, tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer,
+};
 use crate::executable::CompareDirection;
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
@@ -16,8 +18,6 @@ const READER_RHS_ADDR_INDEX: usize = 1;
 const READER_LHS_CONSTANT_INDEX: usize = 4;
 const READER_RHS_CONSTANT_INDEX: usize = 5;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
-const TILE_R: usize = 32;
-const TILE_C: usize = 32;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum BinaryEltwiseOp {
@@ -116,7 +116,7 @@ pub(crate) fn eltwise(
     shape: &[usize],
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
-    let output_tiles = shape_tile_count(shape)?;
+    let output_tiles = tiled_shape_tile_count(shape)?;
     validate_input(lhs, input_dtype, shape, output_tiles, "lhs")?;
     validate_input(rhs, input_dtype, shape, output_tiles, "rhs")?;
 
@@ -130,7 +130,7 @@ pub(crate) fn eltwise(
         .copied()
         .ok_or_else(|| invalid_input("no worker cores are available"))?;
     let output_dtype = op.output_dtype(input_dtype);
-    let output_shape = allocation_shape(shape)?;
+    let output_shape = tiled_allocation_shape(shape)?;
     let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
     let output_addr = u32_arg(output.addr, "output address")?;
 
@@ -183,27 +183,6 @@ fn validate_input(
     Ok(())
 }
 
-fn buffer_shape_matches(buffer_shape: &[usize], logical_shape: &[usize]) -> io::Result<bool> {
-    if buffer_shape == logical_shape {
-        return Ok(true);
-    }
-    Ok(buffer_shape == allocation_shape(logical_shape)?.as_slice())
-}
-
-fn allocation_shape(shape: &[usize]) -> io::Result<Vec<usize>> {
-    match shape.len() {
-        0 => Ok(vec![TILE_R, TILE_C]),
-        1 => Ok(vec![
-            TILE_R,
-            shape[0]
-                .max(1)
-                .checked_next_multiple_of(TILE_C)
-                .ok_or_else(|| invalid_input("shape dimension overflow"))?,
-        ]),
-        _ => Ok(shape.to_vec()),
-    }
-}
-
 fn input_addr(input: EltwiseInput<'_>, name: &str) -> io::Result<u32> {
     match input {
         EltwiseInput::Dram(buffer) => u32_arg(buffer.addr, name),
@@ -216,30 +195,6 @@ fn input_constant(input: EltwiseInput<'_>) -> Option<u32> {
         EltwiseInput::Dram(_) => None,
         EltwiseInput::Constant(value) => Some(value),
     }
-}
-
-#[allow(clippy::manual_is_multiple_of)]
-fn shape_tile_count(shape: &[usize]) -> io::Result<usize> {
-    if shape.is_empty() {
-        return Ok(1);
-    }
-    if shape.len() == 1 {
-        return Ok(shape[0].div_ceil(TILE_C));
-    }
-    let rows = shape[shape.len() - 2];
-    let cols = shape[shape.len() - 1];
-    if rows % TILE_R != 0 || cols % TILE_C != 0 {
-        return Err(invalid_input(format!(
-            "shape rows/cols must be multiples of {TILE_R}x{TILE_C}"
-        )));
-    }
-    let tiles_per_batch = (rows / TILE_R)
-        .checked_mul(cols / TILE_C)
-        .ok_or_else(|| invalid_input("shape tile count is too large"))?;
-    shape[..shape.len() - 2]
-        .iter()
-        .try_fold(tiles_per_batch, |acc, &dim| acc.checked_mul(dim))
-        .ok_or_else(|| invalid_input("shape tile count is too large"))
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {

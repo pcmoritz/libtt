@@ -143,7 +143,6 @@ unsafe impl Sync for PJRT_Api {}
 
 #[cfg(libtt_mlir_frontend)]
 const EXECUTABLE_NAME: &str = "tt.executable.v1";
-const TILED_BUFFER_DIM: usize = 32;
 
 impl PJRT_Client {
     fn new() -> Self {
@@ -374,19 +373,8 @@ fn host_byte_size(dtype: DType, dims: &[usize]) -> Result<usize, *mut PJRT_Error
         .ok_or_else(|| resource_exhausted("host buffer size overflow"))
 }
 
-fn round_up_to_tiled_dim(dim: usize) -> Result<usize, *mut PJRT_Error> {
-    dim.max(1)
-        .checked_add(TILED_BUFFER_DIM - 1)
-        .map(|value| value / TILED_BUFFER_DIM * TILED_BUFFER_DIM)
-        .ok_or_else(|| resource_exhausted("shape dimension overflow"))
-}
-
 fn tiled_allocation_shape(shape: &[usize]) -> Result<Vec<usize>, *mut PJRT_Error> {
-    match shape.len() {
-        0 => Ok(vec![TILED_BUFFER_DIM, TILED_BUFFER_DIM]),
-        1 => Ok(vec![TILED_BUFFER_DIM, round_up_to_tiled_dim(shape[0])?]),
-        _ => Ok(shape.to_vec()),
-    }
+    dram::tiled_allocation_shape(shape).map_err(io_error)
 }
 
 fn padded_host_data(
@@ -406,8 +394,99 @@ fn padded_host_data(
         ));
     }
     let mut padded = vec![0u8; allocation_size];
-    padded[..data.len()].copy_from_slice(data);
+    if logical_shape.len() < 2 {
+        padded[..data.len()].copy_from_slice(data);
+        return Ok(Some(padded));
+    }
+
+    copy_between_host_shapes(
+        data,
+        &mut padded,
+        dtype,
+        logical_shape,
+        allocation_shape,
+        logical_shape,
+    )?;
     Ok(Some(padded))
+}
+
+fn copy_between_host_shapes(
+    source: &[u8],
+    target: &mut [u8],
+    dtype: DType,
+    source_shape: &[usize],
+    target_shape: &[usize],
+    copy_shape: &[usize],
+) -> Result<(), *mut PJRT_Error> {
+    if source_shape.len() != target_shape.len() || source_shape.len() != copy_shape.len() {
+        return Err(invalid_argument(
+            "rank must match when copying between padded host shapes",
+        ));
+    }
+    if copy_shape.len() < 2 {
+        return Err(invalid_argument(
+            "padded host shape copy requires rank >= 2",
+        ));
+    }
+    if copy_shape
+        .iter()
+        .zip(source_shape.iter().zip(target_shape))
+        .any(|(copy, (source, target))| copy > source || copy > target)
+    {
+        return Err(invalid_argument(
+            "copy shape exceeds source or target shape",
+        ));
+    }
+
+    let source_size = host_byte_size(dtype, source_shape)?;
+    let target_size = host_byte_size(dtype, target_shape)?;
+    if source.len() != source_size || target.len() != target_size {
+        return Err(invalid_argument(
+            "host buffer size does not match row-major shape",
+        ));
+    }
+
+    let rank = copy_shape.len();
+    let copy_rows = copy_shape[rank - 2];
+    let copy_cols = copy_shape[rank - 1];
+    let source_rows = source_shape[rank - 2];
+    let source_cols = source_shape[rank - 1];
+    let target_rows = target_shape[rank - 2];
+    let target_cols = target_shape[rank - 1];
+    let batch = copy_shape[..rank - 2]
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| resource_exhausted("shape dimensions overflow"))?;
+    let bytes_per_element = dtype.bytes_per_element();
+    let row_bytes = copy_cols
+        .checked_mul(bytes_per_element)
+        .ok_or_else(|| resource_exhausted("shape dimensions overflow"))?;
+
+    for batch_index in 0..batch {
+        for row in 0..copy_rows {
+            let source_element = (batch_index * source_rows + row)
+                .checked_mul(source_cols)
+                .ok_or_else(|| resource_exhausted("shape dimensions overflow"))?;
+            let target_element = (batch_index * target_rows + row)
+                .checked_mul(target_cols)
+                .ok_or_else(|| resource_exhausted("shape dimensions overflow"))?;
+            let source_start = source_element
+                .checked_mul(bytes_per_element)
+                .ok_or_else(|| resource_exhausted("shape dimensions overflow"))?;
+            let target_start = target_element
+                .checked_mul(bytes_per_element)
+                .ok_or_else(|| resource_exhausted("shape dimensions overflow"))?;
+            let source_end = source_start
+                .checked_add(row_bytes)
+                .ok_or_else(|| resource_exhausted("shape dimensions overflow"))?;
+            let target_end = target_start
+                .checked_add(row_bytes)
+                .ok_or_else(|| resource_exhausted("shape dimensions overflow"))?;
+            target[target_start..target_end].copy_from_slice(&source[source_start..source_end]);
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_dense_row_major_strides(
@@ -468,12 +547,26 @@ fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_
     let dtype = pjrt_buffer_type_to_dtype(buffer.buffer_type)?;
     let dims = dims_i64_to_usize(&buffer.dims)?;
     let byte_size = host_byte_size(dtype, &dims)?;
-    let mut data = read_buffer_bytes(buffer)?;
+    let allocation_shape = buffer
+        .dram_buffer
+        .as_ref()
+        .map(|dram_buffer| dram_buffer.shape.clone())
+        .ok_or_else(|| {
+            pjrt_error(
+                "buffer has been deleted",
+                PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+            )
+        })?;
+    let data = read_buffer_bytes(buffer)?;
     if data.len() == byte_size {
         return Ok(data);
     }
     if buffer.dims.len() < 2 && data.len() >= byte_size {
+        let mut data = data;
         data.truncate(byte_size);
+        return Ok(data);
+    }
+    if let Some(data) = crop_padded_host_data(&data, dtype, &dims, &allocation_shape)? {
         return Ok(data);
     }
     Err(pjrt_error(
@@ -484,6 +577,34 @@ fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_
         ),
         PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
     ))
+}
+
+fn crop_padded_host_data(
+    data: &[u8],
+    dtype: DType,
+    logical_shape: &[usize],
+    allocation_shape: &[usize],
+) -> Result<Option<Vec<u8>>, *mut PJRT_Error> {
+    if logical_shape.len() < 2 || logical_shape.len() != allocation_shape.len() {
+        return Ok(None);
+    }
+
+    let logical_size = host_byte_size(dtype, logical_shape)?;
+    let allocation_size = host_byte_size(dtype, allocation_shape)?;
+    if data.len() != allocation_size {
+        return Ok(None);
+    }
+
+    let mut out = vec![0u8; logical_size];
+    copy_between_host_shapes(
+        data,
+        &mut out,
+        dtype,
+        allocation_shape,
+        logical_shape,
+        logical_shape,
+    )?;
+    Ok(Some(out))
 }
 
 fn with_device<T>(
@@ -1456,6 +1577,14 @@ fn store_output_buffer(
             expected.element_type, dram_buffer.dtype
         )));
     }
+    let logical_shape = dims_i64_to_usize(&expected.dims)?;
+    let allocation_shape = tiled_allocation_shape(&logical_shape)?;
+    if dram_buffer.shape != allocation_shape {
+        return Err(invalid_argument(format!(
+            "TT executable {op} output allocation shape mismatch: expected {:?}, got {:?}",
+            allocation_shape, dram_buffer.shape
+        )));
+    }
     values[output_index] = Some(PJRT_Buffer {
         buffer_type: expected.element_type,
         dims: expected.dims.clone(),
@@ -1667,17 +1796,14 @@ fn execute_broadcast_in_dim(
             "TT executable broadcast input and output element types must match",
         ));
     }
-    if !(input_desc.dims.len() == 1
-        && output_desc.dims.len() == 2
-        && broadcast_dimensions == [0_i64]
-        && output_desc.dims[0] == input_desc.dims[0]
-        && output_desc.dims[1] == 1)
-    {
-        return Err(unimplemented(format!(
-            "TT executable broadcast_in_dim currently supports vector-to-column broadcasts only, got input {:?}, output {:?}, dims {:?}",
-            input_desc.dims, output_desc.dims, broadcast_dimensions
-        )));
-    }
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let broadcast_plan = kernels::broadcast::BroadcastInDimPlan::new(
+        &input_shape,
+        &output_shape,
+        broadcast_dimensions,
+    )
+    .map_err(io_error)?;
 
     let input = device_buffer_for_value(values, input_id, "broadcast_in_dim.operand")?;
     let Some(input_dram) = input.dram_buffer.as_ref() else {
@@ -1686,11 +1812,15 @@ fn execute_broadcast_in_dim(
         ));
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    let rows = dims_i64_to_usize(&[output_desc.dims[0]])?[0];
     let output_dims = output_desc.dims.clone();
-    let output_dram =
-        kernels::broadcast::vector_to_column(device, input_dram, rows, dtype, "pjrt_broadcast")
-            .map_err(io_error)?;
+    let output_dram = kernels::broadcast::broadcast_in_dim(
+        device,
+        input_dram,
+        &broadcast_plan,
+        dtype,
+        "pjrt_broadcast",
+    )
+    .map_err(io_error)?;
     store_output_buffer(
         values,
         plan,
@@ -3157,8 +3287,16 @@ mod tests {
             vec![32, 128]
         );
         assert_eq!(
-            tiled_allocation_shape(&[32, 64]).expect("rank-2 shape should be preserved"),
+            tiled_allocation_shape(&[32, 64]).expect("aligned rank-2 shape should be preserved"),
             vec![32, 64]
+        );
+        assert_eq!(
+            tiled_allocation_shape(&[32, 1]).expect("rank-2 shape should pad columns"),
+            vec![32, 32]
+        );
+        assert_eq!(
+            tiled_allocation_shape(&[33, 33]).expect("rank-2 shape should pad rows and columns"),
+            vec![64, 64]
         );
     }
 
@@ -3170,6 +3308,46 @@ mod tests {
             .expect("padding should be required");
         assert_eq!(&padded[..data.len()], data);
         assert!(padded[data.len()..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn padded_host_data_preserves_logical_matrix_shape() {
+        let data = [1u16, 2, 3, 4, 5, 6]
+            .into_iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let padded = padded_host_data(&data, DType::UInt16, &[3, 2], &[32, 32])
+            .expect("matrix payload should pad")
+            .expect("padding should be required");
+
+        let value_at = |row: usize, col: usize| {
+            let offset = (row * 32 + col) * 2;
+            u16::from_le_bytes([padded[offset], padded[offset + 1]])
+        };
+        assert_eq!(value_at(0, 0), 1);
+        assert_eq!(value_at(0, 1), 2);
+        assert_eq!(value_at(1, 0), 3);
+        assert_eq!(value_at(1, 1), 4);
+        assert_eq!(value_at(2, 0), 5);
+        assert_eq!(value_at(2, 1), 6);
+        assert_eq!(value_at(0, 2), 0);
+    }
+
+    #[test]
+    fn crop_padded_host_data_preserves_logical_matrix_shape() {
+        let values = (0u16..(32 * 32)).collect::<Vec<_>>();
+        let data = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let cropped = crop_padded_host_data(&data, DType::UInt16, &[3, 1], &[32, 32])
+            .expect("crop should not fail")
+            .expect("crop should be possible");
+        let expected = [0u16, 32, 64]
+            .into_iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(cropped, expected);
     }
 
     #[test]
