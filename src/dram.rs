@@ -41,12 +41,12 @@ impl DType {
 pub(crate) fn tiled_allocation_shape(shape: &[usize]) -> io::Result<Vec<usize>> {
     match shape.len() {
         0 => Ok(vec![TILE_R, TILE_C]),
-        1 => Ok(vec![TILE_R, round_up_to_tile_dim(shape[0])?]),
+        1 => Ok(vec![TILE_R, round_up_to_tile_dim(shape[0], TILE_C)?]),
         _ => {
             let mut allocation_shape = shape.to_vec();
             let rank = allocation_shape.len();
-            allocation_shape[rank - 2] = round_up_to_tile_dim(allocation_shape[rank - 2])?;
-            allocation_shape[rank - 1] = round_up_to_tile_dim(allocation_shape[rank - 1])?;
+            allocation_shape[rank - 2] = round_up_to_tile_dim(allocation_shape[rank - 2], TILE_R)?;
+            allocation_shape[rank - 1] = round_up_to_tile_dim(allocation_shape[rank - 1], TILE_C)?;
             Ok(allocation_shape)
         }
     }
@@ -65,10 +65,10 @@ pub(crate) fn tiled_shape_tile_count(shape: &[usize]) -> io::Result<usize> {
         .ok_or_else(|| invalid_input("shape tile count is too large"))
 }
 
-fn round_up_to_tile_dim(value: usize) -> io::Result<usize> {
+fn round_up_to_tile_dim(value: usize, tile_dim: usize) -> io::Result<usize> {
     value
         .max(1)
-        .checked_next_multiple_of(TILE_C)
+        .checked_next_multiple_of(tile_dim)
         .ok_or_else(|| invalid_input("shape dimension overflow"))
 }
 
