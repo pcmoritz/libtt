@@ -2,7 +2,7 @@ use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
 use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C};
 use crate::hw::CoreCoord;
-use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
 use std::io;
 
 const BROADCAST_READER: &str = include_str!("../../kernels/broadcast_reader.cc");
@@ -87,9 +87,9 @@ impl BroadcastInDimPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct BroadcastProgramKey {
-    core: CoreCoord,
+    cores: Vec<CoreCoord>,
     dtype: DType,
     shape: BroadcastKernelShape,
 }
@@ -102,11 +102,11 @@ struct BroadcastKernel {
 
 impl Kernel<BroadcastProgramKey> for BroadcastKernel {
     fn program_key(&self) -> BroadcastProgramKey {
-        self.key
+        self.key.clone()
     }
 
     fn build_program(&self) -> io::Result<Program> {
-        broadcast_program(self.key)
+        broadcast_program(self.key.clone())
     }
 
     #[inline]
@@ -155,22 +155,23 @@ pub(crate) fn broadcast_in_dim(
         )));
     }
 
-    let core = device
-        .cores_ref()
-        .first()
-        .copied()
-        .ok_or_else(|| invalid_input("no worker cores are available"))?;
     let shape = plan.kernel_shape();
-    let output = device.alloc(
-        shape.tile_count as usize,
-        dtype,
-        &plan.output_allocation_shape,
-        name,
-    )?;
+    let output_tiles = usize::try_from(shape.tile_count).map_err(|_| {
+        invalid_input(format!(
+            "tile count does not fit in usize: {}",
+            shape.tile_count
+        ))
+    })?;
+    let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
+    let output = device.alloc(output_tiles, dtype, &plan.output_allocation_shape, name)?;
     let kernel = BroadcastKernel {
         input_addr: u32_addr(input.addr, "input address")?,
         output_addr: u32_addr(output.addr, "output address")?,
-        key: BroadcastProgramKey { core, dtype, shape },
+        key: BroadcastProgramKey {
+            cores,
+            dtype,
+            shape,
+        },
     };
     kernel.run(device)?;
     Ok(output)
@@ -183,18 +184,22 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
         vec![READER_INPUT_ADDR_INDEX],
         Vec::new(),
     );
-    runtime_args.add_core(
-        key.core,
-        vec![0, 0, key.shape.tile_count],
-        vec![
-            0,
-            0,
-            key.shape.tile_count,
-            key.shape.mode.reader_mode_arg(),
-            key.shape.output_tiles_per_row,
-        ],
-        vec![key.shape.tile_count],
-    )?;
+    for (core_index, &core) in key.cores.iter().enumerate() {
+        let (offset, n_tiles) =
+            split_tile_range(key.shape.tile_count, core_index, key.cores.len())?;
+        runtime_args.add_core(
+            core,
+            vec![0, offset, n_tiles],
+            vec![
+                0,
+                offset,
+                n_tiles,
+                key.shape.mode.reader_mode_arg(),
+                key.shape.output_tiles_per_row,
+            ],
+            vec![n_tiles],
+        )?;
+    }
     let runtime_args = runtime_args.build()?;
     Ok(Program {
         reader_kernel: BROADCAST_READER.to_owned(),
@@ -374,6 +379,15 @@ fn u32_addr(value: u64, name: &str) -> io::Result<u32> {
 mod tests {
     use super::*;
 
+    fn arg_u32(blob: &[u8], index: usize) -> u32 {
+        let start = index * std::mem::size_of::<u32>();
+        u32::from_le_bytes(
+            blob[start..start + std::mem::size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
     #[test]
     fn broadcast_plan_normalizes_rank1_column_case() {
         let plan = BroadcastInDimPlan::new(&[32], &[32, 1], &[0]).expect("valid broadcast");
@@ -411,5 +425,35 @@ mod tests {
             .expect_err("unsupported native broadcast should fail");
 
         assert!(err.to_string().contains("transpose+broadcast"));
+    }
+
+    #[test]
+    fn broadcast_program_splits_tiles_across_cores() {
+        let program = broadcast_program(BroadcastProgramKey {
+            cores: vec![
+                CoreCoord { x: 1, y: 2 },
+                CoreCoord { x: 1, y: 3 },
+                CoreCoord { x: 1, y: 4 },
+            ],
+            dtype: DType::Float16B,
+            shape: BroadcastKernelShape {
+                output_tiles_per_row: 2,
+                tile_count: 5,
+                mode: BroadcastMode::Copy,
+            },
+        })
+        .expect("broadcast program");
+
+        assert_eq!(program.runtime_args.cores().len(), 3);
+        let blobs = program.runtime_args.blobs();
+        assert_eq!((arg_u32(&blobs[0], 1), arg_u32(&blobs[0], 2)), (0, 2));
+        assert_eq!((arg_u32(&blobs[1], 1), arg_u32(&blobs[1], 2)), (2, 2));
+        assert_eq!((arg_u32(&blobs[2], 1), arg_u32(&blobs[2], 2)), (4, 1));
+        assert_eq!((arg_u32(&blobs[0], 4), arg_u32(&blobs[0], 5)), (0, 2));
+        assert_eq!((arg_u32(&blobs[1], 4), arg_u32(&blobs[1], 5)), (2, 2));
+        assert_eq!((arg_u32(&blobs[2], 4), arg_u32(&blobs[2], 5)), (4, 1));
+        assert_eq!(arg_u32(&blobs[0], 8), 2);
+        assert_eq!(arg_u32(&blobs[1], 8), 2);
+        assert_eq!(arg_u32(&blobs[2], 8), 1);
     }
 }
