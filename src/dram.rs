@@ -65,14 +65,6 @@ pub(crate) fn tiled_shape_tile_count(shape: &[usize]) -> io::Result<usize> {
         .ok_or_else(|| invalid_input("shape tile count is too large"))
 }
 
-pub(crate) fn buffer_shape_matches(
-    buffer_shape: &[usize],
-    logical_shape: &[usize],
-) -> io::Result<bool> {
-    Ok(buffer_shape == logical_shape
-        || buffer_shape == tiled_allocation_shape(logical_shape)?.as_slice())
-}
-
 fn round_up_to_tile_dim(value: usize) -> io::Result<usize> {
     value
         .max(1)
@@ -90,6 +82,7 @@ pub struct DramBuffer {
     pub addr: u64,
     pub num_tiles: usize,
     pub dtype: DType,
+    /// Physical allocation shape. The last two dimensions are tile-aligned.
     pub shape: Shape,
 }
 
@@ -165,6 +158,7 @@ impl Allocator {
         name: impl Into<String>,
         shape: Shape,
     ) -> io::Result<DramBuffer> {
+        validate_allocation_shape(num_tiles, &shape)?;
         let (addr, next) = next_allocation_range(self.next, num_tiles, dtype, self.bank_count)?;
         self.next = next;
         set_allocator_next(self.local_hardware_id, next);
@@ -557,6 +551,26 @@ fn validate_tiled_shape(
     Ok((batch, rows, cols, expected_len))
 }
 
+fn validate_allocation_shape(num_tiles: usize, shape: &[usize]) -> io::Result<()> {
+    if shape.len() < 2 {
+        return Err(invalid_input(
+            "dram buffer allocation shape must have at least two dimensions",
+        ));
+    }
+    if shape != tiled_allocation_shape(shape)?.as_slice() {
+        return Err(invalid_input(format!(
+            "dram buffer shape must be a tiled allocation shape, got {shape:?}"
+        )));
+    }
+    let shape_tiles = tiled_shape_tile_count(shape)?;
+    if shape_tiles != num_tiles {
+        return Err(invalid_input(format!(
+            "dram buffer tile count mismatch: shape {shape:?} requires {shape_tiles} tiles, got {num_tiles}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +620,20 @@ mod tests {
 
         assert_eq!(buffer.page_size(), 2048);
         assert_eq!(buffer.size(), 6144);
+    }
+
+    #[test]
+    fn allocation_shape_validation_rejects_logical_shape() {
+        let err = validate_allocation_shape(1, &[3, 2])
+            .expect_err("logical shape must not be accepted as allocation shape");
+        assert!(err.to_string().contains("tiled allocation shape"));
+    }
+
+    #[test]
+    fn allocation_shape_validation_checks_tile_count() {
+        let err = validate_allocation_shape(1, &[32, 64])
+            .expect_err("shape tile count must match allocation tile count");
+        assert!(err.to_string().contains("tile count mismatch"));
     }
 
     #[test]

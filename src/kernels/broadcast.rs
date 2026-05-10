@@ -1,8 +1,6 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{
-    buffer_shape_matches, tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C,
-};
+use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
 use std::io;
@@ -141,10 +139,11 @@ pub(crate) fn broadcast_in_dim(
             dtype, input.dtype
         )));
     }
-    if !buffer_shape_matches(&input.shape, &plan.input_shape)? {
+    let expected_input_shape = tiled_allocation_shape(&plan.input_shape)?;
+    if input.shape != expected_input_shape {
         return Err(invalid_input(format!(
-            "broadcast input shape mismatch: got {:?}, expected {:?}",
-            input.shape, plan.input_shape
+            "broadcast input allocation shape mismatch: got {:?}, expected {:?} for logical shape {:?}",
+            input.shape, expected_input_shape, plan.input_shape
         )));
     }
 

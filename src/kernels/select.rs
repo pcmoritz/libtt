@@ -1,8 +1,6 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{
-    buffer_shape_matches, tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer,
-};
+use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
 use std::io;
@@ -134,10 +132,11 @@ fn validate_buffer(
             dtype, buffer.dtype
         )));
     }
-    if !buffer_shape_matches(&buffer.shape, shape)? {
+    let expected_shape = tiled_allocation_shape(shape)?;
+    if buffer.shape != expected_shape {
         return Err(invalid_input(format!(
-            "{name} shape mismatch: got {:?}, expected {:?}",
-            buffer.shape, shape
+            "{name} allocation shape mismatch: got {:?}, expected {:?} for logical shape {:?}",
+            buffer.shape, expected_shape, shape
         )));
     }
     if buffer.num_tiles != expected_tiles {
