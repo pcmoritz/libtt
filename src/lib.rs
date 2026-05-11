@@ -527,27 +527,33 @@ fn event_for_buffer(buffer: &PJRT_Buffer) -> *mut PJRT_Event {
     }
 }
 
-fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
+fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
+    let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+        return Err(pjrt_error(
+            "buffer has been deleted",
+            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+        ));
+    };
     with_device_ptr(buffer.device, |device| {
-        read_buffer_logical_bytes_from_device(device, buffer)
+        device.dram_read(dram_buffer).map_err(io_error)
     })
 }
 
-fn read_buffer_logical_bytes_from_device(
-    device: &mut Device,
-    buffer: &PJRT_Buffer,
-) -> Result<Vec<u8>, *mut PJRT_Error> {
+fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
     let dtype = pjrt_buffer_type_to_dtype(buffer.buffer_type)?;
     let dims = dims_i64_to_usize(&buffer.dims)?;
     let byte_size = host_byte_size(dtype, &dims)?;
-    let dram_buffer = buffer.dram_buffer.as_ref().ok_or_else(|| {
-        pjrt_error(
-            "buffer has been deleted",
-            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
-        )
-    })?;
-    let allocation_shape = dram_buffer.shape.clone();
-    let data = device.dram_read(dram_buffer).map_err(io_error)?;
+    let allocation_shape = buffer
+        .dram_buffer
+        .as_ref()
+        .map(|dram_buffer| dram_buffer.shape.clone())
+        .ok_or_else(|| {
+            pjrt_error(
+                "buffer has been deleted",
+                PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+            )
+        })?;
+    let data = read_buffer_bytes(buffer)?;
     if data.len() == byte_size {
         return Ok(data);
     }
