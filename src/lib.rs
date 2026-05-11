@@ -2302,8 +2302,11 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     if args.num_devices != 1 {
         return unimplemented("only single-device execution is supported");
     }
-    if args.argument_lists.is_null() || args.output_lists.is_null() {
-        return invalid_argument("argument_lists and output_lists must not be null");
+    if args.num_args > 0 && args.argument_lists.is_null() {
+        return invalid_argument("argument_lists must not be null when num_args > 0");
+    }
+    if args.output_lists.is_null() {
+        return invalid_argument("output_lists must not be null");
     }
 
     let execute_device = if !args.execute_device.is_null() {
@@ -2322,13 +2325,13 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         return invalid_argument("execute_device must not be null");
     };
 
-    let device_args = unsafe { *args.argument_lists };
-    if device_args.is_null() {
-        return invalid_argument("argument_lists[0] must not be null");
-    }
     let input_ptrs = if args.num_args == 0 {
         &[][..]
     } else {
+        let device_args = unsafe { *args.argument_lists };
+        if device_args.is_null() {
+            return invalid_argument("argument_lists[0] must not be null when num_args > 0");
+        }
         unsafe { slice::from_raw_parts(device_args, args.num_args) }
     };
     let output_buffer =
