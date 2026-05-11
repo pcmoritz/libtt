@@ -9,6 +9,7 @@ use std::io;
 const READER: &str = include_str!("../../kernels/binary_eltwise_reader.cc");
 const WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
 const ADD_BF16_COMPUTE: &str = include_str!("../../kernels/add_compute.cc");
+const MULTIPLY_COMPUTE: &str = include_str!("../../kernels/multiply_compute.cc");
 const MAX_BF16_COMPUTE: &str = include_str!("../../kernels/max_compute.cc");
 const COMPARE_COMPUTE: &str = include_str!("../../kernels/compare_compute.cc");
 const READER_LHS_ADDR_INDEX: usize = 0;
@@ -20,6 +21,7 @@ const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum BinaryEltwiseOp {
     Add,
+    Multiply,
     Max,
     Compare(CompareDirection),
 }
@@ -28,6 +30,7 @@ impl BinaryEltwiseOp {
     fn compute_source(self, input_dtype: DType) -> io::Result<String> {
         match self {
             Self::Add => Ok(ADD_BF16_COMPUTE.to_owned()),
+            Self::Multiply => Ok(MULTIPLY_COMPUTE.to_owned()),
             Self::Max => Ok(MAX_BF16_COMPUTE.to_owned()),
             Self::Compare(direction) => compare_compute_source(input_dtype, direction),
         }
@@ -36,6 +39,7 @@ impl BinaryEltwiseOp {
     fn kernel_name(self, input_dtype: DType, output_dtype: DType) -> String {
         match self {
             Self::Add => format!("eltwise_add_{input_dtype:?}_{output_dtype:?}"),
+            Self::Multiply => format!("eltwise_multiply_{input_dtype:?}_{output_dtype:?}"),
             Self::Max => "eltwise_max_bf16".to_owned(),
             Self::Compare(direction) => {
                 format!("eltwise_compare_{direction:?}_{input_dtype:?}_{output_dtype:?}")
@@ -46,6 +50,7 @@ impl BinaryEltwiseOp {
     fn output_dtype(self, input_dtype: DType) -> DType {
         match self {
             Self::Add => input_dtype,
+            Self::Multiply => input_dtype,
             Self::Max => DType::Float16B,
             Self::Compare(_) => DType::UInt8,
         }
