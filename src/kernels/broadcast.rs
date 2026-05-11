@@ -1,8 +1,8 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C};
+use crate::dram::{DType, DramBuffer, TILE_C, tiled_allocation_shape, tiled_shape_tile_count};
 use crate::hw::CoreCoord;
-use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder, select_worker_cores, split_tile_range};
 use std::io;
 
 const BROADCAST_READER: &str = include_str!("../../kernels/broadcast_reader.cc");
@@ -28,22 +28,13 @@ enum BroadcastMode {
 }
 
 impl BroadcastMode {
-    fn reader_mode_arg(self) -> u32 {
+    fn cpp_variant(self) -> &'static str {
         match self {
-            Self::Copy => 0,
-            Self::Scalar => 1,
-            Self::Row => 2,
-            Self::Col | Self::Transpose => 3,
-        }
-    }
-
-    fn compute_op_arg(self) -> u32 {
-        match self {
-            Self::Copy => 0,
-            Self::Row => 1,
-            Self::Col => 2,
-            Self::Scalar => 3,
-            Self::Transpose => 4,
+            Self::Copy => "Copy",
+            Self::Scalar => "Scalar",
+            Self::Row => "Row",
+            Self::Col => "Col",
+            Self::Transpose => "Transpose",
         }
     }
 }
@@ -190,19 +181,13 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
         runtime_args.add_core(
             core,
             vec![0, offset, n_tiles],
-            vec![
-                0,
-                offset,
-                n_tiles,
-                key.shape.mode.reader_mode_arg(),
-                key.shape.output_tiles_per_row,
-            ],
+            vec![0, offset, n_tiles, key.shape.output_tiles_per_row],
             vec![n_tiles],
         )?;
     }
     let runtime_args = runtime_args.build()?;
     Ok(Program {
-        reader_kernel: BROADCAST_READER.to_owned(),
+        reader_kernel: broadcast_reader_source(key.shape.mode),
         compute_kernel: broadcast_compute_source(key.shape.mode),
         writer_kernel: BROADCAST_WRITER.to_owned(),
         compile: CompileConfig {
@@ -214,8 +199,12 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
     })
 }
 
+fn broadcast_reader_source(mode: BroadcastMode) -> String {
+    BROADCAST_READER.replace("BROADCAST_MODE", mode.cpp_variant())
+}
+
 fn broadcast_compute_source(mode: BroadcastMode) -> String {
-    BROADCAST_COMPUTE.replace("BROADCAST_COMPUTE_OP", &mode.compute_op_arg().to_string())
+    BROADCAST_COMPUTE.replace("BROADCAST_MODE", mode.cpp_variant())
 }
 
 fn validate_rank(shape: &[usize], name: &str) -> io::Result<()> {
@@ -452,8 +441,8 @@ mod tests {
         assert_eq!((arg_u32(&blobs[0], 4), arg_u32(&blobs[0], 5)), (0, 2));
         assert_eq!((arg_u32(&blobs[1], 4), arg_u32(&blobs[1], 5)), (2, 2));
         assert_eq!((arg_u32(&blobs[2], 4), arg_u32(&blobs[2], 5)), (4, 1));
-        assert_eq!(arg_u32(&blobs[0], 8), 2);
-        assert_eq!(arg_u32(&blobs[1], 8), 2);
-        assert_eq!(arg_u32(&blobs[2], 8), 1);
+        assert_eq!(arg_u32(&blobs[0], 7), 2);
+        assert_eq!(arg_u32(&blobs[1], 7), 2);
+        assert_eq!(arg_u32(&blobs[2], 7), 1);
     }
 }

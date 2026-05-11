@@ -4,27 +4,30 @@
 #include "compute_kernel_api.h"
 
 namespace NAMESPACE {
+enum class BroadcastMode {
+  Copy,
+  Scalar,
+  Row,
+  Col,
+  Transpose,
+};
+
 void MAIN {
   uint32_t n_tiles = get_arg_val<uint32_t>(0);
 
   constexpr uint32_t cb_input = tt::CBIndex::c_0;
   constexpr uint32_t cb_output = tt::CBIndex::c_16;
-  constexpr uint32_t kCopy = 0;
-  constexpr uint32_t kRow = 1;
-  constexpr uint32_t kCol = 2;
-  constexpr uint32_t kScalar = 3;
-  constexpr uint32_t kTranspose = 4;
-  constexpr uint32_t kOp = BROADCAST_COMPUTE_OP;
+  constexpr BroadcastMode mode = BroadcastMode::BROADCAST_MODE;
 
-  if constexpr (kOp == kCopy) {
+  if constexpr (mode == BroadcastMode::Copy) {
     unary_bcast_init<BroadcastType::NONE>(cb_input, cb_output);
-  } else if constexpr (kOp == kRow) {
+  } else if constexpr (mode == BroadcastMode::Row) {
     unary_bcast_init<BroadcastType::ROW>(cb_input, cb_output);
-  } else if constexpr (kOp == kCol) {
+  } else if constexpr (mode == BroadcastMode::Col) {
     unary_bcast_init<BroadcastType::COL>(cb_input, cb_output);
-  } else if constexpr (kOp == kScalar) {
+  } else if constexpr (mode == BroadcastMode::Scalar) {
     unary_bcast_init<BroadcastType::SCALAR>(cb_input, cb_output);
-  } else if constexpr (kOp == kTranspose) {
+  } else if constexpr (mode == BroadcastMode::Transpose) {
     transpose_wh_init(cb_input, cb_output);
   }
 
@@ -33,15 +36,15 @@ void MAIN {
     cb_reserve_back(cb_output, 1);
 
     tile_regs_acquire();
-    if constexpr (kOp == kCopy) {
+    if constexpr (mode == BroadcastMode::Copy) {
       unary_bcast<BroadcastType::NONE>(cb_input, 0, 0);
-    } else if constexpr (kOp == kRow) {
+    } else if constexpr (mode == BroadcastMode::Row) {
       unary_bcast<BroadcastType::ROW>(cb_input, 0, 0);
-    } else if constexpr (kOp == kCol) {
+    } else if constexpr (mode == BroadcastMode::Col) {
       unary_bcast<BroadcastType::COL>(cb_input, 0, 0);
-    } else if constexpr (kOp == kScalar) {
+    } else if constexpr (mode == BroadcastMode::Scalar) {
       unary_bcast<BroadcastType::SCALAR>(cb_input, 0, 0);
-    } else if constexpr (kOp == kTranspose) {
+    } else if constexpr (mode == BroadcastMode::Transpose) {
       transpose_wh_tile(cb_input, 0, 0);
     }
     tile_regs_commit();
