@@ -293,6 +293,48 @@ pub(crate) trait Kernel<K = ()> {
     }
 }
 
+pub(crate) fn select_worker_cores(
+    available: &[CoreCoord],
+    tile_count: usize,
+) -> io::Result<Vec<CoreCoord>> {
+    if available.is_empty() {
+        return Err(invalid_input("no worker cores are available"));
+    }
+    let n_cores = available.len().min(tile_count.max(1));
+    Ok(available[..n_cores].to_vec())
+}
+
+pub(crate) fn split_tile_range(
+    tile_count: u32,
+    core_index: usize,
+    n_cores: usize,
+) -> io::Result<(u32, u32)> {
+    if n_cores == 0 {
+        return Err(invalid_input("tile range requires at least one core"));
+    }
+    if core_index >= n_cores {
+        return Err(invalid_input(format!(
+            "core index {core_index} is out of range for {n_cores} cores"
+        )));
+    }
+
+    let tile_count = usize::try_from(tile_count)
+        .map_err(|_| invalid_input(format!("tile count does not fit in usize: {tile_count}")))?;
+    let base = tile_count / n_cores;
+    let remainder = tile_count % n_cores;
+    let count = base + usize::from(core_index < remainder);
+    let offset = core_index
+        .checked_mul(base)
+        .and_then(|value| value.checked_add(core_index.min(remainder)))
+        .ok_or_else(|| invalid_input("tile range offset overflow"))?;
+    Ok((
+        u32::try_from(offset)
+            .map_err(|_| invalid_input(format!("tile offset does not fit in u32: {offset}")))?,
+        u32::try_from(count)
+            .map_err(|_| invalid_input(format!("tile count does not fit in u32: {count}")))?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +367,12 @@ mod tests {
 
         assert_eq!(&runtime_args.blobs()[0][4..8], &0x1111u32.to_le_bytes());
         assert_eq!(&runtime_args.blobs()[0][8..12], &0x2222u32.to_le_bytes());
+    }
+
+    #[test]
+    fn split_tile_range_balances_remainder_across_early_cores() {
+        assert_eq!(split_tile_range(10, 0, 3).expect("range"), (0, 4));
+        assert_eq!(split_tile_range(10, 1, 3).expect("range"), (4, 3));
+        assert_eq!(split_tile_range(10, 2, 3).expect("range"), (7, 3));
     }
 }

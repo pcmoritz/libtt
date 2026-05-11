@@ -1,8 +1,8 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{DType, DramBuffer};
+use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
 use crate::hw::CoreCoord;
-use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
 use std::io;
 
 const READER: &str = include_str!("../../kernels/select_reader.cc");
@@ -14,8 +14,6 @@ const READER_FALSE_ADDR_INDEX: usize = 2;
 const READER_TRUE_CONSTANT_INDEX: usize = 5;
 const READER_FALSE_CONSTANT_INDEX: usize = 6;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
-const TILE_R: usize = 32;
-const TILE_C: usize = 32;
 
 #[derive(Clone, Copy)]
 pub(crate) enum SelectInput<'a> {
@@ -80,7 +78,7 @@ pub(crate) fn select(
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
     validate_value_dtype(value_dtype)?;
-    let output_tiles = shape_tile_count(shape)?;
+    let output_tiles = tiled_shape_tile_count(shape)?;
     validate_buffer(pred, DType::UInt8, shape, output_tiles, "predicate")?;
     if let SelectInput::Dram(buffer) = on_true {
         validate_buffer(buffer, value_dtype, shape, output_tiles, "on_true")?;
@@ -91,8 +89,8 @@ pub(crate) fn select(
 
     let tile_count = u32::try_from(output_tiles)
         .map_err(|_| invalid_input(format!("tile count does not fit in u32: {output_tiles}")))?;
-    let cores = select_cores(device.cores_ref(), output_tiles)?;
-    let output_shape = allocation_shape(shape)?;
+    let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
+    let output_shape = tiled_allocation_shape(shape)?;
     let output = device.alloc(output_tiles, value_dtype, &output_shape, name)?;
     let kernel = SelectKernel {
         pred_addr: u32_arg(pred.addr, "predicate address")?,
@@ -134,10 +132,11 @@ fn validate_buffer(
             dtype, buffer.dtype
         )));
     }
-    if !buffer_shape_matches(&buffer.shape, shape)? {
+    let expected_shape = tiled_allocation_shape(shape)?;
+    if buffer.shape != expected_shape {
         return Err(invalid_input(format!(
-            "{name} shape mismatch: got {:?}, expected {:?}",
-            buffer.shape, shape
+            "{name} allocation shape mismatch: got {:?}, expected {:?} for logical shape {:?}",
+            buffer.shape, expected_shape, shape
         )));
     }
     if buffer.num_tiles != expected_tiles {
@@ -147,27 +146,6 @@ fn validate_buffer(
         )));
     }
     Ok(())
-}
-
-fn buffer_shape_matches(buffer_shape: &[usize], logical_shape: &[usize]) -> io::Result<bool> {
-    if buffer_shape == logical_shape {
-        return Ok(true);
-    }
-    Ok(buffer_shape == allocation_shape(logical_shape)?.as_slice())
-}
-
-fn allocation_shape(shape: &[usize]) -> io::Result<Vec<usize>> {
-    match shape.len() {
-        0 => Ok(vec![TILE_R, TILE_C]),
-        1 => Ok(vec![
-            TILE_R,
-            shape[0]
-                .max(1)
-                .checked_next_multiple_of(TILE_C)
-                .ok_or_else(|| invalid_input("shape dimension overflow"))?,
-        ]),
-        _ => Ok(shape.to_vec()),
-    }
 }
 
 fn input_addr(input: SelectInput<'_>, name: &str) -> io::Result<u32> {
@@ -184,56 +162,6 @@ fn input_constant(input: SelectInput<'_>) -> Option<u32> {
     }
 }
 
-fn select_cores(available: &[CoreCoord], tile_count: usize) -> io::Result<Vec<CoreCoord>> {
-    if available.is_empty() {
-        return Err(invalid_input("no worker cores are available"));
-    }
-    let n_cores = available.len().min(tile_count.max(1));
-    Ok(available[..n_cores].to_vec())
-}
-
-fn tile_range(tile_count: u32, core_index: usize, n_cores: usize) -> io::Result<(u32, u32)> {
-    let tile_count = usize::try_from(tile_count)
-        .map_err(|_| invalid_input(format!("tile count does not fit in usize: {tile_count}")))?;
-    let base = tile_count / n_cores;
-    let remainder = tile_count % n_cores;
-    let count = base + usize::from(core_index < remainder);
-    let offset = core_index
-        .checked_mul(base)
-        .and_then(|value| value.checked_add(core_index.min(remainder)))
-        .ok_or_else(|| invalid_input("tile range offset overflow"))?;
-    Ok((
-        u32::try_from(offset)
-            .map_err(|_| invalid_input(format!("tile offset does not fit in u32: {offset}")))?,
-        u32::try_from(count)
-            .map_err(|_| invalid_input(format!("tile count does not fit in u32: {count}")))?,
-    ))
-}
-
-#[allow(clippy::manual_is_multiple_of)]
-fn shape_tile_count(shape: &[usize]) -> io::Result<usize> {
-    if shape.is_empty() {
-        return Ok(1);
-    }
-    if shape.len() == 1 {
-        return Ok(shape[0].div_ceil(TILE_C));
-    }
-    let rows = shape[shape.len() - 2];
-    let cols = shape[shape.len() - 1];
-    if rows % TILE_R != 0 || cols % TILE_C != 0 {
-        return Err(invalid_input(format!(
-            "shape rows/cols must be multiples of {TILE_R}x{TILE_C}"
-        )));
-    }
-    let tiles_per_batch = (rows / TILE_R)
-        .checked_mul(cols / TILE_C)
-        .ok_or_else(|| invalid_input("shape tile count is too large"))?;
-    shape[..shape.len() - 2]
-        .iter()
-        .try_fold(tiles_per_batch, |acc, &dim| acc.checked_mul(dim))
-        .ok_or_else(|| invalid_input("shape tile count is too large"))
-}
-
 fn select_program(key: SelectProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
@@ -248,7 +176,7 @@ fn select_program(key: SelectProgramKey) -> io::Result<Program> {
         Vec::new(),
     );
     for (core_index, &core) in key.cores.iter().enumerate() {
-        let (offset, n_tiles) = tile_range(key.tile_count, core_index, key.cores.len())?;
+        let (offset, n_tiles) = split_tile_range(key.tile_count, core_index, key.cores.len())?;
         runtime_args.add_core(
             core,
             vec![0, offset, n_tiles],
