@@ -1625,24 +1625,8 @@ fn execute_binary_eltwise(
     }
     let input_dtype = pjrt_buffer_type_to_dtype(lhs_desc.element_type)?;
     let expected_output_type = match op {
-        kernels::binary_eltwise::BinaryEltwiseOp::Add => lhs_desc.element_type,
-        kernels::binary_eltwise::BinaryEltwiseOp::Multiply => {
-            if !matches!(
-                input_dtype,
-                DType::Float16
-                    | DType::Float16B
-                    | DType::Float32
-                    | DType::Int32
-                    | DType::UInt16
-                    | DType::UInt32
-            ) {
-                return Err(unimplemented(format!(
-                    "TT executable {op_name} currently supports f16, bf16, f32, s32, u16, and u32 buffers, got {:?}",
-                    lhs_desc.element_type
-                )));
-            }
-            lhs_desc.element_type
-        }
+        kernels::binary_eltwise::BinaryEltwiseOp::Add
+        | kernels::binary_eltwise::BinaryEltwiseOp::Multiply => lhs_desc.element_type,
         kernels::binary_eltwise::BinaryEltwiseOp::Max => {
             if input_dtype != DType::Float16B {
                 return Err(unimplemented(format!(
