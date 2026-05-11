@@ -6,39 +6,14 @@
 #include "compute_kernel_api.h"
 
 namespace NAMESPACE {
-template <DataFormat Format>
-ALWI void divide_input_init() {
-  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
-                Format == DataFormat::Float32) {
-    div_binary_tile_init();
-  }
-}
-
-template <DataFormat Format>
-ALWI void divide_input_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
-  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
-                Format == DataFormat::Float32) {
-    div_binary_tile(idst0, idst1, odst);
-  }
-}
-
-constexpr DataFormat divide_input_data_format(uint32_t cb_lhs, uint32_t cb_out) {
-#ifdef UCK_CHLKC_PACK
-  return static_cast<DataFormat>((uint)pack_src_format[cb_out]);
-#else
-  return static_cast<DataFormat>((uint)unpack_src_format[cb_lhs]);
-#endif
-}
-
 void MAIN {
   uint32_t n_tiles = get_arg_val<uint32_t>(0);
   constexpr uint32_t cb_lhs = tt::CBIndex::c_0;
   constexpr uint32_t cb_rhs = tt::CBIndex::c_1;
   constexpr uint32_t cb_out = tt::CBIndex::c_16;
-  constexpr DataFormat input_format = divide_input_data_format(cb_lhs, cb_out);
 
   unary_op_init_common(cb_lhs, cb_out);
-  divide_input_init<input_format>();
+  div_binary_tile_init();
 
   for (uint32_t i = 0; i < n_tiles; ++i) {
     cb_wait_front(cb_lhs, 1);
@@ -50,7 +25,7 @@ void MAIN {
     copy_tile(cb_lhs, 0, 0);
     copy_tile_to_dst_init_short_with_dt(cb_lhs, cb_rhs);
     copy_tile(cb_rhs, 0, 1);
-    divide_input_tile<input_format>(0, 1, 0);
+    div_binary_tile(0, 1, 0);
     tile_regs_commit();
 
     tile_regs_wait();
