@@ -6,9 +6,10 @@ use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, Runt
 use std::io;
 
 const GATHER_READER: &str = include_str!("../../kernels/gather_reader.cc");
+const GATHER_WRITER: &str = include_str!("../../kernels/gather_writer.cc");
 const READER_OPERAND_ADDR_INDEX: usize = 0;
 const READER_START_INDICES_ADDR_INDEX: usize = 1;
-const READER_OUTPUT_ADDR_INDEX: usize = 2;
+const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct GatherKernelShape {
@@ -46,7 +47,14 @@ impl Kernel<GatherProgramKey> for GatherKernel {
         match index {
             READER_OPERAND_ADDR_INDEX => Some(self.operand_addr),
             READER_START_INDICES_ADDR_INDEX => Some(self.start_indices_addr),
-            READER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        match index {
+            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
             _ => None,
         }
     }
@@ -155,12 +163,8 @@ fn validate_buffer(
 fn gather_program(key: GatherProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
-        Vec::new(),
-        vec![
-            READER_OPERAND_ADDR_INDEX,
-            READER_START_INDICES_ADDR_INDEX,
-            READER_OUTPUT_ADDR_INDEX,
-        ],
+        vec![WRITER_OUTPUT_ADDR_INDEX],
+        vec![READER_OPERAND_ADDR_INDEX, READER_START_INDICES_ADDR_INDEX],
         Vec::new(),
     );
     for (core_index, &core) in key.cores.iter().enumerate() {
@@ -168,9 +172,8 @@ fn gather_program(key: GatherProgramKey) -> io::Result<Program> {
             split_tile_range(key.shape.output_row_tile_count, core_index, key.cores.len())?;
         runtime_args.add_core(
             core,
-            Vec::new(),
+            vec![0, offset, row_tiles, key.shape.output_tiles_per_row],
             vec![
-                0,
                 0,
                 0,
                 offset,
@@ -186,6 +189,7 @@ fn gather_program(key: GatherProgramKey) -> io::Result<Program> {
     let runtime_args = runtime_args.build()?;
     Ok(Program {
         reader_kernel: GATHER_READER.to_owned(),
+        writer_kernel: GATHER_WRITER.to_owned(),
         compile: CompileConfig {
             cbs: vec![
                 CBConfig::new(0, DType::Int32),
@@ -259,11 +263,14 @@ mod tests {
 
         let blobs = program.runtime_args.blobs();
         assert_eq!(blobs.len(), 2);
-        assert_eq!((arg_u32(&blobs[0], 3), arg_u32(&blobs[0], 4)), (0, 2));
-        assert_eq!((arg_u32(&blobs[1], 3), arg_u32(&blobs[1], 4)), (2, 1));
-        assert_eq!(arg_u32(&blobs[0], 5), 96);
-        assert_eq!(arg_u32(&blobs[0], 6), 4);
-        assert_eq!(arg_u32(&blobs[0], 7), 4);
-        assert_eq!(arg_u32(&blobs[0], 8), 288);
+        assert_eq!((arg_u32(&blobs[0], 1), arg_u32(&blobs[0], 2)), (0, 2));
+        assert_eq!((arg_u32(&blobs[1], 1), arg_u32(&blobs[1], 2)), (2, 1));
+        assert_eq!(arg_u32(&blobs[0], 3), 4);
+        assert_eq!((arg_u32(&blobs[0], 6), arg_u32(&blobs[0], 7)), (0, 2));
+        assert_eq!((arg_u32(&blobs[1], 6), arg_u32(&blobs[1], 7)), (2, 1));
+        assert_eq!(arg_u32(&blobs[0], 8), 96);
+        assert_eq!(arg_u32(&blobs[0], 9), 4);
+        assert_eq!(arg_u32(&blobs[0], 10), 4);
+        assert_eq!(arg_u32(&blobs[0], 11), 288);
     }
 }

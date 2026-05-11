@@ -40,13 +40,12 @@ void copy_bf16_row(uint32_t source_l1_addr, uint32_t output_l1_addr, uint32_t so
 void kernel_main() {
   uint32_t operand_addr = get_arg_val<uint32_t>(0);
   uint32_t start_indices_addr = get_arg_val<uint32_t>(1);
-  uint32_t output_addr = get_arg_val<uint32_t>(2);
-  uint32_t output_row_tile_offset = get_arg_val<uint32_t>(3);
-  uint32_t output_row_tile_count = get_arg_val<uint32_t>(4);
-  uint32_t logical_output_rows = get_arg_val<uint32_t>(5);
-  uint32_t operand_tiles_per_row = get_arg_val<uint32_t>(6);
-  uint32_t output_tiles_per_row = get_arg_val<uint32_t>(7);
-  uint32_t logical_operand_rows = get_arg_val<uint32_t>(8);
+  uint32_t output_row_tile_offset = get_arg_val<uint32_t>(2);
+  uint32_t output_row_tile_count = get_arg_val<uint32_t>(3);
+  uint32_t logical_output_rows = get_arg_val<uint32_t>(4);
+  uint32_t operand_tiles_per_row = get_arg_val<uint32_t>(5);
+  uint32_t output_tiles_per_row = get_arg_val<uint32_t>(6);
+  uint32_t logical_operand_rows = get_arg_val<uint32_t>(7);
 
   constexpr uint32_t cb_indices = tt::CBIndex::c_0;
   constexpr uint32_t cb_operand = tt::CBIndex::c_1;
@@ -62,12 +61,6 @@ void kernel_main() {
       .page_size = get_tile_size(cb_indices),
       .data_format = get_dataformat(cb_indices),
   };
-  const InterleavedAddrGenFast<true> output = {
-      .bank_base_address = output_addr,
-      .page_size = get_tile_size(cb_output),
-      .data_format = get_dataformat(cb_output),
-  };
-
   for (uint32_t row_tile = 0; row_tile < output_row_tile_count; ++row_tile) {
     uint32_t output_row_tile = output_row_tile_offset + row_tile;
 
@@ -111,11 +104,6 @@ void kernel_main() {
       }
 
       cb_push_back(cb_output, 1);
-      cb_wait_front(cb_output, 1);
-      noc_async_write_tile(output_row_tile * output_tiles_per_row + tile_col, output,
-                           get_read_ptr(cb_output));
-      noc_async_write_barrier();
-      cb_pop_front(cb_output, 1);
     }
 
     cb_pop_front(cb_indices, 1);
