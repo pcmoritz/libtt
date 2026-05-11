@@ -1,8 +1,8 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{DType, DramBuffer, TILE_C, tiled_allocation_shape, tiled_shape_tile_count};
+use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C};
 use crate::hw::CoreCoord;
-use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder, select_worker_cores, split_tile_range};
+use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
 use std::io;
 
 const BROADCAST_READER: &str = include_str!("../../kernels/broadcast_reader.cc");
