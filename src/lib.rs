@@ -527,33 +527,27 @@ fn event_for_buffer(buffer: &PJRT_Buffer) -> *mut PJRT_Event {
     }
 }
 
-fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
-    let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
-        return Err(pjrt_error(
-            "buffer has been deleted",
-            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
-        ));
-    };
+fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
     with_device_ptr(buffer.device, |device| {
-        device.dram_read(dram_buffer).map_err(io_error)
+        read_buffer_logical_bytes_from_device(device, buffer)
     })
 }
 
-fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
+fn read_buffer_logical_bytes_from_device(
+    device: &mut Device,
+    buffer: &PJRT_Buffer,
+) -> Result<Vec<u8>, *mut PJRT_Error> {
     let dtype = pjrt_buffer_type_to_dtype(buffer.buffer_type)?;
     let dims = dims_i64_to_usize(&buffer.dims)?;
     let byte_size = host_byte_size(dtype, &dims)?;
-    let allocation_shape = buffer
-        .dram_buffer
-        .as_ref()
-        .map(|dram_buffer| dram_buffer.shape.clone())
-        .ok_or_else(|| {
-            pjrt_error(
-                "buffer has been deleted",
-                PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
-            )
-        })?;
-    let data = read_buffer_bytes(buffer)?;
+    let dram_buffer = buffer.dram_buffer.as_ref().ok_or_else(|| {
+        pjrt_error(
+            "buffer has been deleted",
+            PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+        )
+    })?;
+    let allocation_shape = dram_buffer.shape.clone();
+    let data = device.dram_read(dram_buffer).map_err(io_error)?;
     if data.len() == byte_size {
         return Ok(data);
     }
@@ -1828,6 +1822,114 @@ fn execute_broadcast_in_dim(
     )
 }
 
+fn execute_gather(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: [u32; 2],
+    output_id: u32,
+    dimension_numbers: &executable::GatherDimensionNumbers,
+    slice_sizes: &[i64],
+) -> Result<(), *mut PJRT_Error> {
+    if dimension_numbers.offset_dims.as_slice() != [1]
+        || dimension_numbers.collapsed_slice_dims.as_slice() != [0]
+        || !dimension_numbers.operand_batching_dims.is_empty()
+        || !dimension_numbers.start_indices_batching_dims.is_empty()
+        || dimension_numbers.start_index_map.as_slice() != [0]
+        || dimension_numbers.index_vector_dim != 1
+    {
+        return Err(unimplemented(
+            "TT executable gather currently only supports rank-2 row gathers",
+        ));
+    }
+
+    let operand = device_buffer_for_value(values, input_ids[0], "gather.operand")?.clone();
+    let start_indices =
+        device_buffer_for_value(values, input_ids[1], "gather.start_indices")?.clone();
+    if start_indices.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
+        return Err(unimplemented(
+            "TT executable gather currently only supports s32 start_indices",
+        ));
+    }
+    if operand.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+        return Err(unimplemented(
+            "TT executable gather currently only supports bf16 operands",
+        ));
+    }
+
+    let operand_shape = dims_i64_to_usize(&operand.dims)?;
+    let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
+    if operand_shape.len() != 2 {
+        return Err(unimplemented(
+            "TT executable gather currently only supports rank-2 operands",
+        ));
+    }
+    if slice_sizes.len() != 2
+        || slice_sizes[0] != 1
+        || usize::try_from(slice_sizes[1]).ok() != Some(operand_shape[1])
+    {
+        return Err(unimplemented(
+            "TT executable gather currently only supports slice_sizes [1, operand_width]",
+        ));
+    }
+
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable gather output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != operand.buffer_type {
+        return Err(invalid_argument(format!(
+            "TT executable gather output must be {:?}, got {:?}",
+            operand.buffer_type, output_desc.element_type
+        )));
+    }
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let expected_output_shape = if start_indices_shape.len() == 2 {
+        vec![start_indices_shape[0], operand_shape[1]]
+    } else {
+        Vec::new()
+    };
+    if output_shape != expected_output_shape {
+        return Err(invalid_argument(format!(
+            "TT executable gather output shape mismatch: expected {:?}, got {:?}",
+            expected_output_shape, output_shape
+        )));
+    }
+
+    let Some(operand_dram) = operand.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable gather operand buffer has no device allocation",
+        ));
+    };
+    let Some(start_indices_dram) = start_indices.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable gather start_indices buffer has no device allocation",
+        ));
+    };
+
+    let output_dram = kernels::gather::gather_bf16_rows(
+        device,
+        operand_dram,
+        start_indices_dram,
+        &operand_shape,
+        &start_indices_shape,
+        &output_shape,
+        "pjrt_gather",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "gather",
+    )
+}
+
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
@@ -2109,11 +2211,22 @@ fn execute_executable_v1(
                     broadcast_dimensions,
                 )?;
             }
-            executable::Op::Gather { .. } => {
-                return Err(unimplemented(
-                    "TT executable gather execution is not currently supported",
-                ));
-            }
+            executable::Op::Gather {
+                input_ids,
+                output_id,
+                dimension_numbers,
+                slice_sizes,
+                ..
+            } => execute_gather(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_ids,
+                *output_id,
+                dimension_numbers,
+                slice_sizes,
+            )?,
             executable::Op::Iota { .. } => {
                 return Err(unimplemented(
                     "TT executable iota execution is not currently supported",
