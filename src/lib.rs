@@ -1936,6 +1936,37 @@ fn execute_gather(
     )
 }
 
+fn execute_iota(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    output_id: u32,
+    iota_dimension: u64,
+) -> Result<(), *mut PJRT_Error> {
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable iota output id {output_id} is out of bounds"
+        ))
+    })?;
+    let logical_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let iota_dimension = usize::try_from(iota_dimension)
+        .map_err(|_| invalid_argument("TT executable iota dimension is too large"))?;
+    let dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    let output_dram =
+        kernels::iota::iota(device, dtype, &logical_shape, iota_dimension, "pjrt_iota")
+            .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "iota",
+    )
+}
+
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
@@ -2233,11 +2264,17 @@ fn execute_executable_v1(
                 dimension_numbers,
                 slice_sizes,
             )?,
-            executable::Op::Iota { .. } => {
-                return Err(unimplemented(
-                    "TT executable iota execution is not currently supported",
-                ));
-            }
+            executable::Op::Iota {
+                output_id,
+                iota_dimension,
+            } => execute_iota(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *output_id,
+                *iota_dimension,
+            )?,
         }
     }
 
