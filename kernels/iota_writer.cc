@@ -35,15 +35,15 @@ uint32_t float_bits(float value) {
 }
 
 void store_iota_value(uint32_t tile_l1_addr, uint32_t element, uint32_t value) {
-#if IOTA_DTYPE_INT32 || IOTA_DTYPE_UINT32
+#if defined(IOTA_DTYPE_INT32) || defined(IOTA_DTYPE_UINT32)
   volatile tt_l1_ptr uint32_t *ptr =
       reinterpret_cast<volatile tt_l1_ptr uint32_t *>(tile_l1_addr);
   ptr[element] = value;
-#elif IOTA_DTYPE_FLOAT32
+#elif defined(IOTA_DTYPE_FLOAT32)
   volatile tt_l1_ptr uint32_t *ptr =
       reinterpret_cast<volatile tt_l1_ptr uint32_t *>(tile_l1_addr);
   ptr[element] = float_bits(static_cast<float>(value));
-#elif IOTA_DTYPE_BFLOAT16
+#elif defined(IOTA_DTYPE_BFLOAT16)
   volatile tt_l1_ptr uint16_t *ptr =
       reinterpret_cast<volatile tt_l1_ptr uint16_t *>(tile_l1_addr);
   ptr[element] = static_cast<uint16_t>(float_bits(static_cast<float>(value)) >> 16);

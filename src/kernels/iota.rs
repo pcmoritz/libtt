@@ -162,18 +162,18 @@ fn iota_program(key: IotaProgramKey) -> io::Result<Program> {
 }
 
 fn iota_writer_source(dtype: DType) -> io::Result<String> {
-    let defines = match dtype {
-        DType::Int32 => "#define IOTA_DTYPE_INT32 1\n#define IOTA_DTYPE_UINT32 0\n#define IOTA_DTYPE_FLOAT32 0\n#define IOTA_DTYPE_BFLOAT16 0\n",
-        DType::UInt32 => "#define IOTA_DTYPE_INT32 0\n#define IOTA_DTYPE_UINT32 1\n#define IOTA_DTYPE_FLOAT32 0\n#define IOTA_DTYPE_BFLOAT16 0\n",
-        DType::Float32 => "#define IOTA_DTYPE_INT32 0\n#define IOTA_DTYPE_UINT32 0\n#define IOTA_DTYPE_FLOAT32 1\n#define IOTA_DTYPE_BFLOAT16 0\n",
-        DType::Float16B => "#define IOTA_DTYPE_INT32 0\n#define IOTA_DTYPE_UINT32 0\n#define IOTA_DTYPE_FLOAT32 0\n#define IOTA_DTYPE_BFLOAT16 1\n",
+    let define = match dtype {
+        DType::Int32 => "IOTA_DTYPE_INT32",
+        DType::UInt32 => "IOTA_DTYPE_UINT32",
+        DType::Float32 => "IOTA_DTYPE_FLOAT32",
+        DType::Float16B => "IOTA_DTYPE_BFLOAT16",
         other => {
             return Err(invalid_input(format!(
                 "iota currently does not support {other:?} outputs"
             )));
         }
     };
-    Ok(format!("{defines}{WRITER}"))
+    Ok(format!("#define {define}\n{WRITER}"))
 }
 
 fn tile_range(tile_count: u32, core: CoreCoord, cores: &[CoreCoord]) -> io::Result<(u32, u32)> {
