@@ -1626,6 +1626,7 @@ fn execute_binary_eltwise(
     let input_dtype = pjrt_buffer_type_to_dtype(lhs_desc.element_type)?;
     let expected_output_type = match op {
         kernels::binary_eltwise::BinaryEltwiseOp::Add
+        | kernels::binary_eltwise::BinaryEltwiseOp::Divide
         | kernels::binary_eltwise::BinaryEltwiseOp::Multiply => lhs_desc.element_type,
         kernels::binary_eltwise::BinaryEltwiseOp::Max => {
             if input_dtype != DType::Float16B {
@@ -2066,10 +2067,20 @@ fn execute_executable_v1(
                     "multiply",
                 )?;
             }
-            executable::Op::Divide { .. } => {
-                return Err(unimplemented(
-                    "TT executable divide execution is not currently supported",
-                ));
+            executable::Op::Divide {
+                input_ids,
+                output_id,
+            } => {
+                execute_binary_eltwise(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Divide,
+                    *input_ids,
+                    *output_id,
+                    "divide",
+                )?;
             }
             executable::Op::Power { .. } => {
                 return Err(unimplemented(

@@ -10,6 +10,7 @@ const READER: &str = include_str!("../../kernels/binary_eltwise_reader.cc");
 const WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
 const ADD_BF16_COMPUTE: &str = include_str!("../../kernels/add_compute.cc");
 const MULTIPLY_COMPUTE: &str = include_str!("../../kernels/multiply_compute.cc");
+const DIVIDE_COMPUTE: &str = include_str!("../../kernels/divide_compute.cc");
 const MAX_BF16_COMPUTE: &str = include_str!("../../kernels/max_compute.cc");
 const COMPARE_COMPUTE: &str = include_str!("../../kernels/compare_compute.cc");
 const READER_LHS_ADDR_INDEX: usize = 0;
@@ -22,6 +23,7 @@ const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 pub(crate) enum BinaryEltwiseOp {
     Add,
     Multiply,
+    Divide,
     Max,
     Compare(CompareDirection),
 }
@@ -31,6 +33,7 @@ impl BinaryEltwiseOp {
         match self {
             Self::Add => Ok(ADD_BF16_COMPUTE.to_owned()),
             Self::Multiply => Ok(MULTIPLY_COMPUTE.to_owned()),
+            Self::Divide => divide_compute_source(input_dtype),
             Self::Max => Ok(MAX_BF16_COMPUTE.to_owned()),
             Self::Compare(direction) => compare_compute_source(input_dtype, direction),
         }
@@ -40,6 +43,7 @@ impl BinaryEltwiseOp {
         match self {
             Self::Add => format!("eltwise_add_{input_dtype:?}_{output_dtype:?}"),
             Self::Multiply => format!("eltwise_multiply_{input_dtype:?}_{output_dtype:?}"),
+            Self::Divide => format!("eltwise_divide_{input_dtype:?}_{output_dtype:?}"),
             Self::Max => "eltwise_max_bf16".to_owned(),
             Self::Compare(direction) => {
                 format!("eltwise_compare_{direction:?}_{input_dtype:?}_{output_dtype:?}")
@@ -51,6 +55,7 @@ impl BinaryEltwiseOp {
         match self {
             Self::Add => input_dtype,
             Self::Multiply => input_dtype,
+            Self::Divide => input_dtype,
             Self::Max => DType::Float16B,
             Self::Compare(_) => DType::UInt8,
         }
@@ -263,6 +268,15 @@ fn compare_compute_source(dtype: DType, direction: CompareDirection) -> io::Resu
     Ok(COMPARE_COMPUTE
         .replace("COMPARE_INT32_INPUT", int32_input)
         .replace("COMPARE_DIRECTION", compare_direction_variant(direction)))
+}
+
+fn divide_compute_source(dtype: DType) -> io::Result<String> {
+    if !matches!(dtype, DType::Float16 | DType::Float16B | DType::Float32) {
+        return Err(invalid_input(format!(
+            "divide currently supports Float16, Float16B, and Float32 inputs, got {dtype:?}"
+        )));
+    }
+    Ok(DIVIDE_COMPUTE.to_owned())
 }
 
 fn compare_direction_variant(direction: CompareDirection) -> &'static str {
