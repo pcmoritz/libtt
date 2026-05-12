@@ -144,14 +144,7 @@ fn concatenate_shape(
         )));
     };
 
-    let mut expected_output = input_shapes[0].clone();
-    if expected_output.len() != rank {
-        return Err(invalid_input(format!(
-            "concatenate input rank {} must match output rank {rank}",
-            expected_output.len()
-        )));
-    }
-    expected_output[dimension] = 0;
+    let mut concat_dim_total = 0usize;
     for (index, input_shape) in input_shapes.iter().enumerate() {
         if input_shape.len() != rank {
             return Err(invalid_input(format!(
@@ -159,23 +152,23 @@ fn concatenate_shape(
                 input_shape.len()
             )));
         }
-        for dim in 0..rank {
+        for (dim, (&input_dim, &output_dim)) in input_shape.iter().zip(output_shape).enumerate() {
             if dim == dimension {
                 continue;
             }
-            if input_shape[dim] != output_shape[dim] {
+            if input_dim != output_dim {
                 return Err(invalid_input(format!(
                     "concatenate input {index} shape {input_shape:?} does not match output shape {output_shape:?} outside dimension {dimension}",
                 )));
             }
         }
-        expected_output[dimension] = expected_output[dimension]
+        concat_dim_total = concat_dim_total
             .checked_add(input_shape[dimension])
             .ok_or_else(|| invalid_input("concatenate output dimension overflow"))?;
     }
-    if expected_output != output_shape {
+    if concat_dim_total != output_shape[dimension] {
         return Err(invalid_input(format!(
-            "concatenate output shape mismatch: expected {expected_output:?}, got {output_shape:?}"
+            "concatenate output dimension {dimension} mismatch: input dimensions sum to {concat_dim_total}, output shape is {output_shape:?}"
         )));
     }
 
