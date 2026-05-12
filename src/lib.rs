@@ -1739,6 +1739,57 @@ fn execute_unary_eltwise(
     )
 }
 
+fn execute_reshape(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_id: u32,
+    output_id: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable reshape operand value id is out of bounds")
+    })?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable reshape output value id is out of bounds")
+    })?;
+    if input_desc.element_type != output_desc.element_type {
+        return Err(invalid_argument(
+            "TT executable reshape input and output element types must match",
+        ));
+    }
+
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+
+    let input = device_buffer_for_value(values, input_id, "reshape.operand")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable reshape operand buffer has no device allocation",
+        ));
+    };
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dims = output_desc.dims.clone();
+    let output_dram = kernels::reshape::reshape(
+        device,
+        input_dram,
+        &input_shape,
+        &output_shape,
+        dtype,
+        "pjrt_reshape",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_dims,
+        output_dram,
+        context,
+        "reshape",
+    )
+}
+
 fn execute_reduce(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2411,11 +2462,17 @@ fn execute_executable_v1(
                 *output_id,
                 "rsqrt",
             )?,
-            executable::Op::Reshape { .. } => {
-                return Err(unimplemented(
-                    "TT executable reshape execution is not currently supported",
-                ));
-            }
+            executable::Op::Reshape {
+                input_id,
+                output_id,
+            } => execute_reshape(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_id,
+                *output_id,
+            )?,
             executable::Op::Slice { .. } => {
                 return Err(unimplemented(
                     "TT executable slice execution is not currently supported",
