@@ -1685,6 +1685,95 @@ fn execute_binary_eltwise(
     )
 }
 
+fn execute_unary_eltwise(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    op: kernels::unary_eltwise::UnaryEltwiseOp,
+    input_id: u32,
+    output_id: u32,
+    op_name: &str,
+) -> Result<(), *mut PJRT_Error> {
+    let input_field = format!("{op_name}.input");
+    let input_desc = plan
+        .values
+        .get(input_id as usize)
+        .ok_or_else(|| invalid_argument(format!("{input_field} value id is out of bounds")))?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable {op_name} output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.dims != input_desc.dims {
+        return Err(invalid_argument(format!(
+            "TT executable {op_name} output shape mismatch: expected {:?}, got {:?}",
+            input_desc.dims, output_desc.dims
+        )));
+    }
+
+    let input_dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    let output_dims = input_desc.dims.clone();
+    let shape = dims_i64_to_usize(&output_dims)?;
+    let input = eltwise_input(values, plan, input_id, input_dtype, &input_field)?;
+    let output_name = format!("pjrt_{op_name}");
+    let output_dram = kernels::unary_eltwise::eltwise(
+        device,
+        op,
+        input,
+        input_dtype,
+        output_dtype,
+        &shape,
+        output_name,
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_dims,
+        output_dram,
+        context,
+        op_name,
+    )
+}
+
+fn execute_identity_custom_call(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    input_id: u32,
+    output_id: u32,
+    call_target_name: &str,
+) -> Result<(), *mut PJRT_Error> {
+    let input = device_buffer_for_value(
+        values,
+        input_id,
+        &format!("custom_call {call_target_name:?}.input"),
+    )?;
+    let output_index = output_id as usize;
+    let expected = plan.values.get(output_index).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} output id {output_id} is out of bounds"
+        ))
+    })?;
+    if input.buffer_type != expected.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} output must be {:?}, got {:?}",
+            expected.element_type, input.buffer_type
+        )));
+    }
+    if input.dims != expected.dims {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} output shape mismatch: expected {:?}, got {:?}",
+            expected.dims, input.dims
+        )));
+    }
+    let output = input.clone();
+    values[output_index] = Some(output);
+    Ok(())
+}
+
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2188,21 +2277,45 @@ fn execute_executable_v1(
                 *output_id,
                 *dimension,
             )?,
-            executable::Op::Cosine { .. } => {
-                return Err(unimplemented(
-                    "TT executable cosine execution is not currently supported",
-                ));
-            }
-            executable::Op::Sine { .. } => {
-                return Err(unimplemented(
-                    "TT executable sine execution is not currently supported",
-                ));
-            }
-            executable::Op::Rsqrt { .. } => {
-                return Err(unimplemented(
-                    "TT executable rsqrt execution is not currently supported",
-                ));
-            }
+            executable::Op::Cosine {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Cosine,
+                *input_id,
+                *output_id,
+                "cosine",
+            )?,
+            executable::Op::Sine {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Sine,
+                *input_id,
+                *output_id,
+                "sine",
+            )?,
+            executable::Op::Rsqrt {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Rsqrt,
+                *input_id,
+                *output_id,
+                "rsqrt",
+            )?,
             executable::Op::Reshape { .. } => {
                 return Err(unimplemented(
                     "TT executable reshape execution is not currently supported",
@@ -2213,20 +2326,56 @@ fn execute_executable_v1(
                     "TT executable slice execution is not currently supported",
                 ));
             }
-            executable::Op::Negate { .. } => {
-                return Err(unimplemented(
-                    "TT executable negate execution is not currently supported",
-                ));
-            }
-            executable::Op::Exponential { .. } => {
-                return Err(unimplemented(
-                    "TT executable exponential execution is not currently supported",
-                ));
-            }
+            executable::Op::Negate {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Negate,
+                *input_id,
+                *output_id,
+                "negate",
+            )?,
+            executable::Op::Exponential {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Exponential,
+                *input_id,
+                *output_id,
+                "exponential",
+            )?,
             executable::Op::Transpose { .. } => {
                 return Err(unimplemented(
                     "TT executable transpose execution is not currently supported",
                 ));
+            }
+            executable::Op::CustomCall {
+                input_ids,
+                output_id,
+                call_target_name,
+                ..
+            } if call_target_name == "annotate_device_placement" => {
+                let [input_id] = input_ids.as_slice() else {
+                    return Err(invalid_argument(format!(
+                        "TT executable custom_call \"annotate_device_placement\" expected one input, got {}",
+                        input_ids.len()
+                    )));
+                };
+                execute_identity_custom_call(
+                    &mut values,
+                    plan,
+                    *input_id,
+                    *output_id,
+                    call_target_name,
+                )?;
             }
             executable::Op::CustomCall {
                 call_target_name, ..
@@ -2235,11 +2384,19 @@ fn execute_executable_v1(
                     "TT executable custom_call {call_target_name:?} execution is not currently supported"
                 )));
             }
-            executable::Op::Convert { .. } => {
-                return Err(unimplemented(
-                    "TT executable convert execution is not currently supported",
-                ));
-            }
+            executable::Op::Convert {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Convert,
+                *input_id,
+                *output_id,
+                "convert",
+            )?,
             executable::Op::Reduce { .. } => {
                 return Err(unimplemented(
                     "TT executable reduce execution is not currently supported",
