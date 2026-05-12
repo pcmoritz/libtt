@@ -2032,12 +2032,6 @@ fn execute_broadcast_in_dim(
     }
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let broadcast_plan = kernels::broadcast::BroadcastInDimPlan::new(
-        &input_shape,
-        &output_shape,
-        broadcast_dimensions,
-    )
-    .map_err(io_error)?;
 
     let input = device_buffer_for_value(values, input_id, "broadcast_in_dim.operand")?;
     let Some(input_dram) = input.dram_buffer.as_ref() else {
@@ -2047,14 +2041,39 @@ fn execute_broadcast_in_dim(
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
-    let output_dram = kernels::broadcast::broadcast_in_dim(
-        device,
-        input_dram,
-        &broadcast_plan,
-        dtype,
-        "pjrt_broadcast",
+    let output_dram = if kernels::broadcast::is_degenerate_reshape_broadcast(
+        &input_shape,
+        &output_shape,
+        broadcast_dimensions,
     )
-    .map_err(io_error)?;
+    .map_err(io_error)?
+    {
+        kernels::reshape::reshape(
+            device,
+            input_dram,
+            &input_shape,
+            &output_shape,
+            dtype,
+            "pjrt_broadcast_reshape",
+        )
+        .map_err(io_error)?
+    } else {
+        let broadcast_plan = kernels::broadcast::BroadcastInDimPlan::new(
+            &input_shape,
+            &output_shape,
+            broadcast_dimensions,
+        )
+        .map_err(io_error)?;
+
+        kernels::broadcast::broadcast_in_dim(
+            device,
+            input_dram,
+            &broadcast_plan,
+            dtype,
+            "pjrt_broadcast",
+        )
+        .map_err(io_error)?
+    };
     store_output_buffer(
         values,
         plan,

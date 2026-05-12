@@ -1,6 +1,8 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C};
+use crate::dram::{
+    tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R,
+};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
 use std::io;
@@ -13,8 +15,10 @@ const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct BroadcastKernelShape {
+    output_tiles_per_batch: u32,
     output_tiles_per_row: u32,
     tile_count: u32,
+    broadcast_batch: bool,
     mode: BroadcastMode,
 }
 
@@ -52,22 +56,24 @@ impl BroadcastInDimPlan {
         output_shape: &[usize],
         broadcast_dimensions: &[i64],
     ) -> io::Result<Self> {
-        validate_rank(input_shape, "input")?;
-        validate_rank(output_shape, "output")?;
         validate_broadcast_dimensions(input_shape, output_shape, broadcast_dimensions)?;
 
         let output_allocation_shape = tiled_allocation_shape(output_shape)?;
         let output_tiles_per_row =
             output_allocation_shape[output_allocation_shape.len() - 1] / TILE_C;
+        let output_tiles_per_batch = tiles_per_batch(&output_allocation_shape)?;
         let tile_count = tiled_shape_tile_count(output_shape)?;
         let mode = broadcast_mode(input_shape, output_shape, broadcast_dimensions)?;
+        let broadcast_batch = should_broadcast_batch(input_shape, output_shape)?;
 
         Ok(Self {
             input_shape: input_shape.to_vec(),
             output_allocation_shape,
             kernel_shape: BroadcastKernelShape {
+                output_tiles_per_batch: u32_arg(output_tiles_per_batch, "output tiles per batch")?,
                 output_tiles_per_row: u32_arg(output_tiles_per_row, "output tiles per row")?,
                 tile_count: u32_arg(tile_count, "tile count")?,
+                broadcast_batch,
                 mode,
             },
         })
@@ -168,6 +174,18 @@ pub(crate) fn broadcast_in_dim(
     Ok(output)
 }
 
+pub(crate) fn is_degenerate_reshape_broadcast(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[i64],
+) -> io::Result<bool> {
+    validate_broadcast_dimensions(input_shape, output_shape, broadcast_dimensions)?;
+    Ok(
+        input_shape != output_shape
+            && logical_volume(input_shape)? == logical_volume(output_shape)?,
+    )
+}
+
 fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
@@ -181,7 +199,14 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
         runtime_args.add_core(
             core,
             vec![0, offset, n_tiles],
-            vec![0, offset, n_tiles, key.shape.output_tiles_per_row],
+            vec![
+                0,
+                offset,
+                n_tiles,
+                key.shape.output_tiles_per_batch,
+                key.shape.output_tiles_per_row,
+                key.shape.broadcast_batch as u32,
+            ],
             vec![n_tiles],
         )?;
     }
@@ -205,16 +230,6 @@ fn broadcast_reader_source(mode: BroadcastMode) -> String {
 
 fn broadcast_compute_source(mode: BroadcastMode) -> String {
     BROADCAST_COMPUTE.replace("BROADCAST_MODE", mode.cpp_variant())
-}
-
-fn validate_rank(shape: &[usize], name: &str) -> io::Result<()> {
-    if shape.len() <= 2 {
-        Ok(())
-    } else {
-        Err(invalid_input(format!(
-            "broadcast_in_dim currently supports rank <= 2 {name} shapes, got {shape:?}"
-        )))
-    }
 }
 
 fn validate_broadcast_dimensions(
@@ -261,13 +276,57 @@ fn validate_broadcast_dimensions(
     Ok(())
 }
 
+fn logical_volume(shape: &[usize]) -> io::Result<usize> {
+    shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| invalid_input("broadcast shape volume overflow"))
+}
+
 fn logical_matrix_view(shape: &[usize]) -> (usize, usize) {
     match shape {
         [] => (1, 1),
         [cols] => (1, *cols),
-        [rows, cols] => (*rows, *cols),
-        _ => unreachable!("broadcast rank validation should reject rank > 2"),
+        shape => (shape[shape.len() - 2], shape[shape.len() - 1]),
     }
+}
+
+fn batch_shape(shape: &[usize]) -> &[usize] {
+    if shape.len() <= 2 {
+        &[]
+    } else {
+        &shape[..shape.len() - 2]
+    }
+}
+
+fn batch_count(shape: &[usize]) -> io::Result<usize> {
+    batch_shape(shape)
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| invalid_input("broadcast batch size overflow"))
+}
+
+fn tiles_per_batch(allocation_shape: &[usize]) -> io::Result<usize> {
+    let rank = allocation_shape.len();
+    (allocation_shape[rank - 2] / TILE_R)
+        .checked_mul(allocation_shape[rank - 1] / TILE_C)
+        .ok_or_else(|| invalid_input("broadcast tiles per batch overflow"))
+}
+
+fn should_broadcast_batch(input_shape: &[usize], output_shape: &[usize]) -> io::Result<bool> {
+    let input_batch = batch_count(input_shape)?;
+    let output_batch = batch_count(output_shape)?;
+    if input_batch == 1 {
+        return Ok(output_batch != 1);
+    }
+    if batch_shape(input_shape) == batch_shape(output_shape) {
+        return Ok(false);
+    }
+    Err(invalid_input(format!(
+        "broadcast_in_dim currently supports equal batch shapes or scalar batch broadcasts, got input {:?} and output {:?}",
+        batch_shape(input_shape),
+        batch_shape(output_shape)
+    )))
 }
 
 fn broadcast_mode(
@@ -280,24 +339,23 @@ fn broadcast_mode(
     let (input_rows, input_cols) = logical_matrix_view(input_shape);
     let (output_rows, output_cols) = logical_matrix_view(output_shape);
 
-    match input_rank {
-        0 => {
-            if output_rank == 0 {
-                Ok(BroadcastMode::Copy)
-            } else {
-                Ok(BroadcastMode::Scalar)
-            }
+    if input_rank == 0 {
+        if output_rank == 0 {
+            return Ok(BroadcastMode::Copy);
         }
-        1 => rank1_broadcast_mode(
+        return Ok(BroadcastMode::Scalar);
+    }
+    if input_rank == 1 && output_rank <= 2 {
+        return rank1_broadcast_mode(
             input_cols,
             output_rank,
             output_rows,
             output_cols,
             broadcast_dimensions,
-        ),
-        2 => rank2_broadcast_mode(input_rows, input_cols, output_rows, output_cols),
-        _ => unreachable!("broadcast rank validation should reject rank > 2"),
+        );
     }
+
+    rank2_broadcast_mode(input_rows, input_cols, output_rows, output_cols)
 }
 
 fn rank1_broadcast_mode(
@@ -323,7 +381,7 @@ fn rank1_broadcast_mode(
                 "broadcast dimension {dim} is not supported for rank-1 input"
             ))),
         },
-        _ => unreachable!("broadcast rank validation should reject rank > 2"),
+        _ => rank2_broadcast_mode(1, input_cols, output_rows, output_cols),
     }
 }
 
@@ -385,8 +443,10 @@ mod tests {
         assert_eq!(
             plan.kernel_shape(),
             BroadcastKernelShape {
+                output_tiles_per_batch: 1,
                 output_tiles_per_row: 1,
                 tile_count: 1,
+                broadcast_batch: false,
                 mode: BroadcastMode::Transpose,
             }
         );
@@ -398,6 +458,60 @@ mod tests {
 
         assert_eq!(plan.output_allocation_shape, vec![32, 32]);
         assert_eq!(plan.kernel_shape().mode, BroadcastMode::Row);
+    }
+
+    #[test]
+    fn broadcast_plan_supports_batched_column_broadcast() {
+        let plan = BroadcastInDimPlan::new(&[18, 4, 1], &[18, 4, 32], &[0, 1, 2])
+            .expect("valid broadcast");
+
+        assert_eq!(plan.output_allocation_shape, vec![18, 32, 32]);
+        assert_eq!(
+            plan.kernel_shape(),
+            BroadcastKernelShape {
+                output_tiles_per_batch: 1,
+                output_tiles_per_row: 1,
+                tile_count: 18,
+                broadcast_batch: false,
+                mode: BroadcastMode::Col,
+            }
+        );
+    }
+
+    #[test]
+    fn broadcast_plan_supports_batched_row_broadcast() {
+        let plan = BroadcastInDimPlan::new(&[18, 1, 32], &[18, 4, 32], &[0, 1, 2])
+            .expect("valid broadcast");
+
+        assert_eq!(plan.output_allocation_shape, vec![18, 32, 32]);
+        assert_eq!(plan.kernel_shape().mode, BroadcastMode::Row);
+        assert!(!plan.kernel_shape().broadcast_batch);
+    }
+
+    #[test]
+    fn broadcast_plan_supports_scalar_batch_broadcast() {
+        let plan = BroadcastInDimPlan::new(&[1, 1, 32], &[18, 4, 32], &[0, 1, 2])
+            .expect("valid broadcast");
+
+        assert_eq!(plan.output_allocation_shape, vec![18, 32, 32]);
+        assert_eq!(plan.kernel_shape().mode, BroadcastMode::Row);
+        assert!(plan.kernel_shape().broadcast_batch);
+    }
+
+    #[test]
+    fn degenerate_broadcast_can_lower_as_reshape() {
+        assert!(
+            is_degenerate_reshape_broadcast(&[18, 4], &[18, 4, 1], &[0, 1])
+                .expect("valid broadcast")
+        );
+    }
+
+    #[test]
+    fn broadcast_plan_rejects_partial_batch_broadcast() {
+        let err = BroadcastInDimPlan::new(&[2, 1, 1, 32], &[2, 4, 4, 32], &[0, 1, 2, 3])
+            .expect_err("partial batch broadcast should fail");
+
+        assert!(err.to_string().contains("batch"));
     }
 
     #[test]
@@ -426,8 +540,10 @@ mod tests {
             ],
             dtype: DType::Float16B,
             shape: BroadcastKernelShape {
+                output_tiles_per_batch: 2,
                 output_tiles_per_row: 2,
                 tile_count: 5,
+                broadcast_batch: false,
                 mode: BroadcastMode::Copy,
             },
         })
@@ -441,8 +557,8 @@ mod tests {
         assert_eq!((arg_u32(&blobs[0], 4), arg_u32(&blobs[0], 5)), (0, 2));
         assert_eq!((arg_u32(&blobs[1], 4), arg_u32(&blobs[1], 5)), (2, 2));
         assert_eq!((arg_u32(&blobs[2], 4), arg_u32(&blobs[2], 5)), (4, 1));
-        assert_eq!(arg_u32(&blobs[0], 7), 2);
-        assert_eq!(arg_u32(&blobs[1], 7), 2);
-        assert_eq!(arg_u32(&blobs[2], 7), 1);
+        assert_eq!(arg_u32(&blobs[0], 9), 2);
+        assert_eq!(arg_u32(&blobs[1], 9), 2);
+        assert_eq!(arg_u32(&blobs[2], 9), 1);
     }
 }
