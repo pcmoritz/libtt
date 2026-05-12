@@ -41,6 +41,13 @@ impl ReduceOp {
     fn is_sum(self) -> bool {
         matches!(self, Self::Sum)
     }
+
+    fn padding_identity_bits(self) -> u32 {
+        match self {
+            Self::Sum => 0.0f32.to_bits(),
+            Self::Max => f32::NEG_INFINITY.to_bits(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -62,6 +69,7 @@ impl OutputRank {
 struct ReduceKernelShape {
     reduce_groups: u32,
     input_width_tiles: u32,
+    valid_last_width: u32,
     output_tiles: u32,
     output_tiles_per_row: u32,
     output_rank: OutputRank,
@@ -121,6 +129,7 @@ impl ReducePlan {
         let output_allocation_shape = tiled_allocation_shape(output_shape)?;
         let rank = input_allocation_shape.len();
         let input_width_tiles = input_allocation_shape[rank - 1] / TILE_C;
+        let valid_last_width = valid_last_tile_width(input_shape[input_shape.len() - 1])?;
         let input_row_tiles = input_allocation_shape[rank - 2] / TILE_R;
         let outer_count = checked_product(&input_shape[..input_shape.len() - 2])?;
         let reduce_groups = outer_count
@@ -145,6 +154,7 @@ impl ReducePlan {
             shape: ReduceKernelShape {
                 reduce_groups: u32_arg(reduce_groups, "reduce group count")?,
                 input_width_tiles: u32_arg(input_width_tiles, "input width tile count")?,
+                valid_last_width,
                 output_tiles: u32_arg(output_tiles, "output tile count")?,
                 output_tiles_per_row: u32_arg(output_tiles_per_row, "output tiles per row")?,
                 output_rank,
@@ -309,6 +319,8 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
                 range.group_offset,
                 range.reduce_groups,
                 shape.input_width_tiles,
+                shape.valid_last_width,
+                key.op.padding_identity_bits(),
             ],
             vec![range.reduce_groups, shape.input_width_tiles],
         )?;
@@ -432,6 +444,16 @@ fn checked_product(values: &[usize]) -> io::Result<usize> {
         .ok_or_else(|| invalid_input("shape dimensions overflow"))
 }
 
+fn valid_last_tile_width(logical_width: usize) -> io::Result<u32> {
+    let width = logical_width % TILE_C;
+    let width = if width == 0 && logical_width != 0 {
+        TILE_C
+    } else {
+        width
+    };
+    u32_arg(width, "valid last reduction tile width")
+}
+
 fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
@@ -448,4 +470,27 @@ fn u32_addr(value: u64, name: &str) -> io::Result<u32> {
 fn checked_mul_u32(lhs: u32, rhs: u32, name: &str) -> io::Result<u32> {
     lhs.checked_mul(rhs)
         .ok_or_else(|| invalid_input(format!("{name} overflow: {lhs} * {rhs}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduce_plan_tracks_partial_last_width_tile() {
+        let plan =
+            ReducePlan::new(DType::Float32, &[2, 30], &[2], &[1], ReduceReducer::Max).unwrap();
+        assert_eq!(plan.shape.input_width_tiles, 1);
+        assert_eq!(plan.shape.valid_last_width, 30);
+        assert_eq!(plan.op.padding_identity_bits(), f32::NEG_INFINITY.to_bits());
+    }
+
+    #[test]
+    fn reduce_plan_keeps_aligned_last_width_tile_unmasked() {
+        let plan =
+            ReducePlan::new(DType::Float32, &[2, 64], &[2], &[1], ReduceReducer::Add).unwrap();
+        assert_eq!(plan.shape.input_width_tiles, 2);
+        assert_eq!(plan.shape.valid_last_width, TILE_C as u32);
+        assert_eq!(plan.op.padding_identity_bits(), 0.0f32.to_bits());
+    }
 }
