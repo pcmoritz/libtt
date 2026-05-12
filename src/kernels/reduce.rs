@@ -5,7 +5,7 @@ use crate::dram::{
 };
 use crate::executable::ReduceReducer;
 use crate::hw::CoreCoord;
-use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
 use std::io;
 
 const READER: &str = include_str!("../../kernels/reduce_reader.cc");
@@ -160,10 +160,18 @@ impl ReducePlan {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ReduceProgramKey {
-    core: CoreCoord,
+    cores: Vec<CoreCoord>,
     dtype: DType,
     op: ReduceOp,
     shape: ReduceKernelShape,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReduceCoreRange {
+    group_offset: u32,
+    reduce_groups: u32,
+    output_tile_offset: u32,
+    output_tiles: u32,
 }
 
 struct ReduceKernel {
@@ -205,17 +213,19 @@ pub(crate) fn reduce(
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
     validate_input(input, plan)?;
-    let core = device
-        .cores_ref()
-        .first()
-        .copied()
-        .ok_or_else(|| invalid_input("no worker cores are available"))?;
     let output_tiles = usize::try_from(plan.shape.output_tiles).map_err(|_| {
         invalid_input(format!(
             "output tile count does not fit in usize: {}",
             plan.shape.output_tiles
         ))
     })?;
+    let partition_count = usize::try_from(reduce_partition_count(plan.shape)?).map_err(|_| {
+        invalid_input(format!(
+            "reduce partition count does not fit in usize for shape {:?}",
+            plan.shape
+        ))
+    })?;
+    let cores = select_worker_cores(device.cores_ref(), partition_count)?;
     let output = device.alloc(
         output_tiles,
         plan.dtype,
@@ -226,7 +236,7 @@ pub(crate) fn reduce(
         input_addr: u32_addr(input.addr, "input address")?,
         output_addr: u32_addr(output.addr, "output address")?,
         key: ReduceProgramKey {
-            core,
+            cores,
             dtype: plan.dtype,
             op: plan.op,
             shape: plan.shape,
@@ -262,10 +272,15 @@ fn validate_input(input: &DramBuffer, plan: &ReducePlan) -> io::Result<()> {
 
 fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
     let shape = key.shape;
-    let output_tiles = usize::try_from(shape.output_tiles).map_err(|_| {
+    let ranges = reduce_core_ranges(shape, key.cores.len())?;
+    let max_core_output_tiles = ranges
+        .iter()
+        .map(|range| range.output_tiles)
+        .max()
+        .unwrap_or(1);
+    let output_tiles = usize::try_from(max_core_output_tiles).map_err(|_| {
         invalid_input(format!(
-            "output tile count does not fit in usize: {}",
-            shape.output_tiles
+            "per-core output tile count does not fit in usize: {max_core_output_tiles}"
         ))
     })?;
     let mut runtime_args = RuntimeArgsBuilder::new(
@@ -274,25 +289,30 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
         vec![READER_INPUT_ADDR_INDEX],
         Vec::new(),
     );
-    runtime_args.add_core(
-        key.core,
-        vec![
-            0,
-            shape.reduce_groups,
-            shape.input_row_tiles,
-            shape.output_tiles,
-            shape.output_tiles_per_row,
-            shape.output_rank.as_arg(),
-            shape.output_dim0,
-            shape.output_dim1,
-        ],
-        vec![
-            0,
-            shape.reduce_groups,
-            shape.input_width_tiles,
-        ],
-        vec![shape.reduce_groups, shape.input_width_tiles],
-    )?;
+    for (&core, range) in key.cores.iter().zip(ranges.iter()) {
+        runtime_args.add_core(
+            core,
+            vec![
+                0,
+                range.group_offset,
+                range.reduce_groups,
+                shape.input_row_tiles,
+                range.output_tile_offset,
+                range.output_tiles,
+                shape.output_tiles_per_row,
+                shape.output_rank.as_arg(),
+                shape.output_dim0,
+                shape.output_dim1,
+            ],
+            vec![
+                0,
+                range.group_offset,
+                range.reduce_groups,
+                shape.input_width_tiles,
+            ],
+            vec![range.reduce_groups, shape.input_width_tiles],
+        )?;
+    }
     let runtime_args = runtime_args.build()?;
     Ok(Program {
         reader_kernel: READER.to_owned(),
@@ -323,7 +343,86 @@ fn reduce_compute_source(op: ReduceOp) -> String {
 }
 
 fn bool_define(value: bool) -> &'static str {
-    if value { "1" } else { "0" }
+    if value {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+fn reduce_partition_count(shape: ReduceKernelShape) -> io::Result<u32> {
+    match shape.output_rank {
+        OutputRank::One => Ok(shape.output_tiles),
+        OutputRank::Two => output_tile_rows(shape),
+    }
+}
+
+fn reduce_core_ranges(
+    shape: ReduceKernelShape,
+    core_count: usize,
+) -> io::Result<Vec<ReduceCoreRange>> {
+    let partition_count = reduce_partition_count(shape)?;
+    (0..core_count)
+        .map(|core_index| {
+            let (partition_offset, partitions) =
+                split_tile_range(partition_count, core_index, core_count)?;
+            reduce_core_range(shape, partition_offset, partitions)
+        })
+        .collect()
+}
+
+fn reduce_core_range(
+    shape: ReduceKernelShape,
+    partition_offset: u32,
+    partitions: u32,
+) -> io::Result<ReduceCoreRange> {
+    match shape.output_rank {
+        OutputRank::One => Ok(ReduceCoreRange {
+            group_offset: partition_offset,
+            reduce_groups: partitions,
+            output_tile_offset: partition_offset,
+            output_tiles: partitions,
+        }),
+        OutputRank::Two => reduce_matrix_core_range(shape, partition_offset, partitions),
+    }
+}
+
+fn reduce_matrix_core_range(
+    shape: ReduceKernelShape,
+    tile_row_offset: u32,
+    tile_rows: u32,
+) -> io::Result<ReduceCoreRange> {
+    let output_tile_offset = checked_mul_u32(
+        tile_row_offset,
+        shape.output_tiles_per_row,
+        "output tile offset",
+    )?;
+    let output_tiles = checked_mul_u32(tile_rows, shape.output_tiles_per_row, "output tiles")?;
+    let output_row_offset = checked_mul_u32(tile_row_offset, TILE_R as u32, "output row offset")?;
+    let max_rows = checked_mul_u32(tile_rows, TILE_R as u32, "output rows")?;
+    let output_rows = shape
+        .output_dim0
+        .saturating_sub(output_row_offset)
+        .min(max_rows);
+    let group_offset = checked_mul_u32(
+        output_row_offset,
+        shape.input_row_tiles,
+        "reduce group offset",
+    )?;
+    let reduce_groups = checked_mul_u32(output_rows, shape.input_row_tiles, "reduce group count")?;
+    Ok(ReduceCoreRange {
+        group_offset,
+        reduce_groups,
+        output_tile_offset,
+        output_tiles,
+    })
+}
+
+fn output_tile_rows(shape: ReduceKernelShape) -> io::Result<u32> {
+    if shape.output_tiles_per_row == 0 {
+        return Err(invalid_input("output tiles per row must be nonzero"));
+    }
+    Ok(shape.output_tiles / shape.output_tiles_per_row)
 }
 
 fn checked_product(values: &[usize]) -> io::Result<usize> {
@@ -344,4 +443,9 @@ fn u32_arg(value: usize, name: &str) -> io::Result<u32> {
 fn u32_addr(value: u64, name: &str) -> io::Result<u32> {
     u32::try_from(value)
         .map_err(|_| invalid_input(format!("{name} does not fit in u32: 0x{value:x}")))
+}
+
+fn checked_mul_u32(lhs: u32, rhs: u32, name: &str) -> io::Result<u32> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| invalid_input(format!("{name} overflow: {lhs} * {rhs}")))
 }

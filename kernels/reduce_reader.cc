@@ -2,8 +2,9 @@
 
 void kernel_main() {
   uint32_t input_addr = get_arg_val<uint32_t>(0);
-  uint32_t reduce_groups = get_arg_val<uint32_t>(1);
-  uint32_t width_tiles = get_arg_val<uint32_t>(2);
+  uint32_t group_offset = get_arg_val<uint32_t>(1);
+  uint32_t reduce_groups = get_arg_val<uint32_t>(2);
+  uint32_t width_tiles = get_arg_val<uint32_t>(3);
 
   constexpr uint32_t cb_input = tt::CBIndex::c_0;
   const InterleavedAddrGenFast<true> input = {
@@ -13,7 +14,7 @@ void kernel_main() {
   };
 
   for (uint32_t group = 0; group < reduce_groups; ++group) {
-    uint32_t tile_base = group * width_tiles;
+    uint32_t tile_base = (group_offset + group) * width_tiles;
     for (uint32_t wt = 0; wt < width_tiles; ++wt) {
       cb_reserve_back(cb_input, 1);
       noc_async_read_tile(tile_base + wt, input, get_write_ptr(cb_input));

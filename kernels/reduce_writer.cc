@@ -27,22 +27,22 @@ void zero_tiles(uint32_t base_l1_addr, uint32_t tile_size, uint32_t tile_count) 
 }
 
 void copy_reduced_tile(uint32_t reduced_l1_addr, uint32_t output_base_l1_addr,
-                       uint32_t output_tile_size, uint32_t group, uint32_t input_row_tiles,
-                       uint32_t output_tiles_per_row, uint32_t output_rank, uint32_t output_dim0,
-                       uint32_t output_dim1) {
+                       uint32_t output_tile_size, uint32_t global_group, uint32_t input_row_tiles,
+                       uint32_t output_tile_offset, uint32_t output_tiles_per_row,
+                       uint32_t output_rank, uint32_t output_dim0, uint32_t output_dim1) {
   volatile tt_l1_ptr uint32_t *reduced =
       reinterpret_cast<volatile tt_l1_ptr uint32_t *>(reduced_l1_addr);
   volatile tt_l1_ptr uint32_t *output =
       reinterpret_cast<volatile tt_l1_ptr uint32_t *>(output_base_l1_addr);
   uint32_t output_tile_elements = output_tile_size / sizeof(uint32_t);
-  uint32_t outer = group / input_row_tiles;
-  uint32_t row_tile = group % input_row_tiles;
+  uint32_t outer = global_group / input_row_tiles;
+  uint32_t row_tile = global_group % input_row_tiles;
 
   for (uint32_t row = 0; row < TILE_R; ++row) {
     uint32_t output_row = 0;
     uint32_t output_col = 0;
     if (output_rank == 1) {
-      output_col = group * TILE_R + row;
+      output_col = global_group * TILE_R + row;
       if (output_col >= output_dim1) {
         continue;
       }
@@ -57,8 +57,9 @@ void copy_reduced_tile(uint32_t reduced_l1_addr, uint32_t output_base_l1_addr,
     uint32_t output_tile_row = output_row / TILE_R;
     uint32_t output_tile_col = output_col / TILE_C;
     uint32_t output_tile = output_tile_row * output_tiles_per_row + output_tile_col;
+    uint32_t local_output_tile = output_tile - output_tile_offset;
     uint32_t output_index =
-        output_tile * output_tile_elements + tile_element_index(output_row % TILE_R, output_col % TILE_C);
+        local_output_tile * output_tile_elements + tile_element_index(output_row % TILE_R, output_col % TILE_C);
     output[output_index] = reduced[tile_element_index(0, row)];
   }
 }
@@ -67,13 +68,15 @@ void copy_reduced_tile(uint32_t reduced_l1_addr, uint32_t output_base_l1_addr,
 
 void kernel_main() {
   uint32_t output_addr = get_arg_val<uint32_t>(0);
-  uint32_t reduce_groups = get_arg_val<uint32_t>(1);
-  uint32_t input_row_tiles = get_arg_val<uint32_t>(2);
-  uint32_t output_tiles = get_arg_val<uint32_t>(3);
-  uint32_t output_tiles_per_row = get_arg_val<uint32_t>(4);
-  uint32_t output_rank = get_arg_val<uint32_t>(5);
-  uint32_t output_dim0 = get_arg_val<uint32_t>(6);
-  uint32_t output_dim1 = get_arg_val<uint32_t>(7);
+  uint32_t group_offset = get_arg_val<uint32_t>(1);
+  uint32_t reduce_groups = get_arg_val<uint32_t>(2);
+  uint32_t input_row_tiles = get_arg_val<uint32_t>(3);
+  uint32_t output_tile_offset = get_arg_val<uint32_t>(4);
+  uint32_t output_tiles = get_arg_val<uint32_t>(5);
+  uint32_t output_tiles_per_row = get_arg_val<uint32_t>(6);
+  uint32_t output_rank = get_arg_val<uint32_t>(7);
+  uint32_t output_dim0 = get_arg_val<uint32_t>(8);
+  uint32_t output_dim1 = get_arg_val<uint32_t>(9);
 
   constexpr uint32_t cb_reduced = tt::CBIndex::c_16;
   constexpr uint32_t cb_output = tt::CBIndex::c_17;
@@ -90,13 +93,14 @@ void kernel_main() {
 
   for (uint32_t group = 0; group < reduce_groups; ++group) {
     cb_wait_front(cb_reduced, 1);
-    copy_reduced_tile(get_read_ptr(cb_reduced), output_base_l1_addr, output_tile_size, group,
-                      input_row_tiles, output_tiles_per_row, output_rank, output_dim0, output_dim1);
+    copy_reduced_tile(get_read_ptr(cb_reduced), output_base_l1_addr, output_tile_size,
+                      group_offset + group, input_row_tiles, output_tile_offset,
+                      output_tiles_per_row, output_rank, output_dim0, output_dim1);
     cb_pop_front(cb_reduced, 1);
   }
 
   for (uint32_t tile = 0; tile < output_tiles; ++tile) {
-    noc_async_write_tile(tile, output, output_base_l1_addr + tile * output_tile_size);
+    noc_async_write_tile(output_tile_offset + tile, output, output_base_l1_addr + tile * output_tile_size);
     noc_async_write_barrier();
   }
   cb_push_back(cb_output, output_tiles);
