@@ -120,8 +120,8 @@ fn validate_input(input: &DramBuffer, dtype: DType, logical_shape: &[usize]) -> 
 }
 
 fn reshape_shape(input_shape: &[usize], output_shape: &[usize]) -> io::Result<ReshapeKernelShape> {
-    let input_volume = logical_volume(input_shape)?;
-    let output_volume = logical_volume(output_shape)?;
+    let input_volume = checked_volume(input_shape, "input shape")?;
+    let output_volume = checked_volume(output_shape, "output shape")?;
     if input_volume != output_volume {
         return Err(invalid_input(format!(
             "reshape input shape {input_shape:?} has volume {input_volume}, output shape {output_shape:?} has volume {output_volume}"
@@ -215,11 +215,16 @@ fn reshape_reader_source(dtype: DType) -> io::Result<String> {
     ))
 }
 
-fn logical_volume(shape: &[usize]) -> io::Result<usize> {
+fn checked_volume(shape: &[usize], label: &str) -> io::Result<usize> {
     shape
         .iter()
         .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-        .ok_or_else(|| invalid_input("reshape logical volume overflow"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("reshape {label} volume overflow"),
+            )
+        })
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -260,5 +265,13 @@ mod tests {
     fn reshape_shape_rejects_volume_mismatch() {
         let err = reshape_shape(&[2, 3], &[2, 4]).expect_err("volume mismatch");
         assert!(err.to_string().contains("volume"));
+    }
+
+    #[test]
+    fn reshape_shape_reports_volume_overflow_as_out_of_memory() {
+        let err = reshape_shape(&[usize::MAX, 2], &[usize::MAX, 2]).expect_err("volume overflow");
+
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert!(err.to_string().contains("input shape volume overflow"));
     }
 }

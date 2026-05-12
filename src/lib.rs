@@ -1761,20 +1761,6 @@ fn execute_reshape(
 
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let input_volume = input_shape
-        .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-        .ok_or_else(|| resource_exhausted("reshape input shape volume overflow"))?;
-    let output_volume = output_shape
-        .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-        .ok_or_else(|| resource_exhausted("reshape output shape volume overflow"))?;
-    if input_volume != output_volume {
-        return Err(invalid_argument(format!(
-            "TT executable reshape volume mismatch: input {:?} has {input_volume} elements, output {:?} has {output_volume}",
-            input_desc.dims, output_desc.dims
-        )));
-    }
 
     let input = device_buffer_for_value(values, input_id, "reshape.operand")?;
     let Some(input_dram) = input.dram_buffer.as_ref() else {
