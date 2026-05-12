@@ -11,6 +11,7 @@ const WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
 const ADD_BF16_COMPUTE: &str = include_str!("../../kernels/add_compute.cc");
 const MULTIPLY_COMPUTE: &str = include_str!("../../kernels/multiply_compute.cc");
 const DIVIDE_COMPUTE: &str = include_str!("../../kernels/divide_compute.cc");
+const POWER_COMPUTE: &str = include_str!("../../kernels/power_compute.cc");
 const MAX_BF16_COMPUTE: &str = include_str!("../../kernels/max_compute.cc");
 const COMPARE_COMPUTE: &str = include_str!("../../kernels/compare_compute.cc");
 const READER_LHS_ADDR_INDEX: usize = 0;
@@ -24,6 +25,7 @@ pub(crate) enum BinaryEltwiseOp {
     Add,
     Multiply,
     Divide,
+    Power,
     Max,
     Compare(CompareDirection),
 }
@@ -34,6 +36,7 @@ impl BinaryEltwiseOp {
             Self::Add => Ok(ADD_BF16_COMPUTE.to_owned()),
             Self::Multiply => Ok(MULTIPLY_COMPUTE.to_owned()),
             Self::Divide => divide_compute_source(input_dtype),
+            Self::Power => power_compute_source(input_dtype),
             Self::Max => Ok(MAX_BF16_COMPUTE.to_owned()),
             Self::Compare(direction) => compare_compute_source(input_dtype, direction),
         }
@@ -44,6 +47,7 @@ impl BinaryEltwiseOp {
             Self::Add => format!("eltwise_add_{input_dtype:?}_{output_dtype:?}"),
             Self::Multiply => format!("eltwise_multiply_{input_dtype:?}_{output_dtype:?}"),
             Self::Divide => format!("eltwise_divide_{input_dtype:?}_{output_dtype:?}"),
+            Self::Power => format!("eltwise_power_{input_dtype:?}_{output_dtype:?}"),
             Self::Max => "eltwise_max_bf16".to_owned(),
             Self::Compare(direction) => {
                 format!("eltwise_compare_{direction:?}_{input_dtype:?}_{output_dtype:?}")
@@ -56,6 +60,7 @@ impl BinaryEltwiseOp {
             Self::Add => input_dtype,
             Self::Multiply => input_dtype,
             Self::Divide => input_dtype,
+            Self::Power => input_dtype,
             Self::Max => DType::Float16B,
             Self::Compare(_) => DType::UInt8,
         }
@@ -277,6 +282,15 @@ fn divide_compute_source(dtype: DType) -> io::Result<String> {
         )));
     }
     Ok(DIVIDE_COMPUTE.to_owned())
+}
+
+fn power_compute_source(dtype: DType) -> io::Result<String> {
+    if !matches!(dtype, DType::Float16 | DType::Float16B | DType::Float32) {
+        return Err(invalid_input(format!(
+            "power currently supports Float16, Float16B, and Float32 inputs, got {dtype:?}"
+        )));
+    }
+    Ok(POWER_COMPUTE.to_owned())
 }
 
 fn compare_direction_variant(direction: CompareDirection) -> &'static str {

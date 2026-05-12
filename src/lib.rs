@@ -1627,7 +1627,8 @@ fn execute_binary_eltwise(
     let expected_output_type = match op {
         kernels::binary_eltwise::BinaryEltwiseOp::Add
         | kernels::binary_eltwise::BinaryEltwiseOp::Divide
-        | kernels::binary_eltwise::BinaryEltwiseOp::Multiply => lhs_desc.element_type,
+        | kernels::binary_eltwise::BinaryEltwiseOp::Multiply
+        | kernels::binary_eltwise::BinaryEltwiseOp::Power => lhs_desc.element_type,
         kernels::binary_eltwise::BinaryEltwiseOp::Max => {
             if input_dtype != DType::Float16B {
                 return Err(unimplemented(format!(
@@ -2082,10 +2083,20 @@ fn execute_executable_v1(
                     "divide",
                 )?;
             }
-            executable::Op::Power { .. } => {
-                return Err(unimplemented(
-                    "TT executable power execution is not currently supported",
-                ));
+            executable::Op::Power {
+                input_ids,
+                output_id,
+            } => {
+                execute_binary_eltwise(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Power,
+                    *input_ids,
+                    *output_id,
+                    "power",
+                )?;
             }
             executable::Op::Concatenate { .. } => {
                 return Err(unimplemented(
