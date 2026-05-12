@@ -37,6 +37,10 @@ impl ReduceOp {
             Self::Max => "ckernel::PoolType::MAX",
         }
     }
+
+    fn is_sum(self) -> bool {
+        matches!(self, Self::Sum)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -286,7 +290,6 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
             0,
             shape.reduce_groups,
             shape.input_width_tiles,
-            1.0f32.to_bits(),
         ],
         vec![shape.reduce_groups, shape.input_width_tiles],
     )?;
@@ -298,11 +301,6 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
         compile: CompileConfig {
             cbs: vec![
                 CBConfig::new(0, key.dtype),
-                CBConfig {
-                    index: 2,
-                    dtype: key.dtype,
-                    tiles: 1,
-                },
                 CBConfig::new(16, key.dtype),
                 CBConfig {
                     index: 17,
@@ -319,7 +317,13 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
 }
 
 fn reduce_compute_source(op: ReduceOp) -> String {
-    COMPUTE.replace("REDUCE_POOL_TYPE", op.cpp_pool_type())
+    COMPUTE
+        .replace("REDUCE_POOL_TYPE", op.cpp_pool_type())
+        .replace("REDUCE_IS_SUM", bool_define(op.is_sum()))
+}
+
+fn bool_define(value: bool) -> &'static str {
+    if value { "1" } else { "0" }
 }
 
 fn checked_product(values: &[usize]) -> io::Result<usize> {
