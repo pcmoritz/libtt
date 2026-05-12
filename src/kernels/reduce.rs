@@ -58,15 +58,13 @@ enum OutputRank {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct ReduceKernelShape {
-    reduce_groups: u32,
     input_width_tiles: u32,
     valid_last_width: u32,
     output_tiles: u32,
-    output_tiles_per_row: u32,
+    inner_output_tiles: u32,
     output_rank: OutputRank,
     output_dim0: u32,
     output_dim1: u32,
-    input_row_tiles: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,14 +119,11 @@ impl ReducePlan {
         let rank = input_allocation_shape.len();
         let input_width_tiles = input_allocation_shape[rank - 1] / TILE_C;
         let valid_last_width = valid_last_tile_width(input_shape[input_shape.len() - 1])?;
-        let input_row_tiles = input_allocation_shape[rank - 2] / TILE_R;
-        let outer_count = checked_product(&input_shape[..input_shape.len() - 2])?;
-        let reduce_groups = outer_count
-            .checked_mul(input_row_tiles)
-            .ok_or_else(|| invalid_input("reduce group count overflow"))?;
+        let inner_output_tiles = input_allocation_shape[rank - 2] / TILE_R;
         let output_tiles = tiled_shape_tile_count(output_shape)?;
-        let output_tiles_per_row =
+        let output_inner_tiles =
             output_allocation_shape[output_allocation_shape.len() - 1] / TILE_C;
+        debug_assert_eq!(inner_output_tiles, output_inner_tiles);
         let (output_rank, output_dim0, output_dim1) = match output_shape {
             [dim] => (OutputRank::One, 1, *dim),
             [dim0, dim1] => (OutputRank::Two, *dim0, *dim1),
@@ -143,15 +138,13 @@ impl ReducePlan {
             input_shape: input_shape.to_vec(),
             output_allocation_shape,
             shape: ReduceKernelShape {
-                reduce_groups: u32_arg(reduce_groups, "reduce group count")?,
                 input_width_tiles: u32_arg(input_width_tiles, "input width tile count")?,
                 valid_last_width,
                 output_tiles: u32_arg(output_tiles, "output tile count")?,
-                output_tiles_per_row: u32_arg(output_tiles_per_row, "output tiles per row")?,
+                inner_output_tiles: u32_arg(inner_output_tiles, "inner output tile count")?,
                 output_rank,
                 output_dim0: u32_arg(output_dim0, "output dim0")?,
                 output_dim1: u32_arg(output_dim1, "output dim1")?,
-                input_row_tiles: u32_arg(input_row_tiles, "input row tile count")?,
             },
             op: ReduceOp::from_reducer(reducer)?,
             dtype,
@@ -297,10 +290,9 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
                 0,
                 range.group_offset,
                 range.reduce_groups,
-                shape.input_row_tiles,
+                shape.inner_output_tiles,
                 range.output_tile_offset,
                 range.output_tiles,
-                shape.output_tiles_per_row,
                 shape.output_dim0,
                 shape.output_dim1,
             ],
@@ -396,10 +388,10 @@ fn reduce_matrix_core_range(
 ) -> io::Result<ReduceCoreRange> {
     let output_tile_offset = checked_mul_u32(
         tile_row_offset,
-        shape.output_tiles_per_row,
+        shape.inner_output_tiles,
         "output tile offset",
     )?;
-    let output_tiles = checked_mul_u32(tile_rows, shape.output_tiles_per_row, "output tiles")?;
+    let output_tiles = checked_mul_u32(tile_rows, shape.inner_output_tiles, "output tiles")?;
     let output_row_offset = checked_mul_u32(tile_row_offset, TILE_R as u32, "output row offset")?;
     let max_rows = checked_mul_u32(tile_rows, TILE_R as u32, "output rows")?;
     let output_rows = shape
@@ -408,10 +400,11 @@ fn reduce_matrix_core_range(
         .min(max_rows);
     let group_offset = checked_mul_u32(
         output_row_offset,
-        shape.input_row_tiles,
+        shape.inner_output_tiles,
         "reduce group offset",
     )?;
-    let reduce_groups = checked_mul_u32(output_rows, shape.input_row_tiles, "reduce group count")?;
+    let reduce_groups =
+        checked_mul_u32(output_rows, shape.inner_output_tiles, "reduce group count")?;
     Ok(ReduceCoreRange {
         group_offset,
         reduce_groups,
@@ -421,17 +414,10 @@ fn reduce_matrix_core_range(
 }
 
 fn output_tile_rows(shape: ReduceKernelShape) -> io::Result<u32> {
-    if shape.output_tiles_per_row == 0 {
-        return Err(invalid_input("output tiles per row must be nonzero"));
+    if shape.inner_output_tiles == 0 {
+        return Err(invalid_input("inner output tile count must be nonzero"));
     }
-    Ok(shape.output_tiles / shape.output_tiles_per_row)
-}
-
-fn checked_product(values: &[usize]) -> io::Result<usize> {
-    values
-        .iter()
-        .try_fold(1usize, |acc, &value| acc.checked_mul(value))
-        .ok_or_else(|| invalid_input("shape dimensions overflow"))
+    Ok(shape.output_tiles / shape.inner_output_tiles)
 }
 
 fn valid_last_tile_width(logical_width: usize) -> io::Result<u32> {
