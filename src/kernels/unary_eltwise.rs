@@ -3,7 +3,7 @@ use crate::dispatch::{CBConfig, CompileConfig, Program};
 use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
 use crate::hw::CoreCoord;
 use crate::kernels::binary_eltwise::EltwiseInput;
-use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
 use std::io;
 
 const READER: &str = include_str!("../../kernels/unary_eltwise_reader.cc");
@@ -93,10 +93,10 @@ impl UnaryEltwiseOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct UnaryEltwiseProgramKey {
     op: UnaryEltwiseOp,
-    core: CoreCoord,
+    cores: Vec<CoreCoord>,
     tile_count: u32,
     input_dtype: DType,
     output_dtype: DType,
@@ -111,11 +111,11 @@ struct UnaryEltwiseKernel {
 
 impl Kernel<UnaryEltwiseProgramKey> for UnaryEltwiseKernel {
     fn program_key(&self) -> UnaryEltwiseProgramKey {
-        self.key
+        self.key.clone()
     }
 
     fn build_program(&self) -> io::Result<Program> {
-        eltwise_program(self.key)
+        eltwise_program(self.key.clone())
     }
 
     #[inline]
@@ -151,11 +151,7 @@ pub(crate) fn eltwise(
     let input_addr = input_addr(input, "input address")?;
     let tile_count = u32::try_from(output_tiles)
         .map_err(|_| invalid_input(format!("tile count does not fit in u32: {output_tiles}")))?;
-    let core = device
-        .cores_ref()
-        .first()
-        .copied()
-        .ok_or_else(|| invalid_input("no worker cores are available"))?;
+    let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
     let output_shape = tiled_allocation_shape(shape)?;
     let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
     let output_addr = u32_arg(output.addr, "output address")?;
@@ -166,7 +162,7 @@ pub(crate) fn eltwise(
         output_addr,
         key: UnaryEltwiseProgramKey {
             op,
-            core,
+            cores,
             tile_count,
             input_dtype,
             output_dtype,
@@ -238,12 +234,15 @@ fn eltwise_program(key: UnaryEltwiseProgramKey) -> io::Result<Program> {
         vec![READER_INPUT_ADDR_INDEX, READER_INPUT_CONSTANT_INDEX],
         Vec::new(),
     );
-    runtime_args.add_core(
-        key.core,
-        vec![0, 0, key.tile_count],
-        vec![0, 0, key.tile_count, 0],
-        vec![key.tile_count],
-    )?;
+    for (core_index, &core) in key.cores.iter().enumerate() {
+        let (offset, n_tiles) = split_tile_range(key.tile_count, core_index, key.cores.len())?;
+        runtime_args.add_core(
+            core,
+            vec![0, offset, n_tiles],
+            vec![0, offset, n_tiles, 0],
+            vec![n_tiles],
+        )?;
+    }
     let runtime_args = runtime_args.build()?;
     Ok(Program {
         reader_kernel: READER.to_owned(),
