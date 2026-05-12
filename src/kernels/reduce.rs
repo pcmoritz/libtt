@@ -1,0 +1,343 @@
+use crate::device::Device;
+use crate::dispatch::{CBConfig, CompileConfig, Program};
+use crate::dram::{
+    tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R,
+};
+use crate::executable::ReduceReducer;
+use crate::hw::CoreCoord;
+use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
+use std::io;
+
+const READER: &str = include_str!("../../kernels/reduce_reader.cc");
+const COMPUTE: &str = include_str!("../../kernels/reduce_compute.cc");
+const WRITER: &str = include_str!("../../kernels/reduce_writer.cc");
+const READER_INPUT_ADDR_INDEX: usize = 0;
+const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum ReduceOp {
+    Sum,
+    Max,
+}
+
+impl ReduceOp {
+    fn from_reducer(reducer: ReduceReducer) -> io::Result<Self> {
+        match reducer {
+            ReduceReducer::Add => Ok(Self::Sum),
+            ReduceReducer::Max => Ok(Self::Max),
+            ReduceReducer::Mul => Err(invalid_input(
+                "reduce kernel currently supports add and max reducers",
+            )),
+        }
+    }
+
+    fn cpp_pool_type(self) -> &'static str {
+        match self {
+            Self::Sum => "ckernel::PoolType::SUM",
+            Self::Max => "ckernel::PoolType::MAX",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum OutputRank {
+    One,
+    Two,
+}
+
+impl OutputRank {
+    fn as_arg(self) -> u32 {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct ReduceKernelShape {
+    reduce_groups: u32,
+    input_width_tiles: u32,
+    output_tiles: u32,
+    output_tiles_per_row: u32,
+    output_rank: OutputRank,
+    output_dim0: u32,
+    output_dim1: u32,
+    input_row_tiles: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReducePlan {
+    input_shape: Vec<usize>,
+    output_allocation_shape: Vec<usize>,
+    shape: ReduceKernelShape,
+    op: ReduceOp,
+    dtype: DType,
+}
+
+impl ReducePlan {
+    pub(crate) fn new(
+        dtype: DType,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        dimensions: &[i64],
+        reducer: ReduceReducer,
+    ) -> io::Result<Self> {
+        if dtype != DType::Float32 {
+            return Err(invalid_input(format!(
+                "reduce kernel currently supports Float32 inputs, got {dtype:?}"
+            )));
+        }
+        if input_shape.len() < 2 {
+            return Err(invalid_input(format!(
+                "reduce kernel requires rank >= 2 input, got {input_shape:?}"
+            )));
+        }
+        if output_shape.len() > 2 {
+            return Err(invalid_input(format!(
+                "reduce kernel currently supports rank <= 2 outputs, got {output_shape:?}"
+            )));
+        }
+
+        let reduce_dim = input_shape.len() - 1;
+        if dimensions != [reduce_dim as i64] {
+            return Err(invalid_input(format!(
+                "reduce kernel currently supports only the last dimension, got dimensions {dimensions:?} for shape {input_shape:?}"
+            )));
+        }
+        let expected_output = &input_shape[..input_shape.len() - 1];
+        if output_shape != expected_output {
+            return Err(invalid_input(format!(
+                "reduce output shape mismatch: expected {:?}, got {:?}",
+                expected_output, output_shape
+            )));
+        }
+
+        let input_allocation_shape = tiled_allocation_shape(input_shape)?;
+        let output_allocation_shape = tiled_allocation_shape(output_shape)?;
+        let rank = input_allocation_shape.len();
+        let input_width_tiles = input_allocation_shape[rank - 1] / TILE_C;
+        let input_row_tiles = input_allocation_shape[rank - 2] / TILE_R;
+        let outer_count = checked_product(&input_shape[..input_shape.len() - 2])?;
+        let reduce_groups = outer_count
+            .checked_mul(input_row_tiles)
+            .ok_or_else(|| invalid_input("reduce group count overflow"))?;
+        let output_tiles = tiled_shape_tile_count(output_shape)?;
+        let output_tiles_per_row =
+            output_allocation_shape[output_allocation_shape.len() - 1] / TILE_C;
+        let (output_rank, output_dim0, output_dim1) = match output_shape {
+            [dim] => (OutputRank::One, 1, *dim),
+            [dim0, dim1] => (OutputRank::Two, *dim0, *dim1),
+            _ => {
+                return Err(invalid_input(format!(
+                    "reduce kernel currently supports rank 1 or 2 outputs, got {output_shape:?}"
+                )))
+            }
+        };
+
+        Ok(Self {
+            input_shape: input_shape.to_vec(),
+            output_allocation_shape,
+            shape: ReduceKernelShape {
+                reduce_groups: u32_arg(reduce_groups, "reduce group count")?,
+                input_width_tiles: u32_arg(input_width_tiles, "input width tile count")?,
+                output_tiles: u32_arg(output_tiles, "output tile count")?,
+                output_tiles_per_row: u32_arg(output_tiles_per_row, "output tiles per row")?,
+                output_rank,
+                output_dim0: u32_arg(output_dim0, "output dim0")?,
+                output_dim1: u32_arg(output_dim1, "output dim1")?,
+                input_row_tiles: u32_arg(input_row_tiles, "input row tile count")?,
+            },
+            op: ReduceOp::from_reducer(reducer)?,
+            dtype,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ReduceProgramKey {
+    core: CoreCoord,
+    dtype: DType,
+    op: ReduceOp,
+    shape: ReduceKernelShape,
+}
+
+struct ReduceKernel {
+    input_addr: u32,
+    output_addr: u32,
+    key: ReduceProgramKey,
+}
+
+impl Kernel<ReduceProgramKey> for ReduceKernel {
+    fn program_key(&self) -> ReduceProgramKey {
+        self.key.clone()
+    }
+
+    fn build_program(&self) -> io::Result<Program> {
+        reduce_program(self.key.clone())
+    }
+
+    #[inline]
+    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        match index {
+            READER_INPUT_ADDR_INDEX => Some(self.input_addr),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        match index {
+            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn reduce(
+    device: &mut Device,
+    input: &DramBuffer,
+    plan: &ReducePlan,
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
+    validate_input(input, plan)?;
+    let core = device
+        .cores_ref()
+        .first()
+        .copied()
+        .ok_or_else(|| invalid_input("no worker cores are available"))?;
+    let output_tiles = usize::try_from(plan.shape.output_tiles).map_err(|_| {
+        invalid_input(format!(
+            "output tile count does not fit in usize: {}",
+            plan.shape.output_tiles
+        ))
+    })?;
+    let output = device.alloc(
+        output_tiles,
+        plan.dtype,
+        &plan.output_allocation_shape,
+        name,
+    )?;
+    let kernel = ReduceKernel {
+        input_addr: u32_addr(input.addr, "input address")?,
+        output_addr: u32_addr(output.addr, "output address")?,
+        key: ReduceProgramKey {
+            core,
+            dtype: plan.dtype,
+            op: plan.op,
+            shape: plan.shape,
+        },
+    };
+    kernel.run(device)?;
+    Ok(output)
+}
+
+fn validate_input(input: &DramBuffer, plan: &ReducePlan) -> io::Result<()> {
+    if input.dtype != plan.dtype {
+        return Err(invalid_input(format!(
+            "reduce input requires {:?}, got {:?}",
+            plan.dtype, input.dtype
+        )));
+    }
+    let expected_shape = tiled_allocation_shape(&plan.input_shape)?;
+    if input.shape != expected_shape {
+        return Err(invalid_input(format!(
+            "reduce input allocation shape mismatch: got {:?}, expected {:?} for logical shape {:?}",
+            input.shape, expected_shape, plan.input_shape
+        )));
+    }
+    let expected_tiles = tiled_shape_tile_count(&plan.input_shape)?;
+    if input.num_tiles != expected_tiles {
+        return Err(invalid_input(format!(
+            "reduce input tile count mismatch: got {}, expected {expected_tiles}",
+            input.num_tiles
+        )));
+    }
+    Ok(())
+}
+
+fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
+    let shape = key.shape;
+    let output_tiles = usize::try_from(shape.output_tiles).map_err(|_| {
+        invalid_input(format!(
+            "output tile count does not fit in usize: {}",
+            shape.output_tiles
+        ))
+    })?;
+    let mut runtime_args = RuntimeArgsBuilder::new(
+        0,
+        vec![WRITER_OUTPUT_ADDR_INDEX],
+        vec![READER_INPUT_ADDR_INDEX],
+        Vec::new(),
+    );
+    runtime_args.add_core(
+        key.core,
+        vec![
+            0,
+            shape.reduce_groups,
+            shape.input_row_tiles,
+            shape.output_tiles,
+            shape.output_tiles_per_row,
+            shape.output_rank.as_arg(),
+            shape.output_dim0,
+            shape.output_dim1,
+        ],
+        vec![
+            0,
+            shape.reduce_groups,
+            shape.input_width_tiles,
+            1.0f32.to_bits(),
+        ],
+        vec![shape.reduce_groups, shape.input_width_tiles],
+    )?;
+    let runtime_args = runtime_args.build()?;
+    Ok(Program {
+        reader_kernel: READER.to_owned(),
+        compute_kernel: reduce_compute_source(key.op),
+        writer_kernel: WRITER.to_owned(),
+        compile: CompileConfig {
+            cbs: vec![
+                CBConfig::new(0, key.dtype),
+                CBConfig {
+                    index: 2,
+                    dtype: key.dtype,
+                    tiles: 1,
+                },
+                CBConfig::new(16, key.dtype),
+                CBConfig {
+                    index: 17,
+                    dtype: key.dtype,
+                    tiles: output_tiles,
+                },
+            ],
+            dst_accum_mode: true,
+            ..CompileConfig::default()
+        },
+        name: format!("reduce_{:?}_{:?}", key.op, key.dtype),
+        ..Program::new(runtime_args)
+    })
+}
+
+fn reduce_compute_source(op: ReduceOp) -> String {
+    COMPUTE.replace("REDUCE_POOL_TYPE", op.cpp_pool_type())
+}
+
+fn checked_product(values: &[usize]) -> io::Result<usize> {
+    values
+        .iter()
+        .try_fold(1usize, |acc, &value| acc.checked_mul(value))
+        .ok_or_else(|| invalid_input("shape dimensions overflow"))
+}
+
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn u32_arg(value: usize, name: &str) -> io::Result<u32> {
+    u32::try_from(value).map_err(|_| invalid_input(format!("{name} does not fit in u32: {value}")))
+}
+
+fn u32_addr(value: u64, name: &str) -> io::Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| invalid_input(format!("{name} does not fit in u32: 0x{value:x}")))
+}

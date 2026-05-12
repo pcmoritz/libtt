@@ -1739,6 +1739,101 @@ fn execute_unary_eltwise(
     )
 }
 
+fn execute_reduce(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    init_value_ids: &[u32],
+    output_id: u32,
+    dimensions: &[i64],
+    reducer: executable::ReduceReducer,
+) -> Result<(), *mut PJRT_Error> {
+    let [input_id] = input_ids else {
+        return Err(unimplemented(
+            "TT executable reduce currently only supports one input",
+        ));
+    };
+    let [init_value_id] = init_value_ids else {
+        return Err(unimplemented(
+            "TT executable reduce currently only supports one init value",
+        ));
+    };
+
+    let input = device_buffer_for_value(values, *input_id, "reduce.input")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable reduce input buffer has no device allocation",
+        ));
+    };
+    let input_desc = plan
+        .values
+        .get(*input_id as usize)
+        .ok_or_else(|| invalid_argument("TT executable reduce input id is out of bounds"))?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable reduce output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != input_desc.element_type {
+        return Err(invalid_argument(
+            "TT executable reduce input and output element types must match",
+        ));
+    }
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let reduce_plan =
+        kernels::reduce::ReducePlan::new(dtype, &input_shape, &output_shape, dimensions, reducer)
+            .map_err(io_error)?;
+    if !reduce_init_is_supported(plan, *init_value_id, reducer) {
+        return Err(unimplemented(
+            "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
+        ));
+    }
+    let output_dram = kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
+        .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "reduce",
+    )
+}
+
+fn reduce_init_is_supported(
+    plan: &executable::Executable,
+    init_value_id: u32,
+    reducer: executable::ReduceReducer,
+) -> bool {
+    if let Some(packed_value) = constant_packed_value(plan, init_value_id) {
+        return match reducer {
+            executable::ReduceReducer::Add => packed_value == 0,
+            executable::ReduceReducer::Max => packed_value == f32::NEG_INFINITY.to_bits(),
+            executable::ReduceReducer::Mul => false,
+        };
+    }
+    true
+}
+
+fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option<u32> {
+    plan.ops.iter().find_map(|op| {
+        if let executable::Op::Constant {
+            packed_value,
+            output_id,
+        } = op
+        {
+            (*output_id == value_id).then_some(*packed_value)
+        } else {
+            None
+        }
+    })
+}
+
 fn execute_identity_custom_call(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2397,11 +2492,23 @@ fn execute_executable_v1(
                 *output_id,
                 "convert",
             )?,
-            executable::Op::Reduce { .. } => {
-                return Err(unimplemented(
-                    "TT executable reduce execution is not currently supported",
-                ));
-            }
+            executable::Op::Reduce {
+                input_ids,
+                init_value_ids,
+                output_id,
+                dimensions,
+                reducer,
+            } => execute_reduce(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_ids,
+                init_value_ids,
+                *output_id,
+                dimensions,
+                *reducer,
+            )?,
             executable::Op::Max {
                 input_ids,
                 output_id,

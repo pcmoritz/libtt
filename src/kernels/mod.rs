@@ -5,5 +5,6 @@ pub(crate) mod gather;
 pub(crate) mod iota;
 pub(crate) mod kernel;
 pub(crate) mod matmul;
+pub(crate) mod reduce;
 pub(crate) mod select;
 pub(crate) mod unary_eltwise;
