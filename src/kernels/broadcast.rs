@@ -1,42 +1,27 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C};
+use crate::dram::{
+    tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R,
+};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
 use std::io;
 
 const BROADCAST_READER: &str = include_str!("../../kernels/broadcast_reader.cc");
-const BROADCAST_COMPUTE: &str = include_str!("../../kernels/broadcast_compute.cc");
 const BROADCAST_WRITER: &str = include_str!("../../kernels/broadcast_writer.cc");
 const READER_INPUT_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct BroadcastKernelShape {
+    input_shape: Vec<u32>,
+    output_shape: Vec<u32>,
+    broadcast_dimensions: Vec<u32>,
+    input_tile_rows: u32,
+    input_tiles_per_row: u32,
+    output_tile_rows: u32,
     output_tiles_per_row: u32,
     tile_count: u32,
-    mode: BroadcastMode,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum BroadcastMode {
-    Copy,
-    Scalar,
-    Row,
-    Col,
-    Transpose,
-}
-
-impl BroadcastMode {
-    fn cpp_variant(self) -> &'static str {
-        match self {
-            Self::Copy => "Copy",
-            Self::Scalar => "Scalar",
-            Self::Row => "Row",
-            Self::Col => "Col",
-            Self::Transpose => "Transpose",
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,29 +37,20 @@ impl BroadcastInDimPlan {
         output_shape: &[usize],
         broadcast_dimensions: &[i64],
     ) -> io::Result<Self> {
-        validate_rank(input_shape, "input")?;
-        validate_rank(output_shape, "output")?;
         validate_broadcast_dimensions(input_shape, output_shape, broadcast_dimensions)?;
 
         let output_allocation_shape = tiled_allocation_shape(output_shape)?;
-        let output_tiles_per_row =
-            output_allocation_shape[output_allocation_shape.len() - 1] / TILE_C;
-        let tile_count = tiled_shape_tile_count(output_shape)?;
-        let mode = broadcast_mode(input_shape, output_shape, broadcast_dimensions)?;
+        let kernel_shape = broadcast_kernel_shape(input_shape, output_shape, broadcast_dimensions)?;
 
         Ok(Self {
             input_shape: input_shape.to_vec(),
             output_allocation_shape,
-            kernel_shape: BroadcastKernelShape {
-                output_tiles_per_row: u32_arg(output_tiles_per_row, "output tiles per row")?,
-                tile_count: u32_arg(tile_count, "tile count")?,
-                mode,
-            },
+            kernel_shape,
         })
     }
 
-    fn kernel_shape(&self) -> BroadcastKernelShape {
-        self.kernel_shape
+    fn kernel_shape(&self) -> &BroadcastKernelShape {
+        &self.kernel_shape
     }
 }
 
@@ -146,7 +122,7 @@ pub(crate) fn broadcast_in_dim(
         )));
     }
 
-    let shape = plan.kernel_shape();
+    let shape = plan.kernel_shape().clone();
     let output_tiles = usize::try_from(shape.tile_count).map_err(|_| {
         invalid_input(format!(
             "tile count does not fit in usize: {}",
@@ -168,6 +144,41 @@ pub(crate) fn broadcast_in_dim(
     Ok(output)
 }
 
+fn broadcast_kernel_shape(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[i64],
+) -> io::Result<BroadcastKernelShape> {
+    let input_allocation_shape = tiled_allocation_shape(input_shape)?;
+    let output_allocation_shape = tiled_allocation_shape(output_shape)?;
+    let input_rank = input_allocation_shape.len();
+    let output_rank = output_allocation_shape.len();
+    let tile_count = tiled_shape_tile_count(output_shape)?;
+
+    Ok(BroadcastKernelShape {
+        input_shape: u32_shape(input_shape, "input shape")?,
+        output_shape: u32_shape(output_shape, "output shape")?,
+        broadcast_dimensions: u32_broadcast_dimensions(broadcast_dimensions)?,
+        input_tile_rows: u32_arg(
+            input_allocation_shape[input_rank - 2] / TILE_R,
+            "input tile rows",
+        )?,
+        input_tiles_per_row: u32_arg(
+            input_allocation_shape[input_rank - 1] / TILE_C,
+            "input tiles per row",
+        )?,
+        output_tile_rows: u32_arg(
+            output_allocation_shape[output_rank - 2] / TILE_R,
+            "output tile rows",
+        )?,
+        output_tiles_per_row: u32_arg(
+            output_allocation_shape[output_rank - 1] / TILE_C,
+            "output tiles per row",
+        )?,
+        tile_count: u32_arg(tile_count, "tile count")?,
+    })
+}
+
 fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
@@ -181,40 +192,52 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
         runtime_args.add_core(
             core,
             vec![0, offset, n_tiles],
-            vec![0, offset, n_tiles, key.shape.output_tiles_per_row],
-            vec![n_tiles],
+            vec![0, offset, n_tiles],
+            Vec::new(),
         )?;
     }
     let runtime_args = runtime_args.build()?;
     Ok(Program {
-        reader_kernel: broadcast_reader_source(key.shape.mode),
-        compute_kernel: broadcast_compute_source(key.shape.mode),
+        reader_kernel: broadcast_reader_source(key.dtype, &key.shape)?,
         writer_kernel: BROADCAST_WRITER.to_owned(),
         compile: CompileConfig {
             cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(16, key.dtype)],
             ..CompileConfig::default()
         },
-        name: format!("broadcast_in_dim_{:?}", key.dtype),
+        name: format!(
+            "broadcast_in_dim_{:?}_{}_{}",
+            key.dtype,
+            key.shape.input_shape.len(),
+            key.shape.output_shape.len()
+        ),
         ..Program::new(runtime_args)
     })
 }
 
-fn broadcast_reader_source(mode: BroadcastMode) -> String {
-    BROADCAST_READER.replace("BROADCAST_MODE", mode.cpp_variant())
-}
-
-fn broadcast_compute_source(mode: BroadcastMode) -> String {
-    BROADCAST_COMPUTE.replace("BROADCAST_MODE", mode.cpp_variant())
-}
-
-fn validate_rank(shape: &[usize], name: &str) -> io::Result<()> {
-    if shape.len() <= 2 {
-        Ok(())
-    } else {
-        Err(invalid_input(format!(
-            "broadcast_in_dim currently supports rank <= 2 {name} shapes, got {shape:?}"
-        )))
-    }
+fn broadcast_reader_source(dtype: DType, shape: &BroadcastKernelShape) -> io::Result<String> {
+    let element_type = element_type(dtype);
+    Ok(format!(
+        "#define BROADCAST_INPUT_RANK {}\n\
+         #define BROADCAST_OUTPUT_RANK {}\n\
+         #define BROADCAST_INPUT_SHAPE {}\n\
+         #define BROADCAST_OUTPUT_SHAPE {}\n\
+         #define BROADCAST_DIMENSIONS {}\n\
+         #define BROADCAST_INPUT_TILE_ROWS {}\n\
+         #define BROADCAST_INPUT_TILES_PER_ROW {}\n\
+         #define BROADCAST_OUTPUT_TILE_ROWS {}\n\
+         #define BROADCAST_OUTPUT_TILES_PER_ROW {}\n\
+         #define BROADCAST_ELEMENT_TYPE {element_type}\n\
+         {BROADCAST_READER}",
+        shape.input_shape.len(),
+        shape.output_shape.len(),
+        cpp_u32_array(&shape.input_shape),
+        cpp_u32_array(&shape.output_shape),
+        cpp_u32_array(&shape.broadcast_dimensions),
+        shape.input_tile_rows,
+        shape.input_tiles_per_row,
+        shape.output_tile_rows,
+        shape.output_tiles_per_row,
+    ))
 }
 
 fn validate_broadcast_dimensions(
@@ -258,96 +281,50 @@ fn validate_broadcast_dimensions(
             )));
         }
     }
+
     Ok(())
 }
 
-fn logical_matrix_view(shape: &[usize]) -> (usize, usize) {
-    match shape {
-        [] => (1, 1),
-        [cols] => (1, *cols),
-        [rows, cols] => (*rows, *cols),
-        _ => unreachable!("broadcast rank validation should reject rank > 2"),
-    }
+fn u32_shape(shape: &[usize], name: &str) -> io::Result<Vec<u32>> {
+    shape
+        .iter()
+        .enumerate()
+        .map(|(index, &dim)| u32_arg(dim, &format!("{name} dimension {index}")))
+        .collect()
 }
 
-fn broadcast_mode(
-    input_shape: &[usize],
-    output_shape: &[usize],
-    broadcast_dimensions: &[i64],
-) -> io::Result<BroadcastMode> {
-    let input_rank = input_shape.len();
-    let output_rank = output_shape.len();
-    let (input_rows, input_cols) = logical_matrix_view(input_shape);
-    let (output_rows, output_cols) = logical_matrix_view(output_shape);
-
-    match input_rank {
-        0 => {
-            if output_rank == 0 {
-                Ok(BroadcastMode::Copy)
-            } else {
-                Ok(BroadcastMode::Scalar)
-            }
-        }
-        1 => rank1_broadcast_mode(
-            input_cols,
-            output_rank,
-            output_rows,
-            output_cols,
-            broadcast_dimensions,
-        ),
-        2 => rank2_broadcast_mode(input_rows, input_cols, output_rows, output_cols),
-        _ => unreachable!("broadcast rank validation should reject rank > 2"),
-    }
+fn u32_broadcast_dimensions(broadcast_dimensions: &[i64]) -> io::Result<Vec<u32>> {
+    broadcast_dimensions
+        .iter()
+        .enumerate()
+        .map(|(index, &dim)| {
+            u32::try_from(dim).map_err(|_| {
+                invalid_input(format!(
+                    "broadcast dimension {index} does not fit in u32: {dim}"
+                ))
+            })
+        })
+        .collect()
 }
 
-fn rank1_broadcast_mode(
-    input_cols: usize,
-    output_rank: usize,
-    output_rows: usize,
-    output_cols: usize,
-    broadcast_dimensions: &[i64],
-) -> io::Result<BroadcastMode> {
-    if input_cols == 1 {
-        return Ok(BroadcastMode::Scalar);
+fn cpp_u32_array(values: &[u32]) -> String {
+    if values.is_empty() {
+        return "{1u}".to_owned();
     }
-    match output_rank {
-        1 => Ok(BroadcastMode::Copy),
-        2 => match broadcast_dimensions[0] {
-            0 if output_cols == 1 => Ok(BroadcastMode::Transpose),
-            0 => Err(invalid_input(format!(
-                "broadcast_in_dim does not support rank-1 dimension 0 broadcasts to output shape [{output_rows}, {output_cols}] without a native transpose+broadcast kernel"
-            ))),
-            1 if output_rows == 1 => Ok(BroadcastMode::Copy),
-            1 => Ok(BroadcastMode::Row),
-            dim => Err(invalid_input(format!(
-                "broadcast dimension {dim} is not supported for rank-1 input"
-            ))),
-        },
-        _ => unreachable!("broadcast rank validation should reject rank > 2"),
-    }
+    let values = values
+        .iter()
+        .map(|value| format!("{value}u"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{values}}}")
 }
 
-fn rank2_broadcast_mode(
-    input_rows: usize,
-    input_cols: usize,
-    output_rows: usize,
-    output_cols: usize,
-) -> io::Result<BroadcastMode> {
-    if input_rows == output_rows && input_cols == output_cols {
-        return Ok(BroadcastMode::Copy);
+fn element_type(dtype: DType) -> &'static str {
+    match dtype {
+        DType::Float32 | DType::Int32 | DType::UInt32 => "uint32_t",
+        DType::Float16 | DType::Float16B | DType::UInt16 => "uint16_t",
+        DType::Int8 | DType::UInt8 => "uint8_t",
     }
-    if input_rows == 1 && input_cols == 1 {
-        return Ok(BroadcastMode::Scalar);
-    }
-    if input_rows == 1 && input_cols == output_cols {
-        return Ok(BroadcastMode::Row);
-    }
-    if input_cols == 1 && input_rows == output_rows {
-        return Ok(BroadcastMode::Col);
-    }
-    Err(invalid_input(format!(
-        "broadcast_in_dim cannot lower [{input_rows}, {input_cols}] to [{output_rows}, {output_cols}] with the native tile broadcast kernel"
-    )))
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -378,16 +355,21 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_plan_normalizes_rank1_column_case() {
+    fn broadcast_plan_describes_rank1_column_case() {
         let plan = BroadcastInDimPlan::new(&[32], &[32, 1], &[0]).expect("valid broadcast");
 
         assert_eq!(plan.output_allocation_shape, vec![32, 32]);
         assert_eq!(
             plan.kernel_shape(),
-            BroadcastKernelShape {
+            &BroadcastKernelShape {
+                input_shape: vec![32],
+                output_shape: vec![32, 1],
+                broadcast_dimensions: vec![0],
+                input_tile_rows: 1,
+                input_tiles_per_row: 1,
+                output_tile_rows: 1,
                 output_tiles_per_row: 1,
                 tile_count: 1,
-                mode: BroadcastMode::Transpose,
             }
         );
     }
@@ -397,7 +379,47 @@ mod tests {
         let plan = BroadcastInDimPlan::new(&[1, 4], &[8, 4], &[0, 1]).expect("valid broadcast");
 
         assert_eq!(plan.output_allocation_shape, vec![32, 32]);
-        assert_eq!(plan.kernel_shape().mode, BroadcastMode::Row);
+        assert_eq!(plan.kernel_shape().input_shape, vec![1, 4]);
+        assert_eq!(plan.kernel_shape().output_shape, vec![8, 4]);
+    }
+
+    #[test]
+    fn broadcast_plan_allows_rank1_transpose_plus_broadcast() {
+        let plan = BroadcastInDimPlan::new(&[4], &[4, 8], &[0]).expect("valid broadcast");
+
+        assert_eq!(plan.output_allocation_shape, vec![32, 32]);
+        assert_eq!(plan.kernel_shape().broadcast_dimensions, vec![0]);
+    }
+
+    #[test]
+    fn broadcast_plan_supports_inserted_middle_dimension() {
+        let plan = BroadcastInDimPlan::new(&[18, 2, 32], &[18, 2, 2, 32], &[0, 1, 3])
+            .expect("valid broadcast");
+
+        assert_eq!(plan.output_allocation_shape, vec![18, 2, 32, 32]);
+        assert_eq!(plan.kernel_shape().input_shape, vec![18, 2, 32]);
+        assert_eq!(plan.kernel_shape().output_shape, vec![18, 2, 2, 32]);
+        assert_eq!(plan.kernel_shape().broadcast_dimensions, vec![0, 1, 3]);
+        assert_eq!(plan.kernel_shape().tile_count, 36);
+    }
+
+    #[test]
+    fn broadcast_plan_supports_batched_column_broadcast() {
+        let plan = BroadcastInDimPlan::new(&[18, 4, 1], &[18, 4, 32], &[0, 1, 2])
+            .expect("valid broadcast");
+
+        assert_eq!(plan.output_allocation_shape, vec![18, 32, 32]);
+        assert_eq!(plan.kernel_shape().tile_count, 18);
+    }
+
+    #[test]
+    fn broadcast_plan_supports_scalar_to_rank3() {
+        let plan = BroadcastInDimPlan::new(&[], &[2, 3, 4], &[]).expect("valid broadcast");
+
+        assert_eq!(plan.output_allocation_shape, vec![2, 32, 32]);
+        assert!(plan.kernel_shape().input_shape.is_empty());
+        assert_eq!(plan.kernel_shape().output_shape, vec![2, 3, 4]);
+        assert_eq!(plan.kernel_shape().tile_count, 2);
     }
 
     #[test]
@@ -409,15 +431,20 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_plan_rejects_rank1_transpose_plus_broadcast() {
-        let err = BroadcastInDimPlan::new(&[4], &[4, 8], &[0])
-            .expect_err("unsupported native broadcast should fail");
+    fn broadcast_reader_source_uses_dummy_arrays_for_scalars() {
+        let plan = BroadcastInDimPlan::new(&[], &[], &[]).expect("valid broadcast");
+        let source = broadcast_reader_source(DType::Float16B, plan.kernel_shape()).expect("source");
 
-        assert!(err.to_string().contains("transpose+broadcast"));
+        assert!(source.contains("#define BROADCAST_INPUT_RANK 0"));
+        assert!(source.contains("#define BROADCAST_OUTPUT_RANK 0"));
+        assert!(source.contains("#define BROADCAST_INPUT_SHAPE {1u}"));
+        assert!(source.contains("#define BROADCAST_DIMENSIONS {1u}"));
     }
 
     #[test]
     fn broadcast_program_splits_tiles_across_cores() {
+        let plan = BroadcastInDimPlan::new(&[5, 32, 32], &[5, 32, 32], &[0, 1, 2])
+            .expect("valid broadcast");
         let program = broadcast_program(BroadcastProgramKey {
             cores: vec![
                 CoreCoord { x: 1, y: 2 },
@@ -425,15 +452,17 @@ mod tests {
                 CoreCoord { x: 1, y: 4 },
             ],
             dtype: DType::Float16B,
-            shape: BroadcastKernelShape {
-                output_tiles_per_row: 2,
-                tile_count: 5,
-                mode: BroadcastMode::Copy,
-            },
+            shape: plan.kernel_shape().clone(),
         })
         .expect("broadcast program");
 
         assert_eq!(program.runtime_args.cores().len(), 3);
+        assert_eq!(program.runtime_args.section_sizes(), (12, 12, 0));
+        assert!(program.compute_kernel.is_empty());
+        assert!(program
+            .reader_kernel
+            .contains("#define BROADCAST_OUTPUT_RANK 3"));
+
         let blobs = program.runtime_args.blobs();
         assert_eq!((arg_u32(&blobs[0], 1), arg_u32(&blobs[0], 2)), (0, 2));
         assert_eq!((arg_u32(&blobs[1], 1), arg_u32(&blobs[1], 2)), (2, 2));
@@ -441,8 +470,5 @@ mod tests {
         assert_eq!((arg_u32(&blobs[0], 4), arg_u32(&blobs[0], 5)), (0, 2));
         assert_eq!((arg_u32(&blobs[1], 4), arg_u32(&blobs[1], 5)), (2, 2));
         assert_eq!((arg_u32(&blobs[2], 4), arg_u32(&blobs[2], 5)), (4, 1));
-        assert_eq!(arg_u32(&blobs[0], 7), 2);
-        assert_eq!(arg_u32(&blobs[1], 7), 2);
-        assert_eq!(arg_u32(&blobs[2], 7), 1);
     }
 }
