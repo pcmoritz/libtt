@@ -29,29 +29,19 @@ void zero_tiles(uint32_t base_l1_addr, uint32_t tile_size, uint32_t tile_count) 
 void copy_reduced_tile(uint32_t reduced_l1_addr, uint32_t output_base_l1_addr,
                        uint32_t output_tile_size, uint32_t global_group, uint32_t input_row_tiles,
                        uint32_t output_tile_offset, uint32_t output_tiles_per_row,
-                       uint32_t output_rank, uint32_t output_dim0, uint32_t output_dim1) {
+                       uint32_t output_dim0, uint32_t output_dim1) {
   volatile tt_l1_ptr uint32_t *reduced =
       reinterpret_cast<volatile tt_l1_ptr uint32_t *>(reduced_l1_addr);
   volatile tt_l1_ptr uint32_t *output =
       reinterpret_cast<volatile tt_l1_ptr uint32_t *>(output_base_l1_addr);
   uint32_t output_tile_elements = output_tile_size / sizeof(uint32_t);
-  uint32_t outer = global_group / input_row_tiles;
-  uint32_t row_tile = global_group % input_row_tiles;
+  uint32_t output_row = global_group / input_row_tiles;
+  uint32_t output_col_base = (global_group % input_row_tiles) * TILE_R;
 
   for (uint32_t row = 0; row < TILE_R; ++row) {
-    uint32_t output_row = 0;
-    uint32_t output_col = 0;
-    if (output_rank == 1) {
-      output_col = global_group * TILE_R + row;
-      if (output_col >= output_dim1) {
-        continue;
-      }
-    } else {
-      output_row = outer;
-      output_col = row_tile * TILE_R + row;
-      if (output_row >= output_dim0 || output_col >= output_dim1) {
-        continue;
-      }
+    uint32_t output_col = output_col_base + row;
+    if (output_row >= output_dim0 || output_col >= output_dim1) {
+      continue;
     }
 
     uint32_t output_tile_row = output_row / TILE_R;
@@ -74,9 +64,8 @@ void kernel_main() {
   uint32_t output_tile_offset = get_arg_val<uint32_t>(4);
   uint32_t output_tiles = get_arg_val<uint32_t>(5);
   uint32_t output_tiles_per_row = get_arg_val<uint32_t>(6);
-  uint32_t output_rank = get_arg_val<uint32_t>(7);
-  uint32_t output_dim0 = get_arg_val<uint32_t>(8);
-  uint32_t output_dim1 = get_arg_val<uint32_t>(9);
+  uint32_t output_dim0 = get_arg_val<uint32_t>(7);
+  uint32_t output_dim1 = get_arg_val<uint32_t>(8);
 
   constexpr uint32_t cb_reduced = tt::CBIndex::c_16;
   constexpr uint32_t cb_output = tt::CBIndex::c_17;
@@ -95,7 +84,7 @@ void kernel_main() {
     cb_wait_front(cb_reduced, 1);
     copy_reduced_tile(get_read_ptr(cb_reduced), output_base_l1_addr, output_tile_size,
                       group_offset + group, input_row_tiles, output_tile_offset,
-                      output_tiles_per_row, output_rank, output_dim0, output_dim1);
+                      output_tiles_per_row, output_dim0, output_dim1);
     cb_pop_front(cb_reduced, 1);
   }
 

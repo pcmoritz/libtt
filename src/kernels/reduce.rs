@@ -56,15 +56,6 @@ enum OutputRank {
     Two,
 }
 
-impl OutputRank {
-    fn as_arg(self) -> u32 {
-        match self {
-            Self::One => 1,
-            Self::Two => 2,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct ReduceKernelShape {
     reduce_groups: u32,
@@ -310,7 +301,6 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
                 range.output_tile_offset,
                 range.output_tiles,
                 shape.output_tiles_per_row,
-                shape.output_rank.as_arg(),
                 shape.output_dim0,
                 shape.output_dim1,
             ],
