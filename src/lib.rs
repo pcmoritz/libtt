@@ -1831,6 +1831,83 @@ fn execute_broadcast_in_dim(
     )
 }
 
+fn execute_concatenate(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    output_id: u32,
+    dimension: u64,
+) -> Result<(), *mut PJRT_Error> {
+    if input_ids.len() < 2 {
+        return Err(invalid_argument(
+            "TT executable concatenate requires at least two inputs",
+        ));
+    }
+
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable concatenate output id {output_id} is out of bounds"
+        ))
+    })?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let dimension = usize::try_from(dimension)
+        .map_err(|_| invalid_argument("TT executable concatenate dimension is too large"))?;
+    if dimension >= output_shape.len() {
+        return Err(invalid_argument(format!(
+            "TT executable concatenate dimension {dimension} is out of bounds for shape {:?}",
+            output_desc.dims
+        )));
+    }
+
+    let dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    let mut input_shapes = Vec::with_capacity(input_ids.len());
+    let mut input_buffers = Vec::with_capacity(input_ids.len());
+    for (index, &input_id) in input_ids.iter().enumerate() {
+        let desc = plan.values.get(input_id as usize).ok_or_else(|| {
+            invalid_argument(format!(
+                "TT executable concatenate input {index} id {input_id} is out of bounds"
+            ))
+        })?;
+        if desc.element_type != output_desc.element_type {
+            return Err(invalid_argument(format!(
+                "TT executable concatenate input {index} element type {:?} must match output {:?}",
+                desc.element_type, output_desc.element_type
+            )));
+        }
+        let input_shape = dims_i64_to_usize(&desc.dims)?;
+        input_shapes.push(input_shape);
+        let input = device_buffer_for_value(values, input_id, "concatenate.operand")?;
+        let Some(input_dram) = input.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable concatenate input {index} buffer has no device allocation"
+            )));
+        };
+        input_buffers.push(input_dram);
+    }
+
+    let output_dram = kernels::concatenate::concatenate(
+        device,
+        &input_buffers,
+        &input_shapes,
+        &output_shape,
+        dimension,
+        dtype,
+        "pjrt_concatenate",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "concatenate",
+    )
+}
+
 fn execute_gather(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2098,11 +2175,19 @@ fn execute_executable_v1(
                     "power",
                 )?;
             }
-            executable::Op::Concatenate { .. } => {
-                return Err(unimplemented(
-                    "TT executable concatenate execution is not currently supported",
-                ));
-            }
+            executable::Op::Concatenate {
+                input_ids,
+                output_id,
+                dimension,
+            } => execute_concatenate(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_ids,
+                *output_id,
+                *dimension,
+            )?,
             executable::Op::Cosine { .. } => {
                 return Err(unimplemented(
                     "TT executable cosine execution is not currently supported",
