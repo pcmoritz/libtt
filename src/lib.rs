@@ -1739,6 +1739,41 @@ fn execute_unary_eltwise(
     )
 }
 
+fn execute_identity_custom_call(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    input_id: u32,
+    output_id: u32,
+    call_target_name: &str,
+) -> Result<(), *mut PJRT_Error> {
+    let input = device_buffer_for_value(
+        values,
+        input_id,
+        &format!("custom_call {call_target_name:?}.input"),
+    )?;
+    let output_index = output_id as usize;
+    let expected = plan.values.get(output_index).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} output id {output_id} is out of bounds"
+        ))
+    })?;
+    if input.buffer_type != expected.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} output must be {:?}, got {:?}",
+            expected.element_type, input.buffer_type
+        )));
+    }
+    if input.dims != expected.dims {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} output shape mismatch: expected {:?}, got {:?}",
+            expected.dims, input.dims
+        )));
+    }
+    let output = input.clone();
+    values[output_index] = Some(output);
+    Ok(())
+}
+
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2321,6 +2356,26 @@ fn execute_executable_v1(
                 return Err(unimplemented(
                     "TT executable transpose execution is not currently supported",
                 ));
+            }
+            executable::Op::CustomCall {
+                input_ids,
+                output_id,
+                call_target_name,
+                ..
+            } if call_target_name == "annotate_device_placement" => {
+                let [input_id] = input_ids.as_slice() else {
+                    return Err(invalid_argument(format!(
+                        "TT executable custom_call \"annotate_device_placement\" expected one input, got {}",
+                        input_ids.len()
+                    )));
+                };
+                execute_identity_custom_call(
+                    &mut values,
+                    plan,
+                    *input_id,
+                    *output_id,
+                    call_target_name,
+                )?;
             }
             executable::Op::CustomCall {
                 call_target_name, ..
