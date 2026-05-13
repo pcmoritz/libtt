@@ -1626,17 +1626,11 @@ fn execute_binary_eltwise(
     let input_dtype = pjrt_buffer_type_to_dtype(lhs_desc.element_type)?;
     let expected_output_type = match op {
         kernels::binary_eltwise::BinaryEltwiseOp::Add
+        | kernels::binary_eltwise::BinaryEltwiseOp::Subtract
         | kernels::binary_eltwise::BinaryEltwiseOp::Divide
         | kernels::binary_eltwise::BinaryEltwiseOp::Multiply
-        | kernels::binary_eltwise::BinaryEltwiseOp::Power => lhs_desc.element_type,
-        kernels::binary_eltwise::BinaryEltwiseOp::Max => {
-            if input_dtype != DType::Float16B {
-                return Err(unimplemented(format!(
-                    "TT executable {op_name} currently only supports bf16 buffers"
-                )));
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        }
+        | kernels::binary_eltwise::BinaryEltwiseOp::Power
+        | kernels::binary_eltwise::BinaryEltwiseOp::Max => lhs_desc.element_type,
         kernels::binary_eltwise::BinaryEltwiseOp::Compare(_) => {
             if !matches!(input_dtype, DType::Float16B | DType::Float32 | DType::Int32) {
                 return Err(unimplemented(format!(
@@ -2417,10 +2411,20 @@ fn execute_executable_v1(
                     "add",
                 )?;
             }
-            executable::Op::Subtract { .. } => {
-                return Err(unimplemented(
-                    "TT executable subtract execution is not currently supported",
-                ));
+            executable::Op::Subtract {
+                input_ids,
+                output_id,
+            } => {
+                execute_binary_eltwise(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Subtract,
+                    *input_ids,
+                    *output_id,
+                    "subtract",
+                )?;
             }
             executable::Op::Multiply {
                 input_ids,
@@ -4451,17 +4455,26 @@ mod tests {
 "#,
             |executable| {
                 assert_eq!(executable.output_ids, vec![3]);
-                assert_eq!(executable.ops.len(), 3);
+                assert_eq!(executable.ops.len(), 4);
                 let executable::Op::Constant {
                     packed_value,
                     output_id,
                 } = &executable.ops[1]
                 else {
+                    panic!("scalar constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 1);
+                assert_eq!(*packed_value, 0x3f80_3f80);
+                let executable::Op::Constant {
+                    packed_value,
+                    output_id,
+                } = &executable.ops[2]
+                else {
                     panic!("broadcasted constant should lower to Constant");
                 };
                 assert_eq!(*output_id, 2);
                 assert_eq!(*packed_value, 0x3f80_3f80);
-                assert!(matches!(executable.ops[2], executable::Op::Max { .. }));
+                assert!(matches!(executable.ops[3], executable::Op::Max { .. }));
             },
         );
     }
@@ -4512,8 +4525,12 @@ mod tests {
 "#,
             |executable| {
                 assert_eq!(executable.output_ids, vec![7]);
-                assert_eq!(executable.ops.len(), 6);
+                assert_eq!(executable.ops.len(), 8);
                 let executable::Op::Constant { output_id, .. } = &executable.ops[1] else {
+                    panic!("scalar constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 1);
+                let executable::Op::Constant { output_id, .. } = &executable.ops[2] else {
                     panic!("broadcasted constant should lower to Constant");
                 };
                 assert_eq!(*output_id, 2);
@@ -4521,21 +4538,25 @@ mod tests {
                     input_ids,
                     output_id,
                     direction,
-                } = &executable.ops[2]
+                } = &executable.ops[3]
                 else {
                     panic!("compare should lower to Compare");
                 };
                 assert_eq!(*input_ids, [0, 2]);
                 assert_eq!(*output_id, 3);
                 assert_eq!(*direction, executable::CompareDirection::Lt);
-                let executable::Op::Constant { output_id, .. } = &executable.ops[3] else {
+                let executable::Op::Constant { output_id, .. } = &executable.ops[4] else {
+                    panic!("second scalar constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 4);
+                let executable::Op::Constant { output_id, .. } = &executable.ops[5] else {
                     panic!("second broadcasted constant should lower to Constant");
                 };
                 assert_eq!(*output_id, 5);
                 let executable::Op::Add {
                     input_ids,
                     output_id,
-                } = &executable.ops[4]
+                } = &executable.ops[6]
                 else {
                     panic!("add should lower to Add");
                 };
@@ -4544,7 +4565,7 @@ mod tests {
                 let executable::Op::Select {
                     input_ids,
                     output_id,
-                } = &executable.ops[5]
+                } = &executable.ops[7]
                 else {
                     panic!("select should lower to Select");
                 };
@@ -4927,6 +4948,43 @@ mod tests {
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
+    fn pjrt_compile_lowers_convert_of_scalar_constant() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main() -> tensor<bf16> {
+    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+    %0 = stablehlo.convert %cst : (tensor<f32>) -> tensor<bf16>
+    return %0 : tensor<bf16>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![1]);
+                assert_eq!(executable.ops.len(), 2);
+                let executable::Op::Constant {
+                    packed_value,
+                    output_id,
+                } = &executable.ops[0]
+                else {
+                    panic!("scalar constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 0);
+                assert_eq!(*packed_value, 0x3f80_0000);
+                let executable::Op::Convert {
+                    input_id,
+                    output_id,
+                } = &executable.ops[1]
+                else {
+                    panic!("convert should lower to Convert");
+                };
+                assert_eq!(*input_id, 0);
+                assert_eq!(*output_id, 1);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
     fn pjrt_compile_lowers_reduce() {
         with_compiled_mlir_executable(
             r#"module {
@@ -4945,14 +5003,18 @@ mod tests {
 "#,
             |executable| {
                 assert_eq!(executable.output_ids, vec![2]);
-                assert_eq!(executable.ops.len(), 2);
+                assert_eq!(executable.ops.len(), 3);
+                let executable::Op::Constant { output_id, .. } = &executable.ops[1] else {
+                    panic!("init constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 1);
                 let executable::Op::Reduce {
                     input_ids,
                     init_value_ids,
                     output_id,
                     dimensions,
                     reducer,
-                } = &executable.ops[1]
+                } = &executable.ops[2]
                 else {
                     panic!("reduce should lower to Reduce");
                 };

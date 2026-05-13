@@ -441,6 +441,7 @@ impl CqSysmem {
                         "CQ completion event mismatch: got {got}, expected {event_id}"
                     )));
                 }
+                self.clear_prefetch_q_entries()?;
                 return Ok(());
             }
             if Instant::now() > deadline {
@@ -457,6 +458,11 @@ impl CqSysmem {
             }
             thread::sleep(Duration::from_micros(200));
         }
+    }
+
+    fn clear_prefetch_q_entries(&mut self) -> io::Result<()> {
+        self.prefetch_win
+            .write(CQ_PREFETCH_Q_BASE, &vec![0; CQ_PREFETCH_Q_SIZE])
     }
 
     fn issue_write(&mut self, record: &[u8]) -> io::Result<()> {
