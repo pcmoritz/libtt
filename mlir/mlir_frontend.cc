@@ -1,6 +1,4 @@
-#include <algorithm>
 #include <cstdlib>
-#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <string>
@@ -47,11 +45,6 @@ bool TT_MlirAnalyzeProgram(
 namespace {
 
 using mlir::func::FuncOp;
-
-bool equalsArray(llvm::ArrayRef<int64_t> values, std::initializer_list<int64_t> expected) {
-    return values.size() == expected.size() &&
-           std::equal(values.begin(), values.end(), expected.begin());
-}
 
 void registerDialects(mlir::MLIRContext& context) {
     mlir::DialectRegistry registry;
@@ -836,98 +829,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     return true;
 }
 
-bool flattenDim0Concatenate(
-    mlir::Value value,
-    llvm::SmallVectorImpl<mlir::Value>& leaves) {
-    auto concatenate = value.getDefiningOp<mlir::stablehlo::ConcatenateOp>();
-    if (!concatenate) {
-        leaves.push_back(value);
-        return true;
-    }
-    if (concatenate.getDimension() != 0) {
-        return false;
-    }
-    for (mlir::Value input : concatenate.getInputs()) {
-        if (!flattenDim0Concatenate(input, leaves)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-mlir::Value matchTransposeColumn(mlir::Value value, int64_t column) {
-    auto leaf_type = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
-    if (!leaf_type || leaf_type.getRank() != 2 || leaf_type.getDimSize(0) != 1) {
-        return {};
-    }
-    int64_t rows = leaf_type.getDimSize(1);
-
-    auto broadcast = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
-    if (!broadcast || !equalsArray(broadcast.getBroadcastDimensions(), {1})) {
-        return {};
-    }
-
-    mlir::Value reshape_value = broadcast.getOperand();
-    auto reshape_type = mlir::dyn_cast<mlir::RankedTensorType>(reshape_value.getType());
-    if (!reshape_type || !equalsArray(reshape_type.getShape(), {rows})) {
-        return {};
-    }
-    auto reshape = reshape_value.getDefiningOp<mlir::stablehlo::ReshapeOp>();
-    if (!reshape) {
-        return {};
-    }
-
-    mlir::Value slice_value = reshape.getOperand();
-    auto slice_type = mlir::dyn_cast<mlir::RankedTensorType>(slice_value.getType());
-    if (!slice_type || !equalsArray(slice_type.getShape(), {rows, 1})) {
-        return {};
-    }
-    auto slice = slice_value.getDefiningOp<mlir::stablehlo::SliceOp>();
-    if (!slice ||
-        !equalsArray(slice.getStartIndices(), {0, column}) ||
-        !equalsArray(slice.getLimitIndices(), {rows, column + 1}) ||
-        !equalsArray(slice.getStrides(), {1, 1})) {
-        return {};
-    }
-
-    return slice.getOperand();
-}
-
-mlir::Value matchManualRank2Transpose(mlir::stablehlo::ConcatenateOp concatenate) {
-    auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(concatenate.getType());
-    if (!output_type || output_type.getRank() != 2 || output_type.getDimSize(0) <= 0 ||
-        output_type.getDimSize(1) <= 0) {
-        return {};
-    }
-
-    llvm::SmallVector<mlir::Value> leaves;
-    if (!flattenDim0Concatenate(concatenate.getResult(), leaves) ||
-        static_cast<int64_t>(leaves.size()) != output_type.getDimSize(0)) {
-        return {};
-    }
-
-    mlir::Value source;
-    for (auto [index, leaf] : llvm::enumerate(leaves)) {
-        mlir::Value candidate = matchTransposeColumn(leaf, static_cast<int64_t>(index));
-        if (!candidate || (source && source != candidate)) {
-            return {};
-        }
-        source = candidate;
-    }
-    if (!source) {
-        return {};
-    }
-
-    auto source_type = mlir::dyn_cast<mlir::RankedTensorType>(source.getType());
-    if (!source_type || source_type.getRank() != 2 ||
-        source_type.getDimSize(0) != output_type.getDimSize(1) ||
-        source_type.getDimSize(1) != output_type.getDimSize(0) ||
-        source_type.getElementType() != output_type.getElementType()) {
-        return {};
-    }
-    return source;
-}
-
 bool eraseDeadOps(FuncOp func) {
     bool changed = false;
     bool local_changed = true;
@@ -995,40 +896,6 @@ bool collapseChainedBroadcasts(FuncOp func) {
             inner.getOperand(),
             builder.getDenseI64ArrayAttr(composed_dims));
         outer.getResult().replaceAllUsesWith(collapsed.getResult());
-        changed = true;
-    }
-
-    if (changed) {
-        eraseDeadOps(func);
-    }
-    return changed;
-}
-
-bool rewriteManualRank2Transposes(FuncOp func) {
-    bool changed = false;
-    llvm::SmallVector<mlir::stablehlo::ConcatenateOp> concatenates;
-    func.walk([&](mlir::stablehlo::ConcatenateOp concatenate) {
-        concatenates.push_back(concatenate);
-    });
-
-    for (auto concatenate : concatenates) {
-        if (concatenate->getParentOp() != func) {
-            continue;
-        }
-        mlir::Value source = matchManualRank2Transpose(concatenate);
-        if (!source) {
-            continue;
-        }
-
-        mlir::OpBuilder builder(concatenate);
-        auto permutation = builder.getDenseI64ArrayAttr({1, 0});
-        auto transpose = mlir::stablehlo::TransposeOp::create(
-            builder,
-            concatenate.getLoc(),
-            concatenate.getType(),
-            source,
-            permutation);
-        concatenate.getResult().replaceAllUsesWith(transpose.getResult());
         changed = true;
     }
 
@@ -1106,7 +973,6 @@ extern "C" bool TT_MlirAnalyzeProgram(
             "module does not contain a function"), alloc_output, user_data);
     }
     collapseChainedBroadcasts(*entry);
-    rewriteManualRank2Transposes(*entry);
     eraseDeadOps(*entry);
 
     tt::AnalysisResult result;
