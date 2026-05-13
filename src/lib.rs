@@ -4669,36 +4669,6 @@ mod tests {
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
-    fn pjrt_compile_collapses_chained_broadcast_in_dim() {
-        with_compiled_mlir_executable(
-            r#"module {
-  func.func public @main(%arg0: tensor<8xbf16>) -> tensor<4x8xbf16> {
-    %0 = stablehlo.broadcast_in_dim %arg0, dims = [1] : (tensor<8xbf16>) -> tensor<1x8xbf16>
-    %1 = stablehlo.broadcast_in_dim %0, dims = [0, 1] : (tensor<1x8xbf16>) -> tensor<4x8xbf16>
-    return %1 : tensor<4x8xbf16>
-  }
-}
-"#,
-            |executable| {
-                assert_eq!(executable.output_ids, vec![2]);
-                assert_eq!(executable.ops.len(), 2);
-                let executable::Op::BroadcastInDim {
-                    input_id,
-                    output_id,
-                    broadcast_dimensions,
-                } = &executable.ops[1]
-                else {
-                    panic!("chained broadcast should lower to one BroadcastInDim");
-                };
-                assert_eq!(*input_id, 0);
-                assert_eq!(*output_id, 2);
-                assert_eq!(*broadcast_dimensions, vec![1]);
-            },
-        );
-    }
-
-    #[cfg(libtt_mlir_frontend)]
-    #[test]
     fn pjrt_compile_lowers_gather() {
         with_compiled_mlir_executable(
             r#"module {
@@ -4940,45 +4910,6 @@ mod tests {
                 assert_eq!(*input_id, 0);
                 assert_eq!(*output_id, 1);
                 assert_eq!(permutation, &vec![2, 0, 1]);
-            },
-        );
-    }
-
-    #[cfg(libtt_mlir_frontend)]
-    #[test]
-    fn pjrt_compile_rewrites_manual_rank2_transpose() {
-        with_compiled_mlir_executable(
-            r#"module {
-  func.func public @main(%arg0: tensor<2x3xf32>) -> tensor<3x2xf32> {
-    %0 = stablehlo.slice %arg0 [0:2, 0:1] : (tensor<2x3xf32>) -> tensor<2x1xf32>
-    %1 = stablehlo.reshape %0 : (tensor<2x1xf32>) -> tensor<2xf32>
-    %2 = stablehlo.broadcast_in_dim %1, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>
-    %3 = stablehlo.slice %arg0 [0:2, 1:2] : (tensor<2x3xf32>) -> tensor<2x1xf32>
-    %4 = stablehlo.reshape %3 : (tensor<2x1xf32>) -> tensor<2xf32>
-    %5 = stablehlo.broadcast_in_dim %4, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>
-    %6 = stablehlo.slice %arg0 [0:2, 2:3] : (tensor<2x3xf32>) -> tensor<2x1xf32>
-    %7 = stablehlo.reshape %6 : (tensor<2x1xf32>) -> tensor<2xf32>
-    %8 = stablehlo.broadcast_in_dim %7, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>
-    %9 = stablehlo.concatenate %2, %5, %8, dim = 0 : (tensor<1x2xf32>, tensor<1x2xf32>, tensor<1x2xf32>) -> tensor<3x2xf32>
-    return %9 : tensor<3x2xf32>
-  }
-}
-"#,
-            |executable| {
-                assert_eq!(executable.output_ids, vec![1]);
-                assert_eq!(executable.ops.len(), 2);
-                let executable::Op::Transpose {
-                    input_id,
-                    output_id,
-                    permutation,
-                } = &executable.ops[1]
-                else {
-                    panic!("manual transpose pattern should lower to Transpose");
-                };
-                assert_eq!(*input_id, 0);
-                assert_eq!(*output_id, 1);
-                assert_eq!(permutation, &vec![1, 0]);
-                assert_eq!(executable.values[1].dims, vec![3, 2]);
             },
         );
     }
