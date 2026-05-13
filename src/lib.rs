@@ -1828,28 +1828,6 @@ fn execute_slice(
         ));
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    if let Some(output_dram) = aliasable_slice(
-        input_dram,
-        &input_shape,
-        &output_shape,
-        start_indices,
-        limit_indices,
-        strides,
-        dtype,
-        "pjrt_slice",
-    )
-    .map_err(io_error)?
-    {
-        return store_output_buffer(
-            values,
-            plan,
-            output_id,
-            output_desc.dims.clone(),
-            output_dram,
-            context,
-            "slice",
-        );
-    }
     let output_dram = kernels::slice::slice(device, input_dram, &slice_plan, dtype, "pjrt_slice")
         .map_err(io_error)?;
     store_output_buffer(
@@ -1861,66 +1839,6 @@ fn execute_slice(
         context,
         "slice",
     )
-}
-
-fn aliasable_slice(
-    input: &DramBuffer,
-    input_shape: &[usize],
-    output_shape: &[usize],
-    start_indices: &[i64],
-    limit_indices: &[i64],
-    strides: &[i64],
-    dtype: DType,
-    name: impl Into<String>,
-) -> io::Result<Option<DramBuffer>> {
-    if input.dtype != dtype
-        || !slice_is_zero_origin_prefix_view(
-            input_shape,
-            output_shape,
-            start_indices,
-            limit_indices,
-            strides,
-        )
-    {
-        return Ok(None);
-    }
-    let output_allocation_shape = dram::tiled_allocation_shape(output_shape)?;
-    let output_tiles = dram::tiled_shape_tile_count(output_shape)?;
-    if input.shape != output_allocation_shape || input.num_tiles != output_tiles {
-        return Ok(None);
-    }
-    Ok(Some(DramBuffer {
-        name: name.into(),
-        addr: input.addr,
-        num_tiles: output_tiles,
-        dtype,
-        shape: output_allocation_shape,
-    }))
-}
-
-fn slice_is_zero_origin_prefix_view(
-    input_shape: &[usize],
-    output_shape: &[usize],
-    start_indices: &[i64],
-    limit_indices: &[i64],
-    strides: &[i64],
-) -> bool {
-    input_shape.len() == output_shape.len()
-        && start_indices.len() == input_shape.len()
-        && limit_indices.len() == input_shape.len()
-        && strides.len() == input_shape.len()
-        && input_shape
-            .iter()
-            .zip(output_shape)
-            .zip(start_indices)
-            .zip(limit_indices)
-            .zip(strides)
-            .all(|((((&input_dim, &output_dim), &start), &limit), &stride)| {
-                start == 0
-                    && stride == 1
-                    && usize::try_from(limit).ok() == Some(output_dim)
-                    && output_dim <= input_dim
-            })
 }
 
 fn execute_transpose(
@@ -4141,38 +4059,6 @@ mod tests {
             &[32],
             &[32],
             &[1]
-        ));
-    }
-
-    #[test]
-    fn slice_alias_only_for_zero_origin_prefix_views() {
-        assert!(slice_is_zero_origin_prefix_view(
-            &[18, 4, 32],
-            &[18, 4, 16],
-            &[0, 0, 0],
-            &[18, 4, 16],
-            &[1, 1, 1]
-        ));
-        assert!(slice_is_zero_origin_prefix_view(
-            &[18, 4, 32],
-            &[18, 1, 32],
-            &[0, 0, 0],
-            &[18, 1, 32],
-            &[1, 1, 1]
-        ));
-        assert!(!slice_is_zero_origin_prefix_view(
-            &[18, 4, 32],
-            &[18, 1, 32],
-            &[0, 1, 0],
-            &[18, 2, 32],
-            &[1, 1, 1]
-        ));
-        assert!(!slice_is_zero_origin_prefix_view(
-            &[18, 4, 32],
-            &[18, 4, 16],
-            &[0, 0, 16],
-            &[18, 4, 32],
-            &[1, 1, 1]
         ));
     }
 
