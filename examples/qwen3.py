@@ -202,11 +202,6 @@ def apply_rope(x, cos, sin):
     return (x * cos[:, None, :] + rotate_half(x) * sin[:, None, :]).astype(x.dtype)
 
 
-def transpose_head_matrix(x, width: int):
-    # Avoid lowering to stablehlo.transpose, which the TT backend cannot execute yet.
-    return jnp.concatenate([x[:, col][None, :] for col in range(width)], axis=0)
-
-
 def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin):
     seq_len = hidden_states.shape[0]
     query_states = hidden_states @ layer["q_proj"]
@@ -228,8 +223,7 @@ def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin):
 
     scores = jnp.stack(
         [
-            query_states[:, head, :]
-            @ transpose_head_matrix(key_states[:, head, :], config.head_dim)
+            query_states[:, head, :] @ key_states[:, head, :].T
             for head in range(config.num_attention_heads)
         ],
         axis=1,

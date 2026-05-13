@@ -1841,6 +1841,61 @@ fn execute_slice(
     )
 }
 
+fn execute_transpose(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_id: u32,
+    output_id: u32,
+    permutation: &[i64],
+) -> Result<(), *mut PJRT_Error> {
+    let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable transpose operand value id is out of bounds")
+    })?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable transpose output value id is out of bounds")
+    })?;
+    if input_desc.element_type != output_desc.element_type {
+        return Err(invalid_argument(
+            "TT executable transpose input and output element types must match",
+        ));
+    }
+    if permutation != [1, 0] {
+        return Err(unimplemented(
+            "TT executable transpose currently only supports rank-2 permutation [1, 0]",
+        ));
+    }
+
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let input = device_buffer_for_value(values, input_id, "transpose.operand")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable transpose operand buffer has no device allocation",
+        ));
+    };
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dram = kernels::transpose::transpose_rank2(
+        device,
+        input_dram,
+        &input_shape,
+        &output_shape,
+        dtype,
+        "pjrt_transpose",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "transpose",
+    )
+}
+
 fn execute_reduce(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2577,11 +2632,19 @@ fn execute_executable_v1(
                 *output_id,
                 "exponential",
             )?,
-            executable::Op::Transpose { .. } => {
-                return Err(unimplemented(
-                    "TT executable transpose execution is not currently supported",
-                ));
-            }
+            executable::Op::Transpose {
+                input_id,
+                output_id,
+                permutation,
+            } => execute_transpose(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_id,
+                *output_id,
+                permutation,
+            )?,
             executable::Op::CustomCall {
                 input_ids,
                 output_id,
