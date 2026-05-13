@@ -56,8 +56,6 @@ const CQ_DISPATCH_CMD_WRITE_LINEAR_HOST_IS_EVENT: u8 = 1;
 
 const CQ_CMD_SIZE: usize = CQ_DISPATCH_CMD_SIZE as usize;
 const DONE_STREAM: u16 = FIRST_STREAM_USED as u16;
-const CQ_PREFETCH_Q_STALL_FLAG: usize = 1 << 15;
-const CQ_PREFETCH_MAX_RECORD_BYTES: usize = (CQ_PREFETCH_Q_STALL_FLAG - 1) * CQ_CMD_SIZE;
 
 pub(crate) struct FastDispatcher {
     path: PathBuf,
@@ -242,26 +240,8 @@ impl CqCommand {
             Self::WritePackedLarge { rects, addr, data } => {
                 let padded = pad_to(data, L1_ALIGN);
                 let mut records = Vec::new();
-                let max_subcmds = CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS as usize;
-                let mut batch_start = 0;
-                while batch_start < rects.len() {
-                    let mut batch_len = 0;
-                    while batch_start + batch_len < rects.len() && batch_len < max_subcmds {
-                        let next_len = batch_len + 1;
-                        let payload_len = packed_large_payload_len(next_len, padded.len());
-                        if relay_inline_record_len(payload_len) > CQ_PREFETCH_MAX_RECORD_BYTES {
-                            if batch_len == 0 {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "CQ packed write payload is too large for one prefetch record",
-                                ));
-                            }
-                            break;
-                        }
-                        batch_len = next_len;
-                    }
-
-                    let batch = &rects[batch_start..batch_start + batch_len];
+                for batch in rects.chunks(CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS as usize)
+                {
                     let mut record = cq_hdr_write_packed_large(batch.len())?;
                     for &(start, end) in batch {
                         let (xy, count) = noc_mcast_xy(start, end);
@@ -288,7 +268,6 @@ impl CqCommand {
                         record.extend_from_slice(&padded);
                     }
                     records.push(record);
-                    batch_start += batch_len;
                 }
                 Ok(records)
             }
@@ -500,12 +479,6 @@ impl CqSysmem {
         let off = CQ_PREFETCH_Q_BASE + idx * CQ_PREFETCH_Q_ENTRY_SIZE;
         let size_16b = u16::try_from(record.len() / CQ_CMD_SIZE)
             .map_err(|_| io::Error::other("CQ record too large for prefetch slot"))?;
-        if usize::from(size_16b) >= CQ_PREFETCH_Q_STALL_FLAG {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "CQ record is too large for one prefetch slot",
-            ));
-        }
         self.prefetch_win.write(off, &size_16b.to_le_bytes())?;
         self.prefetch_q_wr_idx = (idx + 1) % CQ_PREFETCH_Q_ENTRIES;
         Ok(())
@@ -516,16 +489,10 @@ impl CqSysmem {
         let deadline = Instant::now() + timeout;
         loop {
             let bytes = self.prefetch_win.read(off, 2)?;
-            let slot = u16::from_le_bytes([bytes[0], bytes[1]]);
-            if slot == 0 {
+            if u16::from_le_bytes([bytes[0], bytes[1]]) == 0 {
                 return Ok(());
             }
             if Instant::now() > deadline {
-                let rd = self.prefetch_win.read32(CQ_PREFETCH_Q_RD_PTR).unwrap_or(0);
-                let pcie_rd = self.prefetch_win.read32(CQ_PREFETCH_Q_PCIE_RD).unwrap_or(0);
-                log(format!(
-                    "CQ prefetch slot timeout idx={idx} slot={slot} rd=0x{rd:08x} pcie_rd=0x{pcie_rd:08x}"
-                ));
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "timeout waiting for CQ prefetch queue slot",
@@ -679,18 +646,6 @@ fn cq_record(cmd_id: u8, body: impl CqEncode) -> Vec<u8> {
     record
 }
 
-fn packed_large_payload_len(subcmd_count: usize, data_len: usize) -> usize {
-    let header_len = align_up(
-        (CQ_CMD_SIZE + subcmd_count * size_of::<CQDispatchWritePackedLargeSubCmd>()) as u64,
-        L1_ALIGN as u64,
-    ) as usize;
-    header_len + subcmd_count * data_len
-}
-
-fn relay_inline_record_len(payload_len: usize) -> usize {
-    align_up((CQ_CMD_SIZE + payload_len) as u64, PCIE_ALIGN as u64) as usize
-}
-
 impl CqEncode for CQPrefetchRelayInlineCmd {
     fn encode(self, out: &mut Vec<u8>) {
         put_u8(out, self.dispatcher_type);
@@ -767,7 +722,7 @@ impl CqEncode for CQDispatchSetGoSignalNocDataCmd {
 }
 
 fn relay_inline(payload: &[u8]) -> Vec<u8> {
-    let stride = relay_inline_record_len(payload.len());
+    let stride = align_up((CQ_CMD_SIZE + payload.len()) as u64, PCIE_ALIGN as u64) as usize;
     let mut record = cq_record(
         CQPrefetchCmdId::CQ_PREFETCH_CMD_RELAY_INLINE as u8,
         CQPrefetchRelayInlineCmd {
