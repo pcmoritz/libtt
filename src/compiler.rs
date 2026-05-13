@@ -1472,42 +1472,6 @@ fn read_kernel_disk_cache(key: &str) -> Option<CompiledKernel> {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn read_persistent_cache(kind: &str, key: &str) -> Option<Vec<u8>> {
-    let path = cache_file_path(kind, key)?;
-    match fs::read(&path) {
-        Ok(data) => {
-            log(format!("compiler disk cache hit {kind} {key}"));
-            Some(data)
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-        Err(err) => {
-            log(format!(
-                "compiler disk cache ignored {kind} {} at {}: {}",
-                key,
-                path.display(),
-                err
-            ));
-            None
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn write_persistent_cache(kind: &str, key: &str, data: &[u8]) {
-    let Some(path) = cache_file_path(kind, key) else {
-        return;
-    };
-    if let Err(err) = write_atomic(&path, data) {
-        log(format!(
-            "compiler disk cache write failed {kind} {} at {}: {}",
-            key,
-            path.display(),
-            err
-        ));
-    }
-}
-
 fn write_kernel_disk_cache(key: &str, kernel: &CompiledKernel) {
     let Some(path) = cache_file_path("kernels", key) else {
         return;

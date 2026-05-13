@@ -22,20 +22,12 @@ use dram::{DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
-#[cfg(libtt_mlir_frontend)]
-use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::ffi::{c_char, CString};
-#[cfg(libtt_mlir_frontend)]
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::mem::size_of;
 use std::ptr;
 use std::slice;
-#[cfg(libtt_mlir_frontend)]
-use std::sync::Mutex;
 use std::sync::Once;
-#[cfg(libtt_mlir_frontend)]
-use std::sync::OnceLock;
 
 include!("pjrt_bindings.rs");
 
@@ -151,11 +143,6 @@ unsafe impl Sync for PJRT_Api {}
 
 #[cfg(libtt_mlir_frontend)]
 const EXECUTABLE_NAME: &str = "tt.executable.v1";
-#[cfg(libtt_mlir_frontend)]
-const MLIR_ANALYSIS_CACHE_KIND: &str = "mlir-analysis-v7";
-
-#[cfg(libtt_mlir_frontend)]
-static MLIR_ANALYSIS_CACHE: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
 
 impl PJRT_Client {
     fn new() -> Self {
@@ -376,24 +363,6 @@ unsafe fn checked_i64_slice<'a>(
         )));
     }
     // SAFETY: caller owns `ptr` for `len` elements during the call.
-    Ok(unsafe { slice::from_raw_parts(ptr, len) })
-}
-
-#[allow(dead_code)]
-unsafe fn checked_u8_slice<'a>(
-    ptr: *const u8,
-    len: usize,
-    field: &str,
-) -> Result<&'a [u8], *mut PJRT_Error> {
-    if len == 0 {
-        return Ok(&[]);
-    }
-    if ptr.is_null() {
-        return Err(invalid_argument(format!(
-            "{field} must not be null when length > 0"
-        )));
-    }
-    // SAFETY: caller owns `ptr` for `len` bytes during the call.
     Ok(unsafe { slice::from_raw_parts(ptr, len) })
 }
 
@@ -686,35 +655,44 @@ fn executable_metadata_from_program(
     {
         let format = c_api_string(program.format, program.format_size, "program.format")?;
         if format == "mlir" || format == "stablehlo" {
-            let format_bytes = unsafe {
-                checked_u8_slice(
-                    program.format.cast::<u8>(),
-                    program.format_size,
-                    "program.format",
-                )
-            }?;
-            let code_bytes = unsafe {
-                checked_u8_slice(
-                    program.code.cast_const().cast::<u8>(),
-                    program.code_size,
-                    "program.code",
-                )
-            }?;
-            let key = mlir_analysis_cache_key(format_bytes, code_bytes);
-            if let Some(bytes) = read_mlir_analysis_cache(&key) {
-                return metadata_from_mlir_analysis_bytes(&bytes);
-            }
-
             if let Some(handle) = mlir_frontend::AnalysisHandle::analyze(
                 program.format,
                 program.format_size,
                 program.code.cast_const(),
                 program.code_size,
             ) {
-                let bytes = handle.bytes();
-                let metadata = metadata_from_mlir_analysis_bytes(bytes)?;
-                write_mlir_analysis_cache(&key, bytes);
-                return Ok(metadata);
+                let analysis = executable::parse_analysis(handle.bytes()).map_err(|message| {
+                    pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INTERNAL)
+                })?;
+                if analysis.status != MlirAnalysisStatus::Ok {
+                    let message = if analysis.error_message.is_empty() {
+                        format!("MLIR analysis failed with status {:?}", analysis.status)
+                    } else {
+                        analysis.error_message
+                    };
+                    return Err(match analysis.status {
+                        MlirAnalysisStatus::ParseError => invalid_argument(message),
+                        MlirAnalysisStatus::Unsupported => unimplemented(message),
+                        _ => pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INTERNAL),
+                    });
+                }
+
+                if analysis.outputs.len() != 1 {
+                    return Err(unimplemented(format!(
+                        "TT executable must contain exactly one output, got {}",
+                        analysis.outputs.len()
+                    )));
+                }
+                let output = analysis
+                    .outputs
+                    .first()
+                    .expect("analysis output length was checked");
+                return Ok(make_executable_metadata(
+                    EXECUTABLE_NAME,
+                    output.dims.clone(),
+                    output.element_type,
+                    analysis.executable,
+                ));
             }
         }
     }
@@ -723,80 +701,6 @@ fn executable_metadata_from_program(
     Err(unimplemented(
         "MLIR compilation requires the libtt MLIR frontend build",
     ))
-}
-
-#[cfg(libtt_mlir_frontend)]
-fn metadata_from_mlir_analysis_bytes(bytes: &[u8]) -> Result<ExecutableMetadata, *mut PJRT_Error> {
-    let analysis = executable::parse_analysis(bytes)
-        .map_err(|message| pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INTERNAL))?;
-    if analysis.status != MlirAnalysisStatus::Ok {
-        let message = if analysis.error_message.is_empty() {
-            format!("MLIR analysis failed with status {:?}", analysis.status)
-        } else {
-            analysis.error_message
-        };
-        return Err(match analysis.status {
-            MlirAnalysisStatus::ParseError => invalid_argument(message),
-            MlirAnalysisStatus::Unsupported => unimplemented(message),
-            _ => pjrt_error(message, PJRT_Error_Code::PJRT_Error_Code_INTERNAL),
-        });
-    }
-
-    if analysis.outputs.len() != 1 {
-        return Err(unimplemented(format!(
-            "TT executable must contain exactly one output, got {}",
-            analysis.outputs.len()
-        )));
-    }
-    let output = analysis
-        .outputs
-        .first()
-        .expect("analysis output length was checked");
-    Ok(make_executable_metadata(
-        EXECUTABLE_NAME,
-        output.dims.clone(),
-        output.element_type,
-        analysis.executable,
-    ))
-}
-
-#[cfg(libtt_mlir_frontend)]
-fn mlir_analysis_cache_key(format: &[u8], code: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    MLIR_ANALYSIS_CACHE_KIND.hash(&mut hasher);
-    format.hash(&mut hasher);
-    code.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-#[cfg(libtt_mlir_frontend)]
-fn read_mlir_analysis_cache(key: &str) -> Option<Vec<u8>> {
-    if let Some(bytes) = MLIR_ANALYSIS_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("MLIR analysis cache poisoned")
-        .get(key)
-        .cloned()
-    {
-        return Some(bytes);
-    }
-    let bytes = compiler::read_persistent_cache(MLIR_ANALYSIS_CACHE_KIND, key)?;
-    MLIR_ANALYSIS_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("MLIR analysis cache poisoned")
-        .insert(key.to_owned(), bytes.clone());
-    Some(bytes)
-}
-
-#[cfg(libtt_mlir_frontend)]
-fn write_mlir_analysis_cache(key: &str, bytes: &[u8]) {
-    MLIR_ANALYSIS_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("MLIR analysis cache poisoned")
-        .insert(key.to_owned(), bytes.to_vec());
-    compiler::write_persistent_cache(MLIR_ANALYSIS_CACHE_KIND, key, bytes);
 }
 
 #[cfg(libtt_mlir_frontend)]
