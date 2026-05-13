@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import time
 from dataclasses import dataclass
 
 import jax
@@ -294,13 +295,16 @@ def count_parameters(weights) -> int:
     return sum(value.size for value in leaves)
 
 
-def generate(config, weights, device, input_ids, args):
-    rng = np.random.default_rng(args.seed + 1)
-    tokens = input_ids.astype(np.int32).copy()
-    forward = jax.jit(
+def make_forward(config, device):
+    return jax.jit(
         lambda model_weights, ids: qwen3_forward(config, model_weights, ids)[-1],
         device=device,
     )
+
+
+def generate(config, weights, device, input_ids, args, forward):
+    rng = np.random.default_rng(args.seed + 1)
+    tokens = input_ids.astype(np.int32).copy()
 
     for _ in range(args.max_new_tokens):
         ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
@@ -312,6 +316,12 @@ def generate(config, weights, device, input_ids, args):
         if tokens.size >= config.max_position_embeddings:
             break
     return tokens
+
+
+def timed_generate(config, weights, device, input_ids, args, forward):
+    start = time.perf_counter()
+    output_ids = generate(config, weights, device, input_ids, args, forward)
+    return output_ids, time.perf_counter() - start
 
 
 def main():
@@ -332,10 +342,14 @@ def main():
 
     device = select_device(args.backend)
     weights = jax.device_put(init_weights(config, args.seed, np_dtype), device)
-    output_ids = generate(config, weights, device, input_ids, args)
+    forward = make_forward(config, device)
+    _, warmup_seconds = timed_generate(config, weights, device, input_ids, args, forward)
+    output_ids, run_seconds = timed_generate(config, weights, device, input_ids, args, forward)
 
     print(f"device: {device}")
     print(f"parameters: {count_parameters(weights):,}")
+    print(f"warmup_seconds: {warmup_seconds:.3f}")
+    print(f"run_seconds: {run_seconds:.3f}")
     print(tokenizer.decode(output_ids))
 
 
