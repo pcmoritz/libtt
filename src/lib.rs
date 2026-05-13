@@ -33,8 +33,9 @@ use std::ptr;
 use std::slice;
 #[cfg(libtt_mlir_frontend)]
 use std::sync::Mutex;
-use std::sync::{Once, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::Once;
+#[cfg(libtt_mlir_frontend)]
+use std::sync::OnceLock;
 
 include!("pjrt_bindings.rs");
 
@@ -2814,123 +2815,6 @@ fn execute_iota(
     )
 }
 
-#[derive(Clone)]
-struct OpProfile {
-    name: &'static str,
-    count: usize,
-    total: Duration,
-}
-
-struct ExecutionProfile {
-    enabled: bool,
-    started: Instant,
-    ops: Vec<OpProfile>,
-}
-
-impl ExecutionProfile {
-    fn new() -> Self {
-        Self {
-            enabled: host_profile_enabled(),
-            started: Instant::now(),
-            ops: Vec::new(),
-        }
-    }
-
-    fn record(&mut self, name: &'static str, elapsed: Duration) {
-        if !self.enabled {
-            return;
-        }
-        if let Some(entry) = self.ops.iter_mut().find(|entry| entry.name == name) {
-            entry.count += 1;
-            entry.total += elapsed;
-            return;
-        }
-        self.ops.push(OpProfile {
-            name,
-            count: 1,
-            total: elapsed,
-        });
-    }
-
-    fn finish(mut self, op_count: usize) {
-        if !self.enabled {
-            return;
-        }
-        self.ops
-            .sort_by(|left, right| right.total.cmp(&left.total).then(left.name.cmp(right.name)));
-        let summary = self
-            .ops
-            .iter()
-            .take(16)
-            .map(|entry| {
-                format!(
-                    "{}:count={} total_ms={:.3} avg_ms={:.3}",
-                    entry.name,
-                    entry.count,
-                    duration_ms(entry.total),
-                    duration_ms(entry.total) / entry.count as f64
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        log(format!(
-            "profile execute ops={} total_ms={:.3} {}",
-            op_count,
-            duration_ms(self.started.elapsed()),
-            summary
-        ));
-    }
-}
-
-fn host_profile_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("LIBTT_PROFILE") {
-        Ok(value) => {
-            let normalized = value.trim().to_ascii_lowercase();
-            !normalized.is_empty()
-                && normalized != "0"
-                && normalized != "false"
-                && normalized != "off"
-        }
-        Err(_) => false,
-    })
-}
-
-fn duration_ms(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1_000.0
-}
-
-fn executable_op_name(op: &executable::Op) -> &'static str {
-    match op {
-        executable::Op::Parameter { .. } => "parameter",
-        executable::Op::Add { .. } => "add",
-        executable::Op::Subtract { .. } => "subtract",
-        executable::Op::Multiply { .. } => "multiply",
-        executable::Op::Divide { .. } => "divide",
-        executable::Op::Power { .. } => "power",
-        executable::Op::Concatenate { .. } => "concatenate",
-        executable::Op::Cosine { .. } => "cosine",
-        executable::Op::Sine { .. } => "sine",
-        executable::Op::Rsqrt { .. } => "rsqrt",
-        executable::Op::Reshape { .. } => "reshape",
-        executable::Op::Slice { .. } => "slice",
-        executable::Op::Negate { .. } => "negate",
-        executable::Op::Exponential { .. } => "exponential",
-        executable::Op::Transpose { .. } => "transpose",
-        executable::Op::CustomCall { .. } => "custom_call",
-        executable::Op::Convert { .. } => "convert",
-        executable::Op::Reduce { .. } => "reduce",
-        executable::Op::Max { .. } => "max",
-        executable::Op::Matmul { .. } => "matmul",
-        executable::Op::Constant { .. } => "constant",
-        executable::Op::Compare { .. } => "compare",
-        executable::Op::Select { .. } => "select",
-        executable::Op::BroadcastInDim { .. } => "broadcast_in_dim",
-        executable::Op::Gather { .. } => "gather",
-        executable::Op::Iota { .. } => "iota",
-    }
-}
-
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
@@ -2951,10 +2835,7 @@ fn execute_executable_v1(
     };
     let device = &mut target_device.runtime;
 
-    let mut profile = ExecutionProfile::new();
     for op in &plan.ops {
-        let op_name = executable_op_name(op);
-        let op_start = Instant::now();
         let result = (|| -> Result<(), *mut PJRT_Error> {
             match op {
                 executable::Op::Parameter {
@@ -3445,10 +3326,8 @@ fn execute_executable_v1(
             }
             Ok(())
         })();
-        profile.record(op_name, op_start.elapsed());
         result?;
     }
-    profile.finish(plan.ops.len());
 
     let output = device_buffer_for_value(&values, plan.output_ids[0], "output")?;
     Ok(output.clone())
