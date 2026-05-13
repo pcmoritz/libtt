@@ -1790,6 +1790,63 @@ fn execute_reshape(
     )
 }
 
+fn execute_slice(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_id: u32,
+    output_id: u32,
+    start_indices: &[i64],
+    limit_indices: &[i64],
+    strides: &[i64],
+) -> Result<(), *mut PJRT_Error> {
+    let input_desc = plan
+        .values
+        .get(input_id as usize)
+        .ok_or_else(|| invalid_argument("TT executable slice operand value id is out of bounds"))?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable slice output id {output_id} is out of bounds"
+        ))
+    })?;
+    if input_desc.element_type != output_desc.element_type {
+        return Err(invalid_argument(
+            "TT executable slice input and output element types must match",
+        ));
+    }
+
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let slice_plan = kernels::slice::SlicePlan::new(
+        &input_shape,
+        &output_shape,
+        start_indices,
+        limit_indices,
+        strides,
+    )
+    .map_err(io_error)?;
+
+    let input = device_buffer_for_value(values, input_id, "slice.operand")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable slice operand buffer has no device allocation",
+        ));
+    };
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dram = kernels::slice::slice(device, input_dram, &slice_plan, dtype, "pjrt_slice")
+        .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "slice",
+    )
+}
+
 fn execute_reduce(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2473,11 +2530,23 @@ fn execute_executable_v1(
                 *input_id,
                 *output_id,
             )?,
-            executable::Op::Slice { .. } => {
-                return Err(unimplemented(
-                    "TT executable slice execution is not currently supported",
-                ));
-            }
+            executable::Op::Slice {
+                input_id,
+                output_id,
+                start_indices,
+                limit_indices,
+                strides,
+            } => execute_slice(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_id,
+                *output_id,
+                start_indices,
+                limit_indices,
+                strides,
+            )?,
             executable::Op::Negate {
                 input_id,
                 output_id,
