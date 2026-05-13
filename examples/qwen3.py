@@ -57,7 +57,7 @@ def parse_args():
     parser.add_argument("--prompt", default="Qwen3 tiny model:")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=32)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--hidden-size", type=int, default=128)
@@ -284,7 +284,7 @@ def sample_next_token(logits, rng: np.random.Generator, temperature: float, top_
 
     logits = logits / temperature
     if 0 < top_k < logits.size:
-        candidates = np.argpartition(logits, -top_k)[-top_k:]
+        candidates = np.lexsort((np.arange(logits.size), -logits))[:top_k]
         candidate_logits = logits[candidates]
         probs = np.exp(candidate_logits - np.max(candidate_logits))
         probs = probs / np.sum(probs)
