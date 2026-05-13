@@ -3,7 +3,7 @@ use crate::dispatch::{CBConfig, CompileConfig, Program};
 use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
 use crate::executable::CompareDirection;
 use crate::hw::CoreCoord;
-use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
 use std::io;
 
 const READER: &str = include_str!("../../kernels/binary_eltwise_reader.cc");
@@ -72,10 +72,10 @@ impl BinaryEltwiseOp {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct BinaryEltwiseProgramKey {
     op: BinaryEltwiseOp,
-    core: CoreCoord,
+    cores: Vec<CoreCoord>,
     tile_count: u32,
     input_dtype: DType,
     output_dtype: DType,
@@ -92,11 +92,11 @@ struct BinaryEltwiseKernel {
 
 impl Kernel<BinaryEltwiseProgramKey> for BinaryEltwiseKernel {
     fn program_key(&self) -> BinaryEltwiseProgramKey {
-        self.key
+        self.key.clone()
     }
 
     fn build_program(&self) -> io::Result<Program> {
-        eltwise_program(self.key)
+        eltwise_program(self.key.clone())
     }
 
     #[inline]
@@ -142,11 +142,7 @@ pub(crate) fn eltwise(
     let rhs_addr = input_addr(rhs, "rhs address")?;
     let tile_count = u32::try_from(output_tiles)
         .map_err(|_| invalid_input(format!("tile count does not fit in u32: {output_tiles}")))?;
-    let core = device
-        .cores_ref()
-        .first()
-        .copied()
-        .ok_or_else(|| invalid_input("no worker cores are available"))?;
+    let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
     let output_dtype = op.output_dtype(input_dtype);
     let output_shape = tiled_allocation_shape(shape)?;
     let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
@@ -160,7 +156,7 @@ pub(crate) fn eltwise(
         output_addr,
         key: BinaryEltwiseProgramKey {
             op,
-            core,
+            cores,
             tile_count,
             input_dtype,
             output_dtype,
@@ -237,12 +233,15 @@ fn eltwise_program(key: BinaryEltwiseProgramKey) -> io::Result<Program> {
         ],
         Vec::new(),
     );
-    runtime_args.add_core(
-        key.core,
-        vec![0, 0, key.tile_count],
-        vec![0, 0, 0, key.tile_count, 0, 0],
-        vec![key.tile_count],
-    )?;
+    for (core_index, &core) in key.cores.iter().enumerate() {
+        let (offset, n_tiles) = split_tile_range(key.tile_count, core_index, key.cores.len())?;
+        runtime_args.add_core(
+            core,
+            vec![0, offset, n_tiles],
+            vec![0, 0, offset, n_tiles, 0, 0],
+            vec![n_tiles],
+        )?;
+    }
     let runtime_args = runtime_args.build()?;
     Ok(Program {
         reader_kernel: READER.to_owned(),
@@ -327,5 +326,51 @@ fn compare_direction_variant(direction: CompareDirection) -> &'static str {
         CompareDirection::Gt => "Gt",
         CompareDirection::Le => "Le",
         CompareDirection::Lt => "Lt",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arg_u32(blob: &[u8], index: usize) -> u32 {
+        let start = index * std::mem::size_of::<u32>();
+        u32::from_le_bytes(
+            blob[start..start + std::mem::size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn binary_eltwise_program_splits_tiles_across_cores() {
+        let program = eltwise_program(BinaryEltwiseProgramKey {
+            op: BinaryEltwiseOp::Add,
+            cores: vec![
+                CoreCoord { x: 1, y: 2 },
+                CoreCoord { x: 1, y: 3 },
+                CoreCoord { x: 1, y: 4 },
+            ],
+            tile_count: 10,
+            input_dtype: DType::Float16B,
+            output_dtype: DType::Float16B,
+        })
+        .expect("binary eltwise program");
+
+        assert_eq!(program.runtime_args.cores().len(), 3);
+        assert_eq!(program.runtime_args.section_sizes(), (12, 24, 4));
+
+        let blobs = program.runtime_args.blobs();
+        assert_eq!((arg_u32(&blobs[0], 1), arg_u32(&blobs[0], 2)), (0, 4));
+        assert_eq!((arg_u32(&blobs[1], 1), arg_u32(&blobs[1], 2)), (4, 3));
+        assert_eq!((arg_u32(&blobs[2], 1), arg_u32(&blobs[2], 2)), (7, 3));
+
+        assert_eq!((arg_u32(&blobs[0], 5), arg_u32(&blobs[0], 6)), (0, 4));
+        assert_eq!((arg_u32(&blobs[1], 5), arg_u32(&blobs[1], 6)), (4, 3));
+        assert_eq!((arg_u32(&blobs[2], 5), arg_u32(&blobs[2], 6)), (7, 3));
+
+        assert_eq!(arg_u32(&blobs[0], 9), 4);
+        assert_eq!(arg_u32(&blobs[1], 9), 3);
+        assert_eq!(arg_u32(&blobs[2], 9), 3);
     }
 }
