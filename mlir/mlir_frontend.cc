@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cstdlib>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <string>
@@ -7,9 +9,11 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Dialect/Func/Extensions/AllExtensions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -43,6 +47,11 @@ bool TT_MlirAnalyzeProgram(
 namespace {
 
 using mlir::func::FuncOp;
+
+bool equalsArray(llvm::ArrayRef<int64_t> values, std::initializer_list<int64_t> expected) {
+    return values.size() == expected.size() &&
+           std::equal(values.begin(), values.end(), expected.begin());
+}
 
 void registerDialects(mlir::MLIRContext& context) {
     mlir::DialectRegistry registry;
@@ -827,6 +836,352 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     return true;
 }
 
+bool flattenDim0Concatenate(
+    mlir::Value value,
+    llvm::SmallVectorImpl<mlir::Value>& leaves) {
+    auto concatenate = value.getDefiningOp<mlir::stablehlo::ConcatenateOp>();
+    if (!concatenate) {
+        leaves.push_back(value);
+        return true;
+    }
+    if (concatenate.getDimension() != 0) {
+        return false;
+    }
+    for (mlir::Value input : concatenate.getInputs()) {
+        if (!flattenDim0Concatenate(input, leaves)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+mlir::Value matchTransposeColumn(mlir::Value value, int64_t column) {
+    auto leaf_type = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    if (!leaf_type || leaf_type.getRank() != 2 || leaf_type.getDimSize(0) != 1) {
+        return {};
+    }
+    int64_t rows = leaf_type.getDimSize(1);
+
+    auto broadcast = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
+    if (!broadcast || !equalsArray(broadcast.getBroadcastDimensions(), {1})) {
+        return {};
+    }
+
+    mlir::Value reshape_value = broadcast.getOperand();
+    auto reshape_type = mlir::dyn_cast<mlir::RankedTensorType>(reshape_value.getType());
+    if (!reshape_type || !equalsArray(reshape_type.getShape(), {rows})) {
+        return {};
+    }
+    auto reshape = reshape_value.getDefiningOp<mlir::stablehlo::ReshapeOp>();
+    if (!reshape) {
+        return {};
+    }
+
+    mlir::Value slice_value = reshape.getOperand();
+    auto slice_type = mlir::dyn_cast<mlir::RankedTensorType>(slice_value.getType());
+    if (!slice_type || !equalsArray(slice_type.getShape(), {rows, 1})) {
+        return {};
+    }
+    auto slice = slice_value.getDefiningOp<mlir::stablehlo::SliceOp>();
+    if (!slice ||
+        !equalsArray(slice.getStartIndices(), {0, column}) ||
+        !equalsArray(slice.getLimitIndices(), {rows, column + 1}) ||
+        !equalsArray(slice.getStrides(), {1, 1})) {
+        return {};
+    }
+
+    return slice.getOperand();
+}
+
+mlir::Value matchManualRank2Transpose(mlir::stablehlo::ConcatenateOp concatenate) {
+    auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(concatenate.getType());
+    if (!output_type || output_type.getRank() != 2 || output_type.getDimSize(0) <= 0 ||
+        output_type.getDimSize(1) <= 0) {
+        return {};
+    }
+
+    llvm::SmallVector<mlir::Value> leaves;
+    if (!flattenDim0Concatenate(concatenate.getResult(), leaves) ||
+        static_cast<int64_t>(leaves.size()) != output_type.getDimSize(0)) {
+        return {};
+    }
+
+    mlir::Value source;
+    for (auto [index, leaf] : llvm::enumerate(leaves)) {
+        mlir::Value candidate = matchTransposeColumn(leaf, static_cast<int64_t>(index));
+        if (!candidate || (source && source != candidate)) {
+            return {};
+        }
+        source = candidate;
+    }
+    if (!source) {
+        return {};
+    }
+
+    auto source_type = mlir::dyn_cast<mlir::RankedTensorType>(source.getType());
+    if (!source_type || source_type.getRank() != 2 ||
+        source_type.getDimSize(0) != output_type.getDimSize(1) ||
+        source_type.getDimSize(1) != output_type.getDimSize(0) ||
+        source_type.getElementType() != output_type.getElementType()) {
+        return {};
+    }
+    return source;
+}
+
+bool eraseDeadOps(FuncOp func) {
+    bool changed = false;
+    bool local_changed = true;
+    while (local_changed) {
+        local_changed = false;
+        llvm::SmallVector<mlir::Operation*> dead_ops;
+        for (mlir::Operation& op : func.front()) {
+            if (mlir::isa<mlir::func::ReturnOp>(op)) {
+                continue;
+            }
+            if (auto custom_call = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op);
+                custom_call && custom_call.getHasSideEffect()) {
+                continue;
+            }
+            if (op.use_empty()) {
+                dead_ops.push_back(&op);
+            }
+        }
+        for (mlir::Operation* op : dead_ops) {
+            op->erase();
+            local_changed = true;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+bool collapseChainedBroadcasts(FuncOp func) {
+    bool changed = false;
+    llvm::SmallVector<mlir::stablehlo::BroadcastInDimOp> broadcasts;
+    func.walk([&](mlir::stablehlo::BroadcastInDimOp broadcast) {
+        broadcasts.push_back(broadcast);
+    });
+
+    for (auto outer : broadcasts) {
+        if (outer->getParentOp() != func) {
+            continue;
+        }
+        auto inner = outer.getOperand().getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
+        if (!inner) {
+            continue;
+        }
+
+        auto inner_dims = inner.getBroadcastDimensions();
+        auto outer_dims = outer.getBroadcastDimensions();
+        llvm::SmallVector<int64_t> composed_dims;
+        composed_dims.reserve(inner_dims.size());
+        bool valid = true;
+        for (int64_t inner_dim : inner_dims) {
+            if (inner_dim < 0 || inner_dim >= static_cast<int64_t>(outer_dims.size())) {
+                valid = false;
+                break;
+            }
+            composed_dims.push_back(outer_dims[inner_dim]);
+        }
+        if (!valid) {
+            continue;
+        }
+
+        mlir::OpBuilder builder(outer);
+        auto collapsed = mlir::stablehlo::BroadcastInDimOp::create(
+            builder,
+            outer.getLoc(),
+            outer.getType(),
+            inner.getOperand(),
+            builder.getDenseI64ArrayAttr(composed_dims));
+        outer.getResult().replaceAllUsesWith(collapsed.getResult());
+        changed = true;
+    }
+
+    if (changed) {
+        eraseDeadOps(func);
+    }
+    return changed;
+}
+
+mlir::Value matchRepeatAxis1(mlir::stablehlo::ReshapeOp reshape) {
+    auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(reshape.getType());
+    if (!output_type || output_type.getRank() != 3) {
+        return {};
+    }
+
+    auto broadcast = reshape.getOperand().getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
+    if (!broadcast || !equalsArray(broadcast.getBroadcastDimensions(), {0, 1, 3})) {
+        return {};
+    }
+
+    auto broadcast_type = mlir::dyn_cast<mlir::RankedTensorType>(broadcast.getType());
+    auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(broadcast.getOperand().getType());
+    if (!broadcast_type || !input_type || broadcast_type.getRank() != 4 ||
+        input_type.getRank() != 3 ||
+        input_type.getElementType() != output_type.getElementType() ||
+        broadcast_type.getElementType() != output_type.getElementType()) {
+        return {};
+    }
+
+    int64_t batch = input_type.getDimSize(0);
+    int64_t input_axis = input_type.getDimSize(1);
+    int64_t repeat = broadcast_type.getDimSize(2);
+    int64_t width = input_type.getDimSize(2);
+    if (batch <= 0 || input_axis <= 0 || repeat <= 1 || width <= 0 ||
+        !equalsArray(broadcast_type.getShape(), {batch, input_axis, repeat, width}) ||
+        !equalsArray(output_type.getShape(), {batch, input_axis * repeat, width})) {
+        return {};
+    }
+
+    return broadcast.getOperand();
+}
+
+bool rewriteRepeatAxis1(FuncOp func) {
+    bool changed = false;
+    llvm::SmallVector<mlir::stablehlo::ReshapeOp> reshapes;
+    func.walk([&](mlir::stablehlo::ReshapeOp reshape) {
+        reshapes.push_back(reshape);
+    });
+
+    for (auto reshape : reshapes) {
+        if (reshape->getParentOp() != func) {
+            continue;
+        }
+        mlir::Value source = matchRepeatAxis1(reshape);
+        if (!source) {
+            continue;
+        }
+
+        mlir::OpBuilder builder(reshape);
+        mlir::OperationState state(reshape.getLoc(), "stablehlo.custom_call");
+        state.addOperands(source);
+        state.addTypes(reshape.getType());
+        state.addAttribute("call_target_name", builder.getStringAttr("tt.repeat_axis1"));
+        state.addAttribute("has_side_effect", builder.getBoolAttr(false));
+        auto custom_call = mlir::cast<mlir::stablehlo::CustomCallOp>(builder.create(state));
+        reshape.getResult().replaceAllUsesWith(custom_call.getResult(0));
+        changed = true;
+    }
+
+    if (changed) {
+        eraseDeadOps(func);
+    }
+    return changed;
+}
+
+std::optional<int64_t> matchTakeAxis1(mlir::stablehlo::ReshapeOp reshape, mlir::Value& source) {
+    auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(reshape.getType());
+    if (!output_type || output_type.getRank() != 2) {
+        return std::nullopt;
+    }
+
+    auto slice = reshape.getOperand().getDefiningOp<mlir::stablehlo::SliceOp>();
+    if (!slice) {
+        return std::nullopt;
+    }
+
+    auto slice_type = mlir::dyn_cast<mlir::RankedTensorType>(slice.getType());
+    auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(slice.getOperand().getType());
+    if (!slice_type || !input_type || slice_type.getRank() != 3 || input_type.getRank() != 3 ||
+        slice_type.getElementType() != output_type.getElementType() ||
+        input_type.getElementType() != output_type.getElementType()) {
+        return std::nullopt;
+    }
+
+    int64_t batch = input_type.getDimSize(0);
+    int64_t axis1 = input_type.getDimSize(1);
+    int64_t width = input_type.getDimSize(2);
+    if (batch <= 0 || axis1 <= 0 || width <= 0 ||
+        !equalsArray(slice_type.getShape(), {batch, 1, width}) ||
+        !equalsArray(output_type.getShape(), {batch, width}) ||
+        !equalsArray(slice.getStrides(), {1, 1, 1})) {
+        return std::nullopt;
+    }
+
+    auto starts = slice.getStartIndices();
+    auto limits = slice.getLimitIndices();
+    if (starts.size() != 3 || limits.size() != 3 ||
+        starts[0] != 0 || starts[2] != 0 ||
+        limits[0] != batch || limits[2] != width ||
+        starts[1] < 0 || starts[1] >= axis1 || limits[1] != starts[1] + 1) {
+        return std::nullopt;
+    }
+
+    source = slice.getOperand();
+    return starts[1];
+}
+
+bool rewriteTakeAxis1(FuncOp func) {
+    bool changed = false;
+    llvm::SmallVector<mlir::stablehlo::ReshapeOp> reshapes;
+    func.walk([&](mlir::stablehlo::ReshapeOp reshape) {
+        reshapes.push_back(reshape);
+    });
+
+    for (auto reshape : reshapes) {
+        if (reshape->getParentOp() != func) {
+            continue;
+        }
+        mlir::Value source;
+        std::optional<int64_t> axis1_index = matchTakeAxis1(reshape, source);
+        if (!axis1_index) {
+            continue;
+        }
+
+        mlir::OpBuilder builder(reshape);
+        mlir::OperationState state(reshape.getLoc(), "stablehlo.custom_call");
+        state.addOperands(source);
+        state.addTypes(reshape.getType());
+        state.addAttribute(
+            "call_target_name",
+            builder.getStringAttr("tt.take_axis1." + std::to_string(*axis1_index)));
+        state.addAttribute("has_side_effect", builder.getBoolAttr(false));
+        auto custom_call = mlir::cast<mlir::stablehlo::CustomCallOp>(builder.create(state));
+        reshape.getResult().replaceAllUsesWith(custom_call.getResult(0));
+        changed = true;
+    }
+
+    if (changed) {
+        eraseDeadOps(func);
+    }
+    return changed;
+}
+
+bool rewriteManualRank2Transposes(FuncOp func) {
+    bool changed = false;
+    llvm::SmallVector<mlir::stablehlo::ConcatenateOp> concatenates;
+    func.walk([&](mlir::stablehlo::ConcatenateOp concatenate) {
+        concatenates.push_back(concatenate);
+    });
+
+    for (auto concatenate : concatenates) {
+        if (concatenate->getParentOp() != func) {
+            continue;
+        }
+        mlir::Value source = matchManualRank2Transpose(concatenate);
+        if (!source) {
+            continue;
+        }
+
+        mlir::OpBuilder builder(concatenate);
+        auto permutation = builder.getDenseI64ArrayAttr({1, 0});
+        auto transpose = mlir::stablehlo::TransposeOp::create(
+            builder,
+            concatenate.getLoc(),
+            concatenate.getType(),
+            source,
+            permutation);
+        concatenate.getResult().replaceAllUsesWith(transpose.getResult());
+        changed = true;
+    }
+
+    if (changed) {
+        eraseDeadOps(func);
+    }
+    return changed;
+}
+
 tt::AnalysisResult makeResult(tt::AnalysisResult::Status status, const std::string& error = "") {
     tt::AnalysisResult result;
     result.set_status(status);
@@ -894,6 +1249,11 @@ extern "C" bool TT_MlirAnalyzeProgram(
             tt::AnalysisResult::STATUS_PARSE_ERROR,
             "module does not contain a function"), alloc_output, user_data);
     }
+    rewriteRepeatAxis1(*entry);
+    rewriteTakeAxis1(*entry);
+    collapseChainedBroadcasts(*entry);
+    rewriteManualRank2Transposes(*entry);
+    eraseDeadOps(*entry);
 
     tt::AnalysisResult result;
     result.set_status(tt::AnalysisResult::STATUS_OK);
