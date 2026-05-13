@@ -152,7 +152,7 @@ unsafe impl Sync for PJRT_Api {}
 #[cfg(libtt_mlir_frontend)]
 const EXECUTABLE_NAME: &str = "tt.executable.v1";
 #[cfg(libtt_mlir_frontend)]
-const MLIR_ANALYSIS_CACHE_KIND: &str = "mlir-analysis-v6";
+const MLIR_ANALYSIS_CACHE_KIND: &str = "mlir-analysis-v7";
 
 #[cfg(libtt_mlir_frontend)]
 static MLIR_ANALYSIS_CACHE: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
@@ -2262,116 +2262,6 @@ fn execute_identity_custom_call(
     Ok(())
 }
 
-fn execute_repeat_axis1_custom_call(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    device: &mut Device,
-    context: &OutputContext,
-    input_id: u32,
-    output_id: u32,
-) -> Result<(), *mut PJRT_Error> {
-    let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
-        invalid_argument("TT executable repeat_axis1 operand value id is out of bounds")
-    })?;
-    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable repeat_axis1 output id {output_id} is out of bounds"
-        ))
-    })?;
-    if input_desc.element_type != output_desc.element_type {
-        return Err(invalid_argument(
-            "TT executable repeat_axis1 input and output element types must match",
-        ));
-    }
-
-    let input = device_buffer_for_value(values, input_id, "repeat_axis1.input")?;
-    let Some(input_dram) = input.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable repeat_axis1 input buffer has no device allocation",
-        ));
-    };
-    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
-    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let repeat_plan =
-        kernels::repeat::RepeatAxis1Plan::new(&input_shape, &output_shape).map_err(io_error)?;
-    let output_dram =
-        kernels::repeat::repeat_axis1(device, input_dram, &repeat_plan, dtype, "pjrt_repeat_axis1")
-            .map_err(io_error)?;
-    store_output_buffer(
-        values,
-        plan,
-        output_id,
-        output_desc.dims.clone(),
-        output_dram,
-        context,
-        "repeat_axis1",
-    )
-}
-
-fn execute_take_axis1_custom_call(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    device: &mut Device,
-    context: &OutputContext,
-    input_id: u32,
-    output_id: u32,
-    axis1_index: usize,
-) -> Result<(), *mut PJRT_Error> {
-    let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
-        invalid_argument("TT executable take_axis1 operand value id is out of bounds")
-    })?;
-    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable take_axis1 output id {output_id} is out of bounds"
-        ))
-    })?;
-    if input_desc.element_type != output_desc.element_type {
-        return Err(invalid_argument(
-            "TT executable take_axis1 input and output element types must match",
-        ));
-    }
-
-    let input = device_buffer_for_value(values, input_id, "take_axis1.input")?;
-    let Some(input_dram) = input.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable take_axis1 input buffer has no device allocation",
-        ));
-    };
-    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
-    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let take_plan = kernels::take::TakeAxis1Plan::new(&input_shape, &output_shape, axis1_index)
-        .map_err(io_error)?;
-    let output_dram =
-        kernels::take::take_axis1(device, input_dram, &take_plan, dtype, "pjrt_take_axis1")
-            .map_err(io_error)?;
-    store_output_buffer(
-        values,
-        plan,
-        output_id,
-        output_desc.dims.clone(),
-        output_dram,
-        context,
-        "take_axis1",
-    )
-}
-
-fn parse_take_axis1_target(call_target_name: &str) -> Result<Option<usize>, *mut PJRT_Error> {
-    let Some(index) = call_target_name.strip_prefix("tt.take_axis1.") else {
-        return Ok(None);
-    };
-    if index.is_empty() {
-        return Err(invalid_argument(
-            "TT executable take_axis1 custom_call target is missing an index",
-        ));
-    }
-    index
-        .parse::<usize>()
-        .map(Some)
-        .map_err(|_| invalid_argument(format!("invalid take_axis1 index in {call_target_name:?}")))
-}
-
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -3091,51 +2981,6 @@ fn execute_executable_v1(
                         *input_id,
                         *output_id,
                         call_target_name,
-                    )?;
-                }
-                executable::Op::CustomCall {
-                    input_ids,
-                    output_id,
-                    call_target_name,
-                    ..
-                } if call_target_name == "tt.repeat_axis1" => {
-                    let [input_id] = input_ids.as_slice() else {
-                        return Err(invalid_argument(format!(
-                            "TT executable custom_call \"tt.repeat_axis1\" expected one input, got {}",
-                            input_ids.len()
-                        )));
-                    };
-                    execute_repeat_axis1_custom_call(
-                        &mut values,
-                        plan,
-                        device,
-                        &output_context,
-                        *input_id,
-                        *output_id,
-                    )?;
-                }
-                executable::Op::CustomCall {
-                    input_ids,
-                    output_id,
-                    call_target_name,
-                    ..
-                } if parse_take_axis1_target(call_target_name)?.is_some() => {
-                    let axis1_index = parse_take_axis1_target(call_target_name)?
-                        .expect("custom_call target was matched as take_axis1");
-                    let [input_id] = input_ids.as_slice() else {
-                        return Err(invalid_argument(format!(
-                            "TT executable custom_call {call_target_name:?} expected one input, got {}",
-                            input_ids.len()
-                        )));
-                    };
-                    execute_take_axis1_custom_call(
-                        &mut values,
-                        plan,
-                        device,
-                        &output_context,
-                        *input_id,
-                        *output_id,
-                        axis1_index,
                     )?;
                 }
                 executable::Op::CustomCall {
