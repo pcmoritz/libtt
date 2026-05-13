@@ -18,6 +18,7 @@ constexpr uint32_t INPUT_TILE_ROWS = BROADCAST_INPUT_TILE_ROWS;
 constexpr uint32_t INPUT_TILES_PER_ROW = BROADCAST_INPUT_TILES_PER_ROW;
 constexpr uint32_t OUTPUT_TILE_ROWS = BROADCAST_OUTPUT_TILE_ROWS;
 constexpr uint32_t OUTPUT_TILES_PER_ROW = BROADCAST_OUTPUT_TILES_PER_ROW;
+constexpr bool DIRECT_COPY = BROADCAST_DIRECT_COPY != 0;
 using Element = BROADCAST_ELEMENT_TYPE;
 
 struct Location {
@@ -91,78 +92,54 @@ void decode_output_batch(uint32_t output_batch, uint32_t output_coords[OUTPUT_CO
   }
 }
 
-void set_output_matrix_coords(uint32_t output_coords[OUTPUT_COORD_COUNT], uint32_t output_row,
-                              uint32_t output_col) {
-  if constexpr (OUTPUT_RANK == 1) {
-    output_coords[0] = output_col;
-  } else if constexpr (OUTPUT_RANK >= 2) {
-    output_coords[OUTPUT_RANK - 2] = output_row;
-    output_coords[OUTPUT_RANK - 1] = output_col;
+uint32_t output_coord(uint32_t dim, const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
+                      uint32_t output_row, uint32_t output_col) {
+  if constexpr (OUTPUT_RANK == 0) {
+    return 0;
+  } else if constexpr (OUTPUT_RANK == 1) {
+    return output_col;
+  } else {
+    if (dim == OUTPUT_RANK - 1) {
+      return output_col;
+    }
+    if (dim == OUTPUT_RANK - 2) {
+      return output_row;
+    }
+    return base_output_coords[dim];
   }
 }
 
-Location input_location(const uint32_t output_coords[OUTPUT_COORD_COUNT]) {
+uint32_t input_coord(uint32_t dim, const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
+                     uint32_t output_row, uint32_t output_col) {
+  if (INPUT_SHAPE[dim] == 1) {
+    return 0;
+  }
+  return output_coord(BROADCAST_DIMS[dim], base_output_coords, output_row, output_col);
+}
+
+Location input_location(const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
+                        uint32_t output_row, uint32_t output_col) {
   if constexpr (INPUT_RANK == 0) {
     return Location{0, 0, 0};
   } else if constexpr (INPUT_RANK == 1) {
-    uint32_t input_col = INPUT_SHAPE[0] == 1 ? 0 : output_coords[BROADCAST_DIMS[0]];
+    uint32_t input_col = input_coord(0, base_output_coords, output_row, output_col);
     return Location{input_col / TILE_C, 0, input_col % TILE_C};
   } else {
     uint32_t input_batch = 0;
     for (uint32_t dim = 0; dim < INPUT_RANK - 2; ++dim) {
-      uint32_t input_coord =
-          INPUT_SHAPE[dim] == 1 ? 0 : output_coords[BROADCAST_DIMS[dim]];
-      input_batch = input_batch * INPUT_SHAPE[dim] + input_coord;
+      uint32_t coord = input_coord(dim, base_output_coords, output_row, output_col);
+      input_batch = input_batch * INPUT_SHAPE[dim] + coord;
     }
     uint32_t input_row =
-        INPUT_SHAPE[INPUT_RANK - 2] == 1
-            ? 0
-            : output_coords[BROADCAST_DIMS[INPUT_RANK - 2]];
+        input_coord(INPUT_RANK - 2, base_output_coords, output_row, output_col);
     uint32_t input_col =
-        INPUT_SHAPE[INPUT_RANK - 1] == 1
-            ? 0
-            : output_coords[BROADCAST_DIMS[INPUT_RANK - 1]];
+        input_coord(INPUT_RANK - 1, base_output_coords, output_row, output_col);
     uint32_t input_tile_row = input_row / TILE_R;
     uint32_t input_tile_col = input_col / TILE_C;
     uint32_t input_tile =
         (input_batch * INPUT_TILE_ROWS + input_tile_row) * INPUT_TILES_PER_ROW +
         input_tile_col;
     return Location{input_tile, input_row % TILE_R, input_col % TILE_C};
-  }
-}
-
-Location input_location_for_output(const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
-                                   uint32_t output_row, uint32_t output_col) {
-  uint32_t output_coords[OUTPUT_COORD_COUNT];
-  for (uint32_t dim = 0; dim < OUTPUT_RANK; ++dim) {
-    output_coords[dim] = base_output_coords[dim];
-  }
-  set_output_matrix_coords(output_coords, output_row, output_col);
-  return input_location(output_coords);
-}
-
-bool can_copy_complete_tile(const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
-                            uint32_t output_row_base, uint32_t output_col_base,
-                            uint32_t row_count, uint32_t col_count, uint32_t *input_tile) {
-  if (row_count != TILE_R || col_count != TILE_C) {
-    return false;
-  }
-  if constexpr (OUTPUT_RANK < 2) {
-    return false;
-  } else {
-    Location first =
-        input_location_for_output(base_output_coords, output_row_base, output_col_base);
-    Location next_col =
-        input_location_for_output(base_output_coords, output_row_base, output_col_base + 1);
-    Location next_row =
-        input_location_for_output(base_output_coords, output_row_base + 1, output_col_base);
-    if (first.row == 0 && first.col == 0 && next_col.tile == first.tile &&
-        next_col.row == 0 && next_col.col == 1 && next_row.tile == first.tile &&
-        next_row.row == 1 && next_row.col == 0) {
-      *input_tile = first.tile;
-      return true;
-    }
-    return false;
   }
 }
 
@@ -193,10 +170,14 @@ void kernel_main() {
       .page_size = get_tile_size(cb_input),
       .data_format = get_dataformat(cb_input),
   };
-  uint32_t output_matrix_tiles = OUTPUT_TILE_ROWS * OUTPUT_TILES_PER_ROW;
-
   for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
     uint32_t output_tile_id = output_tile_offset + tile;
+    if constexpr (DIRECT_COPY) {
+      read_output_tile(input, output_tile_id, cb_output);
+      continue;
+    }
+
+    uint32_t output_matrix_tiles = OUTPUT_TILE_ROWS * OUTPUT_TILES_PER_ROW;
     uint32_t output_batch = output_tile_id / output_matrix_tiles;
     uint32_t output_matrix_tile = output_tile_id % output_matrix_tiles;
     uint32_t output_tile_row = output_matrix_tile / OUTPUT_TILES_PER_ROW;
@@ -217,13 +198,6 @@ void kernel_main() {
     uint32_t base_output_coords[OUTPUT_COORD_COUNT];
     decode_output_batch(output_batch, base_output_coords);
 
-    uint32_t raw_input_tile = INVALID_TILE;
-    if (can_copy_complete_tile(base_output_coords, output_row_base, output_col_base, row_count,
-                               col_count, &raw_input_tile)) {
-      read_output_tile(input, raw_input_tile, cb_output);
-      continue;
-    }
-
     uint32_t loaded_input_tile = INVALID_TILE;
     cb_reserve_back(cb_output, 1);
     zero_tile(cb_output);
@@ -233,15 +207,13 @@ void kernel_main() {
       uint32_t col = 0;
       while (col < col_count) {
         uint32_t output_col = output_col_base + col;
-        Location source =
-            input_location_for_output(base_output_coords, output_row, output_col);
+        Location source = input_location(base_output_coords, output_row, output_col);
         ensure_input_tile(input, source.tile, &loaded_input_tile);
 
         uint32_t run = 1;
         bool contiguous_cols = false;
         if (col + 1 < col_count) {
-          Location next_source =
-              input_location_for_output(base_output_coords, output_row, output_col + 1);
+          Location next_source = input_location(base_output_coords, output_row, output_col + 1);
           if (next_source.tile == source.tile && next_source.row == source.row) {
             if (next_source.col == source.col + 1) {
               contiguous_cols = true;
