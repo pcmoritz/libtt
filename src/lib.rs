@@ -1764,25 +1764,6 @@ fn execute_reshape(
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
-    if let Some(output_dram) = aliasable_reshape(
-        input_dram,
-        &input_shape,
-        &output_shape,
-        dtype,
-        "pjrt_reshape",
-    )
-    .map_err(io_error)?
-    {
-        return store_output_buffer(
-            values,
-            plan,
-            output_id,
-            output_dims,
-            output_dram,
-            context,
-            "reshape",
-        );
-    }
     let output_dram = kernels::reshape::reshape(
         device,
         input_dram,
@@ -1801,45 +1782,6 @@ fn execute_reshape(
         context,
         "reshape",
     )
-}
-
-fn aliasable_reshape(
-    input: &DramBuffer,
-    input_shape: &[usize],
-    output_shape: &[usize],
-    dtype: DType,
-    name: impl Into<String>,
-) -> io::Result<Option<DramBuffer>> {
-    if input.dtype != dtype || !reshape_preserves_linear_tile_layout(input_shape, output_shape) {
-        return Ok(None);
-    }
-    let output_allocation_shape = dram::tiled_allocation_shape(output_shape)?;
-    let output_tiles = dram::tiled_shape_tile_count(output_shape)?;
-    if input.num_tiles != output_tiles || input.shape != output_allocation_shape {
-        return Ok(None);
-    }
-    Ok(Some(DramBuffer {
-        name: name.into(),
-        addr: input.addr,
-        num_tiles: input.num_tiles,
-        dtype,
-        shape: output_allocation_shape,
-    }))
-}
-
-fn reshape_preserves_linear_tile_layout(input_shape: &[usize], output_shape: &[usize]) -> bool {
-    if input_shape == output_shape {
-        return true;
-    }
-    strip_leading_singletons(input_shape) == strip_leading_singletons(output_shape)
-}
-
-fn strip_leading_singletons(shape: &[usize]) -> &[usize] {
-    let first_non_singleton = shape
-        .iter()
-        .position(|&dimension| dimension != 1)
-        .unwrap_or(shape.len());
-    &shape[first_non_singleton..]
 }
 
 fn execute_slice(
@@ -4166,27 +4108,6 @@ mod tests {
 
         let (code, detail) = take_error_detail(api, error);
         panic!("unexpected PJRT error {code:?}: {detail}");
-    }
-
-    #[test]
-    fn reshape_alias_only_for_linear_tile_layout_preserving_shapes() {
-        assert!(reshape_preserves_linear_tile_layout(&[1, 288], &[288]));
-        assert!(reshape_preserves_linear_tile_layout(&[288], &[1, 288]));
-        assert!(reshape_preserves_linear_tile_layout(
-            &[1, 18, 128],
-            &[18, 128]
-        ));
-        assert!(reshape_preserves_linear_tile_layout(
-            &[18, 128],
-            &[1, 18, 128]
-        ));
-        assert!(reshape_preserves_linear_tile_layout(&[1, 1, 288], &[288]));
-        assert!(reshape_preserves_linear_tile_layout(&[18, 128], &[18, 128]));
-        assert!(!reshape_preserves_linear_tile_layout(&[18, 1], &[18]));
-        assert!(!reshape_preserves_linear_tile_layout(
-            &[18, 4, 32],
-            &[18, 128]
-        ));
     }
 
     #[test]
