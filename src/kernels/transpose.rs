@@ -66,8 +66,8 @@ pub(crate) fn transpose_rank2(
     dtype: DType,
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
-    let shape = transpose_shape(input_shape, output_shape)?;
     validate_input(input, dtype, input_shape)?;
+    let shape = transpose_shape(input_shape, output_shape)?;
     let output_allocation_shape = tiled_allocation_shape(output_shape)?;
     let output_tiles = tiled_shape_tile_count(output_shape)?;
     let output = device.alloc(output_tiles, dtype, &output_allocation_shape, name)?;
@@ -83,6 +83,30 @@ pub(crate) fn transpose_rank2(
     };
     kernel.run(device)?;
     Ok(output)
+}
+
+fn validate_input(input: &DramBuffer, dtype: DType, logical_shape: &[usize]) -> io::Result<()> {
+    if input.dtype != dtype {
+        return Err(invalid_input(format!(
+            "transpose input requires {dtype:?}, got {:?}",
+            input.dtype
+        )));
+    }
+    let expected_shape = tiled_allocation_shape(logical_shape)?;
+    if input.shape != expected_shape {
+        return Err(invalid_input(format!(
+            "transpose input allocation shape mismatch: got {:?}, expected {:?} for logical shape {:?}",
+            input.shape, expected_shape, logical_shape
+        )));
+    }
+    let expected_tiles = tiled_shape_tile_count(logical_shape)?;
+    if input.num_tiles != expected_tiles {
+        return Err(invalid_input(format!(
+            "transpose input tile count mismatch: got {}, expected {expected_tiles}",
+            input.num_tiles
+        )));
+    }
+    Ok(())
 }
 
 fn transpose_shape(
@@ -109,30 +133,6 @@ fn transpose_shape(
         output_tiles_per_row: u32_arg(output_allocation_shape[1] / TILE_C, "output tiles per row")?,
         output_tile_count: u32_arg(tiled_shape_tile_count(output_shape)?, "output tile count")?,
     })
-}
-
-fn validate_input(input: &DramBuffer, dtype: DType, logical_shape: &[usize]) -> io::Result<()> {
-    if input.dtype != dtype {
-        return Err(invalid_input(format!(
-            "transpose input requires {dtype:?}, got {:?}",
-            input.dtype
-        )));
-    }
-    let expected_shape = tiled_allocation_shape(logical_shape)?;
-    if input.shape != expected_shape {
-        return Err(invalid_input(format!(
-            "transpose input allocation shape mismatch: got {:?}, expected {:?} for logical shape {:?}",
-            input.shape, expected_shape, logical_shape
-        )));
-    }
-    let expected_tiles = tiled_shape_tile_count(logical_shape)?;
-    if input.num_tiles != expected_tiles {
-        return Err(invalid_input(format!(
-            "transpose input tile count mismatch: got {}, expected {expected_tiles}",
-            input.num_tiles
-        )));
-    }
-    Ok(())
 }
 
 fn transpose_program(key: TransposeProgramKey) -> io::Result<Program> {
@@ -209,6 +209,17 @@ mod tests {
                 .try_into()
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn transpose_shape_describes_rank2_transpose() {
+        let shape = transpose_shape(&[64, 96], &[96, 64]).expect("transpose shape");
+
+        assert_eq!(shape.input_rows, 64);
+        assert_eq!(shape.input_cols, 96);
+        assert_eq!(shape.input_tiles_per_row, 3);
+        assert_eq!(shape.output_tiles_per_row, 2);
+        assert_eq!(shape.output_tile_count, 6);
     }
 
     #[test]
