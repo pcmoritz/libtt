@@ -202,6 +202,11 @@ def apply_rope(x, cos, sin):
     return (x * cos[:, None, :] + rotate_half(x) * sin[:, None, :]).astype(x.dtype)
 
 
+def transpose_head_matrix(x, width: int):
+    # Avoid lowering to stablehlo.transpose, which the TT backend cannot execute yet.
+    return jnp.concatenate([x[:, col][None, :] for col in range(width)], axis=0)
+
+
 def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin):
     seq_len = hidden_states.shape[0]
     query_states = hidden_states @ layer["q_proj"]
@@ -221,12 +226,26 @@ def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin):
     key_states = jnp.repeat(key_states, repeats, axis=1)
     value_states = jnp.repeat(value_states, repeats, axis=1)
 
-    scores = jnp.einsum("thd,shd->hts", query_states, key_states)
+    scores = jnp.stack(
+        [
+            query_states[:, head, :]
+            @ transpose_head_matrix(key_states[:, head, :], config.head_dim)
+            for head in range(config.num_attention_heads)
+        ],
+        axis=1,
+    )
     scores = scores.astype(jnp.float32) * (config.head_dim**-0.5)
-    causal_mask = jnp.triu(jnp.ones((seq_len, seq_len), dtype=bool), k=1)
-    scores = jnp.where(causal_mask[None, :, :], -1.0e9, scores)
+    position_ids = jnp.arange(seq_len)
+    causal_mask = position_ids[None, :] > position_ids[:, None]
+    scores = jnp.where(causal_mask[:, None, :], -1.0e9, scores)
     probs = jax.nn.softmax(scores, axis=-1).astype(hidden_states.dtype)
-    attn_output = jnp.einsum("hts,shd->thd", probs, value_states)
+    attn_output = jnp.stack(
+        [
+            probs[:, head, :] @ value_states[:, head, :]
+            for head in range(config.num_attention_heads)
+        ],
+        axis=1,
+    )
     attn_output = attn_output.reshape(seq_len, -1)
     return attn_output @ layer["o_proj"]
 
@@ -285,13 +304,13 @@ def generate(config, weights, device, input_ids, args):
     rng = np.random.default_rng(args.seed + 1)
     tokens = input_ids.astype(np.int32).copy()
     forward = jax.jit(
-        lambda model_weights, ids: qwen3_forward(config, model_weights, ids),
+        lambda model_weights, ids: qwen3_forward(config, model_weights, ids)[-1],
         device=device,
     )
 
     for _ in range(args.max_new_tokens):
         ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
-        logits = np.asarray(forward(weights, ids)[-1])
+        logits = np.asarray(forward(weights, ids))
         next_token = sample_next_token(logits, rng, args.temperature, args.top_k)
         tokens = np.append(tokens, np.int32(next_token))
         if next_token == ByteTokenizer.eos_token_id:

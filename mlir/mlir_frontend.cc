@@ -348,14 +348,11 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (!addValueDesc(constant_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
             }
-            auto tensor = mlir::cast<mlir::RankedTensorType>(constant_op.getResult().getType());
-            if (tensor.getRank() >= 2) {
-                auto packed_value = packedConstantValue(constant_op.getResult(), error);
-                if (!packed_value) {
-                    return false;
-                }
-                addConstantOp(executable, output_id, *packed_value);
+            auto packed_value = packedConstantValue(constant_op.getResult(), error);
+            if (!packed_value) {
+                return false;
             }
+            addConstantOp(executable, output_id, *packed_value);
             continue;
         }
 
