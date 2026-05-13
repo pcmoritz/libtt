@@ -856,55 +856,6 @@ bool eraseDeadOps(FuncOp func) {
     return changed;
 }
 
-bool collapseChainedBroadcasts(FuncOp func) {
-    bool changed = false;
-    llvm::SmallVector<mlir::stablehlo::BroadcastInDimOp> broadcasts;
-    func.walk([&](mlir::stablehlo::BroadcastInDimOp broadcast) {
-        broadcasts.push_back(broadcast);
-    });
-
-    for (auto outer : broadcasts) {
-        if (outer->getParentOp() != func) {
-            continue;
-        }
-        auto inner = outer.getOperand().getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
-        if (!inner) {
-            continue;
-        }
-
-        auto inner_dims = inner.getBroadcastDimensions();
-        auto outer_dims = outer.getBroadcastDimensions();
-        llvm::SmallVector<int64_t> composed_dims;
-        composed_dims.reserve(inner_dims.size());
-        bool valid = true;
-        for (int64_t inner_dim : inner_dims) {
-            if (inner_dim < 0 || inner_dim >= static_cast<int64_t>(outer_dims.size())) {
-                valid = false;
-                break;
-            }
-            composed_dims.push_back(outer_dims[inner_dim]);
-        }
-        if (!valid) {
-            continue;
-        }
-
-        mlir::OpBuilder builder(outer);
-        auto collapsed = mlir::stablehlo::BroadcastInDimOp::create(
-            builder,
-            outer.getLoc(),
-            outer.getType(),
-            inner.getOperand(),
-            builder.getDenseI64ArrayAttr(composed_dims));
-        outer.getResult().replaceAllUsesWith(collapsed.getResult());
-        changed = true;
-    }
-
-    if (changed) {
-        eraseDeadOps(func);
-    }
-    return changed;
-}
-
 tt::AnalysisResult makeResult(tt::AnalysisResult::Status status, const std::string& error = "") {
     tt::AnalysisResult result;
     result.set_status(status);
@@ -972,7 +923,6 @@ extern "C" bool TT_MlirAnalyzeProgram(
             tt::AnalysisResult::STATUS_PARSE_ERROR,
             "module does not contain a function"), alloc_output, user_data);
     }
-    collapseChainedBroadcasts(*entry);
     eraseDeadOps(*entry);
 
     tt::AnalysisResult result;
