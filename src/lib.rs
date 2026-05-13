@@ -2153,26 +2153,6 @@ fn execute_broadcast_in_dim(
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
-    if let Some(output_dram) = aliasable_broadcast_in_dim(
-        input_dram,
-        &input_shape,
-        &output_shape,
-        broadcast_dimensions,
-        dtype,
-        "pjrt_broadcast",
-    )
-    .map_err(io_error)?
-    {
-        return store_output_buffer(
-            values,
-            plan,
-            output_id,
-            output_dims,
-            output_dram,
-            context,
-            "broadcast_in_dim",
-        );
-    }
     let output_dram = kernels::broadcast::broadcast_in_dim(
         device,
         input_dram,
@@ -2190,67 +2170,6 @@ fn execute_broadcast_in_dim(
         context,
         "broadcast_in_dim",
     )
-}
-
-fn aliasable_broadcast_in_dim(
-    input: &DramBuffer,
-    input_shape: &[usize],
-    output_shape: &[usize],
-    broadcast_dimensions: &[i64],
-    dtype: DType,
-    name: impl Into<String>,
-) -> io::Result<Option<DramBuffer>> {
-    if input.dtype != dtype
-        || !broadcast_only_inserts_singleton_dimensions(
-            input_shape,
-            output_shape,
-            broadcast_dimensions,
-        )
-    {
-        return Ok(None);
-    }
-    let output_tiles = dram::tiled_shape_tile_count(output_shape)?;
-    if input.num_tiles != output_tiles {
-        return Ok(None);
-    }
-    Ok(Some(DramBuffer {
-        name: name.into(),
-        addr: input.addr,
-        num_tiles: output_tiles,
-        dtype,
-        shape: dram::tiled_allocation_shape(output_shape)?,
-    }))
-}
-
-fn broadcast_only_inserts_singleton_dimensions(
-    input_shape: &[usize],
-    output_shape: &[usize],
-    broadcast_dimensions: &[i64],
-) -> bool {
-    if input_shape.len() != broadcast_dimensions.len() || input_shape.len() > output_shape.len() {
-        return false;
-    }
-
-    let leading_singletons = output_shape.len() - input_shape.len();
-    if !output_shape[..leading_singletons]
-        .iter()
-        .all(|&dim| dim == 1)
-    {
-        return false;
-    }
-
-    for (index, (&input_dim, &output_dim)) in
-        input_shape.iter().zip(broadcast_dimensions).enumerate()
-    {
-        let Ok(output_dim) = usize::try_from(output_dim) else {
-            return false;
-        };
-        let expected_output_dim = leading_singletons + index;
-        if output_dim != expected_output_dim || output_shape[output_dim] != input_dim {
-            return false;
-        }
-    }
-    true
 }
 
 fn execute_concatenate(
@@ -4026,40 +3945,6 @@ mod tests {
 
         let (code, detail) = take_error_detail(api, error);
         panic!("unexpected PJRT error {code:?}: {detail}");
-    }
-
-    #[test]
-    fn broadcast_alias_only_for_singleton_dimension_inserts() {
-        assert!(broadcast_only_inserts_singleton_dimensions(
-            &[128],
-            &[1, 128],
-            &[1]
-        ));
-        assert!(broadcast_only_inserts_singleton_dimensions(
-            &[4, 32],
-            &[1, 4, 32],
-            &[1, 2]
-        ));
-        assert!(!broadcast_only_inserts_singleton_dimensions(
-            &[18],
-            &[18, 1],
-            &[0]
-        ));
-        assert!(!broadcast_only_inserts_singleton_dimensions(
-            &[1, 128],
-            &[18, 128],
-            &[1]
-        ));
-        assert!(!broadcast_only_inserts_singleton_dimensions(
-            &[18, 32],
-            &[18, 1, 32],
-            &[0, 2]
-        ));
-        assert!(!broadcast_only_inserts_singleton_dimensions(
-            &[32],
-            &[32],
-            &[1]
-        ));
     }
 
     #[cfg(libtt_mlir_frontend)]
