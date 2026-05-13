@@ -469,17 +469,21 @@ fn lower_runtime_args(
 
 fn matmul_math_fidelity() -> io::Result<MathFidelity> {
     match env::var("LIBTT_MATMUL_FIDELITY") {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "" | "lofi" | "lo" | "0" => Ok(MathFidelity::LoFi),
-            "hifi2" | "hi2" | "2" => Ok(MathFidelity::HiFi2),
-            other => Err(invalid_input(format!(
-                "invalid LIBTT_MATMUL_FIDELITY={other:?}; expected lofi or hifi2"
-            ))),
-        },
-        Err(env::VarError::NotPresent) => Ok(MathFidelity::LoFi),
+        Ok(value) => parse_matmul_math_fidelity(&value),
+        Err(env::VarError::NotPresent) => Ok(MathFidelity::HiFi2),
         Err(env::VarError::NotUnicode(_)) => {
             Err(invalid_input("LIBTT_MATMUL_FIDELITY must be valid Unicode"))
         }
+    }
+}
+
+fn parse_matmul_math_fidelity(value: &str) -> io::Result<MathFidelity> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "hifi2" | "hi2" | "2" => Ok(MathFidelity::HiFi2),
+        "lofi" | "lo" | "0" => Ok(MathFidelity::LoFi),
+        other => Err(invalid_input(format!(
+            "invalid LIBTT_MATMUL_FIDELITY={other:?}; expected lofi or hifi2"
+        ))),
     }
 }
 
@@ -693,6 +697,26 @@ mod tests {
         assert_eq!(plan.nt, 2);
         assert_eq!(plan.per_core_m * plan.rows.len(), plan.mt);
         assert_eq!(plan.per_core_n * plan.cols.len(), plan.nt);
+    }
+
+    #[test]
+    fn matmul_fidelity_parser_defaults_empty_value_to_hifi2() {
+        assert_eq!(
+            parse_matmul_math_fidelity("").expect("empty value should use the default"),
+            MathFidelity::HiFi2
+        );
+        assert_eq!(
+            parse_matmul_math_fidelity("hifi2").expect("hifi2 should parse"),
+            MathFidelity::HiFi2
+        );
+    }
+
+    #[test]
+    fn matmul_fidelity_parser_accepts_explicit_lofi_override() {
+        assert_eq!(
+            parse_matmul_math_fidelity("lofi").expect("lofi should parse"),
+            MathFidelity::LoFi
+        );
     }
 
     #[test]
