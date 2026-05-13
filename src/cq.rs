@@ -30,6 +30,7 @@ const CQ_PREFETCH_Q_ENTRY_SIZE: usize = size_of::<u16>();
 const CQ_PREFETCH_Q_SIZE: usize = PREFETCH_Q_SIZE as usize;
 const CQ_PREFETCH_Q_ENTRIES: usize = CQ_PREFETCH_Q_SIZE / CQ_PREFETCH_Q_ENTRY_SIZE;
 const CQ_DISPATCH_CB_PAGES: u32 = DISPATCH_CB_PAGES;
+static ZERO_PREFETCH_Q: [u8; CQ_PREFETCH_Q_SIZE] = [0; CQ_PREFETCH_Q_SIZE];
 
 const PCIE_NOC_BASE: u64 = 1 << 60;
 const PCIE_ALIGN: usize = 64;
@@ -346,6 +347,7 @@ struct CqSysmem {
     dispatch_win: TlbWindow,
     issue_wr: usize,
     prefetch_q_wr_idx: usize,
+    prefetch_q_clear_idx: usize,
     completion_base_16b: u32,
     completion_page_16b: u32,
     completion_end_16b: u32,
@@ -395,7 +397,7 @@ impl CqSysmem {
             CQ_PREFETCH_Q_PCIE_RD,
             (noc_local + HOST_ISSUE_BASE as u64) as u32,
         )?;
-        prefetch_win.write(CQ_PREFETCH_Q_BASE, &vec![0; CQ_PREFETCH_Q_SIZE])?;
+        prefetch_win.write(CQ_PREFETCH_Q_BASE, &ZERO_PREFETCH_Q)?;
 
         let mut cq = Self {
             sysmem,
@@ -404,6 +406,7 @@ impl CqSysmem {
             dispatch_win,
             issue_wr: 0,
             prefetch_q_wr_idx: 0,
+            prefetch_q_clear_idx: 0,
             completion_base_16b,
             completion_page_16b,
             completion_end_16b,
@@ -456,13 +459,34 @@ impl CqSysmem {
                     format!("timeout waiting for CQ completion event {event_id}"),
                 ));
             }
-            thread::sleep(Duration::from_micros(200));
+            thread::yield_now();
         }
     }
 
     fn clear_prefetch_q_entries(&mut self) -> io::Result<()> {
+        let start = self.prefetch_q_clear_idx;
+        let end = self.prefetch_q_wr_idx;
+        if start == end {
+            return Ok(());
+        }
+        if start < end {
+            self.clear_prefetch_q_range(start, end)?;
+        } else {
+            self.clear_prefetch_q_range(start, CQ_PREFETCH_Q_ENTRIES)?;
+            self.clear_prefetch_q_range(0, end)?;
+        }
+        self.prefetch_q_clear_idx = end;
+        Ok(())
+    }
+
+    fn clear_prefetch_q_range(&mut self, start: usize, end: usize) -> io::Result<()> {
+        if start == end {
+            return Ok(());
+        }
+        let byte_count = (end - start) * CQ_PREFETCH_Q_ENTRY_SIZE;
+        let offset = CQ_PREFETCH_Q_BASE + start * CQ_PREFETCH_Q_ENTRY_SIZE;
         self.prefetch_win
-            .write(CQ_PREFETCH_Q_BASE, &vec![0; CQ_PREFETCH_Q_SIZE])
+            .write(offset, &ZERO_PREFETCH_Q[..byte_count])
     }
 
     fn issue_write(&mut self, record: &[u8]) -> io::Result<()> {

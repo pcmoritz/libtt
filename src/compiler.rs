@@ -120,6 +120,10 @@ const FW_TARGETS: &[FwTarget] = &[
 
 static FIRMWARE_CACHE: OnceLock<Mutex<HashMap<String, FirmwareCacheEntry>>> = OnceLock::new();
 static KERNEL_CACHE: OnceLock<Mutex<HashMap<String, KernelCacheEntry>>> = OnceLock::new();
+static COMPILER_CACHE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+const KERNEL_CACHE_MAGIC: &[u8] = b"LTTKERN1";
+const FIRMWARE_CACHE_MAGIC: &[u8] = b"LTTFIRM1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PTLoad {
@@ -514,6 +518,18 @@ impl Compiler {
         {
             return Ok(entry.result);
         }
+        if let Some(result) = read_kernel_disk_cache(&key) {
+            kernel_cache()
+                .lock()
+                .expect("kernel cache poisoned")
+                .insert(
+                    key,
+                    KernelCacheEntry {
+                        result: result.clone(),
+                    },
+                );
+            return Ok(result);
+        }
 
         let mut mcpu = if request.trisc {
             vec![
@@ -624,11 +640,12 @@ impl Compiler {
             .lock()
             .expect("kernel cache poisoned")
             .insert(
-                key,
+                key.clone(),
                 KernelCacheEntry {
                     result: result.clone(),
                 },
             );
+        write_kernel_disk_cache(&key, &result);
         Ok(result)
     }
 
@@ -684,6 +701,18 @@ fn compile_firmware(
         .cloned()
     {
         return Ok(entry.result);
+    }
+    if let Some(result) = read_firmware_disk_cache(&key) {
+        firmware_cache()
+            .lock()
+            .expect("firmware cache poisoned")
+            .insert(
+                key,
+                FirmwareCacheEntry {
+                    result: result.clone(),
+                },
+            );
+        return Ok(result);
     }
 
     let mut common_defines = vec![
@@ -758,11 +787,12 @@ fn compile_firmware(
         .lock()
         .expect("firmware cache poisoned")
         .insert(
-            key,
+            key.clone(),
             FirmwareCacheEntry {
                 result: result.clone(),
             },
         );
+    write_firmware_disk_cache(&key, &result);
     Ok(result)
 }
 
@@ -1422,6 +1452,310 @@ fn collect_include_files(
     Ok(())
 }
 
+fn read_kernel_disk_cache(key: &str) -> Option<CompiledKernel> {
+    let path = cache_file_path("kernels", key)?;
+    match fs::read(&path).and_then(|data| decode_kernel_cache(&data)) {
+        Ok(result) => {
+            log(format!("compiler disk cache hit kernel {}", key));
+            Some(result)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => {
+            log(format!(
+                "compiler disk cache ignored kernel {} at {}: {}",
+                key,
+                path.display(),
+                err
+            ));
+            None
+        }
+    }
+}
+
+fn write_kernel_disk_cache(key: &str, kernel: &CompiledKernel) {
+    let Some(path) = cache_file_path("kernels", key) else {
+        return;
+    };
+    if let Err(err) = write_atomic(&path, &encode_kernel_cache(kernel)) {
+        log(format!(
+            "compiler disk cache write failed kernel {} at {}: {}",
+            key,
+            path.display(),
+            err
+        ));
+    }
+}
+
+fn read_firmware_disk_cache(key: &str) -> Option<HashMap<String, CompiledFirmware>> {
+    let path = cache_file_path("firmware", key)?;
+    match fs::read(&path).and_then(|data| decode_firmware_cache(&data)) {
+        Ok(result) => {
+            log(format!("compiler disk cache hit firmware {}", key));
+            Some(result)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => {
+            log(format!(
+                "compiler disk cache ignored firmware {} at {}: {}",
+                key,
+                path.display(),
+                err
+            ));
+            None
+        }
+    }
+}
+
+fn write_firmware_disk_cache(key: &str, firmware: &HashMap<String, CompiledFirmware>) {
+    let Some(path) = cache_file_path("firmware", key) else {
+        return;
+    };
+    if let Err(err) = write_atomic(&path, &encode_firmware_cache(firmware)) {
+        log(format!(
+            "compiler disk cache write failed firmware {} at {}: {}",
+            key,
+            path.display(),
+            err
+        ));
+    }
+}
+
+fn cache_file_path(kind: &str, key: &str) -> Option<PathBuf> {
+    compiler_cache_dir().map(|dir| dir.join(kind).join(format!("{key}.bin")))
+}
+
+fn compiler_cache_dir() -> Option<PathBuf> {
+    COMPILER_CACHE_DIR
+        .get_or_init(resolve_compiler_cache_dir)
+        .clone()
+}
+
+fn resolve_compiler_cache_dir() -> Option<PathBuf> {
+    if matches!(
+        env::var("LIBTT_COMPILER_CACHE").as_deref(),
+        Ok("0") | Ok("false") | Ok("False") | Ok("FALSE")
+    ) {
+        return None;
+    }
+    if let Some(path) = env::var_os("LIBTT_COMPILER_CACHE_DIR") {
+        return (!path.is_empty()).then(|| PathBuf::from(path));
+    }
+    if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path).join("libtt").join("compiler-v1"));
+    }
+    if let Some(home) = env::var_os("HOME").filter(|path| !path.is_empty()) {
+        return Some(
+            PathBuf::from(home)
+                .join(".cache")
+                .join("libtt")
+                .join("compiler-v1"),
+        );
+    }
+    Some(env::temp_dir().join("libtt").join("compiler-v1"))
+}
+
+fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cache path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("cache-entry"),
+        unique_suffix()
+    ));
+    let result = (|| {
+        fs::write(&tmp, data)?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn unique_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
+}
+
+fn encode_kernel_cache(kernel: &CompiledKernel) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(KERNEL_CACHE_MAGIC);
+    put_u64(&mut out, kernel.xip_text_bytes as u64);
+    put_bytes(&mut out, &kernel.xip);
+    match &kernel.elf_bytes {
+        Some(elf) => put_bytes(&mut out, elf),
+        None => put_u64(&mut out, u64::MAX),
+    }
+    out
+}
+
+fn decode_kernel_cache(data: &[u8]) -> io::Result<CompiledKernel> {
+    let mut reader = CacheReader::new(data);
+    reader.expect_magic(KERNEL_CACHE_MAGIC)?;
+    let xip_text_bytes = usize::try_from(reader.read_u64()?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "xip text size overflow"))?;
+    let xip = reader.read_bytes()?.to_vec();
+    let elf_bytes = match reader.read_u64()? {
+        u64::MAX => None,
+        len => Some(reader.read_len_bytes(len)?.to_vec()),
+    };
+    reader.expect_end()?;
+    Ok(CompiledKernel {
+        xip,
+        xip_text_bytes,
+        elf_bytes,
+    })
+}
+
+fn encode_firmware_cache(firmware: &HashMap<String, CompiledFirmware>) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(FIRMWARE_CACHE_MAGIC);
+    put_u32(&mut out, firmware.len() as u32);
+    let mut entries = firmware.iter().collect::<Vec<_>>();
+    entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    for (target, compiled) in entries {
+        put_bytes(&mut out, target.as_bytes());
+        put_bytes(&mut out, &compiled.elf_bytes);
+        put_u32(&mut out, compiled.scratch_base);
+        put_u32(&mut out, compiled.segments.len() as u32);
+        for segment in &compiled.segments {
+            put_u32(&mut out, segment.paddr);
+            put_u32(&mut out, segment.memsz);
+            put_u32(&mut out, segment.flags);
+            put_bytes(&mut out, &segment.data);
+        }
+    }
+    out
+}
+
+fn decode_firmware_cache(data: &[u8]) -> io::Result<HashMap<String, CompiledFirmware>> {
+    let mut reader = CacheReader::new(data);
+    reader.expect_magic(FIRMWARE_CACHE_MAGIC)?;
+    let count = reader.read_u32()?;
+    let mut firmware = HashMap::new();
+    for _ in 0..count {
+        let target = String::from_utf8(reader.read_bytes()?.to_vec()).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid target name: {err}"),
+            )
+        })?;
+        let elf_bytes = reader.read_bytes()?.to_vec();
+        let scratch_base = reader.read_u32()?;
+        let segment_count = reader.read_u32()?;
+        let mut segments = Vec::new();
+        for _ in 0..segment_count {
+            let paddr = reader.read_u32()?;
+            let memsz = reader.read_u32()?;
+            let flags = reader.read_u32()?;
+            let data = reader.read_bytes()?.to_vec();
+            segments.push(PTLoad {
+                paddr,
+                data,
+                memsz,
+                flags,
+            });
+        }
+        firmware.insert(
+            target,
+            CompiledFirmware {
+                elf_bytes,
+                segments,
+                scratch_base,
+            },
+        );
+    }
+    reader.expect_end()?;
+    Ok(firmware)
+}
+
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_u64(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+struct CacheReader<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CacheReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn expect_magic(&mut self, magic: &[u8]) -> io::Result<()> {
+        let found = self.read_exact(magic.len())?;
+        if found != magic {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache magic mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn expect_end(&self) -> io::Result<()> {
+        if self.offset == self.data.len() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache entry has trailing data",
+            ))
+        }
+    }
+
+    fn read_u32(&mut self) -> io::Result<u32> {
+        let bytes = self.read_exact(4)?;
+        Ok(u32::from_le_bytes(bytes.try_into().expect("read 4 bytes")))
+    }
+
+    fn read_u64(&mut self) -> io::Result<u64> {
+        let bytes = self.read_exact(8)?;
+        Ok(u64::from_le_bytes(bytes.try_into().expect("read 8 bytes")))
+    }
+
+    fn read_bytes(&mut self) -> io::Result<&'a [u8]> {
+        let len = self.read_u64()?;
+        self.read_len_bytes(len)
+    }
+
+    fn read_len_bytes(&mut self, len: u64) -> io::Result<&'a [u8]> {
+        let len = usize::try_from(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "cache length overflow"))?;
+        self.read_exact(len)
+    }
+
+    fn read_exact(&mut self, len: usize) -> io::Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cache offset overflow"))?;
+        let bytes = self
+            .data
+            .get(self.offset..end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "short cache read"))?;
+        self.offset = end;
+        Ok(bytes)
+    }
+}
+
 fn read_u16(data: &[u8], offset: usize) -> io::Result<u16> {
     let bytes = data
         .get(offset..offset + 2)
@@ -1534,6 +1868,40 @@ mod tests {
         assert!(headers["chlkc_dst_sync_mode.h"].contains("DstSync::SyncFull"));
         assert!(headers["chlkc_math_fidelity.h"].contains("0"));
         assert!(headers["chlkc_math_approx_mode.h"].contains("true"));
+    }
+
+    #[test]
+    fn kernel_disk_cache_codec_roundtrips() {
+        let kernel = CompiledKernel {
+            xip: vec![1, 2, 3, 4],
+            xip_text_bytes: 3,
+            elf_bytes: Some(vec![5, 6, 7]),
+        };
+        assert_eq!(
+            decode_kernel_cache(&encode_kernel_cache(&kernel)).expect("decode"),
+            kernel
+        );
+    }
+
+    #[test]
+    fn firmware_disk_cache_codec_roundtrips() {
+        let firmware = HashMap::from([(
+            "brisc".to_owned(),
+            CompiledFirmware {
+                elf_bytes: vec![1, 2],
+                scratch_base: 0x1234,
+                segments: vec![PTLoad {
+                    paddr: 0x1000,
+                    data: vec![3, 4, 5],
+                    memsz: 8,
+                    flags: 1,
+                }],
+            },
+        )]);
+        assert_eq!(
+            decode_firmware_cache(&encode_firmware_cache(&firmware)).expect("decode"),
+            firmware
+        );
     }
 
     #[test]

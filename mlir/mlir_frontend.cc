@@ -7,9 +7,11 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Dialect/Func/Extensions/AllExtensions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -827,6 +829,33 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     return true;
 }
 
+bool eraseDeadOps(FuncOp func) {
+    bool changed = false;
+    bool local_changed = true;
+    while (local_changed) {
+        local_changed = false;
+        llvm::SmallVector<mlir::Operation*> dead_ops;
+        for (mlir::Operation& op : func.front()) {
+            if (mlir::isa<mlir::func::ReturnOp>(op)) {
+                continue;
+            }
+            if (auto custom_call = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op);
+                custom_call && custom_call.getHasSideEffect()) {
+                continue;
+            }
+            if (op.use_empty()) {
+                dead_ops.push_back(&op);
+            }
+        }
+        for (mlir::Operation* op : dead_ops) {
+            op->erase();
+            local_changed = true;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 tt::AnalysisResult makeResult(tt::AnalysisResult::Status status, const std::string& error = "") {
     tt::AnalysisResult result;
     result.set_status(status);
@@ -894,6 +923,7 @@ extern "C" bool TT_MlirAnalyzeProgram(
             tt::AnalysisResult::STATUS_PARSE_ERROR,
             "module does not contain a function"), alloc_output, user_data);
     }
+    eraseDeadOps(*entry);
 
     tt::AnalysisResult result;
     result.set_status(tt::AnalysisResult::STATUS_OK);
