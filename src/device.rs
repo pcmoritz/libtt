@@ -1,5 +1,5 @@
 use crate::compiler::Compiler;
-use crate::cq::FastDispatcher;
+use crate::cq::{lower_setup_records, FastDispatcher};
 use crate::dispatch::{
     build_dispatch_setup_plan, mcast_rects, DevMsgs, DispatchCommand, Program, SlowDispatcher,
 };
@@ -105,7 +105,9 @@ pub struct Device {
 
 struct CachedProgramLaunch {
     setup: Vec<DispatchCommand>,
+    setup_records: Vec<Vec<u8>>,
     launch_setup: Vec<DispatchCommand>,
+    launch_setup_records: Vec<Vec<u8>>,
     runtime_args: RuntimeArgs,
 }
 
@@ -115,6 +117,7 @@ trait Dispatcher {
         &mut self,
         program: &Program,
         setup: &[DispatchCommand],
+        setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()>;
 }
@@ -127,10 +130,11 @@ impl Dispatcher for FastDispatcher {
     fn launch(
         &mut self,
         program: &Program,
-        setup: &[DispatchCommand],
+        _setup: &[DispatchCommand],
+        setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
-        FastDispatcher::launch(self, program, setup, runtime_args)
+        FastDispatcher::launch(self, program, setup_records, runtime_args)
     }
 }
 
@@ -143,6 +147,7 @@ impl Dispatcher for SlowDispatcher {
         &mut self,
         _program: &Program,
         setup: &[DispatchCommand],
+        _setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
         SlowDispatcher::launch(self, setup, runtime_args)
@@ -348,18 +353,30 @@ impl Device {
         let is_staged = self.staged_cached_program == Some(program_id);
 
         if !self.cached_program_launches.contains_key(&program_id) {
+            let dispatch_mode = self.dispatcher.dispatch_mode();
             let setup = build_dispatch_setup_plan(
                 &self.compiler,
                 self.cores_ref(),
                 &program,
-                self.dispatcher.dispatch_mode(),
+                dispatch_mode,
             )?;
             let launch_setup = launch_descriptor_setup(&setup);
+            let (setup_records, launch_setup_records) =
+                if dispatch_mode == DevMsgs::DISPATCH_MODE_DEV {
+                    (
+                        lower_setup_records(&setup)?,
+                        lower_setup_records(&launch_setup)?,
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
             self.cached_program_launches.insert(
                 program_id,
                 CachedProgramLaunch {
                     setup,
+                    setup_records,
                     launch_setup,
+                    launch_setup_records,
                     runtime_args: program.runtime_args.clone(),
                 },
             );
@@ -370,13 +387,16 @@ impl Device {
             .get_mut(&program_id)
             .expect("cached program launch was just inserted");
         update_runtime_args(&mut launch.runtime_args)?;
-        let setup = if is_staged {
-            launch.launch_setup.as_slice()
+        let (setup, setup_records) = if is_staged {
+            (
+                launch.launch_setup.as_slice(),
+                launch.launch_setup_records.as_slice(),
+            )
         } else {
-            launch.setup.as_slice()
+            (launch.setup.as_slice(), launch.setup_records.as_slice())
         };
         self.dispatcher
-            .launch(&program, setup, &launch.runtime_args)?;
+            .launch(&program, setup, setup_records, &launch.runtime_args)?;
         self.staged_cached_program = Some(program_id);
         Ok(())
     }

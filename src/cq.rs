@@ -100,10 +100,9 @@ impl FastDispatcher {
     pub(crate) fn launch(
         &mut self,
         program: &Program,
-        setup: &[DispatchCommand],
+        setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
-        let setup_records = relayed_command_records(lower_ir(setup))?;
         let dispatch_core = self.dispatch_core;
         let template = match self
             .runtime_templates
@@ -132,6 +131,10 @@ impl FastDispatcher {
         self.cq_hw
             .wait_completion(self.event_id, Duration::from_secs(10))
     }
+}
+
+pub(crate) fn lower_setup_records(setup: &[DispatchCommand]) -> io::Result<Vec<Vec<u8>>> {
+    relayed_command_records(lower_ir(setup))
 }
 
 #[derive(Clone, Debug)]

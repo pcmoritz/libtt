@@ -4,7 +4,7 @@ use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) const TILE_R: usize = 32;
 pub(crate) const TILE_C: usize = 32;
@@ -76,7 +76,7 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DramBuffer {
     pub name: String,
     pub addr: u64,
@@ -84,7 +84,20 @@ pub struct DramBuffer {
     pub dtype: DType,
     /// Physical allocation shape. The last two dimensions are tile-aligned.
     pub shape: Shape,
+    _allocation: Option<Arc<DramAllocation>>,
 }
+
+impl PartialEq for DramBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.addr == other.addr
+            && self.num_tiles == other.num_tiles
+            && self.dtype == other.dtype
+            && self.shape == other.shape
+    }
+}
+
+impl Eq for DramBuffer {}
 
 impl DramBuffer {
     pub(crate) fn page_size(&self) -> usize {
@@ -96,15 +109,49 @@ impl DramBuffer {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DramAllocation {
+    local_hardware_id: usize,
+    addr: u64,
+    size: u64,
+}
+
+impl Drop for DramAllocation {
+    fn drop(&mut self) {
+        free_allocation(self.local_hardware_id, self.addr, self.size);
+    }
+}
+
 pub struct Allocator {
     window: TlbWindow,
     bank_tiles: Vec<DramTile>,
     local_hardware_id: usize,
-    next: u64,
     bank_count: usize,
 }
 
-static ALLOCATOR_NEXT_BY_DEVICE: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
+#[derive(Debug)]
+struct DeviceAllocatorState {
+    next: u64,
+    free: Vec<FreeBlock>,
+}
+
+impl DeviceAllocatorState {
+    fn new() -> Self {
+        Self {
+            next: Dram::WRITE_OFFSET,
+            free: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreeBlock {
+    addr: u64,
+    size: u64,
+}
+
+static ALLOCATOR_STATE_BY_DEVICE: OnceLock<Mutex<HashMap<usize, DeviceAllocatorState>>> =
+    OnceLock::new();
 
 impl Allocator {
     pub fn open(local_hardware_id: usize) -> io::Result<Self> {
@@ -141,12 +188,10 @@ impl Allocator {
             0,
             NocOrdering::Strict,
         )?;
-        let next = allocator_next(device.local_hardware_id);
         Ok(Self {
             window,
             bank_tiles,
             local_hardware_id: device.local_hardware_id,
-            next,
             bank_count,
         })
     }
@@ -159,15 +204,21 @@ impl Allocator {
         shape: Shape,
     ) -> io::Result<DramBuffer> {
         validate_allocation_shape(num_tiles, &shape)?;
-        let (addr, next) = next_allocation_range(self.next, num_tiles, dtype, self.bank_count)?;
-        self.next = next;
-        set_allocator_next(self.local_hardware_id, next);
+        let (addr, allocation_size, _next) =
+            allocate_allocation_range(self.local_hardware_id, num_tiles, dtype, self.bank_count)?;
         Ok(DramBuffer {
             name: name.into(),
             addr,
             num_tiles,
             dtype,
             shape,
+            _allocation: (allocation_size > 0).then(|| {
+                Arc::new(DramAllocation {
+                    local_hardware_id: self.local_hardware_id,
+                    addr,
+                    size: allocation_size,
+                })
+            }),
         })
     }
 
@@ -300,16 +351,80 @@ impl Allocator {
     }
 }
 
-fn allocator_next(local_hardware_id: usize) -> u64 {
-    let state = ALLOCATOR_NEXT_BY_DEVICE.get_or_init(|| Mutex::new(HashMap::new()));
+fn allocate_allocation_range(
+    local_hardware_id: usize,
+    num_tiles: usize,
+    dtype: DType,
+    bank_count: usize,
+) -> io::Result<(u64, u64, u64)> {
+    let allocation_size = allocation_range_size(num_tiles, dtype, bank_count)?;
+    let state = ALLOCATOR_STATE_BY_DEVICE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut state = state.lock().expect("allocator state lock poisoned");
-    *state.entry(local_hardware_id).or_insert(Dram::WRITE_OFFSET)
+    let device_state = state
+        .entry(local_hardware_id)
+        .or_insert_with(DeviceAllocatorState::new);
+    if allocation_size == 0 {
+        return Ok((device_state.next, allocation_size, device_state.next));
+    }
+    if let Some(addr) = allocate_free_block(&mut device_state.free, allocation_size) {
+        return Ok((addr, allocation_size, device_state.next));
+    }
+
+    let (addr, next) = next_allocation_range(device_state.next, num_tiles, dtype, bank_count)?;
+    device_state.next = next;
+    Ok((addr, allocation_size, next))
 }
 
-fn set_allocator_next(local_hardware_id: usize, next: u64) {
-    let state = ALLOCATOR_NEXT_BY_DEVICE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut state = state.lock().expect("allocator state lock poisoned");
-    state.insert(local_hardware_id, next);
+fn allocate_free_block(free: &mut Vec<FreeBlock>, size: u64) -> Option<u64> {
+    let index = free
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.size >= size)
+        .min_by_key(|(_, block)| block.size)
+        .map(|(index, _)| index)?;
+    let addr = free[index].addr;
+    if free[index].size == size {
+        free.remove(index);
+    } else {
+        free[index].addr += size;
+        free[index].size -= size;
+    }
+    Some(addr)
+}
+
+fn free_allocation(local_hardware_id: usize, addr: u64, size: u64) {
+    if size == 0 {
+        return;
+    }
+    let state = ALLOCATOR_STATE_BY_DEVICE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut state) = state.lock() {
+        let device_state = state
+            .entry(local_hardware_id)
+            .or_insert_with(DeviceAllocatorState::new);
+        insert_free_block(&mut device_state.free, FreeBlock { addr, size });
+    }
+}
+
+fn insert_free_block(free: &mut Vec<FreeBlock>, block: FreeBlock) {
+    if block.size == 0 {
+        return;
+    }
+    free.push(block);
+    free.sort_unstable_by_key(|block| block.addr);
+
+    let mut coalesced = Vec::<FreeBlock>::with_capacity(free.len());
+    for block in free.drain(..) {
+        if let Some(last) = coalesced.last_mut() {
+            let last_end = last.addr.saturating_add(last.size);
+            if last_end >= block.addr {
+                let block_end = block.addr.saturating_add(block.size);
+                last.size = block_end.max(last_end).saturating_sub(last.addr);
+                continue;
+            }
+        }
+        coalesced.push(block);
+    }
+    *free = coalesced;
 }
 
 pub(crate) fn tilize(data: &[u8], dtype: DType, shape: &[usize]) -> io::Result<Vec<u8>> {
@@ -452,14 +567,10 @@ fn next_allocation_range(
     dtype: DType,
     bank_count: usize,
 ) -> io::Result<(u64, u64)> {
-    let pages_per_bank = num_tiles.div_ceil(bank_count);
-    let allocation_size = (pages_per_bank as u64)
-        .checked_mul(dtype.tile_size() as u64)
-        .ok_or_else(|| io::Error::other("dram allocation size overflow"))?;
-    let end = next
+    let allocation_size = allocation_range_size(num_tiles, dtype, bank_count)?;
+    let aligned_end = next
         .checked_add(allocation_size)
         .ok_or_else(|| io::Error::other("dram allocation address overflow"))?;
-    let aligned_end = align_up(end, Dram::ALIGNMENT as u64);
     if aligned_end > Dram::TLB_SIZE_4G {
         return Err(io::Error::other(format!(
             "dram allocation exceeds per-bank address space: end=0x{aligned_end:x} limit=0x{:x}",
@@ -467,6 +578,17 @@ fn next_allocation_range(
         )));
     }
     Ok((next, aligned_end))
+}
+
+fn allocation_range_size(num_tiles: usize, dtype: DType, bank_count: usize) -> io::Result<u64> {
+    if bank_count == 0 {
+        return Err(io::Error::other("dram allocation requires at least one bank"));
+    }
+    let pages_per_bank = num_tiles.div_ceil(bank_count);
+    let allocation_size = (pages_per_bank as u64)
+        .checked_mul(dtype.tile_size() as u64)
+        .ok_or_else(|| io::Error::other("dram allocation size overflow"))?;
+    Ok(align_up(allocation_size, Dram::ALIGNMENT as u64))
 }
 
 fn element_offset(
@@ -616,6 +738,7 @@ mod tests {
             num_tiles: 3,
             dtype: DType::Float16,
             shape: vec![32, 96],
+            _allocation: None,
         };
 
         assert_eq!(buffer.page_size(), 2048);
@@ -671,5 +794,64 @@ mod tests {
         let err = next_allocation_range(Dram::TLB_SIZE_4G, 1, DType::Float16, 1)
             .expect_err("allocation should exceed the per-bank address space");
         assert!(err.to_string().contains("exceeds per-bank address space"));
+    }
+
+    #[test]
+    fn free_list_reuses_released_blocks() {
+        let local_hardware_id = usize::MAX;
+        reset_allocator_for_test(local_hardware_id);
+
+        let (addr, size, _) =
+            allocate_allocation_range(local_hardware_id, 1, DType::Float16, 1).unwrap();
+        free_allocation(local_hardware_id, addr, size);
+
+        let (reused, _, _) =
+            allocate_allocation_range(local_hardware_id, 1, DType::Float16, 1).unwrap();
+        assert_eq!(reused, addr);
+
+        reset_allocator_for_test(local_hardware_id);
+    }
+
+    #[test]
+    fn dram_buffer_clone_frees_on_last_drop() {
+        let local_hardware_id = usize::MAX - 1;
+        reset_allocator_for_test(local_hardware_id);
+        let (addr, size, _) =
+            allocate_allocation_range(local_hardware_id, 1, DType::Float16, 1).unwrap();
+        let buffer = DramBuffer {
+            name: "tmp".to_owned(),
+            addr,
+            num_tiles: 1,
+            dtype: DType::Float16,
+            shape: vec![32, 32],
+            _allocation: Some(Arc::new(DramAllocation {
+                local_hardware_id,
+                addr,
+                size,
+            })),
+        };
+        let clone = buffer.clone();
+
+        drop(buffer);
+        assert_eq!(free_bytes_for_test(local_hardware_id), 0);
+        drop(clone);
+        assert_eq!(free_bytes_for_test(local_hardware_id), size);
+
+        reset_allocator_for_test(local_hardware_id);
+    }
+
+    fn reset_allocator_for_test(local_hardware_id: usize) {
+        let state = ALLOCATOR_STATE_BY_DEVICE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut state = state.lock().expect("allocator state lock poisoned");
+        state.remove(&local_hardware_id);
+    }
+
+    fn free_bytes_for_test(local_hardware_id: usize) -> u64 {
+        let state = ALLOCATOR_STATE_BY_DEVICE.get_or_init(|| Mutex::new(HashMap::new()));
+        let state = state.lock().expect("allocator state lock poisoned");
+        state
+            .get(&local_hardware_id)
+            .map(|device_state| device_state.free.iter().map(|block| block.size).sum())
+            .unwrap_or(0)
     }
 }
