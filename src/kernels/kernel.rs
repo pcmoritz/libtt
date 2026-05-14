@@ -3,6 +3,7 @@ use crate::dispatch::{pack_rta, Program};
 use crate::hw::CoreCoord;
 use std::any::{Any, TypeId};
 use std::collections::{btree_map::Entry, BTreeMap, HashMap};
+use std::env;
 use std::hash::Hash;
 use std::io;
 use std::mem::size_of;
@@ -300,8 +301,32 @@ pub(crate) fn select_worker_cores(
     if available.is_empty() {
         return Err(invalid_input("no worker cores are available"));
     }
-    let n_cores = available.len().min(tile_count.max(1));
+    let max_cores = simple_kernel_core_limit()?;
+    let n_cores = available.len().min(max_cores).min(tile_count.max(1));
     Ok(available[..n_cores].to_vec())
+}
+
+fn simple_kernel_core_limit() -> io::Result<usize> {
+    match env::var("LIBTT_SIMPLE_KERNEL_MAX_CORES") {
+        Ok(value) => {
+            let parsed = value.trim().parse::<usize>().map_err(|_| {
+                invalid_input(format!(
+                    "LIBTT_SIMPLE_KERNEL_MAX_CORES must be a positive integer, got {value:?}"
+                ))
+            })?;
+            if parsed == 0 {
+                Err(invalid_input(
+                    "LIBTT_SIMPLE_KERNEL_MAX_CORES must be greater than zero",
+                ))
+            } else {
+                Ok(parsed)
+            }
+        }
+        Err(env::VarError::NotPresent) => Ok(usize::MAX),
+        Err(env::VarError::NotUnicode(_)) => Err(invalid_input(
+            "LIBTT_SIMPLE_KERNEL_MAX_CORES must be valid Unicode",
+        )),
+    }
 }
 
 pub(crate) fn split_tile_range(

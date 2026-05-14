@@ -61,6 +61,13 @@ impl TlbWindow {
             "Tenstorrent Linux backend is only available on Linux",
         ))
     }
+
+    pub(crate) fn read_into(&self, _offset: usize, _dst: &mut [u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Tenstorrent Linux backend is only available on Linux",
+        ))
+    }
 }
 
 impl PinnedMemory {

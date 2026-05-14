@@ -233,6 +233,13 @@ impl TlbWindow {
             .expect("TLB mapping should exist while window is alive")
             .read(offset, len)
     }
+
+    pub(crate) fn read_into(&self, offset: usize, dst: &mut [u8]) -> io::Result<()> {
+        self.mapping
+            .as_ref()
+            .expect("TLB mapping should exist while window is alive")
+            .read_into(offset, dst)
+    }
 }
 
 impl Drop for TlbWindow {
@@ -370,6 +377,14 @@ impl MappedRegion {
         self.check_range(offset, len)?;
         let bytes = unsafe { std::slice::from_raw_parts(self.addr.add(offset), len) };
         Ok(bytes.to_vec())
+    }
+
+    fn read_into(&self, offset: usize, dst: &mut [u8]) -> io::Result<()> {
+        self.check_range(offset, dst.len())?;
+        unsafe {
+            ptr::copy_nonoverlapping(self.addr.add(offset), dst.as_mut_ptr(), dst.len());
+        }
+        Ok(())
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {

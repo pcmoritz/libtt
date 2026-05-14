@@ -17,7 +17,7 @@ mod linux;
 mod log;
 mod mlir_frontend;
 
-use device::Device;
+use device::{Device, OpCacheKey};
 use dram::{DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
@@ -28,6 +28,7 @@ use std::mem::size_of;
 use std::ptr;
 use std::slice;
 use std::sync::Once;
+use std::time::{Duration, Instant};
 
 include!("pjrt_bindings.rs");
 
@@ -553,6 +554,30 @@ fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_
                 PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
             )
         })?;
+    if dims.len() == 1 {
+        let dram_buffer = buffer.dram_buffer.as_ref().ok_or_else(|| {
+            pjrt_error(
+                "buffer has been deleted",
+                PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
+            )
+        })?;
+        let data = with_device_ptr(buffer.device, |device| {
+            device
+                .dram_read_rank1(dram_buffer, dims[0])
+                .map_err(io_error)
+        })?;
+        if data.len() != byte_size {
+            return Err(pjrt_error(
+                format!(
+                    "rank-1 readback byte size {} does not match buffer byte size {}",
+                    data.len(),
+                    byte_size
+                ),
+                PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
+            ));
+        }
+        return Ok(data);
+    }
     let data = read_buffer_bytes(buffer)?;
     if data.len() == byte_size {
         return Ok(data);
@@ -1478,6 +1503,7 @@ fn device_buffer_for_value<'a>(
 
 fn eltwise_input<'a>(
     values: &'a [Option<PJRT_Buffer>],
+    splat_constants: &[Option<u32>],
     plan: &'a executable::Executable,
     value_id: u32,
     expected_dtype: DType,
@@ -1491,6 +1517,23 @@ fn eltwise_input<'a>(
             )));
         };
         return Ok(kernels::binary_eltwise::EltwiseInput::Dram(dram_buffer));
+    }
+    if let Some(Some(packed_value)) = splat_constants.get(index) {
+        let desc = plan.values.get(index).ok_or_else(|| {
+            invalid_argument(format!(
+                "{field} constant value id {value_id} is out of bounds"
+            ))
+        })?;
+        let dtype = pjrt_buffer_type_to_dtype(desc.element_type)?;
+        if dtype != expected_dtype {
+            return Err(unimplemented(format!(
+                "{field} constant value id {value_id} has type {:?}; expected {expected_dtype:?}",
+                desc.element_type
+            )));
+        }
+        return Ok(kernels::binary_eltwise::EltwiseInput::Constant(
+            *packed_value,
+        ));
     }
     for op in &plan.ops {
         if let executable::Op::Constant {
@@ -1524,12 +1567,20 @@ fn eltwise_input<'a>(
 
 fn select_value_input<'a>(
     values: &'a [Option<PJRT_Buffer>],
+    splat_constants: &[Option<u32>],
     plan: &'a executable::Executable,
     value_id: u32,
     expected_dtype: DType,
     field: &str,
 ) -> Result<kernels::select::SelectInput<'a>, *mut PJRT_Error> {
-    match eltwise_input(values, plan, value_id, expected_dtype, field)? {
+    match eltwise_input(
+        values,
+        splat_constants,
+        plan,
+        value_id,
+        expected_dtype,
+        field,
+    )? {
         kernels::binary_eltwise::EltwiseInput::Dram(buffer) => {
             Ok(kernels::select::SelectInput::Dram(buffer))
         }
@@ -1595,6 +1646,7 @@ fn store_output_buffer(
 
 fn execute_binary_eltwise(
     values: &mut [Option<PJRT_Buffer>],
+    splat_constants: &[Option<u32>],
     plan: &executable::Executable,
     device: &mut Device,
     context: &OutputContext,
@@ -1655,8 +1707,22 @@ fn execute_binary_eltwise(
 
     let output_dims = lhs_desc.dims.clone();
     let shape = dims_i64_to_usize(&output_dims)?;
-    let lhs_input = eltwise_input(values, plan, input_ids[0], input_dtype, &lhs_field)?;
-    let rhs_input = eltwise_input(values, plan, input_ids[1], input_dtype, &rhs_field)?;
+    let lhs_input = eltwise_input(
+        values,
+        splat_constants,
+        plan,
+        input_ids[0],
+        input_dtype,
+        &lhs_field,
+    )?;
+    let rhs_input = eltwise_input(
+        values,
+        splat_constants,
+        plan,
+        input_ids[1],
+        input_dtype,
+        &rhs_field,
+    )?;
     let output_name = format!("pjrt_{op_name}");
     let output_dram = kernels::binary_eltwise::eltwise(
         device,
@@ -1681,6 +1747,7 @@ fn execute_binary_eltwise(
 
 fn execute_unary_eltwise(
     values: &mut [Option<PJRT_Buffer>],
+    splat_constants: &[Option<u32>],
     plan: &executable::Executable,
     device: &mut Device,
     context: &OutputContext,
@@ -1710,7 +1777,38 @@ fn execute_unary_eltwise(
     let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let output_dims = input_desc.dims.clone();
     let shape = dims_i64_to_usize(&output_dims)?;
-    let input = eltwise_input(values, plan, input_id, input_dtype, &input_field)?;
+    if op == kernels::unary_eltwise::UnaryEltwiseOp::Convert && input_dtype == output_dtype {
+        if let Some(input_buffer) = values
+            .get(input_id as usize)
+            .and_then(|value| value.as_ref())
+        {
+            let Some(input_dram) = input_buffer.dram_buffer.as_ref() else {
+                return Err(failed_precondition(format!(
+                    "TT executable {op_name} operand buffer has no device allocation"
+                )));
+            };
+            let output_allocation_shape = dram::tiled_allocation_shape(&shape).map_err(io_error)?;
+            if input_dram.shape == output_allocation_shape {
+                return store_output_buffer(
+                    values,
+                    plan,
+                    output_id,
+                    output_dims,
+                    input_dram.clone(),
+                    context,
+                    op_name,
+                );
+            }
+        }
+    }
+    let input = eltwise_input(
+        values,
+        splat_constants,
+        plan,
+        input_id,
+        input_dtype,
+        &input_field,
+    )?;
     let output_name = format!("pjrt_{op_name}");
     let output_dram = kernels::unary_eltwise::eltwise(
         device,
@@ -1764,6 +1862,33 @@ fn execute_reshape(
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
+    let output_allocation_shape = dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+    if input_dram.shape == output_allocation_shape {
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_dims,
+            input_dram.clone(),
+            context,
+            "reshape",
+        );
+    }
+    if can_retag_tiled_reshape(&input_dram.shape, &output_allocation_shape) {
+        let mut output_dram = input_dram.clone();
+        output_dram.name = "pjrt_reshape".to_owned();
+        output_dram.shape = output_allocation_shape;
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_dims,
+            output_dram,
+            context,
+            "reshape",
+        );
+    }
+
     let output_dram = kernels::reshape::reshape(
         device,
         input_dram,
@@ -1812,6 +1937,53 @@ fn execute_slice(
 
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let input = device_buffer_for_value(values, input_id, "slice.operand")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable slice operand buffer has no device allocation",
+        ));
+    };
+    if is_identity_slice(
+        &input_desc.dims,
+        &output_desc.dims,
+        start_indices,
+        limit_indices,
+        strides,
+    ) {
+        let output_allocation_shape =
+            dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+        if input_dram.shape == output_allocation_shape {
+            return store_output_buffer(
+                values,
+                plan,
+                output_id,
+                output_desc.dims.clone(),
+                input_dram.clone(),
+                context,
+                "slice",
+            );
+        }
+    }
+    if let Some(output_dram) = tile_aligned_slice_view(
+        input_dram,
+        &input_shape,
+        &output_shape,
+        start_indices,
+        limit_indices,
+        strides,
+        device.active_dram_banks,
+    )? {
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_desc.dims.clone(),
+            output_dram,
+            context,
+            "slice",
+        );
+    }
+
     let slice_plan = kernels::slice::SlicePlan::new(
         &input_shape,
         &output_shape,
@@ -1820,13 +1992,6 @@ fn execute_slice(
         strides,
     )
     .map_err(io_error)?;
-
-    let input = device_buffer_for_value(values, input_id, "slice.operand")?;
-    let Some(input_dram) = input.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable slice operand buffer has no device allocation",
-        ));
-    };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dram = kernels::slice::slice(device, input_dram, &slice_plan, dtype, "pjrt_slice")
         .map_err(io_error)?;
@@ -1839,6 +2004,70 @@ fn execute_slice(
         context,
         "slice",
     )
+}
+
+fn execute_slice_reshape_collapse(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_id: u32,
+    reshape_output_id: u32,
+    start_indices: &[i64],
+    limit_indices: &[i64],
+    strides: &[i64],
+) -> Result<bool, *mut PJRT_Error> {
+    let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable fused slice operand value id is out of bounds")
+    })?;
+    let output_desc = plan.values.get(reshape_output_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable fused slice output value id is out of bounds")
+    })?;
+    if input_desc.element_type != output_desc.element_type {
+        return Ok(false);
+    }
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let Some(plan_collapse) = kernels::slice::slice_collapse_middle_dim_plan(
+        &input_shape,
+        &output_shape,
+        start_indices,
+        limit_indices,
+        strides,
+    )
+    .map_err(io_error)?
+    else {
+        return Ok(false);
+    };
+    let input = device_buffer_for_value(values, input_id, "slice_reshape.operand")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable fused slice operand buffer has no device allocation",
+        ));
+    };
+    let expected_input_shape = dram::tiled_allocation_shape(&input_shape).map_err(io_error)?;
+    if input_dram.shape != expected_input_shape {
+        return Ok(false);
+    }
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dram = kernels::slice::slice_collapse_middle_dim(
+        device,
+        input_dram,
+        &plan_collapse,
+        dtype,
+        "pjrt_slice_reshape",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        reshape_output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "slice_reshape",
+    )?;
+    Ok(true)
 }
 
 fn execute_transpose(
@@ -1991,6 +2220,164 @@ fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option
     })
 }
 
+fn is_identity_slice(
+    input_dims: &[i64],
+    output_dims: &[i64],
+    start_indices: &[i64],
+    limit_indices: &[i64],
+    strides: &[i64],
+) -> bool {
+    input_dims == output_dims
+        && start_indices.len() == input_dims.len()
+        && limit_indices.len() == input_dims.len()
+        && strides.len() == input_dims.len()
+        && start_indices.iter().all(|&start| start == 0)
+        && limit_indices == input_dims
+        && strides.iter().all(|&stride| stride == 1)
+}
+
+fn tile_aligned_slice_view(
+    input_dram: &DramBuffer,
+    input_shape: &[usize],
+    output_shape: &[usize],
+    start_indices: &[i64],
+    limit_indices: &[i64],
+    strides: &[i64],
+    bank_count: usize,
+) -> Result<Option<DramBuffer>, *mut PJRT_Error> {
+    let rank = input_shape.len();
+    if rank < 3
+        || output_shape.len() != rank
+        || start_indices.len() != rank
+        || limit_indices.len() != rank
+        || strides.len() != rank
+        || bank_count == 0
+        || !strides.iter().all(|&stride| stride == 1)
+    {
+        return Ok(None);
+    }
+    for dim in rank - 2..rank {
+        if start_indices[dim] != 0
+            || usize::try_from(limit_indices[dim]).ok() != Some(input_shape[dim])
+        {
+            return Ok(None);
+        }
+    }
+
+    let output_allocation_shape = dram::tiled_allocation_shape(output_shape).map_err(io_error)?;
+    let input_last = &input_dram.shape[input_dram.shape.len() - 2..];
+    let output_last = &output_allocation_shape[output_allocation_shape.len() - 2..];
+    if input_last != output_last {
+        return Ok(None);
+    }
+
+    let prefix_rank = rank - 2;
+    let mut partial_dim = None;
+    for dim in 0..prefix_rank {
+        let start = start_indices[dim];
+        let limit = limit_indices[dim];
+        if start < 0 || limit < start || usize::try_from(limit).ok() > Some(input_shape[dim]) {
+            return Ok(None);
+        }
+        let full = start == 0 && usize::try_from(limit).ok() == Some(input_shape[dim]);
+        if !full {
+            if partial_dim.replace(dim).is_some() {
+                return Ok(None);
+            }
+        }
+    }
+    let Some(partial_dim) = partial_dim else {
+        return Ok(None);
+    };
+    for dim in 0..partial_dim {
+        if limit_indices[dim] - start_indices[dim] != 1 {
+            return Ok(None);
+        }
+    }
+    for dim in partial_dim + 1..prefix_rank {
+        if start_indices[dim] != 0
+            || usize::try_from(limit_indices[dim]).ok() != Some(input_shape[dim])
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut flat_start = 0usize;
+    for dim in 0..prefix_rank {
+        let start = usize::try_from(start_indices[dim]).map_err(|_| {
+            invalid_argument("TT executable slice start index must be non-negative")
+        })?;
+        flat_start = flat_start
+            .checked_mul(input_shape[dim])
+            .and_then(|value| value.checked_add(start))
+            .ok_or_else(|| invalid_argument("TT executable slice offset overflow"))?;
+    }
+    let row_tiles = output_last[0] / dram::TILE_R;
+    let col_tiles = output_last[1] / dram::TILE_C;
+    let tiles_per_prefix = row_tiles
+        .checked_mul(col_tiles)
+        .ok_or_else(|| invalid_argument("TT executable slice tile count overflow"))?;
+    let tile_offset = flat_start
+        .checked_mul(tiles_per_prefix)
+        .ok_or_else(|| invalid_argument("TT executable slice tile offset overflow"))?;
+    if tile_offset % bank_count != 0 {
+        return Ok(None);
+    }
+    let output_tiles = output_shape[..prefix_rank]
+        .iter()
+        .try_fold(tiles_per_prefix, |acc, dim| acc.checked_mul(*dim))
+        .ok_or_else(|| invalid_argument("TT executable slice tile count overflow"))?;
+    if output_tiles != dram::tiled_shape_tile_count(output_shape).map_err(io_error)? {
+        return Ok(None);
+    }
+
+    let mut output = input_dram.clone();
+    output.name = "pjrt_slice".to_owned();
+    output.addr += (tile_offset / bank_count * input_dram.page_size()) as u64;
+    output.num_tiles = output_tiles;
+    output.shape = output_allocation_shape;
+    Ok(Some(output))
+}
+
+fn is_identity_broadcast(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[i64],
+) -> bool {
+    input_shape == output_shape
+        && broadcast_dimensions.len() == input_shape.len()
+        && broadcast_dimensions
+            .iter()
+            .enumerate()
+            .all(|(index, &dim)| usize::try_from(dim).ok() == Some(index))
+}
+
+fn can_retag_tiled_reshape(input_shape: &[usize], output_shape: &[usize]) -> bool {
+    if input_shape.len() < 2 || output_shape.len() < 2 {
+        return false;
+    }
+    let input_last = &input_shape[input_shape.len() - 2..];
+    let output_last = &output_shape[output_shape.len() - 2..];
+    input_last == output_last
+        && tiled_prefix_product(input_shape) == tiled_prefix_product(output_shape)
+}
+
+fn tiled_prefix_product(shape: &[usize]) -> Option<usize> {
+    shape[..shape.len().saturating_sub(2)]
+        .iter()
+        .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
+}
+
+const CACHEABLE_PARAMETER_MIN_TILES: usize = 512;
+
+fn is_cacheable_parameter_buffer(input: &PJRT_Buffer) -> bool {
+    input.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32
+        && input
+            .dram_buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.num_tiles >= CACHEABLE_PARAMETER_MIN_TILES)
+}
+
 fn execute_identity_custom_call(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2026,8 +2413,57 @@ fn execute_identity_custom_call(
     Ok(())
 }
 
+fn unary_op_cache_key(
+    values: &[Option<PJRT_Buffer>],
+    cacheable_values: &[bool],
+    plan: &executable::Executable,
+    input_id: u32,
+    output_id: u32,
+    op_name: &'static str,
+    attrs: Vec<i64>,
+) -> Result<Option<OpCacheKey>, *mut PJRT_Error> {
+    if !cacheable_values
+        .get(input_id as usize)
+        .copied()
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable {op_name} output id {output_id} is out of bounds"
+        ))
+    })?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let input = device_buffer_for_value(values, input_id, &format!("{op_name}.operand"))?;
+    let input_dram = input.dram_buffer.as_ref().ok_or_else(|| {
+        failed_precondition(format!(
+            "TT executable {op_name} operand buffer has no device allocation"
+        ))
+    })?;
+    Ok(Some(OpCacheKey::new(
+        op_name,
+        input_dram,
+        output_shape,
+        attrs,
+    )))
+}
+
+fn slice_cache_attrs(start_indices: &[i64], limit_indices: &[i64], strides: &[i64]) -> Vec<i64> {
+    let mut attrs =
+        Vec::with_capacity(3 + start_indices.len() + limit_indices.len() + strides.len());
+    attrs.push(start_indices.len() as i64);
+    attrs.extend_from_slice(start_indices);
+    attrs.push(limit_indices.len() as i64);
+    attrs.extend_from_slice(limit_indices);
+    attrs.push(strides.len() as i64);
+    attrs.extend_from_slice(strides);
+    attrs
+}
+
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
+    splat_constants: &[Option<u32>],
     plan: &executable::Executable,
     device: &mut Device,
     context: &OutputContext,
@@ -2091,8 +2527,22 @@ fn execute_select(
             "TT executable select predicate buffer has no device allocation",
         ));
     };
-    let true_input = select_value_input(values, plan, true_id, value_dtype, "select.on_true")?;
-    let false_input = select_value_input(values, plan, false_id, value_dtype, "select.on_false")?;
+    let true_input = select_value_input(
+        values,
+        splat_constants,
+        plan,
+        true_id,
+        value_dtype,
+        "select.on_true",
+    )?;
+    let false_input = select_value_input(
+        values,
+        splat_constants,
+        plan,
+        false_id,
+        value_dtype,
+        "select.on_false",
+    )?;
     let expected_dims = true_desc.dims.clone();
     let shape = dims_i64_to_usize(&expected_dims)?;
     let output_dram = kernels::select::select(
@@ -2153,6 +2603,22 @@ fn execute_broadcast_in_dim(
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
+    if is_identity_broadcast(&input_shape, &output_shape, broadcast_dimensions) {
+        let output_allocation_shape =
+            dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+        if input_dram.shape == output_allocation_shape {
+            return store_output_buffer(
+                values,
+                plan,
+                output_id,
+                output_dims,
+                input_dram.clone(),
+                context,
+                "broadcast_in_dim",
+            );
+        }
+    }
+
     let output_dram = kernels::broadcast::broadcast_in_dim(
         device,
         input_dram,
@@ -2388,6 +2854,213 @@ fn execute_iota(
     )
 }
 
+struct ExecuteProfile {
+    enabled: bool,
+    entries: Vec<(&'static str, usize, Duration)>,
+}
+
+impl ExecuteProfile {
+    fn new() -> Self {
+        Self {
+            enabled: env_flag_enabled("LIBTT_PROFILE"),
+            entries: Vec::new(),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn record(&mut self, name: &'static str, elapsed: Duration) {
+        if !self.enabled {
+            return;
+        }
+        if let Some((_, count, total)) = self
+            .entries
+            .iter_mut()
+            .find(|(entry_name, _, _)| *entry_name == name)
+        {
+            *count += 1;
+            *total += elapsed;
+        } else {
+            self.entries.push((name, 1, elapsed));
+        }
+    }
+
+    fn emit(&mut self, op_count: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.entries.sort_by_key(|(_, _, total)| *total);
+        self.entries.reverse();
+        let total = self
+            .entries
+            .iter()
+            .fold(Duration::ZERO, |acc, (_, _, elapsed)| acc + *elapsed);
+        eprintln!(
+            "[libtt-profile] executable ops={} total_ms={:.3}",
+            op_count,
+            total.as_secs_f64() * 1000.0
+        );
+        for (name, count, elapsed) in &self.entries {
+            eprintln!(
+                "[libtt-profile] {:>16} count={:>5} total_ms={:>9.3} avg_us={:>9.3}",
+                name,
+                count,
+                elapsed.as_secs_f64() * 1000.0,
+                elapsed.as_secs_f64() * 1_000_000.0 / *count as f64
+            );
+        }
+    }
+}
+
+struct DeferredDispatchGuard {
+    device: *mut Device,
+    previous: bool,
+    active: bool,
+}
+
+impl DeferredDispatchGuard {
+    fn new(device: &mut Device) -> Self {
+        let previous = device.set_defer_dispatch_waits(true);
+        Self {
+            device,
+            previous,
+            active: true,
+        }
+    }
+
+    fn wait_now(&mut self) -> io::Result<()> {
+        if self.active {
+            let device = unsafe { &mut *self.device };
+            device.wait_for_dispatch()?;
+            device.set_defer_dispatch_waits(self.previous);
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DeferredDispatchGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let device = unsafe { &mut *self.device };
+            let _ = device.wait_for_dispatch();
+            device.set_defer_dispatch_waits(self.previous);
+            self.active = false;
+        }
+    }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !normalized.is_empty()
+                && normalized != "0"
+                && normalized != "false"
+                && normalized != "off"
+        }
+        Err(_) => false,
+    }
+}
+
+fn op_profile_name(op: &executable::Op) -> &'static str {
+    match op {
+        executable::Op::Parameter { .. } => "parameter",
+        executable::Op::Add { .. } => "add",
+        executable::Op::Subtract { .. } => "subtract",
+        executable::Op::Multiply { .. } => "multiply",
+        executable::Op::Divide { .. } => "divide",
+        executable::Op::Power { .. } => "power",
+        executable::Op::Concatenate { .. } => "concatenate",
+        executable::Op::Cosine { .. } => "cosine",
+        executable::Op::Sine { .. } => "sine",
+        executable::Op::Rsqrt { .. } => "rsqrt",
+        executable::Op::Reshape { .. } => "reshape",
+        executable::Op::Slice { .. } => "slice",
+        executable::Op::Negate { .. } => "negate",
+        executable::Op::Exponential { .. } => "exponential",
+        executable::Op::Transpose { .. } => "transpose",
+        executable::Op::CustomCall { .. } => "custom_call",
+        executable::Op::Convert { .. } => "convert",
+        executable::Op::Reduce { .. } => "reduce",
+        executable::Op::Matmul { .. } => "matmul",
+        executable::Op::Max { .. } => "max",
+        executable::Op::Constant { .. } => "constant",
+        executable::Op::Compare { .. } => "compare",
+        executable::Op::Select { .. } => "select",
+        executable::Op::BroadcastInDim { .. } => "broadcast",
+        executable::Op::Gather { .. } => "gather",
+        executable::Op::Iota { .. } => "iota",
+    }
+}
+
+fn executable_use_counts(plan: &executable::Executable) -> Vec<usize> {
+    let mut counts = vec![0usize; plan.values.len()];
+    let mut add = |value_id: u32| {
+        if let Some(count) = counts.get_mut(value_id as usize) {
+            *count += 1;
+        }
+    };
+    for op in &plan.ops {
+        match op {
+            executable::Op::Add { input_ids, .. }
+            | executable::Op::Subtract { input_ids, .. }
+            | executable::Op::Multiply { input_ids, .. }
+            | executable::Op::Divide { input_ids, .. }
+            | executable::Op::Power { input_ids, .. }
+            | executable::Op::Max { input_ids, .. }
+            | executable::Op::Compare { input_ids, .. }
+            | executable::Op::Matmul { input_ids, .. } => {
+                add(input_ids[0]);
+                add(input_ids[1]);
+            }
+            executable::Op::Cosine { input_id, .. }
+            | executable::Op::Sine { input_id, .. }
+            | executable::Op::Rsqrt { input_id, .. }
+            | executable::Op::Reshape { input_id, .. }
+            | executable::Op::Slice { input_id, .. }
+            | executable::Op::Negate { input_id, .. }
+            | executable::Op::Exponential { input_id, .. }
+            | executable::Op::Transpose { input_id, .. }
+            | executable::Op::Convert { input_id, .. }
+            | executable::Op::BroadcastInDim { input_id, .. } => add(*input_id),
+            executable::Op::Concatenate { input_ids, .. }
+            | executable::Op::CustomCall { input_ids, .. } => {
+                for &input_id in input_ids {
+                    add(input_id);
+                }
+            }
+            executable::Op::Gather { input_ids, .. } => {
+                add(input_ids[0]);
+                add(input_ids[1]);
+            }
+            executable::Op::Reduce {
+                input_ids,
+                init_value_ids,
+                ..
+            } => {
+                for &input_id in input_ids {
+                    add(input_id);
+                }
+                for &init_value_id in init_value_ids {
+                    add(init_value_id);
+                }
+            }
+            executable::Op::Select { input_ids, .. } => {
+                add(input_ids[0]);
+                add(input_ids[1]);
+                add(input_ids[2]);
+            }
+            executable::Op::Parameter { .. }
+            | executable::Op::Constant { .. }
+            | executable::Op::Iota { .. } => {}
+        }
+    }
+    counts
+}
+
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
@@ -2400,6 +3073,8 @@ fn execute_executable_v1(
         .as_ref()
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
     let mut values = vec![None; plan.values.len()];
+    let mut cacheable_values = vec![false; plan.values.len()];
+    let mut splat_constants = vec![None; plan.values.len()];
     let target_local_hardware_id = target_device.local_hardware_id as usize;
     let output_context = OutputContext {
         device: execute_device,
@@ -2407,8 +3082,17 @@ fn execute_executable_v1(
         local_hardware_id: target_local_hardware_id,
     };
     let device = &mut target_device.runtime;
+    let mut dispatch_guard = DeferredDispatchGuard::new(device);
+    let mut profile = ExecuteProfile::new();
+    let use_counts = executable_use_counts(plan);
 
-    for op in &plan.ops {
+    let mut op_index = 0usize;
+    while op_index < plan.ops.len() {
+        let op = &plan.ops[op_index];
+        let mut skip_next_op = false;
+        let profiling = profile.is_enabled();
+        let op_start = profiling.then(Instant::now);
+        let op_name = profiling.then(|| op_profile_name(op));
         match op {
             executable::Op::Parameter {
                 parameter_index,
@@ -2449,6 +3133,7 @@ fn execute_executable_v1(
                         expected.dims, input.dims
                     )));
                 }
+                cacheable_values[output_index] = is_cacheable_parameter_buffer(input);
                 values[output_index] = Some(input.clone());
             }
             executable::Op::Add {
@@ -2457,6 +3142,7 @@ fn execute_executable_v1(
             } => {
                 execute_binary_eltwise(
                     &mut values,
+                    &splat_constants,
                     plan,
                     device,
                     &output_context,
@@ -2472,6 +3158,7 @@ fn execute_executable_v1(
             } => {
                 execute_binary_eltwise(
                     &mut values,
+                    &splat_constants,
                     plan,
                     device,
                     &output_context,
@@ -2487,6 +3174,7 @@ fn execute_executable_v1(
             } => {
                 execute_binary_eltwise(
                     &mut values,
+                    &splat_constants,
                     plan,
                     device,
                     &output_context,
@@ -2502,6 +3190,7 @@ fn execute_executable_v1(
             } => {
                 execute_binary_eltwise(
                     &mut values,
+                    &splat_constants,
                     plan,
                     device,
                     &output_context,
@@ -2517,6 +3206,7 @@ fn execute_executable_v1(
             } => {
                 execute_binary_eltwise(
                     &mut values,
+                    &splat_constants,
                     plan,
                     device,
                     &output_context,
@@ -2544,6 +3234,7 @@ fn execute_executable_v1(
                 output_id,
             } => execute_unary_eltwise(
                 &mut values,
+                &splat_constants,
                 plan,
                 device,
                 &output_context,
@@ -2557,6 +3248,7 @@ fn execute_executable_v1(
                 output_id,
             } => execute_unary_eltwise(
                 &mut values,
+                &splat_constants,
                 plan,
                 device,
                 &output_context,
@@ -2570,6 +3262,7 @@ fn execute_executable_v1(
                 output_id,
             } => execute_unary_eltwise(
                 &mut values,
+                &splat_constants,
                 plan,
                 device,
                 &output_context,
@@ -2581,36 +3274,170 @@ fn execute_executable_v1(
             executable::Op::Reshape {
                 input_id,
                 output_id,
-            } => execute_reshape(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                *input_id,
-                *output_id,
-            )?,
+            } => {
+                let input_index = *input_id as usize;
+                let output_index = *output_id as usize;
+                if let Some(value) = splat_constants[input_index] {
+                    cacheable_values[output_index] = cacheable_values[input_index];
+                    splat_constants[output_index] = Some(value);
+                } else {
+                    let cache_key = unary_op_cache_key(
+                        &values,
+                        &cacheable_values,
+                        plan,
+                        *input_id,
+                        *output_id,
+                        "reshape",
+                        Vec::new(),
+                    )?;
+                    if let Some(key) = cache_key {
+                        if let Some(cached) = device.cached_op_buffer(&key) {
+                            store_output_buffer(
+                                &mut values,
+                                plan,
+                                *output_id,
+                                plan.values[output_index].dims.clone(),
+                                cached,
+                                &output_context,
+                                "reshape",
+                            )?;
+                        } else {
+                            execute_reshape(
+                                &mut values,
+                                plan,
+                                device,
+                                &output_context,
+                                *input_id,
+                                *output_id,
+                            )?;
+                            if let Some(output) = values[output_index]
+                                .as_ref()
+                                .and_then(|value| value.dram_buffer.clone())
+                            {
+                                device.insert_cached_op_buffer(key, output);
+                            }
+                        }
+                        cacheable_values[output_index] = true;
+                    } else {
+                        execute_reshape(
+                            &mut values,
+                            plan,
+                            device,
+                            &output_context,
+                            *input_id,
+                            *output_id,
+                        )?;
+                        cacheable_values[output_index] = cacheable_values[input_index];
+                    }
+                }
+            }
             executable::Op::Slice {
                 input_id,
                 output_id,
                 start_indices,
                 limit_indices,
                 strides,
-            } => execute_slice(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                *input_id,
-                *output_id,
-                start_indices,
-                limit_indices,
-                strides,
-            )?,
+            } => {
+                let input_index = *input_id as usize;
+                let output_index = *output_id as usize;
+                if let Some(value) = splat_constants[input_index] {
+                    cacheable_values[output_index] = cacheable_values[input_index];
+                    splat_constants[output_index] = Some(value);
+                } else {
+                    if use_counts.get(output_index).copied() == Some(1) {
+                        if let Some(executable::Op::Reshape {
+                            input_id: reshape_input_id,
+                            output_id: reshape_output_id,
+                        }) = plan.ops.get(op_index + 1)
+                        {
+                            if *reshape_input_id == *output_id
+                                && execute_slice_reshape_collapse(
+                                    &mut values,
+                                    plan,
+                                    device,
+                                    &output_context,
+                                    *input_id,
+                                    *reshape_output_id,
+                                    start_indices,
+                                    limit_indices,
+                                    strides,
+                                )?
+                            {
+                                cacheable_values[*reshape_output_id as usize] =
+                                    cacheable_values[input_index];
+                                skip_next_op = true;
+                            }
+                        }
+                    }
+                    if skip_next_op {
+                        if let (Some(name), Some(start)) = (op_name, op_start) {
+                            profile.record(name, start.elapsed());
+                        }
+                        op_index += 2;
+                        continue;
+                    }
+                    let cache_key = unary_op_cache_key(
+                        &values,
+                        &cacheable_values,
+                        plan,
+                        *input_id,
+                        *output_id,
+                        "slice",
+                        slice_cache_attrs(start_indices, limit_indices, strides),
+                    )?;
+                    if let Some(key) = cache_key {
+                        if let Some(cached) = device.cached_op_buffer(&key) {
+                            store_output_buffer(
+                                &mut values,
+                                plan,
+                                *output_id,
+                                plan.values[output_index].dims.clone(),
+                                cached,
+                                &output_context,
+                                "slice",
+                            )?;
+                        } else {
+                            execute_slice(
+                                &mut values,
+                                plan,
+                                device,
+                                &output_context,
+                                *input_id,
+                                *output_id,
+                                start_indices,
+                                limit_indices,
+                                strides,
+                            )?;
+                            if let Some(output) = values[output_index]
+                                .as_ref()
+                                .and_then(|value| value.dram_buffer.clone())
+                            {
+                                device.insert_cached_op_buffer(key, output);
+                            }
+                        }
+                        cacheable_values[output_index] = true;
+                    } else {
+                        execute_slice(
+                            &mut values,
+                            plan,
+                            device,
+                            &output_context,
+                            *input_id,
+                            *output_id,
+                            start_indices,
+                            limit_indices,
+                            strides,
+                        )?;
+                        cacheable_values[output_index] = cacheable_values[input_index];
+                    }
+                }
+            }
             executable::Op::Negate {
                 input_id,
                 output_id,
             } => execute_unary_eltwise(
                 &mut values,
+                &splat_constants,
                 plan,
                 device,
                 &output_context,
@@ -2624,6 +3451,7 @@ fn execute_executable_v1(
                 output_id,
             } => execute_unary_eltwise(
                 &mut values,
+                &splat_constants,
                 plan,
                 device,
                 &output_context,
@@ -2636,15 +3464,73 @@ fn execute_executable_v1(
                 input_id,
                 output_id,
                 permutation,
-            } => execute_transpose(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                *input_id,
-                *output_id,
-                permutation,
-            )?,
+            } => {
+                if let Some(value) = splat_constants[*input_id as usize] {
+                    cacheable_values[*output_id as usize] = cacheable_values[*input_id as usize];
+                    splat_constants[*output_id as usize] = Some(value);
+                } else {
+                    let input_index = *input_id as usize;
+                    let output_index = *output_id as usize;
+                    let cache_key = if cacheable_values[input_index] {
+                        let input =
+                            device_buffer_for_value(&values, *input_id, "transpose.operand")?;
+                        let input_dram = input.dram_buffer.as_ref().ok_or_else(|| {
+                            failed_precondition(
+                                "TT executable transpose operand buffer has no device allocation",
+                            )
+                        })?;
+                        Some(OpCacheKey::new(
+                            "transpose",
+                            input_dram,
+                            dims_i64_to_usize(&plan.values[output_index].dims)?,
+                            permutation.clone(),
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(key) = cache_key {
+                        if let Some(cached) = device.cached_op_buffer(&key) {
+                            store_output_buffer(
+                                &mut values,
+                                plan,
+                                *output_id,
+                                plan.values[output_index].dims.clone(),
+                                cached,
+                                &output_context,
+                                "transpose",
+                            )?;
+                            cacheable_values[output_index] = true;
+                        } else {
+                            execute_transpose(
+                                &mut values,
+                                plan,
+                                device,
+                                &output_context,
+                                *input_id,
+                                *output_id,
+                                permutation,
+                            )?;
+                            if let Some(output) = values[output_index]
+                                .as_ref()
+                                .and_then(|value| value.dram_buffer.clone())
+                            {
+                                device.insert_cached_op_buffer(key, output);
+                                cacheable_values[output_index] = true;
+                            }
+                        }
+                    } else {
+                        execute_transpose(
+                            &mut values,
+                            plan,
+                            device,
+                            &output_context,
+                            *input_id,
+                            *output_id,
+                            permutation,
+                        )?;
+                    }
+                }
+            }
             executable::Op::CustomCall {
                 input_ids,
                 output_id,
@@ -2657,13 +3543,19 @@ fn execute_executable_v1(
                         input_ids.len()
                     )));
                 };
-                execute_identity_custom_call(
-                    &mut values,
-                    plan,
-                    *input_id,
-                    *output_id,
-                    call_target_name,
-                )?;
+                if let Some(value) = splat_constants[*input_id as usize] {
+                    cacheable_values[*output_id as usize] = cacheable_values[*input_id as usize];
+                    splat_constants[*output_id as usize] = Some(value);
+                } else {
+                    execute_identity_custom_call(
+                        &mut values,
+                        plan,
+                        *input_id,
+                        *output_id,
+                        call_target_name,
+                    )?;
+                    cacheable_values[*output_id as usize] = cacheable_values[*input_id as usize];
+                }
             }
             executable::Op::CustomCall {
                 call_target_name, ..
@@ -2675,16 +3567,44 @@ fn execute_executable_v1(
             executable::Op::Convert {
                 input_id,
                 output_id,
-            } => execute_unary_eltwise(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Convert,
-                *input_id,
-                *output_id,
-                "convert",
-            )?,
+            } => {
+                let input_index = *input_id as usize;
+                let output_index = *output_id as usize;
+                if let Some(value) = splat_constants[input_index] {
+                    if plan.values[input_index].element_type
+                        == plan.values[output_index].element_type
+                    {
+                        cacheable_values[output_index] = cacheable_values[input_index];
+                        splat_constants[output_index] = Some(value);
+                    } else {
+                        execute_unary_eltwise(
+                            &mut values,
+                            &splat_constants,
+                            plan,
+                            device,
+                            &output_context,
+                            kernels::unary_eltwise::UnaryEltwiseOp::Convert,
+                            *input_id,
+                            *output_id,
+                            "convert",
+                        )?;
+                        cacheable_values[output_index] = true;
+                    }
+                } else {
+                    execute_unary_eltwise(
+                        &mut values,
+                        &splat_constants,
+                        plan,
+                        device,
+                        &output_context,
+                        kernels::unary_eltwise::UnaryEltwiseOp::Convert,
+                        *input_id,
+                        *output_id,
+                        "convert",
+                    )?;
+                    cacheable_values[output_index] = cacheable_values[input_index];
+                }
+            }
             executable::Op::Reduce {
                 input_ids,
                 init_value_ids,
@@ -2708,6 +3628,7 @@ fn execute_executable_v1(
             } => {
                 execute_binary_eltwise(
                     &mut values,
+                    &splat_constants,
                     plan,
                     device,
                     &output_context,
@@ -2778,7 +3699,13 @@ fn execute_executable_v1(
                     "matmul",
                 )?;
             }
-            executable::Op::Constant { .. } => {}
+            executable::Op::Constant {
+                packed_value,
+                output_id,
+            } => {
+                cacheable_values[*output_id as usize] = true;
+                splat_constants[*output_id as usize] = Some(*packed_value);
+            }
             executable::Op::Compare {
                 input_ids,
                 output_id,
@@ -2786,6 +3713,7 @@ fn execute_executable_v1(
             } => {
                 execute_binary_eltwise(
                     &mut values,
+                    &splat_constants,
                     plan,
                     device,
                     &output_context,
@@ -2801,6 +3729,7 @@ fn execute_executable_v1(
             } => {
                 execute_select(
                     &mut values,
+                    &splat_constants,
                     plan,
                     device,
                     &output_context,
@@ -2813,15 +3742,63 @@ fn execute_executable_v1(
                 output_id,
                 broadcast_dimensions,
             } => {
-                execute_broadcast_in_dim(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    *input_id,
-                    *output_id,
-                    broadcast_dimensions,
-                )?;
+                let input_index = *input_id as usize;
+                let output_index = *output_id as usize;
+                if let Some(value) = splat_constants[input_index] {
+                    cacheable_values[output_index] = cacheable_values[input_index];
+                    splat_constants[output_index] = Some(value);
+                } else {
+                    let cache_key = unary_op_cache_key(
+                        &values,
+                        &cacheable_values,
+                        plan,
+                        *input_id,
+                        *output_id,
+                        "broadcast_in_dim",
+                        broadcast_dimensions.clone(),
+                    )?;
+                    if let Some(key) = cache_key {
+                        if let Some(cached) = device.cached_op_buffer(&key) {
+                            store_output_buffer(
+                                &mut values,
+                                plan,
+                                *output_id,
+                                plan.values[output_index].dims.clone(),
+                                cached,
+                                &output_context,
+                                "broadcast_in_dim",
+                            )?;
+                        } else {
+                            execute_broadcast_in_dim(
+                                &mut values,
+                                plan,
+                                device,
+                                &output_context,
+                                *input_id,
+                                *output_id,
+                                broadcast_dimensions,
+                            )?;
+                            if let Some(output) = values[output_index]
+                                .as_ref()
+                                .and_then(|value| value.dram_buffer.clone())
+                            {
+                                device.insert_cached_op_buffer(key, output);
+                            }
+                        }
+                        cacheable_values[output_index] = true;
+                    } else {
+                        execute_broadcast_in_dim(
+                            &mut values,
+                            plan,
+                            device,
+                            &output_context,
+                            *input_id,
+                            *output_id,
+                            broadcast_dimensions,
+                        )?;
+                        cacheable_values[output_index] = cacheable_values[input_index];
+                    }
+                }
             }
             executable::Op::Gather {
                 input_ids,
@@ -2851,7 +3828,13 @@ fn execute_executable_v1(
                 *iota_dimension,
             )?,
         }
+        if let (Some(name), Some(start)) = (op_name, op_start) {
+            profile.record(name, start.elapsed());
+        }
+        op_index += 1;
     }
+    profile.emit(plan.ops.len());
+    dispatch_guard.wait_now().map_err(io_error)?;
 
     let output = device_buffer_for_value(&values, plan.output_ids[0], "output")?;
     Ok(output.clone())

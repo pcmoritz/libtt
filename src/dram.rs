@@ -4,6 +4,7 @@ use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) const TILE_R: usize = 32;
@@ -11,6 +12,7 @@ pub(crate) const TILE_C: usize = 32;
 const FACE_R: usize = 16;
 const FACE_C: usize = 16;
 type Shape = Vec<usize>;
+static NEXT_DRAM_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum DType {
@@ -78,6 +80,7 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 
 #[derive(Clone, Debug)]
 pub struct DramBuffer {
+    pub id: u64,
     pub name: String,
     pub addr: u64,
     pub num_tiles: usize,
@@ -90,6 +93,7 @@ pub struct DramBuffer {
 impl PartialEq for DramBuffer {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
+            && self.id == other.id
             && self.addr == other.addr
             && self.num_tiles == other.num_tiles
             && self.dtype == other.dtype
@@ -207,6 +211,7 @@ impl Allocator {
         let (addr, allocation_size, _next) =
             allocate_allocation_range(self.local_hardware_id, num_tiles, dtype, self.bank_count)?;
         Ok(DramBuffer {
+            id: NEXT_DRAM_BUFFER_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
             addr,
             num_tiles,
@@ -329,6 +334,81 @@ impl Allocator {
     pub(crate) fn read_host_data(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
         let payload = self.read(buf)?;
         untilize(&payload, buf.dtype, &buf.shape)
+    }
+
+    pub(crate) fn read_rank1_host_data(
+        &mut self,
+        buf: &DramBuffer,
+        logical_len: usize,
+    ) -> io::Result<Vec<u8>> {
+        if buf.shape.len() != 2 || buf.shape[0] != TILE_R {
+            return Err(invalid_input(format!(
+                "rank-1 readback requires allocation shape [{TILE_R}, N], got {:?}",
+                buf.shape
+            )));
+        }
+        let cols = buf.shape[1];
+        if logical_len > cols {
+            return Err(invalid_input(format!(
+                "rank-1 logical length {logical_len} exceeds allocation width {cols}"
+            )));
+        }
+        let expected_tiles = cols / TILE_C;
+        if buf.num_tiles != expected_tiles {
+            return Err(invalid_input(format!(
+                "rank-1 readback tile count mismatch: got {}, expected {expected_tiles}",
+                buf.num_tiles
+            )));
+        }
+
+        let bytes_per_element = buf.dtype.bytes_per_element();
+        let mut out = vec![0u8; logical_len * bytes_per_element];
+        let tile_size = buf.page_size();
+        let tiles_per_row = cols / TILE_C;
+        let face_bytes = FACE_R * FACE_C * bytes_per_element;
+        let row_face_bytes = FACE_C * bytes_per_element;
+
+        for (bank_index, tile) in self.bank_tiles.iter().enumerate() {
+            if bank_index >= tiles_per_row {
+                break;
+            }
+            self.window.target(
+                CoreCoord {
+                    x: tile.x,
+                    y: tile.y,
+                },
+                None,
+                0,
+                NocOrdering::Relaxed,
+            )?;
+
+            for page in (bank_index..tiles_per_row).step_by(self.bank_count) {
+                let element_base = page * TILE_C;
+                if element_base >= logical_len {
+                    break;
+                }
+                let bank_page = page / self.bank_count;
+                let page_addr = buf.addr as usize + bank_page * tile_size;
+                let dst_base = element_base * bytes_per_element;
+
+                let first_elements = (logical_len - element_base).min(FACE_C);
+                let first_bytes = first_elements * bytes_per_element;
+                self.window
+                    .read_into(page_addr, &mut out[dst_base..dst_base + first_bytes])?;
+
+                if logical_len > element_base + FACE_C {
+                    let second_elements = (logical_len - element_base - FACE_C).min(FACE_C);
+                    let second_bytes = second_elements * bytes_per_element;
+                    let second_dst = dst_base + row_face_bytes;
+                    self.window.read_into(
+                        page_addr + face_bytes,
+                        &mut out[second_dst..second_dst + second_bytes],
+                    )?;
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     fn barrier(&mut self) -> io::Result<()> {
@@ -582,7 +662,9 @@ fn next_allocation_range(
 
 fn allocation_range_size(num_tiles: usize, dtype: DType, bank_count: usize) -> io::Result<u64> {
     if bank_count == 0 {
-        return Err(io::Error::other("dram allocation requires at least one bank"));
+        return Err(io::Error::other(
+            "dram allocation requires at least one bank",
+        ));
     }
     let pages_per_bank = num_tiles.div_ceil(bank_count);
     let allocation_size = (pages_per_bank as u64)
@@ -733,6 +815,7 @@ mod tests {
     #[test]
     fn buffer_size_matches_tile_count() {
         let buffer = DramBuffer {
+            id: 1,
             name: "weights".to_owned(),
             addr: Dram::WRITE_OFFSET,
             num_tiles: 3,
@@ -819,6 +902,7 @@ mod tests {
         let (addr, size, _) =
             allocate_allocation_range(local_hardware_id, 1, DType::Float16, 1).unwrap();
         let buffer = DramBuffer {
+            id: 2,
             name: "tmp".to_owned(),
             addr,
             num_tiles: 1,
