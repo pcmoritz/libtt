@@ -7,16 +7,16 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+import torch
 from huggingface_hub import snapshot_download
+from safetensors import safe_open
 from transformers import AutoTokenizer
 
-try:
-    jax.config.update("jax_use_shardy_partitioner", False)
-except Exception:
-    pass
+jax.config.update("jax_use_shardy_partitioner", False)
+
+import jax.numpy as jnp
 
 
 @dataclass(frozen=True)
@@ -36,12 +36,6 @@ class Qwen3Config:
     eos_token_id: int | tuple[int, ...] | None = 151645
 
     def __post_init__(self):
-        if self.hidden_size <= 0:
-            raise ValueError("hidden_size must be positive")
-        if self.num_attention_heads <= 0:
-            raise ValueError("num_attention_heads must be positive")
-        if self.num_key_value_heads <= 0:
-            raise ValueError("num_key_value_heads must be positive")
         if self.num_attention_heads % self.num_key_value_heads != 0:
             raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
         if self.head_dim % 2 != 0:
@@ -308,14 +302,10 @@ def safetensor_files(model_dir: Path) -> list[Path]:
     else:
         files = sorted(model_dir.glob("*.safetensors"))
 
-    if not files:
-        raise SystemExit(f"no safetensors checkpoint files found in {model_dir}")
     return files
 
 
 def tensor_to_numpy(tensor, np_dtype):
-    import torch
-
     tensor = tensor.detach().cpu().contiguous()
     if np.dtype(np_dtype) == np.dtype(ml_dtypes.bfloat16):
         if tensor.dtype == torch.bfloat16:
@@ -328,167 +318,45 @@ def tensor_to_numpy(tensor, np_dtype):
     return tensor.numpy().astype(np_dtype, copy=False)
 
 
-def checkpoint_tensor_names(config: Qwen3Config) -> tuple[set[str], set[str]]:
-    required = {
-        "model.embed_tokens.weight",
-        "model.norm.weight",
-    }
-    optional = {"lm_head.weight"}
-
-    for index in range(config.num_hidden_layers):
-        prefix = f"model.layers.{index}"
-        required.update(
-            {
-                f"{prefix}.input_layernorm.weight",
-                f"{prefix}.post_attention_layernorm.weight",
-                f"{prefix}.self_attn.q_norm.weight",
-                f"{prefix}.self_attn.k_norm.weight",
-                f"{prefix}.self_attn.q_proj.weight",
-                f"{prefix}.self_attn.k_proj.weight",
-                f"{prefix}.self_attn.v_proj.weight",
-                f"{prefix}.self_attn.o_proj.weight",
-                f"{prefix}.mlp.gate_proj.weight",
-                f"{prefix}.mlp.up_proj.weight",
-                f"{prefix}.mlp.down_proj.weight",
-            }
-        )
-
-    if not config.tie_word_embeddings:
-        required.add("lm_head.weight")
-        optional.remove("lm_head.weight")
-    return required, optional
-
-
-def load_checkpoint_arrays(config: Qwen3Config, model_dir: Path, np_dtype):
-    try:
-        from safetensors import safe_open
-    except ModuleNotFoundError as err:
-        raise SystemExit(
-            "missing Python dependency 'safetensors'. Install the example dependencies, "
-            "for example: python3 -m pip install jax ml-dtypes transformers "
-            "huggingface-hub safetensors torch"
-        ) from err
-
-    try:
-        import torch  # noqa: F401
-    except ModuleNotFoundError as err:
-        raise SystemExit(
-            "missing Python dependency 'torch'. Install the example dependencies, "
-            "for example: python3 -m pip install jax ml-dtypes transformers "
-            "huggingface-hub safetensors torch"
-        ) from err
-
-    required, optional = checkpoint_tensor_names(config)
-    remaining = set(required) | set(optional)
+def load_checkpoint_arrays(model_dir: Path, np_dtype):
     arrays = {}
 
     for path in safetensor_files(model_dir):
         with safe_open(path, framework="pt", device="cpu") as f:
-            keys = set(f.keys())
-            for name in sorted(remaining & keys):
+            for name in f.keys():
                 arrays[name] = tensor_to_numpy(f.get_tensor(name), np_dtype)
-                remaining.remove(name)
 
-    missing_required = sorted(required - arrays.keys())
-    if missing_required:
-        preview = ", ".join(missing_required[:8])
-        if len(missing_required) > 8:
-            preview += f", ... ({len(missing_required)} total)"
-        raise SystemExit(f"checkpoint is missing required tensors: {preview}")
     return arrays
 
 
-def expect_shape(name: str, value, expected):
-    if value.shape != expected:
-        raise SystemExit(f"{name} has shape {value.shape}, expected {expected}")
-    return np.ascontiguousarray(value)
-
-
 def load_hf_weights(config: Qwen3Config, model_dir: Path, np_dtype):
-    tensors = load_checkpoint_arrays(config, model_dir, np_dtype)
-    q_out = config.num_attention_heads * config.head_dim
-    kv_out = config.num_key_value_heads * config.head_dim
+    tensors = load_checkpoint_arrays(model_dir, np_dtype)
 
-    embed_tokens = expect_shape(
-        "model.embed_tokens.weight",
-        tensors["model.embed_tokens.weight"],
-        (config.vocab_size, config.hidden_size),
-    )
     weights = {
-        "embed_tokens": embed_tokens,
+        "embed_tokens": np.ascontiguousarray(tensors["model.embed_tokens.weight"]),
         "layers": [],
-        "norm": expect_shape(
-            "model.norm.weight",
-            tensors["model.norm.weight"],
-            (config.hidden_size,),
-        ),
+        "norm": np.ascontiguousarray(tensors["model.norm.weight"]),
     }
 
-    if "lm_head.weight" in tensors:
-        weights["lm_head"] = expect_shape(
-            "lm_head.weight",
-            tensors["lm_head.weight"].T,
-            (config.hidden_size, config.vocab_size),
-        )
+    if not config.tie_word_embeddings:
+        weights["lm_head"] = np.ascontiguousarray(tensors["lm_head.weight"].T)
 
     for index in range(config.num_hidden_layers):
         prefix = f"model.layers.{index}"
         layer = {
-            "input_norm": expect_shape(
-                f"{prefix}.input_layernorm.weight",
-                tensors[f"{prefix}.input_layernorm.weight"],
-                (config.hidden_size,),
+            "input_norm": np.ascontiguousarray(tensors[f"{prefix}.input_layernorm.weight"]),
+            "post_attention_norm": np.ascontiguousarray(
+                tensors[f"{prefix}.post_attention_layernorm.weight"]
             ),
-            "post_attention_norm": expect_shape(
-                f"{prefix}.post_attention_layernorm.weight",
-                tensors[f"{prefix}.post_attention_layernorm.weight"],
-                (config.hidden_size,),
-            ),
-            "q_norm": expect_shape(
-                f"{prefix}.self_attn.q_norm.weight",
-                tensors[f"{prefix}.self_attn.q_norm.weight"],
-                (config.head_dim,),
-            ),
-            "k_norm": expect_shape(
-                f"{prefix}.self_attn.k_norm.weight",
-                tensors[f"{prefix}.self_attn.k_norm.weight"],
-                (config.head_dim,),
-            ),
-            "q_proj": expect_shape(
-                f"{prefix}.self_attn.q_proj.weight",
-                tensors[f"{prefix}.self_attn.q_proj.weight"].T,
-                (config.hidden_size, q_out),
-            ),
-            "k_proj": expect_shape(
-                f"{prefix}.self_attn.k_proj.weight",
-                tensors[f"{prefix}.self_attn.k_proj.weight"].T,
-                (config.hidden_size, kv_out),
-            ),
-            "v_proj": expect_shape(
-                f"{prefix}.self_attn.v_proj.weight",
-                tensors[f"{prefix}.self_attn.v_proj.weight"].T,
-                (config.hidden_size, kv_out),
-            ),
-            "o_proj": expect_shape(
-                f"{prefix}.self_attn.o_proj.weight",
-                tensors[f"{prefix}.self_attn.o_proj.weight"].T,
-                (q_out, config.hidden_size),
-            ),
-            "gate_proj": expect_shape(
-                f"{prefix}.mlp.gate_proj.weight",
-                tensors[f"{prefix}.mlp.gate_proj.weight"].T,
-                (config.hidden_size, config.intermediate_size),
-            ),
-            "up_proj": expect_shape(
-                f"{prefix}.mlp.up_proj.weight",
-                tensors[f"{prefix}.mlp.up_proj.weight"].T,
-                (config.hidden_size, config.intermediate_size),
-            ),
-            "down_proj": expect_shape(
-                f"{prefix}.mlp.down_proj.weight",
-                tensors[f"{prefix}.mlp.down_proj.weight"].T,
-                (config.intermediate_size, config.hidden_size),
-            ),
+            "q_norm": np.ascontiguousarray(tensors[f"{prefix}.self_attn.q_norm.weight"]),
+            "k_norm": np.ascontiguousarray(tensors[f"{prefix}.self_attn.k_norm.weight"]),
+            "q_proj": np.ascontiguousarray(tensors[f"{prefix}.self_attn.q_proj.weight"].T),
+            "k_proj": np.ascontiguousarray(tensors[f"{prefix}.self_attn.k_proj.weight"].T),
+            "v_proj": np.ascontiguousarray(tensors[f"{prefix}.self_attn.v_proj.weight"].T),
+            "o_proj": np.ascontiguousarray(tensors[f"{prefix}.self_attn.o_proj.weight"].T),
+            "gate_proj": np.ascontiguousarray(tensors[f"{prefix}.mlp.gate_proj.weight"].T),
+            "up_proj": np.ascontiguousarray(tensors[f"{prefix}.mlp.up_proj.weight"].T),
+            "down_proj": np.ascontiguousarray(tensors[f"{prefix}.mlp.down_proj.weight"].T),
         }
         weights["layers"].append(layer)
 
@@ -654,10 +522,6 @@ def main():
     args = parse_args()
     if args.max_new_tokens < 0:
         raise SystemExit("--max-new-tokens must be non-negative")
-    if args.max_seq_len is not None and args.max_seq_len <= 0:
-        raise SystemExit("--max-seq-len must be positive")
-    if args.temperature < 0:
-        raise SystemExit("--temperature must be non-negative")
 
     np_dtype = ml_dtypes.bfloat16 if args.dtype == "bf16" else np.float32
 
