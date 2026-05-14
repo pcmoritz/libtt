@@ -7,23 +7,29 @@ constexpr uint32_t TILE_C = 32;
 constexpr uint32_t FACE_R = 16;
 constexpr uint32_t FACE_C = 16;
 constexpr uint32_t INVALID_TILE = 0xffffffffu;
-constexpr uint32_t INPUT_RANK = BROADCAST_INPUT_RANK;
-constexpr uint32_t OUTPUT_RANK = BROADCAST_OUTPUT_RANK;
+constexpr uint32_t INPUT_RANK = SLICE_INPUT_RANK;
+constexpr uint32_t OUTPUT_RANK = SLICE_OUTPUT_RANK;
 constexpr uint32_t INPUT_COORD_COUNT = INPUT_RANK < 3 ? 3 : INPUT_RANK;
 constexpr uint32_t OUTPUT_COORD_COUNT = OUTPUT_RANK < 3 ? 3 : OUTPUT_RANK;
-constexpr uint32_t INPUT_SHAPE[INPUT_COORD_COUNT] = BROADCAST_INPUT_SHAPE;
-constexpr uint32_t OUTPUT_SHAPE[OUTPUT_COORD_COUNT] = BROADCAST_OUTPUT_SHAPE;
-constexpr uint32_t BROADCAST_DIMS[INPUT_COORD_COUNT] = BROADCAST_DIMENSIONS;
-constexpr uint32_t INPUT_TILE_ROWS = BROADCAST_INPUT_TILE_ROWS;
-constexpr uint32_t INPUT_TILES_PER_ROW = BROADCAST_INPUT_TILES_PER_ROW;
-constexpr uint32_t OUTPUT_TILE_ROWS = BROADCAST_OUTPUT_TILE_ROWS;
-constexpr uint32_t OUTPUT_TILES_PER_ROW = BROADCAST_OUTPUT_TILES_PER_ROW;
-constexpr bool DIRECT_COPY = BROADCAST_DIRECT_COPY != 0;
-constexpr bool INSERT_SINGLETON_MIDDLE =
-    INPUT_RANK == 2 && OUTPUT_RANK == 3 && OUTPUT_SHAPE[1] == 1 &&
-    INPUT_SHAPE[0] == OUTPUT_SHAPE[0] && INPUT_SHAPE[1] == OUTPUT_SHAPE[2] &&
-    BROADCAST_DIMS[0] == 0 && BROADCAST_DIMS[1] == 2;
-using Element = BROADCAST_ELEMENT_TYPE;
+constexpr uint32_t INPUT_SHAPE[INPUT_COORD_COUNT] = SLICE_INPUT_SHAPE;
+constexpr uint32_t SLICE_SHAPE[INPUT_COORD_COUNT] = SLICE_SLICE_SHAPE;
+constexpr uint32_t OUTPUT_SHAPE[OUTPUT_COORD_COUNT] = SLICE_OUTPUT_SHAPE;
+constexpr uint32_t START_INDICES[INPUT_COORD_COUNT] = SLICE_START_INDICES;
+constexpr uint32_t STRIDES[INPUT_COORD_COUNT] = SLICE_STRIDES;
+constexpr uint32_t INPUT_TILE_ROWS = SLICE_INPUT_TILE_ROWS;
+constexpr uint32_t INPUT_TILES_PER_ROW = SLICE_INPUT_TILES_PER_ROW;
+constexpr uint32_t OUTPUT_TILE_ROWS = SLICE_OUTPUT_TILE_ROWS;
+constexpr uint32_t OUTPUT_TILES_PER_ROW = SLICE_OUTPUT_TILES_PER_ROW;
+constexpr bool TRANSPOSE_RANK2 = SLICE_TRANSPOSE_RANK2 != 0;
+constexpr bool HEAD_SLICE_RESHAPE =
+    !TRANSPOSE_RANK2 && INPUT_RANK == 3 && OUTPUT_RANK == 2 && SLICE_SHAPE[1] == 1 &&
+    OUTPUT_SHAPE[0] == SLICE_SHAPE[0] && OUTPUT_SHAPE[1] == SLICE_SHAPE[2] &&
+    STRIDES[0] == 1 && STRIDES[1] == 1 && STRIDES[2] == 1;
+constexpr bool HEAD_SLICE_RESHAPE_TRANSPOSE =
+    TRANSPOSE_RANK2 && INPUT_RANK == 3 && OUTPUT_RANK == 2 && SLICE_SHAPE[1] == 1 &&
+    OUTPUT_SHAPE[0] == SLICE_SHAPE[2] && OUTPUT_SHAPE[1] == SLICE_SHAPE[0] &&
+    STRIDES[0] == 1 && STRIDES[1] == 1 && STRIDES[2] == 1;
+using Element = SLICE_ELEMENT_TYPE;
 
 struct Location {
   uint32_t tile;
@@ -65,14 +71,6 @@ void read_input_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile_id
   cb_wait_front(cb, 1);
 }
 
-void read_output_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile_id,
-                      uint32_t cb) {
-  cb_reserve_back(cb, 1);
-  noc_async_read_tile(tile_id, input, get_write_ptr(cb));
-  noc_async_read_barrier();
-  cb_push_back(cb, 1);
-}
-
 void copy_element(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
                   uint32_t source_col, uint32_t output_row, uint32_t output_col) {
   volatile tt_l1_ptr Element *source =
@@ -110,7 +108,8 @@ void copy_row_segment(uint32_t cb_input, uint32_t cb_output, uint32_t source_row
   }
 }
 
-void decode_output_batch(uint32_t output_batch, uint32_t output_coords[OUTPUT_COORD_COUNT]) {
+void decode_output_batch(uint32_t output_batch,
+                         uint32_t output_coords[OUTPUT_COORD_COUNT]) {
   for (uint32_t dim = 0; dim < OUTPUT_RANK; ++dim) {
     output_coords[dim] = 0;
   }
@@ -123,7 +122,8 @@ void decode_output_batch(uint32_t output_batch, uint32_t output_coords[OUTPUT_CO
   }
 }
 
-uint32_t output_coord(uint32_t dim, const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
+uint32_t output_coord(uint32_t dim,
+                      const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
                       uint32_t output_row, uint32_t output_col) {
   if constexpr (OUTPUT_RANK == 0) {
     return 0;
@@ -140,37 +140,62 @@ uint32_t output_coord(uint32_t dim, const uint32_t base_output_coords[OUTPUT_COO
   }
 }
 
-uint32_t input_coord(uint32_t dim, const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
-                     uint32_t output_row, uint32_t output_col) {
-  if (INPUT_SHAPE[dim] == 1) {
+uint32_t output_flat_index(const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
+                           uint32_t output_row, uint32_t output_col) {
+  if constexpr (OUTPUT_RANK == 0) {
     return 0;
+  } else {
+    uint32_t flat = 0;
+    for (uint32_t dim = 0; dim < OUTPUT_RANK; ++dim) {
+      flat = flat * OUTPUT_SHAPE[dim] +
+             output_coord(dim, base_output_coords, output_row, output_col);
+    }
+    return flat;
   }
-  return output_coord(BROADCAST_DIMS[dim], base_output_coords, output_row, output_col);
 }
 
-Location input_location(const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
-                        uint32_t output_row, uint32_t output_col) {
+void decode_slice_coords(uint32_t flat, uint32_t slice_coords[INPUT_COORD_COUNT]) {
+  for (uint32_t dim = 0; dim < INPUT_RANK; ++dim) {
+    slice_coords[dim] = 0;
+  }
+  if constexpr (INPUT_RANK > 0) {
+    for (uint32_t index = 0; index < INPUT_RANK; ++index) {
+      uint32_t dim = INPUT_RANK - 1 - index;
+      slice_coords[dim] = flat % SLICE_SHAPE[dim];
+      flat /= SLICE_SHAPE[dim];
+    }
+  }
+}
+
+Location input_location(uint32_t flat) {
   if constexpr (INPUT_RANK == 0) {
     return Location{0, 0, 0};
-  } else if constexpr (INPUT_RANK == 1) {
-    uint32_t input_col = input_coord(0, base_output_coords, output_row, output_col);
-    return Location{input_col / TILE_C, 0, input_col % TILE_C};
   } else {
-    uint32_t input_batch = 0;
-    for (uint32_t dim = 0; dim < INPUT_RANK - 2; ++dim) {
-      uint32_t coord = input_coord(dim, base_output_coords, output_row, output_col);
-      input_batch = input_batch * INPUT_SHAPE[dim] + coord;
+    uint32_t slice_coords[INPUT_COORD_COUNT];
+    decode_slice_coords(flat, slice_coords);
+
+    if constexpr (INPUT_RANK == 1) {
+      uint32_t input_col = START_INDICES[0] + slice_coords[0] * STRIDES[0];
+      return Location{input_col / TILE_C, 0, input_col % TILE_C};
+    } else {
+      uint32_t input_batch = 0;
+      for (uint32_t dim = 0; dim < INPUT_RANK - 2; ++dim) {
+        uint32_t coord = START_INDICES[dim] + slice_coords[dim] * STRIDES[dim];
+        input_batch = input_batch * INPUT_SHAPE[dim] + coord;
+      }
+      uint32_t input_row =
+          START_INDICES[INPUT_RANK - 2] +
+          slice_coords[INPUT_RANK - 2] * STRIDES[INPUT_RANK - 2];
+      uint32_t input_col =
+          START_INDICES[INPUT_RANK - 1] +
+          slice_coords[INPUT_RANK - 1] * STRIDES[INPUT_RANK - 1];
+      uint32_t input_tile_row = input_row / TILE_R;
+      uint32_t input_tile_col = input_col / TILE_C;
+      uint32_t input_tile =
+          (input_batch * INPUT_TILE_ROWS + input_tile_row) * INPUT_TILES_PER_ROW +
+          input_tile_col;
+      return Location{input_tile, input_row % TILE_R, input_col % TILE_C};
     }
-    uint32_t input_row =
-        input_coord(INPUT_RANK - 2, base_output_coords, output_row, output_col);
-    uint32_t input_col =
-        input_coord(INPUT_RANK - 1, base_output_coords, output_row, output_col);
-    uint32_t input_tile_row = input_row / TILE_R;
-    uint32_t input_tile_col = input_col / TILE_C;
-    uint32_t input_tile =
-        (input_batch * INPUT_TILE_ROWS + input_tile_row) * INPUT_TILES_PER_ROW +
-        input_tile_col;
-    return Location{input_tile, input_row % TILE_R, input_col % TILE_C};
   }
 }
 
@@ -201,13 +226,9 @@ void kernel_main() {
       .page_size = get_tile_size(cb_input),
       .data_format = get_dataformat(cb_input),
   };
+
   for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
     uint32_t output_tile_id = output_tile_offset + tile;
-    if constexpr (DIRECT_COPY) {
-      read_output_tile(input, output_tile_id, cb_output);
-      continue;
-    }
-
     uint32_t output_matrix_tiles = OUTPUT_TILE_ROWS * OUTPUT_TILES_PER_ROW;
     uint32_t output_batch = output_tile_id / output_matrix_tiles;
     uint32_t output_matrix_tile = output_tile_id % output_matrix_tiles;
@@ -226,26 +247,61 @@ void kernel_main() {
       col_count = tile_extent(OUTPUT_SHAPE[OUTPUT_RANK - 1], output_col_base, TILE_C);
     }
 
-    if constexpr (INSERT_SINGLETON_MIDDLE) {
-      uint32_t input_row = output_batch;
-      uint32_t input_tile_row = input_row / TILE_R;
-      uint32_t source_row = input_row % TILE_R;
+    if constexpr (HEAD_SLICE_RESHAPE) {
       uint32_t loaded_input_tile = INVALID_TILE;
-
       cb_reserve_back(cb_output, 1);
       zero_tile(cb_output);
 
-      uint32_t col = 0;
-      while (col < col_count) {
-        uint32_t input_col = output_col_base + col;
-        uint32_t input_tile_col = input_col / TILE_C;
-        uint32_t input_tile = input_tile_row * INPUT_TILES_PER_ROW + input_tile_col;
+      for (uint32_t row = 0; row < row_count; ++row) {
+        uint32_t output_row = output_row_base + row;
+        uint32_t input_batch = START_INDICES[0] + output_row;
+        uint32_t input_row = START_INDICES[1];
+        uint32_t input_tile_row = input_row / TILE_R;
+        uint32_t source_row = input_row % TILE_R;
+        uint32_t col = 0;
+        while (col < col_count) {
+          uint32_t input_col = START_INDICES[2] + output_col_base + col;
+          uint32_t input_tile_col = input_col / TILE_C;
+          uint32_t input_tile =
+              (input_batch * INPUT_TILE_ROWS + input_tile_row) * INPUT_TILES_PER_ROW +
+              input_tile_col;
+          ensure_input_tile(input, input_tile, &loaded_input_tile);
+          uint32_t run = TILE_C - (input_col % TILE_C);
+          uint32_t remaining = col_count - col;
+          run = run < remaining ? run : remaining;
+          copy_row_segment(cb_input, cb_output, source_row, input_col % TILE_C, row, col, run);
+          col += run;
+        }
+      }
+
+      if (loaded_input_tile != INVALID_TILE) {
+        cb_pop_front(cb_input, 1);
+      }
+      cb_push_back(cb_output, 1);
+      continue;
+    }
+
+    if constexpr (HEAD_SLICE_RESHAPE_TRANSPOSE) {
+      uint32_t loaded_input_tile = INVALID_TILE;
+      cb_reserve_back(cb_output, 1);
+      zero_tile(cb_output);
+
+      uint32_t input_tile_col = (START_INDICES[2] + output_row_base) / TILE_C;
+      uint32_t input_row = START_INDICES[1];
+      uint32_t input_tile_row = input_row / TILE_R;
+      uint32_t source_row = input_row % TILE_R;
+
+      for (uint32_t col = 0; col < col_count; ++col) {
+        uint32_t output_col = output_col_base + col;
+        uint32_t input_batch = START_INDICES[0] + output_col;
+        uint32_t input_tile =
+            (input_batch * INPUT_TILE_ROWS + input_tile_row) * INPUT_TILES_PER_ROW +
+            input_tile_col;
         ensure_input_tile(input, input_tile, &loaded_input_tile);
-        uint32_t run = TILE_C - (input_col % TILE_C);
-        uint32_t remaining = col_count - col;
-        run = run < remaining ? run : remaining;
-        copy_row_segment(cb_input, cb_output, source_row, input_col % TILE_C, 0, col, run);
-        col += run;
+        for (uint32_t row = 0; row < row_count; ++row) {
+          uint32_t input_col = START_INDICES[2] + output_row_base + row;
+          copy_element(cb_input, cb_output, source_row, input_col % TILE_C, row, col);
+        }
       }
 
       if (loaded_input_tile != INVALID_TILE) {
@@ -264,34 +320,12 @@ void kernel_main() {
 
     for (uint32_t row = 0; row < row_count; ++row) {
       uint32_t output_row = output_row_base + row;
-      uint32_t col = 0;
-      while (col < col_count) {
+      for (uint32_t col = 0; col < col_count; ++col) {
         uint32_t output_col = output_col_base + col;
-        Location source = input_location(base_output_coords, output_row, output_col);
+        uint32_t flat = output_flat_index(base_output_coords, output_row, output_col);
+        Location source = input_location(flat);
         ensure_input_tile(input, source.tile, &loaded_input_tile);
-
-        uint32_t run = 1;
-        bool contiguous_cols = false;
-        if (col + 1 < col_count) {
-          Location next_source = input_location(base_output_coords, output_row, output_col + 1);
-          if (next_source.tile == source.tile && next_source.row == source.row) {
-            if (next_source.col == source.col + 1) {
-              contiguous_cols = true;
-              uint32_t source_cols_remaining = TILE_C - source.col;
-              uint32_t output_cols_remaining = col_count - col;
-              run = source_cols_remaining < output_cols_remaining ? source_cols_remaining
-                                                                  : output_cols_remaining;
-            } else if (next_source.col == source.col) {
-              run = col_count - col;
-            }
-          }
-        }
-
-        for (uint32_t i = 0; i < run; ++i) {
-          copy_element(cb_input, cb_output, source.row,
-                       contiguous_cols ? source.col + i : source.col, row, col + i);
-        }
-        col += run;
+        copy_element(cb_input, cb_output, source.row, source.col, row, col);
       }
     }
 

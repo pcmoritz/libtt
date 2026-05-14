@@ -273,6 +273,9 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
             for nc in 1..=valid_cols.len() {
                 let cols = &valid_cols[..nc];
                 let nr = rows.len();
+                if nr > mt_base || nc > nt_base {
+                    continue;
+                }
                 if nr * nc > ordered.len() {
                     continue;
                 }
@@ -415,7 +418,7 @@ fn plan_flat_n_matmul(
     let mut best = None;
     let mut best_score = None;
 
-    for active_cores in (1..=cores.len()).rev() {
+    for active_cores in (1..=cores.len().min(nt_base)).rev() {
         let per_core_m = mt_base;
         let per_core_n = nt_base.div_ceil(active_cores);
         let mt = mt_base;
@@ -905,6 +908,15 @@ mod tests {
         assert_eq!(plan.mt, 2);
         assert_eq!(plan.kt, 3);
         assert_eq!(plan.nt, 1);
+    }
+
+    #[test]
+    fn plan_matmul_does_not_overparallelize_tiny_outputs() {
+        let plan = plan_matmul(32, 128, 32, &p100_worker_cores()).expect("plan");
+        assert_eq!(plan.mt, 1);
+        assert_eq!(plan.nt, 1);
+        assert_eq!(plan.grid.len(), 1);
+        assert_eq!(plan.grid[0].len(), 1);
     }
 
     #[test]
