@@ -31,10 +31,7 @@ struct MatmulProgramKey {
 struct MatmulPlan {
     rows: Vec<u8>,
     cols: Vec<u8>,
-    grid: Vec<Vec<CoreCoord>>,
-    rectangular_dispatch: bool,
-    multicast_lhs: bool,
-    multicast_rhs: bool,
+    direct_grid: Option<Vec<Vec<CoreCoord>>>,
     mt: usize,
     kt: usize,
     nt: usize,
@@ -192,15 +189,17 @@ pub(crate) fn matmul_bf16(
 }
 
 fn log_matmul_plan(plan: &MatmulPlan) {
-    let grid_rows = plan.grid.len();
-    let grid_cols = plan.grid.iter().map(Vec::len).max().unwrap_or(0);
+    let grid = plan_grid(plan);
+    let grid_rows = grid.len();
+    let grid_cols = grid.first().map_or(0, Vec::len);
     log(format!(
-        "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
+        "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} mode={} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
         plan.mt,
         plan.kt,
         plan.nt,
         grid_rows,
         grid_cols,
+        if plan.direct_grid.is_some() { "direct" } else { "mcast" },
         plan.per_core_m,
         plan.per_core_n,
         plan.in0_block_w,
@@ -313,17 +312,11 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
                                 active_cores,
                             );
                             if best_score.map_or(true, |current| score > current) {
-                                let rows = rows.to_vec();
-                                let cols = cols.to_vec();
-                                let grid = rectangular_grid(&rows, &cols);
                                 best_score = Some(score);
                                 best = Some((
-                                    rows,
-                                    cols,
-                                    grid,
-                                    true,
-                                    true,
-                                    true,
+                                    rows.to_vec(),
+                                    cols.to_vec(),
+                                    None,
                                     mt,
                                     nt,
                                     per_core_m,
@@ -343,10 +336,7 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
     let Some((
         rows,
         cols,
-        grid,
-        rectangular_dispatch,
-        multicast_lhs,
-        multicast_rhs,
+        direct_grid,
         mt,
         nt,
         per_core_m,
@@ -355,7 +345,7 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
         out_subblock_h,
         out_subblock_w,
     )) = best.or_else(|| {
-        plan_flat_n_matmul(
+        plan_direct_matmul(
             mt_base,
             nt_base,
             &ordered,
@@ -377,10 +367,7 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
         nt,
         rows,
         cols,
-        grid,
-        rectangular_dispatch,
-        multicast_lhs,
-        multicast_rhs,
+        direct_grid,
         per_core_m,
         per_core_n,
         in0_block_w,
@@ -390,7 +377,7 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
 }
 
 #[allow(clippy::type_complexity)]
-fn plan_flat_n_matmul(
+fn plan_direct_matmul(
     mt_base: usize,
     nt_base: usize,
     cores: &[CoreCoord],
@@ -400,10 +387,7 @@ fn plan_flat_n_matmul(
 ) -> Option<(
     Vec<u8>,
     Vec<u8>,
-    Vec<Vec<CoreCoord>>,
-    bool,
-    bool,
-    bool,
+    Option<Vec<Vec<CoreCoord>>>,
     usize,
     usize,
     usize,
@@ -412,72 +396,74 @@ fn plan_flat_n_matmul(
     usize,
     usize,
 )> {
+    if mt_base == 0 || nt_base == 0 {
+        return None;
+    }
+
     let mut best = None;
     let mut best_score = None;
+    let max_rows = mt_base.min(cores.len());
+    for logical_rows in 1..=max_rows {
+        let max_cols = nt_base.min(cores.len() / logical_rows);
+        for logical_cols in 1..=max_cols {
+            let active_cores = logical_rows * logical_cols;
+            let per_core_m = mt_base.div_ceil(logical_rows);
+            let per_core_n = nt_base.div_ceil(logical_cols);
+            let mt = logical_rows * per_core_m;
+            let nt = logical_cols * per_core_n;
+            let out_tiles = per_core_m * per_core_n;
+            let bw_cap = if out_tiles <= 16 { 32 } else { 64 };
 
-    for active_cores in (1..=cores.len()).rev() {
-        let per_core_m = mt_base;
-        let per_core_n = nt_base.div_ceil(active_cores);
-        let mt = mt_base;
-        let nt = active_cores * per_core_n;
-        let out_tiles = per_core_m * per_core_n;
-        let bw_cap = if out_tiles <= 16 { 32 } else { 64 };
-
-        for out_subblock_h in 1..=8 {
-            for out_subblock_w in 1..=8 {
-                let out_subblock_num_tiles = out_subblock_h * out_subblock_w;
-                if out_subblock_num_tiles > 8
-                    || per_core_m % out_subblock_h != 0
-                    || per_core_n % out_subblock_w != 0
-                {
-                    continue;
-                }
-                for &in0_block_w in kt_divs {
-                    if in0_block_w > bw_cap
-                        || !fits_l1(
-                            per_core_m,
-                            per_core_n,
-                            in0_block_w,
-                            tile_bytes,
-                            l1_data_bytes,
-                        )
+            for out_subblock_h in 1..=8 {
+                for out_subblock_w in 1..=8 {
+                    let out_subblock_num_tiles = out_subblock_h * out_subblock_w;
+                    if out_subblock_num_tiles > 8
+                        || per_core_m % out_subblock_h != 0
+                        || per_core_n % out_subblock_w != 0
                     {
                         continue;
                     }
-                    let bias = out_tiles.min(16);
-                    let score = (
-                        active_cores * in0_block_w * bias * bias,
-                        usize::MAX - mt * nt,
-                        active_cores * in0_block_w,
-                        out_subblock_num_tiles,
-                        active_cores,
-                    );
-                    if best_score.map_or(true, |current| score > current) {
-                        let grid = vec![cores[..active_cores].to_vec()];
-                        let rows = grid
-                            .iter()
-                            .flat_map(|row| row.iter().map(|core| core.y))
-                            .collect::<Vec<_>>();
-                        let cols = grid
-                            .iter()
-                            .flat_map(|row| row.iter().map(|core| core.x))
-                            .collect::<Vec<_>>();
-                        best_score = Some(score);
-                        best = Some((
-                            rows,
-                            cols,
-                            grid,
-                            false,
-                            false,
-                            false,
-                            mt,
-                            nt,
-                            per_core_m,
-                            per_core_n,
-                            in0_block_w,
-                            out_subblock_h,
-                            out_subblock_w,
-                        ));
+                    for &in0_block_w in kt_divs {
+                        if in0_block_w > bw_cap
+                            || !fits_l1(
+                                per_core_m,
+                                per_core_n,
+                                in0_block_w,
+                                tile_bytes,
+                                l1_data_bytes,
+                            )
+                        {
+                            continue;
+                        }
+                        let padding = mt * nt - mt_base * nt_base;
+                        let bias = out_tiles.min(16);
+                        let score = (
+                            active_cores * in0_block_w * bias * bias,
+                            usize::MAX - padding,
+                            active_cores * in0_block_w,
+                            out_subblock_num_tiles,
+                            active_cores,
+                        );
+                        if best_score.map_or(true, |current| score > current) {
+                            best_score = Some(score);
+                            best = Some((
+                                Vec::new(),
+                                Vec::new(),
+                                Some(
+                                    cores[..active_cores]
+                                        .chunks(logical_cols)
+                                        .map(|row| row.to_vec())
+                                        .collect(),
+                                ),
+                                mt,
+                                nt,
+                                per_core_m,
+                                per_core_n,
+                                in0_block_w,
+                                out_subblock_h,
+                                out_subblock_w,
+                            ));
+                        }
                     }
                 }
             }
@@ -485,12 +471,6 @@ fn plan_flat_n_matmul(
     }
 
     best
-}
-
-fn rectangular_grid(rows: &[u8], cols: &[u8]) -> Vec<Vec<CoreCoord>> {
-    rows.iter()
-        .map(|&y| cols.iter().map(|&x| CoreCoord { x, y }).collect())
-        .collect()
 }
 
 fn fits_l1(
@@ -572,11 +552,10 @@ fn bf16_program(
             math_fidelity,
             ..CompileConfig::default()
         },
-        grid: if plan.rectangular_dispatch {
-            Some((plan.rows.clone(), plan.cols.clone()))
-        } else {
-            None
-        },
+        grid: plan
+            .direct_grid
+            .is_none()
+            .then(|| (plan.rows.clone(), plan.cols.clone())),
         ..Program::new(runtime_args)
     })
 }
@@ -626,7 +605,14 @@ fn parse_matmul_math_fidelity(value: &str) -> io::Result<MathFidelity> {
 }
 
 fn plan_grid(plan: &MatmulPlan) -> Vec<Vec<CoreCoord>> {
-    plan.grid.clone()
+    if let Some(grid) = &plan.direct_grid {
+        grid.clone()
+    } else {
+        plan.rows
+            .iter()
+            .map(|&y| plan.cols.iter().map(|&x| CoreCoord { x, y }).collect())
+            .collect()
+    }
 }
 
 fn reader_args(
@@ -636,7 +622,9 @@ fn reader_args(
     core: CoreCoord,
     logical_mt: usize,
 ) -> io::Result<Vec<u32>> {
-    let (w_rect, e_rect) = if plan.multicast_lhs {
+    let (w_rect, e_rect, sender) = if plan.direct_grid.is_some() {
+        ([0, 0, 0, 0, 0], [0, 0, 0, 0, 0], core)
+    } else {
         let west_cols = plan
             .cols
             .iter()
@@ -666,14 +654,8 @@ fn reader_args(
                     .collect::<Vec<_>>(),
                 core.y,
             ),
+            grid[row_index][0],
         )
-    } else {
-        ([0, 0, 0, 0, 0], [0, 0, 0, 0, 0])
-    };
-    let sender = if plan.multicast_lhs {
-        grid[row_index][0]
-    } else {
-        core
     };
     let mut args = vec![
         0,
@@ -711,10 +693,10 @@ fn writer_args(
     logical_mt: usize,
     logical_nt: usize,
 ) -> io::Result<Vec<u32>> {
-    let recv_ys = &plan.rows[1..];
-    let mcast = if !plan.multicast_rhs || recv_ys.is_empty() {
+    let mcast = if plan.direct_grid.is_some() || plan.rows.len() <= 1 {
         [0, 0, 0, 0, 0]
     } else {
+        let recv_ys = &plan.rows[1..];
         [
             core.x as u32,
             *recv_ys.last().expect("recv_ys is non-empty") as u32,
@@ -723,10 +705,10 @@ fn writer_args(
             recv_ys.len() as u32,
         ]
     };
-    let sender = if plan.multicast_rhs {
-        grid[0][col_index]
-    } else {
+    let sender = if plan.direct_grid.is_some() {
         core
+    } else {
+        grid[0][col_index]
     };
     let column_start = col_index * plan.per_core_n;
     let out_start = row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n;
@@ -908,18 +890,25 @@ mod tests {
     }
 
     #[test]
-    fn plan_matmul_handles_qwen3_lm_head_shape() {
+    fn plan_matmul_uses_direct_grid_for_wide_projection() {
         let plan = plan_matmul(32, 1024, 151936, &p100_worker_cores()).expect("plan");
+        let grid = plan.direct_grid.as_ref().expect("direct plan");
+        assert_eq!(grid.len(), 1);
+        assert_eq!(grid[0].len(), 118);
         assert_eq!(plan.mt, 1);
         assert_eq!(plan.kt, 32);
-        assert!(plan.nt >= 4748);
-        assert_eq!(plan.grid.len(), 1);
-        assert_eq!(plan.grid[0].len(), 118);
         assert_eq!(plan.per_core_m, 1);
-        assert!(plan.per_core_n <= 41);
-        assert!(!plan.rectangular_dispatch);
-        assert!(!plan.multicast_lhs);
-        assert!(!plan.multicast_rhs);
+        assert_eq!(plan.per_core_n, 41);
+    }
+
+    #[test]
+    fn plan_matmul_direct_grid_is_not_limited_to_single_m_tile() {
+        let plan = plan_matmul(64, 1024, 151936, &p100_worker_cores()).expect("plan");
+        let grid = plan.direct_grid.as_ref().expect("direct plan");
+        assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 118);
+        assert_eq!(plan.mt, 2);
+        assert_eq!(plan.kt, 32);
+        assert_eq!(plan.per_core_m * grid.len(), plan.mt);
     }
 
     #[test]
