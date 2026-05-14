@@ -1841,6 +1841,155 @@ fn execute_slice(
     )
 }
 
+fn execute_slice_reshape(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    slice_input_id: u32,
+    slice_output_id: u32,
+    reshape_output_id: u32,
+    start_indices: &[i64],
+    limit_indices: &[i64],
+    strides: &[i64],
+) -> Result<(), *mut PJRT_Error> {
+    let input_desc = plan.values.get(slice_input_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable slice_reshape operand value id is out of bounds")
+    })?;
+    let slice_desc = plan.values.get(slice_output_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable slice_reshape slice value id is out of bounds")
+    })?;
+    let output_desc = plan.values.get(reshape_output_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable slice_reshape output value id is out of bounds")
+    })?;
+    if input_desc.element_type != slice_desc.element_type
+        || slice_desc.element_type != output_desc.element_type
+    {
+        return Err(invalid_argument(
+            "TT executable slice_reshape input and output element types must match",
+        ));
+    }
+
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let slice_shape = dims_i64_to_usize(&slice_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let slice_reshape_plan = kernels::slice::SliceReshapePlan::new(
+        &input_shape,
+        &slice_shape,
+        &output_shape,
+        start_indices,
+        limit_indices,
+        strides,
+    )
+    .map_err(io_error)?;
+
+    let input = device_buffer_for_value(values, slice_input_id, "slice_reshape.operand")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable slice_reshape operand buffer has no device allocation",
+        ));
+    };
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dims = output_desc.dims.clone();
+    let output_dram = kernels::slice::slice_reshape(
+        device,
+        input_dram,
+        &slice_reshape_plan,
+        dtype,
+        "pjrt_slice_reshape",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        reshape_output_id,
+        output_dims,
+        output_dram,
+        context,
+        "slice_reshape",
+    )
+}
+
+fn execute_slice_reshape_transpose(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    slice_input_id: u32,
+    slice_output_id: u32,
+    reshape_output_id: u32,
+    transpose_output_id: u32,
+    start_indices: &[i64],
+    limit_indices: &[i64],
+    strides: &[i64],
+) -> Result<(), *mut PJRT_Error> {
+    let input_desc = plan.values.get(slice_input_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable slice_reshape_transpose operand value id is out of bounds")
+    })?;
+    let slice_desc = plan.values.get(slice_output_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable slice_reshape_transpose slice value id is out of bounds")
+    })?;
+    let reshape_desc = plan.values.get(reshape_output_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable slice_reshape_transpose reshape value id is out of bounds")
+    })?;
+    let output_desc = plan
+        .values
+        .get(transpose_output_id as usize)
+        .ok_or_else(|| {
+            invalid_argument(
+                "TT executable slice_reshape_transpose output value id is out of bounds",
+            )
+        })?;
+    if input_desc.element_type != slice_desc.element_type
+        || slice_desc.element_type != reshape_desc.element_type
+        || reshape_desc.element_type != output_desc.element_type
+    {
+        return Err(invalid_argument(
+            "TT executable slice_reshape_transpose input and output element types must match",
+        ));
+    }
+
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let slice_shape = dims_i64_to_usize(&slice_desc.dims)?;
+    let reshape_shape = dims_i64_to_usize(&reshape_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let slice_reshape_plan = kernels::slice::SliceReshapePlan::new_transpose_rank2(
+        &input_shape,
+        &slice_shape,
+        &reshape_shape,
+        &output_shape,
+        start_indices,
+        limit_indices,
+        strides,
+    )
+    .map_err(io_error)?;
+
+    let input = device_buffer_for_value(values, slice_input_id, "slice_reshape_transpose.operand")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable slice_reshape_transpose operand buffer has no device allocation",
+        ));
+    };
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dram = kernels::slice::slice_reshape(
+        device,
+        input_dram,
+        &slice_reshape_plan,
+        dtype,
+        "pjrt_slice_reshape_transpose",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        transpose_output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "slice_reshape_transpose",
+    )
+}
+
 fn execute_transpose(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2172,6 +2321,132 @@ fn execute_broadcast_in_dim(
     )
 }
 
+fn execute_repeat_heads(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_id: u32,
+    output_id: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable repeat_heads operand value id is out of bounds")
+    })?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable repeat_heads output value id is out of bounds")
+    })?;
+    if input_desc.element_type != output_desc.element_type {
+        return Err(invalid_argument(
+            "TT executable repeat_heads input and output element types must match",
+        ));
+    }
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let repeat_plan =
+        kernels::broadcast::RepeatHeadsPlan::new(&input_shape, &output_shape).map_err(io_error)?;
+
+    let input = device_buffer_for_value(values, input_id, "repeat_heads.operand")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable repeat_heads operand buffer has no device allocation",
+        ));
+    };
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dram = kernels::broadcast::repeat_heads(
+        device,
+        input_dram,
+        &repeat_plan,
+        dtype,
+        "pjrt_repeat_heads",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "repeat_heads",
+    )
+}
+
+fn execute_stack_heads(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    output_id: u32,
+    flatten: bool,
+) -> Result<(), *mut PJRT_Error> {
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable stack_heads output value id is out of bounds")
+    })?;
+    let first_input_id = input_ids
+        .first()
+        .copied()
+        .ok_or_else(|| invalid_argument("TT executable stack_heads requires inputs"))?;
+    let first_desc = plan.values.get(first_input_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable stack_heads operand value id is out of bounds")
+    })?;
+    if first_desc.element_type != output_desc.element_type {
+        return Err(invalid_argument(
+            "TT executable stack_heads input and output element types must match",
+        ));
+    }
+    for &input_id in input_ids.iter().skip(1) {
+        let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
+            invalid_argument("TT executable stack_heads operand value id is out of bounds")
+        })?;
+        if input_desc.element_type != first_desc.element_type || input_desc.dims != first_desc.dims
+        {
+            return Err(invalid_argument(
+                "TT executable stack_heads inputs must have matching shapes and element types",
+            ));
+        }
+    }
+
+    let input_shape = dims_i64_to_usize(&first_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let stack_plan = kernels::broadcast::StackHeadsPlan::new(
+        &input_shape,
+        &output_shape,
+        input_ids.len(),
+        flatten,
+    )
+    .map_err(io_error)?;
+
+    let mut input_buffers = Vec::with_capacity(input_ids.len());
+    for &input_id in input_ids {
+        let input = device_buffer_for_value(values, input_id, "stack_heads.operand")?;
+        let Some(input_dram) = input.dram_buffer.as_ref() else {
+            return Err(failed_precondition(
+                "TT executable stack_heads operand buffer has no device allocation",
+            ));
+        };
+        input_buffers.push(input_dram);
+    }
+    let dtype = pjrt_buffer_type_to_dtype(first_desc.element_type)?;
+    let output_dram = kernels::broadcast::stack_heads(
+        device,
+        &input_buffers,
+        &stack_plan,
+        dtype,
+        "pjrt_stack_heads",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "stack_heads",
+    )
+}
+
 fn execute_concatenate(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2388,6 +2663,358 @@ fn execute_iota(
     )
 }
 
+fn slice_reshape_fusion<'a>(
+    plan: &'a executable::Executable,
+    use_counts: &[usize],
+    op_index: usize,
+) -> Option<(u32, u32, u32, &'a [i64], &'a [i64], &'a [i64])> {
+    let executable::Op::Slice {
+        input_id: slice_input_id,
+        output_id: slice_output_id,
+        start_indices,
+        limit_indices,
+        strides,
+    } = plan.ops.get(op_index)?
+    else {
+        return None;
+    };
+    let executable::Op::Reshape {
+        input_id: reshape_input_id,
+        output_id: reshape_output_id,
+    } = plan.ops.get(op_index + 1)?
+    else {
+        return None;
+    };
+    if reshape_input_id != slice_output_id {
+        return None;
+    }
+    if use_counts
+        .get(*slice_output_id as usize)
+        .copied()
+        .unwrap_or_default()
+        != 1
+    {
+        return None;
+    }
+
+    Some((
+        *slice_input_id,
+        *slice_output_id,
+        *reshape_output_id,
+        start_indices,
+        limit_indices,
+        strides,
+    ))
+}
+
+fn slice_reshape_transpose_fusion<'a>(
+    plan: &'a executable::Executable,
+    use_counts: &[usize],
+    op_index: usize,
+) -> Option<(u32, u32, u32, u32, &'a [i64], &'a [i64], &'a [i64])> {
+    let executable::Op::Slice {
+        input_id: slice_input_id,
+        output_id: slice_output_id,
+        start_indices,
+        limit_indices,
+        strides,
+    } = plan.ops.get(op_index)?
+    else {
+        return None;
+    };
+    let executable::Op::Reshape {
+        input_id: reshape_input_id,
+        output_id: reshape_output_id,
+    } = plan.ops.get(op_index + 1)?
+    else {
+        return None;
+    };
+    let executable::Op::Transpose {
+        input_id: transpose_input_id,
+        output_id: transpose_output_id,
+        permutation,
+    } = plan.ops.get(op_index + 2)?
+    else {
+        return None;
+    };
+    if reshape_input_id != slice_output_id || transpose_input_id != reshape_output_id {
+        return None;
+    }
+    if permutation.as_slice() != [1, 0] {
+        return None;
+    }
+    if use_counts
+        .get(*slice_output_id as usize)
+        .copied()
+        .unwrap_or_default()
+        != 1
+        || use_counts
+            .get(*reshape_output_id as usize)
+            .copied()
+            .unwrap_or_default()
+            != 1
+    {
+        return None;
+    }
+
+    Some((
+        *slice_input_id,
+        *slice_output_id,
+        *reshape_output_id,
+        *transpose_output_id,
+        start_indices,
+        limit_indices,
+        strides,
+    ))
+}
+
+fn repeat_heads_fusion(
+    plan: &executable::Executable,
+    use_counts: &[usize],
+    op_index: usize,
+) -> Option<(u32, u32, u32)> {
+    let executable::Op::BroadcastInDim {
+        input_id,
+        output_id: broadcast_output_id,
+        broadcast_dimensions,
+    } = plan.ops.get(op_index)?
+    else {
+        return None;
+    };
+    let executable::Op::Reshape {
+        input_id: reshape_input_id,
+        output_id: reshape_output_id,
+    } = plan.ops.get(op_index + 1)?
+    else {
+        return None;
+    };
+    if reshape_input_id != broadcast_output_id {
+        return None;
+    }
+    if use_counts
+        .get(*broadcast_output_id as usize)
+        .copied()
+        .unwrap_or_default()
+        != 1
+    {
+        return None;
+    }
+    if broadcast_dimensions.as_slice() != [0, 1, 3] {
+        return None;
+    }
+
+    let input_desc = plan.values.get(*input_id as usize)?;
+    let broadcast_desc = plan.values.get(*broadcast_output_id as usize)?;
+    let output_desc = plan.values.get(*reshape_output_id as usize)?;
+    if input_desc.element_type != broadcast_desc.element_type
+        || input_desc.element_type != output_desc.element_type
+    {
+        return None;
+    }
+    let input = &input_desc.dims;
+    let broadcast = &broadcast_desc.dims;
+    let output = &output_desc.dims;
+    if input.len() != 3 || broadcast.len() != 4 || output.len() != 3 {
+        return None;
+    }
+    if input[0] != broadcast[0]
+        || input[1] != broadcast[1]
+        || input[2] != broadcast[3]
+        || output[0] != input[0]
+        || output[2] != input[2]
+        || output[1] != input[1].checked_mul(broadcast[2])?
+    {
+        return None;
+    }
+
+    Some((*input_id, *broadcast_output_id, *reshape_output_id))
+}
+
+struct StackHeadsFusion {
+    input_ids: Vec<u32>,
+    output_id: u32,
+    op_count: usize,
+    flatten: bool,
+}
+
+fn stack_heads_fusion(
+    plan: &executable::Executable,
+    use_counts: &[usize],
+    op_index: usize,
+) -> Option<StackHeadsFusion> {
+    let mut input_ids = Vec::new();
+    let mut broadcast_output_ids = Vec::new();
+    let mut input_shape: Option<&[i64]> = None;
+    let mut element_type = None;
+    let mut index = op_index;
+
+    while let Some(executable::Op::BroadcastInDim {
+        input_id,
+        output_id,
+        broadcast_dimensions,
+    }) = plan.ops.get(index)
+    {
+        if broadcast_dimensions.as_slice() != [0, 2] {
+            break;
+        }
+        if use_counts
+            .get(*output_id as usize)
+            .copied()
+            .unwrap_or_default()
+            != 1
+        {
+            break;
+        }
+        let input_desc = plan.values.get(*input_id as usize)?;
+        let output_desc = plan.values.get(*output_id as usize)?;
+        if input_desc.element_type != output_desc.element_type
+            || input_desc.dims.len() != 2
+            || output_desc.dims.len() != 3
+            || output_desc.dims[0] != input_desc.dims[0]
+            || output_desc.dims[1] != 1
+            || output_desc.dims[2] != input_desc.dims[1]
+        {
+            break;
+        }
+        if let Some(shape) = input_shape {
+            if shape != input_desc.dims.as_slice() {
+                break;
+            }
+        } else {
+            input_shape = Some(input_desc.dims.as_slice());
+        }
+        if let Some(dtype) = element_type {
+            if dtype != input_desc.element_type {
+                break;
+            }
+        } else {
+            element_type = Some(input_desc.element_type);
+        }
+        input_ids.push(*input_id);
+        broadcast_output_ids.push(*output_id);
+        index += 1;
+    }
+
+    if input_ids.len() < 2 {
+        return None;
+    }
+    let executable::Op::Concatenate {
+        input_ids: concat_input_ids,
+        output_id: concat_output_id,
+        dimension,
+    } = plan.ops.get(index)?
+    else {
+        return None;
+    };
+    if *dimension != 1 || concat_input_ids.as_slice() != broadcast_output_ids.as_slice() {
+        return None;
+    }
+
+    let input_shape = input_shape?;
+    let concat_desc = plan.values.get(*concat_output_id as usize)?;
+    if concat_desc.dims != vec![input_shape[0], input_ids.len() as i64, input_shape[1]] {
+        return None;
+    }
+
+    if let Some(executable::Op::Reshape {
+        input_id,
+        output_id,
+    }) = plan.ops.get(index + 1)
+    {
+        if *input_id == *concat_output_id
+            && use_counts
+                .get(*concat_output_id as usize)
+                .copied()
+                .unwrap_or_default()
+                == 1
+        {
+            let reshape_desc = plan.values.get(*output_id as usize)?;
+            if reshape_desc.dims == vec![input_shape[0], input_ids.len() as i64 * input_shape[1]] {
+                let op_count = input_ids.len() + 2;
+                return Some(StackHeadsFusion {
+                    input_ids,
+                    output_id: *output_id,
+                    op_count,
+                    flatten: true,
+                });
+            }
+        }
+    }
+
+    Some(StackHeadsFusion {
+        input_ids,
+        output_id: *concat_output_id,
+        op_count: broadcast_output_ids.len() + 1,
+        flatten: false,
+    })
+}
+
+fn executable_value_use_counts(plan: &executable::Executable) -> Vec<usize> {
+    let mut counts = vec![0; plan.values.len()];
+    for op in &plan.ops {
+        match op {
+            executable::Op::Parameter { .. }
+            | executable::Op::Constant { .. }
+            | executable::Op::Iota { .. } => {}
+            executable::Op::Add { input_ids, .. }
+            | executable::Op::Subtract { input_ids, .. }
+            | executable::Op::Multiply { input_ids, .. }
+            | executable::Op::Divide { input_ids, .. }
+            | executable::Op::Power { input_ids, .. }
+            | executable::Op::Max { input_ids, .. }
+            | executable::Op::Compare { input_ids, .. }
+            | executable::Op::Matmul { input_ids, .. }
+            | executable::Op::Gather { input_ids, .. } => {
+                for &value_id in input_ids {
+                    increment_value_use(&mut counts, value_id);
+                }
+            }
+            executable::Op::Concatenate { input_ids, .. }
+            | executable::Op::CustomCall { input_ids, .. } => {
+                for &value_id in input_ids {
+                    increment_value_use(&mut counts, value_id);
+                }
+            }
+            executable::Op::Cosine { input_id, .. }
+            | executable::Op::Sine { input_id, .. }
+            | executable::Op::Rsqrt { input_id, .. }
+            | executable::Op::Reshape { input_id, .. }
+            | executable::Op::Slice { input_id, .. }
+            | executable::Op::Negate { input_id, .. }
+            | executable::Op::Exponential { input_id, .. }
+            | executable::Op::Transpose { input_id, .. }
+            | executable::Op::Convert { input_id, .. }
+            | executable::Op::BroadcastInDim { input_id, .. } => {
+                increment_value_use(&mut counts, *input_id);
+            }
+            executable::Op::Reduce {
+                input_ids,
+                init_value_ids,
+                ..
+            } => {
+                for &value_id in input_ids {
+                    increment_value_use(&mut counts, value_id);
+                }
+                for &value_id in init_value_ids {
+                    increment_value_use(&mut counts, value_id);
+                }
+            }
+            executable::Op::Select { input_ids, .. } => {
+                for &value_id in input_ids {
+                    increment_value_use(&mut counts, value_id);
+                }
+            }
+        }
+    }
+    counts
+}
+
+fn increment_value_use(counts: &mut [usize], value_id: u32) {
+    if let Some(count) = counts.get_mut(value_id as usize) {
+        *count += 1;
+    }
+}
+
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
@@ -2407,8 +3034,92 @@ fn execute_executable_v1(
         local_hardware_id: target_local_hardware_id,
     };
     let device = &mut target_device.runtime;
+    let use_counts = executable_value_use_counts(plan);
 
-    for op in &plan.ops {
+    let mut op_index = 0;
+    while op_index < plan.ops.len() {
+        if let Some((
+            slice_input_id,
+            slice_output_id,
+            reshape_output_id,
+            transpose_output_id,
+            start_indices,
+            limit_indices,
+            strides,
+        )) = slice_reshape_transpose_fusion(plan, &use_counts, op_index)
+        {
+            execute_slice_reshape_transpose(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                slice_input_id,
+                slice_output_id,
+                reshape_output_id,
+                transpose_output_id,
+                start_indices,
+                limit_indices,
+                strides,
+            )?;
+            op_index += 3;
+            continue;
+        }
+
+        if let Some(fusion) = stack_heads_fusion(plan, &use_counts, op_index) {
+            execute_stack_heads(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                &fusion.input_ids,
+                fusion.output_id,
+                fusion.flatten,
+            )?;
+            op_index += fusion.op_count;
+            continue;
+        }
+
+        if let Some((input_id, _broadcast_output_id, output_id)) =
+            repeat_heads_fusion(plan, &use_counts, op_index)
+        {
+            execute_repeat_heads(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_id,
+                output_id,
+            )?;
+            op_index += 2;
+            continue;
+        }
+
+        if let Some((
+            slice_input_id,
+            slice_output_id,
+            reshape_output_id,
+            start_indices,
+            limit_indices,
+            strides,
+        )) = slice_reshape_fusion(plan, &use_counts, op_index)
+        {
+            execute_slice_reshape(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                slice_input_id,
+                slice_output_id,
+                reshape_output_id,
+                start_indices,
+                limit_indices,
+                strides,
+            )?;
+            op_index += 2;
+            continue;
+        }
+
+        let op = &plan.ops[op_index];
         match op {
             executable::Op::Parameter {
                 parameter_index,
@@ -2851,6 +3562,7 @@ fn execute_executable_v1(
                 *iota_dimension,
             )?,
         }
+        op_index += 1;
     }
 
     let output = device_buffer_for_value(&values, plan.output_ids[0], "output")?;
