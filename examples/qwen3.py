@@ -10,6 +10,8 @@ import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
 
 try:
     jax.config.update("jax_use_shardy_partitioner", False)
@@ -137,44 +139,30 @@ def make_random_config(args) -> Qwen3Config:
 
 def load_hf_config(model_dir: Path, max_seq_len: int | None) -> Qwen3Config:
     config_path = model_dir / "config.json"
-    if not config_path.exists():
-        raise SystemExit(f"missing config.json in {model_dir}")
-
     with config_path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    model_type = raw.get("model_type")
-    if model_type not in (None, "qwen3"):
-        raise SystemExit(f"expected a Qwen3 config, got model_type={model_type!r}")
-    if raw.get("attention_bias", False):
-        raise SystemExit("attention_bias=True checkpoints are not supported by this example")
-    if raw.get("rope_scaling") not in (None, {}):
-        raise SystemExit("rope_scaling checkpoints are not supported by this example")
+    eos_token_id = raw.get("eos_token_id")
+    if isinstance(eos_token_id, list):
+        eos_token_id = tuple(int(token) for token in eos_token_id)
+    elif eos_token_id is not None:
+        eos_token_id = int(eos_token_id)
 
-    try:
-        eos_token_id = raw.get("eos_token_id")
-        if isinstance(eos_token_id, list):
-            eos_token_id = tuple(int(token) for token in eos_token_id)
-        elif eos_token_id is not None:
-            eos_token_id = int(eos_token_id)
-
-        config = Qwen3Config(
-            vocab_size=int(raw["vocab_size"]),
-            hidden_size=int(raw["hidden_size"]),
-            intermediate_size=int(raw["intermediate_size"]),
-            num_hidden_layers=int(raw["num_hidden_layers"]),
-            num_attention_heads=int(raw["num_attention_heads"]),
-            num_key_value_heads=int(raw["num_key_value_heads"]),
-            head_dim=int(raw["head_dim"]),
-            max_position_embeddings=int(raw["max_position_embeddings"]),
-            rope_theta=float(raw.get("rope_theta", 1000000.0)),
-            rms_norm_eps=float(raw.get("rms_norm_eps", 1e-6)),
-            initializer_range=float(raw.get("initializer_range", 0.02)),
-            tie_word_embeddings=bool(raw.get("tie_word_embeddings", False)),
-            eos_token_id=eos_token_id,
-        )
-    except KeyError as err:
-        raise SystemExit(f"config.json is missing required key {err.args[0]!r}") from err
+    config = Qwen3Config(
+        vocab_size=int(raw["vocab_size"]),
+        hidden_size=int(raw["hidden_size"]),
+        intermediate_size=int(raw["intermediate_size"]),
+        num_hidden_layers=int(raw["num_hidden_layers"]),
+        num_attention_heads=int(raw["num_attention_heads"]),
+        num_key_value_heads=int(raw["num_key_value_heads"]),
+        head_dim=int(raw["head_dim"]),
+        max_position_embeddings=int(raw["max_position_embeddings"]),
+        rope_theta=float(raw.get("rope_theta", 1000000.0)),
+        rms_norm_eps=float(raw.get("rms_norm_eps", 1e-6)),
+        initializer_range=float(raw.get("initializer_range", 0.02)),
+        tie_word_embeddings=bool(raw.get("tie_word_embeddings", False)),
+        eos_token_id=eos_token_id,
+    )
 
     if max_seq_len is not None:
         config = replace(config, max_position_embeddings=max_seq_len)
@@ -185,15 +173,6 @@ def resolve_model_dir(args) -> Path:
     model_path = Path(args.model).expanduser()
     if model_path.exists():
         return model_path
-
-    try:
-        from huggingface_hub import snapshot_download
-    except ModuleNotFoundError as err:
-        raise SystemExit(
-            "missing Python dependency 'huggingface-hub'. Install the example dependencies, "
-            "for example: python3 -m pip install jax ml-dtypes transformers "
-            "huggingface-hub safetensors torch"
-        ) from err
 
     allow_patterns = [
         "config.json",
@@ -221,15 +200,6 @@ def resolve_model_dir(args) -> Path:
 
 
 def load_hf_tokenizer(model_dir: Path) -> HuggingFaceTokenizer:
-    try:
-        from transformers import AutoTokenizer
-    except ModuleNotFoundError as err:
-        raise SystemExit(
-            "missing Python dependency 'transformers'. Install the example dependencies, "
-            "for example: python3 -m pip install jax ml-dtypes transformers "
-            "huggingface-hub safetensors torch"
-        ) from err
-
     return HuggingFaceTokenizer(
         AutoTokenizer.from_pretrained(
             model_dir,
