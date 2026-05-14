@@ -6,11 +6,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import jax
+import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 
-jax = None
-jnp = None
-ml_dtypes = None
+try:
+    jax.config.update("jax_use_shardy_partitioner", False)
+except Exception:
+    pass
 
 
 @dataclass(frozen=True)
@@ -111,41 +115,6 @@ def parse_args():
     parser.add_argument("--max-seq-len", type=int)
     parser.add_argument("--dtype", choices=("bf16", "f32"), default="bf16")
     return parser.parse_args()
-
-
-def require_runtime():
-    global jax, jnp, ml_dtypes
-    if jax is not None:
-        return
-
-    try:
-        import jax as imported_jax
-    except ModuleNotFoundError as err:
-        raise SystemExit(
-            "missing Python dependency 'jax'. Install the example dependencies, "
-            "for example: python3 -m pip install jax ml-dtypes transformers "
-            "huggingface-hub safetensors torch"
-        ) from err
-
-    try:
-        imported_jax.config.update("jax_use_shardy_partitioner", False)
-    except Exception:
-        pass
-
-    import jax.numpy as imported_jnp
-
-    try:
-        import ml_dtypes as imported_ml_dtypes
-    except ModuleNotFoundError as err:
-        raise SystemExit(
-            "missing Python dependency 'ml-dtypes'. Install the example dependencies, "
-            "for example: python3 -m pip install jax ml-dtypes transformers "
-            "huggingface-hub safetensors torch"
-        ) from err
-
-    jax = imported_jax
-    jnp = imported_jnp
-    ml_dtypes = imported_ml_dtypes
 
 
 def make_random_config(args) -> Qwen3Config:
@@ -719,8 +688,6 @@ def main():
         raise SystemExit("--max-seq-len must be positive")
     if args.temperature < 0:
         raise SystemExit("--temperature must be non-negative")
-
-    require_runtime()
 
     np_dtype = ml_dtypes.bfloat16 if args.dtype == "bf16" else np.float32
 
