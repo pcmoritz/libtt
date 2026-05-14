@@ -437,11 +437,13 @@ fn plan_direct_matmul(
                         }
                         let padding = mt * nt - mt_base * nt_base;
                         let bias = out_tiles.min(16);
+                        // Direct plans do not amortize narrow output blocks with multicast.
+                        // Prefer wider subblocks even if that leaves a few cores idle.
                         let score = (
+                            out_subblock_num_tiles,
                             active_cores * in0_block_w * bias * bias,
                             usize::MAX - padding,
                             active_cores * in0_block_w,
-                            out_subblock_num_tiles,
                             active_cores,
                         );
                         if best_score.map_or(true, |current| score > current) {
@@ -894,21 +896,23 @@ mod tests {
         let plan = plan_matmul(32, 1024, 151936, &p100_worker_cores()).expect("plan");
         let grid = plan.direct_grid.as_ref().expect("direct plan");
         assert_eq!(grid.len(), 1);
-        assert_eq!(grid[0].len(), 118);
+        assert_eq!(grid[0].len(), 101);
         assert_eq!(plan.mt, 1);
         assert_eq!(plan.kt, 32);
         assert_eq!(plan.per_core_m, 1);
-        assert_eq!(plan.per_core_n, 41);
+        assert_eq!(plan.per_core_n, 48);
+        assert_eq!(plan.out_subblock_w, 8);
     }
 
     #[test]
     fn plan_matmul_direct_grid_is_not_limited_to_single_m_tile() {
         let plan = plan_matmul(64, 1024, 151936, &p100_worker_cores()).expect("plan");
         let grid = plan.direct_grid.as_ref().expect("direct plan");
-        assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 118);
+        assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 110);
         assert_eq!(plan.mt, 2);
         assert_eq!(plan.kt, 32);
         assert_eq!(plan.per_core_m * grid.len(), plan.mt);
+        assert_eq!(plan.out_subblock_h * plan.out_subblock_w, 8);
     }
 
     #[test]
