@@ -4175,6 +4175,69 @@ mod tests {
         }
     }
 
+    #[cfg(libtt_mlir_frontend)]
+    fn analyze_mlir(code: &str) -> executable::Analysis {
+        let format = b"mlir";
+        let analysis = mlir_frontend::AnalysisHandle::analyze(
+            format.as_ptr().cast::<c_char>(),
+            format.len(),
+            code.as_ptr().cast::<c_char>(),
+            code.len(),
+        )
+        .expect("MLIR analysis should return a result");
+        executable::parse_analysis(analysis.bytes()).expect("analysis result should parse")
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    fn assert_not_lowered_to_argmax(name: &str, code: &str) {
+        let analysis = analyze_mlir(code);
+        match analysis.status {
+            MlirAnalysisStatus::Ok => {
+                let executable = analysis
+                    .executable
+                    .as_ref()
+                    .expect("successful analysis should include an executable");
+                assert!(
+                    !executable
+                        .ops
+                        .iter()
+                        .any(|op| matches!(op, executable::Op::ArgMax { .. })),
+                    "{name} should not lower to ArgMax"
+                );
+            }
+            MlirAnalysisStatus::Unsupported => {}
+            other => panic!("{name} failed with unexpected analysis status {other:?}"),
+        }
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    fn argmax_reduce_mlir(value_init: &str, value_compare: &str) -> String {
+        r#"module {
+  func.func public @main(%arg0: tensor<64xbf16>) -> tensor<i32> {
+    %0 = stablehlo.iota dim = 0 : tensor<64xi32>
+    %cst = stablehlo.constant dense<__VALUE_INIT__> : tensor<bf16>
+    %c = stablehlo.constant dense<0> : tensor<i32>
+    %1:2 = stablehlo.reduce(%arg0 init: %cst), (%0 init: %c) across dimensions = [0] : (tensor<64xbf16>, tensor<64xi32>, tensor<bf16>, tensor<i32>) -> (tensor<bf16>, tensor<i32>)
+     reducer(%arg1: tensor<bf16>, %arg3: tensor<bf16>) (%arg2: tensor<i32>, %arg4: tensor<i32>)  {
+      %2 = stablehlo.compare __VALUE_COMPARE__, %arg1, %arg3, FLOAT : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
+      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
+      %4 = stablehlo.or %2, %3 : tensor<i1>
+      %5 = stablehlo.compare EQ, %arg1, %arg3, FLOAT : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
+      %6 = stablehlo.compare LT, %arg2, %arg4, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+      %7 = stablehlo.and %5, %6 : tensor<i1>
+      %8 = stablehlo.or %4, %7 : tensor<i1>
+      %9 = stablehlo.select %4, %arg1, %arg3 : tensor<i1>, tensor<bf16>
+      %10 = stablehlo.select %8, %arg2, %arg4 : tensor<i1>, tensor<i32>
+      stablehlo.return %9, %10 : tensor<bf16>, tensor<i32>
+    }
+    return %1#1 : tensor<i32>
+  }
+}
+"#
+        .replace("__VALUE_INIT__", value_init)
+        .replace("__VALUE_COMPARE__", value_compare)
+    }
+
     #[test]
     fn tiled_allocation_shape_pads_scalar_and_vector_buffers() {
         assert_eq!(
@@ -4908,46 +4971,37 @@ mod tests {
     #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_jax_argmax_reduce() {
-        with_compiled_mlir_executable(
-            r#"module {
-  func.func public @main(%arg0: tensor<64xbf16>) -> tensor<i32> {
-    %0 = stablehlo.iota dim = 0 : tensor<64xi32>
-    %cst = stablehlo.constant dense<0xFF80> : tensor<bf16>
-    %c = stablehlo.constant dense<0> : tensor<i32>
-    %1:2 = stablehlo.reduce(%arg0 init: %cst), (%0 init: %c) across dimensions = [0] : (tensor<64xbf16>, tensor<64xi32>, tensor<bf16>, tensor<i32>) -> (tensor<bf16>, tensor<i32>)
-     reducer(%arg1: tensor<bf16>, %arg3: tensor<bf16>) (%arg2: tensor<i32>, %arg4: tensor<i32>)  {
-      %2 = stablehlo.compare GT, %arg1, %arg3, FLOAT : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
-      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
-      %4 = stablehlo.or %2, %3 : tensor<i1>
-      %5 = stablehlo.compare EQ, %arg1, %arg3, FLOAT : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
-      %6 = stablehlo.compare LT, %arg2, %arg4, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
-      %7 = stablehlo.and %5, %6 : tensor<i1>
-      %8 = stablehlo.or %4, %7 : tensor<i1>
-      %9 = stablehlo.select %4, %arg1, %arg3 : tensor<i1>, tensor<bf16>
-      %10 = stablehlo.select %8, %arg2, %arg4 : tensor<i1>, tensor<i32>
-      stablehlo.return %9, %10 : tensor<bf16>, tensor<i32>
+        let code = argmax_reduce_mlir("0xFF80", "GT");
+        with_compiled_mlir_executable(&code, |executable| {
+            assert_eq!(executable.output_ids.len(), 1);
+            assert!(
+                executable
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, executable::Op::ArgMax { .. })),
+                "argmax reduce should lower to ArgMax"
+            );
+            assert!(
+                !executable
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, executable::Op::Iota { .. })),
+                "iota feeding argmax should be folded into ArgMax"
+            );
+        });
     }
-    return %1#1 : tensor<i32>
-  }
-}
-"#,
-            |executable| {
-                assert_eq!(executable.output_ids.len(), 1);
-                assert!(
-                    executable
-                        .ops
-                        .iter()
-                        .any(|op| matches!(op, executable::Op::ArgMax { .. })),
-                    "argmax reduce should lower to ArgMax"
-                );
-                assert!(
-                    !executable
-                        .ops
-                        .iter()
-                        .any(|op| matches!(op, executable::Op::Iota { .. })),
-                    "iota feeding argmax should be folded into ArgMax"
-                );
-            },
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_does_not_lower_non_argmax_reducers_to_argmax() {
+        assert_not_lowered_to_argmax(
+            "argmax-shaped reduce with zero value init",
+            &argmax_reduce_mlir("0x0000", "GT"),
+        );
+
+        assert_not_lowered_to_argmax(
+            "argmin-like value comparison",
+            &argmax_reduce_mlir("0xFF80", "LT"),
         );
     }
 
