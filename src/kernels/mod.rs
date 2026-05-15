@@ -1,3 +1,4 @@
+pub(crate) mod argmax;
 pub(crate) mod binary_eltwise;
 pub(crate) mod broadcast;
 pub(crate) mod concatenate;
@@ -9,5 +10,6 @@ pub(crate) mod reduce;
 pub(crate) mod reshape;
 pub(crate) mod select;
 pub(crate) mod slice;
+pub(crate) mod topk;
 pub(crate) mod transpose;
 pub(crate) mod unary_eltwise;

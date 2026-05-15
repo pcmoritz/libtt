@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
@@ -309,6 +310,83 @@ std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
     return std::nullopt;
 }
 
+struct ArgMaxReduceMatch {
+    mlir::Value operand;
+    mlir::stablehlo::IotaOp iota;
+    llvm::SmallVector<int64_t, 1> dimensions;
+};
+
+bool isZeroIntegerSplat(mlir::Value value) {
+    std::string ignored_error;
+    auto packed_value = packedConstantValue(value, ignored_error);
+    return packed_value && *packed_value == 0;
+}
+
+bool isJaxArgMaxBody(mlir::stablehlo::ReduceOp reduce_op) {
+    auto& body = reduce_op.getBody();
+    if (body.empty() || body.getBlocks().size() != 1) {
+        return false;
+    }
+    auto& block = body.front();
+    if (block.getNumArguments() != 4) {
+        return false;
+    }
+
+    auto return_op = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
+    if (!return_op || return_op.getNumOperands() != 2) {
+        return false;
+    }
+    return return_op.getOperand(0).getDefiningOp<mlir::stablehlo::SelectOp>() &&
+           return_op.getOperand(1).getDefiningOp<mlir::stablehlo::SelectOp>();
+}
+
+std::optional<ArgMaxReduceMatch> matchArgMaxReduce(mlir::stablehlo::ReduceOp reduce_op) {
+    if (reduce_op.getInputs().size() != 2 ||
+        reduce_op.getInitValues().size() != 2 ||
+        reduce_op->getNumResults() != 2 ||
+        !reduce_op->getResult(0).use_empty()) {
+        return std::nullopt;
+    }
+
+    auto dimensions = llvm::SmallVector<int64_t, 1>();
+    for (int64_t dim : reduce_op.getDimensions()) {
+        dimensions.push_back(dim);
+    }
+    if (dimensions.size() != 1) {
+        return std::nullopt;
+    }
+
+    auto iota_op = reduce_op.getInputs()[1].getDefiningOp<mlir::stablehlo::IotaOp>();
+    if (!iota_op || !iota_op.getResult().hasOneUse() ||
+        static_cast<int64_t>(iota_op.getIotaDimension()) != dimensions[0]) {
+        return std::nullopt;
+    }
+    if (!isZeroIntegerSplat(reduce_op.getInitValues()[1]) || !isJaxArgMaxBody(reduce_op)) {
+        return std::nullopt;
+    }
+
+    auto index_type = mlir::dyn_cast<mlir::RankedTensorType>(reduce_op->getResult(1).getType());
+    if (!index_type || !index_type.getElementType().isInteger(32)) {
+        return std::nullopt;
+    }
+
+    return ArgMaxReduceMatch{
+        reduce_op.getInputs()[0],
+        iota_op,
+        dimensions,
+    };
+}
+
+llvm::DenseSet<mlir::Operation*> findArgMaxIotas(FuncOp func) {
+    llvm::DenseSet<mlir::Operation*> iotas;
+    func.walk([&](mlir::stablehlo::ReduceOp reduce_op) {
+        if (auto match = matchArgMaxReduce(reduce_op)) {
+            iotas.insert(match->iota.getOperation());
+        }
+    });
+    return iotas;
+}
+
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -320,6 +398,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     }
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
+    llvm::DenseSet<mlir::Operation*> argmax_iotas = findArgMaxIotas(func);
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
         uint32_t output_id = 0;
@@ -333,15 +412,13 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
 
     for (mlir::Operation& op : func.front()) {
         if (auto return_op = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
-            if (return_op.getNumOperands() != 1) {
-                error = "only single-result functions are currently supported";
-                return false;
+            for (mlir::Value operand : return_op.getOperands()) {
+                uint32_t output_id = 0;
+                if (!addValueDesc(operand, executable, value_ids, error, output_id)) {
+                    return false;
+                }
+                executable.add_output_ids(output_id);
             }
-            uint32_t output_id = 0;
-            if (!addValueDesc(return_op.getOperand(0), executable, value_ids, error, output_id)) {
-                return false;
-            }
-            executable.add_output_ids(output_id);
             continue;
         }
 
@@ -422,6 +499,54 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             select->mutable_select()->set_pred_id(pred_id);
             select->mutable_select()->set_on_true_id(on_true_id);
             select->mutable_select()->set_on_false_id(on_false_id);
+            continue;
+        }
+
+        if (auto top_k_op = mlir::dyn_cast<mlir::chlo::TopKOp>(op)) {
+            uint32_t input_id = 0;
+            uint32_t values_id = 0;
+            uint32_t indices_id = 0;
+            if (!addValueDesc(top_k_op.getOperand(), executable, value_ids, error, input_id) ||
+                !addValueDesc(top_k_op.getValues(), executable, value_ids, error, values_id) ||
+                !addValueDesc(top_k_op.getIndices(), executable, value_ids, error, indices_id)) {
+                return false;
+            }
+
+            auto* top_k = executable.add_ops();
+            top_k->set_output_id(values_id);
+            top_k->mutable_top_k()->set_operand_id(input_id);
+            top_k->mutable_top_k()->set_indices_id(indices_id);
+            top_k->mutable_top_k()->set_k(top_k_op.getK());
+            continue;
+        }
+
+        if (auto composite_op = mlir::dyn_cast<mlir::stablehlo::CompositeOp>(op);
+            composite_op && composite_op.getName().ends_with("top_k")) {
+            if (composite_op.getInputs().size() != 1 || composite_op->getNumResults() != 2) {
+                error = "top_k composite must have one input and two results";
+                return false;
+            }
+            auto attrs = composite_op.getCompositeAttributes();
+            auto k_attr = attrs ? mlir::dyn_cast_or_null<mlir::IntegerAttr>(attrs.get("k")) : nullptr;
+            if (!k_attr) {
+                error = "top_k composite is missing integer attribute k";
+                return false;
+            }
+
+            uint32_t input_id = 0;
+            uint32_t values_id = 0;
+            uint32_t indices_id = 0;
+            if (!addValueDesc(*composite_op.getInputs().begin(), executable, value_ids, error, input_id) ||
+                !addValueDesc(composite_op->getResult(0), executable, value_ids, error, values_id) ||
+                !addValueDesc(composite_op->getResult(1), executable, value_ids, error, indices_id)) {
+                return false;
+            }
+
+            auto* top_k = executable.add_ops();
+            top_k->set_output_id(values_id);
+            top_k->mutable_top_k()->set_operand_id(input_id);
+            top_k->mutable_top_k()->set_indices_id(indices_id);
+            top_k->mutable_top_k()->set_k(static_cast<uint32_t>(k_attr.getInt()));
             continue;
         }
 
@@ -695,6 +820,23 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto reduce_op = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(op)) {
+            if (auto argmax = matchArgMaxReduce(reduce_op)) {
+                uint32_t input_id = 0;
+                uint32_t output_id = 0;
+                if (!addValueDesc(argmax->operand, executable, value_ids, error, input_id) ||
+                    !addValueDesc(reduce_op->getResult(1), executable, value_ids, error, output_id)) {
+                    return false;
+                }
+
+                auto* argmax_op = executable.add_ops();
+                argmax_op->set_output_id(output_id);
+                argmax_op->mutable_argmax()->set_operand_id(input_id);
+                for (int64_t dim : argmax->dimensions) {
+                    argmax_op->mutable_argmax()->add_dimensions(dim);
+                }
+                continue;
+            }
+
             auto reducer = mapReduceReducer(reduce_op, error);
             if (!reducer) {
                 return false;
@@ -738,6 +880,9 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto iota_op = mlir::dyn_cast<mlir::stablehlo::IotaOp>(op)) {
+            if (argmax_iotas.contains(iota_op.getOperation())) {
+                continue;
+            }
             uint32_t output_id = 0;
             if (!addValueDesc(iota_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
@@ -821,8 +966,8 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         return false;
     }
 
-    if (executable.output_ids_size() != 1) {
-        error = "entry function must return exactly one value";
+    if (executable.output_ids_size() == 0) {
+        error = "entry function must return at least one value";
         return false;
     }
 

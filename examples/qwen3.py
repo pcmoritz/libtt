@@ -481,19 +481,45 @@ def sample_next_token(logits, rng: np.random.Generator, temperature: float, top_
     return int(rng.choice(np.arange(logits.size), p=probs))
 
 
+def sample_from_candidates(
+    candidates, candidate_logits, rng: np.random.Generator, temperature: float
+) -> int:
+    candidates = np.asarray(candidates, dtype=np.int32)
+    candidate_logits = np.asarray(candidate_logits, dtype=np.float32) / temperature
+    probs = np.exp(candidate_logits - np.max(candidate_logits))
+    probs = probs / np.sum(probs)
+    return int(rng.choice(candidates, p=probs))
+
+
 def count_parameters(weights) -> int:
     leaves = jax.tree_util.tree_leaves(weights)
     return sum(value.size for value in leaves)
 
 
-def make_forward(config, device):
-    return jax.jit(
+def make_decode_step(config, device, args):
+    if args.temperature <= 0:
+        return "argmax", jax.jit(
+            lambda model_weights, ids: jnp.argmax(
+                qwen3_forward(config, model_weights, ids)[-1], axis=-1
+            ).astype(jnp.int32),
+            device=device,
+        )
+
+    if 0 < args.top_k <= 32 and args.top_k < config.vocab_size:
+        return "top_k", jax.jit(
+            lambda model_weights, ids: jax.lax.top_k(
+                qwen3_forward(config, model_weights, ids)[-1], args.top_k
+            ),
+            device=device,
+        )
+
+    return "logits", jax.jit(
         lambda model_weights, ids: qwen3_forward(config, model_weights, ids)[-1],
         device=device,
     )
 
 
-def generate(config, weights, device, input_ids, args, forward):
+def generate(config, weights, device, input_ids, args, decode_kind, decode_step):
     rng = np.random.default_rng(args.seed + 1)
     tokens = input_ids.astype(np.int32).copy()
     eos_token_ids = config.eos_token_id
@@ -502,8 +528,16 @@ def generate(config, weights, device, input_ids, args, forward):
 
     for _ in range(args.max_new_tokens):
         ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
-        logits = np.asarray(forward(weights, ids))
-        next_token = sample_next_token(logits, rng, args.temperature, args.top_k)
+        if decode_kind == "argmax":
+            next_token = int(np.asarray(decode_step(weights, ids)).item())
+        elif decode_kind == "top_k":
+            candidate_logits, candidates = decode_step(weights, ids)
+            next_token = sample_from_candidates(
+                candidates, candidate_logits, rng, args.temperature
+            )
+        else:
+            logits = np.asarray(decode_step(weights, ids))
+            next_token = sample_next_token(logits, rng, args.temperature, args.top_k)
         tokens = np.append(tokens, np.int32(next_token))
         if eos_token_ids is not None and next_token in eos_token_ids:
             break
@@ -512,9 +546,9 @@ def generate(config, weights, device, input_ids, args, forward):
     return tokens
 
 
-def timed_generate(config, weights, device, input_ids, args, forward):
+def timed_generate(config, weights, device, input_ids, args, decode_kind, decode_step):
     start = time.perf_counter()
-    output_ids = generate(config, weights, device, input_ids, args, forward)
+    output_ids = generate(config, weights, device, input_ids, args, decode_kind, decode_step)
     return output_ids, time.perf_counter() - start
 
 
@@ -545,12 +579,16 @@ def main():
 
     device = select_device(args.backend)
     weights = jax.device_put(weights_host, device)
-    forward = make_forward(config, device)
+    decode_kind, decode_step = make_decode_step(config, device, args)
     if args.warmup:
-        _, warmup_seconds = timed_generate(config, weights, device, input_ids, args, forward)
+        _, warmup_seconds = timed_generate(
+            config, weights, device, input_ids, args, decode_kind, decode_step
+        )
     else:
         warmup_seconds = 0.0
-    output_ids, run_seconds = timed_generate(config, weights, device, input_ids, args, forward)
+    output_ids, run_seconds = timed_generate(
+        config, weights, device, input_ids, args, decode_kind, decode_step
+    )
 
     print(f"device: {device}")
     if not args.random_weights:

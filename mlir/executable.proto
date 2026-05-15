@@ -208,6 +208,19 @@ message IotaOp {
   uint64 iota_dimension = 1;
 }
 
+message ArgMaxOp {
+  // Index into Executable.values for this op's operand.
+  uint32 operand_id = 1;
+  repeated int64 dimensions = 2;
+}
+
+message TopKOp {
+  // Op.output_id is the values result. indices_id is the integer index result.
+  uint32 operand_id = 1;
+  uint32 indices_id = 2;
+  uint32 k = 3;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -239,6 +252,8 @@ message Op {
     ExponentialOp exponential = 25;
     TransposeOp transpose = 26;
     CustomCallOp custom_call = 27;
+    ArgMaxOp argmax = 28;
+    TopKOp top_k = 29;
   }
 }
 

@@ -158,6 +158,17 @@ pub(crate) enum Op {
         output_id: u32,
         iota_dimension: u64,
     },
+    ArgMax {
+        input_id: u32,
+        output_id: u32,
+        dimensions: Vec<i64>,
+    },
+    TopK {
+        input_id: u32,
+        values_id: u32,
+        indices_id: u32,
+        k: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -411,16 +422,20 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     output_id: op_desc.output_id,
                     iota_dimension: iota.iota_dimension,
                 }),
+                Kind::Argmax(argmax) => Ok(Op::ArgMax {
+                    input_id: argmax.operand_id,
+                    output_id: op_desc.output_id,
+                    dimensions: argmax.dimensions,
+                }),
+                Kind::TopK(top_k) => Ok(Op::TopK {
+                    input_id: top_k.operand_id,
+                    values_id: op_desc.output_id,
+                    indices_id: top_k.indices_id,
+                    k: top_k.k,
+                }),
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
-
-    if executable.output_ids.len() != 1 {
-        return Err(format!(
-            "TT executable must contain exactly one output, got {}",
-            executable.output_ids.len()
-        ));
-    }
 
     Ok(Executable {
         values,
@@ -593,5 +608,16 @@ pub(crate) enum Op {
     Iota {
         output_id: u32,
         iota_dimension: u64,
+    },
+    ArgMax {
+        input_id: u32,
+        output_id: u32,
+        dimensions: Vec<i64>,
+    },
+    TopK {
+        input_id: u32,
+        values_id: u32,
+        indices_id: u32,
+        k: u32,
     },
 }

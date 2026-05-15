@@ -677,20 +677,9 @@ fn executable_metadata_from_program(
                     });
                 }
 
-                if analysis.outputs.len() != 1 {
-                    return Err(unimplemented(format!(
-                        "TT executable must contain exactly one output, got {}",
-                        analysis.outputs.len()
-                    )));
-                }
-                let output = analysis
-                    .outputs
-                    .first()
-                    .expect("analysis output length was checked");
                 return Ok(make_executable_metadata(
                     EXECUTABLE_NAME,
-                    output.dims.clone(),
-                    output.element_type,
+                    &analysis.outputs,
                     analysis.executable,
                 ));
             }
@@ -706,11 +695,12 @@ fn executable_metadata_from_program(
 #[cfg(libtt_mlir_frontend)]
 fn make_executable_metadata(
     name: &str,
-    dims: Vec<i64>,
-    output_type: PJRT_Buffer_Type,
+    outputs: &[executable::ValueDesc],
     executable: Option<executable::Executable>,
 ) -> ExecutableMetadata {
-    let output_memory_kinds = vec![cstring_lossy("dram")];
+    let output_memory_kinds = (0..outputs.len())
+        .map(|_| cstring_lossy("dram"))
+        .collect::<Vec<_>>();
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
         .map(|kind| kind.as_ptr())
@@ -719,14 +709,25 @@ fn make_executable_metadata(
         .iter()
         .map(|kind| kind.as_bytes().len())
         .collect::<Vec<_>>();
-    let output_dim_sizes = vec![dims.len()];
-    let fingerprint = executable_fingerprint_string(name, &dims, output_type);
+    let output_types = outputs
+        .iter()
+        .map(|output| output.element_type)
+        .collect::<Vec<_>>();
+    let output_dim_sizes = outputs
+        .iter()
+        .map(|output| output.dims.len())
+        .collect::<Vec<_>>();
+    let output_dims = outputs
+        .iter()
+        .flat_map(|output| output.dims.iter().copied())
+        .collect::<Vec<_>>();
+    let fingerprint = executable_fingerprint_string(name, outputs);
     ExecutableMetadata {
         name: cstring_lossy(name),
         fingerprint,
-        num_outputs: 1,
-        output_types: vec![output_type],
-        output_dims: dims,
+        num_outputs: outputs.len(),
+        output_types,
+        output_dims,
         output_dim_sizes,
         _output_memory_kinds: output_memory_kinds,
         output_memory_kind_ptrs,
@@ -757,19 +758,22 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
 }
 
 #[cfg(libtt_mlir_frontend)]
-fn executable_fingerprint_string(
-    name: &str,
-    dims: &[i64],
-    output_type: PJRT_Buffer_Type,
-) -> CString {
-    let dims = dims
+fn executable_fingerprint_string(name: &str, outputs: &[executable::ValueDesc]) -> CString {
+    let outputs = outputs
         .iter()
-        .map(i64::to_string)
+        .map(|output| {
+            let dims = output
+                .dims
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join("x");
+            format!("{}:{}", output.element_type as u32, dims)
+        })
         .collect::<Vec<_>>()
-        .join("x");
+        .join(",");
     cstring_lossy(&format!(
-        "tt:executable_v1:name={name}:dims={dims}:type={}:v1",
-        output_type as u32
+        "tt:executable_v1:name={name}:outputs={outputs}:v1"
     ))
 }
 
@@ -1962,6 +1966,131 @@ fn execute_reduce(
     )
 }
 
+fn execute_argmax(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_id: u32,
+    output_id: u32,
+    dimensions: &[i64],
+) -> Result<(), *mut PJRT_Error> {
+    let input = device_buffer_for_value(values, input_id, "argmax.input")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable argmax input buffer has no device allocation",
+        ));
+    };
+    let input_desc = plan
+        .values
+        .get(input_id as usize)
+        .ok_or_else(|| invalid_argument("TT executable argmax input id is out of bounds"))?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable argmax output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
+        return Err(invalid_argument(format!(
+            "TT executable argmax output must be S32, got {:?}",
+            output_desc.element_type
+        )));
+    }
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    if !output_shape.is_empty() {
+        return Err(unimplemented(format!(
+            "TT executable argmax currently supports scalar outputs, got {:?}",
+            output_desc.dims
+        )));
+    }
+    let output_dram =
+        kernels::argmax::argmax(device, input_dram, &input_shape, dimensions, "pjrt_argmax")
+            .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "argmax",
+    )
+}
+
+fn execute_top_k(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_id: u32,
+    values_id: u32,
+    indices_id: u32,
+    k: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let input = device_buffer_for_value(values, input_id, "top_k.input")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable top_k input buffer has no device allocation",
+        ));
+    };
+    let input_desc = plan
+        .values
+        .get(input_id as usize)
+        .ok_or_else(|| invalid_argument("TT executable top_k input id is out of bounds"))?;
+    let values_desc = plan.values.get(values_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable top_k values id {values_id} is out of bounds"
+        ))
+    })?;
+    let indices_desc = plan.values.get(indices_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable top_k indices id {indices_id} is out of bounds"
+        ))
+    })?;
+    if values_desc.element_type != input_desc.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable top_k values must match input type {:?}, got {:?}",
+            input_desc.element_type, values_desc.element_type
+        )));
+    }
+    if indices_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
+        return Err(invalid_argument(format!(
+            "TT executable top_k indices must be S32, got {:?}",
+            indices_desc.element_type
+        )));
+    }
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = vec![i64::from(k)];
+    if values_desc.dims != output_shape || indices_desc.dims != output_shape {
+        return Err(invalid_argument(format!(
+            "TT executable top_k output shapes must both be {:?}, got values {:?}, indices {:?}",
+            output_shape, values_desc.dims, indices_desc.dims
+        )));
+    }
+    let (values_dram, indices_dram) =
+        kernels::topk::top_k(device, input_dram, &input_shape, k as usize, "pjrt_top_k")
+            .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        values_id,
+        values_desc.dims.clone(),
+        values_dram,
+        context,
+        "top_k.values",
+    )?;
+    store_output_buffer(
+        values,
+        plan,
+        indices_id,
+        indices_desc.dims.clone(),
+        indices_dram,
+        context,
+        "top_k.indices",
+    )
+}
+
 fn reduce_init_is_supported(
     plan: &executable::Executable,
     init_value_id: u32,
@@ -2393,7 +2522,7 @@ fn execute_executable_v1(
     execute_device: *mut PJRT_Device,
     target_device: &mut PJRT_Device,
     inputs: &[*mut PJRT_Buffer],
-) -> Result<PJRT_Buffer, *mut PJRT_Error> {
+) -> Result<Vec<PJRT_Buffer>, *mut PJRT_Error> {
     let plan = executable
         .metadata
         .executable
@@ -2850,11 +2979,43 @@ fn execute_executable_v1(
                 *output_id,
                 *iota_dimension,
             )?,
+            executable::Op::ArgMax {
+                input_id,
+                output_id,
+                dimensions,
+            } => execute_argmax(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_id,
+                *output_id,
+                dimensions,
+            )?,
+            executable::Op::TopK {
+                input_id,
+                values_id,
+                indices_id,
+                k,
+            } => execute_top_k(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_id,
+                *values_id,
+                *indices_id,
+                *k,
+            )?,
         }
     }
 
-    let output = device_buffer_for_value(&values, plan.output_ids[0], "output")?;
-    Ok(output.clone())
+    let mut outputs = Vec::with_capacity(plan.output_ids.len());
+    for (index, &output_id) in plan.output_ids.iter().enumerate() {
+        let output = device_buffer_for_value(&values, output_id, &format!("output[{index}]"))?;
+        outputs.push(output.clone());
+    }
+    Ok(outputs)
 }
 
 #[unsafe(no_mangle)]
@@ -2909,19 +3070,31 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         }
         unsafe { slice::from_raw_parts(device_args, args.num_args) }
     };
-    let output_buffer =
+    let output_buffers =
         match execute_executable_v1(executable, execute_device, target_device, input_ptrs) {
-            Ok(output) => output,
+            Ok(outputs) => outputs,
             Err(err) => return err,
         };
+    if output_buffers.len() != executable.metadata.num_outputs {
+        return pjrt_error(
+            format!(
+                "executable produced {} outputs but metadata expects {}",
+                output_buffers.len(),
+                executable.metadata.num_outputs
+            ),
+            PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
+        );
+    }
 
     let device_outputs = unsafe { *args.output_lists };
     if device_outputs.is_null() {
         return invalid_argument("output_lists[0] must not be null");
     }
-    let output_ptr = Box::into_raw(Box::new(output_buffer));
-    unsafe {
-        *device_outputs.add(0) = output_ptr;
+    for (index, output_buffer) in output_buffers.into_iter().enumerate() {
+        let output_ptr = Box::into_raw(Box::new(output_buffer));
+        unsafe {
+            *device_outputs.add(index) = output_ptr;
+        }
     }
     if !args.device_complete_events.is_null() {
         unsafe {
@@ -4728,6 +4901,52 @@ mod tests {
                 };
                 assert_eq!(*output_id, 0);
                 assert_eq!(*iota_dimension, 1);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_jax_argmax_reduce() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<64xbf16>) -> tensor<i32> {
+    %0 = stablehlo.iota dim = 0 : tensor<64xi32>
+    %cst = stablehlo.constant dense<0xFF80> : tensor<bf16>
+    %c = stablehlo.constant dense<0> : tensor<i32>
+    %1:2 = stablehlo.reduce(%arg0 init: %cst), (%0 init: %c) across dimensions = [0] : (tensor<64xbf16>, tensor<64xi32>, tensor<bf16>, tensor<i32>) -> (tensor<bf16>, tensor<i32>)
+     reducer(%arg1: tensor<bf16>, %arg3: tensor<bf16>) (%arg2: tensor<i32>, %arg4: tensor<i32>)  {
+      %2 = stablehlo.compare GT, %arg1, %arg3, FLOAT : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
+      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
+      %4 = stablehlo.or %2, %3 : tensor<i1>
+      %5 = stablehlo.compare EQ, %arg1, %arg3, FLOAT : (tensor<bf16>, tensor<bf16>) -> tensor<i1>
+      %6 = stablehlo.compare LT, %arg2, %arg4, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+      %7 = stablehlo.and %5, %6 : tensor<i1>
+      %8 = stablehlo.or %4, %7 : tensor<i1>
+      %9 = stablehlo.select %4, %arg1, %arg3 : tensor<i1>, tensor<bf16>
+      %10 = stablehlo.select %8, %arg2, %arg4 : tensor<i1>, tensor<i32>
+      stablehlo.return %9, %10 : tensor<bf16>, tensor<i32>
+    }
+    return %1#1 : tensor<i32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids.len(), 1);
+                assert!(
+                    executable
+                        .ops
+                        .iter()
+                        .any(|op| matches!(op, executable::Op::ArgMax { .. })),
+                    "argmax reduce should lower to ArgMax"
+                );
+                assert!(
+                    !executable
+                        .ops
+                        .iter()
+                        .any(|op| matches!(op, executable::Op::Iota { .. })),
+                    "iota feeding argmax should be folded into ArgMax"
+                );
             },
         );
     }
