@@ -310,6 +310,36 @@ std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
     return std::nullopt;
 }
 
+bool addTopKOp(
+    mlir::Value operand,
+    mlir::Value values,
+    mlir::Value indices,
+    int64_t k,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    if (k < 0 || k > std::numeric_limits<uint32_t>::max()) {
+        error = "top_k k is out of range";
+        return false;
+    }
+
+    uint32_t input_id = 0;
+    uint32_t values_id = 0;
+    uint32_t indices_id = 0;
+    if (!addValueDesc(operand, executable, value_ids, error, input_id) ||
+        !addValueDesc(values, executable, value_ids, error, values_id) ||
+        !addValueDesc(indices, executable, value_ids, error, indices_id)) {
+        return false;
+    }
+
+    auto* top_k = executable.add_ops();
+    top_k->set_output_id(values_id);
+    top_k->mutable_top_k()->set_operand_id(input_id);
+    top_k->mutable_top_k()->set_indices_id(indices_id);
+    top_k->mutable_top_k()->set_k(static_cast<uint32_t>(k));
+    return true;
+}
+
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -425,20 +455,44 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto top_k_op = mlir::dyn_cast<mlir::chlo::TopKOp>(op)) {
-            uint32_t input_id = 0;
-            uint32_t values_id = 0;
-            uint32_t indices_id = 0;
-            if (!addValueDesc(top_k_op.getOperand(), executable, value_ids, error, input_id) ||
-                !addValueDesc(top_k_op.getValues(), executable, value_ids, error, values_id) ||
-                !addValueDesc(top_k_op.getIndices(), executable, value_ids, error, indices_id)) {
+            if (!addTopKOp(
+                    top_k_op.getOperand(),
+                    top_k_op.getValues(),
+                    top_k_op.getIndices(),
+                    top_k_op.getK(),
+                    executable,
+                    value_ids,
+                    error)) {
                 return false;
             }
+            continue;
+        }
 
-            auto* top_k = executable.add_ops();
-            top_k->set_output_id(values_id);
-            top_k->mutable_top_k()->set_operand_id(input_id);
-            top_k->mutable_top_k()->set_indices_id(indices_id);
-            top_k->mutable_top_k()->set_k(top_k_op.getK());
+        if (auto composite_op = mlir::dyn_cast<mlir::stablehlo::CompositeOp>(op)) {
+            if (composite_op.getName() != "chlo.top_k") {
+                error = "unsupported stablehlo composite: " + composite_op.getName().str();
+                return false;
+            }
+            if (composite_op->getNumOperands() != 1 || composite_op->getNumResults() != 2) {
+                error = "top_k composite must have one operand and two results";
+                return false;
+            }
+            auto attrs = composite_op.getCompositeAttributes();
+            auto k = attrs ? attrs.getAs<mlir::IntegerAttr>("k") : nullptr;
+            if (!k) {
+                error = "top_k composite is missing k";
+                return false;
+            }
+            if (!addTopKOp(
+                    composite_op->getOperand(0),
+                    composite_op->getResult(0),
+                    composite_op->getResult(1),
+                    k.getInt(),
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
             continue;
         }
 
