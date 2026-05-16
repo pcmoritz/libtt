@@ -466,7 +466,7 @@ def qwen3_forward(config: Qwen3Config, weights, input_ids):
 def sample_next_token(
     decode_output, rng: np.random.Generator, temperature: float, top_k: int
 ) -> int:
-    if isinstance(decode_output, tuple):
+    if isinstance(decode_output, (list, tuple)) and len(decode_output) == 2:
         logits, token_ids = decode_output
         top_k = 0
     else:
