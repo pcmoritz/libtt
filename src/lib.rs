@@ -554,30 +554,6 @@ fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_
                 PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
             )
         })?;
-    if dims.len() == 1 {
-        let dram_buffer = buffer.dram_buffer.as_ref().ok_or_else(|| {
-            pjrt_error(
-                "buffer has been deleted",
-                PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
-            )
-        })?;
-        let data = with_device_ptr(buffer.device, |device| {
-            device
-                .dram_read_rank1(dram_buffer, dims[0])
-                .map_err(io_error)
-        })?;
-        if data.len() != byte_size {
-            return Err(pjrt_error(
-                format!(
-                    "rank-1 readback byte size {} does not match buffer byte size {}",
-                    data.len(),
-                    byte_size
-                ),
-                PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
-            ));
-        }
-        return Ok(data);
-    }
     let data = read_buffer_bytes(buffer)?;
     if data.len() == byte_size {
         return Ok(data);

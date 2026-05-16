@@ -504,14 +504,6 @@ impl Device {
         self.allocator_mut()?.read_host_data(buf)
     }
 
-    pub(crate) fn dram_read_rank1(
-        &mut self,
-        buf: &DramBuffer,
-        logical_len: usize,
-    ) -> io::Result<Vec<u8>> {
-        self.allocator_mut()?.read_rank1_host_data(buf, logical_len)
-    }
-
     fn allocator_mut(&mut self) -> io::Result<&mut Allocator> {
         if self.allocator.is_none() {
             self.allocator = Some(Allocator::from_device(self)?);
