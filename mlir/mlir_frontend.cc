@@ -18,7 +18,6 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -47,8 +46,8 @@ bool TT_MlirAnalyzeProgram(
 namespace {
 
 using mlir::func::FuncOp;
-using StablehloCompareDirection = mlir::stablehlo::ComparisonDirection;
-using StablehloCompareType = mlir::stablehlo::ComparisonType;
+using CompareDirection = mlir::stablehlo::ComparisonDirection;
+using CompareType = mlir::stablehlo::ComparisonType;
 
 void registerDialects(mlir::MLIRContext& context) {
     mlir::DialectRegistry registry;
@@ -349,8 +348,8 @@ bool isNegativeInfinitySplat(mlir::Value value) {
 
 bool isCompare(
     mlir::Value value,
-    StablehloCompareDirection direction,
-    StablehloCompareType compare_type,
+    CompareDirection direction,
+    CompareType compare_type,
     mlir::Value lhs,
     mlir::Value rhs) {
     auto compare_op = value.getDefiningOp<mlir::stablehlo::CompareOp>();
@@ -361,68 +360,6 @@ bool isCompare(
     return actual_type && *actual_type == compare_type &&
            compare_op.getLhs() == lhs &&
            compare_op.getRhs() == rhs;
-}
-
-template <typename OpT>
-bool matchBinaryOp(mlir::Value value, mlir::Value& lhs, mlir::Value& rhs) {
-    return mlir::matchPattern(
-        value,
-        mlir::m_Op<OpT>(
-            mlir::matchers::m_Any(&lhs),
-            mlir::matchers::m_Any(&rhs)));
-}
-
-bool matchJaxArgMaxSelectPair(
-    mlir::stablehlo::SelectOp value_select,
-    mlir::stablehlo::SelectOp index_select,
-    mlir::Value selected_value,
-    mlir::Value selected_index,
-    mlir::Value other_value,
-    mlir::Value other_index) {
-    if (value_select.getOnTrue() != selected_value ||
-        value_select.getOnFalse() != other_value ||
-        index_select.getOnTrue() != selected_index ||
-        index_select.getOnFalse() != other_index) {
-        return false;
-    }
-
-    mlir::Value greater;
-    mlir::Value is_nan;
-    if (!matchBinaryOp<mlir::stablehlo::OrOp>(value_select.getPred(), greater, is_nan)) {
-        return false;
-    }
-
-    mlir::Value value_predicate;
-    mlir::Value tie_break;
-    mlir::Value values_equal;
-    mlir::Value lower_index;
-    return matchBinaryOp<mlir::stablehlo::OrOp>(index_select.getPred(), value_predicate, tie_break) &&
-           value_predicate == value_select.getPred() &&
-           matchBinaryOp<mlir::stablehlo::AndOp>(tie_break, values_equal, lower_index) &&
-           isCompare(
-               greater,
-               StablehloCompareDirection::GT,
-               StablehloCompareType::FLOAT,
-               selected_value,
-               other_value) &&
-           isCompare(
-               is_nan,
-               StablehloCompareDirection::NE,
-               StablehloCompareType::FLOAT,
-               selected_value,
-               selected_value) &&
-           isCompare(
-               values_equal,
-               StablehloCompareDirection::EQ,
-               StablehloCompareType::FLOAT,
-               selected_value,
-               other_value) &&
-           isCompare(
-               lower_index,
-               StablehloCompareDirection::LT,
-               StablehloCompareType::SIGNED,
-               selected_index,
-               other_index);
 }
 
 bool isJaxArgMaxBody(mlir::stablehlo::ReduceOp reduce_op) {
@@ -440,19 +377,33 @@ bool isJaxArgMaxBody(mlir::stablehlo::ReduceOp reduce_op) {
         return false;
     }
 
-    auto value_select = return_op.getOperand(0).getDefiningOp<mlir::stablehlo::SelectOp>();
-    auto index_select = return_op.getOperand(1).getDefiningOp<mlir::stablehlo::SelectOp>();
-    if (!value_select || !index_select) {
-        return false;
-    }
-
     mlir::Value lhs_value = block.getArgument(0);
     mlir::Value lhs_index = block.getArgument(1);
     mlir::Value rhs_value = block.getArgument(2);
     mlir::Value rhs_index = block.getArgument(3);
 
-    return matchJaxArgMaxSelectPair(value_select, index_select, lhs_value, lhs_index, rhs_value, rhs_index) ||
-           matchJaxArgMaxSelectPair(value_select, index_select, rhs_value, rhs_index, lhs_value, lhs_index);
+    auto value_select = return_op.getOperand(0).getDefiningOp<mlir::stablehlo::SelectOp>();
+    auto index_select = return_op.getOperand(1).getDefiningOp<mlir::stablehlo::SelectOp>();
+    if (!value_select || !index_select ||
+        value_select.getOnTrue() != lhs_value ||
+        value_select.getOnFalse() != rhs_value ||
+        index_select.getOnTrue() != lhs_index ||
+        index_select.getOnFalse() != rhs_index) {
+        return false;
+    }
+
+    auto value_or = value_select.getPred().getDefiningOp<mlir::stablehlo::OrOp>();
+    auto index_or = index_select.getPred().getDefiningOp<mlir::stablehlo::OrOp>();
+    if (!value_or || !index_or || index_or.getLhs() != value_select.getPred()) {
+        return false;
+    }
+
+    auto tie_and = index_or.getRhs().getDefiningOp<mlir::stablehlo::AndOp>();
+    return tie_and &&
+           isCompare(value_or.getLhs(), CompareDirection::GT, CompareType::FLOAT, lhs_value, rhs_value) &&
+           isCompare(value_or.getRhs(), CompareDirection::NE, CompareType::FLOAT, lhs_value, lhs_value) &&
+           isCompare(tie_and.getLhs(), CompareDirection::EQ, CompareType::FLOAT, lhs_value, rhs_value) &&
+           isCompare(tie_and.getRhs(), CompareDirection::LT, CompareType::SIGNED, lhs_index, rhs_index);
 }
 
 std::optional<ArgMaxReduceMatch> matchArgMaxReduce(mlir::stablehlo::ReduceOp reduce_op) {
@@ -469,16 +420,24 @@ std::optional<ArgMaxReduceMatch> matchArgMaxReduce(mlir::stablehlo::ReduceOp red
     }
     int64_t dimension = dimensions.front();
 
-    auto iota_op = reduce_op.getInputs()[1].getDefiningOp<mlir::stablehlo::IotaOp>();
-    auto index_type = mlir::dyn_cast<mlir::RankedTensorType>(reduce_op->getResult(1).getType());
     if (!isNegativeInfinitySplat(reduce_op.getInitValues()[0]) ||
-        !isZeroIntegerSplat(reduce_op.getInitValues()[1]) ||
-        !isJaxArgMaxBody(reduce_op) ||
-        !iota_op ||
+        !isZeroIntegerSplat(reduce_op.getInitValues()[1])) {
+        return std::nullopt;
+    }
+
+    auto iota_op = reduce_op.getInputs()[1].getDefiningOp<mlir::stablehlo::IotaOp>();
+    if (!iota_op ||
         !iota_op.getResult().hasOneUse() ||
-        static_cast<int64_t>(iota_op.getIotaDimension()) != dimension ||
-        !index_type ||
-        !index_type.getElementType().isInteger(32)) {
+        static_cast<int64_t>(iota_op.getIotaDimension()) != dimension) {
+        return std::nullopt;
+    }
+
+    auto index_type = mlir::dyn_cast<mlir::RankedTensorType>(reduce_op->getResult(1).getType());
+    if (!index_type || !index_type.getElementType().isInteger(32)) {
+        return std::nullopt;
+    }
+
+    if (!isJaxArgMaxBody(reduce_op)) {
         return std::nullopt;
     }
 
