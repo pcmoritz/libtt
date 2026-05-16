@@ -498,10 +498,10 @@ def count_parameters(weights) -> int:
 
 def make_decode_step(config, device, args):
     if args.temperature <= 0:
-        return "argmax", jax.jit(
-            lambda model_weights, ids: jnp.argmax(
-                qwen3_forward(config, model_weights, ids)[-1], axis=-1
-            ).astype(jnp.int32),
+        return "top_k", jax.jit(
+            lambda model_weights, ids: jax.lax.top_k(
+                qwen3_forward(config, model_weights, ids)[-1], 1
+            ),
             device=device,
         )
 
@@ -528,13 +528,14 @@ def generate(config, weights, device, input_ids, args, decode_kind, decode_step)
 
     for _ in range(args.max_new_tokens):
         ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
-        if decode_kind == "argmax":
-            next_token = int(np.asarray(decode_step(weights, ids)).item())
-        elif decode_kind == "top_k":
+        if decode_kind == "top_k":
             candidate_logits, candidates = decode_step(weights, ids)
-            next_token = sample_from_candidates(
-                candidates, candidate_logits, rng, args.temperature
-            )
+            if args.temperature <= 0:
+                next_token = int(np.asarray(candidates).reshape(-1)[0])
+            else:
+                next_token = sample_from_candidates(
+                    candidates, candidate_logits, rng, args.temperature
+                )
         else:
             logits = np.asarray(decode_step(weights, ids))
             next_token = sample_next_token(logits, rng, args.temperature, args.top_k)

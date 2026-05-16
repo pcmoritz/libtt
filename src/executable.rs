@@ -158,11 +158,6 @@ pub(crate) enum Op {
         output_id: u32,
         iota_dimension: u64,
     },
-    ArgMax {
-        input_id: u32,
-        output_id: u32,
-        dimensions: Vec<i64>,
-    },
     TopK {
         input_id: u32,
         values_id: u32,
@@ -422,11 +417,6 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     output_id: op_desc.output_id,
                     iota_dimension: iota.iota_dimension,
                 }),
-                Kind::Argmax(argmax) => Ok(Op::ArgMax {
-                    input_id: argmax.operand_id,
-                    output_id: op_desc.output_id,
-                    dimensions: argmax.dimensions,
-                }),
                 Kind::TopK(top_k) => Ok(Op::TopK {
                     input_id: top_k.operand_id,
                     values_id: op_desc.output_id,
@@ -608,11 +598,6 @@ pub(crate) enum Op {
     Iota {
         output_id: u32,
         iota_dimension: u64,
-    },
-    ArgMax {
-        input_id: u32,
-        output_id: u32,
-        dimensions: Vec<i64>,
     },
     TopK {
         input_id: u32,

@@ -1,4 +1,3 @@
-pub(crate) mod argmax;
 pub(crate) mod binary_eltwise;
 pub(crate) mod broadcast;
 pub(crate) mod concatenate;

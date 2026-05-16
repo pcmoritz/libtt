@@ -4,7 +4,6 @@
 #include <string>
 #include <vector>
 
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
@@ -47,7 +46,6 @@ namespace {
 
 using mlir::func::FuncOp;
 using CompareDirection = mlir::stablehlo::ComparisonDirection;
-using CompareType = mlir::stablehlo::ComparisonType;
 
 void registerDialects(mlir::MLIRContext& context) {
     mlir::DialectRegistry registry;
@@ -312,152 +310,6 @@ std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
     return std::nullopt;
 }
 
-struct ArgMaxReduceMatch {
-    mlir::Value operand;
-    mlir::stablehlo::IotaOp iota;
-    int64_t dimension;
-};
-
-bool isZeroIntegerSplat(mlir::Value value) {
-    std::string ignored_error;
-    auto packed_value = packedConstantValue(value, ignored_error);
-    return packed_value && *packed_value == 0;
-}
-
-bool isNegativeInfinitySplat(mlir::Value value) {
-    while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
-        value = broadcast_op.getOperand();
-    }
-
-    auto constant_op = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
-    if (!constant_op) {
-        return false;
-    }
-
-    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
-    if (!dense || !dense.isSplat()) {
-        return false;
-    }
-
-    auto element_type = mlir::cast<mlir::ShapedType>(dense.getType()).getElementType();
-    if (!element_type.isBF16() && !element_type.isF16() && !element_type.isF32()) {
-        return false;
-    }
-    return dense.getSplatValue<llvm::APFloat>().isNegInfinity();
-}
-
-bool isCompare(
-    mlir::Value value,
-    CompareDirection direction,
-    CompareType compare_type,
-    mlir::Value lhs,
-    mlir::Value rhs) {
-    auto compare_op = value.getDefiningOp<mlir::stablehlo::CompareOp>();
-    if (!compare_op || compare_op.getComparisonDirection() != direction) {
-        return false;
-    }
-    auto actual_type = compare_op.getCompareType();
-    return actual_type && *actual_type == compare_type &&
-           compare_op.getLhs() == lhs &&
-           compare_op.getRhs() == rhs;
-}
-
-bool isJaxArgMaxBody(mlir::stablehlo::ReduceOp reduce_op) {
-    auto& body = reduce_op.getBody();
-    if (body.empty() || body.getBlocks().size() != 1) {
-        return false;
-    }
-    auto& block = body.front();
-    if (block.getNumArguments() != 4) {
-        return false;
-    }
-
-    auto return_op = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
-    if (!return_op || return_op.getNumOperands() != 2) {
-        return false;
-    }
-
-    mlir::Value lhs_value = block.getArgument(0);
-    mlir::Value lhs_index = block.getArgument(1);
-    mlir::Value rhs_value = block.getArgument(2);
-    mlir::Value rhs_index = block.getArgument(3);
-
-    auto value_select = return_op.getOperand(0).getDefiningOp<mlir::stablehlo::SelectOp>();
-    auto index_select = return_op.getOperand(1).getDefiningOp<mlir::stablehlo::SelectOp>();
-    if (!value_select || !index_select ||
-        value_select.getOnTrue() != lhs_value ||
-        value_select.getOnFalse() != rhs_value ||
-        index_select.getOnTrue() != lhs_index ||
-        index_select.getOnFalse() != rhs_index) {
-        return false;
-    }
-
-    auto value_or = value_select.getPred().getDefiningOp<mlir::stablehlo::OrOp>();
-    auto index_or = index_select.getPred().getDefiningOp<mlir::stablehlo::OrOp>();
-    if (!value_or || !index_or || index_or.getLhs() != value_select.getPred()) {
-        return false;
-    }
-
-    auto tie_and = index_or.getRhs().getDefiningOp<mlir::stablehlo::AndOp>();
-    return tie_and &&
-           isCompare(value_or.getLhs(), CompareDirection::GT, CompareType::FLOAT, lhs_value, rhs_value) &&
-           isCompare(value_or.getRhs(), CompareDirection::NE, CompareType::FLOAT, lhs_value, lhs_value) &&
-           isCompare(tie_and.getLhs(), CompareDirection::EQ, CompareType::FLOAT, lhs_value, rhs_value) &&
-           isCompare(tie_and.getRhs(), CompareDirection::LT, CompareType::SIGNED, lhs_index, rhs_index);
-}
-
-std::optional<ArgMaxReduceMatch> matchArgMaxReduce(mlir::stablehlo::ReduceOp reduce_op) {
-    if (reduce_op.getInputs().size() != 2 ||
-        reduce_op.getInitValues().size() != 2 ||
-        reduce_op->getNumResults() != 2 ||
-        !reduce_op->getResult(0).use_empty()) {
-        return std::nullopt;
-    }
-
-    auto dimensions = reduce_op.getDimensions();
-    if (dimensions.size() != 1) {
-        return std::nullopt;
-    }
-    int64_t dimension = dimensions.front();
-
-    if (!isNegativeInfinitySplat(reduce_op.getInitValues()[0]) ||
-        !isZeroIntegerSplat(reduce_op.getInitValues()[1])) {
-        return std::nullopt;
-    }
-
-    auto iota_op = reduce_op.getInputs()[1].getDefiningOp<mlir::stablehlo::IotaOp>();
-    if (!iota_op ||
-        !iota_op.getResult().hasOneUse() ||
-        static_cast<int64_t>(iota_op.getIotaDimension()) != dimension) {
-        return std::nullopt;
-    }
-
-    auto index_type = mlir::dyn_cast<mlir::RankedTensorType>(reduce_op->getResult(1).getType());
-    if (!index_type || !index_type.getElementType().isInteger(32)) {
-        return std::nullopt;
-    }
-
-    if (!isJaxArgMaxBody(reduce_op)) {
-        return std::nullopt;
-    }
-
-    return ArgMaxReduceMatch{
-        reduce_op.getInputs()[0],
-        iota_op,
-        dimension,
-    };
-}
-
-llvm::DenseSet<mlir::Operation*> findArgMaxIotas(FuncOp func) {
-    llvm::DenseSet<mlir::Operation*> iotas;
-    func.walk([&](mlir::stablehlo::ReduceOp reduce_op) {
-        if (auto match = matchArgMaxReduce(reduce_op)) {
-            iotas.insert(match->iota.getOperation());
-        }
-    });
-    return iotas;
-}
-
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -469,7 +321,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     }
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
-    llvm::DenseSet<mlir::Operation*> argmax_iotas = findArgMaxIotas(func);
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
         uint32_t output_id = 0;
@@ -861,21 +712,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto reduce_op = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(op)) {
-            if (auto argmax = matchArgMaxReduce(reduce_op)) {
-                uint32_t input_id = 0;
-                uint32_t output_id = 0;
-                if (!addValueDesc(argmax->operand, executable, value_ids, error, input_id) ||
-                    !addValueDesc(reduce_op->getResult(1), executable, value_ids, error, output_id)) {
-                    return false;
-                }
-
-                auto* argmax_op = executable.add_ops();
-                argmax_op->set_output_id(output_id);
-                argmax_op->mutable_argmax()->set_operand_id(input_id);
-                argmax_op->mutable_argmax()->add_dimensions(argmax->dimension);
-                continue;
-            }
-
             auto reducer = mapReduceReducer(reduce_op, error);
             if (!reducer) {
                 return false;
@@ -919,9 +755,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto iota_op = mlir::dyn_cast<mlir::stablehlo::IotaOp>(op)) {
-            if (argmax_iotas.contains(iota_op.getOperation())) {
-                continue;
-            }
             uint32_t output_id = 0;
             if (!addValueDesc(iota_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
