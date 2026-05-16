@@ -315,7 +315,7 @@ std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
 struct ArgMaxReduceMatch {
     mlir::Value operand;
     mlir::stablehlo::IotaOp iota;
-    llvm::SmallVector<int64_t, 1> dimensions;
+    int64_t dimension;
 };
 
 bool isZeroIntegerSplat(mlir::Value value) {
@@ -489,34 +489,29 @@ std::optional<ArgMaxReduceMatch> matchArgMaxReduce(mlir::stablehlo::ReduceOp red
         return std::nullopt;
     }
 
-    auto dimensions = llvm::SmallVector<int64_t, 1>();
-    for (int64_t dim : reduce_op.getDimensions()) {
-        dimensions.push_back(dim);
-    }
+    auto dimensions = reduce_op.getDimensions();
     if (dimensions.size() != 1) {
         return std::nullopt;
     }
+    int64_t dimension = dimensions.front();
 
     auto iota_op = reduce_op.getInputs()[1].getDefiningOp<mlir::stablehlo::IotaOp>();
-    if (!iota_op || !iota_op.getResult().hasOneUse() ||
-        static_cast<int64_t>(iota_op.getIotaDimension()) != dimensions[0]) {
-        return std::nullopt;
-    }
+    auto index_type = mlir::dyn_cast<mlir::RankedTensorType>(reduce_op->getResult(1).getType());
     if (!isNegativeInfinitySplat(reduce_op.getInitValues()[0]) ||
         !isZeroIntegerSplat(reduce_op.getInitValues()[1]) ||
-        !isJaxArgMaxBody(reduce_op)) {
-        return std::nullopt;
-    }
-
-    auto index_type = mlir::dyn_cast<mlir::RankedTensorType>(reduce_op->getResult(1).getType());
-    if (!index_type || !index_type.getElementType().isInteger(32)) {
+        !isJaxArgMaxBody(reduce_op) ||
+        !iota_op ||
+        !iota_op.getResult().hasOneUse() ||
+        static_cast<int64_t>(iota_op.getIotaDimension()) != dimension ||
+        !index_type ||
+        !index_type.getElementType().isInteger(32)) {
         return std::nullopt;
     }
 
     return ArgMaxReduceMatch{
         reduce_op.getInputs()[0],
         iota_op,
-        dimensions,
+        dimension,
     };
 }
 
@@ -944,9 +939,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 auto* argmax_op = executable.add_ops();
                 argmax_op->set_output_id(output_id);
                 argmax_op->mutable_argmax()->set_operand_id(input_id);
-                for (int64_t dim : argmax->dimensions) {
-                    argmax_op->mutable_argmax()->add_dimensions(dim);
-                }
+                argmax_op->mutable_argmax()->add_dimensions(argmax->dimension);
                 continue;
             }
 
