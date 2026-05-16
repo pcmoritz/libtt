@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -362,6 +363,15 @@ bool isCompare(
            compare_op.getRhs() == rhs;
 }
 
+template <typename OpT>
+bool matchBinaryOp(mlir::Value value, mlir::Value& lhs, mlir::Value& rhs) {
+    return mlir::matchPattern(
+        value,
+        mlir::m_Op<OpT>(
+            mlir::matchers::m_Any(&lhs),
+            mlir::matchers::m_Any(&rhs)));
+}
+
 bool matchJaxArgMaxSelectPair(
     mlir::stablehlo::SelectOp value_select,
     mlir::stablehlo::SelectOp index_select,
@@ -376,34 +386,39 @@ bool matchJaxArgMaxSelectPair(
         return false;
     }
 
-    auto value_or = value_select.getPred().getDefiningOp<mlir::stablehlo::OrOp>();
-    auto index_or = index_select.getPred().getDefiningOp<mlir::stablehlo::OrOp>();
-    if (!value_or || !index_or || index_or.getLhs() != value_select.getPred()) {
+    mlir::Value greater;
+    mlir::Value is_nan;
+    if (!matchBinaryOp<mlir::stablehlo::OrOp>(value_select.getPred(), greater, is_nan)) {
         return false;
     }
 
-    auto tie_and = index_or.getRhs().getDefiningOp<mlir::stablehlo::AndOp>();
-    return tie_and &&
+    mlir::Value value_predicate;
+    mlir::Value tie_break;
+    mlir::Value values_equal;
+    mlir::Value lower_index;
+    return matchBinaryOp<mlir::stablehlo::OrOp>(index_select.getPred(), value_predicate, tie_break) &&
+           value_predicate == value_select.getPred() &&
+           matchBinaryOp<mlir::stablehlo::AndOp>(tie_break, values_equal, lower_index) &&
            isCompare(
-               value_or.getLhs(),
+               greater,
                StablehloCompareDirection::GT,
                StablehloCompareType::FLOAT,
                selected_value,
                other_value) &&
            isCompare(
-               value_or.getRhs(),
+               is_nan,
                StablehloCompareDirection::NE,
                StablehloCompareType::FLOAT,
                selected_value,
                selected_value) &&
            isCompare(
-               tie_and.getLhs(),
+               values_equal,
                StablehloCompareDirection::EQ,
                StablehloCompareType::FLOAT,
                selected_value,
                other_value) &&
            isCompare(
-               tie_and.getRhs(),
+               lower_index,
                StablehloCompareDirection::LT,
                StablehloCompareType::SIGNED,
                selected_index,
