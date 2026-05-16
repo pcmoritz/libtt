@@ -362,93 +362,52 @@ bool isCompare(
            compare_op.getRhs() == rhs;
 }
 
-bool isOrderedCompare(
-    mlir::Value value,
-    StablehloCompareDirection direction,
-    StablehloCompareDirection reversed_direction,
-    StablehloCompareType compare_type,
-    mlir::Value lhs,
-    mlir::Value rhs) {
-    return isCompare(value, direction, compare_type, lhs, rhs) ||
-           isCompare(value, reversed_direction, compare_type, rhs, lhs);
-}
-
-template <typename OpT, typename MatcherA, typename MatcherB>
-bool matchCommutativeBinary(
-    mlir::Value value,
-    MatcherA matches_a,
-    MatcherB matches_b) {
-    auto op = value.getDefiningOp<OpT>();
-    return op &&
-           ((matches_a(op.getLhs()) && matches_b(op.getRhs())) ||
-            (matches_a(op.getRhs()) && matches_b(op.getLhs())));
-}
-
-bool isArgMaxSelectPair(
+bool matchJaxArgMaxSelectPair(
     mlir::stablehlo::SelectOp value_select,
     mlir::stablehlo::SelectOp index_select,
-    mlir::Value chosen_value,
-    mlir::Value chosen_index,
+    mlir::Value selected_value,
+    mlir::Value selected_index,
     mlir::Value other_value,
     mlir::Value other_index) {
-    if (value_select.getOnTrue() != chosen_value ||
+    if (value_select.getOnTrue() != selected_value ||
         value_select.getOnFalse() != other_value ||
-        index_select.getOnTrue() != chosen_index ||
+        index_select.getOnTrue() != selected_index ||
         index_select.getOnFalse() != other_index) {
         return false;
     }
 
-    auto value_better = [&](mlir::Value value) {
-        return isOrderedCompare(
-            value,
-            StablehloCompareDirection::GT,
-            StablehloCompareDirection::LT,
-            StablehloCompareType::FLOAT,
-            chosen_value,
-            other_value);
-    };
-    auto chosen_is_nan = [&](mlir::Value value) {
-        return isCompare(
-            value,
-            StablehloCompareDirection::NE,
-            StablehloCompareType::FLOAT,
-            chosen_value,
-            chosen_value);
-    };
-    auto values_equal = [&](mlir::Value value) {
-        return isOrderedCompare(
-            value,
-            StablehloCompareDirection::EQ,
-            StablehloCompareDirection::EQ,
-            StablehloCompareType::FLOAT,
-            chosen_value,
-            other_value);
-    };
-    auto lower_index = [&](mlir::Value value) {
-        return isOrderedCompare(
-            value,
-            StablehloCompareDirection::LT,
-            StablehloCompareDirection::GT,
-            StablehloCompareType::SIGNED,
-            chosen_index,
-            other_index);
-    };
-    auto tie_break = [&](mlir::Value value) {
-        return matchCommutativeBinary<mlir::stablehlo::AndOp>(
-            value,
-            values_equal,
-            lower_index);
-    };
+    auto value_or = value_select.getPred().getDefiningOp<mlir::stablehlo::OrOp>();
+    auto index_or = index_select.getPred().getDefiningOp<mlir::stablehlo::OrOp>();
+    if (!value_or || !index_or || index_or.getLhs() != value_select.getPred()) {
+        return false;
+    }
 
-    mlir::Value value_pred = value_select.getPred();
-    return matchCommutativeBinary<mlir::stablehlo::OrOp>(
-               value_pred,
-               value_better,
-               chosen_is_nan) &&
-           matchCommutativeBinary<mlir::stablehlo::OrOp>(
-               index_select.getPred(),
-               [&](mlir::Value value) { return value == value_pred; },
-               tie_break);
+    auto tie_and = index_or.getRhs().getDefiningOp<mlir::stablehlo::AndOp>();
+    return tie_and &&
+           isCompare(
+               value_or.getLhs(),
+               StablehloCompareDirection::GT,
+               StablehloCompareType::FLOAT,
+               selected_value,
+               other_value) &&
+           isCompare(
+               value_or.getRhs(),
+               StablehloCompareDirection::NE,
+               StablehloCompareType::FLOAT,
+               selected_value,
+               selected_value) &&
+           isCompare(
+               tie_and.getLhs(),
+               StablehloCompareDirection::EQ,
+               StablehloCompareType::FLOAT,
+               selected_value,
+               other_value) &&
+           isCompare(
+               tie_and.getRhs(),
+               StablehloCompareDirection::LT,
+               StablehloCompareType::SIGNED,
+               selected_index,
+               other_index);
 }
 
 bool isJaxArgMaxBody(mlir::stablehlo::ReduceOp reduce_op) {
@@ -477,8 +436,8 @@ bool isJaxArgMaxBody(mlir::stablehlo::ReduceOp reduce_op) {
     mlir::Value rhs_value = block.getArgument(2);
     mlir::Value rhs_index = block.getArgument(3);
 
-    return isArgMaxSelectPair(value_select, index_select, lhs_value, lhs_index, rhs_value, rhs_index) ||
-           isArgMaxSelectPair(value_select, index_select, rhs_value, rhs_index, lhs_value, lhs_index);
+    return matchJaxArgMaxSelectPair(value_select, index_select, lhs_value, lhs_index, rhs_value, rhs_index) ||
+           matchJaxArgMaxSelectPair(value_select, index_select, rhs_value, rhs_index, lhs_value, lhs_index);
 }
 
 std::optional<ArgMaxReduceMatch> matchArgMaxReduce(mlir::stablehlo::ReduceOp reduce_op) {
