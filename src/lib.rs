@@ -3068,6 +3068,7 @@ fn op_profile_name(op: &executable::Op) -> &'static str {
         executable::Op::BroadcastInDim { .. } => "broadcast",
         executable::Op::Gather { .. } => "gather",
         executable::Op::Iota { .. } => "iota",
+        executable::Op::TopK { .. } => "top_k",
     }
 }
 
@@ -3100,7 +3101,8 @@ fn executable_use_counts(plan: &executable::Executable) -> Vec<usize> {
             | executable::Op::Exponential { input_id, .. }
             | executable::Op::Transpose { input_id, .. }
             | executable::Op::Convert { input_id, .. }
-            | executable::Op::BroadcastInDim { input_id, .. } => add(*input_id),
+            | executable::Op::BroadcastInDim { input_id, .. }
+            | executable::Op::TopK { input_id, .. } => add(*input_id),
             executable::Op::Concatenate { input_ids, .. }
             | executable::Op::CustomCall { input_ids, .. } => {
                 for &input_id in input_ids {
