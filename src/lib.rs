@@ -698,9 +698,7 @@ fn make_executable_metadata(
     outputs: &[executable::ValueDesc],
     executable: Option<executable::Executable>,
 ) -> ExecutableMetadata {
-    let output_memory_kinds = (0..outputs.len())
-        .map(|_| cstring_lossy("dram"))
-        .collect::<Vec<_>>();
+    let output_memory_kinds = vec![cstring_lossy("dram"); outputs.len()];
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
         .map(|kind| kind.as_ptr())

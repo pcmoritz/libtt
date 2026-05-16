@@ -24,7 +24,6 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/executable.pb.h"
-#include "stablehlo/dialect/ChloOps.h"
 #include "stablehlo/dialect/Serialization.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "stablehlo/dialect/VhloOps.h"
@@ -45,7 +44,6 @@ bool TT_MlirAnalyzeProgram(
 namespace {
 
 using mlir::func::FuncOp;
-using CompareDirection = mlir::stablehlo::ComparisonDirection;
 
 void registerDialects(mlir::MLIRContext& context) {
     mlir::DialectRegistry registry;
@@ -53,7 +51,6 @@ void registerDialects(mlir::MLIRContext& context) {
     mlir::func::registerAllExtensions(registry);
     registry.insert<mlir::stablehlo::StablehloDialect>();
     registry.insert<mlir::vhlo::VhloDialect>();
-    registry.insert<mlir::chlo::ChloDialect>();
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
 }
@@ -451,20 +448,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             select->mutable_select()->set_pred_id(pred_id);
             select->mutable_select()->set_on_true_id(on_true_id);
             select->mutable_select()->set_on_false_id(on_false_id);
-            continue;
-        }
-
-        if (auto top_k_op = mlir::dyn_cast<mlir::chlo::TopKOp>(op)) {
-            if (!addTopKOp(
-                    top_k_op.getOperand(),
-                    top_k_op.getValues(),
-                    top_k_op.getIndices(),
-                    top_k_op.getK(),
-                    executable,
-                    value_ids,
-                    error)) {
-                return false;
-            }
             continue;
         }
 

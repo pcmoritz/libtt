@@ -463,32 +463,36 @@ def qwen3_forward(config: Qwen3Config, weights, input_ids):
     return hidden_states @ weights["embed_tokens"].T
 
 
-def sample_next_token(logits, rng: np.random.Generator, temperature: float, top_k: int) -> int:
+def sample_next_token(
+    decode_output, rng: np.random.Generator, temperature: float, top_k: int
+) -> int:
+    if isinstance(decode_output, tuple):
+        logits, token_ids = decode_output
+        top_k = 0
+    else:
+        logits, token_ids = decode_output, None
+
     logits = np.asarray(logits, dtype=np.float32)
+    token_ids = (
+        np.arange(logits.size, dtype=np.int32)
+        if token_ids is None
+        else np.asarray(token_ids, dtype=np.int32)
+    )
+
+    logits = logits.reshape(-1)
+    token_ids = token_ids.reshape(-1)
+    if 0 < top_k < logits.size:
+        top = np.lexsort((token_ids, -logits))[:top_k]
+        logits = logits[top]
+        token_ids = token_ids[top]
+
     if temperature <= 0:
-        return int(np.argmax(logits))
+        return int(token_ids[np.argmax(logits)])
 
     logits = logits / temperature
-    if 0 < top_k < logits.size:
-        candidates = np.lexsort((np.arange(logits.size), -logits))[:top_k]
-        candidate_logits = logits[candidates]
-        probs = np.exp(candidate_logits - np.max(candidate_logits))
-        probs = probs / np.sum(probs)
-        return int(rng.choice(candidates, p=probs))
-
     probs = np.exp(logits - np.max(logits))
     probs = probs / np.sum(probs)
-    return int(rng.choice(np.arange(logits.size), p=probs))
-
-
-def sample_from_candidates(
-    candidates, candidate_logits, rng: np.random.Generator, temperature: float
-) -> int:
-    candidates = np.asarray(candidates, dtype=np.int32)
-    candidate_logits = np.asarray(candidate_logits, dtype=np.float32) / temperature
-    probs = np.exp(candidate_logits - np.max(candidate_logits))
-    probs = probs / np.sum(probs)
-    return int(rng.choice(candidates, p=probs))
+    return int(rng.choice(token_ids, p=probs))
 
 
 def count_parameters(weights) -> int:
@@ -497,29 +501,22 @@ def count_parameters(weights) -> int:
 
 
 def make_decode_step(config, device, args):
-    if args.temperature <= 0:
-        return "top_k", jax.jit(
+    def logits(model_weights, ids):
+        return qwen3_forward(config, model_weights, ids)[-1]
+
+    device_top_k = 1 if args.temperature <= 0 else args.top_k
+    if 0 < device_top_k <= 32 and device_top_k < config.vocab_size:
+        return jax.jit(
             lambda model_weights, ids: jax.lax.top_k(
-                qwen3_forward(config, model_weights, ids)[-1], 1
+                logits(model_weights, ids), device_top_k
             ),
             device=device,
         )
 
-    if 0 < args.top_k <= 32 and args.top_k < config.vocab_size:
-        return "top_k", jax.jit(
-            lambda model_weights, ids: jax.lax.top_k(
-                qwen3_forward(config, model_weights, ids)[-1], args.top_k
-            ),
-            device=device,
-        )
-
-    return "logits", jax.jit(
-        lambda model_weights, ids: qwen3_forward(config, model_weights, ids)[-1],
-        device=device,
-    )
+    return jax.jit(logits, device=device)
 
 
-def generate(config, weights, device, input_ids, args, decode_kind, decode_step):
+def generate(config, weights, device, input_ids, args, decode_step):
     rng = np.random.default_rng(args.seed + 1)
     tokens = input_ids.astype(np.int32).copy()
     eos_token_ids = config.eos_token_id
@@ -528,17 +525,9 @@ def generate(config, weights, device, input_ids, args, decode_kind, decode_step)
 
     for _ in range(args.max_new_tokens):
         ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
-        if decode_kind == "top_k":
-            candidate_logits, candidates = decode_step(weights, ids)
-            if args.temperature <= 0:
-                next_token = int(np.asarray(candidates).reshape(-1)[0])
-            else:
-                next_token = sample_from_candidates(
-                    candidates, candidate_logits, rng, args.temperature
-                )
-        else:
-            logits = np.asarray(decode_step(weights, ids))
-            next_token = sample_next_token(logits, rng, args.temperature, args.top_k)
+        next_token = sample_next_token(
+            decode_step(weights, ids), rng, args.temperature, args.top_k
+        )
         tokens = np.append(tokens, np.int32(next_token))
         if eos_token_ids is not None and next_token in eos_token_ids:
             break
@@ -547,9 +536,9 @@ def generate(config, weights, device, input_ids, args, decode_kind, decode_step)
     return tokens
 
 
-def timed_generate(config, weights, device, input_ids, args, decode_kind, decode_step):
+def timed_generate(config, weights, device, input_ids, args, decode_step):
     start = time.perf_counter()
-    output_ids = generate(config, weights, device, input_ids, args, decode_kind, decode_step)
+    output_ids = generate(config, weights, device, input_ids, args, decode_step)
     return output_ids, time.perf_counter() - start
 
 
@@ -580,16 +569,12 @@ def main():
 
     device = select_device(args.backend)
     weights = jax.device_put(weights_host, device)
-    decode_kind, decode_step = make_decode_step(config, device, args)
+    decode_step = make_decode_step(config, device, args)
     if args.warmup:
-        _, warmup_seconds = timed_generate(
-            config, weights, device, input_ids, args, decode_kind, decode_step
-        )
+        _, warmup_seconds = timed_generate(config, weights, device, input_ids, args, decode_step)
     else:
         warmup_seconds = 0.0
-    output_ids, run_seconds = timed_generate(
-        config, weights, device, input_ids, args, decode_kind, decode_step
-    )
+    output_ids, run_seconds = timed_generate(config, weights, device, input_ids, args, decode_step)
 
     print(f"device: {device}")
     if not args.random_weights:
