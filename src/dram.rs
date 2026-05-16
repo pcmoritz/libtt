@@ -4,6 +4,7 @@ use crate::linux::{NocOrdering, TlbWindow};
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) const TILE_R: usize = 32;
@@ -11,6 +12,7 @@ pub(crate) const TILE_C: usize = 32;
 const FACE_R: usize = 16;
 const FACE_C: usize = 16;
 type Shape = Vec<usize>;
+static NEXT_DRAM_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum DType {
@@ -78,6 +80,7 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 
 #[derive(Clone, Debug)]
 pub struct DramBuffer {
+    pub id: u64,
     pub name: String,
     pub addr: u64,
     pub num_tiles: usize,
@@ -90,6 +93,7 @@ pub struct DramBuffer {
 impl PartialEq for DramBuffer {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
+            && self.id == other.id
             && self.addr == other.addr
             && self.num_tiles == other.num_tiles
             && self.dtype == other.dtype
@@ -207,6 +211,7 @@ impl Allocator {
         let (addr, allocation_size, _next) =
             allocate_allocation_range(self.local_hardware_id, num_tiles, dtype, self.bank_count)?;
         Ok(DramBuffer {
+            id: NEXT_DRAM_BUFFER_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
             addr,
             num_tiles,
@@ -582,7 +587,9 @@ fn next_allocation_range(
 
 fn allocation_range_size(num_tiles: usize, dtype: DType, bank_count: usize) -> io::Result<u64> {
     if bank_count == 0 {
-        return Err(io::Error::other("dram allocation requires at least one bank"));
+        return Err(io::Error::other(
+            "dram allocation requires at least one bank",
+        ));
     }
     let pages_per_bank = num_tiles.div_ceil(bank_count);
     let allocation_size = (pages_per_bank as u64)
@@ -733,6 +740,7 @@ mod tests {
     #[test]
     fn buffer_size_matches_tile_count() {
         let buffer = DramBuffer {
+            id: 1,
             name: "weights".to_owned(),
             addr: Dram::WRITE_OFFSET,
             num_tiles: 3,
@@ -819,6 +827,7 @@ mod tests {
         let (addr, size, _) =
             allocate_allocation_range(local_hardware_id, 1, DType::Float16, 1).unwrap();
         let buffer = DramBuffer {
+            id: 2,
             name: "tmp".to_owned(),
             addr,
             num_tiles: 1,

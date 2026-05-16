@@ -101,6 +101,40 @@ pub struct Device {
     dispatcher: Box<dyn Dispatcher>,
     cached_program_launches: HashMap<usize, CachedProgramLaunch>,
     staged_cached_program: Option<usize>,
+    defer_dispatch_waits: bool,
+    op_cache: HashMap<OpCacheKey, DramBuffer>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct OpCacheKey {
+    op: &'static str,
+    input_id: u64,
+    input_addr: u64,
+    input_tiles: usize,
+    input_dtype: DType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
+    attrs: Vec<i64>,
+}
+
+impl OpCacheKey {
+    pub(crate) fn new(
+        op: &'static str,
+        input: &DramBuffer,
+        output_shape: Vec<usize>,
+        attrs: Vec<i64>,
+    ) -> Self {
+        Self {
+            op,
+            input_id: input.id,
+            input_addr: input.addr,
+            input_tiles: input.num_tiles,
+            input_dtype: input.dtype,
+            input_shape: input.shape.clone(),
+            output_shape,
+            attrs,
+        }
+    }
 }
 
 struct CachedProgramLaunch {
@@ -119,7 +153,11 @@ trait Dispatcher {
         setup: &[DispatchCommand],
         setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
+        wait: bool,
     ) -> io::Result<()>;
+    fn wait_for_idle(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Dispatcher for FastDispatcher {
@@ -133,8 +171,13 @@ impl Dispatcher for FastDispatcher {
         _setup: &[DispatchCommand],
         setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
+        wait: bool,
     ) -> io::Result<()> {
-        FastDispatcher::launch(self, program, setup_records, runtime_args)
+        FastDispatcher::launch(self, program, setup_records, runtime_args, wait)
+    }
+
+    fn wait_for_idle(&mut self) -> io::Result<()> {
+        FastDispatcher::wait_for_idle(self)
     }
 }
 
@@ -149,6 +192,7 @@ impl Dispatcher for SlowDispatcher {
         setup: &[DispatchCommand],
         _setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
+        _wait: bool,
     ) -> io::Result<()> {
         SlowDispatcher::launch(self, setup, runtime_args)
     }
@@ -252,6 +296,8 @@ impl Device {
             dispatcher,
             cached_program_launches: HashMap::new(),
             staged_cached_program: None,
+            defer_dispatch_waits: false,
+            op_cache: HashMap::new(),
         };
 
         if let Err(err) = info.upload_firmware() {
@@ -395,10 +441,33 @@ impl Device {
         } else {
             (launch.setup.as_slice(), launch.setup_records.as_slice())
         };
-        self.dispatcher
-            .launch(&program, setup, setup_records, &launch.runtime_args)?;
+        self.dispatcher.launch(
+            &program,
+            setup,
+            setup_records,
+            &launch.runtime_args,
+            !self.defer_dispatch_waits,
+        )?;
         self.staged_cached_program = Some(program_id);
         Ok(())
+    }
+
+    pub(crate) fn set_defer_dispatch_waits(&mut self, defer: bool) -> bool {
+        let previous = self.defer_dispatch_waits;
+        self.defer_dispatch_waits = defer;
+        previous
+    }
+
+    pub(crate) fn wait_for_dispatch(&mut self) -> io::Result<()> {
+        self.dispatcher.wait_for_idle()
+    }
+
+    pub(crate) fn cached_op_buffer(&self, key: &OpCacheKey) -> Option<DramBuffer> {
+        self.op_cache.get(key).cloned()
+    }
+
+    pub(crate) fn insert_cached_op_buffer(&mut self, key: OpCacheKey, buffer: DramBuffer) {
+        self.op_cache.insert(key, buffer);
     }
 
     pub fn alloc(
