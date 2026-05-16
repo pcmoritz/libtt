@@ -663,36 +663,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
-        if (auto composite_op = mlir::dyn_cast<mlir::stablehlo::CompositeOp>(op);
-            composite_op && composite_op.getName().ends_with("top_k")) {
-            if (composite_op.getInputs().size() != 1 || composite_op->getNumResults() != 2) {
-                error = "top_k composite must have one input and two results";
-                return false;
-            }
-            auto attrs = composite_op.getCompositeAttributes();
-            auto k_attr = attrs ? mlir::dyn_cast_or_null<mlir::IntegerAttr>(attrs.get("k")) : nullptr;
-            if (!k_attr) {
-                error = "top_k composite is missing integer attribute k";
-                return false;
-            }
-
-            uint32_t input_id = 0;
-            uint32_t values_id = 0;
-            uint32_t indices_id = 0;
-            if (!addValueDesc(*composite_op.getInputs().begin(), executable, value_ids, error, input_id) ||
-                !addValueDesc(composite_op->getResult(0), executable, value_ids, error, values_id) ||
-                !addValueDesc(composite_op->getResult(1), executable, value_ids, error, indices_id)) {
-                return false;
-            }
-
-            auto* top_k = executable.add_ops();
-            top_k->set_output_id(values_id);
-            top_k->mutable_top_k()->set_operand_id(input_id);
-            top_k->mutable_top_k()->set_indices_id(indices_id);
-            top_k->mutable_top_k()->set_k(static_cast<uint32_t>(k_attr.getInt()));
-            continue;
-        }
-
         if (auto add_op = mlir::dyn_cast<mlir::stablehlo::AddOp>(op)) {
             uint32_t lhs_id = 0;
             uint32_t rhs_id = 0;
