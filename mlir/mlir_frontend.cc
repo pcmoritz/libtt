@@ -24,7 +24,6 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/executable.pb.h"
-#include "stablehlo/dialect/ChloOps.h"
 #include "stablehlo/dialect/Serialization.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "stablehlo/dialect/VhloOps.h"
@@ -52,7 +51,6 @@ void registerDialects(mlir::MLIRContext& context) {
     mlir::func::registerAllExtensions(registry);
     registry.insert<mlir::stablehlo::StablehloDialect>();
     registry.insert<mlir::vhlo::VhloDialect>();
-    registry.insert<mlir::chlo::ChloDialect>();
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
 }
@@ -309,6 +307,36 @@ std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
     return std::nullopt;
 }
 
+bool addTopKOp(
+    mlir::Value operand,
+    mlir::Value values,
+    mlir::Value indices,
+    int64_t k,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    if (k < 0 || k > std::numeric_limits<uint32_t>::max()) {
+        error = "top_k k is out of range";
+        return false;
+    }
+
+    uint32_t input_id = 0;
+    uint32_t values_id = 0;
+    uint32_t indices_id = 0;
+    if (!addValueDesc(operand, executable, value_ids, error, input_id) ||
+        !addValueDesc(values, executable, value_ids, error, values_id) ||
+        !addValueDesc(indices, executable, value_ids, error, indices_id)) {
+        return false;
+    }
+
+    auto* top_k = executable.add_ops();
+    top_k->set_output_id(values_id);
+    top_k->mutable_top_k()->set_operand_id(input_id);
+    top_k->mutable_top_k()->set_indices_id(indices_id);
+    top_k->mutable_top_k()->set_k(static_cast<uint32_t>(k));
+    return true;
+}
+
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -333,15 +361,13 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
 
     for (mlir::Operation& op : func.front()) {
         if (auto return_op = mlir::dyn_cast<mlir::func::ReturnOp>(op)) {
-            if (return_op.getNumOperands() != 1) {
-                error = "only single-result functions are currently supported";
-                return false;
+            for (mlir::Value operand : return_op.getOperands()) {
+                uint32_t output_id = 0;
+                if (!addValueDesc(operand, executable, value_ids, error, output_id)) {
+                    return false;
+                }
+                executable.add_output_ids(output_id);
             }
-            uint32_t output_id = 0;
-            if (!addValueDesc(return_op.getOperand(0), executable, value_ids, error, output_id)) {
-                return false;
-            }
-            executable.add_output_ids(output_id);
             continue;
         }
 
@@ -422,6 +448,34 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             select->mutable_select()->set_pred_id(pred_id);
             select->mutable_select()->set_on_true_id(on_true_id);
             select->mutable_select()->set_on_false_id(on_false_id);
+            continue;
+        }
+
+        if (auto composite_op = mlir::dyn_cast<mlir::stablehlo::CompositeOp>(op)) {
+            if (composite_op.getName() != "chlo.top_k") {
+                error = "unsupported stablehlo composite: " + composite_op.getName().str();
+                return false;
+            }
+            if (composite_op->getNumOperands() != 1 || composite_op->getNumResults() != 2) {
+                error = "top_k composite must have one operand and two results";
+                return false;
+            }
+            auto attrs = composite_op.getCompositeAttributes();
+            auto k = attrs ? attrs.getAs<mlir::IntegerAttr>("k") : nullptr;
+            if (!k) {
+                error = "top_k composite is missing k";
+                return false;
+            }
+            if (!addTopKOp(
+                    composite_op->getOperand(0),
+                    composite_op->getResult(0),
+                    composite_op->getResult(1),
+                    k.getInt(),
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
             continue;
         }
 
@@ -821,8 +875,8 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         return false;
     }
 
-    if (executable.output_ids_size() != 1) {
-        error = "entry function must return exactly one value";
+    if (executable.output_ids_size() == 0) {
+        error = "entry function must return at least one value";
         return false;
     }
 

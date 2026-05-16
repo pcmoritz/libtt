@@ -208,6 +208,13 @@ message IotaOp {
   uint64 iota_dimension = 1;
 }
 
+message TopKOp {
+  // Op.output_id is the values result. indices_id is the integer index result.
+  uint32 operand_id = 1;
+  uint32 indices_id = 2;
+  uint32 k = 3;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -239,6 +246,7 @@ message Op {
     ExponentialOp exponential = 25;
     TransposeOp transpose = 26;
     CustomCallOp custom_call = 27;
+    TopKOp top_k = 29;
   }
 }
 
@@ -246,7 +254,7 @@ message Executable {
   repeated ValueDesc values = 1;
   repeated Op ops = 2;
   // Indices into values for the program results, in entry-function result
-  // order. The current lowering emits exactly one output.
+  // order.
   repeated uint32 output_ids = 3;
 }
 
