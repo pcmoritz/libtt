@@ -79,7 +79,6 @@ struct MatmulPlan {
     cols: Vec<u8>,
     direct_grid: Option<Vec<Vec<CoreCoord>>>,
     grid_rows_per_batch: usize,
-    grid_cols_per_batch: usize,
     batch_groups: usize,
     batches_per_group: usize,
     mt: usize,
@@ -131,6 +130,42 @@ impl MatmulPlan {
 
     fn cb1_pages(&self) -> usize {
         2 * self.per_core_n * self.in0_block_w
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MatmulPlanCandidate {
+    rows: Vec<u8>,
+    cols: Vec<u8>,
+    direct_grid: Option<Vec<Vec<CoreCoord>>>,
+    grid_rows_per_batch: usize,
+    mt: usize,
+    nt: usize,
+    per_core_m: usize,
+    per_core_n: usize,
+    in0_block_w: usize,
+    out_subblock_h: usize,
+    out_subblock_w: usize,
+}
+
+impl MatmulPlanCandidate {
+    fn into_plan(self, kt: usize, batch_groups: usize, batches_per_group: usize) -> MatmulPlan {
+        MatmulPlan {
+            rows: self.rows,
+            cols: self.cols,
+            direct_grid: self.direct_grid,
+            grid_rows_per_batch: self.grid_rows_per_batch,
+            batch_groups,
+            batches_per_group,
+            mt: self.mt,
+            kt,
+            nt: self.nt,
+            per_core_m: self.per_core_m,
+            per_core_n: self.per_core_n,
+            in0_block_w: self.in0_block_w,
+            out_subblock_h: self.out_subblock_h,
+            out_subblock_w: self.out_subblock_w,
+        }
     }
 }
 
@@ -671,12 +706,11 @@ fn plan_matmul(
                             );
                             if best_score.map_or(true, |current| score > current) {
                                 best_score = Some(score);
-                                best = Some((
-                                    rows.to_vec(),
-                                    cols.to_vec(),
-                                    None,
-                                    nr,
-                                    nc,
+                                best = Some(MatmulPlanCandidate {
+                                    rows: rows.to_vec(),
+                                    cols: cols.to_vec(),
+                                    direct_grid: None,
+                                    grid_rows_per_batch: nr,
                                     mt,
                                     nt,
                                     per_core_m,
@@ -684,7 +718,7 @@ fn plan_matmul(
                                     in0_block_w,
                                     out_subblock_h,
                                     out_subblock_w,
-                                ));
+                                });
                             }
                         }
                     }
@@ -693,20 +727,7 @@ fn plan_matmul(
         }
     }
 
-    let Some((
-        rows,
-        cols,
-        direct_grid,
-        grid_rows_per_batch,
-        grid_cols_per_batch,
-        mt,
-        nt,
-        per_core_m,
-        per_core_n,
-        in0_block_w,
-        out_subblock_h,
-        out_subblock_w,
-    )) = best.or_else(|| {
+    let Some(candidate) = best.or_else(|| {
         plan_direct_matmul(
             mt_base,
             nt_base,
@@ -716,31 +737,14 @@ fn plan_matmul(
             tile_bytes,
             l1_data_bytes,
         )
-    })
-    else {
+    }) else {
         return Err(invalid_input(format!(
             "no valid matmul plan for M={m} K={k} N={n} on {} cores",
             ordered.len()
         )));
     };
 
-    let mut plan = MatmulPlan {
-        mt,
-        kt,
-        nt,
-        rows,
-        cols,
-        direct_grid,
-        grid_rows_per_batch,
-        grid_cols_per_batch,
-        batch_groups: 1,
-        batches_per_group: batch_count,
-        per_core_m,
-        per_core_n,
-        in0_block_w,
-        out_subblock_h,
-        out_subblock_w,
-    };
+    let mut plan = candidate.into_plan(kt, 1, batch_count);
 
     if let Some(batched) = plan_batched_direct_matmul(
         mt_base,
@@ -759,7 +763,6 @@ fn plan_matmul(
     Ok(plan)
 }
 
-#[allow(clippy::type_complexity)]
 fn plan_direct_matmul(
     mt_base: usize,
     nt_base: usize,
@@ -768,20 +771,7 @@ fn plan_direct_matmul(
     kt_divs: &[usize],
     tile_bytes: usize,
     l1_data_bytes: usize,
-) -> Option<(
-    Vec<u8>,
-    Vec<u8>,
-    Option<Vec<Vec<CoreCoord>>>,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-)> {
+) -> Option<MatmulPlanCandidate> {
     if mt_base == 0 || nt_base == 0 || batch_groups == 0 {
         return None;
     }
@@ -838,17 +828,16 @@ fn plan_direct_matmul(
                         );
                         if best_score.map_or(true, |current| score > current) {
                             best_score = Some(score);
-                            best = Some((
-                                Vec::new(),
-                                Vec::new(),
-                                Some(
+                            best = Some(MatmulPlanCandidate {
+                                rows: Vec::new(),
+                                cols: Vec::new(),
+                                direct_grid: Some(
                                     cores[..active_cores]
                                         .chunks(logical_cols)
                                         .map(|row| row.to_vec())
                                         .collect(),
                                 ),
-                                logical_rows,
-                                logical_cols,
+                                grid_rows_per_batch: logical_rows,
                                 mt,
                                 nt,
                                 per_core_m,
@@ -856,7 +845,7 @@ fn plan_direct_matmul(
                                 in0_block_w,
                                 out_subblock_h,
                                 out_subblock_w,
-                            ));
+                            });
                         }
                     }
                 }
@@ -944,7 +933,7 @@ fn plan_batched_direct_matmul(
                             );
                             if best_score.map_or(true, |current| score > current) {
                                 best_score = Some(score);
-                                best = Some(MatmulPlan {
+                                let candidate = MatmulPlanCandidate {
                                     rows: Vec::new(),
                                     cols: Vec::new(),
                                     direct_grid: Some(
@@ -954,18 +943,16 @@ fn plan_batched_direct_matmul(
                                             .collect(),
                                     ),
                                     grid_rows_per_batch: logical_rows,
-                                    grid_cols_per_batch: logical_cols,
-                                    batch_groups,
-                                    batches_per_group,
                                     mt,
-                                    kt,
                                     nt,
                                     per_core_m,
                                     per_core_n,
                                     in0_block_w,
                                     out_subblock_h,
                                     out_subblock_w,
-                                });
+                                };
+                                best =
+                                    Some(candidate.into_plan(kt, batch_groups, batches_per_group));
                             }
                         }
                     }
@@ -1526,7 +1513,8 @@ mod tests {
         assert_eq!(plan.batch_groups, 8);
         assert_eq!(plan.batches_per_group, 1);
         assert_eq!(plan.grid_rows_per_batch, 2);
-        assert_eq!(plan.grid_cols_per_batch, 1);
+        assert_eq!(grid.len(), plan.batch_groups * plan.grid_rows_per_batch);
+        assert!(grid.iter().all(|row| row.len() == 1));
         assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 16);
         assert_eq!(plan.mt, 2);
         assert_eq!(plan.nt, 1);
@@ -1539,7 +1527,8 @@ mod tests {
         assert_eq!(plan.batch_groups, 8);
         assert_eq!(plan.batches_per_group, 1);
         assert_eq!(plan.grid_rows_per_batch, 4);
-        assert_eq!(plan.grid_cols_per_batch, 2);
+        assert_eq!(grid.len(), plan.batch_groups * plan.grid_rows_per_batch);
+        assert!(grid.iter().all(|row| row.len() == 2));
         assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 64);
         assert_eq!(plan.mt, 4);
         assert_eq!(plan.nt, 2);
