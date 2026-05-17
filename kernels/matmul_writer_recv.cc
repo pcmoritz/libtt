@@ -22,6 +22,10 @@ void kernel_main() {
   const uint32_t logical_mt = A(29);
   const uint32_t logical_nt = A(30);
   const uint32_t out_col_offset = A(31);
+  const uint32_t local_batch_count = A(32);
+  const uint32_t batch_start = A(33);
+  const uint32_t total_batch_count = A(34);
+  const uint32_t output_batch_stride = A(36);
   volatile tt_l1_ptr uint32_t *recv_sem = SEM(17);
 
   const InterleavedAddrGenFast<true> out_gen = {
@@ -30,39 +34,46 @@ void kernel_main() {
       .data_format = get_dataformat(cb_out),
   };
 
-  for (uint32_t block = 0; block < nblocks; block++) {
-    cb_reserve_back(cb_in1, block_tiles);
-    noc_semaphore_set(recv_sem, INVALID);
-    noc_semaphore_inc(get_noc_addr(A(14), A(15), get_semaphore(A(16))), 1);
-    noc_semaphore_wait(recv_sem, VALID);
-    cb_push_back(cb_in1, block_tiles);
-  }
-
   const uint32_t padded_nt = out_next_sb_h / out_sb_h;
-  uint32_t sbh_start = out_start;
-  for (uint32_t sbh = 0; sbh < out_num_sb_h; sbh++) {
-    uint32_t sbw_start = sbh_start;
-    for (uint32_t sbw = 0; sbw < out_num_sb_w; sbw++) {
-      cb_wait_front(cb_out, out_sb_tiles);
-      uint32_t l1_addr = get_read_ptr(cb_out);
-      uint32_t row_start = sbw_start;
-      for (uint32_t h = 0; h < out_sb_h; h++) {
-        uint32_t tile_id = row_start;
-        for (uint32_t w = 0; w < out_sb_w; w++) {
-          const uint32_t out_row = tile_id / padded_nt;
-          const uint32_t out_col = out_col_offset + tile_id - out_row * padded_nt;
-          if (out_row < logical_mt && out_col < logical_nt) {
-            noc_async_write_tile(out_row * logical_nt + out_col, out_gen, l1_addr);
-          }
-          l1_addr += out_tile_bytes;
-          tile_id += out_stride_w;
-        }
-        row_start += out_stride_h;
-      }
-      noc_async_write_barrier();
-      cb_pop_front(cb_out, out_sb_tiles);
-      sbw_start += out_next_sb_w;
+  for (uint32_t local_batch = 0; local_batch < local_batch_count; local_batch++) {
+    const uint32_t batch = batch_start + local_batch;
+    const bool valid_batch = batch < total_batch_count;
+    for (uint32_t block = 0; block < nblocks; block++) {
+      cb_reserve_back(cb_in1, block_tiles);
+      noc_semaphore_set(recv_sem, INVALID);
+      noc_semaphore_inc(get_noc_addr(A(14), A(15), get_semaphore(A(16))), 1);
+      noc_semaphore_wait(recv_sem, VALID);
+      cb_push_back(cb_in1, block_tiles);
     }
-    sbh_start += out_next_sb_h;
+
+    uint32_t sbh_start = out_start;
+    for (uint32_t sbh = 0; sbh < out_num_sb_h; sbh++) {
+      uint32_t sbw_start = sbh_start;
+      for (uint32_t sbw = 0; sbw < out_num_sb_w; sbw++) {
+        cb_wait_front(cb_out, out_sb_tiles);
+        uint32_t l1_addr = get_read_ptr(cb_out);
+        uint32_t row_start = sbw_start;
+        for (uint32_t h = 0; h < out_sb_h; h++) {
+          uint32_t tile_id = row_start;
+          for (uint32_t w = 0; w < out_sb_w; w++) {
+            const uint32_t out_row = tile_id / padded_nt;
+            const uint32_t out_col = out_col_offset + tile_id - out_row * padded_nt;
+            if (valid_batch && out_row < logical_mt && out_col < logical_nt) {
+              noc_async_write_tile(
+                  batch * output_batch_stride + out_row * logical_nt + out_col,
+                  out_gen,
+                  l1_addr);
+            }
+            l1_addr += out_tile_bytes;
+            tile_id += out_stride_w;
+          }
+          row_start += out_stride_h;
+        }
+        noc_async_write_barrier();
+        cb_pop_front(cb_out, out_sb_tiles);
+        sbw_start += out_next_sb_w;
+      }
+      sbh_start += out_next_sb_h;
+    }
   }
 }

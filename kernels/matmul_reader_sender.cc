@@ -3,8 +3,409 @@
 #define A(n) get_arg_val<uint32_t>(n)
 #define SEM(n) reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_semaphore(A(n)))
 
+namespace {
+constexpr uint32_t TILE_R = 32;
+constexpr uint32_t TILE_C = 32;
+constexpr uint32_t FACE_R = 16;
+constexpr uint32_t FACE_C = 16;
+constexpr uint32_t MAX_RANK = 8;
+constexpr uint32_t INVALID_TILE = 0xffffffffu;
+constexpr uint32_t VIEW_CONTIGUOUS = 0;
+constexpr uint32_t VIEW_TRANSPOSE_LAST_TWO = 1;
+constexpr uint32_t VIEW_GROUPED_ROWS = 3;
+constexpr uint32_t VIEW_TOKEN_COLUMNS = 4;
+constexpr uint32_t VIEW_GROUPED_COLUMNS = 5;
+constexpr uint32_t ARG_VIEW_KIND = 28;
+constexpr uint32_t ARG_VIEW_SHAPE = ARG_VIEW_KIND + 10;
+constexpr uint32_t ARG_VIEW_BATCH_DIMS = ARG_VIEW_SHAPE + MAX_RANK;
+constexpr uint32_t ARG_VIEW_ROW_DIMS = ARG_VIEW_BATCH_DIMS + MAX_RANK;
+constexpr uint32_t ARG_VIEW_COL_DIMS = ARG_VIEW_ROW_DIMS + MAX_RANK;
+
+struct View {
+  uint32_t kind;
+  uint32_t rank;
+  uint32_t batch_rank;
+  uint32_t row_rank;
+  uint32_t col_rank;
+  uint32_t logical_rows;
+  uint32_t logical_cols;
+  uint32_t tile_rows;
+  uint32_t tiles_per_row;
+  uint32_t iteration_order;
+  uint32_t shape[MAX_RANK];
+  uint32_t batch_dims[MAX_RANK];
+  uint32_t row_dims[MAX_RANK];
+  uint32_t col_dims[MAX_RANK];
+};
+
+uint32_t tile_element_index(uint32_t row, uint32_t col) {
+  uint32_t face_row = row / FACE_R;
+  uint32_t face_col = col / FACE_C;
+  uint32_t row_in_face = row % FACE_R;
+  uint32_t col_in_face = col % FACE_C;
+  return ((face_row * 2 + face_col) * FACE_R * FACE_C) + row_in_face * FACE_C + col_in_face;
+}
+
+void load_array(uint32_t base, uint32_t *target) {
+  for (uint32_t i = 0; i < MAX_RANK; ++i) {
+    target[i] = A(base + i);
+  }
+}
+
+View load_view() {
+  View view;
+  view.kind = A(ARG_VIEW_KIND);
+  view.rank = A(ARG_VIEW_KIND + 1);
+  view.batch_rank = A(ARG_VIEW_KIND + 2);
+  view.row_rank = A(ARG_VIEW_KIND + 3);
+  view.col_rank = A(ARG_VIEW_KIND + 4);
+  view.logical_rows = A(ARG_VIEW_KIND + 5);
+  view.logical_cols = A(ARG_VIEW_KIND + 6);
+  view.tile_rows = A(ARG_VIEW_KIND + 7);
+  view.tiles_per_row = A(ARG_VIEW_KIND + 8);
+  view.iteration_order = A(ARG_VIEW_KIND + 9);
+  load_array(ARG_VIEW_SHAPE, view.shape);
+  load_array(ARG_VIEW_BATCH_DIMS, view.batch_dims);
+  load_array(ARG_VIEW_ROW_DIMS, view.row_dims);
+  load_array(ARG_VIEW_COL_DIMS, view.col_dims);
+  return view;
+}
+
+void zero_tile_at(uint32_t tile_addr, uint32_t tile_bytes) {
+  volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(tile_addr);
+  uint32_t words = tile_bytes / sizeof(uint32_t);
+  for (uint32_t i = 0; i < words; ++i) {
+    ptr[i] = 0;
+  }
+}
+
+void decompose_into_dims(
+    uint32_t flat,
+    const uint32_t *dims,
+    uint32_t dim_count,
+    const uint32_t *shape,
+    uint32_t *indices) {
+  for (int32_t i = static_cast<int32_t>(dim_count) - 1; i >= 0; --i) {
+    uint32_t dim = dims[i];
+    uint32_t extent = shape[dim];
+    indices[dim] = flat % extent;
+    flat /= extent;
+  }
+}
+
+uint32_t tile_id_for_indices(
+    const View &view,
+    const uint32_t *indices,
+    uint32_t *row_in_tile,
+    uint32_t *col_in_tile) {
+  uint32_t prefix = 0;
+  for (uint32_t dim = 0; dim + 2 < view.rank; ++dim) {
+    prefix = prefix * view.shape[dim] + indices[dim];
+  }
+  uint32_t row = indices[view.rank - 2];
+  uint32_t col = indices[view.rank - 1];
+  *row_in_tile = row % TILE_R;
+  *col_in_tile = col % TILE_C;
+  return (prefix * view.tile_rows + row / TILE_R) * view.tiles_per_row + col / TILE_C;
+}
+
+void read_source_tile(
+    const InterleavedAddrGenFast<true> &input,
+    uint32_t tile_id,
+    uint32_t cb_source) {
+  cb_reserve_back(cb_source, 1);
+  noc_async_read_tile(tile_id, input, get_write_ptr(cb_source));
+  noc_async_read_barrier();
+  cb_push_back(cb_source, 1);
+  cb_wait_front(cb_source, 1);
+}
+
+void ensure_source_tile(
+    const InterleavedAddrGenFast<true> &input,
+    uint32_t tile_id,
+    uint32_t cb_source,
+    uint32_t *loaded_tile) {
+  if (*loaded_tile == tile_id) {
+    return;
+  }
+  if (*loaded_tile != INVALID_TILE) {
+    cb_pop_front(cb_source, 1);
+  }
+  read_source_tile(input, tile_id, cb_source);
+  *loaded_tile = tile_id;
+}
+
+void copy_element_from_source(
+    uint32_t cb_source,
+    uint32_t dst_addr,
+    uint32_t source_row,
+    uint32_t source_col,
+    uint32_t dst_row,
+    uint32_t dst_col) {
+  volatile tt_l1_ptr uint16_t *source =
+      reinterpret_cast<volatile tt_l1_ptr uint16_t *>(get_read_ptr(cb_source));
+  volatile tt_l1_ptr uint16_t *dst = reinterpret_cast<volatile tt_l1_ptr uint16_t *>(dst_addr);
+  dst[tile_element_index(dst_row, dst_col)] =
+      source[tile_element_index(source_row, source_col)];
+}
+
+void fill_transposed_tile(
+    const InterleavedAddrGenFast<true> &input,
+    const View &view,
+    uint32_t batch,
+    uint32_t row_tile,
+    uint32_t col_tile,
+    uint32_t dst_addr,
+    uint32_t tile_bytes,
+    uint32_t cb_source) {
+  zero_tile_at(dst_addr, tile_bytes);
+  uint32_t row_base = row_tile * TILE_R;
+  uint32_t col_base = col_tile * TILE_C;
+  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    return;
+  }
+  uint32_t source_tile =
+      batch * view.tile_rows * view.tiles_per_row + col_tile * view.tiles_per_row + row_tile;
+  read_source_tile(input, source_tile, cb_source);
+  for (uint32_t row = 0; row < TILE_R; ++row) {
+    if (row_base + row >= view.logical_rows) {
+      continue;
+    }
+    for (uint32_t col = 0; col < TILE_C; ++col) {
+      if (col_base + col >= view.logical_cols) {
+        continue;
+      }
+      copy_element_from_source(cb_source, dst_addr, col, row, row, col);
+    }
+  }
+  cb_pop_front(cb_source, 1);
+}
+
+void fill_generic_element(
+    const InterleavedAddrGenFast<true> &input,
+    const View &view,
+    uint32_t cb_source,
+    uint32_t dst_addr,
+    uint32_t *loaded_tile,
+    uint32_t *indices,
+    uint32_t logical_row,
+    uint32_t logical_col,
+    uint32_t dst_row,
+    uint32_t dst_col) {
+  decompose_into_dims(logical_row, view.row_dims, view.row_rank, view.shape, indices);
+  decompose_into_dims(logical_col, view.col_dims, view.col_rank, view.shape, indices);
+  uint32_t source_row = 0;
+  uint32_t source_col = 0;
+  uint32_t source_tile = tile_id_for_indices(view, indices, &source_row, &source_col);
+  ensure_source_tile(input, source_tile, cb_source, loaded_tile);
+  copy_element_from_source(cb_source, dst_addr, source_row, source_col, dst_row, dst_col);
+}
+
+void fill_generic_tile(
+    const InterleavedAddrGenFast<true> &input,
+    const View &view,
+    uint32_t batch,
+    uint32_t row_tile,
+    uint32_t col_tile,
+    uint32_t dst_addr,
+    uint32_t tile_bytes,
+    uint32_t cb_source) {
+  zero_tile_at(dst_addr, tile_bytes);
+  uint32_t row_base = row_tile * TILE_R;
+  uint32_t col_base = col_tile * TILE_C;
+  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    return;
+  }
+
+  uint32_t indices[MAX_RANK];
+  for (uint32_t i = 0; i < MAX_RANK; ++i) {
+    indices[i] = 0;
+  }
+  decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
+
+  uint32_t loaded_tile = INVALID_TILE;
+  if (view.iteration_order == 0) {
+    for (uint32_t row = 0; row < TILE_R; ++row) {
+      uint32_t logical_row = row_base + row;
+      if (logical_row >= view.logical_rows) {
+        continue;
+      }
+      for (uint32_t col = 0; col < TILE_C; ++col) {
+        uint32_t logical_col = col_base + col;
+        if (logical_col >= view.logical_cols) {
+          continue;
+        }
+        fill_generic_element(
+            input,
+            view,
+            cb_source,
+            dst_addr,
+            &loaded_tile,
+            indices,
+            logical_row,
+            logical_col,
+            row,
+            col);
+      }
+    }
+  } else {
+    for (uint32_t col = 0; col < TILE_C; ++col) {
+      uint32_t logical_col = col_base + col;
+      if (logical_col >= view.logical_cols) {
+        continue;
+      }
+      for (uint32_t row = 0; row < TILE_R; ++row) {
+        uint32_t logical_row = row_base + row;
+        if (logical_row >= view.logical_rows) {
+          continue;
+        }
+        fill_generic_element(
+            input,
+            view,
+            cb_source,
+            dst_addr,
+            &loaded_tile,
+            indices,
+            logical_row,
+            logical_col,
+            row,
+            col);
+      }
+    }
+  }
+  if (loaded_tile != INVALID_TILE) {
+    cb_pop_front(cb_source, 1);
+  }
+}
+
+void fill_grouped_rows_tile(
+    const InterleavedAddrGenFast<true> &input,
+    const View &view,
+    uint32_t batch,
+    uint32_t row_tile,
+    uint32_t col_tile,
+    uint32_t dst_addr,
+    uint32_t tile_bytes,
+    uint32_t cb_source) {
+  zero_tile_at(dst_addr, tile_bytes);
+  uint32_t row_base = row_tile * TILE_R;
+  uint32_t col_base = col_tile * TILE_C;
+  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    return;
+  }
+  uint32_t heads = view.shape[2];
+  uint32_t groups = view.shape[3];
+  uint32_t batch_index = batch / heads;
+  uint32_t head_index = batch - batch_index * heads;
+  uint32_t loaded_tile = INVALID_TILE;
+  for (uint32_t row = 0; row < TILE_R; ++row) {
+    uint32_t logical_row = row_base + row;
+    if (logical_row >= view.logical_rows) {
+      continue;
+    }
+    uint32_t query = logical_row / groups;
+    uint32_t group = logical_row - query * groups;
+    uint32_t source_prefix = (batch_index * view.shape[1] + query) * heads + head_index;
+    uint32_t source_tile =
+        (source_prefix * view.tile_rows + group / TILE_R) * view.tiles_per_row + col_tile;
+    ensure_source_tile(input, source_tile, cb_source, &loaded_tile);
+    for (uint32_t col = 0; col < TILE_C; ++col) {
+      if (col_base + col >= view.logical_cols) {
+        continue;
+      }
+      copy_element_from_source(cb_source, dst_addr, group % TILE_R, col, row, col);
+    }
+  }
+  if (loaded_tile != INVALID_TILE) {
+    cb_pop_front(cb_source, 1);
+  }
+}
+
+void fill_token_columns_tile(
+    const InterleavedAddrGenFast<true> &input,
+    const View &view,
+    uint32_t batch,
+    uint32_t row_tile,
+    uint32_t col_tile,
+    uint32_t dst_addr,
+    uint32_t tile_bytes,
+    uint32_t cb_source) {
+  zero_tile_at(dst_addr, tile_bytes);
+  uint32_t row_base = row_tile * TILE_R;
+  uint32_t col_base = col_tile * TILE_C;
+  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    return;
+  }
+  uint32_t heads = view.shape[2];
+  uint32_t batch_index = batch / heads;
+  uint32_t head_index = batch - batch_index * heads;
+  for (uint32_t col = 0; col < TILE_C; ++col) {
+    uint32_t token = col_base + col;
+    if (token >= view.logical_cols) {
+      continue;
+    }
+    uint32_t source_prefix = batch_index * view.shape[1] + token;
+    uint32_t source_tile =
+        (source_prefix * view.tile_rows + head_index / TILE_R) * view.tiles_per_row + row_tile;
+    read_source_tile(input, source_tile, cb_source);
+    for (uint32_t row = 0; row < TILE_R; ++row) {
+      if (row_base + row >= view.logical_rows) {
+        continue;
+      }
+      copy_element_from_source(cb_source, dst_addr, head_index % TILE_R, row, row, col);
+    }
+    cb_pop_front(cb_source, 1);
+  }
+}
+
+void fill_grouped_columns_tile(
+    const InterleavedAddrGenFast<true> &input,
+    const View &view,
+    uint32_t batch,
+    uint32_t row_tile,
+    uint32_t col_tile,
+    uint32_t dst_addr,
+    uint32_t tile_bytes,
+    uint32_t cb_source) {
+  zero_tile_at(dst_addr, tile_bytes);
+  uint32_t row_base = row_tile * TILE_R;
+  uint32_t col_base = col_tile * TILE_C;
+  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    return;
+  }
+  uint32_t batch_size = view.shape[1];
+  uint32_t heads = view.shape[2];
+  uint32_t queries = view.shape[3];
+  uint32_t batch_index = batch / heads;
+  uint32_t head_index = batch - batch_index * heads;
+  uint32_t loaded_tile = INVALID_TILE;
+  for (uint32_t col = 0; col < TILE_C; ++col) {
+    uint32_t logical_col = col_base + col;
+    if (logical_col >= view.logical_cols) {
+      continue;
+    }
+    uint32_t group = logical_col / queries;
+    uint32_t query = logical_col - group * queries;
+    uint32_t source_prefix = (group * batch_size + batch_index) * heads + head_index;
+    uint32_t source_tile =
+        (source_prefix * view.tile_rows + query / TILE_R) * view.tiles_per_row + row_tile;
+    ensure_source_tile(input, source_tile, cb_source, &loaded_tile);
+    for (uint32_t row = 0; row < TILE_R; ++row) {
+      if (row_base + row >= view.logical_rows) {
+        continue;
+      }
+      copy_element_from_source(cb_source, dst_addr, query % TILE_R, row, row, col);
+    }
+  }
+  if (loaded_tile != INVALID_TILE) {
+    cb_pop_front(cb_source, 1);
+  }
+}
+}  // namespace
+
 void kernel_main() {
   constexpr uint32_t cb_in0 = tt::CBIndex::c_0;
+  constexpr uint32_t cb_source = tt::CBIndex::c_2;
   const uint32_t tile_bytes = get_tile_size(cb_in0);
   const uint32_t block_w = A(5);
   const uint32_t block_h = A(6);
@@ -13,6 +414,11 @@ void kernel_main() {
   const uint32_t w_nd = A(13);
   const uint32_t e_nd = A(18);
   const uint32_t logical_mt = A(23);
+  const uint32_t local_batch_count = A(24);
+  const uint32_t batch_start = A(25);
+  const uint32_t total_batch_count = A(26);
+  const uint32_t batch_stride = A(27);
+  const View view = load_view();
   volatile tt_l1_ptr uint32_t *sender_sem = SEM(21);
   volatile tt_l1_ptr uint32_t *recv_sem = SEM(22);
   *recv_sem = VALID;
@@ -22,51 +428,124 @@ void kernel_main() {
       .page_size = tile_bytes,
       .data_format = DataFormat::Float16_b,
   };
-  uint32_t cur_block = A(1);
-  for (uint32_t block = 0; block < nblocks; block++) {
-    cb_reserve_back(cb_in0, block_tiles);
-    uint32_t l1_addr = get_write_ptr(cb_in0);
-    uint32_t start_addr = l1_addr;
-    uint32_t row = cur_block;
-    uint32_t row_tile = row / A(3);
-    uint32_t block_bytes = 0;
-    for (uint32_t h = 0; h < block_h; h++) {
-      uint32_t tile_id = row;
-      for (uint32_t w = 0; w < block_w; w++) {
-        // Padded rows only feed padded outputs, so avoid the out-of-bounds DRAM read.
-        if (row_tile < logical_mt) {
-          noc_async_read_tile(tile_id, in0_gen, l1_addr);
+  for (uint32_t local_batch = 0; local_batch < local_batch_count; local_batch++) {
+    const uint32_t batch = batch_start + local_batch;
+    const bool valid_batch = batch < total_batch_count;
+    uint32_t cur_block = A(1) + batch * batch_stride;
+    for (uint32_t block = 0; block < nblocks; block++) {
+      cb_reserve_back(cb_in0, block_tiles);
+      uint32_t l1_addr = get_write_ptr(cb_in0);
+      uint32_t start_addr = l1_addr;
+      uint32_t row = cur_block;
+      uint32_t row_tile = (row - batch * batch_stride) / A(3);
+      uint32_t block_bytes = 0;
+      if (!valid_batch) {
+        for (uint32_t tile = 0; tile < block_tiles; ++tile) {
+          zero_tile_at(l1_addr, tile_bytes);
+          l1_addr += tile_bytes;
+          block_bytes += tile_bytes;
         }
-        l1_addr += tile_bytes;
-        tile_id += A(2);
-        block_bytes += tile_bytes;
+      } else if (view.kind == VIEW_CONTIGUOUS) {
+        for (uint32_t h = 0; h < block_h; h++) {
+          uint32_t tile_id = row;
+          for (uint32_t w = 0; w < block_w; w++) {
+            if (row_tile < logical_mt) {
+              noc_async_read_tile(tile_id, in0_gen, l1_addr);
+            }
+            l1_addr += tile_bytes;
+            tile_id += A(2);
+            block_bytes += tile_bytes;
+          }
+          row += A(3);
+          row_tile++;
+        }
+        noc_async_read_barrier();
+      } else {
+        uint32_t canonical_base = cur_block - batch * batch_stride;
+        for (uint32_t h = 0; h < block_h; h++) {
+          for (uint32_t w = 0; w < block_w; w++) {
+            uint32_t canonical_tile = canonical_base + h * A(3) + w;
+            uint32_t canonical_row_tile = canonical_tile / A(3);
+            uint32_t canonical_col_tile = canonical_tile - canonical_row_tile * A(3);
+            if (view.kind == VIEW_TRANSPOSE_LAST_TWO) {
+              fill_transposed_tile(
+                  in0_gen,
+                  view,
+                  batch,
+                  canonical_row_tile,
+                  canonical_col_tile,
+                  l1_addr,
+                  tile_bytes,
+                  cb_source);
+            } else if (view.kind == VIEW_GROUPED_ROWS) {
+              fill_grouped_rows_tile(
+                  in0_gen,
+                  view,
+                  batch,
+                  canonical_row_tile,
+                  canonical_col_tile,
+                  l1_addr,
+                  tile_bytes,
+                  cb_source);
+            } else if (view.kind == VIEW_TOKEN_COLUMNS) {
+              fill_token_columns_tile(
+                  in0_gen,
+                  view,
+                  batch,
+                  canonical_row_tile,
+                  canonical_col_tile,
+                  l1_addr,
+                  tile_bytes,
+                  cb_source);
+            } else if (view.kind == VIEW_GROUPED_COLUMNS) {
+              fill_grouped_columns_tile(
+                  in0_gen,
+                  view,
+                  batch,
+                  canonical_row_tile,
+                  canonical_col_tile,
+                  l1_addr,
+                  tile_bytes,
+                  cb_source);
+            } else {
+              fill_generic_tile(
+                  in0_gen,
+                  view,
+                  batch,
+                  canonical_row_tile,
+                  canonical_col_tile,
+                  l1_addr,
+                  tile_bytes,
+                  cb_source);
+            }
+            l1_addr += tile_bytes;
+            block_bytes += tile_bytes;
+          }
+        }
       }
-      row += A(3);
-      row_tile++;
-    }
-    cur_block += A(4);
-    noc_async_read_barrier();
+      cur_block += A(4);
 
-    noc_semaphore_wait(sender_sem, w_nd + e_nd);
-    noc_semaphore_set(sender_sem, 0);
-    if (w_nd > 0) {
-      uint64_t wa = get_noc_multicast_addr(A(9), A(10), A(11), A(12), start_addr);
-      noc_async_write_multicast(start_addr, wa, block_bytes, w_nd);
-      noc_async_writes_flushed();
-      noc_semaphore_set_multicast(
-          get_semaphore(A(22)),
-          get_noc_multicast_addr(A(9), A(10), A(11), A(12), get_semaphore(A(22))),
-          w_nd);
+      noc_semaphore_wait(sender_sem, w_nd + e_nd);
+      noc_semaphore_set(sender_sem, 0);
+      if (w_nd > 0) {
+        uint64_t wa = get_noc_multicast_addr(A(9), A(10), A(11), A(12), start_addr);
+        noc_async_write_multicast(start_addr, wa, block_bytes, w_nd);
+        noc_async_writes_flushed();
+        noc_semaphore_set_multicast(
+            get_semaphore(A(22)),
+            get_noc_multicast_addr(A(9), A(10), A(11), A(12), get_semaphore(A(22))),
+            w_nd);
+      }
+      if (e_nd > 0) {
+        uint64_t ea = get_noc_multicast_addr(A(14), A(15), A(16), A(17), start_addr);
+        noc_async_write_multicast(start_addr, ea, block_bytes, e_nd);
+        noc_async_writes_flushed();
+        noc_semaphore_set_multicast(
+            get_semaphore(A(22)),
+            get_noc_multicast_addr(A(14), A(15), A(16), A(17), get_semaphore(A(22))),
+            e_nd);
+      }
+      cb_push_back(cb_in0, block_tiles);
     }
-    if (e_nd > 0) {
-      uint64_t ea = get_noc_multicast_addr(A(14), A(15), A(16), A(17), start_addr);
-      noc_async_write_multicast(start_addr, ea, block_bytes, e_nd);
-      noc_async_writes_flushed();
-      noc_semaphore_set_multicast(
-          get_semaphore(A(22)),
-          get_noc_multicast_addr(A(14), A(15), A(16), A(17), get_semaphore(A(22))),
-          e_nd);
-    }
-    cb_push_back(cb_in0, block_tiles);
   }
 }

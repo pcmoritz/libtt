@@ -1,6 +1,6 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, MathFidelity, Program};
-use crate::dram::{DType, DramBuffer};
+use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
 use crate::kernels::kernel::{Kernel, RuntimeArgs, RuntimeArgsBuilder};
 use crate::log::log;
@@ -17,15 +17,60 @@ const NUM_SEMAPHORES: usize = 4;
 const READER_LHS_ADDR_INDEX: usize = 0;
 const WRITER_RHS_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
+const MAX_RANK: usize = 8;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct MatmulProgramKey {
     logical_mt: usize,
     logical_kt: usize,
     logical_nt: usize,
+    batch_count: usize,
+    lhs_view: MatmulOperandView,
+    rhs_view: MatmulOperandView,
     cores: Arc<[CoreCoord]>,
     math_fidelity: MathFidelity,
     output_dtype: DType,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum MatmulViewKind {
+    Contiguous,
+    TransposeLastTwo,
+    Generic,
+    GroupedRows,
+    TokenColumns,
+    GroupedColumns,
+}
+
+impl MatmulViewKind {
+    fn runtime_value(self) -> u32 {
+        match self {
+            Self::Contiguous => 0,
+            Self::TransposeLastTwo => 1,
+            Self::Generic => 2,
+            Self::GroupedRows => 3,
+            Self::TokenColumns => 4,
+            Self::GroupedColumns => 5,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct MatmulOperandView {
+    kind: MatmulViewKind,
+    rank: u32,
+    batch_rank: u32,
+    row_rank: u32,
+    col_rank: u32,
+    logical_rows: u32,
+    logical_cols: u32,
+    tile_rows: u32,
+    tiles_per_row: u32,
+    iteration_order: u32,
+    shape: [u32; MAX_RANK],
+    batch_dims: [u32; MAX_RANK],
+    row_dims: [u32; MAX_RANK],
+    col_dims: [u32; MAX_RANK],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +78,10 @@ struct MatmulPlan {
     rows: Vec<u8>,
     cols: Vec<u8>,
     direct_grid: Option<Vec<Vec<CoreCoord>>>,
+    grid_rows_per_batch: usize,
+    grid_cols_per_batch: usize,
+    batch_groups: usize,
+    batches_per_group: usize,
     mt: usize,
     kt: usize,
     nt: usize,
@@ -102,6 +151,7 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
             self.key.logical_mt * 32,
             self.key.logical_kt * 32,
             self.key.logical_nt * 32,
+            self.key.batch_count,
             &self.key.cores,
         )?;
         log_matmul_plan(&plan);
@@ -109,6 +159,9 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
             &plan,
             self.key.logical_mt,
             self.key.logical_nt,
+            self.key.batch_count,
+            &self.key.lhs_view,
+            &self.key.rhs_view,
             self.key.math_fidelity,
             self.key.output_dtype,
         )
@@ -132,19 +185,17 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
     }
 }
 
-pub(crate) fn matmul_bf16(
+pub(crate) fn matmul_bf16_dot_general(
     device: &mut Device,
     lhs: &DramBuffer,
     rhs: &DramBuffer,
-    name: impl Into<String>,
-) -> io::Result<DramBuffer> {
-    matmul_bf16_with_output_dtype(device, lhs, rhs, DType::Float16B, name)
-}
-
-pub(crate) fn matmul_bf16_with_output_dtype(
-    device: &mut Device,
-    lhs: &DramBuffer,
-    rhs: &DramBuffer,
+    lhs_logical_shape: &[usize],
+    rhs_logical_shape: &[usize],
+    output_logical_shape: &[usize],
+    lhs_batching_dimensions: &[i64],
+    rhs_batching_dimensions: &[i64],
+    lhs_contracting_dimensions: &[i64],
+    rhs_contracting_dimensions: &[i64],
     output_dtype: DType,
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
@@ -160,33 +211,40 @@ pub(crate) fn matmul_bf16_with_output_dtype(
         )));
     }
 
-    let (m, k) = shape_2d(lhs, "lhs")?;
-    let (rhs_k, n) = shape_2d(rhs, "rhs")?;
-    if k != rhs_k {
-        return Err(invalid_input(format!(
-            "matmul inner dimensions must match, got {k} and {rhs_k}"
-        )));
-    }
-    if m % 32 != 0 || k % 32 != 0 || n % 32 != 0 {
-        return Err(invalid_input(format!(
-            "matmul_bf16 requires 32x32 tiled shapes, got lhs={:?} rhs={:?}",
-            lhs.shape, rhs.shape
-        )));
-    }
-    validate_tile_count(lhs, m / 32 * k / 32, "lhs")?;
-    validate_tile_count(rhs, k / 32 * n / 32, "rhs")?;
+    let shape = dot_general_shape(
+        lhs_logical_shape,
+        rhs_logical_shape,
+        output_logical_shape,
+        lhs_batching_dimensions,
+        rhs_batching_dimensions,
+        lhs_contracting_dimensions,
+        rhs_contracting_dimensions,
+    )?;
+    validate_logical_buffer(lhs, lhs_logical_shape, "lhs")?;
+    validate_logical_buffer(rhs, rhs_logical_shape, "rhs")?;
+    validate_tile_count(lhs, tiled_shape_tile_count(lhs_logical_shape)?, "lhs")?;
+    validate_tile_count(rhs, tiled_shape_tile_count(rhs_logical_shape)?, "rhs")?;
 
     let output_name = name.into();
-    let logical_mt = m / 32;
-    let logical_kt = k / 32;
-    let logical_nt = n / 32;
+    let logical_mt = ceil32(shape.m) / 32;
+    let logical_kt = ceil32(shape.k) / 32;
+    let logical_nt = ceil32(shape.n) / 32;
+    log(format!(
+        "matmul_bf16 dot_general: M={} K={} N={} batches={} lhs_view={:?} rhs_view={:?}",
+        shape.m, shape.k, shape.n, shape.batch_count, shape.lhs_view.kind, shape.rhs_view.kind
+    ));
     let math_fidelity = matmul_math_fidelity()?;
     let cores = device.cores_arc();
-    let output = device.alloc(logical_mt * logical_nt, output_dtype, &[m, n], output_name)?;
+    let output_tiles = tiled_shape_tile_count(output_logical_shape)?;
+    let output_shape = tiled_allocation_shape(output_logical_shape)?;
+    let output = device.alloc(output_tiles, output_dtype, &output_shape, output_name)?;
     let key = MatmulProgramKey {
         logical_mt,
         logical_kt,
         logical_nt,
+        batch_count: shape.batch_count,
+        lhs_view: shape.lhs_view,
+        rhs_view: shape.rhs_view,
         cores,
         math_fidelity,
         output_dtype,
@@ -206,12 +264,14 @@ fn log_matmul_plan(plan: &MatmulPlan) {
     let grid_rows = grid.len();
     let grid_cols = grid.first().map_or(0, Vec::len);
     log(format!(
-        "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} mode={} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
+        "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} batch_groups={} batches_per_group={} mode={} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
         plan.mt,
         plan.kt,
         plan.nt,
         grid_rows,
         grid_cols,
+        plan.batch_groups,
+        plan.batches_per_group,
         if plan.direct_grid.is_some() { "direct" } else { "mcast" },
         plan.per_core_m,
         plan.per_core_n,
@@ -222,14 +282,293 @@ fn log_matmul_plan(plan: &MatmulPlan) {
     ));
 }
 
-fn shape_2d(buffer: &DramBuffer, name: &str) -> io::Result<(usize, usize)> {
-    let shape = &buffer.shape;
-    if shape.len() != 2 {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DotGeneralMatmulShape {
+    batch_count: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    lhs_view: MatmulOperandView,
+    rhs_view: MatmulOperandView,
+}
+
+fn dot_general_shape(
+    lhs_shape: &[usize],
+    rhs_shape: &[usize],
+    output_shape: &[usize],
+    lhs_batching_dimensions: &[i64],
+    rhs_batching_dimensions: &[i64],
+    lhs_contracting_dimensions: &[i64],
+    rhs_contracting_dimensions: &[i64],
+) -> io::Result<DotGeneralMatmulShape> {
+    if !(2..=MAX_RANK).contains(&lhs_shape.len())
+        || !(2..=MAX_RANK).contains(&rhs_shape.len())
+        || output_shape.len() < 2
+    {
         return Err(invalid_input(format!(
-            "matmul_bf16 requires rank-2 {name} input, got shape {shape:?}"
+            "dot_general matmul requires lhs/rhs ranks in 2..={MAX_RANK} and output rank >= 2, got lhs={lhs_shape:?} rhs={rhs_shape:?} output={output_shape:?}"
         )));
     }
-    Ok((shape[0], shape[1]))
+    if lhs_shape.contains(&0) || rhs_shape.contains(&0) || output_shape.contains(&0) {
+        return Err(invalid_input(
+            "dot_general matmul zero-sized dimensions are not currently supported",
+        ));
+    }
+    if lhs_batching_dimensions.len() != rhs_batching_dimensions.len() {
+        return Err(invalid_input(format!(
+            "dot_general lhs/rhs batching dimension counts must match, got {} and {}",
+            lhs_batching_dimensions.len(),
+            rhs_batching_dimensions.len()
+        )));
+    }
+    if lhs_contracting_dimensions.len() != rhs_contracting_dimensions.len() {
+        return Err(invalid_input(format!(
+            "dot_general lhs/rhs contracting dimension counts must match, got {} and {}",
+            lhs_contracting_dimensions.len(),
+            rhs_contracting_dimensions.len()
+        )));
+    }
+
+    let lhs_dims = dot_general_dims(
+        lhs_shape.len(),
+        lhs_batching_dimensions,
+        lhs_contracting_dimensions,
+        "lhs",
+    )?;
+    let rhs_dims = dot_general_dims(
+        rhs_shape.len(),
+        rhs_batching_dimensions,
+        rhs_contracting_dimensions,
+        "rhs",
+    )?;
+
+    let mut batch_shape = Vec::with_capacity(lhs_dims.batch.len());
+    for (&lhs_dim, &rhs_dim) in lhs_dims.batch.iter().zip(&rhs_dims.batch) {
+        if lhs_shape[lhs_dim] != rhs_shape[rhs_dim] {
+            return Err(invalid_input(format!(
+                "dot_general batch dimensions must match, got lhs dim {lhs_dim}={} and rhs dim {rhs_dim}={}",
+                lhs_shape[lhs_dim], rhs_shape[rhs_dim]
+            )));
+        }
+        batch_shape.push(lhs_shape[lhs_dim]);
+    }
+    for (&lhs_dim, &rhs_dim) in lhs_dims.contract.iter().zip(&rhs_dims.contract) {
+        if lhs_shape[lhs_dim] != rhs_shape[rhs_dim] {
+            return Err(invalid_input(format!(
+                "dot_general contracting dimensions must match, got lhs dim {lhs_dim}={} and rhs dim {rhs_dim}={}",
+                lhs_shape[lhs_dim], rhs_shape[rhs_dim]
+            )));
+        }
+    }
+
+    let batch_count = checked_product(&batch_shape, "dot_general batch dimensions")?;
+    let m = checked_product_of_dims(lhs_shape, &lhs_dims.free, "lhs free dimensions")?;
+    let k = checked_product_of_dims(lhs_shape, &lhs_dims.contract, "lhs contracting dimensions")?;
+    let rhs_k =
+        checked_product_of_dims(rhs_shape, &rhs_dims.contract, "rhs contracting dimensions")?;
+    let n = checked_product_of_dims(rhs_shape, &rhs_dims.free, "rhs free dimensions")?;
+    if k != rhs_k {
+        return Err(invalid_input(format!(
+            "dot_general contracting dimension products must match, got {k} and {rhs_k}"
+        )));
+    }
+
+    let mut expected_output = batch_shape;
+    expected_output.push(m);
+    expected_output.push(n);
+    if output_shape != expected_output {
+        return Err(invalid_input(format!(
+            "dot_general matmul output shape mismatch: expected canonical shape {:?}, got {output_shape:?}",
+            expected_output
+        )));
+    }
+
+    Ok(DotGeneralMatmulShape {
+        batch_count,
+        m,
+        k,
+        n,
+        lhs_view: operand_view(
+            lhs_shape,
+            &lhs_dims.batch,
+            &lhs_dims.free,
+            &lhs_dims.contract,
+            m,
+            k,
+        )?,
+        rhs_view: operand_view(
+            rhs_shape,
+            &rhs_dims.batch,
+            &rhs_dims.contract,
+            &rhs_dims.free,
+            k,
+            n,
+        )?,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DotGeneralDims {
+    batch: Vec<usize>,
+    contract: Vec<usize>,
+    free: Vec<usize>,
+}
+
+fn dot_general_dims(
+    rank: usize,
+    batch_dimensions: &[i64],
+    contracting_dimensions: &[i64],
+    name: &str,
+) -> io::Result<DotGeneralDims> {
+    let mut used = vec![false; rank];
+    let mut parse_dims = |dims: &[i64], kind: &str| -> io::Result<Vec<usize>> {
+        let mut parsed = Vec::with_capacity(dims.len());
+        for &dim in dims {
+            let dim = usize::try_from(dim).map_err(|_| {
+                invalid_input(format!("dot_general {name} {kind} dimensions must be >= 0"))
+            })?;
+            if dim >= rank {
+                return Err(invalid_input(format!(
+                    "dot_general {name} {kind} dimension {dim} is out of bounds for rank {rank}"
+                )));
+            }
+            if std::mem::replace(&mut used[dim], true) {
+                return Err(invalid_input(format!(
+                    "dot_general {name} dimension {dim} is used more than once"
+                )));
+            }
+            parsed.push(dim);
+        }
+        Ok(parsed)
+    };
+
+    let batch = parse_dims(batch_dimensions, "batching")?;
+    let contract = parse_dims(contracting_dimensions, "contracting")?;
+    let free = (0..rank).filter(|&dim| !used[dim]).collect::<Vec<_>>();
+    Ok(DotGeneralDims {
+        batch,
+        contract,
+        free,
+    })
+}
+
+fn checked_product_of_dims(shape: &[usize], dims: &[usize], name: &str) -> io::Result<usize> {
+    dims.iter()
+        .map(|&dim| shape[dim])
+        .try_fold(1usize, |acc, value| {
+            acc.checked_mul(value)
+                .ok_or_else(|| invalid_input(format!("{name} product overflow")))
+        })
+}
+
+fn operand_view(
+    shape: &[usize],
+    batch_dims: &[usize],
+    row_dims: &[usize],
+    col_dims: &[usize],
+    logical_rows: usize,
+    logical_cols: usize,
+) -> io::Result<MatmulOperandView> {
+    let allocation_shape = tiled_allocation_shape(shape)?;
+    let rank = shape.len();
+    let kind = operand_view_kind(rank, batch_dims, row_dims, col_dims);
+    let iteration_order = if row_dims.contains(&(rank - 1)) && !col_dims.contains(&(rank - 1)) {
+        1
+    } else {
+        0
+    };
+    Ok(MatmulOperandView {
+        kind,
+        rank: u32_value(rank, "matmul operand rank")?,
+        batch_rank: u32_value(batch_dims.len(), "matmul operand batch rank")?,
+        row_rank: u32_value(row_dims.len(), "matmul operand row rank")?,
+        col_rank: u32_value(col_dims.len(), "matmul operand column rank")?,
+        logical_rows: u32_value(logical_rows, "matmul operand logical rows")?,
+        logical_cols: u32_value(logical_cols, "matmul operand logical columns")?,
+        tile_rows: u32_value(
+            allocation_shape[rank - 2] / 32,
+            "matmul operand source tile rows",
+        )?,
+        tiles_per_row: u32_value(
+            allocation_shape[rank - 1] / 32,
+            "matmul operand source tiles per row",
+        )?,
+        iteration_order,
+        shape: padded_u32_array(shape, "matmul operand shape")?,
+        batch_dims: padded_dim_array(batch_dims, "matmul operand batch dimensions")?,
+        row_dims: padded_dim_array(row_dims, "matmul operand row dimensions")?,
+        col_dims: padded_dim_array(col_dims, "matmul operand column dimensions")?,
+    })
+}
+
+fn operand_view_kind(
+    rank: usize,
+    batch_dims: &[usize],
+    row_dims: &[usize],
+    col_dims: &[usize],
+) -> MatmulViewKind {
+    let leading_batch = batch_dims.iter().copied().eq(0..batch_dims.len());
+    if leading_batch
+        && rank == batch_dims.len() + 2
+        && row_dims == [rank - 2]
+        && col_dims == [rank - 1]
+    {
+        MatmulViewKind::Contiguous
+    } else if leading_batch
+        && rank == batch_dims.len() + 2
+        && row_dims == [rank - 1]
+        && col_dims == [rank - 2]
+    {
+        MatmulViewKind::TransposeLastTwo
+    } else if rank == 5 && batch_dims == [0, 2] && row_dims == [1, 3] && col_dims == [4] {
+        MatmulViewKind::GroupedRows
+    } else if rank == 4 && batch_dims == [0, 2] && row_dims == [3] && col_dims == [1] {
+        MatmulViewKind::TokenColumns
+    } else if rank == 5 && batch_dims == [1, 2] && row_dims == [4] && col_dims == [0, 3] {
+        MatmulViewKind::GroupedColumns
+    } else {
+        MatmulViewKind::Generic
+    }
+}
+
+fn padded_u32_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]> {
+    if values.len() > MAX_RANK {
+        return Err(invalid_input(format!(
+            "{name} rank {} exceeds maximum rank {MAX_RANK}",
+            values.len()
+        )));
+    }
+    let mut result = [0u32; MAX_RANK];
+    for (index, &value) in values.iter().enumerate() {
+        result[index] = u32_value(value, name)?;
+    }
+    Ok(result)
+}
+
+fn padded_dim_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]> {
+    padded_u32_array(values, name)
+}
+
+fn validate_logical_buffer(
+    buffer: &DramBuffer,
+    logical_shape: &[usize],
+    name: &str,
+) -> io::Result<()> {
+    let expected_shape = tiled_allocation_shape(logical_shape)?;
+    if buffer.shape != expected_shape {
+        return Err(invalid_input(format!(
+            "{name} allocation shape mismatch: got {:?}, expected {:?} for logical shape {:?}",
+            buffer.shape, expected_shape, logical_shape
+        )));
+    }
+    Ok(())
+}
+
+fn checked_product(values: &[usize], name: &str) -> io::Result<usize> {
+    values.iter().try_fold(1usize, |acc, &value| {
+        acc.checked_mul(value)
+            .ok_or_else(|| invalid_input(format!("{name} product overflow")))
+    })
 }
 
 fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::Result<()> {
@@ -242,7 +581,13 @@ fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::
     Ok(())
 }
 
-fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
+fn plan_matmul(
+    m: usize,
+    k: usize,
+    n: usize,
+    batch_count: usize,
+    cores: &[CoreCoord],
+) -> io::Result<MatmulPlan> {
     let mt_base = ceil32(m) / 32;
     let kt = ceil32(k) / 32;
     let nt_base = (ceil32(n) / 32).max(1);
@@ -330,6 +675,8 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
                                     rows.to_vec(),
                                     cols.to_vec(),
                                     None,
+                                    nr,
+                                    nc,
                                     mt,
                                     nt,
                                     per_core_m,
@@ -350,6 +697,8 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
         rows,
         cols,
         direct_grid,
+        grid_rows_per_batch,
+        grid_cols_per_batch,
         mt,
         nt,
         per_core_m,
@@ -361,6 +710,7 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
         plan_direct_matmul(
             mt_base,
             nt_base,
+            1,
             &ordered,
             &kt_divs,
             tile_bytes,
@@ -374,25 +724,46 @@ fn plan_matmul(m: usize, k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<
         )));
     };
 
-    Ok(MatmulPlan {
+    let mut plan = MatmulPlan {
         mt,
         kt,
         nt,
         rows,
         cols,
         direct_grid,
+        grid_rows_per_batch,
+        grid_cols_per_batch,
+        batch_groups: 1,
+        batches_per_group: batch_count,
         per_core_m,
         per_core_n,
         in0_block_w,
         out_subblock_h,
         out_subblock_w,
-    })
+    };
+
+    if let Some(batched) = plan_batched_direct_matmul(
+        mt_base,
+        kt,
+        nt_base,
+        batch_count,
+        &ordered,
+        &kt_divs,
+        tile_bytes,
+        l1_data_bytes,
+        &plan,
+    ) {
+        plan = batched;
+    }
+
+    Ok(plan)
 }
 
 #[allow(clippy::type_complexity)]
 fn plan_direct_matmul(
     mt_base: usize,
     nt_base: usize,
+    batch_groups: usize,
     cores: &[CoreCoord],
     kt_divs: &[usize],
     tile_bytes: usize,
@@ -408,8 +779,10 @@ fn plan_direct_matmul(
     usize,
     usize,
     usize,
+    usize,
+    usize,
 )> {
-    if mt_base == 0 || nt_base == 0 {
+    if mt_base == 0 || nt_base == 0 || batch_groups == 0 {
         return None;
     }
 
@@ -419,7 +792,11 @@ fn plan_direct_matmul(
     for logical_rows in 1..=max_rows {
         let max_cols = nt_base.min(cores.len() / logical_rows);
         for logical_cols in 1..=max_cols {
-            let active_cores = logical_rows * logical_cols;
+            let active_cores_per_group = logical_rows * logical_cols;
+            let active_cores = active_cores_per_group * batch_groups;
+            if active_cores > cores.len() {
+                continue;
+            }
             let per_core_m = mt_base.div_ceil(logical_rows);
             let per_core_n = nt_base.div_ceil(logical_cols);
             let mt = logical_rows * per_core_m;
@@ -470,6 +847,8 @@ fn plan_direct_matmul(
                                         .map(|row| row.to_vec())
                                         .collect(),
                                 ),
+                                logical_rows,
+                                logical_cols,
                                 mt,
                                 nt,
                                 per_core_m,
@@ -478,6 +857,116 @@ fn plan_direct_matmul(
                                 out_subblock_h,
                                 out_subblock_w,
                             ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    best
+}
+
+fn plan_batched_direct_matmul(
+    mt_base: usize,
+    kt: usize,
+    nt_base: usize,
+    batch_count: usize,
+    cores: &[CoreCoord],
+    kt_divs: &[usize],
+    tile_bytes: usize,
+    l1_data_bytes: usize,
+    single_group_plan: &MatmulPlan,
+) -> Option<MatmulPlan> {
+    if batch_count <= 1 || mt_base == 0 || nt_base == 0 {
+        return None;
+    }
+
+    let single_group_work = single_group_plan
+        .batches_per_group
+        .saturating_mul(single_group_plan.num_blocks())
+        .saturating_mul(single_group_plan.per_core_m)
+        .saturating_mul(single_group_plan.per_core_n);
+    let mut best = None;
+    let mut best_score = None;
+    let max_groups = batch_count.min(cores.len());
+    for batch_groups in 2..=max_groups {
+        let max_group_cores = cores.len() / batch_groups;
+        if max_group_cores == 0 {
+            continue;
+        }
+        let batches_per_group = batch_count.div_ceil(batch_groups);
+        for logical_rows in 1..=mt_base.min(max_group_cores) {
+            let max_cols = nt_base.min(max_group_cores / logical_rows);
+            for logical_cols in 1..=max_cols {
+                let active_cores_per_group = logical_rows * logical_cols;
+                let active_cores = active_cores_per_group * batch_groups;
+                let per_core_m = mt_base.div_ceil(logical_rows);
+                let per_core_n = nt_base.div_ceil(logical_cols);
+                let mt = logical_rows * per_core_m;
+                let nt = logical_cols * per_core_n;
+                let out_tiles = per_core_m * per_core_n;
+                let bw_cap = if out_tiles <= 16 { 32 } else { 64 };
+                for out_subblock_h in 1..=8 {
+                    for out_subblock_w in 1..=8 {
+                        let out_subblock_num_tiles = out_subblock_h * out_subblock_w;
+                        if out_subblock_num_tiles > 8
+                            || per_core_m % out_subblock_h != 0
+                            || per_core_n % out_subblock_w != 0
+                        {
+                            continue;
+                        }
+                        for &in0_block_w in kt_divs {
+                            if in0_block_w > bw_cap
+                                || !fits_l1(
+                                    per_core_m,
+                                    per_core_n,
+                                    in0_block_w,
+                                    tile_bytes,
+                                    l1_data_bytes,
+                                )
+                            {
+                                continue;
+                            }
+                            let num_blocks = kt / in0_block_w;
+                            let per_core_work =
+                                batches_per_group * num_blocks * per_core_m * per_core_n;
+                            if per_core_work >= single_group_work {
+                                continue;
+                            }
+                            let padding = (mt * nt - mt_base * nt_base) * batch_groups;
+                            let score = (
+                                usize::MAX - per_core_work,
+                                active_cores,
+                                usize::MAX - padding,
+                                in0_block_w,
+                                out_subblock_num_tiles,
+                            );
+                            if best_score.map_or(true, |current| score > current) {
+                                best_score = Some(score);
+                                best = Some(MatmulPlan {
+                                    rows: Vec::new(),
+                                    cols: Vec::new(),
+                                    direct_grid: Some(
+                                        cores[..active_cores]
+                                            .chunks(logical_cols)
+                                            .map(|row| row.to_vec())
+                                            .collect(),
+                                    ),
+                                    grid_rows_per_batch: logical_rows,
+                                    grid_cols_per_batch: logical_cols,
+                                    batch_groups,
+                                    batches_per_group,
+                                    mt,
+                                    kt,
+                                    nt,
+                                    per_core_m,
+                                    per_core_n,
+                                    in0_block_w,
+                                    out_subblock_h,
+                                    out_subblock_w,
+                                });
+                            }
                         }
                     }
                 }
@@ -498,7 +987,8 @@ fn fits_l1(
     let cb0 = 2 * per_core_m * in0_block_w * tile_bytes;
     let cb1 = 2 * per_core_n * in0_block_w * tile_bytes;
     let cb_out = per_core_m * per_core_n * tile_bytes;
-    cb0 + cb1 + cb_out <= l1_data_bytes
+    let transpose_scratch = 2 * tile_bytes;
+    cb0 + cb1 + cb_out + transpose_scratch <= l1_data_bytes
 }
 
 fn ceil32(value: usize) -> usize {
@@ -525,6 +1015,9 @@ fn bf16_program(
     plan: &MatmulPlan,
     logical_mt: usize,
     logical_nt: usize,
+    batch_count: usize,
+    lhs_view: &MatmulOperandView,
+    rhs_view: &MatmulOperandView,
     math_fidelity: MathFidelity,
     output_dtype: DType,
 ) -> io::Result<Program> {
@@ -540,6 +1033,16 @@ fn bf16_program(
             tiles: plan.cb1_pages(),
         },
         CBConfig {
+            index: 2,
+            dtype: DType::Float16B,
+            tiles: 1,
+        },
+        CBConfig {
+            index: 3,
+            dtype: DType::Float16B,
+            tiles: 1,
+        },
+        CBConfig {
             index: 16,
             dtype: output_dtype,
             tiles: plan.out_block_num_tiles(),
@@ -550,11 +1053,22 @@ fn bf16_program(
             tiles: plan.out_block_num_tiles(),
         },
     ];
-    let runtime_args = lower_runtime_args(plan, logical_mt, logical_nt)?;
+    let runtime_args = lower_runtime_args(
+        plan,
+        logical_mt,
+        logical_nt,
+        batch_count,
+        lhs_view,
+        rhs_view,
+    )?;
     Ok(Program {
         reader_kernel: BF16_READER_SENDER.to_owned(),
         writer_kernel: BF16_WRITER_SENDER.to_owned(),
-        compute_kernel: compute_src(plan),
+        compute_kernel: compute_src(
+            plan,
+            plan.batches_per_group,
+            rhs_view.kind == MatmulViewKind::TransposeLastTwo,
+        ),
         reader_recv_kernel: BF16_READER_RECV.to_owned(),
         writer_recv_kernel: BF16_WRITER_RECV.to_owned(),
         name: format!(
@@ -582,6 +1096,9 @@ fn lower_runtime_args(
     plan: &MatmulPlan,
     logical_mt: usize,
     logical_nt: usize,
+    batch_count: usize,
+    lhs_view: &MatmulOperandView,
+    rhs_view: &MatmulOperandView,
 ) -> io::Result<RuntimeArgs> {
     let grid = plan_grid(plan);
     let mut runtime_args = RuntimeArgsBuilder::new(
@@ -590,11 +1107,40 @@ fn lower_runtime_args(
         vec![READER_LHS_ADDR_INDEX],
         Vec::new(),
     );
-    for (row_index, row) in grid.iter().enumerate() {
+    for (flat_row_index, row) in grid.iter().enumerate() {
+        let (batch_group, row_index) = if plan.direct_grid.is_some() {
+            (
+                flat_row_index / plan.grid_rows_per_batch,
+                flat_row_index % plan.grid_rows_per_batch,
+            )
+        } else {
+            (0, flat_row_index)
+        };
+        let batch_start = batch_group * plan.batches_per_group;
         for (col_index, &core) in row.iter().enumerate() {
-            let reader = reader_args(plan, &grid, row_index, core, logical_mt)?;
+            let reader = reader_args(
+                plan,
+                &grid,
+                row_index,
+                core,
+                logical_mt,
+                plan.batches_per_group,
+                batch_start,
+                batch_count,
+                lhs_view,
+            )?;
             let writer = writer_args(
-                plan, &grid, row_index, col_index, core, logical_mt, logical_nt,
+                plan,
+                &grid,
+                row_index,
+                col_index,
+                core,
+                logical_mt,
+                logical_nt,
+                plan.batches_per_group,
+                batch_start,
+                batch_count,
+                rhs_view,
             )?;
             runtime_args.add_core(core, writer, reader, Vec::new())?;
         }
@@ -639,6 +1185,10 @@ fn reader_args(
     row_index: usize,
     core: CoreCoord,
     logical_mt: usize,
+    local_batch_count: usize,
+    batch_start: usize,
+    total_batch_count: usize,
+    lhs_view: &MatmulOperandView,
 ) -> io::Result<Vec<u32>> {
     let (w_rect, e_rect, sender) = if plan.direct_grid.is_some() {
         ([0, 0, 0, 0, 0], [0, 0, 0, 0, 0], core)
@@ -698,7 +1248,12 @@ fn reader_args(
         0,
         1,
         u32_value(logical_mt, "logical M tiles")?,
+        u32_value(local_batch_count, "local batch count")?,
+        u32_value(batch_start, "batch start")?,
+        u32_value(total_batch_count, "total batch count")?,
+        u32_value(logical_mt * plan.kt, "lhs batch stride")?,
     ]);
+    append_view_args(&mut args, lhs_view);
     Ok(args)
 }
 
@@ -710,6 +1265,10 @@ fn writer_args(
     core: CoreCoord,
     logical_mt: usize,
     logical_nt: usize,
+    local_batch_count: usize,
+    batch_start: usize,
+    total_batch_count: usize,
+    rhs_view: &MatmulOperandView,
 ) -> io::Result<Vec<u32>> {
     let mcast = if plan.direct_grid.is_some() || plan.rows.len() <= 1 {
         [0, 0, 0, 0, 0]
@@ -763,8 +1322,33 @@ fn writer_args(
         u32_value(logical_mt, "logical M tiles")?,
         u32_value(logical_nt, "logical N tiles")?,
         0,
+        u32_value(local_batch_count, "local batch count")?,
+        u32_value(batch_start, "batch start")?,
+        u32_value(total_batch_count, "total batch count")?,
+        u32_value(plan.kt * logical_nt, "rhs batch stride")?,
+        u32_value(logical_mt * logical_nt, "output batch stride")?,
     ]);
+    append_view_args(&mut args, rhs_view);
     Ok(args)
+}
+
+fn append_view_args(args: &mut Vec<u32>, view: &MatmulOperandView) {
+    args.extend([
+        view.kind.runtime_value(),
+        view.rank,
+        view.batch_rank,
+        view.row_rank,
+        view.col_rank,
+        view.logical_rows,
+        view.logical_cols,
+        view.tile_rows,
+        view.tiles_per_row,
+        view.iteration_order,
+    ]);
+    args.extend(view.shape);
+    args.extend(view.batch_dims);
+    args.extend(view.row_dims);
+    args.extend(view.col_dims);
 }
 
 fn mcast_rect_args(cols: &[u8], y: u8) -> [u32; 5] {
@@ -781,8 +1365,10 @@ fn mcast_rect_args(cols: &[u8], y: u8) -> [u32; 5] {
     }
 }
 
-fn compute_src(plan: &MatmulPlan) -> String {
+fn compute_src(plan: &MatmulPlan, batch_count: usize, transpose_b: bool) -> String {
     let replacements = [
+        ("@BATCH_COUNT@", batch_count),
+        ("@TRANSPOSE_B@", usize::from(transpose_b)),
         ("@IN0_BLOCK_W@", plan.in0_block_w),
         ("@IN0_NUM_SUBBLOCKS@", plan.in0_num_subblocks()),
         ("@IN0_BLOCK_NUM_TILES@", plan.in0_block_num_tiles()),
@@ -840,7 +1426,7 @@ mod tests {
 
     #[test]
     fn plan_matmul_uses_exact_tiling() {
-        let plan = plan_matmul(64, 64, 64, &cores(&[1, 2], &[2, 3])).expect("plan");
+        let plan = plan_matmul(64, 64, 64, 1, &cores(&[1, 2], &[2, 3])).expect("plan");
         assert_eq!(plan.mt, 2);
         assert_eq!(plan.kt, 2);
         assert_eq!(plan.nt, 2);
@@ -870,15 +1456,17 @@ mod tests {
 
     #[test]
     fn compute_source_contains_plan_constants() {
-        let plan = plan_matmul(64, 64, 64, &cores(&[1], &[2])).expect("plan");
-        let source = compute_src(&plan);
+        let plan = plan_matmul(64, 64, 64, 1, &cores(&[1], &[2])).expect("plan");
+        let source = compute_src(&plan, 3, true);
         assert!(source.contains("constexpr uint32_t in0_block_w = 2;"));
+        assert!(source.contains("constexpr uint32_t batch_count = 3;"));
+        assert!(source.contains("constexpr uint32_t transpose = 1;"));
         assert!(source.contains("#include \"compute_kernel_api/matmul.h\""));
     }
 
     #[test]
     fn plan_matmul_prefers_square_exact_grid() {
-        let plan = plan_matmul(512, 512, 512, &p100_worker_cores()).expect("plan");
+        let plan = plan_matmul(512, 512, 512, 1, &p100_worker_cores()).expect("plan");
         assert_eq!(plan.per_core_m * plan.rows.len(), plan.mt);
         assert_eq!(plan.per_core_n * plan.cols.len(), plan.nt);
         assert!(plan.mt >= 16);
@@ -887,7 +1475,7 @@ mod tests {
 
     #[test]
     fn plan_matmul_prefers_throughput_for_large_shapes() {
-        let plan = plan_matmul(4096, 8192, 4096, &p100_worker_cores()).expect("plan");
+        let plan = plan_matmul(4096, 8192, 4096, 1, &p100_worker_cores()).expect("plan");
         assert_eq!(plan.rows, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         assert_eq!(plan.cols, vec![1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13]);
         assert_eq!(plan.mt, 130);
@@ -901,7 +1489,7 @@ mod tests {
 
     #[test]
     fn plan_matmul_uses_ceiled_tile_shape() {
-        let plan = plan_matmul(33, 65, 1, &cores(&[1], &[2])).expect("plan");
+        let plan = plan_matmul(33, 65, 1, 1, &cores(&[1], &[2])).expect("plan");
         assert_eq!(plan.mt, 2);
         assert_eq!(plan.kt, 3);
         assert_eq!(plan.nt, 1);
@@ -909,7 +1497,7 @@ mod tests {
 
     #[test]
     fn plan_matmul_uses_direct_grid_for_wide_projection() {
-        let plan = plan_matmul(32, 1024, 151936, &p100_worker_cores()).expect("plan");
+        let plan = plan_matmul(32, 1024, 151936, 1, &p100_worker_cores()).expect("plan");
         let grid = plan.direct_grid.as_ref().expect("direct plan");
         assert_eq!(grid.len(), 1);
         assert_eq!(grid[0].len(), 101);
@@ -922,7 +1510,7 @@ mod tests {
 
     #[test]
     fn plan_matmul_direct_grid_is_not_limited_to_single_m_tile() {
-        let plan = plan_matmul(64, 1024, 151936, &p100_worker_cores()).expect("plan");
+        let plan = plan_matmul(64, 1024, 151936, 1, &p100_worker_cores()).expect("plan");
         let grid = plan.direct_grid.as_ref().expect("direct plan");
         assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 110);
         assert_eq!(plan.mt, 2);
@@ -932,11 +1520,38 @@ mod tests {
     }
 
     #[test]
+    fn plan_matmul_parallelizes_score_batches() {
+        let plan = plan_matmul(54, 128, 27, 8, &p100_worker_cores()).expect("plan");
+        let grid = plan.direct_grid.as_ref().expect("batched direct plan");
+        assert_eq!(plan.batch_groups, 8);
+        assert_eq!(plan.batches_per_group, 1);
+        assert_eq!(plan.grid_rows_per_batch, 2);
+        assert_eq!(plan.grid_cols_per_batch, 1);
+        assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 16);
+        assert_eq!(plan.mt, 2);
+        assert_eq!(plan.nt, 1);
+    }
+
+    #[test]
+    fn plan_matmul_parallelizes_value_batches() {
+        let plan = plan_matmul(128, 27, 54, 8, &p100_worker_cores()).expect("plan");
+        let grid = plan.direct_grid.as_ref().expect("batched direct plan");
+        assert_eq!(plan.batch_groups, 8);
+        assert_eq!(plan.batches_per_group, 1);
+        assert_eq!(plan.grid_rows_per_batch, 4);
+        assert_eq!(plan.grid_cols_per_batch, 2);
+        assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 64);
+        assert_eq!(plan.mt, 4);
+        assert_eq!(plan.nt, 2);
+    }
+
+    #[test]
     fn reader_args_exclude_east_sender_from_multicast_receivers() {
         let plan = plan_matmul(
             4096,
             8192,
             1536,
+            1,
             &p100_worker_cores()
                 .into_iter()
                 .filter(|core| core.x >= 10)
@@ -946,7 +1561,9 @@ mod tests {
         let grid = plan_grid(&plan);
         let sender = grid[0][0];
         let mut builder = RuntimeArgsBuilder::new(0, Vec::new(), Vec::new(), Vec::new());
-        let reader = reader_args(&plan, &grid, 0, sender, 128).expect("reader args");
+        let lhs_view = operand_view(&[4096, 8192], &[], &[0], &[1], 4096, 8192).expect("lhs view");
+        let reader =
+            reader_args(&plan, &grid, 0, sender, 128, 1, 0, 1, &lhs_view).expect("reader args");
         builder
             .add_core(sender, Vec::new(), reader, Vec::new())
             .expect("add core");

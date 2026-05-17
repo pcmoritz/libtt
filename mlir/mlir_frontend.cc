@@ -1,5 +1,7 @@
 #include <cstdlib>
+#include <algorithm>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <vector>
@@ -8,6 +10,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -118,6 +121,25 @@ tt::TensorDesc::ElementType mapProtoElementType(mlir::Type element_type) {
     return tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
 }
 
+bool fillTensorDesc(
+    llvm::ArrayRef<int64_t> shape,
+    mlir::Type element_type,
+    tt::TensorDesc& tensor_desc,
+    std::string& error) {
+    auto proto_element_type = mapProtoElementType(element_type);
+    if (proto_element_type == tt::TensorDesc::ELEMENT_TYPE_UNKNOWN) {
+        error = "unsupported tensor element type";
+        return false;
+    }
+
+    tensor_desc.clear_dims();
+    for (auto dim : shape) {
+        tensor_desc.add_dims(dim);
+    }
+    tensor_desc.set_element_type(proto_element_type);
+    return true;
+}
+
 bool fillTensorDesc(mlir::Type type, tt::TensorDesc& tensor_desc, std::string& error) {
     auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
     if (!tensor) {
@@ -129,18 +151,7 @@ bool fillTensorDesc(mlir::Type type, tt::TensorDesc& tensor_desc, std::string& e
         return false;
     }
 
-    auto element_type = mapProtoElementType(tensor.getElementType());
-    if (element_type == tt::TensorDesc::ELEMENT_TYPE_UNKNOWN) {
-        error = "unsupported tensor element type";
-        return false;
-    }
-
-    tensor_desc.clear_dims();
-    for (auto dim : tensor.getShape()) {
-        tensor_desc.add_dims(dim);
-    }
-    tensor_desc.set_element_type(element_type);
-    return true;
+    return fillTensorDesc(tensor.getShape(), tensor.getElementType(), tensor_desc, error);
 }
 
 bool addValueDesc(
@@ -163,6 +174,20 @@ bool addValueDesc(
     uint32_t value_id = executable.values_size() - 1;
     value_ids.try_emplace(value, value_id);
     id_out = value_id;
+    return true;
+}
+
+bool addTensorDesc(
+    llvm::ArrayRef<int64_t> shape,
+    mlir::Type element_type,
+    tt::Executable& executable,
+    std::string& error,
+    uint32_t& id_out) {
+    auto* value_desc = executable.add_values();
+    if (!fillTensorDesc(shape, element_type, *value_desc->mutable_tensor(), error)) {
+        return false;
+    }
+    id_out = executable.values_size() - 1;
     return true;
 }
 
@@ -334,6 +359,198 @@ bool addTopKOp(
     top_k->mutable_top_k()->set_operand_id(input_id);
     top_k->mutable_top_k()->set_indices_id(indices_id);
     top_k->mutable_top_k()->set_k(static_cast<uint32_t>(k));
+    return true;
+}
+
+bool sameShape(llvm::ArrayRef<int64_t> lhs, llvm::ArrayRef<int64_t> rhs) {
+    return lhs.size() == rhs.size() && std::equal(lhs.begin(), lhs.end(), rhs.begin());
+}
+
+bool getFreeDims(
+    llvm::ArrayRef<int64_t> batch_dims,
+    llvm::ArrayRef<int64_t> contract_dims,
+    int64_t rank,
+    llvm::SmallVector<int64_t>& free_dims,
+    std::string& error) {
+    std::vector<bool> used(rank, false);
+    auto mark = [&](int64_t dim, llvm::StringRef kind) {
+        if (dim < 0 || dim >= rank) {
+            error = kind.str() + " dimension is out of range";
+            return false;
+        }
+        if (used[dim]) {
+            error = "dot_general dimensions must be unique";
+            return false;
+        }
+        used[dim] = true;
+        return true;
+    };
+
+    for (int64_t dim : batch_dims) {
+        if (!mark(dim, "batch")) {
+            return false;
+        }
+    }
+    for (int64_t dim : contract_dims) {
+        if (!mark(dim, "contracting")) {
+            return false;
+        }
+    }
+
+    free_dims.clear();
+    for (int64_t dim = 0; dim < rank; ++dim) {
+        if (!used[dim]) {
+            free_dims.push_back(dim);
+        }
+    }
+    return true;
+}
+
+bool checkedProductOfDims(
+    llvm::ArrayRef<int64_t> shape,
+    llvm::ArrayRef<int64_t> dims,
+    llvm::StringRef label,
+    int64_t& product,
+    std::string& error) {
+    product = 1;
+    for (int64_t dim : dims) {
+        int64_t size = shape[dim];
+        if (size < 0 || product > std::numeric_limits<int64_t>::max() / std::max<int64_t>(size, 1)) {
+            error = label.str() + " dimension product overflow";
+            return false;
+        }
+        product *= size;
+    }
+    return true;
+}
+
+bool lowerDotGeneralToExecutable(
+    mlir::stablehlo::DotGeneralOp dot_op,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    auto lhs_type = mlir::dyn_cast<mlir::RankedTensorType>(dot_op.getLhs().getType());
+    auto rhs_type = mlir::dyn_cast<mlir::RankedTensorType>(dot_op.getRhs().getType());
+    auto result_type = mlir::dyn_cast<mlir::RankedTensorType>(dot_op.getResult().getType());
+    if (!lhs_type || !rhs_type || !result_type ||
+        !lhs_type.hasStaticShape() || !rhs_type.hasStaticShape() || !result_type.hasStaticShape()) {
+        error = "dot_general requires ranked static tensor operands and result";
+        return false;
+    }
+
+    auto dims = dot_op.getDotDimensionNumbers();
+    llvm::SmallVector<int64_t> lhs_batch_dims(dims.getLhsBatchingDimensions());
+    llvm::SmallVector<int64_t> rhs_batch_dims(dims.getRhsBatchingDimensions());
+    llvm::SmallVector<int64_t> lhs_contract_dims(dims.getLhsContractingDimensions());
+    llvm::SmallVector<int64_t> rhs_contract_dims(dims.getRhsContractingDimensions());
+
+    if (lhs_batch_dims.size() != rhs_batch_dims.size()) {
+        error = "dot_general lhs/rhs batching dimension counts must match";
+        return false;
+    }
+    if (lhs_contract_dims.size() != rhs_contract_dims.size()) {
+        error = "dot_general lhs/rhs contracting dimension counts must match";
+        return false;
+    }
+
+    auto lhs_shape = lhs_type.getShape();
+    auto rhs_shape = rhs_type.getShape();
+
+    llvm::SmallVector<int64_t> lhs_free_dims;
+    llvm::SmallVector<int64_t> rhs_free_dims;
+    if (!getFreeDims(lhs_batch_dims, lhs_contract_dims, lhs_type.getRank(), lhs_free_dims, error) ||
+        !getFreeDims(rhs_batch_dims, rhs_contract_dims, rhs_type.getRank(), rhs_free_dims, error)) {
+        return false;
+    }
+
+    llvm::SmallVector<int64_t> batch_shape;
+    batch_shape.reserve(lhs_batch_dims.size());
+    for (auto [lhs_dim, rhs_dim] : llvm::zip(lhs_batch_dims, rhs_batch_dims)) {
+        if (lhs_shape[lhs_dim] != rhs_shape[rhs_dim]) {
+            error = "dot_general batching dimension sizes must match";
+            return false;
+        }
+        batch_shape.push_back(lhs_shape[lhs_dim]);
+    }
+
+    int64_t m = 0;
+    int64_t k_lhs = 0;
+    int64_t k_rhs = 0;
+    int64_t n = 0;
+    if (!checkedProductOfDims(lhs_shape, lhs_free_dims, "lhs free", m, error) ||
+        !checkedProductOfDims(lhs_shape, lhs_contract_dims, "lhs contracting", k_lhs, error) ||
+        !checkedProductOfDims(rhs_shape, rhs_contract_dims, "rhs contracting", k_rhs, error) ||
+        !checkedProductOfDims(rhs_shape, rhs_free_dims, "rhs free", n, error)) {
+        return false;
+    }
+    if (k_lhs != k_rhs) {
+        error = "dot_general contracting dimension products must match";
+        return false;
+    }
+
+    llvm::SmallVector<int64_t> expected_result_shape;
+    expected_result_shape.append(batch_shape.begin(), batch_shape.end());
+    for (int64_t dim : lhs_free_dims) {
+        expected_result_shape.push_back(lhs_shape[dim]);
+    }
+    for (int64_t dim : rhs_free_dims) {
+        expected_result_shape.push_back(rhs_shape[dim]);
+    }
+    if (!sameShape(expected_result_shape, result_type.getShape())) {
+        error = "dot_general result shape does not match dimension numbers";
+        return false;
+    }
+
+    uint32_t lhs_id = 0;
+    uint32_t rhs_id = 0;
+    if (!addValueDesc(dot_op.getLhs(), executable, value_ids, error, lhs_id) ||
+        !addValueDesc(dot_op.getRhs(), executable, value_ids, error, rhs_id)) {
+        return false;
+    }
+
+    llvm::SmallVector<int64_t> matmul_output_shape;
+    matmul_output_shape.append(batch_shape.begin(), batch_shape.end());
+    matmul_output_shape.push_back(m);
+    matmul_output_shape.push_back(n);
+
+    uint32_t matmul_output_id = 0;
+    const bool final_reshape_needed = !sameShape(matmul_output_shape, result_type.getShape());
+    if (final_reshape_needed) {
+        if (!addTensorDesc(matmul_output_shape, result_type.getElementType(), executable, error, matmul_output_id)) {
+            return false;
+        }
+    } else if (!addValueDesc(dot_op.getResult(), executable, value_ids, error, matmul_output_id)) {
+        return false;
+    }
+
+    auto* matmul = executable.add_ops();
+    matmul->set_output_id(matmul_output_id);
+    matmul->mutable_matmul()->set_lhs_id(lhs_id);
+    matmul->mutable_matmul()->set_rhs_id(rhs_id);
+    for (int64_t dim : lhs_batch_dims) {
+        matmul->mutable_matmul()->add_lhs_batching_dimensions(dim);
+    }
+    for (int64_t dim : rhs_batch_dims) {
+        matmul->mutable_matmul()->add_rhs_batching_dimensions(dim);
+    }
+    for (int64_t dim : lhs_contract_dims) {
+        matmul->mutable_matmul()->add_lhs_contracting_dimensions(dim);
+    }
+    for (int64_t dim : rhs_contract_dims) {
+        matmul->mutable_matmul()->add_rhs_contracting_dimensions(dim);
+    }
+
+    if (!final_reshape_needed) {
+        return true;
+    }
+
+    uint32_t output_id = 0;
+    if (!addValueDesc(dot_op.getResult(), executable, value_ids, error, output_id)) {
+        return false;
+    }
+    auto* reshape = executable.add_ops();
+    reshape->set_output_id(output_id);
+    reshape->mutable_reshape()->set_operand_id(matmul_output_id);
     return true;
 }
 
@@ -804,31 +1021,8 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto dot_op = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op)) {
-            auto dims = dot_op.getDotDimensionNumbers();
-            uint32_t lhs_id = 0;
-            uint32_t rhs_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(dot_op.getLhs(), executable, value_ids, error, lhs_id) ||
-                !addValueDesc(dot_op.getRhs(), executable, value_ids, error, rhs_id) ||
-                !addValueDesc(dot_op.getResult(), executable, value_ids, error, output_id)) {
+            if (!lowerDotGeneralToExecutable(dot_op, executable, value_ids, error)) {
                 return false;
-            }
-
-            auto* matmul = executable.add_ops();
-            matmul->set_output_id(output_id);
-            matmul->mutable_matmul()->set_lhs_id(lhs_id);
-            matmul->mutable_matmul()->set_rhs_id(rhs_id);
-            for (int64_t dim : dims.getLhsBatchingDimensions()) {
-                matmul->mutable_matmul()->add_lhs_batching_dimensions(dim);
-            }
-            for (int64_t dim : dims.getRhsBatchingDimensions()) {
-                matmul->mutable_matmul()->add_rhs_batching_dimensions(dim);
-            }
-            for (int64_t dim : dims.getLhsContractingDimensions()) {
-                matmul->mutable_matmul()->add_lhs_contracting_dimensions(dim);
-            }
-            for (int64_t dim : dims.getRhsContractingDimensions()) {
-                matmul->mutable_matmul()->add_rhs_contracting_dimensions(dim);
             }
             continue;
         }

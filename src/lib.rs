@@ -3010,84 +3010,42 @@ fn execute_executable_v1(
                     ))
                 })?;
                 let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
-                let rank2_bf16_matmul = lhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                    && rhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                    && matches!(output_dtype, DType::Float16B | DType::Float32)
-                    && lhs.dims.len() == 2
-                    && rhs.dims.len() == 2
-                    && dimension_numbers.lhs_batching_dimensions.is_empty()
-                    && dimension_numbers.rhs_batching_dimensions.is_empty()
-                    && dimension_numbers.lhs_contracting_dimensions == vec![1]
-                    && dimension_numbers.rhs_contracting_dimensions == vec![0];
-                if rank2_bf16_matmul {
-                    if lhs.dims[1] != rhs.dims[0] {
-                        return Err(invalid_argument(format!(
-                            "TT executable matmul shape mismatch: lhs {:?}, rhs {:?}",
-                            lhs.dims, rhs.dims
-                        )));
-                    }
-
-                    let output_dram = if output_dtype == DType::Float16B {
-                        kernels::matmul::matmul_bf16(device, lhs_dram, rhs_dram, "pjrt_matmul")
-                    } else {
-                        kernels::matmul::matmul_bf16_with_output_dtype(
-                            device,
-                            lhs_dram,
-                            rhs_dram,
-                            output_dtype,
-                            "pjrt_matmul",
-                        )
-                    }
-                    .map_err(io_error)?;
-                    let expected_dims = vec![lhs.dims[0], rhs.dims[1]];
-                    store_output_buffer(
-                        &mut values,
-                        plan,
-                        output_id,
-                        expected_dims,
-                        output_dram,
-                        &output_context,
-                        "matmul",
-                    )?;
-                } else {
-                    let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
-                    let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
-                    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-                    let output_dram = kernels::dot_general::dot_general(
-                        device,
-                        lhs_dram,
-                        rhs_dram,
-                        kernels::dot_general::DotGeneralSpec {
-                            lhs_shape,
-                            rhs_shape,
-                            output_shape,
-                            lhs_batching_dimensions: dimension_numbers
-                                .lhs_batching_dimensions
-                                .clone(),
-                            rhs_batching_dimensions: dimension_numbers
-                                .rhs_batching_dimensions
-                                .clone(),
-                            lhs_contracting_dimensions: dimension_numbers
-                                .lhs_contracting_dimensions
-                                .clone(),
-                            rhs_contracting_dimensions: dimension_numbers
-                                .rhs_contracting_dimensions
-                                .clone(),
-                            output_dtype,
-                        },
-                        "pjrt_dot_general",
-                    )
-                    .map_err(io_error)?;
-                    store_output_buffer(
-                        &mut values,
-                        plan,
-                        output_id,
-                        output_desc.dims.clone(),
-                        output_dram,
-                        &output_context,
-                        "dot_general",
-                    )?;
+                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || !matches!(output_dtype, DType::Float16B | DType::Float32)
+                {
+                    return Err(invalid_argument(format!(
+                        "TT executable matmul requires bf16 inputs and bf16/f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
+                        lhs.buffer_type, rhs.buffer_type
+                    )));
                 }
+                let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
+                let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+                let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+                let output_dram = kernels::matmul::matmul_bf16_dot_general(
+                    device,
+                    lhs_dram,
+                    rhs_dram,
+                    &lhs_shape,
+                    &rhs_shape,
+                    &output_shape,
+                    &dimension_numbers.lhs_batching_dimensions,
+                    &dimension_numbers.rhs_batching_dimensions,
+                    &dimension_numbers.lhs_contracting_dimensions,
+                    &dimension_numbers.rhs_contracting_dimensions,
+                    output_dtype,
+                    "pjrt_matmul",
+                )
+                .map_err(io_error)?;
+                store_output_buffer(
+                    &mut values,
+                    plan,
+                    output_id,
+                    output_desc.dims.clone(),
+                    output_dram,
+                    &output_context,
+                    "matmul",
+                )?;
             }
             executable::Op::Constant { .. } => {}
             executable::Op::Compare {
@@ -5318,13 +5276,14 @@ mod tests {
             |executable| {
                 assert_eq!(executable.output_ids, vec![2]);
                 assert_eq!(executable.ops.len(), 3);
+                assert_eq!(executable.values[2].dims, vec![3, 2, 5]);
                 let executable::Op::Matmul {
                     input_ids,
                     output_id,
                     dimension_numbers,
                 } = &executable.ops[2]
                 else {
-                    panic!("dot_general should lower to Matmul");
+                    panic!("dot_general should lower directly to Matmul");
                 };
                 assert_eq!(*input_ids, [0, 1]);
                 assert_eq!(*output_id, 2);
@@ -5332,6 +5291,50 @@ mod tests {
                 assert_eq!(dimension_numbers.rhs_batching_dimensions, vec![1]);
                 assert_eq!(dimension_numbers.lhs_contracting_dimensions, vec![2]);
                 assert_eq!(dimension_numbers.rhs_contracting_dimensions, vec![2]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_decomposes_dot_general_with_flattened_free_dims() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<4x10x3x5x7xf32>, %arg1: tensor<4x10x5x7x3xf32>) -> tensor<4x10x3x7x10x7x3xf32> {
+    %0 = stablehlo.dot_general %arg0, %arg1,
+      batching_dims = [0] x [0],
+      contracting_dims = [3] x [2]
+      : (tensor<4x10x3x5x7xf32>, tensor<4x10x5x7x3xf32>) -> tensor<4x10x3x7x10x7x3xf32>
+    return %0 : tensor<4x10x3x7x10x7x3xf32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![3]);
+                assert_eq!(executable.ops.len(), 4);
+                assert_eq!(executable.values[2].dims, vec![4, 210, 210]);
+                assert_eq!(executable.values[3].dims, vec![4, 10, 3, 7, 10, 7, 3]);
+                let executable::Op::Matmul {
+                    input_ids,
+                    output_id,
+                    dimension_numbers,
+                } = &executable.ops[2]
+                else {
+                    panic!("dot_general should lower directly to Matmul");
+                };
+                assert_eq!(*input_ids, [0, 1]);
+                assert_eq!(*output_id, 2);
+                assert_eq!(dimension_numbers.lhs_batching_dimensions, vec![0]);
+                assert_eq!(dimension_numbers.rhs_batching_dimensions, vec![0]);
+                assert_eq!(dimension_numbers.lhs_contracting_dimensions, vec![3]);
+                assert_eq!(dimension_numbers.rhs_contracting_dimensions, vec![2]);
+                assert!(matches!(
+                    executable.ops[3],
+                    executable::Op::Reshape {
+                        input_id: 2,
+                        output_id: 3
+                    }
+                ));
             },
         );
     }
