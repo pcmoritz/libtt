@@ -8,7 +8,6 @@ use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, Runt
 use std::io;
 
 const SLICE_READER: &str = include_str!("../../kernels/slice_reader.cc");
-const SLICE_COLLAPSE_READER: &str = include_str!("../../kernels/slice_collapse_reader.cc");
 const SLICE_WRITER: &str = include_str!("../../kernels/broadcast_writer.cc");
 const READER_INPUT_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
@@ -78,37 +77,6 @@ struct SliceKernel {
     key: SliceProgramKey,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub(crate) struct SliceCollapsePlan {
-    rows: usize,
-    cols: usize,
-    head: usize,
-    input_tile_rows: usize,
-    input_tiles_per_row: usize,
-    output_tiles_per_row: usize,
-    output_tile_count: usize,
-    output_allocation_shape: Vec<usize>,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct SliceCollapseProgramKey {
-    cores: Vec<CoreCoord>,
-    dtype: DType,
-    rows: u32,
-    cols: u32,
-    head_tile_row: u32,
-    head_row: u32,
-    input_tile_rows: u32,
-    input_tiles_per_row: u32,
-    output_tiles_per_row: u32,
-}
-
-struct SliceCollapseKernel {
-    input_addr: u32,
-    output_addr: u32,
-    key: SliceCollapseProgramKey,
-}
-
 impl Kernel<SliceProgramKey> for SliceKernel {
     fn program_key(&self) -> SliceProgramKey {
         self.key.clone()
@@ -116,32 +84,6 @@ impl Kernel<SliceProgramKey> for SliceKernel {
 
     fn build_program(&self) -> io::Result<Program> {
         slice_program(self.key.clone())
-    }
-
-    #[inline]
-    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            READER_INPUT_ADDR_INDEX => Some(self.input_addr),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
-        }
-    }
-}
-
-impl Kernel<SliceCollapseProgramKey> for SliceCollapseKernel {
-    fn program_key(&self) -> SliceCollapseProgramKey {
-        self.key.clone()
-    }
-
-    fn build_program(&self) -> io::Result<Program> {
-        slice_collapse_program(self.key.clone())
     }
 
     #[inline]
@@ -206,95 +148,6 @@ pub(crate) fn slice(
             cores,
             dtype,
             shape,
-        },
-    };
-    kernel.run(device)?;
-    Ok(output)
-}
-
-pub(crate) fn slice_collapse_middle_dim_plan(
-    input_shape: &[usize],
-    output_shape: &[usize],
-    start_indices: &[i64],
-    limit_indices: &[i64],
-    strides: &[i64],
-) -> io::Result<Option<SliceCollapsePlan>> {
-    if input_shape.len() != 3
-        || output_shape.len() != 2
-        || start_indices.len() != 3
-        || limit_indices.len() != 3
-        || strides != [1, 1, 1]
-        || start_indices[0] != 0
-        || start_indices[2] != 0
-        || usize::try_from(limit_indices[0]).ok() != Some(input_shape[0])
-        || usize::try_from(limit_indices[2]).ok() != Some(input_shape[2])
-        || output_shape != [input_shape[0], input_shape[2]]
-    {
-        return Ok(None);
-    }
-    let head = usize::try_from(start_indices[1]).map_err(|_| {
-        invalid_input(format!(
-            "slice head start must be non-negative, got {}",
-            start_indices[1]
-        ))
-    })?;
-    if usize::try_from(limit_indices[1]).ok() != Some(head + 1) || head >= input_shape[1] {
-        return Ok(None);
-    }
-    let input_allocation_shape = tiled_allocation_shape(input_shape)?;
-    let output_allocation_shape = tiled_allocation_shape(output_shape)?;
-    let output_tile_count = tiled_shape_tile_count(output_shape)?;
-    Ok(Some(SliceCollapsePlan {
-        rows: output_shape[0],
-        cols: output_shape[1],
-        head,
-        input_tile_rows: input_allocation_shape[1] / TILE_R,
-        input_tiles_per_row: input_allocation_shape[2] / TILE_C,
-        output_tiles_per_row: output_allocation_shape[1] / TILE_C,
-        output_tile_count,
-        output_allocation_shape,
-    }))
-}
-
-pub(crate) fn slice_collapse_middle_dim(
-    device: &mut Device,
-    input: &DramBuffer,
-    plan: &SliceCollapsePlan,
-    dtype: DType,
-    name: impl Into<String>,
-) -> io::Result<DramBuffer> {
-    if input.dtype != dtype {
-        return Err(invalid_input(format!(
-            "slice collapse input requires {:?}, got {:?}",
-            dtype, input.dtype
-        )));
-    }
-    let cores = select_worker_cores(device.cores_ref(), plan.output_tile_count)?;
-    let output = device.alloc(
-        plan.output_tile_count,
-        dtype,
-        &plan.output_allocation_shape,
-        name,
-    )?;
-    let kernel = SliceCollapseKernel {
-        input_addr: u32_addr(input.addr, "input address")?,
-        output_addr: u32_addr(output.addr, "output address")?,
-        key: SliceCollapseProgramKey {
-            cores,
-            dtype,
-            rows: u32_arg(plan.rows, "slice collapse rows")?,
-            cols: u32_arg(plan.cols, "slice collapse cols")?,
-            head_tile_row: u32_arg(plan.head / TILE_R, "slice collapse head tile row")?,
-            head_row: u32_arg(plan.head % TILE_R, "slice collapse head row")?,
-            input_tile_rows: u32_arg(plan.input_tile_rows, "slice collapse input tile rows")?,
-            input_tiles_per_row: u32_arg(
-                plan.input_tiles_per_row,
-                "slice collapse input tiles per row",
-            )?,
-            output_tiles_per_row: u32_arg(
-                plan.output_tiles_per_row,
-                "slice collapse output tiles per row",
-            )?,
         },
     };
     kernel.run(device)?;
@@ -372,65 +225,6 @@ fn slice_program(key: SliceProgramKey) -> io::Result<Program> {
         name: format!("slice_{:?}_{}", key.dtype, key.shape.input_shape.len()),
         ..Program::new(runtime_args)
     })
-}
-
-fn slice_collapse_program(key: SliceCollapseProgramKey) -> io::Result<Program> {
-    let mut runtime_args = RuntimeArgsBuilder::new(
-        0,
-        vec![WRITER_OUTPUT_ADDR_INDEX],
-        vec![READER_INPUT_ADDR_INDEX],
-        Vec::new(),
-    );
-    for (core_index, &core) in key.cores.iter().enumerate() {
-        let tile_count = key
-            .rows
-            .div_ceil(TILE_R as u32)
-            .checked_mul(key.output_tiles_per_row)
-            .ok_or_else(|| invalid_input("slice collapse tile count overflow"))?;
-        let (offset, n_tiles) = split_tile_range(tile_count, core_index, key.cores.len())?;
-        runtime_args.add_core(
-            core,
-            vec![0, offset, n_tiles],
-            vec![0, offset, n_tiles],
-            Vec::new(),
-        )?;
-    }
-    let runtime_args = runtime_args.build()?;
-    Ok(Program {
-        reader_kernel: slice_collapse_reader_source(key.dtype, &key)?,
-        writer_kernel: SLICE_WRITER.to_owned(),
-        compile: CompileConfig {
-            cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(16, key.dtype)],
-            ..CompileConfig::default()
-        },
-        name: format!("slice_collapse_{:?}", key.dtype),
-        ..Program::new(runtime_args)
-    })
-}
-
-fn slice_collapse_reader_source(
-    dtype: DType,
-    shape: &SliceCollapseProgramKey,
-) -> io::Result<String> {
-    let element_type = element_type(dtype);
-    Ok(format!(
-        "#define SLICE_COLLAPSE_ROWS {}\n\
-         #define SLICE_COLLAPSE_COLS {}\n\
-         #define SLICE_COLLAPSE_HEAD_TILE_ROW {}\n\
-         #define SLICE_COLLAPSE_HEAD_ROW {}\n\
-         #define SLICE_COLLAPSE_INPUT_TILE_ROWS {}\n\
-         #define SLICE_COLLAPSE_INPUT_TILES_PER_ROW {}\n\
-         #define SLICE_COLLAPSE_OUTPUT_TILES_PER_ROW {}\n\
-         #define SLICE_COLLAPSE_ELEMENT_TYPE {element_type}\n\
-         {SLICE_COLLAPSE_READER}",
-        shape.rows,
-        shape.cols,
-        shape.head_tile_row,
-        shape.head_row,
-        shape.input_tile_rows,
-        shape.input_tiles_per_row,
-        shape.output_tiles_per_row,
-    ))
 }
 
 fn slice_reader_source(dtype: DType, shape: &SliceKernelShape) -> io::Result<String> {
@@ -632,42 +426,6 @@ mod tests {
             .expect_err("wrong output shape should fail");
 
         assert!(err.to_string().contains("output dimension 1 mismatch"));
-    }
-
-    #[test]
-    fn slice_collapse_middle_dim_plan_describes_head_slice() {
-        let plan = slice_collapse_middle_dim_plan(
-            &[27, 16, 128],
-            &[27, 128],
-            &[0, 9, 0],
-            &[27, 10, 128],
-            &[1, 1, 1],
-        )
-        .expect("valid collapse")
-        .expect("slice should collapse middle singleton dimension");
-
-        assert_eq!(plan.rows, 27);
-        assert_eq!(plan.cols, 128);
-        assert_eq!(plan.head, 9);
-        assert_eq!(plan.input_tile_rows, 1);
-        assert_eq!(plan.input_tiles_per_row, 4);
-        assert_eq!(plan.output_tiles_per_row, 4);
-        assert_eq!(plan.output_tile_count, 4);
-        assert_eq!(plan.output_allocation_shape, vec![32, 128]);
-    }
-
-    #[test]
-    fn slice_collapse_middle_dim_plan_rejects_uncollapsed_slice() {
-        let plan = slice_collapse_middle_dim_plan(
-            &[27, 16, 128],
-            &[27, 1, 128],
-            &[0, 9, 0],
-            &[27, 10, 128],
-            &[1, 1, 1],
-        )
-        .expect("valid non-collapse check");
-
-        assert!(plan.is_none());
     }
 
     #[test]

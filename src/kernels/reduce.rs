@@ -9,8 +9,6 @@ use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, Runt
 use std::io;
 
 const READER: &str = include_str!("../../kernels/reduce_reader.cc");
-const DPA_REDUCE_READER: &str = include_str!("../../kernels/dpa_reduce_reader.cc");
-const DPA_REDUCE_WRITER: &str = include_str!("../../kernels/dpa_reduce_writer.cc");
 const COMPUTE: &str = include_str!("../../kernels/reduce_compute.cc");
 const WRITER: &str = include_str!("../../kernels/reduce_writer.cc");
 const READER_INPUT_ADDR_INDEX: usize = 0;
@@ -64,6 +62,7 @@ struct ReduceKernelShape {
     valid_last_width: u32,
     output_tiles: u32,
     inner_output_tiles: u32,
+    output_tile_rows_per_prefix: u32,
     output_rank: OutputRank,
     output_dim0: u32,
     output_dim1: u32,
@@ -74,27 +73,6 @@ pub(crate) struct ReducePlan {
     input_shape: Vec<usize>,
     output_allocation_shape: Vec<usize>,
     shape: ReduceKernelShape,
-    op: ReduceOp,
-    dtype: DType,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-struct DpaReduceShape {
-    output_tile_count: u32,
-    batch: u32,
-    query_tokens: u32,
-    kv_heads: u32,
-    input_tiles_per_row: u32,
-    output_tiles_per_row: u32,
-    valid_last_width: u32,
-    padding_identity_bits: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DpaReducePlan {
-    input_shape: Vec<usize>,
-    output_allocation_shape: Vec<usize>,
-    shape: DpaReduceShape,
     op: ReduceOp,
     dtype: DType,
 }
@@ -117,12 +95,6 @@ impl ReducePlan {
                 "reduce kernel requires rank >= 2 input, got {input_shape:?}"
             )));
         }
-        if output_shape.len() > 2 {
-            return Err(invalid_input(format!(
-                "reduce kernel currently supports rank <= 2 outputs, got {output_shape:?}"
-            )));
-        }
-
         let reduce_dim = input_shape.len() - 1;
         if dimensions != [reduce_dim as i64] {
             return Err(invalid_input(format!(
@@ -147,14 +119,28 @@ impl ReducePlan {
         let output_inner_tiles =
             output_allocation_shape[output_allocation_shape.len() - 1] / TILE_C;
         debug_assert_eq!(inner_output_tiles, output_inner_tiles);
-        let (output_rank, output_dim0, output_dim1) = match output_shape {
-            [dim] => (OutputRank::One, 1, *dim),
-            [dim0, dim1] => (OutputRank::Two, *dim0, *dim1),
-            _ => {
-                return Err(invalid_input(format!(
-                    "reduce kernel currently supports rank 1 or 2 outputs, got {output_shape:?}"
-                )))
-            }
+        let (output_rank, output_dim0, output_dim1, output_tile_rows_per_prefix) =
+            match output_shape {
+                [dim] => (OutputRank::One, 1, *dim, 1),
+                [] => {
+                    return Err(invalid_input(
+                        "reduce kernel currently requires rank >= 1 output",
+                    ))
+                }
+                _ => {
+                    let output_rank = output_shape.len();
+                    (
+                        OutputRank::Two,
+                        output_shape[output_rank - 2],
+                        output_shape[output_rank - 1],
+                        output_allocation_shape[output_rank - 2] / TILE_R,
+                    )
+                }
+            };
+        if output_tile_rows_per_prefix == 0 && !matches!(output_rank, OutputRank::One) {
+            return Err(invalid_input(format!(
+                "reduce output tile rows per prefix must be nonzero for shape {output_shape:?}"
+            )));
         };
 
         let op = ReduceOp::from_reducer(reducer)?;
@@ -166,86 +152,13 @@ impl ReducePlan {
                 valid_last_width,
                 output_tiles: u32_arg(output_tiles, "output tile count")?,
                 inner_output_tiles: u32_arg(inner_output_tiles, "inner output tile count")?,
+                output_tile_rows_per_prefix: u32_arg(
+                    output_tile_rows_per_prefix,
+                    "output tile rows per prefix",
+                )?,
                 output_rank,
                 output_dim0: u32_arg(output_dim0, "output dim0")?,
                 output_dim1: u32_arg(output_dim1, "output dim1")?,
-            },
-            op,
-            dtype,
-        })
-    }
-}
-
-impl DpaReducePlan {
-    pub(crate) fn new(
-        dtype: DType,
-        input_shape: &[usize],
-        output_shape: &[usize],
-        dimensions: &[i64],
-        reducer: ReduceReducer,
-    ) -> io::Result<Self> {
-        if dtype != DType::Float32 {
-            return Err(invalid_input(format!(
-                "DPA reduce kernel currently supports Float32 inputs, got {dtype:?}"
-            )));
-        }
-        if input_shape.len() != 5 || output_shape.len() != 4 {
-            return Err(invalid_input(format!(
-                "DPA reduce expects input rank 5 and output rank 4, got input={input_shape:?} output={output_shape:?}"
-            )));
-        }
-        let reduce_dim = input_shape.len() - 1;
-        if dimensions != [reduce_dim as i64] {
-            return Err(invalid_input(format!(
-                "DPA reduce currently supports only the last dimension, got dimensions {dimensions:?} for shape {input_shape:?}"
-            )));
-        }
-        let expected_output = &input_shape[..input_shape.len() - 1];
-        if output_shape != expected_output {
-            return Err(invalid_input(format!(
-                "DPA reduce output shape mismatch: expected {:?}, got {:?}",
-                expected_output, output_shape
-            )));
-        }
-        if input_shape.contains(&0) || output_shape.contains(&0) {
-            return Err(invalid_input(
-                "DPA reduce zero-sized dimensions are not currently supported",
-            ));
-        }
-
-        let input_allocation_shape = tiled_allocation_shape(input_shape)?;
-        let output_allocation_shape = tiled_allocation_shape(output_shape)?;
-        let batch = input_shape[1];
-        let kv_heads = input_shape[2];
-        let query_tokens = input_shape[3];
-        let input_tile_rows = input_allocation_shape[3] / TILE_R;
-        let input_tiles_per_row = input_allocation_shape[4] / TILE_C;
-        let output_tiles_per_row = output_allocation_shape[3] / TILE_C;
-        let output_matrix_tiles = output_allocation_shape[2] / TILE_R * output_tiles_per_row;
-        if kv_heads > TILE_R
-            || output_matrix_tiles != output_tiles_per_row
-            || input_tile_rows != output_tiles_per_row
-        {
-            return Err(invalid_input(format!(
-                "DPA reduce supports [groups,batch,kv_heads,query,key] with kv_heads <= {TILE_R} and one output kv-head tile, got input={input_shape:?} output={output_shape:?}"
-            )));
-        }
-        let op = ReduceOp::from_reducer(reducer)?;
-        Ok(Self {
-            input_shape: input_shape.to_vec(),
-            output_allocation_shape,
-            shape: DpaReduceShape {
-                output_tile_count: u32_arg(
-                    tiled_shape_tile_count(output_shape)?,
-                    "output tile count",
-                )?,
-                batch: u32_arg(batch, "DPA reduce batch")?,
-                query_tokens: u32_arg(query_tokens, "DPA reduce query tokens")?,
-                kv_heads: u32_arg(kv_heads, "DPA reduce kv heads")?,
-                input_tiles_per_row: u32_arg(input_tiles_per_row, "input tiles per row")?,
-                output_tiles_per_row: u32_arg(output_tiles_per_row, "output tiles per row")?,
-                valid_last_width: valid_last_tile_width(input_shape[4])?,
-                padding_identity_bits: op.padding_identity_bits(),
             },
             op,
             dtype,
@@ -275,19 +188,6 @@ struct ReduceKernel {
     key: ReduceProgramKey,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct DpaReduceProgramKey {
-    cores: Vec<CoreCoord>,
-    op: ReduceOp,
-    shape: DpaReduceShape,
-}
-
-struct DpaReduceKernel {
-    input_addr: u32,
-    output_addr: u32,
-    key: DpaReduceProgramKey,
-}
-
 impl Kernel<ReduceProgramKey> for ReduceKernel {
     fn program_key(&self) -> ReduceProgramKey {
         self.key.clone()
@@ -295,32 +195,6 @@ impl Kernel<ReduceProgramKey> for ReduceKernel {
 
     fn build_program(&self) -> io::Result<Program> {
         reduce_program(self.key.clone())
-    }
-
-    #[inline]
-    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            READER_INPUT_ADDR_INDEX => Some(self.input_addr),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
-        }
-    }
-}
-
-impl Kernel<DpaReduceProgramKey> for DpaReduceKernel {
-    fn program_key(&self) -> DpaReduceProgramKey {
-        self.key.clone()
-    }
-
-    fn build_program(&self) -> io::Result<Program> {
-        dpa_reduce_program(self.key.clone())
     }
 
     #[inline]
@@ -380,40 +254,6 @@ pub(crate) fn reduce(
     Ok(output)
 }
 
-pub(crate) fn reduce_dpa_attention(
-    device: &mut Device,
-    input: &DramBuffer,
-    plan: &DpaReducePlan,
-    name: impl Into<String>,
-) -> io::Result<DramBuffer> {
-    let output_name = name.into();
-    validate_dpa_attention_input(input, plan)?;
-    let output_tiles = usize::try_from(plan.shape.output_tile_count).map_err(|_| {
-        invalid_input(format!(
-            "output tile count does not fit in usize: {}",
-            plan.shape.output_tile_count
-        ))
-    })?;
-    let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
-    let output = device.alloc(
-        output_tiles,
-        plan.dtype,
-        &plan.output_allocation_shape,
-        output_name,
-    )?;
-    let kernel = DpaReduceKernel {
-        input_addr: u32_addr(input.addr, "input address")?,
-        output_addr: u32_addr(output.addr, "output address")?,
-        key: DpaReduceProgramKey {
-            cores,
-            op: plan.op,
-            shape: plan.shape,
-        },
-    };
-    kernel.run(device)?;
-    Ok(output)
-}
-
 fn validate_input(input: &DramBuffer, plan: &ReducePlan) -> io::Result<()> {
     if input.dtype != plan.dtype {
         return Err(invalid_input(format!(
@@ -432,30 +272,6 @@ fn validate_input(input: &DramBuffer, plan: &ReducePlan) -> io::Result<()> {
     if input.num_tiles != expected_tiles {
         return Err(invalid_input(format!(
             "reduce input tile count mismatch: got {}, expected {expected_tiles}",
-            input.num_tiles
-        )));
-    }
-    Ok(())
-}
-
-fn validate_dpa_attention_input(input: &DramBuffer, plan: &DpaReducePlan) -> io::Result<()> {
-    if input.dtype != plan.dtype {
-        return Err(invalid_input(format!(
-            "DPA reduce input requires {:?}, got {:?}",
-            plan.dtype, input.dtype
-        )));
-    }
-    let expected_shape = tiled_allocation_shape(&plan.input_shape)?;
-    if input.shape != expected_shape {
-        return Err(invalid_input(format!(
-            "DPA reduce input allocation shape mismatch: got {:?}, expected {:?} for logical shape {:?}",
-            input.shape, expected_shape, plan.input_shape
-        )));
-    }
-    let expected_tiles = tiled_shape_tile_count(&plan.input_shape)?;
-    if input.num_tiles != expected_tiles {
-        return Err(invalid_input(format!(
-            "DPA reduce input tile count mismatch: got {}, expected {expected_tiles}",
             input.num_tiles
         )));
     }
@@ -493,6 +309,7 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
                 range.output_tiles,
                 shape.output_dim0,
                 shape.output_dim1,
+                shape.output_tile_rows_per_prefix,
             ],
             vec![
                 0,
@@ -526,74 +343,6 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
         name: format!("reduce_{:?}_{:?}", key.op, key.dtype),
         ..Program::new(runtime_args)
     })
-}
-
-fn dpa_reduce_program(key: DpaReduceProgramKey) -> io::Result<Program> {
-    let mut runtime_args = RuntimeArgsBuilder::new(
-        0,
-        vec![WRITER_OUTPUT_ADDR_INDEX],
-        vec![READER_INPUT_ADDR_INDEX],
-        Vec::new(),
-    );
-    for (core_index, &core) in key.cores.iter().enumerate() {
-        let (offset, n_tiles) =
-            split_tile_range(key.shape.output_tile_count, core_index, key.cores.len())?;
-        let reduce_groups = n_tiles
-            .checked_mul(TILE_R as u32)
-            .ok_or_else(|| invalid_input("dpa reduce group count overflow"))?;
-        runtime_args.add_core(
-            core,
-            dpa_reduce_writer_args(&key.shape, offset, n_tiles),
-            dpa_reduce_reader_args(&key.shape, offset, n_tiles),
-            vec![reduce_groups, key.shape.input_tiles_per_row],
-        )?;
-    }
-    let runtime_args = runtime_args.build()?;
-    Ok(Program {
-        reader_kernel: DPA_REDUCE_READER.to_owned(),
-        compute_kernel: reduce_compute_source(key.op),
-        writer_kernel: DPA_REDUCE_WRITER.to_owned(),
-        compile: CompileConfig {
-            cbs: vec![
-                CBConfig::new(0, DType::Float32),
-                CBConfig::new(16, DType::Float32),
-                CBConfig::new(17, DType::Float32),
-            ],
-            dst_accum_mode: true,
-            ..CompileConfig::default()
-        },
-        name: format!(
-            "dpa_reduce_{:?}_t{}_kv{}",
-            key.op, key.shape.query_tokens, key.shape.kv_heads
-        ),
-        ..Program::new(runtime_args)
-    })
-}
-
-fn dpa_reduce_reader_args(shape: &DpaReduceShape, offset: u32, n_tiles: u32) -> Vec<u32> {
-    vec![
-        0,
-        offset,
-        n_tiles,
-        shape.query_tokens,
-        shape.batch,
-        shape.kv_heads,
-        shape.input_tiles_per_row,
-        shape.output_tiles_per_row,
-        shape.valid_last_width,
-        shape.padding_identity_bits,
-    ]
-}
-
-fn dpa_reduce_writer_args(shape: &DpaReduceShape, offset: u32, n_tiles: u32) -> Vec<u32> {
-    vec![
-        0,
-        offset,
-        n_tiles,
-        shape.query_tokens,
-        shape.kv_heads,
-        shape.output_tiles_per_row,
-    ]
 }
 
 fn reduce_compute_source(op: ReduceOp) -> String {
@@ -658,19 +407,45 @@ fn reduce_matrix_core_range(
         "output tile offset",
     )?;
     let output_tiles = checked_mul_u32(tile_rows, shape.inner_output_tiles, "output tiles")?;
-    let output_row_offset = checked_mul_u32(tile_row_offset, TILE_R as u32, "output row offset")?;
-    let max_rows = checked_mul_u32(tile_rows, TILE_R as u32, "output rows")?;
-    let output_rows = shape
-        .output_dim0
-        .saturating_sub(output_row_offset)
-        .min(max_rows);
+    let tile_rows_per_prefix = shape.output_tile_rows_per_prefix;
+    if tile_rows_per_prefix == 0 {
+        return Err(invalid_input(
+            "matrix reduce requires nonzero output tile rows per prefix",
+        ));
+    }
+    let prefix_offset = tile_row_offset / tile_rows_per_prefix;
+    let row_tile_offset = tile_row_offset % tile_rows_per_prefix;
+    let row_offset = checked_mul_u32(row_tile_offset, TILE_R as u32, "output row offset")?;
+    let prefix_group_offset = checked_mul_u32(
+        prefix_offset,
+        shape.output_dim0,
+        "reduce prefix group offset",
+    )?;
+    let group_row_offset = prefix_group_offset
+        .checked_add(row_offset)
+        .ok_or_else(|| invalid_input("reduce group row offset overflow"))?;
     let group_offset = checked_mul_u32(
-        output_row_offset,
+        group_row_offset,
         shape.inner_output_tiles,
         "reduce group offset",
     )?;
+    let end_tile_row = tile_row_offset
+        .checked_add(tile_rows)
+        .ok_or_else(|| invalid_input("reduce tile row range overflow"))?;
+    let mut reduce_rows = 0u32;
+    for tile_row in tile_row_offset..end_tile_row {
+        let row_tile = tile_row % tile_rows_per_prefix;
+        let row_offset = checked_mul_u32(row_tile, TILE_R as u32, "output row offset")?;
+        let rows = shape
+            .output_dim0
+            .saturating_sub(row_offset)
+            .min(TILE_R as u32);
+        reduce_rows = reduce_rows
+            .checked_add(rows)
+            .ok_or_else(|| invalid_input("reduce row count overflow"))?;
+    }
     let reduce_groups =
-        checked_mul_u32(output_rows, shape.inner_output_tiles, "reduce group count")?;
+        checked_mul_u32(reduce_rows, shape.inner_output_tiles, "reduce group count")?;
     Ok(ReduceCoreRange {
         group_offset,
         reduce_groups,
@@ -734,43 +509,5 @@ mod tests {
         assert_eq!(plan.shape.input_width_tiles, 2);
         assert_eq!(plan.shape.valid_last_width, TILE_C as u32);
         assert_eq!(plan.op.padding_identity_bits(), 0.0f32.to_bits());
-    }
-
-    #[test]
-    fn dpa_reduce_shape_matches_dot_product_attention_layout() {
-        let plan = DpaReducePlan::new(
-            DType::Float32,
-            &[2, 1, 8, 65, 65],
-            &[2, 1, 8, 65],
-            &[4],
-            ReduceReducer::Max,
-        )
-        .unwrap();
-
-        assert_eq!(plan.shape.batch, 1);
-        assert_eq!(plan.shape.kv_heads, 8);
-        assert_eq!(plan.shape.query_tokens, 65);
-        assert_eq!(plan.shape.input_tiles_per_row, 3);
-        assert_eq!(plan.shape.output_tiles_per_row, 3);
-        assert_eq!(plan.shape.output_tile_count, 6);
-        assert_eq!(plan.shape.valid_last_width, 1);
-        assert_eq!(
-            plan.shape.padding_identity_bits,
-            f32::NEG_INFINITY.to_bits()
-        );
-    }
-
-    #[test]
-    fn dpa_reduce_shape_rejects_multi_tile_kv_heads() {
-        let err = DpaReducePlan::new(
-            DType::Float32,
-            &[2, 1, 33, 65, 65],
-            &[2, 1, 33, 65],
-            &[4],
-            ReduceReducer::Max,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("kv_heads"));
     }
 }

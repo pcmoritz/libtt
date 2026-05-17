@@ -13,7 +13,6 @@ const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum ConcatenateAxis {
-    Prefix,
     Rows,
     Cols,
 }
@@ -24,7 +23,6 @@ struct ConcatenateInputShape {
     cols: u32,
     tile_rows: u32,
     tiles_per_row: u32,
-    concat_len: u32,
     concat_offset: u32,
 }
 
@@ -138,8 +136,6 @@ fn concatenate_shape(
         ConcatenateAxis::Cols
     } else if dimension == rank - 2 {
         ConcatenateAxis::Rows
-    } else if rank == 3 && dimension == 0 {
-        ConcatenateAxis::Prefix
     } else {
         return Err(invalid_input(format!(
             "concatenate currently supports dimensions {} and {} for rank-{rank} tensors, got {dimension}",
@@ -184,17 +180,11 @@ fn concatenate_shape(
     let mut inputs = Vec::with_capacity(input_shapes.len());
     for input_shape in input_shapes {
         let allocation_shape = tiled_allocation_shape(input_shape)?;
-        let concat_len = match axis {
-            ConcatenateAxis::Prefix => input_shape[dimension],
-            ConcatenateAxis::Rows => input_shape[rank - 2],
-            ConcatenateAxis::Cols => input_shape[rank - 1],
-        };
         inputs.push(ConcatenateInputShape {
             rows: u32_arg(input_shape[rank - 2], "input rows")?,
             cols: u32_arg(input_shape[rank - 1], "input cols")?,
             tile_rows: u32_arg(allocation_shape[rank - 2] / TILE_R, "input tile rows")?,
             tiles_per_row: u32_arg(allocation_shape[rank - 1] / TILE_C, "input tiles per row")?,
-            concat_len: u32_arg(concat_len, "concat length")?,
             concat_offset: u32_arg(concat_offset, "concat offset")?,
         });
         concat_offset = concat_offset
@@ -269,7 +259,6 @@ fn concatenate_program(key: ConcatenateProgramKey) -> io::Result<Program> {
                 input.cols,
                 input.tile_rows,
                 input.tiles_per_row,
-                input.concat_len,
                 input.concat_offset,
             ]);
         }
@@ -302,11 +291,9 @@ fn concatenate_reader_source(
         DType::Int8 | DType::UInt8 => "uint8_t",
     };
     let axis_cols = matches!(axis, ConcatenateAxis::Cols);
-    let axis_prefix = matches!(axis, ConcatenateAxis::Prefix);
     Ok(format!(
-        "#define CONCAT_INPUT_COUNT {input_count}\n#define CONCAT_ELEMENT_TYPE {element_type}\n#define CONCAT_AXIS_COLS {}\n#define CONCAT_AXIS_PREFIX {}\n{CONCATENATE_READER}",
-        if axis_cols { 1 } else { 0 },
-        if axis_prefix { 1 } else { 0 }
+        "#define CONCAT_INPUT_COUNT {input_count}\n#define CONCAT_ELEMENT_TYPE {element_type}\n#define CONCAT_AXIS_COLS {}\n{CONCATENATE_READER}",
+        if axis_cols { 1 } else { 0 }
     ))
 }
 
@@ -339,8 +326,6 @@ mod tests {
         assert_eq!(shape.output_tile_rows, 1);
         assert_eq!(shape.output_tiles_per_row, 1);
         assert_eq!(shape.tile_count, 1);
-        assert_eq!(shape.inputs[0].concat_len, 16);
-        assert_eq!(shape.inputs[1].concat_len, 16);
         assert_eq!(shape.inputs[0].concat_offset, 0);
         assert_eq!(shape.inputs[1].concat_offset, 16);
     }
@@ -356,32 +341,13 @@ mod tests {
         assert_eq!(shape.output_tile_rows, 1);
         assert_eq!(shape.output_tiles_per_row, 1);
         assert_eq!(shape.tile_count, 1);
-        assert_eq!(shape.inputs[0].concat_len, 2);
-        assert_eq!(shape.inputs[1].concat_len, 3);
         assert_eq!(shape.inputs[0].concat_offset, 0);
         assert_eq!(shape.inputs[1].concat_offset, 2);
     }
 
     #[test]
-    fn concatenate_shape_describes_rank3_prefix_concat() {
-        let shape = concatenate_shape(&[vec![2, 3, 4], vec![5, 3, 4]], &[7, 3, 4], 0)
-            .expect("shape should be supported");
-
-        assert_eq!(shape.axis, ConcatenateAxis::Prefix);
-        assert_eq!(shape.output_rows, 3);
-        assert_eq!(shape.output_cols, 4);
-        assert_eq!(shape.output_tile_rows, 1);
-        assert_eq!(shape.output_tiles_per_row, 1);
-        assert_eq!(shape.tile_count, 7);
-        assert_eq!(shape.inputs[0].concat_len, 2);
-        assert_eq!(shape.inputs[1].concat_len, 5);
-        assert_eq!(shape.inputs[0].concat_offset, 0);
-        assert_eq!(shape.inputs[1].concat_offset, 2);
-    }
-
-    #[test]
-    fn concatenate_shape_rejects_unsupported_batch_dimension_concat() {
-        let err = concatenate_shape(&[vec![2, 3, 4, 5], vec![2, 6, 4, 5]], &[2, 9, 4, 5], 1)
+    fn concatenate_shape_rejects_batch_dimension_concat() {
+        let err = concatenate_shape(&[vec![2, 3, 4], vec![2, 5, 4]], &[2, 8, 4], 0)
             .expect_err("batch dimension concat should not be accepted");
         assert!(err.to_string().contains("currently supports dimensions"));
     }

@@ -109,10 +109,6 @@ pub struct Device {
 pub(crate) struct OpCacheKey {
     op: &'static str,
     input_id: u64,
-    input_addr: u64,
-    input_tiles: usize,
-    input_dtype: DType,
-    input_shape: Vec<usize>,
     output_shape: Vec<usize>,
     attrs: Vec<i64>,
 }
@@ -127,10 +123,6 @@ impl OpCacheKey {
         Self {
             op,
             input_id: input.id,
-            input_addr: input.addr,
-            input_tiles: input.num_tiles,
-            input_dtype: input.dtype,
-            input_shape: input.shape.clone(),
             output_shape,
             attrs,
         }

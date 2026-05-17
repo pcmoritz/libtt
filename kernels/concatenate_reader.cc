@@ -8,7 +8,6 @@ constexpr uint32_t FACE_R = 16;
 constexpr uint32_t FACE_C = 16;
 constexpr uint32_t INPUT_COUNT = CONCAT_INPUT_COUNT;
 constexpr bool CONCAT_COLS = CONCAT_AXIS_COLS;
-constexpr bool CONCAT_PREFIX = CONCAT_AXIS_PREFIX;
 using Element = CONCAT_ELEMENT_TYPE;
 
 uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
@@ -79,14 +78,12 @@ void kernel_main() {
   uint32_t input_cols[INPUT_COUNT];
   uint32_t input_tile_rows[INPUT_COUNT];
   uint32_t input_tiles_per_row[INPUT_COUNT];
-  uint32_t concat_lens[INPUT_COUNT];
   uint32_t concat_offsets[INPUT_COUNT];
   for (uint32_t i = 0; i < INPUT_COUNT; ++i) {
     input_rows[i] = get_arg_val<uint32_t>(arg++);
     input_cols[i] = get_arg_val<uint32_t>(arg++);
     input_tile_rows[i] = get_arg_val<uint32_t>(arg++);
     input_tiles_per_row[i] = get_arg_val<uint32_t>(arg++);
-    concat_lens[i] = get_arg_val<uint32_t>(arg++);
     concat_offsets[i] = get_arg_val<uint32_t>(arg++);
   }
 
@@ -107,27 +104,7 @@ void kernel_main() {
     zero_tile(cb_output);
 
     for (uint32_t input_index = 0; input_index < INPUT_COUNT; ++input_index) {
-      if (CONCAT_PREFIX) {
-        if (batch < concat_offsets[input_index] ||
-            batch >= concat_offsets[input_index] + concat_lens[input_index]) {
-          continue;
-        }
-        uint32_t source_batch = batch - concat_offsets[input_index];
-        uint32_t tile_id =
-            input_tile_id(source_batch, output_tile_row, output_tile_col,
-                          input_tile_rows[input_index],
-                          input_tiles_per_row[input_index]);
-        read_input_tile(input_addr[input_index], tile_id, cb_input);
-        volatile tt_l1_ptr Element *source =
-            reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_input));
-        volatile tt_l1_ptr Element *output =
-            reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
-        uint32_t elements = get_tile_size(cb_output) / sizeof(Element);
-        for (uint32_t i = 0; i < elements; ++i) {
-          output[i] = source[i];
-        }
-        cb_pop_front(cb_input, 1);
-      } else if (CONCAT_COLS) {
+      if (CONCAT_COLS) {
         uint32_t row_begin = output_row_base;
         uint32_t row_end = min_u32(output_row_base + TILE_R, output_rows);
         uint32_t col_begin =

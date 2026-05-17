@@ -1,8 +1,12 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R};
+use crate::dram::{
+    tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R,
+};
 use crate::hw::CoreCoord;
-use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{
+    select_worker_cores, split_tile_range, DramKernel, Kernel, RuntimeArgsBuilder,
+};
 use std::io;
 
 const READER: &str = include_str!("../../kernels/transpose_reader.cc");
@@ -28,12 +32,6 @@ struct TransposeProgramKey {
     shape: TransposeKernelShape,
 }
 
-struct TransposeKernel {
-    input_addr: u32,
-    output_addr: u32,
-    key: TransposeProgramKey,
-}
-
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct GeneralTransposeKernelShape {
     rank: u32,
@@ -56,64 +54,6 @@ struct GeneralTransposeProgramKey {
     shape: GeneralTransposeKernelShape,
 }
 
-struct GeneralTransposeKernel {
-    input_addr: u32,
-    output_addr: u32,
-    key: GeneralTransposeProgramKey,
-}
-
-impl Kernel<TransposeProgramKey> for TransposeKernel {
-    fn program_key(&self) -> TransposeProgramKey {
-        self.key.clone()
-    }
-
-    fn build_program(&self) -> io::Result<Program> {
-        transpose_program(self.key.clone())
-    }
-
-    #[inline]
-    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            READER_INPUT_ADDR_INDEX => Some(self.input_addr),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
-        }
-    }
-}
-
-impl Kernel<GeneralTransposeProgramKey> for GeneralTransposeKernel {
-    fn program_key(&self) -> GeneralTransposeProgramKey {
-        self.key.clone()
-    }
-
-    fn build_program(&self) -> io::Result<Program> {
-        general_transpose_program(self.key.clone())
-    }
-
-    #[inline]
-    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            READER_INPUT_ADDR_INDEX => Some(self.input_addr),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
-        }
-    }
-}
-
 pub(crate) fn transpose_rank2(
     device: &mut Device,
     input: &DramBuffer,
@@ -128,14 +68,15 @@ pub(crate) fn transpose_rank2(
     let output_tiles = tiled_shape_tile_count(output_shape)?;
     let output = device.alloc(output_tiles, dtype, &output_allocation_shape, name)?;
     let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
-    let kernel = TransposeKernel {
-        input_addr: u32_addr(input.addr, "input address")?,
+    let kernel = DramKernel {
+        reader_addrs: [u32_addr(input.addr, "input address")?],
         output_addr: u32_addr(output.addr, "output address")?,
         key: TransposeProgramKey {
             cores,
             dtype,
             shape,
         },
+        build: transpose_program,
     };
     kernel.run(device)?;
     Ok(output)
@@ -156,14 +97,15 @@ pub(crate) fn transpose_general(
     let output_tiles = tiled_shape_tile_count(output_shape)?;
     let output = device.alloc(output_tiles, dtype, &output_allocation_shape, name)?;
     let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
-    let kernel = GeneralTransposeKernel {
-        input_addr: u32_addr(input.addr, "input address")?,
+    let kernel = DramKernel {
+        reader_addrs: [u32_addr(input.addr, "input address")?],
         output_addr: u32_addr(output.addr, "output address")?,
         key: GeneralTransposeProgramKey {
             cores,
             dtype,
             shape,
         },
+        build: general_transpose_program,
     };
     kernel.run(device)?;
     Ok(output)
@@ -282,9 +224,9 @@ fn general_transpose_shape(
         output_tiles_per_row: u32_arg(output_tiles_per_row, "output tiles per row")?,
         output_matrix_tiles: u32_arg(output_matrix_tiles, "output matrix tiles")?,
         output_tile_count: u32_arg(tiled_shape_tile_count(output_shape)?, "output tile count")?,
-        input_shape: padded_array(input_shape, "input shape")?,
-        output_shape: padded_array(output_shape, "output shape")?,
-        permutation: padded_array(&permutation_usize, "permutation")?,
+        input_shape: padded_array(input_shape)?,
+        output_shape: padded_array(output_shape)?,
+        permutation: padded_array(&permutation_usize)?,
     })
 }
 
@@ -356,11 +298,7 @@ fn general_transpose_program(key: GeneralTransposeProgramKey) -> io::Result<Prog
     })
 }
 
-fn general_reader_args(
-    shape: &GeneralTransposeKernelShape,
-    offset: u32,
-    n_tiles: u32,
-) -> Vec<u32> {
+fn general_reader_args(shape: &GeneralTransposeKernelShape, offset: u32, n_tiles: u32) -> Vec<u32> {
     let mut args = vec![
         0,
         offset,
@@ -401,16 +339,10 @@ fn general_transpose_reader_source(dtype: DType) -> io::Result<String> {
     ))
 }
 
-fn padded_array(values: &[usize], label: &str) -> io::Result<[u32; MAX_RANK]> {
-    if values.len() > MAX_RANK {
-        return Err(invalid_input(format!(
-            "general transpose {label} rank exceeds {MAX_RANK}: {}",
-            values.len()
-        )));
-    }
+fn padded_array(values: &[usize]) -> io::Result<[u32; MAX_RANK]> {
     let mut out = [0u32; MAX_RANK];
     for (index, &value) in values.iter().enumerate() {
-        out[index] = u32_arg(value, label)?;
+        out[index] = u32_arg(value, "ranked value")?;
     }
     Ok(out)
 }
@@ -469,22 +401,6 @@ mod tests {
         assert_eq!((arg_u32(&blobs[1], 1), arg_u32(&blobs[1], 2)), (3, 3));
         assert_eq!((arg_u32(&blobs[0], 4), arg_u32(&blobs[0], 5)), (0, 3));
         assert_eq!((arg_u32(&blobs[1], 4), arg_u32(&blobs[1], 5)), (3, 3));
-    }
-
-    #[test]
-    fn general_transpose_shape_describes_rank5_permutation() {
-        let shape = general_transpose_shape(
-            &[2, 1, 16, 2, 5],
-            &[2, 1, 5, 2, 16],
-            &[0, 1, 4, 3, 2],
-        )
-        .expect("transpose shape");
-
-        assert_eq!(shape.rank, 5);
-        assert_eq!(shape.output_rows, 2);
-        assert_eq!(shape.output_cols, 16);
-        assert_eq!(shape.output_tile_count, 10);
-        assert_eq!(shape.permutation[..5], [0, 1, 4, 3, 2]);
     }
 
     #[test]

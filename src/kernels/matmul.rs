@@ -182,12 +182,7 @@ pub(crate) fn matmul_bf16_with_output_dtype(
     let logical_nt = n / 32;
     let math_fidelity = matmul_math_fidelity()?;
     let cores = device.cores_arc();
-    let output = device.alloc(
-        logical_mt * logical_nt,
-        output_dtype,
-        &[m, n],
-        output_name,
-    )?;
+    let output = device.alloc(logical_mt * logical_nt, output_dtype, &[m, n], output_name)?;
     let key = MatmulProgramKey {
         logical_mt,
         logical_kt,

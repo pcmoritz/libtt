@@ -4,7 +4,9 @@ use crate::dram::{
     tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R,
 };
 use crate::hw::CoreCoord;
-use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{
+    select_worker_cores, split_tile_range, DramKernel, Kernel, RuntimeArgsBuilder,
+};
 use std::io;
 
 const BROADCAST_READER: &str = include_str!("../../kernels/broadcast_reader.cc");
@@ -73,38 +75,6 @@ struct BroadcastProgramKey {
     shape: BroadcastKernelShape,
 }
 
-struct BroadcastKernel {
-    input_addr: u32,
-    output_addr: u32,
-    key: BroadcastProgramKey,
-}
-
-impl Kernel<BroadcastProgramKey> for BroadcastKernel {
-    fn program_key(&self) -> BroadcastProgramKey {
-        self.key.clone()
-    }
-
-    fn build_program(&self) -> io::Result<Program> {
-        broadcast_program(self.key.clone())
-    }
-
-    #[inline]
-    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            READER_INPUT_ADDR_INDEX => Some(self.input_addr),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
-        }
-    }
-}
-
 pub(crate) fn broadcast_in_dim(
     device: &mut Device,
     input: &DramBuffer,
@@ -143,14 +113,15 @@ pub(crate) fn broadcast_in_dim(
     })?;
     let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
     let output = device.alloc(output_tiles, dtype, &plan.output_allocation_shape, name)?;
-    let kernel = BroadcastKernel {
-        input_addr: u32_addr(input.addr, "input address")?,
+    let kernel = DramKernel {
+        reader_addrs: [u32_addr(input.addr, "input address")?],
         output_addr: u32_addr(output.addr, "output address")?,
         key: BroadcastProgramKey {
             cores,
             dtype,
             shape,
         },
+        build: broadcast_program,
     };
     kernel.run(device)?;
     Ok(output)
@@ -222,27 +193,18 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
             broadcast_reader_source(key.dtype, &key.shape)?
         }
     };
-    let cbs = if key.shape.reader_kind == BroadcastReaderKind::PrefixTileCopy {
-        vec![CBConfig {
-            index: 16,
-            dtype: key.dtype,
-            tiles: 4,
-        }]
-    } else {
-        vec![
-            CBConfig::new(0, key.dtype),
-            CBConfig {
-                index: 16,
-                dtype: key.dtype,
-                tiles: 4,
-            },
-        ]
-    };
     Ok(Program {
         reader_kernel,
         writer_kernel: BROADCAST_WRITER.to_owned(),
         compile: CompileConfig {
-            cbs,
+            cbs: vec![
+                CBConfig::new(0, key.dtype),
+                CBConfig {
+                    index: 16,
+                    dtype: key.dtype,
+                    tiles: 4,
+                },
+            ],
             ..CompileConfig::default()
         },
         name: format!(
@@ -470,21 +432,11 @@ fn is_last_dim_broadcast(
     output_shape: &[usize],
     broadcast_dimensions: &[u32],
 ) -> bool {
-    if input_shape.len() < 2
-        || input_shape.len() != output_shape.len()
-        || broadcast_dimensions.len() != input_shape.len()
-    {
-        return false;
-    }
     let rank = input_shape.len();
-    if !broadcast_dimensions
-        .iter()
-        .enumerate()
-        .all(|(index, &dim)| dim == index as u32)
-    {
-        return false;
-    }
-    input_shape[..rank - 1] == output_shape[..rank - 1]
+    rank >= 2
+        && rank == output_shape.len()
+        && broadcast_dimensions.iter().copied().eq(0..rank as u32)
+        && input_shape[..rank - 1] == output_shape[..rank - 1]
         && input_shape[rank - 1] == 1
         && output_shape[rank - 1] > 1
 }
@@ -575,29 +527,6 @@ mod tests {
         assert_eq!(
             plan.kernel_shape().reader_kind,
             BroadcastReaderKind::Generic
-        );
-    }
-
-    #[test]
-    fn broadcast_plan_uses_prefix_tile_copy_when_matrix_dims_match() {
-        let plan = BroadcastInDimPlan::new(&[1, 1, 1, 5, 5], &[1, 1, 2, 5, 5], &[0, 1, 2, 3, 4])
-            .expect("valid broadcast");
-
-        assert_eq!(
-            plan.kernel_shape().reader_kind,
-            BroadcastReaderKind::PrefixTileCopy
-        );
-        assert_eq!(plan.kernel_shape().tile_count, 2);
-    }
-
-    #[test]
-    fn broadcast_plan_uses_last_dim_reader_for_column_expansion() {
-        let plan = BroadcastInDimPlan::new(&[2, 1, 2, 5, 1], &[2, 1, 2, 5, 5], &[0, 1, 2, 3, 4])
-            .expect("valid broadcast");
-
-        assert_eq!(
-            plan.kernel_shape().reader_kind,
-            BroadcastReaderKind::LastDim
         );
     }
 

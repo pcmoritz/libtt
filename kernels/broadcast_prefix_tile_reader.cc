@@ -1,7 +1,5 @@
 #include <cstdint>
-
 namespace {
-
 constexpr uint32_t TILE_R = 32;
 constexpr uint32_t TILE_C = 32;
 constexpr uint32_t INPUT_RANK = BROADCAST_INPUT_RANK;
@@ -15,7 +13,6 @@ constexpr uint32_t INPUT_TILE_ROWS = BROADCAST_INPUT_TILE_ROWS;
 constexpr uint32_t INPUT_TILES_PER_ROW = BROADCAST_INPUT_TILES_PER_ROW;
 constexpr uint32_t OUTPUT_TILE_ROWS = BROADCAST_OUTPUT_TILE_ROWS;
 constexpr uint32_t OUTPUT_TILES_PER_ROW = BROADCAST_OUTPUT_TILES_PER_ROW;
-
 void decode_output_batch(uint32_t output_batch, uint32_t output_coords[OUTPUT_COORD_COUNT]) {
   for (uint32_t dim = 0; dim < OUTPUT_RANK; ++dim) {
     output_coords[dim] = 0;
@@ -28,7 +25,6 @@ void decode_output_batch(uint32_t output_batch, uint32_t output_coords[OUTPUT_CO
     }
   }
 }
-
 uint32_t input_prefix_from_output(const uint32_t output_coords[OUTPUT_COORD_COUNT]) {
   uint32_t input_prefix = 0;
   if constexpr (INPUT_RANK >= 3) {
@@ -39,21 +35,17 @@ uint32_t input_prefix_from_output(const uint32_t output_coords[OUTPUT_COORD_COUN
   }
   return input_prefix;
 }
-
 }  // namespace
-
 void kernel_main() {
   const uint32_t input_addr = get_arg_val<uint32_t>(0);
   const uint32_t output_tile_offset = get_arg_val<uint32_t>(1);
   const uint32_t output_tile_count = get_arg_val<uint32_t>(2);
-
   constexpr uint32_t cb_output = tt::CBIndex::c_16;
   const InterleavedAddrGenFast<true> input = {
       .bank_base_address = input_addr,
       .page_size = get_tile_size(cb_output),
       .data_format = get_dataformat(cb_output),
   };
-
   constexpr uint32_t output_matrix_tiles = OUTPUT_TILE_ROWS * OUTPUT_TILES_PER_ROW;
   uint32_t output_coords[OUTPUT_COORD_COUNT];
   for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
@@ -66,7 +58,6 @@ void kernel_main() {
     const uint32_t input_prefix = input_prefix_from_output(output_coords);
     const uint32_t input_tile =
         (input_prefix * INPUT_TILE_ROWS + output_tile_row) * INPUT_TILES_PER_ROW + output_tile_col;
-
     cb_reserve_back(cb_output, 1);
     noc_async_read_tile(input_tile, input, get_write_ptr(cb_output));
     noc_async_read_barrier();

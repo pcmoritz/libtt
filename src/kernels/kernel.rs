@@ -3,7 +3,6 @@ use crate::dispatch::{pack_rta, Program};
 use crate::hw::CoreCoord;
 use std::any::{Any, TypeId};
 use std::collections::{btree_map::Entry, BTreeMap, HashMap};
-use std::env;
 use std::hash::Hash;
 use std::io;
 use std::mem::size_of;
@@ -294,6 +293,31 @@ pub(crate) trait Kernel<K = ()> {
     }
 }
 
+pub(crate) struct DramKernel<K, const READER_ADDRS: usize> {
+    pub(crate) reader_addrs: [u32; READER_ADDRS],
+    pub(crate) output_addr: u32,
+    pub(crate) key: K,
+    pub(crate) build: fn(K) -> io::Result<Program>,
+}
+
+impl<K: Clone, const READER_ADDRS: usize> Kernel<K> for DramKernel<K, READER_ADDRS> {
+    fn program_key(&self) -> K {
+        self.key.clone()
+    }
+
+    fn build_program(&self) -> io::Result<Program> {
+        (self.build)(self.key.clone())
+    }
+
+    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        self.reader_addrs.get(index).copied()
+    }
+
+    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        (index == 0).then_some(self.output_addr)
+    }
+}
+
 pub(crate) fn select_worker_cores(
     available: &[CoreCoord],
     tile_count: usize,
@@ -301,32 +325,8 @@ pub(crate) fn select_worker_cores(
     if available.is_empty() {
         return Err(invalid_input("no worker cores are available"));
     }
-    let max_cores = simple_kernel_core_limit()?;
-    let n_cores = available.len().min(max_cores).min(tile_count.max(1));
+    let n_cores = available.len().min(tile_count.max(1));
     Ok(available[..n_cores].to_vec())
-}
-
-fn simple_kernel_core_limit() -> io::Result<usize> {
-    match env::var("LIBTT_SIMPLE_KERNEL_MAX_CORES") {
-        Ok(value) => {
-            let parsed = value.trim().parse::<usize>().map_err(|_| {
-                invalid_input(format!(
-                    "LIBTT_SIMPLE_KERNEL_MAX_CORES must be a positive integer, got {value:?}"
-                ))
-            })?;
-            if parsed == 0 {
-                Err(invalid_input(
-                    "LIBTT_SIMPLE_KERNEL_MAX_CORES must be greater than zero",
-                ))
-            } else {
-                Ok(parsed)
-            }
-        }
-        Err(env::VarError::NotPresent) => Ok(usize::MAX),
-        Err(env::VarError::NotUnicode(_)) => Err(invalid_input(
-            "LIBTT_SIMPLE_KERNEL_MAX_CORES must be valid Unicode",
-        )),
-    }
 }
 
 pub(crate) fn split_tile_range(
