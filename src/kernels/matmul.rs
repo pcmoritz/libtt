@@ -78,7 +78,6 @@ struct MatmulPlan {
     rows: Vec<u8>,
     cols: Vec<u8>,
     direct_grid: Option<Vec<Vec<CoreCoord>>>,
-    grid_rows_per_batch: usize,
     batch_groups: usize,
     batches_per_group: usize,
     mt: usize,
@@ -131,6 +130,14 @@ impl MatmulPlan {
     fn cb1_pages(&self) -> usize {
         2 * self.per_core_n * self.in0_block_w
     }
+
+    fn direct_grid_rows_per_batch(&self) -> Option<usize> {
+        self.direct_grid.as_ref().map(|grid| {
+            debug_assert!(self.batch_groups > 0);
+            debug_assert_eq!(grid.len() % self.batch_groups, 0);
+            grid.len() / self.batch_groups
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,7 +145,6 @@ struct MatmulPlanCandidate {
     rows: Vec<u8>,
     cols: Vec<u8>,
     direct_grid: Option<Vec<Vec<CoreCoord>>>,
-    grid_rows_per_batch: usize,
     mt: usize,
     nt: usize,
     per_core_m: usize,
@@ -154,7 +160,6 @@ impl MatmulPlanCandidate {
             rows: self.rows,
             cols: self.cols,
             direct_grid: self.direct_grid,
-            grid_rows_per_batch: self.grid_rows_per_batch,
             batch_groups,
             batches_per_group,
             mt: self.mt,
@@ -710,7 +715,6 @@ fn plan_matmul(
                                     rows: rows.to_vec(),
                                     cols: cols.to_vec(),
                                     direct_grid: None,
-                                    grid_rows_per_batch: nr,
                                     mt,
                                     nt,
                                     per_core_m,
@@ -837,7 +841,6 @@ fn plan_direct_matmul(
                                         .map(|row| row.to_vec())
                                         .collect(),
                                 ),
-                                grid_rows_per_batch: logical_rows,
                                 mt,
                                 nt,
                                 per_core_m,
@@ -942,7 +945,6 @@ fn plan_batched_direct_matmul(
                                             .map(|row| row.to_vec())
                                             .collect(),
                                     ),
-                                    grid_rows_per_batch: logical_rows,
                                     mt,
                                     nt,
                                     per_core_m,
@@ -1094,11 +1096,12 @@ fn lower_runtime_args(
         vec![READER_LHS_ADDR_INDEX],
         Vec::new(),
     );
+    let direct_grid_rows_per_batch = plan.direct_grid_rows_per_batch();
     for (flat_row_index, row) in grid.iter().enumerate() {
-        let (batch_group, row_index) = if plan.direct_grid.is_some() {
+        let (batch_group, row_index) = if let Some(rows_per_batch) = direct_grid_rows_per_batch {
             (
-                flat_row_index / plan.grid_rows_per_batch,
-                flat_row_index % plan.grid_rows_per_batch,
+                flat_row_index / rows_per_batch,
+                flat_row_index % rows_per_batch,
             )
         } else {
             (0, flat_row_index)
@@ -1512,8 +1515,8 @@ mod tests {
         let grid = plan.direct_grid.as_ref().expect("batched direct plan");
         assert_eq!(plan.batch_groups, 8);
         assert_eq!(plan.batches_per_group, 1);
-        assert_eq!(plan.grid_rows_per_batch, 2);
-        assert_eq!(grid.len(), plan.batch_groups * plan.grid_rows_per_batch);
+        assert_eq!(plan.direct_grid_rows_per_batch(), Some(2));
+        assert_eq!(grid.len(), plan.batch_groups * 2);
         assert!(grid.iter().all(|row| row.len() == 1));
         assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 16);
         assert_eq!(plan.mt, 2);
@@ -1526,8 +1529,8 @@ mod tests {
         let grid = plan.direct_grid.as_ref().expect("batched direct plan");
         assert_eq!(plan.batch_groups, 8);
         assert_eq!(plan.batches_per_group, 1);
-        assert_eq!(plan.grid_rows_per_batch, 4);
-        assert_eq!(grid.len(), plan.batch_groups * plan.grid_rows_per_batch);
+        assert_eq!(plan.direct_grid_rows_per_batch(), Some(4));
+        assert_eq!(grid.len(), plan.batch_groups * 4);
         assert!(grid.iter().all(|row| row.len() == 2));
         assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 64);
         assert_eq!(plan.mt, 4);
