@@ -6,7 +6,8 @@
 void kernel_main() {
   constexpr uint32_t cb_in1 = tt::CBIndex::c_1;
   constexpr uint32_t cb_out = tt::CBIndex::c_16;
-  const uint32_t tile_bytes = get_tile_size(cb_in1);
+  const uint32_t in1_tile_bytes = get_tile_size(cb_in1);
+  const uint32_t out_tile_bytes = get_tile_size(cb_out);
   const uint32_t block_w = A(5);
   const uint32_t block_h = A(6);
   const uint32_t block_tiles = A(7);
@@ -31,13 +32,13 @@ void kernel_main() {
 
   const InterleavedAddrGenFast<true> in1_gen = {
       .bank_base_address = A(0),
-      .page_size = tile_bytes,
+      .page_size = in1_tile_bytes,
       .data_format = DataFormat::Float16_b,
   };
   const InterleavedAddrGenFast<true> out_gen = {
       .bank_base_address = A(18),
-      .page_size = tile_bytes,
-      .data_format = DataFormat::Float16_b,
+      .page_size = out_tile_bytes,
+      .data_format = get_dataformat(cb_out),
   };
 
   uint32_t cur_block = A(1);
@@ -54,9 +55,9 @@ void kernel_main() {
         if (A(1) + w < logical_nt) {
           noc_async_read_tile(tile_id, in1_gen, l1_addr);
         }
-        l1_addr += tile_bytes;
+        l1_addr += in1_tile_bytes;
         tile_id += A(2);
-        block_bytes += tile_bytes;
+        block_bytes += in1_tile_bytes;
       }
       row += A(3);
     }
@@ -93,7 +94,7 @@ void kernel_main() {
           if (out_row < logical_mt && out_col < logical_nt) {
             noc_async_write_tile(out_row * logical_nt + out_col, out_gen, l1_addr);
           }
-          l1_addr += tile_bytes;
+          l1_addr += out_tile_bytes;
           tile_id += out_stride_w;
         }
         row_start += out_stride_h;

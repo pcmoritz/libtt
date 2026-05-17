@@ -2068,12 +2068,6 @@ fn execute_transpose(
             "TT executable transpose input and output element types must match",
         ));
     }
-    if permutation != [1, 0] {
-        return Err(unimplemented(
-            "TT executable transpose currently only supports rank-2 permutation [1, 0]",
-        ));
-    }
-
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
     let input = device_buffer_for_value(values, input_id, "transpose.operand")?;
@@ -2083,15 +2077,28 @@ fn execute_transpose(
         ));
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    let output_dram = kernels::transpose::transpose_rank2(
-        device,
-        input_dram,
-        &input_shape,
-        &output_shape,
-        dtype,
-        "pjrt_transpose",
-    )
-    .map_err(io_error)?;
+    let output_dram = if permutation == [1, 0] && input_shape.len() == 2 {
+        kernels::transpose::transpose_rank2(
+            device,
+            input_dram,
+            &input_shape,
+            &output_shape,
+            dtype,
+            "pjrt_transpose",
+        )
+        .map_err(io_error)?
+    } else {
+        kernels::transpose::transpose_general(
+            device,
+            input_dram,
+            &input_shape,
+            &output_shape,
+            permutation,
+            dtype,
+            "pjrt_transpose",
+        )
+        .map_err(io_error)?
+    };
     store_output_buffer(
         values,
         plan,
@@ -2148,16 +2155,34 @@ fn execute_reduce(
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let reduce_plan =
-        kernels::reduce::ReducePlan::new(dtype, &input_shape, &output_shape, dimensions, reducer)
-            .map_err(io_error)?;
     if !reduce_init_is_supported(plan, *init_value_id, reducer) {
         return Err(unimplemented(
             "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
         ));
     }
-    let output_dram = kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
+    let output_dram = if output_shape.len() <= 2 {
+        let reduce_plan = kernels::reduce::ReducePlan::new(
+            dtype,
+            &input_shape,
+            &output_shape,
+            dimensions,
+            reducer,
+        )
         .map_err(io_error)?;
+        kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
+            .map_err(io_error)?
+    } else {
+        let reduce_plan = kernels::reduce::GeneralReducePlan::new(
+            dtype,
+            &input_shape,
+            &output_shape,
+            dimensions,
+            reducer,
+        )
+        .map_err(io_error)?;
+        kernels::reduce::reduce_general(device, input_dram, &reduce_plan, "pjrt_reduce")
+            .map_err(io_error)?
+    };
     store_output_buffer(
         values,
         plan,
@@ -3137,6 +3162,7 @@ fn execute_executable_v1(
     let device = &mut target_device.runtime;
     let mut dispatch_guard = DeferredDispatchGuard::new(device);
     let mut profile = ExecuteProfile::new();
+    let sync_each_op = env_flag_enabled("LIBTT_SYNC_EACH_OP");
     let use_counts = executable_use_counts(plan);
 
     let mut op_index = 0usize;
@@ -3146,6 +3172,9 @@ fn execute_executable_v1(
         let profiling = profile.is_enabled();
         let op_start = profiling.then(Instant::now);
         let op_name = profiling.then(|| op_profile_name(op));
+        if sync_each_op {
+            log(format!("pjrt execute op[{op_index}] {}", op_profile_name(op)));
+        }
         match op {
             executable::Op::Parameter {
                 parameter_index,
@@ -3699,34 +3728,6 @@ fn execute_executable_v1(
                 let output_id = *output_id;
                 let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
                 let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
-                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                {
-                    return Err(unimplemented(
-                        "TT executable matmul currently only supports bf16 buffers",
-                    ));
-                }
-                if !dimension_numbers.lhs_batching_dimensions.is_empty()
-                    || !dimension_numbers.rhs_batching_dimensions.is_empty()
-                    || dimension_numbers.lhs_contracting_dimensions != vec![1]
-                    || dimension_numbers.rhs_contracting_dimensions != vec![0]
-                {
-                    return Err(unimplemented(
-                        "TT executable dot_general execution currently only supports rank-2 standard matrix multiplication",
-                    ));
-                }
-                if lhs.dims.len() != 2 || rhs.dims.len() != 2 {
-                    return Err(unimplemented(
-                        "TT executable matmul currently only supports rank-2 buffers",
-                    ));
-                }
-                if lhs.dims[1] != rhs.dims[0] {
-                    return Err(invalid_argument(format!(
-                        "TT executable matmul shape mismatch: lhs {:?}, rhs {:?}",
-                        lhs.dims, rhs.dims
-                    )));
-                }
-
                 let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
                     return Err(failed_precondition(
                         "TT executable matmul lhs buffer has no device allocation",
@@ -3737,20 +3738,91 @@ fn execute_executable_v1(
                         "TT executable matmul rhs buffer has no device allocation",
                     ));
                 };
+                let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable matmul output id {output_id} is out of bounds"
+                    ))
+                })?;
+                let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+                let rank2_bf16_matmul =
+                    lhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                        && rhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                        && matches!(output_dtype, DType::Float16B | DType::Float32)
+                        && lhs.dims.len() == 2
+                        && rhs.dims.len() == 2
+                        && dimension_numbers.lhs_batching_dimensions.is_empty()
+                        && dimension_numbers.rhs_batching_dimensions.is_empty()
+                        && dimension_numbers.lhs_contracting_dimensions == vec![1]
+                        && dimension_numbers.rhs_contracting_dimensions == vec![0];
+                if rank2_bf16_matmul {
+                    if lhs.dims[1] != rhs.dims[0] {
+                        return Err(invalid_argument(format!(
+                            "TT executable matmul shape mismatch: lhs {:?}, rhs {:?}",
+                            lhs.dims, rhs.dims
+                        )));
+                    }
 
-                let output_dram =
-                    kernels::matmul::matmul_bf16(device, lhs_dram, rhs_dram, "pjrt_matmul")
-                        .map_err(io_error)?;
-                let expected_dims = vec![lhs.dims[0], rhs.dims[1]];
-                store_output_buffer(
-                    &mut values,
-                    plan,
-                    output_id,
-                    expected_dims,
-                    output_dram,
-                    &output_context,
-                    "matmul",
-                )?;
+                    let output_dram = if output_dtype == DType::Float16B {
+                        kernels::matmul::matmul_bf16(device, lhs_dram, rhs_dram, "pjrt_matmul")
+                    } else {
+                        kernels::matmul::matmul_bf16_with_output_dtype(
+                            device,
+                            lhs_dram,
+                            rhs_dram,
+                            output_dtype,
+                            "pjrt_matmul",
+                        )
+                    }
+                    .map_err(io_error)?;
+                    let expected_dims = vec![lhs.dims[0], rhs.dims[1]];
+                    store_output_buffer(
+                        &mut values,
+                        plan,
+                        output_id,
+                        expected_dims,
+                        output_dram,
+                        &output_context,
+                        "matmul",
+                    )?;
+                } else {
+                    let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
+                    let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+                    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+                    let output_dram = kernels::dot_general::dot_general(
+                        device,
+                        lhs_dram,
+                        rhs_dram,
+                        kernels::dot_general::DotGeneralSpec {
+                            lhs_shape,
+                            rhs_shape,
+                            output_shape,
+                            lhs_batching_dimensions: dimension_numbers
+                                .lhs_batching_dimensions
+                                .clone(),
+                            rhs_batching_dimensions: dimension_numbers
+                                .rhs_batching_dimensions
+                                .clone(),
+                            lhs_contracting_dimensions: dimension_numbers
+                                .lhs_contracting_dimensions
+                                .clone(),
+                            rhs_contracting_dimensions: dimension_numbers
+                                .rhs_contracting_dimensions
+                                .clone(),
+                            output_dtype,
+                        },
+                        "pjrt_dot_general",
+                    )
+                    .map_err(io_error)?;
+                    store_output_buffer(
+                        &mut values,
+                        plan,
+                        output_id,
+                        output_desc.dims.clone(),
+                        output_dram,
+                        &output_context,
+                        "dot_general",
+                    )?;
+                }
             }
             executable::Op::Constant {
                 packed_value,
@@ -3895,6 +3967,10 @@ fn execute_executable_v1(
                 *indices_id,
                 *k,
             )?,
+        }
+        if sync_each_op {
+            dispatch_guard.wait_now().map_err(io_error)?;
+            dispatch_guard = DeferredDispatchGuard::new(device);
         }
         if let (Some(name), Some(start)) = (op_name, op_start) {
             profile.record(name, start.elapsed());

@@ -8,6 +8,9 @@ use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, Runt
 use std::io;
 
 const BROADCAST_READER: &str = include_str!("../../kernels/broadcast_reader.cc");
+const BROADCAST_LAST_DIM_READER: &str = include_str!("../../kernels/broadcast_last_dim_reader.cc");
+const BROADCAST_PREFIX_TILE_READER: &str =
+    include_str!("../../kernels/broadcast_prefix_tile_reader.cc");
 const BROADCAST_WRITER: &str = include_str!("../../kernels/broadcast_writer.cc");
 const READER_INPUT_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
@@ -22,7 +25,15 @@ pub(crate) struct BroadcastKernelShape {
     output_tile_rows: u32,
     output_tiles_per_row: u32,
     tile_count: u32,
-    direct_copy: bool,
+    reader_kind: BroadcastReaderKind,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum BroadcastReaderKind {
+    Generic,
+    DirectCopy,
+    PrefixTileCopy,
+    LastDim,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,8 +170,7 @@ fn broadcast_kernel_shape(
     let input_shape_u32 = u32_shape(input_shape, "input shape")?;
     let output_shape_u32 = u32_shape(output_shape, "output shape")?;
     let broadcast_dimensions_u32 = u32_broadcast_dimensions(broadcast_dimensions)?;
-    let direct_copy =
-        is_direct_copy_broadcast(input_shape, output_shape, &broadcast_dimensions_u32);
+    let reader_kind = broadcast_reader_kind(input_shape, output_shape, &broadcast_dimensions_u32);
 
     Ok(BroadcastKernelShape {
         input_shape: input_shape_u32,
@@ -183,7 +193,7 @@ fn broadcast_kernel_shape(
             "output tiles per row",
         )?,
         tile_count: u32_arg(tile_count, "tile count")?,
-        direct_copy,
+        reader_kind,
     })
 }
 
@@ -205,11 +215,34 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
         )?;
     }
     let runtime_args = runtime_args.build()?;
+    let reader_kernel = match key.shape.reader_kind {
+        BroadcastReaderKind::PrefixTileCopy => broadcast_prefix_tile_reader_source(&key.shape)?,
+        BroadcastReaderKind::LastDim => broadcast_last_dim_reader_source(key.dtype, &key.shape)?,
+        BroadcastReaderKind::Generic | BroadcastReaderKind::DirectCopy => {
+            broadcast_reader_source(key.dtype, &key.shape)?
+        }
+    };
+    let cbs = if key.shape.reader_kind == BroadcastReaderKind::PrefixTileCopy {
+        vec![CBConfig {
+            index: 16,
+            dtype: key.dtype,
+            tiles: 4,
+        }]
+    } else {
+        vec![
+            CBConfig::new(0, key.dtype),
+            CBConfig {
+                index: 16,
+                dtype: key.dtype,
+                tiles: 4,
+            },
+        ]
+    };
     Ok(Program {
-        reader_kernel: broadcast_reader_source(key.dtype, &key.shape)?,
+        reader_kernel,
         writer_kernel: BROADCAST_WRITER.to_owned(),
         compile: CompileConfig {
-            cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(16, key.dtype)],
+            cbs,
             ..CompileConfig::default()
         },
         name: format!(
@@ -220,6 +253,55 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
         ),
         ..Program::new(runtime_args)
     })
+}
+
+fn broadcast_last_dim_reader_source(
+    dtype: DType,
+    shape: &BroadcastKernelShape,
+) -> io::Result<String> {
+    let element_type = element_type(dtype);
+    Ok(format!(
+        "#define BROADCAST_INPUT_RANK {}\n\
+         #define BROADCAST_OUTPUT_RANK {}\n\
+         #define BROADCAST_OUTPUT_SHAPE {}\n\
+         #define BROADCAST_INPUT_TILE_ROWS {}\n\
+         #define BROADCAST_INPUT_TILES_PER_ROW {}\n\
+         #define BROADCAST_OUTPUT_TILE_ROWS {}\n\
+         #define BROADCAST_OUTPUT_TILES_PER_ROW {}\n\
+         #define BROADCAST_ELEMENT_TYPE {element_type}\n\
+         {BROADCAST_LAST_DIM_READER}",
+        shape.input_shape.len(),
+        shape.output_shape.len(),
+        cpp_u32_array(&shape.output_shape),
+        shape.input_tile_rows,
+        shape.input_tiles_per_row,
+        shape.output_tile_rows,
+        shape.output_tiles_per_row,
+    ))
+}
+
+fn broadcast_prefix_tile_reader_source(shape: &BroadcastKernelShape) -> io::Result<String> {
+    Ok(format!(
+        "#define BROADCAST_INPUT_RANK {}\n\
+         #define BROADCAST_OUTPUT_RANK {}\n\
+         #define BROADCAST_INPUT_SHAPE {}\n\
+         #define BROADCAST_OUTPUT_SHAPE {}\n\
+         #define BROADCAST_DIMENSIONS {}\n\
+         #define BROADCAST_INPUT_TILE_ROWS {}\n\
+         #define BROADCAST_INPUT_TILES_PER_ROW {}\n\
+         #define BROADCAST_OUTPUT_TILE_ROWS {}\n\
+         #define BROADCAST_OUTPUT_TILES_PER_ROW {}\n\
+         {BROADCAST_PREFIX_TILE_READER}",
+        shape.input_shape.len(),
+        shape.output_shape.len(),
+        cpp_u32_array(&shape.input_shape),
+        cpp_u32_array(&shape.output_shape),
+        cpp_u32_array(&shape.broadcast_dimensions),
+        shape.input_tile_rows,
+        shape.input_tiles_per_row,
+        shape.output_tile_rows,
+        shape.output_tiles_per_row,
+    ))
 }
 
 fn broadcast_reader_source(dtype: DType, shape: &BroadcastKernelShape) -> io::Result<String> {
@@ -246,7 +328,7 @@ fn broadcast_reader_source(dtype: DType, shape: &BroadcastKernelShape) -> io::Re
         shape.input_tiles_per_row,
         shape.output_tile_rows,
         shape.output_tiles_per_row,
-        shape.direct_copy as u32,
+        (shape.reader_kind == BroadcastReaderKind::DirectCopy) as u32,
     ))
 }
 
@@ -341,6 +423,72 @@ fn is_direct_copy_broadcast(
             .all(|(index, &dim)| dim == index as u32)
 }
 
+fn broadcast_reader_kind(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[u32],
+) -> BroadcastReaderKind {
+    if is_direct_copy_broadcast(input_shape, output_shape, broadcast_dimensions) {
+        BroadcastReaderKind::DirectCopy
+    } else if is_prefix_tile_copy_broadcast(input_shape, output_shape, broadcast_dimensions) {
+        BroadcastReaderKind::PrefixTileCopy
+    } else if is_last_dim_broadcast(input_shape, output_shape, broadcast_dimensions) {
+        BroadcastReaderKind::LastDim
+    } else {
+        BroadcastReaderKind::Generic
+    }
+}
+
+fn is_prefix_tile_copy_broadcast(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[u32],
+) -> bool {
+    if input_shape.len() < 2 || output_shape.len() < 2 {
+        return false;
+    }
+    let input_rank = input_shape.len();
+    let output_rank = output_shape.len();
+    if broadcast_dimensions[input_rank - 2] as usize != output_rank - 2
+        || broadcast_dimensions[input_rank - 1] as usize != output_rank - 1
+        || input_shape[input_rank - 2] != output_shape[output_rank - 2]
+        || input_shape[input_rank - 1] != output_shape[output_rank - 1]
+    {
+        return false;
+    }
+    for input_dim in 0..input_rank - 2 {
+        let output_dim = broadcast_dimensions[input_dim] as usize;
+        if input_shape[input_dim] != 1 && input_shape[input_dim] != output_shape[output_dim] {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_last_dim_broadcast(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[u32],
+) -> bool {
+    if input_shape.len() < 2
+        || input_shape.len() != output_shape.len()
+        || broadcast_dimensions.len() != input_shape.len()
+    {
+        return false;
+    }
+    let rank = input_shape.len();
+    if !broadcast_dimensions
+        .iter()
+        .enumerate()
+        .all(|(index, &dim)| dim == index as u32)
+    {
+        return false;
+    }
+    input_shape[..rank - 1] == output_shape[..rank - 1]
+        && input_shape[rank - 1] == 1
+        && output_shape[rank - 1] > 1
+}
+
 fn element_type(dtype: DType) -> &'static str {
     match dtype {
         DType::Float32 | DType::Int32 | DType::UInt32 => "uint32_t",
@@ -392,7 +540,7 @@ mod tests {
                 output_tile_rows: 1,
                 output_tiles_per_row: 1,
                 tile_count: 1,
-                direct_copy: false,
+                reader_kind: BroadcastReaderKind::Generic,
             }
         );
     }
@@ -424,6 +572,33 @@ mod tests {
         assert_eq!(plan.kernel_shape().output_shape, vec![18, 2, 2, 32]);
         assert_eq!(plan.kernel_shape().broadcast_dimensions, vec![0, 1, 3]);
         assert_eq!(plan.kernel_shape().tile_count, 36);
+        assert_eq!(
+            plan.kernel_shape().reader_kind,
+            BroadcastReaderKind::Generic
+        );
+    }
+
+    #[test]
+    fn broadcast_plan_uses_prefix_tile_copy_when_matrix_dims_match() {
+        let plan = BroadcastInDimPlan::new(&[1, 1, 1, 5, 5], &[1, 1, 2, 5, 5], &[0, 1, 2, 3, 4])
+            .expect("valid broadcast");
+
+        assert_eq!(
+            plan.kernel_shape().reader_kind,
+            BroadcastReaderKind::PrefixTileCopy
+        );
+        assert_eq!(plan.kernel_shape().tile_count, 2);
+    }
+
+    #[test]
+    fn broadcast_plan_uses_last_dim_reader_for_column_expansion() {
+        let plan = BroadcastInDimPlan::new(&[2, 1, 2, 5, 1], &[2, 1, 2, 5, 5], &[0, 1, 2, 3, 4])
+            .expect("valid broadcast");
+
+        assert_eq!(
+            plan.kernel_shape().reader_kind,
+            BroadcastReaderKind::LastDim
+        );
     }
 
     #[test]
@@ -482,7 +657,10 @@ mod tests {
         assert_eq!(program.runtime_args.cores().len(), 3);
         assert_eq!(program.runtime_args.section_sizes(), (12, 12, 0));
         assert!(program.compute_kernel.is_empty());
-        assert!(plan.kernel_shape().direct_copy);
+        assert_eq!(
+            plan.kernel_shape().reader_kind,
+            BroadcastReaderKind::DirectCopy
+        );
         assert!(program
             .reader_kernel
             .contains("#define BROADCAST_OUTPUT_RANK 3"));

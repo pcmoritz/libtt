@@ -6,7 +6,7 @@
 void kernel_main() {
   constexpr uint32_t cb_in1 = tt::CBIndex::c_1;
   constexpr uint32_t cb_out = tt::CBIndex::c_16;
-  const uint32_t tile_bytes = get_tile_size(cb_in1);
+  const uint32_t out_tile_bytes = get_tile_size(cb_out);
   const uint32_t block_tiles = A(7);
   const uint32_t nblocks = A(8);
   const uint32_t out_start = A(19);
@@ -26,8 +26,8 @@ void kernel_main() {
 
   const InterleavedAddrGenFast<true> out_gen = {
       .bank_base_address = A(18),
-      .page_size = tile_bytes,
-      .data_format = DataFormat::Float16_b,
+      .page_size = out_tile_bytes,
+      .data_format = get_dataformat(cb_out),
   };
 
   for (uint32_t block = 0; block < nblocks; block++) {
@@ -54,7 +54,7 @@ void kernel_main() {
           if (out_row < logical_mt && out_col < logical_nt) {
             noc_async_write_tile(out_row * logical_nt + out_col, out_gen, l1_addr);
           }
-          l1_addr += tile_bytes;
+          l1_addr += out_tile_bytes;
           tile_id += out_stride_w;
         }
         row_start += out_stride_h;

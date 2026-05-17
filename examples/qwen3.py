@@ -100,6 +100,7 @@ def parse_args():
     parser.add_argument("--prompt", default="Write a short sentence about Tenstorrent hardware.")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--kv-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=32)
@@ -378,7 +379,11 @@ def rotate_half(x):
 
 
 def rope_cos_sin(config: Qwen3Config, seq_len: int):
-    position_ids = jnp.arange(seq_len, dtype=jnp.float32)[:, None]
+    return rope_cos_sin_range(config, 0, seq_len)
+
+
+def rope_cos_sin_range(config: Qwen3Config, start: int, length: int):
+    position_ids = jnp.arange(start, start + length, dtype=jnp.float32)[:, None]
     inv_freq = 1.0 / (
         config.rope_theta
         ** (jnp.arange(0, config.head_dim, 2, dtype=jnp.float32) / config.head_dim)
@@ -392,7 +397,17 @@ def apply_rope(x, cos, sin):
     return (x * cos[:, None, :] + rotate_half(x) * sin[:, None, :]).astype(x.dtype)
 
 
-def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin):
+def causal_attention_bias(seq_len: int):
+    position_ids = jnp.arange(seq_len)
+    bias = jnp.where(
+        position_ids[None, :] > position_ids[:, None],
+        -1.0e9,
+        0.0,
+    )
+    return bias[None, None, :, :]
+
+
+def attention_projection(config: Qwen3Config, hidden_states, layer, cos, sin):
     seq_len = hidden_states.shape[0]
     query_states = hidden_states @ layer["q_proj"]
     key_states = hidden_states @ layer["k_proj"]
@@ -406,50 +421,73 @@ def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin):
     key_states = rms_norm(key_states, layer["k_norm"], config.rms_norm_eps)
     query_states = apply_rope(query_states, cos, sin)
     key_states = apply_rope(key_states, cos, sin)
+    return query_states, key_states, value_states
 
-    repeats = config.num_attention_heads // config.num_key_value_heads
-    key_states = jnp.repeat(key_states, repeats, axis=1)
-    value_states = jnp.repeat(value_states, repeats, axis=1)
 
-    scores = jnp.stack(
-        [
-            query_states[:, head, :] @ key_states[:, head, :].T
-            for head in range(config.num_attention_heads)
-        ],
-        axis=1,
+def attention_output(query_states, key_states, value_states, bias=None):
+    seq_len = query_states.shape[0]
+    attn_output = jax.nn.dot_product_attention(
+        query_states,
+        key_states,
+        value_states,
+        bias=bias,
+        implementation="xla",
     )
-    scores = scores.astype(jnp.float32) * (config.head_dim**-0.5)
-    position_ids = jnp.arange(seq_len)
-    causal_mask = position_ids[None, :] > position_ids[:, None]
-    scores = jnp.where(causal_mask[:, None, :], -1.0e9, scores)
-    probs = jax.nn.softmax(scores, axis=-1).astype(hidden_states.dtype)
-    attn_output = jnp.stack(
-        [
-            probs[:, head, :] @ value_states[:, head, :]
-            for head in range(config.num_attention_heads)
-        ],
-        axis=1,
+    return attn_output.reshape(seq_len, -1)
+
+
+def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin, causal_bias):
+    query_states, key_states, value_states = attention_projection(
+        config, hidden_states, layer, cos, sin
     )
-    attn_output = attn_output.reshape(seq_len, -1)
-    return attn_output @ layer["o_proj"]
+    return attention_output(
+        query_states,
+        key_states,
+        value_states,
+        causal_bias,
+    ) @ layer["o_proj"]
 
 
-def mlp(hidden_states, layer):
-    gate = silu(hidden_states @ layer["gate_proj"])
-    up = hidden_states @ layer["up_proj"]
-    return (gate * up) @ layer["down_proj"]
+def self_attention_prefill(config: Qwen3Config, hidden_states, layer, cos, sin, causal_bias):
+    query_states, key_states, value_states = attention_projection(
+        config, hidden_states, layer, cos, sin
+    )
+    output = attention_output(query_states, key_states, value_states, causal_bias)
+    return output @ layer["o_proj"], key_states, value_states
 
 
-def qwen3_forward(config: Qwen3Config, weights, input_ids):
+def self_attention_decode(config: Qwen3Config, hidden_states, layer, key_cache, value_cache):
+    position = key_cache.shape[0]
+    cos, sin = rope_cos_sin_range(config, position, 1)
+    cos = cos.astype(hidden_states.dtype)
+    sin = sin.astype(hidden_states.dtype)
+    query_states, key_states, value_states = attention_projection(
+        config, hidden_states, layer, cos, sin
+    )
+    key_cache = jnp.concatenate((key_cache, key_states), axis=0)
+    value_cache = jnp.concatenate((value_cache, value_states), axis=0)
+    output = attention_output(query_states, key_cache, value_cache)
+    return output @ layer["o_proj"], key_cache, value_cache
+
+
+def qwen3_prefill(config: Qwen3Config, weights, input_ids):
     hidden_states = weights["embed_tokens"][input_ids]
     cos, sin = rope_cos_sin(config, input_ids.shape[0])
     cos = cos.astype(hidden_states.dtype)
     sin = sin.astype(hidden_states.dtype)
+    causal_bias = causal_attention_bias(input_ids.shape[0])
 
+    key_cache = []
+    value_cache = []
     for layer in weights["layers"]:
         residual = hidden_states
         hidden_states = rms_norm(hidden_states, layer["input_norm"], config.rms_norm_eps)
-        hidden_states = residual + self_attention(config, hidden_states, layer, cos, sin)
+        attn, keys, values = self_attention_prefill(
+            config, hidden_states, layer, cos, sin, causal_bias
+        )
+        key_cache.append(keys)
+        value_cache.append(values)
+        hidden_states = residual + attn
 
         residual = hidden_states
         hidden_states = rms_norm(
@@ -458,9 +496,82 @@ def qwen3_forward(config: Qwen3Config, weights, input_ids):
         hidden_states = residual + mlp(hidden_states, layer)
 
     hidden_states = rms_norm(hidden_states, weights["norm"], config.rms_norm_eps)
+    return hidden_states, (tuple(key_cache), tuple(value_cache))
+
+
+def qwen3_decode_cached(config: Qwen3Config, weights, token_ids, cache):
+    hidden_states = weights["embed_tokens"][token_ids]
+    key_cache, value_cache = cache
+    new_key_cache = []
+    new_value_cache = []
+
+    for layer, keys, values in zip(weights["layers"], key_cache, value_cache):
+        residual = hidden_states
+        hidden_states = rms_norm(hidden_states, layer["input_norm"], config.rms_norm_eps)
+        attn, keys, values = self_attention_decode(
+            config, hidden_states, layer, keys, values
+        )
+        new_key_cache.append(keys)
+        new_value_cache.append(values)
+        hidden_states = residual + attn
+
+        residual = hidden_states
+        hidden_states = rms_norm(
+            hidden_states, layer["post_attention_norm"], config.rms_norm_eps
+        )
+        hidden_states = residual + mlp(hidden_states, layer)
+
+    hidden_states = rms_norm(hidden_states, weights["norm"], config.rms_norm_eps)
+    return hidden_states, (tuple(new_key_cache), tuple(new_value_cache))
+
+
+def mlp(hidden_states, layer):
+    gate = silu(hidden_states @ layer["gate_proj"])
+    up = hidden_states @ layer["up_proj"]
+    return (gate * up) @ layer["down_proj"]
+
+
+def qwen3_hidden_states(config: Qwen3Config, weights, input_ids):
+    hidden_states = weights["embed_tokens"][input_ids]
+    cos, sin = rope_cos_sin(config, input_ids.shape[0])
+    cos = cos.astype(hidden_states.dtype)
+    sin = sin.astype(hidden_states.dtype)
+    causal_bias = causal_attention_bias(input_ids.shape[0])
+
+    for layer in weights["layers"]:
+        residual = hidden_states
+        hidden_states = rms_norm(hidden_states, layer["input_norm"], config.rms_norm_eps)
+        hidden_states = residual + self_attention(
+            config, hidden_states, layer, cos, sin, causal_bias
+        )
+
+        residual = hidden_states
+        hidden_states = rms_norm(
+            hidden_states, layer["post_attention_norm"], config.rms_norm_eps
+        )
+        hidden_states = residual + mlp(hidden_states, layer)
+
+    return rms_norm(hidden_states, weights["norm"], config.rms_norm_eps)
+
+
+def qwen3_forward(config: Qwen3Config, weights, input_ids):
+    hidden_states = qwen3_hidden_states(config, weights, input_ids)
     if "lm_head" in weights:
         return hidden_states @ weights["lm_head"]
     return hidden_states @ weights["embed_tokens"].T
+
+
+def qwen3_logits_from_last_hidden(weights, last_hidden):
+    if "lm_head" in weights:
+        logits = last_hidden @ weights["lm_head"]
+    else:
+        logits = last_hidden @ weights["embed_tokens"].T
+    return logits[0]
+
+
+def qwen3_next_logits(config: Qwen3Config, weights, input_ids):
+    hidden_states = qwen3_hidden_states(config, weights, input_ids)
+    return qwen3_logits_from_last_hidden(weights, hidden_states[-1:, :])
 
 
 def sample_next_token(
@@ -502,7 +613,7 @@ def count_parameters(weights) -> int:
 
 def make_decode_step(config, device, args):
     def logits(model_weights, ids):
-        return qwen3_forward(config, model_weights, ids)[-1]
+        return qwen3_next_logits(config, model_weights, ids)
 
     device_top_k = 1 if args.temperature <= 0 else args.top_k
     if 0 < device_top_k <= 32 and device_top_k < config.vocab_size:
@@ -514,6 +625,27 @@ def make_decode_step(config, device, args):
         )
 
     return jax.jit(logits, device=device)
+
+
+def make_cached_decode_steps(config, device, args):
+    device_top_k = 1 if args.temperature <= 0 else args.top_k
+
+    def maybe_top_k(logits):
+        if 0 < device_top_k <= 32 and device_top_k < config.vocab_size:
+            return jax.lax.top_k(logits, device_top_k)
+        return logits
+
+    def prefill(model_weights, ids):
+        hidden_states, cache = qwen3_prefill(config, model_weights, ids)
+        logits = qwen3_logits_from_last_hidden(model_weights, hidden_states[-1:, :])
+        return maybe_top_k(logits), cache
+
+    def decode(model_weights, token_ids, cache):
+        hidden_states, cache = qwen3_decode_cached(config, model_weights, token_ids, cache)
+        logits = qwen3_logits_from_last_hidden(model_weights, hidden_states)
+        return maybe_top_k(logits), cache
+
+    return jax.jit(prefill, device=device), jax.jit(decode, device=device)
 
 
 def generate(config, weights, device, input_ids, args, decode_step):
@@ -536,9 +668,45 @@ def generate(config, weights, device, input_ids, args, decode_step):
     return tokens
 
 
+def generate_cached(config, weights, device, input_ids, args, prefill_step, decode_step):
+    rng = np.random.default_rng(args.seed + 1)
+    tokens = input_ids.astype(np.int32).copy()
+    eos_token_ids = config.eos_token_id
+    if isinstance(eos_token_ids, int):
+        eos_token_ids = (eos_token_ids,)
+    if args.max_new_tokens == 0:
+        return tokens
+
+    ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
+    decode_output, cache = prefill_step(weights, ids)
+    for index in range(args.max_new_tokens):
+        next_token = sample_next_token(
+            decode_output, rng, args.temperature, args.top_k
+        )
+        tokens = np.append(tokens, np.int32(next_token))
+        if eos_token_ids is not None and next_token in eos_token_ids:
+            break
+        if tokens.size >= config.max_position_embeddings:
+            break
+        if index + 1 == args.max_new_tokens:
+            break
+
+        token_ids = jax.device_put(jnp.asarray([next_token], dtype=jnp.int32), device)
+        decode_output, cache = decode_step(weights, token_ids, cache)
+    return tokens
+
+
 def timed_generate(config, weights, device, input_ids, args, decode_step):
     start = time.perf_counter()
     output_ids = generate(config, weights, device, input_ids, args, decode_step)
+    return output_ids, time.perf_counter() - start
+
+
+def timed_generate_cached(config, weights, device, input_ids, args, prefill_step, decode_step):
+    start = time.perf_counter()
+    output_ids = generate_cached(
+        config, weights, device, input_ids, args, prefill_step, decode_step
+    )
     return output_ids, time.perf_counter() - start
 
 
@@ -569,12 +737,21 @@ def main():
 
     device = select_device(args.backend)
     weights = jax.device_put(weights_host, device)
-    decode_step = make_decode_step(config, device, args)
+    if args.kv_cache:
+        prefill_step, decode_step = make_cached_decode_steps(config, device, args)
+        run_generate = lambda: timed_generate_cached(
+            config, weights, device, input_ids, args, prefill_step, decode_step
+        )
+    else:
+        decode_step = make_decode_step(config, device, args)
+        run_generate = lambda: timed_generate(
+            config, weights, device, input_ids, args, decode_step
+        )
     if args.warmup:
-        _, warmup_seconds = timed_generate(config, weights, device, input_ids, args, decode_step)
+        _, warmup_seconds = run_generate()
     else:
         warmup_seconds = 0.0
-    output_ids, run_seconds = timed_generate(config, weights, device, input_ids, args, decode_step)
+    output_ids, run_seconds = run_generate()
 
     print(f"device: {device}")
     if not args.random_weights:

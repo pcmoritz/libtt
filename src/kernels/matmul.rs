@@ -25,6 +25,7 @@ struct MatmulProgramKey {
     logical_nt: usize,
     cores: Arc<[CoreCoord]>,
     math_fidelity: MathFidelity,
+    output_dtype: DType,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +110,7 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
             self.key.logical_mt,
             self.key.logical_nt,
             self.key.math_fidelity,
+            self.key.output_dtype,
         )
     }
 
@@ -136,10 +138,25 @@ pub(crate) fn matmul_bf16(
     rhs: &DramBuffer,
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
+    matmul_bf16_with_output_dtype(device, lhs, rhs, DType::Float16B, name)
+}
+
+pub(crate) fn matmul_bf16_with_output_dtype(
+    device: &mut Device,
+    lhs: &DramBuffer,
+    rhs: &DramBuffer,
+    output_dtype: DType,
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
     if lhs.dtype != DType::Float16B || rhs.dtype != DType::Float16B {
         return Err(invalid_input(format!(
             "matmul_bf16 requires bf16 inputs, got {:?} and {:?}",
             lhs.dtype, rhs.dtype
+        )));
+    }
+    if !matches!(output_dtype, DType::Float16B | DType::Float32) {
+        return Err(invalid_input(format!(
+            "matmul_bf16 output must be Float16B or Float32, got {output_dtype:?}"
         )));
     }
 
@@ -167,7 +184,7 @@ pub(crate) fn matmul_bf16(
     let cores = device.cores_arc();
     let output = device.alloc(
         logical_mt * logical_nt,
-        DType::Float16B,
+        output_dtype,
         &[m, n],
         output_name,
     )?;
@@ -177,6 +194,7 @@ pub(crate) fn matmul_bf16(
         logical_nt,
         cores,
         math_fidelity,
+        output_dtype,
     };
     let kernel = MatmulBf16Kernel {
         lhs_addr: u32_arg(lhs.addr, "lhs address")?,
@@ -513,6 +531,7 @@ fn bf16_program(
     logical_mt: usize,
     logical_nt: usize,
     math_fidelity: MathFidelity,
+    output_dtype: DType,
 ) -> io::Result<Program> {
     let cbs = vec![
         CBConfig {
@@ -527,12 +546,12 @@ fn bf16_program(
         },
         CBConfig {
             index: 16,
-            dtype: DType::Float16B,
+            dtype: output_dtype,
             tiles: plan.out_block_num_tiles(),
         },
         CBConfig {
             index: 24,
-            dtype: DType::Float16B,
+            dtype: output_dtype,
             tiles: plan.out_block_num_tiles(),
         },
     ];
@@ -544,7 +563,8 @@ fn bf16_program(
         reader_recv_kernel: BF16_READER_RECV.to_owned(),
         writer_recv_kernel: BF16_WRITER_RECV.to_owned(),
         name: format!(
-            "matmul_bf16_{}x{}x{}",
+            "matmul_bf16_{:?}_{}x{}x{}",
+            output_dtype,
             plan.mt * 32,
             plan.kt * 32,
             plan.nt * 32
@@ -552,6 +572,7 @@ fn bf16_program(
         compile: CompileConfig {
             cbs,
             math_fidelity,
+            dst_accum_mode: output_dtype == DType::Float32,
             ..CompileConfig::default()
         },
         grid: plan
