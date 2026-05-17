@@ -2172,7 +2172,7 @@ fn execute_reduce(
         kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
             .map_err(io_error)?
     } else {
-        let reduce_plan = kernels::reduce::GeneralReducePlan::new(
+        let reduce_plan = kernels::reduce::DpaReducePlan::new(
             dtype,
             &input_shape,
             &output_shape,
@@ -2180,7 +2180,7 @@ fn execute_reduce(
             reducer,
         )
         .map_err(io_error)?;
-        kernels::reduce::reduce_general(device, input_dram, &reduce_plan, "pjrt_reduce")
+        kernels::reduce::reduce_dpa_attention(device, input_dram, &reduce_plan, "pjrt_reduce")
             .map_err(io_error)?
     };
     store_output_buffer(
