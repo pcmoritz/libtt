@@ -5310,10 +5310,9 @@ mod tests {
 }
 "#,
             |executable| {
-                assert_eq!(executable.output_ids, vec![3]);
-                assert_eq!(executable.ops.len(), 4);
-                assert_eq!(executable.values[2].dims, vec![4, 210, 210]);
-                assert_eq!(executable.values[3].dims, vec![4, 10, 3, 7, 10, 7, 3]);
+                assert_eq!(executable.output_ids, vec![2]);
+                assert_eq!(executable.ops.len(), 3);
+                assert_eq!(executable.values[2].dims, vec![4, 10, 3, 7, 10, 7, 3]);
                 let executable::Op::Matmul {
                     input_ids,
                     output_id,
@@ -5328,13 +5327,6 @@ mod tests {
                 assert_eq!(dimension_numbers.rhs_batching_dimensions, vec![0]);
                 assert_eq!(dimension_numbers.lhs_contracting_dimensions, vec![3]);
                 assert_eq!(dimension_numbers.rhs_contracting_dimensions, vec![2]);
-                assert!(matches!(
-                    executable.ops[3],
-                    executable::Op::Reshape {
-                        input_id: 2,
-                        output_id: 3
-                    }
-                ));
             },
         );
     }

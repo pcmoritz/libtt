@@ -27,6 +27,7 @@ struct MatmulProgramKey {
     batch_count: usize,
     lhs_view: MatmulOperandView,
     rhs_view: MatmulOperandView,
+    output_view: MatmulOperandView,
     cores: Arc<[CoreCoord]>,
     math_fidelity: MathFidelity,
     output_dtype: DType,
@@ -202,6 +203,7 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
             self.key.batch_count,
             &self.key.lhs_view,
             &self.key.rhs_view,
+            &self.key.output_view,
             self.key.math_fidelity,
             self.key.output_dtype,
         )
@@ -285,6 +287,7 @@ pub(crate) fn matmul_bf16_dot_general(
         batch_count: shape.batch_count,
         lhs_view: shape.lhs_view,
         rhs_view: shape.rhs_view,
+        output_view: shape.output_view,
         cores,
         math_fidelity,
         output_dtype,
@@ -330,6 +333,7 @@ struct DotGeneralMatmulShape {
     n: usize,
     lhs_view: MatmulOperandView,
     rhs_view: MatmulOperandView,
+    output_view: MatmulOperandView,
 }
 
 fn dot_general_shape(
@@ -413,15 +417,24 @@ fn dot_general_shape(
         )));
     }
 
-    let mut expected_output = batch_shape;
-    expected_output.push(m);
-    expected_output.push(n);
+    let mut expected_output = batch_shape.clone();
+    for &dim in &lhs_dims.free {
+        expected_output.push(lhs_shape[dim]);
+    }
+    for &dim in &rhs_dims.free {
+        expected_output.push(rhs_shape[dim]);
+    }
     if output_shape != expected_output {
         return Err(invalid_input(format!(
-            "dot_general matmul output shape mismatch: expected canonical shape {:?}, got {output_shape:?}",
+            "dot_general matmul output shape mismatch: expected shape {:?}, got {output_shape:?}",
             expected_output
         )));
     }
+    let output_batch_dims = (0..batch_shape.len()).collect::<Vec<_>>();
+    let output_row_dims =
+        (batch_shape.len()..batch_shape.len() + lhs_dims.free.len()).collect::<Vec<_>>();
+    let output_col_dims =
+        (batch_shape.len() + lhs_dims.free.len()..output_shape.len()).collect::<Vec<_>>();
 
     Ok(DotGeneralMatmulShape {
         batch_count,
@@ -442,6 +455,14 @@ fn dot_general_shape(
             &rhs_dims.contract,
             &rhs_dims.free,
             k,
+            n,
+        )?,
+        output_view: operand_view(
+            output_shape,
+            &output_batch_dims,
+            &output_row_dims,
+            &output_col_dims,
+            m,
             n,
         )?,
     })
@@ -1007,6 +1028,7 @@ fn bf16_program(
     batch_count: usize,
     lhs_view: &MatmulOperandView,
     rhs_view: &MatmulOperandView,
+    output_view: &MatmulOperandView,
     math_fidelity: MathFidelity,
     output_dtype: DType,
 ) -> io::Result<Program> {
@@ -1049,6 +1071,7 @@ fn bf16_program(
         batch_count,
         lhs_view,
         rhs_view,
+        output_view,
     )?;
     Ok(Program {
         reader_kernel: BF16_READER_SENDER.to_owned(),
@@ -1088,6 +1111,7 @@ fn lower_runtime_args(
     batch_count: usize,
     lhs_view: &MatmulOperandView,
     rhs_view: &MatmulOperandView,
+    output_view: &MatmulOperandView,
 ) -> io::Result<RuntimeArgs> {
     let grid = plan_grid(plan);
     let mut runtime_args = RuntimeArgsBuilder::new(
@@ -1131,6 +1155,7 @@ fn lower_runtime_args(
                 batch_start,
                 batch_count,
                 rhs_view,
+                output_view,
             )?;
             runtime_args.add_core(core, writer, reader, Vec::new())?;
         }
@@ -1259,6 +1284,7 @@ fn writer_args(
     batch_start: usize,
     total_batch_count: usize,
     rhs_view: &MatmulOperandView,
+    output_view: &MatmulOperandView,
 ) -> io::Result<Vec<u32>> {
     let mcast = if plan.direct_grid.is_some() || plan.rows.len() <= 1 {
         [0, 0, 0, 0, 0]
@@ -1319,6 +1345,7 @@ fn writer_args(
         u32_value(logical_mt * logical_nt, "output batch stride")?,
     ]);
     append_view_args(&mut args, rhs_view);
+    append_view_args(&mut args, output_view);
     Ok(args)
 }
 
@@ -1452,6 +1479,30 @@ mod tests {
         assert!(source.contains("constexpr uint32_t batch_count = 3;"));
         assert!(source.contains("constexpr uint32_t transpose = 1;"));
         assert!(source.contains("#include \"compute_kernel_api/matmul.h\""));
+    }
+
+    #[test]
+    fn dot_general_shape_keeps_real_output_layout() {
+        let shape = dot_general_shape(
+            &[4, 10, 3, 5, 7],
+            &[4, 10, 5, 7, 3],
+            &[4, 10, 3, 7, 10, 7, 3],
+            &[0],
+            &[0],
+            &[3],
+            &[2],
+        )
+        .expect("shape");
+        assert_eq!(shape.batch_count, 4);
+        assert_eq!(shape.m, 210);
+        assert_eq!(shape.k, 5);
+        assert_eq!(shape.n, 210);
+        assert_eq!(shape.output_view.kind, MatmulViewKind::Generic);
+        assert_eq!(shape.output_view.batch_rank, 1);
+        assert_eq!(shape.output_view.row_rank, 3);
+        assert_eq!(shape.output_view.col_rank, 3);
+        assert_eq!(shape.output_view.logical_rows, 210);
+        assert_eq!(shape.output_view.logical_cols, 210);
     }
 
     #[test]

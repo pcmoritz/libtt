@@ -177,20 +177,6 @@ bool addValueDesc(
     return true;
 }
 
-bool addTensorDesc(
-    llvm::ArrayRef<int64_t> shape,
-    mlir::Type element_type,
-    tt::Executable& executable,
-    std::string& error,
-    uint32_t& id_out) {
-    auto* value_desc = executable.add_values();
-    if (!fillTensorDesc(shape, element_type, *value_desc->mutable_tensor(), error)) {
-        return false;
-    }
-    id_out = executable.values_size() - 1;
-    return true;
-}
-
 bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& error) {
     auto type = func.getFunctionType();
 
@@ -508,23 +494,13 @@ bool lowerDotGeneralToExecutable(
         return false;
     }
 
-    llvm::SmallVector<int64_t> matmul_output_shape;
-    matmul_output_shape.append(batch_shape.begin(), batch_shape.end());
-    matmul_output_shape.push_back(m);
-    matmul_output_shape.push_back(n);
-
-    uint32_t matmul_output_id = 0;
-    const bool final_reshape_needed = !sameShape(matmul_output_shape, result_type.getShape());
-    if (final_reshape_needed) {
-        if (!addTensorDesc(matmul_output_shape, result_type.getElementType(), executable, error, matmul_output_id)) {
-            return false;
-        }
-    } else if (!addValueDesc(dot_op.getResult(), executable, value_ids, error, matmul_output_id)) {
+    uint32_t output_id = 0;
+    if (!addValueDesc(dot_op.getResult(), executable, value_ids, error, output_id)) {
         return false;
     }
 
     auto* matmul = executable.add_ops();
-    matmul->set_output_id(matmul_output_id);
+    matmul->set_output_id(output_id);
     matmul->mutable_matmul()->set_lhs_id(lhs_id);
     matmul->mutable_matmul()->set_rhs_id(rhs_id);
     for (int64_t dim : lhs_batch_dims) {
@@ -539,18 +515,6 @@ bool lowerDotGeneralToExecutable(
     for (int64_t dim : rhs_contract_dims) {
         matmul->mutable_matmul()->add_rhs_contracting_dimensions(dim);
     }
-
-    if (!final_reshape_needed) {
-        return true;
-    }
-
-    uint32_t output_id = 0;
-    if (!addValueDesc(dot_op.getResult(), executable, value_ids, error, output_id)) {
-        return false;
-    }
-    auto* reshape = executable.add_ops();
-    reshape->set_output_id(output_id);
-    reshape->mutable_reshape()->set_operand_id(matmul_output_id);
     return true;
 }
 
