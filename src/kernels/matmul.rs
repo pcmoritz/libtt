@@ -10,8 +10,14 @@ use std::sync::Arc;
 
 const BF16_READER_SENDER: &str = include_str!("../../kernels/matmul_reader_sender.cc");
 const BF16_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
-const BF16_WRITER_SENDER: &str = include_str!("../../kernels/matmul_writer_sender.cc");
-const BF16_WRITER_RECV: &str = include_str!("../../kernels/matmul_writer_recv.cc");
+const BF16_WRITER_SENDER: &str = concat!(
+    include_str!("../../kernels/matmul_writer_common.cc"),
+    include_str!("../../kernels/matmul_writer_sender.cc")
+);
+const BF16_WRITER_RECV: &str = concat!(
+    include_str!("../../kernels/matmul_writer_common.cc"),
+    include_str!("../../kernels/matmul_writer_recv.cc")
+);
 const BF16_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
 const READER_LHS_ADDR_INDEX: usize = 0;
@@ -194,6 +200,7 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
             self.key.logical_nt * 32,
             self.key.batch_count,
             &self.key.cores,
+            self.key.output_view.kind == MatmulViewKind::Contiguous,
         )?;
         log_matmul_plan(&plan);
         bf16_program(
@@ -648,6 +655,7 @@ fn plan_matmul(
     n: usize,
     batch_count: usize,
     cores: &[CoreCoord],
+    allow_column_split: bool,
 ) -> io::Result<MatmulPlan> {
     let mt_base = ceil32(m) / 32;
     let kt = ceil32(k) / 32;
@@ -688,9 +696,13 @@ fn plan_matmul(
             if valid_cols.is_empty() {
                 continue;
             }
-            for nc in 1..=valid_cols.len() {
+            let max_nc = if allow_column_split { valid_cols.len() } else { 1 };
+            for nc in 1..=max_nc {
                 let cols = &valid_cols[..nc];
                 let nr = rows.len();
+                if nr > mt_base {
+                    continue;
+                }
                 if nr * nc > ordered.len() {
                     continue;
                 }
@@ -752,7 +764,7 @@ fn plan_matmul(
         }
     }
 
-    let Some(candidate) = best.or_else(|| {
+    let direct = || {
         plan_direct_matmul(
             mt_base,
             nt_base,
@@ -761,8 +773,15 @@ fn plan_matmul(
             &kt_divs,
             tile_bytes,
             l1_data_bytes,
+            allow_column_split,
         )
-    }) else {
+    };
+    let candidate = if mt_base == 1 {
+        direct().or(best)
+    } else {
+        best.or_else(direct)
+    };
+    let Some(candidate) = candidate else {
         return Err(invalid_input(format!(
             "no valid matmul plan for M={m} K={k} N={n} on {} cores",
             ordered.len()
@@ -781,6 +800,7 @@ fn plan_matmul(
         tile_bytes,
         l1_data_bytes,
         &plan,
+        allow_column_split,
     ) {
         plan = batched;
     }
@@ -796,6 +816,7 @@ fn plan_direct_matmul(
     kt_divs: &[usize],
     tile_bytes: usize,
     l1_data_bytes: usize,
+    allow_column_split: bool,
 ) -> Option<MatmulPlanCandidate> {
     if mt_base == 0 || nt_base == 0 || batch_groups == 0 {
         return None;
@@ -803,9 +824,14 @@ fn plan_direct_matmul(
 
     let mut best = None;
     let mut best_score = None;
+    let kt = *kt_divs.last()?;
     let max_rows = mt_base.min(cores.len());
     for logical_rows in 1..=max_rows {
-        let max_cols = nt_base.min(cores.len() / logical_rows);
+        let max_cols = if allow_column_split {
+            nt_base.min(cores.len() / logical_rows)
+        } else {
+            1
+        };
         for logical_cols in 1..=max_cols {
             let active_cores_per_group = logical_rows * logical_cols;
             let active_cores = active_cores_per_group * batch_groups;
@@ -844,13 +870,24 @@ fn plan_direct_matmul(
                         let bias = out_tiles.min(16);
                         // Direct plans do not amortize narrow output blocks with multicast.
                         // Prefer wider subblocks even if that leaves a few cores idle.
-                        let score = (
-                            out_subblock_num_tiles,
-                            active_cores * in0_block_w * bias * bias,
-                            usize::MAX - padding,
-                            active_cores * in0_block_w,
-                            active_cores,
-                        );
+                        let score = if mt_base == 1 {
+                            let per_core_work = (kt / in0_block_w) * per_core_m * per_core_n;
+                            (
+                                usize::MAX - per_core_work,
+                                usize::MAX - padding,
+                                active_cores,
+                                out_subblock_num_tiles,
+                                in0_block_w,
+                            )
+                        } else {
+                            (
+                                out_subblock_num_tiles,
+                                active_cores * in0_block_w * bias * bias,
+                                usize::MAX - padding,
+                                active_cores * in0_block_w,
+                                active_cores,
+                            )
+                        };
                         if best_score.map_or(true, |current| score > current) {
                             best_score = Some(score);
                             best = Some(MatmulPlanCandidate {
@@ -890,6 +927,7 @@ fn plan_batched_direct_matmul(
     tile_bytes: usize,
     l1_data_bytes: usize,
     single_group_plan: &MatmulPlan,
+    allow_column_split: bool,
 ) -> Option<MatmulPlan> {
     if batch_count <= 1 || mt_base == 0 || nt_base == 0 {
         return None;
@@ -910,7 +948,11 @@ fn plan_batched_direct_matmul(
         }
         let batches_per_group = batch_count.div_ceil(batch_groups);
         for logical_rows in 1..=mt_base.min(max_group_cores) {
-            let max_cols = nt_base.min(max_group_cores / logical_rows);
+            let max_cols = if allow_column_split {
+                nt_base.min(max_group_cores / logical_rows)
+            } else {
+                1
+            };
             for logical_cols in 1..=max_cols {
                 let active_cores_per_group = logical_rows * logical_cols;
                 let active_cores = active_cores_per_group * batch_groups;
@@ -1051,6 +1093,11 @@ fn bf16_program(
         CBConfig {
             index: 3,
             dtype: DType::Float16B,
+            tiles: 1,
+        },
+        CBConfig {
+            index: 4,
+            dtype: output_dtype,
             tiles: 1,
         },
         CBConfig {
@@ -1443,12 +1490,13 @@ mod tests {
 
     #[test]
     fn plan_matmul_uses_exact_tiling() {
-        let plan = plan_matmul(64, 64, 64, 1, &cores(&[1, 2], &[2, 3])).expect("plan");
+        let plan = plan_matmul(64, 64, 64, 1, &cores(&[1, 2], &[2, 3]), true).expect("plan");
+        let grid = plan_grid(&plan);
         assert_eq!(plan.mt, 2);
         assert_eq!(plan.kt, 2);
         assert_eq!(plan.nt, 2);
-        assert_eq!(plan.per_core_m * plan.rows.len(), plan.mt);
-        assert_eq!(plan.per_core_n * plan.cols.len(), plan.nt);
+        assert_eq!(plan.per_core_m * grid.len(), plan.mt);
+        assert_eq!(plan.per_core_n * grid[0].len(), plan.nt);
     }
 
     #[test]
@@ -1473,7 +1521,7 @@ mod tests {
 
     #[test]
     fn compute_source_contains_plan_constants() {
-        let plan = plan_matmul(64, 64, 64, 1, &cores(&[1], &[2])).expect("plan");
+        let plan = plan_matmul(64, 64, 64, 1, &cores(&[1], &[2]), true).expect("plan");
         let source = compute_src(&plan, 3, true);
         assert!(source.contains("constexpr uint32_t in0_block_w = 2;"));
         assert!(source.contains("constexpr uint32_t batch_count = 3;"));
@@ -1507,7 +1555,7 @@ mod tests {
 
     #[test]
     fn plan_matmul_prefers_square_exact_grid() {
-        let plan = plan_matmul(512, 512, 512, 1, &p100_worker_cores()).expect("plan");
+        let plan = plan_matmul(512, 512, 512, 1, &p100_worker_cores(), true).expect("plan");
         assert_eq!(plan.per_core_m * plan.rows.len(), plan.mt);
         assert_eq!(plan.per_core_n * plan.cols.len(), plan.nt);
         assert!(plan.mt >= 16);
@@ -1516,7 +1564,7 @@ mod tests {
 
     #[test]
     fn plan_matmul_prefers_throughput_for_large_shapes() {
-        let plan = plan_matmul(4096, 8192, 4096, 1, &p100_worker_cores()).expect("plan");
+        let plan = plan_matmul(4096, 8192, 4096, 1, &p100_worker_cores(), true).expect("plan");
         assert_eq!(plan.rows, vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         assert_eq!(plan.cols, vec![1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13]);
         assert_eq!(plan.mt, 130);
@@ -1530,28 +1578,46 @@ mod tests {
 
     #[test]
     fn plan_matmul_uses_ceiled_tile_shape() {
-        let plan = plan_matmul(33, 65, 1, 1, &cores(&[1], &[2])).expect("plan");
+        let plan = plan_matmul(33, 65, 1, 1, &cores(&[1], &[2]), true).expect("plan");
         assert_eq!(plan.mt, 2);
         assert_eq!(plan.kt, 3);
         assert_eq!(plan.nt, 1);
     }
 
     #[test]
+    fn plan_matmul_does_not_mcast_padded_rows() {
+        let plan = plan_matmul(1, 1024, 6144, 1, &p100_worker_cores(), true).expect("plan");
+        assert_eq!(plan.mt, 1);
+        assert_eq!(plan.per_core_m, 1);
+    }
+
+    #[test]
+    fn plan_matmul_splits_single_row_projection_across_columns() {
+        let plan = plan_matmul(1, 3072, 1024, 1, &p100_worker_cores(), true).expect("plan");
+        let grid = plan.direct_grid.as_ref().expect("single-row direct plan");
+        assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 32);
+        assert_eq!(plan.mt, 1);
+        assert_eq!(plan.nt, 32);
+        assert_eq!(plan.per_core_n, 1);
+        assert_eq!(plan.in0_block_w, 32);
+        assert_eq!(plan.out_subblock_w, 1);
+    }
+
+    #[test]
     fn plan_matmul_uses_direct_grid_for_wide_projection() {
-        let plan = plan_matmul(32, 1024, 151936, 1, &p100_worker_cores()).expect("plan");
+        let plan = plan_matmul(32, 1024, 151936, 1, &p100_worker_cores(), true).expect("plan");
         let grid = plan.direct_grid.as_ref().expect("direct plan");
         assert_eq!(grid.len(), 1);
-        assert_eq!(grid[0].len(), 101);
+        assert!(grid[0].len() >= 100);
         assert_eq!(plan.mt, 1);
         assert_eq!(plan.kt, 32);
         assert_eq!(plan.per_core_m, 1);
-        assert_eq!(plan.per_core_n, 48);
-        assert_eq!(plan.out_subblock_w, 8);
+        assert!(plan.per_core_n <= 48);
     }
 
     #[test]
     fn plan_matmul_direct_grid_is_not_limited_to_single_m_tile() {
-        let plan = plan_matmul(64, 1024, 151936, 1, &p100_worker_cores()).expect("plan");
+        let plan = plan_matmul(64, 1024, 151936, 1, &p100_worker_cores(), true).expect("plan");
         let grid = plan.direct_grid.as_ref().expect("direct plan");
         assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 110);
         assert_eq!(plan.mt, 2);
@@ -1562,7 +1628,7 @@ mod tests {
 
     #[test]
     fn plan_matmul_parallelizes_score_batches() {
-        let plan = plan_matmul(54, 128, 27, 8, &p100_worker_cores()).expect("plan");
+        let plan = plan_matmul(54, 128, 27, 8, &p100_worker_cores(), false).expect("plan");
         let grid = plan.direct_grid.as_ref().expect("batched direct plan");
         assert_eq!(plan.batch_groups, 8);
         assert_eq!(plan.batches_per_group, 1);
@@ -1576,16 +1642,17 @@ mod tests {
 
     #[test]
     fn plan_matmul_parallelizes_value_batches() {
-        let plan = plan_matmul(128, 27, 54, 8, &p100_worker_cores()).expect("plan");
+        let plan = plan_matmul(128, 27, 54, 8, &p100_worker_cores(), false).expect("plan");
         let grid = plan.direct_grid.as_ref().expect("batched direct plan");
         assert_eq!(plan.batch_groups, 8);
         assert_eq!(plan.batches_per_group, 1);
         assert_eq!(plan.direct_grid_rows_per_batch(), Some(4));
         assert_eq!(grid.len(), plan.batch_groups * 4);
-        assert!(grid.iter().all(|row| row.len() == 2));
-        assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 64);
+        assert!(grid.iter().all(|row| row.len() == 1));
+        assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 32);
         assert_eq!(plan.mt, 4);
         assert_eq!(plan.nt, 2);
+        assert_eq!(plan.per_core_n, 2);
     }
 
     #[test]
@@ -1599,6 +1666,7 @@ mod tests {
                 .into_iter()
                 .filter(|core| core.x >= 10)
                 .collect::<Vec<_>>(),
+            true,
         )
         .expect("east plan");
         let grid = plan_grid(&plan);

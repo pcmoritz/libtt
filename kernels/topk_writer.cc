@@ -122,29 +122,73 @@ void kernel_main() {
   uint32_t best_indices[MAX_K];
   uint32_t count = 0;
 
-  for (uint32_t tile_id = 0; tile_id < input_tiles; ++tile_id) {
-    uint32_t base_index = tile_id * TILE_C;
-    if (base_index >= logical_len) {
-      break;
-    }
-    uint32_t valid_cols = logical_len - base_index;
-    if (valid_cols > TILE_C) {
-      valid_cols = TILE_C;
+  if (k == 1) {
+    uint32_t best_key = 0;
+    uint32_t best_value = 0;
+    uint32_t best_index = 0;
+    bool have_best = false;
+
+    for (uint32_t tile_id = 0; tile_id < input_tiles; ++tile_id) {
+      uint32_t base_index = tile_id * TILE_C;
+      if (base_index >= logical_len) {
+        break;
+      }
+      uint32_t valid_cols = logical_len - base_index;
+      if (valid_cols > TILE_C) {
+        valid_cols = TILE_C;
+      }
+
+      cb_reserve_back(cb_input, 1);
+      uint32_t input_l1_addr = get_write_ptr(cb_input);
+      noc_async_read_tile(tile_id, input, input_l1_addr);
+      noc_async_read_barrier();
+
+      for (uint32_t col = 0; col < valid_cols; ++col) {
+        uint32_t element = tile_element_index(0, col);
+        uint32_t bits = load_value_bits(input_l1_addr, element);
+        uint32_t key = value_key(bits);
+        uint32_t index = base_index + col;
+        if (!have_best || candidate_before(key, index, best_key, best_index)) {
+          best_key = key;
+          best_value = bits;
+          best_index = index;
+          have_best = true;
+        }
+      }
+      cb_push_back(cb_input, 1);
+      cb_pop_front(cb_input, 1);
     }
 
-    cb_reserve_back(cb_input, 1);
-    uint32_t input_l1_addr = get_write_ptr(cb_input);
-    noc_async_read_tile(tile_id, input, input_l1_addr);
-    noc_async_read_barrier();
-
-    for (uint32_t col = 0; col < valid_cols; ++col) {
-      uint32_t element = tile_element_index(0, col);
-      uint32_t bits = load_value_bits(input_l1_addr, element);
-      insert_candidate(value_key(bits), bits, base_index + col, k, best_keys, best_values,
-                       best_indices, count);
+    if (have_best) {
+      best_values[0] = best_value;
+      best_indices[0] = best_index;
+      count = 1;
     }
-    cb_push_back(cb_input, 1);
-    cb_pop_front(cb_input, 1);
+  } else {
+    for (uint32_t tile_id = 0; tile_id < input_tiles; ++tile_id) {
+      uint32_t base_index = tile_id * TILE_C;
+      if (base_index >= logical_len) {
+        break;
+      }
+      uint32_t valid_cols = logical_len - base_index;
+      if (valid_cols > TILE_C) {
+        valid_cols = TILE_C;
+      }
+
+      cb_reserve_back(cb_input, 1);
+      uint32_t input_l1_addr = get_write_ptr(cb_input);
+      noc_async_read_tile(tile_id, input, input_l1_addr);
+      noc_async_read_barrier();
+
+      for (uint32_t col = 0; col < valid_cols; ++col) {
+        uint32_t element = tile_element_index(0, col);
+        uint32_t bits = load_value_bits(input_l1_addr, element);
+        insert_candidate(value_key(bits), bits, base_index + col, k, best_keys, best_values,
+                         best_indices, count);
+      }
+      cb_push_back(cb_input, 1);
+      cb_pop_front(cb_input, 1);
+    }
   }
 
   cb_reserve_back(cb_values, 1);
