@@ -1814,12 +1814,6 @@ fn execute_slice(
 
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let input = device_buffer_for_value(values, input_id, "slice.operand")?;
-    let Some(input_dram) = input.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable slice operand buffer has no device allocation",
-        ));
-    };
     let slice_plan = kernels::slice::SlicePlan::new(
         &input_shape,
         &output_shape,
@@ -1828,6 +1822,13 @@ fn execute_slice(
         strides,
     )
     .map_err(io_error)?;
+
+    let input = device_buffer_for_value(values, input_id, "slice.operand")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable slice operand buffer has no device allocation",
+        ));
+    };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dram = kernels::slice::slice(device, input_dram, &slice_plan, dtype, "pjrt_slice")
         .map_err(io_error)?;
@@ -1949,14 +1950,14 @@ fn execute_reduce(
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let reduce_plan =
+        kernels::reduce::ReducePlan::new(dtype, &input_shape, &output_shape, dimensions, reducer)
+            .map_err(io_error)?;
     if !reduce_init_is_supported(plan, *init_value_id, reducer) {
         return Err(unimplemented(
             "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
         ));
     }
-    let reduce_plan =
-        kernels::reduce::ReducePlan::new(dtype, &input_shape, &output_shape, dimensions, reducer)
-            .map_err(io_error)?;
     let output_dram = kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
         .map_err(io_error)?;
     store_output_buffer(
@@ -2469,6 +2470,28 @@ fn execute_iota(
     )
 }
 
+struct DispatchFinishGuard {
+    device: *mut Device,
+}
+
+impl DispatchFinishGuard {
+    fn new(device: &mut Device) -> Self {
+        Self { device }
+    }
+
+    fn finish_now(&mut self) -> io::Result<()> {
+        let device = unsafe { &mut *self.device };
+        device.finish_dispatch()
+    }
+}
+
+impl Drop for DispatchFinishGuard {
+    fn drop(&mut self) {
+        let device = unsafe { &mut *self.device };
+        let _ = device.finish_dispatch();
+    }
+}
+
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
@@ -2488,475 +2511,466 @@ fn execute_executable_v1(
         local_hardware_id: target_local_hardware_id,
     };
     let device = &mut target_device.runtime;
+    let mut dispatch_finish = DispatchFinishGuard::new(device);
 
-    let execute_result = (|| -> Result<(), *mut PJRT_Error> {
-        for op in &plan.ops {
-            match op {
-                executable::Op::Parameter {
-                    parameter_index,
-                    output_id,
-                } => {
-                    let parameter_index = *parameter_index;
-                    let output_id = *output_id;
-                    let input_ptr = inputs.get(parameter_index).copied().ok_or_else(|| {
-                        invalid_argument(format!(
-                            "TT executable parameter index {parameter_index} is out of range"
-                        ))
-                    })?;
-                    let input = unsafe { checked_ref(input_ptr, "argument_lists[0][*]") }?;
-                    if input.deleted {
-                        Err(failed_precondition("input buffers must not be deleted"))?;
-                    }
-                    if input.local_hardware_id != target_local_hardware_id {
-                        Err(invalid_argument(
-                            "all input buffers and execute_device must be on the same device",
-                        ))?;
-                    }
+    for op in &plan.ops {
+        match op {
+            executable::Op::Parameter {
+                parameter_index,
+                output_id,
+            } => {
+                let parameter_index = *parameter_index;
+                let output_id = *output_id;
+                let input_ptr = inputs.get(parameter_index).copied().ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable parameter index {parameter_index} is out of range"
+                    ))
+                })?;
+                let input = unsafe { checked_ref(input_ptr, "argument_lists[0][*]") }?;
+                if input.deleted {
+                    return Err(failed_precondition("input buffers must not be deleted"));
+                }
+                if input.local_hardware_id != target_local_hardware_id {
+                    return Err(invalid_argument(
+                        "all input buffers and execute_device must be on the same device",
+                    ));
+                }
 
-                    let output_index = output_id as usize;
-                    let expected = plan.values.get(output_index).ok_or_else(|| {
-                        invalid_argument(format!(
-                            "TT executable parameter output id {output_id} is out of bounds"
-                        ))
-                    })?;
-                    if input.buffer_type != expected.element_type {
-                        Err(unimplemented(format!(
-                            "TT executable parameter {parameter_index} expected {:?}, got {:?}",
-                            expected.element_type, input.buffer_type
-                        )))?;
-                    }
-                    if input.dims != expected.dims {
-                        Err(invalid_argument(format!(
-                            "TT executable parameter {parameter_index} shape mismatch: expected {:?}, got {:?}",
-                            expected.dims, input.dims
-                        )))?;
-                    }
-                    values[output_index] = Some(input.clone());
+                let output_index = output_id as usize;
+                let expected = plan.values.get(output_index).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable parameter output id {output_id} is out of bounds"
+                    ))
+                })?;
+                if input.buffer_type != expected.element_type {
+                    return Err(unimplemented(format!(
+                        "TT executable parameter {parameter_index} expected {:?}, got {:?}",
+                        expected.element_type, input.buffer_type
+                    )));
                 }
-                executable::Op::Add {
-                    input_ids,
-                    output_id,
-                } => {
-                    execute_binary_eltwise(
-                        &mut values,
-                        plan,
-                        device,
-                        &output_context,
-                        kernels::binary_eltwise::BinaryEltwiseOp::Add,
-                        *input_ids,
-                        *output_id,
-                        "add",
-                    )?;
+                if input.dims != expected.dims {
+                    return Err(invalid_argument(format!(
+                        "TT executable parameter {parameter_index} shape mismatch: expected {:?}, got {:?}",
+                        expected.dims, input.dims
+                    )));
                 }
-                executable::Op::Subtract {
-                    input_ids,
-                    output_id,
-                } => {
-                    execute_binary_eltwise(
-                        &mut values,
-                        plan,
-                        device,
-                        &output_context,
-                        kernels::binary_eltwise::BinaryEltwiseOp::Subtract,
-                        *input_ids,
-                        *output_id,
-                        "subtract",
-                    )?;
-                }
-                executable::Op::Multiply {
-                    input_ids,
-                    output_id,
-                } => {
-                    execute_binary_eltwise(
-                        &mut values,
-                        plan,
-                        device,
-                        &output_context,
-                        kernels::binary_eltwise::BinaryEltwiseOp::Multiply,
-                        *input_ids,
-                        *output_id,
-                        "multiply",
-                    )?;
-                }
-                executable::Op::Divide {
-                    input_ids,
-                    output_id,
-                } => {
-                    execute_binary_eltwise(
-                        &mut values,
-                        plan,
-                        device,
-                        &output_context,
-                        kernels::binary_eltwise::BinaryEltwiseOp::Divide,
-                        *input_ids,
-                        *output_id,
-                        "divide",
-                    )?;
-                }
-                executable::Op::Power {
-                    input_ids,
-                    output_id,
-                } => {
-                    execute_binary_eltwise(
-                        &mut values,
-                        plan,
-                        device,
-                        &output_context,
-                        kernels::binary_eltwise::BinaryEltwiseOp::Power,
-                        *input_ids,
-                        *output_id,
-                        "power",
-                    )?;
-                }
-                executable::Op::Concatenate {
-                    input_ids,
-                    output_id,
-                    dimension,
-                } => execute_concatenate(
+                values[output_index] = Some(input.clone());
+            }
+            executable::Op::Add {
+                input_ids,
+                output_id,
+            } => {
+                execute_binary_eltwise(
                     &mut values,
                     plan,
                     device,
                     &output_context,
-                    input_ids,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Add,
+                    *input_ids,
                     *output_id,
-                    *dimension,
-                )?,
-                executable::Op::Cosine {
-                    input_id,
-                    output_id,
-                } => execute_unary_eltwise(
+                    "add",
+                )?;
+            }
+            executable::Op::Subtract {
+                input_ids,
+                output_id,
+            } => {
+                execute_binary_eltwise(
                     &mut values,
                     plan,
                     device,
                     &output_context,
-                    kernels::unary_eltwise::UnaryEltwiseOp::Cosine,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Subtract,
+                    *input_ids,
+                    *output_id,
+                    "subtract",
+                )?;
+            }
+            executable::Op::Multiply {
+                input_ids,
+                output_id,
+            } => {
+                execute_binary_eltwise(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Multiply,
+                    *input_ids,
+                    *output_id,
+                    "multiply",
+                )?;
+            }
+            executable::Op::Divide {
+                input_ids,
+                output_id,
+            } => {
+                execute_binary_eltwise(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Divide,
+                    *input_ids,
+                    *output_id,
+                    "divide",
+                )?;
+            }
+            executable::Op::Power {
+                input_ids,
+                output_id,
+            } => {
+                execute_binary_eltwise(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Power,
+                    *input_ids,
+                    *output_id,
+                    "power",
+                )?;
+            }
+            executable::Op::Concatenate {
+                input_ids,
+                output_id,
+                dimension,
+            } => execute_concatenate(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_ids,
+                *output_id,
+                *dimension,
+            )?,
+            executable::Op::Cosine {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Cosine,
+                *input_id,
+                *output_id,
+                "cosine",
+            )?,
+            executable::Op::Sine {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Sine,
+                *input_id,
+                *output_id,
+                "sine",
+            )?,
+            executable::Op::Rsqrt {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Rsqrt,
+                *input_id,
+                *output_id,
+                "rsqrt",
+            )?,
+            executable::Op::Reshape {
+                input_id,
+                output_id,
+            } => execute_reshape(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_id,
+                *output_id,
+            )?,
+            executable::Op::Slice {
+                input_id,
+                output_id,
+                start_indices,
+                limit_indices,
+                strides,
+            } => execute_slice(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_id,
+                *output_id,
+                start_indices,
+                limit_indices,
+                strides,
+            )?,
+            executable::Op::Negate {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Negate,
+                *input_id,
+                *output_id,
+                "negate",
+            )?,
+            executable::Op::Exponential {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Exponential,
+                *input_id,
+                *output_id,
+                "exponential",
+            )?,
+            executable::Op::Transpose {
+                input_id,
+                output_id,
+                permutation,
+            } => execute_transpose(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_id,
+                *output_id,
+                permutation,
+            )?,
+            executable::Op::CustomCall {
+                input_ids,
+                output_id,
+                call_target_name,
+                ..
+            } if call_target_name == "annotate_device_placement" => {
+                let [input_id] = input_ids.as_slice() else {
+                    return Err(invalid_argument(format!(
+                        "TT executable custom_call \"annotate_device_placement\" expected one input, got {}",
+                        input_ids.len()
+                    )));
+                };
+                execute_identity_custom_call(
+                    &mut values,
+                    plan,
                     *input_id,
                     *output_id,
-                    "cosine",
-                )?,
-                executable::Op::Sine {
-                    input_id,
-                    output_id,
-                } => execute_unary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::unary_eltwise::UnaryEltwiseOp::Sine,
-                    *input_id,
-                    *output_id,
-                    "sine",
-                )?,
-                executable::Op::Rsqrt {
-                    input_id,
-                    output_id,
-                } => execute_unary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::unary_eltwise::UnaryEltwiseOp::Rsqrt,
-                    *input_id,
-                    *output_id,
-                    "rsqrt",
-                )?,
-                executable::Op::Reshape {
-                    input_id,
-                    output_id,
-                } => execute_reshape(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    *input_id,
-                    *output_id,
-                )?,
-                executable::Op::Slice {
-                    input_id,
-                    output_id,
-                    start_indices,
-                    limit_indices,
-                    strides,
-                } => execute_slice(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    *input_id,
-                    *output_id,
-                    start_indices,
-                    limit_indices,
-                    strides,
-                )?,
-                executable::Op::Negate {
-                    input_id,
-                    output_id,
-                } => execute_unary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::unary_eltwise::UnaryEltwiseOp::Negate,
-                    *input_id,
-                    *output_id,
-                    "negate",
-                )?,
-                executable::Op::Exponential {
-                    input_id,
-                    output_id,
-                } => execute_unary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::unary_eltwise::UnaryEltwiseOp::Exponential,
-                    *input_id,
-                    *output_id,
-                    "exponential",
-                )?,
-                executable::Op::Transpose {
-                    input_id,
-                    output_id,
-                    permutation,
-                } => execute_transpose(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    *input_id,
-                    *output_id,
-                    permutation,
-                )?,
-                executable::Op::CustomCall {
-                    input_ids,
-                    output_id,
                     call_target_name,
-                    ..
-                } if call_target_name == "annotate_device_placement" => {
-                    let input_id = match input_ids.as_slice() {
-                        [input_id] => input_id,
-                        _ => Err(invalid_argument(format!(
-                            "TT executable custom_call \"annotate_device_placement\" expected one input, got {}",
-                            input_ids.len()
-                        )))?,
-                    };
-                    execute_identity_custom_call(
-                        &mut values,
-                        plan,
-                        *input_id,
-                        *output_id,
-                        call_target_name,
-                    )?;
-                }
-                executable::Op::CustomCall {
-                    call_target_name, ..
-                } => {
-                    Err(unimplemented(format!(
-                        "TT executable custom_call {call_target_name:?} execution is not currently supported"
-                    )))?;
-                }
-                executable::Op::Convert {
-                    input_id,
-                    output_id,
-                } => execute_unary_eltwise(
+                )?;
+            }
+            executable::Op::CustomCall {
+                call_target_name, ..
+            } => {
+                return Err(unimplemented(format!(
+                    "TT executable custom_call {call_target_name:?} execution is not currently supported"
+                )));
+            }
+            executable::Op::Convert {
+                input_id,
+                output_id,
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Convert,
+                *input_id,
+                *output_id,
+                "convert",
+            )?,
+            executable::Op::Reduce {
+                input_ids,
+                init_value_ids,
+                output_id,
+                dimensions,
+                reducer,
+            } => execute_reduce(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_ids,
+                init_value_ids,
+                *output_id,
+                dimensions,
+                *reducer,
+            )?,
+            executable::Op::Max {
+                input_ids,
+                output_id,
+            } => {
+                execute_binary_eltwise(
                     &mut values,
                     plan,
                     device,
                     &output_context,
-                    kernels::unary_eltwise::UnaryEltwiseOp::Convert,
-                    *input_id,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Max,
+                    *input_ids,
                     *output_id,
-                    "convert",
-                )?,
-                executable::Op::Reduce {
-                    input_ids,
-                    init_value_ids,
+                    "max",
+                )?;
+            }
+            executable::Op::Matmul {
+                input_ids,
+                output_id,
+                dimension_numbers,
+            } => {
+                let output_id = *output_id;
+                let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
+                let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
+                let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable matmul lhs buffer has no device allocation",
+                    ));
+                };
+                let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+                    return Err(failed_precondition(
+                        "TT executable matmul rhs buffer has no device allocation",
+                    ));
+                };
+                let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable matmul output id {output_id} is out of bounds"
+                    ))
+                })?;
+                let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || !matches!(output_dtype, DType::Float16B | DType::Float32)
+                {
+                    return Err(invalid_argument(format!(
+                        "TT executable matmul requires bf16 inputs and bf16/f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
+                        lhs.buffer_type, rhs.buffer_type
+                    )));
+                }
+                let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
+                let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+                let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+                let output_dram = kernels::matmul::matmul_bf16_dot_general(
+                    device,
+                    lhs_dram,
+                    rhs_dram,
+                    &lhs_shape,
+                    &rhs_shape,
+                    &output_shape,
+                    &dimension_numbers.lhs_batching_dimensions,
+                    &dimension_numbers.rhs_batching_dimensions,
+                    &dimension_numbers.lhs_contracting_dimensions,
+                    &dimension_numbers.rhs_contracting_dimensions,
+                    output_dtype,
+                    "pjrt_matmul",
+                )
+                .map_err(io_error)?;
+                store_output_buffer(
+                    &mut values,
+                    plan,
                     output_id,
-                    dimensions,
-                    reducer,
-                } => execute_reduce(
+                    output_desc.dims.clone(),
+                    output_dram,
+                    &output_context,
+                    "matmul",
+                )?;
+            }
+            executable::Op::Constant { .. } => {}
+            executable::Op::Compare {
+                input_ids,
+                output_id,
+                direction,
+            } => {
+                execute_binary_eltwise(
                     &mut values,
                     plan,
                     device,
                     &output_context,
-                    input_ids,
-                    init_value_ids,
+                    kernels::binary_eltwise::BinaryEltwiseOp::Compare(*direction),
+                    *input_ids,
                     *output_id,
-                    dimensions,
-                    *reducer,
-                )?,
-                executable::Op::Max {
-                    input_ids,
-                    output_id,
-                } => {
-                    execute_binary_eltwise(
-                        &mut values,
-                        plan,
-                        device,
-                        &output_context,
-                        kernels::binary_eltwise::BinaryEltwiseOp::Max,
-                        *input_ids,
-                        *output_id,
-                        "max",
-                    )?;
-                }
-                executable::Op::Matmul {
-                    input_ids,
-                    output_id,
-                    dimension_numbers,
-                } => {
-                    let output_id = *output_id;
-                    let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
-                    let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
-                    let lhs_dram = match lhs.dram_buffer.as_ref() {
-                        Some(lhs_dram) => lhs_dram,
-                        None => Err(failed_precondition(
-                            "TT executable matmul lhs buffer has no device allocation",
-                        ))?,
-                    };
-                    let rhs_dram = match rhs.dram_buffer.as_ref() {
-                        Some(rhs_dram) => rhs_dram,
-                        None => Err(failed_precondition(
-                            "TT executable matmul rhs buffer has no device allocation",
-                        ))?,
-                    };
-                    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-                        invalid_argument(format!(
-                            "TT executable matmul output id {output_id} is out of bounds"
-                        ))
-                    })?;
-                    let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
-                    if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                        || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                        || !matches!(output_dtype, DType::Float16B | DType::Float32)
-                    {
-                        Err(invalid_argument(format!(
-                            "TT executable matmul requires bf16 inputs and bf16/f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
-                            lhs.buffer_type, rhs.buffer_type
-                        )))?;
-                    }
-                    let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
-                    let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
-                    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-                    let output_dram = kernels::matmul::matmul_bf16_dot_general(
-                        device,
-                        lhs_dram,
-                        rhs_dram,
-                        &lhs_shape,
-                        &rhs_shape,
-                        &output_shape,
-                        &dimension_numbers.lhs_batching_dimensions,
-                        &dimension_numbers.rhs_batching_dimensions,
-                        &dimension_numbers.lhs_contracting_dimensions,
-                        &dimension_numbers.rhs_contracting_dimensions,
-                        output_dtype,
-                        "pjrt_matmul",
-                    )
-                    .map_err(io_error)?;
-                    store_output_buffer(
-                        &mut values,
-                        plan,
-                        output_id,
-                        output_desc.dims.clone(),
-                        output_dram,
-                        &output_context,
-                        "matmul",
-                    )?;
-                }
-                executable::Op::Constant { .. } => {}
-                executable::Op::Compare {
-                    input_ids,
-                    output_id,
-                    direction,
-                } => {
-                    execute_binary_eltwise(
-                        &mut values,
-                        plan,
-                        device,
-                        &output_context,
-                        kernels::binary_eltwise::BinaryEltwiseOp::Compare(*direction),
-                        *input_ids,
-                        *output_id,
-                        "compare",
-                    )?;
-                }
-                executable::Op::Select {
-                    input_ids,
-                    output_id,
-                } => {
-                    execute_select(
-                        &mut values,
-                        plan,
-                        device,
-                        &output_context,
-                        *input_ids,
-                        *output_id,
-                    )?;
-                }
-                executable::Op::BroadcastInDim {
-                    input_id,
-                    output_id,
-                    broadcast_dimensions,
-                } => execute_broadcast_in_dim(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    *input_id,
-                    *output_id,
-                    broadcast_dimensions,
-                )?,
-                executable::Op::Gather {
-                    input_ids,
-                    output_id,
-                    dimension_numbers,
-                    slice_sizes,
-                    ..
-                } => execute_gather(
+                    "compare",
+                )?;
+            }
+            executable::Op::Select {
+                input_ids,
+                output_id,
+            } => {
+                execute_select(
                     &mut values,
                     plan,
                     device,
                     &output_context,
                     *input_ids,
                     *output_id,
-                    dimension_numbers,
-                    slice_sizes,
-                )?,
-                executable::Op::Iota {
-                    output_id,
-                    iota_dimension,
-                } => execute_iota(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    *output_id,
-                    *iota_dimension,
-                )?,
-                executable::Op::TopK {
-                    input_id,
-                    values_id,
-                    indices_id,
-                    k,
-                } => execute_top_k(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    *input_id,
-                    *values_id,
-                    *indices_id,
-                    *k,
-                )?,
+                )?;
             }
+            executable::Op::BroadcastInDim {
+                input_id,
+                output_id,
+                broadcast_dimensions,
+            } => execute_broadcast_in_dim(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_id,
+                *output_id,
+                broadcast_dimensions,
+            )?,
+            executable::Op::Gather {
+                input_ids,
+                output_id,
+                dimension_numbers,
+                slice_sizes,
+                ..
+            } => execute_gather(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_ids,
+                *output_id,
+                dimension_numbers,
+                slice_sizes,
+            )?,
+            executable::Op::Iota {
+                output_id,
+                iota_dimension,
+            } => execute_iota(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *output_id,
+                *iota_dimension,
+            )?,
+            executable::Op::TopK {
+                input_id,
+                values_id,
+                indices_id,
+                k,
+            } => execute_top_k(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_id,
+                *values_id,
+                *indices_id,
+                *k,
+            )?,
         }
-        Ok(())
-    })();
-    if let Err(err) = execute_result {
-        let _ = device.finish_dispatch();
-        return Err(err);
     }
-    device.finish_dispatch().map_err(io_error)?;
+    dispatch_finish.finish_now().map_err(io_error)?;
 
     let mut outputs = Vec::with_capacity(plan.output_ids.len());
     for (index, &output_id) in plan.output_ids.iter().enumerate() {
