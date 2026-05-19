@@ -172,7 +172,7 @@ fn general_transpose_program(key: GeneralTransposeProgramKey) -> io::Result<Prog
         runtime_args.add_core(
             core,
             vec![0, offset, n_tiles],
-            general_reader_args(offset, n_tiles),
+            vec![0, offset, n_tiles],
             Vec::new(),
         )?;
     }
@@ -187,10 +187,6 @@ fn general_transpose_program(key: GeneralTransposeProgramKey) -> io::Result<Prog
         name: format!("transpose_general_{:?}_rank{}", key.dtype, key.shape.rank),
         ..Program::new(runtime_args)
     })
-}
-
-fn general_reader_args(offset: u32, n_tiles: u32) -> Vec<u32> {
-    vec![0, offset, n_tiles]
 }
 
 fn general_transpose_reader_source(

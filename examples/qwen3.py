@@ -502,28 +502,6 @@ def qwen3_next_logits_and_cache(config: Qwen3Config, weights, input_ids, caches=
     return project_logits(weights, last_hidden)[0], caches
 
 
-def sample_next_token(
-    decode_output, rng: np.random.Generator, temperature: float, top_k: int
-) -> int:
-    logits = np.asarray(decode_output, dtype=np.float32)
-    token_ids = np.arange(logits.size, dtype=np.int32)
-
-    logits = logits.reshape(-1)
-    token_ids = token_ids.reshape(-1)
-    if 0 < top_k < logits.size:
-        top = np.lexsort((token_ids, -logits))[:top_k]
-        logits = logits[top]
-        token_ids = token_ids[top]
-
-    if temperature <= 0:
-        return int(token_ids[np.argmax(logits)])
-
-    logits = logits / temperature
-    probs = np.exp(logits - np.max(logits))
-    probs = probs / np.sum(probs)
-    return int(rng.choice(token_ids, p=probs))
-
-
 def count_parameters(weights) -> int:
     leaves = jax.tree_util.tree_leaves(weights)
     return sum(value.size for value in leaves)

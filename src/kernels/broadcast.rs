@@ -172,9 +172,8 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
         )?;
     }
     let runtime_args = runtime_args.build()?;
-    let reader_kernel = broadcast_reader_source(key.dtype, &key.shape)?;
     Ok(Program {
-        reader_kernel,
+        reader_kernel: broadcast_reader_source(key.dtype, &key.shape)?,
         writer_kernel: BROADCAST_WRITER.to_owned(),
         compile: CompileConfig {
             cbs: vec![
