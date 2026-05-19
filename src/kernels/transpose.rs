@@ -17,7 +17,6 @@ const MAX_RANK: usize = 8;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct GeneralTransposeKernelShape {
-    rank2_swap: bool,
     rank: u32,
     input_tile_rows: u32,
     input_tiles_per_row: u32,
@@ -102,12 +101,6 @@ fn general_transpose_shape(
             "general transpose requires matching ranks in 2..={MAX_RANK}, got input={input_shape:?} output={output_shape:?} permutation={permutation:?}"
         )));
     }
-    let rank2_swap = rank == 2 && permutation == [1, 0];
-    if !rank2_swap && (input_shape.contains(&0) || output_shape.contains(&0)) {
-        return Err(invalid_input(
-            "general transpose zero-sized dimensions are not currently supported",
-        ));
-    }
     let mut seen = vec![false; rank];
     let mut permutation_usize = Vec::with_capacity(rank);
     for &dim in permutation {
@@ -124,6 +117,11 @@ fn general_transpose_shape(
             )));
         }
         permutation_usize.push(dim);
+    }
+    if rank != 2 && (input_shape.contains(&0) || output_shape.contains(&0)) {
+        return Err(invalid_input(
+            "general transpose zero-sized dimensions are not currently supported",
+        ));
     }
     let expected_output = permutation_usize
         .iter()
@@ -144,7 +142,6 @@ fn general_transpose_shape(
         .checked_mul(output_tiles_per_row)
         .ok_or_else(|| invalid_input("general transpose output matrix tile count overflow"))?;
     Ok(GeneralTransposeKernelShape {
-        rank2_swap,
         rank: u32_arg(rank, "rank")?,
         input_tile_rows: u32_arg(input_allocation_shape[rank - 2] / TILE_R, "input tile rows")?,
         input_tiles_per_row: u32_arg(
@@ -175,7 +172,7 @@ fn general_transpose_program(key: GeneralTransposeProgramKey) -> io::Result<Prog
         runtime_args.add_core(
             core,
             vec![0, offset, n_tiles],
-            general_reader_args(&key.shape, offset, n_tiles),
+            general_reader_args(offset, n_tiles),
             Vec::new(),
         )?;
     }
@@ -192,39 +189,8 @@ fn general_transpose_program(key: GeneralTransposeProgramKey) -> io::Result<Prog
     })
 }
 
-fn general_reader_args(
-    shape: &GeneralTransposeKernelShape,
-    offset: u32,
-    n_tiles: u32,
-) -> Vec<u32> {
-    if shape.rank2_swap {
-        return vec![
-            0,
-            offset,
-            n_tiles,
-            shape.output_cols,
-            shape.output_rows,
-            shape.input_tiles_per_row,
-            shape.output_tiles_per_row,
-        ];
-    }
-
-    let mut args = vec![
-        0,
-        offset,
-        n_tiles,
-        shape.rank,
-        shape.input_tile_rows,
-        shape.input_tiles_per_row,
-        shape.output_rows,
-        shape.output_cols,
-        shape.output_tiles_per_row,
-        shape.output_matrix_tiles,
-    ];
-    args.extend(shape.output_shape);
-    args.extend(shape.input_shape);
-    args.extend(shape.permutation);
-    args
+fn general_reader_args(offset: u32, n_tiles: u32) -> Vec<u32> {
+    vec![0, offset, n_tiles]
 }
 
 fn general_transpose_reader_source(
@@ -238,11 +204,40 @@ fn general_transpose_reader_source(
     };
     Ok(format!(
         "#define TRANSPOSE_GENERAL_MAX_RANK {MAX_RANK}\n\
-         #define TRANSPOSE_GENERAL_RANK2_SWAP {}\n\
+         #define TRANSPOSE_GENERAL_RANK {}\n\
+         #define TRANSPOSE_GENERAL_INPUT_TILE_ROWS {}\n\
+         #define TRANSPOSE_GENERAL_INPUT_TILES_PER_ROW {}\n\
+         #define TRANSPOSE_GENERAL_OUTPUT_ROWS {}\n\
+         #define TRANSPOSE_GENERAL_OUTPUT_COLS {}\n\
+         #define TRANSPOSE_GENERAL_OUTPUT_TILES_PER_ROW {}\n\
+         #define TRANSPOSE_GENERAL_OUTPUT_MATRIX_TILES {}\n\
+         #define TRANSPOSE_GENERAL_OUTPUT_SHAPE {}\n\
+         #define TRANSPOSE_GENERAL_INPUT_SHAPE {}\n\
+         #define TRANSPOSE_GENERAL_PERMUTATION {}\n\
          #define TRANSPOSE_GENERAL_ELEMENT_TYPE {element_type}\n\
          {GENERAL_READER}",
-        shape.rank2_swap as u32,
+        shape.rank,
+        shape.input_tile_rows,
+        shape.input_tiles_per_row,
+        shape.output_rows,
+        shape.output_cols,
+        shape.output_tiles_per_row,
+        shape.output_matrix_tiles,
+        format_u32_array(&shape.output_shape),
+        format_u32_array(&shape.input_shape),
+        format_u32_array(&shape.permutation),
     ))
+}
+
+fn format_u32_array(values: &[u32; MAX_RANK]) -> String {
+    format!(
+        "{{{}}}",
+        values
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn padded_array(values: &[usize]) -> io::Result<[u32; MAX_RANK]> {
@@ -285,7 +280,6 @@ mod tests {
         let shape =
             general_transpose_shape(&[64, 96], &[96, 64], &[1, 0]).expect("transpose shape");
 
-        assert!(shape.rank2_swap);
         assert_eq!(shape.rank, 2);
         assert_eq!(shape.input_tile_rows, 2);
         assert_eq!(shape.input_tiles_per_row, 3);
@@ -307,15 +301,13 @@ mod tests {
         })
         .expect("transpose program");
 
-        assert_eq!(program.runtime_args.section_sizes(), (12, 28, 0));
+        assert_eq!(program.runtime_args.section_sizes(), (12, 12, 0));
         assert!(program
             .reader_kernel
-            .contains("#define TRANSPOSE_GENERAL_RANK2_SWAP 1"));
+            .contains("#define TRANSPOSE_GENERAL_RANK 2"));
         let blobs = program.runtime_args.blobs();
         assert_eq!((arg_u32(&blobs[0], 1), arg_u32(&blobs[0], 2)), (0, 3));
         assert_eq!((arg_u32(&blobs[1], 1), arg_u32(&blobs[1], 2)), (3, 3));
-        assert_eq!((arg_u32(&blobs[0], 4), arg_u32(&blobs[0], 5)), (0, 3));
-        assert_eq!((arg_u32(&blobs[1], 4), arg_u32(&blobs[1], 5)), (3, 3));
     }
 
     #[test]
