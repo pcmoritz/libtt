@@ -1872,28 +1872,16 @@ fn execute_transpose(
         ));
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    let output_dram = if permutation == [1, 0] && input_shape.len() == 2 {
-        kernels::transpose::transpose_rank2(
-            device,
-            input_dram,
-            &input_shape,
-            &output_shape,
-            dtype,
-            "pjrt_transpose",
-        )
-        .map_err(io_error)?
-    } else {
-        kernels::transpose::transpose_general(
-            device,
-            input_dram,
-            &input_shape,
-            &output_shape,
-            permutation,
-            dtype,
-            "pjrt_transpose",
-        )
-        .map_err(io_error)?
-    };
+    let output_dram = kernels::transpose::transpose_general(
+        device,
+        input_dram,
+        &input_shape,
+        &output_shape,
+        permutation,
+        dtype,
+        "pjrt_transpose",
+    )
+    .map_err(io_error)?;
     store_output_buffer(
         values,
         plan,
