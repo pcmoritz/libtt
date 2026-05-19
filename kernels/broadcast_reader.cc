@@ -92,6 +92,48 @@ void decode_output_batch(uint32_t output_batch, uint32_t output_coords[OUTPUT_CO
   }
 }
 
+constexpr bool whole_tile_copy_broadcast() {
+  if constexpr (INPUT_RANK < 2 || OUTPUT_RANK < 2) {
+    return false;
+  }
+  if (BROADCAST_DIMS[INPUT_RANK - 2] != OUTPUT_RANK - 2 ||
+      BROADCAST_DIMS[INPUT_RANK - 1] != OUTPUT_RANK - 1 ||
+      INPUT_SHAPE[INPUT_RANK - 2] != OUTPUT_SHAPE[OUTPUT_RANK - 2] ||
+      INPUT_SHAPE[INPUT_RANK - 1] != OUTPUT_SHAPE[OUTPUT_RANK - 1]) {
+    return false;
+  }
+  for (uint32_t dim = 0; dim < INPUT_RANK - 2; ++dim) {
+    uint32_t output_dim = BROADCAST_DIMS[dim];
+    if (INPUT_SHAPE[dim] != 1 && INPUT_SHAPE[dim] != OUTPUT_SHAPE[output_dim]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+constexpr bool WHOLE_TILE_COPY = whole_tile_copy_broadcast();
+
+uint32_t whole_tile_input_tile(uint32_t output_tile_id) {
+  constexpr uint32_t output_matrix_tiles = OUTPUT_TILE_ROWS * OUTPUT_TILES_PER_ROW;
+  uint32_t output_batch = output_tile_id / output_matrix_tiles;
+  uint32_t output_matrix_tile = output_tile_id % output_matrix_tiles;
+  uint32_t output_tile_row = output_matrix_tile / OUTPUT_TILES_PER_ROW;
+  uint32_t output_tile_col = output_matrix_tile % OUTPUT_TILES_PER_ROW;
+
+  uint32_t output_coords[OUTPUT_COORD_COUNT];
+  decode_output_batch(output_batch, output_coords);
+
+  uint32_t input_prefix = 0;
+  if constexpr (INPUT_RANK >= 3) {
+    for (uint32_t dim = 0; dim < INPUT_RANK - 2; ++dim) {
+      uint32_t coord = INPUT_SHAPE[dim] == 1 ? 0 : output_coords[BROADCAST_DIMS[dim]];
+      input_prefix = input_prefix * INPUT_SHAPE[dim] + coord;
+    }
+  }
+  return (input_prefix * INPUT_TILE_ROWS + output_tile_row) * INPUT_TILES_PER_ROW +
+         output_tile_col;
+}
+
 uint32_t output_coord(uint32_t dim, const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
                       uint32_t output_row, uint32_t output_col) {
   if constexpr (OUTPUT_RANK == 0) {
@@ -174,6 +216,10 @@ void kernel_main() {
     uint32_t output_tile_id = output_tile_offset + tile;
     if constexpr (DIRECT_COPY) {
       read_output_tile(input, output_tile_id, cb_output);
+      continue;
+    }
+    if constexpr (WHOLE_TILE_COPY) {
+      read_output_tile(input, whole_tile_input_tile(output_tile_id), cb_output);
       continue;
     }
 
