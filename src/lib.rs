@@ -17,7 +17,7 @@ mod linux;
 mod log;
 mod mlir_frontend;
 
-use device::{Device, OpCacheKey};
+use device::Device;
 use dram::{DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
@@ -2072,14 +2072,6 @@ fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option
     })
 }
 
-fn is_cacheable_parameter_buffer(input: &PJRT_Buffer) -> bool {
-    input.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32
-        && input
-            .dram_buffer
-            .as_ref()
-            .is_some_and(|buffer| buffer.num_tiles >= 512)
-}
-
 fn execute_identity_custom_call(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2113,109 +2105,6 @@ fn execute_identity_custom_call(
     let output = input.clone();
     values[output_index] = Some(output);
     Ok(())
-}
-
-fn unary_op_cache_key(
-    values: &[Option<PJRT_Buffer>],
-    cacheable_values: &[bool],
-    plan: &executable::Executable,
-    input_id: u32,
-    output_id: u32,
-    op_name: &'static str,
-    attrs: Vec<i64>,
-) -> Result<Option<OpCacheKey>, *mut PJRT_Error> {
-    if !cacheable_values
-        .get(input_id as usize)
-        .copied()
-        .unwrap_or(false)
-    {
-        return Ok(None);
-    }
-    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable {op_name} output id {output_id} is out of bounds"
-        ))
-    })?;
-    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let input = device_buffer_for_value(values, input_id, &format!("{op_name}.operand"))?;
-    let input_dram = input.dram_buffer.as_ref().ok_or_else(|| {
-        failed_precondition(format!(
-            "TT executable {op_name} operand buffer has no device allocation"
-        ))
-    })?;
-    Ok(Some(OpCacheKey::new(
-        op_name,
-        input_dram,
-        output_shape,
-        attrs,
-    )))
-}
-
-fn execute_cached_unary<F>(
-    values: &mut [Option<PJRT_Buffer>],
-    cacheable_values: &mut [bool],
-    plan: &executable::Executable,
-    device: &mut Device,
-    context: &OutputContext,
-    input_id: u32,
-    output_id: u32,
-    op_name: &'static str,
-    attrs: Vec<i64>,
-    execute: F,
-) -> Result<(), *mut PJRT_Error>
-where
-    F: FnOnce(
-        &mut [Option<PJRT_Buffer>],
-        &mut Device,
-        &OutputContext,
-    ) -> Result<(), *mut PJRT_Error>,
-{
-    let input_index = input_id as usize;
-    let output_index = output_id as usize;
-    let input_cacheable = cacheable_values.get(input_index).copied().unwrap_or(false);
-    let cache_key = unary_op_cache_key(
-        values,
-        cacheable_values,
-        plan,
-        input_id,
-        output_id,
-        op_name,
-        attrs,
-    )?;
-    if let Some(key) = cache_key {
-        if let Some(cached) = device.cached_op_buffer(&key) {
-            store_output_buffer(
-                values,
-                plan,
-                output_id,
-                plan.values[output_index].dims.clone(),
-                cached,
-                context,
-                op_name,
-            )?;
-        } else {
-            execute(values, device, context)?;
-            if let Some(output) = values[output_index]
-                .as_ref()
-                .and_then(|value| value.dram_buffer.clone())
-            {
-                device.insert_cached_op_buffer(key, output);
-            }
-        }
-        cacheable_values[output_index] = true;
-    } else {
-        execute(values, device, context)?;
-        cacheable_values[output_index] = input_cacheable;
-    }
-    Ok(())
-}
-
-fn slice_cache_attrs(start_indices: &[i64], limit_indices: &[i64], strides: &[i64]) -> Vec<i64> {
-    let mut attrs = Vec::with_capacity(start_indices.len() + limit_indices.len() + strides.len());
-    attrs.extend_from_slice(start_indices);
-    attrs.extend_from_slice(limit_indices);
-    attrs.extend_from_slice(strides);
-    attrs
 }
 
 fn execute_select(
@@ -2630,7 +2519,6 @@ fn execute_executable_v1(
         .as_ref()
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
     let mut values = vec![None; plan.values.len()];
-    let mut cacheable_values = vec![false; plan.values.len()];
     let target_local_hardware_id = target_device.local_hardware_id as usize;
     let output_context = OutputContext {
         device: execute_device,
@@ -2681,7 +2569,6 @@ fn execute_executable_v1(
                         expected.dims, input.dims
                     )));
                 }
-                cacheable_values[output_index] = is_cacheable_parameter_buffer(input);
                 values[output_index] = Some(input.clone());
             }
             executable::Op::Add {
@@ -2814,19 +2701,13 @@ fn execute_executable_v1(
             executable::Op::Reshape {
                 input_id,
                 output_id,
-            } => execute_cached_unary(
+            } => execute_reshape(
                 &mut values,
-                &mut cacheable_values,
                 plan,
                 device,
                 &output_context,
                 *input_id,
                 *output_id,
-                "reshape",
-                Vec::new(),
-                |values, device, context| {
-                    execute_reshape(values, plan, device, context, *input_id, *output_id)
-                },
             )?,
             executable::Op::Slice {
                 input_id,
@@ -2834,29 +2715,16 @@ fn execute_executable_v1(
                 start_indices,
                 limit_indices,
                 strides,
-            } => execute_cached_unary(
+            } => execute_slice(
                 &mut values,
-                &mut cacheable_values,
                 plan,
                 device,
                 &output_context,
                 *input_id,
                 *output_id,
-                "slice",
-                slice_cache_attrs(start_indices, limit_indices, strides),
-                |values, device, context| {
-                    execute_slice(
-                        values,
-                        plan,
-                        device,
-                        context,
-                        *input_id,
-                        *output_id,
-                        start_indices,
-                        limit_indices,
-                        strides,
-                    )
-                },
+                start_indices,
+                limit_indices,
+                strides,
             )?,
             executable::Op::Negate {
                 input_id,
@@ -2888,27 +2756,14 @@ fn execute_executable_v1(
                 input_id,
                 output_id,
                 permutation,
-            } => execute_cached_unary(
+            } => execute_transpose(
                 &mut values,
-                &mut cacheable_values,
                 plan,
                 device,
                 &output_context,
                 *input_id,
                 *output_id,
-                "transpose",
-                permutation.clone(),
-                |values, device, context| {
-                    execute_transpose(
-                        values,
-                        plan,
-                        device,
-                        context,
-                        *input_id,
-                        *output_id,
-                        permutation,
-                    )
-                },
+                permutation,
             )?,
             executable::Op::CustomCall {
                 input_ids,
@@ -2929,7 +2784,6 @@ fn execute_executable_v1(
                     *output_id,
                     call_target_name,
                 )?;
-                cacheable_values[*output_id as usize] = cacheable_values[*input_id as usize];
             }
             executable::Op::CustomCall {
                 call_target_name, ..
@@ -2941,19 +2795,16 @@ fn execute_executable_v1(
             executable::Op::Convert {
                 input_id,
                 output_id,
-            } => {
-                execute_unary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::unary_eltwise::UnaryEltwiseOp::Convert,
-                    *input_id,
-                    *output_id,
-                    "convert",
-                )?;
-                cacheable_values[*output_id as usize] = cacheable_values[*input_id as usize];
-            }
+            } => execute_unary_eltwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                kernels::unary_eltwise::UnaryEltwiseOp::Convert,
+                *input_id,
+                *output_id,
+                "convert",
+            )?,
             executable::Op::Reduce {
                 input_ids,
                 init_value_ids,
@@ -3081,27 +2932,14 @@ fn execute_executable_v1(
                 input_id,
                 output_id,
                 broadcast_dimensions,
-            } => execute_cached_unary(
+            } => execute_broadcast_in_dim(
                 &mut values,
-                &mut cacheable_values,
                 plan,
                 device,
                 &output_context,
                 *input_id,
                 *output_id,
-                "broadcast_in_dim",
-                broadcast_dimensions.clone(),
-                |values, device, context| {
-                    execute_broadcast_in_dim(
-                        values,
-                        plan,
-                        device,
-                        context,
-                        *input_id,
-                        *output_id,
-                        broadcast_dimensions,
-                    )
-                },
+                broadcast_dimensions,
             )?,
             executable::Op::Gather {
                 input_ids,

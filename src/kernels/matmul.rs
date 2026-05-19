@@ -696,7 +696,11 @@ fn plan_matmul(
             if valid_cols.is_empty() {
                 continue;
             }
-            let max_nc = if allow_column_split { valid_cols.len() } else { 1 };
+            let max_nc = if allow_column_split {
+                valid_cols.len()
+            } else {
+                1
+            };
             for nc in 1..=max_nc {
                 let cols = &valid_cols[..nc];
                 let nr = rows.len();

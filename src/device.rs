@@ -102,31 +102,6 @@ pub struct Device {
     cached_program_launches: HashMap<usize, CachedProgramLaunch>,
     staged_cached_program: Option<usize>,
     defer_dispatch_waits: bool,
-    op_cache: HashMap<OpCacheKey, DramBuffer>,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub(crate) struct OpCacheKey {
-    op: &'static str,
-    input_id: u64,
-    output_shape: Vec<usize>,
-    attrs: Vec<i64>,
-}
-
-impl OpCacheKey {
-    pub(crate) fn new(
-        op: &'static str,
-        input: &DramBuffer,
-        output_shape: Vec<usize>,
-        attrs: Vec<i64>,
-    ) -> Self {
-        Self {
-            op,
-            input_id: input.id,
-            output_shape,
-            attrs,
-        }
-    }
 }
 
 struct CachedProgramLaunch {
@@ -289,7 +264,6 @@ impl Device {
             cached_program_launches: HashMap::new(),
             staged_cached_program: None,
             defer_dispatch_waits: false,
-            op_cache: HashMap::new(),
         };
 
         if let Err(err) = info.upload_firmware() {
@@ -452,14 +426,6 @@ impl Device {
 
     pub(crate) fn wait_for_dispatch(&mut self) -> io::Result<()> {
         self.dispatcher.wait_for_idle()
-    }
-
-    pub(crate) fn cached_op_buffer(&self, key: &OpCacheKey) -> Option<DramBuffer> {
-        self.op_cache.get(key).cloned()
-    }
-
-    pub(crate) fn insert_cached_op_buffer(&mut self, key: OpCacheKey, buffer: DramBuffer) {
-        self.op_cache.insert(key, buffer);
     }
 
     pub fn alloc(
