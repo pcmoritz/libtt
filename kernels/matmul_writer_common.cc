@@ -1,40 +1,8 @@
 #include <cstdint>
 
-#define A(n) get_arg_val<uint32_t>(n)
-#define SEM(n) reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_semaphore(A(n)))
-
 namespace {
-constexpr uint32_t VIEW_ARG_COUNT = 9 + 4 * MAX_RANK;
 constexpr uint32_t ARG_RHS_VIEW_KIND = 37;
 constexpr uint32_t ARG_OUTPUT_VIEW_KIND = ARG_RHS_VIEW_KIND + VIEW_ARG_COUNT;
-
-void load_array(uint32_t base, uint32_t *target) {
-  for (uint32_t i = 0; i < MAX_RANK; ++i) {
-    target[i] = A(base + i);
-  }
-}
-
-View load_view(uint32_t arg_view_kind) {
-  const uint32_t arg_view_shape = arg_view_kind + 9;
-  const uint32_t arg_view_batch_dims = arg_view_shape + MAX_RANK;
-  const uint32_t arg_view_row_dims = arg_view_batch_dims + MAX_RANK;
-  const uint32_t arg_view_col_dims = arg_view_row_dims + MAX_RANK;
-  View view;
-  view.kind = A(arg_view_kind);
-  view.rank = A(arg_view_kind + 1);
-  view.batch_rank = A(arg_view_kind + 2);
-  view.row_rank = A(arg_view_kind + 3);
-  view.col_rank = A(arg_view_kind + 4);
-  view.logical_rows = A(arg_view_kind + 5);
-  view.logical_cols = A(arg_view_kind + 6);
-  view.tile_rows = A(arg_view_kind + 7);
-  view.tiles_per_row = A(arg_view_kind + 8);
-  load_array(arg_view_shape, view.shape);
-  load_array(arg_view_batch_dims, view.batch_dims);
-  load_array(arg_view_row_dims, view.row_dims);
-  load_array(arg_view_col_dims, view.col_dims);
-  return view;
-}
 
 uint32_t output_tile_for_element(
     const View &view,

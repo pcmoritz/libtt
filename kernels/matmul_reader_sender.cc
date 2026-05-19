@@ -1,38 +1,7 @@
 #include <cstdint>
 
-#define A(n) get_arg_val<uint32_t>(n)
-#define SEM(n) reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_semaphore(A(n)))
-
 namespace {
 constexpr uint32_t ARG_VIEW_KIND = 28;
-constexpr uint32_t ARG_VIEW_SHAPE = ARG_VIEW_KIND + 9;
-constexpr uint32_t ARG_VIEW_BATCH_DIMS = ARG_VIEW_SHAPE + MAX_RANK;
-constexpr uint32_t ARG_VIEW_ROW_DIMS = ARG_VIEW_BATCH_DIMS + MAX_RANK;
-constexpr uint32_t ARG_VIEW_COL_DIMS = ARG_VIEW_ROW_DIMS + MAX_RANK;
-
-void load_array(uint32_t base, uint32_t *target) {
-  for (uint32_t i = 0; i < MAX_RANK; ++i) {
-    target[i] = A(base + i);
-  }
-}
-
-View load_view() {
-  View view;
-  view.kind = A(ARG_VIEW_KIND);
-  view.rank = A(ARG_VIEW_KIND + 1);
-  view.batch_rank = A(ARG_VIEW_KIND + 2);
-  view.row_rank = A(ARG_VIEW_KIND + 3);
-  view.col_rank = A(ARG_VIEW_KIND + 4);
-  view.logical_rows = A(ARG_VIEW_KIND + 5);
-  view.logical_cols = A(ARG_VIEW_KIND + 6);
-  view.tile_rows = A(ARG_VIEW_KIND + 7);
-  view.tiles_per_row = A(ARG_VIEW_KIND + 8);
-  load_array(ARG_VIEW_SHAPE, view.shape);
-  load_array(ARG_VIEW_BATCH_DIMS, view.batch_dims);
-  load_array(ARG_VIEW_ROW_DIMS, view.row_dims);
-  load_array(ARG_VIEW_COL_DIMS, view.col_dims);
-  return view;
-}
 
 void fill_transposed_tile(
     const InterleavedAddrGenFast<true> &input,
@@ -83,7 +52,7 @@ void kernel_main() {
   const uint32_t batch_start = A(25);
   const uint32_t total_batch_count = A(26);
   const uint32_t batch_stride = A(27);
-  const View view = load_view();
+  const View view = load_view(ARG_VIEW_KIND);
   volatile tt_l1_ptr uint32_t *sender_sem = SEM(21);
   volatile tt_l1_ptr uint32_t *recv_sem = SEM(22);
   *recv_sem = VALID;
