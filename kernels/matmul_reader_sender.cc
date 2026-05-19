@@ -2,39 +2,6 @@
 
 namespace {
 constexpr uint32_t ARG_VIEW_KIND = 28;
-
-void fill_transposed_tile(
-    const InterleavedAddrGenFast<true> &input,
-    const View &view,
-    uint32_t batch,
-    uint32_t row_tile,
-    uint32_t col_tile,
-    uint32_t dst_addr,
-    uint32_t tile_bytes,
-    uint32_t cb_source) {
-  zero_tile_at(dst_addr, tile_bytes);
-  uint32_t row_base = row_tile * TILE_R;
-  uint32_t col_base = col_tile * TILE_C;
-  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
-    return;
-  }
-  uint32_t source_tile =
-      batch * view.tile_rows * view.tiles_per_row + col_tile * view.tiles_per_row + row_tile;
-  read_source_tile(input, source_tile, cb_source);
-  for (uint32_t row = 0; row < TILE_R; ++row) {
-    if (row_base + row >= view.logical_rows) {
-      continue;
-    }
-    for (uint32_t col = 0; col < TILE_C; ++col) {
-      if (col_base + col >= view.logical_cols) {
-        continue;
-      }
-      copy_element_from_source(cb_source, dst_addr, col, row, row, col);
-    }
-  }
-  cb_pop_front(cb_source, 1);
-}
-
 }  // namespace
 
 void kernel_main() {
@@ -101,38 +68,8 @@ void kernel_main() {
             uint32_t canonical_tile = canonical_base + h * A(3) + w;
             uint32_t canonical_row_tile = canonical_tile / A(3);
             uint32_t canonical_col_tile = canonical_tile - canonical_row_tile * A(3);
-            if (view.kind == VIEW_TRANSPOSE_LAST_TWO) {
-              fill_transposed_tile(
-                  in0_gen,
-                  view,
-                  batch,
-                  canonical_row_tile,
-                  canonical_col_tile,
-                  l1_addr,
-                  tile_bytes,
-                  cb_source);
-            } else if (view.kind == VIEW_GROUPED_ROWS) {
-              fill_grouped_rows_tile(
-                  in0_gen,
-                  view,
-                  batch,
-                  canonical_row_tile,
-                  canonical_col_tile,
-                  l1_addr,
-                  tile_bytes,
-                  cb_source);
-            } else if (view.kind == VIEW_TOKEN_COLUMNS) {
+            if (view.kind == VIEW_TOKEN_COLUMNS) {
               fill_token_columns_tile(
-                  in0_gen,
-                  view,
-                  batch,
-                  canonical_row_tile,
-                  canonical_col_tile,
-                  l1_addr,
-                  tile_bytes,
-                  cb_source);
-            } else if (view.kind == VIEW_GROUPED_COLUMNS) {
-              fill_grouped_columns_tile(
                   in0_gen,
                   view,
                   batch,

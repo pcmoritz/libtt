@@ -61,38 +61,8 @@ void kernel_main() {
             uint32_t canonical_tile = canonical_base + h * A(3) + w;
             uint32_t canonical_row_tile = canonical_tile / A(3);
             uint32_t canonical_col_tile = canonical_tile - canonical_row_tile * A(3);
-            if (view.kind == VIEW_TRANSPOSE_LAST_TWO) {
-              const uint32_t row_base = canonical_row_tile * TILE_R;
-              const uint32_t col_base = canonical_col_tile * TILE_C;
-              if (row_base < view.logical_rows && col_base < view.logical_cols) {
-                const uint32_t source_tile =
-                    batch * view.tile_rows * view.tiles_per_row +
-                    canonical_col_tile * view.tiles_per_row +
-                    canonical_row_tile;
-                noc_async_read_tile(source_tile, in1_gen, l1_addr);
-              }
-            } else if (view.kind == VIEW_GROUPED_ROWS) {
-              fill_grouped_rows_tile(
-                  in1_gen,
-                  view,
-                  batch,
-                  canonical_row_tile,
-                  canonical_col_tile,
-                  l1_addr,
-                  in1_tile_bytes,
-                  cb_source);
-            } else if (view.kind == VIEW_TOKEN_COLUMNS) {
+            if (view.kind == VIEW_TOKEN_COLUMNS) {
               fill_token_columns_tile(
-                  in1_gen,
-                  view,
-                  batch,
-                  canonical_row_tile,
-                  canonical_col_tile,
-                  l1_addr,
-                  in1_tile_bytes,
-                  cb_source);
-            } else if (view.kind == VIEW_GROUPED_COLUMNS) {
-              fill_grouped_columns_tile(
                   in1_gen,
                   view,
                   batch,
@@ -115,9 +85,6 @@ void kernel_main() {
             l1_addr += in1_tile_bytes;
             block_bytes += in1_tile_bytes;
           }
-        }
-        if (view.kind == VIEW_TRANSPOSE_LAST_TWO) {
-          noc_async_read_barrier();
         }
       }
       cur_block += A(4);

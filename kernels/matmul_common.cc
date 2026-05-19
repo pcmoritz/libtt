@@ -9,8 +9,8 @@ constexpr uint32_t FACE_R = 16, FACE_C = 16;
 constexpr uint32_t MAX_RANK = 8;
 constexpr uint32_t INVALID_TILE = 0xffffffffu;
 constexpr uint32_t VIEW_ARG_COUNT = 9 + 4 * MAX_RANK;
-constexpr uint32_t VIEW_CONTIGUOUS = 0, VIEW_TRANSPOSE_LAST_TWO = 1;
-constexpr uint32_t VIEW_GROUPED_ROWS = 3, VIEW_TOKEN_COLUMNS = 4, VIEW_GROUPED_COLUMNS = 5;
+constexpr uint32_t VIEW_CONTIGUOUS = 0;
+constexpr uint32_t VIEW_TOKEN_COLUMNS = 4;
 
 struct View {
   uint32_t kind, rank, batch_rank, row_rank, col_rank;
@@ -176,43 +176,6 @@ void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &vi
   }
 }
 
-void fill_grouped_rows_tile(const InterleavedAddrGenFast<true> &input, const View &view,
-                            uint32_t batch, uint32_t row_tile, uint32_t col_tile,
-                            uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
-  zero_tile_at(dst_addr, tile_bytes);
-  uint32_t row_base = row_tile * TILE_R;
-  uint32_t col_base = col_tile * TILE_C;
-  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
-    return;
-  }
-  uint32_t heads = view.shape[2];
-  uint32_t groups = view.shape[3];
-  uint32_t batch_index = batch / heads;
-  uint32_t head_index = batch - batch_index * heads;
-  uint32_t loaded_tile = INVALID_TILE;
-  for (uint32_t row = 0; row < TILE_R; ++row) {
-    uint32_t logical_row = row_base + row;
-    if (logical_row >= view.logical_rows) {
-      continue;
-    }
-    uint32_t query = logical_row / groups;
-    uint32_t group = logical_row - query * groups;
-    uint32_t source_prefix = (batch_index * view.shape[1] + query) * heads + head_index;
-    uint32_t source_tile =
-        (source_prefix * view.tile_rows + group / TILE_R) * view.tiles_per_row + col_tile;
-    ensure_source_tile(input, source_tile, cb_source, &loaded_tile);
-    for (uint32_t col = 0; col < TILE_C; ++col) {
-      if (col_base + col >= view.logical_cols) {
-        continue;
-      }
-      copy_element_from_source(cb_source, dst_addr, group % TILE_R, col, row, col);
-    }
-  }
-  if (loaded_tile != INVALID_TILE) {
-    cb_pop_front(cb_source, 1);
-  }
-}
-
 void fill_token_columns_tile(const InterleavedAddrGenFast<true> &input, const View &view,
                              uint32_t batch, uint32_t row_tile, uint32_t col_tile,
                              uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
@@ -240,44 +203,6 @@ void fill_token_columns_tile(const InterleavedAddrGenFast<true> &input, const Vi
       }
       copy_element_from_source(cb_source, dst_addr, head_index % TILE_R, row, row, col);
     }
-    cb_pop_front(cb_source, 1);
-  }
-}
-
-void fill_grouped_columns_tile(const InterleavedAddrGenFast<true> &input, const View &view,
-                               uint32_t batch, uint32_t row_tile, uint32_t col_tile,
-                               uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
-  zero_tile_at(dst_addr, tile_bytes);
-  uint32_t row_base = row_tile * TILE_R;
-  uint32_t col_base = col_tile * TILE_C;
-  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
-    return;
-  }
-  uint32_t batch_size = view.shape[1];
-  uint32_t heads = view.shape[2];
-  uint32_t queries = view.shape[3];
-  uint32_t batch_index = batch / heads;
-  uint32_t head_index = batch - batch_index * heads;
-  uint32_t loaded_tile = INVALID_TILE;
-  for (uint32_t col = 0; col < TILE_C; ++col) {
-    uint32_t logical_col = col_base + col;
-    if (logical_col >= view.logical_cols) {
-      continue;
-    }
-    uint32_t group = logical_col / queries;
-    uint32_t query = logical_col - group * queries;
-    uint32_t source_prefix = (group * batch_size + batch_index) * heads + head_index;
-    uint32_t source_tile =
-        (source_prefix * view.tile_rows + query / TILE_R) * view.tiles_per_row + row_tile;
-    ensure_source_tile(input, source_tile, cb_source, &loaded_tile);
-    for (uint32_t row = 0; row < TILE_R; ++row) {
-      if (row_base + row >= view.logical_rows) {
-        continue;
-      }
-      copy_element_from_source(cb_source, dst_addr, query % TILE_R, row, row, col);
-    }
-  }
-  if (loaded_tile != INVALID_TILE) {
     cb_pop_front(cb_source, 1);
   }
 }

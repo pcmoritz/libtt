@@ -47,22 +47,16 @@ struct MatmulProgramKey {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum MatmulViewKind {
     Contiguous,
-    TransposeLastTwo,
     Generic,
-    GroupedRows,
     TokenColumns,
-    GroupedColumns,
 }
 
 impl MatmulViewKind {
     fn runtime_value(self) -> u32 {
         match self {
             Self::Contiguous => 0,
-            Self::TransposeLastTwo => 1,
             Self::Generic => 2,
-            Self::GroupedRows => 3,
             Self::TokenColumns => 4,
-            Self::GroupedColumns => 5,
         }
     }
 }
@@ -574,18 +568,12 @@ fn operand_view_kind(
         && col_dims == [rank - 1]
     {
         MatmulViewKind::Contiguous
-    } else if leading_batch
-        && rank == batch_dims.len() + 2
-        && row_dims == [rank - 1]
-        && col_dims == [rank - 2]
+    } else if rank == 4
+        && batch_dims == [0, 2]
+        && row_dims == [3]
+        && col_dims == [1]
     {
-        MatmulViewKind::TransposeLastTwo
-    } else if rank == 5 && batch_dims == [0, 2] && row_dims == [1, 3] && col_dims == [4] {
-        MatmulViewKind::GroupedRows
-    } else if rank == 4 && batch_dims == [0, 2] && row_dims == [3] && col_dims == [1] {
         MatmulViewKind::TokenColumns
-    } else if rank == 5 && batch_dims == [1, 2] && row_dims == [4] && col_dims == [0, 3] {
-        MatmulViewKind::GroupedColumns
     } else {
         MatmulViewKind::Generic
     }
@@ -1099,11 +1087,7 @@ fn bf16_program(
     Ok(Program {
         reader_kernel: BF16_READER_SENDER.to_owned(),
         writer_kernel: BF16_WRITER_SENDER.to_owned(),
-        compute_kernel: compute_src(
-            plan,
-            plan.batches_per_group,
-            rhs_view.kind == MatmulViewKind::TransposeLastTwo,
-        ),
+        compute_kernel: compute_src(plan, plan.batches_per_group),
         reader_recv_kernel: BF16_READER_RECV.to_owned(),
         writer_recv_kernel: BF16_WRITER_RECV.to_owned(),
         name: format!(
@@ -1404,10 +1388,9 @@ fn mcast_rect_args(cols: &[u8], y: u8) -> [u32; 5] {
     }
 }
 
-fn compute_src(plan: &MatmulPlan, batch_count: usize, transpose_b: bool) -> String {
+fn compute_src(plan: &MatmulPlan, batch_count: usize) -> String {
     let replacements = [
         ("@BATCH_COUNT@", batch_count),
-        ("@TRANSPOSE_B@", usize::from(transpose_b)),
         ("@IN0_BLOCK_W@", plan.in0_block_w),
         ("@IN0_NUM_SUBBLOCKS@", plan.in0_num_subblocks()),
         ("@IN0_BLOCK_NUM_TILES@", plan.in0_block_num_tiles()),
@@ -1497,10 +1480,10 @@ mod tests {
     #[test]
     fn compute_source_contains_plan_constants() {
         let plan = plan_matmul(64, 64, 64, 1, &cores(&[1], &[2]), true).expect("plan");
-        let source = compute_src(&plan, 3, true);
+        let source = compute_src(&plan, 3);
         assert!(source.contains("constexpr uint32_t in0_block_w = 2;"));
         assert!(source.contains("constexpr uint32_t batch_count = 3;"));
-        assert!(source.contains("constexpr uint32_t transpose = 1;"));
+        assert!(!source.contains("@TRANSPOSE_B@"));
         assert!(source.contains("#include \"compute_kernel_api/matmul.h\""));
     }
 

@@ -20,13 +20,12 @@ void MAIN {
   constexpr uint32_t out_subblock_num_tiles = @OUT_SUBBLOCK_NUM_TILES@;
   constexpr uint32_t out_block_num_tiles = @OUT_BLOCK_NUM_TILES@;
   constexpr uint32_t batch_count = @BATCH_COUNT@;
-  constexpr uint32_t transpose = @TRANSPOSE_B@;
 
   mm_block_init(
       tt::CBIndex::c_0,
       tt::CBIndex::c_1,
       tt::CBIndex::c_16,
-      transpose,
+      0,
       out_subblock_w,
       out_subblock_h,
       in0_block_w);
@@ -54,7 +53,7 @@ void MAIN {
             mm_block_init_short(
                 tt::CBIndex::c_0,
                 tt::CBIndex::c_1,
-                transpose,
+                0,
                 out_subblock_w,
                 out_subblock_h,
                 in0_block_w);
@@ -70,7 +69,7 @@ void MAIN {
                 in0_tile_index,
                 in1_tile_index,
                 0,
-                transpose,
+                0,
                 out_subblock_w,
                 out_subblock_h,
                 in0_block_w);
