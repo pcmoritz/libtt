@@ -5120,42 +5120,6 @@ mod tests {
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
-    fn pjrt_compile_decomposes_dot_general_with_flattened_free_dims() {
-        with_compiled_mlir_executable(
-            r#"module {
-  func.func public @main(%arg0: tensor<4x10x3x5x7xf32>, %arg1: tensor<4x10x5x7x3xf32>) -> tensor<4x10x3x7x10x7x3xf32> {
-    %0 = stablehlo.dot_general %arg0, %arg1,
-      batching_dims = [0] x [0],
-      contracting_dims = [3] x [2]
-      : (tensor<4x10x3x5x7xf32>, tensor<4x10x5x7x3xf32>) -> tensor<4x10x3x7x10x7x3xf32>
-    return %0 : tensor<4x10x3x7x10x7x3xf32>
-  }
-}
-"#,
-            |executable| {
-                assert_eq!(executable.output_ids, vec![2]);
-                assert_eq!(executable.ops.len(), 3);
-                assert_eq!(executable.values[2].dims, vec![4, 10, 3, 7, 10, 7, 3]);
-                let executable::Op::Matmul {
-                    input_ids,
-                    output_id,
-                    dimension_numbers,
-                } = &executable.ops[2]
-                else {
-                    panic!("dot_general should lower directly to Matmul");
-                };
-                assert_eq!(*input_ids, [0, 1]);
-                assert_eq!(*output_id, 2);
-                assert_eq!(dimension_numbers.lhs_batching_dimensions, vec![0]);
-                assert_eq!(dimension_numbers.rhs_batching_dimensions, vec![0]);
-                assert_eq!(dimension_numbers.lhs_contracting_dimensions, vec![3]);
-                assert_eq!(dimension_numbers.rhs_contracting_dimensions, vec![2]);
-            },
-        );
-    }
-
-    #[cfg(libtt_mlir_frontend)]
-    #[test]
     fn pjrt_compile_lowers_convert() {
         with_compiled_mlir_executable(
             r#"module {

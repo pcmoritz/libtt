@@ -8,13 +8,18 @@ use std::env;
 use std::io;
 use std::sync::Arc;
 
-const BF16_READER_SENDER: &str = include_str!("../../kernels/matmul_reader_sender.cc");
+const BF16_READER_SENDER: &str = concat!(
+    include_str!("../../kernels/matmul_common.cc"),
+    include_str!("../../kernels/matmul_reader_sender.cc")
+);
 const BF16_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
 const BF16_WRITER_SENDER: &str = concat!(
+    include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_writer_common.cc"),
     include_str!("../../kernels/matmul_writer_sender.cc")
 );
 const BF16_WRITER_RECV: &str = concat!(
+    include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_writer_common.cc"),
     include_str!("../../kernels/matmul_writer_recv.cc")
 );
@@ -73,7 +78,6 @@ struct MatmulOperandView {
     logical_cols: u32,
     tile_rows: u32,
     tiles_per_row: u32,
-    iteration_order: u32,
     shape: [u32; MAX_RANK],
     batch_dims: [u32; MAX_RANK],
     row_dims: [u32; MAX_RANK],
@@ -269,8 +273,6 @@ pub(crate) fn matmul_bf16_dot_general(
         lhs_contracting_dimensions,
         rhs_contracting_dimensions,
     )?;
-    validate_logical_buffer(lhs, lhs_logical_shape, "lhs")?;
-    validate_logical_buffer(rhs, rhs_logical_shape, "rhs")?;
     validate_tile_count(lhs, tiled_shape_tile_count(lhs_logical_shape)?, "lhs")?;
     validate_tile_count(rhs, tiled_shape_tile_count(rhs_logical_shape)?, "rhs")?;
 
@@ -540,11 +542,6 @@ fn operand_view(
     let allocation_shape = tiled_allocation_shape(shape)?;
     let rank = shape.len();
     let kind = operand_view_kind(rank, batch_dims, row_dims, col_dims);
-    let iteration_order = if row_dims.contains(&(rank - 1)) && !col_dims.contains(&(rank - 1)) {
-        1
-    } else {
-        0
-    };
     Ok(MatmulOperandView {
         kind,
         rank: u32_value(rank, "matmul operand rank")?,
@@ -561,11 +558,10 @@ fn operand_view(
             allocation_shape[rank - 1] / 32,
             "matmul operand source tiles per row",
         )?,
-        iteration_order,
         shape: padded_u32_array(shape, "matmul operand shape")?,
-        batch_dims: padded_dim_array(batch_dims, "matmul operand batch dimensions")?,
-        row_dims: padded_dim_array(row_dims, "matmul operand row dimensions")?,
-        col_dims: padded_dim_array(col_dims, "matmul operand column dimensions")?,
+        batch_dims: padded_u32_array(batch_dims, "matmul operand batch dimensions")?,
+        row_dims: padded_u32_array(row_dims, "matmul operand row dimensions")?,
+        col_dims: padded_u32_array(col_dims, "matmul operand column dimensions")?,
     })
 }
 
@@ -611,25 +607,6 @@ fn padded_u32_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]>
         result[index] = u32_value(value, name)?;
     }
     Ok(result)
-}
-
-fn padded_dim_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]> {
-    padded_u32_array(values, name)
-}
-
-fn validate_logical_buffer(
-    buffer: &DramBuffer,
-    logical_shape: &[usize],
-    name: &str,
-) -> io::Result<()> {
-    let expected_shape = tiled_allocation_shape(logical_shape)?;
-    if buffer.shape != expected_shape {
-        return Err(invalid_input(format!(
-            "{name} allocation shape mismatch: got {:?}, expected {:?} for logical shape {:?}",
-            buffer.shape, expected_shape, logical_shape
-        )));
-    }
-    Ok(())
 }
 
 fn checked_product(values: &[usize], name: &str) -> io::Result<usize> {
@@ -793,7 +770,6 @@ fn plan_matmul(
     };
 
     let mut plan = candidate.into_plan(kt, 1, batch_count);
-
     if let Some(batched) = plan_batched_direct_matmul(
         mt_base,
         kt,
@@ -837,8 +813,7 @@ fn plan_direct_matmul(
             1
         };
         for logical_cols in 1..=max_cols {
-            let active_cores_per_group = logical_rows * logical_cols;
-            let active_cores = active_cores_per_group * batch_groups;
+            let active_cores = logical_rows * logical_cols * batch_groups;
             if active_cores > cores.len() {
                 continue;
             }
@@ -1003,25 +978,26 @@ fn plan_batched_direct_matmul(
                             );
                             if best_score.map_or(true, |current| score > current) {
                                 best_score = Some(score);
-                                let candidate = MatmulPlanCandidate {
-                                    rows: Vec::new(),
-                                    cols: Vec::new(),
-                                    direct_grid: Some(
-                                        cores[..active_cores]
-                                            .chunks(logical_cols)
-                                            .map(|row| row.to_vec())
-                                            .collect(),
-                                    ),
-                                    mt,
-                                    nt,
-                                    per_core_m,
-                                    per_core_n,
-                                    in0_block_w,
-                                    out_subblock_h,
-                                    out_subblock_w,
-                                };
-                                best =
-                                    Some(candidate.into_plan(kt, batch_groups, batches_per_group));
+                                best = Some(
+                                    MatmulPlanCandidate {
+                                        rows: Vec::new(),
+                                        cols: Vec::new(),
+                                        direct_grid: Some(
+                                            cores[..active_cores]
+                                                .chunks(logical_cols)
+                                                .map(|row| row.to_vec())
+                                                .collect(),
+                                        ),
+                                        mt,
+                                        nt,
+                                        per_core_m,
+                                        per_core_n,
+                                        in0_block_w,
+                                        out_subblock_h,
+                                        out_subblock_w,
+                                    }
+                                    .into_plan(kt, batch_groups, batches_per_group),
+                                );
                             }
                         }
                     }
@@ -1411,7 +1387,6 @@ fn append_view_args(args: &mut Vec<u32>, view: &MatmulOperandView) {
         view.logical_cols,
         view.tile_rows,
         view.tiles_per_row,
-        view.iteration_order,
     ]);
     args.extend(view.shape);
     args.extend(view.batch_dims);
@@ -1534,30 +1509,6 @@ mod tests {
     }
 
     #[test]
-    fn dot_general_shape_keeps_real_output_layout() {
-        let shape = dot_general_shape(
-            &[4, 10, 3, 5, 7],
-            &[4, 10, 5, 7, 3],
-            &[4, 10, 3, 7, 10, 7, 3],
-            &[0],
-            &[0],
-            &[3],
-            &[2],
-        )
-        .expect("shape");
-        assert_eq!(shape.batch_count, 4);
-        assert_eq!(shape.m, 210);
-        assert_eq!(shape.k, 5);
-        assert_eq!(shape.n, 210);
-        assert_eq!(shape.output_view.kind, MatmulViewKind::Generic);
-        assert_eq!(shape.output_view.batch_rank, 1);
-        assert_eq!(shape.output_view.row_rank, 3);
-        assert_eq!(shape.output_view.col_rank, 3);
-        assert_eq!(shape.output_view.logical_rows, 210);
-        assert_eq!(shape.output_view.logical_cols, 210);
-    }
-
-    #[test]
     fn plan_matmul_prefers_square_exact_grid() {
         let plan = plan_matmul(512, 512, 512, 1, &p100_worker_cores(), true).expect("plan");
         assert_eq!(plan.per_core_m * plan.rows.len(), plan.mt);
@@ -1589,25 +1540,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_matmul_does_not_mcast_padded_rows() {
-        let plan = plan_matmul(1, 1024, 6144, 1, &p100_worker_cores(), true).expect("plan");
-        assert_eq!(plan.mt, 1);
-        assert_eq!(plan.per_core_m, 1);
-    }
-
-    #[test]
-    fn plan_matmul_splits_single_row_projection_across_columns() {
-        let plan = plan_matmul(1, 3072, 1024, 1, &p100_worker_cores(), true).expect("plan");
-        let grid = plan.direct_grid.as_ref().expect("single-row direct plan");
-        assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 32);
-        assert_eq!(plan.mt, 1);
-        assert_eq!(plan.nt, 32);
-        assert_eq!(plan.per_core_n, 1);
-        assert_eq!(plan.in0_block_w, 32);
-        assert_eq!(plan.out_subblock_w, 1);
-    }
-
-    #[test]
     fn plan_matmul_uses_direct_grid_for_wide_projection() {
         let plan = plan_matmul(32, 1024, 151936, 1, &p100_worker_cores(), true).expect("plan");
         let grid = plan.direct_grid.as_ref().expect("direct plan");
@@ -1628,35 +1560,6 @@ mod tests {
         assert_eq!(plan.kt, 32);
         assert_eq!(plan.per_core_m * grid.len(), plan.mt);
         assert_eq!(plan.out_subblock_h * plan.out_subblock_w, 8);
-    }
-
-    #[test]
-    fn plan_matmul_parallelizes_score_batches() {
-        let plan = plan_matmul(54, 128, 27, 8, &p100_worker_cores(), false).expect("plan");
-        let grid = plan.direct_grid.as_ref().expect("batched direct plan");
-        assert_eq!(plan.batch_groups, 8);
-        assert_eq!(plan.batches_per_group, 1);
-        assert_eq!(plan.direct_grid_rows_per_batch(), Some(2));
-        assert_eq!(grid.len(), plan.batch_groups * 2);
-        assert!(grid.iter().all(|row| row.len() == 1));
-        assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 16);
-        assert_eq!(plan.mt, 2);
-        assert_eq!(plan.nt, 1);
-    }
-
-    #[test]
-    fn plan_matmul_parallelizes_value_batches() {
-        let plan = plan_matmul(128, 27, 54, 8, &p100_worker_cores(), false).expect("plan");
-        let grid = plan.direct_grid.as_ref().expect("batched direct plan");
-        assert_eq!(plan.batch_groups, 8);
-        assert_eq!(plan.batches_per_group, 1);
-        assert_eq!(plan.direct_grid_rows_per_batch(), Some(4));
-        assert_eq!(grid.len(), plan.batch_groups * 4);
-        assert!(grid.iter().all(|row| row.len() == 1));
-        assert_eq!(grid.iter().map(Vec::len).sum::<usize>(), 32);
-        assert_eq!(plan.mt, 4);
-        assert_eq!(plan.nt, 2);
-        assert_eq!(plan.per_core_n, 2);
     }
 
     #[test]

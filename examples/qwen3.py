@@ -103,8 +103,6 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=32)
-    parser.add_argument("--no-kv-cache", action="store_true")
-    parser.add_argument("--stop-on-eos", action="store_true")
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--intermediate-size", type=int, default=384)
@@ -407,16 +405,7 @@ def causal_attention_bias(seq_len: int):
     return bias[None, None, :, :]
 
 
-def self_attention(
-    config: Qwen3Config,
-    hidden_states,
-    layer,
-    cos,
-    sin,
-    causal_bias,
-    cache=None,
-    use_cache: bool = False,
-):
+def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin, causal_bias, cache=None):
     seq_len = hidden_states.shape[0]
     query_states = hidden_states @ layer["q_proj"]
     key_states = hidden_states @ layer["k_proj"]
@@ -431,30 +420,23 @@ def self_attention(
     query_states = apply_rope(query_states, cos, sin)
     key_states = apply_rope(key_states, cos, sin)
 
-    new_cache = None
-    if use_cache:
-        key_cache = key_states.reshape((seq_len, -1))
-        value_cache = value_states.reshape((seq_len, -1))
-        if cache is not None:
-            key_cache = jnp.concatenate((cache[0], key_cache), axis=0)
-            value_cache = jnp.concatenate((cache[1], value_cache), axis=0)
-        key_states = key_cache.reshape(
-            (key_cache.shape[0], config.num_key_value_heads, config.head_dim)
-        )
-        value_states = value_cache.reshape(
-            (value_cache.shape[0], config.num_key_value_heads, config.head_dim)
-        )
-        new_cache = (key_cache, value_cache)
+    key_cache = key_states.reshape((seq_len, -1))
+    value_cache = value_states.reshape((seq_len, -1))
+    if cache is not None:
+        key_cache = jnp.concatenate((cache[0], key_cache), axis=0)
+        value_cache = jnp.concatenate((cache[1], value_cache), axis=0)
+    key_states = key_cache.reshape(
+        (key_cache.shape[0], config.num_key_value_heads, config.head_dim)
+    )
+    value_states = value_cache.reshape(
+        (value_cache.shape[0], config.num_key_value_heads, config.head_dim)
+    )
 
     attn_output = jax.nn.dot_product_attention(
-        query_states,
-        key_states,
-        value_states,
-        bias=causal_bias,
-        implementation="xla",
+        query_states, key_states, value_states, bias=causal_bias, implementation="xla"
     )
     output = attn_output.reshape(seq_len, -1) @ layer["o_proj"]
-    return output, new_cache
+    return output, (key_cache, value_cache)
 
 
 def mlp(hidden_states, layer):
@@ -463,17 +445,8 @@ def mlp(hidden_states, layer):
     return (gate * up) @ layer["down_proj"]
 
 
-def qwen3_layers(
-    config: Qwen3Config,
-    weights,
-    hidden_states,
-    cos,
-    sin,
-    causal_bias,
-    caches=None,
-    use_cache: bool = False,
-):
-    new_caches = [] if use_cache else None
+def qwen3_layers(config: Qwen3Config, weights, hidden_states, cos, sin, causal_bias, caches=None):
+    new_caches = []
     layer_caches = caches if caches is not None else (None,) * len(weights["layers"])
     if len(layer_caches) != len(weights["layers"]):
         raise ValueError("KV cache must have one entry per decoder layer")
@@ -481,17 +454,9 @@ def qwen3_layers(
         residual = hidden_states
         hidden_states = rms_norm(hidden_states, layer["input_norm"], config.rms_norm_eps)
         attn_output, new_cache = self_attention(
-            config,
-            hidden_states,
-            layer,
-            cos,
-            sin,
-            causal_bias,
-            cache=cache,
-            use_cache=use_cache,
+            config, hidden_states, layer, cos, sin, causal_bias, cache
         )
-        if use_cache:
-            new_caches.append(new_cache)
+        new_caches.append(new_cache)
         hidden_states = residual + attn_output
 
         residual = hidden_states
@@ -500,7 +465,7 @@ def qwen3_layers(
         )
         hidden_states = residual + mlp(hidden_states, layer)
 
-    return hidden_states, tuple(new_caches) if use_cache else None
+    return hidden_states, tuple(new_caches)
 
 
 def project_logits(weights, hidden_states):
@@ -509,13 +474,11 @@ def project_logits(weights, hidden_states):
     return hidden_states @ weights["embed_tokens"].T
 
 
-def qwen3_forward(config: Qwen3Config, weights, input_ids, caches=None, use_cache=False):
+def qwen3_forward(config: Qwen3Config, weights, input_ids, caches=None):
     input_ids = input_ids.reshape((-1,))
     seq_len = input_ids.shape[0]
-    if caches is not None:
-        if seq_len != 1:
-            raise ValueError("cached decode expects exactly one new token")
-        use_cache = True
+    if caches is not None and seq_len != 1:
+        raise ValueError("cached decode expects exactly one new token")
     cache_len = 0 if caches is None else caches[0][0].shape[0]
     hidden_states = weights["embed_tokens"][input_ids]
     cos = weights["rope_cos"][cache_len : cache_len + seq_len]
@@ -529,25 +492,12 @@ def qwen3_forward(config: Qwen3Config, weights, input_ids, caches=None, use_cach
         sin,
         causal_bias,
         caches=caches,
-        use_cache=use_cache,
     )
     return rms_norm(hidden_states, weights["norm"], config.rms_norm_eps), new_caches
 
 
-def qwen3_hidden_states(config: Qwen3Config, weights, input_ids):
-    hidden_states, _ = qwen3_forward(config, weights, input_ids)
-    return hidden_states
-
-
-def qwen3_next_logits(config: Qwen3Config, weights, input_ids):
-    last_hidden = qwen3_hidden_states(config, weights, input_ids)[-1:, :]
-    return project_logits(weights, last_hidden)[0]
-
-
 def qwen3_next_logits_and_cache(config: Qwen3Config, weights, input_ids, caches=None):
-    hidden_states, caches = qwen3_forward(
-        config, weights, input_ids, caches=caches, use_cache=True
-    )
+    hidden_states, caches = qwen3_forward(config, weights, input_ids, caches=caches)
     last_hidden = hidden_states[-1:, :]
     return project_logits(weights, last_hidden)[0], caches
 
@@ -555,18 +505,8 @@ def qwen3_next_logits_and_cache(config: Qwen3Config, weights, input_ids, caches=
 def sample_next_token(
     decode_output, rng: np.random.Generator, temperature: float, top_k: int
 ) -> int:
-    if isinstance(decode_output, (list, tuple)) and len(decode_output) == 2:
-        logits, token_ids = decode_output
-        top_k = 0
-    else:
-        logits, token_ids = decode_output, None
-
-    logits = np.asarray(logits, dtype=np.float32)
-    token_ids = (
-        np.arange(logits.size, dtype=np.int32)
-        if token_ids is None
-        else np.asarray(token_ids, dtype=np.int32)
-    )
+    logits = np.asarray(decode_output, dtype=np.float32)
+    token_ids = np.arange(logits.size, dtype=np.int32)
 
     logits = logits.reshape(-1)
     token_ids = token_ids.reshape(-1)
@@ -590,111 +530,29 @@ def count_parameters(weights) -> int:
 
 
 def make_decode_step(config, device, args):
-    device_top_k = 1 if args.temperature <= 0 else args.top_k
-
-    def decode_output(logits):
-        if 0 < device_top_k <= 32 and device_top_k < config.vocab_size:
-            return jax.lax.top_k(logits, device_top_k)
-        return logits
-
-    if not args.no_kv_cache:
-        if args.temperature <= 0 and not args.stop_on_eos:
-            def greedy_tokens(model_weights, ids):
-                logits, caches = qwen3_next_logits_and_cache(config, model_weights, ids)
-                token = jax.lax.top_k(logits, 1)[1][0].astype(jnp.int32)
-                generated = [token.reshape((1, 1))]
-                for _ in range(1, args.max_new_tokens):
-                    logits, caches = qwen3_next_logits_and_cache(
-                        config, model_weights, token, caches
-                    )
-                    token = jax.lax.top_k(logits, 1)[1][0].astype(jnp.int32)
-                    generated.append(token.reshape((1, 1)))
-                return jnp.concatenate(generated, axis=0)
-
-            return ("greedy_cached", jax.jit(greedy_tokens, device=device))
-
-        def prefill(model_weights, ids):
-            logits, caches = qwen3_next_logits_and_cache(config, model_weights, ids)
-            return decode_output(logits), caches
-
-        def decode_token(model_weights, token_id, caches):
-            logits, new_caches = qwen3_next_logits_and_cache(
-                config, model_weights, token_id, caches
+    def greedy_tokens(model_weights, ids):
+        logits, caches = qwen3_next_logits_and_cache(config, model_weights, ids)
+        token = jax.lax.top_k(logits, 1)[1][0].astype(jnp.int32)
+        generated = [token.reshape((1, 1))]
+        for _ in range(1, args.max_new_tokens):
+            logits, caches = qwen3_next_logits_and_cache(
+                config, model_weights, token, caches
             )
-            return decode_output(logits), new_caches
+            token = jax.lax.top_k(logits, 1)[1][0].astype(jnp.int32)
+            generated.append(token.reshape((1, 1)))
+        return jnp.concatenate(generated, axis=0)
 
-        return (
-            jax.jit(prefill, device=device),
-            jax.jit(decode_token, device=device),
-        )
-
-    def logits(model_weights, ids):
-        return qwen3_next_logits(config, model_weights, ids)
-
-    if 0 < device_top_k <= 32 and device_top_k < config.vocab_size:
-        return jax.jit(
-            lambda model_weights, ids: decode_output(logits(model_weights, ids)),
-            device=device,
-        )
-
-    return jax.jit(logits, device=device)
+    return ("greedy_cached", jax.jit(greedy_tokens, device=device))
 
 
 def generate(config, weights, device, input_ids, args, decode_step):
-    rng = np.random.default_rng(args.seed + 1)
     tokens = input_ids.astype(np.int32).copy()
-    eos_token_ids = config.eos_token_id
-    if isinstance(eos_token_ids, int):
-        eos_token_ids = (eos_token_ids,)
 
-    if (
-        isinstance(decode_step, tuple)
-        and len(decode_step) == 2
-        and decode_step[0] == "greedy_cached"
-    ):
-        if args.max_new_tokens == 0:
-            return tokens
-        ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
-        generated = np.asarray(decode_step[1](weights, ids), dtype=np.int32).reshape(-1)
-        return np.concatenate((tokens, generated))
-
-    if isinstance(decode_step, tuple):
-        if args.max_new_tokens == 0:
-            return tokens
-        prefill_step, token_step = decode_step
-        ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
-        decode_output, caches = prefill_step(weights, ids)
-        next_token = sample_next_token(
-            decode_output, rng, args.temperature, args.top_k
-        )
-        tokens = np.append(tokens, np.int32(next_token))
-        if args.stop_on_eos and eos_token_ids is not None and next_token in eos_token_ids:
-            return tokens
-
-        for _ in range(1, args.max_new_tokens):
-            token_id = jax.device_put(jnp.asarray([next_token], dtype=jnp.int32), device)
-            decode_output, caches = token_step(weights, token_id, caches)
-            next_token = sample_next_token(
-                decode_output, rng, args.temperature, args.top_k
-            )
-            tokens = np.append(tokens, np.int32(next_token))
-            if args.stop_on_eos and eos_token_ids is not None and next_token in eos_token_ids:
-                break
-            if tokens.size >= config.max_position_embeddings:
-                break
+    if args.max_new_tokens == 0:
         return tokens
-
-    for _ in range(args.max_new_tokens):
-        ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
-        next_token = sample_next_token(
-            decode_step(weights, ids), rng, args.temperature, args.top_k
-        )
-        tokens = np.append(tokens, np.int32(next_token))
-        if args.stop_on_eos and eos_token_ids is not None and next_token in eos_token_ids:
-            break
-        if tokens.size >= config.max_position_embeddings:
-            break
-    return tokens
+    ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
+    generated = np.asarray(decode_step[1](weights, ids), dtype=np.int32).reshape(-1)
+    return np.concatenate((tokens, generated))
 
 
 def timed_generate(config, weights, device, input_ids, args, decode_step):
@@ -737,14 +595,10 @@ def main():
     weights = jax.device_put(weights_host, device)
     decode_step = make_decode_step(config, device, args)
     if args.warmup:
-        _, warmup_seconds = timed_generate(
-            config, weights, device, input_ids, args, decode_step
-        )
+        _, warmup_seconds = timed_generate(config, weights, device, input_ids, args, decode_step)
     else:
         warmup_seconds = 0.0
-    output_ids, run_seconds = timed_generate(
-        config, weights, device, input_ids, args, decode_step
-    )
+    output_ids, run_seconds = timed_generate(config, weights, device, input_ids, args, decode_step)
 
     print(f"device: {device}")
     if not args.random_weights:

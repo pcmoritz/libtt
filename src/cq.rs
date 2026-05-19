@@ -57,7 +57,8 @@ const CQ_DISPATCH_CMD_WRITE_LINEAR_HOST_IS_EVENT: u8 = 1;
 
 const CQ_CMD_SIZE: usize = CQ_DISPATCH_CMD_SIZE as usize;
 const DONE_STREAM: u16 = FIRST_STREAM_USED as u16;
-const PENDING_LAUNCH_WAIT_INTERVAL: usize = 128;
+const PENDING_LAUNCH_WAIT_INTERVAL: usize = 16;
+const PENDING_RECORD_WAIT_LIMIT: usize = CQ_PREFETCH_Q_ENTRIES / 2;
 
 pub(crate) struct FastDispatcher {
     path: PathBuf,
@@ -67,6 +68,7 @@ pub(crate) struct FastDispatcher {
     cq_hw: CqSysmem,
     event_id: u32,
     pending_launches: usize,
+    pending_records: usize,
     runtime_templates: HashMap<usize, RuntimeCqTemplate>,
 }
 
@@ -96,6 +98,7 @@ impl FastDispatcher {
             cq_hw,
             event_id: 0,
             pending_launches: 0,
+            pending_records: 0,
             runtime_templates: HashMap::new(),
         })
     }
@@ -107,15 +110,32 @@ impl FastDispatcher {
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
         let dispatch_core = self.dispatch_core;
-        let template = match self
-            .runtime_templates
-            .entry(program as *const Program as usize)
-        {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                RuntimeCqTemplate::new(runtime_args, go_word(dispatch_core))?,
-            ),
+        let program_id = program as *const Program as usize;
+        match self.runtime_templates.entry(program_id) {
+            std::collections::hash_map::Entry::Occupied(_) => {}
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(RuntimeCqTemplate::new(runtime_args, go_word(dispatch_core))?);
+            }
+        }
+
+        let record_count = {
+            let template = self
+                .runtime_templates
+                .get(&program_id)
+                .expect("runtime template was just inserted");
+            setup_records.len()
+                + template.records_before_runtime.len()
+                + 1
+                + template.records_after_runtime.len()
         };
+        if self.pending_records + record_count + 1 >= PENDING_RECORD_WAIT_LIMIT {
+            self.finish()?;
+        }
+
+        let template = self
+            .runtime_templates
+            .get_mut(&program_id)
+            .expect("runtime template was just inserted");
         template.patch_runtime_blobs(runtime_args.blobs());
 
         self.event_id = self.event_id.wrapping_add(1);
@@ -130,12 +150,12 @@ impl FastDispatcher {
             self.cq_hw.issue_write(record)?;
         }
         self.pending_launches += 1;
+        self.pending_records += record_count;
         if self.pending_launches >= PENDING_LAUNCH_WAIT_INTERVAL {
             self.finish()?;
         }
         Ok(())
     }
-
     pub(crate) fn finish(&mut self) -> io::Result<()> {
         if self.pending_launches == 0 {
             return Ok(());
@@ -143,9 +163,11 @@ impl FastDispatcher {
         let event_record = host_event_record(self.event_id)?;
         self.event_id = self.event_id.wrapping_add(1);
         self.cq_hw.issue_write(&event_record)?;
+        let timeout = Duration::from_secs((10 * self.pending_launches as u64).clamp(10, 60));
         self.cq_hw
-            .wait_completion(self.event_id.wrapping_sub(1), Duration::from_secs(10))?;
+            .wait_completion(self.event_id.wrapping_sub(1), timeout)?;
         self.pending_launches = 0;
+        self.pending_records = 0;
         Ok(())
     }
 }
