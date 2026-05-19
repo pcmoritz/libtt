@@ -1,36 +1,13 @@
 void kernel_main() {
   constexpr uint32_t cb_in1 = tt::CBIndex::c_1;
-  constexpr uint32_t cb_out = tt::CBIndex::c_16;
-  const uint32_t out_tile_bytes = get_tile_size(cb_out);
   const uint32_t block_tiles = A(7);
   const uint32_t nblocks = A(8);
-  const uint32_t out_start = A(19);
-  const uint32_t out_stride_w = A(20);
-  const uint32_t out_stride_h = A(21);
-  const uint32_t out_next_sb_w = A(22);
-  const uint32_t out_next_sb_h = A(23);
-  const uint32_t out_sb_w = A(24);
-  const uint32_t out_sb_h = A(25);
-  const uint32_t out_sb_tiles = A(26);
-  const uint32_t out_num_sb_w = A(27);
-  const uint32_t out_num_sb_h = A(28);
-  const uint32_t logical_mt = A(29);
-  const uint32_t logical_nt = A(30);
-  const uint32_t out_col_offset = A(31);
   const uint32_t local_batch_count = A(32);
   const uint32_t batch_start = A(33);
   const uint32_t total_batch_count = A(34);
-  const uint32_t output_batch_stride = A(36);
-  const View output_view = load_view(ARG_OUTPUT_VIEW_KIND);
+  const OutputDrain output_drain = load_output_drain();
   volatile tt_l1_ptr uint32_t *recv_sem = SEM(17);
 
-  const InterleavedAddrGenFast<true> out_gen = {
-      .bank_base_address = A(18),
-      .page_size = out_tile_bytes,
-      .data_format = get_dataformat(cb_out),
-  };
-
-  const uint32_t padded_nt = out_next_sb_h / out_sb_h;
   for (uint32_t local_batch = 0; local_batch < local_batch_count; local_batch++) {
     const uint32_t batch = batch_start + local_batch;
     const bool valid_batch = batch < total_batch_count;
@@ -42,62 +19,6 @@ void kernel_main() {
       cb_push_back(cb_in1, block_tiles);
     }
 
-    uint32_t sbh_start = out_start;
-    for (uint32_t sbh = 0; sbh < out_num_sb_h; sbh++) {
-      uint32_t sbw_start = sbh_start;
-      for (uint32_t sbw = 0; sbw < out_num_sb_w; sbw++) {
-        cb_wait_front(cb_out, out_sb_tiles);
-        uint32_t l1_addr = get_read_ptr(cb_out);
-        uint32_t row_start = sbw_start;
-        if (valid_batch && output_rows_are_physical_tiles(output_view) &&
-            out_col_offset == 0 && out_sb_w == logical_nt) {
-          for (uint32_t h = 0; h < out_sb_h; h++) {
-            const uint32_t out_row = row_start / padded_nt;
-            if (out_row < logical_mt) {
-              write_output_row_physical_tiles(
-                  out_gen,
-                  output_view,
-                  tt::CBIndex::c_4,
-                  batch,
-                  out_row,
-                  0,
-                  out_sb_w,
-                  l1_addr,
-                  out_tile_bytes,
-                  out_tile_bytes / (TILE_R * TILE_C));
-            }
-            l1_addr += out_sb_w * out_tile_bytes;
-            row_start += out_stride_h;
-          }
-        } else {
-          for (uint32_t h = 0; h < out_sb_h; h++) {
-            uint32_t tile_id = row_start;
-            for (uint32_t w = 0; w < out_sb_w; w++) {
-              const uint32_t out_row = tile_id / padded_nt;
-              const uint32_t out_col = out_col_offset + tile_id - out_row * padded_nt;
-              if (valid_batch && out_row < logical_mt && out_col < logical_nt) {
-                write_output_tile(
-                    out_gen,
-                    output_view,
-                    batch,
-                    out_row,
-                    out_col,
-                    output_batch_stride,
-                    logical_nt,
-                    l1_addr,
-                    out_tile_bytes / (TILE_R * TILE_C));
-              }
-              l1_addr += out_tile_bytes;
-              tile_id += out_stride_w;
-            }
-            row_start += out_stride_h;
-          }
-        }
-        noc_async_write_barrier();
-        cb_pop_front(cb_out, out_sb_tiles);
-        sbw_start += out_next_sb_w;
-      }
-      sbh_start += out_next_sb_h;
-    }
+    drain_output_blocks(output_drain, batch, valid_batch);
   }
 }

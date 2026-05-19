@@ -202,4 +202,118 @@ void write_output_tile(
     }
   }
 }
+
+struct OutputDrain {
+  View view;
+  InterleavedAddrGenFast<true> gen;
+  uint32_t tile_bytes;
+  uint32_t start;
+  uint32_t stride_w;
+  uint32_t stride_h;
+  uint32_t next_sb_w;
+  uint32_t next_sb_h;
+  uint32_t sb_w;
+  uint32_t sb_h;
+  uint32_t sb_tiles;
+  uint32_t num_sb_w;
+  uint32_t num_sb_h;
+  uint32_t logical_mt;
+  uint32_t logical_nt;
+  uint32_t col_offset;
+  uint32_t batch_stride;
+};
+
+OutputDrain load_output_drain() {
+  constexpr uint32_t cb_out = tt::CBIndex::c_16;
+  const uint32_t tile_bytes = get_tile_size(cb_out);
+  return {
+      .view = load_view(ARG_OUTPUT_VIEW_KIND),
+      .gen = {
+          .bank_base_address = A(18),
+          .page_size = tile_bytes,
+          .data_format = get_dataformat(cb_out),
+      },
+      .tile_bytes = tile_bytes,
+      .start = A(19),
+      .stride_w = A(20),
+      .stride_h = A(21),
+      .next_sb_w = A(22),
+      .next_sb_h = A(23),
+      .sb_w = A(24),
+      .sb_h = A(25),
+      .sb_tiles = A(26),
+      .num_sb_w = A(27),
+      .num_sb_h = A(28),
+      .logical_mt = A(29),
+      .logical_nt = A(30),
+      .col_offset = A(31),
+      .batch_stride = A(36),
+  };
+}
+
+void drain_output_blocks(const OutputDrain &output, uint32_t batch, bool valid_batch) {
+  constexpr uint32_t cb_out = tt::CBIndex::c_16;
+  constexpr uint32_t cb_scratch = tt::CBIndex::c_4;
+  const uint32_t element_bytes = output.tile_bytes / (TILE_R * TILE_C);
+  const uint32_t padded_nt = output.next_sb_h / output.sb_h;
+  uint32_t sbh_start = output.start;
+  for (uint32_t sbh = 0; sbh < output.num_sb_h; sbh++) {
+    uint32_t sbw_start = sbh_start;
+    for (uint32_t sbw = 0; sbw < output.num_sb_w; sbw++) {
+      cb_wait_front(cb_out, output.sb_tiles);
+      uint32_t l1_addr = get_read_ptr(cb_out);
+      uint32_t row_start = sbw_start;
+      if (valid_batch && output_rows_are_physical_tiles(output.view) &&
+          output.col_offset == 0 && output.sb_w == output.logical_nt) {
+        for (uint32_t h = 0; h < output.sb_h; h++) {
+          const uint32_t out_row = row_start / padded_nt;
+          if (out_row < output.logical_mt) {
+            write_output_row_physical_tiles(
+                output.gen,
+                output.view,
+                cb_scratch,
+                batch,
+                out_row,
+                0,
+                output.sb_w,
+                l1_addr,
+                output.tile_bytes,
+                element_bytes);
+          }
+          l1_addr += output.sb_w * output.tile_bytes;
+          row_start += output.stride_h;
+        }
+      } else {
+        for (uint32_t h = 0; h < output.sb_h; h++) {
+          uint32_t tile_id = row_start;
+          for (uint32_t w = 0; w < output.sb_w; w++) {
+            const uint32_t out_row = tile_id / padded_nt;
+            const uint32_t out_col =
+                output.col_offset + tile_id - out_row * padded_nt;
+            if (valid_batch && out_row < output.logical_mt &&
+                out_col < output.logical_nt) {
+              write_output_tile(
+                  output.gen,
+                  output.view,
+                  batch,
+                  out_row,
+                  out_col,
+                  output.batch_stride,
+                  output.logical_nt,
+                  l1_addr,
+                  element_bytes);
+            }
+            l1_addr += output.tile_bytes;
+            tile_id += output.stride_w;
+          }
+          row_start += output.stride_h;
+        }
+      }
+      noc_async_write_barrier();
+      cb_pop_front(cb_out, output.sb_tiles);
+      sbw_start += output.next_sb_w;
+    }
+    sbh_start += output.next_sb_h;
+  }
+}
 }  // namespace
