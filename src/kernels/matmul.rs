@@ -280,10 +280,6 @@ pub(crate) fn matmul_bf16_dot_general(
     let logical_mt = ceil32(shape.m) / 32;
     let logical_kt = ceil32(shape.k) / 32;
     let logical_nt = ceil32(shape.n) / 32;
-    log(format!(
-        "matmul_bf16 dot_general: M={} K={} N={} batches={} lhs_view={:?} rhs_view={:?}",
-        shape.m, shape.k, shape.n, shape.batch_count, shape.lhs_view.kind, shape.rhs_view.kind
-    ));
     let math_fidelity = matmul_math_fidelity()?;
     let cores = device.cores_arc();
     let output_tiles = tiled_shape_tile_count(output_logical_shape)?;

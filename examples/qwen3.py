@@ -542,7 +542,7 @@ def make_decode_step(config, device, args):
             generated.append(token.reshape((1, 1)))
         return jnp.concatenate(generated, axis=0)
 
-    return ("greedy_cached", jax.jit(greedy_tokens, device=device))
+    return jax.jit(greedy_tokens, device=device)
 
 
 def generate(config, weights, device, input_ids, args, decode_step):
@@ -551,7 +551,7 @@ def generate(config, weights, device, input_ids, args, decode_step):
     if args.max_new_tokens == 0:
         return tokens
     ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
-    generated = np.asarray(decode_step[1](weights, ids), dtype=np.int32).reshape(-1)
+    generated = np.asarray(decode_step(weights, ids), dtype=np.int32).reshape(-1)
     return np.concatenate((tokens, generated))
 
 

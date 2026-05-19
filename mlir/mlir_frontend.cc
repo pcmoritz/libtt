@@ -118,25 +118,6 @@ tt::TensorDesc::ElementType mapProtoElementType(mlir::Type element_type) {
     return tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
 }
 
-bool fillTensorDesc(
-    llvm::ArrayRef<int64_t> shape,
-    mlir::Type element_type,
-    tt::TensorDesc& tensor_desc,
-    std::string& error) {
-    auto proto_element_type = mapProtoElementType(element_type);
-    if (proto_element_type == tt::TensorDesc::ELEMENT_TYPE_UNKNOWN) {
-        error = "unsupported tensor element type";
-        return false;
-    }
-
-    tensor_desc.clear_dims();
-    for (auto dim : shape) {
-        tensor_desc.add_dims(dim);
-    }
-    tensor_desc.set_element_type(proto_element_type);
-    return true;
-}
-
 bool fillTensorDesc(mlir::Type type, tt::TensorDesc& tensor_desc, std::string& error) {
     auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
     if (!tensor) {
@@ -148,7 +129,18 @@ bool fillTensorDesc(mlir::Type type, tt::TensorDesc& tensor_desc, std::string& e
         return false;
     }
 
-    return fillTensorDesc(tensor.getShape(), tensor.getElementType(), tensor_desc, error);
+    auto element_type = mapProtoElementType(tensor.getElementType());
+    if (element_type == tt::TensorDesc::ELEMENT_TYPE_UNKNOWN) {
+        error = "unsupported tensor element type";
+        return false;
+    }
+
+    tensor_desc.clear_dims();
+    for (auto dim : tensor.getShape()) {
+        tensor_desc.add_dims(dim);
+    }
+    tensor_desc.set_element_type(element_type);
+    return true;
 }
 
 bool addValueDesc(

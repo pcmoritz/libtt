@@ -68,24 +68,14 @@ void read_output_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile_i
   cb_push_back(cb, 1);
 }
 
-void copy_element_run(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
-                      uint32_t source_col, uint32_t output_row, uint32_t output_col,
-                      uint32_t run, bool contiguous_cols) {
+void copy_element(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
+                  uint32_t source_col, uint32_t output_row, uint32_t output_col) {
   volatile tt_l1_ptr Element *source =
       reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_input));
   volatile tt_l1_ptr Element *output =
       reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
-  if (contiguous_cols) {
-    for (uint32_t i = 0; i < run; ++i) {
-      output[tile_element_index(output_row, output_col + i)] =
-          source[tile_element_index(source_row, source_col + i)];
-    }
-  } else {
-    const Element value = source[tile_element_index(source_row, source_col)];
-    for (uint32_t i = 0; i < run; ++i) {
-      output[tile_element_index(output_row, output_col + i)] = value;
-    }
-  }
+  output[tile_element_index(output_row, output_col)] =
+      source[tile_element_index(source_row, source_col)];
 }
 
 void decode_output_batch(uint32_t output_batch, uint32_t output_coords[OUTPUT_COORD_COUNT]) {
@@ -319,8 +309,10 @@ void kernel_main() {
           }
         }
 
-        copy_element_run(cb_input, cb_output, source.row, source.col, row, col, run,
-                         contiguous_cols);
+        for (uint32_t i = 0; i < run; ++i) {
+          copy_element(cb_input, cb_output, source.row,
+                       contiguous_cols ? source.col + i : source.col, row, col + i);
+        }
         col += run;
       }
     }

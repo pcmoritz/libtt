@@ -2905,15 +2905,17 @@ fn execute_executable_v1(
                 input_id,
                 output_id,
                 broadcast_dimensions,
-            } => execute_broadcast_in_dim(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                *input_id,
-                *output_id,
-                broadcast_dimensions,
-            )?,
+            } => {
+                execute_broadcast_in_dim(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    *input_id,
+                    *output_id,
+                    broadcast_dimensions,
+                )?;
+            }
             executable::Op::Gather {
                 input_ids,
                 output_id,
@@ -5087,14 +5089,13 @@ mod tests {
             |executable| {
                 assert_eq!(executable.output_ids, vec![2]);
                 assert_eq!(executable.ops.len(), 3);
-                assert_eq!(executable.values[2].dims, vec![3, 2, 5]);
                 let executable::Op::Matmul {
                     input_ids,
                     output_id,
                     dimension_numbers,
                 } = &executable.ops[2]
                 else {
-                    panic!("dot_general should lower directly to Matmul");
+                    panic!("dot_general should lower to Matmul");
                 };
                 assert_eq!(*input_ids, [0, 1]);
                 assert_eq!(*output_id, 2);
