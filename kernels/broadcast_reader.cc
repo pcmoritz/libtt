@@ -18,7 +18,6 @@ constexpr uint32_t INPUT_TILE_ROWS = BROADCAST_INPUT_TILE_ROWS;
 constexpr uint32_t INPUT_TILES_PER_ROW = BROADCAST_INPUT_TILES_PER_ROW;
 constexpr uint32_t OUTPUT_TILE_ROWS = BROADCAST_OUTPUT_TILE_ROWS;
 constexpr uint32_t OUTPUT_TILES_PER_ROW = BROADCAST_OUTPUT_TILES_PER_ROW;
-constexpr bool DIRECT_COPY = BROADCAST_DIRECT_COPY != 0;
 using Element = BROADCAST_ELEMENT_TYPE;
 
 struct Location {
@@ -243,10 +242,6 @@ void kernel_main() {
   };
   for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
     uint32_t output_tile_id = output_tile_offset + tile;
-    if constexpr (DIRECT_COPY) {
-      read_output_tile(input, output_tile_id, cb_output);
-      continue;
-    }
     if constexpr (WHOLE_TILE_COPY) {
       read_output_tile(input, whole_tile_input_tile(output_tile_id), cb_output);
       continue;

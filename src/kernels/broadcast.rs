@@ -24,13 +24,6 @@ pub(crate) struct BroadcastKernelShape {
     output_tile_rows: u32,
     output_tiles_per_row: u32,
     tile_count: u32,
-    reader_kind: BroadcastReaderKind,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum BroadcastReaderKind {
-    Generic,
-    DirectCopy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,7 +129,6 @@ fn broadcast_kernel_shape(
     let input_shape_u32 = u32_shape(input_shape, "input shape")?;
     let output_shape_u32 = u32_shape(output_shape, "output shape")?;
     let broadcast_dimensions_u32 = u32_broadcast_dimensions(broadcast_dimensions)?;
-    let reader_kind = broadcast_reader_kind(input_shape, output_shape, &broadcast_dimensions_u32);
 
     Ok(BroadcastKernelShape {
         input_shape: input_shape_u32,
@@ -159,7 +151,6 @@ fn broadcast_kernel_shape(
             "output tiles per row",
         )?,
         tile_count: u32_arg(tile_count, "tile count")?,
-        reader_kind,
     })
 }
 
@@ -181,11 +172,7 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
         )?;
     }
     let runtime_args = runtime_args.build()?;
-    let reader_kernel = match key.shape.reader_kind {
-        BroadcastReaderKind::Generic | BroadcastReaderKind::DirectCopy => {
-            broadcast_reader_source(key.dtype, &key.shape)?
-        }
-    };
+    let reader_kernel = broadcast_reader_source(key.dtype, &key.shape)?;
     Ok(Program {
         reader_kernel,
         writer_kernel: BROADCAST_WRITER.to_owned(),
@@ -222,7 +209,6 @@ fn broadcast_reader_source(dtype: DType, shape: &BroadcastKernelShape) -> io::Re
          #define BROADCAST_INPUT_TILES_PER_ROW {}\n\
          #define BROADCAST_OUTPUT_TILE_ROWS {}\n\
          #define BROADCAST_OUTPUT_TILES_PER_ROW {}\n\
-         #define BROADCAST_DIRECT_COPY {}\n\
          #define BROADCAST_ELEMENT_TYPE {element_type}\n\
          {BROADCAST_READER}",
         shape.input_shape.len(),
@@ -234,7 +220,6 @@ fn broadcast_reader_source(dtype: DType, shape: &BroadcastKernelShape) -> io::Re
         shape.input_tiles_per_row,
         shape.output_tile_rows,
         shape.output_tiles_per_row,
-        (shape.reader_kind == BroadcastReaderKind::DirectCopy) as u32,
     ))
 }
 
@@ -317,30 +302,6 @@ fn cpp_u32_array(values: &[u32]) -> String {
     format!("{{{values}}}")
 }
 
-fn is_direct_copy_broadcast(
-    input_shape: &[usize],
-    output_shape: &[usize],
-    broadcast_dimensions: &[u32],
-) -> bool {
-    input_shape == output_shape
-        && broadcast_dimensions
-            .iter()
-            .enumerate()
-            .all(|(index, &dim)| dim == index as u32)
-}
-
-fn broadcast_reader_kind(
-    input_shape: &[usize],
-    output_shape: &[usize],
-    broadcast_dimensions: &[u32],
-) -> BroadcastReaderKind {
-    if is_direct_copy_broadcast(input_shape, output_shape, broadcast_dimensions) {
-        BroadcastReaderKind::DirectCopy
-    } else {
-        BroadcastReaderKind::Generic
-    }
-}
-
 fn element_type(dtype: DType) -> &'static str {
     match dtype {
         DType::Float32 | DType::Int32 | DType::UInt32 => "uint32_t",
@@ -392,7 +353,6 @@ mod tests {
                 output_tile_rows: 1,
                 output_tiles_per_row: 1,
                 tile_count: 1,
-                reader_kind: BroadcastReaderKind::Generic,
             }
         );
     }
@@ -424,10 +384,6 @@ mod tests {
         assert_eq!(plan.kernel_shape().output_shape, vec![18, 2, 2, 32]);
         assert_eq!(plan.kernel_shape().broadcast_dimensions, vec![0, 1, 3]);
         assert_eq!(plan.kernel_shape().tile_count, 36);
-        assert_eq!(
-            plan.kernel_shape().reader_kind,
-            BroadcastReaderKind::Generic
-        );
     }
 
     #[test]
@@ -486,16 +442,9 @@ mod tests {
         assert_eq!(program.runtime_args.cores().len(), 3);
         assert_eq!(program.runtime_args.section_sizes(), (12, 12, 0));
         assert!(program.compute_kernel.is_empty());
-        assert_eq!(
-            plan.kernel_shape().reader_kind,
-            BroadcastReaderKind::DirectCopy
-        );
         assert!(program
             .reader_kernel
             .contains("#define BROADCAST_OUTPUT_RANK 3"));
-        assert!(program
-            .reader_kernel
-            .contains("#define BROADCAST_DIRECT_COPY 1"));
 
         let blobs = program.runtime_args.blobs();
         assert_eq!((arg_u32(&blobs[0], 1), arg_u32(&blobs[0], 2)), (0, 2));
