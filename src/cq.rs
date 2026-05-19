@@ -57,7 +57,7 @@ const CQ_DISPATCH_CMD_WRITE_LINEAR_HOST_IS_EVENT: u8 = 1;
 
 const CQ_CMD_SIZE: usize = CQ_DISPATCH_CMD_SIZE as usize;
 const DONE_STREAM: u16 = FIRST_STREAM_USED as u16;
-const DEFERRED_LAUNCH_WAIT_INTERVAL: usize = 128;
+const PENDING_LAUNCH_WAIT_INTERVAL: usize = 128;
 
 pub(crate) struct FastDispatcher {
     path: PathBuf,
@@ -66,7 +66,7 @@ pub(crate) struct FastDispatcher {
     _pcie_base_guard: PinnedMemory,
     cq_hw: CqSysmem,
     event_id: u32,
-    deferred_launches: usize,
+    pending_launches: usize,
     runtime_templates: HashMap<usize, RuntimeCqTemplate>,
 }
 
@@ -95,7 +95,7 @@ impl FastDispatcher {
             _pcie_base_guard: pcie_base_guard,
             cq_hw,
             event_id: 0,
-            deferred_launches: 0,
+            pending_launches: 0,
             runtime_templates: HashMap::new(),
         })
     }
@@ -105,7 +105,6 @@ impl FastDispatcher {
         program: &Program,
         setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
-        wait: bool,
     ) -> io::Result<()> {
         let dispatch_core = self.dispatch_core;
         let template = match self
@@ -130,15 +129,15 @@ impl FastDispatcher {
         for record in &template.records_after_runtime {
             self.cq_hw.issue_write(record)?;
         }
-        self.deferred_launches += 1;
-        if wait || self.deferred_launches >= DEFERRED_LAUNCH_WAIT_INTERVAL {
-            self.wait_for_idle()?;
+        self.pending_launches += 1;
+        if self.pending_launches >= PENDING_LAUNCH_WAIT_INTERVAL {
+            self.finish()?;
         }
         Ok(())
     }
 
-    pub(crate) fn wait_for_idle(&mut self) -> io::Result<()> {
-        if self.deferred_launches == 0 {
+    pub(crate) fn finish(&mut self) -> io::Result<()> {
+        if self.pending_launches == 0 {
             return Ok(());
         }
         let event_record = host_event_record(self.event_id)?;
@@ -146,7 +145,7 @@ impl FastDispatcher {
         self.cq_hw.issue_write(&event_record)?;
         self.cq_hw
             .wait_completion(self.event_id.wrapping_sub(1), Duration::from_secs(10))?;
-        self.deferred_launches = 0;
+        self.pending_launches = 0;
         Ok(())
     }
 }

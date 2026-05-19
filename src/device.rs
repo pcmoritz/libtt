@@ -101,7 +101,6 @@ pub struct Device {
     dispatcher: Box<dyn Dispatcher>,
     cached_program_launches: HashMap<usize, CachedProgramLaunch>,
     staged_cached_program: Option<usize>,
-    defer_dispatch_waits: bool,
 }
 
 struct CachedProgramLaunch {
@@ -120,9 +119,8 @@ trait Dispatcher {
         setup: &[DispatchCommand],
         setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
-        wait: bool,
     ) -> io::Result<()>;
-    fn wait_for_idle(&mut self) -> io::Result<()> {
+    fn finish(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -138,13 +136,12 @@ impl Dispatcher for FastDispatcher {
         _setup: &[DispatchCommand],
         setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
-        wait: bool,
     ) -> io::Result<()> {
-        FastDispatcher::launch(self, program, setup_records, runtime_args, wait)
+        FastDispatcher::launch(self, program, setup_records, runtime_args)
     }
 
-    fn wait_for_idle(&mut self) -> io::Result<()> {
-        FastDispatcher::wait_for_idle(self)
+    fn finish(&mut self) -> io::Result<()> {
+        FastDispatcher::finish(self)
     }
 }
 
@@ -159,7 +156,6 @@ impl Dispatcher for SlowDispatcher {
         setup: &[DispatchCommand],
         _setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
-        _wait: bool,
     ) -> io::Result<()> {
         SlowDispatcher::launch(self, setup, runtime_args)
     }
@@ -263,7 +259,6 @@ impl Device {
             dispatcher,
             cached_program_launches: HashMap::new(),
             staged_cached_program: None,
-            defer_dispatch_waits: false,
         };
 
         if let Err(err) = info.upload_firmware() {
@@ -407,25 +402,14 @@ impl Device {
         } else {
             (launch.setup.as_slice(), launch.setup_records.as_slice())
         };
-        self.dispatcher.launch(
-            &program,
-            setup,
-            setup_records,
-            &launch.runtime_args,
-            !self.defer_dispatch_waits,
-        )?;
+        self.dispatcher
+            .launch(&program, setup, setup_records, &launch.runtime_args)?;
         self.staged_cached_program = Some(program_id);
         Ok(())
     }
 
-    pub(crate) fn set_defer_dispatch_waits(&mut self, defer: bool) -> bool {
-        let previous = self.defer_dispatch_waits;
-        self.defer_dispatch_waits = defer;
-        previous
-    }
-
-    pub(crate) fn wait_for_dispatch(&mut self) -> io::Result<()> {
-        self.dispatcher.wait_for_idle()
+    pub(crate) fn finish_dispatch(&mut self) -> io::Result<()> {
+        self.dispatcher.finish()
     }
 
     pub fn alloc(
