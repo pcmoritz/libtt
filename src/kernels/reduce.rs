@@ -5,7 +5,9 @@ use crate::dram::{
 };
 use crate::executable::ReduceReducer;
 use crate::hw::CoreCoord;
-use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{
+    select_worker_cores, split_tile_range, DramKernel, Kernel, RuntimeArgsBuilder,
+};
 use std::io;
 
 const READER: &str = include_str!("../../kernels/reduce_reader.cc");
@@ -182,38 +184,6 @@ struct ReduceCoreRange {
     output_tiles: u32,
 }
 
-struct ReduceKernel {
-    input_addr: u32,
-    output_addr: u32,
-    key: ReduceProgramKey,
-}
-
-impl Kernel<ReduceProgramKey> for ReduceKernel {
-    fn program_key(&self) -> ReduceProgramKey {
-        self.key.clone()
-    }
-
-    fn build_program(&self) -> io::Result<Program> {
-        reduce_program(self.key.clone())
-    }
-
-    #[inline]
-    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            READER_INPUT_ADDR_INDEX => Some(self.input_addr),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
-        }
-    }
-}
-
 pub(crate) fn reduce(
     device: &mut Device,
     input: &DramBuffer,
@@ -240,8 +210,8 @@ pub(crate) fn reduce(
         &plan.output_allocation_shape,
         name,
     )?;
-    let kernel = ReduceKernel {
-        input_addr: u32_addr(input.addr, "input address")?,
+    let kernel = DramKernel {
+        reader_addrs: [u32_addr(input.addr, "input address")?],
         output_addr: u32_addr(output.addr, "output address")?,
         key: ReduceProgramKey {
             cores,
@@ -249,6 +219,7 @@ pub(crate) fn reduce(
             op: plan.op,
             shape: plan.shape,
         },
+        build: reduce_program,
     };
     kernel.run(device)?;
     Ok(output)

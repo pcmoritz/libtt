@@ -118,19 +118,6 @@ void copy_element_from_source(uint32_t cb_source, uint32_t dst_addr, uint32_t so
       source[tile_element_index(source_row, source_col)];
 }
 
-void fill_generic_element(const InterleavedAddrGenFast<true> &input, const View &view,
-                          uint32_t cb_source, uint32_t dst_addr, uint32_t *loaded_tile,
-                          uint32_t *indices, uint32_t logical_row, uint32_t logical_col,
-                          uint32_t dst_row, uint32_t dst_col) {
-  decompose_into_dims(logical_row, view.row_dims, view.row_rank, view.shape, indices);
-  decompose_into_dims(logical_col, view.col_dims, view.col_rank, view.shape, indices);
-  uint32_t source_row = 0;
-  uint32_t source_col = 0;
-  uint32_t source_tile = tile_id_for_indices(view, indices, &source_row, &source_col);
-  ensure_source_tile(input, source_tile, cb_source, loaded_tile);
-  copy_element_from_source(cb_source, dst_addr, source_row, source_col, dst_row, dst_col);
-}
-
 void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &view,
                        uint32_t batch, uint32_t row_tile, uint32_t col_tile,
                        uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
@@ -158,17 +145,13 @@ void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &vi
       if (logical_col >= view.logical_cols) {
         continue;
       }
-      fill_generic_element(
-          input,
-          view,
-          cb_source,
-          dst_addr,
-          &loaded_tile,
-          indices,
-          logical_row,
-          logical_col,
-          row,
-          col);
+      decompose_into_dims(logical_row, view.row_dims, view.row_rank, view.shape, indices);
+      decompose_into_dims(logical_col, view.col_dims, view.col_rank, view.shape, indices);
+      uint32_t source_row = 0;
+      uint32_t source_col = 0;
+      uint32_t source_tile = tile_id_for_indices(view, indices, &source_row, &source_col);
+      ensure_source_tile(input, source_tile, cb_source, &loaded_tile);
+      copy_element_from_source(cb_source, dst_addr, source_row, source_col, row, col);
     }
   }
   if (loaded_tile != INVALID_TILE) {
@@ -186,10 +169,6 @@ struct TiledIndexMap {
   uint32_t source_col_dim;
 };
 
-TiledIndexMap tiled_index_map_for_view(const View &view) {
-  return TiledIndexMap{view.row_dims[0], view.col_dims[0]};
-}
-
 void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const View &view,
                                uint32_t batch, uint32_t row_tile, uint32_t col_tile,
                                uint32_t dst_addr, uint32_t tile_bytes,
@@ -206,7 +185,7 @@ void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const 
     indices[i] = 0;
   }
   decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
-  TiledIndexMap map = tiled_index_map_for_view(view);
+  TiledIndexMap map = {view.row_dims[0], view.col_dims[0]};
   indices[map.source_row_dim] = row_base;
 
   for (uint32_t col = 0; col < TILE_C; ++col) {

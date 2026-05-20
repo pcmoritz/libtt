@@ -1,8 +1,6 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{
-    tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R,
-};
+use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{
     select_worker_cores, split_tile_range, DramKernel, Kernel, RuntimeArgsBuilder,
@@ -18,12 +16,6 @@ const MAX_RANK: usize = 8;
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct GeneralTransposeKernelShape {
     rank: u32,
-    input_tile_rows: u32,
-    input_tiles_per_row: u32,
-    output_rows: u32,
-    output_cols: u32,
-    output_tiles_per_row: u32,
-    output_matrix_tiles: u32,
     output_tile_count: u32,
     input_shape: [u32; MAX_RANK],
     output_shape: [u32; MAX_RANK],
@@ -134,24 +126,8 @@ fn general_transpose_shape(
         )));
     }
 
-    let input_allocation_shape = tiled_allocation_shape(input_shape)?;
-    let output_allocation_shape = tiled_allocation_shape(output_shape)?;
-    let output_tile_rows = output_allocation_shape[rank - 2] / TILE_R;
-    let output_tiles_per_row = output_allocation_shape[rank - 1] / TILE_C;
-    let output_matrix_tiles = output_tile_rows
-        .checked_mul(output_tiles_per_row)
-        .ok_or_else(|| invalid_input("general transpose output matrix tile count overflow"))?;
     Ok(GeneralTransposeKernelShape {
         rank: u32_arg(rank, "rank")?,
-        input_tile_rows: u32_arg(input_allocation_shape[rank - 2] / TILE_R, "input tile rows")?,
-        input_tiles_per_row: u32_arg(
-            input_allocation_shape[rank - 1] / TILE_C,
-            "input tiles per row",
-        )?,
-        output_rows: u32_arg(output_shape[rank - 2], "output rows")?,
-        output_cols: u32_arg(output_shape[rank - 1], "output cols")?,
-        output_tiles_per_row: u32_arg(output_tiles_per_row, "output tiles per row")?,
-        output_matrix_tiles: u32_arg(output_matrix_tiles, "output matrix tiles")?,
         output_tile_count: u32_arg(tiled_shape_tile_count(output_shape)?, "output tile count")?,
         input_shape: padded_array(input_shape)?,
         output_shape: padded_array(output_shape)?,
@@ -201,24 +177,12 @@ fn general_transpose_reader_source(
     Ok(format!(
         "#define TRANSPOSE_GENERAL_MAX_RANK {MAX_RANK}\n\
          #define TRANSPOSE_GENERAL_RANK {}\n\
-         #define TRANSPOSE_GENERAL_INPUT_TILE_ROWS {}\n\
-         #define TRANSPOSE_GENERAL_INPUT_TILES_PER_ROW {}\n\
-         #define TRANSPOSE_GENERAL_OUTPUT_ROWS {}\n\
-         #define TRANSPOSE_GENERAL_OUTPUT_COLS {}\n\
-         #define TRANSPOSE_GENERAL_OUTPUT_TILES_PER_ROW {}\n\
-         #define TRANSPOSE_GENERAL_OUTPUT_MATRIX_TILES {}\n\
          #define TRANSPOSE_GENERAL_OUTPUT_SHAPE {}\n\
          #define TRANSPOSE_GENERAL_INPUT_SHAPE {}\n\
          #define TRANSPOSE_GENERAL_PERMUTATION {}\n\
          #define TRANSPOSE_GENERAL_ELEMENT_TYPE {element_type}\n\
          {GENERAL_READER}",
         shape.rank,
-        shape.input_tile_rows,
-        shape.input_tiles_per_row,
-        shape.output_rows,
-        shape.output_cols,
-        shape.output_tiles_per_row,
-        shape.output_matrix_tiles,
         format_u32_array(&shape.output_shape),
         format_u32_array(&shape.input_shape),
         format_u32_array(&shape.permutation),
@@ -277,12 +241,6 @@ mod tests {
             general_transpose_shape(&[64, 96], &[96, 64], &[1, 0]).expect("transpose shape");
 
         assert_eq!(shape.rank, 2);
-        assert_eq!(shape.input_tile_rows, 2);
-        assert_eq!(shape.input_tiles_per_row, 3);
-        assert_eq!(shape.output_rows, 96);
-        assert_eq!(shape.output_cols, 64);
-        assert_eq!(shape.output_tiles_per_row, 2);
-        assert_eq!(shape.output_matrix_tiles, 6);
         assert_eq!(shape.output_tile_count, 6);
     }
 

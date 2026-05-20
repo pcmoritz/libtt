@@ -21,19 +21,6 @@ uint32_t output_tile_for_element(
   return tile_id_for_indices(view, indices, row_in_tile, col_in_tile);
 }
 
-void write_output_fragment(
-    const InterleavedAddrGenFast<true> &out_gen,
-    uint32_t dst_tile,
-    uint32_t src_l1_addr,
-    uint32_t src_offset,
-    uint32_t dst_offset,
-    uint32_t bytes) {
-  noc_async_write(
-      src_l1_addr + src_offset,
-      get_noc_addr(dst_tile, out_gen, dst_offset),
-      bytes);
-}
-
 bool output_rows_are_physical_tiles(const View &view) {
   if (view.kind == VIEW_CONTIGUOUS || view.row_rank != 1 || view.rank < 2) {
     return false;
@@ -58,7 +45,6 @@ void write_output_row_physical_tiles(
     uint32_t src_l1_addr,
     uint32_t tile_bytes,
     uint32_t element_bytes) {
-  (void)tile_bytes;
   const uint32_t row_base = canonical_row_tile * TILE_R;
   cb_reserve_back(cb_scratch, 1);
   uint32_t scratch_l1_addr = get_write_ptr(cb_scratch);
@@ -191,12 +177,9 @@ void write_output_tile(
         }
         ++run;
       }
-      write_output_fragment(
-          out_gen,
-          dst_tile,
-          src_l1_addr,
-          src_offset,
-          dst_offset,
+      noc_async_write(
+          src_l1_addr + src_offset,
+          get_noc_addr(dst_tile, out_gen, dst_offset),
           run * element_bytes);
       col += run;
     }

@@ -746,7 +746,6 @@ fn plan_matmul(
         plan_direct_matmul(
             mt_base,
             nt_base,
-            1,
             &ordered,
             &kt_divs,
             tile_bytes,
@@ -788,14 +787,13 @@ fn plan_matmul(
 fn plan_direct_matmul(
     mt_base: usize,
     nt_base: usize,
-    batch_groups: usize,
     cores: &[CoreCoord],
     kt_divs: &[usize],
     tile_bytes: usize,
     l1_data_bytes: usize,
     allow_column_split: bool,
 ) -> Option<MatmulPlanCandidate> {
-    if mt_base == 0 || nt_base == 0 || batch_groups == 0 {
+    if mt_base == 0 || nt_base == 0 {
         return None;
     }
 
@@ -810,10 +808,7 @@ fn plan_direct_matmul(
             1
         };
         for logical_cols in 1..=max_cols {
-            let active_cores = logical_rows * logical_cols * batch_groups;
-            if active_cores > cores.len() {
-                continue;
-            }
+            let active_cores = logical_rows * logical_cols;
             let per_core_m = mt_base.div_ceil(logical_rows);
             let per_core_n = nt_base.div_ceil(logical_cols);
             let mt = logical_rows * per_core_m;
