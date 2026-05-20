@@ -33,7 +33,6 @@ class Qwen3Config:
     rms_norm_eps: float = 1e-6
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
-    eos_token_id: int | tuple[int, ...] | None = 151645
 
     def __post_init__(self):
         if self.num_attention_heads % self.num_key_value_heads != 0:
@@ -44,7 +43,6 @@ class Qwen3Config:
 
 class ByteTokenizer:
     bos_token_id = 256
-    eos_token_id = 257
 
     def encode(self, text: str, add_bos: bool = True) -> np.ndarray:
         tokens = list(text.encode("utf-8", errors="replace"))
@@ -60,7 +58,6 @@ class ByteTokenizer:
 class HuggingFaceTokenizer:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
-        self.eos_token_id = tokenizer.eos_token_id
 
     def encode(self, text: str, raw_prompt: bool, thinking: bool) -> np.ndarray:
         if not raw_prompt and getattr(self.tokenizer, "chat_template", None):
@@ -101,8 +98,6 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-k", type=int, default=32)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--intermediate-size", type=int, default=384)
@@ -127,7 +122,6 @@ def make_random_config(args) -> Qwen3Config:
         max_position_embeddings=args.max_seq_len or 512,
         rope_theta=10000.0,
         tie_word_embeddings=False,
-        eos_token_id=ByteTokenizer.eos_token_id,
     )
 
 
@@ -135,12 +129,6 @@ def load_hf_config(model_dir: Path, max_seq_len: int | None) -> Qwen3Config:
     config_path = model_dir / "config.json"
     with config_path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
-
-    eos_token_id = raw.get("eos_token_id")
-    if isinstance(eos_token_id, list):
-        eos_token_id = tuple(int(token) for token in eos_token_id)
-    elif eos_token_id is not None:
-        eos_token_id = int(eos_token_id)
 
     config = Qwen3Config(
         vocab_size=int(raw["vocab_size"]),
@@ -155,7 +143,6 @@ def load_hf_config(model_dir: Path, max_seq_len: int | None) -> Qwen3Config:
         rms_norm_eps=float(raw.get("rms_norm_eps", 1e-6)),
         initializer_range=float(raw.get("initializer_range", 0.02)),
         tie_word_embeddings=bool(raw.get("tie_word_embeddings", False)),
-        eos_token_id=eos_token_id,
     )
 
     if max_seq_len is not None:
@@ -219,16 +206,10 @@ def normal(rng: np.random.Generator, shape, std, dtype):
 
 def precompute_rope_cos_sin(config: Qwen3Config, seq_len: int, dtype):
     position_ids = np.arange(seq_len, dtype=np.float32)[:, None]
-    inv_freq = 1.0 / (
-        config.rope_theta
-        ** (np.arange(0, config.head_dim, 2, dtype=np.float32) / config.head_dim)
-    )
+    inv_freq = 1.0 / (config.rope_theta ** (np.arange(0, config.head_dim, 2, dtype=np.float32) / config.head_dim))
     freqs = position_ids * inv_freq[None, :]
     emb = np.concatenate((freqs, freqs), axis=-1)
-    return (
-        np.ascontiguousarray(np.cos(emb).astype(dtype)),
-        np.ascontiguousarray(np.sin(emb).astype(dtype)),
-    )
+    return np.ascontiguousarray(np.cos(emb).astype(dtype)), np.ascontiguousarray(np.sin(emb).astype(dtype))
 
 
 def init_weights(config: Qwen3Config, seed: int, np_dtype):
@@ -397,12 +378,7 @@ def apply_rope(x, cos, sin):
 
 def causal_attention_bias(seq_len: int):
     position_ids = jnp.arange(seq_len)
-    bias = jnp.where(
-        position_ids[None, :] > position_ids[:, None],
-        -1.0e9,
-        0.0,
-    )
-    return bias[None, None, :, :]
+    return jnp.where(position_ids[None, :] > position_ids[:, None], -1.0e9, 0.0)[None, None, :, :]
 
 
 def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin, causal_bias, cache=None):
@@ -425,16 +401,10 @@ def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin, causal_b
     if cache is not None:
         key_cache = jnp.concatenate((cache[0], key_cache), axis=0)
         value_cache = jnp.concatenate((cache[1], value_cache), axis=0)
-    key_states = key_cache.reshape(
-        (key_cache.shape[0], config.num_key_value_heads, config.head_dim)
-    )
-    value_states = value_cache.reshape(
-        (value_cache.shape[0], config.num_key_value_heads, config.head_dim)
-    )
+    key_states = key_cache.reshape((key_cache.shape[0], config.num_key_value_heads, config.head_dim))
+    value_states = value_cache.reshape((value_cache.shape[0], config.num_key_value_heads, config.head_dim))
 
-    attn_output = jax.nn.dot_product_attention(
-        query_states, key_states, value_states, bias=causal_bias, implementation="xla"
-    )
+    attn_output = jax.nn.dot_product_attention(query_states, key_states, value_states, bias=causal_bias, implementation="xla")
     output = attn_output.reshape(seq_len, -1) @ layer["o_proj"]
     return output, (key_cache, value_cache)
 
@@ -443,35 +413,6 @@ def mlp(hidden_states, layer):
     gate = silu(hidden_states @ layer["gate_proj"])
     up = hidden_states @ layer["up_proj"]
     return (gate * up) @ layer["down_proj"]
-
-
-def qwen3_layers(config: Qwen3Config, weights, hidden_states, cos, sin, causal_bias, caches=None):
-    new_caches = []
-    layer_caches = caches if caches is not None else (None,) * len(weights["layers"])
-    if len(layer_caches) != len(weights["layers"]):
-        raise ValueError("KV cache must have one entry per decoder layer")
-    for layer, cache in zip(weights["layers"], layer_caches):
-        residual = hidden_states
-        hidden_states = rms_norm(hidden_states, layer["input_norm"], config.rms_norm_eps)
-        attn_output, new_cache = self_attention(
-            config, hidden_states, layer, cos, sin, causal_bias, cache
-        )
-        new_caches.append(new_cache)
-        hidden_states = residual + attn_output
-
-        residual = hidden_states
-        hidden_states = rms_norm(
-            hidden_states, layer["post_attention_norm"], config.rms_norm_eps
-        )
-        hidden_states = residual + mlp(hidden_states, layer)
-
-    return hidden_states, tuple(new_caches)
-
-
-def project_logits(weights, hidden_states):
-    if "lm_head" in weights:
-        return hidden_states @ weights["lm_head"]
-    return hidden_states @ weights["embed_tokens"].T
 
 
 def qwen3_forward(config: Qwen3Config, weights, input_ids, caches=None):
@@ -484,22 +425,27 @@ def qwen3_forward(config: Qwen3Config, weights, input_ids, caches=None):
     cos = weights["rope_cos"][cache_len : cache_len + seq_len]
     sin = weights["rope_sin"][cache_len : cache_len + seq_len]
     causal_bias = causal_attention_bias(seq_len) if caches is None else None
-    hidden_states, new_caches = qwen3_layers(
-        config,
-        weights,
-        hidden_states,
-        cos,
-        sin,
-        causal_bias,
-        caches=caches,
-    )
-    return rms_norm(hidden_states, weights["norm"], config.rms_norm_eps), new_caches
+    new_caches = []
+    layer_caches = caches if caches is not None else (None,) * len(weights["layers"])
+    if len(layer_caches) != len(weights["layers"]):
+        raise ValueError("KV cache must have one entry per decoder layer")
+    for layer, cache in zip(weights["layers"], layer_caches):
+        residual = hidden_states
+        hidden_states = rms_norm(hidden_states, layer["input_norm"], config.rms_norm_eps)
+        attn_output, new_cache = self_attention(config, hidden_states, layer, cos, sin, causal_bias, cache)
+        new_caches.append(new_cache)
+        hidden_states = residual + attn_output
+
+        residual = hidden_states
+        hidden_states = rms_norm(hidden_states, layer["post_attention_norm"], config.rms_norm_eps)
+        hidden_states = residual + mlp(hidden_states, layer)
+    return rms_norm(hidden_states, weights["norm"], config.rms_norm_eps), tuple(new_caches)
 
 
 def qwen3_next_logits_and_cache(config: Qwen3Config, weights, input_ids, caches=None):
     hidden_states, caches = qwen3_forward(config, weights, input_ids, caches=caches)
-    last_hidden = hidden_states[-1:, :]
-    return project_logits(weights, last_hidden)[0], caches
+    head = weights["lm_head"] if "lm_head" in weights else weights["embed_tokens"].T
+    return (hidden_states[-1:, :] @ head)[0], caches
 
 
 def count_parameters(weights) -> int:
@@ -513,9 +459,7 @@ def make_decode_step(config, device, args):
         token = jax.lax.top_k(logits, 1)[1][0].astype(jnp.int32)
         generated = [token.reshape((1, 1))]
         for _ in range(1, args.max_new_tokens):
-            logits, caches = qwen3_next_logits_and_cache(
-                config, model_weights, token, caches
-            )
+            logits, caches = qwen3_next_logits_and_cache(config, model_weights, token, caches)
             token = jax.lax.top_k(logits, 1)[1][0].astype(jnp.int32)
             generated.append(token.reshape((1, 1)))
         return jnp.concatenate(generated, axis=0)
@@ -563,11 +507,7 @@ def main():
             "prompt plus generation length exceeds --max-seq-len: "
             f"{input_ids.size + args.max_new_tokens} > {config.max_position_embeddings}"
         )
-    weights_host["rope_cos"], weights_host["rope_sin"] = precompute_rope_cos_sin(
-        config,
-        input_ids.size + args.max_new_tokens,
-        np_dtype,
-    )
+    weights_host["rope_cos"], weights_host["rope_sin"] = precompute_rope_cos_sin(config, input_ids.size + args.max_new_tokens, np_dtype)
 
     device = select_device(args.backend)
     weights = jax.device_put(weights_host, device)
