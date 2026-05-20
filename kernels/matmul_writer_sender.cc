@@ -61,8 +61,8 @@ void kernel_main() {
             uint32_t canonical_tile = canonical_base + h * A(3) + w;
             uint32_t canonical_row_tile = canonical_tile / A(3);
             uint32_t canonical_col_tile = canonical_tile - canonical_row_tile * A(3);
-            if (view.kind == VIEW_TOKEN_COLUMNS) {
-              fill_token_columns_tile(
+            if (view.kind == VIEW_TILED_INDEX_MAP) {
+              fill_tiled_index_map_tile(
                   in1_gen,
                   view,
                   batch,

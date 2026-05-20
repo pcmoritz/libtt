@@ -48,7 +48,7 @@ struct MatmulProgramKey {
 enum MatmulViewKind {
     Contiguous,
     Generic,
-    TokenColumns,
+    TiledIndexMap,
 }
 
 impl MatmulViewKind {
@@ -56,7 +56,7 @@ impl MatmulViewKind {
         match self {
             Self::Contiguous => 0,
             Self::Generic => 2,
-            Self::TokenColumns => 4,
+            Self::TiledIndexMap => 4,
         }
     }
 }
@@ -568,15 +568,28 @@ fn operand_view_kind(
         && col_dims == [rank - 1]
     {
         MatmulViewKind::Contiguous
-    } else if rank == 4
-        && batch_dims == [0, 2]
-        && row_dims == [3]
-        && col_dims == [1]
-    {
-        MatmulViewKind::TokenColumns
+    } else if is_tiled_index_map_view(rank, batch_dims, row_dims, col_dims) {
+        MatmulViewKind::TiledIndexMap
     } else {
         MatmulViewKind::Generic
     }
+}
+
+fn is_tiled_index_map_view(
+    rank: usize,
+    batch_dims: &[usize],
+    row_dims: &[usize],
+    col_dims: &[usize],
+) -> bool {
+    // Example: [batch, token, head, dim] viewed as [batch, head, dim, token].
+    // The matmul row dim is the physical innermost dim, and the matmul column
+    // dim is a prefix dim, so each output column maps to one source tile.
+    if rank < 3 || row_dims != [rank - 1] || col_dims.len() != 1 || col_dims[0] >= rank - 2 {
+        return false;
+    }
+    (0..rank)
+        .filter(|&dim| dim != col_dims[0] && dim != row_dims[0])
+        .eq(batch_dims.iter().copied())
 }
 
 fn padded_u32_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]> {
@@ -1485,6 +1498,30 @@ mod tests {
         assert!(source.contains("constexpr uint32_t batch_count = 3;"));
         assert!(!source.contains("@TRANSPOSE_B@"));
         assert!(source.contains("#include \"compute_kernel_api/matmul.h\""));
+    }
+
+    #[test]
+    fn operand_view_kind_recognizes_tiled_index_map() {
+        assert_eq!(
+            operand_view_kind(4, &[0, 2], &[3], &[1]),
+            MatmulViewKind::TiledIndexMap
+        );
+        assert_eq!(
+            operand_view_kind(5, &[0, 2, 3], &[4], &[1]),
+            MatmulViewKind::TiledIndexMap
+        );
+    }
+
+    #[test]
+    fn operand_view_kind_keeps_other_remaps_generic() {
+        assert_eq!(
+            operand_view_kind(5, &[0, 2, 3], &[4], &[1, 2]),
+            MatmulViewKind::Generic
+        );
+        assert_eq!(
+            operand_view_kind(5, &[0, 2, 3], &[3], &[1]),
+            MatmulViewKind::Generic
+        );
     }
 
     #[test]

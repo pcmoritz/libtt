@@ -10,7 +10,7 @@ constexpr uint32_t MAX_RANK = 8;
 constexpr uint32_t INVALID_TILE = 0xffffffffu;
 constexpr uint32_t VIEW_ARG_COUNT = 9 + 4 * MAX_RANK;
 constexpr uint32_t VIEW_CONTIGUOUS = 0;
-constexpr uint32_t VIEW_TOKEN_COLUMNS = 4;
+constexpr uint32_t VIEW_TILED_INDEX_MAP = 4;
 
 struct View {
   uint32_t kind, rank, batch_rank, row_rank, col_rank;
@@ -176,32 +176,54 @@ void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &vi
   }
 }
 
-void fill_token_columns_tile(const InterleavedAddrGenFast<true> &input, const View &view,
-                             uint32_t batch, uint32_t row_tile, uint32_t col_tile,
-                             uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
+// Specialized tiled index map for views where the matmul row dimension is the
+// source tensor's innermost physical dimension and the matmul column dimension
+// is a prefix dimension. Example: [batch, token, head, dim] is viewed as
+// [batch, head, dim, token], so one output column/token maps to one source tile
+// and output rows/dim walk contiguous columns inside that source tile.
+struct TiledIndexMap {
+  uint32_t source_row_dim;
+  uint32_t source_col_dim;
+};
+
+TiledIndexMap tiled_index_map_for_view(const View &view) {
+  return TiledIndexMap{view.row_dims[0], view.col_dims[0]};
+}
+
+void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const View &view,
+                               uint32_t batch, uint32_t row_tile, uint32_t col_tile,
+                               uint32_t dst_addr, uint32_t tile_bytes,
+                               uint32_t cb_source) {
   zero_tile_at(dst_addr, tile_bytes);
   uint32_t row_base = row_tile * TILE_R;
   uint32_t col_base = col_tile * TILE_C;
   if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
     return;
   }
-  uint32_t heads = view.shape[2];
-  uint32_t batch_index = batch / heads;
-  uint32_t head_index = batch - batch_index * heads;
+
+  uint32_t indices[MAX_RANK];
+  for (uint32_t i = 0; i < MAX_RANK; ++i) {
+    indices[i] = 0;
+  }
+  decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
+  TiledIndexMap map = tiled_index_map_for_view(view);
+  indices[map.source_row_dim] = row_base;
+
   for (uint32_t col = 0; col < TILE_C; ++col) {
-    uint32_t token = col_base + col;
-    if (token >= view.logical_cols) {
+    uint32_t logical_col = col_base + col;
+    if (logical_col >= view.logical_cols) {
       continue;
     }
-    uint32_t source_prefix = batch_index * view.shape[1] + token;
-    uint32_t source_tile =
-        (source_prefix * view.tile_rows + head_index / TILE_R) * view.tiles_per_row + row_tile;
+    indices[map.source_col_dim] = logical_col;
+    uint32_t source_row = 0;
+    uint32_t source_col = 0;
+    uint32_t source_tile = tile_id_for_indices(view, indices, &source_row, &source_col);
     read_source_tile(input, source_tile, cb_source);
     for (uint32_t row = 0; row < TILE_R; ++row) {
       if (row_base + row >= view.logical_rows) {
         continue;
       }
-      copy_element_from_source(cb_source, dst_addr, head_index % TILE_R, row, row, col);
+      copy_element_from_source(cb_source, dst_addr, source_row, source_col + row, row, col);
     }
     cb_pop_front(cb_source, 1);
   }
