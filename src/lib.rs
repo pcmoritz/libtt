@@ -1872,7 +1872,7 @@ fn execute_transpose(
         ));
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    let output_dram = kernels::transpose::transpose_general(
+    let output_dram = kernels::transpose::transpose(
         device,
         input_dram,
         &input_shape,
