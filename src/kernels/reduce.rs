@@ -53,19 +53,12 @@ impl ReduceOp {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum OutputRank {
-    One,
-    Two,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct ReduceKernelShape {
     input_width_tiles: u32,
     valid_last_width: u32,
     output_tiles: u32,
     inner_output_tiles: u32,
     output_tile_rows_per_prefix: u32,
-    output_rank: OutputRank,
     output_dim0: u32,
     output_dim1: u32,
 }
@@ -121,25 +114,23 @@ impl ReducePlan {
         let output_inner_tiles =
             output_allocation_shape[output_allocation_shape.len() - 1] / TILE_C;
         debug_assert_eq!(inner_output_tiles, output_inner_tiles);
-        let (output_rank, output_dim0, output_dim1, output_tile_rows_per_prefix) =
-            match output_shape {
-                [dim] => (OutputRank::One, 1, *dim, 1),
-                [] => {
-                    return Err(invalid_input(
-                        "reduce kernel currently requires rank >= 1 output",
-                    ))
-                }
-                _ => {
-                    let output_rank = output_shape.len();
-                    (
-                        OutputRank::Two,
-                        output_shape[output_rank - 2],
-                        output_shape[output_rank - 1],
-                        output_allocation_shape[output_rank - 2] / TILE_R,
-                    )
-                }
-            };
-        if output_tile_rows_per_prefix == 0 && !matches!(output_rank, OutputRank::One) {
+        let (output_dim0, output_dim1, output_tile_rows_per_prefix) = match output_shape {
+            [dim] => (1, *dim, 1),
+            [] => {
+                return Err(invalid_input(
+                    "reduce kernel currently requires rank >= 1 output",
+                ))
+            }
+            _ => {
+                let rank = output_shape.len();
+                (
+                    output_shape[rank - 2],
+                    output_shape[rank - 1],
+                    output_allocation_shape[rank - 2] / TILE_R,
+                )
+            }
+        };
+        if output_tile_rows_per_prefix == 0 {
             return Err(invalid_input(format!(
                 "reduce output tile rows per prefix must be nonzero for shape {output_shape:?}"
             )));
@@ -158,7 +149,6 @@ impl ReducePlan {
                     output_tile_rows_per_prefix,
                     "output tile rows per prefix",
                 )?,
-                output_rank,
                 output_dim0: u32_arg(output_dim0, "output dim0")?,
                 output_dim1: u32_arg(output_dim1, "output dim1")?,
             },
@@ -331,10 +321,15 @@ fn bool_define(value: bool) -> &'static str {
 }
 
 fn reduce_partition_count(shape: ReduceKernelShape) -> io::Result<u32> {
-    match shape.output_rank {
-        OutputRank::One => Ok(shape.output_tiles),
-        OutputRank::Two => output_tile_rows(shape),
+    if partitions_by_output_tile(shape) {
+        Ok(shape.output_tiles)
+    } else {
+        output_tile_rows(shape)
     }
+}
+
+fn partitions_by_output_tile(shape: ReduceKernelShape) -> bool {
+    shape.output_dim0 == 1 && shape.output_tile_rows_per_prefix == 1
 }
 
 fn reduce_core_ranges(
@@ -356,14 +351,15 @@ fn reduce_core_range(
     partition_offset: u32,
     partitions: u32,
 ) -> io::Result<ReduceCoreRange> {
-    match shape.output_rank {
-        OutputRank::One => Ok(ReduceCoreRange {
+    if partitions_by_output_tile(shape) {
+        Ok(ReduceCoreRange {
             group_offset: partition_offset,
             reduce_groups: partitions,
             output_tile_offset: partition_offset,
             output_tiles: partitions,
-        }),
-        OutputRank::Two => reduce_matrix_core_range(shape, partition_offset, partitions),
+        })
+    } else {
+        reduce_matrix_core_range(shape, partition_offset, partitions)
     }
 }
 
@@ -480,5 +476,27 @@ mod tests {
         assert_eq!(plan.shape.input_width_tiles, 2);
         assert_eq!(plan.shape.valid_last_width, TILE_C as u32);
         assert_eq!(plan.op.padding_identity_bits(), 0.0f32.to_bits());
+    }
+
+    #[test]
+    fn reduce_vector_output_partitions_by_output_tile() {
+        let plan =
+            ReducePlan::new(DType::Float32, &[65, 64], &[65], &[1], ReduceReducer::Add).unwrap();
+
+        assert!(partitions_by_output_tile(plan.shape));
+        assert_eq!(reduce_partition_count(plan.shape).unwrap(), plan.shape.output_tiles);
+    }
+
+    #[test]
+    fn reduce_ranked_output_partitions_by_tile_row() {
+        let plan =
+            ReducePlan::new(DType::Float32, &[2, 65, 64], &[2, 65], &[2], ReduceReducer::Add)
+                .unwrap();
+
+        assert!(!partitions_by_output_tile(plan.shape));
+        assert_eq!(
+            reduce_partition_count(plan.shape).unwrap(),
+            output_tile_rows(plan.shape).unwrap()
+        );
     }
 }
