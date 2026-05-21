@@ -2,7 +2,9 @@ use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
 use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C};
 use crate::hw::CoreCoord;
-use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{
+    select_worker_cores, split_tile_range, DramKernel, Kernel, RuntimeArgsBuilder,
+};
 use std::io;
 
 const READER: &str = include_str!("../../kernels/transpose_reader.cc");
@@ -26,38 +28,6 @@ struct TransposeProgramKey {
     shape: TransposeKernelShape,
 }
 
-struct TransposeKernel {
-    input_addr: u32,
-    output_addr: u32,
-    key: TransposeProgramKey,
-}
-
-impl Kernel<TransposeProgramKey> for TransposeKernel {
-    fn program_key(&self) -> TransposeProgramKey {
-        self.key.clone()
-    }
-
-    fn build_program(&self) -> io::Result<Program> {
-        transpose_program(self.key.clone())
-    }
-
-    #[inline]
-    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            READER_INPUT_ADDR_INDEX => Some(self.input_addr),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
-        }
-    }
-}
-
 pub(crate) fn transpose_rank2(
     device: &mut Device,
     input: &DramBuffer,
@@ -72,14 +42,15 @@ pub(crate) fn transpose_rank2(
     let output_tiles = tiled_shape_tile_count(output_shape)?;
     let output = device.alloc(output_tiles, dtype, &output_allocation_shape, name)?;
     let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
-    let kernel = TransposeKernel {
-        input_addr: u32_addr(input.addr, "input address")?,
+    let kernel = DramKernel {
+        reader_addrs: [u32_addr(input.addr, "input address")?],
         output_addr: u32_addr(output.addr, "output address")?,
         key: TransposeProgramKey {
             cores,
             dtype,
             shape,
         },
+        build: transpose_program,
     };
     kernel.run(device)?;
     Ok(output)

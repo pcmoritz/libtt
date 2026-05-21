@@ -18,7 +18,6 @@ constexpr uint32_t INPUT_TILE_ROWS = BROADCAST_INPUT_TILE_ROWS;
 constexpr uint32_t INPUT_TILES_PER_ROW = BROADCAST_INPUT_TILES_PER_ROW;
 constexpr uint32_t OUTPUT_TILE_ROWS = BROADCAST_OUTPUT_TILE_ROWS;
 constexpr uint32_t OUTPUT_TILES_PER_ROW = BROADCAST_OUTPUT_TILES_PER_ROW;
-constexpr bool DIRECT_COPY = BROADCAST_DIRECT_COPY != 0;
 using Element = BROADCAST_ELEMENT_TYPE;
 
 struct Location {
@@ -91,6 +90,37 @@ void decode_output_batch(uint32_t output_batch, uint32_t output_coords[OUTPUT_CO
     }
   }
 }
+
+constexpr bool column_fill_broadcast() {
+  if constexpr (INPUT_RANK < 2 || OUTPUT_RANK < 2 || INPUT_RANK != OUTPUT_RANK) {
+    return false;
+  }
+  for (uint32_t dim = 0; dim < INPUT_RANK; ++dim) {
+    if (BROADCAST_DIMS[dim] != dim) {
+      return false;
+    }
+  }
+  for (uint32_t dim = 0; dim < INPUT_RANK - 1; ++dim) {
+    if (INPUT_SHAPE[dim] != OUTPUT_SHAPE[dim]) {
+      return false;
+    }
+  }
+  return INPUT_SHAPE[INPUT_RANK - 1] == 1 && OUTPUT_SHAPE[OUTPUT_RANK - 1] > 1;
+}
+
+constexpr bool COLUMN_FILL = column_fill_broadcast();
+
+constexpr bool direct_full_tile_mapping() {
+  if constexpr (INPUT_RANK < 2 || OUTPUT_RANK < 2) {
+    return false;
+  }
+  return BROADCAST_DIMS[INPUT_RANK - 2] == OUTPUT_RANK - 2 &&
+         BROADCAST_DIMS[INPUT_RANK - 1] == OUTPUT_RANK - 1 &&
+         INPUT_SHAPE[INPUT_RANK - 2] == OUTPUT_SHAPE[OUTPUT_RANK - 2] &&
+         INPUT_SHAPE[INPUT_RANK - 1] == OUTPUT_SHAPE[OUTPUT_RANK - 1];
+}
+
+constexpr bool DIRECT_FULL_TILE = direct_full_tile_mapping();
 
 uint32_t output_coord(uint32_t dim, const uint32_t base_output_coords[OUTPUT_COORD_COUNT],
                       uint32_t output_row, uint32_t output_col) {
@@ -172,11 +202,6 @@ void kernel_main() {
   };
   for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
     uint32_t output_tile_id = output_tile_offset + tile;
-    if constexpr (DIRECT_COPY) {
-      read_output_tile(input, output_tile_id, cb_output);
-      continue;
-    }
-
     uint32_t output_matrix_tiles = OUTPUT_TILE_ROWS * OUTPUT_TILES_PER_ROW;
     uint32_t output_batch = output_tile_id / output_matrix_tiles;
     uint32_t output_matrix_tile = output_tile_id % output_matrix_tiles;
@@ -195,8 +220,38 @@ void kernel_main() {
       col_count = tile_extent(OUTPUT_SHAPE[OUTPUT_RANK - 1], output_col_base, TILE_C);
     }
 
+    if constexpr (COLUMN_FILL) {
+      uint32_t input_tile =
+          (output_batch * INPUT_TILE_ROWS + output_tile_row) * INPUT_TILES_PER_ROW;
+      read_input_tile(input, input_tile, cb_input);
+
+      cb_reserve_back(cb_output, 1);
+      zero_tile(cb_output);
+      volatile tt_l1_ptr Element *source =
+          reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_input));
+      volatile tt_l1_ptr Element *output =
+          reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
+      for (uint32_t row = 0; row < row_count; ++row) {
+        const Element value = source[tile_element_index(row, 0)];
+        for (uint32_t col = 0; col < col_count; ++col) {
+          output[tile_element_index(row, col)] = value;
+        }
+      }
+      cb_pop_front(cb_input, 1);
+      cb_push_back(cb_output, 1);
+      continue;
+    }
+
     uint32_t base_output_coords[OUTPUT_COORD_COUNT];
     decode_output_batch(output_batch, base_output_coords);
+
+    if constexpr (DIRECT_FULL_TILE) {
+      Location source = input_location(base_output_coords, output_row_base, output_col_base);
+      if (source.row == 0 && source.col == 0) {
+        read_output_tile(input, source.tile, cb_output);
+        continue;
+      }
+    }
 
     uint32_t loaded_input_tile = INVALID_TILE;
     cb_reserve_back(cb_output, 1);
