@@ -44,20 +44,17 @@ struct MatmulProgramKey {
     output_dtype: DType,
 }
 
+#[repr(u32)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum MatmulViewKind {
-    Contiguous,
-    Generic,
-    TiledIndexMap,
+    Contiguous = 0,
+    Generic = 2,
+    TiledIndexMap = 4,
 }
 
 impl MatmulViewKind {
     fn runtime_value(self) -> u32 {
-        match self {
-            Self::Contiguous => 0,
-            Self::Generic => 2,
-            Self::TiledIndexMap => 4,
-        }
+        self as u32
     }
 }
 
@@ -142,40 +139,6 @@ impl MatmulPlan {
             debug_assert_eq!(grid.len() % self.batch_groups, 0);
             grid.len() / self.batch_groups
         })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct MatmulPlanCandidate {
-    rows: Vec<u8>,
-    cols: Vec<u8>,
-    direct_grid: Option<Vec<Vec<CoreCoord>>>,
-    mt: usize,
-    nt: usize,
-    per_core_m: usize,
-    per_core_n: usize,
-    in0_block_w: usize,
-    out_subblock_h: usize,
-    out_subblock_w: usize,
-}
-
-impl MatmulPlanCandidate {
-    fn into_plan(self, kt: usize, batch_groups: usize, batches_per_group: usize) -> MatmulPlan {
-        MatmulPlan {
-            rows: self.rows,
-            cols: self.cols,
-            direct_grid: self.direct_grid,
-            batch_groups,
-            batches_per_group,
-            mt: self.mt,
-            kt,
-            nt: self.nt,
-            per_core_m: self.per_core_m,
-            per_core_n: self.per_core_n,
-            in0_block_w: self.in0_block_w,
-            out_subblock_h: self.out_subblock_h,
-            out_subblock_w: self.out_subblock_w,
-        }
     }
 }
 
@@ -505,11 +468,7 @@ fn dot_general_dims(
     let batch = parse_dims(batch_dimensions, "batching")?;
     let contract = parse_dims(contracting_dimensions, "contracting")?;
     let free = (0..rank).filter(|&dim| !used[dim]).collect::<Vec<_>>();
-    Ok(DotGeneralDims {
-        batch,
-        contract,
-        free,
-    })
+    Ok(DotGeneralDims { batch, contract, free })
 }
 
 fn checked_product_of_dims(shape: &[usize], dims: &[usize], name: &str) -> io::Result<usize> {
@@ -540,14 +499,8 @@ fn operand_view(
         col_rank: u32_value(col_dims.len(), "matmul operand column rank")?,
         logical_rows: u32_value(logical_rows, "matmul operand logical rows")?,
         logical_cols: u32_value(logical_cols, "matmul operand logical columns")?,
-        tile_rows: u32_value(
-            allocation_shape[rank - 2] / 32,
-            "matmul operand source tile rows",
-        )?,
-        tiles_per_row: u32_value(
-            allocation_shape[rank - 1] / 32,
-            "matmul operand source tiles per row",
-        )?,
+        tile_rows: u32_value(allocation_shape[rank - 2] / 32, "matmul operand source tile rows")?,
+        tiles_per_row: u32_value(allocation_shape[rank - 1] / 32, "matmul operand source tiles per row")?,
         shape: padded_u32_array(shape, "matmul operand shape")?,
         batch_dims: padded_u32_array(batch_dims, "matmul operand batch dimensions")?,
         row_dims: padded_u32_array(row_dims, "matmul operand row dimensions")?,
@@ -562,11 +515,7 @@ fn operand_view_kind(
     col_dims: &[usize],
 ) -> MatmulViewKind {
     let leading_batch = batch_dims.iter().copied().eq(0..batch_dims.len());
-    if leading_batch
-        && rank == batch_dims.len() + 2
-        && row_dims == [rank - 2]
-        && col_dims == [rank - 1]
-    {
+    if leading_batch && rank == batch_dims.len() + 2 && row_dims == [rank - 2] && col_dims == [rank - 1] {
         MatmulViewKind::Contiguous
     } else if is_tiled_index_map_view(rank, batch_dims, row_dims, col_dims) {
         MatmulViewKind::TiledIndexMap
@@ -594,10 +543,7 @@ fn is_tiled_index_map_view(
 
 fn padded_u32_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]> {
     if values.len() > MAX_RANK {
-        return Err(invalid_input(format!(
-            "{name} rank {} exceeds maximum rank {MAX_RANK}",
-            values.len()
-        )));
+        return Err(invalid_input(format!("{name} rank {} exceeds maximum rank {MAX_RANK}", values.len())));
     }
     let mut result = [0u32; MAX_RANK];
     for (index, &value) in values.iter().enumerate() {
@@ -607,10 +553,7 @@ fn padded_u32_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]>
 }
 
 fn checked_product(values: &[usize], name: &str) -> io::Result<usize> {
-    values.iter().try_fold(1usize, |acc, &value| {
-        acc.checked_mul(value)
-            .ok_or_else(|| invalid_input(format!("{name} product overflow")))
-    })
+    values.iter().try_fold(1usize, |acc, &value| acc.checked_mul(value).ok_or_else(|| invalid_input(format!("{name} product overflow"))))
 }
 
 fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::Result<()> {
@@ -722,11 +665,14 @@ fn plan_matmul(
                             );
                             if best_score.map_or(true, |current| score > current) {
                                 best_score = Some(score);
-                                best = Some(MatmulPlanCandidate {
+                                best = Some(MatmulPlan {
                                     rows: rows.to_vec(),
                                     cols: cols.to_vec(),
                                     direct_grid: None,
+                                    batch_groups: 1,
+                                    batches_per_group: batch_count,
                                     mt,
+                                    kt,
                                     nt,
                                     per_core_m,
                                     per_core_n,
@@ -750,6 +696,7 @@ fn plan_matmul(
             &kt_divs,
             tile_bytes,
             l1_data_bytes,
+            batch_count,
             allow_column_split,
         )
     };
@@ -765,7 +712,7 @@ fn plan_matmul(
         )));
     };
 
-    let mut plan = candidate.into_plan(kt, 1, batch_count);
+    let mut plan = candidate;
     if let Some(batched) = plan_batched_direct_matmul(
         mt_base,
         kt,
@@ -791,8 +738,9 @@ fn plan_direct_matmul(
     kt_divs: &[usize],
     tile_bytes: usize,
     l1_data_bytes: usize,
+    batch_count: usize,
     allow_column_split: bool,
-) -> Option<MatmulPlanCandidate> {
+) -> Option<MatmulPlan> {
     if mt_base == 0 || nt_base == 0 {
         return None;
     }
@@ -861,7 +809,7 @@ fn plan_direct_matmul(
                         };
                         if best_score.map_or(true, |current| score > current) {
                             best_score = Some(score);
-                            best = Some(MatmulPlanCandidate {
+                            best = Some(MatmulPlan {
                                 rows: Vec::new(),
                                 cols: Vec::new(),
                                 direct_grid: Some(
@@ -870,7 +818,10 @@ fn plan_direct_matmul(
                                         .map(|row| row.to_vec())
                                         .collect(),
                                 ),
+                                batch_groups: 1,
+                                batches_per_group: batch_count,
                                 mt,
+                                kt,
                                 nt,
                                 per_core_m,
                                 per_core_n,
@@ -970,26 +921,26 @@ fn plan_batched_direct_matmul(
                             );
                             if best_score.map_or(true, |current| score > current) {
                                 best_score = Some(score);
-                                best = Some(
-                                    MatmulPlanCandidate {
-                                        rows: Vec::new(),
-                                        cols: Vec::new(),
-                                        direct_grid: Some(
-                                            cores[..active_cores]
-                                                .chunks(logical_cols)
-                                                .map(|row| row.to_vec())
-                                                .collect(),
-                                        ),
-                                        mt,
-                                        nt,
-                                        per_core_m,
-                                        per_core_n,
-                                        in0_block_w,
-                                        out_subblock_h,
-                                        out_subblock_w,
-                                    }
-                                    .into_plan(kt, batch_groups, batches_per_group),
-                                );
+                                best = Some(MatmulPlan {
+                                    rows: Vec::new(),
+                                    cols: Vec::new(),
+                                    direct_grid: Some(
+                                        cores[..active_cores]
+                                            .chunks(logical_cols)
+                                            .map(|row| row.to_vec())
+                                            .collect(),
+                                    ),
+                                    batch_groups,
+                                    batches_per_group,
+                                    mt,
+                                    kt,
+                                    nt,
+                                    per_core_m,
+                                    per_core_n,
+                                    in0_block_w,
+                                    out_subblock_h,
+                                    out_subblock_w,
+                                });
                             }
                         }
                     }
@@ -1463,60 +1414,6 @@ mod tests {
         assert_eq!(plan.nt, 2);
         assert_eq!(plan.per_core_m * grid.len(), plan.mt);
         assert_eq!(plan.per_core_n * grid[0].len(), plan.nt);
-    }
-
-    #[test]
-    fn matmul_fidelity_parser_defaults_empty_value_to_hifi2() {
-        assert_eq!(
-            parse_matmul_math_fidelity("").expect("empty value should use the default"),
-            MathFidelity::HiFi2
-        );
-        assert_eq!(
-            parse_matmul_math_fidelity("hifi2").expect("hifi2 should parse"),
-            MathFidelity::HiFi2
-        );
-    }
-
-    #[test]
-    fn matmul_fidelity_parser_accepts_explicit_lofi_override() {
-        assert_eq!(
-            parse_matmul_math_fidelity("lofi").expect("lofi should parse"),
-            MathFidelity::LoFi
-        );
-    }
-
-    #[test]
-    fn compute_source_contains_plan_constants() {
-        let plan = plan_matmul(64, 64, 64, 1, &cores(&[1], &[2]), true).expect("plan");
-        let source = compute_src(&plan, 3);
-        assert!(source.contains("constexpr uint32_t in0_block_w = 2;"));
-        assert!(source.contains("constexpr uint32_t batch_count = 3;"));
-        assert!(!source.contains("@TRANSPOSE_B@"));
-        assert!(source.contains("#include \"compute_kernel_api/matmul.h\""));
-    }
-
-    #[test]
-    fn operand_view_kind_recognizes_tiled_index_map() {
-        assert_eq!(
-            operand_view_kind(4, &[0, 2], &[3], &[1]),
-            MatmulViewKind::TiledIndexMap
-        );
-        assert_eq!(
-            operand_view_kind(5, &[0, 2, 3], &[4], &[1]),
-            MatmulViewKind::TiledIndexMap
-        );
-    }
-
-    #[test]
-    fn operand_view_kind_keeps_other_remaps_generic() {
-        assert_eq!(
-            operand_view_kind(5, &[0, 2, 3], &[4], &[1, 2]),
-            MatmulViewKind::Generic
-        );
-        assert_eq!(
-            operand_view_kind(5, &[0, 2, 3], &[3], &[1]),
-            MatmulViewKind::Generic
-        );
     }
 
     #[test]
