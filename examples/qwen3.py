@@ -33,6 +33,7 @@ class Qwen3Config:
     rms_norm_eps: float = 1e-6
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
+    eos_token_id: int | tuple[int, ...] | None = 151645
 
     def __post_init__(self):
         if self.num_attention_heads % self.num_key_value_heads != 0:
@@ -43,6 +44,7 @@ class Qwen3Config:
 
 class ByteTokenizer:
     bos_token_id = 256
+    eos_token_id = 257
 
     def encode(self, text: str, add_bos: bool = True) -> np.ndarray:
         tokens = list(text.encode("utf-8", errors="replace"))
@@ -58,6 +60,7 @@ class ByteTokenizer:
 class HuggingFaceTokenizer:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
+        self.eos_token_id = tokenizer.eos_token_id
 
     def encode(self, text: str, raw_prompt: bool, thinking: bool) -> np.ndarray:
         if not raw_prompt and getattr(self.tokenizer, "chat_template", None):
@@ -98,6 +101,8 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-k", type=int, default=32)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--intermediate-size", type=int, default=384)
@@ -122,6 +127,7 @@ def make_random_config(args) -> Qwen3Config:
         max_position_embeddings=args.max_seq_len or 512,
         rope_theta=10000.0,
         tie_word_embeddings=False,
+        eos_token_id=ByteTokenizer.eos_token_id,
     )
 
 
@@ -129,6 +135,12 @@ def load_hf_config(model_dir: Path, max_seq_len: int | None) -> Qwen3Config:
     config_path = model_dir / "config.json"
     with config_path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
+
+    eos_token_id = raw.get("eos_token_id")
+    if isinstance(eos_token_id, list):
+        eos_token_id = tuple(int(token) for token in eos_token_id)
+    elif eos_token_id is not None:
+        eos_token_id = int(eos_token_id)
 
     config = Qwen3Config(
         vocab_size=int(raw["vocab_size"]),
@@ -143,6 +155,7 @@ def load_hf_config(model_dir: Path, max_seq_len: int | None) -> Qwen3Config:
         rms_norm_eps=float(raw.get("rms_norm_eps", 1e-6)),
         initializer_range=float(raw.get("initializer_range", 0.02)),
         tie_word_embeddings=bool(raw.get("tie_word_embeddings", False)),
+        eos_token_id=eos_token_id,
     )
 
     if max_seq_len is not None:
@@ -202,14 +215,6 @@ def select_device(backend: str):
 
 def normal(rng: np.random.Generator, shape, std, dtype):
     return rng.normal(0.0, std, shape).astype(dtype)
-
-
-def precompute_rope_cos_sin(config: Qwen3Config, seq_len: int, dtype):
-    position_ids = np.arange(seq_len, dtype=np.float32)[:, None]
-    inv_freq = 1.0 / (config.rope_theta ** (np.arange(0, config.head_dim, 2, dtype=np.float32) / config.head_dim))
-    freqs = position_ids * inv_freq[None, :]
-    emb = np.concatenate((freqs, freqs), axis=-1)
-    return np.ascontiguousarray(np.cos(emb).astype(dtype)), np.ascontiguousarray(np.sin(emb).astype(dtype))
 
 
 def init_weights(config: Qwen3Config, seed: int, np_dtype):
@@ -372,16 +377,22 @@ def rotate_half(x):
     return jnp.concatenate((-x[..., half:], x[..., :half]), axis=-1)
 
 
+def rope_cos_sin(config: Qwen3Config, seq_len: int):
+    position_ids = jnp.arange(seq_len, dtype=jnp.float32)[:, None]
+    inv_freq = 1.0 / (
+        config.rope_theta
+        ** (jnp.arange(0, config.head_dim, 2, dtype=jnp.float32) / config.head_dim)
+    )
+    freqs = position_ids * inv_freq[None, :]
+    emb = jnp.concatenate((freqs, freqs), axis=-1)
+    return jnp.cos(emb), jnp.sin(emb)
+
+
 def apply_rope(x, cos, sin):
     return (x * cos[:, None, :] + rotate_half(x) * sin[:, None, :]).astype(x.dtype)
 
 
-def causal_attention_bias(seq_len: int):
-    position_ids = jnp.arange(seq_len)
-    return jnp.where(position_ids[None, :] > position_ids[:, None], -1.0e9, 0.0)[None, None, :, :]
-
-
-def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin, causal_bias, cache=None):
+def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin):
     seq_len = hidden_states.shape[0]
     query_states = hidden_states @ layer["q_proj"]
     key_states = hidden_states @ layer["k_proj"]
@@ -396,17 +407,31 @@ def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin, causal_b
     query_states = apply_rope(query_states, cos, sin)
     key_states = apply_rope(key_states, cos, sin)
 
-    key_cache = key_states.reshape((seq_len, -1))
-    value_cache = value_states.reshape((seq_len, -1))
-    if cache is not None:
-        key_cache = jnp.concatenate((cache[0], key_cache), axis=0)
-        value_cache = jnp.concatenate((cache[1], value_cache), axis=0)
-    key_states = key_cache.reshape((key_cache.shape[0], config.num_key_value_heads, config.head_dim))
-    value_states = value_cache.reshape((value_cache.shape[0], config.num_key_value_heads, config.head_dim))
+    repeats = config.num_attention_heads // config.num_key_value_heads
+    key_states = jnp.repeat(key_states, repeats, axis=1)
+    value_states = jnp.repeat(value_states, repeats, axis=1)
 
-    attn_output = jax.nn.dot_product_attention(query_states, key_states, value_states, bias=causal_bias, implementation="xla")
-    output = attn_output.reshape(seq_len, -1) @ layer["o_proj"]
-    return output, (key_cache, value_cache)
+    scores = jnp.stack(
+        [
+            query_states[:, head, :] @ key_states[:, head, :].T
+            for head in range(config.num_attention_heads)
+        ],
+        axis=1,
+    )
+    scores = scores.astype(jnp.float32) * (config.head_dim**-0.5)
+    position_ids = jnp.arange(seq_len)
+    causal_mask = position_ids[None, :] > position_ids[:, None]
+    scores = jnp.where(causal_mask[:, None, :], -1.0e9, scores)
+    probs = jax.nn.softmax(scores, axis=-1).astype(hidden_states.dtype)
+    attn_output = jnp.stack(
+        [
+            probs[:, head, :] @ value_states[:, head, :]
+            for head in range(config.num_attention_heads)
+        ],
+        axis=1,
+    )
+    attn_output = attn_output.reshape(seq_len, -1)
+    return attn_output @ layer["o_proj"]
 
 
 def mlp(hidden_states, layer):
@@ -415,37 +440,59 @@ def mlp(hidden_states, layer):
     return (gate * up) @ layer["down_proj"]
 
 
-def qwen3_forward(config: Qwen3Config, weights, input_ids, caches=None):
-    input_ids = input_ids.reshape((-1,))
-    seq_len = input_ids.shape[0]
-    if caches is not None and seq_len != 1:
-        raise ValueError("cached decode expects exactly one new token")
-    cache_len = 0 if caches is None else caches[0][0].shape[0]
+def qwen3_forward(config: Qwen3Config, weights, input_ids):
     hidden_states = weights["embed_tokens"][input_ids]
-    cos = weights["rope_cos"][cache_len : cache_len + seq_len]
-    sin = weights["rope_sin"][cache_len : cache_len + seq_len]
-    causal_bias = causal_attention_bias(seq_len) if caches is None else None
-    new_caches = []
-    layer_caches = caches if caches is not None else (None,) * len(weights["layers"])
-    if len(layer_caches) != len(weights["layers"]):
-        raise ValueError("KV cache must have one entry per decoder layer")
-    for layer, cache in zip(weights["layers"], layer_caches):
+    cos, sin = rope_cos_sin(config, input_ids.shape[0])
+    cos = cos.astype(hidden_states.dtype)
+    sin = sin.astype(hidden_states.dtype)
+
+    for layer in weights["layers"]:
         residual = hidden_states
         hidden_states = rms_norm(hidden_states, layer["input_norm"], config.rms_norm_eps)
-        attn_output, new_cache = self_attention(config, hidden_states, layer, cos, sin, causal_bias, cache)
-        new_caches.append(new_cache)
-        hidden_states = residual + attn_output
+        hidden_states = residual + self_attention(config, hidden_states, layer, cos, sin)
 
         residual = hidden_states
-        hidden_states = rms_norm(hidden_states, layer["post_attention_norm"], config.rms_norm_eps)
+        hidden_states = rms_norm(
+            hidden_states, layer["post_attention_norm"], config.rms_norm_eps
+        )
         hidden_states = residual + mlp(hidden_states, layer)
-    return rms_norm(hidden_states, weights["norm"], config.rms_norm_eps), tuple(new_caches)
+
+    hidden_states = rms_norm(hidden_states, weights["norm"], config.rms_norm_eps)
+    if "lm_head" in weights:
+        return hidden_states @ weights["lm_head"]
+    return hidden_states @ weights["embed_tokens"].T
 
 
-def qwen3_next_logits_and_cache(config: Qwen3Config, weights, input_ids, caches=None):
-    hidden_states, caches = qwen3_forward(config, weights, input_ids, caches=caches)
-    head = weights["lm_head"] if "lm_head" in weights else weights["embed_tokens"].T
-    return (hidden_states[-1:, :] @ head)[0], caches
+def sample_next_token(
+    decode_output, rng: np.random.Generator, temperature: float, top_k: int
+) -> int:
+    if isinstance(decode_output, (list, tuple)) and len(decode_output) == 2:
+        logits, token_ids = decode_output
+        top_k = 0
+    else:
+        logits, token_ids = decode_output, None
+
+    logits = np.asarray(logits, dtype=np.float32)
+    token_ids = (
+        np.arange(logits.size, dtype=np.int32)
+        if token_ids is None
+        else np.asarray(token_ids, dtype=np.int32)
+    )
+
+    logits = logits.reshape(-1)
+    token_ids = token_ids.reshape(-1)
+    if 0 < top_k < logits.size:
+        top = np.lexsort((token_ids, -logits))[:top_k]
+        logits = logits[top]
+        token_ids = token_ids[top]
+
+    if temperature <= 0:
+        return int(token_ids[np.argmax(logits)])
+
+    logits = logits / temperature
+    probs = np.exp(logits - np.max(logits))
+    probs = probs / np.sum(probs)
+    return int(rng.choice(token_ids, p=probs))
 
 
 def count_parameters(weights) -> int:
@@ -454,27 +501,39 @@ def count_parameters(weights) -> int:
 
 
 def make_decode_step(config, device, args):
-    def greedy_tokens(model_weights, ids):
-        logits, caches = qwen3_next_logits_and_cache(config, model_weights, ids)
-        token = jax.lax.top_k(logits, 1)[1][0].astype(jnp.int32)
-        generated = [token.reshape((1, 1))]
-        for _ in range(1, args.max_new_tokens):
-            logits, caches = qwen3_next_logits_and_cache(config, model_weights, token, caches)
-            token = jax.lax.top_k(logits, 1)[1][0].astype(jnp.int32)
-            generated.append(token.reshape((1, 1)))
-        return jnp.concatenate(generated, axis=0)
+    def logits(model_weights, ids):
+        return qwen3_forward(config, model_weights, ids)[-1]
 
-    return jax.jit(greedy_tokens, device=device)
+    device_top_k = 1 if args.temperature <= 0 else args.top_k
+    if 0 < device_top_k <= 32 and device_top_k < config.vocab_size:
+        return jax.jit(
+            lambda model_weights, ids: jax.lax.top_k(
+                logits(model_weights, ids), device_top_k
+            ),
+            device=device,
+        )
+
+    return jax.jit(logits, device=device)
 
 
 def generate(config, weights, device, input_ids, args, decode_step):
+    rng = np.random.default_rng(args.seed + 1)
     tokens = input_ids.astype(np.int32).copy()
+    eos_token_ids = config.eos_token_id
+    if isinstance(eos_token_ids, int):
+        eos_token_ids = (eos_token_ids,)
 
-    if args.max_new_tokens == 0:
-        return tokens
-    ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
-    generated = np.asarray(decode_step(weights, ids), dtype=np.int32).reshape(-1)
-    return np.concatenate((tokens, generated))
+    for _ in range(args.max_new_tokens):
+        ids = jax.device_put(jnp.asarray(tokens, dtype=jnp.int32), device)
+        next_token = sample_next_token(
+            decode_step(weights, ids), rng, args.temperature, args.top_k
+        )
+        tokens = np.append(tokens, np.int32(next_token))
+        if eos_token_ids is not None and next_token in eos_token_ids:
+            break
+        if tokens.size >= config.max_position_embeddings:
+            break
+    return tokens
 
 
 def timed_generate(config, weights, device, input_ids, args, decode_step):
@@ -507,7 +566,6 @@ def main():
             "prompt plus generation length exceeds --max-seq-len: "
             f"{input_ids.size + args.max_new_tokens} > {config.max_position_embeddings}"
         )
-    weights_host["rope_cos"], weights_host["rope_sin"] = precompute_rope_cos_sin(config, input_ids.size + args.max_new_tokens, np_dtype)
 
     device = select_device(args.backend)
     weights = jax.device_put(weights_host, device)
