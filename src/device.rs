@@ -120,6 +120,9 @@ trait Dispatcher {
         setup_records: &[Vec<u8>],
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()>;
+    fn finish(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Dispatcher for FastDispatcher {
@@ -135,6 +138,10 @@ impl Dispatcher for FastDispatcher {
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
         FastDispatcher::launch(self, program, setup_records, runtime_args)
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        FastDispatcher::finish(self)
     }
 }
 
@@ -399,6 +406,10 @@ impl Device {
             .launch(&program, setup, setup_records, &launch.runtime_args)?;
         self.staged_cached_program = Some(program_id);
         Ok(())
+    }
+
+    pub(crate) fn finish_dispatch(&mut self) -> io::Result<()> {
+        self.dispatcher.finish()
     }
 
     pub fn alloc(

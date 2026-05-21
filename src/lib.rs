@@ -2942,6 +2942,7 @@ fn execute_executable_v1(
             )?,
         }
     }
+    device.finish_dispatch().map_err(io_error)?;
 
     let mut outputs = Vec::with_capacity(plan.output_ids.len());
     for (index, &output_id) in plan.output_ids.iter().enumerate() {
