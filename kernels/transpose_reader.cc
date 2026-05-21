@@ -1,5 +1,7 @@
 #include <cstdint>
+
 namespace {
+
 constexpr uint32_t TILE_R = 32;
 constexpr uint32_t TILE_C = 32;
 constexpr uint32_t FACE_R = 16;
@@ -18,10 +20,7 @@ constexpr uint32_t OUTPUT_TILES_PER_ROW = (OUTPUT_COLS + TILE_C - 1) / TILE_C;
 constexpr uint32_t OUTPUT_MATRIX_TILES =
     ((OUTPUT_ROWS + TILE_R - 1) / TILE_R) * OUTPUT_TILES_PER_ROW;
 using Element = TRANSPOSE_ELEMENT_TYPE;
-constexpr uint32_t ARG_INPUT_ADDR = 0;
-constexpr uint32_t ARG_OUTPUT_TILE_OFFSET = 1;
-constexpr uint32_t ARG_OUTPUT_TILE_COUNT = 2;
-uint32_t A(uint32_t index) { return get_arg_val<uint32_t>(index); }
+
 uint32_t tile_element_index(uint32_t row, uint32_t col) {
   uint32_t face_row = row / FACE_R;
   uint32_t face_col = col / FACE_C;
@@ -29,6 +28,7 @@ uint32_t tile_element_index(uint32_t row, uint32_t col) {
   uint32_t col_in_face = col % FACE_C;
   return ((face_row * 2 + face_col) * FACE_R * FACE_C) + row_in_face * FACE_C + col_in_face;
 }
+
 void zero_tile(uint32_t cb) {
   volatile tt_l1_ptr uint32_t *ptr =
       reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_write_ptr(cb));
@@ -37,13 +37,16 @@ void zero_tile(uint32_t cb) {
     ptr[i] = 0;
   }
 }
-void read_input_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile_id, uint32_t cb) {
+
+void read_input_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile_id,
+                     uint32_t cb) {
   cb_reserve_back(cb, 1);
   noc_async_read_tile(tile_id, input, get_write_ptr(cb));
   noc_async_read_barrier();
   cb_push_back(cb, 1);
   cb_wait_front(cb, 1);
 }
+
 void ensure_input_tile(const InterleavedAddrGenFast<true> &input, uint32_t requested_tile,
                        uint32_t *loaded_tile) {
   constexpr uint32_t cb_input = tt::CBIndex::c_0;
@@ -56,15 +59,17 @@ void ensure_input_tile(const InterleavedAddrGenFast<true> &input, uint32_t reque
   read_input_tile(input, requested_tile, cb_input);
   *loaded_tile = requested_tile;
 }
-void copy_element(uint32_t source_row, uint32_t source_col, uint32_t output_row,
-                  uint32_t output_col) {
+
+void copy_element(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
+                  uint32_t source_col, uint32_t output_row, uint32_t output_col) {
   volatile tt_l1_ptr Element *source =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(tt::CBIndex::c_0));
+      reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_input));
   volatile tt_l1_ptr Element *output =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(tt::CBIndex::c_16));
+      reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
   output[tile_element_index(output_row, output_col)] =
       source[tile_element_index(source_row, source_col)];
 }
+
 void decompose_prefix(uint32_t flat, uint32_t *indices) {
   for (int32_t dim = static_cast<int32_t>(RANK) - 3; dim >= 0; --dim) {
     uint32_t extent = OUTPUT_SHAPE[dim];
@@ -72,10 +77,9 @@ void decompose_prefix(uint32_t flat, uint32_t *indices) {
     flat /= extent;
   }
 }
-uint32_t tile_id_for_indices(
-    const uint32_t *indices,
-    uint32_t *row_in_tile,
-    uint32_t *col_in_tile) {
+
+uint32_t tile_id_for_indices(const uint32_t *indices, uint32_t *row_in_tile,
+                             uint32_t *col_in_tile) {
   uint32_t prefix = 0;
   for (uint32_t dim = 0; dim + 2 < RANK; ++dim) {
     prefix = prefix * INPUT_SHAPE[dim] + indices[dim];
@@ -86,20 +90,26 @@ uint32_t tile_id_for_indices(
   *col_in_tile = col % TILE_C;
   return (prefix * INPUT_TILE_ROWS + row / TILE_R) * INPUT_TILES_PER_ROW + col / TILE_C;
 }
+
 }  // namespace
+
 void kernel_main() {
+  uint32_t input_addr = get_arg_val<uint32_t>(0);
+  uint32_t output_tile_offset = get_arg_val<uint32_t>(1);
+  uint32_t output_tile_count = get_arg_val<uint32_t>(2);
+
   constexpr uint32_t cb_input = tt::CBIndex::c_0;
   constexpr uint32_t cb_output = tt::CBIndex::c_16;
   const InterleavedAddrGenFast<true> input = {
-      .bank_base_address = A(ARG_INPUT_ADDR),
+      .bank_base_address = input_addr,
       .page_size = get_tile_size(cb_input),
       .data_format = get_dataformat(cb_input),
   };
 
   uint32_t output_indices[MAX_RANK];
   uint32_t input_indices[MAX_RANK];
-  for (uint32_t tile = 0; tile < A(ARG_OUTPUT_TILE_COUNT); ++tile) {
-    uint32_t output_tile_id = A(ARG_OUTPUT_TILE_OFFSET) + tile;
+  for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
+    uint32_t output_tile_id = output_tile_offset + tile;
     uint32_t output_prefix = output_tile_id / OUTPUT_MATRIX_TILES;
     uint32_t output_matrix_tile = output_tile_id % OUTPUT_MATRIX_TILES;
     uint32_t output_tile_row = output_matrix_tile / OUTPUT_TILES_PER_ROW;
@@ -107,8 +117,10 @@ void kernel_main() {
     uint32_t output_row_base = output_tile_row * TILE_R;
     uint32_t output_col_base = output_tile_col * TILE_C;
     uint32_t loaded_input_tile = INVALID_TILE;
+
     cb_reserve_back(cb_output, 1);
     zero_tile(cb_output);
+
     decompose_prefix(output_prefix, output_indices);
     for (uint32_t row = 0; row < TILE_R; ++row) {
       uint32_t output_row = output_row_base + row;
@@ -121,6 +133,7 @@ void kernel_main() {
         if (output_col >= OUTPUT_COLS) {
           continue;
         }
+
         output_indices[RANK - 1] = output_col;
         for (uint32_t dim = 0; dim < RANK; ++dim) {
           input_indices[PERMUTATION[dim]] = output_indices[dim];
@@ -129,9 +142,10 @@ void kernel_main() {
         uint32_t input_col = 0;
         uint32_t input_tile = tile_id_for_indices(input_indices, &input_row, &input_col);
         ensure_input_tile(input, input_tile, &loaded_input_tile);
-        copy_element(input_row, input_col, row, col);
+        copy_element(cb_input, cb_output, input_row, input_col, row, col);
       }
     }
+
     if (loaded_input_tile != INVALID_TILE) {
       cb_pop_front(cb_input, 1);
     }
