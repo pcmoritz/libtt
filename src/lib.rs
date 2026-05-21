@@ -2458,28 +2458,6 @@ fn execute_iota(
     )
 }
 
-struct DispatchFinishGuard {
-    device: *mut Device,
-}
-
-impl DispatchFinishGuard {
-    fn new(device: &mut Device) -> Self {
-        Self { device }
-    }
-
-    fn finish_now(&mut self) -> io::Result<()> {
-        let device = unsafe { &mut *self.device };
-        device.finish_dispatch()
-    }
-}
-
-impl Drop for DispatchFinishGuard {
-    fn drop(&mut self) {
-        let device = unsafe { &mut *self.device };
-        let _ = device.finish_dispatch();
-    }
-}
-
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
     execute_device: *mut PJRT_Device,
@@ -2499,7 +2477,6 @@ fn execute_executable_v1(
         local_hardware_id: target_local_hardware_id,
     };
     let device = &mut target_device.runtime;
-    let mut dispatch_finish = DispatchFinishGuard::new(device);
 
     for op in &plan.ops {
         match op {
@@ -2960,7 +2937,7 @@ fn execute_executable_v1(
             )?,
         }
     }
-    dispatch_finish.finish_now().map_err(io_error)?;
+    device.finish_dispatch().map_err(io_error)?;
 
     let mut outputs = Vec::with_capacity(plan.output_ids.len());
     for (index, &output_id) in plan.output_ids.iter().enumerate() {
