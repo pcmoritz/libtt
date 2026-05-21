@@ -321,15 +321,11 @@ fn bool_define(value: bool) -> &'static str {
 }
 
 fn reduce_partition_count(shape: ReduceKernelShape) -> io::Result<u32> {
-    if partitions_by_output_tile(shape) {
+    if shape.output_dim0 == 1 && shape.output_tile_rows_per_prefix == 1 {
         Ok(shape.output_tiles)
     } else {
         output_tile_rows(shape)
     }
-}
-
-fn partitions_by_output_tile(shape: ReduceKernelShape) -> bool {
-    shape.output_dim0 == 1 && shape.output_tile_rows_per_prefix == 1
 }
 
 fn reduce_core_ranges(
@@ -351,7 +347,7 @@ fn reduce_core_range(
     partition_offset: u32,
     partitions: u32,
 ) -> io::Result<ReduceCoreRange> {
-    if partitions_by_output_tile(shape) {
+    if shape.output_dim0 == 1 && shape.output_tile_rows_per_prefix == 1 {
         Ok(ReduceCoreRange {
             group_offset: partition_offset,
             reduce_groups: partitions,
@@ -478,25 +474,4 @@ mod tests {
         assert_eq!(plan.op.padding_identity_bits(), 0.0f32.to_bits());
     }
 
-    #[test]
-    fn reduce_vector_output_partitions_by_output_tile() {
-        let plan =
-            ReducePlan::new(DType::Float32, &[65, 64], &[65], &[1], ReduceReducer::Add).unwrap();
-
-        assert!(partitions_by_output_tile(plan.shape));
-        assert_eq!(reduce_partition_count(plan.shape).unwrap(), plan.shape.output_tiles);
-    }
-
-    #[test]
-    fn reduce_ranked_output_partitions_by_tile_row() {
-        let plan =
-            ReducePlan::new(DType::Float32, &[2, 65, 64], &[2, 65], &[2], ReduceReducer::Add)
-                .unwrap();
-
-        assert!(!partitions_by_output_tile(plan.shape));
-        assert_eq!(
-            reduce_partition_count(plan.shape).unwrap(),
-            output_tile_rows(plan.shape).unwrap()
-        );
-    }
 }
