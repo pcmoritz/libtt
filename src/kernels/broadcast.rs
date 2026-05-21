@@ -4,7 +4,9 @@ use crate::dram::{
     tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R,
 };
 use crate::hw::CoreCoord;
-use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
+use crate::kernels::kernel::{
+    select_worker_cores, split_tile_range, DramKernel, Kernel, RuntimeArgsBuilder,
+};
 use std::io;
 
 const BROADCAST_READER: &str = include_str!("../../kernels/broadcast_reader.cc");
@@ -22,7 +24,6 @@ pub(crate) struct BroadcastKernelShape {
     output_tile_rows: u32,
     output_tiles_per_row: u32,
     tile_count: u32,
-    direct_copy: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,38 +61,6 @@ struct BroadcastProgramKey {
     cores: Vec<CoreCoord>,
     dtype: DType,
     shape: BroadcastKernelShape,
-}
-
-struct BroadcastKernel {
-    input_addr: u32,
-    output_addr: u32,
-    key: BroadcastProgramKey,
-}
-
-impl Kernel<BroadcastProgramKey> for BroadcastKernel {
-    fn program_key(&self) -> BroadcastProgramKey {
-        self.key.clone()
-    }
-
-    fn build_program(&self) -> io::Result<Program> {
-        broadcast_program(self.key.clone())
-    }
-
-    #[inline]
-    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            READER_INPUT_ADDR_INDEX => Some(self.input_addr),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
-        }
-    }
 }
 
 pub(crate) fn broadcast_in_dim(
@@ -132,14 +101,15 @@ pub(crate) fn broadcast_in_dim(
     })?;
     let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
     let output = device.alloc(output_tiles, dtype, &plan.output_allocation_shape, name)?;
-    let kernel = BroadcastKernel {
-        input_addr: u32_addr(input.addr, "input address")?,
+    let kernel = DramKernel {
+        reader_addrs: [u32_addr(input.addr, "input address")?],
         output_addr: u32_addr(output.addr, "output address")?,
         key: BroadcastProgramKey {
             cores,
             dtype,
             shape,
         },
+        build: broadcast_program,
     };
     kernel.run(device)?;
     Ok(output)
@@ -159,8 +129,6 @@ fn broadcast_kernel_shape(
     let input_shape_u32 = u32_shape(input_shape, "input shape")?;
     let output_shape_u32 = u32_shape(output_shape, "output shape")?;
     let broadcast_dimensions_u32 = u32_broadcast_dimensions(broadcast_dimensions)?;
-    let direct_copy =
-        is_direct_copy_broadcast(input_shape, output_shape, &broadcast_dimensions_u32);
 
     Ok(BroadcastKernelShape {
         input_shape: input_shape_u32,
@@ -183,7 +151,6 @@ fn broadcast_kernel_shape(
             "output tiles per row",
         )?,
         tile_count: u32_arg(tile_count, "tile count")?,
-        direct_copy,
     })
 }
 
@@ -209,7 +176,14 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
         reader_kernel: broadcast_reader_source(key.dtype, &key.shape)?,
         writer_kernel: BROADCAST_WRITER.to_owned(),
         compile: CompileConfig {
-            cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(16, key.dtype)],
+            cbs: vec![
+                CBConfig::new(0, key.dtype),
+                CBConfig {
+                    index: 16,
+                    dtype: key.dtype,
+                    tiles: 4,
+                },
+            ],
             ..CompileConfig::default()
         },
         name: format!(
@@ -234,7 +208,6 @@ fn broadcast_reader_source(dtype: DType, shape: &BroadcastKernelShape) -> io::Re
          #define BROADCAST_INPUT_TILES_PER_ROW {}\n\
          #define BROADCAST_OUTPUT_TILE_ROWS {}\n\
          #define BROADCAST_OUTPUT_TILES_PER_ROW {}\n\
-         #define BROADCAST_DIRECT_COPY {}\n\
          #define BROADCAST_ELEMENT_TYPE {element_type}\n\
          {BROADCAST_READER}",
         shape.input_shape.len(),
@@ -246,7 +219,6 @@ fn broadcast_reader_source(dtype: DType, shape: &BroadcastKernelShape) -> io::Re
         shape.input_tiles_per_row,
         shape.output_tile_rows,
         shape.output_tiles_per_row,
-        shape.direct_copy as u32,
     ))
 }
 
@@ -329,18 +301,6 @@ fn cpp_u32_array(values: &[u32]) -> String {
     format!("{{{values}}}")
 }
 
-fn is_direct_copy_broadcast(
-    input_shape: &[usize],
-    output_shape: &[usize],
-    broadcast_dimensions: &[u32],
-) -> bool {
-    input_shape == output_shape
-        && broadcast_dimensions
-            .iter()
-            .enumerate()
-            .all(|(index, &dim)| dim == index as u32)
-}
-
 fn element_type(dtype: DType) -> &'static str {
     match dtype {
         DType::Float32 | DType::Int32 | DType::UInt32 => "uint32_t",
@@ -392,7 +352,6 @@ mod tests {
                 output_tile_rows: 1,
                 output_tiles_per_row: 1,
                 tile_count: 1,
-                direct_copy: false,
             }
         );
     }
@@ -482,13 +441,9 @@ mod tests {
         assert_eq!(program.runtime_args.cores().len(), 3);
         assert_eq!(program.runtime_args.section_sizes(), (12, 12, 0));
         assert!(program.compute_kernel.is_empty());
-        assert!(plan.kernel_shape().direct_copy);
         assert!(program
             .reader_kernel
             .contains("#define BROADCAST_OUTPUT_RANK 3"));
-        assert!(program
-            .reader_kernel
-            .contains("#define BROADCAST_DIRECT_COPY 1"));
 
         let blobs = program.runtime_args.blobs();
         assert_eq!((arg_u32(&blobs[0], 1), arg_u32(&blobs[0], 2)), (0, 2));

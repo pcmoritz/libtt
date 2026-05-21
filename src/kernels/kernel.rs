@@ -293,6 +293,31 @@ pub(crate) trait Kernel<K = ()> {
     }
 }
 
+pub(crate) struct DramKernel<K, const READER_ADDRS: usize> {
+    pub(crate) reader_addrs: [u32; READER_ADDRS],
+    pub(crate) output_addr: u32,
+    pub(crate) key: K,
+    pub(crate) build: fn(K) -> io::Result<Program>,
+}
+
+impl<K: Clone, const READER_ADDRS: usize> Kernel<K> for DramKernel<K, READER_ADDRS> {
+    fn program_key(&self) -> K {
+        self.key.clone()
+    }
+
+    fn build_program(&self) -> io::Result<Program> {
+        (self.build)(self.key.clone())
+    }
+
+    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        self.reader_addrs.get(index).copied()
+    }
+
+    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        (index == 0).then_some(self.output_addr)
+    }
+}
+
 pub(crate) fn select_worker_cores(
     available: &[CoreCoord],
     tile_count: usize,
