@@ -128,10 +128,7 @@ void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &vi
     return;
   }
 
-  uint32_t indices[MAX_RANK];
-  for (uint32_t i = 0; i < MAX_RANK; ++i) {
-    indices[i] = 0;
-  }
+  uint32_t indices[MAX_RANK] = {};
   decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
 
   uint32_t loaded_tile = INVALID_TILE;
@@ -180,10 +177,7 @@ void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const 
     return;
   }
 
-  uint32_t indices[MAX_RANK];
-  for (uint32_t i = 0; i < MAX_RANK; ++i) {
-    indices[i] = 0;
-  }
+  uint32_t indices[MAX_RANK] = {};
   decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
   TiledIndexMap map = {view.row_dims[0], view.col_dims[0]};
   indices[map.source_row_dim] = row_base;
