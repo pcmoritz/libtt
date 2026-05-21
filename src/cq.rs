@@ -57,6 +57,8 @@ const CQ_DISPATCH_CMD_WRITE_LINEAR_HOST_IS_EVENT: u8 = 1;
 
 const CQ_CMD_SIZE: usize = CQ_DISPATCH_CMD_SIZE as usize;
 const DONE_STREAM: u16 = FIRST_STREAM_USED as u16;
+const PENDING_LAUNCH_WAIT_INTERVAL: usize = 16;
+const PENDING_RECORD_WAIT_LIMIT: usize = CQ_PREFETCH_Q_ENTRIES / 2;
 
 pub(crate) struct FastDispatcher {
     path: PathBuf,
@@ -65,6 +67,8 @@ pub(crate) struct FastDispatcher {
     _pcie_base_guard: PinnedMemory,
     cq_hw: CqSysmem,
     event_id: u32,
+    pending_launches: usize,
+    pending_records: usize,
     runtime_templates: HashMap<usize, RuntimeCqTemplate>,
 }
 
@@ -93,6 +97,8 @@ impl FastDispatcher {
             _pcie_base_guard: pcie_base_guard,
             cq_hw,
             event_id: 0,
+            pending_launches: 0,
+            pending_records: 0,
             runtime_templates: HashMap::new(),
         })
     }
@@ -104,15 +110,32 @@ impl FastDispatcher {
         runtime_args: &RuntimeArgs,
     ) -> io::Result<()> {
         let dispatch_core = self.dispatch_core;
-        let template = match self
-            .runtime_templates
-            .entry(program as *const Program as usize)
-        {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                RuntimeCqTemplate::new(runtime_args, go_word(dispatch_core))?,
-            ),
+        let program_id = program as *const Program as usize;
+        match self.runtime_templates.entry(program_id) {
+            std::collections::hash_map::Entry::Occupied(_) => {}
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(RuntimeCqTemplate::new(runtime_args, go_word(dispatch_core))?);
+            }
+        }
+
+        let record_count = {
+            let template = self
+                .runtime_templates
+                .get(&program_id)
+                .expect("runtime template was just inserted");
+            setup_records.len()
+                + template.records_before_runtime.len()
+                + 1
+                + template.records_after_runtime.len()
         };
+        if self.pending_records + record_count + 1 >= PENDING_RECORD_WAIT_LIMIT {
+            self.finish()?;
+        }
+
+        let template = self
+            .runtime_templates
+            .get_mut(&program_id)
+            .expect("runtime template was just inserted");
         template.patch_runtime_blobs(runtime_args.blobs());
 
         self.event_id = self.event_id.wrapping_add(1);
@@ -126,10 +149,26 @@ impl FastDispatcher {
         for record in &template.records_after_runtime {
             self.cq_hw.issue_write(record)?;
         }
+        self.pending_launches += 1;
+        self.pending_records += record_count;
+        if self.pending_launches >= PENDING_LAUNCH_WAIT_INTERVAL {
+            self.finish()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn finish(&mut self) -> io::Result<()> {
+        if self.pending_launches == 0 {
+            return Ok(());
+        }
         let event_record = host_event_record(self.event_id)?;
+        self.event_id = self.event_id.wrapping_add(1);
         self.cq_hw.issue_write(&event_record)?;
+        let timeout = Duration::from_secs((10 * self.pending_launches as u64).clamp(10, 60));
         self.cq_hw
-            .wait_completion(self.event_id, Duration::from_secs(10))
+            .wait_completion(self.event_id.wrapping_sub(1), timeout)?;
+        self.pending_launches = 0;
+        self.pending_records = 0;
+        Ok(())
     }
 }
 
@@ -502,31 +541,12 @@ impl CqSysmem {
         self.issue_wr += record.len();
 
         let idx = self.prefetch_q_wr_idx;
-        self.wait_prefetch_slot_free(idx, Duration::from_secs(1))?;
         let off = CQ_PREFETCH_Q_BASE + idx * CQ_PREFETCH_Q_ENTRY_SIZE;
         let size_16b = u16::try_from(record.len() / CQ_CMD_SIZE)
             .map_err(|_| io::Error::other("CQ record too large for prefetch slot"))?;
         self.prefetch_win.write(off, &size_16b.to_le_bytes())?;
         self.prefetch_q_wr_idx = (idx + 1) % CQ_PREFETCH_Q_ENTRIES;
         Ok(())
-    }
-
-    fn wait_prefetch_slot_free(&mut self, idx: usize, timeout: Duration) -> io::Result<()> {
-        let off = CQ_PREFETCH_Q_BASE + idx * CQ_PREFETCH_Q_ENTRY_SIZE;
-        let deadline = Instant::now() + timeout;
-        loop {
-            let bytes = self.prefetch_win.read(off, 2)?;
-            if u16::from_le_bytes([bytes[0], bytes[1]]) == 0 {
-                return Ok(());
-            }
-            if Instant::now() > deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timeout waiting for CQ prefetch queue slot",
-                ));
-            }
-            thread::sleep(Duration::from_micros(50));
-        }
     }
 }
 
