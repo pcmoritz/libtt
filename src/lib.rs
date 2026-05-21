@@ -1863,12 +1863,6 @@ fn execute_transpose(
             "TT executable transpose input and output element types must match",
         ));
     }
-    if permutation != [1, 0] {
-        return Err(unimplemented(
-            "TT executable transpose currently only supports rank-2 permutation [1, 0]",
-        ));
-    }
-
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
     let input = device_buffer_for_value(values, input_id, "transpose.operand")?;
@@ -1878,11 +1872,12 @@ fn execute_transpose(
         ));
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    let output_dram = kernels::transpose::transpose_rank2(
+    let output_dram = kernels::transpose::transpose(
         device,
         input_dram,
         &input_shape,
         &output_shape,
+        permutation,
         dtype,
         "pjrt_transpose",
     )

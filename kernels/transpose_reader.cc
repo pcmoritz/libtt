@@ -7,6 +7,18 @@ constexpr uint32_t TILE_C = 32;
 constexpr uint32_t FACE_R = 16;
 constexpr uint32_t FACE_C = 16;
 constexpr uint32_t INVALID_TILE = 0xffffffffu;
+constexpr uint32_t MAX_RANK = TRANSPOSE_MAX_RANK;
+constexpr uint32_t RANK = TRANSPOSE_RANK;
+constexpr uint32_t OUTPUT_SHAPE[MAX_RANK] = TRANSPOSE_OUTPUT_SHAPE;
+constexpr uint32_t INPUT_SHAPE[MAX_RANK] = TRANSPOSE_INPUT_SHAPE;
+constexpr uint32_t PERMUTATION[MAX_RANK] = TRANSPOSE_PERMUTATION;
+constexpr uint32_t OUTPUT_ROWS = OUTPUT_SHAPE[RANK - 2];
+constexpr uint32_t OUTPUT_COLS = OUTPUT_SHAPE[RANK - 1];
+constexpr uint32_t INPUT_TILE_ROWS = (INPUT_SHAPE[RANK - 2] + TILE_R - 1) / TILE_R;
+constexpr uint32_t INPUT_TILES_PER_ROW = (INPUT_SHAPE[RANK - 1] + TILE_C - 1) / TILE_C;
+constexpr uint32_t OUTPUT_TILES_PER_ROW = (OUTPUT_COLS + TILE_C - 1) / TILE_C;
+constexpr uint32_t OUTPUT_MATRIX_TILES =
+    ((OUTPUT_ROWS + TILE_R - 1) / TILE_R) * OUTPUT_TILES_PER_ROW;
 using Element = TRANSPOSE_ELEMENT_TYPE;
 
 uint32_t tile_element_index(uint32_t row, uint32_t col) {
@@ -58,16 +70,33 @@ void copy_element(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
       source[tile_element_index(source_row, source_col)];
 }
 
+void decompose_prefix(uint32_t flat, uint32_t *indices) {
+  for (int32_t dim = static_cast<int32_t>(RANK) - 3; dim >= 0; --dim) {
+    uint32_t extent = OUTPUT_SHAPE[dim];
+    indices[dim] = flat % extent;
+    flat /= extent;
+  }
+}
+
+uint32_t tile_id_for_indices(const uint32_t *indices, uint32_t *row_in_tile,
+                             uint32_t *col_in_tile) {
+  uint32_t prefix = 0;
+  for (uint32_t dim = 0; dim + 2 < RANK; ++dim) {
+    prefix = prefix * INPUT_SHAPE[dim] + indices[dim];
+  }
+  uint32_t row = indices[RANK - 2];
+  uint32_t col = indices[RANK - 1];
+  *row_in_tile = row % TILE_R;
+  *col_in_tile = col % TILE_C;
+  return (prefix * INPUT_TILE_ROWS + row / TILE_R) * INPUT_TILES_PER_ROW + col / TILE_C;
+}
+
 }  // namespace
 
 void kernel_main() {
   uint32_t input_addr = get_arg_val<uint32_t>(0);
   uint32_t output_tile_offset = get_arg_val<uint32_t>(1);
   uint32_t output_tile_count = get_arg_val<uint32_t>(2);
-  uint32_t input_rows = get_arg_val<uint32_t>(3);
-  uint32_t input_cols = get_arg_val<uint32_t>(4);
-  uint32_t input_tiles_per_row = get_arg_val<uint32_t>(5);
-  uint32_t output_tiles_per_row = get_arg_val<uint32_t>(6);
 
   constexpr uint32_t cb_input = tt::CBIndex::c_0;
   constexpr uint32_t cb_output = tt::CBIndex::c_16;
@@ -77,10 +106,14 @@ void kernel_main() {
       .data_format = get_dataformat(cb_input),
   };
 
+  uint32_t output_indices[MAX_RANK];
+  uint32_t input_indices[MAX_RANK];
   for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
     uint32_t output_tile_id = output_tile_offset + tile;
-    uint32_t output_tile_row = output_tile_id / output_tiles_per_row;
-    uint32_t output_tile_col = output_tile_id % output_tiles_per_row;
+    uint32_t output_prefix = output_tile_id / OUTPUT_MATRIX_TILES;
+    uint32_t output_matrix_tile = output_tile_id % OUTPUT_MATRIX_TILES;
+    uint32_t output_tile_row = output_matrix_tile / OUTPUT_TILES_PER_ROW;
+    uint32_t output_tile_col = output_matrix_tile % OUTPUT_TILES_PER_ROW;
     uint32_t output_row_base = output_tile_row * TILE_R;
     uint32_t output_col_base = output_tile_col * TILE_C;
     uint32_t loaded_input_tile = INVALID_TILE;
@@ -88,24 +121,28 @@ void kernel_main() {
     cb_reserve_back(cb_output, 1);
     zero_tile(cb_output);
 
+    decompose_prefix(output_prefix, output_indices);
     for (uint32_t row = 0; row < TILE_R; ++row) {
       uint32_t output_row = output_row_base + row;
-      if (output_row >= input_cols) {
+      if (output_row >= OUTPUT_ROWS) {
         continue;
       }
+      output_indices[RANK - 2] = output_row;
       for (uint32_t col = 0; col < TILE_C; ++col) {
         uint32_t output_col = output_col_base + col;
-        if (output_col >= input_rows) {
+        if (output_col >= OUTPUT_COLS) {
           continue;
         }
 
-        uint32_t input_row = output_col;
-        uint32_t input_col = output_row;
-        uint32_t input_tile_row = input_row / TILE_R;
-        uint32_t input_tile_col = input_col / TILE_C;
-        uint32_t input_tile = input_tile_row * input_tiles_per_row + input_tile_col;
+        output_indices[RANK - 1] = output_col;
+        for (uint32_t dim = 0; dim < RANK; ++dim) {
+          input_indices[PERMUTATION[dim]] = output_indices[dim];
+        }
+        uint32_t input_row = 0;
+        uint32_t input_col = 0;
+        uint32_t input_tile = tile_id_for_indices(input_indices, &input_row, &input_col);
         ensure_input_tile(input, input_tile, &loaded_input_tile);
-        copy_element(cb_input, cb_output, input_row % TILE_R, input_col % TILE_C, row, col);
+        copy_element(cb_input, cb_output, input_row, input_col, row, col);
       }
     }
 
