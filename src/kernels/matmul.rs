@@ -691,6 +691,7 @@ fn plan_matmul(
     let direct = || {
         plan_direct_matmul(
             mt_base,
+            kt,
             nt_base,
             &ordered,
             &kt_divs,
@@ -698,6 +699,9 @@ fn plan_matmul(
             l1_data_bytes,
             batch_count,
             allow_column_split,
+            1,
+            1,
+            None,
         )
     };
     let candidate = if mt_base == 1 {
@@ -713,17 +717,20 @@ fn plan_matmul(
     };
 
     let mut plan = candidate;
-    if let Some(batched) = plan_batched_direct_matmul(
+    let baseline_work = plan_work(&plan);
+    if let Some(batched) = plan_direct_matmul(
         mt_base,
         kt,
         nt_base,
-        batch_count,
         &ordered,
         &kt_divs,
         tile_bytes,
         l1_data_bytes,
-        &plan,
+        batch_count,
         allow_column_split,
+        2,
+        batch_count.min(ordered.len()),
+        Some(baseline_work),
     ) {
         plan = batched;
     }
@@ -733,6 +740,7 @@ fn plan_matmul(
 
 fn plan_direct_matmul(
     mt_base: usize,
+    kt: usize,
     nt_base: usize,
     cores: &[CoreCoord],
     kt_divs: &[usize],
@@ -740,6 +748,9 @@ fn plan_direct_matmul(
     l1_data_bytes: usize,
     batch_count: usize,
     allow_column_split: bool,
+    min_batch_groups: usize,
+    max_batch_groups: usize,
+    baseline_work: Option<usize>,
 ) -> Option<MatmulPlan> {
     if mt_base == 0 || nt_base == 0 {
         return None;
@@ -747,123 +758,13 @@ fn plan_direct_matmul(
 
     let mut best = None;
     let mut best_score = None;
-    let kt = *kt_divs.last()?;
-    let max_rows = mt_base.min(cores.len());
-    for logical_rows in 1..=max_rows {
-        let max_cols = if allow_column_split {
-            nt_base.min(cores.len() / logical_rows)
-        } else {
-            1
-        };
-        for logical_cols in 1..=max_cols {
-            let active_cores = logical_rows * logical_cols;
-            let per_core_m = mt_base.div_ceil(logical_rows);
-            let per_core_n = nt_base.div_ceil(logical_cols);
-            let mt = logical_rows * per_core_m;
-            let nt = logical_cols * per_core_n;
-            let out_tiles = per_core_m * per_core_n;
-            let bw_cap = if out_tiles <= 16 { 32 } else { 64 };
-
-            for out_subblock_h in 1..=8 {
-                for out_subblock_w in 1..=8 {
-                    let out_subblock_num_tiles = out_subblock_h * out_subblock_w;
-                    if out_subblock_num_tiles > 8
-                        || per_core_m % out_subblock_h != 0
-                        || per_core_n % out_subblock_w != 0
-                    {
-                        continue;
-                    }
-                    for &in0_block_w in kt_divs {
-                        if in0_block_w > bw_cap
-                            || !fits_l1(
-                                per_core_m,
-                                per_core_n,
-                                in0_block_w,
-                                tile_bytes,
-                                l1_data_bytes,
-                            )
-                        {
-                            continue;
-                        }
-                        let padding = mt * nt - mt_base * nt_base;
-                        let bias = out_tiles.min(16);
-                        // Direct plans do not amortize narrow output blocks with multicast.
-                        // Prefer wider subblocks even if that leaves a few cores idle.
-                        let score = if mt_base == 1 {
-                            let per_core_work = (kt / in0_block_w) * per_core_m * per_core_n;
-                            (
-                                usize::MAX - per_core_work,
-                                usize::MAX - padding,
-                                active_cores,
-                                out_subblock_num_tiles,
-                                in0_block_w,
-                            )
-                        } else {
-                            (
-                                out_subblock_num_tiles,
-                                active_cores * in0_block_w * bias * bias,
-                                usize::MAX - padding,
-                                active_cores * in0_block_w,
-                                active_cores,
-                            )
-                        };
-                        if best_score.map_or(true, |current| score > current) {
-                            best_score = Some(score);
-                            best = Some(MatmulPlan {
-                                rows: Vec::new(),
-                                cols: Vec::new(),
-                                direct_grid: Some(
-                                    cores[..active_cores]
-                                        .chunks(logical_cols)
-                                        .map(|row| row.to_vec())
-                                        .collect(),
-                                ),
-                                batch_groups: 1,
-                                batches_per_group: batch_count,
-                                mt,
-                                kt,
-                                nt,
-                                per_core_m,
-                                per_core_n,
-                                in0_block_w,
-                                out_subblock_h,
-                                out_subblock_w,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    best
-}
-
-fn plan_batched_direct_matmul(
-    mt_base: usize,
-    kt: usize,
-    nt_base: usize,
-    batch_count: usize,
-    cores: &[CoreCoord],
-    kt_divs: &[usize],
-    tile_bytes: usize,
-    l1_data_bytes: usize,
-    single_group_plan: &MatmulPlan,
-    allow_column_split: bool,
-) -> Option<MatmulPlan> {
-    if batch_count <= 1 || mt_base == 0 || nt_base == 0 {
+    let min_batch_groups = min_batch_groups.max(1);
+    let max_batch_groups = max_batch_groups.min(batch_count).min(cores.len());
+    if min_batch_groups > max_batch_groups {
         return None;
     }
 
-    let single_group_work = single_group_plan
-        .batches_per_group
-        .saturating_mul(single_group_plan.num_blocks())
-        .saturating_mul(single_group_plan.per_core_m)
-        .saturating_mul(single_group_plan.per_core_n);
-    let mut best = None;
-    let mut best_score = None;
-    let max_groups = batch_count.min(cores.len());
-    for batch_groups in 2..=max_groups {
+    for batch_groups in min_batch_groups..=max_batch_groups {
         let max_group_cores = cores.len() / batch_groups;
         if max_group_cores == 0 {
             continue;
@@ -894,6 +795,7 @@ fn plan_batched_direct_matmul(
                             continue;
                         }
                         for &in0_block_w in kt_divs {
+                            let num_blocks = kt / in0_block_w;
                             if in0_block_w > bw_cap
                                 || !fits_l1(
                                     per_core_m,
@@ -905,20 +807,43 @@ fn plan_batched_direct_matmul(
                             {
                                 continue;
                             }
-                            let num_blocks = kt / in0_block_w;
                             let per_core_work =
                                 batches_per_group * num_blocks * per_core_m * per_core_n;
-                            if per_core_work >= single_group_work {
-                                continue;
+                            if batch_groups > 1 {
+                                let Some(baseline) = baseline_work else {
+                                    continue;
+                                };
+                                if per_core_work >= baseline {
+                                    continue;
+                                }
                             }
                             let padding = (mt * nt - mt_base * nt_base) * batch_groups;
-                            let score = (
-                                usize::MAX - per_core_work,
-                                active_cores,
-                                usize::MAX - padding,
-                                in0_block_w,
-                                out_subblock_num_tiles,
-                            );
+                            let bias = out_tiles.min(16);
+                            let score = if batch_groups > 1 {
+                                (
+                                    usize::MAX - per_core_work,
+                                    active_cores,
+                                    usize::MAX - padding,
+                                    in0_block_w,
+                                    out_subblock_num_tiles,
+                                )
+                            } else if mt_base == 1 {
+                                (
+                                    usize::MAX - per_core_work,
+                                    usize::MAX - padding,
+                                    active_cores,
+                                    out_subblock_num_tiles,
+                                    in0_block_w,
+                                )
+                            } else {
+                                (
+                                    out_subblock_num_tiles,
+                                    active_cores * in0_block_w * bias * bias,
+                                    usize::MAX - padding,
+                                    active_cores * in0_block_w,
+                                    active_cores,
+                                )
+                            };
                             if best_score.map_or(true, |current| score > current) {
                                 best_score = Some(score);
                                 best = Some(MatmulPlan {
@@ -950,6 +875,13 @@ fn plan_batched_direct_matmul(
     }
 
     best
+}
+
+fn plan_work(plan: &MatmulPlan) -> usize {
+    plan.batches_per_group
+        .saturating_mul(plan.num_blocks())
+        .saturating_mul(plan.per_core_m)
+        .saturating_mul(plan.per_core_n)
 }
 
 fn fits_l1(
@@ -1468,6 +1400,15 @@ mod tests {
         assert_eq!(plan.kt, 32);
         assert_eq!(plan.per_core_m * grid.len(), plan.mt);
         assert_eq!(plan.out_subblock_h * plan.out_subblock_w, 8);
+    }
+
+    #[test]
+    fn plan_matmul_splits_batches_across_direct_grid() {
+        let plan = plan_matmul(32, 1024, 1024, 16, &p100_worker_cores(), true).expect("plan");
+        let grid = plan.direct_grid.as_ref().expect("direct plan");
+        assert!(plan.batch_groups > 1);
+        assert_eq!(grid.len() % plan.batch_groups, 0);
+        assert_eq!(plan.direct_grid_rows_per_batch(), Some(grid.len() / plan.batch_groups));
     }
 
     #[test]
