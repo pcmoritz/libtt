@@ -11,83 +11,55 @@ uint32_t output_tile_for_element(const View &view, uint32_t batch, uint32_t logi
   decompose_into_dims(logical_col, view.col_dims, view.col_rank, view.shape, indices);
   return tile_id_for_indices(view, indices, row_in_tile, col_in_tile);
 }
-bool output_rows_are_physical_tiles(const View &view) {
-  if (view.kind == VIEW_CONTIGUOUS || view.row_rank != 1 || view.rank < 2) {
-    return false;
+void copy_l1_bytes(uint32_t dst_l1_addr, uint32_t src_l1_addr, uint32_t bytes) {
+  volatile tt_l1_ptr uint16_t *dst =
+      reinterpret_cast<volatile tt_l1_ptr uint16_t *>(dst_l1_addr);
+  volatile tt_l1_ptr uint16_t *src =
+      reinterpret_cast<volatile tt_l1_ptr uint16_t *>(src_l1_addr);
+  for (uint32_t i = 0; i < bytes / sizeof(uint16_t); ++i) {
+    dst[i] = src[i];
   }
-  const uint32_t physical_row_dim = view.rank - 2;
-  for (uint32_t i = 0; i < view.col_rank; ++i) {
-    if (view.col_dims[i] == physical_row_dim) {
-      return true;
-    }
-  }
-  return false;
 }
-void write_output_row_physical_tiles(const InterleavedAddrGenFast<true> &out_gen,
-                                     const View &output_view, uint32_t cb_scratch,
-                                     uint32_t batch, uint32_t canonical_row_tile,
-                                     uint32_t first_col_tile, uint32_t col_tile_count,
-                                     uint32_t src_l1_addr, uint32_t tile_bytes,
-                                     uint32_t element_bytes) {
-  const uint32_t row_base = canonical_row_tile * TILE_R;
-  cb_reserve_back(cb_scratch, 1);
-  uint32_t scratch_l1_addr = get_write_ptr(cb_scratch);
-  for (uint32_t row = 0; row < TILE_R; ++row) {
-    const uint32_t logical_row = row_base + row;
-    if (logical_row >= output_view.logical_rows) {
+void write_output_run(const InterleavedAddrGenFast<true> &out_gen, uint32_t dst_tile,
+                      uint32_t dst_offset, uint32_t src_l1_addr, uint32_t bytes,
+                      uint32_t scratch_l1_addr) {
+  while (bytes > 0) {
+    // Blackhole DRAM NOC writes need 16-byte alignment. Full aligned blocks can
+    // go directly; fragments use a scratch block so the actual write is aligned.
+    const bool aligned = ((dst_offset | src_l1_addr) & 0xfu) == 0;
+    if (aligned && bytes >= 16) {
+      uint32_t direct_bytes = bytes & ~0xfu;
+      noc_async_write(src_l1_addr, get_noc_addr(dst_tile, out_gen, dst_offset),
+                      direct_bytes);
+      src_l1_addr += direct_bytes;
+      dst_offset += direct_bytes;
+      bytes -= direct_bytes;
       continue;
     }
-    uint32_t current_tile = INVALID_TILE;
-    uint32_t current_block = INVALID_TILE;
-    bool have_block = false;
-    for (uint32_t tile_col = 0; tile_col < col_tile_count; ++tile_col) {
-      const uint32_t canonical_col_tile = first_col_tile + tile_col;
-      const uint32_t col_base = canonical_col_tile * TILE_C;
-      uint32_t source_tile_l1_addr = src_l1_addr + tile_col * tile_bytes;
-      for (uint32_t col = 0; col < TILE_C; ++col) {
-        const uint32_t logical_col = col_base + col;
-        if (logical_col >= output_view.logical_cols) {
-          break;
-        }
-        uint32_t dst_row = 0;
-        uint32_t dst_col = 0;
-        const uint32_t dst_tile = output_tile_for_element(
-            output_view, batch, logical_row, logical_col, &dst_row, &dst_col);
-        const uint32_t dst_offset = tile_element_index(dst_row, dst_col) * element_bytes;
-        const uint32_t dst_block = dst_offset & ~0xfu;
-        if (!have_block) {
-          current_tile = dst_tile;
-          current_block = dst_block;
-          have_block = true;
-          zero_tile_at(scratch_l1_addr, 16);
-        } else if (dst_tile != current_tile || dst_block != current_block) {
-          noc_async_write(scratch_l1_addr, get_noc_addr(current_tile, out_gen, current_block), 16);
-          noc_async_write_barrier();
-          current_tile = dst_tile;
-          current_block = dst_block;
-          zero_tile_at(scratch_l1_addr, 16);
-        }
-        volatile tt_l1_ptr uint16_t *src = reinterpret_cast<volatile tt_l1_ptr uint16_t *>(
-            source_tile_l1_addr + tile_element_index(row, col) * element_bytes);
-        volatile tt_l1_ptr uint16_t *dst = reinterpret_cast<volatile tt_l1_ptr uint16_t *>(
-            scratch_l1_addr + (dst_offset - current_block));
-        for (uint32_t i = 0; i < element_bytes / sizeof(uint16_t); ++i) {
-          dst[i] = src[i];
-        }
-      }
+
+    const uint32_t dst_block = dst_offset & ~0xfu;
+    const uint32_t block_offset = dst_offset - dst_block;
+    uint32_t block_bytes = 16 - block_offset;
+    if (block_bytes > bytes) {
+      block_bytes = bytes;
     }
-    if (have_block) {
-      noc_async_write(scratch_l1_addr, get_noc_addr(current_tile, out_gen, current_block), 16);
-      noc_async_write_barrier();
+    if (block_offset != 0 || block_bytes != 16) {
+      noc_async_read(get_noc_addr(dst_tile, out_gen, dst_block), scratch_l1_addr, 16);
+      noc_async_read_barrier();
     }
+    copy_l1_bytes(scratch_l1_addr + block_offset, src_l1_addr, block_bytes);
+    noc_async_write(scratch_l1_addr, get_noc_addr(dst_tile, out_gen, dst_block), 16);
+    noc_async_write_barrier();
+    src_l1_addr += block_bytes;
+    dst_offset += block_bytes;
+    bytes -= block_bytes;
   }
-  cb_push_back(cb_scratch, 1);
-  cb_pop_front(cb_scratch, 1);
 }
 void write_output_tile(const InterleavedAddrGenFast<true> &out_gen, const View &output_view,
                        uint32_t batch, uint32_t canonical_row_tile,
                        uint32_t canonical_col_tile, uint32_t output_batch_stride,
-                       uint32_t logical_nt, uint32_t src_l1_addr, uint32_t element_bytes) {
+                       uint32_t logical_nt, uint32_t src_l1_addr, uint32_t element_bytes,
+                       uint32_t cb_scratch) {
   if (output_view.kind == VIEW_CONTIGUOUS) {
     noc_async_write_tile(batch * output_batch_stride + canonical_row_tile * logical_nt +
                              canonical_col_tile,
@@ -96,6 +68,8 @@ void write_output_tile(const InterleavedAddrGenFast<true> &out_gen, const View &
   }
   const uint32_t row_base = canonical_row_tile * TILE_R;
   const uint32_t col_base = canonical_col_tile * TILE_C;
+  cb_reserve_back(cb_scratch, 1);
+  uint32_t scratch_l1_addr = get_write_ptr(cb_scratch);
   for (uint32_t row = 0; row < TILE_R; ++row) {
     const uint32_t logical_row = row_base + row;
     if (logical_row >= output_view.logical_rows) {
@@ -133,11 +107,13 @@ void write_output_tile(const InterleavedAddrGenFast<true> &out_gen, const View &
         }
         ++run;
       }
-      noc_async_write(src_l1_addr + src_offset, get_noc_addr(dst_tile, out_gen, dst_offset),
-                      run * element_bytes);
+      write_output_run(out_gen, dst_tile, dst_offset, src_l1_addr + src_offset,
+                       run * element_bytes, scratch_l1_addr);
       col += run;
     }
   }
+  cb_push_back(cb_scratch, 1);
+  cb_pop_front(cb_scratch, 1);
 }
 struct OutputDrain {
   View view;
@@ -185,35 +161,21 @@ void drain_output_blocks(const OutputDrain &output, uint32_t batch, bool valid_b
       cb_wait_front(cb_out, output.sb_tiles);
       uint32_t l1_addr = get_read_ptr(cb_out);
       uint32_t row_start = sbw_start;
-      if (valid_batch && output_rows_are_physical_tiles(output.view) &&
-          output.col_offset == 0 && output.sb_w == output.logical_nt) {
-        for (uint32_t h = 0; h < output.sb_h; h++) {
-          const uint32_t out_row = row_start / padded_nt;
-          if (out_row < output.logical_mt) {
-            write_output_row_physical_tiles(output.gen, output.view, cb_scratch, batch, out_row,
-                                            0, output.sb_w, l1_addr, output.tile_bytes,
-                                            element_bytes);
+      for (uint32_t h = 0; h < output.sb_h; h++) {
+        uint32_t tile_id = row_start;
+        for (uint32_t w = 0; w < output.sb_w; w++) {
+          const uint32_t out_row = tile_id / padded_nt;
+          const uint32_t out_col = output.col_offset + tile_id - out_row * padded_nt;
+          if (valid_batch && out_row < output.logical_mt &&
+              out_col < output.logical_nt) {
+            write_output_tile(output.gen, output.view, batch, out_row, out_col,
+                              output.batch_stride, output.logical_nt, l1_addr,
+                              element_bytes, cb_scratch);
           }
-          l1_addr += output.sb_w * output.tile_bytes;
-          row_start += output.stride_h;
+          l1_addr += output.tile_bytes;
+          tile_id += output.stride_w;
         }
-      } else {
-        for (uint32_t h = 0; h < output.sb_h; h++) {
-          uint32_t tile_id = row_start;
-          for (uint32_t w = 0; w < output.sb_w; w++) {
-            const uint32_t out_row = tile_id / padded_nt;
-            const uint32_t out_col = output.col_offset + tile_id - out_row * padded_nt;
-            if (valid_batch && out_row < output.logical_mt &&
-                out_col < output.logical_nt) {
-              write_output_tile(output.gen, output.view, batch, out_row, out_col,
-                                output.batch_stride, output.logical_nt, l1_addr,
-                                element_bytes);
-            }
-            l1_addr += output.tile_bytes;
-            tile_id += output.stride_w;
-          }
-          row_start += output.stride_h;
-        }
+        row_start += output.stride_h;
       }
       noc_async_write_barrier();
       cb_pop_front(cb_out, output.sb_tiles);
