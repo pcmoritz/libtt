@@ -370,23 +370,7 @@ fn reduce_matrix_core_range(
         "output tile offset",
     )?;
     let output_tiles = checked_mul_u32(tile_rows, shape.inner_output_tiles, "output tiles")?;
-    let tile_rows_per_prefix = shape.output_tile_rows_per_prefix;
-    if tile_rows_per_prefix == 0 {
-        return Err(invalid_input(
-            "matrix reduce requires nonzero output tile rows per prefix",
-        ));
-    }
-    let prefix_offset = tile_row_offset / tile_rows_per_prefix;
-    let row_tile_offset = tile_row_offset % tile_rows_per_prefix;
-    let row_offset = checked_mul_u32(row_tile_offset, TILE_R as u32, "output row offset")?;
-    let prefix_group_offset = checked_mul_u32(
-        prefix_offset,
-        shape.output_dim0,
-        "reduce prefix group offset",
-    )?;
-    let group_row_offset = prefix_group_offset
-        .checked_add(row_offset)
-        .ok_or_else(|| invalid_input("reduce group row offset overflow"))?;
+    let group_row_offset = output_rows_before_tile_row(shape, tile_row_offset)?;
     let group_offset = checked_mul_u32(
         group_row_offset,
         shape.inner_output_tiles,
@@ -395,18 +379,9 @@ fn reduce_matrix_core_range(
     let end_tile_row = tile_row_offset
         .checked_add(tile_rows)
         .ok_or_else(|| invalid_input("reduce tile row range overflow"))?;
-    let mut reduce_rows = 0u32;
-    for tile_row in tile_row_offset..end_tile_row {
-        let row_tile = tile_row % tile_rows_per_prefix;
-        let row_offset = checked_mul_u32(row_tile, TILE_R as u32, "output row offset")?;
-        let rows = shape
-            .output_dim0
-            .saturating_sub(row_offset)
-            .min(TILE_R as u32);
-        reduce_rows = reduce_rows
-            .checked_add(rows)
-            .ok_or_else(|| invalid_input("reduce row count overflow"))?;
-    }
+    let reduce_rows = output_rows_before_tile_row(shape, end_tile_row)?
+        .checked_sub(group_row_offset)
+        .ok_or_else(|| invalid_input("reduce row count underflow"))?;
     let reduce_groups =
         checked_mul_u32(reduce_rows, shape.inner_output_tiles, "reduce group count")?;
     Ok(ReduceCoreRange {
@@ -415,6 +390,23 @@ fn reduce_matrix_core_range(
         output_tile_offset,
         output_tiles,
     })
+}
+
+fn output_rows_before_tile_row(shape: ReduceKernelShape, tile_row: u32) -> io::Result<u32> {
+    let tile_rows_per_prefix = shape.output_tile_rows_per_prefix;
+    if tile_rows_per_prefix == 0 {
+        return Err(invalid_input(
+            "matrix reduce requires nonzero output tile rows per prefix",
+        ));
+    }
+    let prefix = tile_row / tile_rows_per_prefix;
+    let row_tile = tile_row % tile_rows_per_prefix;
+    let prefix_rows = checked_mul_u32(prefix, shape.output_dim0, "reduce prefix row offset")?;
+    let row_offset = checked_mul_u32(row_tile, TILE_R as u32, "output row offset")?
+        .min(shape.output_dim0);
+    prefix_rows
+        .checked_add(row_offset)
+        .ok_or_else(|| invalid_input("reduce output row offset overflow"))
 }
 
 fn output_tile_rows(shape: ReduceKernelShape) -> io::Result<u32> {
