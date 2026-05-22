@@ -2795,34 +2795,6 @@ fn execute_executable_v1(
                 let output_id = *output_id;
                 let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
                 let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
-                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                {
-                    return Err(unimplemented(
-                        "TT executable matmul currently only supports bf16 buffers",
-                    ));
-                }
-                if !dimension_numbers.lhs_batching_dimensions.is_empty()
-                    || !dimension_numbers.rhs_batching_dimensions.is_empty()
-                    || dimension_numbers.lhs_contracting_dimensions != vec![1]
-                    || dimension_numbers.rhs_contracting_dimensions != vec![0]
-                {
-                    return Err(unimplemented(
-                        "TT executable dot_general execution currently only supports rank-2 standard matrix multiplication",
-                    ));
-                }
-                if lhs.dims.len() != 2 || rhs.dims.len() != 2 {
-                    return Err(unimplemented(
-                        "TT executable matmul currently only supports rank-2 buffers",
-                    ));
-                }
-                if lhs.dims[1] != rhs.dims[0] {
-                    return Err(invalid_argument(format!(
-                        "TT executable matmul shape mismatch: lhs {:?}, rhs {:?}",
-                        lhs.dims, rhs.dims
-                    )));
-                }
-
                 let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
                     return Err(failed_precondition(
                         "TT executable matmul lhs buffer has no device allocation",
@@ -2833,16 +2805,44 @@ fn execute_executable_v1(
                         "TT executable matmul rhs buffer has no device allocation",
                     ));
                 };
-
-                let output_dram =
-                    kernels::matmul::matmul_bf16(device, lhs_dram, rhs_dram, "pjrt_matmul")
-                        .map_err(io_error)?;
-                let expected_dims = vec![lhs.dims[0], rhs.dims[1]];
+                let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+                    invalid_argument(format!(
+                        "TT executable matmul output id {output_id} is out of bounds"
+                    ))
+                })?;
+                let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                    || !matches!(output_dtype, DType::Float16B | DType::Float32)
+                {
+                    return Err(invalid_argument(format!(
+                        "TT executable matmul requires bf16 inputs and bf16/f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
+                        lhs.buffer_type, rhs.buffer_type
+                    )));
+                }
+                let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
+                let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+                let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+                let output_dram = kernels::matmul::matmul_bf16_dot_general(
+                    device,
+                    lhs_dram,
+                    rhs_dram,
+                    &lhs_shape,
+                    &rhs_shape,
+                    &output_shape,
+                    &dimension_numbers.lhs_batching_dimensions,
+                    &dimension_numbers.rhs_batching_dimensions,
+                    &dimension_numbers.lhs_contracting_dimensions,
+                    &dimension_numbers.rhs_contracting_dimensions,
+                    output_dtype,
+                    "pjrt_matmul",
+                )
+                .map_err(io_error)?;
                 store_output_buffer(
                     &mut values,
                     plan,
                     output_id,
-                    expected_dims,
+                    output_desc.dims.clone(),
                     output_dram,
                     &output_context,
                     "matmul",
