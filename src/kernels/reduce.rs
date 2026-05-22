@@ -53,18 +53,12 @@ impl ReduceOp {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum OutputRank {
-    One,
-    Two,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct ReduceKernelShape {
     input_width_tiles: u32,
     valid_last_width: u32,
     output_tiles: u32,
     inner_output_tiles: u32,
-    output_rank: OutputRank,
+    output_tile_rows_per_prefix: u32,
     output_dim0: u32,
     output_dim1: u32,
 }
@@ -96,12 +90,6 @@ impl ReducePlan {
                 "reduce kernel requires rank >= 2 input, got {input_shape:?}"
             )));
         }
-        if output_shape.len() > 2 {
-            return Err(invalid_input(format!(
-                "reduce kernel currently supports rank <= 2 outputs, got {output_shape:?}"
-            )));
-        }
-
         let reduce_dim = input_shape.len() - 1;
         if dimensions != [reduce_dim as i64] {
             return Err(invalid_input(format!(
@@ -126,16 +114,29 @@ impl ReducePlan {
         let output_inner_tiles =
             output_allocation_shape[output_allocation_shape.len() - 1] / TILE_C;
         debug_assert_eq!(inner_output_tiles, output_inner_tiles);
-        let (output_rank, output_dim0, output_dim1) = match output_shape {
-            [dim] => (OutputRank::One, 1, *dim),
-            [dim0, dim1] => (OutputRank::Two, *dim0, *dim1),
+        let (output_dim0, output_dim1, output_tile_rows_per_prefix) = match output_shape {
+            [dim] => (1, *dim, 1),
+            [] => {
+                return Err(invalid_input(
+                    "reduce kernel currently requires rank >= 1 output",
+                ))
+            }
             _ => {
-                return Err(invalid_input(format!(
-                    "reduce kernel currently supports rank 1 or 2 outputs, got {output_shape:?}"
-                )))
+                let rank = output_shape.len();
+                (
+                    output_shape[rank - 2],
+                    output_shape[rank - 1],
+                    output_allocation_shape[rank - 2] / TILE_R,
+                )
             }
         };
+        if output_tile_rows_per_prefix == 0 {
+            return Err(invalid_input(format!(
+                "reduce output tile rows per prefix must be nonzero for shape {output_shape:?}"
+            )));
+        };
 
+        let op = ReduceOp::from_reducer(reducer)?;
         Ok(Self {
             input_shape: input_shape.to_vec(),
             output_allocation_shape,
@@ -144,11 +145,14 @@ impl ReducePlan {
                 valid_last_width,
                 output_tiles: u32_arg(output_tiles, "output tile count")?,
                 inner_output_tiles: u32_arg(inner_output_tiles, "inner output tile count")?,
-                output_rank,
+                output_tile_rows_per_prefix: u32_arg(
+                    output_tile_rows_per_prefix,
+                    "output tile rows per prefix",
+                )?,
                 output_dim0: u32_arg(output_dim0, "output dim0")?,
                 output_dim1: u32_arg(output_dim1, "output dim1")?,
             },
-            op: ReduceOp::from_reducer(reducer)?,
+            op,
             dtype,
         })
     }
@@ -266,6 +270,7 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
                 range.output_tiles,
                 shape.output_dim0,
                 shape.output_dim1,
+                shape.output_tile_rows_per_prefix,
             ],
             vec![
                 0,
@@ -316,9 +321,10 @@ fn bool_define(value: bool) -> &'static str {
 }
 
 fn reduce_partition_count(shape: ReduceKernelShape) -> io::Result<u32> {
-    match shape.output_rank {
-        OutputRank::One => Ok(shape.output_tiles),
-        OutputRank::Two => output_tile_rows(shape),
+    if shape.output_dim0 == 1 && shape.output_tile_rows_per_prefix == 1 {
+        Ok(shape.output_tiles)
+    } else {
+        output_tile_rows(shape)
     }
 }
 
@@ -341,14 +347,15 @@ fn reduce_core_range(
     partition_offset: u32,
     partitions: u32,
 ) -> io::Result<ReduceCoreRange> {
-    match shape.output_rank {
-        OutputRank::One => Ok(ReduceCoreRange {
+    if shape.output_dim0 == 1 && shape.output_tile_rows_per_prefix == 1 {
+        Ok(ReduceCoreRange {
             group_offset: partition_offset,
             reduce_groups: partitions,
             output_tile_offset: partition_offset,
             output_tiles: partitions,
-        }),
-        OutputRank::Two => reduce_matrix_core_range(shape, partition_offset, partitions),
+        })
+    } else {
+        reduce_matrix_core_range(shape, partition_offset, partitions)
     }
 }
 
@@ -363,25 +370,43 @@ fn reduce_matrix_core_range(
         "output tile offset",
     )?;
     let output_tiles = checked_mul_u32(tile_rows, shape.inner_output_tiles, "output tiles")?;
-    let output_row_offset = checked_mul_u32(tile_row_offset, TILE_R as u32, "output row offset")?;
-    let max_rows = checked_mul_u32(tile_rows, TILE_R as u32, "output rows")?;
-    let output_rows = shape
-        .output_dim0
-        .saturating_sub(output_row_offset)
-        .min(max_rows);
+    let group_row_offset = output_rows_before_tile_row(shape, tile_row_offset)?;
     let group_offset = checked_mul_u32(
-        output_row_offset,
+        group_row_offset,
         shape.inner_output_tiles,
         "reduce group offset",
     )?;
+    let end_tile_row = tile_row_offset
+        .checked_add(tile_rows)
+        .ok_or_else(|| invalid_input("reduce tile row range overflow"))?;
+    let reduce_rows = output_rows_before_tile_row(shape, end_tile_row)?
+        .checked_sub(group_row_offset)
+        .ok_or_else(|| invalid_input("reduce row count underflow"))?;
     let reduce_groups =
-        checked_mul_u32(output_rows, shape.inner_output_tiles, "reduce group count")?;
+        checked_mul_u32(reduce_rows, shape.inner_output_tiles, "reduce group count")?;
     Ok(ReduceCoreRange {
         group_offset,
         reduce_groups,
         output_tile_offset,
         output_tiles,
     })
+}
+
+fn output_rows_before_tile_row(shape: ReduceKernelShape, tile_row: u32) -> io::Result<u32> {
+    let tile_rows_per_prefix = shape.output_tile_rows_per_prefix;
+    if tile_rows_per_prefix == 0 {
+        return Err(invalid_input(
+            "matrix reduce requires nonzero output tile rows per prefix",
+        ));
+    }
+    let prefix = tile_row / tile_rows_per_prefix;
+    let row_tile = tile_row % tile_rows_per_prefix;
+    let prefix_rows = checked_mul_u32(prefix, shape.output_dim0, "reduce prefix row offset")?;
+    let row_offset = checked_mul_u32(row_tile, TILE_R as u32, "output row offset")?
+        .min(shape.output_dim0);
+    prefix_rows
+        .checked_add(row_offset)
+        .ok_or_else(|| invalid_input("reduce output row offset overflow"))
 }
 
 fn output_tile_rows(shape: ReduceKernelShape) -> io::Result<u32> {
@@ -440,4 +465,5 @@ mod tests {
         assert_eq!(plan.shape.valid_last_width, TILE_C as u32);
         assert_eq!(plan.op.padding_identity_bits(), 0.0f32.to_bits());
     }
+
 }
