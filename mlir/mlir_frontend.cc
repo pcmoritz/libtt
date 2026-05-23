@@ -668,6 +668,174 @@ bool addFusedElementwiseOp(
     return true;
 }
 
+mlir::Operation* singleUser(mlir::Value value) {
+    if (!value.hasOneUse()) {
+        return nullptr;
+    }
+    return *value.user_begin();
+}
+
+bool isBf16Tensor(mlir::Value value) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    return tensor && tensor.hasStaticShape() && tensor.getElementType().isBF16();
+}
+
+bool isS32Tensor(mlir::Value value) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    if (!tensor || !tensor.hasStaticShape()) {
+        return false;
+    }
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(tensor.getElementType());
+    return integer && integer.getWidth() == 32 && !integer.isUnsigned();
+}
+
+bool isTensorShape(mlir::Value value, llvm::ArrayRef<int64_t> shape) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    return tensor && tensor.hasStaticShape() && tensor.getShape() == shape;
+}
+
+bool isSingleRowFlatten(mlir::stablehlo::ReshapeOp reshape_op) {
+    auto input = mlir::dyn_cast<mlir::RankedTensorType>(
+        reshape_op.getOperand().getType());
+    auto output = mlir::dyn_cast<mlir::RankedTensorType>(
+        reshape_op.getResult().getType());
+    if (!input || !output || !input.hasStaticShape() ||
+        !output.hasStaticShape() ||
+        input.getElementType() != output.getElementType() ||
+        input.getRank() != 2 || output.getRank() != 1) {
+        return false;
+    }
+    return input.getShape()[0] == 1 &&
+           output.getShape()[0] == input.getShape()[1];
+}
+
+std::optional<int64_t> topKCompositeK(mlir::stablehlo::CompositeOp composite_op) {
+    if (composite_op.getName() != "chlo.top_k") {
+        return std::nullopt;
+    }
+    auto attrs = composite_op.getCompositeAttributes();
+    auto k = attrs ? attrs.getAs<mlir::IntegerAttr>("k") : nullptr;
+    if (!k) {
+        return std::nullopt;
+    }
+    return k.getInt();
+}
+
+struct MatmulTopKEpilogueRegion {
+    mlir::stablehlo::CompositeOp top_k;
+    mlir::stablehlo::ReshapeOp flatten;
+};
+
+// Lower the decode-logits idiom to a matmul with a top-k epilogue:
+//   dot_general : tensor<1xNxbf16>
+//   reshape     : tensor<1xNxbf16> -> tensor<Nxbf16>
+//   chlo.top_k  : k = 1
+// The full logits and reshape are single-use and are not materialized.
+std::optional<MatmulTopKEpilogueRegion> collectMatmulTopKEpilogue(
+    mlir::stablehlo::DotGeneralOp dot_op) {
+    if (!isBf16Tensor(dot_op.getLhs()) ||
+        !isBf16Tensor(dot_op.getRhs()) ||
+        !isBf16Tensor(dot_op.getResult())) {
+        return std::nullopt;
+    }
+    auto result_type = mlir::cast<mlir::RankedTensorType>(
+        dot_op.getResult().getType());
+    if (!result_type.hasStaticShape() || result_type.getRank() != 2 ||
+        result_type.getShape()[0] != 1) {
+        return std::nullopt;
+    }
+
+    auto* reshape_user = singleUser(dot_op.getResult());
+    auto flatten = reshape_user
+        ? mlir::dyn_cast<mlir::stablehlo::ReshapeOp>(reshape_user)
+        : nullptr;
+    if (!flatten || !isSingleRowFlatten(flatten)) {
+        return std::nullopt;
+    }
+
+    auto* top_k_user = singleUser(flatten.getResult());
+    auto top_k = top_k_user
+        ? mlir::dyn_cast<mlir::stablehlo::CompositeOp>(top_k_user)
+        : nullptr;
+    if (!top_k || top_k->getNumOperands() != 1 ||
+        top_k->getOperand(0) != flatten.getResult() ||
+        top_k->getNumResults() != 2) {
+        return std::nullopt;
+    }
+
+    auto k = topKCompositeK(top_k);
+    if (!k.has_value() || *k != 1) {
+        return std::nullopt;
+    }
+    if (!isBf16Tensor(top_k->getResult(0)) ||
+        !isS32Tensor(top_k->getResult(1)) ||
+        !isTensorShape(top_k->getResult(0), {1}) ||
+        !isTensorShape(top_k->getResult(1), {1})) {
+        return std::nullopt;
+    }
+
+    return MatmulTopKEpilogueRegion{
+        .top_k = top_k,
+        .flatten = flatten,
+    };
+}
+
+void addMatmulDimensions(
+    mlir::stablehlo::DotGeneralOp dot_op,
+    tt::MatmulOp& matmul) {
+    auto dims = dot_op.getDotDimensionNumbers();
+    for (int64_t dim : dims.getLhsBatchingDimensions()) {
+        matmul.add_lhs_batching_dimensions(dim);
+    }
+    for (int64_t dim : dims.getRhsBatchingDimensions()) {
+        matmul.add_rhs_batching_dimensions(dim);
+    }
+    for (int64_t dim : dims.getLhsContractingDimensions()) {
+        matmul.add_lhs_contracting_dimensions(dim);
+    }
+    for (int64_t dim : dims.getRhsContractingDimensions()) {
+        matmul.add_rhs_contracting_dimensions(dim);
+    }
+}
+
+bool addMatmulOp(
+    mlir::stablehlo::DotGeneralOp dot_op,
+    const MatmulTopKEpilogueRegion* top_k_epilogue,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    uint32_t lhs_id = 0;
+    uint32_t rhs_id = 0;
+    uint32_t matmul_output_id = 0;
+    if (!addValueDesc(dot_op.getLhs(), executable, value_ids, error, lhs_id) ||
+        !addValueDesc(dot_op.getRhs(), executable, value_ids, error, rhs_id) ||
+        !addValueDesc(dot_op.getResult(), executable, value_ids, error, matmul_output_id)) {
+        return false;
+    }
+
+    auto* op = executable.add_ops();
+    op->set_output_id(matmul_output_id);
+    auto* matmul = op->mutable_matmul();
+    matmul->set_lhs_id(lhs_id);
+    matmul->set_rhs_id(rhs_id);
+    addMatmulDimensions(dot_op, *matmul);
+
+    if (top_k_epilogue) {
+        uint32_t values_id = 0;
+        uint32_t indices_id = 0;
+        if (!addValueDesc(top_k_epilogue->top_k->getResult(0), executable, value_ids, error, values_id) ||
+            !addValueDesc(top_k_epilogue->top_k->getResult(1), executable, value_ids, error, indices_id)) {
+            return false;
+        }
+        op->set_output_id(values_id);
+        auto* epilogue = matmul->mutable_top_k_epilogue();
+        epilogue->set_matmul_output_id(matmul_output_id);
+        epilogue->set_indices_id(indices_id);
+        epilogue->set_k(1);
+    }
+    return true;
+}
+
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -680,6 +848,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
     auto fused_elementwise = buildFusedElementwisePlan(func);
+    llvm::DenseSet<mlir::Operation*> matmul_top_k_covered_ops;
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
         uint32_t output_id = 0;
@@ -716,6 +885,9 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
         if (fused_elementwise.covered_ops.contains(&op)) {
+            continue;
+        }
+        if (matmul_top_k_covered_ops.contains(&op)) {
             continue;
         }
 
@@ -1152,31 +1324,18 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto dot_op = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op)) {
-            auto dims = dot_op.getDotDimensionNumbers();
-            uint32_t lhs_id = 0;
-            uint32_t rhs_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(dot_op.getLhs(), executable, value_ids, error, lhs_id) ||
-                !addValueDesc(dot_op.getRhs(), executable, value_ids, error, rhs_id) ||
-                !addValueDesc(dot_op.getResult(), executable, value_ids, error, output_id)) {
+            auto epilogue = collectMatmulTopKEpilogue(dot_op);
+            if (!addMatmulOp(
+                    dot_op,
+                    epilogue.has_value() ? &*epilogue : nullptr,
+                    executable,
+                    value_ids,
+                    error)) {
                 return false;
             }
-
-            auto* matmul = executable.add_ops();
-            matmul->set_output_id(output_id);
-            matmul->mutable_matmul()->set_lhs_id(lhs_id);
-            matmul->mutable_matmul()->set_rhs_id(rhs_id);
-            for (int64_t dim : dims.getLhsBatchingDimensions()) {
-                matmul->mutable_matmul()->add_lhs_batching_dimensions(dim);
-            }
-            for (int64_t dim : dims.getRhsBatchingDimensions()) {
-                matmul->mutable_matmul()->add_rhs_batching_dimensions(dim);
-            }
-            for (int64_t dim : dims.getLhsContractingDimensions()) {
-                matmul->mutable_matmul()->add_lhs_contracting_dimensions(dim);
-            }
-            for (int64_t dim : dims.getRhsContractingDimensions()) {
-                matmul->mutable_matmul()->add_rhs_contracting_dimensions(dim);
+            if (epilogue.has_value()) {
+                matmul_top_k_covered_ops.insert(epilogue->flatten.getOperation());
+                matmul_top_k_covered_ops.insert(epilogue->top_k.getOperation());
             }
             continue;
         }

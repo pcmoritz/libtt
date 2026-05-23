@@ -145,6 +145,15 @@ message MatmulOp {
   repeated int64 rhs_batching_dimensions = 4;
   repeated int64 lhs_contracting_dimensions = 5;
   repeated int64 rhs_contracting_dimensions = 6;
+  MatmulTopKEpilogue top_k_epilogue = 7;
+}
+
+message MatmulTopKEpilogue {
+  // Logical full matmul result. This value is not materialized when the
+  // epilogue is present, but its shape is needed to lower dot_general.
+  uint32 matmul_output_id = 1;
+  uint32 indices_id = 2;
+  uint32 k = 3;
 }
 
 message MaxOp {

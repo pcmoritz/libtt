@@ -31,9 +31,9 @@ const BF16_CONTIGUOUS_WRITER_SENDER: &str =
     include_str!("../../kernels/matmul_contiguous_writer_sender.cc");
 const BF16_CONTIGUOUS_WRITER_RECV: &str =
     include_str!("../../kernels/matmul_contiguous_writer_recv.cc");
-const BF16_LM_HEAD_TOP1_WRITER: &str = concat!(
+const BF16_MATMUL_TOP1_WRITER: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
-    include_str!("../../kernels/matmul_lm_head_top1_writer_sender.cc")
+    include_str!("../../kernels/matmul_top1_writer_sender.cc")
 );
 const BF16_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
@@ -164,7 +164,7 @@ struct MatmulBf16Kernel {
     key: MatmulProgramKey,
 }
 
-struct LmHeadTop1Kernel {
+struct MatmulTop1Kernel {
     lhs_addr: u32,
     rhs_addr: u32,
     partial_values_addr: u32,
@@ -172,13 +172,13 @@ struct LmHeadTop1Kernel {
     key: MatmulProgramKey,
 }
 
-impl Kernel<MatmulProgramKey> for LmHeadTop1Kernel {
+impl Kernel<MatmulProgramKey> for MatmulTop1Kernel {
     fn program_key(&self) -> MatmulProgramKey {
         self.key.clone()
     }
 
     fn build_program(&self) -> io::Result<Program> {
-        lm_head_top1_program(
+        matmul_top1_program(
             &self.key,
             self.key.logical_mt,
             self.key.logical_nt,
@@ -325,38 +325,38 @@ pub(crate) fn matmul_bf16_dot_general(
     Ok(output)
 }
 
-pub(crate) fn lm_head_top1_bf16(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_top1_bf16_dot_general(
     device: &mut Device,
     lhs: &DramBuffer,
     rhs: &DramBuffer,
     lhs_logical_shape: &[usize],
     rhs_logical_shape: &[usize],
+    output_logical_shape: &[usize],
+    lhs_batching_dimensions: &[i64],
+    rhs_batching_dimensions: &[i64],
+    lhs_contracting_dimensions: &[i64],
+    rhs_contracting_dimensions: &[i64],
     name: impl Into<String>,
-) -> io::Result<DramBuffer> {
+) -> io::Result<(DramBuffer, DramBuffer)> {
     if lhs.dtype != DType::Float16B || rhs.dtype != DType::Float16B {
         return Err(invalid_input(format!(
-            "lm_head_top1 requires bf16 inputs, got {:?} and {:?}",
+            "matmul_top1 requires bf16 inputs, got {:?} and {:?}",
             lhs.dtype, rhs.dtype
         )));
     }
-    if lhs_logical_shape.len() != 2 || lhs_logical_shape[0] != 1 || rhs_logical_shape.len() != 2 {
-        return Err(invalid_input(format!(
-            "lm_head_top1 expects lhs [1, hidden] and rhs [hidden, vocab], got {lhs_logical_shape:?} and {rhs_logical_shape:?}"
-        )));
-    }
-    let output_logical_shape = [1, rhs_logical_shape[1]];
     let shape = dot_general_shape(
         lhs_logical_shape,
         rhs_logical_shape,
-        &output_logical_shape,
-        &[],
-        &[],
-        &[1],
-        &[0],
+        output_logical_shape,
+        lhs_batching_dimensions,
+        rhs_batching_dimensions,
+        lhs_contracting_dimensions,
+        rhs_contracting_dimensions,
     )?;
     if shape.batch_count != 1 || shape.m != 1 {
         return Err(invalid_input(format!(
-            "lm_head_top1 expects a single row output, got batch_count={} M={}",
+            "matmul_top1 expects a single row output, got batch_count={} M={}",
             shape.batch_count, shape.m
         )));
     }
@@ -368,7 +368,7 @@ pub(crate) fn lm_head_top1_bf16(
     let logical_nt = ceil32(shape.n) / 32;
     let math_fidelity = matmul_math_fidelity()?;
     let cores = device.cores_arc();
-    let plan = plan_lm_head_top1(shape.k, shape.n, &cores)?;
+    let plan = plan_matmul_top1(shape.k, shape.n, &cores)?;
     let partial_count = plan_grid(&plan).iter().map(Vec::len).sum::<usize>();
     let partial_shape = [partial_count * 32, 32];
     let name = name.into();
@@ -396,17 +396,17 @@ pub(crate) fn lm_head_top1_bf16(
         math_fidelity,
         output_dtype: DType::Float16B,
     };
-    let kernel = LmHeadTop1Kernel {
+    let kernel = MatmulTop1Kernel {
         lhs_addr: u32_arg(lhs.addr, "lhs address")?,
         rhs_addr: u32_arg(rhs.addr, "rhs address")?,
         partial_values_addr: u32_arg(partial_values.addr, "partial values address")?,
         partial_indices_addr: u32_arg(partial_indices.addr, "partial indices address")?,
         key,
     };
-    log("lm_head_top1: running partial matmul".to_owned());
+    log("matmul_top1: running partial matmul".to_owned());
     kernel.run(device)?;
-    log("lm_head_top1: partial matmul complete".to_owned());
-    log("lm_head_top1: finalizing partials".to_owned());
+    log("matmul_top1: partial matmul complete".to_owned());
+    log("matmul_top1: finalizing partials".to_owned());
     let (_values, indices) = crate::kernels::topk::top1_finalize_partials(
         device,
         &partial_values,
@@ -414,8 +414,8 @@ pub(crate) fn lm_head_top1_bf16(
         partial_count,
         format!("{name}_top1"),
     )?;
-    log("lm_head_top1: finalize complete".to_owned());
-    Ok(indices)
+    log("matmul_top1: finalize complete".to_owned());
+    Ok((_values, indices))
 }
 
 fn log_matmul_plan(plan: &MatmulPlan) {
@@ -1005,7 +1005,7 @@ fn plan_flat_column_matmul(
     best
 }
 
-fn plan_lm_head_top1(k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
+fn plan_matmul_top1(k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
     let kt = ceil32(k) / 32;
     let nt = (ceil32(n) / 32).max(1);
     let tile_bytes = DType::Float16B.tile_size();
@@ -1081,7 +1081,7 @@ fn plan_lm_head_top1(k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<Matm
 
     best.ok_or_else(|| {
         invalid_input(format!(
-            "no valid lm_head_top1 plan for K={k} N={n} on {} cores",
+            "no valid matmul_top1 plan for K={k} N={n} on {} cores",
             ordered.len()
         ))
     })
@@ -1388,7 +1388,7 @@ fn bf16_program(
     })
 }
 
-fn lm_head_top1_program(
+fn matmul_top1_program(
     key: &MatmulProgramKey,
     logical_mt: usize,
     logical_nt: usize,
@@ -1399,7 +1399,7 @@ fn lm_head_top1_program(
     math_fidelity: MathFidelity,
     output_dtype: DType,
 ) -> io::Result<Program> {
-    let plan = plan_lm_head_top1(
+    let plan = plan_matmul_top1(
         key.logical_kt * 32,
         output_view.logical_cols as usize,
         &key.cores,
@@ -1447,7 +1447,7 @@ fn lm_head_top1_program(
             tiles: plan.out_block_num_tiles(),
         },
     ];
-    let runtime_args = lower_lm_head_top1_runtime_args(
+    let runtime_args = lower_matmul_top1_runtime_args(
         &plan,
         logical_mt,
         logical_nt,
@@ -1458,12 +1458,12 @@ fn lm_head_top1_program(
     )?;
     Ok(Program {
         reader_kernel: BF16_READER_SENDER.to_owned(),
-        writer_kernel: BF16_LM_HEAD_TOP1_WRITER.to_owned(),
+        writer_kernel: BF16_MATMUL_TOP1_WRITER.to_owned(),
         compute_kernel: compute_src(&plan, plan.batches_per_group),
         reader_recv_kernel: BF16_READER_RECV.to_owned(),
-        writer_recv_kernel: BF16_LM_HEAD_TOP1_WRITER.to_owned(),
+        writer_recv_kernel: BF16_MATMUL_TOP1_WRITER.to_owned(),
         name: format!(
-            "lm_head_top1_bf16_{}x{}x{}",
+            "matmul_top1_bf16_{}x{}x{}",
             plan.mt * 32,
             plan.kt * 32,
             plan.nt * 32
@@ -1539,7 +1539,7 @@ fn lower_runtime_args(
     runtime_args.build()
 }
 
-fn lower_lm_head_top1_runtime_args(
+fn lower_matmul_top1_runtime_args(
     plan: &MatmulPlan,
     logical_mt: usize,
     logical_nt: usize,
@@ -1584,7 +1584,7 @@ fn lower_lm_head_top1_runtime_args(
                 total_wave_count,
                 lhs_view,
             )?;
-            let writer = lm_head_top1_writer_args(
+            let writer = matmul_top1_writer_args(
                 plan,
                 &grid,
                 row_index,
@@ -1812,7 +1812,7 @@ fn writer_args(
     Ok(args)
 }
 
-fn lm_head_top1_writer_args(
+fn matmul_top1_writer_args(
     plan: &MatmulPlan,
     grid: &[Vec<CoreCoord>],
     row_index: usize,

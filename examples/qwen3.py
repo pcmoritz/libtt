@@ -20,7 +20,6 @@ import jax.numpy as jnp
 
 USE_TT_ROPE_DECODE = False
 USE_TT_SWIGLU = False
-USE_TT_LM_HEAD_TOP1 = False
 
 
 @dataclass(frozen=True)
@@ -485,13 +484,7 @@ def qwen3_next_token_and_cache(config: Qwen3Config, weights, input_ids, caches=N
     hidden_states, caches = qwen3_forward(config, weights, input_ids, caches=caches)
     head = weights["lm_head"] if "lm_head" in weights else weights["embed_tokens"].T
     hidden = hidden_states[-1:, :]
-    if USE_TT_LM_HEAD_TOP1 and hidden.dtype == jnp.bfloat16 and head.dtype == jnp.bfloat16:
-        token = jax.ffi.ffi_call(
-            "tt.lm_head_top1",
-            jax.ShapeDtypeStruct((1,), jnp.int32),
-        )(hidden, head)[0]
-    else:
-        token = jax.lax.top_k((hidden @ head)[0], 1)[1][0].astype(jnp.int32)
+    token = jax.lax.top_k((hidden @ head)[0], 1)[1][0].astype(jnp.int32)
     return token, caches
 
 
@@ -532,7 +525,7 @@ def timed_generate(config, weights, device, input_ids, args, decode_step):
 
 
 def main():
-    global USE_TT_ROPE_DECODE, USE_TT_SWIGLU, USE_TT_LM_HEAD_TOP1
+    global USE_TT_ROPE_DECODE, USE_TT_SWIGLU
 
     args = parse_args()
     if args.max_new_tokens < 0:
@@ -541,7 +534,6 @@ def main():
     np_dtype = ml_dtypes.bfloat16 if args.dtype == "bf16" else np.float32
     USE_TT_ROPE_DECODE = args.backend == "tt" and args.dtype == "bf16"
     USE_TT_SWIGLU = args.backend == "tt" and args.dtype == "bf16"
-    USE_TT_LM_HEAD_TOP1 = args.backend == "tt" and args.dtype == "bf16"
 
     if args.random_weights:
         config = make_random_config(args)
