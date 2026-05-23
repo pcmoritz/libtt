@@ -121,12 +121,6 @@ impl MatmulRuntimeEpilogue {
         }
     }
 
-    fn before_run(&self) {
-        if matches!(self, Self::Top1 { .. }) {
-            log("matmul_top1: running partial matmul".to_owned());
-        }
-    }
-
     fn finalize(self, device: &mut Device) -> io::Result<MatmulOutput> {
         match self {
             Self::Store { output, .. } => Ok(MatmulOutput::Store(output)),
@@ -429,7 +423,6 @@ pub(crate) fn matmul_bf16_dot_general(
         epilogue: runtime_epilogue,
         key,
     };
-    kernel.epilogue.before_run();
     kernel.run(device)?;
     let MatmulBf16Kernel { epilogue, .. } = kernel;
     epilogue.finalize(device)
