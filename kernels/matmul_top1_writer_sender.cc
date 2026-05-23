@@ -1,7 +1,7 @@
 #include <cstdint>
 
 namespace {
-constexpr uint32_t ARG_RHS_VIEW_KIND = 39;
+constexpr uint32_t ARG_RHS_VIEW_KIND = 38;
 constexpr uint32_t ARG_OUTPUT_VIEW_KIND = ARG_RHS_VIEW_KIND + VIEW_ARG_COUNT;
 constexpr uint32_t BF16_NEG_INF = 0xff80;
 
@@ -33,20 +33,20 @@ struct OutputTop1 {
 OutputTop1 load_output_top1() {
   return {
       .view = load_view(ARG_OUTPUT_VIEW_KIND),
-      .start = A(20),
-      .stride_w = A(21),
-      .stride_h = A(22),
-      .next_sb_w = A(23),
-      .next_sb_h = A(24),
-      .sb_w = A(25),
-      .sb_h = A(26),
-      .sb_tiles = A(27),
-      .num_sb_w = A(28),
-      .num_sb_h = A(29),
-      .logical_mt = A(30),
-      .logical_nt = A(31),
-      .col_offset = A(32),
-      .partial_tile_id = A(33),
+      .start = A(19),
+      .stride_w = A(20),
+      .stride_h = A(21),
+      .next_sb_w = A(22),
+      .next_sb_h = A(23),
+      .sb_w = A(24),
+      .sb_h = A(25),
+      .sb_tiles = A(26),
+      .num_sb_w = A(27),
+      .num_sb_h = A(28),
+      .logical_mt = A(29),
+      .logical_nt = A(30),
+      .col_offset = A(31),
+      .partial_tile_id = A(32),
   };
 }
 
@@ -113,41 +113,24 @@ void zero_tile(uint32_t cb) {
 }
 
 void write_partial(const OutputTop1 &output, const Top1 &best) {
-  constexpr uint32_t cb_values = tt::CBIndex::c_4;
-  constexpr uint32_t cb_indices = tt::CBIndex::c_17;
+  constexpr uint32_t cb_pairs = tt::CBIndex::c_4;
 
-  const InterleavedAddrGenFast<true> partial_values = {
+  const InterleavedAddrGenFast<true> partial_pairs = {
       .bank_base_address = A(18),
-      .page_size = get_tile_size(cb_values),
-      .data_format = get_dataformat(cb_values),
-  };
-  const InterleavedAddrGenFast<true> partial_indices = {
-      .bank_base_address = A(19),
-      .page_size = get_tile_size(cb_indices),
-      .data_format = get_dataformat(cb_indices),
+      .page_size = get_tile_size(cb_pairs),
+      .data_format = get_dataformat(cb_pairs),
   };
 
-  cb_reserve_back(cb_values, 1);
-  zero_tile(cb_values);
-  volatile tt_l1_ptr uint16_t *value_ptr =
-      reinterpret_cast<volatile tt_l1_ptr uint16_t *>(get_write_ptr(cb_values));
-  value_ptr[tile_element_index(0, 0)] =
-      static_cast<uint16_t>(best.have_best ? best.value : BF16_NEG_INF);
-  noc_async_write_tile(output.partial_tile_id, partial_values, get_write_ptr(cb_values));
+  cb_reserve_back(cb_pairs, 1);
+  zero_tile(cb_pairs);
+  volatile tt_l1_ptr uint32_t *pair_ptr =
+      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_write_ptr(cb_pairs));
+  pair_ptr[tile_element_index(0, 0)] = best.have_best ? best.value : BF16_NEG_INF;
+  pair_ptr[tile_element_index(0, 1)] = best.have_best ? best.index : 0xffffffffu;
+  noc_async_write_tile(output.partial_tile_id, partial_pairs, get_write_ptr(cb_pairs));
   noc_async_write_barrier();
-  cb_push_back(cb_values, 1);
-  cb_pop_front(cb_values, 1);
-
-  cb_reserve_back(cb_indices, 1);
-  zero_tile(cb_indices);
-  volatile tt_l1_ptr int32_t *index_ptr =
-      reinterpret_cast<volatile tt_l1_ptr int32_t *>(get_write_ptr(cb_indices));
-  index_ptr[tile_element_index(0, 0)] =
-      static_cast<int32_t>(best.have_best ? best.index : 0xffffffffu);
-  noc_async_write_tile(output.partial_tile_id, partial_indices, get_write_ptr(cb_indices));
-  noc_async_write_barrier();
-  cb_push_back(cb_indices, 1);
-  cb_pop_front(cb_indices, 1);
+  cb_push_back(cb_pairs, 1);
+  cb_pop_front(cb_pairs, 1);
 }
 
 }  // namespace
@@ -161,11 +144,11 @@ void kernel_main() {
   const uint32_t block_tiles = A(7);
   const uint32_t nblocks = A(8);
   const uint32_t i1_nd = A(13);
-  const uint32_t logical_nt = A(31);
-  const uint32_t local_batch_count = A(34);
-  const uint32_t batch_start = A(35);
-  const uint32_t total_batch_count = A(36);
-  const uint32_t rhs_batch_stride = A(37);
+  const uint32_t logical_nt = A(30);
+  const uint32_t local_batch_count = A(33);
+  const uint32_t batch_start = A(34);
+  const uint32_t total_batch_count = A(35);
+  const uint32_t rhs_batch_stride = A(36);
   const View view = load_view(ARG_RHS_VIEW_KIND);
   const OutputTop1 output_top1 = load_output_top1();
   Top1 best = {.have_best = false, .key = 0, .value = BF16_NEG_INF, .index = 0xffffffffu};

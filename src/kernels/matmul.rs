@@ -32,8 +32,7 @@ const NUM_SEMAPHORES: usize = 4;
 const READER_LHS_ADDR_INDEX: usize = 0;
 const WRITER_RHS_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
-const WRITER_PARTIAL_VALUES_ADDR_INDEX: usize = 18;
-const WRITER_PARTIAL_INDICES_ADDR_INDEX: usize = 19;
+const WRITER_PARTIAL_PAIRS_ADDR_INDEX: usize = 18;
 const MAX_RANK: usize = 8;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -87,10 +86,8 @@ enum MatmulRuntimeEpilogue {
         output_addr: u32,
     },
     Top1 {
-        partial_values: DramBuffer,
-        partial_indices: DramBuffer,
-        partial_values_addr: u32,
-        partial_indices_addr: u32,
+        partial_pairs: DramBuffer,
+        partial_pairs_addr: u32,
         partial_count: usize,
         name: String,
     },
@@ -110,12 +107,9 @@ impl MatmulRuntimeEpilogue {
                 (index == WRITER_OUTPUT_ADDR_INDEX).then_some(*output_addr)
             }
             Self::Top1 {
-                partial_values_addr,
-                partial_indices_addr,
-                ..
+                partial_pairs_addr, ..
             } => match index {
-                WRITER_PARTIAL_VALUES_ADDR_INDEX => Some(*partial_values_addr),
-                WRITER_PARTIAL_INDICES_ADDR_INDEX => Some(*partial_indices_addr),
+                WRITER_PARTIAL_PAIRS_ADDR_INDEX => Some(*partial_pairs_addr),
                 _ => None,
             },
         }
@@ -125,8 +119,7 @@ impl MatmulRuntimeEpilogue {
         match self {
             Self::Store { output, .. } => Ok(MatmulOutput::Store(output)),
             Self::Top1 {
-                partial_values,
-                partial_indices,
+                partial_pairs,
                 partial_count,
                 name,
                 ..
@@ -135,8 +128,7 @@ impl MatmulRuntimeEpilogue {
                 log("matmul_top1: finalizing partials".to_owned());
                 let (values, indices) = crate::kernels::topk::top1_finalize_partials(
                     device,
-                    &partial_values,
-                    &partial_indices,
+                    &partial_pairs,
                     partial_count,
                     format!("{name}_top1"),
                 )?;
@@ -392,25 +384,16 @@ pub(crate) fn matmul_bf16_dot_general(
             let plan = plan_for_key(&key)?;
             let partial_count = plan_grid(&plan).iter().map(Vec::len).sum::<usize>();
             let partial_shape = [partial_count * 32, 32];
-            let partial_values = device.alloc(
-                partial_count,
-                DType::Float16B,
-                &partial_shape,
-                format!("{name}_partial_values"),
-            )?;
-            let partial_indices = device.alloc(
+            let partial_pairs = device.alloc(
                 partial_count,
                 DType::Int32,
                 &partial_shape,
-                format!("{name}_partial_indices"),
+                format!("{name}_partial_pairs"),
             )?;
-            let partial_values_addr = u32_arg(partial_values.addr, "partial values address")?;
-            let partial_indices_addr = u32_arg(partial_indices.addr, "partial indices address")?;
+            let partial_pairs_addr = u32_arg(partial_pairs.addr, "partial pairs address")?;
             MatmulRuntimeEpilogue::Top1 {
-                partial_values,
-                partial_indices,
-                partial_values_addr,
-                partial_indices_addr,
+                partial_pairs,
+                partial_pairs_addr,
                 partial_count,
                 name,
             }
@@ -1138,7 +1121,7 @@ fn bf16_program(
     output_dtype: DType,
     epilogue: MatmulEpilogueKind,
 ) -> io::Result<Program> {
-    let mut cbs = vec![
+    let cbs = vec![
         CBConfig {
             index: 0,
             dtype: DType::Float16B,
@@ -1161,7 +1144,11 @@ fn bf16_program(
         },
         CBConfig {
             index: 4,
-            dtype: output_dtype,
+            dtype: if epilogue == MatmulEpilogueKind::Top1 {
+                DType::Int32
+            } else {
+                output_dtype
+            },
             tiles: 1,
         },
         CBConfig {
@@ -1175,13 +1162,6 @@ fn bf16_program(
             tiles: plan.out_block_num_tiles(),
         },
     ];
-    if epilogue == MatmulEpilogueKind::Top1 {
-        cbs.push(CBConfig {
-            index: 17,
-            dtype: DType::Int32,
-            tiles: 1,
-        });
-    }
     let runtime_args = lower_runtime_args(
         plan,
         logical_mt,
@@ -1243,11 +1223,7 @@ fn lower_runtime_args(
     let grid = plan_grid(plan);
     let writer_dynamic_indices = match epilogue {
         MatmulEpilogueKind::Store => vec![WRITER_RHS_ADDR_INDEX, WRITER_OUTPUT_ADDR_INDEX],
-        MatmulEpilogueKind::Top1 => vec![
-            WRITER_RHS_ADDR_INDEX,
-            WRITER_PARTIAL_VALUES_ADDR_INDEX,
-            WRITER_PARTIAL_INDICES_ADDR_INDEX,
-        ],
+        MatmulEpilogueKind::Top1 => vec![WRITER_RHS_ADDR_INDEX, WRITER_PARTIAL_PAIRS_ADDR_INDEX],
     };
     let mut runtime_args = RuntimeArgsBuilder::new(
         NUM_SEMAPHORES,
@@ -1472,9 +1448,6 @@ fn writer_args(
         args.push(value);
     }
     args.extend([sender.x as u32, sender.y as u32, 2, 3, 0]);
-    if let WriterEpilogue::Top1 { .. } = epilogue {
-        args.push(0);
-    }
     args.extend([
         u32_value(out_start, "output tile offset")?,
         1,

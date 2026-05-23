@@ -26,24 +26,8 @@ uint32_t ordered_float_key(uint32_t bits) {
   return (bits & 0x80000000u) != 0 ? ~bits : (bits ^ 0x80000000u);
 }
 
-uint32_t load_value_bits(uint32_t tile_l1_addr, uint32_t element) {
-#if defined(TOPK_DTYPE_BFLOAT16)
-  volatile tt_l1_ptr uint16_t *ptr =
-      reinterpret_cast<volatile tt_l1_ptr uint16_t *>(tile_l1_addr);
-  return ptr[element];
-#elif defined(TOPK_DTYPE_FLOAT32)
-  volatile tt_l1_ptr uint32_t *ptr =
-      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(tile_l1_addr);
-  return ptr[element];
-#endif
-}
-
 uint32_t value_key(uint32_t value_bits) {
-#if defined(TOPK_DTYPE_BFLOAT16)
   return ordered_float_key(value_bits << 16);
-#elif defined(TOPK_DTYPE_FLOAT32)
-  return ordered_float_key(value_bits);
-#endif
 }
 
 bool candidate_before(uint32_t lhs_key, uint32_t lhs_index, uint32_t rhs_key, uint32_t rhs_index) {
@@ -51,40 +35,27 @@ bool candidate_before(uint32_t lhs_key, uint32_t lhs_index, uint32_t rhs_key, ui
 }
 
 void store_value(uint32_t tile_l1_addr, uint32_t element, uint32_t value_bits) {
-#if defined(TOPK_DTYPE_BFLOAT16)
   volatile tt_l1_ptr uint16_t *ptr =
       reinterpret_cast<volatile tt_l1_ptr uint16_t *>(tile_l1_addr);
   ptr[element] = static_cast<uint16_t>(value_bits);
-#elif defined(TOPK_DTYPE_FLOAT32)
-  volatile tt_l1_ptr uint32_t *ptr =
-      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(tile_l1_addr);
-  ptr[element] = value_bits;
-#endif
 }
 
 }  // namespace
 
 void kernel_main() {
-  uint32_t partial_values_addr = get_arg_val<uint32_t>(0);
-  uint32_t partial_indices_addr = get_arg_val<uint32_t>(1);
-  uint32_t values_addr = get_arg_val<uint32_t>(2);
-  uint32_t indices_addr = get_arg_val<uint32_t>(3);
-  uint32_t partial_count = get_arg_val<uint32_t>(4);
+  uint32_t partial_pairs_addr = get_arg_val<uint32_t>(0);
+  uint32_t values_addr = get_arg_val<uint32_t>(1);
+  uint32_t indices_addr = get_arg_val<uint32_t>(2);
+  uint32_t partial_count = get_arg_val<uint32_t>(3);
 
-  constexpr uint32_t cb_partial_values = tt::CBIndex::c_0;
-  constexpr uint32_t cb_partial_indices = tt::CBIndex::c_1;
+  constexpr uint32_t cb_partial_pairs = tt::CBIndex::c_0;
   constexpr uint32_t cb_values = tt::CBIndex::c_16;
   constexpr uint32_t cb_indices = tt::CBIndex::c_17;
 
-  const InterleavedAddrGenFast<true> partial_values = {
-      .bank_base_address = partial_values_addr,
-      .page_size = get_tile_size(cb_partial_values),
-      .data_format = get_dataformat(cb_partial_values),
-  };
-  const InterleavedAddrGenFast<true> partial_indices = {
-      .bank_base_address = partial_indices_addr,
-      .page_size = get_tile_size(cb_partial_indices),
-      .data_format = get_dataformat(cb_partial_indices),
+  const InterleavedAddrGenFast<true> partial_pairs = {
+      .bank_base_address = partial_pairs_addr,
+      .page_size = get_tile_size(cb_partial_pairs),
+      .data_format = get_dataformat(cb_partial_pairs),
   };
   const InterleavedAddrGenFast<true> values = {
       .bank_base_address = values_addr,
@@ -101,26 +72,18 @@ void kernel_main() {
   uint32_t best_key = 0;
   uint32_t best_value = 0;
   uint32_t best_index = 0;
-  constexpr uint32_t element = 0;
 
   for (uint32_t tile_id = 0; tile_id < partial_count; ++tile_id) {
-    cb_reserve_back(cb_partial_values, 1);
-    uint32_t value_l1_addr = get_write_ptr(cb_partial_values);
-    noc_async_read_tile(tile_id, partial_values, value_l1_addr);
+    cb_reserve_back(cb_partial_pairs, 1);
+    uint32_t pair_l1_addr = get_write_ptr(cb_partial_pairs);
+    noc_async_read_tile(tile_id, partial_pairs, pair_l1_addr);
     noc_async_read_barrier();
-    uint32_t value_bits = load_value_bits(value_l1_addr, tile_element_index(0, element));
-    cb_push_back(cb_partial_values, 1);
-    cb_pop_front(cb_partial_values, 1);
-
-    cb_reserve_back(cb_partial_indices, 1);
-    uint32_t index_l1_addr = get_write_ptr(cb_partial_indices);
-    noc_async_read_tile(tile_id, partial_indices, index_l1_addr);
-    noc_async_read_barrier();
-    volatile tt_l1_ptr int32_t *index_ptr =
-        reinterpret_cast<volatile tt_l1_ptr int32_t *>(index_l1_addr);
-    uint32_t index = static_cast<uint32_t>(index_ptr[tile_element_index(0, element)]);
-    cb_push_back(cb_partial_indices, 1);
-    cb_pop_front(cb_partial_indices, 1);
+    volatile tt_l1_ptr uint32_t *pair_ptr =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t *>(pair_l1_addr);
+    uint32_t value_bits = pair_ptr[tile_element_index(0, 0)];
+    uint32_t index = pair_ptr[tile_element_index(0, 1)];
+    cb_push_back(cb_partial_pairs, 1);
+    cb_pop_front(cb_partial_pairs, 1);
 
     uint32_t key = value_key(value_bits);
     if (!have_best || candidate_before(key, index, best_key, best_index)) {
