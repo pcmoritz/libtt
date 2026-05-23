@@ -2242,7 +2242,7 @@ fn execute_matmul(
         }
 
         let matmul_shape = dims_i64_to_usize(&matmul_desc.dims)?;
-        let (values_dram, indices_dram) = kernels::matmul::matmul_top1_bf16_dot_general(
+        let matmul_output = kernels::matmul::matmul_bf16_dot_general(
             device,
             lhs_dram,
             rhs_dram,
@@ -2253,9 +2253,18 @@ fn execute_matmul(
             &dimension_numbers.rhs_batching_dimensions,
             &dimension_numbers.lhs_contracting_dimensions,
             &dimension_numbers.rhs_contracting_dimensions,
+            kernels::matmul::MatmulEpilogue::Top1,
             "pjrt_matmul_top_k",
         )
         .map_err(io_error)?;
+        let (values_dram, indices_dram) = match matmul_output {
+            kernels::matmul::MatmulOutput::Top1 { values, indices } => (values, indices),
+            kernels::matmul::MatmulOutput::Store(_) => {
+                return Err(invalid_argument(
+                    "TT executable matmul top_k epilogue returned a stored matmul output",
+                ));
+            }
+        };
         store_output_buffer(
             values,
             plan,
@@ -2303,10 +2312,18 @@ fn execute_matmul(
         &dimension_numbers.rhs_batching_dimensions,
         &dimension_numbers.lhs_contracting_dimensions,
         &dimension_numbers.rhs_contracting_dimensions,
-        output_dtype,
+        kernels::matmul::MatmulEpilogue::Store { output_dtype },
         "pjrt_matmul",
     )
     .map_err(io_error)?;
+    let output_dram = match output_dram {
+        kernels::matmul::MatmulOutput::Store(output) => output,
+        kernels::matmul::MatmulOutput::Top1 { .. } => {
+            return Err(invalid_argument(
+                "TT executable matmul returned a top_k epilogue output for normal matmul",
+            ));
+        }
+    };
     store_output_buffer(
         values,
         plan,
