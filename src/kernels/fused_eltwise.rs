@@ -532,8 +532,7 @@ pub(crate) fn eltwise(
     shape: &[usize],
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
-    validate_fused_eltwise(external_inputs, nodes, shape)?;
-    let input_reads = input_reads(external_inputs, nodes)?;
+    let input_reads = validate_and_collect_inputs(external_inputs, nodes, shape)?;
 
     let output_tiles = tiled_shape_tile_count(shape)?;
     let tile_count = u32_arg(output_tiles, "tile count")?;
@@ -561,11 +560,11 @@ pub(crate) fn eltwise(
     Ok(output)
 }
 
-fn validate_fused_eltwise(
-    external_inputs: &[&DramBuffer],
+fn validate_and_collect_inputs<'a>(
+    external_inputs: &[&'a DramBuffer],
     nodes: &[FusedEltwiseNode],
     shape: &[usize],
-) -> io::Result<()> {
+) -> io::Result<Vec<&'a DramBuffer>> {
     if external_inputs.len() > MAX_FUSED_INPUTS {
         return Err(invalid_input(format!(
             "fused eltwise supports at most {MAX_FUSED_INPUTS} external inputs, got {}",
@@ -590,6 +589,7 @@ fn validate_fused_eltwise(
 
     let expected_tiles = tiled_shape_tile_count(shape)?;
     let expected_shape = tiled_allocation_shape(shape)?;
+    let mut input_reads = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         match node.op {
             FusedEltwiseOp::Input => {
@@ -643,6 +643,7 @@ fn validate_fused_eltwise(
                         )));
                     }
                 }
+                input_reads.push(buffer);
             }
             FusedEltwiseOp::Constant => {
                 if !is_supported_leaf_dtype(node.dtype) {
@@ -673,42 +674,13 @@ fn validate_fused_eltwise(
             .collect::<Vec<_>>();
         node.op.validate_dtypes(index, &input_dtypes, node.dtype)?;
     }
-    let leaf_count = nodes
-        .iter()
-        .filter(|node| node.op == FusedEltwiseOp::Input)
-        .count();
-    if leaf_count == 0 || leaf_count > MAX_FUSED_INPUTS {
+    if input_reads.is_empty() || input_reads.len() > MAX_FUSED_INPUTS {
         return Err(invalid_input(format!(
-            "fused eltwise requires 1..={MAX_FUSED_INPUTS} leaf inputs, got {leaf_count}"
+            "fused eltwise requires 1..={MAX_FUSED_INPUTS} leaf inputs, got {}",
+            input_reads.len()
         )));
     }
-    Ok(())
-}
-
-fn input_reads<'a>(
-    external_inputs: &[&'a DramBuffer],
-    nodes: &[FusedEltwiseNode],
-) -> io::Result<Vec<&'a DramBuffer>> {
-    let mut inputs = Vec::new();
-    for (index, node) in nodes.iter().enumerate() {
-        match node.op {
-            FusedEltwiseOp::Input => {
-                let input_index = usize::try_from(node.input_index).map_err(|_| {
-                    invalid_input(format!("node[{index}] input index is out of range"))
-                })?;
-                let input = external_inputs.get(input_index).copied().ok_or_else(|| {
-                    invalid_input(format!(
-                        "node[{index}] input index {} is out of bounds",
-                        node.input_index
-                    ))
-                })?;
-                inputs.push(input);
-            }
-            FusedEltwiseOp::Constant => {}
-            _ => {}
-        }
-    }
-    Ok(inputs)
+    Ok(input_reads)
 }
 
 fn validate_node_inputs(index: usize, node: &FusedEltwiseNode, expected: usize) -> io::Result<()> {
