@@ -8,8 +8,25 @@ use std::fmt::Display;
 use std::io;
 
 const WRITER: &str = include_str!("../../kernels/tile_writer.cc");
+const COMPUTE: &str = include_str!("../../kernels/fused_eltwise_compute.cc");
 const MAX_FUSED_INPUTS: usize = 8;
 const MAX_FUSED_NODES: usize = 16;
+
+const HEADER_ADD_INT: &str = "compute_kernel_api/add_int_sfpu.h";
+const HEADER_BINARY_MAX_MIN: &str = "compute_kernel_api/binary_max_min.h";
+const HEADER_BINARY_SFPU: &str = "compute_kernel_api/eltwise_binary_sfpu.h";
+const HEADER_BINOP_WITH_SCALAR: &str = "compute_kernel_api/eltwise_unary/binop_with_scalar.h";
+const HEADER_COMP: &str = "compute_kernel_api/eltwise_unary/comp.h";
+const HEADER_EXP: &str = "compute_kernel_api/eltwise_unary/exp.h";
+const HEADER_MUL_INT: &str = "compute_kernel_api/mul_int_sfpu.h";
+const HEADER_MUL_INT32: &str = "compute_kernel_api/mul_int32_sfpu.h";
+const HEADER_NEGATIVE: &str = "compute_kernel_api/eltwise_unary/negative.h";
+const HEADER_RDIV: &str = "compute_kernel_api/eltwise_unary/rdiv.h";
+const HEADER_RPOW: &str = "compute_kernel_api/eltwise_unary/rpow.h";
+const HEADER_RSQRT: &str = "compute_kernel_api/eltwise_unary/rsqrt.h";
+const HEADER_SUB_INT: &str = "compute_kernel_api/sub_int_sfpu.h";
+const HEADER_TRIGONOMETRY: &str = "compute_kernel_api/eltwise_unary/trigonometry.h";
+const HEADER_TYPECAST: &str = "compute_kernel_api/eltwise_unary/typecast.h";
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum FusedEltwiseOp {
@@ -32,12 +49,14 @@ pub(crate) enum FusedEltwiseOp {
 
 #[derive(Clone, Copy)]
 struct UnaryCompute {
+    header: &'static str,
     init: &'static str,
     tile: &'static str,
 }
 
 #[derive(Clone, Copy)]
 struct BinaryCompute {
+    header: &'static str,
     init: &'static str,
     tile: &'static str,
 }
@@ -52,6 +71,7 @@ enum ScalarOperand {
 struct ScalarCompute {
     operand: ScalarOperand,
     scalar: u32,
+    header: Option<&'static str>,
     init: &'static str,
     tile: &'static str,
 }
@@ -197,22 +217,27 @@ impl FusedEltwiseOp {
     fn unary_compute(self) -> Option<UnaryCompute> {
         match self {
             Self::Negate => Some(UnaryCompute {
+                header: HEADER_NEGATIVE,
                 init: "negative_tile_init();",
                 tile: "negative_tile(0);",
             }),
             Self::Cosine => Some(UnaryCompute {
+                header: HEADER_TRIGONOMETRY,
                 init: "cos_tile_init();",
                 tile: "cos_tile(0);",
             }),
             Self::Sine => Some(UnaryCompute {
+                header: HEADER_TRIGONOMETRY,
                 init: "sin_tile_init();",
                 tile: "sin_tile(0);",
             }),
             Self::Exponential => Some(UnaryCompute {
+                header: HEADER_EXP,
                 init: "exp_tile_init();",
                 tile: "exp_tile(0);",
             }),
             Self::Rsqrt => Some(UnaryCompute {
+                header: HEADER_RSQRT,
                 init: "rsqrt_tile_init();",
                 tile: "rsqrt_tile(0);",
             }),
@@ -232,14 +257,17 @@ impl FusedEltwiseOp {
     fn binary_compute(self) -> Option<BinaryCompute> {
         match self {
             Self::Divide => Some(BinaryCompute {
+                header: HEADER_BINARY_SFPU,
                 init: "div_binary_tile_init",
                 tile: "div_binary_tile",
             }),
             Self::Power => Some(BinaryCompute {
+                header: HEADER_BINARY_SFPU,
                 init: "power_binary_tile_init",
                 tile: "power_binary_tile",
             }),
             Self::Max => Some(BinaryCompute {
+                header: HEADER_BINARY_MAX_MIN,
                 init: "binary_max_tile_init",
                 tile: "binary_max_tile",
             }),
@@ -263,17 +291,19 @@ impl FusedEltwiseOp {
             Some(ScalarCompute {
                 operand,
                 scalar,
+                header: Some(HEADER_BINOP_WITH_SCALAR),
                 init: "binop_with_scalar_tile_init",
                 tile,
             })
         };
-        let float_scalar_op = |operand, dtype, scalar, init, tile| {
+        let float_scalar_op = |operand, dtype, scalar, header, init, tile| {
             if !is_float_dtype(dtype) {
                 return None;
             }
             Some(ScalarCompute {
                 operand,
                 scalar,
+                header,
                 init,
                 tile,
             })
@@ -305,6 +335,7 @@ impl FusedEltwiseOp {
                 ScalarOperand::Rhs,
                 rhs_dtype,
                 scalar,
+                Some(HEADER_BINOP_WITH_SCALAR),
                 "binop_with_scalar_tile_init",
                 "rsub_unary_tile",
             ),
@@ -312,6 +343,7 @@ impl FusedEltwiseOp {
                 ScalarOperand::Lhs,
                 lhs_dtype,
                 scalar,
+                Some(HEADER_BINOP_WITH_SCALAR),
                 "binop_with_scalar_tile_init",
                 "mul_unary_tile",
             ),
@@ -319,6 +351,7 @@ impl FusedEltwiseOp {
                 ScalarOperand::Rhs,
                 rhs_dtype,
                 scalar,
+                Some(HEADER_BINOP_WITH_SCALAR),
                 "binop_with_scalar_tile_init",
                 "mul_unary_tile",
             ),
@@ -326,6 +359,7 @@ impl FusedEltwiseOp {
                 ScalarOperand::Lhs,
                 lhs_dtype,
                 (1.0f32 / f32::from_bits(scalar)).to_bits(),
+                Some(HEADER_BINOP_WITH_SCALAR),
                 "binop_with_scalar_tile_init",
                 "div_unary_tile",
             ),
@@ -333,6 +367,7 @@ impl FusedEltwiseOp {
                 ScalarOperand::Rhs,
                 rhs_dtype,
                 scalar,
+                Some(HEADER_RDIV),
                 "rdiv_tile_init",
                 "rdiv_tile",
             ),
@@ -340,6 +375,7 @@ impl FusedEltwiseOp {
                 ScalarOperand::Lhs,
                 lhs_dtype,
                 scalar,
+                None,
                 "power_tile_init",
                 "power_tile",
             ),
@@ -347,6 +383,7 @@ impl FusedEltwiseOp {
                 ScalarOperand::Rhs,
                 rhs_dtype,
                 scalar,
+                Some(HEADER_RPOW),
                 "rpow_tile_init",
                 "rpow_tile",
             ),
@@ -354,14 +391,16 @@ impl FusedEltwiseOp {
                 ScalarOperand::Lhs,
                 lhs_dtype,
                 scalar,
-                "binop_with_scalar_tile_init",
+                None,
+                "unary_max_tile_init",
                 "unary_max_tile",
             ),
             (Self::Max, Some(scalar), None) => float_scalar_op(
                 ScalarOperand::Rhs,
                 rhs_dtype,
                 scalar,
-                "binop_with_scalar_tile_init",
+                None,
+                "unary_max_tile_init",
                 "unary_max_tile",
             ),
             _ => None,
@@ -520,7 +559,10 @@ pub(crate) fn eltwise(
     let mut input_addrs = Vec::with_capacity(input_reads.len());
     let mut input_dtypes = Vec::with_capacity(input_reads.len());
     for (index, input) in input_reads.iter().enumerate() {
-        input_addrs.push(u32_arg(input.buffer.addr, &format!("input[{index}] address"))?);
+        input_addrs.push(u32_arg(
+            input.buffer.addr,
+            &format!("input[{index}] address"),
+        )?);
         input_dtypes.push(input.dtype);
     }
 
@@ -836,66 +878,120 @@ fn reader_source(input_broadcasts: &[bool], input_dtypes: &[DType]) -> String {
 
 fn compute_source(key: &FusedEltwiseProgramKey) -> io::Result<String> {
     let steps = compute_steps(&key.nodes, key.root_node_id)?;
-    Ok(format!(
-        "#include <cstdint>\n\
-         #include \"compute_kernel_api/common.h\"\n\
-         #include \"compute_kernel_api/tile_move_copy.h\"\n\
-         #include \"compute_kernel_api/eltwise_unary/eltwise_unary.h\"\n\
-         #include \"compute_kernel_api/eltwise_unary/negative.h\"\n\
-         #include \"compute_kernel_api/eltwise_unary/exp.h\"\n\
-         #include \"compute_kernel_api/eltwise_unary/rsqrt.h\"\n\
-         #include \"compute_kernel_api/eltwise_unary/binop_with_scalar.h\"\n\
-         #include \"compute_kernel_api/eltwise_unary/rdiv.h\"\n\
-         #include \"compute_kernel_api/eltwise_unary/rpow.h\"\n\
-         #include \"compute_kernel_api/eltwise_unary/trigonometry.h\"\n\
-         #include \"compute_kernel_api/eltwise_unary/typecast.h\"\n\
-         #include \"compute_kernel_api/eltwise_binary_sfpu.h\"\n\
-         #include \"compute_kernel_api/eltwise_unary/sfpu_split_includes.h\"\n\
-         #include \"compute_kernel_api/binary_max_min.h\"\n\
-         #include \"compute_kernel_api/add_int_sfpu.h\"\n\
-         #include \"compute_kernel_api/sub_int_sfpu.h\"\n\
-         #include \"compute_kernel_api/mul_int_sfpu.h\"\n\
-         #include \"compute_kernel_api/mul_int32_sfpu.h\"\n\
-         #include \"compute_kernel_api/eltwise_unary/comp.h\"\n\
-         #include \"compute_kernel_api.h\"\n\
-         \n\
-         namespace NAMESPACE {{\n\
-         ELTWISE_HELPERS\
-         void MAIN {{\n\
-           uint32_t n_tiles = get_arg_val<uint32_t>(0);\n\
-           constexpr uint32_t cb_out = tt::CBIndex::c_16;\n\
-         \n\
-          unary_op_init_common(tt::CBIndex::c_0, cb_out);\n\
-          add_binary_tile_init();\n\
-          sub_binary_tile_init();\n\
-          mul_binary_tile_init();\n\
-          div_binary_tile_init();\n\
-          binary_max_tile_init();\n\
-          unary_max_tile_init();\n\
-          negative_tile_init();\n\
-          exp_tile_init();\n\
-          rsqrt_tile_init();\n\
-          cos_tile_init();\n\
-          sin_tile_init();\n\
-           binop_with_scalar_tile_init();\n\
-           rdiv_tile_init();\n\
-           rpow_tile_init();\n\
-           power_tile_init();\n\
-           power_binary_tile_init();\n\
-           FUSED_TYPECAST_INITS\n\
-         \n\
-           for (uint32_t i = 0; i < n_tiles; ++i) {{\n\
-         FUSED_STEPS\
-           }}\n\
-         }}\n\
-         }}  // namespace NAMESPACE\n"
-    )
-    .replace("ELTWISE_HELPERS", compute_helpers())
-    .replace("FUSED_TYPECAST_INITS", &steps.typecast_inits)
-    .replace("FUSED_STEPS", &steps.body))
+    Ok(COMPUTE
+        .replace("FUSED_HEADERS", &steps.features.headers_source())
+        .replace("FUSED_HELPERS", &steps.features.helpers_source())
+        .replace("FUSED_TYPECAST_INITS", &steps.typecast_inits)
+        .replace("FUSED_STEPS", &steps.body))
 }
 
-fn compute_helpers() -> &'static str {
+#[derive(Default)]
+struct ComputeSourceFeatures {
+    headers: Vec<&'static str>,
+    add_input_helper: bool,
+    subtract_input_helper: bool,
+    multiply_input_helper: bool,
+    compare_helpers: bool,
+}
+
+impl ComputeSourceFeatures {
+    fn add_header(&mut self, header: &'static str) {
+        if !self.headers.contains(&header) {
+            self.headers.push(header);
+        }
+    }
+
+    fn add_unary(&mut self, unary: UnaryCompute) {
+        self.add_header(unary.header);
+    }
+
+    fn add_binary(&mut self, binary: BinaryCompute) {
+        self.add_header(binary.header);
+    }
+
+    fn add_scalar(&mut self, scalar: ScalarCompute) {
+        if let Some(header) = scalar.header {
+            self.add_header(header);
+        }
+    }
+
+    fn add_typecast(&mut self) {
+        self.add_header(HEADER_TYPECAST);
+    }
+
+    fn add_unary_compare(&mut self) {
+        self.add_header(HEADER_COMP);
+    }
+
+    fn add_compare_helpers(&mut self) {
+        self.compare_helpers = true;
+        self.add_header(HEADER_BINARY_SFPU);
+        self.add_header(HEADER_SUB_INT);
+        self.add_header(HEADER_COMP);
+    }
+
+    fn add_data_format_binary_helper(&mut self, op: FusedEltwiseOp) {
+        self.add_header(HEADER_BINARY_SFPU);
+        match op {
+            FusedEltwiseOp::Add => {
+                self.add_input_helper = true;
+                self.add_header(HEADER_ADD_INT);
+            }
+            FusedEltwiseOp::Subtract => {
+                self.subtract_input_helper = true;
+                self.add_header(HEADER_SUB_INT);
+            }
+            FusedEltwiseOp::Multiply => {
+                self.multiply_input_helper = true;
+                self.add_header(HEADER_MUL_INT);
+                self.add_header(HEADER_MUL_INT32);
+            }
+            _ => {}
+        }
+    }
+
+    fn headers_source(&self) -> String {
+        self.headers
+            .iter()
+            .map(|header| format!("#include \"{header}\"\n"))
+            .collect()
+    }
+
+    fn helpers_source(&self) -> String {
+        let mut helpers = String::new();
+        if self.add_input_helper || self.subtract_input_helper || self.multiply_input_helper {
+            helpers.push_str(binary_input_data_format_helper());
+        }
+        if self.add_input_helper {
+            helpers.push_str(add_input_helper());
+        }
+        if self.subtract_input_helper {
+            helpers.push_str(subtract_input_helper());
+        }
+        if self.multiply_input_helper {
+            helpers.push_str(multiply_input_helper());
+        }
+        if self.compare_helpers {
+            helpers.push_str(compare_helpers());
+        }
+        helpers
+    }
+}
+
+fn binary_input_data_format_helper() -> &'static str {
+    r#"
+constexpr DataFormat binary_input_data_format(uint32_t cb_lhs, uint32_t cb_out) {
+#ifdef UCK_CHLKC_PACK
+  return static_cast<DataFormat>((uint)pack_src_format[cb_out]);
+#else
+  return static_cast<DataFormat>((uint)unpack_src_format[cb_lhs]);
+#endif
+}
+
+"#
+}
+
+fn add_input_helper() -> &'static str {
     r#"
 template <DataFormat Format>
 ALWI void add_input_init() {
@@ -921,6 +1017,11 @@ ALWI void add_input_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
   }
 }
 
+"#
+}
+
+fn subtract_input_helper() -> &'static str {
+    r#"
 template <DataFormat Format>
 ALWI void subtract_input_init() {
   if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
@@ -941,6 +1042,11 @@ ALWI void subtract_input_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
   }
 }
 
+"#
+}
+
+fn multiply_input_helper() -> &'static str {
+    r#"
 template <DataFormat Format>
 ALWI void multiply_input_init() {
   if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
@@ -967,14 +1073,11 @@ ALWI void multiply_input_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
   }
 }
 
-constexpr DataFormat binary_input_data_format(uint32_t cb_lhs, uint32_t cb_out) {
-#ifdef UCK_CHLKC_PACK
-  return static_cast<DataFormat>((uint)pack_src_format[cb_out]);
-#else
-  return static_cast<DataFormat>((uint)unpack_src_format[cb_lhs]);
-#endif
+"#
 }
 
+fn compare_helpers() -> &'static str {
+    r#"
 enum class CompareDirection : uint32_t {
   Eq,
   Ne,
@@ -1069,6 +1172,7 @@ ALWI void compare_zero_tile(CompareDirection direction, uint32_t idst) {
 struct ComputeSteps {
     body: String,
     typecast_inits: String,
+    features: ComputeSourceFeatures,
 }
 
 fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<ComputeSteps> {
@@ -1088,7 +1192,8 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
 
     let (node_cbs, _) = cb_plan(nodes, root_node_id)?;
     let mut body = String::new();
-    let mut typecast_inits = String::new();
+    let mut typecast_inits = Vec::<String>::new();
+    let mut features = ComputeSourceFeatures::default();
 
     for (index, node) in nodes.iter().enumerate() {
         match node.op.arity() {
@@ -1104,13 +1209,17 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                     "    {init}\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{input_cb});\n    copy_tile(tt::CBIndex::c_{input_cb}, 0, 0);\n"
                 ));
                 if let Some(unary) = unary {
+                    features.add_unary(unary);
                     body.push_str(&format!("    {}\n", unary.tile));
                 } else {
                     debug_assert_eq!(node.op, FusedEltwiseOp::Convert);
+                    features.add_typecast();
                     let from = nodes[input].dtype as u32;
                     let to = node.dtype as u32;
-                    typecast_inits
-                        .push_str(&format!("typecast_tile_init<{from}, {to}>();\n           "));
+                    let init = format!("  typecast_tile_init<{from}, {to}>();\n");
+                    if !typecast_inits.contains(&init) {
+                        typecast_inits.push(init);
+                    }
                     body.push_str(&format!("    typecast_tile<{from}, {to}>(0);\n"));
                 }
                 append_pack_and_pop(
@@ -1134,6 +1243,7 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                         let init = scalar_direction.unary_init();
                         let call = scalar_direction.unary_tile(int32_input);
                         append_waits(&mut body, &[value_cb]);
+                        features.add_unary_compare();
                         body.push_str(&format!(
                             "    {init}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{value_cb});\n    copy_tile(tt::CBIndex::c_{value_cb}, 0, 0);\n    {call}(0, {scalar});\n"
                         ));
@@ -1160,6 +1270,7 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                     let value_cb = cb_for_node(&node_cbs, value_node)?;
                     let output_cb = cb_for_node(&node_cbs, index)?;
                     append_waits(&mut body, &[value_cb]);
+                    features.add_scalar(scalar_op);
                     body.push_str(&format!(
                         "    {}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{value_cb});\n    copy_tile(tt::CBIndex::c_{value_cb}, 0, 0);\n    {}(0, {});\n",
                         scalar_op.init, scalar_op.tile, scalar_op.scalar
@@ -1180,6 +1291,7 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                     let int32_input = bool_literal(nodes[lhs].dtype == DType::Int32);
                     let direction = direction.variant();
                     append_waits(&mut body, &[lhs_cb, rhs_cb]);
+                    features.add_compare_helpers();
                     body.push_str(&format!(
                         "    compare_sub_init<{int32_input}>();\n    compare_zero_init(CompareDirection::{direction});\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{lhs_cb});\n    copy_tile(tt::CBIndex::c_{lhs_cb}, 0, 0);\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb});\n    copy_tile(tt::CBIndex::c_{rhs_cb}, 0, 1);\n    compare_sub_tile<{int32_input}>(0, 1, 0);\n    compare_zero_tile<{int32_input}>(CompareDirection::{direction}, 0);\n"
                     ));
@@ -1194,6 +1306,7 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                 }
                 if let Some(helper) = node.op.data_format_binary_helper() {
                     append_waits(&mut body, &[lhs_cb, rhs_cb]);
+                    features.add_data_format_binary_helper(node.op);
                     body.push_str(&format!(
                         "    constexpr DataFormat input_format_{index} = binary_input_data_format(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{output_cb});\n    {helper}_init<input_format_{index}>();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{lhs_cb});\n    copy_tile(tt::CBIndex::c_{lhs_cb}, 0, 0);\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb});\n    copy_tile(tt::CBIndex::c_{rhs_cb}, 0, 1);\n    {helper}_tile<input_format_{index}>(0, 1, 0);\n"
                     ));
@@ -1210,6 +1323,7 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                     invalid_input(format!("missing binary lowering for {:?}", node.op))
                 })?;
                 append_waits(&mut body, &[lhs_cb, rhs_cb]);
+                features.add_binary(binary);
                 body.push_str(&format!(
                     "    {}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{lhs_cb});\n    copy_tile(tt::CBIndex::c_{lhs_cb}, 0, 0);\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb});\n    copy_tile(tt::CBIndex::c_{rhs_cb}, 0, 1);\n    {}(0, 1, 0);\n",
                     binary.init, binary.tile
@@ -1228,7 +1342,8 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
 
     Ok(ComputeSteps {
         body,
-        typecast_inits,
+        typecast_inits: typecast_inits.concat(),
+        features,
     })
 }
 
@@ -1444,6 +1559,18 @@ mod tests {
         }
     }
 
+    fn program_key(nodes: Vec<FusedEltwiseNode>, root_node_id: u32) -> FusedEltwiseProgramKey {
+        FusedEltwiseProgramKey {
+            cores: Vec::new(),
+            tile_count: 1,
+            input_dtypes: Vec::new(),
+            input_broadcasts: Vec::new(),
+            output_dtype: nodes[root_node_id as usize].dtype,
+            nodes,
+            root_node_id,
+        }
+    }
+
     #[test]
     fn compute_steps_handles_constant_left_divide_as_rdiv() {
         let mut constant = node(FusedEltwiseOp::Constant, Vec::new());
@@ -1506,5 +1633,57 @@ mod tests {
 
         assert!(steps.body.contains("unary_lt_tile_init();"));
         assert!(steps.body.contains("unary_lt_tile(0, 0);"));
+    }
+
+    #[test]
+    fn compute_steps_handles_constant_right_max_as_unary_max() {
+        let mut constant = node(FusedEltwiseOp::Constant, Vec::new());
+        constant.packed_value = 0;
+
+        let nodes = vec![
+            node(FusedEltwiseOp::Input, Vec::new()),
+            constant,
+            node(FusedEltwiseOp::Max, vec![0, 1]),
+        ];
+        let steps = compute_steps(&nodes, 2).expect("max(value, constant) should lower");
+
+        assert!(steps.body.contains("unary_max_tile_init();"));
+        assert!(steps.body.contains("unary_max_tile(0, 0);"));
+    }
+
+    #[test]
+    fn compute_source_only_emits_used_add_helpers() {
+        let nodes = vec![
+            node(FusedEltwiseOp::Input, Vec::new()),
+            node(FusedEltwiseOp::Input, Vec::new()),
+            node(FusedEltwiseOp::Add, vec![0, 1]),
+        ];
+        let source = compute_source(&program_key(nodes, 2)).expect("add source should generate");
+
+        assert!(source.contains(HEADER_BINARY_SFPU));
+        assert!(source.contains(HEADER_ADD_INT));
+        assert!(source.contains("ALWI void add_input_tile"));
+        assert!(!source.contains(HEADER_EXP));
+        assert!(!source.contains(HEADER_COMP));
+        assert!(!source.contains("ALWI void compare_zero_tile"));
+        assert!(!source.contains("FUSED_"));
+    }
+
+    #[test]
+    fn compute_source_only_emits_compare_helpers_for_compare() {
+        let nodes = vec![
+            node(FusedEltwiseOp::Input, Vec::new()),
+            node(FusedEltwiseOp::Input, Vec::new()),
+            node(FusedEltwiseOp::Compare(CompareDirection::Gt), vec![0, 1]),
+        ];
+        let source =
+            compute_source(&program_key(nodes, 2)).expect("compare source should generate");
+
+        assert!(source.contains(HEADER_COMP));
+        assert!(source.contains(HEADER_SUB_INT));
+        assert!(source.contains("ALWI void compare_zero_tile"));
+        assert!(!source.contains(HEADER_ADD_INT));
+        assert!(!source.contains("ALWI void add_input_tile"));
+        assert!(!source.contains("FUSED_"));
     }
 }
