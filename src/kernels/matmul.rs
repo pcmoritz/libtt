@@ -770,22 +770,6 @@ fn plan_matmul(
     let kt_divs = divisors(kt);
     let mut best = None;
     let mut best_score = None;
-    let flat_column = if false && mt_base == 1 && batch_count == 1 && allow_column_split {
-        plan_flat_column_matmul(
-            mt_base,
-            kt,
-            nt_base,
-            &xs,
-            &ys,
-            &available,
-            &kt_divs,
-            tile_bytes,
-            l1_data_bytes,
-        )
-    } else {
-        None
-    };
-
     for y_start in 0..ys.len() {
         for y_stop in y_start + 1..=ys.len() {
             let rows = &ys[y_start..y_stop];
@@ -892,9 +876,7 @@ fn plan_matmul(
             None,
         )
     };
-    let candidate = if let Some(flat_column) = flat_column {
-        Some(flat_column)
-    } else if mt_base == 1 {
+    let candidate = if mt_base == 1 {
         direct().or(best)
     } else {
         best.or_else(direct)
@@ -926,75 +908,6 @@ fn plan_matmul(
     }
 
     Ok(plan)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn plan_flat_column_matmul(
-    mt_base: usize,
-    kt: usize,
-    nt_base: usize,
-    xs: &[u8],
-    ys: &[u8],
-    available: &[CoreCoord],
-    kt_divs: &[usize],
-    tile_bytes: usize,
-    l1_data_bytes: usize,
-) -> Option<MatmulPlan> {
-    if mt_base != 1 || nt_base == 0 {
-        return None;
-    }
-
-    let mut best = None;
-    let mut best_score = None;
-    for y_start in 0..ys.len() {
-        for y_stop in y_start + 1..=ys.len() {
-            let rows = &ys[y_start..y_stop];
-            let valid_cols = xs
-                .iter()
-                .copied()
-                .filter(|&x| {
-                    rows.iter()
-                        .all(|&y| available.contains(&CoreCoord { x, y }))
-                })
-                .collect::<Vec<_>>();
-            if valid_cols.is_empty() {
-                continue;
-            }
-            for nc in 1..=valid_cols.len() {
-                let cols = &valid_cols[..nc];
-                let active_cores = rows.len() * cols.len();
-                if active_cores != nt_base {
-                    continue;
-                }
-                for &in0_block_w in kt_divs {
-                    if in0_block_w > 32 || !fits_l1(1, 1, in0_block_w, tile_bytes, l1_data_bytes) {
-                        continue;
-                    }
-                    let score = (cols.len(), rows.len(), in0_block_w);
-                    if best_score.map_or(true, |current| score > current) {
-                        best_score = Some(score);
-                        best = Some(MatmulPlan {
-                            rows: rows.to_vec(),
-                            cols: cols.to_vec(),
-                            direct_grid: None,
-                            flat_column_grid: true,
-                            batch_groups: 1,
-                            batches_per_group: 1,
-                            mt: mt_base,
-                            kt,
-                            nt: nt_base,
-                            per_core_m: 1,
-                            per_core_n: 1,
-                            in0_block_w,
-                            out_subblock_h: 1,
-                            out_subblock_w: 1,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    best
 }
 
 fn plan_matmul_top1(k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
