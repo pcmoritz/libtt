@@ -1626,27 +1626,16 @@ fn execute_binary_eltwise(
         )));
     }
     let input_dtype = pjrt_buffer_type_to_dtype(lhs_desc.element_type)?;
-    let expected_output_type = match op {
-        kernels::fused_eltwise::FusedEltwiseOp::Add
-        | kernels::fused_eltwise::FusedEltwiseOp::Subtract
-        | kernels::fused_eltwise::FusedEltwiseOp::Divide
-        | kernels::fused_eltwise::FusedEltwiseOp::Multiply
-        | kernels::fused_eltwise::FusedEltwiseOp::Power
-        | kernels::fused_eltwise::FusedEltwiseOp::Max => lhs_desc.element_type,
-        kernels::fused_eltwise::FusedEltwiseOp::Compare(_) => {
-            if !matches!(input_dtype, DType::Float16B | DType::Float32 | DType::Int32) {
-                return Err(unimplemented(format!(
-                    "TT executable compare currently supports bf16, f32, and s32 inputs, got {:?}",
-                    lhs_desc.element_type
-                )));
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
-        }
-        _ => {
-            return Err(invalid_argument(format!(
-                "TT executable {op_name} is not a binary elementwise op"
-            )));
-        }
+    if !op.is_binary() {
+        return Err(invalid_argument(format!(
+            "TT executable {op_name} is not a binary elementwise op"
+        )));
+    };
+    let output_dtype = op.binary_output_dtype(input_dtype).map_err(io_error)?;
+    let expected_output_type = if op.is_compare() {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
+    } else {
+        lhs_desc.element_type
     };
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
@@ -1659,13 +1648,20 @@ fn execute_binary_eltwise(
             expected_output_type, output_desc.element_type
         )));
     }
+    if pjrt_buffer_type_to_dtype(expected_output_type)? != output_dtype {
+        return Err(invalid_argument(format!(
+            "TT executable {op_name} output dtype metadata mismatch: {:?} vs {:?}",
+            expected_output_type, output_dtype
+        )));
+    }
 
     let output_dims = lhs_desc.dims.clone();
     let shape = dims_i64_to_usize(&output_dims)?;
     let lhs_input = eltwise_input(values, plan, input_ids[0], input_dtype, &lhs_field)?;
     let rhs_input = eltwise_input(values, plan, input_ids[1], input_dtype, &rhs_field)?;
     let output_name = format!("pjrt_{op_name}");
-    let (inputs, nodes) = fused_binary_eltwise_inputs(op, lhs_input, rhs_input, input_dtype);
+    let (inputs, nodes) =
+        fused_binary_eltwise_inputs(op, lhs_input, rhs_input, input_dtype).map_err(io_error)?;
     let output_dram =
         kernels::fused_eltwise::eltwise(device, &inputs, &nodes, 2, &shape, output_name)
             .map_err(io_error)?;
@@ -1733,18 +1729,14 @@ fn fused_binary_eltwise_inputs<'a>(
     lhs: EltwiseInput<'a>,
     rhs: EltwiseInput<'a>,
     input_dtype: DType,
-) -> (
+) -> io::Result<(
     Vec<kernels::fused_eltwise::FusedEltwiseInput<'a>>,
     Vec<kernels::fused_eltwise::FusedEltwiseNode>,
-) {
+)> {
     let mut inputs = Vec::new();
     let lhs = fused_eltwise_input_node(lhs, input_dtype, &mut inputs);
     let rhs = fused_eltwise_input_node(rhs, input_dtype, &mut inputs);
-    let output_dtype = if matches!(op, kernels::fused_eltwise::FusedEltwiseOp::Compare(_)) {
-        DType::UInt8
-    } else {
-        input_dtype
-    };
+    let output_dtype = op.binary_output_dtype(input_dtype)?;
     let root = kernels::fused_eltwise::FusedEltwiseNode {
         op,
         input_nodes: vec![0, 1],
@@ -1753,7 +1745,7 @@ fn fused_binary_eltwise_inputs<'a>(
         dtype: output_dtype,
         single_tile_broadcast: false,
     };
-    (inputs, vec![lhs, rhs, root])
+    Ok((inputs, vec![lhs, rhs, root]))
 }
 
 fn fused_unary_eltwise_inputs<'a>(
@@ -1968,7 +1960,7 @@ fn execute_fused_elementwise(
         .iter()
         .map(|node| {
             Ok(kernels::fused_eltwise::FusedEltwiseNode {
-                op: fused_eltwise_op(node.kind),
+                op: node.kind.into(),
                 input_nodes: node.input_nodes.clone(),
                 input_index: node.input_index,
                 packed_value: node.packed_value,
@@ -1995,34 +1987,6 @@ fn execute_fused_elementwise(
         context,
         "fused_elementwise",
     )
-}
-
-fn fused_eltwise_op(
-    kind: executable::FusedElementwiseKind,
-) -> kernels::fused_eltwise::FusedEltwiseOp {
-    match kind {
-        executable::FusedElementwiseKind::Input => kernels::fused_eltwise::FusedEltwiseOp::Input,
-        executable::FusedElementwiseKind::Constant => {
-            kernels::fused_eltwise::FusedEltwiseOp::Constant
-        }
-        executable::FusedElementwiseKind::Add => kernels::fused_eltwise::FusedEltwiseOp::Add,
-        executable::FusedElementwiseKind::Subtract => {
-            kernels::fused_eltwise::FusedEltwiseOp::Subtract
-        }
-        executable::FusedElementwiseKind::Multiply => {
-            kernels::fused_eltwise::FusedEltwiseOp::Multiply
-        }
-        executable::FusedElementwiseKind::Divide => kernels::fused_eltwise::FusedEltwiseOp::Divide,
-        executable::FusedElementwiseKind::Max => kernels::fused_eltwise::FusedEltwiseOp::Max,
-        executable::FusedElementwiseKind::Negate => kernels::fused_eltwise::FusedEltwiseOp::Negate,
-        executable::FusedElementwiseKind::Exponential => {
-            kernels::fused_eltwise::FusedEltwiseOp::Exponential
-        }
-        executable::FusedElementwiseKind::Rsqrt => kernels::fused_eltwise::FusedEltwiseOp::Rsqrt,
-        executable::FusedElementwiseKind::Convert => {
-            kernels::fused_eltwise::FusedEltwiseOp::Convert
-        }
-    }
 }
 
 fn execute_transpose(

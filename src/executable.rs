@@ -200,6 +200,25 @@ pub(crate) enum FusedElementwiseKind {
     Convert,
 }
 
+#[cfg(libtt_mlir_frontend)]
+impl FusedElementwiseKind {
+    fn from_proto(kind: ProtoFusedElementwiseKind) -> Self {
+        match kind {
+            ProtoFusedElementwiseKind::Input => Self::Input,
+            ProtoFusedElementwiseKind::Constant => Self::Constant,
+            ProtoFusedElementwiseKind::Add => Self::Add,
+            ProtoFusedElementwiseKind::Subtract => Self::Subtract,
+            ProtoFusedElementwiseKind::Multiply => Self::Multiply,
+            ProtoFusedElementwiseKind::Divide => Self::Divide,
+            ProtoFusedElementwiseKind::Max => Self::Max,
+            ProtoFusedElementwiseKind::Negate => Self::Negate,
+            ProtoFusedElementwiseKind::Exponential => Self::Exponential,
+            ProtoFusedElementwiseKind::Rsqrt => Self::Rsqrt,
+            ProtoFusedElementwiseKind::Convert => Self::Convert,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum CompareDirection {
@@ -300,21 +319,9 @@ fn parse_reduce_reducer(reducer: i32) -> Result<ReduceReducer, String> {
 
 #[cfg(libtt_mlir_frontend)]
 fn parse_fused_elementwise_kind(kind: i32) -> Result<FusedElementwiseKind, String> {
-    match ProtoFusedElementwiseKind::try_from(kind)
-        .map_err(|_| "TT executable fused elementwise op contains an invalid kind".to_owned())?
-    {
-        ProtoFusedElementwiseKind::Input => Ok(FusedElementwiseKind::Input),
-        ProtoFusedElementwiseKind::Constant => Ok(FusedElementwiseKind::Constant),
-        ProtoFusedElementwiseKind::Add => Ok(FusedElementwiseKind::Add),
-        ProtoFusedElementwiseKind::Subtract => Ok(FusedElementwiseKind::Subtract),
-        ProtoFusedElementwiseKind::Multiply => Ok(FusedElementwiseKind::Multiply),
-        ProtoFusedElementwiseKind::Divide => Ok(FusedElementwiseKind::Divide),
-        ProtoFusedElementwiseKind::Max => Ok(FusedElementwiseKind::Max),
-        ProtoFusedElementwiseKind::Negate => Ok(FusedElementwiseKind::Negate),
-        ProtoFusedElementwiseKind::Exponential => Ok(FusedElementwiseKind::Exponential),
-        ProtoFusedElementwiseKind::Rsqrt => Ok(FusedElementwiseKind::Rsqrt),
-        ProtoFusedElementwiseKind::Convert => Ok(FusedElementwiseKind::Convert),
-    }
+    ProtoFusedElementwiseKind::try_from(kind)
+        .map(FusedElementwiseKind::from_proto)
+        .map_err(|_| "TT executable fused elementwise op contains an invalid kind".to_owned())
 }
 
 #[cfg(libtt_mlir_frontend)]
