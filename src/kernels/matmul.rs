@@ -86,7 +86,6 @@ struct MatmulPlan {
     rows: Vec<u8>,
     cols: Vec<u8>,
     direct_grid: Option<Vec<Vec<CoreCoord>>>,
-    flat_column_grid: bool,
     batch_groups: usize,
     batches_per_group: usize,
     mt: usize,
@@ -425,8 +424,6 @@ fn log_matmul_plan(plan: &MatmulPlan) {
         plan.batches_per_group,
         if plan.direct_grid.is_some() {
             "direct"
-        } else if plan.flat_column_grid {
-            "flat-column"
         } else {
             "mcast"
         },
@@ -840,7 +837,6 @@ fn plan_matmul(
                                     rows: rows.to_vec(),
                                     cols: cols.to_vec(),
                                     direct_grid: None,
-                                    flat_column_grid: false,
                                     batch_groups: 1,
                                     batches_per_group: batch_count,
                                     mt,
@@ -923,68 +919,22 @@ fn plan_matmul_top1(k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<Matmu
         return Err(invalid_input("no worker cores are available"));
     }
 
-    let mut xs = ordered.iter().map(|core| core.x).collect::<Vec<_>>();
-    xs.sort_unstable();
-    xs.dedup();
-    let mut ys = ordered.iter().map(|core| core.y).collect::<Vec<_>>();
-    ys.sort_unstable();
-    ys.dedup();
-    let available = ordered.iter().copied().collect::<Vec<_>>();
     let kt_divs = divisors(kt);
-
-    let mut best = None;
-    let mut best_score = None;
-    for y_start in 0..ys.len() {
-        for y_stop in y_start + 1..=ys.len() {
-            let rows = &ys[y_start..y_stop];
-            let valid_cols = xs
-                .iter()
-                .copied()
-                .filter(|&x| {
-                    rows.iter()
-                        .all(|&y| available.contains(&CoreCoord { x, y }))
-                })
-                .collect::<Vec<_>>();
-            if valid_cols.is_empty() {
-                continue;
-            }
-            for nc in 1..=valid_cols.len() {
-                let cols = &valid_cols[..nc];
-                let active_cores = rows.len() * cols.len();
-                if active_cores > nt {
-                    continue;
-                }
-                for &in0_block_w in &kt_divs {
-                    if in0_block_w > 32 || !fits_l1(1, 1, in0_block_w, tile_bytes, l1_data_bytes) {
-                        continue;
-                    }
-                    let waves = nt.div_ceil(active_cores);
-                    let score = (active_cores, cols.len(), in0_block_w, usize::MAX - waves);
-                    if best_score.map_or(true, |current| score > current) {
-                        best_score = Some(score);
-                        best = Some(MatmulPlan {
-                            rows: rows.to_vec(),
-                            cols: cols.to_vec(),
-                            direct_grid: None,
-                            flat_column_grid: true,
-                            batch_groups: 1,
-                            batches_per_group: waves,
-                            mt: 1,
-                            kt,
-                            nt: active_cores,
-                            per_core_m: 1,
-                            per_core_n: 1,
-                            in0_block_w,
-                            out_subblock_h: 1,
-                            out_subblock_w: 1,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    best.ok_or_else(|| {
+    plan_direct_matmul(
+        1,
+        kt,
+        nt,
+        &ordered,
+        &kt_divs,
+        tile_bytes,
+        l1_data_bytes,
+        1,
+        true,
+        1,
+        1,
+        None,
+    )
+    .ok_or_else(|| {
         invalid_input(format!(
             "no valid matmul_top1 plan for K={k} N={n} on {} cores",
             ordered.len()
@@ -1109,7 +1059,6 @@ fn plan_direct_matmul(
                                             .map(|row| row.to_vec())
                                             .collect(),
                                     ),
-                                    flat_column_grid: false,
                                     batch_groups,
                                     batches_per_group,
                                     mt,
@@ -1235,11 +1184,7 @@ fn bf16_program(
         writer_kernel: BF16_WRITER_SENDER.to_owned(),
         compute_kernel: compute_src(plan, plan.batches_per_group),
         reader_recv_kernel: BF16_READER_RECV.to_owned(),
-        writer_recv_kernel: if plan.flat_column_grid {
-            BF16_WRITER_SENDER.to_owned()
-        } else {
-            BF16_WRITER_RECV.to_owned()
-        },
+        writer_recv_kernel: BF16_WRITER_RECV.to_owned(),
         name: format!(
             "matmul_bf16_{:?}_{}x{}x{}",
             output_dtype,
@@ -1349,7 +1294,10 @@ fn matmul_top1_program(
             dst_full_sync: true,
             ..CompileConfig::default()
         },
-        grid: Some((plan.rows.clone(), plan.cols.clone())),
+        grid: plan
+            .direct_grid
+            .is_none()
+            .then(|| (plan.rows.clone(), plan.cols.clone())),
         ..Program::new(runtime_args)
     })
 }
@@ -1557,11 +1505,7 @@ fn reader_args(
             grid[row_index][0],
         )
     };
-    let lhs_block_offset = if plan.flat_column_grid {
-        0
-    } else {
-        row_index * plan.per_core_m * plan.kt
-    };
+    let lhs_block_offset = row_index * plan.per_core_m * plan.kt;
     let mut args = vec![
         0,
         u32_value(lhs_block_offset, "lhs block offset")?,
@@ -1588,14 +1532,7 @@ fn reader_args(
         u32_value(local_batch_count, "local batch count")?,
         u32_value(batch_start, "batch start")?,
         u32_value(total_batch_count, "total batch count")?,
-        u32_value(
-            if plan.flat_column_grid {
-                0
-            } else {
-                logical_mt * plan.kt
-            },
-            "lhs batch stride",
-        )?,
+        u32_value(logical_mt * plan.kt, "lhs batch stride")?,
     ]);
     append_view_args(&mut args, lhs_view);
     Ok(args)
@@ -1615,7 +1552,7 @@ fn writer_args(
     rhs_view: &MatmulOperandView,
     output_view: &MatmulOperandView,
 ) -> io::Result<Vec<u32>> {
-    let mcast = if plan.direct_grid.is_some() || plan.flat_column_grid || plan.rows.len() <= 1 {
+    let mcast = if plan.direct_grid.is_some() || plan.rows.len() <= 1 {
         [0, 0, 0, 0, 0]
     } else {
         let recv_ys = &plan.rows[1..];
@@ -1627,21 +1564,13 @@ fn writer_args(
             recv_ys.len() as u32,
         ]
     };
-    let sender = if plan.direct_grid.is_some() || plan.flat_column_grid {
+    let sender = if plan.direct_grid.is_some() {
         core
     } else {
         grid[0][col_index]
     };
-    let column_start = if plan.flat_column_grid {
-        row_index * grid[row_index].len() + col_index
-    } else {
-        col_index * plan.per_core_n
-    };
-    let out_start = if plan.flat_column_grid {
-        column_start
-    } else {
-        row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n
-    };
+    let column_start = col_index * plan.per_core_n;
+    let out_start = row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n;
     let mut args = vec![
         0,
         u32_value(column_start, "rhs block offset")?,
@@ -1701,7 +1630,7 @@ fn matmul_top1_writer_args(
     rhs_view: &MatmulOperandView,
     output_view: &MatmulOperandView,
 ) -> io::Result<Vec<u32>> {
-    let mcast = if plan.direct_grid.is_some() || plan.flat_column_grid || plan.rows.len() <= 1 {
+    let mcast = if plan.direct_grid.is_some() || plan.rows.len() <= 1 {
         [0, 0, 0, 0, 0]
     } else {
         let recv_ys = &plan.rows[1..];
@@ -1713,21 +1642,13 @@ fn matmul_top1_writer_args(
             recv_ys.len() as u32,
         ]
     };
-    let sender = if plan.direct_grid.is_some() || plan.flat_column_grid {
+    let sender = if plan.direct_grid.is_some() {
         core
     } else {
         grid[0][col_index]
     };
-    let column_start = if plan.flat_column_grid {
-        row_index * grid[row_index].len() + col_index
-    } else {
-        col_index * plan.per_core_n
-    };
-    let out_start = if plan.flat_column_grid {
-        column_start
-    } else {
-        row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n
-    };
+    let column_start = col_index * plan.per_core_n;
+    let out_start = row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n;
     let mut args = vec![
         0,
         u32_value(column_start, "rhs block offset")?,
@@ -1766,14 +1687,7 @@ fn matmul_top1_writer_args(
         u32_value(local_batch_count, "local batch count")?,
         u32_value(batch_start, "batch start")?,
         u32_value(total_batch_count, "total batch count")?,
-        u32_value(
-            if plan.flat_column_grid {
-                plan.nt
-            } else {
-                plan.kt * logical_nt
-            },
-            "rhs batch stride",
-        )?,
+        u32_value(plan.kt * logical_nt, "rhs batch stride")?,
         u32_value(logical_mt * logical_nt, "output batch stride")?,
     ]);
     append_view_args(&mut args, rhs_view);
