@@ -1121,6 +1121,90 @@ struct ComputeSteps {
     features: ComputeSourceFeatures,
 }
 
+struct ComputeEmitContext<'a> {
+    node_cbs: &'a [Option<u32>],
+    remaining_uses: &'a mut [u32],
+    body: String,
+    typecast_inits: Vec<String>,
+    features: ComputeSourceFeatures,
+}
+
+impl ComputeEmitContext<'_> {
+    fn cb_for_node(&self, node: usize) -> io::Result<u32> {
+        cb_for_node(self.node_cbs, node)
+    }
+
+    fn pack_and_pop(&mut self, output_cb: u32, input_nodes: &[usize]) -> io::Result<()> {
+        append_pack_and_pop(
+            &mut self.body,
+            output_cb,
+            input_nodes,
+            self.node_cbs,
+            self.remaining_uses,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Lowering {
+    Leaf,
+    Unary(UnarySpec),
+    ScalarBinary(ScalarBinarySpec),
+    Binary(BinarySpec),
+    Compare(CompareSpec),
+}
+
+#[derive(Clone, Copy)]
+struct UnarySpec {
+    input: usize,
+    op: UnaryLowering,
+}
+
+#[derive(Clone, Copy)]
+enum UnaryLowering {
+    Tile(UnaryCompute),
+    Convert { from: u32, to: u32 },
+}
+
+#[derive(Clone, Copy)]
+struct ScalarBinarySpec {
+    value_node: usize,
+    init: &'static str,
+    tile: &'static str,
+    scalar: u32,
+    feature: ScalarBinaryFeature,
+}
+
+#[derive(Clone, Copy)]
+enum ScalarBinaryFeature {
+    Scalar(ScalarCompute),
+    UnaryCompare,
+}
+
+#[derive(Clone, Copy)]
+struct BinarySpec {
+    lhs: usize,
+    rhs: usize,
+    op: BinaryLowering,
+}
+
+#[derive(Clone, Copy)]
+enum BinaryLowering {
+    DataFormatHelper {
+        helper: &'static str,
+        op: FusedEltwiseOp,
+    },
+    Tile(BinaryCompute),
+}
+
+#[derive(Clone, Copy)]
+struct CompareSpec {
+    lhs: usize,
+    rhs: usize,
+    direction: CompareDirection,
+    int32_input: bool,
+}
+
 fn compute_steps(nodes: &[FusedEltwiseNode]) -> io::Result<ComputeSteps> {
     let mut remaining_uses = vec![0u32; nodes.len()];
     for node in nodes {
@@ -1137,160 +1221,214 @@ fn compute_steps(nodes: &[FusedEltwiseNode]) -> io::Result<ComputeSteps> {
     }
 
     let (node_cbs, _) = cb_plan(nodes)?;
-    let mut body = String::new();
-    let mut typecast_inits = Vec::<String>::new();
-    let mut features = ComputeSourceFeatures::default();
+    let mut ctx = ComputeEmitContext {
+        node_cbs: &node_cbs,
+        remaining_uses: &mut remaining_uses,
+        body: String::new(),
+        typecast_inits: Vec::new(),
+        features: ComputeSourceFeatures::default(),
+    };
 
     for (index, node) in nodes.iter().enumerate() {
-        match node.op.arity() {
-            0 => {}
-            1 => {
-                let input = node.input_nodes[0] as usize;
-                let input_cb = cb_for_node(&node_cbs, input)?;
-                let output_cb = cb_for_node(&node_cbs, index)?;
-                append_waits(&mut body, &[input_cb]);
-                let unary = node.op.unary_compute();
-                let init = unary.map_or("", |op| op.init);
-                body.push_str(&format!(
-                    "    {init}\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{input_cb});\n    copy_tile(tt::CBIndex::c_{input_cb}, 0, 0);\n"
-                ));
-                if let Some(unary) = unary {
-                    features.add_unary(unary);
-                    body.push_str(&format!("    {}\n", unary.tile));
-                } else {
-                    debug_assert_eq!(node.op, FusedEltwiseOp::Convert);
-                    features.add_typecast();
-                    let from = nodes[input].dtype as u32;
-                    let to = node.dtype as u32;
-                    let init = format!("  typecast_tile_init<{from}, {to}>();\n");
-                    if !typecast_inits.contains(&init) {
-                        typecast_inits.push(init);
-                    }
-                    body.push_str(&format!("    typecast_tile<{from}, {to}>(0);\n"));
-                }
-                append_pack_and_pop(
-                    &mut body,
-                    output_cb,
-                    &[input],
-                    &node_cbs,
-                    &mut remaining_uses,
-                )?;
-            }
-            2 => {
-                let lhs = node.input_nodes[0] as usize;
-                let rhs = node.input_nodes[1] as usize;
-                if let FusedEltwiseOp::Compare(direction) = node.op {
-                    if let Some((value_node, scalar, scalar_direction)) =
-                        scalar_compare_op(nodes, lhs, rhs, direction)
-                    {
-                        let value_cb = cb_for_node(&node_cbs, value_node)?;
-                        let output_cb = cb_for_node(&node_cbs, index)?;
-                        let int32_input = nodes[value_node].dtype == DType::Int32;
-                        let init = scalar_direction.unary_init();
-                        let call = scalar_direction.unary_tile(int32_input);
-                        append_waits(&mut body, &[value_cb]);
-                        features.add_unary_compare();
-                        body.push_str(&format!(
-                            "    {init}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{value_cb});\n    copy_tile(tt::CBIndex::c_{value_cb}, 0, 0);\n    {call}(0, {scalar});\n"
-                        ));
-                        append_pack_and_pop(
-                            &mut body,
-                            output_cb,
-                            &[value_node],
-                            &node_cbs,
-                            &mut remaining_uses,
-                        )?;
-                        continue;
-                    }
-                }
-                if let Some(scalar_op) = node.op.scalar_compute(
-                    nodes[lhs].dtype,
-                    nodes[rhs].dtype,
-                    constant_scalar_bits(nodes, lhs),
-                    constant_scalar_bits(nodes, rhs),
-                ) {
-                    let value_node = match scalar_op.operand {
-                        ScalarOperand::Lhs => lhs,
-                        ScalarOperand::Rhs => rhs,
-                    };
-                    let value_cb = cb_for_node(&node_cbs, value_node)?;
-                    let output_cb = cb_for_node(&node_cbs, index)?;
-                    append_waits(&mut body, &[value_cb]);
-                    features.add_scalar(scalar_op);
-                    body.push_str(&format!(
-                        "    {}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{value_cb});\n    copy_tile(tt::CBIndex::c_{value_cb}, 0, 0);\n    {}(0, {});\n",
-                        scalar_op.init, scalar_op.tile, scalar_op.scalar
-                    ));
-                    append_pack_and_pop(
-                        &mut body,
-                        output_cb,
-                        &[value_node],
-                        &node_cbs,
-                        &mut remaining_uses,
-                    )?;
-                    continue;
-                }
-                let lhs_cb = cb_for_node(&node_cbs, lhs)?;
-                let rhs_cb = cb_for_node(&node_cbs, rhs)?;
-                let output_cb = cb_for_node(&node_cbs, index)?;
-                if let FusedEltwiseOp::Compare(direction) = node.op {
-                    let int32_input = bool_literal(nodes[lhs].dtype == DType::Int32);
-                    let direction = direction.variant();
-                    append_waits(&mut body, &[lhs_cb, rhs_cb]);
-                    features.add_compare_helpers();
-                    body.push_str(&format!(
-                        "    compare_sub_init<{int32_input}>();\n    compare_zero_init(CompareDirection::{direction});\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{lhs_cb});\n    copy_tile(tt::CBIndex::c_{lhs_cb}, 0, 0);\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb});\n    copy_tile(tt::CBIndex::c_{rhs_cb}, 0, 1);\n    compare_sub_tile<{int32_input}>(0, 1, 0);\n    compare_zero_tile<{int32_input}>(CompareDirection::{direction}, 0);\n"
-                    ));
-                    append_pack_and_pop(
-                        &mut body,
-                        output_cb,
-                        &[lhs, rhs],
-                        &node_cbs,
-                        &mut remaining_uses,
-                    )?;
-                    continue;
-                }
-                if let Some(helper) = node.op.data_format_binary_helper() {
-                    append_waits(&mut body, &[lhs_cb, rhs_cb]);
-                    features.add_data_format_binary_helper(node.op);
-                    body.push_str(&format!(
-                        "    constexpr DataFormat input_format_{index} = binary_input_data_format(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{output_cb});\n    {helper}_init<input_format_{index}>();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{lhs_cb});\n    copy_tile(tt::CBIndex::c_{lhs_cb}, 0, 0);\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb});\n    copy_tile(tt::CBIndex::c_{rhs_cb}, 0, 1);\n    {helper}_tile<input_format_{index}>(0, 1, 0);\n"
-                    ));
-                    append_pack_and_pop(
-                        &mut body,
-                        output_cb,
-                        &[lhs, rhs],
-                        &node_cbs,
-                        &mut remaining_uses,
-                    )?;
-                    continue;
-                }
-                let binary = node.op.binary_compute().ok_or_else(|| {
-                    invalid_input(format!("missing binary lowering for {:?}", node.op))
-                })?;
-                append_waits(&mut body, &[lhs_cb, rhs_cb]);
-                features.add_binary(binary);
-                body.push_str(&format!(
-                    "    {}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{lhs_cb});\n    copy_tile(tt::CBIndex::c_{lhs_cb}, 0, 0);\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb});\n    copy_tile(tt::CBIndex::c_{rhs_cb}, 0, 1);\n    {}(0, 1, 0);\n",
-                    binary.init, binary.tile
-                ));
-                append_pack_and_pop(
-                    &mut body,
-                    output_cb,
-                    &[lhs, rhs],
-                    &node_cbs,
-                    &mut remaining_uses,
-                )?;
-            }
-            _ => unreachable!("fused eltwise op arity is limited to 0, 1, or 2"),
+        match lowering_for(node, nodes)? {
+            Lowering::Leaf => {}
+            Lowering::Unary(spec) => emit_unary(&mut ctx, index, spec)?,
+            Lowering::ScalarBinary(spec) => emit_scalar_binary(&mut ctx, index, spec)?,
+            Lowering::Binary(spec) => emit_binary(&mut ctx, index, spec)?,
+            Lowering::Compare(spec) => emit_compare(&mut ctx, index, spec)?,
         }
     }
 
     Ok(ComputeSteps {
-        body,
-        typecast_inits: typecast_inits.concat(),
-        features,
+        body: ctx.body,
+        typecast_inits: ctx.typecast_inits.concat(),
+        features: ctx.features,
     })
+}
+
+fn lowering_for(node: &FusedEltwiseNode, nodes: &[FusedEltwiseNode]) -> io::Result<Lowering> {
+    match node.op.arity() {
+        0 => Ok(Lowering::Leaf),
+        1 => {
+            let input = node.input_nodes[0] as usize;
+            let op = if let Some(unary) = node.op.unary_compute() {
+                UnaryLowering::Tile(unary)
+            } else {
+                debug_assert_eq!(node.op, FusedEltwiseOp::Convert);
+                UnaryLowering::Convert {
+                    from: nodes[input].dtype as u32,
+                    to: node.dtype as u32,
+                }
+            };
+            Ok(Lowering::Unary(UnarySpec { input, op }))
+        }
+        2 => {
+            let lhs = node.input_nodes[0] as usize;
+            let rhs = node.input_nodes[1] as usize;
+            if let FusedEltwiseOp::Compare(direction) = node.op {
+                if let Some((value_node, scalar, scalar_direction)) =
+                    scalar_compare_op(nodes, lhs, rhs, direction)
+                {
+                    let int32_input = nodes[value_node].dtype == DType::Int32;
+                    return Ok(Lowering::ScalarBinary(ScalarBinarySpec {
+                        value_node,
+                        init: scalar_direction.unary_init(),
+                        tile: scalar_direction.unary_tile(int32_input),
+                        scalar,
+                        feature: ScalarBinaryFeature::UnaryCompare,
+                    }));
+                }
+            }
+            if let Some(scalar_op) = node.op.scalar_compute(
+                nodes[lhs].dtype,
+                nodes[rhs].dtype,
+                constant_scalar_bits(nodes, lhs),
+                constant_scalar_bits(nodes, rhs),
+            ) {
+                let value_node = match scalar_op.operand {
+                    ScalarOperand::Lhs => lhs,
+                    ScalarOperand::Rhs => rhs,
+                };
+                return Ok(Lowering::ScalarBinary(ScalarBinarySpec {
+                    value_node,
+                    init: scalar_op.init,
+                    tile: scalar_op.tile,
+                    scalar: scalar_op.scalar,
+                    feature: ScalarBinaryFeature::Scalar(scalar_op),
+                }));
+            }
+            if let FusedEltwiseOp::Compare(direction) = node.op {
+                return Ok(Lowering::Compare(CompareSpec {
+                    lhs,
+                    rhs,
+                    direction,
+                    int32_input: nodes[lhs].dtype == DType::Int32,
+                }));
+            }
+            if let Some(helper) = node.op.data_format_binary_helper() {
+                return Ok(Lowering::Binary(BinarySpec {
+                    lhs,
+                    rhs,
+                    op: BinaryLowering::DataFormatHelper {
+                        helper,
+                        op: node.op,
+                    },
+                }));
+            }
+            let binary = node.op.binary_compute().ok_or_else(|| {
+                invalid_input(format!("missing binary lowering for {:?}", node.op))
+            })?;
+            Ok(Lowering::Binary(BinarySpec {
+                lhs,
+                rhs,
+                op: BinaryLowering::Tile(binary),
+            }))
+        }
+        _ => unreachable!("fused eltwise op arity is limited to 0, 1, or 2"),
+    }
+}
+
+fn emit_unary(ctx: &mut ComputeEmitContext<'_>, index: usize, spec: UnarySpec) -> io::Result<()> {
+    let input_cb = ctx.cb_for_node(spec.input)?;
+    let output_cb = ctx.cb_for_node(index)?;
+    append_waits(&mut ctx.body, &[input_cb]);
+    let init = match spec.op {
+        UnaryLowering::Tile(unary) => unary.init,
+        UnaryLowering::Convert { .. } => "",
+    };
+    ctx.body.push_str(&format!(
+        "    {init}\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{input_cb});\n    copy_tile(tt::CBIndex::c_{input_cb}, 0, 0);\n"
+    ));
+    match spec.op {
+        UnaryLowering::Tile(unary) => {
+            ctx.features.add_unary(unary);
+            ctx.body.push_str(&format!("    {}\n", unary.tile));
+        }
+        UnaryLowering::Convert { from, to } => {
+            ctx.features.add_typecast();
+            let init = format!("  typecast_tile_init<{from}, {to}>();\n");
+            if !ctx.typecast_inits.contains(&init) {
+                ctx.typecast_inits.push(init);
+            }
+            ctx.body
+                .push_str(&format!("    typecast_tile<{from}, {to}>(0);\n"));
+        }
+    }
+    ctx.pack_and_pop(output_cb, &[spec.input])
+}
+
+fn emit_scalar_binary(
+    ctx: &mut ComputeEmitContext<'_>,
+    index: usize,
+    spec: ScalarBinarySpec,
+) -> io::Result<()> {
+    let value_cb = ctx.cb_for_node(spec.value_node)?;
+    let output_cb = ctx.cb_for_node(index)?;
+    append_waits(&mut ctx.body, &[value_cb]);
+    match spec.feature {
+        ScalarBinaryFeature::Scalar(scalar) => ctx.features.add_scalar(scalar),
+        ScalarBinaryFeature::UnaryCompare => ctx.features.add_unary_compare(),
+    }
+    ctx.body.push_str(&format!(
+        "    {}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{value_cb});\n    copy_tile(tt::CBIndex::c_{value_cb}, 0, 0);\n    {}(0, {});\n",
+        spec.init, spec.tile, spec.scalar
+    ));
+    ctx.pack_and_pop(output_cb, &[spec.value_node])
+}
+
+fn emit_binary(ctx: &mut ComputeEmitContext<'_>, index: usize, spec: BinarySpec) -> io::Result<()> {
+    let lhs_cb = ctx.cb_for_node(spec.lhs)?;
+    let rhs_cb = ctx.cb_for_node(spec.rhs)?;
+    let output_cb = ctx.cb_for_node(index)?;
+    append_waits(&mut ctx.body, &[lhs_cb, rhs_cb]);
+    match spec.op {
+        BinaryLowering::DataFormatHelper { helper, op } => {
+            ctx.features.add_data_format_binary_helper(op);
+            ctx.body.push_str(&format!(
+                "    constexpr DataFormat input_format_{index} = binary_input_data_format(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{output_cb});\n    {helper}_init<input_format_{index}>();\n"
+            ));
+            append_binary_tile_setup(&mut ctx.body, output_cb, lhs_cb, rhs_cb);
+            ctx.body.push_str(&format!(
+                "    {helper}_tile<input_format_{index}>(0, 1, 0);\n"
+            ));
+        }
+        BinaryLowering::Tile(binary) => {
+            ctx.features.add_binary(binary);
+            ctx.body.push_str(&format!("    {}();\n", binary.init));
+            append_binary_tile_setup(&mut ctx.body, output_cb, lhs_cb, rhs_cb);
+            ctx.body
+                .push_str(&format!("    {}(0, 1, 0);\n", binary.tile));
+        }
+    }
+    ctx.pack_and_pop(output_cb, &[spec.lhs, spec.rhs])
+}
+
+fn emit_compare(
+    ctx: &mut ComputeEmitContext<'_>,
+    index: usize,
+    spec: CompareSpec,
+) -> io::Result<()> {
+    let lhs_cb = ctx.cb_for_node(spec.lhs)?;
+    let rhs_cb = ctx.cb_for_node(spec.rhs)?;
+    let output_cb = ctx.cb_for_node(index)?;
+    let int32_input = bool_literal(spec.int32_input);
+    let direction = spec.direction.variant();
+    append_waits(&mut ctx.body, &[lhs_cb, rhs_cb]);
+    ctx.features.add_compare_helpers();
+    ctx.body.push_str(&format!(
+        "    compare_sub_init<{int32_input}>();\n    compare_zero_init(CompareDirection::{direction});\n"
+    ));
+    append_binary_tile_setup(&mut ctx.body, output_cb, lhs_cb, rhs_cb);
+    ctx.body.push_str(&format!(
+        "    compare_sub_tile<{int32_input}>(0, 1, 0);\n    compare_zero_tile<{int32_input}>(CompareDirection::{direction}, 0);\n"
+    ));
+    ctx.pack_and_pop(output_cb, &[spec.lhs, spec.rhs])
+}
+
+fn append_binary_tile_setup(body: &mut String, output_cb: u32, lhs_cb: u32, rhs_cb: u32) {
+    body.push_str(&format!(
+        "    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{lhs_cb});\n    copy_tile(tt::CBIndex::c_{lhs_cb}, 0, 0);\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb});\n    copy_tile(tt::CBIndex::c_{rhs_cb}, 0, 1);\n"
+    ));
 }
 
 fn cb_plan(nodes: &[FusedEltwiseNode]) -> io::Result<(Vec<Option<u32>>, Vec<(u32, DType)>)> {
