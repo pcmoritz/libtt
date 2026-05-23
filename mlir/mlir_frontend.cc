@@ -229,29 +229,83 @@ std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& erro
     return std::nullopt;
 }
 
+std::optional<uint32_t> packedConvertedConstantValue(
+    mlir::stablehlo::ConvertOp convert_op,
+    std::string& error) {
+    mlir::Value value = convert_op.getOperand();
+    while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
+        value = broadcast_op.getOperand();
+    }
+
+    auto constant_op = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
+    if (!constant_op) {
+        return std::nullopt;
+    }
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
+    if (!dense || !dense.isSplat()) {
+        error = "only splat constant converts are currently supported";
+        return std::nullopt;
+    }
+
+    auto input_element_type = mlir::cast<mlir::ShapedType>(dense.getType()).getElementType();
+    auto output_element_type =
+        mlir::cast<mlir::RankedTensorType>(convert_op.getResult().getType()).getElementType();
+    if (!input_element_type.isBF16() && !input_element_type.isF16() &&
+        !input_element_type.isF32()) {
+        error = "constant convert currently supports only float inputs";
+        return std::nullopt;
+    }
+
+    auto value_float = dense.getSplatValue<llvm::APFloat>();
+    auto pack_float = [&](const llvm::fltSemantics& semantics, unsigned bit_width) {
+        auto converted = value_float;
+        bool loses_info = false;
+        converted.convert(
+            semantics,
+            llvm::APFloat::rmNearestTiesToEven,
+            &loses_info);
+        auto bits = converted.bitcastToAPInt();
+        uint32_t value = bits.extractBitsAsZExtValue(bit_width, 0);
+        return bit_width == 16 ? value | (value << 16) : value;
+    };
+
+    if (output_element_type.isBF16()) {
+        return pack_float(llvm::APFloat::BFloat(), 16);
+    }
+    if (output_element_type.isF16()) {
+        return pack_float(llvm::APFloat::IEEEhalf(), 16);
+    }
+    if (output_element_type.isF32()) {
+        return pack_float(llvm::APFloat::IEEEsingle(), 32);
+    }
+
+    error = "constant convert currently supports only float outputs";
+    return std::nullopt;
+}
+
 void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value) {
     auto* constant = executable.add_ops();
     constant->set_output_id(output_id);
     constant->mutable_constant()->set_packed_value(packed_value);
 }
 
-tt::CompareOp::Direction mapCompareDirection(
+tt::FusedElementwiseOp::Node::CompareDirection mapCompareDirection(
     mlir::stablehlo::ComparisonDirection direction) {
     switch (direction) {
         case mlir::stablehlo::ComparisonDirection::EQ:
-            return tt::CompareOp::DIRECTION_EQ;
+            return tt::FusedElementwiseOp::Node::DIRECTION_EQ;
         case mlir::stablehlo::ComparisonDirection::NE:
-            return tt::CompareOp::DIRECTION_NE;
+            return tt::FusedElementwiseOp::Node::DIRECTION_NE;
         case mlir::stablehlo::ComparisonDirection::GE:
-            return tt::CompareOp::DIRECTION_GE;
+            return tt::FusedElementwiseOp::Node::DIRECTION_GE;
         case mlir::stablehlo::ComparisonDirection::GT:
-            return tt::CompareOp::DIRECTION_GT;
+            return tt::FusedElementwiseOp::Node::DIRECTION_GT;
         case mlir::stablehlo::ComparisonDirection::LE:
-            return tt::CompareOp::DIRECTION_LE;
+            return tt::FusedElementwiseOp::Node::DIRECTION_LE;
         case mlir::stablehlo::ComparisonDirection::LT:
-            return tt::CompareOp::DIRECTION_LT;
+            return tt::FusedElementwiseOp::Node::DIRECTION_LT;
     }
-    return tt::CompareOp::DIRECTION_EQ;
+    return tt::FusedElementwiseOp::Node::DIRECTION_EQ;
 }
 
 std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
@@ -356,6 +410,8 @@ struct FusedElementwiseNodeDesc {
     tt::TensorDesc::ElementType element_type =
         tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
     bool single_tile_broadcast = false;
+    tt::FusedElementwiseOp::Node::CompareDirection compare_direction =
+        tt::FusedElementwiseOp::Node::DIRECTION_EQ;
 };
 
 struct FusedElementwiseRegion {
@@ -371,6 +427,60 @@ bool isFloatTensor(mlir::Value value) {
     }
     auto element = tensor.getElementType();
     return element.isBF16() || element.isF16() || element.isF32();
+}
+
+bool isIntegerTensor(mlir::Value value, unsigned width, bool unsigned_only = false) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    if (!tensor || !tensor.hasStaticShape()) {
+        return false;
+    }
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(tensor.getElementType());
+    return integer && integer.getWidth() == width &&
+           (!unsigned_only || integer.isUnsigned());
+}
+
+bool isSignedOrSignlessIntegerTensor(mlir::Value value, unsigned width) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    if (!tensor || !tensor.hasStaticShape()) {
+        return false;
+    }
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(tensor.getElementType());
+    return integer && integer.getWidth() == width && !integer.isUnsigned();
+}
+
+bool isBf16OrF32Tensor(mlir::Value value) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    if (!tensor || !tensor.hasStaticShape()) {
+        return false;
+    }
+    auto element = tensor.getElementType();
+    return element.isBF16() || element.isF32();
+}
+
+bool isSupportedFusedLeafTensor(mlir::Value value) {
+    return isFloatTensor(value) || isIntegerTensor(value, 32) ||
+           isIntegerTensor(value, 16, true);
+}
+
+bool isSupportedConvertTensor(mlir::Value value) {
+    return isBf16OrF32Tensor(value) ||
+           isSignedOrSignlessIntegerTensor(value, 32) ||
+           isIntegerTensor(value, 32, true) ||
+           isIntegerTensor(value, 16, true);
+}
+
+bool isSupportedCompareTensor(mlir::Value value) {
+    return isBf16OrF32Tensor(value) ||
+           isSignedOrSignlessIntegerTensor(value, 32);
+}
+
+bool isPredTensor(mlir::Value value) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    if (!tensor || !tensor.hasStaticShape()) {
+        return false;
+    }
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(tensor.getElementType());
+    return integer && integer.getWidth() == 1;
 }
 
 bool sameTensorShape(mlir::Value lhs, mlir::Value rhs) {
@@ -407,8 +517,20 @@ std::optional<tt::FusedElementwiseOp::Node::Kind> fusedElementwiseKind(
     if (mlir::isa<mlir::stablehlo::DivOp>(op)) {
         return tt::FusedElementwiseOp::Node::KIND_DIVIDE;
     }
+    if (mlir::isa<mlir::stablehlo::PowOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_POWER;
+    }
     if (mlir::isa<mlir::stablehlo::MaxOp>(op)) {
         return tt::FusedElementwiseOp::Node::KIND_MAX;
+    }
+    if (mlir::isa<mlir::stablehlo::CompareOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_COMPARE;
+    }
+    if (mlir::isa<mlir::stablehlo::CosineOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_COSINE;
+    }
+    if (mlir::isa<mlir::stablehlo::SineOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_SINE;
     }
     if (mlir::isa<mlir::stablehlo::NegOp>(op)) {
         return tt::FusedElementwiseOp::Node::KIND_NEGATE;
@@ -419,13 +541,20 @@ std::optional<tt::FusedElementwiseOp::Node::Kind> fusedElementwiseKind(
     if (mlir::isa<mlir::stablehlo::RsqrtOp>(op)) {
         return tt::FusedElementwiseOp::Node::KIND_RSQRT;
     }
+    if (mlir::isa<mlir::stablehlo::ConvertOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_CONVERT;
+    }
     return std::nullopt;
 }
 
 bool isFusableElementwiseOp(mlir::Operation* op) {
+    if (auto compare_op = mlir::dyn_cast_or_null<mlir::stablehlo::CompareOp>(op)) {
+        return compare_op->getNumResults() == 1 &&
+               isPredTensor(compare_op.getResult());
+    }
     return op && op->getNumResults() == 1 &&
            fusedElementwiseKind(op).has_value() &&
-           isFloatTensor(op->getResult(0));
+           isSupportedFusedLeafTensor(op->getResult(0));
 }
 
 bool hasSupportedFusedElementwiseTypes(mlir::Operation* op) {
@@ -434,13 +563,60 @@ bool hasSupportedFusedElementwiseTypes(mlir::Operation* op) {
     }
     mlir::Value result = op->getResult(0);
 
+    if (mlir::isa<mlir::stablehlo::CompareOp>(op)) {
+        if (valueElementType(result) != tt::TensorDesc::ELEMENT_TYPE_PRED) {
+            return false;
+        }
+        auto lhs_type = valueElementType(*op->operand_begin());
+        for (mlir::Value operand : op->getOperands()) {
+            if (!isSupportedCompareTensor(operand) ||
+                valueElementType(operand) != lhs_type) {
+                return false;
+            }
+            std::string ignored;
+            if (packedConstantValue(operand, ignored).has_value()) {
+                continue;
+            }
+            if (!sameTensorShape(operand, result)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (mlir::isa<mlir::stablehlo::ConvertOp>(op)) {
+        mlir::Value operand = op->getOperand(0);
+        return sameTensorShape(operand, result) &&
+               isSupportedConvertTensor(operand) &&
+               isSupportedConvertTensor(result);
+    }
+
+    bool float_only = mlir::isa<mlir::stablehlo::DivOp>(op) ||
+                      mlir::isa<mlir::stablehlo::PowOp>(op) ||
+                      mlir::isa<mlir::stablehlo::MaxOp>(op) ||
+                      mlir::isa<mlir::stablehlo::CosineOp>(op) ||
+                      mlir::isa<mlir::stablehlo::SineOp>(op) ||
+                      mlir::isa<mlir::stablehlo::NegOp>(op) ||
+                      mlir::isa<mlir::stablehlo::ExpOp>(op) ||
+                      mlir::isa<mlir::stablehlo::RsqrtOp>(op);
+    if (float_only && !isFloatTensor(result)) {
+        return false;
+    }
+    if (mlir::isa<mlir::stablehlo::SubtractOp>(op) &&
+        !(isFloatTensor(result) || isSignedOrSignlessIntegerTensor(result, 32))) {
+        return false;
+    }
+
     for (mlir::Value operand : op->getOperands()) {
+        if (!isSupportedFusedLeafTensor(operand) ||
+            valueElementType(operand) != valueElementType(result)) {
+            return false;
+        }
         std::string ignored;
         if (packedConstantValue(operand, ignored).has_value()) {
             continue;
         }
-        if (!isFloatTensor(operand) || !sameTensorShape(operand, result) ||
-            valueElementType(operand) != valueElementType(result)) {
+        if (!sameTensorShape(operand, result)) {
             return false;
         }
     }
@@ -467,6 +643,22 @@ uint32_t fusedElementwiseInputIndex(
     return input_index;
 }
 
+void addCoveredConstantProducers(
+    FusedElementwiseRegion& region,
+    mlir::Value value) {
+    while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
+        if (!broadcast_op->getResult(0).hasOneUse()) {
+            return;
+        }
+        region.covered_ops.push_back(broadcast_op);
+        value = broadcast_op.getOperand();
+    }
+    if (auto constant_op = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
+        constant_op && constant_op->getResult(0).hasOneUse()) {
+        region.covered_ops.push_back(constant_op);
+    }
+}
+
 std::optional<uint32_t> collectFusedElementwiseValue(
     mlir::Value value,
     mlir::Value root_value,
@@ -491,6 +683,9 @@ std::optional<uint32_t> collectFusedElementwiseOp(
     FusedElementwiseNodeDesc node;
     node.kind = kind;
     node.element_type = valueElementType(op->getResult(0));
+    if (auto compare_op = mlir::dyn_cast<mlir::stablehlo::CompareOp>(op)) {
+        node.compare_direction = mapCompareDirection(compare_op.getComparisonDirection());
+    }
 
     FusedElementwiseRegion candidate_region = region;
     llvm::DenseMap<mlir::Value, uint32_t> candidate_node_ids = node_ids;
@@ -526,7 +721,7 @@ std::optional<uint32_t> collectFusedElementwiseValue(
 
     std::string ignored;
     if (auto packed = packedConstantValue(value, ignored)) {
-        if (!isFloatTensor(value)) {
+        if (!isSupportedFusedLeafTensor(value)) {
             return std::nullopt;
         }
         FusedElementwiseNodeDesc node;
@@ -535,6 +730,7 @@ std::optional<uint32_t> collectFusedElementwiseValue(
         node.element_type = valueElementType(value);
         uint32_t node_id = addFusedNode(region, std::move(node));
         node_ids.try_emplace(value, node_id);
+        addCoveredConstantProducers(region, value);
         return node_id;
     }
 
@@ -565,7 +761,7 @@ std::optional<uint32_t> collectFusedElementwiseValue(
         }
     }
 
-    if (!isFloatTensor(value) || !sameTensorShape(value, root_value)) {
+    if (!isSupportedFusedLeafTensor(value) || !sameTensorShape(value, root_value)) {
         return std::nullopt;
     }
 
@@ -595,7 +791,7 @@ std::optional<FusedElementwiseRegion> collectFusedElementwiseRegion(
             return node.kind != tt::FusedElementwiseOp::Node::KIND_INPUT &&
                    node.kind != tt::FusedElementwiseOp::Node::KIND_CONSTANT;
         });
-    if (!collected_root.has_value() || fused_op_count < 2 ||
+    if (!collected_root.has_value() || fused_op_count < 1 ||
         region.nodes.size() > kMaxFusedElementwiseNodes ||
         region.inputs.size() > kMaxFusedElementwiseInputs) {
         return std::nullopt;
@@ -666,6 +862,7 @@ bool addFusedElementwiseOp(
         proto_node->set_packed_value(node.packed_value);
         proto_node->set_element_type(node.element_type);
         proto_node->set_single_tile_broadcast(node.single_tile_broadcast);
+        proto_node->set_compare_direction(node.compare_direction);
     }
     return true;
 }
@@ -703,6 +900,20 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 executable.add_output_ids(output_id);
             }
             continue;
+        }
+
+        if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
+            if (auto packed_value = packedConvertedConstantValue(convert_op, error)) {
+                uint32_t output_id = 0;
+                if (!addValueDesc(convert_op.getResult(), executable, value_ids, error, output_id)) {
+                    return false;
+                }
+                addConstantOp(executable, output_id, *packed_value);
+                continue;
+            }
+            if (!error.empty()) {
+                return false;
+            }
         }
 
         auto fused_root = fused_elementwise.roots.find(&op);
@@ -762,25 +973,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
-        if (auto compare_op = mlir::dyn_cast<mlir::stablehlo::CompareOp>(op)) {
-            uint32_t lhs_id = 0;
-            uint32_t rhs_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(compare_op.getLhs(), executable, value_ids, error, lhs_id) ||
-                !addValueDesc(compare_op.getRhs(), executable, value_ids, error, rhs_id) ||
-                !addValueDesc(compare_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* compare = executable.add_ops();
-            compare->set_output_id(output_id);
-            compare->mutable_compare()->set_lhs_id(lhs_id);
-            compare->mutable_compare()->set_rhs_id(rhs_id);
-            compare->mutable_compare()->set_direction(
-                mapCompareDirection(compare_op.getComparisonDirection()));
-            continue;
-        }
-
         if (auto select_op = mlir::dyn_cast<mlir::stablehlo::SelectOp>(op)) {
             uint32_t pred_id = 0;
             uint32_t on_true_id = 0;
@@ -829,91 +1021,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
-        if (auto add_op = mlir::dyn_cast<mlir::stablehlo::AddOp>(op)) {
-            uint32_t lhs_id = 0;
-            uint32_t rhs_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(add_op.getLhs(), executable, value_ids, error, lhs_id) ||
-                !addValueDesc(add_op.getRhs(), executable, value_ids, error, rhs_id) ||
-                !addValueDesc(add_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* add = executable.add_ops();
-            add->set_output_id(output_id);
-            add->mutable_add()->set_lhs_id(lhs_id);
-            add->mutable_add()->set_rhs_id(rhs_id);
-            continue;
-        }
-
-        if (auto subtract_op = mlir::dyn_cast<mlir::stablehlo::SubtractOp>(op)) {
-            uint32_t lhs_id = 0;
-            uint32_t rhs_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(subtract_op.getLhs(), executable, value_ids, error, lhs_id) ||
-                !addValueDesc(subtract_op.getRhs(), executable, value_ids, error, rhs_id) ||
-                !addValueDesc(subtract_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* subtract = executable.add_ops();
-            subtract->set_output_id(output_id);
-            subtract->mutable_subtract()->set_lhs_id(lhs_id);
-            subtract->mutable_subtract()->set_rhs_id(rhs_id);
-            continue;
-        }
-
-        if (auto mul_op = mlir::dyn_cast<mlir::stablehlo::MulOp>(op)) {
-            uint32_t lhs_id = 0;
-            uint32_t rhs_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(mul_op.getLhs(), executable, value_ids, error, lhs_id) ||
-                !addValueDesc(mul_op.getRhs(), executable, value_ids, error, rhs_id) ||
-                !addValueDesc(mul_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* multiply = executable.add_ops();
-            multiply->set_output_id(output_id);
-            multiply->mutable_multiply()->set_lhs_id(lhs_id);
-            multiply->mutable_multiply()->set_rhs_id(rhs_id);
-            continue;
-        }
-
-        if (auto div_op = mlir::dyn_cast<mlir::stablehlo::DivOp>(op)) {
-            uint32_t lhs_id = 0;
-            uint32_t rhs_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(div_op.getLhs(), executable, value_ids, error, lhs_id) ||
-                !addValueDesc(div_op.getRhs(), executable, value_ids, error, rhs_id) ||
-                !addValueDesc(div_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* divide = executable.add_ops();
-            divide->set_output_id(output_id);
-            divide->mutable_divide()->set_lhs_id(lhs_id);
-            divide->mutable_divide()->set_rhs_id(rhs_id);
-            continue;
-        }
-
-        if (auto pow_op = mlir::dyn_cast<mlir::stablehlo::PowOp>(op)) {
-            uint32_t lhs_id = 0;
-            uint32_t rhs_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(pow_op.getLhs(), executable, value_ids, error, lhs_id) ||
-                !addValueDesc(pow_op.getRhs(), executable, value_ids, error, rhs_id) ||
-                !addValueDesc(pow_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* power = executable.add_ops();
-            power->set_output_id(output_id);
-            power->mutable_power()->set_lhs_id(lhs_id);
-            power->mutable_power()->set_rhs_id(rhs_id);
-            continue;
-        }
-
         if (auto concatenate_op = mlir::dyn_cast<mlir::stablehlo::ConcatenateOp>(op)) {
             uint32_t output_id = 0;
             if (!addValueDesc(concatenate_op.getResult(), executable, value_ids, error, output_id)) {
@@ -930,48 +1037,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 concatenate->mutable_concatenate()->add_input_ids(input_id);
             }
             concatenate->mutable_concatenate()->set_dimension(concatenate_op.getDimension());
-            continue;
-        }
-
-        if (auto cosine_op = mlir::dyn_cast<mlir::stablehlo::CosineOp>(op)) {
-            uint32_t operand_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(cosine_op.getOperand(), executable, value_ids, error, operand_id) ||
-                !addValueDesc(cosine_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* cosine = executable.add_ops();
-            cosine->set_output_id(output_id);
-            cosine->mutable_cosine()->set_operand_id(operand_id);
-            continue;
-        }
-
-        if (auto sine_op = mlir::dyn_cast<mlir::stablehlo::SineOp>(op)) {
-            uint32_t operand_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(sine_op.getOperand(), executable, value_ids, error, operand_id) ||
-                !addValueDesc(sine_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* sine = executable.add_ops();
-            sine->set_output_id(output_id);
-            sine->mutable_sine()->set_operand_id(operand_id);
-            continue;
-        }
-
-        if (auto rsqrt_op = mlir::dyn_cast<mlir::stablehlo::RsqrtOp>(op)) {
-            uint32_t operand_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(rsqrt_op.getOperand(), executable, value_ids, error, operand_id) ||
-                !addValueDesc(rsqrt_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* rsqrt = executable.add_ops();
-            rsqrt->set_output_id(output_id);
-            rsqrt->mutable_rsqrt()->set_operand_id(operand_id);
             continue;
         }
 
@@ -1009,34 +1074,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             for (int64_t stride : slice_op.getStrides()) {
                 slice->mutable_slice()->add_strides(stride);
             }
-            continue;
-        }
-
-        if (auto negate_op = mlir::dyn_cast<mlir::stablehlo::NegOp>(op)) {
-            uint32_t operand_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(negate_op.getOperand(), executable, value_ids, error, operand_id) ||
-                !addValueDesc(negate_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* negate = executable.add_ops();
-            negate->set_output_id(output_id);
-            negate->mutable_negate()->set_operand_id(operand_id);
-            continue;
-        }
-
-        if (auto exponential_op = mlir::dyn_cast<mlir::stablehlo::ExpOp>(op)) {
-            uint32_t operand_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(exponential_op.getOperand(), executable, value_ids, error, operand_id) ||
-                !addValueDesc(exponential_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* exponential = executable.add_ops();
-            exponential->set_output_id(output_id);
-            exponential->mutable_exponential()->set_operand_id(operand_id);
             continue;
         }
 
@@ -1084,20 +1121,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
-        if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
-            uint32_t operand_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(convert_op.getOperand(), executable, value_ids, error, operand_id) ||
-                !addValueDesc(convert_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* convert = executable.add_ops();
-            convert->set_output_id(output_id);
-            convert->mutable_convert()->set_operand_id(operand_id);
-            continue;
-        }
-
         if (auto reduce_op = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(op)) {
             auto reducer = mapReduceReducer(reduce_op, error);
             if (!reducer) {
@@ -1121,23 +1144,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 reduce->mutable_reduce()->add_dimensions(dim);
             }
             reduce->mutable_reduce()->set_reducer(*reducer);
-            continue;
-        }
-
-        if (auto max_op = mlir::dyn_cast<mlir::stablehlo::MaxOp>(op)) {
-            uint32_t lhs_id = 0;
-            uint32_t rhs_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(max_op.getLhs(), executable, value_ids, error, lhs_id) ||
-                !addValueDesc(max_op.getRhs(), executable, value_ids, error, rhs_id) ||
-                !addValueDesc(max_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* max = executable.add_ops();
-            max->set_output_id(output_id);
-            max->mutable_max()->set_lhs_id(lhs_id);
-            max->mutable_max()->set_rhs_id(rhs_id);
             continue;
         }
 

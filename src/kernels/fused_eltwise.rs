@@ -104,28 +104,6 @@ impl FusedEltwiseOp {
         }
     }
 
-    pub(crate) fn is_binary(self) -> bool {
-        self.arity() == 2
-    }
-
-    pub(crate) fn is_compare(self) -> bool {
-        matches!(self, Self::Compare(_))
-    }
-
-    pub(crate) fn binary_output_dtype(self, input_dtype: DType) -> io::Result<DType> {
-        if !self.is_binary() {
-            return Err(invalid_input(format!(
-                "{self:?} is not a binary eltwise op"
-            )));
-        }
-        self.validate_binary_dtype(input_dtype)?;
-        Ok(if self.is_compare() {
-            DType::UInt8
-        } else {
-            input_dtype
-        })
-    }
-
     fn validate_dtypes(
         self,
         node_index: usize,
@@ -425,10 +403,15 @@ impl From<FusedElementwiseKind> for FusedEltwiseOp {
             FusedElementwiseKind::Subtract => Self::Subtract,
             FusedElementwiseKind::Multiply => Self::Multiply,
             FusedElementwiseKind::Divide => Self::Divide,
+            FusedElementwiseKind::Power => Self::Power,
             FusedElementwiseKind::Max => Self::Max,
+            FusedElementwiseKind::Compare(direction) => Self::Compare(direction),
+            FusedElementwiseKind::Cosine => Self::Cosine,
+            FusedElementwiseKind::Sine => Self::Sine,
             FusedElementwiseKind::Negate => Self::Negate,
             FusedElementwiseKind::Exponential => Self::Exponential,
             FusedElementwiseKind::Rsqrt => Self::Rsqrt,
+            FusedElementwiseKind::Convert => Self::Convert,
         }
     }
 }
