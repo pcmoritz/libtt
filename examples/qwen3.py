@@ -18,8 +18,6 @@ jax.config.update("jax_use_shardy_partitioner", False)
 
 import jax.numpy as jnp
 
-USE_TT_ROPE_DECODE = False
-
 
 @dataclass(frozen=True)
 class Qwen3Config:
@@ -385,15 +383,6 @@ def apply_rope(x, cos, sin):
     return (x * cos[:, None, :] + rotate_half(x) * sin[:, None, :]).astype(x.dtype)
 
 
-def apply_rope_decode(x, cos, sin):
-    if USE_TT_ROPE_DECODE and x.dtype == jnp.bfloat16 and x.shape[-1] % 64 == 0:
-        return jax.ffi.ffi_call(
-            "tt.rope_decode",
-            jax.ShapeDtypeStruct(x.shape, x.dtype),
-        )(x, cos, sin)
-    return apply_rope(x, cos, sin)
-
-
 def causal_attention_bias(seq_len: int):
     position_ids = jnp.arange(seq_len)
     return jnp.where(position_ids[None, :] > position_ids[:, None], -1.0e9, 0.0)[None, None, :, :]
@@ -432,8 +421,8 @@ def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin, causal_b
             query_states, key_states, value_states, bias=causal_bias, implementation="xla"
         )
     else:
-        query_states = apply_rope_decode(query_states, cos, sin)
-        key_states = apply_rope_decode(key_states, cos, sin)
+        query_states = apply_rope(query_states, cos, sin)
+        key_states = apply_rope(key_states, cos, sin)
         key_cache = jnp.concatenate((cache[0], jnp.transpose(key_states, (1, 2, 0))), axis=2)
         value_cache = jnp.concatenate((cache[1], jnp.transpose(value_states, (1, 0, 2))), axis=1)
         attn_output = decode_attention(config, query_states, key_cache, value_cache)
@@ -519,14 +508,11 @@ def timed_generate(config, weights, device, input_ids, args, decode_step):
 
 
 def main():
-    global USE_TT_ROPE_DECODE
-
     args = parse_args()
     if args.max_new_tokens < 0:
         raise SystemExit("--max-new-tokens must be non-negative")
 
     np_dtype = ml_dtypes.bfloat16 if args.dtype == "bf16" else np.float32
-    USE_TT_ROPE_DECODE = args.backend == "tt" and args.dtype == "bf16"
 
     if args.random_weights:
         config = make_random_config(args)

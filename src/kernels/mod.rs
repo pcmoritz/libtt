@@ -8,7 +8,6 @@ pub(crate) mod kernel;
 pub(crate) mod matmul;
 pub(crate) mod reduce;
 pub(crate) mod reshape;
-pub(crate) mod rope;
 pub(crate) mod select;
 pub(crate) mod slice;
 pub(crate) mod topk;

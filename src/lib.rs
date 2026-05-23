@@ -2399,112 +2399,6 @@ fn execute_identity_custom_call(
     Ok(())
 }
 
-fn execute_rope_decode_custom_call(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    device: &mut Device,
-    context: &OutputContext,
-    input_ids: &[u32],
-    output_id: u32,
-    call_target_name: &str,
-) -> Result<(), *mut PJRT_Error> {
-    let [input_id, cos_id, sin_id] = input_ids else {
-        return Err(invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} expected three inputs, got {}",
-            input_ids.len()
-        )));
-    };
-    let input_desc = plan.values.get(*input_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} input id {input_id} is out of bounds"
-        ))
-    })?;
-    let cos_desc = plan.values.get(*cos_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} cos id {cos_id} is out of bounds"
-        ))
-    })?;
-    let sin_desc = plan.values.get(*sin_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} sin id {sin_id} is out of bounds"
-        ))
-    })?;
-    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} output id {output_id} is out of bounds"
-        ))
-    })?;
-    if input_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || cos_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || sin_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-    {
-        return Err(unimplemented(format!(
-            "TT executable custom_call {call_target_name:?} currently requires bf16 inputs and output"
-        )));
-    }
-    if output_desc.dims != input_desc.dims {
-        return Err(invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} output shape mismatch: expected {:?}, got {:?}",
-            input_desc.dims, output_desc.dims
-        )));
-    }
-    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
-    let cos_shape = dims_i64_to_usize(&cos_desc.dims)?;
-    let sin_shape = dims_i64_to_usize(&sin_desc.dims)?;
-    let input = device_buffer_for_value(
-        values,
-        *input_id,
-        &format!("custom_call {call_target_name:?}.input"),
-    )?;
-    let cos = device_buffer_for_value(
-        values,
-        *cos_id,
-        &format!("custom_call {call_target_name:?}.cos"),
-    )?;
-    let sin = device_buffer_for_value(
-        values,
-        *sin_id,
-        &format!("custom_call {call_target_name:?}.sin"),
-    )?;
-    let Some(input_dram) = input.dram_buffer.as_ref() else {
-        return Err(failed_precondition(format!(
-            "TT executable custom_call {call_target_name:?} input buffer has no device allocation"
-        )));
-    };
-    let Some(cos_dram) = cos.dram_buffer.as_ref() else {
-        return Err(failed_precondition(format!(
-            "TT executable custom_call {call_target_name:?} cos buffer has no device allocation"
-        )));
-    };
-    let Some(sin_dram) = sin.dram_buffer.as_ref() else {
-        return Err(failed_precondition(format!(
-            "TT executable custom_call {call_target_name:?} sin buffer has no device allocation"
-        )));
-    };
-    let output_dims = output_desc.dims.clone();
-    let output_dram = kernels::rope::rope_decode(
-        device,
-        input_dram,
-        &input_shape,
-        cos_dram,
-        &cos_shape,
-        sin_dram,
-        &sin_shape,
-        "pjrt_rope_decode",
-    )
-    .map_err(io_error)?;
-    store_output_buffer(
-        values,
-        plan,
-        output_id,
-        output_dims,
-        output_dram,
-        context,
-        call_target_name,
-    )
-}
-
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -3193,22 +3087,6 @@ fn execute_executable_v1(
                 *output_id,
                 permutation,
             )?,
-            executable::Op::CustomCall {
-                input_ids,
-                output_id,
-                call_target_name,
-                ..
-            } if call_target_name == "tt.rope_decode" => {
-                execute_rope_decode_custom_call(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    input_ids,
-                    *output_id,
-                    call_target_name,
-                )?;
-            }
             executable::Op::CustomCall {
                 input_ids,
                 output_id,
