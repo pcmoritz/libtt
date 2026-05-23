@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <algorithm>
 #include <limits>
 #include <optional>
 #include <string>
@@ -7,7 +8,9 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -337,6 +340,334 @@ bool addTopKOp(
     return true;
 }
 
+constexpr unsigned kMaxFusedElementwiseNodes = 8;
+constexpr unsigned kMaxFusedElementwiseInputs = 8;
+
+// Fused elementwise lowering is intentionally conservative: it only folds
+// single-use StableHLO elementwise producers into an elementwise root, and it
+// keeps reductions, layout-changing ops, matmuls, and custom calls as
+// boundaries. Non-constant broadcasts are only folded for logical scalar
+// tensors; the runtime reader expands the first element to a full tile.
+struct FusedElementwiseNodeDesc {
+    tt::FusedElementwiseOp::Node::Kind kind;
+    llvm::SmallVector<uint32_t> input_nodes;
+    uint32_t input_index = 0;
+    uint32_t packed_value = 0;
+    tt::TensorDesc::ElementType element_type =
+        tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
+    bool single_tile_broadcast = false;
+};
+
+struct FusedElementwiseRegion {
+    llvm::SmallVector<mlir::Value> inputs;
+    llvm::SmallVector<FusedElementwiseNodeDesc> nodes;
+    llvm::SmallVector<mlir::Operation*> covered_ops;
+    uint32_t root_node_id = 0;
+    unsigned fused_op_count = 0;
+};
+
+bool isFloatTensor(mlir::Value value) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    if (!tensor || !tensor.hasStaticShape()) {
+        return false;
+    }
+    auto element = tensor.getElementType();
+    return element.isBF16() || element.isF16() || element.isF32();
+}
+
+bool sameTensorShape(mlir::Value lhs, mlir::Value rhs) {
+    auto lhs_tensor = mlir::dyn_cast<mlir::RankedTensorType>(lhs.getType());
+    auto rhs_tensor = mlir::dyn_cast<mlir::RankedTensorType>(rhs.getType());
+    return lhs_tensor && rhs_tensor && lhs_tensor.hasStaticShape() &&
+           rhs_tensor.hasStaticShape() && lhs_tensor.getShape() == rhs_tensor.getShape();
+}
+
+tt::TensorDesc::ElementType valueElementType(mlir::Value value) {
+    auto tensor = mlir::cast<mlir::RankedTensorType>(value.getType());
+    return mapProtoElementType(tensor.getElementType());
+}
+
+bool isLogicalScalarTile(mlir::Value value) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    if (!tensor || !tensor.hasStaticShape()) {
+        return false;
+    }
+    return llvm::all_of(tensor.getShape(), [](int64_t dim) { return dim == 1; });
+}
+
+std::optional<tt::FusedElementwiseOp::Node::Kind> fusedElementwiseKind(
+    mlir::Operation* op) {
+    if (mlir::isa<mlir::stablehlo::AddOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_ADD;
+    }
+    if (mlir::isa<mlir::stablehlo::SubtractOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_SUBTRACT;
+    }
+    if (mlir::isa<mlir::stablehlo::MulOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_MULTIPLY;
+    }
+    if (mlir::isa<mlir::stablehlo::DivOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_DIVIDE;
+    }
+    if (mlir::isa<mlir::stablehlo::MaxOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_MAX;
+    }
+    if (mlir::isa<mlir::stablehlo::NegOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_NEGATE;
+    }
+    if (mlir::isa<mlir::stablehlo::ExpOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_EXPONENTIAL;
+    }
+    if (mlir::isa<mlir::stablehlo::RsqrtOp>(op)) {
+        return tt::FusedElementwiseOp::Node::KIND_RSQRT;
+    }
+    return std::nullopt;
+}
+
+bool isFusableElementwiseOp(mlir::Operation* op) {
+    return op && op->getNumResults() == 1 &&
+           fusedElementwiseKind(op).has_value() &&
+           isFloatTensor(op->getResult(0));
+}
+
+bool hasSupportedFusedElementwiseTypes(mlir::Operation* op) {
+    if (!isFusableElementwiseOp(op)) {
+        return false;
+    }
+    mlir::Value result = op->getResult(0);
+
+    for (mlir::Value operand : op->getOperands()) {
+        std::string ignored;
+        if (packedConstantValue(operand, ignored).has_value()) {
+            continue;
+        }
+        if (!isFloatTensor(operand) || !sameTensorShape(operand, result) ||
+            valueElementType(operand) != valueElementType(result)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t addFusedNode(
+    FusedElementwiseRegion& region,
+    FusedElementwiseNodeDesc node) {
+    uint32_t node_id = static_cast<uint32_t>(region.nodes.size());
+    region.nodes.push_back(std::move(node));
+    return node_id;
+}
+
+std::optional<uint32_t> collectFusedElementwiseValue(
+    mlir::Value value,
+    mlir::Value root_value,
+    FusedElementwiseRegion& region,
+    llvm::DenseMap<mlir::Value, uint32_t>& node_ids);
+
+std::optional<uint32_t> collectFusedElementwiseOp(
+    mlir::Operation* op,
+    mlir::Value root_value,
+    bool is_root,
+    FusedElementwiseRegion& region,
+    llvm::DenseMap<mlir::Value, uint32_t>& node_ids) {
+    if (!is_root && !op->getResult(0).hasOneUse()) {
+        return std::nullopt;
+    }
+    if (!sameTensorShape(op->getResult(0), root_value) ||
+        !hasSupportedFusedElementwiseTypes(op)) {
+        return std::nullopt;
+    }
+
+    auto kind = *fusedElementwiseKind(op);
+    FusedElementwiseNodeDesc node;
+    node.kind = kind;
+    node.element_type = valueElementType(op->getResult(0));
+
+    for (mlir::Value operand : op->getOperands()) {
+        auto node_id =
+            collectFusedElementwiseValue(operand, root_value, region, node_ids);
+        if (!node_id.has_value()) {
+            return std::nullopt;
+        }
+        node.input_nodes.push_back(*node_id);
+    }
+
+    uint32_t node_id = addFusedNode(region, std::move(node));
+    node_ids.try_emplace(op->getResult(0), node_id);
+    region.covered_ops.push_back(op);
+    region.fused_op_count += 1;
+    return node_id;
+}
+
+std::optional<uint32_t> collectFusedElementwiseValue(
+    mlir::Value value,
+    mlir::Value root_value,
+    FusedElementwiseRegion& region,
+    llvm::DenseMap<mlir::Value, uint32_t>& node_ids) {
+    auto existing = node_ids.find(value);
+    if (existing != node_ids.end()) {
+        return existing->second;
+    }
+
+    std::string ignored;
+    if (auto packed = packedConstantValue(value, ignored)) {
+        if (!isFloatTensor(value)) {
+            return std::nullopt;
+        }
+        FusedElementwiseNodeDesc node;
+        node.kind = tt::FusedElementwiseOp::Node::KIND_CONSTANT;
+        node.packed_value = *packed;
+        node.element_type = valueElementType(value);
+        uint32_t node_id = addFusedNode(region, std::move(node));
+        node_ids.try_emplace(value, node_id);
+        return node_id;
+    }
+
+    if (auto* defining_op = value.getDefiningOp();
+        defining_op && isFusableElementwiseOp(defining_op)) {
+        if (auto node_id = collectFusedElementwiseOp(
+                defining_op, root_value, false, region, node_ids)) {
+            return node_id;
+        }
+    }
+
+    if (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
+        mlir::Value operand = broadcast_op.getOperand();
+        if (broadcast_op->getResult(0).hasOneUse() && isFloatTensor(operand) &&
+            mlir::isa<mlir::BlockArgument>(operand) &&
+            sameTensorShape(value, root_value) &&
+            valueElementType(operand) == valueElementType(value) &&
+            isLogicalScalarTile(operand)) {
+            auto input_it = std::find(region.inputs.begin(), region.inputs.end(), operand);
+            uint32_t input_index = 0;
+            if (input_it == region.inputs.end()) {
+                input_index = static_cast<uint32_t>(region.inputs.size());
+                region.inputs.push_back(operand);
+            } else {
+                input_index = static_cast<uint32_t>(input_it - region.inputs.begin());
+            }
+
+            FusedElementwiseNodeDesc node;
+            node.kind = tt::FusedElementwiseOp::Node::KIND_INPUT;
+            node.input_index = input_index;
+            node.element_type = valueElementType(value);
+            node.single_tile_broadcast = true;
+            uint32_t node_id = addFusedNode(region, std::move(node));
+            node_ids.try_emplace(value, node_id);
+            region.covered_ops.push_back(broadcast_op);
+            return node_id;
+        }
+    }
+
+    if (!isFloatTensor(value) || !sameTensorShape(value, root_value)) {
+        return std::nullopt;
+    }
+
+    auto input_it = std::find(region.inputs.begin(), region.inputs.end(), value);
+    uint32_t input_index = 0;
+    if (input_it == region.inputs.end()) {
+        input_index = static_cast<uint32_t>(region.inputs.size());
+        region.inputs.push_back(value);
+    } else {
+        input_index = static_cast<uint32_t>(input_it - region.inputs.begin());
+    }
+
+    FusedElementwiseNodeDesc node;
+    node.kind = tt::FusedElementwiseOp::Node::KIND_INPUT;
+    node.input_index = input_index;
+    node.element_type = valueElementType(value);
+    uint32_t node_id = addFusedNode(region, std::move(node));
+    node_ids.try_emplace(value, node_id);
+    return node_id;
+}
+
+std::optional<FusedElementwiseRegion> collectFusedElementwiseRegion(
+    mlir::Operation* root) {
+    if (!isFusableElementwiseOp(root) ||
+        !hasSupportedFusedElementwiseTypes(root)) {
+        return std::nullopt;
+    }
+
+    FusedElementwiseRegion region;
+    llvm::DenseMap<mlir::Value, uint32_t> node_ids;
+    auto root_node_id = collectFusedElementwiseOp(
+        root, root->getResult(0), true, region, node_ids);
+    if (!root_node_id.has_value() || region.fused_op_count < 2 ||
+        region.nodes.size() > kMaxFusedElementwiseNodes ||
+        region.inputs.size() > kMaxFusedElementwiseInputs) {
+        return std::nullopt;
+    }
+    region.root_node_id = *root_node_id;
+    return region;
+}
+
+struct FusedElementwisePlan {
+    llvm::DenseMap<mlir::Operation*, FusedElementwiseRegion> roots;
+    llvm::DenseSet<mlir::Operation*> covered_ops;
+};
+
+FusedElementwisePlan buildFusedElementwisePlan(FuncOp func) {
+    FusedElementwisePlan plan;
+    llvm::SmallVector<mlir::Operation*> ops;
+    for (mlir::Operation& op : func.front()) {
+        if (!mlir::isa<mlir::func::ReturnOp>(op)) {
+            ops.push_back(&op);
+        }
+    }
+
+    for (mlir::Operation* op : llvm::reverse(ops)) {
+        if (plan.covered_ops.contains(op)) {
+            continue;
+        }
+        auto region = collectFusedElementwiseRegion(op);
+        if (!region.has_value()) {
+            continue;
+        }
+        for (mlir::Operation* covered : region->covered_ops) {
+            plan.covered_ops.insert(covered);
+        }
+        plan.roots.try_emplace(op, std::move(*region));
+    }
+    return plan;
+}
+
+bool addFusedElementwiseOp(
+    mlir::Operation* root,
+    const FusedElementwiseRegion& region,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    uint32_t output_id = 0;
+    if (!addValueDesc(root->getResult(0), executable, value_ids, error, output_id)) {
+        return false;
+    }
+
+    auto* fused = executable.add_ops();
+    fused->set_output_id(output_id);
+    auto* fused_op = fused->mutable_fused_elementwise();
+
+    for (mlir::Value input : region.inputs) {
+        uint32_t input_id = 0;
+        if (!addValueDesc(input, executable, value_ids, error, input_id)) {
+            return false;
+        }
+        fused_op->add_input_ids(input_id);
+    }
+
+    for (const FusedElementwiseNodeDesc& node : region.nodes) {
+        auto* proto_node = fused_op->add_nodes();
+        proto_node->set_kind(node.kind);
+        for (uint32_t input_node : node.input_nodes) {
+            proto_node->add_input_nodes(input_node);
+        }
+        proto_node->set_input_index(node.input_index);
+        proto_node->set_packed_value(node.packed_value);
+        proto_node->set_element_type(node.element_type);
+        proto_node->set_single_tile_broadcast(node.single_tile_broadcast);
+    }
+    fused_op->set_root_node_id(region.root_node_id);
+    return true;
+}
+
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -348,6 +679,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     }
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
+    auto fused_elementwise = buildFusedElementwisePlan(func);
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
         uint32_t output_id = 0;
@@ -368,6 +700,22 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 }
                 executable.add_output_ids(output_id);
             }
+            continue;
+        }
+
+        auto fused_root = fused_elementwise.roots.find(&op);
+        if (fused_root != fused_elementwise.roots.end()) {
+            if (!addFusedElementwiseOp(
+                    &op,
+                    fused_root->second,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+        if (fused_elementwise.covered_ops.contains(&op)) {
             continue;
         }
 

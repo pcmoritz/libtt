@@ -1,9 +1,10 @@
-#[cfg(libtt_mlir_frontend)]
 use crate::PJRT_Buffer_Type;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::compare_op::Direction as ProtoCompareDirection;
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::fused_elementwise_op::node::Kind as ProtoFusedElementwiseKind;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::op::Kind;
 #[cfg(libtt_mlir_frontend)]
@@ -164,6 +165,39 @@ pub(crate) enum Op {
         indices_id: u32,
         k: u32,
     },
+    FusedElementwise {
+        input_ids: Vec<u32>,
+        output_id: u32,
+        nodes: Vec<FusedElementwiseNode>,
+        root_node_id: u32,
+    },
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct FusedElementwiseNode {
+    pub(crate) kind: FusedElementwiseKind,
+    pub(crate) input_nodes: Vec<u32>,
+    pub(crate) input_index: u32,
+    pub(crate) packed_value: u32,
+    pub(crate) element_type: PJRT_Buffer_Type,
+    pub(crate) single_tile_broadcast: bool,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum FusedElementwiseKind {
+    Input,
+    Constant,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Max,
+    Negate,
+    Exponential,
+    Rsqrt,
+    Convert,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -262,6 +296,39 @@ fn parse_reduce_reducer(reducer: i32) -> Result<ReduceReducer, String> {
         ProtoReduceReducer::Max => Ok(ReduceReducer::Max),
         ProtoReduceReducer::Mul => Ok(ReduceReducer::Mul),
     }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn parse_fused_elementwise_kind(kind: i32) -> Result<FusedElementwiseKind, String> {
+    match ProtoFusedElementwiseKind::try_from(kind)
+        .map_err(|_| "TT executable fused elementwise op contains an invalid kind".to_owned())?
+    {
+        ProtoFusedElementwiseKind::Input => Ok(FusedElementwiseKind::Input),
+        ProtoFusedElementwiseKind::Constant => Ok(FusedElementwiseKind::Constant),
+        ProtoFusedElementwiseKind::Add => Ok(FusedElementwiseKind::Add),
+        ProtoFusedElementwiseKind::Subtract => Ok(FusedElementwiseKind::Subtract),
+        ProtoFusedElementwiseKind::Multiply => Ok(FusedElementwiseKind::Multiply),
+        ProtoFusedElementwiseKind::Divide => Ok(FusedElementwiseKind::Divide),
+        ProtoFusedElementwiseKind::Max => Ok(FusedElementwiseKind::Max),
+        ProtoFusedElementwiseKind::Negate => Ok(FusedElementwiseKind::Negate),
+        ProtoFusedElementwiseKind::Exponential => Ok(FusedElementwiseKind::Exponential),
+        ProtoFusedElementwiseKind::Rsqrt => Ok(FusedElementwiseKind::Rsqrt),
+        ProtoFusedElementwiseKind::Convert => Ok(FusedElementwiseKind::Convert),
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn parse_fused_elementwise_node(
+    node: executable_proto::tt::fused_elementwise_op::Node,
+) -> Result<FusedElementwiseNode, String> {
+    Ok(FusedElementwiseNode {
+        kind: parse_fused_elementwise_kind(node.kind)?,
+        input_nodes: node.input_nodes,
+        input_index: node.input_index,
+        packed_value: node.packed_value,
+        element_type: map_element_type(node.element_type)?,
+        single_tile_broadcast: node.single_tile_broadcast,
+    })
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -422,6 +489,16 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     values_id: op_desc.output_id,
                     indices_id: top_k.indices_id,
                     k: top_k.k,
+                }),
+                Kind::FusedElementwise(fused) => Ok(Op::FusedElementwise {
+                    input_ids: fused.input_ids,
+                    output_id: op_desc.output_id,
+                    nodes: fused
+                        .nodes
+                        .into_iter()
+                        .map(parse_fused_elementwise_node)
+                        .collect::<Result<Vec<_>, String>>()?,
+                    root_node_id: fused.root_node_id,
                 }),
             }
         })
@@ -604,5 +681,11 @@ pub(crate) enum Op {
         values_id: u32,
         indices_id: u32,
         k: u32,
+    },
+    FusedElementwise {
+        input_ids: Vec<u32>,
+        output_id: u32,
+        nodes: Vec<FusedElementwiseNode>,
+        root_node_id: u32,
     },
 }

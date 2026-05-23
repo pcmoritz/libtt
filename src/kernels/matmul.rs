@@ -13,6 +13,10 @@ const BF16_READER_SENDER: &str = concat!(
     include_str!("../../kernels/matmul_reader_sender.cc")
 );
 const BF16_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
+const BF16_CONTIGUOUS_READER_SENDER: &str =
+    include_str!("../../kernels/matmul_contiguous_reader_sender.cc");
+const BF16_CONTIGUOUS_READER_RECV: &str =
+    include_str!("../../kernels/matmul_contiguous_reader_recv.cc");
 const BF16_WRITER_SENDER: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_writer_common.cc"),
@@ -23,11 +27,21 @@ const BF16_WRITER_RECV: &str = concat!(
     include_str!("../../kernels/matmul_writer_common.cc"),
     include_str!("../../kernels/matmul_writer_recv.cc")
 );
+const BF16_CONTIGUOUS_WRITER_SENDER: &str =
+    include_str!("../../kernels/matmul_contiguous_writer_sender.cc");
+const BF16_CONTIGUOUS_WRITER_RECV: &str =
+    include_str!("../../kernels/matmul_contiguous_writer_recv.cc");
+const BF16_LM_HEAD_TOP1_WRITER: &str = concat!(
+    include_str!("../../kernels/matmul_common.cc"),
+    include_str!("../../kernels/matmul_lm_head_top1_writer_sender.cc")
+);
 const BF16_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
 const READER_LHS_ADDR_INDEX: usize = 0;
 const WRITER_RHS_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
+const WRITER_PARTIAL_VALUES_ADDR_INDEX: usize = 18;
+const WRITER_PARTIAL_INDICES_ADDR_INDEX: usize = 19;
 const MAX_RANK: usize = 8;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -80,6 +94,7 @@ struct MatmulPlan {
     rows: Vec<u8>,
     cols: Vec<u8>,
     direct_grid: Option<Vec<Vec<CoreCoord>>>,
+    flat_column_grid: bool,
     batch_groups: usize,
     batches_per_group: usize,
     mt: usize,
@@ -147,6 +162,52 @@ struct MatmulBf16Kernel {
     rhs_addr: u32,
     output_addr: u32,
     key: MatmulProgramKey,
+}
+
+struct LmHeadTop1Kernel {
+    lhs_addr: u32,
+    rhs_addr: u32,
+    partial_values_addr: u32,
+    partial_indices_addr: u32,
+    key: MatmulProgramKey,
+}
+
+impl Kernel<MatmulProgramKey> for LmHeadTop1Kernel {
+    fn program_key(&self) -> MatmulProgramKey {
+        self.key.clone()
+    }
+
+    fn build_program(&self) -> io::Result<Program> {
+        lm_head_top1_program(
+            &self.key,
+            self.key.logical_mt,
+            self.key.logical_nt,
+            self.key.batch_count,
+            &self.key.lhs_view,
+            &self.key.rhs_view,
+            &self.key.output_view,
+            self.key.math_fidelity,
+            self.key.output_dtype,
+        )
+    }
+
+    #[inline]
+    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        match index {
+            READER_LHS_ADDR_INDEX => Some(self.lhs_addr),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        match index {
+            WRITER_RHS_ADDR_INDEX => Some(self.rhs_addr),
+            WRITER_PARTIAL_VALUES_ADDR_INDEX => Some(self.partial_values_addr),
+            WRITER_PARTIAL_INDICES_ADDR_INDEX => Some(self.partial_indices_addr),
+            _ => None,
+        }
+    }
 }
 
 impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
@@ -264,6 +325,99 @@ pub(crate) fn matmul_bf16_dot_general(
     Ok(output)
 }
 
+pub(crate) fn lm_head_top1_bf16(
+    device: &mut Device,
+    lhs: &DramBuffer,
+    rhs: &DramBuffer,
+    lhs_logical_shape: &[usize],
+    rhs_logical_shape: &[usize],
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
+    if lhs.dtype != DType::Float16B || rhs.dtype != DType::Float16B {
+        return Err(invalid_input(format!(
+            "lm_head_top1 requires bf16 inputs, got {:?} and {:?}",
+            lhs.dtype, rhs.dtype
+        )));
+    }
+    if lhs_logical_shape.len() != 2 || lhs_logical_shape[0] != 1 || rhs_logical_shape.len() != 2 {
+        return Err(invalid_input(format!(
+            "lm_head_top1 expects lhs [1, hidden] and rhs [hidden, vocab], got {lhs_logical_shape:?} and {rhs_logical_shape:?}"
+        )));
+    }
+    let output_logical_shape = [1, rhs_logical_shape[1]];
+    let shape = dot_general_shape(
+        lhs_logical_shape,
+        rhs_logical_shape,
+        &output_logical_shape,
+        &[],
+        &[],
+        &[1],
+        &[0],
+    )?;
+    if shape.batch_count != 1 || shape.m != 1 {
+        return Err(invalid_input(format!(
+            "lm_head_top1 expects a single row output, got batch_count={} M={}",
+            shape.batch_count, shape.m
+        )));
+    }
+    validate_tile_count(lhs, tiled_shape_tile_count(lhs_logical_shape)?, "lhs")?;
+    validate_tile_count(rhs, tiled_shape_tile_count(rhs_logical_shape)?, "rhs")?;
+
+    let logical_mt = ceil32(shape.m) / 32;
+    let logical_kt = ceil32(shape.k) / 32;
+    let logical_nt = ceil32(shape.n) / 32;
+    let math_fidelity = matmul_math_fidelity()?;
+    let cores = device.cores_arc();
+    let plan = plan_lm_head_top1(shape.k, shape.n, &cores)?;
+    let partial_count = plan_grid(&plan).iter().map(Vec::len).sum::<usize>();
+    let partial_shape = [partial_count * 32, 32];
+    let name = name.into();
+    let partial_values = device.alloc(
+        partial_count,
+        DType::Float16B,
+        &partial_shape,
+        format!("{name}_partial_values"),
+    )?;
+    let partial_indices = device.alloc(
+        partial_count,
+        DType::Int32,
+        &partial_shape,
+        format!("{name}_partial_indices"),
+    )?;
+    let key = MatmulProgramKey {
+        logical_mt,
+        logical_kt,
+        logical_nt,
+        batch_count: shape.batch_count,
+        lhs_view: shape.lhs_view,
+        rhs_view: shape.rhs_view,
+        output_view: shape.output_view,
+        cores,
+        math_fidelity,
+        output_dtype: DType::Float16B,
+    };
+    let kernel = LmHeadTop1Kernel {
+        lhs_addr: u32_arg(lhs.addr, "lhs address")?,
+        rhs_addr: u32_arg(rhs.addr, "rhs address")?,
+        partial_values_addr: u32_arg(partial_values.addr, "partial values address")?,
+        partial_indices_addr: u32_arg(partial_indices.addr, "partial indices address")?,
+        key,
+    };
+    log("lm_head_top1: running partial matmul".to_owned());
+    kernel.run(device)?;
+    log("lm_head_top1: partial matmul complete".to_owned());
+    log("lm_head_top1: finalizing partials".to_owned());
+    let (_values, indices) = crate::kernels::topk::top1_finalize_partials(
+        device,
+        &partial_values,
+        &partial_indices,
+        partial_count,
+        format!("{name}_top1"),
+    )?;
+    log("lm_head_top1: finalize complete".to_owned());
+    Ok(indices)
+}
+
 fn log_matmul_plan(plan: &MatmulPlan) {
     let grid = plan_grid(plan);
     let grid_rows = grid.len();
@@ -277,7 +431,13 @@ fn log_matmul_plan(plan: &MatmulPlan) {
         grid_cols,
         plan.batch_groups,
         plan.batches_per_group,
-        if plan.direct_grid.is_some() { "direct" } else { "mcast" },
+        if plan.direct_grid.is_some() {
+            "direct"
+        } else if plan.flat_column_grid {
+            "flat-column"
+        } else {
+            "mcast"
+        },
         plan.per_core_m,
         plan.per_core_n,
         plan.in0_block_w,
@@ -468,7 +628,11 @@ fn dot_general_dims(
     let batch = parse_dims(batch_dimensions, "batching")?;
     let contract = parse_dims(contracting_dimensions, "contracting")?;
     let free = (0..rank).filter(|&dim| !used[dim]).collect::<Vec<_>>();
-    Ok(DotGeneralDims { batch, contract, free })
+    Ok(DotGeneralDims {
+        batch,
+        contract,
+        free,
+    })
 }
 
 fn checked_product_of_dims(shape: &[usize], dims: &[usize], name: &str) -> io::Result<usize> {
@@ -499,8 +663,14 @@ fn operand_view(
         col_rank: u32_value(col_dims.len(), "matmul operand column rank")?,
         logical_rows: u32_value(logical_rows, "matmul operand logical rows")?,
         logical_cols: u32_value(logical_cols, "matmul operand logical columns")?,
-        tile_rows: u32_value(allocation_shape[rank - 2] / 32, "matmul operand source tile rows")?,
-        tiles_per_row: u32_value(allocation_shape[rank - 1] / 32, "matmul operand source tiles per row")?,
+        tile_rows: u32_value(
+            allocation_shape[rank - 2] / 32,
+            "matmul operand source tile rows",
+        )?,
+        tiles_per_row: u32_value(
+            allocation_shape[rank - 1] / 32,
+            "matmul operand source tiles per row",
+        )?,
         shape: padded_u32_array(shape, "matmul operand shape")?,
         batch_dims: padded_u32_array(batch_dims, "matmul operand batch dimensions")?,
         row_dims: padded_u32_array(row_dims, "matmul operand row dimensions")?,
@@ -515,7 +685,11 @@ fn operand_view_kind(
     col_dims: &[usize],
 ) -> MatmulViewKind {
     let leading_batch = batch_dims.iter().copied().eq(0..batch_dims.len());
-    if leading_batch && rank == batch_dims.len() + 2 && row_dims == [rank - 2] && col_dims == [rank - 1] {
+    if leading_batch
+        && rank == batch_dims.len() + 2
+        && row_dims == [rank - 2]
+        && col_dims == [rank - 1]
+    {
         MatmulViewKind::Contiguous
     } else if is_tiled_index_map_view(rank, batch_dims, row_dims, col_dims) {
         MatmulViewKind::TiledIndexMap
@@ -543,7 +717,10 @@ fn is_tiled_index_map_view(
 
 fn padded_u32_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]> {
     if values.len() > MAX_RANK {
-        return Err(invalid_input(format!("{name} rank {} exceeds maximum rank {MAX_RANK}", values.len())));
+        return Err(invalid_input(format!(
+            "{name} rank {} exceeds maximum rank {MAX_RANK}",
+            values.len()
+        )));
     }
     let mut result = [0u32; MAX_RANK];
     for (index, &value) in values.iter().enumerate() {
@@ -553,7 +730,10 @@ fn padded_u32_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]>
 }
 
 fn checked_product(values: &[usize], name: &str) -> io::Result<usize> {
-    values.iter().try_fold(1usize, |acc, &value| acc.checked_mul(value).ok_or_else(|| invalid_input(format!("{name} product overflow"))))
+    values.iter().try_fold(1usize, |acc, &value| {
+        acc.checked_mul(value)
+            .ok_or_else(|| invalid_input(format!("{name} product overflow")))
+    })
 }
 
 fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::Result<()> {
@@ -598,6 +778,21 @@ fn plan_matmul(
     let kt_divs = divisors(kt);
     let mut best = None;
     let mut best_score = None;
+    let flat_column = if false && mt_base == 1 && batch_count == 1 && allow_column_split {
+        plan_flat_column_matmul(
+            mt_base,
+            kt,
+            nt_base,
+            &xs,
+            &ys,
+            &available,
+            &kt_divs,
+            tile_bytes,
+            l1_data_bytes,
+        )
+    } else {
+        None
+    };
 
     for y_start in 0..ys.len() {
         for y_stop in y_start + 1..=ys.len() {
@@ -669,6 +864,7 @@ fn plan_matmul(
                                     rows: rows.to_vec(),
                                     cols: cols.to_vec(),
                                     direct_grid: None,
+                                    flat_column_grid: false,
                                     batch_groups: 1,
                                     batches_per_group: batch_count,
                                     mt,
@@ -704,7 +900,9 @@ fn plan_matmul(
             None,
         )
     };
-    let candidate = if mt_base == 1 {
+    let candidate = if let Some(flat_column) = flat_column {
+        Some(flat_column)
+    } else if mt_base == 1 {
         direct().or(best)
     } else {
         best.or_else(direct)
@@ -736,6 +934,157 @@ fn plan_matmul(
     }
 
     Ok(plan)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_flat_column_matmul(
+    mt_base: usize,
+    kt: usize,
+    nt_base: usize,
+    xs: &[u8],
+    ys: &[u8],
+    available: &[CoreCoord],
+    kt_divs: &[usize],
+    tile_bytes: usize,
+    l1_data_bytes: usize,
+) -> Option<MatmulPlan> {
+    if mt_base != 1 || nt_base == 0 {
+        return None;
+    }
+
+    let mut best = None;
+    let mut best_score = None;
+    for y_start in 0..ys.len() {
+        for y_stop in y_start + 1..=ys.len() {
+            let rows = &ys[y_start..y_stop];
+            let valid_cols = xs
+                .iter()
+                .copied()
+                .filter(|&x| {
+                    rows.iter()
+                        .all(|&y| available.contains(&CoreCoord { x, y }))
+                })
+                .collect::<Vec<_>>();
+            if valid_cols.is_empty() {
+                continue;
+            }
+            for nc in 1..=valid_cols.len() {
+                let cols = &valid_cols[..nc];
+                let active_cores = rows.len() * cols.len();
+                if active_cores != nt_base {
+                    continue;
+                }
+                for &in0_block_w in kt_divs {
+                    if in0_block_w > 32 || !fits_l1(1, 1, in0_block_w, tile_bytes, l1_data_bytes) {
+                        continue;
+                    }
+                    let score = (cols.len(), rows.len(), in0_block_w);
+                    if best_score.map_or(true, |current| score > current) {
+                        best_score = Some(score);
+                        best = Some(MatmulPlan {
+                            rows: rows.to_vec(),
+                            cols: cols.to_vec(),
+                            direct_grid: None,
+                            flat_column_grid: true,
+                            batch_groups: 1,
+                            batches_per_group: 1,
+                            mt: mt_base,
+                            kt,
+                            nt: nt_base,
+                            per_core_m: 1,
+                            per_core_n: 1,
+                            in0_block_w,
+                            out_subblock_h: 1,
+                            out_subblock_w: 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+fn plan_lm_head_top1(k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
+    let kt = ceil32(k) / 32;
+    let nt = (ceil32(n) / 32).max(1);
+    let tile_bytes = DType::Float16B.tile_size();
+    let l1_data_bytes = TensixL1::SIZE as usize - TensixL1::DATA_BUFFER_SPACE_BASE as usize;
+
+    let mut ordered = cores.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+    if ordered.is_empty() {
+        return Err(invalid_input("no worker cores are available"));
+    }
+
+    let mut xs = ordered.iter().map(|core| core.x).collect::<Vec<_>>();
+    xs.sort_unstable();
+    xs.dedup();
+    let mut ys = ordered.iter().map(|core| core.y).collect::<Vec<_>>();
+    ys.sort_unstable();
+    ys.dedup();
+    let available = ordered.iter().copied().collect::<Vec<_>>();
+    let kt_divs = divisors(kt);
+
+    let mut best = None;
+    let mut best_score = None;
+    for y_start in 0..ys.len() {
+        for y_stop in y_start + 1..=ys.len() {
+            let rows = &ys[y_start..y_stop];
+            let valid_cols = xs
+                .iter()
+                .copied()
+                .filter(|&x| {
+                    rows.iter()
+                        .all(|&y| available.contains(&CoreCoord { x, y }))
+                })
+                .collect::<Vec<_>>();
+            if valid_cols.is_empty() {
+                continue;
+            }
+            for nc in 1..=valid_cols.len() {
+                let cols = &valid_cols[..nc];
+                let active_cores = rows.len() * cols.len();
+                if active_cores > nt {
+                    continue;
+                }
+                for &in0_block_w in &kt_divs {
+                    if in0_block_w > 32 || !fits_l1(1, 1, in0_block_w, tile_bytes, l1_data_bytes) {
+                        continue;
+                    }
+                    let waves = nt.div_ceil(active_cores);
+                    let score = (active_cores, cols.len(), in0_block_w, usize::MAX - waves);
+                    if best_score.map_or(true, |current| score > current) {
+                        best_score = Some(score);
+                        best = Some(MatmulPlan {
+                            rows: rows.to_vec(),
+                            cols: cols.to_vec(),
+                            direct_grid: None,
+                            flat_column_grid: true,
+                            batch_groups: 1,
+                            batches_per_group: waves,
+                            mt: 1,
+                            kt,
+                            nt: active_cores,
+                            per_core_m: 1,
+                            per_core_n: 1,
+                            in0_block_w,
+                            out_subblock_h: 1,
+                            out_subblock_w: 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    best.ok_or_else(|| {
+        invalid_input(format!(
+            "no valid lm_head_top1 plan for K={k} N={n} on {} cores",
+            ordered.len()
+        ))
+    })
 }
 
 fn plan_direct_matmul(
@@ -855,6 +1204,7 @@ fn plan_direct_matmul(
                                             .map(|row| row.to_vec())
                                             .collect(),
                                     ),
+                                    flat_column_grid: false,
                                     batch_groups,
                                     batches_per_group,
                                     mt,
@@ -929,6 +1279,132 @@ fn bf16_program(
     math_fidelity: MathFidelity,
     output_dtype: DType,
 ) -> io::Result<Program> {
+    let use_contiguous_kernels = batch_count == 1
+        && output_dtype == DType::Float16B
+        && lhs_view.kind == MatmulViewKind::Contiguous
+        && rhs_view.kind == MatmulViewKind::Contiguous
+        && output_view.kind == MatmulViewKind::Contiguous;
+    let mut cbs = vec![
+        CBConfig {
+            index: 0,
+            dtype: DType::Float16B,
+            tiles: plan.cb0_pages(),
+        },
+        CBConfig {
+            index: 1,
+            dtype: DType::Float16B,
+            tiles: plan.cb1_pages(),
+        },
+    ];
+    if !use_contiguous_kernels {
+        cbs.extend([
+            CBConfig {
+                index: 2,
+                dtype: DType::Float16B,
+                tiles: 1,
+            },
+            CBConfig {
+                index: 3,
+                dtype: DType::Float16B,
+                tiles: 1,
+            },
+            CBConfig {
+                index: 4,
+                dtype: output_dtype,
+                tiles: 1,
+            },
+        ]);
+    }
+    cbs.extend([
+        CBConfig {
+            index: 16,
+            dtype: output_dtype,
+            tiles: plan.out_block_num_tiles(),
+        },
+        CBConfig {
+            index: 24,
+            dtype: output_dtype,
+            tiles: plan.out_block_num_tiles(),
+        },
+    ]);
+    let runtime_args = lower_runtime_args(
+        plan,
+        logical_mt,
+        logical_nt,
+        batch_count,
+        lhs_view,
+        rhs_view,
+        output_view,
+    )?;
+    Ok(Program {
+        reader_kernel: if use_contiguous_kernels {
+            BF16_CONTIGUOUS_READER_SENDER.to_owned()
+        } else {
+            BF16_READER_SENDER.to_owned()
+        },
+        writer_kernel: if use_contiguous_kernels {
+            BF16_CONTIGUOUS_WRITER_SENDER.to_owned()
+        } else {
+            BF16_WRITER_SENDER.to_owned()
+        },
+        compute_kernel: compute_src(plan, plan.batches_per_group),
+        reader_recv_kernel: if use_contiguous_kernels {
+            BF16_CONTIGUOUS_READER_RECV.to_owned()
+        } else {
+            BF16_READER_RECV.to_owned()
+        },
+        writer_recv_kernel: if use_contiguous_kernels {
+            if plan.flat_column_grid {
+                BF16_CONTIGUOUS_WRITER_SENDER.to_owned()
+            } else {
+                BF16_CONTIGUOUS_WRITER_RECV.to_owned()
+            }
+        } else {
+            if plan.flat_column_grid {
+                BF16_WRITER_SENDER.to_owned()
+            } else {
+                BF16_WRITER_RECV.to_owned()
+            }
+        },
+        name: format!(
+            "matmul_bf16_{:?}_{}x{}x{}",
+            output_dtype,
+            plan.mt * 32,
+            plan.kt * 32,
+            plan.nt * 32
+        ),
+        compile: CompileConfig {
+            cbs,
+            math_fidelity,
+            dst_accum_mode: true,
+            dst_full_sync: true,
+            ..CompileConfig::default()
+        },
+        grid: plan
+            .direct_grid
+            .is_none()
+            .then(|| (plan.rows.clone(), plan.cols.clone())),
+        ..Program::new(runtime_args)
+    })
+}
+
+fn lm_head_top1_program(
+    key: &MatmulProgramKey,
+    logical_mt: usize,
+    logical_nt: usize,
+    batch_count: usize,
+    lhs_view: &MatmulOperandView,
+    rhs_view: &MatmulOperandView,
+    output_view: &MatmulOperandView,
+    math_fidelity: MathFidelity,
+    output_dtype: DType,
+) -> io::Result<Program> {
+    let plan = plan_lm_head_top1(
+        key.logical_kt * 32,
+        output_view.logical_cols as usize,
+        &key.cores,
+    )?;
+    log_matmul_plan(&plan);
     let cbs = vec![
         CBConfig {
             index: 0,
@@ -961,13 +1437,18 @@ fn bf16_program(
             tiles: plan.out_block_num_tiles(),
         },
         CBConfig {
+            index: 17,
+            dtype: DType::Int32,
+            tiles: 1,
+        },
+        CBConfig {
             index: 24,
             dtype: output_dtype,
             tiles: plan.out_block_num_tiles(),
         },
     ];
-    let runtime_args = lower_runtime_args(
-        plan,
+    let runtime_args = lower_lm_head_top1_runtime_args(
+        &plan,
         logical_mt,
         logical_nt,
         batch_count,
@@ -977,13 +1458,12 @@ fn bf16_program(
     )?;
     Ok(Program {
         reader_kernel: BF16_READER_SENDER.to_owned(),
-        writer_kernel: BF16_WRITER_SENDER.to_owned(),
-        compute_kernel: compute_src(plan, plan.batches_per_group),
+        writer_kernel: BF16_LM_HEAD_TOP1_WRITER.to_owned(),
+        compute_kernel: compute_src(&plan, plan.batches_per_group),
         reader_recv_kernel: BF16_READER_RECV.to_owned(),
-        writer_recv_kernel: BF16_WRITER_RECV.to_owned(),
+        writer_recv_kernel: BF16_LM_HEAD_TOP1_WRITER.to_owned(),
         name: format!(
-            "matmul_bf16_{:?}_{}x{}x{}",
-            output_dtype,
+            "lm_head_top1_bf16_{}x{}x{}",
             plan.mt * 32,
             plan.kt * 32,
             plan.nt * 32
@@ -991,13 +1471,11 @@ fn bf16_program(
         compile: CompileConfig {
             cbs,
             math_fidelity,
-            dst_accum_mode: output_dtype == DType::Float32,
+            dst_accum_mode: true,
+            dst_full_sync: true,
             ..CompileConfig::default()
         },
-        grid: plan
-            .direct_grid
-            .is_none()
-            .then(|| (plan.rows.clone(), plan.cols.clone())),
+        grid: Some((plan.rows.clone(), plan.cols.clone())),
         ..Program::new(runtime_args)
     })
 }
@@ -1056,6 +1534,73 @@ fn lower_runtime_args(
                 output_view,
             )?;
             runtime_args.add_core(core, writer, reader, Vec::new())?;
+        }
+    }
+    runtime_args.build()
+}
+
+fn lower_lm_head_top1_runtime_args(
+    plan: &MatmulPlan,
+    logical_mt: usize,
+    logical_nt: usize,
+    _batch_count: usize,
+    lhs_view: &MatmulOperandView,
+    rhs_view: &MatmulOperandView,
+    output_view: &MatmulOperandView,
+) -> io::Result<RuntimeArgs> {
+    let grid = plan_grid(plan);
+    let mut runtime_args = RuntimeArgsBuilder::new(
+        NUM_SEMAPHORES,
+        vec![
+            WRITER_RHS_ADDR_INDEX,
+            WRITER_PARTIAL_VALUES_ADDR_INDEX,
+            WRITER_PARTIAL_INDICES_ADDR_INDEX,
+        ],
+        vec![READER_LHS_ADDR_INDEX],
+        Vec::new(),
+    );
+    let direct_grid_rows_per_batch = plan.direct_grid_rows_per_batch();
+    let mut partial_tile_id = 0usize;
+    let total_wave_count = plan.batches_per_group;
+    for (flat_row_index, row) in grid.iter().enumerate() {
+        let (batch_group, row_index) = if let Some(rows_per_batch) = direct_grid_rows_per_batch {
+            (
+                flat_row_index / rows_per_batch,
+                flat_row_index % rows_per_batch,
+            )
+        } else {
+            (0, flat_row_index)
+        };
+        let batch_start = batch_group * plan.batches_per_group;
+        for (col_index, &core) in row.iter().enumerate() {
+            let reader = reader_args(
+                plan,
+                &grid,
+                row_index,
+                core,
+                logical_mt,
+                plan.batches_per_group,
+                batch_start,
+                total_wave_count,
+                lhs_view,
+            )?;
+            let writer = lm_head_top1_writer_args(
+                plan,
+                &grid,
+                row_index,
+                col_index,
+                core,
+                logical_mt,
+                logical_nt,
+                plan.batches_per_group,
+                batch_start,
+                total_wave_count,
+                partial_tile_id,
+                rhs_view,
+                output_view,
+            )?;
+            runtime_args.add_core(core, writer, reader, Vec::new())?;
+            partial_tile_id += 1;
         }
     }
     runtime_args.build()
@@ -1138,9 +1683,14 @@ fn reader_args(
             grid[row_index][0],
         )
     };
+    let lhs_block_offset = if plan.flat_column_grid {
+        0
+    } else {
+        row_index * plan.per_core_m * plan.kt
+    };
     let mut args = vec![
         0,
-        u32_value(row_index * plan.per_core_m * plan.kt, "lhs block offset")?,
+        u32_value(lhs_block_offset, "lhs block offset")?,
         1,
         u32_value(plan.kt, "lhs row stride")?,
         u32_value(plan.in0_block_w, "lhs block advance")?,
@@ -1164,7 +1714,14 @@ fn reader_args(
         u32_value(local_batch_count, "local batch count")?,
         u32_value(batch_start, "batch start")?,
         u32_value(total_batch_count, "total batch count")?,
-        u32_value(logical_mt * plan.kt, "lhs batch stride")?,
+        u32_value(
+            if plan.flat_column_grid {
+                0
+            } else {
+                logical_mt * plan.kt
+            },
+            "lhs batch stride",
+        )?,
     ]);
     append_view_args(&mut args, lhs_view);
     Ok(args)
@@ -1184,7 +1741,7 @@ fn writer_args(
     rhs_view: &MatmulOperandView,
     output_view: &MatmulOperandView,
 ) -> io::Result<Vec<u32>> {
-    let mcast = if plan.direct_grid.is_some() || plan.rows.len() <= 1 {
+    let mcast = if plan.direct_grid.is_some() || plan.flat_column_grid || plan.rows.len() <= 1 {
         [0, 0, 0, 0, 0]
     } else {
         let recv_ys = &plan.rows[1..];
@@ -1196,13 +1753,21 @@ fn writer_args(
             recv_ys.len() as u32,
         ]
     };
-    let sender = if plan.direct_grid.is_some() {
+    let sender = if plan.direct_grid.is_some() || plan.flat_column_grid {
         core
     } else {
         grid[0][col_index]
     };
-    let column_start = col_index * plan.per_core_n;
-    let out_start = row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n;
+    let column_start = if plan.flat_column_grid {
+        row_index * grid[row_index].len() + col_index
+    } else {
+        col_index * plan.per_core_n
+    };
+    let out_start = if plan.flat_column_grid {
+        column_start
+    } else {
+        row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n
+    };
     let mut args = vec![
         0,
         u32_value(column_start, "rhs block offset")?,
@@ -1240,6 +1805,101 @@ fn writer_args(
         u32_value(batch_start, "batch start")?,
         u32_value(total_batch_count, "total batch count")?,
         u32_value(plan.kt * logical_nt, "rhs batch stride")?,
+        u32_value(logical_mt * logical_nt, "output batch stride")?,
+    ]);
+    append_view_args(&mut args, rhs_view);
+    append_view_args(&mut args, output_view);
+    Ok(args)
+}
+
+fn lm_head_top1_writer_args(
+    plan: &MatmulPlan,
+    grid: &[Vec<CoreCoord>],
+    row_index: usize,
+    col_index: usize,
+    core: CoreCoord,
+    logical_mt: usize,
+    logical_nt: usize,
+    local_batch_count: usize,
+    batch_start: usize,
+    total_batch_count: usize,
+    partial_tile_id: usize,
+    rhs_view: &MatmulOperandView,
+    output_view: &MatmulOperandView,
+) -> io::Result<Vec<u32>> {
+    let mcast = if plan.direct_grid.is_some() || plan.flat_column_grid || plan.rows.len() <= 1 {
+        [0, 0, 0, 0, 0]
+    } else {
+        let recv_ys = &plan.rows[1..];
+        [
+            core.x as u32,
+            *recv_ys.last().expect("recv_ys is non-empty") as u32,
+            core.x as u32,
+            recv_ys[0] as u32,
+            recv_ys.len() as u32,
+        ]
+    };
+    let sender = if plan.direct_grid.is_some() || plan.flat_column_grid {
+        core
+    } else {
+        grid[0][col_index]
+    };
+    let column_start = if plan.flat_column_grid {
+        row_index * grid[row_index].len() + col_index
+    } else {
+        col_index * plan.per_core_n
+    };
+    let out_start = if plan.flat_column_grid {
+        column_start
+    } else {
+        row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n
+    };
+    let mut args = vec![
+        0,
+        u32_value(column_start, "rhs block offset")?,
+        1,
+        u32_value(logical_nt, "rhs row stride")?,
+        u32_value(plan.in0_block_w * logical_nt, "rhs block advance")?,
+        u32_value(plan.per_core_n, "rhs block width")?,
+        u32_value(plan.in0_block_w, "rhs block height")?,
+        u32_value(plan.in1_block_num_tiles(), "rhs block tiles")?,
+        u32_value(plan.num_blocks(), "num blocks")?,
+    ];
+    for value in mcast {
+        args.push(value);
+    }
+    args.extend([
+        sender.x as u32,
+        sender.y as u32,
+        2,
+        3,
+        0,
+        0,
+        u32_value(out_start, "output tile offset")?,
+        1,
+        u32_value(plan.nt, "output row stride")?,
+        u32_value(plan.out_subblock_w, "output next subblock w")?,
+        u32_value(plan.out_subblock_h * plan.nt, "output next subblock h")?,
+        u32_value(plan.out_subblock_w, "output subblock width")?,
+        u32_value(plan.out_subblock_h, "output subblock height")?,
+        u32_value(plan.out_subblock_num_tiles(), "output subblock tiles")?,
+        u32_value(plan.in1_num_subblocks(), "output num subblocks w")?,
+        u32_value(plan.in0_num_subblocks(), "output num subblocks h")?,
+        u32_value(logical_mt, "logical M tiles")?,
+        u32_value(logical_nt, "logical N tiles")?,
+        0,
+        u32_value(partial_tile_id, "partial tile id")?,
+        u32_value(local_batch_count, "local batch count")?,
+        u32_value(batch_start, "batch start")?,
+        u32_value(total_batch_count, "total batch count")?,
+        u32_value(
+            if plan.flat_column_grid {
+                plan.nt
+            } else {
+                plan.kt * logical_nt
+            },
+            "rhs batch stride",
+        )?,
         u32_value(logical_mt * logical_nt, "output batch stride")?,
     ]);
     append_view_args(&mut args, rhs_view);
@@ -1408,7 +2068,10 @@ mod tests {
         let grid = plan.direct_grid.as_ref().expect("direct plan");
         assert!(plan.batch_groups > 1);
         assert_eq!(grid.len() % plan.batch_groups, 0);
-        assert_eq!(plan.direct_grid_rows_per_batch(), Some(grid.len() / plan.batch_groups));
+        assert_eq!(
+            plan.direct_grid_rows_per_batch(),
+            Some(grid.len() / plan.batch_groups)
+        );
     }
 
     #[test]

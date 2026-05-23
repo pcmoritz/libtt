@@ -18,7 +18,7 @@ mod log;
 mod mlir_frontend;
 
 use device::Device;
-use dram::{DType, DramBuffer};
+use dram::{tiled_allocation_shape, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
@@ -1764,6 +1764,21 @@ fn execute_reshape(
             "TT executable reshape operand buffer has no device allocation",
         ));
     };
+    let output_allocation_shape = tiled_allocation_shape(&output_shape).map_err(io_error)?;
+    if leading_unit_dims_compatible(&input_dram.shape, &output_allocation_shape) {
+        let mut output_dram = input_dram.clone();
+        output_dram.name = "pjrt_reshape_view".to_owned();
+        output_dram.shape = output_allocation_shape;
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_desc.dims.clone(),
+            output_dram,
+            context,
+            "reshape",
+        );
+    }
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
     let output_dram = kernels::reshape::reshape(
@@ -1784,6 +1799,17 @@ fn execute_reshape(
         context,
         "reshape",
     )
+}
+
+fn leading_unit_dims_compatible(lhs: &[usize], rhs: &[usize]) -> bool {
+    trim_leading_unit_dims(lhs) == trim_leading_unit_dims(rhs)
+}
+
+fn trim_leading_unit_dims(mut shape: &[usize]) -> &[usize] {
+    while shape.len() > 2 && shape[0] == 1 {
+        shape = &shape[1..];
+    }
+    shape
 }
 
 fn execute_slice(
@@ -1841,6 +1867,113 @@ fn execute_slice(
         context,
         "slice",
     )
+}
+
+fn execute_fused_elementwise(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    output_id: u32,
+    nodes: &[executable::FusedElementwiseNode],
+    root_node_id: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable fused_elementwise output id {output_id} is out of bounds"
+        ))
+    })?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let root = nodes.get(root_node_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable fused_elementwise root node id {root_node_id} is out of bounds"
+        ))
+    })?;
+    if root.element_type != output_desc.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable fused_elementwise root type {:?} does not match output type {:?}",
+            root.element_type, output_desc.element_type
+        )));
+    }
+
+    let mut inputs = Vec::with_capacity(input_ids.len());
+    for (index, &input_id) in input_ids.iter().enumerate() {
+        let input = device_buffer_for_value(
+            values,
+            input_id,
+            &format!("fused_elementwise.input[{index}]"),
+        )?;
+        let Some(input_dram) = input.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable fused_elementwise input[{index}] buffer has no device allocation"
+            )));
+        };
+        inputs.push(kernels::fused_eltwise::FusedEltwiseInput::Dram {
+            buffer: input_dram,
+            single_tile_broadcast: false,
+        });
+    }
+
+    let kernel_nodes = nodes
+        .iter()
+        .map(|node| {
+            Ok(kernels::fused_eltwise::FusedEltwiseNode {
+                op: fused_eltwise_op(node.kind),
+                input_nodes: node.input_nodes.clone(),
+                input_index: node.input_index,
+                packed_value: node.packed_value,
+                dtype: pjrt_buffer_type_to_dtype(node.element_type)?,
+                single_tile_broadcast: node.single_tile_broadcast,
+            })
+        })
+        .collect::<Result<Vec<_>, *mut PJRT_Error>>()?;
+    let output_dram = kernels::fused_eltwise::eltwise(
+        device,
+        &inputs,
+        &kernel_nodes,
+        root_node_id,
+        &output_shape,
+        "pjrt_fused_elementwise",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "fused_elementwise",
+    )
+}
+
+fn fused_eltwise_op(
+    kind: executable::FusedElementwiseKind,
+) -> kernels::fused_eltwise::FusedEltwiseOp {
+    match kind {
+        executable::FusedElementwiseKind::Input => kernels::fused_eltwise::FusedEltwiseOp::Input,
+        executable::FusedElementwiseKind::Constant => {
+            kernels::fused_eltwise::FusedEltwiseOp::Constant
+        }
+        executable::FusedElementwiseKind::Add => kernels::fused_eltwise::FusedEltwiseOp::Add,
+        executable::FusedElementwiseKind::Subtract => {
+            kernels::fused_eltwise::FusedEltwiseOp::Subtract
+        }
+        executable::FusedElementwiseKind::Multiply => {
+            kernels::fused_eltwise::FusedEltwiseOp::Multiply
+        }
+        executable::FusedElementwiseKind::Divide => kernels::fused_eltwise::FusedEltwiseOp::Divide,
+        executable::FusedElementwiseKind::Max => kernels::fused_eltwise::FusedEltwiseOp::Max,
+        executable::FusedElementwiseKind::Negate => kernels::fused_eltwise::FusedEltwiseOp::Negate,
+        executable::FusedElementwiseKind::Exponential => {
+            kernels::fused_eltwise::FusedEltwiseOp::Exponential
+        }
+        executable::FusedElementwiseKind::Rsqrt => kernels::fused_eltwise::FusedEltwiseOp::Rsqrt,
+        executable::FusedElementwiseKind::Convert => {
+            kernels::fused_eltwise::FusedEltwiseOp::Convert
+        }
+    }
 }
 
 fn execute_transpose(
@@ -2096,6 +2229,290 @@ fn execute_identity_custom_call(
     Ok(())
 }
 
+fn execute_rope_decode_custom_call(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    output_id: u32,
+    call_target_name: &str,
+) -> Result<(), *mut PJRT_Error> {
+    let [input_id, cos_id, sin_id] = input_ids else {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} expected three inputs, got {}",
+            input_ids.len()
+        )));
+    };
+    let input_desc = plan.values.get(*input_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} input id {input_id} is out of bounds"
+        ))
+    })?;
+    let cos_desc = plan.values.get(*cos_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} cos id {cos_id} is out of bounds"
+        ))
+    })?;
+    let sin_desc = plan.values.get(*sin_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} sin id {sin_id} is out of bounds"
+        ))
+    })?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} output id {output_id} is out of bounds"
+        ))
+    })?;
+    if input_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || cos_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || sin_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+    {
+        return Err(unimplemented(format!(
+            "TT executable custom_call {call_target_name:?} currently requires bf16 inputs and output"
+        )));
+    }
+    if output_desc.dims != input_desc.dims {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} output shape mismatch: expected {:?}, got {:?}",
+            input_desc.dims, output_desc.dims
+        )));
+    }
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let cos_shape = dims_i64_to_usize(&cos_desc.dims)?;
+    let sin_shape = dims_i64_to_usize(&sin_desc.dims)?;
+    let input = device_buffer_for_value(
+        values,
+        *input_id,
+        &format!("custom_call {call_target_name:?}.input"),
+    )?;
+    let cos = device_buffer_for_value(
+        values,
+        *cos_id,
+        &format!("custom_call {call_target_name:?}.cos"),
+    )?;
+    let sin = device_buffer_for_value(
+        values,
+        *sin_id,
+        &format!("custom_call {call_target_name:?}.sin"),
+    )?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(format!(
+            "TT executable custom_call {call_target_name:?} input buffer has no device allocation"
+        )));
+    };
+    let Some(cos_dram) = cos.dram_buffer.as_ref() else {
+        return Err(failed_precondition(format!(
+            "TT executable custom_call {call_target_name:?} cos buffer has no device allocation"
+        )));
+    };
+    let Some(sin_dram) = sin.dram_buffer.as_ref() else {
+        return Err(failed_precondition(format!(
+            "TT executable custom_call {call_target_name:?} sin buffer has no device allocation"
+        )));
+    };
+    let output_dims = output_desc.dims.clone();
+    let output_dram = kernels::rope::rope_decode(
+        device,
+        input_dram,
+        &input_shape,
+        cos_dram,
+        &cos_shape,
+        sin_dram,
+        &sin_shape,
+        "pjrt_rope_decode",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_dims,
+        output_dram,
+        context,
+        call_target_name,
+    )
+}
+
+fn execute_swiglu_custom_call(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    output_id: u32,
+    call_target_name: &str,
+) -> Result<(), *mut PJRT_Error> {
+    let [gate_id, up_id] = input_ids else {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} expected two inputs, got {}",
+            input_ids.len()
+        )));
+    };
+    let gate_desc = plan.values.get(*gate_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} gate id {gate_id} is out of bounds"
+        ))
+    })?;
+    let up_desc = plan.values.get(*up_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} up id {up_id} is out of bounds"
+        ))
+    })?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} output id {output_id} is out of bounds"
+        ))
+    })?;
+    if gate_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || up_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+    {
+        return Err(unimplemented(format!(
+            "TT executable custom_call {call_target_name:?} currently requires bf16 inputs and output"
+        )));
+    }
+    if gate_desc.dims != up_desc.dims || output_desc.dims != gate_desc.dims {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} requires matching input/output shapes, got gate {:?}, up {:?}, output {:?}",
+            gate_desc.dims, up_desc.dims, output_desc.dims
+        )));
+    }
+    let shape = dims_i64_to_usize(&gate_desc.dims)?;
+    let gate = device_buffer_for_value(
+        values,
+        *gate_id,
+        &format!("custom_call {call_target_name:?}.gate"),
+    )?;
+    let up = device_buffer_for_value(
+        values,
+        *up_id,
+        &format!("custom_call {call_target_name:?}.up"),
+    )?;
+    let Some(gate_dram) = gate.dram_buffer.as_ref() else {
+        return Err(failed_precondition(format!(
+            "TT executable custom_call {call_target_name:?} gate buffer has no device allocation"
+        )));
+    };
+    let Some(up_dram) = up.dram_buffer.as_ref() else {
+        return Err(failed_precondition(format!(
+            "TT executable custom_call {call_target_name:?} up buffer has no device allocation"
+        )));
+    };
+    let output_dims = output_desc.dims.clone();
+    let output_dram = kernels::swiglu::swiglu(device, gate_dram, up_dram, &shape, "pjrt_swiglu")
+        .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_dims,
+        output_dram,
+        context,
+        call_target_name,
+    )
+}
+
+fn execute_lm_head_top1_custom_call(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    output_id: u32,
+    call_target_name: &str,
+) -> Result<(), *mut PJRT_Error> {
+    let [hidden_id, head_id] = input_ids else {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} expected two inputs, got {}",
+            input_ids.len()
+        )));
+    };
+    let hidden_desc = plan.values.get(*hidden_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} hidden id {hidden_id} is out of bounds"
+        ))
+    })?;
+    let head_desc = plan.values.get(*head_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} head id {head_id} is out of bounds"
+        ))
+    })?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} output id {output_id} is out of bounds"
+        ))
+    })?;
+    if hidden_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || head_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32
+    {
+        return Err(unimplemented(format!(
+            "TT executable custom_call {call_target_name:?} requires bf16 inputs and s32 output"
+        )));
+    }
+    let hidden_shape = dims_i64_to_usize(&hidden_desc.dims)?;
+    let head_shape = dims_i64_to_usize(&head_desc.dims)?;
+    if hidden_shape.len() != 2 || hidden_shape[0] != 1 || head_shape.len() != 2 {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} expects hidden [1, hidden] and head [hidden, vocab], got {:?} and {:?}",
+            hidden_desc.dims, head_desc.dims
+        )));
+    }
+    if hidden_shape[1] != head_shape[0] {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} hidden/head mismatch: {:?} and {:?}",
+            hidden_desc.dims, head_desc.dims
+        )));
+    }
+    if output_desc.dims != [1] {
+        return Err(invalid_argument(format!(
+            "TT executable custom_call {call_target_name:?} output must be [1], got {:?}",
+            output_desc.dims
+        )));
+    }
+    let hidden = device_buffer_for_value(
+        values,
+        *hidden_id,
+        &format!("custom_call {call_target_name:?}.hidden"),
+    )?;
+    let head = device_buffer_for_value(
+        values,
+        *head_id,
+        &format!("custom_call {call_target_name:?}.head"),
+    )?;
+    let Some(hidden_dram) = hidden.dram_buffer.as_ref() else {
+        return Err(failed_precondition(format!(
+            "TT executable custom_call {call_target_name:?} hidden buffer has no device allocation"
+        )));
+    };
+    let Some(head_dram) = head.dram_buffer.as_ref() else {
+        return Err(failed_precondition(format!(
+            "TT executable custom_call {call_target_name:?} head buffer has no device allocation"
+        )));
+    };
+
+    let indices = kernels::matmul::lm_head_top1_bf16(
+        device,
+        hidden_dram,
+        head_dram,
+        &hidden_shape,
+        &head_shape,
+        "pjrt_lm_head_top1",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        indices,
+        context,
+        call_target_name,
+    )
+}
+
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2223,6 +2640,27 @@ fn execute_broadcast_in_dim(
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
+    let output_allocation_shape = tiled_allocation_shape(&output_shape).map_err(io_error)?;
+    if broadcast_in_dim_can_alias(
+        &input_shape,
+        &output_shape,
+        broadcast_dimensions,
+        &input_dram.shape,
+        &output_allocation_shape,
+    ) {
+        let mut output_dram = input_dram.clone();
+        output_dram.name = "pjrt_broadcast_view".to_owned();
+        output_dram.shape = output_allocation_shape;
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_dims,
+            output_dram,
+            context,
+            "broadcast_in_dim",
+        );
+    }
     let output_dram = kernels::broadcast::broadcast_in_dim(
         device,
         input_dram,
@@ -2240,6 +2678,54 @@ fn execute_broadcast_in_dim(
         context,
         "broadcast_in_dim",
     )
+}
+
+fn broadcast_in_dim_can_alias(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[i64],
+    input_allocation_shape: &[usize],
+    output_allocation_shape: &[usize],
+) -> bool {
+    if !leading_unit_dims_compatible(input_allocation_shape, output_allocation_shape) {
+        return false;
+    }
+    if broadcast_dimensions.len() != input_shape.len() {
+        return false;
+    }
+
+    let mut mapped_output_dims = vec![false; output_shape.len()];
+    for (input_dim, &output_dim) in broadcast_dimensions.iter().enumerate() {
+        let Ok(output_dim) = usize::try_from(output_dim) else {
+            return false;
+        };
+        if output_dim >= output_shape.len() || mapped_output_dims[output_dim] {
+            return false;
+        }
+        if input_shape[input_dim] != output_shape[output_dim] {
+            return false;
+        }
+        mapped_output_dims[output_dim] = true;
+    }
+    for (dim, &mapped) in mapped_output_dims.iter().enumerate() {
+        if !mapped && output_shape[dim] != 1 {
+            return false;
+        }
+    }
+
+    match input_shape.len() {
+        0 => output_shape.iter().all(|&dim| dim == 1),
+        1 => usize::try_from(broadcast_dimensions[0])
+            .is_ok_and(|output_dim| output_dim == output_shape.len().saturating_sub(1)),
+        input_rank => {
+            let output_rank = output_shape.len();
+            output_rank >= 2
+                && usize::try_from(broadcast_dimensions[input_rank - 2])
+                    .is_ok_and(|dim| dim == output_rank - 2)
+                && usize::try_from(broadcast_dimensions[input_rank - 1])
+                    .is_ok_and(|dim| dim == output_rank - 1)
+        }
+    }
 }
 
 fn execute_concatenate(
@@ -2720,6 +3206,54 @@ fn execute_executable_v1(
                 output_id,
                 call_target_name,
                 ..
+            } if call_target_name == "tt.rope_decode" => {
+                execute_rope_decode_custom_call(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    input_ids,
+                    *output_id,
+                    call_target_name,
+                )?;
+            }
+            executable::Op::CustomCall {
+                input_ids,
+                output_id,
+                call_target_name,
+                ..
+            } if call_target_name == "tt.swiglu" => {
+                execute_swiglu_custom_call(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    input_ids,
+                    *output_id,
+                    call_target_name,
+                )?;
+            }
+            executable::Op::CustomCall {
+                input_ids,
+                output_id,
+                call_target_name,
+                ..
+            } if call_target_name == "tt.lm_head_top1" => {
+                execute_lm_head_top1_custom_call(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    input_ids,
+                    *output_id,
+                    call_target_name,
+                )?;
+            }
+            executable::Op::CustomCall {
+                input_ids,
+                output_id,
+                call_target_name,
+                ..
             } if call_target_name == "annotate_device_placement" => {
                 let [input_id] = input_ids.as_slice() else {
                     return Err(invalid_argument(format!(
@@ -2934,6 +3468,21 @@ fn execute_executable_v1(
                 *values_id,
                 *indices_id,
                 *k,
+            )?,
+            executable::Op::FusedElementwise {
+                input_ids,
+                output_id,
+                nodes,
+                root_node_id,
+            } => execute_fused_elementwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_ids,
+                *output_id,
+                nodes,
+                *root_node_id,
             )?,
         }
     }
@@ -4521,6 +5070,33 @@ mod tests {
     }
 
     #[cfg(libtt_mlir_frontend)]
+    fn assert_fused_add_chain(op: &executable::Op) {
+        let executable::Op::FusedElementwise {
+            input_ids,
+            output_id,
+            nodes,
+            root_node_id,
+        } = op
+        else {
+            panic!("expected fused elementwise op");
+        };
+        assert_eq!(input_ids, &[0, 1, 2]);
+        assert_eq!(*output_id, 3);
+        assert_eq!(*root_node_id, 4);
+        assert_eq!(nodes.len(), 5);
+        assert_eq!(nodes[0].kind, executable::FusedElementwiseKind::Input);
+        assert_eq!(nodes[0].input_index, 0);
+        assert_eq!(nodes[1].kind, executable::FusedElementwiseKind::Input);
+        assert_eq!(nodes[1].input_index, 1);
+        assert_eq!(nodes[2].kind, executable::FusedElementwiseKind::Add);
+        assert_eq!(nodes[2].input_nodes, vec![0, 1]);
+        assert_eq!(nodes[3].kind, executable::FusedElementwiseKind::Input);
+        assert_eq!(nodes[3].input_index, 2);
+        assert_eq!(nodes[4].kind, executable::FusedElementwiseKind::Add);
+        assert_eq!(nodes[4].input_nodes, vec![2, 3]);
+    }
+
+    #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_simple_binary_ops() {
         struct Case {
@@ -4598,9 +5174,10 @@ mod tests {
 }
 "#,
             |executable| {
-                assert_eq!(executable.values.len(), 5);
-                assert_eq!(executable.ops.len(), 5);
-                assert_eq!(executable.output_ids, vec![4]);
+                assert_eq!(executable.values.len(), 4);
+                assert_eq!(executable.ops.len(), 4);
+                assert_eq!(executable.output_ids, vec![3]);
+                assert_fused_add_chain(&executable.ops[3]);
             },
         );
     }
