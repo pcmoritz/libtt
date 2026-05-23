@@ -84,10 +84,10 @@ class HuggingFaceTokenizer:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run Qwen3-0.6B or a tiny random-weight Qwen3-style decoder-only LLM with JAX."
+        description="Run Qwen3-4B or a tiny random-weight Qwen3-style decoder-only LLM with JAX."
     )
     parser.add_argument("--backend", default="tt")
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--model", default="Qwen/Qwen3-4B")
     parser.add_argument("--revision")
     parser.add_argument("--cache-dir")
     parser.add_argument("--local-files-only", action="store_true")
