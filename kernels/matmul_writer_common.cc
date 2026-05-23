@@ -55,6 +55,123 @@ void write_output_run(const InterleavedAddrGenFast<true> &out_gen, uint32_t dst_
     bytes -= block_bytes;
   }
 }
+
+bool is_grouped_row_output_view(const View &view) {
+  return view.rank == 5 && view.batch_rank == 2 && view.row_rank == 2 &&
+         view.col_rank == 1 && view.batch_dims[0] == 0 &&
+         view.batch_dims[1] == 1 && view.row_dims[0] == 2 &&
+         view.row_dims[1] == 3 && view.col_dims[0] == 4 &&
+         view.shape[3] > 0 && view.shape[3] <= TILE_R &&
+         TILE_R % view.shape[3] == 0;
+}
+
+void write_grouped_row_output_tile(const InterleavedAddrGenFast<true> &out_gen,
+                                   const View &view, uint32_t batch,
+                                   uint32_t canonical_row_tile,
+                                   uint32_t canonical_col_tile,
+                                   uint32_t src_l1_addr,
+                                   uint32_t element_bytes,
+                                   uint32_t cb_scratch) {
+  const uint32_t row_base = canonical_row_tile * TILE_R;
+  const uint32_t col_base = canonical_col_tile * TILE_C;
+  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    return;
+  }
+  const uint32_t group_rows = view.shape[3];
+  const uint32_t valid_cols =
+      (view.logical_cols - col_base) < TILE_C ? (view.logical_cols - col_base) : TILE_C;
+  uint32_t indices[MAX_RANK] = {};
+  decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
+  indices[4] = col_base;
+
+  cb_reserve_back(cb_scratch, 1);
+  uint32_t scratch_l1_addr = get_write_ptr(cb_scratch);
+  for (uint32_t row_group = 0; row_group < TILE_R; row_group += group_rows) {
+    const uint32_t logical_row = row_base + row_group;
+    if (logical_row >= view.logical_rows) {
+      break;
+    }
+    indices[2] = logical_row / group_rows;
+    indices[3] = 0;
+    uint32_t dst_row = 0;
+    uint32_t dst_col = 0;
+    uint32_t dst_tile = tile_id_for_indices(view, indices, &dst_row, &dst_col);
+    for (uint32_t inner = 0; inner < group_rows; ++inner) {
+      if (logical_row + inner >= view.logical_rows) {
+        break;
+      }
+      const uint32_t src_offset =
+          tile_element_index(row_group + inner, 0) * element_bytes;
+      const uint32_t dst_offset =
+          tile_element_index(dst_row + inner, dst_col) * element_bytes;
+      write_output_run(out_gen, dst_tile, dst_offset, src_l1_addr + src_offset,
+                       valid_cols * element_bytes, scratch_l1_addr);
+    }
+  }
+  cb_push_back(cb_scratch, 1);
+  cb_pop_front(cb_scratch, 1);
+}
+
+bool is_row_by_grouped_col_output_view(const View &view) {
+  return view.rank == 5 && view.batch_rank == 2 && view.row_rank == 1 &&
+         view.col_rank == 2 && view.batch_dims[0] == 0 &&
+         view.batch_dims[1] == 1 && view.row_dims[0] == 2 &&
+         view.col_dims[0] == 3 && view.col_dims[1] == 4 &&
+         view.shape[3] > 0 && view.shape[3] <= TILE_R &&
+         view.shape[4] > 0 && view.shape[4] <= TILE_C;
+}
+
+void write_row_by_grouped_col_output_tile(
+    const InterleavedAddrGenFast<true> &out_gen, const View &view,
+    uint32_t batch, uint32_t canonical_row_tile, uint32_t canonical_col_tile,
+    uint32_t src_l1_addr, uint32_t element_bytes, uint32_t cb_scratch) {
+  const uint32_t row_base = canonical_row_tile * TILE_R;
+  const uint32_t col_base = canonical_col_tile * TILE_C;
+  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    return;
+  }
+  const uint32_t token_count = view.shape[4];
+  const uint32_t valid_rows =
+      (view.logical_rows - row_base) < TILE_R ? (view.logical_rows - row_base) : TILE_R;
+  uint32_t indices[MAX_RANK] = {};
+  decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
+
+  cb_reserve_back(cb_scratch, 1);
+  uint32_t scratch_l1_addr = get_write_ptr(cb_scratch);
+  for (uint32_t row = 0; row < valid_rows; ++row) {
+    indices[2] = row_base + row;
+    uint32_t col = 0;
+    while (col < TILE_C) {
+      uint32_t logical_col = col_base + col;
+      if (logical_col >= view.logical_cols) {
+        break;
+      }
+      uint32_t repeat = logical_col / token_count;
+      uint32_t token = logical_col - repeat * token_count;
+      indices[3] = repeat;
+      indices[4] = token;
+      uint32_t dst_row = 0;
+      uint32_t dst_col = 0;
+      uint32_t dst_tile = tile_id_for_indices(view, indices, &dst_row, &dst_col);
+      uint32_t run = 1;
+      while (col + run < TILE_C && col_base + col + run < view.logical_cols) {
+        uint32_t next_logical_col = col_base + col + run;
+        if (next_logical_col / token_count != repeat) {
+          break;
+        }
+        ++run;
+      }
+      const uint32_t src_offset = tile_element_index(row, col) * element_bytes;
+      const uint32_t dst_offset = tile_element_index(dst_row, dst_col) * element_bytes;
+      write_output_run(out_gen, dst_tile, dst_offset, src_l1_addr + src_offset,
+                       run * element_bytes, scratch_l1_addr);
+      col += run;
+    }
+  }
+  cb_push_back(cb_scratch, 1);
+  cb_pop_front(cb_scratch, 1);
+}
+
 void write_output_tile(const InterleavedAddrGenFast<true> &out_gen, const View &output_view,
                        uint32_t batch, uint32_t canonical_row_tile,
                        uint32_t canonical_col_tile, uint32_t output_batch_stride,
@@ -66,8 +183,35 @@ void write_output_tile(const InterleavedAddrGenFast<true> &out_gen, const View &
                          out_gen, src_l1_addr);
     return;
   }
+  if (is_grouped_row_output_view(output_view)) {
+    write_grouped_row_output_tile(out_gen, output_view, batch,
+                                  canonical_row_tile, canonical_col_tile,
+                                  src_l1_addr, element_bytes, cb_scratch);
+    return;
+  }
+  if (is_row_by_grouped_col_output_view(output_view)) {
+    write_row_by_grouped_col_output_tile(
+        out_gen, output_view, batch, canonical_row_tile, canonical_col_tile,
+        src_l1_addr, element_bytes, cb_scratch);
+    return;
+  }
   const uint32_t row_base = canonical_row_tile * TILE_R;
   const uint32_t col_base = canonical_col_tile * TILE_C;
+  uint32_t batch_indices[MAX_RANK] = {};
+  decompose_into_dims(batch, output_view.batch_dims, output_view.batch_rank,
+                      output_view.shape, batch_indices);
+  uint32_t col_indices[TILE_C][MAX_RANK] = {};
+  bool valid_cols[TILE_C] = {};
+  for (uint32_t col = 0; col < TILE_C; ++col) {
+    const uint32_t logical_col = col_base + col;
+    if (logical_col >= output_view.logical_cols) {
+      continue;
+    }
+    valid_cols[col] = true;
+    decompose_into_dims(logical_col, output_view.col_dims,
+                        output_view.col_rank, output_view.shape,
+                        col_indices[col]);
+  }
   cb_reserve_back(cb_scratch, 1);
   uint32_t scratch_l1_addr = get_write_ptr(cb_scratch);
   for (uint32_t row = 0; row < TILE_R; ++row) {
@@ -75,29 +219,37 @@ void write_output_tile(const InterleavedAddrGenFast<true> &out_gen, const View &
     if (logical_row >= output_view.logical_rows) {
       continue;
     }
+    uint32_t indices[MAX_RANK] = {};
+    for (uint32_t i = 0; i < MAX_RANK; ++i) {
+      indices[i] = batch_indices[i];
+    }
+    decompose_into_dims(logical_row, output_view.row_dims,
+                        output_view.row_rank, output_view.shape, indices);
     uint32_t col = 0;
     while (col < TILE_C) {
-      const uint32_t logical_col = col_base + col;
-      if (logical_col >= output_view.logical_cols) {
+      if (!valid_cols[col]) {
         break;
+      }
+      for (uint32_t i = 0; i < output_view.col_rank; ++i) {
+        uint32_t dim = output_view.col_dims[i];
+        indices[dim] = col_indices[col][dim];
       }
       uint32_t dst_row = 0;
       uint32_t dst_col = 0;
-      const uint32_t dst_tile = output_tile_for_element(
-          output_view, batch, logical_row, logical_col, &dst_row, &dst_col);
+      const uint32_t dst_tile =
+          tile_id_for_indices(output_view, indices, &dst_row, &dst_col);
       const uint32_t src_offset = tile_element_index(row, col) * element_bytes;
       const uint32_t dst_offset = tile_element_index(dst_row, dst_col) * element_bytes;
       uint32_t run = 1;
-      while (col + run < TILE_C && col_base + col + run < output_view.logical_cols) {
+      while (col + run < TILE_C && valid_cols[col + run]) {
+        for (uint32_t i = 0; i < output_view.col_rank; ++i) {
+          uint32_t dim = output_view.col_dims[i];
+          indices[dim] = col_indices[col + run][dim];
+        }
         uint32_t next_dst_row = 0;
         uint32_t next_dst_col = 0;
-        const uint32_t next_dst_tile = output_tile_for_element(
-            output_view,
-            batch,
-            logical_row,
-            col_base + col + run,
-            &next_dst_row,
-            &next_dst_col);
+        const uint32_t next_dst_tile = tile_id_for_indices(
+            output_view, indices, &next_dst_row, &next_dst_col);
         const uint32_t next_src_offset = tile_element_index(row, col + run) * element_bytes;
         const uint32_t next_dst_offset = tile_element_index(next_dst_row, next_dst_col) * element_bytes;
         if (next_dst_tile != dst_tile ||

@@ -13,8 +13,12 @@ use std::io;
 const READER: &str = include_str!("../../kernels/reduce_reader.cc");
 const COMPUTE: &str = include_str!("../../kernels/reduce_compute.cc");
 const WRITER: &str = include_str!("../../kernels/reduce_writer.cc");
+const WIDTH_PARTIAL_READER: &str = include_str!("../../kernels/reduce_width_partial_reader.cc");
+const WIDTH_PARTIAL_WRITER: &str = include_str!("../../kernels/reduce_width_partial_writer.cc");
 const READER_INPUT_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
+const MAX_WIDTH_SPLIT_PARTITIONS: usize = 8;
+const MIN_WIDTH_SPLIT_TILES: u32 = 64;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum ReduceOp {
@@ -166,6 +170,15 @@ struct ReduceProgramKey {
     shape: ReduceKernelShape,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ReduceWidthPartialProgramKey {
+    cores: Vec<CoreCoord>,
+    dtype: DType,
+    op: ReduceOp,
+    input_width_tiles: u32,
+    valid_last_width: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReduceCoreRange {
     group_offset: u32,
@@ -174,7 +187,46 @@ struct ReduceCoreRange {
     output_tiles: u32,
 }
 
+struct ReduceWidthPartialKernel {
+    input_addr: u32,
+    partial_addr: u32,
+    key: ReduceWidthPartialProgramKey,
+}
+
+impl Kernel<ReduceWidthPartialProgramKey> for ReduceWidthPartialKernel {
+    fn program_key(&self) -> ReduceWidthPartialProgramKey {
+        self.key.clone()
+    }
+
+    fn build_program(&self) -> io::Result<Program> {
+        reduce_width_partial_program(self.key.clone())
+    }
+
+    #[inline]
+    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        (index == READER_INPUT_ADDR_INDEX).then_some(self.input_addr)
+    }
+
+    #[inline]
+    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        (index == WRITER_OUTPUT_ADDR_INDEX).then_some(self.partial_addr)
+    }
+}
+
 pub(crate) fn reduce(
+    device: &mut Device,
+    input: &DramBuffer,
+    plan: &ReducePlan,
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
+    let name = name.into();
+    if let Some(partition_count) = width_split_partition_count(device.cores_ref().len(), plan)? {
+        return reduce_width_split(device, input, plan, partition_count, name);
+    }
+    reduce_serial(device, input, plan, name)
+}
+
+fn reduce_serial(
     device: &mut Device,
     input: &DramBuffer,
     plan: &ReducePlan,
@@ -213,6 +265,48 @@ pub(crate) fn reduce(
     };
     kernel.run(device)?;
     Ok(output)
+}
+
+fn reduce_width_split(
+    device: &mut Device,
+    input: &DramBuffer,
+    plan: &ReducePlan,
+    partition_count: usize,
+    name: String,
+) -> io::Result<DramBuffer> {
+    validate_input(input, plan)?;
+    let cores = select_worker_cores(device.cores_ref(), partition_count)?;
+    let partial_width = partition_count
+        .checked_mul(TILE_C)
+        .ok_or_else(|| invalid_input("reduce partial width overflow"))?;
+    let partial_shape = tiled_allocation_shape(&[TILE_R, partial_width])?;
+    let partials = device.alloc(
+        partition_count,
+        plan.dtype,
+        &partial_shape,
+        format!("{name}_partials"),
+    )?;
+    let partial_kernel = ReduceWidthPartialKernel {
+        input_addr: u32_addr(input.addr, "input address")?,
+        partial_addr: u32_addr(partials.addr, "partial reduce address")?,
+        key: ReduceWidthPartialProgramKey {
+            cores,
+            dtype: plan.dtype,
+            op: plan.op,
+            input_width_tiles: plan.shape.input_width_tiles,
+            valid_last_width: plan.shape.valid_last_width,
+        },
+    };
+    partial_kernel.run(device)?;
+
+    let final_plan = ReducePlan::new(
+        plan.dtype,
+        &[TILE_R, partial_width],
+        &[TILE_R],
+        &[1],
+        ReduceReducer::Add,
+    )?;
+    reduce_serial(device, &partials, &final_plan, name)
 }
 
 fn validate_input(input: &DramBuffer, plan: &ReducePlan) -> io::Result<()> {
@@ -306,6 +400,55 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
     })
 }
 
+fn reduce_width_partial_program(key: ReduceWidthPartialProgramKey) -> io::Result<Program> {
+    let core_count = key.cores.len();
+    let max_core_width_tiles = (key.input_width_tiles as usize).div_ceil(core_count);
+    let input_tiles = max_core_width_tiles.max(1);
+    let mut runtime_args = RuntimeArgsBuilder::new(
+        0,
+        vec![WRITER_OUTPUT_ADDR_INDEX],
+        vec![READER_INPUT_ADDR_INDEX],
+        Vec::new(),
+    );
+    for (core_index, &core) in key.cores.iter().enumerate() {
+        let (width_start, width_tiles) =
+            split_tile_range(key.input_width_tiles, core_index, core_count)?;
+        runtime_args.add_core(
+            core,
+            vec![0, u32_arg(core_index, "reduce width partial column")?],
+            vec![
+                0,
+                width_start,
+                width_tiles,
+                key.input_width_tiles,
+                key.valid_last_width,
+                key.op.padding_identity_bits(),
+            ],
+            vec![1, width_tiles],
+        )?;
+    }
+    let runtime_args = runtime_args.build()?;
+    Ok(Program {
+        reader_kernel: WIDTH_PARTIAL_READER.to_owned(),
+        compute_kernel: reduce_compute_source(key.op),
+        writer_kernel: WIDTH_PARTIAL_WRITER.to_owned(),
+        compile: CompileConfig {
+            cbs: vec![
+                CBConfig {
+                    index: 0,
+                    dtype: key.dtype,
+                    tiles: input_tiles,
+                },
+                CBConfig::new(16, key.dtype),
+            ],
+            dst_accum_mode: true,
+            ..CompileConfig::default()
+        },
+        name: format!("reduce_width_partial_{:?}_{:?}", key.op, key.dtype),
+        ..Program::new(runtime_args)
+    })
+}
+
 fn reduce_compute_source(op: ReduceOp) -> String {
     COMPUTE
         .replace("REDUCE_POOL_TYPE", op.cpp_pool_type())
@@ -318,6 +461,34 @@ fn bool_define(value: bool) -> &'static str {
     } else {
         "0"
     }
+}
+
+fn width_split_partition_count(
+    available_cores: usize,
+    plan: &ReducePlan,
+) -> io::Result<Option<usize>> {
+    let shape = plan.shape;
+    if plan.dtype != DType::Float32
+        || !plan.op.is_sum()
+        || plan.input_shape.len() != 2
+        || shape.output_tiles != 1
+        || shape.inner_output_tiles != 1
+        || shape.output_dim0 != 1
+        || shape.output_tile_rows_per_prefix != 1
+        || shape.input_width_tiles < MIN_WIDTH_SPLIT_TILES
+    {
+        return Ok(None);
+    }
+    let partition_count = available_cores
+        .min(MAX_WIDTH_SPLIT_PARTITIONS)
+        .min(TILE_C)
+        .min(usize::try_from(shape.input_width_tiles).map_err(|_| {
+            invalid_input(format!(
+                "input width tile count does not fit in usize: {}",
+                shape.input_width_tiles
+            ))
+        })?);
+    Ok((partition_count > 1).then_some(partition_count))
 }
 
 fn reduce_partition_count(shape: ReduceKernelShape) -> io::Result<u32> {
@@ -464,5 +635,22 @@ mod tests {
         assert_eq!(plan.shape.input_width_tiles, 2);
         assert_eq!(plan.shape.valid_last_width, TILE_C as u32);
         assert_eq!(plan.op.padding_identity_bits(), 0.0f32.to_bits());
+    }
+
+    #[test]
+    fn width_split_targets_single_tile_vector_sums() {
+        let plan =
+            ReducePlan::new(DType::Float32, &[32, 2560], &[32], &[1], ReduceReducer::Add).unwrap();
+        assert_eq!(
+            width_split_partition_count(140, &plan).unwrap(),
+            Some(MAX_WIDTH_SPLIT_PARTITIONS)
+        );
+    }
+
+    #[test]
+    fn width_split_skips_small_reductions() {
+        let plan =
+            ReducePlan::new(DType::Float32, &[32, 128], &[32], &[1], ReduceReducer::Add).unwrap();
+        assert_eq!(width_split_partition_count(140, &plan).unwrap(), None);
     }
 }
