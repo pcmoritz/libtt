@@ -13,10 +13,6 @@ const BF16_READER_SENDER: &str = concat!(
     include_str!("../../kernels/matmul_reader_sender.cc")
 );
 const BF16_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
-const BF16_CONTIGUOUS_READER_SENDER: &str =
-    include_str!("../../kernels/matmul_contiguous_reader_sender.cc");
-const BF16_CONTIGUOUS_READER_RECV: &str =
-    include_str!("../../kernels/matmul_contiguous_reader_recv.cc");
 const BF16_WRITER_SENDER: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_writer_common.cc"),
@@ -27,10 +23,6 @@ const BF16_WRITER_RECV: &str = concat!(
     include_str!("../../kernels/matmul_writer_common.cc"),
     include_str!("../../kernels/matmul_writer_recv.cc")
 );
-const BF16_CONTIGUOUS_WRITER_SENDER: &str =
-    include_str!("../../kernels/matmul_contiguous_writer_sender.cc");
-const BF16_CONTIGUOUS_WRITER_RECV: &str =
-    include_str!("../../kernels/matmul_contiguous_writer_recv.cc");
 const BF16_MATMUL_TOP1_WRITER: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_top1_writer_sender.cc")
@@ -1279,12 +1271,7 @@ fn bf16_program(
     math_fidelity: MathFidelity,
     output_dtype: DType,
 ) -> io::Result<Program> {
-    let use_contiguous_kernels = batch_count == 1
-        && output_dtype == DType::Float16B
-        && lhs_view.kind == MatmulViewKind::Contiguous
-        && rhs_view.kind == MatmulViewKind::Contiguous
-        && output_view.kind == MatmulViewKind::Contiguous;
-    let mut cbs = vec![
+    let cbs = vec![
         CBConfig {
             index: 0,
             dtype: DType::Float16B,
@@ -1295,27 +1282,21 @@ fn bf16_program(
             dtype: DType::Float16B,
             tiles: plan.cb1_pages(),
         },
-    ];
-    if !use_contiguous_kernels {
-        cbs.extend([
-            CBConfig {
-                index: 2,
-                dtype: DType::Float16B,
-                tiles: 1,
-            },
-            CBConfig {
-                index: 3,
-                dtype: DType::Float16B,
-                tiles: 1,
-            },
-            CBConfig {
-                index: 4,
-                dtype: output_dtype,
-                tiles: 1,
-            },
-        ]);
-    }
-    cbs.extend([
+        CBConfig {
+            index: 2,
+            dtype: DType::Float16B,
+            tiles: 1,
+        },
+        CBConfig {
+            index: 3,
+            dtype: DType::Float16B,
+            tiles: 1,
+        },
+        CBConfig {
+            index: 4,
+            dtype: output_dtype,
+            tiles: 1,
+        },
         CBConfig {
             index: 16,
             dtype: output_dtype,
@@ -1326,7 +1307,7 @@ fn bf16_program(
             dtype: output_dtype,
             tiles: plan.out_block_num_tiles(),
         },
-    ]);
+    ];
     let runtime_args = lower_runtime_args(
         plan,
         logical_mt,
@@ -1337,34 +1318,14 @@ fn bf16_program(
         output_view,
     )?;
     Ok(Program {
-        reader_kernel: if use_contiguous_kernels {
-            BF16_CONTIGUOUS_READER_SENDER.to_owned()
-        } else {
-            BF16_READER_SENDER.to_owned()
-        },
-        writer_kernel: if use_contiguous_kernels {
-            BF16_CONTIGUOUS_WRITER_SENDER.to_owned()
-        } else {
-            BF16_WRITER_SENDER.to_owned()
-        },
+        reader_kernel: BF16_READER_SENDER.to_owned(),
+        writer_kernel: BF16_WRITER_SENDER.to_owned(),
         compute_kernel: compute_src(plan, plan.batches_per_group),
-        reader_recv_kernel: if use_contiguous_kernels {
-            BF16_CONTIGUOUS_READER_RECV.to_owned()
+        reader_recv_kernel: BF16_READER_RECV.to_owned(),
+        writer_recv_kernel: if plan.flat_column_grid {
+            BF16_WRITER_SENDER.to_owned()
         } else {
-            BF16_READER_RECV.to_owned()
-        },
-        writer_recv_kernel: if use_contiguous_kernels {
-            if plan.flat_column_grid {
-                BF16_CONTIGUOUS_WRITER_SENDER.to_owned()
-            } else {
-                BF16_CONTIGUOUS_WRITER_RECV.to_owned()
-            }
-        } else {
-            if plan.flat_column_grid {
-                BF16_WRITER_SENDER.to_owned()
-            } else {
-                BF16_WRITER_RECV.to_owned()
-            }
+            BF16_WRITER_RECV.to_owned()
         },
         name: format!(
             "matmul_bf16_{:?}_{}x{}x{}",
