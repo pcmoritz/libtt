@@ -9,6 +9,14 @@ use std::io;
 
 const WRITER: &str = include_str!("../../kernels/tile_writer.cc");
 const COMPUTE: &str = include_str!("../../kernels/fused_eltwise_compute.cc");
+const HELPER_BINARY_INPUT_DATA_FORMAT: &str =
+    include_str!("../../kernels/fused_eltwise_helpers/binary_input_data_format.cc.inc");
+const HELPER_ADD_INPUT: &str = include_str!("../../kernels/fused_eltwise_helpers/add_input.cc.inc");
+const HELPER_SUBTRACT_INPUT: &str =
+    include_str!("../../kernels/fused_eltwise_helpers/subtract_input.cc.inc");
+const HELPER_MULTIPLY_INPUT: &str =
+    include_str!("../../kernels/fused_eltwise_helpers/multiply_input.cc.inc");
+const HELPER_COMPARE: &str = include_str!("../../kernels/fused_eltwise_helpers/compare.cc.inc");
 const MAX_FUSED_INPUTS: usize = 8;
 const MAX_FUSED_NODES: usize = 16;
 
@@ -906,213 +914,22 @@ impl ComputeSourceFeatures {
     fn helpers_source(&self) -> String {
         let mut helpers = String::new();
         if self.add_input_helper || self.subtract_input_helper || self.multiply_input_helper {
-            helpers.push_str(binary_input_data_format_helper());
+            helpers.push_str(HELPER_BINARY_INPUT_DATA_FORMAT);
         }
         if self.add_input_helper {
-            helpers.push_str(add_input_helper());
+            helpers.push_str(HELPER_ADD_INPUT);
         }
         if self.subtract_input_helper {
-            helpers.push_str(subtract_input_helper());
+            helpers.push_str(HELPER_SUBTRACT_INPUT);
         }
         if self.multiply_input_helper {
-            helpers.push_str(multiply_input_helper());
+            helpers.push_str(HELPER_MULTIPLY_INPUT);
         }
         if self.compare_helpers {
-            helpers.push_str(compare_helpers());
+            helpers.push_str(HELPER_COMPARE);
         }
         helpers
     }
-}
-
-fn binary_input_data_format_helper() -> &'static str {
-    r#"
-constexpr DataFormat binary_input_data_format(uint32_t cb_lhs, uint32_t cb_out) {
-#ifdef UCK_CHLKC_PACK
-  return static_cast<DataFormat>((uint)pack_src_format[cb_out]);
-#else
-  return static_cast<DataFormat>((uint)unpack_src_format[cb_lhs]);
-#endif
-}
-
-"#
-}
-
-fn add_input_helper() -> &'static str {
-    r#"
-template <DataFormat Format>
-ALWI void add_input_init() {
-  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
-                Format == DataFormat::Float32) {
-    add_binary_tile_init();
-  } else {
-    add_int_tile_init();
-  }
-}
-
-template <DataFormat Format>
-ALWI void add_input_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
-  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
-                Format == DataFormat::Float32) {
-    add_binary_tile(idst0, idst1, odst);
-  } else if constexpr (Format == DataFormat::Int32) {
-    add_int32_tile(idst0, idst1, odst);
-  } else if constexpr (Format == DataFormat::UInt32) {
-    add_uint32_tile(idst0, idst1, odst);
-  } else if constexpr (Format == DataFormat::UInt16) {
-    add_uint16_tile(idst0, idst1, odst);
-  }
-}
-
-"#
-}
-
-fn subtract_input_helper() -> &'static str {
-    r#"
-template <DataFormat Format>
-ALWI void subtract_input_init() {
-  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
-                Format == DataFormat::Float32) {
-    sub_binary_tile_init();
-  } else if constexpr (Format == DataFormat::Int32) {
-    sub_int_tile_init();
-  }
-}
-
-template <DataFormat Format>
-ALWI void subtract_input_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
-  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
-                Format == DataFormat::Float32) {
-    sub_binary_tile(idst0, idst1, odst);
-  } else if constexpr (Format == DataFormat::Int32) {
-    sub_int32_tile(idst0, idst1, odst);
-  }
-}
-
-"#
-}
-
-fn multiply_input_helper() -> &'static str {
-    r#"
-template <DataFormat Format>
-ALWI void multiply_input_init() {
-  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
-                Format == DataFormat::Float32) {
-    mul_binary_tile_init();
-  } else if constexpr (Format == DataFormat::Int32 || Format == DataFormat::UInt32) {
-    mul_int32_tile_init();
-  } else if constexpr (Format == DataFormat::UInt16) {
-    mul_int_tile_init();
-  }
-}
-
-template <DataFormat Format>
-ALWI void multiply_input_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
-  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
-                Format == DataFormat::Float32) {
-    mul_binary_tile(idst0, idst1, odst);
-  } else if constexpr (Format == DataFormat::Int32) {
-    mul_int32_tile(idst0, idst1, odst);
-  } else if constexpr (Format == DataFormat::UInt32) {
-    mul_uint32_tile(idst0, idst1, odst);
-  } else if constexpr (Format == DataFormat::UInt16) {
-    mul_uint16_tile(idst0, idst1, odst);
-  }
-}
-
-"#
-}
-
-fn compare_helpers() -> &'static str {
-    r#"
-enum class CompareDirection : uint32_t {
-  Eq,
-  Ne,
-  Ge,
-  Gt,
-  Le,
-  Lt,
-};
-
-template <bool Int32Input>
-ALWI void compare_sub_init() {
-  if constexpr (Int32Input) {
-    sub_int_tile_init();
-  } else {
-    sub_binary_tile_init();
-  }
-}
-
-template <bool Int32Input>
-ALWI void compare_sub_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
-  if constexpr (Int32Input) {
-    sub_int32_tile(idst0, idst1, odst);
-  } else {
-    sub_binary_tile(idst0, idst1, odst);
-  }
-}
-
-ALWI void compare_zero_init(CompareDirection direction) {
-  switch (direction) {
-    case CompareDirection::Eq: eqz_tile_init(); break;
-    case CompareDirection::Ne: nez_tile_init(); break;
-    case CompareDirection::Ge: gez_tile_init(); break;
-    case CompareDirection::Gt: gtz_tile_init(); break;
-    case CompareDirection::Le: lez_tile_init(); break;
-    case CompareDirection::Lt: ltz_tile_init(); break;
-    default: break;
-  }
-}
-
-template <bool Int32Input>
-ALWI void compare_zero_tile(CompareDirection direction, uint32_t idst) {
-  switch (direction) {
-    case CompareDirection::Eq:
-      if constexpr (Int32Input) {
-        eqz_tile_int32(idst);
-      } else {
-        eqz_tile(idst);
-      }
-      break;
-    case CompareDirection::Ne:
-      if constexpr (Int32Input) {
-        nez_tile_int32(idst);
-      } else {
-        nez_tile(idst);
-      }
-      break;
-    case CompareDirection::Ge:
-      if constexpr (Int32Input) {
-        gez_tile_int32(idst);
-      } else {
-        gez_tile(idst);
-      }
-      break;
-    case CompareDirection::Gt:
-      if constexpr (Int32Input) {
-        gtz_tile_int32(idst);
-      } else {
-        gtz_tile(idst);
-      }
-      break;
-    case CompareDirection::Le:
-      if constexpr (Int32Input) {
-        lez_tile_int32(idst);
-      } else {
-        lez_tile(idst);
-      }
-      break;
-    case CompareDirection::Lt:
-      if constexpr (Int32Input) {
-        ltz_tile_int32(idst);
-      } else {
-        ltz_tile(idst);
-      }
-      break;
-    default: break;
-  }
-}
-
-"#
 }
 
 struct ComputeSteps {

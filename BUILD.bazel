@@ -11,7 +11,10 @@ RUST_SRCS = glob(
 )
 
 KERNEL_SRCS = glob(
-    ["kernels/**/*.cc"],
+    [
+        "kernels/**/*.cc",
+        "kernels/**/*.cc.inc",
+    ],
 )
 
 rust_static_library(
