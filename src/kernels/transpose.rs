@@ -8,7 +8,7 @@ use crate::kernels::kernel::{
 use std::io;
 
 const READER: &str = include_str!("../../kernels/transpose_reader.cc");
-const WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
+const WRITER: &str = include_str!("../../kernels/tile_writer.cc");
 const READER_INPUT_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 const MAX_RANK: usize = 8;

@@ -1478,13 +1478,19 @@ fn device_buffer_for_value<'a>(
         .ok_or_else(|| invalid_argument(format!("{field} value id {value_id} is not available")))
 }
 
+#[derive(Clone, Copy)]
+enum EltwiseInput<'a> {
+    Dram(&'a DramBuffer),
+    Constant(u32),
+}
+
 fn eltwise_input<'a>(
     values: &'a [Option<PJRT_Buffer>],
     plan: &'a executable::Executable,
     value_id: u32,
     expected_dtype: DType,
     field: &str,
-) -> Result<kernels::binary_eltwise::EltwiseInput<'a>, *mut PJRT_Error> {
+) -> Result<EltwiseInput<'a>, *mut PJRT_Error> {
     let index = value_id as usize;
     if let Some(buffer) = values.get(index).and_then(|value| value.as_ref()) {
         let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
@@ -1492,7 +1498,7 @@ fn eltwise_input<'a>(
                 "TT executable {field} buffer has no device allocation"
             )));
         };
-        return Ok(kernels::binary_eltwise::EltwiseInput::Dram(dram_buffer));
+        return Ok(EltwiseInput::Dram(dram_buffer));
     }
     for op in &plan.ops {
         if let executable::Op::Constant {
@@ -1513,9 +1519,7 @@ fn eltwise_input<'a>(
                         desc.element_type
                     )));
                 }
-                return Ok(kernels::binary_eltwise::EltwiseInput::Constant(
-                    *packed_value,
-                ));
+                return Ok(EltwiseInput::Constant(*packed_value));
             }
         }
     }
@@ -1532,12 +1536,8 @@ fn select_value_input<'a>(
     field: &str,
 ) -> Result<kernels::select::SelectInput<'a>, *mut PJRT_Error> {
     match eltwise_input(values, plan, value_id, expected_dtype, field)? {
-        kernels::binary_eltwise::EltwiseInput::Dram(buffer) => {
-            Ok(kernels::select::SelectInput::Dram(buffer))
-        }
-        kernels::binary_eltwise::EltwiseInput::Constant(value) => {
-            Ok(kernels::select::SelectInput::Constant(value))
-        }
+        EltwiseInput::Dram(buffer) => Ok(kernels::select::SelectInput::Dram(buffer)),
+        EltwiseInput::Constant(value) => Ok(kernels::select::SelectInput::Constant(value)),
     }
 }
 
@@ -1600,7 +1600,7 @@ fn execute_binary_eltwise(
     plan: &executable::Executable,
     device: &mut Device,
     context: &OutputContext,
-    op: kernels::binary_eltwise::BinaryEltwiseOp,
+    op: kernels::fused_eltwise::FusedEltwiseOp,
     input_ids: [u32; 2],
     output_id: u32,
     op_name: &str,
@@ -1627,13 +1627,13 @@ fn execute_binary_eltwise(
     }
     let input_dtype = pjrt_buffer_type_to_dtype(lhs_desc.element_type)?;
     let expected_output_type = match op {
-        kernels::binary_eltwise::BinaryEltwiseOp::Add
-        | kernels::binary_eltwise::BinaryEltwiseOp::Subtract
-        | kernels::binary_eltwise::BinaryEltwiseOp::Divide
-        | kernels::binary_eltwise::BinaryEltwiseOp::Multiply
-        | kernels::binary_eltwise::BinaryEltwiseOp::Power
-        | kernels::binary_eltwise::BinaryEltwiseOp::Max => lhs_desc.element_type,
-        kernels::binary_eltwise::BinaryEltwiseOp::Compare(_) => {
+        kernels::fused_eltwise::FusedEltwiseOp::Add
+        | kernels::fused_eltwise::FusedEltwiseOp::Subtract
+        | kernels::fused_eltwise::FusedEltwiseOp::Divide
+        | kernels::fused_eltwise::FusedEltwiseOp::Multiply
+        | kernels::fused_eltwise::FusedEltwiseOp::Power
+        | kernels::fused_eltwise::FusedEltwiseOp::Max => lhs_desc.element_type,
+        kernels::fused_eltwise::FusedEltwiseOp::Compare(_) => {
             if !matches!(input_dtype, DType::Float16B | DType::Float32 | DType::Int32) {
                 return Err(unimplemented(format!(
                     "TT executable compare currently supports bf16, f32, and s32 inputs, got {:?}",
@@ -1641,6 +1641,11 @@ fn execute_binary_eltwise(
                 )));
             }
             PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
+        }
+        _ => {
+            return Err(invalid_argument(format!(
+                "TT executable {op_name} is not a binary elementwise op"
+            )));
         }
     };
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
@@ -1660,16 +1665,10 @@ fn execute_binary_eltwise(
     let lhs_input = eltwise_input(values, plan, input_ids[0], input_dtype, &lhs_field)?;
     let rhs_input = eltwise_input(values, plan, input_ids[1], input_dtype, &rhs_field)?;
     let output_name = format!("pjrt_{op_name}");
-    let output_dram = kernels::binary_eltwise::eltwise(
-        device,
-        op,
-        lhs_input,
-        rhs_input,
-        input_dtype,
-        &shape,
-        output_name,
-    )
-    .map_err(io_error)?;
+    let (inputs, nodes) = fused_binary_eltwise_inputs(op, lhs_input, rhs_input, input_dtype);
+    let output_dram =
+        kernels::fused_eltwise::eltwise(device, &inputs, &nodes, 2, &shape, output_name)
+            .map_err(io_error)?;
     store_output_buffer(
         values,
         plan,
@@ -1686,7 +1685,7 @@ fn execute_unary_eltwise(
     plan: &executable::Executable,
     device: &mut Device,
     context: &OutputContext,
-    op: kernels::unary_eltwise::UnaryEltwiseOp,
+    op: kernels::fused_eltwise::FusedEltwiseOp,
     input_id: u32,
     output_id: u32,
     op_name: &str,
@@ -1714,16 +1713,10 @@ fn execute_unary_eltwise(
     let shape = dims_i64_to_usize(&output_dims)?;
     let input = eltwise_input(values, plan, input_id, input_dtype, &input_field)?;
     let output_name = format!("pjrt_{op_name}");
-    let output_dram = kernels::unary_eltwise::eltwise(
-        device,
-        op,
-        input,
-        input_dtype,
-        output_dtype,
-        &shape,
-        output_name,
-    )
-    .map_err(io_error)?;
+    let (inputs, nodes) = fused_unary_eltwise_inputs(op, input, input_dtype, output_dtype);
+    let output_dram =
+        kernels::fused_eltwise::eltwise(device, &inputs, &nodes, 1, &shape, output_name)
+            .map_err(io_error)?;
     store_output_buffer(
         values,
         plan,
@@ -1733,6 +1726,88 @@ fn execute_unary_eltwise(
         context,
         op_name,
     )
+}
+
+fn fused_binary_eltwise_inputs<'a>(
+    op: kernels::fused_eltwise::FusedEltwiseOp,
+    lhs: EltwiseInput<'a>,
+    rhs: EltwiseInput<'a>,
+    input_dtype: DType,
+) -> (
+    Vec<kernels::fused_eltwise::FusedEltwiseInput<'a>>,
+    Vec<kernels::fused_eltwise::FusedEltwiseNode>,
+) {
+    let mut inputs = Vec::new();
+    let lhs = fused_eltwise_input_node(lhs, input_dtype, &mut inputs);
+    let rhs = fused_eltwise_input_node(rhs, input_dtype, &mut inputs);
+    let output_dtype = if matches!(op, kernels::fused_eltwise::FusedEltwiseOp::Compare(_)) {
+        DType::UInt8
+    } else {
+        input_dtype
+    };
+    let root = kernels::fused_eltwise::FusedEltwiseNode {
+        op,
+        input_nodes: vec![0, 1],
+        input_index: 0,
+        packed_value: 0,
+        dtype: output_dtype,
+        single_tile_broadcast: false,
+    };
+    (inputs, vec![lhs, rhs, root])
+}
+
+fn fused_unary_eltwise_inputs<'a>(
+    op: kernels::fused_eltwise::FusedEltwiseOp,
+    input: EltwiseInput<'a>,
+    input_dtype: DType,
+    output_dtype: DType,
+) -> (
+    Vec<kernels::fused_eltwise::FusedEltwiseInput<'a>>,
+    Vec<kernels::fused_eltwise::FusedEltwiseNode>,
+) {
+    let mut inputs = Vec::new();
+    let input = fused_eltwise_input_node(input, input_dtype, &mut inputs);
+    let root = kernels::fused_eltwise::FusedEltwiseNode {
+        op,
+        input_nodes: vec![0],
+        input_index: 0,
+        packed_value: 0,
+        dtype: output_dtype,
+        single_tile_broadcast: false,
+    };
+    (inputs, vec![input, root])
+}
+
+fn fused_eltwise_input_node<'a>(
+    input: EltwiseInput<'a>,
+    dtype: DType,
+    inputs: &mut Vec<kernels::fused_eltwise::FusedEltwiseInput<'a>>,
+) -> kernels::fused_eltwise::FusedEltwiseNode {
+    match input {
+        EltwiseInput::Dram(buffer) => {
+            let input_index = inputs.len() as u32;
+            inputs.push(kernels::fused_eltwise::FusedEltwiseInput::Dram {
+                buffer,
+                single_tile_broadcast: false,
+            });
+            kernels::fused_eltwise::FusedEltwiseNode {
+                op: kernels::fused_eltwise::FusedEltwiseOp::Input,
+                input_nodes: Vec::new(),
+                input_index,
+                packed_value: 0,
+                dtype,
+                single_tile_broadcast: false,
+            }
+        }
+        EltwiseInput::Constant(packed_value) => kernels::fused_eltwise::FusedEltwiseNode {
+            op: kernels::fused_eltwise::FusedEltwiseOp::Constant,
+            input_nodes: Vec::new(),
+            input_index: 0,
+            packed_value,
+            dtype,
+            single_tile_broadcast: false,
+        },
+    }
 }
 
 fn execute_reshape(
@@ -2637,7 +2712,7 @@ fn execute_executable_v1(
                     plan,
                     device,
                     &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Add,
+                    kernels::fused_eltwise::FusedEltwiseOp::Add,
                     *input_ids,
                     *output_id,
                     "add",
@@ -2652,7 +2727,7 @@ fn execute_executable_v1(
                     plan,
                     device,
                     &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Subtract,
+                    kernels::fused_eltwise::FusedEltwiseOp::Subtract,
                     *input_ids,
                     *output_id,
                     "subtract",
@@ -2667,7 +2742,7 @@ fn execute_executable_v1(
                     plan,
                     device,
                     &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Multiply,
+                    kernels::fused_eltwise::FusedEltwiseOp::Multiply,
                     *input_ids,
                     *output_id,
                     "multiply",
@@ -2682,7 +2757,7 @@ fn execute_executable_v1(
                     plan,
                     device,
                     &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Divide,
+                    kernels::fused_eltwise::FusedEltwiseOp::Divide,
                     *input_ids,
                     *output_id,
                     "divide",
@@ -2697,7 +2772,7 @@ fn execute_executable_v1(
                     plan,
                     device,
                     &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Power,
+                    kernels::fused_eltwise::FusedEltwiseOp::Power,
                     *input_ids,
                     *output_id,
                     "power",
@@ -2724,7 +2799,7 @@ fn execute_executable_v1(
                 plan,
                 device,
                 &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Cosine,
+                kernels::fused_eltwise::FusedEltwiseOp::Cosine,
                 *input_id,
                 *output_id,
                 "cosine",
@@ -2737,7 +2812,7 @@ fn execute_executable_v1(
                 plan,
                 device,
                 &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Sine,
+                kernels::fused_eltwise::FusedEltwiseOp::Sine,
                 *input_id,
                 *output_id,
                 "sine",
@@ -2750,7 +2825,7 @@ fn execute_executable_v1(
                 plan,
                 device,
                 &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Rsqrt,
+                kernels::fused_eltwise::FusedEltwiseOp::Rsqrt,
                 *input_id,
                 *output_id,
                 "rsqrt",
@@ -2791,7 +2866,7 @@ fn execute_executable_v1(
                 plan,
                 device,
                 &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Negate,
+                kernels::fused_eltwise::FusedEltwiseOp::Negate,
                 *input_id,
                 *output_id,
                 "negate",
@@ -2804,7 +2879,7 @@ fn execute_executable_v1(
                 plan,
                 device,
                 &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Exponential,
+                kernels::fused_eltwise::FusedEltwiseOp::Exponential,
                 *input_id,
                 *output_id,
                 "exponential",
@@ -2857,7 +2932,7 @@ fn execute_executable_v1(
                 plan,
                 device,
                 &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Convert,
+                kernels::fused_eltwise::FusedEltwiseOp::Convert,
                 *input_id,
                 *output_id,
                 "convert",
@@ -2888,7 +2963,7 @@ fn execute_executable_v1(
                     plan,
                     device,
                     &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Max,
+                    kernels::fused_eltwise::FusedEltwiseOp::Max,
                     *input_ids,
                     *output_id,
                     "max",
@@ -2966,7 +3041,7 @@ fn execute_executable_v1(
                     plan,
                     device,
                     &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Compare(*direction),
+                    kernels::fused_eltwise::FusedEltwiseOp::Compare(*direction),
                     *input_ids,
                     *output_id,
                     "compare",

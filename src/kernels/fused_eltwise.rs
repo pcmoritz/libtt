@@ -1,12 +1,13 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
 use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
+use crate::executable::CompareDirection;
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
 use std::fmt::Display;
 use std::io;
 
-const WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
+const WRITER: &str = include_str!("../../kernels/tile_writer.cc");
 const MAX_FUSED_INPUTS: usize = 8;
 const MAX_FUSED_NODES: usize = 16;
 
@@ -18,7 +19,11 @@ pub(crate) enum FusedEltwiseOp {
     Subtract,
     Multiply,
     Divide,
+    Power,
     Max,
+    Compare(CompareDirection),
+    Cosine,
+    Sine,
     Negate,
     Exponential,
     Rsqrt,
@@ -170,25 +175,15 @@ fn validate_fused_eltwise(
 
     let expected_tiles = tiled_shape_tile_count(shape)?;
     let expected_shape = tiled_allocation_shape(shape)?;
-    for (index, input) in external_inputs.iter().enumerate() {
-        let FusedEltwiseInput::Dram { buffer, .. } = input;
-        if !is_supported_float(buffer.dtype) {
-            return Err(invalid_input(format!(
-                "input[{index}] dtype {:?} is not supported by fused eltwise",
-                buffer.dtype
-            )));
-        }
-    }
-
     for (index, node) in nodes.iter().enumerate() {
-        if !is_supported_float(node.dtype) {
-            return Err(invalid_input(format!(
-                "node[{index}] dtype {:?} is not supported by fused eltwise",
-                node.dtype
-            )));
-        }
         match node.op {
             FusedEltwiseOp::Input => {
+                if !is_supported_leaf_dtype(node.dtype) {
+                    return Err(invalid_input(format!(
+                        "node[{index}] input dtype {:?} is not supported by fused eltwise",
+                        node.dtype
+                    )));
+                }
                 let input_index = usize::try_from(node.input_index).map_err(|_| {
                     invalid_input(format!("node[{index}] input index is out of range"))
                 })?;
@@ -235,6 +230,12 @@ fn validate_fused_eltwise(
                 }
             }
             FusedEltwiseOp::Constant => {
+                if !is_supported_leaf_dtype(node.dtype) {
+                    return Err(invalid_input(format!(
+                        "node[{index}] constant dtype {:?} is not supported by fused eltwise",
+                        node.dtype
+                    )));
+                }
                 if !node.input_nodes.is_empty() {
                     return Err(invalid_input(format!(
                         "node[{index}] constant node must not have operands"
@@ -242,6 +243,8 @@ fn validate_fused_eltwise(
                 }
             }
             FusedEltwiseOp::Negate
+            | FusedEltwiseOp::Cosine
+            | FusedEltwiseOp::Sine
             | FusedEltwiseOp::Exponential
             | FusedEltwiseOp::Rsqrt
             | FusedEltwiseOp::Convert => validate_node_inputs(index, node, 1)?,
@@ -249,7 +252,9 @@ fn validate_fused_eltwise(
             | FusedEltwiseOp::Subtract
             | FusedEltwiseOp::Multiply
             | FusedEltwiseOp::Divide
-            | FusedEltwiseOp::Max => validate_node_inputs(index, node, 2)?,
+            | FusedEltwiseOp::Power
+            | FusedEltwiseOp::Max
+            | FusedEltwiseOp::Compare(_) => validate_node_inputs(index, node, 2)?,
         }
         for &input_node in &node.input_nodes {
             if usize::try_from(input_node).map_or(true, |input| input >= index) {
@@ -258,6 +263,7 @@ fn validate_fused_eltwise(
                 )));
             }
         }
+        validate_node_dtype(index, node, nodes)?;
     }
     let leaf_count = nodes
         .iter()
@@ -308,6 +314,141 @@ fn validate_node_inputs(index: usize, node: &FusedEltwiseNode, expected: usize) 
             "node[{index}] {:?} expected {expected} operands, got {}",
             node.op,
             node.input_nodes.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_node_dtype(
+    index: usize,
+    node: &FusedEltwiseNode,
+    nodes: &[FusedEltwiseNode],
+) -> io::Result<()> {
+    match node.op {
+        FusedEltwiseOp::Input | FusedEltwiseOp::Constant => Ok(()),
+        FusedEltwiseOp::Cosine
+        | FusedEltwiseOp::Sine
+        | FusedEltwiseOp::Negate
+        | FusedEltwiseOp::Exponential
+        | FusedEltwiseOp::Rsqrt => {
+            let input = &nodes[node.input_nodes[0] as usize];
+            if input.dtype != node.dtype {
+                return Err(invalid_input(format!(
+                    "node[{index}] {:?} output dtype must match input dtype, got {:?} -> {:?}",
+                    node.op, input.dtype, node.dtype
+                )));
+            }
+            if !is_float_dtype(input.dtype) {
+                return Err(invalid_input(format!(
+                    "node[{index}] {:?} supports Float16, Float16B, and Float32 inputs, got {:?}",
+                    node.op, input.dtype
+                )));
+            }
+            Ok(())
+        }
+        FusedEltwiseOp::Convert => {
+            let input = &nodes[node.input_nodes[0] as usize];
+            if !is_convert_dtype(input.dtype) || !is_convert_dtype(node.dtype) {
+                return Err(invalid_input(format!(
+                    "node[{index}] convert supports Float16B, Float32, Int32, UInt16, and UInt32, got {:?} -> {:?}",
+                    input.dtype, node.dtype
+                )));
+            }
+            Ok(())
+        }
+        FusedEltwiseOp::Add | FusedEltwiseOp::Multiply => {
+            validate_binary_input_dtypes(index, node, nodes)?;
+            let input_dtype = nodes[node.input_nodes[0] as usize].dtype;
+            if node.dtype != input_dtype {
+                return Err(invalid_input(format!(
+                    "node[{index}] {:?} output dtype must match input dtype, got {:?} -> {:?}",
+                    node.op, input_dtype, node.dtype
+                )));
+            }
+            if !matches!(
+                input_dtype,
+                DType::Float16
+                    | DType::Float16B
+                    | DType::Float32
+                    | DType::Int32
+                    | DType::UInt16
+                    | DType::UInt32
+            ) {
+                return Err(invalid_input(format!(
+                    "node[{index}] {:?} does not support input dtype {:?}",
+                    node.op, input_dtype
+                )));
+            }
+            Ok(())
+        }
+        FusedEltwiseOp::Subtract => {
+            validate_binary_input_dtypes(index, node, nodes)?;
+            let input_dtype = nodes[node.input_nodes[0] as usize].dtype;
+            if node.dtype != input_dtype {
+                return Err(invalid_input(format!(
+                    "node[{index}] subtract output dtype must match input dtype, got {:?} -> {:?}",
+                    input_dtype, node.dtype
+                )));
+            }
+            if !matches!(
+                input_dtype,
+                DType::Float16 | DType::Float16B | DType::Float32 | DType::Int32
+            ) {
+                return Err(invalid_input(format!(
+                    "node[{index}] subtract does not support input dtype {:?}",
+                    input_dtype
+                )));
+            }
+            Ok(())
+        }
+        FusedEltwiseOp::Divide | FusedEltwiseOp::Power | FusedEltwiseOp::Max => {
+            validate_binary_input_dtypes(index, node, nodes)?;
+            let input_dtype = nodes[node.input_nodes[0] as usize].dtype;
+            if node.dtype != input_dtype {
+                return Err(invalid_input(format!(
+                    "node[{index}] {:?} output dtype must match input dtype, got {:?} -> {:?}",
+                    node.op, input_dtype, node.dtype
+                )));
+            }
+            if !is_float_dtype(input_dtype) {
+                return Err(invalid_input(format!(
+                    "node[{index}] {:?} supports Float16, Float16B, and Float32 inputs, got {:?}",
+                    node.op, input_dtype
+                )));
+            }
+            Ok(())
+        }
+        FusedEltwiseOp::Compare(_) => {
+            validate_binary_input_dtypes(index, node, nodes)?;
+            let input_dtype = nodes[node.input_nodes[0] as usize].dtype;
+            if node.dtype != DType::UInt8 {
+                return Err(invalid_input(format!(
+                    "node[{index}] compare output dtype must be UInt8, got {:?}",
+                    node.dtype
+                )));
+            }
+            if !matches!(input_dtype, DType::Float16B | DType::Float32 | DType::Int32) {
+                return Err(invalid_input(format!(
+                    "node[{index}] compare supports Float16B, Float32, and Int32 inputs, got {:?}",
+                    input_dtype
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_binary_input_dtypes(
+    index: usize,
+    node: &FusedEltwiseNode,
+    nodes: &[FusedEltwiseNode],
+) -> io::Result<()> {
+    let lhs = nodes[node.input_nodes[0] as usize].dtype;
+    let rhs = nodes[node.input_nodes[1] as usize].dtype;
+    if lhs != rhs {
+        return Err(invalid_input(format!(
+            "node[{index}] {:?} input dtypes must match, got {:?} and {:?}",
+            node.op, lhs, rhs
         )));
     }
     Ok(())
@@ -449,13 +590,22 @@ fn compute_source(key: &FusedEltwiseProgramKey) -> io::Result<String> {
          #include \"compute_kernel_api/eltwise_unary/exp.h\"\n\
          #include \"compute_kernel_api/eltwise_unary/rsqrt.h\"\n\
          #include \"compute_kernel_api/eltwise_unary/binop_with_scalar.h\"\n\
+         #include \"compute_kernel_api/eltwise_unary/rdiv.h\"\n\
+         #include \"compute_kernel_api/eltwise_unary/rpow.h\"\n\
+         #include \"compute_kernel_api/eltwise_unary/trigonometry.h\"\n\
          #include \"compute_kernel_api/eltwise_unary/typecast.h\"\n\
          #include \"compute_kernel_api/eltwise_binary_sfpu.h\"\n\
          #include \"compute_kernel_api/eltwise_unary/sfpu_split_includes.h\"\n\
          #include \"compute_kernel_api/binary_max_min.h\"\n\
+         #include \"compute_kernel_api/add_int_sfpu.h\"\n\
+         #include \"compute_kernel_api/sub_int_sfpu.h\"\n\
+         #include \"compute_kernel_api/mul_int_sfpu.h\"\n\
+         #include \"compute_kernel_api/mul_int32_sfpu.h\"\n\
+         #include \"compute_kernel_api/eltwise_unary/comp.h\"\n\
          #include \"compute_kernel_api.h\"\n\
          \n\
          namespace NAMESPACE {{\n\
+         ELTWISE_HELPERS\
          void MAIN {{\n\
            uint32_t n_tiles = get_arg_val<uint32_t>(0);\n\
            constexpr uint32_t cb_out = tt::CBIndex::c_16;\n\
@@ -470,7 +620,13 @@ fn compute_source(key: &FusedEltwiseProgramKey) -> io::Result<String> {
           negative_tile_init();\n\
           exp_tile_init();\n\
           rsqrt_tile_init();\n\
+          cos_tile_init();\n\
+          sin_tile_init();\n\
            binop_with_scalar_tile_init();\n\
+           rdiv_tile_init();\n\
+           rpow_tile_init();\n\
+           power_tile_init();\n\
+           power_binary_tile_init();\n\
            FUSED_TYPECAST_INITS\n\
          \n\
            for (uint32_t i = 0; i < n_tiles; ++i) {{\n\
@@ -479,8 +635,180 @@ fn compute_source(key: &FusedEltwiseProgramKey) -> io::Result<String> {
          }}\n\
          }}  // namespace NAMESPACE\n"
     )
+    .replace("ELTWISE_HELPERS", compute_helpers())
     .replace("FUSED_TYPECAST_INITS", &steps.typecast_inits)
     .replace("FUSED_STEPS", &steps.body))
+}
+
+fn compute_helpers() -> &'static str {
+    r#"
+template <DataFormat Format>
+ALWI void add_input_init() {
+  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
+                Format == DataFormat::Float32) {
+    add_binary_tile_init();
+  } else {
+    add_int_tile_init();
+  }
+}
+
+template <DataFormat Format>
+ALWI void add_input_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
+  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
+                Format == DataFormat::Float32) {
+    add_binary_tile(idst0, idst1, odst);
+  } else if constexpr (Format == DataFormat::Int32) {
+    add_int32_tile(idst0, idst1, odst);
+  } else if constexpr (Format == DataFormat::UInt32) {
+    add_uint32_tile(idst0, idst1, odst);
+  } else if constexpr (Format == DataFormat::UInt16) {
+    add_uint16_tile(idst0, idst1, odst);
+  }
+}
+
+template <DataFormat Format>
+ALWI void subtract_input_init() {
+  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
+                Format == DataFormat::Float32) {
+    sub_binary_tile_init();
+  } else if constexpr (Format == DataFormat::Int32) {
+    sub_int_tile_init();
+  }
+}
+
+template <DataFormat Format>
+ALWI void subtract_input_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
+  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
+                Format == DataFormat::Float32) {
+    sub_binary_tile(idst0, idst1, odst);
+  } else if constexpr (Format == DataFormat::Int32) {
+    sub_int32_tile(idst0, idst1, odst);
+  }
+}
+
+template <DataFormat Format>
+ALWI void multiply_input_init() {
+  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
+                Format == DataFormat::Float32) {
+    mul_binary_tile_init();
+  } else if constexpr (Format == DataFormat::Int32 || Format == DataFormat::UInt32) {
+    mul_int32_tile_init();
+  } else if constexpr (Format == DataFormat::UInt16) {
+    mul_int_tile_init();
+  }
+}
+
+template <DataFormat Format>
+ALWI void multiply_input_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
+  if constexpr (Format == DataFormat::Float16 || Format == DataFormat::Float16_b ||
+                Format == DataFormat::Float32) {
+    mul_binary_tile(idst0, idst1, odst);
+  } else if constexpr (Format == DataFormat::Int32) {
+    mul_int32_tile(idst0, idst1, odst);
+  } else if constexpr (Format == DataFormat::UInt32) {
+    mul_uint32_tile(idst0, idst1, odst);
+  } else if constexpr (Format == DataFormat::UInt16) {
+    mul_uint16_tile(idst0, idst1, odst);
+  }
+}
+
+constexpr DataFormat binary_input_data_format(uint32_t cb_lhs, uint32_t cb_out) {
+#ifdef UCK_CHLKC_PACK
+  return static_cast<DataFormat>((uint)pack_src_format[cb_out]);
+#else
+  return static_cast<DataFormat>((uint)unpack_src_format[cb_lhs]);
+#endif
+}
+
+enum class CompareDirection : uint32_t {
+  Eq,
+  Ne,
+  Ge,
+  Gt,
+  Le,
+  Lt,
+};
+
+template <bool Int32Input>
+ALWI void compare_sub_init() {
+  if constexpr (Int32Input) {
+    sub_int_tile_init();
+  } else {
+    sub_binary_tile_init();
+  }
+}
+
+template <bool Int32Input>
+ALWI void compare_sub_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
+  if constexpr (Int32Input) {
+    sub_int32_tile(idst0, idst1, odst);
+  } else {
+    sub_binary_tile(idst0, idst1, odst);
+  }
+}
+
+ALWI void compare_zero_init(CompareDirection direction) {
+  switch (direction) {
+    case CompareDirection::Eq: eqz_tile_init(); break;
+    case CompareDirection::Ne: nez_tile_init(); break;
+    case CompareDirection::Ge: gez_tile_init(); break;
+    case CompareDirection::Gt: gtz_tile_init(); break;
+    case CompareDirection::Le: lez_tile_init(); break;
+    case CompareDirection::Lt: ltz_tile_init(); break;
+    default: break;
+  }
+}
+
+template <bool Int32Input>
+ALWI void compare_zero_tile(CompareDirection direction, uint32_t idst) {
+  switch (direction) {
+    case CompareDirection::Eq:
+      if constexpr (Int32Input) {
+        eqz_tile_int32(idst);
+      } else {
+        eqz_tile(idst);
+      }
+      break;
+    case CompareDirection::Ne:
+      if constexpr (Int32Input) {
+        nez_tile_int32(idst);
+      } else {
+        nez_tile(idst);
+      }
+      break;
+    case CompareDirection::Ge:
+      if constexpr (Int32Input) {
+        gez_tile_int32(idst);
+      } else {
+        gez_tile(idst);
+      }
+      break;
+    case CompareDirection::Gt:
+      if constexpr (Int32Input) {
+        gtz_tile_int32(idst);
+      } else {
+        gtz_tile(idst);
+      }
+      break;
+    case CompareDirection::Le:
+      if constexpr (Int32Input) {
+        lez_tile_int32(idst);
+      } else {
+        lez_tile(idst);
+      }
+      break;
+    case CompareDirection::Lt:
+      if constexpr (Int32Input) {
+        ltz_tile_int32(idst);
+      } else {
+        ltz_tile(idst);
+      }
+      break;
+    default: break;
+  }
+}
+
+"#
 }
 
 struct ComputeSteps {
@@ -511,6 +839,8 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
         match node.op {
             FusedEltwiseOp::Input | FusedEltwiseOp::Constant => {}
             FusedEltwiseOp::Negate
+            | FusedEltwiseOp::Cosine
+            | FusedEltwiseOp::Sine
             | FusedEltwiseOp::Exponential
             | FusedEltwiseOp::Rsqrt
             | FusedEltwiseOp::Convert => {
@@ -520,6 +850,8 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                 append_waits(&mut body, &[input_cb]);
                 let init = match node.op {
                     FusedEltwiseOp::Negate => "negative_tile_init();",
+                    FusedEltwiseOp::Cosine => "cos_tile_init();",
+                    FusedEltwiseOp::Sine => "sin_tile_init();",
                     FusedEltwiseOp::Exponential => "exp_tile_init();",
                     FusedEltwiseOp::Rsqrt => "rsqrt_tile_init();",
                     FusedEltwiseOp::Convert => "",
@@ -531,6 +863,12 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                 match node.op {
                     FusedEltwiseOp::Negate => {
                         body.push_str("    negative_tile(0);\n");
+                    }
+                    FusedEltwiseOp::Cosine => {
+                        body.push_str("    cos_tile(0);\n");
+                    }
+                    FusedEltwiseOp::Sine => {
+                        body.push_str("    sin_tile(0);\n");
                     }
                     FusedEltwiseOp::Exponential => {
                         body.push_str("    exp_tile(0);\n");
@@ -559,17 +897,43 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
             | FusedEltwiseOp::Subtract
             | FusedEltwiseOp::Multiply
             | FusedEltwiseOp::Divide
-            | FusedEltwiseOp::Max => {
+            | FusedEltwiseOp::Power
+            | FusedEltwiseOp::Max
+            | FusedEltwiseOp::Compare(_) => {
                 let lhs = node.input_nodes[0] as usize;
                 let rhs = node.input_nodes[1] as usize;
+                if let FusedEltwiseOp::Compare(direction) = node.op {
+                    if let Some((value_node, scalar, scalar_direction)) =
+                        scalar_compare_op(nodes, lhs, rhs, direction)
+                    {
+                        let value_cb = cb_for_node(&node_cbs, value_node)?;
+                        let output_cb = cb_for_node(&node_cbs, index)?;
+                        let int32_input = nodes[value_node].dtype == DType::Int32;
+                        let init = unary_compare_init(scalar_direction);
+                        let call = unary_compare_call(scalar_direction, int32_input);
+                        append_waits(&mut body, &[value_cb]);
+                        body.push_str(&format!(
+                            "    {init}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{value_cb});\n    copy_tile(tt::CBIndex::c_{value_cb}, 0, 0);\n    {call}(0, {scalar});\n"
+                        ));
+                        append_pack_and_pop(
+                            &mut body,
+                            output_cb,
+                            &[value_node],
+                            &node_cbs,
+                            &mut remaining_uses,
+                        )?;
+                        continue;
+                    }
+                }
                 if let Some((value_node, scalar, scalar_op)) =
                     scalar_binary_op(nodes, node.op, lhs, rhs)
                 {
                     let value_cb = cb_for_node(&node_cbs, value_node)?;
                     let output_cb = cb_for_node(&node_cbs, index)?;
+                    let scalar_init = scalar_op_init(scalar_op);
                     append_waits(&mut body, &[value_cb]);
                     body.push_str(&format!(
-                        "    binop_with_scalar_tile_init();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{value_cb});\n    copy_tile(tt::CBIndex::c_{value_cb}, 0, 0);\n    {scalar_op}(0, {scalar});\n"
+                        "    {scalar_init}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{value_cb});\n    copy_tile(tt::CBIndex::c_{value_cb}, 0, 0);\n    {scalar_op}(0, {scalar});\n"
                     ));
                     append_pack_and_pop(
                         &mut body,
@@ -583,19 +947,54 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                 let lhs_cb = cb_for_node(&node_cbs, lhs)?;
                 let rhs_cb = cb_for_node(&node_cbs, rhs)?;
                 let output_cb = cb_for_node(&node_cbs, index)?;
+                if let FusedEltwiseOp::Compare(direction) = node.op {
+                    let int32_input = bool_literal(nodes[lhs].dtype == DType::Int32);
+                    let direction = compare_direction_variant(direction);
+                    append_waits(&mut body, &[lhs_cb, rhs_cb]);
+                    body.push_str(&format!(
+                        "    compare_sub_init<{int32_input}>();\n    compare_zero_init(CompareDirection::{direction});\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{lhs_cb});\n    copy_tile(tt::CBIndex::c_{lhs_cb}, 0, 0);\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb});\n    copy_tile(tt::CBIndex::c_{rhs_cb}, 0, 1);\n    compare_sub_tile<{int32_input}>(0, 1, 0);\n    compare_zero_tile<{int32_input}>(CompareDirection::{direction}, 0);\n"
+                    ));
+                    append_pack_and_pop(
+                        &mut body,
+                        output_cb,
+                        &[lhs, rhs],
+                        &node_cbs,
+                        &mut remaining_uses,
+                    )?;
+                    continue;
+                }
+                if matches!(
+                    node.op,
+                    FusedEltwiseOp::Add | FusedEltwiseOp::Subtract | FusedEltwiseOp::Multiply
+                ) {
+                    let helper = match node.op {
+                        FusedEltwiseOp::Add => "add_input",
+                        FusedEltwiseOp::Subtract => "subtract_input",
+                        FusedEltwiseOp::Multiply => "multiply_input",
+                        _ => unreachable!(),
+                    };
+                    append_waits(&mut body, &[lhs_cb, rhs_cb]);
+                    body.push_str(&format!(
+                        "    constexpr DataFormat input_format_{index} = binary_input_data_format(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{output_cb});\n    {helper}_init<input_format_{index}>();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{lhs_cb});\n    copy_tile(tt::CBIndex::c_{lhs_cb}, 0, 0);\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb});\n    copy_tile(tt::CBIndex::c_{rhs_cb}, 0, 1);\n    {helper}_tile<input_format_{index}>(0, 1, 0);\n"
+                    ));
+                    append_pack_and_pop(
+                        &mut body,
+                        output_cb,
+                        &[lhs, rhs],
+                        &node_cbs,
+                        &mut remaining_uses,
+                    )?;
+                    continue;
+                }
                 let call = match node.op {
-                    FusedEltwiseOp::Add => "add_binary_tile",
-                    FusedEltwiseOp::Subtract => "sub_binary_tile",
-                    FusedEltwiseOp::Multiply => "mul_binary_tile",
                     FusedEltwiseOp::Divide => "div_binary_tile",
+                    FusedEltwiseOp::Power => "power_binary_tile",
                     FusedEltwiseOp::Max => "binary_max_tile",
                     _ => unreachable!(),
                 };
                 let init = match node.op {
-                    FusedEltwiseOp::Add => "add_binary_tile_init",
-                    FusedEltwiseOp::Subtract => "sub_binary_tile_init",
-                    FusedEltwiseOp::Multiply => "mul_binary_tile_init",
                     FusedEltwiseOp::Divide => "div_binary_tile_init",
+                    FusedEltwiseOp::Power => "power_binary_tile_init",
                     FusedEltwiseOp::Max => "binary_max_tile_init",
                     _ => unreachable!(),
                 };
@@ -721,21 +1120,168 @@ fn scalar_binary_op(
 ) -> Option<(usize, u32, &'static str)> {
     let lhs_constant = constant_scalar_bits(nodes, lhs);
     let rhs_constant = constant_scalar_bits(nodes, rhs);
+    let scalar_op = |value_node: usize,
+                     scalar: u32,
+                     float_op: &'static str,
+                     int32_op: &'static str|
+     -> Option<(usize, u32, &'static str)> {
+        let op = match nodes[value_node].dtype {
+            DType::Float16 | DType::Float16B | DType::Float32 => float_op,
+            DType::Int32 => int32_op,
+            _ => return None,
+        };
+        Some((value_node, scalar, op))
+    };
     match (op, lhs_constant, rhs_constant) {
-        (FusedEltwiseOp::Add, None, Some(scalar)) => Some((lhs, scalar, "add_unary_tile")),
-        (FusedEltwiseOp::Add, Some(scalar), None) => Some((rhs, scalar, "add_unary_tile")),
-        (FusedEltwiseOp::Subtract, None, Some(scalar)) => Some((lhs, scalar, "sub_unary_tile")),
-        (FusedEltwiseOp::Subtract, Some(scalar), None) => Some((rhs, scalar, "rsub_unary_tile")),
-        (FusedEltwiseOp::Multiply, None, Some(scalar)) => Some((lhs, scalar, "mul_unary_tile")),
-        (FusedEltwiseOp::Multiply, Some(scalar), None) => Some((rhs, scalar, "mul_unary_tile")),
-        (FusedEltwiseOp::Divide, None, Some(scalar)) => Some((
-            lhs,
-            (1.0f32 / f32::from_bits(scalar)).to_bits(),
-            "div_unary_tile",
-        )),
-        (FusedEltwiseOp::Max, None, Some(scalar)) => Some((lhs, scalar, "unary_max_tile")),
-        (FusedEltwiseOp::Max, Some(scalar), None) => Some((rhs, scalar, "unary_max_tile")),
+        (FusedEltwiseOp::Add, None, Some(scalar)) => {
+            scalar_op(lhs, scalar, "add_unary_tile", "add_unary_tile_int32")
+        }
+        (FusedEltwiseOp::Add, Some(scalar), None) => {
+            scalar_op(rhs, scalar, "add_unary_tile", "add_unary_tile_int32")
+        }
+        (FusedEltwiseOp::Subtract, None, Some(scalar)) => {
+            scalar_op(lhs, scalar, "sub_unary_tile", "sub_unary_tile_int32")
+        }
+        (FusedEltwiseOp::Subtract, Some(scalar), None)
+            if matches!(
+                nodes[rhs].dtype,
+                DType::Float16 | DType::Float16B | DType::Float32
+            ) =>
+        {
+            Some((rhs, scalar, "rsub_unary_tile"))
+        }
+        (FusedEltwiseOp::Multiply, None, Some(scalar))
+            if matches!(
+                nodes[lhs].dtype,
+                DType::Float16 | DType::Float16B | DType::Float32
+            ) =>
+        {
+            Some((lhs, scalar, "mul_unary_tile"))
+        }
+        (FusedEltwiseOp::Multiply, Some(scalar), None)
+            if matches!(
+                nodes[rhs].dtype,
+                DType::Float16 | DType::Float16B | DType::Float32
+            ) =>
+        {
+            Some((rhs, scalar, "mul_unary_tile"))
+        }
+        (FusedEltwiseOp::Divide, None, Some(scalar))
+            if matches!(
+                nodes[lhs].dtype,
+                DType::Float16 | DType::Float16B | DType::Float32
+            ) =>
+        {
+            Some((
+                lhs,
+                (1.0f32 / f32::from_bits(scalar)).to_bits(),
+                "div_unary_tile",
+            ))
+        }
+        (FusedEltwiseOp::Divide, Some(scalar), None)
+            if matches!(
+                nodes[rhs].dtype,
+                DType::Float16 | DType::Float16B | DType::Float32
+            ) =>
+        {
+            Some((rhs, scalar, "rdiv_tile"))
+        }
+        (FusedEltwiseOp::Power, None, Some(scalar))
+            if matches!(
+                nodes[lhs].dtype,
+                DType::Float16 | DType::Float16B | DType::Float32
+            ) =>
+        {
+            Some((lhs, scalar, "power_tile"))
+        }
+        (FusedEltwiseOp::Power, Some(scalar), None)
+            if matches!(
+                nodes[rhs].dtype,
+                DType::Float16 | DType::Float16B | DType::Float32
+            ) =>
+        {
+            Some((rhs, scalar, "rpow_tile"))
+        }
+        (FusedEltwiseOp::Max, None, Some(scalar))
+            if matches!(
+                nodes[lhs].dtype,
+                DType::Float16 | DType::Float16B | DType::Float32
+            ) =>
+        {
+            Some((lhs, scalar, "unary_max_tile"))
+        }
+        (FusedEltwiseOp::Max, Some(scalar), None)
+            if matches!(
+                nodes[rhs].dtype,
+                DType::Float16 | DType::Float16B | DType::Float32
+            ) =>
+        {
+            Some((rhs, scalar, "unary_max_tile"))
+        }
         _ => None,
+    }
+}
+
+fn scalar_compare_op(
+    nodes: &[FusedEltwiseNode],
+    lhs: usize,
+    rhs: usize,
+    direction: CompareDirection,
+) -> Option<(usize, u32, CompareDirection)> {
+    let lhs_constant = constant_scalar_bits(nodes, lhs);
+    let rhs_constant = constant_scalar_bits(nodes, rhs);
+    match (lhs_constant, rhs_constant) {
+        (None, Some(scalar)) => Some((lhs, scalar, direction)),
+        (Some(scalar), None) => Some((rhs, scalar, reverse_compare_direction(direction))),
+        _ => None,
+    }
+}
+
+fn reverse_compare_direction(direction: CompareDirection) -> CompareDirection {
+    match direction {
+        CompareDirection::Eq => CompareDirection::Eq,
+        CompareDirection::Ne => CompareDirection::Ne,
+        CompareDirection::Ge => CompareDirection::Le,
+        CompareDirection::Gt => CompareDirection::Lt,
+        CompareDirection::Le => CompareDirection::Ge,
+        CompareDirection::Lt => CompareDirection::Gt,
+    }
+}
+
+fn scalar_op_init(scalar_op: &str) -> &'static str {
+    match scalar_op {
+        "rdiv_tile" => "rdiv_tile_init",
+        "rpow_tile" => "rpow_tile_init",
+        "power_tile" => "power_tile_init",
+        _ => "binop_with_scalar_tile_init",
+    }
+}
+
+fn unary_compare_init(direction: CompareDirection) -> &'static str {
+    match direction {
+        CompareDirection::Eq => "unary_eq_tile_init",
+        CompareDirection::Ne => "unary_ne_tile_init",
+        CompareDirection::Ge => "unary_ge_tile_init",
+        CompareDirection::Gt => "unary_gt_tile_init",
+        CompareDirection::Le => "unary_le_tile_init",
+        CompareDirection::Lt => "unary_lt_tile_init",
+    }
+}
+
+fn unary_compare_call(direction: CompareDirection, int32_input: bool) -> &'static str {
+    match (direction, int32_input) {
+        (CompareDirection::Eq, false) => "unary_eq_tile",
+        (CompareDirection::Ne, false) => "unary_ne_tile",
+        (CompareDirection::Ge, false) => "unary_ge_tile",
+        (CompareDirection::Gt, false) => "unary_gt_tile",
+        (CompareDirection::Le, false) => "unary_le_tile",
+        (CompareDirection::Lt, false) => "unary_lt_tile",
+        (CompareDirection::Eq, true) => "unary_eq_tile_int32",
+        (CompareDirection::Ne, true) => "unary_ne_tile_int32",
+        (CompareDirection::Ge, true) => "unary_ge_tile_int32",
+        (CompareDirection::Gt, true) => "unary_gt_tile_int32",
+        (CompareDirection::Le, true) => "unary_le_tile_int32",
+        (CompareDirection::Lt, true) => "unary_lt_tile_int32",
     }
 }
 
@@ -747,6 +1293,25 @@ fn constant_scalar_bits(nodes: &[FusedEltwiseNode], index: usize) -> Option<u32>
         DType::Float16 => f16_to_f32_bits((node.packed_value & 0xffff) as u16),
         _ => node.packed_value,
     })
+}
+
+fn bool_literal(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn compare_direction_variant(direction: CompareDirection) -> &'static str {
+    match direction {
+        CompareDirection::Eq => "Eq",
+        CompareDirection::Ne => "Ne",
+        CompareDirection::Ge => "Ge",
+        CompareDirection::Gt => "Gt",
+        CompareDirection::Le => "Le",
+        CompareDirection::Lt => "Lt",
+    }
 }
 
 fn f16_to_f32_bits(value: u16) -> u32 {
@@ -770,8 +1335,27 @@ fn f16_to_f32_bits(value: u16) -> u32 {
     }
 }
 
-fn is_supported_float(dtype: DType) -> bool {
+fn is_supported_leaf_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::Float16
+            | DType::Float16B
+            | DType::Float32
+            | DType::Int32
+            | DType::UInt16
+            | DType::UInt32
+    )
+}
+
+fn is_float_dtype(dtype: DType) -> bool {
     matches!(dtype, DType::Float16 | DType::Float16B | DType::Float32)
+}
+
+fn is_convert_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::Float16B | DType::Float32 | DType::Int32 | DType::UInt16 | DType::UInt32
+    )
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -785,4 +1369,84 @@ where
     value
         .try_into()
         .map_err(|_| invalid_input(format!("{name} does not fit in u32: {value}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(op: FusedEltwiseOp, input_nodes: Vec<u32>) -> FusedEltwiseNode {
+        FusedEltwiseNode {
+            op,
+            input_nodes,
+            input_index: 0,
+            packed_value: 0,
+            dtype: DType::Float16B,
+            single_tile_broadcast: false,
+        }
+    }
+
+    #[test]
+    fn compute_steps_handles_constant_left_divide_as_rdiv() {
+        let mut constant = node(FusedEltwiseOp::Constant, Vec::new());
+        constant.packed_value = 0x3f80_3f80;
+
+        let nodes = vec![
+            node(FusedEltwiseOp::Input, Vec::new()),
+            constant,
+            node(FusedEltwiseOp::Divide, vec![1, 0]),
+        ];
+        let steps = compute_steps(&nodes, 2).expect("constant / value should lower");
+
+        assert!(steps.body.contains("rdiv_tile_init();"));
+        assert!(steps.body.contains("rdiv_tile(0, 1065353216);"));
+    }
+
+    #[test]
+    fn compute_steps_handles_constant_right_power_as_unary_power() {
+        let mut constant = node(FusedEltwiseOp::Constant, Vec::new());
+        constant.packed_value = 0x4000_4000;
+
+        let nodes = vec![
+            node(FusedEltwiseOp::Input, Vec::new()),
+            constant,
+            node(FusedEltwiseOp::Power, vec![0, 1]),
+        ];
+        let steps = compute_steps(&nodes, 2).expect("value ** constant should lower");
+
+        assert!(steps.body.contains("power_tile_init();"));
+        assert!(steps.body.contains("power_tile(0, 1073741824);"));
+    }
+
+    #[test]
+    fn compute_steps_handles_constant_right_compare_as_unary_compare() {
+        let mut constant = node(FusedEltwiseOp::Constant, Vec::new());
+        constant.packed_value = 0;
+
+        let nodes = vec![
+            node(FusedEltwiseOp::Input, Vec::new()),
+            constant,
+            node(FusedEltwiseOp::Compare(CompareDirection::Gt), vec![0, 1]),
+        ];
+        let steps = compute_steps(&nodes, 2).expect("value > constant should lower");
+
+        assert!(steps.body.contains("unary_gt_tile_init();"));
+        assert!(steps.body.contains("unary_gt_tile(0, 0);"));
+    }
+
+    #[test]
+    fn compute_steps_reverses_constant_left_compare() {
+        let mut constant = node(FusedEltwiseOp::Constant, Vec::new());
+        constant.packed_value = 0;
+
+        let nodes = vec![
+            constant,
+            node(FusedEltwiseOp::Input, Vec::new()),
+            node(FusedEltwiseOp::Compare(CompareDirection::Gt), vec![0, 1]),
+        ];
+        let steps = compute_steps(&nodes, 2).expect("constant > value should lower");
+
+        assert!(steps.body.contains("unary_lt_tile_init();"));
+        assert!(steps.body.contains("unary_lt_tile(0, 0);"));
+    }
 }
