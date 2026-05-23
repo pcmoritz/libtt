@@ -55,6 +55,21 @@ impl MatmulEpilogue {
             Self::Top1 => MatmulEpilogueKind::Top1,
         }
     }
+
+    fn validate_shape(self, shape: &DotGeneralMatmulShape) -> io::Result<()> {
+        match self {
+            Self::Store { .. } => Ok(()),
+            Self::Top1 => {
+                if shape.batch_count != 1 || shape.m != 1 {
+                    return Err(invalid_input(format!(
+                        "matmul_top1 expects a single row output, got batch_count={} M={}",
+                        shape.batch_count, shape.m
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -66,22 +81,74 @@ pub(crate) enum MatmulOutput {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MatmulRuntimeEpilogue {
     Store {
+        output: DramBuffer,
         output_addr: u32,
     },
     Top1 {
+        partial_values: DramBuffer,
+        partial_indices: DramBuffer,
         partial_values_addr: u32,
         partial_indices_addr: u32,
+        partial_count: usize,
+        name: String,
     },
 }
 
 impl MatmulRuntimeEpilogue {
-    fn kind(self) -> MatmulEpilogueKind {
+    fn kind(&self) -> MatmulEpilogueKind {
         match self {
             Self::Store { .. } => MatmulEpilogueKind::Store,
             Self::Top1 { .. } => MatmulEpilogueKind::Top1,
+        }
+    }
+
+    fn writer_runtime_arg(&self, index: usize) -> Option<u32> {
+        match self {
+            Self::Store { output_addr, .. } => {
+                (index == WRITER_OUTPUT_ADDR_INDEX).then_some(*output_addr)
+            }
+            Self::Top1 {
+                partial_values_addr,
+                partial_indices_addr,
+                ..
+            } => match index {
+                WRITER_PARTIAL_VALUES_ADDR_INDEX => Some(*partial_values_addr),
+                WRITER_PARTIAL_INDICES_ADDR_INDEX => Some(*partial_indices_addr),
+                _ => None,
+            },
+        }
+    }
+
+    fn before_run(&self) {
+        if matches!(self, Self::Top1 { .. }) {
+            log("matmul_top1: running partial matmul".to_owned());
+        }
+    }
+
+    fn finalize(self, device: &mut Device) -> io::Result<MatmulOutput> {
+        match self {
+            Self::Store { output, .. } => Ok(MatmulOutput::Store(output)),
+            Self::Top1 {
+                partial_values,
+                partial_indices,
+                partial_count,
+                name,
+                ..
+            } => {
+                log("matmul_top1: partial matmul complete".to_owned());
+                log("matmul_top1: finalizing partials".to_owned());
+                let (values, indices) = crate::kernels::topk::top1_finalize_partials(
+                    device,
+                    &partial_values,
+                    &partial_indices,
+                    partial_count,
+                    format!("{name}_top1"),
+                )?;
+                log("matmul_top1: finalize complete".to_owned());
+                Ok(MatmulOutput::Top1 { values, indices })
+            }
         }
     }
 }
@@ -239,21 +306,10 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
     #[inline]
     fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
         debug_assert_eq!(self.key.epilogue, self.epilogue.kind());
-        match self.epilogue {
-            MatmulRuntimeEpilogue::Store { output_addr } => match index {
-                WRITER_RHS_ADDR_INDEX => Some(self.rhs_addr),
-                WRITER_OUTPUT_ADDR_INDEX => Some(output_addr),
-                _ => None,
-            },
-            MatmulRuntimeEpilogue::Top1 {
-                partial_values_addr,
-                partial_indices_addr,
-            } => match index {
-                WRITER_RHS_ADDR_INDEX => Some(self.rhs_addr),
-                WRITER_PARTIAL_VALUES_ADDR_INDEX => Some(partial_values_addr),
-                WRITER_PARTIAL_INDICES_ADDR_INDEX => Some(partial_indices_addr),
-                _ => None,
-            },
+        if index == WRITER_RHS_ADDR_INDEX {
+            Some(self.rhs_addr)
+        } else {
+            self.epilogue.writer_runtime_arg(index)
         }
     }
 }
@@ -301,12 +357,7 @@ pub(crate) fn matmul_bf16_dot_general(
         lhs_contracting_dimensions,
         rhs_contracting_dimensions,
     )?;
-    if epilogue_kind == MatmulEpilogueKind::Top1 && (shape.batch_count != 1 || shape.m != 1) {
-        return Err(invalid_input(format!(
-            "matmul_top1 expects a single row output, got batch_count={} M={}",
-            shape.batch_count, shape.m
-        )));
-    }
+    epilogue.validate_shape(&shape)?;
     validate_tile_count(lhs, tiled_shape_tile_count(lhs_logical_shape)?, "lhs")?;
     validate_tile_count(rhs, tiled_shape_tile_count(rhs_logical_shape)?, "rhs")?;
 
@@ -329,22 +380,19 @@ pub(crate) fn matmul_bf16_dot_general(
         output_dtype,
         epilogue: epilogue_kind,
     };
+    let lhs_addr = u32_arg(lhs.addr, "lhs address")?;
+    let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
 
-    match epilogue {
+    let runtime_epilogue = match epilogue {
         MatmulEpilogue::Store { output_dtype } => {
             let output_tiles = tiled_shape_tile_count(output_logical_shape)?;
             let output_shape = tiled_allocation_shape(output_logical_shape)?;
             let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
-            let kernel = MatmulBf16Kernel {
-                lhs_addr: u32_arg(lhs.addr, "lhs address")?,
-                rhs_addr: u32_arg(rhs.addr, "rhs address")?,
-                epilogue: MatmulRuntimeEpilogue::Store {
-                    output_addr: u32_arg(output.addr, "output address")?,
-                },
-                key,
-            };
-            kernel.run(device)?;
-            Ok(MatmulOutput::Store(output))
+            let output_addr = u32_arg(output.addr, "output address")?;
+            MatmulRuntimeEpilogue::Store {
+                output,
+                output_addr,
+            }
         }
         MatmulEpilogue::Top1 => {
             let plan = plan_for_key(&key)?;
@@ -362,30 +410,29 @@ pub(crate) fn matmul_bf16_dot_general(
                 &partial_shape,
                 format!("{name}_partial_indices"),
             )?;
-            let kernel = MatmulBf16Kernel {
-                lhs_addr: u32_arg(lhs.addr, "lhs address")?,
-                rhs_addr: u32_arg(rhs.addr, "rhs address")?,
-                epilogue: MatmulRuntimeEpilogue::Top1 {
-                    partial_values_addr: u32_arg(partial_values.addr, "partial values address")?,
-                    partial_indices_addr: u32_arg(partial_indices.addr, "partial indices address")?,
-                },
-                key,
-            };
-            log("matmul_top1: running partial matmul".to_owned());
-            kernel.run(device)?;
-            log("matmul_top1: partial matmul complete".to_owned());
-            log("matmul_top1: finalizing partials".to_owned());
-            let (values, indices) = crate::kernels::topk::top1_finalize_partials(
-                device,
-                &partial_values,
-                &partial_indices,
+            let partial_values_addr = u32_arg(partial_values.addr, "partial values address")?;
+            let partial_indices_addr = u32_arg(partial_indices.addr, "partial indices address")?;
+            MatmulRuntimeEpilogue::Top1 {
+                partial_values,
+                partial_indices,
+                partial_values_addr,
+                partial_indices_addr,
                 partial_count,
-                format!("{name}_top1"),
-            )?;
-            log("matmul_top1: finalize complete".to_owned());
-            Ok(MatmulOutput::Top1 { values, indices })
+                name,
+            }
         }
-    }
+    };
+
+    let kernel = MatmulBf16Kernel {
+        lhs_addr,
+        rhs_addr,
+        epilogue: runtime_epilogue,
+        key,
+    };
+    kernel.epilogue.before_run();
+    kernel.run(device)?;
+    let MatmulBf16Kernel { epilogue, .. } = kernel;
+    epilogue.finalize(device)
 }
 
 fn log_matmul_plan(plan: &MatmulPlan) {
