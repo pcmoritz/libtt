@@ -215,6 +215,35 @@ message TopKOp {
   uint32 k = 3;
 }
 
+message FusedElementwiseOp {
+  message Node {
+    enum Kind {
+      KIND_INPUT = 0;
+      KIND_CONSTANT = 1;
+      KIND_ADD = 2;
+      KIND_SUBTRACT = 3;
+      KIND_MULTIPLY = 4;
+      KIND_DIVIDE = 5;
+      KIND_MAX = 6;
+      KIND_NEGATE = 7;
+      KIND_EXPONENTIAL = 8;
+      KIND_RSQRT = 9;
+      KIND_CONVERT = 10;
+    }
+
+    Kind kind = 1;
+    repeated uint32 input_nodes = 2;
+    uint32 input_index = 3;
+    uint32 packed_value = 4;
+    TensorDesc.ElementType element_type = 5;
+    bool single_tile_broadcast = 6;
+  }
+
+  repeated uint32 input_ids = 1;
+  repeated Node nodes = 2;
+  uint32 root_node_id = 3;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -247,6 +276,7 @@ message Op {
     TransposeOp transpose = 26;
     CustomCallOp custom_call = 27;
     TopKOp top_k = 29;
+    FusedElementwiseOp fused_elementwise = 30;
   }
 }
 

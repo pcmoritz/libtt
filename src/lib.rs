@@ -1843,6 +1843,113 @@ fn execute_slice(
     )
 }
 
+fn execute_fused_elementwise(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    output_id: u32,
+    nodes: &[executable::FusedElementwiseNode],
+    root_node_id: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable fused_elementwise output id {output_id} is out of bounds"
+        ))
+    })?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let root = nodes.get(root_node_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable fused_elementwise root node id {root_node_id} is out of bounds"
+        ))
+    })?;
+    if root.element_type != output_desc.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable fused_elementwise root type {:?} does not match output type {:?}",
+            root.element_type, output_desc.element_type
+        )));
+    }
+
+    let mut inputs = Vec::with_capacity(input_ids.len());
+    for (index, &input_id) in input_ids.iter().enumerate() {
+        let input = device_buffer_for_value(
+            values,
+            input_id,
+            &format!("fused_elementwise.input[{index}]"),
+        )?;
+        let Some(input_dram) = input.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable fused_elementwise input[{index}] buffer has no device allocation"
+            )));
+        };
+        inputs.push(kernels::fused_eltwise::FusedEltwiseInput::Dram {
+            buffer: input_dram,
+            single_tile_broadcast: false,
+        });
+    }
+
+    let kernel_nodes = nodes
+        .iter()
+        .map(|node| {
+            Ok(kernels::fused_eltwise::FusedEltwiseNode {
+                op: fused_eltwise_op(node.kind),
+                input_nodes: node.input_nodes.clone(),
+                input_index: node.input_index,
+                packed_value: node.packed_value,
+                dtype: pjrt_buffer_type_to_dtype(node.element_type)?,
+                single_tile_broadcast: node.single_tile_broadcast,
+            })
+        })
+        .collect::<Result<Vec<_>, *mut PJRT_Error>>()?;
+    let output_dram = kernels::fused_eltwise::eltwise(
+        device,
+        &inputs,
+        &kernel_nodes,
+        root_node_id,
+        &output_shape,
+        "pjrt_fused_elementwise",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "fused_elementwise",
+    )
+}
+
+fn fused_eltwise_op(
+    kind: executable::FusedElementwiseKind,
+) -> kernels::fused_eltwise::FusedEltwiseOp {
+    match kind {
+        executable::FusedElementwiseKind::Input => kernels::fused_eltwise::FusedEltwiseOp::Input,
+        executable::FusedElementwiseKind::Constant => {
+            kernels::fused_eltwise::FusedEltwiseOp::Constant
+        }
+        executable::FusedElementwiseKind::Add => kernels::fused_eltwise::FusedEltwiseOp::Add,
+        executable::FusedElementwiseKind::Subtract => {
+            kernels::fused_eltwise::FusedEltwiseOp::Subtract
+        }
+        executable::FusedElementwiseKind::Multiply => {
+            kernels::fused_eltwise::FusedEltwiseOp::Multiply
+        }
+        executable::FusedElementwiseKind::Divide => kernels::fused_eltwise::FusedEltwiseOp::Divide,
+        executable::FusedElementwiseKind::Max => kernels::fused_eltwise::FusedEltwiseOp::Max,
+        executable::FusedElementwiseKind::Negate => kernels::fused_eltwise::FusedEltwiseOp::Negate,
+        executable::FusedElementwiseKind::Exponential => {
+            kernels::fused_eltwise::FusedEltwiseOp::Exponential
+        }
+        executable::FusedElementwiseKind::Rsqrt => kernels::fused_eltwise::FusedEltwiseOp::Rsqrt,
+        executable::FusedElementwiseKind::Convert => {
+            kernels::fused_eltwise::FusedEltwiseOp::Convert
+        }
+    }
+}
+
 fn execute_transpose(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2934,6 +3041,21 @@ fn execute_executable_v1(
                 *values_id,
                 *indices_id,
                 *k,
+            )?,
+            executable::Op::FusedElementwise {
+                input_ids,
+                output_id,
+                nodes,
+                root_node_id,
+            } => execute_fused_elementwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_ids,
+                *output_id,
+                nodes,
+                *root_node_id,
             )?,
         }
     }
@@ -4521,6 +4643,33 @@ mod tests {
     }
 
     #[cfg(libtt_mlir_frontend)]
+    fn assert_fused_add_chain(op: &executable::Op) {
+        let executable::Op::FusedElementwise {
+            input_ids,
+            output_id,
+            nodes,
+            root_node_id,
+        } = op
+        else {
+            panic!("expected fused elementwise op");
+        };
+        assert_eq!(input_ids, &[0, 1, 2]);
+        assert_eq!(*output_id, 3);
+        assert_eq!(*root_node_id, 4);
+        assert_eq!(nodes.len(), 5);
+        assert_eq!(nodes[0].kind, executable::FusedElementwiseKind::Input);
+        assert_eq!(nodes[0].input_index, 0);
+        assert_eq!(nodes[1].kind, executable::FusedElementwiseKind::Input);
+        assert_eq!(nodes[1].input_index, 1);
+        assert_eq!(nodes[2].kind, executable::FusedElementwiseKind::Add);
+        assert_eq!(nodes[2].input_nodes, vec![0, 1]);
+        assert_eq!(nodes[3].kind, executable::FusedElementwiseKind::Input);
+        assert_eq!(nodes[3].input_index, 2);
+        assert_eq!(nodes[4].kind, executable::FusedElementwiseKind::Add);
+        assert_eq!(nodes[4].input_nodes, vec![2, 3]);
+    }
+
+    #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_simple_binary_ops() {
         struct Case {
@@ -4598,9 +4747,60 @@ mod tests {
 }
 "#,
             |executable| {
-                assert_eq!(executable.values.len(), 5);
-                assert_eq!(executable.ops.len(), 5);
-                assert_eq!(executable.output_ids, vec![4]);
+                assert_eq!(executable.values.len(), 4);
+                assert_eq!(executable.ops.len(), 4);
+                assert_eq!(executable.output_ids, vec![3]);
+                assert_fused_add_chain(&executable.ops[3]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_silu_product_as_fused_elementwise() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func @main(%arg0: tensor<2x2xbf16>, %arg1: tensor<2x2xbf16>) -> tensor<2x2xbf16> {
+    %cst = stablehlo.constant dense<1.000000e+00> : tensor<bf16>
+    %0 = stablehlo.negate %arg0 : tensor<2x2xbf16>
+    %1 = stablehlo.exponential %0 : tensor<2x2xbf16>
+    %2 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<bf16>) -> tensor<2x2xbf16>
+    %3 = stablehlo.add %1, %2 : tensor<2x2xbf16>
+    %4 = stablehlo.divide %arg0, %3 : tensor<2x2xbf16>
+    %5 = stablehlo.multiply %4, %arg1 : tensor<2x2xbf16>
+    return %5 : tensor<2x2xbf16>
+  }
+}
+"#,
+            |executable| {
+                let fused = executable.ops.iter().find_map(|op| {
+                    if let executable::Op::FusedElementwise {
+                        input_ids,
+                        output_id,
+                        nodes,
+                        root_node_id,
+                    } = op
+                    {
+                        Some((input_ids, output_id, nodes, root_node_id))
+                    } else {
+                        None
+                    }
+                });
+                let Some((input_ids, output_id, nodes, root_node_id)) = fused else {
+                    panic!("expected fused elementwise op");
+                };
+                assert_eq!(input_ids, &[0, 1]);
+                assert_eq!(*output_id, executable.output_ids[0]);
+                assert_eq!(*root_node_id, 8);
+                assert_eq!(nodes.len(), 9);
+                assert_eq!(nodes[8].kind, executable::FusedElementwiseKind::Multiply);
+
+                let input_indices = nodes
+                    .iter()
+                    .filter(|node| node.kind == executable::FusedElementwiseKind::Input)
+                    .map(|node| node.input_index)
+                    .collect::<Vec<_>>();
+                assert_eq!(input_indices, vec![0, 0, 1]);
             },
         );
     }
