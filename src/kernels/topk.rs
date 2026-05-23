@@ -6,9 +6,13 @@ use crate::kernels::kernel::{select_worker_cores, Kernel, RuntimeArgsBuilder};
 use std::io;
 
 const WRITER: &str = include_str!("../../kernels/topk_writer.cc");
+const TOP1_FINAL_WRITER: &str = include_str!("../../kernels/top1_final_writer.cc");
 const WRITER_INPUT_ADDR_INDEX: usize = 0;
 const WRITER_VALUES_ADDR_INDEX: usize = 1;
 const WRITER_INDICES_ADDR_INDEX: usize = 2;
+const TOP1_FINAL_PARTIAL_PAIRS_ADDR_INDEX: usize = 0;
+const TOP1_FINAL_VALUES_ADDR_INDEX: usize = 1;
+const TOP1_FINAL_INDICES_ADDR_INDEX: usize = 2;
 const MAX_TOP_K: usize = 32;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -47,6 +51,39 @@ impl Kernel<TopKProgramKey> for TopKKernel {
     }
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct Top1FinalProgramKey {
+    core: CoreCoord,
+    partial_count: u32,
+}
+
+struct Top1FinalKernel {
+    partial_pairs_addr: u32,
+    values_addr: u32,
+    indices_addr: u32,
+    key: Top1FinalProgramKey,
+}
+
+impl Kernel<Top1FinalProgramKey> for Top1FinalKernel {
+    fn program_key(&self) -> Top1FinalProgramKey {
+        self.key.clone()
+    }
+
+    fn build_program(&self) -> io::Result<Program> {
+        top1_final_program(self.key.clone())
+    }
+
+    #[inline]
+    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        match index {
+            TOP1_FINAL_PARTIAL_PAIRS_ADDR_INDEX => Some(self.partial_pairs_addr),
+            TOP1_FINAL_VALUES_ADDR_INDEX => Some(self.values_addr),
+            TOP1_FINAL_INDICES_ADDR_INDEX => Some(self.indices_addr),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) fn top_k(
     device: &mut Device,
     input: &DramBuffer,
@@ -55,7 +92,6 @@ pub(crate) fn top_k(
     name: impl Into<String>,
 ) -> io::Result<(DramBuffer, DramBuffer)> {
     validate_top_k(input, input_shape, k)?;
-
     let cores = select_worker_cores(device.cores_ref(), 1)?;
     let [core] = cores.as_slice() else {
         return Err(invalid_input("top_k requires one worker core"));
@@ -77,6 +113,46 @@ pub(crate) fn top_k(
         },
     };
     kernel.run(device)?;
+    Ok((values, indices))
+}
+
+pub(crate) fn top1_finalize_partials(
+    device: &mut Device,
+    partial_pairs: &DramBuffer,
+    partial_count: usize,
+    name: impl Into<String>,
+) -> io::Result<(DramBuffer, DramBuffer)> {
+    if partial_pairs.dtype != DType::Int32 {
+        return Err(invalid_input(format!(
+            "top1 final partial pairs must be Int32, got {:?}",
+            partial_pairs.dtype
+        )));
+    }
+    if partial_pairs.num_tiles != partial_count {
+        return Err(invalid_input(format!(
+            "top1 final partial tile count mismatch: expected {partial_count}, got {}",
+            partial_pairs.num_tiles
+        )));
+    }
+
+    let cores = select_worker_cores(device.cores_ref(), 1)?;
+    let [core] = cores.as_slice() else {
+        return Err(invalid_input("top1 final requires one worker core"));
+    };
+    let output_shape = tiled_allocation_shape(&[1])?;
+    let name = name.into();
+    let values = device.alloc(1, DType::Float16B, &output_shape, format!("{name}_values"))?;
+    let indices = device.alloc(1, DType::Int32, &output_shape, format!("{name}_indices"))?;
+    let final_kernel = Top1FinalKernel {
+        partial_pairs_addr: u32_addr(partial_pairs.addr, "top1 partial pairs address")?,
+        values_addr: u32_addr(values.addr, "values address")?,
+        indices_addr: u32_addr(indices.addr, "indices address")?,
+        key: Top1FinalProgramKey {
+            core: *core,
+            partial_count: u32_arg(partial_count, "top1 partial count")?,
+        },
+    };
+    final_kernel.run(device)?;
     Ok((values, indices))
 }
 
@@ -153,7 +229,44 @@ fn top_k_program(key: TopKProgramKey) -> io::Result<Program> {
     })
 }
 
+fn top1_final_program(key: Top1FinalProgramKey) -> io::Result<Program> {
+    let mut runtime_args = RuntimeArgsBuilder::new(
+        0,
+        vec![
+            TOP1_FINAL_PARTIAL_PAIRS_ADDR_INDEX,
+            TOP1_FINAL_VALUES_ADDR_INDEX,
+            TOP1_FINAL_INDICES_ADDR_INDEX,
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    runtime_args.add_core(
+        key.core,
+        vec![0, 0, 0, key.partial_count],
+        Vec::new(),
+        Vec::new(),
+    )?;
+    let runtime_args = runtime_args.build()?;
+    Ok(Program {
+        writer_kernel: TOP1_FINAL_WRITER.to_owned(),
+        compile: CompileConfig {
+            cbs: vec![
+                CBConfig::new(0, DType::Int32),
+                CBConfig::new(16, DType::Float16B),
+                CBConfig::new(17, DType::Int32),
+            ],
+            ..CompileConfig::default()
+        },
+        name: format!("top1_final_bf16_{}", key.partial_count),
+        ..Program::new(runtime_args)
+    })
+}
+
 fn top_k_writer_source(dtype: DType) -> io::Result<String> {
+    top1_writer_source(dtype, WRITER)
+}
+
+fn top1_writer_source(dtype: DType, writer: &str) -> io::Result<String> {
     let define = match dtype {
         DType::Float16B => "TOPK_DTYPE_BFLOAT16",
         DType::Float32 => "TOPK_DTYPE_FLOAT32",
@@ -163,7 +276,7 @@ fn top_k_writer_source(dtype: DType) -> io::Result<String> {
             )));
         }
     };
-    Ok(format!("#define {define}\n{WRITER}"))
+    Ok(format!("#define {define}\n{writer}"))
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {

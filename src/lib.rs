@@ -18,7 +18,7 @@ mod log;
 mod mlir_frontend;
 
 use device::Device;
-use dram::{DType, DramBuffer};
+use dram::{tiled_allocation_shape, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
@@ -1764,6 +1764,21 @@ fn execute_reshape(
             "TT executable reshape operand buffer has no device allocation",
         ));
     };
+    let output_allocation_shape = tiled_allocation_shape(&output_shape).map_err(io_error)?;
+    if leading_unit_dims_compatible(&input_dram.shape, &output_allocation_shape) {
+        let mut output_dram = input_dram.clone();
+        output_dram.name = "pjrt_reshape_view".to_owned();
+        output_dram.shape = output_allocation_shape;
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_desc.dims.clone(),
+            output_dram,
+            context,
+            "reshape",
+        );
+    }
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
     let output_dram = kernels::reshape::reshape(
@@ -1784,6 +1799,17 @@ fn execute_reshape(
         context,
         "reshape",
     )
+}
+
+fn leading_unit_dims_compatible(lhs: &[usize], rhs: &[usize]) -> bool {
+    trim_leading_unit_dims(lhs) == trim_leading_unit_dims(rhs)
+}
+
+fn trim_leading_unit_dims(mut shape: &[usize]) -> &[usize] {
+    while shape.len() > 2 && shape[0] == 1 {
+        shape = &shape[1..];
+    }
+    shape
 }
 
 fn execute_slice(
@@ -1841,6 +1867,113 @@ fn execute_slice(
         context,
         "slice",
     )
+}
+
+fn execute_fused_elementwise(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    output_id: u32,
+    nodes: &[executable::FusedElementwiseNode],
+    root_node_id: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable fused_elementwise output id {output_id} is out of bounds"
+        ))
+    })?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let root = nodes.get(root_node_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable fused_elementwise root node id {root_node_id} is out of bounds"
+        ))
+    })?;
+    if root.element_type != output_desc.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable fused_elementwise root type {:?} does not match output type {:?}",
+            root.element_type, output_desc.element_type
+        )));
+    }
+
+    let mut inputs = Vec::with_capacity(input_ids.len());
+    for (index, &input_id) in input_ids.iter().enumerate() {
+        let input = device_buffer_for_value(
+            values,
+            input_id,
+            &format!("fused_elementwise.input[{index}]"),
+        )?;
+        let Some(input_dram) = input.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable fused_elementwise input[{index}] buffer has no device allocation"
+            )));
+        };
+        inputs.push(kernels::fused_eltwise::FusedEltwiseInput::Dram {
+            buffer: input_dram,
+            single_tile_broadcast: false,
+        });
+    }
+
+    let kernel_nodes = nodes
+        .iter()
+        .map(|node| {
+            Ok(kernels::fused_eltwise::FusedEltwiseNode {
+                op: fused_eltwise_op(node.kind),
+                input_nodes: node.input_nodes.clone(),
+                input_index: node.input_index,
+                packed_value: node.packed_value,
+                dtype: pjrt_buffer_type_to_dtype(node.element_type)?,
+                single_tile_broadcast: node.single_tile_broadcast,
+            })
+        })
+        .collect::<Result<Vec<_>, *mut PJRT_Error>>()?;
+    let output_dram = kernels::fused_eltwise::eltwise(
+        device,
+        &inputs,
+        &kernel_nodes,
+        root_node_id,
+        &output_shape,
+        "pjrt_fused_elementwise",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "fused_elementwise",
+    )
+}
+
+fn fused_eltwise_op(
+    kind: executable::FusedElementwiseKind,
+) -> kernels::fused_eltwise::FusedEltwiseOp {
+    match kind {
+        executable::FusedElementwiseKind::Input => kernels::fused_eltwise::FusedEltwiseOp::Input,
+        executable::FusedElementwiseKind::Constant => {
+            kernels::fused_eltwise::FusedEltwiseOp::Constant
+        }
+        executable::FusedElementwiseKind::Add => kernels::fused_eltwise::FusedEltwiseOp::Add,
+        executable::FusedElementwiseKind::Subtract => {
+            kernels::fused_eltwise::FusedEltwiseOp::Subtract
+        }
+        executable::FusedElementwiseKind::Multiply => {
+            kernels::fused_eltwise::FusedEltwiseOp::Multiply
+        }
+        executable::FusedElementwiseKind::Divide => kernels::fused_eltwise::FusedEltwiseOp::Divide,
+        executable::FusedElementwiseKind::Max => kernels::fused_eltwise::FusedEltwiseOp::Max,
+        executable::FusedElementwiseKind::Negate => kernels::fused_eltwise::FusedEltwiseOp::Negate,
+        executable::FusedElementwiseKind::Exponential => {
+            kernels::fused_eltwise::FusedEltwiseOp::Exponential
+        }
+        executable::FusedElementwiseKind::Rsqrt => kernels::fused_eltwise::FusedEltwiseOp::Rsqrt,
+        executable::FusedElementwiseKind::Convert => {
+            kernels::fused_eltwise::FusedEltwiseOp::Convert
+        }
+    }
 }
 
 fn execute_transpose(
@@ -2029,6 +2162,176 @@ fn execute_top_k(
         indices_dram,
         context,
         "top_k.indices",
+    )
+}
+
+fn execute_matmul(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: [u32; 2],
+    output_id: u32,
+    dimension_numbers: &executable::DotGeneralDimensionNumbers,
+    top_k_epilogue: Option<&executable::MatmulTopKEpilogue>,
+) -> Result<(), *mut PJRT_Error> {
+    let lhs = device_buffer_for_value(values, input_ids[0], "matmul.lhs")?;
+    let rhs = device_buffer_for_value(values, input_ids[1], "matmul.rhs")?;
+    let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable matmul lhs buffer has no device allocation",
+        ));
+    };
+    let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable matmul rhs buffer has no device allocation",
+        ));
+    };
+    let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
+    let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+
+    if let Some(epilogue) = top_k_epilogue {
+        if epilogue.k != 1 {
+            return Err(invalid_argument(
+                "TT executable matmul top_k epilogue currently requires k=1",
+            ));
+        }
+        let matmul_desc = plan
+            .values
+            .get(epilogue.matmul_output_id as usize)
+            .ok_or_else(|| {
+                invalid_argument(format!(
+                    "TT executable matmul top_k epilogue matmul output id {} is out of bounds",
+                    epilogue.matmul_output_id
+                ))
+            })?;
+        let values_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+            invalid_argument(format!(
+                "TT executable matmul top_k epilogue values id {output_id} is out of bounds"
+            ))
+        })?;
+        let indices_desc = plan
+            .values
+            .get(epilogue.indices_id as usize)
+            .ok_or_else(|| {
+                invalid_argument(format!(
+                    "TT executable matmul top_k epilogue indices id {} is out of bounds",
+                    epilogue.indices_id
+                ))
+            })?;
+        if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+            || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+            || matmul_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+            || values_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+            || indices_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32
+        {
+            return Err(invalid_argument(format!(
+                "TT executable matmul top_k epilogue requires bf16 matmul/top_k values and s32 indices, got lhs={:?} rhs={:?} matmul={:?} values={:?} indices={:?}",
+                lhs.buffer_type,
+                rhs.buffer_type,
+                matmul_desc.element_type,
+                values_desc.element_type,
+                indices_desc.element_type
+            )));
+        }
+        if values_desc.dims != [1] || indices_desc.dims != [1] {
+            return Err(invalid_argument(format!(
+                "TT executable matmul top_k epilogue output shapes must be [1], got values {:?} indices {:?}",
+                values_desc.dims, indices_desc.dims
+            )));
+        }
+
+        let matmul_shape = dims_i64_to_usize(&matmul_desc.dims)?;
+        let matmul_output = kernels::matmul::matmul_bf16_dot_general(
+            device,
+            lhs_dram,
+            rhs_dram,
+            &lhs_shape,
+            &rhs_shape,
+            &matmul_shape,
+            &dimension_numbers.lhs_batching_dimensions,
+            &dimension_numbers.rhs_batching_dimensions,
+            &dimension_numbers.lhs_contracting_dimensions,
+            &dimension_numbers.rhs_contracting_dimensions,
+            kernels::matmul::MatmulEpilogue::Top1,
+            "pjrt_matmul_top_k",
+        )
+        .map_err(io_error)?;
+        let (values_dram, indices_dram) = match matmul_output {
+            kernels::matmul::MatmulOutput::Top1 { values, indices } => (values, indices),
+            kernels::matmul::MatmulOutput::Store(_) => {
+                return Err(invalid_argument(
+                    "TT executable matmul top_k epilogue returned a stored matmul output",
+                ));
+            }
+        };
+        store_output_buffer(
+            values,
+            plan,
+            output_id,
+            values_desc.dims.clone(),
+            values_dram,
+            context,
+            "matmul.top_k.values",
+        )?;
+        return store_output_buffer(
+            values,
+            plan,
+            epilogue.indices_id,
+            indices_desc.dims.clone(),
+            indices_dram,
+            context,
+            "matmul.top_k.indices",
+        );
+    }
+
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable matmul output id {output_id} is out of bounds"
+        ))
+    })?;
+    let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || !matches!(output_dtype, DType::Float16B | DType::Float32)
+    {
+        return Err(invalid_argument(format!(
+            "TT executable matmul requires bf16 inputs and bf16/f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
+            lhs.buffer_type, rhs.buffer_type
+        )));
+    }
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let output_dram = kernels::matmul::matmul_bf16_dot_general(
+        device,
+        lhs_dram,
+        rhs_dram,
+        &lhs_shape,
+        &rhs_shape,
+        &output_shape,
+        &dimension_numbers.lhs_batching_dimensions,
+        &dimension_numbers.rhs_batching_dimensions,
+        &dimension_numbers.lhs_contracting_dimensions,
+        &dimension_numbers.rhs_contracting_dimensions,
+        kernels::matmul::MatmulEpilogue::Store { output_dtype },
+        "pjrt_matmul",
+    )
+    .map_err(io_error)?;
+    let output_dram = match output_dram {
+        kernels::matmul::MatmulOutput::Store(output) => output,
+        kernels::matmul::MatmulOutput::Top1 { .. } => {
+            return Err(invalid_argument(
+                "TT executable matmul returned a top_k epilogue output for normal matmul",
+            ));
+        }
+    };
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "matmul",
     )
 }
 
@@ -2223,6 +2526,27 @@ fn execute_broadcast_in_dim(
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
+    let output_allocation_shape = tiled_allocation_shape(&output_shape).map_err(io_error)?;
+    if broadcast_in_dim_can_alias(
+        &input_shape,
+        &output_shape,
+        broadcast_dimensions,
+        &input_dram.shape,
+        &output_allocation_shape,
+    ) {
+        let mut output_dram = input_dram.clone();
+        output_dram.name = "pjrt_broadcast_view".to_owned();
+        output_dram.shape = output_allocation_shape;
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_dims,
+            output_dram,
+            context,
+            "broadcast_in_dim",
+        );
+    }
     let output_dram = kernels::broadcast::broadcast_in_dim(
         device,
         input_dram,
@@ -2240,6 +2564,54 @@ fn execute_broadcast_in_dim(
         context,
         "broadcast_in_dim",
     )
+}
+
+fn broadcast_in_dim_can_alias(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[i64],
+    input_allocation_shape: &[usize],
+    output_allocation_shape: &[usize],
+) -> bool {
+    if !leading_unit_dims_compatible(input_allocation_shape, output_allocation_shape) {
+        return false;
+    }
+    if broadcast_dimensions.len() != input_shape.len() {
+        return false;
+    }
+
+    let mut mapped_output_dims = vec![false; output_shape.len()];
+    for (input_dim, &output_dim) in broadcast_dimensions.iter().enumerate() {
+        let Ok(output_dim) = usize::try_from(output_dim) else {
+            return false;
+        };
+        if output_dim >= output_shape.len() || mapped_output_dims[output_dim] {
+            return false;
+        }
+        if input_shape[input_dim] != output_shape[output_dim] {
+            return false;
+        }
+        mapped_output_dims[output_dim] = true;
+    }
+    for (dim, &mapped) in mapped_output_dims.iter().enumerate() {
+        if !mapped && output_shape[dim] != 1 {
+            return false;
+        }
+    }
+
+    match input_shape.len() {
+        0 => output_shape.iter().all(|&dim| dim == 1),
+        1 => usize::try_from(broadcast_dimensions[0])
+            .is_ok_and(|output_dim| output_dim == output_shape.len().saturating_sub(1)),
+        input_rank => {
+            let output_rank = output_shape.len();
+            output_rank >= 2
+                && usize::try_from(broadcast_dimensions[input_rank - 2])
+                    .is_ok_and(|dim| dim == output_rank - 2)
+                && usize::try_from(broadcast_dimensions[input_rank - 1])
+                    .is_ok_and(|dim| dim == output_rank - 1)
+        }
+    }
 }
 
 fn execute_concatenate(
@@ -2791,63 +3163,17 @@ fn execute_executable_v1(
                 input_ids,
                 output_id,
                 dimension_numbers,
-            } => {
-                let output_id = *output_id;
-                let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
-                let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
-                let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
-                    return Err(failed_precondition(
-                        "TT executable matmul lhs buffer has no device allocation",
-                    ));
-                };
-                let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
-                    return Err(failed_precondition(
-                        "TT executable matmul rhs buffer has no device allocation",
-                    ));
-                };
-                let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-                    invalid_argument(format!(
-                        "TT executable matmul output id {output_id} is out of bounds"
-                    ))
-                })?;
-                let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
-                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                    || !matches!(output_dtype, DType::Float16B | DType::Float32)
-                {
-                    return Err(invalid_argument(format!(
-                        "TT executable matmul requires bf16 inputs and bf16/f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
-                        lhs.buffer_type, rhs.buffer_type
-                    )));
-                }
-                let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
-                let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
-                let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-                let output_dram = kernels::matmul::matmul_bf16_dot_general(
-                    device,
-                    lhs_dram,
-                    rhs_dram,
-                    &lhs_shape,
-                    &rhs_shape,
-                    &output_shape,
-                    &dimension_numbers.lhs_batching_dimensions,
-                    &dimension_numbers.rhs_batching_dimensions,
-                    &dimension_numbers.lhs_contracting_dimensions,
-                    &dimension_numbers.rhs_contracting_dimensions,
-                    output_dtype,
-                    "pjrt_matmul",
-                )
-                .map_err(io_error)?;
-                store_output_buffer(
-                    &mut values,
-                    plan,
-                    output_id,
-                    output_desc.dims.clone(),
-                    output_dram,
-                    &output_context,
-                    "matmul",
-                )?;
-            }
+                top_k_epilogue,
+            } => execute_matmul(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_ids,
+                *output_id,
+                dimension_numbers,
+                top_k_epilogue.as_ref(),
+            )?,
             executable::Op::Constant { .. } => {}
             executable::Op::Compare {
                 input_ids,
@@ -2934,6 +3260,21 @@ fn execute_executable_v1(
                 *values_id,
                 *indices_id,
                 *k,
+            )?,
+            executable::Op::FusedElementwise {
+                input_ids,
+                output_id,
+                nodes,
+                root_node_id,
+            } => execute_fused_elementwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_ids,
+                *output_id,
+                nodes,
+                *root_node_id,
             )?,
         }
     }
@@ -4521,6 +4862,33 @@ mod tests {
     }
 
     #[cfg(libtt_mlir_frontend)]
+    fn assert_fused_add_chain(op: &executable::Op) {
+        let executable::Op::FusedElementwise {
+            input_ids,
+            output_id,
+            nodes,
+            root_node_id,
+        } = op
+        else {
+            panic!("expected fused elementwise op");
+        };
+        assert_eq!(input_ids, &[0, 1, 2]);
+        assert_eq!(*output_id, 3);
+        assert_eq!(*root_node_id, 4);
+        assert_eq!(nodes.len(), 5);
+        assert_eq!(nodes[0].kind, executable::FusedElementwiseKind::Input);
+        assert_eq!(nodes[0].input_index, 0);
+        assert_eq!(nodes[1].kind, executable::FusedElementwiseKind::Input);
+        assert_eq!(nodes[1].input_index, 1);
+        assert_eq!(nodes[2].kind, executable::FusedElementwiseKind::Add);
+        assert_eq!(nodes[2].input_nodes, vec![0, 1]);
+        assert_eq!(nodes[3].kind, executable::FusedElementwiseKind::Input);
+        assert_eq!(nodes[3].input_index, 2);
+        assert_eq!(nodes[4].kind, executable::FusedElementwiseKind::Add);
+        assert_eq!(nodes[4].input_nodes, vec![2, 3]);
+    }
+
+    #[cfg(libtt_mlir_frontend)]
     #[test]
     fn pjrt_compile_lowers_simple_binary_ops() {
         struct Case {
@@ -4598,9 +4966,60 @@ mod tests {
 }
 "#,
             |executable| {
-                assert_eq!(executable.values.len(), 5);
-                assert_eq!(executable.ops.len(), 5);
-                assert_eq!(executable.output_ids, vec![4]);
+                assert_eq!(executable.values.len(), 4);
+                assert_eq!(executable.ops.len(), 4);
+                assert_eq!(executable.output_ids, vec![3]);
+                assert_fused_add_chain(&executable.ops[3]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_silu_product_as_fused_elementwise() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func @main(%arg0: tensor<2x2xbf16>, %arg1: tensor<2x2xbf16>) -> tensor<2x2xbf16> {
+    %cst = stablehlo.constant dense<1.000000e+00> : tensor<bf16>
+    %0 = stablehlo.negate %arg0 : tensor<2x2xbf16>
+    %1 = stablehlo.exponential %0 : tensor<2x2xbf16>
+    %2 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<bf16>) -> tensor<2x2xbf16>
+    %3 = stablehlo.add %1, %2 : tensor<2x2xbf16>
+    %4 = stablehlo.divide %arg0, %3 : tensor<2x2xbf16>
+    %5 = stablehlo.multiply %4, %arg1 : tensor<2x2xbf16>
+    return %5 : tensor<2x2xbf16>
+  }
+}
+"#,
+            |executable| {
+                let fused = executable.ops.iter().find_map(|op| {
+                    if let executable::Op::FusedElementwise {
+                        input_ids,
+                        output_id,
+                        nodes,
+                        root_node_id,
+                    } = op
+                    {
+                        Some((input_ids, output_id, nodes, root_node_id))
+                    } else {
+                        None
+                    }
+                });
+                let Some((input_ids, output_id, nodes, root_node_id)) = fused else {
+                    panic!("expected fused elementwise op");
+                };
+                assert_eq!(input_ids, &[0, 1]);
+                assert_eq!(*output_id, executable.output_ids[0]);
+                assert_eq!(*root_node_id, 8);
+                assert_eq!(nodes.len(), 9);
+                assert_eq!(nodes[8].kind, executable::FusedElementwiseKind::Multiply);
+
+                let input_indices = nodes
+                    .iter()
+                    .filter(|node| node.kind == executable::FusedElementwiseKind::Input)
+                    .map(|node| node.input_index)
+                    .collect::<Vec<_>>();
+                assert_eq!(input_indices, vec![0, 0, 1]);
             },
         );
     }
@@ -5070,16 +5489,66 @@ mod tests {
                     input_ids,
                     output_id,
                     dimension_numbers,
+                    top_k_epilogue,
                 } = &executable.ops[2]
                 else {
                     panic!("dot_general should lower to Matmul");
                 };
                 assert_eq!(*input_ids, [0, 1]);
                 assert_eq!(*output_id, 2);
+                assert!(top_k_epilogue.is_none());
                 assert_eq!(dimension_numbers.lhs_batching_dimensions, vec![1]);
                 assert_eq!(dimension_numbers.rhs_batching_dimensions, vec![1]);
                 assert_eq!(dimension_numbers.lhs_contracting_dimensions, vec![2]);
                 assert_eq!(dimension_numbers.rhs_contracting_dimensions, vec![2]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_matmul_top_k_epilogue() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func private @top_k(%arg0: tensor<128xbf16>) -> (tensor<1xbf16>, tensor<1xi32>)
+  func.func public @main(%arg0: tensor<1x80xbf16>, %arg1: tensor<80x128xbf16>) -> (tensor<1xbf16>, tensor<1xi32>) {
+    %0 = stablehlo.dot_general %arg0, %arg1,
+      contracting_dims = [1] x [0]
+      : (tensor<1x80xbf16>, tensor<80x128xbf16>) -> tensor<1x128xbf16>
+    %1 = stablehlo.reshape %0 : (tensor<1x128xbf16>) -> tensor<128xbf16>
+    %2:2 = stablehlo.composite "chlo.top_k" %1 {
+      composite_attributes = {k = 1 : i64},
+      decomposition = @top_k
+    } : (tensor<128xbf16>) -> (tensor<1xbf16>, tensor<1xi32>)
+    return %2#0, %2#1 : tensor<1xbf16>, tensor<1xi32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![3, 4]);
+                assert_eq!(executable.ops.len(), 3);
+                assert_eq!(executable.values[2].dims, vec![1, 128]);
+                let executable::Op::Matmul {
+                    input_ids,
+                    output_id,
+                    dimension_numbers,
+                    top_k_epilogue,
+                } = &executable.ops[2]
+                else {
+                    panic!("dot_general/top_k should lower to Matmul with top_k epilogue");
+                };
+                assert_eq!(*input_ids, [0, 1]);
+                assert_eq!(*output_id, 3);
+                assert!(dimension_numbers.lhs_batching_dimensions.is_empty());
+                assert!(dimension_numbers.rhs_batching_dimensions.is_empty());
+                assert_eq!(dimension_numbers.lhs_contracting_dimensions, vec![1]);
+                assert_eq!(dimension_numbers.rhs_contracting_dimensions, vec![0]);
+                let epilogue = top_k_epilogue
+                    .as_ref()
+                    .expect("matmul should have a top_k epilogue");
+                assert_eq!(epilogue.matmul_output_id, 2);
+                assert_eq!(epilogue.indices_id, 4);
+                assert_eq!(epilogue.k, 1);
             },
         );
     }

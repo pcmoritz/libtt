@@ -57,7 +57,7 @@ const CQ_DISPATCH_CMD_WRITE_LINEAR_HOST_IS_EVENT: u8 = 1;
 
 const CQ_CMD_SIZE: usize = CQ_DISPATCH_CMD_SIZE as usize;
 const DONE_STREAM: u16 = FIRST_STREAM_USED as u16;
-const PENDING_LAUNCH_WAIT_INTERVAL: usize = 16;
+const PENDING_LAUNCH_WAIT_INTERVAL: usize = 256;
 const PENDING_RECORD_WAIT_LIMIT: usize = CQ_PREFETCH_Q_ENTRIES / 2;
 
 pub(crate) struct FastDispatcher {
@@ -114,7 +114,10 @@ impl FastDispatcher {
         match self.runtime_templates.entry(program_id) {
             std::collections::hash_map::Entry::Occupied(_) => {}
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(RuntimeCqTemplate::new(runtime_args, go_word(dispatch_core))?);
+                entry.insert(RuntimeCqTemplate::new(
+                    runtime_args,
+                    go_word(dispatch_core),
+                )?);
             }
         }
 

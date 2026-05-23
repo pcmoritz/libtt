@@ -1,6 +1,7 @@
 pub(crate) mod binary_eltwise;
 pub(crate) mod broadcast;
 pub(crate) mod concatenate;
+pub(crate) mod fused_eltwise;
 pub(crate) mod gather;
 pub(crate) mod iota;
 pub(crate) mod kernel;
