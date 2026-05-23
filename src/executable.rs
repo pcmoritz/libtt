@@ -196,7 +196,6 @@ pub(crate) enum FusedElementwiseKind {
     Negate,
     Exponential,
     Rsqrt,
-    Convert,
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -213,7 +212,6 @@ impl FusedElementwiseKind {
             ProtoFusedElementwiseKind::Negate => Self::Negate,
             ProtoFusedElementwiseKind::Exponential => Self::Exponential,
             ProtoFusedElementwiseKind::Rsqrt => Self::Rsqrt,
-            ProtoFusedElementwiseKind::Convert => Self::Convert,
         }
     }
 }

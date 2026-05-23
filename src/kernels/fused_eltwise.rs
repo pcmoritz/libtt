@@ -421,7 +421,6 @@ impl From<FusedElementwiseKind> for FusedEltwiseOp {
             FusedElementwiseKind::Negate => Self::Negate,
             FusedElementwiseKind::Exponential => Self::Exponential,
             FusedElementwiseKind::Rsqrt => Self::Rsqrt,
-            FusedElementwiseKind::Convert => Self::Convert,
         }
     }
 }

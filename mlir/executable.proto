@@ -228,7 +228,6 @@ message FusedElementwiseOp {
       KIND_NEGATE = 7;
       KIND_EXPONENTIAL = 8;
       KIND_RSQRT = 9;
-      KIND_CONVERT = 10;
     }
 
     Kind kind = 1;
