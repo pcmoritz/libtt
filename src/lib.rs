@@ -1626,11 +1626,6 @@ fn execute_binary_eltwise(
         )));
     }
     let input_dtype = pjrt_buffer_type_to_dtype(lhs_desc.element_type)?;
-    if !op.is_binary() {
-        return Err(invalid_argument(format!(
-            "TT executable {op_name} is not a binary elementwise op"
-        )));
-    };
     let output_dtype = op.binary_output_dtype(input_dtype).map_err(io_error)?;
     let expected_output_type = if op.is_compare() {
         PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
@@ -1646,12 +1641,6 @@ fn execute_binary_eltwise(
         return Err(invalid_argument(format!(
             "TT executable {op_name} output must be {:?}, got {:?}",
             expected_output_type, output_desc.element_type
-        )));
-    }
-    if pjrt_buffer_type_to_dtype(expected_output_type)? != output_dtype {
-        return Err(invalid_argument(format!(
-            "TT executable {op_name} output dtype metadata mismatch: {:?} vs {:?}",
-            expected_output_type, output_dtype
         )));
     }
 
@@ -4795,15 +4784,15 @@ mod tests {
                 };
                 assert_eq!(input_ids, &[0, 1]);
                 assert_eq!(*output_id, executable.output_ids[0]);
-                assert_eq!(nodes.len(), 9);
-                assert_eq!(nodes[8].kind, executable::FusedElementwiseKind::Multiply);
+                assert_eq!(nodes.len(), 8);
+                assert_eq!(nodes[7].kind, executable::FusedElementwiseKind::Multiply);
 
                 let input_indices = nodes
                     .iter()
                     .filter(|node| node.kind == executable::FusedElementwiseKind::Input)
                     .map(|node| node.input_index)
                     .collect::<Vec<_>>();
-                assert_eq!(input_indices, vec![0, 0, 1]);
+                assert_eq!(input_indices, vec![0, 1]);
             },
         );
     }

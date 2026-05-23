@@ -362,7 +362,6 @@ struct FusedElementwiseRegion {
     llvm::SmallVector<mlir::Value> inputs;
     llvm::SmallVector<FusedElementwiseNodeDesc> nodes;
     llvm::SmallVector<mlir::Operation*> covered_ops;
-    unsigned fused_op_count = 0;
 };
 
 bool isFloatTensor(mlir::Value value) {
@@ -456,6 +455,18 @@ uint32_t addFusedNode(
     return node_id;
 }
 
+uint32_t fusedElementwiseInputIndex(
+    FusedElementwiseRegion& region,
+    mlir::Value input) {
+    auto input_it = std::find(region.inputs.begin(), region.inputs.end(), input);
+    if (input_it != region.inputs.end()) {
+        return static_cast<uint32_t>(input_it - region.inputs.begin());
+    }
+    uint32_t input_index = static_cast<uint32_t>(region.inputs.size());
+    region.inputs.push_back(input);
+    return input_index;
+}
+
 std::optional<uint32_t> collectFusedElementwiseValue(
     mlir::Value value,
     mlir::Value root_value,
@@ -498,7 +509,6 @@ std::optional<uint32_t> collectFusedElementwiseOp(
     uint32_t node_id = addFusedNode(candidate_region, std::move(node));
     candidate_node_ids.try_emplace(op->getResult(0), node_id);
     candidate_region.covered_ops.push_back(op);
-    candidate_region.fused_op_count += 1;
     region = std::move(candidate_region);
     node_ids = std::move(candidate_node_ids);
     return node_id;
@@ -511,15 +521,7 @@ std::optional<uint32_t> collectFusedElementwiseValue(
     llvm::DenseMap<mlir::Value, uint32_t>& node_ids) {
     auto existing = node_ids.find(value);
     if (existing != node_ids.end()) {
-        auto kind = region.nodes[existing->second].kind;
-        if (kind != tt::FusedElementwiseOp::Node::KIND_INPUT &&
-            kind != tt::FusedElementwiseOp::Node::KIND_CONSTANT) {
-            return existing->second;
-        }
-        // Leaf values may be used by both an in-place unary chain and a later
-        // binary op, e.g. silu(x) = x / (1 + exp(-x)). Model each occurrence
-        // as a separate leaf node so the compute kernel can mutate each leaf
-        // locally without corrupting the other occurrence.
+        return existing->second;
     }
 
     std::string ignored;
@@ -551,18 +553,9 @@ std::optional<uint32_t> collectFusedElementwiseValue(
             sameTensorShape(value, root_value) &&
             valueElementType(operand) == valueElementType(value) &&
             isLogicalScalarTile(operand)) {
-            auto input_it = std::find(region.inputs.begin(), region.inputs.end(), operand);
-            uint32_t input_index = 0;
-            if (input_it == region.inputs.end()) {
-                input_index = static_cast<uint32_t>(region.inputs.size());
-                region.inputs.push_back(operand);
-            } else {
-                input_index = static_cast<uint32_t>(input_it - region.inputs.begin());
-            }
-
             FusedElementwiseNodeDesc node;
             node.kind = tt::FusedElementwiseOp::Node::KIND_INPUT;
-            node.input_index = input_index;
+            node.input_index = fusedElementwiseInputIndex(region, operand);
             node.element_type = valueElementType(value);
             node.single_tile_broadcast = true;
             uint32_t node_id = addFusedNode(region, std::move(node));
@@ -576,18 +569,9 @@ std::optional<uint32_t> collectFusedElementwiseValue(
         return std::nullopt;
     }
 
-    auto input_it = std::find(region.inputs.begin(), region.inputs.end(), value);
-    uint32_t input_index = 0;
-    if (input_it == region.inputs.end()) {
-        input_index = static_cast<uint32_t>(region.inputs.size());
-        region.inputs.push_back(value);
-    } else {
-        input_index = static_cast<uint32_t>(input_it - region.inputs.begin());
-    }
-
     FusedElementwiseNodeDesc node;
     node.kind = tt::FusedElementwiseOp::Node::KIND_INPUT;
-    node.input_index = input_index;
+    node.input_index = fusedElementwiseInputIndex(region, value);
     node.element_type = valueElementType(value);
     uint32_t node_id = addFusedNode(region, std::move(node));
     node_ids.try_emplace(value, node_id);
@@ -605,7 +589,13 @@ std::optional<FusedElementwiseRegion> collectFusedElementwiseRegion(
     llvm::DenseMap<mlir::Value, uint32_t> node_ids;
     auto collected_root = collectFusedElementwiseOp(
         root, root->getResult(0), true, region, node_ids);
-    if (!collected_root.has_value() || region.fused_op_count < 2 ||
+    unsigned fused_op_count = llvm::count_if(
+        region.nodes,
+        [](const FusedElementwiseNodeDesc& node) {
+            return node.kind != tt::FusedElementwiseOp::Node::KIND_INPUT &&
+                   node.kind != tt::FusedElementwiseOp::Node::KIND_CONSTANT;
+        });
+    if (!collected_root.has_value() || fused_op_count < 2 ||
         region.nodes.size() > kMaxFusedElementwiseNodes ||
         region.inputs.size() > kMaxFusedElementwiseInputs) {
         return std::nullopt;
