@@ -1660,8 +1660,11 @@ fn execute_binary_eltwise(
     let lhs_input = eltwise_input(values, plan, input_ids[0], input_dtype, &lhs_field)?;
     let rhs_input = eltwise_input(values, plan, input_ids[1], input_dtype, &rhs_field)?;
     let output_name = format!("pjrt_{op_name}");
-    let (inputs, nodes) =
-        fused_binary_eltwise_inputs(op, lhs_input, rhs_input, input_dtype).map_err(io_error)?;
+    let (inputs, nodes) = fused_single_op_inputs(
+        op,
+        &[(lhs_input, input_dtype), (rhs_input, input_dtype)],
+        output_dtype,
+    );
     let output_dram = kernels::fused_eltwise::eltwise(device, &inputs, &nodes, &shape, output_name)
         .map_err(io_error)?;
     store_output_buffer(
@@ -1708,7 +1711,7 @@ fn execute_unary_eltwise(
     let shape = dims_i64_to_usize(&output_dims)?;
     let input = eltwise_input(values, plan, input_id, input_dtype, &input_field)?;
     let output_name = format!("pjrt_{op_name}");
-    let (inputs, nodes) = fused_unary_eltwise_inputs(op, input, input_dtype, output_dtype);
+    let (inputs, nodes) = fused_single_op_inputs(op, &[(input, input_dtype)], output_dtype);
     let output_dram = kernels::fused_eltwise::eltwise(device, &inputs, &nodes, &shape, output_name)
         .map_err(io_error)?;
     store_output_buffer(
@@ -1722,50 +1725,29 @@ fn execute_unary_eltwise(
     )
 }
 
-fn fused_binary_eltwise_inputs<'a>(
+fn fused_single_op_inputs<'a>(
     op: kernels::fused_eltwise::FusedEltwiseOp,
-    lhs: EltwiseInput<'a>,
-    rhs: EltwiseInput<'a>,
-    input_dtype: DType,
-) -> io::Result<(
-    Vec<&'a DramBuffer>,
-    Vec<kernels::fused_eltwise::FusedEltwiseNode>,
-)> {
-    let mut inputs = Vec::new();
-    let lhs = fused_eltwise_input_node(lhs, input_dtype, &mut inputs);
-    let rhs = fused_eltwise_input_node(rhs, input_dtype, &mut inputs);
-    let output_dtype = op.binary_output_dtype(input_dtype)?;
-    let root = kernels::fused_eltwise::FusedEltwiseNode {
-        op,
-        input_nodes: vec![0, 1],
-        input_index: 0,
-        packed_value: 0,
-        dtype: output_dtype,
-        single_tile_broadcast: false,
-    };
-    Ok((inputs, vec![lhs, rhs, root]))
-}
-
-fn fused_unary_eltwise_inputs<'a>(
-    op: kernels::fused_eltwise::FusedEltwiseOp,
-    input: EltwiseInput<'a>,
-    input_dtype: DType,
+    operands: &[(EltwiseInput<'a>, DType)],
     output_dtype: DType,
 ) -> (
     Vec<&'a DramBuffer>,
     Vec<kernels::fused_eltwise::FusedEltwiseNode>,
 ) {
     let mut inputs = Vec::new();
-    let input = fused_eltwise_input_node(input, input_dtype, &mut inputs);
-    let root = kernels::fused_eltwise::FusedEltwiseNode {
+    let mut nodes = operands
+        .iter()
+        .map(|&(input, dtype)| fused_eltwise_input_node(input, dtype, &mut inputs))
+        .collect::<Vec<_>>();
+    let root_node_id = nodes.len() as u32;
+    nodes.push(kernels::fused_eltwise::FusedEltwiseNode {
         op,
-        input_nodes: vec![0],
+        input_nodes: (0..root_node_id).collect(),
         input_index: 0,
         packed_value: 0,
         dtype: output_dtype,
         single_tile_broadcast: false,
-    };
-    (inputs, vec![input, root])
+    });
+    (inputs, nodes)
 }
 
 fn fused_eltwise_input_node<'a>(
