@@ -36,6 +36,32 @@ const WRITER_PARTIAL_VALUES_ADDR_INDEX: usize = 18;
 const WRITER_PARTIAL_INDICES_ADDR_INDEX: usize = 19;
 const MAX_RANK: usize = 8;
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum MatmulEpilogueKind {
+    Store,
+    Top1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatmulEpilogue {
+    Store {
+        output_addr: u32,
+    },
+    Top1 {
+        partial_values_addr: u32,
+        partial_indices_addr: u32,
+    },
+}
+
+impl MatmulEpilogue {
+    fn kind(self) -> MatmulEpilogueKind {
+        match self {
+            Self::Store { .. } => MatmulEpilogueKind::Store,
+            Self::Top1 { .. } => MatmulEpilogueKind::Top1,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct MatmulProgramKey {
     logical_mt: usize,
@@ -48,6 +74,7 @@ struct MatmulProgramKey {
     cores: Arc<[CoreCoord]>,
     math_fidelity: MathFidelity,
     output_dtype: DType,
+    epilogue: MatmulEpilogueKind,
 }
 
 #[repr(u32)]
@@ -151,54 +178,8 @@ impl MatmulPlan {
 struct MatmulBf16Kernel {
     lhs_addr: u32,
     rhs_addr: u32,
-    output_addr: u32,
+    epilogue: MatmulEpilogue,
     key: MatmulProgramKey,
-}
-
-struct MatmulTop1Kernel {
-    lhs_addr: u32,
-    rhs_addr: u32,
-    partial_values_addr: u32,
-    partial_indices_addr: u32,
-    key: MatmulProgramKey,
-}
-
-impl Kernel<MatmulProgramKey> for MatmulTop1Kernel {
-    fn program_key(&self) -> MatmulProgramKey {
-        self.key.clone()
-    }
-
-    fn build_program(&self) -> io::Result<Program> {
-        matmul_top1_program(
-            &self.key,
-            self.key.logical_mt,
-            self.key.logical_nt,
-            self.key.batch_count,
-            &self.key.lhs_view,
-            &self.key.rhs_view,
-            &self.key.output_view,
-            self.key.math_fidelity,
-            self.key.output_dtype,
-        )
-    }
-
-    #[inline]
-    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            READER_LHS_ADDR_INDEX => Some(self.lhs_addr),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_RHS_ADDR_INDEX => Some(self.rhs_addr),
-            WRITER_PARTIAL_VALUES_ADDR_INDEX => Some(self.partial_values_addr),
-            WRITER_PARTIAL_INDICES_ADDR_INDEX => Some(self.partial_indices_addr),
-            _ => None,
-        }
-    }
 }
 
 impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
@@ -207,14 +188,7 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
     }
 
     fn build_program(&self) -> io::Result<Program> {
-        let plan = plan_matmul(
-            self.key.logical_mt * 32,
-            self.key.logical_kt * 32,
-            self.key.logical_nt * 32,
-            self.key.batch_count,
-            &self.key.cores,
-            self.key.output_view.kind == MatmulViewKind::Contiguous,
-        )?;
+        let plan = plan_for_key(&self.key)?;
         log_matmul_plan(&plan);
         bf16_program(
             &plan,
@@ -226,6 +200,7 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
             &self.key.output_view,
             self.key.math_fidelity,
             self.key.output_dtype,
+            self.key.epilogue,
         )
     }
 
@@ -239,10 +214,22 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
 
     #[inline]
     fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_RHS_ADDR_INDEX => Some(self.rhs_addr),
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
+        debug_assert_eq!(self.key.epilogue, self.epilogue.kind());
+        match self.epilogue {
+            MatmulEpilogue::Store { output_addr } => match index {
+                WRITER_RHS_ADDR_INDEX => Some(self.rhs_addr),
+                WRITER_OUTPUT_ADDR_INDEX => Some(output_addr),
+                _ => None,
+            },
+            MatmulEpilogue::Top1 {
+                partial_values_addr,
+                partial_indices_addr,
+            } => match index {
+                WRITER_RHS_ADDR_INDEX => Some(self.rhs_addr),
+                WRITER_PARTIAL_VALUES_ADDR_INDEX => Some(partial_values_addr),
+                WRITER_PARTIAL_INDICES_ADDR_INDEX => Some(partial_indices_addr),
+                _ => None,
+            },
         }
     }
 }
@@ -305,11 +292,14 @@ pub(crate) fn matmul_bf16_dot_general(
         cores,
         math_fidelity,
         output_dtype,
+        epilogue: MatmulEpilogueKind::Store,
     };
     let kernel = MatmulBf16Kernel {
         lhs_addr: u32_arg(lhs.addr, "lhs address")?,
         rhs_addr: u32_arg(rhs.addr, "rhs address")?,
-        output_addr: u32_arg(output.addr, "output address")?,
+        epilogue: MatmulEpilogue::Store {
+            output_addr: u32_arg(output.addr, "output address")?,
+        },
         key,
     };
     kernel.run(device)?;
@@ -359,10 +349,23 @@ pub(crate) fn matmul_top1_bf16_dot_general(
     let logical_nt = ceil32(shape.n) / 32;
     let math_fidelity = matmul_math_fidelity()?;
     let cores = device.cores_arc();
-    let plan = plan_matmul_top1(shape.k, shape.n, &cores)?;
+    let name = name.into();
+    let key = MatmulProgramKey {
+        logical_mt,
+        logical_kt,
+        logical_nt,
+        batch_count: shape.batch_count,
+        lhs_view: shape.lhs_view,
+        rhs_view: shape.rhs_view,
+        output_view: shape.output_view,
+        cores,
+        math_fidelity,
+        output_dtype: DType::Float16B,
+        epilogue: MatmulEpilogueKind::Top1,
+    };
+    let plan = plan_for_key(&key)?;
     let partial_count = plan_grid(&plan).iter().map(Vec::len).sum::<usize>();
     let partial_shape = [partial_count * 32, 32];
-    let name = name.into();
     let partial_values = device.alloc(
         partial_count,
         DType::Float16B,
@@ -375,23 +378,13 @@ pub(crate) fn matmul_top1_bf16_dot_general(
         &partial_shape,
         format!("{name}_partial_indices"),
     )?;
-    let key = MatmulProgramKey {
-        logical_mt,
-        logical_kt,
-        logical_nt,
-        batch_count: shape.batch_count,
-        lhs_view: shape.lhs_view,
-        rhs_view: shape.rhs_view,
-        output_view: shape.output_view,
-        cores,
-        math_fidelity,
-        output_dtype: DType::Float16B,
-    };
-    let kernel = MatmulTop1Kernel {
+    let kernel = MatmulBf16Kernel {
         lhs_addr: u32_arg(lhs.addr, "lhs address")?,
         rhs_addr: u32_arg(rhs.addr, "rhs address")?,
-        partial_values_addr: u32_arg(partial_values.addr, "partial values address")?,
-        partial_indices_addr: u32_arg(partial_indices.addr, "partial indices address")?,
+        epilogue: MatmulEpilogue::Top1 {
+            partial_values_addr: u32_arg(partial_values.addr, "partial values address")?,
+            partial_indices_addr: u32_arg(partial_indices.addr, "partial indices address")?,
+        },
         key,
     };
     log("matmul_top1: running partial matmul".to_owned());
@@ -735,6 +728,27 @@ fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::
     Ok(())
 }
 
+fn plan_for_key(key: &MatmulProgramKey) -> io::Result<MatmulPlan> {
+    match key.epilogue {
+        MatmulEpilogueKind::Store => plan_matmul(
+            key.logical_mt * 32,
+            key.logical_kt * 32,
+            key.logical_nt * 32,
+            key.batch_count,
+            &key.cores,
+            key.output_view.kind == MatmulViewKind::Contiguous,
+        ),
+        MatmulEpilogueKind::Top1 => plan_matmul(
+            32,
+            key.logical_kt * 32,
+            key.output_view.logical_cols as usize,
+            1,
+            &key.cores,
+            true,
+        ),
+    }
+}
+
 fn plan_matmul(
     m: usize,
     k: usize,
@@ -904,42 +918,6 @@ fn plan_matmul(
     }
 
     Ok(plan)
-}
-
-fn plan_matmul_top1(k: usize, n: usize, cores: &[CoreCoord]) -> io::Result<MatmulPlan> {
-    let kt = ceil32(k) / 32;
-    let nt = (ceil32(n) / 32).max(1);
-    let tile_bytes = DType::Float16B.tile_size();
-    let l1_data_bytes = TensixL1::SIZE as usize - TensixL1::DATA_BUFFER_SPACE_BASE as usize;
-
-    let mut ordered = cores.to_vec();
-    ordered.sort_unstable();
-    ordered.dedup();
-    if ordered.is_empty() {
-        return Err(invalid_input("no worker cores are available"));
-    }
-
-    let kt_divs = divisors(kt);
-    plan_direct_matmul(
-        1,
-        kt,
-        nt,
-        &ordered,
-        &kt_divs,
-        tile_bytes,
-        l1_data_bytes,
-        1,
-        true,
-        1,
-        1,
-        None,
-    )
-    .ok_or_else(|| {
-        invalid_input(format!(
-            "no valid matmul_top1 plan for K={k} N={n} on {} cores",
-            ordered.len()
-        ))
-    })
 }
 
 fn plan_direct_matmul(
@@ -1132,8 +1110,9 @@ fn bf16_program(
     output_view: &MatmulOperandView,
     math_fidelity: MathFidelity,
     output_dtype: DType,
+    epilogue: MatmulEpilogueKind,
 ) -> io::Result<Program> {
-    let cbs = vec![
+    let mut cbs = vec![
         CBConfig {
             index: 0,
             dtype: DType::Float16B,
@@ -1170,6 +1149,13 @@ fn bf16_program(
             tiles: plan.out_block_num_tiles(),
         },
     ];
+    if epilogue == MatmulEpilogueKind::Top1 {
+        cbs.push(CBConfig {
+            index: 17,
+            dtype: DType::Int32,
+            tiles: 1,
+        });
+    }
     let runtime_args = lower_runtime_args(
         plan,
         logical_mt,
@@ -1178,111 +1164,27 @@ fn bf16_program(
         lhs_view,
         rhs_view,
         output_view,
+        epilogue,
     )?;
+    let top1_epilogue = epilogue == MatmulEpilogueKind::Top1;
     Ok(Program {
         reader_kernel: BF16_READER_SENDER.to_owned(),
-        writer_kernel: BF16_WRITER_SENDER.to_owned(),
+        writer_kernel: if top1_epilogue {
+            BF16_MATMUL_TOP1_WRITER.to_owned()
+        } else {
+            BF16_WRITER_SENDER.to_owned()
+        },
         compute_kernel: compute_src(plan, plan.batches_per_group),
         reader_recv_kernel: BF16_READER_RECV.to_owned(),
-        writer_recv_kernel: BF16_WRITER_RECV.to_owned(),
+        writer_recv_kernel: if top1_epilogue {
+            BF16_MATMUL_TOP1_WRITER.to_owned()
+        } else {
+            BF16_WRITER_RECV.to_owned()
+        },
         name: format!(
-            "matmul_bf16_{:?}_{}x{}x{}",
+            "matmul{}_bf16_{:?}_{}x{}x{}",
+            if top1_epilogue { "_top1" } else { "" },
             output_dtype,
-            plan.mt * 32,
-            plan.kt * 32,
-            plan.nt * 32
-        ),
-        compile: CompileConfig {
-            cbs,
-            math_fidelity,
-            dst_accum_mode: true,
-            dst_full_sync: true,
-            ..CompileConfig::default()
-        },
-        grid: plan
-            .direct_grid
-            .is_none()
-            .then(|| (plan.rows.clone(), plan.cols.clone())),
-        ..Program::new(runtime_args)
-    })
-}
-
-fn matmul_top1_program(
-    key: &MatmulProgramKey,
-    logical_mt: usize,
-    logical_nt: usize,
-    batch_count: usize,
-    lhs_view: &MatmulOperandView,
-    rhs_view: &MatmulOperandView,
-    output_view: &MatmulOperandView,
-    math_fidelity: MathFidelity,
-    output_dtype: DType,
-) -> io::Result<Program> {
-    let plan = plan_matmul_top1(
-        key.logical_kt * 32,
-        output_view.logical_cols as usize,
-        &key.cores,
-    )?;
-    log_matmul_plan(&plan);
-    let cbs = vec![
-        CBConfig {
-            index: 0,
-            dtype: DType::Float16B,
-            tiles: plan.cb0_pages(),
-        },
-        CBConfig {
-            index: 1,
-            dtype: DType::Float16B,
-            tiles: plan.cb1_pages(),
-        },
-        CBConfig {
-            index: 2,
-            dtype: DType::Float16B,
-            tiles: 1,
-        },
-        CBConfig {
-            index: 3,
-            dtype: DType::Float16B,
-            tiles: 1,
-        },
-        CBConfig {
-            index: 4,
-            dtype: output_dtype,
-            tiles: 1,
-        },
-        CBConfig {
-            index: 16,
-            dtype: output_dtype,
-            tiles: plan.out_block_num_tiles(),
-        },
-        CBConfig {
-            index: 17,
-            dtype: DType::Int32,
-            tiles: 1,
-        },
-        CBConfig {
-            index: 24,
-            dtype: output_dtype,
-            tiles: plan.out_block_num_tiles(),
-        },
-    ];
-    let runtime_args = lower_matmul_top1_runtime_args(
-        &plan,
-        logical_mt,
-        logical_nt,
-        batch_count,
-        lhs_view,
-        rhs_view,
-        output_view,
-    )?;
-    Ok(Program {
-        reader_kernel: BF16_READER_SENDER.to_owned(),
-        writer_kernel: BF16_MATMUL_TOP1_WRITER.to_owned(),
-        compute_kernel: compute_src(&plan, plan.batches_per_group),
-        reader_recv_kernel: BF16_READER_RECV.to_owned(),
-        writer_recv_kernel: BF16_MATMUL_TOP1_WRITER.to_owned(),
-        name: format!(
-            "matmul_top1_bf16_{}x{}x{}",
             plan.mt * 32,
             plan.kt * 32,
             plan.nt * 32
@@ -1310,15 +1212,25 @@ fn lower_runtime_args(
     lhs_view: &MatmulOperandView,
     rhs_view: &MatmulOperandView,
     output_view: &MatmulOperandView,
+    epilogue: MatmulEpilogueKind,
 ) -> io::Result<RuntimeArgs> {
     let grid = plan_grid(plan);
+    let writer_dynamic_indices = match epilogue {
+        MatmulEpilogueKind::Store => vec![WRITER_RHS_ADDR_INDEX, WRITER_OUTPUT_ADDR_INDEX],
+        MatmulEpilogueKind::Top1 => vec![
+            WRITER_RHS_ADDR_INDEX,
+            WRITER_PARTIAL_VALUES_ADDR_INDEX,
+            WRITER_PARTIAL_INDICES_ADDR_INDEX,
+        ],
+    };
     let mut runtime_args = RuntimeArgsBuilder::new(
         NUM_SEMAPHORES,
-        vec![WRITER_RHS_ADDR_INDEX, WRITER_OUTPUT_ADDR_INDEX],
+        writer_dynamic_indices,
         vec![READER_LHS_ADDR_INDEX],
         Vec::new(),
     );
     let direct_grid_rows_per_batch = plan.direct_grid_rows_per_batch();
+    let mut partial_tile_id = 0usize;
     for (flat_row_index, row) in grid.iter().enumerate() {
         let (batch_group, row_index) = if let Some(rows_per_batch) = direct_grid_rows_per_batch {
             (
@@ -1341,6 +1253,10 @@ fn lower_runtime_args(
                 batch_count,
                 lhs_view,
             )?;
+            let writer_epilogue = match epilogue {
+                MatmulEpilogueKind::Store => WriterEpilogue::Store,
+                MatmulEpilogueKind::Top1 => WriterEpilogue::Top1 { partial_tile_id },
+            };
             let writer = writer_args(
                 plan,
                 &grid,
@@ -1354,75 +1270,12 @@ fn lower_runtime_args(
                 batch_count,
                 rhs_view,
                 output_view,
+                writer_epilogue,
             )?;
             runtime_args.add_core(core, writer, reader, Vec::new())?;
-        }
-    }
-    runtime_args.build()
-}
-
-fn lower_matmul_top1_runtime_args(
-    plan: &MatmulPlan,
-    logical_mt: usize,
-    logical_nt: usize,
-    _batch_count: usize,
-    lhs_view: &MatmulOperandView,
-    rhs_view: &MatmulOperandView,
-    output_view: &MatmulOperandView,
-) -> io::Result<RuntimeArgs> {
-    let grid = plan_grid(plan);
-    let mut runtime_args = RuntimeArgsBuilder::new(
-        NUM_SEMAPHORES,
-        vec![
-            WRITER_RHS_ADDR_INDEX,
-            WRITER_PARTIAL_VALUES_ADDR_INDEX,
-            WRITER_PARTIAL_INDICES_ADDR_INDEX,
-        ],
-        vec![READER_LHS_ADDR_INDEX],
-        Vec::new(),
-    );
-    let direct_grid_rows_per_batch = plan.direct_grid_rows_per_batch();
-    let mut partial_tile_id = 0usize;
-    let total_wave_count = plan.batches_per_group;
-    for (flat_row_index, row) in grid.iter().enumerate() {
-        let (batch_group, row_index) = if let Some(rows_per_batch) = direct_grid_rows_per_batch {
-            (
-                flat_row_index / rows_per_batch,
-                flat_row_index % rows_per_batch,
-            )
-        } else {
-            (0, flat_row_index)
-        };
-        let batch_start = batch_group * plan.batches_per_group;
-        for (col_index, &core) in row.iter().enumerate() {
-            let reader = reader_args(
-                plan,
-                &grid,
-                row_index,
-                core,
-                logical_mt,
-                plan.batches_per_group,
-                batch_start,
-                total_wave_count,
-                lhs_view,
-            )?;
-            let writer = matmul_top1_writer_args(
-                plan,
-                &grid,
-                row_index,
-                col_index,
-                core,
-                logical_mt,
-                logical_nt,
-                plan.batches_per_group,
-                batch_start,
-                total_wave_count,
-                partial_tile_id,
-                rhs_view,
-                output_view,
-            )?;
-            runtime_args.add_core(core, writer, reader, Vec::new())?;
-            partial_tile_id += 1;
+            if epilogue == MatmulEpilogueKind::Top1 {
+                partial_tile_id += 1;
+            }
         }
     }
     runtime_args.build()
@@ -1538,6 +1391,12 @@ fn reader_args(
     Ok(args)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriterEpilogue {
+    Store,
+    Top1 { partial_tile_id: usize },
+}
+
 fn writer_args(
     plan: &MatmulPlan,
     grid: &[Vec<CoreCoord>],
@@ -1551,6 +1410,7 @@ fn writer_args(
     total_batch_count: usize,
     rhs_view: &MatmulOperandView,
     output_view: &MatmulOperandView,
+    epilogue: WriterEpilogue,
 ) -> io::Result<Vec<u32>> {
     let mcast = if plan.direct_grid.is_some() || plan.rows.len() <= 1 {
         [0, 0, 0, 0, 0]
@@ -1585,12 +1445,11 @@ fn writer_args(
     for value in mcast {
         args.push(value);
     }
+    args.extend([sender.x as u32, sender.y as u32, 2, 3, 0]);
+    if let WriterEpilogue::Top1 { .. } = epilogue {
+        args.push(0);
+    }
     args.extend([
-        sender.x as u32,
-        sender.y as u32,
-        2,
-        3,
-        0,
         u32_value(out_start, "output tile offset")?,
         1,
         u32_value(plan.nt, "output row stride")?,
@@ -1604,86 +1463,11 @@ fn writer_args(
         u32_value(logical_mt, "logical M tiles")?,
         u32_value(logical_nt, "logical N tiles")?,
         0,
-        u32_value(local_batch_count, "local batch count")?,
-        u32_value(batch_start, "batch start")?,
-        u32_value(total_batch_count, "total batch count")?,
-        u32_value(plan.kt * logical_nt, "rhs batch stride")?,
-        u32_value(logical_mt * logical_nt, "output batch stride")?,
     ]);
-    append_view_args(&mut args, rhs_view);
-    append_view_args(&mut args, output_view);
-    Ok(args)
-}
-
-fn matmul_top1_writer_args(
-    plan: &MatmulPlan,
-    grid: &[Vec<CoreCoord>],
-    row_index: usize,
-    col_index: usize,
-    core: CoreCoord,
-    logical_mt: usize,
-    logical_nt: usize,
-    local_batch_count: usize,
-    batch_start: usize,
-    total_batch_count: usize,
-    partial_tile_id: usize,
-    rhs_view: &MatmulOperandView,
-    output_view: &MatmulOperandView,
-) -> io::Result<Vec<u32>> {
-    let mcast = if plan.direct_grid.is_some() || plan.rows.len() <= 1 {
-        [0, 0, 0, 0, 0]
-    } else {
-        let recv_ys = &plan.rows[1..];
-        [
-            core.x as u32,
-            *recv_ys.last().expect("recv_ys is non-empty") as u32,
-            core.x as u32,
-            recv_ys[0] as u32,
-            recv_ys.len() as u32,
-        ]
-    };
-    let sender = if plan.direct_grid.is_some() {
-        core
-    } else {
-        grid[0][col_index]
-    };
-    let column_start = col_index * plan.per_core_n;
-    let out_start = row_index * plan.per_core_m * plan.nt + col_index * plan.per_core_n;
-    let mut args = vec![
-        0,
-        u32_value(column_start, "rhs block offset")?,
-        1,
-        u32_value(logical_nt, "rhs row stride")?,
-        u32_value(plan.in0_block_w * logical_nt, "rhs block advance")?,
-        u32_value(plan.per_core_n, "rhs block width")?,
-        u32_value(plan.in0_block_w, "rhs block height")?,
-        u32_value(plan.in1_block_num_tiles(), "rhs block tiles")?,
-        u32_value(plan.num_blocks(), "num blocks")?,
-    ];
-    for value in mcast {
-        args.push(value);
+    if let WriterEpilogue::Top1 { partial_tile_id } = epilogue {
+        args.push(u32_value(partial_tile_id, "partial tile id")?);
     }
     args.extend([
-        sender.x as u32,
-        sender.y as u32,
-        2,
-        3,
-        0,
-        0,
-        u32_value(out_start, "output tile offset")?,
-        1,
-        u32_value(plan.nt, "output row stride")?,
-        u32_value(plan.out_subblock_w, "output next subblock w")?,
-        u32_value(plan.out_subblock_h * plan.nt, "output next subblock h")?,
-        u32_value(plan.out_subblock_w, "output subblock width")?,
-        u32_value(plan.out_subblock_h, "output subblock height")?,
-        u32_value(plan.out_subblock_num_tiles(), "output subblock tiles")?,
-        u32_value(plan.in1_num_subblocks(), "output num subblocks w")?,
-        u32_value(plan.in0_num_subblocks(), "output num subblocks h")?,
-        u32_value(logical_mt, "logical M tiles")?,
-        u32_value(logical_nt, "logical N tiles")?,
-        0,
-        u32_value(partial_tile_id, "partial tile id")?,
         u32_value(local_batch_count, "local batch count")?,
         u32_value(batch_start, "batch start")?,
         u32_value(total_batch_count, "total batch count")?,
