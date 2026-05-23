@@ -19,7 +19,6 @@ jax.config.update("jax_use_shardy_partitioner", False)
 import jax.numpy as jnp
 
 USE_TT_ROPE_DECODE = False
-USE_TT_SWIGLU = False
 
 
 @dataclass(frozen=True)
@@ -374,11 +373,6 @@ def silu(x):
 
 
 def swiglu(gate, up):
-    if USE_TT_SWIGLU and gate.dtype == jnp.bfloat16 and up.dtype == jnp.bfloat16:
-        return jax.ffi.ffi_call(
-            "tt.swiglu",
-            jax.ShapeDtypeStruct(gate.shape, gate.dtype),
-        )(gate, up)
     return silu(gate) * up
 
 
@@ -525,7 +519,7 @@ def timed_generate(config, weights, device, input_ids, args, decode_step):
 
 
 def main():
-    global USE_TT_ROPE_DECODE, USE_TT_SWIGLU
+    global USE_TT_ROPE_DECODE
 
     args = parse_args()
     if args.max_new_tokens < 0:
@@ -533,7 +527,6 @@ def main():
 
     np_dtype = ml_dtypes.bfloat16 if args.dtype == "bf16" else np.float32
     USE_TT_ROPE_DECODE = args.backend == "tt" and args.dtype == "bf16"
-    USE_TT_SWIGLU = args.backend == "tt" and args.dtype == "bf16"
 
     if args.random_weights:
         config = make_random_config(args)

@@ -2505,85 +2505,6 @@ fn execute_rope_decode_custom_call(
     )
 }
 
-fn execute_swiglu_custom_call(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    device: &mut Device,
-    context: &OutputContext,
-    input_ids: &[u32],
-    output_id: u32,
-    call_target_name: &str,
-) -> Result<(), *mut PJRT_Error> {
-    let [gate_id, up_id] = input_ids else {
-        return Err(invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} expected two inputs, got {}",
-            input_ids.len()
-        )));
-    };
-    let gate_desc = plan.values.get(*gate_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} gate id {gate_id} is out of bounds"
-        ))
-    })?;
-    let up_desc = plan.values.get(*up_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} up id {up_id} is out of bounds"
-        ))
-    })?;
-    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} output id {output_id} is out of bounds"
-        ))
-    })?;
-    if gate_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || up_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-    {
-        return Err(unimplemented(format!(
-            "TT executable custom_call {call_target_name:?} currently requires bf16 inputs and output"
-        )));
-    }
-    if gate_desc.dims != up_desc.dims || output_desc.dims != gate_desc.dims {
-        return Err(invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} requires matching input/output shapes, got gate {:?}, up {:?}, output {:?}",
-            gate_desc.dims, up_desc.dims, output_desc.dims
-        )));
-    }
-    let shape = dims_i64_to_usize(&gate_desc.dims)?;
-    let gate = device_buffer_for_value(
-        values,
-        *gate_id,
-        &format!("custom_call {call_target_name:?}.gate"),
-    )?;
-    let up = device_buffer_for_value(
-        values,
-        *up_id,
-        &format!("custom_call {call_target_name:?}.up"),
-    )?;
-    let Some(gate_dram) = gate.dram_buffer.as_ref() else {
-        return Err(failed_precondition(format!(
-            "TT executable custom_call {call_target_name:?} gate buffer has no device allocation"
-        )));
-    };
-    let Some(up_dram) = up.dram_buffer.as_ref() else {
-        return Err(failed_precondition(format!(
-            "TT executable custom_call {call_target_name:?} up buffer has no device allocation"
-        )));
-    };
-    let output_dims = output_desc.dims.clone();
-    let output_dram = kernels::swiglu::swiglu(device, gate_dram, up_dram, &shape, "pjrt_swiglu")
-        .map_err(io_error)?;
-    store_output_buffer(
-        values,
-        plan,
-        output_id,
-        output_dims,
-        output_dram,
-        context,
-        call_target_name,
-    )
-}
-
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -3279,22 +3200,6 @@ fn execute_executable_v1(
                 ..
             } if call_target_name == "tt.rope_decode" => {
                 execute_rope_decode_custom_call(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    input_ids,
-                    *output_id,
-                    call_target_name,
-                )?;
-            }
-            executable::Op::CustomCall {
-                input_ids,
-                output_id,
-                call_target_name,
-                ..
-            } if call_target_name == "tt.swiglu" => {
-                execute_swiglu_custom_call(
                     &mut values,
                     plan,
                     device,
@@ -5187,6 +5092,56 @@ mod tests {
                 assert_eq!(executable.ops.len(), 4);
                 assert_eq!(executable.output_ids, vec![3]);
                 assert_fused_add_chain(&executable.ops[3]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_silu_product_as_fused_elementwise() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func @main(%arg0: tensor<2x2xbf16>, %arg1: tensor<2x2xbf16>) -> tensor<2x2xbf16> {
+    %cst = stablehlo.constant dense<1.000000e+00> : tensor<bf16>
+    %0 = stablehlo.negate %arg0 : tensor<2x2xbf16>
+    %1 = stablehlo.exponential %0 : tensor<2x2xbf16>
+    %2 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<bf16>) -> tensor<2x2xbf16>
+    %3 = stablehlo.add %1, %2 : tensor<2x2xbf16>
+    %4 = stablehlo.divide %arg0, %3 : tensor<2x2xbf16>
+    %5 = stablehlo.multiply %4, %arg1 : tensor<2x2xbf16>
+    return %5 : tensor<2x2xbf16>
+  }
+}
+"#,
+            |executable| {
+                let fused = executable.ops.iter().find_map(|op| {
+                    if let executable::Op::FusedElementwise {
+                        input_ids,
+                        output_id,
+                        nodes,
+                        root_node_id,
+                    } = op
+                    {
+                        Some((input_ids, output_id, nodes, root_node_id))
+                    } else {
+                        None
+                    }
+                });
+                let Some((input_ids, output_id, nodes, root_node_id)) = fused else {
+                    panic!("expected fused elementwise op");
+                };
+                assert_eq!(input_ids, &[0, 1]);
+                assert_eq!(*output_id, executable.output_ids[0]);
+                assert_eq!(*root_node_id, 8);
+                assert_eq!(nodes.len(), 9);
+                assert_eq!(nodes[8].kind, executable::FusedElementwiseKind::Multiply);
+
+                let input_indices = nodes
+                    .iter()
+                    .filter(|node| node.kind == executable::FusedElementwiseKind::Input)
+                    .map(|node| node.input_index)
+                    .collect::<Vec<_>>();
+                assert_eq!(input_indices, vec![0, 0, 1]);
             },
         );
     }

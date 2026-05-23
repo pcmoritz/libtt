@@ -340,7 +340,7 @@ bool addTopKOp(
     return true;
 }
 
-constexpr unsigned kMaxFusedElementwiseNodes = 8;
+constexpr unsigned kMaxFusedElementwiseNodes = 16;
 constexpr unsigned kMaxFusedElementwiseInputs = 8;
 
 // Fused elementwise lowering is intentionally conservative: it only folds
@@ -505,7 +505,15 @@ std::optional<uint32_t> collectFusedElementwiseValue(
     llvm::DenseMap<mlir::Value, uint32_t>& node_ids) {
     auto existing = node_ids.find(value);
     if (existing != node_ids.end()) {
-        return existing->second;
+        auto kind = region.nodes[existing->second].kind;
+        if (kind != tt::FusedElementwiseOp::Node::KIND_INPUT &&
+            kind != tt::FusedElementwiseOp::Node::KIND_CONSTANT) {
+            return existing->second;
+        }
+        // Leaf values may be used by both an in-place unary chain and a later
+        // binary op, e.g. silu(x) = x / (1 + exp(-x)). Model each occurrence
+        // as a separate leaf node so the compute kernel can mutate each leaf
+        // locally without corrupting the other occurrence.
     }
 
     std::string ignored;

@@ -8,8 +8,7 @@ use std::io;
 
 const WRITER: &str = include_str!("../../kernels/binary_eltwise_writer.cc");
 const MAX_FUSED_INPUTS: usize = 8;
-const MAX_FUSED_NODES: usize = 8;
-const MAX_DST_SLOTS: u32 = 8;
+const MAX_FUSED_NODES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum FusedEltwiseOp {
@@ -329,9 +328,13 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     }
     let runtime_args = runtime_args.build()?;
 
-    let mut cbs = Vec::with_capacity(input_count + 1);
+    let (_, intermediate_cbs) = cb_plan(&key.nodes, key.root_node_id)?;
+    let mut cbs = Vec::with_capacity(input_count + intermediate_cbs.len() + 1);
     for (index, &dtype) in key.input_dtypes.iter().enumerate() {
         cbs.push(CBConfig::new(index, dtype));
+    }
+    for (cb, dtype) in intermediate_cbs {
+        cbs.push(CBConfig::new(cb as usize, dtype));
     }
     cbs.push(CBConfig::new(16, key.output_dtype));
 
@@ -339,6 +342,7 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
         .input_dtypes
         .iter()
         .chain(std::iter::once(&key.output_dtype))
+        .chain(key.nodes.iter().map(|node| &node.dtype))
         .any(|dtype| matches!(dtype, DType::Float32 | DType::Int32 | DType::UInt32));
 
     Ok(Program {
@@ -470,40 +474,22 @@ fn compute_source(key: &FusedEltwiseProgramKey) -> io::Result<String> {
            FUSED_TYPECAST_INITS\n\
          \n\
            for (uint32_t i = 0; i < n_tiles; ++i) {{\n\
-         FUSED_WAITS\
-             cb_reserve_back(cb_out, 1);\n\
-         \n\
-             tile_regs_acquire();\n\
          FUSED_STEPS\
-             tile_regs_commit();\n\
-         \n\
-             tile_regs_wait();\n\
-             pack_tile(FUSED_ROOT_SLOT, cb_out);\n\
-             tile_regs_release();\n\
-         \n\
-         FUSED_POPS\
-             cb_push_back(cb_out, 1);\n\
            }}\n\
          }}\n\
          }}  // namespace NAMESPACE\n"
     )
     .replace("FUSED_TYPECAST_INITS", &steps.typecast_inits)
-    .replace("FUSED_WAITS", &steps.waits)
-    .replace("FUSED_STEPS", &steps.body)
-    .replace("FUSED_ROOT_SLOT", &steps.root_slot.to_string())
-    .replace("FUSED_POPS", &steps.pops))
+    .replace("FUSED_STEPS", &steps.body))
 }
 
 struct ComputeSteps {
-    waits: String,
-    pops: String,
     body: String,
     typecast_inits: String,
-    root_slot: u32,
 }
 
 fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<ComputeSteps> {
-    let mut use_counts = vec![0u32; nodes.len()];
+    let mut remaining_uses = vec![0u32; nodes.len()];
     for node in nodes {
         for &input_node in &node.input_nodes {
             let index = usize::try_from(input_node)
@@ -513,70 +499,61 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                     "node id out of bounds: {input_node}"
                 )));
             }
-            use_counts[index] += 1;
+            remaining_uses[index] += 1;
         }
     }
 
-    let mut slots = vec![None; nodes.len()];
-    let mut leaf_count = 0u32;
-    let mut waits = String::new();
-    let mut pops = String::new();
+    let (node_cbs, _) = cb_plan(nodes, root_node_id)?;
     let mut body = String::new();
     let mut typecast_inits = String::new();
-    let mut next_slot = 0u32;
 
     for (index, node) in nodes.iter().enumerate() {
         match node.op {
-            FusedEltwiseOp::Input => {
-                let cb = leaf_count;
-                leaf_count += 1;
-                next_slot = next_slot.max(cb + 1);
-                if leaf_count > MAX_DST_SLOTS {
-                    return Err(invalid_input(format!(
-                        "fused eltwise needs {leaf_count} leaf dst slots, max is {MAX_DST_SLOTS}"
-                    )));
-                }
-                slots[index] = Some(cb);
-                waits.push_str(&format!("    cb_wait_front(tt::CBIndex::c_{cb}, 1);\n"));
-                pops.push_str(&format!("    cb_pop_front(tt::CBIndex::c_{cb}, 1);\n"));
-                body.push_str(&format!(
-                    "    copy_tile_to_dst_init_short(tt::CBIndex::c_{cb});\n    copy_tile(tt::CBIndex::c_{cb}, 0, {cb});\n"
-                ));
-            }
-            FusedEltwiseOp::Constant => {}
+            FusedEltwiseOp::Input | FusedEltwiseOp::Constant => {}
             FusedEltwiseOp::Negate
             | FusedEltwiseOp::Exponential
             | FusedEltwiseOp::Rsqrt
             | FusedEltwiseOp::Convert => {
                 let input = node.input_nodes[0] as usize;
-                if use_counts[input] != 1 {
-                    return Err(invalid_input(format!(
-                        "fused eltwise unary node {index} cannot overwrite shared input node {input}"
-                    )));
-                }
-                let slot = slots[input].ok_or_else(|| {
-                    invalid_input(format!("input slot for node {input} is not available"))
-                })?;
-                slots[index] = Some(slot);
+                let input_cb = cb_for_node(&node_cbs, input)?;
+                let output_cb = cb_for_node(&node_cbs, index)?;
+                append_waits(&mut body, &[input_cb]);
+                let init = match node.op {
+                    FusedEltwiseOp::Negate => "negative_tile_init();",
+                    FusedEltwiseOp::Exponential => "exp_tile_init();",
+                    FusedEltwiseOp::Rsqrt => "rsqrt_tile_init();",
+                    FusedEltwiseOp::Convert => "",
+                    _ => unreachable!(),
+                };
+                body.push_str(&format!(
+                    "    {init}\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{input_cb});\n    copy_tile(tt::CBIndex::c_{input_cb}, 0, 0);\n"
+                ));
                 match node.op {
                     FusedEltwiseOp::Negate => {
-                        body.push_str(&format!("    negative_tile({slot});\n"));
+                        body.push_str("    negative_tile(0);\n");
                     }
                     FusedEltwiseOp::Exponential => {
-                        body.push_str(&format!("    exp_tile({slot});\n"));
+                        body.push_str("    exp_tile(0);\n");
                     }
                     FusedEltwiseOp::Rsqrt => {
-                        body.push_str(&format!("    rsqrt_tile({slot});\n"));
+                        body.push_str("    rsqrt_tile(0);\n");
                     }
                     FusedEltwiseOp::Convert => {
                         let from = nodes[input].dtype as u32;
                         let to = node.dtype as u32;
                         typecast_inits
                             .push_str(&format!("typecast_tile_init<{from}, {to}>();\n           "));
-                        body.push_str(&format!("    typecast_tile<{from}, {to}>({slot});\n"));
+                        body.push_str(&format!("    typecast_tile<{from}, {to}>(0);\n"));
                     }
                     _ => unreachable!(),
                 }
+                append_pack_and_pop(
+                    &mut body,
+                    output_cb,
+                    &[input],
+                    &node_cbs,
+                    &mut remaining_uses,
+                )?;
             }
             FusedEltwiseOp::Add
             | FusedEltwiseOp::Subtract
@@ -588,41 +565,24 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                 if let Some((value_node, scalar, scalar_op)) =
                     scalar_binary_op(nodes, node.op, lhs, rhs)
                 {
-                    if use_counts[value_node] != 1 {
-                        return Err(invalid_input(format!(
-                            "fused eltwise scalar op node {index} cannot overwrite shared input node {value_node}"
-                        )));
-                    }
-                    let slot = slots[value_node].ok_or_else(|| {
-                        invalid_input(format!(
-                            "scalar input slot for node {value_node} is not available"
-                        ))
-                    })?;
-                    slots[index] = Some(slot);
-                    body.push_str(&format!("    {scalar_op}({slot}, {scalar});\n"));
+                    let value_cb = cb_for_node(&node_cbs, value_node)?;
+                    let output_cb = cb_for_node(&node_cbs, index)?;
+                    append_waits(&mut body, &[value_cb]);
+                    body.push_str(&format!(
+                        "    binop_with_scalar_tile_init();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{value_cb});\n    copy_tile(tt::CBIndex::c_{value_cb}, 0, 0);\n    {scalar_op}(0, {scalar});\n"
+                    ));
+                    append_pack_and_pop(
+                        &mut body,
+                        output_cb,
+                        &[value_node],
+                        &node_cbs,
+                        &mut remaining_uses,
+                    )?;
                     continue;
                 }
-                let lhs_slot = slots[lhs].ok_or_else(|| {
-                    invalid_input(format!("lhs slot for node {lhs} is not available"))
-                })?;
-                let rhs_slot = slots[rhs].ok_or_else(|| {
-                    invalid_input(format!("rhs slot for node {rhs} is not available"))
-                })?;
-                let out_slot = if use_counts[lhs] == 1 {
-                    lhs_slot
-                } else if use_counts[rhs] == 1 {
-                    rhs_slot
-                } else {
-                    let slot = next_slot;
-                    next_slot += 1;
-                    if next_slot > MAX_DST_SLOTS {
-                        return Err(invalid_input(format!(
-                            "fused eltwise needs more than {MAX_DST_SLOTS} dst slots"
-                        )));
-                    }
-                    slot
-                };
-                slots[index] = Some(out_slot);
+                let lhs_cb = cb_for_node(&node_cbs, lhs)?;
+                let rhs_cb = cb_for_node(&node_cbs, rhs)?;
+                let output_cb = cb_for_node(&node_cbs, index)?;
                 let call = match node.op {
                     FusedEltwiseOp::Add => "add_binary_tile",
                     FusedEltwiseOp::Subtract => "sub_binary_tile",
@@ -631,26 +591,126 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
                     FusedEltwiseOp::Max => "binary_max_tile",
                     _ => unreachable!(),
                 };
+                let init = match node.op {
+                    FusedEltwiseOp::Add => "add_binary_tile_init",
+                    FusedEltwiseOp::Subtract => "sub_binary_tile_init",
+                    FusedEltwiseOp::Multiply => "mul_binary_tile_init",
+                    FusedEltwiseOp::Divide => "div_binary_tile_init",
+                    FusedEltwiseOp::Max => "binary_max_tile_init",
+                    _ => unreachable!(),
+                };
+                append_waits(&mut body, &[lhs_cb, rhs_cb]);
                 body.push_str(&format!(
-                    "    {call}({lhs_slot}, {rhs_slot}, {out_slot});\n"
+                    "    {init}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{lhs_cb});\n    copy_tile(tt::CBIndex::c_{lhs_cb}, 0, 0);\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb});\n    copy_tile(tt::CBIndex::c_{rhs_cb}, 0, 1);\n    {call}(0, 1, 0);\n"
                 ));
+                append_pack_and_pop(
+                    &mut body,
+                    output_cb,
+                    &[lhs, rhs],
+                    &node_cbs,
+                    &mut remaining_uses,
+                )?;
             }
         }
     }
 
-    let root_index = root_node_id as usize;
-    let root_slot = slots
-        .get(root_index)
-        .and_then(|slot| *slot)
-        .ok_or_else(|| invalid_input(format!("root node slot is not available: {root_node_id}")))?;
-
     Ok(ComputeSteps {
-        waits,
-        pops,
         body,
         typecast_inits,
-        root_slot,
     })
+}
+
+fn cb_plan(
+    nodes: &[FusedEltwiseNode],
+    root_node_id: u32,
+) -> io::Result<(Vec<Option<u32>>, Vec<(u32, DType)>)> {
+    let mut node_cbs = vec![None; nodes.len()];
+    let mut leaf_count = 0u32;
+    for (index, node) in nodes.iter().enumerate() {
+        if node.op == FusedEltwiseOp::Input {
+            if leaf_count >= 16 {
+                return Err(invalid_input("fused eltwise needs too many input CBs"));
+            }
+            node_cbs[index] = Some(leaf_count);
+            leaf_count += 1;
+        }
+    }
+
+    let root_index = usize::try_from(root_node_id)
+        .map_err(|_| invalid_input(format!("root node id is out of range: {root_node_id}")))?;
+    let mut next_cb = leaf_count;
+    let mut intermediate_cbs = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if matches!(node.op, FusedEltwiseOp::Input | FusedEltwiseOp::Constant) {
+            continue;
+        }
+        if index == root_index {
+            node_cbs[index] = Some(16);
+        } else {
+            if next_cb >= 16 {
+                return Err(invalid_input(
+                    "fused eltwise needs too many intermediate CBs",
+                ));
+            }
+            node_cbs[index] = Some(next_cb);
+            intermediate_cbs.push((next_cb, node.dtype));
+            next_cb += 1;
+        }
+    }
+    Ok((node_cbs, intermediate_cbs))
+}
+
+fn cb_for_node(node_cbs: &[Option<u32>], node: usize) -> io::Result<u32> {
+    node_cbs
+        .get(node)
+        .and_then(|cb| *cb)
+        .ok_or_else(|| invalid_input(format!("node {node} does not have a CB")))
+}
+
+fn append_waits(body: &mut String, cbs: &[u32]) {
+    let mut waited = Vec::new();
+    for &cb in cbs {
+        if waited.contains(&cb) {
+            continue;
+        }
+        waited.push(cb);
+        body.push_str(&format!("    cb_wait_front(tt::CBIndex::c_{cb}, 1);\n"));
+    }
+}
+
+fn append_pack_and_pop(
+    body: &mut String,
+    output_cb: u32,
+    input_nodes: &[usize],
+    node_cbs: &[Option<u32>],
+    remaining_uses: &mut [u32],
+) -> io::Result<()> {
+    body.push_str(&format!(
+        "    tile_regs_commit();\n    tile_regs_wait();\n    pack_tile(0, tt::CBIndex::c_{output_cb});\n    tile_regs_release();\n"
+    ));
+
+    let mut consumed = Vec::<(usize, u32)>::new();
+    for &node in input_nodes {
+        if let Some((_, count)) = consumed.iter_mut().find(|(existing, _)| *existing == node) {
+            *count += 1;
+        } else {
+            consumed.push((node, 1));
+        }
+    }
+    for (node, count) in consumed {
+        remaining_uses[node] = remaining_uses[node]
+            .checked_sub(count)
+            .ok_or_else(|| invalid_input(format!("node {node} use count underflow")))?;
+        if remaining_uses[node] == 0 {
+            if let Some(cb) = node_cbs[node] {
+                body.push_str(&format!("    cb_pop_front(tt::CBIndex::c_{cb}, 1);\n"));
+            }
+        }
+    }
+    body.push_str(&format!(
+        "    cb_push_back(tt::CBIndex::c_{output_cb}, 1);\n"
+    ));
+    Ok(())
 }
 
 fn scalar_binary_op(

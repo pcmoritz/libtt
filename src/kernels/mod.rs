@@ -11,7 +11,6 @@ pub(crate) mod reshape;
 pub(crate) mod rope;
 pub(crate) mod select;
 pub(crate) mod slice;
-pub(crate) mod swiglu;
 pub(crate) mod topk;
 pub(crate) mod transpose;
 pub(crate) mod unary_eltwise;
