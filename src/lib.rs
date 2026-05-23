@@ -5026,6 +5026,41 @@ mod tests {
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
+    fn pjrt_compile_fuses_single_tile_broadcast_elementwise() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func @main(%arg0: tensor<1x32xf32>, %arg1: tensor<1x1xf32>) -> tensor<1x32xf32> {
+    %0 = stablehlo.broadcast_in_dim %arg1, dims = [0, 1] : (tensor<1x1xf32>) -> tensor<1x32xf32>
+    %1 = stablehlo.multiply %arg0, %0 : tensor<1x32xf32>
+    return %1 : tensor<1x32xf32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.values.len(), 3);
+                assert_eq!(executable.output_ids, vec![2]);
+                assert_eq!(executable.ops.len(), 3);
+                let executable::Op::FusedElementwise {
+                    input_ids,
+                    output_id,
+                    nodes,
+                    root_node_id,
+                } = &executable.ops[2]
+                else {
+                    panic!("expected fused elementwise op");
+                };
+                assert_eq!(input_ids, &[0, 1]);
+                assert_eq!(*output_id, 2);
+                assert_eq!(*root_node_id, 2);
+                assert_eq!(nodes.len(), 3);
+                assert!(nodes[1].single_tile_broadcast);
+                assert_eq!(nodes[2].kind, executable::FusedElementwiseKind::Multiply);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
     fn pjrt_compile_lowers_maximum_with_broadcast_constant() {
         with_compiled_mlir_executable(
             r#"module {

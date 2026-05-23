@@ -346,8 +346,9 @@ constexpr unsigned kMaxFusedElementwiseInputs = 8;
 // Fused elementwise lowering is intentionally conservative: it only folds
 // single-use StableHLO elementwise producers into an elementwise root, and it
 // keeps reductions, layout-changing ops, matmuls, and custom calls as
-// boundaries. Non-constant broadcasts are only folded for logical scalar
-// tensors; the runtime reader expands the first element to a full tile.
+// boundaries. Non-constant broadcasts are folded when their source is a
+// single-tile float tensor; the runtime reader expands the first element to a
+// full output tile.
 struct FusedElementwiseNodeDesc {
     tt::FusedElementwiseOp::Node::Kind kind;
     llvm::SmallVector<uint32_t> input_nodes;
@@ -541,7 +542,6 @@ std::optional<uint32_t> collectFusedElementwiseValue(
     if (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
         mlir::Value operand = broadcast_op.getOperand();
         if (broadcast_op->getResult(0).hasOneUse() && isFloatTensor(operand) &&
-            mlir::isa<mlir::BlockArgument>(operand) &&
             sameTensorShape(value, root_value) &&
             valueElementType(operand) == valueElementType(value) &&
             isLogicalScalarTile(operand)) {
@@ -599,7 +599,7 @@ std::optional<FusedElementwiseRegion> collectFusedElementwiseRegion(
     llvm::DenseMap<mlir::Value, uint32_t> node_ids;
     auto root_node_id = collectFusedElementwiseOp(
         root, root->getResult(0), true, region, node_ids);
-    if (!root_node_id.has_value() || region.fused_op_count < 2 ||
+    if (!root_node_id.has_value() || region.covered_ops.size() < 2 ||
         region.nodes.size() > kMaxFusedElementwiseNodes ||
         region.inputs.size() > kMaxFusedElementwiseInputs) {
         return std::nullopt;
