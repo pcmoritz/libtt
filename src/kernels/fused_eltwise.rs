@@ -487,21 +487,10 @@ pub(crate) struct FusedEltwiseNode {
     pub(crate) single_tile_broadcast: bool,
 }
 
-#[derive(Clone, Copy)]
-struct FusedEltwiseRead<'a> {
-    buffer: &'a DramBuffer,
-    dtype: DType,
-    // Logical scalar broadcasts are passed as a one-tile input. The reader
-    // replicates the first element across each output tile before compute.
-    single_tile_broadcast: bool,
-}
-
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct FusedEltwiseProgramKey {
     cores: Vec<CoreCoord>,
     tile_count: u32,
-    input_dtypes: Vec<DType>,
-    input_broadcasts: Vec<bool>,
     output_dtype: DType,
     nodes: Vec<FusedEltwiseNode>,
 }
@@ -554,13 +543,8 @@ pub(crate) fn eltwise(
     let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
 
     let mut input_addrs = Vec::with_capacity(input_reads.len());
-    let mut input_dtypes = Vec::with_capacity(input_reads.len());
-    for (index, input) in input_reads.iter().enumerate() {
-        input_addrs.push(u32_arg(
-            input.buffer.addr,
-            &format!("input[{index}] address"),
-        )?);
-        input_dtypes.push(input.dtype);
+    for (index, &input) in input_reads.iter().enumerate() {
+        input_addrs.push(u32_arg(input.addr, &format!("input[{index}] address"))?);
     }
 
     let kernel = FusedEltwiseKernel {
@@ -569,11 +553,6 @@ pub(crate) fn eltwise(
         key: FusedEltwiseProgramKey {
             cores,
             tile_count,
-            input_dtypes,
-            input_broadcasts: input_reads
-                .iter()
-                .map(|input| input.single_tile_broadcast)
-                .collect(),
             output_dtype,
             nodes: nodes.to_vec(),
         },
@@ -709,7 +688,7 @@ fn validate_fused_eltwise(
 fn input_reads<'a>(
     external_inputs: &[&'a DramBuffer],
     nodes: &[FusedEltwiseNode],
-) -> io::Result<Vec<FusedEltwiseRead<'a>>> {
+) -> io::Result<Vec<&'a DramBuffer>> {
     let mut inputs = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         match node.op {
@@ -723,11 +702,7 @@ fn input_reads<'a>(
                         node.input_index
                     ))
                 })?;
-                inputs.push(FusedEltwiseRead {
-                    buffer: input,
-                    dtype: node.dtype,
-                    single_tile_broadcast: node.single_tile_broadcast,
-                });
+                inputs.push(input);
             }
             FusedEltwiseOp::Constant => {}
             _ => {}
@@ -748,7 +723,8 @@ fn validate_node_inputs(index: usize, node: &FusedEltwiseNode, expected: usize) 
 }
 
 fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
-    let input_count = key.input_dtypes.len();
+    let input_nodes = fused_input_nodes(&key.nodes);
+    let input_count = input_nodes.len();
     let mut reader_dynamic_indices = Vec::with_capacity(input_count);
     reader_dynamic_indices.extend(0..input_count);
 
@@ -764,8 +740,8 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
 
     let (_, intermediate_cbs) = cb_plan(&key.nodes)?;
     let mut cbs = Vec::with_capacity(input_count + intermediate_cbs.len() + 1);
-    for (index, &dtype) in key.input_dtypes.iter().enumerate() {
-        cbs.push(CBConfig::new(index, dtype));
+    for (index, node) in input_nodes.iter().enumerate() {
+        cbs.push(CBConfig::new(index, node.dtype));
     }
     for (cb, dtype) in intermediate_cbs {
         cbs.push(CBConfig::new(cb as usize, dtype));
@@ -773,14 +749,14 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     cbs.push(CBConfig::new(16, key.output_dtype));
 
     let dst_accum_mode = key
-        .input_dtypes
+        .nodes
         .iter()
+        .map(|node| &node.dtype)
         .chain(std::iter::once(&key.output_dtype))
-        .chain(key.nodes.iter().map(|node| &node.dtype))
         .any(|dtype| matches!(dtype, DType::Float32 | DType::Int32 | DType::UInt32));
 
     Ok(Program {
-        reader_kernel: reader_source(&key.input_broadcasts, &key.input_dtypes),
+        reader_kernel: reader_source(&input_nodes),
         compute_kernel: compute_source(&key)?,
         writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
@@ -793,8 +769,15 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     })
 }
 
-fn reader_source(input_broadcasts: &[bool], input_dtypes: &[DType]) -> String {
-    let input_count = input_broadcasts.len();
+fn fused_input_nodes(nodes: &[FusedEltwiseNode]) -> Vec<&FusedEltwiseNode> {
+    nodes
+        .iter()
+        .filter(|node| node.op == FusedEltwiseOp::Input)
+        .collect()
+}
+
+fn reader_source(input_nodes: &[&FusedEltwiseNode]) -> String {
+    let input_count = input_nodes.len();
     let mut arg_loads = String::new();
     let mut addr_gens = String::new();
     let mut reserves = String::new();
@@ -809,7 +792,7 @@ fn reader_source(input_broadcasts: &[bool], input_dtypes: &[DType]) -> String {
             "  constexpr uint32_t cb_input_{index} = tt::CBIndex::c_{index};\n  const InterleavedAddrGenFast<true> input_{index} = {{\n    .bank_base_address = input_addr_{index}, .page_size = get_tile_size(cb_input_{index}), .data_format = get_dataformat(cb_input_{index}),\n  }};\n"
         ));
         reserves.push_str(&format!("    cb_reserve_back(cb_input_{index}, 1);\n"));
-        let tile_id = if input_broadcasts[index] {
+        let tile_id = if input_nodes[index].single_tile_broadcast {
             "0".to_owned()
         } else {
             "offset + i".to_owned()
@@ -820,8 +803,8 @@ fn reader_source(input_broadcasts: &[bool], input_dtypes: &[DType]) -> String {
             )
             .replace("offset + i", &tile_id),
         );
-        if input_broadcasts[index] {
-            let mode = match input_dtypes[index] {
+        if input_nodes[index].single_tile_broadcast {
+            let mode = match input_nodes[index].dtype {
                 DType::Float16 | DType::Float16B | DType::UInt16 => "true",
                 _ => "false",
             };
@@ -1553,8 +1536,6 @@ mod tests {
         FusedEltwiseProgramKey {
             cores: Vec::new(),
             tile_count: 1,
-            input_dtypes: Vec::new(),
-            input_broadcasts: Vec::new(),
             output_dtype: nodes.last().expect("test nodes must not be empty").dtype,
             nodes,
         }
