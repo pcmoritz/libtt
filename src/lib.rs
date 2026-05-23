@@ -1730,7 +1730,7 @@ fn fused_binary_eltwise_inputs<'a>(
     rhs: EltwiseInput<'a>,
     input_dtype: DType,
 ) -> io::Result<(
-    Vec<kernels::fused_eltwise::FusedEltwiseInput<'a>>,
+    Vec<&'a DramBuffer>,
     Vec<kernels::fused_eltwise::FusedEltwiseNode>,
 )> {
     let mut inputs = Vec::new();
@@ -1754,7 +1754,7 @@ fn fused_unary_eltwise_inputs<'a>(
     input_dtype: DType,
     output_dtype: DType,
 ) -> (
-    Vec<kernels::fused_eltwise::FusedEltwiseInput<'a>>,
+    Vec<&'a DramBuffer>,
     Vec<kernels::fused_eltwise::FusedEltwiseNode>,
 ) {
     let mut inputs = Vec::new();
@@ -1773,15 +1773,12 @@ fn fused_unary_eltwise_inputs<'a>(
 fn fused_eltwise_input_node<'a>(
     input: EltwiseInput<'a>,
     dtype: DType,
-    inputs: &mut Vec<kernels::fused_eltwise::FusedEltwiseInput<'a>>,
+    inputs: &mut Vec<&'a DramBuffer>,
 ) -> kernels::fused_eltwise::FusedEltwiseNode {
     match input {
         EltwiseInput::Dram(buffer) => {
             let input_index = inputs.len() as u32;
-            inputs.push(kernels::fused_eltwise::FusedEltwiseInput::Dram {
-                buffer,
-                single_tile_broadcast: false,
-            });
+            inputs.push(buffer);
             kernels::fused_eltwise::FusedEltwiseNode {
                 op: kernels::fused_eltwise::FusedEltwiseOp::Input,
                 input_nodes: Vec::new(),
@@ -1950,10 +1947,7 @@ fn execute_fused_elementwise(
                 "TT executable fused_elementwise input[{index}] buffer has no device allocation"
             )));
         };
-        inputs.push(kernels::fused_eltwise::FusedEltwiseInput::Dram {
-            buffer: input_dram,
-            single_tile_broadcast: false,
-        });
+        inputs.push(input_dram);
     }
 
     let kernel_nodes = nodes

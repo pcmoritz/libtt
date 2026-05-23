@@ -450,13 +450,12 @@ pub(crate) struct FusedEltwiseNode {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum FusedEltwiseInput<'a> {
-    Dram {
-        buffer: &'a DramBuffer,
-        // Logical scalar broadcasts are passed as a one-tile input. The reader
-        // replicates the first element across each output tile before compute.
-        single_tile_broadcast: bool,
-    },
+struct FusedEltwiseRead<'a> {
+    buffer: &'a DramBuffer,
+    dtype: DType,
+    // Logical scalar broadcasts are passed as a one-tile input. The reader
+    // replicates the first element across each output tile before compute.
+    single_tile_broadcast: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -502,14 +501,14 @@ impl Kernel<FusedEltwiseProgramKey> for FusedEltwiseKernel {
 
 pub(crate) fn eltwise(
     device: &mut Device,
-    external_inputs: &[FusedEltwiseInput<'_>],
+    external_inputs: &[&DramBuffer],
     nodes: &[FusedEltwiseNode],
     root_node_id: u32,
     shape: &[usize],
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
     validate_fused_eltwise(external_inputs, nodes, root_node_id, shape)?;
-    let leaf_inputs = leaf_inputs(external_inputs, nodes)?;
+    let input_reads = input_reads(external_inputs, nodes)?;
 
     let output_tiles = tiled_shape_tile_count(shape)?;
     let tile_count = u32_arg(output_tiles, "tile count")?;
@@ -518,15 +517,11 @@ pub(crate) fn eltwise(
     let output_shape = tiled_allocation_shape(shape)?;
     let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
 
-    let mut input_addrs = Vec::with_capacity(leaf_inputs.len());
-    let mut input_dtypes = Vec::with_capacity(leaf_inputs.len());
-    for (index, input) in leaf_inputs.iter().enumerate() {
-        match input {
-            FusedEltwiseInput::Dram { buffer, .. } => {
-                input_addrs.push(u32_arg(buffer.addr, &format!("input[{index}] address"))?);
-                input_dtypes.push(buffer.dtype);
-            }
-        }
+    let mut input_addrs = Vec::with_capacity(input_reads.len());
+    let mut input_dtypes = Vec::with_capacity(input_reads.len());
+    for (index, input) in input_reads.iter().enumerate() {
+        input_addrs.push(u32_arg(input.buffer.addr, &format!("input[{index}] address"))?);
+        input_dtypes.push(input.dtype);
     }
 
     let kernel = FusedEltwiseKernel {
@@ -536,15 +531,9 @@ pub(crate) fn eltwise(
             cores,
             tile_count,
             input_dtypes,
-            input_broadcasts: leaf_inputs
+            input_broadcasts: input_reads
                 .iter()
-                .map(|input| {
-                    let FusedEltwiseInput::Dram {
-                        single_tile_broadcast,
-                        ..
-                    } = input;
-                    *single_tile_broadcast
-                })
+                .map(|input| input.single_tile_broadcast)
                 .collect(),
             output_dtype,
             nodes: nodes.to_vec(),
@@ -556,7 +545,7 @@ pub(crate) fn eltwise(
 }
 
 fn validate_fused_eltwise(
-    external_inputs: &[FusedEltwiseInput<'_>],
+    external_inputs: &[&DramBuffer],
     nodes: &[FusedEltwiseNode],
     root_node_id: u32,
     shape: &[usize],
@@ -603,7 +592,7 @@ fn validate_fused_eltwise(
                         external_inputs.len()
                     )));
                 }
-                let FusedEltwiseInput::Dram { buffer, .. } = external_inputs[input_index];
+                let buffer = external_inputs[input_index];
                 let input_dtype = buffer.dtype;
                 if input_dtype != node.dtype {
                     return Err(invalid_input(format!(
@@ -679,10 +668,10 @@ fn validate_fused_eltwise(
     Ok(())
 }
 
-fn leaf_inputs<'a>(
-    external_inputs: &[FusedEltwiseInput<'a>],
+fn input_reads<'a>(
+    external_inputs: &[&'a DramBuffer],
     nodes: &[FusedEltwiseNode],
-) -> io::Result<Vec<FusedEltwiseInput<'a>>> {
+) -> io::Result<Vec<FusedEltwiseRead<'a>>> {
     let mut inputs = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         match node.op {
@@ -696,11 +685,10 @@ fn leaf_inputs<'a>(
                         node.input_index
                     ))
                 })?;
-                inputs.push(match input {
-                    FusedEltwiseInput::Dram { buffer, .. } => FusedEltwiseInput::Dram {
-                        buffer,
-                        single_tile_broadcast: node.single_tile_broadcast,
-                    },
+                inputs.push(FusedEltwiseRead {
+                    buffer: input,
+                    dtype: node.dtype,
+                    single_tile_broadcast: node.single_tile_broadcast,
                 });
             }
             FusedEltwiseOp::Constant => {}

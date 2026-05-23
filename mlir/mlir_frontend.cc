@@ -482,19 +482,26 @@ std::optional<uint32_t> collectFusedElementwiseOp(
     node.kind = kind;
     node.element_type = valueElementType(op->getResult(0));
 
+    FusedElementwiseRegion candidate_region = region;
+    llvm::DenseMap<mlir::Value, uint32_t> candidate_node_ids = node_ids;
     for (mlir::Value operand : op->getOperands()) {
-        auto node_id =
-            collectFusedElementwiseValue(operand, root_value, region, node_ids);
+        auto node_id = collectFusedElementwiseValue(
+            operand,
+            root_value,
+            candidate_region,
+            candidate_node_ids);
         if (!node_id.has_value()) {
             return std::nullopt;
         }
         node.input_nodes.push_back(*node_id);
     }
 
-    uint32_t node_id = addFusedNode(region, std::move(node));
-    node_ids.try_emplace(op->getResult(0), node_id);
-    region.covered_ops.push_back(op);
-    region.fused_op_count += 1;
+    uint32_t node_id = addFusedNode(candidate_region, std::move(node));
+    candidate_node_ids.try_emplace(op->getResult(0), node_id);
+    candidate_region.covered_ops.push_back(op);
+    candidate_region.fused_op_count += 1;
+    region = std::move(candidate_region);
+    node_ids = std::move(candidate_node_ids);
     return node_id;
 }
 
