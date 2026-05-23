@@ -169,7 +169,6 @@ pub(crate) enum Op {
         input_ids: Vec<u32>,
         output_id: u32,
         nodes: Vec<FusedElementwiseNode>,
-        root_node_id: u32,
     },
 }
 
@@ -505,7 +504,6 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                         .into_iter()
                         .map(parse_fused_elementwise_node)
                         .collect::<Result<Vec<_>, String>>()?,
-                    root_node_id: fused.root_node_id,
                 }),
             }
         })
@@ -693,6 +691,5 @@ pub(crate) enum Op {
         input_ids: Vec<u32>,
         output_id: u32,
         nodes: Vec<FusedElementwiseNode>,
-        root_node_id: u32,
     },
 }

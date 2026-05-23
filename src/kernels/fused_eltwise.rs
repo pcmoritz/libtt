@@ -505,7 +505,6 @@ struct FusedEltwiseProgramKey {
     input_broadcasts: Vec<bool>,
     output_dtype: DType,
     nodes: Vec<FusedEltwiseNode>,
-    root_node_id: u32,
 }
 
 struct FusedEltwiseKernel {
@@ -542,17 +541,16 @@ pub(crate) fn eltwise(
     device: &mut Device,
     external_inputs: &[&DramBuffer],
     nodes: &[FusedEltwiseNode],
-    root_node_id: u32,
     shape: &[usize],
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
-    validate_fused_eltwise(external_inputs, nodes, root_node_id, shape)?;
+    validate_fused_eltwise(external_inputs, nodes, shape)?;
     let input_reads = input_reads(external_inputs, nodes)?;
 
     let output_tiles = tiled_shape_tile_count(shape)?;
     let tile_count = u32_arg(output_tiles, "tile count")?;
     let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
-    let output_dtype = nodes[root_node_id as usize].dtype;
+    let output_dtype = nodes[nodes.len() - 1].dtype;
     let output_shape = tiled_allocation_shape(shape)?;
     let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
 
@@ -579,7 +577,6 @@ pub(crate) fn eltwise(
                 .collect(),
             output_dtype,
             nodes: nodes.to_vec(),
-            root_node_id,
         },
     };
     kernel.run(device)?;
@@ -589,7 +586,6 @@ pub(crate) fn eltwise(
 fn validate_fused_eltwise(
     external_inputs: &[&DramBuffer],
     nodes: &[FusedEltwiseNode],
-    root_node_id: u32,
     shape: &[usize],
 ) -> io::Result<()> {
     if external_inputs.len() > MAX_FUSED_INPUTS {
@@ -604,12 +600,13 @@ fn validate_fused_eltwise(
             nodes.len()
         )));
     }
-    let root_index = usize::try_from(root_node_id)
-        .map_err(|_| invalid_input(format!("root node id is out of range: {root_node_id}")))?;
-    if root_index >= nodes.len() {
+    let root = nodes
+        .last()
+        .expect("nodes was already checked as non-empty");
+    if matches!(root.op, FusedEltwiseOp::Input | FusedEltwiseOp::Constant) {
         return Err(invalid_input(format!(
-            "root node id {root_node_id} is out of bounds for {} nodes",
-            nodes.len()
+            "fused eltwise root node must be the final operation, got {:?}",
+            root.op
         )));
     }
 
@@ -766,7 +763,7 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     }
     let runtime_args = runtime_args.build()?;
 
-    let (_, intermediate_cbs) = cb_plan(&key.nodes, key.root_node_id)?;
+    let (_, intermediate_cbs) = cb_plan(&key.nodes)?;
     let mut cbs = Vec::with_capacity(input_count + intermediate_cbs.len() + 1);
     for (index, &dtype) in key.input_dtypes.iter().enumerate() {
         cbs.push(CBConfig::new(index, dtype));
@@ -792,12 +789,7 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
             dst_accum_mode,
             ..CompileConfig::default()
         },
-        name: format!(
-            "fused_eltwise_{}_{}_{}",
-            input_count,
-            key.nodes.len(),
-            key.root_node_id
-        ),
+        name: format!("fused_eltwise_{}_{}", input_count, key.nodes.len()),
         ..Program::new(runtime_args)
     })
 }
@@ -877,7 +869,7 @@ fn reader_source(input_broadcasts: &[bool], input_dtypes: &[DType]) -> String {
 }
 
 fn compute_source(key: &FusedEltwiseProgramKey) -> io::Result<String> {
-    let steps = compute_steps(&key.nodes, key.root_node_id)?;
+    let steps = compute_steps(&key.nodes)?;
     Ok(COMPUTE
         .replace("FUSED_HEADERS", &steps.features.headers_source())
         .replace("FUSED_HELPERS", &steps.features.helpers_source())
@@ -1175,7 +1167,7 @@ struct ComputeSteps {
     features: ComputeSourceFeatures,
 }
 
-fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<ComputeSteps> {
+fn compute_steps(nodes: &[FusedEltwiseNode]) -> io::Result<ComputeSteps> {
     let mut remaining_uses = vec![0u32; nodes.len()];
     for node in nodes {
         for &input_node in &node.input_nodes {
@@ -1190,7 +1182,7 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
         }
     }
 
-    let (node_cbs, _) = cb_plan(nodes, root_node_id)?;
+    let (node_cbs, _) = cb_plan(nodes)?;
     let mut body = String::new();
     let mut typecast_inits = Vec::<String>::new();
     let mut features = ComputeSourceFeatures::default();
@@ -1347,10 +1339,7 @@ fn compute_steps(nodes: &[FusedEltwiseNode], root_node_id: u32) -> io::Result<Co
     })
 }
 
-fn cb_plan(
-    nodes: &[FusedEltwiseNode],
-    root_node_id: u32,
-) -> io::Result<(Vec<Option<u32>>, Vec<(u32, DType)>)> {
+fn cb_plan(nodes: &[FusedEltwiseNode]) -> io::Result<(Vec<Option<u32>>, Vec<(u32, DType)>)> {
     let mut node_cbs = vec![None; nodes.len()];
     let mut leaf_count = 0u32;
     for (index, node) in nodes.iter().enumerate() {
@@ -1363,8 +1352,10 @@ fn cb_plan(
         }
     }
 
-    let root_index = usize::try_from(root_node_id)
-        .map_err(|_| invalid_input(format!("root node id is out of range: {root_node_id}")))?;
+    let root_index = nodes
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| invalid_input("fused eltwise requires at least one node"))?;
     let mut next_cb = leaf_count;
     let mut intermediate_cbs = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
@@ -1559,15 +1550,14 @@ mod tests {
         }
     }
 
-    fn program_key(nodes: Vec<FusedEltwiseNode>, root_node_id: u32) -> FusedEltwiseProgramKey {
+    fn program_key(nodes: Vec<FusedEltwiseNode>) -> FusedEltwiseProgramKey {
         FusedEltwiseProgramKey {
             cores: Vec::new(),
             tile_count: 1,
             input_dtypes: Vec::new(),
             input_broadcasts: Vec::new(),
-            output_dtype: nodes[root_node_id as usize].dtype,
+            output_dtype: nodes.last().expect("test nodes must not be empty").dtype,
             nodes,
-            root_node_id,
         }
     }
 
@@ -1581,7 +1571,7 @@ mod tests {
             constant,
             node(FusedEltwiseOp::Divide, vec![1, 0]),
         ];
-        let steps = compute_steps(&nodes, 2).expect("constant / value should lower");
+        let steps = compute_steps(&nodes).expect("constant / value should lower");
 
         assert!(steps.body.contains("rdiv_tile_init();"));
         assert!(steps.body.contains("rdiv_tile(0, 1065353216);"));
@@ -1597,7 +1587,7 @@ mod tests {
             constant,
             node(FusedEltwiseOp::Power, vec![0, 1]),
         ];
-        let steps = compute_steps(&nodes, 2).expect("value ** constant should lower");
+        let steps = compute_steps(&nodes).expect("value ** constant should lower");
 
         assert!(steps.body.contains("power_tile_init();"));
         assert!(steps.body.contains("power_tile(0, 1073741824);"));
@@ -1613,7 +1603,7 @@ mod tests {
             constant,
             node(FusedEltwiseOp::Compare(CompareDirection::Gt), vec![0, 1]),
         ];
-        let steps = compute_steps(&nodes, 2).expect("value > constant should lower");
+        let steps = compute_steps(&nodes).expect("value > constant should lower");
 
         assert!(steps.body.contains("unary_gt_tile_init();"));
         assert!(steps.body.contains("unary_gt_tile(0, 0);"));
@@ -1629,7 +1619,7 @@ mod tests {
             node(FusedEltwiseOp::Input, Vec::new()),
             node(FusedEltwiseOp::Compare(CompareDirection::Gt), vec![0, 1]),
         ];
-        let steps = compute_steps(&nodes, 2).expect("constant > value should lower");
+        let steps = compute_steps(&nodes).expect("constant > value should lower");
 
         assert!(steps.body.contains("unary_lt_tile_init();"));
         assert!(steps.body.contains("unary_lt_tile(0, 0);"));
@@ -1645,7 +1635,7 @@ mod tests {
             constant,
             node(FusedEltwiseOp::Max, vec![0, 1]),
         ];
-        let steps = compute_steps(&nodes, 2).expect("max(value, constant) should lower");
+        let steps = compute_steps(&nodes).expect("max(value, constant) should lower");
 
         assert!(steps.body.contains("unary_max_tile_init();"));
         assert!(steps.body.contains("unary_max_tile(0, 0);"));
@@ -1658,7 +1648,7 @@ mod tests {
             node(FusedEltwiseOp::Input, Vec::new()),
             node(FusedEltwiseOp::Add, vec![0, 1]),
         ];
-        let source = compute_source(&program_key(nodes, 2)).expect("add source should generate");
+        let source = compute_source(&program_key(nodes)).expect("add source should generate");
 
         assert!(source.contains(HEADER_BINARY_SFPU));
         assert!(source.contains(HEADER_ADD_INT));
@@ -1676,8 +1666,7 @@ mod tests {
             node(FusedEltwiseOp::Input, Vec::new()),
             node(FusedEltwiseOp::Compare(CompareDirection::Gt), vec![0, 1]),
         ];
-        let source =
-            compute_source(&program_key(nodes, 2)).expect("compare source should generate");
+        let source = compute_source(&program_key(nodes)).expect("compare source should generate");
 
         assert!(source.contains(HEADER_COMP));
         assert!(source.contains(HEADER_SUB_INT));

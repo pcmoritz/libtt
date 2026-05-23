@@ -362,7 +362,6 @@ struct FusedElementwiseRegion {
     llvm::SmallVector<mlir::Value> inputs;
     llvm::SmallVector<FusedElementwiseNodeDesc> nodes;
     llvm::SmallVector<mlir::Operation*> covered_ops;
-    uint32_t root_node_id = 0;
     unsigned fused_op_count = 0;
 };
 
@@ -604,14 +603,13 @@ std::optional<FusedElementwiseRegion> collectFusedElementwiseRegion(
 
     FusedElementwiseRegion region;
     llvm::DenseMap<mlir::Value, uint32_t> node_ids;
-    auto root_node_id = collectFusedElementwiseOp(
+    auto collected_root = collectFusedElementwiseOp(
         root, root->getResult(0), true, region, node_ids);
-    if (!root_node_id.has_value() || region.fused_op_count < 2 ||
+    if (!collected_root.has_value() || region.fused_op_count < 2 ||
         region.nodes.size() > kMaxFusedElementwiseNodes ||
         region.inputs.size() > kMaxFusedElementwiseInputs) {
         return std::nullopt;
     }
-    region.root_node_id = *root_node_id;
     return region;
 }
 
@@ -679,7 +677,6 @@ bool addFusedElementwiseOp(
         proto_node->set_element_type(node.element_type);
         proto_node->set_single_tile_broadcast(node.single_tile_broadcast);
     }
-    fused_op->set_root_node_id(region.root_node_id);
     return true;
 }
 

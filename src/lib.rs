@@ -1662,9 +1662,8 @@ fn execute_binary_eltwise(
     let output_name = format!("pjrt_{op_name}");
     let (inputs, nodes) =
         fused_binary_eltwise_inputs(op, lhs_input, rhs_input, input_dtype).map_err(io_error)?;
-    let output_dram =
-        kernels::fused_eltwise::eltwise(device, &inputs, &nodes, 2, &shape, output_name)
-            .map_err(io_error)?;
+    let output_dram = kernels::fused_eltwise::eltwise(device, &inputs, &nodes, &shape, output_name)
+        .map_err(io_error)?;
     store_output_buffer(
         values,
         plan,
@@ -1710,9 +1709,8 @@ fn execute_unary_eltwise(
     let input = eltwise_input(values, plan, input_id, input_dtype, &input_field)?;
     let output_name = format!("pjrt_{op_name}");
     let (inputs, nodes) = fused_unary_eltwise_inputs(op, input, input_dtype, output_dtype);
-    let output_dram =
-        kernels::fused_eltwise::eltwise(device, &inputs, &nodes, 1, &shape, output_name)
-            .map_err(io_error)?;
+    let output_dram = kernels::fused_eltwise::eltwise(device, &inputs, &nodes, &shape, output_name)
+        .map_err(io_error)?;
     store_output_buffer(
         values,
         plan,
@@ -1915,7 +1913,6 @@ fn execute_fused_elementwise(
     input_ids: &[u32],
     output_id: u32,
     nodes: &[executable::FusedElementwiseNode],
-    root_node_id: u32,
 ) -> Result<(), *mut PJRT_Error> {
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
@@ -1923,11 +1920,9 @@ fn execute_fused_elementwise(
         ))
     })?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let root = nodes.get(root_node_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable fused_elementwise root node id {root_node_id} is out of bounds"
-        ))
-    })?;
+    let root = nodes
+        .last()
+        .ok_or_else(|| invalid_argument("TT executable fused_elementwise has no nodes"))?;
     if root.element_type != output_desc.element_type {
         return Err(invalid_argument(format!(
             "TT executable fused_elementwise root type {:?} does not match output type {:?}",
@@ -1967,7 +1962,6 @@ fn execute_fused_elementwise(
         device,
         &inputs,
         &kernel_nodes,
-        root_node_id,
         &output_shape,
         "pjrt_fused_elementwise",
     )
@@ -3079,7 +3073,6 @@ fn execute_executable_v1(
                 input_ids,
                 output_id,
                 nodes,
-                root_node_id,
             } => execute_fused_elementwise(
                 &mut values,
                 plan,
@@ -3088,7 +3081,6 @@ fn execute_executable_v1(
                 input_ids,
                 *output_id,
                 nodes,
-                *root_node_id,
             )?,
         }
     }
@@ -4681,14 +4673,12 @@ mod tests {
             input_ids,
             output_id,
             nodes,
-            root_node_id,
         } = op
         else {
             panic!("expected fused elementwise op");
         };
         assert_eq!(input_ids, &[0, 1, 2]);
         assert_eq!(*output_id, 3);
-        assert_eq!(*root_node_id, 4);
         assert_eq!(nodes.len(), 5);
         assert_eq!(nodes[0].kind, executable::FusedElementwiseKind::Input);
         assert_eq!(nodes[0].input_index, 0);
@@ -4811,20 +4801,18 @@ mod tests {
                         input_ids,
                         output_id,
                         nodes,
-                        root_node_id,
                     } = op
                     {
-                        Some((input_ids, output_id, nodes, root_node_id))
+                        Some((input_ids, output_id, nodes))
                     } else {
                         None
                     }
                 });
-                let Some((input_ids, output_id, nodes, root_node_id)) = fused else {
+                let Some((input_ids, output_id, nodes)) = fused else {
                     panic!("expected fused elementwise op");
                 };
                 assert_eq!(input_ids, &[0, 1]);
                 assert_eq!(*output_id, executable.output_ids[0]);
-                assert_eq!(*root_node_id, 8);
                 assert_eq!(nodes.len(), 9);
                 assert_eq!(nodes[8].kind, executable::FusedElementwiseKind::Multiply);
 

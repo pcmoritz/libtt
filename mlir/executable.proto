@@ -241,7 +241,6 @@ message FusedElementwiseOp {
 
   repeated uint32 input_ids = 1;
   repeated Node nodes = 2;
-  uint32 root_node_id = 3;
 }
 
 message Op {
