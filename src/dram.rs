@@ -409,22 +409,32 @@ fn insert_free_block(free: &mut Vec<FreeBlock>, block: FreeBlock) {
     if block.size == 0 {
         return;
     }
-    free.push(block);
-    free.sort_unstable_by_key(|block| block.addr);
-
-    let mut coalesced = Vec::<FreeBlock>::with_capacity(free.len());
-    for block in free.drain(..) {
-        if let Some(last) = coalesced.last_mut() {
-            let last_end = last.addr.saturating_add(last.size);
-            if last_end >= block.addr {
-                let block_end = block.addr.saturating_add(block.size);
-                last.size = block_end.max(last_end).saturating_sub(last.addr);
-                continue;
-            }
+    let mut index = free.partition_point(|free_block| free_block.addr < block.addr);
+    if index > 0 {
+        let previous = index - 1;
+        let previous_end = free[previous].addr.saturating_add(free[previous].size);
+        if previous_end >= block.addr {
+            let block_end = block.addr.saturating_add(block.size);
+            free[previous].size = block_end
+                .max(previous_end)
+                .saturating_sub(free[previous].addr);
+            index = previous;
+        } else {
+            free.insert(index, block);
         }
-        coalesced.push(block);
+    } else {
+        free.insert(index, block);
     }
-    *free = coalesced;
+
+    while index + 1 < free.len() {
+        let current_end = free[index].addr.saturating_add(free[index].size);
+        if current_end < free[index + 1].addr {
+            break;
+        }
+        let next = free.remove(index + 1);
+        let next_end = next.addr.saturating_add(next.size);
+        free[index].size = next_end.max(current_end).saturating_sub(free[index].addr);
+    }
 }
 
 pub(crate) fn tilize(data: &[u8], dtype: DType, shape: &[usize]) -> io::Result<Vec<u8>> {

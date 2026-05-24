@@ -96,8 +96,11 @@ void kernel_main() {
       }
       cur_block += A(4);
 
-      noc_semaphore_wait(sender_sem, w_nd + e_nd);
-      noc_semaphore_set(sender_sem, 0);
+      const uint32_t receivers = w_nd + e_nd;
+      if (receivers > 0) {
+        noc_semaphore_wait(sender_sem, receivers);
+        noc_semaphore_set(sender_sem, 0);
+      }
       if (w_nd > 0) {
         uint64_t wa = get_noc_multicast_addr(A(9), A(10), A(11), A(12), start_addr);
         noc_async_write_multicast(start_addr, wa, block_bytes, w_nd);
