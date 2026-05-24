@@ -22,10 +22,10 @@ import jax.numpy as jnp
 @dataclass(frozen=True)
 class Qwen3Config:
     vocab_size: int = 151936
-    hidden_size: int = 1024
-    intermediate_size: int = 3072
-    num_hidden_layers: int = 28
-    num_attention_heads: int = 16
+    hidden_size: int = 2560
+    intermediate_size: int = 9728
+    num_hidden_layers: int = 36
+    num_attention_heads: int = 32
     num_key_value_heads: int = 8
     head_dim: int = 128
     max_position_embeddings: int = 40960
@@ -333,7 +333,9 @@ def load_hf_weights(config: Qwen3Config, model_dir: Path, np_dtype):
         "norm": np.ascontiguousarray(tensors["model.norm.weight"]),
     }
 
-    if not config.tie_word_embeddings:
+    if config.tie_word_embeddings:
+        weights["lm_head"] = np.ascontiguousarray(weights["embed_tokens"].T)
+    else:
         weights["lm_head"] = np.ascontiguousarray(tensors["lm_head.weight"].T)
 
     for index in range(config.num_hidden_layers):
@@ -360,11 +362,16 @@ def load_hf_weights(config: Qwen3Config, model_dir: Path, np_dtype):
 
 def rms_norm(x, weight, eps):
     variance = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
-    return (x * jax.lax.rsqrt(variance + eps) * weight).astype(x.dtype)
+    scale = jax.lax.rsqrt(variance + eps)
+    return (x * scale * weight).astype(x.dtype)
 
 
 def silu(x):
-    return x * jax.nn.sigmoid(x)
+    return x / (1.0 + jnp.exp(-x))
+
+
+def swiglu(gate, up):
+    return silu(gate) * up
 
 
 def rotate_half(x):
@@ -381,6 +388,17 @@ def causal_attention_bias(seq_len: int):
     return jnp.where(position_ids[None, :] > position_ids[:, None], -1.0e9, 0.0)[None, None, :, :]
 
 
+def decode_attention(config: Qwen3Config, query_states, key_cache, value_cache):
+    repeats = config.num_attention_heads // config.num_key_value_heads
+    grouped_query = query_states[0].reshape(config.num_key_value_heads, repeats, config.head_dim)
+    scores = jnp.einsum("hrd,hdt->hrt", grouped_query, key_cache).astype(jnp.float32)
+    scores = scores * (config.head_dim**-0.5)
+    probs = jax.nn.softmax(scores, axis=-1).astype(query_states.dtype)
+    return jnp.einsum("hrt,htd->hrd", probs, value_cache).reshape(
+        1, config.num_attention_heads, config.head_dim
+    )
+
+
 def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin, causal_bias, cache=None):
     seq_len = hidden_states.shape[0]
     query_states = hidden_states @ layer["q_proj"]
@@ -393,26 +411,29 @@ def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin, causal_b
 
     query_states = rms_norm(query_states, layer["q_norm"], config.rms_norm_eps)
     key_states = rms_norm(key_states, layer["k_norm"], config.rms_norm_eps)
-    query_states = apply_rope(query_states, cos, sin)
-    key_states = apply_rope(key_states, cos, sin)
 
-    key_cache = key_states.reshape((seq_len, -1))
-    value_cache = value_states.reshape((seq_len, -1))
-    if cache is not None:
-        key_cache = jnp.concatenate((cache[0], key_cache), axis=0)
-        value_cache = jnp.concatenate((cache[1], value_cache), axis=0)
-    key_states = key_cache.reshape((key_cache.shape[0], config.num_key_value_heads, config.head_dim))
-    value_states = value_cache.reshape((value_cache.shape[0], config.num_key_value_heads, config.head_dim))
-
-    attn_output = jax.nn.dot_product_attention(query_states, key_states, value_states, bias=causal_bias, implementation="xla")
+    if cache is None:
+        query_states = apply_rope(query_states, cos, sin)
+        key_states = apply_rope(key_states, cos, sin)
+        key_cache = jnp.transpose(key_states, (1, 2, 0))
+        value_cache = jnp.transpose(value_states, (1, 0, 2))
+        attn_output = jax.nn.dot_product_attention(
+            query_states, key_states, value_states, bias=causal_bias, implementation="xla"
+        )
+    else:
+        query_states = apply_rope(query_states, cos, sin)
+        key_states = apply_rope(key_states, cos, sin)
+        key_cache = jnp.concatenate((cache[0], jnp.transpose(key_states, (1, 2, 0))), axis=2)
+        value_cache = jnp.concatenate((cache[1], jnp.transpose(value_states, (1, 0, 2))), axis=1)
+        attn_output = decode_attention(config, query_states, key_cache, value_cache)
     output = attn_output.reshape(seq_len, -1) @ layer["o_proj"]
     return output, (key_cache, value_cache)
 
 
 def mlp(hidden_states, layer):
-    gate = silu(hidden_states @ layer["gate_proj"])
+    gate = hidden_states @ layer["gate_proj"]
     up = hidden_states @ layer["up_proj"]
-    return (gate * up) @ layer["down_proj"]
+    return swiglu(gate, up) @ layer["down_proj"]
 
 
 def qwen3_forward(config: Qwen3Config, weights, input_ids, caches=None):
@@ -420,7 +441,7 @@ def qwen3_forward(config: Qwen3Config, weights, input_ids, caches=None):
     seq_len = input_ids.shape[0]
     if caches is not None and seq_len != 1:
         raise ValueError("cached decode expects exactly one new token")
-    cache_len = 0 if caches is None else caches[0][0].shape[0]
+    cache_len = 0 if caches is None else caches[0][0].shape[2]
     hidden_states = weights["embed_tokens"][input_ids]
     cos = weights["rope_cos"][cache_len : cache_len + seq_len]
     sin = weights["rope_sin"][cache_len : cache_len + seq_len]
@@ -442,25 +463,28 @@ def qwen3_forward(config: Qwen3Config, weights, input_ids, caches=None):
     return rms_norm(hidden_states, weights["norm"], config.rms_norm_eps), tuple(new_caches)
 
 
-def qwen3_next_logits_and_cache(config: Qwen3Config, weights, input_ids, caches=None):
+def qwen3_next_token_and_cache(config: Qwen3Config, weights, input_ids, caches=None):
     hidden_states, caches = qwen3_forward(config, weights, input_ids, caches=caches)
     head = weights["lm_head"] if "lm_head" in weights else weights["embed_tokens"].T
-    return (hidden_states[-1:, :] @ head)[0], caches
+    hidden = hidden_states[-1:, :]
+    token = jax.lax.top_k((hidden @ head)[0], 1)[1][0].astype(jnp.int32)
+    return token, caches
 
 
-def count_parameters(weights) -> int:
-    leaves = jax.tree_util.tree_leaves(weights)
+def count_parameters(config: Qwen3Config, weights) -> int:
+    counted_weights = dict(weights)
+    if config.tie_word_embeddings:
+        counted_weights.pop("lm_head", None)
+    leaves = jax.tree_util.tree_leaves(counted_weights)
     return sum(value.size for value in leaves)
 
 
 def make_decode_step(config, device, args):
     def greedy_tokens(model_weights, ids):
-        logits, caches = qwen3_next_logits_and_cache(config, model_weights, ids)
-        token = jax.lax.top_k(logits, 1)[1][0].astype(jnp.int32)
+        token, caches = qwen3_next_token_and_cache(config, model_weights, ids)
         generated = [token.reshape((1, 1))]
         for _ in range(1, args.max_new_tokens):
-            logits, caches = qwen3_next_logits_and_cache(config, model_weights, token, caches)
-            token = jax.lax.top_k(logits, 1)[1][0].astype(jnp.int32)
+            token, caches = qwen3_next_token_and_cache(config, model_weights, token, caches)
             generated.append(token.reshape((1, 1)))
         return jnp.concatenate(generated, axis=0)
 
@@ -521,7 +545,7 @@ def main():
     print(f"device: {device}")
     if not args.random_weights:
         print(f"model: {args.model}")
-    print(f"parameters: {count_parameters(weights):,}")
+    print(f"parameters: {count_parameters(config, weights):,}")
     print(f"warmup_seconds: {warmup_seconds:.3f}")
     print(f"run_seconds: {run_seconds:.3f}")
     print(tokenizer.decode(output_ids))
