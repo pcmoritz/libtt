@@ -439,18 +439,20 @@ std::optional<tt::TensorDesc::ElementType> staticValueElementType(mlir::Value va
     return std::nullopt;
 }
 
-bool supportsFusedLeafElement(mlir::Value value) {
-    auto element_type = staticValueElementType(value);
+bool isFusedFloatElementType(tt::TensorDesc::ElementType element_type) {
     return element_type == tt::TensorDesc::ELEMENT_TYPE_BF16 ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_F16 ||
-           element_type == tt::TensorDesc::ELEMENT_TYPE_F32 ||
+           element_type == tt::TensorDesc::ELEMENT_TYPE_F32;
+}
+
+bool supportsFusedLeafElementType(tt::TensorDesc::ElementType element_type) {
+    return isFusedFloatElementType(element_type) ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_U32 ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_S32 ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_U16;
 }
 
-bool supportsConvertElement(mlir::Value value) {
-    auto element_type = staticValueElementType(value);
+bool supportsConvertElementType(tt::TensorDesc::ElementType element_type) {
     return element_type == tt::TensorDesc::ELEMENT_TYPE_BF16 ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_F32 ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_U32 ||
@@ -458,15 +460,52 @@ bool supportsConvertElement(mlir::Value value) {
            element_type == tt::TensorDesc::ELEMENT_TYPE_U16;
 }
 
-bool supportsCompareElement(mlir::Value value) {
-    auto element_type = staticValueElementType(value);
+bool supportsCompareElementType(tt::TensorDesc::ElementType element_type) {
     return element_type == tt::TensorDesc::ELEMENT_TYPE_BF16 ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_F32 ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_S32;
 }
 
-bool isPredTensor(mlir::Value value) {
-    return staticValueElementType(value) == tt::TensorDesc::ELEMENT_TYPE_PRED;
+bool supportsFusedElementwiseDTypes(
+    tt::FusedElementwiseOp::Node::Kind kind,
+    tt::TensorDesc::ElementType input_type,
+    tt::TensorDesc::ElementType output_type) {
+    using Node = tt::FusedElementwiseOp::Node;
+    if (kind == Node::KIND_CONVERT) {
+        return supportsConvertElementType(input_type) &&
+               supportsConvertElementType(output_type);
+    }
+    if (kind == Node::KIND_COMPARE) {
+        return supportsCompareElementType(input_type) &&
+               output_type == tt::TensorDesc::ELEMENT_TYPE_PRED;
+    }
+    if (input_type != output_type) {
+        return false;
+    }
+    switch (kind) {
+        case Node::KIND_ADD:
+        case Node::KIND_MULTIPLY:
+            return supportsFusedLeafElementType(input_type);
+        case Node::KIND_SUBTRACT:
+            return isFusedFloatElementType(input_type) ||
+                   input_type == tt::TensorDesc::ELEMENT_TYPE_S32;
+        case Node::KIND_DIVIDE:
+        case Node::KIND_POWER:
+        case Node::KIND_MAX:
+        case Node::KIND_COSINE:
+        case Node::KIND_SINE:
+        case Node::KIND_NEGATE:
+        case Node::KIND_EXPONENTIAL:
+        case Node::KIND_RSQRT:
+            return isFusedFloatElementType(input_type);
+        default:
+            return false;
+    }
+}
+
+bool supportsFusedLeafElement(mlir::Value value) {
+    auto element_type = staticValueElementType(value);
+    return element_type && supportsFusedLeafElementType(*element_type);
 }
 
 bool sameTensorShape(mlir::Value lhs, mlir::Value rhs) {
@@ -510,78 +549,32 @@ std::optional<tt::FusedElementwiseOp::Node::Kind> fusedElementwiseKind(
 }
 
 bool isFusableElementwiseOp(mlir::Operation* op) {
-    if (auto compare_op = mlir::dyn_cast_or_null<mlir::stablehlo::CompareOp>(op)) {
-        return compare_op->getNumResults() == 1 &&
-               isPredTensor(compare_op.getResult());
-    }
     return op && op->getNumResults() == 1 &&
            fusedElementwiseKind(op).has_value() &&
-           supportsFusedLeafElement(op->getResult(0));
+           staticValueElementType(op->getResult(0)).has_value();
 }
 
 bool hasSupportedFusedElementwiseTypes(mlir::Operation* op) {
-    if (!isFusableElementwiseOp(op)) {
+    auto kind = fusedElementwiseKind(op);
+    if (!isFusableElementwiseOp(op) || !kind) {
         return false;
     }
     mlir::Value result = op->getResult(0);
-
-    if (mlir::isa<mlir::stablehlo::CompareOp>(op)) {
-        if (valueElementType(result) != tt::TensorDesc::ELEMENT_TYPE_PRED) {
-            return false;
-        }
-        auto lhs_type = valueElementType(*op->operand_begin());
-        for (mlir::Value operand : op->getOperands()) {
-            if (!supportsCompareElement(operand) ||
-                valueElementType(operand) != lhs_type) {
-                return false;
-            }
-            std::string ignored;
-            if (packedConstantValue(operand, ignored).has_value()) {
-                continue;
-            }
-            if (!sameTensorShape(operand, result)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    if (mlir::isa<mlir::stablehlo::ConvertOp>(op)) {
-        mlir::Value operand = op->getOperand(0);
-        return sameTensorShape(operand, result) &&
-               supportsConvertElement(operand) &&
-               supportsConvertElement(result);
-    }
-
-    bool float_only = mlir::isa<mlir::stablehlo::DivOp>(op) ||
-                      mlir::isa<mlir::stablehlo::PowOp>(op) ||
-                      mlir::isa<mlir::stablehlo::MaxOp>(op) ||
-                      mlir::isa<mlir::stablehlo::CosineOp>(op) ||
-                      mlir::isa<mlir::stablehlo::SineOp>(op) ||
-                      mlir::isa<mlir::stablehlo::NegOp>(op) ||
-                      mlir::isa<mlir::stablehlo::ExpOp>(op) ||
-                      mlir::isa<mlir::stablehlo::RsqrtOp>(op);
     auto result_element = staticValueElementType(result);
     if (!result_element) {
         return false;
     }
-    bool result_is_float =
-        *result_element == tt::TensorDesc::ELEMENT_TYPE_BF16 ||
-        *result_element == tt::TensorDesc::ELEMENT_TYPE_F16 ||
-        *result_element == tt::TensorDesc::ELEMENT_TYPE_F32;
-    if (float_only && !result_is_float) {
-        return false;
-    }
-    if (mlir::isa<mlir::stablehlo::SubtractOp>(op) &&
-        !(result_is_float || *result_element == tt::TensorDesc::ELEMENT_TYPE_S32)) {
-        return false;
-    }
 
+    std::optional<tt::TensorDesc::ElementType> input_element;
     for (mlir::Value operand : op->getOperands()) {
-        if (!supportsFusedLeafElement(operand) ||
-            valueElementType(operand) != valueElementType(result)) {
+        auto operand_element = staticValueElementType(operand);
+        if (!operand_element) {
             return false;
         }
+        if (input_element && *input_element != *operand_element) {
+            return false;
+        }
+        input_element = *operand_element;
         std::string ignored;
         if (packedConstantValue(operand, ignored).has_value()) {
             continue;
@@ -590,7 +583,8 @@ bool hasSupportedFusedElementwiseTypes(mlir::Operation* op) {
             return false;
         }
     }
-    return true;
+    return input_element &&
+           supportsFusedElementwiseDTypes(*kind, *input_element, *result_element);
 }
 
 uint32_t addFusedNode(
@@ -715,12 +709,8 @@ std::optional<uint32_t> collectFusedElementwiseValue(
     if (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
         mlir::Value operand = broadcast_op.getOperand();
         auto operand_element = staticValueElementType(operand);
-        bool operand_is_float =
-            operand_element == tt::TensorDesc::ELEMENT_TYPE_BF16 ||
-            operand_element == tt::TensorDesc::ELEMENT_TYPE_F16 ||
-            operand_element == tt::TensorDesc::ELEMENT_TYPE_F32;
         if (broadcast_op->getResult(0).hasOneUse() &&
-            operand_is_float &&
+            operand_element && isFusedFloatElementType(*operand_element) &&
             mlir::isa<mlir::BlockArgument>(operand) &&
             sameTensorShape(value, root_value) &&
             valueElementType(operand) == valueElementType(value) &&
