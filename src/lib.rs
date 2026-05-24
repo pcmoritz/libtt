@@ -4855,7 +4855,7 @@ mod tests {
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
-    fn pjrt_compile_keeps_convert_as_fusion_boundary() {
+    fn pjrt_compile_fuses_mixed_convert_chain() {
         with_compiled_mlir_executable(
             r#"module {
   func.func public @main(%arg0: tensor<1x64xbf16>, %arg1: tensor<1x64xf32>) -> tensor<1x64xbf16> {
@@ -4867,26 +4867,33 @@ mod tests {
 }
 "#,
             |executable| {
-                assert_eq!(executable.output_ids, vec![4]);
-                assert_eq!(executable.ops.len(), 5);
-                assert_single_fused_op(
-                    &executable.ops[2],
-                    &[0],
-                    2,
-                    executable::FusedElementwiseKind::Convert,
-                );
-                assert_single_fused_op(
-                    &executable.ops[3],
-                    &[2, 1],
-                    3,
-                    executable::FusedElementwiseKind::Multiply,
-                );
-                assert_single_fused_op(
-                    &executable.ops[4],
-                    &[3],
-                    4,
-                    executable::FusedElementwiseKind::Convert,
-                );
+                assert_eq!(executable.output_ids, vec![2]);
+                assert_eq!(executable.ops.len(), 3);
+                let executable::Op::FusedElementwise {
+                    input_ids,
+                    output_id,
+                    nodes,
+                } = &executable.ops[2]
+                else {
+                    panic!("expected fused elementwise op");
+                };
+                assert_eq!(input_ids, &[0, 1]);
+                assert_eq!(*output_id, 2);
+                assert_eq!(nodes.len(), 5);
+                assert_eq!(nodes[0].kind, executable::FusedElementwiseKind::Input);
+                assert_eq!(nodes[0].input_index, 0);
+                assert_eq!(nodes[1].kind, executable::FusedElementwiseKind::Convert);
+                assert_eq!(nodes[1].input_nodes, vec![0]);
+                assert_eq!(nodes[1].dtype, DType::Float32);
+                assert_eq!(nodes[2].kind, executable::FusedElementwiseKind::Input);
+                assert_eq!(nodes[2].input_index, 1);
+                assert_eq!(nodes[2].dtype, DType::Float32);
+                assert_eq!(nodes[3].kind, executable::FusedElementwiseKind::Multiply);
+                assert_eq!(nodes[3].input_nodes, vec![1, 2]);
+                assert_eq!(nodes[3].dtype, DType::Float32);
+                assert_eq!(nodes[4].kind, executable::FusedElementwiseKind::Convert);
+                assert_eq!(nodes[4].input_nodes, vec![3]);
+                assert_eq!(nodes[4].dtype, DType::Float16B);
             },
         );
     }

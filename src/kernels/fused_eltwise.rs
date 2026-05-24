@@ -818,7 +818,7 @@ fn compute_source(key: &FusedEltwiseProgramKey) -> io::Result<String> {
     Ok(COMPUTE
         .replace("FUSED_HEADERS", &steps.features.headers_source())
         .replace("FUSED_HELPERS", &steps.features.helpers_source())
-        .replace("FUSED_TYPECAST_INITS", &steps.typecast_inits)
+        .replace("FUSED_TYPECAST_INITS", "")
         .replace("FUSED_STEPS", &steps.body))
 }
 
@@ -917,15 +917,16 @@ impl ComputeSourceFeatures {
 
 struct ComputeSteps {
     body: String,
-    typecast_inits: String,
     features: ComputeSourceFeatures,
 }
 
 struct ComputeEmitContext<'a> {
     node_cbs: &'a [Option<u32>],
+    cb_dtypes: &'a [Option<DType>; 32],
     remaining_uses: &'a mut [u32],
+    srca_cb: u32,
+    pack_cb: u32,
     body: String,
-    typecast_inits: Vec<String>,
     features: ComputeSourceFeatures,
 }
 
@@ -935,13 +936,27 @@ impl ComputeEmitContext<'_> {
     }
 
     fn pack_and_pop(&mut self, output_cb: u32, input_nodes: &[usize]) -> io::Result<()> {
+        let old_pack_dtype = cb_dtype(self.cb_dtypes, self.pack_cb)?;
+        let output_dtype = cb_dtype(self.cb_dtypes, output_cb)?;
         append_pack_and_pop(
             &mut self.body,
+            self.pack_cb,
+            old_pack_dtype != output_dtype,
             output_cb,
             input_nodes,
             self.node_cbs,
             self.remaining_uses,
-        )
+        )?;
+        self.pack_cb = output_cb;
+        Ok(())
+    }
+
+    fn copy_to_dst(&mut self, cb: u32, dst: u32) {
+        self.body.push_str(&format!(
+            "    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{}, tt::CBIndex::c_{cb});\n    copy_tile(tt::CBIndex::c_{cb}, 0, {dst});\n",
+            self.srca_cb
+        ));
+        self.srca_cb = cb;
     }
 }
 
@@ -1021,11 +1036,24 @@ fn compute_steps(nodes: &[FusedEltwiseNode]) -> io::Result<ComputeSteps> {
     }
 
     let (node_cbs, _) = cb_plan(nodes)?;
+    let mut cb_dtypes = [None; 32];
+    for (node, cb) in nodes.iter().zip(node_cbs.iter().copied()) {
+        if let Some(cb) = cb {
+            let index = usize::try_from(cb)
+                .map_err(|_| invalid_input(format!("CB id out of range: {cb}")))?;
+            if index >= cb_dtypes.len() {
+                return Err(invalid_input(format!("CB id out of bounds: {cb}")));
+            }
+            cb_dtypes[index] = Some(node.dtype);
+        }
+    }
     let mut ctx = ComputeEmitContext {
         node_cbs: &node_cbs,
+        cb_dtypes: &cb_dtypes,
         remaining_uses: &mut remaining_uses,
+        srca_cb: 0,
+        pack_cb: 16,
         body: String::new(),
-        typecast_inits: Vec::new(),
         features: ComputeSourceFeatures::default(),
     };
 
@@ -1041,7 +1069,6 @@ fn compute_steps(nodes: &[FusedEltwiseNode]) -> io::Result<ComputeSteps> {
 
     Ok(ComputeSteps {
         body: ctx.body,
-        typecast_inits: ctx.typecast_inits.concat(),
         features: ctx.features,
     })
 }
@@ -1137,8 +1164,9 @@ fn emit_unary(ctx: &mut ComputeEmitContext<'_>, index: usize, spec: UnarySpec) -
         UnaryLowering::Convert { .. } => "",
     };
     ctx.body.push_str(&format!(
-        "    {init}\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{input_cb});\n    copy_tile(tt::CBIndex::c_{input_cb}, 0, 0);\n"
+        "    {init}\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n"
     ));
+    ctx.copy_to_dst(input_cb, 0);
     match spec.op {
         UnaryLowering::Tile(unary) => {
             ctx.features.add_unary(unary);
@@ -1146,12 +1174,9 @@ fn emit_unary(ctx: &mut ComputeEmitContext<'_>, index: usize, spec: UnarySpec) -
         }
         UnaryLowering::Convert { from, to } => {
             ctx.features.add_typecast();
-            let init = format!("  typecast_tile_init<{from}, {to}>();\n");
-            if !ctx.typecast_inits.contains(&init) {
-                ctx.typecast_inits.push(init);
-            }
-            ctx.body
-                .push_str(&format!("    typecast_tile<{from}, {to}>(0);\n"));
+            ctx.body.push_str(&format!(
+                "    typecast_tile_init<{from}, {to}>();\n    typecast_tile<{from}, {to}>(0);\n"
+            ));
         }
     }
     ctx.pack_and_pop(output_cb, &[spec.input])
@@ -1170,9 +1195,12 @@ fn emit_scalar_binary(
         ScalarBinaryFeature::UnaryCompare => ctx.features.add_unary_compare(),
     }
     ctx.body.push_str(&format!(
-        "    {}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short(tt::CBIndex::c_{value_cb});\n    copy_tile(tt::CBIndex::c_{value_cb}, 0, 0);\n    {}(0, {});\n",
-        spec.init, spec.tile, spec.scalar
+        "    {}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n",
+        spec.init
     ));
+    ctx.copy_to_dst(value_cb, 0);
+    ctx.body
+        .push_str(&format!("    {}(0, {});\n", spec.tile, spec.scalar));
     ctx.pack_and_pop(output_cb, &[spec.value_node])
 }
 
@@ -1187,7 +1215,7 @@ fn emit_binary(ctx: &mut ComputeEmitContext<'_>, index: usize, spec: BinarySpec)
             ctx.body.push_str(&format!(
                 "    constexpr DataFormat input_format_{index} = binary_input_data_format(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{output_cb});\n    {helper}_init<input_format_{index}>();\n"
             ));
-            append_binary_tile_setup(&mut ctx.body, output_cb, lhs_cb, rhs_cb);
+            append_binary_tile_setup(ctx, output_cb, lhs_cb, rhs_cb);
             ctx.body.push_str(&format!(
                 "    {helper}_tile<input_format_{index}>(0, 1, 0);\n"
             ));
@@ -1195,7 +1223,7 @@ fn emit_binary(ctx: &mut ComputeEmitContext<'_>, index: usize, spec: BinarySpec)
         BinaryLowering::Tile(binary) => {
             ctx.features.add_binary(binary);
             ctx.body.push_str(&format!("    {}();\n", binary.init));
-            append_binary_tile_setup(&mut ctx.body, output_cb, lhs_cb, rhs_cb);
+            append_binary_tile_setup(ctx, output_cb, lhs_cb, rhs_cb);
             ctx.body
                 .push_str(&format!("    {}(0, 1, 0);\n", binary.tile));
         }
@@ -1218,17 +1246,24 @@ fn emit_compare(
     ctx.body.push_str(&format!(
         "    compare_sub_init<{int32_input}>();\n    compare_zero_init(CompareDirection::{direction});\n"
     ));
-    append_binary_tile_setup(&mut ctx.body, output_cb, lhs_cb, rhs_cb);
+    append_binary_tile_setup(ctx, output_cb, lhs_cb, rhs_cb);
     ctx.body.push_str(&format!(
         "    compare_sub_tile<{int32_input}>(0, 1, 0);\n    compare_zero_tile<{int32_input}>(CompareDirection::{direction}, 0);\n"
     ));
     ctx.pack_and_pop(output_cb, &[spec.lhs, spec.rhs])
 }
 
-fn append_binary_tile_setup(body: &mut String, output_cb: u32, lhs_cb: u32, rhs_cb: u32) {
-    body.push_str(&format!(
-        "    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{lhs_cb});\n    copy_tile(tt::CBIndex::c_{lhs_cb}, 0, 0);\n    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb});\n    copy_tile(tt::CBIndex::c_{rhs_cb}, 0, 1);\n"
+fn append_binary_tile_setup(
+    ctx: &mut ComputeEmitContext<'_>,
+    output_cb: u32,
+    lhs_cb: u32,
+    rhs_cb: u32,
+) {
+    ctx.body.push_str(&format!(
+        "    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n"
     ));
+    ctx.copy_to_dst(lhs_cb, 0);
+    ctx.copy_to_dst(rhs_cb, 1);
 }
 
 fn cb_plan(nodes: &[FusedEltwiseNode]) -> io::Result<(Vec<Option<u32>>, Vec<(u32, DType)>)> {
@@ -1277,6 +1312,15 @@ fn cb_for_node(node_cbs: &[Option<u32>], node: usize) -> io::Result<u32> {
         .ok_or_else(|| invalid_input(format!("node {node} does not have a CB")))
 }
 
+fn cb_dtype(cb_dtypes: &[Option<DType>; 32], cb: u32) -> io::Result<DType> {
+    let index =
+        usize::try_from(cb).map_err(|_| invalid_input(format!("CB id out of range: {cb}")))?;
+    cb_dtypes
+        .get(index)
+        .and_then(|dtype| *dtype)
+        .ok_or_else(|| invalid_input(format!("CB {cb} does not have a dtype")))
+}
+
 fn append_waits(body: &mut String, cbs: &[u32]) {
     let mut waited = Vec::new();
     for &cb in cbs {
@@ -1290,13 +1334,21 @@ fn append_waits(body: &mut String, cbs: &[u32]) {
 
 fn append_pack_and_pop(
     body: &mut String,
+    previous_output_cb: u32,
+    reconfigure_pack: bool,
     output_cb: u32,
     input_nodes: &[usize],
     node_cbs: &[Option<u32>],
     remaining_uses: &mut [u32],
 ) -> io::Result<()> {
+    body.push_str(&format!("    tile_regs_commit();\n    tile_regs_wait();\n"));
+    if reconfigure_pack {
+        body.push_str(&format!(
+            "    pack_reconfig_data_format(tt::CBIndex::c_{previous_output_cb}, tt::CBIndex::c_{output_cb});\n"
+        ));
+    }
     body.push_str(&format!(
-        "    tile_regs_commit();\n    tile_regs_wait();\n    pack_tile(0, tt::CBIndex::c_{output_cb});\n    tile_regs_release();\n"
+        "    pack_tile(0, tt::CBIndex::c_{output_cb});\n    tile_regs_release();\n"
     ));
 
     let mut consumed = Vec::<(usize, u32)>::new();
