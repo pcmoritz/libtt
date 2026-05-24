@@ -445,14 +445,7 @@ bool isFusedFloatElementType(tt::TensorDesc::ElementType element_type) {
            element_type == tt::TensorDesc::ELEMENT_TYPE_F32;
 }
 
-bool supportsFusedLeafElementType(tt::TensorDesc::ElementType element_type) {
-    return isFusedFloatElementType(element_type) ||
-           element_type == tt::TensorDesc::ELEMENT_TYPE_U32 ||
-           element_type == tt::TensorDesc::ELEMENT_TYPE_S32 ||
-           element_type == tt::TensorDesc::ELEMENT_TYPE_U16;
-}
-
-bool supportsConvertElementType(tt::TensorDesc::ElementType element_type) {
+bool supportsFusedValueElementType(tt::TensorDesc::ElementType element_type) {
     return isFusedFloatElementType(element_type) ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_U32 ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_S32 ||
@@ -470,8 +463,8 @@ bool supportsFusedElementwiseDTypes(
     tt::TensorDesc::ElementType output_type) {
     using Node = tt::FusedElementwiseOp::Node;
     if (kind == Node::KIND_CONVERT) {
-        return supportsConvertElementType(input_type) &&
-               supportsConvertElementType(output_type);
+        return supportsFusedValueElementType(input_type) &&
+               supportsFusedValueElementType(output_type);
     }
     if (kind == Node::KIND_COMPARE) {
         return supportsCompareElementType(input_type) &&
@@ -483,7 +476,7 @@ bool supportsFusedElementwiseDTypes(
     switch (kind) {
         case Node::KIND_ADD:
         case Node::KIND_MULTIPLY:
-            return supportsFusedLeafElementType(input_type);
+            return supportsFusedValueElementType(input_type);
         case Node::KIND_SUBTRACT:
             return isFusedFloatElementType(input_type) ||
                    input_type == tt::TensorDesc::ELEMENT_TYPE_S32;
@@ -501,9 +494,9 @@ bool supportsFusedElementwiseDTypes(
     }
 }
 
-bool supportsFusedLeafElement(mlir::Value value) {
+bool supportsFusedValueElement(mlir::Value value) {
     auto element_type = staticValueElementType(value);
-    return element_type && supportsFusedLeafElementType(*element_type);
+    return element_type && supportsFusedValueElementType(*element_type);
 }
 
 bool sameTensorShape(mlir::Value lhs, mlir::Value rhs) {
@@ -683,7 +676,7 @@ std::optional<uint32_t> collectFusedElementwiseValue(
 
     std::string ignored;
     if (auto packed = packedConstantValue(value, ignored)) {
-        if (!supportsFusedLeafElement(value)) {
+        if (!supportsFusedValueElement(value)) {
             return std::nullopt;
         }
         FusedElementwiseNodeDesc node;
@@ -725,7 +718,7 @@ std::optional<uint32_t> collectFusedElementwiseValue(
         }
     }
 
-    if (!supportsFusedLeafElement(value) || !sameTensorShape(value, root_value)) {
+    if (!supportsFusedValueElement(value) || !sameTensorShape(value, root_value)) {
         return std::nullopt;
     }
 
