@@ -106,7 +106,9 @@ impl FusedElementwiseKind {
             }
             Self::Convert => {
                 let input_dtype = input_dtypes[0];
-                if !is_convert_dtype(input_dtype) || !is_convert_dtype(output_dtype) {
+                if !is_supported_value_dtype(input_dtype)
+                    || !is_supported_value_dtype(output_dtype)
+                {
                     return Err(invalid_input(format!(
                         "node[{node_index}] convert supports Float16, Float16B, Float32, Int32, UInt16, and UInt32, got {input_dtype:?} -> {output_dtype:?}"
                     )));
@@ -543,7 +545,7 @@ fn validate_and_collect_inputs<'a>(
         let dtype = node_dtype(node)?;
         match node.kind {
             FusedElementwiseKind::Input => {
-                if !is_supported_leaf_dtype(dtype) {
+                if !is_supported_value_dtype(dtype) {
                     return Err(invalid_input(format!(
                         "node[{index}] input dtype {:?} is not supported by fused eltwise",
                         dtype
@@ -594,7 +596,7 @@ fn validate_and_collect_inputs<'a>(
                 input_reads.push(buffer);
             }
             FusedElementwiseKind::Constant => {
-                if !is_supported_leaf_dtype(dtype) {
+                if !is_supported_value_dtype(dtype) {
                     return Err(invalid_input(format!(
                         "node[{index}] constant dtype {:?} is not supported by fused eltwise",
                         dtype
@@ -1425,7 +1427,7 @@ fn f16_to_f32_bits(value: u16) -> u32 {
     }
 }
 
-fn is_supported_leaf_dtype(dtype: DType) -> bool {
+fn is_supported_value_dtype(dtype: DType) -> bool {
     matches!(
         dtype,
         DType::Float16
@@ -1439,18 +1441,6 @@ fn is_supported_leaf_dtype(dtype: DType) -> bool {
 
 fn is_float_dtype(dtype: DType) -> bool {
     matches!(dtype, DType::Float16 | DType::Float16B | DType::Float32)
-}
-
-fn is_convert_dtype(dtype: DType) -> bool {
-    matches!(
-        dtype,
-        DType::Float16
-            | DType::Float16B
-            | DType::Float32
-            | DType::Int32
-            | DType::UInt16
-            | DType::UInt32
-    )
 }
 
 fn validate_same_output_dtype(
