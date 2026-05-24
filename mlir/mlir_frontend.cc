@@ -539,31 +539,29 @@ std::optional<tt::FusedElementwiseOp::Node::Kind> fusedElementwiseKind(
         .Default([](auto) { return std::nullopt; });
 }
 
-bool isFusableElementwiseOp(mlir::Operation* op) {
-    return op && op->getNumResults() == 1 &&
-           fusedElementwiseKind(op).has_value() &&
-           staticValueElementType(op->getResult(0)).has_value();
-}
-
-bool hasSupportedFusedElementwiseTypes(mlir::Operation* op) {
+std::optional<tt::FusedElementwiseOp::Node::Kind> supportedFusedElementwiseKind(
+    mlir::Operation* op) {
+    if (!op || op->getNumResults() != 1) {
+        return std::nullopt;
+    }
     auto kind = fusedElementwiseKind(op);
-    if (!isFusableElementwiseOp(op) || !kind) {
-        return false;
+    if (!kind) {
+        return std::nullopt;
     }
     mlir::Value result = op->getResult(0);
     auto result_element = staticValueElementType(result);
     if (!result_element) {
-        return false;
+        return std::nullopt;
     }
 
     std::optional<tt::TensorDesc::ElementType> input_element;
     for (mlir::Value operand : op->getOperands()) {
         auto operand_element = staticValueElementType(operand);
         if (!operand_element) {
-            return false;
+            return std::nullopt;
         }
         if (input_element && *input_element != *operand_element) {
-            return false;
+            return std::nullopt;
         }
         input_element = *operand_element;
         std::string ignored;
@@ -571,11 +569,14 @@ bool hasSupportedFusedElementwiseTypes(mlir::Operation* op) {
             continue;
         }
         if (!sameTensorShape(operand, result)) {
-            return false;
+            return std::nullopt;
         }
     }
-    return input_element &&
-           supportsFusedElementwiseDTypes(*kind, *input_element, *result_element);
+    if (!input_element ||
+        !supportsFusedElementwiseDTypes(*kind, *input_element, *result_element)) {
+        return std::nullopt;
+    }
+    return kind;
 }
 
 uint32_t addFusedNode(
@@ -626,18 +627,21 @@ std::optional<uint32_t> collectFusedElementwiseOp(
     bool is_root,
     FusedElementwiseRegion& region,
     llvm::DenseMap<mlir::Value, uint32_t>& node_ids) {
-    if (!is_root && !op->getResult(0).hasOneUse()) {
+    auto kind = supportedFusedElementwiseKind(op);
+    if (!kind) {
         return std::nullopt;
     }
-    if (!sameTensorShape(op->getResult(0), root_value) ||
-        !hasSupportedFusedElementwiseTypes(op)) {
+    mlir::Value result = op->getResult(0);
+    if (!is_root && !result.hasOneUse()) {
+        return std::nullopt;
+    }
+    if (!sameTensorShape(result, root_value)) {
         return std::nullopt;
     }
 
-    auto kind = *fusedElementwiseKind(op);
     FusedElementwiseNodeDesc node;
-    node.kind = kind;
-    node.element_type = valueElementType(op->getResult(0));
+    node.kind = *kind;
+    node.element_type = valueElementType(result);
     if (auto compare_op = mlir::dyn_cast<mlir::stablehlo::CompareOp>(op)) {
         node.compare_direction = mapCompareDirection(compare_op.getComparisonDirection());
     }
@@ -657,7 +661,7 @@ std::optional<uint32_t> collectFusedElementwiseOp(
     }
 
     uint32_t node_id = addFusedNode(candidate_region, std::move(node));
-    candidate_node_ids.try_emplace(op->getResult(0), node_id);
+    candidate_node_ids.try_emplace(result, node_id);
     candidate_region.covered_ops.push_back(op);
     region = std::move(candidate_region);
     node_ids = std::move(candidate_node_ids);
@@ -689,8 +693,7 @@ std::optional<uint32_t> collectFusedElementwiseValue(
         return node_id;
     }
 
-    if (auto* defining_op = value.getDefiningOp();
-        defining_op && isFusableElementwiseOp(defining_op)) {
+    if (auto* defining_op = value.getDefiningOp()) {
         if (auto node_id = collectFusedElementwiseOp(
                 defining_op, root_value, false, region, node_ids)) {
             return node_id;
@@ -733,10 +736,6 @@ std::optional<uint32_t> collectFusedElementwiseValue(
 
 std::optional<FusedElementwiseRegion> collectFusedElementwiseRegion(
     mlir::Operation* root) {
-    if (!hasSupportedFusedElementwiseTypes(root)) {
-        return std::nullopt;
-    }
-
     FusedElementwiseRegion region;
     llvm::DenseMap<mlir::Value, uint32_t> node_ids;
     auto collected_root = collectFusedElementwiseOp(
