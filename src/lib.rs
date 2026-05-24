@@ -16,6 +16,7 @@ mod kernels;
 mod linux;
 mod log;
 mod mlir_frontend;
+mod utils;
 
 use device::Device;
 use dram::{DType, DramBuffer};
@@ -309,23 +310,11 @@ unsafe fn checked_ref<'a, T>(ptr: *const T, name: &str) -> Result<&'a T, *mut PJ
 }
 
 fn pjrt_buffer_type_to_dtype(buffer_type: PJRT_Buffer_Type) -> Result<DType, *mut PJRT_Error> {
-    match buffer_type {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S8 => Ok(DType::Int8),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => Ok(DType::UInt8),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Ok(DType::Int32),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 => Ok(DType::UInt8),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Ok(DType::UInt16),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => Ok(DType::UInt32),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F16 => Ok(DType::Float16),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 => Ok(DType::Float32),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => Ok(DType::Float16B),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_INVALID => {
-            Err(invalid_argument("invalid PJRT buffer type"))
-        }
-        _ => Err(unimplemented(format!(
-            "unsupported PJRT buffer type {buffer_type:?}"
-        ))),
-    }
+    utils::pjrt_buffer_type_to_dtype(buffer_type).map_err(|err| match err.kind() {
+        io::ErrorKind::InvalidInput => invalid_argument(err.to_string()),
+        io::ErrorKind::Unsupported => unimplemented(err.to_string()),
+        _ => io_error(err),
+    })
 }
 
 fn dtype_to_pjrt_buffer_type(dtype: DType) -> PJRT_Buffer_Type {
@@ -1478,13 +1467,13 @@ fn device_buffer_for_value<'a>(
         .ok_or_else(|| invalid_argument(format!("{field} value id {value_id} is not available")))
 }
 
-fn eltwise_input<'a>(
+fn select_value_input<'a>(
     values: &'a [Option<PJRT_Buffer>],
     plan: &'a executable::Executable,
     value_id: u32,
     expected_dtype: DType,
     field: &str,
-) -> Result<kernels::binary_eltwise::EltwiseInput<'a>, *mut PJRT_Error> {
+) -> Result<kernels::select::SelectInput<'a>, *mut PJRT_Error> {
     let index = value_id as usize;
     if let Some(buffer) = values.get(index).and_then(|value| value.as_ref()) {
         let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
@@ -1492,7 +1481,7 @@ fn eltwise_input<'a>(
                 "TT executable {field} buffer has no device allocation"
             )));
         };
-        return Ok(kernels::binary_eltwise::EltwiseInput::Dram(dram_buffer));
+        return Ok(kernels::select::SelectInput::Dram(dram_buffer));
     }
     for op in &plan.ops {
         if let executable::Op::Constant {
@@ -1513,32 +1502,13 @@ fn eltwise_input<'a>(
                         desc.element_type
                     )));
                 }
-                return Ok(kernels::binary_eltwise::EltwiseInput::Constant(
-                    *packed_value,
-                ));
+                return Ok(kernels::select::SelectInput::Constant(*packed_value));
             }
         }
     }
     Err(invalid_argument(format!(
         "{field} value id {value_id} is not available"
     )))
-}
-
-fn select_value_input<'a>(
-    values: &'a [Option<PJRT_Buffer>],
-    plan: &'a executable::Executable,
-    value_id: u32,
-    expected_dtype: DType,
-    field: &str,
-) -> Result<kernels::select::SelectInput<'a>, *mut PJRT_Error> {
-    match eltwise_input(values, plan, value_id, expected_dtype, field)? {
-        kernels::binary_eltwise::EltwiseInput::Dram(buffer) => {
-            Ok(kernels::select::SelectInput::Dram(buffer))
-        }
-        kernels::binary_eltwise::EltwiseInput::Constant(value) => {
-            Ok(kernels::select::SelectInput::Constant(value))
-        }
-    }
 }
 
 struct OutputContext {
@@ -1593,146 +1563,6 @@ fn store_output_buffer(
         deleted: false,
     });
     Ok(())
-}
-
-fn execute_binary_eltwise(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    device: &mut Device,
-    context: &OutputContext,
-    op: kernels::binary_eltwise::BinaryEltwiseOp,
-    input_ids: [u32; 2],
-    output_id: u32,
-    op_name: &str,
-) -> Result<(), *mut PJRT_Error> {
-    let lhs_field = format!("{op_name}.lhs");
-    let rhs_field = format!("{op_name}.rhs");
-    let lhs_desc = plan
-        .values
-        .get(input_ids[0] as usize)
-        .ok_or_else(|| invalid_argument(format!("{lhs_field} value id is out of bounds")))?;
-    let rhs_desc = plan
-        .values
-        .get(input_ids[1] as usize)
-        .ok_or_else(|| invalid_argument(format!("{rhs_field} value id is out of bounds")))?;
-    if lhs_desc.element_type != rhs_desc.element_type {
-        return Err(invalid_argument(format!(
-            "TT executable {op_name} input element types must match"
-        )));
-    }
-    if lhs_desc.dims != rhs_desc.dims {
-        return Err(invalid_argument(format!(
-            "TT executable {op_name} input shapes must match"
-        )));
-    }
-    let input_dtype = pjrt_buffer_type_to_dtype(lhs_desc.element_type)?;
-    let expected_output_type = match op {
-        kernels::binary_eltwise::BinaryEltwiseOp::Add
-        | kernels::binary_eltwise::BinaryEltwiseOp::Subtract
-        | kernels::binary_eltwise::BinaryEltwiseOp::Divide
-        | kernels::binary_eltwise::BinaryEltwiseOp::Multiply
-        | kernels::binary_eltwise::BinaryEltwiseOp::Power
-        | kernels::binary_eltwise::BinaryEltwiseOp::Max => lhs_desc.element_type,
-        kernels::binary_eltwise::BinaryEltwiseOp::Compare(_) => {
-            if !matches!(input_dtype, DType::Float16B | DType::Float32 | DType::Int32) {
-                return Err(unimplemented(format!(
-                    "TT executable compare currently supports bf16, f32, and s32 inputs, got {:?}",
-                    lhs_desc.element_type
-                )));
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
-        }
-    };
-    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable {op_name} output id {output_id} is out of bounds"
-        ))
-    })?;
-    if output_desc.element_type != expected_output_type {
-        return Err(invalid_argument(format!(
-            "TT executable {op_name} output must be {:?}, got {:?}",
-            expected_output_type, output_desc.element_type
-        )));
-    }
-
-    let output_dims = lhs_desc.dims.clone();
-    let shape = dims_i64_to_usize(&output_dims)?;
-    let lhs_input = eltwise_input(values, plan, input_ids[0], input_dtype, &lhs_field)?;
-    let rhs_input = eltwise_input(values, plan, input_ids[1], input_dtype, &rhs_field)?;
-    let output_name = format!("pjrt_{op_name}");
-    let output_dram = kernels::binary_eltwise::eltwise(
-        device,
-        op,
-        lhs_input,
-        rhs_input,
-        input_dtype,
-        &shape,
-        output_name,
-    )
-    .map_err(io_error)?;
-    store_output_buffer(
-        values,
-        plan,
-        output_id,
-        output_dims,
-        output_dram,
-        context,
-        op_name,
-    )
-}
-
-fn execute_unary_eltwise(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    device: &mut Device,
-    context: &OutputContext,
-    op: kernels::unary_eltwise::UnaryEltwiseOp,
-    input_id: u32,
-    output_id: u32,
-    op_name: &str,
-) -> Result<(), *mut PJRT_Error> {
-    let input_field = format!("{op_name}.input");
-    let input_desc = plan
-        .values
-        .get(input_id as usize)
-        .ok_or_else(|| invalid_argument(format!("{input_field} value id is out of bounds")))?;
-    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable {op_name} output id {output_id} is out of bounds"
-        ))
-    })?;
-    if output_desc.dims != input_desc.dims {
-        return Err(invalid_argument(format!(
-            "TT executable {op_name} output shape mismatch: expected {:?}, got {:?}",
-            input_desc.dims, output_desc.dims
-        )));
-    }
-
-    let input_dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
-    let output_dims = input_desc.dims.clone();
-    let shape = dims_i64_to_usize(&output_dims)?;
-    let input = eltwise_input(values, plan, input_id, input_dtype, &input_field)?;
-    let output_name = format!("pjrt_{op_name}");
-    let output_dram = kernels::unary_eltwise::eltwise(
-        device,
-        op,
-        input,
-        input_dtype,
-        output_dtype,
-        &shape,
-        output_name,
-    )
-    .map_err(io_error)?;
-    store_output_buffer(
-        values,
-        plan,
-        output_id,
-        output_dims,
-        output_dram,
-        context,
-        op_name,
-    )
 }
 
 fn execute_reshape(
@@ -1840,6 +1670,65 @@ fn execute_slice(
         output_dram,
         context,
         "slice",
+    )
+}
+
+fn execute_fused_elementwise(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    output_id: u32,
+    nodes: &[executable::FusedElementwiseNode],
+) -> Result<(), *mut PJRT_Error> {
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable fused_elementwise output id {output_id} is out of bounds"
+        ))
+    })?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let root = nodes
+        .last()
+        .ok_or_else(|| invalid_argument("TT executable fused_elementwise has no nodes"))?;
+    if root.element_type != output_desc.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable fused_elementwise root type {:?} does not match output type {:?}",
+            root.element_type, output_desc.element_type
+        )));
+    }
+
+    let mut inputs = Vec::with_capacity(input_ids.len());
+    for (index, &input_id) in input_ids.iter().enumerate() {
+        let input = device_buffer_for_value(
+            values,
+            input_id,
+            &format!("fused_elementwise.input[{index}]"),
+        )?;
+        let Some(input_dram) = input.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable fused_elementwise input[{index}] buffer has no device allocation"
+            )));
+        };
+        inputs.push(input_dram);
+    }
+
+    let output_dram = kernels::fused_eltwise::eltwise(
+        device,
+        &inputs,
+        nodes,
+        &output_shape,
+        "pjrt_fused_elementwise",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "fused_elementwise",
     )
 }
 
@@ -2521,81 +2410,6 @@ fn execute_executable_v1(
                 }
                 values[output_index] = Some(input.clone());
             }
-            executable::Op::Add {
-                input_ids,
-                output_id,
-            } => {
-                execute_binary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Add,
-                    *input_ids,
-                    *output_id,
-                    "add",
-                )?;
-            }
-            executable::Op::Subtract {
-                input_ids,
-                output_id,
-            } => {
-                execute_binary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Subtract,
-                    *input_ids,
-                    *output_id,
-                    "subtract",
-                )?;
-            }
-            executable::Op::Multiply {
-                input_ids,
-                output_id,
-            } => {
-                execute_binary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Multiply,
-                    *input_ids,
-                    *output_id,
-                    "multiply",
-                )?;
-            }
-            executable::Op::Divide {
-                input_ids,
-                output_id,
-            } => {
-                execute_binary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Divide,
-                    *input_ids,
-                    *output_id,
-                    "divide",
-                )?;
-            }
-            executable::Op::Power {
-                input_ids,
-                output_id,
-            } => {
-                execute_binary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Power,
-                    *input_ids,
-                    *output_id,
-                    "power",
-                )?;
-            }
             executable::Op::Concatenate {
                 input_ids,
                 output_id,
@@ -2608,45 +2422,6 @@ fn execute_executable_v1(
                 input_ids,
                 *output_id,
                 *dimension,
-            )?,
-            executable::Op::Cosine {
-                input_id,
-                output_id,
-            } => execute_unary_eltwise(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Cosine,
-                *input_id,
-                *output_id,
-                "cosine",
-            )?,
-            executable::Op::Sine {
-                input_id,
-                output_id,
-            } => execute_unary_eltwise(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Sine,
-                *input_id,
-                *output_id,
-                "sine",
-            )?,
-            executable::Op::Rsqrt {
-                input_id,
-                output_id,
-            } => execute_unary_eltwise(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Rsqrt,
-                *input_id,
-                *output_id,
-                "rsqrt",
             )?,
             executable::Op::Reshape {
                 input_id,
@@ -2675,32 +2450,6 @@ fn execute_executable_v1(
                 start_indices,
                 limit_indices,
                 strides,
-            )?,
-            executable::Op::Negate {
-                input_id,
-                output_id,
-            } => execute_unary_eltwise(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Negate,
-                *input_id,
-                *output_id,
-                "negate",
-            )?,
-            executable::Op::Exponential {
-                input_id,
-                output_id,
-            } => execute_unary_eltwise(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Exponential,
-                *input_id,
-                *output_id,
-                "exponential",
             )?,
             executable::Op::Transpose {
                 input_id,
@@ -2742,19 +2491,6 @@ fn execute_executable_v1(
                     "TT executable custom_call {call_target_name:?} execution is not currently supported"
                 )));
             }
-            executable::Op::Convert {
-                input_id,
-                output_id,
-            } => execute_unary_eltwise(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                kernels::unary_eltwise::UnaryEltwiseOp::Convert,
-                *input_id,
-                *output_id,
-                "convert",
-            )?,
             executable::Op::Reduce {
                 input_ids,
                 init_value_ids,
@@ -2772,21 +2508,6 @@ fn execute_executable_v1(
                 dimensions,
                 *reducer,
             )?,
-            executable::Op::Max {
-                input_ids,
-                output_id,
-            } => {
-                execute_binary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Max,
-                    *input_ids,
-                    *output_id,
-                    "max",
-                )?;
-            }
             executable::Op::Matmul {
                 input_ids,
                 output_id,
@@ -2849,22 +2570,6 @@ fn execute_executable_v1(
                 )?;
             }
             executable::Op::Constant { .. } => {}
-            executable::Op::Compare {
-                input_ids,
-                output_id,
-                direction,
-            } => {
-                execute_binary_eltwise(
-                    &mut values,
-                    plan,
-                    device,
-                    &output_context,
-                    kernels::binary_eltwise::BinaryEltwiseOp::Compare(*direction),
-                    *input_ids,
-                    *output_id,
-                    "compare",
-                )?;
-            }
             executable::Op::Select {
                 input_ids,
                 output_id,
@@ -2934,6 +2639,19 @@ fn execute_executable_v1(
                 *values_id,
                 *indices_id,
                 *k,
+            )?,
+            executable::Op::FusedElementwise {
+                input_ids,
+                output_id,
+                nodes,
+            } => execute_fused_elementwise(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_ids,
+                *output_id,
+                nodes,
             )?,
         }
     }
@@ -4411,113 +4129,71 @@ mod tests {
     }
 
     #[cfg(libtt_mlir_frontend)]
-    #[derive(Clone, Copy, Debug)]
-    enum BinaryOpKind {
-        Add,
-        Subtract,
-        Multiply,
-        Divide,
-        Power,
+    fn assert_fused_elementwise<'a>(
+        op: &'a executable::Op,
+        expected_inputs: &[u32],
+        expected_output: u32,
+    ) -> &'a [executable::FusedElementwiseNode] {
+        let executable::Op::FusedElementwise {
+            input_ids,
+            output_id,
+            nodes,
+        } = op
+        else {
+            panic!("expected fused elementwise op");
+        };
+        assert_eq!(input_ids.as_slice(), expected_inputs);
+        assert_eq!(*output_id, expected_output);
+        nodes
     }
 
     #[cfg(libtt_mlir_frontend)]
-    fn assert_binary_op(op: &executable::Op, expected: BinaryOpKind) {
-        match (expected, op) {
-            (
-                BinaryOpKind::Add,
-                executable::Op::Add {
-                    input_ids,
-                    output_id,
-                },
-            )
-            | (
-                BinaryOpKind::Subtract,
-                executable::Op::Subtract {
-                    input_ids,
-                    output_id,
-                },
-            )
-            | (
-                BinaryOpKind::Multiply,
-                executable::Op::Multiply {
-                    input_ids,
-                    output_id,
-                },
-            )
-            | (
-                BinaryOpKind::Divide,
-                executable::Op::Divide {
-                    input_ids,
-                    output_id,
-                },
-            )
-            | (
-                BinaryOpKind::Power,
-                executable::Op::Power {
-                    input_ids,
-                    output_id,
-                },
-            ) => {
-                assert_eq!(*input_ids, [0, 1]);
-                assert_eq!(*output_id, 2);
-            }
-            _ => panic!("expected {expected:?} op"),
+    fn fused_kinds(
+        nodes: &[executable::FusedElementwiseNode],
+    ) -> Vec<executable::FusedElementwiseKind> {
+        nodes.iter().map(|node| node.kind).collect()
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    fn assert_fused_add_chain(op: &executable::Op) {
+        let nodes = assert_fused_elementwise(op, &[0, 1, 2], 3);
+        assert_eq!(nodes.len(), 5);
+        assert_eq!(
+            fused_kinds(nodes),
+            vec![
+                executable::FusedElementwiseKind::Input,
+                executable::FusedElementwiseKind::Input,
+                executable::FusedElementwiseKind::Add,
+                executable::FusedElementwiseKind::Input,
+                executable::FusedElementwiseKind::Add,
+            ]
+        );
+        assert_eq!(nodes[0].input_index, 0);
+        assert_eq!(nodes[1].input_index, 1);
+        assert_eq!(nodes[2].input_nodes, vec![0, 1]);
+        assert_eq!(nodes[3].input_index, 2);
+        assert_eq!(nodes[4].input_nodes, vec![2, 3]);
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    fn assert_single_fused_op(
+        op: &executable::Op,
+        expected_inputs: &[u32],
+        expected_output: u32,
+        expected_kind: executable::FusedElementwiseKind,
+    ) {
+        let nodes = assert_fused_elementwise(op, expected_inputs, expected_output);
+        assert_eq!(nodes.len(), expected_inputs.len() + 1);
+        for (index, node) in nodes.iter().take(expected_inputs.len()).enumerate() {
+            assert_eq!(node.kind, executable::FusedElementwiseKind::Input);
+            assert_eq!(node.input_index, index as u32);
         }
-    }
-
-    #[cfg(libtt_mlir_frontend)]
-    #[derive(Clone, Copy, Debug)]
-    enum UnaryOpKind {
-        Cosine,
-        Sine,
-        Rsqrt,
-        Negate,
-        Exponential,
-    }
-
-    #[cfg(libtt_mlir_frontend)]
-    fn assert_unary_op(op: &executable::Op, expected: UnaryOpKind) {
-        match (expected, op) {
-            (
-                UnaryOpKind::Cosine,
-                executable::Op::Cosine {
-                    input_id,
-                    output_id,
-                },
-            )
-            | (
-                UnaryOpKind::Sine,
-                executable::Op::Sine {
-                    input_id,
-                    output_id,
-                },
-            )
-            | (
-                UnaryOpKind::Rsqrt,
-                executable::Op::Rsqrt {
-                    input_id,
-                    output_id,
-                },
-            )
-            | (
-                UnaryOpKind::Negate,
-                executable::Op::Negate {
-                    input_id,
-                    output_id,
-                },
-            )
-            | (
-                UnaryOpKind::Exponential,
-                executable::Op::Exponential {
-                    input_id,
-                    output_id,
-                },
-            ) => {
-                assert_eq!(*input_id, 0);
-                assert_eq!(*output_id, 1);
-            }
-            _ => panic!("expected {expected:?} op"),
-        }
+        let root = nodes.last().expect("single fused op should have root");
+        assert_eq!(root.kind, expected_kind);
+        assert_eq!(
+            root.input_nodes,
+            (0..expected_inputs.len() as u32).collect::<Vec<_>>()
+        );
     }
 
     #[cfg(libtt_mlir_frontend)]
@@ -4527,7 +4203,7 @@ mod tests {
             name: &'static str,
             op_name: &'static str,
             ty: &'static str,
-            expected: BinaryOpKind,
+            expected: executable::FusedElementwiseKind,
         }
 
         let cases = [
@@ -4535,31 +4211,31 @@ mod tests {
                 name: "add",
                 op_name: "add",
                 ty: "bf16",
-                expected: BinaryOpKind::Add,
+                expected: executable::FusedElementwiseKind::Add,
             },
             Case {
                 name: "multiply",
                 op_name: "multiply",
                 ty: "bf16",
-                expected: BinaryOpKind::Multiply,
+                expected: executable::FusedElementwiseKind::Multiply,
             },
             Case {
                 name: "subtract",
                 op_name: "subtract",
                 ty: "bf16",
-                expected: BinaryOpKind::Subtract,
+                expected: executable::FusedElementwiseKind::Subtract,
             },
             Case {
                 name: "divide",
                 op_name: "divide",
                 ty: "bf16",
-                expected: BinaryOpKind::Divide,
+                expected: executable::FusedElementwiseKind::Divide,
             },
             Case {
                 name: "power",
                 op_name: "power",
                 ty: "f32",
-                expected: BinaryOpKind::Power,
+                expected: executable::FusedElementwiseKind::Power,
             },
         ];
 
@@ -4580,7 +4256,7 @@ mod tests {
                 assert_eq!(executable.values.len(), 3, "{} values", case.name);
                 assert_eq!(executable.output_ids, vec![2], "{} outputs", case.name);
                 assert_eq!(executable.ops.len(), 3, "{} ops", case.name);
-                assert_binary_op(&executable.ops[2], case.expected);
+                assert_single_fused_op(&executable.ops[2], &[0, 1], 2, case.expected);
             });
         }
     }
@@ -4598,9 +4274,47 @@ mod tests {
 }
 "#,
             |executable| {
-                assert_eq!(executable.values.len(), 5);
-                assert_eq!(executable.ops.len(), 5);
-                assert_eq!(executable.output_ids, vec![4]);
+                assert_eq!(executable.values.len(), 4);
+                assert_eq!(executable.ops.len(), 4);
+                assert_eq!(executable.output_ids, vec![3]);
+                assert_fused_add_chain(&executable.ops[3]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_silu_product_as_fused_elementwise() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func @main(%arg0: tensor<2x2xbf16>, %arg1: tensor<2x2xbf16>) -> tensor<2x2xbf16> {
+    %cst = stablehlo.constant dense<1.000000e+00> : tensor<bf16>
+    %0 = stablehlo.negate %arg0 : tensor<2x2xbf16>
+    %1 = stablehlo.exponential %0 : tensor<2x2xbf16>
+    %2 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<bf16>) -> tensor<2x2xbf16>
+    %3 = stablehlo.add %1, %2 : tensor<2x2xbf16>
+    %4 = stablehlo.divide %arg0, %3 : tensor<2x2xbf16>
+    %5 = stablehlo.multiply %4, %arg1 : tensor<2x2xbf16>
+    return %5 : tensor<2x2xbf16>
+  }
+}
+"#,
+            |executable| {
+                let fused = executable
+                    .ops
+                    .iter()
+                    .find(|op| matches!(op, executable::Op::FusedElementwise { .. }))
+                    .expect("expected fused elementwise op");
+                let nodes = assert_fused_elementwise(fused, &[0, 1], executable.output_ids[0]);
+                assert_eq!(nodes.len(), 8);
+                assert_eq!(nodes[7].kind, executable::FusedElementwiseKind::Multiply);
+
+                let input_indices = nodes
+                    .iter()
+                    .filter(|node| node.kind == executable::FusedElementwiseKind::Input)
+                    .map(|node| node.input_index)
+                    .collect::<Vec<_>>();
+                assert_eq!(input_indices, vec![0, 1]);
             },
         );
     }
@@ -4619,27 +4333,20 @@ mod tests {
 }
 "#,
             |executable| {
-                assert_eq!(executable.output_ids, vec![3]);
-                assert_eq!(executable.ops.len(), 4);
-                let executable::Op::Constant {
-                    packed_value,
-                    output_id,
-                } = &executable.ops[1]
-                else {
-                    panic!("scalar constant should lower to Constant");
-                };
-                assert_eq!(*output_id, 1);
-                assert_eq!(*packed_value, 0x3f80_3f80);
-                let executable::Op::Constant {
-                    packed_value,
-                    output_id,
-                } = &executable.ops[2]
-                else {
-                    panic!("broadcasted constant should lower to Constant");
-                };
-                assert_eq!(*output_id, 2);
-                assert_eq!(*packed_value, 0x3f80_3f80);
-                assert!(matches!(executable.ops[3], executable::Op::Max { .. }));
+                assert_eq!(executable.output_ids, vec![1]);
+                assert_eq!(executable.ops.len(), 2);
+                let nodes = assert_fused_elementwise(&executable.ops[1], &[0], 1);
+                assert_eq!(nodes.len(), 3);
+                assert_eq!(
+                    fused_kinds(nodes),
+                    vec![
+                        executable::FusedElementwiseKind::Input,
+                        executable::FusedElementwiseKind::Constant,
+                        executable::FusedElementwiseKind::Max,
+                    ]
+                );
+                assert_eq!(nodes[1].packed_value, 0x3f80_3f80);
+                assert_eq!(nodes[2].input_nodes, vec![0, 1]);
             },
         );
     }
@@ -4689,53 +4396,35 @@ mod tests {
 }
 "#,
             |executable| {
-                assert_eq!(executable.output_ids, vec![7]);
-                assert_eq!(executable.ops.len(), 8);
-                let executable::Op::Constant { output_id, .. } = &executable.ops[1] else {
-                    panic!("scalar constant should lower to Constant");
-                };
-                assert_eq!(*output_id, 1);
-                let executable::Op::Constant { output_id, .. } = &executable.ops[2] else {
-                    panic!("broadcasted constant should lower to Constant");
-                };
-                assert_eq!(*output_id, 2);
-                let executable::Op::Compare {
-                    input_ids,
-                    output_id,
-                    direction,
-                } = &executable.ops[3]
-                else {
-                    panic!("compare should lower to Compare");
-                };
-                assert_eq!(*input_ids, [0, 2]);
-                assert_eq!(*output_id, 3);
-                assert_eq!(*direction, executable::CompareDirection::Lt);
-                let executable::Op::Constant { output_id, .. } = &executable.ops[4] else {
-                    panic!("second scalar constant should lower to Constant");
-                };
-                assert_eq!(*output_id, 4);
-                let executable::Op::Constant { output_id, .. } = &executable.ops[5] else {
-                    panic!("second broadcasted constant should lower to Constant");
-                };
-                assert_eq!(*output_id, 5);
-                let executable::Op::Add {
-                    input_ids,
-                    output_id,
-                } = &executable.ops[6]
-                else {
-                    panic!("add should lower to Add");
-                };
-                assert_eq!(*input_ids, [0, 5]);
-                assert_eq!(*output_id, 6);
+                assert_eq!(executable.output_ids, vec![3]);
+                assert_eq!(executable.ops.len(), 4);
+                let nodes = assert_fused_elementwise(&executable.ops[1], &[0], 1);
+                assert_eq!(
+                    fused_kinds(nodes),
+                    vec![
+                        executable::FusedElementwiseKind::Input,
+                        executable::FusedElementwiseKind::Constant,
+                        executable::FusedElementwiseKind::Compare(executable::CompareDirection::Lt),
+                    ]
+                );
+                let nodes = assert_fused_elementwise(&executable.ops[2], &[0], 2);
+                assert_eq!(
+                    fused_kinds(nodes),
+                    vec![
+                        executable::FusedElementwiseKind::Input,
+                        executable::FusedElementwiseKind::Constant,
+                        executable::FusedElementwiseKind::Add,
+                    ]
+                );
                 let executable::Op::Select {
                     input_ids,
                     output_id,
-                } = &executable.ops[7]
+                } = &executable.ops[3]
                 else {
                     panic!("select should lower to Select");
                 };
-                assert_eq!(*input_ids, [3, 6, 0]);
-                assert_eq!(*output_id, 7);
+                assert_eq!(*input_ids, [1, 2, 0]);
+                assert_eq!(*output_id, 3);
             },
         );
     }
@@ -4869,34 +4558,34 @@ mod tests {
         struct Case {
             name: &'static str,
             op_name: &'static str,
-            expected: UnaryOpKind,
+            expected: executable::FusedElementwiseKind,
         }
 
         let cases = [
             Case {
                 name: "cosine",
                 op_name: "cosine",
-                expected: UnaryOpKind::Cosine,
+                expected: executable::FusedElementwiseKind::Cosine,
             },
             Case {
                 name: "sine",
                 op_name: "sine",
-                expected: UnaryOpKind::Sine,
+                expected: executable::FusedElementwiseKind::Sine,
             },
             Case {
                 name: "rsqrt",
                 op_name: "rsqrt",
-                expected: UnaryOpKind::Rsqrt,
+                expected: executable::FusedElementwiseKind::Rsqrt,
             },
             Case {
                 name: "negate",
                 op_name: "negate",
-                expected: UnaryOpKind::Negate,
+                expected: executable::FusedElementwiseKind::Negate,
             },
             Case {
                 name: "exponential",
                 op_name: "exponential",
-                expected: UnaryOpKind::Exponential,
+                expected: executable::FusedElementwiseKind::Exponential,
             },
         ];
 
@@ -4915,7 +4604,7 @@ mod tests {
             with_compiled_mlir_executable(&code, |executable| {
                 assert_eq!(executable.output_ids, vec![1], "{} outputs", case.name);
                 assert_eq!(executable.ops.len(), 2, "{} ops", case.name);
-                assert_unary_op(&executable.ops[1], case.expected);
+                assert_single_fused_op(&executable.ops[1], &[0], 1, case.expected);
             });
         }
     }
@@ -5098,15 +4787,65 @@ mod tests {
             |executable| {
                 assert_eq!(executable.output_ids, vec![1]);
                 assert_eq!(executable.ops.len(), 2);
-                let executable::Op::Convert {
-                    input_id,
-                    output_id,
-                } = &executable.ops[1]
-                else {
-                    panic!("convert should lower to Convert");
-                };
-                assert_eq!(*input_id, 0);
-                assert_eq!(*output_id, 1);
+                assert_single_fused_op(
+                    &executable.ops[1],
+                    &[0],
+                    1,
+                    executable::FusedElementwiseKind::Convert,
+                );
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_fuses_mixed_convert_chain() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<1x64xbf16>, %arg1: tensor<1x64xf32>) -> tensor<1x64xbf16> {
+    %0 = stablehlo.convert %arg0 : (tensor<1x64xbf16>) -> tensor<1x64xf32>
+    %1 = stablehlo.multiply %0, %arg1 : tensor<1x64xf32>
+    %2 = stablehlo.convert %1 : (tensor<1x64xf32>) -> tensor<1x64xbf16>
+    return %2 : tensor<1x64xbf16>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![2]);
+                assert_eq!(executable.ops.len(), 3);
+                let nodes = assert_fused_elementwise(&executable.ops[2], &[0, 1], 2);
+                assert_eq!(nodes.len(), 5);
+                assert_eq!(
+                    fused_kinds(nodes),
+                    vec![
+                        executable::FusedElementwiseKind::Input,
+                        executable::FusedElementwiseKind::Convert,
+                        executable::FusedElementwiseKind::Input,
+                        executable::FusedElementwiseKind::Multiply,
+                        executable::FusedElementwiseKind::Convert,
+                    ]
+                );
+                assert_eq!(nodes[0].input_index, 0);
+                assert_eq!(nodes[1].input_nodes, vec![0]);
+                assert_eq!(
+                    nodes[1].element_type,
+                    PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+                );
+                assert_eq!(nodes[2].input_index, 1);
+                assert_eq!(
+                    nodes[2].element_type,
+                    PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+                );
+                assert_eq!(nodes[3].input_nodes, vec![1, 2]);
+                assert_eq!(
+                    nodes[3].element_type,
+                    PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+                );
+                assert_eq!(nodes[4].input_nodes, vec![3]);
+                assert_eq!(
+                    nodes[4].element_type,
+                    PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                );
             },
         );
     }
@@ -5124,26 +4863,17 @@ mod tests {
 }
 "#,
             |executable| {
-                assert_eq!(executable.output_ids, vec![1]);
-                assert_eq!(executable.ops.len(), 2);
+                assert_eq!(executable.output_ids, vec![0]);
+                assert_eq!(executable.ops.len(), 1);
                 let executable::Op::Constant {
                     packed_value,
                     output_id,
                 } = &executable.ops[0]
                 else {
-                    panic!("scalar constant should lower to Constant");
+                    panic!("converted scalar constant should lower to Constant");
                 };
                 assert_eq!(*output_id, 0);
-                assert_eq!(*packed_value, 0x3f80_0000);
-                let executable::Op::Convert {
-                    input_id,
-                    output_id,
-                } = &executable.ops[1]
-                else {
-                    panic!("convert should lower to Convert");
-                };
-                assert_eq!(*input_id, 0);
-                assert_eq!(*output_id, 1);
+                assert_eq!(*packed_value, 0x3f80_3f80);
             },
         );
     }

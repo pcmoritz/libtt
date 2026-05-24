@@ -1,9 +1,10 @@
-#[cfg(libtt_mlir_frontend)]
 use crate::PJRT_Buffer_Type;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status;
 #[cfg(libtt_mlir_frontend)]
-use executable_proto::tt::compare_op::Direction as ProtoCompareDirection;
+use executable_proto::tt::fused_elementwise_op::node::CompareDirection as ProtoFusedElementwiseCompareDirection;
+#[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::fused_elementwise_op::node::Kind as ProtoFusedElementwiseKind;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::op::Kind;
 #[cfg(libtt_mlir_frontend)]
@@ -42,42 +43,10 @@ pub(crate) enum Op {
         parameter_index: usize,
         output_id: u32,
     },
-    Add {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
-    Subtract {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
-    Multiply {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
-    Divide {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
-    Power {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
     Concatenate {
         input_ids: Vec<u32>,
         output_id: u32,
         dimension: u64,
-    },
-    Cosine {
-        input_id: u32,
-        output_id: u32,
-    },
-    Sine {
-        input_id: u32,
-        output_id: u32,
-    },
-    Rsqrt {
-        input_id: u32,
-        output_id: u32,
     },
     Reshape {
         input_id: u32,
@@ -90,14 +59,6 @@ pub(crate) enum Op {
         limit_indices: Vec<i64>,
         strides: Vec<i64>,
     },
-    Negate {
-        input_id: u32,
-        output_id: u32,
-    },
-    Exponential {
-        input_id: u32,
-        output_id: u32,
-    },
     Transpose {
         input_id: u32,
         output_id: u32,
@@ -108,10 +69,6 @@ pub(crate) enum Op {
         output_id: u32,
         call_target_name: String,
         has_side_effect: bool,
-    },
-    Convert {
-        input_id: u32,
-        output_id: u32,
     },
     Reduce {
         input_ids: Vec<u32>,
@@ -125,18 +82,9 @@ pub(crate) enum Op {
         output_id: u32,
         dimension_numbers: DotGeneralDimensionNumbers,
     },
-    Max {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
     Constant {
         packed_value: u32,
         output_id: u32,
-    },
-    Compare {
-        input_ids: [u32; 2],
-        output_id: u32,
-        direction: CompareDirection,
     },
     Select {
         input_ids: [u32; 3],
@@ -164,6 +112,42 @@ pub(crate) enum Op {
         indices_id: u32,
         k: u32,
     },
+    FusedElementwise {
+        input_ids: Vec<u32>,
+        output_id: u32,
+        nodes: Vec<FusedElementwiseNode>,
+    },
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct FusedElementwiseNode {
+    pub(crate) kind: FusedElementwiseKind,
+    pub(crate) input_nodes: Vec<u32>,
+    pub(crate) input_index: u32,
+    pub(crate) packed_value: u32,
+    pub(crate) element_type: PJRT_Buffer_Type,
+    pub(crate) single_tile_broadcast: bool,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum FusedElementwiseKind {
+    Input,
+    Constant,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Power,
+    Max,
+    Compare(CompareDirection),
+    Cosine,
+    Sine,
+    Negate,
+    Exponential,
+    Rsqrt,
+    Convert,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -241,15 +225,15 @@ fn parse_tensor_desc(tensor: ProtoTensorDesc) -> Result<ValueDesc, String> {
 
 #[cfg(libtt_mlir_frontend)]
 fn parse_compare_direction(direction: i32) -> Result<CompareDirection, String> {
-    match ProtoCompareDirection::try_from(direction)
-        .map_err(|_| "TT executable compare op contains an invalid direction".to_owned())?
-    {
-        ProtoCompareDirection::Eq => Ok(CompareDirection::Eq),
-        ProtoCompareDirection::Ne => Ok(CompareDirection::Ne),
-        ProtoCompareDirection::Ge => Ok(CompareDirection::Ge),
-        ProtoCompareDirection::Gt => Ok(CompareDirection::Gt),
-        ProtoCompareDirection::Le => Ok(CompareDirection::Le),
-        ProtoCompareDirection::Lt => Ok(CompareDirection::Lt),
+    match ProtoFusedElementwiseCompareDirection::try_from(direction).map_err(|_| {
+        "TT executable fused elementwise compare node contains an invalid direction".to_owned()
+    })? {
+        ProtoFusedElementwiseCompareDirection::DirectionEq => Ok(CompareDirection::Eq),
+        ProtoFusedElementwiseCompareDirection::DirectionNe => Ok(CompareDirection::Ne),
+        ProtoFusedElementwiseCompareDirection::DirectionGe => Ok(CompareDirection::Ge),
+        ProtoFusedElementwiseCompareDirection::DirectionGt => Ok(CompareDirection::Gt),
+        ProtoFusedElementwiseCompareDirection::DirectionLe => Ok(CompareDirection::Le),
+        ProtoFusedElementwiseCompareDirection::DirectionLt => Ok(CompareDirection::Lt),
     }
 }
 
@@ -262,6 +246,48 @@ fn parse_reduce_reducer(reducer: i32) -> Result<ReduceReducer, String> {
         ProtoReduceReducer::Max => Ok(ReduceReducer::Max),
         ProtoReduceReducer::Mul => Ok(ReduceReducer::Mul),
     }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn parse_fused_elementwise_kind(
+    kind: i32,
+    compare_direction: i32,
+) -> Result<FusedElementwiseKind, String> {
+    match ProtoFusedElementwiseKind::try_from(kind)
+        .map_err(|_| "TT executable fused elementwise op contains an invalid kind".to_owned())?
+    {
+        ProtoFusedElementwiseKind::Input => Ok(FusedElementwiseKind::Input),
+        ProtoFusedElementwiseKind::Constant => Ok(FusedElementwiseKind::Constant),
+        ProtoFusedElementwiseKind::Add => Ok(FusedElementwiseKind::Add),
+        ProtoFusedElementwiseKind::Subtract => Ok(FusedElementwiseKind::Subtract),
+        ProtoFusedElementwiseKind::Multiply => Ok(FusedElementwiseKind::Multiply),
+        ProtoFusedElementwiseKind::Divide => Ok(FusedElementwiseKind::Divide),
+        ProtoFusedElementwiseKind::Power => Ok(FusedElementwiseKind::Power),
+        ProtoFusedElementwiseKind::Max => Ok(FusedElementwiseKind::Max),
+        ProtoFusedElementwiseKind::Compare => Ok(FusedElementwiseKind::Compare(
+            parse_compare_direction(compare_direction)?,
+        )),
+        ProtoFusedElementwiseKind::Cosine => Ok(FusedElementwiseKind::Cosine),
+        ProtoFusedElementwiseKind::Sine => Ok(FusedElementwiseKind::Sine),
+        ProtoFusedElementwiseKind::Negate => Ok(FusedElementwiseKind::Negate),
+        ProtoFusedElementwiseKind::Exponential => Ok(FusedElementwiseKind::Exponential),
+        ProtoFusedElementwiseKind::Rsqrt => Ok(FusedElementwiseKind::Rsqrt),
+        ProtoFusedElementwiseKind::Convert => Ok(FusedElementwiseKind::Convert),
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn parse_fused_elementwise_node(
+    node: executable_proto::tt::fused_elementwise_op::Node,
+) -> Result<FusedElementwiseNode, String> {
+    Ok(FusedElementwiseNode {
+        kind: parse_fused_elementwise_kind(node.kind, node.compare_direction)?,
+        input_nodes: node.input_nodes,
+        input_index: node.input_index,
+        packed_value: node.packed_value,
+        element_type: map_element_type(node.element_type)?,
+        single_tile_broadcast: node.single_tile_broadcast,
+    })
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -289,42 +315,10 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     parameter_index: parameter.parameter_index as usize,
                     output_id: op_desc.output_id,
                 }),
-                Kind::Add(add) => Ok(Op::Add {
-                    input_ids: [add.lhs_id, add.rhs_id],
-                    output_id: op_desc.output_id,
-                }),
-                Kind::Subtract(subtract) => Ok(Op::Subtract {
-                    input_ids: [subtract.lhs_id, subtract.rhs_id],
-                    output_id: op_desc.output_id,
-                }),
-                Kind::Multiply(multiply) => Ok(Op::Multiply {
-                    input_ids: [multiply.lhs_id, multiply.rhs_id],
-                    output_id: op_desc.output_id,
-                }),
-                Kind::Divide(divide) => Ok(Op::Divide {
-                    input_ids: [divide.lhs_id, divide.rhs_id],
-                    output_id: op_desc.output_id,
-                }),
-                Kind::Power(power) => Ok(Op::Power {
-                    input_ids: [power.lhs_id, power.rhs_id],
-                    output_id: op_desc.output_id,
-                }),
                 Kind::Concatenate(concatenate) => Ok(Op::Concatenate {
                     input_ids: concatenate.input_ids,
                     output_id: op_desc.output_id,
                     dimension: concatenate.dimension,
-                }),
-                Kind::Cosine(cosine) => Ok(Op::Cosine {
-                    input_id: cosine.operand_id,
-                    output_id: op_desc.output_id,
-                }),
-                Kind::Sine(sine) => Ok(Op::Sine {
-                    input_id: sine.operand_id,
-                    output_id: op_desc.output_id,
-                }),
-                Kind::Rsqrt(rsqrt) => Ok(Op::Rsqrt {
-                    input_id: rsqrt.operand_id,
-                    output_id: op_desc.output_id,
                 }),
                 Kind::Reshape(reshape) => Ok(Op::Reshape {
                     input_id: reshape.operand_id,
@@ -337,14 +331,6 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     limit_indices: slice.limit_indices,
                     strides: slice.strides,
                 }),
-                Kind::Negate(negate) => Ok(Op::Negate {
-                    input_id: negate.operand_id,
-                    output_id: op_desc.output_id,
-                }),
-                Kind::Exponential(exponential) => Ok(Op::Exponential {
-                    input_id: exponential.operand_id,
-                    output_id: op_desc.output_id,
-                }),
                 Kind::Transpose(transpose) => Ok(Op::Transpose {
                     input_id: transpose.operand_id,
                     output_id: op_desc.output_id,
@@ -355,10 +341,6 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     output_id: op_desc.output_id,
                     call_target_name: custom_call.call_target_name,
                     has_side_effect: custom_call.has_side_effect,
-                }),
-                Kind::Convert(convert) => Ok(Op::Convert {
-                    input_id: convert.operand_id,
-                    output_id: op_desc.output_id,
                 }),
                 Kind::Reduce(reduce) => Ok(Op::Reduce {
                     input_ids: reduce.input_ids,
@@ -377,18 +359,9 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                         rhs_contracting_dimensions: matmul.rhs_contracting_dimensions,
                     },
                 }),
-                Kind::Max(max) => Ok(Op::Max {
-                    input_ids: [max.lhs_id, max.rhs_id],
-                    output_id: op_desc.output_id,
-                }),
                 Kind::Constant(constant) => Ok(Op::Constant {
                     packed_value: constant.packed_value,
                     output_id: op_desc.output_id,
-                }),
-                Kind::Compare(compare) => Ok(Op::Compare {
-                    input_ids: [compare.lhs_id, compare.rhs_id],
-                    output_id: op_desc.output_id,
-                    direction: parse_compare_direction(compare.direction)?,
                 }),
                 Kind::Select(select) => Ok(Op::Select {
                     input_ids: [select.pred_id, select.on_true_id, select.on_false_id],
@@ -422,6 +395,15 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     values_id: op_desc.output_id,
                     indices_id: top_k.indices_id,
                     k: top_k.k,
+                }),
+                Kind::FusedElementwise(fused) => Ok(Op::FusedElementwise {
+                    input_ids: fused.input_ids,
+                    output_id: op_desc.output_id,
+                    nodes: fused
+                        .nodes
+                        .into_iter()
+                        .map(parse_fused_elementwise_node)
+                        .collect::<Result<Vec<_>, String>>()?,
                 }),
             }
         })
@@ -483,42 +465,10 @@ pub(crate) enum Op {
         parameter_index: usize,
         output_id: u32,
     },
-    Add {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
-    Subtract {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
-    Multiply {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
-    Divide {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
-    Power {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
     Concatenate {
         input_ids: Vec<u32>,
         output_id: u32,
         dimension: u64,
-    },
-    Cosine {
-        input_id: u32,
-        output_id: u32,
-    },
-    Sine {
-        input_id: u32,
-        output_id: u32,
-    },
-    Rsqrt {
-        input_id: u32,
-        output_id: u32,
     },
     Reshape {
         input_id: u32,
@@ -531,14 +481,6 @@ pub(crate) enum Op {
         limit_indices: Vec<i64>,
         strides: Vec<i64>,
     },
-    Negate {
-        input_id: u32,
-        output_id: u32,
-    },
-    Exponential {
-        input_id: u32,
-        output_id: u32,
-    },
     Transpose {
         input_id: u32,
         output_id: u32,
@@ -549,10 +491,6 @@ pub(crate) enum Op {
         output_id: u32,
         call_target_name: String,
         has_side_effect: bool,
-    },
-    Convert {
-        input_id: u32,
-        output_id: u32,
     },
     Reduce {
         input_ids: Vec<u32>,
@@ -566,18 +504,9 @@ pub(crate) enum Op {
         output_id: u32,
         dimension_numbers: DotGeneralDimensionNumbers,
     },
-    Max {
-        input_ids: [u32; 2],
-        output_id: u32,
-    },
     Constant {
         packed_value: u32,
         output_id: u32,
-    },
-    Compare {
-        input_ids: [u32; 2],
-        output_id: u32,
-        direction: CompareDirection,
     },
     Select {
         input_ids: [u32; 3],
@@ -604,5 +533,10 @@ pub(crate) enum Op {
         values_id: u32,
         indices_id: u32,
         k: u32,
+    },
+    FusedElementwise {
+        input_ids: Vec<u32>,
+        output_id: u32,
+        nodes: Vec<FusedElementwiseNode>,
     },
 }

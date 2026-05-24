@@ -31,55 +31,10 @@ message ParameterOp {
   uint32 parameter_index = 1;
 }
 
-message AddOp {
-  // Indices into Executable.values for this op's operands.
-  uint32 lhs_id = 1;
-  uint32 rhs_id = 2;
-}
-
-message SubtractOp {
-  // Indices into Executable.values for this op's operands.
-  uint32 lhs_id = 1;
-  uint32 rhs_id = 2;
-}
-
-message MultiplyOp {
-  // Indices into Executable.values for this op's operands.
-  uint32 lhs_id = 1;
-  uint32 rhs_id = 2;
-}
-
-message DivideOp {
-  // Indices into Executable.values for this op's operands.
-  uint32 lhs_id = 1;
-  uint32 rhs_id = 2;
-}
-
-message PowerOp {
-  // Indices into Executable.values for this op's operands.
-  uint32 lhs_id = 1;
-  uint32 rhs_id = 2;
-}
-
 message ConcatenateOp {
   // Indices into Executable.values for this op's operands.
   repeated uint32 input_ids = 1;
   uint64 dimension = 2;
-}
-
-message CosineOp {
-  // Index into Executable.values for this op's operand.
-  uint32 operand_id = 1;
-}
-
-message SineOp {
-  // Index into Executable.values for this op's operand.
-  uint32 operand_id = 1;
-}
-
-message RsqrtOp {
-  // Index into Executable.values for this op's operand.
-  uint32 operand_id = 1;
 }
 
 message ReshapeOp {
@@ -95,16 +50,6 @@ message SliceOp {
   repeated int64 strides = 4;
 }
 
-message NegateOp {
-  // Index into Executable.values for this op's operand.
-  uint32 operand_id = 1;
-}
-
-message ExponentialOp {
-  // Index into Executable.values for this op's operand.
-  uint32 operand_id = 1;
-}
-
 message TransposeOp {
   // Index into Executable.values for this op's operand.
   uint32 operand_id = 1;
@@ -116,11 +61,6 @@ message CustomCallOp {
   repeated uint32 input_ids = 1;
   string call_target_name = 2;
   bool has_side_effect = 3;
-}
-
-message ConvertOp {
-  // Index into Executable.values for this op's operand.
-  uint32 operand_id = 1;
 }
 
 message ReduceOp {
@@ -147,33 +87,11 @@ message MatmulOp {
   repeated int64 rhs_contracting_dimensions = 6;
 }
 
-message MaxOp {
-  // Indices into Executable.values for this op's operands.
-  uint32 lhs_id = 1;
-  uint32 rhs_id = 2;
-}
-
 message ConstantOp {
   // Splat scalar packed according to Op.output_id's logical element type.
   // 16-bit values are duplicated into both u32 halfwords; 32-bit and narrower
   // integer/predicate values use their raw low bits.
   uint32 packed_value = 1;
-}
-
-message CompareOp {
-  enum Direction {
-    DIRECTION_EQ = 0;
-    DIRECTION_NE = 1;
-    DIRECTION_GE = 2;
-    DIRECTION_GT = 3;
-    DIRECTION_LE = 4;
-    DIRECTION_LT = 5;
-  }
-
-  // Indices into Executable.values for this op's operands.
-  uint32 lhs_id = 1;
-  uint32 rhs_id = 2;
-  Direction direction = 3;
 }
 
 message SelectOp {
@@ -215,38 +133,68 @@ message TopKOp {
   uint32 k = 3;
 }
 
+message FusedElementwiseOp {
+  message Node {
+    enum Kind {
+      KIND_INPUT = 0;
+      KIND_CONSTANT = 1;
+      KIND_ADD = 2;
+      KIND_SUBTRACT = 3;
+      KIND_MULTIPLY = 4;
+      KIND_DIVIDE = 5;
+      KIND_MAX = 6;
+      KIND_NEGATE = 7;
+      KIND_EXPONENTIAL = 8;
+      KIND_RSQRT = 9;
+      KIND_POWER = 10;
+      KIND_COMPARE = 11;
+      KIND_COSINE = 12;
+      KIND_SINE = 13;
+      KIND_CONVERT = 14;
+    }
+
+    enum CompareDirection {
+      DIRECTION_EQ = 0;
+      DIRECTION_NE = 1;
+      DIRECTION_GE = 2;
+      DIRECTION_GT = 3;
+      DIRECTION_LE = 4;
+      DIRECTION_LT = 5;
+    }
+
+    Kind kind = 1;
+    repeated uint32 input_nodes = 2;
+    uint32 input_index = 3;
+    uint32 packed_value = 4;
+    TensorDesc.ElementType element_type = 5;
+    bool single_tile_broadcast = 6;
+    CompareDirection compare_direction = 7;
+  }
+
+  repeated uint32 input_ids = 1;
+  repeated Node nodes = 2;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
 
   oneof kind {
     ParameterOp parameter = 2;
-    AddOp add = 3;
     MatmulOp matmul = 4;
-    MaxOp max = 5;
     ConstantOp constant = 6;
-    CompareOp compare = 7;
     SelectOp select = 8;
     BroadcastInDimOp broadcast_in_dim = 9;
     GatherOp gather = 10;
     IotaOp iota = 11;
-    MultiplyOp multiply = 12;
-    DivideOp divide = 13;
-    PowerOp power = 14;
     ConcatenateOp concatenate = 15;
-    CosineOp cosine = 16;
-    SineOp sine = 17;
-    ConvertOp convert = 18;
     ReduceOp reduce = 19;
-    RsqrtOp rsqrt = 20;
     ReshapeOp reshape = 21;
     SliceOp slice = 22;
-    NegateOp negate = 23;
-    SubtractOp subtract = 24;
-    ExponentialOp exponential = 25;
     TransposeOp transpose = 26;
     CustomCallOp custom_call = 27;
     TopKOp top_k = 29;
+    FusedElementwiseOp fused_elementwise = 30;
   }
 }
 
