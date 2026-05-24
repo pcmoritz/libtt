@@ -81,6 +81,7 @@ pub(crate) enum Op {
         input_ids: [u32; 2],
         output_id: u32,
         dimension_numbers: DotGeneralDimensionNumbers,
+        top_k_epilogue: Option<MatmulTopKEpilogue>,
     },
     Constant {
         packed_value: u32,
@@ -187,6 +188,14 @@ pub(crate) struct DotGeneralDimensionNumbers {
     pub(crate) rhs_batching_dimensions: Vec<i64>,
     pub(crate) lhs_contracting_dimensions: Vec<i64>,
     pub(crate) rhs_contracting_dimensions: Vec<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct MatmulTopKEpilogue {
+    pub(crate) matmul_output_id: u32,
+    pub(crate) indices_id: u32,
+    pub(crate) k: u32,
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -358,6 +367,11 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                         lhs_contracting_dimensions: matmul.lhs_contracting_dimensions,
                         rhs_contracting_dimensions: matmul.rhs_contracting_dimensions,
                     },
+                    top_k_epilogue: matmul.top_k_epilogue.map(|epilogue| MatmulTopKEpilogue {
+                        matmul_output_id: epilogue.matmul_output_id,
+                        indices_id: epilogue.indices_id,
+                        k: epilogue.k,
+                    }),
                 }),
                 Kind::Constant(constant) => Ok(Op::Constant {
                     packed_value: constant.packed_value,
@@ -503,6 +517,7 @@ pub(crate) enum Op {
         input_ids: [u32; 2],
         output_id: u32,
         dimension_numbers: DotGeneralDimensionNumbers,
+        top_k_epilogue: Option<MatmulTopKEpilogue>,
     },
     Constant {
         packed_value: u32,

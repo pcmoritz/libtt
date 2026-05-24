@@ -1921,6 +1921,176 @@ fn execute_top_k(
     )
 }
 
+fn execute_matmul(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: [u32; 2],
+    output_id: u32,
+    dimension_numbers: &executable::DotGeneralDimensionNumbers,
+    top_k_epilogue: Option<&executable::MatmulTopKEpilogue>,
+) -> Result<(), *mut PJRT_Error> {
+    let lhs = device_buffer_for_value(values, input_ids[0], "matmul.lhs")?;
+    let rhs = device_buffer_for_value(values, input_ids[1], "matmul.rhs")?;
+    let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable matmul lhs buffer has no device allocation",
+        ));
+    };
+    let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable matmul rhs buffer has no device allocation",
+        ));
+    };
+    let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
+    let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+
+    if let Some(epilogue) = top_k_epilogue {
+        if epilogue.k != 1 {
+            return Err(invalid_argument(
+                "TT executable matmul top_k epilogue currently requires k=1",
+            ));
+        }
+        let matmul_desc = plan
+            .values
+            .get(epilogue.matmul_output_id as usize)
+            .ok_or_else(|| {
+                invalid_argument(format!(
+                    "TT executable matmul top_k epilogue matmul output id {} is out of bounds",
+                    epilogue.matmul_output_id
+                ))
+            })?;
+        let values_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+            invalid_argument(format!(
+                "TT executable matmul top_k epilogue values id {output_id} is out of bounds"
+            ))
+        })?;
+        let indices_desc = plan
+            .values
+            .get(epilogue.indices_id as usize)
+            .ok_or_else(|| {
+                invalid_argument(format!(
+                    "TT executable matmul top_k epilogue indices id {} is out of bounds",
+                    epilogue.indices_id
+                ))
+            })?;
+        if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+            || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+            || matmul_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+            || values_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+            || indices_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32
+        {
+            return Err(invalid_argument(format!(
+                "TT executable matmul top_k epilogue requires bf16 matmul/top_k values and s32 indices, got lhs={:?} rhs={:?} matmul={:?} values={:?} indices={:?}",
+                lhs.buffer_type,
+                rhs.buffer_type,
+                matmul_desc.element_type,
+                values_desc.element_type,
+                indices_desc.element_type
+            )));
+        }
+        if values_desc.dims != [1] || indices_desc.dims != [1] {
+            return Err(invalid_argument(format!(
+                "TT executable matmul top_k epilogue output shapes must be [1], got values {:?} indices {:?}",
+                values_desc.dims, indices_desc.dims
+            )));
+        }
+
+        let matmul_shape = dims_i64_to_usize(&matmul_desc.dims)?;
+        let matmul_output = kernels::matmul::matmul_bf16_dot_general(
+            device,
+            lhs_dram,
+            rhs_dram,
+            &lhs_shape,
+            &rhs_shape,
+            &matmul_shape,
+            &dimension_numbers.lhs_batching_dimensions,
+            &dimension_numbers.rhs_batching_dimensions,
+            &dimension_numbers.lhs_contracting_dimensions,
+            &dimension_numbers.rhs_contracting_dimensions,
+            kernels::matmul::MatmulEpilogue::Top1,
+            "pjrt_matmul_top_k",
+        )
+        .map_err(io_error)?;
+        let (values_dram, indices_dram) = match matmul_output {
+            kernels::matmul::MatmulOutput::Top1 { values, indices } => (values, indices),
+            kernels::matmul::MatmulOutput::Store(_) => {
+                return Err(invalid_argument(
+                    "TT executable matmul top_k epilogue returned a stored matmul output",
+                ));
+            }
+        };
+        store_output_buffer(
+            values,
+            plan,
+            output_id,
+            values_desc.dims.clone(),
+            values_dram,
+            context,
+            "matmul.top_k.values",
+        )?;
+        return store_output_buffer(
+            values,
+            plan,
+            epilogue.indices_id,
+            indices_desc.dims.clone(),
+            indices_dram,
+            context,
+            "matmul.top_k.indices",
+        );
+    }
+
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable matmul output id {output_id} is out of bounds"
+        ))
+    })?;
+    let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || !matches!(output_dtype, DType::Float16B | DType::Float32)
+    {
+        return Err(invalid_argument(format!(
+            "TT executable matmul requires bf16 inputs and bf16/f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
+            lhs.buffer_type, rhs.buffer_type
+        )));
+    }
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let output_dram = kernels::matmul::matmul_bf16_dot_general(
+        device,
+        lhs_dram,
+        rhs_dram,
+        &lhs_shape,
+        &rhs_shape,
+        &output_shape,
+        &dimension_numbers.lhs_batching_dimensions,
+        &dimension_numbers.rhs_batching_dimensions,
+        &dimension_numbers.lhs_contracting_dimensions,
+        &dimension_numbers.rhs_contracting_dimensions,
+        kernels::matmul::MatmulEpilogue::Store { output_dtype },
+        "pjrt_matmul",
+    )
+    .map_err(io_error)?;
+    let output_dram = match output_dram {
+        kernels::matmul::MatmulOutput::Store(output) => output,
+        kernels::matmul::MatmulOutput::Top1 { .. } => {
+            return Err(invalid_argument(
+                "TT executable matmul returned a top_k epilogue output for normal matmul",
+            ));
+        }
+    };
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "matmul",
+    )
+}
+
 fn reduce_init_is_supported(
     plan: &executable::Executable,
     init_value_id: u32,
@@ -2512,63 +2682,17 @@ fn execute_executable_v1(
                 input_ids,
                 output_id,
                 dimension_numbers,
-            } => {
-                let output_id = *output_id;
-                let lhs = device_buffer_for_value(&values, input_ids[0], "matmul.lhs")?;
-                let rhs = device_buffer_for_value(&values, input_ids[1], "matmul.rhs")?;
-                let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
-                    return Err(failed_precondition(
-                        "TT executable matmul lhs buffer has no device allocation",
-                    ));
-                };
-                let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
-                    return Err(failed_precondition(
-                        "TT executable matmul rhs buffer has no device allocation",
-                    ));
-                };
-                let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-                    invalid_argument(format!(
-                        "TT executable matmul output id {output_id} is out of bounds"
-                    ))
-                })?;
-                let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
-                if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                    || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-                    || !matches!(output_dtype, DType::Float16B | DType::Float32)
-                {
-                    return Err(invalid_argument(format!(
-                        "TT executable matmul requires bf16 inputs and bf16/f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
-                        lhs.buffer_type, rhs.buffer_type
-                    )));
-                }
-                let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
-                let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
-                let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-                let output_dram = kernels::matmul::matmul_bf16_dot_general(
-                    device,
-                    lhs_dram,
-                    rhs_dram,
-                    &lhs_shape,
-                    &rhs_shape,
-                    &output_shape,
-                    &dimension_numbers.lhs_batching_dimensions,
-                    &dimension_numbers.rhs_batching_dimensions,
-                    &dimension_numbers.lhs_contracting_dimensions,
-                    &dimension_numbers.rhs_contracting_dimensions,
-                    output_dtype,
-                    "pjrt_matmul",
-                )
-                .map_err(io_error)?;
-                store_output_buffer(
-                    &mut values,
-                    plan,
-                    output_id,
-                    output_desc.dims.clone(),
-                    output_dram,
-                    &output_context,
-                    "matmul",
-                )?;
-            }
+                top_k_epilogue,
+            } => execute_matmul(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_ids,
+                *output_id,
+                dimension_numbers,
+                top_k_epilogue.as_ref(),
+            )?,
             executable::Op::Constant { .. } => {}
             executable::Op::Select {
                 input_ids,
@@ -4759,16 +4883,66 @@ mod tests {
                     input_ids,
                     output_id,
                     dimension_numbers,
+                    top_k_epilogue,
                 } = &executable.ops[2]
                 else {
                     panic!("dot_general should lower to Matmul");
                 };
                 assert_eq!(*input_ids, [0, 1]);
                 assert_eq!(*output_id, 2);
+                assert!(top_k_epilogue.is_none());
                 assert_eq!(dimension_numbers.lhs_batching_dimensions, vec![1]);
                 assert_eq!(dimension_numbers.rhs_batching_dimensions, vec![1]);
                 assert_eq!(dimension_numbers.lhs_contracting_dimensions, vec![2]);
                 assert_eq!(dimension_numbers.rhs_contracting_dimensions, vec![2]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_matmul_top_k_epilogue() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func private @top_k(%arg0: tensor<128xbf16>) -> (tensor<1xbf16>, tensor<1xi32>)
+  func.func public @main(%arg0: tensor<1x80xbf16>, %arg1: tensor<80x128xbf16>) -> (tensor<1xbf16>, tensor<1xi32>) {
+    %0 = stablehlo.dot_general %arg0, %arg1,
+      contracting_dims = [1] x [0]
+      : (tensor<1x80xbf16>, tensor<80x128xbf16>) -> tensor<1x128xbf16>
+    %1 = stablehlo.reshape %0 : (tensor<1x128xbf16>) -> tensor<128xbf16>
+    %2:2 = stablehlo.composite "chlo.top_k" %1 {
+      composite_attributes = {k = 1 : i64},
+      decomposition = @top_k
+    } : (tensor<128xbf16>) -> (tensor<1xbf16>, tensor<1xi32>)
+    return %2#0, %2#1 : tensor<1xbf16>, tensor<1xi32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![3, 4]);
+                assert_eq!(executable.ops.len(), 3);
+                assert_eq!(executable.values[2].dims, vec![1, 128]);
+                let executable::Op::Matmul {
+                    input_ids,
+                    output_id,
+                    dimension_numbers,
+                    top_k_epilogue,
+                } = &executable.ops[2]
+                else {
+                    panic!("dot_general/top_k should lower to Matmul with top_k epilogue");
+                };
+                assert_eq!(*input_ids, [0, 1]);
+                assert_eq!(*output_id, 3);
+                assert!(dimension_numbers.lhs_batching_dimensions.is_empty());
+                assert!(dimension_numbers.rhs_batching_dimensions.is_empty());
+                assert_eq!(dimension_numbers.lhs_contracting_dimensions, vec![1]);
+                assert_eq!(dimension_numbers.rhs_contracting_dimensions, vec![0]);
+                let epilogue = top_k_epilogue
+                    .as_ref()
+                    .expect("matmul should have a top_k epilogue");
+                assert_eq!(epilogue.matmul_output_id, 2);
+                assert_eq!(epilogue.indices_id, 4);
+                assert_eq!(epilogue.k, 1);
             },
         );
     }

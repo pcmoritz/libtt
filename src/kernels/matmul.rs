@@ -23,12 +23,121 @@ const BF16_WRITER_RECV: &str = concat!(
     include_str!("../../kernels/matmul_writer_common.cc"),
     include_str!("../../kernels/matmul_writer_recv.cc")
 );
+const BF16_MATMUL_TOP1_WRITER: &str = concat!(
+    include_str!("../../kernels/matmul_common.cc"),
+    include_str!("../../kernels/matmul_top1_writer_sender.cc")
+);
 const BF16_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
 const READER_LHS_ADDR_INDEX: usize = 0;
 const WRITER_RHS_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
+const WRITER_PARTIAL_PAIRS_ADDR_INDEX: usize = 18;
 const MAX_RANK: usize = 8;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum MatmulEpilogueKind {
+    Store,
+    Top1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MatmulEpilogue {
+    Store { output_dtype: DType },
+    Top1,
+}
+
+impl MatmulEpilogue {
+    fn kind(self) -> MatmulEpilogueKind {
+        match self {
+            Self::Store { .. } => MatmulEpilogueKind::Store,
+            Self::Top1 => MatmulEpilogueKind::Top1,
+        }
+    }
+
+    fn validate_shape(self, shape: &DotGeneralMatmulShape) -> io::Result<()> {
+        match self {
+            Self::Store { .. } => Ok(()),
+            Self::Top1 => {
+                if shape.batch_count != 1 || shape.m != 1 {
+                    return Err(invalid_input(format!(
+                        "matmul_top1 expects a single row output, got batch_count={} M={}",
+                        shape.batch_count, shape.m
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum MatmulOutput {
+    Store(DramBuffer),
+    Top1 {
+        values: DramBuffer,
+        indices: DramBuffer,
+    },
+}
+
+enum MatmulRuntimeEpilogue {
+    Store {
+        output: DramBuffer,
+        output_addr: u32,
+    },
+    Top1 {
+        partial_pairs: DramBuffer,
+        partial_pairs_addr: u32,
+        partial_count: usize,
+        name: String,
+    },
+}
+
+impl MatmulRuntimeEpilogue {
+    fn kind(&self) -> MatmulEpilogueKind {
+        match self {
+            Self::Store { .. } => MatmulEpilogueKind::Store,
+            Self::Top1 { .. } => MatmulEpilogueKind::Top1,
+        }
+    }
+
+    fn writer_runtime_arg(&self, index: usize) -> Option<u32> {
+        match self {
+            Self::Store { output_addr, .. } => {
+                (index == WRITER_OUTPUT_ADDR_INDEX).then_some(*output_addr)
+            }
+            Self::Top1 {
+                partial_pairs_addr, ..
+            } => match index {
+                WRITER_PARTIAL_PAIRS_ADDR_INDEX => Some(*partial_pairs_addr),
+                _ => None,
+            },
+        }
+    }
+
+    fn finalize(self, device: &mut Device) -> io::Result<MatmulOutput> {
+        match self {
+            Self::Store { output, .. } => Ok(MatmulOutput::Store(output)),
+            Self::Top1 {
+                partial_pairs,
+                partial_count,
+                name,
+                ..
+            } => {
+                log("matmul_top1: partial matmul complete".to_owned());
+                log("matmul_top1: finalizing partials".to_owned());
+                let (values, indices) = crate::kernels::topk::top1_finalize_partials(
+                    device,
+                    &partial_pairs,
+                    partial_count,
+                    format!("{name}_top1"),
+                )?;
+                log("matmul_top1: finalize complete".to_owned());
+                Ok(MatmulOutput::Top1 { values, indices })
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct MatmulProgramKey {
@@ -42,6 +151,7 @@ struct MatmulProgramKey {
     cores: Arc<[CoreCoord]>,
     math_fidelity: MathFidelity,
     output_dtype: DType,
+    epilogue: MatmulEpilogueKind,
 }
 
 #[repr(u32)]
@@ -145,7 +255,7 @@ impl MatmulPlan {
 struct MatmulBf16Kernel {
     lhs_addr: u32,
     rhs_addr: u32,
-    output_addr: u32,
+    epilogue: MatmulRuntimeEpilogue,
     key: MatmulProgramKey,
 }
 
@@ -155,14 +265,7 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
     }
 
     fn build_program(&self) -> io::Result<Program> {
-        let plan = plan_matmul(
-            self.key.logical_mt * 32,
-            self.key.logical_kt * 32,
-            self.key.logical_nt * 32,
-            self.key.batch_count,
-            &self.key.cores,
-            self.key.output_view.kind == MatmulViewKind::Contiguous,
-        )?;
+        let plan = plan_for_key(&self.key)?;
         log_matmul_plan(&plan);
         bf16_program(
             &plan,
@@ -174,6 +277,7 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
             &self.key.output_view,
             self.key.math_fidelity,
             self.key.output_dtype,
+            self.key.epilogue,
         )
     }
 
@@ -187,14 +291,16 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
 
     #[inline]
     fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_RHS_ADDR_INDEX => Some(self.rhs_addr),
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
+        debug_assert_eq!(self.key.epilogue, self.epilogue.kind());
+        if index == WRITER_RHS_ADDR_INDEX {
+            Some(self.rhs_addr)
+        } else {
+            self.epilogue.writer_runtime_arg(index)
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_bf16_dot_general(
     device: &mut Device,
     lhs: &DramBuffer,
@@ -206,20 +312,27 @@ pub(crate) fn matmul_bf16_dot_general(
     rhs_batching_dimensions: &[i64],
     lhs_contracting_dimensions: &[i64],
     rhs_contracting_dimensions: &[i64],
-    output_dtype: DType,
+    epilogue: MatmulEpilogue,
     name: impl Into<String>,
-) -> io::Result<DramBuffer> {
+) -> io::Result<MatmulOutput> {
     if lhs.dtype != DType::Float16B || rhs.dtype != DType::Float16B {
         return Err(invalid_input(format!(
             "matmul_bf16 requires bf16 inputs, got {:?} and {:?}",
             lhs.dtype, rhs.dtype
         )));
     }
-    if !matches!(output_dtype, DType::Float16B | DType::Float32) {
-        return Err(invalid_input(format!(
-            "matmul_bf16 output must be Float16B or Float32, got {output_dtype:?}"
-        )));
-    }
+    let output_dtype = match epilogue {
+        MatmulEpilogue::Store { output_dtype } => {
+            if !matches!(output_dtype, DType::Float16B | DType::Float32) {
+                return Err(invalid_input(format!(
+                    "matmul_bf16 output must be Float16B or Float32, got {output_dtype:?}"
+                )));
+            }
+            output_dtype
+        }
+        MatmulEpilogue::Top1 => DType::Float16B,
+    };
+    let epilogue_kind = epilogue.kind();
 
     let shape = dot_general_shape(
         lhs_logical_shape,
@@ -230,18 +343,16 @@ pub(crate) fn matmul_bf16_dot_general(
         lhs_contracting_dimensions,
         rhs_contracting_dimensions,
     )?;
+    epilogue.validate_shape(&shape)?;
     validate_tile_count(lhs, tiled_shape_tile_count(lhs_logical_shape)?, "lhs")?;
     validate_tile_count(rhs, tiled_shape_tile_count(rhs_logical_shape)?, "rhs")?;
 
-    let output_name = name.into();
     let logical_mt = ceil32(shape.m) / 32;
     let logical_kt = ceil32(shape.k) / 32;
     let logical_nt = ceil32(shape.n) / 32;
     let math_fidelity = matmul_math_fidelity()?;
     let cores = device.cores_arc();
-    let output_tiles = tiled_shape_tile_count(output_logical_shape)?;
-    let output_shape = tiled_allocation_shape(output_logical_shape)?;
-    let output = device.alloc(output_tiles, output_dtype, &output_shape, output_name)?;
+    let name = name.into();
     let key = MatmulProgramKey {
         logical_mt,
         logical_kt,
@@ -253,15 +364,51 @@ pub(crate) fn matmul_bf16_dot_general(
         cores,
         math_fidelity,
         output_dtype,
+        epilogue: epilogue_kind,
     };
+    let lhs_addr = u32_arg(lhs.addr, "lhs address")?;
+    let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
+
+    let runtime_epilogue = match epilogue {
+        MatmulEpilogue::Store { output_dtype } => {
+            let output_tiles = tiled_shape_tile_count(output_logical_shape)?;
+            let output_shape = tiled_allocation_shape(output_logical_shape)?;
+            let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
+            let output_addr = u32_arg(output.addr, "output address")?;
+            MatmulRuntimeEpilogue::Store {
+                output,
+                output_addr,
+            }
+        }
+        MatmulEpilogue::Top1 => {
+            let plan = plan_for_key(&key)?;
+            let partial_count = plan_grid(&plan).iter().map(Vec::len).sum::<usize>();
+            let partial_shape = [partial_count * 32, 32];
+            let partial_pairs = device.alloc(
+                partial_count,
+                DType::Int32,
+                &partial_shape,
+                format!("{name}_partial_pairs"),
+            )?;
+            let partial_pairs_addr = u32_arg(partial_pairs.addr, "partial pairs address")?;
+            MatmulRuntimeEpilogue::Top1 {
+                partial_pairs,
+                partial_pairs_addr,
+                partial_count,
+                name,
+            }
+        }
+    };
+
     let kernel = MatmulBf16Kernel {
-        lhs_addr: u32_arg(lhs.addr, "lhs address")?,
-        rhs_addr: u32_arg(rhs.addr, "rhs address")?,
-        output_addr: u32_arg(output.addr, "output address")?,
+        lhs_addr,
+        rhs_addr,
+        epilogue: runtime_epilogue,
         key,
     };
     kernel.run(device)?;
-    Ok(output)
+    let MatmulBf16Kernel { epilogue, .. } = kernel;
+    epilogue.finalize(device)
 }
 
 fn log_matmul_plan(plan: &MatmulPlan) {
@@ -468,7 +615,11 @@ fn dot_general_dims(
     let batch = parse_dims(batch_dimensions, "batching")?;
     let contract = parse_dims(contracting_dimensions, "contracting")?;
     let free = (0..rank).filter(|&dim| !used[dim]).collect::<Vec<_>>();
-    Ok(DotGeneralDims { batch, contract, free })
+    Ok(DotGeneralDims {
+        batch,
+        contract,
+        free,
+    })
 }
 
 fn checked_product_of_dims(shape: &[usize], dims: &[usize], name: &str) -> io::Result<usize> {
@@ -499,8 +650,14 @@ fn operand_view(
         col_rank: u32_value(col_dims.len(), "matmul operand column rank")?,
         logical_rows: u32_value(logical_rows, "matmul operand logical rows")?,
         logical_cols: u32_value(logical_cols, "matmul operand logical columns")?,
-        tile_rows: u32_value(allocation_shape[rank - 2] / 32, "matmul operand source tile rows")?,
-        tiles_per_row: u32_value(allocation_shape[rank - 1] / 32, "matmul operand source tiles per row")?,
+        tile_rows: u32_value(
+            allocation_shape[rank - 2] / 32,
+            "matmul operand source tile rows",
+        )?,
+        tiles_per_row: u32_value(
+            allocation_shape[rank - 1] / 32,
+            "matmul operand source tiles per row",
+        )?,
         shape: padded_u32_array(shape, "matmul operand shape")?,
         batch_dims: padded_u32_array(batch_dims, "matmul operand batch dimensions")?,
         row_dims: padded_u32_array(row_dims, "matmul operand row dimensions")?,
@@ -515,7 +672,11 @@ fn operand_view_kind(
     col_dims: &[usize],
 ) -> MatmulViewKind {
     let leading_batch = batch_dims.iter().copied().eq(0..batch_dims.len());
-    if leading_batch && rank == batch_dims.len() + 2 && row_dims == [rank - 2] && col_dims == [rank - 1] {
+    if leading_batch
+        && rank == batch_dims.len() + 2
+        && row_dims == [rank - 2]
+        && col_dims == [rank - 1]
+    {
         MatmulViewKind::Contiguous
     } else if is_tiled_index_map_view(rank, batch_dims, row_dims, col_dims) {
         MatmulViewKind::TiledIndexMap
@@ -543,7 +704,10 @@ fn is_tiled_index_map_view(
 
 fn padded_u32_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]> {
     if values.len() > MAX_RANK {
-        return Err(invalid_input(format!("{name} rank {} exceeds maximum rank {MAX_RANK}", values.len())));
+        return Err(invalid_input(format!(
+            "{name} rank {} exceeds maximum rank {MAX_RANK}",
+            values.len()
+        )));
     }
     let mut result = [0u32; MAX_RANK];
     for (index, &value) in values.iter().enumerate() {
@@ -553,7 +717,10 @@ fn padded_u32_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]>
 }
 
 fn checked_product(values: &[usize], name: &str) -> io::Result<usize> {
-    values.iter().try_fold(1usize, |acc, &value| acc.checked_mul(value).ok_or_else(|| invalid_input(format!("{name} product overflow"))))
+    values.iter().try_fold(1usize, |acc, &value| {
+        acc.checked_mul(value)
+            .ok_or_else(|| invalid_input(format!("{name} product overflow")))
+    })
 }
 
 fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::Result<()> {
@@ -564,6 +731,27 @@ fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::
         )));
     }
     Ok(())
+}
+
+fn plan_for_key(key: &MatmulProgramKey) -> io::Result<MatmulPlan> {
+    match key.epilogue {
+        MatmulEpilogueKind::Store => plan_matmul(
+            key.logical_mt * 32,
+            key.logical_kt * 32,
+            key.logical_nt * 32,
+            key.batch_count,
+            &key.cores,
+            key.output_view.kind == MatmulViewKind::Contiguous,
+        ),
+        MatmulEpilogueKind::Top1 => plan_matmul(
+            32,
+            key.logical_kt * 32,
+            key.output_view.logical_cols as usize,
+            1,
+            &key.cores,
+            true,
+        ),
+    }
 }
 
 fn plan_matmul(
@@ -928,6 +1116,7 @@ fn bf16_program(
     output_view: &MatmulOperandView,
     math_fidelity: MathFidelity,
     output_dtype: DType,
+    epilogue: MatmulEpilogueKind,
 ) -> io::Result<Program> {
     let cbs = vec![
         CBConfig {
@@ -952,7 +1141,11 @@ fn bf16_program(
         },
         CBConfig {
             index: 4,
-            dtype: output_dtype,
+            dtype: if epilogue == MatmulEpilogueKind::Top1 {
+                DType::Int32
+            } else {
+                output_dtype
+            },
             tiles: 1,
         },
         CBConfig {
@@ -974,15 +1167,26 @@ fn bf16_program(
         lhs_view,
         rhs_view,
         output_view,
+        epilogue,
     )?;
+    let top1_epilogue = epilogue == MatmulEpilogueKind::Top1;
     Ok(Program {
         reader_kernel: BF16_READER_SENDER.to_owned(),
-        writer_kernel: BF16_WRITER_SENDER.to_owned(),
+        writer_kernel: if top1_epilogue {
+            BF16_MATMUL_TOP1_WRITER.to_owned()
+        } else {
+            BF16_WRITER_SENDER.to_owned()
+        },
         compute_kernel: compute_src(plan, plan.batches_per_group),
         reader_recv_kernel: BF16_READER_RECV.to_owned(),
-        writer_recv_kernel: BF16_WRITER_RECV.to_owned(),
+        writer_recv_kernel: if top1_epilogue {
+            BF16_MATMUL_TOP1_WRITER.to_owned()
+        } else {
+            BF16_WRITER_RECV.to_owned()
+        },
         name: format!(
-            "matmul_bf16_{:?}_{}x{}x{}",
+            "matmul{}_bf16_{:?}_{}x{}x{}",
+            if top1_epilogue { "_top1" } else { "" },
             output_dtype,
             plan.mt * 32,
             plan.kt * 32,
@@ -991,7 +1195,8 @@ fn bf16_program(
         compile: CompileConfig {
             cbs,
             math_fidelity,
-            dst_accum_mode: output_dtype == DType::Float32,
+            dst_accum_mode: output_dtype == DType::Float32 || top1_epilogue,
+            dst_full_sync: top1_epilogue,
             ..CompileConfig::default()
         },
         grid: plan
@@ -1010,15 +1215,21 @@ fn lower_runtime_args(
     lhs_view: &MatmulOperandView,
     rhs_view: &MatmulOperandView,
     output_view: &MatmulOperandView,
+    epilogue: MatmulEpilogueKind,
 ) -> io::Result<RuntimeArgs> {
     let grid = plan_grid(plan);
+    let writer_dynamic_indices = match epilogue {
+        MatmulEpilogueKind::Store => vec![WRITER_RHS_ADDR_INDEX, WRITER_OUTPUT_ADDR_INDEX],
+        MatmulEpilogueKind::Top1 => vec![WRITER_RHS_ADDR_INDEX, WRITER_PARTIAL_PAIRS_ADDR_INDEX],
+    };
     let mut runtime_args = RuntimeArgsBuilder::new(
         NUM_SEMAPHORES,
-        vec![WRITER_RHS_ADDR_INDEX, WRITER_OUTPUT_ADDR_INDEX],
+        writer_dynamic_indices,
         vec![READER_LHS_ADDR_INDEX],
         Vec::new(),
     );
     let direct_grid_rows_per_batch = plan.direct_grid_rows_per_batch();
+    let mut partial_tile_id = 0usize;
     for (flat_row_index, row) in grid.iter().enumerate() {
         let (batch_group, row_index) = if let Some(rows_per_batch) = direct_grid_rows_per_batch {
             (
@@ -1041,6 +1252,10 @@ fn lower_runtime_args(
                 batch_count,
                 lhs_view,
             )?;
+            let writer_epilogue = match epilogue {
+                MatmulEpilogueKind::Store => WriterEpilogue::Store,
+                MatmulEpilogueKind::Top1 => WriterEpilogue::Top1 { partial_tile_id },
+            };
             let writer = writer_args(
                 plan,
                 &grid,
@@ -1054,8 +1269,12 @@ fn lower_runtime_args(
                 batch_count,
                 rhs_view,
                 output_view,
+                writer_epilogue,
             )?;
             runtime_args.add_core(core, writer, reader, Vec::new())?;
+            if epilogue == MatmulEpilogueKind::Top1 {
+                partial_tile_id += 1;
+            }
         }
     }
     runtime_args.build()
@@ -1170,6 +1389,12 @@ fn reader_args(
     Ok(args)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriterEpilogue {
+    Store,
+    Top1 { partial_tile_id: usize },
+}
+
 fn writer_args(
     plan: &MatmulPlan,
     grid: &[Vec<CoreCoord>],
@@ -1183,6 +1408,7 @@ fn writer_args(
     total_batch_count: usize,
     rhs_view: &MatmulOperandView,
     output_view: &MatmulOperandView,
+    epilogue: WriterEpilogue,
 ) -> io::Result<Vec<u32>> {
     let mcast = if plan.direct_grid.is_some() || plan.rows.len() <= 1 {
         [0, 0, 0, 0, 0]
@@ -1236,6 +1462,11 @@ fn writer_args(
         u32_value(logical_mt, "logical M tiles")?,
         u32_value(logical_nt, "logical N tiles")?,
         0,
+    ]);
+    if let WriterEpilogue::Top1 { partial_tile_id } = epilogue {
+        args.push(u32_value(partial_tile_id, "partial tile id")?);
+    }
+    args.extend([
         u32_value(local_batch_count, "local batch count")?,
         u32_value(batch_start, "batch start")?,
         u32_value(total_batch_count, "total batch count")?,
@@ -1408,7 +1639,10 @@ mod tests {
         let grid = plan.direct_grid.as_ref().expect("direct plan");
         assert!(plan.batch_groups > 1);
         assert_eq!(grid.len() % plan.batch_groups, 0);
-        assert_eq!(plan.direct_grid_rows_per_batch(), Some(grid.len() / plan.batch_groups));
+        assert_eq!(
+            plan.direct_grid_rows_per_batch(),
+            Some(grid.len() / plan.batch_groups)
+        );
     }
 
     #[test]
