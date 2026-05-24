@@ -114,10 +114,7 @@ impl FastDispatcher {
         match self.runtime_templates.entry(program_id) {
             std::collections::hash_map::Entry::Occupied(_) => {}
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(RuntimeCqTemplate::new(
-                    runtime_args,
-                    go_word(dispatch_core),
-                )?);
+                entry.insert(RuntimeCqTemplate::new(runtime_args, go_word(dispatch_core))?);
             }
         }
 

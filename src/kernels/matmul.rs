@@ -468,11 +468,7 @@ fn dot_general_dims(
     let batch = parse_dims(batch_dimensions, "batching")?;
     let contract = parse_dims(contracting_dimensions, "contracting")?;
     let free = (0..rank).filter(|&dim| !used[dim]).collect::<Vec<_>>();
-    Ok(DotGeneralDims {
-        batch,
-        contract,
-        free,
-    })
+    Ok(DotGeneralDims { batch, contract, free })
 }
 
 fn checked_product_of_dims(shape: &[usize], dims: &[usize], name: &str) -> io::Result<usize> {
@@ -503,14 +499,8 @@ fn operand_view(
         col_rank: u32_value(col_dims.len(), "matmul operand column rank")?,
         logical_rows: u32_value(logical_rows, "matmul operand logical rows")?,
         logical_cols: u32_value(logical_cols, "matmul operand logical columns")?,
-        tile_rows: u32_value(
-            allocation_shape[rank - 2] / 32,
-            "matmul operand source tile rows",
-        )?,
-        tiles_per_row: u32_value(
-            allocation_shape[rank - 1] / 32,
-            "matmul operand source tiles per row",
-        )?,
+        tile_rows: u32_value(allocation_shape[rank - 2] / 32, "matmul operand source tile rows")?,
+        tiles_per_row: u32_value(allocation_shape[rank - 1] / 32, "matmul operand source tiles per row")?,
         shape: padded_u32_array(shape, "matmul operand shape")?,
         batch_dims: padded_u32_array(batch_dims, "matmul operand batch dimensions")?,
         row_dims: padded_u32_array(row_dims, "matmul operand row dimensions")?,
@@ -525,11 +515,7 @@ fn operand_view_kind(
     col_dims: &[usize],
 ) -> MatmulViewKind {
     let leading_batch = batch_dims.iter().copied().eq(0..batch_dims.len());
-    if leading_batch
-        && rank == batch_dims.len() + 2
-        && row_dims == [rank - 2]
-        && col_dims == [rank - 1]
-    {
+    if leading_batch && rank == batch_dims.len() + 2 && row_dims == [rank - 2] && col_dims == [rank - 1] {
         MatmulViewKind::Contiguous
     } else if is_tiled_index_map_view(rank, batch_dims, row_dims, col_dims) {
         MatmulViewKind::TiledIndexMap
@@ -557,10 +543,7 @@ fn is_tiled_index_map_view(
 
 fn padded_u32_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]> {
     if values.len() > MAX_RANK {
-        return Err(invalid_input(format!(
-            "{name} rank {} exceeds maximum rank {MAX_RANK}",
-            values.len()
-        )));
+        return Err(invalid_input(format!("{name} rank {} exceeds maximum rank {MAX_RANK}", values.len())));
     }
     let mut result = [0u32; MAX_RANK];
     for (index, &value) in values.iter().enumerate() {
@@ -570,10 +553,7 @@ fn padded_u32_array(values: &[usize], name: &str) -> io::Result<[u32; MAX_RANK]>
 }
 
 fn checked_product(values: &[usize], name: &str) -> io::Result<usize> {
-    values.iter().try_fold(1usize, |acc, &value| {
-        acc.checked_mul(value)
-            .ok_or_else(|| invalid_input(format!("{name} product overflow")))
-    })
+    values.iter().try_fold(1usize, |acc, &value| acc.checked_mul(value).ok_or_else(|| invalid_input(format!("{name} product overflow"))))
 }
 
 fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::Result<()> {
@@ -1428,10 +1408,7 @@ mod tests {
         let grid = plan.direct_grid.as_ref().expect("direct plan");
         assert!(plan.batch_groups > 1);
         assert_eq!(grid.len() % plan.batch_groups, 0);
-        assert_eq!(
-            plan.direct_grid_rows_per_batch(),
-            Some(grid.len() / plan.batch_groups)
-        );
+        assert_eq!(plan.direct_grid_rows_per_batch(), Some(grid.len() / plan.batch_groups));
     }
 
     #[test]

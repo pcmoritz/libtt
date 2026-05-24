@@ -15,7 +15,6 @@ void MAIN {
   constexpr uint32_t cb_out = tt::CBIndex::c_16;
 
   unary_op_init_common(tt::CBIndex::c_0, cb_out);
-FUSED_TYPECAST_INITS
 
   for (uint32_t i = 0; i < n_tiles; ++i) {
 FUSED_STEPS

@@ -605,7 +605,16 @@ fn validate_and_collect_inputs<'a>(
                     )));
                 }
             }
-            _ => validate_node_inputs(index, node, node.kind.arity())?,
+            _ => {
+                let expected = node.kind.arity();
+                if node.input_nodes.len() != expected {
+                    return Err(invalid_input(format!(
+                        "node[{index}] {:?} expected {expected} operands, got {}",
+                        node.kind,
+                        node.input_nodes.len()
+                    )));
+                }
+            }
         }
         for &input_node in &node.input_nodes {
             if input_node as usize >= index {
@@ -628,21 +637,6 @@ fn validate_and_collect_inputs<'a>(
         )));
     }
     Ok(input_reads)
-}
-
-fn validate_node_inputs(
-    index: usize,
-    node: &FusedElementwiseNode,
-    expected: usize,
-) -> io::Result<()> {
-    if node.input_nodes.len() != expected {
-        return Err(invalid_input(format!(
-            "node[{index}] {:?} expected {expected} operands, got {}",
-            node.kind,
-            node.input_nodes.len()
-        )));
-    }
-    Ok(())
 }
 
 fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
@@ -800,7 +794,6 @@ fn compute_source(key: &FusedEltwiseProgramKey) -> io::Result<String> {
     Ok(COMPUTE
         .replace("FUSED_HEADERS", &steps.features.headers_source())
         .replace("FUSED_HELPERS", &steps.features.helpers_source())
-        .replace("FUSED_TYPECAST_INITS", "")
         .replace("FUSED_STEPS", &steps.body))
 }
 
@@ -1331,12 +1324,10 @@ fn cb_dtype(cb_dtypes: &[Option<DType>; 32], cb: u32) -> io::Result<DType> {
 }
 
 fn append_waits(body: &mut String, cbs: &[u32]) {
-    let mut waited = Vec::new();
-    for &cb in cbs {
-        if waited.contains(&cb) {
+    for (index, &cb) in cbs.iter().enumerate() {
+        if cbs[..index].contains(&cb) {
             continue;
         }
-        waited.push(cb);
         writeln!(body, "    cb_wait_front(tt::CBIndex::c_{cb}, 1);").unwrap();
     }
 }

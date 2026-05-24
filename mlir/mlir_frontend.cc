@@ -766,8 +766,7 @@ std::optional<uint32_t> collectFusedElementwiseValue(
 
 std::optional<FusedElementwiseRegion> collectFusedElementwiseRegion(
     mlir::Operation* root) {
-    if (!isFusableElementwiseOp(root) ||
-        !hasSupportedFusedElementwiseTypes(root)) {
+    if (!hasSupportedFusedElementwiseTypes(root)) {
         return std::nullopt;
     }
 
@@ -775,13 +774,7 @@ std::optional<FusedElementwiseRegion> collectFusedElementwiseRegion(
     llvm::DenseMap<mlir::Value, uint32_t> node_ids;
     auto collected_root = collectFusedElementwiseOp(
         root, root->getResult(0), true, region, node_ids);
-    unsigned fused_op_count = llvm::count_if(
-        region.nodes,
-        [](const FusedElementwiseNodeDesc& node) {
-            return node.kind != tt::FusedElementwiseOp::Node::KIND_INPUT &&
-                   node.kind != tt::FusedElementwiseOp::Node::KIND_CONSTANT;
-        });
-    if (!collected_root.has_value() || fused_op_count < 1 ||
+    if (!collected_root.has_value() ||
         region.nodes.size() > kMaxFusedElementwiseNodes ||
         region.inputs.size() > kMaxFusedElementwiseInputs) {
         return std::nullopt;

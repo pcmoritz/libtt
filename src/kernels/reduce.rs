@@ -402,8 +402,8 @@ fn output_rows_before_tile_row(shape: ReduceKernelShape, tile_row: u32) -> io::R
     let prefix = tile_row / tile_rows_per_prefix;
     let row_tile = tile_row % tile_rows_per_prefix;
     let prefix_rows = checked_mul_u32(prefix, shape.output_dim0, "reduce prefix row offset")?;
-    let row_offset =
-        checked_mul_u32(row_tile, TILE_R as u32, "output row offset")?.min(shape.output_dim0);
+    let row_offset = checked_mul_u32(row_tile, TILE_R as u32, "output row offset")?
+        .min(shape.output_dim0);
     prefix_rows
         .checked_add(row_offset)
         .ok_or_else(|| invalid_input("reduce output row offset overflow"))
@@ -465,4 +465,5 @@ mod tests {
         assert_eq!(plan.shape.valid_last_width, TILE_C as u32);
         assert_eq!(plan.op.padding_identity_bits(), 0.0f32.to_bits());
     }
+
 }
