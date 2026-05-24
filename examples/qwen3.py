@@ -381,6 +381,17 @@ def causal_attention_bias(seq_len: int):
     return jnp.where(position_ids[None, :] > position_ids[:, None], -1.0e9, 0.0)[None, None, :, :]
 
 
+def decode_attention(config: Qwen3Config, query_states, key_cache, value_cache):
+    repeats = config.num_attention_heads // config.num_key_value_heads
+    grouped_query = query_states[0].reshape(config.num_key_value_heads, repeats, config.head_dim)
+    scores = jnp.einsum("hrd,hdt->hrt", grouped_query, key_cache).astype(jnp.float32)
+    scores = scores * (config.head_dim**-0.5)
+    probs = jax.nn.softmax(scores, axis=-1).astype(query_states.dtype)
+    return jnp.einsum("hrt,htd->hrd", probs, value_cache).reshape(
+        1, config.num_attention_heads, config.head_dim
+    )
+
+
 def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin, causal_bias, cache=None):
     seq_len = hidden_states.shape[0]
     query_states = hidden_states @ layer["q_proj"]
@@ -393,18 +404,21 @@ def self_attention(config: Qwen3Config, hidden_states, layer, cos, sin, causal_b
 
     query_states = rms_norm(query_states, layer["q_norm"], config.rms_norm_eps)
     key_states = rms_norm(key_states, layer["k_norm"], config.rms_norm_eps)
-    query_states = apply_rope(query_states, cos, sin)
-    key_states = apply_rope(key_states, cos, sin)
 
-    key_cache = key_states.reshape((seq_len, -1))
-    value_cache = value_states.reshape((seq_len, -1))
-    if cache is not None:
-        key_cache = jnp.concatenate((cache[0], key_cache), axis=0)
-        value_cache = jnp.concatenate((cache[1], value_cache), axis=0)
-    key_states = key_cache.reshape((key_cache.shape[0], config.num_key_value_heads, config.head_dim))
-    value_states = value_cache.reshape((value_cache.shape[0], config.num_key_value_heads, config.head_dim))
-
-    attn_output = jax.nn.dot_product_attention(query_states, key_states, value_states, bias=causal_bias, implementation="xla")
+    if cache is None:
+        query_states = apply_rope(query_states, cos, sin)
+        key_states = apply_rope(key_states, cos, sin)
+        key_cache = jnp.transpose(key_states, (1, 2, 0))
+        value_cache = jnp.transpose(value_states, (1, 0, 2))
+        attn_output = jax.nn.dot_product_attention(
+            query_states, key_states, value_states, bias=causal_bias, implementation="xla"
+        )
+    else:
+        query_states = apply_rope(query_states, cos, sin)
+        key_states = apply_rope(key_states, cos, sin)
+        key_cache = jnp.concatenate((cache[0], jnp.transpose(key_states, (1, 2, 0))), axis=2)
+        value_cache = jnp.concatenate((cache[1], jnp.transpose(value_states, (1, 0, 2))), axis=1)
+        attn_output = decode_attention(config, query_states, key_cache, value_cache)
     output = attn_output.reshape(seq_len, -1) @ layer["o_proj"]
     return output, (key_cache, value_cache)
 
@@ -420,7 +434,7 @@ def qwen3_forward(config: Qwen3Config, weights, input_ids, caches=None):
     seq_len = input_ids.shape[0]
     if caches is not None and seq_len != 1:
         raise ValueError("cached decode expects exactly one new token")
-    cache_len = 0 if caches is None else caches[0][0].shape[0]
+    cache_len = 0 if caches is None else caches[0][0].shape[2]
     hidden_states = weights["embed_tokens"][input_ids]
     cos = weights["rope_cos"][cache_len : cache_len + seq_len]
     sin = weights["rope_sin"][cache_len : cache_len + seq_len]
