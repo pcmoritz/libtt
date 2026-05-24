@@ -5,22 +5,19 @@ constexpr uint32_t ARG_RHS_VIEW_KIND = 38;
 constexpr uint32_t ARG_OUTPUT_VIEW_KIND = ARG_RHS_VIEW_KIND + VIEW_ARG_COUNT;
 constexpr uint32_t BF16_NEG_INF = 0xff80;
 
-uint32_t ordered_float_key(uint32_t bits) {
-  return (bits & 0x80000000u) != 0 ? ~bits : (bits ^ 0x80000000u);
+uint16_t value_key(uint16_t bits) {
+  return static_cast<uint16_t>(
+      (bits & 0x8000u) != 0 ? ~bits : (bits ^ 0x8000u));
 }
 
-uint32_t value_key(uint32_t value_bits) {
-  return ordered_float_key(value_bits << 16);
-}
-
-bool candidate_before(uint32_t lhs_key, uint32_t lhs_index, uint32_t rhs_key,
+bool candidate_before(uint16_t lhs_key, uint32_t lhs_index, uint16_t rhs_key,
                       uint32_t rhs_index) {
   return lhs_key > rhs_key || (lhs_key == rhs_key && lhs_index < rhs_index);
 }
 
 struct Top1 {
   bool have_best;
-  uint32_t key;
+  uint16_t key;
   uint32_t value;
   uint32_t index;
 };
@@ -61,8 +58,8 @@ void consider_output_tile(Top1 *best, uint32_t l1_addr, uint32_t col_tile,
     if (index >= logical_cols) {
       break;
     }
-    uint32_t value = tile[tile_element_index(0, col)];
-    uint32_t key = value_key(value);
+    uint16_t value = tile[tile_element_index(0, col)];
+    uint16_t key = value_key(value);
     if (!best->have_best || candidate_before(key, index, best->key, best->index)) {
       best->have_best = true;
       best->key = key;
@@ -105,15 +102,6 @@ void drain_output_top1(const OutputTop1 &output, uint32_t batch, bool valid_batc
   }
 }
 
-void zero_tile(uint32_t cb) {
-  volatile tt_l1_ptr uint32_t *ptr =
-      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_write_ptr(cb));
-  uint32_t words = get_tile_size(cb) / sizeof(uint32_t);
-  for (uint32_t i = 0; i < words; ++i) {
-    ptr[i] = 0;
-  }
-}
-
 void write_partial(const OutputTop1 &output, const Top1 &best) {
   constexpr uint32_t cb_pairs = tt::CBIndex::c_4;
 
@@ -124,11 +112,10 @@ void write_partial(const OutputTop1 &output, const Top1 &best) {
   };
 
   cb_reserve_back(cb_pairs, 1);
-  zero_tile(cb_pairs);
   volatile tt_l1_ptr uint32_t *pair_ptr =
       reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_write_ptr(cb_pairs));
-  pair_ptr[tile_element_index(0, 0)] = best.have_best ? best.value : BF16_NEG_INF;
-  pair_ptr[tile_element_index(0, 1)] = best.have_best ? best.index : 0xffffffffu;
+  pair_ptr[0] = best.have_best ? best.value : BF16_NEG_INF;
+  pair_ptr[1] = best.have_best ? best.index : 0xffffffffu;
   noc_async_write_tile(output.partial_tile_id, partial_pairs, get_write_ptr(cb_pairs));
   noc_async_write_barrier();
   cb_push_back(cb_pairs, 1);
