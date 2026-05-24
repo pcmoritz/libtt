@@ -796,25 +796,19 @@ struct FusedElementwisePlan {
 
 FusedElementwisePlan buildFusedElementwisePlan(FuncOp func) {
     FusedElementwisePlan plan;
-    llvm::SmallVector<mlir::Operation*> ops;
-    for (mlir::Operation& op : func.front()) {
-        if (!mlir::isa<mlir::func::ReturnOp>(op)) {
-            ops.push_back(&op);
-        }
-    }
 
-    for (mlir::Operation* op : llvm::reverse(ops)) {
-        if (plan.covered_ops.contains(op)) {
+    for (mlir::Operation& op : llvm::reverse(func.front().without_terminator())) {
+        if (plan.covered_ops.contains(&op)) {
             continue;
         }
-        auto region = collectFusedElementwiseRegion(op);
+        auto region = collectFusedElementwiseRegion(&op);
         if (!region.has_value()) {
             continue;
         }
         for (mlir::Operation* covered : region->covered_ops) {
             plan.covered_ops.insert(covered);
         }
-        plan.roots.try_emplace(op, std::move(*region));
+        plan.roots.try_emplace(&op, std::move(*region));
     }
     return plan;
 }

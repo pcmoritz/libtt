@@ -16,6 +16,7 @@ mod kernels;
 mod linux;
 mod log;
 mod mlir_frontend;
+mod utils;
 
 use device::Device;
 use dram::{DType, DramBuffer};
@@ -309,23 +310,11 @@ unsafe fn checked_ref<'a, T>(ptr: *const T, name: &str) -> Result<&'a T, *mut PJ
 }
 
 fn pjrt_buffer_type_to_dtype(buffer_type: PJRT_Buffer_Type) -> Result<DType, *mut PJRT_Error> {
-    match buffer_type {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S8 => Ok(DType::Int8),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => Ok(DType::UInt8),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Ok(DType::Int32),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 => Ok(DType::UInt8),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Ok(DType::UInt16),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => Ok(DType::UInt32),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F16 => Ok(DType::Float16),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 => Ok(DType::Float32),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => Ok(DType::Float16B),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_INVALID => {
-            Err(invalid_argument("invalid PJRT buffer type"))
-        }
-        _ => Err(unimplemented(format!(
-            "unsupported PJRT buffer type {buffer_type:?}"
-        ))),
-    }
+    utils::pjrt_buffer_type_to_dtype(buffer_type).map_err(|err| match err.kind() {
+        io::ErrorKind::InvalidInput => invalid_argument(err.to_string()),
+        io::ErrorKind::Unsupported => unimplemented(err.to_string()),
+        _ => io_error(err),
+    })
 }
 
 fn dtype_to_pjrt_buffer_type(dtype: DType) -> PJRT_Buffer_Type {

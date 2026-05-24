@@ -4,8 +4,8 @@ use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuf
 use crate::executable::{CompareDirection, FusedElementwiseKind, FusedElementwiseNode};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
-use crate::PJRT_Buffer_Type;
-use std::fmt::Display;
+use crate::utils::pjrt_buffer_type_to_dtype;
+use std::fmt::{Display, Write};
 use std::io;
 
 const WRITER: &str = include_str!("../../kernels/tile_writer.cc");
@@ -466,24 +466,8 @@ impl Kernel<FusedEltwiseProgramKey> for FusedEltwiseKernel {
     }
 }
 
-fn element_type_to_dtype(element_type: PJRT_Buffer_Type) -> io::Result<DType> {
-    match element_type {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S8 => Ok(DType::Int8),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => Ok(DType::UInt8),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Ok(DType::Int32),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 => Ok(DType::UInt8),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Ok(DType::UInt16),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => Ok(DType::UInt32),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F16 => Ok(DType::Float16),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 => Ok(DType::Float32),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => Ok(DType::Float16B),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_INVALID => Err(invalid_input("invalid element type")),
-        other => Err(invalid_input(format!("unsupported element type {other:?}"))),
-    }
-}
-
 fn node_dtype(node: &FusedElementwiseNode) -> io::Result<DType> {
-    element_type_to_dtype(node.element_type)
+    pjrt_buffer_type_to_dtype(node.element_type)
 }
 
 pub(crate) fn eltwise(
@@ -564,9 +548,7 @@ fn validate_and_collect_inputs<'a>(
                         dtype
                     )));
                 }
-                let input_index = usize::try_from(node.input_index).map_err(|_| {
-                    invalid_input(format!("node[{index}] input index is out of range"))
-                })?;
+                let input_index = node.input_index as usize;
                 if input_index >= external_inputs.len() {
                     return Err(invalid_input(format!(
                         "node[{index}] input index {} is out of bounds for {} inputs",
@@ -626,7 +608,7 @@ fn validate_and_collect_inputs<'a>(
             _ => validate_node_inputs(index, node, node.kind.arity())?,
         }
         for &input_node in &node.input_nodes {
-            if usize::try_from(input_node).map_or(true, |input| input >= index) {
+            if input_node as usize >= index {
                 return Err(invalid_input(format!(
                     "node[{index}] references non-prior input node {input_node}"
                 )));
@@ -666,8 +648,7 @@ fn validate_node_inputs(
 fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     let input_nodes = fused_input_nodes(&key.nodes);
     let input_count = input_nodes.len();
-    let mut reader_dynamic_indices = Vec::with_capacity(input_count);
-    reader_dynamic_indices.extend(0..input_count);
+    let reader_dynamic_indices: Vec<usize> = (0..input_count).collect();
 
     let mut runtime_args = RuntimeArgsBuilder::new(0, vec![0], reader_dynamic_indices, Vec::new());
     for (core_index, &core) in key.cores.iter().enumerate() {
@@ -733,34 +714,50 @@ fn reader_source(input_nodes: &[&FusedElementwiseNode]) -> io::Result<String> {
     let mut broadcasts = String::new();
     let mut pushes = String::new();
     for index in 0..input_count {
-        arg_loads.push_str(&format!(
-            "  uint32_t input_addr_{index} = get_arg_val<uint32_t>({index});\n"
-        ));
-        addr_gens.push_str(&format!(
-            "  constexpr uint32_t cb_input_{index} = tt::CBIndex::c_{index};\n  const InterleavedAddrGenFast<true> input_{index} = {{\n    .bank_base_address = input_addr_{index}, .page_size = get_tile_size(cb_input_{index}), .data_format = get_dataformat(cb_input_{index}),\n  }};\n"
-        ));
-        reserves.push_str(&format!("    cb_reserve_back(cb_input_{index}, 1);\n"));
+        writeln!(
+            arg_loads,
+            "  uint32_t input_addr_{index} = get_arg_val<uint32_t>({index});"
+        )
+        .unwrap();
+        writeln!(
+            addr_gens,
+            "  constexpr uint32_t cb_input_{index} = tt::CBIndex::c_{index};"
+        )
+        .unwrap();
+        writeln!(
+            addr_gens,
+            "  const InterleavedAddrGenFast<true> input_{index} = {{"
+        )
+        .unwrap();
+        writeln!(
+            addr_gens,
+            "    .bank_base_address = input_addr_{index}, .page_size = get_tile_size(cb_input_{index}), .data_format = get_dataformat(cb_input_{index}),"
+        )
+        .unwrap();
+        writeln!(addr_gens, "  }};").unwrap();
+        writeln!(reserves, "    cb_reserve_back(cb_input_{index}, 1);").unwrap();
         let tile_id = if input_nodes[index].single_tile_broadcast {
-            "0".to_owned()
+            "0"
         } else {
-            "offset + i".to_owned()
+            "offset + i"
         };
-        reads.push_str(
-            &format!(
-                "    noc_async_read_tile(offset + i, input_{index}, get_write_ptr(cb_input_{index}));\n"
-            )
-            .replace("offset + i", &tile_id),
-        );
+        writeln!(
+            reads,
+            "    noc_async_read_tile({tile_id}, input_{index}, get_write_ptr(cb_input_{index}));"
+        )
+        .unwrap();
         if input_nodes[index].single_tile_broadcast {
             let mode = match node_dtype(input_nodes[index])? {
-                DType::Float16 | DType::Float16B | DType::UInt16 => "true",
-                _ => "false",
+                DType::Float16 | DType::Float16B | DType::UInt16 => true,
+                _ => false,
             };
-            broadcasts.push_str(&format!(
-                "    replicate_first_element(cb_input_{index}, {mode});\n"
-            ));
+            writeln!(
+                broadcasts,
+                "    replicate_first_element(cb_input_{index}, {mode});"
+            )
+            .unwrap();
         }
-        pushes.push_str(&format!("    cb_push_back(cb_input_{index}, 1);\n"));
+        writeln!(pushes, "    cb_push_back(cb_input_{index}, 1);").unwrap();
     }
 
     Ok(format!(
@@ -873,10 +870,11 @@ impl ComputeSourceFeatures {
     }
 
     fn headers_source(&self) -> String {
-        self.headers
-            .iter()
-            .map(|header| format!("#include \"{header}\"\n"))
-            .collect()
+        let mut source = String::new();
+        for header in &self.headers {
+            writeln!(source, "#include \"{header}\"").unwrap();
+        }
+        source
     }
 
     fn helpers_source(&self) -> String {
@@ -937,10 +935,13 @@ impl ComputeEmitContext<'_> {
     }
 
     fn copy_to_dst(&mut self, cb: u32, dst: u32) {
-        self.body.push_str(&format!(
-            "    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{}, tt::CBIndex::c_{cb});\n    copy_tile(tt::CBIndex::c_{cb}, 0, {dst});\n",
+        writeln!(
+            self.body,
+            "    copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_{}, tt::CBIndex::c_{cb});",
             self.srca_cb
-        ));
+        )
+        .unwrap();
+        writeln!(self.body, "    copy_tile(tt::CBIndex::c_{cb}, 0, {dst});").unwrap();
         self.srca_cb = cb;
     }
 }
@@ -1009,8 +1010,7 @@ fn compute_steps(nodes: &[FusedElementwiseNode]) -> io::Result<ComputeSteps> {
     let mut remaining_uses = vec![0u32; nodes.len()];
     for node in nodes {
         for &input_node in &node.input_nodes {
-            let index = usize::try_from(input_node)
-                .map_err(|_| invalid_input(format!("node id out of range: {input_node}")))?;
+            let index = input_node as usize;
             if index >= nodes.len() {
                 return Err(invalid_input(format!(
                     "node id out of bounds: {input_node}"
@@ -1024,8 +1024,7 @@ fn compute_steps(nodes: &[FusedElementwiseNode]) -> io::Result<ComputeSteps> {
     let mut cb_dtypes = [None; 32];
     for (node, cb) in nodes.iter().zip(node_cbs.iter().copied()) {
         if let Some(cb) = cb {
-            let index = usize::try_from(cb)
-                .map_err(|_| invalid_input(format!("CB id out of range: {cb}")))?;
+            let index = cb as usize;
             if index >= cb_dtypes.len() {
                 return Err(invalid_input(format!("CB id out of bounds: {cb}")));
             }
@@ -1151,20 +1150,25 @@ fn emit_unary(ctx: &mut ComputeEmitContext<'_>, index: usize, spec: UnarySpec) -
         UnaryLowering::Tile(unary) => unary.init,
         UnaryLowering::Convert { .. } => "",
     };
-    ctx.body.push_str(&format!(
-        "    {init}\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n"
-    ));
+    if !init.is_empty() {
+        writeln!(ctx.body, "    {init}").unwrap();
+    }
+    writeln!(
+        ctx.body,
+        "    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);"
+    )
+    .unwrap();
+    writeln!(ctx.body, "    tile_regs_acquire();").unwrap();
     ctx.copy_to_dst(input_cb, 0);
     match spec.op {
         UnaryLowering::Tile(unary) => {
             ctx.features.add_unary(unary);
-            ctx.body.push_str(&format!("    {}\n", unary.tile));
+            writeln!(ctx.body, "    {}", unary.tile).unwrap();
         }
         UnaryLowering::Convert { from, to } => {
             ctx.features.add_typecast();
-            ctx.body.push_str(&format!(
-                "    typecast_tile_init<{from}, {to}>();\n    typecast_tile<{from}, {to}>(0);\n"
-            ));
+            writeln!(ctx.body, "    typecast_tile_init<{from}, {to}>();").unwrap();
+            writeln!(ctx.body, "    typecast_tile<{from}, {to}>(0);").unwrap();
         }
     }
     ctx.pack_and_pop(output_cb, &[spec.input])
@@ -1182,13 +1186,15 @@ fn emit_scalar_binary(
         ScalarBinaryFeature::Scalar(scalar) => ctx.features.add_scalar(scalar),
         ScalarBinaryFeature::UnaryCompare => ctx.features.add_unary_compare(),
     }
-    ctx.body.push_str(&format!(
-        "    {}();\n    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n",
-        spec.init
-    ));
+    writeln!(ctx.body, "    {}();", spec.init).unwrap();
+    writeln!(
+        ctx.body,
+        "    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);"
+    )
+    .unwrap();
+    writeln!(ctx.body, "    tile_regs_acquire();").unwrap();
     ctx.copy_to_dst(value_cb, 0);
-    ctx.body
-        .push_str(&format!("    {}(0, {});\n", spec.tile, spec.scalar));
+    writeln!(ctx.body, "    {}(0, {});", spec.tile, spec.scalar).unwrap();
     ctx.pack_and_pop(output_cb, &[spec.value_node])
 }
 
@@ -1200,20 +1206,24 @@ fn emit_binary(ctx: &mut ComputeEmitContext<'_>, index: usize, spec: BinarySpec)
     match spec.op {
         BinaryLowering::DataFormatHelper { helper, op } => {
             ctx.features.add_data_format_binary_helper(op);
-            ctx.body.push_str(&format!(
-                "    constexpr DataFormat input_format_{index} = binary_input_data_format(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{output_cb});\n    {helper}_init<input_format_{index}>();\n"
-            ));
+            writeln!(
+                ctx.body,
+                "    constexpr DataFormat input_format_{index} = binary_input_data_format(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{output_cb});"
+            )
+            .unwrap();
+            writeln!(ctx.body, "    {helper}_init<input_format_{index}>();").unwrap();
             append_binary_tile_setup(ctx, output_cb, lhs_cb, rhs_cb);
-            ctx.body.push_str(&format!(
-                "    {helper}_tile<input_format_{index}>(0, 1, 0);\n"
-            ));
+            writeln!(
+                ctx.body,
+                "    {helper}_tile<input_format_{index}>(0, 1, 0);"
+            )
+            .unwrap();
         }
         BinaryLowering::Tile(binary) => {
             ctx.features.add_binary(binary);
-            ctx.body.push_str(&format!("    {}();\n", binary.init));
+            writeln!(ctx.body, "    {}();", binary.init).unwrap();
             append_binary_tile_setup(ctx, output_cb, lhs_cb, rhs_cb);
-            ctx.body
-                .push_str(&format!("    {}(0, 1, 0);\n", binary.tile));
+            writeln!(ctx.body, "    {}(0, 1, 0);", binary.tile).unwrap();
         }
     }
     ctx.pack_and_pop(output_cb, &[spec.lhs, spec.rhs])
@@ -1227,17 +1237,23 @@ fn emit_compare(
     let lhs_cb = ctx.cb_for_node(spec.lhs)?;
     let rhs_cb = ctx.cb_for_node(spec.rhs)?;
     let output_cb = ctx.cb_for_node(index)?;
-    let int32_input = bool_literal(spec.int32_input);
+    let int32_input = spec.int32_input;
     let direction = spec.direction.variant();
     append_waits(&mut ctx.body, &[lhs_cb, rhs_cb]);
     ctx.features.add_compare_helpers();
-    ctx.body.push_str(&format!(
-        "    compare_sub_init<{int32_input}>();\n    compare_zero_init(CompareDirection::{direction});\n"
-    ));
+    writeln!(ctx.body, "    compare_sub_init<{int32_input}>();").unwrap();
+    writeln!(
+        ctx.body,
+        "    compare_zero_init(CompareDirection::{direction});"
+    )
+    .unwrap();
     append_binary_tile_setup(ctx, output_cb, lhs_cb, rhs_cb);
-    ctx.body.push_str(&format!(
-        "    compare_sub_tile<{int32_input}>(0, 1, 0);\n    compare_zero_tile<{int32_input}>(CompareDirection::{direction}, 0);\n"
-    ));
+    writeln!(ctx.body, "    compare_sub_tile<{int32_input}>(0, 1, 0);").unwrap();
+    writeln!(
+        ctx.body,
+        "    compare_zero_tile<{int32_input}>(CompareDirection::{direction}, 0);"
+    )
+    .unwrap();
     ctx.pack_and_pop(output_cb, &[spec.lhs, spec.rhs])
 }
 
@@ -1247,9 +1263,12 @@ fn append_binary_tile_setup(
     lhs_cb: u32,
     rhs_cb: u32,
 ) {
-    ctx.body.push_str(&format!(
-        "    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);\n    tile_regs_acquire();\n"
-    ));
+    writeln!(
+        ctx.body,
+        "    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);"
+    )
+    .unwrap();
+    writeln!(ctx.body, "    tile_regs_acquire();").unwrap();
     ctx.copy_to_dst(lhs_cb, 0);
     ctx.copy_to_dst(rhs_cb, 1);
 }
@@ -1304,8 +1323,7 @@ fn cb_for_node(node_cbs: &[Option<u32>], node: usize) -> io::Result<u32> {
 }
 
 fn cb_dtype(cb_dtypes: &[Option<DType>; 32], cb: u32) -> io::Result<DType> {
-    let index =
-        usize::try_from(cb).map_err(|_| invalid_input(format!("CB id out of range: {cb}")))?;
+    let index = cb as usize;
     cb_dtypes
         .get(index)
         .and_then(|dtype| *dtype)
@@ -1319,7 +1337,7 @@ fn append_waits(body: &mut String, cbs: &[u32]) {
             continue;
         }
         waited.push(cb);
-        body.push_str(&format!("    cb_wait_front(tt::CBIndex::c_{cb}, 1);\n"));
+        writeln!(body, "    cb_wait_front(tt::CBIndex::c_{cb}, 1);").unwrap();
     }
 }
 
@@ -1332,15 +1350,17 @@ fn append_pack_and_pop(
     node_cbs: &[Option<u32>],
     remaining_uses: &mut [u32],
 ) -> io::Result<()> {
-    body.push_str(&format!("    tile_regs_commit();\n    tile_regs_wait();\n"));
+    writeln!(body, "    tile_regs_commit();").unwrap();
+    writeln!(body, "    tile_regs_wait();").unwrap();
     if reconfigure_pack {
-        body.push_str(&format!(
-            "    pack_reconfig_data_format(tt::CBIndex::c_{previous_output_cb}, tt::CBIndex::c_{output_cb});\n"
-        ));
+        writeln!(
+            body,
+            "    pack_reconfig_data_format(tt::CBIndex::c_{previous_output_cb}, tt::CBIndex::c_{output_cb});"
+        )
+        .unwrap();
     }
-    body.push_str(&format!(
-        "    pack_tile(0, tt::CBIndex::c_{output_cb});\n    tile_regs_release();\n"
-    ));
+    writeln!(body, "    pack_tile(0, tt::CBIndex::c_{output_cb});").unwrap();
+    writeln!(body, "    tile_regs_release();").unwrap();
 
     let mut consumed = Vec::<(usize, u32)>::new();
     for &node in input_nodes {
@@ -1356,13 +1376,11 @@ fn append_pack_and_pop(
             .ok_or_else(|| invalid_input(format!("node {node} use count underflow")))?;
         if remaining_uses[node] == 0 {
             if let Some(cb) = node_cbs[node] {
-                body.push_str(&format!("    cb_pop_front(tt::CBIndex::c_{cb}, 1);\n"));
+                writeln!(body, "    cb_pop_front(tt::CBIndex::c_{cb}, 1);").unwrap();
             }
         }
     }
-    body.push_str(&format!(
-        "    cb_push_back(tt::CBIndex::c_{output_cb}, 1);\n"
-    ));
+    writeln!(body, "    cb_push_back(tt::CBIndex::c_{output_cb}, 1);").unwrap();
     Ok(())
 }
 
@@ -1392,14 +1410,6 @@ fn constant_scalar_bits(nodes: &[FusedElementwiseNode], index: usize) -> io::Res
         DType::Float16 => f16_to_f32_bits((node.packed_value & 0xffff) as u16),
         _ => node.packed_value,
     }))
-}
-
-fn bool_literal(value: bool) -> &'static str {
-    if value {
-        "true"
-    } else {
-        "false"
-    }
 }
 
 fn f16_to_f32_bits(value: u16) -> u32 {
@@ -1476,6 +1486,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PJRT_Buffer_Type;
 
     fn element_type(dtype: DType) -> PJRT_Buffer_Type {
         match dtype {
