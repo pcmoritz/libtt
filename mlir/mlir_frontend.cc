@@ -663,7 +663,8 @@ std::optional<uint32_t> collectFusedElementwiseValue(
     mlir::Value value,
     mlir::Value root_value,
     FusedElementwiseRegion& region,
-    llvm::DenseMap<mlir::Value, uint32_t>& node_ids);
+    llvm::DenseMap<mlir::Value, uint32_t>& node_ids,
+    bool allow_fused_producer);
 
 std::optional<uint32_t> collectFusedElementwiseOp(
     mlir::Operation* op,
@@ -672,6 +673,9 @@ std::optional<uint32_t> collectFusedElementwiseOp(
     FusedElementwiseRegion& region,
     llvm::DenseMap<mlir::Value, uint32_t>& node_ids) {
     if (!is_root && !op->getResult(0).hasOneUse()) {
+        return std::nullopt;
+    }
+    if (!is_root && mlir::isa<mlir::stablehlo::ConvertOp>(op)) {
         return std::nullopt;
     }
     if (!sameTensorShape(op->getResult(0), root_value) ||
@@ -689,12 +693,14 @@ std::optional<uint32_t> collectFusedElementwiseOp(
 
     FusedElementwiseRegion candidate_region = region;
     llvm::DenseMap<mlir::Value, uint32_t> candidate_node_ids = node_ids;
+    bool allow_fused_operands = !mlir::isa<mlir::stablehlo::ConvertOp>(op);
     for (mlir::Value operand : op->getOperands()) {
         auto node_id = collectFusedElementwiseValue(
             operand,
             root_value,
             candidate_region,
-            candidate_node_ids);
+            candidate_node_ids,
+            allow_fused_operands);
         if (!node_id.has_value()) {
             return std::nullopt;
         }
@@ -713,7 +719,8 @@ std::optional<uint32_t> collectFusedElementwiseValue(
     mlir::Value value,
     mlir::Value root_value,
     FusedElementwiseRegion& region,
-    llvm::DenseMap<mlir::Value, uint32_t>& node_ids) {
+    llvm::DenseMap<mlir::Value, uint32_t>& node_ids,
+    bool allow_fused_producer) {
     auto existing = node_ids.find(value);
     if (existing != node_ids.end()) {
         return existing->second;
@@ -734,11 +741,13 @@ std::optional<uint32_t> collectFusedElementwiseValue(
         return node_id;
     }
 
-    if (auto* defining_op = value.getDefiningOp();
-        defining_op && isFusableElementwiseOp(defining_op)) {
-        if (auto node_id = collectFusedElementwiseOp(
-                defining_op, root_value, false, region, node_ids)) {
-            return node_id;
+    if (allow_fused_producer) {
+        if (auto* defining_op = value.getDefiningOp();
+            defining_op && isFusableElementwiseOp(defining_op)) {
+            if (auto node_id = collectFusedElementwiseOp(
+                    defining_op, root_value, false, region, node_ids)) {
+                return node_id;
+            }
         }
     }
 

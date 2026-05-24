@@ -4855,6 +4855,44 @@ mod tests {
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
+    fn pjrt_compile_keeps_convert_as_fusion_boundary() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<1x64xbf16>, %arg1: tensor<1x64xf32>) -> tensor<1x64xbf16> {
+    %0 = stablehlo.convert %arg0 : (tensor<1x64xbf16>) -> tensor<1x64xf32>
+    %1 = stablehlo.multiply %0, %arg1 : tensor<1x64xf32>
+    %2 = stablehlo.convert %1 : (tensor<1x64xf32>) -> tensor<1x64xbf16>
+    return %2 : tensor<1x64xbf16>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![4]);
+                assert_eq!(executable.ops.len(), 5);
+                assert_single_fused_op(
+                    &executable.ops[2],
+                    &[0],
+                    2,
+                    executable::FusedElementwiseKind::Convert,
+                );
+                assert_single_fused_op(
+                    &executable.ops[3],
+                    &[2, 1],
+                    3,
+                    executable::FusedElementwiseKind::Multiply,
+                );
+                assert_single_fused_op(
+                    &executable.ops[4],
+                    &[3],
+                    4,
+                    executable::FusedElementwiseKind::Convert,
+                );
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
     fn pjrt_compile_lowers_convert_of_scalar_constant() {
         with_compiled_mlir_executable(
             r#"module {
