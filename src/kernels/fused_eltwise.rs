@@ -155,33 +155,27 @@ impl FusedElementwiseKind {
     }
 
     fn validate_binary_dtype(self, input_dtype: DType) -> io::Result<()> {
-        let ok = match self {
-            Self::Add | Self::Multiply => matches!(
-                input_dtype,
+        match (self, input_dtype) {
+            (
+                Self::Add | Self::Multiply,
                 DType::Float16
-                    | DType::Float16B
-                    | DType::Float32
-                    | DType::Int32
-                    | DType::UInt16
-                    | DType::UInt32
-            ),
-            Self::Subtract => matches!(
-                input_dtype,
-                DType::Float16 | DType::Float16B | DType::Float32 | DType::Int32
-            ),
-            Self::Divide | Self::Power | Self::Max => is_float_dtype(input_dtype),
-            Self::Compare(_) => matches!(
-                input_dtype,
-                DType::Float16 | DType::Float16B | DType::Float32 | DType::Int32
-            ),
-            _ => false,
-        };
-        if ok {
-            Ok(())
-        } else {
-            Err(invalid_input(format!(
+                | DType::Float16B
+                | DType::Float32
+                | DType::Int32
+                | DType::UInt16
+                | DType::UInt32,
+            )
+            | (
+                Self::Subtract | Self::Compare(_),
+                DType::Float16 | DType::Float16B | DType::Float32 | DType::Int32,
+            )
+            | (
+                Self::Divide | Self::Power | Self::Max,
+                DType::Float16 | DType::Float16B | DType::Float32,
+            ) => Ok(()),
+            _ => Err(invalid_input(format!(
                 "{self:?} does not support input dtype {input_dtype:?}"
-            )))
+            ))),
         }
     }
 

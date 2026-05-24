@@ -210,7 +210,7 @@ std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& erro
         return std::nullopt;
     }
 
-    auto element_type = mlir::cast<mlir::ShapedType>(dense.getType()).getElementType();
+    auto element_type = dense.getElementType();
     if (element_type.isBF16() || element_type.isF16()) {
         auto bits = dense.getSplatValue<llvm::APFloat>().bitcastToAPInt();
         uint32_t value16 = bits.extractBitsAsZExtValue(16, 0);
@@ -248,7 +248,7 @@ std::optional<uint32_t> packedConvertedConstantValue(
         return std::nullopt;
     }
 
-    auto input_element_type = mlir::cast<mlir::ShapedType>(dense.getType()).getElementType();
+    auto input_element_type = dense.getElementType();
     auto output_element_type =
         mlir::cast<mlir::RankedTensorType>(convert_op.getResult().getType()).getElementType();
     if (!input_element_type.isBF16() && !input_element_type.isF16() &&
@@ -415,6 +415,9 @@ struct FusedElementwiseNodeDesc {
         tt::FusedElementwiseOp::Node::DIRECTION_EQ;
 };
 
+// Temporary collector state for one fused subgraph. `inputs` are external MLIR
+// values read by the runtime kernel, `nodes` are the internal fused DAG in
+// dependency order, and `covered_ops` are skipped by the main lowering loop.
 struct FusedElementwiseRegion {
     llvm::SmallVector<mlir::Value> inputs;
     llvm::SmallVector<FusedElementwiseNodeDesc> nodes;
