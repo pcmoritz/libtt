@@ -436,65 +436,55 @@ std::optional<mlir::Type> getStaticElementType(mlir::Value value) {
     return std::nullopt;
 }
 
-bool isFloatTensor(mlir::Value value) {
-    auto element = getStaticElementType(value);
-    if (!element) {
-        return false;
-    }
-    return element->isBF16() || element->isF16() || element->isF32();
+bool isFloatElement(mlir::Type element) {
+    return element.isBF16() || element.isF16() || element.isF32();
 }
 
-bool isIntegerTensor(mlir::Value value, unsigned width, bool unsigned_only = false) {
-    auto element = getStaticElementType(value);
-    if (!element) {
-        return false;
-    }
-    auto integer = mlir::dyn_cast<mlir::IntegerType>(*element);
+bool isBf16OrF32Element(mlir::Type element) {
+    return element.isBF16() || element.isF32();
+}
+
+bool isIntegerElement(mlir::Type element, unsigned width, bool unsigned_only = false) {
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(element);
     return integer && integer.getWidth() == width &&
            (!unsigned_only || integer.isUnsigned());
 }
 
-bool isSignedOrSignlessIntegerTensor(mlir::Value value, unsigned width) {
+bool isSignedOrSignlessI32Element(mlir::Type element) {
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(element);
+    return integer && integer.getWidth() == 32 && !integer.isUnsigned();
+}
+
+template <typename Predicate>
+bool hasStaticElement(mlir::Value value, Predicate predicate) {
     auto element = getStaticElementType(value);
-    if (!element) {
-        return false;
-    }
-    auto integer = mlir::dyn_cast<mlir::IntegerType>(*element);
-    return integer && integer.getWidth() == width && !integer.isUnsigned();
+    return element && predicate(*element);
 }
 
-bool isBf16OrF32Tensor(mlir::Value value) {
-    auto element = getStaticElementType(value);
-    if (!element) {
-        return false;
-    }
-    return element->isBF16() || element->isF32();
+bool supportsFusedLeafElement(mlir::Value value) {
+    return hasStaticElement(value, [](mlir::Type element) {
+        return isFloatElement(element) || isIntegerElement(element, 32) ||
+               isIntegerElement(element, 16, true);
+    });
 }
 
-bool isSupportedFusedLeafTensor(mlir::Value value) {
-    return isFloatTensor(value) || isIntegerTensor(value, 32) ||
-           isIntegerTensor(value, 16, true);
+bool supportsConvertElement(mlir::Value value) {
+    return hasStaticElement(value, [](mlir::Type element) {
+        return isBf16OrF32Element(element) || isIntegerElement(element, 32) ||
+               isIntegerElement(element, 16, true);
+    });
 }
 
-bool isSupportedConvertTensor(mlir::Value value) {
-    return isBf16OrF32Tensor(value) ||
-           isSignedOrSignlessIntegerTensor(value, 32) ||
-           isIntegerTensor(value, 32, true) ||
-           isIntegerTensor(value, 16, true);
-}
-
-bool isSupportedCompareTensor(mlir::Value value) {
-    return isBf16OrF32Tensor(value) ||
-           isSignedOrSignlessIntegerTensor(value, 32);
+bool supportsCompareElement(mlir::Value value) {
+    return hasStaticElement(value, [](mlir::Type element) {
+        return isBf16OrF32Element(element) || isSignedOrSignlessI32Element(element);
+    });
 }
 
 bool isPredTensor(mlir::Value value) {
-    auto element = getStaticElementType(value);
-    if (!element) {
-        return false;
-    }
-    auto integer = mlir::dyn_cast<mlir::IntegerType>(*element);
-    return integer && integer.getWidth() == 1;
+    return hasStaticElement(value, [](mlir::Type element) {
+        return isIntegerElement(element, 1);
+    });
 }
 
 bool sameTensorShape(mlir::Value lhs, mlir::Value rhs) {
@@ -544,7 +534,7 @@ bool isFusableElementwiseOp(mlir::Operation* op) {
     }
     return op && op->getNumResults() == 1 &&
            fusedElementwiseKind(op).has_value() &&
-           isSupportedFusedLeafTensor(op->getResult(0));
+           supportsFusedLeafElement(op->getResult(0));
 }
 
 bool hasSupportedFusedElementwiseTypes(mlir::Operation* op) {
@@ -559,7 +549,7 @@ bool hasSupportedFusedElementwiseTypes(mlir::Operation* op) {
         }
         auto lhs_type = valueElementType(*op->operand_begin());
         for (mlir::Value operand : op->getOperands()) {
-            if (!isSupportedCompareTensor(operand) ||
+            if (!supportsCompareElement(operand) ||
                 valueElementType(operand) != lhs_type) {
                 return false;
             }
@@ -577,8 +567,8 @@ bool hasSupportedFusedElementwiseTypes(mlir::Operation* op) {
     if (mlir::isa<mlir::stablehlo::ConvertOp>(op)) {
         mlir::Value operand = op->getOperand(0);
         return sameTensorShape(operand, result) &&
-               isSupportedConvertTensor(operand) &&
-               isSupportedConvertTensor(result);
+               supportsConvertElement(operand) &&
+               supportsConvertElement(result);
     }
 
     bool float_only = mlir::isa<mlir::stablehlo::DivOp>(op) ||
@@ -589,16 +579,21 @@ bool hasSupportedFusedElementwiseTypes(mlir::Operation* op) {
                       mlir::isa<mlir::stablehlo::NegOp>(op) ||
                       mlir::isa<mlir::stablehlo::ExpOp>(op) ||
                       mlir::isa<mlir::stablehlo::RsqrtOp>(op);
-    if (float_only && !isFloatTensor(result)) {
+    auto result_element = getStaticElementType(result);
+    if (!result_element) {
+        return false;
+    }
+    if (float_only && !isFloatElement(*result_element)) {
         return false;
     }
     if (mlir::isa<mlir::stablehlo::SubtractOp>(op) &&
-        !(isFloatTensor(result) || isSignedOrSignlessIntegerTensor(result, 32))) {
+        !(isFloatElement(*result_element) ||
+          isSignedOrSignlessI32Element(*result_element))) {
         return false;
     }
 
     for (mlir::Value operand : op->getOperands()) {
-        if (!isSupportedFusedLeafTensor(operand) ||
+        if (!supportsFusedLeafElement(operand) ||
             valueElementType(operand) != valueElementType(result)) {
             return false;
         }
@@ -711,7 +706,7 @@ std::optional<uint32_t> collectFusedElementwiseValue(
 
     std::string ignored;
     if (auto packed = packedConstantValue(value, ignored)) {
-        if (!isSupportedFusedLeafTensor(value)) {
+        if (!supportsFusedLeafElement(value)) {
             return std::nullopt;
         }
         FusedElementwiseNodeDesc node;
@@ -734,7 +729,9 @@ std::optional<uint32_t> collectFusedElementwiseValue(
 
     if (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
         mlir::Value operand = broadcast_op.getOperand();
-        if (broadcast_op->getResult(0).hasOneUse() && isFloatTensor(operand) &&
+        auto operand_element = getStaticElementType(operand);
+        if (broadcast_op->getResult(0).hasOneUse() &&
+            operand_element && isFloatElement(*operand_element) &&
             mlir::isa<mlir::BlockArgument>(operand) &&
             sameTensorShape(value, root_value) &&
             valueElementType(operand) == valueElementType(value) &&
@@ -751,7 +748,7 @@ std::optional<uint32_t> collectFusedElementwiseValue(
         }
     }
 
-    if (!isSupportedFusedLeafTensor(value) || !sameTensorShape(value, root_value)) {
+    if (!supportsFusedLeafElement(value) || !sameTensorShape(value, root_value)) {
         return std::nullopt;
     }
 
