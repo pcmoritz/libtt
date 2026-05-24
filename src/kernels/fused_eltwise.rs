@@ -1,9 +1,10 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
 use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
-use crate::executable::{CompareDirection, FusedElementwiseKind};
+use crate::executable::{CompareDirection, FusedElementwiseKind, FusedElementwiseNode};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
+use crate::PJRT_Buffer_Type;
 use std::fmt::Display;
 use std::io;
 
@@ -36,25 +37,6 @@ const HEADER_SUB_INT: &str = "compute_kernel_api/sub_int_sfpu.h";
 const HEADER_TRIGONOMETRY: &str = "compute_kernel_api/eltwise_unary/trigonometry.h";
 const HEADER_TYPECAST: &str = "compute_kernel_api/eltwise_unary/typecast.h";
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub(crate) enum FusedEltwiseOp {
-    Input,
-    Constant,
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    Power,
-    Max,
-    Compare(CompareDirection),
-    Cosine,
-    Sine,
-    Negate,
-    Exponential,
-    Rsqrt,
-    Convert,
-}
-
 #[derive(Clone, Copy)]
 struct UnaryCompute {
     header: &'static str,
@@ -84,7 +66,7 @@ struct ScalarCompute {
     tile: &'static str,
 }
 
-impl FusedEltwiseOp {
+impl FusedElementwiseKind {
     fn arity(self) -> usize {
         match self {
             Self::Input | Self::Constant => 0,
@@ -394,28 +376,6 @@ impl FusedEltwiseOp {
     }
 }
 
-impl From<FusedElementwiseKind> for FusedEltwiseOp {
-    fn from(kind: FusedElementwiseKind) -> Self {
-        match kind {
-            FusedElementwiseKind::Input => Self::Input,
-            FusedElementwiseKind::Constant => Self::Constant,
-            FusedElementwiseKind::Add => Self::Add,
-            FusedElementwiseKind::Subtract => Self::Subtract,
-            FusedElementwiseKind::Multiply => Self::Multiply,
-            FusedElementwiseKind::Divide => Self::Divide,
-            FusedElementwiseKind::Power => Self::Power,
-            FusedElementwiseKind::Max => Self::Max,
-            FusedElementwiseKind::Compare(direction) => Self::Compare(direction),
-            FusedElementwiseKind::Cosine => Self::Cosine,
-            FusedElementwiseKind::Sine => Self::Sine,
-            FusedElementwiseKind::Negate => Self::Negate,
-            FusedElementwiseKind::Exponential => Self::Exponential,
-            FusedElementwiseKind::Rsqrt => Self::Rsqrt,
-            FusedElementwiseKind::Convert => Self::Convert,
-        }
-    }
-}
-
 impl CompareDirection {
     fn reversed(self) -> Self {
         match self {
@@ -469,21 +429,11 @@ impl CompareDirection {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub(crate) struct FusedEltwiseNode {
-    pub(crate) op: FusedEltwiseOp,
-    pub(crate) input_nodes: Vec<u32>,
-    pub(crate) input_index: u32,
-    pub(crate) packed_value: u32,
-    pub(crate) dtype: DType,
-    pub(crate) single_tile_broadcast: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct FusedEltwiseProgramKey {
     cores: Vec<CoreCoord>,
     tile_count: u32,
     output_dtype: DType,
-    nodes: Vec<FusedEltwiseNode>,
+    nodes: Vec<FusedElementwiseNode>,
 }
 
 struct FusedEltwiseKernel {
@@ -516,10 +466,30 @@ impl Kernel<FusedEltwiseProgramKey> for FusedEltwiseKernel {
     }
 }
 
+fn element_type_to_dtype(element_type: PJRT_Buffer_Type) -> io::Result<DType> {
+    match element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S8 => Ok(DType::Int8),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => Ok(DType::UInt8),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Ok(DType::Int32),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 => Ok(DType::UInt8),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Ok(DType::UInt16),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => Ok(DType::UInt32),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F16 => Ok(DType::Float16),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 => Ok(DType::Float32),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => Ok(DType::Float16B),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_INVALID => Err(invalid_input("invalid element type")),
+        other => Err(invalid_input(format!("unsupported element type {other:?}"))),
+    }
+}
+
+fn node_dtype(node: &FusedElementwiseNode) -> io::Result<DType> {
+    element_type_to_dtype(node.element_type)
+}
+
 pub(crate) fn eltwise(
     device: &mut Device,
     external_inputs: &[&DramBuffer],
-    nodes: &[FusedEltwiseNode],
+    nodes: &[FusedElementwiseNode],
     shape: &[usize],
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
@@ -528,7 +498,7 @@ pub(crate) fn eltwise(
     let output_tiles = tiled_shape_tile_count(shape)?;
     let tile_count = u32_arg(output_tiles, "tile count")?;
     let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
-    let output_dtype = nodes[nodes.len() - 1].dtype;
+    let output_dtype = node_dtype(&nodes[nodes.len() - 1])?;
     let output_shape = tiled_allocation_shape(shape)?;
     let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
 
@@ -553,7 +523,7 @@ pub(crate) fn eltwise(
 
 fn validate_and_collect_inputs<'a>(
     external_inputs: &[&'a DramBuffer],
-    nodes: &[FusedEltwiseNode],
+    nodes: &[FusedElementwiseNode],
     shape: &[usize],
 ) -> io::Result<Vec<&'a DramBuffer>> {
     if external_inputs.len() > MAX_FUSED_INPUTS {
@@ -571,10 +541,13 @@ fn validate_and_collect_inputs<'a>(
     let root = nodes
         .last()
         .expect("nodes was already checked as non-empty");
-    if matches!(root.op, FusedEltwiseOp::Input | FusedEltwiseOp::Constant) {
+    if matches!(
+        root.kind,
+        FusedElementwiseKind::Input | FusedElementwiseKind::Constant
+    ) {
         return Err(invalid_input(format!(
             "fused eltwise root node must be the final operation, got {:?}",
-            root.op
+            root.kind
         )));
     }
 
@@ -582,12 +555,13 @@ fn validate_and_collect_inputs<'a>(
     let expected_shape = tiled_allocation_shape(shape)?;
     let mut input_reads = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
-        match node.op {
-            FusedEltwiseOp::Input => {
-                if !is_supported_leaf_dtype(node.dtype) {
+        let dtype = node_dtype(node)?;
+        match node.kind {
+            FusedElementwiseKind::Input => {
+                if !is_supported_leaf_dtype(dtype) {
                     return Err(invalid_input(format!(
                         "node[{index}] input dtype {:?} is not supported by fused eltwise",
-                        node.dtype
+                        dtype
                     )));
                 }
                 let input_index = usize::try_from(node.input_index).map_err(|_| {
@@ -602,10 +576,10 @@ fn validate_and_collect_inputs<'a>(
                 }
                 let buffer = external_inputs[input_index];
                 let input_dtype = buffer.dtype;
-                if input_dtype != node.dtype {
+                if input_dtype != dtype {
                     return Err(invalid_input(format!(
                         "node[{index}] input dtype mismatch: node {:?}, input {:?}",
-                        node.dtype, input_dtype
+                        dtype, input_dtype
                     )));
                 }
                 if !node.input_nodes.is_empty() {
@@ -636,11 +610,11 @@ fn validate_and_collect_inputs<'a>(
                 }
                 input_reads.push(buffer);
             }
-            FusedEltwiseOp::Constant => {
-                if !is_supported_leaf_dtype(node.dtype) {
+            FusedElementwiseKind::Constant => {
+                if !is_supported_leaf_dtype(dtype) {
                     return Err(invalid_input(format!(
                         "node[{index}] constant dtype {:?} is not supported by fused eltwise",
-                        node.dtype
+                        dtype
                     )));
                 }
                 if !node.input_nodes.is_empty() {
@@ -649,7 +623,7 @@ fn validate_and_collect_inputs<'a>(
                     )));
                 }
             }
-            _ => validate_node_inputs(index, node, node.op.arity())?,
+            _ => validate_node_inputs(index, node, node.kind.arity())?,
         }
         for &input_node in &node.input_nodes {
             if usize::try_from(input_node).map_or(true, |input| input >= index) {
@@ -661,9 +635,9 @@ fn validate_and_collect_inputs<'a>(
         let input_dtypes = node
             .input_nodes
             .iter()
-            .map(|&input_node| nodes[input_node as usize].dtype)
-            .collect::<Vec<_>>();
-        node.op.validate_dtypes(index, &input_dtypes, node.dtype)?;
+            .map(|&input_node| node_dtype(&nodes[input_node as usize]))
+            .collect::<io::Result<Vec<_>>>()?;
+        node.kind.validate_dtypes(index, &input_dtypes, dtype)?;
     }
     if input_reads.is_empty() || input_reads.len() > MAX_FUSED_INPUTS {
         return Err(invalid_input(format!(
@@ -674,11 +648,15 @@ fn validate_and_collect_inputs<'a>(
     Ok(input_reads)
 }
 
-fn validate_node_inputs(index: usize, node: &FusedEltwiseNode, expected: usize) -> io::Result<()> {
+fn validate_node_inputs(
+    index: usize,
+    node: &FusedElementwiseNode,
+    expected: usize,
+) -> io::Result<()> {
     if node.input_nodes.len() != expected {
         return Err(invalid_input(format!(
             "node[{index}] {:?} expected {expected} operands, got {}",
-            node.op,
+            node.kind,
             node.input_nodes.len()
         )));
     }
@@ -704,22 +682,29 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     let (_, intermediate_cbs) = cb_plan(&key.nodes)?;
     let mut cbs = Vec::with_capacity(input_count + intermediate_cbs.len() + 1);
     for (index, node) in input_nodes.iter().enumerate() {
-        cbs.push(CBConfig::new(index, node.dtype));
+        cbs.push(CBConfig::new(index, node_dtype(node)?));
     }
     for (cb, dtype) in intermediate_cbs {
         cbs.push(CBConfig::new(cb as usize, dtype));
     }
     cbs.push(CBConfig::new(16, key.output_dtype));
 
-    let dst_accum_mode = key
-        .nodes
-        .iter()
-        .map(|node| &node.dtype)
-        .chain(std::iter::once(&key.output_dtype))
-        .any(|dtype| matches!(dtype, DType::Float32 | DType::Int32 | DType::UInt32));
+    let mut dst_accum_mode = matches!(
+        key.output_dtype,
+        DType::Float32 | DType::Int32 | DType::UInt32
+    );
+    for node in &key.nodes {
+        if matches!(
+            node_dtype(node)?,
+            DType::Float32 | DType::Int32 | DType::UInt32
+        ) {
+            dst_accum_mode = true;
+            break;
+        }
+    }
 
     Ok(Program {
-        reader_kernel: reader_source(&input_nodes),
+        reader_kernel: reader_source(&input_nodes)?,
         compute_kernel: compute_source(&key)?,
         writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
@@ -732,14 +717,14 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     })
 }
 
-fn fused_input_nodes(nodes: &[FusedEltwiseNode]) -> Vec<&FusedEltwiseNode> {
+fn fused_input_nodes(nodes: &[FusedElementwiseNode]) -> Vec<&FusedElementwiseNode> {
     nodes
         .iter()
-        .filter(|node| node.op == FusedEltwiseOp::Input)
+        .filter(|node| node.kind == FusedElementwiseKind::Input)
         .collect()
 }
 
-fn reader_source(input_nodes: &[&FusedEltwiseNode]) -> String {
+fn reader_source(input_nodes: &[&FusedElementwiseNode]) -> io::Result<String> {
     let input_count = input_nodes.len();
     let mut arg_loads = String::new();
     let mut addr_gens = String::new();
@@ -767,7 +752,7 @@ fn reader_source(input_nodes: &[&FusedEltwiseNode]) -> String {
             .replace("offset + i", &tile_id),
         );
         if input_nodes[index].single_tile_broadcast {
-            let mode = match input_nodes[index].dtype {
+            let mode = match node_dtype(input_nodes[index])? {
                 DType::Float16 | DType::Float16B | DType::UInt16 => "true",
                 _ => "false",
             };
@@ -778,7 +763,7 @@ fn reader_source(input_nodes: &[&FusedEltwiseNode]) -> String {
         pushes.push_str(&format!("    cb_push_back(cb_input_{index}, 1);\n"));
     }
 
-    format!(
+    Ok(format!(
         "#include <cstdint>\n\
          \n\
          namespace {{\n\
@@ -810,7 +795,7 @@ fn reader_source(input_nodes: &[&FusedEltwiseNode]) -> String {
            }}\n\
          }}\n",
         input_count + 1
-    )
+    ))
 }
 
 fn compute_source(key: &FusedEltwiseProgramKey) -> io::Result<String> {
@@ -867,18 +852,18 @@ impl ComputeSourceFeatures {
         self.add_header(HEADER_COMP);
     }
 
-    fn add_data_format_binary_helper(&mut self, op: FusedEltwiseOp) {
+    fn add_data_format_binary_helper(&mut self, op: FusedElementwiseKind) {
         self.add_header(HEADER_BINARY_SFPU);
         match op {
-            FusedEltwiseOp::Add => {
+            FusedElementwiseKind::Add => {
                 self.add_input_helper = true;
                 self.add_header(HEADER_ADD_INT);
             }
-            FusedEltwiseOp::Subtract => {
+            FusedElementwiseKind::Subtract => {
                 self.subtract_input_helper = true;
                 self.add_header(HEADER_SUB_INT);
             }
-            FusedEltwiseOp::Multiply => {
+            FusedElementwiseKind::Multiply => {
                 self.multiply_input_helper = true;
                 self.add_header(HEADER_MUL_INT);
                 self.add_header(HEADER_MUL_INT32);
@@ -1007,7 +992,7 @@ struct BinarySpec {
 enum BinaryLowering {
     DataFormatHelper {
         helper: &'static str,
-        op: FusedEltwiseOp,
+        op: FusedElementwiseKind,
     },
     Tile(BinaryCompute),
 }
@@ -1020,7 +1005,7 @@ struct CompareSpec {
     int32_input: bool,
 }
 
-fn compute_steps(nodes: &[FusedEltwiseNode]) -> io::Result<ComputeSteps> {
+fn compute_steps(nodes: &[FusedElementwiseNode]) -> io::Result<ComputeSteps> {
     let mut remaining_uses = vec![0u32; nodes.len()];
     for node in nodes {
         for &input_node in &node.input_nodes {
@@ -1044,7 +1029,7 @@ fn compute_steps(nodes: &[FusedEltwiseNode]) -> io::Result<ComputeSteps> {
             if index >= cb_dtypes.len() {
                 return Err(invalid_input(format!("CB id out of bounds: {cb}")));
             }
-            cb_dtypes[index] = Some(node.dtype);
+            cb_dtypes[index] = Some(node_dtype(node)?);
         }
     }
     let mut ctx = ComputeEmitContext {
@@ -1073,18 +1058,21 @@ fn compute_steps(nodes: &[FusedEltwiseNode]) -> io::Result<ComputeSteps> {
     })
 }
 
-fn lowering_for(node: &FusedEltwiseNode, nodes: &[FusedEltwiseNode]) -> io::Result<Lowering> {
-    match node.op.arity() {
+fn lowering_for(
+    node: &FusedElementwiseNode,
+    nodes: &[FusedElementwiseNode],
+) -> io::Result<Lowering> {
+    match node.kind.arity() {
         0 => Ok(Lowering::Leaf),
         1 => {
             let input = node.input_nodes[0] as usize;
-            let op = if let Some(unary) = node.op.unary_compute() {
+            let op = if let Some(unary) = node.kind.unary_compute() {
                 UnaryLowering::Tile(unary)
             } else {
-                debug_assert_eq!(node.op, FusedEltwiseOp::Convert);
+                debug_assert_eq!(node.kind, FusedElementwiseKind::Convert);
                 UnaryLowering::Convert {
-                    from: nodes[input].dtype as u32,
-                    to: node.dtype as u32,
+                    from: node_dtype(&nodes[input])? as u32,
+                    to: node_dtype(node)? as u32,
                 }
             };
             Ok(Lowering::Unary(UnarySpec { input, op }))
@@ -1092,11 +1080,11 @@ fn lowering_for(node: &FusedEltwiseNode, nodes: &[FusedEltwiseNode]) -> io::Resu
         2 => {
             let lhs = node.input_nodes[0] as usize;
             let rhs = node.input_nodes[1] as usize;
-            if let FusedEltwiseOp::Compare(direction) = node.op {
+            if let FusedElementwiseKind::Compare(direction) = node.kind {
                 if let Some((value_node, scalar, scalar_direction)) =
-                    scalar_compare_op(nodes, lhs, rhs, direction)
+                    scalar_compare_op(nodes, lhs, rhs, direction)?
                 {
-                    let int32_input = nodes[value_node].dtype == DType::Int32;
+                    let int32_input = node_dtype(&nodes[value_node])? == DType::Int32;
                     return Ok(Lowering::ScalarBinary(ScalarBinarySpec {
                         value_node,
                         init: scalar_direction.unary_init(),
@@ -1106,11 +1094,11 @@ fn lowering_for(node: &FusedEltwiseNode, nodes: &[FusedEltwiseNode]) -> io::Resu
                     }));
                 }
             }
-            if let Some(scalar_op) = node.op.scalar_compute(
-                nodes[lhs].dtype,
-                nodes[rhs].dtype,
-                constant_scalar_bits(nodes, lhs),
-                constant_scalar_bits(nodes, rhs),
+            if let Some(scalar_op) = node.kind.scalar_compute(
+                node_dtype(&nodes[lhs])?,
+                node_dtype(&nodes[rhs])?,
+                constant_scalar_bits(nodes, lhs)?,
+                constant_scalar_bits(nodes, rhs)?,
             ) {
                 let value_node = match scalar_op.operand {
                     ScalarOperand::Lhs => lhs,
@@ -1124,26 +1112,26 @@ fn lowering_for(node: &FusedEltwiseNode, nodes: &[FusedEltwiseNode]) -> io::Resu
                     feature: ScalarBinaryFeature::Scalar(scalar_op),
                 }));
             }
-            if let FusedEltwiseOp::Compare(direction) = node.op {
+            if let FusedElementwiseKind::Compare(direction) = node.kind {
                 return Ok(Lowering::Compare(CompareSpec {
                     lhs,
                     rhs,
                     direction,
-                    int32_input: nodes[lhs].dtype == DType::Int32,
+                    int32_input: node_dtype(&nodes[lhs])? == DType::Int32,
                 }));
             }
-            if let Some(helper) = node.op.data_format_binary_helper() {
+            if let Some(helper) = node.kind.data_format_binary_helper() {
                 return Ok(Lowering::Binary(BinarySpec {
                     lhs,
                     rhs,
                     op: BinaryLowering::DataFormatHelper {
                         helper,
-                        op: node.op,
+                        op: node.kind,
                     },
                 }));
             }
-            let binary = node.op.binary_compute().ok_or_else(|| {
-                invalid_input(format!("missing binary lowering for {:?}", node.op))
+            let binary = node.kind.binary_compute().ok_or_else(|| {
+                invalid_input(format!("missing binary lowering for {:?}", node.kind))
             })?;
             Ok(Lowering::Binary(BinarySpec {
                 lhs,
@@ -1266,11 +1254,11 @@ fn append_binary_tile_setup(
     ctx.copy_to_dst(rhs_cb, 1);
 }
 
-fn cb_plan(nodes: &[FusedEltwiseNode]) -> io::Result<(Vec<Option<u32>>, Vec<(u32, DType)>)> {
+fn cb_plan(nodes: &[FusedElementwiseNode]) -> io::Result<(Vec<Option<u32>>, Vec<(u32, DType)>)> {
     let mut node_cbs = vec![None; nodes.len()];
     let mut leaf_count = 0u32;
     for (index, node) in nodes.iter().enumerate() {
-        if node.op == FusedEltwiseOp::Input {
+        if node.kind == FusedElementwiseKind::Input {
             if leaf_count >= 16 {
                 return Err(invalid_input("fused eltwise needs too many input CBs"));
             }
@@ -1286,7 +1274,10 @@ fn cb_plan(nodes: &[FusedEltwiseNode]) -> io::Result<(Vec<Option<u32>>, Vec<(u32
     let mut next_cb = leaf_count;
     let mut intermediate_cbs = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
-        if matches!(node.op, FusedEltwiseOp::Input | FusedEltwiseOp::Constant) {
+        if matches!(
+            node.kind,
+            FusedElementwiseKind::Input | FusedElementwiseKind::Constant
+        ) {
             continue;
         }
         if index == root_index {
@@ -1298,7 +1289,7 @@ fn cb_plan(nodes: &[FusedEltwiseNode]) -> io::Result<(Vec<Option<u32>>, Vec<(u32
                 ));
             }
             node_cbs[index] = Some(next_cb);
-            intermediate_cbs.push((next_cb, node.dtype));
+            intermediate_cbs.push((next_cb, node_dtype(node)?));
             next_cb += 1;
         }
     }
@@ -1376,28 +1367,31 @@ fn append_pack_and_pop(
 }
 
 fn scalar_compare_op(
-    nodes: &[FusedEltwiseNode],
+    nodes: &[FusedElementwiseNode],
     lhs: usize,
     rhs: usize,
     direction: CompareDirection,
-) -> Option<(usize, u32, CompareDirection)> {
-    let lhs_constant = constant_scalar_bits(nodes, lhs);
-    let rhs_constant = constant_scalar_bits(nodes, rhs);
-    match (lhs_constant, rhs_constant) {
+) -> io::Result<Option<(usize, u32, CompareDirection)>> {
+    let lhs_constant = constant_scalar_bits(nodes, lhs)?;
+    let rhs_constant = constant_scalar_bits(nodes, rhs)?;
+    Ok(match (lhs_constant, rhs_constant) {
         (None, Some(scalar)) => Some((lhs, scalar, direction)),
         (Some(scalar), None) => Some((rhs, scalar, direction.reversed())),
         _ => None,
-    }
+    })
 }
 
-fn constant_scalar_bits(nodes: &[FusedEltwiseNode], index: usize) -> Option<u32> {
+fn constant_scalar_bits(nodes: &[FusedElementwiseNode], index: usize) -> io::Result<Option<u32>> {
     let node = &nodes[index];
-    (node.op == FusedEltwiseOp::Constant).then(|| match node.dtype {
+    if node.kind != FusedElementwiseKind::Constant {
+        return Ok(None);
+    }
+    Ok(Some(match node_dtype(node)? {
         DType::Float32 => node.packed_value,
         DType::Float16B => (node.packed_value & 0xffff) << 16,
         DType::Float16 => f16_to_f32_bits((node.packed_value & 0xffff) as u16),
         _ => node.packed_value,
-    })
+    }))
 }
 
 fn bool_literal(value: bool) -> &'static str {
@@ -1454,7 +1448,7 @@ fn is_convert_dtype(dtype: DType) -> bool {
 
 fn validate_same_output_dtype(
     node_index: usize,
-    op: FusedEltwiseOp,
+    op: FusedElementwiseKind,
     input_dtype: DType,
     output_dtype: DType,
 ) -> io::Result<()> {
@@ -1483,35 +1477,49 @@ where
 mod tests {
     use super::*;
 
-    fn node(op: FusedEltwiseOp, input_nodes: Vec<u32>) -> FusedEltwiseNode {
-        FusedEltwiseNode {
-            op,
+    fn element_type(dtype: DType) -> PJRT_Buffer_Type {
+        match dtype {
+            DType::Float32 => PJRT_Buffer_Type::PJRT_Buffer_Type_F32,
+            DType::Float16 => PJRT_Buffer_Type::PJRT_Buffer_Type_F16,
+            DType::Float16B => PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+            DType::Int32 => PJRT_Buffer_Type::PJRT_Buffer_Type_S32,
+            DType::UInt16 => PJRT_Buffer_Type::PJRT_Buffer_Type_U16,
+            DType::Int8 => PJRT_Buffer_Type::PJRT_Buffer_Type_S8,
+            DType::UInt32 => PJRT_Buffer_Type::PJRT_Buffer_Type_U32,
+            DType::UInt8 => PJRT_Buffer_Type::PJRT_Buffer_Type_U8,
+        }
+    }
+
+    fn node(op: FusedElementwiseKind, input_nodes: Vec<u32>) -> FusedElementwiseNode {
+        FusedElementwiseNode {
+            kind: op,
             input_nodes,
             input_index: 0,
             packed_value: 0,
-            dtype: DType::Float16B,
+            element_type: element_type(DType::Float16B),
             single_tile_broadcast: false,
         }
     }
 
-    fn program_key(nodes: Vec<FusedEltwiseNode>) -> FusedEltwiseProgramKey {
+    fn program_key(nodes: Vec<FusedElementwiseNode>) -> FusedEltwiseProgramKey {
         FusedEltwiseProgramKey {
             cores: Vec::new(),
             tile_count: 1,
-            output_dtype: nodes.last().expect("test nodes must not be empty").dtype,
+            output_dtype: node_dtype(nodes.last().expect("test nodes must not be empty"))
+                .expect("test node dtype must be valid"),
             nodes,
         }
     }
 
     #[test]
     fn compute_steps_handles_constant_left_divide_as_rdiv() {
-        let mut constant = node(FusedEltwiseOp::Constant, Vec::new());
+        let mut constant = node(FusedElementwiseKind::Constant, Vec::new());
         constant.packed_value = 0x3f80_3f80;
 
         let nodes = vec![
-            node(FusedEltwiseOp::Input, Vec::new()),
+            node(FusedElementwiseKind::Input, Vec::new()),
             constant,
-            node(FusedEltwiseOp::Divide, vec![1, 0]),
+            node(FusedElementwiseKind::Divide, vec![1, 0]),
         ];
         let steps = compute_steps(&nodes).expect("constant / value should lower");
 
@@ -1521,13 +1529,13 @@ mod tests {
 
     #[test]
     fn compute_steps_handles_constant_right_power_as_unary_power() {
-        let mut constant = node(FusedEltwiseOp::Constant, Vec::new());
+        let mut constant = node(FusedElementwiseKind::Constant, Vec::new());
         constant.packed_value = 0x4000_4000;
 
         let nodes = vec![
-            node(FusedEltwiseOp::Input, Vec::new()),
+            node(FusedElementwiseKind::Input, Vec::new()),
             constant,
-            node(FusedEltwiseOp::Power, vec![0, 1]),
+            node(FusedElementwiseKind::Power, vec![0, 1]),
         ];
         let steps = compute_steps(&nodes).expect("value ** constant should lower");
 
@@ -1537,13 +1545,16 @@ mod tests {
 
     #[test]
     fn compute_steps_handles_constant_right_compare_as_unary_compare() {
-        let mut constant = node(FusedEltwiseOp::Constant, Vec::new());
+        let mut constant = node(FusedElementwiseKind::Constant, Vec::new());
         constant.packed_value = 0;
 
         let nodes = vec![
-            node(FusedEltwiseOp::Input, Vec::new()),
+            node(FusedElementwiseKind::Input, Vec::new()),
             constant,
-            node(FusedEltwiseOp::Compare(CompareDirection::Gt), vec![0, 1]),
+            node(
+                FusedElementwiseKind::Compare(CompareDirection::Gt),
+                vec![0, 1],
+            ),
         ];
         let steps = compute_steps(&nodes).expect("value > constant should lower");
 
@@ -1553,13 +1564,16 @@ mod tests {
 
     #[test]
     fn compute_steps_reverses_constant_left_compare() {
-        let mut constant = node(FusedEltwiseOp::Constant, Vec::new());
+        let mut constant = node(FusedElementwiseKind::Constant, Vec::new());
         constant.packed_value = 0;
 
         let nodes = vec![
             constant,
-            node(FusedEltwiseOp::Input, Vec::new()),
-            node(FusedEltwiseOp::Compare(CompareDirection::Gt), vec![0, 1]),
+            node(FusedElementwiseKind::Input, Vec::new()),
+            node(
+                FusedElementwiseKind::Compare(CompareDirection::Gt),
+                vec![0, 1],
+            ),
         ];
         let steps = compute_steps(&nodes).expect("constant > value should lower");
 
@@ -1569,13 +1583,13 @@ mod tests {
 
     #[test]
     fn compute_steps_handles_constant_right_max_as_unary_max() {
-        let mut constant = node(FusedEltwiseOp::Constant, Vec::new());
+        let mut constant = node(FusedElementwiseKind::Constant, Vec::new());
         constant.packed_value = 0;
 
         let nodes = vec![
-            node(FusedEltwiseOp::Input, Vec::new()),
+            node(FusedElementwiseKind::Input, Vec::new()),
             constant,
-            node(FusedEltwiseOp::Max, vec![0, 1]),
+            node(FusedElementwiseKind::Max, vec![0, 1]),
         ];
         let steps = compute_steps(&nodes).expect("max(value, constant) should lower");
 
@@ -1586,9 +1600,9 @@ mod tests {
     #[test]
     fn compute_source_only_emits_used_add_helpers() {
         let nodes = vec![
-            node(FusedEltwiseOp::Input, Vec::new()),
-            node(FusedEltwiseOp::Input, Vec::new()),
-            node(FusedEltwiseOp::Add, vec![0, 1]),
+            node(FusedElementwiseKind::Input, Vec::new()),
+            node(FusedElementwiseKind::Input, Vec::new()),
+            node(FusedElementwiseKind::Add, vec![0, 1]),
         ];
         let source = compute_source(&program_key(nodes)).expect("add source should generate");
 
@@ -1604,9 +1618,12 @@ mod tests {
     #[test]
     fn compute_source_only_emits_compare_helpers_for_compare() {
         let nodes = vec![
-            node(FusedEltwiseOp::Input, Vec::new()),
-            node(FusedEltwiseOp::Input, Vec::new()),
-            node(FusedEltwiseOp::Compare(CompareDirection::Gt), vec![0, 1]),
+            node(FusedElementwiseKind::Input, Vec::new()),
+            node(FusedElementwiseKind::Input, Vec::new()),
+            node(
+                FusedElementwiseKind::Compare(CompareDirection::Gt),
+                vec![0, 1],
+            ),
         ];
         let source = compute_source(&program_key(nodes)).expect("compare source should generate");
 

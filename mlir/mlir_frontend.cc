@@ -12,6 +12,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/Builders.h"
@@ -420,41 +421,54 @@ struct FusedElementwiseRegion {
     llvm::SmallVector<mlir::Operation*> covered_ops;
 };
 
-bool isFloatTensor(mlir::Value value) {
+std::optional<mlir::RankedTensorType> getStaticTensorType(mlir::Value value) {
     auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
     if (!tensor || !tensor.hasStaticShape()) {
+        return std::nullopt;
+    }
+    return tensor;
+}
+
+std::optional<mlir::Type> getStaticElementType(mlir::Value value) {
+    if (auto tensor = getStaticTensorType(value)) {
+        return tensor->getElementType();
+    }
+    return std::nullopt;
+}
+
+bool isFloatTensor(mlir::Value value) {
+    auto element = getStaticElementType(value);
+    if (!element) {
         return false;
     }
-    auto element = tensor.getElementType();
-    return element.isBF16() || element.isF16() || element.isF32();
+    return element->isBF16() || element->isF16() || element->isF32();
 }
 
 bool isIntegerTensor(mlir::Value value, unsigned width, bool unsigned_only = false) {
-    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
-    if (!tensor || !tensor.hasStaticShape()) {
+    auto element = getStaticElementType(value);
+    if (!element) {
         return false;
     }
-    auto integer = mlir::dyn_cast<mlir::IntegerType>(tensor.getElementType());
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(*element);
     return integer && integer.getWidth() == width &&
            (!unsigned_only || integer.isUnsigned());
 }
 
 bool isSignedOrSignlessIntegerTensor(mlir::Value value, unsigned width) {
-    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
-    if (!tensor || !tensor.hasStaticShape()) {
+    auto element = getStaticElementType(value);
+    if (!element) {
         return false;
     }
-    auto integer = mlir::dyn_cast<mlir::IntegerType>(tensor.getElementType());
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(*element);
     return integer && integer.getWidth() == width && !integer.isUnsigned();
 }
 
 bool isBf16OrF32Tensor(mlir::Value value) {
-    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
-    if (!tensor || !tensor.hasStaticShape()) {
+    auto element = getStaticElementType(value);
+    if (!element) {
         return false;
     }
-    auto element = tensor.getElementType();
-    return element.isBF16() || element.isF32();
+    return element->isBF16() || element->isF32();
 }
 
 bool isSupportedFusedLeafTensor(mlir::Value value) {
@@ -475,19 +489,18 @@ bool isSupportedCompareTensor(mlir::Value value) {
 }
 
 bool isPredTensor(mlir::Value value) {
-    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
-    if (!tensor || !tensor.hasStaticShape()) {
+    auto element = getStaticElementType(value);
+    if (!element) {
         return false;
     }
-    auto integer = mlir::dyn_cast<mlir::IntegerType>(tensor.getElementType());
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(*element);
     return integer && integer.getWidth() == 1;
 }
 
 bool sameTensorShape(mlir::Value lhs, mlir::Value rhs) {
-    auto lhs_tensor = mlir::dyn_cast<mlir::RankedTensorType>(lhs.getType());
-    auto rhs_tensor = mlir::dyn_cast<mlir::RankedTensorType>(rhs.getType());
-    return lhs_tensor && rhs_tensor && lhs_tensor.hasStaticShape() &&
-           rhs_tensor.hasStaticShape() && lhs_tensor.getShape() == rhs_tensor.getShape();
+    auto lhs_tensor = getStaticTensorType(lhs);
+    auto rhs_tensor = getStaticTensorType(rhs);
+    return lhs_tensor && rhs_tensor && lhs_tensor->getShape() == rhs_tensor->getShape();
 }
 
 tt::TensorDesc::ElementType valueElementType(mlir::Value value) {
@@ -496,55 +509,32 @@ tt::TensorDesc::ElementType valueElementType(mlir::Value value) {
 }
 
 bool isLogicalScalarTile(mlir::Value value) {
-    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
-    if (!tensor || !tensor.hasStaticShape()) {
+    auto tensor = getStaticTensorType(value);
+    if (!tensor) {
         return false;
     }
-    return llvm::all_of(tensor.getShape(), [](int64_t dim) { return dim == 1; });
+    return llvm::all_of(tensor->getShape(), [](int64_t dim) { return dim == 1; });
 }
 
 std::optional<tt::FusedElementwiseOp::Node::Kind> fusedElementwiseKind(
     mlir::Operation* op) {
-    if (mlir::isa<mlir::stablehlo::AddOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_ADD;
-    }
-    if (mlir::isa<mlir::stablehlo::SubtractOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_SUBTRACT;
-    }
-    if (mlir::isa<mlir::stablehlo::MulOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_MULTIPLY;
-    }
-    if (mlir::isa<mlir::stablehlo::DivOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_DIVIDE;
-    }
-    if (mlir::isa<mlir::stablehlo::PowOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_POWER;
-    }
-    if (mlir::isa<mlir::stablehlo::MaxOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_MAX;
-    }
-    if (mlir::isa<mlir::stablehlo::CompareOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_COMPARE;
-    }
-    if (mlir::isa<mlir::stablehlo::CosineOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_COSINE;
-    }
-    if (mlir::isa<mlir::stablehlo::SineOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_SINE;
-    }
-    if (mlir::isa<mlir::stablehlo::NegOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_NEGATE;
-    }
-    if (mlir::isa<mlir::stablehlo::ExpOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_EXPONENTIAL;
-    }
-    if (mlir::isa<mlir::stablehlo::RsqrtOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_RSQRT;
-    }
-    if (mlir::isa<mlir::stablehlo::ConvertOp>(op)) {
-        return tt::FusedElementwiseOp::Node::KIND_CONVERT;
-    }
-    return std::nullopt;
+    using Kind = tt::FusedElementwiseOp::Node::Kind;
+    using Node = tt::FusedElementwiseOp::Node;
+    return llvm::TypeSwitch<mlir::Operation*, std::optional<Kind>>(op)
+        .Case<mlir::stablehlo::AddOp>([](auto) { return Node::KIND_ADD; })
+        .Case<mlir::stablehlo::SubtractOp>([](auto) { return Node::KIND_SUBTRACT; })
+        .Case<mlir::stablehlo::MulOp>([](auto) { return Node::KIND_MULTIPLY; })
+        .Case<mlir::stablehlo::DivOp>([](auto) { return Node::KIND_DIVIDE; })
+        .Case<mlir::stablehlo::PowOp>([](auto) { return Node::KIND_POWER; })
+        .Case<mlir::stablehlo::MaxOp>([](auto) { return Node::KIND_MAX; })
+        .Case<mlir::stablehlo::CompareOp>([](auto) { return Node::KIND_COMPARE; })
+        .Case<mlir::stablehlo::CosineOp>([](auto) { return Node::KIND_COSINE; })
+        .Case<mlir::stablehlo::SineOp>([](auto) { return Node::KIND_SINE; })
+        .Case<mlir::stablehlo::NegOp>([](auto) { return Node::KIND_NEGATE; })
+        .Case<mlir::stablehlo::ExpOp>([](auto) { return Node::KIND_EXPONENTIAL; })
+        .Case<mlir::stablehlo::RsqrtOp>([](auto) { return Node::KIND_RSQRT; })
+        .Case<mlir::stablehlo::ConvertOp>([](auto) { return Node::KIND_CONVERT; })
+        .Default([](auto) { return std::nullopt; });
 }
 
 bool isFusableElementwiseOp(mlir::Operation* op) {

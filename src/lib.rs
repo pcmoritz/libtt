@@ -1743,23 +1743,10 @@ fn execute_fused_elementwise(
         inputs.push(input_dram);
     }
 
-    let kernel_nodes = nodes
-        .iter()
-        .map(|node| {
-            Ok(kernels::fused_eltwise::FusedEltwiseNode {
-                op: node.kind.into(),
-                input_nodes: node.input_nodes.clone(),
-                input_index: node.input_index,
-                packed_value: node.packed_value,
-                dtype: pjrt_buffer_type_to_dtype(node.element_type)?,
-                single_tile_broadcast: node.single_tile_broadcast,
-            })
-        })
-        .collect::<Result<Vec<_>, *mut PJRT_Error>>()?;
     let output_dram = kernels::fused_eltwise::eltwise(
         device,
         &inputs,
-        &kernel_nodes,
+        nodes,
         &output_shape,
         "pjrt_fused_elementwise",
     )
@@ -4884,16 +4871,28 @@ mod tests {
                 assert_eq!(nodes[0].input_index, 0);
                 assert_eq!(nodes[1].kind, executable::FusedElementwiseKind::Convert);
                 assert_eq!(nodes[1].input_nodes, vec![0]);
-                assert_eq!(nodes[1].dtype, DType::Float32);
+                assert_eq!(
+                    nodes[1].element_type,
+                    PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+                );
                 assert_eq!(nodes[2].kind, executable::FusedElementwiseKind::Input);
                 assert_eq!(nodes[2].input_index, 1);
-                assert_eq!(nodes[2].dtype, DType::Float32);
+                assert_eq!(
+                    nodes[2].element_type,
+                    PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+                );
                 assert_eq!(nodes[3].kind, executable::FusedElementwiseKind::Multiply);
                 assert_eq!(nodes[3].input_nodes, vec![1, 2]);
-                assert_eq!(nodes[3].dtype, DType::Float32);
+                assert_eq!(
+                    nodes[3].element_type,
+                    PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+                );
                 assert_eq!(nodes[4].kind, executable::FusedElementwiseKind::Convert);
                 assert_eq!(nodes[4].input_nodes, vec![3]);
-                assert_eq!(nodes[4].dtype, DType::Float16B);
+                assert_eq!(
+                    nodes[4].element_type,
+                    PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+                );
             },
         );
     }
