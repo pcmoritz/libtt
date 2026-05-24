@@ -108,7 +108,7 @@ impl FusedElementwiseKind {
                 let input_dtype = input_dtypes[0];
                 if !is_convert_dtype(input_dtype) || !is_convert_dtype(output_dtype) {
                     return Err(invalid_input(format!(
-                        "node[{node_index}] convert supports Float16B, Float32, Int32, UInt16, and UInt32, got {input_dtype:?} -> {output_dtype:?}"
+                        "node[{node_index}] convert supports Float16, Float16B, Float32, Int32, UInt16, and UInt32, got {input_dtype:?} -> {output_dtype:?}"
                     )));
                 }
                 Ok(())
@@ -168,9 +168,10 @@ impl FusedElementwiseKind {
                 DType::Float16 | DType::Float16B | DType::Float32 | DType::Int32
             ),
             Self::Divide | Self::Power | Self::Max => is_float_dtype(input_dtype),
-            Self::Compare(_) => {
-                matches!(input_dtype, DType::Float16B | DType::Float32 | DType::Int32)
-            }
+            Self::Compare(_) => matches!(
+                input_dtype,
+                DType::Float16 | DType::Float16B | DType::Float32 | DType::Int32
+            ),
             _ => false,
         };
         if ok {
@@ -1443,7 +1444,12 @@ fn is_float_dtype(dtype: DType) -> bool {
 fn is_convert_dtype(dtype: DType) -> bool {
     matches!(
         dtype,
-        DType::Float16B | DType::Float32 | DType::Int32 | DType::UInt16 | DType::UInt32
+        DType::Float16
+            | DType::Float16B
+            | DType::Float32
+            | DType::Int32
+            | DType::UInt16
+            | DType::UInt32
     )
 }
 

@@ -453,16 +453,14 @@ bool supportsFusedLeafElementType(tt::TensorDesc::ElementType element_type) {
 }
 
 bool supportsConvertElementType(tt::TensorDesc::ElementType element_type) {
-    return element_type == tt::TensorDesc::ELEMENT_TYPE_BF16 ||
-           element_type == tt::TensorDesc::ELEMENT_TYPE_F32 ||
+    return isFusedFloatElementType(element_type) ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_U32 ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_S32 ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_U16;
 }
 
 bool supportsCompareElementType(tt::TensorDesc::ElementType element_type) {
-    return element_type == tt::TensorDesc::ELEMENT_TYPE_BF16 ||
-           element_type == tt::TensorDesc::ELEMENT_TYPE_F32 ||
+    return isFusedFloatElementType(element_type) ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_S32;
 }
 
