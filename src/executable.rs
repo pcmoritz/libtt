@@ -163,6 +163,7 @@ pub(crate) struct FusedElementwiseNode {
     pub(crate) packed_value: u32,
     pub(crate) element_type: PJRT_Buffer_Type,
     pub(crate) single_tile_broadcast: bool,
+    pub(crate) broadcast_dimensions: Vec<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -177,6 +178,7 @@ pub(crate) enum FusedElementwiseKind {
     Power,
     Max,
     Compare(CompareDirection),
+    Select,
     Cosine,
     Sine,
     Negate,
@@ -339,9 +341,7 @@ fn parse_bitwise_binary_kind(kind: ProtoBitwiseBinaryKind) -> Result<BitwiseBina
         ProtoBitwiseBinaryKind::Xor => Ok(BitwiseBinaryKind::Xor),
         ProtoBitwiseBinaryKind::ShiftLeft => Ok(BitwiseBinaryKind::ShiftLeft),
         ProtoBitwiseBinaryKind::ShiftRightLogical => Ok(BitwiseBinaryKind::ShiftRightLogical),
-        ProtoBitwiseBinaryKind::ShiftRightArithmetic => {
-            Ok(BitwiseBinaryKind::ShiftRightArithmetic)
-        }
+        ProtoBitwiseBinaryKind::ShiftRightArithmetic => Ok(BitwiseBinaryKind::ShiftRightArithmetic),
     }
 }
 
@@ -385,6 +385,7 @@ fn parse_fused_elementwise_node(
         packed_value: node.packed_value,
         element_type: map_element_type(node.element_type)?,
         single_tile_broadcast: node.single_tile_broadcast,
+        broadcast_dimensions: Vec::new(),
     })
 }
 

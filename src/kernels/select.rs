@@ -113,7 +113,12 @@ pub(crate) fn select(
 fn validate_value_dtype(dtype: DType) -> io::Result<()> {
     if matches!(
         dtype,
-        DType::Float16B | DType::Float32 | DType::Int32 | DType::UInt32 | DType::UInt16 | DType::UInt8
+        DType::Float16B
+            | DType::Float32
+            | DType::Int32
+            | DType::UInt32
+            | DType::UInt16
+            | DType::UInt8
     ) {
         Ok(())
     } else {
@@ -189,7 +194,10 @@ fn select_program(key: SelectProgramKey) -> io::Result<Program> {
         )?;
     }
     let runtime_args = runtime_args.build()?;
-    if matches!(key.value_dtype, DType::UInt32 | DType::UInt16 | DType::UInt8) {
+    if matches!(
+        key.value_dtype,
+        DType::UInt32 | DType::UInt16 | DType::UInt8
+    ) {
         return Ok(Program {
             reader_kernel: select_raw_reader_source(key.value_dtype)?,
             writer_kernel: WRITER.to_owned(),

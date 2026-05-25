@@ -114,7 +114,10 @@ impl FastDispatcher {
         match self.runtime_templates.entry(program_id) {
             std::collections::hash_map::Entry::Occupied(_) => {}
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(RuntimeCqTemplate::new(runtime_args, go_word(dispatch_core))?);
+                entry.insert(RuntimeCqTemplate::new(
+                    runtime_args,
+                    go_word(dispatch_core),
+                )?);
             }
         }
 
@@ -648,6 +651,7 @@ fn upload_cq_core(
         win.write(TensixL1::KERNEL_CONFIG_BASE as usize + offset as usize, xip)?;
     }
     win.write(TensixL1::LAUNCH as usize, launch)?;
+    win.write(TensixL1::GO_MSG_INDEX as usize, &[0; size_of::<u32>()])?;
     win.write(
         TensixL1::GO_MSG as usize,
         &go_word(CoreCoord { x: 0, y: 0 }).to_le_bytes(),

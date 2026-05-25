@@ -183,10 +183,8 @@ fn validate_buffers(
 
     validate_allocation(operand, operand_shape, "dynamic_update_slice operand")?;
     validate_allocation(update, update_shape, "dynamic_update_slice update")?;
-    for (index, (start_index, start_index_shape)) in start_indices
-        .iter()
-        .zip(start_indices_shapes)
-        .enumerate()
+    for (index, (start_index, start_index_shape)) in
+        start_indices.iter().zip(start_indices_shapes).enumerate()
     {
         if start_index.dtype != DType::Int32 {
             return Err(invalid_input(format!(
@@ -261,7 +259,8 @@ fn dynamic_update_slice_shape(
 fn dynamic_update_slice_program(key: DynamicUpdateSliceProgramKey) -> io::Result<Program> {
     let rank = key.shape.operand_shape.len();
     let mut reader_dynamic_indices = vec![READER_OPERAND_ADDR_INDEX, READER_UPDATE_ADDR_INDEX];
-    reader_dynamic_indices.extend(READER_START_INDEX_ADDR_BASE..READER_START_INDEX_ADDR_BASE + rank);
+    reader_dynamic_indices
+        .extend(READER_START_INDEX_ADDR_BASE..READER_START_INDEX_ADDR_BASE + rank);
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
         vec![WRITER_OUTPUT_ADDR_INDEX],

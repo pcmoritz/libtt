@@ -165,10 +165,7 @@ fn transpose_program(key: TransposeProgramKey) -> io::Result<Program> {
     })
 }
 
-fn transpose_reader_source(
-    dtype: DType,
-    shape: &TransposeKernelShape,
-) -> io::Result<String> {
+fn transpose_reader_source(dtype: DType, shape: &TransposeKernelShape) -> io::Result<String> {
     let element_type = match dtype {
         DType::Float32 | DType::Int32 | DType::UInt32 => "uint32_t",
         DType::Float16 | DType::Float16B | DType::UInt16 => "uint16_t",
@@ -254,9 +251,7 @@ mod tests {
         .expect("transpose program");
 
         assert_eq!(program.runtime_args.section_sizes(), (12, 12, 0));
-        assert!(program
-            .reader_kernel
-            .contains("#define TRANSPOSE_RANK 2"));
+        assert!(program.reader_kernel.contains("#define TRANSPOSE_RANK 2"));
         let blobs = program.runtime_args.blobs();
         assert_eq!((arg_u32(&blobs[0], 1), arg_u32(&blobs[0], 2)), (0, 3));
         assert_eq!((arg_u32(&blobs[1], 1), arg_u32(&blobs[1], 2)), (3, 3));

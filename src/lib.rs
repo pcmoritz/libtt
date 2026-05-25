@@ -23,12 +23,18 @@ use dram::{allocator_stats, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
 use std::ptr;
 use std::slice;
-use std::sync::Once;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, Once, OnceLock,
+};
+use std::time::{Duration, Instant};
 
 include!("pjrt_bindings.rs");
 
@@ -124,6 +130,7 @@ pub struct PJRT_Executable {
 pub struct PJRT_LoadedExecutable {
     metadata: ExecutableMetadata,
     addressable_devices: Vec<*mut PJRT_Device>,
+    constant_cache: Arc<Mutex<HashMap<ConstantCacheKey, PJRT_Buffer>>>,
     deleted: bool,
 }
 
@@ -262,6 +269,16 @@ fn io_error(err: io::Error) -> *mut PJRT_Error {
         _ => PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
     };
     pjrt_error(err.to_string(), code)
+}
+
+fn io_error_with_context(err: io::Error, context: impl AsRef<str>) -> *mut PJRT_Error {
+    let code = match err.kind() {
+        io::ErrorKind::InvalidInput => PJRT_Error_Code::PJRT_Error_Code_INVALID_ARGUMENT,
+        io::ErrorKind::TimedOut => PJRT_Error_Code::PJRT_Error_Code_DEADLINE_EXCEEDED,
+        io::ErrorKind::OutOfMemory => PJRT_Error_Code::PJRT_Error_Code_RESOURCE_EXHAUSTED,
+        _ => PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
+    };
+    pjrt_error(format!("{}: {}", context.as_ref(), err), code)
 }
 
 fn failed_precondition(message: impl AsRef<str>) -> *mut PJRT_Error {
@@ -712,6 +729,7 @@ fn make_executable_metadata(
         .iter()
         .flat_map(|output| output.dims.iter().copied())
         .collect::<Vec<_>>();
+    let executable = executable.map(optimize_executable);
     let fingerprint = executable_fingerprint_string(name, outputs);
     ExecutableMetadata {
         name: cstring_lossy(name),
@@ -727,9 +745,1301 @@ fn make_executable_metadata(
     }
 }
 
+#[cfg(libtt_mlir_frontend)]
+fn optimize_executable(mut executable: executable::Executable) -> executable::Executable {
+    let mut total_fused = 0usize;
+    let mut total_scalar_broadcasts = 0usize;
+    let mut total_input_broadcasts = 0usize;
+    let mut total_selects = 0usize;
+    loop {
+        let selects = lower_selects_to_fused_once(&mut executable);
+        let scalar_broadcasts = fold_scalar_broadcasts_into_fused_once(&mut executable);
+        let input_broadcasts = fold_input_broadcasts_into_fused_once(&mut executable);
+        let fused = fuse_elementwise_chains_once(&mut executable);
+        if selects == 0 && scalar_broadcasts == 0 && input_broadcasts == 0 && fused == 0 {
+            break;
+        }
+        total_selects += selects;
+        total_scalar_broadcasts += scalar_broadcasts;
+        total_input_broadcasts += input_broadcasts;
+        total_fused += fused;
+    }
+    if (total_fused > 0
+        || total_scalar_broadcasts > 0
+        || total_input_broadcasts > 0
+        || total_selects > 0)
+        && env_flag("LIBTT_LOG_OPTIMIZATIONS")
+    {
+        eprintln!(
+            "[libtt-opt] fused_elementwise_chains={} scalar_broadcasts={} input_broadcasts={} selects={} ops={}",
+            total_fused,
+            total_scalar_broadcasts,
+            total_input_broadcasts,
+            total_selects,
+            executable.ops.len()
+        );
+    }
+    executable
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn lower_selects_to_fused_once(executable: &mut executable::Executable) -> usize {
+    let use_counts = executable_value_use_counts(&executable.ops);
+    let graph_outputs = executable
+        .output_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let producers = op_output_producers(&executable.ops);
+    let mut removed = vec![false; executable.ops.len()];
+    let mut replacements = HashMap::<usize, executable::Op>::new();
+    let mut lowered_count = 0usize;
+
+    for (op_index, op) in executable.ops.iter().enumerate() {
+        let executable::Op::Select {
+            input_ids,
+            output_id,
+        } = op
+        else {
+            continue;
+        };
+        let Some((replacement, removable_constants)) = select_to_fused_elementwise(
+            executable,
+            &use_counts,
+            &graph_outputs,
+            &producers,
+            *input_ids,
+            *output_id,
+        ) else {
+            continue;
+        };
+        for producer_index in removable_constants {
+            removed[producer_index] = true;
+        }
+        replacements.insert(op_index, replacement);
+        lowered_count += 1;
+    }
+
+    if lowered_count == 0 {
+        return 0;
+    }
+
+    let mut old_ops = std::mem::take(&mut executable.ops);
+    executable.ops = old_ops
+        .drain(..)
+        .enumerate()
+        .filter_map(|(index, op)| {
+            if removed[index] {
+                None
+            } else {
+                Some(replacements.remove(&index).unwrap_or(op))
+            }
+        })
+        .collect();
+    lowered_count
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn select_to_fused_elementwise(
+    executable: &executable::Executable,
+    use_counts: &HashMap<u32, usize>,
+    graph_outputs: &std::collections::HashSet<u32>,
+    producers: &HashMap<u32, usize>,
+    input_ids: [u32; 3],
+    output_id: u32,
+) -> Option<(executable::Op, Vec<usize>)> {
+    let [pred_id, true_id, false_id] = input_ids;
+    let pred_desc = executable.values.get(pred_id as usize)?;
+    let true_desc = executable.values.get(true_id as usize)?;
+    let false_desc = executable.values.get(false_id as usize)?;
+    let output_desc = executable.values.get(output_id as usize)?;
+    if pred_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
+        || true_desc.element_type != false_desc.element_type
+        || output_desc.element_type != true_desc.element_type
+        || pred_desc.dims != true_desc.dims
+        || true_desc.dims != false_desc.dims
+        || output_desc.dims != true_desc.dims
+        || !fused_select_value_type_supported(output_desc.element_type)
+    {
+        return None;
+    }
+
+    let mut builder = FusedElementwiseBuilder::default();
+    let pred_node = builder.input_node(
+        pred_id,
+        &fused_input_node(PJRT_Buffer_Type::PJRT_Buffer_Type_PRED),
+    )?;
+    let (true_node, true_constant) =
+        fused_select_value_node(&mut builder, executable, true_id, true_desc)?;
+    let (false_node, false_constant) =
+        fused_select_value_node(&mut builder, executable, false_id, false_desc)?;
+    let select_node_index = u32::try_from(builder.nodes.len()).ok()?;
+    builder.nodes.push(executable::FusedElementwiseNode {
+        kind: executable::FusedElementwiseKind::Select,
+        input_nodes: vec![pred_node, true_node, false_node],
+        input_index: 0,
+        packed_value: 0,
+        element_type: output_desc.element_type,
+        single_tile_broadcast: false,
+        broadcast_dimensions: Vec::new(),
+    });
+    debug_assert_eq!(select_node_index as usize, builder.nodes.len() - 1);
+
+    if builder.input_ids.len() > kernels::fused_eltwise::MAX_FUSED_INPUTS
+        || builder.nodes.len() > kernels::fused_eltwise::MAX_FUSED_NODES
+    {
+        return None;
+    }
+
+    let mut removable_constants = Vec::new();
+    for (value_id, embedded) in [(true_id, true_constant), (false_id, false_constant)] {
+        if !embedded
+            || graph_outputs.contains(&value_id)
+            || use_counts.get(&value_id).copied().unwrap_or(0) != 1
+        {
+            continue;
+        }
+        let Some(&producer_index) = producers.get(&value_id) else {
+            continue;
+        };
+        if matches!(
+            executable.ops.get(producer_index),
+            Some(executable::Op::Constant { .. })
+        ) {
+            removable_constants.push(producer_index);
+        }
+    }
+    removable_constants.sort_unstable();
+    removable_constants.dedup();
+
+    Some((
+        executable::Op::FusedElementwise {
+            input_ids: builder.input_ids,
+            output_id,
+            nodes: builder.nodes,
+        },
+        removable_constants,
+    ))
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn fused_select_value_type_supported(element_type: PJRT_Buffer_Type) -> bool {
+    matches!(
+        pjrt_buffer_type_to_dtype(element_type),
+        Ok(DType::Float16 | DType::Float16B | DType::Float32 | DType::Int32)
+    )
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn fused_select_value_node(
+    builder: &mut FusedElementwiseBuilder,
+    executable: &executable::Executable,
+    value_id: u32,
+    desc: &executable::ValueDesc,
+) -> Option<(u32, bool)> {
+    if let Some(packed_value) = constant_packed_value(executable, value_id) {
+        let node_index = u32::try_from(builder.nodes.len()).ok()?;
+        builder.nodes.push(executable::FusedElementwiseNode {
+            kind: executable::FusedElementwiseKind::Constant,
+            input_nodes: Vec::new(),
+            input_index: 0,
+            packed_value,
+            element_type: desc.element_type,
+            single_tile_broadcast: false,
+            broadcast_dimensions: Vec::new(),
+        });
+        return Some((node_index, true));
+    }
+    Some((
+        builder.input_node(value_id, &fused_input_node(desc.element_type))?,
+        false,
+    ))
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn fused_input_node(element_type: PJRT_Buffer_Type) -> executable::FusedElementwiseNode {
+    executable::FusedElementwiseNode {
+        kind: executable::FusedElementwiseKind::Input,
+        input_nodes: Vec::new(),
+        input_index: 0,
+        packed_value: 0,
+        element_type,
+        single_tile_broadcast: false,
+        broadcast_dimensions: Vec::new(),
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn fold_scalar_broadcasts_into_fused_once(executable: &mut executable::Executable) -> usize {
+    let use_counts = executable_value_use_counts(&executable.ops);
+    let graph_outputs = executable
+        .output_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let producers = op_output_producers(&executable.ops);
+    let mut removed = vec![false; executable.ops.len()];
+    let mut replacements = HashMap::<usize, executable::Op>::new();
+    let mut folded_count = 0usize;
+
+    for consumer_index in (0..executable.ops.len()).rev() {
+        if replacements.contains_key(&consumer_index) {
+            continue;
+        }
+        let Some((input_ids, output_id, nodes)) =
+            fused_elementwise_parts(&executable.ops[consumer_index])
+        else {
+            continue;
+        };
+        let Some(consumer_output_desc) = executable.values.get(*output_id as usize) else {
+            continue;
+        };
+
+        let mut new_input_ids = input_ids.clone();
+        let mut broadcast_input_indices = Vec::<u32>::new();
+        let mut producer_indices = Vec::<usize>::new();
+        for (input_index, &input_id) in input_ids.iter().enumerate() {
+            let Some((producer_index, source_id)) = scalar_broadcast_source_for_fused_input(
+                executable,
+                &use_counts,
+                &graph_outputs,
+                &producers,
+                &removed,
+                input_id,
+                consumer_output_desc,
+            ) else {
+                continue;
+            };
+            new_input_ids[input_index] = source_id;
+            broadcast_input_indices.push(input_index as u32);
+            producer_indices.push(producer_index);
+        }
+        if producer_indices.is_empty() {
+            continue;
+        }
+
+        producer_indices.sort_unstable();
+        producer_indices.dedup();
+        for &producer_index in &producer_indices {
+            removed[producer_index] = true;
+        }
+
+        let mut new_nodes = nodes.clone();
+        for node in &mut new_nodes {
+            if node.kind == executable::FusedElementwiseKind::Input
+                && broadcast_input_indices.contains(&node.input_index)
+            {
+                node.single_tile_broadcast = true;
+            }
+        }
+        replacements.insert(
+            consumer_index,
+            executable::Op::FusedElementwise {
+                input_ids: new_input_ids,
+                output_id: *output_id,
+                nodes: new_nodes,
+            },
+        );
+        folded_count += producer_indices.len();
+    }
+
+    if folded_count == 0 {
+        return 0;
+    }
+
+    let mut old_ops = std::mem::take(&mut executable.ops);
+    executable.ops = old_ops
+        .drain(..)
+        .enumerate()
+        .filter_map(|(index, op)| {
+            if removed[index] {
+                None
+            } else {
+                Some(replacements.remove(&index).unwrap_or(op))
+            }
+        })
+        .collect();
+    folded_count
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn scalar_broadcast_source_for_fused_input(
+    executable: &executable::Executable,
+    use_counts: &HashMap<u32, usize>,
+    graph_outputs: &std::collections::HashSet<u32>,
+    producers: &HashMap<u32, usize>,
+    removed: &[bool],
+    input_id: u32,
+    consumer_output_desc: &executable::ValueDesc,
+) -> Option<(usize, u32)> {
+    let &producer_index = producers.get(&input_id)?;
+    if removed.get(producer_index).copied().unwrap_or(true)
+        || use_counts.get(&input_id).copied().unwrap_or(0) != 1
+        || graph_outputs.contains(&input_id)
+    {
+        return None;
+    }
+    let executable::Op::BroadcastInDim {
+        input_id: source_id,
+        output_id,
+        ..
+    } = &executable.ops[producer_index]
+    else {
+        return None;
+    };
+    if *output_id != input_id {
+        return None;
+    }
+    let source_desc = executable.values.get(*source_id as usize)?;
+    let output_desc = executable.values.get(*output_id as usize)?;
+    if output_desc.dims != consumer_output_desc.dims
+        || output_desc.element_type != consumer_output_desc.element_type
+        || source_desc.element_type != output_desc.element_type
+    {
+        return None;
+    }
+    let source_shape = dims_i64_to_usize(&source_desc.dims).ok()?;
+    if static_shape_volume(&source_shape)? != 1 {
+        return None;
+    }
+    Some((producer_index, *source_id))
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn fold_input_broadcasts_into_fused_once(executable: &mut executable::Executable) -> usize {
+    let use_counts = executable_value_use_counts(&executable.ops);
+    let graph_outputs = executable
+        .output_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let producers = op_output_producers(&executable.ops);
+    let mut removed = vec![false; executable.ops.len()];
+    let mut replacements = HashMap::<usize, executable::Op>::new();
+    let mut folded_count = 0usize;
+
+    for consumer_index in (0..executable.ops.len()).rev() {
+        if replacements.contains_key(&consumer_index) {
+            continue;
+        }
+        let Some((input_ids, output_id, nodes)) =
+            fused_elementwise_parts(&executable.ops[consumer_index])
+        else {
+            continue;
+        };
+        let Some(consumer_output_desc) = executable.values.get(*output_id as usize) else {
+            continue;
+        };
+
+        let mut new_input_ids = input_ids.clone();
+        let mut broadcast_inputs = HashMap::<u32, Vec<i64>>::new();
+        let mut producer_indices = Vec::<usize>::new();
+        for (input_index, &input_id) in input_ids.iter().enumerate() {
+            let Some((producer_index, source_id, broadcast_dimensions)) =
+                input_broadcast_source_for_fused_input(
+                    executable,
+                    &use_counts,
+                    &graph_outputs,
+                    &producers,
+                    &removed,
+                    input_id,
+                    consumer_output_desc,
+                )
+            else {
+                continue;
+            };
+            new_input_ids[input_index] = source_id;
+            broadcast_inputs.insert(input_index as u32, broadcast_dimensions);
+            producer_indices.push(producer_index);
+        }
+        if producer_indices.is_empty() {
+            continue;
+        }
+
+        producer_indices.sort_unstable();
+        producer_indices.dedup();
+        for &producer_index in &producer_indices {
+            removed[producer_index] = true;
+        }
+
+        let mut new_nodes = nodes.clone();
+        for node in &mut new_nodes {
+            if node.kind != executable::FusedElementwiseKind::Input {
+                continue;
+            }
+            let Some(broadcast_dimensions) = broadcast_inputs.get(&node.input_index) else {
+                continue;
+            };
+            node.single_tile_broadcast = false;
+            node.broadcast_dimensions = broadcast_dimensions.clone();
+        }
+        replacements.insert(
+            consumer_index,
+            executable::Op::FusedElementwise {
+                input_ids: new_input_ids,
+                output_id: *output_id,
+                nodes: new_nodes,
+            },
+        );
+        folded_count += producer_indices.len();
+    }
+
+    if folded_count == 0 {
+        return 0;
+    }
+
+    let mut old_ops = std::mem::take(&mut executable.ops);
+    executable.ops = old_ops
+        .drain(..)
+        .enumerate()
+        .filter_map(|(index, op)| {
+            if removed[index] {
+                None
+            } else {
+                Some(replacements.remove(&index).unwrap_or(op))
+            }
+        })
+        .collect();
+    folded_count
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn input_broadcast_source_for_fused_input(
+    executable: &executable::Executable,
+    use_counts: &HashMap<u32, usize>,
+    graph_outputs: &std::collections::HashSet<u32>,
+    producers: &HashMap<u32, usize>,
+    removed: &[bool],
+    input_id: u32,
+    consumer_output_desc: &executable::ValueDesc,
+) -> Option<(usize, u32, Vec<i64>)> {
+    let &producer_index = producers.get(&input_id)?;
+    if removed.get(producer_index).copied().unwrap_or(true)
+        || use_counts.get(&input_id).copied().unwrap_or(0) != 1
+        || graph_outputs.contains(&input_id)
+    {
+        return None;
+    }
+    let executable::Op::BroadcastInDim {
+        input_id: source_id,
+        output_id,
+        broadcast_dimensions,
+    } = &executable.ops[producer_index]
+    else {
+        return None;
+    };
+    if *output_id != input_id {
+        return None;
+    }
+    let source_desc = executable.values.get(*source_id as usize)?;
+    let output_desc = executable.values.get(*output_id as usize)?;
+    if output_desc.dims != consumer_output_desc.dims
+        || output_desc.element_type != consumer_output_desc.element_type
+        || source_desc.element_type != output_desc.element_type
+    {
+        return None;
+    }
+    let source_shape = dims_i64_to_usize(&source_desc.dims).ok()?;
+    if static_shape_volume(&source_shape)? == 1 {
+        return None;
+    }
+    let output_shape = dims_i64_to_usize(&output_desc.dims).ok()?;
+    if !kernels::fused_eltwise::supports_input_broadcast(
+        &source_shape,
+        &output_shape,
+        broadcast_dimensions,
+    ) {
+        return None;
+    }
+    Some((producer_index, *source_id, broadcast_dimensions.clone()))
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn static_shape_volume(shape: &[usize]) -> Option<usize> {
+    shape
+        .iter()
+        .try_fold(1usize, |volume, &dim| volume.checked_mul(dim))
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn fuse_elementwise_chains_once(executable: &mut executable::Executable) -> usize {
+    let use_counts = executable_value_use_counts(&executable.ops);
+    let graph_outputs = executable
+        .output_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let producers = op_output_producers(&executable.ops);
+    let mut removed = vec![false; executable.ops.len()];
+    let mut replacements = HashMap::<usize, executable::Op>::new();
+    let mut fused_count = 0usize;
+
+    for consumer_index in (0..executable.ops.len()).rev() {
+        if removed[consumer_index] || replacements.contains_key(&consumer_index) {
+            continue;
+        }
+        let Some((input_ids, output_id, nodes)) =
+            fused_elementwise_parts(&executable.ops[consumer_index])
+        else {
+            continue;
+        };
+
+        let Some((replacement, producer_indices)) = try_fuse_elementwise_consumer(
+            executable,
+            &use_counts,
+            &graph_outputs,
+            &producers,
+            &removed,
+            input_ids,
+            *output_id,
+            nodes,
+        ) else {
+            continue;
+        };
+
+        for producer_index in producer_indices {
+            removed[producer_index] = true;
+            fused_count += 1;
+        }
+        replacements.insert(consumer_index, replacement);
+    }
+
+    if fused_count == 0 {
+        return 0;
+    }
+
+    let mut old_ops = std::mem::take(&mut executable.ops);
+    executable.ops = old_ops
+        .drain(..)
+        .enumerate()
+        .filter_map(|(index, op)| {
+            if removed[index] {
+                None
+            } else {
+                Some(replacements.remove(&index).unwrap_or(op))
+            }
+        })
+        .collect();
+    fused_count
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn fused_elementwise_parts(
+    op: &executable::Op,
+) -> Option<(&Vec<u32>, &u32, &Vec<executable::FusedElementwiseNode>)> {
+    if let executable::Op::FusedElementwise {
+        input_ids,
+        output_id,
+        nodes,
+    } = op
+    {
+        Some((input_ids, output_id, nodes))
+    } else {
+        None
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn op_output_producers(ops: &[executable::Op]) -> HashMap<u32, usize> {
+    let mut producers = HashMap::new();
+    for (index, op) in ops.iter().enumerate() {
+        add_op_outputs(op, index, &mut producers);
+    }
+    producers
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn add_op_outputs(op: &executable::Op, index: usize, producers: &mut HashMap<u32, usize>) {
+    match op {
+        executable::Op::Parameter { output_id, .. }
+        | executable::Op::Concatenate { output_id, .. }
+        | executable::Op::Reshape { output_id, .. }
+        | executable::Op::Slice { output_id, .. }
+        | executable::Op::DynamicUpdateSlice { output_id, .. }
+        | executable::Op::Transpose { output_id, .. }
+        | executable::Op::Pad { output_id, .. }
+        | executable::Op::CustomCall { output_id, .. }
+        | executable::Op::Reduce { output_id, .. }
+        | executable::Op::ReduceWindow { output_id, .. }
+        | executable::Op::Matmul { output_id, .. }
+        | executable::Op::Constant { output_id, .. }
+        | executable::Op::Select { output_id, .. }
+        | executable::Op::BroadcastInDim { output_id, .. }
+        | executable::Op::Gather { output_id, .. }
+        | executable::Op::Scatter { output_id, .. }
+        | executable::Op::BitwiseBinary { output_id, .. }
+        | executable::Op::Iota { output_id, .. }
+        | executable::Op::FusedElementwise { output_id, .. } => {
+            producers.insert(*output_id, index);
+        }
+        executable::Op::TopK {
+            values_id,
+            indices_id,
+            ..
+        } => {
+            producers.insert(*values_id, index);
+            producers.insert(*indices_id, index);
+        }
+    }
+    if let executable::Op::Matmul {
+        top_k_epilogue: Some(epilogue),
+        ..
+    } = op
+    {
+        producers.insert(epilogue.indices_id, index);
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn executable_value_use_counts(ops: &[executable::Op]) -> HashMap<u32, usize> {
+    let mut counts = HashMap::new();
+    for op in ops {
+        add_op_input_uses(op, &mut counts);
+    }
+    counts
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn add_use(counts: &mut HashMap<u32, usize>, value_id: u32) {
+    *counts.entry(value_id).or_default() += 1;
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn add_op_input_uses(op: &executable::Op, counts: &mut HashMap<u32, usize>) {
+    match op {
+        executable::Op::Parameter { .. }
+        | executable::Op::Constant { .. }
+        | executable::Op::Iota { .. } => {}
+        executable::Op::Concatenate { input_ids, .. }
+        | executable::Op::FusedElementwise { input_ids, .. } => {
+            for &input_id in input_ids {
+                add_use(counts, input_id);
+            }
+        }
+        executable::Op::DynamicUpdateSlice { input_ids, .. } => {
+            for &input_id in input_ids {
+                add_use(counts, input_id);
+            }
+        }
+        executable::Op::Reduce {
+            input_ids,
+            init_value_ids,
+            ..
+        }
+        | executable::Op::ReduceWindow {
+            input_ids,
+            init_value_ids,
+            ..
+        } => {
+            for &input_id in input_ids {
+                add_use(counts, input_id);
+            }
+            for &init_id in init_value_ids {
+                add_use(counts, init_id);
+            }
+        }
+        executable::Op::Reshape { input_id, .. }
+        | executable::Op::Slice { input_id, .. }
+        | executable::Op::Transpose { input_id, .. }
+        | executable::Op::BroadcastInDim { input_id, .. }
+        | executable::Op::TopK { input_id, .. } => {
+            add_use(counts, *input_id);
+        }
+        executable::Op::CustomCall { input_ids, .. } => {
+            for &input_id in input_ids {
+                add_use(counts, input_id);
+            }
+        }
+        executable::Op::Pad {
+            input_id,
+            padding_value_id,
+            ..
+        } => {
+            add_use(counts, *input_id);
+            add_use(counts, *padding_value_id);
+        }
+        executable::Op::Matmul { input_ids, .. }
+        | executable::Op::Gather { input_ids, .. }
+        | executable::Op::BitwiseBinary { input_ids, .. } => {
+            for &input_id in input_ids {
+                add_use(counts, input_id);
+            }
+        }
+        executable::Op::Select { input_ids, .. } | executable::Op::Scatter { input_ids, .. } => {
+            for &input_id in input_ids {
+                add_use(counts, input_id);
+            }
+        }
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn try_fuse_elementwise_consumer(
+    executable: &executable::Executable,
+    use_counts: &HashMap<u32, usize>,
+    graph_outputs: &std::collections::HashSet<u32>,
+    producers: &HashMap<u32, usize>,
+    removed: &[bool],
+    consumer_input_ids: &[u32],
+    consumer_output_id: u32,
+    consumer_nodes: &[executable::FusedElementwiseNode],
+) -> Option<(executable::Op, Vec<usize>)> {
+    let consumer_output_desc = executable.values.get(consumer_output_id as usize)?;
+    let mut inline_inputs = HashMap::<u32, InlineFusedProducer<'_>>::new();
+    let mut removed_indices = Vec::<usize>::new();
+    for &input_id in consumer_input_ids {
+        let Some(producer) = inline_fused_producer_for_input(
+            executable,
+            use_counts,
+            graph_outputs,
+            producers,
+            removed,
+            input_id,
+            consumer_output_desc,
+        ) else {
+            continue;
+        };
+        removed_indices.extend(producer.remove_indices.iter().copied());
+        inline_inputs.insert(input_id, producer);
+    }
+    if inline_inputs.is_empty() {
+        return None;
+    }
+
+    removed_indices.sort_unstable();
+    removed_indices.dedup();
+
+    let mut builder = FusedElementwiseBuilder::default();
+    let mut consumer_input_replacements = HashMap::<u32, u32>::new();
+    for &input_id in consumer_input_ids {
+        if consumer_input_replacements.contains_key(&input_id) {
+            continue;
+        }
+        let Some(producer) = inline_inputs.get(&input_id) else {
+            continue;
+        };
+        let root = builder.append_nodes(producer.input_ids, producer.nodes, &HashMap::new())?;
+        consumer_input_replacements.insert(input_id, root);
+    }
+    builder.append_nodes(
+        consumer_input_ids,
+        consumer_nodes,
+        &consumer_input_replacements,
+    )?;
+
+    if builder.input_ids.len() > kernels::fused_eltwise::MAX_FUSED_INPUTS
+        || builder.nodes.len() > kernels::fused_eltwise::MAX_FUSED_NODES
+    {
+        return None;
+    }
+
+    Some((
+        executable::Op::FusedElementwise {
+            input_ids: builder.input_ids,
+            output_id: consumer_output_id,
+            nodes: builder.nodes,
+        },
+        removed_indices,
+    ))
+}
+
+#[cfg(libtt_mlir_frontend)]
+struct InlineFusedProducer<'a> {
+    remove_indices: Vec<usize>,
+    input_ids: &'a Vec<u32>,
+    nodes: &'a Vec<executable::FusedElementwiseNode>,
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn inline_fused_producer_for_input<'a>(
+    executable: &'a executable::Executable,
+    use_counts: &HashMap<u32, usize>,
+    graph_outputs: &std::collections::HashSet<u32>,
+    producers: &HashMap<u32, usize>,
+    removed: &[bool],
+    input_id: u32,
+    consumer_output_desc: &executable::ValueDesc,
+) -> Option<InlineFusedProducer<'a>> {
+    direct_inline_fused_producer(
+        executable,
+        use_counts,
+        graph_outputs,
+        producers,
+        removed,
+        input_id,
+        consumer_output_desc,
+    )
+    .or_else(|| {
+        metadata_alias_inline_fused_producer(
+            executable,
+            use_counts,
+            graph_outputs,
+            producers,
+            removed,
+            input_id,
+            consumer_output_desc,
+        )
+    })
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn direct_inline_fused_producer<'a>(
+    executable: &'a executable::Executable,
+    use_counts: &HashMap<u32, usize>,
+    graph_outputs: &std::collections::HashSet<u32>,
+    producers: &HashMap<u32, usize>,
+    removed: &[bool],
+    input_id: u32,
+    consumer_output_desc: &executable::ValueDesc,
+) -> Option<InlineFusedProducer<'a>> {
+    let &producer_index = producers.get(&input_id)?;
+    if removed.get(producer_index).copied().unwrap_or(true)
+        || use_counts.get(&input_id).copied().unwrap_or(0) != 1
+        || graph_outputs.contains(&input_id)
+    {
+        return None;
+    }
+    let (producer_input_ids, producer_output_id, producer_nodes) =
+        fused_elementwise_parts(&executable.ops[producer_index])?;
+    let producer_output_desc = executable.values.get(*producer_output_id as usize)?;
+    if producer_output_desc.dims != consumer_output_desc.dims
+        || producer_output_desc.element_type != consumer_output_desc.element_type
+    {
+        return None;
+    }
+    Some(InlineFusedProducer {
+        remove_indices: vec![producer_index],
+        input_ids: producer_input_ids,
+        nodes: producer_nodes,
+    })
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn metadata_alias_inline_fused_producer<'a>(
+    executable: &'a executable::Executable,
+    use_counts: &HashMap<u32, usize>,
+    graph_outputs: &std::collections::HashSet<u32>,
+    producers: &HashMap<u32, usize>,
+    removed: &[bool],
+    input_id: u32,
+    consumer_output_desc: &executable::ValueDesc,
+) -> Option<InlineFusedProducer<'a>> {
+    let &alias_index = producers.get(&input_id)?;
+    if removed.get(alias_index).copied().unwrap_or(true)
+        || use_counts.get(&input_id).copied().unwrap_or(0) != 1
+        || graph_outputs.contains(&input_id)
+    {
+        return None;
+    }
+
+    let alias_output_desc = executable.values.get(input_id as usize)?;
+    if alias_output_desc.dims != consumer_output_desc.dims
+        || alias_output_desc.element_type != consumer_output_desc.element_type
+    {
+        return None;
+    }
+
+    let source_id = metadata_alias_source_id(&executable.ops[alias_index], input_id)?;
+    if !metadata_alias_is_compatible(
+        executable,
+        &executable.ops[alias_index],
+        source_id,
+        input_id,
+    )? {
+        return None;
+    }
+
+    let &producer_index = producers.get(&source_id)?;
+    if removed.get(producer_index).copied().unwrap_or(true)
+        || use_counts.get(&source_id).copied().unwrap_or(0) != 1
+        || graph_outputs.contains(&source_id)
+    {
+        return None;
+    }
+    let (producer_input_ids, producer_output_id, producer_nodes) =
+        fused_elementwise_parts(&executable.ops[producer_index])?;
+    if *producer_output_id != source_id {
+        return None;
+    }
+    let producer_output_desc = executable.values.get(*producer_output_id as usize)?;
+    if producer_output_desc.element_type != alias_output_desc.element_type {
+        return None;
+    }
+
+    Some(InlineFusedProducer {
+        remove_indices: vec![alias_index, producer_index],
+        input_ids: producer_input_ids,
+        nodes: producer_nodes,
+    })
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn metadata_alias_source_id(op: &executable::Op, expected_output_id: u32) -> Option<u32> {
+    match op {
+        executable::Op::Reshape {
+            input_id,
+            output_id,
+        }
+        | executable::Op::Transpose {
+            input_id,
+            output_id,
+            ..
+        }
+        | executable::Op::BroadcastInDim {
+            input_id,
+            output_id,
+            ..
+        } if *output_id == expected_output_id => Some(*input_id),
+        _ => None,
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn metadata_alias_is_compatible(
+    executable: &executable::Executable,
+    alias_op: &executable::Op,
+    source_id: u32,
+    output_id: u32,
+) -> Option<bool> {
+    let source_desc = executable.values.get(source_id as usize)?;
+    let output_desc = executable.values.get(output_id as usize)?;
+    if source_desc.element_type != output_desc.element_type {
+        return Some(false);
+    }
+    let source_shape = dims_i64_to_usize(&source_desc.dims).ok()?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims).ok()?;
+    match alias_op {
+        executable::Op::Reshape { .. } => {
+            can_alias_metadata_only_reshape(&source_shape, &output_shape).ok()
+        }
+        executable::Op::Transpose { permutation, .. } => {
+            can_alias_metadata_only_transpose(&source_shape, &output_shape, permutation).ok()
+        }
+        executable::Op::BroadcastInDim {
+            broadcast_dimensions,
+            ..
+        } => can_alias_metadata_only_broadcast(&source_shape, &output_shape, broadcast_dimensions)
+            .ok(),
+        _ => Some(false),
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+#[derive(Default)]
+struct FusedElementwiseBuilder {
+    input_ids: Vec<u32>,
+    input_nodes: HashMap<FusedInputKey, u32>,
+    nodes: Vec<executable::FusedElementwiseNode>,
+}
+
+#[cfg(libtt_mlir_frontend)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct FusedInputKey {
+    value_id: u32,
+    element_type: PJRT_Buffer_Type,
+    single_tile_broadcast: bool,
+    broadcast_dimensions: Vec<i64>,
+}
+
+#[cfg(libtt_mlir_frontend)]
+impl FusedElementwiseBuilder {
+    fn append_nodes(
+        &mut self,
+        input_ids: &[u32],
+        nodes: &[executable::FusedElementwiseNode],
+        input_replacements: &HashMap<u32, u32>,
+    ) -> Option<u32> {
+        let mut remap = Vec::<u32>::with_capacity(nodes.len());
+        for node in nodes {
+            let new_node = match node.kind {
+                executable::FusedElementwiseKind::Input => {
+                    let input_id = *input_ids.get(node.input_index as usize)?;
+                    if let Some(&replacement) = input_replacements.get(&input_id) {
+                        remap.push(replacement);
+                        continue;
+                    }
+                    let node_index = self.input_node(input_id, node)?;
+                    remap.push(node_index);
+                    continue;
+                }
+                executable::FusedElementwiseKind::Constant => node.clone(),
+                _ => {
+                    let mut node = node.clone();
+                    for input_node in &mut node.input_nodes {
+                        *input_node = *remap.get(*input_node as usize)?;
+                    }
+                    node
+                }
+            };
+            let node_index = u32::try_from(self.nodes.len()).ok()?;
+            self.nodes.push(new_node);
+            remap.push(node_index);
+        }
+        remap.last().copied()
+    }
+
+    fn input_node(
+        &mut self,
+        input_id: u32,
+        template: &executable::FusedElementwiseNode,
+    ) -> Option<u32> {
+        let key = FusedInputKey {
+            value_id: input_id,
+            element_type: template.element_type,
+            single_tile_broadcast: template.single_tile_broadcast,
+            broadcast_dimensions: template.broadcast_dimensions.clone(),
+        };
+        if let Some(&node_index) = self.input_nodes.get(&key) {
+            return Some(node_index);
+        }
+        let input_index = u32::try_from(self.input_ids.len()).ok()?;
+        let node_index = u32::try_from(self.nodes.len()).ok()?;
+        let mut node = template.clone();
+        node.input_nodes.clear();
+        node.input_index = input_index;
+        self.input_ids.push(input_id);
+        self.nodes.push(node);
+        self.input_nodes.insert(key, node_index);
+        Some(node_index)
+    }
+}
+
 fn make_executable(metadata: ExecutableMetadata) -> PJRT_Executable {
     PJRT_Executable { metadata }
 }
+
+static PROFILE_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
+static TRACE_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+const DEFAULT_DEFERRED_SYNC_LAUNCH_LIMIT: u64 = 4096;
+
+#[derive(Default)]
+struct OpTiming {
+    count: usize,
+    launches: u64,
+    enqueue: Duration,
+    sync: Duration,
+}
+
+struct ExecutionProfile {
+    id: u64,
+    sync_ops: bool,
+    min_duration: Duration,
+    top_n: usize,
+    start: Instant,
+    op_timings: BTreeMap<&'static str, OpTiming>,
+    final_sync: Duration,
+    output_collect: Duration,
+}
+
+impl ExecutionProfile {
+    fn new_from_env() -> Option<Self> {
+        if !env_flag("LIBTT_PROFILE") {
+            return None;
+        }
+        Some(Self {
+            id: PROFILE_EXECUTION_ID.fetch_add(1, Ordering::Relaxed),
+            sync_ops: env_flag("LIBTT_PROFILE_SYNC_OPS"),
+            min_duration: env_duration_ms("LIBTT_PROFILE_MIN_MS").unwrap_or_default(),
+            top_n: env_usize("LIBTT_PROFILE_TOP_N").unwrap_or(16),
+            start: Instant::now(),
+            op_timings: BTreeMap::new(),
+            final_sync: Duration::ZERO,
+            output_collect: Duration::ZERO,
+        })
+    }
+
+    fn record_op(
+        &mut self,
+        op_name: &'static str,
+        launches: u64,
+        enqueue: Duration,
+        sync: Duration,
+    ) {
+        let timing = self.op_timings.entry(op_name).or_default();
+        timing.count += 1;
+        timing.launches += launches;
+        timing.enqueue += enqueue;
+        timing.sync += sync;
+    }
+
+    fn print(&self, plan: &executable::Executable) {
+        let total = self.start.elapsed();
+        if total < self.min_duration {
+            return;
+        }
+        let op_total = self
+            .op_timings
+            .values()
+            .fold(Duration::ZERO, |total, timing| {
+                total + timing.enqueue + timing.sync
+            });
+        let launch_total = self
+            .op_timings
+            .values()
+            .fold(0u64, |total, timing| total + timing.launches);
+        eprintln!(
+            "[libtt-profile] exec={} total_ms={:.3} ops={} launches={} outputs={} sync_ops={} op_total_ms={:.3} final_sync_ms={:.3} output_collect_ms={:.3}",
+            self.id,
+            duration_ms(total),
+            plan.ops.len(),
+            launch_total,
+            plan.output_ids.len(),
+            self.sync_ops,
+            duration_ms(op_total),
+            duration_ms(self.final_sync),
+            duration_ms(self.output_collect),
+        );
+
+        let mut entries = self.op_timings.iter().collect::<Vec<_>>();
+        entries.sort_by(|(_, lhs), (_, rhs)| {
+            let lhs_total = lhs.enqueue + lhs.sync;
+            let rhs_total = rhs.enqueue + rhs.sync;
+            rhs_total.cmp(&lhs_total)
+        });
+        for (op_name, timing) in entries.into_iter().take(self.top_n) {
+            eprintln!(
+                "[libtt-profile] exec={} op={} count={} launches={} total_ms={:.3} enqueue_ms={:.3} sync_ms={:.3}",
+                self.id,
+                op_name,
+                timing.count,
+                timing.launches,
+                duration_ms(timing.enqueue + timing.sync),
+                duration_ms(timing.enqueue),
+                duration_ms(timing.sync),
+            );
+        }
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn env_duration_ms(name: &str) -> Option<Duration> {
+    let millis = std::env::var(name).ok()?.parse::<f64>().ok()?;
+    if millis.is_finite() && millis >= 0.0 {
+        Some(Duration::from_secs_f64(millis / 1000.0))
+    } else {
+        None
+    }
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+fn trace_once(name: &str, key: String) {
+    let Ok(mut keys) = TRACE_KEYS.get_or_init(|| Mutex::new(HashSet::new())).lock() else {
+        return;
+    };
+    if keys.insert(format!("{name}:{key}")) {
+        eprintln!("[libtt-trace] {name} {key}");
+    }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn executable_op_name(op: &executable::Op) -> &'static str {
+    match op {
+        executable::Op::Parameter { .. } => "parameter",
+        executable::Op::Concatenate { .. } => "concatenate",
+        executable::Op::Reshape { .. } => "reshape",
+        executable::Op::Slice { .. } => "slice",
+        executable::Op::DynamicUpdateSlice { .. } => "dynamic_update_slice",
+        executable::Op::Transpose { .. } => "transpose",
+        executable::Op::Pad { .. } => "pad",
+        executable::Op::CustomCall { .. } => "custom_call",
+        executable::Op::Reduce { .. } => "reduce",
+        executable::Op::ReduceWindow { .. } => "reduce_window",
+        executable::Op::Matmul { .. } => "matmul",
+        executable::Op::Constant { .. } => "constant",
+        executable::Op::Select { .. } => "select",
+        executable::Op::BroadcastInDim { .. } => "broadcast_in_dim",
+        executable::Op::Gather { .. } => "gather",
+        executable::Op::Scatter { .. } => "scatter",
+        executable::Op::BitwiseBinary { .. } => "bitwise_binary",
+        executable::Op::Iota { .. } => "iota",
+        executable::Op::TopK { .. } => "top_k",
+        executable::Op::FusedElementwise { .. } => "fused_elementwise",
+    }
+}
+
+fn executable_op_output_ids(op: &executable::Op) -> Vec<u32> {
+    match op {
+        executable::Op::Parameter { output_id, .. }
+        | executable::Op::Concatenate { output_id, .. }
+        | executable::Op::Reshape { output_id, .. }
+        | executable::Op::Slice { output_id, .. }
+        | executable::Op::DynamicUpdateSlice { output_id, .. }
+        | executable::Op::Transpose { output_id, .. }
+        | executable::Op::Pad { output_id, .. }
+        | executable::Op::CustomCall { output_id, .. }
+        | executable::Op::Reduce { output_id, .. }
+        | executable::Op::ReduceWindow { output_id, .. }
+        | executable::Op::Matmul { output_id, .. }
+        | executable::Op::Constant { output_id, .. }
+        | executable::Op::Select { output_id, .. }
+        | executable::Op::BroadcastInDim { output_id, .. }
+        | executable::Op::Gather { output_id, .. }
+        | executable::Op::Scatter { output_id, .. }
+        | executable::Op::BitwiseBinary { output_id, .. }
+        | executable::Op::Iota { output_id, .. }
+        | executable::Op::FusedElementwise { output_id, .. } => vec![*output_id],
+        executable::Op::TopK {
+            values_id,
+            indices_id,
+            ..
+        } => vec![*values_id, *indices_id],
+    }
+}
+
+fn executable_op_context(
+    plan: &executable::Executable,
+    op_index: usize,
+    op: &executable::Op,
+) -> String {
+    let outputs = executable_op_output_ids(op)
+        .into_iter()
+        .map(|output_id| match plan.values.get(output_id as usize) {
+            Some(desc) => format!("{output_id}:{:?}{:?}", desc.element_type, desc.dims),
+            None => format!("{output_id}:<missing>"),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "op[{op_index}] {} outputs=[{outputs}]",
+        executable_op_name(op)
+    )
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct ConstantCacheKey {
+    local_hardware_id: usize,
+    output_id: u32,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ZeroSplatConstantCacheKey {
+    local_hardware_id: usize,
+    element_type: PJRT_Buffer_Type,
+    dims: Vec<i64>,
+}
+
+static ZERO_SPLAT_CONSTANT_CACHE: OnceLock<Mutex<HashMap<ZeroSplatConstantCacheKey, DramBuffer>>> =
+    OnceLock::new();
 
 fn make_loaded_executable(
     metadata: ExecutableMetadata,
@@ -738,6 +2048,7 @@ fn make_loaded_executable(
     PJRT_LoadedExecutable {
         metadata,
         addressable_devices,
+        constant_cache: Arc::new(Mutex::new(HashMap::new())),
         deleted: false,
     }
 }
@@ -1520,6 +2831,7 @@ struct OutputContext {
     device: *mut PJRT_Device,
     memory: *mut PJRT_Memory,
     local_hardware_id: usize,
+    constant_cache: Arc<Mutex<HashMap<ConstantCacheKey, PJRT_Buffer>>>,
 }
 
 fn store_output_buffer(
@@ -1655,6 +2967,53 @@ fn execute_constant(
             "TT executable constant output id {output_id} is out of bounds"
         ))
     })?;
+    let cache_key = ConstantCacheKey {
+        local_hardware_id: context.local_hardware_id,
+        output_id,
+    };
+    if let Some(mut cached) = context
+        .constant_cache
+        .lock()
+        .map_err(|_| failed_precondition("TT executable constant cache lock is poisoned"))?
+        .get(&cache_key)
+        .cloned()
+    {
+        cached.device = context.device;
+        cached.memory = context.memory;
+        cached.local_hardware_id = context.local_hardware_id;
+        cached.deleted = false;
+        let output_index = output_id as usize;
+        values[output_index] = Some(cached);
+        return Ok(());
+    }
+
+    let zero_cache_key =
+        (logical_data.is_empty() && packed_value == 0).then(|| ZeroSplatConstantCacheKey {
+            local_hardware_id: context.local_hardware_id,
+            element_type: output_desc.element_type,
+            dims: output_desc.dims.clone(),
+        });
+    if let Some(zero_cache_key) = zero_cache_key.as_ref() {
+        if let Some(cached_dram) = ZERO_SPLAT_CONSTANT_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| failed_precondition("TT zero constant cache lock is poisoned"))?
+            .get(zero_cache_key)
+            .cloned()
+        {
+            values[output_id as usize] = Some(PJRT_Buffer {
+                buffer_type: output_desc.element_type,
+                dims: output_desc.dims.clone(),
+                device: context.device,
+                memory: context.memory,
+                local_hardware_id: context.local_hardware_id,
+                dram_buffer: Some(cached_dram),
+                deleted: false,
+            });
+            return Ok(());
+        }
+    }
+
     let dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let logical_shape = dims_i64_to_usize(&output_desc.dims)?;
     let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
@@ -1682,7 +3041,24 @@ fn execute_constant(
         output_dram,
         context,
         "constant",
-    )
+    )?;
+    if let Some(cached) = values.get(output_id as usize).and_then(Option::as_ref) {
+        context
+            .constant_cache
+            .lock()
+            .map_err(|_| failed_precondition("TT executable constant cache lock is poisoned"))?
+            .insert(cache_key, cached.clone());
+        if let Some(zero_cache_key) = zero_cache_key {
+            if let Some(dram_buffer) = cached.dram_buffer.as_ref() {
+                ZERO_SPLAT_CONSTANT_CACHE
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .map_err(|_| failed_precondition("TT zero constant cache lock is poisoned"))?
+                    .insert(zero_cache_key, dram_buffer.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn execute_reshape(
@@ -1701,8 +3077,18 @@ fn execute_reshape(
     })?;
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    if input_desc.element_type == output_desc.element_type && input_desc.dims == output_desc.dims {
-        return alias_output_buffer(values, plan, input_id, output_id, context, "reshape");
+    if input_desc.element_type == output_desc.element_type
+        && can_alias_metadata_only_reshape(&input_shape, &output_shape)?
+    {
+        return alias_reshape_output_buffer(
+            values,
+            plan,
+            input_id,
+            output_id,
+            context,
+            &input_shape,
+            &output_shape,
+        );
     }
 
     let input = device_buffer_for_value(values, input_id, "reshape.operand")?;
@@ -1714,6 +3100,18 @@ fn execute_reshape(
     let input_dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
+    if env_flag("LIBTT_TRACE_RESHAPE") {
+        trace_once(
+            "reshape",
+            format!(
+                "{:?}{:?}->{:?}{:?}",
+                input_desc.element_type,
+                input_desc.dims,
+                output_desc.element_type,
+                output_desc.dims
+            ),
+        );
+    }
     let output_dram = if input_desc.element_type == output_desc.element_type {
         kernels::reshape::reshape(
             device,
@@ -1744,6 +3142,241 @@ fn execute_reshape(
         context,
         "reshape",
     )
+}
+
+#[derive(Clone, Copy)]
+struct TiledLogicalLayout {
+    volume: usize,
+    rows: usize,
+    cols: usize,
+    tile_rows: usize,
+    tiles_per_row: usize,
+    tile_count: usize,
+}
+
+fn checked_shape_volume(shape: &[usize], label: &str) -> Result<usize, *mut PJRT_Error> {
+    shape.iter().try_fold(1usize, |acc, &dim| {
+        acc.checked_mul(dim)
+            .ok_or_else(|| invalid_argument(format!("{label} volume is too large")))
+    })
+}
+
+fn tiled_logical_layout(shape: &[usize]) -> Result<TiledLogicalLayout, *mut PJRT_Error> {
+    let allocation_shape = dram::tiled_allocation_shape(shape).map_err(io_error)?;
+    let rank = shape.len();
+    let (rows, cols) = if rank >= 2 {
+        (shape[rank - 2], shape[rank - 1])
+    } else {
+        (
+            allocation_shape[allocation_shape.len() - 2],
+            allocation_shape[allocation_shape.len() - 1],
+        )
+    };
+    Ok(TiledLogicalLayout {
+        volume: checked_shape_volume(shape, "reshape")?,
+        rows,
+        cols,
+        tile_rows: allocation_shape[allocation_shape.len() - 2] / dram::TILE_R,
+        tiles_per_row: allocation_shape[allocation_shape.len() - 1] / dram::TILE_C,
+        tile_count: dram::tiled_shape_tile_count(shape).map_err(io_error)?,
+    })
+}
+
+fn can_alias_metadata_only_reshape(
+    input_shape: &[usize],
+    output_shape: &[usize],
+) -> Result<bool, *mut PJRT_Error> {
+    let input = tiled_logical_layout(input_shape)?;
+    let output = tiled_logical_layout(output_shape)?;
+    if input.volume != output.volume || input.tile_count != output.tile_count {
+        return Ok(false);
+    }
+    if input.volume <= 1 {
+        return Ok(true);
+    }
+
+    if input.rows == output.rows
+        && input.cols == output.cols
+        && input.tile_rows == output.tile_rows
+        && input.tiles_per_row == output.tiles_per_row
+    {
+        return Ok(true);
+    }
+
+    if input.cols != 0 && input.cols == output.cols {
+        let used_rows = input.volume.div_ceil(input.cols);
+        return Ok(used_rows <= input.rows.min(output.rows));
+    }
+
+    Ok(false)
+}
+
+fn can_alias_metadata_only_transpose(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    permutation: &[i64],
+) -> Result<bool, *mut PJRT_Error> {
+    if env_flag("LIBTT_DISABLE_TRANSPOSE_ALIAS") {
+        return Ok(false);
+    }
+    let rank = input_shape.len();
+    if output_shape.len() != rank || permutation.len() != rank {
+        return Ok(false);
+    }
+    if input_shape
+        .iter()
+        .chain(output_shape.iter())
+        .any(|&dim| dim == 0)
+    {
+        return Ok(false);
+    }
+
+    let mut seen = vec![false; rank];
+    for (output_dim, &input_dim_i64) in permutation.iter().enumerate() {
+        let input_dim = usize::try_from(input_dim_i64)
+            .map_err(|_| invalid_argument("transpose permutation dims must be >= 0"))?;
+        if input_dim >= rank {
+            return Err(invalid_argument(format!(
+                "transpose permutation dim {input_dim} is out of bounds for rank {rank}"
+            )));
+        }
+        if std::mem::replace(&mut seen[input_dim], true) {
+            return Err(invalid_argument(format!(
+                "transpose permutation repeats dim {input_dim}"
+            )));
+        }
+        if output_shape[output_dim] != input_shape[input_dim] {
+            return Ok(false);
+        }
+    }
+
+    let input_non_singleton = input_shape
+        .iter()
+        .copied()
+        .filter(|&dim| dim != 1)
+        .collect::<Vec<_>>();
+    let output_non_singleton = output_shape
+        .iter()
+        .copied()
+        .filter(|&dim| dim != 1)
+        .collect::<Vec<_>>();
+    if input_non_singleton != output_non_singleton {
+        return Ok(false);
+    }
+
+    can_alias_metadata_only_reshape(input_shape, output_shape)
+}
+
+fn alias_reshape_output_buffer(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    input_id: u32,
+    output_id: u32,
+    context: &OutputContext,
+    input_shape: &[usize],
+    output_shape: &[usize],
+) -> Result<(), *mut PJRT_Error> {
+    alias_metadata_only_output_buffer(
+        values,
+        plan,
+        input_id,
+        output_id,
+        context,
+        input_shape,
+        output_shape,
+        "reshape",
+    )
+}
+
+fn alias_metadata_only_output_buffer(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    input_id: u32,
+    output_id: u32,
+    context: &OutputContext,
+    input_shape: &[usize],
+    output_shape: &[usize],
+    op: &str,
+) -> Result<(), *mut PJRT_Error> {
+    let output_index = output_id as usize;
+    let expected = plan.values.get(output_index).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable {op} output id {output_id} is out of bounds"
+        ))
+    })?;
+    let mut output = device_buffer_for_value(values, input_id, op)?.clone();
+    if output.buffer_type != expected.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable {op} output dtype mismatch: expected {:?}, got {:?}",
+            expected.element_type, output.buffer_type
+        )));
+    }
+
+    let input_allocation_shape = dram::tiled_allocation_shape(input_shape).map_err(io_error)?;
+    let output_allocation_shape = dram::tiled_allocation_shape(output_shape).map_err(io_error)?;
+    let output_tile_count = dram::tiled_shape_tile_count(output_shape).map_err(io_error)?;
+    let Some(dram_buffer) = output.dram_buffer.as_mut() else {
+        return Err(failed_precondition(format!(
+            "TT executable {op} operand buffer has no device allocation"
+        )));
+    };
+    if dram_buffer.shape != input_allocation_shape {
+        return Err(invalid_argument(format!(
+            "TT executable {op} input allocation shape mismatch: expected {:?}, got {:?}",
+            input_allocation_shape, dram_buffer.shape
+        )));
+    }
+    if dram_buffer.num_tiles != output_tile_count {
+        return Err(invalid_argument(format!(
+            "TT executable {op} output tile count mismatch: expected {}, got {}",
+            output_tile_count, dram_buffer.num_tiles
+        )));
+    }
+    dram_buffer.shape = output_allocation_shape;
+
+    output.dims = expected.dims.clone();
+    output.device = context.device;
+    output.memory = context.memory;
+    output.local_hardware_id = context.local_hardware_id;
+    output.deleted = false;
+    values[output_index] = Some(output);
+    Ok(())
+}
+
+fn can_alias_metadata_only_broadcast(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[i64],
+) -> Result<bool, *mut PJRT_Error> {
+    if broadcast_dimensions.len() != input_shape.len() {
+        return Ok(false);
+    }
+
+    let mut mapped_output_dims = vec![false; output_shape.len()];
+    let mut previous_output_dim = None;
+    for (input_dim, &output_dim) in broadcast_dimensions.iter().enumerate() {
+        let output_dim = usize::try_from(output_dim)
+            .map_err(|_| invalid_argument("TT executable broadcast dimension is negative"))?;
+        if output_dim >= output_shape.len() {
+            return Ok(false);
+        }
+        if previous_output_dim.is_some_and(|previous| output_dim <= previous) {
+            return Ok(false);
+        }
+        previous_output_dim = Some(output_dim);
+        mapped_output_dims[output_dim] = true;
+        if input_shape[input_dim] != output_shape[output_dim] {
+            return Ok(false);
+        }
+    }
+
+    for (&mapped, &output_dim) in mapped_output_dims.iter().zip(output_shape) {
+        if !mapped && output_dim != 1 {
+            return Ok(false);
+        }
+    }
+
+    can_alias_metadata_only_reshape(input_shape, output_shape)
 }
 
 fn execute_slice(
@@ -1787,6 +3420,24 @@ fn execute_slice(
     if is_full_slice {
         return alias_output_buffer(values, plan, input_id, output_id, context, "slice");
     }
+    if can_alias_metadata_only_slice(
+        &input_shape,
+        &output_shape,
+        start_indices,
+        limit_indices,
+        strides,
+    )? {
+        return alias_metadata_only_output_buffer(
+            values,
+            plan,
+            input_id,
+            output_id,
+            context,
+            &input_shape,
+            &output_shape,
+            "slice",
+        );
+    }
     let slice_plan = kernels::slice::SlicePlan::new(
         &input_shape,
         &output_shape,
@@ -1814,6 +3465,37 @@ fn execute_slice(
         context,
         "slice",
     )
+}
+
+fn can_alias_metadata_only_slice(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    start_indices: &[i64],
+    limit_indices: &[i64],
+    strides: &[i64],
+) -> Result<bool, *mut PJRT_Error> {
+    if input_shape.len() != output_shape.len()
+        || start_indices.len() != input_shape.len()
+        || limit_indices.len() != input_shape.len()
+        || strides.len() != input_shape.len()
+    {
+        return Ok(false);
+    }
+    if !start_indices.iter().all(|&start| start == 0) || !strides.iter().all(|&stride| stride == 1)
+    {
+        return Ok(false);
+    }
+    for ((&limit, &output_dim), &input_dim) in
+        limit_indices.iter().zip(output_shape).zip(input_shape)
+    {
+        if usize::try_from(limit).ok() != Some(output_dim) || output_dim > input_dim {
+            return Ok(false);
+        }
+    }
+
+    let input_allocation_shape = dram::tiled_allocation_shape(input_shape).map_err(io_error)?;
+    let output_allocation_shape = dram::tiled_allocation_shape(output_shape).map_err(io_error)?;
+    Ok(input_allocation_shape == output_allocation_shape)
 }
 
 fn execute_dynamic_update_slice(
@@ -1964,45 +3646,38 @@ fn execute_fused_elementwise(
             root.element_type, output_desc.element_type
         )));
     }
-    let folded_nodes = fold_fused_constant_nodes(nodes);
-    let effective_nodes = folded_nodes.as_slice();
+    let effective_nodes = fold_fused_constant_nodes(nodes);
     if let Some(executable::FusedElementwiseNode {
         kind: executable::FusedElementwiseKind::Constant,
         packed_value,
         ..
     }) = effective_nodes.last()
     {
-        return execute_constant(
-            values,
-            plan,
-            device,
-            context,
-            *packed_value,
-            &[],
-            output_id,
-        );
+        return execute_constant(values, plan, device, context, *packed_value, &[], output_id);
     }
     if input_ids.is_empty() {
         let Some(packed_value) =
-            fused_constant_packed_value(effective_nodes, output_desc.element_type)
+            fused_constant_packed_value(&effective_nodes, output_desc.element_type)
         else {
             return Err(unimplemented(
                 "TT executable fused_elementwise with no inputs requires a foldable constant expression",
             ));
         };
-        return execute_constant(
-            values,
-            plan,
-            device,
-            context,
-            packed_value,
-            &[],
-            output_id,
-        );
+        return execute_constant(values, plan, device, context, packed_value, &[], output_id);
     }
 
-    let mut inputs = Vec::with_capacity(input_ids.len());
+    let full_tile_inputs = fused_full_tile_input_flags(input_ids.len(), &effective_nodes);
+    let expected_input_shape = dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+    let mut raw_inputs = Vec::with_capacity(input_ids.len());
+    let mut adjusted_inputs = Vec::with_capacity(input_ids.len());
+    let mut input_shapes = Vec::with_capacity(input_ids.len());
     for (index, &input_id) in input_ids.iter().enumerate() {
+        let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
+            invalid_argument(format!(
+                "TT executable fused_elementwise input[{index}] id {input_id} is out of bounds"
+            ))
+        })?;
+        input_shapes.push(dims_i64_to_usize(&input_desc.dims)?);
         let input = device_buffer_for_value(
             values,
             input_id,
@@ -2013,13 +3688,30 @@ fn execute_fused_elementwise(
                 "TT executable fused_elementwise input[{index}] buffer has no device allocation"
             )));
         };
-        inputs.push(input_dram);
+        let adjusted = if full_tile_inputs.get(index).copied().unwrap_or(false) {
+            alias_fused_input_to_output_shape(
+                input_dram,
+                input_desc,
+                &output_shape,
+                &expected_input_shape,
+            )?
+        } else {
+            None
+        };
+        raw_inputs.push(input_dram);
+        adjusted_inputs.push(adjusted);
     }
+    let inputs = raw_inputs
+        .iter()
+        .enumerate()
+        .map(|(index, &input)| adjusted_inputs[index].as_ref().unwrap_or(input))
+        .collect::<Vec<_>>();
 
     let output_dram = kernels::fused_eltwise::eltwise(
         device,
         &inputs,
-        effective_nodes,
+        &input_shapes,
+        &effective_nodes,
         &output_shape,
         "pjrt_fused_elementwise",
     )
@@ -2033,6 +3725,39 @@ fn execute_fused_elementwise(
         context,
         "fused_elementwise",
     )
+}
+
+fn fused_full_tile_input_flags(
+    input_count: usize,
+    nodes: &[executable::FusedElementwiseNode],
+) -> Vec<bool> {
+    let mut full_tile_inputs = vec![false; input_count];
+    for node in nodes {
+        if node.kind == executable::FusedElementwiseKind::Input && !node.single_tile_broadcast {
+            if let Some(input) = full_tile_inputs.get_mut(node.input_index as usize) {
+                *input = true;
+            }
+        }
+    }
+    full_tile_inputs
+}
+
+fn alias_fused_input_to_output_shape(
+    input_dram: &DramBuffer,
+    input_desc: &executable::ValueDesc,
+    output_shape: &[usize],
+    expected_allocation_shape: &[usize],
+) -> Result<Option<DramBuffer>, *mut PJRT_Error> {
+    if input_dram.shape == expected_allocation_shape {
+        return Ok(None);
+    }
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    if !can_alias_metadata_only_reshape(&input_shape, output_shape)? {
+        return Ok(None);
+    }
+    let mut adjusted = input_dram.clone();
+    adjusted.shape = expected_allocation_shape.to_vec();
+    Ok(Some(adjusted))
 }
 
 fn execute_pad(
@@ -2051,9 +3776,10 @@ fn execute_pad(
         .values
         .get(input_id as usize)
         .ok_or_else(|| invalid_argument("TT executable pad operand value id is out of bounds"))?;
-    let padding_desc = plan.values.get(padding_value_id as usize).ok_or_else(|| {
-        invalid_argument("TT executable pad padding value id is out of bounds")
-    })?;
+    let padding_desc = plan
+        .values
+        .get(padding_value_id as usize)
+        .ok_or_else(|| invalid_argument("TT executable pad padding value id is out of bounds"))?;
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
             "TT executable pad output id {output_id} is out of bounds"
@@ -2074,6 +3800,15 @@ fn execute_pad(
 
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    if is_noop_pad(
+        &input_shape,
+        &output_shape,
+        edge_padding_low,
+        edge_padding_high,
+        interior_padding,
+    ) {
+        return alias_output_buffer(values, plan, input_id, output_id, context, "pad");
+    }
     let pad_plan = kernels::pad::PadPlan::new(
         &input_shape,
         &output_shape,
@@ -2138,6 +3873,31 @@ fn execute_transpose(
     }
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    if can_alias_metadata_only_transpose(&input_shape, &output_shape, permutation)? {
+        return alias_metadata_only_output_buffer(
+            values,
+            plan,
+            input_id,
+            output_id,
+            context,
+            &input_shape,
+            &output_shape,
+            "transpose",
+        );
+    }
+    if env_flag("LIBTT_TRACE_TRANSPOSE") {
+        trace_once(
+            "transpose",
+            format!(
+                "{:?}{:?}->{:?}{:?} perm={:?}",
+                input_desc.element_type,
+                input_desc.dims,
+                output_desc.element_type,
+                output_desc.dims,
+                permutation
+            ),
+        );
+    }
     let is_identity_permutation = permutation.len() == input_shape.len()
         && permutation
             .iter()
@@ -2219,11 +3979,32 @@ fn execute_reduce(
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    if !matches!(
+        reducer,
+        executable::ReduceReducer::And | executable::ReduceReducer::Or
+    ) && reduce_init_is_supported(plan, *init_value_id, reducer, input_desc.element_type)
+        && can_alias_degenerate_reduce(&input_shape, &output_shape, dimensions)?
+    {
+        return alias_metadata_only_output_buffer(
+            values,
+            plan,
+            *input_id,
+            output_id,
+            context,
+            &input_shape,
+            &output_shape,
+            "reduce",
+        );
+    }
     let (kernel_input_shape, kernel_output_shape, kernel_dimensions) =
         if input_shape.len() == 1 && output_shape.is_empty() && dimensions == [0] {
             (vec![1, input_shape[0]], vec![1], vec![1])
         } else {
-            (input_shape.clone(), output_shape.clone(), dimensions.to_vec())
+            (
+                input_shape.clone(),
+                output_shape.clone(),
+                dimensions.to_vec(),
+            )
         };
     if matches!(
         reducer,
@@ -2233,8 +4014,8 @@ fn execute_reduce(
             bitwise_reduce_identity(plan, *init_value_id, reducer, input_desc.element_type)
                 .ok_or_else(|| {
                     unimplemented(
-                        "TT executable bitwise reduce requires a supported constant identity init value",
-                    )
+                "TT executable bitwise reduce requires a supported constant identity init value",
+            )
                 })?;
         let reduce_plan = kernels::bitwise_reduce::BitwiseReducePlan::new(
             dtype,
@@ -2258,15 +4039,14 @@ fn execute_reduce(
             "reduce",
         );
     }
-    let reduce_plan =
-        kernels::reduce::ReducePlan::new(
-            dtype,
-            &kernel_input_shape,
-            &kernel_output_shape,
-            &kernel_dimensions,
-            reducer,
-        )
-        .map_err(io_error)?;
+    let reduce_plan = kernels::reduce::ReducePlan::new(
+        dtype,
+        &kernel_input_shape,
+        &kernel_output_shape,
+        &kernel_dimensions,
+        reducer,
+    )
+    .map_err(io_error)?;
     if !reduce_init_is_supported(plan, *init_value_id, reducer, input_desc.element_type) {
         return Err(unimplemented(
             "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
@@ -2471,6 +4251,22 @@ fn execute_matmul(
     };
     let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
     let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+    if env_flag("LIBTT_TRACE_MATMUL") {
+        trace_once(
+            "matmul",
+            format!(
+                "lhs={:?}{:?} rhs={:?}{:?} lb={:?} rb={:?} lc={:?} rc={:?}",
+                lhs.buffer_type,
+                lhs.dims,
+                rhs.buffer_type,
+                rhs.dims,
+                dimension_numbers.lhs_batching_dimensions,
+                dimension_numbers.rhs_batching_dimensions,
+                dimension_numbers.lhs_contracting_dimensions,
+                dimension_numbers.rhs_contracting_dimensions
+            ),
+        );
+    }
 
     if let Some(epilogue) = top_k_epilogue {
         if epilogue.k != 1 {
@@ -2645,6 +4441,51 @@ fn execute_matmul(
     )
 }
 
+fn is_noop_pad(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    edge_padding_low: &[i64],
+    edge_padding_high: &[i64],
+    interior_padding: &[i64],
+) -> bool {
+    let rank = input_shape.len();
+    input_shape == output_shape
+        && edge_padding_low.len() == rank
+        && edge_padding_high.len() == rank
+        && interior_padding.len() == rank
+        && edge_padding_low.iter().all(|&padding| padding == 0)
+        && edge_padding_high.iter().all(|&padding| padding == 0)
+        && interior_padding.iter().all(|&padding| padding == 0)
+}
+
+fn can_alias_degenerate_reduce(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    dimensions: &[i64],
+) -> Result<bool, *mut PJRT_Error> {
+    let mut reduced = vec![false; input_shape.len()];
+    for &dimension in dimensions {
+        let dimension = usize::try_from(dimension)
+            .map_err(|_| invalid_argument("TT executable reduce dimension is negative"))?;
+        if dimension >= input_shape.len() {
+            return Ok(false);
+        }
+        if reduced[dimension] || input_shape[dimension] != 1 {
+            return Ok(false);
+        }
+        reduced[dimension] = true;
+    }
+    let expected_output_shape = input_shape
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &dim)| (!reduced[index]).then_some(dim))
+        .collect::<Vec<_>>();
+    if expected_output_shape != output_shape {
+        return Ok(false);
+    }
+    can_alias_metadata_only_reshape(input_shape, output_shape)
+}
+
 fn reduce_init_is_supported(
     plan: &executable::Executable,
     init_value_id: u32,
@@ -2747,8 +4588,7 @@ fn bitwise_identity_from_packed(
             PJRT_Buffer_Type::PJRT_Buffer_Type_U16 if packed_value & 0xffff == 0xffff => {
                 Some(0xffff)
             }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_S32
-            | PJRT_Buffer_Type::PJRT_Buffer_Type_U32
+            PJRT_Buffer_Type::PJRT_Buffer_Type_S32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U32
                 if packed_value == u32::MAX =>
             {
                 Some(u32::MAX)
@@ -2821,6 +4661,14 @@ fn fused_constant_packed_value(
                 let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
                 ConstantScalar::Bool(scalar_compare(*lhs, *rhs, direction)?)
             }
+            executable::FusedElementwiseKind::Select => {
+                let [pred, on_true, on_false] = fused_constant_inputs(&values, &node.input_nodes)?;
+                if (*pred).as_u32()? != 0 {
+                    *on_true
+                } else {
+                    *on_false
+                }
+            }
             executable::FusedElementwiseKind::Negate => {
                 let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
                 match input {
@@ -2861,23 +4709,32 @@ fn fused_constant_packed_value(
 
 fn fold_fused_constant_nodes(
     nodes: &[executable::FusedElementwiseNode],
-) -> Vec<executable::FusedElementwiseNode> {
-    let mut folded = nodes.to_vec();
+) -> Cow<'_, [executable::FusedElementwiseNode]> {
+    let mut folded = None;
     let mut values = Vec::<Option<ConstantScalar>>::with_capacity(nodes.len());
-    for index in 0..folded.len() {
-        let value = fused_constant_node_value(&folded[index], &values);
+    for (index, node) in nodes.iter().enumerate() {
+        let value = fused_constant_node_value(node, &values);
         if let Some(value) = value {
-            if let Some(packed_value) = scalar_to_packed(value, folded[index].element_type) {
-                folded[index].kind = executable::FusedElementwiseKind::Constant;
-                folded[index].input_nodes.clear();
-                folded[index].input_index = 0;
-                folded[index].packed_value = packed_value;
-                folded[index].single_tile_broadcast = false;
+            if let Some(packed_value) = scalar_to_packed(value, node.element_type) {
+                let needs_update = !matches!(node.kind, executable::FusedElementwiseKind::Constant)
+                    || !node.input_nodes.is_empty()
+                    || node.input_index != 0
+                    || node.packed_value != packed_value
+                    || node.single_tile_broadcast;
+                if needs_update {
+                    let folded = folded.get_or_insert_with(|| nodes.to_vec());
+                    let node = &mut folded[index];
+                    node.kind = executable::FusedElementwiseKind::Constant;
+                    node.input_nodes.clear();
+                    node.input_index = 0;
+                    node.packed_value = packed_value;
+                    node.single_tile_broadcast = false;
+                }
             }
         }
         values.push(value);
     }
-    folded
+    folded.map(Cow::Owned).unwrap_or(Cow::Borrowed(nodes))
 }
 
 fn fused_constant_node_value(
@@ -2916,6 +4773,14 @@ fn fused_constant_node_value(
         executable::FusedElementwiseKind::Compare(direction) => {
             let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
             ConstantScalar::Bool(scalar_compare(lhs, rhs, direction)?)
+        }
+        executable::FusedElementwiseKind::Select => {
+            let [pred, on_true, on_false] = folded_constant_inputs(values, &node.input_nodes)?;
+            if pred.as_u32()? != 0 {
+                on_true
+            } else {
+                on_false
+            }
         }
         executable::FusedElementwiseKind::Negate => {
             let [input] = folded_constant_inputs(values, &node.input_nodes)?;
@@ -3051,11 +4916,9 @@ fn scalar_add(
         PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(
             lhs.as_i32()?.wrapping_add(rhs.as_i32()?),
         )),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => {
-            Some(ConstantScalar::U32(
-                lhs.as_u32()?.wrapping_add(rhs.as_u32()?),
-            ))
-        }
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Some(
+            ConstantScalar::U32(lhs.as_u32()?.wrapping_add(rhs.as_u32()?)),
+        ),
         _ => None,
     }
 }
@@ -3088,11 +4951,9 @@ fn scalar_multiply(
         PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(
             lhs.as_i32()?.wrapping_mul(rhs.as_i32()?),
         )),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => {
-            Some(ConstantScalar::U32(
-                lhs.as_u32()?.wrapping_mul(rhs.as_u32()?),
-            ))
-        }
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Some(
+            ConstantScalar::U32(lhs.as_u32()?.wrapping_mul(rhs.as_u32()?)),
+        ),
         _ => None,
     }
 }
@@ -3114,10 +4975,7 @@ fn scalar_compare(
     })
 }
 
-fn scalar_convert(
-    value: ConstantScalar,
-    element_type: PJRT_Buffer_Type,
-) -> Option<ConstantScalar> {
+fn scalar_convert(value: ConstantScalar, element_type: PJRT_Buffer_Type) -> Option<ConstantScalar> {
     match element_type {
         PJRT_Buffer_Type::PJRT_Buffer_Type_F32 | PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
             Some(ConstantScalar::F32(value.as_f32()?))
@@ -3301,6 +5159,18 @@ fn execute_broadcast_in_dim(
             input_id,
             output_id,
             context,
+            "broadcast_in_dim",
+        );
+    }
+    if can_alias_metadata_only_broadcast(&input_shape, &output_shape, broadcast_dimensions)? {
+        return alias_metadata_only_output_buffer(
+            values,
+            plan,
+            input_id,
+            output_id,
+            context,
+            &input_shape,
+            &output_shape,
             "broadcast_in_dim",
         );
     }
@@ -3491,8 +5361,8 @@ fn execute_gather(
         .filter(|&dim| dim != axis_i64)
         .collect::<Vec<_>>();
     let expected_collapsed_slice_dims = [axis_i64];
-    let is_single_axis_slice_gather =
-        dimension_numbers.offset_dims.as_slice() == expected_offset_dims.as_slice()
+    let is_single_axis_slice_gather = dimension_numbers.offset_dims.as_slice()
+        == expected_offset_dims.as_slice()
         && dimension_numbers.collapsed_slice_dims.as_slice()
             == expected_collapsed_slice_dims.as_slice()
         && dimension_numbers.operand_batching_dims.is_empty()
@@ -3810,10 +5680,15 @@ fn execute_executable_v1(
         device: execute_device,
         memory: target_device.default_memory,
         local_hardware_id: target_local_hardware_id,
+        constant_cache: Arc::clone(&executable.constant_cache),
     };
     let device = &mut target_device.runtime;
+    let mut profile = ExecutionProfile::new_from_env();
 
-    for op in &plan.ops {
+    for (op_index, op) in plan.ops.iter().enumerate() {
+        let op_name = executable_op_name(op);
+        let op_start = profile.as_ref().map(|_| Instant::now());
+        let launch_count_before = profile.as_ref().map(|_| device.launch_count());
         match op {
             executable::Op::Parameter {
                 parameter_index,
@@ -3949,7 +5824,9 @@ fn execute_executable_v1(
                 output_id,
                 call_target_name,
                 ..
-            } if call_target_name == "annotate_device_placement" || call_target_name == "Sharding" => {
+            } if call_target_name == "annotate_device_placement"
+                || call_target_name == "Sharding" =>
+            {
                 let [input_id] = input_ids.as_slice() else {
                     return Err(invalid_argument(format!(
                         "TT executable custom_call {call_target_name:?} expected one input, got {}",
@@ -4146,13 +6023,66 @@ fn execute_executable_v1(
                 nodes,
             )?,
         }
+        let enqueue_elapsed = op_start.map(|start| start.elapsed());
+        let sync_ops = profile
+            .as_ref()
+            .map(|profile| profile.sync_ops)
+            .unwrap_or(false);
+        let sync_elapsed = if sync_ops {
+            let sync_start = Instant::now();
+            let sync_context = executable_op_context(plan, op_index, op);
+            device
+                .finish_dispatch()
+                .map_err(|err| io_error_with_context(err, format!("{sync_context} sync")))?;
+            sync_start.elapsed()
+        } else {
+            Duration::ZERO
+        };
+        if let (Some(profile), Some(enqueue_elapsed)) = (profile.as_mut(), enqueue_elapsed) {
+            let launches = launch_count_before
+                .map(|before| device.launch_count().wrapping_sub(before))
+                .unwrap_or(0);
+            profile.record_op(op_name, launches, enqueue_elapsed, sync_elapsed);
+        }
     }
-    device.finish_dispatch().map_err(io_error)?;
+    if !env_flag("LIBTT_DEFER_EXECUTABLE_SYNC") || env_flag("LIBTT_SYNC_EXECUTABLES") {
+        let final_sync_start = profile.as_ref().map(|_| Instant::now());
+        device
+            .finish_dispatch()
+            .map_err(|err| io_error_with_context(err, "final executable sync"))?;
+        if let (Some(profile), Some(final_sync_start)) = (profile.as_mut(), final_sync_start) {
+            profile.final_sync = final_sync_start.elapsed();
+        }
+    } else {
+        let pending_buffers = values
+            .iter()
+            .filter_map(|value| value.as_ref())
+            .filter_map(|buffer| buffer.dram_buffer.as_ref().cloned())
+            .collect::<Vec<_>>();
+        device.retain_until_finish(pending_buffers);
+        let deferred_sync_limit = env_u64("LIBTT_DEFERRED_SYNC_LAUNCH_LIMIT")
+            .unwrap_or(DEFAULT_DEFERRED_SYNC_LAUNCH_LIMIT);
+        if deferred_sync_limit > 0 && device.pending_launches_since_finish() >= deferred_sync_limit
+        {
+            let final_sync_start = profile.as_ref().map(|_| Instant::now());
+            device
+                .finish_dispatch()
+                .map_err(|err| io_error_with_context(err, "deferred executable sync"))?;
+            if let (Some(profile), Some(final_sync_start)) = (profile.as_mut(), final_sync_start) {
+                profile.final_sync = final_sync_start.elapsed();
+            }
+        }
+    }
 
+    let output_collect_start = profile.as_ref().map(|_| Instant::now());
     let mut outputs = Vec::with_capacity(plan.output_ids.len());
     for (index, &output_id) in plan.output_ids.iter().enumerate() {
         let output = device_buffer_for_value(&values, output_id, &format!("output[{index}]"))?;
         outputs.push(output.clone());
+    }
+    if let (Some(profile), Some(output_collect_start)) = (profile.as_mut(), output_collect_start) {
+        profile.output_collect = output_collect_start.elapsed();
+        profile.print(plan);
     }
     Ok(outputs)
 }
@@ -4542,7 +6472,10 @@ pub unsafe extern "C" fn TT_Device_MemoryStats(
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
-    let stats = allocator_stats(device.runtime.local_hardware_id, device.runtime.active_dram_banks);
+    let stats = allocator_stats(
+        device.runtime.local_hardware_id,
+        device.runtime.active_dram_banks,
+    );
     args.bytes_in_use = pjrt_i64(stats.bytes_in_use);
     args.peak_bytes_in_use = args.bytes_in_use;
     args.peak_bytes_in_use_is_set = true;
@@ -5349,6 +7282,138 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_reshape_detects_same_tiled_layout() {
+        assert!(
+            can_alias_metadata_only_reshape(&[2, 3, 32, 128], &[6, 32, 128])
+                .expect("layout check should succeed")
+        );
+        assert!(can_alias_metadata_only_reshape(&[1, 128], &[128])
+            .expect("layout check should succeed"));
+        assert!(can_alias_metadata_only_reshape(&[], &[1]).expect("layout check should succeed"));
+    }
+
+    #[test]
+    fn metadata_only_reshape_rejects_tile_reordering() {
+        assert!(!can_alias_metadata_only_reshape(&[2, 64], &[128])
+            .expect("layout check should succeed"));
+        assert!(!can_alias_metadata_only_reshape(&[2, 1, 128], &[2, 128])
+            .expect("layout check should succeed"));
+        assert!(
+            !can_alias_metadata_only_reshape(&[1, 4, 1, 128], &[1, 4, 128])
+                .expect("layout check should succeed")
+        );
+    }
+
+    #[test]
+    fn metadata_only_transpose_detects_singleton_axis_shuffle() {
+        assert!(can_alias_metadata_only_transpose(
+            &[1, 1, 4, 27, 27],
+            &[4, 1, 1, 27, 27],
+            &[2, 0, 1, 3, 4],
+        )
+        .expect("transpose layout check should succeed"));
+        assert!(
+            can_alias_metadata_only_transpose(&[1, 8, 1, 128], &[8, 1, 1, 128], &[1, 0, 2, 3],)
+                .expect("transpose layout check should succeed")
+        );
+    }
+
+    #[test]
+    fn metadata_only_transpose_rejects_real_tile_reordering() {
+        assert!(
+            !can_alias_metadata_only_transpose(&[1, 32], &[32, 1], &[1, 0])
+                .expect("transpose layout check should succeed")
+        );
+        assert!(!can_alias_metadata_only_transpose(
+            &[1, 8, 27, 4, 27],
+            &[4, 1, 8, 27, 27],
+            &[3, 0, 1, 2, 4],
+        )
+        .expect("transpose layout check should succeed"));
+    }
+
+    #[test]
+    fn metadata_only_broadcast_detects_size_one_dimension_changes() {
+        assert!(can_alias_metadata_only_broadcast(&[128], &[1, 128], &[1])
+            .expect("broadcast layout check should succeed"));
+        assert!(can_alias_metadata_only_broadcast(&[], &[1, 1], &[])
+            .expect("broadcast layout check should succeed"));
+        assert!(!can_alias_metadata_only_broadcast(&[], &[2], &[])
+            .expect("broadcast layout check should succeed"));
+        assert!(
+            !can_alias_metadata_only_broadcast(&[1, 128], &[2, 128], &[0, 1])
+                .expect("broadcast layout check should succeed")
+        );
+    }
+
+    #[test]
+    fn degenerate_reduce_detects_size_one_reductions() {
+        assert!(can_alias_degenerate_reduce(&[1], &[], &[0])
+            .expect("reduce layout check should succeed"));
+        assert!(can_alias_degenerate_reduce(&[1, 128], &[128], &[0])
+            .expect("reduce layout check should succeed"));
+        assert!(!can_alias_degenerate_reduce(&[2], &[], &[0])
+            .expect("reduce layout check should succeed"));
+        assert!(!can_alias_degenerate_reduce(&[1, 128], &[1], &[0])
+            .expect("reduce layout check should succeed"));
+    }
+
+    #[test]
+    fn metadata_only_slice_detects_prefix_inside_padded_tile() {
+        assert!(
+            can_alias_metadata_only_slice(&[2, 128], &[1, 128], &[0, 0], &[1, 128], &[1, 1])
+                .expect("slice layout check should succeed")
+        );
+        assert!(
+            can_alias_metadata_only_slice(&[128, 2], &[128, 1], &[0, 0], &[128, 1], &[1, 1])
+                .expect("slice layout check should succeed")
+        );
+        assert!(
+            !can_alias_metadata_only_slice(&[64], &[1], &[0], &[1], &[1])
+                .expect("slice layout check should succeed")
+        );
+        assert!(
+            !can_alias_metadata_only_slice(&[2, 128], &[1, 128], &[1, 0], &[2, 128], &[1, 1])
+                .expect("slice layout check should succeed")
+        );
+        assert!(!can_alias_metadata_only_slice(
+            &[64, 128],
+            &[32, 128],
+            &[0, 0],
+            &[32, 128],
+            &[1, 1]
+        )
+        .expect("slice layout check should succeed"));
+    }
+
+    #[test]
+    fn noop_pad_detects_zero_padding_only() {
+        assert!(is_noop_pad(&[2, 128], &[2, 128], &[0, 0], &[0, 0], &[0, 0]));
+        assert!(is_noop_pad(&[], &[], &[], &[], &[]));
+        assert!(!is_noop_pad(
+            &[2, 128],
+            &[3, 128],
+            &[0, 0],
+            &[0, 0],
+            &[0, 0]
+        ));
+        assert!(!is_noop_pad(
+            &[2, 128],
+            &[2, 128],
+            &[1, 0],
+            &[0, 0],
+            &[0, 0]
+        ));
+        assert!(!is_noop_pad(
+            &[2, 128],
+            &[2, 128],
+            &[0, 0],
+            &[0, 0],
+            &[1, 0]
+        ));
+    }
+
+    #[test]
     fn padded_host_data_places_logical_payload_at_start() {
         let data = [1u8, 0, 2, 0, 3, 0];
         let padded = padded_host_data(&data, DType::UInt16, &[3], &[32, 32])
@@ -5849,6 +7914,38 @@ mod tests {
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
+    fn pjrt_compile_folds_column_broadcast_into_fused_elementwise_input() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<4x32xbf16>, %arg1: tensor<4x1xbf16>) -> tensor<4x32xbf16> {
+    %0 = stablehlo.broadcast_in_dim %arg1, dims = [0, 1] : (tensor<4x1xbf16>) -> tensor<4x32xbf16>
+    %1 = stablehlo.add %arg0, %0 : tensor<4x32xbf16>
+    return %1 : tensor<4x32xbf16>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![3]);
+                assert_eq!(executable.ops.len(), 3);
+                let nodes = assert_fused_elementwise(&executable.ops[2], &[0, 1], 3);
+                assert_eq!(nodes.len(), 3);
+                assert_eq!(
+                    fused_kinds(nodes),
+                    vec![
+                        executable::FusedElementwiseKind::Input,
+                        executable::FusedElementwiseKind::Input,
+                        executable::FusedElementwiseKind::Add,
+                    ]
+                );
+                assert!(nodes[0].broadcast_dimensions.is_empty());
+                assert_eq!(nodes[1].broadcast_dimensions, vec![0, 1]);
+                assert_eq!(nodes[2].input_nodes, vec![0, 1]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
     fn pjrt_compile_lowers_small_integer_splat_constant() {
         with_compiled_mlir_executable(
             r#"module {
@@ -5894,34 +7991,22 @@ mod tests {
 "#,
             |executable| {
                 assert_eq!(executable.output_ids, vec![3]);
-                assert_eq!(executable.ops.len(), 4);
-                let nodes = assert_fused_elementwise(&executable.ops[1], &[0], 1);
+                assert_eq!(executable.ops.len(), 2);
+                let nodes = assert_fused_elementwise(&executable.ops[1], &[0], 3);
                 assert_eq!(
                     fused_kinds(nodes),
                     vec![
                         executable::FusedElementwiseKind::Input,
                         executable::FusedElementwiseKind::Constant,
                         executable::FusedElementwiseKind::Compare(executable::CompareDirection::Lt),
-                    ]
-                );
-                let nodes = assert_fused_elementwise(&executable.ops[2], &[0], 2);
-                assert_eq!(
-                    fused_kinds(nodes),
-                    vec![
-                        executable::FusedElementwiseKind::Input,
                         executable::FusedElementwiseKind::Constant,
                         executable::FusedElementwiseKind::Add,
+                        executable::FusedElementwiseKind::Select,
                     ]
                 );
-                let executable::Op::Select {
-                    input_ids,
-                    output_id,
-                } = &executable.ops[3]
-                else {
-                    panic!("select should lower to Select");
-                };
-                assert_eq!(*input_ids, [1, 2, 0]);
-                assert_eq!(*output_id, 3);
+                assert_eq!(nodes[2].input_nodes, vec![0, 1]);
+                assert_eq!(nodes[4].input_nodes, vec![0, 3]);
+                assert_eq!(nodes[5].input_nodes, vec![2, 4, 0]);
             },
         );
     }

@@ -502,12 +502,7 @@ pub(crate) fn matmul_f32_dot_general(
         .checked_mul(output_tiles_per_row)
         .ok_or_else(|| invalid_input("matmul_f32 output tile shape overflow"))?;
     let cores = crate::kernels::kernel::select_worker_cores(device.cores_ref(), output_tiles)?;
-    let output = device.alloc(
-        output_tiles,
-        DType::Float32,
-        &output_allocation_shape,
-        name,
-    )?;
+    let output = device.alloc(output_tiles, DType::Float32, &output_allocation_shape, name)?;
     let key = MatmulF32ProgramKey {
         cores,
         lhs_view: shape.lhs_view,
@@ -1344,8 +1339,11 @@ fn f32_program(key: MatmulF32ProgramKey) -> io::Result<Program> {
         Vec::new(),
     );
     for (core_index, &core) in key.cores.iter().enumerate() {
-        let (offset, n_tiles) =
-            crate::kernels::kernel::split_tile_range(key.output_tiles, core_index, key.cores.len())?;
+        let (offset, n_tiles) = crate::kernels::kernel::split_tile_range(
+            key.output_tiles,
+            core_index,
+            key.cores.len(),
+        )?;
         let mut reader = vec![
             0,
             0,
