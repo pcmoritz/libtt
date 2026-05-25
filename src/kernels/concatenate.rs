@@ -210,11 +210,7 @@ fn concatenate_shape(
     Ok(ConcatenateKernelShape {
         axis,
         output_rows: u32_arg(
-            if rank == 1 {
-                1
-            } else {
-                output_shape[rank - 2]
-            },
+            if rank == 1 { 1 } else { output_shape[rank - 2] },
             "output rows",
         )?,
         output_cols: u32_arg(

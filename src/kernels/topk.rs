@@ -6,14 +6,18 @@ use crate::kernels::kernel::{select_worker_cores, Kernel, RuntimeArgsBuilder};
 use std::io;
 
 const WRITER: &str = include_str!("../../kernels/topk_writer.cc");
+const TOP1_PARTIAL_WRITER: &str = include_str!("../../kernels/top1_partial_writer.cc");
 const TOP1_FINAL_WRITER: &str = include_str!("../../kernels/top1_final_writer.cc");
 const WRITER_INPUT_ADDR_INDEX: usize = 0;
 const WRITER_VALUES_ADDR_INDEX: usize = 1;
 const WRITER_INDICES_ADDR_INDEX: usize = 2;
+const TOP1_PARTIAL_INPUT_ADDR_INDEX: usize = 0;
+const TOP1_PARTIAL_PAIRS_ADDR_INDEX: usize = 1;
 const TOP1_FINAL_PARTIAL_PAIRS_ADDR_INDEX: usize = 0;
 const TOP1_FINAL_VALUES_ADDR_INDEX: usize = 1;
 const TOP1_FINAL_INDICES_ADDR_INDEX: usize = 2;
 const MAX_TOP_K: usize = 32;
+const PARALLEL_TOP1_MIN_TILES: usize = 512;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct TopKProgramKey {
@@ -46,6 +50,38 @@ impl Kernel<TopKProgramKey> for TopKKernel {
             WRITER_INPUT_ADDR_INDEX => Some(self.input_addr),
             WRITER_VALUES_ADDR_INDEX => Some(self.values_addr),
             WRITER_INDICES_ADDR_INDEX => Some(self.indices_addr),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct Top1PartialProgramKey {
+    cores: Vec<CoreCoord>,
+    input_tiles: u32,
+    logical_len: u32,
+}
+
+struct Top1PartialKernel {
+    input_addr: u32,
+    partial_pairs_addr: u32,
+    key: Top1PartialProgramKey,
+}
+
+impl Kernel<Top1PartialProgramKey> for Top1PartialKernel {
+    fn program_key(&self) -> Top1PartialProgramKey {
+        self.key.clone()
+    }
+
+    fn build_program(&self) -> io::Result<Program> {
+        top1_partial_program(self.key.clone())
+    }
+
+    #[inline]
+    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        match index {
+            TOP1_PARTIAL_INPUT_ADDR_INDEX => Some(self.input_addr),
+            TOP1_PARTIAL_PAIRS_ADDR_INDEX => Some(self.partial_pairs_addr),
             _ => None,
         }
     }
@@ -92,13 +128,16 @@ pub(crate) fn top_k(
     name: impl Into<String>,
 ) -> io::Result<(DramBuffer, DramBuffer)> {
     validate_top_k(input, input_shape, k)?;
+    let name = name.into();
+    if k == 1 && input.dtype == DType::Float16B && input.num_tiles >= PARALLEL_TOP1_MIN_TILES {
+        return top1_parallel_bf16(device, input, input_shape, name);
+    }
 
     let cores = select_worker_cores(device.cores_ref(), 1)?;
     let [core] = cores.as_slice() else {
         return Err(invalid_input("top_k requires one worker core"));
     };
     let output_shape = tiled_allocation_shape(&[k])?;
-    let name = name.into();
     let values = device.alloc(1, input.dtype, &output_shape, format!("{name}_values"))?;
     let indices = device.alloc(1, DType::Int32, &output_shape, format!("{name}_indices"))?;
     let kernel = TopKKernel {
@@ -115,6 +154,34 @@ pub(crate) fn top_k(
     };
     kernel.run(device)?;
     Ok((values, indices))
+}
+
+fn top1_parallel_bf16(
+    device: &mut Device,
+    input: &DramBuffer,
+    input_shape: &[usize],
+    name: String,
+) -> io::Result<(DramBuffer, DramBuffer)> {
+    let cores = select_worker_cores(device.cores_ref(), input.num_tiles)?;
+    let partial_count = cores.len();
+    let partial_shape = [partial_count * 32, 32];
+    let partial_pairs = device.alloc(
+        partial_count,
+        DType::Int32,
+        &partial_shape,
+        format!("{name}_partial_pairs"),
+    )?;
+    let partial_kernel = Top1PartialKernel {
+        input_addr: u32_addr(input.addr, "top1 input address")?,
+        partial_pairs_addr: u32_addr(partial_pairs.addr, "top1 partial pairs address")?,
+        key: Top1PartialProgramKey {
+            cores,
+            input_tiles: u32_arg(input.num_tiles, "input tile count")?,
+            logical_len: u32_arg(top_k_logical_len(input_shape)?, "top_k length")?,
+        },
+    };
+    partial_kernel.run(device)?;
+    top1_finalize_partials(device, &partial_pairs, partial_count, name)
 }
 
 pub(crate) fn top1_finalize_partials(
@@ -238,6 +305,45 @@ fn top_k_program(key: TopKProgramKey) -> io::Result<Program> {
     })
 }
 
+fn top1_partial_program(key: Top1PartialProgramKey) -> io::Result<Program> {
+    let mut runtime_args = RuntimeArgsBuilder::new(
+        0,
+        vec![TOP1_PARTIAL_INPUT_ADDR_INDEX, TOP1_PARTIAL_PAIRS_ADDR_INDEX],
+        Vec::new(),
+        Vec::new(),
+    );
+    for (core_index, &core) in key.cores.iter().enumerate() {
+        let (tile_offset, tile_count) =
+            crate::kernels::kernel::split_tile_range(key.input_tiles, core_index, key.cores.len())?;
+        runtime_args.add_core(
+            core,
+            vec![
+                0,
+                0,
+                tile_offset,
+                tile_count,
+                key.logical_len,
+                u32_arg(core_index, "top1 partial index")?,
+            ],
+            Vec::new(),
+            Vec::new(),
+        )?;
+    }
+    let runtime_args = runtime_args.build()?;
+    Ok(Program {
+        writer_kernel: TOP1_PARTIAL_WRITER.to_owned(),
+        compile: CompileConfig {
+            cbs: vec![
+                CBConfig::new(0, DType::Float16B),
+                CBConfig::new(16, DType::Int32),
+            ],
+            ..CompileConfig::default()
+        },
+        name: "top1_partial_bf16".to_owned(),
+        ..Program::new(runtime_args)
+    })
+}
+
 fn top1_final_program(key: Top1FinalProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
@@ -299,4 +405,67 @@ fn u32_arg(value: usize, name: &str) -> io::Result<u32> {
 fn u32_addr(value: u64, name: &str) -> io::Result<u32> {
     u32::try_from(value)
         .map_err(|_| invalid_input(format!("{name} does not fit in u32: 0x{value:x}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn u32_at(blob: &[u8], index: usize) -> u32 {
+        let offset = index * std::mem::size_of::<u32>();
+        u32::from_le_bytes(
+            blob[offset..offset + 4]
+                .try_into()
+                .expect("u32 runtime arg"),
+        )
+    }
+
+    #[test]
+    fn top1_partial_program_splits_input_tiles_across_cores() {
+        let cores = vec![
+            CoreCoord { x: 0, y: 0 },
+            CoreCoord { x: 1, y: 0 },
+            CoreCoord { x: 2, y: 0 },
+        ];
+        let program = top1_partial_program(Top1PartialProgramKey {
+            cores,
+            input_tiles: 10,
+            logical_len: 319,
+        })
+        .expect("top1 partial program");
+
+        assert_eq!(program.name, "top1_partial_bf16");
+        assert_eq!(program.runtime_args.cores().len(), 3);
+        assert_eq!(
+            program.runtime_args.section_sizes().0,
+            6 * std::mem::size_of::<u32>()
+        );
+
+        let blobs = program.runtime_args.blobs();
+        assert_eq!(
+            (
+                u32_at(&blobs[0], 2),
+                u32_at(&blobs[0], 3),
+                u32_at(&blobs[0], 5)
+            ),
+            (0, 4, 0)
+        );
+        assert_eq!(
+            (
+                u32_at(&blobs[1], 2),
+                u32_at(&blobs[1], 3),
+                u32_at(&blobs[1], 5)
+            ),
+            (4, 3, 1)
+        );
+        assert_eq!(
+            (
+                u32_at(&blobs[2], 2),
+                u32_at(&blobs[2], 3),
+                u32_at(&blobs[2], 5)
+            ),
+            (7, 3, 2)
+        );
+        assert!(blobs.iter().all(|blob| u32_at(blob, 4) == 319));
+    }
 }

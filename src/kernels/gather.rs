@@ -465,11 +465,7 @@ fn validate_buffer(
     Ok(())
 }
 
-fn validate_allocation(
-    buffer: &DramBuffer,
-    logical_shape: &[usize],
-    name: &str,
-) -> io::Result<()> {
+fn validate_allocation(buffer: &DramBuffer, logical_shape: &[usize], name: &str) -> io::Result<()> {
     let expected_shape = tiled_allocation_shape(logical_shape)?;
     if buffer.shape != expected_shape {
         return Err(invalid_input(format!(
@@ -538,11 +534,8 @@ fn gather_rank1_program(key: GatherRank1ProgramKey) -> io::Result<Program> {
         Vec::new(),
     );
     for (core_index, &core) in key.cores.iter().enumerate() {
-        let (offset, tiles) = split_tile_range(
-            key.shape.output_tiles,
-            core_index,
-            key.cores.len(),
-        )?;
+        let (offset, tiles) =
+            split_tile_range(key.shape.output_tiles, core_index, key.cores.len())?;
         runtime_args.add_core(
             core,
             vec![0, offset, tiles, 1],

@@ -1,6 +1,8 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
+use crate::dram::{
+    tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R,
+};
 use crate::executable::{CompareDirection, FusedElementwiseKind, FusedElementwiseNode};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
@@ -18,8 +20,8 @@ const HELPER_SUBTRACT_INPUT: &str =
 const HELPER_MULTIPLY_INPUT: &str =
     include_str!("../../kernels/fused_eltwise_helpers/multiply_input.cc.inc");
 const HELPER_COMPARE: &str = include_str!("../../kernels/fused_eltwise_helpers/compare.cc.inc");
-const MAX_FUSED_INPUTS: usize = 8;
-const MAX_FUSED_NODES: usize = 16;
+pub(crate) const MAX_FUSED_INPUTS: usize = 8;
+pub(crate) const MAX_FUSED_NODES: usize = 16;
 
 const HEADER_ADD_INT: &str = "compute_kernel_api/add_int_sfpu.h";
 const HEADER_BINARY_MAX_MIN: &str = "compute_kernel_api/binary_max_min.h";
@@ -34,9 +36,82 @@ const HEADER_NEGATIVE: &str = "compute_kernel_api/eltwise_unary/negative.h";
 const HEADER_RDIV: &str = "compute_kernel_api/eltwise_unary/rdiv.h";
 const HEADER_RPOW: &str = "compute_kernel_api/eltwise_unary/rpow.h";
 const HEADER_RSQRT: &str = "compute_kernel_api/eltwise_unary/rsqrt.h";
+const HEADER_SFPU_SPLIT: &str = "compute_kernel_api/eltwise_unary/sfpu_split_includes.h";
 const HEADER_SUB_INT: &str = "compute_kernel_api/sub_int_sfpu.h";
 const HEADER_TRIGONOMETRY: &str = "compute_kernel_api/eltwise_unary/trigonometry.h";
 const HEADER_TYPECAST: &str = "compute_kernel_api/eltwise_unary/typecast.h";
+
+const HELPER_SELECT: &str = r#"
+#ifdef TRISC_MATH
+#define FUSED_SELECT_ITERATIONS (8)
+
+template <bool KeepWhenPred, bool Int32Value>
+inline void fused_select_gate_value(const uint dst_index_pred, const uint dst_index_value, const uint dst_index_out) {
+  constexpr uint dst_tile_size_sfpi = 32;
+  for (int i = 0; i < FUSED_SELECT_ITERATIONS; ++i) {
+    vInt pred = dst_reg[dst_index_pred * dst_tile_size_sfpi];
+    if constexpr (Int32Value) {
+      vInt values = dst_reg[dst_index_value * dst_tile_size_sfpi];
+      if constexpr (KeepWhenPred) {
+        v_if (pred != 0) {
+          dst_reg[dst_index_out * dst_tile_size_sfpi] = values;
+        } v_else {
+          dst_reg[dst_index_out * dst_tile_size_sfpi] = 0;
+        } v_endif;
+      } else {
+        v_if (pred != 0) {
+          dst_reg[dst_index_out * dst_tile_size_sfpi] = 0;
+        } v_else {
+          dst_reg[dst_index_out * dst_tile_size_sfpi] = values;
+        } v_endif;
+      }
+    } else {
+      vFloat values = dst_reg[dst_index_value * dst_tile_size_sfpi];
+      if constexpr (KeepWhenPred) {
+        v_if (pred != 0) {
+          dst_reg[dst_index_out * dst_tile_size_sfpi] = values;
+        } v_else {
+          dst_reg[dst_index_out * dst_tile_size_sfpi] = 0.0f;
+        } v_endif;
+      } else {
+        v_if (pred != 0) {
+          dst_reg[dst_index_out * dst_tile_size_sfpi] = 0.0f;
+        } v_else {
+          dst_reg[dst_index_out * dst_tile_size_sfpi] = values;
+        } v_endif;
+      }
+    }
+    dst_reg++;
+  }
+}
+#endif
+
+constexpr DataFormat fused_select_value_format(uint32_t cb_value, uint32_t cb_out) {
+#ifdef UCK_CHLKC_PACK
+  return static_cast<DataFormat>((uint)pack_src_format[cb_out]);
+#else
+  return static_cast<DataFormat>((uint)unpack_src_format[cb_value]);
+#endif
+}
+
+template <DataFormat Format>
+ALWI void fused_select_add_init() {
+  if constexpr (Format == DataFormat::Int32) {
+    add_int_tile_init();
+  } else {
+    add_binary_tile_init();
+  }
+}
+
+template <DataFormat Format>
+ALWI void fused_select_add_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
+  if constexpr (Format == DataFormat::Int32) {
+    add_int32_tile(idst0, idst1, odst);
+  } else {
+    add_binary_tile(idst0, idst1, odst);
+  }
+}
+"#;
 
 #[derive(Clone, Copy)]
 struct UnaryCompute {
@@ -85,6 +160,7 @@ impl FusedElementwiseKind {
             | Self::Power
             | Self::Max
             | Self::Compare(_) => 2,
+            Self::Select => 3,
         }
     }
 
@@ -142,6 +218,28 @@ impl FusedElementwiseKind {
                 }
                 self.validate_binary_dtype(input_dtype)
                     .map_err(|err| invalid_input(format!("node[{node_index}] {err}")))
+            }
+            Self::Select => {
+                let pred_dtype = input_dtypes[0];
+                let true_dtype = input_dtypes[1];
+                let false_dtype = input_dtypes[2];
+                if pred_dtype != DType::UInt8 {
+                    return Err(invalid_input(format!(
+                        "node[{node_index}] select predicate dtype must be UInt8, got {pred_dtype:?}"
+                    )));
+                }
+                if true_dtype != false_dtype {
+                    return Err(invalid_input(format!(
+                        "node[{node_index}] select value dtypes must match, got {true_dtype:?} and {false_dtype:?}"
+                    )));
+                }
+                validate_same_output_dtype(node_index, self, true_dtype, output_dtype)?;
+                if !is_supported_select_value_dtype(true_dtype) {
+                    return Err(invalid_input(format!(
+                        "node[{node_index}] select supports Float16, Float16B, Float32, and Int32 values, got {true_dtype:?}"
+                    )));
+                }
+                Ok(())
             }
         }
     }
@@ -440,8 +538,11 @@ impl CompareDirection {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct FusedEltwiseProgramKey {
     cores: Vec<CoreCoord>,
+    tile_offset: u32,
     tile_count: u32,
+    output_shape: Vec<u32>,
     output_dtype: DType,
+    input_specs: Vec<FusedInputSpec>,
     nodes: Vec<FusedElementwiseNode>,
 }
 
@@ -449,6 +550,12 @@ struct FusedEltwiseKernel {
     input_addrs: Vec<u32>,
     output_addr: u32,
     key: FusedEltwiseProgramKey,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct FusedInputSpec {
+    shape: Vec<u32>,
+    broadcast_dimensions: Vec<u32>,
 }
 
 impl Kernel<FusedEltwiseProgramKey> for FusedEltwiseKernel {
@@ -479,18 +586,66 @@ fn node_dtype(node: &FusedElementwiseNode) -> io::Result<DType> {
     pjrt_buffer_type_to_dtype(node.element_type)
 }
 
+fn fused_input_specs(
+    external_input_shapes: &[Vec<usize>],
+    nodes: &[FusedElementwiseNode],
+    output_shape: &[usize],
+) -> io::Result<Vec<FusedInputSpec>> {
+    let mut broadcast_dimensions = vec![None::<Vec<i64>>; external_input_shapes.len()];
+    for node in nodes {
+        if node.kind != FusedElementwiseKind::Input || node.broadcast_dimensions.is_empty() {
+            continue;
+        }
+        let input_index = node.input_index as usize;
+        let Some(slot) = broadcast_dimensions.get_mut(input_index) else {
+            return Err(invalid_input(format!(
+                "input index {} is out of bounds for {} inputs",
+                node.input_index,
+                external_input_shapes.len()
+            )));
+        };
+        if let Some(existing) = slot {
+            if existing != &node.broadcast_dimensions {
+                return Err(invalid_input(format!(
+                    "input[{input_index}] has conflicting fused broadcast dimensions"
+                )));
+            }
+        } else {
+            *slot = Some(node.broadcast_dimensions.clone());
+        }
+    }
+
+    external_input_shapes
+        .iter()
+        .enumerate()
+        .map(|(index, shape)| {
+            let dims = broadcast_dimensions[index].clone().unwrap_or_default();
+            if !dims.is_empty() && !supports_input_broadcast(shape, output_shape, &dims) {
+                return Err(invalid_input(format!(
+                    "input[{index}] broadcast {:?} -> {:?} dims {:?} is not supported by fused eltwise",
+                    shape, output_shape, dims
+                )));
+            }
+            Ok(FusedInputSpec {
+                shape: u32_shape(shape, "fused eltwise input shape")?,
+                broadcast_dimensions: u32_dims(&dims, "fused eltwise broadcast dimensions")?,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn eltwise(
     device: &mut Device,
     external_inputs: &[&DramBuffer],
+    external_input_shapes: &[Vec<usize>],
     nodes: &[FusedElementwiseNode],
     shape: &[usize],
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
-    let input_reads = validate_and_collect_inputs(external_inputs, nodes, shape)?;
+    let input_specs = fused_input_specs(external_input_shapes, nodes, shape)?;
+    let input_reads = validate_and_collect_inputs(external_inputs, &input_specs, nodes, shape)?;
 
     let output_tiles = tiled_shape_tile_count(shape)?;
-    let tile_count = u32_arg(output_tiles, "tile count")?;
-    let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
     let output_dtype = node_dtype(&nodes[nodes.len() - 1])?;
     let output_shape = tiled_allocation_shape(shape)?;
     let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
@@ -500,22 +655,35 @@ pub(crate) fn eltwise(
         input_addrs.push(u32_arg(input.addr, &format!("input[{index}] address"))?);
     }
 
-    let kernel = FusedEltwiseKernel {
-        input_addrs,
-        output_addr: u32_arg(output.addr, "output address")?,
-        key: FusedEltwiseProgramKey {
-            cores,
-            tile_count,
-            output_dtype,
-            nodes: nodes.to_vec(),
-        },
-    };
-    kernel.run(device)?;
+    let output_addr = u32_arg(output.addr, "output address")?;
+    let output_shape = u32_shape(shape, "fused eltwise output shape")?;
+    let max_tiles_per_launch = device.cores_ref().len().max(1);
+    let mut tile_offset = 0usize;
+    while tile_offset < output_tiles {
+        let chunk_tiles = (output_tiles - tile_offset).min(max_tiles_per_launch);
+        let cores = select_worker_cores(device.cores_ref(), chunk_tiles)?;
+        let kernel = FusedEltwiseKernel {
+            input_addrs: input_addrs.clone(),
+            output_addr,
+            key: FusedEltwiseProgramKey {
+                cores,
+                tile_offset: u32_arg(tile_offset, "tile offset")?,
+                tile_count: u32_arg(chunk_tiles, "tile count")?,
+                output_shape: output_shape.clone(),
+                output_dtype,
+                input_specs: input_specs.clone(),
+                nodes: nodes.to_vec(),
+            },
+        };
+        kernel.run(device)?;
+        tile_offset += chunk_tiles;
+    }
     Ok(output)
 }
 
 fn validate_and_collect_inputs<'a>(
     external_inputs: &[&'a DramBuffer],
+    input_specs: &[FusedInputSpec],
     nodes: &[FusedElementwiseNode],
     shape: &[usize],
 ) -> io::Result<Vec<&'a DramBuffer>> {
@@ -565,6 +733,11 @@ fn validate_and_collect_inputs<'a>(
                         external_inputs.len()
                     )));
                 }
+                let input_spec = input_specs.get(input_index).ok_or_else(|| {
+                    invalid_input(format!(
+                        "input[{input_index}] is missing a fused input spec"
+                    ))
+                })?;
                 let buffer = external_inputs[input_index];
                 let input_dtype = buffer.dtype;
                 if input_dtype != dtype {
@@ -582,6 +755,22 @@ fn validate_and_collect_inputs<'a>(
                     if buffer.num_tiles != 1 {
                         return Err(invalid_input(format!(
                             "node[{index}] single-tile broadcast input has {} tiles, expected 1",
+                            buffer.num_tiles
+                        )));
+                    }
+                } else if !node.broadcast_dimensions.is_empty() {
+                    let input_shape = usize_shape(&input_spec.shape)?;
+                    let expected_input_shape = tiled_allocation_shape(&input_shape)?;
+                    if buffer.shape != expected_input_shape {
+                        return Err(invalid_input(format!(
+                            "node[{index}] broadcast input allocation shape mismatch: got {:?}, expected {:?} for logical shape {:?}",
+                            buffer.shape, expected_input_shape, input_shape
+                        )));
+                    }
+                    let expected_input_tiles = tiled_shape_tile_count(&input_shape)?;
+                    if buffer.num_tiles != expected_input_tiles {
+                        return Err(invalid_input(format!(
+                            "node[{index}] broadcast input tile count mismatch: got {}, expected {expected_input_tiles}",
                             buffer.num_tiles
                         )));
                     }
@@ -661,6 +850,10 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(0, vec![0], reader_dynamic_indices, Vec::new());
     for (core_index, &core) in key.cores.iter().enumerate() {
         let (offset, n_tiles) = split_tile_range(key.tile_count, core_index, key.cores.len())?;
+        let offset = key
+            .tile_offset
+            .checked_add(offset)
+            .ok_or_else(|| invalid_input("fused eltwise tile offset overflow"))?;
         let mut reader_args = vec![0; input_count];
         reader_args.push(offset);
         reader_args.push(n_tiles);
@@ -685,14 +878,20 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
         if matches!(
             node_dtype(node)?,
             DType::Float32 | DType::Int32 | DType::UInt32
-        ) {
+        ) || node.kind == FusedElementwiseKind::Select
+        {
             dst_accum_mode = true;
             break;
         }
     }
 
     Ok(Program {
-        reader_kernel: reader_source(&leaf_nodes, input_count)?,
+        reader_kernel: reader_source(
+            &leaf_nodes,
+            input_count,
+            &key.input_specs,
+            &key.output_shape,
+        )?,
         compute_kernel: compute_source(&key)?,
         writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
@@ -725,13 +924,24 @@ fn fused_leaf_nodes<'a>(
 fn reader_source(
     leaf_nodes: &[(u32, &FusedElementwiseNode)],
     input_count: usize,
+    input_specs: &[FusedInputSpec],
+    output_shape: &[u32],
 ) -> io::Result<String> {
     let mut arg_loads = String::new();
     let mut addr_gens = String::new();
     let mut reserves = String::new();
+    let mut geometry = String::new();
     let mut reads = String::new();
     let mut broadcasts = String::new();
     let mut pushes = String::new();
+    let has_input_broadcast = input_specs
+        .iter()
+        .any(|spec| !spec.broadcast_dimensions.is_empty());
+    let (output_tile_rows, output_tiles_per_row) = if has_input_broadcast {
+        tile_grid(output_shape, "fused eltwise output")?
+    } else {
+        (0, 0)
+    };
     for index in 0..input_count {
         writeln!(
             arg_loads,
@@ -747,11 +957,7 @@ fn reader_source(
             "  constexpr uint32_t cb_leaf_{leaf_index} = tt::CBIndex::c_{cb};"
         )
         .unwrap();
-        writeln!(
-            reserves,
-            "    cb_reserve_back(cb_leaf_{leaf_index}, 1);"
-        )
-        .unwrap();
+        writeln!(reserves, "    cb_reserve_back(cb_leaf_{leaf_index}, 1);").unwrap();
         match node.kind {
             FusedElementwiseKind::Input => {
                 writeln!(
@@ -765,16 +971,69 @@ fn reader_source(
                 )
                 .unwrap();
                 writeln!(addr_gens, "  }};").unwrap();
-                let tile_id = if node.single_tile_broadcast {
-                    "0"
+                let input_spec = input_specs.get(input_arg_index).ok_or_else(|| {
+                    invalid_input(format!(
+                        "missing fused input spec for input {input_arg_index}"
+                    ))
+                })?;
+                let broadcast_kind = fused_broadcast_kind(
+                    &input_spec.shape,
+                    output_shape,
+                    &input_spec.broadcast_dimensions,
+                );
+                if let Some(kind) = broadcast_kind {
+                    let (input_tile_rows, input_tiles_per_row) = tile_grid(
+                        &input_spec.shape,
+                        &format!("fused eltwise input {input_arg_index}"),
+                    )?;
+                    writeln!(
+                        geometry,
+                        "    uint32_t input_tile_leaf_{leaf_index} = {};",
+                        broadcast_tile_expr(
+                            kind,
+                            input_arg_index,
+                            input_tile_rows,
+                            input_tiles_per_row,
+                            output_tile_rows,
+                            output_tiles_per_row,
+                        )
+                    )
+                    .unwrap();
+                    writeln!(
+                        reads,
+                        "    noc_async_read_tile(input_tile_leaf_{leaf_index}, input_{input_arg_index}, get_write_ptr(cb_leaf_{leaf_index}));"
+                    )
+                    .unwrap();
+                    let element = element_type(node_dtype(node)?);
+                    match kind {
+                        FusedBroadcastKind::DirectFullTile => {}
+                        FusedBroadcastKind::ColumnFill => {
+                            writeln!(
+                                broadcasts,
+                                "    fill_broadcast_columns<{element}>(cb_leaf_{leaf_index}, fused_row_count, fused_col_count);"
+                            )
+                            .unwrap();
+                        }
+                        FusedBroadcastKind::RowFill => {
+                            writeln!(
+                                broadcasts,
+                                "    fill_broadcast_rows<{element}>(cb_leaf_{leaf_index}, fused_row_count, fused_col_count);"
+                            )
+                            .unwrap();
+                        }
+                    }
                 } else {
-                    "offset + i"
-                };
-                writeln!(
-                    reads,
-                    "    noc_async_read_tile({tile_id}, input_{input_arg_index}, get_write_ptr(cb_leaf_{leaf_index}));"
-                )
-                .unwrap();
+                    let tile_id = if node.single_tile_broadcast {
+                        "0"
+                    } else {
+                        "output_tile_id"
+                    };
+                    writeln!(
+                        reads,
+                        "    noc_async_read_tile({tile_id}, input_{input_arg_index}, get_write_ptr(cb_leaf_{leaf_index}));"
+                    )
+                    .unwrap();
+                }
                 if node.single_tile_broadcast {
                     let bytes = element_bytes(node_dtype(node)?);
                     writeln!(
@@ -796,9 +1055,46 @@ fn reader_source(
             }
             _ => unreachable!("fused reader leaves are limited to inputs and constants"),
         }
+        writeln!(pushes, "    cb_push_back(cb_leaf_{leaf_index}, 1);").unwrap();
+    }
+
+    let broadcast_geometry = if has_input_broadcast {
+        format!(
+            "    uint32_t fused_output_matrix_tiles = {output_tile_rows}u * {output_tiles_per_row}u;\n\
+             uint32_t fused_output_batch = output_tile_id / fused_output_matrix_tiles;\n\
+             uint32_t fused_output_matrix_tile = output_tile_id % fused_output_matrix_tiles;\n\
+             uint32_t fused_output_tile_row = fused_output_matrix_tile / {output_tiles_per_row}u;\n\
+             uint32_t fused_output_tile_col = fused_output_matrix_tile % {output_tiles_per_row}u;\n\
+             uint32_t fused_row_count = tile_extent({}, fused_output_tile_row * 32u, 32u);\n\
+             uint32_t fused_col_count = tile_extent({}, fused_output_tile_col * 32u, 32u);\n",
+            output_shape[output_shape.len() - 2],
+            output_shape[output_shape.len() - 1]
+        )
+    } else {
+        String::new()
+    };
+    let output_shape_source = cpp_u32_array(output_shape);
+    let mut input_shape_sources = String::new();
+    for (index, spec) in input_specs.iter().enumerate() {
+        if spec.broadcast_dimensions.is_empty() {
+            continue;
+        }
         writeln!(
-            pushes,
-            "    cb_push_back(cb_leaf_{leaf_index}, 1);"
+            input_shape_sources,
+            "constexpr uint32_t input_rank_{index} = {}u;",
+            spec.shape.len()
+        )
+        .unwrap();
+        writeln!(
+            input_shape_sources,
+            "constexpr uint32_t input_shape_{index}[input_rank_{index}] = {};",
+            cpp_u32_array(&spec.shape)
+        )
+        .unwrap();
+        writeln!(
+            input_shape_sources,
+            "constexpr uint32_t broadcast_dims_{index}[input_rank_{index}] = {};",
+            cpp_u32_array(&spec.broadcast_dimensions)
         )
         .unwrap();
     }
@@ -807,6 +1103,10 @@ fn reader_source(
         "#include <cstdint>\n\
          \n\
          namespace {{\n\
+         constexpr uint32_t output_rank = {}u;\n\
+         constexpr uint32_t output_coord_count = output_rank == 0u ? 1u : output_rank;\n\
+         constexpr uint32_t output_shape[output_coord_count] = {output_shape_source};\n\
+         {input_shape_sources}\
          uint32_t repeated_word(uint32_t packed_value, uint32_t element_bytes) {{\n\
            if (element_bytes == 1) {{\n\
              uint32_t byte = packed_value & 0xffu;\n\
@@ -836,6 +1136,78 @@ fn reader_source(
              ptr[i] = packed_value;\n\
            }}\n\
          }}\n\
+         uint32_t tile_element_index(uint32_t row, uint32_t col) {{\n\
+           uint32_t face_row = row / 16u;\n\
+           uint32_t face_col = col / 16u;\n\
+           uint32_t row_in_face = row % 16u;\n\
+           uint32_t col_in_face = col % 16u;\n\
+           return ((face_row * 2u + face_col) * 16u * 16u) + row_in_face * 16u + col_in_face;\n\
+         }}\n\
+         uint32_t tile_extent(uint32_t logical_dim, uint32_t base, uint32_t tile_dim) {{\n\
+           if (base >= logical_dim) {{\n\
+             return 0;\n\
+           }}\n\
+           uint32_t remaining = logical_dim - base;\n\
+           return remaining < tile_dim ? remaining : tile_dim;\n\
+         }}\n\
+         void zero_tile(uint32_t cb) {{\n\
+           volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_write_ptr(cb));\n\
+           uint32_t words = get_tile_size(cb) / sizeof(uint32_t);\n\
+           for (uint32_t i = 0; i < words; ++i) {{\n\
+             ptr[i] = 0;\n\
+           }}\n\
+         }}\n\
+         uint32_t output_batch_coord(uint32_t output_batch, uint32_t dim) {{\n\
+           if (output_rank < 3u || dim >= output_rank - 2u) {{\n\
+             return 0;\n\
+           }}\n\
+           for (uint32_t rev = 0; rev < output_rank - 2u; ++rev) {{\n\
+             uint32_t current = output_rank - 3u - rev;\n\
+             uint32_t coord = output_batch % output_shape[current];\n\
+             if (current == dim) {{\n\
+               return coord;\n\
+             }}\n\
+             output_batch /= output_shape[current];\n\
+           }}\n\
+           return 0;\n\
+         }}\n\
+         uint32_t direct_broadcast_tile(uint32_t output_batch, uint32_t output_tile_row, uint32_t output_tile_col, const uint32_t *input_shape, uint32_t input_rank, const uint32_t *broadcast_dims, uint32_t input_tile_rows, uint32_t input_tiles_per_row) {{\n\
+           uint32_t input_batch = 0;\n\
+           for (uint32_t dim = 0; dim < input_rank - 2u; ++dim) {{\n\
+             uint32_t coord = input_shape[dim] == 1u ? 0u : output_batch_coord(output_batch, broadcast_dims[dim]);\n\
+             input_batch = input_batch * input_shape[dim] + coord;\n\
+           }}\n\
+           return (input_batch * input_tile_rows + output_tile_row) * input_tiles_per_row + output_tile_col;\n\
+         }}\n\
+         template <typename Element>\n\
+         void fill_broadcast_columns(uint32_t cb, uint32_t row_count, uint32_t col_count) {{\n\
+           volatile tt_l1_ptr Element *ptr = reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb));\n\
+           Element values[32];\n\
+           for (uint32_t row = 0; row < row_count; ++row) {{\n\
+             values[row] = ptr[tile_element_index(row, 0u)];\n\
+           }}\n\
+           zero_tile(cb);\n\
+           for (uint32_t row = 0; row < row_count; ++row) {{\n\
+             Element value = values[row];\n\
+             for (uint32_t col = 0; col < col_count; ++col) {{\n\
+               ptr[tile_element_index(row, col)] = value;\n\
+             }}\n\
+           }}\n\
+         }}\n\
+         template <typename Element>\n\
+         void fill_broadcast_rows(uint32_t cb, uint32_t row_count, uint32_t col_count) {{\n\
+           volatile tt_l1_ptr Element *ptr = reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb));\n\
+           Element values[32];\n\
+           for (uint32_t col = 0; col < col_count; ++col) {{\n\
+             values[col] = ptr[tile_element_index(0u, col)];\n\
+           }}\n\
+           zero_tile(cb);\n\
+           for (uint32_t row = 0; row < row_count; ++row) {{\n\
+             for (uint32_t col = 0; col < col_count; ++col) {{\n\
+               ptr[tile_element_index(row, col)] = values[col];\n\
+             }}\n\
+           }}\n\
+         }}\n\
          }}  // namespace\n\
          \n\
          void kernel_main() {{\n\
@@ -844,15 +1216,76 @@ fn reader_source(
            uint32_t n_tiles = get_arg_val<uint32_t>({});\n\
          {addr_gens}\
            for (uint32_t i = 0; i < n_tiles; ++i) {{\n\
+             uint32_t output_tile_id = offset + i;\n\
+         {broadcast_geometry}\
+         {geometry}\
          {reserves}\
          {reads}\
              noc_async_read_barrier();\n\
          {broadcasts}\
-         {pushes}\
+        {pushes}\
            }}\n\
          }}\n",
+        output_shape.len(),
         input_count + 1
     ))
+}
+
+fn broadcast_tile_expr(
+    kind: FusedBroadcastKind,
+    input_index: usize,
+    input_tile_rows: u32,
+    input_tiles_per_row: u32,
+    _output_tile_rows: u32,
+    _output_tiles_per_row: u32,
+) -> String {
+    match kind {
+        FusedBroadcastKind::DirectFullTile => format!(
+            "direct_broadcast_tile(fused_output_batch, fused_output_tile_row, fused_output_tile_col, input_shape_{input_index}, input_rank_{input_index}, broadcast_dims_{input_index}, {input_tile_rows}u, {input_tiles_per_row}u)"
+        ),
+        FusedBroadcastKind::ColumnFill => format!(
+            "(fused_output_batch * {input_tile_rows}u + fused_output_tile_row) * {input_tiles_per_row}u"
+        ),
+        FusedBroadcastKind::RowFill => format!(
+            "(fused_output_batch * {input_tile_rows}u) * {input_tiles_per_row}u + fused_output_tile_col"
+        ),
+    }
+}
+
+fn tile_grid(shape: &[u32], name: &str) -> io::Result<(u32, u32)> {
+    let shape = usize_shape(shape)?;
+    let allocation_shape = tiled_allocation_shape(&shape)?;
+    let rank = allocation_shape.len();
+    Ok((
+        u32_arg(
+            allocation_shape[rank - 2] / TILE_R,
+            &format!("{name} tile rows"),
+        )?,
+        u32_arg(
+            allocation_shape[rank - 1] / TILE_C,
+            &format!("{name} tiles per row"),
+        )?,
+    ))
+}
+
+fn cpp_u32_array(values: &[u32]) -> String {
+    if values.is_empty() {
+        return "{1u}".to_owned();
+    }
+    let values = values
+        .iter()
+        .map(|value| format!("{value}u"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{values}}}")
+}
+
+fn element_type(dtype: DType) -> &'static str {
+    match dtype {
+        DType::Float32 | DType::Int32 | DType::UInt32 => "uint32_t",
+        DType::Float16 | DType::Float16B | DType::UInt16 => "uint16_t",
+        DType::Int8 | DType::UInt8 => "uint8_t",
+    }
 }
 
 fn compute_source(key: &FusedEltwiseProgramKey) -> io::Result<String> {
@@ -870,6 +1303,7 @@ struct ComputeSourceFeatures {
     subtract_input_helper: bool,
     multiply_input_helper: bool,
     compare_helpers: bool,
+    select_helper: bool,
 }
 
 impl ComputeSourceFeatures {
@@ -906,6 +1340,13 @@ impl ComputeSourceFeatures {
         self.add_header(HEADER_BINARY_SFPU);
         self.add_header(HEADER_SUB_INT);
         self.add_header(HEADER_COMP);
+    }
+
+    fn add_select_helper(&mut self) {
+        self.select_helper = true;
+        self.add_header(HEADER_BINARY_SFPU);
+        self.add_header(HEADER_ADD_INT);
+        self.add_header(HEADER_SFPU_SPLIT);
     }
 
     fn add_data_format_binary_helper(&mut self, op: FusedElementwiseKind) {
@@ -952,6 +1393,9 @@ impl ComputeSourceFeatures {
         }
         if self.compare_helpers {
             helpers.push_str(HELPER_COMPARE);
+        }
+        if self.select_helper {
+            helpers.push_str(HELPER_SELECT);
         }
         helpers
     }
@@ -1012,6 +1456,7 @@ enum Lowering {
     ScalarBinary(ScalarBinarySpec),
     Binary(BinarySpec),
     Compare(CompareSpec),
+    Select(SelectSpec),
 }
 
 #[derive(Clone, Copy)]
@@ -1065,6 +1510,14 @@ struct CompareSpec {
     int32_input: bool,
 }
 
+#[derive(Clone, Copy)]
+struct SelectSpec {
+    pred: usize,
+    on_true: usize,
+    on_false: usize,
+    int32_value: bool,
+}
+
 fn compute_steps(nodes: &[FusedElementwiseNode]) -> io::Result<ComputeSteps> {
     let mut remaining_uses = vec![0u32; nodes.len()];
     for node in nodes {
@@ -1107,6 +1560,7 @@ fn compute_steps(nodes: &[FusedElementwiseNode]) -> io::Result<ComputeSteps> {
             Lowering::ScalarBinary(spec) => emit_scalar_binary(&mut ctx, index, spec)?,
             Lowering::Binary(spec) => emit_binary(&mut ctx, index, spec)?,
             Lowering::Compare(spec) => emit_compare(&mut ctx, index, spec)?,
+            Lowering::Select(spec) => emit_select(&mut ctx, index, spec)?,
         }
     }
 
@@ -1197,7 +1651,24 @@ fn lowering_for(
                 op: BinaryLowering::Tile(binary),
             }))
         }
-        _ => unreachable!("fused eltwise op arity is limited to 0, 1, or 2"),
+        3 => {
+            if node.kind != FusedElementwiseKind::Select {
+                return Err(invalid_input(format!(
+                    "missing ternary lowering for {:?}",
+                    node.kind
+                )));
+            }
+            let pred = node.input_nodes[0] as usize;
+            let on_true = node.input_nodes[1] as usize;
+            let on_false = node.input_nodes[2] as usize;
+            Ok(Lowering::Select(SelectSpec {
+                pred,
+                on_true,
+                on_false,
+                int32_value: node_dtype(&nodes[on_true])? == DType::Int32,
+            }))
+        }
+        _ => unreachable!("fused eltwise op arity is limited to 0, 1, 2, or 3"),
     }
 }
 
@@ -1314,6 +1785,69 @@ fn emit_compare(
     )
     .unwrap();
     ctx.pack_and_pop(output_cb, &[spec.lhs, spec.rhs])
+}
+
+fn emit_select(ctx: &mut ComputeEmitContext<'_>, index: usize, spec: SelectSpec) -> io::Result<()> {
+    let pred_cb = ctx.cb_for_node(spec.pred)?;
+    let true_cb = ctx.cb_for_node(spec.on_true)?;
+    let false_cb = ctx.cb_for_node(spec.on_false)?;
+    let output_cb = ctx.cb_for_node(index)?;
+    let int32_value = spec.int32_value;
+    append_waits(&mut ctx.body, &[pred_cb, true_cb, false_cb]);
+    ctx.features.add_select_helper();
+    writeln!(
+        ctx.body,
+        "    constexpr DataFormat select_format_{index} = fused_select_value_format(tt::CBIndex::c_{true_cb}, tt::CBIndex::c_{output_cb});"
+    )
+    .unwrap();
+    writeln!(
+        ctx.body,
+        "    fused_select_add_init<select_format_{index}>();"
+    )
+    .unwrap();
+    writeln!(
+        ctx.body,
+        "    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);"
+    )
+    .unwrap();
+    writeln!(ctx.body, "    tile_regs_acquire();").unwrap();
+    writeln!(
+        ctx.body,
+        "    reconfig_data_format_srca<true>(tt::CBIndex::c_{pred_cb});"
+    )
+    .unwrap();
+    writeln!(
+        ctx.body,
+        "    copy_tile_to_dst_init_short(tt::CBIndex::c_{pred_cb});"
+    )
+    .unwrap();
+    writeln!(ctx.body, "    copy_tile(tt::CBIndex::c_{pred_cb}, 0, 0);").unwrap();
+    writeln!(
+        ctx.body,
+        "    reconfig_data_format_srca<true>(tt::CBIndex::c_{true_cb});"
+    )
+    .unwrap();
+    writeln!(ctx.body, "    copy_tile_init(tt::CBIndex::c_{true_cb});").unwrap();
+    writeln!(ctx.body, "    copy_tile(tt::CBIndex::c_{true_cb}, 0, 1);").unwrap();
+    writeln!(
+        ctx.body,
+        "    MATH(_llk_math_eltwise_binary_sfpu_params_<false>(fused_select_gate_value<true, {int32_value}>, 0, 1, 1, VectorMode::RC);)"
+    )
+    .unwrap();
+    writeln!(ctx.body, "    copy_tile_init(tt::CBIndex::c_{false_cb});").unwrap();
+    writeln!(ctx.body, "    copy_tile(tt::CBIndex::c_{false_cb}, 0, 2);").unwrap();
+    writeln!(
+        ctx.body,
+        "    MATH(_llk_math_eltwise_binary_sfpu_params_<false>(fused_select_gate_value<false, {int32_value}>, 0, 2, 2, VectorMode::RC);)"
+    )
+    .unwrap();
+    writeln!(
+        ctx.body,
+        "    fused_select_add_tile<select_format_{index}>(1, 2, 0);"
+    )
+    .unwrap();
+    ctx.srca_cb = false_cb;
+    ctx.pack_and_pop(output_cb, &[spec.pred, spec.on_true, spec.on_false])
 }
 
 fn append_binary_tile_setup(
@@ -1472,6 +2006,169 @@ fn constant_scalar_bits(nodes: &[FusedElementwiseNode], index: usize) -> io::Res
     }))
 }
 
+pub(crate) fn supports_input_broadcast(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[i64],
+) -> bool {
+    if !valid_broadcast_dimensions(input_shape, output_shape, broadcast_dimensions) {
+        return false;
+    }
+    if direct_full_tile_broadcast(input_shape, output_shape, broadcast_dimensions) {
+        return true;
+    }
+    if identity_column_fill_broadcast(input_shape, output_shape, broadcast_dimensions) {
+        return true;
+    }
+    if identity_row_fill_broadcast(input_shape, output_shape, broadcast_dimensions) {
+        return true;
+    }
+    false
+}
+
+fn valid_broadcast_dimensions(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[i64],
+) -> bool {
+    if broadcast_dimensions.len() != input_shape.len() {
+        return false;
+    }
+    let mut previous = None;
+    for (input_dim, &output_dim) in broadcast_dimensions.iter().enumerate() {
+        let Ok(output_dim) = usize::try_from(output_dim) else {
+            return false;
+        };
+        if output_dim >= output_shape.len() {
+            return false;
+        }
+        if previous.is_some_and(|previous| output_dim <= previous) {
+            return false;
+        }
+        previous = Some(output_dim);
+        let input = input_shape[input_dim];
+        let output = output_shape[output_dim];
+        if input != output && input != 1 {
+            return false;
+        }
+    }
+    true
+}
+
+fn direct_full_tile_broadcast(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[i64],
+) -> bool {
+    let input_rank = input_shape.len();
+    let output_rank = output_shape.len();
+    input_rank >= 2
+        && output_rank >= 2
+        && usize::try_from(broadcast_dimensions[input_rank - 2]).ok() == Some(output_rank - 2)
+        && usize::try_from(broadcast_dimensions[input_rank - 1]).ok() == Some(output_rank - 1)
+        && input_shape[input_rank - 2] == output_shape[output_rank - 2]
+        && input_shape[input_rank - 1] == output_shape[output_rank - 1]
+}
+
+fn identity_column_fill_broadcast(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[i64],
+) -> bool {
+    let rank = input_shape.len();
+    rank >= 2
+        && rank == output_shape.len()
+        && broadcast_dimensions
+            .iter()
+            .enumerate()
+            .all(|(index, &dim)| usize::try_from(dim).ok() == Some(index))
+        && input_shape[..rank - 1] == output_shape[..rank - 1]
+        && input_shape[rank - 1] == 1
+        && output_shape[rank - 1] > 1
+}
+
+fn identity_row_fill_broadcast(
+    input_shape: &[usize],
+    output_shape: &[usize],
+    broadcast_dimensions: &[i64],
+) -> bool {
+    let rank = input_shape.len();
+    rank >= 2
+        && rank == output_shape.len()
+        && broadcast_dimensions
+            .iter()
+            .enumerate()
+            .all(|(index, &dim)| usize::try_from(dim).ok() == Some(index))
+        && input_shape[..rank - 2] == output_shape[..rank - 2]
+        && input_shape[rank - 2] == 1
+        && output_shape[rank - 2] > 1
+        && input_shape[rank - 1] == output_shape[rank - 1]
+}
+
+#[derive(Clone, Copy)]
+enum FusedBroadcastKind {
+    DirectFullTile,
+    ColumnFill,
+    RowFill,
+}
+
+fn fused_broadcast_kind(
+    input_shape: &[u32],
+    output_shape: &[u32],
+    dims: &[u32],
+) -> Option<FusedBroadcastKind> {
+    if dims.is_empty() || dims.len() != input_shape.len() {
+        return None;
+    }
+    let input_shape_usize = input_shape
+        .iter()
+        .map(|&dim| dim as usize)
+        .collect::<Vec<_>>();
+    let output_shape_usize = output_shape
+        .iter()
+        .map(|&dim| dim as usize)
+        .collect::<Vec<_>>();
+    let dims_i64 = dims.iter().map(|&dim| i64::from(dim)).collect::<Vec<_>>();
+    if !valid_broadcast_dimensions(&input_shape_usize, &output_shape_usize, &dims_i64) {
+        return None;
+    }
+    if direct_full_tile_broadcast(&input_shape_usize, &output_shape_usize, &dims_i64) {
+        Some(FusedBroadcastKind::DirectFullTile)
+    } else if identity_column_fill_broadcast(&input_shape_usize, &output_shape_usize, &dims_i64) {
+        Some(FusedBroadcastKind::ColumnFill)
+    } else if identity_row_fill_broadcast(&input_shape_usize, &output_shape_usize, &dims_i64) {
+        Some(FusedBroadcastKind::RowFill)
+    } else {
+        None
+    }
+}
+
+fn u32_shape(shape: &[usize], name: &str) -> io::Result<Vec<u32>> {
+    shape
+        .iter()
+        .map(|&dim| u32_arg(dim, name))
+        .collect::<io::Result<Vec<_>>>()
+}
+
+fn u32_dims(dims: &[i64], name: &str) -> io::Result<Vec<u32>> {
+    dims.iter()
+        .map(|&dim| {
+            u32::try_from(dim)
+                .map_err(|_| invalid_input(format!("{name} does not fit in u32: {dim}")))
+        })
+        .collect()
+}
+
+fn usize_shape(shape: &[u32]) -> io::Result<Vec<usize>> {
+    shape
+        .iter()
+        .map(|&dim| {
+            usize::try_from(dim)
+                .map_err(|_| invalid_input(format!("shape dim does not fit in usize: {dim}")))
+        })
+        .collect()
+}
+
 fn element_bytes(dtype: DType) -> usize {
     match dtype {
         DType::Float32 | DType::Int32 | DType::UInt32 => 4,
@@ -1515,6 +2212,13 @@ fn is_supported_value_dtype(dtype: DType) -> bool {
 
 fn is_supported_convert_dtype(dtype: DType) -> bool {
     is_supported_value_dtype(dtype) || dtype == DType::UInt8
+}
+
+fn is_supported_select_value_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::Float16 | DType::Float16B | DType::Float32 | DType::Int32
+    )
 }
 
 fn is_float_dtype(dtype: DType) -> bool {
@@ -1574,15 +2278,26 @@ mod tests {
             packed_value: 0,
             element_type: element_type(DType::Float16B),
             single_tile_broadcast: false,
+            broadcast_dimensions: Vec::new(),
         }
     }
 
     fn program_key(nodes: Vec<FusedElementwiseNode>) -> FusedEltwiseProgramKey {
         FusedEltwiseProgramKey {
             cores: Vec::new(),
+            tile_offset: 0,
             tile_count: 1,
+            output_shape: vec![32, 32],
             output_dtype: node_dtype(nodes.last().expect("test nodes must not be empty"))
                 .expect("test node dtype must be valid"),
+            input_specs: nodes
+                .iter()
+                .filter(|node| node.kind == FusedElementwiseKind::Input)
+                .map(|_| FusedInputSpec {
+                    shape: vec![32, 32],
+                    broadcast_dimensions: Vec::new(),
+                })
+                .collect(),
             nodes,
         }
     }

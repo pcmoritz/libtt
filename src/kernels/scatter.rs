@@ -260,7 +260,11 @@ fn scatter_dim0_program(key: ScatterDim0ProgramKey) -> io::Result<Program> {
             ],
             ..CompileConfig::default()
         },
-        name: format!("scatter_dim0_set_{:?}_{}", key.dtype, key.shape.operand_shape.len()),
+        name: format!(
+            "scatter_dim0_set_{:?}_{}",
+            key.dtype,
+            key.shape.operand_shape.len()
+        ),
         ..Program::new(runtime_args)
     })
 }

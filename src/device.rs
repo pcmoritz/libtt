@@ -101,6 +101,9 @@ pub struct Device {
     dispatcher: Box<dyn Dispatcher>,
     cached_program_launches: HashMap<usize, CachedProgramLaunch>,
     staged_cached_program: Option<usize>,
+    launch_count: u64,
+    pending_launches_since_finish: u64,
+    pending_buffers: Vec<DramBuffer>,
 }
 
 struct CachedProgramLaunch {
@@ -259,6 +262,9 @@ impl Device {
             dispatcher,
             cached_program_launches: HashMap::new(),
             staged_cached_program: None,
+            launch_count: 0,
+            pending_launches_since_finish: 0,
+            pending_buffers: Vec::new(),
         };
 
         if let Err(err) = info.upload_firmware() {
@@ -404,12 +410,29 @@ impl Device {
         };
         self.dispatcher
             .launch(&program, setup, setup_records, &launch.runtime_args)?;
+        self.launch_count = self.launch_count.wrapping_add(1);
+        self.pending_launches_since_finish = self.pending_launches_since_finish.wrapping_add(1);
         self.staged_cached_program = Some(program_id);
         Ok(())
     }
 
+    pub(crate) fn launch_count(&self) -> u64 {
+        self.launch_count
+    }
+
+    pub(crate) fn pending_launches_since_finish(&self) -> u64 {
+        self.pending_launches_since_finish
+    }
+
     pub(crate) fn finish_dispatch(&mut self) -> io::Result<()> {
-        self.dispatcher.finish()
+        self.dispatcher.finish()?;
+        self.pending_launches_since_finish = 0;
+        self.pending_buffers.clear();
+        Ok(())
+    }
+
+    pub(crate) fn retain_until_finish(&mut self, buffers: impl IntoIterator<Item = DramBuffer>) {
+        self.pending_buffers.extend(buffers);
     }
 
     pub fn alloc(
@@ -443,6 +466,7 @@ impl Device {
     }
 
     pub fn dram_read(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
+        self.finish_dispatch()?;
         self.allocator_mut()?.read_host_data(buf)
     }
 
