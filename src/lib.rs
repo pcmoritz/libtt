@@ -19,7 +19,7 @@ mod mlir_frontend;
 mod utils;
 
 use device::Device;
-use dram::{DType, DramBuffer};
+use dram::{allocator_stats, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
@@ -229,6 +229,10 @@ impl PJRT_Client {
 fn cstring_lossy<S: AsRef<str>>(value: S) -> CString {
     let sanitized = value.as_ref().replace('\0', "?");
     CString::new(sanitized).expect("CString::new should succeed after sanitizing NULs")
+}
+
+fn pjrt_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn pjrt_error(message: impl AsRef<str>, code: PJRT_Error_Code) -> *mut PJRT_Error {
@@ -1486,10 +1490,11 @@ fn select_value_input<'a>(
     for op in &plan.ops {
         if let executable::Op::Constant {
             packed_value,
+            data,
             output_id,
         } = op
         {
-            if *output_id == value_id {
+            if *output_id == value_id && data.is_empty() {
                 let desc = plan.values.get(index).ok_or_else(|| {
                     invalid_argument(format!(
                         "{field} constant value id {value_id} is out of bounds"
@@ -1565,6 +1570,121 @@ fn store_output_buffer(
     Ok(())
 }
 
+fn alias_output_buffer(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    input_id: u32,
+    output_id: u32,
+    context: &OutputContext,
+    op: &str,
+) -> Result<(), *mut PJRT_Error> {
+    let output_index = output_id as usize;
+    let expected = plan.values.get(output_index).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable {op} output id {output_id} is out of bounds"
+        ))
+    })?;
+    let mut output = device_buffer_for_value(values, input_id, op)?.clone();
+    let expected_dtype = pjrt_buffer_type_to_dtype(expected.element_type)?;
+    let input_dtype = pjrt_buffer_type_to_dtype(output.buffer_type)?;
+    if input_dtype != expected_dtype {
+        return Err(invalid_argument(format!(
+            "TT executable {op} output dtype mismatch: expected {:?}, got {:?}",
+            expected.element_type, output.buffer_type
+        )));
+    }
+    let Some(dram_buffer) = output.dram_buffer.as_ref() else {
+        return Err(failed_precondition(format!(
+            "TT executable {op} operand buffer has no device allocation"
+        )));
+    };
+    let logical_shape = dims_i64_to_usize(&expected.dims)?;
+    let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
+    if dram_buffer.shape != allocation_shape {
+        return Err(invalid_argument(format!(
+            "TT executable {op} output allocation shape mismatch: expected {:?}, got {:?}",
+            allocation_shape, dram_buffer.shape
+        )));
+    }
+    output.buffer_type = expected.element_type;
+    output.dims = expected.dims.clone();
+    output.device = context.device;
+    output.memory = context.memory;
+    output.local_hardware_id = context.local_hardware_id;
+    output.deleted = false;
+    values[output_index] = Some(output);
+    Ok(())
+}
+
+fn packed_element_bytes(dtype: DType, packed_value: u32) -> Vec<u8> {
+    match dtype {
+        DType::Int8 | DType::UInt8 => vec![packed_value as u8],
+        DType::Float16 | DType::Float16B | DType::UInt16 => {
+            (packed_value as u16).to_le_bytes().to_vec()
+        }
+        DType::Float32 | DType::Int32 | DType::UInt32 => packed_value.to_le_bytes().to_vec(),
+    }
+}
+
+fn splat_allocation_data(
+    dtype: DType,
+    packed_value: u32,
+    allocation_shape: &[usize],
+) -> Result<Vec<u8>, *mut PJRT_Error> {
+    let allocation_size = host_byte_size(dtype, allocation_shape)?;
+    let element = packed_element_bytes(dtype, packed_value);
+    let elements = allocation_size / element.len();
+    let mut data = Vec::with_capacity(allocation_size);
+    for _ in 0..elements {
+        data.extend_from_slice(&element);
+    }
+    Ok(data)
+}
+
+fn execute_constant(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    packed_value: u32,
+    logical_data: &[u8],
+    output_id: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable constant output id {output_id} is out of bounds"
+        ))
+    })?;
+    let dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    let logical_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
+    let data = if logical_data.is_empty() {
+        splat_allocation_data(dtype, packed_value, &allocation_shape)?
+    } else {
+        let logical_size = host_byte_size(dtype, &logical_shape)?;
+        if logical_data.len() != logical_size {
+            return Err(invalid_argument(format!(
+                "TT executable constant data size mismatch: expected {logical_size}, got {}",
+                logical_data.len()
+            )));
+        }
+        padded_host_data(logical_data, dtype, &logical_shape, &allocation_shape)?
+            .unwrap_or_else(|| logical_data.to_vec())
+    };
+    let output_dram = device
+        .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
+        .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "constant",
+    )
+}
+
 fn execute_reshape(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -1579,14 +1699,11 @@ fn execute_reshape(
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument("TT executable reshape output value id is out of bounds")
     })?;
-    if input_desc.element_type != output_desc.element_type {
-        return Err(invalid_argument(
-            "TT executable reshape input and output element types must match",
-        ));
-    }
-
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    if input_desc.element_type == output_desc.element_type && input_desc.dims == output_desc.dims {
+        return alias_output_buffer(values, plan, input_id, output_id, context, "reshape");
+    }
 
     let input = device_buffer_for_value(values, input_id, "reshape.operand")?;
     let Some(input_dram) = input.dram_buffer.as_ref() else {
@@ -1594,16 +1711,29 @@ fn execute_reshape(
             "TT executable reshape operand buffer has no device allocation",
         ));
     };
-    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let input_dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
-    let output_dram = kernels::reshape::reshape(
-        device,
-        input_dram,
-        &input_shape,
-        &output_shape,
-        dtype,
-        "pjrt_reshape",
-    )
+    let output_dram = if input_desc.element_type == output_desc.element_type {
+        kernels::reshape::reshape(
+            device,
+            input_dram,
+            &input_shape,
+            &output_shape,
+            input_dtype,
+            "pjrt_reshape",
+        )
+    } else {
+        kernels::reshape::bitcast_reshape(
+            device,
+            input_dram,
+            &input_shape,
+            &output_shape,
+            input_dtype,
+            output_dtype,
+            "pjrt_bitcast_convert",
+        )
+    }
     .map_err(io_error)?;
     store_output_buffer(
         values,
@@ -1644,6 +1774,19 @@ fn execute_slice(
 
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let is_full_slice = input_shape == output_shape
+        && start_indices.len() == input_shape.len()
+        && limit_indices.len() == input_shape.len()
+        && strides.len() == input_shape.len()
+        && start_indices.iter().all(|&start| start == 0)
+        && limit_indices
+            .iter()
+            .zip(input_shape.iter())
+            .all(|(&limit, &dim)| usize::try_from(limit).ok() == Some(dim))
+        && strides.iter().all(|&stride| stride == 1);
+    if is_full_slice {
+        return alias_output_buffer(values, plan, input_id, output_id, context, "slice");
+    }
     let slice_plan = kernels::slice::SlicePlan::new(
         &input_shape,
         &output_shape,
@@ -1673,6 +1816,130 @@ fn execute_slice(
     )
 }
 
+fn execute_dynamic_update_slice(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    output_id: u32,
+) -> Result<(), *mut PJRT_Error> {
+    if input_ids.len() < 2 {
+        return Err(invalid_argument(format!(
+            "TT executable dynamic_update_slice expected at least operand and update ids, got {}",
+            input_ids.len()
+        )));
+    }
+    let operand_id = input_ids[0];
+    let update_id = input_ids[1];
+    let start_index_ids = &input_ids[2..];
+
+    let operand_desc = plan.values.get(operand_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable dynamic_update_slice operand value id is out of bounds")
+    })?;
+    let update_desc = plan.values.get(update_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable dynamic_update_slice update value id is out of bounds")
+    })?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable dynamic_update_slice output id {output_id} is out of bounds"
+        ))
+    })?;
+    if operand_desc.element_type != update_desc.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable dynamic_update_slice operand type {:?} must match update type {:?}",
+            operand_desc.element_type, update_desc.element_type
+        )));
+    }
+    if output_desc.element_type != operand_desc.element_type {
+        return Err(invalid_argument(format!(
+            "TT executable dynamic_update_slice output must be {:?}, got {:?}",
+            operand_desc.element_type, output_desc.element_type
+        )));
+    }
+    if output_desc.dims != operand_desc.dims {
+        return Err(invalid_argument(format!(
+            "TT executable dynamic_update_slice output shape mismatch: expected {:?}, got {:?}",
+            operand_desc.dims, output_desc.dims
+        )));
+    }
+
+    let operand_shape = dims_i64_to_usize(&operand_desc.dims)?;
+    let update_shape = dims_i64_to_usize(&update_desc.dims)?;
+    if start_index_ids.len() != operand_shape.len() {
+        return Err(invalid_argument(format!(
+            "TT executable dynamic_update_slice requires {} start indices, got {}",
+            operand_shape.len(),
+            start_index_ids.len()
+        )));
+    }
+    let mut start_index_shapes = Vec::with_capacity(start_index_ids.len());
+    for (index, &start_index_id) in start_index_ids.iter().enumerate() {
+        let start_desc = plan.values.get(start_index_id as usize).ok_or_else(|| {
+            invalid_argument(format!(
+                "TT executable dynamic_update_slice start index {index} id {start_index_id} is out of bounds"
+            ))
+        })?;
+        if start_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
+            return Err(unimplemented(format!(
+                "TT executable dynamic_update_slice start index {index} currently requires s32, got {:?}",
+                start_desc.element_type
+            )));
+        }
+        start_index_shapes.push(dims_i64_to_usize(&start_desc.dims)?);
+    }
+
+    let operand = device_buffer_for_value(values, operand_id, "dynamic_update_slice.operand")?;
+    let Some(operand_dram) = operand.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable dynamic_update_slice operand buffer has no device allocation",
+        ));
+    };
+    let update = device_buffer_for_value(values, update_id, "dynamic_update_slice.update")?;
+    let Some(update_dram) = update.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable dynamic_update_slice update buffer has no device allocation",
+        ));
+    };
+    let mut start_index_drams = Vec::with_capacity(start_index_ids.len());
+    for (index, &start_index_id) in start_index_ids.iter().enumerate() {
+        let start_index = device_buffer_for_value(
+            values,
+            start_index_id,
+            &format!("dynamic_update_slice.start_index_{index}"),
+        )?;
+        let Some(start_index_dram) = start_index.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable dynamic_update_slice start index {index} buffer has no device allocation"
+            )));
+        };
+        start_index_drams.push(start_index_dram.clone());
+    }
+
+    let dtype = pjrt_buffer_type_to_dtype(operand_desc.element_type)?;
+    let output_dram = kernels::dynamic_update_slice::dynamic_update_slice(
+        device,
+        operand_dram,
+        update_dram,
+        &start_index_drams,
+        &operand_shape,
+        &update_shape,
+        &start_index_shapes,
+        dtype,
+        "pjrt_dynamic_update_slice",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "dynamic_update_slice",
+    )
+}
+
 fn execute_fused_elementwise(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -1697,6 +1964,42 @@ fn execute_fused_elementwise(
             root.element_type, output_desc.element_type
         )));
     }
+    let folded_nodes = fold_fused_constant_nodes(nodes);
+    let effective_nodes = folded_nodes.as_slice();
+    if let Some(executable::FusedElementwiseNode {
+        kind: executable::FusedElementwiseKind::Constant,
+        packed_value,
+        ..
+    }) = effective_nodes.last()
+    {
+        return execute_constant(
+            values,
+            plan,
+            device,
+            context,
+            *packed_value,
+            &[],
+            output_id,
+        );
+    }
+    if input_ids.is_empty() {
+        let Some(packed_value) =
+            fused_constant_packed_value(effective_nodes, output_desc.element_type)
+        else {
+            return Err(unimplemented(
+                "TT executable fused_elementwise with no inputs requires a foldable constant expression",
+            ));
+        };
+        return execute_constant(
+            values,
+            plan,
+            device,
+            context,
+            packed_value,
+            &[],
+            output_id,
+        );
+    }
 
     let mut inputs = Vec::with_capacity(input_ids.len());
     for (index, &input_id) in input_ids.iter().enumerate() {
@@ -1716,7 +2019,7 @@ fn execute_fused_elementwise(
     let output_dram = kernels::fused_eltwise::eltwise(
         device,
         &inputs,
-        nodes,
+        effective_nodes,
         &output_shape,
         "pjrt_fused_elementwise",
     )
@@ -1729,6 +2032,87 @@ fn execute_fused_elementwise(
         output_dram,
         context,
         "fused_elementwise",
+    )
+}
+
+fn execute_pad(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_id: u32,
+    padding_value_id: u32,
+    output_id: u32,
+    edge_padding_low: &[i64],
+    edge_padding_high: &[i64],
+    interior_padding: &[i64],
+) -> Result<(), *mut PJRT_Error> {
+    let input_desc = plan
+        .values
+        .get(input_id as usize)
+        .ok_or_else(|| invalid_argument("TT executable pad operand value id is out of bounds"))?;
+    let padding_desc = plan.values.get(padding_value_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable pad padding value id is out of bounds")
+    })?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable pad output id {output_id} is out of bounds"
+        ))
+    })?;
+    if input_desc.element_type != output_desc.element_type
+        || padding_desc.element_type != input_desc.element_type
+    {
+        return Err(invalid_argument(
+            "TT executable pad operand, padding value, and output element types must match",
+        ));
+    }
+    if !padding_desc.dims.is_empty() {
+        return Err(unimplemented(
+            "TT executable pad currently requires a scalar padding value",
+        ));
+    }
+
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let pad_plan = kernels::pad::PadPlan::new(
+        &input_shape,
+        &output_shape,
+        edge_padding_low,
+        edge_padding_high,
+        interior_padding,
+    )
+    .map_err(io_error)?;
+
+    let input = device_buffer_for_value(values, input_id, "pad.operand")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable pad operand buffer has no device allocation",
+        ));
+    };
+    let padding = device_buffer_for_value(values, padding_value_id, "pad.padding_value")?;
+    let Some(padding_dram) = padding.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable pad padding value buffer has no device allocation",
+        ));
+    };
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dram = kernels::pad::pad(
+        device,
+        input_dram,
+        padding_dram,
+        &pad_plan,
+        dtype,
+        "pjrt_pad",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "pad",
     )
 }
 
@@ -1754,6 +2138,14 @@ fn execute_transpose(
     }
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let is_identity_permutation = permutation.len() == input_shape.len()
+        && permutation
+            .iter()
+            .enumerate()
+            .all(|(dim, &permutation_dim)| usize::try_from(permutation_dim).ok() == Some(dim));
+    if input_shape == output_shape && is_identity_permutation {
+        return alias_output_buffer(values, plan, input_id, output_id, context, "transpose");
+    }
     let input = device_buffer_for_value(values, input_id, "transpose.operand")?;
     let Some(input_dram) = input.dram_buffer.as_ref() else {
         return Err(failed_precondition(
@@ -1827,10 +2219,55 @@ fn execute_reduce(
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let (kernel_input_shape, kernel_output_shape, kernel_dimensions) =
+        if input_shape.len() == 1 && output_shape.is_empty() && dimensions == [0] {
+            (vec![1, input_shape[0]], vec![1], vec![1])
+        } else {
+            (input_shape.clone(), output_shape.clone(), dimensions.to_vec())
+        };
+    if matches!(
+        reducer,
+        executable::ReduceReducer::And | executable::ReduceReducer::Or
+    ) {
+        let identity =
+            bitwise_reduce_identity(plan, *init_value_id, reducer, input_desc.element_type)
+                .ok_or_else(|| {
+                    unimplemented(
+                        "TT executable bitwise reduce requires a supported constant identity init value",
+                    )
+                })?;
+        let reduce_plan = kernels::bitwise_reduce::BitwiseReducePlan::new(
+            dtype,
+            &kernel_input_shape,
+            &kernel_output_shape,
+            &kernel_dimensions,
+            reducer,
+            identity,
+        )
+        .map_err(io_error)?;
+        let output_dram =
+            kernels::bitwise_reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
+                .map_err(io_error)?;
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_desc.dims.clone(),
+            output_dram,
+            context,
+            "reduce",
+        );
+    }
     let reduce_plan =
-        kernels::reduce::ReducePlan::new(dtype, &input_shape, &output_shape, dimensions, reducer)
-            .map_err(io_error)?;
-    if !reduce_init_is_supported(plan, *init_value_id, reducer) {
+        kernels::reduce::ReducePlan::new(
+            dtype,
+            &kernel_input_shape,
+            &kernel_output_shape,
+            &kernel_dimensions,
+            reducer,
+        )
+        .map_err(io_error)?;
+    if !reduce_init_is_supported(plan, *init_value_id, reducer, input_desc.element_type) {
         return Err(unimplemented(
             "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
         ));
@@ -1845,6 +2282,95 @@ fn execute_reduce(
         output_dram,
         context,
         "reduce",
+    )
+}
+
+fn execute_reduce_window(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    init_value_ids: &[u32],
+    output_id: u32,
+    attributes: &executable::ReduceWindowAttributes,
+    reducer: executable::ReduceReducer,
+) -> Result<(), *mut PJRT_Error> {
+    let [input_id] = input_ids else {
+        return Err(unimplemented(
+            "TT executable reduce_window currently only supports one input",
+        ));
+    };
+    let [init_value_id] = init_value_ids else {
+        return Err(unimplemented(
+            "TT executable reduce_window currently only supports one init value",
+        ));
+    };
+
+    let input = device_buffer_for_value(values, *input_id, "reduce_window.input")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable reduce_window input buffer has no device allocation",
+        ));
+    };
+    let input_desc = plan
+        .values
+        .get(*input_id as usize)
+        .ok_or_else(|| invalid_argument("TT executable reduce_window input id is out of bounds"))?;
+    let init_desc = plan.values.get(*init_value_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable reduce_window init value id is out of bounds")
+    })?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable reduce_window output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != input_desc.element_type
+        || init_desc.element_type != input_desc.element_type
+    {
+        return Err(invalid_argument(
+            "TT executable reduce_window input, init, and output element types must match",
+        ));
+    }
+    if !init_desc.dims.is_empty() {
+        return Err(unimplemented(
+            "TT executable reduce_window currently requires a scalar init value",
+        ));
+    }
+    if reducer != executable::ReduceReducer::Add
+        || constant_packed_value(plan, *init_value_id) != Some(0)
+    {
+        return Err(unimplemented(
+            "TT executable reduce_window currently requires add with a constant zero init value",
+        ));
+    }
+
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let reduce_window_plan = kernels::reduce_window::ReduceWindowPlan::new(
+        dtype,
+        &input_shape,
+        &output_shape,
+        attributes,
+        reducer,
+    )
+    .map_err(io_error)?;
+    let output_dram = kernels::reduce_window::reduce_window(
+        device,
+        input_dram,
+        &reduce_window_plan,
+        "pjrt_reduce_window",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "reduce_window",
     )
 }
 
@@ -2047,6 +2573,35 @@ fn execute_matmul(
         ))
     })?;
     let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    if lhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+        && rhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+        && output_dtype == DType::Float32
+    {
+        let output_dram = kernels::matmul::matmul_f32_dot_general(
+            device,
+            lhs_dram,
+            rhs_dram,
+            &lhs_shape,
+            &rhs_shape,
+            &output_shape,
+            &dimension_numbers.lhs_batching_dimensions,
+            &dimension_numbers.rhs_batching_dimensions,
+            &dimension_numbers.lhs_contracting_dimensions,
+            &dimension_numbers.rhs_contracting_dimensions,
+            "pjrt_matmul_f32",
+        )
+        .map_err(io_error)?;
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_desc.dims.clone(),
+            output_dram,
+            context,
+            "matmul",
+        );
+    }
     if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
         || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
         || !matches!(output_dtype, DType::Float16B | DType::Float32)
@@ -2056,7 +2611,6 @@ fn execute_matmul(
             lhs.buffer_type, rhs.buffer_type
         )));
     }
-    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
     let output_dram = kernels::matmul::matmul_bf16_dot_general(
         device,
         lhs_dram,
@@ -2095,29 +2649,488 @@ fn reduce_init_is_supported(
     plan: &executable::Executable,
     init_value_id: u32,
     reducer: executable::ReduceReducer,
+    element_type: PJRT_Buffer_Type,
 ) -> bool {
     if let Some(packed_value) = constant_packed_value(plan, init_value_id) {
         return match reducer {
-            executable::ReduceReducer::Add => packed_value == 0,
-            executable::ReduceReducer::Max => packed_value == f32::NEG_INFINITY.to_bits(),
+            executable::ReduceReducer::Add
+            | executable::ReduceReducer::Max
+            | executable::ReduceReducer::Min => {
+                arithmetic_reduce_identity_from_packed(reducer, element_type, packed_value)
+                    .is_some()
+            }
+            executable::ReduceReducer::And => {
+                bitwise_identity_from_packed(reducer, element_type, packed_value).is_some()
+            }
+            executable::ReduceReducer::Or => packed_value == 0,
             executable::ReduceReducer::Mul => false,
         };
     }
     true
 }
 
+fn arithmetic_reduce_identity_from_packed(
+    reducer: executable::ReduceReducer,
+    element_type: PJRT_Buffer_Type,
+    packed_value: u32,
+) -> Option<u32> {
+    match reducer {
+        executable::ReduceReducer::Add if packed_value == 0 => Some(0),
+        executable::ReduceReducer::Max => match element_type {
+            PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+                if packed_value == f32::NEG_INFINITY.to_bits() =>
+            {
+                Some(packed_value)
+            }
+            PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 if packed_value & 0xffff == 0xff80 => {
+                Some(0xff80)
+            }
+            PJRT_Buffer_Type::PJRT_Buffer_Type_S32 if packed_value == i32::MIN as u32 => {
+                Some(packed_value)
+            }
+            PJRT_Buffer_Type::PJRT_Buffer_Type_U32 if packed_value == 0 => Some(0),
+            PJRT_Buffer_Type::PJRT_Buffer_Type_U16 if packed_value & 0xffff == 0 => Some(0),
+            PJRT_Buffer_Type::PJRT_Buffer_Type_U8 | PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
+                if packed_value & 0xff == 0 =>
+            {
+                Some(0)
+            }
+            _ => None,
+        },
+        executable::ReduceReducer::Min => match element_type {
+            PJRT_Buffer_Type::PJRT_Buffer_Type_F32 if packed_value == f32::INFINITY.to_bits() => {
+                Some(packed_value)
+            }
+            PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 if packed_value & 0xffff == 0x7f80 => {
+                Some(0x7f80)
+            }
+            PJRT_Buffer_Type::PJRT_Buffer_Type_S32 if packed_value == i32::MAX as u32 => {
+                Some(packed_value)
+            }
+            PJRT_Buffer_Type::PJRT_Buffer_Type_U32 if packed_value == u32::MAX => {
+                Some(packed_value)
+            }
+            PJRT_Buffer_Type::PJRT_Buffer_Type_U16 if packed_value & 0xffff == 0xffff => {
+                Some(0xffff)
+            }
+            PJRT_Buffer_Type::PJRT_Buffer_Type_U8 | PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
+                if packed_value & 0xff == 0xff =>
+            {
+                Some(0xff)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn bitwise_reduce_identity(
+    plan: &executable::Executable,
+    init_value_id: u32,
+    reducer: executable::ReduceReducer,
+    element_type: PJRT_Buffer_Type,
+) -> Option<u32> {
+    let packed_value = constant_packed_value(plan, init_value_id)?;
+    bitwise_identity_from_packed(reducer, element_type, packed_value)
+}
+
+fn bitwise_identity_from_packed(
+    reducer: executable::ReduceReducer,
+    element_type: PJRT_Buffer_Type,
+    packed_value: u32,
+) -> Option<u32> {
+    match reducer {
+        executable::ReduceReducer::Or if packed_value == 0 => Some(0),
+        executable::ReduceReducer::And => match element_type {
+            PJRT_Buffer_Type::PJRT_Buffer_Type_PRED if packed_value == 1 => Some(1),
+            PJRT_Buffer_Type::PJRT_Buffer_Type_U8 if packed_value & 0xff == 0xff => Some(0xff),
+            PJRT_Buffer_Type::PJRT_Buffer_Type_U16 if packed_value & 0xffff == 0xffff => {
+                Some(0xffff)
+            }
+            PJRT_Buffer_Type::PJRT_Buffer_Type_S32
+            | PJRT_Buffer_Type::PJRT_Buffer_Type_U32
+                if packed_value == u32::MAX =>
+            {
+                Some(u32::MAX)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option<u32> {
     plan.ops.iter().find_map(|op| {
         if let executable::Op::Constant {
             packed_value,
+            data,
             output_id,
         } = op
         {
-            (*output_id == value_id).then_some(*packed_value)
+            (*output_id == value_id && data.is_empty()).then_some(*packed_value)
         } else {
             None
         }
     })
+}
+
+#[derive(Clone, Copy)]
+enum ConstantScalar {
+    F32(f32),
+    I32(i32),
+    U32(u32),
+    Bool(bool),
+}
+
+fn fused_constant_packed_value(
+    nodes: &[executable::FusedElementwiseNode],
+    output_type: PJRT_Buffer_Type,
+) -> Option<u32> {
+    let mut values = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let value = match node.kind {
+            executable::FusedElementwiseKind::Input => return None,
+            executable::FusedElementwiseKind::Constant => {
+                scalar_from_packed(node.element_type, node.packed_value)?
+            }
+            executable::FusedElementwiseKind::Add => {
+                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
+                scalar_add(*lhs, *rhs, node.element_type)?
+            }
+            executable::FusedElementwiseKind::Subtract => {
+                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
+                scalar_subtract(*lhs, *rhs, node.element_type)?
+            }
+            executable::FusedElementwiseKind::Multiply => {
+                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
+                scalar_multiply(*lhs, *rhs, node.element_type)?
+            }
+            executable::FusedElementwiseKind::Divide => {
+                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
+                ConstantScalar::F32(lhs.as_f32()? / rhs.as_f32()?)
+            }
+            executable::FusedElementwiseKind::Power => {
+                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
+                ConstantScalar::F32(lhs.as_f32()?.powf(rhs.as_f32()?))
+            }
+            executable::FusedElementwiseKind::Max => {
+                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
+                ConstantScalar::F32(lhs.as_f32()?.max(rhs.as_f32()?))
+            }
+            executable::FusedElementwiseKind::Compare(direction) => {
+                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
+                ConstantScalar::Bool(scalar_compare(*lhs, *rhs, direction)?)
+            }
+            executable::FusedElementwiseKind::Negate => {
+                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
+                match input {
+                    ConstantScalar::F32(value) => ConstantScalar::F32(-value),
+                    ConstantScalar::I32(value) => ConstantScalar::I32(value.wrapping_neg()),
+                    _ => return None,
+                }
+            }
+            executable::FusedElementwiseKind::Exponential => {
+                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
+                ConstantScalar::F32(input.as_f32()?.exp())
+            }
+            executable::FusedElementwiseKind::Log => {
+                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
+                ConstantScalar::F32(input.as_f32()?.ln())
+            }
+            executable::FusedElementwiseKind::Rsqrt => {
+                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
+                ConstantScalar::F32(1.0 / input.as_f32()?.sqrt())
+            }
+            executable::FusedElementwiseKind::Cosine => {
+                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
+                ConstantScalar::F32(input.as_f32()?.cos())
+            }
+            executable::FusedElementwiseKind::Sine => {
+                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
+                ConstantScalar::F32(input.as_f32()?.sin())
+            }
+            executable::FusedElementwiseKind::Convert => {
+                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
+                scalar_convert(*input, node.element_type)?
+            }
+        };
+        values.push(value);
+    }
+    scalar_to_packed(*values.last()?, output_type)
+}
+
+fn fold_fused_constant_nodes(
+    nodes: &[executable::FusedElementwiseNode],
+) -> Vec<executable::FusedElementwiseNode> {
+    let mut folded = nodes.to_vec();
+    let mut values = Vec::<Option<ConstantScalar>>::with_capacity(nodes.len());
+    for index in 0..folded.len() {
+        let value = fused_constant_node_value(&folded[index], &values);
+        if let Some(value) = value {
+            if let Some(packed_value) = scalar_to_packed(value, folded[index].element_type) {
+                folded[index].kind = executable::FusedElementwiseKind::Constant;
+                folded[index].input_nodes.clear();
+                folded[index].input_index = 0;
+                folded[index].packed_value = packed_value;
+                folded[index].single_tile_broadcast = false;
+            }
+        }
+        values.push(value);
+    }
+    folded
+}
+
+fn fused_constant_node_value(
+    node: &executable::FusedElementwiseNode,
+    values: &[Option<ConstantScalar>],
+) -> Option<ConstantScalar> {
+    Some(match node.kind {
+        executable::FusedElementwiseKind::Input => return None,
+        executable::FusedElementwiseKind::Constant => {
+            scalar_from_packed(node.element_type, node.packed_value)?
+        }
+        executable::FusedElementwiseKind::Add => {
+            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            scalar_add(lhs, rhs, node.element_type)?
+        }
+        executable::FusedElementwiseKind::Subtract => {
+            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            scalar_subtract(lhs, rhs, node.element_type)?
+        }
+        executable::FusedElementwiseKind::Multiply => {
+            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            scalar_multiply(lhs, rhs, node.element_type)?
+        }
+        executable::FusedElementwiseKind::Divide => {
+            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            ConstantScalar::F32(lhs.as_f32()? / rhs.as_f32()?)
+        }
+        executable::FusedElementwiseKind::Power => {
+            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            ConstantScalar::F32(lhs.as_f32()?.powf(rhs.as_f32()?))
+        }
+        executable::FusedElementwiseKind::Max => {
+            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            ConstantScalar::F32(lhs.as_f32()?.max(rhs.as_f32()?))
+        }
+        executable::FusedElementwiseKind::Compare(direction) => {
+            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            ConstantScalar::Bool(scalar_compare(lhs, rhs, direction)?)
+        }
+        executable::FusedElementwiseKind::Negate => {
+            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            match input {
+                ConstantScalar::F32(value) => ConstantScalar::F32(-value),
+                ConstantScalar::I32(value) => ConstantScalar::I32(value.wrapping_neg()),
+                _ => return None,
+            }
+        }
+        executable::FusedElementwiseKind::Exponential => {
+            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            ConstantScalar::F32(input.as_f32()?.exp())
+        }
+        executable::FusedElementwiseKind::Log => {
+            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            ConstantScalar::F32(input.as_f32()?.ln())
+        }
+        executable::FusedElementwiseKind::Rsqrt => {
+            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            ConstantScalar::F32(1.0 / input.as_f32()?.sqrt())
+        }
+        executable::FusedElementwiseKind::Cosine => {
+            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            ConstantScalar::F32(input.as_f32()?.cos())
+        }
+        executable::FusedElementwiseKind::Sine => {
+            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            ConstantScalar::F32(input.as_f32()?.sin())
+        }
+        executable::FusedElementwiseKind::Convert => {
+            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            scalar_convert(input, node.element_type)?
+        }
+    })
+}
+
+impl ConstantScalar {
+    fn as_f32(self) -> Option<f32> {
+        match self {
+            Self::F32(value) => Some(value),
+            Self::I32(value) => Some(value as f32),
+            Self::U32(value) => Some(value as f32),
+            Self::Bool(value) => Some(u32::from(value) as f32),
+        }
+    }
+
+    fn as_i32(self) -> Option<i32> {
+        match self {
+            Self::I32(value) => Some(value),
+            Self::U32(value) => Some(value as i32),
+            Self::Bool(value) => Some(i32::from(value)),
+            Self::F32(value) => Some(value as i32),
+        }
+    }
+
+    fn as_u32(self) -> Option<u32> {
+        match self {
+            Self::U32(value) => Some(value),
+            Self::I32(value) => Some(value as u32),
+            Self::Bool(value) => Some(u32::from(value)),
+            Self::F32(value) => Some(value as u32),
+        }
+    }
+}
+
+fn fused_constant_inputs<'a, const N: usize>(
+    values: &'a [ConstantScalar],
+    input_nodes: &[u32],
+) -> Option<[&'a ConstantScalar; N]> {
+    let inputs: Vec<&ConstantScalar> = input_nodes
+        .iter()
+        .map(|&index| values.get(index as usize))
+        .collect::<Option<Vec<_>>>()?;
+    inputs.try_into().ok()
+}
+
+fn folded_constant_inputs<const N: usize>(
+    values: &[Option<ConstantScalar>],
+    input_nodes: &[u32],
+) -> Option<[ConstantScalar; N]> {
+    let inputs: Vec<ConstantScalar> = input_nodes
+        .iter()
+        .map(|&index| values.get(index as usize).copied().flatten())
+        .collect::<Option<Vec<_>>>()?;
+    inputs.try_into().ok()
+}
+
+fn scalar_from_packed(element_type: PJRT_Buffer_Type, packed: u32) -> Option<ConstantScalar> {
+    match element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 => Some(ConstantScalar::F32(f32::from_bits(packed))),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
+            Some(ConstantScalar::F32(f32::from_bits((packed & 0xffff) << 16)))
+        }
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(packed as i32)),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => Some(ConstantScalar::U32(packed)),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Some(ConstantScalar::U32(packed & 0xffff)),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 | PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => {
+            Some(ConstantScalar::Bool((packed & 0xff) != 0))
+        }
+        _ => None,
+    }
+}
+
+fn scalar_to_packed(value: ConstantScalar, element_type: PJRT_Buffer_Type) -> Option<u32> {
+    match element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 => Some(value.as_f32()?.to_bits()),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
+            let bits = value.as_f32()?.to_bits() >> 16;
+            Some(bits | (bits << 16))
+        }
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(value.as_i32()? as u32),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => Some(value.as_u32()?),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => {
+            let bits = value.as_u32()? & 0xffff;
+            Some(bits | (bits << 16))
+        }
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 | PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => {
+            Some(u32::from(value.as_u32()? != 0))
+        }
+        _ => None,
+    }
+}
+
+fn scalar_add(
+    lhs: ConstantScalar,
+    rhs: ConstantScalar,
+    element_type: PJRT_Buffer_Type,
+) -> Option<ConstantScalar> {
+    match element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 | PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
+            Some(ConstantScalar::F32(lhs.as_f32()? + rhs.as_f32()?))
+        }
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(
+            lhs.as_i32()?.wrapping_add(rhs.as_i32()?),
+        )),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => {
+            Some(ConstantScalar::U32(
+                lhs.as_u32()?.wrapping_add(rhs.as_u32()?),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn scalar_subtract(
+    lhs: ConstantScalar,
+    rhs: ConstantScalar,
+    element_type: PJRT_Buffer_Type,
+) -> Option<ConstantScalar> {
+    match element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 | PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
+            Some(ConstantScalar::F32(lhs.as_f32()? - rhs.as_f32()?))
+        }
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(
+            lhs.as_i32()?.wrapping_sub(rhs.as_i32()?),
+        )),
+        _ => None,
+    }
+}
+
+fn scalar_multiply(
+    lhs: ConstantScalar,
+    rhs: ConstantScalar,
+    element_type: PJRT_Buffer_Type,
+) -> Option<ConstantScalar> {
+    match element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 | PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
+            Some(ConstantScalar::F32(lhs.as_f32()? * rhs.as_f32()?))
+        }
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(
+            lhs.as_i32()?.wrapping_mul(rhs.as_i32()?),
+        )),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => {
+            Some(ConstantScalar::U32(
+                lhs.as_u32()?.wrapping_mul(rhs.as_u32()?),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn scalar_compare(
+    lhs: ConstantScalar,
+    rhs: ConstantScalar,
+    direction: executable::CompareDirection,
+) -> Option<bool> {
+    let lhs = lhs.as_f32()?;
+    let rhs = rhs.as_f32()?;
+    Some(match direction {
+        executable::CompareDirection::Eq => lhs == rhs,
+        executable::CompareDirection::Ne => lhs != rhs,
+        executable::CompareDirection::Ge => lhs >= rhs,
+        executable::CompareDirection::Gt => lhs > rhs,
+        executable::CompareDirection::Le => lhs <= rhs,
+        executable::CompareDirection::Lt => lhs < rhs,
+    })
+}
+
+fn scalar_convert(
+    value: ConstantScalar,
+    element_type: PJRT_Buffer_Type,
+) -> Option<ConstantScalar> {
+    match element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 | PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
+            Some(ConstantScalar::F32(value.as_f32()?))
+        }
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(value.as_i32()?)),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => {
+            Some(ConstantScalar::U32(value.as_u32()?))
+        }
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 | PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => {
+            Some(ConstantScalar::Bool(value.as_u32()? != 0))
+        }
+        _ => None,
+    }
 }
 
 fn execute_identity_custom_call(
@@ -2208,9 +3221,17 @@ fn execute_select(
         )));
     }
     let value_dtype = pjrt_buffer_type_to_dtype(true_desc.element_type)?;
-    if !matches!(value_dtype, DType::Float16B | DType::Float32 | DType::Int32) {
+    if !matches!(
+        value_dtype,
+        DType::Float16B
+            | DType::Float32
+            | DType::Int32
+            | DType::UInt32
+            | DType::UInt16
+            | DType::UInt8
+    ) {
         return Err(unimplemented(format!(
-            "TT executable select currently supports bf16, f32, and s32 values, got {:?}",
+            "TT executable select currently supports bf16, f32, s32, and unsigned integer values, got {:?}",
             true_desc.element_type
         )));
     }
@@ -2267,6 +3288,22 @@ fn execute_broadcast_in_dim(
     }
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let is_noop_broadcast = input_shape == output_shape
+        && broadcast_dimensions.len() == input_shape.len()
+        && broadcast_dimensions
+            .iter()
+            .enumerate()
+            .all(|(dim, &broadcast_dim)| usize::try_from(broadcast_dim).ok() == Some(dim));
+    if is_noop_broadcast {
+        return alias_output_buffer(
+            values,
+            plan,
+            input_id,
+            output_id,
+            context,
+            "broadcast_in_dim",
+        );
+    }
     let broadcast_plan = kernels::broadcast::BroadcastInDimPlan::new(
         &input_shape,
         &output_shape,
@@ -2388,18 +3425,6 @@ fn execute_gather(
     dimension_numbers: &executable::GatherDimensionNumbers,
     slice_sizes: &[i64],
 ) -> Result<(), *mut PJRT_Error> {
-    if dimension_numbers.offset_dims.as_slice() != [1]
-        || dimension_numbers.collapsed_slice_dims.as_slice() != [0]
-        || !dimension_numbers.operand_batching_dims.is_empty()
-        || !dimension_numbers.start_indices_batching_dims.is_empty()
-        || dimension_numbers.start_index_map.as_slice() != [0]
-        || dimension_numbers.index_vector_dim != 1
-    {
-        return Err(unimplemented(
-            "TT executable gather currently only supports rank-2 row gathers",
-        ));
-    }
-
     let operand = device_buffer_for_value(values, input_ids[0], "gather.operand")?.clone();
     let start_indices =
         device_buffer_for_value(values, input_ids[1], "gather.start_indices")?.clone();
@@ -2408,28 +3433,9 @@ fn execute_gather(
             "TT executable gather currently only supports s32 start_indices",
         ));
     }
-    if operand.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
-        return Err(unimplemented(
-            "TT executable gather currently only supports bf16 operands",
-        ));
-    }
 
     let operand_shape = dims_i64_to_usize(&operand.dims)?;
     let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
-    if operand_shape.len() != 2 {
-        return Err(unimplemented(
-            "TT executable gather currently only supports rank-2 operands",
-        ));
-    }
-    if slice_sizes.len() != 2
-        || slice_sizes[0] != 1
-        || usize::try_from(slice_sizes[1]).ok() != Some(operand_shape[1])
-    {
-        return Err(unimplemented(
-            "TT executable gather currently only supports slice_sizes [1, operand_width]",
-        ));
-    }
-
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
             "TT executable gather output id {output_id} is out of bounds"
@@ -2442,18 +3448,6 @@ fn execute_gather(
         )));
     }
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let expected_output_shape = if start_indices_shape.len() == 2 {
-        vec![start_indices_shape[0], operand_shape[1]]
-    } else {
-        Vec::new()
-    };
-    if output_shape != expected_output_shape {
-        return Err(invalid_argument(format!(
-            "TT executable gather output shape mismatch: expected {:?}, got {:?}",
-            expected_output_shape, output_shape
-        )));
-    }
-
     let Some(operand_dram) = operand.dram_buffer.as_ref() else {
         return Err(failed_precondition(
             "TT executable gather operand buffer has no device allocation",
@@ -2465,15 +3459,118 @@ fn execute_gather(
         ));
     };
 
-    let output_dram = kernels::gather::gather_bf16_rows(
-        device,
-        operand_dram,
-        start_indices_dram,
-        &operand_shape,
-        &start_indices_shape,
-        &output_shape,
-        "pjrt_gather",
-    )
+    let rank = operand_shape.len();
+    if rank == 0 {
+        return Err(unimplemented(
+            "TT executable gather currently requires operand rank >= 1",
+        ));
+    }
+    let Some(&axis_i64) = dimension_numbers.start_index_map.first() else {
+        return Err(unimplemented(
+            "TT executable gather currently requires one start_index_map entry",
+        ));
+    };
+    if dimension_numbers.start_index_map.len() != 1 {
+        return Err(unimplemented(format!(
+            "TT executable gather currently requires one start_index_map entry, got {:?}",
+            dimension_numbers.start_index_map
+        )));
+    }
+    let axis = usize::try_from(axis_i64).map_err(|_| {
+        unimplemented(format!(
+            "TT executable gather axis must be non-negative, got {axis_i64}"
+        ))
+    })?;
+    if axis >= rank {
+        return Err(invalid_argument(format!(
+            "TT executable gather axis {axis} is out of bounds for operand shape {:?}",
+            operand_shape
+        )));
+    }
+    let expected_offset_dims = (0..rank as i64)
+        .filter(|&dim| dim != axis_i64)
+        .collect::<Vec<_>>();
+    let expected_collapsed_slice_dims = [axis_i64];
+    let is_single_axis_slice_gather =
+        dimension_numbers.offset_dims.as_slice() == expected_offset_dims.as_slice()
+        && dimension_numbers.collapsed_slice_dims.as_slice()
+            == expected_collapsed_slice_dims.as_slice()
+        && dimension_numbers.operand_batching_dims.is_empty()
+        && dimension_numbers.start_indices_batching_dims.is_empty()
+        && dimension_numbers.index_vector_dim == 1;
+    if !is_single_axis_slice_gather {
+        return Err(unimplemented(format!(
+            "TT executable gather currently only supports single-axis slice gathers; expected offset_dims={expected_offset_dims:?}, collapsed_slice_dims={expected_collapsed_slice_dims:?}; got offset_dims={:?}, collapsed_slice_dims={:?}, start_index_map={:?}, index_vector_dim={}",
+            dimension_numbers.offset_dims,
+            dimension_numbers.collapsed_slice_dims,
+            dimension_numbers.start_index_map,
+            dimension_numbers.index_vector_dim
+        )));
+    }
+    if slice_sizes.len() != rank
+        || !slice_sizes.iter().enumerate().all(|(dim, &slice)| {
+            if dim == axis {
+                slice == 1
+            } else {
+                usize::try_from(slice).ok() == Some(operand_shape[dim])
+            }
+        })
+    {
+        return Err(unimplemented(format!(
+            "TT executable gather currently only supports slice_sizes with 1 at gathered axis and full slices elsewhere; got {slice_sizes:?} for operand shape {operand_shape:?}, axis {axis}"
+        )));
+    }
+    let mut expected_output_shape = operand_shape.clone();
+    if start_indices_shape.len() == 2 {
+        expected_output_shape[axis] = start_indices_shape[0];
+    }
+    if output_shape != expected_output_shape {
+        return Err(invalid_argument(format!(
+            "TT executable gather output shape mismatch: expected {:?}, got {:?}",
+            expected_output_shape, output_shape
+        )));
+    }
+
+    let output_dram = if axis == 0
+        && rank == 1
+        && operand.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_S32
+    {
+        kernels::gather::gather_s32_rank1(
+            device,
+            operand_dram,
+            start_indices_dram,
+            &operand_shape,
+            &start_indices_shape,
+            &output_shape,
+            "pjrt_gather_rank1",
+        )
+    } else if axis == 0
+        && rank == 2
+        && operand.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+    {
+        kernels::gather::gather_bf16_rows(
+            device,
+            operand_dram,
+            start_indices_dram,
+            &operand_shape,
+            &start_indices_shape,
+            &output_shape,
+            "pjrt_gather",
+        )
+    } else {
+        let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
+        kernels::gather::gather_dim0_slices(
+            device,
+            operand_dram,
+            start_indices_dram,
+            &operand_shape,
+            &start_indices_shape,
+            &output_shape,
+            axis,
+            dtype,
+            "pjrt_gather_axis",
+        )
+    }
     .map_err(io_error)?;
     store_output_buffer(
         values,
@@ -2483,6 +3580,185 @@ fn execute_gather(
         output_dram,
         context,
         "gather",
+    )
+}
+
+fn execute_scatter(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: [u32; 3],
+    output_id: u32,
+    dimension_numbers: &executable::ScatterDimensionNumbers,
+) -> Result<(), *mut PJRT_Error> {
+    let operand = device_buffer_for_value(values, input_ids[0], "scatter.operand")?.clone();
+    let start_indices =
+        device_buffer_for_value(values, input_ids[1], "scatter.start_indices")?.clone();
+    let updates = device_buffer_for_value(values, input_ids[2], "scatter.updates")?.clone();
+    if start_indices.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
+        return Err(unimplemented(
+            "TT executable scatter currently only supports s32 start_indices",
+        ));
+    }
+    if updates.buffer_type != operand.buffer_type {
+        return Err(invalid_argument(format!(
+            "TT executable scatter updates must be {:?}, got {:?}",
+            operand.buffer_type, updates.buffer_type
+        )));
+    }
+
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable scatter output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != operand.buffer_type {
+        return Err(invalid_argument(format!(
+            "TT executable scatter output must be {:?}, got {:?}",
+            operand.buffer_type, output_desc.element_type
+        )));
+    }
+
+    let operand_shape = dims_i64_to_usize(&operand.dims)?;
+    let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
+    let update_shape = dims_i64_to_usize(&updates.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    if output_shape != operand_shape {
+        return Err(invalid_argument(format!(
+            "TT executable scatter output shape mismatch: expected {:?}, got {:?}",
+            operand_shape, output_shape
+        )));
+    }
+    let full_window_dims = (0..operand_shape.len() as i64).collect::<Vec<_>>();
+    let is_full_window_set = dimension_numbers.update_window_dims == full_window_dims
+        && dimension_numbers.inserted_window_dims.is_empty()
+        && dimension_numbers.input_batching_dims.is_empty()
+        && dimension_numbers.scatter_indices_batching_dims.is_empty()
+        && update_shape == operand_shape;
+    if is_full_window_set {
+        let mut output = updates;
+        output.dims = output_desc.dims.clone();
+        values[output_id as usize] = Some(output);
+        return Ok(());
+    }
+    kernels::scatter::validate_dim0_set_dimension_numbers(
+        operand_shape.len(),
+        &dimension_numbers.update_window_dims,
+        &dimension_numbers.inserted_window_dims,
+        &dimension_numbers.input_batching_dims,
+        &dimension_numbers.scatter_indices_batching_dims,
+        &dimension_numbers.scatter_dims_to_operand_dims,
+        dimension_numbers.index_vector_dim,
+    )
+    .map_err(|err| unimplemented(err.to_string()))?;
+
+    let Some(operand_dram) = operand.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable scatter operand buffer has no device allocation",
+        ));
+    };
+    let Some(start_indices_dram) = start_indices.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable scatter start_indices buffer has no device allocation",
+        ));
+    };
+    let Some(updates_dram) = updates.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable scatter updates buffer has no device allocation",
+        ));
+    };
+
+    let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
+    let output_dram = kernels::scatter::scatter_dim0_set(
+        device,
+        operand_dram,
+        start_indices_dram,
+        updates_dram,
+        &operand_shape,
+        &start_indices_shape,
+        &update_shape,
+        dtype,
+        "pjrt_scatter",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "scatter",
+    )
+}
+
+fn execute_bitwise_binary(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: [u32; 2],
+    output_id: u32,
+    kind: executable::BitwiseBinaryKind,
+) -> Result<(), *mut PJRT_Error> {
+    let lhs = device_buffer_for_value(values, input_ids[0], "bitwise.lhs")?.clone();
+    let rhs = device_buffer_for_value(values, input_ids[1], "bitwise.rhs")?.clone();
+    if lhs.buffer_type != rhs.buffer_type {
+        return Err(invalid_argument(format!(
+            "TT executable bitwise input element types must match, got {:?} and {:?}",
+            lhs.buffer_type, rhs.buffer_type
+        )));
+    }
+    if lhs.dims != rhs.dims {
+        return Err(invalid_argument(format!(
+            "TT executable bitwise input shapes must match, got {:?} and {:?}",
+            lhs.dims, rhs.dims
+        )));
+    }
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable bitwise output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != lhs.buffer_type || output_desc.dims != lhs.dims {
+        return Err(invalid_argument(format!(
+            "TT executable bitwise output must be {:?} {:?}, got {:?} {:?}",
+            lhs.buffer_type, lhs.dims, output_desc.element_type, output_desc.dims
+        )));
+    }
+
+    let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable bitwise lhs buffer has no device allocation",
+        ));
+    };
+    let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable bitwise rhs buffer has no device allocation",
+        ));
+    };
+
+    let shape = dims_i64_to_usize(&lhs.dims)?;
+    let dtype = pjrt_buffer_type_to_dtype(lhs.buffer_type)?;
+    let output_dram = kernels::bitwise::bitwise_binary(
+        device,
+        lhs_dram,
+        rhs_dram,
+        &shape,
+        dtype,
+        kind,
+        "pjrt_bitwise",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "bitwise",
     )
 }
 
@@ -2566,7 +3842,9 @@ fn execute_executable_v1(
                         "TT executable parameter output id {output_id} is out of bounds"
                     ))
                 })?;
-                if input.buffer_type != expected.element_type {
+                let input_dtype = pjrt_buffer_type_to_dtype(input.buffer_type)?;
+                let expected_dtype = pjrt_buffer_type_to_dtype(expected.element_type)?;
+                if input_dtype != expected_dtype {
                     return Err(unimplemented(format!(
                         "TT executable parameter {parameter_index} expected {:?}, got {:?}",
                         expected.element_type, input.buffer_type
@@ -2578,7 +3856,9 @@ fn execute_executable_v1(
                         expected.dims, input.dims
                     )));
                 }
-                values[output_index] = Some(input.clone());
+                let mut parameter = input.clone();
+                parameter.buffer_type = expected.element_type;
+                values[output_index] = Some(parameter);
             }
             executable::Op::Concatenate {
                 input_ids,
@@ -2621,6 +3901,17 @@ fn execute_executable_v1(
                 limit_indices,
                 strides,
             )?,
+            executable::Op::DynamicUpdateSlice {
+                input_ids,
+                output_id,
+            } => execute_dynamic_update_slice(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_ids,
+                *output_id,
+            )?,
             executable::Op::Transpose {
                 input_id,
                 output_id,
@@ -2634,15 +3925,34 @@ fn execute_executable_v1(
                 *output_id,
                 permutation,
             )?,
+            executable::Op::Pad {
+                input_id,
+                padding_value_id,
+                output_id,
+                edge_padding_low,
+                edge_padding_high,
+                interior_padding,
+            } => execute_pad(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_id,
+                *padding_value_id,
+                *output_id,
+                edge_padding_low,
+                edge_padding_high,
+                interior_padding,
+            )?,
             executable::Op::CustomCall {
                 input_ids,
                 output_id,
                 call_target_name,
                 ..
-            } if call_target_name == "annotate_device_placement" => {
+            } if call_target_name == "annotate_device_placement" || call_target_name == "Sharding" => {
                 let [input_id] = input_ids.as_slice() else {
                     return Err(invalid_argument(format!(
-                        "TT executable custom_call \"annotate_device_placement\" expected one input, got {}",
+                        "TT executable custom_call {call_target_name:?} expected one input, got {}",
                         input_ids.len()
                     )));
                 };
@@ -2678,6 +3988,23 @@ fn execute_executable_v1(
                 dimensions,
                 *reducer,
             )?,
+            executable::Op::ReduceWindow {
+                input_ids,
+                init_value_ids,
+                output_id,
+                attributes,
+                reducer,
+            } => execute_reduce_window(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_ids,
+                init_value_ids,
+                *output_id,
+                attributes,
+                *reducer,
+            )?,
             executable::Op::Matmul {
                 input_ids,
                 output_id,
@@ -2693,7 +4020,21 @@ fn execute_executable_v1(
                 dimension_numbers,
                 top_k_epilogue.as_ref(),
             )?,
-            executable::Op::Constant { .. } => {}
+            executable::Op::Constant {
+                packed_value,
+                data,
+                output_id,
+            } => {
+                execute_constant(
+                    &mut values,
+                    plan,
+                    device,
+                    &output_context,
+                    *packed_value,
+                    data,
+                    *output_id,
+                )?;
+            }
             executable::Op::Select {
                 input_ids,
                 output_id,
@@ -2737,6 +4078,33 @@ fn execute_executable_v1(
                 *output_id,
                 dimension_numbers,
                 slice_sizes,
+            )?,
+            executable::Op::Scatter {
+                input_ids,
+                output_id,
+                dimension_numbers,
+                ..
+            } => execute_scatter(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_ids,
+                *output_id,
+                dimension_numbers,
+            )?,
+            executable::Op::BitwiseBinary {
+                input_ids,
+                output_id,
+                kind,
+            } => execute_bitwise_binary(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_ids,
+                *output_id,
+                *kind,
             )?,
             executable::Op::Iota {
                 output_id,
@@ -3171,23 +4539,27 @@ pub unsafe extern "C" fn TT_Device_MemoryStats(
     if args.device.is_null() {
         return invalid_argument("device must not be null");
     }
-    args.bytes_in_use = 0;
-    args.peak_bytes_in_use = 0;
-    args.peak_bytes_in_use_is_set = false;
+    let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
+        return invalid_argument("device must not be null");
+    };
+    let stats = allocator_stats(device.runtime.local_hardware_id, device.runtime.active_dram_banks);
+    args.bytes_in_use = pjrt_i64(stats.bytes_in_use);
+    args.peak_bytes_in_use = args.bytes_in_use;
+    args.peak_bytes_in_use_is_set = true;
     args.num_allocs = 0;
     args.num_allocs_is_set = false;
     args.largest_alloc_size = 0;
     args.largest_alloc_size_is_set = false;
-    args.bytes_limit = 0;
-    args.bytes_limit_is_set = false;
-    args.bytes_reserved = 0;
-    args.bytes_reserved_is_set = false;
+    args.bytes_limit = pjrt_i64(stats.bytes_limit);
+    args.bytes_limit_is_set = true;
+    args.bytes_reserved = args.bytes_in_use;
+    args.bytes_reserved_is_set = true;
     args.peak_bytes_reserved = 0;
     args.peak_bytes_reserved_is_set = false;
-    args.bytes_reservable_limit = 0;
-    args.bytes_reservable_limit_is_set = false;
-    args.largest_free_block_bytes = 0;
-    args.largest_free_block_bytes_is_set = false;
+    args.bytes_reservable_limit = args.bytes_limit;
+    args.bytes_reservable_limit_is_set = true;
+    args.largest_free_block_bytes = pjrt_i64(stats.largest_free_block_bytes);
+    args.largest_free_block_bytes_is_set = true;
     args.pool_bytes = 0;
     args.pool_bytes_is_set = false;
     args.peak_pool_bytes = 0;
@@ -4492,6 +5864,7 @@ mod tests {
                 let executable::Op::Constant {
                     packed_value,
                     output_id,
+                    ..
                 } = &executable.ops[0]
                 else {
                     panic!("predicate splat constant should lower to Constant");
@@ -4864,6 +6237,36 @@ mod tests {
 
     #[cfg(libtt_mlir_frontend)]
     #[test]
+    fn pjrt_compile_elides_identity_custom_call() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %0 = stablehlo.custom_call @Sharding(%arg0) {
+      has_side_effect = false
+    } : (tensor<2x2xf32>) -> tensor<2x2xf32>
+    return %0 : tensor<2x2xf32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![0]);
+                assert_eq!(executable.values.len(), 1);
+                assert_eq!(executable.ops.len(), 1);
+                let executable::Op::Parameter {
+                    parameter_index,
+                    output_id,
+                } = &executable.ops[0]
+                else {
+                    panic!("identity custom_call should alias the parameter");
+                };
+                assert_eq!(*parameter_index, 0);
+                assert_eq!(*output_id, 0);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
     fn pjrt_compile_lowers_batched_dot_general() {
         with_compiled_mlir_executable(
             r#"module {
@@ -5042,6 +6445,7 @@ mod tests {
                 let executable::Op::Constant {
                     packed_value,
                     output_id,
+                    ..
                 } = &executable.ops[0]
                 else {
                     panic!("converted scalar constant should lower to Constant");

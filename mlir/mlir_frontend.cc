@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <cstdint>
 #include <algorithm>
 #include <limits>
 #include <optional>
@@ -22,6 +23,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -81,12 +83,648 @@ mlir::OwningOpRef<mlir::ModuleOp> parseModule(
         &context);
 }
 
-bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module) {
+bool isInitializerCallee(llvm::StringRef callee) {
+    return callee.starts_with("_normal") || callee.starts_with("_uniform");
+}
+
+void eraseInitializerCalleeBodies(mlir::ModuleOp module) {
+    module.walk([&](FuncOp func) {
+        if (isInitializerCallee(func.getName()) && !func.isExternal()) {
+            func.eraseBody();
+        }
+    });
+}
+
+std::optional<mlir::Value> createCaseIndexConstant(
+    mlir::OpBuilder& builder,
+    mlir::Location loc,
+    mlir::RankedTensorType index_type,
+    uint64_t value,
+    std::string& error) {
+    auto integer_type = mlir::dyn_cast<mlir::IntegerType>(index_type.getElementType());
+    if (!integer_type) {
+        error = "stablehlo.case index must have integer element type";
+        return std::nullopt;
+    }
+    if (index_type.getRank() != 0) {
+        error = "stablehlo.case index must be a scalar tensor";
+        return std::nullopt;
+    }
+
+    auto attr = mlir::DenseElementsAttr::get(
+        index_type,
+        llvm::APInt(integer_type.getWidth(), value, !integer_type.isUnsigned()));
+    return builder.create<mlir::stablehlo::ConstantOp>(loc, attr).getResult();
+}
+
+std::optional<mlir::Value> createCaseBranchPredicate(
+    mlir::OpBuilder& builder,
+    mlir::Location loc,
+    mlir::Value index,
+    uint64_t branch_index,
+    std::string& error) {
+    auto index_type = mlir::dyn_cast<mlir::RankedTensorType>(index.getType());
+    if (!index_type) {
+        error = "stablehlo.case index must be a ranked tensor";
+        return std::nullopt;
+    }
+    auto integer_type = mlir::dyn_cast<mlir::IntegerType>(index_type.getElementType());
+    if (!integer_type) {
+        error = "stablehlo.case index must have integer element type";
+        return std::nullopt;
+    }
+    auto constant = createCaseIndexConstant(
+        builder, loc, index_type, branch_index, error);
+    if (!constant) {
+        return std::nullopt;
+    }
+
+    auto pred_type = mlir::RankedTensorType::get(
+        index_type.getShape(),
+        builder.getI1Type());
+    auto compare_type = mlir::stablehlo::ComparisonTypeAttr::get(
+        builder.getContext(),
+        integer_type.isUnsigned() ? mlir::stablehlo::ComparisonType::UNSIGNED
+                                  : mlir::stablehlo::ComparisonType::SIGNED);
+    return builder.create<mlir::stablehlo::CompareOp>(
+        loc,
+        pred_type,
+        index,
+        *constant,
+        mlir::stablehlo::ComparisonDirection::EQ,
+        compare_type).getResult();
+}
+
+std::optional<mlir::Value> broadcastCasePredicateToResult(
+    mlir::OpBuilder& builder,
+    mlir::Location loc,
+    mlir::Value predicate,
+    mlir::Type result_type,
+    std::string& error) {
+    auto pred_type = mlir::dyn_cast<mlir::RankedTensorType>(predicate.getType());
+    auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(result_type);
+    if (!pred_type || !tensor_type) {
+        error = "stablehlo.case select values must be ranked tensors";
+        return std::nullopt;
+    }
+    if (pred_type.getShape() == tensor_type.getShape()) {
+        return predicate;
+    }
+    if (pred_type.getRank() != 0) {
+        error = "stablehlo.case non-scalar predicates cannot be broadcast to branch result shapes";
+        return std::nullopt;
+    }
+
+    auto broadcast_type = mlir::RankedTensorType::get(
+        tensor_type.getShape(),
+        pred_type.getElementType());
+    return builder.create<mlir::stablehlo::BroadcastInDimOp>(
+        loc,
+        broadcast_type,
+        predicate,
+        llvm::ArrayRef<int64_t>{}).getResult();
+}
+
+bool cloneCaseBranch(
+    mlir::OpBuilder& builder,
+    mlir::stablehlo::CaseOp case_op,
+    mlir::Region& branch,
+    llvm::SmallVectorImpl<mlir::Value>& results,
+    std::string& error) {
+    if (branch.empty() || branch.getBlocks().size() != 1) {
+        error = "stablehlo.case branches must contain exactly one block";
+        return false;
+    }
+    mlir::Block& block = branch.front();
+    if (!block.getArguments().empty()) {
+        error = "stablehlo.case branch block arguments are not supported";
+        return false;
+    }
+
+    auto return_op = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
+    if (!return_op) {
+        error = "stablehlo.case branches must terminate with stablehlo.return";
+        return false;
+    }
+    if (return_op.getResults().size() != case_op->getNumResults()) {
+        error = "stablehlo.case branch result count does not match case result count";
+        return false;
+    }
+
+    mlir::IRMapping mapper;
+    for (mlir::Operation& op : block) {
+        if (&op == return_op.getOperation()) {
+            break;
+        }
+        builder.clone(op, mapper);
+    }
+
+    results.clear();
+    for (mlir::Value value : return_op.getResults()) {
+        results.push_back(mapper.lookupOrDefault(value));
+    }
+    return true;
+}
+
+std::optional<uint64_t> constantCaseIndex(mlir::Value index) {
+    auto constant_op = index.getDefiningOp<mlir::stablehlo::ConstantOp>();
+    if (!constant_op) {
+        return std::nullopt;
+    }
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
+    if (!dense || !dense.isSplat()) {
+        return std::nullopt;
+    }
+    auto integer_type = mlir::dyn_cast<mlir::IntegerType>(
+        mlir::cast<mlir::RankedTensorType>(index.getType()).getElementType());
+    if (!integer_type) {
+        return std::nullopt;
+    }
+    return dense.getSplatValue<llvm::APInt>().getLimitedValue();
+}
+
+std::optional<int64_t> constantScalarIntegerValue(mlir::Value value) {
+    auto constant_op = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
+    if (!constant_op) {
+        return std::nullopt;
+    }
+    auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    if (!tensor_type || tensor_type.getRank() != 0) {
+        return std::nullopt;
+    }
+    auto integer_type = mlir::dyn_cast<mlir::IntegerType>(tensor_type.getElementType());
+    if (!integer_type || integer_type.getWidth() > 63) {
+        return std::nullopt;
+    }
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
+    if (!dense || !dense.isSplat()) {
+        return std::nullopt;
+    }
+
+    llvm::APInt value_bits = dense.getSplatValue<llvm::APInt>();
+    if (integer_type.isUnsigned()) {
+        if (value_bits.getActiveBits() > 63) {
+            return std::nullopt;
+        }
+        return static_cast<int64_t>(value_bits.getZExtValue());
+    }
+    return value_bits.getSExtValue();
+}
+
+bool lowerSingleCaseOpToSelects(mlir::stablehlo::CaseOp case_op, std::string& error) {
+    auto branches = case_op.getBranches();
+    if (branches.empty()) {
+        error = "stablehlo.case must contain at least one branch";
+        return false;
+    }
+
+    mlir::OpBuilder builder(case_op);
+    if (auto constant_index = constantCaseIndex(case_op.getIndex())) {
+        uint64_t branch_index = *constant_index < branches.size()
+            ? *constant_index
+            : static_cast<uint64_t>(branches.size() - 1);
+        llvm::SmallVector<mlir::Value> results;
+        if (!cloneCaseBranch(
+                builder,
+                case_op,
+                branches[static_cast<size_t>(branch_index)],
+                results,
+                error)) {
+            return false;
+        }
+        case_op->replaceAllUsesWith(results);
+        case_op.erase();
+        return true;
+    }
+
+    llvm::SmallVector<llvm::SmallVector<mlir::Value>> branch_results;
+    branch_results.reserve(branches.size());
+    for (mlir::Region& branch : branches) {
+        llvm::SmallVector<mlir::Value> results;
+        if (!cloneCaseBranch(builder, case_op, branch, results, error)) {
+            return false;
+        }
+        branch_results.push_back(std::move(results));
+    }
+
+    llvm::SmallVector<mlir::Value> selected(branch_results.back().begin(), branch_results.back().end());
+    for (int64_t branch_index = static_cast<int64_t>(branch_results.size()) - 2;
+         branch_index >= 0;
+         --branch_index) {
+        auto predicate = createCaseBranchPredicate(
+            builder,
+            case_op.getLoc(),
+            case_op.getIndex(),
+            static_cast<uint64_t>(branch_index),
+            error);
+        if (!predicate) {
+            return false;
+        }
+
+        for (auto [result_index, selected_value] : llvm::enumerate(selected)) {
+            auto pred_for_result = broadcastCasePredicateToResult(
+                builder,
+                case_op.getLoc(),
+                *predicate,
+                case_op->getResult(result_index).getType(),
+                error);
+            if (!pred_for_result) {
+                return false;
+            }
+            selected[result_index] = builder.create<mlir::stablehlo::SelectOp>(
+                case_op.getLoc(),
+                case_op->getResult(result_index).getType(),
+                *pred_for_result,
+                branch_results[branch_index][result_index],
+                selected_value).getResult();
+        }
+    }
+
+    case_op->replaceAllUsesWith(selected);
+    case_op.erase();
+    return true;
+}
+
+std::optional<mlir::stablehlo::ComparisonDirection> invertComparisonDirection(
+    mlir::stablehlo::ComparisonDirection direction) {
+    switch (direction) {
+        case mlir::stablehlo::ComparisonDirection::LT:
+            return mlir::stablehlo::ComparisonDirection::GT;
+        case mlir::stablehlo::ComparisonDirection::LE:
+            return mlir::stablehlo::ComparisonDirection::GE;
+        case mlir::stablehlo::ComparisonDirection::GT:
+            return mlir::stablehlo::ComparisonDirection::LT;
+        case mlir::stablehlo::ComparisonDirection::GE:
+            return mlir::stablehlo::ComparisonDirection::LE;
+        default:
+            return std::nullopt;
+    }
+}
+
+std::optional<int64_t> computeStaticTripCount(
+    int64_t init,
+    int64_t bound,
+    int64_t step,
+    mlir::stablehlo::ComparisonDirection direction) {
+    if (step == 0) {
+        return std::nullopt;
+    }
+
+    auto ceilDivPositive = [](auto numerator, auto denominator) -> int64_t {
+        return static_cast<int64_t>((numerator + denominator - 1) / denominator);
+    };
+
+    if (step > 0) {
+        switch (direction) {
+            case mlir::stablehlo::ComparisonDirection::LT:
+                if (init >= bound) return 0;
+                return ceilDivPositive(
+                    static_cast<__int128>(bound) - init,
+                    static_cast<__int128>(step));
+            case mlir::stablehlo::ComparisonDirection::LE:
+                if (init > bound) return 0;
+                return static_cast<int64_t>(
+                    (static_cast<__int128>(bound) - init) / step + 1);
+            case mlir::stablehlo::ComparisonDirection::GT:
+            case mlir::stablehlo::ComparisonDirection::GE:
+                return 0;
+            default:
+                return std::nullopt;
+        }
+    }
+
+    int64_t step_abs = -step;
+    switch (direction) {
+        case mlir::stablehlo::ComparisonDirection::GT:
+            if (init <= bound) return 0;
+            return ceilDivPositive(
+                static_cast<__int128>(init) - bound,
+                static_cast<__int128>(step_abs));
+        case mlir::stablehlo::ComparisonDirection::GE:
+            if (init < bound) return 0;
+            return static_cast<int64_t>(
+                (static_cast<__int128>(init) - bound) / step_abs + 1);
+        case mlir::stablehlo::ComparisonDirection::LT:
+        case mlir::stablehlo::ComparisonDirection::LE:
+            return 0;
+        default:
+            return std::nullopt;
+    }
+}
+
+struct StaticWhilePlan {
+    int64_t trip_count;
+};
+
+std::optional<int64_t> loopCounterStep(
+    mlir::Value updated_value,
+    mlir::BlockArgument counter_argument) {
+    if (auto add_op = updated_value.getDefiningOp<mlir::stablehlo::AddOp>()) {
+        if (add_op.getLhs() == counter_argument) {
+            return constantScalarIntegerValue(add_op.getRhs());
+        }
+        if (add_op.getRhs() == counter_argument) {
+            return constantScalarIntegerValue(add_op.getLhs());
+        }
+    }
+
+    if (auto subtract_op = updated_value.getDefiningOp<mlir::stablehlo::SubtractOp>()) {
+        if (subtract_op.getLhs() == counter_argument) {
+            auto value = constantScalarIntegerValue(subtract_op.getRhs());
+            if (!value || *value == std::numeric_limits<int64_t>::min()) {
+                return std::nullopt;
+            }
+            return -*value;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<StaticWhilePlan> analyzeStaticWhile(
+    mlir::stablehlo::WhileOp while_op,
+    std::string& error) {
+    if (while_op.getCond().empty() || while_op.getCond().getBlocks().size() != 1 ||
+        while_op.getBody().empty() || while_op.getBody().getBlocks().size() != 1) {
+        error = "stablehlo.while regions must contain exactly one block";
+        return std::nullopt;
+    }
+
+    mlir::Block& cond_block = while_op.getCond().front();
+    mlir::Block& body_block = while_op.getBody().front();
+    if (cond_block.getNumArguments() != while_op->getNumOperands() ||
+        body_block.getNumArguments() != while_op->getNumOperands()) {
+        error = "stablehlo.while block argument count must match operand count";
+        return std::nullopt;
+    }
+
+    auto cond_return = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(cond_block.getTerminator());
+    auto body_return = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(body_block.getTerminator());
+    if (!cond_return || !body_return || cond_return.getResults().size() != 1 ||
+        body_return.getResults().size() != while_op->getNumResults()) {
+        error = "stablehlo.while must have stablehlo.return terminators with matching result counts";
+        return std::nullopt;
+    }
+
+    auto predicate_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        cond_return.getResults()[0].getType());
+    if (!predicate_type || predicate_type.getRank() != 0 ||
+        !predicate_type.getElementType().isInteger(1)) {
+        error = "stablehlo.while condition must return a scalar predicate";
+        return std::nullopt;
+    }
+
+    auto compare_op = cond_return.getResults()[0].getDefiningOp<mlir::stablehlo::CompareOp>();
+    if (!compare_op) {
+        error = "only statically bounded stablehlo.while compare conditions are supported";
+        return std::nullopt;
+    }
+
+    auto direction = compare_op.getComparisonDirection();
+    std::optional<size_t> counter_index;
+    std::optional<int64_t> bound;
+    if (auto lhs_argument = mlir::dyn_cast<mlir::BlockArgument>(compare_op.getLhs())) {
+        if (lhs_argument.getOwner() == &cond_block) {
+            counter_index = lhs_argument.getArgNumber();
+            bound = constantScalarIntegerValue(compare_op.getRhs());
+        }
+    }
+    if (!counter_index || !bound) {
+        if (auto rhs_argument = mlir::dyn_cast<mlir::BlockArgument>(compare_op.getRhs())) {
+            if (rhs_argument.getOwner() == &cond_block) {
+                auto inverted = invertComparisonDirection(direction);
+                if (!inverted) {
+                    error = "unsupported stablehlo.while comparison direction";
+                    return std::nullopt;
+                }
+                counter_index = rhs_argument.getArgNumber();
+                bound = constantScalarIntegerValue(compare_op.getLhs());
+                direction = *inverted;
+            }
+        }
+    }
+    if (!counter_index || !bound) {
+        error = "stablehlo.while condition must compare one loop counter against a scalar constant";
+        return std::nullopt;
+    }
+    if (*counter_index >= static_cast<size_t>(while_op->getNumOperands())) {
+        error = "stablehlo.while loop counter index is out of range";
+        return std::nullopt;
+    }
+
+    mlir::Value init_value = while_op->getOperand(*counter_index);
+    auto init = constantScalarIntegerValue(init_value);
+    if (!init) {
+        error = "stablehlo.while loop counter initial value must be a scalar constant";
+        return std::nullopt;
+    }
+
+    auto counter_arg = body_block.getArgument(*counter_index);
+    auto step = loopCounterStep(body_return.getResults()[*counter_index], counter_arg);
+    if (!step) {
+        error = "stablehlo.while loop counter update must be add/subtract by a scalar constant";
+        return std::nullopt;
+    }
+
+    auto trip_count = computeStaticTripCount(*init, *bound, *step, direction);
+    if (!trip_count) {
+        error = "stablehlo.while loop trip count is not statically bounded";
+        return std::nullopt;
+    }
+    if (*trip_count > 4096) {
+        error = "stablehlo.while static trip count is too large to unroll";
+        return std::nullopt;
+    }
+
+    return StaticWhilePlan{*trip_count};
+}
+
+bool lowerSingleStaticWhileOp(mlir::stablehlo::WhileOp while_op, std::string& error) {
+    auto plan = analyzeStaticWhile(while_op, error);
+    if (!plan) {
+        return false;
+    }
+
+    mlir::Block& body_block = while_op.getBody().front();
+    auto body_return = mlir::cast<mlir::stablehlo::ReturnOp>(body_block.getTerminator());
+
+    mlir::OpBuilder builder(while_op);
+    llvm::SmallVector<mlir::Value> carried(
+        while_op->getOperands().begin(),
+        while_op->getOperands().end());
+    for (int64_t iteration = 0; iteration < plan->trip_count; ++iteration) {
+        mlir::IRMapping mapper;
+        for (auto [index, argument] : llvm::enumerate(body_block.getArguments())) {
+            mapper.map(argument, carried[index]);
+        }
+
+        for (mlir::Operation& op : body_block) {
+            if (&op == body_return.getOperation()) {
+                break;
+            }
+            mlir::Operation* cloned = builder.clone(op, mapper);
+            builder.setInsertionPointAfter(cloned);
+        }
+
+        llvm::SmallVector<mlir::Value> next_carried;
+        next_carried.reserve(body_return.getResults().size());
+        for (mlir::Value result : body_return.getResults()) {
+            next_carried.push_back(mapper.lookupOrDefault(result));
+        }
+        carried = std::move(next_carried);
+    }
+
+    while_op->replaceAllUsesWith(carried);
+    while_op.erase();
+    return true;
+}
+
+bool lowerStaticWhileOps(mlir::ModuleOp module, std::string& error) {
+    while (true) {
+        mlir::Operation* next_while = nullptr;
+        auto walk_result = module.walk([&](mlir::stablehlo::WhileOp while_op) {
+            next_while = while_op.getOperation();
+            return mlir::WalkResult::interrupt();
+        });
+        if (!walk_result.wasInterrupted()) {
+            return true;
+        }
+        if (!lowerSingleStaticWhileOp(
+                mlir::cast<mlir::stablehlo::WhileOp>(next_while),
+                error)) {
+            return false;
+        }
+    }
+}
+
+std::optional<mlir::Value> createIntegerSplatConstant(
+    mlir::OpBuilder& builder,
+    mlir::Location loc,
+    mlir::RankedTensorType tensor_type,
+    uint64_t value,
+    std::string& error) {
+    auto integer_type = mlir::dyn_cast<mlir::IntegerType>(tensor_type.getElementType());
+    if (!integer_type) {
+        error = "predicate convert currently supports only integer result types";
+        return std::nullopt;
+    }
+    auto attr = mlir::DenseElementsAttr::get(
+        tensor_type,
+        llvm::APInt(integer_type.getWidth(), value, !integer_type.isUnsigned()));
+    return builder.create<mlir::stablehlo::ConstantOp>(loc, attr).getResult();
+}
+
+bool lowerSinglePredicateConvertToSelect(
+    mlir::stablehlo::ConvertOp convert_op,
+    std::string& error) {
+    auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        convert_op.getOperand().getType());
+    auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        convert_op.getResult().getType());
+    if (!input_type || !output_type) {
+        error = "predicate convert requires ranked tensor operands";
+        return false;
+    }
+    if (!input_type.getElementType().isInteger(1)) {
+        return true;
+    }
+    if (input_type.getShape() != output_type.getShape()) {
+        error = "predicate convert requires matching input and output shapes";
+        return false;
+    }
+
+    mlir::OpBuilder builder(convert_op);
+    auto one = createIntegerSplatConstant(
+        builder, convert_op.getLoc(), output_type, 1, error);
+    if (!one) {
+        return false;
+    }
+    auto zero = createIntegerSplatConstant(
+        builder, convert_op.getLoc(), output_type, 0, error);
+    if (!zero) {
+        return false;
+    }
+    auto select = builder.create<mlir::stablehlo::SelectOp>(
+        convert_op.getLoc(),
+        output_type,
+        convert_op.getOperand(),
+        *one,
+        *zero);
+    convert_op.getResult().replaceAllUsesWith(select.getResult());
+    convert_op.erase();
+    return true;
+}
+
+bool lowerPredicateConvertsToSelects(mlir::ModuleOp module, std::string& error) {
+    while (true) {
+        mlir::Operation* next_convert = nullptr;
+        auto walk_result = module.walk([&](mlir::stablehlo::ConvertOp convert_op) {
+            auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+                convert_op.getOperand().getType());
+            if (input_type && input_type.getElementType().isInteger(1)) {
+                next_convert = convert_op.getOperation();
+                return mlir::WalkResult::interrupt();
+            }
+            return mlir::WalkResult::advance();
+        });
+        if (!walk_result.wasInterrupted()) {
+            return true;
+        }
+        if (!lowerSinglePredicateConvertToSelect(
+                mlir::cast<mlir::stablehlo::ConvertOp>(next_convert),
+                error)) {
+            return false;
+        }
+    }
+}
+
+bool lowerCaseOpsToSelects(mlir::ModuleOp module, std::string& error) {
+    while (true) {
+        mlir::Operation* next_case = nullptr;
+        auto walk_result = module.walk([&](mlir::stablehlo::CaseOp case_op) {
+            next_case = case_op.getOperation();
+            return mlir::WalkResult::interrupt();
+        });
+        if (!walk_result.wasInterrupted()) {
+            return true;
+        }
+        if (!lowerSingleCaseOpToSelects(
+                mlir::cast<mlir::stablehlo::CaseOp>(next_case),
+                error)) {
+            return false;
+        }
+    }
+}
+
+bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module, std::string& error) {
+    eraseInitializerCalleeBodies(module);
     mlir::PassManager pm(&context);
     pm.addPass(mlir::createInlinerPass());
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(mlir::createCSEPass());
-    return mlir::succeeded(pm.run(module));
+    if (mlir::failed(pm.run(module))) {
+        error = "failed to run MLIR cleanup passes";
+        return false;
+    }
+    if (!lowerPredicateConvertsToSelects(module, error)) {
+        return false;
+    }
+    if (!lowerCaseOpsToSelects(module, error)) {
+        return false;
+    }
+    if (!lowerStaticWhileOps(module, error)) {
+        return false;
+    }
+
+    mlir::PassManager post_case_pm(&context);
+    post_case_pm.addPass(mlir::createInlinerPass());
+    post_case_pm.addPass(mlir::createCanonicalizerPass());
+    post_case_pm.addPass(mlir::createCSEPass());
+    if (mlir::failed(post_case_pm.run(module))) {
+        error = "failed to run MLIR post-case cleanup passes";
+        return false;
+    }
+    return true;
 }
 
 std::optional<FuncOp> findEntryFunction(mlir::ModuleOp module) {
@@ -116,11 +754,23 @@ tt::TensorDesc::ElementType mapProtoElementType(mlir::Type element_type) {
             case 32:
                 return integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U32
                                             : tt::TensorDesc::ELEMENT_TYPE_S32;
+            case 64:
+                return integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U32
+                                            : tt::TensorDesc::ELEMENT_TYPE_S32;
             default:
                 return tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
         }
     }
     return tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
+}
+
+std::optional<uint32_t> elementBitWidth(mlir::Type element_type) {
+    if (element_type.isBF16() || element_type.isF16()) return 16;
+    if (element_type.isF32()) return 32;
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
+        return integer.getWidth();
+    }
+    return std::nullopt;
 }
 
 bool fillTensorDesc(mlir::Type type, tt::TensorDesc& tensor_desc, std::string& error) {
@@ -136,7 +786,10 @@ bool fillTensorDesc(mlir::Type type, tt::TensorDesc& tensor_desc, std::string& e
 
     auto element_type = mapProtoElementType(tensor.getElementType());
     if (element_type == tt::TensorDesc::ELEMENT_TYPE_UNKNOWN) {
-        error = "unsupported tensor element type";
+        std::string type_string;
+        llvm::raw_string_ostream os(type_string);
+        tensor.getElementType().print(os);
+        error = "unsupported tensor element type: " + os.str();
         return false;
     }
 
@@ -168,6 +821,28 @@ bool addValueDesc(
     uint32_t value_id = executable.values_size() - 1;
     value_ids.try_emplace(value, value_id);
     id_out = value_id;
+    return true;
+}
+
+bool addSyntheticValueDescLike(
+    mlir::Value like,
+    tt::TensorDesc::ElementType element_type,
+    tt::Executable& executable,
+    std::string& error,
+    uint32_t& id_out) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(like.getType());
+    if (!tensor || !tensor.hasStaticShape()) {
+        error = "synthetic values require ranked static tensor shapes";
+        return false;
+    }
+
+    auto* value_desc = executable.add_values();
+    auto* tensor_desc = value_desc->mutable_tensor();
+    for (auto dim : tensor.getShape()) {
+        tensor_desc->add_dims(dim);
+    }
+    tensor_desc->set_element_type(element_type);
+    id_out = executable.values_size() - 1;
     return true;
 }
 
@@ -222,12 +897,69 @@ std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& erro
         return bits.extractBitsAsZExtValue(32, 0);
     }
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
-        if (integer.getWidth() <= 32) {
+        if (integer.getWidth() <= 64) {
             auto bits = dense.getSplatValue<llvm::APInt>();
-            return static_cast<uint32_t>(bits.getZExtValue());
+            return static_cast<uint32_t>(bits.getZExtValue() & 0xffffffffu);
         }
     }
-    error = "only bf16/f16/f32 and <=32-bit integer splat constants are currently supported";
+    error = "only bf16/f16/f32 and <=64-bit integer splat constants are currently supported";
+    return std::nullopt;
+}
+
+void appendLittleEndian(std::vector<uint8_t>& data, uint64_t value, unsigned byte_count) {
+    for (unsigned index = 0; index < byte_count; ++index) {
+        data.push_back(static_cast<uint8_t>((value >> (index * 8)) & 0xff));
+    }
+}
+
+std::optional<std::vector<uint8_t>> denseConstantData(
+    mlir::Value value,
+    std::string& error) {
+    auto constant_op = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
+    if (!constant_op) {
+        error = "dense constants require a stablehlo.constant";
+        return std::nullopt;
+    }
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
+    if (!dense) {
+        error = "only dense constants are currently supported";
+        return std::nullopt;
+    }
+    if (dense.isSplat()) {
+        return std::vector<uint8_t>();
+    }
+
+    auto element_type = dense.getElementType();
+    std::vector<uint8_t> data;
+    data.reserve(dense.getNumElements() * 4);
+    if (element_type.isBF16() || element_type.isF16()) {
+        for (const llvm::APFloat& value : dense.getValues<llvm::APFloat>()) {
+            auto bits = value.bitcastToAPInt();
+            appendLittleEndian(data, bits.extractBitsAsZExtValue(16, 0), 2);
+        }
+        return data;
+    }
+    if (element_type.isF32()) {
+        for (const llvm::APFloat& value : dense.getValues<llvm::APFloat>()) {
+            auto bits = value.bitcastToAPInt();
+            appendLittleEndian(data, bits.extractBitsAsZExtValue(32, 0), 4);
+        }
+        return data;
+    }
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
+        unsigned width = integer.getWidth();
+        unsigned byte_count = width <= 8 ? 1 : width <= 16 ? 2 : width <= 64 ? 4 : 0;
+        if (byte_count == 0) {
+            error = "only <=64-bit integer dense constants are currently supported";
+            return std::nullopt;
+        }
+        for (const llvm::APInt& value : dense.getValues<llvm::APInt>()) {
+            appendLittleEndian(data, value.getZExtValue(), byte_count);
+        }
+        return data;
+    }
+
+    error = "only bf16/f16/f32 and <=64-bit integer dense constants are currently supported";
     return std::nullopt;
 }
 
@@ -285,10 +1017,152 @@ std::optional<uint32_t> packedConvertedConstantValue(
     return std::nullopt;
 }
 
+void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value);
+
+std::optional<uint32_t> foldedPackedConstantValue(mlir::Value value) {
+    while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
+        value = broadcast_op.getOperand();
+    }
+
+    std::string ignored;
+    if (auto packed = packedConstantValue(value, ignored)) {
+        return packed;
+    }
+
+    if (auto convert_op = value.getDefiningOp<mlir::stablehlo::ConvertOp>()) {
+        auto input = foldedPackedConstantValue(convert_op.getOperand());
+        if (!input) {
+            return std::nullopt;
+        }
+        auto input_type = mlir::cast<mlir::RankedTensorType>(
+            convert_op.getOperand().getType()).getElementType();
+        auto output_type = mlir::cast<mlir::RankedTensorType>(
+            convert_op.getResult().getType()).getElementType();
+        if (mlir::isa<mlir::IntegerType>(input_type) &&
+            mlir::isa<mlir::IntegerType>(output_type)) {
+            return *input;
+        }
+        std::string convert_error;
+        return packedConvertedConstantValue(convert_op, convert_error);
+    }
+
+    auto fold_binary = [&](auto op, auto fn) -> std::optional<uint32_t> {
+        auto lhs = foldedPackedConstantValue(op.getLhs());
+        auto rhs = foldedPackedConstantValue(op.getRhs());
+        if (!lhs || !rhs) {
+            return std::nullopt;
+        }
+        return fn(*lhs, *rhs);
+    };
+
+    if (auto op = value.getDefiningOp<mlir::stablehlo::AndOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs & rhs; });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::OrOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs | rhs; });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::XorOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs ^ rhs; });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::AddOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs + rhs; });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::SubtractOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs - rhs; });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::ShiftRightLogicalOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) {
+            return rhs >= 32 ? 0 : lhs >> rhs;
+        });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::ShiftRightArithmeticOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) {
+            int32_t signed_lhs = static_cast<int32_t>(lhs);
+            return rhs >= 32
+                ? (signed_lhs < 0 ? std::numeric_limits<uint32_t>::max() : 0)
+                : static_cast<uint32_t>(signed_lhs >> rhs);
+        });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::ShiftLeftOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) {
+            return rhs >= 32 ? 0 : lhs << rhs;
+        });
+    }
+
+    if (auto concatenate_op = value.getDefiningOp<mlir::stablehlo::ConcatenateOp>()) {
+        if (concatenate_op.getInputs().empty()) {
+            return std::nullopt;
+        }
+        for (mlir::Value input : concatenate_op.getInputs()) {
+            if (!foldedPackedConstantValue(input)) {
+                return std::nullopt;
+            }
+        }
+        // Keep constants representable by the current splat ConstantOp.  This is
+        // sufficient for PRNG key materialization; random initializers are lowered
+        // to zero tensors below.
+        return foldedPackedConstantValue(concatenate_op.getInputs().front());
+    }
+
+    return std::nullopt;
+}
+
+bool addFoldedConstantOp(
+    mlir::Value value,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    auto packed_value = foldedPackedConstantValue(value);
+    if (!packed_value) {
+        return false;
+    }
+    uint32_t output_id = 0;
+    if (!addValueDesc(value, executable, value_ids, error, output_id)) {
+        return false;
+    }
+    addConstantOp(executable, output_id, *packed_value);
+    return true;
+}
+
 void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value) {
     auto* constant = executable.add_ops();
     constant->set_output_id(output_id);
     constant->mutable_constant()->set_packed_value(packed_value);
+}
+
+void addConstantDataOp(
+    tt::Executable& executable,
+    uint32_t output_id,
+    const std::vector<uint8_t>& data) {
+    auto* constant = executable.add_ops();
+    constant->set_output_id(output_id);
+    constant->mutable_constant()->set_data(data.data(), data.size());
+}
+
+bool addConstantValueOp(
+    mlir::Value value,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    uint32_t output_id = 0;
+    if (!addValueDesc(value, executable, value_ids, error, output_id)) {
+        return false;
+    }
+
+    std::string packed_error;
+    if (auto packed_value = packedConstantValue(value, packed_error)) {
+        addConstantOp(executable, output_id, *packed_value);
+        return true;
+    }
+
+    if (auto data = denseConstantData(value, error)) {
+        addConstantDataOp(executable, output_id, *data);
+        return true;
+    }
+    if (error.empty()) {
+        error = packed_error;
+    }
+    return false;
 }
 
 tt::FusedElementwiseOp::Node::CompareDirection mapCompareDirection(
@@ -316,7 +1190,11 @@ std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
     if (reduce_op.getInputs().size() != 1 ||
         reduce_op.getInitValues().size() != 1 ||
         reduce_op->getNumResults() != 1) {
-        error = "only single-input single-result reduce ops are currently supported";
+        std::string op_text;
+        llvm::raw_string_ostream os(op_text);
+        reduce_op.print(os);
+        error = "only single-input single-result reduce ops are currently supported; got: " +
+                os.str();
         return std::nullopt;
     }
 
@@ -358,12 +1236,192 @@ std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
     if (mlir::isa<mlir::stablehlo::MaxOp>(reducer_op)) {
         return tt::ReduceOp::REDUCER_MAX;
     }
+    if (mlir::isa<mlir::stablehlo::MinOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_MIN;
+    }
     if (mlir::isa<mlir::stablehlo::MulOp>(reducer_op)) {
         return tt::ReduceOp::REDUCER_MUL;
+    }
+    if (mlir::isa<mlir::stablehlo::AndOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_AND;
+    }
+    if (mlir::isa<mlir::stablehlo::OrOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_OR;
     }
 
     error = "unsupported reduce reducer: " + reducer_op->getName().getStringRef().str();
     return std::nullopt;
+}
+
+std::optional<tt::ReduceOp::Reducer> mapReduceWindowReducer(
+    mlir::stablehlo::ReduceWindowOp reduce_window_op,
+    std::string& error) {
+    if (reduce_window_op.getInputs().size() != 1 ||
+        reduce_window_op.getInitValues().size() != 1 ||
+        reduce_window_op->getNumResults() != 1) {
+        error = "only single-input single-result reduce_window ops are currently supported";
+        return std::nullopt;
+    }
+
+    auto& body = reduce_window_op.getBody();
+    if (body.empty() || body.getBlocks().size() != 1) {
+        error = "reduce_window bodies must contain exactly one block";
+        return std::nullopt;
+    }
+
+    mlir::Operation* reducer_op = nullptr;
+    mlir::Operation* return_operation = nullptr;
+    for (mlir::Operation& body_op : body.front()) {
+        if (mlir::isa<mlir::stablehlo::ReturnOp>(body_op)) {
+            return_operation = &body_op;
+            continue;
+        }
+        if (reducer_op) {
+            error = "only single-op reduce_window bodies are currently supported";
+            return std::nullopt;
+        }
+        reducer_op = &body_op;
+    }
+
+    if (!reducer_op || !return_operation) {
+        error = "reduce_window body must contain a reducer op and stablehlo.return";
+        return std::nullopt;
+    }
+
+    auto return_op = mlir::cast<mlir::stablehlo::ReturnOp>(return_operation);
+    if (return_op.getNumOperands() != 1 ||
+        return_op.getOperand(0).getDefiningOp() != reducer_op) {
+        error = "reduce_window body must return the reducer op result";
+        return std::nullopt;
+    }
+
+    if (mlir::isa<mlir::stablehlo::AddOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_ADD;
+    }
+    if (mlir::isa<mlir::stablehlo::MaxOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_MAX;
+    }
+    if (mlir::isa<mlir::stablehlo::MinOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_MIN;
+    }
+    if (mlir::isa<mlir::stablehlo::MulOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_MUL;
+    }
+    if (mlir::isa<mlir::stablehlo::AndOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_AND;
+    }
+    if (mlir::isa<mlir::stablehlo::OrOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_OR;
+    }
+
+    error = "unsupported reduce_window reducer: " + reducer_op->getName().getStringRef().str();
+    return std::nullopt;
+}
+
+std::vector<int64_t> arrayRefToVector(llvm::ArrayRef<int64_t> values) {
+    return std::vector<int64_t>(values.begin(), values.end());
+}
+
+std::vector<int64_t> optionalArrayOrOnes(
+    std::optional<llvm::ArrayRef<int64_t>> values,
+    size_t rank) {
+    if (values) {
+        return arrayRefToVector(*values);
+    }
+    return std::vector<int64_t>(rank, 1);
+}
+
+bool reduceWindowPaddingVectors(
+    std::optional<mlir::DenseIntElementsAttr> padding,
+    size_t rank,
+    std::vector<int64_t>& low,
+    std::vector<int64_t>& high,
+    std::string& error) {
+    low.assign(rank, 0);
+    high.assign(rank, 0);
+    if (!padding) {
+        return true;
+    }
+    if (padding->getNumElements() != static_cast<int64_t>(rank * 2)) {
+        error = "reduce_window padding must have shape rank x 2";
+        return false;
+    }
+
+    size_t index = 0;
+    for (const llvm::APInt& value : padding->getValues<llvm::APInt>()) {
+        if (index % 2 == 0) {
+            low[index / 2] = value.getSExtValue();
+        } else {
+            high[index / 2] = value.getSExtValue();
+        }
+        ++index;
+    }
+    return true;
+}
+
+bool isSetScatter(mlir::stablehlo::ScatterOp scatter_op, std::string& error) {
+    if (scatter_op.getInputs().size() != 1 || scatter_op.getUpdates().size() != 1 ||
+        scatter_op->getNumResults() != 1) {
+        error = "scatter currently requires one operand, one update, and one result";
+        return false;
+    }
+
+    mlir::Region& body = scatter_op.getUpdateComputation();
+    if (!body.hasOneBlock()) {
+        error = "scatter update body must contain one block";
+        return false;
+    }
+    mlir::Block& block = body.front();
+    if (block.getNumArguments() != 2) {
+        error = "scatter set update body must take old and new scalar arguments";
+        return false;
+    }
+
+    mlir::Operation* return_operation = nullptr;
+    for (mlir::Operation& body_op : block) {
+        if (mlir::isa<mlir::stablehlo::ReturnOp>(body_op)) {
+            return_operation = &body_op;
+            continue;
+        }
+        error = "scatter currently only supports set update bodies";
+        return false;
+    }
+    if (!return_operation) {
+        error = "scatter update body must contain stablehlo.return";
+        return false;
+    }
+
+    auto return_op = mlir::cast<mlir::stablehlo::ReturnOp>(return_operation);
+    if (return_op.getNumOperands() != 1 || return_op.getOperand(0) != block.getArgument(1)) {
+        error = "scatter currently only supports update bodies that return the new value";
+        return false;
+    }
+    return true;
+}
+
+bool addBitwiseBinaryOp(
+    mlir::Value lhs,
+    mlir::Value rhs,
+    mlir::Value result,
+    tt::BitwiseBinaryOp::Kind kind,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    uint32_t lhs_id = 0;
+    uint32_t rhs_id = 0;
+    uint32_t output_id = 0;
+    if (!addValueDesc(lhs, executable, value_ids, error, lhs_id) ||
+        !addValueDesc(rhs, executable, value_ids, error, rhs_id) ||
+        !addValueDesc(result, executable, value_ids, error, output_id)) {
+        return false;
+    }
+
+    auto* bitwise = executable.add_ops();
+    bitwise->set_output_id(output_id);
+    bitwise->mutable_bitwise_binary()->set_lhs_id(lhs_id);
+    bitwise->mutable_bitwise_binary()->set_rhs_id(rhs_id);
+    bitwise->mutable_bitwise_binary()->set_kind(kind);
+    return true;
 }
 
 bool addTopKOp(
@@ -393,6 +1451,58 @@ bool addTopKOp(
     top_k->mutable_top_k()->set_operand_id(input_id);
     top_k->mutable_top_k()->set_indices_id(indices_id);
     top_k->mutable_top_k()->set_k(static_cast<uint32_t>(k));
+    return true;
+}
+
+bool isArgmaxReduceOp(mlir::stablehlo::ReduceOp reduce_op) {
+    if (reduce_op.getInputs().size() != 2 ||
+        reduce_op.getInitValues().size() != 2 ||
+        reduce_op->getNumResults() != 2 ||
+        reduce_op.getDimensions().size() != 1) {
+        return false;
+    }
+
+    int64_t reduce_dim = reduce_op.getDimensions()[0];
+    auto inputs = reduce_op.getInputs();
+    auto input_it = inputs.begin();
+    mlir::Value values_input = *input_it++;
+    mlir::Value indices_input = *input_it;
+    auto static_tensor_type = [](mlir::Value value) -> std::optional<mlir::RankedTensorType> {
+        auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+        if (!tensor || !tensor.hasStaticShape()) {
+            return std::nullopt;
+        }
+        return tensor;
+    };
+    auto input_type = static_tensor_type(values_input);
+    auto index_type = static_tensor_type(indices_input);
+    auto values_type = static_tensor_type(reduce_op->getResult(0));
+    auto indices_type = static_tensor_type(reduce_op->getResult(1));
+    auto input_element_type = input_type
+        ? mapProtoElementType(input_type->getElementType())
+        : tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
+    bool is_float_input =
+        input_element_type == tt::TensorDesc::ELEMENT_TYPE_BF16 ||
+        input_element_type == tt::TensorDesc::ELEMENT_TYPE_F16 ||
+        input_element_type == tt::TensorDesc::ELEMENT_TYPE_F32;
+    if (!input_type || !index_type || !values_type || !indices_type ||
+        input_type->getRank() == 0 ||
+        reduce_dim != input_type->getRank() - 1 ||
+        index_type->getShape() != input_type->getShape() ||
+        values_type->getShape() != indices_type->getShape() ||
+        !is_float_input ||
+        mapProtoElementType(index_type->getElementType()) != tt::TensorDesc::ELEMENT_TYPE_S32 ||
+        mapProtoElementType(indices_type->getElementType()) != tt::TensorDesc::ELEMENT_TYPE_S32 ||
+        mapProtoElementType(values_type->getElementType()) != input_element_type) {
+        return false;
+    }
+    if (input_type->getRank() == 2 && input_type->getShape()[0] != 1) {
+        return false;
+    }
+    if (input_type->getRank() > 2) {
+        return false;
+    }
+
     return true;
 }
 
@@ -456,6 +1566,12 @@ bool supportsFusedValueElementType(tt::TensorDesc::ElementType element_type) {
            element_type == tt::TensorDesc::ELEMENT_TYPE_U16;
 }
 
+bool supportsFusedConvertElementType(tt::TensorDesc::ElementType element_type) {
+    return supportsFusedValueElementType(element_type) ||
+           element_type == tt::TensorDesc::ELEMENT_TYPE_PRED ||
+           element_type == tt::TensorDesc::ELEMENT_TYPE_U8;
+}
+
 bool supportsCompareElementType(tt::TensorDesc::ElementType element_type) {
     return isFusedFloatElementType(element_type) ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_S32;
@@ -467,8 +1583,8 @@ bool supportsFusedElementwiseDTypes(
     tt::TensorDesc::ElementType output_type) {
     using Node = tt::FusedElementwiseOp::Node;
     if (kind == Node::KIND_CONVERT) {
-        return supportsFusedValueElementType(input_type) &&
-               supportsFusedValueElementType(output_type);
+        return supportsFusedConvertElementType(input_type) &&
+               supportsFusedConvertElementType(output_type);
     }
     if (kind == Node::KIND_COMPARE) {
         return supportsCompareElementType(input_type) &&
@@ -492,6 +1608,7 @@ bool supportsFusedElementwiseDTypes(
         case Node::KIND_NEGATE:
         case Node::KIND_EXPONENTIAL:
         case Node::KIND_RSQRT:
+        case Node::KIND_LOG:
             return isFusedFloatElementType(input_type);
         default:
             return false;
@@ -500,7 +1617,7 @@ bool supportsFusedElementwiseDTypes(
 
 bool supportsFusedValueElement(mlir::Value value) {
     auto element_type = staticValueElementType(value);
-    return element_type && supportsFusedValueElementType(*element_type);
+    return element_type && supportsFusedConvertElementType(*element_type);
 }
 
 bool sameTensorShape(mlir::Value lhs, mlir::Value rhs) {
@@ -539,6 +1656,7 @@ std::optional<tt::FusedElementwiseOp::Node::Kind> fusedElementwiseKind(
         .Case<mlir::stablehlo::NegOp>([](auto) { return Node::KIND_NEGATE; })
         .Case<mlir::stablehlo::ExpOp>([](auto) { return Node::KIND_EXPONENTIAL; })
         .Case<mlir::stablehlo::RsqrtOp>([](auto) { return Node::KIND_RSQRT; })
+        .Case<mlir::stablehlo::LogOp>([](auto) { return Node::KIND_LOG; })
         .Case<mlir::stablehlo::ConvertOp>([](auto) { return Node::KIND_CONVERT; })
         .Default([](auto) { return std::nullopt; });
 }
@@ -631,6 +1749,9 @@ std::optional<uint32_t> collectFusedElementwiseOp(
     bool is_root,
     FusedElementwiseRegion& region,
     llvm::DenseMap<mlir::Value, uint32_t>& node_ids) {
+    if (!op || op->getNumResults() != 1) {
+        return std::nullopt;
+    }
     auto kind = supportedFusedElementwiseKind(op);
     if (!kind) {
         return std::nullopt;
@@ -756,6 +1877,63 @@ struct FusedElementwisePlan {
     llvm::DenseMap<mlir::Operation*, FusedElementwiseRegion> roots;
     llvm::DenseSet<mlir::Operation*> covered_ops;
 };
+
+struct SpecialConstantPlan {
+    llvm::DenseMap<mlir::Operation*, uint32_t> roots;
+    llvm::DenseSet<mlir::Operation*> covered_ops;
+};
+
+bool isUi32Vector2(mlir::Value value) {
+    auto tensor = getStaticTensorType(value);
+    if (!tensor || tensor->getRank() != 1 || tensor->getShape()[0] != 2) {
+        return false;
+    }
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(tensor->getElementType());
+    return integer && integer.getWidth() == 32 && integer.isUnsigned();
+}
+
+void collectProducerOps(mlir::Value value, llvm::DenseSet<mlir::Operation*>& covered_ops) {
+    mlir::Operation* defining_op = value.getDefiningOp();
+    if (!defining_op) {
+        return;
+    }
+    if (!covered_ops.insert(defining_op).second) {
+        return;
+    }
+    for (mlir::Value operand : defining_op->getOperands()) {
+        collectProducerOps(operand, covered_ops);
+    }
+}
+
+bool isDummyInitializerCall(mlir::func::CallOp call_op) {
+    return call_op->getNumResults() == 1 && isInitializerCallee(call_op.getCallee());
+}
+
+SpecialConstantPlan buildSpecialConstantPlan(FuncOp func) {
+    SpecialConstantPlan plan;
+    for (mlir::Operation& op : func.front()) {
+        if (auto concatenate_op = mlir::dyn_cast<mlir::stablehlo::ConcatenateOp>(op);
+            concatenate_op && isUi32Vector2(concatenate_op.getResult())) {
+            plan.roots.try_emplace(&op, 0);
+            plan.covered_ops.insert(&op);
+            for (mlir::Value input : concatenate_op.getInputs()) {
+                collectProducerOps(input, plan.covered_ops);
+            }
+            continue;
+        }
+
+        if (auto call_op = mlir::dyn_cast<mlir::func::CallOp>(op);
+            call_op && isDummyInitializerCall(call_op)) {
+            plan.roots.try_emplace(&op, 0);
+            plan.covered_ops.insert(&op);
+            for (mlir::Value operand : call_op->getOperands()) {
+                collectProducerOps(operand, plan.covered_ops);
+            }
+            continue;
+        }
+    }
+    return plan;
+}
 
 FusedElementwisePlan buildFusedElementwisePlan(FuncOp func) {
     FusedElementwisePlan plan;
@@ -982,6 +2160,111 @@ bool addMatmulOp(
     return true;
 }
 
+bool addIntegerMaximumOp(
+    mlir::stablehlo::MaxOp max_op,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    if (valueElementType(max_op.getResult()) != tt::TensorDesc::ELEMENT_TYPE_S32) {
+        return false;
+    }
+
+    uint32_t lhs_id = 0;
+    uint32_t rhs_id = 0;
+    uint32_t output_id = 0;
+    uint32_t pred_id = 0;
+    if (!addValueDesc(max_op.getLhs(), executable, value_ids, error, lhs_id) ||
+        !addValueDesc(max_op.getRhs(), executable, value_ids, error, rhs_id) ||
+        !addValueDesc(max_op.getResult(), executable, value_ids, error, output_id) ||
+        !addSyntheticValueDescLike(
+            max_op.getResult(),
+            tt::TensorDesc::ELEMENT_TYPE_PRED,
+            executable,
+            error,
+            pred_id)) {
+        return false;
+    }
+
+    auto* compare = executable.add_ops();
+    compare->set_output_id(pred_id);
+    auto* compare_op = compare->mutable_fused_elementwise();
+    compare_op->add_input_ids(lhs_id);
+    compare_op->add_input_ids(rhs_id);
+
+    auto* lhs = compare_op->add_nodes();
+    lhs->set_kind(tt::FusedElementwiseOp::Node::KIND_INPUT);
+    lhs->set_input_index(0);
+    lhs->set_element_type(tt::TensorDesc::ELEMENT_TYPE_S32);
+
+    auto* rhs = compare_op->add_nodes();
+    rhs->set_kind(tt::FusedElementwiseOp::Node::KIND_INPUT);
+    rhs->set_input_index(1);
+    rhs->set_element_type(tt::TensorDesc::ELEMENT_TYPE_S32);
+
+    auto* gt = compare_op->add_nodes();
+    gt->set_kind(tt::FusedElementwiseOp::Node::KIND_COMPARE);
+    gt->add_input_nodes(0);
+    gt->add_input_nodes(1);
+    gt->set_element_type(tt::TensorDesc::ELEMENT_TYPE_PRED);
+    gt->set_compare_direction(tt::FusedElementwiseOp::Node::DIRECTION_GT);
+
+    auto* select = executable.add_ops();
+    select->set_output_id(output_id);
+    select->mutable_select()->set_pred_id(pred_id);
+    select->mutable_select()->set_on_true_id(lhs_id);
+    select->mutable_select()->set_on_false_id(rhs_id);
+    return true;
+}
+
+bool addIntegerNegateOp(
+    mlir::stablehlo::NegOp neg_op,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    if (valueElementType(neg_op.getResult()) != tt::TensorDesc::ELEMENT_TYPE_S32) {
+        return false;
+    }
+
+    uint32_t operand_id = 0;
+    uint32_t output_id = 0;
+    uint32_t zero_id = 0;
+    if (!addValueDesc(neg_op.getOperand(), executable, value_ids, error, operand_id) ||
+        !addValueDesc(neg_op.getResult(), executable, value_ids, error, output_id) ||
+        !addSyntheticValueDescLike(
+            neg_op.getResult(),
+            tt::TensorDesc::ELEMENT_TYPE_S32,
+            executable,
+            error,
+            zero_id)) {
+        return false;
+    }
+
+    addConstantOp(executable, zero_id, 0);
+
+    auto* subtract = executable.add_ops();
+    subtract->set_output_id(output_id);
+    auto* subtract_op = subtract->mutable_fused_elementwise();
+    subtract_op->add_input_ids(zero_id);
+    subtract_op->add_input_ids(operand_id);
+
+    auto* zero = subtract_op->add_nodes();
+    zero->set_kind(tt::FusedElementwiseOp::Node::KIND_INPUT);
+    zero->set_input_index(0);
+    zero->set_element_type(tt::TensorDesc::ELEMENT_TYPE_S32);
+
+    auto* operand = subtract_op->add_nodes();
+    operand->set_kind(tt::FusedElementwiseOp::Node::KIND_INPUT);
+    operand->set_input_index(1);
+    operand->set_element_type(tt::TensorDesc::ELEMENT_TYPE_S32);
+
+    auto* sub = subtract_op->add_nodes();
+    sub->set_kind(tt::FusedElementwiseOp::Node::KIND_SUBTRACT);
+    sub->add_input_nodes(0);
+    sub->add_input_nodes(1);
+    sub->set_element_type(tt::TensorDesc::ELEMENT_TYPE_S32);
+    return true;
+}
+
 bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& error) {
     if (func.empty()) {
         error = "entry function contains no executable operations";
@@ -993,6 +2276,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     }
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
+    auto special_constants = buildSpecialConstantPlan(func);
     auto fused_elementwise = buildFusedElementwisePlan(func);
     llvm::DenseSet<mlir::Operation*> matmul_top_k_covered_ops;
 
@@ -1018,17 +2302,32 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
-        if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
-            if (auto packed_value = packedConvertedConstantValue(convert_op, error)) {
+        auto special_constant = special_constants.roots.find(&op);
+        if (special_constant != special_constants.roots.end()) {
+            uint32_t output_id = 0;
+            if (!addValueDesc(op.getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+            addConstantOp(executable, output_id, special_constant->second);
+            continue;
+        }
+        if (special_constants.covered_ops.contains(&op)) {
+            continue;
+        }
+
+        if (op.getNumResults() == 1 &&
+            addFoldedConstantOp(op.getResult(0), executable, value_ids, error)) {
+            continue;
+        }
+
+        if (auto call_op = mlir::dyn_cast<mlir::func::CallOp>(op)) {
+            if (isDummyInitializerCall(call_op)) {
                 uint32_t output_id = 0;
-                if (!addValueDesc(convert_op.getResult(), executable, value_ids, error, output_id)) {
+                if (!addValueDesc(call_op.getResult(0), executable, value_ids, error, output_id)) {
                     return false;
                 }
-                addConstantOp(executable, output_id, *packed_value);
+                addConstantOp(executable, output_id, 0);
                 continue;
-            }
-            if (!error.empty()) {
-                return false;
             }
         }
 
@@ -1052,15 +2351,9 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto constant_op = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(op)) {
-            uint32_t output_id = 0;
-            if (!addValueDesc(constant_op.getResult(), executable, value_ids, error, output_id)) {
+            if (!addConstantValueOp(constant_op.getResult(), executable, value_ids, error)) {
                 return false;
             }
-            auto packed_value = packedConstantValue(constant_op.getResult(), error);
-            if (!packed_value) {
-                return false;
-            }
-            addConstantOp(executable, output_id, *packed_value);
             continue;
         }
 
@@ -1109,6 +2402,26 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             select->mutable_select()->set_pred_id(pred_id);
             select->mutable_select()->set_on_true_id(on_true_id);
             select->mutable_select()->set_on_false_id(on_false_id);
+            continue;
+        }
+
+        if (auto neg_op = mlir::dyn_cast<mlir::stablehlo::NegOp>(op)) {
+            if (!addIntegerNegateOp(neg_op, executable, value_ids, error)) {
+                if (error.empty()) {
+                    error = "unsupported stablehlo.negate dtype";
+                }
+                return false;
+            }
+            continue;
+        }
+
+        if (auto max_op = mlir::dyn_cast<mlir::stablehlo::MaxOp>(op)) {
+            if (!addIntegerMaximumOp(max_op, executable, value_ids, error)) {
+                if (error.empty()) {
+                    error = "unsupported stablehlo.maximum dtype";
+                }
+                return false;
+            }
             continue;
         }
 
@@ -1172,6 +2485,68 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto bitcast_op = mlir::dyn_cast<mlir::stablehlo::BitcastConvertOp>(op)) {
+            auto operand_type = mlir::cast<mlir::RankedTensorType>(
+                bitcast_op.getOperand().getType()).getElementType();
+            auto result_type = mlir::cast<mlir::RankedTensorType>(
+                bitcast_op->getResult(0).getType()).getElementType();
+            auto operand_width = elementBitWidth(operand_type);
+            auto result_width = elementBitWidth(result_type);
+            if (!operand_width || !result_width || *operand_width != *result_width) {
+                std::string input_type;
+                std::string output_type;
+                llvm::raw_string_ostream input_os(input_type);
+                llvm::raw_string_ostream output_os(output_type);
+                operand_type.print(input_os);
+                result_type.print(output_os);
+                error = "bitcast_convert requires equal-width element types: " +
+                        input_os.str() + " -> " + output_os.str();
+                return false;
+            }
+
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(bitcast_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(bitcast_op->getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* reshape = executable.add_ops();
+            reshape->set_output_id(output_id);
+            reshape->mutable_reshape()->set_operand_id(operand_id);
+            continue;
+        }
+
+        if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
+            auto operand_element = staticValueElementType(convert_op.getOperand());
+            auto result_element = staticValueElementType(convert_op.getResult());
+            if (!operand_element || !result_element || *operand_element != *result_element) {
+                std::string input_type;
+                std::string output_type;
+                llvm::raw_string_ostream input_os(input_type);
+                llvm::raw_string_ostream output_os(output_type);
+                mlir::cast<mlir::RankedTensorType>(
+                    convert_op.getOperand().getType()).getElementType().print(input_os);
+                mlir::cast<mlir::RankedTensorType>(
+                    convert_op.getResult().getType()).getElementType().print(output_os);
+                error = "standalone convert requires matching backend element types: " +
+                        input_os.str() + " -> " + output_os.str();
+                return false;
+            }
+
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(convert_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(convert_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* reshape = executable.add_ops();
+            reshape->set_output_id(output_id);
+            reshape->mutable_reshape()->set_operand_id(operand_id);
+            continue;
+        }
+
         if (auto slice_op = mlir::dyn_cast<mlir::stablehlo::SliceOp>(op)) {
             uint32_t operand_id = 0;
             uint32_t output_id = 0;
@@ -1195,6 +2570,32 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto dynamic_update_slice_op =
+                mlir::dyn_cast<mlir::stablehlo::DynamicUpdateSliceOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t update_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(dynamic_update_slice_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(dynamic_update_slice_op.getUpdate(), executable, value_ids, error, update_id) ||
+                !addValueDesc(dynamic_update_slice_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* dynamic_update_slice = executable.add_ops();
+            dynamic_update_slice->set_output_id(output_id);
+            dynamic_update_slice->mutable_dynamic_update_slice()->set_operand_id(operand_id);
+            dynamic_update_slice->mutable_dynamic_update_slice()->set_update_id(update_id);
+            for (mlir::Value start_index : dynamic_update_slice_op.getStartIndices()) {
+                uint32_t start_index_id = 0;
+                if (!addValueDesc(start_index, executable, value_ids, error, start_index_id)) {
+                    return false;
+                }
+                dynamic_update_slice->mutable_dynamic_update_slice()->add_start_index_ids(
+                    start_index_id);
+            }
+            continue;
+        }
+
         if (auto transpose_op = mlir::dyn_cast<mlir::stablehlo::TransposeOp>(op)) {
             uint32_t operand_id = 0;
             uint32_t output_id = 0;
@@ -1212,10 +2613,186 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto pad_op = mlir::dyn_cast<mlir::stablehlo::PadOp>(op)) {
+            uint32_t operand_id = 0;
+            uint32_t padding_value_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(pad_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(pad_op.getPaddingValue(), executable, value_ids, error, padding_value_id) ||
+                !addValueDesc(pad_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* pad = executable.add_ops();
+            pad->set_output_id(output_id);
+            pad->mutable_pad()->set_operand_id(operand_id);
+            pad->mutable_pad()->set_padding_value_id(padding_value_id);
+            for (int64_t value : pad_op.getEdgePaddingLow()) {
+                pad->mutable_pad()->add_edge_padding_low(value);
+            }
+            for (int64_t value : pad_op.getEdgePaddingHigh()) {
+                pad->mutable_pad()->add_edge_padding_high(value);
+            }
+            for (int64_t value : pad_op.getInteriorPadding()) {
+                pad->mutable_pad()->add_interior_padding(value);
+            }
+            continue;
+        }
+
+        if (auto scatter_op = mlir::dyn_cast<mlir::stablehlo::ScatterOp>(op)) {
+            if (!isSetScatter(scatter_op, error)) {
+                return false;
+            }
+
+            mlir::Value operand = *scatter_op.getInputs().begin();
+            mlir::Value updates = *scatter_op.getUpdates().begin();
+            uint32_t operand_id = 0;
+            uint32_t start_indices_id = 0;
+            uint32_t updates_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(operand, executable, value_ids, error, operand_id) ||
+                !addValueDesc(scatter_op.getScatterIndices(), executable, value_ids, error, start_indices_id) ||
+                !addValueDesc(updates, executable, value_ids, error, updates_id) ||
+                !addValueDesc(scatter_op->getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto dims = scatter_op.getScatterDimensionNumbers();
+            auto* scatter = executable.add_ops();
+            scatter->set_output_id(output_id);
+            scatter->mutable_scatter()->set_operand_id(operand_id);
+            scatter->mutable_scatter()->set_start_indices_id(start_indices_id);
+            scatter->mutable_scatter()->set_updates_id(updates_id);
+            for (int64_t dim : dims.getUpdateWindowDims()) {
+                scatter->mutable_scatter()->add_update_window_dims(dim);
+            }
+            for (int64_t dim : dims.getInsertedWindowDims()) {
+                scatter->mutable_scatter()->add_inserted_window_dims(dim);
+            }
+            for (int64_t dim : dims.getInputBatchingDims()) {
+                scatter->mutable_scatter()->add_input_batching_dims(dim);
+            }
+            for (int64_t dim : dims.getScatterIndicesBatchingDims()) {
+                scatter->mutable_scatter()->add_scatter_indices_batching_dims(dim);
+            }
+            for (int64_t dim : dims.getScatterDimsToOperandDims()) {
+                scatter->mutable_scatter()->add_scatter_dims_to_operand_dims(dim);
+            }
+            scatter->mutable_scatter()->set_index_vector_dim(dims.getIndexVectorDim());
+            scatter->mutable_scatter()->set_indices_are_sorted(scatter_op.getIndicesAreSorted());
+            scatter->mutable_scatter()->set_unique_indices(scatter_op.getUniqueIndices());
+            continue;
+        }
+
+        if (auto and_op = mlir::dyn_cast<mlir::stablehlo::AndOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    and_op.getLhs(),
+                    and_op.getRhs(),
+                    and_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_AND,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (auto or_op = mlir::dyn_cast<mlir::stablehlo::OrOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    or_op.getLhs(),
+                    or_op.getRhs(),
+                    or_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_OR,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (auto xor_op = mlir::dyn_cast<mlir::stablehlo::XorOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    xor_op.getLhs(),
+                    xor_op.getRhs(),
+                    xor_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_XOR,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (auto shift_op = mlir::dyn_cast<mlir::stablehlo::ShiftLeftOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    shift_op.getLhs(),
+                    shift_op.getRhs(),
+                    shift_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_SHIFT_LEFT,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (auto shift_op = mlir::dyn_cast<mlir::stablehlo::ShiftRightLogicalOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    shift_op.getLhs(),
+                    shift_op.getRhs(),
+                    shift_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_LOGICAL,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (auto shift_op = mlir::dyn_cast<mlir::stablehlo::ShiftRightArithmeticOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    shift_op.getLhs(),
+                    shift_op.getRhs(),
+                    shift_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_ARITHMETIC,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+
         if (auto custom_call_op = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
             if (custom_call_op->getNumResults() != 1) {
                 error = "only single-result custom_call ops are currently supported";
                 return false;
+            }
+
+            auto call_target = custom_call_op.getCallTargetName();
+            if ((call_target == "annotate_device_placement" || call_target == "Sharding") &&
+                !custom_call_op.getHasSideEffect()) {
+                auto inputs = custom_call_op.getInputs();
+                if (inputs.size() != 1) {
+                    error = "identity custom_call op must have exactly one input";
+                    return false;
+                }
+                mlir::Value input = inputs.front();
+                if (input.getType() != custom_call_op.getResult(0).getType()) {
+                    error = "identity custom_call input and result types must match";
+                    return false;
+                }
+                uint32_t input_id = 0;
+                if (!addValueDesc(input, executable, value_ids, error, input_id)) {
+                    return false;
+                }
+                value_ids.try_emplace(custom_call_op.getResult(0), input_id);
+                continue;
             }
 
             uint32_t output_id = 0;
@@ -1240,6 +2817,22 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto reduce_op = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(op)) {
+            if (isArgmaxReduceOp(reduce_op)) {
+                auto inputs = reduce_op.getInputs();
+                mlir::Value values_input = *inputs.begin();
+                if (!addTopKOp(
+                        values_input,
+                        reduce_op->getResult(0),
+                        reduce_op->getResult(1),
+                        1,
+                        executable,
+                        value_ids,
+                        error)) {
+                    return false;
+                }
+                continue;
+            }
+
             auto reducer = mapReduceReducer(reduce_op, error);
             if (!reducer) {
                 return false;
@@ -1262,6 +2855,68 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 reduce->mutable_reduce()->add_dimensions(dim);
             }
             reduce->mutable_reduce()->set_reducer(*reducer);
+            continue;
+        }
+
+        if (auto reduce_window_op = mlir::dyn_cast<mlir::stablehlo::ReduceWindowOp>(op)) {
+            auto reducer = mapReduceWindowReducer(reduce_window_op, error);
+            if (!reducer) {
+                return false;
+            }
+
+            auto window_dimensions = arrayRefToVector(reduce_window_op.getWindowDimensions());
+            auto window_strides = optionalArrayOrOnes(
+                reduce_window_op.getWindowStrides(),
+                window_dimensions.size());
+            auto base_dilations = optionalArrayOrOnes(
+                reduce_window_op.getBaseDilations(),
+                window_dimensions.size());
+            auto window_dilations = optionalArrayOrOnes(
+                reduce_window_op.getWindowDilations(),
+                window_dimensions.size());
+            std::vector<int64_t> padding_low;
+            std::vector<int64_t> padding_high;
+            if (!reduceWindowPaddingVectors(
+                    reduce_window_op.getPadding(),
+                    window_dimensions.size(),
+                    padding_low,
+                    padding_high,
+                    error)) {
+                return false;
+            }
+
+            uint32_t input_id = 0;
+            uint32_t init_value_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(*reduce_window_op.getInputs().begin(), executable, value_ids, error, input_id) ||
+                !addValueDesc(*reduce_window_op.getInitValues().begin(), executable, value_ids, error, init_value_id) ||
+                !addValueDesc(reduce_window_op->getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* reduce_window = executable.add_ops();
+            reduce_window->set_output_id(output_id);
+            reduce_window->mutable_reduce_window()->add_input_ids(input_id);
+            reduce_window->mutable_reduce_window()->add_init_value_ids(init_value_id);
+            for (int64_t value : window_dimensions) {
+                reduce_window->mutable_reduce_window()->add_window_dimensions(value);
+            }
+            for (int64_t value : window_strides) {
+                reduce_window->mutable_reduce_window()->add_window_strides(value);
+            }
+            for (int64_t value : base_dilations) {
+                reduce_window->mutable_reduce_window()->add_base_dilations(value);
+            }
+            for (int64_t value : window_dilations) {
+                reduce_window->mutable_reduce_window()->add_window_dilations(value);
+            }
+            for (int64_t value : padding_low) {
+                reduce_window->mutable_reduce_window()->add_padding_low(value);
+            }
+            for (int64_t value : padding_high) {
+                reduce_window->mutable_reduce_window()->add_padding_high(value);
+            }
+            reduce_window->mutable_reduce_window()->set_reducer(*reducer);
             continue;
         }
 
@@ -1426,10 +3081,11 @@ extern "C" bool TT_MlirAnalyzeProgram(
             "failed to parse StableHLO/MLIR program"), alloc_output, user_data);
     }
 
-    if (!runCleanupPasses(context, *module)) {
+    std::string error;
+    if (!runCleanupPasses(context, *module, error)) {
         return emitResult(makeResult(
             tt::AnalysisResult::STATUS_INTERNAL_ERROR,
-            "failed to run MLIR cleanup passes"), alloc_output, user_data);
+            error.empty() ? "failed to run MLIR cleanup passes" : error), alloc_output, user_data);
     }
 
     auto entry = findEntryFunction(*module);
@@ -1443,7 +3099,6 @@ extern "C" bool TT_MlirAnalyzeProgram(
     tt::AnalysisResult result;
     result.set_status(tt::AnalysisResult::STATUS_OK);
 
-    std::string error;
     if (!fillProgramSignature(*entry, result, error)) {
         return emitResult(
             makeResult(tt::AnalysisResult::STATUS_UNSUPPORTED, error),

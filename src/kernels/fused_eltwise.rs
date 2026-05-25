@@ -27,6 +27,7 @@ const HEADER_BINARY_SFPU: &str = "compute_kernel_api/eltwise_binary_sfpu.h";
 const HEADER_BINOP_WITH_SCALAR: &str = "compute_kernel_api/eltwise_unary/binop_with_scalar.h";
 const HEADER_COMP: &str = "compute_kernel_api/eltwise_unary/comp.h";
 const HEADER_EXP: &str = "compute_kernel_api/eltwise_unary/exp.h";
+const HEADER_LOG: &str = "compute_kernel_api.h";
 const HEADER_MUL_INT: &str = "compute_kernel_api/mul_int_sfpu.h";
 const HEADER_MUL_INT32: &str = "compute_kernel_api/mul_int32_sfpu.h";
 const HEADER_NEGATIVE: &str = "compute_kernel_api/eltwise_unary/negative.h";
@@ -74,6 +75,7 @@ impl FusedElementwiseKind {
             | Self::Sine
             | Self::Negate
             | Self::Exponential
+            | Self::Log
             | Self::Rsqrt
             | Self::Convert => 1,
             Self::Add
@@ -94,7 +96,12 @@ impl FusedElementwiseKind {
     ) -> io::Result<()> {
         match self {
             Self::Input | Self::Constant => Ok(()),
-            Self::Cosine | Self::Sine | Self::Negate | Self::Exponential | Self::Rsqrt => {
+            Self::Cosine
+            | Self::Sine
+            | Self::Negate
+            | Self::Exponential
+            | Self::Log
+            | Self::Rsqrt => {
                 let input_dtype = input_dtypes[0];
                 validate_same_output_dtype(node_index, self, input_dtype, output_dtype)?;
                 if !is_float_dtype(input_dtype) {
@@ -106,11 +113,11 @@ impl FusedElementwiseKind {
             }
             Self::Convert => {
                 let input_dtype = input_dtypes[0];
-                if !is_supported_value_dtype(input_dtype)
-                    || !is_supported_value_dtype(output_dtype)
+                if !is_supported_convert_dtype(input_dtype)
+                    || !is_supported_convert_dtype(output_dtype)
                 {
                     return Err(invalid_input(format!(
-                        "node[{node_index}] convert supports Float16, Float16B, Float32, Int32, UInt16, and UInt32, got {input_dtype:?} -> {output_dtype:?}"
+                        "node[{node_index}] convert supports Float16, Float16B, Float32, Int32, UInt8, UInt16, and UInt32, got {input_dtype:?} -> {output_dtype:?}"
                     )));
                 }
                 Ok(())
@@ -200,6 +207,11 @@ impl FusedElementwiseKind {
                 header: HEADER_EXP,
                 init: "exp_tile_init();",
                 tile: "exp_tile(0);",
+            }),
+            Self::Log => Some(UnaryCompute {
+                header: HEADER_LOG,
+                init: "log_tile_init();",
+                tile: "log_tile(0);",
             }),
             Self::Rsqrt => Some(UnaryCompute {
                 header: HEADER_RSQRT,
@@ -539,7 +551,7 @@ fn validate_and_collect_inputs<'a>(
         let dtype = node_dtype(node)?;
         match node.kind {
             FusedElementwiseKind::Input => {
-                if !is_supported_value_dtype(dtype) {
+                if !is_supported_convert_dtype(dtype) {
                     return Err(invalid_input(format!(
                         "node[{index}] input dtype {:?} is not supported by fused eltwise",
                         dtype
@@ -590,7 +602,7 @@ fn validate_and_collect_inputs<'a>(
                 input_reads.push(buffer);
             }
             FusedElementwiseKind::Constant => {
-                if !is_supported_value_dtype(dtype) {
+                if !is_supported_convert_dtype(dtype) {
                     return Err(invalid_input(format!(
                         "node[{index}] constant dtype {:?} is not supported by fused eltwise",
                         dtype
@@ -637,8 +649,13 @@ fn validate_and_collect_inputs<'a>(
 }
 
 fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
-    let input_nodes = fused_input_nodes(&key.nodes);
-    let input_count = input_nodes.len();
+    let (node_cbs, intermediate_cbs) = cb_plan(&key.nodes)?;
+    let leaf_nodes = fused_leaf_nodes(&key.nodes, &node_cbs)?;
+    let input_count = key
+        .nodes
+        .iter()
+        .filter(|node| node.kind == FusedElementwiseKind::Input)
+        .count();
     let reader_dynamic_indices: Vec<usize> = (0..input_count).collect();
 
     let mut runtime_args = RuntimeArgsBuilder::new(0, vec![0], reader_dynamic_indices, Vec::new());
@@ -651,10 +668,9 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     }
     let runtime_args = runtime_args.build()?;
 
-    let (_, intermediate_cbs) = cb_plan(&key.nodes)?;
-    let mut cbs = Vec::with_capacity(input_count + intermediate_cbs.len() + 1);
-    for (index, node) in input_nodes.iter().enumerate() {
-        cbs.push(CBConfig::new(index, node_dtype(node)?));
+    let mut cbs = Vec::with_capacity(leaf_nodes.len() + intermediate_cbs.len() + 1);
+    for (cb, node) in &leaf_nodes {
+        cbs.push(CBConfig::new(*cb as usize, node_dtype(node)?));
     }
     for (cb, dtype) in intermediate_cbs {
         cbs.push(CBConfig::new(cb as usize, dtype));
@@ -676,7 +692,7 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     }
 
     Ok(Program {
-        reader_kernel: reader_source(&input_nodes)?,
+        reader_kernel: reader_source(&leaf_nodes, input_count)?,
         compute_kernel: compute_source(&key)?,
         writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
@@ -689,15 +705,27 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     })
 }
 
-fn fused_input_nodes(nodes: &[FusedElementwiseNode]) -> Vec<&FusedElementwiseNode> {
+fn fused_leaf_nodes<'a>(
+    nodes: &'a [FusedElementwiseNode],
+    node_cbs: &[Option<u32>],
+) -> io::Result<Vec<(u32, &'a FusedElementwiseNode)>> {
     nodes
         .iter()
-        .filter(|node| node.kind == FusedElementwiseKind::Input)
+        .enumerate()
+        .filter(|(_, node)| {
+            matches!(
+                node.kind,
+                FusedElementwiseKind::Input | FusedElementwiseKind::Constant
+            )
+        })
+        .map(|(index, node)| Ok((cb_for_node(node_cbs, index)?, node)))
         .collect()
 }
 
-fn reader_source(input_nodes: &[&FusedElementwiseNode]) -> io::Result<String> {
-    let input_count = input_nodes.len();
+fn reader_source(
+    leaf_nodes: &[(u32, &FusedElementwiseNode)],
+    input_count: usize,
+) -> io::Result<String> {
     let mut arg_loads = String::new();
     let mut addr_gens = String::new();
     let mut reserves = String::new();
@@ -710,58 +738,99 @@ fn reader_source(input_nodes: &[&FusedElementwiseNode]) -> io::Result<String> {
             "  uint32_t input_addr_{index} = get_arg_val<uint32_t>({index});"
         )
         .unwrap();
+    }
+
+    let mut input_arg_index = 0usize;
+    for (leaf_index, (cb, node)) in leaf_nodes.iter().enumerate() {
         writeln!(
             addr_gens,
-            "  constexpr uint32_t cb_input_{index} = tt::CBIndex::c_{index};"
+            "  constexpr uint32_t cb_leaf_{leaf_index} = tt::CBIndex::c_{cb};"
         )
         .unwrap();
         writeln!(
-            addr_gens,
-            "  const InterleavedAddrGenFast<true> input_{index} = {{"
+            reserves,
+            "    cb_reserve_back(cb_leaf_{leaf_index}, 1);"
         )
         .unwrap();
-        writeln!(
-            addr_gens,
-            "    .bank_base_address = input_addr_{index}, .page_size = get_tile_size(cb_input_{index}), .data_format = get_dataformat(cb_input_{index}),"
-        )
-        .unwrap();
-        writeln!(addr_gens, "  }};").unwrap();
-        writeln!(reserves, "    cb_reserve_back(cb_input_{index}, 1);").unwrap();
-        let tile_id = if input_nodes[index].single_tile_broadcast {
-            "0"
-        } else {
-            "offset + i"
-        };
-        writeln!(
-            reads,
-            "    noc_async_read_tile({tile_id}, input_{index}, get_write_ptr(cb_input_{index}));"
-        )
-        .unwrap();
-        if input_nodes[index].single_tile_broadcast {
-            let mode = match node_dtype(input_nodes[index])? {
-                DType::Float16 | DType::Float16B | DType::UInt16 => true,
-                _ => false,
-            };
-            writeln!(
-                broadcasts,
-                "    replicate_first_element(cb_input_{index}, {mode});"
-            )
-            .unwrap();
+        match node.kind {
+            FusedElementwiseKind::Input => {
+                writeln!(
+                    addr_gens,
+                    "  const InterleavedAddrGenFast<true> input_{input_arg_index} = {{"
+                )
+                .unwrap();
+                writeln!(
+                    addr_gens,
+                    "    .bank_base_address = input_addr_{input_arg_index}, .page_size = get_tile_size(cb_leaf_{leaf_index}), .data_format = get_dataformat(cb_leaf_{leaf_index}),"
+                )
+                .unwrap();
+                writeln!(addr_gens, "  }};").unwrap();
+                let tile_id = if node.single_tile_broadcast {
+                    "0"
+                } else {
+                    "offset + i"
+                };
+                writeln!(
+                    reads,
+                    "    noc_async_read_tile({tile_id}, input_{input_arg_index}, get_write_ptr(cb_leaf_{leaf_index}));"
+                )
+                .unwrap();
+                if node.single_tile_broadcast {
+                    let bytes = element_bytes(node_dtype(node)?);
+                    writeln!(
+                        broadcasts,
+                        "    replicate_first_element(cb_leaf_{leaf_index}, {bytes});"
+                    )
+                    .unwrap();
+                }
+                input_arg_index += 1;
+            }
+            FusedElementwiseKind::Constant => {
+                let bytes = element_bytes(node_dtype(node)?);
+                writeln!(
+                    broadcasts,
+                    "    fill_constant_tile(cb_leaf_{leaf_index}, {}u, {bytes});",
+                    node.packed_value
+                )
+                .unwrap();
+            }
+            _ => unreachable!("fused reader leaves are limited to inputs and constants"),
         }
-        writeln!(pushes, "    cb_push_back(cb_input_{index}, 1);").unwrap();
+        writeln!(
+            pushes,
+            "    cb_push_back(cb_leaf_{leaf_index}, 1);"
+        )
+        .unwrap();
     }
 
     Ok(format!(
         "#include <cstdint>\n\
          \n\
          namespace {{\n\
-         void replicate_first_element(uint32_t cb, bool is_16bit) {{\n\
+         uint32_t repeated_word(uint32_t packed_value, uint32_t element_bytes) {{\n\
+           if (element_bytes == 1) {{\n\
+             uint32_t byte = packed_value & 0xffu;\n\
+             return byte | (byte << 8) | (byte << 16) | (byte << 24);\n\
+           }}\n\
+           if (element_bytes == 2) {{\n\
+             uint32_t half = packed_value & 0xffffu;\n\
+             return half | (half << 16);\n\
+           }}\n\
+           return packed_value;\n\
+         }}\n\
+         void fill_constant_tile(uint32_t cb, uint32_t packed_value, uint32_t element_bytes) {{\n\
            uint32_t l1_addr = get_write_ptr(cb);\n\
            volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(l1_addr);\n\
-           uint32_t packed_value = ptr[0];\n\
-           if (is_16bit) {{\n\
-             packed_value = (packed_value & 0xffffu) | ((packed_value & 0xffffu) << 16);\n\
+           uint32_t word = repeated_word(packed_value, element_bytes);\n\
+           uint32_t words = get_tile_size(cb) / sizeof(uint32_t);\n\
+           for (uint32_t i = 0; i < words; ++i) {{\n\
+             ptr[i] = word;\n\
            }}\n\
+         }}\n\
+         void replicate_first_element(uint32_t cb, uint32_t element_bytes) {{\n\
+           uint32_t l1_addr = get_write_ptr(cb);\n\
+           volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(l1_addr);\n\
+           uint32_t packed_value = repeated_word(ptr[0], element_bytes);\n\
            uint32_t words = get_tile_size(cb) / sizeof(uint32_t);\n\
            for (uint32_t i = 0; i < words; ++i) {{\n\
              ptr[i] = packed_value;\n\
@@ -1267,9 +1336,12 @@ fn cb_plan(nodes: &[FusedElementwiseNode]) -> io::Result<(Vec<Option<u32>>, Vec<
     let mut node_cbs = vec![None; nodes.len()];
     let mut leaf_count = 0u32;
     for (index, node) in nodes.iter().enumerate() {
-        if node.kind == FusedElementwiseKind::Input {
+        if matches!(
+            node.kind,
+            FusedElementwiseKind::Input | FusedElementwiseKind::Constant
+        ) {
             if leaf_count >= 16 {
-                return Err(invalid_input("fused eltwise needs too many input CBs"));
+                return Err(invalid_input("fused eltwise needs too many leaf CBs"));
             }
             node_cbs[index] = Some(leaf_count);
             leaf_count += 1;
@@ -1400,6 +1472,14 @@ fn constant_scalar_bits(nodes: &[FusedElementwiseNode], index: usize) -> io::Res
     }))
 }
 
+fn element_bytes(dtype: DType) -> usize {
+    match dtype {
+        DType::Float32 | DType::Int32 | DType::UInt32 => 4,
+        DType::Float16 | DType::Float16B | DType::UInt16 => 2,
+        DType::Int8 | DType::UInt8 => 1,
+    }
+}
+
 fn f16_to_f32_bits(value: u16) -> u32 {
     let sign = ((value & 0x8000) as u32) << 16;
     let exponent = ((value >> 10) & 0x1f) as i32;
@@ -1431,6 +1511,10 @@ fn is_supported_value_dtype(dtype: DType) -> bool {
             | DType::UInt16
             | DType::UInt32
     )
+}
+
+fn is_supported_convert_dtype(dtype: DType) -> bool {
+    is_supported_value_dtype(dtype) || dtype == DType::UInt8
 }
 
 fn is_float_dtype(dtype: DType) -> bool {

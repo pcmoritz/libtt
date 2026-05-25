@@ -39,6 +39,11 @@ void MAIN {
         add_binary_tile_init();
         add_binary_tile(0, dst_idx, 0);
       }
+#elif REDUCE_IS_MIN
+      if (wt > 0) {
+        ckernel::binary_min_tile_init();
+        ckernel::binary_min_tile(0, dst_idx, 0);
+      }
 #else
       if (wt > 0) {
         ckernel::binary_max_tile_init();

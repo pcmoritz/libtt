@@ -77,6 +77,12 @@ void decompose_into_dims(uint32_t flat, const uint32_t *dims, uint32_t dim_count
 
 uint32_t tile_id_for_indices(const View &view, const uint32_t *indices,
                              uint32_t *row_in_tile, uint32_t *col_in_tile) {
+  if (view.rank == 1) {
+    uint32_t col = indices[0];
+    *row_in_tile = 0;
+    *col_in_tile = col % TILE_C;
+    return col / TILE_C;
+  }
   uint32_t prefix = 0;
   for (uint32_t dim = 0; dim + 2 < view.rank; ++dim) {
     prefix = prefix * view.shape[dim] + indices[dim];

@@ -31,7 +31,8 @@ struct ReshapeKernelShape {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ReshapeProgramKey {
     cores: Vec<CoreCoord>,
-    dtype: DType,
+    input_dtype: DType,
+    output_dtype: DType,
     shape: ReshapeKernelShape,
 }
 
@@ -75,11 +76,48 @@ pub(crate) fn reshape(
     dtype: DType,
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
-    validate_input(input, dtype, input_shape)?;
+    reshape_with_dtypes(device, input, input_shape, output_shape, dtype, dtype, name)
+}
+
+pub(crate) fn bitcast_reshape(
+    device: &mut Device,
+    input: &DramBuffer,
+    input_shape: &[usize],
+    output_shape: &[usize],
+    input_dtype: DType,
+    output_dtype: DType,
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
+    if element_size(input_dtype) != element_size(output_dtype) {
+        return Err(invalid_input(format!(
+            "bitcast reshape requires equal-width element types, got {input_dtype:?} and {output_dtype:?}"
+        )));
+    }
+    reshape_with_dtypes(
+        device,
+        input,
+        input_shape,
+        output_shape,
+        input_dtype,
+        output_dtype,
+        name,
+    )
+}
+
+fn reshape_with_dtypes(
+    device: &mut Device,
+    input: &DramBuffer,
+    input_shape: &[usize],
+    output_shape: &[usize],
+    input_dtype: DType,
+    output_dtype: DType,
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
+    validate_input(input, input_dtype, input_shape)?;
     let shape = reshape_shape(input_shape, output_shape)?;
     let output_allocation_shape = tiled_allocation_shape(output_shape)?;
     let output_tiles = tiled_shape_tile_count(output_shape)?;
-    let output = device.alloc(output_tiles, dtype, &output_allocation_shape, name)?;
+    let output = device.alloc(output_tiles, output_dtype, &output_allocation_shape, name)?;
     let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
 
     let kernel = ReshapeKernel {
@@ -87,7 +125,8 @@ pub(crate) fn reshape(
         output_addr: u32_addr(output.addr, "output address")?,
         key: ReshapeProgramKey {
             cores,
-            dtype,
+            input_dtype,
+            output_dtype,
             shape,
         },
     };
@@ -193,13 +232,16 @@ fn reshape_program(key: ReshapeProgramKey) -> io::Result<Program> {
     }
     let runtime_args = runtime_args.build()?;
     Ok(Program {
-        reader_kernel: reshape_reader_source(key.dtype)?,
+        reader_kernel: reshape_reader_source(key.input_dtype)?,
         writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
-            cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(16, key.dtype)],
+            cbs: vec![
+                CBConfig::new(0, key.input_dtype),
+                CBConfig::new(16, key.output_dtype),
+            ],
             ..CompileConfig::default()
         },
-        name: format!("reshape_{:?}", key.dtype),
+        name: format!("reshape_{:?}_{:?}", key.input_dtype, key.output_dtype),
         ..Program::new(runtime_args)
     })
 }
@@ -213,6 +255,14 @@ fn reshape_reader_source(dtype: DType) -> io::Result<String> {
     Ok(format!(
         "#define RESHAPE_ELEMENT_TYPE {element_type}\n{READER}"
     ))
+}
+
+fn element_size(dtype: DType) -> usize {
+    match dtype {
+        DType::Float32 | DType::Int32 | DType::UInt32 => 4,
+        DType::Float16 | DType::Float16B | DType::UInt16 => 2,
+        DType::Int8 | DType::UInt8 => 1,
+    }
 }
 
 fn checked_volume(shape: &[usize], label: &str) -> io::Result<usize> {

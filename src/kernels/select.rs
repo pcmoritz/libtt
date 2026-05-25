@@ -6,6 +6,7 @@ use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, Runt
 use std::io;
 
 const READER: &str = include_str!("../../kernels/select_reader.cc");
+const RAW_READER: &str = include_str!("../../kernels/select_u8_reader.cc");
 const COMPUTE: &str = include_str!("../../kernels/select_compute.cc");
 const WRITER: &str = include_str!("../../kernels/select_writer.cc");
 const READER_PRED_ADDR_INDEX: usize = 0;
@@ -110,11 +111,14 @@ pub(crate) fn select(
 }
 
 fn validate_value_dtype(dtype: DType) -> io::Result<()> {
-    if matches!(dtype, DType::Float16B | DType::Float32 | DType::Int32) {
+    if matches!(
+        dtype,
+        DType::Float16B | DType::Float32 | DType::Int32 | DType::UInt32 | DType::UInt16 | DType::UInt8
+    ) {
         Ok(())
     } else {
         Err(invalid_input(format!(
-            "select currently supports Float16B, Float32, and Int32 values, got {dtype:?}"
+            "select currently supports Float16B, Float32, Int32, and unsigned integer values, got {dtype:?}"
         )))
     }
 }
@@ -185,6 +189,23 @@ fn select_program(key: SelectProgramKey) -> io::Result<Program> {
         )?;
     }
     let runtime_args = runtime_args.build()?;
+    if matches!(key.value_dtype, DType::UInt32 | DType::UInt16 | DType::UInt8) {
+        return Ok(Program {
+            reader_kernel: select_raw_reader_source(key.value_dtype)?,
+            writer_kernel: WRITER.to_owned(),
+            compile: CompileConfig {
+                cbs: vec![
+                    CBConfig::new(0, DType::UInt8),
+                    CBConfig::new(1, key.value_dtype),
+                    CBConfig::new(2, key.value_dtype),
+                    CBConfig::new(16, key.value_dtype),
+                ],
+                ..CompileConfig::default()
+            },
+            name: format!("select_raw_{:?}", key.value_dtype),
+            ..Program::new(runtime_args)
+        });
+    }
     Ok(Program {
         reader_kernel: READER.to_owned(),
         compute_kernel: COMPUTE.to_owned(),
@@ -202,6 +223,25 @@ fn select_program(key: SelectProgramKey) -> io::Result<Program> {
         name: format!("select_{:?}", key.value_dtype),
         ..Program::new(runtime_args)
     })
+}
+
+fn select_raw_reader_source(dtype: DType) -> io::Result<String> {
+    Ok(format!(
+        "#define SELECT_RAW_ELEMENT_TYPE {}\n\
+         {RAW_READER}",
+        element_type(dtype)?
+    ))
+}
+
+fn element_type(dtype: DType) -> io::Result<&'static str> {
+    match dtype {
+        DType::UInt32 => Ok("uint32_t"),
+        DType::UInt16 => Ok("uint16_t"),
+        DType::UInt8 => Ok("uint8_t"),
+        _ => Err(invalid_input(format!(
+            "select raw kernel does not support dtype {dtype:?}"
+        ))),
+    }
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {

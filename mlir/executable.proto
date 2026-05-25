@@ -50,6 +50,13 @@ message SliceOp {
   repeated int64 strides = 4;
 }
 
+message DynamicUpdateSliceOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 operand_id = 1;
+  uint32 update_id = 2;
+  repeated uint32 start_index_ids = 3;
+}
+
 message TransposeOp {
   // Index into Executable.values for this op's operand.
   uint32 operand_id = 1;
@@ -68,6 +75,9 @@ message ReduceOp {
     REDUCER_ADD = 0;
     REDUCER_MAX = 1;
     REDUCER_MUL = 2;
+    REDUCER_MIN = 3;
+    REDUCER_AND = 4;
+    REDUCER_OR = 5;
   }
 
   // Indices into Executable.values for this op's operands.
@@ -75,6 +85,20 @@ message ReduceOp {
   repeated uint32 init_value_ids = 2;
   repeated int64 dimensions = 3;
   Reducer reducer = 4;
+}
+
+message ReduceWindowOp {
+  // Indices into Executable.values for this op's operands.
+  repeated uint32 input_ids = 1;
+  repeated uint32 init_value_ids = 2;
+
+  repeated int64 window_dimensions = 3;
+  repeated int64 window_strides = 4;
+  repeated int64 base_dilations = 5;
+  repeated int64 window_dilations = 6;
+  repeated int64 padding_low = 7;
+  repeated int64 padding_high = 8;
+  ReduceOp.Reducer reducer = 9;
 }
 
 message MatmulOp {
@@ -101,6 +125,8 @@ message ConstantOp {
   // 16-bit values are duplicated into both u32 halfwords; 32-bit and narrower
   // integer/predicate values use their raw low bits.
   uint32 packed_value = 1;
+  // Logical, row-major constant payload. Empty means use packed_value as a splat.
+  bytes data = 2;
 }
 
 message SelectOp {
@@ -129,6 +155,22 @@ message GatherOp {
   int64 index_vector_dim = 8;
   repeated int64 slice_sizes = 9;
   bool indices_are_sorted = 10;
+}
+
+message ScatterOp {
+  // Indices into Executable.values for this op's operands.
+  uint32 operand_id = 1;
+  uint32 start_indices_id = 2;
+  uint32 updates_id = 3;
+
+  repeated int64 update_window_dims = 4;
+  repeated int64 inserted_window_dims = 5;
+  repeated int64 input_batching_dims = 6;
+  repeated int64 scatter_indices_batching_dims = 7;
+  repeated int64 scatter_dims_to_operand_dims = 8;
+  int64 index_vector_dim = 9;
+  bool indices_are_sorted = 10;
+  bool unique_indices = 11;
 }
 
 message IotaOp {
@@ -160,6 +202,7 @@ message FusedElementwiseOp {
       KIND_COSINE = 12;
       KIND_SINE = 13;
       KIND_CONVERT = 14;
+      KIND_LOG = 15;
     }
 
     enum CompareDirection {
@@ -184,6 +227,29 @@ message FusedElementwiseOp {
   repeated Node nodes = 2;
 }
 
+message PadOp {
+  uint32 operand_id = 1;
+  uint32 padding_value_id = 2;
+  repeated int64 edge_padding_low = 3;
+  repeated int64 edge_padding_high = 4;
+  repeated int64 interior_padding = 5;
+}
+
+message BitwiseBinaryOp {
+  enum Kind {
+    KIND_AND = 0;
+    KIND_OR = 1;
+    KIND_XOR = 2;
+    KIND_SHIFT_LEFT = 3;
+    KIND_SHIFT_RIGHT_LOGICAL = 4;
+    KIND_SHIFT_RIGHT_ARITHMETIC = 5;
+  }
+
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+  Kind kind = 3;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -204,6 +270,11 @@ message Op {
     CustomCallOp custom_call = 27;
     TopKOp top_k = 29;
     FusedElementwiseOp fused_elementwise = 30;
+    PadOp pad = 31;
+    ScatterOp scatter = 32;
+    BitwiseBinaryOp bitwise_binary = 33;
+    ReduceWindowOp reduce_window = 34;
+    DynamicUpdateSliceOp dynamic_update_slice = 35;
   }
 }
 

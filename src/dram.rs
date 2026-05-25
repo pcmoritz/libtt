@@ -150,6 +150,13 @@ struct FreeBlock {
     size: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AllocatorStats {
+    pub(crate) bytes_in_use: u64,
+    pub(crate) bytes_limit: u64,
+    pub(crate) largest_free_block_bytes: u64,
+}
+
 static ALLOCATOR_STATE_BY_DEVICE: OnceLock<Mutex<HashMap<usize, DeviceAllocatorState>>> =
     OnceLock::new();
 
@@ -402,6 +409,57 @@ fn free_allocation(local_hardware_id: usize, addr: u64, size: u64) {
             .entry(local_hardware_id)
             .or_insert_with(DeviceAllocatorState::new);
         insert_free_block(&mut device_state.free, FreeBlock { addr, size });
+    }
+}
+
+pub(crate) fn allocator_stats(local_hardware_id: usize, bank_count: usize) -> AllocatorStats {
+    let bank_count = bank_count as u64;
+    let tail_bytes_per_bank = Dram::TLB_SIZE_4G.saturating_sub(Dram::WRITE_OFFSET);
+    let bytes_limit = tail_bytes_per_bank.saturating_mul(bank_count);
+    let default_free = tail_bytes_per_bank.saturating_mul(bank_count);
+    let Some(state) = ALLOCATOR_STATE_BY_DEVICE.get() else {
+        return AllocatorStats {
+            bytes_in_use: 0,
+            bytes_limit,
+            largest_free_block_bytes: default_free,
+        };
+    };
+    let Ok(state) = state.lock() else {
+        return AllocatorStats {
+            bytes_in_use: 0,
+            bytes_limit,
+            largest_free_block_bytes: default_free,
+        };
+    };
+    let Some(device_state) = state.get(&local_hardware_id) else {
+        return AllocatorStats {
+            bytes_in_use: 0,
+            bytes_limit,
+            largest_free_block_bytes: default_free,
+        };
+    };
+
+    let allocated_span = device_state.next.saturating_sub(Dram::WRITE_OFFSET);
+    let free_bytes = device_state
+        .free
+        .iter()
+        .map(|block| block.size)
+        .fold(0u64, u64::saturating_add);
+    let tail_free = Dram::TLB_SIZE_4G.saturating_sub(device_state.next);
+    let largest_free_per_bank = device_state
+        .free
+        .iter()
+        .map(|block| block.size)
+        .chain(std::iter::once(tail_free))
+        .max()
+        .unwrap_or(0);
+
+    AllocatorStats {
+        bytes_in_use: allocated_span
+            .saturating_sub(free_bytes)
+            .saturating_mul(bank_count),
+        bytes_limit,
+        largest_free_block_bytes: largest_free_per_bank.saturating_mul(bank_count),
     }
 }
 

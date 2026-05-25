@@ -28,8 +28,15 @@ const BF16_MATMUL_TOP1_WRITER: &str = concat!(
     include_str!("../../kernels/matmul_top1_writer_sender.cc")
 );
 const BF16_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
+const F32_READER: &str = concat!(
+    include_str!("../../kernels/matmul_common.cc"),
+    include_str!("../../kernels/matmul_writer_common.cc"),
+    include_str!("../../kernels/matmul_f32_reader.cc")
+);
 const NUM_SEMAPHORES: usize = 4;
 const READER_LHS_ADDR_INDEX: usize = 0;
+const F32_READER_RHS_ADDR_INDEX: usize = 1;
+const F32_READER_OUTPUT_ADDR_INDEX: usize = 2;
 const WRITER_RHS_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
 const WRITER_PARTIAL_PAIRS_ADDR_INDEX: usize = 18;
@@ -259,6 +266,29 @@ struct MatmulBf16Kernel {
     key: MatmulProgramKey,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct MatmulF32ProgramKey {
+    cores: Vec<CoreCoord>,
+    lhs_view: MatmulOperandView,
+    rhs_view: MatmulOperandView,
+    output_view: MatmulOperandView,
+    batch_count: u32,
+    m: u32,
+    k: u32,
+    n: u32,
+    output_tile_rows: u32,
+    output_tiles_per_row: u32,
+    output_tiles_per_batch: u32,
+    output_tiles: u32,
+}
+
+struct MatmulF32Kernel {
+    lhs_addr: u32,
+    rhs_addr: u32,
+    output_addr: u32,
+    key: MatmulF32ProgramKey,
+}
+
 impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
     fn program_key(&self) -> MatmulProgramKey {
         self.key.clone()
@@ -296,6 +326,26 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
             Some(self.rhs_addr)
         } else {
             self.epilogue.writer_runtime_arg(index)
+        }
+    }
+}
+
+impl Kernel<MatmulF32ProgramKey> for MatmulF32Kernel {
+    fn program_key(&self) -> MatmulF32ProgramKey {
+        self.key.clone()
+    }
+
+    fn build_program(&self) -> io::Result<Program> {
+        f32_program(self.key.clone())
+    }
+
+    #[inline]
+    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        match index {
+            READER_LHS_ADDR_INDEX => Some(self.lhs_addr),
+            F32_READER_RHS_ADDR_INDEX => Some(self.rhs_addr),
+            F32_READER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
+            _ => None,
         }
     }
 }
@@ -411,6 +461,80 @@ pub(crate) fn matmul_bf16_dot_general(
     epilogue.finalize(device)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_f32_dot_general(
+    device: &mut Device,
+    lhs: &DramBuffer,
+    rhs: &DramBuffer,
+    lhs_logical_shape: &[usize],
+    rhs_logical_shape: &[usize],
+    output_logical_shape: &[usize],
+    lhs_batching_dimensions: &[i64],
+    rhs_batching_dimensions: &[i64],
+    lhs_contracting_dimensions: &[i64],
+    rhs_contracting_dimensions: &[i64],
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
+    if lhs.dtype != DType::Float32 || rhs.dtype != DType::Float32 {
+        return Err(invalid_input(format!(
+            "matmul_f32 requires f32 inputs, got {:?} and {:?}",
+            lhs.dtype, rhs.dtype
+        )));
+    }
+    let shape = dot_general_shape(
+        lhs_logical_shape,
+        rhs_logical_shape,
+        output_logical_shape,
+        lhs_batching_dimensions,
+        rhs_batching_dimensions,
+        lhs_contracting_dimensions,
+        rhs_contracting_dimensions,
+    )?;
+    validate_tile_count(lhs, tiled_shape_tile_count(lhs_logical_shape)?, "lhs")?;
+    validate_tile_count(rhs, tiled_shape_tile_count(rhs_logical_shape)?, "rhs")?;
+
+    let output_tiles = tiled_shape_tile_count(output_logical_shape)?;
+    let output_allocation_shape = tiled_allocation_shape(output_logical_shape)?;
+    let output_rank = output_allocation_shape.len();
+    let output_tile_rows = output_allocation_shape[output_rank - 2] / 32;
+    let output_tiles_per_row = output_allocation_shape[output_rank - 1] / 32;
+    let output_tiles_per_batch = output_tile_rows
+        .checked_mul(output_tiles_per_row)
+        .ok_or_else(|| invalid_input("matmul_f32 output tile shape overflow"))?;
+    let cores = crate::kernels::kernel::select_worker_cores(device.cores_ref(), output_tiles)?;
+    let output = device.alloc(
+        output_tiles,
+        DType::Float32,
+        &output_allocation_shape,
+        name,
+    )?;
+    let key = MatmulF32ProgramKey {
+        cores,
+        lhs_view: shape.lhs_view,
+        rhs_view: shape.rhs_view,
+        output_view: shape.output_view,
+        batch_count: u32_value(shape.batch_count, "matmul_f32 batch count")?,
+        m: u32_value(shape.m, "matmul_f32 M")?,
+        k: u32_value(shape.k, "matmul_f32 K")?,
+        n: u32_value(shape.n, "matmul_f32 N")?,
+        output_tile_rows: u32_value(output_tile_rows, "matmul_f32 output tile rows")?,
+        output_tiles_per_row: u32_value(output_tiles_per_row, "matmul_f32 output tiles per row")?,
+        output_tiles_per_batch: u32_value(
+            output_tiles_per_batch,
+            "matmul_f32 output tiles per batch",
+        )?,
+        output_tiles: u32_value(output_tiles, "matmul_f32 output tiles")?,
+    };
+    let kernel = MatmulF32Kernel {
+        lhs_addr: u32_arg(lhs.addr, "matmul_f32 lhs address")?,
+        rhs_addr: u32_arg(rhs.addr, "matmul_f32 rhs address")?,
+        output_addr: u32_arg(output.addr, "matmul_f32 output address")?,
+        key,
+    };
+    kernel.run(device)?;
+    Ok(output)
+}
+
 fn log_matmul_plan(plan: &MatmulPlan) {
     let grid = plan_grid(plan);
     let grid_rows = grid.len();
@@ -454,12 +578,12 @@ fn dot_general_shape(
     lhs_contracting_dimensions: &[i64],
     rhs_contracting_dimensions: &[i64],
 ) -> io::Result<DotGeneralMatmulShape> {
-    if !(2..=MAX_RANK).contains(&lhs_shape.len())
-        || !(2..=MAX_RANK).contains(&rhs_shape.len())
-        || output_shape.len() < 2
+    if !(1..=MAX_RANK).contains(&lhs_shape.len())
+        || !(1..=MAX_RANK).contains(&rhs_shape.len())
+        || output_shape.is_empty()
     {
         return Err(invalid_input(format!(
-            "dot_general matmul requires lhs/rhs ranks in 2..={MAX_RANK} and output rank >= 2, got lhs={lhs_shape:?} rhs={rhs_shape:?} output={output_shape:?}"
+            "dot_general matmul requires lhs/rhs ranks in 1..={MAX_RANK} and output rank >= 1, got lhs={lhs_shape:?} rhs={rhs_shape:?} output={output_shape:?}"
         )));
     }
     if lhs_shape.contains(&0) || rhs_shape.contains(&0) || output_shape.contains(&0) {
@@ -641,6 +765,7 @@ fn operand_view(
 ) -> io::Result<MatmulOperandView> {
     let allocation_shape = tiled_allocation_shape(shape)?;
     let rank = shape.len();
+    let allocation_rank = allocation_shape.len();
     let kind = operand_view_kind(rank, batch_dims, row_dims, col_dims);
     Ok(MatmulOperandView {
         kind,
@@ -651,11 +776,11 @@ fn operand_view(
         logical_rows: u32_value(logical_rows, "matmul operand logical rows")?,
         logical_cols: u32_value(logical_cols, "matmul operand logical columns")?,
         tile_rows: u32_value(
-            allocation_shape[rank - 2] / 32,
+            allocation_shape[allocation_rank - 2] / 32,
             "matmul operand source tile rows",
         )?,
         tiles_per_row: u32_value(
-            allocation_shape[rank - 1] / 32,
+            allocation_shape[allocation_rank - 1] / 32,
             "matmul operand source tiles per row",
         )?,
         shape: padded_u32_array(shape, "matmul operand shape")?,
@@ -1203,6 +1328,56 @@ fn bf16_program(
             .direct_grid
             .is_none()
             .then(|| (plan.rows.clone(), plan.cols.clone())),
+        ..Program::new(runtime_args)
+    })
+}
+
+fn f32_program(key: MatmulF32ProgramKey) -> io::Result<Program> {
+    let mut runtime_args = RuntimeArgsBuilder::new(
+        0,
+        Vec::new(),
+        vec![
+            READER_LHS_ADDR_INDEX,
+            F32_READER_RHS_ADDR_INDEX,
+            F32_READER_OUTPUT_ADDR_INDEX,
+        ],
+        Vec::new(),
+    );
+    for (core_index, &core) in key.cores.iter().enumerate() {
+        let (offset, n_tiles) =
+            crate::kernels::kernel::split_tile_range(key.output_tiles, core_index, key.cores.len())?;
+        let mut reader = vec![
+            0,
+            0,
+            0,
+            offset,
+            n_tiles,
+            key.batch_count,
+            key.m,
+            key.k,
+            key.n,
+            key.output_tile_rows,
+            key.output_tiles_per_row,
+            key.output_tiles_per_batch,
+        ];
+        append_view_args(&mut reader, &key.lhs_view);
+        append_view_args(&mut reader, &key.rhs_view);
+        append_view_args(&mut reader, &key.output_view);
+        runtime_args.add_core(core, Vec::new(), reader, Vec::new())?;
+    }
+    let runtime_args = runtime_args.build()?;
+    Ok(Program {
+        reader_kernel: F32_READER.to_owned(),
+        compile: CompileConfig {
+            cbs: vec![
+                CBConfig::new(0, DType::Float32),
+                CBConfig::new(1, DType::Float32),
+                CBConfig::new(4, DType::Float32),
+                CBConfig::new(16, DType::Float32),
+            ],
+            ..CompileConfig::default()
+        },
+        name: format!("matmul_f32_{}x{}x{}", key.m, key.k, key.n),
         ..Program::new(runtime_args)
     })
 }
