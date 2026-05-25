@@ -181,6 +181,7 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
                 CBConfig {
                     index: 16,
                     dtype: key.dtype,
+                    compute_dtype: key.dtype,
                     tiles: 4,
                 },
             ],

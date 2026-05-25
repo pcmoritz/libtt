@@ -840,9 +840,11 @@ fn device_defines(
 
 fn ckernel_headers(config: &CompileConfig) -> BTreeMap<String, String> {
     let mut formats = vec![DType::Float16B; 32];
+    let mut compute_formats = vec![DType::Float16B; 32];
     for cb in &config.cbs {
         if cb.index < formats.len() {
             formats[cb.index] = cb.dtype;
+            compute_formats[cb.index] = cb.compute_dtype;
         }
     }
     let tile_sizes = formats
@@ -877,11 +879,11 @@ fn ckernel_headers(config: &CompileConfig) -> BTreeMap<String, String> {
         "DstSync::SyncHalf"
     };
 
-    let data_fmt = |prefix: &str, ctype: &str| -> String {
+    let data_fmt = |prefix: &str, ctype: &str, src: &[DType], dst: &[DType]| -> String {
         format!(
             "#pragma once\n#include <cstdint>\nconstexpr {ctype} {prefix}_src_format[32] = {{{}}};\nconstexpr {ctype} {prefix}_dst_format[32] = {{{}}};\n",
-            join(&formats),
-            join(&formats)
+            join(src),
+            join(dst)
         )
     };
     let tile_dims = |prefix: &str| -> String {
@@ -900,11 +902,11 @@ fn ckernel_headers(config: &CompileConfig) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             "chlkc_unpack_data_format.h".to_owned(),
-            data_fmt("unpack", "std::int32_t"),
+            data_fmt("unpack", "std::int32_t", &formats, &compute_formats),
         ),
         (
             "chlkc_pack_data_format.h".to_owned(),
-            data_fmt("pack", "unsigned char"),
+            data_fmt("pack", "unsigned char", &compute_formats, &formats),
         ),
         ("chlkc_unpack_tile_dims.h".to_owned(), tile_dims("unpack")),
         ("chlkc_pack_tile_dims.h".to_owned(), tile_dims("pack")),
@@ -1853,6 +1855,7 @@ mod tests {
             cbs: vec![CBConfig {
                 index: 1,
                 dtype: DType::UInt8,
+                compute_dtype: DType::UInt8,
                 tiles: 4,
             }],
             approx: true,
@@ -1868,6 +1871,18 @@ mod tests {
         assert!(headers["chlkc_dst_sync_mode.h"].contains("DstSync::SyncFull"));
         assert!(headers["chlkc_math_fidelity.h"].contains("0"));
         assert!(headers["chlkc_math_approx_mode.h"].contains("true"));
+
+        let config = CompileConfig {
+            cbs: vec![CBConfig::new(0, DType::Float32).with_compute_dtype(DType::Float16B)],
+            ..CompileConfig::default()
+        };
+        let headers = ckernel_headers(&config);
+        assert!(headers["chlkc_unpack_data_format.h"]
+            .contains("unpack_src_format[32] = {0,"));
+        assert!(headers["chlkc_unpack_data_format.h"]
+            .contains("unpack_dst_format[32] = {5,"));
+        assert!(headers["chlkc_pack_data_format.h"].contains("pack_src_format[32] = {5,"));
+        assert!(headers["chlkc_pack_data_format.h"].contains("pack_dst_format[32] = {0,"));
     }
 
     #[test]

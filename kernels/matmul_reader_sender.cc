@@ -27,7 +27,7 @@ void kernel_main() {
   const InterleavedAddrGenFast<true> in0_gen = {
       .bank_base_address = A(0),
       .page_size = tile_bytes,
-      .data_format = DataFormat::Float16_b,
+      .data_format = get_dataformat(cb_in0),
   };
   for (uint32_t local_batch = 0; local_batch < local_batch_count; local_batch++) {
     const uint32_t batch = batch_start + local_batch;

@@ -116,18 +116,30 @@ void ensure_source_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile
 }
 
 void copy_element_from_source(uint32_t cb_source, uint32_t dst_addr, uint32_t source_row,
-                              uint32_t source_col, uint32_t dst_row, uint32_t dst_col) {
-  volatile tt_l1_ptr uint16_t *source =
-      reinterpret_cast<volatile tt_l1_ptr uint16_t *>(get_read_ptr(cb_source));
-  volatile tt_l1_ptr uint16_t *dst = reinterpret_cast<volatile tt_l1_ptr uint16_t *>(dst_addr);
-  dst[tile_element_index(dst_row, dst_col)] =
-      source[tile_element_index(source_row, source_col)];
+                              uint32_t source_col, uint32_t dst_row, uint32_t dst_col,
+                              uint32_t datum_bytes) {
+  const uint32_t dst_index = tile_element_index(dst_row, dst_col);
+  const uint32_t source_index = tile_element_index(source_row, source_col);
+  if (datum_bytes == sizeof(uint32_t)) {
+    volatile tt_l1_ptr uint32_t *source =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_read_ptr(cb_source));
+    volatile tt_l1_ptr uint32_t *dst =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t *>(dst_addr);
+    dst[dst_index] = source[source_index];
+  } else {
+    volatile tt_l1_ptr uint16_t *source =
+        reinterpret_cast<volatile tt_l1_ptr uint16_t *>(get_read_ptr(cb_source));
+    volatile tt_l1_ptr uint16_t *dst =
+        reinterpret_cast<volatile tt_l1_ptr uint16_t *>(dst_addr);
+    dst[dst_index] = source[source_index];
+  }
 }
 
 void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &view,
                        uint32_t batch, uint32_t row_tile, uint32_t col_tile,
                        uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
   zero_tile_at(dst_addr, tile_bytes);
+  const uint32_t datum_bytes = tile_bytes / (TILE_R * TILE_C);
   uint32_t row_base = row_tile * TILE_R;
   uint32_t col_base = col_tile * TILE_C;
   if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
@@ -154,7 +166,8 @@ void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &vi
       uint32_t source_col = 0;
       uint32_t source_tile = tile_id_for_indices(view, indices, &source_row, &source_col);
       ensure_source_tile(input, source_tile, cb_source, &loaded_tile);
-      copy_element_from_source(cb_source, dst_addr, source_row, source_col, row, col);
+      copy_element_from_source(cb_source, dst_addr, source_row, source_col, row, col,
+                               datum_bytes);
     }
   }
   if (loaded_tile != INVALID_TILE) {
@@ -177,6 +190,7 @@ void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const 
                                uint32_t dst_addr, uint32_t tile_bytes,
                                uint32_t cb_source) {
   zero_tile_at(dst_addr, tile_bytes);
+  const uint32_t datum_bytes = tile_bytes / (TILE_R * TILE_C);
   uint32_t row_base = row_tile * TILE_R;
   uint32_t col_base = col_tile * TILE_C;
   if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
@@ -202,7 +216,8 @@ void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const 
       if (row_base + row >= view.logical_rows) {
         continue;
       }
-      copy_element_from_source(cb_source, dst_addr, source_row, source_col + row, row, col);
+      copy_element_from_source(cb_source, dst_addr, source_row, source_col + row, row, col,
+                               datum_bytes);
     }
     cb_pop_front(cb_source, 1);
   }

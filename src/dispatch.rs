@@ -78,6 +78,8 @@ pub enum MathFidelity {
 pub struct CBConfig {
     pub index: usize,
     pub dtype: DType,
+    // Format presented to compute unpack/pack; storage/page size still comes from dtype.
+    pub compute_dtype: DType,
     pub tiles: usize,
 }
 
@@ -86,8 +88,14 @@ impl CBConfig {
         Self {
             index,
             dtype,
+            compute_dtype: dtype,
             tiles: 2,
         }
+    }
+
+    pub fn with_compute_dtype(mut self, compute_dtype: DType) -> Self {
+        self.compute_dtype = compute_dtype;
+        self
     }
 }
 
@@ -836,16 +844,19 @@ mod tests {
                 CBConfig {
                     index: 0,
                     dtype: DType::Float16,
+                    compute_dtype: DType::Float16,
                     tiles: 2,
                 },
                 CBConfig {
                     index: 16,
                     dtype: DType::Float16B,
+                    compute_dtype: DType::Float16B,
                     tiles: 1,
                 },
                 CBConfig {
                     index: 24,
                     dtype: DType::Float16B,
+                    compute_dtype: DType::Float16B,
                     tiles: 1,
                 },
             ],

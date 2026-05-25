@@ -393,6 +393,7 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
                 CBConfig {
                     index: 17,
                     dtype: key.dtype,
+                    compute_dtype: key.dtype,
                     tiles: output_tiles,
                 },
             ],

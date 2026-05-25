@@ -2524,7 +2524,7 @@ fn execute_matmul(
         }
 
         let matmul_shape = dims_i64_to_usize(&matmul_desc.dims)?;
-        let matmul_output = kernels::matmul::matmul_bf16_dot_general(
+        let matmul_output = kernels::matmul::matmul_dot_general(
             device,
             lhs_dram,
             rhs_dram,
@@ -2574,44 +2574,19 @@ fn execute_matmul(
     })?;
     let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    if lhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+    let bf16_matmul = lhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        && rhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        && matches!(output_dtype, DType::Float16B | DType::Float32);
+    let f32_matmul = lhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_F32
         && rhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_F32
-        && output_dtype == DType::Float32
-    {
-        let output_dram = kernels::matmul::matmul_f32_dot_general(
-            device,
-            lhs_dram,
-            rhs_dram,
-            &lhs_shape,
-            &rhs_shape,
-            &output_shape,
-            &dimension_numbers.lhs_batching_dimensions,
-            &dimension_numbers.rhs_batching_dimensions,
-            &dimension_numbers.lhs_contracting_dimensions,
-            &dimension_numbers.rhs_contracting_dimensions,
-            "pjrt_matmul_f32",
-        )
-        .map_err(io_error)?;
-        return store_output_buffer(
-            values,
-            plan,
-            output_id,
-            output_desc.dims.clone(),
-            output_dram,
-            context,
-            "matmul",
-        );
-    }
-    if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || !matches!(output_dtype, DType::Float16B | DType::Float32)
-    {
+        && output_dtype == DType::Float32;
+    if !bf16_matmul && !f32_matmul {
         return Err(invalid_argument(format!(
-            "TT executable matmul requires bf16 inputs and bf16/f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
+            "TT executable matmul requires bf16 inputs with bf16/f32 output or f32 inputs with f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
             lhs.buffer_type, rhs.buffer_type
         )));
     }
-    let output_dram = kernels::matmul::matmul_bf16_dot_general(
+    let output_dram = kernels::matmul::matmul_dot_general(
         device,
         lhs_dram,
         rhs_dram,
