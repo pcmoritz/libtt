@@ -44,6 +44,17 @@ void fill_tile(uint32_t cb, Element value) {
   }
 }
 
+void fill_padded_columns(uint32_t tile_l1_addr, uint32_t valid_cols,
+                         uint32_t identity_bits) {
+  volatile tt_l1_ptr uint32_t *tile =
+      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(tile_l1_addr);
+  for (uint32_t row = 0; row < TILE_R; ++row) {
+    for (uint32_t col = valid_cols; col < TILE_C; ++col) {
+      tile[tile_element_index(row, col)] = identity_bits;
+    }
+  }
+}
+
 uint32_t read_tile_to_reserved_cb(const InterleavedAddrGenFast<true> &input,
                                   uint32_t tile_id, uint32_t cb) {
   cb_reserve_back(cb, 1);
@@ -162,11 +173,38 @@ void kernel_main() {
   uint32_t input_addr = get_arg_val<uint32_t>(0);
   uint32_t group_offset = get_arg_val<uint32_t>(1);
   uint32_t reduce_groups = get_arg_val<uint32_t>(2);
-  uint32_t reduce_count = get_arg_val<uint32_t>(3);
 
   constexpr uint32_t cb_reduce = tt::CBIndex::c_0;
+
+  if constexpr (REDUCE_LAST_DIM_TILED) {
+    uint32_t width_tiles = get_arg_val<uint32_t>(3);
+    uint32_t valid_last_width = get_arg_val<uint32_t>(4);
+    uint32_t padding_identity_bits = get_arg_val<uint32_t>(5);
+    const InterleavedAddrGenFast<true> input = {
+        .bank_base_address = input_addr,
+        .page_size = get_tile_size(cb_reduce),
+        .data_format = get_dataformat(cb_reduce),
+    };
+
+    for (uint32_t group = 0; group < reduce_groups; ++group) {
+      uint32_t tile_base = (group_offset + group) * width_tiles;
+      for (uint32_t wt = 0; wt < width_tiles; ++wt) {
+        cb_reserve_back(cb_reduce, 1);
+        uint32_t tile_l1_addr = get_write_ptr(cb_reduce);
+        noc_async_read_tile(tile_base + wt, input, tile_l1_addr);
+        noc_async_read_barrier();
+        if (wt == width_tiles - 1 && valid_last_width < TILE_C) {
+          fill_padded_columns(tile_l1_addr, valid_last_width, padding_identity_bits);
+        }
+        cb_push_back(cb_reduce, 1);
+      }
+    }
+    return;
+  }
+
   constexpr uint32_t cb_source = tt::CBIndex::c_1;
-  const InterleavedAddrGenFast<true> input = {
+  uint32_t reduce_count = get_arg_val<uint32_t>(3);
+  const InterleavedAddrGenFast<true> source_input = {
       .bank_base_address = input_addr,
       .page_size = get_tile_size(cb_source),
       .data_format = get_dataformat(cb_source),
@@ -187,7 +225,7 @@ void kernel_main() {
 
         uint32_t input_coords[COORD_COUNT];
         input_coords_for_output(output_coords, reduce_index, input_coords);
-        Element value = read_input_element(input, input_coords, &loaded_source_tile);
+        Element value = read_input_element(source_input, input_coords, &loaded_source_tile);
         write_reduce_element(0, lane, value);
       }
 

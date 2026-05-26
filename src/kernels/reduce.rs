@@ -39,6 +39,22 @@ impl ReduceOp {
         matches!(self, Self::Sum)
     }
 
+    fn cpp_pool_type(self) -> &'static str {
+        match self {
+            Self::Sum => "ckernel::PoolType::SUM",
+            Self::Max => "ckernel::PoolType::MAX",
+            Self::Min => "ckernel::PoolType::MIN",
+        }
+    }
+
+    fn padding_identity_bits(self) -> u32 {
+        match self {
+            Self::Sum => 0.0f32.to_bits(),
+            Self::Max => f32::NEG_INFINITY.to_bits(),
+            Self::Min => f32::INFINITY.to_bits(),
+        }
+    }
+
     fn is_min(self) -> bool {
         matches!(self, Self::Min)
     }
@@ -68,6 +84,7 @@ impl ReduceOp {
 struct ReduceKernelShape {
     reduce_dim: u32,
     reduce_count: u32,
+    valid_last_width: u32,
     output_tiles: u32,
     inner_output_tiles: u32,
     output_tile_rows_per_prefix: u32,
@@ -95,11 +112,7 @@ impl ReducePlan {
     ) -> io::Result<Self> {
         if !matches!(
             dtype,
-            DType::Float32
-                | DType::Float16B
-                | DType::Int32
-                | DType::UInt32
-                | DType::UInt16
+            DType::Float32 | DType::Float16B | DType::Int32 | DType::UInt32 | DType::UInt16
         ) {
             return Err(invalid_input(format!(
                 "reduce kernel currently supports Float32, BF16, UInt16, UInt32, and Int32 inputs, got {dtype:?}"
@@ -140,6 +153,7 @@ impl ReducePlan {
 
         let output_allocation_shape = tiled_allocation_shape(output_shape)?;
         let reduce_count = input_shape[reduce_dim];
+        let valid_last_width = valid_last_tile_width(input_shape[input_shape.len() - 1])?;
         let output_tiles = tiled_shape_tile_count(output_shape)?;
         let output_inner_tiles =
             output_allocation_shape[output_allocation_shape.len() - 1] / TILE_C;
@@ -174,6 +188,7 @@ impl ReducePlan {
             shape: ReduceKernelShape {
                 reduce_dim: u32_arg(reduce_dim, "reduce dimension")?,
                 reduce_count: u32_arg(reduce_count, "reduce element count")?,
+                valid_last_width,
                 output_tiles: u32_arg(output_tiles, "output tile count")?,
                 inner_output_tiles: u32_arg(inner_output_tiles, "inner output tile count")?,
                 output_tile_rows_per_prefix: u32_arg(
@@ -299,6 +314,7 @@ fn validate_input(input: &DramBuffer, plan: &ReducePlan) -> io::Result<()> {
 
 fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
     let shape = key.shape;
+    let use_tiled_last_dim = use_tiled_last_dim(&key);
     let ranges = reduce_core_ranges(shape, key.cores.len())?;
     let max_core_output_tiles = ranges
         .iter()
@@ -317,6 +333,28 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
         Vec::new(),
     );
     for (&core, range) in key.cores.iter().zip(ranges.iter()) {
+        let reader_args = if use_tiled_last_dim {
+            vec![
+                0,
+                range.group_offset,
+                range.reduce_groups,
+                key.input_tiles_per_row,
+                shape.valid_last_width,
+                key.op.padding_identity_bits(),
+            ]
+        } else {
+            vec![
+                0,
+                range.group_offset,
+                range.reduce_groups,
+                shape.reduce_count,
+            ]
+        };
+        let compute_args = if use_tiled_last_dim {
+            vec![range.reduce_groups, key.input_tiles_per_row]
+        } else {
+            vec![range.reduce_groups, shape.reduce_count]
+        };
         runtime_args.add_core(
             core,
             vec![
@@ -330,20 +368,15 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
                 shape.output_dim1,
                 shape.output_tile_rows_per_prefix,
             ],
-            vec![
-                0,
-                range.group_offset,
-                range.reduce_groups,
-                shape.reduce_count,
-            ],
-            vec![range.reduce_groups, shape.reduce_count],
+            reader_args,
+            compute_args,
         )?;
     }
     let runtime_args = runtime_args.build()?;
     let compute_dtype = reduce_compute_dtype(key.dtype)?;
     Ok(Program {
-        reader_kernel: reduce_reader_source(&key)?,
-        compute_kernel: reduce_compute_source(key.op, compute_dtype),
+        reader_kernel: reduce_reader_source(&key, use_tiled_last_dim)?,
+        compute_kernel: reduce_compute_source(key.op, compute_dtype, use_tiled_last_dim),
         writer_kernel: reduce_writer_source(key.dtype)?,
         compile: CompileConfig {
             cbs: vec![
@@ -365,9 +398,16 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
     })
 }
 
-fn reduce_reader_source(key: &ReduceProgramKey) -> io::Result<String> {
+fn use_tiled_last_dim(key: &ReduceProgramKey) -> bool {
+    key.dtype == DType::Float32
+        && !key.op.is_min()
+        && key.shape.reduce_dim as usize == key.input_shape.len().saturating_sub(1)
+}
+
+fn reduce_reader_source(key: &ReduceProgramKey, use_tiled_last_dim: bool) -> io::Result<String> {
     Ok(format!(
-        "#define REDUCE_RANK {}\n\
+        "#define REDUCE_LAST_DIM_TILED {}\n\
+         #define REDUCE_RANK {}\n\
          #define REDUCE_DIMENSION {}\n\
          #define REDUCE_INPUT_SHAPE {}\n\
          #define REDUCE_OUTPUT_SHAPE {}\n\
@@ -377,6 +417,7 @@ fn reduce_reader_source(key: &ReduceProgramKey) -> io::Result<String> {
          #define REDUCE_IDENTITY {}\n\
          #define REDUCE_ELEMENT_TYPE {}\n\
          {READER}",
+        bool_define(use_tiled_last_dim),
         key.input_shape.len(),
         key.shape.reduce_dim,
         cpp_u32_array(&key.input_shape),
@@ -389,9 +430,11 @@ fn reduce_reader_source(key: &ReduceProgramKey) -> io::Result<String> {
     ))
 }
 
-fn reduce_compute_source(op: ReduceOp, compute_dtype: DType) -> String {
+fn reduce_compute_source(op: ReduceOp, compute_dtype: DType, use_tiled_last_dim: bool) -> String {
     COMPUTE
+        .replace("REDUCE_LAST_DIM_TILED", bool_define(use_tiled_last_dim))
         .replace("REDUCE_DATA_FORMAT", data_format(compute_dtype))
+        .replace("REDUCE_POOL_TYPE", op.cpp_pool_type())
         .replace("REDUCE_IS_SUM", bool_define(op.is_sum()))
         .replace("REDUCE_IS_MIN", bool_define(op.is_min()))
 }
@@ -514,8 +557,8 @@ fn output_rows_before_tile_row(shape: ReduceKernelShape, tile_row: u32) -> io::R
     let prefix = tile_row / tile_rows_per_prefix;
     let row_tile = tile_row % tile_rows_per_prefix;
     let prefix_rows = checked_mul_u32(prefix, shape.output_dim0, "reduce prefix row offset")?;
-    let row_offset = checked_mul_u32(row_tile, TILE_R as u32, "output row offset")?
-        .min(shape.output_dim0);
+    let row_offset =
+        checked_mul_u32(row_tile, TILE_R as u32, "output row offset")?.min(shape.output_dim0);
     prefix_rows
         .checked_add(row_offset)
         .ok_or_else(|| invalid_input("reduce output row offset overflow"))
@@ -526,6 +569,16 @@ fn output_tile_rows(shape: ReduceKernelShape) -> io::Result<u32> {
         return Err(invalid_input("inner output tile count must be nonzero"));
     }
     Ok(shape.output_tiles / shape.inner_output_tiles)
+}
+
+fn valid_last_tile_width(logical_width: usize) -> io::Result<u32> {
+    let width = logical_width % TILE_C;
+    let width = if width == 0 && logical_width != 0 {
+        TILE_C
+    } else {
+        width
+    };
+    u32_arg(width, "valid last reduction tile width")
 }
 
 fn u32_shape(shape: &[usize], name: &str) -> io::Result<Vec<u32>> {
@@ -588,6 +641,7 @@ mod tests {
         let plan =
             ReducePlan::new(DType::Float32, &[2, 30], &[2], &[1], ReduceReducer::Max).unwrap();
         assert_eq!(plan.shape.reduce_count, 30);
+        assert_eq!(plan.shape.valid_last_width, 30);
     }
 
     #[test]
@@ -595,6 +649,6 @@ mod tests {
         let plan =
             ReducePlan::new(DType::Float32, &[2, 64], &[2], &[1], ReduceReducer::Add).unwrap();
         assert_eq!(plan.shape.reduce_count, 64);
+        assert_eq!(plan.shape.valid_last_width, TILE_C as u32);
     }
-
 }
