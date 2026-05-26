@@ -6,7 +6,6 @@ use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, Runt
 use std::io;
 
 const READER: &str = include_str!("../../kernels/select_reader.cc");
-const RAW_READER: &str = include_str!("../../kernels/select_u8_reader.cc");
 const COMPUTE: &str = include_str!("../../kernels/select_compute.cc");
 const WRITER: &str = include_str!("../../kernels/select_writer.cc");
 const READER_PRED_ADDR_INDEX: usize = 0;
@@ -228,7 +227,7 @@ fn select_program(key: SelectProgramKey) -> io::Result<Program> {
 fn select_raw_reader_source(dtype: DType) -> io::Result<String> {
     Ok(format!(
         "#define SELECT_RAW_ELEMENT_TYPE {}\n\
-         {RAW_READER}",
+         {READER}",
         element_type(dtype)?
     ))
 }
