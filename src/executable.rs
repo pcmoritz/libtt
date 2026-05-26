@@ -124,11 +124,6 @@ pub(crate) enum Op {
         indices_are_sorted: bool,
         unique_indices: bool,
     },
-    BitwiseBinary {
-        input_ids: [u32; 2],
-        output_id: u32,
-        kind: BitwiseBinaryKind,
-    },
     Pad {
         input_id: u32,
         padding_value_id: u32,
@@ -176,6 +171,7 @@ pub(crate) enum FusedElementwiseKind {
     Divide,
     Power,
     Max,
+    Bitwise(BitwiseBinaryKind),
     Compare(CompareDirection),
     Cosine,
     Sine,
@@ -342,6 +338,47 @@ fn parse_bitwise_binary_kind(kind: ProtoBitwiseBinaryKind) -> Result<BitwiseBina
         ProtoBitwiseBinaryKind::ShiftRightArithmetic => {
             Ok(BitwiseBinaryKind::ShiftRightArithmetic)
         }
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn value_element_type(
+    values: &[ValueDesc],
+    value_id: u32,
+    label: &str,
+) -> Result<PJRT_Buffer_Type, String> {
+    values
+        .get(value_id as usize)
+        .map(|value| value.element_type)
+        .ok_or_else(|| {
+            format!("TT executable bitwise {label} value id {value_id} is out of bounds")
+        })
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn fused_input_node(input_index: u32, element_type: PJRT_Buffer_Type) -> FusedElementwiseNode {
+    FusedElementwiseNode {
+        kind: FusedElementwiseKind::Input,
+        input_nodes: Vec::new(),
+        input_index,
+        packed_value: 0,
+        element_type,
+        single_tile_broadcast: false,
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn fused_bitwise_node(
+    kind: BitwiseBinaryKind,
+    element_type: PJRT_Buffer_Type,
+) -> FusedElementwiseNode {
+    FusedElementwiseNode {
+        kind: FusedElementwiseKind::Bitwise(kind),
+        input_nodes: vec![0, 1],
+        input_index: 0,
+        packed_value: 0,
+        element_type,
+        single_tile_broadcast: false,
     }
 }
 
@@ -533,11 +570,26 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     indices_are_sorted: scatter.indices_are_sorted,
                     unique_indices: scatter.unique_indices,
                 }),
-                Kind::BitwiseBinary(bitwise) => Ok(Op::BitwiseBinary {
-                    input_ids: [bitwise.lhs_id, bitwise.rhs_id],
-                    output_id: op_desc.output_id,
-                    kind: parse_bitwise_binary_kind(bitwise.kind())?,
-                }),
+                Kind::BitwiseBinary(bitwise) => {
+                    let lhs_id = bitwise.lhs_id;
+                    let rhs_id = bitwise.rhs_id;
+                    let output_id = op_desc.output_id;
+                    let lhs_element_type = value_element_type(&values, lhs_id, "lhs")?;
+                    let rhs_element_type = value_element_type(&values, rhs_id, "rhs")?;
+                    let output_element_type = value_element_type(&values, output_id, "output")?;
+                    Ok(Op::FusedElementwise {
+                        input_ids: vec![lhs_id, rhs_id],
+                        output_id,
+                        nodes: vec![
+                            fused_input_node(0, lhs_element_type),
+                            fused_input_node(1, rhs_element_type),
+                            fused_bitwise_node(
+                                parse_bitwise_binary_kind(bitwise.kind())?,
+                                output_element_type,
+                            ),
+                        ],
+                    })
+                }
                 Kind::Pad(pad) => Ok(Op::Pad {
                     input_id: pad.operand_id,
                     padding_value_id: pad.padding_value_id,
@@ -703,11 +755,6 @@ pub(crate) enum Op {
         dimension_numbers: ScatterDimensionNumbers,
         indices_are_sorted: bool,
         unique_indices: bool,
-    },
-    BitwiseBinary {
-        input_ids: [u32; 2],
-        output_id: u32,
-        kind: BitwiseBinaryKind,
     },
     Pad {
         input_id: u32,

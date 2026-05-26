@@ -2765,6 +2765,7 @@ fn fused_constant_packed_value(
                 let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
                 ConstantScalar::F32(lhs.as_f32()?.max(rhs.as_f32()?))
             }
+            executable::FusedElementwiseKind::Bitwise(_) => return None,
             executable::FusedElementwiseKind::Compare(direction) => {
                 let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
                 ConstantScalar::Bool(scalar_compare(*lhs, *rhs, direction)?)
@@ -2861,6 +2862,7 @@ fn fused_constant_node_value(
             let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
             ConstantScalar::F32(lhs.as_f32()?.max(rhs.as_f32()?))
         }
+        executable::FusedElementwiseKind::Bitwise(_) => return None,
         executable::FusedElementwiseKind::Compare(direction) => {
             let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
             ConstantScalar::Bool(scalar_compare(lhs, rhs, direction)?)
@@ -3628,75 +3630,6 @@ fn execute_scatter(
     )
 }
 
-fn execute_bitwise_binary(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    device: &mut Device,
-    context: &OutputContext,
-    input_ids: [u32; 2],
-    output_id: u32,
-    kind: executable::BitwiseBinaryKind,
-) -> Result<(), *mut PJRT_Error> {
-    let lhs = device_buffer_for_value(values, input_ids[0], "bitwise.lhs")?.clone();
-    let rhs = device_buffer_for_value(values, input_ids[1], "bitwise.rhs")?.clone();
-    if lhs.buffer_type != rhs.buffer_type {
-        return Err(invalid_argument(format!(
-            "TT executable bitwise input element types must match, got {:?} and {:?}",
-            lhs.buffer_type, rhs.buffer_type
-        )));
-    }
-    if lhs.dims != rhs.dims {
-        return Err(invalid_argument(format!(
-            "TT executable bitwise input shapes must match, got {:?} and {:?}",
-            lhs.dims, rhs.dims
-        )));
-    }
-    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable bitwise output id {output_id} is out of bounds"
-        ))
-    })?;
-    if output_desc.element_type != lhs.buffer_type || output_desc.dims != lhs.dims {
-        return Err(invalid_argument(format!(
-            "TT executable bitwise output must be {:?} {:?}, got {:?} {:?}",
-            lhs.buffer_type, lhs.dims, output_desc.element_type, output_desc.dims
-        )));
-    }
-
-    let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable bitwise lhs buffer has no device allocation",
-        ));
-    };
-    let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable bitwise rhs buffer has no device allocation",
-        ));
-    };
-
-    let shape = dims_i64_to_usize(&lhs.dims)?;
-    let dtype = pjrt_buffer_type_to_dtype(lhs.buffer_type)?;
-    let output_dram = kernels::bitwise::bitwise_binary(
-        device,
-        lhs_dram,
-        rhs_dram,
-        &shape,
-        dtype,
-        kind,
-        "pjrt_bitwise",
-    )
-    .map_err(io_error)?;
-    store_output_buffer(
-        values,
-        plan,
-        output_id,
-        output_desc.dims.clone(),
-        output_dram,
-        context,
-        "bitwise",
-    )
-}
-
 fn execute_iota(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -4027,19 +3960,6 @@ fn execute_executable_v1(
                 *input_ids,
                 *output_id,
                 dimension_numbers,
-            )?,
-            executable::Op::BitwiseBinary {
-                input_ids,
-                output_id,
-                kind,
-            } => execute_bitwise_binary(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                *input_ids,
-                *output_id,
-                *kind,
             )?,
             executable::Op::Iota {
                 output_id,
