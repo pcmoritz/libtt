@@ -13,6 +13,8 @@ use std::io;
 const READER: &str = include_str!("../../kernels/reduce_reader.cc");
 const COMPUTE: &str = include_str!("../../kernels/reduce_compute.cc");
 const WRITER: &str = include_str!("../../kernels/reduce_writer.cc");
+const BITWISE_READER: &str = include_str!("../../kernels/bitwise_reduce_lastdim_reader.cc");
+const BITWISE_WRITER: &str = include_str!("../../kernels/broadcast_writer.cc");
 const READER_INPUT_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 
@@ -21,6 +23,8 @@ enum ReduceOp {
     Sum,
     Max,
     Min,
+    And,
+    Or,
 }
 
 impl ReduceOp {
@@ -29,10 +33,16 @@ impl ReduceOp {
             ReduceReducer::Add => Ok(Self::Sum),
             ReduceReducer::Max => Ok(Self::Max),
             ReduceReducer::Min => Ok(Self::Min),
-            ReduceReducer::Mul | ReduceReducer::And | ReduceReducer::Or => Err(invalid_input(
-                "reduce kernel currently supports add, min, and max reducers",
+            ReduceReducer::And => Ok(Self::And),
+            ReduceReducer::Or => Ok(Self::Or),
+            ReduceReducer::Mul => Err(invalid_input(
+                "reduce kernel currently supports add, min, max, and bitwise and/or reducers",
             )),
         }
+    }
+
+    fn is_bitwise(self) -> bool {
+        matches!(self, Self::And | Self::Or)
     }
 
     fn is_sum(self) -> bool {
@@ -44,6 +54,7 @@ impl ReduceOp {
             Self::Sum => "ckernel::PoolType::SUM",
             Self::Max => "ckernel::PoolType::MAX",
             Self::Min => "ckernel::PoolType::MIN",
+            Self::And | Self::Or => unreachable!("bitwise reduce does not use compute pool type"),
         }
     }
 
@@ -52,6 +63,7 @@ impl ReduceOp {
             Self::Sum => 0.0f32.to_bits(),
             Self::Max => f32::NEG_INFINITY.to_bits(),
             Self::Min => f32::INFINITY.to_bits(),
+            Self::And | Self::Or => 0,
         }
     }
 
@@ -72,9 +84,22 @@ impl ReduceOp {
             (Self::Max, DType::UInt32 | DType::UInt16) => Ok("0"),
             (Self::Min, DType::UInt32) => Ok("0xffffffffu"),
             (Self::Min, DType::UInt16) => Ok("0xffffu"),
+            (Self::And | Self::Or, _) => Err(invalid_input(
+                "bitwise reduce does not use arithmetic identity literals",
+            )),
             _ => Err(invalid_input(format!(
                 "reduce kernel does not support {:?} with dtype {dtype:?}",
                 self
+            ))),
+        }
+    }
+
+    fn bitwise_op_value(self) -> io::Result<u32> {
+        match self {
+            Self::And => Ok(0),
+            Self::Or => Ok(1),
+            _ => Err(invalid_input(format!(
+                "arithmetic reduce op {self:?} has no bitwise op value"
             ))),
         }
     }
@@ -100,6 +125,7 @@ pub(crate) struct ReducePlan {
     shape: ReduceKernelShape,
     op: ReduceOp,
     dtype: DType,
+    identity: Option<u32>,
 }
 
 impl ReducePlan {
@@ -109,15 +135,10 @@ impl ReducePlan {
         output_shape: &[usize],
         dimensions: &[i64],
         reducer: ReduceReducer,
+        identity: Option<u32>,
     ) -> io::Result<Self> {
-        if !matches!(
-            dtype,
-            DType::Float32 | DType::Float16B | DType::Int32 | DType::UInt32 | DType::UInt16
-        ) {
-            return Err(invalid_input(format!(
-                "reduce kernel currently supports Float32, BF16, UInt16, UInt32, and Int32 inputs, got {dtype:?}"
-            )));
-        }
+        let op = ReduceOp::from_reducer(reducer)?;
+        validate_reduce_dtype(dtype, op)?;
         if input_shape.len() < 2 {
             return Err(invalid_input(format!(
                 "reduce kernel requires rank >= 2 input, got {input_shape:?}"
@@ -137,6 +158,11 @@ impl ReducePlan {
         if reduce_dim >= input_shape.len() {
             return Err(invalid_input(format!(
                 "reduce dimension {reduce_dim} is out of range for shape {input_shape:?}"
+            )));
+        }
+        if op.is_bitwise() && reduce_dim != input_shape.len() - 1 {
+            return Err(invalid_input(format!(
+                "bitwise reduce currently supports only the last dimension, got dimensions {dimensions:?} for shape {input_shape:?}"
             )));
         }
         let expected_output = input_shape
@@ -179,8 +205,10 @@ impl ReducePlan {
                 "reduce output tile rows per prefix must be nonzero for shape {output_shape:?}"
             )));
         };
+        if op.is_bitwise() && identity.is_none() {
+            return Err(invalid_input("bitwise reduce requires an identity value"));
+        }
 
-        let op = ReduceOp::from_reducer(reducer)?;
         Ok(Self {
             input_shape: input_shape.to_vec(),
             output_shape: output_shape.to_vec(),
@@ -200,6 +228,7 @@ impl ReducePlan {
             },
             op,
             dtype,
+            identity,
         })
     }
 }
@@ -216,6 +245,7 @@ struct ReduceProgramKey {
     output_tile_rows: u32,
     output_tiles_per_row: u32,
     shape: ReduceKernelShape,
+    identity: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,12 +269,16 @@ pub(crate) fn reduce(
             plan.shape.output_tiles
         ))
     })?;
-    let partition_count = usize::try_from(reduce_partition_count(plan.shape)?).map_err(|_| {
-        invalid_input(format!(
-            "reduce partition count does not fit in usize for shape {:?}",
-            plan.shape
-        ))
-    })?;
+    let partition_count = if plan.op.is_bitwise() {
+        output_tiles
+    } else {
+        usize::try_from(reduce_partition_count(plan.shape)?).map_err(|_| {
+            invalid_input(format!(
+                "reduce partition count does not fit in usize for shape {:?}",
+                plan.shape
+            ))
+        })?
+    };
     let cores = select_worker_cores(device.cores_ref(), partition_count)?;
     let output = device.alloc(
         output_tiles,
@@ -281,6 +315,7 @@ pub(crate) fn reduce(
                 "reduce output tiles per row",
             )?,
             shape: plan.shape,
+            identity: plan.identity,
         },
         build: reduce_program,
     };
@@ -312,7 +347,33 @@ fn validate_input(input: &DramBuffer, plan: &ReducePlan) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_reduce_dtype(dtype: DType, op: ReduceOp) -> io::Result<()> {
+    if op.is_bitwise() {
+        if matches!(
+            dtype,
+            DType::Int32 | DType::UInt32 | DType::UInt16 | DType::UInt8
+        ) {
+            return Ok(());
+        }
+        return Err(invalid_input(format!(
+            "bitwise reduce does not support dtype {dtype:?}"
+        )));
+    }
+    if matches!(
+        dtype,
+        DType::Float32 | DType::Float16B | DType::Int32 | DType::UInt32 | DType::UInt16
+    ) {
+        return Ok(());
+    }
+    Err(invalid_input(format!(
+        "reduce kernel currently supports Float32, BF16, UInt16, UInt32, and Int32 inputs, got {dtype:?}"
+    )))
+}
+
 fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
+    if key.op.is_bitwise() {
+        return bitwise_reduce_program(key);
+    }
     let shape = key.shape;
     let use_tiled_last_dim = use_tiled_last_dim(&key);
     let ranges = reduce_core_ranges(shape, key.cores.len())?;
@@ -396,6 +457,63 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
         name: format!("reduce_{:?}_{:?}", key.op, key.dtype),
         ..Program::new(runtime_args)
     })
+}
+
+fn bitwise_reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
+    let mut runtime_args = RuntimeArgsBuilder::new(
+        0,
+        vec![WRITER_OUTPUT_ADDR_INDEX],
+        vec![READER_INPUT_ADDR_INDEX],
+        Vec::new(),
+    );
+    for (core_index, &core) in key.cores.iter().enumerate() {
+        let (offset, n_tiles) =
+            split_tile_range(key.shape.output_tiles, core_index, key.cores.len())?;
+        runtime_args.add_core(
+            core,
+            vec![0, offset, n_tiles],
+            vec![0, offset, n_tiles],
+            Vec::new(),
+        )?;
+    }
+    let runtime_args = runtime_args.build()?;
+    Ok(Program {
+        reader_kernel: bitwise_reduce_reader_source(&key)?,
+        writer_kernel: BITWISE_WRITER.to_owned(),
+        compile: CompileConfig {
+            cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(16, key.dtype)],
+            ..CompileConfig::default()
+        },
+        name: format!("bitwise_reduce_{:?}_{:?}", key.op, key.dtype),
+        ..Program::new(runtime_args)
+    })
+}
+
+fn bitwise_reduce_reader_source(key: &ReduceProgramKey) -> io::Result<String> {
+    Ok(format!(
+        "#define BITWISE_REDUCE_RANK {}\n\
+         #define BITWISE_REDUCE_INPUT_SHAPE {}\n\
+         #define BITWISE_REDUCE_OUTPUT_SHAPE {}\n\
+         #define BITWISE_REDUCE_INPUT_TILE_ROWS {}\n\
+         #define BITWISE_REDUCE_INPUT_TILES_PER_ROW {}\n\
+         #define BITWISE_REDUCE_OUTPUT_TILE_ROWS {}\n\
+         #define BITWISE_REDUCE_OUTPUT_TILES_PER_ROW {}\n\
+         #define BITWISE_REDUCE_OP {}\n\
+         #define BITWISE_REDUCE_IDENTITY {}\n\
+         #define BITWISE_REDUCE_ELEMENT_TYPE {}\n\
+         {BITWISE_READER}",
+        key.input_shape.len(),
+        cpp_u32_array(&key.input_shape),
+        cpp_u32_array(&key.output_shape),
+        key.input_tile_rows,
+        key.input_tiles_per_row,
+        key.output_tile_rows,
+        key.output_tiles_per_row,
+        key.op.bitwise_op_value()?,
+        key.identity
+            .ok_or_else(|| invalid_input("bitwise reduce requires an identity value"))?,
+        bitwise_element_type(key.dtype)?,
+    ))
 }
 
 fn use_tiled_last_dim(key: &ReduceProgramKey) -> bool {
@@ -614,6 +732,17 @@ fn element_type(dtype: DType) -> io::Result<&'static str> {
     }
 }
 
+fn bitwise_element_type(dtype: DType) -> io::Result<&'static str> {
+    match dtype {
+        DType::Int32 | DType::UInt32 => Ok("uint32_t"),
+        DType::UInt16 => Ok("uint16_t"),
+        DType::UInt8 => Ok("uint8_t"),
+        _ => Err(invalid_input(format!(
+            "bitwise reduce does not support dtype {dtype:?}"
+        ))),
+    }
+}
+
 fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
@@ -638,16 +767,30 @@ mod tests {
 
     #[test]
     fn reduce_plan_tracks_partial_last_width_tile() {
-        let plan =
-            ReducePlan::new(DType::Float32, &[2, 30], &[2], &[1], ReduceReducer::Max).unwrap();
+        let plan = ReducePlan::new(
+            DType::Float32,
+            &[2, 30],
+            &[2],
+            &[1],
+            ReduceReducer::Max,
+            None,
+        )
+        .unwrap();
         assert_eq!(plan.shape.reduce_count, 30);
         assert_eq!(plan.shape.valid_last_width, 30);
     }
 
     #[test]
     fn reduce_plan_keeps_aligned_last_width_tile_unmasked() {
-        let plan =
-            ReducePlan::new(DType::Float32, &[2, 64], &[2], &[1], ReduceReducer::Add).unwrap();
+        let plan = ReducePlan::new(
+            DType::Float32,
+            &[2, 64],
+            &[2],
+            &[1],
+            ReduceReducer::Add,
+            None,
+        )
+        .unwrap();
         assert_eq!(plan.shape.reduce_count, 64);
         assert_eq!(plan.shape.valid_last_width, TILE_C as u32);
     }

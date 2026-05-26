@@ -1,5 +1,4 @@
 pub(crate) mod bitwise;
-pub(crate) mod bitwise_reduce;
 pub(crate) mod broadcast;
 pub(crate) mod concatenate;
 pub(crate) mod dynamic_update_slice;

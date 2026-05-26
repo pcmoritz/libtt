@@ -2225,49 +2225,33 @@ fn execute_reduce(
         } else {
             (input_shape.clone(), output_shape.clone(), dimensions.to_vec())
         };
-    if matches!(
+    let bitwise_identity = if matches!(
         reducer,
         executable::ReduceReducer::And | executable::ReduceReducer::Or
     ) {
-        let identity =
+        Some(
             bitwise_reduce_identity(plan, *init_value_id, reducer, input_desc.element_type)
                 .ok_or_else(|| {
                     unimplemented(
                         "TT executable bitwise reduce requires a supported constant identity init value",
                     )
-                })?;
-        let reduce_plan = kernels::bitwise_reduce::BitwiseReducePlan::new(
-            dtype,
-            &kernel_input_shape,
-            &kernel_output_shape,
-            &kernel_dimensions,
-            reducer,
-            identity,
+                })?,
         )
-        .map_err(io_error)?;
-        let output_dram =
-            kernels::bitwise_reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
-                .map_err(io_error)?;
-        return store_output_buffer(
-            values,
-            plan,
-            output_id,
-            output_desc.dims.clone(),
-            output_dram,
-            context,
-            "reduce",
-        );
-    }
-    let reduce_plan =
-        kernels::reduce::ReducePlan::new(
-            dtype,
-            &kernel_input_shape,
-            &kernel_output_shape,
-            &kernel_dimensions,
-            reducer,
-        )
-        .map_err(io_error)?;
-    if !reduce_init_is_supported(plan, *init_value_id, reducer, input_desc.element_type) {
+    } else {
+        None
+    };
+    let reduce_plan = kernels::reduce::ReducePlan::new(
+        dtype,
+        &kernel_input_shape,
+        &kernel_output_shape,
+        &kernel_dimensions,
+        reducer,
+        bitwise_identity,
+    )
+    .map_err(io_error)?;
+    if bitwise_identity.is_none()
+        && !reduce_init_is_supported(plan, *init_value_id, reducer, input_desc.element_type)
+    {
         return Err(unimplemented(
             "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
         ));
