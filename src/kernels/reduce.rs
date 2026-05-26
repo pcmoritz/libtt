@@ -12,8 +12,6 @@ use std::io;
 
 const READER: &str = include_str!("../../kernels/reduce_reader.cc");
 const COMPUTE: &str = include_str!("../../kernels/reduce_compute.cc");
-const RAW_READER: &str = include_str!("../../kernels/reduce_raw_lastdim_reader.cc");
-const RAW_WRITER: &str = include_str!("../../kernels/broadcast_writer.cc");
 const WRITER: &str = include_str!("../../kernels/reduce_writer.cc");
 const READER_INPUT_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
@@ -37,36 +35,12 @@ impl ReduceOp {
         }
     }
 
-    fn cpp_pool_type(self) -> &'static str {
-        match self {
-            Self::Sum => "ckernel::PoolType::SUM",
-            Self::Max => "ckernel::PoolType::MAX",
-            Self::Min => "ckernel::PoolType::MIN",
-        }
-    }
-
     fn is_sum(self) -> bool {
         matches!(self, Self::Sum)
     }
 
-    fn padding_identity_bits(self) -> u32 {
-        match self {
-            Self::Sum => 0.0f32.to_bits(),
-            Self::Max => f32::NEG_INFINITY.to_bits(),
-            Self::Min => f32::INFINITY.to_bits(),
-        }
-    }
-
     fn is_min(self) -> bool {
         matches!(self, Self::Min)
-    }
-
-    fn op_value(self) -> u32 {
-        match self {
-            Self::Sum => 0,
-            Self::Max => 1,
-            Self::Min => 2,
-        }
     }
 
     fn identity_literal(self, dtype: DType) -> io::Result<&'static str> {
@@ -79,12 +53,11 @@ impl ReduceOp {
             (Self::Min, DType::Int32) => Ok("2147483647"),
             (Self::Max, DType::Float16B) => Ok("0xff80u"),
             (Self::Min, DType::Float16B) => Ok("0x7f80u"),
-            (Self::Max, DType::UInt32 | DType::UInt16 | DType::UInt8) => Ok("0"),
+            (Self::Max, DType::UInt32 | DType::UInt16) => Ok("0"),
             (Self::Min, DType::UInt32) => Ok("0xffffffffu"),
             (Self::Min, DType::UInt16) => Ok("0xffffu"),
-            (Self::Min, DType::UInt8) => Ok("0xffu"),
             _ => Err(invalid_input(format!(
-                "reduce raw kernel does not support {:?} with dtype {dtype:?}",
+                "reduce kernel does not support {:?} with dtype {dtype:?}",
                 self
             ))),
         }
@@ -94,8 +67,7 @@ impl ReduceOp {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct ReduceKernelShape {
     reduce_dim: u32,
-    input_width_tiles: u32,
-    valid_last_width: u32,
+    reduce_count: u32,
     output_tiles: u32,
     inner_output_tiles: u32,
     output_tile_rows_per_prefix: u32,
@@ -128,10 +100,9 @@ impl ReducePlan {
                 | DType::Int32
                 | DType::UInt32
                 | DType::UInt16
-                | DType::UInt8
         ) {
             return Err(invalid_input(format!(
-                "reduce kernel currently supports Float32, BF16, and unsigned/s32 integer inputs, got {dtype:?}"
+                "reduce kernel currently supports Float32, BF16, UInt16, UInt32, and Int32 inputs, got {dtype:?}"
             )));
         }
         if input_shape.len() < 2 {
@@ -167,21 +138,12 @@ impl ReducePlan {
             )));
         }
 
-        let input_allocation_shape = tiled_allocation_shape(input_shape)?;
         let output_allocation_shape = tiled_allocation_shape(output_shape)?;
-        let rank = input_allocation_shape.len();
-        let input_width_tiles = input_allocation_shape[rank - 1] / TILE_C;
-        let valid_last_width = valid_last_tile_width(input_shape[input_shape.len() - 1])?;
+        let reduce_count = input_shape[reduce_dim];
         let output_tiles = tiled_shape_tile_count(output_shape)?;
         let output_inner_tiles =
             output_allocation_shape[output_allocation_shape.len() - 1] / TILE_C;
-        let inner_output_tiles = if reduce_dim == input_shape.len() - 1 {
-            let input_inner_tiles = input_allocation_shape[rank - 2] / TILE_R;
-            debug_assert_eq!(input_inner_tiles, output_inner_tiles);
-            input_inner_tiles
-        } else {
-            output_inner_tiles
-        };
+        let inner_output_tiles = output_inner_tiles;
         let (output_dim0, output_dim1, output_tile_rows_per_prefix) = match output_shape {
             [dim] => (1, *dim, 1),
             [] => {
@@ -211,8 +173,7 @@ impl ReducePlan {
             output_allocation_shape,
             shape: ReduceKernelShape {
                 reduce_dim: u32_arg(reduce_dim, "reduce dimension")?,
-                input_width_tiles: u32_arg(input_width_tiles, "input width tile count")?,
-                valid_last_width,
+                reduce_count: u32_arg(reduce_count, "reduce element count")?,
                 output_tiles: u32_arg(output_tiles, "output tile count")?,
                 inner_output_tiles: u32_arg(inner_output_tiles, "inner output tile count")?,
                 output_tile_rows_per_prefix: u32_arg(
@@ -236,6 +197,7 @@ struct ReduceProgramKey {
     input_shape: Vec<u32>,
     output_shape: Vec<u32>,
     input_tile_rows: u32,
+    input_tiles_per_row: u32,
     output_tile_rows: u32,
     output_tiles_per_row: u32,
     shape: ReduceKernelShape,
@@ -291,6 +253,10 @@ pub(crate) fn reduce(
                 input_allocation_shape[input_rank - 2] / TILE_R,
                 "reduce input tile rows",
             )?,
+            input_tiles_per_row: u32_arg(
+                input_allocation_shape[input_rank - 1] / TILE_C,
+                "reduce input tiles per row",
+            )?,
             output_tile_rows: u32_arg(
                 plan.output_allocation_shape[output_rank - 2] / TILE_R,
                 "reduce output tile rows",
@@ -332,12 +298,6 @@ fn validate_input(input: &DramBuffer, plan: &ReducePlan) -> io::Result<()> {
 }
 
 fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
-    if key.dtype != DType::Float32
-        || key.shape.reduce_dim as usize != key.input_shape.len().saturating_sub(1)
-    {
-        return reduce_raw_program(key);
-    }
-
     let shape = key.shape;
     let ranges = reduce_core_ranges(shape, key.cores.len())?;
     let max_core_output_tiles = ranges
@@ -374,22 +334,22 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
                 0,
                 range.group_offset,
                 range.reduce_groups,
-                shape.input_width_tiles,
-                shape.valid_last_width,
-                key.op.padding_identity_bits(),
+                shape.reduce_count,
             ],
-            vec![range.reduce_groups, shape.input_width_tiles],
+            vec![range.reduce_groups, shape.reduce_count],
         )?;
     }
     let runtime_args = runtime_args.build()?;
+    let compute_dtype = reduce_compute_dtype(key.dtype)?;
     Ok(Program {
-        reader_kernel: READER.to_owned(),
-        compute_kernel: reduce_compute_source(key.op),
-        writer_kernel: WRITER.to_owned(),
+        reader_kernel: reduce_reader_source(&key)?,
+        compute_kernel: reduce_compute_source(key.op, compute_dtype),
+        writer_kernel: reduce_writer_source(key.dtype)?,
         compile: CompileConfig {
             cbs: vec![
-                CBConfig::new(0, key.dtype),
-                CBConfig::new(16, key.dtype),
+                CBConfig::new(0, key.dtype).with_compute_dtype(compute_dtype),
+                CBConfig::new(1, key.dtype),
+                CBConfig::new(16, key.dtype).with_compute_dtype(compute_dtype),
                 CBConfig {
                     index: 17,
                     dtype: key.dtype,
@@ -405,73 +365,63 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
     })
 }
 
-fn reduce_raw_program(key: ReduceProgramKey) -> io::Result<Program> {
-    let mut runtime_args = RuntimeArgsBuilder::new(
-        0,
-        vec![WRITER_OUTPUT_ADDR_INDEX],
-        vec![READER_INPUT_ADDR_INDEX],
-        Vec::new(),
-    );
-    for (core_index, &core) in key.cores.iter().enumerate() {
-        let (offset, n_tiles) =
-            split_tile_range(key.shape.output_tiles, core_index, key.cores.len())?;
-        runtime_args.add_core(
-            core,
-            vec![0, offset, n_tiles],
-            vec![0, offset, n_tiles],
-            Vec::new(),
-        )?;
-    }
-    let runtime_args = runtime_args.build()?;
-    Ok(Program {
-        reader_kernel: reduce_raw_reader_source(&key)?,
-        writer_kernel: RAW_WRITER.to_owned(),
-        compile: CompileConfig {
-            cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(16, key.dtype)],
-            ..CompileConfig::default()
-        },
-        name: format!("reduce_raw_{:?}_{:?}", key.op, key.dtype),
-        ..Program::new(runtime_args)
-    })
-}
-
-fn reduce_raw_reader_source(key: &ReduceProgramKey) -> io::Result<String> {
+fn reduce_reader_source(key: &ReduceProgramKey) -> io::Result<String> {
     Ok(format!(
-        "#define REDUCE_RAW_RANK {}\n\
-         #define REDUCE_RAW_DIM {}\n\
-         #define REDUCE_RAW_INPUT_SHAPE {}\n\
-         #define REDUCE_RAW_OUTPUT_SHAPE {}\n\
-         #define REDUCE_RAW_INPUT_TILE_ROWS {}\n\
-         #define REDUCE_RAW_INPUT_TILES_PER_ROW {}\n\
-         #define REDUCE_RAW_OUTPUT_TILE_ROWS_PER_PREFIX {}\n\
-         #define REDUCE_RAW_OUTPUT_TILES_PER_ROW {}\n\
-         #define REDUCE_RAW_OP {}\n\
-         #define REDUCE_RAW_IDENTITY {}\n\
-         #define REDUCE_RAW_IS_BF16 {}\n\
-         #define REDUCE_RAW_IS_FLOAT32 {}\n\
-         #define REDUCE_RAW_ELEMENT_TYPE {}\n\
-         {RAW_READER}",
+        "#define REDUCE_RANK {}\n\
+         #define REDUCE_DIMENSION {}\n\
+         #define REDUCE_INPUT_SHAPE {}\n\
+         #define REDUCE_OUTPUT_SHAPE {}\n\
+         #define REDUCE_INPUT_TILE_ROWS {}\n\
+         #define REDUCE_INPUT_TILES_PER_ROW {}\n\
+         #define REDUCE_INNER_OUTPUT_TILES {}\n\
+         #define REDUCE_IDENTITY {}\n\
+         #define REDUCE_ELEMENT_TYPE {}\n\
+         {READER}",
         key.input_shape.len(),
         key.shape.reduce_dim,
         cpp_u32_array(&key.input_shape),
         cpp_u32_array(&key.output_shape),
         key.input_tile_rows,
-        key.shape.input_width_tiles,
-        key.output_tile_rows,
-        key.output_tiles_per_row,
-        key.op.op_value(),
+        key.input_tiles_per_row,
+        key.shape.inner_output_tiles,
         key.op.identity_literal(key.dtype)?,
-        bool_define(key.dtype == DType::Float16B),
-        bool_define(key.dtype == DType::Float32),
         element_type(key.dtype)?,
     ))
 }
 
-fn reduce_compute_source(op: ReduceOp) -> String {
+fn reduce_compute_source(op: ReduceOp, compute_dtype: DType) -> String {
     COMPUTE
-        .replace("REDUCE_POOL_TYPE", op.cpp_pool_type())
+        .replace("REDUCE_DATA_FORMAT", data_format(compute_dtype))
         .replace("REDUCE_IS_SUM", bool_define(op.is_sum()))
         .replace("REDUCE_IS_MIN", bool_define(op.is_min()))
+}
+
+fn reduce_writer_source(dtype: DType) -> io::Result<String> {
+    Ok(format!(
+        "#define REDUCE_ELEMENT_TYPE {}\n{WRITER}",
+        element_type(dtype)?
+    ))
+}
+
+fn reduce_compute_dtype(dtype: DType) -> io::Result<DType> {
+    match dtype {
+        DType::Float16B => Ok(DType::Float32),
+        DType::Float32 | DType::Int32 | DType::UInt32 | DType::UInt16 => Ok(dtype),
+        _ => Err(invalid_input(format!(
+            "reduce compute kernel does not support dtype {dtype:?}"
+        ))),
+    }
+}
+
+fn data_format(dtype: DType) -> &'static str {
+    match dtype {
+        DType::Float32 => "DataFormat::Float32",
+        DType::Float16B => "DataFormat::Float16_b",
+        DType::Int32 => "DataFormat::Int32",
+        DType::UInt32 => "DataFormat::UInt32",
+        DType::UInt16 => "DataFormat::UInt16",
+        _ => "DataFormat::Invalid",
+    }
 }
 
 fn bool_define(value: bool) -> &'static str {
@@ -578,16 +528,6 @@ fn output_tile_rows(shape: ReduceKernelShape) -> io::Result<u32> {
     Ok(shape.output_tiles / shape.inner_output_tiles)
 }
 
-fn valid_last_tile_width(logical_width: usize) -> io::Result<u32> {
-    let width = logical_width % TILE_C;
-    let width = if width == 0 && logical_width != 0 {
-        TILE_C
-    } else {
-        width
-    };
-    u32_arg(width, "valid last reduction tile width")
-}
-
 fn u32_shape(shape: &[usize], name: &str) -> io::Result<Vec<u32>> {
     shape
         .iter()
@@ -615,9 +555,8 @@ fn element_type(dtype: DType) -> io::Result<&'static str> {
         DType::Int32 => Ok("int32_t"),
         DType::UInt32 => Ok("uint32_t"),
         DType::UInt16 => Ok("uint16_t"),
-        DType::UInt8 => Ok("uint8_t"),
         _ => Err(invalid_input(format!(
-            "reduce raw kernel does not support dtype {dtype:?}"
+            "reduce kernel does not support dtype {dtype:?}"
         ))),
     }
 }
@@ -648,18 +587,14 @@ mod tests {
     fn reduce_plan_tracks_partial_last_width_tile() {
         let plan =
             ReducePlan::new(DType::Float32, &[2, 30], &[2], &[1], ReduceReducer::Max).unwrap();
-        assert_eq!(plan.shape.input_width_tiles, 1);
-        assert_eq!(plan.shape.valid_last_width, 30);
-        assert_eq!(plan.op.padding_identity_bits(), f32::NEG_INFINITY.to_bits());
+        assert_eq!(plan.shape.reduce_count, 30);
     }
 
     #[test]
     fn reduce_plan_keeps_aligned_last_width_tile_unmasked() {
         let plan =
             ReducePlan::new(DType::Float32, &[2, 64], &[2], &[1], ReduceReducer::Add).unwrap();
-        assert_eq!(plan.shape.input_width_tiles, 2);
-        assert_eq!(plan.shape.valid_last_width, TILE_C as u32);
-        assert_eq!(plan.op.padding_identity_bits(), 0.0f32.to_bits());
+        assert_eq!(plan.shape.reduce_count, 64);
     }
 
 }
