@@ -676,6 +676,18 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
         cbs.push(CBConfig::new(cb as usize, dtype));
     }
     cbs.push(CBConfig::new(16, key.output_dtype));
+    // Multi-stage fusions reuse DST across several compute/pack sections in
+    // one kernel; full sync avoids half-DST ping-pong races between stages.
+    let fused_compute_ops = key
+        .nodes
+        .iter()
+        .filter(|node| node.kind.arity() > 0)
+        .count();
+    if fused_compute_ops > 1 {
+        for cb in &mut cbs {
+            cb.tiles = cb.tiles.max(4);
+        }
+    }
 
     let mut dst_accum_mode = matches!(
         key.output_dtype,
@@ -698,6 +710,7 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
         compile: CompileConfig {
             cbs,
             dst_accum_mode,
+            dst_full_sync: fused_compute_ops > 1,
             ..CompileConfig::default()
         },
         name: format!("fused_eltwise_{}_{}", input_count, key.nodes.len()),
