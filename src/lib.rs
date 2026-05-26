@@ -3507,19 +3507,6 @@ fn execute_gather(
     }
 
     let output_dram = if axis == 0
-        && rank == 1
-        && operand.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_S32
-    {
-        kernels::gather::gather_s32_rank1(
-            device,
-            operand_dram,
-            start_indices_dram,
-            &operand_shape,
-            &start_indices_shape,
-            &output_shape,
-            "pjrt_gather_rank1",
-        )
-    } else if axis == 0
         && rank == 2
         && operand.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
     {

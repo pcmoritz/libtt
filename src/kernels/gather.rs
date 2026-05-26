@@ -9,7 +9,6 @@ use std::io;
 
 const GATHER_READER: &str = include_str!("../../kernels/gather_reader.cc");
 const GATHER_DIM0_READER: &str = include_str!("../../kernels/gather_dim0_reader.cc");
-const GATHER_RANK1_READER: &str = include_str!("../../kernels/gather_rank1_reader.cc");
 const GATHER_DIM0_WRITER: &str = include_str!("../../kernels/broadcast_writer.cc");
 const GATHER_WRITER: &str = include_str!("../../kernels/gather_writer.cc");
 const READER_OPERAND_ADDR_INDEX: usize = 0;
@@ -211,116 +210,6 @@ pub(crate) fn gather_dim0_slices(
     };
     kernel.run(device)?;
     Ok(output)
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-struct GatherRank1Shape {
-    output_tiles: u32,
-    logical_output_elements: u32,
-    logical_operand_elements: u32,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct GatherRank1ProgramKey {
-    cores: Vec<CoreCoord>,
-    shape: GatherRank1Shape,
-}
-
-struct GatherRank1Kernel {
-    operand_addr: u32,
-    start_indices_addr: u32,
-    output_addr: u32,
-    key: GatherRank1ProgramKey,
-}
-
-impl Kernel<GatherRank1ProgramKey> for GatherRank1Kernel {
-    fn program_key(&self) -> GatherRank1ProgramKey {
-        self.key.clone()
-    }
-
-    fn build_program(&self) -> io::Result<Program> {
-        gather_rank1_program(self.key.clone())
-    }
-
-    #[inline]
-    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            READER_OPERAND_ADDR_INDEX => Some(self.operand_addr),
-            READER_START_INDICES_ADDR_INDEX => Some(self.start_indices_addr),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
-        }
-    }
-}
-
-pub(crate) fn gather_s32_rank1(
-    device: &mut Device,
-    operand: &DramBuffer,
-    start_indices: &DramBuffer,
-    operand_shape: &[usize],
-    start_indices_shape: &[usize],
-    output_shape: &[usize],
-    name: impl Into<String>,
-) -> io::Result<DramBuffer> {
-    validate_rank1_shapes(operand_shape, start_indices_shape, output_shape)?;
-    validate_buffer(operand, DType::Int32, operand_shape, "rank1 gather operand")?;
-    validate_buffer(
-        start_indices,
-        DType::Int32,
-        start_indices_shape,
-        "rank1 gather start_indices",
-    )?;
-
-    let output_allocation_shape = tiled_allocation_shape(output_shape)?;
-    let output_tiles = tiled_tile_count(&output_allocation_shape)?;
-    let output = device.alloc(output_tiles, DType::Int32, &output_allocation_shape, name)?;
-
-    let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
-    let shape = GatherRank1Shape {
-        output_tiles: u32_arg(output_tiles, "rank1 gather output tile count")?,
-        logical_output_elements: u32_arg(output_shape[0], "rank1 gather output elements")?,
-        logical_operand_elements: u32_arg(operand_shape[0], "rank1 gather operand elements")?,
-    };
-    let kernel = GatherRank1Kernel {
-        operand_addr: u32_addr(operand.addr, "rank1 gather operand address")?,
-        start_indices_addr: u32_addr(start_indices.addr, "rank1 gather start_indices address")?,
-        output_addr: u32_addr(output.addr, "rank1 gather output address")?,
-        key: GatherRank1ProgramKey { cores, shape },
-    };
-    kernel.run(device)?;
-    Ok(output)
-}
-
-fn validate_rank1_shapes(
-    operand_shape: &[usize],
-    start_indices_shape: &[usize],
-    output_shape: &[usize],
-) -> io::Result<()> {
-    if operand_shape.len() != 1 {
-        return Err(invalid_input(format!(
-            "gather_s32_rank1 requires a rank-1 operand, got {operand_shape:?}"
-        )));
-    }
-    if start_indices_shape.len() != 2 || start_indices_shape[1] != 1 {
-        return Err(invalid_input(format!(
-            "gather_s32_rank1 requires start_indices shaped [N, 1], got {start_indices_shape:?}"
-        )));
-    }
-    let expected_output_shape = [start_indices_shape[0]];
-    if output_shape != expected_output_shape {
-        return Err(invalid_input(format!(
-            "gather_s32_rank1 output shape mismatch: expected {:?}, got {:?}",
-            expected_output_shape, output_shape
-        )));
-    }
-    Ok(())
 }
 
 fn validate_dim0_buffers(
@@ -526,50 +415,6 @@ fn gather_program(key: GatherProgramKey) -> io::Result<Program> {
             ..CompileConfig::default()
         },
         name: "gather_bf16_rows".to_owned(),
-        ..Program::new(runtime_args)
-    })
-}
-
-fn gather_rank1_program(key: GatherRank1ProgramKey) -> io::Result<Program> {
-    let mut runtime_args = RuntimeArgsBuilder::new(
-        0,
-        vec![WRITER_OUTPUT_ADDR_INDEX],
-        vec![READER_OPERAND_ADDR_INDEX, READER_START_INDICES_ADDR_INDEX],
-        Vec::new(),
-    );
-    for (core_index, &core) in key.cores.iter().enumerate() {
-        let (offset, tiles) = split_tile_range(
-            key.shape.output_tiles,
-            core_index,
-            key.cores.len(),
-        )?;
-        runtime_args.add_core(
-            core,
-            vec![0, offset, tiles, 1],
-            vec![
-                0,
-                0,
-                offset,
-                tiles,
-                key.shape.logical_output_elements,
-                key.shape.logical_operand_elements,
-            ],
-            Vec::new(),
-        )?;
-    }
-    let runtime_args = runtime_args.build()?;
-    Ok(Program {
-        reader_kernel: GATHER_RANK1_READER.to_owned(),
-        writer_kernel: GATHER_WRITER.to_owned(),
-        compile: CompileConfig {
-            cbs: vec![
-                CBConfig::new(0, DType::Int32),
-                CBConfig::new(1, DType::Int32),
-                CBConfig::new(16, DType::Int32),
-            ],
-            ..CompileConfig::default()
-        },
-        name: "gather_s32_rank1".to_owned(),
         ..Program::new(runtime_args)
     })
 }
