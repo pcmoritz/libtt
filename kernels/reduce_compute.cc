@@ -54,6 +54,31 @@ void max_reduce_tile(uint32_t lhs, uint32_t rhs, uint32_t output) {
   }
 }
 
+void reduce_last_dim_tile(uint32_t dst_idx) {
+  ckernel::transpose_wh_dest_init_short<true>();
+  ckernel::transpose_wh_dest<true>(dst_idx);
+  // This tt-metal snapshot's sfpu_reduce_init wrapper does not compile for
+  // SUM/Float32, so keep the equivalent lower-level init and use sfpu_reduce.
+  MATH((ckernel::llk_math_eltwise_unary_sfpu_init<SfpuType::reduce, true>(
+      ckernel::sfpu::_init_reduce_<REDUCE_POOL_TYPE, REDUCE_DATA_FORMAT>, 1)));
+  ckernel::sfpu_reduce<REDUCE_POOL_TYPE, REDUCE_DATA_FORMAT>(dst_idx);
+}
+
+template <DataFormat Format>
+void combine_into_accumulator(uint32_t index, uint32_t dst_idx) {
+  if (index == 0) {
+    return;
+  }
+#if REDUCE_IS_SUM
+  add_reduce_init<Format>();
+  add_reduce_tile<Format>(0, dst_idx, 0);
+#elif REDUCE_IS_MIN
+  min_reduce_tile<Format>(0, dst_idx, 0);
+#else
+  max_reduce_tile<Format>(0, dst_idx, 0);
+#endif
+}
+
 void MAIN {
   uint32_t reduce_groups = get_arg_val<uint32_t>(0);
   uint32_t count = get_arg_val<uint32_t>(1);
@@ -73,28 +98,8 @@ void MAIN {
         cb_wait_front(cb_input, onetile);
         copy_tile_to_dst_init_short(cb_input);
         copy_tile(cb_input, 0, dst_idx);
-        ckernel::transpose_wh_dest_init_short<true>();
-        ckernel::transpose_wh_dest<true>(dst_idx);
-        MATH((ckernel::llk_math_eltwise_unary_sfpu_init<SfpuType::reduce, true>(
-            ckernel::sfpu::_init_reduce_<REDUCE_POOL_TYPE, REDUCE_DATA_FORMAT>, 1)));
-        MATH((_llk_math_eltwise_unary_sfpu_params_<true>(
-            ckernel::sfpu::_calculate_reduce_<REDUCE_POOL_TYPE, ckernel::ReduceDim::REDUCE_COL,
-                                              REDUCE_DATA_FORMAT>,
-            dst_idx, VectorMode::RC_custom, 1)));
-#if REDUCE_IS_SUM
-        if (wt > 0) {
-          add_reduce_init<REDUCE_DATA_FORMAT>();
-          add_reduce_tile<REDUCE_DATA_FORMAT>(0, dst_idx, 0);
-        }
-#elif REDUCE_IS_MIN
-        if (wt > 0) {
-          min_reduce_tile<REDUCE_DATA_FORMAT>(0, dst_idx, 0);
-        }
-#else
-        if (wt > 0) {
-          max_reduce_tile<REDUCE_DATA_FORMAT>(0, dst_idx, 0);
-        }
-#endif
+        reduce_last_dim_tile(dst_idx);
+        combine_into_accumulator<REDUCE_DATA_FORMAT>(wt, dst_idx);
         cb_pop_front(cb_input, onetile);
       }
       cb_reserve_back(cb_output, onetile);
@@ -115,20 +120,7 @@ void MAIN {
       cb_wait_front(cb_input, onetile);
       copy_tile_to_dst_init_short(cb_input);
       copy_tile(cb_input, 0, dst_idx);
-#if REDUCE_IS_SUM
-      if (index > 0) {
-        add_reduce_init<REDUCE_DATA_FORMAT>();
-        add_reduce_tile<REDUCE_DATA_FORMAT>(0, dst_idx, 0);
-      }
-#elif REDUCE_IS_MIN
-      if (index > 0) {
-        min_reduce_tile<REDUCE_DATA_FORMAT>(0, dst_idx, 0);
-      }
-#else
-      if (index > 0) {
-        max_reduce_tile<REDUCE_DATA_FORMAT>(0, dst_idx, 0);
-      }
-#endif
+      combine_into_accumulator<REDUCE_DATA_FORMAT>(index, dst_idx);
       cb_pop_front(cb_input, onetile);
     }
     cb_reserve_back(cb_output, onetile);
