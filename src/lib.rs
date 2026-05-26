@@ -1714,26 +1714,15 @@ fn execute_reshape(
     let input_dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
-    let output_dram = if input_desc.element_type == output_desc.element_type {
-        kernels::reshape::reshape(
-            device,
-            input_dram,
-            &input_shape,
-            &output_shape,
-            input_dtype,
-            "pjrt_reshape",
-        )
-    } else {
-        kernels::reshape::bitcast_reshape(
-            device,
-            input_dram,
-            &input_shape,
-            &output_shape,
-            input_dtype,
-            output_dtype,
-            "pjrt_bitcast_convert",
-        )
-    }
+    let output_dram = kernels::reshape::reshape(
+        device,
+        input_dram,
+        &input_shape,
+        &output_shape,
+        input_dtype,
+        output_dtype,
+        "pjrt_reshape",
+    )
     .map_err(io_error)?;
     store_output_buffer(
         values,

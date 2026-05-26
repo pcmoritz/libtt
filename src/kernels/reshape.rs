@@ -73,47 +73,16 @@ pub(crate) fn reshape(
     input: &DramBuffer,
     input_shape: &[usize],
     output_shape: &[usize],
-    dtype: DType,
-    name: impl Into<String>,
-) -> io::Result<DramBuffer> {
-    reshape_with_dtypes(device, input, input_shape, output_shape, dtype, dtype, name)
-}
-
-pub(crate) fn bitcast_reshape(
-    device: &mut Device,
-    input: &DramBuffer,
-    input_shape: &[usize],
-    output_shape: &[usize],
-    input_dtype: DType,
-    output_dtype: DType,
-    name: impl Into<String>,
-) -> io::Result<DramBuffer> {
-    if element_size(input_dtype) != element_size(output_dtype) {
-        return Err(invalid_input(format!(
-            "bitcast reshape requires equal-width element types, got {input_dtype:?} and {output_dtype:?}"
-        )));
-    }
-    reshape_with_dtypes(
-        device,
-        input,
-        input_shape,
-        output_shape,
-        input_dtype,
-        output_dtype,
-        name,
-    )
-}
-
-fn reshape_with_dtypes(
-    device: &mut Device,
-    input: &DramBuffer,
-    input_shape: &[usize],
-    output_shape: &[usize],
     input_dtype: DType,
     output_dtype: DType,
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
     validate_input(input, input_dtype, input_shape)?;
+    if input_dtype != output_dtype && element_size(input_dtype) != element_size(output_dtype) {
+        return Err(invalid_input(format!(
+            "reshape bitcast requires equal-width element types, got {input_dtype:?} and {output_dtype:?}"
+        )));
+    }
     let shape = reshape_shape(input_shape, output_shape)?;
     let output_allocation_shape = tiled_allocation_shape(output_shape)?;
     let output_tiles = tiled_shape_tile_count(output_shape)?;
