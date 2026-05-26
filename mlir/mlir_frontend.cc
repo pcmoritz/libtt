@@ -579,22 +579,36 @@ bool lowerSingleStaticWhileOp(mlir::stablehlo::WhileOp while_op, std::string& er
     return true;
 }
 
-bool lowerStaticWhileOps(mlir::ModuleOp module, std::string& error) {
+template <typename OpTy, typename MatchFn, typename LowerFn>
+bool lowerAllMatching(
+    mlir::ModuleOp module,
+    MatchFn match,
+    LowerFn lower,
+    std::string& error) {
     while (true) {
-        mlir::Operation* next_while = nullptr;
-        auto walk_result = module.walk([&](mlir::stablehlo::WhileOp while_op) {
-            next_while = while_op.getOperation();
+        mlir::Operation* next = nullptr;
+        auto walk_result = module.walk([&](OpTy op) {
+            if (!match(op)) {
+                return mlir::WalkResult::advance();
+            }
+            next = op.getOperation();
             return mlir::WalkResult::interrupt();
         });
         if (!walk_result.wasInterrupted()) {
             return true;
         }
-        if (!lowerSingleStaticWhileOp(
-                mlir::cast<mlir::stablehlo::WhileOp>(next_while),
-                error)) {
+        if (!lower(mlir::cast<OpTy>(next), error)) {
             return false;
         }
     }
+}
+
+bool lowerStaticWhileOps(mlir::ModuleOp module, std::string& error) {
+    return lowerAllMatching<mlir::stablehlo::WhileOp>(
+        module,
+        [](mlir::stablehlo::WhileOp) { return true; },
+        lowerSingleStaticWhileOp,
+        error);
 }
 
 std::optional<mlir::Value> createIntegerSplatConstant(
@@ -655,45 +669,26 @@ bool lowerSinglePredicateConvertToSelect(
     return true;
 }
 
+bool isPredicateConvert(mlir::stablehlo::ConvertOp convert_op) {
+    auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        convert_op.getOperand().getType());
+    return input_type && input_type.getElementType().isInteger(1);
+}
+
 bool lowerPredicateConvertsToSelects(mlir::ModuleOp module, std::string& error) {
-    while (true) {
-        mlir::Operation* next_convert = nullptr;
-        auto walk_result = module.walk([&](mlir::stablehlo::ConvertOp convert_op) {
-            auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
-                convert_op.getOperand().getType());
-            if (input_type && input_type.getElementType().isInteger(1)) {
-                next_convert = convert_op.getOperation();
-                return mlir::WalkResult::interrupt();
-            }
-            return mlir::WalkResult::advance();
-        });
-        if (!walk_result.wasInterrupted()) {
-            return true;
-        }
-        if (!lowerSinglePredicateConvertToSelect(
-                mlir::cast<mlir::stablehlo::ConvertOp>(next_convert),
-                error)) {
-            return false;
-        }
-    }
+    return lowerAllMatching<mlir::stablehlo::ConvertOp>(
+        module,
+        isPredicateConvert,
+        lowerSinglePredicateConvertToSelect,
+        error);
 }
 
 bool lowerCaseOpsToSelects(mlir::ModuleOp module, std::string& error) {
-    while (true) {
-        mlir::Operation* next_case = nullptr;
-        auto walk_result = module.walk([&](mlir::stablehlo::CaseOp case_op) {
-            next_case = case_op.getOperation();
-            return mlir::WalkResult::interrupt();
-        });
-        if (!walk_result.wasInterrupted()) {
-            return true;
-        }
-        if (!lowerSingleCaseOpToSelects(
-                mlir::cast<mlir::stablehlo::CaseOp>(next_case),
-                error)) {
-            return false;
-        }
-    }
+    return lowerAllMatching<mlir::stablehlo::CaseOp>(
+        module,
+        [](mlir::stablehlo::CaseOp) { return true; },
+        lowerSingleCaseOpToSelects,
+        error);
 }
 
 bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module, std::string& error) {
