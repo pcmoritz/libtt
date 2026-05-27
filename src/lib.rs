@@ -1593,6 +1593,12 @@ fn alias_output_buffer(
             expected.element_type, output.buffer_type
         )));
     }
+    if output.dims != expected.dims {
+        return Err(invalid_argument(format!(
+            "TT executable {op} output shape mismatch: expected {:?}, got {:?}",
+            expected.dims, output.dims
+        )));
+    }
     let Some(dram_buffer) = output.dram_buffer.as_ref() else {
         return Err(failed_precondition(format!(
             "TT executable {op} operand buffer has no device allocation"
@@ -2761,41 +2767,6 @@ fn scalar_convert(
     }
 }
 
-fn execute_identity_custom_call(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    input_id: u32,
-    output_id: u32,
-    call_target_name: &str,
-) -> Result<(), *mut PJRT_Error> {
-    let input = device_buffer_for_value(
-        values,
-        input_id,
-        &format!("custom_call {call_target_name:?}.input"),
-    )?;
-    let output_index = output_id as usize;
-    let expected = plan.values.get(output_index).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} output id {output_id} is out of bounds"
-        ))
-    })?;
-    if input.buffer_type != expected.element_type {
-        return Err(invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} output must be {:?}, got {:?}",
-            expected.element_type, input.buffer_type
-        )));
-    }
-    if input.dims != expected.dims {
-        return Err(invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} output shape mismatch: expected {:?}, got {:?}",
-            expected.dims, input.dims
-        )));
-    }
-    let output = input.clone();
-    values[output_index] = Some(output);
-    Ok(())
-}
-
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -3237,10 +3208,7 @@ fn execute_scatter(
         && dimension_numbers.scatter_indices_batching_dims.is_empty()
         && update_shape == operand_shape;
     if is_full_window_set {
-        let mut output = updates;
-        output.dims = output_desc.dims.clone();
-        values[output_id as usize] = Some(output);
-        return Ok(());
+        return alias_output_buffer(values, plan, input_ids[2], output_id, context, "scatter");
     }
     kernels::scatter::validate_dim0_set_dimension_numbers(
         operand_shape.len(),
@@ -3457,12 +3425,13 @@ fn execute_executable_v1(
                         input_ids.len()
                     )));
                 };
-                execute_identity_custom_call(
+                alias_output_buffer(
                     &mut values,
                     plan,
                     *input_id,
                     *output_id,
-                    call_target_name,
+                    &output_context,
+                    &format!("custom_call {call_target_name:?}"),
                 )?;
             }
             executable::Op::CustomCall {
