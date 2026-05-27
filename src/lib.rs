@@ -167,7 +167,7 @@ impl PJRT_Client {
         for info in &discovered {
             memories.push(PJRT_Memory {
                 id: info.id as i32,
-                kind: cstring_lossy("dram"),
+                kind: cstring_lossy("device"),
                 debug_string: cstring_lossy(info.memory_debug_string()),
                 to_string: cstring_lossy(info.memory_to_string()),
                 device_ptrs: Vec::with_capacity(1),
@@ -691,7 +691,7 @@ fn make_executable_metadata(
     outputs: &[executable::ValueDesc],
     executable: Option<executable::Executable>,
 ) -> ExecutableMetadata {
-    let output_memory_kinds = vec![cstring_lossy("dram"); outputs.len()];
+    let output_memory_kinds = vec![cstring_lossy("device"); outputs.len()];
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
         .map(|kind| kind.as_ptr())
@@ -1507,14 +1507,6 @@ fn select_value_input<'a>(
     )))
 }
 
-fn is_identity_i64_sequence(values: &[i64], len: usize) -> bool {
-    values.len() == len
-        && values
-            .iter()
-            .enumerate()
-            .all(|(index, &value)| usize::try_from(value).ok() == Some(index))
-}
-
 struct OutputContext {
     device: *mut PJRT_Device,
     memory: *mut PJRT_Memory,
@@ -1566,58 +1558,6 @@ fn store_output_buffer(
         dram_buffer: Some(dram_buffer),
         deleted: false,
     });
-    Ok(())
-}
-
-fn alias_output_buffer(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    input_id: u32,
-    output_id: u32,
-    context: &OutputContext,
-    op: &str,
-) -> Result<(), *mut PJRT_Error> {
-    let output_index = output_id as usize;
-    let expected = plan.values.get(output_index).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable {op} output id {output_id} is out of bounds"
-        ))
-    })?;
-    let mut output = device_buffer_for_value(values, input_id, op)?.clone();
-    let expected_dtype = pjrt_buffer_type_to_dtype(expected.element_type)?;
-    let input_dtype = pjrt_buffer_type_to_dtype(output.buffer_type)?;
-    if input_dtype != expected_dtype {
-        return Err(invalid_argument(format!(
-            "TT executable {op} output dtype mismatch: expected {:?}, got {:?}",
-            expected.element_type, output.buffer_type
-        )));
-    }
-    if output.dims != expected.dims {
-        return Err(invalid_argument(format!(
-            "TT executable {op} output shape mismatch: expected {:?}, got {:?}",
-            expected.dims, output.dims
-        )));
-    }
-    let Some(dram_buffer) = output.dram_buffer.as_ref() else {
-        return Err(failed_precondition(format!(
-            "TT executable {op} operand buffer has no device allocation"
-        )));
-    };
-    let logical_shape = dims_i64_to_usize(&expected.dims)?;
-    let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
-    if dram_buffer.shape != allocation_shape {
-        return Err(invalid_argument(format!(
-            "TT executable {op} output allocation shape mismatch: expected {:?}, got {:?}",
-            allocation_shape, dram_buffer.shape
-        )));
-    }
-    output.buffer_type = expected.element_type;
-    output.dims = expected.dims.clone();
-    output.device = context.device;
-    output.memory = context.memory;
-    output.local_hardware_id = context.local_hardware_id;
-    output.deleted = false;
-    values[output_index] = Some(output);
     Ok(())
 }
 
@@ -1693,9 +1633,6 @@ fn execute_reshape(
     })?;
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    if input_desc.element_type == output_desc.element_type && input_desc.dims == output_desc.dims {
-        return alias_output_buffer(values, plan, input_id, output_id, context, "reshape");
-    }
 
     let input = device_buffer_for_value(values, input_id, "reshape.operand")?;
     let Some(input_dram) = input.dram_buffer.as_ref() else {
@@ -1755,19 +1692,6 @@ fn execute_slice(
 
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let is_full_slice = input_shape == output_shape
-        && start_indices.len() == input_shape.len()
-        && limit_indices.len() == input_shape.len()
-        && strides.len() == input_shape.len()
-        && start_indices.iter().all(|&start| start == 0)
-        && limit_indices
-            .iter()
-            .zip(input_shape.iter())
-            .all(|(&limit, &dim)| usize::try_from(limit).ok() == Some(dim))
-        && strides.iter().all(|&stride| stride == 1);
-    if is_full_slice {
-        return alias_output_buffer(values, plan, input_id, output_id, context, "slice");
-    }
     let slice_plan = kernels::slice::SlicePlan::new(
         &input_shape,
         &output_shape,
@@ -1895,9 +1819,6 @@ fn execute_transpose(
     }
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    if input_shape == output_shape && is_identity_i64_sequence(permutation, input_shape.len()) {
-        return alias_output_buffer(values, plan, input_id, output_id, context, "transpose");
-    }
     let input = device_buffer_for_value(values, input_id, "transpose.operand")?;
     let Some(input_dram) = input.dram_buffer.as_ref() else {
         return Err(failed_precondition(
@@ -2877,18 +2798,6 @@ fn execute_broadcast_in_dim(
     }
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let is_noop_broadcast = input_shape == output_shape
-        && is_identity_i64_sequence(broadcast_dimensions, input_shape.len());
-    if is_noop_broadcast {
-        return alias_output_buffer(
-            values,
-            plan,
-            input_id,
-            output_id,
-            context,
-            "broadcast_in_dim",
-        );
-    }
     let broadcast_plan = kernels::broadcast::BroadcastInDimPlan::new(
         &input_shape,
         &output_shape,
@@ -3187,17 +3096,6 @@ fn execute_scatter(
             operand_shape, output_shape
         )));
     }
-    let is_full_window_set = is_identity_i64_sequence(
-        &dimension_numbers.update_window_dims,
-        operand_shape.len(),
-    )
-        && dimension_numbers.inserted_window_dims.is_empty()
-        && dimension_numbers.input_batching_dims.is_empty()
-        && dimension_numbers.scatter_indices_batching_dims.is_empty()
-        && update_shape == operand_shape;
-    if is_full_window_set {
-        return alias_output_buffer(values, plan, input_ids[2], output_id, context, "scatter");
-    }
     kernels::scatter::validate_dim0_set_dimension_numbers(
         operand_shape.len(),
         &dimension_numbers.update_window_dims,
@@ -3401,27 +3299,6 @@ fn execute_executable_v1(
                 *output_id,
                 permutation,
             )?,
-            executable::Op::CustomCall {
-                input_ids,
-                output_id,
-                call_target_name,
-                ..
-            } if call_target_name == "annotate_device_placement" || call_target_name == "Sharding" => {
-                let [input_id] = input_ids.as_slice() else {
-                    return Err(invalid_argument(format!(
-                        "TT executable custom_call {call_target_name:?} expected one input, got {}",
-                        input_ids.len()
-                    )));
-                };
-                alias_output_buffer(
-                    &mut values,
-                    plan,
-                    *input_id,
-                    *output_id,
-                    &output_context,
-                    &format!("custom_call {call_target_name:?}"),
-                )?;
-            }
             executable::Op::CustomCall {
                 call_target_name, ..
             } => {
@@ -5057,7 +4934,7 @@ mod tests {
         );
 
         let memory = &client.memories[0];
-        assert_eq!(memory.kind.as_bytes(), b"dram");
+        assert_eq!(memory.kind.as_bytes(), b"device");
         let memory_debug = std::str::from_utf8(memory.debug_string.as_bytes())
             .expect("memory debug string should be utf-8");
         assert!(memory_debug.contains("dram_banks=7"));
