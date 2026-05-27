@@ -61,10 +61,6 @@ pub(crate) enum Op {
         limit_indices: Vec<i64>,
         strides: Vec<i64>,
     },
-    DynamicUpdateSlice {
-        input_ids: Vec<u32>,
-        output_id: u32,
-    },
     Transpose {
         input_id: u32,
         output_id: u32,
@@ -466,17 +462,6 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     limit_indices: slice.limit_indices,
                     strides: slice.strides,
                 }),
-                Kind::DynamicUpdateSlice(dynamic_update_slice) => {
-                    let mut input_ids =
-                        Vec::with_capacity(2 + dynamic_update_slice.start_index_ids.len());
-                    input_ids.push(dynamic_update_slice.operand_id);
-                    input_ids.push(dynamic_update_slice.update_id);
-                    input_ids.extend(dynamic_update_slice.start_index_ids);
-                    Ok(Op::DynamicUpdateSlice {
-                        input_ids,
-                        output_id: op_desc.output_id,
-                    })
-                }
                 Kind::Transpose(transpose) => Ok(Op::Transpose {
                     input_id: transpose.operand_id,
                     output_id: op_desc.output_id,
@@ -692,10 +677,6 @@ pub(crate) enum Op {
         start_indices: Vec<i64>,
         limit_indices: Vec<i64>,
         strides: Vec<i64>,
-    },
-    DynamicUpdateSlice {
-        input_ids: Vec<u32>,
-        output_id: u32,
     },
     Transpose {
         input_id: u32,

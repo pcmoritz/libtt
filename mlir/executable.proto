@@ -50,13 +50,6 @@ message SliceOp {
   repeated int64 strides = 4;
 }
 
-message DynamicUpdateSliceOp {
-  // Indices into Executable.values for this op's operands.
-  uint32 operand_id = 1;
-  uint32 update_id = 2;
-  repeated uint32 start_index_ids = 3;
-}
-
 message TransposeOp {
   // Index into Executable.values for this op's operand.
   uint32 operand_id = 1;
@@ -274,7 +267,6 @@ message Op {
     ScatterOp scatter = 32;
     BitwiseBinaryOp bitwise_binary = 33;
     ReduceWindowOp reduce_window = 34;
-    DynamicUpdateSliceOp dynamic_update_slice = 35;
   }
 }
 

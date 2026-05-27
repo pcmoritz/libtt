@@ -628,6 +628,123 @@ std::optional<mlir::Value> createIntegerSplatConstant(
     return builder.create<mlir::stablehlo::ConstantOp>(loc, attr).getResult();
 }
 
+bool lowerSingleDynamicUpdateSliceToScatter(
+    mlir::stablehlo::DynamicUpdateSliceOp update_slice_op,
+    std::string& error) {
+    auto operand_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        update_slice_op.getOperand().getType());
+    auto update_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        update_slice_op.getUpdate().getType());
+    if (!operand_type || !update_type || !operand_type.hasStaticShape() ||
+        !update_type.hasStaticShape()) {
+        error = "dynamic_update_slice-to-scatter requires ranked static tensors";
+        return false;
+    }
+    if (operand_type.getRank() != 1 || update_type.getRank() != 1) {
+        error = "dynamic_update_slice-to-scatter currently supports only rank-1 updates";
+        return false;
+    }
+    if (update_slice_op.getStartIndices().size() != 1) {
+        error = "rank-1 dynamic_update_slice requires one start index";
+        return false;
+    }
+
+    int64_t operand_size = operand_type.getDimSize(0);
+    int64_t update_size = update_type.getDimSize(0);
+    if (update_size > operand_size) {
+        error = "dynamic_update_slice update size exceeds operand size";
+        return false;
+    }
+
+    mlir::Value start = update_slice_op.getStartIndices().front();
+    auto start_type = mlir::dyn_cast<mlir::RankedTensorType>(start.getType());
+    if (!start_type || start_type.getRank() != 0 ||
+        !mlir::isa<mlir::IntegerType>(start_type.getElementType())) {
+        error = "dynamic_update_slice start index must be a scalar integer tensor";
+        return false;
+    }
+
+    mlir::OpBuilder builder(update_slice_op);
+    mlir::Location loc = update_slice_op.getLoc();
+    auto zero = createIntegerSplatConstant(builder, loc, start_type, 0, error);
+    if (!zero) {
+        return false;
+    }
+    auto max_start = createIntegerSplatConstant(
+        builder, loc, start_type, static_cast<uint64_t>(operand_size - update_size), error);
+    if (!max_start) {
+        return false;
+    }
+
+    // StableHLO dynamic_update_slice clamps starts into
+    // [0, operand_size - update_size]. Express min(x, hi) using max/subtract
+    // because the backend already supports integer maximum.
+    mlir::Value nonnegative_start = builder.create<mlir::stablehlo::MaxOp>(
+        loc, start_type, start, *zero).getResult();
+    mlir::Value excess = builder.create<mlir::stablehlo::SubtractOp>(
+        loc, start_type, nonnegative_start, *max_start).getResult();
+    mlir::Value clamped_excess = builder.create<mlir::stablehlo::MaxOp>(
+        loc, start_type, excess, *zero).getResult();
+    mlir::Value clamped_start = builder.create<mlir::stablehlo::SubtractOp>(
+        loc, start_type, nonnegative_start, clamped_excess).getResult();
+
+    auto indices_vector_type = mlir::RankedTensorType::get(
+        {update_size}, start_type.getElementType());
+    mlir::Value iota = builder.create<mlir::stablehlo::IotaOp>(
+        loc, indices_vector_type, builder.getI64IntegerAttr(0)).getResult();
+    mlir::Value start_vector = builder.create<mlir::stablehlo::BroadcastInDimOp>(
+        loc,
+        indices_vector_type,
+        clamped_start,
+        builder.getDenseI64ArrayAttr({})).getResult();
+    mlir::Value indices_vector = builder.create<mlir::stablehlo::AddOp>(
+        loc, indices_vector_type, iota, start_vector).getResult();
+    auto indices_matrix_type = mlir::RankedTensorType::get(
+        {update_size, 1}, start_type.getElementType());
+    mlir::Value indices = builder.create<mlir::stablehlo::ReshapeOp>(
+        loc, indices_matrix_type, indices_vector).getResult();
+
+    auto scatter_dims = mlir::stablehlo::ScatterDimensionNumbersAttr::get(
+        builder.getContext(),
+        /*updateWindowDims=*/{},
+        /*insertedWindowDims=*/{0},
+        /*inputBatchingDims=*/{},
+        /*scatterIndicesBatchingDims=*/{},
+        /*scatterDimsToOperandDims=*/{0},
+        /*indexVectorDim=*/1);
+    auto scatter = builder.create<mlir::stablehlo::ScatterOp>(
+        loc,
+        update_slice_op->getResultTypes(),
+        mlir::ValueRange{update_slice_op.getOperand()},
+        indices,
+        mlir::ValueRange{update_slice_op.getUpdate()},
+        scatter_dims,
+        /*indicesAreSorted=*/true,
+        /*uniqueIndices=*/true);
+
+    auto scalar_type = mlir::RankedTensorType::get(
+        {}, update_type.getElementType());
+    auto* block = new mlir::Block();
+    scatter.getUpdateComputation().push_back(block);
+    block->addArgument(scalar_type, loc);
+    block->addArgument(scalar_type, loc);
+    mlir::OpBuilder body_builder = mlir::OpBuilder::atBlockEnd(block);
+    body_builder.create<mlir::stablehlo::ReturnOp>(
+        loc, block->getArgument(1));
+
+    update_slice_op.getResult().replaceAllUsesWith(scatter.getResult(0));
+    update_slice_op.erase();
+    return true;
+}
+
+bool lowerDynamicUpdateSliceOpsToScatters(mlir::ModuleOp module, std::string& error) {
+    return lowerAllMatching<mlir::stablehlo::DynamicUpdateSliceOp>(
+        module,
+        [](mlir::stablehlo::DynamicUpdateSliceOp) { return true; },
+        lowerSingleDynamicUpdateSliceToScatter,
+        error);
+}
+
 bool lowerSinglePredicateConvertToSelect(
     mlir::stablehlo::ConvertOp convert_op,
     std::string& error) {
@@ -708,6 +825,9 @@ bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module, std::st
         return false;
     }
     if (!lowerStaticWhileOps(module, error)) {
+        return false;
+    }
+    if (!lowerDynamicUpdateSliceOpsToScatters(module, error)) {
         return false;
     }
 
@@ -2561,32 +2681,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             }
             for (int64_t stride : slice_op.getStrides()) {
                 slice->mutable_slice()->add_strides(stride);
-            }
-            continue;
-        }
-
-        if (auto dynamic_update_slice_op =
-                mlir::dyn_cast<mlir::stablehlo::DynamicUpdateSliceOp>(op)) {
-            uint32_t operand_id = 0;
-            uint32_t update_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(dynamic_update_slice_op.getOperand(), executable, value_ids, error, operand_id) ||
-                !addValueDesc(dynamic_update_slice_op.getUpdate(), executable, value_ids, error, update_id) ||
-                !addValueDesc(dynamic_update_slice_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* dynamic_update_slice = executable.add_ops();
-            dynamic_update_slice->set_output_id(output_id);
-            dynamic_update_slice->mutable_dynamic_update_slice()->set_operand_id(operand_id);
-            dynamic_update_slice->mutable_dynamic_update_slice()->set_update_id(update_id);
-            for (mlir::Value start_index : dynamic_update_slice_op.getStartIndices()) {
-                uint32_t start_index_id = 0;
-                if (!addValueDesc(start_index, executable, value_ids, error, start_index_id)) {
-                    return false;
-                }
-                dynamic_update_slice->mutable_dynamic_update_slice()->add_start_index_ids(
-                    start_index_id);
             }
             continue;
         }

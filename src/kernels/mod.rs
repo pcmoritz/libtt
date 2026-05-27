@@ -1,6 +1,5 @@
 pub(crate) mod broadcast;
 pub(crate) mod concatenate;
-pub(crate) mod dynamic_update_slice;
 pub(crate) mod fused_eltwise;
 pub(crate) mod gather;
 pub(crate) mod iota;
