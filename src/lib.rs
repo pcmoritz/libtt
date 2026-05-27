@@ -1872,87 +1872,6 @@ fn execute_fused_elementwise(
     )
 }
 
-fn execute_pad(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    device: &mut Device,
-    context: &OutputContext,
-    input_id: u32,
-    padding_value_id: u32,
-    output_id: u32,
-    edge_padding_low: &[i64],
-    edge_padding_high: &[i64],
-    interior_padding: &[i64],
-) -> Result<(), *mut PJRT_Error> {
-    let input_desc = plan
-        .values
-        .get(input_id as usize)
-        .ok_or_else(|| invalid_argument("TT executable pad operand value id is out of bounds"))?;
-    let padding_desc = plan.values.get(padding_value_id as usize).ok_or_else(|| {
-        invalid_argument("TT executable pad padding value id is out of bounds")
-    })?;
-    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable pad output id {output_id} is out of bounds"
-        ))
-    })?;
-    if input_desc.element_type != output_desc.element_type
-        || padding_desc.element_type != input_desc.element_type
-    {
-        return Err(invalid_argument(
-            "TT executable pad operand, padding value, and output element types must match",
-        ));
-    }
-    if !padding_desc.dims.is_empty() {
-        return Err(unimplemented(
-            "TT executable pad currently requires a scalar padding value",
-        ));
-    }
-
-    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
-    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let pad_plan = kernels::pad::PadPlan::new(
-        &input_shape,
-        &output_shape,
-        edge_padding_low,
-        edge_padding_high,
-        interior_padding,
-    )
-    .map_err(io_error)?;
-
-    let input = device_buffer_for_value(values, input_id, "pad.operand")?;
-    let Some(input_dram) = input.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable pad operand buffer has no device allocation",
-        ));
-    };
-    let padding = device_buffer_for_value(values, padding_value_id, "pad.padding_value")?;
-    let Some(padding_dram) = padding.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable pad padding value buffer has no device allocation",
-        ));
-    };
-    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    let output_dram = kernels::pad::pad(
-        device,
-        input_dram,
-        padding_dram,
-        &pad_plan,
-        dtype,
-        "pjrt_pad",
-    )
-    .map_err(io_error)?;
-    store_output_buffer(
-        values,
-        plan,
-        output_id,
-        output_desc.dims.clone(),
-        output_dram,
-        context,
-        "pad",
-    )
-}
-
 fn execute_transpose(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -3540,25 +3459,6 @@ fn execute_executable_v1(
                 *input_id,
                 *output_id,
                 permutation,
-            )?,
-            executable::Op::Pad {
-                input_id,
-                padding_value_id,
-                output_id,
-                edge_padding_low,
-                edge_padding_high,
-                interior_padding,
-            } => execute_pad(
-                &mut values,
-                plan,
-                device,
-                &output_context,
-                *input_id,
-                *padding_value_id,
-                *output_id,
-                edge_padding_low,
-                edge_padding_high,
-                interior_padding,
             )?,
             executable::Op::CustomCall {
                 input_ids,

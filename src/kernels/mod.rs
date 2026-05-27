@@ -5,7 +5,6 @@ pub(crate) mod gather;
 pub(crate) mod iota;
 pub(crate) mod kernel;
 pub(crate) mod matmul;
-pub(crate) mod pad;
 pub(crate) mod reduce;
 pub(crate) mod reduce_window;
 pub(crate) mod reshape;

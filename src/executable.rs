@@ -120,14 +120,6 @@ pub(crate) enum Op {
         indices_are_sorted: bool,
         unique_indices: bool,
     },
-    Pad {
-        input_id: u32,
-        padding_value_id: u32,
-        output_id: u32,
-        edge_padding_low: Vec<i64>,
-        edge_padding_high: Vec<i64>,
-        interior_padding: Vec<i64>,
-    },
     Iota {
         output_id: u32,
         iota_dimension: u64,
@@ -575,14 +567,6 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                         ],
                     })
                 }
-                Kind::Pad(pad) => Ok(Op::Pad {
-                    input_id: pad.operand_id,
-                    padding_value_id: pad.padding_value_id,
-                    output_id: op_desc.output_id,
-                    edge_padding_low: pad.edge_padding_low,
-                    edge_padding_high: pad.edge_padding_high,
-                    interior_padding: pad.interior_padding,
-                }),
                 Kind::Iota(iota) => Ok(Op::Iota {
                     output_id: op_desc.output_id,
                     iota_dimension: iota.iota_dimension,
@@ -736,14 +720,6 @@ pub(crate) enum Op {
         dimension_numbers: ScatterDimensionNumbers,
         indices_are_sorted: bool,
         unique_indices: bool,
-    },
-    Pad {
-        input_id: u32,
-        padding_value_id: u32,
-        output_id: u32,
-        edge_padding_low: Vec<i64>,
-        edge_padding_high: Vec<i64>,
-        interior_padding: Vec<i64>,
     },
     Iota {
         output_id: u32,

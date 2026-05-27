@@ -745,6 +745,275 @@ bool lowerDynamicUpdateSliceOpsToScatters(mlir::ModuleOp module, std::string& er
         error);
 }
 
+std::optional<mlir::Value> createI32ScalarConstant(
+    mlir::OpBuilder& builder,
+    mlir::Location loc,
+    int64_t value,
+    std::string& error) {
+    if (value < std::numeric_limits<int32_t>::min() ||
+        value > std::numeric_limits<int32_t>::max()) {
+        error = "i32 scalar constant value is out of range";
+        return std::nullopt;
+    }
+    auto type = mlir::RankedTensorType::get({}, builder.getI32Type());
+    return createIntegerSplatConstant(
+        builder, loc, type, static_cast<uint64_t>(value), error);
+}
+
+bool hasZeroDimension(llvm::ArrayRef<int64_t> shape) {
+    return llvm::any_of(shape, [](int64_t dim) { return dim == 0; });
+}
+
+bool isIdentityPermutation(llvm::ArrayRef<int64_t> permutation) {
+    for (auto [index, dim] : llvm::enumerate(permutation)) {
+        if (static_cast<int64_t>(index) != dim) {
+            return false;
+        }
+    }
+    return true;
+}
+
+llvm::SmallVector<int64_t> moveDimToFrontPermutation(int64_t rank, int64_t dim) {
+    llvm::SmallVector<int64_t> permutation;
+    permutation.reserve(rank);
+    permutation.push_back(dim);
+    for (int64_t index = 0; index < rank; ++index) {
+        if (index != dim) {
+            permutation.push_back(index);
+        }
+    }
+    return permutation;
+}
+
+llvm::SmallVector<int64_t> inversePermutation(llvm::ArrayRef<int64_t> permutation) {
+    llvm::SmallVector<int64_t> inverse(permutation.size(), 0);
+    for (auto [index, dim] : llvm::enumerate(permutation)) {
+        inverse[dim] = static_cast<int64_t>(index);
+    }
+    return inverse;
+}
+
+llvm::SmallVector<int64_t> permuteShape(
+    llvm::ArrayRef<int64_t> shape,
+    llvm::ArrayRef<int64_t> permutation) {
+    llvm::SmallVector<int64_t> result;
+    result.reserve(permutation.size());
+    for (int64_t dim : permutation) {
+        result.push_back(shape[dim]);
+    }
+    return result;
+}
+
+bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) {
+    auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        pad_op.getOperand().getType());
+    auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        pad_op.getResult().getType());
+    auto padding_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        pad_op.getPaddingValue().getType());
+    if (!input_type || !output_type || !padding_type ||
+        !input_type.hasStaticShape() || !output_type.hasStaticShape()) {
+        error = "pad-to-scatter requires ranked static tensors";
+        return false;
+    }
+    if (padding_type.getRank() != 0) {
+        error = "pad-to-scatter requires a scalar padding value";
+        return false;
+    }
+    int64_t rank = input_type.getRank();
+    if (output_type.getRank() != rank ||
+        pad_op.getEdgePaddingLow().size() != static_cast<size_t>(rank) ||
+        pad_op.getEdgePaddingHigh().size() != static_cast<size_t>(rank) ||
+        pad_op.getInteriorPadding().size() != static_cast<size_t>(rank)) {
+        error = "pad attributes must match input/output rank";
+        return false;
+    }
+    if (input_type.getShape() == output_type.getShape() &&
+        llvm::all_of(pad_op.getEdgePaddingLow(), [](int64_t value) { return value == 0; }) &&
+        llvm::all_of(pad_op.getEdgePaddingHigh(), [](int64_t value) { return value == 0; }) &&
+        llvm::all_of(pad_op.getInteriorPadding(), [](int64_t value) { return value == 0; })) {
+        pad_op.getResult().replaceAllUsesWith(pad_op.getOperand());
+        pad_op.erase();
+        return true;
+    }
+    if (rank == 0) {
+        error = "non-noop scalar pad is unsupported";
+        return false;
+    }
+
+    auto low = pad_op.getEdgePaddingLow();
+    auto high = pad_op.getEdgePaddingHigh();
+    auto interior = pad_op.getInteriorPadding();
+    for (int64_t dim = 0; dim < rank; ++dim) {
+        if (low[dim] < 0 || high[dim] < 0 || interior[dim] < 0) {
+            error = "pad-to-scatter requires non-negative padding";
+            return false;
+        }
+        int64_t expected = low[dim] + input_type.getDimSize(dim) +
+                           std::max<int64_t>(input_type.getDimSize(dim) - 1, 0) * interior[dim] +
+                           high[dim];
+        if (output_type.getDimSize(dim) != expected) {
+            error = "pad output shape does not match pad attributes";
+            return false;
+        }
+    }
+
+    mlir::OpBuilder builder(pad_op);
+    mlir::Location loc = pad_op.getLoc();
+    mlir::Type element_type = input_type.getElementType();
+    mlir::Value current = pad_op.getOperand();
+    llvm::SmallVector<int64_t> current_shape(
+        input_type.getShape().begin(),
+        input_type.getShape().end());
+
+    // The runtime scatter path updates dimension 0, so pad one logical
+    // dimension at a time and transpose that dimension to the front when needed.
+    for (int64_t dim = 0; dim < rank; ++dim) {
+        if (low[dim] == 0 && high[dim] == 0 && interior[dim] == 0) {
+            continue;
+        }
+        int64_t step = interior[dim] + 1;
+        if (current_shape[dim] > std::numeric_limits<int32_t>::max() ||
+            low[dim] > std::numeric_limits<int32_t>::max() ||
+            step > std::numeric_limits<int32_t>::max()) {
+            error = "pad-to-scatter index values exceed i32 range";
+            return false;
+        }
+
+        llvm::SmallVector<int64_t> next_shape = current_shape;
+        next_shape[dim] = low[dim] + current_shape[dim] +
+                          std::max<int64_t>(current_shape[dim] - 1, 0) * interior[dim] +
+                          high[dim];
+        auto next_type = mlir::RankedTensorType::get(next_shape, element_type);
+        mlir::Value base = builder.create<mlir::stablehlo::BroadcastInDimOp>(
+            loc,
+            next_type,
+            pad_op.getPaddingValue(),
+            builder.getDenseI64ArrayAttr({})).getResult();
+        if (hasZeroDimension(current_shape)) {
+            current = base;
+            current_shape = next_shape;
+            continue;
+        }
+
+        auto index_vector_type = mlir::RankedTensorType::get(
+            {current_shape[dim]}, builder.getI32Type());
+        mlir::Value indices_vector = builder.create<mlir::stablehlo::IotaOp>(
+            loc, index_vector_type, builder.getI64IntegerAttr(0)).getResult();
+        if (step != 1) {
+            auto step_scalar = createI32ScalarConstant(builder, loc, step, error);
+            if (!step_scalar) {
+                return false;
+            }
+            mlir::Value step_vector = builder.create<mlir::stablehlo::BroadcastInDimOp>(
+                loc,
+                index_vector_type,
+                *step_scalar,
+                builder.getDenseI64ArrayAttr({})).getResult();
+            indices_vector = builder.create<mlir::stablehlo::MulOp>(
+                loc, index_vector_type, indices_vector, step_vector).getResult();
+        }
+        if (low[dim] != 0) {
+            auto low_scalar = createI32ScalarConstant(builder, loc, low[dim], error);
+            if (!low_scalar) {
+                return false;
+            }
+            mlir::Value low_vector = builder.create<mlir::stablehlo::BroadcastInDimOp>(
+                loc,
+                index_vector_type,
+                *low_scalar,
+                builder.getDenseI64ArrayAttr({})).getResult();
+            indices_vector = builder.create<mlir::stablehlo::AddOp>(
+                loc, index_vector_type, indices_vector, low_vector).getResult();
+        }
+        auto indices_matrix_type = mlir::RankedTensorType::get(
+            {current_shape[dim], 1}, builder.getI32Type());
+        mlir::Value indices = builder.create<mlir::stablehlo::ReshapeOp>(
+            loc, indices_matrix_type, indices_vector).getResult();
+
+        mlir::Value scatter_operand = base;
+        mlir::Value scatter_updates = current;
+        auto permutation = moveDimToFrontPermutation(rank, dim);
+        bool needs_transpose = !isIdentityPermutation(permutation);
+        mlir::RankedTensorType scatter_output_type = next_type;
+        if (needs_transpose) {
+            auto transposed_next_shape = permuteShape(next_shape, permutation);
+            auto transposed_current_shape = permuteShape(current_shape, permutation);
+            scatter_output_type = mlir::RankedTensorType::get(
+                transposed_next_shape,
+                element_type);
+            auto transposed_current_type = mlir::RankedTensorType::get(
+                transposed_current_shape,
+                element_type);
+            scatter_operand = builder.create<mlir::stablehlo::TransposeOp>(
+                loc,
+                scatter_output_type,
+                base,
+                builder.getDenseI64ArrayAttr(permutation)).getResult();
+            scatter_updates = builder.create<mlir::stablehlo::TransposeOp>(
+                loc,
+                transposed_current_type,
+                current,
+                builder.getDenseI64ArrayAttr(permutation)).getResult();
+        }
+
+        llvm::SmallVector<int64_t> update_window_dims;
+        update_window_dims.reserve(rank > 0 ? rank - 1 : 0);
+        for (int64_t update_dim = 1; update_dim < rank; ++update_dim) {
+            update_window_dims.push_back(update_dim);
+        }
+        auto scatter_dims = mlir::stablehlo::ScatterDimensionNumbersAttr::get(
+            builder.getContext(),
+            update_window_dims,
+            /*insertedWindowDims=*/{0},
+            /*inputBatchingDims=*/{},
+            /*scatterIndicesBatchingDims=*/{},
+            /*scatterDimsToOperandDims=*/{0},
+            /*indexVectorDim=*/1);
+        llvm::SmallVector<mlir::Type> scatter_result_types{scatter_output_type};
+        auto scatter = builder.create<mlir::stablehlo::ScatterOp>(
+            loc,
+            scatter_result_types,
+            mlir::ValueRange{scatter_operand},
+            indices,
+            mlir::ValueRange{scatter_updates},
+            scatter_dims,
+            /*indicesAreSorted=*/true,
+            /*uniqueIndices=*/true);
+
+        auto scalar_type = mlir::RankedTensorType::get({}, element_type);
+        auto* block = new mlir::Block();
+        scatter.getUpdateComputation().push_back(block);
+        block->addArgument(scalar_type, loc);
+        block->addArgument(scalar_type, loc);
+        mlir::OpBuilder body_builder = mlir::OpBuilder::atBlockEnd(block);
+        body_builder.create<mlir::stablehlo::ReturnOp>(
+            loc, block->getArgument(1));
+
+        current = scatter.getResult(0);
+        if (needs_transpose) {
+            current = builder.create<mlir::stablehlo::TransposeOp>(
+                loc,
+                next_type,
+                current,
+                builder.getDenseI64ArrayAttr(inversePermutation(permutation))).getResult();
+        }
+        current_shape = next_shape;
+    }
+
+    pad_op.getResult().replaceAllUsesWith(current);
+    pad_op.erase();
+    return true;
+}
+
+bool lowerPadOpsToScatters(mlir::ModuleOp module, std::string& error) {
+    return lowerAllMatching<mlir::stablehlo::PadOp>(
+        module,
+        [](mlir::stablehlo::PadOp) { return true; },
+        lowerSinglePadToScatter,
+        error);
+}
+
 bool lowerSinglePredicateConvertToSelect(
     mlir::stablehlo::ConvertOp convert_op,
     std::string& error) {
@@ -828,6 +1097,9 @@ bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module, std::st
         return false;
     }
     if (!lowerDynamicUpdateSliceOpsToScatters(module, error)) {
+        return false;
+    }
+    if (!lowerPadOpsToScatters(module, error)) {
         return false;
     }
 
@@ -2698,32 +2970,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             transpose->mutable_transpose()->set_operand_id(operand_id);
             for (int64_t dim : transpose_op.getPermutation()) {
                 transpose->mutable_transpose()->add_permutation(dim);
-            }
-            continue;
-        }
-
-        if (auto pad_op = mlir::dyn_cast<mlir::stablehlo::PadOp>(op)) {
-            uint32_t operand_id = 0;
-            uint32_t padding_value_id = 0;
-            uint32_t output_id = 0;
-            if (!addValueDesc(pad_op.getOperand(), executable, value_ids, error, operand_id) ||
-                !addValueDesc(pad_op.getPaddingValue(), executable, value_ids, error, padding_value_id) ||
-                !addValueDesc(pad_op.getResult(), executable, value_ids, error, output_id)) {
-                return false;
-            }
-
-            auto* pad = executable.add_ops();
-            pad->set_output_id(output_id);
-            pad->mutable_pad()->set_operand_id(operand_id);
-            pad->mutable_pad()->set_padding_value_id(padding_value_id);
-            for (int64_t value : pad_op.getEdgePaddingLow()) {
-                pad->mutable_pad()->add_edge_padding_low(value);
-            }
-            for (int64_t value : pad_op.getEdgePaddingHigh()) {
-                pad->mutable_pad()->add_edge_padding_high(value);
-            }
-            for (int64_t value : pad_op.getInteriorPadding()) {
-                pad->mutable_pad()->add_interior_padding(value);
             }
             continue;
         }

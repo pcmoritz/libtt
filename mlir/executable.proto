@@ -220,14 +220,6 @@ message FusedElementwiseOp {
   repeated Node nodes = 2;
 }
 
-message PadOp {
-  uint32 operand_id = 1;
-  uint32 padding_value_id = 2;
-  repeated int64 edge_padding_low = 3;
-  repeated int64 edge_padding_high = 4;
-  repeated int64 interior_padding = 5;
-}
-
 message BitwiseBinaryOp {
   enum Kind {
     KIND_AND = 0;
@@ -263,7 +255,6 @@ message Op {
     CustomCallOp custom_call = 27;
     TopKOp top_k = 29;
     FusedElementwiseOp fused_elementwise = 30;
-    PadOp pad = 31;
     ScatterOp scatter = 32;
     BitwiseBinaryOp bitwise_binary = 33;
     ReduceWindowOp reduce_window = 34;
