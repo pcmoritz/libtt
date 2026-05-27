@@ -1,5 +1,6 @@
 #include <cstdint>
 #include "compute_kernel_api/add_int_sfpu.h"
+#include "compute_kernel_api/binary_bitwise_sfpu.h"
 #include "compute_kernel_api/binary_max_min.h"
 #include "compute_kernel_api/eltwise_binary_sfpu.h"
 #include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
@@ -54,6 +55,7 @@ void max_reduce_tile(uint32_t lhs, uint32_t rhs, uint32_t output) {
   }
 }
 
+#if !REDUCE_IS_BITWISE
 void reduce_last_dim_tile(uint32_t dst_idx) {
   ckernel::transpose_wh_dest_init_short<true>();
   ckernel::transpose_wh_dest<true>(dst_idx);
@@ -63,13 +65,34 @@ void reduce_last_dim_tile(uint32_t dst_idx) {
       ckernel::sfpu::_init_reduce_<REDUCE_POOL_TYPE, REDUCE_DATA_FORMAT>, 1)));
   ckernel::sfpu_reduce<REDUCE_POOL_TYPE, REDUCE_DATA_FORMAT>(dst_idx);
 }
+#endif
+
+template <DataFormat Format>
+void bitwise_reduce_tile(uint32_t lhs, uint32_t rhs, uint32_t output) {
+  ckernel::binary_bitwise_tile_init();
+#if REDUCE_IS_OR
+  if constexpr (Format == DataFormat::UInt16) {
+    ckernel::bitwise_or_uint16_binary_tile(lhs, rhs, output);
+  } else {
+    ckernel::bitwise_or_uint32_binary_tile(lhs, rhs, output);
+  }
+#else
+  if constexpr (Format == DataFormat::UInt16) {
+    ckernel::bitwise_and_uint16_binary_tile(lhs, rhs, output);
+  } else {
+    ckernel::bitwise_and_uint32_binary_tile(lhs, rhs, output);
+  }
+#endif
+}
 
 template <DataFormat Format>
 void combine_into_accumulator(uint32_t index, uint32_t dst_idx) {
   if (index == 0) {
     return;
   }
-#if REDUCE_IS_SUM
+#if REDUCE_IS_BITWISE
+  bitwise_reduce_tile<Format>(0, dst_idx, 0);
+#elif REDUCE_IS_SUM
   add_reduce_init<Format>();
   add_reduce_tile<Format>(0, dst_idx, 0);
 #elif REDUCE_IS_MIN
@@ -89,6 +112,7 @@ void MAIN {
 
   unary_op_init_common(cb_input, cb_output);
 
+#if !REDUCE_IS_BITWISE
   if constexpr (REDUCE_LAST_DIM_TILED) {
     uint32_t width_tiles = count;
     for (uint32_t group = 0; group < reduce_groups; ++group) {
@@ -111,6 +135,7 @@ void MAIN {
     }
     return;
   }
+#endif
 
   uint32_t reduce_count = count;
   for (uint32_t group = 0; group < reduce_groups; ++group) {

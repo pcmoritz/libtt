@@ -13,8 +13,6 @@ use std::io;
 const READER: &str = include_str!("../../kernels/reduce_reader.cc");
 const COMPUTE: &str = include_str!("../../kernels/reduce_compute.cc");
 const WRITER: &str = include_str!("../../kernels/reduce_writer.cc");
-const BITWISE_READER: &str = include_str!("../../kernels/bitwise_reduce_lastdim_reader.cc");
-const BITWISE_WRITER: &str = include_str!("../../kernels/broadcast_writer.cc");
 const READER_INPUT_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 
@@ -54,7 +52,7 @@ impl ReduceOp {
             Self::Sum => "ckernel::PoolType::SUM",
             Self::Max => "ckernel::PoolType::MAX",
             Self::Min => "ckernel::PoolType::MIN",
-            Self::And | Self::Or => unreachable!("bitwise reduce does not use compute pool type"),
+            Self::And | Self::Or => "ckernel::PoolType::SUM",
         }
     }
 
@@ -90,16 +88,6 @@ impl ReduceOp {
             _ => Err(invalid_input(format!(
                 "reduce kernel does not support {:?} with dtype {dtype:?}",
                 self
-            ))),
-        }
-    }
-
-    fn bitwise_op_value(self) -> io::Result<u32> {
-        match self {
-            Self::And => Ok(0),
-            Self::Or => Ok(1),
-            _ => Err(invalid_input(format!(
-                "arithmetic reduce op {self:?} has no bitwise op value"
             ))),
         }
     }
@@ -158,11 +146,6 @@ impl ReducePlan {
         if reduce_dim >= input_shape.len() {
             return Err(invalid_input(format!(
                 "reduce dimension {reduce_dim} is out of range for shape {input_shape:?}"
-            )));
-        }
-        if op.is_bitwise() && reduce_dim != input_shape.len() - 1 {
-            return Err(invalid_input(format!(
-                "bitwise reduce currently supports only the last dimension, got dimensions {dimensions:?} for shape {input_shape:?}"
             )));
         }
         let expected_output = input_shape
@@ -242,8 +225,6 @@ struct ReduceProgramKey {
     output_shape: Vec<u32>,
     input_tile_rows: u32,
     input_tiles_per_row: u32,
-    output_tile_rows: u32,
-    output_tiles_per_row: u32,
     shape: ReduceKernelShape,
     identity: Option<u32>,
 }
@@ -269,16 +250,12 @@ pub(crate) fn reduce(
             plan.shape.output_tiles
         ))
     })?;
-    let partition_count = if plan.op.is_bitwise() {
-        output_tiles
-    } else {
-        usize::try_from(reduce_partition_count(plan.shape)?).map_err(|_| {
-            invalid_input(format!(
-                "reduce partition count does not fit in usize for shape {:?}",
-                plan.shape
-            ))
-        })?
-    };
+    let partition_count = usize::try_from(reduce_partition_count(plan.shape)?).map_err(|_| {
+        invalid_input(format!(
+            "reduce partition count does not fit in usize for shape {:?}",
+            plan.shape
+        ))
+    })?;
     let cores = select_worker_cores(device.cores_ref(), partition_count)?;
     let output = device.alloc(
         output_tiles,
@@ -288,7 +265,6 @@ pub(crate) fn reduce(
     )?;
     let input_allocation_shape = tiled_allocation_shape(&plan.input_shape)?;
     let input_rank = input_allocation_shape.len();
-    let output_rank = plan.output_allocation_shape.len();
     let kernel = DramKernel {
         reader_addrs: [u32_addr(input.addr, "input address")?],
         output_addr: u32_addr(output.addr, "output address")?,
@@ -305,14 +281,6 @@ pub(crate) fn reduce(
             input_tiles_per_row: u32_arg(
                 input_allocation_shape[input_rank - 1] / TILE_C,
                 "reduce input tiles per row",
-            )?,
-            output_tile_rows: u32_arg(
-                plan.output_allocation_shape[output_rank - 2] / TILE_R,
-                "reduce output tile rows",
-            )?,
-            output_tiles_per_row: u32_arg(
-                plan.output_allocation_shape[output_rank - 1] / TILE_C,
-                "reduce output tiles per row",
             )?,
             shape: plan.shape,
             identity: plan.identity,
@@ -371,9 +339,6 @@ fn validate_reduce_dtype(dtype: DType, op: ReduceOp) -> io::Result<()> {
 }
 
 fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
-    if key.op.is_bitwise() {
-        return bitwise_reduce_program(key);
-    }
     let shape = key.shape;
     let use_tiled_last_dim = use_tiled_last_dim(&key);
     let ranges = reduce_core_ranges(shape, key.cores.len())?;
@@ -438,7 +403,7 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
     Ok(Program {
         reader_kernel: reduce_reader_source(&key, use_tiled_last_dim)?,
         compute_kernel: reduce_compute_source(key.op, compute_dtype, use_tiled_last_dim),
-        writer_kernel: reduce_writer_source(key.dtype)?,
+        writer_kernel: reduce_writer_source(key.dtype, key.op)?,
         compile: CompileConfig {
             cbs: vec![
                 CBConfig::new(0, key.dtype).with_compute_dtype(compute_dtype),
@@ -457,63 +422,6 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
         name: format!("reduce_{:?}_{:?}", key.op, key.dtype),
         ..Program::new(runtime_args)
     })
-}
-
-fn bitwise_reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
-    let mut runtime_args = RuntimeArgsBuilder::new(
-        0,
-        vec![WRITER_OUTPUT_ADDR_INDEX],
-        vec![READER_INPUT_ADDR_INDEX],
-        Vec::new(),
-    );
-    for (core_index, &core) in key.cores.iter().enumerate() {
-        let (offset, n_tiles) =
-            split_tile_range(key.shape.output_tiles, core_index, key.cores.len())?;
-        runtime_args.add_core(
-            core,
-            vec![0, offset, n_tiles],
-            vec![0, offset, n_tiles],
-            Vec::new(),
-        )?;
-    }
-    let runtime_args = runtime_args.build()?;
-    Ok(Program {
-        reader_kernel: bitwise_reduce_reader_source(&key)?,
-        writer_kernel: BITWISE_WRITER.to_owned(),
-        compile: CompileConfig {
-            cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(16, key.dtype)],
-            ..CompileConfig::default()
-        },
-        name: format!("bitwise_reduce_{:?}_{:?}", key.op, key.dtype),
-        ..Program::new(runtime_args)
-    })
-}
-
-fn bitwise_reduce_reader_source(key: &ReduceProgramKey) -> io::Result<String> {
-    Ok(format!(
-        "#define BITWISE_REDUCE_RANK {}\n\
-         #define BITWISE_REDUCE_INPUT_SHAPE {}\n\
-         #define BITWISE_REDUCE_OUTPUT_SHAPE {}\n\
-         #define BITWISE_REDUCE_INPUT_TILE_ROWS {}\n\
-         #define BITWISE_REDUCE_INPUT_TILES_PER_ROW {}\n\
-         #define BITWISE_REDUCE_OUTPUT_TILE_ROWS {}\n\
-         #define BITWISE_REDUCE_OUTPUT_TILES_PER_ROW {}\n\
-         #define BITWISE_REDUCE_OP {}\n\
-         #define BITWISE_REDUCE_IDENTITY {}\n\
-         #define BITWISE_REDUCE_ELEMENT_TYPE {}\n\
-         {BITWISE_READER}",
-        key.input_shape.len(),
-        cpp_u32_array(&key.input_shape),
-        cpp_u32_array(&key.output_shape),
-        key.input_tile_rows,
-        key.input_tiles_per_row,
-        key.output_tile_rows,
-        key.output_tiles_per_row,
-        key.op.bitwise_op_value()?,
-        key.identity
-            .ok_or_else(|| invalid_input("bitwise reduce requires an identity value"))?,
-        bitwise_element_type(key.dtype)?,
-    ))
 }
 
 fn use_tiled_last_dim(key: &ReduceProgramKey) -> bool {
@@ -543,8 +451,8 @@ fn reduce_reader_source(key: &ReduceProgramKey, use_tiled_last_dim: bool) -> io:
         key.input_tile_rows,
         key.input_tiles_per_row,
         key.shape.inner_output_tiles,
-        key.op.identity_literal(key.dtype)?,
-        element_type(key.dtype)?,
+        reduce_identity_literal(key)?,
+        reduce_element_type(key.dtype, key.op)?,
     ))
 }
 
@@ -555,19 +463,21 @@ fn reduce_compute_source(op: ReduceOp, compute_dtype: DType, use_tiled_last_dim:
         .replace("REDUCE_POOL_TYPE", op.cpp_pool_type())
         .replace("REDUCE_IS_SUM", bool_define(op.is_sum()))
         .replace("REDUCE_IS_MIN", bool_define(op.is_min()))
+        .replace("REDUCE_IS_OR", bool_define(matches!(op, ReduceOp::Or)))
+        .replace("REDUCE_IS_BITWISE", bool_define(op.is_bitwise()))
 }
 
-fn reduce_writer_source(dtype: DType) -> io::Result<String> {
+fn reduce_writer_source(dtype: DType, op: ReduceOp) -> io::Result<String> {
     Ok(format!(
         "#define REDUCE_ELEMENT_TYPE {}\n{WRITER}",
-        element_type(dtype)?
+        reduce_element_type(dtype, op)?
     ))
 }
 
 fn reduce_compute_dtype(dtype: DType) -> io::Result<DType> {
     match dtype {
         DType::Float16B => Ok(DType::Float32),
-        DType::Float32 | DType::Int32 | DType::UInt32 | DType::UInt16 => Ok(dtype),
+        DType::Float32 | DType::Int32 | DType::UInt32 | DType::UInt16 | DType::UInt8 => Ok(dtype),
         _ => Err(invalid_input(format!(
             "reduce compute kernel does not support dtype {dtype:?}"
         ))),
@@ -581,6 +491,7 @@ fn data_format(dtype: DType) -> &'static str {
         DType::Int32 => "DataFormat::Int32",
         DType::UInt32 => "DataFormat::UInt32",
         DType::UInt16 => "DataFormat::UInt16",
+        DType::UInt8 => "DataFormat::UInt8",
         _ => "DataFormat::Invalid",
     }
 }
@@ -719,7 +630,24 @@ fn cpp_u32_array(values: &[u32]) -> String {
     format!("{{{values}}}")
 }
 
-fn element_type(dtype: DType) -> io::Result<&'static str> {
+fn reduce_identity_literal(key: &ReduceProgramKey) -> io::Result<String> {
+    if key.op.is_bitwise() {
+        let identity = key
+            .identity
+            .ok_or_else(|| invalid_input("bitwise reduce requires an identity value"))?;
+        return Ok(format!("{identity}u"));
+    }
+    Ok(key.op.identity_literal(key.dtype)?.to_owned())
+}
+
+fn reduce_element_type(dtype: DType, op: ReduceOp) -> io::Result<&'static str> {
+    if op.is_bitwise() {
+        return bitwise_element_type(dtype);
+    }
+    arithmetic_element_type(dtype)
+}
+
+fn arithmetic_element_type(dtype: DType) -> io::Result<&'static str> {
     match dtype {
         DType::Float32 => Ok("float"),
         DType::Float16B => Ok("uint16_t"),
