@@ -1487,33 +1487,32 @@ fn select_value_input<'a>(
         };
         return Ok(kernels::select::SelectInput::Dram(dram_buffer));
     }
-    for op in &plan.ops {
-        if let executable::Op::Constant {
-            packed_value,
-            data,
-            output_id,
-        } = op
-        {
-            if *output_id == value_id && data.is_empty() {
-                let desc = plan.values.get(index).ok_or_else(|| {
-                    invalid_argument(format!(
-                        "{field} constant value id {value_id} is out of bounds"
-                    ))
-                })?;
-                let dtype = pjrt_buffer_type_to_dtype(desc.element_type)?;
-                if dtype != expected_dtype {
-                    return Err(unimplemented(format!(
-                        "{field} constant value id {value_id} has type {:?}; expected {expected_dtype:?}",
-                        desc.element_type
-                    )));
-                }
-                return Ok(kernels::select::SelectInput::Constant(*packed_value));
-            }
+    if let Some(packed_value) = constant_packed_value(plan, value_id) {
+        let desc = plan.values.get(index).ok_or_else(|| {
+            invalid_argument(format!(
+                "{field} constant value id {value_id} is out of bounds"
+            ))
+        })?;
+        let dtype = pjrt_buffer_type_to_dtype(desc.element_type)?;
+        if dtype != expected_dtype {
+            return Err(unimplemented(format!(
+                "{field} constant value id {value_id} has type {:?}; expected {expected_dtype:?}",
+                desc.element_type
+            )));
         }
+        return Ok(kernels::select::SelectInput::Constant(packed_value));
     }
     Err(invalid_argument(format!(
         "{field} value id {value_id} is not available"
     )))
+}
+
+fn is_identity_i64_sequence(values: &[i64], len: usize) -> bool {
+    values.len() == len
+        && values
+            .iter()
+            .enumerate()
+            .all(|(index, &value)| usize::try_from(value).ok() == Some(index))
 }
 
 struct OutputContext {
@@ -1631,11 +1630,7 @@ fn splat_allocation_data(
     let packed_bytes = packed_value.to_le_bytes();
     let element = &packed_bytes[..dtype.bytes_per_element()];
     let elements = allocation_size / element.len();
-    let mut data = Vec::with_capacity(allocation_size);
-    for _ in 0..elements {
-        data.extend_from_slice(element);
-    }
-    Ok(data)
+    Ok(element.repeat(elements))
 }
 
 fn execute_constant(
@@ -1900,12 +1895,7 @@ fn execute_transpose(
     }
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let is_identity_permutation = permutation.len() == input_shape.len()
-        && permutation
-            .iter()
-            .enumerate()
-            .all(|(dim, &permutation_dim)| usize::try_from(permutation_dim).ok() == Some(dim));
-    if input_shape == output_shape && is_identity_permutation {
+    if input_shape == output_shape && is_identity_i64_sequence(permutation, input_shape.len()) {
         return alias_output_buffer(values, plan, input_id, output_id, context, "transpose");
     }
     let input = device_buffer_for_value(values, input_id, "transpose.operand")?;
@@ -2888,11 +2878,7 @@ fn execute_broadcast_in_dim(
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
     let is_noop_broadcast = input_shape == output_shape
-        && broadcast_dimensions.len() == input_shape.len()
-        && broadcast_dimensions
-            .iter()
-            .enumerate()
-            .all(|(dim, &broadcast_dim)| usize::try_from(broadcast_dim).ok() == Some(dim));
+        && is_identity_i64_sequence(broadcast_dimensions, input_shape.len());
     if is_noop_broadcast {
         return alias_output_buffer(
             values,
@@ -3201,8 +3187,10 @@ fn execute_scatter(
             operand_shape, output_shape
         )));
     }
-    let full_window_dims = (0..operand_shape.len() as i64).collect::<Vec<_>>();
-    let is_full_window_set = dimension_numbers.update_window_dims == full_window_dims
+    let is_full_window_set = is_identity_i64_sequence(
+        &dimension_numbers.update_window_dims,
+        operand_shape.len(),
+    )
         && dimension_numbers.inserted_window_dims.is_empty()
         && dimension_numbers.input_batching_dims.is_empty()
         && dimension_numbers.scatter_indices_batching_dims.is_empty()
