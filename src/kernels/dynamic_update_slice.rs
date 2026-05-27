@@ -1,8 +1,6 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{
-    tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R,
-};
+use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
 use std::io;
@@ -17,12 +15,8 @@ const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct DynamicUpdateSliceShape {
-    operand_shape: Vec<u32>,
-    update_shape: Vec<u32>,
-    operand_tile_rows: u32,
-    operand_tiles_per_row: u32,
-    update_tile_rows: u32,
-    update_tiles_per_row: u32,
+    operand_size: u32,
+    update_size: u32,
     output_tiles: u32,
 }
 
@@ -230,38 +224,17 @@ fn dynamic_update_slice_shape(
     operand_shape: &[usize],
     update_shape: &[usize],
 ) -> io::Result<DynamicUpdateSliceShape> {
-    let operand_allocation_shape = tiled_allocation_shape(operand_shape)?;
-    let update_allocation_shape = tiled_allocation_shape(update_shape)?;
-    let operand_rank = operand_allocation_shape.len();
-    let update_rank = update_allocation_shape.len();
     let output_tiles = tiled_shape_tile_count(operand_shape)?;
     Ok(DynamicUpdateSliceShape {
-        operand_shape: u32_shape(operand_shape, "dynamic_update_slice operand shape")?,
-        update_shape: u32_shape(update_shape, "dynamic_update_slice update shape")?,
-        operand_tile_rows: u32_arg(
-            operand_allocation_shape[operand_rank - 2] / TILE_R,
-            "dynamic_update_slice operand tile rows",
-        )?,
-        operand_tiles_per_row: u32_arg(
-            operand_allocation_shape[operand_rank - 1] / TILE_C,
-            "dynamic_update_slice operand tiles per row",
-        )?,
-        update_tile_rows: u32_arg(
-            update_allocation_shape[update_rank - 2] / TILE_R,
-            "dynamic_update_slice update tile rows",
-        )?,
-        update_tiles_per_row: u32_arg(
-            update_allocation_shape[update_rank - 1] / TILE_C,
-            "dynamic_update_slice update tiles per row",
-        )?,
+        operand_size: u32_arg(operand_shape[0], "dynamic_update_slice operand size")?,
+        update_size: u32_arg(update_shape[0], "dynamic_update_slice update size")?,
         output_tiles: u32_arg(output_tiles, "dynamic_update_slice output tile count")?,
     })
 }
 
 fn dynamic_update_slice_program(key: DynamicUpdateSliceProgramKey) -> io::Result<Program> {
-    let rank = key.shape.operand_shape.len();
     let mut reader_dynamic_indices = vec![READER_OPERAND_ADDR_INDEX, READER_UPDATE_ADDR_INDEX];
-    reader_dynamic_indices.extend(READER_START_INDEX_ADDR_BASE..READER_START_INDEX_ADDR_BASE + rank);
+    reader_dynamic_indices.push(READER_START_INDEX_ADDR_BASE);
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
         vec![WRITER_OUTPUT_ADDR_INDEX],
@@ -271,10 +244,7 @@ fn dynamic_update_slice_program(key: DynamicUpdateSliceProgramKey) -> io::Result
     for (core_index, &core) in key.cores.iter().enumerate() {
         let (offset, n_tiles) =
             split_tile_range(key.shape.output_tiles, core_index, key.cores.len())?;
-        let mut reader_args = vec![0, 0];
-        reader_args.extend(std::iter::repeat(0).take(rank));
-        reader_args.push(offset);
-        reader_args.push(n_tiles);
+        let reader_args = vec![0, 0, 0, offset, n_tiles];
         runtime_args.add_core(core, vec![0, offset, n_tiles], reader_args, Vec::new())?;
     }
     let runtime_args = runtime_args.build()?;
@@ -290,11 +260,7 @@ fn dynamic_update_slice_program(key: DynamicUpdateSliceProgramKey) -> io::Result
             ],
             ..CompileConfig::default()
         },
-        name: format!(
-            "dynamic_update_slice_{:?}_{}",
-            key.dtype,
-            key.shape.operand_shape.len()
-        ),
+        name: format!("dynamic_update_slice_rank1_{:?}", key.dtype),
         ..Program::new(runtime_args)
     })
 }
@@ -305,43 +271,13 @@ fn dynamic_update_slice_reader_source(
 ) -> io::Result<String> {
     let element_type = element_type(dtype);
     Ok(format!(
-        "#define DUS_RANK {}\n\
-         #define DUS_OPERAND_SHAPE {}\n\
-         #define DUS_UPDATE_SHAPE {}\n\
-         #define DUS_OPERAND_TILE_ROWS {}\n\
-         #define DUS_OPERAND_TILES_PER_ROW {}\n\
-         #define DUS_UPDATE_TILE_ROWS {}\n\
-         #define DUS_UPDATE_TILES_PER_ROW {}\n\
+        "#define DUS_OPERAND_SIZE {}\n\
+         #define DUS_UPDATE_SIZE {}\n\
          #define DUS_ELEMENT_TYPE {element_type}\n\
          {DYNAMIC_UPDATE_SLICE_READER}",
-        shape.operand_shape.len(),
-        cpp_u32_array(&shape.operand_shape),
-        cpp_u32_array(&shape.update_shape),
-        shape.operand_tile_rows,
-        shape.operand_tiles_per_row,
-        shape.update_tile_rows,
-        shape.update_tiles_per_row,
+        shape.operand_size,
+        shape.update_size,
     ))
-}
-
-fn u32_shape(shape: &[usize], name: &str) -> io::Result<Vec<u32>> {
-    shape
-        .iter()
-        .enumerate()
-        .map(|(index, &dim)| u32_arg(dim, &format!("{name} dimension {index}")))
-        .collect()
-}
-
-fn cpp_u32_array(values: &[u32]) -> String {
-    if values.is_empty() {
-        return "{1u}".to_owned();
-    }
-    let values = values
-        .iter()
-        .map(|value| format!("{value}u"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{{values}}}")
 }
 
 fn element_type(dtype: DType) -> &'static str {
@@ -392,7 +328,7 @@ mod tests {
         assert_eq!(program.runtime_args.section_sizes(), (12, 20, 0));
         assert!(program
             .reader_kernel
-            .contains("#define DUS_OPERAND_SHAPE {64u}"));
+            .contains("#define DUS_OPERAND_SIZE 64"));
         let blobs = program.runtime_args.blobs();
         assert_eq!(arg_u32(&blobs[0], 6), 0);
         assert_eq!(arg_u32(&blobs[0], 7), 2);

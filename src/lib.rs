@@ -2191,7 +2191,10 @@ fn execute_reduce(
         executable::ReduceReducer::And | executable::ReduceReducer::Or
     ) {
         Some(
-            bitwise_reduce_identity(plan, *init_value_id, reducer, input_desc.element_type)
+            constant_packed_value(plan, *init_value_id)
+                .and_then(|packed_value| {
+                    bitwise_identity_from_packed(reducer, input_desc.element_type, packed_value)
+                })
                 .ok_or_else(|| {
                     unimplemented(
                         "TT executable bitwise reduce requires a supported constant identity init value",
@@ -2579,10 +2582,9 @@ fn reduce_init_is_supported(
                 arithmetic_reduce_identity_from_packed(reducer, element_type, packed_value)
                     .is_some()
             }
-            executable::ReduceReducer::And => {
+            executable::ReduceReducer::And | executable::ReduceReducer::Or => {
                 bitwise_identity_from_packed(reducer, element_type, packed_value).is_some()
             }
-            executable::ReduceReducer::Or => packed_value == 0,
             executable::ReduceReducer::Mul => false,
         };
     }
@@ -2642,16 +2644,6 @@ fn arithmetic_reduce_identity_from_packed(
         },
         _ => None,
     }
-}
-
-fn bitwise_reduce_identity(
-    plan: &executable::Executable,
-    init_value_id: u32,
-    reducer: executable::ReduceReducer,
-    element_type: PJRT_Buffer_Type,
-) -> Option<u32> {
-    let packed_value = constant_packed_value(plan, init_value_id)?;
-    bitwise_identity_from_packed(reducer, element_type, packed_value)
 }
 
 fn bitwise_identity_from_packed(
