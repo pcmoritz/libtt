@@ -1971,25 +1971,6 @@ fn execute_fused_elementwise(
             output_id,
         );
     }
-    if input_ids.is_empty() {
-        let Some(packed_value) =
-            fused_constant_packed_value(effective_nodes, output_desc.element_type)
-        else {
-            return Err(unimplemented(
-                "TT executable fused_elementwise with no inputs requires a foldable constant expression",
-            ));
-        };
-        return execute_constant(
-            values,
-            plan,
-            device,
-            context,
-            packed_value,
-            &[],
-            output_id,
-        );
-    }
-
     let mut inputs = Vec::with_capacity(input_ids.len());
     for (index, &input_id) in input_ids.iter().enumerate() {
         let input = device_buffer_for_value(
@@ -2730,91 +2711,15 @@ enum ConstantScalar {
     Bool(bool),
 }
 
-fn fused_constant_packed_value(
-    nodes: &[executable::FusedElementwiseNode],
-    output_type: PJRT_Buffer_Type,
-) -> Option<u32> {
-    let mut values = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let value = match node.kind {
-            executable::FusedElementwiseKind::Input => return None,
-            executable::FusedElementwiseKind::Constant => {
-                scalar_from_packed(node.element_type, node.packed_value)?
-            }
-            executable::FusedElementwiseKind::Add => {
-                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
-                scalar_add(*lhs, *rhs, node.element_type)?
-            }
-            executable::FusedElementwiseKind::Subtract => {
-                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
-                scalar_subtract(*lhs, *rhs, node.element_type)?
-            }
-            executable::FusedElementwiseKind::Multiply => {
-                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
-                scalar_multiply(*lhs, *rhs, node.element_type)?
-            }
-            executable::FusedElementwiseKind::Divide => {
-                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
-                ConstantScalar::F32(lhs.as_f32()? / rhs.as_f32()?)
-            }
-            executable::FusedElementwiseKind::Power => {
-                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
-                ConstantScalar::F32(lhs.as_f32()?.powf(rhs.as_f32()?))
-            }
-            executable::FusedElementwiseKind::Max => {
-                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
-                ConstantScalar::F32(lhs.as_f32()?.max(rhs.as_f32()?))
-            }
-            executable::FusedElementwiseKind::Bitwise(_) => return None,
-            executable::FusedElementwiseKind::Compare(direction) => {
-                let [lhs, rhs] = fused_constant_inputs(&values, &node.input_nodes)?;
-                ConstantScalar::Bool(scalar_compare(*lhs, *rhs, direction)?)
-            }
-            executable::FusedElementwiseKind::Negate => {
-                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
-                match input {
-                    ConstantScalar::F32(value) => ConstantScalar::F32(-value),
-                    ConstantScalar::I32(value) => ConstantScalar::I32(value.wrapping_neg()),
-                    _ => return None,
-                }
-            }
-            executable::FusedElementwiseKind::Exponential => {
-                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
-                ConstantScalar::F32(input.as_f32()?.exp())
-            }
-            executable::FusedElementwiseKind::Log => {
-                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
-                ConstantScalar::F32(input.as_f32()?.ln())
-            }
-            executable::FusedElementwiseKind::Rsqrt => {
-                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
-                ConstantScalar::F32(1.0 / input.as_f32()?.sqrt())
-            }
-            executable::FusedElementwiseKind::Cosine => {
-                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
-                ConstantScalar::F32(input.as_f32()?.cos())
-            }
-            executable::FusedElementwiseKind::Sine => {
-                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
-                ConstantScalar::F32(input.as_f32()?.sin())
-            }
-            executable::FusedElementwiseKind::Convert => {
-                let [input] = fused_constant_inputs(&values, &node.input_nodes)?;
-                scalar_convert(*input, node.element_type)?
-            }
-        };
-        values.push(value);
-    }
-    scalar_to_packed(*values.last()?, output_type)
-}
-
 fn fold_fused_constant_nodes(
     nodes: &[executable::FusedElementwiseNode],
 ) -> Vec<executable::FusedElementwiseNode> {
     let mut folded = nodes.to_vec();
     let mut values = Vec::<Option<ConstantScalar>>::with_capacity(nodes.len());
     for index in 0..folded.len() {
-        let value = fused_constant_node_value(&folded[index], &values);
+        let value = fused_constant_node_value(&folded[index], |input_node| {
+            values.get(input_node as usize).copied().flatten()
+        });
         if let Some(value) = value {
             if let Some(packed_value) = scalar_to_packed(value, folded[index].element_type) {
                 folded[index].kind = executable::FusedElementwiseKind::Constant;
@@ -2829,46 +2734,49 @@ fn fold_fused_constant_nodes(
     folded
 }
 
-fn fused_constant_node_value(
+fn fused_constant_node_value<F>(
     node: &executable::FusedElementwiseNode,
-    values: &[Option<ConstantScalar>],
-) -> Option<ConstantScalar> {
+    mut input_value: F,
+) -> Option<ConstantScalar>
+where
+    F: FnMut(u32) -> Option<ConstantScalar>,
+{
     Some(match node.kind {
         executable::FusedElementwiseKind::Input => return None,
         executable::FusedElementwiseKind::Constant => {
             scalar_from_packed(node.element_type, node.packed_value)?
         }
         executable::FusedElementwiseKind::Add => {
-            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
             scalar_add(lhs, rhs, node.element_type)?
         }
         executable::FusedElementwiseKind::Subtract => {
-            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
             scalar_subtract(lhs, rhs, node.element_type)?
         }
         executable::FusedElementwiseKind::Multiply => {
-            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
             scalar_multiply(lhs, rhs, node.element_type)?
         }
         executable::FusedElementwiseKind::Divide => {
-            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
             ConstantScalar::F32(lhs.as_f32()? / rhs.as_f32()?)
         }
         executable::FusedElementwiseKind::Power => {
-            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
             ConstantScalar::F32(lhs.as_f32()?.powf(rhs.as_f32()?))
         }
         executable::FusedElementwiseKind::Max => {
-            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
             ConstantScalar::F32(lhs.as_f32()?.max(rhs.as_f32()?))
         }
         executable::FusedElementwiseKind::Bitwise(_) => return None,
         executable::FusedElementwiseKind::Compare(direction) => {
-            let [lhs, rhs] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
             ConstantScalar::Bool(scalar_compare(lhs, rhs, direction)?)
         }
         executable::FusedElementwiseKind::Negate => {
-            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
             match input {
                 ConstantScalar::F32(value) => ConstantScalar::F32(-value),
                 ConstantScalar::I32(value) => ConstantScalar::I32(value.wrapping_neg()),
@@ -2876,27 +2784,27 @@ fn fused_constant_node_value(
             }
         }
         executable::FusedElementwiseKind::Exponential => {
-            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
             ConstantScalar::F32(input.as_f32()?.exp())
         }
         executable::FusedElementwiseKind::Log => {
-            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
             ConstantScalar::F32(input.as_f32()?.ln())
         }
         executable::FusedElementwiseKind::Rsqrt => {
-            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
             ConstantScalar::F32(1.0 / input.as_f32()?.sqrt())
         }
         executable::FusedElementwiseKind::Cosine => {
-            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
             ConstantScalar::F32(input.as_f32()?.cos())
         }
         executable::FusedElementwiseKind::Sine => {
-            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
             ConstantScalar::F32(input.as_f32()?.sin())
         }
         executable::FusedElementwiseKind::Convert => {
-            let [input] = folded_constant_inputs(values, &node.input_nodes)?;
+            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
             scalar_convert(input, node.element_type)?
         }
     })
@@ -2931,24 +2839,16 @@ impl ConstantScalar {
     }
 }
 
-fn fused_constant_inputs<'a, const N: usize>(
-    values: &'a [ConstantScalar],
+fn constant_input_values<const N: usize, F>(
     input_nodes: &[u32],
-) -> Option<[&'a ConstantScalar; N]> {
-    let inputs: Vec<&ConstantScalar> = input_nodes
-        .iter()
-        .map(|&index| values.get(index as usize))
-        .collect::<Option<Vec<_>>>()?;
-    inputs.try_into().ok()
-}
-
-fn folded_constant_inputs<const N: usize>(
-    values: &[Option<ConstantScalar>],
-    input_nodes: &[u32],
-) -> Option<[ConstantScalar; N]> {
+    input_value: &mut F,
+) -> Option<[ConstantScalar; N]>
+where
+    F: FnMut(u32) -> Option<ConstantScalar>,
+{
     let inputs: Vec<ConstantScalar> = input_nodes
         .iter()
-        .map(|&index| values.get(index as usize).copied().flatten())
+        .map(|&input_node| input_value(input_node))
         .collect::<Option<Vec<_>>>()?;
     inputs.try_into().ok()
 }
