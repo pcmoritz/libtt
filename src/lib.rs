@@ -3159,33 +3159,18 @@ fn execute_gather(
         )));
     }
 
-    let output_dram = if axis == 0
-        && rank == 2
-        && operand.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-    {
-        kernels::gather::gather_bf16_rows(
-            device,
-            operand_dram,
-            start_indices_dram,
-            &operand_shape,
-            &start_indices_shape,
-            &output_shape,
-            "pjrt_gather",
-        )
-    } else {
-        let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
-        kernels::gather::gather_dim0_slices(
-            device,
-            operand_dram,
-            start_indices_dram,
-            &operand_shape,
-            &start_indices_shape,
-            &output_shape,
-            axis,
-            dtype,
-            "pjrt_gather_axis",
-        )
-    }
+    let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
+    let output_dram = kernels::gather::gather(
+        device,
+        operand_dram,
+        start_indices_dram,
+        &operand_shape,
+        &start_indices_shape,
+        &output_shape,
+        axis,
+        dtype,
+        "pjrt_gather",
+    )
     .map_err(io_error)?;
     store_output_buffer(
         values,
