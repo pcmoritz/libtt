@@ -78,7 +78,7 @@ pub(crate) fn reshape(
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
     validate_input(input, input_dtype, input_shape)?;
-    if input_dtype != output_dtype && element_size(input_dtype) != element_size(output_dtype) {
+    if input_dtype != output_dtype && input_dtype.bytes_per_element() != output_dtype.bytes_per_element() {
         return Err(invalid_input(format!(
             "reshape bitcast requires equal-width element types, got {input_dtype:?} and {output_dtype:?}"
         )));
@@ -224,14 +224,6 @@ fn reshape_reader_source(dtype: DType) -> io::Result<String> {
     Ok(format!(
         "#define RESHAPE_ELEMENT_TYPE {element_type}\n{READER}"
     ))
-}
-
-fn element_size(dtype: DType) -> usize {
-    match dtype {
-        DType::Float32 | DType::Int32 | DType::UInt32 => 4,
-        DType::Float16 | DType::Float16B | DType::UInt16 => 2,
-        DType::Int8 | DType::UInt8 => 1,
-    }
 }
 
 fn checked_volume(shape: &[usize], label: &str) -> io::Result<usize> {

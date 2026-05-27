@@ -1616,27 +1616,18 @@ fn alias_output_buffer(
     Ok(())
 }
 
-fn packed_element_bytes(dtype: DType, packed_value: u32) -> Vec<u8> {
-    match dtype {
-        DType::Int8 | DType::UInt8 => vec![packed_value as u8],
-        DType::Float16 | DType::Float16B | DType::UInt16 => {
-            (packed_value as u16).to_le_bytes().to_vec()
-        }
-        DType::Float32 | DType::Int32 | DType::UInt32 => packed_value.to_le_bytes().to_vec(),
-    }
-}
-
 fn splat_allocation_data(
     dtype: DType,
     packed_value: u32,
     allocation_shape: &[usize],
 ) -> Result<Vec<u8>, *mut PJRT_Error> {
     let allocation_size = host_byte_size(dtype, allocation_shape)?;
-    let element = packed_element_bytes(dtype, packed_value);
+    let packed_bytes = packed_value.to_le_bytes();
+    let element = &packed_bytes[..dtype.bytes_per_element()];
     let elements = allocation_size / element.len();
     let mut data = Vec::with_capacity(allocation_size);
     for _ in 0..elements {
-        data.extend_from_slice(&element);
+        data.extend_from_slice(element);
     }
     Ok(data)
 }
