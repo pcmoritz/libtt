@@ -574,19 +574,19 @@ bool lowerAllMatching(
     LowerFn lower,
     std::string& error) {
     while (true) {
-        mlir::Operation* next = nullptr;
-        auto walk_result = module.walk([&](OpTy op) {
-            if (!match(op)) {
-                return mlir::WalkResult::advance();
+        llvm::SmallVector<OpTy> matches;
+        module.walk<mlir::WalkOrder::PostOrder>([&](OpTy op) {
+            if (match(op)) {
+                matches.push_back(op);
             }
-            next = op.getOperation();
-            return mlir::WalkResult::interrupt();
         });
-        if (!walk_result.wasInterrupted()) {
+        if (matches.empty()) {
             return true;
         }
-        if (!lower(mlir::cast<OpTy>(next), error)) {
-            return false;
+        for (OpTy op : matches) {
+            if (!lower(op, error)) {
+                return false;
+            }
         }
     }
 }
@@ -752,46 +752,6 @@ bool hasZeroDimension(llvm::ArrayRef<int64_t> shape) {
     return llvm::any_of(shape, [](int64_t dim) { return dim == 0; });
 }
 
-bool isIdentityPermutation(llvm::ArrayRef<int64_t> permutation) {
-    for (auto [index, dim] : llvm::enumerate(permutation)) {
-        if (static_cast<int64_t>(index) != dim) {
-            return false;
-        }
-    }
-    return true;
-}
-
-llvm::SmallVector<int64_t> moveDimToFrontPermutation(int64_t rank, int64_t dim) {
-    llvm::SmallVector<int64_t> permutation;
-    permutation.reserve(rank);
-    permutation.push_back(dim);
-    for (int64_t index = 0; index < rank; ++index) {
-        if (index != dim) {
-            permutation.push_back(index);
-        }
-    }
-    return permutation;
-}
-
-llvm::SmallVector<int64_t> inversePermutation(llvm::ArrayRef<int64_t> permutation) {
-    llvm::SmallVector<int64_t> inverse(permutation.size(), 0);
-    for (auto [index, dim] : llvm::enumerate(permutation)) {
-        inverse[dim] = static_cast<int64_t>(index);
-    }
-    return inverse;
-}
-
-llvm::SmallVector<int64_t> permuteShape(
-    llvm::ArrayRef<int64_t> shape,
-    llvm::ArrayRef<int64_t> permutation) {
-    llvm::SmallVector<int64_t> result;
-    result.reserve(permutation.size());
-    for (int64_t dim : permutation) {
-        result.push_back(shape[dim]);
-    }
-    return result;
-}
-
 bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) {
     auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
         pad_op.getOperand().getType());
@@ -854,8 +814,6 @@ bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) 
         input_type.getShape().begin(),
         input_type.getShape().end());
 
-    // The runtime scatter path updates dimension 0, so pad one logical
-    // dimension at a time and transpose that dimension to the front when needed.
     for (int64_t dim = 0; dim < rank; ++dim) {
         if (low[dim] == 0 && high[dim] == 0 && interior[dim] == 0) {
             continue;
@@ -919,52 +877,28 @@ bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) 
         mlir::Value indices = builder.create<mlir::stablehlo::ReshapeOp>(
             loc, indices_matrix_type, indices_vector).getResult();
 
-        mlir::Value scatter_operand = base;
-        mlir::Value scatter_updates = current;
-        auto permutation = moveDimToFrontPermutation(rank, dim);
-        bool needs_transpose = !isIdentityPermutation(permutation);
-        mlir::RankedTensorType scatter_output_type = next_type;
-        if (needs_transpose) {
-            auto transposed_next_shape = permuteShape(next_shape, permutation);
-            auto transposed_current_shape = permuteShape(current_shape, permutation);
-            scatter_output_type = mlir::RankedTensorType::get(
-                transposed_next_shape,
-                element_type);
-            auto transposed_current_type = mlir::RankedTensorType::get(
-                transposed_current_shape,
-                element_type);
-            scatter_operand = builder.create<mlir::stablehlo::TransposeOp>(
-                loc,
-                scatter_output_type,
-                base,
-                builder.getDenseI64ArrayAttr(permutation)).getResult();
-            scatter_updates = builder.create<mlir::stablehlo::TransposeOp>(
-                loc,
-                transposed_current_type,
-                current,
-                builder.getDenseI64ArrayAttr(permutation)).getResult();
-        }
-
         llvm::SmallVector<int64_t> update_window_dims;
         update_window_dims.reserve(rank > 0 ? rank - 1 : 0);
-        for (int64_t update_dim = 1; update_dim < rank; ++update_dim) {
-            update_window_dims.push_back(update_dim);
+        for (int64_t update_dim = 0; update_dim < rank; ++update_dim) {
+            if (update_dim != dim) {
+                update_window_dims.push_back(update_dim);
+            }
         }
         auto scatter_dims = mlir::stablehlo::ScatterDimensionNumbersAttr::get(
             builder.getContext(),
             update_window_dims,
-            /*insertedWindowDims=*/{0},
+            /*insertedWindowDims=*/{dim},
             /*inputBatchingDims=*/{},
             /*scatterIndicesBatchingDims=*/{},
-            /*scatterDimsToOperandDims=*/{0},
+            /*scatterDimsToOperandDims=*/{dim},
             /*indexVectorDim=*/1);
-        llvm::SmallVector<mlir::Type> scatter_result_types{scatter_output_type};
+        llvm::SmallVector<mlir::Type> scatter_result_types{next_type};
         auto scatter = builder.create<mlir::stablehlo::ScatterOp>(
             loc,
             scatter_result_types,
-            mlir::ValueRange{scatter_operand},
+            mlir::ValueRange{base},
             indices,
-            mlir::ValueRange{scatter_updates},
+            mlir::ValueRange{current},
             scatter_dims,
             /*indicesAreSorted=*/true,
             /*uniqueIndices=*/true);
@@ -979,13 +913,6 @@ bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) 
             loc, block->getArgument(1));
 
         current = scatter.getResult(0);
-        if (needs_transpose) {
-            current = builder.create<mlir::stablehlo::TransposeOp>(
-                loc,
-                next_type,
-                current,
-                builder.getDenseI64ArrayAttr(inversePermutation(permutation))).getResult();
-        }
         current_shape = next_shape;
     }
 

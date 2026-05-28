@@ -11,6 +11,7 @@ constexpr uint32_t RANK = SCATTER_RANK;
 constexpr uint32_t COORD_COUNT = RANK == 0 ? 1 : RANK;
 constexpr uint32_t OPERAND_SHAPE[COORD_COUNT] = SCATTER_OPERAND_SHAPE;
 constexpr uint32_t UPDATE_SHAPE[COORD_COUNT] = SCATTER_UPDATE_SHAPE;
+constexpr uint32_t SCATTER_DIM = SCATTER_DIM_ARG;
 constexpr uint32_t UPDATE_COUNT = SCATTER_UPDATE_COUNT;
 constexpr uint32_t OPERAND_TILE_ROWS = SCATTER_OPERAND_TILE_ROWS;
 constexpr uint32_t OPERAND_TILES_PER_ROW = SCATTER_OPERAND_TILES_PER_ROW;
@@ -212,7 +213,7 @@ void kernel_main() {
     uint32_t loaded_update_tile = INVALID_TILE;
     for (uint32_t update_index = 0; update_index < UPDATE_COUNT; ++update_index) {
       int32_t target = read_scatter_index(indices, update_index, &loaded_index_tile);
-      if (target < 0 || static_cast<uint32_t>(target) >= OPERAND_SHAPE[0]) {
+      if (target < 0 || static_cast<uint32_t>(target) >= OPERAND_SHAPE[SCATTER_DIM]) {
         continue;
       }
 
@@ -220,15 +221,16 @@ void kernel_main() {
         uint32_t output_row = output_row_base + row;
         for (uint32_t col = 0; col < col_count; ++col) {
           uint32_t output_col = output_col_base + col;
-          if (output_coord(0, base_coords, output_row, output_col) !=
+          if (output_coord(SCATTER_DIM, base_coords, output_row, output_col) !=
               static_cast<uint32_t>(target)) {
             continue;
           }
 
           uint32_t update_coords[COORD_COUNT];
-          update_coords[0] = update_index;
-          for (uint32_t dim = 1; dim < RANK; ++dim) {
-            update_coords[dim] = output_coord(dim, base_coords, output_row, output_col);
+          for (uint32_t dim = 0; dim < RANK; ++dim) {
+            update_coords[dim] = dim == SCATTER_DIM
+                                     ? update_index
+                                     : output_coord(dim, base_coords, output_row, output_col);
           }
 
           Location source =

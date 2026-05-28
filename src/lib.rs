@@ -2814,7 +2814,7 @@ fn execute_scatter(
             "scatter",
         );
     }
-    kernels::scatter::validate_set_dimension_numbers(
+    let scatter_dim = kernels::scatter::validate_set_dimension_numbers(
         operand_shape.len(),
         &dimension_numbers.update_window_dims,
         &dimension_numbers.inserted_window_dims,
@@ -2850,6 +2850,7 @@ fn execute_scatter(
         &operand_shape,
         &start_indices_shape,
         &update_shape,
+        scatter_dim,
         dtype,
         "pjrt_scatter",
     )
@@ -5002,6 +5003,49 @@ mod tests {
                 assert_eq!(*output_id, 0);
                 assert_eq!(*packed_value, 0);
                 assert_eq!(data, &[1, 0, 0, 0, 2, 0, 0, 0]);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_pad_to_axis_scatter_without_transpose() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x3xf32>) -> tensor<2x5xf32> {
+    %c = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %0 = "stablehlo.pad"(%arg0, %c) {
+      edge_padding_low = array<i64: 0, 1>,
+      edge_padding_high = array<i64: 0, 1>,
+      interior_padding = array<i64: 0, 0>
+    } : (tensor<2x3xf32>, tensor<f32>) -> tensor<2x5xf32>
+    return %0 : tensor<2x5xf32>
+  }
+}
+"#,
+            |executable| {
+                let scatters = executable
+                    .ops
+                    .iter()
+                    .filter_map(|op| {
+                        if let executable::Op::Scatter {
+                            dimension_numbers, ..
+                        } = op
+                        {
+                            Some(dimension_numbers)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(scatters.len(), 1);
+                assert_eq!(scatters[0].update_window_dims, vec![0]);
+                assert_eq!(scatters[0].inserted_window_dims, vec![1]);
+                assert_eq!(scatters[0].scatter_dims_to_operand_dims, vec![1]);
+                assert!(!executable
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, executable::Op::Transpose { .. })));
             },
         );
     }
