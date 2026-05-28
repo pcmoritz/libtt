@@ -369,96 +369,6 @@ std::optional<uint32_t> packedConvertedConstantValue(
 
 void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value);
 
-std::optional<uint32_t> foldedPackedConstantValue(mlir::Value value) {
-    while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
-        value = broadcast_op.getOperand();
-    }
-
-    std::string ignored;
-    if (auto packed = packedConstantValue(value, ignored)) {
-        return packed;
-    }
-
-    if (auto convert_op = value.getDefiningOp<mlir::stablehlo::ConvertOp>()) {
-        auto input = foldedPackedConstantValue(convert_op.getOperand());
-        if (!input) {
-            return std::nullopt;
-        }
-        auto input_type = mlir::cast<mlir::RankedTensorType>(
-            convert_op.getOperand().getType()).getElementType();
-        auto output_type = mlir::cast<mlir::RankedTensorType>(
-            convert_op.getResult().getType()).getElementType();
-        if (mlir::isa<mlir::IntegerType>(input_type) &&
-            mlir::isa<mlir::IntegerType>(output_type)) {
-            return *input;
-        }
-        std::string convert_error;
-        return packedConvertedConstantValue(convert_op, convert_error);
-    }
-
-    auto fold_binary = [&](auto op, auto fn) -> std::optional<uint32_t> {
-        auto lhs = foldedPackedConstantValue(op.getLhs());
-        auto rhs = foldedPackedConstantValue(op.getRhs());
-        if (!lhs || !rhs) {
-            return std::nullopt;
-        }
-        return fn(*lhs, *rhs);
-    };
-
-    if (auto op = value.getDefiningOp<mlir::stablehlo::AndOp>()) {
-        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs & rhs; });
-    }
-    if (auto op = value.getDefiningOp<mlir::stablehlo::OrOp>()) {
-        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs | rhs; });
-    }
-    if (auto op = value.getDefiningOp<mlir::stablehlo::XorOp>()) {
-        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs ^ rhs; });
-    }
-    if (auto op = value.getDefiningOp<mlir::stablehlo::AddOp>()) {
-        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs + rhs; });
-    }
-    if (auto op = value.getDefiningOp<mlir::stablehlo::SubtractOp>()) {
-        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs - rhs; });
-    }
-    if (auto op = value.getDefiningOp<mlir::stablehlo::ShiftRightLogicalOp>()) {
-        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) {
-            return rhs >= 32 ? 0 : lhs >> rhs;
-        });
-    }
-    if (auto op = value.getDefiningOp<mlir::stablehlo::ShiftRightArithmeticOp>()) {
-        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) {
-            int32_t signed_lhs = static_cast<int32_t>(lhs);
-            return rhs >= 32
-                ? (signed_lhs < 0 ? std::numeric_limits<uint32_t>::max() : 0)
-                : static_cast<uint32_t>(signed_lhs >> rhs);
-        });
-    }
-    if (auto op = value.getDefiningOp<mlir::stablehlo::ShiftLeftOp>()) {
-        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) {
-            return rhs >= 32 ? 0 : lhs << rhs;
-        });
-    }
-
-    return std::nullopt;
-}
-
-bool addFoldedConstantOp(
-    mlir::Value value,
-    tt::Executable& executable,
-    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
-    std::string& error) {
-    auto packed_value = foldedPackedConstantValue(value);
-    if (!packed_value) {
-        return false;
-    }
-    uint32_t output_id = 0;
-    if (!addValueDesc(value, executable, value_ids, error, output_id)) {
-        return false;
-    }
-    addConstantOp(executable, output_id, *packed_value);
-    return true;
-}
-
 void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value) {
     auto* constant = executable.add_ops();
     constant->set_output_id(output_id);
@@ -1224,11 +1134,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 }
                 executable.add_output_ids(output_id);
             }
-            continue;
-        }
-
-        if (op.getNumResults() == 1 &&
-            addFoldedConstantOp(op.getResult(0), executable, value_ids, error)) {
             continue;
         }
 
