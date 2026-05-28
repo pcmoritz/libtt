@@ -19,7 +19,7 @@ mod mlir_frontend;
 mod utils;
 
 use device::Device;
-use dram::{DType, DramBuffer};
+use dram::{allocator_stats, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
@@ -236,6 +236,10 @@ impl PJRT_Client {
 fn cstring_lossy<S: AsRef<str>>(value: S) -> CString {
     let sanitized = value.as_ref().replace('\0', "?");
     CString::new(sanitized).expect("CString::new should succeed after sanitizing NULs")
+}
+
+fn pjrt_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn pjrt_error(message: impl AsRef<str>, code: PJRT_Error_Code) -> *mut PJRT_Error {
@@ -3190,23 +3194,27 @@ pub unsafe extern "C" fn TT_Device_MemoryStats(
     if args.device.is_null() {
         return invalid_argument("device must not be null");
     }
-    args.bytes_in_use = 0;
-    args.peak_bytes_in_use = 0;
-    args.peak_bytes_in_use_is_set = false;
+    let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
+        return invalid_argument("device must not be null");
+    };
+    let stats = allocator_stats(device.runtime.local_hardware_id, device.runtime.active_dram_banks);
+    args.bytes_in_use = pjrt_i64(stats.bytes_in_use);
+    args.peak_bytes_in_use = args.bytes_in_use;
+    args.peak_bytes_in_use_is_set = true;
     args.num_allocs = 0;
     args.num_allocs_is_set = false;
     args.largest_alloc_size = 0;
     args.largest_alloc_size_is_set = false;
-    args.bytes_limit = 0;
-    args.bytes_limit_is_set = false;
-    args.bytes_reserved = 0;
-    args.bytes_reserved_is_set = false;
+    args.bytes_limit = pjrt_i64(stats.bytes_limit);
+    args.bytes_limit_is_set = true;
+    args.bytes_reserved = args.bytes_in_use;
+    args.bytes_reserved_is_set = true;
     args.peak_bytes_reserved = 0;
     args.peak_bytes_reserved_is_set = false;
-    args.bytes_reservable_limit = 0;
-    args.bytes_reservable_limit_is_set = false;
-    args.largest_free_block_bytes = 0;
-    args.largest_free_block_bytes_is_set = false;
+    args.bytes_reservable_limit = args.bytes_limit;
+    args.bytes_reservable_limit_is_set = true;
+    args.largest_free_block_bytes = pjrt_i64(stats.largest_free_block_bytes);
+    args.largest_free_block_bytes_is_set = true;
     args.pool_bytes = 0;
     args.pool_bytes_is_set = false;
     args.peak_pool_bytes = 0;
