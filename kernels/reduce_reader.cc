@@ -18,8 +18,8 @@ constexpr uint32_t INPUT_TILE_ROWS = REDUCE_INPUT_TILE_ROWS;
 constexpr uint32_t INPUT_TILES_PER_ROW = REDUCE_INPUT_TILES_PER_ROW;
 constexpr uint32_t INNER_OUTPUT_TILES = REDUCE_INNER_OUTPUT_TILES;
 using Element = REDUCE_ELEMENT_TYPE;
-constexpr Element IDENTITY = static_cast<Element>(REDUCE_IDENTITY);
-constexpr Element ONE = static_cast<Element>(REDUCE_ONE);
+constexpr uint32_t IDENTITY_BITS = REDUCE_IDENTITY_BITS;
+constexpr uint32_t ONE_BITS = REDUCE_ONE_BITS;
 
 struct Location {
   uint32_t tile;
@@ -36,12 +36,30 @@ uint32_t tile_element_index(uint32_t row, uint32_t col) {
          col_in_face;
 }
 
-void fill_tile(uint32_t cb, Element value) {
-  volatile tt_l1_ptr Element *ptr =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb));
-  uint32_t elements = get_tile_size(cb) / sizeof(Element);
-  for (uint32_t i = 0; i < elements; ++i) {
-    ptr[i] = value;
+void fill_tile(uint32_t cb, uint32_t value_bits) {
+  if constexpr (sizeof(Element) == sizeof(uint32_t)) {
+    volatile tt_l1_ptr uint32_t *ptr =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_write_ptr(cb));
+    uint32_t elements = get_tile_size(cb) / sizeof(uint32_t);
+    for (uint32_t i = 0; i < elements; ++i) {
+      ptr[i] = value_bits;
+    }
+  } else if constexpr (sizeof(Element) == sizeof(uint16_t)) {
+    volatile tt_l1_ptr uint16_t *ptr =
+        reinterpret_cast<volatile tt_l1_ptr uint16_t *>(get_write_ptr(cb));
+    uint16_t value = static_cast<uint16_t>(value_bits);
+    uint32_t elements = get_tile_size(cb) / sizeof(uint16_t);
+    for (uint32_t i = 0; i < elements; ++i) {
+      ptr[i] = value;
+    }
+  } else {
+    volatile tt_l1_ptr uint8_t *ptr =
+        reinterpret_cast<volatile tt_l1_ptr uint8_t *>(get_write_ptr(cb));
+    uint8_t value = static_cast<uint8_t>(value_bits);
+    uint32_t elements = get_tile_size(cb) / sizeof(uint8_t);
+    for (uint32_t i = 0; i < elements; ++i) {
+      ptr[i] = value;
+    }
   }
 }
 
@@ -203,7 +221,7 @@ void kernel_main() {
     if constexpr (REDUCE_BLOCK_MAX_ROW) {
       constexpr uint32_t cb_scaler = tt::CBIndex::c_2;
       cb_reserve_back(cb_scaler, 1);
-      fill_tile(cb_scaler, ONE);
+      fill_tile(cb_scaler, ONE_BITS);
       cb_push_back(cb_scaler, 1);
       padded_width_tiles =
           ((width_tiles + REDUCE_BLOCK_MAX_ROW_TILES - 1) /
@@ -231,7 +249,7 @@ void kernel_main() {
             fill_padded_columns(tile_l1_addr, valid_last_width, padding_identity_bits);
           }
         } else {
-          fill_tile(cb_reduce, IDENTITY);
+          fill_tile(cb_reduce, IDENTITY_BITS);
         }
         cb_push_back(cb_reduce, 1);
       }
@@ -251,7 +269,7 @@ void kernel_main() {
     uint32_t global_group = group_offset + group;
     for (uint32_t reduce_index = 0; reduce_index < reduce_count; ++reduce_index) {
       cb_reserve_back(cb_reduce, 1);
-      fill_tile(cb_reduce, IDENTITY);
+      fill_tile(cb_reduce, IDENTITY_BITS);
 
       uint32_t loaded_source_tile = INVALID_TILE;
       for (uint32_t lane = 0; lane < TILE_R; ++lane) {

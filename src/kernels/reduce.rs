@@ -56,7 +56,7 @@ impl ReduceOp {
         }
     }
 
-    fn padding_identity_bits(self, dtype: DType) -> io::Result<u32> {
+    fn identity_bits(self, dtype: DType) -> io::Result<u32> {
         match (self, dtype) {
             (Self::Sum, _) => Ok(0),
             (Self::Max, DType::Float32) => Ok(f32::NEG_INFINITY.to_bits()),
@@ -69,9 +69,12 @@ impl ReduceOp {
             (Self::Min, DType::UInt32) => Ok(u32::MAX),
             (Self::Min, DType::UInt16) => Ok(0xffff),
             (Self::Min, DType::UInt8) => Ok(0xff),
-            (Self::And | Self::Or, _) => Ok(0),
+            (Self::And, DType::Int32 | DType::UInt32) => Ok(u32::MAX),
+            (Self::And, DType::UInt16) => Ok(0xffff),
+            (Self::And, DType::UInt8) => Ok(0xff),
+            (Self::Or, DType::Int32 | DType::UInt32 | DType::UInt16 | DType::UInt8) => Ok(0),
             _ => Err(invalid_input(format!(
-                "reduce padding identity does not support {:?} with dtype {dtype:?}",
+                "reduce identity does not support {:?} with dtype {dtype:?}",
                 self
             ))),
         }
@@ -80,29 +83,10 @@ impl ReduceOp {
     fn is_min(self) -> bool {
         matches!(self, Self::Min)
     }
+}
 
-    fn identity_literal(self, dtype: DType) -> io::Result<&'static str> {
-        match (self, dtype) {
-            (Self::Sum, DType::Float32) => Ok("0.0f"),
-            (Self::Sum, _) => Ok("0"),
-            (Self::Max, DType::Float32) => Ok("(-3.4028234663852886e+38F)"),
-            (Self::Min, DType::Float32) => Ok("3.4028234663852886e+38F"),
-            (Self::Max, DType::Int32) => Ok("(-2147483647 - 1)"),
-            (Self::Min, DType::Int32) => Ok("2147483647"),
-            (Self::Max, DType::Float16B) => Ok("0xff80u"),
-            (Self::Min, DType::Float16B) => Ok("0x7f80u"),
-            (Self::Max, DType::UInt32 | DType::UInt16) => Ok("0"),
-            (Self::Min, DType::UInt32) => Ok("0xffffffffu"),
-            (Self::Min, DType::UInt16) => Ok("0xffffu"),
-            (Self::And | Self::Or, _) => Err(invalid_input(
-                "bitwise reduce does not use arithmetic identity literals",
-            )),
-            _ => Err(invalid_input(format!(
-                "reduce kernel does not support {:?} with dtype {dtype:?}",
-                self
-            ))),
-        }
-    }
+pub(crate) fn reducer_identity_bits(reducer: ReduceReducer, dtype: DType) -> io::Result<u32> {
+    ReduceOp::from_reducer(reducer)?.identity_bits(dtype)
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -380,7 +364,7 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
                 range.reduce_groups,
                 key.input_tiles_per_row,
                 shape.valid_last_width,
-                key.op.padding_identity_bits(key.dtype)?,
+                key.op.identity_bits(key.dtype)?,
             ]
         } else {
             vec![
@@ -488,8 +472,8 @@ fn reduce_reader_source(
          #define REDUCE_INPUT_TILES_PER_ROW {}\n\
          #define REDUCE_BLOCK_MAX_ROW_TILES {}\n\
          #define REDUCE_INNER_OUTPUT_TILES {}\n\
-         #define REDUCE_IDENTITY {}\n\
-         #define REDUCE_ONE {}\n\
+         #define REDUCE_IDENTITY_BITS {}\n\
+         #define REDUCE_ONE_BITS {}\n\
          #define REDUCE_ELEMENT_TYPE {}\n\
          {READER}",
         bool_define(use_tiled_last_dim),
@@ -502,8 +486,8 @@ fn reduce_reader_source(
         key.input_tiles_per_row,
         block_max_row_tiles(key),
         key.shape.inner_output_tiles,
-        reduce_identity_literal(key)?,
-        reduce_one_literal(key.dtype)?,
+        cpp_u32_literal(reduce_identity_bits(key)?),
+        cpp_u32_literal(reduce_one_bits(key.dtype)?),
         reduce_element_type(key.dtype, key.op)?,
     ))
 }
@@ -694,21 +678,22 @@ fn cpp_u32_array(values: &[u32]) -> String {
     format!("{{{values}}}")
 }
 
-fn reduce_identity_literal(key: &ReduceProgramKey) -> io::Result<String> {
-    if key.op.is_bitwise() {
-        let identity = key
-            .identity
-            .ok_or_else(|| invalid_input("bitwise reduce requires an identity value"))?;
-        return Ok(format!("{identity}u"));
-    }
-    Ok(key.op.identity_literal(key.dtype)?.to_owned())
+fn cpp_u32_literal(value: u32) -> String {
+    format!("{value}u")
 }
 
-fn reduce_one_literal(dtype: DType) -> io::Result<&'static str> {
+fn reduce_identity_bits(key: &ReduceProgramKey) -> io::Result<u32> {
+    if let Some(identity) = key.identity {
+        return Ok(identity);
+    }
+    key.op.identity_bits(key.dtype)
+}
+
+fn reduce_one_bits(dtype: DType) -> io::Result<u32> {
     match dtype {
-        DType::Float32 => Ok("1.0f"),
-        DType::Float16B => Ok("0x3f80u"),
-        DType::Int32 | DType::UInt32 | DType::UInt16 | DType::UInt8 => Ok("1u"),
+        DType::Float32 => Ok(1.0f32.to_bits()),
+        DType::Float16B => Ok(0x3f80),
+        DType::Int32 | DType::UInt32 | DType::UInt16 | DType::UInt8 => Ok(1),
         _ => Err(invalid_input(format!(
             "reduce one literal does not support dtype {dtype:?}"
         ))),

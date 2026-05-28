@@ -775,27 +775,6 @@ fn plan_for_key(key: &MatmulProgramKey) -> io::Result<MatmulPlan> {
     }
 }
 
-#[cfg(test)]
-fn plan_matmul(
-    m: usize,
-    k: usize,
-    n: usize,
-    batch_count: usize,
-    cores: &[CoreCoord],
-    allow_column_split: bool,
-) -> io::Result<MatmulPlan> {
-    plan_matmul_with_tile_sizes(
-        m,
-        k,
-        n,
-        batch_count,
-        cores,
-        allow_column_split,
-        DType::Float16B.tile_size(),
-        DType::Float16B.tile_size(),
-    )
-}
-
 fn plan_matmul_with_tile_sizes(
     m: usize,
     k: usize,
@@ -1605,6 +1584,26 @@ mod tests {
         .filter(|core| *core != CoreCoord { x: 14, y: 2 })
         .filter(|core| *core != CoreCoord { x: 14, y: 3 })
         .collect()
+    }
+
+    fn plan_matmul(
+        m: usize,
+        k: usize,
+        n: usize,
+        batch_count: usize,
+        cores: &[CoreCoord],
+        allow_column_split: bool,
+    ) -> std::io::Result<MatmulPlan> {
+        plan_matmul_with_tile_sizes(
+            m,
+            k,
+            n,
+            batch_count,
+            cores,
+            allow_column_split,
+            DType::Float16B.tile_size(),
+            DType::Float16B.tile_size(),
+        )
     }
 
     #[test]
