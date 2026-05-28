@@ -878,6 +878,46 @@ mod tests {
     }
 
     #[test]
+    fn allocator_stats_tracks_usage_and_free_capacity() {
+        let local_hardware_id = usize::MAX - 2;
+        let bank_count = 2;
+        reset_allocator_for_test(local_hardware_id);
+
+        let tail_bytes_per_bank = Dram::TLB_SIZE_4G - Dram::WRITE_OFFSET;
+        assert_eq!(
+            allocator_stats(local_hardware_id, bank_count),
+            AllocatorStats {
+                bytes_in_use: 0,
+                bytes_limit: tail_bytes_per_bank * bank_count as u64,
+                largest_free_block_bytes: tail_bytes_per_bank * bank_count as u64,
+            }
+        );
+
+        let (addr, size, _) =
+            allocate_allocation_range(local_hardware_id, 3, DType::Float16, bank_count).unwrap();
+        assert_eq!(
+            allocator_stats(local_hardware_id, bank_count),
+            AllocatorStats {
+                bytes_in_use: size * bank_count as u64,
+                bytes_limit: tail_bytes_per_bank * bank_count as u64,
+                largest_free_block_bytes: (tail_bytes_per_bank - size) * bank_count as u64,
+            }
+        );
+
+        free_allocation(local_hardware_id, addr, size);
+        assert_eq!(
+            allocator_stats(local_hardware_id, bank_count),
+            AllocatorStats {
+                bytes_in_use: 0,
+                bytes_limit: tail_bytes_per_bank * bank_count as u64,
+                largest_free_block_bytes: size.max(tail_bytes_per_bank - size) * bank_count as u64,
+            }
+        );
+
+        reset_allocator_for_test(local_hardware_id);
+    }
+
+    #[test]
     fn dram_buffer_clone_frees_on_last_drop() {
         let local_hardware_id = usize::MAX - 1;
         reset_allocator_for_test(local_hardware_id);
