@@ -635,6 +635,31 @@ bool isSetScatter(mlir::stablehlo::ScatterOp scatter_op, std::string& error) {
     return true;
 }
 
+bool addBitwiseBinaryOp(
+    mlir::Value lhs,
+    mlir::Value rhs,
+    mlir::Value result,
+    tt::BitwiseBinaryOp::Kind kind,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    uint32_t lhs_id = 0;
+    uint32_t rhs_id = 0;
+    uint32_t output_id = 0;
+    if (!addValueDesc(lhs, executable, value_ids, error, lhs_id) ||
+        !addValueDesc(rhs, executable, value_ids, error, rhs_id) ||
+        !addValueDesc(result, executable, value_ids, error, output_id)) {
+        return false;
+    }
+
+    auto* bitwise = executable.add_ops();
+    bitwise->set_output_id(output_id);
+    bitwise->mutable_bitwise_binary()->set_lhs_id(lhs_id);
+    bitwise->mutable_bitwise_binary()->set_rhs_id(rhs_id);
+    bitwise->mutable_bitwise_binary()->set_kind(kind);
+    return true;
+}
+
 bool addTopKOp(
     mlir::Value operand,
     mlir::Value values,
@@ -777,6 +802,12 @@ bool supportsFusedValueElementType(tt::TensorDesc::ElementType element_type) {
            element_type == tt::TensorDesc::ELEMENT_TYPE_U16;
 }
 
+bool supportsFusedConvertElementType(tt::TensorDesc::ElementType element_type) {
+    return supportsFusedValueElementType(element_type) ||
+           element_type == tt::TensorDesc::ELEMENT_TYPE_PRED ||
+           element_type == tt::TensorDesc::ELEMENT_TYPE_U8;
+}
+
 bool supportsCompareElementType(tt::TensorDesc::ElementType element_type) {
     return isFusedFloatElementType(element_type) ||
            element_type == tt::TensorDesc::ELEMENT_TYPE_S32;
@@ -788,8 +819,8 @@ bool supportsFusedElementwiseDTypes(
     tt::TensorDesc::ElementType output_type) {
     using Node = tt::FusedElementwiseOp::Node;
     if (kind == Node::KIND_CONVERT) {
-        return supportsFusedValueElementType(input_type) &&
-               supportsFusedValueElementType(output_type);
+        return supportsFusedConvertElementType(input_type) &&
+               supportsFusedConvertElementType(output_type);
     }
     if (kind == Node::KIND_COMPARE) {
         return supportsCompareElementType(input_type) &&
@@ -813,6 +844,7 @@ bool supportsFusedElementwiseDTypes(
         case Node::KIND_NEGATE:
         case Node::KIND_EXPONENTIAL:
         case Node::KIND_RSQRT:
+        case Node::KIND_LOG:
             return isFusedFloatElementType(input_type);
         default:
             return false;
@@ -821,7 +853,7 @@ bool supportsFusedElementwiseDTypes(
 
 bool supportsFusedValueElement(mlir::Value value) {
     auto element_type = staticValueElementType(value);
-    return element_type && supportsFusedValueElementType(*element_type);
+    return element_type && supportsFusedConvertElementType(*element_type);
 }
 
 bool sameTensorShape(mlir::Value lhs, mlir::Value rhs) {
@@ -860,6 +892,7 @@ std::optional<tt::FusedElementwiseOp::Node::Kind> fusedElementwiseKind(
         .Case<mlir::stablehlo::NegOp>([](auto) { return Node::KIND_NEGATE; })
         .Case<mlir::stablehlo::ExpOp>([](auto) { return Node::KIND_EXPONENTIAL; })
         .Case<mlir::stablehlo::RsqrtOp>([](auto) { return Node::KIND_RSQRT; })
+        .Case<mlir::stablehlo::LogOp>([](auto) { return Node::KIND_LOG; })
         .Case<mlir::stablehlo::ConvertOp>([](auto) { return Node::KIND_CONVERT; })
         .Default([](auto) { return std::nullopt; });
 }
@@ -1631,6 +1664,90 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             scatter->mutable_scatter()->set_index_vector_dim(dims.getIndexVectorDim());
             scatter->mutable_scatter()->set_indices_are_sorted(scatter_op.getIndicesAreSorted());
             scatter->mutable_scatter()->set_unique_indices(scatter_op.getUniqueIndices());
+            continue;
+        }
+
+        if (auto and_op = mlir::dyn_cast<mlir::stablehlo::AndOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    and_op.getLhs(),
+                    and_op.getRhs(),
+                    and_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_AND,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (auto or_op = mlir::dyn_cast<mlir::stablehlo::OrOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    or_op.getLhs(),
+                    or_op.getRhs(),
+                    or_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_OR,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (auto xor_op = mlir::dyn_cast<mlir::stablehlo::XorOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    xor_op.getLhs(),
+                    xor_op.getRhs(),
+                    xor_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_XOR,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (auto shift_op = mlir::dyn_cast<mlir::stablehlo::ShiftLeftOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    shift_op.getLhs(),
+                    shift_op.getRhs(),
+                    shift_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_SHIFT_LEFT,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (auto shift_op = mlir::dyn_cast<mlir::stablehlo::ShiftRightLogicalOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    shift_op.getLhs(),
+                    shift_op.getRhs(),
+                    shift_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_LOGICAL,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (auto shift_op = mlir::dyn_cast<mlir::stablehlo::ShiftRightArithmeticOp>(op)) {
+            if (!addBitwiseBinaryOp(
+                    shift_op.getLhs(),
+                    shift_op.getRhs(),
+                    shift_op.getResult(),
+                    tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_ARITHMETIC,
+                    executable,
+                    value_ids,
+                    error)) {
+                return false;
+            }
             continue;
         }
 
