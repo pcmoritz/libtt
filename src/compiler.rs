@@ -1850,12 +1850,7 @@ mod tests {
     #[test]
     fn ckernel_headers_reflect_program_formats() {
         let config = CompileConfig {
-            cbs: vec![CBConfig {
-                index: 1,
-                dtype: DType::UInt8,
-                compute_dtype: DType::UInt8,
-                tiles: 4,
-            }],
+            cbs: vec![CBConfig::new(1, DType::UInt8).with_tiles(4)],
             approx: true,
             dst_accum_mode: true,
             dst_full_sync: true,

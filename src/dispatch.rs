@@ -97,6 +97,11 @@ impl CBConfig {
         self.compute_dtype = compute_dtype;
         self
     }
+
+    pub fn with_tiles(mut self, tiles: usize) -> Self {
+        self.tiles = tiles;
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -841,24 +846,9 @@ mod tests {
     fn build_cb_blob_packs_buffers() {
         let config = CompileConfig {
             cbs: vec![
-                CBConfig {
-                    index: 0,
-                    dtype: DType::Float16,
-                    compute_dtype: DType::Float16,
-                    tiles: 2,
-                },
-                CBConfig {
-                    index: 16,
-                    dtype: DType::Float16B,
-                    compute_dtype: DType::Float16B,
-                    tiles: 1,
-                },
-                CBConfig {
-                    index: 24,
-                    dtype: DType::Float16B,
-                    compute_dtype: DType::Float16B,
-                    tiles: 1,
-                },
+                CBConfig::new(0, DType::Float16),
+                CBConfig::new(16, DType::Float16B).with_tiles(1),
+                CBConfig::new(24, DType::Float16B).with_tiles(1),
             ],
             ..CompileConfig::default()
         };

@@ -432,25 +432,17 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
         writer_kernel: reduce_writer_source(key.dtype, key.op, use_block_max_row)?,
         compile: CompileConfig {
             cbs: vec![
-                CBConfig {
-                    index: 0,
-                    dtype: key.dtype,
-                    compute_dtype: input_compute_dtype,
-                    tiles: if use_block_max_row {
+                CBConfig::new(0, key.dtype)
+                    .with_compute_dtype(input_compute_dtype)
+                    .with_tiles(if use_block_max_row {
                         block_max_row_tiles as usize
                     } else {
                         2
-                    },
-                },
+                    }),
                 CBConfig::new(1, key.dtype),
                 CBConfig::new(2, key.dtype),
                 CBConfig::new(16, key.dtype).with_compute_dtype(compute_dtype),
-                CBConfig {
-                    index: 17,
-                    dtype: key.dtype,
-                    compute_dtype: key.dtype,
-                    tiles: output_tiles,
-                },
+                CBConfig::new(17, key.dtype).with_tiles(output_tiles),
             ],
             dst_accum_mode: true,
             ..CompileConfig::default()
