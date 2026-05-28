@@ -2931,7 +2931,9 @@ fn execute_executable_v1(
                         "TT executable parameter output id {output_id} is out of bounds"
                     ))
                 })?;
-                if input.buffer_type != expected.element_type {
+                let input_dtype = pjrt_buffer_type_to_dtype(input.buffer_type)?;
+                let expected_dtype = pjrt_buffer_type_to_dtype(expected.element_type)?;
+                if input_dtype != expected_dtype {
                     return Err(unimplemented(format!(
                         "TT executable parameter {parameter_index} expected {:?}, got {:?}",
                         expected.element_type, input.buffer_type
@@ -2943,7 +2945,9 @@ fn execute_executable_v1(
                         expected.dims, input.dims
                     )));
                 }
-                values[output_index] = Some(input.clone());
+                let mut parameter = input.clone();
+                parameter.buffer_type = expected.element_type;
+                values[output_index] = Some(parameter);
             }
             executable::Op::Concatenate {
                 input_ids,
@@ -4775,6 +4779,54 @@ mod tests {
                 ty: "f32",
                 expected: executable::FusedElementwiseKind::Power,
             },
+            Case {
+                name: "bitwise_and",
+                op_name: "and",
+                ty: "ui32",
+                expected: executable::FusedElementwiseKind::Bitwise(
+                    executable::BitwiseBinaryKind::And,
+                ),
+            },
+            Case {
+                name: "bitwise_or",
+                op_name: "or",
+                ty: "ui32",
+                expected: executable::FusedElementwiseKind::Bitwise(
+                    executable::BitwiseBinaryKind::Or,
+                ),
+            },
+            Case {
+                name: "bitwise_xor",
+                op_name: "xor",
+                ty: "ui32",
+                expected: executable::FusedElementwiseKind::Bitwise(
+                    executable::BitwiseBinaryKind::Xor,
+                ),
+            },
+            Case {
+                name: "shift_left",
+                op_name: "shift_left",
+                ty: "ui32",
+                expected: executable::FusedElementwiseKind::Bitwise(
+                    executable::BitwiseBinaryKind::ShiftLeft,
+                ),
+            },
+            Case {
+                name: "shift_right_logical",
+                op_name: "shift_right_logical",
+                ty: "ui32",
+                expected: executable::FusedElementwiseKind::Bitwise(
+                    executable::BitwiseBinaryKind::ShiftRightLogical,
+                ),
+            },
+            Case {
+                name: "shift_right_arithmetic",
+                op_name: "shift_right_arithmetic",
+                ty: "i32",
+                expected: executable::FusedElementwiseKind::Bitwise(
+                    executable::BitwiseBinaryKind::ShiftRightArithmetic,
+                ),
+            },
         ];
 
         for case in cases {
@@ -5193,6 +5245,11 @@ mod tests {
                 op_name: "exponential",
                 expected: executable::FusedElementwiseKind::Exponential,
             },
+            Case {
+                name: "log",
+                op_name: "log",
+                expected: executable::FusedElementwiseKind::Log,
+            },
         ];
 
         for case in cases {
@@ -5479,6 +5536,33 @@ mod tests {
                     1,
                     executable::FusedElementwiseKind::Convert,
                 );
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_predicate_to_uint8_convert() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x2xi1>) -> tensor<2x2xui8> {
+    %0 = stablehlo.convert %arg0 : (tensor<2x2xi1>) -> tensor<2x2xui8>
+    return %0 : tensor<2x2xui8>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![1]);
+                assert_eq!(executable.ops.len(), 2);
+                let nodes = assert_fused_elementwise(&executable.ops[1], &[0], 1);
+                assert_eq!(nodes.len(), 2);
+                assert_eq!(nodes[0].kind, executable::FusedElementwiseKind::Input);
+                assert_eq!(
+                    nodes[0].element_type,
+                    PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
+                );
+                assert_eq!(nodes[1].kind, executable::FusedElementwiseKind::Convert);
+                assert_eq!(nodes[1].element_type, PJRT_Buffer_Type::PJRT_Buffer_Type_U8);
             },
         );
     }

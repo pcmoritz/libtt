@@ -2,6 +2,8 @@ use crate::PJRT_Buffer_Type;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status;
 #[cfg(libtt_mlir_frontend)]
+use executable_proto::tt::bitwise_binary_op::Kind as ProtoBitwiseBinaryKind;
+#[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::fused_elementwise_op::node::CompareDirection as ProtoFusedElementwiseCompareDirection;
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::fused_elementwise_op::node::Kind as ProtoFusedElementwiseKind;
@@ -157,13 +159,26 @@ pub(crate) enum FusedElementwiseKind {
     Divide,
     Power,
     Max,
+    Bitwise(BitwiseBinaryKind),
     Compare(CompareDirection),
     Cosine,
     Sine,
     Negate,
     Exponential,
     Rsqrt,
+    Log,
     Convert,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum BitwiseBinaryKind {
+    And,
+    Or,
+    Xor,
+    ShiftLeft,
+    ShiftRightLogical,
+    ShiftRightArithmetic,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -301,6 +316,59 @@ fn parse_reduce_reducer(reducer: i32) -> Result<ReduceReducer, String> {
 }
 
 #[cfg(libtt_mlir_frontend)]
+fn parse_bitwise_binary_kind(kind: ProtoBitwiseBinaryKind) -> Result<BitwiseBinaryKind, String> {
+    match kind {
+        ProtoBitwiseBinaryKind::And => Ok(BitwiseBinaryKind::And),
+        ProtoBitwiseBinaryKind::Or => Ok(BitwiseBinaryKind::Or),
+        ProtoBitwiseBinaryKind::Xor => Ok(BitwiseBinaryKind::Xor),
+        ProtoBitwiseBinaryKind::ShiftLeft => Ok(BitwiseBinaryKind::ShiftLeft),
+        ProtoBitwiseBinaryKind::ShiftRightLogical => Ok(BitwiseBinaryKind::ShiftRightLogical),
+        ProtoBitwiseBinaryKind::ShiftRightArithmetic => Ok(BitwiseBinaryKind::ShiftRightArithmetic),
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn value_element_type(
+    values: &[ValueDesc],
+    value_id: u32,
+    label: &str,
+) -> Result<PJRT_Buffer_Type, String> {
+    values
+        .get(value_id as usize)
+        .map(|value| value.element_type)
+        .ok_or_else(|| {
+            format!("TT executable bitwise {label} value id {value_id} is out of bounds")
+        })
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn fused_input_node(input_index: u32, element_type: PJRT_Buffer_Type) -> FusedElementwiseNode {
+    FusedElementwiseNode {
+        kind: FusedElementwiseKind::Input,
+        input_nodes: Vec::new(),
+        input_index,
+        packed_value: 0,
+        element_type,
+        single_tile_broadcast: false,
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
+fn fused_bitwise_node(
+    kind: BitwiseBinaryKind,
+    element_type: PJRT_Buffer_Type,
+) -> FusedElementwiseNode {
+    FusedElementwiseNode {
+        kind: FusedElementwiseKind::Bitwise(kind),
+        input_nodes: vec![0, 1],
+        input_index: 0,
+        packed_value: 0,
+        element_type,
+        single_tile_broadcast: false,
+    }
+}
+
+#[cfg(libtt_mlir_frontend)]
 fn parse_fused_elementwise_kind(
     kind: i32,
     compare_direction: i32,
@@ -324,6 +392,7 @@ fn parse_fused_elementwise_kind(
         ProtoFusedElementwiseKind::Negate => Ok(FusedElementwiseKind::Negate),
         ProtoFusedElementwiseKind::Exponential => Ok(FusedElementwiseKind::Exponential),
         ProtoFusedElementwiseKind::Rsqrt => Ok(FusedElementwiseKind::Rsqrt),
+        ProtoFusedElementwiseKind::Log => Ok(FusedElementwiseKind::Log),
         ProtoFusedElementwiseKind::Convert => Ok(FusedElementwiseKind::Convert),
     }
 }
@@ -476,6 +545,26 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     indices_are_sorted: scatter.indices_are_sorted,
                     unique_indices: scatter.unique_indices,
                 }),
+                Kind::BitwiseBinary(bitwise) => {
+                    let lhs_id = bitwise.lhs_id;
+                    let rhs_id = bitwise.rhs_id;
+                    let output_id = op_desc.output_id;
+                    let lhs_element_type = value_element_type(&values, lhs_id, "lhs")?;
+                    let rhs_element_type = value_element_type(&values, rhs_id, "rhs")?;
+                    let output_element_type = value_element_type(&values, output_id, "output")?;
+                    Ok(Op::FusedElementwise {
+                        input_ids: vec![lhs_id, rhs_id],
+                        output_id,
+                        nodes: vec![
+                            fused_input_node(0, lhs_element_type),
+                            fused_input_node(1, rhs_element_type),
+                            fused_bitwise_node(
+                                parse_bitwise_binary_kind(bitwise.kind())?,
+                                output_element_type,
+                            ),
+                        ],
+                    })
+                }
                 Kind::Iota(iota) => Ok(Op::Iota {
                     output_id: op_desc.output_id,
                     iota_dimension: iota.iota_dimension,

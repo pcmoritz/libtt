@@ -195,6 +195,7 @@ message FusedElementwiseOp {
       KIND_COSINE = 12;
       KIND_SINE = 13;
       KIND_CONVERT = 14;
+      KIND_LOG = 15;
     }
 
     enum CompareDirection {
@@ -219,6 +220,21 @@ message FusedElementwiseOp {
   repeated Node nodes = 2;
 }
 
+message BitwiseBinaryOp {
+  enum Kind {
+    KIND_AND = 0;
+    KIND_OR = 1;
+    KIND_XOR = 2;
+    KIND_SHIFT_LEFT = 3;
+    KIND_SHIFT_RIGHT_LOGICAL = 4;
+    KIND_SHIFT_RIGHT_ARITHMETIC = 5;
+  }
+
+  uint32 lhs_id = 1;
+  uint32 rhs_id = 2;
+  Kind kind = 3;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -240,6 +256,7 @@ message Op {
     TopKOp top_k = 29;
     FusedElementwiseOp fused_elementwise = 30;
     ScatterOp scatter = 32;
+    BitwiseBinaryOp bitwise_binary = 33;
     ReduceWindowOp reduce_window = 34;
   }
 }
