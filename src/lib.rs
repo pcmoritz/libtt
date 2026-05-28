@@ -3242,8 +3242,9 @@ fn execute_iota(
 
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
-    execute_device: *mut PJRT_Device,
-    target_device: &mut PJRT_Device,
+    device: &mut Device,
+    output_context: &OutputContext,
+    target_local_hardware_id: usize,
     inputs: &[*mut PJRT_Buffer],
 ) -> Result<Vec<PJRT_Buffer>, *mut PJRT_Error> {
     let plan = executable
@@ -3252,13 +3253,6 @@ fn execute_executable_v1(
         .as_ref()
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
     let mut values = vec![None; plan.values.len()];
-    let target_local_hardware_id = target_device.local_hardware_id as usize;
-    let output_context = OutputContext {
-        device: execute_device,
-        memory: target_device.default_memory,
-        local_hardware_id: target_local_hardware_id,
-    };
-    let device = &mut target_device.runtime;
 
     for op in &plan.ops {
         match op {
@@ -3593,15 +3587,24 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         }
         unsafe { slice::from_raw_parts(device_args, args.num_args) }
     };
+    let target_local_hardware_id = target_device.local_hardware_id as usize;
+    let output_context = OutputContext {
+        device: execute_device,
+        memory: target_device.default_memory,
+        local_hardware_id: target_local_hardware_id,
+    };
     let output_buffers = {
-        // Keep the guard scoped around runtime mutation without tying up the
-        // mutable borrow needed by execute_executable_v1.
-        let runtime_lock = ptr::addr_of!(target_device.runtime_lock);
-        let _guard = match unsafe { &*runtime_lock }.lock() {
+        let _guard = match target_device.runtime_lock.lock() {
             Ok(guard) => guard,
             Err(_) => return failed_precondition("device runtime lock is poisoned"),
         };
-        match execute_executable_v1(executable, execute_device, target_device, input_ptrs) {
+        match execute_executable_v1(
+            executable,
+            &mut target_device.runtime,
+            &output_context,
+            target_local_hardware_id,
+            input_ptrs,
+        ) {
             Ok(outputs) => outputs,
             Err(err) => return err,
         }

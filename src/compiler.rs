@@ -839,13 +839,11 @@ fn device_defines(
 }
 
 fn ckernel_headers(config: &CompileConfig) -> BTreeMap<String, String> {
-    let mut formats = vec![DType::Float16B; 32];
-    let mut compute_formats = vec![DType::Float16B; 32];
-    for cb in &config.cbs {
-        if cb.index < formats.len() {
-            formats[cb.index] = cb.dtype;
-            compute_formats[cb.index] = cb.compute_dtype;
-        }
+    let mut formats = [DType::Float16B; 32];
+    let mut compute_formats = [DType::Float16B; 32];
+    for cb in config.cbs.iter().filter(|cb| cb.index < 32) {
+        formats[cb.index] = cb.dtype;
+        compute_formats[cb.index] = cb.compute_dtype;
     }
     let tile_sizes = formats
         .iter()
