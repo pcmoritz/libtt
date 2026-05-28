@@ -20,6 +20,64 @@ const HELPER_SUBTRACT_INPUT: &str =
 const HELPER_MULTIPLY_INPUT: &str =
     include_str!("../../kernels/fused_eltwise_helpers/multiply_input.cc.inc");
 const HELPER_COMPARE: &str = include_str!("../../kernels/fused_eltwise_helpers/compare.cc.inc");
+const HELPER_RAW_BITWISE: &str = r#"
+template <uint32_t OP>
+uint8_t raw_bitwise_u8_apply(uint8_t lhs, uint8_t rhs) {
+  if constexpr (OP == 0) {
+    return lhs & rhs;
+  } else if constexpr (OP == 1) {
+    return lhs | rhs;
+  } else if constexpr (OP == 2) {
+    return lhs ^ rhs;
+  } else {
+    uint32_t amount = static_cast<uint32_t>(rhs);
+    if (amount >= 8) {
+      if constexpr (OP == 5) {
+        return static_cast<int8_t>(lhs) < 0 ? 0xff : 0;
+      }
+      return 0;
+    }
+    if constexpr (OP == 3) {
+      return static_cast<uint8_t>(lhs << amount);
+    } else if constexpr (OP == 4) {
+      return static_cast<uint8_t>(lhs >> amount);
+    } else {
+      return static_cast<uint8_t>(static_cast<int8_t>(lhs) >> amount);
+    }
+  }
+}
+
+template <uint32_t OP>
+void raw_bitwise_u8_tile(uint32_t lhs_cb, uint32_t rhs_cb, uint32_t output_cb) {
+#ifdef TRISC_PACK
+  {
+    uint32_t output_addr =
+        get_local_cb_interface(output_cb).fifo_wr_ptr << 4;
+    mailbox_write(ckernel::ThreadId::UnpackThreadId, output_addr);
+    mailbox_read(ckernel::ThreadId::UnpackThreadId);
+  }
+#endif
+#ifdef TRISC_UNPACK
+  {
+    uint32_t lhs_addr =
+        get_local_cb_interface(lhs_cb).fifo_rd_ptr << 4;
+    uint32_t rhs_addr =
+        get_local_cb_interface(rhs_cb).fifo_rd_ptr << 4;
+    uint32_t output_addr = mailbox_read(ckernel::ThreadId::PackThreadId);
+    volatile tt_l1_ptr uint8_t *lhs =
+        reinterpret_cast<volatile tt_l1_ptr uint8_t *>(lhs_addr);
+    volatile tt_l1_ptr uint8_t *rhs =
+        reinterpret_cast<volatile tt_l1_ptr uint8_t *>(rhs_addr);
+    volatile tt_l1_ptr uint8_t *output =
+        reinterpret_cast<volatile tt_l1_ptr uint8_t *>(output_addr);
+    for (uint32_t element = 0; element < 1024; ++element) {
+      output[element] = raw_bitwise_u8_apply<OP>(lhs[element], rhs[element]);
+    }
+    mailbox_write(ckernel::ThreadId::PackThreadId, 1);
+  }
+#endif
+}
+"#;
 const MAX_FUSED_INPUTS: usize = 8;
 const MAX_FUSED_NODES: usize = 16;
 
@@ -141,7 +199,7 @@ impl FusedElementwiseKind {
             Self::Bitwise(kind) => {
                 let input_dtype = self.validate_binary_input_dtypes(node_index, input_dtypes)?;
                 validate_same_output_dtype(node_index, self, input_dtype, output_dtype)?;
-                if bitwise_compute(kind, input_dtype).is_none() {
+                if bitwise_compute(kind, input_dtype).is_none() && input_dtype != DType::UInt8 {
                     return Err(invalid_input(format!(
                         "node[{node_index}] {self:?} does not support dtype {input_dtype:?}"
                     )));
@@ -819,11 +877,7 @@ fn reader_source(
             "  constexpr uint32_t cb_leaf_{leaf_index} = tt::CBIndex::c_{cb};"
         )
         .unwrap();
-        writeln!(
-            reserves,
-            "    cb_reserve_back(cb_leaf_{leaf_index}, 1);"
-        )
-        .unwrap();
+        writeln!(reserves, "    cb_reserve_back(cb_leaf_{leaf_index}, 1);").unwrap();
         match node.kind {
             FusedElementwiseKind::Input => {
                 writeln!(
@@ -868,11 +922,7 @@ fn reader_source(
             }
             _ => unreachable!("fused reader leaves are limited to inputs and constants"),
         }
-        writeln!(
-            pushes,
-            "    cb_push_back(cb_leaf_{leaf_index}, 1);"
-        )
-        .unwrap();
+        writeln!(pushes, "    cb_push_back(cb_leaf_{leaf_index}, 1);").unwrap();
     }
 
     Ok(format!(
@@ -942,6 +992,7 @@ struct ComputeSourceFeatures {
     subtract_input_helper: bool,
     multiply_input_helper: bool,
     compare_helpers: bool,
+    raw_bitwise: bool,
 }
 
 impl ComputeSourceFeatures {
@@ -978,6 +1029,10 @@ impl ComputeSourceFeatures {
         self.add_header(HEADER_BINARY_SFPU);
         self.add_header(HEADER_SUB_INT);
         self.add_header(HEADER_COMP);
+    }
+
+    fn add_raw_bitwise(&mut self) {
+        self.raw_bitwise = true;
     }
 
     fn add_data_format_binary_helper(&mut self, op: FusedElementwiseKind) {
@@ -1024,6 +1079,9 @@ impl ComputeSourceFeatures {
         }
         if self.compare_helpers {
             helpers.push_str(HELPER_COMPARE);
+        }
+        if self.raw_bitwise {
+            helpers.push_str(HELPER_RAW_BITWISE);
         }
         helpers
     }
@@ -1083,6 +1141,7 @@ enum Lowering {
     Unary(UnarySpec),
     ScalarBinary(ScalarBinarySpec),
     Binary(BinarySpec),
+    RawBitwise(RawBitwiseSpec),
     Compare(CompareSpec),
 }
 
@@ -1118,6 +1177,13 @@ struct BinarySpec {
     lhs: usize,
     rhs: usize,
     op: BinaryLowering,
+}
+
+#[derive(Clone, Copy)]
+struct RawBitwiseSpec {
+    lhs: usize,
+    rhs: usize,
+    kind: BitwiseBinaryKind,
 }
 
 #[derive(Clone, Copy)]
@@ -1178,6 +1244,7 @@ fn compute_steps(nodes: &[FusedElementwiseNode]) -> io::Result<ComputeSteps> {
             Lowering::Unary(spec) => emit_unary(&mut ctx, index, spec)?,
             Lowering::ScalarBinary(spec) => emit_scalar_binary(&mut ctx, index, spec)?,
             Lowering::Binary(spec) => emit_binary(&mut ctx, index, spec)?,
+            Lowering::RawBitwise(spec) => emit_raw_bitwise(&mut ctx, index, spec)?,
             Lowering::Compare(spec) => emit_compare(&mut ctx, index, spec)?,
         }
     }
@@ -1212,17 +1279,20 @@ fn lowering_for(
             let rhs = node.input_nodes[1] as usize;
             if let FusedElementwiseKind::Bitwise(kind) = node.kind {
                 let dtype = node_dtype(node)?;
-                let binary = bitwise_compute(kind, dtype).ok_or_else(|| {
-                    invalid_input(format!(
+                if let Some(binary) = bitwise_compute(kind, dtype) {
+                    return Ok(Lowering::Binary(BinarySpec {
+                        lhs,
+                        rhs,
+                        op: BinaryLowering::Tile(binary),
+                    }));
+                }
+                if dtype != DType::UInt8 {
+                    return Err(invalid_input(format!(
                         "missing bitwise lowering for {:?} with dtype {dtype:?}",
                         node.kind
-                    ))
-                })?;
-                return Ok(Lowering::Binary(BinarySpec {
-                    lhs,
-                    rhs,
-                    op: BinaryLowering::Tile(binary),
-                }));
+                    )));
+                }
+                return Ok(Lowering::RawBitwise(RawBitwiseSpec { lhs, rhs, kind }));
             }
             if let FusedElementwiseKind::Compare(direction) = node.kind {
                 if let Some((value_node, scalar, scalar_direction)) =
@@ -1372,6 +1442,36 @@ fn emit_binary(ctx: &mut ComputeEmitContext<'_>, index: usize, spec: BinarySpec)
         }
     }
     ctx.pack_and_pop(output_cb, &[spec.lhs, spec.rhs])
+}
+
+fn emit_raw_bitwise(
+    ctx: &mut ComputeEmitContext<'_>,
+    index: usize,
+    spec: RawBitwiseSpec,
+) -> io::Result<()> {
+    let lhs_cb = ctx.cb_for_node(spec.lhs)?;
+    let rhs_cb = ctx.cb_for_node(spec.rhs)?;
+    let output_cb = ctx.cb_for_node(index)?;
+    append_waits(&mut ctx.body, &[lhs_cb, rhs_cb]);
+    ctx.features.add_raw_bitwise();
+    writeln!(
+        ctx.body,
+        "    cb_reserve_back(tt::CBIndex::c_{output_cb}, 1);"
+    )
+    .unwrap();
+    writeln!(
+        ctx.body,
+        "    raw_bitwise_u8_tile<{}>(tt::CBIndex::c_{lhs_cb}, tt::CBIndex::c_{rhs_cb}, tt::CBIndex::c_{output_cb});",
+        raw_bitwise_op_value(spec.kind)
+    )
+    .unwrap();
+    append_pop_consumed_and_push(
+        &mut ctx.body,
+        output_cb,
+        &[spec.lhs, spec.rhs],
+        ctx.node_cbs,
+        ctx.remaining_uses,
+    )
 }
 
 fn emit_compare(
@@ -1572,6 +1672,17 @@ fn element_bytes(dtype: DType) -> usize {
         DType::Float32 | DType::Int32 | DType::UInt32 => 4,
         DType::Float16 | DType::Float16B | DType::UInt16 => 2,
         DType::Int8 | DType::UInt8 => 1,
+    }
+}
+
+fn raw_bitwise_op_value(kind: BitwiseBinaryKind) -> u32 {
+    match kind {
+        BitwiseBinaryKind::And => 0,
+        BitwiseBinaryKind::Or => 1,
+        BitwiseBinaryKind::Xor => 2,
+        BitwiseBinaryKind::ShiftLeft => 3,
+        BitwiseBinaryKind::ShiftRightLogical => 4,
+        BitwiseBinaryKind::ShiftRightArithmetic => 5,
     }
 }
 

@@ -260,7 +260,11 @@ fn scatter_dim0_program(key: ScatterDim0ProgramKey) -> io::Result<Program> {
             ],
             ..CompileConfig::default()
         },
-        name: format!("scatter_dim0_set_{:?}_{}", key.dtype, key.shape.operand_shape.len()),
+        name: format!(
+            "scatter_dim0_set_{:?}_{}",
+            key.dtype,
+            key.shape.operand_shape.len()
+        ),
         ..Program::new(runtime_args)
     })
 }
@@ -326,6 +330,24 @@ pub(crate) fn validate_dim0_set_dimension_numbers(
         )));
     }
     Ok(())
+}
+
+pub(crate) fn is_full_window_set_dimension_numbers(
+    rank: usize,
+    update_window_dims: &[i64],
+    inserted_window_dims: &[i64],
+    input_batching_dims: &[i64],
+    scatter_indices_batching_dims: &[i64],
+    scatter_dims_to_operand_dims: &[i64],
+    index_vector_dim: i64,
+) -> bool {
+    let expected_update_window_dims = (0..rank as i64).collect::<Vec<_>>();
+    update_window_dims == expected_update_window_dims.as_slice()
+        && inserted_window_dims.is_empty()
+        && input_batching_dims.is_empty()
+        && scatter_indices_batching_dims.is_empty()
+        && scatter_dims_to_operand_dims.is_empty()
+        && index_vector_dim == 0
 }
 
 fn u32_shape(shape: &[usize], name: &str) -> io::Result<Vec<u32>> {

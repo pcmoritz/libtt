@@ -56,12 +56,24 @@ impl ReduceOp {
         }
     }
 
-    fn padding_identity_bits(self) -> u32 {
-        match self {
-            Self::Sum => 0.0f32.to_bits(),
-            Self::Max => f32::NEG_INFINITY.to_bits(),
-            Self::Min => f32::INFINITY.to_bits(),
-            Self::And | Self::Or => 0,
+    fn padding_identity_bits(self, dtype: DType) -> io::Result<u32> {
+        match (self, dtype) {
+            (Self::Sum, _) => Ok(0),
+            (Self::Max, DType::Float32) => Ok(f32::NEG_INFINITY.to_bits()),
+            (Self::Max, DType::Float16B) => Ok(0xff80),
+            (Self::Min, DType::Float32) => Ok(f32::INFINITY.to_bits()),
+            (Self::Min, DType::Float16B) => Ok(0x7f80),
+            (Self::Max, DType::Int32) => Ok(i32::MIN as u32),
+            (Self::Min, DType::Int32) => Ok(i32::MAX as u32),
+            (Self::Max, DType::UInt32 | DType::UInt16 | DType::UInt8) => Ok(0),
+            (Self::Min, DType::UInt32) => Ok(u32::MAX),
+            (Self::Min, DType::UInt16) => Ok(0xffff),
+            (Self::Min, DType::UInt8) => Ok(0xff),
+            (Self::And | Self::Or, _) => Ok(0),
+            _ => Err(invalid_input(format!(
+                "reduce padding identity does not support {:?} with dtype {dtype:?}",
+                self
+            ))),
         }
     }
 
@@ -340,7 +352,9 @@ fn validate_reduce_dtype(dtype: DType, op: ReduceOp) -> io::Result<()> {
 
 fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
     let shape = key.shape;
-    let use_tiled_last_dim = use_tiled_last_dim(&key);
+    let use_block_max_row = use_block_max_row(&key);
+    let use_tiled_last_dim = use_block_max_row || use_tiled_last_dim(&key);
+    let block_max_row_tiles = block_max_row_tiles(&key);
     let ranges = reduce_core_ranges(shape, key.cores.len())?;
     let max_core_output_tiles = ranges
         .iter()
@@ -366,7 +380,7 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
                 range.reduce_groups,
                 key.input_tiles_per_row,
                 shape.valid_last_width,
-                key.op.padding_identity_bits(),
+                key.op.padding_identity_bits(key.dtype)?,
             ]
         } else {
             vec![
@@ -400,14 +414,36 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
     }
     let runtime_args = runtime_args.build()?;
     let compute_dtype = reduce_compute_dtype(key.dtype)?;
+    let input_compute_dtype = if use_block_max_row {
+        key.dtype
+    } else {
+        compute_dtype
+    };
+    let reader_kernel = reduce_reader_source(&key, use_tiled_last_dim, use_block_max_row)?;
     Ok(Program {
-        reader_kernel: reduce_reader_source(&key, use_tiled_last_dim)?,
-        compute_kernel: reduce_compute_source(key.op, compute_dtype, use_tiled_last_dim),
-        writer_kernel: reduce_writer_source(key.dtype, key.op)?,
+        reader_kernel,
+        compute_kernel: reduce_compute_source(
+            key.op,
+            key.dtype,
+            use_tiled_last_dim,
+            use_block_max_row,
+            block_max_row_tiles,
+        ),
+        writer_kernel: reduce_writer_source(key.dtype, key.op, use_block_max_row)?,
         compile: CompileConfig {
             cbs: vec![
-                CBConfig::new(0, key.dtype).with_compute_dtype(compute_dtype),
+                CBConfig {
+                    index: 0,
+                    dtype: key.dtype,
+                    compute_dtype: input_compute_dtype,
+                    tiles: if use_block_max_row {
+                        block_max_row_tiles as usize
+                    } else {
+                        2
+                    },
+                },
                 CBConfig::new(1, key.dtype),
+                CBConfig::new(2, key.dtype),
                 CBConfig::new(16, key.dtype).with_compute_dtype(compute_dtype),
                 CBConfig {
                     index: 17,
@@ -425,40 +461,75 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
 }
 
 fn use_tiled_last_dim(key: &ReduceProgramKey) -> bool {
-    key.dtype == DType::Float32
-        && !key.op.is_min()
+    if key.shape.reduce_dim as usize != key.input_shape.len().saturating_sub(1) {
+        return false;
+    }
+    matches!(
+        (key.dtype, key.op),
+        (DType::Float32, ReduceOp::Sum | ReduceOp::Max)
+    )
+}
+
+fn use_block_max_row(key: &ReduceProgramKey) -> bool {
+    key.dtype == DType::Float16B
+        && key.op == ReduceOp::Max
         && key.shape.reduce_dim as usize == key.input_shape.len().saturating_sub(1)
 }
 
-fn reduce_reader_source(key: &ReduceProgramKey, use_tiled_last_dim: bool) -> io::Result<String> {
+fn block_max_row_tiles(key: &ReduceProgramKey) -> u32 {
+    key.input_tiles_per_row.clamp(1, 64)
+}
+
+fn reduce_reader_source(
+    key: &ReduceProgramKey,
+    use_tiled_last_dim: bool,
+    use_block_max_row: bool,
+) -> io::Result<String> {
     Ok(format!(
         "#define REDUCE_LAST_DIM_TILED {}\n\
+         #define REDUCE_BLOCK_MAX_ROW {}\n\
          #define REDUCE_RANK {}\n\
          #define REDUCE_DIMENSION {}\n\
          #define REDUCE_INPUT_SHAPE {}\n\
          #define REDUCE_OUTPUT_SHAPE {}\n\
          #define REDUCE_INPUT_TILE_ROWS {}\n\
          #define REDUCE_INPUT_TILES_PER_ROW {}\n\
+         #define REDUCE_BLOCK_MAX_ROW_TILES {}\n\
          #define REDUCE_INNER_OUTPUT_TILES {}\n\
          #define REDUCE_IDENTITY {}\n\
+         #define REDUCE_ONE {}\n\
          #define REDUCE_ELEMENT_TYPE {}\n\
          {READER}",
         bool_define(use_tiled_last_dim),
+        bool_define(use_block_max_row),
         key.input_shape.len(),
         key.shape.reduce_dim,
         cpp_u32_array(&key.input_shape),
         cpp_u32_array(&key.output_shape),
         key.input_tile_rows,
         key.input_tiles_per_row,
+        block_max_row_tiles(key),
         key.shape.inner_output_tiles,
         reduce_identity_literal(key)?,
+        reduce_one_literal(key.dtype)?,
         reduce_element_type(key.dtype, key.op)?,
     ))
 }
 
-fn reduce_compute_source(op: ReduceOp, compute_dtype: DType, use_tiled_last_dim: bool) -> String {
+fn reduce_compute_source(
+    op: ReduceOp,
+    compute_dtype: DType,
+    use_tiled_last_dim: bool,
+    use_block_max_row: bool,
+    block_max_row_tiles: u32,
+) -> String {
     COMPUTE
         .replace("REDUCE_LAST_DIM_TILED", bool_define(use_tiled_last_dim))
+        .replace(
+            "REDUCE_BLOCK_MAX_ROW_TILES",
+            &block_max_row_tiles.to_string(),
+        )
+        .replace("REDUCE_BLOCK_MAX_ROW", bool_define(use_block_max_row))
         .replace("REDUCE_DATA_FORMAT", data_format(compute_dtype))
         .replace("REDUCE_POOL_TYPE", op.cpp_pool_type())
         .replace("REDUCE_IS_SUM", bool_define(op.is_sum()))
@@ -467,9 +538,10 @@ fn reduce_compute_source(op: ReduceOp, compute_dtype: DType, use_tiled_last_dim:
         .replace("REDUCE_IS_BITWISE", bool_define(op.is_bitwise()))
 }
 
-fn reduce_writer_source(dtype: DType, op: ReduceOp) -> io::Result<String> {
+fn reduce_writer_source(dtype: DType, op: ReduceOp, use_block_max_row: bool) -> io::Result<String> {
     Ok(format!(
-        "#define REDUCE_ELEMENT_TYPE {}\n{WRITER}",
+        "#define REDUCE_BLOCK_MAX_ROW {}\n#define REDUCE_ELEMENT_TYPE {}\n{WRITER}",
+        bool_define(use_block_max_row),
         reduce_element_type(dtype, op)?
     ))
 }
@@ -638,6 +710,17 @@ fn reduce_identity_literal(key: &ReduceProgramKey) -> io::Result<String> {
         return Ok(format!("{identity}u"));
     }
     Ok(key.op.identity_literal(key.dtype)?.to_owned())
+}
+
+fn reduce_one_literal(dtype: DType) -> io::Result<&'static str> {
+    match dtype {
+        DType::Float32 => Ok("1.0f"),
+        DType::Float16B => Ok("0x3f80u"),
+        DType::Int32 | DType::UInt32 | DType::UInt16 | DType::UInt8 => Ok("1u"),
+        _ => Err(invalid_input(format!(
+            "reduce one literal does not support dtype {dtype:?}"
+        ))),
+    }
 }
 
 fn reduce_element_type(dtype: DType, op: ReduceOp) -> io::Result<&'static str> {

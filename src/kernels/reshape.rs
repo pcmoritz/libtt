@@ -78,7 +78,9 @@ pub(crate) fn reshape(
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
     validate_input(input, input_dtype, input_shape)?;
-    if input_dtype != output_dtype && input_dtype.bytes_per_element() != output_dtype.bytes_per_element() {
+    if input_dtype != output_dtype
+        && input_dtype.bytes_per_element() != output_dtype.bytes_per_element()
+    {
         return Err(invalid_input(format!(
             "reshape bitcast requires equal-width element types, got {input_dtype:?} and {output_dtype:?}"
         )));

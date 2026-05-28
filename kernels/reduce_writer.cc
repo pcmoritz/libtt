@@ -56,7 +56,9 @@ void copy_reduced_tile(uint32_t reduced_l1_addr, uint32_t output_base_l1_addr,
 
     uint32_t output_index =
         local_output_tile * output_tile_elements + tile_element_index(output_row % TILE_R, output_col % TILE_C);
-    output[output_index] = reduced[tile_element_index(0, col)];
+    uint32_t reduced_index = REDUCE_BLOCK_MAX_ROW ? tile_element_index(col, 0)
+                                                  : tile_element_index(0, col);
+    output[output_index] = reduced[reduced_index];
   }
 }
 

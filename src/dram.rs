@@ -170,9 +170,24 @@ impl Allocator {
         Self::from_device_with_path(device.path.clone(), device)
     }
 
+    pub(crate) fn from_existing_device(
+        path: PathBuf,
+        local_hardware_id: usize,
+        dram_tiles: &[DramTile],
+    ) -> io::Result<Self> {
+        Self::from_parts(path, local_hardware_id, dram_tiles)
+    }
+
     fn from_device_with_path(path: PathBuf, device: &Device) -> io::Result<Self> {
-        let bank_tiles = device
-            .dram_tiles
+        Self::from_parts(path, device.local_hardware_id, &device.dram_tiles)
+    }
+
+    fn from_parts(
+        path: PathBuf,
+        local_hardware_id: usize,
+        dram_tiles: &[DramTile],
+    ) -> io::Result<Self> {
+        let bank_tiles = dram_tiles
             .iter()
             .step_by(Dram::TILES_PER_BANK)
             .copied()
@@ -198,7 +213,7 @@ impl Allocator {
         Ok(Self {
             window,
             bank_tiles,
-            local_hardware_id: device.local_hardware_id,
+            local_hardware_id,
             bank_count,
         })
     }

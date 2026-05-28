@@ -5,6 +5,7 @@
 #include "compute_kernel_api/eltwise_binary_sfpu.h"
 #include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
 #include "compute_kernel_api/pack.h"
+#include "compute_kernel_api/reduce_custom.h"
 #include "compute_kernel_api/tile_move_copy.h"
 #include "compute_kernel_api/transpose_wh_dest.h"
 #include "compute_kernel_api.h"
@@ -115,6 +116,34 @@ void MAIN {
 #if !REDUCE_IS_BITWISE
   if constexpr (REDUCE_LAST_DIM_TILED) {
     uint32_t width_tiles = count;
+#if REDUCE_BLOCK_MAX_ROW
+    constexpr uint32_t cb_scaler = tt::CBIndex::c_2;
+    cb_wait_front(cb_scaler, onetile);
+    ckernel::reduce_block_max_row_init<REDUCE_BLOCK_MAX_ROW_TILES>();
+    for (uint32_t group = 0; group < reduce_groups; ++group) {
+      tile_regs_acquire();
+      uint32_t block_count =
+          (width_tiles + REDUCE_BLOCK_MAX_ROW_TILES - 1) /
+          REDUCE_BLOCK_MAX_ROW_TILES;
+      for (uint32_t block = 0; block < block_count; ++block) {
+        uint32_t dst_idx = block == 0 ? 0 : 1;
+        cb_wait_front(cb_input, REDUCE_BLOCK_MAX_ROW_TILES);
+        ckernel::reduce_block_max_row<REDUCE_BLOCK_MAX_ROW_TILES>(
+            cb_input, cb_scaler, 0, dst_idx);
+        combine_into_accumulator<REDUCE_DATA_FORMAT>(block, dst_idx);
+        cb_pop_front(cb_input, REDUCE_BLOCK_MAX_ROW_TILES);
+      }
+      cb_reserve_back(cb_output, onetile);
+      tile_regs_commit();
+      tile_regs_wait();
+      pack_tile(0, cb_output);
+      tile_regs_release();
+      cb_push_back(cb_output, onetile);
+    }
+    ckernel::reduce_block_max_row_uninit<DST_ACCUM_MODE>();
+    cb_pop_front(cb_scaler, onetile);
+    return;
+#else
     for (uint32_t group = 0; group < reduce_groups; ++group) {
       tile_regs_acquire();
       for (uint32_t wt = 0; wt < width_tiles; ++wt) {
@@ -134,6 +163,7 @@ void MAIN {
       cb_push_back(cb_output, onetile);
     }
     return;
+#endif
   }
 #endif
 

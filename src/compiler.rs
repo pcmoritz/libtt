@@ -1877,10 +1877,8 @@ mod tests {
             ..CompileConfig::default()
         };
         let headers = ckernel_headers(&config);
-        assert!(headers["chlkc_unpack_data_format.h"]
-            .contains("unpack_src_format[32] = {0,"));
-        assert!(headers["chlkc_unpack_data_format.h"]
-            .contains("unpack_dst_format[32] = {5,"));
+        assert!(headers["chlkc_unpack_data_format.h"].contains("unpack_src_format[32] = {0,"));
+        assert!(headers["chlkc_unpack_data_format.h"].contains("unpack_dst_format[32] = {5,"));
         assert!(headers["chlkc_pack_data_format.h"].contains("pack_src_format[32] = {5,"));
         assert!(headers["chlkc_pack_data_format.h"].contains("pack_dst_format[32] = {0,"));
     }

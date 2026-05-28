@@ -19,6 +19,7 @@ constexpr uint32_t INPUT_TILES_PER_ROW = REDUCE_INPUT_TILES_PER_ROW;
 constexpr uint32_t INNER_OUTPUT_TILES = REDUCE_INNER_OUTPUT_TILES;
 using Element = REDUCE_ELEMENT_TYPE;
 constexpr Element IDENTITY = static_cast<Element>(REDUCE_IDENTITY);
+constexpr Element ONE = static_cast<Element>(REDUCE_ONE);
 
 struct Location {
   uint32_t tile;
@@ -46,11 +47,31 @@ void fill_tile(uint32_t cb, Element value) {
 
 void fill_padded_columns(uint32_t tile_l1_addr, uint32_t valid_cols,
                          uint32_t identity_bits) {
-  volatile tt_l1_ptr uint32_t *tile =
-      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(tile_l1_addr);
-  for (uint32_t row = 0; row < TILE_R; ++row) {
-    for (uint32_t col = valid_cols; col < TILE_C; ++col) {
-      tile[tile_element_index(row, col)] = identity_bits;
+  if constexpr (sizeof(Element) == sizeof(uint32_t)) {
+    volatile tt_l1_ptr uint32_t *tile =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t *>(tile_l1_addr);
+    for (uint32_t row = 0; row < TILE_R; ++row) {
+      for (uint32_t col = valid_cols; col < TILE_C; ++col) {
+        tile[tile_element_index(row, col)] = identity_bits;
+      }
+    }
+  } else if constexpr (sizeof(Element) == sizeof(uint16_t)) {
+    volatile tt_l1_ptr uint16_t *tile =
+        reinterpret_cast<volatile tt_l1_ptr uint16_t *>(tile_l1_addr);
+    uint16_t identity = static_cast<uint16_t>(identity_bits);
+    for (uint32_t row = 0; row < TILE_R; ++row) {
+      for (uint32_t col = valid_cols; col < TILE_C; ++col) {
+        tile[tile_element_index(row, col)] = identity;
+      }
+    }
+  } else {
+    volatile tt_l1_ptr uint8_t *tile =
+        reinterpret_cast<volatile tt_l1_ptr uint8_t *>(tile_l1_addr);
+    uint8_t identity = static_cast<uint8_t>(identity_bits);
+    for (uint32_t row = 0; row < TILE_R; ++row) {
+      for (uint32_t col = valid_cols; col < TILE_C; ++col) {
+        tile[tile_element_index(row, col)] = identity;
+      }
     }
   }
 }
@@ -178,6 +199,18 @@ void kernel_main() {
 
   if constexpr (REDUCE_LAST_DIM_TILED) {
     uint32_t width_tiles = get_arg_val<uint32_t>(3);
+    uint32_t padded_width_tiles = width_tiles;
+    if constexpr (REDUCE_BLOCK_MAX_ROW) {
+      constexpr uint32_t cb_scaler = tt::CBIndex::c_2;
+      cb_reserve_back(cb_scaler, 1);
+      fill_tile(cb_scaler, ONE);
+      cb_push_back(cb_scaler, 1);
+      padded_width_tiles =
+          ((width_tiles + REDUCE_BLOCK_MAX_ROW_TILES - 1) /
+           REDUCE_BLOCK_MAX_ROW_TILES) *
+          REDUCE_BLOCK_MAX_ROW_TILES;
+    }
+
     uint32_t valid_last_width = get_arg_val<uint32_t>(4);
     uint32_t padding_identity_bits = get_arg_val<uint32_t>(5);
     const InterleavedAddrGenFast<true> input = {
@@ -188,13 +221,17 @@ void kernel_main() {
 
     for (uint32_t group = 0; group < reduce_groups; ++group) {
       uint32_t tile_base = (group_offset + group) * width_tiles;
-      for (uint32_t wt = 0; wt < width_tiles; ++wt) {
+      for (uint32_t wt = 0; wt < padded_width_tiles; ++wt) {
         cb_reserve_back(cb_reduce, 1);
         uint32_t tile_l1_addr = get_write_ptr(cb_reduce);
-        noc_async_read_tile(tile_base + wt, input, tile_l1_addr);
-        noc_async_read_barrier();
-        if (wt == width_tiles - 1 && valid_last_width < TILE_C) {
-          fill_padded_columns(tile_l1_addr, valid_last_width, padding_identity_bits);
+        if (wt < width_tiles) {
+          noc_async_read_tile(tile_base + wt, input, tile_l1_addr);
+          noc_async_read_barrier();
+          if (wt == width_tiles - 1 && valid_last_width < TILE_C) {
+            fill_padded_columns(tile_l1_addr, valid_last_width, padding_identity_bits);
+          }
+        } else {
+          fill_tile(cb_reduce, IDENTITY);
         }
         cb_push_back(cb_reduce, 1);
       }

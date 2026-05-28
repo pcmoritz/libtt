@@ -26,9 +26,10 @@ use log::log;
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
+use std::path::PathBuf;
 use std::ptr;
 use std::slice;
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 include!("pjrt_bindings.rs");
 
@@ -71,6 +72,9 @@ pub struct PJRT_Device {
     addressable: bool,
     default_memory: *mut PJRT_Memory,
     memory_ptrs: Vec<*mut PJRT_Memory>,
+    readback_path: PathBuf,
+    readback_dram_tiles: Vec<hw::DramTile>,
+    runtime_lock: Mutex<()>,
     runtime: Device,
 }
 
@@ -190,6 +194,9 @@ impl PJRT_Client {
                 addressable: true,
                 default_memory,
                 memory_ptrs: vec![default_memory],
+                readback_path: info.path.clone(),
+                readback_dram_tiles: info.dram_tiles.clone(),
+                runtime_lock: Mutex::new(()),
                 runtime: info,
             });
         }
@@ -527,9 +534,14 @@ fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
             PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
         ));
     };
-    with_device_ptr(buffer.device, |device| {
-        device.dram_read(dram_buffer).map_err(io_error)
-    })
+    let pjrt_device = unsafe { checked_ref(buffer.device, "device") }?;
+    let mut reader = dram::Allocator::from_existing_device(
+        pjrt_device.readback_path.clone(),
+        pjrt_device.local_hardware_id as usize,
+        &pjrt_device.readback_dram_tiles,
+    )
+    .map_err(io_error)?;
+    reader.read_host_data(dram_buffer).map_err(io_error)
 }
 
 fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
@@ -600,15 +612,11 @@ fn with_device<T>(
     pjrt_device: &mut PJRT_Device,
     f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
 ) -> Result<T, *mut PJRT_Error> {
+    let _guard = pjrt_device
+        .runtime_lock
+        .lock()
+        .map_err(|_| failed_precondition("device runtime lock is poisoned"))?;
     f(&mut pjrt_device.runtime)
-}
-
-fn with_device_ptr<T>(
-    pjrt_device: *mut PJRT_Device,
-    f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
-) -> Result<T, *mut PJRT_Error> {
-    let pjrt_device = unsafe { checked_mut(pjrt_device, "device") }?;
-    with_device(pjrt_device, f)
 }
 
 fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *mut PJRT_Error> {
@@ -1916,6 +1924,37 @@ fn execute_reduce(
     } else {
         None
     };
+    if bitwise_identity.is_none()
+        && !reduce_init_is_supported(plan, *init_value_id, reducer, input_desc.element_type)
+    {
+        return Err(unimplemented(
+            "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
+        ));
+    }
+    if let [dimension] = dimensions {
+        let reduce_dim = usize::try_from(*dimension).map_err(|_| {
+            invalid_argument(format!(
+                "TT executable reduce dimension {dimension} is negative"
+            ))
+        })?;
+        if input_shape.get(reduce_dim) == Some(&1) {
+            let input_allocation_shape =
+                dram::tiled_allocation_shape(&input_shape).map_err(io_error)?;
+            let output_allocation_shape =
+                dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+            if input_allocation_shape == output_allocation_shape {
+                return store_output_buffer(
+                    values,
+                    plan,
+                    output_id,
+                    output_desc.dims.clone(),
+                    input_dram.clone(),
+                    context,
+                    "reduce.alias",
+                );
+            }
+        }
+    }
     let reduce_plan = kernels::reduce::ReducePlan::new(
         dtype,
         &kernel_input_shape,
@@ -1925,13 +1964,6 @@ fn execute_reduce(
         bitwise_identity,
     )
     .map_err(io_error)?;
-    if bitwise_identity.is_none()
-        && !reduce_init_is_supported(plan, *init_value_id, reducer, input_desc.element_type)
-    {
-        return Err(unimplemented(
-            "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
-        ));
-    }
     let output_dram = kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
         .map_err(io_error)?;
     store_output_buffer(
@@ -3096,6 +3128,36 @@ fn execute_scatter(
             operand_shape, output_shape
         )));
     }
+    if kernels::scatter::is_full_window_set_dimension_numbers(
+        operand_shape.len(),
+        &dimension_numbers.update_window_dims,
+        &dimension_numbers.inserted_window_dims,
+        &dimension_numbers.input_batching_dims,
+        &dimension_numbers.scatter_indices_batching_dims,
+        &dimension_numbers.scatter_dims_to_operand_dims,
+        dimension_numbers.index_vector_dim,
+    ) {
+        if start_indices_shape != [0] || update_shape != operand_shape {
+            return Err(unimplemented(format!(
+                "TT executable full-window scatter requires start_indices_shape [0] and update_shape {:?}; got start_indices_shape={start_indices_shape:?} update_shape={update_shape:?}",
+                operand_shape
+            )));
+        }
+        let Some(updates_dram) = updates.dram_buffer.as_ref() else {
+            return Err(failed_precondition(
+                "TT executable scatter updates buffer has no device allocation",
+            ));
+        };
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_desc.dims.clone(),
+            updates_dram.clone(),
+            context,
+            "scatter",
+        );
+    }
     kernels::scatter::validate_dim0_set_dimension_numbers(
         operand_shape.len(),
         &dimension_numbers.update_window_dims,
@@ -3531,11 +3593,19 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         }
         unsafe { slice::from_raw_parts(device_args, args.num_args) }
     };
-    let output_buffers =
+    let output_buffers = {
+        // Keep the guard scoped around runtime mutation without tying up the
+        // mutable borrow needed by execute_executable_v1.
+        let runtime_lock = ptr::addr_of!(target_device.runtime_lock);
+        let _guard = match unsafe { &*runtime_lock }.lock() {
+            Ok(guard) => guard,
+            Err(_) => return failed_precondition("device runtime lock is poisoned"),
+        };
         match execute_executable_v1(executable, execute_device, target_device, input_ptrs) {
             Ok(outputs) => outputs,
             Err(err) => return err,
-        };
+        }
+    };
     if output_buffers.len() != executable.metadata.num_outputs {
         return pjrt_error(
             format!(

@@ -52,16 +52,19 @@ impl ReduceWindowPlan {
         let output_allocation_shape = tiled_allocation_shape(output_shape)?;
         let input_rank = input_allocation_shape.len();
         let output_rank = output_allocation_shape.len();
-        let window_elements = attributes
-            .window_dimensions
-            .iter()
-            .try_fold(1usize, |acc, &dim| {
-                let dim = usize::try_from(dim).map_err(|_| {
-                    invalid_input(format!("reduce_window window dimension must be positive: {dim}"))
+        let window_elements =
+            attributes
+                .window_dimensions
+                .iter()
+                .try_fold(1usize, |acc, &dim| {
+                    let dim = usize::try_from(dim).map_err(|_| {
+                        invalid_input(format!(
+                            "reduce_window window dimension must be positive: {dim}"
+                        ))
+                    })?;
+                    acc.checked_mul(dim)
+                        .ok_or_else(|| invalid_input("reduce_window window element count overflow"))
                 })?;
-                acc.checked_mul(dim)
-                    .ok_or_else(|| invalid_input("reduce_window window element count overflow"))
-            })?;
 
         Ok(Self {
             input_shape: input_shape.to_vec(),

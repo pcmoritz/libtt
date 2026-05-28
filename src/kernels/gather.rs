@@ -225,11 +225,7 @@ fn gather_shape(
     })
 }
 
-fn validate_allocation(
-    buffer: &DramBuffer,
-    logical_shape: &[usize],
-    name: &str,
-) -> io::Result<()> {
+fn validate_allocation(buffer: &DramBuffer, logical_shape: &[usize], name: &str) -> io::Result<()> {
     let expected_shape = tiled_allocation_shape(logical_shape)?;
     if buffer.shape != expected_shape {
         return Err(invalid_input(format!(
@@ -257,11 +253,8 @@ fn gather_program(key: GatherProgramKey) -> io::Result<Program> {
     match key.shape.mode {
         GatherMode::Bf16Rows => {
             for (core_index, &core) in key.cores.iter().enumerate() {
-                let (offset, row_tiles) = split_tile_range(
-                    key.shape.output_row_tile_count,
-                    core_index,
-                    key.cores.len(),
-                )?;
+                let (offset, row_tiles) =
+                    split_tile_range(key.shape.output_row_tile_count, core_index, key.cores.len())?;
                 runtime_args.add_core(
                     core,
                     vec![
@@ -402,8 +395,8 @@ mod tests {
 
     #[test]
     fn gather_program_splits_bf16_row_tiles_across_cores() {
-        let shape = gather_shape(&[288, 128], &[96, 128], 0, DType::Float16B)
-            .expect("gather shape");
+        let shape =
+            gather_shape(&[288, 128], &[96, 128], 0, DType::Float16B).expect("gather shape");
         let program = gather_program(GatherProgramKey {
             cores: vec![CoreCoord { x: 1, y: 2 }, CoreCoord { x: 1, y: 3 }],
             dtype: DType::Float16B,
@@ -423,8 +416,7 @@ mod tests {
 
     #[test]
     fn gather_program_uses_axis_mode_for_non_bf16_rows() {
-        let shape = gather_shape(&[4, 8], &[2, 8], 0, DType::Float32)
-            .expect("gather shape");
+        let shape = gather_shape(&[4, 8], &[2, 8], 0, DType::Float32).expect("gather shape");
         let program = gather_program(GatherProgramKey {
             cores: vec![CoreCoord { x: 1, y: 2 }],
             dtype: DType::Float32,

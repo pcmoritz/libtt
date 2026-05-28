@@ -323,9 +323,7 @@ fn parse_bitwise_binary_kind(kind: ProtoBitwiseBinaryKind) -> Result<BitwiseBina
         ProtoBitwiseBinaryKind::Xor => Ok(BitwiseBinaryKind::Xor),
         ProtoBitwiseBinaryKind::ShiftLeft => Ok(BitwiseBinaryKind::ShiftLeft),
         ProtoBitwiseBinaryKind::ShiftRightLogical => Ok(BitwiseBinaryKind::ShiftRightLogical),
-        ProtoBitwiseBinaryKind::ShiftRightArithmetic => {
-            Ok(BitwiseBinaryKind::ShiftRightArithmetic)
-        }
+        ProtoBitwiseBinaryKind::ShiftRightArithmetic => Ok(BitwiseBinaryKind::ShiftRightArithmetic),
     }
 }
 
