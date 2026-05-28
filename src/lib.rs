@@ -26,9 +26,10 @@ use log::log;
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
+use std::path::PathBuf;
 use std::ptr;
 use std::slice;
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 include!("pjrt_bindings.rs");
 
@@ -71,6 +72,9 @@ pub struct PJRT_Device {
     addressable: bool,
     default_memory: *mut PJRT_Memory,
     memory_ptrs: Vec<*mut PJRT_Memory>,
+    readback_path: PathBuf,
+    readback_dram_tiles: Vec<hw::DramTile>,
+    runtime_lock: Mutex<()>,
     runtime: Device,
 }
 
@@ -167,7 +171,7 @@ impl PJRT_Client {
         for info in &discovered {
             memories.push(PJRT_Memory {
                 id: info.id as i32,
-                kind: cstring_lossy("dram"),
+                kind: cstring_lossy("device"),
                 debug_string: cstring_lossy(info.memory_debug_string()),
                 to_string: cstring_lossy(info.memory_to_string()),
                 device_ptrs: Vec::with_capacity(1),
@@ -190,6 +194,9 @@ impl PJRT_Client {
                 addressable: true,
                 default_memory,
                 memory_ptrs: vec![default_memory],
+                readback_path: info.path.clone(),
+                readback_dram_tiles: info.dram_tiles.clone(),
+                runtime_lock: Mutex::new(()),
                 runtime: info,
             });
         }
@@ -523,9 +530,14 @@ fn read_buffer_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
             PJRT_Error_Code::PJRT_Error_Code_FAILED_PRECONDITION,
         ));
     };
-    with_device_ptr(buffer.device, |device| {
-        device.dram_read(dram_buffer).map_err(io_error)
-    })
+    let pjrt_device = unsafe { checked_ref(buffer.device, "device") }?;
+    let mut reader = dram::Allocator::from_existing_device(
+        pjrt_device.readback_path.clone(),
+        pjrt_device.local_hardware_id as usize,
+        &pjrt_device.readback_dram_tiles,
+    )
+    .map_err(io_error)?;
+    reader.read_host_data(dram_buffer).map_err(io_error)
 }
 
 fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_Error> {
@@ -596,15 +608,11 @@ fn with_device<T>(
     pjrt_device: &mut PJRT_Device,
     f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
 ) -> Result<T, *mut PJRT_Error> {
+    let _guard = pjrt_device
+        .runtime_lock
+        .lock()
+        .map_err(|_| failed_precondition("device runtime lock is poisoned"))?;
     f(&mut pjrt_device.runtime)
-}
-
-fn with_device_ptr<T>(
-    pjrt_device: *mut PJRT_Device,
-    f: impl FnOnce(&mut Device) -> Result<T, *mut PJRT_Error>,
-) -> Result<T, *mut PJRT_Error> {
-    let pjrt_device = unsafe { checked_mut(pjrt_device, "device") }?;
-    with_device(pjrt_device, f)
 }
 
 fn c_api_string(ptr: *const c_char, len: usize, field: &str) -> Result<String, *mut PJRT_Error> {
@@ -687,7 +695,7 @@ fn make_executable_metadata(
     outputs: &[executable::ValueDesc],
     executable: Option<executable::Executable>,
 ) -> ExecutableMetadata {
-    let output_memory_kinds = vec![cstring_lossy("dram"); outputs.len()];
+    let output_memory_kinds = vec![cstring_lossy("device"); outputs.len()];
     let output_memory_kind_ptrs = output_memory_kinds
         .iter()
         .map(|kind| kind.as_ptr())
@@ -2519,8 +2527,9 @@ fn execute_iota(
 
 fn execute_executable_v1(
     executable: &PJRT_LoadedExecutable,
-    execute_device: *mut PJRT_Device,
-    target_device: &mut PJRT_Device,
+    device: &mut Device,
+    output_context: &OutputContext,
+    target_local_hardware_id: usize,
     inputs: &[*mut PJRT_Buffer],
 ) -> Result<Vec<PJRT_Buffer>, *mut PJRT_Error> {
     let plan = executable
@@ -2529,13 +2538,6 @@ fn execute_executable_v1(
         .as_ref()
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
     let mut values = vec![None; plan.values.len()];
-    let target_local_hardware_id = target_device.local_hardware_id as usize;
-    let output_context = OutputContext {
-        device: execute_device,
-        memory: target_device.default_memory,
-        local_hardware_id: target_local_hardware_id,
-    };
-    let device = &mut target_device.runtime;
 
     for op in &plan.ops {
         match op {
@@ -2588,7 +2590,7 @@ fn execute_executable_v1(
                 &mut values,
                 plan,
                 device,
-                &output_context,
+                output_context,
                 input_ids,
                 *output_id,
                 *dimension,
@@ -2600,7 +2602,7 @@ fn execute_executable_v1(
                 &mut values,
                 plan,
                 device,
-                &output_context,
+                output_context,
                 *input_id,
                 *output_id,
             )?,
@@ -2614,7 +2616,7 @@ fn execute_executable_v1(
                 &mut values,
                 plan,
                 device,
-                &output_context,
+                output_context,
                 *input_id,
                 *output_id,
                 start_indices,
@@ -2629,7 +2631,7 @@ fn execute_executable_v1(
                 &mut values,
                 plan,
                 device,
-                &output_context,
+                output_context,
                 *input_id,
                 *output_id,
                 permutation,
@@ -2671,7 +2673,7 @@ fn execute_executable_v1(
                 &mut values,
                 plan,
                 device,
-                &output_context,
+                output_context,
                 input_ids,
                 init_value_ids,
                 *output_id,
@@ -2687,7 +2689,7 @@ fn execute_executable_v1(
                 &mut values,
                 plan,
                 device,
-                &output_context,
+                output_context,
                 *input_ids,
                 *output_id,
                 dimension_numbers,
@@ -2702,7 +2704,7 @@ fn execute_executable_v1(
                     &mut values,
                     plan,
                     device,
-                    &output_context,
+                    output_context,
                     *input_ids,
                     *output_id,
                 )?;
@@ -2716,7 +2718,7 @@ fn execute_executable_v1(
                     &mut values,
                     plan,
                     device,
-                    &output_context,
+                    output_context,
                     *input_id,
                     *output_id,
                     broadcast_dimensions,
@@ -2732,7 +2734,7 @@ fn execute_executable_v1(
                 &mut values,
                 plan,
                 device,
-                &output_context,
+                output_context,
                 *input_ids,
                 *output_id,
                 dimension_numbers,
@@ -2745,7 +2747,7 @@ fn execute_executable_v1(
                 &mut values,
                 plan,
                 device,
-                &output_context,
+                output_context,
                 *output_id,
                 *iota_dimension,
             )?,
@@ -2758,7 +2760,7 @@ fn execute_executable_v1(
                 &mut values,
                 plan,
                 device,
-                &output_context,
+                output_context,
                 *input_id,
                 *values_id,
                 *indices_id,
@@ -2772,7 +2774,7 @@ fn execute_executable_v1(
                 &mut values,
                 plan,
                 device,
-                &output_context,
+                output_context,
                 input_ids,
                 *output_id,
                 nodes,
@@ -2841,11 +2843,28 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         }
         unsafe { slice::from_raw_parts(device_args, args.num_args) }
     };
-    let output_buffers =
-        match execute_executable_v1(executable, execute_device, target_device, input_ptrs) {
+    let target_local_hardware_id = target_device.local_hardware_id as usize;
+    let output_context = OutputContext {
+        device: execute_device,
+        memory: target_device.default_memory,
+        local_hardware_id: target_local_hardware_id,
+    };
+    let output_buffers = {
+        let _guard = match target_device.runtime_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => return failed_precondition("device runtime lock is poisoned"),
+        };
+        match execute_executable_v1(
+            executable,
+            &mut target_device.runtime,
+            &output_context,
+            target_local_hardware_id,
+            input_ptrs,
+        ) {
             Ok(outputs) => outputs,
             Err(err) => return err,
-        };
+        }
+    };
     if output_buffers.len() != executable.metadata.num_outputs {
         return pjrt_error(
             format!(
@@ -4240,7 +4259,7 @@ mod tests {
         );
 
         let memory = &client.memories[0];
-        assert_eq!(memory.kind.as_bytes(), b"dram");
+        assert_eq!(memory.kind.as_bytes(), b"device");
         let memory_debug = std::str::from_utf8(memory.debug_string.as_bytes())
             .expect("memory debug string should be utf-8");
         assert!(memory_debug.contains("dram_banks=7"));
