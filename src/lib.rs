@@ -1760,15 +1760,7 @@ fn execute_fused_elementwise(
         ..
     }) = nodes.last()
     {
-        return execute_constant(
-            values,
-            plan,
-            device,
-            context,
-            *packed_value,
-            &[],
-            output_id,
-        );
+        return execute_constant(values, plan, device, context, *packed_value, &[], output_id);
     }
 
     let mut inputs = Vec::with_capacity(input_ids.len());
@@ -1904,7 +1896,11 @@ fn execute_reduce(
         if input_shape.len() == 1 && output_shape.is_empty() && dimensions == [0] {
             (vec![1, input_shape[0]], vec![1], vec![1])
         } else {
-            (input_shape.clone(), output_shape.clone(), dimensions.to_vec())
+            (
+                input_shape.clone(),
+                output_shape.clone(),
+                dimensions.to_vec(),
+            )
         };
     let bitwise_identity = if matches!(
         reducer,
@@ -1913,7 +1909,7 @@ fn execute_reduce(
         Some(
             constant_packed_value(plan, *init_value_id)
                 .and_then(|packed_value| {
-                    bitwise_identity_from_packed(reducer, input_desc.element_type, packed_value)
+                    reduce_identity_from_packed(reducer, input_desc.element_type, packed_value)
                 })
                 .ok_or_else(|| {
                     unimplemented(
@@ -2319,98 +2315,39 @@ fn reduce_init_is_supported(
     element_type: PJRT_Buffer_Type,
 ) -> bool {
     if let Some(packed_value) = constant_packed_value(plan, init_value_id) {
-        return match reducer {
-            executable::ReduceReducer::Add
-            | executable::ReduceReducer::Max
-            | executable::ReduceReducer::Min => {
-                arithmetic_reduce_identity_from_packed(reducer, element_type, packed_value)
-                    .is_some()
-            }
-            executable::ReduceReducer::And | executable::ReduceReducer::Or => {
-                bitwise_identity_from_packed(reducer, element_type, packed_value).is_some()
-            }
-            executable::ReduceReducer::Mul => false,
-        };
+        return reduce_identity_from_packed(reducer, element_type, packed_value).is_some();
     }
     true
 }
 
-fn arithmetic_reduce_identity_from_packed(
+fn reduce_identity_from_packed(
     reducer: executable::ReduceReducer,
     element_type: PJRT_Buffer_Type,
     packed_value: u32,
 ) -> Option<u32> {
-    match reducer {
-        executable::ReduceReducer::Add if packed_value == 0 => Some(0),
-        executable::ReduceReducer::Max => match element_type {
-            PJRT_Buffer_Type::PJRT_Buffer_Type_F32
-                if packed_value == f32::NEG_INFINITY.to_bits() =>
-            {
-                Some(packed_value)
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 if packed_value & 0xffff == 0xff80 => {
-                Some(0xff80)
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_S32 if packed_value == i32::MIN as u32 => {
-                Some(packed_value)
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_U32 if packed_value == 0 => Some(0),
-            PJRT_Buffer_Type::PJRT_Buffer_Type_U16 if packed_value & 0xffff == 0 => Some(0),
-            PJRT_Buffer_Type::PJRT_Buffer_Type_U8 | PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
-                if packed_value & 0xff == 0 =>
-            {
-                Some(0)
-            }
-            _ => None,
-        },
-        executable::ReduceReducer::Min => match element_type {
-            PJRT_Buffer_Type::PJRT_Buffer_Type_F32 if packed_value == f32::INFINITY.to_bits() => {
-                Some(packed_value)
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 if packed_value & 0xffff == 0x7f80 => {
-                Some(0x7f80)
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_S32 if packed_value == i32::MAX as u32 => {
-                Some(packed_value)
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_U32 if packed_value == u32::MAX => {
-                Some(packed_value)
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_U16 if packed_value & 0xffff == 0xffff => {
-                Some(0xffff)
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_U8 | PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
-                if packed_value & 0xff == 0xff =>
-            {
-                Some(0xff)
-            }
-            _ => None,
-        },
-        _ => None,
-    }
+    let dtype = utils::pjrt_buffer_type_to_dtype(element_type).ok()?;
+    let identity = if element_type == PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
+        && reducer == executable::ReduceReducer::And
+    {
+        1
+    } else {
+        kernels::reduce::reducer_identity_bits(reducer, dtype).ok()?
+    };
+    let mask = packed_identity_mask(element_type)?;
+    ((packed_value & mask) == (identity & mask)).then_some(identity)
 }
 
-fn bitwise_identity_from_packed(
-    reducer: executable::ReduceReducer,
-    element_type: PJRT_Buffer_Type,
-    packed_value: u32,
-) -> Option<u32> {
-    match reducer {
-        executable::ReduceReducer::Or if packed_value == 0 => Some(0),
-        executable::ReduceReducer::And => match element_type {
-            PJRT_Buffer_Type::PJRT_Buffer_Type_PRED if packed_value == 1 => Some(1),
-            PJRT_Buffer_Type::PJRT_Buffer_Type_U8 if packed_value & 0xff == 0xff => Some(0xff),
-            PJRT_Buffer_Type::PJRT_Buffer_Type_U16 if packed_value & 0xffff == 0xffff => {
-                Some(0xffff)
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_S32
-            | PJRT_Buffer_Type::PJRT_Buffer_Type_U32
-                if packed_value == u32::MAX =>
-            {
-                Some(u32::MAX)
-            }
-            _ => None,
-        },
+fn packed_identity_mask(element_type: PJRT_Buffer_Type) -> Option<u32> {
+    match element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_S8
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_U8 => Some(0xff),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F16
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Some(0xffff),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_S32
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => Some(u32::MAX),
         _ => None,
     }
 }
@@ -2737,8 +2674,8 @@ fn execute_gather(
         .filter(|&dim| dim != axis_i64)
         .collect::<Vec<_>>();
     let expected_collapsed_slice_dims = [axis_i64];
-    let is_single_axis_slice_gather =
-        dimension_numbers.offset_dims.as_slice() == expected_offset_dims.as_slice()
+    let is_single_axis_slice_gather = dimension_numbers.offset_dims.as_slice()
+        == expected_offset_dims.as_slice()
         && dimension_numbers.collapsed_slice_dims.as_slice()
             == expected_collapsed_slice_dims.as_slice()
         && dimension_numbers.operand_batching_dims.is_empty()
@@ -3657,7 +3594,10 @@ pub unsafe extern "C" fn TT_Device_MemoryStats(
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
-    let stats = allocator_stats(device.runtime.local_hardware_id, device.runtime.active_dram_banks);
+    let stats = allocator_stats(
+        device.runtime.local_hardware_id,
+        device.runtime.active_dram_banks,
+    );
     args.bytes_in_use = pjrt_i64(stats.bytes_in_use);
     args.peak_bytes_in_use = args.bytes_in_use;
     args.peak_bytes_in_use_is_set = true;

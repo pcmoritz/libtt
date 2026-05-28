@@ -324,31 +324,25 @@ pub(crate) fn matmul_dot_general(
         )));
     }
     let input_dtype = lhs.dtype;
-    let output_dtype = match epilogue {
-        MatmulEpilogue::Store { output_dtype } => {
-            match input_dtype {
-                DType::Float16B if matches!(output_dtype, DType::Float16B | DType::Float32) => {}
-                DType::Float32 if output_dtype == DType::Float32 => {}
-                _ => {
-                    return Err(invalid_input(format!(
-                        "matmul output for {input_dtype:?} inputs must be {}, got {output_dtype:?}",
-                        if input_dtype == DType::Float32 {
-                            "Float32"
-                        } else {
-                            "Float16B or Float32"
-                        }
-                    )));
-                }
-            }
-            output_dtype
-        }
-        MatmulEpilogue::Top1 => {
-            if input_dtype != DType::Float16B {
-                return Err(invalid_input(format!(
-                    "matmul top1 epilogue requires bf16 inputs, got {input_dtype:?}"
-                )));
-            }
-            DType::Float16B
+    let output_dtype = match (input_dtype, epilogue) {
+        (
+            DType::Float16B,
+            MatmulEpilogue::Store {
+                output_dtype: output @ (DType::Float16B | DType::Float32),
+            },
+        ) => output,
+        (
+            DType::Float32,
+            MatmulEpilogue::Store {
+                output_dtype: DType::Float32,
+            },
+        ) => DType::Float32,
+        (DType::Float16B, MatmulEpilogue::Top1) => DType::Float16B,
+        _ => {
+            return Err(invalid_input(format!(
+                "matmul requires valid dtype combinations, got input={input_dtype:?} epilogue={:?}",
+                epilogue.kind()
+            )));
         }
     };
     let epilogue_kind = epilogue.kind();
@@ -779,27 +773,6 @@ fn plan_for_key(key: &MatmulProgramKey) -> io::Result<MatmulPlan> {
             output_tile_bytes,
         ),
     }
-}
-
-#[cfg(test)]
-fn plan_matmul(
-    m: usize,
-    k: usize,
-    n: usize,
-    batch_count: usize,
-    cores: &[CoreCoord],
-    allow_column_split: bool,
-) -> io::Result<MatmulPlan> {
-    plan_matmul_with_tile_sizes(
-        m,
-        k,
-        n,
-        batch_count,
-        cores,
-        allow_column_split,
-        DType::Float16B.tile_size(),
-        DType::Float16B.tile_size(),
-    )
 }
 
 fn plan_matmul_with_tile_sizes(
@@ -1611,6 +1584,26 @@ mod tests {
         .filter(|core| *core != CoreCoord { x: 14, y: 2 })
         .filter(|core| *core != CoreCoord { x: 14, y: 3 })
         .collect()
+    }
+
+    fn plan_matmul(
+        m: usize,
+        k: usize,
+        n: usize,
+        batch_count: usize,
+        cores: &[CoreCoord],
+        allow_column_split: bool,
+    ) -> std::io::Result<MatmulPlan> {
+        plan_matmul_with_tile_sizes(
+            m,
+            k,
+            n,
+            batch_count,
+            cores,
+            allow_column_split,
+            DType::Float16B.tile_size(),
+            DType::Float16B.tile_size(),
+        )
     }
 
     #[test]
