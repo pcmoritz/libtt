@@ -127,6 +127,15 @@ tt::TensorDesc::ElementType mapProtoElementType(mlir::Type element_type) {
     return tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
 }
 
+std::optional<uint32_t> elementBitWidth(mlir::Type element_type) {
+    if (element_type.isBF16() || element_type.isF16()) return 16;
+    if (element_type.isF32()) return 32;
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
+        return integer.getWidth();
+    }
+    return std::nullopt;
+}
+
 bool fillTensorDesc(mlir::Type type, tt::TensorDesc& tensor_desc, std::string& error) {
     auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
     if (!tensor) {
@@ -1290,6 +1299,68 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto bitcast_op = mlir::dyn_cast<mlir::stablehlo::BitcastConvertOp>(op)) {
+            auto operand_type = mlir::cast<mlir::RankedTensorType>(
+                bitcast_op.getOperand().getType()).getElementType();
+            auto result_type = mlir::cast<mlir::RankedTensorType>(
+                bitcast_op->getResult(0).getType()).getElementType();
+            auto operand_width = elementBitWidth(operand_type);
+            auto result_width = elementBitWidth(result_type);
+            if (!operand_width || !result_width || *operand_width != *result_width) {
+                std::string input_type;
+                std::string output_type;
+                llvm::raw_string_ostream input_os(input_type);
+                llvm::raw_string_ostream output_os(output_type);
+                operand_type.print(input_os);
+                result_type.print(output_os);
+                error = "bitcast_convert requires equal-width element types: " +
+                        input_os.str() + " -> " + output_os.str();
+                return false;
+            }
+
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(bitcast_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(bitcast_op->getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* reshape = executable.add_ops();
+            reshape->set_output_id(output_id);
+            reshape->mutable_reshape()->set_operand_id(operand_id);
+            continue;
+        }
+
+        if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
+            auto operand_element = staticValueElementType(convert_op.getOperand());
+            auto result_element = staticValueElementType(convert_op.getResult());
+            if (!operand_element || !result_element || *operand_element != *result_element) {
+                std::string input_type;
+                std::string output_type;
+                llvm::raw_string_ostream input_os(input_type);
+                llvm::raw_string_ostream output_os(output_type);
+                mlir::cast<mlir::RankedTensorType>(
+                    convert_op.getOperand().getType()).getElementType().print(input_os);
+                mlir::cast<mlir::RankedTensorType>(
+                    convert_op.getResult().getType()).getElementType().print(output_os);
+                error = "standalone convert requires matching backend element types: " +
+                        input_os.str() + " -> " + output_os.str();
+                return false;
+            }
+
+            uint32_t operand_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(convert_op.getOperand(), executable, value_ids, error, operand_id) ||
+                !addValueDesc(convert_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* reshape = executable.add_ops();
+            reshape->set_output_id(output_id);
+            reshape->mutable_reshape()->set_operand_id(operand_id);
+            continue;
+        }
+
         if (auto slice_op = mlir::dyn_cast<mlir::stablehlo::SliceOp>(op)) {
             uint32_t operand_id = 0;
             uint32_t output_id = 0;
@@ -1334,6 +1405,27 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             if (custom_call_op->getNumResults() != 1) {
                 error = "only single-result custom_call ops are currently supported";
                 return false;
+            }
+
+            auto call_target = custom_call_op.getCallTargetName();
+            if ((call_target == "annotate_device_placement" || call_target == "Sharding") &&
+                !custom_call_op.getHasSideEffect()) {
+                auto inputs = custom_call_op.getInputs();
+                if (inputs.size() != 1) {
+                    error = "identity custom_call op must have exactly one input";
+                    return false;
+                }
+                mlir::Value input = inputs.front();
+                if (input.getType() != custom_call_op.getResult(0).getType()) {
+                    error = "identity custom_call input and result types must match";
+                    return false;
+                }
+                uint32_t input_id = 0;
+                if (!addValueDesc(input, executable, value_ids, error, input_id)) {
+                    return false;
+                }
+                value_ids.try_emplace(custom_call_op.getResult(0), input_id);
+                continue;
             }
 
             uint32_t output_id = 0;

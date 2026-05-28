@@ -109,7 +109,7 @@ pub(crate) fn top_k(
             core: *core,
             input_dtype: input.dtype,
             input_tiles: u32_arg(input.num_tiles, "input tile count")?,
-            logical_len: u32_arg(input_shape[0], "top_k length")?,
+            logical_len: u32_arg(top_k_logical_len(input_shape)?, "top_k length")?,
             k: u32_arg(k, "top_k k")?,
         },
     };
@@ -164,9 +164,9 @@ fn validate_top_k(input: &DramBuffer, input_shape: &[usize], k: usize) -> io::Re
             input.dtype
         )));
     }
-    if input_shape.len() != 1 {
+    if input_shape.len() != 1 && !(input_shape.len() == 2 && input_shape[0] == 1) {
         return Err(invalid_input(format!(
-            "top_k currently supports rank-1 inputs, got {input_shape:?}"
+            "top_k currently supports rank-1 inputs or rank-2 inputs with leading dimension 1, got {input_shape:?}"
         )));
     }
     if k == 0 || k > MAX_TOP_K {
@@ -174,10 +174,11 @@ fn validate_top_k(input: &DramBuffer, input_shape: &[usize], k: usize) -> io::Re
             "top_k currently requires 1 <= k <= {MAX_TOP_K}, got {k}"
         )));
     }
-    if k > input_shape[0] {
+    let logical_len = top_k_logical_len(input_shape)?;
+    if k > logical_len {
         return Err(invalid_input(format!(
             "top_k k must be <= input length, got k={k} length={}",
-            input_shape[0]
+            logical_len
         )));
     }
     let expected_shape = tiled_allocation_shape(input_shape)?;
@@ -195,6 +196,13 @@ fn validate_top_k(input: &DramBuffer, input_shape: &[usize], k: usize) -> io::Re
         )));
     }
     Ok(())
+}
+
+fn top_k_logical_len(input_shape: &[usize]) -> io::Result<usize> {
+    input_shape
+        .last()
+        .copied()
+        .ok_or_else(|| invalid_input("top_k requires non-scalar input"))
 }
 
 fn top_k_program(key: TopKProgramKey) -> io::Result<Program> {

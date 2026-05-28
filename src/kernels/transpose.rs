@@ -8,9 +8,9 @@ use crate::kernels::kernel::{
 use std::io;
 
 const READER: &str = include_str!("../../kernels/transpose_reader.cc");
-const WRITER: &str = include_str!("../../kernels/tile_writer.cc");
+const WRITER: &str = "void kernel_main() {}\n";
 const READER_INPUT_ADDR_INDEX: usize = 0;
-const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
+const READER_OUTPUT_ADDR_INDEX: usize = 1;
 const MAX_RANK: usize = 8;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -45,8 +45,11 @@ pub(crate) fn transpose(
     let output = device.alloc(output_tiles, dtype, &output_allocation_shape, name)?;
     let cores = select_worker_cores(device.cores_ref(), output_tiles)?;
     let kernel = DramKernel {
-        reader_addrs: [u32_addr(input.addr, "input address")?],
-        output_addr: u32_addr(output.addr, "output address")?,
+        reader_addrs: [
+            u32_addr(input.addr, "input address")?,
+            u32_addr(output.addr, "output address")?,
+        ],
+        output_addr: 0,
         key: TransposeProgramKey {
             cores,
             dtype,
@@ -138,26 +141,21 @@ fn transpose_shape(
 fn transpose_program(key: TransposeProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
-        vec![WRITER_OUTPUT_ADDR_INDEX],
-        vec![READER_INPUT_ADDR_INDEX],
+        Vec::new(),
+        vec![READER_INPUT_ADDR_INDEX, READER_OUTPUT_ADDR_INDEX],
         Vec::new(),
     );
     for (core_index, &core) in key.cores.iter().enumerate() {
         let (offset, n_tiles) =
             split_tile_range(key.shape.output_tile_count, core_index, key.cores.len())?;
-        runtime_args.add_core(
-            core,
-            vec![0, offset, n_tiles],
-            vec![0, offset, n_tiles],
-            Vec::new(),
-        )?;
+        runtime_args.add_core(core, Vec::new(), vec![0, 0, offset, n_tiles], Vec::new())?;
     }
     let runtime_args = runtime_args.build()?;
     Ok(Program {
         reader_kernel: transpose_reader_source(key.dtype, &key.shape)?,
         writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
-            cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(16, key.dtype)],
+            cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(1, key.dtype)],
             ..CompileConfig::default()
         },
         name: format!("transpose_{:?}_rank{}", key.dtype, key.shape.rank),
@@ -165,10 +163,7 @@ fn transpose_program(key: TransposeProgramKey) -> io::Result<Program> {
     })
 }
 
-fn transpose_reader_source(
-    dtype: DType,
-    shape: &TransposeKernelShape,
-) -> io::Result<String> {
+fn transpose_reader_source(dtype: DType, shape: &TransposeKernelShape) -> io::Result<String> {
     let element_type = match dtype {
         DType::Float32 | DType::Int32 | DType::UInt32 => "uint32_t",
         DType::Float16 | DType::Float16B | DType::UInt16 => "uint16_t",
@@ -253,13 +248,11 @@ mod tests {
         })
         .expect("transpose program");
 
-        assert_eq!(program.runtime_args.section_sizes(), (12, 12, 0));
-        assert!(program
-            .reader_kernel
-            .contains("#define TRANSPOSE_RANK 2"));
+        assert_eq!(program.runtime_args.section_sizes(), (0, 16, 0));
+        assert!(program.reader_kernel.contains("#define TRANSPOSE_RANK 2"));
         let blobs = program.runtime_args.blobs();
-        assert_eq!((arg_u32(&blobs[0], 1), arg_u32(&blobs[0], 2)), (0, 3));
-        assert_eq!((arg_u32(&blobs[1], 1), arg_u32(&blobs[1], 2)), (3, 3));
+        assert_eq!((arg_u32(&blobs[0], 2), arg_u32(&blobs[0], 3)), (0, 3));
+        assert_eq!((arg_u32(&blobs[1], 2), arg_u32(&blobs[1], 3)), (3, 3));
     }
 
     #[test]
