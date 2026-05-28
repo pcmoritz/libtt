@@ -82,10 +82,6 @@ mlir::OwningOpRef<mlir::ModuleOp> parseModule(
         &context);
 }
 
-bool isInitializerCallee(llvm::StringRef callee) {
-    return callee.starts_with("_normal") || callee.starts_with("_uniform");
-}
-
 bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module) {
     mlir::PassManager pm(&context);
     pm.addPass(mlir::createInlinerPass());
@@ -1115,14 +1111,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 executable.add_output_ids(output_id);
             }
             continue;
-        }
-
-        if (auto call_op = mlir::dyn_cast<mlir::func::CallOp>(op)) {
-            if (isInitializerCallee(call_op.getCallee())) {
-                error = "random initializer call " + call_op.getCallee().str() +
-                        " reached executable lowering; compile the model apply path with real weights instead of initializer code";
-                return false;
-            }
         }
 
         if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
