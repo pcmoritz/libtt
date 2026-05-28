@@ -1709,15 +1709,11 @@ std::optional<tt::ReduceOp::Reducer> mapReduceWindowReducer(
     return std::nullopt;
 }
 
-std::vector<int64_t> arrayRefToVector(llvm::ArrayRef<int64_t> values) {
-    return std::vector<int64_t>(values.begin(), values.end());
-}
-
 std::vector<int64_t> optionalArrayOrOnes(
     std::optional<llvm::ArrayRef<int64_t>> values,
     size_t rank) {
     if (values) {
-        return arrayRefToVector(*values);
+        return values->vec();
     }
     return std::vector<int64_t>(rank, 1);
 }
@@ -3129,7 +3125,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 return false;
             }
 
-            auto window_dimensions = arrayRefToVector(reduce_window_op.getWindowDimensions());
+            auto window_dimensions = reduce_window_op.getWindowDimensions().vec();
             auto window_strides = optionalArrayOrOnes(
                 reduce_window_op.getWindowStrides(),
                 window_dimensions.size());

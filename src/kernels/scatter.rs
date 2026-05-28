@@ -7,7 +7,7 @@ use crate::hw::CoreCoord;
 use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
 use std::io;
 
-const SCATTER_DIM0_READER: &str = include_str!("../../kernels/scatter_dim0_reader.cc");
+const SCATTER_READER: &str = include_str!("../../kernels/scatter_reader.cc");
 const SCATTER_WRITER: &str = include_str!("../../kernels/broadcast_writer.cc");
 const READER_OPERAND_ADDR_INDEX: usize = 0;
 const READER_START_INDICES_ADDR_INDEX: usize = 1;
@@ -15,7 +15,7 @@ const READER_UPDATES_ADDR_INDEX: usize = 2;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub(crate) struct ScatterDim0Shape {
+pub(crate) struct ScatterShape {
     operand_shape: Vec<u32>,
     update_shape: Vec<u32>,
     update_count: u32,
@@ -27,27 +27,27 @@ pub(crate) struct ScatterDim0Shape {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct ScatterDim0ProgramKey {
+struct ScatterProgramKey {
     cores: Vec<CoreCoord>,
     dtype: DType,
-    shape: ScatterDim0Shape,
+    shape: ScatterShape,
 }
 
-struct ScatterDim0Kernel {
+struct ScatterKernel {
     operand_addr: u32,
     start_indices_addr: u32,
     updates_addr: u32,
     output_addr: u32,
-    key: ScatterDim0ProgramKey,
+    key: ScatterProgramKey,
 }
 
-impl Kernel<ScatterDim0ProgramKey> for ScatterDim0Kernel {
-    fn program_key(&self) -> ScatterDim0ProgramKey {
+impl Kernel<ScatterProgramKey> for ScatterKernel {
+    fn program_key(&self) -> ScatterProgramKey {
         self.key.clone()
     }
 
     fn build_program(&self) -> io::Result<Program> {
-        scatter_dim0_program(self.key.clone())
+        scatter_program(self.key.clone())
     }
 
     #[inline]
@@ -69,7 +69,7 @@ impl Kernel<ScatterDim0ProgramKey> for ScatterDim0Kernel {
     }
 }
 
-pub(crate) fn scatter_dim0_set(
+pub(crate) fn scatter_set(
     device: &mut Device,
     operand: &DramBuffer,
     start_indices: &DramBuffer,
@@ -80,7 +80,7 @@ pub(crate) fn scatter_dim0_set(
     dtype: DType,
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
-    validate_dim0_buffers(
+    validate_scatter_buffers(
         operand,
         start_indices,
         updates,
@@ -90,7 +90,7 @@ pub(crate) fn scatter_dim0_set(
         dtype,
     )?;
 
-    let shape = scatter_dim0_shape(operand_shape, update_shape)?;
+    let shape = scatter_shape(operand_shape, update_shape)?;
     let output_tiles = usize::try_from(shape.output_tiles).map_err(|_| {
         invalid_input(format!(
             "scatter output tile count does not fit in usize: {}",
@@ -104,12 +104,12 @@ pub(crate) fn scatter_dim0_set(
         &tiled_allocation_shape(operand_shape)?,
         name,
     )?;
-    let kernel = ScatterDim0Kernel {
+    let kernel = ScatterKernel {
         operand_addr: u32_addr(operand.addr, "scatter operand address")?,
         start_indices_addr: u32_addr(start_indices.addr, "scatter start_indices address")?,
         updates_addr: u32_addr(updates.addr, "scatter updates address")?,
         output_addr: u32_addr(output.addr, "scatter output address")?,
-        key: ScatterDim0ProgramKey {
+        key: ScatterProgramKey {
             cores,
             dtype,
             shape,
@@ -119,7 +119,7 @@ pub(crate) fn scatter_dim0_set(
     Ok(output)
 }
 
-fn validate_dim0_buffers(
+fn validate_scatter_buffers(
     operand: &DramBuffer,
     start_indices: &DramBuffer,
     updates: &DramBuffer,
@@ -129,7 +129,7 @@ fn validate_dim0_buffers(
     dtype: DType,
 ) -> io::Result<()> {
     if operand_shape.is_empty() {
-        return Err(invalid_input("scatter_dim0_set requires rank >= 1"));
+        return Err(invalid_input("scatter set requires rank >= 1"));
     }
     if operand.dtype != dtype {
         return Err(invalid_input(format!(
@@ -152,18 +152,18 @@ fn validate_dim0_buffers(
 
     if start_indices_shape.len() != 2 || start_indices_shape[1] != 1 {
         return Err(invalid_input(format!(
-            "scatter_dim0_set requires start_indices shaped [N, 1], got {start_indices_shape:?}"
+            "scatter set requires start_indices shaped [N, 1], got {start_indices_shape:?}"
         )));
     }
     let update_count = start_indices_shape[0];
     if update_shape.len() != operand_shape.len() || update_shape.first() != Some(&update_count) {
         return Err(invalid_input(format!(
-            "scatter_dim0_set update shape must be [N] + operand_shape[1..], got {update_shape:?} for operand {operand_shape:?} and N={update_count}"
+            "scatter set update shape must be [N] + operand_shape[1..], got {update_shape:?} for operand {operand_shape:?} and N={update_count}"
         )));
     }
     if update_shape[1..] != operand_shape[1..] {
         return Err(invalid_input(format!(
-            "scatter_dim0_set update tail shape mismatch: got {:?}, expected {:?}",
+            "scatter set update tail shape mismatch: got {:?}, expected {:?}",
             &update_shape[1..],
             &operand_shape[1..]
         )));
@@ -193,16 +193,13 @@ fn validate_allocation(buffer: &DramBuffer, logical_shape: &[usize], name: &str)
     Ok(())
 }
 
-fn scatter_dim0_shape(
-    operand_shape: &[usize],
-    update_shape: &[usize],
-) -> io::Result<ScatterDim0Shape> {
+fn scatter_shape(operand_shape: &[usize], update_shape: &[usize]) -> io::Result<ScatterShape> {
     let operand_allocation_shape = tiled_allocation_shape(operand_shape)?;
     let update_allocation_shape = tiled_allocation_shape(update_shape)?;
     let operand_rank = operand_allocation_shape.len();
     let update_rank = update_allocation_shape.len();
     let output_tiles = tiled_shape_tile_count(operand_shape)?;
-    Ok(ScatterDim0Shape {
+    Ok(ScatterShape {
         operand_shape: u32_shape(operand_shape, "scatter operand shape")?,
         update_shape: u32_shape(update_shape, "scatter update shape")?,
         update_count: u32_arg(update_shape[0], "scatter update count")?,
@@ -226,7 +223,7 @@ fn scatter_dim0_shape(
     })
 }
 
-fn scatter_dim0_program(key: ScatterDim0ProgramKey) -> io::Result<Program> {
+fn scatter_program(key: ScatterProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
         vec![WRITER_OUTPUT_ADDR_INDEX],
@@ -249,7 +246,7 @@ fn scatter_dim0_program(key: ScatterDim0ProgramKey) -> io::Result<Program> {
     }
     let runtime_args = runtime_args.build()?;
     Ok(Program {
-        reader_kernel: scatter_dim0_reader_source(key.dtype, &key.shape)?,
+        reader_kernel: scatter_reader_source(key.dtype, &key.shape)?,
         writer_kernel: SCATTER_WRITER.to_owned(),
         compile: CompileConfig {
             cbs: vec![
@@ -261,7 +258,7 @@ fn scatter_dim0_program(key: ScatterDim0ProgramKey) -> io::Result<Program> {
             ..CompileConfig::default()
         },
         name: format!(
-            "scatter_dim0_set_{:?}_{}",
+            "scatter_set_{:?}_{}",
             key.dtype,
             key.shape.operand_shape.len()
         ),
@@ -269,7 +266,7 @@ fn scatter_dim0_program(key: ScatterDim0ProgramKey) -> io::Result<Program> {
     })
 }
 
-fn scatter_dim0_reader_source(dtype: DType, shape: &ScatterDim0Shape) -> io::Result<String> {
+fn scatter_reader_source(dtype: DType, shape: &ScatterShape) -> io::Result<String> {
     let element_type = element_type(dtype);
     Ok(format!(
         "#define SCATTER_RANK {}\n\
@@ -281,7 +278,7 @@ fn scatter_dim0_reader_source(dtype: DType, shape: &ScatterDim0Shape) -> io::Res
          #define SCATTER_UPDATE_TILE_ROWS {}\n\
          #define SCATTER_UPDATE_TILES_PER_ROW {}\n\
          #define SCATTER_ELEMENT_TYPE {element_type}\n\
-         {SCATTER_DIM0_READER}",
+         {SCATTER_READER}",
         shape.operand_shape.len(),
         cpp_u32_array(&shape.operand_shape),
         cpp_u32_array(&shape.update_shape),
@@ -293,7 +290,7 @@ fn scatter_dim0_reader_source(dtype: DType, shape: &ScatterDim0Shape) -> io::Res
     ))
 }
 
-pub(crate) fn validate_dim0_set_dimension_numbers(
+pub(crate) fn validate_set_dimension_numbers(
     rank: usize,
     update_window_dims: &[i64],
     inserted_window_dims: &[i64],
@@ -305,28 +302,28 @@ pub(crate) fn validate_dim0_set_dimension_numbers(
     let expected_update_window_dims = (1..rank as i64).collect::<Vec<_>>();
     if update_window_dims != expected_update_window_dims.as_slice() {
         return Err(invalid_input(format!(
-            "scatter_dim0_set requires update_window_dims {:?}, got {:?}",
+            "scatter set requires update_window_dims {:?}, got {:?}",
             expected_update_window_dims, update_window_dims
         )));
     }
     if inserted_window_dims != [0] {
         return Err(invalid_input(format!(
-            "scatter_dim0_set requires inserted_window_dims [0], got {inserted_window_dims:?}"
+            "scatter set requires inserted_window_dims [0], got {inserted_window_dims:?}"
         )));
     }
     if !input_batching_dims.is_empty() || !scatter_indices_batching_dims.is_empty() {
         return Err(invalid_input(
-            "scatter_dim0_set does not support scatter batching dimensions",
+            "scatter set does not support scatter batching dimensions",
         ));
     }
     if scatter_dims_to_operand_dims != [0] {
         return Err(invalid_input(format!(
-            "scatter_dim0_set requires scatter_dims_to_operand_dims [0], got {scatter_dims_to_operand_dims:?}"
+            "scatter set requires scatter_dims_to_operand_dims [0], got {scatter_dims_to_operand_dims:?}"
         )));
     }
     if index_vector_dim != 1 {
         return Err(invalid_input(format!(
-            "scatter_dim0_set requires index_vector_dim 1, got {index_vector_dim}"
+            "scatter set requires index_vector_dim 1, got {index_vector_dim}"
         )));
     }
     Ok(())

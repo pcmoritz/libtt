@@ -2814,7 +2814,7 @@ fn execute_scatter(
             "scatter",
         );
     }
-    kernels::scatter::validate_dim0_set_dimension_numbers(
+    kernels::scatter::validate_set_dimension_numbers(
         operand_shape.len(),
         &dimension_numbers.update_window_dims,
         &dimension_numbers.inserted_window_dims,
@@ -2842,7 +2842,7 @@ fn execute_scatter(
     };
 
     let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
-    let output_dram = kernels::scatter::scatter_dim0_set(
+    let output_dram = kernels::scatter::scatter_set(
         device,
         operand_dram,
         start_indices_dram,
