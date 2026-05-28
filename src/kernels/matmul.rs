@@ -8,26 +8,26 @@ use std::env;
 use std::io;
 use std::sync::Arc;
 
-const BF16_READER_SENDER: &str = concat!(
+const MATMUL_READER_SENDER: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_reader_sender.cc")
 );
-const BF16_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
-const BF16_WRITER_SENDER: &str = concat!(
+const MATMUL_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
+const MATMUL_WRITER_SENDER: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_writer_common.cc"),
     include_str!("../../kernels/matmul_writer_sender.cc")
 );
-const BF16_WRITER_RECV: &str = concat!(
+const MATMUL_WRITER_RECV: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_writer_common.cc"),
     include_str!("../../kernels/matmul_writer_recv.cc")
 );
-const BF16_MATMUL_TOP1_WRITER: &str = concat!(
+const MATMUL_TOP1_WRITER: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_top1_writer_sender.cc")
 );
-const BF16_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
+const MATMUL_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
 const READER_LHS_ADDR_INDEX: usize = 0;
 const WRITER_RHS_ADDR_INDEX: usize = 0;
@@ -150,6 +150,7 @@ struct MatmulProgramKey {
     output_view: MatmulOperandView,
     cores: Arc<[CoreCoord]>,
     math_fidelity: MathFidelity,
+    input_dtype: DType,
     output_dtype: DType,
     epilogue: MatmulEpilogueKind,
 }
@@ -252,14 +253,14 @@ impl MatmulPlan {
     }
 }
 
-struct MatmulBf16Kernel {
+struct MatmulKernel {
     lhs_addr: u32,
     rhs_addr: u32,
     epilogue: MatmulRuntimeEpilogue,
     key: MatmulProgramKey,
 }
 
-impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
+impl Kernel<MatmulProgramKey> for MatmulKernel {
     fn program_key(&self) -> MatmulProgramKey {
         self.key.clone()
     }
@@ -267,7 +268,7 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
     fn build_program(&self) -> io::Result<Program> {
         let plan = plan_for_key(&self.key)?;
         log_matmul_plan(&plan);
-        bf16_program(
+        matmul_program(
             &plan,
             self.key.logical_mt,
             self.key.logical_nt,
@@ -276,6 +277,7 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
             &self.key.rhs_view,
             &self.key.output_view,
             self.key.math_fidelity,
+            self.key.input_dtype,
             self.key.output_dtype,
             self.key.epilogue,
         )
@@ -301,7 +303,7 @@ impl Kernel<MatmulProgramKey> for MatmulBf16Kernel {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn matmul_bf16_dot_general(
+pub(crate) fn matmul_dot_general(
     device: &mut Device,
     lhs: &DramBuffer,
     rhs: &DramBuffer,
@@ -315,22 +317,39 @@ pub(crate) fn matmul_bf16_dot_general(
     epilogue: MatmulEpilogue,
     name: impl Into<String>,
 ) -> io::Result<MatmulOutput> {
-    if lhs.dtype != DType::Float16B || rhs.dtype != DType::Float16B {
+    if lhs.dtype != rhs.dtype || !matches!(lhs.dtype, DType::Float16B | DType::Float32) {
         return Err(invalid_input(format!(
-            "matmul_bf16 requires bf16 inputs, got {:?} and {:?}",
+            "matmul requires matching bf16 or f32 inputs, got {:?} and {:?}",
             lhs.dtype, rhs.dtype
         )));
     }
+    let input_dtype = lhs.dtype;
     let output_dtype = match epilogue {
         MatmulEpilogue::Store { output_dtype } => {
-            if !matches!(output_dtype, DType::Float16B | DType::Float32) {
-                return Err(invalid_input(format!(
-                    "matmul_bf16 output must be Float16B or Float32, got {output_dtype:?}"
-                )));
+            match input_dtype {
+                DType::Float16B if matches!(output_dtype, DType::Float16B | DType::Float32) => {}
+                DType::Float32 if output_dtype == DType::Float32 => {}
+                _ => {
+                    return Err(invalid_input(format!(
+                        "matmul output for {input_dtype:?} inputs must be {}, got {output_dtype:?}",
+                        if input_dtype == DType::Float32 {
+                            "Float32"
+                        } else {
+                            "Float16B or Float32"
+                        }
+                    )));
+                }
             }
             output_dtype
         }
-        MatmulEpilogue::Top1 => DType::Float16B,
+        MatmulEpilogue::Top1 => {
+            if input_dtype != DType::Float16B {
+                return Err(invalid_input(format!(
+                    "matmul top1 epilogue requires bf16 inputs, got {input_dtype:?}"
+                )));
+            }
+            DType::Float16B
+        }
     };
     let epilogue_kind = epilogue.kind();
 
@@ -363,6 +382,7 @@ pub(crate) fn matmul_bf16_dot_general(
         output_view: shape.output_view,
         cores,
         math_fidelity,
+        input_dtype,
         output_dtype,
         epilogue: epilogue_kind,
     };
@@ -400,14 +420,14 @@ pub(crate) fn matmul_bf16_dot_general(
         }
     };
 
-    let kernel = MatmulBf16Kernel {
+    let kernel = MatmulKernel {
         lhs_addr,
         rhs_addr,
         epilogue: runtime_epilogue,
         key,
     };
     kernel.run(device)?;
-    let MatmulBf16Kernel { epilogue, .. } = kernel;
+    let MatmulKernel { epilogue, .. } = kernel;
     epilogue.finalize(device)
 }
 
@@ -416,7 +436,7 @@ fn log_matmul_plan(plan: &MatmulPlan) {
     let grid_rows = grid.len();
     let grid_cols = grid.first().map_or(0, Vec::len);
     log(format!(
-        "matmul_bf16 plan: Mt={} Kt={} Nt={} grid={}x{} batch_groups={} batches_per_group={} mode={} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
+        "matmul plan: Mt={} Kt={} Nt={} grid={}x{} batch_groups={} batches_per_group={} mode={} per_core_M={} per_core_N={} in0_block_w={} num_blocks={} subblock={}x{}",
         plan.mt,
         plan.kt,
         plan.nt,
@@ -735,26 +755,33 @@ fn validate_tile_count(buffer: &DramBuffer, expected: usize, name: &str) -> io::
 }
 
 fn plan_for_key(key: &MatmulProgramKey) -> io::Result<MatmulPlan> {
+    let input_tile_bytes = key.input_dtype.tile_size();
+    let output_tile_bytes = key.output_dtype.tile_size();
     match key.epilogue {
-        MatmulEpilogueKind::Store => plan_matmul(
+        MatmulEpilogueKind::Store => plan_matmul_with_tile_sizes(
             key.logical_mt * 32,
             key.logical_kt * 32,
             key.logical_nt * 32,
             key.batch_count,
             &key.cores,
             key.output_view.kind == MatmulViewKind::Contiguous,
+            input_tile_bytes,
+            output_tile_bytes,
         ),
-        MatmulEpilogueKind::Top1 => plan_matmul(
+        MatmulEpilogueKind::Top1 => plan_matmul_with_tile_sizes(
             32,
             key.logical_kt * 32,
             key.output_view.logical_cols as usize,
             1,
             &key.cores,
             true,
+            input_tile_bytes,
+            output_tile_bytes,
         ),
     }
 }
 
+#[cfg(test)]
 fn plan_matmul(
     m: usize,
     k: usize,
@@ -763,10 +790,31 @@ fn plan_matmul(
     cores: &[CoreCoord],
     allow_column_split: bool,
 ) -> io::Result<MatmulPlan> {
+    plan_matmul_with_tile_sizes(
+        m,
+        k,
+        n,
+        batch_count,
+        cores,
+        allow_column_split,
+        DType::Float16B.tile_size(),
+        DType::Float16B.tile_size(),
+    )
+}
+
+fn plan_matmul_with_tile_sizes(
+    m: usize,
+    k: usize,
+    n: usize,
+    batch_count: usize,
+    cores: &[CoreCoord],
+    allow_column_split: bool,
+    input_tile_bytes: usize,
+    output_tile_bytes: usize,
+) -> io::Result<MatmulPlan> {
     let mt_base = ceil32(m) / 32;
     let kt = ceil32(k) / 32;
     let nt_base = (ceil32(n) / 32).max(1);
-    let tile_bytes = DType::Float16B.tile_size();
     let l1_data_bytes = TensixL1::SIZE as usize - TensixL1::DATA_BUFFER_SPACE_BASE as usize;
 
     let mut ordered = cores.to_vec();
@@ -837,7 +885,8 @@ fn plan_matmul(
                                     per_core_m,
                                     per_core_n,
                                     in0_block_w,
-                                    tile_bytes,
+                                    input_tile_bytes,
+                                    output_tile_bytes,
                                     l1_data_bytes,
                                 )
                             {
@@ -884,7 +933,8 @@ fn plan_matmul(
             nt_base,
             &ordered,
             &kt_divs,
-            tile_bytes,
+            input_tile_bytes,
+            output_tile_bytes,
             l1_data_bytes,
             batch_count,
             allow_column_split,
@@ -913,7 +963,8 @@ fn plan_matmul(
         nt_base,
         &ordered,
         &kt_divs,
-        tile_bytes,
+        input_tile_bytes,
+        output_tile_bytes,
         l1_data_bytes,
         batch_count,
         allow_column_split,
@@ -933,7 +984,8 @@ fn plan_direct_matmul(
     nt_base: usize,
     cores: &[CoreCoord],
     kt_divs: &[usize],
-    tile_bytes: usize,
+    input_tile_bytes: usize,
+    output_tile_bytes: usize,
     l1_data_bytes: usize,
     batch_count: usize,
     allow_column_split: bool,
@@ -990,7 +1042,8 @@ fn plan_direct_matmul(
                                     per_core_m,
                                     per_core_n,
                                     in0_block_w,
-                                    tile_bytes,
+                                    input_tile_bytes,
+                                    output_tile_bytes,
                                     l1_data_bytes,
                                 )
                             {
@@ -1077,13 +1130,14 @@ fn fits_l1(
     per_core_m: usize,
     per_core_n: usize,
     in0_block_w: usize,
-    tile_bytes: usize,
+    input_tile_bytes: usize,
+    output_tile_bytes: usize,
     l1_data_bytes: usize,
 ) -> bool {
-    let cb0 = 2 * per_core_m * in0_block_w * tile_bytes;
-    let cb1 = 2 * per_core_n * in0_block_w * tile_bytes;
-    let cb_out = per_core_m * per_core_n * tile_bytes;
-    let transpose_scratch = 2 * tile_bytes;
+    let cb0 = 2 * per_core_m * in0_block_w * input_tile_bytes;
+    let cb1 = 2 * per_core_n * in0_block_w * input_tile_bytes;
+    let cb_out = per_core_m * per_core_n * output_tile_bytes;
+    let transpose_scratch = 2 * input_tile_bytes + output_tile_bytes;
     cb0 + cb1 + cb_out + transpose_scratch <= l1_data_bytes
 }
 
@@ -1107,7 +1161,7 @@ fn divisors(n: usize) -> Vec<usize> {
     divs
 }
 
-fn bf16_program(
+fn matmul_program(
     plan: &MatmulPlan,
     logical_mt: usize,
     logical_nt: usize,
@@ -1116,19 +1170,33 @@ fn bf16_program(
     rhs_view: &MatmulOperandView,
     output_view: &MatmulOperandView,
     math_fidelity: MathFidelity,
+    input_dtype: DType,
     output_dtype: DType,
     epilogue: MatmulEpilogueKind,
 ) -> io::Result<Program> {
+    let input_compute_dtype = if input_dtype == DType::Float32 {
+        DType::Float16B
+    } else {
+        input_dtype
+    };
     let output_index_dtype = if epilogue == MatmulEpilogueKind::Top1 {
         DType::Int32
     } else {
         output_dtype
     };
     let cbs = vec![
-        CBConfig::new(0, DType::Float16B).with_tiles(plan.cb0_pages()),
-        CBConfig::new(1, DType::Float16B).with_tiles(plan.cb1_pages()),
-        CBConfig::new(2, DType::Float16B).with_tiles(1),
-        CBConfig::new(3, DType::Float16B).with_tiles(1),
+        CBConfig::new(0, input_dtype)
+            .with_compute_dtype(input_compute_dtype)
+            .with_tiles(plan.cb0_pages()),
+        CBConfig::new(1, input_dtype)
+            .with_compute_dtype(input_compute_dtype)
+            .with_tiles(plan.cb1_pages()),
+        CBConfig::new(2, input_dtype)
+            .with_compute_dtype(input_compute_dtype)
+            .with_tiles(1),
+        CBConfig::new(3, input_dtype)
+            .with_compute_dtype(input_compute_dtype)
+            .with_tiles(1),
         CBConfig::new(4, output_index_dtype).with_tiles(1),
         CBConfig::new(16, output_dtype).with_tiles(plan.out_block_num_tiles()),
         CBConfig::new(24, output_dtype).with_tiles(plan.out_block_num_tiles()),
@@ -1145,22 +1213,23 @@ fn bf16_program(
     )?;
     let top1_epilogue = epilogue == MatmulEpilogueKind::Top1;
     Ok(Program {
-        reader_kernel: BF16_READER_SENDER.to_owned(),
+        reader_kernel: MATMUL_READER_SENDER.to_owned(),
         writer_kernel: if top1_epilogue {
-            BF16_MATMUL_TOP1_WRITER.to_owned()
+            MATMUL_TOP1_WRITER.to_owned()
         } else {
-            BF16_WRITER_SENDER.to_owned()
+            MATMUL_WRITER_SENDER.to_owned()
         },
         compute_kernel: compute_src(plan, plan.batches_per_group),
-        reader_recv_kernel: BF16_READER_RECV.to_owned(),
+        reader_recv_kernel: MATMUL_READER_RECV.to_owned(),
         writer_recv_kernel: if top1_epilogue {
-            BF16_MATMUL_TOP1_WRITER.to_owned()
+            MATMUL_TOP1_WRITER.to_owned()
         } else {
-            BF16_WRITER_RECV.to_owned()
+            MATMUL_WRITER_RECV.to_owned()
         },
         name: format!(
-            "matmul{}_bf16_{:?}_{}x{}x{}",
+            "matmul{}_{:?}_{:?}_{}x{}x{}",
             if top1_epilogue { "_top1" } else { "" },
+            input_dtype,
             output_dtype,
             plan.mt * 32,
             plan.kt * 32,
@@ -1169,7 +1238,9 @@ fn bf16_program(
         compile: CompileConfig {
             cbs,
             math_fidelity,
-            dst_accum_mode: output_dtype == DType::Float32 || top1_epilogue,
+            dst_accum_mode: input_dtype == DType::Float32
+                || output_dtype == DType::Float32
+                || top1_epilogue,
             dst_full_sync: top1_epilogue,
             ..CompileConfig::default()
         },
@@ -1501,7 +1572,7 @@ fn compute_src(plan: &MatmulPlan, batch_count: usize) -> String {
         ("@OUT_BLOCK_NUM_TILES@", plan.out_block_num_tiles()),
     ];
 
-    let mut src = BF16_COMPUTE_TEMPLATE.to_owned();
+    let mut src = MATMUL_COMPUTE_TEMPLATE.to_owned();
     for (token, value) in replacements {
         src = src.replace(token, &value.to_string());
     }
