@@ -1639,12 +1639,6 @@ fn execute_reshape(
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument("TT executable reshape output value id is out of bounds")
     })?;
-    if input_desc.element_type != output_desc.element_type {
-        return Err(invalid_argument(
-            "TT executable reshape input and output element types must match",
-        ));
-    }
-
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
 
@@ -1654,14 +1648,16 @@ fn execute_reshape(
             "TT executable reshape operand buffer has no device allocation",
         ));
     };
-    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let input_dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
     let output_dram = kernels::reshape::reshape(
         device,
         input_dram,
         &input_shape,
         &output_shape,
-        dtype,
+        input_dtype,
+        output_dtype,
         "pjrt_reshape",
     )
     .map_err(io_error)?;
@@ -2198,41 +2194,6 @@ fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option
     })
 }
 
-fn execute_identity_custom_call(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    input_id: u32,
-    output_id: u32,
-    call_target_name: &str,
-) -> Result<(), *mut PJRT_Error> {
-    let input = device_buffer_for_value(
-        values,
-        input_id,
-        &format!("custom_call {call_target_name:?}.input"),
-    )?;
-    let output_index = output_id as usize;
-    let expected = plan.values.get(output_index).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} output id {output_id} is out of bounds"
-        ))
-    })?;
-    if input.buffer_type != expected.element_type {
-        return Err(invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} output must be {:?}, got {:?}",
-            expected.element_type, input.buffer_type
-        )));
-    }
-    if input.dims != expected.dims {
-        return Err(invalid_argument(format!(
-            "TT executable custom_call {call_target_name:?} output shape mismatch: expected {:?}, got {:?}",
-            expected.dims, input.dims
-        )));
-    }
-    let output = input.clone();
-    values[output_index] = Some(output);
-    Ok(())
-}
-
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2706,26 +2667,6 @@ fn execute_executable_v1(
                 *output_id,
                 permutation,
             )?,
-            executable::Op::CustomCall {
-                input_ids,
-                output_id,
-                call_target_name,
-                ..
-            } if call_target_name == "annotate_device_placement" => {
-                let [input_id] = input_ids.as_slice() else {
-                    return Err(invalid_argument(format!(
-                        "TT executable custom_call \"annotate_device_placement\" expected one input, got {}",
-                        input_ids.len()
-                    )));
-                };
-                execute_identity_custom_call(
-                    &mut values,
-                    plan,
-                    *input_id,
-                    *output_id,
-                    call_target_name,
-                )?;
-            }
             executable::Op::CustomCall {
                 call_target_name, ..
             } => {
@@ -4995,6 +4936,36 @@ mod tests {
                 assert_eq!(*output_id, 1);
                 assert_eq!(call_target_name, "foo");
                 assert!(!has_side_effect);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_elides_identity_custom_call() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %0 = stablehlo.custom_call @Sharding(%arg0) {
+      has_side_effect = false
+    } : (tensor<2x2xf32>) -> tensor<2x2xf32>
+    return %0 : tensor<2x2xf32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![0]);
+                assert_eq!(executable.values.len(), 1);
+                assert_eq!(executable.ops.len(), 1);
+                let executable::Op::Parameter {
+                    parameter_index,
+                    output_id,
+                } = &executable.ops[0]
+                else {
+                    panic!("identity custom_call should alias the parameter");
+                };
+                assert_eq!(*parameter_index, 0);
+                assert_eq!(*output_id, 0);
             },
         );
     }

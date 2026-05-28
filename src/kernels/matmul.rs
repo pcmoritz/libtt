@@ -454,12 +454,12 @@ fn dot_general_shape(
     lhs_contracting_dimensions: &[i64],
     rhs_contracting_dimensions: &[i64],
 ) -> io::Result<DotGeneralMatmulShape> {
-    if !(2..=MAX_RANK).contains(&lhs_shape.len())
-        || !(2..=MAX_RANK).contains(&rhs_shape.len())
-        || output_shape.len() < 2
+    if !(1..=MAX_RANK).contains(&lhs_shape.len())
+        || !(1..=MAX_RANK).contains(&rhs_shape.len())
+        || output_shape.is_empty()
     {
         return Err(invalid_input(format!(
-            "dot_general matmul requires lhs/rhs ranks in 2..={MAX_RANK} and output rank >= 2, got lhs={lhs_shape:?} rhs={rhs_shape:?} output={output_shape:?}"
+            "dot_general matmul requires lhs/rhs ranks in 1..={MAX_RANK} and output rank >= 1, got lhs={lhs_shape:?} rhs={rhs_shape:?} output={output_shape:?}"
         )));
     }
     if lhs_shape.contains(&0) || rhs_shape.contains(&0) || output_shape.contains(&0) {
@@ -641,6 +641,7 @@ fn operand_view(
 ) -> io::Result<MatmulOperandView> {
     let allocation_shape = tiled_allocation_shape(shape)?;
     let rank = shape.len();
+    let allocation_rank = allocation_shape.len();
     let kind = operand_view_kind(rank, batch_dims, row_dims, col_dims);
     Ok(MatmulOperandView {
         kind,
@@ -651,11 +652,11 @@ fn operand_view(
         logical_rows: u32_value(logical_rows, "matmul operand logical rows")?,
         logical_cols: u32_value(logical_cols, "matmul operand logical columns")?,
         tile_rows: u32_value(
-            allocation_shape[rank - 2] / 32,
+            allocation_shape[allocation_rank - 2] / 32,
             "matmul operand source tile rows",
         )?,
         tiles_per_row: u32_value(
-            allocation_shape[rank - 1] / 32,
+            allocation_shape[allocation_rank - 1] / 32,
             "matmul operand source tiles per row",
         )?,
         shape: padded_u32_array(shape, "matmul operand shape")?,

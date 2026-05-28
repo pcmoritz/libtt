@@ -126,13 +126,15 @@ fn concatenate_shape(
             "concatenate requires at least two input tensors",
         ));
     }
-    if output_shape.len() < 2 {
-        return Err(invalid_input(format!(
-            "concatenate currently supports rank >= 2 outputs, got {output_shape:?}"
-        )));
-    }
     let rank = output_shape.len();
-    let axis = if dimension == rank - 1 {
+    let axis = if rank == 1 {
+        if dimension != 0 {
+            return Err(invalid_input(format!(
+                "concatenate rank-1 tensors require dimension 0, got {dimension}"
+            )));
+        }
+        ConcatenateAxis::Cols
+    } else if dimension == rank - 1 {
         ConcatenateAxis::Cols
     } else if dimension == rank - 2 {
         ConcatenateAxis::Rows
@@ -173,18 +175,31 @@ fn concatenate_shape(
     }
 
     let output_allocation_shape = tiled_allocation_shape(output_shape)?;
-    let output_tile_rows = output_allocation_shape[rank - 2] / TILE_R;
-    let output_tiles_per_row = output_allocation_shape[rank - 1] / TILE_C;
+    let output_allocation_rank = output_allocation_shape.len();
+    let output_tile_rows = output_allocation_shape[output_allocation_rank - 2] / TILE_R;
+    let output_tiles_per_row = output_allocation_shape[output_allocation_rank - 1] / TILE_C;
     let tile_count = tiled_shape_tile_count(output_shape)?;
     let mut concat_offset = 0usize;
     let mut inputs = Vec::with_capacity(input_shapes.len());
     for input_shape in input_shapes {
         let allocation_shape = tiled_allocation_shape(input_shape)?;
+        let allocation_rank = allocation_shape.len();
+        let (rows, cols) = if rank == 1 {
+            (1usize, input_shape[0])
+        } else {
+            (input_shape[rank - 2], input_shape[rank - 1])
+        };
         inputs.push(ConcatenateInputShape {
-            rows: u32_arg(input_shape[rank - 2], "input rows")?,
-            cols: u32_arg(input_shape[rank - 1], "input cols")?,
-            tile_rows: u32_arg(allocation_shape[rank - 2] / TILE_R, "input tile rows")?,
-            tiles_per_row: u32_arg(allocation_shape[rank - 1] / TILE_C, "input tiles per row")?,
+            rows: u32_arg(rows, "input rows")?,
+            cols: u32_arg(cols, "input cols")?,
+            tile_rows: u32_arg(
+                allocation_shape[allocation_rank - 2] / TILE_R,
+                "input tile rows",
+            )?,
+            tiles_per_row: u32_arg(
+                allocation_shape[allocation_rank - 1] / TILE_C,
+                "input tiles per row",
+            )?,
             concat_offset: u32_arg(concat_offset, "concat offset")?,
         });
         concat_offset = concat_offset
@@ -194,8 +209,18 @@ fn concatenate_shape(
 
     Ok(ConcatenateKernelShape {
         axis,
-        output_rows: u32_arg(output_shape[rank - 2], "output rows")?,
-        output_cols: u32_arg(output_shape[rank - 1], "output cols")?,
+        output_rows: u32_arg(
+            if rank == 1 { 1 } else { output_shape[rank - 2] },
+            "output rows",
+        )?,
+        output_cols: u32_arg(
+            if rank == 1 {
+                output_shape[0]
+            } else {
+                output_shape[rank - 1]
+            },
+            "output cols",
+        )?,
         output_tile_rows: u32_arg(output_tile_rows, "output tile rows")?,
         output_tiles_per_row: u32_arg(output_tiles_per_row, "output tiles per row")?,
         tile_count: u32_arg(tile_count, "tile count")?,
@@ -343,6 +368,23 @@ mod tests {
         assert_eq!(shape.tile_count, 1);
         assert_eq!(shape.inputs[0].concat_offset, 0);
         assert_eq!(shape.inputs[1].concat_offset, 2);
+    }
+
+    #[test]
+    fn concatenate_shape_describes_rank1_concat() {
+        let shape =
+            concatenate_shape(&[vec![0], vec![1]], &[1], 0).expect("shape should be supported");
+
+        assert_eq!(shape.axis, ConcatenateAxis::Cols);
+        assert_eq!(shape.output_rows, 1);
+        assert_eq!(shape.output_cols, 1);
+        assert_eq!(shape.output_tile_rows, 1);
+        assert_eq!(shape.output_tiles_per_row, 1);
+        assert_eq!(shape.tile_count, 1);
+        assert_eq!(shape.inputs[0].rows, 1);
+        assert_eq!(shape.inputs[0].cols, 0);
+        assert_eq!(shape.inputs[1].concat_offset, 0);
+        assert_eq!(shape.inputs[1].cols, 1);
     }
 
     #[test]

@@ -38,17 +38,18 @@ void zero_tile(uint32_t cb) {
   }
 }
 
-void read_input_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile_id,
-                     uint32_t cb) {
+uint32_t read_input_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile_id,
+                         uint32_t cb) {
   cb_reserve_back(cb, 1);
-  noc_async_read_tile(tile_id, input, get_write_ptr(cb));
+  uint32_t l1_addr = get_write_ptr(cb);
+  noc_async_read_tile(tile_id, input, l1_addr);
   noc_async_read_barrier();
   cb_push_back(cb, 1);
-  cb_wait_front(cb, 1);
+  return l1_addr;
 }
 
 void ensure_input_tile(const InterleavedAddrGenFast<true> &input, uint32_t requested_tile,
-                       uint32_t *loaded_tile) {
+                       uint32_t *loaded_tile, uint32_t *loaded_l1_addr) {
   constexpr uint32_t cb_input = tt::CBIndex::c_0;
   if (requested_tile == *loaded_tile) {
     return;
@@ -56,14 +57,14 @@ void ensure_input_tile(const InterleavedAddrGenFast<true> &input, uint32_t reque
   if (*loaded_tile != INVALID_TILE) {
     cb_pop_front(cb_input, 1);
   }
-  read_input_tile(input, requested_tile, cb_input);
+  *loaded_l1_addr = read_input_tile(input, requested_tile, cb_input);
   *loaded_tile = requested_tile;
 }
 
-void copy_element(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
+void copy_element(uint32_t input_l1_addr, uint32_t cb_output, uint32_t source_row,
                   uint32_t source_col, uint32_t output_row, uint32_t output_col) {
   volatile tt_l1_ptr Element *source =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_input));
+      reinterpret_cast<volatile tt_l1_ptr Element *>(input_l1_addr);
   volatile tt_l1_ptr Element *output =
       reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
   output[tile_element_index(output_row, output_col)] =
@@ -95,15 +96,21 @@ uint32_t tile_id_for_indices(const uint32_t *indices, uint32_t *row_in_tile,
 
 void kernel_main() {
   uint32_t input_addr = get_arg_val<uint32_t>(0);
-  uint32_t output_tile_offset = get_arg_val<uint32_t>(1);
-  uint32_t output_tile_count = get_arg_val<uint32_t>(2);
+  uint32_t output_addr = get_arg_val<uint32_t>(1);
+  uint32_t output_tile_offset = get_arg_val<uint32_t>(2);
+  uint32_t output_tile_count = get_arg_val<uint32_t>(3);
 
   constexpr uint32_t cb_input = tt::CBIndex::c_0;
-  constexpr uint32_t cb_output = tt::CBIndex::c_16;
+  constexpr uint32_t cb_output = tt::CBIndex::c_1;
   const InterleavedAddrGenFast<true> input = {
       .bank_base_address = input_addr,
       .page_size = get_tile_size(cb_input),
       .data_format = get_dataformat(cb_input),
+  };
+  const InterleavedAddrGenFast<true> output = {
+      .bank_base_address = output_addr,
+      .page_size = get_tile_size(cb_output),
+      .data_format = get_dataformat(cb_output),
   };
 
   uint32_t output_indices[MAX_RANK];
@@ -117,6 +124,7 @@ void kernel_main() {
     uint32_t output_row_base = output_tile_row * TILE_R;
     uint32_t output_col_base = output_tile_col * TILE_C;
     uint32_t loaded_input_tile = INVALID_TILE;
+    uint32_t loaded_input_l1_addr = 0;
 
     cb_reserve_back(cb_output, 1);
     zero_tile(cb_output);
@@ -141,14 +149,18 @@ void kernel_main() {
         uint32_t input_row = 0;
         uint32_t input_col = 0;
         uint32_t input_tile = tile_id_for_indices(input_indices, &input_row, &input_col);
-        ensure_input_tile(input, input_tile, &loaded_input_tile);
-        copy_element(cb_input, cb_output, input_row, input_col, row, col);
+        ensure_input_tile(input, input_tile, &loaded_input_tile,
+                          &loaded_input_l1_addr);
+        copy_element(loaded_input_l1_addr, cb_output, input_row, input_col, row, col);
       }
     }
 
     if (loaded_input_tile != INVALID_TILE) {
       cb_pop_front(cb_input, 1);
     }
+    noc_async_write_tile(output_tile_id, output, get_write_ptr(cb_output));
+    noc_async_write_barrier();
     cb_push_back(cb_output, 1);
+    cb_pop_front(cb_output, 1);
   }
 }
