@@ -756,9 +756,9 @@ fn validate_and_collect_inputs<'a>(
             .collect::<io::Result<Vec<_>>>()?;
         node.kind.validate_dtypes(index, &input_dtypes, dtype)?;
     }
-    if input_reads.is_empty() || input_reads.len() > MAX_FUSED_INPUTS {
+    if input_reads.len() > MAX_FUSED_INPUTS {
         return Err(invalid_input(format!(
-            "fused eltwise requires 1..={MAX_FUSED_INPUTS} leaf inputs, got {}",
+            "fused eltwise supports at most {MAX_FUSED_INPUTS} leaf inputs, got {}",
             input_reads.len()
         )));
     }
@@ -1877,6 +1877,20 @@ mod tests {
 
         assert!(steps.body.contains("unary_max_tile_init();"));
         assert!(steps.body.contains("unary_max_tile(0, 0);"));
+    }
+
+    #[test]
+    fn validate_allows_constant_only_fusion() {
+        let mut lhs = node(FusedElementwiseKind::Constant, Vec::new());
+        lhs.packed_value = 0x3f80_3f80;
+        let mut rhs = node(FusedElementwiseKind::Constant, Vec::new());
+        rhs.packed_value = 0x4000_4000;
+
+        let nodes = vec![lhs, rhs, node(FusedElementwiseKind::Add, vec![0, 1])];
+        let inputs = validate_and_collect_inputs(&[], &nodes, &[32, 32])
+            .expect("constant-only fused op should not require external inputs");
+
+        assert!(inputs.is_empty());
     }
 
     #[test]
