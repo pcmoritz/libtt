@@ -223,12 +223,12 @@ std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& erro
         return bits.extractBitsAsZExtValue(32, 0);
     }
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
-        if (integer.getWidth() <= 64) {
+        if (integer.getWidth() <= 32) {
             auto bits = dense.getSplatValue<llvm::APInt>();
-            return static_cast<uint32_t>(bits.getZExtValue() & 0xffffffffu);
+            return static_cast<uint32_t>(bits.getZExtValue());
         }
     }
-    error = "only bf16/f16/f32 and <=64-bit integer splat constants are currently supported";
+    error = "only bf16/f16/f32 and <=32-bit integer splat constants are currently supported";
     return std::nullopt;
 }
 
@@ -251,10 +251,6 @@ std::optional<std::vector<uint8_t>> denseConstantData(
         error = "only dense constants are currently supported";
         return std::nullopt;
     }
-    if (dense.isSplat()) {
-        return std::vector<uint8_t>();
-    }
-
     auto element_type = dense.getElementType();
     std::vector<uint8_t> data;
     data.reserve(dense.getNumElements() * 4);
@@ -274,9 +270,9 @@ std::optional<std::vector<uint8_t>> denseConstantData(
     }
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
         unsigned width = integer.getWidth();
-        unsigned byte_count = width <= 8 ? 1 : width <= 16 ? 2 : width <= 64 ? 4 : 0;
+        unsigned byte_count = width <= 8 ? 1 : width <= 16 ? 2 : width <= 32 ? 4 : 0;
         if (byte_count == 0) {
-            error = "only <=64-bit integer dense constants are currently supported";
+            error = "only <=32-bit integer dense constants are currently supported";
             return std::nullopt;
         }
         for (const llvm::APInt& value : dense.getValues<llvm::APInt>()) {
@@ -285,7 +281,7 @@ std::optional<std::vector<uint8_t>> denseConstantData(
         return data;
     }
 
-    error = "only bf16/f16/f32 and <=64-bit integer dense constants are currently supported";
+    error = "only bf16/f16/f32 and <=32-bit integer dense constants are currently supported";
     return std::nullopt;
 }
 
