@@ -1753,6 +1753,7 @@ fn execute_fused_elementwise(
             root.element_type, output_desc.element_type
         )));
     }
+
     if let Some(executable::FusedElementwiseNode {
         kind: executable::FusedElementwiseKind::Constant,
         packed_value,
@@ -1769,6 +1770,7 @@ fn execute_fused_elementwise(
             output_id,
         );
     }
+
     let mut inputs = Vec::with_capacity(input_ids.len());
     for (index, &input_id) in input_ids.iter().enumerate() {
         let input = device_buffer_for_value(
