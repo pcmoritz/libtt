@@ -324,31 +324,25 @@ pub(crate) fn matmul_dot_general(
         )));
     }
     let input_dtype = lhs.dtype;
-    let output_dtype = match epilogue {
-        MatmulEpilogue::Store { output_dtype } => {
-            match input_dtype {
-                DType::Float16B if matches!(output_dtype, DType::Float16B | DType::Float32) => {}
-                DType::Float32 if output_dtype == DType::Float32 => {}
-                _ => {
-                    return Err(invalid_input(format!(
-                        "matmul output for {input_dtype:?} inputs must be {}, got {output_dtype:?}",
-                        if input_dtype == DType::Float32 {
-                            "Float32"
-                        } else {
-                            "Float16B or Float32"
-                        }
-                    )));
-                }
-            }
-            output_dtype
-        }
-        MatmulEpilogue::Top1 => {
-            if input_dtype != DType::Float16B {
-                return Err(invalid_input(format!(
-                    "matmul top1 epilogue requires bf16 inputs, got {input_dtype:?}"
-                )));
-            }
-            DType::Float16B
+    let output_dtype = match (input_dtype, epilogue) {
+        (
+            DType::Float16B,
+            MatmulEpilogue::Store {
+                output_dtype: output @ (DType::Float16B | DType::Float32),
+            },
+        ) => output,
+        (
+            DType::Float32,
+            MatmulEpilogue::Store {
+                output_dtype: DType::Float32,
+            },
+        ) => DType::Float32,
+        (DType::Float16B, MatmulEpilogue::Top1) => DType::Float16B,
+        _ => {
+            return Err(invalid_input(format!(
+                "matmul requires valid dtype combinations, got input={input_dtype:?} epilogue={:?}",
+                epilogue.kind()
+            )));
         }
     };
     let epilogue_kind = epilogue.kind();

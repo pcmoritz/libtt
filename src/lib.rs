@@ -2302,21 +2302,24 @@ fn bitwise_identity_from_packed(
     element_type: PJRT_Buffer_Type,
     packed_value: u32,
 ) -> Option<u32> {
+    let expected_mask = bitwise_identity_mask(element_type)?;
     match reducer {
         executable::ReduceReducer::Or if packed_value == 0 => Some(0),
-        executable::ReduceReducer::And => match element_type {
-            PJRT_Buffer_Type::PJRT_Buffer_Type_PRED if packed_value == 1 => Some(1),
-            PJRT_Buffer_Type::PJRT_Buffer_Type_U8 if packed_value & 0xff == 0xff => Some(0xff),
-            PJRT_Buffer_Type::PJRT_Buffer_Type_U16 if packed_value & 0xffff == 0xffff => {
-                Some(0xffff)
-            }
-            PJRT_Buffer_Type::PJRT_Buffer_Type_S32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U32
-                if packed_value == u32::MAX =>
-            {
-                Some(u32::MAX)
-            }
-            _ => None,
-        },
+        executable::ReduceReducer::And if packed_value & expected_mask == expected_mask => {
+            Some(expected_mask)
+        }
+        _ => None,
+    }
+}
+
+fn bitwise_identity_mask(element_type: PJRT_Buffer_Type) -> Option<u32> {
+    match element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => Some(1),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 => Some(0xff),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Some(0xffff),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => {
+            Some(u32::MAX)
+        }
         _ => None,
     }
 }
