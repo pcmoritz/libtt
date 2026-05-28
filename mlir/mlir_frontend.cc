@@ -660,6 +660,21 @@ bool addBitwiseBinaryOp(
     return true;
 }
 
+std::optional<tt::BitwiseBinaryOp::Kind> bitwiseBinaryKind(mlir::Operation* op) {
+    using Kind = tt::BitwiseBinaryOp::Kind;
+    return llvm::TypeSwitch<mlir::Operation*, std::optional<Kind>>(op)
+        .Case<mlir::stablehlo::AndOp>([](auto) { return tt::BitwiseBinaryOp::KIND_AND; })
+        .Case<mlir::stablehlo::OrOp>([](auto) { return tt::BitwiseBinaryOp::KIND_OR; })
+        .Case<mlir::stablehlo::XorOp>([](auto) { return tt::BitwiseBinaryOp::KIND_XOR; })
+        .Case<mlir::stablehlo::ShiftLeftOp>(
+            [](auto) { return tt::BitwiseBinaryOp::KIND_SHIFT_LEFT; })
+        .Case<mlir::stablehlo::ShiftRightLogicalOp>(
+            [](auto) { return tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_LOGICAL; })
+        .Case<mlir::stablehlo::ShiftRightArithmeticOp>(
+            [](auto) { return tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_ARITHMETIC; })
+        .Default([](auto) { return std::nullopt; });
+}
+
 bool addTopKOp(
     mlir::Value operand,
     mlir::Value values,
@@ -1667,82 +1682,12 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
-        if (auto and_op = mlir::dyn_cast<mlir::stablehlo::AndOp>(op)) {
+        if (auto bitwise_kind = bitwiseBinaryKind(op)) {
             if (!addBitwiseBinaryOp(
-                    and_op.getLhs(),
-                    and_op.getRhs(),
-                    and_op.getResult(),
-                    tt::BitwiseBinaryOp::KIND_AND,
-                    executable,
-                    value_ids,
-                    error)) {
-                return false;
-            }
-            continue;
-        }
-
-        if (auto or_op = mlir::dyn_cast<mlir::stablehlo::OrOp>(op)) {
-            if (!addBitwiseBinaryOp(
-                    or_op.getLhs(),
-                    or_op.getRhs(),
-                    or_op.getResult(),
-                    tt::BitwiseBinaryOp::KIND_OR,
-                    executable,
-                    value_ids,
-                    error)) {
-                return false;
-            }
-            continue;
-        }
-
-        if (auto xor_op = mlir::dyn_cast<mlir::stablehlo::XorOp>(op)) {
-            if (!addBitwiseBinaryOp(
-                    xor_op.getLhs(),
-                    xor_op.getRhs(),
-                    xor_op.getResult(),
-                    tt::BitwiseBinaryOp::KIND_XOR,
-                    executable,
-                    value_ids,
-                    error)) {
-                return false;
-            }
-            continue;
-        }
-
-        if (auto shift_op = mlir::dyn_cast<mlir::stablehlo::ShiftLeftOp>(op)) {
-            if (!addBitwiseBinaryOp(
-                    shift_op.getLhs(),
-                    shift_op.getRhs(),
-                    shift_op.getResult(),
-                    tt::BitwiseBinaryOp::KIND_SHIFT_LEFT,
-                    executable,
-                    value_ids,
-                    error)) {
-                return false;
-            }
-            continue;
-        }
-
-        if (auto shift_op = mlir::dyn_cast<mlir::stablehlo::ShiftRightLogicalOp>(op)) {
-            if (!addBitwiseBinaryOp(
-                    shift_op.getLhs(),
-                    shift_op.getRhs(),
-                    shift_op.getResult(),
-                    tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_LOGICAL,
-                    executable,
-                    value_ids,
-                    error)) {
-                return false;
-            }
-            continue;
-        }
-
-        if (auto shift_op = mlir::dyn_cast<mlir::stablehlo::ShiftRightArithmeticOp>(op)) {
-            if (!addBitwiseBinaryOp(
-                    shift_op.getLhs(),
-                    shift_op.getRhs(),
-                    shift_op.getResult(),
-                    tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_ARITHMETIC,
+                    op->getOperand(0),
+                    op->getOperand(1),
+                    op->getResult(0),
+                    *bitwise_kind,
                     executable,
                     value_ids,
                     error)) {
