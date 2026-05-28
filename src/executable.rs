@@ -77,6 +77,13 @@ pub(crate) enum Op {
         dimensions: Vec<i64>,
         reducer: ReduceReducer,
     },
+    ReduceWindow {
+        input_ids: Vec<u32>,
+        init_value_ids: Vec<u32>,
+        output_id: u32,
+        attributes: ReduceWindowAttributes,
+        reducer: ReduceReducer,
+    },
     Matmul {
         input_ids: [u32; 2],
         output_id: u32,
@@ -103,6 +110,13 @@ pub(crate) enum Op {
         dimension_numbers: GatherDimensionNumbers,
         slice_sizes: Vec<i64>,
         indices_are_sorted: bool,
+    },
+    Scatter {
+        input_ids: [u32; 3],
+        output_id: u32,
+        dimension_numbers: ScatterDimensionNumbers,
+        indices_are_sorted: bool,
+        unique_indices: bool,
     },
     Iota {
         output_id: u32,
@@ -174,6 +188,17 @@ pub(crate) enum ReduceReducer {
     Or,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ReduceWindowAttributes {
+    pub(crate) window_dimensions: Vec<i64>,
+    pub(crate) window_strides: Vec<i64>,
+    pub(crate) base_dilations: Vec<i64>,
+    pub(crate) window_dilations: Vec<i64>,
+    pub(crate) padding_low: Vec<i64>,
+    pub(crate) padding_high: Vec<i64>,
+}
+
 #[derive(Clone)]
 #[allow(dead_code)]
 pub(crate) struct GatherDimensionNumbers {
@@ -182,6 +207,17 @@ pub(crate) struct GatherDimensionNumbers {
     pub(crate) operand_batching_dims: Vec<i64>,
     pub(crate) start_indices_batching_dims: Vec<i64>,
     pub(crate) start_index_map: Vec<i64>,
+    pub(crate) index_vector_dim: i64,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct ScatterDimensionNumbers {
+    pub(crate) update_window_dims: Vec<i64>,
+    pub(crate) inserted_window_dims: Vec<i64>,
+    pub(crate) input_batching_dims: Vec<i64>,
+    pub(crate) scatter_indices_batching_dims: Vec<i64>,
+    pub(crate) scatter_dims_to_operand_dims: Vec<i64>,
     pub(crate) index_vector_dim: i64,
 }
 
@@ -365,6 +401,20 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     dimensions: reduce.dimensions,
                     reducer: parse_reduce_reducer(reduce.reducer)?,
                 }),
+                Kind::ReduceWindow(reduce_window) => Ok(Op::ReduceWindow {
+                    input_ids: reduce_window.input_ids,
+                    init_value_ids: reduce_window.init_value_ids,
+                    output_id: op_desc.output_id,
+                    attributes: ReduceWindowAttributes {
+                        window_dimensions: reduce_window.window_dimensions,
+                        window_strides: reduce_window.window_strides,
+                        base_dilations: reduce_window.base_dilations,
+                        window_dilations: reduce_window.window_dilations,
+                        padding_low: reduce_window.padding_low,
+                        padding_high: reduce_window.padding_high,
+                    },
+                    reducer: parse_reduce_reducer(reduce_window.reducer)?,
+                }),
                 Kind::Matmul(matmul) => Ok(Op::Matmul {
                     input_ids: [matmul.lhs_id, matmul.rhs_id],
                     output_id: op_desc.output_id,
@@ -407,6 +457,24 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     },
                     slice_sizes: gather.slice_sizes,
                     indices_are_sorted: gather.indices_are_sorted,
+                }),
+                Kind::Scatter(scatter) => Ok(Op::Scatter {
+                    input_ids: [
+                        scatter.operand_id,
+                        scatter.start_indices_id,
+                        scatter.updates_id,
+                    ],
+                    output_id: op_desc.output_id,
+                    dimension_numbers: ScatterDimensionNumbers {
+                        update_window_dims: scatter.update_window_dims,
+                        inserted_window_dims: scatter.inserted_window_dims,
+                        input_batching_dims: scatter.input_batching_dims,
+                        scatter_indices_batching_dims: scatter.scatter_indices_batching_dims,
+                        scatter_dims_to_operand_dims: scatter.scatter_dims_to_operand_dims,
+                        index_vector_dim: scatter.index_vector_dim,
+                    },
+                    indices_are_sorted: scatter.indices_are_sorted,
+                    unique_indices: scatter.unique_indices,
                 }),
                 Kind::Iota(iota) => Ok(Op::Iota {
                     output_id: op_desc.output_id,
@@ -521,6 +589,13 @@ pub(crate) enum Op {
         dimensions: Vec<i64>,
         reducer: ReduceReducer,
     },
+    ReduceWindow {
+        input_ids: Vec<u32>,
+        init_value_ids: Vec<u32>,
+        output_id: u32,
+        attributes: ReduceWindowAttributes,
+        reducer: ReduceReducer,
+    },
     Matmul {
         input_ids: [u32; 2],
         output_id: u32,
@@ -547,6 +622,13 @@ pub(crate) enum Op {
         dimension_numbers: GatherDimensionNumbers,
         slice_sizes: Vec<i64>,
         indices_are_sorted: bool,
+    },
+    Scatter {
+        input_ids: [u32; 3],
+        output_id: u32,
+        dimension_numbers: ScatterDimensionNumbers,
+        indices_are_sorted: bool,
+        unique_indices: bool,
     },
     Iota {
         output_id: u32,

@@ -1973,6 +1973,95 @@ fn execute_reduce(
     )
 }
 
+fn execute_reduce_window(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: &[u32],
+    init_value_ids: &[u32],
+    output_id: u32,
+    attributes: &executable::ReduceWindowAttributes,
+    reducer: executable::ReduceReducer,
+) -> Result<(), *mut PJRT_Error> {
+    let [input_id] = input_ids else {
+        return Err(unimplemented(
+            "TT executable reduce_window currently only supports one input",
+        ));
+    };
+    let [init_value_id] = init_value_ids else {
+        return Err(unimplemented(
+            "TT executable reduce_window currently only supports one init value",
+        ));
+    };
+
+    let input = device_buffer_for_value(values, *input_id, "reduce_window.input")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable reduce_window input buffer has no device allocation",
+        ));
+    };
+    let input_desc = plan
+        .values
+        .get(*input_id as usize)
+        .ok_or_else(|| invalid_argument("TT executable reduce_window input id is out of bounds"))?;
+    let init_desc = plan.values.get(*init_value_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable reduce_window init value id is out of bounds")
+    })?;
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable reduce_window output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != input_desc.element_type
+        || init_desc.element_type != input_desc.element_type
+    {
+        return Err(invalid_argument(
+            "TT executable reduce_window input, init, and output element types must match",
+        ));
+    }
+    if !init_desc.dims.is_empty() {
+        return Err(unimplemented(
+            "TT executable reduce_window currently requires a scalar init value",
+        ));
+    }
+    if reducer != executable::ReduceReducer::Add
+        || constant_packed_value(plan, *init_value_id) != Some(0)
+    {
+        return Err(unimplemented(
+            "TT executable reduce_window currently requires add with a constant zero init value",
+        ));
+    }
+
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let input_shape = dims_i64_to_usize(&input_desc.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let reduce_window_plan = kernels::reduce_window::ReduceWindowPlan::new(
+        dtype,
+        &input_shape,
+        &output_shape,
+        attributes,
+        reducer,
+    )
+    .map_err(io_error)?;
+    let output_dram = kernels::reduce_window::reduce_window(
+        device,
+        input_dram,
+        &reduce_window_plan,
+        "pjrt_reduce_window",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "reduce_window",
+    )
+}
+
 fn execute_top_k(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2640,6 +2729,134 @@ fn execute_gather(
     )
 }
 
+fn execute_scatter(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: [u32; 3],
+    output_id: u32,
+    dimension_numbers: &executable::ScatterDimensionNumbers,
+) -> Result<(), *mut PJRT_Error> {
+    let operand = device_buffer_for_value(values, input_ids[0], "scatter.operand")?.clone();
+    let start_indices =
+        device_buffer_for_value(values, input_ids[1], "scatter.start_indices")?.clone();
+    let updates = device_buffer_for_value(values, input_ids[2], "scatter.updates")?.clone();
+    if start_indices.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
+        return Err(unimplemented(
+            "TT executable scatter currently only supports s32 start_indices",
+        ));
+    }
+    if updates.buffer_type != operand.buffer_type {
+        return Err(invalid_argument(format!(
+            "TT executable scatter updates must be {:?}, got {:?}",
+            operand.buffer_type, updates.buffer_type
+        )));
+    }
+
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable scatter output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != operand.buffer_type {
+        return Err(invalid_argument(format!(
+            "TT executable scatter output must be {:?}, got {:?}",
+            operand.buffer_type, output_desc.element_type
+        )));
+    }
+
+    let operand_shape = dims_i64_to_usize(&operand.dims)?;
+    let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
+    let update_shape = dims_i64_to_usize(&updates.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    if output_shape != operand_shape {
+        return Err(invalid_argument(format!(
+            "TT executable scatter output shape mismatch: expected {:?}, got {:?}",
+            operand_shape, output_shape
+        )));
+    }
+    if kernels::scatter::is_full_window_set_dimension_numbers(
+        operand_shape.len(),
+        &dimension_numbers.update_window_dims,
+        &dimension_numbers.inserted_window_dims,
+        &dimension_numbers.input_batching_dims,
+        &dimension_numbers.scatter_indices_batching_dims,
+        &dimension_numbers.scatter_dims_to_operand_dims,
+        dimension_numbers.index_vector_dim,
+    ) {
+        if start_indices_shape != [0] || update_shape != operand_shape {
+            return Err(unimplemented(format!(
+                "TT executable full-window scatter requires start_indices_shape [0] and update_shape {:?}; got start_indices_shape={start_indices_shape:?} update_shape={update_shape:?}",
+                operand_shape
+            )));
+        }
+        let Some(updates_dram) = updates.dram_buffer.as_ref() else {
+            return Err(failed_precondition(
+                "TT executable scatter updates buffer has no device allocation",
+            ));
+        };
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_desc.dims.clone(),
+            updates_dram.clone(),
+            context,
+            "scatter",
+        );
+    }
+    kernels::scatter::validate_set_dimension_numbers(
+        operand_shape.len(),
+        &dimension_numbers.update_window_dims,
+        &dimension_numbers.inserted_window_dims,
+        &dimension_numbers.input_batching_dims,
+        &dimension_numbers.scatter_indices_batching_dims,
+        &dimension_numbers.scatter_dims_to_operand_dims,
+        dimension_numbers.index_vector_dim,
+    )
+    .map_err(|err| unimplemented(err.to_string()))?;
+
+    let Some(operand_dram) = operand.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable scatter operand buffer has no device allocation",
+        ));
+    };
+    let Some(start_indices_dram) = start_indices.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable scatter start_indices buffer has no device allocation",
+        ));
+    };
+    let Some(updates_dram) = updates.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable scatter updates buffer has no device allocation",
+        ));
+    };
+
+    let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
+    let output_dram = kernels::scatter::scatter_set(
+        device,
+        operand_dram,
+        start_indices_dram,
+        updates_dram,
+        &operand_shape,
+        &start_indices_shape,
+        &update_shape,
+        dtype,
+        "pjrt_scatter",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "scatter",
+    )
+}
+
 fn execute_iota(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2806,6 +3023,23 @@ fn execute_executable_v1(
                 dimensions,
                 *reducer,
             )?,
+            executable::Op::ReduceWindow {
+                input_ids,
+                init_value_ids,
+                output_id,
+                attributes,
+                reducer,
+            } => execute_reduce_window(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                input_ids,
+                init_value_ids,
+                *output_id,
+                attributes,
+                *reducer,
+            )?,
             executable::Op::Matmul {
                 input_ids,
                 output_id,
@@ -2879,6 +3113,20 @@ fn execute_executable_v1(
                 *output_id,
                 dimension_numbers,
                 slice_sizes,
+            )?,
+            executable::Op::Scatter {
+                input_ids,
+                output_id,
+                dimension_numbers,
+                ..
+            } => execute_scatter(
+                &mut values,
+                plan,
+                device,
+                &output_context,
+                *input_ids,
+                *output_id,
+                dimension_numbers,
             )?,
             executable::Op::Iota {
                 output_id,
