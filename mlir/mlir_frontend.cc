@@ -339,8 +339,6 @@ std::optional<uint32_t> packedConvertedConstantValue(
     return std::nullopt;
 }
 
-void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value);
-
 void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value) {
     auto* constant = executable.add_ops();
     constant->set_output_id(output_id);
@@ -1511,7 +1509,6 @@ extern "C" bool TT_MlirAnalyzeProgram(
             "failed to parse StableHLO/MLIR program"), alloc_output, user_data);
     }
 
-    std::string error;
     if (!runCleanupPasses(context, *module)) {
         return emitResult(makeResult(
             tt::AnalysisResult::STATUS_INTERNAL_ERROR,
@@ -1529,6 +1526,7 @@ extern "C" bool TT_MlirAnalyzeProgram(
     tt::AnalysisResult result;
     result.set_status(tt::AnalysisResult::STATUS_OK);
 
+    std::string error;
     if (!fillProgramSignature(*entry, result, error)) {
         return emitResult(
             makeResult(tt::AnalysisResult::STATUS_UNSUPPORTED, error),
