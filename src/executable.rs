@@ -85,6 +85,7 @@ pub(crate) enum Op {
     },
     Constant {
         packed_value: u32,
+        data: Vec<u8>,
         output_id: u32,
     },
     Select {
@@ -375,6 +376,7 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                 }),
                 Kind::Constant(constant) => Ok(Op::Constant {
                     packed_value: constant.packed_value,
+                    data: constant.data,
                     output_id: op_desc.output_id,
                 }),
                 Kind::Select(select) => Ok(Op::Select {
@@ -521,6 +523,7 @@ pub(crate) enum Op {
     },
     Constant {
         packed_value: u32,
+        data: Vec<u8>,
         output_id: u32,
     },
     Select {

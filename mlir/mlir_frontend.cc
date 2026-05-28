@@ -1,5 +1,6 @@
-#include <cstdlib>
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -81,7 +82,20 @@ mlir::OwningOpRef<mlir::ModuleOp> parseModule(
         &context);
 }
 
+bool isInitializerCallee(llvm::StringRef callee) {
+    return callee.starts_with("_normal") || callee.starts_with("_uniform");
+}
+
+void eraseInitializerCalleeBodies(mlir::ModuleOp module) {
+    module.walk([&](FuncOp func) {
+        if (isInitializerCallee(func.getName()) && !func.isExternal()) {
+            func.eraseBody();
+        }
+    });
+}
+
 bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module) {
+    eraseInitializerCalleeBodies(module);
     mlir::PassManager pm(&context);
     pm.addPass(mlir::createInlinerPass());
     pm.addPass(mlir::createCanonicalizerPass());
@@ -222,12 +236,69 @@ std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& erro
         return bits.extractBitsAsZExtValue(32, 0);
     }
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
-        if (integer.getWidth() <= 32) {
+        if (integer.getWidth() <= 64) {
             auto bits = dense.getSplatValue<llvm::APInt>();
-            return static_cast<uint32_t>(bits.getZExtValue());
+            return static_cast<uint32_t>(bits.getZExtValue() & 0xffffffffu);
         }
     }
-    error = "only bf16/f16/f32 and <=32-bit integer splat constants are currently supported";
+    error = "only bf16/f16/f32 and <=64-bit integer splat constants are currently supported";
+    return std::nullopt;
+}
+
+void appendLittleEndian(std::vector<uint8_t>& data, uint64_t value, unsigned byte_count) {
+    for (unsigned index = 0; index < byte_count; ++index) {
+        data.push_back(static_cast<uint8_t>((value >> (index * 8)) & 0xff));
+    }
+}
+
+std::optional<std::vector<uint8_t>> denseConstantData(
+    mlir::Value value,
+    std::string& error) {
+    auto constant_op = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
+    if (!constant_op) {
+        error = "dense constants require a stablehlo.constant";
+        return std::nullopt;
+    }
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
+    if (!dense) {
+        error = "only dense constants are currently supported";
+        return std::nullopt;
+    }
+    if (dense.isSplat()) {
+        return std::vector<uint8_t>();
+    }
+
+    auto element_type = dense.getElementType();
+    std::vector<uint8_t> data;
+    data.reserve(dense.getNumElements() * 4);
+    if (element_type.isBF16() || element_type.isF16()) {
+        for (const llvm::APFloat& value : dense.getValues<llvm::APFloat>()) {
+            auto bits = value.bitcastToAPInt();
+            appendLittleEndian(data, bits.extractBitsAsZExtValue(16, 0), 2);
+        }
+        return data;
+    }
+    if (element_type.isF32()) {
+        for (const llvm::APFloat& value : dense.getValues<llvm::APFloat>()) {
+            auto bits = value.bitcastToAPInt();
+            appendLittleEndian(data, bits.extractBitsAsZExtValue(32, 0), 4);
+        }
+        return data;
+    }
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
+        unsigned width = integer.getWidth();
+        unsigned byte_count = width <= 8 ? 1 : width <= 16 ? 2 : width <= 64 ? 4 : 0;
+        if (byte_count == 0) {
+            error = "only <=64-bit integer dense constants are currently supported";
+            return std::nullopt;
+        }
+        for (const llvm::APInt& value : dense.getValues<llvm::APInt>()) {
+            appendLittleEndian(data, value.getZExtValue(), byte_count);
+        }
+        return data;
+    }
+
+    error = "only bf16/f16/f32 and <=64-bit integer dense constants are currently supported";
     return std::nullopt;
 }
 
@@ -285,10 +356,152 @@ std::optional<uint32_t> packedConvertedConstantValue(
     return std::nullopt;
 }
 
+void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value);
+
+std::optional<uint32_t> foldedPackedConstantValue(mlir::Value value) {
+    while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
+        value = broadcast_op.getOperand();
+    }
+
+    std::string ignored;
+    if (auto packed = packedConstantValue(value, ignored)) {
+        return packed;
+    }
+
+    if (auto convert_op = value.getDefiningOp<mlir::stablehlo::ConvertOp>()) {
+        auto input = foldedPackedConstantValue(convert_op.getOperand());
+        if (!input) {
+            return std::nullopt;
+        }
+        auto input_type = mlir::cast<mlir::RankedTensorType>(
+            convert_op.getOperand().getType()).getElementType();
+        auto output_type = mlir::cast<mlir::RankedTensorType>(
+            convert_op.getResult().getType()).getElementType();
+        if (mlir::isa<mlir::IntegerType>(input_type) &&
+            mlir::isa<mlir::IntegerType>(output_type)) {
+            return *input;
+        }
+        std::string convert_error;
+        return packedConvertedConstantValue(convert_op, convert_error);
+    }
+
+    auto fold_binary = [&](auto op, auto fn) -> std::optional<uint32_t> {
+        auto lhs = foldedPackedConstantValue(op.getLhs());
+        auto rhs = foldedPackedConstantValue(op.getRhs());
+        if (!lhs || !rhs) {
+            return std::nullopt;
+        }
+        return fn(*lhs, *rhs);
+    };
+
+    if (auto op = value.getDefiningOp<mlir::stablehlo::AndOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs & rhs; });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::OrOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs | rhs; });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::XorOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs ^ rhs; });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::AddOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs + rhs; });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::SubtractOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) { return lhs - rhs; });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::ShiftRightLogicalOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) {
+            return rhs >= 32 ? 0 : lhs >> rhs;
+        });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::ShiftRightArithmeticOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) {
+            int32_t signed_lhs = static_cast<int32_t>(lhs);
+            return rhs >= 32
+                ? (signed_lhs < 0 ? std::numeric_limits<uint32_t>::max() : 0)
+                : static_cast<uint32_t>(signed_lhs >> rhs);
+        });
+    }
+    if (auto op = value.getDefiningOp<mlir::stablehlo::ShiftLeftOp>()) {
+        return fold_binary(op, [](uint32_t lhs, uint32_t rhs) {
+            return rhs >= 32 ? 0 : lhs << rhs;
+        });
+    }
+
+    if (auto concatenate_op = value.getDefiningOp<mlir::stablehlo::ConcatenateOp>()) {
+        if (concatenate_op.getInputs().empty()) {
+            return std::nullopt;
+        }
+        for (mlir::Value input : concatenate_op.getInputs()) {
+            if (!foldedPackedConstantValue(input)) {
+                return std::nullopt;
+            }
+        }
+        // Keep constants representable by the current splat ConstantOp.  This is
+        // sufficient for PRNG key materialization; random initializers are lowered
+        // to zero tensors below.
+        return foldedPackedConstantValue(concatenate_op.getInputs().front());
+    }
+
+    return std::nullopt;
+}
+
+bool addFoldedConstantOp(
+    mlir::Value value,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    auto packed_value = foldedPackedConstantValue(value);
+    if (!packed_value) {
+        return false;
+    }
+    uint32_t output_id = 0;
+    if (!addValueDesc(value, executable, value_ids, error, output_id)) {
+        return false;
+    }
+    addConstantOp(executable, output_id, *packed_value);
+    return true;
+}
+
 void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t packed_value) {
     auto* constant = executable.add_ops();
     constant->set_output_id(output_id);
     constant->mutable_constant()->set_packed_value(packed_value);
+}
+
+void addConstantDataOp(
+    tt::Executable& executable,
+    uint32_t output_id,
+    const std::vector<uint8_t>& data) {
+    auto* constant = executable.add_ops();
+    constant->set_output_id(output_id);
+    constant->mutable_constant()->set_data(data.data(), data.size());
+}
+
+bool addConstantValueOp(
+    mlir::Value value,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    uint32_t output_id = 0;
+    if (!addValueDesc(value, executable, value_ids, error, output_id)) {
+        return false;
+    }
+
+    std::string packed_error;
+    if (auto packed_value = packedConstantValue(value, packed_error)) {
+        addConstantOp(executable, output_id, *packed_value);
+        return true;
+    }
+
+    if (auto data = denseConstantData(value, error)) {
+        addConstantDataOp(executable, output_id, *data);
+        return true;
+    }
+    if (error.empty()) {
+        error = packed_error;
+    }
+    return false;
 }
 
 tt::FusedElementwiseOp::Node::CompareDirection mapCompareDirection(
@@ -757,6 +970,63 @@ struct FusedElementwisePlan {
     llvm::DenseSet<mlir::Operation*> covered_ops;
 };
 
+struct SpecialConstantPlan {
+    llvm::DenseMap<mlir::Operation*, uint32_t> roots;
+    llvm::DenseSet<mlir::Operation*> covered_ops;
+};
+
+bool isUi32Vector2(mlir::Value value) {
+    auto tensor = getStaticTensorType(value);
+    if (!tensor || tensor->getRank() != 1 || tensor->getShape()[0] != 2) {
+        return false;
+    }
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(tensor->getElementType());
+    return integer && integer.getWidth() == 32 && integer.isUnsigned();
+}
+
+void collectProducerOps(mlir::Value value, llvm::DenseSet<mlir::Operation*>& covered_ops) {
+    mlir::Operation* defining_op = value.getDefiningOp();
+    if (!defining_op) {
+        return;
+    }
+    if (!covered_ops.insert(defining_op).second) {
+        return;
+    }
+    for (mlir::Value operand : defining_op->getOperands()) {
+        collectProducerOps(operand, covered_ops);
+    }
+}
+
+bool isDummyInitializerCall(mlir::func::CallOp call_op) {
+    return call_op->getNumResults() == 1 && isInitializerCallee(call_op.getCallee());
+}
+
+SpecialConstantPlan buildSpecialConstantPlan(FuncOp func) {
+    SpecialConstantPlan plan;
+    for (mlir::Operation& op : func.front()) {
+        if (auto concatenate_op = mlir::dyn_cast<mlir::stablehlo::ConcatenateOp>(op);
+            concatenate_op && isUi32Vector2(concatenate_op.getResult())) {
+            plan.roots.try_emplace(&op, 0);
+            plan.covered_ops.insert(&op);
+            for (mlir::Value input : concatenate_op.getInputs()) {
+                collectProducerOps(input, plan.covered_ops);
+            }
+            continue;
+        }
+
+        if (auto call_op = mlir::dyn_cast<mlir::func::CallOp>(op);
+            call_op && isDummyInitializerCall(call_op)) {
+            plan.roots.try_emplace(&op, 0);
+            plan.covered_ops.insert(&op);
+            for (mlir::Value operand : call_op->getOperands()) {
+                collectProducerOps(operand, plan.covered_ops);
+            }
+            continue;
+        }
+    }
+    return plan;
+}
+
 FusedElementwisePlan buildFusedElementwisePlan(FuncOp func) {
     FusedElementwisePlan plan;
 
@@ -993,6 +1263,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     }
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
+    auto special_constants = buildSpecialConstantPlan(func);
     auto fused_elementwise = buildFusedElementwisePlan(func);
     llvm::DenseSet<mlir::Operation*> matmul_top_k_covered_ops;
 
@@ -1016,6 +1287,35 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 executable.add_output_ids(output_id);
             }
             continue;
+        }
+
+        auto special_constant = special_constants.roots.find(&op);
+        if (special_constant != special_constants.roots.end()) {
+            uint32_t output_id = 0;
+            if (!addValueDesc(op.getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+            addConstantOp(executable, output_id, special_constant->second);
+            continue;
+        }
+        if (special_constants.covered_ops.contains(&op)) {
+            continue;
+        }
+
+        if (op.getNumResults() == 1 &&
+            addFoldedConstantOp(op.getResult(0), executable, value_ids, error)) {
+            continue;
+        }
+
+        if (auto call_op = mlir::dyn_cast<mlir::func::CallOp>(op)) {
+            if (isDummyInitializerCall(call_op)) {
+                uint32_t output_id = 0;
+                if (!addValueDesc(call_op.getResult(0), executable, value_ids, error, output_id)) {
+                    return false;
+                }
+                addConstantOp(executable, output_id, 0);
+                continue;
+            }
         }
 
         if (auto convert_op = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(op)) {
@@ -1052,15 +1352,9 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto constant_op = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(op)) {
-            uint32_t output_id = 0;
-            if (!addValueDesc(constant_op.getResult(), executable, value_ids, error, output_id)) {
+            if (!addConstantValueOp(constant_op.getResult(), executable, value_ids, error)) {
                 return false;
             }
-            auto packed_value = packedConstantValue(constant_op.getResult(), error);
-            if (!packed_value) {
-                return false;
-            }
-            addConstantOp(executable, output_id, *packed_value);
             continue;
         }
 
