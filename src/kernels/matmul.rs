@@ -1118,46 +1118,19 @@ fn bf16_program(
     output_dtype: DType,
     epilogue: MatmulEpilogueKind,
 ) -> io::Result<Program> {
+    let output_index_dtype = if epilogue == MatmulEpilogueKind::Top1 {
+        DType::Int32
+    } else {
+        output_dtype
+    };
     let cbs = vec![
-        CBConfig {
-            index: 0,
-            dtype: DType::Float16B,
-            tiles: plan.cb0_pages(),
-        },
-        CBConfig {
-            index: 1,
-            dtype: DType::Float16B,
-            tiles: plan.cb1_pages(),
-        },
-        CBConfig {
-            index: 2,
-            dtype: DType::Float16B,
-            tiles: 1,
-        },
-        CBConfig {
-            index: 3,
-            dtype: DType::Float16B,
-            tiles: 1,
-        },
-        CBConfig {
-            index: 4,
-            dtype: if epilogue == MatmulEpilogueKind::Top1 {
-                DType::Int32
-            } else {
-                output_dtype
-            },
-            tiles: 1,
-        },
-        CBConfig {
-            index: 16,
-            dtype: output_dtype,
-            tiles: plan.out_block_num_tiles(),
-        },
-        CBConfig {
-            index: 24,
-            dtype: output_dtype,
-            tiles: plan.out_block_num_tiles(),
-        },
+        CBConfig::new(0, DType::Float16B).with_tiles(plan.cb0_pages()),
+        CBConfig::new(1, DType::Float16B).with_tiles(plan.cb1_pages()),
+        CBConfig::new(2, DType::Float16B).with_tiles(1),
+        CBConfig::new(3, DType::Float16B).with_tiles(1),
+        CBConfig::new(4, output_index_dtype).with_tiles(1),
+        CBConfig::new(16, output_dtype).with_tiles(plan.out_block_num_tiles()),
+        CBConfig::new(24, output_dtype).with_tiles(plan.out_block_num_tiles()),
     ];
     let runtime_args = lower_runtime_args(
         plan,
