@@ -178,11 +178,7 @@ fn broadcast_program(key: BroadcastProgramKey) -> io::Result<Program> {
         compile: CompileConfig {
             cbs: vec![
                 CBConfig::new(0, key.dtype),
-                CBConfig {
-                    index: 16,
-                    dtype: key.dtype,
-                    tiles: 4,
-                },
+                CBConfig::new(16, key.dtype).with_tiles(4),
             ],
             ..CompileConfig::default()
         },

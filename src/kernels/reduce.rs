@@ -292,11 +292,7 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
             cbs: vec![
                 CBConfig::new(0, key.dtype),
                 CBConfig::new(16, key.dtype),
-                CBConfig {
-                    index: 17,
-                    dtype: key.dtype,
-                    tiles: output_tiles,
-                },
+                CBConfig::new(17, key.dtype).with_tiles(output_tiles),
             ],
             dst_accum_mode: true,
             ..CompileConfig::default()

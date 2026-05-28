@@ -78,6 +78,8 @@ pub enum MathFidelity {
 pub struct CBConfig {
     pub index: usize,
     pub dtype: DType,
+    // Format presented to compute unpack/pack; storage/page size still comes from dtype.
+    pub compute_dtype: DType,
     pub tiles: usize,
 }
 
@@ -86,8 +88,19 @@ impl CBConfig {
         Self {
             index,
             dtype,
+            compute_dtype: dtype,
             tiles: 2,
         }
+    }
+
+    pub fn with_compute_dtype(mut self, compute_dtype: DType) -> Self {
+        self.compute_dtype = compute_dtype;
+        self
+    }
+
+    pub fn with_tiles(mut self, tiles: usize) -> Self {
+        self.tiles = tiles;
+        self
     }
 }
 
@@ -833,21 +846,9 @@ mod tests {
     fn build_cb_blob_packs_buffers() {
         let config = CompileConfig {
             cbs: vec![
-                CBConfig {
-                    index: 0,
-                    dtype: DType::Float16,
-                    tiles: 2,
-                },
-                CBConfig {
-                    index: 16,
-                    dtype: DType::Float16B,
-                    tiles: 1,
-                },
-                CBConfig {
-                    index: 24,
-                    dtype: DType::Float16B,
-                    tiles: 1,
-                },
+                CBConfig::new(0, DType::Float16),
+                CBConfig::new(16, DType::Float16B).with_tiles(1),
+                CBConfig::new(24, DType::Float16B).with_tiles(1),
             ],
             ..CompileConfig::default()
         };
