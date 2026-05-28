@@ -508,6 +508,133 @@ std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
     return std::nullopt;
 }
 
+std::optional<tt::ReduceOp::Reducer> mapReduceWindowReducer(
+    mlir::stablehlo::ReduceWindowOp reduce_window_op,
+    std::string& error) {
+    if (reduce_window_op.getInputs().size() != 1 ||
+        reduce_window_op.getInitValues().size() != 1 ||
+        reduce_window_op->getNumResults() != 1) {
+        error = "only single-input single-result reduce_window ops are currently supported";
+        return std::nullopt;
+    }
+
+    auto& body = reduce_window_op.getBody();
+    if (body.empty() || body.getBlocks().size() != 1) {
+        error = "reduce_window bodies must contain exactly one block";
+        return std::nullopt;
+    }
+
+    mlir::Operation* reducer_op = nullptr;
+    mlir::Operation* return_operation = nullptr;
+    for (mlir::Operation& body_op : body.front()) {
+        if (mlir::isa<mlir::stablehlo::ReturnOp>(body_op)) {
+            return_operation = &body_op;
+            continue;
+        }
+        if (reducer_op) {
+            error = "only single-op reduce_window bodies are currently supported";
+            return std::nullopt;
+        }
+        reducer_op = &body_op;
+    }
+
+    if (!reducer_op || !return_operation) {
+        error = "reduce_window body must contain a reducer op and stablehlo.return";
+        return std::nullopt;
+    }
+
+    auto return_op = mlir::cast<mlir::stablehlo::ReturnOp>(return_operation);
+    if (return_op.getNumOperands() != 1 ||
+        return_op.getOperand(0).getDefiningOp() != reducer_op) {
+        error = "reduce_window body must return the reducer op result";
+        return std::nullopt;
+    }
+
+    if (mlir::isa<mlir::stablehlo::AddOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_ADD;
+    }
+
+    error = "unsupported reduce_window reducer: " + reducer_op->getName().getStringRef().str();
+    return std::nullopt;
+}
+
+std::vector<int64_t> optionalArrayOrOnes(
+    std::optional<llvm::ArrayRef<int64_t>> values,
+    size_t rank) {
+    if (values) {
+        return values->vec();
+    }
+    return std::vector<int64_t>(rank, 1);
+}
+
+bool reduceWindowPaddingVectors(
+    std::optional<mlir::DenseIntElementsAttr> padding,
+    size_t rank,
+    std::vector<int64_t>& low,
+    std::vector<int64_t>& high,
+    std::string& error) {
+    low.assign(rank, 0);
+    high.assign(rank, 0);
+    if (!padding) {
+        return true;
+    }
+    if (padding->getNumElements() != static_cast<int64_t>(rank * 2)) {
+        error = "reduce_window padding must have shape rank x 2";
+        return false;
+    }
+
+    size_t index = 0;
+    for (const llvm::APInt& value : padding->getValues<llvm::APInt>()) {
+        if (index % 2 == 0) {
+            low[index / 2] = value.getSExtValue();
+        } else {
+            high[index / 2] = value.getSExtValue();
+        }
+        ++index;
+    }
+    return true;
+}
+
+bool isSetScatter(mlir::stablehlo::ScatterOp scatter_op, std::string& error) {
+    if (scatter_op.getInputs().size() != 1 || scatter_op.getUpdates().size() != 1 ||
+        scatter_op->getNumResults() != 1) {
+        error = "scatter currently requires one operand, one update, and one result";
+        return false;
+    }
+
+    mlir::Region& body = scatter_op.getUpdateComputation();
+    if (!body.hasOneBlock()) {
+        error = "scatter update body must contain one block";
+        return false;
+    }
+    mlir::Block& block = body.front();
+    if (block.getNumArguments() != 2) {
+        error = "scatter set update body must take old and new scalar arguments";
+        return false;
+    }
+
+    mlir::Operation* return_operation = nullptr;
+    for (mlir::Operation& body_op : block) {
+        if (mlir::isa<mlir::stablehlo::ReturnOp>(body_op)) {
+            return_operation = &body_op;
+            continue;
+        }
+        error = "scatter currently only supports set update bodies";
+        return false;
+    }
+    if (!return_operation) {
+        error = "scatter update body must contain stablehlo.return";
+        return false;
+    }
+
+    auto return_op = mlir::cast<mlir::stablehlo::ReturnOp>(return_operation);
+    if (return_op.getNumOperands() != 1 || return_op.getOperand(0) != block.getArgument(1)) {
+        error = "scatter currently only supports update bodies that return the new value";
+        return false;
+    }
+    return true;
+}
+
 bool addTopKOp(
     mlir::Value operand,
     mlir::Value values,
@@ -1462,6 +1589,51 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
+        if (auto scatter_op = mlir::dyn_cast<mlir::stablehlo::ScatterOp>(op)) {
+            if (!isSetScatter(scatter_op, error)) {
+                return false;
+            }
+
+            mlir::Value operand = *scatter_op.getInputs().begin();
+            mlir::Value updates = *scatter_op.getUpdates().begin();
+            uint32_t operand_id = 0;
+            uint32_t start_indices_id = 0;
+            uint32_t updates_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(operand, executable, value_ids, error, operand_id) ||
+                !addValueDesc(scatter_op.getScatterIndices(), executable, value_ids, error, start_indices_id) ||
+                !addValueDesc(updates, executable, value_ids, error, updates_id) ||
+                !addValueDesc(scatter_op->getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto dims = scatter_op.getScatterDimensionNumbers();
+            auto* scatter = executable.add_ops();
+            scatter->set_output_id(output_id);
+            scatter->mutable_scatter()->set_operand_id(operand_id);
+            scatter->mutable_scatter()->set_start_indices_id(start_indices_id);
+            scatter->mutable_scatter()->set_updates_id(updates_id);
+            for (int64_t dim : dims.getUpdateWindowDims()) {
+                scatter->mutable_scatter()->add_update_window_dims(dim);
+            }
+            for (int64_t dim : dims.getInsertedWindowDims()) {
+                scatter->mutable_scatter()->add_inserted_window_dims(dim);
+            }
+            for (int64_t dim : dims.getInputBatchingDims()) {
+                scatter->mutable_scatter()->add_input_batching_dims(dim);
+            }
+            for (int64_t dim : dims.getScatterIndicesBatchingDims()) {
+                scatter->mutable_scatter()->add_scatter_indices_batching_dims(dim);
+            }
+            for (int64_t dim : dims.getScatterDimsToOperandDims()) {
+                scatter->mutable_scatter()->add_scatter_dims_to_operand_dims(dim);
+            }
+            scatter->mutable_scatter()->set_index_vector_dim(dims.getIndexVectorDim());
+            scatter->mutable_scatter()->set_indices_are_sorted(scatter_op.getIndicesAreSorted());
+            scatter->mutable_scatter()->set_unique_indices(scatter_op.getUniqueIndices());
+            continue;
+        }
+
         if (auto custom_call_op = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
             if (custom_call_op->getNumResults() != 1) {
                 error = "only single-result custom_call ops are currently supported";
@@ -1549,6 +1721,68 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 reduce->mutable_reduce()->add_dimensions(dim);
             }
             reduce->mutable_reduce()->set_reducer(*reducer);
+            continue;
+        }
+
+        if (auto reduce_window_op = mlir::dyn_cast<mlir::stablehlo::ReduceWindowOp>(op)) {
+            auto reducer = mapReduceWindowReducer(reduce_window_op, error);
+            if (!reducer) {
+                return false;
+            }
+
+            auto window_dimensions = reduce_window_op.getWindowDimensions().vec();
+            auto window_strides = optionalArrayOrOnes(
+                reduce_window_op.getWindowStrides(),
+                window_dimensions.size());
+            auto base_dilations = optionalArrayOrOnes(
+                reduce_window_op.getBaseDilations(),
+                window_dimensions.size());
+            auto window_dilations = optionalArrayOrOnes(
+                reduce_window_op.getWindowDilations(),
+                window_dimensions.size());
+            std::vector<int64_t> padding_low;
+            std::vector<int64_t> padding_high;
+            if (!reduceWindowPaddingVectors(
+                    reduce_window_op.getPadding(),
+                    window_dimensions.size(),
+                    padding_low,
+                    padding_high,
+                    error)) {
+                return false;
+            }
+
+            uint32_t input_id = 0;
+            uint32_t init_value_id = 0;
+            uint32_t output_id = 0;
+            if (!addValueDesc(*reduce_window_op.getInputs().begin(), executable, value_ids, error, input_id) ||
+                !addValueDesc(*reduce_window_op.getInitValues().begin(), executable, value_ids, error, init_value_id) ||
+                !addValueDesc(reduce_window_op->getResult(0), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            auto* reduce_window = executable.add_ops();
+            reduce_window->set_output_id(output_id);
+            reduce_window->mutable_reduce_window()->add_input_ids(input_id);
+            reduce_window->mutable_reduce_window()->add_init_value_ids(init_value_id);
+            for (int64_t value : window_dimensions) {
+                reduce_window->mutable_reduce_window()->add_window_dimensions(value);
+            }
+            for (int64_t value : window_strides) {
+                reduce_window->mutable_reduce_window()->add_window_strides(value);
+            }
+            for (int64_t value : base_dilations) {
+                reduce_window->mutable_reduce_window()->add_base_dilations(value);
+            }
+            for (int64_t value : window_dilations) {
+                reduce_window->mutable_reduce_window()->add_window_dilations(value);
+            }
+            for (int64_t value : padding_low) {
+                reduce_window->mutable_reduce_window()->add_padding_low(value);
+            }
+            for (int64_t value : padding_high) {
+                reduce_window->mutable_reduce_window()->add_padding_high(value);
+            }
+            reduce_window->mutable_reduce_window()->set_reducer(*reducer);
             continue;
         }
 
