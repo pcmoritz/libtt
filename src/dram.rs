@@ -156,16 +156,23 @@ static ALLOCATOR_STATE_BY_DEVICE: OnceLock<Mutex<HashMap<usize, DeviceAllocatorS
 impl Allocator {
     pub fn open(local_hardware_id: usize) -> io::Result<Self> {
         let (path, info) = load_device(local_hardware_id)?;
-        Self::from_device_with_path(path, &info)
+        Self::from_existing_device(path, info.local_hardware_id, &info.dram_tiles)
     }
 
     pub(crate) fn from_device(device: &Device) -> io::Result<Self> {
-        Self::from_device_with_path(device.path.clone(), device)
+        Self::from_existing_device(
+            device.path.clone(),
+            device.local_hardware_id,
+            &device.dram_tiles,
+        )
     }
 
-    fn from_device_with_path(path: PathBuf, device: &Device) -> io::Result<Self> {
-        let bank_tiles = device
-            .dram_tiles
+    pub(crate) fn from_existing_device(
+        path: PathBuf,
+        local_hardware_id: usize,
+        dram_tiles: &[DramTile],
+    ) -> io::Result<Self> {
+        let bank_tiles = dram_tiles
             .iter()
             .step_by(Dram::TILES_PER_BANK)
             .copied()
@@ -191,7 +198,7 @@ impl Allocator {
         Ok(Self {
             window,
             bank_tiles,
-            local_hardware_id: device.local_hardware_id,
+            local_hardware_id,
             bank_count,
         })
     }
