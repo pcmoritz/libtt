@@ -1247,6 +1247,39 @@ bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& 
     return true;
 }
 
+std::optional<uint32_t> packIntegerConstant(
+    mlir::IntegerType integer_type,
+    const llvm::APInt& bits,
+    std::string& error) {
+    unsigned width = integer_type.getWidth();
+    if (width <= 32) {
+        return static_cast<uint32_t>(bits.getZExtValue());
+    }
+    // The executable type system maps 64-bit StableHLO integers onto 32-bit
+    // runtime integer tensors, so only accept values that round-trip exactly.
+    if (width <= 64) {
+        if (integer_type.isUnsigned()) {
+            uint64_t value = bits.getZExtValue();
+            if (value <= std::numeric_limits<uint32_t>::max()) {
+                return static_cast<uint32_t>(value);
+            }
+            error = "unsigned 64-bit integer constant does not fit in the 32-bit executable type";
+            return std::nullopt;
+        }
+
+        int64_t value = bits.getSExtValue();
+        if (value >= std::numeric_limits<int32_t>::min() &&
+            value <= std::numeric_limits<int32_t>::max()) {
+            return static_cast<uint32_t>(static_cast<int32_t>(value));
+        }
+        error = "signed 64-bit integer constant does not fit in the 32-bit executable type";
+        return std::nullopt;
+    }
+
+    error = "only <=64-bit integer constants are currently supported";
+    return std::nullopt;
+}
+
 std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& error) {
     while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
         value = broadcast_op.getOperand();
@@ -1275,12 +1308,9 @@ std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& erro
         return bits.extractBitsAsZExtValue(32, 0);
     }
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
-        if (integer.getWidth() <= 32) {
-            auto bits = dense.getSplatValue<llvm::APInt>();
-            return static_cast<uint32_t>(bits.getZExtValue());
-        }
+        return packIntegerConstant(integer, dense.getSplatValue<llvm::APInt>(), error);
     }
-    error = "only bf16/f16/f32 and <=32-bit integer splat constants are currently supported";
+    error = "only bf16/f16/f32 and <=64-bit integer splat constants are currently supported";
     return std::nullopt;
 }
 
@@ -1322,18 +1352,20 @@ std::optional<std::vector<uint8_t>> denseConstantData(
     }
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
         unsigned width = integer.getWidth();
-        unsigned byte_count = width <= 8 ? 1 : width <= 16 ? 2 : width <= 32 ? 4 : 0;
+        unsigned byte_count = width <= 8 ? 1 : width <= 16 ? 2 : width <= 64 ? 4 : 0;
         if (byte_count == 0) {
-            error = "only <=32-bit integer dense constants are currently supported";
+            error = "only <=64-bit integer dense constants are currently supported";
             return std::nullopt;
         }
         for (const llvm::APInt& value : dense.getValues<llvm::APInt>()) {
-            appendLittleEndian(data, value.getZExtValue(), byte_count);
+            auto packed = packIntegerConstant(integer, value, error);
+            if (!packed) return std::nullopt;
+            appendLittleEndian(data, *packed, byte_count);
         }
         return data;
     }
 
-    error = "only bf16/f16/f32 and <=32-bit integer dense constants are currently supported";
+    error = "only bf16/f16/f32 and <=64-bit integer dense constants are currently supported";
     return std::nullopt;
 }
 
