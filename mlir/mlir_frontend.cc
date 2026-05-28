@@ -1,5 +1,6 @@
-#include <cstdlib>
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -116,6 +117,9 @@ tt::TensorDesc::ElementType mapProtoElementType(mlir::Type element_type) {
             case 32:
                 return integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U32
                                             : tt::TensorDesc::ELEMENT_TYPE_S32;
+            case 64:
+                return integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U32
+                                            : tt::TensorDesc::ELEMENT_TYPE_S32;
             default:
                 return tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
         }
@@ -194,6 +198,38 @@ bool fillProgramSignature(FuncOp func, tt::AnalysisResult& result, std::string& 
     return true;
 }
 
+std::optional<uint32_t> packIntegerConstant(
+    mlir::IntegerType integer_type,
+    const llvm::APInt& bits,
+    std::string& error) {
+    if (mapProtoElementType(integer_type) == tt::TensorDesc::ELEMENT_TYPE_UNKNOWN) {
+        error = "unsupported integer constant type";
+        return std::nullopt;
+    }
+    if (integer_type.getWidth() <= 32) {
+        return static_cast<uint32_t>(bits.getZExtValue());
+    }
+
+    // The executable type system maps 64-bit StableHLO integers onto 32-bit
+    // runtime integer tensors, so only accept values that round-trip exactly.
+    if (integer_type.isUnsigned()) {
+        uint64_t value = bits.getZExtValue();
+        if (value <= std::numeric_limits<uint32_t>::max()) {
+            return static_cast<uint32_t>(value);
+        }
+        error = "unsigned 64-bit integer constant does not fit in the 32-bit executable type";
+        return std::nullopt;
+    }
+
+    int64_t value = bits.getSExtValue();
+    if (value >= std::numeric_limits<int32_t>::min() &&
+        value <= std::numeric_limits<int32_t>::max()) {
+        return static_cast<uint32_t>(static_cast<int32_t>(value));
+    }
+    error = "signed 64-bit integer constant does not fit in the 32-bit executable type";
+    return std::nullopt;
+}
+
 std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& error) {
     while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
         value = broadcast_op.getOperand();
@@ -222,12 +258,65 @@ std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& erro
         return bits.extractBitsAsZExtValue(32, 0);
     }
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
-        if (integer.getWidth() <= 32) {
-            auto bits = dense.getSplatValue<llvm::APInt>();
-            return static_cast<uint32_t>(bits.getZExtValue());
-        }
+        return packIntegerConstant(integer, dense.getSplatValue<llvm::APInt>(), error);
     }
-    error = "only bf16/f16/f32 and <=32-bit integer splat constants are currently supported";
+    error = "only bf16/f16/f32 and <=64-bit integer splat constants are currently supported";
+    return std::nullopt;
+}
+
+void appendLittleEndian(std::vector<uint8_t>& data, uint64_t value, unsigned byte_count) {
+    for (unsigned index = 0; index < byte_count; ++index) {
+        data.push_back(static_cast<uint8_t>((value >> (index * 8)) & 0xff));
+    }
+}
+
+std::optional<std::vector<uint8_t>> denseConstantData(
+    mlir::Value value,
+    std::string& error) {
+    auto constant_op = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
+    if (!constant_op) {
+        error = "dense constants require a stablehlo.constant";
+        return std::nullopt;
+    }
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
+    if (!dense) {
+        error = "only dense constants are currently supported";
+        return std::nullopt;
+    }
+    auto element_type = dense.getElementType();
+    std::vector<uint8_t> data;
+    data.reserve(dense.getNumElements() * 4);
+    if (element_type.isBF16() || element_type.isF16()) {
+        for (const llvm::APFloat& value : dense.getValues<llvm::APFloat>()) {
+            auto bits = value.bitcastToAPInt();
+            appendLittleEndian(data, bits.extractBitsAsZExtValue(16, 0), 2);
+        }
+        return data;
+    }
+    if (element_type.isF32()) {
+        for (const llvm::APFloat& value : dense.getValues<llvm::APFloat>()) {
+            auto bits = value.bitcastToAPInt();
+            appendLittleEndian(data, bits.extractBitsAsZExtValue(32, 0), 4);
+        }
+        return data;
+    }
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
+        if (mapProtoElementType(integer) == tt::TensorDesc::ELEMENT_TYPE_UNKNOWN) {
+            error = "unsupported integer dense constant type";
+            return std::nullopt;
+        }
+        unsigned byte_count = std::min<unsigned>(
+            (integer.getWidth() + 7) / 8,
+            sizeof(uint32_t));
+        for (const llvm::APInt& value : dense.getValues<llvm::APInt>()) {
+            auto packed = packIntegerConstant(integer, value, error);
+            if (!packed) return std::nullopt;
+            appendLittleEndian(data, *packed, byte_count);
+        }
+        return data;
+    }
+
+    error = "only bf16/f16/f32 and <=64-bit integer dense constants are currently supported";
     return std::nullopt;
 }
 
@@ -289,6 +378,41 @@ void addConstantOp(tt::Executable& executable, uint32_t output_id, uint32_t pack
     auto* constant = executable.add_ops();
     constant->set_output_id(output_id);
     constant->mutable_constant()->set_packed_value(packed_value);
+}
+
+void addConstantDataOp(
+    tt::Executable& executable,
+    uint32_t output_id,
+    const std::vector<uint8_t>& data) {
+    auto* constant = executable.add_ops();
+    constant->set_output_id(output_id);
+    constant->mutable_constant()->set_data(data.data(), data.size());
+}
+
+bool addConstantValueOp(
+    mlir::Value value,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    uint32_t output_id = 0;
+    if (!addValueDesc(value, executable, value_ids, error, output_id)) {
+        return false;
+    }
+
+    std::string packed_error;
+    if (auto packed_value = packedConstantValue(value, packed_error)) {
+        addConstantOp(executable, output_id, *packed_value);
+        return true;
+    }
+
+    if (auto data = denseConstantData(value, error)) {
+        addConstantDataOp(executable, output_id, *data);
+        return true;
+    }
+    if (error.empty()) {
+        error = packed_error;
+    }
+    return false;
 }
 
 tt::FusedElementwiseOp::Node::CompareDirection mapCompareDirection(
@@ -1052,15 +1176,9 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto constant_op = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(op)) {
-            uint32_t output_id = 0;
-            if (!addValueDesc(constant_op.getResult(), executable, value_ids, error, output_id)) {
+            if (!addConstantValueOp(constant_op.getResult(), executable, value_ids, error)) {
                 return false;
             }
-            auto packed_value = packedConstantValue(constant_op.getResult(), error);
-            if (!packed_value) {
-                return false;
-            }
-            addConstantOp(executable, output_id, *packed_value);
             continue;
         }
 

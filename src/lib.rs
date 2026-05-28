@@ -1495,28 +1495,20 @@ fn select_value_input<'a>(
         };
         return Ok(kernels::select::SelectInput::Dram(dram_buffer));
     }
-    for op in &plan.ops {
-        if let executable::Op::Constant {
-            packed_value,
-            output_id,
-        } = op
-        {
-            if *output_id == value_id {
-                let desc = plan.values.get(index).ok_or_else(|| {
-                    invalid_argument(format!(
-                        "{field} constant value id {value_id} is out of bounds"
-                    ))
-                })?;
-                let dtype = pjrt_buffer_type_to_dtype(desc.element_type)?;
-                if dtype != expected_dtype {
-                    return Err(unimplemented(format!(
-                        "{field} constant value id {value_id} has type {:?}; expected {expected_dtype:?}",
-                        desc.element_type
-                    )));
-                }
-                return Ok(kernels::select::SelectInput::Constant(*packed_value));
-            }
+    if let Some(packed_value) = constant_packed_value(plan, value_id) {
+        let desc = plan.values.get(index).ok_or_else(|| {
+            invalid_argument(format!(
+                "{field} constant value id {value_id} is out of bounds"
+            ))
+        })?;
+        let dtype = pjrt_buffer_type_to_dtype(desc.element_type)?;
+        if dtype != expected_dtype {
+            return Err(unimplemented(format!(
+                "{field} constant value id {value_id} has type {:?}; expected {expected_dtype:?}",
+                desc.element_type
+            )));
         }
+        return Ok(kernels::select::SelectInput::Constant(packed_value));
     }
     Err(invalid_argument(format!(
         "{field} value id {value_id} is not available"
@@ -1575,6 +1567,62 @@ fn store_output_buffer(
         deleted: false,
     });
     Ok(())
+}
+
+fn splat_allocation_data(
+    dtype: DType,
+    packed_value: u32,
+    allocation_shape: &[usize],
+) -> Result<Vec<u8>, *mut PJRT_Error> {
+    let allocation_size = host_byte_size(dtype, allocation_shape)?;
+    let packed_bytes = packed_value.to_le_bytes();
+    let element = &packed_bytes[..dtype.bytes_per_element()];
+    let elements = allocation_size / element.len();
+    Ok(element.repeat(elements))
+}
+
+fn execute_constant(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    packed_value: u32,
+    logical_data: &[u8],
+    output_id: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable constant output id {output_id} is out of bounds"
+        ))
+    })?;
+    let dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    let logical_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
+    let data = if logical_data.is_empty() {
+        splat_allocation_data(dtype, packed_value, &allocation_shape)?
+    } else {
+        let logical_size = host_byte_size(dtype, &logical_shape)?;
+        if logical_data.len() != logical_size {
+            return Err(invalid_argument(format!(
+                "TT executable constant data size mismatch: expected {logical_size}, got {}",
+                logical_data.len()
+            )));
+        }
+        padded_host_data(logical_data, dtype, &logical_shape, &allocation_shape)?
+            .unwrap_or_else(|| logical_data.to_vec())
+    };
+    let output_dram = device
+        .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
+        .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "constant",
+    )
 }
 
 fn execute_reshape(
@@ -1708,6 +1756,23 @@ fn execute_fused_elementwise(
             "TT executable fused_elementwise root type {:?} does not match output type {:?}",
             root.element_type, output_desc.element_type
         )));
+    }
+
+    if let Some(executable::FusedElementwiseNode {
+        kind: executable::FusedElementwiseKind::Constant,
+        packed_value,
+        ..
+    }) = nodes.last()
+    {
+        return execute_constant(
+            values,
+            plan,
+            device,
+            context,
+            *packed_value,
+            &[],
+            output_id,
+        );
     }
 
     let mut inputs = Vec::with_capacity(input_ids.len());
@@ -2122,10 +2187,11 @@ fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option
     plan.ops.iter().find_map(|op| {
         if let executable::Op::Constant {
             packed_value,
+            data,
             output_id,
         } = op
         {
-            (*output_id == value_id).then_some(*packed_value)
+            (*output_id == value_id && data.is_empty()).then_some(*packed_value)
         } else {
             None
         }
@@ -2699,7 +2765,21 @@ fn execute_executable_v1(
                 dimension_numbers,
                 top_k_epilogue.as_ref(),
             )?,
-            executable::Op::Constant { .. } => {}
+            executable::Op::Constant {
+                packed_value,
+                data,
+                output_id,
+            } => {
+                execute_constant(
+                    &mut values,
+                    plan,
+                    device,
+                    output_context,
+                    *packed_value,
+                    data,
+                    *output_id,
+                )?;
+            }
             executable::Op::Select {
                 input_ids,
                 output_id,
@@ -4519,12 +4599,42 @@ mod tests {
                 let executable::Op::Constant {
                     packed_value,
                     output_id,
+                    ..
                 } = &executable.ops[0]
                 else {
                     panic!("predicate splat constant should lower to Constant");
                 };
                 assert_eq!(*output_id, 0);
                 assert_eq!(*packed_value, 1);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_dense_constant_payload() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main() -> tensor<2xi32> {
+    %0 = stablehlo.constant dense<[1, 2]> : tensor<2xi32>
+    return %0 : tensor<2xi32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![0]);
+                assert_eq!(executable.ops.len(), 1);
+                let executable::Op::Constant {
+                    packed_value,
+                    data,
+                    output_id,
+                } = &executable.ops[0]
+                else {
+                    panic!("dense constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 0);
+                assert_eq!(*packed_value, 0);
+                assert_eq!(data, &[1, 0, 0, 0, 2, 0, 0, 0]);
             },
         );
     }
@@ -5069,6 +5179,7 @@ mod tests {
                 let executable::Op::Constant {
                     packed_value,
                     output_id,
+                    ..
                 } = &executable.ops[0]
                 else {
                     panic!("converted scalar constant should lower to Constant");

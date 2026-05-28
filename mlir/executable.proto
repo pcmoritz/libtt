@@ -101,6 +101,8 @@ message ConstantOp {
   // 16-bit values are duplicated into both u32 halfwords; 32-bit and narrower
   // integer/predicate values use their raw low bits.
   uint32 packed_value = 1;
+  // Logical, row-major constant payload. Empty means use packed_value as a splat.
+  bytes data = 2;
 }
 
 message SelectOp {
