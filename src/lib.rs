@@ -1753,13 +1753,11 @@ fn execute_fused_elementwise(
             root.element_type, output_desc.element_type
         )));
     }
-    let folded_nodes = fold_fused_constant_nodes(nodes);
-    let effective_nodes = folded_nodes.as_slice();
     if let Some(executable::FusedElementwiseNode {
         kind: executable::FusedElementwiseKind::Constant,
         packed_value,
         ..
-    }) = effective_nodes.last()
+    }) = nodes.last()
     {
         return execute_constant(
             values,
@@ -1789,7 +1787,7 @@ fn execute_fused_elementwise(
     let output_dram = kernels::fused_eltwise::eltwise(
         device,
         &inputs,
-        effective_nodes,
+        nodes,
         &output_shape,
         "pjrt_fused_elementwise",
     )
@@ -2428,286 +2426,6 @@ fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option
             None
         }
     })
-}
-
-#[derive(Clone, Copy)]
-enum ConstantScalar {
-    F32(f32),
-    I32(i32),
-    U32(u32),
-    Bool(bool),
-}
-
-fn fold_fused_constant_nodes(
-    nodes: &[executable::FusedElementwiseNode],
-) -> Vec<executable::FusedElementwiseNode> {
-    let mut folded = nodes.to_vec();
-    let mut values = Vec::<Option<ConstantScalar>>::with_capacity(nodes.len());
-    for index in 0..folded.len() {
-        let value = fused_constant_node_value(&folded[index], |input_node| {
-            values.get(input_node as usize).copied().flatten()
-        });
-        if let Some(value) = value {
-            if let Some(packed_value) = scalar_to_packed(value, folded[index].element_type) {
-                folded[index].kind = executable::FusedElementwiseKind::Constant;
-                folded[index].input_nodes.clear();
-                folded[index].input_index = 0;
-                folded[index].packed_value = packed_value;
-                folded[index].single_tile_broadcast = false;
-            }
-        }
-        values.push(value);
-    }
-    folded
-}
-
-fn fused_constant_node_value<F>(
-    node: &executable::FusedElementwiseNode,
-    mut input_value: F,
-) -> Option<ConstantScalar>
-where
-    F: FnMut(u32) -> Option<ConstantScalar>,
-{
-    Some(match node.kind {
-        executable::FusedElementwiseKind::Input => return None,
-        executable::FusedElementwiseKind::Constant => {
-            scalar_from_packed(node.element_type, node.packed_value)?
-        }
-        executable::FusedElementwiseKind::Add => {
-            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            scalar_add(lhs, rhs, node.element_type)?
-        }
-        executable::FusedElementwiseKind::Subtract => {
-            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            scalar_subtract(lhs, rhs, node.element_type)?
-        }
-        executable::FusedElementwiseKind::Multiply => {
-            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            scalar_multiply(lhs, rhs, node.element_type)?
-        }
-        executable::FusedElementwiseKind::Divide => {
-            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            ConstantScalar::F32(lhs.as_f32()? / rhs.as_f32()?)
-        }
-        executable::FusedElementwiseKind::Power => {
-            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            ConstantScalar::F32(lhs.as_f32()?.powf(rhs.as_f32()?))
-        }
-        executable::FusedElementwiseKind::Max => {
-            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            ConstantScalar::F32(lhs.as_f32()?.max(rhs.as_f32()?))
-        }
-        executable::FusedElementwiseKind::Bitwise(_) => return None,
-        executable::FusedElementwiseKind::Compare(direction) => {
-            let [lhs, rhs] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            ConstantScalar::Bool(scalar_compare(lhs, rhs, direction)?)
-        }
-        executable::FusedElementwiseKind::Negate => {
-            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            match input {
-                ConstantScalar::F32(value) => ConstantScalar::F32(-value),
-                ConstantScalar::I32(value) => ConstantScalar::I32(value.wrapping_neg()),
-                _ => return None,
-            }
-        }
-        executable::FusedElementwiseKind::Exponential => {
-            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            ConstantScalar::F32(input.as_f32()?.exp())
-        }
-        executable::FusedElementwiseKind::Log => {
-            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            ConstantScalar::F32(input.as_f32()?.ln())
-        }
-        executable::FusedElementwiseKind::Rsqrt => {
-            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            ConstantScalar::F32(1.0 / input.as_f32()?.sqrt())
-        }
-        executable::FusedElementwiseKind::Cosine => {
-            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            ConstantScalar::F32(input.as_f32()?.cos())
-        }
-        executable::FusedElementwiseKind::Sine => {
-            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            ConstantScalar::F32(input.as_f32()?.sin())
-        }
-        executable::FusedElementwiseKind::Convert => {
-            let [input] = constant_input_values(&node.input_nodes, &mut input_value)?;
-            scalar_convert(input, node.element_type)?
-        }
-    })
-}
-
-impl ConstantScalar {
-    fn as_f32(self) -> Option<f32> {
-        match self {
-            Self::F32(value) => Some(value),
-            Self::I32(value) => Some(value as f32),
-            Self::U32(value) => Some(value as f32),
-            Self::Bool(value) => Some(u32::from(value) as f32),
-        }
-    }
-
-    fn as_i32(self) -> Option<i32> {
-        match self {
-            Self::I32(value) => Some(value),
-            Self::U32(value) => Some(value as i32),
-            Self::Bool(value) => Some(i32::from(value)),
-            Self::F32(value) => Some(value as i32),
-        }
-    }
-
-    fn as_u32(self) -> Option<u32> {
-        match self {
-            Self::U32(value) => Some(value),
-            Self::I32(value) => Some(value as u32),
-            Self::Bool(value) => Some(u32::from(value)),
-            Self::F32(value) => Some(value as u32),
-        }
-    }
-}
-
-fn constant_input_values<const N: usize, F>(
-    input_nodes: &[u32],
-    input_value: &mut F,
-) -> Option<[ConstantScalar; N]>
-where
-    F: FnMut(u32) -> Option<ConstantScalar>,
-{
-    let inputs: Vec<ConstantScalar> = input_nodes
-        .iter()
-        .map(|&input_node| input_value(input_node))
-        .collect::<Option<Vec<_>>>()?;
-    inputs.try_into().ok()
-}
-
-fn scalar_from_packed(element_type: PJRT_Buffer_Type, packed: u32) -> Option<ConstantScalar> {
-    match element_type {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 => Some(ConstantScalar::F32(f32::from_bits(packed))),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
-            Some(ConstantScalar::F32(f32::from_bits((packed & 0xffff) << 16)))
-        }
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(packed as i32)),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => Some(ConstantScalar::U32(packed)),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Some(ConstantScalar::U32(packed & 0xffff)),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 | PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => {
-            Some(ConstantScalar::Bool((packed & 0xff) != 0))
-        }
-        _ => None,
-    }
-}
-
-fn scalar_to_packed(value: ConstantScalar, element_type: PJRT_Buffer_Type) -> Option<u32> {
-    match element_type {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 => Some(value.as_f32()?.to_bits()),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
-            let bits = value.as_f32()?.to_bits() >> 16;
-            Some(bits | (bits << 16))
-        }
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(value.as_i32()? as u32),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => Some(value.as_u32()?),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => {
-            let bits = value.as_u32()? & 0xffff;
-            Some(bits | (bits << 16))
-        }
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 | PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => {
-            Some(u32::from(value.as_u32()? != 0))
-        }
-        _ => None,
-    }
-}
-
-fn scalar_add(
-    lhs: ConstantScalar,
-    rhs: ConstantScalar,
-    element_type: PJRT_Buffer_Type,
-) -> Option<ConstantScalar> {
-    match element_type {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 | PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
-            Some(ConstantScalar::F32(lhs.as_f32()? + rhs.as_f32()?))
-        }
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(
-            lhs.as_i32()?.wrapping_add(rhs.as_i32()?),
-        )),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => {
-            Some(ConstantScalar::U32(
-                lhs.as_u32()?.wrapping_add(rhs.as_u32()?),
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn scalar_subtract(
-    lhs: ConstantScalar,
-    rhs: ConstantScalar,
-    element_type: PJRT_Buffer_Type,
-) -> Option<ConstantScalar> {
-    match element_type {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 | PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
-            Some(ConstantScalar::F32(lhs.as_f32()? - rhs.as_f32()?))
-        }
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(
-            lhs.as_i32()?.wrapping_sub(rhs.as_i32()?),
-        )),
-        _ => None,
-    }
-}
-
-fn scalar_multiply(
-    lhs: ConstantScalar,
-    rhs: ConstantScalar,
-    element_type: PJRT_Buffer_Type,
-) -> Option<ConstantScalar> {
-    match element_type {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 | PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
-            Some(ConstantScalar::F32(lhs.as_f32()? * rhs.as_f32()?))
-        }
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(
-            lhs.as_i32()?.wrapping_mul(rhs.as_i32()?),
-        )),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => {
-            Some(ConstantScalar::U32(
-                lhs.as_u32()?.wrapping_mul(rhs.as_u32()?),
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn scalar_compare(
-    lhs: ConstantScalar,
-    rhs: ConstantScalar,
-    direction: executable::CompareDirection,
-) -> Option<bool> {
-    let lhs = lhs.as_f32()?;
-    let rhs = rhs.as_f32()?;
-    Some(match direction {
-        executable::CompareDirection::Eq => lhs == rhs,
-        executable::CompareDirection::Ne => lhs != rhs,
-        executable::CompareDirection::Ge => lhs >= rhs,
-        executable::CompareDirection::Gt => lhs > rhs,
-        executable::CompareDirection::Le => lhs <= rhs,
-        executable::CompareDirection::Lt => lhs < rhs,
-    })
-}
-
-fn scalar_convert(
-    value: ConstantScalar,
-    element_type: PJRT_Buffer_Type,
-) -> Option<ConstantScalar> {
-    match element_type {
-        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 | PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => {
-            Some(ConstantScalar::F32(value.as_f32()?))
-        }
-        PJRT_Buffer_Type::PJRT_Buffer_Type_S32 => Some(ConstantScalar::I32(value.as_i32()?)),
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U32 | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => {
-            Some(ConstantScalar::U32(value.as_u32()?))
-        }
-        PJRT_Buffer_Type::PJRT_Buffer_Type_U8 | PJRT_Buffer_Type::PJRT_Buffer_Type_PRED => {
-            Some(ConstantScalar::Bool(value.as_u32()? != 0))
-        }
-        _ => None,
-    }
 }
 
 fn execute_select(
@@ -3420,7 +3138,7 @@ fn execute_executable_v1(
                     &mut values,
                     plan,
                     device,
-                    &output_context,
+                    output_context,
                     *packed_value,
                     data,
                     *output_id,
@@ -5266,6 +4984,35 @@ mod tests {
                 };
                 assert_eq!(*output_id, 0);
                 assert_eq!(*packed_value, 1);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_dense_constant_payload() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main() -> tensor<2xi32> {
+    %0 = stablehlo.constant dense<[1, 2]> : tensor<2xi32>
+    return %0 : tensor<2xi32>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![0]);
+                assert_eq!(executable.ops.len(), 1);
+                let executable::Op::Constant {
+                    packed_value,
+                    data,
+                    output_id,
+                } = &executable.ops[0]
+                else {
+                    panic!("dense constant should lower to Constant");
+                };
+                assert_eq!(*output_id, 0);
+                assert_eq!(*packed_value, 0);
+                assert_eq!(data, &[1, 0, 0, 0, 2, 0, 0, 0]);
             },
         );
     }
