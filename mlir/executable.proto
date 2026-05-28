@@ -68,6 +68,9 @@ message ReduceOp {
     REDUCER_ADD = 0;
     REDUCER_MAX = 1;
     REDUCER_MUL = 2;
+    REDUCER_MIN = 3;
+    REDUCER_AND = 4;
+    REDUCER_OR = 5;
   }
 
   // Indices into Executable.values for this op's operands.

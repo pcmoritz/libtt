@@ -1760,15 +1760,7 @@ fn execute_fused_elementwise(
         ..
     }) = nodes.last()
     {
-        return execute_constant(
-            values,
-            plan,
-            device,
-            context,
-            *packed_value,
-            &[],
-            output_id,
-        );
+        return execute_constant(values, plan, device, context, *packed_value, &[], output_id);
     }
 
     let mut inputs = Vec::with_capacity(input_ids.len());
@@ -1900,14 +1892,74 @@ fn execute_reduce(
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let reduce_plan =
-        kernels::reduce::ReducePlan::new(dtype, &input_shape, &output_shape, dimensions, reducer)
-            .map_err(io_error)?;
-    if !reduce_init_is_supported(plan, *init_value_id, reducer) {
+    let (kernel_input_shape, kernel_output_shape, kernel_dimensions) =
+        if input_shape.len() == 1 && output_shape.is_empty() && dimensions == [0] {
+            (vec![1, input_shape[0]], vec![1], vec![1])
+        } else {
+            (
+                input_shape.clone(),
+                output_shape.clone(),
+                dimensions.to_vec(),
+            )
+        };
+    let bitwise_identity = if matches!(
+        reducer,
+        executable::ReduceReducer::And | executable::ReduceReducer::Or
+    ) {
+        Some(
+            constant_packed_value(plan, *init_value_id)
+                .and_then(|packed_value| {
+                    reduce_identity_from_packed(reducer, input_desc.element_type, packed_value)
+                })
+                .ok_or_else(|| {
+                    unimplemented(
+                        "TT executable bitwise reduce requires a supported constant identity init value",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    if bitwise_identity.is_none()
+        && !reduce_init_is_supported(plan, *init_value_id, reducer, input_desc.element_type)
+    {
         return Err(unimplemented(
             "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
         ));
     }
+    if let [dimension] = dimensions {
+        let reduce_dim = usize::try_from(*dimension).map_err(|_| {
+            invalid_argument(format!(
+                "TT executable reduce dimension {dimension} is negative"
+            ))
+        })?;
+        if input_shape.get(reduce_dim) == Some(&1) {
+            let input_allocation_shape =
+                dram::tiled_allocation_shape(&input_shape).map_err(io_error)?;
+            let output_allocation_shape =
+                dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+            if input_allocation_shape == output_allocation_shape {
+                return store_output_buffer(
+                    values,
+                    plan,
+                    output_id,
+                    output_desc.dims.clone(),
+                    input_dram.clone(),
+                    context,
+                    "reduce.alias",
+                );
+            }
+        }
+    }
+    let reduce_plan = kernels::reduce::ReducePlan::new(
+        dtype,
+        &kernel_input_shape,
+        &kernel_output_shape,
+        &kernel_dimensions,
+        reducer,
+        bitwise_identity,
+    )
+    .map_err(io_error)?;
     let output_dram = kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
         .map_err(io_error)?;
     store_output_buffer(
@@ -2071,7 +2123,7 @@ fn execute_matmul(
         }
 
         let matmul_shape = dims_i64_to_usize(&matmul_desc.dims)?;
-        let matmul_output = kernels::matmul::matmul_bf16_dot_general(
+        let matmul_output = kernels::matmul::matmul_dot_general(
             device,
             lhs_dram,
             rhs_dram,
@@ -2120,17 +2172,20 @@ fn execute_matmul(
         ))
     })?;
     let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
-    if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || !matches!(output_dtype, DType::Float16B | DType::Float32)
-    {
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let bf16_matmul = lhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        && rhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        && matches!(output_dtype, DType::Float16B | DType::Float32);
+    let f32_matmul = lhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+        && rhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+        && output_dtype == DType::Float32;
+    if !bf16_matmul && !f32_matmul {
         return Err(invalid_argument(format!(
-            "TT executable matmul requires bf16 inputs and bf16/f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
+            "TT executable matmul requires bf16 inputs with bf16/f32 output or f32 inputs with f32 output, got lhs={:?} rhs={:?} output={output_dtype:?}",
             lhs.buffer_type, rhs.buffer_type
         )));
     }
-    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let output_dram = kernels::matmul::matmul_bf16_dot_general(
+    let output_dram = kernels::matmul::matmul_dot_general(
         device,
         lhs_dram,
         rhs_dram,
@@ -2168,15 +2223,44 @@ fn reduce_init_is_supported(
     plan: &executable::Executable,
     init_value_id: u32,
     reducer: executable::ReduceReducer,
+    element_type: PJRT_Buffer_Type,
 ) -> bool {
     if let Some(packed_value) = constant_packed_value(plan, init_value_id) {
-        return match reducer {
-            executable::ReduceReducer::Add => packed_value == 0,
-            executable::ReduceReducer::Max => packed_value == f32::NEG_INFINITY.to_bits(),
-            executable::ReduceReducer::Mul => false,
-        };
+        return reduce_identity_from_packed(reducer, element_type, packed_value).is_some();
     }
     true
+}
+
+fn reduce_identity_from_packed(
+    reducer: executable::ReduceReducer,
+    element_type: PJRT_Buffer_Type,
+    packed_value: u32,
+) -> Option<u32> {
+    let dtype = utils::pjrt_buffer_type_to_dtype(element_type).ok()?;
+    let identity = if element_type == PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
+        && reducer == executable::ReduceReducer::And
+    {
+        1
+    } else {
+        kernels::reduce::reducer_identity_bits(reducer, dtype).ok()?
+    };
+    let mask = packed_identity_mask(element_type)?;
+    ((packed_value & mask) == (identity & mask)).then_some(identity)
+}
+
+fn packed_identity_mask(element_type: PJRT_Buffer_Type) -> Option<u32> {
+    match element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_PRED
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_S8
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_U8 => Some(0xff),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F16
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_U16 => Some(0xffff),
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_S32
+        | PJRT_Buffer_Type::PJRT_Buffer_Type_U32 => Some(u32::MAX),
+        _ => None,
+    }
 }
 
 fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option<u32> {
@@ -3218,7 +3302,10 @@ pub unsafe extern "C" fn TT_Device_MemoryStats(
     let Ok(device) = (unsafe { checked_ref(args.device, "device") }) else {
         return invalid_argument("device must not be null");
     };
-    let stats = allocator_stats(device.runtime.local_hardware_id, device.runtime.active_dram_banks);
+    let stats = allocator_stats(
+        device.runtime.local_hardware_id,
+        device.runtime.active_dram_banks,
+    );
     args.bytes_in_use = pjrt_i64(stats.bytes_in_use);
     args.peak_bytes_in_use = args.bytes_in_use;
     args.peak_bytes_in_use_is_set = true;

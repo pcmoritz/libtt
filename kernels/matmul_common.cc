@@ -115,18 +115,31 @@ void ensure_source_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile
   *loaded_tile = tile_id;
 }
 
+template <uint32_t DatumBytes>
 void copy_element_from_source(uint32_t cb_source, uint32_t dst_addr, uint32_t source_row,
                               uint32_t source_col, uint32_t dst_row, uint32_t dst_col) {
-  volatile tt_l1_ptr uint16_t *source =
-      reinterpret_cast<volatile tt_l1_ptr uint16_t *>(get_read_ptr(cb_source));
-  volatile tt_l1_ptr uint16_t *dst = reinterpret_cast<volatile tt_l1_ptr uint16_t *>(dst_addr);
-  dst[tile_element_index(dst_row, dst_col)] =
-      source[tile_element_index(source_row, source_col)];
+  const uint32_t dst_index = tile_element_index(dst_row, dst_col);
+  const uint32_t source_index = tile_element_index(source_row, source_col);
+  if constexpr (DatumBytes == sizeof(uint32_t)) {
+    volatile tt_l1_ptr uint32_t *source =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_read_ptr(cb_source));
+    volatile tt_l1_ptr uint32_t *dst =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t *>(dst_addr);
+    dst[dst_index] = source[source_index];
+  } else {
+    static_assert(DatumBytes == sizeof(uint16_t));
+    volatile tt_l1_ptr uint16_t *source =
+        reinterpret_cast<volatile tt_l1_ptr uint16_t *>(get_read_ptr(cb_source));
+    volatile tt_l1_ptr uint16_t *dst =
+        reinterpret_cast<volatile tt_l1_ptr uint16_t *>(dst_addr);
+    dst[dst_index] = source[source_index];
+  }
 }
 
-void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &view,
-                       uint32_t batch, uint32_t row_tile, uint32_t col_tile,
-                       uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
+template <uint32_t DatumBytes>
+void fill_generic_tile_impl(const InterleavedAddrGenFast<true> &input, const View &view,
+                            uint32_t batch, uint32_t row_tile, uint32_t col_tile,
+                            uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
   zero_tile_at(dst_addr, tile_bytes);
   uint32_t row_base = row_tile * TILE_R;
   uint32_t col_base = col_tile * TILE_C;
@@ -154,11 +167,24 @@ void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &vi
       uint32_t source_col = 0;
       uint32_t source_tile = tile_id_for_indices(view, indices, &source_row, &source_col);
       ensure_source_tile(input, source_tile, cb_source, &loaded_tile);
-      copy_element_from_source(cb_source, dst_addr, source_row, source_col, row, col);
+      copy_element_from_source<DatumBytes>(cb_source, dst_addr, source_row, source_col, row,
+                                           col);
     }
   }
   if (loaded_tile != INVALID_TILE) {
     cb_pop_front(cb_source, 1);
+  }
+}
+
+void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &view,
+                       uint32_t batch, uint32_t row_tile, uint32_t col_tile,
+                       uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
+  if (tile_bytes == sizeof(uint32_t) * TILE_R * TILE_C) {
+    fill_generic_tile_impl<sizeof(uint32_t)>(
+        input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
+  } else {
+    fill_generic_tile_impl<sizeof(uint16_t)>(
+        input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
   }
 }
 
@@ -172,10 +198,11 @@ struct TiledIndexMap {
   uint32_t source_col_dim;
 };
 
-void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const View &view,
-                               uint32_t batch, uint32_t row_tile, uint32_t col_tile,
-                               uint32_t dst_addr, uint32_t tile_bytes,
-                               uint32_t cb_source) {
+template <uint32_t DatumBytes>
+void fill_tiled_index_map_tile_impl(const InterleavedAddrGenFast<true> &input,
+                                    const View &view, uint32_t batch, uint32_t row_tile,
+                                    uint32_t col_tile, uint32_t dst_addr,
+                                    uint32_t tile_bytes, uint32_t cb_source) {
   zero_tile_at(dst_addr, tile_bytes);
   uint32_t row_base = row_tile * TILE_R;
   uint32_t col_base = col_tile * TILE_C;
@@ -202,9 +229,23 @@ void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const 
       if (row_base + row >= view.logical_rows) {
         continue;
       }
-      copy_element_from_source(cb_source, dst_addr, source_row, source_col + row, row, col);
+      copy_element_from_source<DatumBytes>(cb_source, dst_addr, source_row, source_col + row,
+                                           row, col);
     }
     cb_pop_front(cb_source, 1);
+  }
+}
+
+void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const View &view,
+                               uint32_t batch, uint32_t row_tile, uint32_t col_tile,
+                               uint32_t dst_addr, uint32_t tile_bytes,
+                               uint32_t cb_source) {
+  if (tile_bytes == sizeof(uint32_t) * TILE_R * TILE_C) {
+    fill_tiled_index_map_tile_impl<sizeof(uint32_t)>(
+        input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
+  } else {
+    fill_tiled_index_map_tile_impl<sizeof(uint16_t)>(
+        input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
   }
 }
 }  // namespace

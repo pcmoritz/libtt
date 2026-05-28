@@ -6,6 +6,7 @@ constexpr uint32_t TILE_R = 32;
 constexpr uint32_t TILE_C = 32;
 constexpr uint32_t FACE_R = 16;
 constexpr uint32_t FACE_C = 16;
+using Element = REDUCE_ELEMENT_TYPE;
 
 uint32_t tile_element_index(uint32_t row, uint32_t col) {
   uint32_t face_row = row / FACE_R;
@@ -31,11 +32,11 @@ void copy_reduced_tile(uint32_t reduced_l1_addr, uint32_t output_base_l1_addr,
                        uint32_t inner_output_tiles, uint32_t output_tile_offset,
                        uint32_t output_dim0, uint32_t output_dim1,
                        uint32_t output_tile_rows_per_prefix) {
-  volatile tt_l1_ptr uint32_t *reduced =
-      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(reduced_l1_addr);
-  volatile tt_l1_ptr uint32_t *output =
-      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(output_base_l1_addr);
-  uint32_t output_tile_elements = output_tile_size / sizeof(uint32_t);
+  volatile tt_l1_ptr Element *reduced =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(reduced_l1_addr);
+  volatile tt_l1_ptr Element *output =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(output_base_l1_addr);
+  uint32_t output_tile_elements = output_tile_size / sizeof(Element);
   uint32_t output_col_base = (global_group % inner_output_tiles) * TILE_C;
 
   uint32_t row_group = global_group / inner_output_tiles;
@@ -55,7 +56,9 @@ void copy_reduced_tile(uint32_t reduced_l1_addr, uint32_t output_base_l1_addr,
 
     uint32_t output_index =
         local_output_tile * output_tile_elements + tile_element_index(output_row % TILE_R, output_col % TILE_C);
-    output[output_index] = reduced[tile_element_index(0, col)];
+    uint32_t reduced_index = REDUCE_BLOCK_MAX_ROW ? tile_element_index(col, 0)
+                                                  : tile_element_index(0, col);
+    output[output_index] = reduced[reduced_index];
   }
 }
 

@@ -491,8 +491,17 @@ std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
     if (mlir::isa<mlir::stablehlo::MaxOp>(reducer_op)) {
         return tt::ReduceOp::REDUCER_MAX;
     }
+    if (mlir::isa<mlir::stablehlo::MinOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_MIN;
+    }
     if (mlir::isa<mlir::stablehlo::MulOp>(reducer_op)) {
         return tt::ReduceOp::REDUCER_MUL;
+    }
+    if (mlir::isa<mlir::stablehlo::AndOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_AND;
+    }
+    if (mlir::isa<mlir::stablehlo::OrOp>(reducer_op)) {
+        return tt::ReduceOp::REDUCER_OR;
     }
 
     error = "unsupported reduce reducer: " + reducer_op->getName().getStringRef().str();
@@ -526,6 +535,58 @@ bool addTopKOp(
     top_k->mutable_top_k()->set_operand_id(input_id);
     top_k->mutable_top_k()->set_indices_id(indices_id);
     top_k->mutable_top_k()->set_k(static_cast<uint32_t>(k));
+    return true;
+}
+
+bool isArgmaxReduceOp(mlir::stablehlo::ReduceOp reduce_op) {
+    if (reduce_op.getInputs().size() != 2 ||
+        reduce_op.getInitValues().size() != 2 ||
+        reduce_op->getNumResults() != 2 ||
+        reduce_op.getDimensions().size() != 1) {
+        return false;
+    }
+
+    int64_t reduce_dim = reduce_op.getDimensions()[0];
+    auto inputs = reduce_op.getInputs();
+    auto input_it = inputs.begin();
+    mlir::Value values_input = *input_it++;
+    mlir::Value indices_input = *input_it;
+    auto static_tensor_type = [](mlir::Value value) -> std::optional<mlir::RankedTensorType> {
+        auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+        if (!tensor || !tensor.hasStaticShape()) {
+            return std::nullopt;
+        }
+        return tensor;
+    };
+    auto input_type = static_tensor_type(values_input);
+    auto index_type = static_tensor_type(indices_input);
+    auto values_type = static_tensor_type(reduce_op->getResult(0));
+    auto indices_type = static_tensor_type(reduce_op->getResult(1));
+    auto input_element_type = input_type
+        ? mapProtoElementType(input_type->getElementType())
+        : tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
+    bool is_float_input =
+        input_element_type == tt::TensorDesc::ELEMENT_TYPE_BF16 ||
+        input_element_type == tt::TensorDesc::ELEMENT_TYPE_F16 ||
+        input_element_type == tt::TensorDesc::ELEMENT_TYPE_F32;
+    if (!input_type || !index_type || !values_type || !indices_type ||
+        input_type->getRank() == 0 ||
+        reduce_dim != input_type->getRank() - 1 ||
+        index_type->getShape() != input_type->getShape() ||
+        values_type->getShape() != indices_type->getShape() ||
+        !is_float_input ||
+        mapProtoElementType(index_type->getElementType()) != tt::TensorDesc::ELEMENT_TYPE_S32 ||
+        mapProtoElementType(indices_type->getElementType()) != tt::TensorDesc::ELEMENT_TYPE_S32 ||
+        mapProtoElementType(values_type->getElementType()) != input_element_type) {
+        return false;
+    }
+    if (input_type->getRank() == 2 && input_type->getShape()[0] != 1) {
+        return false;
+    }
+    if (input_type->getRank() > 2) {
+        return false;
+    }
+
     return true;
 }
 
@@ -1450,6 +1511,22 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto reduce_op = mlir::dyn_cast<mlir::stablehlo::ReduceOp>(op)) {
+            if (isArgmaxReduceOp(reduce_op)) {
+                auto inputs = reduce_op.getInputs();
+                mlir::Value values_input = *inputs.begin();
+                if (!addTopKOp(
+                        values_input,
+                        reduce_op->getResult(0),
+                        reduce_op->getResult(1),
+                        1,
+                        executable,
+                        value_ids,
+                        error)) {
+                    return false;
+                }
+                continue;
+            }
+
             auto reducer = mapReduceReducer(reduce_op, error);
             if (!reducer) {
                 return false;

@@ -168,7 +168,10 @@ pub(crate) enum CompareDirection {
 pub(crate) enum ReduceReducer {
     Add,
     Max,
+    Min,
     Mul,
+    And,
+    Or,
 }
 
 #[derive(Clone)]
@@ -254,7 +257,10 @@ fn parse_reduce_reducer(reducer: i32) -> Result<ReduceReducer, String> {
     {
         ProtoReduceReducer::Add => Ok(ReduceReducer::Add),
         ProtoReduceReducer::Max => Ok(ReduceReducer::Max),
+        ProtoReduceReducer::Min => Ok(ReduceReducer::Min),
         ProtoReduceReducer::Mul => Ok(ReduceReducer::Mul),
+        ProtoReduceReducer::And => Ok(ReduceReducer::And),
+        ProtoReduceReducer::Or => Ok(ReduceReducer::Or),
     }
 }
 
