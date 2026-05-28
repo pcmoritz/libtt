@@ -30,7 +30,6 @@ struct GatherShape {
     output_tile_rows: u32,
     output_tiles_per_row: u32,
     output_tiles: u32,
-    output_row_tile_count: u32,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -90,7 +89,6 @@ pub(crate) fn gather(
         start_indices,
         operand_shape,
         start_indices_shape,
-        output_shape,
         axis,
         dtype,
     )?;
@@ -104,10 +102,10 @@ pub(crate) fn gather(
         ))
     })?;
     let work_units = match shape.mode {
-        GatherMode::Bf16Rows => usize::try_from(shape.output_row_tile_count).map_err(|_| {
+        GatherMode::Bf16Rows => usize::try_from(shape.output_tile_rows).map_err(|_| {
             invalid_input(format!(
                 "gather output row tile count does not fit in usize: {}",
-                shape.output_row_tile_count
+                shape.output_tile_rows
             ))
         })?,
         GatherMode::Axis => output_tiles,
@@ -133,7 +131,6 @@ fn validate_gather_buffers(
     start_indices: &DramBuffer,
     operand_shape: &[usize],
     start_indices_shape: &[usize],
-    output_shape: &[usize],
     axis: usize,
     dtype: DType,
 ) -> io::Result<()> {
@@ -163,15 +160,6 @@ fn validate_gather_buffers(
         )));
     }
 
-    let mut expected_output_shape = operand_shape.to_vec();
-    expected_output_shape[axis] = start_indices_shape[0];
-    if output_shape != expected_output_shape {
-        return Err(invalid_input(format!(
-            "gather output shape mismatch: expected {:?}, got {:?}",
-            expected_output_shape, output_shape
-        )));
-    }
-
     validate_allocation(operand, operand_shape, "gather operand")?;
     validate_allocation(start_indices, start_indices_shape, "gather start_indices")?;
     Ok(())
@@ -192,12 +180,23 @@ fn gather_shape(
     } else {
         GatherMode::Axis
     };
+    let (kernel_operand_shape, kernel_output_shape, kernel_axis) = match mode {
+        GatherMode::Bf16Rows => (operand_shape.to_vec(), output_shape.to_vec(), axis),
+        GatherMode::Axis => {
+            let padded_rank = operand_shape.len().max(3);
+            (
+                pad_rank(operand_shape, padded_rank),
+                pad_rank(output_shape, padded_rank),
+                axis + padded_rank - operand_shape.len(),
+            )
+        }
+    };
 
     Ok(GatherShape {
         mode,
-        axis: u32_arg(axis, "gather axis")?,
-        operand_shape: u32_shape(operand_shape, "gather operand shape")?,
-        output_shape: u32_shape(output_shape, "gather output shape")?,
+        axis: u32_arg(kernel_axis, "gather axis")?,
+        operand_shape: u32_shape(&kernel_operand_shape, "gather operand shape")?,
+        output_shape: u32_shape(&kernel_output_shape, "gather output shape")?,
         operand_tile_rows: u32_arg(
             operand_allocation_shape[operand_rank - 2] / TILE_R,
             "gather operand tile rows",
@@ -218,11 +217,13 @@ fn gather_shape(
             tiled_shape_tile_count(output_shape)?,
             "gather output tile count",
         )?,
-        output_row_tile_count: u32_arg(
-            output_allocation_shape[output_rank - 2] / TILE_R,
-            "gather output row tile count",
-        )?,
     })
+}
+
+fn pad_rank(shape: &[usize], rank: usize) -> Vec<usize> {
+    let mut padded = vec![1; rank - shape.len()];
+    padded.extend_from_slice(shape);
+    padded
 }
 
 fn validate_allocation(buffer: &DramBuffer, logical_shape: &[usize], name: &str) -> io::Result<()> {
@@ -254,7 +255,7 @@ fn gather_program(key: GatherProgramKey) -> io::Result<Program> {
         GatherMode::Bf16Rows => {
             for (core_index, &core) in key.cores.iter().enumerate() {
                 let (offset, row_tiles) =
-                    split_tile_range(key.shape.output_row_tile_count, core_index, key.cores.len())?;
+                    split_tile_range(key.shape.output_tile_rows, core_index, key.cores.len())?;
                 runtime_args.add_core(
                     core,
                     vec![
@@ -426,6 +427,24 @@ mod tests {
 
         assert_eq!(program.runtime_args.section_sizes(), (12, 16, 0));
         assert!(program.reader_kernel.contains("#define GATHER_BF16_ROWS 0"));
-        assert!(program.reader_kernel.contains("#define GATHER_AXIS 0"));
+        assert!(program.reader_kernel.contains("#define GATHER_RANK 3"));
+        assert!(program.reader_kernel.contains("#define GATHER_AXIS 1"));
+    }
+
+    #[test]
+    fn gather_program_pads_rank1_axis_shape() {
+        let shape = gather_shape(&[8], &[2], 0, DType::Float32).expect("gather shape");
+        let program = gather_program(GatherProgramKey {
+            cores: vec![CoreCoord { x: 1, y: 2 }],
+            dtype: DType::Float32,
+            shape,
+        })
+        .expect("gather program");
+
+        assert!(program.reader_kernel.contains("#define GATHER_RANK 3"));
+        assert!(program.reader_kernel.contains("#define GATHER_AXIS 2"));
+        assert!(program
+            .reader_kernel
+            .contains("#define GATHER_OPERAND_SHAPE {1u, 1u, 8u}"));
     }
 }

@@ -2616,7 +2616,6 @@ fn execute_gather(
             "TT executable gather currently only supports s32 start_indices",
         ));
     }
-
     let operand_shape = dims_i64_to_usize(&operand.dims)?;
     let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
@@ -5072,6 +5071,44 @@ mod tests {
                 assert_eq!(dimension_numbers.start_index_map, vec![0]);
                 assert_eq!(dimension_numbers.index_vector_dim, 1);
                 assert_eq!(*slice_sizes, vec![1, 8]);
+                assert!(!indices_are_sorted);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_axis_gather() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x4x8xbf16>, %arg1: tensor<3x1xi32>) -> tensor<2x3x8xbf16> {
+    %0 = "stablehlo.gather"(%arg0, %arg1) <{dimension_numbers = #stablehlo.gather<offset_dims = [0, 2], collapsed_slice_dims = [1], start_index_map = [1], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 2, 1, 8>}> : (tensor<2x4x8xbf16>, tensor<3x1xi32>) -> tensor<2x3x8xbf16>
+    return %0 : tensor<2x3x8xbf16>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![2]);
+                assert_eq!(executable.ops.len(), 3);
+                let executable::Op::Gather {
+                    input_ids,
+                    output_id,
+                    dimension_numbers,
+                    slice_sizes,
+                    indices_are_sorted,
+                } = &executable.ops[2]
+                else {
+                    panic!("axis gather should lower to Gather");
+                };
+                assert_eq!(*input_ids, [0, 1]);
+                assert_eq!(*output_id, 2);
+                assert_eq!(dimension_numbers.offset_dims, vec![0, 2]);
+                assert_eq!(dimension_numbers.collapsed_slice_dims, vec![1]);
+                assert!(dimension_numbers.operand_batching_dims.is_empty());
+                assert!(dimension_numbers.start_indices_batching_dims.is_empty());
+                assert_eq!(dimension_numbers.start_index_map, vec![1]);
+                assert_eq!(dimension_numbers.index_vector_dim, 1);
+                assert_eq!(*slice_sizes, vec![2, 1, 8]);
                 assert!(!indices_are_sorted);
             },
         );

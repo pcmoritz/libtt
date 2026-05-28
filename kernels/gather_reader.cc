@@ -10,7 +10,8 @@ constexpr uint32_t INVALID_TILE = 0xffffffffu;
 constexpr bool BF16_ROWS = GATHER_BF16_ROWS != 0;
 constexpr uint32_t RANK = GATHER_RANK;
 constexpr uint32_t AXIS = GATHER_AXIS;
-constexpr uint32_t COORD_COUNT = RANK == 0 ? 1 : RANK;
+static_assert(RANK >= 2, "gather reader expects shapes padded to at least rank 2");
+constexpr uint32_t COORD_COUNT = RANK;
 constexpr uint32_t OPERAND_SHAPE[COORD_COUNT] = GATHER_OPERAND_SHAPE;
 constexpr uint32_t OUTPUT_SHAPE[COORD_COUNT] = GATHER_OUTPUT_SHAPE;
 constexpr uint32_t OPERAND_TILE_ROWS = GATHER_OPERAND_TILE_ROWS;
@@ -64,49 +65,37 @@ void decode_batch(uint32_t batch, const uint32_t shape[COORD_COUNT],
   for (uint32_t dim = 0; dim < RANK; ++dim) {
     coords[dim] = 0;
   }
-  if constexpr (RANK >= 3) {
-    for (uint32_t index = 0; index < RANK - 2; ++index) {
-      uint32_t dim = RANK - 3 - index;
-      coords[dim] = batch % shape[dim];
-      batch /= shape[dim];
-    }
+  for (uint32_t index = 0; index < RANK - 2; ++index) {
+    uint32_t dim = RANK - 3 - index;
+    coords[dim] = batch % shape[dim];
+    batch /= shape[dim];
   }
 }
 
 uint32_t output_coord(uint32_t dim, const uint32_t base_coords[COORD_COUNT],
                       uint32_t output_row, uint32_t output_col) {
-  if constexpr (RANK == 1) {
+  if (dim == RANK - 1) {
     return output_col;
-  } else {
-    if (dim == RANK - 1) {
-      return output_col;
-    }
-    if (dim == RANK - 2) {
-      return output_row;
-    }
-    return base_coords[dim];
   }
+  if (dim == RANK - 2) {
+    return output_row;
+  }
+  return base_coords[dim];
 }
 
 Location tensor_location(const uint32_t shape[COORD_COUNT], uint32_t tile_rows,
                          uint32_t tiles_per_row,
                          const uint32_t coords[COORD_COUNT]) {
-  if constexpr (RANK == 1) {
-    return Location{coords[0] / TILE_C, 0, coords[0] % TILE_C};
-  } else {
-    uint32_t batch = 0;
-    if constexpr (RANK >= 3) {
-      for (uint32_t dim = 0; dim < RANK - 2; ++dim) {
-        batch = batch * shape[dim] + coords[dim];
-      }
-    }
-    uint32_t row = coords[RANK - 2];
-    uint32_t col = coords[RANK - 1];
-    uint32_t tile_row = row / TILE_R;
-    uint32_t tile_col = col / TILE_C;
-    uint32_t tile = (batch * tile_rows + tile_row) * tiles_per_row + tile_col;
-    return Location{tile, row % TILE_R, col % TILE_C};
+  uint32_t batch = 0;
+  for (uint32_t dim = 0; dim < RANK - 2; ++dim) {
+    batch = batch * shape[dim] + coords[dim];
   }
+  uint32_t row = coords[RANK - 2];
+  uint32_t col = coords[RANK - 1];
+  uint32_t tile_row = row / TILE_R;
+  uint32_t tile_col = col / TILE_C;
+  uint32_t tile = (batch * tile_rows + tile_row) * tiles_per_row + tile_col;
+  return Location{tile, row % TILE_R, col % TILE_C};
 }
 
 void ensure_tile(const InterleavedAddrGenFast<true> &input, uint32_t requested_tile,
@@ -154,6 +143,8 @@ void copy_bf16_row(uint32_t source_l1_addr, uint32_t output_l1_addr, uint32_t so
   }
 }
 
+// Embedding lookup is a hot LLM path: rank-2 BF16 row gathers can copy a whole
+// tile row from one operand tile instead of doing per-element coordinate decode.
 void run_bf16_rows_gather(const InterleavedAddrGenFast<true> &operand,
                           const InterleavedAddrGenFast<true> &start_indices) {
   uint32_t output_row_tile_offset = get_arg_val<uint32_t>(2);
@@ -226,15 +217,8 @@ void run_axis_gather(const InterleavedAddrGenFast<true> &operand,
     uint32_t output_tile_col = output_matrix_tile % OUTPUT_TILES_PER_ROW;
     uint32_t output_row_base = output_tile_row * TILE_R;
     uint32_t output_col_base = output_tile_col * TILE_C;
-    uint32_t row_count = 1;
-    uint32_t col_count = 1;
-
-    if constexpr (RANK == 1) {
-      col_count = tile_extent(OUTPUT_SHAPE[0], output_col_base, TILE_C);
-    } else {
-      row_count = tile_extent(OUTPUT_SHAPE[RANK - 2], output_row_base, TILE_R);
-      col_count = tile_extent(OUTPUT_SHAPE[RANK - 1], output_col_base, TILE_C);
-    }
+    uint32_t row_count = tile_extent(OUTPUT_SHAPE[RANK - 2], output_row_base, TILE_R);
+    uint32_t col_count = tile_extent(OUTPUT_SHAPE[RANK - 1], output_col_base, TILE_C);
 
     uint32_t base_coords[COORD_COUNT];
     decode_batch(output_batch, OUTPUT_SHAPE, base_coords);
