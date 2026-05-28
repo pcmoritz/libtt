@@ -87,14 +87,6 @@ bool isInitializerCallee(llvm::StringRef callee) {
     return callee.starts_with("_normal") || callee.starts_with("_uniform");
 }
 
-void eraseInitializerCalleeBodies(mlir::ModuleOp module) {
-    module.walk([&](FuncOp func) {
-        if (isInitializerCallee(func.getName()) && !func.isExternal()) {
-            func.eraseBody();
-        }
-    });
-}
-
 std::optional<mlir::Value> createCaseIndexConstant(
     mlir::OpBuilder& builder,
     mlir::Location loc,
@@ -1078,7 +1070,6 @@ bool lowerCaseOpsToSelects(mlir::ModuleOp module, std::string& error) {
 }
 
 bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module, std::string& error) {
-    eraseInitializerCalleeBodies(module);
     mlir::PassManager pm(&context);
     pm.addPass(mlir::createInlinerPass());
     pm.addPass(mlir::createCanonicalizerPass());
@@ -1474,21 +1465,6 @@ std::optional<uint32_t> foldedPackedConstantValue(mlir::Value value) {
         return fold_binary(op, [](uint32_t lhs, uint32_t rhs) {
             return rhs >= 32 ? 0 : lhs << rhs;
         });
-    }
-
-    if (auto concatenate_op = value.getDefiningOp<mlir::stablehlo::ConcatenateOp>()) {
-        if (concatenate_op.getInputs().empty()) {
-            return std::nullopt;
-        }
-        for (mlir::Value input : concatenate_op.getInputs()) {
-            if (!foldedPackedConstantValue(input)) {
-                return std::nullopt;
-            }
-        }
-        // Keep constants representable by the current splat ConstantOp.  This is
-        // sufficient for PRNG key materialization; random initializers are lowered
-        // to zero tensors below.
-        return foldedPackedConstantValue(concatenate_op.getInputs().front());
     }
 
     return std::nullopt;
@@ -2265,63 +2241,6 @@ struct FusedElementwisePlan {
     llvm::DenseSet<mlir::Operation*> covered_ops;
 };
 
-struct SpecialConstantPlan {
-    llvm::DenseMap<mlir::Operation*, uint32_t> roots;
-    llvm::DenseSet<mlir::Operation*> covered_ops;
-};
-
-bool isUi32Vector2(mlir::Value value) {
-    auto tensor = getStaticTensorType(value);
-    if (!tensor || tensor->getRank() != 1 || tensor->getShape()[0] != 2) {
-        return false;
-    }
-    auto integer = mlir::dyn_cast<mlir::IntegerType>(tensor->getElementType());
-    return integer && integer.getWidth() == 32 && integer.isUnsigned();
-}
-
-void collectProducerOps(mlir::Value value, llvm::DenseSet<mlir::Operation*>& covered_ops) {
-    mlir::Operation* defining_op = value.getDefiningOp();
-    if (!defining_op) {
-        return;
-    }
-    if (!covered_ops.insert(defining_op).second) {
-        return;
-    }
-    for (mlir::Value operand : defining_op->getOperands()) {
-        collectProducerOps(operand, covered_ops);
-    }
-}
-
-bool isDummyInitializerCall(mlir::func::CallOp call_op) {
-    return call_op->getNumResults() == 1 && isInitializerCallee(call_op.getCallee());
-}
-
-SpecialConstantPlan buildSpecialConstantPlan(FuncOp func) {
-    SpecialConstantPlan plan;
-    for (mlir::Operation& op : func.front()) {
-        if (auto concatenate_op = mlir::dyn_cast<mlir::stablehlo::ConcatenateOp>(op);
-            concatenate_op && isUi32Vector2(concatenate_op.getResult())) {
-            plan.roots.try_emplace(&op, 0);
-            plan.covered_ops.insert(&op);
-            for (mlir::Value input : concatenate_op.getInputs()) {
-                collectProducerOps(input, plan.covered_ops);
-            }
-            continue;
-        }
-
-        if (auto call_op = mlir::dyn_cast<mlir::func::CallOp>(op);
-            call_op && isDummyInitializerCall(call_op)) {
-            plan.roots.try_emplace(&op, 0);
-            plan.covered_ops.insert(&op);
-            for (mlir::Value operand : call_op->getOperands()) {
-                collectProducerOps(operand, plan.covered_ops);
-            }
-            continue;
-        }
-    }
-    return plan;
-}
-
 FusedElementwisePlan buildFusedElementwisePlan(FuncOp func) {
     FusedElementwisePlan plan;
 
@@ -2663,7 +2582,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     }
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
-    auto special_constants = buildSpecialConstantPlan(func);
     auto fused_elementwise = buildFusedElementwisePlan(func);
     llvm::DenseSet<mlir::Operation*> matmul_top_k_covered_ops;
 
@@ -2689,32 +2607,16 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
-        auto special_constant = special_constants.roots.find(&op);
-        if (special_constant != special_constants.roots.end()) {
-            uint32_t output_id = 0;
-            if (!addValueDesc(op.getResult(0), executable, value_ids, error, output_id)) {
-                return false;
-            }
-            addConstantOp(executable, output_id, special_constant->second);
-            continue;
-        }
-        if (special_constants.covered_ops.contains(&op)) {
-            continue;
-        }
-
         if (op.getNumResults() == 1 &&
             addFoldedConstantOp(op.getResult(0), executable, value_ids, error)) {
             continue;
         }
 
         if (auto call_op = mlir::dyn_cast<mlir::func::CallOp>(op)) {
-            if (isDummyInitializerCall(call_op)) {
-                uint32_t output_id = 0;
-                if (!addValueDesc(call_op.getResult(0), executable, value_ids, error, output_id)) {
-                    return false;
-                }
-                addConstantOp(executable, output_id, 0);
-                continue;
+            if (isInitializerCallee(call_op.getCallee())) {
+                error = "random initializer call " + call_op.getCallee().str() +
+                        " reached executable lowering; compile the model apply path with real weights instead of initializer code";
+                return false;
             }
         }
 
