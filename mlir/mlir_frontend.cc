@@ -86,7 +86,27 @@ bool isInitializerCallee(llvm::StringRef callee) {
     return callee.starts_with("_normal") || callee.starts_with("_uniform");
 }
 
-bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module) {
+bool rejectInitializerCalls(mlir::ModuleOp module, std::string& error) {
+    mlir::func::CallOp initializer_call;
+    auto walk = module.walk([&](mlir::func::CallOp call_op) {
+        if (!isInitializerCallee(call_op.getCallee())) {
+            return mlir::WalkResult::advance();
+        }
+        initializer_call = call_op;
+        return mlir::WalkResult::interrupt();
+    });
+    if (!walk.wasInterrupted()) {
+        return true;
+    }
+    error = "random initializer call " + initializer_call.getCallee().str() +
+            " reached executable lowering; compile the model apply path with real weights instead of initializer code";
+    return false;
+}
+
+bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module, std::string& error) {
+    if (!rejectInitializerCalls(module, error)) {
+        return false;
+    }
     mlir::PassManager pm(&context);
     pm.addPass(mlir::createInlinerPass());
     pm.addPass(mlir::createCanonicalizerPass());
@@ -1622,10 +1642,14 @@ extern "C" bool TT_MlirAnalyzeProgram(
             "failed to parse StableHLO/MLIR program"), alloc_output, user_data);
     }
 
-    if (!runCleanupPasses(context, *module)) {
+    std::string error;
+    if (!runCleanupPasses(context, *module, error)) {
+        auto status = error.empty()
+            ? tt::AnalysisResult::STATUS_INTERNAL_ERROR
+            : tt::AnalysisResult::STATUS_UNSUPPORTED;
         return emitResult(makeResult(
-            tt::AnalysisResult::STATUS_INTERNAL_ERROR,
-            "failed to run MLIR cleanup passes"), alloc_output, user_data);
+            status,
+            error.empty() ? "failed to run MLIR cleanup passes" : error), alloc_output, user_data);
     }
 
     auto entry = findEntryFunction(*module);
@@ -1639,7 +1663,6 @@ extern "C" bool TT_MlirAnalyzeProgram(
     tt::AnalysisResult result;
     result.set_status(tt::AnalysisResult::STATUS_OK);
 
-    std::string error;
     if (!fillProgramSignature(*entry, result, error)) {
         return emitResult(
             makeResult(tt::AnalysisResult::STATUS_UNSUPPORTED, error),
