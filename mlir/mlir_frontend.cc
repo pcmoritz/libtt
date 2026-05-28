@@ -100,53 +100,29 @@ std::optional<FuncOp> findEntryFunction(mlir::ModuleOp module) {
     return entry;
 }
 
-struct IntegerRuntimeType {
-    tt::TensorDesc::ElementType element_type;
-    unsigned storage_bytes;
-    bool narrows_to_32_bits;
-};
-
-std::optional<IntegerRuntimeType> integerRuntimeType(mlir::IntegerType integer) {
-    switch (integer.getWidth()) {
-        case 1:
-            return IntegerRuntimeType{tt::TensorDesc::ELEMENT_TYPE_PRED, 1, false};
-        case 8:
-            return IntegerRuntimeType{
-                integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U8
-                                     : tt::TensorDesc::ELEMENT_TYPE_S8,
-                1,
-                false};
-        case 16:
-            if (integer.isUnsigned()) {
-                return IntegerRuntimeType{tt::TensorDesc::ELEMENT_TYPE_U16, 2, false};
-            }
-            return std::nullopt;
-        case 32:
-            return IntegerRuntimeType{
-                integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U32
-                                     : tt::TensorDesc::ELEMENT_TYPE_S32,
-                4,
-                false};
-        case 64:
-            return IntegerRuntimeType{
-                integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U32
-                                     : tt::TensorDesc::ELEMENT_TYPE_S32,
-                4,
-                true};
-        default:
-            return std::nullopt;
-    }
-}
-
 tt::TensorDesc::ElementType mapProtoElementType(mlir::Type element_type) {
     if (element_type.isBF16()) return tt::TensorDesc::ELEMENT_TYPE_BF16;
     if (element_type.isF16()) return tt::TensorDesc::ELEMENT_TYPE_F16;
     if (element_type.isF32()) return tt::TensorDesc::ELEMENT_TYPE_F32;
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
-        if (auto runtime_type = integerRuntimeType(integer)) {
-            return runtime_type->element_type;
+        switch (integer.getWidth()) {
+            case 1:
+                return tt::TensorDesc::ELEMENT_TYPE_PRED;
+            case 8:
+                return integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U8
+                                            : tt::TensorDesc::ELEMENT_TYPE_S8;
+            case 16:
+                return integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U16
+                                            : tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
+            case 32:
+                return integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U32
+                                            : tt::TensorDesc::ELEMENT_TYPE_S32;
+            case 64:
+                return integer.isUnsigned() ? tt::TensorDesc::ELEMENT_TYPE_U32
+                                            : tt::TensorDesc::ELEMENT_TYPE_S32;
+            default:
+                return tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
         }
-        return tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
     }
     return tt::TensorDesc::ELEMENT_TYPE_UNKNOWN;
 }
@@ -226,12 +202,11 @@ std::optional<uint32_t> packIntegerConstant(
     mlir::IntegerType integer_type,
     const llvm::APInt& bits,
     std::string& error) {
-    auto runtime_type = integerRuntimeType(integer_type);
-    if (!runtime_type) {
+    if (mapProtoElementType(integer_type) == tt::TensorDesc::ELEMENT_TYPE_UNKNOWN) {
         error = "unsupported integer constant type";
         return std::nullopt;
     }
-    if (!runtime_type->narrows_to_32_bits) {
+    if (integer_type.getWidth() <= 32) {
         return static_cast<uint32_t>(bits.getZExtValue());
     }
 
@@ -326,15 +301,17 @@ std::optional<std::vector<uint8_t>> denseConstantData(
         return data;
     }
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element_type)) {
-        auto runtime_type = integerRuntimeType(integer);
-        if (!runtime_type) {
+        if (mapProtoElementType(integer) == tt::TensorDesc::ELEMENT_TYPE_UNKNOWN) {
             error = "unsupported integer dense constant type";
             return std::nullopt;
         }
+        unsigned byte_count = std::min<unsigned>(
+            (integer.getWidth() + 7) / 8,
+            sizeof(uint32_t));
         for (const llvm::APInt& value : dense.getValues<llvm::APInt>()) {
             auto packed = packIntegerConstant(integer, value, error);
             if (!packed) return std::nullopt;
-            appendLittleEndian(data, *packed, runtime_type->storage_bytes);
+            appendLittleEndian(data, *packed, byte_count);
         }
         return data;
     }
