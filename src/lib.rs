@@ -2511,18 +2511,6 @@ fn execute_gather(
     dimension_numbers: &executable::GatherDimensionNumbers,
     slice_sizes: &[i64],
 ) -> Result<(), *mut PJRT_Error> {
-    if dimension_numbers.offset_dims.as_slice() != [1]
-        || dimension_numbers.collapsed_slice_dims.as_slice() != [0]
-        || !dimension_numbers.operand_batching_dims.is_empty()
-        || !dimension_numbers.start_indices_batching_dims.is_empty()
-        || dimension_numbers.start_index_map.as_slice() != [0]
-        || dimension_numbers.index_vector_dim != 1
-    {
-        return Err(unimplemented(
-            "TT executable gather currently only supports rank-2 row gathers",
-        ));
-    }
-
     let operand = device_buffer_for_value(values, input_ids[0], "gather.operand")?.clone();
     let start_indices =
         device_buffer_for_value(values, input_ids[1], "gather.start_indices")?.clone();
@@ -2531,28 +2519,8 @@ fn execute_gather(
             "TT executable gather currently only supports s32 start_indices",
         ));
     }
-    if operand.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
-        return Err(unimplemented(
-            "TT executable gather currently only supports bf16 operands",
-        ));
-    }
-
     let operand_shape = dims_i64_to_usize(&operand.dims)?;
     let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
-    if operand_shape.len() != 2 {
-        return Err(unimplemented(
-            "TT executable gather currently only supports rank-2 operands",
-        ));
-    }
-    if slice_sizes.len() != 2
-        || slice_sizes[0] != 1
-        || usize::try_from(slice_sizes[1]).ok() != Some(operand_shape[1])
-    {
-        return Err(unimplemented(
-            "TT executable gather currently only supports slice_sizes [1, operand_width]",
-        ));
-    }
-
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
             "TT executable gather output id {output_id} is out of bounds"
@@ -2565,18 +2533,6 @@ fn execute_gather(
         )));
     }
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let expected_output_shape = if start_indices_shape.len() == 2 {
-        vec![start_indices_shape[0], operand_shape[1]]
-    } else {
-        Vec::new()
-    };
-    if output_shape != expected_output_shape {
-        return Err(invalid_argument(format!(
-            "TT executable gather output shape mismatch: expected {:?}, got {:?}",
-            expected_output_shape, output_shape
-        )));
-    }
-
     let Some(operand_dram) = operand.dram_buffer.as_ref() else {
         return Err(failed_precondition(
             "TT executable gather operand buffer has no device allocation",
@@ -2588,13 +2544,88 @@ fn execute_gather(
         ));
     };
 
-    let output_dram = kernels::gather::gather_bf16_rows(
+    let rank = operand_shape.len();
+    if rank == 0 {
+        return Err(unimplemented(
+            "TT executable gather currently requires operand rank >= 1",
+        ));
+    }
+    let Some(&axis_i64) = dimension_numbers.start_index_map.first() else {
+        return Err(unimplemented(
+            "TT executable gather currently requires one start_index_map entry",
+        ));
+    };
+    if dimension_numbers.start_index_map.len() != 1 {
+        return Err(unimplemented(format!(
+            "TT executable gather currently requires one start_index_map entry, got {:?}",
+            dimension_numbers.start_index_map
+        )));
+    }
+    let axis = usize::try_from(axis_i64).map_err(|_| {
+        unimplemented(format!(
+            "TT executable gather axis must be non-negative, got {axis_i64}"
+        ))
+    })?;
+    if axis >= rank {
+        return Err(invalid_argument(format!(
+            "TT executable gather axis {axis} is out of bounds for operand shape {:?}",
+            operand_shape
+        )));
+    }
+    let expected_offset_dims = (0..rank as i64)
+        .filter(|&dim| dim != axis_i64)
+        .collect::<Vec<_>>();
+    let expected_collapsed_slice_dims = [axis_i64];
+    let is_single_axis_slice_gather = dimension_numbers.offset_dims.as_slice()
+        == expected_offset_dims.as_slice()
+        && dimension_numbers.collapsed_slice_dims.as_slice()
+            == expected_collapsed_slice_dims.as_slice()
+        && dimension_numbers.operand_batching_dims.is_empty()
+        && dimension_numbers.start_indices_batching_dims.is_empty()
+        && dimension_numbers.index_vector_dim == 1;
+    if !is_single_axis_slice_gather {
+        return Err(unimplemented(format!(
+            "TT executable gather currently only supports single-axis slice gathers; expected offset_dims={expected_offset_dims:?}, collapsed_slice_dims={expected_collapsed_slice_dims:?}; got offset_dims={:?}, collapsed_slice_dims={:?}, start_index_map={:?}, index_vector_dim={}",
+            dimension_numbers.offset_dims,
+            dimension_numbers.collapsed_slice_dims,
+            dimension_numbers.start_index_map,
+            dimension_numbers.index_vector_dim
+        )));
+    }
+    if slice_sizes.len() != rank
+        || !slice_sizes.iter().enumerate().all(|(dim, &slice)| {
+            if dim == axis {
+                slice == 1
+            } else {
+                usize::try_from(slice).ok() == Some(operand_shape[dim])
+            }
+        })
+    {
+        return Err(unimplemented(format!(
+            "TT executable gather currently only supports slice_sizes with 1 at gathered axis and full slices elsewhere; got {slice_sizes:?} for operand shape {operand_shape:?}, axis {axis}"
+        )));
+    }
+    let mut expected_output_shape = operand_shape.clone();
+    if start_indices_shape.len() == 2 {
+        expected_output_shape[axis] = start_indices_shape[0];
+    }
+    if output_shape != expected_output_shape {
+        return Err(invalid_argument(format!(
+            "TT executable gather output shape mismatch: expected {:?}, got {:?}",
+            expected_output_shape, output_shape
+        )));
+    }
+
+    let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
+    let output_dram = kernels::gather::gather(
         device,
         operand_dram,
         start_indices_dram,
         &operand_shape,
         &start_indices_shape,
         &output_shape,
+        axis,
+        dtype,
         "pjrt_gather",
     )
     .map_err(io_error)?;
@@ -4780,6 +4811,44 @@ mod tests {
                 assert_eq!(dimension_numbers.start_index_map, vec![0]);
                 assert_eq!(dimension_numbers.index_vector_dim, 1);
                 assert_eq!(*slice_sizes, vec![1, 8]);
+                assert!(!indices_are_sorted);
+            },
+        );
+    }
+
+    #[cfg(libtt_mlir_frontend)]
+    #[test]
+    fn pjrt_compile_lowers_axis_gather() {
+        with_compiled_mlir_executable(
+            r#"module {
+  func.func public @main(%arg0: tensor<2x4x8xbf16>, %arg1: tensor<3x1xi32>) -> tensor<2x3x8xbf16> {
+    %0 = "stablehlo.gather"(%arg0, %arg1) <{dimension_numbers = #stablehlo.gather<offset_dims = [0, 2], collapsed_slice_dims = [1], start_index_map = [1], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 2, 1, 8>}> : (tensor<2x4x8xbf16>, tensor<3x1xi32>) -> tensor<2x3x8xbf16>
+    return %0 : tensor<2x3x8xbf16>
+  }
+}
+"#,
+            |executable| {
+                assert_eq!(executable.output_ids, vec![2]);
+                assert_eq!(executable.ops.len(), 3);
+                let executable::Op::Gather {
+                    input_ids,
+                    output_id,
+                    dimension_numbers,
+                    slice_sizes,
+                    indices_are_sorted,
+                } = &executable.ops[2]
+                else {
+                    panic!("axis gather should lower to Gather");
+                };
+                assert_eq!(*input_ids, [0, 1]);
+                assert_eq!(*output_id, 2);
+                assert_eq!(dimension_numbers.offset_dims, vec![0, 2]);
+                assert_eq!(dimension_numbers.collapsed_slice_dims, vec![1]);
+                assert!(dimension_numbers.operand_batching_dims.is_empty());
+                assert!(dimension_numbers.start_indices_batching_dims.is_empty());
+                assert_eq!(dimension_numbers.start_index_map, vec![1]);
+                assert_eq!(dimension_numbers.index_vector_dim, 1);
+                assert_eq!(*slice_sizes, vec![2, 1, 8]);
                 assert!(!indices_are_sorted);
             },
         );
