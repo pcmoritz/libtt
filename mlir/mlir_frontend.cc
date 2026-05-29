@@ -23,12 +23,15 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/OwningOpRef.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/executable.pb.h"
 #include "stablehlo/dialect/Serialization.h"
@@ -87,15 +90,14 @@ std::optional<mlir::Value> createCaseIndexConstant(
     mlir::OpBuilder& builder,
     mlir::Location loc,
     mlir::RankedTensorType index_type,
-    uint64_t value,
-    std::string& error) {
+    uint64_t value) {
     auto integer_type = mlir::dyn_cast<mlir::IntegerType>(index_type.getElementType());
     if (!integer_type) {
-        error = "stablehlo.case index must have integer element type";
+        mlir::emitError(loc, "stablehlo.case index must have integer element type");
         return std::nullopt;
     }
     if (index_type.getRank() != 0) {
-        error = "stablehlo.case index must be a scalar tensor";
+        mlir::emitError(loc, "stablehlo.case index must be a scalar tensor");
         return std::nullopt;
     }
 
@@ -109,20 +111,19 @@ std::optional<mlir::Value> createCaseBranchPredicate(
     mlir::OpBuilder& builder,
     mlir::Location loc,
     mlir::Value index,
-    uint64_t branch_index,
-    std::string& error) {
+    uint64_t branch_index) {
     auto index_type = mlir::dyn_cast<mlir::RankedTensorType>(index.getType());
     if (!index_type) {
-        error = "stablehlo.case index must be a ranked tensor";
+        mlir::emitError(loc, "stablehlo.case index must be a ranked tensor");
         return std::nullopt;
     }
     auto integer_type = mlir::dyn_cast<mlir::IntegerType>(index_type.getElementType());
     if (!integer_type) {
-        error = "stablehlo.case index must have integer element type";
+        mlir::emitError(loc, "stablehlo.case index must have integer element type");
         return std::nullopt;
     }
     auto constant = createCaseIndexConstant(
-        builder, loc, index_type, branch_index, error);
+        builder, loc, index_type, branch_index);
     if (!constant) {
         return std::nullopt;
     }
@@ -147,19 +148,20 @@ std::optional<mlir::Value> broadcastCasePredicateToResult(
     mlir::OpBuilder& builder,
     mlir::Location loc,
     mlir::Value predicate,
-    mlir::Type result_type,
-    std::string& error) {
+    mlir::Type result_type) {
     auto pred_type = mlir::dyn_cast<mlir::RankedTensorType>(predicate.getType());
     auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(result_type);
     if (!pred_type || !tensor_type) {
-        error = "stablehlo.case select values must be ranked tensors";
+        mlir::emitError(loc, "stablehlo.case select values must be ranked tensors");
         return std::nullopt;
     }
     if (pred_type.getShape() == tensor_type.getShape()) {
         return predicate;
     }
     if (pred_type.getRank() != 0) {
-        error = "stablehlo.case non-scalar predicates cannot be broadcast to branch result shapes";
+        mlir::emitError(
+            loc,
+            "stablehlo.case non-scalar predicates cannot be broadcast to branch result shapes");
         return std::nullopt;
     }
 
@@ -173,30 +175,25 @@ std::optional<mlir::Value> broadcastCasePredicateToResult(
         llvm::ArrayRef<int64_t>{}).getResult();
 }
 
-bool cloneCaseBranch(
+mlir::LogicalResult cloneCaseBranch(
     mlir::OpBuilder& builder,
     mlir::stablehlo::CaseOp case_op,
     mlir::Region& branch,
-    llvm::SmallVectorImpl<mlir::Value>& results,
-    std::string& error) {
+    llvm::SmallVectorImpl<mlir::Value>& results) {
     if (branch.empty() || branch.getBlocks().size() != 1) {
-        error = "stablehlo.case branches must contain exactly one block";
-        return false;
+        return case_op.emitError("stablehlo.case branches must contain exactly one block");
     }
     mlir::Block& block = branch.front();
     if (!block.getArguments().empty()) {
-        error = "stablehlo.case branch block arguments are not supported";
-        return false;
+        return case_op.emitError("stablehlo.case branch block arguments are not supported");
     }
 
     auto return_op = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
     if (!return_op) {
-        error = "stablehlo.case branches must terminate with stablehlo.return";
-        return false;
+        return case_op.emitError("stablehlo.case branches must terminate with stablehlo.return");
     }
     if (return_op.getResults().size() != case_op->getNumResults()) {
-        error = "stablehlo.case branch result count does not match case result count";
-        return false;
+        return case_op.emitError("stablehlo.case branch result count does not match case result count");
     }
 
     mlir::IRMapping mapper;
@@ -211,7 +208,7 @@ bool cloneCaseBranch(
     for (mlir::Value value : return_op.getResults()) {
         results.push_back(mapper.lookupOrDefault(value));
     }
-    return true;
+    return mlir::success();
 }
 
 std::optional<uint64_t> constantCaseIndex(mlir::Value index) {
@@ -259,38 +256,37 @@ std::optional<int64_t> constantScalarIntegerValue(mlir::Value value) {
     return value_bits.getSExtValue();
 }
 
-bool lowerSingleCaseOpToSelects(mlir::stablehlo::CaseOp case_op, std::string& error) {
+mlir::LogicalResult lowerSingleCaseOpToSelects(
+    mlir::stablehlo::CaseOp case_op,
+    mlir::PatternRewriter& rewriter) {
     auto branches = case_op.getBranches();
     if (branches.empty()) {
-        error = "stablehlo.case must contain at least one branch";
-        return false;
+        return case_op.emitError("stablehlo.case must contain at least one branch");
     }
 
-    mlir::OpBuilder builder(case_op);
+    rewriter.setInsertionPoint(case_op);
     if (auto constant_index = constantCaseIndex(case_op.getIndex())) {
         uint64_t branch_index = *constant_index < branches.size()
             ? *constant_index
             : static_cast<uint64_t>(branches.size() - 1);
         llvm::SmallVector<mlir::Value> results;
-        if (!cloneCaseBranch(
-                builder,
+        if (mlir::failed(cloneCaseBranch(
+                rewriter,
                 case_op,
                 branches[static_cast<size_t>(branch_index)],
-                results,
-                error)) {
-            return false;
+                results))) {
+            return mlir::failure();
         }
-        case_op->replaceAllUsesWith(results);
-        case_op.erase();
-        return true;
+        rewriter.replaceOp(case_op, results);
+        return mlir::success();
     }
 
     llvm::SmallVector<llvm::SmallVector<mlir::Value>> branch_results;
     branch_results.reserve(branches.size());
     for (mlir::Region& branch : branches) {
         llvm::SmallVector<mlir::Value> results;
-        if (!cloneCaseBranch(builder, case_op, branch, results, error)) {
-            return false;
+        if (mlir::failed(cloneCaseBranch(rewriter, case_op, branch, results))) {
+            return mlir::failure();
         }
         branch_results.push_back(std::move(results));
     }
@@ -300,26 +296,24 @@ bool lowerSingleCaseOpToSelects(mlir::stablehlo::CaseOp case_op, std::string& er
          branch_index >= 0;
          --branch_index) {
         auto predicate = createCaseBranchPredicate(
-            builder,
+            rewriter,
             case_op.getLoc(),
             case_op.getIndex(),
-            static_cast<uint64_t>(branch_index),
-            error);
+            static_cast<uint64_t>(branch_index));
         if (!predicate) {
-            return false;
+            return mlir::failure();
         }
 
         for (auto [result_index, selected_value] : llvm::enumerate(selected)) {
             auto pred_for_result = broadcastCasePredicateToResult(
-                builder,
+                rewriter,
                 case_op.getLoc(),
                 *predicate,
-                case_op->getResult(result_index).getType(),
-                error);
+                case_op->getResult(result_index).getType());
             if (!pred_for_result) {
-                return false;
+                return mlir::failure();
             }
-            selected[result_index] = builder.create<mlir::stablehlo::SelectOp>(
+            selected[result_index] = rewriter.create<mlir::stablehlo::SelectOp>(
                 case_op.getLoc(),
                 case_op->getResult(result_index).getType(),
                 *pred_for_result,
@@ -328,9 +322,8 @@ bool lowerSingleCaseOpToSelects(mlir::stablehlo::CaseOp case_op, std::string& er
         }
     }
 
-    case_op->replaceAllUsesWith(selected);
-    case_op.erase();
-    return true;
+    rewriter.replaceOp(case_op, selected);
+    return mlir::success();
 }
 
 std::optional<mlir::stablehlo::ComparisonDirection> invertComparisonDirection(
@@ -429,12 +422,10 @@ std::optional<int64_t> loopCounterStep(
     return std::nullopt;
 }
 
-std::optional<StaticWhilePlan> analyzeStaticWhile(
-    mlir::stablehlo::WhileOp while_op,
-    std::string& error) {
+std::optional<StaticWhilePlan> analyzeStaticWhile(mlir::stablehlo::WhileOp while_op) {
     if (while_op.getCond().empty() || while_op.getCond().getBlocks().size() != 1 ||
         while_op.getBody().empty() || while_op.getBody().getBlocks().size() != 1) {
-        error = "stablehlo.while regions must contain exactly one block";
+        while_op.emitError("stablehlo.while regions must contain exactly one block");
         return std::nullopt;
     }
 
@@ -442,7 +433,7 @@ std::optional<StaticWhilePlan> analyzeStaticWhile(
     mlir::Block& body_block = while_op.getBody().front();
     if (cond_block.getNumArguments() != while_op->getNumOperands() ||
         body_block.getNumArguments() != while_op->getNumOperands()) {
-        error = "stablehlo.while block argument count must match operand count";
+        while_op.emitError("stablehlo.while block argument count must match operand count");
         return std::nullopt;
     }
 
@@ -450,7 +441,7 @@ std::optional<StaticWhilePlan> analyzeStaticWhile(
     auto body_return = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(body_block.getTerminator());
     if (!cond_return || !body_return || cond_return.getResults().size() != 1 ||
         body_return.getResults().size() != while_op->getNumResults()) {
-        error = "stablehlo.while must have stablehlo.return terminators with matching result counts";
+        while_op.emitError("stablehlo.while must have stablehlo.return terminators with matching result counts");
         return std::nullopt;
     }
 
@@ -458,13 +449,13 @@ std::optional<StaticWhilePlan> analyzeStaticWhile(
         cond_return.getResults()[0].getType());
     if (!predicate_type || predicate_type.getRank() != 0 ||
         !predicate_type.getElementType().isInteger(1)) {
-        error = "stablehlo.while condition must return a scalar predicate";
+        while_op.emitError("stablehlo.while condition must return a scalar predicate");
         return std::nullopt;
     }
 
     auto compare_op = cond_return.getResults()[0].getDefiningOp<mlir::stablehlo::CompareOp>();
     if (!compare_op) {
-        error = "only statically bounded stablehlo.while compare conditions are supported";
+        while_op.emitError("only statically bounded stablehlo.while compare conditions are supported");
         return std::nullopt;
     }
 
@@ -482,7 +473,7 @@ std::optional<StaticWhilePlan> analyzeStaticWhile(
             if (rhs_argument.getOwner() == &cond_block) {
                 auto inverted = invertComparisonDirection(direction);
                 if (!inverted) {
-                    error = "unsupported stablehlo.while comparison direction";
+                    while_op.emitError("unsupported stablehlo.while comparison direction");
                     return std::nullopt;
                 }
                 counter_index = rhs_argument.getArgNumber();
@@ -492,51 +483,53 @@ std::optional<StaticWhilePlan> analyzeStaticWhile(
         }
     }
     if (!counter_index || !bound) {
-        error = "stablehlo.while condition must compare one loop counter against a scalar constant";
+        while_op.emitError("stablehlo.while condition must compare one loop counter against a scalar constant");
         return std::nullopt;
     }
     if (*counter_index >= static_cast<size_t>(while_op->getNumOperands())) {
-        error = "stablehlo.while loop counter index is out of range";
+        while_op.emitError("stablehlo.while loop counter index is out of range");
         return std::nullopt;
     }
 
     mlir::Value init_value = while_op->getOperand(*counter_index);
     auto init = constantScalarIntegerValue(init_value);
     if (!init) {
-        error = "stablehlo.while loop counter initial value must be a scalar constant";
+        while_op.emitError("stablehlo.while loop counter initial value must be a scalar constant");
         return std::nullopt;
     }
 
     auto counter_arg = body_block.getArgument(*counter_index);
     auto step = loopCounterStep(body_return.getResults()[*counter_index], counter_arg);
     if (!step) {
-        error = "stablehlo.while loop counter update must be add/subtract by a scalar constant";
+        while_op.emitError("stablehlo.while loop counter update must be add/subtract by a scalar constant");
         return std::nullopt;
     }
 
     auto trip_count = computeStaticTripCount(*init, *bound, *step, direction);
     if (!trip_count) {
-        error = "stablehlo.while loop trip count is not statically bounded";
+        while_op.emitError("stablehlo.while loop trip count is not statically bounded");
         return std::nullopt;
     }
     if (*trip_count > 4096) {
-        error = "stablehlo.while static trip count is too large to unroll";
+        while_op.emitError("stablehlo.while static trip count is too large to unroll");
         return std::nullopt;
     }
 
     return StaticWhilePlan{*trip_count};
 }
 
-bool lowerSingleStaticWhileOp(mlir::stablehlo::WhileOp while_op, std::string& error) {
-    auto plan = analyzeStaticWhile(while_op, error);
+mlir::LogicalResult lowerSingleStaticWhileOp(
+    mlir::stablehlo::WhileOp while_op,
+    mlir::PatternRewriter& rewriter) {
+    auto plan = analyzeStaticWhile(while_op);
     if (!plan) {
-        return false;
+        return mlir::failure();
     }
 
     mlir::Block& body_block = while_op.getBody().front();
     auto body_return = mlir::cast<mlir::stablehlo::ReturnOp>(body_block.getTerminator());
 
-    mlir::OpBuilder builder(while_op);
+    rewriter.setInsertionPoint(while_op);
     llvm::SmallVector<mlir::Value> carried(
         while_op->getOperands().begin(),
         while_op->getOperands().end());
@@ -550,8 +543,8 @@ bool lowerSingleStaticWhileOp(mlir::stablehlo::WhileOp while_op, std::string& er
             if (&op == body_return.getOperation()) {
                 break;
             }
-            mlir::Operation* cloned = builder.clone(op, mapper);
-            builder.setInsertionPointAfter(cloned);
+            mlir::Operation* cloned = rewriter.clone(op, mapper);
+            rewriter.setInsertionPointAfter(cloned);
         }
 
         llvm::SmallVector<mlir::Value> next_carried;
@@ -562,52 +555,18 @@ bool lowerSingleStaticWhileOp(mlir::stablehlo::WhileOp while_op, std::string& er
         carried = std::move(next_carried);
     }
 
-    while_op->replaceAllUsesWith(carried);
-    while_op.erase();
-    return true;
-}
-
-template <typename OpTy, typename MatchFn, typename LowerFn>
-bool lowerAllMatching(
-    mlir::ModuleOp module,
-    MatchFn match,
-    LowerFn lower,
-    std::string& error) {
-    while (true) {
-        llvm::SmallVector<OpTy> matches;
-        module.walk<mlir::WalkOrder::PostOrder>([&](OpTy op) {
-            if (match(op)) {
-                matches.push_back(op);
-            }
-        });
-        if (matches.empty()) {
-            return true;
-        }
-        for (OpTy op : matches) {
-            if (!lower(op, error)) {
-                return false;
-            }
-        }
-    }
-}
-
-bool lowerStaticWhileOps(mlir::ModuleOp module, std::string& error) {
-    return lowerAllMatching<mlir::stablehlo::WhileOp>(
-        module,
-        [](mlir::stablehlo::WhileOp) { return true; },
-        lowerSingleStaticWhileOp,
-        error);
+    rewriter.replaceOp(while_op, carried);
+    return mlir::success();
 }
 
 std::optional<mlir::Value> createIntegerSplatConstant(
     mlir::OpBuilder& builder,
     mlir::Location loc,
     mlir::RankedTensorType tensor_type,
-    uint64_t value,
-    std::string& error) {
+    uint64_t value) {
     auto integer_type = mlir::dyn_cast<mlir::IntegerType>(tensor_type.getElementType());
     if (!integer_type) {
-        error = "predicate convert currently supports only integer result types";
+        mlir::emitError(loc, "expected integer tensor type for splat constant");
         return std::nullopt;
     }
     auto attr = mlir::DenseElementsAttr::get(
@@ -616,91 +575,90 @@ std::optional<mlir::Value> createIntegerSplatConstant(
     return builder.create<mlir::stablehlo::ConstantOp>(loc, attr).getResult();
 }
 
-bool lowerSingleDynamicUpdateSliceToScatter(
+mlir::LogicalResult lowerSingleDynamicUpdateSliceToScatter(
     mlir::stablehlo::DynamicUpdateSliceOp update_slice_op,
-    std::string& error) {
+    mlir::PatternRewriter& rewriter) {
     auto operand_type = mlir::dyn_cast<mlir::RankedTensorType>(
         update_slice_op.getOperand().getType());
     auto update_type = mlir::dyn_cast<mlir::RankedTensorType>(
         update_slice_op.getUpdate().getType());
     if (!operand_type || !update_type || !operand_type.hasStaticShape() ||
         !update_type.hasStaticShape()) {
-        error = "dynamic_update_slice-to-scatter requires ranked static tensors";
-        return false;
+        return update_slice_op.emitError(
+            "dynamic_update_slice-to-scatter requires ranked static tensors");
     }
     if (operand_type.getRank() != 1 || update_type.getRank() != 1) {
-        error = "dynamic_update_slice-to-scatter currently supports only rank-1 updates";
-        return false;
+        return update_slice_op.emitError(
+            "dynamic_update_slice-to-scatter currently supports only rank-1 updates");
     }
     if (update_slice_op.getStartIndices().size() != 1) {
-        error = "rank-1 dynamic_update_slice requires one start index";
-        return false;
+        return update_slice_op.emitError(
+            "rank-1 dynamic_update_slice requires one start index");
     }
 
     int64_t operand_size = operand_type.getDimSize(0);
     int64_t update_size = update_type.getDimSize(0);
     if (update_size > operand_size) {
-        error = "dynamic_update_slice update size exceeds operand size";
-        return false;
+        return update_slice_op.emitError("dynamic_update_slice update size exceeds operand size");
     }
 
     mlir::Value start = update_slice_op.getStartIndices().front();
     auto start_type = mlir::dyn_cast<mlir::RankedTensorType>(start.getType());
     if (!start_type || start_type.getRank() != 0 ||
         !mlir::isa<mlir::IntegerType>(start_type.getElementType())) {
-        error = "dynamic_update_slice start index must be a scalar integer tensor";
-        return false;
+        return update_slice_op.emitError(
+            "dynamic_update_slice start index must be a scalar integer tensor");
     }
 
-    mlir::OpBuilder builder(update_slice_op);
+    rewriter.setInsertionPoint(update_slice_op);
     mlir::Location loc = update_slice_op.getLoc();
-    auto zero = createIntegerSplatConstant(builder, loc, start_type, 0, error);
+    auto zero = createIntegerSplatConstant(rewriter, loc, start_type, 0);
     if (!zero) {
-        return false;
+        return mlir::failure();
     }
     auto max_start = createIntegerSplatConstant(
-        builder, loc, start_type, static_cast<uint64_t>(operand_size - update_size), error);
+        rewriter, loc, start_type, static_cast<uint64_t>(operand_size - update_size));
     if (!max_start) {
-        return false;
+        return mlir::failure();
     }
 
     // StableHLO dynamic_update_slice clamps starts into
     // [0, operand_size - update_size]. Express min(x, hi) using max/subtract
     // because the backend already supports integer maximum.
-    mlir::Value nonnegative_start = builder.create<mlir::stablehlo::MaxOp>(
+    mlir::Value nonnegative_start = rewriter.create<mlir::stablehlo::MaxOp>(
         loc, start_type, start, *zero).getResult();
-    mlir::Value excess = builder.create<mlir::stablehlo::SubtractOp>(
+    mlir::Value excess = rewriter.create<mlir::stablehlo::SubtractOp>(
         loc, start_type, nonnegative_start, *max_start).getResult();
-    mlir::Value clamped_excess = builder.create<mlir::stablehlo::MaxOp>(
+    mlir::Value clamped_excess = rewriter.create<mlir::stablehlo::MaxOp>(
         loc, start_type, excess, *zero).getResult();
-    mlir::Value clamped_start = builder.create<mlir::stablehlo::SubtractOp>(
+    mlir::Value clamped_start = rewriter.create<mlir::stablehlo::SubtractOp>(
         loc, start_type, nonnegative_start, clamped_excess).getResult();
 
     auto indices_vector_type = mlir::RankedTensorType::get(
         {update_size}, start_type.getElementType());
-    mlir::Value iota = builder.create<mlir::stablehlo::IotaOp>(
-        loc, indices_vector_type, builder.getI64IntegerAttr(0)).getResult();
-    mlir::Value start_vector = builder.create<mlir::stablehlo::BroadcastInDimOp>(
+    mlir::Value iota = rewriter.create<mlir::stablehlo::IotaOp>(
+        loc, indices_vector_type, rewriter.getI64IntegerAttr(0)).getResult();
+    mlir::Value start_vector = rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
         loc,
         indices_vector_type,
         clamped_start,
-        builder.getDenseI64ArrayAttr({})).getResult();
-    mlir::Value indices_vector = builder.create<mlir::stablehlo::AddOp>(
+        rewriter.getDenseI64ArrayAttr({})).getResult();
+    mlir::Value indices_vector = rewriter.create<mlir::stablehlo::AddOp>(
         loc, indices_vector_type, iota, start_vector).getResult();
     auto indices_matrix_type = mlir::RankedTensorType::get(
         {update_size, 1}, start_type.getElementType());
-    mlir::Value indices = builder.create<mlir::stablehlo::ReshapeOp>(
+    mlir::Value indices = rewriter.create<mlir::stablehlo::ReshapeOp>(
         loc, indices_matrix_type, indices_vector).getResult();
 
     auto scatter_dims = mlir::stablehlo::ScatterDimensionNumbersAttr::get(
-        builder.getContext(),
+        rewriter.getContext(),
         /*updateWindowDims=*/{},
         /*insertedWindowDims=*/{0},
         /*inputBatchingDims=*/{},
         /*scatterIndicesBatchingDims=*/{},
         /*scatterDimsToOperandDims=*/{0},
         /*indexVectorDim=*/1);
-    auto scatter = builder.create<mlir::stablehlo::ScatterOp>(
+    auto scatter = rewriter.create<mlir::stablehlo::ScatterOp>(
         loc,
         update_slice_op->getResultTypes(),
         mlir::ValueRange{update_slice_op.getOperand()},
@@ -720,39 +678,31 @@ bool lowerSingleDynamicUpdateSliceToScatter(
     body_builder.create<mlir::stablehlo::ReturnOp>(
         loc, block->getArgument(1));
 
-    update_slice_op.getResult().replaceAllUsesWith(scatter.getResult(0));
-    update_slice_op.erase();
-    return true;
-}
-
-bool lowerDynamicUpdateSliceOpsToScatters(mlir::ModuleOp module, std::string& error) {
-    return lowerAllMatching<mlir::stablehlo::DynamicUpdateSliceOp>(
-        module,
-        [](mlir::stablehlo::DynamicUpdateSliceOp) { return true; },
-        lowerSingleDynamicUpdateSliceToScatter,
-        error);
+    rewriter.replaceOp(update_slice_op, mlir::ValueRange{scatter.getResult(0)});
+    return mlir::success();
 }
 
 std::optional<mlir::Value> createI32ScalarConstant(
     mlir::OpBuilder& builder,
     mlir::Location loc,
-    int64_t value,
-    std::string& error) {
+    int64_t value) {
     if (value < std::numeric_limits<int32_t>::min() ||
         value > std::numeric_limits<int32_t>::max()) {
-        error = "i32 scalar constant value is out of range";
+        mlir::emitError(loc, "i32 scalar constant value is out of range");
         return std::nullopt;
     }
     auto type = mlir::RankedTensorType::get({}, builder.getI32Type());
     return createIntegerSplatConstant(
-        builder, loc, type, static_cast<uint64_t>(value), error);
+        builder, loc, type, static_cast<uint64_t>(value));
 }
 
 bool hasZeroDimension(llvm::ArrayRef<int64_t> shape) {
     return llvm::any_of(shape, [](int64_t dim) { return dim == 0; });
 }
 
-bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) {
+mlir::LogicalResult lowerSinglePadToScatter(
+    mlir::stablehlo::PadOp pad_op,
+    mlir::PatternRewriter& rewriter) {
     auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
         pad_op.getOperand().getType());
     auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
@@ -761,32 +711,27 @@ bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) 
         pad_op.getPaddingValue().getType());
     if (!input_type || !output_type || !padding_type ||
         !input_type.hasStaticShape() || !output_type.hasStaticShape()) {
-        error = "pad-to-scatter requires ranked static tensors";
-        return false;
+        return pad_op.emitError("pad-to-scatter requires ranked static tensors");
     }
     if (padding_type.getRank() != 0) {
-        error = "pad-to-scatter requires a scalar padding value";
-        return false;
+        return pad_op.emitError("pad-to-scatter requires a scalar padding value");
     }
     int64_t rank = input_type.getRank();
     if (output_type.getRank() != rank ||
         pad_op.getEdgePaddingLow().size() != static_cast<size_t>(rank) ||
         pad_op.getEdgePaddingHigh().size() != static_cast<size_t>(rank) ||
         pad_op.getInteriorPadding().size() != static_cast<size_t>(rank)) {
-        error = "pad attributes must match input/output rank";
-        return false;
+        return pad_op.emitError("pad attributes must match input/output rank");
     }
     if (input_type.getShape() == output_type.getShape() &&
         llvm::all_of(pad_op.getEdgePaddingLow(), [](int64_t value) { return value == 0; }) &&
         llvm::all_of(pad_op.getEdgePaddingHigh(), [](int64_t value) { return value == 0; }) &&
         llvm::all_of(pad_op.getInteriorPadding(), [](int64_t value) { return value == 0; })) {
-        pad_op.getResult().replaceAllUsesWith(pad_op.getOperand());
-        pad_op.erase();
-        return true;
+        rewriter.replaceOp(pad_op, mlir::ValueRange{pad_op.getOperand()});
+        return mlir::success();
     }
     if (rank == 0) {
-        error = "non-noop scalar pad is unsupported";
-        return false;
+        return pad_op.emitError("non-noop scalar pad is unsupported");
     }
 
     auto low = pad_op.getEdgePaddingLow();
@@ -794,19 +739,17 @@ bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) 
     auto interior = pad_op.getInteriorPadding();
     for (int64_t dim = 0; dim < rank; ++dim) {
         if (low[dim] < 0 || high[dim] < 0 || interior[dim] < 0) {
-            error = "pad-to-scatter requires non-negative padding";
-            return false;
+            return pad_op.emitError("pad-to-scatter requires non-negative padding");
         }
         int64_t expected = low[dim] + input_type.getDimSize(dim) +
                            std::max<int64_t>(input_type.getDimSize(dim) - 1, 0) * interior[dim] +
                            high[dim];
         if (output_type.getDimSize(dim) != expected) {
-            error = "pad output shape does not match pad attributes";
-            return false;
+            return pad_op.emitError("pad output shape does not match pad attributes");
         }
     }
 
-    mlir::OpBuilder builder(pad_op);
+    rewriter.setInsertionPoint(pad_op);
     mlir::Location loc = pad_op.getLoc();
     mlir::Type element_type = input_type.getElementType();
     mlir::Value current = pad_op.getOperand();
@@ -822,8 +765,7 @@ bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) 
         if (current_shape[dim] > std::numeric_limits<int32_t>::max() ||
             low[dim] > std::numeric_limits<int32_t>::max() ||
             step > std::numeric_limits<int32_t>::max()) {
-            error = "pad-to-scatter index values exceed i32 range";
-            return false;
+            return pad_op.emitError("pad-to-scatter index values exceed i32 range");
         }
 
         llvm::SmallVector<int64_t> next_shape = current_shape;
@@ -831,11 +773,11 @@ bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) 
                           std::max<int64_t>(current_shape[dim] - 1, 0) * interior[dim] +
                           high[dim];
         auto next_type = mlir::RankedTensorType::get(next_shape, element_type);
-        mlir::Value base = builder.create<mlir::stablehlo::BroadcastInDimOp>(
+        mlir::Value base = rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
             loc,
             next_type,
             pad_op.getPaddingValue(),
-            builder.getDenseI64ArrayAttr({})).getResult();
+            rewriter.getDenseI64ArrayAttr({})).getResult();
         if (hasZeroDimension(current_shape)) {
             current = base;
             current_shape = next_shape;
@@ -843,38 +785,38 @@ bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) 
         }
 
         auto index_vector_type = mlir::RankedTensorType::get(
-            {current_shape[dim]}, builder.getI32Type());
-        mlir::Value indices_vector = builder.create<mlir::stablehlo::IotaOp>(
-            loc, index_vector_type, builder.getI64IntegerAttr(0)).getResult();
+            {current_shape[dim]}, rewriter.getI32Type());
+        mlir::Value indices_vector = rewriter.create<mlir::stablehlo::IotaOp>(
+            loc, index_vector_type, rewriter.getI64IntegerAttr(0)).getResult();
         if (step != 1) {
-            auto step_scalar = createI32ScalarConstant(builder, loc, step, error);
+            auto step_scalar = createI32ScalarConstant(rewriter, loc, step);
             if (!step_scalar) {
-                return false;
+                return mlir::failure();
             }
-            mlir::Value step_vector = builder.create<mlir::stablehlo::BroadcastInDimOp>(
+            mlir::Value step_vector = rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
                 loc,
                 index_vector_type,
                 *step_scalar,
-                builder.getDenseI64ArrayAttr({})).getResult();
-            indices_vector = builder.create<mlir::stablehlo::MulOp>(
+                rewriter.getDenseI64ArrayAttr({})).getResult();
+            indices_vector = rewriter.create<mlir::stablehlo::MulOp>(
                 loc, index_vector_type, indices_vector, step_vector).getResult();
         }
         if (low[dim] != 0) {
-            auto low_scalar = createI32ScalarConstant(builder, loc, low[dim], error);
+            auto low_scalar = createI32ScalarConstant(rewriter, loc, low[dim]);
             if (!low_scalar) {
-                return false;
+                return mlir::failure();
             }
-            mlir::Value low_vector = builder.create<mlir::stablehlo::BroadcastInDimOp>(
+            mlir::Value low_vector = rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
                 loc,
                 index_vector_type,
                 *low_scalar,
-                builder.getDenseI64ArrayAttr({})).getResult();
-            indices_vector = builder.create<mlir::stablehlo::AddOp>(
+                rewriter.getDenseI64ArrayAttr({})).getResult();
+            indices_vector = rewriter.create<mlir::stablehlo::AddOp>(
                 loc, index_vector_type, indices_vector, low_vector).getResult();
         }
         auto indices_matrix_type = mlir::RankedTensorType::get(
-            {current_shape[dim], 1}, builder.getI32Type());
-        mlir::Value indices = builder.create<mlir::stablehlo::ReshapeOp>(
+            {current_shape[dim], 1}, rewriter.getI32Type());
+        mlir::Value indices = rewriter.create<mlir::stablehlo::ReshapeOp>(
             loc, indices_matrix_type, indices_vector).getResult();
 
         llvm::SmallVector<int64_t> update_window_dims;
@@ -885,7 +827,7 @@ bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) 
             }
         }
         auto scatter_dims = mlir::stablehlo::ScatterDimensionNumbersAttr::get(
-            builder.getContext(),
+            rewriter.getContext(),
             update_window_dims,
             /*insertedWindowDims=*/{dim},
             /*inputBatchingDims=*/{},
@@ -893,7 +835,7 @@ bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) 
             /*scatterDimsToOperandDims=*/{dim},
             /*indexVectorDim=*/1);
         llvm::SmallVector<mlir::Type> scatter_result_types{next_type};
-        auto scatter = builder.create<mlir::stablehlo::ScatterOp>(
+        auto scatter = rewriter.create<mlir::stablehlo::ScatterOp>(
             loc,
             scatter_result_types,
             mlir::ValueRange{base},
@@ -916,58 +858,46 @@ bool lowerSinglePadToScatter(mlir::stablehlo::PadOp pad_op, std::string& error) 
         current_shape = next_shape;
     }
 
-    pad_op.getResult().replaceAllUsesWith(current);
-    pad_op.erase();
-    return true;
+    rewriter.replaceOp(pad_op, mlir::ValueRange{current});
+    return mlir::success();
 }
 
-bool lowerPadOpsToScatters(mlir::ModuleOp module, std::string& error) {
-    return lowerAllMatching<mlir::stablehlo::PadOp>(
-        module,
-        [](mlir::stablehlo::PadOp) { return true; },
-        lowerSinglePadToScatter,
-        error);
-}
-
-bool lowerSinglePredicateConvertToSelect(
+mlir::LogicalResult lowerSinglePredicateConvertToSelect(
     mlir::stablehlo::ConvertOp convert_op,
-    std::string& error) {
+    mlir::PatternRewriter& rewriter) {
     auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
         convert_op.getOperand().getType());
     auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
         convert_op.getResult().getType());
     if (!input_type || !output_type) {
-        error = "predicate convert requires ranked tensor operands";
-        return false;
+        return convert_op.emitError("predicate convert requires ranked tensor operands");
     }
     if (!input_type.getElementType().isInteger(1)) {
-        return true;
+        return mlir::success();
     }
     if (input_type.getShape() != output_type.getShape()) {
-        error = "predicate convert requires matching input and output shapes";
-        return false;
+        return convert_op.emitError("predicate convert requires matching input and output shapes");
     }
 
-    mlir::OpBuilder builder(convert_op);
+    rewriter.setInsertionPoint(convert_op);
     auto one = createIntegerSplatConstant(
-        builder, convert_op.getLoc(), output_type, 1, error);
+        rewriter, convert_op.getLoc(), output_type, 1);
     if (!one) {
-        return false;
+        return mlir::failure();
     }
     auto zero = createIntegerSplatConstant(
-        builder, convert_op.getLoc(), output_type, 0, error);
+        rewriter, convert_op.getLoc(), output_type, 0);
     if (!zero) {
-        return false;
+        return mlir::failure();
     }
-    auto select = builder.create<mlir::stablehlo::SelectOp>(
+    auto select = rewriter.create<mlir::stablehlo::SelectOp>(
         convert_op.getLoc(),
         output_type,
         convert_op.getOperand(),
         *one,
         *zero);
-    convert_op.getResult().replaceAllUsesWith(select.getResult());
-    convert_op.erase();
-    return true;
+    rewriter.replaceOp(convert_op, mlir::ValueRange{select.getResult()});
+    return mlir::success();
 }
 
 bool isPredicateConvert(mlir::stablehlo::ConvertOp convert_op) {
@@ -976,20 +906,142 @@ bool isPredicateConvert(mlir::stablehlo::ConvertOp convert_op) {
     return input_type && input_type.getElementType().isInteger(1);
 }
 
-bool lowerPredicateConvertsToSelects(mlir::ModuleOp module, std::string& error) {
-    return lowerAllMatching<mlir::stablehlo::ConvertOp>(
-        module,
-        isPredicateConvert,
-        lowerSinglePredicateConvertToSelect,
-        error);
+bool isNestedInCaseRegion(mlir::Operation* op) {
+    return op->getParentOfType<mlir::stablehlo::CaseOp>() != nullptr;
 }
 
-bool lowerCaseOpsToSelects(mlir::ModuleOp module, std::string& error) {
-    return lowerAllMatching<mlir::stablehlo::CaseOp>(
-        module,
-        [](mlir::stablehlo::CaseOp) { return true; },
-        lowerSingleCaseOpToSelects,
-        error);
+struct CleanupRewriteState {
+    bool failed = false;
+};
+
+struct PredicateConvertToSelectPattern
+    : public mlir::OpRewritePattern<mlir::stablehlo::ConvertOp> {
+    PredicateConvertToSelectPattern(mlir::MLIRContext* context, CleanupRewriteState& state)
+        : OpRewritePattern(context), state(state) {}
+
+    mlir::LogicalResult matchAndRewrite(
+        mlir::stablehlo::ConvertOp convert_op,
+        mlir::PatternRewriter& rewriter) const override {
+        if (state.failed) {
+            return mlir::failure();
+        }
+        if (isNestedInCaseRegion(convert_op)) {
+            return mlir::failure();
+        }
+        if (!isPredicateConvert(convert_op)) {
+            return mlir::failure();
+        }
+        mlir::LogicalResult result = lowerSinglePredicateConvertToSelect(convert_op, rewriter);
+        state.failed = mlir::failed(result);
+        return result;
+    }
+
+    CleanupRewriteState& state;
+};
+
+struct CaseToSelectPattern : public mlir::OpRewritePattern<mlir::stablehlo::CaseOp> {
+    CaseToSelectPattern(mlir::MLIRContext* context, CleanupRewriteState& state)
+        : OpRewritePattern(context), state(state) {}
+
+    mlir::LogicalResult matchAndRewrite(
+        mlir::stablehlo::CaseOp case_op,
+        mlir::PatternRewriter& rewriter) const override {
+        if (state.failed) {
+            return mlir::failure();
+        }
+        if (isNestedInCaseRegion(case_op)) {
+            return mlir::failure();
+        }
+        mlir::LogicalResult result = lowerSingleCaseOpToSelects(case_op, rewriter);
+        state.failed = mlir::failed(result);
+        return result;
+    }
+
+    CleanupRewriteState& state;
+};
+
+struct StaticWhilePattern : public mlir::OpRewritePattern<mlir::stablehlo::WhileOp> {
+    StaticWhilePattern(mlir::MLIRContext* context, CleanupRewriteState& state)
+        : OpRewritePattern(context), state(state) {}
+
+    mlir::LogicalResult matchAndRewrite(
+        mlir::stablehlo::WhileOp while_op,
+        mlir::PatternRewriter& rewriter) const override {
+        if (state.failed) {
+            return mlir::failure();
+        }
+        if (isNestedInCaseRegion(while_op)) {
+            return mlir::failure();
+        }
+        mlir::LogicalResult result = lowerSingleStaticWhileOp(while_op, rewriter);
+        state.failed = mlir::failed(result);
+        return result;
+    }
+
+    CleanupRewriteState& state;
+};
+
+struct DynamicUpdateSliceToScatterPattern
+    : public mlir::OpRewritePattern<mlir::stablehlo::DynamicUpdateSliceOp> {
+    DynamicUpdateSliceToScatterPattern(mlir::MLIRContext* context, CleanupRewriteState& state)
+        : OpRewritePattern(context), state(state) {}
+
+    mlir::LogicalResult matchAndRewrite(
+        mlir::stablehlo::DynamicUpdateSliceOp update_slice_op,
+        mlir::PatternRewriter& rewriter) const override {
+        if (state.failed) {
+            return mlir::failure();
+        }
+        if (isNestedInCaseRegion(update_slice_op)) {
+            return mlir::failure();
+        }
+        mlir::LogicalResult result =
+            lowerSingleDynamicUpdateSliceToScatter(update_slice_op, rewriter);
+        state.failed = mlir::failed(result);
+        return result;
+    }
+
+    CleanupRewriteState& state;
+};
+
+struct PadToScatterPattern : public mlir::OpRewritePattern<mlir::stablehlo::PadOp> {
+    PadToScatterPattern(mlir::MLIRContext* context, CleanupRewriteState& state)
+        : OpRewritePattern(context), state(state) {}
+
+    mlir::LogicalResult matchAndRewrite(
+        mlir::stablehlo::PadOp pad_op,
+        mlir::PatternRewriter& rewriter) const override {
+        if (state.failed) {
+            return mlir::failure();
+        }
+        if (isNestedInCaseRegion(pad_op)) {
+            return mlir::failure();
+        }
+        mlir::LogicalResult result = lowerSinglePadToScatter(pad_op, rewriter);
+        state.failed = mlir::failed(result);
+        return result;
+    }
+
+    CleanupRewriteState& state;
+};
+
+mlir::LogicalResult runCleanupRewritePatterns(
+    mlir::MLIRContext& context,
+    mlir::ModuleOp module) {
+    CleanupRewriteState state;
+    mlir::RewritePatternSet patterns(&context);
+    patterns.add<
+        PredicateConvertToSelectPattern,
+        CaseToSelectPattern,
+        StaticWhilePattern,
+        DynamicUpdateSliceToScatterPattern,
+        PadToScatterPattern>(&context, state);
+    mlir::GreedyRewriteConfig config;
+    config.enableFolding();
+    if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns), config))) {
+        return mlir::failure();
+    }
+    return state.failed ? mlir::failure() : mlir::success();
 }
 
 bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module, std::string& error) {
@@ -1001,19 +1053,8 @@ bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module, std::st
         error = "failed to run MLIR cleanup passes";
         return false;
     }
-    if (!lowerPredicateConvertsToSelects(module, error)) {
-        return false;
-    }
-    if (!lowerCaseOpsToSelects(module, error)) {
-        return false;
-    }
-    if (!lowerStaticWhileOps(module, error)) {
-        return false;
-    }
-    if (!lowerDynamicUpdateSliceOpsToScatters(module, error)) {
-        return false;
-    }
-    if (!lowerPadOpsToScatters(module, error)) {
+    if (mlir::failed(runCleanupRewritePatterns(context, module))) {
+        error = "failed to apply MLIR cleanup rewrite patterns; see MLIR diagnostics above";
         return false;
     }
 
