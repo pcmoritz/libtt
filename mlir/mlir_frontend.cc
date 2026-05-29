@@ -1682,11 +1682,11 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
-        if (auto bitwise_kind = bitwiseBinaryKind(op)) {
+        if (auto bitwise_kind = bitwiseBinaryKind(&op)) {
             if (!addBitwiseBinaryOp(
-                    op->getOperand(0),
-                    op->getOperand(1),
-                    op->getResult(0),
+                    op.getOperand(0),
+                    op.getOperand(1),
+                    op.getResult(0),
                     *bitwise_kind,
                     executable,
                     value_ids,
