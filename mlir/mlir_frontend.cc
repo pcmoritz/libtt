@@ -560,6 +560,18 @@ mlir::LogicalResult lowerSingleStaticWhileOp(
     return mlir::success();
 }
 
+void appendOverwriteUpdateComputation(
+    mlir::stablehlo::ScatterOp scatter,
+    mlir::Type element_type,
+    mlir::Location loc) {
+    auto scalar_type = mlir::RankedTensorType::get({}, element_type);
+    mlir::Block& block = scatter.getUpdateComputation().emplaceBlock();
+    block.addArgument(scalar_type, loc);
+    block.addArgument(scalar_type, loc);
+    mlir::OpBuilder::atBlockEnd(&block)
+        .create<mlir::stablehlo::ReturnOp>(loc, block.getArgument(1));
+}
+
 std::optional<mlir::Value> createIntegerSplatConstant(
     mlir::OpBuilder& builder,
     mlir::Location loc,
@@ -669,15 +681,7 @@ mlir::LogicalResult lowerSingleDynamicUpdateSliceToScatter(
         /*indicesAreSorted=*/true,
         /*uniqueIndices=*/true);
 
-    auto scalar_type = mlir::RankedTensorType::get(
-        {}, update_type.getElementType());
-    auto* block = new mlir::Block();
-    scatter.getUpdateComputation().push_back(block);
-    block->addArgument(scalar_type, loc);
-    block->addArgument(scalar_type, loc);
-    mlir::OpBuilder body_builder = mlir::OpBuilder::atBlockEnd(block);
-    body_builder.create<mlir::stablehlo::ReturnOp>(
-        loc, block->getArgument(1));
+    appendOverwriteUpdateComputation(scatter, update_type.getElementType(), loc);
 
     rewriter.replaceOp(update_slice_op, mlir::ValueRange{scatter.getResult(0)});
     return mlir::success();
@@ -846,14 +850,7 @@ mlir::LogicalResult lowerSinglePadToScatter(
             /*indicesAreSorted=*/true,
             /*uniqueIndices=*/true);
 
-        auto scalar_type = mlir::RankedTensorType::get({}, element_type);
-        auto* block = new mlir::Block();
-        scatter.getUpdateComputation().push_back(block);
-        block->addArgument(scalar_type, loc);
-        block->addArgument(scalar_type, loc);
-        mlir::OpBuilder body_builder = mlir::OpBuilder::atBlockEnd(block);
-        body_builder.create<mlir::stablehlo::ReturnOp>(
-            loc, block->getArgument(1));
+        appendOverwriteUpdateComputation(scatter, element_type, loc);
 
         current = scatter.getResult(0);
         current_shape = next_shape;
@@ -872,9 +869,6 @@ mlir::LogicalResult lowerSinglePredicateConvertToSelect(
         convert_op.getResult().getType());
     if (!input_type || !output_type) {
         return convert_op.emitError("predicate convert requires ranked tensor operands");
-    }
-    if (!input_type.getElementType().isInteger(1)) {
-        return mlir::success();
     }
     if (input_type.getShape() != output_type.getShape()) {
         return convert_op.emitError("predicate convert requires matching input and output shapes");
