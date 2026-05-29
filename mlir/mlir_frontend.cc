@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -914,115 +915,39 @@ struct CleanupRewriteState {
     bool failed = false;
 };
 
-struct PredicateConvertToSelectPattern
-    : public mlir::OpRewritePattern<mlir::stablehlo::ConvertOp> {
-    PredicateConvertToSelectPattern(mlir::MLIRContext* context, CleanupRewriteState& state)
-        : OpRewritePattern(context), state(state) {}
+template <typename OpT>
+struct CleanupPattern : public mlir::OpRewritePattern<OpT> {
+    using Lower = mlir::LogicalResult (*)(OpT, mlir::PatternRewriter&);
+    using Match = bool (*)(OpT);
 
-    mlir::LogicalResult matchAndRewrite(
-        mlir::stablehlo::ConvertOp convert_op,
-        mlir::PatternRewriter& rewriter) const override {
+    CleanupPattern(
+        mlir::MLIRContext* context,
+        CleanupRewriteState& state,
+        Lower lower,
+        Match match = nullptr)
+        : mlir::OpRewritePattern<OpT>(context),
+          state(state),
+          lower(lower),
+          match(match) {}
+
+    mlir::LogicalResult matchAndRewrite(OpT op, mlir::PatternRewriter& rewriter) const override {
         if (state.failed) {
             return mlir::failure();
         }
-        if (isNestedInCaseRegion(convert_op)) {
+        if (isNestedInCaseRegion(op.getOperation())) {
             return mlir::failure();
         }
-        if (!isPredicateConvert(convert_op)) {
+        if (match && !match(op)) {
             return mlir::failure();
         }
-        mlir::LogicalResult result = lowerSinglePredicateConvertToSelect(convert_op, rewriter);
+        mlir::LogicalResult result = lower(op, rewriter);
         state.failed = mlir::failed(result);
         return result;
     }
 
     CleanupRewriteState& state;
-};
-
-struct CaseToSelectPattern : public mlir::OpRewritePattern<mlir::stablehlo::CaseOp> {
-    CaseToSelectPattern(mlir::MLIRContext* context, CleanupRewriteState& state)
-        : OpRewritePattern(context), state(state) {}
-
-    mlir::LogicalResult matchAndRewrite(
-        mlir::stablehlo::CaseOp case_op,
-        mlir::PatternRewriter& rewriter) const override {
-        if (state.failed) {
-            return mlir::failure();
-        }
-        if (isNestedInCaseRegion(case_op)) {
-            return mlir::failure();
-        }
-        mlir::LogicalResult result = lowerSingleCaseOpToSelects(case_op, rewriter);
-        state.failed = mlir::failed(result);
-        return result;
-    }
-
-    CleanupRewriteState& state;
-};
-
-struct StaticWhilePattern : public mlir::OpRewritePattern<mlir::stablehlo::WhileOp> {
-    StaticWhilePattern(mlir::MLIRContext* context, CleanupRewriteState& state)
-        : OpRewritePattern(context), state(state) {}
-
-    mlir::LogicalResult matchAndRewrite(
-        mlir::stablehlo::WhileOp while_op,
-        mlir::PatternRewriter& rewriter) const override {
-        if (state.failed) {
-            return mlir::failure();
-        }
-        if (isNestedInCaseRegion(while_op)) {
-            return mlir::failure();
-        }
-        mlir::LogicalResult result = lowerSingleStaticWhileOp(while_op, rewriter);
-        state.failed = mlir::failed(result);
-        return result;
-    }
-
-    CleanupRewriteState& state;
-};
-
-struct DynamicUpdateSliceToScatterPattern
-    : public mlir::OpRewritePattern<mlir::stablehlo::DynamicUpdateSliceOp> {
-    DynamicUpdateSliceToScatterPattern(mlir::MLIRContext* context, CleanupRewriteState& state)
-        : OpRewritePattern(context), state(state) {}
-
-    mlir::LogicalResult matchAndRewrite(
-        mlir::stablehlo::DynamicUpdateSliceOp update_slice_op,
-        mlir::PatternRewriter& rewriter) const override {
-        if (state.failed) {
-            return mlir::failure();
-        }
-        if (isNestedInCaseRegion(update_slice_op)) {
-            return mlir::failure();
-        }
-        mlir::LogicalResult result =
-            lowerSingleDynamicUpdateSliceToScatter(update_slice_op, rewriter);
-        state.failed = mlir::failed(result);
-        return result;
-    }
-
-    CleanupRewriteState& state;
-};
-
-struct PadToScatterPattern : public mlir::OpRewritePattern<mlir::stablehlo::PadOp> {
-    PadToScatterPattern(mlir::MLIRContext* context, CleanupRewriteState& state)
-        : OpRewritePattern(context), state(state) {}
-
-    mlir::LogicalResult matchAndRewrite(
-        mlir::stablehlo::PadOp pad_op,
-        mlir::PatternRewriter& rewriter) const override {
-        if (state.failed) {
-            return mlir::failure();
-        }
-        if (isNestedInCaseRegion(pad_op)) {
-            return mlir::failure();
-        }
-        mlir::LogicalResult result = lowerSinglePadToScatter(pad_op, rewriter);
-        state.failed = mlir::failed(result);
-        return result;
-    }
-
-    CleanupRewriteState& state;
+    Lower lower;
+    Match match;
 };
 
 mlir::LogicalResult runCleanupRewritePatterns(
@@ -1030,12 +955,16 @@ mlir::LogicalResult runCleanupRewritePatterns(
     mlir::ModuleOp module) {
     CleanupRewriteState state;
     mlir::RewritePatternSet patterns(&context);
-    patterns.add<
-        PredicateConvertToSelectPattern,
-        CaseToSelectPattern,
-        StaticWhilePattern,
-        DynamicUpdateSliceToScatterPattern,
-        PadToScatterPattern>(&context, state);
+    patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::ConvertOp>>(
+        &context, state, lowerSinglePredicateConvertToSelect, isPredicateConvert));
+    patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::CaseOp>>(
+        &context, state, lowerSingleCaseOpToSelects));
+    patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::WhileOp>>(
+        &context, state, lowerSingleStaticWhileOp));
+    patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::DynamicUpdateSliceOp>>(
+        &context, state, lowerSingleDynamicUpdateSliceToScatter));
+    patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::PadOp>>(
+        &context, state, lowerSinglePadToScatter));
     mlir::GreedyRewriteConfig config;
     config.enableFolding();
     if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns), config))) {
