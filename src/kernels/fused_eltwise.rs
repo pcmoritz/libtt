@@ -756,9 +756,9 @@ fn validate_and_collect_inputs<'a>(
             .collect::<io::Result<Vec<_>>>()?;
         node.kind.validate_dtypes(index, &input_dtypes, dtype)?;
     }
-    if input_reads.is_empty() || input_reads.len() > MAX_FUSED_INPUTS {
+    if input_reads.len() > MAX_FUSED_INPUTS {
         return Err(invalid_input(format!(
-            "fused eltwise requires 1..={MAX_FUSED_INPUTS} leaf inputs, got {}",
+            "fused eltwise supports at most {MAX_FUSED_INPUTS} leaf inputs, got {}",
             input_reads.len()
         )));
     }
@@ -766,8 +766,12 @@ fn validate_and_collect_inputs<'a>(
 }
 
 fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
-    let input_nodes = fused_input_nodes(&key.nodes);
-    let input_count = input_nodes.len();
+    let (node_cbs, intermediate_cbs) = cb_plan(&key.nodes)?;
+    let leaf_nodes = fused_leaf_nodes(&key.nodes, &node_cbs)?;
+    let input_count = leaf_nodes
+        .iter()
+        .filter(|(_, node)| node.kind == FusedElementwiseKind::Input)
+        .count();
     let reader_dynamic_indices: Vec<usize> = (0..input_count).collect();
 
     let mut runtime_args = RuntimeArgsBuilder::new(0, vec![0], reader_dynamic_indices, Vec::new());
@@ -780,10 +784,9 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     }
     let runtime_args = runtime_args.build()?;
 
-    let (_, intermediate_cbs) = cb_plan(&key.nodes)?;
-    let mut cbs = Vec::with_capacity(input_count + intermediate_cbs.len() + 1);
-    for (index, node) in input_nodes.iter().enumerate() {
-        cbs.push(CBConfig::new(index, node_dtype(node)?));
+    let mut cbs = Vec::with_capacity(leaf_nodes.len() + intermediate_cbs.len() + 1);
+    for (cb, node) in &leaf_nodes {
+        cbs.push(CBConfig::new(*cb as usize, node_dtype(node)?));
     }
     for (cb, dtype) in intermediate_cbs {
         cbs.push(CBConfig::new(cb as usize, dtype));
@@ -817,7 +820,7 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     }
 
     Ok(Program {
-        reader_kernel: reader_source(&input_nodes)?,
+        reader_kernel: reader_source(&leaf_nodes, input_count)?,
         compute_kernel: compute_source(&key)?,
         writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
@@ -831,15 +834,27 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     })
 }
 
-fn fused_input_nodes(nodes: &[FusedElementwiseNode]) -> Vec<&FusedElementwiseNode> {
+fn fused_leaf_nodes<'a>(
+    nodes: &'a [FusedElementwiseNode],
+    node_cbs: &[Option<u32>],
+) -> io::Result<Vec<(u32, &'a FusedElementwiseNode)>> {
     nodes
         .iter()
-        .filter(|node| node.kind == FusedElementwiseKind::Input)
+        .enumerate()
+        .filter(|(_, node)| {
+            matches!(
+                node.kind,
+                FusedElementwiseKind::Input | FusedElementwiseKind::Constant
+            )
+        })
+        .map(|(index, node)| Ok((cb_for_node(node_cbs, index)?, node)))
         .collect()
 }
 
-fn reader_source(input_nodes: &[&FusedElementwiseNode]) -> io::Result<String> {
-    let input_count = input_nodes.len();
+fn reader_source(
+    leaf_nodes: &[(u32, &FusedElementwiseNode)],
+    input_count: usize,
+) -> io::Result<String> {
     let mut arg_loads = String::new();
     let mut addr_gens = String::new();
     let mut reserves = String::new();
@@ -852,42 +867,61 @@ fn reader_source(input_nodes: &[&FusedElementwiseNode]) -> io::Result<String> {
             "  uint32_t input_addr_{index} = get_arg_val<uint32_t>({index});"
         )
         .unwrap();
+    }
+
+    let mut input_arg_index = 0usize;
+    for (leaf_index, (cb, node)) in leaf_nodes.iter().enumerate() {
         writeln!(
             addr_gens,
-            "  constexpr uint32_t cb_input_{index} = tt::CBIndex::c_{index};"
+            "  constexpr uint32_t cb_leaf_{leaf_index} = tt::CBIndex::c_{cb};"
         )
         .unwrap();
-        writeln!(
-            addr_gens,
-            "  const InterleavedAddrGenFast<true> input_{index} = {{"
-        )
-        .unwrap();
-        writeln!(
-            addr_gens,
-            "    .bank_base_address = input_addr_{index}, .page_size = get_tile_size(cb_input_{index}), .data_format = get_dataformat(cb_input_{index}),"
-        )
-        .unwrap();
-        writeln!(addr_gens, "  }};").unwrap();
-        writeln!(reserves, "    cb_reserve_back(cb_input_{index}, 1);").unwrap();
-        let tile_id = if input_nodes[index].single_tile_broadcast {
-            "0"
-        } else {
-            "offset + i"
-        };
-        writeln!(
-            reads,
-            "    noc_async_read_tile({tile_id}, input_{index}, get_write_ptr(cb_input_{index}));"
-        )
-        .unwrap();
-        if input_nodes[index].single_tile_broadcast {
-            let bytes = element_bytes(node_dtype(input_nodes[index])?);
-            writeln!(
-                broadcasts,
-                "    replicate_first_element(cb_input_{index}, {bytes});"
-            )
-            .unwrap();
+        writeln!(reserves, "    cb_reserve_back(cb_leaf_{leaf_index}, 1);").unwrap();
+        match node.kind {
+            FusedElementwiseKind::Input => {
+                writeln!(
+                    addr_gens,
+                    "  const InterleavedAddrGenFast<true> input_{input_arg_index} = {{"
+                )
+                .unwrap();
+                writeln!(
+                    addr_gens,
+                    "    .bank_base_address = input_addr_{input_arg_index}, .page_size = get_tile_size(cb_leaf_{leaf_index}), .data_format = get_dataformat(cb_leaf_{leaf_index}),"
+                )
+                .unwrap();
+                writeln!(addr_gens, "  }};").unwrap();
+                let tile_id = if node.single_tile_broadcast {
+                    "0"
+                } else {
+                    "offset + i"
+                };
+                writeln!(
+                    reads,
+                    "    noc_async_read_tile({tile_id}, input_{input_arg_index}, get_write_ptr(cb_leaf_{leaf_index}));"
+                )
+                .unwrap();
+                if node.single_tile_broadcast {
+                    let bytes = element_bytes(node_dtype(node)?);
+                    writeln!(
+                        broadcasts,
+                        "    replicate_first_element(cb_leaf_{leaf_index}, {bytes});"
+                    )
+                    .unwrap();
+                }
+                input_arg_index += 1;
+            }
+            FusedElementwiseKind::Constant => {
+                let bytes = element_bytes(node_dtype(node)?);
+                writeln!(
+                    broadcasts,
+                    "    fill_constant_tile(cb_leaf_{leaf_index}, {}u, {bytes});",
+                    node.packed_value
+                )
+                .unwrap();
+            }
+            _ => unreachable!("fused reader leaves are limited to inputs and constants"),
         }
-        writeln!(pushes, "    cb_push_back(cb_input_{index}, 1);").unwrap();
+        writeln!(pushes, "    cb_push_back(cb_leaf_{leaf_index}, 1);").unwrap();
     }
 
     Ok(format!(
@@ -904,6 +938,15 @@ fn reader_source(input_nodes: &[&FusedElementwiseNode]) -> io::Result<String> {
              return half | (half << 16);\n\
            }}\n\
            return packed_value;\n\
+         }}\n\
+         void fill_constant_tile(uint32_t cb, uint32_t packed_value, uint32_t element_bytes) {{\n\
+           uint32_t l1_addr = get_write_ptr(cb);\n\
+           volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(l1_addr);\n\
+           uint32_t word = repeated_word(packed_value, element_bytes);\n\
+           uint32_t words = get_tile_size(cb) / sizeof(uint32_t);\n\
+           for (uint32_t i = 0; i < words; ++i) {{\n\
+             ptr[i] = word;\n\
+           }}\n\
          }}\n\
          void replicate_first_element(uint32_t cb, uint32_t element_bytes) {{\n\
            uint32_t l1_addr = get_write_ptr(cb);\n\
@@ -1478,9 +1521,12 @@ fn cb_plan(nodes: &[FusedElementwiseNode]) -> io::Result<(Vec<Option<u32>>, Vec<
     let mut node_cbs = vec![None; nodes.len()];
     let mut leaf_count = 0u32;
     for (index, node) in nodes.iter().enumerate() {
-        if node.kind == FusedElementwiseKind::Input {
+        if matches!(
+            node.kind,
+            FusedElementwiseKind::Input | FusedElementwiseKind::Constant
+        ) {
             if leaf_count >= 16 {
-                return Err(invalid_input("fused eltwise needs too many input CBs"));
+                return Err(invalid_input("fused eltwise needs too many leaf CBs"));
             }
             node_cbs[index] = Some(leaf_count);
             leaf_count += 1;
@@ -1830,6 +1876,20 @@ mod tests {
 
         assert!(steps.body.contains("unary_max_tile_init();"));
         assert!(steps.body.contains("unary_max_tile(0, 0);"));
+    }
+
+    #[test]
+    fn validate_allows_constant_only_fusion() {
+        let mut lhs = node(FusedElementwiseKind::Constant, Vec::new());
+        lhs.packed_value = 0x3f80_3f80;
+        let mut rhs = node(FusedElementwiseKind::Constant, Vec::new());
+        rhs.packed_value = 0x4000_4000;
+
+        let nodes = vec![lhs, rhs, node(FusedElementwiseKind::Add, vec![0, 1])];
+        let inputs = validate_and_collect_inputs(&[], &nodes, &[32, 32])
+            .expect("constant-only fused op should not require external inputs");
+
+        assert!(inputs.is_empty());
     }
 
     #[test]
