@@ -2806,7 +2806,7 @@ fn execute_scatter(
             "scatter",
         );
     }
-    kernels::scatter::validate_set_dimension_numbers(
+    let scatter_dim = kernels::scatter::validate_set_dimension_numbers(
         operand_shape.len(),
         &dimension_numbers.update_window_dims,
         &dimension_numbers.inserted_window_dims,
@@ -2842,6 +2842,7 @@ fn execute_scatter(
         &operand_shape,
         &start_indices_shape,
         &update_shape,
+        scatter_dim,
         dtype,
         "pjrt_scatter",
     )

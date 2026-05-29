@@ -18,6 +18,7 @@ const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
 pub(crate) struct ScatterShape {
     operand_shape: Vec<u32>,
     update_shape: Vec<u32>,
+    scatter_dim: u32,
     update_count: u32,
     operand_tile_rows: u32,
     operand_tiles_per_row: u32,
@@ -77,6 +78,7 @@ pub(crate) fn scatter_set(
     operand_shape: &[usize],
     start_indices_shape: &[usize],
     update_shape: &[usize],
+    scatter_dim: usize,
     dtype: DType,
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
@@ -87,10 +89,11 @@ pub(crate) fn scatter_set(
         operand_shape,
         start_indices_shape,
         update_shape,
+        scatter_dim,
         dtype,
     )?;
 
-    let shape = scatter_shape(operand_shape, update_shape)?;
+    let shape = scatter_shape(operand_shape, update_shape, scatter_dim)?;
     let output_tiles = usize::try_from(shape.output_tiles).map_err(|_| {
         invalid_input(format!(
             "scatter output tile count does not fit in usize: {}",
@@ -126,10 +129,17 @@ fn validate_scatter_buffers(
     operand_shape: &[usize],
     start_indices_shape: &[usize],
     update_shape: &[usize],
+    scatter_dim: usize,
     dtype: DType,
 ) -> io::Result<()> {
     if operand_shape.is_empty() {
         return Err(invalid_input("scatter set requires rank >= 1"));
+    }
+    if scatter_dim >= operand_shape.len() {
+        return Err(invalid_input(format!(
+            "scatter dim {scatter_dim} is out of bounds for rank {}",
+            operand_shape.len()
+        )));
     }
     if operand.dtype != dtype {
         return Err(invalid_input(format!(
@@ -156,16 +166,16 @@ fn validate_scatter_buffers(
         )));
     }
     let update_count = start_indices_shape[0];
-    if update_shape.len() != operand_shape.len() || update_shape.first() != Some(&update_count) {
+    if update_shape.len() != operand_shape.len() {
         return Err(invalid_input(format!(
-            "scatter set update shape must be [N] + operand_shape[1..], got {update_shape:?} for operand {operand_shape:?} and N={update_count}"
+            "scatter set update rank must match operand rank, got {update_shape:?} for operand {operand_shape:?}"
         )));
     }
-    if update_shape[1..] != operand_shape[1..] {
+    let mut expected_update_shape = operand_shape.to_vec();
+    expected_update_shape[scatter_dim] = update_count;
+    if update_shape != expected_update_shape.as_slice() {
         return Err(invalid_input(format!(
-            "scatter set update tail shape mismatch: got {:?}, expected {:?}",
-            &update_shape[1..],
-            &operand_shape[1..]
+            "scatter set update shape mismatch: got {update_shape:?}, expected {expected_update_shape:?}"
         )));
     }
 
@@ -193,7 +203,11 @@ fn validate_allocation(buffer: &DramBuffer, logical_shape: &[usize], name: &str)
     Ok(())
 }
 
-fn scatter_shape(operand_shape: &[usize], update_shape: &[usize]) -> io::Result<ScatterShape> {
+fn scatter_shape(
+    operand_shape: &[usize],
+    update_shape: &[usize],
+    scatter_dim: usize,
+) -> io::Result<ScatterShape> {
     let operand_allocation_shape = tiled_allocation_shape(operand_shape)?;
     let update_allocation_shape = tiled_allocation_shape(update_shape)?;
     let operand_rank = operand_allocation_shape.len();
@@ -202,7 +216,8 @@ fn scatter_shape(operand_shape: &[usize], update_shape: &[usize]) -> io::Result<
     Ok(ScatterShape {
         operand_shape: u32_shape(operand_shape, "scatter operand shape")?,
         update_shape: u32_shape(update_shape, "scatter update shape")?,
-        update_count: u32_arg(update_shape[0], "scatter update count")?,
+        scatter_dim: u32_arg(scatter_dim, "scatter dim")?,
+        update_count: u32_arg(update_shape[scatter_dim], "scatter update count")?,
         operand_tile_rows: u32_arg(
             operand_allocation_shape[operand_rank - 2] / TILE_R,
             "scatter operand tile rows",
@@ -272,6 +287,7 @@ fn scatter_reader_source(dtype: DType, shape: &ScatterShape) -> io::Result<Strin
         "#define SCATTER_RANK {}\n\
          #define SCATTER_OPERAND_SHAPE {}\n\
          #define SCATTER_UPDATE_SHAPE {}\n\
+         #define SCATTER_DIM_ARG {}\n\
          #define SCATTER_UPDATE_COUNT {}\n\
          #define SCATTER_OPERAND_TILE_ROWS {}\n\
          #define SCATTER_OPERAND_TILES_PER_ROW {}\n\
@@ -282,6 +298,7 @@ fn scatter_reader_source(dtype: DType, shape: &ScatterShape) -> io::Result<Strin
         shape.operand_shape.len(),
         cpp_u32_array(&shape.operand_shape),
         cpp_u32_array(&shape.update_shape),
+        shape.scatter_dim,
         shape.update_count,
         shape.operand_tile_rows,
         shape.operand_tiles_per_row,
@@ -298,17 +315,30 @@ pub(crate) fn validate_set_dimension_numbers(
     scatter_indices_batching_dims: &[i64],
     scatter_dims_to_operand_dims: &[i64],
     index_vector_dim: i64,
-) -> io::Result<()> {
-    let expected_update_window_dims = (1..rank as i64).collect::<Vec<_>>();
+) -> io::Result<usize> {
+    if scatter_dims_to_operand_dims.len() != 1 {
+        return Err(invalid_input(format!(
+            "scatter set requires one scatter_dims_to_operand_dims entry, got {scatter_dims_to_operand_dims:?}"
+        )));
+    }
+    let scatter_dim = scatter_dims_to_operand_dims[0];
+    if scatter_dim < 0 || scatter_dim >= rank as i64 {
+        return Err(invalid_input(format!(
+            "scatter dim {scatter_dim} is out of bounds for rank {rank}"
+        )));
+    }
+    let expected_update_window_dims = (0..rank as i64)
+        .filter(|dim| *dim != scatter_dim)
+        .collect::<Vec<_>>();
     if update_window_dims != expected_update_window_dims.as_slice() {
         return Err(invalid_input(format!(
             "scatter set requires update_window_dims {:?}, got {:?}",
             expected_update_window_dims, update_window_dims
         )));
     }
-    if inserted_window_dims != [0] {
+    if inserted_window_dims != [scatter_dim] {
         return Err(invalid_input(format!(
-            "scatter set requires inserted_window_dims [0], got {inserted_window_dims:?}"
+            "scatter set requires inserted_window_dims [{scatter_dim}], got {inserted_window_dims:?}"
         )));
     }
     if !input_batching_dims.is_empty() || !scatter_indices_batching_dims.is_empty() {
@@ -316,17 +346,12 @@ pub(crate) fn validate_set_dimension_numbers(
             "scatter set does not support scatter batching dimensions",
         ));
     }
-    if scatter_dims_to_operand_dims != [0] {
-        return Err(invalid_input(format!(
-            "scatter set requires scatter_dims_to_operand_dims [0], got {scatter_dims_to_operand_dims:?}"
-        )));
-    }
     if index_vector_dim != 1 {
         return Err(invalid_input(format!(
             "scatter set requires index_vector_dim 1, got {index_vector_dim}"
         )));
     }
-    Ok(())
+    Ok(scatter_dim as usize)
 }
 
 pub(crate) fn is_full_window_set_dimension_numbers(
