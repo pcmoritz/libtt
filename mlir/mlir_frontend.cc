@@ -118,17 +118,13 @@ std::optional<mlir::Value> createCaseBranchPredicate(
         mlir::emitError(loc, "stablehlo.case index must be a ranked tensor");
         return std::nullopt;
     }
-    auto integer_type = mlir::dyn_cast<mlir::IntegerType>(index_type.getElementType());
-    if (!integer_type) {
-        mlir::emitError(loc, "stablehlo.case index must have integer element type");
-        return std::nullopt;
-    }
     auto constant = createCaseIndexConstant(
         builder, loc, index_type, branch_index);
     if (!constant) {
         return std::nullopt;
     }
 
+    auto integer_type = mlir::cast<mlir::IntegerType>(index_type.getElementType());
     auto pred_type = mlir::RankedTensorType::get(
         index_type.getShape(),
         builder.getI1Type());
@@ -968,10 +964,14 @@ mlir::LogicalResult runCleanupRewritePatterns(
 }
 
 bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module, std::string& error) {
+    auto addCleanup = [](mlir::PassManager& pm) {
+        pm.addPass(mlir::createInlinerPass());
+        pm.addPass(mlir::createCanonicalizerPass());
+        pm.addPass(mlir::createCSEPass());
+    };
+
     mlir::PassManager pm(&context);
-    pm.addPass(mlir::createInlinerPass());
-    pm.addPass(mlir::createCanonicalizerPass());
-    pm.addPass(mlir::createCSEPass());
+    addCleanup(pm);
     if (mlir::failed(pm.run(module))) {
         error = "failed to run MLIR cleanup passes";
         return false;
@@ -982,9 +982,7 @@ bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module, std::st
     }
 
     mlir::PassManager post_case_pm(&context);
-    post_case_pm.addPass(mlir::createInlinerPass());
-    post_case_pm.addPass(mlir::createCanonicalizerPass());
-    post_case_pm.addPass(mlir::createCSEPass());
+    addCleanup(post_case_pm);
     if (mlir::failed(post_case_pm.run(module))) {
         error = "failed to run MLIR post-case cleanup passes";
         return false;
