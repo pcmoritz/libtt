@@ -768,10 +768,9 @@ fn validate_and_collect_inputs<'a>(
 fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     let (node_cbs, intermediate_cbs) = cb_plan(&key.nodes)?;
     let leaf_nodes = fused_leaf_nodes(&key.nodes, &node_cbs)?;
-    let input_count = key
-        .nodes
+    let input_count = leaf_nodes
         .iter()
-        .filter(|node| node.kind == FusedElementwiseKind::Input)
+        .filter(|(_, node)| node.kind == FusedElementwiseKind::Input)
         .count();
     let reader_dynamic_indices: Vec<usize> = (0..input_count).collect();
 
