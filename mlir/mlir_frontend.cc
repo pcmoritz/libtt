@@ -2121,6 +2121,20 @@ mlir::Operation* singleUser(mlir::Value value) {
     return *value.user_begin();
 }
 
+bool isIdentityCustomCall(mlir::stablehlo::CustomCallOp custom_call_op) {
+    if (!custom_call_op || custom_call_op->getNumResults() != 1 ||
+        custom_call_op.getHasSideEffect()) {
+        return false;
+    }
+    auto call_target = custom_call_op.getCallTargetName();
+    if (call_target != "annotate_device_placement" && call_target != "Sharding") {
+        return false;
+    }
+    auto inputs = custom_call_op.getInputs();
+    return inputs.size() == 1 &&
+           inputs.front().getType() == custom_call_op.getResult(0).getType();
+}
+
 bool isBf16Tensor(mlir::Value value) {
     auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
     return tensor && tensor.hasStaticShape() && tensor.getElementType().isBF16();
@@ -2226,20 +2240,67 @@ std::optional<MatmulTopKEpilogueRegion> collectMatmulTopKEpilogue(
     };
 }
 
+bool isFoldableRhsMatmulTranspose(mlir::stablehlo::TransposeOp transpose_op) {
+    if (!transpose_op) {
+        return false;
+    }
+    auto* user = singleUser(transpose_op.getResult());
+    mlir::Value dot_rhs = transpose_op.getResult();
+    if (auto custom_call_op =
+            mlir::dyn_cast_or_null<mlir::stablehlo::CustomCallOp>(user);
+        isIdentityCustomCall(custom_call_op)) {
+        dot_rhs = custom_call_op.getResult(0);
+        user = singleUser(dot_rhs);
+    }
+    auto dot_op = user
+        ? mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(user)
+        : nullptr;
+    if (!dot_op || dot_op.getRhs() != dot_rhs) {
+        return false;
+    }
+    auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        transpose_op.getOperand().getType());
+    auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        transpose_op.getResult().getType());
+    if (!input_type || !output_type ||
+        !input_type.hasStaticShape() ||
+        !output_type.hasStaticShape() ||
+        input_type.getRank() != 2 ||
+        output_type.getRank() != 2) {
+        return false;
+    }
+    auto permutation = transpose_op.getPermutation();
+    return permutation.size() == 2 && permutation[0] == 1 && permutation[1] == 0;
+}
+
+std::vector<int64_t> transposeOperandDims(
+    mlir::stablehlo::TransposeOp transpose_op,
+    llvm::ArrayRef<int64_t> result_dims) {
+    auto permutation = transpose_op.getPermutation();
+    std::vector<int64_t> operand_dims;
+    operand_dims.reserve(result_dims.size());
+    for (int64_t dim : result_dims) {
+        operand_dims.push_back(permutation[dim]);
+    }
+    return operand_dims;
+}
+
 void addMatmulDimensions(
-    mlir::stablehlo::DotGeneralOp dot_op,
+    llvm::ArrayRef<int64_t> lhs_batching_dimensions,
+    llvm::ArrayRef<int64_t> rhs_batching_dimensions,
+    llvm::ArrayRef<int64_t> lhs_contracting_dimensions,
+    llvm::ArrayRef<int64_t> rhs_contracting_dimensions,
     tt::MatmulOp& matmul) {
-    auto dims = dot_op.getDotDimensionNumbers();
-    for (int64_t dim : dims.getLhsBatchingDimensions()) {
+    for (int64_t dim : lhs_batching_dimensions) {
         matmul.add_lhs_batching_dimensions(dim);
     }
-    for (int64_t dim : dims.getRhsBatchingDimensions()) {
+    for (int64_t dim : rhs_batching_dimensions) {
         matmul.add_rhs_batching_dimensions(dim);
     }
-    for (int64_t dim : dims.getLhsContractingDimensions()) {
+    for (int64_t dim : lhs_contracting_dimensions) {
         matmul.add_lhs_contracting_dimensions(dim);
     }
-    for (int64_t dim : dims.getRhsContractingDimensions()) {
+    for (int64_t dim : rhs_contracting_dimensions) {
         matmul.add_rhs_contracting_dimensions(dim);
     }
 }
@@ -2250,11 +2311,33 @@ bool addMatmulOp(
     tt::Executable& executable,
     llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
     std::string& error) {
+    mlir::Value rhs = dot_op.getRhs();
+    auto dims = dot_op.getDotDimensionNumbers();
+    auto rhs_batching_dimensions = dims.getRhsBatchingDimensions().vec();
+    auto rhs_contracting_dimensions = dims.getRhsContractingDimensions().vec();
+    mlir::Value rhs_transpose_value = rhs;
+    if (auto custom_call_op =
+            mlir::dyn_cast_or_null<mlir::stablehlo::CustomCallOp>(
+                rhs.getDefiningOp());
+        isIdentityCustomCall(custom_call_op)) {
+        rhs_transpose_value = custom_call_op.getInputs().front();
+    }
+    if (auto transpose_op =
+            mlir::dyn_cast_or_null<mlir::stablehlo::TransposeOp>(
+                rhs_transpose_value.getDefiningOp());
+        isFoldableRhsMatmulTranspose(transpose_op)) {
+        rhs = transpose_op.getOperand();
+        rhs_batching_dimensions =
+            transposeOperandDims(transpose_op, rhs_batching_dimensions);
+        rhs_contracting_dimensions =
+            transposeOperandDims(transpose_op, rhs_contracting_dimensions);
+    }
+
     uint32_t lhs_id = 0;
     uint32_t rhs_id = 0;
     uint32_t matmul_output_id = 0;
     if (!addValueDesc(dot_op.getLhs(), executable, value_ids, error, lhs_id) ||
-        !addValueDesc(dot_op.getRhs(), executable, value_ids, error, rhs_id) ||
+        !addValueDesc(rhs, executable, value_ids, error, rhs_id) ||
         !addValueDesc(dot_op.getResult(), executable, value_ids, error, matmul_output_id)) {
         return false;
     }
@@ -2264,7 +2347,12 @@ bool addMatmulOp(
     auto* matmul = op->mutable_matmul();
     matmul->set_lhs_id(lhs_id);
     matmul->set_rhs_id(rhs_id);
-    addMatmulDimensions(dot_op, *matmul);
+    addMatmulDimensions(
+        dims.getLhsBatchingDimensions(),
+        rhs_batching_dimensions,
+        dims.getLhsContractingDimensions(),
+        rhs_contracting_dimensions,
+        *matmul);
 
     if (top_k_epilogue) {
         uint32_t values_id = 0;
@@ -2663,6 +2751,9 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto transpose_op = mlir::dyn_cast<mlir::stablehlo::TransposeOp>(op)) {
+            if (isFoldableRhsMatmulTranspose(transpose_op)) {
+                continue;
+            }
             uint32_t operand_id = 0;
             uint32_t output_id = 0;
             if (!addValueDesc(transpose_op.getOperand(), executable, value_ids, error, operand_id) ||
@@ -2756,6 +2847,12 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 if (input.getType() != custom_call_op.getResult(0).getType()) {
                     error = "identity custom_call input and result types must match";
                     return false;
+                }
+                if (auto transpose_op =
+                        mlir::dyn_cast_or_null<mlir::stablehlo::TransposeOp>(
+                            input.getDefiningOp());
+                    isFoldableRhsMatmulTranspose(transpose_op)) {
+                    input = transpose_op.getOperand();
                 }
                 uint32_t input_id = 0;
                 if (!addValueDesc(input, executable, value_ids, error, input_id)) {

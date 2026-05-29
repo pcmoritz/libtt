@@ -161,6 +161,7 @@ enum MatmulViewKind {
     Contiguous = 0,
     Generic = 2,
     TiledIndexMap = 4,
+    TileTranspose = 5,
 }
 
 impl MatmulViewKind {
@@ -571,6 +572,7 @@ fn dot_general_shape(
             &lhs_dims.contract,
             m,
             k,
+            false,
         )?,
         rhs_view: operand_view(
             rhs_shape,
@@ -579,6 +581,7 @@ fn dot_general_shape(
             &rhs_dims.free,
             k,
             n,
+            true,
         )?,
         output_view: operand_view(
             output_shape,
@@ -587,6 +590,7 @@ fn dot_general_shape(
             &output_col_dims,
             m,
             n,
+            false,
         )?,
     })
 }
@@ -652,11 +656,12 @@ fn operand_view(
     col_dims: &[usize],
     logical_rows: usize,
     logical_cols: usize,
+    allow_tile_transpose: bool,
 ) -> io::Result<MatmulOperandView> {
     let allocation_shape = tiled_allocation_shape(shape)?;
     let rank = shape.len();
     let allocation_rank = allocation_shape.len();
-    let kind = operand_view_kind(rank, batch_dims, row_dims, col_dims);
+    let kind = operand_view_kind(rank, batch_dims, row_dims, col_dims, allow_tile_transpose);
     Ok(MatmulOperandView {
         kind,
         rank: u32_value(rank, "matmul operand rank")?,
@@ -685,6 +690,7 @@ fn operand_view_kind(
     batch_dims: &[usize],
     row_dims: &[usize],
     col_dims: &[usize],
+    allow_tile_transpose: bool,
 ) -> MatmulViewKind {
     let leading_batch = batch_dims.iter().copied().eq(0..batch_dims.len());
     if leading_batch
@@ -693,11 +699,25 @@ fn operand_view_kind(
         && col_dims == [rank - 1]
     {
         MatmulViewKind::Contiguous
+    } else if allow_tile_transpose && is_tile_transpose_view(rank, batch_dims, row_dims, col_dims) {
+        MatmulViewKind::TileTranspose
     } else if is_tiled_index_map_view(rank, batch_dims, row_dims, col_dims) {
         MatmulViewKind::TiledIndexMap
     } else {
         MatmulViewKind::Generic
     }
+}
+
+fn is_tile_transpose_view(
+    rank: usize,
+    batch_dims: &[usize],
+    row_dims: &[usize],
+    col_dims: &[usize],
+) -> bool {
+    rank >= 2
+        && row_dims == [rank - 1]
+        && col_dims == [rank - 2]
+        && batch_dims.iter().copied().eq(0..rank - 2)
 }
 
 fn is_tiled_index_map_view(
@@ -1192,7 +1212,11 @@ fn matmul_program(
         } else {
             MATMUL_WRITER_SENDER.to_owned()
         },
-        compute_kernel: compute_src(plan, plan.batches_per_group),
+        compute_kernel: compute_src(
+            plan,
+            plan.batches_per_group,
+            rhs_view.kind == MatmulViewKind::TileTranspose,
+        ),
         reader_recv_kernel: MATMUL_READER_RECV.to_owned(),
         writer_recv_kernel: if top1_epilogue {
             MATMUL_TOP1_WRITER.to_owned()
@@ -1528,9 +1552,10 @@ fn mcast_rect_args(cols: &[u8], y: u8) -> [u32; 5] {
     }
 }
 
-fn compute_src(plan: &MatmulPlan, batch_count: usize) -> String {
+fn compute_src(plan: &MatmulPlan, batch_count: usize, in1_transpose: bool) -> String {
     let replacements = [
         ("@BATCH_COUNT@", batch_count),
+        ("@IN1_TRANSPOSE@", usize::from(in1_transpose)),
         ("@IN0_BLOCK_W@", plan.in0_block_w),
         ("@IN0_NUM_SUBBLOCKS@", plan.in0_num_subblocks()),
         ("@IN0_BLOCK_NUM_TILES@", plan.in0_block_num_tiles()),
@@ -1700,7 +1725,8 @@ mod tests {
         let grid = plan_grid(&plan);
         let sender = grid[0][0];
         let mut builder = RuntimeArgsBuilder::new(0, Vec::new(), Vec::new(), Vec::new());
-        let lhs_view = operand_view(&[4096, 8192], &[], &[0], &[1], 4096, 8192).expect("lhs view");
+        let lhs_view =
+            operand_view(&[4096, 8192], &[], &[0], &[1], 4096, 8192, false).expect("lhs view");
         let reader =
             reader_args(&plan, &grid, 0, sender, 128, 1, 0, 1, &lhs_view).expect("reader args");
         builder

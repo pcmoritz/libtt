@@ -8,6 +8,7 @@ use crate::hw::{align_down, worker_cores, Arc, CoreCoord, Dram, DramTile, Tensix
 use crate::kernels::kernel::RuntimeArgs;
 use crate::linux::{NocOrdering, TlbWindow};
 use crate::log::log;
+use crate::profile;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -402,8 +403,15 @@ impl Device {
         } else {
             (launch.setup.as_slice(), launch.setup_records.as_slice())
         };
+        let profile_start = profile::start();
         self.dispatcher
             .launch(&program, setup, setup_records, &launch.runtime_args)?;
+        profile::record_program_launch(&program.name, is_staged, profile_start);
+        if profile::sync_each_program() {
+            let sync_start = profile::start();
+            self.dispatcher.finish()?;
+            profile::record_program_sync(&program.name, is_staged, sync_start);
+        }
         self.staged_cached_program = Some(program_id);
         Ok(())
     }
