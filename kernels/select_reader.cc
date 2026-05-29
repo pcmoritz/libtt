@@ -4,6 +4,20 @@ namespace {
 
 constexpr uint32_t pred_tile_bytes = 32 * 32;
 
+#ifdef SELECT_RAW_ELEMENT_TYPE
+using Element = SELECT_RAW_ELEMENT_TYPE;
+
+void fill_tile(uint32_t cb, Element value) {
+  uint32_t l1_addr = get_write_ptr(cb);
+  volatile tt_l1_ptr Element *ptr =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(l1_addr);
+  uint32_t elements = get_tile_size(cb) / sizeof(Element);
+  for (uint32_t i = 0; i < elements; ++i) {
+    ptr[i] = value;
+  }
+}
+#else
+
 void fill_tile(uint32_t cb, uint32_t packed_value) {
   uint32_t l1_addr = get_write_ptr(cb);
   volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(l1_addr);
@@ -13,6 +27,8 @@ void fill_tile(uint32_t cb, uint32_t packed_value) {
   }
 }
 
+#endif
+
 }  // namespace
 
 void kernel_main() {
@@ -21,12 +37,20 @@ void kernel_main() {
   uint32_t false_addr = get_arg_val<uint32_t>(2);
   uint32_t offset = get_arg_val<uint32_t>(3);
   uint32_t n_tiles = get_arg_val<uint32_t>(4);
+#ifdef SELECT_RAW_ELEMENT_TYPE
+  Element true_constant = static_cast<Element>(get_arg_val<uint32_t>(5));
+  Element false_constant = static_cast<Element>(get_arg_val<uint32_t>(6));
+#else
   uint32_t true_constant = get_arg_val<uint32_t>(5);
   uint32_t false_constant = get_arg_val<uint32_t>(6);
+#endif
 
   constexpr uint32_t cb_pred = tt::CBIndex::c_0;
   constexpr uint32_t cb_true = tt::CBIndex::c_1;
   constexpr uint32_t cb_false = tt::CBIndex::c_2;
+#ifdef SELECT_RAW_ELEMENT_TYPE
+  constexpr uint32_t cb_out = tt::CBIndex::c_16;
+#endif
 
   const InterleavedAddrGenFast<true> pred = {
     .bank_base_address = pred_addr, .page_size = pred_tile_bytes, .data_format = DataFormat::UInt8,
@@ -59,5 +83,30 @@ void kernel_main() {
     cb_push_back(cb_pred, 1);
     cb_push_back(cb_true, 1);
     cb_push_back(cb_false, 1);
+
+#ifdef SELECT_RAW_ELEMENT_TYPE
+    cb_wait_front(cb_pred, 1);
+    cb_wait_front(cb_true, 1);
+    cb_wait_front(cb_false, 1);
+    cb_reserve_back(cb_out, 1);
+
+    volatile tt_l1_ptr const uint8_t *pred_ptr =
+        reinterpret_cast<volatile tt_l1_ptr const uint8_t *>(get_read_ptr(cb_pred));
+    volatile tt_l1_ptr const Element *true_ptr =
+        reinterpret_cast<volatile tt_l1_ptr const Element *>(get_read_ptr(cb_true));
+    volatile tt_l1_ptr const Element *false_ptr =
+        reinterpret_cast<volatile tt_l1_ptr const Element *>(get_read_ptr(cb_false));
+    volatile tt_l1_ptr Element *out_ptr =
+        reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_out));
+    uint32_t elements = get_tile_size(cb_out) / sizeof(Element);
+    for (uint32_t element = 0; element < elements; ++element) {
+      out_ptr[element] = pred_ptr[element] != 0 ? true_ptr[element] : false_ptr[element];
+    }
+
+    cb_pop_front(cb_pred, 1);
+    cb_pop_front(cb_true, 1);
+    cb_pop_front(cb_false, 1);
+    cb_push_back(cb_out, 1);
+#endif
   }
 }
