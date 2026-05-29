@@ -87,79 +87,95 @@ mlir::OwningOpRef<mlir::ModuleOp> parseModule(
         &context);
 }
 
-std::optional<mlir::Value> createCaseIndexConstant(
-    mlir::OpBuilder& builder,
-    mlir::Location loc,
-    mlir::RankedTensorType index_type,
-    uint64_t value) {
+struct CaseIndexInfo {
+    mlir::RankedTensorType tensor_type;
+    mlir::IntegerType integer_type;
+};
+
+std::optional<CaseIndexInfo> validateCaseIndex(mlir::stablehlo::CaseOp case_op) {
+    auto index_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        case_op.getIndex().getType());
+    if (!index_type) {
+        case_op.emitError("stablehlo.case index must be a ranked tensor");
+        return std::nullopt;
+    }
     auto integer_type = mlir::dyn_cast<mlir::IntegerType>(index_type.getElementType());
     if (!integer_type) {
-        mlir::emitError(loc, "stablehlo.case index must have integer element type");
+        case_op.emitError("stablehlo.case index must have integer element type");
         return std::nullopt;
     }
     if (index_type.getRank() != 0) {
-        mlir::emitError(loc, "stablehlo.case index must be a scalar tensor");
+        case_op.emitError("stablehlo.case index must be a scalar tensor");
         return std::nullopt;
     }
+    return CaseIndexInfo{index_type, integer_type};
+}
 
+mlir::Value createCaseIndexConstant(
+    mlir::OpBuilder& builder,
+    mlir::Location loc,
+    CaseIndexInfo index_info,
+    uint64_t value) {
     auto attr = mlir::DenseElementsAttr::get(
-        index_type,
-        llvm::APInt(integer_type.getWidth(), value, !integer_type.isUnsigned()));
+        index_info.tensor_type,
+        llvm::APInt(
+            index_info.integer_type.getWidth(),
+            value,
+            !index_info.integer_type.isUnsigned()));
     return builder.create<mlir::stablehlo::ConstantOp>(loc, attr).getResult();
 }
 
-std::optional<mlir::Value> createCaseBranchPredicate(
+mlir::Value createCaseBranchPredicate(
     mlir::OpBuilder& builder,
     mlir::Location loc,
     mlir::Value index,
+    CaseIndexInfo index_info,
     uint64_t branch_index) {
-    auto index_type = mlir::dyn_cast<mlir::RankedTensorType>(index.getType());
-    if (!index_type) {
-        mlir::emitError(loc, "stablehlo.case index must be a ranked tensor");
-        return std::nullopt;
-    }
     auto constant = createCaseIndexConstant(
-        builder, loc, index_type, branch_index);
-    if (!constant) {
-        return std::nullopt;
-    }
-
-    auto integer_type = mlir::cast<mlir::IntegerType>(index_type.getElementType());
+        builder, loc, index_info, branch_index);
     auto pred_type = mlir::RankedTensorType::get(
-        index_type.getShape(),
+        index_info.tensor_type.getShape(),
         builder.getI1Type());
     auto compare_type = mlir::stablehlo::ComparisonTypeAttr::get(
         builder.getContext(),
-        integer_type.isUnsigned() ? mlir::stablehlo::ComparisonType::UNSIGNED
-                                  : mlir::stablehlo::ComparisonType::SIGNED);
+        index_info.integer_type.isUnsigned()
+            ? mlir::stablehlo::ComparisonType::UNSIGNED
+            : mlir::stablehlo::ComparisonType::SIGNED);
     return builder.create<mlir::stablehlo::CompareOp>(
         loc,
         pred_type,
         index,
-        *constant,
+        constant,
         mlir::stablehlo::ComparisonDirection::EQ,
         compare_type).getResult();
 }
 
-std::optional<mlir::Value> broadcastCasePredicateToResult(
+mlir::LogicalResult validateCasePredicateBroadcast(
+    mlir::stablehlo::CaseOp case_op,
+    CaseIndexInfo index_info) {
+    for (mlir::OpResult result : case_op->getResults()) {
+        auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(result.getType());
+        if (!tensor_type) {
+            return case_op.emitError("stablehlo.case select values must be ranked tensors");
+        }
+        if (index_info.tensor_type.getShape() != tensor_type.getShape() &&
+            index_info.tensor_type.getRank() != 0) {
+            return case_op.emitError(
+                "stablehlo.case non-scalar predicates cannot be broadcast to branch result shapes");
+        }
+    }
+    return mlir::success();
+}
+
+mlir::Value broadcastCasePredicateToResult(
     mlir::OpBuilder& builder,
     mlir::Location loc,
     mlir::Value predicate,
     mlir::Type result_type) {
-    auto pred_type = mlir::dyn_cast<mlir::RankedTensorType>(predicate.getType());
-    auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(result_type);
-    if (!pred_type || !tensor_type) {
-        mlir::emitError(loc, "stablehlo.case select values must be ranked tensors");
-        return std::nullopt;
-    }
+    auto pred_type = mlir::cast<mlir::RankedTensorType>(predicate.getType());
+    auto tensor_type = mlir::cast<mlir::RankedTensorType>(result_type);
     if (pred_type.getShape() == tensor_type.getShape()) {
         return predicate;
-    }
-    if (pred_type.getRank() != 0) {
-        mlir::emitError(
-            loc,
-            "stablehlo.case non-scalar predicates cannot be broadcast to branch result shapes");
-        return std::nullopt;
     }
 
     auto broadcast_type = mlir::RankedTensorType::get(
@@ -172,11 +188,9 @@ std::optional<mlir::Value> broadcastCasePredicateToResult(
         llvm::ArrayRef<int64_t>{}).getResult();
 }
 
-mlir::LogicalResult cloneCaseBranch(
-    mlir::OpBuilder& builder,
+mlir::LogicalResult validateCaseBranch(
     mlir::stablehlo::CaseOp case_op,
-    mlir::Region& branch,
-    llvm::SmallVectorImpl<mlir::Value>& results) {
+    mlir::Region& branch) {
     if (branch.empty() || branch.getBlocks().size() != 1) {
         return case_op.emitError("stablehlo.case branches must contain exactly one block");
     }
@@ -192,7 +206,20 @@ mlir::LogicalResult cloneCaseBranch(
     if (return_op.getResults().size() != case_op->getNumResults()) {
         return case_op.emitError("stablehlo.case branch result count does not match case result count");
     }
+    for (auto [result_index, result] : llvm::enumerate(return_op.getResults())) {
+        if (result.getType() != case_op->getResult(result_index).getType()) {
+            return case_op.emitError("stablehlo.case branch result type does not match case result type");
+        }
+    }
+    return mlir::success();
+}
 
+void cloneCaseBranch(
+    mlir::OpBuilder& builder,
+    mlir::Region& branch,
+    llvm::SmallVectorImpl<mlir::Value>& results) {
+    mlir::Block& block = branch.front();
+    auto return_op = mlir::cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
     mlir::IRMapping mapper;
     for (mlir::Operation& op : block) {
         if (&op == return_op.getOperation()) {
@@ -205,7 +232,6 @@ mlir::LogicalResult cloneCaseBranch(
     for (mlir::Value value : return_op.getResults()) {
         results.push_back(mapper.lookupOrDefault(value));
     }
-    return mlir::success();
 }
 
 std::optional<uint64_t> constantCaseIndex(mlir::Value index) {
@@ -261,19 +287,32 @@ mlir::LogicalResult lowerSingleCaseOpToSelects(
         return case_op.emitError("stablehlo.case must contain at least one branch");
     }
 
+    auto index_info = validateCaseIndex(case_op);
+    if (!index_info) {
+        return mlir::failure();
+    }
+    for (mlir::Region& branch : branches) {
+        if (mlir::failed(validateCaseBranch(case_op, branch))) {
+            return mlir::failure();
+        }
+    }
+
+    auto constant_index = constantCaseIndex(case_op.getIndex());
+    if (!constant_index &&
+        mlir::failed(validateCasePredicateBroadcast(case_op, *index_info))) {
+        return mlir::failure();
+    }
+
     rewriter.setInsertionPoint(case_op);
-    if (auto constant_index = constantCaseIndex(case_op.getIndex())) {
+    if (constant_index) {
         uint64_t branch_index = *constant_index < branches.size()
             ? *constant_index
             : static_cast<uint64_t>(branches.size() - 1);
         llvm::SmallVector<mlir::Value> results;
-        if (mlir::failed(cloneCaseBranch(
-                rewriter,
-                case_op,
-                branches[static_cast<size_t>(branch_index)],
-                results))) {
-            return mlir::failure();
-        }
+        cloneCaseBranch(
+            rewriter,
+            branches[static_cast<size_t>(branch_index)],
+            results);
         rewriter.replaceOp(case_op, results);
         return mlir::success();
     }
@@ -282,9 +321,7 @@ mlir::LogicalResult lowerSingleCaseOpToSelects(
     branch_results.reserve(branches.size());
     for (mlir::Region& branch : branches) {
         llvm::SmallVector<mlir::Value> results;
-        if (mlir::failed(cloneCaseBranch(rewriter, case_op, branch, results))) {
-            return mlir::failure();
-        }
+        cloneCaseBranch(rewriter, branch, results);
         branch_results.push_back(std::move(results));
     }
 
@@ -296,24 +333,19 @@ mlir::LogicalResult lowerSingleCaseOpToSelects(
             rewriter,
             case_op.getLoc(),
             case_op.getIndex(),
+            *index_info,
             static_cast<uint64_t>(branch_index));
-        if (!predicate) {
-            return mlir::failure();
-        }
 
         for (auto [result_index, selected_value] : llvm::enumerate(selected)) {
-            auto pred_for_result = broadcastCasePredicateToResult(
+            mlir::Value pred_for_result = broadcastCasePredicateToResult(
                 rewriter,
                 case_op.getLoc(),
-                *predicate,
+                predicate,
                 case_op->getResult(result_index).getType());
-            if (!pred_for_result) {
-                return mlir::failure();
-            }
             selected[result_index] = rewriter.create<mlir::stablehlo::SelectOp>(
                 case_op.getLoc(),
                 case_op->getResult(result_index).getType(),
-                *pred_for_result,
+                pred_for_result,
                 branch_results[branch_index][result_index],
                 selected_value).getResult();
         }
@@ -364,7 +396,10 @@ std::optional<int64_t> computeStaticTripCount(
                 return static_cast<int64_t>(
                     (static_cast<__int128>(bound) - init) / step + 1);
             case mlir::stablehlo::ComparisonDirection::GT:
+                if (init > bound) return std::nullopt;
+                return 0;
             case mlir::stablehlo::ComparisonDirection::GE:
+                if (init >= bound) return std::nullopt;
                 return 0;
             default:
                 return std::nullopt;
@@ -383,7 +418,10 @@ std::optional<int64_t> computeStaticTripCount(
             return static_cast<int64_t>(
                 (static_cast<__int128>(init) - bound) / step_abs + 1);
         case mlir::stablehlo::ComparisonDirection::LT:
+            if (init < bound) return std::nullopt;
+            return 0;
         case mlir::stablehlo::ComparisonDirection::LE:
+            if (init <= bound) return std::nullopt;
             return 0;
         default:
             return std::nullopt;
