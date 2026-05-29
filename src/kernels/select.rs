@@ -193,29 +193,29 @@ fn select_program(key: SelectProgramKey) -> io::Result<Program> {
         )?;
     }
     let runtime_args = runtime_args.build()?;
-    if matches!(
+    let raw_select = matches!(
         key.value_dtype,
         DType::UInt32 | DType::UInt16 | DType::UInt8
-    ) {
-        return Ok(Program {
-            reader_kernel: select_raw_reader_source(key.value_dtype)?,
-            writer_kernel: WRITER.to_owned(),
-            compile: CompileConfig {
-                cbs: vec![
-                    CBConfig::new(0, DType::UInt8),
-                    CBConfig::new(1, key.value_dtype),
-                    CBConfig::new(2, key.value_dtype),
-                    CBConfig::new(16, key.value_dtype),
-                ],
-                ..CompileConfig::default()
-            },
-            name: format!("select_raw_{:?}", key.value_dtype),
-            ..Program::new(runtime_args)
-        });
-    }
+    );
+    let reader_kernel = if raw_select {
+        select_raw_reader_source(key.value_dtype)?
+    } else {
+        READER.to_owned()
+    };
+    let compute_kernel = if raw_select {
+        String::new()
+    } else {
+        COMPUTE.to_owned()
+    };
+    let name = if raw_select {
+        format!("select_raw_{:?}", key.value_dtype)
+    } else {
+        format!("select_{:?}", key.value_dtype)
+    };
+
     Ok(Program {
-        reader_kernel: READER.to_owned(),
-        compute_kernel: COMPUTE.to_owned(),
+        reader_kernel,
+        compute_kernel,
         writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
             cbs: vec![
@@ -224,10 +224,10 @@ fn select_program(key: SelectProgramKey) -> io::Result<Program> {
                 CBConfig::new(2, key.value_dtype),
                 CBConfig::new(16, key.value_dtype),
             ],
-            dst_accum_mode: true,
+            dst_accum_mode: !raw_select,
             ..CompileConfig::default()
         },
-        name: format!("select_{:?}", key.value_dtype),
+        name,
         ..Program::new(runtime_args)
     })
 }
