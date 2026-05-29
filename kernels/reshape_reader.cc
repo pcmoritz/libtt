@@ -16,6 +16,10 @@ uint32_t tile_element_index(uint32_t row, uint32_t col) {
   return ((face_row * 2 + face_col) * FACE_R * FACE_C) + row_in_face * FACE_C + col_in_face;
 }
 
+uint32_t min_u32(uint32_t lhs, uint32_t rhs) {
+  return lhs < rhs ? lhs : rhs;
+}
+
 void zero_tile(uint32_t cb) {
   volatile tt_l1_ptr uint32_t *ptr =
       reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_write_ptr(cb));
@@ -79,30 +83,39 @@ void kernel_main() {
     uint32_t output_col_base = output_tile_col * TILE_C;
     uint32_t loaded_input_tile = 0xffffffffu;
 
-    cb_reserve_back(cb_output, 1);
-    zero_tile(cb_output);
+    uint32_t valid_rows = output_row_base < output_rows
+                              ? min_u32(TILE_R, output_rows - output_row_base)
+                              : 0;
+    uint32_t valid_cols = output_col_base < output_cols
+                              ? min_u32(TILE_C, output_cols - output_col_base)
+                              : 0;
+    uint32_t tile_first_index =
+        (output_batch * output_rows + output_row_base) * output_cols + output_col_base;
+    uint32_t tile_last_index =
+        tile_first_index + (TILE_R - 1) * output_cols + (TILE_C - 1);
+    bool tile_fully_written =
+        valid_rows == TILE_R && valid_cols == TILE_C && tile_last_index < logical_volume;
 
-    for (uint32_t row = 0; row < TILE_R; ++row) {
+    cb_reserve_back(cb_output, 1);
+    if (!tile_fully_written) {
+      zero_tile(cb_output);
+    }
+
+    for (uint32_t row = 0; row < valid_rows; ++row) {
       uint32_t output_row = output_row_base + row;
-      if (output_row >= output_rows) {
+      uint32_t flat_index =
+          (output_batch * output_rows + output_row) * output_cols + output_col_base;
+      if (flat_index >= logical_volume) {
         continue;
       }
-      for (uint32_t col = 0; col < TILE_C; ++col) {
-        uint32_t output_col = output_col_base + col;
-        if (output_col >= output_cols) {
-          continue;
-        }
 
-        uint32_t flat_index =
-            (output_batch * output_rows + output_row) * output_cols + output_col;
-        if (flat_index >= logical_volume) {
-          continue;
-        }
+      uint32_t row_cols = min_u32(valid_cols, logical_volume - flat_index);
+      uint32_t input_col = flat_index % input_cols;
+      uint32_t input_row_major = flat_index / input_cols;
+      uint32_t input_row = input_row_major % input_rows;
+      uint32_t input_batch = input_row_major / input_rows;
 
-        uint32_t input_col = flat_index % input_cols;
-        uint32_t input_row_major = flat_index / input_cols;
-        uint32_t input_row = input_row_major % input_rows;
-        uint32_t input_batch = input_row_major / input_rows;
+      for (uint32_t col = 0; col < row_cols; ++col) {
         uint32_t input_tile_row = input_row / TILE_R;
         uint32_t input_tile_col = input_col / TILE_C;
         uint32_t input_tile =
@@ -118,6 +131,15 @@ void kernel_main() {
         }
 
         copy_element(cb_input, cb_output, input_row % TILE_R, input_col % TILE_C, row, col);
+        ++input_col;
+        if (input_col == input_cols) {
+          input_col = 0;
+          ++input_row;
+          if (input_row == input_rows) {
+            input_row = 0;
+            ++input_batch;
+          }
+        }
       }
     }
 
