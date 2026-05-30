@@ -155,6 +155,67 @@ void copy_element_from_source(uint32_t cb_source, uint32_t dst_addr, uint32_t so
   }
 }
 
+bool contains_dim(const uint32_t *dims, uint32_t dim_count, uint32_t dim) {
+  for (uint32_t i = 0; i < dim_count; ++i) {
+    if (dims[i] == dim) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool is_prefix_row_inner_col_view(const View &view) {
+  // GQA KV-cache score matmuls read logical rows from a prefix dimension while
+  // columns stay in the innermost physical dimension.
+  if (view.rank < 3 || view.row_rank != 1 || view.col_rank != 1 ||
+      view.col_dims[0] != view.rank - 1 || view.row_dims[0] + 2 >= view.rank) {
+    return false;
+  }
+  if (view.grouped_dim == GROUPED_DIM_NONE || view.group_size <= 1) {
+    return false;
+  }
+  for (uint32_t dim = 0; dim + 2 < view.rank; ++dim) {
+    if (dim != view.row_dims[0] &&
+        !contains_dim(view.batch_dims, view.batch_rank, dim)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <uint32_t DatumBytes>
+void fill_prefix_row_inner_col_tile_impl(const InterleavedAddrGenFast<true> &input,
+                                         const View &view, uint32_t batch,
+                                         uint32_t row_tile, uint32_t col_tile,
+                                         uint32_t dst_addr, uint32_t tile_bytes,
+                                         uint32_t cb_source) {
+  zero_tile_at(dst_addr, tile_bytes);
+  const uint32_t row_base = row_tile * TILE_R;
+  const uint32_t col_base = col_tile * TILE_C;
+  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    return;
+  }
+
+  uint32_t indices[MAX_RANK] = {};
+  decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
+  indices[view.col_dims[0]] = col_base;
+  const uint32_t valid_rows = min_u32(TILE_R, view.logical_rows - row_base);
+  const uint32_t valid_cols = min_u32(TILE_C, view.logical_cols - col_base);
+  for (uint32_t row = 0; row < valid_rows; ++row) {
+    uint32_t source_row = 0;
+    uint32_t source_col = 0;
+    indices[view.row_dims[0]] = row_base + row;
+    const uint32_t source_tile =
+        tile_id_for_indices(view, indices, &source_row, &source_col);
+    read_source_tile(input, source_tile, cb_source);
+    for (uint32_t col = 0; col < valid_cols; ++col) {
+      copy_element_from_source<DatumBytes>(cb_source, dst_addr, source_row,
+                                           source_col + col, row, col);
+    }
+    cb_pop_front(cb_source, 1);
+  }
+}
+
 template <uint32_t DatumBytes>
 void fill_generic_tile_impl(const InterleavedAddrGenFast<true> &input, const View &view,
                             uint32_t batch, uint32_t row_tile, uint32_t col_tile,
@@ -198,12 +259,23 @@ void fill_generic_tile_impl(const InterleavedAddrGenFast<true> &input, const Vie
 void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &view,
                        uint32_t batch, uint32_t row_tile, uint32_t col_tile,
                        uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
+  const bool prefix_row_inner_col = is_prefix_row_inner_col_view(view);
   if (tile_bytes == sizeof(uint32_t) * TILE_R * TILE_C) {
-    fill_generic_tile_impl<sizeof(uint32_t)>(
-        input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
+    if (prefix_row_inner_col) {
+      fill_prefix_row_inner_col_tile_impl<sizeof(uint32_t)>(
+          input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
+    } else {
+      fill_generic_tile_impl<sizeof(uint32_t)>(
+          input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
+    }
   } else {
-    fill_generic_tile_impl<sizeof(uint16_t)>(
-        input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
+    if (prefix_row_inner_col) {
+      fill_prefix_row_inner_col_tile_impl<sizeof(uint16_t)>(
+          input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
+    } else {
+      fill_generic_tile_impl<sizeof(uint16_t)>(
+          input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
+    }
   }
 }
 
