@@ -65,6 +65,10 @@ uint32_t tile_element_index(uint32_t row, uint32_t col) {
   return ((face_row * 2 + face_col) * FACE_R * FACE_C) + row_in_face * FACE_C + col_in_face;
 }
 
+uint32_t min_u32(uint32_t lhs, uint32_t rhs) {
+  return lhs < rhs ? lhs : rhs;
+}
+
 void zero_tile_at(uint32_t tile_addr, uint32_t tile_bytes) {
   volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(tile_addr);
   uint32_t words = tile_bytes / sizeof(uint32_t);
@@ -227,25 +231,36 @@ void fill_tiled_index_map_tile_impl(const InterleavedAddrGenFast<true> &input,
 
   uint32_t indices[MAX_RANK] = {};
   decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
+  if (view.grouped_dim != GROUPED_DIM_NONE) {
+    indices[view.grouped_dim] /= view.group_size;
+  }
+
   TiledIndexMap map = {view.row_dims[0], view.col_dims[0]};
   indices[map.source_row_dim] = row_base;
+  const uint32_t source_row_base = indices[view.rank - 2];
+  const uint32_t source_col_base = row_base;
+  const uint32_t source_row_in_tile = source_row_base % TILE_R;
+  const uint32_t source_col_in_tile = source_col_base % TILE_C;
+  const uint32_t source_tile_row = source_row_base / TILE_R;
+  const uint32_t source_tile_col = source_col_base / TILE_C;
+  const uint32_t valid_rows = min_u32(TILE_R, view.logical_rows - row_base);
 
   for (uint32_t col = 0; col < TILE_C; ++col) {
     uint32_t logical_col = col_base + col;
     if (logical_col >= view.logical_cols) {
       continue;
     }
-    indices[map.source_col_dim] = logical_col;
-    uint32_t source_row = 0;
-    uint32_t source_col = 0;
-    uint32_t source_tile = tile_id_for_indices(view, indices, &source_row, &source_col);
+    uint32_t prefix = 0;
+    for (uint32_t dim = 0; dim + 2 < view.rank; ++dim) {
+      uint32_t index = dim == map.source_col_dim ? logical_col : indices[dim];
+      prefix = prefix * view.physical_shape[dim] + index;
+    }
+    uint32_t source_tile =
+        (prefix * view.tile_rows + source_tile_row) * view.tiles_per_row + source_tile_col;
     read_source_tile(input, source_tile, cb_source);
-    for (uint32_t row = 0; row < TILE_R; ++row) {
-      if (row_base + row >= view.logical_rows) {
-        continue;
-      }
-      copy_element_from_source<DatumBytes>(cb_source, dst_addr, source_row, source_col + row,
-                                           row, col);
+    for (uint32_t row = 0; row < valid_rows; ++row) {
+      copy_element_from_source<DatumBytes>(
+          cb_source, dst_addr, source_row_in_tile, source_col_in_tile + row, row, col);
     }
     cb_pop_front(cb_source, 1);
   }
