@@ -2265,12 +2265,22 @@ bool isFoldableRhsMatmulTranspose(mlir::stablehlo::TransposeOp transpose_op) {
     if (!input_type || !output_type ||
         !input_type.hasStaticShape() ||
         !output_type.hasStaticShape() ||
-        input_type.getRank() != 2 ||
-        output_type.getRank() != 2) {
+        input_type.getRank() < 2 ||
+        output_type.getRank() != input_type.getRank()) {
         return false;
     }
     auto permutation = transpose_op.getPermutation();
-    return permutation.size() == 2 && permutation[0] == 1 && permutation[1] == 0;
+    int64_t rank = input_type.getRank();
+    if (static_cast<int64_t>(permutation.size()) != rank) {
+        return false;
+    }
+    for (int64_t dim = 0; dim < rank - 2; ++dim) {
+        if (permutation[dim] != dim) {
+            return false;
+        }
+    }
+    return permutation[rank - 2] == rank - 1 &&
+           permutation[rank - 1] == rank - 2;
 }
 
 std::vector<int64_t> transposeOperandDims(

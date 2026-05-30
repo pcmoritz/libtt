@@ -16,7 +16,6 @@ mod kernels;
 mod linux;
 mod log;
 mod mlir_frontend;
-mod profile;
 mod utils;
 
 use device::Device;
@@ -3183,9 +3182,7 @@ fn execute_executable_v1(
             )?,
         }
     }
-    let finish_start = profile::start();
     device.finish_dispatch().map_err(io_error)?;
-    profile::record_dispatch_finish(finish_start);
 
     let mut outputs = Vec::with_capacity(plan.output_ids.len());
     for (index, &output_id) in plan.output_ids.iter().enumerate() {
@@ -3212,7 +3209,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     if executable.deleted {
         return failed_precondition("executable has been deleted");
     }
-    let profile_start = profile::start();
     if args.num_devices != 1 {
         return unimplemented("only single-device execution is supported");
     }
@@ -3270,7 +3266,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
             Err(err) => return err,
         }
     };
-    profile::record_executable(executable.metadata.executable.as_ref(), profile_start);
     if output_buffers.len() != executable.metadata.num_outputs {
         return pjrt_error(
             format!(
