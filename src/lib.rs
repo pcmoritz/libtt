@@ -4318,6 +4318,396 @@ mod tests {
         panic!("unexpected PJRT error {code:?}: {detail}");
     }
 
+    fn unwrap_pjrt_result<T>(result: Result<T, *mut PJRT_Error>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => {
+                let api = unsafe { &*GetPjrtApi() };
+                let (code, detail) = take_error_detail(api, error);
+                panic!("unexpected PJRT error {code:?}: {detail}");
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct RhsTransposeMatmulCase {
+        name: &'static str,
+        batch_shape: &'static [usize],
+        m: usize,
+        k: usize,
+        n: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RhsTransposeMatmulDTypeCase {
+        name: &'static str,
+        dtype: DType,
+        output_dtype: DType,
+        rtol: f32,
+        atol: f32,
+    }
+
+    fn patterned_values(shape: &[usize]) -> Vec<f32> {
+        let size = shape.iter().product::<usize>();
+        (0..size)
+            .map(|index| (((index * 7) % 31) as f32 - 15.0) / 32.0)
+            .collect()
+    }
+
+    fn f32_to_bf16_bits(value: f32) -> u16 {
+        let bits = value.to_bits();
+        let round_to_nearest_even = 0x7fff + ((bits >> 16) & 1);
+        ((bits.wrapping_add(round_to_nearest_even)) >> 16) as u16
+    }
+
+    fn bf16_bits_to_f32(bits: u16) -> f32 {
+        f32::from_bits((bits as u32) << 16)
+    }
+
+    fn typed_host_bytes_and_values(values: &[f32], dtype: DType) -> (Vec<u8>, Vec<f32>) {
+        match dtype {
+            DType::Float32 => (
+                values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+                values.to_vec(),
+            ),
+            DType::Float16B => {
+                let bits = values.iter().map(|&value| f32_to_bf16_bits(value));
+                let bytes = bits.clone().flat_map(|value| value.to_le_bytes()).collect();
+                let rounded = bits.map(bf16_bits_to_f32).collect();
+                (bytes, rounded)
+            }
+            _ => panic!("unsupported matmul test dtype {dtype:?}"),
+        }
+    }
+
+    fn f32_values_from_host_bytes(data: &[u8], dtype: DType) -> Vec<f32> {
+        match dtype {
+            DType::Float32 => data
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("f32 bytes")))
+                .collect(),
+            DType::Float16B => data
+                .chunks_exact(2)
+                .map(|bytes| {
+                    bf16_bits_to_f32(u16::from_le_bytes(bytes.try_into().expect("bf16 bytes")))
+                })
+                .collect(),
+            _ => panic!("unsupported matmul test dtype {dtype:?}"),
+        }
+    }
+
+    fn alloc_logical_host_data(
+        device: &mut Device,
+        values: &[f32],
+        dtype: DType,
+        logical_shape: &[usize],
+        name: impl Into<String>,
+    ) -> (DramBuffer, Vec<f32>) {
+        let (bytes, rounded_values) = typed_host_bytes_and_values(values, dtype);
+        let allocation_shape =
+            dram::tiled_allocation_shape(logical_shape).expect("allocation shape");
+        let allocation_data = match unwrap_pjrt_result(padded_host_data(
+            &bytes,
+            dtype,
+            logical_shape,
+            &allocation_shape,
+        )) {
+            Some(padded) => padded,
+            None => bytes,
+        };
+        let buffer = device
+            .alloc_write(&allocation_data, dtype, &allocation_shape, name)
+            .expect("device allocation");
+        (buffer, rounded_values)
+    }
+
+    fn read_logical_f32_values(
+        device: &mut Device,
+        buffer: &DramBuffer,
+        dtype: DType,
+        logical_shape: &[usize],
+    ) -> Vec<f32> {
+        let data = device.dram_read(buffer).expect("read matmul output");
+        let logical_data = match unwrap_pjrt_result(crop_padded_host_data(
+            &data,
+            dtype,
+            logical_shape,
+            &buffer.shape,
+        )) {
+            Some(cropped) => cropped,
+            None => data,
+        };
+        f32_values_from_host_bytes(&logical_data, dtype)
+    }
+
+    fn transpose_rhs_batches(rhs: &[f32], batch_count: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut transposed = vec![0.0f32; rhs.len()];
+        for batch in 0..batch_count {
+            let rhs_offset = batch * n * k;
+            let transposed_offset = batch * k * n;
+            for row in 0..n {
+                for col in 0..k {
+                    transposed[transposed_offset + col * n + row] = rhs[rhs_offset + row * k + col];
+                }
+            }
+        }
+        transposed
+    }
+
+    fn reference_rhs_transpose_matmul(
+        lhs: &[f32],
+        rhs: &[f32],
+        batch_count: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0f32; batch_count * m * n];
+        for batch in 0..batch_count {
+            let lhs_offset = batch * m * k;
+            let rhs_offset = batch * n * k;
+            let output_offset = batch * m * n;
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = 0.0f32;
+                    for kk in 0..k {
+                        acc += lhs[lhs_offset + row * k + kk] * rhs[rhs_offset + col * k + kk];
+                    }
+                    output[output_offset + row * n + col] = acc;
+                }
+            }
+        }
+        output
+    }
+
+    fn assert_all_close(name: &str, actual: &[f32], expected: &[f32], rtol: f32, atol: f32) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{name} length mismatch: actual={} expected={}",
+            actual.len(),
+            expected.len()
+        );
+        let mut max_diff = 0.0f32;
+        let mut max_index = 0usize;
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            let diff = (actual - expected).abs();
+            let tolerance = atol + rtol * expected.abs();
+            if diff > max_diff {
+                max_diff = diff;
+                max_index = index;
+            }
+            assert!(
+                diff <= tolerance,
+                "{name} mismatch at {index}: actual={actual} expected={expected} diff={diff} tolerance={tolerance}"
+            );
+        }
+        println!("{name}: max_abs_diff={max_diff} at {max_index}");
+    }
+
+    #[test]
+    fn matmul_rhs_transpose_edge_tiles_match_reference() {
+        if std::env::var("LIBTT_RUN_DEVICE_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping device test; set LIBTT_RUN_DEVICE_TESTS=1 to run");
+            return;
+        }
+        let mut device = Device::discover()
+            .into_iter()
+            .next()
+            .expect("expected at least one Tenstorrent device");
+
+        let cases = [
+            RhsTransposeMatmulCase {
+                name: "m17_k33_n65",
+                batch_shape: &[],
+                m: 17,
+                k: 33,
+                n: 65,
+            },
+            RhsTransposeMatmulCase {
+                name: "m64_k31_n32",
+                batch_shape: &[],
+                m: 64,
+                k: 31,
+                n: 32,
+            },
+            RhsTransposeMatmulCase {
+                name: "m1_k1_n1",
+                batch_shape: &[],
+                m: 1,
+                k: 1,
+                n: 1,
+            },
+            RhsTransposeMatmulCase {
+                name: "batched_2x3_m17_k33_n65",
+                batch_shape: &[2, 3],
+                m: 17,
+                k: 33,
+                n: 65,
+            },
+        ];
+        let dtype_cases = [
+            RhsTransposeMatmulDTypeCase {
+                name: "bf16",
+                dtype: DType::Float16B,
+                output_dtype: DType::Float16B,
+                rtol: 0.08,
+                atol: 0.25,
+            },
+            RhsTransposeMatmulDTypeCase {
+                name: "f32",
+                dtype: DType::Float32,
+                output_dtype: DType::Float32,
+                rtol: 0.05,
+                atol: 0.05,
+            },
+        ];
+
+        for dtype_case in dtype_cases {
+            for case in cases {
+                let batch_count = case.batch_shape.iter().product::<usize>().max(1);
+                let mut lhs_shape = case.batch_shape.to_vec();
+                lhs_shape.extend([case.m, case.k]);
+                let mut rhs_shape = case.batch_shape.to_vec();
+                rhs_shape.extend([case.n, case.k]);
+                let mut rhs_transposed_shape = case.batch_shape.to_vec();
+                rhs_transposed_shape.extend([case.k, case.n]);
+                let mut output_shape = case.batch_shape.to_vec();
+                output_shape.extend([case.m, case.n]);
+
+                let lhs_values = patterned_values(&lhs_shape);
+                let rhs_values = patterned_values(&rhs_shape);
+                let rhs_transposed_values =
+                    transpose_rhs_batches(&rhs_values, batch_count, case.k, case.n);
+                let (lhs, lhs_rounded) = alloc_logical_host_data(
+                    &mut device,
+                    &lhs_values,
+                    dtype_case.dtype,
+                    &lhs_shape,
+                    format!("{}_{}_lhs", case.name, dtype_case.name),
+                );
+                let (rhs, rhs_rounded) = alloc_logical_host_data(
+                    &mut device,
+                    &rhs_values,
+                    dtype_case.dtype,
+                    &rhs_shape,
+                    format!("{}_{}_rhs", case.name, dtype_case.name),
+                );
+                let (rhs_transposed, _) = alloc_logical_host_data(
+                    &mut device,
+                    &rhs_transposed_values,
+                    dtype_case.dtype,
+                    &rhs_transposed_shape,
+                    format!("{}_{}_rhs_transposed", case.name, dtype_case.name),
+                );
+
+                let batch_dims = (0..case.batch_shape.len())
+                    .map(|dim| dim as i64)
+                    .collect::<Vec<_>>();
+                let rank = lhs_shape.len();
+                let lhs_contracting = [(rank - 1) as i64];
+                let rhs_tile_transpose_contracting = [(rank - 1) as i64];
+                let rhs_explicit_contracting = [(rank - 2) as i64];
+
+                let fused_output = match kernels::matmul::matmul_dot_general(
+                    &mut device,
+                    &lhs,
+                    &rhs,
+                    &lhs_shape,
+                    &rhs_shape,
+                    &output_shape,
+                    &batch_dims,
+                    &batch_dims,
+                    &lhs_contracting,
+                    &rhs_tile_transpose_contracting,
+                    kernels::matmul::MatmulEpilogue::Store {
+                        output_dtype: dtype_case.output_dtype,
+                    },
+                    format!("{}_{}_rhs_tile_transpose", case.name, dtype_case.name),
+                )
+                .expect("fused RHS transpose matmul")
+                {
+                    kernels::matmul::MatmulOutput::Store(output) => output,
+                    kernels::matmul::MatmulOutput::Top1 { .. } => {
+                        panic!("expected stored matmul output")
+                    }
+                };
+                device.finish_dispatch().expect("finish fused matmul");
+                let fused_values = read_logical_f32_values(
+                    &mut device,
+                    &fused_output,
+                    dtype_case.output_dtype,
+                    &output_shape,
+                );
+
+                let explicit_output = match kernels::matmul::matmul_dot_general(
+                    &mut device,
+                    &lhs,
+                    &rhs_transposed,
+                    &lhs_shape,
+                    &rhs_transposed_shape,
+                    &output_shape,
+                    &batch_dims,
+                    &batch_dims,
+                    &lhs_contracting,
+                    &rhs_explicit_contracting,
+                    kernels::matmul::MatmulEpilogue::Store {
+                        output_dtype: dtype_case.output_dtype,
+                    },
+                    format!("{}_{}_explicit_transpose", case.name, dtype_case.name),
+                )
+                .expect("explicit transpose matmul")
+                {
+                    kernels::matmul::MatmulOutput::Store(output) => output,
+                    kernels::matmul::MatmulOutput::Top1 { .. } => {
+                        panic!("expected stored matmul output")
+                    }
+                };
+                device.finish_dispatch().expect("finish explicit matmul");
+                let explicit_values = read_logical_f32_values(
+                    &mut device,
+                    &explicit_output,
+                    dtype_case.output_dtype,
+                    &output_shape,
+                );
+
+                let reference = reference_rhs_transpose_matmul(
+                    &lhs_rounded,
+                    &rhs_rounded,
+                    batch_count,
+                    case.m,
+                    case.k,
+                    case.n,
+                );
+                let label = format!("{}/{}", case.name, dtype_case.name);
+                assert_all_close(
+                    &format!("{label} fused vs reference"),
+                    &fused_values,
+                    &reference,
+                    dtype_case.rtol,
+                    dtype_case.atol,
+                );
+                assert_all_close(
+                    &format!("{label} explicit vs reference"),
+                    &explicit_values,
+                    &reference,
+                    dtype_case.rtol,
+                    dtype_case.atol,
+                );
+                assert_all_close(
+                    &format!("{label} fused vs explicit"),
+                    &fused_values,
+                    &explicit_values,
+                    dtype_case.rtol,
+                    dtype_case.atol,
+                );
+            }
+        }
+    }
+
     #[cfg(libtt_mlir_frontend)]
     fn with_compiled_mlir_executable(code: &str, check: impl FnOnce(&executable::Executable)) {
         let api = unsafe { &*GetPjrtApi() };
