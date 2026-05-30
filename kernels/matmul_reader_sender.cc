@@ -68,7 +68,17 @@ void kernel_main() {
             uint32_t canonical_tile = canonical_base + h * A(3) + w;
             uint32_t canonical_row_tile = canonical_tile / A(3);
             uint32_t canonical_col_tile = canonical_tile - canonical_row_tile * A(3);
-            if (view.kind == VIEW_TILED_INDEX_MAP) {
+            if (view.kind == VIEW_TILE_TRANSPOSE) {
+              fill_tile_transpose_tile(
+                  in0_gen,
+                  view,
+                  batch,
+                  canonical_row_tile,
+                  canonical_col_tile,
+                  l1_addr,
+                  tile_bytes,
+                  cb_source);
+            } else if (view.kind == VIEW_TILED_INDEX_MAP) {
               fill_tiled_index_map_tile(
                   in0_gen,
                   view,

@@ -935,6 +935,114 @@ bool isPredicateConvert(mlir::stablehlo::ConvertOp convert_op) {
     return input_type && input_type.getElementType().isInteger(1);
 }
 
+bool isIdentityCustomCall(mlir::stablehlo::CustomCallOp custom_call_op) {
+    if (!custom_call_op || custom_call_op->getNumResults() != 1 ||
+        custom_call_op.getHasSideEffect()) {
+        return false;
+    }
+    auto call_target = custom_call_op.getCallTargetName();
+    if (call_target != "annotate_device_placement" && call_target != "Sharding") {
+        return false;
+    }
+    auto inputs = custom_call_op.getInputs();
+    return inputs.size() == 1 &&
+           inputs.front().getType() == custom_call_op.getResult(0).getType();
+}
+
+bool isLastTwoDimSwap(mlir::stablehlo::TransposeOp transpose_op) {
+    if (!transpose_op) {
+        return false;
+    }
+    auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        transpose_op.getOperand().getType());
+    auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        transpose_op.getResult().getType());
+    if (!input_type || !output_type ||
+        !input_type.hasStaticShape() ||
+        !output_type.hasStaticShape() ||
+        input_type.getRank() < 2 ||
+        output_type.getRank() != input_type.getRank()) {
+        return false;
+    }
+    auto permutation = transpose_op.getPermutation();
+    int64_t rank = input_type.getRank();
+    if (static_cast<int64_t>(permutation.size()) != rank) {
+        return false;
+    }
+    for (int64_t dim = 0; dim < rank - 2; ++dim) {
+        if (permutation[dim] != dim) {
+            return false;
+        }
+    }
+    return permutation[rank - 2] == rank - 1 &&
+           permutation[rank - 1] == rank - 2;
+}
+
+std::optional<mlir::stablehlo::TransposeOp> singleUseRhsTranspose(mlir::Value rhs) {
+    mlir::Value current = rhs;
+    while (auto custom_call_op =
+               current.getDefiningOp<mlir::stablehlo::CustomCallOp>()) {
+        if (!current.hasOneUse() || !isIdentityCustomCall(custom_call_op)) {
+            return std::nullopt;
+        }
+        current = custom_call_op.getInputs().front();
+    }
+
+    auto transpose_op = current.getDefiningOp<mlir::stablehlo::TransposeOp>();
+    if (!transpose_op || !current.hasOneUse() || !isLastTwoDimSwap(transpose_op)) {
+        return std::nullopt;
+    }
+    return transpose_op;
+}
+
+bool isRhsMatmulTransposeFold(mlir::stablehlo::DotGeneralOp dot_op) {
+    return singleUseRhsTranspose(dot_op.getRhs()).has_value();
+}
+
+llvm::SmallVector<int64_t> transposeOperandDims(
+    mlir::stablehlo::TransposeOp transpose_op,
+    llvm::ArrayRef<int64_t> result_dims) {
+    auto permutation = transpose_op.getPermutation();
+    llvm::SmallVector<int64_t> operand_dims;
+    operand_dims.reserve(result_dims.size());
+    for (int64_t dim : result_dims) {
+        operand_dims.push_back(permutation[dim]);
+    }
+    return operand_dims;
+}
+
+mlir::LogicalResult lowerSingleRhsMatmulTranspose(
+    mlir::stablehlo::DotGeneralOp dot_op,
+    mlir::PatternRewriter& rewriter) {
+    auto transpose_op = singleUseRhsTranspose(dot_op.getRhs());
+    if (!transpose_op) {
+        return mlir::failure();
+    }
+
+    auto dims = dot_op.getDotDimensionNumbers();
+    auto rhs_batching_dimensions =
+        transposeOperandDims(*transpose_op, dims.getRhsBatchingDimensions());
+    auto rhs_contracting_dimensions =
+        transposeOperandDims(*transpose_op, dims.getRhsContractingDimensions());
+    auto remapped_dims = mlir::stablehlo::DotDimensionNumbersAttr::get(
+        rewriter.getContext(),
+        dims.getLhsBatchingDimensions(),
+        rhs_batching_dimensions,
+        dims.getLhsContractingDimensions(),
+        rhs_contracting_dimensions);
+
+    auto replacement = rewriter.create<mlir::stablehlo::DotGeneralOp>(
+        dot_op.getLoc(),
+        dot_op.getResult().getType(),
+        dot_op.getLhs(),
+        transpose_op->getOperand(),
+        remapped_dims,
+        dot_op.getPrecisionConfigAttr(),
+        dot_op.getAlgorithmAttr());
+    rewriter.replaceOp(dot_op, replacement.getResult());
+    return mlir::success();
+}
+
 bool isNestedInCaseRegion(mlir::Operation* op) {
     return op->getParentOfType<mlir::stablehlo::CaseOp>() != nullptr;
 }
@@ -993,6 +1101,8 @@ mlir::LogicalResult runCleanupRewritePatterns(
         &context, state, lowerSingleDynamicUpdateSliceToScatter));
     patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::PadOp>>(
         &context, state, lowerSinglePadToScatter));
+    patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::DotGeneralOp>>(
+        &context, state, lowerSingleRhsMatmulTranspose, isRhsMatmulTransposeFold));
     mlir::GreedyRewriteConfig config;
     config.enableFolding();
     if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns), config))) {

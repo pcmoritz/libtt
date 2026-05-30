@@ -11,6 +11,7 @@ constexpr uint32_t INVALID_TILE = 0xffffffffu;
 constexpr uint32_t VIEW_ARG_COUNT = 9 + 4 * MAX_RANK;
 constexpr uint32_t VIEW_CONTIGUOUS = 0;
 constexpr uint32_t VIEW_TILED_INDEX_MAP = 4;
+constexpr uint32_t VIEW_TILE_TRANSPOSE = 5;
 
 struct View {
   uint32_t kind, rank, batch_rank, row_rank, col_rank;
@@ -245,6 +246,57 @@ void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const 
         input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
   } else {
     fill_tiled_index_map_tile_impl<sizeof(uint16_t)>(
+        input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
+  }
+}
+
+template <uint32_t DatumBytes>
+void fill_tile_transpose_tile_impl(const InterleavedAddrGenFast<true> &input,
+                                   const View &view, uint32_t batch, uint32_t row_tile,
+                                   uint32_t col_tile, uint32_t dst_addr,
+                                   uint32_t tile_bytes, uint32_t cb_source) {
+  zero_tile_at(dst_addr, tile_bytes);
+  uint32_t row_base = row_tile * TILE_R;
+  uint32_t col_base = col_tile * TILE_C;
+  if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    return;
+  }
+
+  uint32_t indices[MAX_RANK] = {};
+  decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
+  indices[view.col_dims[0]] = col_base;
+  indices[view.row_dims[0]] = row_base;
+
+  uint32_t source_row_base = 0;
+  uint32_t source_col_base = 0;
+  uint32_t source_tile =
+      tile_id_for_indices(view, indices, &source_row_base, &source_col_base);
+  if (row_base + TILE_R <= view.logical_rows && col_base + TILE_C <= view.logical_cols) {
+    noc_async_read_tile(source_tile, input, dst_addr);
+    noc_async_read_barrier();
+    return;
+  }
+
+  read_source_tile(input, source_tile, cb_source);
+
+  for (uint32_t row = 0; row < TILE_R && col_base + row < view.logical_cols; ++row) {
+    for (uint32_t col = 0; col < TILE_C && row_base + col < view.logical_rows; ++col) {
+      copy_element_from_source<DatumBytes>(
+          cb_source, dst_addr, source_row_base + row, source_col_base + col, row, col);
+    }
+  }
+  cb_pop_front(cb_source, 1);
+}
+
+void fill_tile_transpose_tile(const InterleavedAddrGenFast<true> &input, const View &view,
+                              uint32_t batch, uint32_t row_tile, uint32_t col_tile,
+                              uint32_t dst_addr, uint32_t tile_bytes,
+                              uint32_t cb_source) {
+  if (tile_bytes == sizeof(uint32_t) * TILE_R * TILE_C) {
+    fill_tile_transpose_tile_impl<sizeof(uint32_t)>(
+        input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
+  } else {
+    fill_tile_transpose_tile_impl<sizeof(uint16_t)>(
         input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
   }
 }

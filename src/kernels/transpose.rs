@@ -158,9 +158,23 @@ fn transpose_program(key: TransposeProgramKey) -> io::Result<Program> {
             cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(1, key.dtype)],
             ..CompileConfig::default()
         },
-        name: format!("transpose_{:?}_rank{}", key.dtype, key.shape.rank),
+        name: format!(
+            "transpose_{:?}_{}_to_{}",
+            key.dtype,
+            shape_name(&key.shape.input_shape, key.shape.rank),
+            shape_name(&key.shape.output_shape, key.shape.rank)
+        ),
         ..Program::new(runtime_args)
     })
+}
+
+fn shape_name(shape: &[u32; MAX_RANK], rank: u32) -> String {
+    shape
+        .iter()
+        .take(rank as usize)
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join("x")
 }
 
 fn transpose_reader_source(dtype: DType, shape: &TransposeKernelShape) -> io::Result<String> {
