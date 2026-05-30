@@ -91,6 +91,8 @@ pub(crate) enum Op {
         output_id: u32,
         dimension_numbers: DotGeneralDimensionNumbers,
         top_k_epilogue: Option<MatmulTopKEpilogue>,
+        lhs_grouped_head_view: Option<MatmulGroupedHeadView>,
+        rhs_grouped_head_view: Option<MatmulGroupedHeadView>,
     },
     Constant {
         packed_value: u32,
@@ -251,6 +253,14 @@ pub(crate) struct MatmulTopKEpilogue {
     pub(crate) matmul_output_id: u32,
     pub(crate) indices_id: u32,
     pub(crate) k: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct MatmulGroupedHeadView {
+    pub(crate) logical_shape: Vec<i64>,
+    pub(crate) grouped_dimension: u32,
+    pub(crate) group_size: u32,
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -498,6 +508,20 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                         indices_id: epilogue.indices_id,
                         k: epilogue.k,
                     }),
+                    lhs_grouped_head_view: matmul.lhs_grouped_head_view.map(|view| {
+                        MatmulGroupedHeadView {
+                            logical_shape: view.logical_shape,
+                            grouped_dimension: view.grouped_dimension,
+                            group_size: view.group_size,
+                        }
+                    }),
+                    rhs_grouped_head_view: matmul.rhs_grouped_head_view.map(|view| {
+                        MatmulGroupedHeadView {
+                            logical_shape: view.logical_shape,
+                            grouped_dimension: view.grouped_dimension,
+                            group_size: view.group_size,
+                        }
+                    }),
                 }),
                 Kind::Constant(constant) => Ok(Op::Constant {
                     packed_value: constant.packed_value,
@@ -690,6 +714,8 @@ pub(crate) enum Op {
         output_id: u32,
         dimension_numbers: DotGeneralDimensionNumbers,
         top_k_epilogue: Option<MatmulTopKEpilogue>,
+        lhs_grouped_head_view: Option<MatmulGroupedHeadView>,
+        rhs_grouped_head_view: Option<MatmulGroupedHeadView>,
     },
     Constant {
         packed_value: u32,
