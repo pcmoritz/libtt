@@ -23,13 +23,16 @@ use dram::{allocator_stats, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
+use std::collections::HashMap;
+use std::env;
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, Once, OnceLock};
+use std::time::Instant;
 
 include!("pjrt_bindings.rs");
 
@@ -117,6 +120,271 @@ struct ExecutableMetadata {
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
     executable: Option<executable::Executable>,
+}
+
+#[derive(Default)]
+struct ExecutionProfileStats {
+    count: u64,
+    total_ns: u128,
+    max_ns: u128,
+}
+
+#[derive(Default)]
+struct ExecutionProfileState {
+    executions: u64,
+    timings: HashMap<String, ExecutionProfileStats>,
+}
+
+static EXECUTION_PROFILE_STATE: OnceLock<Mutex<ExecutionProfileState>> = OnceLock::new();
+
+fn execution_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| matches!(env::var("LIBTT_EXEC_PROFILE").as_deref(), Ok("1")))
+}
+
+fn execution_profile_sync_each_op() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            env::var("LIBTT_EXEC_PROFILE_SYNC_EACH_OP").as_deref(),
+            Ok("1")
+        )
+    })
+}
+
+fn execution_profile_report_interval() -> u64 {
+    static INTERVAL: OnceLock<u64> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        env::var("LIBTT_EXEC_PROFILE_EVERY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(100)
+    })
+}
+
+fn execution_profile_report_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        env::var("LIBTT_EXEC_PROFILE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(25)
+    })
+}
+
+fn execution_profile_reset_on_report() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            env::var("LIBTT_EXEC_PROFILE_RESET_ON_REPORT").as_deref(),
+            Ok("1")
+        )
+    })
+}
+
+fn profile_value_signature(plan: &executable::Executable, value_id: u32) -> String {
+    plan.values
+        .get(value_id as usize)
+        .map(|value| format!("{:?}{:?}", value.element_type, value.dims))
+        .unwrap_or_else(|| format!("value#{value_id}"))
+}
+
+fn profile_op_signature(op: &executable::Op, plan: &executable::Executable) -> String {
+    match op {
+        executable::Op::Parameter { output_id, .. } => {
+            format!("parameter {}", profile_value_signature(plan, *output_id))
+        }
+        executable::Op::Concatenate {
+            output_id,
+            dimension,
+            ..
+        } => format!(
+            "concatenate dim={dimension} {}",
+            profile_value_signature(plan, *output_id)
+        ),
+        executable::Op::Reshape {
+            input_id,
+            output_id,
+        } => format!(
+            "reshape {} -> {}",
+            profile_value_signature(plan, *input_id),
+            profile_value_signature(plan, *output_id)
+        ),
+        executable::Op::Slice {
+            input_id,
+            output_id,
+            ..
+        } => format!(
+            "slice {} -> {}",
+            profile_value_signature(plan, *input_id),
+            profile_value_signature(plan, *output_id)
+        ),
+        executable::Op::Transpose {
+            input_id,
+            output_id,
+            permutation,
+        } => format!(
+            "transpose perm={permutation:?} {} -> {}",
+            profile_value_signature(plan, *input_id),
+            profile_value_signature(plan, *output_id)
+        ),
+        executable::Op::CustomCall {
+            output_id,
+            call_target_name,
+            ..
+        } => format!(
+            "custom_call target={call_target_name} {}",
+            profile_value_signature(plan, *output_id)
+        ),
+        executable::Op::Reduce {
+            output_id,
+            dimensions,
+            reducer,
+            ..
+        } => format!(
+            "reduce reducer={reducer:?} dims={dimensions:?} {}",
+            profile_value_signature(plan, *output_id)
+        ),
+        executable::Op::ReduceWindow {
+            output_id, reducer, ..
+        } => format!(
+            "reduce_window reducer={reducer:?} {}",
+            profile_value_signature(plan, *output_id)
+        ),
+        executable::Op::Matmul {
+            input_ids,
+            output_id,
+            dimension_numbers,
+            top_k_epilogue,
+            lhs_grouped_head_view,
+            rhs_grouped_head_view,
+        } => format!(
+            "matmul topk={} gqa_lhs={} gqa_rhs={} lhs={} rhs={} out={} lhs_c={:?} rhs_c={:?} lhs_b={:?} rhs_b={:?}",
+            top_k_epilogue.is_some(),
+            lhs_grouped_head_view.is_some(),
+            rhs_grouped_head_view.is_some(),
+            profile_value_signature(plan, input_ids[0]),
+            profile_value_signature(plan, input_ids[1]),
+            profile_value_signature(plan, *output_id),
+            dimension_numbers.lhs_contracting_dimensions,
+            dimension_numbers.rhs_contracting_dimensions,
+            dimension_numbers.lhs_batching_dimensions,
+            dimension_numbers.rhs_batching_dimensions
+        ),
+        executable::Op::Constant {
+            output_id, data, ..
+        } => format!(
+            "constant data_bytes={} {}",
+            data.len(),
+            profile_value_signature(plan, *output_id)
+        ),
+        executable::Op::Select { output_id, .. } => {
+            format!("select {}", profile_value_signature(plan, *output_id))
+        }
+        executable::Op::BroadcastInDim {
+            input_id,
+            output_id,
+            broadcast_dimensions,
+        } => format!(
+            "broadcast dims={broadcast_dimensions:?} {} -> {}",
+            profile_value_signature(plan, *input_id),
+            profile_value_signature(plan, *output_id)
+        ),
+        executable::Op::Gather { output_id, .. } => {
+            format!("gather {}", profile_value_signature(plan, *output_id))
+        }
+        executable::Op::Scatter { output_id, .. } => {
+            format!("scatter {}", profile_value_signature(plan, *output_id))
+        }
+        executable::Op::Iota {
+            output_id,
+            iota_dimension,
+        } => format!(
+            "iota dim={iota_dimension} {}",
+            profile_value_signature(plan, *output_id)
+        ),
+        executable::Op::TopK { input_id, k, .. } => {
+            format!("topk k={k} {}", profile_value_signature(plan, *input_id))
+        }
+        executable::Op::FusedElementwise {
+            input_ids,
+            output_id,
+            nodes,
+        } => format!(
+            "fused_elementwise root={:?} inputs={} nodes={} out={}",
+            nodes.last().map(|node| node.kind),
+            input_ids.len(),
+            nodes.len(),
+            profile_value_signature(plan, *output_id)
+        ),
+    }
+}
+
+fn record_execution_profile(signature: String, elapsed_ns: u128) {
+    if !execution_profile_enabled() {
+        return;
+    }
+    let state =
+        EXECUTION_PROFILE_STATE.get_or_init(|| Mutex::new(ExecutionProfileState::default()));
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    let stats = state.timings.entry(signature).or_default();
+    stats.count += 1;
+    stats.total_ns += elapsed_ns;
+    stats.max_ns = stats.max_ns.max(elapsed_ns);
+}
+
+fn finish_profiled_execution() {
+    if !execution_profile_enabled() {
+        return;
+    }
+    let state =
+        EXECUTION_PROFILE_STATE.get_or_init(|| Mutex::new(ExecutionProfileState::default()));
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    state.executions += 1;
+    if state.executions % execution_profile_report_interval() != 0 {
+        return;
+    }
+
+    let mut entries = state
+        .timings
+        .iter()
+        .map(|(signature, stats)| (signature, stats))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|(_, lhs), (_, rhs)| rhs.total_ns.cmp(&lhs.total_ns));
+
+    eprintln!(
+        "LIBTT_EXEC_PROFILE executions={} signatures={} sync_each_op={}",
+        state.executions,
+        state.timings.len(),
+        execution_profile_sync_each_op()
+    );
+    for (rank, (signature, stats)) in entries
+        .into_iter()
+        .take(execution_profile_report_limit())
+        .enumerate()
+    {
+        let total_ms = stats.total_ns as f64 / 1_000_000.0;
+        let avg_ms = total_ms / stats.count as f64;
+        let max_ms = stats.max_ns as f64 / 1_000_000.0;
+        eprintln!(
+            "LIBTT_EXEC_PROFILE #{:02} total_ms={:.3} avg_ms={:.3} max_ms={:.3} count={} {}",
+            rank + 1,
+            total_ms,
+            avg_ms,
+            max_ms,
+            stats.count,
+            signature
+        );
+    }
+    if execution_profile_reset_on_report() {
+        state.timings.clear();
+    }
 }
 
 #[repr(C)]
@@ -2135,6 +2403,19 @@ fn execute_top_k(
     )
 }
 
+fn kernel_matmul_grouped_head_view(
+    view: &executable::MatmulGroupedHeadView,
+) -> Result<kernels::matmul::MatmulGroupedHeadView, *mut PJRT_Error> {
+    Ok(kernels::matmul::MatmulGroupedHeadView {
+        logical_shape: dims_i64_to_usize(&view.logical_shape)?,
+        grouped_dimension: usize::try_from(view.grouped_dimension).map_err(|_| {
+            invalid_argument("TT executable matmul grouped dimension does not fit usize")
+        })?,
+        group_size: usize::try_from(view.group_size)
+            .map_err(|_| invalid_argument("TT executable matmul group size does not fit usize"))?,
+    })
+}
+
 fn execute_matmul(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2144,6 +2425,8 @@ fn execute_matmul(
     output_id: u32,
     dimension_numbers: &executable::DotGeneralDimensionNumbers,
     top_k_epilogue: Option<&executable::MatmulTopKEpilogue>,
+    lhs_grouped_head_view: Option<&executable::MatmulGroupedHeadView>,
+    rhs_grouped_head_view: Option<&executable::MatmulGroupedHeadView>,
 ) -> Result<(), *mut PJRT_Error> {
     let lhs = device_buffer_for_value(values, input_ids[0], "matmul.lhs")?;
     let rhs = device_buffer_for_value(values, input_ids[1], "matmul.rhs")?;
@@ -2159,6 +2442,12 @@ fn execute_matmul(
     };
     let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
     let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+    let lhs_grouped_head_view = lhs_grouped_head_view
+        .map(kernel_matmul_grouped_head_view)
+        .transpose()?;
+    let rhs_grouped_head_view = rhs_grouped_head_view
+        .map(kernel_matmul_grouped_head_view)
+        .transpose()?;
 
     if let Some(epilogue) = top_k_epilogue {
         if epilogue.k != 1 {
@@ -2212,7 +2501,7 @@ fn execute_matmul(
         }
 
         let matmul_shape = dims_i64_to_usize(&matmul_desc.dims)?;
-        let matmul_output = kernels::matmul::matmul_dot_general(
+        let matmul_output = kernels::matmul::matmul_dot_general_with_views(
             device,
             lhs_dram,
             rhs_dram,
@@ -2223,6 +2512,8 @@ fn execute_matmul(
             &dimension_numbers.rhs_batching_dimensions,
             &dimension_numbers.lhs_contracting_dimensions,
             &dimension_numbers.rhs_contracting_dimensions,
+            lhs_grouped_head_view.as_ref(),
+            rhs_grouped_head_view.as_ref(),
             kernels::matmul::MatmulEpilogue::Top1,
             "pjrt_matmul_top_k",
         )
@@ -2274,7 +2565,7 @@ fn execute_matmul(
             lhs.buffer_type, rhs.buffer_type
         )));
     }
-    let output_dram = kernels::matmul::matmul_dot_general(
+    let output_dram = kernels::matmul::matmul_dot_general_with_views(
         device,
         lhs_dram,
         rhs_dram,
@@ -2285,6 +2576,8 @@ fn execute_matmul(
         &dimension_numbers.rhs_batching_dimensions,
         &dimension_numbers.lhs_contracting_dimensions,
         &dimension_numbers.rhs_contracting_dimensions,
+        lhs_grouped_head_view.as_ref(),
+        rhs_grouped_head_view.as_ref(),
         kernels::matmul::MatmulEpilogue::Store { output_dtype },
         "pjrt_matmul",
     )
@@ -2912,7 +3205,9 @@ fn execute_executable_v1(
     let mut values = vec![None; plan.values.len()];
 
     for op in &plan.ops {
-        match op {
+        let profile_start = execution_profile_enabled().then(Instant::now);
+        let op_result = (|| -> Result<(), *mut PJRT_Error> {
+            match op {
             executable::Op::Parameter {
                 parameter_index,
                 output_id,
@@ -2957,6 +3252,7 @@ fn execute_executable_v1(
                 let mut parameter = input.clone();
                 parameter.buffer_type = expected.element_type;
                 values[output_index] = Some(parameter);
+                Ok(())
             }
             executable::Op::Concatenate {
                 input_ids,
@@ -2970,7 +3266,7 @@ fn execute_executable_v1(
                 input_ids,
                 *output_id,
                 *dimension,
-            )?,
+            ),
             executable::Op::Reshape {
                 input_id,
                 output_id,
@@ -2981,7 +3277,7 @@ fn execute_executable_v1(
                 output_context,
                 *input_id,
                 *output_id,
-            )?,
+            ),
             executable::Op::Slice {
                 input_id,
                 output_id,
@@ -2998,7 +3294,7 @@ fn execute_executable_v1(
                 start_indices,
                 limit_indices,
                 strides,
-            )?,
+            ),
             executable::Op::Transpose {
                 input_id,
                 output_id,
@@ -3011,13 +3307,13 @@ fn execute_executable_v1(
                 *input_id,
                 *output_id,
                 permutation,
-            )?,
+            ),
             executable::Op::CustomCall {
                 call_target_name, ..
             } => {
-                return Err(unimplemented(format!(
+                Err(unimplemented(format!(
                     "TT executable custom_call {call_target_name:?} execution is not currently supported"
-                )));
+                )))
             }
             executable::Op::Reduce {
                 input_ids,
@@ -3035,7 +3331,7 @@ fn execute_executable_v1(
                 *output_id,
                 dimensions,
                 *reducer,
-            )?,
+            ),
             executable::Op::ReduceWindow {
                 input_ids,
                 init_value_ids,
@@ -3052,12 +3348,14 @@ fn execute_executable_v1(
                 *output_id,
                 attributes,
                 *reducer,
-            )?,
+            ),
             executable::Op::Matmul {
                 input_ids,
                 output_id,
                 dimension_numbers,
                 top_k_epilogue,
+                lhs_grouped_head_view,
+                rhs_grouped_head_view,
             } => execute_matmul(
                 &mut values,
                 plan,
@@ -3067,50 +3365,46 @@ fn execute_executable_v1(
                 *output_id,
                 dimension_numbers,
                 top_k_epilogue.as_ref(),
-            )?,
+                lhs_grouped_head_view.as_ref(),
+                rhs_grouped_head_view.as_ref(),
+            ),
             executable::Op::Constant {
                 packed_value,
                 data,
                 output_id,
-            } => {
-                execute_constant(
-                    &mut values,
-                    plan,
-                    device,
-                    output_context,
-                    *packed_value,
-                    data,
-                    *output_id,
-                )?;
-            }
+            } => execute_constant(
+                &mut values,
+                plan,
+                device,
+                output_context,
+                *packed_value,
+                data,
+                *output_id,
+            ),
             executable::Op::Select {
                 input_ids,
                 output_id,
-            } => {
-                execute_select(
-                    &mut values,
-                    plan,
-                    device,
-                    output_context,
-                    *input_ids,
-                    *output_id,
-                )?;
-            }
+            } => execute_select(
+                &mut values,
+                plan,
+                device,
+                output_context,
+                *input_ids,
+                *output_id,
+            ),
             executable::Op::BroadcastInDim {
                 input_id,
                 output_id,
                 broadcast_dimensions,
-            } => {
-                execute_broadcast_in_dim(
-                    &mut values,
-                    plan,
-                    device,
-                    output_context,
-                    *input_id,
-                    *output_id,
-                    broadcast_dimensions,
-                )?;
-            }
+            } => execute_broadcast_in_dim(
+                &mut values,
+                plan,
+                device,
+                output_context,
+                *input_id,
+                *output_id,
+                broadcast_dimensions,
+            ),
             executable::Op::Gather {
                 input_ids,
                 output_id,
@@ -3126,7 +3420,7 @@ fn execute_executable_v1(
                 *output_id,
                 dimension_numbers,
                 slice_sizes,
-            )?,
+            ),
             executable::Op::Scatter {
                 input_ids,
                 output_id,
@@ -3140,7 +3434,7 @@ fn execute_executable_v1(
                 *input_ids,
                 *output_id,
                 dimension_numbers,
-            )?,
+            ),
             executable::Op::Iota {
                 output_id,
                 iota_dimension,
@@ -3151,7 +3445,7 @@ fn execute_executable_v1(
                 output_context,
                 *output_id,
                 *iota_dimension,
-            )?,
+            ),
             executable::Op::TopK {
                 input_id,
                 values_id,
@@ -3166,7 +3460,7 @@ fn execute_executable_v1(
                 *values_id,
                 *indices_id,
                 *k,
-            )?,
+            ),
             executable::Op::FusedElementwise {
                 input_ids,
                 output_id,
@@ -3179,10 +3473,23 @@ fn execute_executable_v1(
                 input_ids,
                 *output_id,
                 nodes,
-            )?,
+            ),
+            }
+        })();
+        op_result?;
+        if execution_profile_sync_each_op() {
+            device.finish_dispatch().map_err(io_error)?;
+        }
+        if let Some(start) = profile_start {
+            record_execution_profile(profile_op_signature(op, plan), start.elapsed().as_nanos());
         }
     }
+    let profile_start = execution_profile_enabled().then(Instant::now);
     device.finish_dispatch().map_err(io_error)?;
+    if let Some(start) = profile_start {
+        record_execution_profile("finish_dispatch".to_owned(), start.elapsed().as_nanos());
+    }
+    finish_profiled_execution();
 
     let mut outputs = Vec::with_capacity(plan.output_ids.len());
     for (index, &output_id) in plan.output_ids.iter().enumerate() {
@@ -5895,6 +6202,7 @@ mod tests {
                     output_id,
                     dimension_numbers,
                     top_k_epilogue,
+                    ..
                 } = &executable.ops[2]
                 else {
                     panic!("dot_general should lower to Matmul");
@@ -5938,6 +6246,7 @@ mod tests {
                     output_id,
                     dimension_numbers,
                     top_k_epilogue,
+                    ..
                 } = &executable.ops[2]
                 else {
                     panic!("dot_general/top_k should lower to Matmul with top_k epilogue");
