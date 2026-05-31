@@ -249,10 +249,10 @@ void fill_prefix_row_inner_col_tile_impl(const InterleavedAddrGenFast<true> &inp
                                          uint32_t row_tile, uint32_t col_tile,
                                          uint32_t dst_addr, uint32_t tile_bytes,
                                          uint32_t cb_source) {
-  zero_tile_at(dst_addr, tile_bytes);
   const uint32_t row_base = row_tile * TILE_R;
   const uint32_t col_base = col_tile * TILE_C;
   if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    zero_tile_at(dst_addr, tile_bytes);
     return;
   }
 
@@ -261,12 +261,34 @@ void fill_prefix_row_inner_col_tile_impl(const InterleavedAddrGenFast<true> &inp
   indices[view.col_dims[0]] = col_base;
   const uint32_t valid_rows = min_u32(TILE_R, view.logical_rows - row_base);
   const uint32_t valid_cols = min_u32(TILE_C, view.logical_cols - col_base);
+  if (valid_rows != TILE_R || valid_cols != TILE_C) {
+    zero_tile_at(dst_addr, tile_bytes);
+  }
+
+  const uint32_t row_dim = view.row_dims[0];
+  const bool can_stride_source_tiles = row_dim != view.grouped_dim;
+  uint32_t source_tile_base = 0;
+  uint32_t source_tile_stride = 0;
+  uint32_t strided_source_row = 0;
+  uint32_t strided_source_col = 0;
+  if (can_stride_source_tiles) {
+    indices[row_dim] = row_base;
+    source_tile_base = tile_id_for_indices(
+        view, indices, &strided_source_row, &strided_source_col);
+    source_tile_stride = view.tile_rows * view.tiles_per_row;
+    for (uint32_t dim = row_dim + 1; dim + 2 < view.rank; ++dim) {
+      source_tile_stride *= view.physical_shape[dim];
+    }
+  }
+
   for (uint32_t row = 0; row < valid_rows; ++row) {
-    uint32_t source_row = 0;
-    uint32_t source_col = 0;
-    indices[view.row_dims[0]] = row_base + row;
-    const uint32_t source_tile =
-        tile_id_for_indices(view, indices, &source_row, &source_col);
+    uint32_t source_row = strided_source_row;
+    uint32_t source_col = strided_source_col;
+    uint32_t source_tile = source_tile_base + row * source_tile_stride;
+    if (!can_stride_source_tiles) {
+      indices[row_dim] = row_base + row;
+      source_tile = tile_id_for_indices(view, indices, &source_row, &source_col);
+    }
     read_source_tile(input, source_tile, cb_source);
     copy_source_row_to_dst_row<DatumBytes>(
         cb_source, dst_addr, source_row, source_col, row, 0, valid_cols);
@@ -278,11 +300,14 @@ template <uint32_t DatumBytes>
 void fill_generic_tile_impl(const InterleavedAddrGenFast<true> &input, const View &view,
                             uint32_t batch, uint32_t row_tile, uint32_t col_tile,
                             uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
-  zero_tile_at(dst_addr, tile_bytes);
   uint32_t row_base = row_tile * TILE_R;
   uint32_t col_base = col_tile * TILE_C;
   if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    zero_tile_at(dst_addr, tile_bytes);
     return;
+  }
+  if (row_base + TILE_R > view.logical_rows || col_base + TILE_C > view.logical_cols) {
+    zero_tile_at(dst_addr, tile_bytes);
   }
 
   uint32_t indices[MAX_RANK] = {};
@@ -352,11 +377,16 @@ void fill_tiled_index_map_tile_impl(const InterleavedAddrGenFast<true> &input,
                                     const View &view, uint32_t batch, uint32_t row_tile,
                                     uint32_t col_tile, uint32_t dst_addr,
                                     uint32_t tile_bytes, uint32_t cb_source) {
-  zero_tile_at(dst_addr, tile_bytes);
   uint32_t row_base = row_tile * TILE_R;
   uint32_t col_base = col_tile * TILE_C;
   if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    zero_tile_at(dst_addr, tile_bytes);
     return;
+  }
+  const uint32_t valid_rows = min_u32(TILE_R, view.logical_rows - row_base);
+  const uint32_t valid_cols = min_u32(TILE_C, view.logical_cols - col_base);
+  if (valid_rows != TILE_R || valid_cols != TILE_C) {
+    zero_tile_at(dst_addr, tile_bytes);
   }
 
   uint32_t indices[MAX_RANK] = {};
@@ -373,13 +403,9 @@ void fill_tiled_index_map_tile_impl(const InterleavedAddrGenFast<true> &input,
   const uint32_t source_col_in_tile = source_col_base % TILE_C;
   const uint32_t source_tile_row = source_row_base / TILE_R;
   const uint32_t source_tile_col = source_col_base / TILE_C;
-  const uint32_t valid_rows = min_u32(TILE_R, view.logical_rows - row_base);
 
-  for (uint32_t col = 0; col < TILE_C; ++col) {
+  for (uint32_t col = 0; col < valid_cols; ++col) {
     uint32_t logical_col = col_base + col;
-    if (logical_col >= view.logical_cols) {
-      continue;
-    }
     uint32_t prefix = 0;
     for (uint32_t dim = 0; dim + 2 < view.rank; ++dim) {
       uint32_t index = dim == map.source_col_dim ? logical_col : indices[dim];
@@ -412,10 +438,10 @@ void fill_tile_transpose_tile_impl(const InterleavedAddrGenFast<true> &input,
                                    const View &view, uint32_t batch, uint32_t row_tile,
                                    uint32_t col_tile, uint32_t dst_addr,
                                    uint32_t tile_bytes, uint32_t cb_source) {
-  zero_tile_at(dst_addr, tile_bytes);
   uint32_t row_base = row_tile * TILE_R;
   uint32_t col_base = col_tile * TILE_C;
   if (row_base >= view.logical_rows || col_base >= view.logical_cols) {
+    zero_tile_at(dst_addr, tile_bytes);
     return;
   }
 
@@ -434,6 +460,7 @@ void fill_tile_transpose_tile_impl(const InterleavedAddrGenFast<true> &input,
     return;
   }
 
+  zero_tile_at(dst_addr, tile_bytes);
   read_source_tile(input, source_tile, cb_source);
 
   for (uint32_t row = 0; row < TILE_R && col_base + row < view.logical_cols; ++row) {

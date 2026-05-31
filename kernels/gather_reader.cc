@@ -373,6 +373,51 @@ void run_axis_gather(const InterleavedAddrGenFast<true> &operand,
   }
 }
 
+void run_prefix_axis_gather(const InterleavedAddrGenFast<true> &operand,
+                            const InterleavedAddrGenFast<true> &indices) {
+  uint32_t output_tile_offset = get_arg_val<uint32_t>(2);
+  uint32_t output_tile_count = get_arg_val<uint32_t>(3);
+
+  constexpr uint32_t cb_indices = tt::CBIndex::c_1;
+  constexpr uint32_t cb_output = tt::CBIndex::c_16;
+
+  uint32_t loaded_index_tile = INVALID_TILE;
+  for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
+    uint32_t output_tile_id = output_tile_offset + tile;
+    uint32_t output_matrix_tiles = OUTPUT_TILE_ROWS * OUTPUT_TILES_PER_ROW;
+    uint32_t output_batch = output_tile_id / output_matrix_tiles;
+    uint32_t output_matrix_tile = output_tile_id % output_matrix_tiles;
+    uint32_t output_tile_row = output_matrix_tile / OUTPUT_TILES_PER_ROW;
+    uint32_t output_tile_col = output_matrix_tile % OUTPUT_TILES_PER_ROW;
+
+    uint32_t base_coords[COORD_COUNT];
+    decode_batch(output_batch, OUTPUT_SHAPE, base_coords);
+    int32_t gather_index =
+        read_gather_index(indices, base_coords[AXIS], &loaded_index_tile);
+
+    cb_reserve_back(cb_output, 1);
+    if (gather_index < 0 || static_cast<uint32_t>(gather_index) >= OPERAND_SHAPE[AXIS]) {
+      zero_tile(cb_output);
+    } else {
+      uint32_t operand_coords[COORD_COUNT];
+      for (uint32_t dim = 0; dim < RANK; ++dim) {
+        operand_coords[dim] = base_coords[dim];
+      }
+      operand_coords[AXIS] = static_cast<uint32_t>(gather_index);
+      operand_coords[RANK - 2] = output_tile_row * TILE_R;
+      operand_coords[RANK - 1] = output_tile_col * TILE_C;
+      Location source = tensor_location(
+          OPERAND_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW, operand_coords);
+      noc_async_read_tile(source.tile, operand, get_write_ptr(cb_output));
+      noc_async_read_barrier();
+    }
+    cb_push_back(cb_output, 1);
+  }
+  if (loaded_index_tile != INVALID_TILE) {
+    cb_pop_front(cb_indices, 1);
+  }
+}
+
 }  // namespace
 
 void kernel_main() {
@@ -394,6 +439,8 @@ void kernel_main() {
   };
   if constexpr (BF16_ROWS) {
     run_bf16_rows_gather(operand, start_indices);
+  } else if constexpr (!OPERAND_RESHAPE_VIEW && RANK >= 3 && AXIS + 2 < RANK) {
+    run_prefix_axis_gather(operand, start_indices);
   } else if constexpr (OPERAND_RESHAPE_VIEW && RANK >= 3 && AXIS == RANK - 2) {
     run_reshape_row_axis_gather(operand, start_indices);
   } else {

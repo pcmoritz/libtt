@@ -2060,6 +2060,25 @@ fn execute_reshape(
         if can_leave_reshape_unmaterialized(plan, output_id) {
             return Ok(());
         }
+        let input = device_buffer_for_value(values, input_id, "reshape.operand")?;
+        if let Some(input_dram) = input.dram_buffer.as_ref() {
+            let output_allocation_shape =
+                dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+            if input_dram.shape == output_allocation_shape
+                && reshape_preserves_tiled_layout(&input_shape, &output_shape)?
+            {
+                let output_dram = input_dram.clone();
+                return store_output_buffer(
+                    values,
+                    plan,
+                    output_id,
+                    output_desc.dims.clone(),
+                    output_dram,
+                    context,
+                    "reshape",
+                );
+            }
+        }
         if plan.output_ids.contains(&output_id) {
             // Preserve same-volume output reshapes as views so loop-carried buffers do not
             // pay a device-side copy just to change logical shape.
@@ -2909,6 +2928,32 @@ fn reshape_is_same_dtype_same_volume(
         return false;
     };
     input_desc.element_type == output_desc.element_type && input_elements == output_elements
+}
+
+fn tiled_layout_matrix(shape: &[usize]) -> Result<(usize, usize, usize), *mut PJRT_Error> {
+    let elements = element_count(shape)?;
+    let (rows, cols) = match shape.len() {
+        0 => (1, 1),
+        1 => (1, shape[0]),
+        rank => (shape[rank - 2], shape[rank - 1]),
+    };
+    let matrix_elements = rows
+        .checked_mul(cols)
+        .ok_or_else(|| invalid_argument(format!("shape {shape:?} matrix dimensions overflow")))?;
+    if matrix_elements == 0 || elements % matrix_elements != 0 {
+        return Err(invalid_argument(format!(
+            "shape {shape:?} cannot be represented as a tiled matrix"
+        )));
+    }
+    Ok((elements / matrix_elements, rows, cols))
+}
+
+fn reshape_preserves_tiled_layout(
+    source_shape: &[usize],
+    logical_shape: &[usize],
+) -> Result<bool, *mut PJRT_Error> {
+    Ok(element_count(source_shape)? == element_count(logical_shape)?
+        && tiled_layout_matrix(source_shape)? == tiled_layout_matrix(logical_shape)?)
 }
 
 fn can_leave_reshape_unmaterialized(plan: &executable::Executable, value_id: u32) -> bool {
