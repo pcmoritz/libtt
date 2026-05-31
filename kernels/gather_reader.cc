@@ -14,6 +14,11 @@ static_assert(RANK >= 2, "gather reader expects shapes padded to at least rank 2
 constexpr uint32_t COORD_COUNT = RANK;
 constexpr uint32_t OPERAND_SHAPE[COORD_COUNT] = GATHER_OPERAND_SHAPE;
 constexpr uint32_t OUTPUT_SHAPE[COORD_COUNT] = GATHER_OUTPUT_SHAPE;
+constexpr bool OPERAND_RESHAPE_VIEW = GATHER_OPERAND_RESHAPE_VIEW != 0;
+constexpr uint32_t SOURCE_ROWS = GATHER_SOURCE_ROWS;
+constexpr uint32_t SOURCE_COLS = GATHER_SOURCE_COLS;
+constexpr uint32_t SOURCE_TILE_ROWS = GATHER_SOURCE_TILE_ROWS;
+constexpr uint32_t SOURCE_TILES_PER_ROW = GATHER_SOURCE_TILES_PER_ROW;
 constexpr uint32_t OPERAND_TILE_ROWS = GATHER_OPERAND_TILE_ROWS;
 constexpr uint32_t OPERAND_TILES_PER_ROW = GATHER_OPERAND_TILES_PER_ROW;
 constexpr uint32_t OUTPUT_TILE_ROWS = GATHER_OUTPUT_TILE_ROWS;
@@ -98,6 +103,30 @@ Location tensor_location(const uint32_t shape[COORD_COUNT], uint32_t tile_rows,
   return Location{tile, row % TILE_R, col % TILE_C};
 }
 
+Location reshape_source_location(uint32_t flat_index) {
+  uint32_t col = flat_index % SOURCE_COLS;
+  uint32_t row_major = flat_index / SOURCE_COLS;
+  uint32_t row = row_major % SOURCE_ROWS;
+  uint32_t batch = row_major / SOURCE_ROWS;
+  uint32_t tile_row = row / TILE_R;
+  uint32_t tile_col = col / TILE_C;
+  uint32_t tile = (batch * SOURCE_TILE_ROWS + tile_row) * SOURCE_TILES_PER_ROW + tile_col;
+  return Location{tile, row % TILE_R, col % TILE_C};
+}
+
+Location operand_location(const uint32_t coords[COORD_COUNT]) {
+  if constexpr (OPERAND_RESHAPE_VIEW) {
+    uint32_t flat = 0;
+    for (uint32_t dim = 0; dim < RANK; ++dim) {
+      flat = flat * OPERAND_SHAPE[dim] + coords[dim];
+    }
+    return reshape_source_location(flat);
+  } else {
+    return tensor_location(OPERAND_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW,
+                           coords);
+  }
+}
+
 void ensure_tile(const InterleavedAddrGenFast<true> &input, uint32_t requested_tile,
                  uint32_t cb, uint32_t *loaded_tile) {
   if (requested_tile == *loaded_tile) {
@@ -132,14 +161,93 @@ void copy_operand_element(uint32_t source_row, uint32_t source_col,
       source[tile_element_index(source_row, source_col)];
 }
 
+void copy_operand_row(uint32_t source_l1_addr, uint32_t output_l1_addr,
+                      uint32_t source_row, uint32_t source_col,
+                      uint32_t output_row, uint32_t output_col,
+                      uint32_t count) {
+  volatile tt_l1_ptr Element *source =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(source_l1_addr);
+  volatile tt_l1_ptr Element *output =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(output_l1_addr);
+  if (count == TILE_C && source_col == 0 && output_col == 0) {
+    uint32_t source_face0 = tile_element_index(source_row, 0);
+    uint32_t source_face1 = tile_element_index(source_row, FACE_C);
+    uint32_t output_face0 = tile_element_index(output_row, 0);
+    uint32_t output_face1 = tile_element_index(output_row, FACE_C);
+    for (uint32_t col = 0; col < FACE_C; ++col) {
+      output[output_face0 + col] = source[source_face0 + col];
+      output[output_face1 + col] = source[source_face1 + col];
+    }
+    return;
+  }
+  for (uint32_t col = 0; col < count; ++col) {
+    output[tile_element_index(output_row, output_col + col)] =
+        source[tile_element_index(source_row, source_col + col)];
+  }
+}
+
 void copy_bf16_row(uint32_t source_l1_addr, uint32_t output_l1_addr, uint32_t source_row,
                    uint32_t output_row) {
-  volatile tt_l1_ptr uint16_t *source =
-      reinterpret_cast<volatile tt_l1_ptr uint16_t *>(source_l1_addr);
-  volatile tt_l1_ptr uint16_t *output =
-      reinterpret_cast<volatile tt_l1_ptr uint16_t *>(output_l1_addr);
-  for (uint32_t col = 0; col < TILE_C; ++col) {
-    output[tile_element_index(output_row, col)] = source[tile_element_index(source_row, col)];
+  copy_operand_row(source_l1_addr, output_l1_addr, source_row, 0, output_row, 0, TILE_C);
+}
+
+void run_reshape_row_axis_gather(const InterleavedAddrGenFast<true> &operand,
+                                 const InterleavedAddrGenFast<true> &indices) {
+  uint32_t output_tile_offset = get_arg_val<uint32_t>(2);
+  uint32_t output_tile_count = get_arg_val<uint32_t>(3);
+
+  constexpr uint32_t cb_operand = tt::CBIndex::c_0;
+  constexpr uint32_t cb_indices = tt::CBIndex::c_1;
+  constexpr uint32_t cb_output = tt::CBIndex::c_16;
+
+  uint32_t loaded_index_tile = INVALID_TILE;
+  for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
+    uint32_t output_tile_id = output_tile_offset + tile;
+    uint32_t output_matrix_tiles = OUTPUT_TILE_ROWS * OUTPUT_TILES_PER_ROW;
+    uint32_t output_batch = output_tile_id / output_matrix_tiles;
+    uint32_t output_matrix_tile = output_tile_id % output_matrix_tiles;
+    uint32_t output_tile_row = output_matrix_tile / OUTPUT_TILES_PER_ROW;
+    uint32_t output_tile_col = output_matrix_tile % OUTPUT_TILES_PER_ROW;
+    uint32_t output_row_base = output_tile_row * TILE_R;
+    uint32_t output_col_base = output_tile_col * TILE_C;
+    uint32_t row_count = tile_extent(OUTPUT_SHAPE[RANK - 2], output_row_base, TILE_R);
+    uint32_t col_count = tile_extent(OUTPUT_SHAPE[RANK - 1], output_col_base, TILE_C);
+
+    uint32_t loaded_operand_tile = INVALID_TILE;
+    cb_reserve_back(cb_output, 1);
+    zero_tile(cb_output);
+    uint32_t output_l1_addr = get_write_ptr(cb_output);
+
+    for (uint32_t row = 0; row < row_count; ++row) {
+      uint32_t output_row = output_row_base + row;
+      int32_t gather_index = read_gather_index(indices, output_row, &loaded_index_tile);
+      if (gather_index < 0 ||
+          static_cast<uint32_t>(gather_index) >= OPERAND_SHAPE[RANK - 2]) {
+        continue;
+      }
+
+      uint32_t compact_row =
+          output_batch * OPERAND_SHAPE[RANK - 2] + static_cast<uint32_t>(gather_index);
+      uint32_t source_row = compact_row % SOURCE_ROWS;
+      uint32_t source_batch = compact_row / SOURCE_ROWS;
+      uint32_t source_tile_row = source_row / TILE_R;
+      uint32_t source_tile_col = output_col_base / TILE_C;
+      uint32_t source_tile =
+          (source_batch * SOURCE_TILE_ROWS + source_tile_row) * SOURCE_TILES_PER_ROW +
+          source_tile_col;
+
+      ensure_tile(operand, source_tile, cb_operand, &loaded_operand_tile);
+      copy_operand_row(get_read_ptr(cb_operand), output_l1_addr, source_row % TILE_R,
+                       output_col_base % TILE_C, row, 0, col_count);
+    }
+
+    if (loaded_operand_tile != INVALID_TILE) {
+      cb_pop_front(cb_operand, 1);
+    }
+    cb_push_back(cb_output, 1);
+  }
+  if (loaded_index_tile != INVALID_TILE) {
+    cb_pop_front(cb_indices, 1);
   }
 }
 
@@ -249,9 +357,7 @@ void run_axis_gather(const InterleavedAddrGenFast<true> &operand,
                   : output_coord(dim, base_coords, output_row, output_col);
         }
 
-        Location source =
-            tensor_location(OPERAND_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW,
-                            operand_coords);
+        Location source = operand_location(operand_coords);
         ensure_tile(operand, source.tile, cb_operand, &loaded_operand_tile);
         copy_operand_element(source.row, source.col, row, col);
       }
@@ -288,6 +394,8 @@ void kernel_main() {
   };
   if constexpr (BF16_ROWS) {
     run_bf16_rows_gather(operand, start_indices);
+  } else if constexpr (OPERAND_RESHAPE_VIEW && RANK >= 3 && AXIS == RANK - 2) {
+    run_reshape_row_axis_gather(operand, start_indices);
   } else {
     run_axis_gather(operand, start_indices);
   }
