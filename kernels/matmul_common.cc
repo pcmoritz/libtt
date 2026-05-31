@@ -135,23 +135,83 @@ void ensure_source_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile
 }
 
 template <uint32_t DatumBytes>
+struct ElementForDatumBytes;
+
+template <>
+struct ElementForDatumBytes<sizeof(uint16_t)> {
+  using Type = uint16_t;
+};
+
+template <>
+struct ElementForDatumBytes<sizeof(uint32_t)> {
+  using Type = uint32_t;
+};
+
+template <uint32_t DatumBytes>
+using ElementForDatumBytesT = typename ElementForDatumBytes<DatumBytes>::Type;
+
+template <uint32_t DatumBytes>
 void copy_element_from_source(uint32_t cb_source, uint32_t dst_addr, uint32_t source_row,
                               uint32_t source_col, uint32_t dst_row, uint32_t dst_col) {
+  using Element = ElementForDatumBytesT<DatumBytes>;
   const uint32_t dst_index = tile_element_index(dst_row, dst_col);
   const uint32_t source_index = tile_element_index(source_row, source_col);
-  if constexpr (DatumBytes == sizeof(uint32_t)) {
-    volatile tt_l1_ptr uint32_t *source =
-        reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_read_ptr(cb_source));
-    volatile tt_l1_ptr uint32_t *dst =
-        reinterpret_cast<volatile tt_l1_ptr uint32_t *>(dst_addr);
-    dst[dst_index] = source[source_index];
-  } else {
-    static_assert(DatumBytes == sizeof(uint16_t));
-    volatile tt_l1_ptr uint16_t *source =
-        reinterpret_cast<volatile tt_l1_ptr uint16_t *>(get_read_ptr(cb_source));
-    volatile tt_l1_ptr uint16_t *dst =
-        reinterpret_cast<volatile tt_l1_ptr uint16_t *>(dst_addr);
-    dst[dst_index] = source[source_index];
+  volatile tt_l1_ptr Element *source =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_source));
+  volatile tt_l1_ptr Element *dst =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(dst_addr);
+  dst[dst_index] = source[source_index];
+}
+
+template <uint32_t DatumBytes>
+void copy_source_row_to_dst_row(uint32_t cb_source, uint32_t dst_addr,
+                                uint32_t source_row, uint32_t source_col,
+                                uint32_t dst_row, uint32_t dst_col, uint32_t count) {
+  if (count == TILE_C && source_col == 0 && dst_col == 0) {
+    using Element = ElementForDatumBytesT<DatumBytes>;
+    const uint32_t source_face0 = tile_element_index(source_row, 0);
+    const uint32_t source_face1 = tile_element_index(source_row, FACE_C);
+    const uint32_t dst_face0 = tile_element_index(dst_row, 0);
+    const uint32_t dst_face1 = tile_element_index(dst_row, FACE_C);
+    volatile tt_l1_ptr Element *source =
+        reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_source));
+    volatile tt_l1_ptr Element *dst =
+        reinterpret_cast<volatile tt_l1_ptr Element *>(dst_addr);
+    for (uint32_t col = 0; col < FACE_C; ++col) {
+      dst[dst_face0 + col] = source[source_face0 + col];
+      dst[dst_face1 + col] = source[source_face1 + col];
+    }
+    return;
+  }
+  for (uint32_t col = 0; col < count; ++col) {
+    copy_element_from_source<DatumBytes>(
+        cb_source, dst_addr, source_row, source_col + col, dst_row, dst_col + col);
+  }
+}
+
+template <uint32_t DatumBytes>
+void copy_source_row_to_dst_col(uint32_t cb_source, uint32_t dst_addr,
+                                uint32_t source_row, uint32_t source_col,
+                                uint32_t dst_row, uint32_t dst_col, uint32_t count) {
+  if (count == TILE_R && source_col == 0 && dst_row == 0) {
+    using Element = ElementForDatumBytesT<DatumBytes>;
+    const uint32_t source_face0 = tile_element_index(source_row, 0);
+    const uint32_t source_face1 = tile_element_index(source_row, FACE_C);
+    const uint32_t dst_face0 = tile_element_index(0, dst_col);
+    const uint32_t dst_face1 = tile_element_index(FACE_R, dst_col);
+    volatile tt_l1_ptr Element *source =
+        reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_source));
+    volatile tt_l1_ptr Element *dst =
+        reinterpret_cast<volatile tt_l1_ptr Element *>(dst_addr);
+    for (uint32_t row = 0; row < FACE_R; ++row) {
+      dst[dst_face0 + row * FACE_C] = source[source_face0 + row];
+      dst[dst_face1 + row * FACE_C] = source[source_face1 + row];
+    }
+    return;
+  }
+  for (uint32_t row = 0; row < count; ++row) {
+    copy_element_from_source<DatumBytes>(
+        cb_source, dst_addr, source_row, source_col + row, dst_row + row, dst_col);
   }
 }
 
@@ -208,10 +268,8 @@ void fill_prefix_row_inner_col_tile_impl(const InterleavedAddrGenFast<true> &inp
     const uint32_t source_tile =
         tile_id_for_indices(view, indices, &source_row, &source_col);
     read_source_tile(input, source_tile, cb_source);
-    for (uint32_t col = 0; col < valid_cols; ++col) {
-      copy_element_from_source<DatumBytes>(cb_source, dst_addr, source_row,
-                                           source_col + col, row, col);
-    }
+    copy_source_row_to_dst_row<DatumBytes>(
+        cb_source, dst_addr, source_row, source_col, row, 0, valid_cols);
     cb_pop_front(cb_source, 1);
   }
 }
@@ -330,10 +388,8 @@ void fill_tiled_index_map_tile_impl(const InterleavedAddrGenFast<true> &input,
     uint32_t source_tile =
         (prefix * view.tile_rows + source_tile_row) * view.tiles_per_row + source_tile_col;
     read_source_tile(input, source_tile, cb_source);
-    for (uint32_t row = 0; row < valid_rows; ++row) {
-      copy_element_from_source<DatumBytes>(
-          cb_source, dst_addr, source_row_in_tile, source_col_in_tile + row, row, col);
-    }
+    copy_source_row_to_dst_col<DatumBytes>(
+        cb_source, dst_addr, source_row_in_tile, source_col_in_tile, 0, col, valid_rows);
     cb_pop_front(cb_source, 1);
   }
 }

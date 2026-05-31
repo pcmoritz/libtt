@@ -5,6 +5,7 @@ use crate::dram::{
 };
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
+use crate::kernels::reshape_view::{reshape_source_view, ReshapeSourceView};
 use std::io;
 
 const SCATTER_READER: &str = include_str!("../../kernels/scatter_reader.cc");
@@ -20,6 +21,7 @@ pub(crate) struct ScatterShape {
     update_shape: Vec<u32>,
     scatter_dim: u32,
     update_count: u32,
+    operand_source_view: Option<ReshapeSourceView>,
     operand_tile_rows: u32,
     operand_tiles_per_row: u32,
     update_tile_rows: u32,
@@ -76,6 +78,7 @@ pub(crate) fn scatter_set(
     start_indices: &DramBuffer,
     updates: &DramBuffer,
     operand_shape: &[usize],
+    operand_source_shape: Option<&[usize]>,
     start_indices_shape: &[usize],
     update_shape: &[usize],
     scatter_dim: usize,
@@ -87,13 +90,14 @@ pub(crate) fn scatter_set(
         start_indices,
         updates,
         operand_shape,
+        operand_source_shape,
         start_indices_shape,
         update_shape,
         scatter_dim,
         dtype,
     )?;
 
-    let shape = scatter_shape(operand_shape, update_shape, scatter_dim)?;
+    let shape = scatter_shape(operand_shape, operand_source_shape, update_shape, scatter_dim)?;
     let output_tiles = usize::try_from(shape.output_tiles).map_err(|_| {
         invalid_input(format!(
             "scatter output tile count does not fit in usize: {}",
@@ -127,6 +131,7 @@ fn validate_scatter_buffers(
     start_indices: &DramBuffer,
     updates: &DramBuffer,
     operand_shape: &[usize],
+    operand_source_shape: Option<&[usize]>,
     start_indices_shape: &[usize],
     update_shape: &[usize],
     scatter_dim: usize,
@@ -179,7 +184,11 @@ fn validate_scatter_buffers(
         )));
     }
 
-    validate_allocation(operand, operand_shape, "scatter operand")?;
+    validate_allocation(
+        operand,
+        operand_source_shape.unwrap_or(operand_shape),
+        "scatter operand",
+    )?;
     validate_allocation(start_indices, start_indices_shape, "scatter start_indices")?;
     validate_allocation(updates, update_shape, "scatter updates")?;
     Ok(())
@@ -205,6 +214,7 @@ fn validate_allocation(buffer: &DramBuffer, logical_shape: &[usize], name: &str)
 
 fn scatter_shape(
     operand_shape: &[usize],
+    operand_source_shape: Option<&[usize]>,
     update_shape: &[usize],
     scatter_dim: usize,
 ) -> io::Result<ScatterShape> {
@@ -213,11 +223,21 @@ fn scatter_shape(
     let operand_rank = operand_allocation_shape.len();
     let update_rank = update_allocation_shape.len();
     let output_tiles = tiled_shape_tile_count(operand_shape)?;
+    let operand_source_view = if let Some(source_shape) = operand_source_shape {
+        Some(reshape_source_view(
+            source_shape,
+            operand_shape,
+            "scatter reshape view",
+        )?)
+    } else {
+        None
+    };
     Ok(ScatterShape {
         operand_shape: u32_shape(operand_shape, "scatter operand shape")?,
         update_shape: u32_shape(update_shape, "scatter update shape")?,
         scatter_dim: u32_arg(scatter_dim, "scatter dim")?,
         update_count: u32_arg(update_shape[scatter_dim], "scatter update count")?,
+        operand_source_view,
         operand_tile_rows: u32_arg(
             operand_allocation_shape[operand_rank - 2] / TILE_R,
             "scatter operand tile rows",
@@ -283,12 +303,18 @@ fn scatter_program(key: ScatterProgramKey) -> io::Result<Program> {
 
 fn scatter_reader_source(dtype: DType, shape: &ScatterShape) -> io::Result<String> {
     let element_type = element_type(dtype);
+    let source_view = shape.operand_source_view.as_ref();
     Ok(format!(
         "#define SCATTER_RANK {}\n\
          #define SCATTER_OPERAND_SHAPE {}\n\
          #define SCATTER_UPDATE_SHAPE {}\n\
          #define SCATTER_DIM_ARG {}\n\
          #define SCATTER_UPDATE_COUNT {}\n\
+         #define SCATTER_OPERAND_RESHAPE_VIEW {}\n\
+         #define SCATTER_SOURCE_ROWS {}\n\
+         #define SCATTER_SOURCE_COLS {}\n\
+         #define SCATTER_SOURCE_TILE_ROWS {}\n\
+         #define SCATTER_SOURCE_TILES_PER_ROW {}\n\
          #define SCATTER_OPERAND_TILE_ROWS {}\n\
          #define SCATTER_OPERAND_TILES_PER_ROW {}\n\
          #define SCATTER_UPDATE_TILE_ROWS {}\n\
@@ -300,6 +326,11 @@ fn scatter_reader_source(dtype: DType, shape: &ScatterShape) -> io::Result<Strin
         cpp_u32_array(&shape.update_shape),
         shape.scatter_dim,
         shape.update_count,
+        source_view.is_some() as u32,
+        source_view.map_or(1, |view| view.rows),
+        source_view.map_or(1, |view| view.cols),
+        source_view.map_or(1, |view| view.tile_rows),
+        source_view.map_or(1, |view| view.tiles_per_row),
         shape.operand_tile_rows,
         shape.operand_tiles_per_row,
         shape.update_tile_rows,
