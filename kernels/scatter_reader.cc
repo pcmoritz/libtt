@@ -18,6 +18,11 @@ constexpr uint32_t SOURCE_ROWS = SCATTER_SOURCE_ROWS;
 constexpr uint32_t SOURCE_COLS = SCATTER_SOURCE_COLS;
 constexpr uint32_t SOURCE_TILE_ROWS = SCATTER_SOURCE_TILE_ROWS;
 constexpr uint32_t SOURCE_TILES_PER_ROW = SCATTER_SOURCE_TILES_PER_ROW;
+constexpr bool UPDATE_RESHAPE_VIEW = SCATTER_UPDATE_RESHAPE_VIEW != 0;
+constexpr uint32_t UPDATE_SOURCE_ROWS = SCATTER_UPDATE_SOURCE_ROWS;
+constexpr uint32_t UPDATE_SOURCE_COLS = SCATTER_UPDATE_SOURCE_COLS;
+constexpr uint32_t UPDATE_SOURCE_TILE_ROWS = SCATTER_UPDATE_SOURCE_TILE_ROWS;
+constexpr uint32_t UPDATE_SOURCE_TILES_PER_ROW = SCATTER_UPDATE_SOURCE_TILES_PER_ROW;
 constexpr uint32_t OPERAND_TILE_ROWS = SCATTER_OPERAND_TILE_ROWS;
 constexpr uint32_t OPERAND_TILES_PER_ROW = SCATTER_OPERAND_TILES_PER_ROW;
 constexpr uint32_t UPDATE_TILE_ROWS = SCATTER_UPDATE_TILE_ROWS;
@@ -121,14 +126,15 @@ Location tensor_location(const uint32_t shape[COORD_COUNT], uint32_t tile_rows,
   }
 }
 
-Location reshape_source_location(uint32_t flat_index) {
-  uint32_t col = flat_index % SOURCE_COLS;
-  uint32_t row_major = flat_index / SOURCE_COLS;
-  uint32_t row = row_major % SOURCE_ROWS;
-  uint32_t batch = row_major / SOURCE_ROWS;
+Location reshape_source_location(uint32_t flat_index, uint32_t rows, uint32_t cols,
+                                 uint32_t tile_rows, uint32_t tiles_per_row) {
+  uint32_t col = flat_index % cols;
+  uint32_t row_major = flat_index / cols;
+  uint32_t row = row_major % rows;
+  uint32_t batch = row_major / rows;
   uint32_t tile_row = row / TILE_R;
   uint32_t tile_col = col / TILE_C;
-  uint32_t tile = (batch * SOURCE_TILE_ROWS + tile_row) * SOURCE_TILES_PER_ROW + tile_col;
+  uint32_t tile = (batch * tile_rows + tile_row) * tiles_per_row + tile_col;
   return Location{tile, row % TILE_R, col % TILE_C};
 }
 
@@ -138,10 +144,45 @@ Location operand_location(const uint32_t coords[COORD_COUNT]) {
     for (uint32_t dim = 0; dim < RANK; ++dim) {
       flat = flat * OPERAND_SHAPE[dim] + coords[dim];
     }
-    return reshape_source_location(flat);
+    return reshape_source_location(flat, SOURCE_ROWS, SOURCE_COLS, SOURCE_TILE_ROWS,
+                                   SOURCE_TILES_PER_ROW);
   } else {
     return tensor_location(OPERAND_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW,
                            coords);
+  }
+}
+
+Location update_location(const uint32_t coords[COORD_COUNT]) {
+  if constexpr (UPDATE_RESHAPE_VIEW) {
+    uint32_t flat = 0;
+    for (uint32_t dim = 0; dim < RANK; ++dim) {
+      flat = flat * UPDATE_SHAPE[dim] + coords[dim];
+    }
+    return reshape_source_location(flat, UPDATE_SOURCE_ROWS, UPDATE_SOURCE_COLS,
+                                   UPDATE_SOURCE_TILE_ROWS,
+                                   UPDATE_SOURCE_TILES_PER_ROW);
+  } else {
+    return tensor_location(UPDATE_SHAPE, UPDATE_TILE_ROWS, UPDATE_TILES_PER_ROW,
+                           coords);
+  }
+}
+
+Location update_row_location(uint32_t update_batch, uint32_t output_row,
+                             uint32_t output_col_base) {
+  if constexpr (UPDATE_RESHAPE_VIEW) {
+    uint32_t flat =
+        (update_batch * UPDATE_SHAPE[RANK - 2] + output_row) * UPDATE_SHAPE[RANK - 1] +
+        output_col_base;
+    return reshape_source_location(flat, UPDATE_SOURCE_ROWS, UPDATE_SOURCE_COLS,
+                                   UPDATE_SOURCE_TILE_ROWS,
+                                   UPDATE_SOURCE_TILES_PER_ROW);
+  } else {
+    uint32_t update_tile_row = output_row / TILE_R;
+    uint32_t update_tile_col = output_col_base / TILE_C;
+    uint32_t update_tile =
+        (update_batch * UPDATE_TILE_ROWS + update_tile_row) * UPDATE_TILES_PER_ROW +
+        update_tile_col;
+    return Location{update_tile, output_row % TILE_R, output_col_base % TILE_C};
   }
 }
 
@@ -194,14 +235,12 @@ void ensure_update_tile(const InterleavedAddrGenFast<true> &updates,
   *loaded_tile = requested_tile;
 }
 
-void copy_update_element(uint32_t source_row, uint32_t source_col,
-                         uint32_t output_row, uint32_t output_col) {
-  constexpr uint32_t cb_updates = tt::CBIndex::c_2;
-  constexpr uint32_t cb_output = tt::CBIndex::c_16;
+void copy_element(uint32_t source_cb, uint32_t source_row, uint32_t source_col,
+                  uint32_t output_row, uint32_t output_col) {
   volatile tt_l1_ptr Element *source =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_updates));
+      reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(source_cb));
   volatile tt_l1_ptr Element *output =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
+      reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(tt::CBIndex::c_16));
   output[tile_element_index(output_row, output_col)] =
       source[tile_element_index(source_row, source_col)];
 }
@@ -228,18 +267,6 @@ void copy_row(uint32_t source_l1_addr, uint32_t output_l1_addr,
     output[tile_element_index(output_row, output_col + col)] =
         source[tile_element_index(source_row, source_col + col)];
   }
-}
-
-void copy_operand_element(uint32_t source_row, uint32_t source_col,
-                          uint32_t output_row, uint32_t output_col) {
-  constexpr uint32_t cb_operand = tt::CBIndex::c_0;
-  constexpr uint32_t cb_output = tt::CBIndex::c_16;
-  volatile tt_l1_ptr Element *source =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_operand));
-  volatile tt_l1_ptr Element *output =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
-  output[tile_element_index(output_row, output_col)] =
-      source[tile_element_index(source_row, source_col)];
 }
 
 }  // namespace
@@ -326,7 +353,7 @@ void kernel_main() {
             }
             Location source = operand_location(operand_coords);
             ensure_operand_tile(operand, source.tile, &loaded_operand_tile);
-            copy_operand_element(source.row, source.col, row, col);
+            copy_element(cb_operand, source.row, source.col, row, col);
           }
         }
       }
@@ -338,7 +365,8 @@ void kernel_main() {
     }
 
     uint32_t loaded_update_tile = INVALID_TILE;
-    if constexpr (RANK >= 3 && SCATTER_DIM + 2 < RANK) {
+    if constexpr (RANK >= 3 && SCATTER_DIM + 2 < RANK &&
+                  (!UPDATE_RESHAPE_VIEW || UPDATE_SOURCE_COLS == UPDATE_SHAPE[RANK - 1])) {
       uint32_t output_l1_addr = get_write_ptr(cb_output);
       for (uint32_t update_index = 0; update_index < UPDATE_COUNT; ++update_index) {
         int32_t target = read_scatter_index(indices, update_index, &loaded_index_tile);
@@ -352,15 +380,10 @@ void kernel_main() {
             uint32_t coord = dim == SCATTER_DIM ? update_index : base_coords[dim];
             update_batch = update_batch * UPDATE_SHAPE[dim] + coord;
           }
-          uint32_t update_tile_row = output_row / TILE_R;
-          uint32_t update_tile_col = output_col_base / TILE_C;
-          uint32_t update_tile =
-              (update_batch * UPDATE_TILE_ROWS + update_tile_row) *
-                  UPDATE_TILES_PER_ROW +
-              update_tile_col;
-          ensure_update_tile(updates, update_tile, &loaded_update_tile);
-          copy_row(get_read_ptr(cb_updates), output_l1_addr, output_row % TILE_R,
-                   output_col_base % TILE_C, row, 0, col_count);
+          Location source = update_row_location(update_batch, output_row, output_col_base);
+          ensure_update_tile(updates, source.tile, &loaded_update_tile);
+          copy_row(get_read_ptr(cb_updates), output_l1_addr, source.row, source.col, row,
+                   0, col_count);
         }
       }
     } else {
@@ -386,10 +409,9 @@ void kernel_main() {
                                        : output_coord(dim, base_coords, output_row, output_col);
             }
 
-            Location source = tensor_location(UPDATE_SHAPE, UPDATE_TILE_ROWS,
-                                              UPDATE_TILES_PER_ROW, update_coords);
+            Location source = update_location(update_coords);
             ensure_update_tile(updates, source.tile, &loaded_update_tile);
-            copy_update_element(source.row, source.col, row, col);
+            copy_element(cb_updates, source.row, source.col, row, col);
           }
         }
       }
