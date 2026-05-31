@@ -1,6 +1,7 @@
 void kernel_main() {
   constexpr uint32_t cb_in1 = tt::CBIndex::c_1;
   constexpr uint32_t cb_source = tt::CBIndex::c_3;
+  constexpr uint32_t cb_gather_indices = tt::CBIndex::c_5;
   const uint32_t in1_tile_bytes = get_tile_size(cb_in1);
   const uint32_t block_w = A(5);
   const uint32_t block_h = A(6);
@@ -13,6 +14,8 @@ void kernel_main() {
   const uint32_t total_batch_count = A(34);
   const uint32_t rhs_batch_stride = A(35);
   const View view = load_view(ARG_RHS_VIEW_KIND);
+  GatherIndexReader gather_indices =
+      make_gather_index_reader(A(ARG_RHS_GATHER_INDICES_ADDR), cb_gather_indices);
   const OutputDrain output_drain = load_output_drain();
   volatile tt_l1_ptr uint32_t *sender_sem = SEM(16);
   volatile tt_l1_ptr uint32_t *recv_sem = SEM(17);
@@ -80,7 +83,8 @@ void kernel_main() {
                   canonical_col_tile,
                   l1_addr,
                   in1_tile_bytes,
-                  cb_source);
+                  cb_source,
+                  gather_indices);
             } else {
               fill_generic_tile(
                   in1_gen,
@@ -90,7 +94,8 @@ void kernel_main() {
                   canonical_col_tile,
                   l1_addr,
                   in1_tile_bytes,
-                  cb_source);
+                  cb_source,
+                  gather_indices);
             }
             l1_addr += in1_tile_bytes;
             block_bytes += in1_tile_bytes;

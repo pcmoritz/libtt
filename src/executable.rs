@@ -93,6 +93,8 @@ pub(crate) enum Op {
         top_k_epilogue: Option<MatmulTopKEpilogue>,
         lhs_grouped_head_view: Option<MatmulGroupedHeadView>,
         rhs_grouped_head_view: Option<MatmulGroupedHeadView>,
+        lhs_gather_view: Option<MatmulGatherView>,
+        rhs_gather_view: Option<MatmulGatherView>,
     },
     Constant {
         packed_value: u32,
@@ -114,6 +116,8 @@ pub(crate) enum Op {
         dimension_numbers: GatherDimensionNumbers,
         slice_sizes: Vec<i64>,
         indices_are_sorted: bool,
+        operand_dim_strides: Vec<i64>,
+        operand_dim_offsets: Vec<i64>,
     },
     Scatter {
         input_ids: [u32; 3],
@@ -261,6 +265,16 @@ pub(crate) struct MatmulGroupedHeadView {
     pub(crate) logical_shape: Vec<i64>,
     pub(crate) grouped_dimension: u32,
     pub(crate) group_size: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct MatmulGatherView {
+    pub(crate) indices_id: u32,
+    pub(crate) logical_shape: Vec<i64>,
+    pub(crate) axis: u32,
+    pub(crate) operand_dim_strides: Vec<i64>,
+    pub(crate) operand_dim_offsets: Vec<i64>,
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -522,6 +536,20 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                             group_size: view.group_size,
                         }
                     }),
+                    lhs_gather_view: matmul.lhs_gather_view.map(|view| MatmulGatherView {
+                        indices_id: view.indices_id,
+                        logical_shape: view.logical_shape,
+                        axis: view.axis,
+                        operand_dim_strides: view.operand_dim_strides,
+                        operand_dim_offsets: view.operand_dim_offsets,
+                    }),
+                    rhs_gather_view: matmul.rhs_gather_view.map(|view| MatmulGatherView {
+                        indices_id: view.indices_id,
+                        logical_shape: view.logical_shape,
+                        axis: view.axis,
+                        operand_dim_strides: view.operand_dim_strides,
+                        operand_dim_offsets: view.operand_dim_offsets,
+                    }),
                 }),
                 Kind::Constant(constant) => Ok(Op::Constant {
                     packed_value: constant.packed_value,
@@ -550,6 +578,8 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     },
                     slice_sizes: gather.slice_sizes,
                     indices_are_sorted: gather.indices_are_sorted,
+                    operand_dim_strides: gather.operand_dim_strides,
+                    operand_dim_offsets: gather.operand_dim_offsets,
                 }),
                 Kind::Scatter(scatter) => Ok(Op::Scatter {
                     input_ids: [
@@ -716,6 +746,8 @@ pub(crate) enum Op {
         top_k_epilogue: Option<MatmulTopKEpilogue>,
         lhs_grouped_head_view: Option<MatmulGroupedHeadView>,
         rhs_grouped_head_view: Option<MatmulGroupedHeadView>,
+        lhs_gather_view: Option<MatmulGatherView>,
+        rhs_gather_view: Option<MatmulGatherView>,
     },
     Constant {
         packed_value: u32,
@@ -737,6 +769,8 @@ pub(crate) enum Op {
         dimension_numbers: GatherDimensionNumbers,
         slice_sizes: Vec<i64>,
         indices_are_sorted: bool,
+        operand_dim_strides: Vec<i64>,
+        operand_dim_offsets: Vec<i64>,
     },
     Scatter {
         input_ids: [u32; 3],
