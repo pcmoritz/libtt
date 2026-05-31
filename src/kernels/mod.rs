@@ -1,5 +1,6 @@
 pub(crate) mod broadcast;
 pub(crate) mod concatenate;
+pub(crate) mod constant;
 pub(crate) mod fused_eltwise;
 pub(crate) mod gather;
 pub(crate) mod iota;

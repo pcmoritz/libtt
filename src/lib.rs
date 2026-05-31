@@ -2014,8 +2014,23 @@ fn execute_constant(
     let dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let logical_shape = dims_i64_to_usize(&output_desc.dims)?;
     let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
-    let data = if logical_data.is_empty() {
-        splat_allocation_data(dtype, packed_value, &allocation_shape)?
+    let output_dram = if logical_data.is_empty() {
+        let tile_count = dram::tiled_shape_tile_count(&allocation_shape).map_err(io_error)?;
+        if tile_count > 1 {
+            kernels::constant::splat_constant(
+                device,
+                dtype,
+                packed_value,
+                &allocation_shape,
+                "pjrt_constant",
+            )
+            .map_err(io_error)?
+        } else {
+            let data = splat_allocation_data(dtype, packed_value, &allocation_shape)?;
+            device
+                .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
+                .map_err(io_error)?
+        }
     } else {
         let logical_size = host_byte_size(dtype, &logical_shape)?;
         if logical_data.len() != logical_size {
@@ -2024,12 +2039,12 @@ fn execute_constant(
                 logical_data.len()
             )));
         }
-        padded_host_data(logical_data, dtype, &logical_shape, &allocation_shape)?
-            .unwrap_or_else(|| logical_data.to_vec())
+        let data = padded_host_data(logical_data, dtype, &logical_shape, &allocation_shape)?
+            .unwrap_or_else(|| logical_data.to_vec());
+        device
+            .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
+            .map_err(io_error)?
     };
-    let output_dram = device
-        .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
-        .map_err(io_error)?;
     store_output_buffer(
         values,
         plan,
