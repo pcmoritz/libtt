@@ -1,6 +1,7 @@
 #include <cstdint>
 namespace {
-constexpr uint32_t ARG_RHS_VIEW_KIND = 37;
+constexpr uint32_t ARG_RHS_GATHER_INDICES_ADDR = 37;
+constexpr uint32_t ARG_RHS_VIEW_KIND = 38;
 constexpr uint32_t ARG_OUTPUT_VIEW_KIND = ARG_RHS_VIEW_KIND + VIEW_ARG_COUNT;
 uint32_t output_tile_for_element(const View &view, uint32_t batch, uint32_t logical_row,
                                  uint32_t logical_col, uint32_t *row_in_tile,

@@ -30,9 +30,12 @@ const MATMUL_TOP1_WRITER: &str = concat!(
 const MATMUL_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
 const READER_LHS_ADDR_INDEX: usize = 0;
+const READER_LHS_GATHER_INDICES_ADDR_INDEX: usize = 28;
 const WRITER_RHS_ADDR_INDEX: usize = 0;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
 const WRITER_PARTIAL_PAIRS_ADDR_INDEX: usize = 18;
+const WRITER_RHS_GATHER_INDICES_ADDR_INDEX: usize = 37;
+const WRITER_TOP1_RHS_GATHER_INDICES_ADDR_INDEX: usize = 38;
 const MAX_RANK: usize = 8;
 const GROUPED_DIM_NONE: u32 = u32::MAX;
 
@@ -53,6 +56,14 @@ pub(crate) struct MatmulGroupedHeadView {
     pub(crate) logical_shape: Vec<usize>,
     pub(crate) grouped_dimension: usize,
     pub(crate) group_size: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MatmulGatherView {
+    pub(crate) logical_shape: Vec<usize>,
+    pub(crate) axis: usize,
+    pub(crate) operand_dim_strides: Vec<usize>,
+    pub(crate) operand_dim_offsets: Vec<usize>,
 }
 
 impl MatmulEpilogue {
@@ -191,8 +202,11 @@ struct MatmulOperandView {
     tiles_per_row: u32,
     grouped_dim: u32,
     group_size: u32,
+    gather_dim: u32,
     shape: [u32; MAX_RANK],
     physical_shape: [u32; MAX_RANK],
+    dim_strides: [u32; MAX_RANK],
+    dim_offsets: [u32; MAX_RANK],
     batch_dims: [u32; MAX_RANK],
     row_dims: [u32; MAX_RANK],
     col_dims: [u32; MAX_RANK],
@@ -268,6 +282,8 @@ impl MatmulPlan {
 struct MatmulKernel {
     lhs_addr: u32,
     rhs_addr: u32,
+    lhs_gather_indices_addr: Option<u32>,
+    rhs_gather_indices_addr: Option<u32>,
     epilogue: MatmulRuntimeEpilogue,
     key: MatmulProgramKey,
 }
@@ -299,6 +315,7 @@ impl Kernel<MatmulProgramKey> for MatmulKernel {
     fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
         match index {
             READER_LHS_ADDR_INDEX => Some(self.lhs_addr),
+            READER_LHS_GATHER_INDICES_ADDR_INDEX => Some(self.lhs_gather_indices_addr.unwrap_or(0)),
             _ => None,
         }
     }
@@ -308,9 +325,18 @@ impl Kernel<MatmulProgramKey> for MatmulKernel {
         debug_assert_eq!(self.key.epilogue, self.epilogue.kind());
         if index == WRITER_RHS_ADDR_INDEX {
             Some(self.rhs_addr)
+        } else if index == writer_rhs_gather_indices_addr_index(self.key.epilogue) {
+            Some(self.rhs_gather_indices_addr.unwrap_or(0))
         } else {
             self.epilogue.writer_runtime_arg(index)
         }
+    }
+}
+
+fn writer_rhs_gather_indices_addr_index(epilogue: MatmulEpilogueKind) -> usize {
+    match epilogue {
+        MatmulEpilogueKind::Store => WRITER_RHS_GATHER_INDICES_ADDR_INDEX,
+        MatmulEpilogueKind::Top1 => WRITER_TOP1_RHS_GATHER_INDICES_ADDR_INDEX,
     }
 }
 
@@ -334,6 +360,8 @@ pub(crate) fn matmul_dot_general(
         device,
         lhs,
         rhs,
+        None,
+        None,
         lhs_shape,
         rhs_shape,
         output_logical_shape,
@@ -341,6 +369,8 @@ pub(crate) fn matmul_dot_general(
         rhs_batching_dimensions,
         lhs_contracting_dimensions,
         rhs_contracting_dimensions,
+        None,
+        None,
         None,
         None,
         epilogue,
@@ -353,6 +383,8 @@ pub(crate) fn matmul_dot_general_with_views(
     device: &mut Device,
     lhs: &DramBuffer,
     rhs: &DramBuffer,
+    lhs_gather_indices: Option<&DramBuffer>,
+    rhs_gather_indices: Option<&DramBuffer>,
     lhs_physical_shape: &[usize],
     rhs_physical_shape: &[usize],
     output_logical_shape: &[usize],
@@ -362,6 +394,8 @@ pub(crate) fn matmul_dot_general_with_views(
     rhs_contracting_dimensions: &[i64],
     lhs_grouped_head_view: Option<&MatmulGroupedHeadView>,
     rhs_grouped_head_view: Option<&MatmulGroupedHeadView>,
+    lhs_gather_view: Option<&MatmulGatherView>,
+    rhs_gather_view: Option<&MatmulGatherView>,
     epilogue: MatmulEpilogue,
     name: impl Into<String>,
 ) -> io::Result<MatmulOutput> {
@@ -394,22 +428,52 @@ pub(crate) fn matmul_dot_general_with_views(
         }
     };
     let epilogue_kind = epilogue.kind();
-    validate_grouped_head_view(lhs_physical_shape, lhs_grouped_head_view, "lhs")?;
-    validate_grouped_head_view(rhs_physical_shape, rhs_grouped_head_view, "rhs")?;
-    let lhs_logical_shape = lhs_grouped_head_view
+    validate_gather_view(
+        lhs_physical_shape,
+        lhs_gather_view,
+        lhs_gather_indices,
+        "lhs",
+    )?;
+    validate_gather_view(
+        rhs_physical_shape,
+        rhs_gather_view,
+        rhs_gather_indices,
+        "rhs",
+    )?;
+    let lhs_base_shape = lhs_gather_view
         .map(|view| view.logical_shape.as_slice())
         .unwrap_or(lhs_physical_shape);
-    let rhs_logical_shape = rhs_grouped_head_view
+    let rhs_base_shape = rhs_gather_view
         .map(|view| view.logical_shape.as_slice())
         .unwrap_or(rhs_physical_shape);
+    validate_grouped_head_view(
+        lhs_base_shape,
+        lhs_grouped_head_view,
+        lhs_gather_view,
+        "lhs",
+    )?;
+    validate_grouped_head_view(
+        rhs_base_shape,
+        rhs_grouped_head_view,
+        rhs_gather_view,
+        "rhs",
+    )?;
+    let lhs_logical_shape = lhs_grouped_head_view
+        .map(|view| view.logical_shape.as_slice())
+        .unwrap_or(lhs_base_shape);
+    let rhs_logical_shape = rhs_grouped_head_view
+        .map(|view| view.logical_shape.as_slice())
+        .unwrap_or(rhs_base_shape);
 
     let shape = dot_general_shape_with_views(
         lhs_physical_shape,
         lhs_logical_shape,
         lhs_grouped_head_view,
+        lhs_gather_view,
         rhs_physical_shape,
         rhs_logical_shape,
         rhs_grouped_head_view,
+        rhs_gather_view,
         output_logical_shape,
         lhs_batching_dimensions,
         rhs_batching_dimensions,
@@ -442,6 +506,12 @@ pub(crate) fn matmul_dot_general_with_views(
     };
     let lhs_addr = u32_arg(lhs.addr, "lhs address")?;
     let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
+    let lhs_gather_indices_addr = lhs_gather_indices
+        .map(|indices| u32_arg(indices.addr, "lhs gather indices address"))
+        .transpose()?;
+    let rhs_gather_indices_addr = rhs_gather_indices
+        .map(|indices| u32_arg(indices.addr, "rhs gather indices address"))
+        .transpose()?;
 
     let runtime_epilogue = match epilogue {
         MatmulEpilogue::Store { output_dtype } => {
@@ -477,6 +547,8 @@ pub(crate) fn matmul_dot_general_with_views(
     let kernel = MatmulKernel {
         lhs_addr,
         rhs_addr,
+        lhs_gather_indices_addr,
+        rhs_gather_indices_addr,
         epilogue: runtime_epilogue,
         key,
     };
@@ -533,8 +605,10 @@ fn dot_general_shape(
         lhs_shape,
         lhs_shape,
         None,
+        None,
         rhs_shape,
         rhs_shape,
+        None,
         None,
         output_shape,
         lhs_batching_dimensions,
@@ -549,9 +623,11 @@ fn dot_general_shape_with_views(
     lhs_physical_shape: &[usize],
     lhs_shape: &[usize],
     lhs_grouped_head_view: Option<&MatmulGroupedHeadView>,
+    lhs_gather_view: Option<&MatmulGatherView>,
     rhs_physical_shape: &[usize],
     rhs_shape: &[usize],
     rhs_grouped_head_view: Option<&MatmulGroupedHeadView>,
+    rhs_gather_view: Option<&MatmulGatherView>,
     output_shape: &[usize],
     lhs_batching_dimensions: &[i64],
     rhs_batching_dimensions: &[i64],
@@ -666,6 +742,7 @@ fn dot_general_shape_with_views(
             k,
             false,
             lhs_grouped_head_view,
+            lhs_gather_view,
         )?,
         rhs_view: operand_view(
             rhs_physical_shape,
@@ -677,6 +754,7 @@ fn dot_general_shape_with_views(
             n,
             true,
             rhs_grouped_head_view,
+            rhs_gather_view,
         )?,
         output_view: operand_view(
             output_shape,
@@ -687,6 +765,7 @@ fn dot_general_shape_with_views(
             m,
             n,
             false,
+            None,
             None,
         )?,
     })
@@ -747,17 +826,18 @@ fn checked_product_of_dims(shape: &[usize], dims: &[usize], name: &str) -> io::R
 }
 
 fn validate_grouped_head_view(
-    physical_shape: &[usize],
+    base_shape: &[usize],
     view: Option<&MatmulGroupedHeadView>,
+    gather_view: Option<&MatmulGatherView>,
     name: &str,
 ) -> io::Result<()> {
     let Some(view) = view else {
         return Ok(());
     };
-    if physical_shape.len() != view.logical_shape.len() {
+    if base_shape.len() != view.logical_shape.len() {
         return Err(invalid_input(format!(
-            "matmul {name} grouped-head view rank mismatch: physical={} logical={}",
-            physical_shape.len(),
+            "matmul {name} grouped-head view rank mismatch: base={} logical={}",
+            base_shape.len(),
             view.logical_shape.len()
         )));
     }
@@ -767,24 +847,103 @@ fn validate_grouped_head_view(
             view.group_size
         )));
     }
-    if view.grouped_dimension >= physical_shape.len() {
+    if view.grouped_dimension >= base_shape.len() {
         return Err(invalid_input(format!(
             "matmul {name} grouped-head dimension {} is out of bounds for rank {}",
             view.grouped_dimension,
-            physical_shape.len()
+            base_shape.len()
         )));
     }
-    for (dim, (&physical, &logical)) in physical_shape.iter().zip(&view.logical_shape).enumerate() {
+    if gather_view.is_some_and(|gather| gather.axis == view.grouped_dimension) {
+        return Err(invalid_input(format!(
+            "matmul {name} gather axis and grouped-head dimension must be different"
+        )));
+    }
+    for (dim, (&base, &logical)) in base_shape.iter().zip(&view.logical_shape).enumerate() {
         let expected = if dim == view.grouped_dimension {
-            physical.checked_mul(view.group_size).ok_or_else(|| {
+            base.checked_mul(view.group_size).ok_or_else(|| {
                 invalid_input(format!("matmul {name} grouped-head shape overflow"))
             })?
         } else {
-            physical
+            base
         };
         if logical != expected {
             return Err(invalid_input(format!(
                 "matmul {name} grouped-head logical shape mismatch at dim {dim}: expected {expected}, got {logical}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_gather_view(
+    physical_shape: &[usize],
+    view: Option<&MatmulGatherView>,
+    indices: Option<&DramBuffer>,
+    name: &str,
+) -> io::Result<()> {
+    let Some(view) = view else {
+        if indices.is_some() {
+            return Err(invalid_input(format!(
+                "matmul {name} gather indices supplied without a gather view"
+            )));
+        }
+        return Ok(());
+    };
+    let Some(indices) = indices else {
+        return Err(invalid_input(format!(
+            "matmul {name} gather view requires an indices buffer"
+        )));
+    };
+    let rank = physical_shape.len();
+    if view.logical_shape.len() != rank
+        || view.operand_dim_strides.len() != rank
+        || view.operand_dim_offsets.len() != rank
+    {
+        return Err(invalid_input(format!(
+            "matmul {name} gather view rank mismatch: physical={rank} logical={} strides={} offsets={}",
+            view.logical_shape.len(),
+            view.operand_dim_strides.len(),
+            view.operand_dim_offsets.len()
+        )));
+    }
+    if view.axis >= rank {
+        return Err(invalid_input(format!(
+            "matmul {name} gather axis {} is out of bounds for rank {rank}",
+            view.axis
+        )));
+    }
+    if indices.dtype != DType::Int32 {
+        return Err(invalid_input(format!(
+            "matmul {name} gather indices must be Int32, got {:?}",
+            indices.dtype
+        )));
+    }
+    validate_tile_count(
+        indices,
+        tiled_shape_tile_count(&[view.logical_shape[view.axis], 1])?,
+        &format!("{name} gather indices"),
+    )?;
+    for dim in 0..rank {
+        let logical = view.logical_shape[dim];
+        let stride = view.operand_dim_strides[dim];
+        let offset = view.operand_dim_offsets[dim];
+        if logical == 0 || stride == 0 {
+            return Err(invalid_input(format!(
+                "matmul {name} gather view has invalid dim {dim}: logical={logical} stride={stride}"
+            )));
+        }
+        let max_index = offset
+            .checked_add((logical - 1).checked_mul(stride).ok_or_else(|| {
+                invalid_input(format!("matmul {name} gather view dim {dim} overflows"))
+            })?)
+            .ok_or_else(|| {
+                invalid_input(format!("matmul {name} gather view dim {dim} overflows"))
+            })?;
+        if max_index >= physical_shape[dim] {
+            return Err(invalid_input(format!(
+                "matmul {name} gather view dim {dim} maps max logical index {logical} to {max_index}, outside physical extent {}",
+                physical_shape[dim]
             )));
         }
     }
@@ -818,6 +977,7 @@ fn operand_view(
     logical_cols: usize,
     allow_tile_transpose: bool,
     grouped_head_view: Option<&MatmulGroupedHeadView>,
+    gather_view: Option<&MatmulGatherView>,
 ) -> io::Result<MatmulOperandView> {
     let allocation_shape = tiled_allocation_shape(physical_shape)?;
     let rank = shape.len();
@@ -829,12 +989,13 @@ fn operand_view(
     }
     let allocation_rank = allocation_shape.len();
     let has_grouped_head_view = grouped_head_view.is_some();
+    let has_gather_view = gather_view.is_some();
     let kind = operand_view_kind(
         rank,
         batch_dims,
         row_dims,
         col_dims,
-        allow_tile_transpose && !has_grouped_head_view,
+        allow_tile_transpose && !has_grouped_head_view && !has_gather_view,
         has_grouped_head_view,
     );
     let grouped_dim = grouped_head_view
@@ -845,6 +1006,18 @@ fn operand_view(
         .map(|view| u32_value(view.group_size, "matmul grouped head size"))
         .transpose()?
         .unwrap_or(1);
+    let gather_dim = gather_view
+        .map(|view| u32_value(view.axis, "matmul gather axis"))
+        .transpose()?
+        .unwrap_or(GROUPED_DIM_NONE);
+    let dim_strides = gather_view
+        .map(|view| padded_u32_array(&view.operand_dim_strides, "matmul operand dim strides"))
+        .transpose()?
+        .unwrap_or([1u32; MAX_RANK]);
+    let dim_offsets = gather_view
+        .map(|view| padded_u32_array(&view.operand_dim_offsets, "matmul operand dim offsets"))
+        .transpose()?
+        .unwrap_or([0u32; MAX_RANK]);
     Ok(MatmulOperandView {
         kind,
         rank: u32_value(rank, "matmul operand rank")?,
@@ -863,8 +1036,11 @@ fn operand_view(
         )?,
         grouped_dim,
         group_size,
+        gather_dim,
         shape: padded_u32_array(shape, "matmul operand shape")?,
         physical_shape: padded_u32_array(physical_shape, "matmul operand physical shape")?,
+        dim_strides,
+        dim_offsets,
         batch_dims: padded_u32_array(batch_dims, "matmul operand batch dimensions")?,
         row_dims: padded_u32_array(row_dims, "matmul operand row dimensions")?,
         col_dims: padded_u32_array(col_dims, "matmul operand column dimensions")?,
@@ -1243,9 +1419,10 @@ fn plan_direct_matmul(
                             let padding = (mt * nt - mt_base * nt_base) * batch_groups;
                             let bias = out_tiles.min(16);
                             let score = if batch_groups > 1 {
+                                let scheduled_work = active_cores.saturating_mul(per_core_work);
                                 (
                                     usize::MAX - per_core_work,
-                                    active_cores,
+                                    usize::MAX - scheduled_work,
                                     usize::MAX - padding,
                                     in0_block_w,
                                     out_subblock_num_tiles,
@@ -1365,7 +1542,9 @@ fn matmul_program(
     } else {
         output_dtype
     };
-    let cbs = vec![
+    let uses_gather_indices =
+        lhs_view.gather_dim != GROUPED_DIM_NONE || rhs_view.gather_dim != GROUPED_DIM_NONE;
+    let mut cbs = vec![
         CBConfig::new(0, input_dtype)
             .with_compute_dtype(input_compute_dtype)
             .with_tiles(plan.cb0_pages()),
@@ -1382,6 +1561,9 @@ fn matmul_program(
         CBConfig::new(16, output_dtype).with_tiles(plan.out_block_num_tiles()),
         CBConfig::new(24, output_dtype).with_tiles(plan.out_block_num_tiles()),
     ];
+    if uses_gather_indices {
+        cbs.push(CBConfig::new(5, DType::Int32).with_tiles(1));
+    }
     let runtime_args = lower_runtime_args(
         plan,
         logical_mt,
@@ -1449,13 +1631,21 @@ fn lower_runtime_args(
 ) -> io::Result<RuntimeArgs> {
     let grid = plan_grid(plan);
     let writer_dynamic_indices = match epilogue {
-        MatmulEpilogueKind::Store => vec![WRITER_RHS_ADDR_INDEX, WRITER_OUTPUT_ADDR_INDEX],
-        MatmulEpilogueKind::Top1 => vec![WRITER_RHS_ADDR_INDEX, WRITER_PARTIAL_PAIRS_ADDR_INDEX],
+        MatmulEpilogueKind::Store => vec![
+            WRITER_RHS_ADDR_INDEX,
+            WRITER_OUTPUT_ADDR_INDEX,
+            WRITER_RHS_GATHER_INDICES_ADDR_INDEX,
+        ],
+        MatmulEpilogueKind::Top1 => vec![
+            WRITER_RHS_ADDR_INDEX,
+            WRITER_PARTIAL_PAIRS_ADDR_INDEX,
+            WRITER_TOP1_RHS_GATHER_INDICES_ADDR_INDEX,
+        ],
     };
     let mut runtime_args = RuntimeArgsBuilder::new(
         NUM_SEMAPHORES,
         writer_dynamic_indices,
-        vec![READER_LHS_ADDR_INDEX],
+        vec![READER_LHS_ADDR_INDEX, READER_LHS_GATHER_INDICES_ADDR_INDEX],
         Vec::new(),
     );
     let direct_grid_rows_per_batch = plan.direct_grid_rows_per_batch();
@@ -1614,6 +1804,7 @@ fn reader_args(
         u32_value(batch_start, "batch start")?,
         u32_value(total_batch_count, "total batch count")?,
         u32_value(logical_mt * plan.kt, "lhs batch stride")?,
+        0,
     ]);
     append_view_args(&mut args, lhs_view);
     Ok(args)
@@ -1702,6 +1893,7 @@ fn writer_args(
         u32_value(total_batch_count, "total batch count")?,
         u32_value(plan.kt * logical_nt, "rhs batch stride")?,
         u32_value(logical_mt * logical_nt, "output batch stride")?,
+        0,
     ]);
     append_view_args(&mut args, rhs_view);
     append_view_args(&mut args, output_view);
@@ -1721,9 +1913,12 @@ fn append_view_args(args: &mut Vec<u32>, view: &MatmulOperandView) {
         view.tiles_per_row,
         view.grouped_dim,
         view.group_size,
+        view.gather_dim,
     ]);
     args.extend(view.shape);
     args.extend(view.physical_shape);
+    args.extend(view.dim_strides);
+    args.extend(view.dim_offsets);
     args.extend(view.batch_dims);
     args.extend(view.row_dims);
     args.extend(view.col_dims);

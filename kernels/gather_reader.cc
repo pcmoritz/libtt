@@ -13,8 +13,22 @@ constexpr uint32_t AXIS = GATHER_AXIS;
 static_assert(RANK >= 2, "gather reader expects shapes padded to at least rank 2");
 constexpr uint32_t COORD_COUNT = RANK;
 constexpr uint32_t OPERAND_SHAPE[COORD_COUNT] = GATHER_OPERAND_SHAPE;
+constexpr uint32_t OPERAND_PHYSICAL_SHAPE[COORD_COUNT] =
+    GATHER_OPERAND_PHYSICAL_SHAPE;
 constexpr uint32_t OUTPUT_SHAPE[COORD_COUNT] = GATHER_OUTPUT_SHAPE;
+constexpr uint32_t OPERAND_DIM_STRIDES[COORD_COUNT] =
+    GATHER_OPERAND_DIM_STRIDES;
+constexpr uint32_t OPERAND_DIM_OFFSETS[COORD_COUNT] =
+    GATHER_OPERAND_DIM_OFFSETS;
 constexpr bool OPERAND_RESHAPE_VIEW = GATHER_OPERAND_RESHAPE_VIEW != 0;
+constexpr bool OPERAND_HAS_DIM_TRANSFORM = [] {
+  for (uint32_t dim = 0; dim < COORD_COUNT; ++dim) {
+    if (OPERAND_DIM_STRIDES[dim] != 1 || OPERAND_DIM_OFFSETS[dim] != 0) {
+      return true;
+    }
+  }
+  return false;
+}();
 constexpr uint32_t SOURCE_ROWS = GATHER_SOURCE_ROWS;
 constexpr uint32_t SOURCE_COLS = GATHER_SOURCE_COLS;
 constexpr uint32_t SOURCE_TILE_ROWS = GATHER_SOURCE_TILE_ROWS;
@@ -115,15 +129,21 @@ Location reshape_source_location(uint32_t flat_index) {
 }
 
 Location operand_location(const uint32_t coords[COORD_COUNT]) {
+  uint32_t physical_coords[COORD_COUNT];
+  for (uint32_t dim = 0; dim < RANK; ++dim) {
+    physical_coords[dim] =
+        coords[dim] * OPERAND_DIM_STRIDES[dim] + OPERAND_DIM_OFFSETS[dim];
+  }
   if constexpr (OPERAND_RESHAPE_VIEW) {
     uint32_t flat = 0;
     for (uint32_t dim = 0; dim < RANK; ++dim) {
-      flat = flat * OPERAND_SHAPE[dim] + coords[dim];
+      flat = flat * OPERAND_PHYSICAL_SHAPE[dim] + physical_coords[dim];
     }
     return reshape_source_location(flat);
   } else {
-    return tensor_location(OPERAND_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW,
-                           coords);
+    return tensor_location(
+        OPERAND_PHYSICAL_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW,
+        physical_coords);
   }
 }
 
@@ -379,6 +399,7 @@ void run_prefix_axis_gather(const InterleavedAddrGenFast<true> &operand,
   uint32_t output_tile_count = get_arg_val<uint32_t>(3);
 
   constexpr uint32_t cb_indices = tt::CBIndex::c_1;
+  constexpr uint32_t cb_operand = tt::CBIndex::c_0;
   constexpr uint32_t cb_output = tt::CBIndex::c_16;
 
   uint32_t loaded_index_tile = INVALID_TILE;
@@ -389,6 +410,10 @@ void run_prefix_axis_gather(const InterleavedAddrGenFast<true> &operand,
     uint32_t output_matrix_tile = output_tile_id % output_matrix_tiles;
     uint32_t output_tile_row = output_matrix_tile / OUTPUT_TILES_PER_ROW;
     uint32_t output_tile_col = output_matrix_tile % OUTPUT_TILES_PER_ROW;
+    uint32_t output_row_base = output_tile_row * TILE_R;
+    uint32_t output_col_base = output_tile_col * TILE_C;
+    uint32_t row_count = tile_extent(OUTPUT_SHAPE[RANK - 2], output_row_base, TILE_R);
+    uint32_t col_count = tile_extent(OUTPUT_SHAPE[RANK - 1], output_col_base, TILE_C);
 
     uint32_t base_coords[COORD_COUNT];
     decode_batch(output_batch, OUTPUT_SHAPE, base_coords);
@@ -398,18 +423,39 @@ void run_prefix_axis_gather(const InterleavedAddrGenFast<true> &operand,
     cb_reserve_back(cb_output, 1);
     if (gather_index < 0 || static_cast<uint32_t>(gather_index) >= OPERAND_SHAPE[AXIS]) {
       zero_tile(cb_output);
-    } else {
+    } else if constexpr (!OPERAND_RESHAPE_VIEW && !OPERAND_HAS_DIM_TRANSFORM) {
       uint32_t operand_coords[COORD_COUNT];
       for (uint32_t dim = 0; dim < RANK; ++dim) {
         operand_coords[dim] = base_coords[dim];
       }
       operand_coords[AXIS] = static_cast<uint32_t>(gather_index);
-      operand_coords[RANK - 2] = output_tile_row * TILE_R;
-      operand_coords[RANK - 1] = output_tile_col * TILE_C;
+      operand_coords[RANK - 2] = output_row_base;
+      operand_coords[RANK - 1] = output_col_base;
       Location source = tensor_location(
           OPERAND_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW, operand_coords);
       noc_async_read_tile(source.tile, operand, get_write_ptr(cb_output));
       noc_async_read_barrier();
+    } else {
+      zero_tile(cb_output);
+      uint32_t output_l1_addr = get_write_ptr(cb_output);
+      uint32_t loaded_operand_tile = INVALID_TILE;
+      uint32_t operand_coords[COORD_COUNT];
+      for (uint32_t dim = 0; dim < RANK; ++dim) {
+        operand_coords[dim] = base_coords[dim];
+      }
+      operand_coords[AXIS] = static_cast<uint32_t>(gather_index);
+      for (uint32_t row = 0; row < row_count; ++row) {
+        operand_coords[RANK - 2] = output_row_base + row;
+        operand_coords[RANK - 1] = output_col_base;
+        Location source = operand_location(operand_coords);
+        ensure_tile(operand, source.tile, cb_operand, &loaded_operand_tile);
+        copy_operand_row(
+            get_read_ptr(cb_operand), output_l1_addr, source.row, source.col,
+            row, 0, col_count);
+      }
+      if (loaded_operand_tile != INVALID_TILE) {
+        cb_pop_front(cb_operand, 1);
+      }
     }
     cb_push_back(cb_output, 1);
   }
@@ -439,9 +485,11 @@ void kernel_main() {
   };
   if constexpr (BF16_ROWS) {
     run_bf16_rows_gather(operand, start_indices);
-  } else if constexpr (!OPERAND_RESHAPE_VIEW && RANK >= 3 && AXIS + 2 < RANK) {
+  } else if constexpr (RANK >= 3 && AXIS + 2 < RANK) {
     run_prefix_axis_gather(operand, start_indices);
-  } else if constexpr (OPERAND_RESHAPE_VIEW && RANK >= 3 && AXIS == RANK - 2) {
+  } else if constexpr (
+      OPERAND_RESHAPE_VIEW && !OPERAND_HAS_DIM_TRANSFORM && RANK >= 3 &&
+      AXIS == RANK - 2) {
     run_reshape_row_axis_gather(operand, start_indices);
   } else {
     run_axis_gather(operand, start_indices);

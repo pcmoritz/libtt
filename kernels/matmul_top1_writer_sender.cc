@@ -1,7 +1,8 @@
 #include <cstdint>
 
 namespace {
-constexpr uint32_t ARG_RHS_VIEW_KIND = 38;
+constexpr uint32_t ARG_RHS_GATHER_INDICES_ADDR = 38;
+constexpr uint32_t ARG_RHS_VIEW_KIND = 39;
 constexpr uint32_t ARG_OUTPUT_VIEW_KIND = ARG_RHS_VIEW_KIND + VIEW_ARG_COUNT;
 constexpr uint32_t BF16_NEG_INF = 0xff80;
 
@@ -127,6 +128,7 @@ void write_partial(const OutputTop1 &output, const Top1 &best) {
 void kernel_main() {
   constexpr uint32_t cb_in1 = tt::CBIndex::c_1;
   constexpr uint32_t cb_source = tt::CBIndex::c_3;
+  constexpr uint32_t cb_gather_indices = tt::CBIndex::c_5;
   const uint32_t in1_tile_bytes = get_tile_size(cb_in1);
   const uint32_t block_w = A(5);
   const uint32_t block_h = A(6);
@@ -139,6 +141,8 @@ void kernel_main() {
   const uint32_t total_batch_count = A(35);
   const uint32_t rhs_batch_stride = A(36);
   const View view = load_view(ARG_RHS_VIEW_KIND);
+  GatherIndexReader gather_indices =
+      make_gather_index_reader(A(ARG_RHS_GATHER_INDICES_ADDR), cb_gather_indices);
   const OutputTop1 output_top1 = load_output_top1();
   Top1 best = {.have_best = false, .key = 0, .value = BF16_NEG_INF, .index = 0xffffffffu};
 
@@ -198,7 +202,8 @@ void kernel_main() {
                   canonical_col_tile,
                   l1_addr,
                   in1_tile_bytes,
-                  cb_source);
+                  cb_source,
+                  gather_indices);
             } else {
               fill_generic_tile(
                   in1_gen,
@@ -208,7 +213,8 @@ void kernel_main() {
                   canonical_col_tile,
                   l1_addr,
                   in1_tile_bytes,
-                  cb_source);
+                  cb_source,
+                  gather_indices);
             }
             l1_addr += in1_tile_bytes;
             block_bytes += in1_tile_bytes;

@@ -262,11 +262,15 @@ fn profile_op_signature(op: &executable::Op, plan: &executable::Executable) -> S
             top_k_epilogue,
             lhs_grouped_head_view,
             rhs_grouped_head_view,
+            lhs_gather_view,
+            rhs_gather_view,
         } => format!(
-            "matmul topk={} gqa_lhs={} gqa_rhs={} lhs={} rhs={} out={} lhs_c={:?} rhs_c={:?} lhs_b={:?} rhs_b={:?}",
+            "matmul topk={} gqa_lhs={} gqa_rhs={} gather_lhs={} gather_rhs={} lhs={} rhs={} out={} lhs_c={:?} rhs_c={:?} lhs_b={:?} rhs_b={:?}",
             top_k_epilogue.is_some(),
             lhs_grouped_head_view.is_some(),
             rhs_grouped_head_view.is_some(),
+            lhs_gather_view.is_some(),
+            rhs_gather_view.is_some(),
             profile_value_signature(plan, input_ids[0]),
             profile_value_signature(plan, input_ids[1]),
             profile_value_signature(plan, *output_id),
@@ -2064,10 +2068,13 @@ fn execute_reshape(
         if let Some(input_dram) = input.dram_buffer.as_ref() {
             let output_allocation_shape =
                 dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
-            if input_dram.shape == output_allocation_shape
+            let output_tile_count =
+                dram::tiled_shape_tile_count(&output_shape).map_err(io_error)?;
+            if input_dram.num_tiles == output_tile_count
                 && reshape_preserves_tiled_layout(&input_shape, &output_shape)?
             {
-                let output_dram = input_dram.clone();
+                let mut output_dram = input_dram.clone();
+                output_dram.shape = output_allocation_shape;
                 return store_output_buffer(
                     values,
                     plan,
@@ -2100,17 +2107,16 @@ fn execute_reshape(
         }
     }
 
-    let input = device_buffer_for_value(values, input_id, "reshape.operand")?;
-    let Some(input_dram) = input.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable reshape operand buffer has no device allocation",
-        ));
-    };
+    let input = device_dram_view_for_value(values, plan, input_id, "reshape.operand")?;
+    let input_source_shape = input
+        .source_shape
+        .as_deref()
+        .unwrap_or(input_shape.as_slice());
     let output_dims = output_desc.dims.clone();
     let output_dram = kernels::reshape::reshape(
         device,
-        input_dram,
-        &input_shape,
+        input.dram_buffer,
+        input_source_shape,
         &output_shape,
         input_dtype,
         output_dtype,
@@ -2604,6 +2610,50 @@ fn kernel_matmul_grouped_head_view(
     })
 }
 
+fn kernel_matmul_gather_view<'a>(
+    values: &'a [Option<PJRT_Buffer>],
+    view: &executable::MatmulGatherView,
+    name: &str,
+) -> Result<(kernels::matmul::MatmulGatherView, &'a DramBuffer), *mut PJRT_Error> {
+    let indices = device_buffer_for_value(values, view.indices_id, name)?;
+    if indices.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
+        return Err(invalid_argument(format!(
+            "TT executable {name} must be S32, got {:?}",
+            indices.buffer_type
+        )));
+    }
+    let logical_shape = dims_i64_to_usize(&view.logical_shape)?;
+    let axis = usize::try_from(view.axis)
+        .map_err(|_| invalid_argument(format!("TT executable {name} axis does not fit usize")))?;
+    if axis >= logical_shape.len() {
+        return Err(invalid_argument(format!(
+            "TT executable {name} axis {axis} is out of bounds for rank {}",
+            logical_shape.len()
+        )));
+    }
+    let expected_indices_shape = vec![logical_shape[axis] as i64, 1];
+    if indices.dims != expected_indices_shape {
+        return Err(invalid_argument(format!(
+            "TT executable {name} shape mismatch: expected {expected_indices_shape:?}, got {:?}",
+            indices.dims
+        )));
+    }
+    let Some(indices_dram) = indices.dram_buffer.as_ref() else {
+        return Err(failed_precondition(format!(
+            "TT executable {name} buffer has no device allocation"
+        )));
+    };
+    Ok((
+        kernels::matmul::MatmulGatherView {
+            logical_shape,
+            axis,
+            operand_dim_strides: dims_i64_to_usize(&view.operand_dim_strides)?,
+            operand_dim_offsets: dims_i64_to_usize(&view.operand_dim_offsets)?,
+        },
+        indices_dram,
+    ))
+}
+
 fn execute_matmul(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2615,6 +2665,8 @@ fn execute_matmul(
     top_k_epilogue: Option<&executable::MatmulTopKEpilogue>,
     lhs_grouped_head_view: Option<&executable::MatmulGroupedHeadView>,
     rhs_grouped_head_view: Option<&executable::MatmulGroupedHeadView>,
+    lhs_gather_view: Option<&executable::MatmulGatherView>,
+    rhs_gather_view: Option<&executable::MatmulGatherView>,
 ) -> Result<(), *mut PJRT_Error> {
     let lhs = device_buffer_for_value(values, input_ids[0], "matmul.lhs")?;
     let rhs = device_buffer_for_value(values, input_ids[1], "matmul.rhs")?;
@@ -2636,6 +2688,16 @@ fn execute_matmul(
     let rhs_grouped_head_view = rhs_grouped_head_view
         .map(kernel_matmul_grouped_head_view)
         .transpose()?;
+    let lhs_gather_view = lhs_gather_view
+        .map(|view| kernel_matmul_gather_view(values, view, "matmul.lhs_gather_indices"))
+        .transpose()?;
+    let rhs_gather_view = rhs_gather_view
+        .map(|view| kernel_matmul_gather_view(values, view, "matmul.rhs_gather_indices"))
+        .transpose()?;
+    let lhs_gather_view_ref = lhs_gather_view.as_ref().map(|(view, _)| view);
+    let rhs_gather_view_ref = rhs_gather_view.as_ref().map(|(view, _)| view);
+    let lhs_gather_indices = lhs_gather_view.as_ref().map(|(_, indices)| *indices);
+    let rhs_gather_indices = rhs_gather_view.as_ref().map(|(_, indices)| *indices);
 
     if let Some(epilogue) = top_k_epilogue {
         if epilogue.k != 1 {
@@ -2693,6 +2755,8 @@ fn execute_matmul(
             device,
             lhs_dram,
             rhs_dram,
+            lhs_gather_indices,
+            rhs_gather_indices,
             &lhs_shape,
             &rhs_shape,
             &matmul_shape,
@@ -2702,6 +2766,8 @@ fn execute_matmul(
             &dimension_numbers.rhs_contracting_dimensions,
             lhs_grouped_head_view.as_ref(),
             rhs_grouped_head_view.as_ref(),
+            lhs_gather_view_ref,
+            rhs_gather_view_ref,
             kernels::matmul::MatmulEpilogue::Top1,
             "pjrt_matmul_top_k",
         )
@@ -2757,6 +2823,8 @@ fn execute_matmul(
         device,
         lhs_dram,
         rhs_dram,
+        lhs_gather_indices,
+        rhs_gather_indices,
         &lhs_shape,
         &rhs_shape,
         &output_shape,
@@ -2766,6 +2834,8 @@ fn execute_matmul(
         &dimension_numbers.rhs_contracting_dimensions,
         lhs_grouped_head_view.as_ref(),
         rhs_grouped_head_view.as_ref(),
+        lhs_gather_view_ref,
+        rhs_gather_view_ref,
         kernels::matmul::MatmulEpilogue::Store { output_dtype },
         "pjrt_matmul",
     )
@@ -2952,8 +3022,10 @@ fn reshape_preserves_tiled_layout(
     source_shape: &[usize],
     logical_shape: &[usize],
 ) -> Result<bool, *mut PJRT_Error> {
-    Ok(element_count(source_shape)? == element_count(logical_shape)?
-        && tiled_layout_matrix(source_shape)? == tiled_layout_matrix(logical_shape)?)
+    Ok(
+        element_count(source_shape)? == element_count(logical_shape)?
+            && tiled_layout_matrix(source_shape)? == tiled_layout_matrix(logical_shape)?,
+    )
 }
 
 fn can_leave_reshape_unmaterialized(plan: &executable::Executable, value_id: u32) -> bool {
@@ -3251,6 +3323,58 @@ fn execute_concatenate(
     )
 }
 
+fn optional_dim_transform(
+    values: &[i64],
+    rank: usize,
+    default: usize,
+) -> Result<Vec<usize>, String> {
+    if values.is_empty() {
+        return Ok(vec![default; rank]);
+    }
+    if values.len() != rank {
+        return Err(format!(
+            "operand dim transform rank mismatch: got {} entries for rank {rank}",
+            values.len()
+        ));
+    }
+    values
+        .iter()
+        .enumerate()
+        .map(|(dim, &value)| {
+            usize::try_from(value).map_err(|_| {
+                format!("operand dim transform at dim {dim} must be non-negative, got {value}")
+            })
+        })
+        .collect()
+}
+
+fn transformed_operand_shape(
+    physical_shape: &[usize],
+    dim_strides: &[usize],
+    dim_offsets: &[usize],
+) -> Result<Vec<usize>, String> {
+    if dim_strides.len() != physical_shape.len() || dim_offsets.len() != physical_shape.len() {
+        return Err("operand dim transform rank mismatch".to_owned());
+    }
+    physical_shape
+        .iter()
+        .zip(dim_strides)
+        .zip(dim_offsets)
+        .enumerate()
+        .map(|(dim, ((&physical, &stride), &offset))| {
+            if stride == 0 {
+                return Err(format!("operand dim stride at dim {dim} must be non-zero"));
+            }
+            if offset >= physical {
+                return Err(format!(
+                    "operand dim offset {offset} at dim {dim} is out of bounds for extent {physical}"
+                ));
+            }
+            Ok((physical - 1 - offset) / stride + 1)
+        })
+        .collect()
+}
+
 fn execute_gather(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -3260,6 +3384,8 @@ fn execute_gather(
     output_id: u32,
     dimension_numbers: &executable::GatherDimensionNumbers,
     slice_sizes: &[i64],
+    operand_dim_strides: &[i64],
+    operand_dim_offsets: &[i64],
 ) -> Result<(), *mut PJRT_Error> {
     let operand = device_dram_view_for_value(values, plan, input_ids[0], "gather.operand")?;
     let start_indices =
@@ -3270,6 +3396,15 @@ fn execute_gather(
         ));
     }
     let operand_shape = dims_i64_to_usize(&operand.dims)?;
+    let operand_dim_strides =
+        optional_dim_transform(operand_dim_strides, operand_shape.len(), 1)
+            .map_err(|err| invalid_argument(format!("TT executable gather {err}")))?;
+    let operand_dim_offsets =
+        optional_dim_transform(operand_dim_offsets, operand_shape.len(), 0)
+            .map_err(|err| invalid_argument(format!("TT executable gather {err}")))?;
+    let logical_operand_shape =
+        transformed_operand_shape(&operand_shape, &operand_dim_strides, &operand_dim_offsets)
+            .map_err(|err| invalid_argument(format!("TT executable gather {err}")))?;
     let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
@@ -3289,7 +3424,7 @@ fn execute_gather(
         ));
     };
 
-    let rank = operand_shape.len();
+    let rank = logical_operand_shape.len();
     if rank == 0 {
         return Err(unimplemented(
             "TT executable gather currently requires operand rank >= 1",
@@ -3314,7 +3449,7 @@ fn execute_gather(
     if axis >= rank {
         return Err(invalid_argument(format!(
             "TT executable gather axis {axis} is out of bounds for operand shape {:?}",
-            operand_shape
+            logical_operand_shape
         )));
     }
     let expected_offset_dims = (0..rank as i64)
@@ -3342,15 +3477,15 @@ fn execute_gather(
             if dim == axis {
                 slice == 1
             } else {
-                usize::try_from(slice).ok() == Some(operand_shape[dim])
+                usize::try_from(slice).ok() == Some(logical_operand_shape[dim])
             }
         })
     {
         return Err(unimplemented(format!(
-            "TT executable gather currently only supports slice_sizes with 1 at gathered axis and full slices elsewhere; got {slice_sizes:?} for operand shape {operand_shape:?}, axis {axis}"
+            "TT executable gather currently only supports slice_sizes with 1 at gathered axis and full slices elsewhere; got {slice_sizes:?} for operand shape {logical_operand_shape:?}, axis {axis}"
         )));
     }
-    let mut expected_output_shape = operand_shape.clone();
+    let mut expected_output_shape = logical_operand_shape.clone();
     if start_indices_shape.len() == 2 {
         expected_output_shape[axis] = start_indices_shape[0];
     }
@@ -3366,11 +3501,14 @@ fn execute_gather(
         device,
         operand.dram_buffer,
         start_indices_dram,
+        &logical_operand_shape,
         &operand_shape,
         operand.source_shape.as_deref(),
         &start_indices_shape,
         &output_shape,
         axis,
+        &operand_dim_strides,
+        &operand_dim_offsets,
         dtype,
         "pjrt_gather",
     )
@@ -3699,6 +3837,8 @@ fn execute_executable_v1(
                 top_k_epilogue,
                 lhs_grouped_head_view,
                 rhs_grouped_head_view,
+                lhs_gather_view,
+                rhs_gather_view,
             } => execute_matmul(
                 &mut values,
                 plan,
@@ -3710,6 +3850,8 @@ fn execute_executable_v1(
                 top_k_epilogue.as_ref(),
                 lhs_grouped_head_view.as_ref(),
                 rhs_grouped_head_view.as_ref(),
+                lhs_gather_view.as_ref(),
+                rhs_gather_view.as_ref(),
             ),
             executable::Op::Constant {
                 packed_value,
@@ -3759,6 +3901,8 @@ fn execute_executable_v1(
                 output_id,
                 dimension_numbers,
                 slice_sizes,
+                operand_dim_strides,
+                operand_dim_offsets,
                 ..
             } => execute_gather(
                 &mut values,
@@ -3769,6 +3913,8 @@ fn execute_executable_v1(
                 *output_id,
                 dimension_numbers,
                 slice_sizes,
+                operand_dim_strides,
+                operand_dim_offsets,
             ),
             executable::Op::Scatter {
                 input_ids,
