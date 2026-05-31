@@ -2660,6 +2660,61 @@ fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option
     })
 }
 
+fn op_consumes_value(op: &executable::Op, value_id: u32) -> bool {
+    match op {
+        executable::Op::Parameter { .. }
+        | executable::Op::Constant { .. }
+        | executable::Op::Iota { .. } => false,
+        executable::Op::Concatenate { input_ids, .. }
+        | executable::Op::CustomCall { input_ids, .. }
+        | executable::Op::FusedElementwise { input_ids, .. } => input_ids.contains(&value_id),
+        executable::Op::Reshape { input_id, .. }
+        | executable::Op::Slice { input_id, .. }
+        | executable::Op::Transpose { input_id, .. }
+        | executable::Op::BroadcastInDim { input_id, .. }
+        | executable::Op::TopK { input_id, .. } => *input_id == value_id,
+        executable::Op::Reduce {
+            input_ids,
+            init_value_ids,
+            ..
+        }
+        | executable::Op::ReduceWindow {
+            input_ids,
+            init_value_ids,
+            ..
+        } => input_ids.contains(&value_id) || init_value_ids.contains(&value_id),
+        executable::Op::Matmul { input_ids, .. } | executable::Op::Gather { input_ids, .. } => {
+            input_ids.contains(&value_id)
+        }
+        executable::Op::Scatter { input_ids, .. } | executable::Op::Select { input_ids, .. } => {
+            input_ids.contains(&value_id)
+        }
+    }
+}
+
+fn can_leave_splat_constant_unmaterialized(plan: &executable::Executable, value_id: u32) -> bool {
+    if plan.output_ids.contains(&value_id) {
+        return false;
+    }
+
+    let mut has_lazy_consumer = false;
+    for op in &plan.ops {
+        match op {
+            executable::Op::Select { input_ids, .. } => {
+                if input_ids[0] == value_id {
+                    return false;
+                }
+                if input_ids[1] == value_id || input_ids[2] == value_id {
+                    has_lazy_consumer = true;
+                }
+            }
+            _ if op_consumes_value(op, value_id) => return false,
+            _ => {}
+        }
+    }
+    has_lazy_consumer
+}
+
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -3372,15 +3427,21 @@ fn execute_executable_v1(
                 packed_value,
                 data,
                 output_id,
-            } => execute_constant(
-                &mut values,
-                plan,
-                device,
-                output_context,
-                *packed_value,
-                data,
-                *output_id,
-            ),
+            } => {
+                if data.is_empty() && can_leave_splat_constant_unmaterialized(plan, *output_id) {
+                    Ok(())
+                } else {
+                    execute_constant(
+                        &mut values,
+                        plan,
+                        device,
+                        output_context,
+                        *packed_value,
+                        data,
+                        *output_id,
+                    )
+                }
+            }
             executable::Op::Select {
                 input_ids,
                 output_id,
