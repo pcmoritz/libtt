@@ -35,6 +35,7 @@ struct ScatterProgramKey {
     cores: Vec<CoreCoord>,
     dtype: DType,
     shape: ScatterShape,
+    in_place: bool,
 }
 
 struct ScatterKernel {
@@ -128,10 +129,76 @@ pub(crate) fn scatter_set(
             cores,
             dtype,
             shape,
+            in_place: false,
         },
     };
     kernel.run(device)?;
     Ok(output)
+}
+
+pub(crate) fn scatter_set_in_place(
+    device: &mut Device,
+    operand: &DramBuffer,
+    start_indices: &DramBuffer,
+    updates: &DramBuffer,
+    operand_shape: &[usize],
+    operand_source_shape: Option<&[usize]>,
+    start_indices_shape: &[usize],
+    update_shape: &[usize],
+    update_source_shape: Option<&[usize]>,
+    scatter_dim: usize,
+    dtype: DType,
+) -> io::Result<DramBuffer> {
+    validate_scatter_buffers(
+        operand,
+        start_indices,
+        updates,
+        operand_shape,
+        operand_source_shape,
+        start_indices_shape,
+        update_shape,
+        update_source_shape,
+        scatter_dim,
+        dtype,
+    )?;
+
+    let shape = scatter_shape(
+        operand_shape,
+        operand_source_shape,
+        update_shape,
+        update_source_shape,
+        scatter_dim,
+    )?;
+    if !can_scatter_in_place(&shape) {
+        return Err(invalid_input(format!(
+            "scatter in-place path does not support shape {:?} update {:?} dim {}",
+            operand_shape, update_shape, scatter_dim
+        )));
+    }
+    let updated_tiles = tiled_shape_tile_count(update_shape)?;
+    let cores = select_worker_cores(device.cores_ref(), updated_tiles)?;
+    let kernel = ScatterKernel {
+        operand_addr: u32_addr(operand.addr, "scatter operand address")?,
+        start_indices_addr: u32_addr(start_indices.addr, "scatter start_indices address")?,
+        updates_addr: u32_addr(updates.addr, "scatter updates address")?,
+        output_addr: u32_addr(operand.addr, "scatter output address")?,
+        key: ScatterProgramKey {
+            cores,
+            dtype,
+            shape,
+            in_place: true,
+        },
+    };
+    kernel.run(device)?;
+    Ok(operand.clone())
+}
+
+fn can_scatter_in_place(shape: &ScatterShape) -> bool {
+    let rank = shape.operand_shape.len();
+    rank >= 3
+        && shape.scatter_dim + 2 < rank as u32
+        && shape.operand_source_view.is_none()
+        && shape.update_source_view.is_none()
 }
 
 fn validate_scatter_buffers(
@@ -295,8 +362,21 @@ fn scatter_program(key: ScatterProgramKey) -> io::Result<Program> {
         Vec::new(),
     );
     for (core_index, &core) in key.cores.iter().enumerate() {
-        let (offset, n_tiles) =
-            split_tile_range(key.shape.output_tiles, core_index, key.cores.len())?;
+        let work_tiles = if key.in_place {
+            let update_shape = key
+                .shape
+                .update_shape
+                .iter()
+                .map(|&dim| dim as usize)
+                .collect::<Vec<_>>();
+            u32_arg(
+                tiled_shape_tile_count(&update_shape)?,
+                "scatter updated tile count",
+            )?
+        } else {
+            key.shape.output_tiles
+        };
+        let (offset, n_tiles) = split_tile_range(work_tiles, core_index, key.cores.len())?;
         runtime_args.add_core(
             core,
             Vec::new(),
@@ -306,7 +386,7 @@ fn scatter_program(key: ScatterProgramKey) -> io::Result<Program> {
     }
     let runtime_args = runtime_args.build()?;
     Ok(Program {
-        reader_kernel: scatter_reader_source(key.dtype, &key.shape)?,
+        reader_kernel: scatter_reader_source(key.dtype, &key.shape, key.in_place)?,
         writer_kernel: SCATTER_WRITER.to_owned(),
         compile: CompileConfig {
             cbs: vec![
@@ -326,7 +406,7 @@ fn scatter_program(key: ScatterProgramKey) -> io::Result<Program> {
     })
 }
 
-fn scatter_reader_source(dtype: DType, shape: &ScatterShape) -> io::Result<String> {
+fn scatter_reader_source(dtype: DType, shape: &ScatterShape, in_place: bool) -> io::Result<String> {
     let element_type = element_type(dtype);
     let operand_source_view = shape.operand_source_view.as_ref();
     let update_source_view = shape.update_source_view.as_ref();
@@ -350,6 +430,7 @@ fn scatter_reader_source(dtype: DType, shape: &ScatterShape) -> io::Result<Strin
          #define SCATTER_OPERAND_TILES_PER_ROW {}\n\
          #define SCATTER_UPDATE_TILE_ROWS {}\n\
          #define SCATTER_UPDATE_TILES_PER_ROW {}\n\
+         #define SCATTER_IN_PLACE {}\n\
          #define SCATTER_ELEMENT_TYPE {element_type}\n\
          {SCATTER_READER}",
         shape.operand_shape.len(),
@@ -371,6 +452,7 @@ fn scatter_reader_source(dtype: DType, shape: &ScatterShape) -> io::Result<Strin
         shape.operand_tiles_per_row,
         shape.update_tile_rows,
         shape.update_tiles_per_row,
+        in_place as u32,
     ))
 }
 

@@ -3,7 +3,9 @@
 #include "compute_kernel_api/binary_bitwise_sfpu.h"
 #include "compute_kernel_api/binary_max_min.h"
 #include "compute_kernel_api/eltwise_binary_sfpu.h"
+#include "compute_kernel_api/eltwise_unary/binop_with_scalar.h"
 #include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
+#include "compute_kernel_api/eltwise_unary/rsqrt.h"
 #include "compute_kernel_api/pack.h"
 #include "compute_kernel_api/reduce_custom.h"
 #include "compute_kernel_api/tile_move_copy.h"
@@ -106,6 +108,16 @@ void square_pre_reduce_tile(uint32_t dst_idx) {
 #endif
 }
 
+void post_rsqrt_tile() {
+#if REDUCE_POST_RSQRT
+  binop_with_scalar_tile_init();
+  mul_unary_tile(0, REDUCE_POST_SCALE_BITS);
+  add_unary_tile(0, REDUCE_POST_BIAS_BITS);
+  rsqrt_tile_init();
+  rsqrt_tile(0);
+#endif
+}
+
 void MAIN {
   uint32_t reduce_groups = get_arg_val<uint32_t>(0);
   uint32_t count = get_arg_val<uint32_t>(1);
@@ -136,6 +148,7 @@ void MAIN {
         combine_into_accumulator(block, dst_idx);
         cb_pop_front(cb_input, REDUCE_BLOCK_MAX_ROW_TILES);
       }
+      post_rsqrt_tile();
       cb_reserve_back(cb_output, onetile);
       tile_regs_commit();
       tile_regs_wait();
@@ -159,6 +172,7 @@ void MAIN {
         combine_into_accumulator(wt, dst_idx);
         cb_pop_front(cb_input, onetile);
       }
+      post_rsqrt_tile();
       cb_reserve_back(cb_output, onetile);
       tile_regs_commit();
       tile_regs_wait();
@@ -183,6 +197,7 @@ void MAIN {
       combine_into_accumulator(index, dst_idx);
       cb_pop_front(cb_input, onetile);
     }
+    post_rsqrt_tile();
     cb_reserve_back(cb_output, onetile);
     tile_regs_commit();
     tile_regs_wait();

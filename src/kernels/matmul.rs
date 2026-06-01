@@ -43,12 +43,14 @@ const GROUPED_DIM_NONE: u32 = u32::MAX;
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum MatmulEpilogueKind {
     Store,
+    StoreSilu,
     Top1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MatmulEpilogue {
     Store { output_dtype: DType },
+    StoreSilu { output_dtype: DType },
     Top1,
 }
 
@@ -72,13 +74,14 @@ impl MatmulEpilogue {
     fn kind(self) -> MatmulEpilogueKind {
         match self {
             Self::Store { .. } => MatmulEpilogueKind::Store,
+            Self::StoreSilu { .. } => MatmulEpilogueKind::StoreSilu,
             Self::Top1 => MatmulEpilogueKind::Top1,
         }
     }
 
     fn validate_shape(self, shape: &DotGeneralMatmulShape) -> io::Result<()> {
         match self {
-            Self::Store { .. } => Ok(()),
+            Self::Store { .. } | Self::StoreSilu { .. } => Ok(()),
             Self::Top1 => {
                 if shape.batch_count != 1 || shape.m != 1 {
                     return Err(invalid_input(format!(
@@ -105,6 +108,7 @@ enum MatmulRuntimeEpilogue {
     Store {
         output: DramBuffer,
         output_addr: u32,
+        post_silu: bool,
     },
     Top1 {
         partial_pairs: DramBuffer,
@@ -117,7 +121,13 @@ enum MatmulRuntimeEpilogue {
 impl MatmulRuntimeEpilogue {
     fn kind(&self) -> MatmulEpilogueKind {
         match self {
-            Self::Store { .. } => MatmulEpilogueKind::Store,
+            Self::Store { post_silu, .. } => {
+                if *post_silu {
+                    MatmulEpilogueKind::StoreSilu
+                } else {
+                    MatmulEpilogueKind::Store
+                }
+            }
             Self::Top1 { .. } => MatmulEpilogueKind::Top1,
         }
     }
@@ -184,6 +194,7 @@ enum MatmulViewKind {
     TiledIndexMap = 4,
     TileTranspose = 5,
     PackedHead = 6,
+    PackedHeadTranspose = 7,
 }
 
 impl MatmulViewKind {
@@ -340,7 +351,9 @@ impl Kernel<MatmulProgramKey> for MatmulKernel {
 
 fn writer_rhs_gather_indices_addr_index(epilogue: MatmulEpilogueKind) -> usize {
     match epilogue {
-        MatmulEpilogueKind::Store => WRITER_RHS_GATHER_INDICES_ADDR_INDEX,
+        MatmulEpilogueKind::Store | MatmulEpilogueKind::StoreSilu => {
+            WRITER_RHS_GATHER_INDICES_ADDR_INDEX
+        }
         MatmulEpilogueKind::Top1 => WRITER_TOP1_RHS_GATHER_INDICES_ADDR_INDEX,
     }
 }
@@ -372,6 +385,7 @@ pub(crate) fn matmul_dot_general(
         rhs_shape,
         rhs_shape,
         output_logical_shape,
+        None,
         lhs_batching_dimensions,
         rhs_batching_dimensions,
         lhs_contracting_dimensions,
@@ -397,6 +411,7 @@ pub(crate) fn matmul_dot_general_with_views(
     rhs_physical_shape: &[usize],
     rhs_shape: &[usize],
     output_logical_shape: &[usize],
+    output_physical_shape: Option<&[usize]>,
     lhs_batching_dimensions: &[i64],
     rhs_batching_dimensions: &[i64],
     lhs_contracting_dimensions: &[i64],
@@ -420,6 +435,12 @@ pub(crate) fn matmul_dot_general_with_views(
             DType::Float16B,
             MatmulEpilogue::Store {
                 output_dtype: output @ (DType::Float16B | DType::Float32),
+            },
+        ) => output,
+        (
+            DType::Float16B,
+            MatmulEpilogue::StoreSilu {
+                output_dtype: output @ DType::Float16B,
             },
         ) => output,
         (
@@ -476,6 +497,7 @@ pub(crate) fn matmul_dot_general_with_views(
         rhs_grouped_head_view,
         rhs_gather_view,
         output_logical_shape,
+        output_physical_shape.unwrap_or(output_logical_shape),
         lhs_batching_dimensions,
         rhs_batching_dimensions,
         lhs_contracting_dimensions,
@@ -515,7 +537,7 @@ pub(crate) fn matmul_dot_general_with_views(
         .transpose()?;
 
     let runtime_epilogue = match epilogue {
-        MatmulEpilogue::Store { output_dtype } => {
+        MatmulEpilogue::Store { output_dtype } | MatmulEpilogue::StoreSilu { output_dtype } => {
             let output_tiles = tiled_shape_tile_count(&shape.output_allocation_shape)?;
             let output_shape = tiled_allocation_shape(&shape.output_allocation_shape)?;
             let output = device.alloc(output_tiles, output_dtype, &output_shape, name)?;
@@ -523,6 +545,7 @@ pub(crate) fn matmul_dot_general_with_views(
             MatmulRuntimeEpilogue::Store {
                 output,
                 output_addr,
+                post_silu: matches!(epilogue, MatmulEpilogue::StoreSilu { .. }),
             }
         }
         MatmulEpilogue::Top1 => {
@@ -615,6 +638,7 @@ fn dot_general_shape(
         None,
         None,
         output_shape,
+        output_shape,
         lhs_batching_dimensions,
         rhs_batching_dimensions,
         lhs_contracting_dimensions,
@@ -635,6 +659,7 @@ fn dot_general_shape_with_views(
     rhs_grouped_head_view: Option<&MatmulGroupedHeadView>,
     rhs_gather_view: Option<&MatmulGatherView>,
     output_shape: &[usize],
+    output_physical_shape: &[usize],
     lhs_batching_dimensions: &[i64],
     rhs_batching_dimensions: &[i64],
     lhs_contracting_dimensions: &[i64],
@@ -695,10 +720,16 @@ fn dot_general_shape_with_views(
         rhs_grouped_head_view,
         rhs_gather_view,
         output_shape,
+        output_physical_shape,
         &lhs_dims,
         &rhs_dims,
     )? {
         return Ok(shape);
+    }
+    if output_physical_shape != output_shape {
+        return Err(invalid_input(format!(
+            "dot_general matmul physical output shape override {output_physical_shape:?} is only supported for packed GQA output shape {output_shape:?}"
+        )));
     }
 
     let mut batch_shape = Vec::with_capacity(lhs_dims.batch.len());
@@ -756,7 +787,7 @@ fn dot_general_shape_with_views(
         m,
         k,
         n,
-        output_allocation_shape: output_shape.to_vec(),
+        output_allocation_shape: output_physical_shape.to_vec(),
         lhs_view: operand_view(
             lhs_physical_shape,
             lhs_source_shape,
@@ -812,6 +843,7 @@ fn packed_gqa_shape(
     rhs_grouped_head_view: Option<&MatmulGroupedHeadView>,
     rhs_gather_view: Option<&MatmulGatherView>,
     output_shape: &[usize],
+    output_physical_shape: &[usize],
     lhs_dims: &DotGeneralDims,
     rhs_dims: &DotGeneralDims,
 ) -> io::Result<Option<DotGeneralMatmulShape>> {
@@ -877,7 +909,11 @@ fn packed_gqa_shape(
     }
 
     let m = lhs_base_shape[lhs_dims.free[0]];
-    let k = checked_product_of_dims(lhs_base_shape, &lhs_dims.contract, "lhs contracting dimensions")?;
+    let k = checked_product_of_dims(
+        lhs_base_shape,
+        &lhs_dims.contract,
+        "lhs contracting dimensions",
+    )?;
     let rhs_internal_shape = vec![rhs_shape[0], kv_heads, group_size, rhs_shape[2]];
     let packed_output_shape = vec![kv_heads, output_shape[1], output_shape[2], group_size];
     let rhs_view = packed_head_rhs_view(
@@ -887,14 +923,23 @@ fn packed_gqa_shape(
         k,
         group_size,
     )?;
-    let output_view = packed_head_output_view(output_shape, &packed_output_shape, m, group_size)?;
+    let output_view = if is_packed_head_transpose_output(output_shape, output_physical_shape) {
+        packed_head_transpose_output_view(
+            output_physical_shape,
+            &packed_output_shape,
+            m,
+            group_size,
+        )?
+    } else {
+        packed_head_output_view(output_shape, &packed_output_shape, m, group_size)?
+    };
 
     Ok(Some(DotGeneralMatmulShape {
         batch_count: kv_heads,
         m,
         k,
         n: group_size,
-        output_allocation_shape: output_shape.to_vec(),
+        output_allocation_shape: output_physical_shape.to_vec(),
         lhs_view: operand_view(
             lhs_physical_shape,
             lhs_source_shape,
@@ -973,13 +1018,74 @@ fn packed_head_output_view(
         gather_dim: GROUPED_DIM_NONE,
         reshape_source: None,
         shape: padded_u32_array(output_shape, "packed GQA output shape")?,
-        physical_shape: padded_u32_array(output_physical_shape, "packed GQA output physical shape")?,
+        physical_shape: padded_u32_array(
+            output_physical_shape,
+            "packed GQA output physical shape",
+        )?,
         reshape_shape: padded_u32_array(output_physical_shape, "packed GQA output reshape shape")?,
         dim_strides: [1u32; MAX_RANK],
         dim_offsets: [0u32; MAX_RANK],
         batch_dims: padded_u32_array(&[0], "packed GQA output batch dims")?,
         row_dims: padded_u32_array(&[1], "packed GQA output row dims")?,
         col_dims: padded_u32_array(&[2, 3], "packed GQA output col dims")?,
+    })
+}
+
+fn is_packed_head_transpose_output(
+    output_shape: &[usize],
+    output_physical_shape: &[usize],
+) -> bool {
+    output_shape.len() == 3
+        && output_shape[2] == 1
+        && output_physical_shape == [1, output_shape[0], output_shape[1]]
+}
+
+fn packed_head_transpose_output_view(
+    output_physical_shape: &[usize],
+    output_shape: &[usize],
+    logical_rows: usize,
+    group_size: usize,
+) -> io::Result<MatmulOperandView> {
+    if output_physical_shape.len() != 3 {
+        return Err(invalid_input(format!(
+            "packed GQA transposed output requires rank-3 physical shape, got {output_physical_shape:?}"
+        )));
+    }
+    let allocation_shape = tiled_allocation_shape(output_physical_shape)?;
+    Ok(MatmulOperandView {
+        kind: MatmulViewKind::PackedHeadTranspose,
+        rank: u32_value(output_shape.len(), "packed GQA transposed output rank")?,
+        batch_rank: 1,
+        row_rank: 1,
+        col_rank: 2,
+        logical_rows: u32_value(logical_rows, "packed GQA transposed output rows")?,
+        logical_cols: u32_value(group_size, "packed GQA transposed output columns")?,
+        tile_rows: u32_value(
+            allocation_shape[1] / 32,
+            "packed GQA transposed output tile rows",
+        )?,
+        tiles_per_row: u32_value(
+            allocation_shape[2] / 32,
+            "packed GQA transposed output tiles per row",
+        )?,
+        grouped_dim: 0,
+        group_size: u32_value(group_size, "packed GQA transposed output group size")?,
+        gather_dim: GROUPED_DIM_NONE,
+        reshape_source: None,
+        shape: padded_u32_array(output_shape, "packed GQA transposed output shape")?,
+        physical_shape: padded_u32_array(
+            output_physical_shape,
+            "packed GQA transposed output physical shape",
+        )?,
+        reshape_shape: padded_u32_array(
+            output_physical_shape,
+            "packed GQA transposed output reshape shape",
+        )?,
+        dim_strides: [1u32; MAX_RANK],
+        dim_offsets: [0u32; MAX_RANK],
+        batch_dims: padded_u32_array(&[0], "packed GQA transposed output batch dims")?,
+        row_dims: padded_u32_array(&[1], "packed GQA transposed output row dims")?,
+        col_dims: padded_u32_array(&[2, 3], "packed GQA transposed output col dims")?,
     })
 }
 
@@ -1374,7 +1480,7 @@ fn plan_for_key(key: &MatmulProgramKey) -> io::Result<MatmulPlan> {
     let input_tile_bytes = key.input_dtype.tile_size();
     let output_tile_bytes = key.output_dtype.tile_size();
     match key.epilogue {
-        MatmulEpilogueKind::Store => plan_matmul_with_tile_sizes(
+        MatmulEpilogueKind::Store | MatmulEpilogueKind::StoreSilu => plan_matmul_with_tile_sizes(
             key.logical_mt * 32,
             key.logical_kt * 32,
             key.logical_nt * 32,
@@ -1795,11 +1901,11 @@ fn matmul_program(
         CBConfig::new(3, input_dtype)
             .with_compute_dtype(input_compute_dtype)
             .with_tiles(1),
-        CBConfig::new(4, output_index_dtype).with_tiles(
-            (output_view.kind == MatmulViewKind::PackedHead)
-                .then_some(output_view.group_size as usize)
-                .unwrap_or(1),
-        ),
+        CBConfig::new(4, output_index_dtype).with_tiles(match output_view.kind {
+            MatmulViewKind::PackedHead => output_view.group_size as usize,
+            MatmulViewKind::PackedHeadTranspose => output_view.group_size as usize + 1,
+            _ => 1,
+        }),
         CBConfig::new(16, output_dtype).with_tiles(plan.out_block_num_tiles()),
         CBConfig::new(24, output_dtype).with_tiles(plan.out_block_num_tiles()),
     ];
@@ -1817,6 +1923,7 @@ fn matmul_program(
         epilogue,
     )?;
     let top1_epilogue = epilogue == MatmulEpilogueKind::Top1;
+    let post_silu = epilogue == MatmulEpilogueKind::StoreSilu;
     Ok(Program {
         reader_kernel: MATMUL_READER_SENDER.to_owned(),
         writer_kernel: if top1_epilogue {
@@ -1828,6 +1935,7 @@ fn matmul_program(
             plan,
             plan.batches_per_group,
             rhs_view.kind == MatmulViewKind::TileTranspose,
+            post_silu,
         ),
         reader_recv_kernel: MATMUL_READER_RECV.to_owned(),
         writer_recv_kernel: if top1_epilogue {
@@ -1873,7 +1981,7 @@ fn lower_runtime_args(
 ) -> io::Result<RuntimeArgs> {
     let grid = plan_grid(plan);
     let writer_dynamic_indices = match epilogue {
-        MatmulEpilogueKind::Store => vec![
+        MatmulEpilogueKind::Store | MatmulEpilogueKind::StoreSilu => vec![
             WRITER_RHS_ADDR_INDEX,
             WRITER_OUTPUT_ADDR_INDEX,
             WRITER_RHS_GATHER_INDICES_ADDR_INDEX,
@@ -1915,7 +2023,7 @@ fn lower_runtime_args(
                 lhs_view,
             )?;
             let writer_epilogue = match epilogue {
-                MatmulEpilogueKind::Store => WriterEpilogue::Store,
+                MatmulEpilogueKind::Store | MatmulEpilogueKind::StoreSilu => WriterEpilogue::Store,
                 MatmulEpilogueKind::Top1 => WriterEpilogue::Top1 { partial_tile_id },
             };
             let writer = writer_args(
@@ -2190,10 +2298,16 @@ fn mcast_rect_args(cols: &[u8], y: u8) -> [u32; 5] {
     }
 }
 
-fn compute_src(plan: &MatmulPlan, batch_count: usize, in1_transpose: bool) -> String {
+fn compute_src(
+    plan: &MatmulPlan,
+    batch_count: usize,
+    in1_transpose: bool,
+    post_silu: bool,
+) -> String {
     let replacements = [
         ("@BATCH_COUNT@", batch_count),
         ("@IN1_TRANSPOSE@", usize::from(in1_transpose)),
+        ("@POST_SILU@", usize::from(post_silu)),
         ("@IN0_BLOCK_W@", plan.in0_block_w),
         ("@IN0_NUM_SUBBLOCKS@", plan.in0_num_subblocks()),
         ("@IN0_BLOCK_NUM_TILES@", plan.in0_block_num_tiles()),

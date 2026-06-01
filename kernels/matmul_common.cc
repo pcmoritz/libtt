@@ -13,6 +13,7 @@ constexpr uint32_t VIEW_CONTIGUOUS = 0;
 constexpr uint32_t VIEW_TILED_INDEX_MAP = 4;
 constexpr uint32_t VIEW_TILE_TRANSPOSE = 5;
 constexpr uint32_t VIEW_PACKED_HEAD = 6;
+constexpr uint32_t VIEW_PACKED_HEAD_TRANSPOSE = 7;
 constexpr uint32_t GROUPED_DIM_NONE = 0xffffffffu;
 
 struct View {

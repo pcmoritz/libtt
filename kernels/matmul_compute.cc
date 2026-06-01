@@ -21,6 +21,7 @@ void MAIN {
   constexpr uint32_t out_block_num_tiles = @OUT_BLOCK_NUM_TILES@;
   constexpr uint32_t batch_count = @BATCH_COUNT@;
   constexpr uint32_t in1_transpose = @IN1_TRANSPOSE@;
+  constexpr uint32_t post_silu = @POST_SILU@;
 
   mm_block_init(
       tt::CBIndex::c_0,
@@ -79,6 +80,13 @@ void MAIN {
           if (last_out) {
             cb_reserve_back(tt::CBIndex::c_16, out_subblock_num_tiles);
             tile_regs_wait();
+            if constexpr (post_silu) {
+              silu_tile_init();
+#pragma GCC unroll 0
+              for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
+                silu_tile(i);
+              }
+            }
             PACK((llk_pack_reconfig_l1_acc(0)));
 #pragma GCC unroll 0
             for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {

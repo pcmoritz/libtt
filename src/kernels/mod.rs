@@ -10,6 +10,7 @@ pub(crate) mod reduce;
 pub(crate) mod reduce_window;
 pub(crate) mod reshape;
 pub(crate) mod reshape_view;
+pub(crate) mod rotary;
 pub(crate) mod scatter;
 pub(crate) mod select;
 pub(crate) mod slice;

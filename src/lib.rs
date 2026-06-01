@@ -133,9 +133,27 @@ struct ExecutableAnalysis {
     packed_constants: HashMap<u32, u32>,
     lazy_splat_constants: HashSet<u32>,
     square_fused_inputs: HashMap<u32, u32>,
+    reduce_post_rsqrt_outputs: HashMap<u32, RuntimeReducePostRsqrt>,
+    rotary_fusions: HashMap<u32, RuntimeRotaryFusion>,
+    fused_elementwise_rewrites: HashMap<u32, RuntimeFusedElementwiseRewrite>,
+    silu_fusions: HashMap<u32, RuntimeSiluFusion>,
+    inplace_scatter_outputs: HashMap<u32, u32>,
+    matmul_transpose_outputs: HashMap<u32, u32>,
     skipped_fused_outputs: HashSet<u32>,
+    skipped_reshape_outputs: HashSet<u32>,
+    skipped_slice_outputs: HashSet<u32>,
+    skipped_broadcast_outputs: HashSet<u32>,
+    skipped_transpose_outputs: HashSet<u32>,
+    matmul_silu_epilogues: HashMap<u32, u32>,
     matmul_top1_epilogues: HashMap<u32, RuntimeMatmulTop1>,
     skipped_topk_inputs: HashSet<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeReducePostRsqrt {
+    final_output_id: u32,
+    scale_bits: u32,
+    bias_bits: u32,
 }
 
 #[derive(Clone)]
@@ -143,6 +161,31 @@ struct RuntimeMatmulTop1 {
     values_id: u32,
     indices_id: u32,
     k: u32,
+}
+
+#[derive(Clone)]
+struct RuntimeRotaryFusion {
+    input_id: u32,
+    cos_id: u32,
+    sin_id: u32,
+}
+
+#[derive(Clone)]
+struct RuntimeFusedElementwiseRewrite {
+    input_ids: Vec<u32>,
+    nodes: Vec<executable::FusedElementwiseNode>,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeSiluFusion {
+    input_id: u32,
+    kind: SiluFusionKind,
+}
+
+#[derive(Clone, Copy)]
+enum SiluFusionKind {
+    DirectDivide,
+    OneDivMultiply,
 }
 
 #[derive(Default)]
@@ -1894,7 +1937,6 @@ fn executable_analysis(executable: Option<&executable::Executable>) -> Executabl
     }
     let mut producers = HashMap::<u32, usize>::new();
     let mut consumers = HashMap::<u32, Vec<usize>>::new();
-    let mut square_outputs = HashMap::<u32, u32>::new();
     for (op_index, op) in plan.ops.iter().enumerate() {
         for output_id in op_output_ids(op) {
             producers.insert(output_id, op_index);
@@ -1902,34 +1944,255 @@ fn executable_analysis(executable: Option<&executable::Executable>) -> Executabl
         for input_id in op_input_ids(op) {
             consumers.entry(input_id).or_default().push(op_index);
         }
+    }
+    let mut square_outputs = HashMap::<u32, SquareFusedInput>::new();
+    for op in &plan.ops {
         if let executable::Op::FusedElementwise {
             input_ids,
             output_id,
             nodes,
         } = op
         {
-            if let Some(input_id) = fused_square_input(input_ids, nodes) {
-                square_outputs.insert(*output_id, input_id);
+            if let Some(fusion) = fused_square_input(plan, &producers, &consumers, input_ids, nodes)
+            {
+                square_outputs.insert(*output_id, fusion);
             }
         }
     }
-    for (output_id, input_id) in square_outputs {
-        let Some(indices) = consumers.get(&output_id) else {
+    for (output_id, fusion) in square_outputs {
+        let mut skipped_reshape_outputs = Vec::new();
+        let Some(reduce_input_id) =
+            skip_reshape_consumers(plan, &consumers, output_id, &mut skipped_reshape_outputs)
+        else {
             continue;
         };
-        if indices.len() != 1 {
+        let Some(indices) = consumers.get(&reduce_input_id) else {
             continue;
-        }
+        };
+        let [reduce_op_index] = indices.as_slice() else {
+            continue;
+        };
         if matches!(
-            &plan.ops[indices[0]],
+            &plan.ops[*reduce_op_index],
             executable::Op::Reduce {
                 input_ids,
                 reducer: executable::ReduceReducer::Add,
                 ..
-            } if input_ids.first() == Some(&output_id)
+            } if input_ids.first() == Some(&reduce_input_id)
         ) {
-            analysis.square_fused_inputs.insert(output_id, input_id);
+            analysis
+                .square_fused_inputs
+                .insert(reduce_input_id, fusion.input_id);
             analysis.skipped_fused_outputs.insert(output_id);
+            for skipped_output in fusion.skipped_fused_outputs {
+                analysis.skipped_fused_outputs.insert(skipped_output);
+            }
+            for skipped_output in skipped_reshape_outputs {
+                analysis.skipped_reshape_outputs.insert(skipped_output);
+            }
+        }
+    }
+    for (op_index, op) in plan.ops.iter().enumerate() {
+        let executable::Op::Reduce {
+            input_ids,
+            output_id,
+            dimensions,
+            reducer: executable::ReduceReducer::Add,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        if dimensions.len() != 1
+            || !input_ids
+                .first()
+                .is_some_and(|input_id| analysis.square_fused_inputs.contains_key(input_id))
+        {
+            continue;
+        }
+        if let Some(fusion) = detect_reduce_post_rsqrt(
+            plan,
+            &consumers,
+            &producers,
+            &analysis.packed_constants,
+            *output_id,
+            op_index,
+        ) {
+            for output_id in &fusion.skipped_fused_outputs {
+                analysis.skipped_fused_outputs.insert(*output_id);
+            }
+            for output_id in &fusion.skipped_reshape_outputs {
+                analysis.skipped_reshape_outputs.insert(*output_id);
+            }
+            analysis.reduce_post_rsqrt_outputs.insert(
+                *output_id,
+                RuntimeReducePostRsqrt {
+                    final_output_id: fusion.final_output_id,
+                    scale_bits: fusion.scale_bits,
+                    bias_bits: fusion.bias_bits,
+                },
+            );
+        }
+    }
+    for op in &plan.ops {
+        let executable::Op::Concatenate {
+            input_ids,
+            output_id,
+            dimension,
+        } = op
+        else {
+            continue;
+        };
+        if let Some(fusion) = detect_rotary_fusion(
+            plan, &consumers, &producers, input_ids, *output_id, *dimension,
+        ) {
+            analysis.rotary_fusions.insert(
+                *output_id,
+                RuntimeRotaryFusion {
+                    input_id: fusion.input_id,
+                    cos_id: fusion.cos_id,
+                    sin_id: fusion.sin_id,
+                },
+            );
+            for output_id in fusion.skipped_fused_outputs {
+                analysis.skipped_fused_outputs.insert(output_id);
+            }
+            for output_id in fusion.skipped_slice_outputs {
+                analysis.skipped_slice_outputs.insert(output_id);
+            }
+        }
+    }
+    for (op_index, op) in plan.ops.iter().enumerate() {
+        let executable::Op::FusedElementwise {
+            input_ids,
+            output_id,
+            nodes,
+        } = op
+        else {
+            continue;
+        };
+        if let Some((rewrite, skipped_broadcasts)) = detect_fused_scalar_broadcast_inputs(
+            plan, &consumers, &producers, op_index, input_ids, *output_id, nodes,
+        ) {
+            analysis
+                .fused_elementwise_rewrites
+                .insert(*output_id, rewrite);
+            for skipped_output in skipped_broadcasts {
+                analysis.skipped_broadcast_outputs.insert(skipped_output);
+            }
+        }
+    }
+    for op in &plan.ops {
+        let executable::Op::Matmul { output_id, .. } = op else {
+            continue;
+        };
+        if let Some(fusion) = detect_matmul_silu(
+            plan,
+            &consumers,
+            &producers,
+            &analysis.packed_constants,
+            *output_id,
+        ) {
+            analysis.silu_fusions.insert(
+                fusion.final_output_id,
+                RuntimeSiluFusion {
+                    input_id: *output_id,
+                    kind: fusion.kind,
+                },
+            );
+            for output_id in fusion.skipped_fused_outputs {
+                if output_id != fusion.final_output_id {
+                    analysis.skipped_fused_outputs.insert(output_id);
+                }
+            }
+        }
+    }
+    for op in &plan.ops {
+        let executable::Op::Matmul {
+            output_id,
+            lhs_grouped_head_view,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        if lhs_grouped_head_view.is_none() || plan.output_ids.contains(output_id) {
+            continue;
+        }
+        let Some(consumer_index) = single_consumer_index(&consumers, *output_id) else {
+            continue;
+        };
+        if let executable::Op::Transpose {
+            input_id,
+            output_id: transpose_output_id,
+            permutation,
+        } = &plan.ops[consumer_index]
+        {
+            if *input_id == *output_id
+                && is_foldable_gqa_output_transpose(
+                    plan,
+                    *output_id,
+                    *transpose_output_id,
+                    permutation,
+                )
+            {
+                analysis
+                    .matmul_transpose_outputs
+                    .insert(*output_id, *transpose_output_id);
+                analysis
+                    .skipped_transpose_outputs
+                    .insert(*transpose_output_id);
+            }
+        }
+    }
+    for (op_index, op) in plan.ops.iter().enumerate() {
+        let executable::Op::FusedElementwise {
+            input_ids,
+            output_id,
+            nodes,
+        } = op
+        else {
+            continue;
+        };
+        if analysis.skipped_fused_outputs.contains(output_id)
+            || analysis.silu_fusions.contains_key(output_id)
+        {
+            continue;
+        }
+        if let Some((rewrite, skipped_output, skipped_broadcasts)) =
+            detect_fused_convert_arithmetic_pair(
+                plan, &consumers, &producers, &analysis, op_index, input_ids, *output_id, nodes,
+            )
+        {
+            analysis
+                .fused_elementwise_rewrites
+                .insert(*output_id, rewrite);
+            analysis.skipped_fused_outputs.insert(skipped_output);
+            for skipped_output in skipped_broadcasts {
+                analysis.skipped_broadcast_outputs.insert(skipped_output);
+            }
+        }
+    }
+    for (op_index, op) in plan.ops.iter().enumerate() {
+        let executable::Op::Scatter {
+            input_ids,
+            output_id,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let Some(&operand_id) = input_ids.first() else {
+            continue;
+        };
+        if !plan.output_ids.contains(&operand_id)
+            && consumers
+                .get(&operand_id)
+                .is_some_and(|indices| indices.as_slice() == [op_index])
+        {
+            analysis
+                .inplace_scatter_outputs
+                .insert(*output_id, operand_id);
         }
     }
     for op in &plan.ops {
@@ -1944,9 +2207,9 @@ fn executable_analysis(executable: Option<&executable::Executable>) -> Executabl
         };
         if *k != 1
             || consumers.get(input_id).map_or(0, Vec::len) != 1
-            || !producers.get(input_id).is_some_and(|&index| {
-                matches!(plan.ops[index], executable::Op::Matmul { .. })
-            })
+            || !producers
+                .get(input_id)
+                .is_some_and(|&index| matches!(plan.ops[index], executable::Op::Matmul { .. }))
         {
             continue;
         }
@@ -1961,6 +2224,1159 @@ fn executable_analysis(executable: Option<&executable::Executable>) -> Executabl
         analysis.skipped_topk_inputs.insert(*input_id);
     }
     analysis
+}
+
+struct ReducePostRsqrtFusion {
+    final_output_id: u32,
+    scale_bits: u32,
+    bias_bits: u32,
+    skipped_fused_outputs: Vec<u32>,
+    skipped_reshape_outputs: Vec<u32>,
+}
+
+struct MatmulSiluFusion {
+    final_output_id: u32,
+    kind: SiluFusionKind,
+    skipped_fused_outputs: Vec<u32>,
+}
+
+struct MatmulSiluCandidate {
+    consumer_index: usize,
+    final_output_id: u32,
+    kind: SiluFusionKind,
+    skipped_fused_outputs: Vec<u32>,
+}
+
+struct RotaryFusion {
+    input_id: u32,
+    cos_id: u32,
+    sin_id: u32,
+    skipped_fused_outputs: Vec<u32>,
+    skipped_slice_outputs: Vec<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct RotaryTerm {
+    half: u32,
+    scale_id: u32,
+    slice_id: u32,
+    multiply_id: u32,
+}
+
+struct RotaryBranch {
+    lhs: RotaryTerm,
+    rhs: RotaryTerm,
+    output_id: u32,
+}
+
+fn detect_fused_scalar_broadcast_inputs(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    op_index: usize,
+    input_ids: &[u32],
+    output_id: u32,
+    nodes: &[executable::FusedElementwiseNode],
+) -> Option<(RuntimeFusedElementwiseRewrite, Vec<u32>)> {
+    let mut rewritten_input_ids = input_ids.to_vec();
+    let mut rewritten_nodes = nodes.to_vec();
+    let skipped_broadcasts = rewrite_scalar_broadcast_inputs(
+        plan,
+        consumers,
+        producers,
+        &[op_index],
+        output_id,
+        &mut rewritten_input_ids,
+        &mut rewritten_nodes,
+    )?;
+    Some((
+        RuntimeFusedElementwiseRewrite {
+            input_ids: rewritten_input_ids,
+            nodes: rewritten_nodes,
+        },
+        skipped_broadcasts,
+    ))
+}
+
+fn rewrite_scalar_broadcast_inputs(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    consumer_indices: &[usize],
+    output_id: u32,
+    input_ids: &mut [u32],
+    nodes: &mut [executable::FusedElementwiseNode],
+) -> Option<Vec<u32>> {
+    let output_desc = plan.values.get(output_id as usize)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims).ok()?;
+    let mut broadcast_inputs = HashMap::<u32, u32>::new();
+    let mut skipped_broadcasts = Vec::new();
+
+    for (input_index, input_id) in input_ids.iter_mut().enumerate() {
+        let original_input_id = *input_id;
+        if plan.output_ids.contains(&original_input_id)
+            || !consumers
+                .get(&original_input_id)
+                .is_some_and(|indices| indices.len() == 1 && consumer_indices.contains(&indices[0]))
+        {
+            continue;
+        }
+        let producer_index = *producers.get(&original_input_id)?;
+        let executable::Op::BroadcastInDim {
+            input_id: source_id,
+            output_id: broadcast_output_id,
+            ..
+        } = &plan.ops[producer_index]
+        else {
+            continue;
+        };
+        if *broadcast_output_id != original_input_id {
+            continue;
+        }
+        let source_desc = plan.values.get(*source_id as usize)?;
+        let broadcast_desc = plan.values.get(original_input_id as usize)?;
+        if source_desc.element_type != broadcast_desc.element_type
+            || broadcast_desc.element_type != output_desc.element_type
+            || broadcast_desc.dims != output_desc.dims
+        {
+            continue;
+        }
+        let source_shape = dims_i64_to_usize(&source_desc.dims).ok()?;
+        let broadcast_kind = if source_shape.iter().all(|&dim| dim == 1) {
+            0
+        } else if is_row_scalar_broadcast(&source_shape, &output_shape) {
+            1
+        } else {
+            continue;
+        };
+        if dram::tiled_shape_tile_count(&source_shape).ok()? != 1
+            || dims_i64_to_usize(&broadcast_desc.dims).ok()? != output_shape
+        {
+            continue;
+        }
+        *input_id = *source_id;
+        broadcast_inputs.insert(input_index as u32, broadcast_kind);
+        skipped_broadcasts.push(original_input_id);
+    }
+
+    if broadcast_inputs.is_empty() {
+        return None;
+    }
+
+    for node in nodes {
+        if node.kind == executable::FusedElementwiseKind::Input {
+            if let Some(&broadcast_kind) = broadcast_inputs.get(&node.input_index) {
+                node.single_tile_broadcast = true;
+                node.packed_value = broadcast_kind;
+            }
+        }
+    }
+
+    Some(skipped_broadcasts)
+}
+
+fn is_row_scalar_broadcast(source_shape: &[usize], output_shape: &[usize]) -> bool {
+    source_shape.len() == output_shape.len()
+        && source_shape.len() >= 2
+        && source_shape[source_shape.len() - 1] == 1
+        && source_shape[..source_shape.len() - 1] == output_shape[..output_shape.len() - 1]
+}
+
+fn detect_fused_convert_arithmetic_pair(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    analysis: &ExecutableAnalysis,
+    consumer_index: usize,
+    consumer_input_ids: &[u32],
+    consumer_output_id: u32,
+    consumer_nodes: &[executable::FusedElementwiseNode],
+) -> Option<(RuntimeFusedElementwiseRewrite, u32, Vec<u32>)> {
+    let mut producer = None;
+    for &input_id in consumer_input_ids {
+        if plan.output_ids.contains(&input_id)
+            || !fused_pair_input_available(analysis, input_id)
+            || consumers.get(&input_id)?.as_slice() != [consumer_index]
+        {
+            continue;
+        }
+        let producer_index = *producers.get(&input_id)?;
+        if matches!(
+            plan.ops.get(producer_index),
+            Some(executable::Op::FusedElementwise { .. })
+        ) {
+            if producer.replace((producer_index, input_id)).is_some() {
+                return None;
+            }
+        }
+    }
+    let (producer_index, producer_output_id) = producer?;
+    let executable::Op::FusedElementwise {
+        input_ids: original_producer_input_ids,
+        output_id,
+        nodes: original_producer_nodes,
+    } = &plan.ops[producer_index]
+    else {
+        return None;
+    };
+    let (producer_input_ids, producer_nodes) =
+        if let Some(rewrite) = analysis.fused_elementwise_rewrites.get(&producer_output_id) {
+            (rewrite.input_ids.clone(), rewrite.nodes.clone())
+        } else {
+            (
+                original_producer_input_ids.clone(),
+                original_producer_nodes.clone(),
+            )
+        };
+    if *output_id != producer_output_id
+        || plan.output_ids.contains(&producer_output_id)
+        || !fused_pair_input_available(analysis, producer_output_id)
+        || !can_merge_convert_arithmetic_pair(&producer_nodes, consumer_nodes)?
+    {
+        return None;
+    }
+
+    let mut merged_input_ids = producer_input_ids;
+    let mut merged_nodes = producer_nodes;
+    let producer_root = u32::try_from(merged_nodes.len().checked_sub(1)?).ok()?;
+    let mut consumer_node_map = Vec::<u32>::with_capacity(consumer_nodes.len());
+
+    for node in consumer_nodes {
+        let mut merged_node = node.clone();
+        match node.kind {
+            executable::FusedElementwiseKind::Input => {
+                let external_id = *consumer_input_ids.get(node.input_index as usize)?;
+                if external_id == producer_output_id {
+                    consumer_node_map.push(producer_root);
+                    continue;
+                }
+                merged_node.input_index = u32::try_from(merged_input_ids.len()).ok()?;
+                merged_input_ids.push(external_id);
+            }
+            _ => {
+                let mut remapped = Vec::with_capacity(node.input_nodes.len());
+                for &input_node in &node.input_nodes {
+                    remapped.push(*consumer_node_map.get(input_node as usize)?);
+                }
+                merged_node.input_nodes = remapped;
+            }
+        }
+        consumer_node_map.push(u32::try_from(merged_nodes.len()).ok()?);
+        merged_nodes.push(merged_node);
+    }
+
+    if merged_input_ids.len() > 8 || merged_nodes.len() > 16 {
+        return None;
+    }
+
+    let skipped_broadcasts = rewrite_scalar_broadcast_inputs(
+        plan,
+        consumers,
+        producers,
+        &[producer_index, consumer_index],
+        consumer_output_id,
+        &mut merged_input_ids,
+        &mut merged_nodes,
+    )
+    .unwrap_or_default();
+
+    if merged_input_ids
+        .iter()
+        .any(|&input_id| !fused_pair_input_available(analysis, input_id))
+    {
+        return None;
+    }
+
+    Some((
+        RuntimeFusedElementwiseRewrite {
+            input_ids: merged_input_ids,
+            nodes: merged_nodes,
+        },
+        producer_output_id,
+        skipped_broadcasts,
+    ))
+}
+
+fn can_merge_convert_arithmetic_pair(
+    producer_nodes: &[executable::FusedElementwiseNode],
+    consumer_nodes: &[executable::FusedElementwiseNode],
+) -> Option<bool> {
+    let producer = producer_nodes.last()?;
+    let consumer = consumer_nodes.last()?;
+    Some(
+        (producer.kind == executable::FusedElementwiseKind::Convert
+            && is_pair_arithmetic_root(consumer.kind))
+            || (is_pair_arithmetic_root(producer.kind)
+                && consumer.kind == executable::FusedElementwiseKind::Convert),
+    )
+    .filter(|&allowed| allowed)
+}
+
+fn is_pair_arithmetic_root(kind: executable::FusedElementwiseKind) -> bool {
+    matches!(
+        kind,
+        executable::FusedElementwiseKind::Add
+            | executable::FusedElementwiseKind::Subtract
+            | executable::FusedElementwiseKind::Multiply
+            | executable::FusedElementwiseKind::Divide
+    )
+}
+
+fn fused_pair_input_available(analysis: &ExecutableAnalysis, value_id: u32) -> bool {
+    !analysis.skipped_fused_outputs.contains(&value_id)
+        && !analysis.skipped_reshape_outputs.contains(&value_id)
+        && !analysis.skipped_slice_outputs.contains(&value_id)
+        && !analysis.skipped_broadcast_outputs.contains(&value_id)
+}
+
+fn detect_rotary_fusion(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    input_ids: &[u32],
+    output_id: u32,
+    dimension: u64,
+) -> Option<RotaryFusion> {
+    let output_desc = plan.values.get(output_id as usize)?;
+    if output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+        return None;
+    }
+    let output_shape = dims_i64_to_usize(&output_desc.dims).ok()?;
+    if output_shape.len() < 2
+        || dimension as usize != output_shape.len() - 1
+        || output_shape[output_shape.len() - 1] % 2 != 0
+    {
+        return None;
+    }
+    let half_dim = output_shape[output_shape.len() - 1] / 2;
+    let [first_id, second_id] = input_ids else {
+        return None;
+    };
+
+    let first = match_rotary_branch(
+        plan,
+        consumers,
+        producers,
+        *first_id,
+        executable::FusedElementwiseKind::Subtract,
+    )?;
+    let second = match_rotary_branch(
+        plan,
+        consumers,
+        producers,
+        *second_id,
+        executable::FusedElementwiseKind::Add,
+    )?;
+    if consumers.get(first_id)?.len() != 1 || consumers.get(second_id)?.len() != 1 {
+        return None;
+    }
+
+    let (input_id, cos_id, sin_id, first_slice, second_slice) =
+        match_rotary_terms(plan, consumers, producers, &first, &second, half_dim)?;
+    let input_desc = plan.values.get(input_id as usize)?;
+    if input_desc.element_type != output_desc.element_type
+        || dims_i64_to_usize(&input_desc.dims).ok()? != output_shape
+    {
+        return None;
+    }
+    let mut scale_shape = output_shape.clone();
+    let scale_rank = scale_shape.len();
+    scale_shape[scale_rank - 1] = half_dim;
+    for scale_id in [cos_id, sin_id] {
+        let desc = plan.values.get(scale_id as usize)?;
+        if desc.element_type != output_desc.element_type
+            || dims_i64_to_usize(&desc.dims).ok()? != scale_shape
+        {
+            return None;
+        }
+    }
+
+    Some(RotaryFusion {
+        input_id,
+        cos_id,
+        sin_id,
+        skipped_fused_outputs: vec![
+            first.lhs.multiply_id,
+            first.rhs.multiply_id,
+            second.lhs.multiply_id,
+            second.rhs.multiply_id,
+            first.output_id,
+            second.output_id,
+        ],
+        skipped_slice_outputs: vec![first_slice, second_slice],
+    })
+}
+
+fn match_rotary_terms(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    first: &RotaryBranch,
+    second: &RotaryBranch,
+    half_dim: usize,
+) -> Option<(u32, u32, u32, u32, u32)> {
+    let first_cos = term_for_half(first, 0)?;
+    let first_sin = term_for_half(first, 1)?;
+    let second_cos = term_for_half(second, 1)?;
+    let second_sin = term_for_half(second, 0)?;
+    if first_cos.scale_id != second_cos.scale_id || first_sin.scale_id != second_sin.scale_id {
+        return None;
+    }
+    let (input_id, first_slice) = rotary_slice_input(plan, first_cos.slice_id, 0, half_dim)?;
+    let (input_id_again, second_slice) = rotary_slice_input(plan, first_sin.slice_id, 1, half_dim)?;
+    let (input_id_third, _) = rotary_slice_input(plan, second_cos.slice_id, 1, half_dim)?;
+    let (input_id_fourth, _) = rotary_slice_input(plan, second_sin.slice_id, 0, half_dim)?;
+    if input_id != input_id_again || input_id != input_id_third || input_id != input_id_fourth {
+        return None;
+    }
+    for (slice_id, expected_muls) in [
+        (first_slice, [first_cos.multiply_id, second_sin.multiply_id]),
+        (
+            second_slice,
+            [first_sin.multiply_id, second_cos.multiply_id],
+        ),
+    ] {
+        let mut actual = consumers.get(&slice_id)?.clone();
+        let mut expected = expected_muls
+            .into_iter()
+            .map(|output_id| producers.get(&output_id).copied())
+            .collect::<Option<Vec<_>>>()?;
+        actual.sort_unstable();
+        expected.sort_unstable();
+        if actual != expected {
+            return None;
+        }
+    }
+    Some((
+        input_id,
+        first_cos.scale_id,
+        first_sin.scale_id,
+        first_slice,
+        second_slice,
+    ))
+}
+
+fn term_for_half(branch: &RotaryBranch, half: u32) -> Option<RotaryTerm> {
+    if branch.lhs.half == half {
+        Some(branch.lhs)
+    } else if branch.rhs.half == half {
+        Some(branch.rhs)
+    } else {
+        None
+    }
+}
+
+fn rotary_slice_input(
+    plan: &executable::Executable,
+    slice_id: u32,
+    half: u32,
+    half_dim: usize,
+) -> Option<(u32, u32)> {
+    let op = plan.ops.iter().find(|op| {
+        matches!(
+            op,
+            executable::Op::Slice {
+                output_id,
+                ..
+            } if *output_id == slice_id
+        )
+    })?;
+    let executable::Op::Slice {
+        input_id,
+        output_id,
+        start_indices,
+        limit_indices,
+        strides,
+    } = op
+    else {
+        return None;
+    };
+    if strides.iter().any(|&stride| stride != 1) {
+        return None;
+    }
+    let input_desc = plan.values.get(*input_id as usize)?;
+    let output_desc = plan.values.get(*output_id as usize)?;
+    if input_desc.element_type != output_desc.element_type {
+        return None;
+    }
+    let input_shape = dims_i64_to_usize(&input_desc.dims).ok()?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims).ok()?;
+    if input_shape.len() != output_shape.len()
+        || input_shape[input_shape.len() - 1] != half_dim * 2
+        || output_shape[output_shape.len() - 1] != half_dim
+        || input_shape[..input_shape.len() - 1] != output_shape[..output_shape.len() - 1]
+    {
+        return None;
+    }
+    let rank = input_shape.len();
+    if start_indices.len() != rank || limit_indices.len() != rank {
+        return None;
+    }
+    for dim in 0..rank - 1 {
+        if start_indices[dim] != 0 || usize::try_from(limit_indices[dim]).ok()? != input_shape[dim]
+        {
+            return None;
+        }
+    }
+    let expected_start = i64::try_from(half as usize * half_dim).ok()?;
+    let expected_limit = i64::try_from((half as usize + 1) * half_dim).ok()?;
+    if start_indices[rank - 1] != expected_start || limit_indices[rank - 1] != expected_limit {
+        return None;
+    }
+    Some((*input_id, *output_id))
+}
+
+fn match_rotary_branch(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    output_id: u32,
+    kind: executable::FusedElementwiseKind,
+) -> Option<RotaryBranch> {
+    let producer_index = *producers.get(&output_id)?;
+    let executable::Op::FusedElementwise {
+        input_ids, nodes, ..
+    } = &plan.ops[producer_index]
+    else {
+        return None;
+    };
+    let root = nodes.last()?;
+    if root.kind != kind || root.input_nodes.len() != 2 {
+        return None;
+    }
+    let lhs_id = fused_external_id(fused_arg(input_ids, nodes, root.input_nodes[0] as usize)?)?;
+    let rhs_id = fused_external_id(fused_arg(input_ids, nodes, root.input_nodes[1] as usize)?)?;
+    if consumers.get(&lhs_id)?.as_slice() != [producer_index]
+        || consumers.get(&rhs_id)?.as_slice() != [producer_index]
+    {
+        return None;
+    }
+    Some(RotaryBranch {
+        lhs: match_rotary_multiply(plan, producers, lhs_id)?,
+        rhs: match_rotary_multiply(plan, producers, rhs_id)?,
+        output_id,
+    })
+}
+
+fn match_rotary_multiply(
+    plan: &executable::Executable,
+    producers: &HashMap<u32, usize>,
+    output_id: u32,
+) -> Option<RotaryTerm> {
+    let producer_index = *producers.get(&output_id)?;
+    let executable::Op::FusedElementwise {
+        input_ids, nodes, ..
+    } = &plan.ops[producer_index]
+    else {
+        return None;
+    };
+    let root = nodes.last()?;
+    if root.kind != executable::FusedElementwiseKind::Multiply || root.input_nodes.len() != 2 {
+        return None;
+    }
+    let lhs_id = fused_external_id(fused_arg(input_ids, nodes, root.input_nodes[0] as usize)?)?;
+    let rhs_id = fused_external_id(fused_arg(input_ids, nodes, root.input_nodes[1] as usize)?)?;
+    rotary_term_from_operands(plan, lhs_id, rhs_id, output_id)
+        .or_else(|| rotary_term_from_operands(plan, rhs_id, lhs_id, output_id))
+}
+
+fn rotary_term_from_operands(
+    plan: &executable::Executable,
+    slice_id: u32,
+    scale_id: u32,
+    multiply_id: u32,
+) -> Option<RotaryTerm> {
+    let op = plan.ops.iter().find(|op| {
+        matches!(
+            op,
+            executable::Op::Slice {
+                output_id,
+                ..
+            } if *output_id == slice_id
+        )
+    })?;
+    let executable::Op::Slice { start_indices, .. } = op else {
+        return None;
+    };
+    let half = if *start_indices.last()? == 0 { 0 } else { 1 };
+    Some(RotaryTerm {
+        half,
+        scale_id,
+        slice_id,
+        multiply_id,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum FusedArg {
+    External(u32),
+    Constant(u32, PJRT_Buffer_Type),
+}
+
+fn detect_matmul_silu(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    packed_constants: &HashMap<u32, u32>,
+    matmul_output_id: u32,
+) -> Option<MatmulSiluFusion> {
+    let matmul_desc = plan.values.get(matmul_output_id as usize)?;
+    if matmul_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+        return None;
+    }
+    let consumer_indices = consumers.get(&matmul_output_id)?;
+    let (negate_index, negate_id) = find_unary_fused_consumer(
+        plan,
+        consumer_indices,
+        matmul_output_id,
+        executable::FusedElementwiseKind::Negate,
+    )?;
+    let exp_id = match_unary_fused_consumer(
+        plan,
+        consumers,
+        negate_id,
+        executable::FusedElementwiseKind::Exponential,
+    )?;
+    let add_id =
+        match_add_one_fused_consumer(plan, consumers, producers, packed_constants, exp_id)?;
+    let candidate = match_direct_silu_divide_fused_consumer(
+        plan,
+        consumers,
+        consumer_indices,
+        matmul_output_id,
+        add_id,
+    )
+    .or_else(|| {
+        let sigmoid_id =
+            match_one_div_fused_consumer(plan, consumers, producers, packed_constants, add_id)?;
+        let (multiply_index, multiply_id) = find_commutative_binary_fused_consumer(
+            plan,
+            consumer_indices,
+            matmul_output_id,
+            sigmoid_id,
+            executable::FusedElementwiseKind::Multiply,
+        )?;
+        if consumers.get(&sigmoid_id)?.as_slice() != [multiply_index] {
+            return None;
+        }
+        Some(MatmulSiluCandidate {
+            consumer_index: multiply_index,
+            final_output_id: multiply_id,
+            kind: SiluFusionKind::OneDivMultiply,
+            skipped_fused_outputs: vec![sigmoid_id, multiply_id],
+        })
+    })?;
+
+    if consumer_indices
+        .iter()
+        .any(|index| *index != negate_index && *index != candidate.consumer_index)
+    {
+        return None;
+    }
+
+    let final_desc = plan.values.get(candidate.final_output_id as usize)?;
+    if final_desc.element_type != matmul_desc.element_type || final_desc.dims != matmul_desc.dims {
+        return None;
+    }
+    let mut skipped_fused_outputs = vec![negate_id, exp_id, add_id];
+    skipped_fused_outputs.extend(candidate.skipped_fused_outputs);
+    Some(MatmulSiluFusion {
+        final_output_id: candidate.final_output_id,
+        kind: candidate.kind,
+        skipped_fused_outputs,
+    })
+}
+
+fn detect_reduce_post_rsqrt(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    packed_constants: &HashMap<u32, u32>,
+    reduce_output_id: u32,
+    reduce_op_index: usize,
+) -> Option<ReducePostRsqrtFusion> {
+    let reduce_output_desc = plan.values.get(reduce_output_id as usize)?;
+    if reduce_output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_F32 {
+        return None;
+    }
+
+    let mut skipped_fused_outputs = Vec::new();
+    let mut skipped_reshape_outputs = Vec::new();
+    let mut current = skip_reshape_consumers(
+        plan,
+        consumers,
+        reduce_output_id,
+        &mut skipped_reshape_outputs,
+    )?;
+
+    let (scaled_id, scale_bits) = match_scale_fused_consumer(
+        plan,
+        consumers,
+        producers,
+        packed_constants,
+        current,
+        reduce_op_index,
+    )?;
+    skipped_fused_outputs.push(scaled_id);
+    current = skip_reshape_consumers(plan, consumers, scaled_id, &mut skipped_reshape_outputs)?;
+
+    let (biased_id, bias_bits) =
+        match_add_scalar_fused_consumer(plan, consumers, producers, packed_constants, current)?;
+    skipped_fused_outputs.push(biased_id);
+    current = skip_reshape_consumers(plan, consumers, biased_id, &mut skipped_reshape_outputs)?;
+
+    let rsqrt_id = match_unary_fused_consumer(
+        plan,
+        consumers,
+        current,
+        executable::FusedElementwiseKind::Rsqrt,
+    )?;
+    skipped_fused_outputs.push(rsqrt_id);
+    let final_output_id =
+        skip_reshape_consumers(plan, consumers, rsqrt_id, &mut skipped_reshape_outputs)?;
+
+    Some(ReducePostRsqrtFusion {
+        final_output_id,
+        scale_bits,
+        bias_bits,
+        skipped_fused_outputs,
+        skipped_reshape_outputs,
+    })
+}
+
+fn skip_reshape_consumers(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    mut value_id: u32,
+    skipped_outputs: &mut Vec<u32>,
+) -> Option<u32> {
+    loop {
+        let Some(op_index) = single_consumer_index(consumers, value_id) else {
+            return Some(value_id);
+        };
+        let executable::Op::Reshape {
+            input_id,
+            output_id,
+        } = &plan.ops[op_index]
+        else {
+            return Some(value_id);
+        };
+        if *input_id != value_id || !same_tiled_layout(plan, value_id, *output_id)? {
+            return None;
+        }
+        skipped_outputs.push(*output_id);
+        value_id = *output_id;
+    }
+}
+
+fn single_consumer_index(consumers: &HashMap<u32, Vec<usize>>, value_id: u32) -> Option<usize> {
+    match consumers.get(&value_id)?.as_slice() {
+        [index] => Some(*index),
+        _ => None,
+    }
+}
+
+fn is_foldable_gqa_output_transpose(
+    plan: &executable::Executable,
+    matmul_output_id: u32,
+    transpose_output_id: u32,
+    permutation: &[i64],
+) -> bool {
+    if permutation != [2, 0, 1] {
+        return false;
+    }
+    let Some(matmul_output) = plan.values.get(matmul_output_id as usize) else {
+        return false;
+    };
+    let Some(transpose_output) = plan.values.get(transpose_output_id as usize) else {
+        return false;
+    };
+    if matmul_output.element_type != transpose_output.element_type {
+        return false;
+    }
+    let Ok(matmul_shape) = dims_i64_to_usize(&matmul_output.dims) else {
+        return false;
+    };
+    let Ok(transpose_shape) = dims_i64_to_usize(&transpose_output.dims) else {
+        return false;
+    };
+    matmul_shape.len() == 3
+        && matmul_shape[2] == 1
+        && transpose_shape == [1, matmul_shape[0], matmul_shape[1]]
+}
+
+fn same_tiled_layout(plan: &executable::Executable, lhs_id: u32, rhs_id: u32) -> Option<bool> {
+    let lhs = plan.values.get(lhs_id as usize)?;
+    let rhs = plan.values.get(rhs_id as usize)?;
+    if lhs.element_type != rhs.element_type {
+        return Some(false);
+    }
+    let lhs_shape = dims_i64_to_usize(&lhs.dims).ok()?;
+    let rhs_shape = dims_i64_to_usize(&rhs.dims).ok()?;
+    reshape_preserves_tiled_layout(&lhs_shape, &rhs_shape).ok()
+}
+
+fn match_scale_fused_consumer(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    packed_constants: &HashMap<u32, u32>,
+    input_id: u32,
+    reduce_op_index: usize,
+) -> Option<(u32, u32)> {
+    let op_index = single_consumer_index(consumers, input_id)?;
+    if op_index == reduce_op_index {
+        return None;
+    }
+    let executable::Op::FusedElementwise {
+        input_ids,
+        output_id,
+        nodes,
+    } = &plan.ops[op_index]
+    else {
+        return None;
+    };
+    let root = nodes.last()?;
+    if root.input_nodes.len() != 2 {
+        return None;
+    }
+    let lhs = fused_arg(input_ids, nodes, root.input_nodes[0] as usize)?;
+    let rhs = fused_arg(input_ids, nodes, root.input_nodes[1] as usize)?;
+    let lhs_external = fused_external_id(lhs);
+    let rhs_external = fused_external_id(rhs);
+    let lhs_constant = fused_constant_bits_with_producers(plan, producers, packed_constants, lhs);
+    let rhs_constant = fused_constant_bits_with_producers(plan, producers, packed_constants, rhs);
+    match root.kind {
+        executable::FusedElementwiseKind::Divide
+            if lhs_external == Some(input_id)
+                && rhs_constant
+                    .is_some_and(|(_, ty)| ty == PJRT_Buffer_Type::PJRT_Buffer_Type_F32) =>
+        {
+            let bits = rhs_constant?.0;
+            let divisor = f32::from_bits(bits);
+            divisor
+                .is_finite()
+                .then_some((*output_id, (1.0f32 / divisor).to_bits()))
+        }
+        executable::FusedElementwiseKind::Multiply
+            if lhs_external == Some(input_id)
+                && rhs_constant
+                    .is_some_and(|(_, ty)| ty == PJRT_Buffer_Type::PJRT_Buffer_Type_F32) =>
+        {
+            Some((*output_id, rhs_constant?.0))
+        }
+        executable::FusedElementwiseKind::Multiply
+            if rhs_external == Some(input_id)
+                && lhs_constant
+                    .is_some_and(|(_, ty)| ty == PJRT_Buffer_Type::PJRT_Buffer_Type_F32) =>
+        {
+            Some((*output_id, lhs_constant?.0))
+        }
+        _ => None,
+    }
+}
+
+fn match_add_scalar_fused_consumer(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    packed_constants: &HashMap<u32, u32>,
+    input_id: u32,
+) -> Option<(u32, u32)> {
+    let op_index = single_consumer_index(consumers, input_id)?;
+    let executable::Op::FusedElementwise {
+        input_ids,
+        output_id,
+        nodes,
+    } = &plan.ops[op_index]
+    else {
+        return None;
+    };
+    let root = nodes.last()?;
+    if root.kind != executable::FusedElementwiseKind::Add || root.input_nodes.len() != 2 {
+        return None;
+    }
+    let lhs = fused_arg(input_ids, nodes, root.input_nodes[0] as usize)?;
+    let rhs = fused_arg(input_ids, nodes, root.input_nodes[1] as usize)?;
+    let lhs_external = fused_external_id(lhs);
+    let rhs_external = fused_external_id(rhs);
+    let lhs_constant = fused_constant_bits_with_producers(plan, producers, packed_constants, lhs);
+    let rhs_constant = fused_constant_bits_with_producers(plan, producers, packed_constants, rhs);
+    if lhs_external == Some(input_id)
+        && rhs_constant.is_some_and(|(_, ty)| ty == PJRT_Buffer_Type::PJRT_Buffer_Type_F32)
+    {
+        return Some((*output_id, rhs_constant?.0));
+    }
+    if rhs_external == Some(input_id)
+        && lhs_constant.is_some_and(|(_, ty)| ty == PJRT_Buffer_Type::PJRT_Buffer_Type_F32)
+    {
+        return Some((*output_id, lhs_constant?.0));
+    }
+    None
+}
+
+fn match_unary_fused_consumer(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    input_id: u32,
+    kind: executable::FusedElementwiseKind,
+) -> Option<u32> {
+    let op_index = single_consumer_index(consumers, input_id)?;
+    let executable::Op::FusedElementwise {
+        input_ids,
+        output_id,
+        nodes,
+    } = &plan.ops[op_index]
+    else {
+        return None;
+    };
+    let root = nodes.last()?;
+    if root.kind != kind || root.input_nodes.len() != 1 {
+        return None;
+    }
+    match fused_arg(input_ids, nodes, root.input_nodes[0] as usize)? {
+        FusedArg::External(external_id) if external_id == input_id => Some(*output_id),
+        _ => None,
+    }
+}
+
+fn match_direct_silu_divide_fused_consumer(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    consumer_indices: &[usize],
+    numerator_id: u32,
+    denominator_id: u32,
+) -> Option<MatmulSiluCandidate> {
+    let (divide_index, divide_id) = find_binary_fused_consumer(
+        plan,
+        consumer_indices,
+        numerator_id,
+        denominator_id,
+        executable::FusedElementwiseKind::Divide,
+    )?;
+    if consumers.get(&denominator_id)?.as_slice() != [divide_index] {
+        return None;
+    }
+    Some(MatmulSiluCandidate {
+        consumer_index: divide_index,
+        final_output_id: divide_id,
+        kind: SiluFusionKind::DirectDivide,
+        skipped_fused_outputs: vec![divide_id],
+    })
+}
+
+fn find_unary_fused_consumer(
+    plan: &executable::Executable,
+    consumer_indices: &[usize],
+    input_id: u32,
+    kind: executable::FusedElementwiseKind,
+) -> Option<(usize, u32)> {
+    consumer_indices.iter().find_map(|&op_index| {
+        let executable::Op::FusedElementwise {
+            input_ids,
+            output_id,
+            nodes,
+        } = &plan.ops[op_index]
+        else {
+            return None;
+        };
+        let root = nodes.last()?;
+        if root.kind != kind || root.input_nodes.len() != 1 {
+            return None;
+        }
+        match fused_arg(input_ids, nodes, root.input_nodes[0] as usize)? {
+            FusedArg::External(external_id) if external_id == input_id => {
+                Some((op_index, *output_id))
+            }
+            _ => None,
+        }
+    })
+}
+
+fn find_binary_fused_consumer(
+    plan: &executable::Executable,
+    consumer_indices: &[usize],
+    lhs_id: u32,
+    rhs_id: u32,
+    kind: executable::FusedElementwiseKind,
+) -> Option<(usize, u32)> {
+    consumer_indices.iter().find_map(|&op_index| {
+        let executable::Op::FusedElementwise {
+            input_ids,
+            output_id,
+            nodes,
+        } = &plan.ops[op_index]
+        else {
+            return None;
+        };
+        let root = nodes.last()?;
+        if root.kind != kind || root.input_nodes.len() != 2 {
+            return None;
+        }
+        let lhs = fused_external_id(fused_arg(input_ids, nodes, root.input_nodes[0] as usize)?);
+        let rhs = fused_external_id(fused_arg(input_ids, nodes, root.input_nodes[1] as usize)?);
+        (lhs == Some(lhs_id) && rhs == Some(rhs_id)).then_some((op_index, *output_id))
+    })
+}
+
+fn find_commutative_binary_fused_consumer(
+    plan: &executable::Executable,
+    consumer_indices: &[usize],
+    lhs_id: u32,
+    rhs_id: u32,
+    kind: executable::FusedElementwiseKind,
+) -> Option<(usize, u32)> {
+    find_binary_fused_consumer(plan, consumer_indices, lhs_id, rhs_id, kind)
+        .or_else(|| find_binary_fused_consumer(plan, consumer_indices, rhs_id, lhs_id, kind))
+}
+
+fn match_add_one_fused_consumer(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    packed_constants: &HashMap<u32, u32>,
+    input_id: u32,
+) -> Option<u32> {
+    let op_index = single_consumer_index(consumers, input_id)?;
+    let executable::Op::FusedElementwise {
+        input_ids,
+        output_id,
+        nodes,
+    } = &plan.ops[op_index]
+    else {
+        return None;
+    };
+    let root = nodes.last()?;
+    if root.kind != executable::FusedElementwiseKind::Add || root.input_nodes.len() != 2 {
+        return None;
+    }
+    let lhs = fused_arg(input_ids, nodes, root.input_nodes[0] as usize)?;
+    let rhs = fused_arg(input_ids, nodes, root.input_nodes[1] as usize)?;
+    let lhs_external = fused_external_id(lhs);
+    let rhs_external = fused_external_id(rhs);
+    let lhs_constant = fused_constant_bits_with_producers(plan, producers, packed_constants, lhs);
+    let rhs_constant = fused_constant_bits_with_producers(plan, producers, packed_constants, rhs);
+    if lhs_external == Some(input_id) && rhs_constant.is_some_and(is_one_constant) {
+        return Some(*output_id);
+    }
+    if rhs_external == Some(input_id) && lhs_constant.is_some_and(is_one_constant) {
+        return Some(*output_id);
+    }
+    None
+}
+
+fn match_one_div_fused_consumer(
+    plan: &executable::Executable,
+    consumers: &HashMap<u32, Vec<usize>>,
+    producers: &HashMap<u32, usize>,
+    packed_constants: &HashMap<u32, u32>,
+    input_id: u32,
+) -> Option<u32> {
+    let op_index = single_consumer_index(consumers, input_id)?;
+    let executable::Op::FusedElementwise {
+        input_ids,
+        output_id,
+        nodes,
+    } = &plan.ops[op_index]
+    else {
+        return None;
+    };
+    let root = nodes.last()?;
+    if root.kind != executable::FusedElementwiseKind::Divide || root.input_nodes.len() != 2 {
+        return None;
+    }
+    let lhs = fused_arg(input_ids, nodes, root.input_nodes[0] as usize)?;
+    let rhs = fused_arg(input_ids, nodes, root.input_nodes[1] as usize)?;
+    let lhs_constant = fused_constant_bits_with_producers(plan, producers, packed_constants, lhs);
+    let rhs_external = fused_external_id(rhs);
+    if lhs_constant.is_some_and(is_one_constant) && rhs_external == Some(input_id) {
+        return Some(*output_id);
+    }
+    None
+}
+
+fn is_one_constant((bits, element_type): (u32, PJRT_Buffer_Type)) -> bool {
+    match element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => bits & 0xffff == 0x3f80,
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 => bits == 1.0f32.to_bits(),
+        _ => false,
+    }
+}
+
+fn fused_arg(
+    input_ids: &[u32],
+    nodes: &[executable::FusedElementwiseNode],
+    node_index: usize,
+) -> Option<FusedArg> {
+    let node = nodes.get(node_index)?;
+    match node.kind {
+        executable::FusedElementwiseKind::Input => input_ids
+            .get(node.input_index as usize)
+            .copied()
+            .map(FusedArg::External),
+        executable::FusedElementwiseKind::Constant => {
+            Some(FusedArg::Constant(node.packed_value, node.element_type))
+        }
+        _ => None,
+    }
+}
+
+fn fused_external_id(arg: FusedArg) -> Option<u32> {
+    match arg {
+        FusedArg::External(id) => Some(id),
+        FusedArg::Constant(_, _) => None,
+    }
+}
+
+fn fused_constant_bits(
+    plan: &executable::Executable,
+    packed_constants: &HashMap<u32, u32>,
+    arg: FusedArg,
+) -> Option<(u32, PJRT_Buffer_Type)> {
+    match arg {
+        FusedArg::Constant(bits, element_type) => Some((bits, element_type)),
+        FusedArg::External(id) => {
+            let desc = plan.values.get(id as usize)?;
+            packed_constants
+                .get(&id)
+                .copied()
+                .map(|bits| (bits, desc.element_type))
+        }
+    }
+}
+
+fn fused_constant_bits_with_producers(
+    plan: &executable::Executable,
+    producers: &HashMap<u32, usize>,
+    packed_constants: &HashMap<u32, u32>,
+    arg: FusedArg,
+) -> Option<(u32, PJRT_Buffer_Type)> {
+    match arg {
+        FusedArg::Constant(bits, element_type) => Some((bits, element_type)),
+        FusedArg::External(id) => constant_value_bits(plan, producers, packed_constants, id),
+    }
+}
+
+fn constant_value_bits(
+    plan: &executable::Executable,
+    producers: &HashMap<u32, usize>,
+    packed_constants: &HashMap<u32, u32>,
+    value_id: u32,
+) -> Option<(u32, PJRT_Buffer_Type)> {
+    if let Some(bits) = packed_constants.get(&value_id).copied() {
+        let desc = plan.values.get(value_id as usize)?;
+        return Some((bits, desc.element_type));
+    }
+    let producer = producers
+        .get(&value_id)
+        .and_then(|&index| plan.ops.get(index))?;
+    match producer {
+        executable::Op::BroadcastInDim { input_id, .. }
+        | executable::Op::Reshape { input_id, .. } => {
+            constant_value_bits(plan, producers, packed_constants, *input_id)
+        }
+        _ => None,
+    }
 }
 
 fn op_output_ids(op: &executable::Op) -> Vec<u32> {
@@ -2002,7 +3418,11 @@ fn op_input_ids(op: &executable::Op) -> Vec<u32> {
         executable::Op::Concatenate { input_ids, .. }
         | executable::Op::CustomCall { input_ids, .. }
         | executable::Op::FusedElementwise { input_ids, .. } => input_ids.clone(),
-        executable::Op::Reduce { input_ids, init_value_ids, .. }
+        executable::Op::Reduce {
+            input_ids,
+            init_value_ids,
+            ..
+        }
         | executable::Op::ReduceWindow {
             input_ids,
             init_value_ids,
@@ -2021,17 +3441,47 @@ fn op_input_ids(op: &executable::Op) -> Vec<u32> {
     }
 }
 
+struct SquareFusedInput {
+    input_id: u32,
+    skipped_fused_outputs: Vec<u32>,
+}
+
 fn fused_square_input(
+    plan: &executable::Executable,
+    producers: &HashMap<u32, usize>,
+    consumers: &HashMap<u32, Vec<usize>>,
     input_ids: &[u32],
     nodes: &[executable::FusedElementwiseNode],
-) -> Option<u32> {
+) -> Option<SquareFusedInput> {
     let root = nodes.last()?;
     if root.kind != executable::FusedElementwiseKind::Multiply || root.input_nodes.len() != 2 {
         return None;
     }
-    let lhs = fused_external_input(input_ids, nodes, root.input_nodes[0] as usize)?;
-    let rhs = fused_external_input(input_ids, nodes, root.input_nodes[1] as usize)?;
-    (lhs == rhs).then_some(lhs)
+    let lhs_node = root.input_nodes[0] as usize;
+    let rhs_node = root.input_nodes[1] as usize;
+    if let (Some(lhs), Some(rhs)) = (
+        fused_external_input(input_ids, nodes, lhs_node),
+        fused_external_input(input_ids, nodes, rhs_node),
+    ) {
+        if lhs != rhs {
+            return None;
+        }
+        return converted_square_input(plan, producers, consumers, lhs).or_else(|| {
+            Some(SquareFusedInput {
+                input_id: lhs,
+                skipped_fused_outputs: Vec::new(),
+            })
+        });
+    }
+    let lhs = fused_convert_external_input(input_ids, nodes, lhs_node)?;
+    let rhs = fused_convert_external_input(input_ids, nodes, rhs_node)?;
+    if lhs != rhs || !is_bf16_to_f32_value(plan, lhs, root.element_type)? {
+        return None;
+    }
+    Some(SquareFusedInput {
+        input_id: lhs,
+        skipped_fused_outputs: Vec::new(),
+    })
 }
 
 fn fused_external_input(
@@ -2044,6 +3494,68 @@ fn fused_external_input(
         return None;
     }
     input_ids.get(node.input_index as usize).copied()
+}
+
+fn fused_convert_external_input(
+    input_ids: &[u32],
+    nodes: &[executable::FusedElementwiseNode],
+    node_index: usize,
+) -> Option<u32> {
+    let node = nodes.get(node_index)?;
+    if node.kind != executable::FusedElementwiseKind::Convert || node.input_nodes.len() != 1 {
+        return None;
+    }
+    let input_id = fused_external_input(input_ids, nodes, node.input_nodes[0] as usize)?;
+    (node.element_type == PJRT_Buffer_Type::PJRT_Buffer_Type_F32).then_some(input_id)
+}
+
+fn converted_square_input(
+    plan: &executable::Executable,
+    producers: &HashMap<u32, usize>,
+    consumers: &HashMap<u32, Vec<usize>>,
+    value_id: u32,
+) -> Option<SquareFusedInput> {
+    if consumers.get(&value_id)?.len() != 1 {
+        return None;
+    }
+    let op = producers
+        .get(&value_id)
+        .and_then(|&index| plan.ops.get(index))?;
+    let executable::Op::FusedElementwise {
+        input_ids,
+        output_id,
+        nodes,
+    } = op
+    else {
+        return None;
+    };
+    if *output_id != value_id {
+        return None;
+    }
+    let root = nodes.last()?;
+    if root.kind != executable::FusedElementwiseKind::Convert || root.input_nodes.len() != 1 {
+        return None;
+    }
+    let input_id = fused_external_input(input_ids, nodes, root.input_nodes[0] as usize)?;
+    if !is_bf16_to_f32_value(plan, input_id, root.element_type)? {
+        return None;
+    }
+    Some(SquareFusedInput {
+        input_id,
+        skipped_fused_outputs: vec![value_id],
+    })
+}
+
+fn is_bf16_to_f32_value(
+    plan: &executable::Executable,
+    input_id: u32,
+    output_type: PJRT_Buffer_Type,
+) -> Option<bool> {
+    let input = plan.values.get(input_id as usize)?;
+    Some(
+        input.element_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+            && output_type == PJRT_Buffer_Type::PJRT_Buffer_Type_F32,
+    )
 }
 
 fn device_dram_view_for_value<'a>(
@@ -2324,6 +3836,13 @@ fn execute_reshape(
     input_id: u32,
     output_id: u32,
 ) -> Result<(), *mut PJRT_Error> {
+    if context
+        .analysis
+        .skipped_reshape_outputs
+        .contains(&output_id)
+    {
+        return Ok(());
+    }
     let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
         invalid_argument("TT executable reshape operand value id is out of bounds")
     })?;
@@ -2363,11 +3882,7 @@ fn execute_reshape(
                 );
             }
         }
-        if can_leave_reshape_unmaterialized_cached(
-            plan,
-            output_id,
-            &context.lazy_reshape_cache,
-        )? {
+        if can_leave_reshape_unmaterialized_cached(plan, output_id, &context.lazy_reshape_cache)? {
             return Ok(());
         }
         if plan.output_ids.contains(&output_id) {
@@ -2482,6 +3997,9 @@ fn execute_slice(
     limit_indices: &[i64],
     strides: &[i64],
 ) -> Result<(), *mut PJRT_Error> {
+    if context.analysis.skipped_slice_outputs.contains(&output_id) {
+        return Ok(());
+    }
     let input_desc = plan
         .values
         .get(input_id as usize)
@@ -2528,6 +4046,102 @@ fn execute_slice(
     )
 }
 
+fn execute_silu_fusion(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    output_id: u32,
+    fusion: RuntimeSiluFusion,
+) -> Result<(), *mut PJRT_Error> {
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable silu fusion output id {output_id} is out of bounds"
+        ))
+    })?;
+    let input_desc = plan
+        .values
+        .get(fusion.input_id as usize)
+        .ok_or_else(|| invalid_argument("TT executable silu fusion input id is out of bounds"))?;
+    if input_desc.element_type != output_desc.element_type || input_desc.dims != output_desc.dims {
+        return Err(invalid_argument(
+            "TT executable silu fusion requires matching input/output shape and type",
+        ));
+    }
+    let one_bits = match output_desc.element_type {
+        PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 => 0x3f80,
+        PJRT_Buffer_Type::PJRT_Buffer_Type_F32 => 1.0f32.to_bits(),
+        other => {
+            return Err(unimplemented(format!(
+                "TT executable silu fusion does not support {other:?}"
+            )))
+        }
+    };
+    let input = device_buffer_for_value(values, fusion.input_id, "silu.input")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable silu fusion input buffer has no device allocation",
+        ));
+    };
+    let element_type = output_desc.element_type;
+    let node = |kind, input_nodes, packed_value| executable::FusedElementwiseNode {
+        kind,
+        input_nodes,
+        input_index: 0,
+        packed_value,
+        element_type,
+        single_tile_broadcast: false,
+    };
+    let mut nodes = vec![
+        node(executable::FusedElementwiseKind::Input, Vec::new(), 0),
+        node(executable::FusedElementwiseKind::Negate, vec![0], 0),
+        node(executable::FusedElementwiseKind::Exponential, vec![1], 0),
+        node(
+            executable::FusedElementwiseKind::Constant,
+            Vec::new(),
+            one_bits,
+        ),
+        node(executable::FusedElementwiseKind::Add, vec![3, 2], 0),
+    ];
+    match fusion.kind {
+        SiluFusionKind::DirectDivide => nodes.push(node(
+            executable::FusedElementwiseKind::Divide,
+            vec![0, 4],
+            0,
+        )),
+        SiluFusionKind::OneDivMultiply => {
+            nodes.push(node(
+                executable::FusedElementwiseKind::Constant,
+                Vec::new(),
+                one_bits,
+            ));
+            nodes.push(node(
+                executable::FusedElementwiseKind::Divide,
+                vec![5, 4],
+                0,
+            ));
+            nodes.push(node(
+                executable::FusedElementwiseKind::Multiply,
+                vec![0, 6],
+                0,
+            ));
+        }
+    }
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let output_dram =
+        kernels::fused_eltwise::eltwise(device, &[input_dram], &nodes, &output_shape, "pjrt_silu")
+            .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "silu",
+    )
+}
+
 fn execute_fused_elementwise(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2537,6 +4151,15 @@ fn execute_fused_elementwise(
     output_id: u32,
     nodes: &[executable::FusedElementwiseNode],
 ) -> Result<(), *mut PJRT_Error> {
+    if let Some(&fusion) = context.analysis.silu_fusions.get(&output_id) {
+        return execute_silu_fusion(values, plan, device, context, output_id, fusion);
+    }
+    let (input_ids, nodes) =
+        if let Some(rewrite) = context.analysis.fused_elementwise_rewrites.get(&output_id) {
+            (rewrite.input_ids.as_slice(), rewrite.nodes.as_slice())
+        } else {
+            (input_ids, nodes)
+        };
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
             "TT executable fused_elementwise output id {output_id} is out of bounds"
@@ -2774,6 +4397,11 @@ fn execute_reduce(
         && reducer == executable::ReduceReducer::Add
         && dimensions.len() == 1;
     let input_id = pre_square_input.unwrap_or(*input_id);
+    let post_rsqrt = context
+        .analysis
+        .reduce_post_rsqrt_outputs
+        .get(&output_id)
+        .copied();
 
     let input = device_buffer_for_value(values, input_id, "reduce.input")?;
     let Some(input_dram) = input.dram_buffer.as_ref() else {
@@ -2790,12 +4418,17 @@ fn execute_reduce(
             "TT executable reduce output id {output_id} is out of bounds"
         ))
     })?;
-    if output_desc.element_type != input_desc.element_type {
+    let input_dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    let fused_bf16_square_to_f32 = pre_square
+        && reducer == executable::ReduceReducer::Add
+        && input_dtype == DType::Float16B
+        && output_dtype == DType::Float32;
+    if output_desc.element_type != input_desc.element_type && !fused_bf16_square_to_f32 {
         return Err(invalid_argument(
             "TT executable reduce input and output element types must match",
         ));
     }
-    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
     let (kernel_input_shape, kernel_output_shape, kernel_dimensions) =
@@ -2827,7 +4460,7 @@ fn execute_reduce(
         None
     };
     if bitwise_identity.is_none()
-        && !reduce_init_is_supported(context, *init_value_id, reducer, input_desc.element_type)
+        && !reduce_init_is_supported(context, *init_value_id, reducer, output_desc.element_type)
     {
         return Err(unimplemented(
             "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
@@ -2844,7 +4477,9 @@ fn execute_reduce(
                 dram::tiled_allocation_shape(&input_shape).map_err(io_error)?;
             let output_allocation_shape =
                 dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
-            if input_allocation_shape == output_allocation_shape {
+            if input_desc.element_type == output_desc.element_type
+                && input_allocation_shape == output_allocation_shape
+            {
                 return store_output_buffer(
                     values,
                     plan,
@@ -2857,23 +4492,72 @@ fn execute_reduce(
             }
         }
     }
+    if !pre_square
+        && post_rsqrt.is_none()
+        && reducer == executable::ReduceReducer::Max
+        && dimensions == [1]
+        && input_shape.len() == 2
+        && input_shape[0] == 1
+        && output_shape == [1]
+        && output_dtype == input_dtype
+        && matches!(input_dtype, DType::Float16B | DType::Float32)
+    {
+        let (values_dram, _indices_dram) =
+            kernels::topk::top_k(device, input_dram, &input_shape, 1, "pjrt_reduce_max_top1")
+                .map_err(io_error)?;
+        return store_output_buffer(
+            values,
+            plan,
+            output_id,
+            output_desc.dims.clone(),
+            values_dram,
+            context,
+            "reduce.max_top1",
+        );
+    }
     let reduce_plan = kernels::reduce::ReducePlan::new(
-        dtype,
+        input_dtype,
+        output_dtype,
         &kernel_input_shape,
         &kernel_output_shape,
         &kernel_dimensions,
         reducer,
         bitwise_identity,
         pre_square,
+        post_rsqrt.map(|post| kernels::reduce::ReducePostRsqrt {
+            scale_bits: post.scale_bits,
+            bias_bits: post.bias_bits,
+        }),
     )
     .map_err(io_error)?;
-    let output_dram = kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
+    let mut output_dram = kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
         .map_err(io_error)?;
+    let (store_output_id, store_dims) = if let Some(post) = post_rsqrt {
+        let final_desc = plan
+            .values
+            .get(post.final_output_id as usize)
+            .ok_or_else(|| {
+                invalid_argument("TT executable fused reduce rsqrt output id is out of bounds")
+            })?;
+        let final_shape = dims_i64_to_usize(&final_desc.dims)?;
+        let final_allocation_shape =
+            dram::tiled_allocation_shape(&final_shape).map_err(io_error)?;
+        let final_tiles = dram::tiled_shape_tile_count(&final_shape).map_err(io_error)?;
+        if final_tiles != output_dram.num_tiles {
+            return Err(invalid_argument(
+                "TT executable fused reduce rsqrt output shape changes tile count",
+            ));
+        }
+        output_dram.shape = final_allocation_shape;
+        (post.final_output_id, final_desc.dims.clone())
+    } else {
+        (output_id, output_desc.dims.clone())
+    };
     store_output_buffer(
         values,
         plan,
-        output_id,
-        output_desc.dims.clone(),
+        store_output_id,
+        store_dims,
         output_dram,
         context,
         "reduce",
@@ -3147,46 +4831,44 @@ fn execute_matmul(
         .then(|| context.analysis.matmul_top1_epilogues.get(&output_id))
         .flatten();
     if top_k_epilogue.is_some() || runtime_top1.is_some() {
-        let (matmul_output_id, values_id, indices_id, k) =
-            if let Some(epilogue) = top_k_epilogue {
-                (
-                    epilogue.matmul_output_id,
-                    output_id,
-                    epilogue.indices_id,
-                    epilogue.k,
-                )
-            } else {
-                let epilogue = runtime_top1.expect("runtime top1 checked above");
-                (output_id, epilogue.values_id, epilogue.indices_id, epilogue.k)
-            };
+        let (matmul_output_id, values_id, indices_id, k) = if let Some(epilogue) = top_k_epilogue {
+            (
+                epilogue.matmul_output_id,
+                output_id,
+                epilogue.indices_id,
+                epilogue.k,
+            )
+        } else {
+            let epilogue = runtime_top1.expect("runtime top1 checked above");
+            (
+                output_id,
+                epilogue.values_id,
+                epilogue.indices_id,
+                epilogue.k,
+            )
+        };
         if k != 1 {
             return Err(invalid_argument(
                 "TT executable matmul top_k epilogue currently requires k=1",
             ));
         }
-        let matmul_desc = plan
-            .values
-            .get(matmul_output_id as usize)
-            .ok_or_else(|| {
-                invalid_argument(format!(
-                    "TT executable matmul top_k epilogue matmul output id {} is out of bounds",
-                    matmul_output_id
-                ))
-            })?;
+        let matmul_desc = plan.values.get(matmul_output_id as usize).ok_or_else(|| {
+            invalid_argument(format!(
+                "TT executable matmul top_k epilogue matmul output id {} is out of bounds",
+                matmul_output_id
+            ))
+        })?;
         let values_desc = plan.values.get(values_id as usize).ok_or_else(|| {
             invalid_argument(format!(
                 "TT executable matmul top_k epilogue values id {values_id} is out of bounds"
             ))
         })?;
-        let indices_desc = plan
-            .values
-            .get(indices_id as usize)
-            .ok_or_else(|| {
-                invalid_argument(format!(
-                    "TT executable matmul top_k epilogue indices id {} is out of bounds",
-                    indices_id
-                ))
-            })?;
+        let indices_desc = plan.values.get(indices_id as usize).ok_or_else(|| {
+            invalid_argument(format!(
+                "TT executable matmul top_k epilogue indices id {} is out of bounds",
+                indices_id
+            ))
+        })?;
         if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
             || rhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
             || matmul_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
@@ -3221,6 +4903,7 @@ fn execute_matmul(
             rhs_physical_shape,
             &rhs_shape,
             &matmul_shape,
+            None,
             &dimension_numbers.lhs_batching_dimensions,
             &dimension_numbers.rhs_batching_dimensions,
             &dimension_numbers.lhs_contracting_dimensions,
@@ -3266,8 +4949,35 @@ fn execute_matmul(
             "TT executable matmul output id {output_id} is out of bounds"
         ))
     })?;
-    let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    let runtime_transpose = context
+        .analysis
+        .matmul_transpose_outputs
+        .get(&output_id)
+        .copied();
+    let runtime_silu = context
+        .analysis
+        .matmul_silu_epilogues
+        .get(&output_id)
+        .copied();
+    let final_output_id = runtime_silu.or(runtime_transpose).unwrap_or(output_id);
+    let final_output_desc = plan.values.get(final_output_id as usize).ok_or_else(|| {
+        invalid_argument("TT executable matmul fused silu output id is out of bounds")
+    })?;
+    if runtime_silu.is_some()
+        && (final_output_desc.element_type != output_desc.element_type
+            || final_output_desc.dims != output_desc.dims)
+    {
+        return Err(invalid_argument(
+            "TT executable matmul fused silu output shape/type mismatch",
+        ));
+    }
+    let output_dtype = pjrt_buffer_type_to_dtype(final_output_desc.element_type)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let output_physical_shape = if runtime_transpose.is_some() {
+        Some(dims_i64_to_usize(&final_output_desc.dims)?)
+    } else {
+        None
+    };
     let bf16_matmul = lhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
         && rhs.buffer_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
         && matches!(output_dtype, DType::Float16B | DType::Float32);
@@ -3280,7 +4990,12 @@ fn execute_matmul(
             lhs.buffer_type, rhs.buffer_type
         )));
     }
-    let output_dram = kernels::matmul::matmul_dot_general_with_views(
+    let epilogue = if runtime_silu.is_some() {
+        kernels::matmul::MatmulEpilogue::StoreSilu { output_dtype }
+    } else {
+        kernels::matmul::MatmulEpilogue::Store { output_dtype }
+    };
+    let matmul_output = kernels::matmul::matmul_dot_general_with_views(
         device,
         lhs.dram_buffer,
         rhs.dram_buffer,
@@ -3291,6 +5006,7 @@ fn execute_matmul(
         rhs_physical_shape,
         &rhs_shape,
         &output_shape,
+        output_physical_shape.as_deref(),
         &dimension_numbers.lhs_batching_dimensions,
         &dimension_numbers.rhs_batching_dimensions,
         &dimension_numbers.lhs_contracting_dimensions,
@@ -3299,11 +5015,42 @@ fn execute_matmul(
         rhs_grouped_head_view.as_ref(),
         lhs_gather_view_ref,
         rhs_gather_view_ref,
-        kernels::matmul::MatmulEpilogue::Store { output_dtype },
+        epilogue,
         "pjrt_matmul",
-    )
-    .map_err(io_error)?;
-    let output_dram = match output_dram {
+    );
+    let (matmul_output, store_output_id, store_output_desc) =
+        match (matmul_output, runtime_transpose) {
+            (Ok(output), _) => (output, final_output_id, final_output_desc),
+            (Err(_), Some(_)) => {
+                let fallback_output = kernels::matmul::matmul_dot_general_with_views(
+                    device,
+                    lhs.dram_buffer,
+                    rhs.dram_buffer,
+                    lhs_gather_indices,
+                    rhs_gather_indices,
+                    lhs_physical_shape,
+                    &lhs_shape,
+                    rhs_physical_shape,
+                    &rhs_shape,
+                    &output_shape,
+                    None,
+                    &dimension_numbers.lhs_batching_dimensions,
+                    &dimension_numbers.rhs_batching_dimensions,
+                    &dimension_numbers.lhs_contracting_dimensions,
+                    &dimension_numbers.rhs_contracting_dimensions,
+                    lhs_grouped_head_view.as_ref(),
+                    rhs_grouped_head_view.as_ref(),
+                    lhs_gather_view_ref,
+                    rhs_gather_view_ref,
+                    epilogue,
+                    "pjrt_matmul",
+                )
+                .map_err(io_error)?;
+                (fallback_output, output_id, output_desc)
+            }
+            (Err(err), None) => return Err(io_error(err)),
+        };
+    let output_dram = match matmul_output {
         kernels::matmul::MatmulOutput::Store(output) => output,
         kernels::matmul::MatmulOutput::Top1 { .. } => {
             return Err(invalid_argument(
@@ -3314,8 +5061,8 @@ fn execute_matmul(
     store_output_buffer(
         values,
         plan,
-        output_id,
-        output_desc.dims.clone(),
+        store_output_id,
+        store_output_desc.dims.clone(),
         output_dram,
         context,
         "matmul",
@@ -3452,7 +5199,11 @@ fn reshape_is_same_dtype_same_volume(
     input_desc.element_type == output_desc.element_type && input_elements == output_elements
 }
 
-fn reshape_keeps_innermost_dim(plan: &executable::Executable, input_id: u32, output_id: u32) -> bool {
+fn reshape_keeps_innermost_dim(
+    plan: &executable::Executable,
+    input_id: u32,
+    output_id: u32,
+) -> bool {
     let Some(input_desc) = plan.values.get(input_id as usize) else {
         return false;
     };
@@ -3660,10 +5411,22 @@ fn execute_select(
             "TT executable select predicate buffer has no device allocation",
         ));
     };
-    let true_input =
-        select_value_input(values, plan, context, true_id, value_dtype, "select.on_true")?;
-    let false_input =
-        select_value_input(values, plan, context, false_id, value_dtype, "select.on_false")?;
+    let true_input = select_value_input(
+        values,
+        plan,
+        context,
+        true_id,
+        value_dtype,
+        "select.on_true",
+    )?;
+    let false_input = select_value_input(
+        values,
+        plan,
+        context,
+        false_id,
+        value_dtype,
+        "select.on_false",
+    )?;
     let expected_dims = true_desc.dims.clone();
     let shape = dims_i64_to_usize(&expected_dims)?;
     let output_dram = kernels::select::select(
@@ -3696,6 +5459,13 @@ fn execute_broadcast_in_dim(
     output_id: u32,
     broadcast_dimensions: &[i64],
 ) -> Result<(), *mut PJRT_Error> {
+    if context
+        .analysis
+        .skipped_broadcast_outputs
+        .contains(&output_id)
+    {
+        return Ok(());
+    }
     let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
         invalid_argument("TT executable broadcast operand value id is out of bounds")
     })?;
@@ -3743,6 +5513,58 @@ fn execute_broadcast_in_dim(
     )
 }
 
+fn execute_rotary(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    output_id: u32,
+    fusion: &RuntimeRotaryFusion,
+) -> Result<(), *mut PJRT_Error> {
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable rotary output id {output_id} is out of bounds"
+        ))
+    })?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let input = device_buffer_for_value(values, fusion.input_id, "rotary.input")?;
+    let cos = device_buffer_for_value(values, fusion.cos_id, "rotary.cos")?;
+    let sin = device_buffer_for_value(values, fusion.sin_id, "rotary.sin")?;
+    let Some(input_dram) = input.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable rotary input buffer has no device allocation",
+        ));
+    };
+    let Some(cos_dram) = cos.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable rotary cos buffer has no device allocation",
+        ));
+    };
+    let Some(sin_dram) = sin.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable rotary sin buffer has no device allocation",
+        ));
+    };
+    let output_dram = kernels::rotary::rotary(
+        device,
+        input_dram,
+        cos_dram,
+        sin_dram,
+        &output_shape,
+        "pjrt_rotary",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "rotary",
+    )
+}
+
 fn execute_concatenate(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -3771,6 +5593,9 @@ fn execute_concatenate(
             "TT executable concatenate dimension {dimension} is out of bounds for shape {:?}",
             output_desc.dims
         )));
+    }
+    if let Some(fusion) = context.analysis.rotary_fusions.get(&output_id) {
+        return execute_rotary(values, plan, device, context, output_id, fusion);
     }
 
     let dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
@@ -4114,6 +5939,37 @@ fn execute_scatter(
         ));
     };
     let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
+    if context
+        .analysis
+        .inplace_scatter_outputs
+        .get(&output_id)
+        .copied()
+        == Some(input_ids[0])
+    {
+        if let Ok(output_dram) = kernels::scatter::scatter_set_in_place(
+            device,
+            operand.dram_buffer,
+            start_indices_dram,
+            updates.dram_buffer,
+            &operand_shape,
+            operand.source_shape.as_deref(),
+            &start_indices_shape,
+            &update_shape,
+            updates.source_shape.as_deref(),
+            scatter_dim,
+            dtype,
+        ) {
+            return store_output_buffer(
+                values,
+                plan,
+                output_id,
+                output_desc.dims.clone(),
+                output_dram,
+                context,
+                "scatter.in_place",
+            );
+        }
+    }
     let output_dram = kernels::scatter::scatter_set(
         device,
         operand.dram_buffer,
@@ -4280,15 +6136,29 @@ fn execute_executable_v1(
                 input_id,
                 output_id,
                 permutation,
-            } => execute_transpose(
-                &mut values,
-                plan,
-                device,
-                output_context,
-                *input_id,
-                *output_id,
-                permutation,
-            ),
+            } => {
+                if output_context
+                    .analysis
+                    .skipped_transpose_outputs
+                    .contains(output_id)
+                    && values
+                        .get(*output_id as usize)
+                        .and_then(Option::as_ref)
+                        .is_some()
+                {
+                    Ok(())
+                } else {
+                    execute_transpose(
+                        &mut values,
+                        plan,
+                        device,
+                        output_context,
+                        *input_id,
+                        *output_id,
+                        permutation,
+                    )
+                }
+            }
             executable::Op::CustomCall {
                 call_target_name, ..
             } => {

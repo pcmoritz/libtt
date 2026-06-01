@@ -27,6 +27,7 @@ constexpr uint32_t OPERAND_TILE_ROWS = SCATTER_OPERAND_TILE_ROWS;
 constexpr uint32_t OPERAND_TILES_PER_ROW = SCATTER_OPERAND_TILES_PER_ROW;
 constexpr uint32_t UPDATE_TILE_ROWS = SCATTER_UPDATE_TILE_ROWS;
 constexpr uint32_t UPDATE_TILES_PER_ROW = SCATTER_UPDATE_TILES_PER_ROW;
+constexpr bool IN_PLACE = SCATTER_IN_PLACE != 0;
 using Element = SCATTER_ELEMENT_TYPE;
 
 struct Location {
@@ -306,6 +307,46 @@ void kernel_main() {
   };
 
   uint32_t loaded_index_tile = INVALID_TILE;
+  if constexpr (IN_PLACE) {
+    for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
+      uint32_t update_tile_id = output_tile_offset + tile;
+      uint32_t update_matrix_tiles = UPDATE_TILE_ROWS * UPDATE_TILES_PER_ROW;
+      uint32_t update_batch = update_tile_id / update_matrix_tiles;
+      uint32_t update_matrix_tile = update_tile_id % update_matrix_tiles;
+      uint32_t update_tile_row = update_matrix_tile / UPDATE_TILES_PER_ROW;
+      uint32_t update_tile_col = update_matrix_tile % UPDATE_TILES_PER_ROW;
+
+      uint32_t update_coords[COORD_COUNT];
+      decode_batch(update_batch, UPDATE_SHAPE, update_coords);
+      uint32_t update_index = update_coords[SCATTER_DIM];
+      int32_t target = read_scatter_index(indices, update_index, &loaded_index_tile);
+      if (target < 0 || static_cast<uint32_t>(target) >= OPERAND_SHAPE[SCATTER_DIM]) {
+        continue;
+      }
+
+      uint32_t output_batch = 0;
+      for (uint32_t dim = 0; dim + 2 < RANK; ++dim) {
+        uint32_t coord = dim == SCATTER_DIM ? static_cast<uint32_t>(target) : update_coords[dim];
+        output_batch = output_batch * OPERAND_SHAPE[dim] + coord;
+      }
+      uint32_t output_tile_id =
+          (output_batch * OPERAND_TILE_ROWS + update_tile_row) * OPERAND_TILES_PER_ROW +
+          update_tile_col;
+
+      cb_reserve_back(cb_updates, 1);
+      noc_async_read_tile(update_tile_id, updates, get_write_ptr(cb_updates));
+      noc_async_read_barrier();
+      noc_async_write_tile(output_tile_id, output, get_write_ptr(cb_updates));
+      noc_async_write_barrier();
+      cb_push_back(cb_updates, 1);
+      cb_pop_front(cb_updates, 1);
+    }
+    if (loaded_index_tile != INVALID_TILE) {
+      cb_pop_front(cb_indices, 1);
+    }
+    return;
+  }
+
   for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
     uint32_t output_tile_id = output_tile_offset + tile;
     uint32_t output_matrix_tiles = OPERAND_TILE_ROWS * OPERAND_TILES_PER_ROW;

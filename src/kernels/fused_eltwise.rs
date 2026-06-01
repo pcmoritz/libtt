@@ -902,11 +902,12 @@ fn reader_source(
                 .unwrap();
                 if node.single_tile_broadcast {
                     let bytes = element_bytes(node_dtype(node)?);
-                    writeln!(
-                        broadcasts,
-                        "    replicate_first_element(cb_leaf_{leaf_index}, {bytes});"
-                    )
-                    .unwrap();
+                    let helper = if node.packed_value == 1 {
+                        "replicate_first_column"
+                    } else {
+                        "replicate_first_element"
+                    };
+                    writeln!(broadcasts, "    {helper}(cb_leaf_{leaf_index}, {bytes});").unwrap();
                 }
                 input_arg_index += 1;
             }
@@ -928,6 +929,17 @@ fn reader_source(
         "#include <cstdint>\n\
          \n\
          namespace {{\n\
+         constexpr uint32_t TILE_R = 32;\n\
+         constexpr uint32_t TILE_C = 32;\n\
+         constexpr uint32_t FACE_R = 16;\n\
+         constexpr uint32_t FACE_C = 16;\n\
+         uint32_t tile_element_index(uint32_t row, uint32_t col) {{\n\
+           uint32_t face_row = row / FACE_R;\n\
+           uint32_t face_col = col / FACE_C;\n\
+           uint32_t row_in_face = row % FACE_R;\n\
+           uint32_t col_in_face = col % FACE_C;\n\
+           return ((face_row * 2 + face_col) * FACE_R * FACE_C) + row_in_face * FACE_C + col_in_face;\n\
+         }}\n\
          uint32_t repeated_word(uint32_t packed_value, uint32_t element_bytes) {{\n\
            if (element_bytes == 1) {{\n\
              uint32_t byte = packed_value & 0xffu;\n\
@@ -955,6 +967,34 @@ fn reader_source(
            uint32_t words = get_tile_size(cb) / sizeof(uint32_t);\n\
            for (uint32_t i = 0; i < words; ++i) {{\n\
              ptr[i] = packed_value;\n\
+           }}\n\
+         }}\n\
+         void replicate_first_column(uint32_t cb, uint32_t element_bytes) {{\n\
+           uint32_t l1_addr = get_write_ptr(cb);\n\
+           if (element_bytes == 4) {{\n\
+             volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(l1_addr);\n\
+             for (uint32_t row = 0; row < TILE_R; ++row) {{\n\
+               uint32_t value = ptr[tile_element_index(row, 0)];\n\
+               for (uint32_t col = 1; col < TILE_C; ++col) {{\n\
+                 ptr[tile_element_index(row, col)] = value;\n\
+               }}\n\
+             }}\n\
+           }} else if (element_bytes == 2) {{\n\
+             volatile tt_l1_ptr uint16_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint16_t *>(l1_addr);\n\
+             for (uint32_t row = 0; row < TILE_R; ++row) {{\n\
+               uint16_t value = ptr[tile_element_index(row, 0)];\n\
+               for (uint32_t col = 1; col < TILE_C; ++col) {{\n\
+                 ptr[tile_element_index(row, col)] = value;\n\
+               }}\n\
+             }}\n\
+           }} else {{\n\
+             volatile tt_l1_ptr uint8_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint8_t *>(l1_addr);\n\
+             for (uint32_t row = 0; row < TILE_R; ++row) {{\n\
+               uint8_t value = ptr[tile_element_index(row, 0)];\n\
+               for (uint32_t col = 1; col < TILE_C; ++col) {{\n\
+                 ptr[tile_element_index(row, col)] = value;\n\
+               }}\n\
+             }}\n\
            }}\n\
          }}\n\
          }}  // namespace\n\

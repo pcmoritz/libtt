@@ -43,6 +43,29 @@ void copy_packed_head_column_to_col0(uint32_t src_l1_addr, uint32_t dst_l1_addr,
         src_l1_addr, dst_l1_addr, source_col, valid_rows);
   }
 }
+template <typename Element>
+void copy_packed_head_column_to_linear(uint32_t src_l1_addr, uint32_t dst_l1_addr,
+                                       uint32_t source_col, uint32_t row_start,
+                                       uint32_t count) {
+  volatile tt_l1_ptr Element *src =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(src_l1_addr);
+  volatile tt_l1_ptr Element *dst =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(dst_l1_addr);
+  for (uint32_t i = 0; i < count; ++i) {
+    dst[i] = src[tile_element_index(row_start + i, source_col)];
+  }
+}
+void copy_packed_head_column_to_linear(uint32_t src_l1_addr, uint32_t dst_l1_addr,
+                                       uint32_t source_col, uint32_t row_start,
+                                       uint32_t count, uint32_t element_bytes) {
+  if (element_bytes == sizeof(uint32_t)) {
+    copy_packed_head_column_to_linear<uint32_t>(
+        src_l1_addr, dst_l1_addr, source_col, row_start, count);
+  } else {
+    copy_packed_head_column_to_linear<uint16_t>(
+        src_l1_addr, dst_l1_addr, source_col, row_start, count);
+  }
+}
 void write_output_run(const InterleavedAddrGenFast<true> &out_gen, uint32_t dst_tile,
                       uint32_t dst_offset, uint32_t src_l1_addr, uint32_t bytes,
                       uint32_t scratch_l1_addr) {
@@ -110,6 +133,44 @@ void write_output_tile(const InterleavedAddrGenFast<true> &out_gen, const View &
     noc_async_write_barrier();
     cb_push_back(cb_scratch, valid_cols);
     cb_pop_front(cb_scratch, valid_cols);
+    return;
+  }
+  if (output_view.kind == VIEW_PACKED_HEAD_TRANSPOSE) {
+    const uint32_t row_base = canonical_row_tile * TILE_R;
+    const uint32_t col_base = canonical_col_tile * TILE_C;
+    if (row_base >= output_view.logical_rows || col_base >= output_view.logical_cols) {
+      return;
+    }
+    const uint32_t valid_rows = min_u32(TILE_R, output_view.logical_rows - row_base);
+    const uint32_t valid_cols = min_u32(TILE_C, output_view.logical_cols - col_base);
+    const uint32_t tile_bytes = element_bytes * TILE_R * TILE_C;
+    cb_reserve_back(cb_scratch, valid_cols + 1);
+    uint32_t scratch_l1_base = get_write_ptr(cb_scratch);
+    uint32_t rmw_scratch_l1_addr = scratch_l1_base + valid_cols * tile_bytes;
+    for (uint32_t col = 0; col < valid_cols; ++col) {
+      const uint32_t head = batch * output_view.group_size + col_base + col;
+      if (head >= output_view.physical_shape[1]) {
+        continue;
+      }
+      const uint32_t dst_tile =
+          (head / TILE_R) * output_view.tiles_per_row + canonical_row_tile;
+      const uint32_t dst_row = head % TILE_R;
+      uint32_t data_l1_addr = scratch_l1_base + col * tile_bytes;
+      uint32_t row_offset = 0;
+      while (row_offset < valid_rows) {
+        uint32_t count = min_u32(FACE_C, valid_rows - row_offset);
+        copy_packed_head_column_to_linear(
+            src_l1_addr, data_l1_addr, col, row_offset, count, element_bytes);
+        const uint32_t dst_offset =
+            tile_element_index(dst_row, row_offset) * element_bytes;
+        write_output_run(out_gen, dst_tile, dst_offset, data_l1_addr,
+                         count * element_bytes, rmw_scratch_l1_addr);
+        row_offset += count;
+      }
+    }
+    noc_async_write_barrier();
+    cb_push_back(cb_scratch, valid_cols + 1);
+    cb_pop_front(cb_scratch, valid_cols + 1);
     return;
   }
   if (output_view.kind == VIEW_CONTIGUOUS) {
