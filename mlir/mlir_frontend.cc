@@ -2800,6 +2800,7 @@ struct GatherOperandView {
 struct DynamicGatherOperandView {
     mlir::Value source;
     mlir::Value start_indices;
+    bool dynamic_indices;
     std::vector<int64_t> logical_shape;
     uint32_t axis;
     std::vector<int64_t> dim_strides;
@@ -2900,10 +2901,29 @@ std::optional<DynamicGatherOperandView> matchDynamicGatherOperandView(mlir::Valu
         covered_ops.append(static_view->covered_ops.begin(), static_view->covered_ops.end());
     }
 
+    if (auto static_gather = matchStaticAxisGather(gather_op)) {
+        offsets[static_gather->axis] +=
+            static_gather->offset * strides[static_gather->axis];
+        strides[static_gather->axis] *= static_gather->stride;
+        covered_ops.push_back(gather_op.getOperation());
+        collectSingleUseStaticIntegerProducers(gather_op.getStartIndices(), covered_ops);
+        return DynamicGatherOperandView{
+            .source = source,
+            .start_indices = {},
+            .dynamic_indices = false,
+            .logical_shape = std::move(axis_gather->result_shape),
+            .axis = static_cast<uint32_t>(axis_gather->axis),
+            .dim_strides = std::move(strides),
+            .dim_offsets = std::move(offsets),
+            .covered_ops = std::move(covered_ops),
+        };
+    }
+
     covered_ops.push_back(gather_op.getOperation());
     return DynamicGatherOperandView{
         .source = source,
         .start_indices = gather_op.getStartIndices(),
+        .dynamic_indices = true,
         .logical_shape = std::move(axis_gather->result_shape),
         .axis = static_cast<uint32_t>(axis_gather->axis),
         .dim_strides = std::move(strides),
@@ -3020,13 +3040,17 @@ bool addMatmulOperand(
             if (auto dynamic_gather = matchDynamicGatherOperandView(source)) {
                 source = dynamic_gather->source;
                 uint32_t indices_id = 0;
-                if (!addValueDesc(
-                        dynamic_gather->start_indices,
-                        executable,
-                        value_ids,
-                        error,
-                        indices_id)) {
-                    return false;
+                if (dynamic_gather->dynamic_indices) {
+                    if (!addValueDesc(
+                            dynamic_gather->start_indices,
+                            executable,
+                            value_ids,
+                            error,
+                            indices_id)) {
+                        return false;
+                    }
+                } else {
+                    indices_id = std::numeric_limits<uint32_t>::max();
                 }
                 fillMatmulGatherView(*dynamic_gather, indices_id, gather_view);
             }

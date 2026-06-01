@@ -31,7 +31,7 @@ use std::mem::size_of;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Arc as StdArc, Mutex, Once, OnceLock};
 use std::time::Instant;
 
 include!("pjrt_bindings.rs");
@@ -122,6 +122,7 @@ struct ExecutableMetadata {
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
     executable: Option<executable::Executable>,
+    lazy_reshape_cache: StdArc<Mutex<HashMap<u32, bool>>>,
 }
 
 #[derive(Default)]
@@ -264,6 +265,7 @@ fn profile_op_signature(op: &executable::Op, plan: &executable::Executable) -> S
             rhs_grouped_head_view,
             lhs_gather_view,
             rhs_gather_view,
+            ..
         } => format!(
             "matmul topk={} gqa_lhs={} gqa_rhs={} gather_lhs={} gather_rhs={} lhs={} rhs={} out={} lhs_c={:?} rhs_c={:?} lhs_b={:?} rhs_b={:?}",
             top_k_epilogue.is_some(),
@@ -1022,6 +1024,7 @@ fn make_executable_metadata(
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
         executable,
+        lazy_reshape_cache: StdArc::new(Mutex::new(HashMap::new())),
     }
 }
 
@@ -1776,6 +1779,44 @@ struct DeviceDramView<'a> {
     source_shape: Option<Vec<usize>>,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct TransposeCacheKey {
+    allocation_identity: (usize, u64, u64, usize),
+    dtype: DType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
+    permutation: Vec<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct TransposeCacheEntry {
+    _input: DramBuffer,
+    output: DramBuffer,
+}
+
+static TRANSPOSE_CACHE: OnceLock<Mutex<HashMap<TransposeCacheKey, TransposeCacheEntry>>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ReshapeCacheKey {
+    allocation_identity: (usize, u64, u64, usize),
+    input_dtype: DType,
+    output_dtype: DType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct ReshapeCacheEntry {
+    _input: DramBuffer,
+    output: DramBuffer,
+}
+
+static RESHAPE_CACHE: OnceLock<Mutex<HashMap<ReshapeCacheKey, ReshapeCacheEntry>>> =
+    OnceLock::new();
+
+const STATIC_MATMUL_GATHER_INDICES_ID: u32 = u32::MAX;
+
 fn reshape_input_id(plan: &executable::Executable, output_id: u32) -> Option<u32> {
     plan.ops.iter().find_map(|op| {
         if let executable::Op::Reshape {
@@ -2059,6 +2100,7 @@ fn execute_constant(
 fn execute_reshape(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
+    lazy_reshape_cache: &Mutex<HashMap<u32, bool>>,
     device: &mut Device,
     context: &OutputContext,
     input_id: u32,
@@ -2076,11 +2118,13 @@ fn execute_reshape(
     let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let same_element_count = element_count(&input_shape)? == element_count(&output_shape)?;
     if input_dtype == output_dtype && same_element_count {
-        if can_leave_reshape_unmaterialized(plan, output_id) {
-            return Ok(());
-        }
-        let input = device_buffer_for_value(values, input_id, "reshape.operand")?;
-        if let Some(input_dram) = input.dram_buffer.as_ref() {
+        if let Some(input) = values
+            .get(input_id as usize)
+            .and_then(|value| value.as_ref())
+        {
+            let input_dram = input.dram_buffer.as_ref().ok_or_else(|| {
+                failed_precondition("TT executable reshape operand has no device allocation")
+            })?;
             let output_allocation_shape =
                 dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
             let output_tile_count =
@@ -2101,6 +2145,9 @@ fn execute_reshape(
                 );
             }
         }
+        if can_leave_reshape_unmaterialized_cached(plan, output_id, lazy_reshape_cache)? {
+            return Ok(());
+        }
         if plan.output_ids.contains(&output_id) {
             // Preserve same-volume output reshapes as views so loop-carried buffers do not
             // pay a device-side copy just to change logical shape.
@@ -2120,6 +2167,36 @@ fn execute_reshape(
                 "reshape",
             );
         }
+        let input = device_buffer_for_value(values, input_id, "reshape.operand")?;
+        if let Some(input_dram) = input.dram_buffer.as_ref() {
+            if let Some(key) = reshape_cache_key(
+                plan,
+                input_id,
+                input_dram,
+                input_dtype,
+                output_dtype,
+                &input_shape,
+                &output_shape,
+            ) {
+                let cache = RESHAPE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                let cached = cache
+                    .lock()
+                    .map_err(|_| failed_precondition("reshape cache lock is poisoned"))?
+                    .get(&key)
+                    .map(|entry| entry.output.clone());
+                if let Some(output_dram) = cached {
+                    return store_output_buffer(
+                        values,
+                        plan,
+                        output_id,
+                        output_desc.dims.clone(),
+                        output_dram,
+                        context,
+                        "reshape.cache",
+                    );
+                }
+            }
+        }
     }
 
     let input = device_dram_view_for_value(values, plan, input_id, "reshape.operand")?;
@@ -2127,6 +2204,15 @@ fn execute_reshape(
         .source_shape
         .as_deref()
         .unwrap_or(input_shape.as_slice());
+    let cache_key = reshape_cache_key(
+        plan,
+        input_id,
+        input.dram_buffer,
+        input_dtype,
+        output_dtype,
+        &input_shape,
+        &output_shape,
+    );
     let output_dims = output_desc.dims.clone();
     let output_dram = kernels::reshape::reshape(
         device,
@@ -2138,6 +2224,19 @@ fn execute_reshape(
         "pjrt_reshape",
     )
     .map_err(io_error)?;
+    if let Some(key) = cache_key {
+        let cache = RESHAPE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        cache
+            .lock()
+            .map_err(|_| failed_precondition("reshape cache lock is poisoned"))?
+            .insert(
+                key,
+                ReshapeCacheEntry {
+                    _input: input.dram_buffer.clone(),
+                    output: output_dram.clone(),
+                },
+            );
+    }
     store_output_buffer(
         values,
         plan,
@@ -2274,6 +2373,76 @@ fn execute_fused_elementwise(
     )
 }
 
+fn parameter_value(plan: &executable::Executable, value_id: u32) -> bool {
+    plan.ops.iter().any(|op| {
+        matches!(
+            op,
+            executable::Op::Parameter { output_id, .. } if *output_id == value_id
+        )
+    })
+}
+
+fn reshape_cache_key(
+    plan: &executable::Executable,
+    input_id: u32,
+    input: &DramBuffer,
+    input_dtype: DType,
+    output_dtype: DType,
+    input_shape: &[usize],
+    output_shape: &[usize],
+) -> Option<ReshapeCacheKey> {
+    const MIN_CACHED_RESHAPE_ELEMENTS: usize = 1024;
+    if input_dtype != DType::Float16B
+        || output_dtype != DType::Float16B
+        || input_shape.len() != 1
+        || output_shape.len() != 2
+        || output_shape[0] != 1
+        || output_shape[1] != input_shape[0]
+        || input_shape[0] < MIN_CACHED_RESHAPE_ELEMENTS
+        || !parameter_value(plan, input_id)
+    {
+        return None;
+    }
+    Some(ReshapeCacheKey {
+        allocation_identity: input.allocation_identity()?,
+        input_dtype,
+        output_dtype,
+        input_shape: input_shape.to_vec(),
+        output_shape: output_shape.to_vec(),
+    })
+}
+
+fn transpose_cache_key(
+    plan: &executable::Executable,
+    input_id: u32,
+    input: &DramBuffer,
+    dtype: DType,
+    input_shape: &[usize],
+    output_shape: &[usize],
+    permutation: &[i64],
+) -> Option<TransposeCacheKey> {
+    const MIN_CACHED_TRANSPOSE_ELEMENTS: usize = 1_000_000;
+    let element_count = input_shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
+    if dtype != DType::Float16B
+        || input_shape.len() != 2
+        || output_shape.len() != 2
+        || permutation != [1, 0]
+        || element_count < MIN_CACHED_TRANSPOSE_ELEMENTS
+        || !parameter_value(plan, input_id)
+    {
+        return None;
+    }
+    Some(TransposeCacheKey {
+        allocation_identity: input.allocation_identity()?,
+        dtype,
+        input_shape: input_shape.to_vec(),
+        output_shape: output_shape.to_vec(),
+        permutation: permutation.to_vec(),
+    })
+}
+
 fn execute_transpose(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2303,6 +2472,34 @@ fn execute_transpose(
         ));
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let cache_key = transpose_cache_key(
+        plan,
+        input_id,
+        input_dram,
+        dtype,
+        &input_shape,
+        &output_shape,
+        permutation,
+    );
+    if let Some(key) = cache_key.as_ref() {
+        let cache = TRANSPOSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let cached = cache
+            .lock()
+            .map_err(|_| failed_precondition("transpose cache lock is poisoned"))?
+            .get(key)
+            .map(|entry| entry.output.clone());
+        if let Some(output_dram) = cached {
+            return store_output_buffer(
+                values,
+                plan,
+                output_id,
+                output_desc.dims.clone(),
+                output_dram,
+                context,
+                "transpose.cache",
+            );
+        }
+    }
     let output_dram = kernels::transpose::transpose(
         device,
         input_dram,
@@ -2313,6 +2510,19 @@ fn execute_transpose(
         "pjrt_transpose",
     )
     .map_err(io_error)?;
+    if let Some(key) = cache_key {
+        let cache = TRANSPOSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        cache
+            .lock()
+            .map_err(|_| failed_precondition("transpose cache lock is poisoned"))?
+            .insert(
+                key,
+                TransposeCacheEntry {
+                    _input: input_dram.clone(),
+                    output: output_dram.clone(),
+                },
+            );
+    }
     store_output_buffer(
         values,
         plan,
@@ -2629,14 +2839,8 @@ fn kernel_matmul_gather_view<'a>(
     values: &'a [Option<PJRT_Buffer>],
     view: &executable::MatmulGatherView,
     name: &str,
-) -> Result<(kernels::matmul::MatmulGatherView, &'a DramBuffer), *mut PJRT_Error> {
-    let indices = device_buffer_for_value(values, view.indices_id, name)?;
-    if indices.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
-        return Err(invalid_argument(format!(
-            "TT executable {name} must be S32, got {:?}",
-            indices.buffer_type
-        )));
-    }
+) -> Result<(kernels::matmul::MatmulGatherView, Option<&'a DramBuffer>), *mut PJRT_Error> {
+    let dynamic_indices = view.indices_id != STATIC_MATMUL_GATHER_INDICES_ID;
     let logical_shape = dims_i64_to_usize(&view.logical_shape)?;
     let axis = usize::try_from(view.axis)
         .map_err(|_| invalid_argument(format!("TT executable {name} axis does not fit usize")))?;
@@ -2646,20 +2850,33 @@ fn kernel_matmul_gather_view<'a>(
             logical_shape.len()
         )));
     }
-    let expected_indices_shape = vec![logical_shape[axis] as i64, 1];
-    if indices.dims != expected_indices_shape {
-        return Err(invalid_argument(format!(
-            "TT executable {name} shape mismatch: expected {expected_indices_shape:?}, got {:?}",
-            indices.dims
-        )));
-    }
-    let Some(indices_dram) = indices.dram_buffer.as_ref() else {
-        return Err(failed_precondition(format!(
-            "TT executable {name} buffer has no device allocation"
-        )));
+    let indices_dram = if dynamic_indices {
+        let indices = device_buffer_for_value(values, view.indices_id, name)?;
+        if indices.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
+            return Err(invalid_argument(format!(
+                "TT executable {name} must be S32, got {:?}",
+                indices.buffer_type
+            )));
+        }
+        let expected_indices_shape = vec![logical_shape[axis] as i64, 1];
+        if indices.dims != expected_indices_shape {
+            return Err(invalid_argument(format!(
+                "TT executable {name} shape mismatch: expected {expected_indices_shape:?}, got {:?}",
+                indices.dims
+            )));
+        }
+        let Some(indices_dram) = indices.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable {name} buffer has no device allocation"
+            )));
+        };
+        Some(indices_dram)
+    } else {
+        None
     };
     Ok((
         kernels::matmul::MatmulGatherView {
+            dynamic_indices,
             logical_shape,
             axis,
             operand_dim_strides: dims_i64_to_usize(&view.operand_dim_strides)?,
@@ -2683,20 +2900,12 @@ fn execute_matmul(
     lhs_gather_view: Option<&executable::MatmulGatherView>,
     rhs_gather_view: Option<&executable::MatmulGatherView>,
 ) -> Result<(), *mut PJRT_Error> {
-    let lhs = device_buffer_for_value(values, input_ids[0], "matmul.lhs")?;
-    let rhs = device_buffer_for_value(values, input_ids[1], "matmul.rhs")?;
-    let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable matmul lhs buffer has no device allocation",
-        ));
-    };
-    let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable matmul rhs buffer has no device allocation",
-        ));
-    };
+    let lhs = device_dram_view_for_value(values, plan, input_ids[0], "matmul.lhs")?;
+    let rhs = device_dram_view_for_value(values, plan, input_ids[1], "matmul.rhs")?;
     let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
     let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+    let lhs_physical_shape = lhs.source_shape.as_deref().unwrap_or(&lhs_shape);
+    let rhs_physical_shape = rhs.source_shape.as_deref().unwrap_or(&rhs_shape);
     let lhs_grouped_head_view = lhs_grouped_head_view
         .map(kernel_matmul_grouped_head_view)
         .transpose()?;
@@ -2711,8 +2920,8 @@ fn execute_matmul(
         .transpose()?;
     let lhs_gather_view_ref = lhs_gather_view.as_ref().map(|(view, _)| view);
     let rhs_gather_view_ref = rhs_gather_view.as_ref().map(|(view, _)| view);
-    let lhs_gather_indices = lhs_gather_view.as_ref().map(|(_, indices)| *indices);
-    let rhs_gather_indices = rhs_gather_view.as_ref().map(|(_, indices)| *indices);
+    let lhs_gather_indices = lhs_gather_view.as_ref().and_then(|(_, indices)| *indices);
+    let rhs_gather_indices = rhs_gather_view.as_ref().and_then(|(_, indices)| *indices);
 
     if let Some(epilogue) = top_k_epilogue {
         if epilogue.k != 1 {
@@ -2768,11 +2977,13 @@ fn execute_matmul(
         let matmul_shape = dims_i64_to_usize(&matmul_desc.dims)?;
         let matmul_output = kernels::matmul::matmul_dot_general_with_views(
             device,
-            lhs_dram,
-            rhs_dram,
+            lhs.dram_buffer,
+            rhs.dram_buffer,
             lhs_gather_indices,
             rhs_gather_indices,
+            lhs_physical_shape,
             &lhs_shape,
+            rhs_physical_shape,
             &rhs_shape,
             &matmul_shape,
             &dimension_numbers.lhs_batching_dimensions,
@@ -2836,11 +3047,13 @@ fn execute_matmul(
     }
     let output_dram = kernels::matmul::matmul_dot_general_with_views(
         device,
-        lhs_dram,
-        rhs_dram,
+        lhs.dram_buffer,
+        rhs.dram_buffer,
         lhs_gather_indices,
         rhs_gather_indices,
+        lhs_physical_shape,
         &lhs_shape,
+        rhs_physical_shape,
         &rhs_shape,
         &output_shape,
         &dimension_numbers.lhs_batching_dimensions,
@@ -3075,6 +3288,11 @@ fn can_leave_reshape_unmaterialized(plan: &executable::Executable, value_id: u32
                         {
                             has_lazy_consumer = true;
                         }
+                        executable::Op::Matmul { input_ids, .. }
+                            if input_ids.contains(&value_id) =>
+                        {
+                            has_lazy_consumer = true;
+                        }
                         executable::Op::Reshape {
                             input_id,
                             output_id,
@@ -3105,6 +3323,27 @@ fn can_leave_reshape_unmaterialized(plan: &executable::Executable, value_id: u32
     }
 
     check(plan, value_id, &mut HashMap::new(), &mut HashSet::new())
+}
+
+fn can_leave_reshape_unmaterialized_cached(
+    plan: &executable::Executable,
+    value_id: u32,
+    cache: &Mutex<HashMap<u32, bool>>,
+) -> Result<bool, *mut PJRT_Error> {
+    if let Some(result) = cache
+        .lock()
+        .map_err(|_| failed_precondition("lazy reshape cache lock is poisoned"))?
+        .get(&value_id)
+        .copied()
+    {
+        return Ok(result);
+    }
+    let result = can_leave_reshape_unmaterialized(plan, value_id);
+    cache
+        .lock()
+        .map_err(|_| failed_precondition("lazy reshape cache lock is poisoned"))?
+        .insert(value_id, result);
+    Ok(result)
 }
 
 fn execute_select(
@@ -3769,6 +4008,7 @@ fn execute_executable_v1(
             } => execute_reshape(
                 &mut values,
                 plan,
+                &executable.metadata.lazy_reshape_cache,
                 device,
                 output_context,
                 *input_id,
@@ -3850,11 +4090,11 @@ fn execute_executable_v1(
                 output_id,
                 dimension_numbers,
                 top_k_epilogue,
-                lhs_grouped_head_view,
-                rhs_grouped_head_view,
-                lhs_gather_view,
-                rhs_gather_view,
-            } => execute_matmul(
+            lhs_grouped_head_view,
+            rhs_grouped_head_view,
+            lhs_gather_view,
+            rhs_gather_view,
+        } => execute_matmul(
                 &mut values,
                 plan,
                 device,
