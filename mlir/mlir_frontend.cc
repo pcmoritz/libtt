@@ -2010,20 +2010,26 @@ uint32_t fusedElementwiseInputIndex(
     return input_index;
 }
 
-void addCoveredConstantProducers(
-    FusedElementwiseRegion& region,
-    mlir::Value value) {
+void collectSingleUseBroadcastConstantProducers(
+    mlir::Value value,
+    llvm::SmallVectorImpl<mlir::Operation*>& covered_ops) {
     while (auto broadcast_op = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
         if (!broadcast_op->getResult(0).hasOneUse()) {
             return;
         }
-        region.covered_ops.push_back(broadcast_op);
+        covered_ops.push_back(broadcast_op);
         value = broadcast_op.getOperand();
     }
     if (auto constant_op = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
         constant_op && constant_op->getResult(0).hasOneUse()) {
-        region.covered_ops.push_back(constant_op);
+        covered_ops.push_back(constant_op);
     }
+}
+
+void addCoveredConstantProducers(
+    FusedElementwiseRegion& region,
+    mlir::Value value) {
+    collectSingleUseBroadcastConstantProducers(value, region.covered_ops);
 }
 
 std::optional<uint32_t> collectFusedElementwiseValue(
@@ -2336,6 +2342,671 @@ std::optional<MatmulTopKEpilogueRegion> collectMatmulTopKEpilogue(
     };
 }
 
+struct GroupedHeadExpansion {
+    mlir::Value source;
+    std::vector<int64_t> logical_shape;
+    uint32_t grouped_dimension;
+    uint32_t group_size;
+};
+
+std::optional<GroupedHeadExpansion> matchGroupedHeadExpansion(mlir::Value value) {
+    mlir::Value current = value;
+    while (auto custom_call_op =
+               current.getDefiningOp<mlir::stablehlo::CustomCallOp>()) {
+        if (!current.hasOneUse() || !isIdentityCustomCall(custom_call_op)) {
+            return std::nullopt;
+        }
+        current = custom_call_op.getInputs().front();
+    }
+
+    auto reshape_op = current.getDefiningOp<mlir::stablehlo::ReshapeOp>();
+    if (!reshape_op || !current.hasOneUse()) {
+        return std::nullopt;
+    }
+    auto broadcast_op =
+        reshape_op.getOperand().getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
+    if (!broadcast_op || !broadcast_op.getResult().hasOneUse()) {
+        return std::nullopt;
+    }
+
+    auto source_type = getStaticTensorType(broadcast_op.getOperand());
+    auto broadcast_type = getStaticTensorType(broadcast_op.getResult());
+    auto logical_type = getStaticTensorType(reshape_op.getResult());
+    if (!source_type || !broadcast_type || !logical_type) {
+        return std::nullopt;
+    }
+
+    auto source_shape = source_type->getShape();
+    auto broadcast_shape = broadcast_type->getShape();
+    auto logical_shape = logical_type->getShape();
+    int64_t source_rank = source_type->getRank();
+    if (source_rank <= 0 ||
+        broadcast_type->getRank() != source_rank + 1 ||
+        logical_type->getRank() != source_rank) {
+        return std::nullopt;
+    }
+
+    auto broadcast_dims = broadcast_op.getBroadcastDimensions();
+    if (static_cast<int64_t>(broadcast_dims.size()) != source_rank) {
+        return std::nullopt;
+    }
+    std::vector<bool> mapped(source_rank + 1, false);
+    for (int64_t dim : broadcast_dims) {
+        if (dim < 0 || dim >= source_rank + 1 || mapped[dim]) {
+            return std::nullopt;
+        }
+        mapped[dim] = true;
+    }
+
+    int64_t inserted_dim = -1;
+    for (int64_t dim = 0; dim < source_rank + 1; ++dim) {
+        if (!mapped[dim]) {
+            inserted_dim = dim;
+            break;
+        }
+    }
+    if (inserted_dim <= 0) {
+        return std::nullopt;
+    }
+    int64_t grouped_dim = inserted_dim - 1;
+    int64_t group_size = broadcast_shape[inserted_dim];
+    if (group_size <= 1) {
+        return std::nullopt;
+    }
+
+    for (int64_t source_dim = 0; source_dim < source_rank; ++source_dim) {
+        int64_t expected_broadcast_dim =
+            source_dim <= grouped_dim ? source_dim : source_dim + 1;
+        if (broadcast_dims[source_dim] != expected_broadcast_dim ||
+            broadcast_shape[expected_broadcast_dim] != source_shape[source_dim]) {
+            return std::nullopt;
+        }
+
+        int64_t expected_logical =
+            source_dim == grouped_dim
+                ? source_shape[source_dim] * group_size
+                : source_shape[source_dim];
+        if (logical_shape[source_dim] != expected_logical) {
+            return std::nullopt;
+        }
+    }
+
+    return GroupedHeadExpansion{
+        .source = broadcast_op.getOperand(),
+        .logical_shape = std::vector<int64_t>(logical_shape.begin(), logical_shape.end()),
+        .grouped_dimension = static_cast<uint32_t>(grouped_dim),
+        .group_size = static_cast<uint32_t>(group_size),
+    };
+}
+
+bool dimensionListContains(llvm::ArrayRef<int64_t> dimensions, uint32_t target) {
+    return llvm::any_of(dimensions, [&](int64_t dim) {
+        return dim >= 0 && static_cast<uint32_t>(dim) == target;
+    });
+}
+
+struct GroupedHeadDotConsumer {
+    mlir::stablehlo::DotGeneralOp dot_op;
+    mlir::Value operand;
+};
+
+std::optional<GroupedHeadDotConsumer> singleUseGroupedHeadDotConsumer(
+    mlir::Value value) {
+    mlir::Value current = value;
+    while (mlir::Operation* user = singleUser(current)) {
+        if (auto custom_call_op =
+                mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(user)) {
+            if (!isIdentityCustomCall(custom_call_op)) {
+                return std::nullopt;
+            }
+            current = custom_call_op.getResult(0);
+            continue;
+        }
+
+        if (auto dot_op = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(user)) {
+            return GroupedHeadDotConsumer{
+                .dot_op = dot_op,
+                .operand = current,
+            };
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+bool isGroupedHeadExpansionCoveredOp(mlir::Operation* op) {
+    mlir::Value value;
+    auto reshape_op = mlir::dyn_cast<mlir::stablehlo::ReshapeOp>(op);
+    if (!reshape_op) {
+        if (auto broadcast_op = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(op)) {
+            if (!broadcast_op.getResult().hasOneUse()) {
+                return false;
+            }
+            reshape_op = mlir::dyn_cast<mlir::stablehlo::ReshapeOp>(
+                *broadcast_op.getResult().user_begin());
+            if (!reshape_op) {
+                return false;
+            }
+        } else if (auto custom_call_op =
+                       mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
+            if (!isIdentityCustomCall(custom_call_op)) {
+                return false;
+            }
+            value = custom_call_op.getResult(0);
+        } else {
+            return false;
+        }
+    }
+    if (reshape_op) {
+        value = reshape_op.getResult();
+    }
+    auto expansion = matchGroupedHeadExpansion(value);
+    auto consumer = singleUseGroupedHeadDotConsumer(value);
+    if (!expansion || !consumer) {
+        return false;
+    }
+    auto dims = consumer->dot_op.getDotDimensionNumbers();
+    if (consumer->dot_op.getLhs() == consumer->operand) {
+        return dimensionListContains(
+            dims.getLhsBatchingDimensions(),
+            expansion->grouped_dimension);
+    }
+    if (consumer->dot_op.getRhs() == consumer->operand) {
+        return dimensionListContains(
+            dims.getRhsBatchingDimensions(),
+            expansion->grouped_dimension);
+    }
+    return false;
+}
+
+std::optional<std::vector<int64_t>> denseIntegerVector(mlir::Value value) {
+    auto constant_op = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
+    if (!constant_op) {
+        return std::nullopt;
+    }
+    auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constant_op.getValue());
+    if (!tensor_type || !tensor_type.hasStaticShape() || !dense ||
+        !mlir::isa<mlir::IntegerType>(tensor_type.getElementType())) {
+        return std::nullopt;
+    }
+
+    std::vector<int64_t> values;
+    values.reserve(dense.getNumElements());
+    for (const llvm::APInt& value_bits : dense.getValues<llvm::APInt>()) {
+        if (value_bits.getBitWidth() > 63) {
+            return std::nullopt;
+        }
+        values.push_back(value_bits.getSExtValue());
+    }
+    return values;
+}
+
+std::optional<int64_t> staticTensorElementCount(mlir::RankedTensorType type) {
+    int64_t elements = 1;
+    for (int64_t dim : type.getShape()) {
+        if (dim < 0 || dim > std::numeric_limits<int64_t>::max() / elements) {
+            return std::nullopt;
+        }
+        elements *= dim;
+    }
+    return elements;
+}
+
+std::optional<std::vector<int64_t>> staticIntegerVector(mlir::Value value);
+
+std::optional<std::vector<int64_t>> elementwiseStaticIntegerVector(
+    mlir::Value lhs,
+    mlir::Value rhs,
+    int64_t result_elements,
+    int64_t (*apply)(int64_t, int64_t)) {
+    auto lhs_values = staticIntegerVector(lhs);
+    auto rhs_values = staticIntegerVector(rhs);
+    if (!lhs_values || !rhs_values) {
+        return std::nullopt;
+    }
+    size_t count = static_cast<size_t>(result_elements);
+    if ((lhs_values->size() != 1 && lhs_values->size() != count) ||
+        (rhs_values->size() != 1 && rhs_values->size() != count)) {
+        return std::nullopt;
+    }
+
+    std::vector<int64_t> values;
+    values.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        int64_t lhs_value = (*lhs_values)[lhs_values->size() == 1 ? 0 : index];
+        int64_t rhs_value = (*rhs_values)[rhs_values->size() == 1 ? 0 : index];
+        values.push_back(apply(lhs_value, rhs_value));
+    }
+    return values;
+}
+
+std::optional<std::vector<int64_t>> staticIntegerVector(mlir::Value value) {
+    auto tensor_type = getStaticTensorType(value);
+    if (!tensor_type ||
+        !mlir::isa<mlir::IntegerType>(tensor_type->getElementType())) {
+        return std::nullopt;
+    }
+    auto element_count = staticTensorElementCount(*tensor_type);
+    if (!element_count || *element_count < 0 ||
+        *element_count > std::numeric_limits<int32_t>::max()) {
+        return std::nullopt;
+    }
+
+    if (auto values = denseIntegerVector(value)) {
+        return values;
+    }
+    if (auto iota_op = value.getDefiningOp<mlir::stablehlo::IotaOp>()) {
+        if (iota_op.getIotaDimension() != 0 || tensor_type->getRank() != 1) {
+            return std::nullopt;
+        }
+        std::vector<int64_t> values;
+        values.reserve(static_cast<size_t>(*element_count));
+        for (int64_t index = 0; index < *element_count; ++index) {
+            values.push_back(index);
+        }
+        return values;
+    }
+    if (auto broadcast_op =
+            value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
+        auto operand_values = staticIntegerVector(broadcast_op.getOperand());
+        if (!operand_values) {
+            return std::nullopt;
+        }
+        if (operand_values->size() == 1) {
+            return std::vector<int64_t>(
+                static_cast<size_t>(*element_count),
+                operand_values->front());
+        }
+        auto operand_type = getStaticTensorType(broadcast_op.getOperand());
+        auto dims = broadcast_op.getBroadcastDimensions();
+        if (!operand_type || operand_type->getRank() != 1 ||
+            dims.size() != 1 || dims[0] != 0 ||
+            static_cast<int64_t>(operand_values->size()) != *element_count) {
+            return std::nullopt;
+        }
+        return operand_values;
+    }
+
+    if (auto add_op = value.getDefiningOp<mlir::stablehlo::AddOp>()) {
+        return elementwiseStaticIntegerVector(
+            add_op.getLhs(),
+            add_op.getRhs(),
+            *element_count,
+            [](int64_t lhs, int64_t rhs) { return lhs + rhs; });
+    }
+    if (auto multiply_op = value.getDefiningOp<mlir::stablehlo::MulOp>()) {
+        return elementwiseStaticIntegerVector(
+            multiply_op.getLhs(),
+            multiply_op.getRhs(),
+            *element_count,
+            [](int64_t lhs, int64_t rhs) { return lhs * rhs; });
+    }
+    if (auto subtract_op = value.getDefiningOp<mlir::stablehlo::SubtractOp>()) {
+        return elementwiseStaticIntegerVector(
+            subtract_op.getLhs(),
+            subtract_op.getRhs(),
+            *element_count,
+            [](int64_t lhs, int64_t rhs) { return lhs - rhs; });
+    }
+
+    return std::nullopt;
+}
+
+bool isStaticIntegerProducer(mlir::Operation* op) {
+    return mlir::isa<
+        mlir::stablehlo::ConstantOp,
+        mlir::stablehlo::IotaOp,
+        mlir::stablehlo::BroadcastInDimOp,
+        mlir::stablehlo::AddOp,
+        mlir::stablehlo::SubtractOp,
+        mlir::stablehlo::MulOp>(op);
+}
+
+void collectSingleUseStaticIntegerProducers(
+    mlir::Value value,
+    llvm::SmallVectorImpl<mlir::Operation*>& covered_ops) {
+    mlir::Operation* op = value.getDefiningOp();
+    if (!op || op->getNumResults() != 1 || !op->getResult(0).hasOneUse() ||
+        !isStaticIntegerProducer(op)) {
+        return;
+    }
+    covered_ops.push_back(op);
+    for (mlir::Value operand : op->getOperands()) {
+        collectSingleUseStaticIntegerProducers(operand, covered_ops);
+    }
+}
+
+struct StaticAxisGather {
+    int64_t axis;
+    int64_t offset;
+    int64_t stride;
+};
+
+struct AxisSliceGather {
+    int64_t axis;
+    std::vector<int64_t> result_shape;
+};
+
+std::optional<AxisSliceGather> matchAxisSliceGather(
+    mlir::stablehlo::GatherOp gather_op) {
+    if (!gather_op || !gather_op.getResult().hasOneUse()) {
+        return std::nullopt;
+    }
+    auto operand_type = getStaticTensorType(gather_op.getOperand());
+    auto indices_type = getStaticTensorType(gather_op.getStartIndices());
+    auto result_type = getStaticTensorType(gather_op.getResult());
+    if (!operand_type || !indices_type || !result_type ||
+        operand_type->getRank() == 0 ||
+        result_type->getRank() != operand_type->getRank() ||
+        indices_type->getRank() != 2 ||
+        indices_type->getShape()[1] != 1) {
+        return std::nullopt;
+    }
+
+    auto dims = gather_op.getDimensionNumbers();
+    if (dims.getStartIndexMap().size() != 1 ||
+        !dims.getOperandBatchingDims().empty() ||
+        !dims.getStartIndicesBatchingDims().empty() ||
+        dims.getIndexVectorDim() != 1) {
+        return std::nullopt;
+    }
+    int64_t axis = dims.getStartIndexMap()[0];
+    int64_t rank = operand_type->getRank();
+    if (axis < 0 || axis >= rank) {
+        return std::nullopt;
+    }
+
+    llvm::SmallVector<int64_t> expected_offset_dims;
+    expected_offset_dims.reserve(rank > 0 ? rank - 1 : 0);
+    for (int64_t dim = 0; dim < rank; ++dim) {
+        if (dim != axis) {
+            expected_offset_dims.push_back(dim);
+        }
+    }
+    llvm::SmallVector<int64_t> expected_collapsed_slice_dims{axis};
+    if (dims.getOffsetDims() != llvm::ArrayRef<int64_t>(expected_offset_dims) ||
+        dims.getCollapsedSliceDims() !=
+            llvm::ArrayRef<int64_t>(expected_collapsed_slice_dims)) {
+        return std::nullopt;
+    }
+
+    auto slice_sizes = gather_op.getSliceSizes();
+    if (static_cast<int64_t>(slice_sizes.size()) != rank) {
+        return std::nullopt;
+    }
+    for (int64_t dim = 0; dim < rank; ++dim) {
+        int64_t expected = dim == axis ? 1 : operand_type->getDimSize(dim);
+        if (slice_sizes[dim] != expected) {
+            return std::nullopt;
+        }
+    }
+
+    std::vector<int64_t> expected_result_shape(
+        operand_type->getShape().begin(),
+        operand_type->getShape().end());
+    expected_result_shape[axis] = indices_type->getShape()[0];
+    if (result_type->getShape() != llvm::ArrayRef<int64_t>(expected_result_shape)) {
+        return std::nullopt;
+    }
+
+    return AxisSliceGather{
+        .axis = axis,
+        .result_shape = std::move(expected_result_shape),
+    };
+}
+
+std::optional<StaticAxisGather> matchStaticAxisGather(
+    mlir::stablehlo::GatherOp gather_op) {
+    auto axis_gather = matchAxisSliceGather(gather_op);
+    if (!axis_gather) {
+        return std::nullopt;
+    }
+    auto operand_type = getStaticTensorType(gather_op.getOperand());
+    if (!operand_type) {
+        return std::nullopt;
+    }
+    auto indices = staticIntegerVector(gather_op.getStartIndices());
+    if (!indices || indices->empty()) {
+        return std::nullopt;
+    }
+    int64_t offset = (*indices)[0];
+    int64_t stride = indices->size() == 1 ? 1 : (*indices)[1] - (*indices)[0];
+    if (stride <= 0 || offset < 0) {
+        return std::nullopt;
+    }
+    for (auto [index, value] : llvm::enumerate(*indices)) {
+        if (value != offset + static_cast<int64_t>(index) * stride ||
+            value < 0 ||
+            value >= operand_type->getDimSize(axis_gather->axis)) {
+            return std::nullopt;
+        }
+    }
+
+    return StaticAxisGather{
+        .axis = axis_gather->axis,
+        .offset = offset,
+        .stride = stride,
+    };
+}
+
+struct GatherOperandView {
+    mlir::Value source;
+    std::vector<int64_t> dim_strides;
+    std::vector<int64_t> dim_offsets;
+    llvm::SmallVector<mlir::Operation*> covered_ops;
+};
+
+struct DynamicGatherOperandView {
+    mlir::Value source;
+    mlir::Value start_indices;
+    bool dynamic_indices;
+    std::vector<int64_t> logical_shape;
+    uint32_t axis;
+    std::vector<int64_t> dim_strides;
+    std::vector<int64_t> dim_offsets;
+    llvm::SmallVector<mlir::Operation*> covered_ops;
+};
+
+std::optional<GatherOperandView> matchStaticGatherOperandView(mlir::Value value) {
+    llvm::SmallVector<mlir::Operation*> covered_ops;
+    mlir::Value current = value;
+    while (auto custom_call =
+               current.getDefiningOp<mlir::stablehlo::CustomCallOp>()) {
+        if (!current.hasOneUse() || !isIdentityCustomCall(custom_call)) {
+            return std::nullopt;
+        }
+        covered_ops.push_back(custom_call.getOperation());
+        current = custom_call.getInputs().front();
+    }
+
+    auto gather_op = current.getDefiningOp<mlir::stablehlo::GatherOp>();
+    auto static_gather = matchStaticAxisGather(gather_op);
+    if (!static_gather) {
+        return std::nullopt;
+    }
+    auto operand_type = getStaticTensorType(gather_op.getOperand());
+    if (!operand_type) {
+        return std::nullopt;
+    }
+
+    std::vector<int64_t> strides(operand_type->getRank(), 1);
+    std::vector<int64_t> offsets(operand_type->getRank(), 0);
+    strides[static_gather->axis] = static_gather->stride;
+    offsets[static_gather->axis] = static_gather->offset;
+
+    covered_ops.push_back(gather_op.getOperation());
+    collectSingleUseStaticIntegerProducers(gather_op.getStartIndices(), covered_ops);
+
+    return GatherOperandView{
+        .source = gather_op.getOperand(),
+        .dim_strides = std::move(strides),
+        .dim_offsets = std::move(offsets),
+        .covered_ops = std::move(covered_ops),
+    };
+}
+
+bool isZeroSplatValue(mlir::Value value) {
+    std::string ignored;
+    auto packed = packedConstantValue(value, ignored);
+    return packed.has_value() && *packed == 0;
+}
+
+std::optional<DynamicGatherOperandView> matchDynamicGatherOperandView(mlir::Value value) {
+    llvm::SmallVector<mlir::Operation*> covered_ops;
+    mlir::Value current = value;
+    while (auto custom_call =
+               current.getDefiningOp<mlir::stablehlo::CustomCallOp>()) {
+        if (!current.hasOneUse() || !isIdentityCustomCall(custom_call)) {
+            return std::nullopt;
+        }
+        covered_ops.push_back(custom_call.getOperation());
+        current = custom_call.getInputs().front();
+    }
+
+    if (auto select_op = current.getDefiningOp<mlir::stablehlo::SelectOp>()) {
+        if (!current.hasOneUse()) {
+            return std::nullopt;
+        }
+        if (isZeroSplatValue(select_op.getOnFalse())) {
+            covered_ops.push_back(select_op.getOperation());
+            collectSingleUseBroadcastConstantProducers(select_op.getOnFalse(), covered_ops);
+            current = select_op.getOnTrue();
+        } else if (isZeroSplatValue(select_op.getOnTrue())) {
+            covered_ops.push_back(select_op.getOperation());
+            collectSingleUseBroadcastConstantProducers(select_op.getOnTrue(), covered_ops);
+            current = select_op.getOnFalse();
+        } else {
+            return std::nullopt;
+        }
+    }
+
+    auto gather_op = current.getDefiningOp<mlir::stablehlo::GatherOp>();
+    auto axis_gather = matchAxisSliceGather(gather_op);
+    if (!axis_gather) {
+        return std::nullopt;
+    }
+
+    mlir::Value source = gather_op.getOperand();
+    auto operand_type = getStaticTensorType(source);
+    if (!operand_type) {
+        return std::nullopt;
+    }
+    std::vector<int64_t> strides(operand_type->getRank(), 1);
+    std::vector<int64_t> offsets(operand_type->getRank(), 0);
+    if (auto static_view = matchStaticGatherOperandView(source)) {
+        source = static_view->source;
+        strides = std::move(static_view->dim_strides);
+        offsets = std::move(static_view->dim_offsets);
+        covered_ops.append(static_view->covered_ops.begin(), static_view->covered_ops.end());
+    }
+
+    if (auto static_gather = matchStaticAxisGather(gather_op)) {
+        offsets[static_gather->axis] +=
+            static_gather->offset * strides[static_gather->axis];
+        strides[static_gather->axis] *= static_gather->stride;
+        covered_ops.push_back(gather_op.getOperation());
+        collectSingleUseStaticIntegerProducers(gather_op.getStartIndices(), covered_ops);
+        return DynamicGatherOperandView{
+            .source = source,
+            .start_indices = {},
+            .dynamic_indices = false,
+            .logical_shape = std::move(axis_gather->result_shape),
+            .axis = static_cast<uint32_t>(axis_gather->axis),
+            .dim_strides = std::move(strides),
+            .dim_offsets = std::move(offsets),
+            .covered_ops = std::move(covered_ops),
+        };
+    }
+
+    covered_ops.push_back(gather_op.getOperation());
+    return DynamicGatherOperandView{
+        .source = source,
+        .start_indices = gather_op.getStartIndices(),
+        .dynamic_indices = true,
+        .logical_shape = std::move(axis_gather->result_shape),
+        .axis = static_cast<uint32_t>(axis_gather->axis),
+        .dim_strides = std::move(strides),
+        .dim_offsets = std::move(offsets),
+        .covered_ops = std::move(covered_ops),
+    };
+}
+
+void fillMatmulGatherView(const DynamicGatherOperandView& view,
+                          uint32_t indices_id,
+                          tt::MatmulGatherView* proto_view) {
+    proto_view->set_indices_id(indices_id);
+    proto_view->set_axis(view.axis);
+    for (int64_t dim : view.logical_shape) {
+        proto_view->add_logical_shape(dim);
+    }
+    for (int64_t stride : view.dim_strides) {
+        proto_view->add_operand_dim_strides(stride);
+    }
+    for (int64_t offset : view.dim_offsets) {
+        proto_view->add_operand_dim_offsets(offset);
+    }
+}
+
+void fillMatmulGroupedHeadView(const GroupedHeadExpansion& expansion,
+                               tt::MatmulGroupedHeadView* grouped_head_view) {
+    for (int64_t dim : expansion.logical_shape) {
+        grouped_head_view->add_logical_shape(dim);
+    }
+    grouped_head_view->set_grouped_dimension(expansion.grouped_dimension);
+    grouped_head_view->set_group_size(expansion.group_size);
+}
+
+llvm::DenseSet<mlir::Operation*> collectStaticGatherViewCoveredOps(FuncOp func) {
+    llvm::DenseSet<mlir::Operation*> covered;
+    for (mlir::Operation& op : func.front()) {
+        auto gather_op = mlir::dyn_cast<mlir::stablehlo::GatherOp>(op);
+        if (!gather_op) {
+            continue;
+        }
+        auto view = matchStaticGatherOperandView(gather_op.getOperand());
+        if (!view) {
+            continue;
+        }
+        for (mlir::Operation* covered_op : view->covered_ops) {
+            covered.insert(covered_op);
+        }
+    }
+    return covered;
+}
+
+void collectMatmulOperandGatherViewCoveredOps(
+    mlir::Value value,
+    llvm::ArrayRef<int64_t> batching_dimensions,
+    llvm::DenseSet<mlir::Operation*>& covered) {
+    if (auto expansion = matchGroupedHeadExpansion(value)) {
+        if (dimensionListContains(batching_dimensions, expansion->grouped_dimension)) {
+            if (auto view = matchDynamicGatherOperandView(expansion->source)) {
+                for (mlir::Operation* covered_op : view->covered_ops) {
+                    covered.insert(covered_op);
+                }
+            }
+        }
+        return;
+    }
+}
+
+llvm::DenseSet<mlir::Operation*> collectMatmulGatherViewCoveredOps(FuncOp func) {
+    llvm::DenseSet<mlir::Operation*> covered;
+    for (mlir::Operation& op : func.front()) {
+        auto dot_op = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op);
+        if (!dot_op) {
+            continue;
+        }
+        auto dims = dot_op.getDotDimensionNumbers();
+        collectMatmulOperandGatherViewCoveredOps(
+            dot_op.getLhs(), dims.getLhsBatchingDimensions(), covered);
+        collectMatmulOperandGatherViewCoveredOps(
+            dot_op.getRhs(), dims.getRhsBatchingDimensions(), covered);
+    }
+    return covered;
+}
+
 void addMatmulDimensions(
     mlir::stablehlo::DotGeneralOp dot_op,
     tt::MatmulOp& matmul) {
@@ -2354,6 +3025,45 @@ void addMatmulDimensions(
     }
 }
 
+bool addMatmulOperand(
+    mlir::Value value,
+    llvm::ArrayRef<int64_t> batching_dimensions,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error,
+    uint32_t& id_out,
+    tt::MatmulGroupedHeadView* grouped_head_view,
+    tt::MatmulGatherView* gather_view) {
+    if (auto expansion = matchGroupedHeadExpansion(value)) {
+        if (dimensionListContains(batching_dimensions, expansion->grouped_dimension)) {
+            mlir::Value source = expansion->source;
+            if (auto dynamic_gather = matchDynamicGatherOperandView(source)) {
+                source = dynamic_gather->source;
+                uint32_t indices_id = 0;
+                if (dynamic_gather->dynamic_indices) {
+                    if (!addValueDesc(
+                            dynamic_gather->start_indices,
+                            executable,
+                            value_ids,
+                            error,
+                            indices_id)) {
+                        return false;
+                    }
+                } else {
+                    indices_id = std::numeric_limits<uint32_t>::max();
+                }
+                fillMatmulGatherView(*dynamic_gather, indices_id, gather_view);
+            }
+            if (!addValueDesc(source, executable, value_ids, error, id_out)) {
+                return false;
+            }
+            fillMatmulGroupedHeadView(*expansion, grouped_head_view);
+            return true;
+        }
+    }
+    return addValueDesc(value, executable, value_ids, error, id_out);
+}
+
 bool addMatmulOp(
     mlir::stablehlo::DotGeneralOp dot_op,
     const MatmulTopKEpilogueRegion* top_k_epilogue,
@@ -2363,15 +3073,46 @@ bool addMatmulOp(
     uint32_t lhs_id = 0;
     uint32_t rhs_id = 0;
     uint32_t matmul_output_id = 0;
-    if (!addValueDesc(dot_op.getLhs(), executable, value_ids, error, lhs_id) ||
-        !addValueDesc(dot_op.getRhs(), executable, value_ids, error, rhs_id) ||
-        !addValueDesc(dot_op.getResult(), executable, value_ids, error, matmul_output_id)) {
+    if (!addValueDesc(dot_op.getResult(), executable, value_ids, error, matmul_output_id)) {
         return false;
     }
 
     auto* op = executable.add_ops();
     op->set_output_id(matmul_output_id);
     auto* matmul = op->mutable_matmul();
+    auto dims = dot_op.getDotDimensionNumbers();
+    if (!addMatmulOperand(
+            dot_op.getLhs(),
+            dims.getLhsBatchingDimensions(),
+            executable,
+            value_ids,
+            error,
+            lhs_id,
+            matmul->mutable_lhs_grouped_head_view(),
+            matmul->mutable_lhs_gather_view()) ||
+        !addMatmulOperand(
+            dot_op.getRhs(),
+            dims.getRhsBatchingDimensions(),
+            executable,
+            value_ids,
+            error,
+            rhs_id,
+            matmul->mutable_rhs_grouped_head_view(),
+            matmul->mutable_rhs_gather_view())) {
+        return false;
+    }
+    if (matmul->lhs_grouped_head_view().logical_shape().empty()) {
+        matmul->clear_lhs_grouped_head_view();
+    }
+    if (matmul->rhs_grouped_head_view().logical_shape().empty()) {
+        matmul->clear_rhs_grouped_head_view();
+    }
+    if (matmul->lhs_gather_view().logical_shape().empty()) {
+        matmul->clear_lhs_gather_view();
+    }
+    if (matmul->rhs_gather_view().logical_shape().empty()) {
+        matmul->clear_rhs_gather_view();
+    }
     matmul->set_lhs_id(lhs_id);
     matmul->set_rhs_id(rhs_id);
     addMatmulDimensions(dot_op, *matmul);
@@ -2510,6 +3251,8 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
     auto fused_elementwise = buildFusedElementwisePlan(func);
     llvm::DenseSet<mlir::Operation*> matmul_top_k_covered_ops;
+    auto matmul_gather_view_covered_ops = collectMatmulGatherViewCoveredOps(func);
+    auto static_gather_view_covered_ops = collectStaticGatherViewCoveredOps(func);
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
         uint32_t output_id = 0;
@@ -2549,6 +3292,15 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
         if (matmul_top_k_covered_ops.contains(&op)) {
+            continue;
+        }
+        if (matmul_gather_view_covered_ops.contains(&op)) {
+            continue;
+        }
+        if (isGroupedHeadExpansionCoveredOp(&op)) {
+            continue;
+        }
+        if (static_gather_view_covered_ops.contains(&op)) {
             continue;
         }
 
@@ -3030,10 +3782,17 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto gather_op = mlir::dyn_cast<mlir::stablehlo::GatherOp>(op)) {
+            mlir::Value operand = gather_op.getOperand();
+            std::optional<GatherOperandView> operand_view =
+                matchStaticGatherOperandView(operand);
+            if (operand_view) {
+                operand = operand_view->source;
+            }
+
             uint32_t operand_id = 0;
             uint32_t start_indices_id = 0;
             uint32_t output_id = 0;
-            if (!addValueDesc(gather_op.getOperand(), executable, value_ids, error, operand_id) ||
+            if (!addValueDesc(operand, executable, value_ids, error, operand_id) ||
                 !addValueDesc(gather_op.getStartIndices(), executable, value_ids, error, start_indices_id) ||
                 !addValueDesc(gather_op.getResult(), executable, value_ids, error, output_id)) {
                 return false;
@@ -3064,6 +3823,14 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 gather->mutable_gather()->add_slice_sizes(size);
             }
             gather->mutable_gather()->set_indices_are_sorted(gather_op.getIndicesAreSorted());
+            if (operand_view) {
+                for (int64_t stride : operand_view->dim_strides) {
+                    gather->mutable_gather()->add_operand_dim_strides(stride);
+                }
+                for (int64_t offset : operand_view->dim_offsets) {
+                    gather->mutable_gather()->add_operand_dim_offsets(offset);
+                }
+            }
             continue;
         }
 

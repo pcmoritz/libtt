@@ -1,5 +1,6 @@
 pub(crate) mod broadcast;
 pub(crate) mod concatenate;
+pub(crate) mod constant;
 pub(crate) mod fused_eltwise;
 pub(crate) mod gather;
 pub(crate) mod iota;
@@ -8,6 +9,7 @@ pub(crate) mod matmul;
 pub(crate) mod reduce;
 pub(crate) mod reduce_window;
 pub(crate) mod reshape;
+pub(crate) mod reshape_view;
 pub(crate) mod scatter;
 pub(crate) mod select;
 pub(crate) mod slice;
