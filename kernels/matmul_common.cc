@@ -12,6 +12,7 @@ constexpr uint32_t VIEW_ARG_COUNT = 17 + 8 * MAX_RANK;
 constexpr uint32_t VIEW_CONTIGUOUS = 0;
 constexpr uint32_t VIEW_TILED_INDEX_MAP = 4;
 constexpr uint32_t VIEW_TILE_TRANSPOSE = 5;
+constexpr uint32_t VIEW_PACKED_HEAD = 6;
 constexpr uint32_t GROUPED_DIM_NONE = 0xffffffffu;
 
 struct View {
@@ -123,6 +124,30 @@ void decompose_into_dims(uint32_t flat, const uint32_t *dims, uint32_t dim_count
 
 uint32_t tile_id_for_indices(const View &view, const uint32_t *indices,
                              uint32_t *row_in_tile, uint32_t *col_in_tile) {
+  if (view.kind == VIEW_PACKED_HEAD) {
+    uint32_t physical[MAX_RANK] = {};
+    const uint32_t group_dim = view.col_dims[view.col_rank - 1];
+    uint32_t physical_rank = 0;
+    for (uint32_t dim = 0; dim < view.rank; ++dim) {
+      if (dim == group_dim) {
+        continue;
+      }
+      uint32_t index = indices[dim];
+      if (dim == view.grouped_dim) {
+        index = index * view.group_size + indices[group_dim];
+      }
+      physical[physical_rank++] = index * view.dim_strides[dim] + view.dim_offsets[dim];
+    }
+    uint32_t prefix = 0;
+    for (uint32_t dim = 0; dim + 2 < physical_rank; ++dim) {
+      prefix = prefix * view.physical_shape[dim] + physical[dim];
+    }
+    uint32_t row = physical[physical_rank - 2];
+    uint32_t col = physical[physical_rank - 1];
+    *row_in_tile = row % TILE_R;
+    *col_in_tile = col % TILE_C;
+    return (prefix * view.tile_rows + row / TILE_R) * view.tiles_per_row + col / TILE_C;
+  }
   auto physical_index = [&](uint32_t dim) -> uint32_t {
     uint32_t index = indices[dim];
     if (dim == view.grouped_dim) {
@@ -386,9 +411,6 @@ bool is_prefix_row_inner_col_view(const View &view) {
   // columns stay in the innermost physical dimension.
   if (view.rank < 3 || view.row_rank != 1 || view.col_rank != 1 ||
       view.col_dims[0] != view.rank - 1 || view.row_dims[0] + 2 >= view.rank) {
-    return false;
-  }
-  if (view.grouped_dim == GROUPED_DIM_NONE || view.group_size <= 1) {
     return false;
   }
   for (uint32_t dim = 0; dim + 2 < view.rank; ++dim) {

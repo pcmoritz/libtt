@@ -110,6 +110,7 @@ pub(crate) struct ReducePlan {
     op: ReduceOp,
     dtype: DType,
     identity: Option<u32>,
+    pre_square: bool,
 }
 
 impl ReducePlan {
@@ -120,6 +121,7 @@ impl ReducePlan {
         dimensions: &[i64],
         reducer: ReduceReducer,
         identity: Option<u32>,
+        pre_square: bool,
     ) -> io::Result<Self> {
         let op = ReduceOp::from_reducer(reducer)?;
         validate_reduce_dtype(dtype, op)?;
@@ -208,6 +210,7 @@ impl ReducePlan {
             op,
             dtype,
             identity,
+            pre_square,
         })
     }
 }
@@ -223,6 +226,7 @@ struct ReduceProgramKey {
     input_tiles_per_row: u32,
     shape: ReduceKernelShape,
     identity: Option<u32>,
+    pre_square: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,6 +284,7 @@ pub(crate) fn reduce(
             )?,
             shape: plan.shape,
             identity: plan.identity,
+            pre_square: plan.pre_square,
         },
         build: reduce_program,
     };
@@ -412,6 +417,7 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
             use_tiled_last_dim,
             use_block_max_row,
             block_max_row_tiles,
+            key.pre_square,
         ),
         writer_kernel: reduce_writer_source(key.dtype, key.op, use_block_max_row)?,
         compile: CompileConfig {
@@ -498,6 +504,7 @@ fn reduce_compute_source(
     use_tiled_last_dim: bool,
     use_block_max_row: bool,
     block_max_row_tiles: u32,
+    pre_square: bool,
 ) -> String {
     COMPUTE
         .replace("REDUCE_LAST_DIM_TILED", bool_define(use_tiled_last_dim))
@@ -511,6 +518,7 @@ fn reduce_compute_source(
         .replace("REDUCE_IS_SUM", bool_define(op.is_sum()))
         .replace("REDUCE_IS_MIN", bool_define(op.is_min()))
         .replace("REDUCE_IS_OR", bool_define(matches!(op, ReduceOp::Or)))
+        .replace("REDUCE_PRE_SQUARE", bool_define(pre_square))
         .replace("REDUCE_IS_BITWISE", bool_define(op.is_bitwise()))
 }
 
@@ -762,6 +770,7 @@ mod tests {
             &[1],
             ReduceReducer::Max,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(plan.shape.reduce_count, 30);
@@ -777,6 +786,7 @@ mod tests {
             &[1],
             ReduceReducer::Add,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(plan.shape.reduce_count, 64);
