@@ -275,8 +275,9 @@ void kernel_main() {
   uint32_t operand_addr = get_arg_val<uint32_t>(0);
   uint32_t start_indices_addr = get_arg_val<uint32_t>(1);
   uint32_t updates_addr = get_arg_val<uint32_t>(2);
-  uint32_t output_tile_offset = get_arg_val<uint32_t>(3);
-  uint32_t output_tile_count = get_arg_val<uint32_t>(4);
+  uint32_t output_addr = get_arg_val<uint32_t>(3);
+  uint32_t output_tile_offset = get_arg_val<uint32_t>(4);
+  uint32_t output_tile_count = get_arg_val<uint32_t>(5);
 
   constexpr uint32_t cb_operand = tt::CBIndex::c_0;
   constexpr uint32_t cb_indices = tt::CBIndex::c_1;
@@ -297,6 +298,11 @@ void kernel_main() {
       .bank_base_address = updates_addr,
       .page_size = get_tile_size(cb_updates),
       .data_format = get_dataformat(cb_updates),
+  };
+  const InterleavedAddrGenFast<true> output = {
+      .bank_base_address = output_addr,
+      .page_size = get_tile_size(cb_output),
+      .data_format = get_dataformat(cb_output),
   };
 
   uint32_t loaded_index_tile = INVALID_TILE;
@@ -420,7 +426,10 @@ void kernel_main() {
     if (loaded_update_tile != INVALID_TILE) {
       cb_pop_front(cb_updates, 1);
     }
+    noc_async_write_tile(output_tile_id, output, get_write_ptr(cb_output));
+    noc_async_write_barrier();
     cb_push_back(cb_output, 1);
+    cb_pop_front(cb_output, 1);
   }
   if (loaded_index_tile != INVALID_TILE) {
     cb_pop_front(cb_indices, 1);

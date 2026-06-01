@@ -9,11 +9,11 @@ use crate::kernels::reshape_view::{reshape_source_view, ReshapeSourceView};
 use std::io;
 
 const SCATTER_READER: &str = include_str!("../../kernels/scatter_reader.cc");
-const SCATTER_WRITER: &str = include_str!("../../kernels/broadcast_writer.cc");
+const SCATTER_WRITER: &str = "void kernel_main() {}\n";
 const READER_OPERAND_ADDR_INDEX: usize = 0;
 const READER_START_INDICES_ADDR_INDEX: usize = 1;
 const READER_UPDATES_ADDR_INDEX: usize = 2;
-const WRITER_OUTPUT_ADDR_INDEX: usize = 0;
+const READER_OUTPUT_ADDR_INDEX: usize = 3;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct ScatterShape {
@@ -60,16 +60,15 @@ impl Kernel<ScatterProgramKey> for ScatterKernel {
             READER_OPERAND_ADDR_INDEX => Some(self.operand_addr),
             READER_START_INDICES_ADDR_INDEX => Some(self.start_indices_addr),
             READER_UPDATES_ADDR_INDEX => Some(self.updates_addr),
+            READER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
             _ => None,
         }
     }
 
     #[inline]
     fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
-        match index {
-            WRITER_OUTPUT_ADDR_INDEX => Some(self.output_addr),
-            _ => None,
-        }
+        let _ = index;
+        None
     }
 }
 
@@ -286,11 +285,12 @@ fn optional_reshape_source_view(
 fn scatter_program(key: ScatterProgramKey) -> io::Result<Program> {
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
-        vec![WRITER_OUTPUT_ADDR_INDEX],
+        Vec::new(),
         vec![
             READER_OPERAND_ADDR_INDEX,
             READER_START_INDICES_ADDR_INDEX,
             READER_UPDATES_ADDR_INDEX,
+            READER_OUTPUT_ADDR_INDEX,
         ],
         Vec::new(),
     );
@@ -299,8 +299,8 @@ fn scatter_program(key: ScatterProgramKey) -> io::Result<Program> {
             split_tile_range(key.shape.output_tiles, core_index, key.cores.len())?;
         runtime_args.add_core(
             core,
-            vec![0, offset, n_tiles],
-            vec![0, 0, 0, offset, n_tiles],
+            Vec::new(),
+            vec![0, 0, 0, 0, offset, n_tiles],
             Vec::new(),
         )?;
     }
