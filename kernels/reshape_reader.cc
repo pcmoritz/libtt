@@ -47,6 +47,30 @@ void copy_element(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
       source[tile_element_index(source_row, source_col)];
 }
 
+void copy_row_segment(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
+                      uint32_t source_col, uint32_t output_row, uint32_t output_col,
+                      uint32_t count) {
+  if (count == TILE_C && source_col == 0 && output_col == 0) {
+    volatile tt_l1_ptr Element *source =
+        reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_input));
+    volatile tt_l1_ptr Element *output =
+        reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
+    const uint32_t source_face0 = tile_element_index(source_row, 0);
+    const uint32_t source_face1 = tile_element_index(source_row, FACE_C);
+    const uint32_t output_face0 = tile_element_index(output_row, 0);
+    const uint32_t output_face1 = tile_element_index(output_row, FACE_C);
+    for (uint32_t col = 0; col < FACE_C; ++col) {
+      output[output_face0 + col] = source[source_face0 + col];
+      output[output_face1 + col] = source[source_face1 + col];
+    }
+    return;
+  }
+  for (uint32_t col = 0; col < count; ++col) {
+    copy_element(cb_input, cb_output, source_row, source_col + col, output_row,
+                 output_col + col);
+  }
+}
+
 }  // namespace
 
 void kernel_main() {
@@ -115,7 +139,8 @@ void kernel_main() {
       uint32_t input_row = input_row_major % input_rows;
       uint32_t input_batch = input_row_major / input_rows;
 
-      for (uint32_t col = 0; col < row_cols; ++col) {
+      uint32_t col = 0;
+      while (col < row_cols) {
         uint32_t input_tile_row = input_row / TILE_R;
         uint32_t input_tile_col = input_col / TILE_C;
         uint32_t input_tile =
@@ -130,8 +155,14 @@ void kernel_main() {
           loaded_input_tile = input_tile;
         }
 
-        copy_element(cb_input, cb_output, input_row % TILE_R, input_col % TILE_C, row, col);
-        ++input_col;
+        uint32_t input_col_in_tile = input_col % TILE_C;
+        uint32_t segment_cols = min_u32(row_cols - col, TILE_C - input_col_in_tile);
+        segment_cols = min_u32(segment_cols, input_cols - input_col);
+        copy_row_segment(cb_input, cb_output, input_row % TILE_R, input_col_in_tile, row,
+                         col, segment_cols);
+
+        col += segment_cols;
+        input_col += segment_cols;
         if (input_col == input_cols) {
           input_col = 0;
           ++input_row;

@@ -23,13 +23,14 @@ use dram::{allocator_stats, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
-use std::sync::{Mutex, Once};
+use std::sync::{Arc as StdArc, Mutex, Once};
 
 include!("pjrt_bindings.rs");
 
@@ -92,6 +93,8 @@ pub struct PJRT_Buffer {
     memory: *mut PJRT_Memory,
     local_hardware_id: usize,
     dram_buffer: Option<DramBuffer>,
+    // Logical shape of the underlying allocation when this buffer is a reshape view.
+    source_shape: Option<Vec<usize>>,
     deleted: bool,
 }
 
@@ -117,6 +120,27 @@ struct ExecutableMetadata {
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
     executable: Option<executable::Executable>,
+    analysis: StdArc<ExecutableAnalysis>,
+    lazy_reshape_cache: StdArc<Mutex<HashMap<u32, bool>>>,
+}
+
+#[derive(Clone, Default)]
+struct ExecutableAnalysis {
+    parameter_values: HashSet<u32>,
+    reshape_inputs: HashMap<u32, u32>,
+    packed_constants: HashMap<u32, u32>,
+    lazy_splat_constants: HashSet<u32>,
+    square_fused_inputs: HashMap<u32, u32>,
+    skipped_fused_outputs: HashSet<u32>,
+    matmul_top1_epilogues: HashMap<u32, RuntimeMatmulTop1>,
+    skipped_topk_inputs: HashSet<u32>,
+}
+
+#[derive(Clone)]
+struct RuntimeMatmulTop1 {
+    values_id: u32,
+    indices_id: u32,
+    k: u32,
 }
 
 #[repr(C)]
@@ -373,6 +397,12 @@ fn host_byte_size(dtype: DType, dims: &[usize]) -> Result<usize, *mut PJRT_Error
         .ok_or_else(|| resource_exhausted("host buffer size overflow"))
 }
 
+fn element_count(dims: &[usize]) -> Result<usize, *mut PJRT_Error> {
+    dims.iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| resource_exhausted("shape element count overflow"))
+}
+
 fn padded_host_data(
     data: &[u8],
     dtype: DType,
@@ -559,15 +589,25 @@ fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_
             )
         })?;
     let data = read_buffer_bytes(buffer)?;
-    if data.len() == byte_size {
+    let read_shape = buffer.source_shape.as_deref().unwrap_or(&dims);
+    let read_byte_size = host_byte_size(dtype, read_shape)?;
+    if buffer.source_shape.is_some() && read_byte_size != byte_size {
+        return Err(pjrt_error(
+            format!(
+                "reshape view source byte size {read_byte_size} does not match logical byte size {byte_size}"
+            ),
+            PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
+        ));
+    }
+    if data.len() == read_byte_size {
         return Ok(data);
     }
-    if buffer.dims.len() < 2 && data.len() >= byte_size {
+    if read_shape.len() < 2 && data.len() >= read_byte_size {
         let mut data = data;
-        data.truncate(byte_size);
+        data.truncate(read_byte_size);
         return Ok(data);
     }
-    if let Some(data) = crop_padded_host_data(&data, dtype, &dims, &allocation_shape)? {
+    if let Some(data) = crop_padded_host_data(&data, dtype, read_shape, &allocation_shape)? {
         return Ok(data);
     }
     Err(pjrt_error(
@@ -721,6 +761,7 @@ fn make_executable_metadata(
         .flat_map(|output| output.dims.iter().copied())
         .collect::<Vec<_>>();
     let fingerprint = executable_fingerprint_string(name, outputs);
+    let analysis = StdArc::new(executable_analysis(executable.as_ref()));
     ExecutableMetadata {
         name: cstring_lossy(name),
         fingerprint,
@@ -732,6 +773,8 @@ fn make_executable_metadata(
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
         executable,
+        analysis,
+        lazy_reshape_cache: StdArc::new(Mutex::new(HashMap::new())),
     }
 }
 
@@ -1479,9 +1522,289 @@ fn device_buffer_for_value<'a>(
         .ok_or_else(|| invalid_argument(format!("{field} value id {value_id} is not available")))
 }
 
+struct DeviceDramView<'a> {
+    buffer_type: PJRT_Buffer_Type,
+    dims: Vec<i64>,
+    dram_buffer: &'a DramBuffer,
+    source_shape: Option<Vec<usize>>,
+}
+
+const STATIC_MATMUL_GATHER_INDICES_ID: u32 = u32::MAX;
+
+fn reshape_input_id(plan: &executable::Executable, output_id: u32) -> Option<u32> {
+    plan.ops.iter().find_map(|op| {
+        if let executable::Op::Reshape {
+            input_id,
+            output_id: reshape_output_id,
+        } = op
+        {
+            (*reshape_output_id == output_id).then_some(*input_id)
+        } else {
+            None
+        }
+    })
+}
+
+fn executable_analysis(executable: Option<&executable::Executable>) -> ExecutableAnalysis {
+    let Some(plan) = executable else {
+        return ExecutableAnalysis::default();
+    };
+    let mut analysis = ExecutableAnalysis::default();
+    for op in &plan.ops {
+        match op {
+            executable::Op::Parameter { output_id, .. } => {
+                analysis.parameter_values.insert(*output_id);
+            }
+            executable::Op::Reshape {
+                input_id,
+                output_id,
+            } => {
+                analysis.reshape_inputs.insert(*output_id, *input_id);
+            }
+            executable::Op::Constant {
+                packed_value,
+                data,
+                output_id,
+            } if data.is_empty() => {
+                analysis.packed_constants.insert(*output_id, *packed_value);
+            }
+            _ => {}
+        }
+    }
+    for &value_id in analysis.packed_constants.keys() {
+        if can_leave_splat_constant_unmaterialized(plan, value_id) {
+            analysis.lazy_splat_constants.insert(value_id);
+        }
+    }
+    let mut producers = HashMap::<u32, usize>::new();
+    let mut consumers = HashMap::<u32, Vec<usize>>::new();
+    let mut square_outputs = HashMap::<u32, u32>::new();
+    for (op_index, op) in plan.ops.iter().enumerate() {
+        for output_id in op_output_ids(op) {
+            producers.insert(output_id, op_index);
+        }
+        for input_id in op_input_ids(op) {
+            consumers.entry(input_id).or_default().push(op_index);
+        }
+        if let executable::Op::FusedElementwise {
+            input_ids,
+            output_id,
+            nodes,
+        } = op
+        {
+            if let Some(input_id) = fused_square_input(input_ids, nodes) {
+                square_outputs.insert(*output_id, input_id);
+            }
+        }
+    }
+    for (output_id, input_id) in square_outputs {
+        let Some(indices) = consumers.get(&output_id) else {
+            continue;
+        };
+        if indices.len() != 1 {
+            continue;
+        }
+        if matches!(
+            &plan.ops[indices[0]],
+            executable::Op::Reduce {
+                input_ids,
+                reducer: executable::ReduceReducer::Add,
+                ..
+            } if input_ids.first() == Some(&output_id)
+        ) {
+            analysis.square_fused_inputs.insert(output_id, input_id);
+            analysis.skipped_fused_outputs.insert(output_id);
+        }
+    }
+    for op in &plan.ops {
+        let executable::Op::TopK {
+            input_id,
+            values_id,
+            indices_id,
+            k,
+        } = op
+        else {
+            continue;
+        };
+        if *k != 1
+            || consumers.get(input_id).map_or(0, Vec::len) != 1
+            || !producers.get(input_id).is_some_and(|&index| {
+                matches!(plan.ops[index], executable::Op::Matmul { .. })
+            })
+        {
+            continue;
+        }
+        analysis.matmul_top1_epilogues.insert(
+            *input_id,
+            RuntimeMatmulTop1 {
+                values_id: *values_id,
+                indices_id: *indices_id,
+                k: *k,
+            },
+        );
+        analysis.skipped_topk_inputs.insert(*input_id);
+    }
+    analysis
+}
+
+fn op_output_ids(op: &executable::Op) -> Vec<u32> {
+    match op {
+        executable::Op::Parameter { output_id, .. }
+        | executable::Op::Reshape { output_id, .. }
+        | executable::Op::Slice { output_id, .. }
+        | executable::Op::Transpose { output_id, .. }
+        | executable::Op::CustomCall { output_id, .. }
+        | executable::Op::Reduce { output_id, .. }
+        | executable::Op::ReduceWindow { output_id, .. }
+        | executable::Op::Matmul { output_id, .. }
+        | executable::Op::Constant { output_id, .. }
+        | executable::Op::Select { output_id, .. }
+        | executable::Op::BroadcastInDim { output_id, .. }
+        | executable::Op::Gather { output_id, .. }
+        | executable::Op::Scatter { output_id, .. }
+        | executable::Op::Iota { output_id, .. }
+        | executable::Op::FusedElementwise { output_id, .. } => vec![*output_id],
+        executable::Op::Concatenate { output_id, .. } => vec![*output_id],
+        executable::Op::TopK {
+            values_id,
+            indices_id,
+            ..
+        } => vec![*values_id, *indices_id],
+    }
+}
+
+fn op_input_ids(op: &executable::Op) -> Vec<u32> {
+    match op {
+        executable::Op::Parameter { .. }
+        | executable::Op::Constant { .. }
+        | executable::Op::Iota { .. } => Vec::new(),
+        executable::Op::Reshape { input_id, .. }
+        | executable::Op::Slice { input_id, .. }
+        | executable::Op::Transpose { input_id, .. }
+        | executable::Op::BroadcastInDim { input_id, .. }
+        | executable::Op::TopK { input_id, .. } => vec![*input_id],
+        executable::Op::Concatenate { input_ids, .. }
+        | executable::Op::CustomCall { input_ids, .. }
+        | executable::Op::FusedElementwise { input_ids, .. } => input_ids.clone(),
+        executable::Op::Reduce { input_ids, init_value_ids, .. }
+        | executable::Op::ReduceWindow {
+            input_ids,
+            init_value_ids,
+            ..
+        } => input_ids
+            .iter()
+            .chain(init_value_ids.iter())
+            .copied()
+            .collect(),
+        executable::Op::Matmul { input_ids, .. } | executable::Op::Gather { input_ids, .. } => {
+            input_ids.to_vec()
+        }
+        executable::Op::Scatter { input_ids, .. } | executable::Op::Select { input_ids, .. } => {
+            input_ids.to_vec()
+        }
+    }
+}
+
+fn fused_square_input(
+    input_ids: &[u32],
+    nodes: &[executable::FusedElementwiseNode],
+) -> Option<u32> {
+    let root = nodes.last()?;
+    if root.kind != executable::FusedElementwiseKind::Multiply || root.input_nodes.len() != 2 {
+        return None;
+    }
+    let lhs = fused_external_input(input_ids, nodes, root.input_nodes[0] as usize)?;
+    let rhs = fused_external_input(input_ids, nodes, root.input_nodes[1] as usize)?;
+    (lhs == rhs).then_some(lhs)
+}
+
+fn fused_external_input(
+    input_ids: &[u32],
+    nodes: &[executable::FusedElementwiseNode],
+    node_index: usize,
+) -> Option<u32> {
+    let node = nodes.get(node_index)?;
+    if node.kind != executable::FusedElementwiseKind::Input {
+        return None;
+    }
+    input_ids.get(node.input_index as usize).copied()
+}
+
+fn device_dram_view_for_value<'a>(
+    values: &'a [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    context: &OutputContext,
+    value_id: u32,
+    field: &str,
+) -> Result<DeviceDramView<'a>, *mut PJRT_Error> {
+    let index = value_id as usize;
+    if let Some(buffer) = values.get(index).and_then(|value| value.as_ref()) {
+        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable {field} buffer has no device allocation"
+            )));
+        };
+        return Ok(DeviceDramView {
+            buffer_type: buffer.buffer_type,
+            dims: buffer.dims.clone(),
+            dram_buffer,
+            source_shape: buffer.source_shape.clone(),
+        });
+    }
+
+    let Some(input_id) = context.analysis.reshape_inputs.get(&value_id).copied() else {
+        return Err(invalid_argument(format!(
+            "{field} value id {value_id} is not available"
+        )));
+    };
+    if !can_leave_reshape_unmaterialized_cached(plan, value_id, &context.lazy_reshape_cache)? {
+        return Err(invalid_argument(format!(
+            "{field} reshape value id {value_id} is not materialized"
+        )));
+    }
+
+    let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "{field} reshape input value id {input_id} is out of bounds"
+        ))
+    })?;
+    let output_desc = plan.values.get(index).ok_or_else(|| {
+        invalid_argument(format!(
+            "{field} reshape output value id {value_id} is out of bounds"
+        ))
+    })?;
+    if input_desc.element_type != output_desc.element_type {
+        return Err(invalid_argument(format!(
+            "{field} lazy reshape requires matching element types, got {:?} -> {:?}",
+            input_desc.element_type, output_desc.element_type
+        )));
+    }
+
+    let input_view = device_dram_view_for_value(values, plan, context, input_id, field)?;
+    let source_shape = input_view
+        .source_shape
+        .unwrap_or(dims_i64_to_usize(&input_view.dims)?);
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let source_elements = element_count(&source_shape)?;
+    let output_elements = element_count(&output_shape)?;
+    if source_elements != output_elements {
+        return Err(invalid_argument(format!(
+            "{field} lazy reshape volume mismatch: source {source_shape:?}, output {output_shape:?}"
+        )));
+    }
+    let source_shape = (source_shape != output_shape).then_some(source_shape);
+    Ok(DeviceDramView {
+        buffer_type: output_desc.element_type,
+        dims: output_desc.dims.clone(),
+        dram_buffer: input_view.dram_buffer,
+        source_shape,
+    })
+}
+
 fn select_value_input<'a>(
     values: &'a [Option<PJRT_Buffer>],
     plan: &'a executable::Executable,
+    context: &OutputContext,
     value_id: u32,
     expected_dtype: DType,
     field: &str,
@@ -1495,7 +1818,7 @@ fn select_value_input<'a>(
         };
         return Ok(kernels::select::SelectInput::Dram(dram_buffer));
     }
-    if let Some(packed_value) = constant_packed_value(plan, value_id) {
+    if let Some(packed_value) = constant_packed_value(context, value_id) {
         let desc = plan.values.get(index).ok_or_else(|| {
             invalid_argument(format!(
                 "{field} constant value id {value_id} is out of bounds"
@@ -1519,6 +1842,8 @@ struct OutputContext {
     device: *mut PJRT_Device,
     memory: *mut PJRT_Memory,
     local_hardware_id: usize,
+    analysis: StdArc<ExecutableAnalysis>,
+    lazy_reshape_cache: StdArc<Mutex<HashMap<u32, bool>>>,
 }
 
 fn store_output_buffer(
@@ -1527,6 +1852,28 @@ fn store_output_buffer(
     output_id: u32,
     expected_dims: Vec<i64>,
     dram_buffer: DramBuffer,
+    context: &OutputContext,
+    op: &str,
+) -> Result<(), *mut PJRT_Error> {
+    store_output_buffer_with_source_shape(
+        values,
+        plan,
+        output_id,
+        expected_dims,
+        dram_buffer,
+        None,
+        context,
+        op,
+    )
+}
+
+fn store_output_buffer_with_source_shape(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    output_id: u32,
+    expected_dims: Vec<i64>,
+    dram_buffer: DramBuffer,
+    source_shape: Option<Vec<usize>>,
     context: &OutputContext,
     op: &str,
 ) -> Result<(), *mut PJRT_Error> {
@@ -1550,7 +1897,19 @@ fn store_output_buffer(
         )));
     }
     let logical_shape = dims_i64_to_usize(&expected.dims)?;
-    let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
+    let source_shape = source_shape.filter(|shape| shape.as_slice() != logical_shape.as_slice());
+    if let Some(source_shape) = source_shape.as_ref() {
+        let source_elements = element_count(source_shape)?;
+        let logical_elements = element_count(&logical_shape)?;
+        if source_elements != logical_elements {
+            return Err(invalid_argument(format!(
+                "TT executable {op} reshape view volume mismatch: source {source_shape:?}, logical {logical_shape:?}"
+            )));
+        }
+    }
+    let allocation_logical_shape = source_shape.as_deref().unwrap_or(&logical_shape);
+    let allocation_shape =
+        dram::tiled_allocation_shape(allocation_logical_shape).map_err(io_error)?;
     if dram_buffer.shape != allocation_shape {
         return Err(invalid_argument(format!(
             "TT executable {op} output allocation shape mismatch: expected {:?}, got {:?}",
@@ -1564,6 +1923,7 @@ fn store_output_buffer(
         memory: context.memory,
         local_hardware_id: context.local_hardware_id,
         dram_buffer: Some(dram_buffer),
+        source_shape,
         deleted: false,
     });
     Ok(())
@@ -1598,8 +1958,23 @@ fn execute_constant(
     let dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let logical_shape = dims_i64_to_usize(&output_desc.dims)?;
     let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
-    let data = if logical_data.is_empty() {
-        splat_allocation_data(dtype, packed_value, &allocation_shape)?
+    let output_dram = if logical_data.is_empty() {
+        let tile_count = dram::tiled_shape_tile_count(&allocation_shape).map_err(io_error)?;
+        if tile_count > 1 {
+            kernels::constant::splat_constant(
+                device,
+                dtype,
+                packed_value,
+                &allocation_shape,
+                "pjrt_constant",
+            )
+            .map_err(io_error)?
+        } else {
+            let data = splat_allocation_data(dtype, packed_value, &allocation_shape)?;
+            device
+                .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
+                .map_err(io_error)?
+        }
     } else {
         let logical_size = host_byte_size(dtype, &logical_shape)?;
         if logical_data.len() != logical_size {
@@ -1608,12 +1983,12 @@ fn execute_constant(
                 logical_data.len()
             )));
         }
-        padded_host_data(logical_data, dtype, &logical_shape, &allocation_shape)?
-            .unwrap_or_else(|| logical_data.to_vec())
+        let data = padded_host_data(logical_data, dtype, &logical_shape, &allocation_shape)?
+            .unwrap_or_else(|| logical_data.to_vec());
+        device
+            .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
+            .map_err(io_error)?
     };
-    let output_dram = device
-        .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
-        .map_err(io_error)?;
     store_output_buffer(
         values,
         plan,
@@ -1641,20 +2016,76 @@ fn execute_reshape(
     })?;
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-
-    let input = device_buffer_for_value(values, input_id, "reshape.operand")?;
-    let Some(input_dram) = input.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable reshape operand buffer has no device allocation",
-        ));
-    };
     let input_dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    let same_element_count = element_count(&input_shape)? == element_count(&output_shape)?;
+    if input_dtype == output_dtype && same_element_count {
+        if let Some(input) = values
+            .get(input_id as usize)
+            .and_then(|value| value.as_ref())
+        {
+            let input_dram = input.dram_buffer.as_ref().ok_or_else(|| {
+                failed_precondition("TT executable reshape operand has no device allocation")
+            })?;
+            let output_allocation_shape =
+                dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+            let output_tile_count =
+                dram::tiled_shape_tile_count(&output_shape).map_err(io_error)?;
+            if input_dram.num_tiles == output_tile_count
+                && reshape_preserves_tiled_layout(&input_shape, &output_shape)?
+            {
+                let mut output_dram = input_dram.clone();
+                output_dram.shape = output_allocation_shape;
+                return store_output_buffer(
+                    values,
+                    plan,
+                    output_id,
+                    output_desc.dims.clone(),
+                    output_dram,
+                    context,
+                    "reshape",
+                );
+            }
+        }
+        if can_leave_reshape_unmaterialized_cached(
+            plan,
+            output_id,
+            &context.lazy_reshape_cache,
+        )? {
+            return Ok(());
+        }
+        if plan.output_ids.contains(&output_id) {
+            // Preserve same-volume output reshapes as views so loop-carried buffers do not
+            // pay a device-side copy just to change logical shape.
+            let input =
+                device_dram_view_for_value(values, plan, context, input_id, "reshape.operand")?;
+            let source_shape = input
+                .source_shape
+                .clone()
+                .unwrap_or_else(|| input_shape.clone());
+            return store_output_buffer_with_source_shape(
+                values,
+                plan,
+                output_id,
+                output_desc.dims.clone(),
+                input.dram_buffer.clone(),
+                Some(source_shape),
+                context,
+                "reshape",
+            );
+        }
+    }
+
+    let input = device_dram_view_for_value(values, plan, context, input_id, "reshape.operand")?;
+    let input_source_shape = input
+        .source_shape
+        .as_deref()
+        .unwrap_or(input_shape.as_slice());
     let output_dims = output_desc.dims.clone();
     let output_dram = kernels::reshape::reshape(
         device,
-        input_dram,
-        &input_shape,
+        input.dram_buffer,
+        input_source_shape,
         &output_shape,
         input_dtype,
         output_dtype,
@@ -1868,8 +2299,13 @@ fn execute_reduce(
             "TT executable reduce currently only supports one init value",
         ));
     };
+    let pre_square_input = context.analysis.square_fused_inputs.get(input_id).copied();
+    let pre_square = pre_square_input.is_some()
+        && reducer == executable::ReduceReducer::Add
+        && dimensions.len() == 1;
+    let input_id = pre_square_input.unwrap_or(*input_id);
 
-    let input = device_buffer_for_value(values, *input_id, "reduce.input")?;
+    let input = device_buffer_for_value(values, input_id, "reduce.input")?;
     let Some(input_dram) = input.dram_buffer.as_ref() else {
         return Err(failed_precondition(
             "TT executable reduce input buffer has no device allocation",
@@ -1877,7 +2313,7 @@ fn execute_reduce(
     };
     let input_desc = plan
         .values
-        .get(*input_id as usize)
+        .get(input_id as usize)
         .ok_or_else(|| invalid_argument("TT executable reduce input id is out of bounds"))?;
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
@@ -1907,7 +2343,7 @@ fn execute_reduce(
         executable::ReduceReducer::And | executable::ReduceReducer::Or
     ) {
         Some(
-            constant_packed_value(plan, *init_value_id)
+            constant_packed_value(context, *init_value_id)
                 .and_then(|packed_value| {
                     reduce_identity_from_packed(reducer, input_desc.element_type, packed_value)
                 })
@@ -1921,7 +2357,7 @@ fn execute_reduce(
         None
     };
     if bitwise_identity.is_none()
-        && !reduce_init_is_supported(plan, *init_value_id, reducer, input_desc.element_type)
+        && !reduce_init_is_supported(context, *init_value_id, reducer, input_desc.element_type)
     {
         return Err(unimplemented(
             "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
@@ -1958,6 +2394,7 @@ fn execute_reduce(
         &kernel_dimensions,
         reducer,
         bitwise_identity,
+        pre_square,
     )
     .map_err(io_error)?;
     let output_dram = kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
@@ -2026,7 +2463,7 @@ fn execute_reduce_window(
         ));
     }
     if reducer != executable::ReduceReducer::Add
-        || constant_packed_value(plan, *init_value_id) != Some(0)
+        || constant_packed_value(context, *init_value_id) != Some(0)
     {
         return Err(unimplemented(
             "TT executable reduce_window currently requires add with a constant zero init value",
@@ -2135,6 +2572,70 @@ fn execute_top_k(
     )
 }
 
+fn kernel_matmul_grouped_head_view(
+    view: &executable::MatmulGroupedHeadView,
+) -> Result<kernels::matmul::MatmulGroupedHeadView, *mut PJRT_Error> {
+    Ok(kernels::matmul::MatmulGroupedHeadView {
+        logical_shape: dims_i64_to_usize(&view.logical_shape)?,
+        grouped_dimension: usize::try_from(view.grouped_dimension).map_err(|_| {
+            invalid_argument("TT executable matmul grouped dimension does not fit usize")
+        })?,
+        group_size: usize::try_from(view.group_size)
+            .map_err(|_| invalid_argument("TT executable matmul group size does not fit usize"))?,
+    })
+}
+
+fn kernel_matmul_gather_view<'a>(
+    values: &'a [Option<PJRT_Buffer>],
+    view: &executable::MatmulGatherView,
+    name: &str,
+) -> Result<(kernels::matmul::MatmulGatherView, Option<&'a DramBuffer>), *mut PJRT_Error> {
+    let dynamic_indices = view.indices_id != STATIC_MATMUL_GATHER_INDICES_ID;
+    let logical_shape = dims_i64_to_usize(&view.logical_shape)?;
+    let axis = usize::try_from(view.axis)
+        .map_err(|_| invalid_argument(format!("TT executable {name} axis does not fit usize")))?;
+    if axis >= logical_shape.len() {
+        return Err(invalid_argument(format!(
+            "TT executable {name} axis {axis} is out of bounds for rank {}",
+            logical_shape.len()
+        )));
+    }
+    let indices_dram = if dynamic_indices {
+        let indices = device_buffer_for_value(values, view.indices_id, name)?;
+        if indices.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
+            return Err(invalid_argument(format!(
+                "TT executable {name} must be S32, got {:?}",
+                indices.buffer_type
+            )));
+        }
+        let expected_indices_shape = vec![logical_shape[axis] as i64, 1];
+        if indices.dims != expected_indices_shape {
+            return Err(invalid_argument(format!(
+                "TT executable {name} shape mismatch: expected {expected_indices_shape:?}, got {:?}",
+                indices.dims
+            )));
+        }
+        let Some(indices_dram) = indices.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable {name} buffer has no device allocation"
+            )));
+        };
+        Some(indices_dram)
+    } else {
+        None
+    };
+    Ok((
+        kernels::matmul::MatmulGatherView {
+            dynamic_indices,
+            logical_shape,
+            axis,
+            operand_dim_strides: dims_i64_to_usize(&view.operand_dim_strides)?,
+            operand_dim_offsets: dims_i64_to_usize(&view.operand_dim_offsets)?,
+        },
+        indices_dram,
+    ))
+}
+
 fn execute_matmul(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2144,49 +2645,76 @@ fn execute_matmul(
     output_id: u32,
     dimension_numbers: &executable::DotGeneralDimensionNumbers,
     top_k_epilogue: Option<&executable::MatmulTopKEpilogue>,
+    lhs_grouped_head_view: Option<&executable::MatmulGroupedHeadView>,
+    rhs_grouped_head_view: Option<&executable::MatmulGroupedHeadView>,
+    lhs_gather_view: Option<&executable::MatmulGatherView>,
+    rhs_gather_view: Option<&executable::MatmulGatherView>,
 ) -> Result<(), *mut PJRT_Error> {
-    let lhs = device_buffer_for_value(values, input_ids[0], "matmul.lhs")?;
-    let rhs = device_buffer_for_value(values, input_ids[1], "matmul.rhs")?;
-    let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable matmul lhs buffer has no device allocation",
-        ));
-    };
-    let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable matmul rhs buffer has no device allocation",
-        ));
-    };
+    let lhs = device_dram_view_for_value(values, plan, context, input_ids[0], "matmul.lhs")?;
+    let rhs = device_dram_view_for_value(values, plan, context, input_ids[1], "matmul.rhs")?;
     let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
     let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+    let lhs_physical_shape = lhs.source_shape.as_deref().unwrap_or(&lhs_shape);
+    let rhs_physical_shape = rhs.source_shape.as_deref().unwrap_or(&rhs_shape);
+    let lhs_grouped_head_view = lhs_grouped_head_view
+        .map(kernel_matmul_grouped_head_view)
+        .transpose()?;
+    let rhs_grouped_head_view = rhs_grouped_head_view
+        .map(kernel_matmul_grouped_head_view)
+        .transpose()?;
+    let lhs_gather_view = lhs_gather_view
+        .map(|view| kernel_matmul_gather_view(values, view, "matmul.lhs_gather_indices"))
+        .transpose()?;
+    let rhs_gather_view = rhs_gather_view
+        .map(|view| kernel_matmul_gather_view(values, view, "matmul.rhs_gather_indices"))
+        .transpose()?;
+    let lhs_gather_view_ref = lhs_gather_view.as_ref().map(|(view, _)| view);
+    let rhs_gather_view_ref = rhs_gather_view.as_ref().map(|(view, _)| view);
+    let lhs_gather_indices = lhs_gather_view.as_ref().and_then(|(_, indices)| *indices);
+    let rhs_gather_indices = rhs_gather_view.as_ref().and_then(|(_, indices)| *indices);
 
-    if let Some(epilogue) = top_k_epilogue {
-        if epilogue.k != 1 {
+    let runtime_top1 = (top_k_epilogue.is_none())
+        .then(|| context.analysis.matmul_top1_epilogues.get(&output_id))
+        .flatten();
+    if top_k_epilogue.is_some() || runtime_top1.is_some() {
+        let (matmul_output_id, values_id, indices_id, k) =
+            if let Some(epilogue) = top_k_epilogue {
+                (
+                    epilogue.matmul_output_id,
+                    output_id,
+                    epilogue.indices_id,
+                    epilogue.k,
+                )
+            } else {
+                let epilogue = runtime_top1.expect("runtime top1 checked above");
+                (output_id, epilogue.values_id, epilogue.indices_id, epilogue.k)
+            };
+        if k != 1 {
             return Err(invalid_argument(
                 "TT executable matmul top_k epilogue currently requires k=1",
             ));
         }
         let matmul_desc = plan
             .values
-            .get(epilogue.matmul_output_id as usize)
+            .get(matmul_output_id as usize)
             .ok_or_else(|| {
                 invalid_argument(format!(
                     "TT executable matmul top_k epilogue matmul output id {} is out of bounds",
-                    epilogue.matmul_output_id
+                    matmul_output_id
                 ))
             })?;
-        let values_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        let values_desc = plan.values.get(values_id as usize).ok_or_else(|| {
             invalid_argument(format!(
-                "TT executable matmul top_k epilogue values id {output_id} is out of bounds"
+                "TT executable matmul top_k epilogue values id {values_id} is out of bounds"
             ))
         })?;
         let indices_desc = plan
             .values
-            .get(epilogue.indices_id as usize)
+            .get(indices_id as usize)
             .ok_or_else(|| {
                 invalid_argument(format!(
                     "TT executable matmul top_k epilogue indices id {} is out of bounds",
-                    epilogue.indices_id
+                    indices_id
                 ))
             })?;
         if lhs.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
@@ -2212,17 +2740,25 @@ fn execute_matmul(
         }
 
         let matmul_shape = dims_i64_to_usize(&matmul_desc.dims)?;
-        let matmul_output = kernels::matmul::matmul_dot_general(
+        let matmul_output = kernels::matmul::matmul_dot_general_with_views(
             device,
-            lhs_dram,
-            rhs_dram,
+            lhs.dram_buffer,
+            rhs.dram_buffer,
+            lhs_gather_indices,
+            rhs_gather_indices,
+            lhs_physical_shape,
             &lhs_shape,
+            rhs_physical_shape,
             &rhs_shape,
             &matmul_shape,
             &dimension_numbers.lhs_batching_dimensions,
             &dimension_numbers.rhs_batching_dimensions,
             &dimension_numbers.lhs_contracting_dimensions,
             &dimension_numbers.rhs_contracting_dimensions,
+            lhs_grouped_head_view.as_ref(),
+            rhs_grouped_head_view.as_ref(),
+            lhs_gather_view_ref,
+            rhs_gather_view_ref,
             kernels::matmul::MatmulEpilogue::Top1,
             "pjrt_matmul_top_k",
         )
@@ -2238,7 +2774,7 @@ fn execute_matmul(
         store_output_buffer(
             values,
             plan,
-            output_id,
+            values_id,
             values_desc.dims.clone(),
             values_dram,
             context,
@@ -2247,7 +2783,7 @@ fn execute_matmul(
         return store_output_buffer(
             values,
             plan,
-            epilogue.indices_id,
+            indices_id,
             indices_desc.dims.clone(),
             indices_dram,
             context,
@@ -2274,17 +2810,25 @@ fn execute_matmul(
             lhs.buffer_type, rhs.buffer_type
         )));
     }
-    let output_dram = kernels::matmul::matmul_dot_general(
+    let output_dram = kernels::matmul::matmul_dot_general_with_views(
         device,
-        lhs_dram,
-        rhs_dram,
+        lhs.dram_buffer,
+        rhs.dram_buffer,
+        lhs_gather_indices,
+        rhs_gather_indices,
+        lhs_physical_shape,
         &lhs_shape,
+        rhs_physical_shape,
         &rhs_shape,
         &output_shape,
         &dimension_numbers.lhs_batching_dimensions,
         &dimension_numbers.rhs_batching_dimensions,
         &dimension_numbers.lhs_contracting_dimensions,
         &dimension_numbers.rhs_contracting_dimensions,
+        lhs_grouped_head_view.as_ref(),
+        rhs_grouped_head_view.as_ref(),
+        lhs_gather_view_ref,
+        rhs_gather_view_ref,
         kernels::matmul::MatmulEpilogue::Store { output_dtype },
         "pjrt_matmul",
     )
@@ -2309,12 +2853,12 @@ fn execute_matmul(
 }
 
 fn reduce_init_is_supported(
-    plan: &executable::Executable,
+    context: &OutputContext,
     init_value_id: u32,
     reducer: executable::ReduceReducer,
     element_type: PJRT_Buffer_Type,
 ) -> bool {
-    if let Some(packed_value) = constant_packed_value(plan, init_value_id) {
+    if let Some(packed_value) = constant_packed_value(context, init_value_id) {
         return reduce_identity_from_packed(reducer, element_type, packed_value).is_some();
     }
     true
@@ -2352,19 +2896,225 @@ fn packed_identity_mask(element_type: PJRT_Buffer_Type) -> Option<u32> {
     }
 }
 
-fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option<u32> {
-    plan.ops.iter().find_map(|op| {
-        if let executable::Op::Constant {
-            packed_value,
-            data,
-            output_id,
-        } = op
-        {
-            (*output_id == value_id && data.is_empty()).then_some(*packed_value)
-        } else {
-            None
+fn constant_packed_value(context: &OutputContext, value_id: u32) -> Option<u32> {
+    context.analysis.packed_constants.get(&value_id).copied()
+}
+
+fn op_consumes_value(op: &executable::Op, value_id: u32) -> bool {
+    match op {
+        executable::Op::Parameter { .. }
+        | executable::Op::Constant { .. }
+        | executable::Op::Iota { .. } => false,
+        executable::Op::Concatenate { input_ids, .. }
+        | executable::Op::CustomCall { input_ids, .. }
+        | executable::Op::FusedElementwise { input_ids, .. } => input_ids.contains(&value_id),
+        executable::Op::Reshape { input_id, .. }
+        | executable::Op::Slice { input_id, .. }
+        | executable::Op::Transpose { input_id, .. }
+        | executable::Op::BroadcastInDim { input_id, .. }
+        | executable::Op::TopK { input_id, .. } => *input_id == value_id,
+        executable::Op::Reduce {
+            input_ids,
+            init_value_ids,
+            ..
         }
+        | executable::Op::ReduceWindow {
+            input_ids,
+            init_value_ids,
+            ..
+        } => input_ids.contains(&value_id) || init_value_ids.contains(&value_id),
+        executable::Op::Matmul { input_ids, .. } | executable::Op::Gather { input_ids, .. } => {
+            input_ids.contains(&value_id)
+        }
+        executable::Op::Scatter { input_ids, .. } | executable::Op::Select { input_ids, .. } => {
+            input_ids.contains(&value_id)
+        }
+    }
+}
+
+fn can_leave_splat_constant_unmaterialized(plan: &executable::Executable, value_id: u32) -> bool {
+    if plan.output_ids.contains(&value_id) {
+        return false;
+    }
+
+    let mut has_lazy_consumer = false;
+    for op in &plan.ops {
+        match op {
+            executable::Op::Select { input_ids, .. } => {
+                if input_ids[0] == value_id {
+                    return false;
+                }
+                if input_ids[1] == value_id || input_ids[2] == value_id {
+                    has_lazy_consumer = true;
+                }
+            }
+            _ if op_consumes_value(op, value_id) => return false,
+            _ => {}
+        }
+    }
+    has_lazy_consumer
+}
+
+fn shape_element_count_i64(dims: &[i64]) -> Option<usize> {
+    dims.iter().try_fold(1usize, |acc, &dim| {
+        let dim = usize::try_from(dim).ok()?;
+        acc.checked_mul(dim)
     })
+}
+
+fn reshape_is_same_dtype_same_volume(
+    plan: &executable::Executable,
+    input_id: u32,
+    output_id: u32,
+) -> bool {
+    let Some(input_desc) = plan.values.get(input_id as usize) else {
+        return false;
+    };
+    let Some(output_desc) = plan.values.get(output_id as usize) else {
+        return false;
+    };
+    let Some(input_elements) = shape_element_count_i64(&input_desc.dims) else {
+        return false;
+    };
+    let Some(output_elements) = shape_element_count_i64(&output_desc.dims) else {
+        return false;
+    };
+    input_desc.element_type == output_desc.element_type && input_elements == output_elements
+}
+
+fn reshape_keeps_innermost_dim(plan: &executable::Executable, input_id: u32, output_id: u32) -> bool {
+    let Some(input_desc) = plan.values.get(input_id as usize) else {
+        return false;
+    };
+    let Some(output_desc) = plan.values.get(output_id as usize) else {
+        return false;
+    };
+    let Some(&input_last) = input_desc.dims.last() else {
+        return false;
+    };
+    let Some(&output_last) = output_desc.dims.last() else {
+        return false;
+    };
+    input_last == output_last
+}
+
+fn tiled_layout_matrix(shape: &[usize]) -> Result<(usize, usize, usize), *mut PJRT_Error> {
+    let elements = element_count(shape)?;
+    let (rows, cols) = match shape.len() {
+        0 => (1, 1),
+        1 => (1, shape[0]),
+        rank => (shape[rank - 2], shape[rank - 1]),
+    };
+    let matrix_elements = rows
+        .checked_mul(cols)
+        .ok_or_else(|| invalid_argument(format!("shape {shape:?} matrix dimensions overflow")))?;
+    if matrix_elements == 0 || elements % matrix_elements != 0 {
+        return Err(invalid_argument(format!(
+            "shape {shape:?} cannot be represented as a tiled matrix"
+        )));
+    }
+    Ok((elements / matrix_elements, rows, cols))
+}
+
+fn reshape_preserves_tiled_layout(
+    source_shape: &[usize],
+    logical_shape: &[usize],
+) -> Result<bool, *mut PJRT_Error> {
+    Ok(
+        element_count(source_shape)? == element_count(logical_shape)?
+            && tiled_layout_matrix(source_shape)? == tiled_layout_matrix(logical_shape)?,
+    )
+}
+
+fn can_leave_reshape_unmaterialized(plan: &executable::Executable, value_id: u32) -> bool {
+    fn check(
+        plan: &executable::Executable,
+        value_id: u32,
+        memo: &mut HashMap<u32, bool>,
+        visiting: &mut HashSet<u32>,
+    ) -> bool {
+        if let Some(&cached) = memo.get(&value_id) {
+            return cached;
+        }
+        if !visiting.insert(value_id) {
+            return false;
+        }
+
+        let result = if plan.output_ids.contains(&value_id) {
+            false
+        } else if let Some(input_id) = reshape_input_id(plan, value_id) {
+            if !reshape_is_same_dtype_same_volume(plan, input_id, value_id) {
+                false
+            } else {
+                let mut has_lazy_consumer = false;
+                let mut valid = true;
+                for op in &plan.ops {
+                    match op {
+                        executable::Op::Gather { input_ids, .. } if input_ids[0] == value_id => {
+                            has_lazy_consumer = true;
+                        }
+                        executable::Op::Scatter { input_ids, .. }
+                            if input_ids[0] == value_id || input_ids[2] == value_id =>
+                        {
+                            has_lazy_consumer = true;
+                        }
+                        executable::Op::Matmul { input_ids, .. }
+                            if input_ids.contains(&value_id)
+                                && reshape_keeps_innermost_dim(plan, input_id, value_id) =>
+                        {
+                            has_lazy_consumer = true;
+                        }
+                        executable::Op::Reshape {
+                            input_id,
+                            output_id,
+                        } if *input_id == value_id => {
+                            if check(plan, *output_id, memo, visiting) {
+                                has_lazy_consumer = true;
+                            } else {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        _ if op_consumes_value(op, value_id) => {
+                            valid = false;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                valid && has_lazy_consumer
+            }
+        } else {
+            false
+        };
+
+        visiting.remove(&value_id);
+        memo.insert(value_id, result);
+        result
+    }
+
+    check(plan, value_id, &mut HashMap::new(), &mut HashSet::new())
+}
+
+fn can_leave_reshape_unmaterialized_cached(
+    plan: &executable::Executable,
+    value_id: u32,
+    cache: &Mutex<HashMap<u32, bool>>,
+) -> Result<bool, *mut PJRT_Error> {
+    if let Some(result) = cache
+        .lock()
+        .map_err(|_| failed_precondition("lazy reshape cache lock is poisoned"))?
+        .get(&value_id)
+        .copied()
+    {
+        return Ok(result);
+    }
+    let result = can_leave_reshape_unmaterialized(plan, value_id);
+    cache
+        .lock()
+        .map_err(|_| failed_precondition("lazy reshape cache lock is poisoned"))?
+        .insert(value_id, result);
+    Ok(result)
 }
 
 fn execute_select(
@@ -2440,8 +3190,10 @@ fn execute_select(
             "TT executable select predicate buffer has no device allocation",
         ));
     };
-    let true_input = select_value_input(values, plan, true_id, value_dtype, "select.on_true")?;
-    let false_input = select_value_input(values, plan, false_id, value_dtype, "select.on_false")?;
+    let true_input =
+        select_value_input(values, plan, context, true_id, value_dtype, "select.on_true")?;
+    let false_input =
+        select_value_input(values, plan, context, false_id, value_dtype, "select.on_false")?;
     let expected_dims = true_desc.dims.clone();
     let shape = dims_i64_to_usize(&expected_dims)?;
     let output_dram = kernels::select::select(
@@ -2598,6 +3350,58 @@ fn execute_concatenate(
     )
 }
 
+fn optional_dim_transform(
+    values: &[i64],
+    rank: usize,
+    default: usize,
+) -> Result<Vec<usize>, String> {
+    if values.is_empty() {
+        return Ok(vec![default; rank]);
+    }
+    if values.len() != rank {
+        return Err(format!(
+            "operand dim transform rank mismatch: got {} entries for rank {rank}",
+            values.len()
+        ));
+    }
+    values
+        .iter()
+        .enumerate()
+        .map(|(dim, &value)| {
+            usize::try_from(value).map_err(|_| {
+                format!("operand dim transform at dim {dim} must be non-negative, got {value}")
+            })
+        })
+        .collect()
+}
+
+fn transformed_operand_shape(
+    physical_shape: &[usize],
+    dim_strides: &[usize],
+    dim_offsets: &[usize],
+) -> Result<Vec<usize>, String> {
+    if dim_strides.len() != physical_shape.len() || dim_offsets.len() != physical_shape.len() {
+        return Err("operand dim transform rank mismatch".to_owned());
+    }
+    physical_shape
+        .iter()
+        .zip(dim_strides)
+        .zip(dim_offsets)
+        .enumerate()
+        .map(|(dim, ((&physical, &stride), &offset))| {
+            if stride == 0 {
+                return Err(format!("operand dim stride at dim {dim} must be non-zero"));
+            }
+            if offset >= physical {
+                return Err(format!(
+                    "operand dim offset {offset} at dim {dim} is out of bounds for extent {physical}"
+                ));
+            }
+            Ok((physical - 1 - offset) / stride + 1)
+        })
+        .collect()
+}
+
 fn execute_gather(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2607,8 +3411,11 @@ fn execute_gather(
     output_id: u32,
     dimension_numbers: &executable::GatherDimensionNumbers,
     slice_sizes: &[i64],
+    operand_dim_strides: &[i64],
+    operand_dim_offsets: &[i64],
 ) -> Result<(), *mut PJRT_Error> {
-    let operand = device_buffer_for_value(values, input_ids[0], "gather.operand")?.clone();
+    let operand =
+        device_dram_view_for_value(values, plan, context, input_ids[0], "gather.operand")?;
     let start_indices =
         device_buffer_for_value(values, input_ids[1], "gather.start_indices")?.clone();
     if start_indices.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
@@ -2617,6 +3424,15 @@ fn execute_gather(
         ));
     }
     let operand_shape = dims_i64_to_usize(&operand.dims)?;
+    let operand_dim_strides =
+        optional_dim_transform(operand_dim_strides, operand_shape.len(), 1)
+            .map_err(|err| invalid_argument(format!("TT executable gather {err}")))?;
+    let operand_dim_offsets =
+        optional_dim_transform(operand_dim_offsets, operand_shape.len(), 0)
+            .map_err(|err| invalid_argument(format!("TT executable gather {err}")))?;
+    let logical_operand_shape =
+        transformed_operand_shape(&operand_shape, &operand_dim_strides, &operand_dim_offsets)
+            .map_err(|err| invalid_argument(format!("TT executable gather {err}")))?;
     let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
@@ -2630,18 +3446,13 @@ fn execute_gather(
         )));
     }
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let Some(operand_dram) = operand.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable gather operand buffer has no device allocation",
-        ));
-    };
     let Some(start_indices_dram) = start_indices.dram_buffer.as_ref() else {
         return Err(failed_precondition(
             "TT executable gather start_indices buffer has no device allocation",
         ));
     };
 
-    let rank = operand_shape.len();
+    let rank = logical_operand_shape.len();
     if rank == 0 {
         return Err(unimplemented(
             "TT executable gather currently requires operand rank >= 1",
@@ -2666,7 +3477,7 @@ fn execute_gather(
     if axis >= rank {
         return Err(invalid_argument(format!(
             "TT executable gather axis {axis} is out of bounds for operand shape {:?}",
-            operand_shape
+            logical_operand_shape
         )));
     }
     let expected_offset_dims = (0..rank as i64)
@@ -2694,15 +3505,15 @@ fn execute_gather(
             if dim == axis {
                 slice == 1
             } else {
-                usize::try_from(slice).ok() == Some(operand_shape[dim])
+                usize::try_from(slice).ok() == Some(logical_operand_shape[dim])
             }
         })
     {
         return Err(unimplemented(format!(
-            "TT executable gather currently only supports slice_sizes with 1 at gathered axis and full slices elsewhere; got {slice_sizes:?} for operand shape {operand_shape:?}, axis {axis}"
+            "TT executable gather currently only supports slice_sizes with 1 at gathered axis and full slices elsewhere; got {slice_sizes:?} for operand shape {logical_operand_shape:?}, axis {axis}"
         )));
     }
-    let mut expected_output_shape = operand_shape.clone();
+    let mut expected_output_shape = logical_operand_shape.clone();
     if start_indices_shape.len() == 2 {
         expected_output_shape[axis] = start_indices_shape[0];
     }
@@ -2716,12 +3527,16 @@ fn execute_gather(
     let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
     let output_dram = kernels::gather::gather(
         device,
-        operand_dram,
+        operand.dram_buffer,
         start_indices_dram,
+        &logical_operand_shape,
         &operand_shape,
+        operand.source_shape.as_deref(),
         &start_indices_shape,
         &output_shape,
         axis,
+        &operand_dim_strides,
+        &operand_dim_offsets,
         dtype,
         "pjrt_gather",
     )
@@ -2746,10 +3561,12 @@ fn execute_scatter(
     output_id: u32,
     dimension_numbers: &executable::ScatterDimensionNumbers,
 ) -> Result<(), *mut PJRT_Error> {
-    let operand = device_buffer_for_value(values, input_ids[0], "scatter.operand")?.clone();
+    let operand =
+        device_dram_view_for_value(values, plan, context, input_ids[0], "scatter.operand")?;
     let start_indices =
         device_buffer_for_value(values, input_ids[1], "scatter.start_indices")?.clone();
-    let updates = device_buffer_for_value(values, input_ids[2], "scatter.updates")?.clone();
+    let updates =
+        device_dram_view_for_value(values, plan, context, input_ids[2], "scatter.updates")?;
     if start_indices.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
         return Err(unimplemented(
             "TT executable scatter currently only supports s32 start_indices",
@@ -2799,17 +3616,13 @@ fn execute_scatter(
                 operand_shape
             )));
         }
-        let Some(updates_dram) = updates.dram_buffer.as_ref() else {
-            return Err(failed_precondition(
-                "TT executable scatter updates buffer has no device allocation",
-            ));
-        };
-        return store_output_buffer(
+        return store_output_buffer_with_source_shape(
             values,
             plan,
             output_id,
             output_desc.dims.clone(),
-            updates_dram.clone(),
+            updates.dram_buffer.clone(),
+            updates.source_shape.clone(),
             context,
             "scatter",
         );
@@ -2825,31 +3638,22 @@ fn execute_scatter(
     )
     .map_err(|err| unimplemented(err.to_string()))?;
 
-    let Some(operand_dram) = operand.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable scatter operand buffer has no device allocation",
-        ));
-    };
     let Some(start_indices_dram) = start_indices.dram_buffer.as_ref() else {
         return Err(failed_precondition(
             "TT executable scatter start_indices buffer has no device allocation",
         ));
     };
-    let Some(updates_dram) = updates.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable scatter updates buffer has no device allocation",
-        ));
-    };
-
     let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
     let output_dram = kernels::scatter::scatter_set(
         device,
-        operand_dram,
+        operand.dram_buffer,
         start_indices_dram,
-        updates_dram,
+        updates.dram_buffer,
         &operand_shape,
+        operand.source_shape.as_deref(),
         &start_indices_shape,
         &update_shape,
+        updates.source_shape.as_deref(),
         scatter_dim,
         dtype,
         "pjrt_scatter",
@@ -2912,7 +3716,8 @@ fn execute_executable_v1(
     let mut values = vec![None; plan.values.len()];
 
     for op in &plan.ops {
-        match op {
+        let op_result = (|| -> Result<(), *mut PJRT_Error> {
+            match op {
             executable::Op::Parameter {
                 parameter_index,
                 output_id,
@@ -2957,6 +3762,7 @@ fn execute_executable_v1(
                 let mut parameter = input.clone();
                 parameter.buffer_type = expected.element_type;
                 values[output_index] = Some(parameter);
+                Ok(())
             }
             executable::Op::Concatenate {
                 input_ids,
@@ -2970,7 +3776,7 @@ fn execute_executable_v1(
                 input_ids,
                 *output_id,
                 *dimension,
-            )?,
+            ),
             executable::Op::Reshape {
                 input_id,
                 output_id,
@@ -2981,7 +3787,7 @@ fn execute_executable_v1(
                 output_context,
                 *input_id,
                 *output_id,
-            )?,
+            ),
             executable::Op::Slice {
                 input_id,
                 output_id,
@@ -2998,7 +3804,7 @@ fn execute_executable_v1(
                 start_indices,
                 limit_indices,
                 strides,
-            )?,
+            ),
             executable::Op::Transpose {
                 input_id,
                 output_id,
@@ -3011,13 +3817,13 @@ fn execute_executable_v1(
                 *input_id,
                 *output_id,
                 permutation,
-            )?,
+            ),
             executable::Op::CustomCall {
                 call_target_name, ..
             } => {
-                return Err(unimplemented(format!(
+                Err(unimplemented(format!(
                     "TT executable custom_call {call_target_name:?} execution is not currently supported"
-                )));
+                )))
             }
             executable::Op::Reduce {
                 input_ids,
@@ -3035,7 +3841,7 @@ fn execute_executable_v1(
                 *output_id,
                 dimensions,
                 *reducer,
-            )?,
+            ),
             executable::Op::ReduceWindow {
                 input_ids,
                 init_value_ids,
@@ -3052,13 +3858,17 @@ fn execute_executable_v1(
                 *output_id,
                 attributes,
                 *reducer,
-            )?,
+            ),
             executable::Op::Matmul {
                 input_ids,
                 output_id,
                 dimension_numbers,
                 top_k_epilogue,
-            } => execute_matmul(
+            lhs_grouped_head_view,
+            rhs_grouped_head_view,
+            lhs_gather_view,
+            rhs_gather_view,
+        } => execute_matmul(
                 &mut values,
                 plan,
                 device,
@@ -3067,55 +3877,66 @@ fn execute_executable_v1(
                 *output_id,
                 dimension_numbers,
                 top_k_epilogue.as_ref(),
-            )?,
+                lhs_grouped_head_view.as_ref(),
+                rhs_grouped_head_view.as_ref(),
+                lhs_gather_view.as_ref(),
+                rhs_gather_view.as_ref(),
+            ),
             executable::Op::Constant {
                 packed_value,
                 data,
                 output_id,
             } => {
-                execute_constant(
-                    &mut values,
-                    plan,
-                    device,
-                    output_context,
-                    *packed_value,
-                    data,
-                    *output_id,
-                )?;
+                if data.is_empty()
+                    && output_context
+                        .analysis
+                        .lazy_splat_constants
+                        .contains(output_id)
+                {
+                    Ok(())
+                } else {
+                    execute_constant(
+                        &mut values,
+                        plan,
+                        device,
+                        output_context,
+                        *packed_value,
+                        data,
+                        *output_id,
+                    )
+                }
             }
             executable::Op::Select {
                 input_ids,
                 output_id,
-            } => {
-                execute_select(
-                    &mut values,
-                    plan,
-                    device,
-                    output_context,
-                    *input_ids,
-                    *output_id,
-                )?;
-            }
+            } => execute_select(
+                &mut values,
+                plan,
+                device,
+                output_context,
+                *input_ids,
+                *output_id,
+            ),
             executable::Op::BroadcastInDim {
                 input_id,
                 output_id,
                 broadcast_dimensions,
-            } => {
-                execute_broadcast_in_dim(
-                    &mut values,
-                    plan,
-                    device,
-                    output_context,
-                    *input_id,
-                    *output_id,
-                    broadcast_dimensions,
-                )?;
-            }
+            } => execute_broadcast_in_dim(
+                &mut values,
+                plan,
+                device,
+                output_context,
+                *input_id,
+                *output_id,
+                broadcast_dimensions,
+            ),
             executable::Op::Gather {
                 input_ids,
                 output_id,
                 dimension_numbers,
                 slice_sizes,
+                operand_dim_strides,
+                operand_dim_offsets,
                 ..
             } => execute_gather(
                 &mut values,
@@ -3126,7 +3947,9 @@ fn execute_executable_v1(
                 *output_id,
                 dimension_numbers,
                 slice_sizes,
-            )?,
+                operand_dim_strides,
+                operand_dim_offsets,
+            ),
             executable::Op::Scatter {
                 input_ids,
                 output_id,
@@ -3140,7 +3963,7 @@ fn execute_executable_v1(
                 *input_ids,
                 *output_id,
                 dimension_numbers,
-            )?,
+            ),
             executable::Op::Iota {
                 output_id,
                 iota_dimension,
@@ -3151,36 +3974,58 @@ fn execute_executable_v1(
                 output_context,
                 *output_id,
                 *iota_dimension,
-            )?,
+            ),
             executable::Op::TopK {
                 input_id,
                 values_id,
                 indices_id,
                 k,
-            } => execute_top_k(
-                &mut values,
-                plan,
-                device,
-                output_context,
-                *input_id,
-                *values_id,
-                *indices_id,
-                *k,
-            )?,
+            } => {
+                if output_context
+                    .analysis
+                    .skipped_topk_inputs
+                    .contains(input_id)
+                {
+                    Ok(())
+                } else {
+                    execute_top_k(
+                        &mut values,
+                        plan,
+                        device,
+                        output_context,
+                        *input_id,
+                        *values_id,
+                        *indices_id,
+                        *k,
+                    )
+                }
+            }
             executable::Op::FusedElementwise {
                 input_ids,
                 output_id,
                 nodes,
-            } => execute_fused_elementwise(
-                &mut values,
-                plan,
-                device,
-                output_context,
-                input_ids,
-                *output_id,
-                nodes,
-            )?,
-        }
+            } => {
+                if output_context
+                    .analysis
+                    .skipped_fused_outputs
+                    .contains(output_id)
+                {
+                    Ok(())
+                } else {
+                    execute_fused_elementwise(
+                        &mut values,
+                        plan,
+                        device,
+                        output_context,
+                        input_ids,
+                        *output_id,
+                        nodes,
+                    )
+                }
+            }
+            }
+        })();
+        op_result?;
     }
     device.finish_dispatch().map_err(io_error)?;
 
@@ -3249,6 +4094,8 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         device: execute_device,
         memory: target_device.default_memory,
         local_hardware_id: target_local_hardware_id,
+        analysis: StdArc::clone(&executable.metadata.analysis),
+        lazy_reshape_cache: StdArc::clone(&executable.metadata.lazy_reshape_cache),
     };
     let output_buffers = {
         let _guard = match target_device.runtime_lock.lock() {
@@ -3408,6 +4255,7 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         memory: target_memory,
         local_hardware_id,
         dram_buffer: Some(dram_buffer),
+        source_shape: None,
         deleted: false,
     }));
     ptr::null_mut()
@@ -5895,6 +6743,7 @@ mod tests {
                     output_id,
                     dimension_numbers,
                     top_k_epilogue,
+                    ..
                 } = &executable.ops[2]
                 else {
                     panic!("dot_general should lower to Matmul");
@@ -5938,6 +6787,7 @@ mod tests {
                     output_id,
                     dimension_numbers,
                     top_k_epilogue,
+                    ..
                 } = &executable.ops[2]
                 else {
                     panic!("dot_general/top_k should lower to Matmul with top_k epilogue");

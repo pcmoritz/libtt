@@ -1,12 +1,14 @@
 #include <cstdint>
 
 namespace {
-constexpr uint32_t ARG_VIEW_KIND = 28;
+constexpr uint32_t ARG_GATHER_INDICES_ADDR = 28;
+constexpr uint32_t ARG_VIEW_KIND = 29;
 }  // namespace
 
 void kernel_main() {
   constexpr uint32_t cb_in0 = tt::CBIndex::c_0;
   constexpr uint32_t cb_source = tt::CBIndex::c_2;
+  constexpr uint32_t cb_gather_indices = tt::CBIndex::c_5;
   const uint32_t tile_bytes = get_tile_size(cb_in0);
   const uint32_t block_w = A(5);
   const uint32_t block_h = A(6);
@@ -20,6 +22,8 @@ void kernel_main() {
   const uint32_t total_batch_count = A(26);
   const uint32_t batch_stride = A(27);
   const View view = load_view(ARG_VIEW_KIND);
+  GatherIndexReader gather_indices =
+      make_gather_index_reader(A(ARG_GATHER_INDICES_ADDR), cb_gather_indices);
   volatile tt_l1_ptr uint32_t *sender_sem = SEM(21);
   volatile tt_l1_ptr uint32_t *recv_sem = SEM(22);
   *recv_sem = VALID;
@@ -87,7 +91,8 @@ void kernel_main() {
                   canonical_col_tile,
                   l1_addr,
                   tile_bytes,
-                  cb_source);
+                  cb_source,
+                  gather_indices);
             } else {
               fill_generic_tile(
                   in0_gen,
@@ -97,7 +102,8 @@ void kernel_main() {
                   canonical_col_tile,
                   l1_addr,
                   tile_bytes,
-                  cb_source);
+                  cb_source,
+                  gather_indices);
             }
             l1_addr += tile_bytes;
             block_bytes += tile_bytes;
