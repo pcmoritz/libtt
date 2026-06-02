@@ -53,30 +53,6 @@ void copy_element(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
       source[tile_element_index(source_row, source_col)];
 }
 
-void copy_row(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
-              uint32_t source_col, uint32_t output_row, uint32_t output_col,
-              uint32_t count) {
-  volatile tt_l1_ptr Element *source =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_input));
-  volatile tt_l1_ptr Element *output =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
-  if (count == TILE_C && source_col == 0 && output_col == 0) {
-    uint32_t source_face0 = tile_element_index(source_row, 0);
-    uint32_t source_face1 = tile_element_index(source_row, FACE_C);
-    uint32_t output_face0 = tile_element_index(output_row, 0);
-    uint32_t output_face1 = tile_element_index(output_row, FACE_C);
-    for (uint32_t col = 0; col < FACE_C; ++col) {
-      output[output_face0 + col] = source[source_face0 + col];
-      output[output_face1 + col] = source[source_face1 + col];
-    }
-    return;
-  }
-  for (uint32_t col = 0; col < count; ++col) {
-    output[tile_element_index(output_row, output_col + col)] =
-        source[tile_element_index(source_row, source_col + col)];
-  }
-}
-
 uint32_t input_tile_id(uint32_t batch, uint32_t tile_row, uint32_t tile_col,
                        uint32_t input_tile_rows, uint32_t input_tiles_per_row) {
   return (batch * input_tile_rows + tile_row) * input_tiles_per_row + tile_col;
@@ -159,10 +135,11 @@ void kernel_main() {
 
           read_input_tile(input_addr[input_index], tile_id, cb_input);
           for (uint32_t row = row_begin; row < row_end; ++row) {
-            copy_row(cb_input, cb_output, row - output_row_base,
-                     copy_col_begin - concat_offsets[input_index] - source_tile_col_base,
-                     row - output_row_base, copy_col_begin - output_col_base,
-                     copy_col_end - copy_col_begin);
+            for (uint32_t col = copy_col_begin; col < copy_col_end; ++col) {
+              copy_element(cb_input, cb_output, row - output_row_base,
+                           col - concat_offsets[input_index] - source_tile_col_base,
+                           row - output_row_base, col - output_col_base);
+            }
           }
           cb_pop_front(cb_input, 1);
         }
@@ -199,11 +176,12 @@ void kernel_main() {
 
           read_input_tile(input_addr[input_index], tile_id, cb_input);
           for (uint32_t row = copy_row_begin; row < copy_row_end; ++row) {
-            copy_row(cb_input, cb_output,
-                     row - concat_offsets[input_index] - source_tile_row_base,
-                     source_col_begin - output_col_base, row - output_row_base,
-                     source_col_begin - output_col_base,
-                     source_col_end - source_col_begin);
+            for (uint32_t col = source_col_begin; col < source_col_end; ++col) {
+              copy_element(cb_input, cb_output,
+                           row - concat_offsets[input_index] - source_tile_row_base,
+                           col - output_col_base, row - output_row_base,
+                           col - output_col_base);
+            }
           }
           cb_pop_front(cb_input, 1);
         }

@@ -155,10 +155,7 @@ fn transpose_program(key: TransposeProgramKey) -> io::Result<Program> {
         reader_kernel: transpose_reader_source(key.dtype, &key.shape)?,
         writer_kernel: WRITER.to_owned(),
         compile: CompileConfig {
-            cbs: vec![
-                CBConfig::new(0, key.dtype).with_tiles(transpose_input_cb_tiles(&key.shape)),
-                CBConfig::new(1, key.dtype),
-            ],
+            cbs: vec![CBConfig::new(0, key.dtype), CBConfig::new(1, key.dtype)],
             ..CompileConfig::default()
         },
         name: format!(
@@ -169,20 +166,6 @@ fn transpose_program(key: TransposeProgramKey) -> io::Result<Program> {
         ),
         ..Program::new(runtime_args)
     })
-}
-
-fn transpose_input_cb_tiles(shape: &TransposeKernelShape) -> usize {
-    if shape.rank == 3
-        && shape.permutation[0] == 2
-        && shape.permutation[1] == 0
-        && shape.permutation[2] == 1
-        && shape.input_shape[2] == 1
-        && shape.output_shape[0] == 1
-    {
-        32
-    } else {
-        1
-    }
 }
 
 fn shape_name(shape: &[u32; MAX_RANK], rank: u32) -> String {

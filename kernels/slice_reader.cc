@@ -78,30 +78,6 @@ void copy_element(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
       source[tile_element_index(source_row, source_col)];
 }
 
-void copy_row(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
-              uint32_t source_col, uint32_t output_row, uint32_t output_col,
-              uint32_t count) {
-  volatile tt_l1_ptr Element *source =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_input));
-  volatile tt_l1_ptr Element *output =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
-  if (count == TILE_C && source_col == 0 && output_col == 0) {
-    uint32_t source_face0 = tile_element_index(source_row, 0);
-    uint32_t source_face1 = tile_element_index(source_row, FACE_C);
-    uint32_t output_face0 = tile_element_index(output_row, 0);
-    uint32_t output_face1 = tile_element_index(output_row, FACE_C);
-    for (uint32_t col = 0; col < FACE_C; ++col) {
-      output[output_face0 + col] = source[source_face0 + col];
-      output[output_face1 + col] = source[source_face1 + col];
-    }
-    return;
-  }
-  for (uint32_t col = 0; col < count; ++col) {
-    output[tile_element_index(output_row, output_col + col)] =
-        source[tile_element_index(source_row, source_col + col)];
-  }
-}
-
 void decode_output_batch(uint32_t output_batch, uint32_t output_coords[COORD_COUNT]) {
   for (uint32_t dim = 0; dim < RANK; ++dim) {
     output_coords[dim] = 0;
@@ -240,10 +216,9 @@ void kernel_main() {
           }
         }
 
-        if (contiguous_cols) {
-          copy_row(cb_input, cb_output, source.row, source.col, row, col, run);
-        } else {
-          copy_element(cb_input, cb_output, source.row, source.col, row, col);
+        for (uint32_t i = 0; i < run; ++i) {
+          copy_element(cb_input, cb_output, source.row,
+                       contiguous_cols ? source.col + i : source.col, row, col + i);
         }
         col += run;
       }

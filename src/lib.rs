@@ -24,15 +24,13 @@ use dram::{allocator_stats, DType, DramBuffer};
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
-use std::sync::{Arc as StdArc, Mutex, Once, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc as StdArc, Mutex, Once};
 
 include!("pjrt_bindings.rs");
 
@@ -143,284 +141,6 @@ struct RuntimeMatmulTop1 {
     values_id: u32,
     indices_id: u32,
     k: u32,
-}
-
-#[derive(Default)]
-struct ExecutionProfileStats {
-    count: u64,
-    total_ns: u128,
-    max_ns: u128,
-}
-
-#[derive(Default)]
-struct ExecutionProfileState {
-    executions: u64,
-    timings: HashMap<String, ExecutionProfileStats>,
-}
-
-static EXECUTION_PROFILE_STATE: OnceLock<Mutex<ExecutionProfileState>> = OnceLock::new();
-
-fn execution_profile_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| matches!(env::var("LIBTT_EXEC_PROFILE").as_deref(), Ok("1")))
-}
-
-fn execution_profile_sync_each_op() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            env::var("LIBTT_EXEC_PROFILE_SYNC_EACH_OP").as_deref(),
-            Ok("1")
-        )
-    })
-}
-
-fn execution_profile_report_interval() -> u64 {
-    static INTERVAL: OnceLock<u64> = OnceLock::new();
-    *INTERVAL.get_or_init(|| {
-        env::var("LIBTT_EXEC_PROFILE_EVERY")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(100)
-    })
-}
-
-fn execution_profile_report_limit() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        env::var("LIBTT_EXEC_PROFILE_LIMIT")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(25)
-    })
-}
-
-fn execution_profile_reset_on_report() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            env::var("LIBTT_EXEC_PROFILE_RESET_ON_REPORT").as_deref(),
-            Ok("1")
-        )
-    })
-}
-
-fn profile_value_signature(plan: &executable::Executable, value_id: u32) -> String {
-    plan.values
-        .get(value_id as usize)
-        .map(|value| format!("{:?}{:?}", value.element_type, value.dims))
-        .unwrap_or_else(|| format!("value#{value_id}"))
-}
-
-fn profile_op_signature(op: &executable::Op, plan: &executable::Executable) -> String {
-    match op {
-        executable::Op::Parameter { output_id, .. } => {
-            format!("parameter {}", profile_value_signature(plan, *output_id))
-        }
-        executable::Op::Concatenate {
-            output_id,
-            dimension,
-            ..
-        } => format!(
-            "concatenate dim={dimension} {}",
-            profile_value_signature(plan, *output_id)
-        ),
-        executable::Op::Reshape {
-            input_id,
-            output_id,
-        } => format!(
-            "reshape {} -> {}",
-            profile_value_signature(plan, *input_id),
-            profile_value_signature(plan, *output_id)
-        ),
-        executable::Op::Slice {
-            input_id,
-            output_id,
-            ..
-        } => format!(
-            "slice {} -> {}",
-            profile_value_signature(plan, *input_id),
-            profile_value_signature(plan, *output_id)
-        ),
-        executable::Op::Transpose {
-            input_id,
-            output_id,
-            permutation,
-        } => format!(
-            "transpose perm={permutation:?} {} -> {}",
-            profile_value_signature(plan, *input_id),
-            profile_value_signature(plan, *output_id)
-        ),
-        executable::Op::CustomCall {
-            output_id,
-            call_target_name,
-            ..
-        } => format!(
-            "custom_call target={call_target_name} {}",
-            profile_value_signature(plan, *output_id)
-        ),
-        executable::Op::Reduce {
-            output_id,
-            dimensions,
-            reducer,
-            ..
-        } => format!(
-            "reduce reducer={reducer:?} dims={dimensions:?} {}",
-            profile_value_signature(plan, *output_id)
-        ),
-        executable::Op::ReduceWindow {
-            output_id, reducer, ..
-        } => format!(
-            "reduce_window reducer={reducer:?} {}",
-            profile_value_signature(plan, *output_id)
-        ),
-        executable::Op::Matmul {
-            input_ids,
-            output_id,
-            dimension_numbers,
-            top_k_epilogue,
-            lhs_grouped_head_view,
-            rhs_grouped_head_view,
-            lhs_gather_view,
-            rhs_gather_view,
-            ..
-        } => format!(
-            "matmul topk={} gqa_lhs={} gqa_rhs={} gather_lhs={} gather_rhs={} lhs={} rhs={} out={} lhs_c={:?} rhs_c={:?} lhs_b={:?} rhs_b={:?}",
-            top_k_epilogue.is_some(),
-            lhs_grouped_head_view.is_some(),
-            rhs_grouped_head_view.is_some(),
-            lhs_gather_view.is_some(),
-            rhs_gather_view.is_some(),
-            profile_value_signature(plan, input_ids[0]),
-            profile_value_signature(plan, input_ids[1]),
-            profile_value_signature(plan, *output_id),
-            dimension_numbers.lhs_contracting_dimensions,
-            dimension_numbers.rhs_contracting_dimensions,
-            dimension_numbers.lhs_batching_dimensions,
-            dimension_numbers.rhs_batching_dimensions
-        ),
-        executable::Op::Constant {
-            output_id, data, ..
-        } => format!(
-            "constant data_bytes={} {}",
-            data.len(),
-            profile_value_signature(plan, *output_id)
-        ),
-        executable::Op::Select { output_id, .. } => {
-            format!("select {}", profile_value_signature(plan, *output_id))
-        }
-        executable::Op::BroadcastInDim {
-            input_id,
-            output_id,
-            broadcast_dimensions,
-        } => format!(
-            "broadcast dims={broadcast_dimensions:?} {} -> {}",
-            profile_value_signature(plan, *input_id),
-            profile_value_signature(plan, *output_id)
-        ),
-        executable::Op::Gather { output_id, .. } => {
-            format!("gather {}", profile_value_signature(plan, *output_id))
-        }
-        executable::Op::Scatter { output_id, .. } => {
-            format!("scatter {}", profile_value_signature(plan, *output_id))
-        }
-        executable::Op::Iota {
-            output_id,
-            iota_dimension,
-        } => format!(
-            "iota dim={iota_dimension} {}",
-            profile_value_signature(plan, *output_id)
-        ),
-        executable::Op::TopK { input_id, k, .. } => {
-            format!("topk k={k} {}", profile_value_signature(plan, *input_id))
-        }
-        executable::Op::FusedElementwise {
-            input_ids,
-            output_id,
-            nodes,
-        } => {
-            let node_kinds = nodes
-                .iter()
-                .map(|node| format!("{:?}", node.kind))
-                .collect::<Vec<_>>()
-                .join(">");
-            format!(
-                "fused_elementwise root={:?} inputs={} nodes={} seq={} out={}",
-                nodes.last().map(|node| node.kind),
-                input_ids.len(),
-                nodes.len(),
-                node_kinds,
-                profile_value_signature(plan, *output_id)
-            )
-        }
-    }
-}
-
-fn record_execution_profile(signature: String, elapsed_ns: u128) {
-    if !execution_profile_enabled() {
-        return;
-    }
-    let state =
-        EXECUTION_PROFILE_STATE.get_or_init(|| Mutex::new(ExecutionProfileState::default()));
-    let Ok(mut state) = state.lock() else {
-        return;
-    };
-    let stats = state.timings.entry(signature).or_default();
-    stats.count += 1;
-    stats.total_ns += elapsed_ns;
-    stats.max_ns = stats.max_ns.max(elapsed_ns);
-}
-
-fn finish_profiled_execution() {
-    if !execution_profile_enabled() {
-        return;
-    }
-    let state =
-        EXECUTION_PROFILE_STATE.get_or_init(|| Mutex::new(ExecutionProfileState::default()));
-    let Ok(mut state) = state.lock() else {
-        return;
-    };
-    state.executions += 1;
-    if state.executions % execution_profile_report_interval() != 0 {
-        return;
-    }
-
-    let mut entries = state
-        .timings
-        .iter()
-        .map(|(signature, stats)| (signature, stats))
-        .collect::<Vec<_>>();
-    entries.sort_unstable_by(|(_, lhs), (_, rhs)| rhs.total_ns.cmp(&lhs.total_ns));
-
-    eprintln!(
-        "LIBTT_EXEC_PROFILE executions={} signatures={} sync_each_op={}",
-        state.executions,
-        state.timings.len(),
-        execution_profile_sync_each_op()
-    );
-    for (rank, (signature, stats)) in entries
-        .into_iter()
-        .take(execution_profile_report_limit())
-        .enumerate()
-    {
-        let total_ms = stats.total_ns as f64 / 1_000_000.0;
-        let avg_ms = total_ms / stats.count as f64;
-        let max_ms = stats.max_ns as f64 / 1_000_000.0;
-        eprintln!(
-            "LIBTT_EXEC_PROFILE #{:02} total_ms={:.3} avg_ms={:.3} max_ms={:.3} count={} {}",
-            rank + 1,
-            total_ms,
-            avg_ms,
-            max_ms,
-            stats.count,
-            signature
-        );
-    }
-    if execution_profile_reset_on_report() {
-        state.timings.clear();
-    }
 }
 
 #[repr(C)]
@@ -1809,42 +1529,6 @@ struct DeviceDramView<'a> {
     source_shape: Option<Vec<usize>>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct TransposeCacheKey {
-    allocation_identity: (usize, u64, u64, usize),
-    dtype: DType,
-    input_shape: Vec<usize>,
-    output_shape: Vec<usize>,
-    permutation: Vec<i64>,
-}
-
-#[derive(Clone, Debug)]
-struct TransposeCacheEntry {
-    _input: DramBuffer,
-    output: DramBuffer,
-}
-
-static TRANSPOSE_CACHE: OnceLock<Mutex<HashMap<TransposeCacheKey, TransposeCacheEntry>>> =
-    OnceLock::new();
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct ReshapeCacheKey {
-    allocation_identity: (usize, u64, u64, usize),
-    input_dtype: DType,
-    output_dtype: DType,
-    input_shape: Vec<usize>,
-    output_shape: Vec<usize>,
-}
-
-#[derive(Clone, Debug)]
-struct ReshapeCacheEntry {
-    _input: DramBuffer,
-    output: DramBuffer,
-}
-
-static RESHAPE_CACHE: OnceLock<Mutex<HashMap<ReshapeCacheKey, ReshapeCacheEntry>>> =
-    OnceLock::new();
-
 const STATIC_MATMUL_GATHER_INDICES_ID: u32 = u32::MAX;
 
 fn reshape_input_id(plan: &executable::Executable, output_id: u32) -> Option<u32> {
@@ -2390,36 +2074,6 @@ fn execute_reshape(
                 "reshape",
             );
         }
-        let input = device_buffer_for_value(values, input_id, "reshape.operand")?;
-        if let Some(input_dram) = input.dram_buffer.as_ref() {
-            if let Some(key) = reshape_cache_key(
-                &context.analysis,
-                input_id,
-                input_dram,
-                input_dtype,
-                output_dtype,
-                &input_shape,
-                &output_shape,
-            ) {
-                let cache = RESHAPE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-                let cached = cache
-                    .lock()
-                    .map_err(|_| failed_precondition("reshape cache lock is poisoned"))?
-                    .get(&key)
-                    .map(|entry| entry.output.clone());
-                if let Some(output_dram) = cached {
-                    return store_output_buffer(
-                        values,
-                        plan,
-                        output_id,
-                        output_desc.dims.clone(),
-                        output_dram,
-                        context,
-                        "reshape.cache",
-                    );
-                }
-            }
-        }
     }
 
     let input = device_dram_view_for_value(values, plan, context, input_id, "reshape.operand")?;
@@ -2427,15 +2081,6 @@ fn execute_reshape(
         .source_shape
         .as_deref()
         .unwrap_or(input_shape.as_slice());
-    let cache_key = reshape_cache_key(
-        &context.analysis,
-        input_id,
-        input.dram_buffer,
-        input_dtype,
-        output_dtype,
-        &input_shape,
-        &output_shape,
-    );
     let output_dims = output_desc.dims.clone();
     let output_dram = kernels::reshape::reshape(
         device,
@@ -2447,19 +2092,6 @@ fn execute_reshape(
         "pjrt_reshape",
     )
     .map_err(io_error)?;
-    if let Some(key) = cache_key {
-        let cache = RESHAPE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        cache
-            .lock()
-            .map_err(|_| failed_precondition("reshape cache lock is poisoned"))?
-            .insert(
-                key,
-                ReshapeCacheEntry {
-                    _input: input.dram_buffer.clone(),
-                    output: output_dram.clone(),
-                },
-            );
-    }
     store_output_buffer(
         values,
         plan,
@@ -2596,67 +2228,6 @@ fn execute_fused_elementwise(
     )
 }
 
-fn reshape_cache_key(
-    analysis: &ExecutableAnalysis,
-    input_id: u32,
-    input: &DramBuffer,
-    input_dtype: DType,
-    output_dtype: DType,
-    input_shape: &[usize],
-    output_shape: &[usize],
-) -> Option<ReshapeCacheKey> {
-    const MIN_CACHED_RESHAPE_ELEMENTS: usize = 1024;
-    if input_dtype != DType::Float16B
-        || output_dtype != DType::Float16B
-        || input_shape.len() != 1
-        || output_shape.len() != 2
-        || output_shape[0] != 1
-        || output_shape[1] != input_shape[0]
-        || input_shape[0] < MIN_CACHED_RESHAPE_ELEMENTS
-        || !analysis.parameter_values.contains(&input_id)
-    {
-        return None;
-    }
-    Some(ReshapeCacheKey {
-        allocation_identity: input.allocation_identity()?,
-        input_dtype,
-        output_dtype,
-        input_shape: input_shape.to_vec(),
-        output_shape: output_shape.to_vec(),
-    })
-}
-
-fn transpose_cache_key(
-    analysis: &ExecutableAnalysis,
-    input_id: u32,
-    input: &DramBuffer,
-    dtype: DType,
-    input_shape: &[usize],
-    output_shape: &[usize],
-    permutation: &[i64],
-) -> Option<TransposeCacheKey> {
-    const MIN_CACHED_TRANSPOSE_ELEMENTS: usize = 1_000_000;
-    let element_count = input_shape
-        .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
-    if dtype != DType::Float16B
-        || input_shape.len() != 2
-        || output_shape.len() != 2
-        || permutation != [1, 0]
-        || element_count < MIN_CACHED_TRANSPOSE_ELEMENTS
-        || !analysis.parameter_values.contains(&input_id)
-    {
-        return None;
-    }
-    Some(TransposeCacheKey {
-        allocation_identity: input.allocation_identity()?,
-        dtype,
-        input_shape: input_shape.to_vec(),
-        output_shape: output_shape.to_vec(),
-        permutation: permutation.to_vec(),
-    })
-}
-
 fn execute_transpose(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2686,34 +2257,6 @@ fn execute_transpose(
         ));
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    let cache_key = transpose_cache_key(
-        &context.analysis,
-        input_id,
-        input_dram,
-        dtype,
-        &input_shape,
-        &output_shape,
-        permutation,
-    );
-    if let Some(key) = cache_key.as_ref() {
-        let cache = TRANSPOSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let cached = cache
-            .lock()
-            .map_err(|_| failed_precondition("transpose cache lock is poisoned"))?
-            .get(key)
-            .map(|entry| entry.output.clone());
-        if let Some(output_dram) = cached {
-            return store_output_buffer(
-                values,
-                plan,
-                output_id,
-                output_desc.dims.clone(),
-                output_dram,
-                context,
-                "transpose.cache",
-            );
-        }
-    }
     let output_dram = kernels::transpose::transpose(
         device,
         input_dram,
@@ -2724,19 +2267,6 @@ fn execute_transpose(
         "pjrt_transpose",
     )
     .map_err(io_error)?;
-    if let Some(key) = cache_key {
-        let cache = TRANSPOSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        cache
-            .lock()
-            .map_err(|_| failed_precondition("transpose cache lock is poisoned"))?
-            .insert(
-                key,
-                TransposeCacheEntry {
-                    _input: input_dram.clone(),
-                    output: output_dram.clone(),
-                },
-            );
-    }
     store_output_buffer(
         values,
         plan,
@@ -4186,7 +3716,6 @@ fn execute_executable_v1(
     let mut values = vec![None; plan.values.len()];
 
     for op in &plan.ops {
-        let profile_start = execution_profile_enabled().then(Instant::now);
         let op_result = (|| -> Result<(), *mut PJRT_Error> {
             match op {
             executable::Op::Parameter {
@@ -4497,19 +4026,8 @@ fn execute_executable_v1(
             }
         })();
         op_result?;
-        if execution_profile_sync_each_op() {
-            device.finish_dispatch().map_err(io_error)?;
-        }
-        if let Some(start) = profile_start {
-            record_execution_profile(profile_op_signature(op, plan), start.elapsed().as_nanos());
-        }
     }
-    let profile_start = execution_profile_enabled().then(Instant::now);
     device.finish_dispatch().map_err(io_error)?;
-    if let Some(start) = profile_start {
-        record_execution_profile("finish_dispatch".to_owned(), start.elapsed().as_nanos());
-    }
-    finish_profiled_execution();
 
     let mut outputs = Vec::with_capacity(plan.output_ids.len());
     for (index, &output_id) in plan.output_ids.iter().enumerate() {

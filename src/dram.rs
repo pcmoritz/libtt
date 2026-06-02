@@ -107,17 +107,6 @@ impl DramBuffer {
     pub(crate) fn size(&self) -> usize {
         self.num_tiles * self.page_size()
     }
-
-    pub(crate) fn allocation_identity(&self) -> Option<(usize, u64, u64, usize)> {
-        self._allocation.as_ref().map(|allocation| {
-            (
-                allocation.local_hardware_id,
-                allocation.addr,
-                allocation.size,
-                Arc::as_ptr(allocation) as usize,
-            )
-        })
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -658,9 +647,7 @@ fn next_allocation_range(
 
 fn allocation_range_size(num_tiles: usize, dtype: DType, bank_count: usize) -> io::Result<u64> {
     if bank_count == 0 {
-        return Err(io::Error::other(
-            "dram allocation requires at least one bank",
-        ));
+        return Err(io::Error::other("dram allocation requires at least one bank"));
     }
     let pages_per_bank = num_tiles.div_ceil(bank_count);
     let allocation_size = (pages_per_bank as u64)

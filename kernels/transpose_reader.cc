@@ -19,9 +19,6 @@ constexpr uint32_t INPUT_TILES_PER_ROW = (INPUT_SHAPE[RANK - 1] + TILE_C - 1) / 
 constexpr uint32_t OUTPUT_TILES_PER_ROW = (OUTPUT_COLS + TILE_C - 1) / TILE_C;
 constexpr uint32_t OUTPUT_MATRIX_TILES =
     ((OUTPUT_ROWS + TILE_R - 1) / TILE_R) * OUTPUT_TILES_PER_ROW;
-constexpr bool RANK3_LAST_DIM_TO_FRONT =
-    RANK == 3 && PERMUTATION[0] == 2 && PERMUTATION[1] == 0 &&
-    PERMUTATION[2] == 1 && INPUT_SHAPE[2] == 1 && OUTPUT_SHAPE[0] == 1;
 using Element = TRANSPOSE_ELEMENT_TYPE;
 
 uint32_t tile_element_index(uint32_t row, uint32_t col) {
@@ -31,8 +28,6 @@ uint32_t tile_element_index(uint32_t row, uint32_t col) {
   uint32_t col_in_face = col % FACE_C;
   return ((face_row * 2 + face_col) * FACE_R * FACE_C) + row_in_face * FACE_C + col_in_face;
 }
-
-uint32_t min_u32(uint32_t lhs, uint32_t rhs) { return lhs < rhs ? lhs : rhs; }
 
 void zero_tile(uint32_t cb) {
   volatile tt_l1_ptr uint32_t *ptr =
@@ -76,18 +71,6 @@ void copy_element(uint32_t input_l1_addr, uint32_t cb_output, uint32_t source_ro
       source[tile_element_index(source_row, source_col)];
 }
 
-void copy_input_col0_to_output_row(uint32_t input_l1_addr, uint32_t cb_output,
-                                   uint32_t output_row, uint32_t valid_cols) {
-  volatile tt_l1_ptr Element *source =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(input_l1_addr);
-  volatile tt_l1_ptr Element *output =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
-  for (uint32_t col = 0; col < valid_cols; ++col) {
-    output[tile_element_index(output_row, col)] =
-        source[tile_element_index(col, 0)];
-  }
-}
-
 void decompose_prefix(uint32_t flat, uint32_t *indices) {
   for (int32_t dim = static_cast<int32_t>(RANK) - 3; dim >= 0; --dim) {
     uint32_t extent = OUTPUT_SHAPE[dim];
@@ -129,46 +112,6 @@ void kernel_main() {
       .page_size = get_tile_size(cb_output),
       .data_format = get_dataformat(cb_output),
   };
-
-  if constexpr (RANK3_LAST_DIM_TO_FRONT) {
-    for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
-      uint32_t output_tile_id = output_tile_offset + tile;
-      uint32_t output_tile_row = output_tile_id / OUTPUT_TILES_PER_ROW;
-      uint32_t output_tile_col = output_tile_id % OUTPUT_TILES_PER_ROW;
-      uint32_t output_row_base = output_tile_row * TILE_R;
-      uint32_t output_col_base = output_tile_col * TILE_C;
-      uint32_t valid_rows =
-          output_row_base < OUTPUT_ROWS ? min_u32(TILE_R, OUTPUT_ROWS - output_row_base) : 0;
-      uint32_t valid_cols =
-          output_col_base < OUTPUT_COLS ? min_u32(TILE_C, OUTPUT_COLS - output_col_base) : 0;
-
-      cb_reserve_back(cb_output, 1);
-      zero_tile(cb_output);
-
-      cb_reserve_back(cb_input, valid_rows);
-      uint32_t input_l1_base = get_write_ptr(cb_input);
-      uint32_t input_tile_bytes = get_tile_size(cb_input);
-      for (uint32_t row = 0; row < valid_rows; ++row) {
-        uint32_t input_head = output_row_base + row;
-        uint32_t input_tile = input_head * INPUT_TILE_ROWS + output_tile_col;
-        uint32_t input_l1_addr = input_l1_base + row * input_tile_bytes;
-        noc_async_read_tile(input_tile, input, input_l1_addr);
-      }
-      noc_async_read_barrier();
-      cb_push_back(cb_input, valid_rows);
-      for (uint32_t row = 0; row < valid_rows; ++row) {
-        uint32_t input_l1_addr = input_l1_base + row * input_tile_bytes;
-        copy_input_col0_to_output_row(input_l1_addr, cb_output, row, valid_cols);
-      }
-      cb_pop_front(cb_input, valid_rows);
-
-      noc_async_write_tile(output_tile_id, output, get_write_ptr(cb_output));
-      noc_async_write_barrier();
-      cb_push_back(cb_output, 1);
-      cb_pop_front(cb_output, 1);
-    }
-    return;
-  }
 
   uint32_t output_indices[MAX_RANK];
   uint32_t input_indices[MAX_RANK];
