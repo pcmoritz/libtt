@@ -20,6 +20,28 @@ void copy_l1_bytes(uint32_t dst_l1_addr, uint32_t src_l1_addr, uint32_t bytes) {
     dst[i] = src[i];
   }
 }
+template <typename Element>
+void copy_packed_head_column_to_col0(uint32_t src_l1_addr, uint32_t dst_l1_addr,
+                                     uint32_t src_col, uint32_t valid_rows) {
+  volatile tt_l1_ptr Element *src =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(src_l1_addr);
+  volatile tt_l1_ptr Element *dst =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(dst_l1_addr);
+  for (uint32_t row = 0; row < valid_rows; ++row) {
+    dst[tile_element_index(row, 0)] = src[tile_element_index(row, src_col)];
+  }
+}
+void copy_packed_head_column_to_col0(uint32_t src_l1_addr, uint32_t dst_l1_addr,
+                                     uint32_t src_col, uint32_t valid_rows,
+                                     uint32_t element_bytes) {
+  if (element_bytes == sizeof(uint32_t)) {
+    copy_packed_head_column_to_col0<uint32_t>(
+        src_l1_addr, dst_l1_addr, src_col, valid_rows);
+  } else {
+    copy_packed_head_column_to_col0<uint16_t>(
+        src_l1_addr, dst_l1_addr, src_col, valid_rows);
+  }
+}
 void write_output_run(const InterleavedAddrGenFast<true> &out_gen, uint32_t dst_tile,
                       uint32_t dst_offset, uint32_t src_l1_addr, uint32_t bytes,
                       uint32_t scratch_l1_addr) {
@@ -70,6 +92,33 @@ void write_output_tile(const InterleavedAddrGenFast<true> &out_gen, const View &
   const uint32_t col_base = canonical_col_tile * TILE_C;
   cb_reserve_back(cb_scratch, 1);
   uint32_t scratch_l1_addr = get_write_ptr(cb_scratch);
+  if (output_view.kind == VIEW_PACKED_HEAD) {
+    zero_tile_at(scratch_l1_addr, element_bytes * TILE_R * TILE_C);
+    const uint32_t valid_rows =
+        row_base < output_view.logical_rows
+            ? ((output_view.logical_rows - row_base) < TILE_R
+                   ? (output_view.logical_rows - row_base)
+                   : TILE_R)
+            : 0;
+    const uint32_t valid_cols =
+        col_base < output_view.logical_cols
+            ? ((output_view.logical_cols - col_base) < TILE_C
+                   ? (output_view.logical_cols - col_base)
+                   : TILE_C)
+            : 0;
+    for (uint32_t col = 0; col < valid_cols; ++col) {
+      const uint32_t head = batch * output_view.group_size + col_base + col;
+      const uint32_t dst_tile =
+          (head * output_view.tile_rows + canonical_row_tile) *
+          output_view.tiles_per_row;
+      copy_packed_head_column_to_col0(
+          src_l1_addr, scratch_l1_addr, col, valid_rows, element_bytes);
+      noc_async_write_tile(dst_tile, out_gen, scratch_l1_addr);
+    }
+    cb_push_back(cb_scratch, 1);
+    cb_pop_front(cb_scratch, 1);
+    return;
+  }
   for (uint32_t row = 0; row < TILE_R; ++row) {
     const uint32_t logical_row = row_base + row;
     if (logical_row >= output_view.logical_rows) {
