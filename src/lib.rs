@@ -2135,6 +2135,16 @@ fn execute_top_k(
     )
 }
 
+fn kernel_matmul_grouped_head_view(
+    view: &executable::MatmulGroupedHeadView,
+) -> Result<kernels::matmul::MatmulGroupedHeadView, *mut PJRT_Error> {
+    Ok(kernels::matmul::MatmulGroupedHeadView {
+        logical_shape: dims_i64_to_usize(&view.logical_shape)?,
+        grouped_dimension: view.grouped_dimension as usize,
+        group_size: view.group_size as usize,
+    })
+}
+
 fn execute_matmul(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2144,6 +2154,8 @@ fn execute_matmul(
     output_id: u32,
     dimension_numbers: &executable::DotGeneralDimensionNumbers,
     top_k_epilogue: Option<&executable::MatmulTopKEpilogue>,
+    lhs_grouped_head_view: Option<&executable::MatmulGroupedHeadView>,
+    rhs_grouped_head_view: Option<&executable::MatmulGroupedHeadView>,
 ) -> Result<(), *mut PJRT_Error> {
     let lhs = device_buffer_for_value(values, input_ids[0], "matmul.lhs")?;
     let rhs = device_buffer_for_value(values, input_ids[1], "matmul.rhs")?;
@@ -2159,8 +2171,19 @@ fn execute_matmul(
     };
     let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
     let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+    let lhs_grouped_head_view = lhs_grouped_head_view
+        .map(kernel_matmul_grouped_head_view)
+        .transpose()?;
+    let rhs_grouped_head_view = rhs_grouped_head_view
+        .map(kernel_matmul_grouped_head_view)
+        .transpose()?;
 
     if let Some(epilogue) = top_k_epilogue {
+        if lhs_grouped_head_view.is_some() || rhs_grouped_head_view.is_some() {
+            return Err(invalid_argument(
+                "TT executable matmul top_k epilogue does not support grouped-head views",
+            ));
+        }
         if epilogue.k != 1 {
             return Err(invalid_argument(
                 "TT executable matmul top_k epilogue currently requires k=1",
@@ -2274,7 +2297,7 @@ fn execute_matmul(
             lhs.buffer_type, rhs.buffer_type
         )));
     }
-    let output_dram = kernels::matmul::matmul_dot_general(
+    let output_dram = kernels::matmul::matmul_dot_general_with_grouped_head_views(
         device,
         lhs_dram,
         rhs_dram,
@@ -2285,6 +2308,8 @@ fn execute_matmul(
         &dimension_numbers.rhs_batching_dimensions,
         &dimension_numbers.lhs_contracting_dimensions,
         &dimension_numbers.rhs_contracting_dimensions,
+        lhs_grouped_head_view.as_ref(),
+        rhs_grouped_head_view.as_ref(),
         kernels::matmul::MatmulEpilogue::Store { output_dtype },
         "pjrt_matmul",
     )
@@ -3058,6 +3083,8 @@ fn execute_executable_v1(
                 output_id,
                 dimension_numbers,
                 top_k_epilogue,
+                lhs_grouped_head_view,
+                rhs_grouped_head_view,
             } => execute_matmul(
                 &mut values,
                 plan,
@@ -3067,6 +3094,8 @@ fn execute_executable_v1(
                 *output_id,
                 dimension_numbers,
                 top_k_epilogue.as_ref(),
+                lhs_grouped_head_view.as_ref(),
+                rhs_grouped_head_view.as_ref(),
             )?,
             executable::Op::Constant {
                 packed_value,
@@ -5895,6 +5924,7 @@ mod tests {
                     output_id,
                     dimension_numbers,
                     top_k_epilogue,
+                    ..
                 } = &executable.ops[2]
                 else {
                     panic!("dot_general should lower to Matmul");
@@ -5938,6 +5968,7 @@ mod tests {
                     output_id,
                     dimension_numbers,
                     top_k_epilogue,
+                    ..
                 } = &executable.ops[2]
                 else {
                     panic!("dot_general/top_k should lower to Matmul with top_k epilogue");
