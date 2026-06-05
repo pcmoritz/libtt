@@ -6,7 +6,6 @@ constexpr uint32_t TILE_R = 32;
 constexpr uint32_t TILE_C = 32;
 constexpr uint32_t FACE_R = 16;
 constexpr uint32_t FACE_C = 16;
-constexpr uint32_t BF16_BYTES = 2;
 constexpr uint32_t NEG_INF_BF16_PAIR = 0xff7fff7f;
 
 uint32_t tile_element_index(uint32_t row, uint32_t col) {
@@ -17,11 +16,10 @@ uint32_t tile_element_index(uint32_t row, uint32_t col) {
   return ((face_row * 2 + face_col) * FACE_R * FACE_C) + row_in_face * FACE_C + col_in_face;
 }
 
-void fill_tile_u32(uint32_t l1_addr, uint32_t words, uint32_t value) {
-  volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(l1_addr);
-  for (uint32_t i = 0; i < words; ++i) {
-    ptr[i] = value;
-  }
+uint32_t tile_row_word_index(uint32_t row, uint32_t face_col) {
+  return ((row / FACE_R * 2 + face_col) * FACE_R * FACE_C +
+          (row % FACE_R) * FACE_C) /
+         2;
 }
 
 int32_t read_s32_element(uint32_t l1_addr, uint32_t row) {
@@ -41,10 +39,24 @@ void copy_bf16_row_from_l1(
     uint32_t source_row,
     uint32_t dst_addr,
     uint32_t dst_row) {
-  volatile tt_l1_ptr uint16_t *src = reinterpret_cast<volatile tt_l1_ptr uint16_t *>(source_l1);
-  volatile tt_l1_ptr uint16_t *dst = reinterpret_cast<volatile tt_l1_ptr uint16_t *>(dst_addr);
-  for (uint32_t col = 0; col < TILE_C; ++col) {
-    dst[tile_element_index(dst_row, col)] = src[tile_element_index(source_row, col)];
+  volatile tt_l1_ptr uint32_t *src = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(source_l1);
+  volatile tt_l1_ptr uint32_t *dst = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(dst_addr);
+  for (uint32_t face_col = 0; face_col < 2; ++face_col) {
+    uint32_t source_word = tile_row_word_index(source_row, face_col);
+    uint32_t dst_word = tile_row_word_index(dst_row, face_col);
+    for (uint32_t word = 0; word < FACE_C / 2; ++word) {
+      dst[dst_word + word] = src[source_word + word];
+    }
+  }
+}
+
+void zero_bf16_row(uint32_t l1_addr, uint32_t row) {
+  volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(l1_addr);
+  for (uint32_t face_col = 0; face_col < 2; ++face_col) {
+    uint32_t dst_word = tile_row_word_index(row, face_col);
+    for (uint32_t word = 0; word < FACE_C / 2; ++word) {
+      ptr[dst_word + word] = 0;
+    }
   }
 }
 
@@ -73,11 +85,21 @@ void copy_bf16_kv_rows_from_tiles(
 
 void write_mask_tile(uint32_t l1_addr, const bool valid[TILE_C]) {
   volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(l1_addr);
-  for (uint32_t row = 0; row < TILE_R; ++row) {
-    for (uint32_t col_pair = 0; col_pair < TILE_C; col_pair += 2) {
+  uint32_t mask_words[2][FACE_C / 2];
+  for (uint32_t face_col = 0; face_col < 2; ++face_col) {
+    for (uint32_t word = 0; word < FACE_C / 2; ++word) {
+      uint32_t col_pair = face_col * FACE_C + word * 2;
       uint32_t first = valid[col_pair] ? 0 : (NEG_INF_BF16_PAIR & 0xffffu);
       uint32_t second = valid[col_pair + 1] ? 0 : (NEG_INF_BF16_PAIR & 0xffff0000u);
-      ptr[tile_element_index(row, col_pair) / 2] = first | second;
+      mask_words[face_col][word] = first | second;
+    }
+  }
+  for (uint32_t row = 0; row < TILE_R; ++row) {
+    for (uint32_t face_col = 0; face_col < 2; ++face_col) {
+      uint32_t dst_word = tile_row_word_index(row, face_col);
+      for (uint32_t word = 0; word < FACE_C / 2; ++word) {
+        ptr[dst_word + word] = mask_words[face_col][word];
+      }
     }
   }
 }
@@ -169,33 +191,25 @@ void kernel_main() {
 
     for (uint32_t sk = 0; sk < active_sk_chunk_t; ++sk) {
       uint32_t global_tile = chunk + sk;
-      bool tile_has_valid_positions = global_tile * TILE_R < effective_seq_len;
       uint32_t cache_tiles[TILE_R];
-      if (!tile_has_valid_positions) {
-        for (uint32_t row = 0; row < TILE_R; ++row) {
-          valid_rows[sk][row] = false;
-          cache_tiles[row] = 0;
+      if (loaded_loc_tile != global_tile) {
+        if (loaded_loc_tile != 0xffffffffu) {
+          cb_push_back(cb_loc, 1);
+          cb_wait_front(cb_loc, 1);
+          cb_pop_front(cb_loc, 1);
         }
-      } else {
-        if (loaded_loc_tile != global_tile) {
-          if (loaded_loc_tile != 0xffffffffu) {
-            cb_push_back(cb_loc, 1);
-            cb_wait_front(cb_loc, 1);
-            cb_pop_front(cb_loc, 1);
-          }
-          read_s32_tile(loc_reader, global_tile, cb_loc);
-          loc_l1_addr = get_write_ptr(cb_loc);
-          loaded_loc_tile = global_tile;
-        }
+        read_s32_tile(loc_reader, global_tile, cb_loc);
+        loc_l1_addr = get_write_ptr(cb_loc);
+        loaded_loc_tile = global_tile;
+      }
 
-        for (uint32_t row = 0; row < TILE_R; ++row) {
-          uint32_t pos = global_tile * TILE_R + row;
-          int32_t cache_index = read_s32_element(loc_l1_addr, row);
-          bool valid = pos < effective_seq_len && cache_index > 0 &&
-                       cache_index < static_cast<int32_t>(CACHE_TOKENS);
-          valid_rows[sk][row] = valid;
-          cache_tiles[row] = valid ? static_cast<uint32_t>(cache_index) * DHT : 0;
-        }
+      for (uint32_t row = 0; row < TILE_R; ++row) {
+        uint32_t pos = global_tile * TILE_R + row;
+        int32_t cache_index = read_s32_element(loc_l1_addr, row);
+        bool valid = pos < effective_seq_len && cache_index > 0 &&
+                     cache_index < static_cast<int32_t>(CACHE_TOKENS);
+        valid_rows[sk][row] = valid;
+        cache_tiles[row] = valid ? static_cast<uint32_t>(cache_index) * DHT : 0;
       }
 
       for (uint32_t d = 0; d < DHT; ++d) {
@@ -203,18 +217,23 @@ void kernel_main() {
         uint32_t v_tile_index = sk * DHT + d;
         uint32_t k_dst = k_base + k_tile_index * tile_bytes;
         uint32_t v_dst = v_base + v_tile_index * tile_bytes;
-        fill_tile_u32(k_dst, tile_bytes / sizeof(uint32_t), 0);
-        fill_tile_u32(v_dst, tile_bytes / sizeof(uint32_t), 0);
-
-        if (!tile_has_valid_positions) {
-          continue;
-        }
 
         for (uint32_t row = 0; row < TILE_R; ++row) {
           if (valid_rows[sk][row]) {
             uint32_t cache_tile = cache_tiles[row] + d;
             copy_bf16_kv_rows_from_tiles(
-                k_reader, v_reader, cache_tile, cache_tile, cur_kv_head, k_dst, v_dst, row, cb_temp);
+                k_reader,
+                v_reader,
+                cache_tile,
+                cache_tile,
+                cur_kv_head,
+                k_dst,
+                v_dst,
+                row,
+                cb_temp);
+          } else {
+            zero_bf16_row(k_dst, row);
+            zero_bf16_row(v_dst, row);
           }
         }
       }
