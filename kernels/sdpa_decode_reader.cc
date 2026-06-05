@@ -48,27 +48,61 @@ void copy_bf16_row_from_l1(
   }
 }
 
+void zero_bf16_row(uint32_t dst_addr, uint32_t dst_row) {
+  volatile tt_l1_ptr uint16_t *dst = reinterpret_cast<volatile tt_l1_ptr uint16_t *>(dst_addr);
+  for (uint32_t col = 0; col < TILE_C; ++col) {
+    dst[tile_element_index(dst_row, col)] = 0;
+  }
+}
+
 template <typename KAddrGen, typename VAddrGen>
 void copy_bf16_kv_rows_from_tiles(
     const KAddrGen &k_gen,
     const VAddrGen &v_gen,
-    uint32_t k_tile,
-    uint32_t v_tile,
+    const uint32_t cache_tiles[TILE_R],
+    const bool valid[TILE_R],
+    uint32_t valid_count,
+    uint32_t d,
     uint32_t source_row,
     uint32_t k_dst_addr,
     uint32_t v_dst_addr,
-    uint32_t dst_row,
     uint32_t cb_temp) {
   uint32_t tile_bytes = get_tile_size(cb_temp);
-  cb_reserve_back(cb_temp, 2);
-  uint32_t temp_base = get_write_ptr(cb_temp);
-  noc_async_read_tile(k_tile, k_gen, temp_base);
-  noc_async_read_tile(v_tile, v_gen, temp_base + tile_bytes);
-  noc_async_read_barrier();
-  copy_bf16_row_from_l1(temp_base, source_row, k_dst_addr, dst_row);
-  copy_bf16_row_from_l1(temp_base + tile_bytes, source_row, v_dst_addr, dst_row);
-  cb_push_back(cb_temp, 2);
-  cb_pop_front(cb_temp, 2);
+  if (valid_count > 0) {
+    cb_reserve_back(cb_temp, valid_count * 2);
+    uint32_t temp_base = get_write_ptr(cb_temp);
+    uint32_t temp_index = 0;
+    for (uint32_t row = 0; row < TILE_R; ++row) {
+      if (!valid[row]) {
+        continue;
+      }
+      uint32_t k_tile = cache_tiles[row] + d;
+      uint32_t v_tile = cache_tiles[row] + d;
+      noc_async_read_tile(k_tile, k_gen, temp_base + (temp_index * 2) * tile_bytes);
+      noc_async_read_tile(v_tile, v_gen, temp_base + (temp_index * 2 + 1) * tile_bytes);
+      ++temp_index;
+    }
+    noc_async_read_barrier();
+
+    temp_index = 0;
+    for (uint32_t row = 0; row < TILE_R; ++row) {
+      if (valid[row]) {
+        copy_bf16_row_from_l1(temp_base + (temp_index * 2) * tile_bytes, source_row, k_dst_addr, row);
+        copy_bf16_row_from_l1(temp_base + (temp_index * 2 + 1) * tile_bytes, source_row, v_dst_addr, row);
+        ++temp_index;
+      } else {
+        zero_bf16_row(k_dst_addr, row);
+        zero_bf16_row(v_dst_addr, row);
+      }
+    }
+    cb_push_back(cb_temp, valid_count * 2);
+    cb_pop_front(cb_temp, valid_count * 2);
+  } else {
+    for (uint32_t row = 0; row < TILE_R; ++row) {
+      zero_bf16_row(k_dst_addr, row);
+      zero_bf16_row(v_dst_addr, row);
+    }
+  }
 }
 
 void write_mask_tile(uint32_t l1_addr, const bool valid[TILE_C]) {
@@ -168,31 +202,23 @@ void kernel_main() {
     for (uint32_t sk = 0; sk < SK_CHUNK_T; ++sk) {
       uint32_t global_tile = chunk + sk;
       bool tile_has_valid_positions = global_tile * TILE_R < effective_seq_len;
+      uint32_t cache_tiles[TILE_R];
+      uint32_t valid_count = 0;
       if (!tile_has_valid_positions) {
         for (uint32_t row = 0; row < TILE_R; ++row) {
           valid_rows[sk][row] = false;
+          cache_tiles[row] = 0;
         }
-      } else if (loaded_loc_tile != global_tile) {
-        if (loaded_loc_tile != 0xffffffffu) {
-          cb_push_back(cb_loc, 1);
-          cb_wait_front(cb_loc, 1);
-          cb_pop_front(cb_loc, 1);
-        }
-        read_s32_tile(loc_reader, global_tile, cb_loc);
-        loc_l1_addr = get_write_ptr(cb_loc);
-        loaded_loc_tile = global_tile;
-      }
-
-      for (uint32_t d = 0; d < DHT; ++d) {
-        uint32_t k_tile_index = d * SK_CHUNK_T + sk;
-        uint32_t v_tile_index = sk * DHT + d;
-        uint32_t k_dst = k_base + k_tile_index * tile_bytes;
-        uint32_t v_dst = v_base + v_tile_index * tile_bytes;
-        fill_tile_u32(k_dst, tile_bytes / sizeof(uint32_t), 0);
-        fill_tile_u32(v_dst, tile_bytes / sizeof(uint32_t), 0);
-
-        if (!tile_has_valid_positions) {
-          continue;
+      } else {
+        if (loaded_loc_tile != global_tile) {
+          if (loaded_loc_tile != 0xffffffffu) {
+            cb_push_back(cb_loc, 1);
+            cb_wait_front(cb_loc, 1);
+            cb_pop_front(cb_loc, 1);
+          }
+          read_s32_tile(loc_reader, global_tile, cb_loc);
+          loc_l1_addr = get_write_ptr(cb_loc);
+          loaded_loc_tile = global_tile;
         }
 
         for (uint32_t row = 0; row < TILE_R; ++row) {
@@ -200,16 +226,21 @@ void kernel_main() {
           int32_t cache_index = read_s32_element(loc_l1_addr, row);
           bool valid = pos < effective_seq_len && cache_index > 0 &&
                        cache_index < static_cast<int32_t>(CACHE_TOKENS);
-          if (d == 0) {
-            valid_rows[sk][row] = valid;
+          valid_rows[sk][row] = valid;
+          cache_tiles[row] = valid ? static_cast<uint32_t>(cache_index) * DHT : 0;
+          if (valid) {
+            ++valid_count;
           }
-          if (!valid) {
-            continue;
-          }
-          uint32_t cache_tile = static_cast<uint32_t>(cache_index) * DHT + d;
-          copy_bf16_kv_rows_from_tiles(
-              k_reader, v_reader, cache_tile, cache_tile, cur_kv_head, k_dst, v_dst, row, cb_temp);
         }
+      }
+
+      for (uint32_t d = 0; d < DHT; ++d) {
+        uint32_t k_tile_index = d * SK_CHUNK_T + sk;
+        uint32_t v_tile_index = sk * DHT + d;
+        uint32_t k_dst = k_base + k_tile_index * tile_bytes;
+        uint32_t v_dst = v_base + v_tile_index * tile_bytes;
+        copy_bf16_kv_rows_from_tiles(
+            k_reader, v_reader, cache_tiles, valid_rows[sk], valid_count, d, cur_kv_head, k_dst, v_dst, cb_temp);
       }
     }
 

@@ -278,7 +278,7 @@ fn sdpa_decode_program(key: SdpaDecodeProgramKey) -> io::Result<Program> {
                 CBConfig::new(7, DType::Float16B).with_tiles(1),
                 CBConfig::new(8, DType::Int32).with_tiles(1),
                 CBConfig::new(9, DType::Int32).with_tiles(1),
-                CBConfig::new(10, DType::Float16B).with_tiles(q_tiles.max(2)),
+                CBConfig::new(10, DType::Float16B).with_tiles(2 * TILE_R),
                 CBConfig::new(16, DType::Float16B).with_tiles(out_tiles),
                 CBConfig::new(17, DType::Float16B).with_tiles(1),
                 CBConfig::new(18, DType::Float16B).with_tiles(1),
