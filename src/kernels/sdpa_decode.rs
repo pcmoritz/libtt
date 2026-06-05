@@ -184,9 +184,9 @@ fn validate_sdpa_decode_shapes(
         )));
     }
     let key_tokens = loc_shape[0];
-    if key_tokens == 0 || key_tokens % TILE_R != 0 || cache_tokens == 0 {
+    if key_tokens == 0 || cache_tokens == 0 {
         return Err(invalid_input(format!(
-            "sdpa_decode requires non-empty tiled key/cache lengths, got key_tokens={key_tokens} cache_tokens={cache_tokens}"
+            "sdpa_decode requires non-empty key/cache lengths, got key_tokens={key_tokens} cache_tokens={cache_tokens}"
         )));
     }
     validate_tiled_buffer(q, q_shape, "q")?;
@@ -227,7 +227,7 @@ fn select_kv_head_cores(available: &[CoreCoord], kv_heads: usize) -> io::Result<
 
 fn sdpa_decode_program(key: SdpaDecodeProgramKey) -> io::Result<Program> {
     let dht = key.head_dim / TILE_C;
-    let st = key.key_tokens / TILE_R;
+    let st = key.key_tokens.div_ceil(TILE_R);
     let sk_chunk_t = sdpa_key_chunk_tiles(st);
     let mut runtime_args = RuntimeArgsBuilder::new(
         0,
