@@ -56,6 +56,20 @@ namespace {
 
 using mlir::func::FuncOp;
 
+constexpr llvm::StringLiteral kGroupedHeadExpansionTarget =
+    "libtt.grouped_head_expand";
+constexpr llvm::StringLiteral kGroupedHeadDimensionAttr =
+    "libtt.grouped_dimension";
+constexpr llvm::StringLiteral kGroupedHeadGroupSizeAttr =
+    "libtt.group_size";
+
+struct GroupedHeadExpansion {
+    mlir::Value source;
+    std::vector<int64_t> logical_shape;
+    uint32_t grouped_dimension;
+    uint32_t group_size;
+};
+
 void registerDialects(mlir::MLIRContext& context) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::func::FuncDialect>();
@@ -1043,6 +1057,11 @@ mlir::LogicalResult lowerSingleRhsMatmulTranspose(
     return mlir::success();
 }
 
+bool isGroupedHeadMatmulExpansion(mlir::stablehlo::DotGeneralOp dot_op);
+mlir::LogicalResult lowerSingleGroupedHeadMatmulExpansion(
+    mlir::stablehlo::DotGeneralOp dot_op,
+    mlir::PatternRewriter& rewriter);
+
 bool isNestedInCaseRegion(mlir::Operation* op) {
     return op->getParentOfType<mlir::stablehlo::CaseOp>() != nullptr;
 }
@@ -1101,6 +1120,8 @@ mlir::LogicalResult runCleanupRewritePatterns(
         &context, state, lowerSingleDynamicUpdateSliceToScatter));
     patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::PadOp>>(
         &context, state, lowerSinglePadToScatter));
+    patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::DotGeneralOp>>(
+        &context, state, lowerSingleGroupedHeadMatmulExpansion, isGroupedHeadMatmulExpansion));
     patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::DotGeneralOp>>(
         &context, state, lowerSingleRhsMatmulTranspose, isRhsMatmulTransposeFold));
     mlir::GreedyRewriteConfig config;
@@ -2336,23 +2357,13 @@ std::optional<MatmulTopKEpilogueRegion> collectMatmulTopKEpilogue(
     };
 }
 
-struct GroupedHeadExpansion {
-    mlir::Value source;
-    std::vector<int64_t> logical_shape;
-    uint32_t grouped_dimension;
-    uint32_t group_size;
-    llvm::SmallVector<mlir::Operation*> covered_ops;
-};
-
 std::optional<GroupedHeadExpansion> matchGroupedHeadExpansion(mlir::Value value) {
-    llvm::SmallVector<mlir::Operation*> covered_ops;
     mlir::Value current = value;
     while (auto custom_call_op =
                current.getDefiningOp<mlir::stablehlo::CustomCallOp>()) {
         if (!current.hasOneUse() || !isIdentityCustomCall(custom_call_op)) {
             return std::nullopt;
         }
-        covered_ops.push_back(custom_call_op.getOperation());
         current = custom_call_op.getInputs().front();
     }
 
@@ -2428,14 +2439,11 @@ std::optional<GroupedHeadExpansion> matchGroupedHeadExpansion(mlir::Value value)
         }
     }
 
-    covered_ops.push_back(reshape_op.getOperation());
-    covered_ops.push_back(broadcast_op.getOperation());
     return GroupedHeadExpansion{
         .source = broadcast_op.getOperand(),
         .logical_shape = std::vector<int64_t>(logical_shape.begin(), logical_shape.end()),
         .grouped_dimension = static_cast<uint32_t>(grouped_dim),
         .group_size = static_cast<uint32_t>(group_size),
-        .covered_ops = std::move(covered_ops),
     };
 }
 
@@ -2520,6 +2528,98 @@ bool isPackedGqaLhsExpansion(
     return true;
 }
 
+std::optional<GroupedHeadExpansion> markerGroupedHeadExpansion(mlir::Value value) {
+    auto custom_call_op = value.getDefiningOp<mlir::stablehlo::CustomCallOp>();
+    if (!custom_call_op ||
+        custom_call_op.getCallTargetName() != kGroupedHeadExpansionTarget ||
+        custom_call_op.getHasSideEffect() ||
+        custom_call_op->getNumResults() != 1 ||
+        custom_call_op.getInputs().size() != 1) {
+        return std::nullopt;
+    }
+
+    auto result_type = getStaticTensorType(custom_call_op.getResult(0));
+    auto source_type = getStaticTensorType(custom_call_op.getInputs().front());
+    auto grouped_dim_attr =
+        custom_call_op->getAttrOfType<mlir::IntegerAttr>(kGroupedHeadDimensionAttr);
+    auto group_size_attr =
+        custom_call_op->getAttrOfType<mlir::IntegerAttr>(kGroupedHeadGroupSizeAttr);
+    if (!result_type || !source_type || !grouped_dim_attr || !group_size_attr ||
+        result_type->getRank() != source_type->getRank()) {
+        return std::nullopt;
+    }
+
+    int64_t grouped_dim = grouped_dim_attr.getInt();
+    int64_t group_size = group_size_attr.getInt();
+    if (grouped_dim < 0 ||
+        grouped_dim >= result_type->getRank() ||
+        grouped_dim > std::numeric_limits<uint32_t>::max() ||
+        group_size <= 1 ||
+        group_size > std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;
+    }
+
+    return GroupedHeadExpansion{
+        .source = custom_call_op.getInputs().front(),
+        .logical_shape = std::vector<int64_t>(
+            result_type->getShape().begin(),
+            result_type->getShape().end()),
+        .grouped_dimension = static_cast<uint32_t>(grouped_dim),
+        .group_size = static_cast<uint32_t>(group_size),
+    };
+}
+
+bool isGroupedHeadExpansionMarker(mlir::stablehlo::CustomCallOp custom_call_op) {
+    return custom_call_op &&
+           custom_call_op.getCallTargetName() == kGroupedHeadExpansionTarget &&
+           markerGroupedHeadExpansion(custom_call_op.getResult(0)).has_value();
+}
+
+bool isGroupedHeadMatmulExpansion(mlir::stablehlo::DotGeneralOp dot_op) {
+    auto expansion = matchGroupedHeadExpansion(dot_op.getLhs());
+    return expansion.has_value() && isPackedGqaLhsExpansion(dot_op, *expansion);
+}
+
+mlir::LogicalResult lowerSingleGroupedHeadMatmulExpansion(
+    mlir::stablehlo::DotGeneralOp dot_op,
+    mlir::PatternRewriter& rewriter) {
+    auto expansion = matchGroupedHeadExpansion(dot_op.getLhs());
+    if (!expansion || !isPackedGqaLhsExpansion(dot_op, *expansion)) {
+        return mlir::failure();
+    }
+
+    llvm::SmallVector<mlir::NamedAttribute> attrs;
+    attrs.push_back(rewriter.getNamedAttr(
+        "call_target_name",
+        rewriter.getStringAttr(kGroupedHeadExpansionTarget)));
+    attrs.push_back(rewriter.getNamedAttr(
+        "has_side_effect",
+        rewriter.getBoolAttr(false)));
+    attrs.push_back(rewriter.getNamedAttr(
+        kGroupedHeadDimensionAttr,
+        rewriter.getI64IntegerAttr(expansion->grouped_dimension)));
+    attrs.push_back(rewriter.getNamedAttr(
+        kGroupedHeadGroupSizeAttr,
+        rewriter.getI64IntegerAttr(expansion->group_size)));
+
+    rewriter.setInsertionPoint(dot_op);
+    auto marker = rewriter.create<mlir::stablehlo::CustomCallOp>(
+        dot_op.getLoc(),
+        mlir::TypeRange{dot_op.getLhs().getType()},
+        mlir::ValueRange{expansion->source},
+        attrs);
+    auto replacement = rewriter.create<mlir::stablehlo::DotGeneralOp>(
+        dot_op.getLoc(),
+        dot_op.getResult().getType(),
+        marker.getResult(0),
+        dot_op.getRhs(),
+        dot_op.getDotDimensionNumbers(),
+        dot_op.getPrecisionConfigAttr(),
+        dot_op.getAlgorithmAttr());
+    rewriter.replaceOp(dot_op, replacement.getResult());
+    return mlir::success();
+}
+
 void fillMatmulGroupedHeadView(const GroupedHeadExpansion& expansion,
                                tt::MatmulGroupedHeadView* grouped_head_view) {
     for (int64_t dim : expansion.logical_shape) {
@@ -2527,35 +2627,6 @@ void fillMatmulGroupedHeadView(const GroupedHeadExpansion& expansion,
     }
     grouped_head_view->set_grouped_dimension(expansion.grouped_dimension);
     grouped_head_view->set_group_size(expansion.group_size);
-}
-
-void collectMatmulOperandGroupedHeadCoveredOps(
-    mlir::stablehlo::DotGeneralOp dot_op,
-    mlir::Value value,
-    llvm::DenseSet<mlir::Operation*>& covered) {
-    auto expansion = matchGroupedHeadExpansion(value);
-    if (!expansion || dot_op.getLhs() != value ||
-        !isPackedGqaLhsExpansion(dot_op, *expansion)) {
-        return;
-    }
-    for (mlir::Operation* op : expansion->covered_ops) {
-        covered.insert(op);
-    }
-}
-
-llvm::DenseSet<mlir::Operation*> collectMatmulGroupedHeadCoveredOps(FuncOp func) {
-    llvm::DenseSet<mlir::Operation*> covered;
-    for (mlir::Operation& op : func.front()) {
-        auto dot_op = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op);
-        if (!dot_op) {
-            continue;
-        }
-        collectMatmulOperandGroupedHeadCoveredOps(
-            dot_op, dot_op.getLhs(), covered);
-        collectMatmulOperandGroupedHeadCoveredOps(
-            dot_op, dot_op.getRhs(), covered);
-    }
-    return covered;
 }
 
 void addMatmulDimensions(
@@ -2584,7 +2655,7 @@ bool addMatmulOperand(
     std::string& error,
     uint32_t& id_out,
     tt::MatmulGroupedHeadView* grouped_head_view) {
-    if (auto expansion = matchGroupedHeadExpansion(value)) {
+    if (auto expansion = markerGroupedHeadExpansion(value)) {
         if (dot_op.getLhs() == value && isPackedGqaLhsExpansion(dot_op, *expansion)) {
             if (!addValueDesc(expansion->source, executable, value_ids, error, id_out)) {
                 return false;
@@ -2774,7 +2845,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
     auto fused_elementwise = buildFusedElementwisePlan(func);
     llvm::DenseSet<mlir::Operation*> matmul_top_k_covered_ops;
-    auto matmul_grouped_head_covered_ops = collectMatmulGroupedHeadCoveredOps(func);
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
         uint32_t output_id = 0;
@@ -2814,9 +2884,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
         if (matmul_top_k_covered_ops.contains(&op)) {
-            continue;
-        }
-        if (matmul_grouped_head_covered_ops.contains(&op)) {
             continue;
         }
 
@@ -3117,6 +3184,10 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto custom_call_op = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
+            if (isGroupedHeadExpansionMarker(custom_call_op)) {
+                continue;
+            }
+
             if (custom_call_op->getNumResults() != 1) {
                 error = "only single-result custom_call ops are currently supported";
                 return false;
