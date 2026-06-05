@@ -11,5 +11,6 @@ pub(crate) mod reshape;
 pub(crate) mod scatter;
 pub(crate) mod select;
 pub(crate) mod slice;
+pub(crate) mod sdpa_decode;
 pub(crate) mod topk;
 pub(crate) mod transpose;

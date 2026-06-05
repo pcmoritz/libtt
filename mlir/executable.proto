@@ -235,6 +235,19 @@ message BitwiseBinaryOp {
   Kind kind = 3;
 }
 
+message SdpaDecodeOp {
+  // Query, key cache, value cache, sequence lengths, and cache-location vector.
+  // The first supported lowering is decode-only BF16 attention with shapes:
+  // q=[1, q_heads, head_dim], k/v=[cache_tokens, kv_heads, head_dim],
+  // seq_lens=[1], loc=[key_tokens].
+  uint32 q_id = 1;
+  uint32 k_id = 2;
+  uint32 v_id = 3;
+  uint32 seq_lens_id = 4;
+  uint32 loc_id = 5;
+  uint32 scale_bf16_packed = 6;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -258,6 +271,7 @@ message Op {
     ScatterOp scatter = 32;
     BitwiseBinaryOp bitwise_binary = 33;
     ReduceWindowOp reduce_window = 34;
+    SdpaDecodeOp sdpa_decode = 35;
   }
 }
 

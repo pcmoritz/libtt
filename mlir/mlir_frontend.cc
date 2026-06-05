@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -55,6 +56,10 @@ bool TT_MlirAnalyzeProgram(
 namespace {
 
 using mlir::func::FuncOp;
+
+std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& error);
+
+constexpr llvm::StringLiteral kSdpaDecodeTarget = "tt.sdpa_decode";
 
 void registerDialects(mlir::MLIRContext& context) {
     mlir::DialectRegistry registry;
@@ -949,6 +954,22 @@ bool isIdentityCustomCall(mlir::stablehlo::CustomCallOp custom_call_op) {
            inputs.front().getType() == custom_call_op.getResult(0).getType();
 }
 
+mlir::Value peelIdentityCustomCalls(mlir::Value value) {
+    while (auto custom_call_op =
+               value.getDefiningOp<mlir::stablehlo::CustomCallOp>()) {
+        if (!isIdentityCustomCall(custom_call_op)) {
+            break;
+        }
+        value = custom_call_op.getInputs().front();
+    }
+    return value;
+}
+
+template <typename OpTy>
+OpTy definingOpSkippingIdentityCustomCalls(mlir::Value value) {
+    return peelIdentityCustomCalls(value).template getDefiningOp<OpTy>();
+}
+
 bool isLastTwoDimSwap(mlir::stablehlo::TransposeOp transpose_op) {
     if (!transpose_op) {
         return false;
@@ -1043,6 +1064,427 @@ mlir::LogicalResult lowerSingleRhsMatmulTranspose(
     return mlir::success();
 }
 
+std::optional<mlir::RankedTensorType> getStaticRankedTensor(mlir::Value value) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+    if (!tensor || !tensor.hasStaticShape()) {
+        return std::nullopt;
+    }
+    return tensor;
+}
+
+bool int64ArrayEquals(
+    llvm::ArrayRef<int64_t> values,
+    std::initializer_list<int64_t> expected) {
+    return values.size() == expected.size() &&
+           std::equal(values.begin(), values.end(), expected.begin());
+}
+
+bool isStaticBf16Tensor(mlir::Value value) {
+    auto tensor = getStaticRankedTensor(value);
+    return tensor && tensor->getElementType().isBF16();
+}
+
+bool isS32TensorWithLength(mlir::Value value, int64_t length) {
+    auto tensor = getStaticRankedTensor(value);
+    if (!tensor || tensor->getRank() != 1 || tensor->getDimSize(0) != length) {
+        return false;
+    }
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(tensor->getElementType());
+    return integer && integer.getWidth() == 32 && !integer.isUnsigned();
+}
+
+std::optional<mlir::Value> findS32TensorWithLength(
+    mlir::Value value,
+    int64_t length,
+    llvm::DenseSet<mlir::Value>& visited) {
+    if (!visited.insert(value).second) {
+        return std::nullopt;
+    }
+    if (mlir::isa<mlir::BlockArgument>(value) &&
+        isS32TensorWithLength(value, length)) {
+        return value;
+    }
+    mlir::Operation* op = value.getDefiningOp();
+    if (!op) {
+        return std::nullopt;
+    }
+    for (mlir::Value operand : op->getOperands()) {
+        if (auto match = findS32TensorWithLength(operand, length, visited)) {
+            return match;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<mlir::Value> findS32TensorWithLength(
+    mlir::Value value,
+    int64_t length) {
+    llvm::DenseSet<mlir::Value> visited;
+    return findS32TensorWithLength(value, length, visited);
+}
+
+std::optional<uint32_t> bf16PackedConstant(mlir::Value value) {
+    value = peelIdentityCustomCalls(value);
+    while (auto broadcast_op =
+               value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
+        value = peelIdentityCustomCalls(broadcast_op.getOperand());
+    }
+    if (!isStaticBf16Tensor(value)) {
+        return std::nullopt;
+    }
+    std::string ignored;
+    return packedConstantValue(value, ignored);
+}
+
+struct RepeatedCacheMatch {
+    mlir::Value cache;
+    mlir::Value loc;
+    int64_t cache_tokens = 0;
+    int64_t kv_heads = 0;
+    int64_t head_dim = 0;
+    int64_t key_tokens = 0;
+};
+
+std::optional<mlir::stablehlo::GatherOp> gatherFromCacheValue(mlir::Value value) {
+    value = peelIdentityCustomCalls(value);
+    if (auto gather_op = value.getDefiningOp<mlir::stablehlo::GatherOp>()) {
+        return gather_op;
+    }
+    if (auto select_op = value.getDefiningOp<mlir::stablehlo::SelectOp>()) {
+        mlir::Value on_true = peelIdentityCustomCalls(select_op.getOnTrue());
+        if (auto gather_op =
+                on_true.getDefiningOp<mlir::stablehlo::GatherOp>()) {
+            return gather_op;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<RepeatedCacheMatch> matchRepeatedCache(
+    mlir::Value value,
+    int64_t q_heads) {
+    value = peelIdentityCustomCalls(value);
+    auto reshape_op = value.getDefiningOp<mlir::stablehlo::ReshapeOp>();
+    if (!reshape_op) {
+        return std::nullopt;
+    }
+    auto reshape_type = getStaticRankedTensor(reshape_op.getResult());
+    if (!reshape_type || reshape_type->getRank() != 3 ||
+        reshape_type->getDimSize(1) != q_heads) {
+        return std::nullopt;
+    }
+    int64_t key_tokens = reshape_type->getDimSize(0);
+    int64_t head_dim = reshape_type->getDimSize(2);
+
+    auto broadcast_op =
+        definingOpSkippingIdentityCustomCalls<mlir::stablehlo::BroadcastInDimOp>(
+            reshape_op.getOperand());
+    if (!broadcast_op) {
+        return std::nullopt;
+    }
+    auto broadcast_type = getStaticRankedTensor(broadcast_op.getResult());
+    if (!broadcast_type || broadcast_type->getRank() != 4 ||
+        broadcast_type->getDimSize(0) != key_tokens ||
+        broadcast_type->getDimSize(3) != head_dim) {
+        return std::nullopt;
+    }
+    mlir::Value gathered_value = peelIdentityCustomCalls(broadcast_op.getOperand());
+    if (int64ArrayEquals(broadcast_op.getBroadcastDimensions(), {0, 1, 2, 3})) {
+        auto expand_op =
+            definingOpSkippingIdentityCustomCalls<mlir::stablehlo::BroadcastInDimOp>(
+                gathered_value);
+        auto expand_type = getStaticRankedTensor(gathered_value);
+        if (!expand_op || !expand_type || expand_type->getRank() != 4 ||
+            expand_type->getDimSize(0) != key_tokens ||
+            expand_type->getDimSize(2) != 1 ||
+            expand_type->getDimSize(3) != head_dim ||
+            !int64ArrayEquals(expand_op.getBroadcastDimensions(), {0, 1, 3})) {
+            return std::nullopt;
+        }
+        gathered_value = peelIdentityCustomCalls(expand_op.getOperand());
+    } else if (!int64ArrayEquals(broadcast_op.getBroadcastDimensions(), {0, 1, 3})) {
+        return std::nullopt;
+    }
+    int64_t kv_heads = broadcast_type->getDimSize(1);
+    int64_t repeat = broadcast_type->getDimSize(2);
+    if (kv_heads <= 0 || repeat <= 0 || kv_heads * repeat != q_heads) {
+        return std::nullopt;
+    }
+
+    auto gather_match = gatherFromCacheValue(gathered_value);
+    if (!gather_match) {
+        return std::nullopt;
+    }
+    auto gather_op = *gather_match;
+    auto gather_type = getStaticRankedTensor(gather_op.getResult());
+    auto cache_type = getStaticRankedTensor(gather_op.getOperand());
+    if (!gather_type || !cache_type ||
+        gather_type->getRank() != 3 ||
+        cache_type->getRank() != 3 ||
+        gather_type->getDimSize(0) != key_tokens ||
+        gather_type->getDimSize(1) != kv_heads ||
+        gather_type->getDimSize(2) != head_dim ||
+        cache_type->getDimSize(1) != kv_heads ||
+        cache_type->getDimSize(2) != head_dim ||
+        !isStaticBf16Tensor(gather_op.getOperand())) {
+        return std::nullopt;
+    }
+
+    auto loc = findS32TensorWithLength(gather_op.getStartIndices(), key_tokens);
+    if (!loc) {
+        return std::nullopt;
+    }
+    return RepeatedCacheMatch{
+        gather_op.getOperand(),
+        *loc,
+        cache_type->getDimSize(0),
+        kv_heads,
+        head_dim,
+        key_tokens};
+}
+
+std::optional<mlir::Value> peelSoftmaxInput(mlir::Value probabilities) {
+    auto div_op =
+        definingOpSkippingIdentityCustomCalls<mlir::stablehlo::DivOp>(
+            probabilities);
+    if (!div_op) {
+        return std::nullopt;
+    }
+    auto exp_op =
+        definingOpSkippingIdentityCustomCalls<mlir::stablehlo::ExpOp>(
+            div_op.getLhs());
+    if (!exp_op) {
+        return std::nullopt;
+    }
+    auto subtract_op =
+        definingOpSkippingIdentityCustomCalls<mlir::stablehlo::SubtractOp>(
+            exp_op.getOperand());
+    if (!subtract_op) {
+        return std::nullopt;
+    }
+    return peelIdentityCustomCalls(subtract_op.getLhs());
+}
+
+struct ScorePathMatch {
+    mlir::Value q;
+    mlir::Value k;
+    mlir::Value seq_lens;
+    mlir::Value loc;
+    uint32_t scale_bf16_packed = 0;
+};
+
+std::optional<ScorePathMatch> matchScorePath(
+    mlir::Value masked_scores,
+    int64_t q_heads,
+    int64_t key_tokens) {
+    auto seq_lens = findS32TensorWithLength(masked_scores, 1);
+    if (!seq_lens) {
+        return std::nullopt;
+    }
+
+    mlir::Value scaled_scores = peelIdentityCustomCalls(masked_scores);
+    for (unsigned depth = 0; depth < 4; ++depth) {
+        auto select_op = scaled_scores.getDefiningOp<mlir::stablehlo::SelectOp>();
+        if (!select_op) {
+            break;
+        }
+        scaled_scores = peelIdentityCustomCalls(select_op.getOnTrue());
+    }
+
+    auto multiply_op = scaled_scores.getDefiningOp<mlir::stablehlo::MulOp>();
+    if (!multiply_op) {
+        return std::nullopt;
+    }
+
+    mlir::Value score_tiles;
+    std::optional<uint32_t> scale_bf16_packed =
+        bf16PackedConstant(multiply_op.getLhs());
+    if (scale_bf16_packed) {
+        score_tiles = multiply_op.getRhs();
+    } else {
+        scale_bf16_packed = bf16PackedConstant(multiply_op.getRhs());
+        if (!scale_bf16_packed) {
+            return std::nullopt;
+        }
+        score_tiles = multiply_op.getLhs();
+    }
+    score_tiles = peelIdentityCustomCalls(score_tiles);
+
+    auto transpose_op = score_tiles.getDefiningOp<mlir::stablehlo::TransposeOp>();
+    auto score_type = getStaticRankedTensor(score_tiles);
+    if (!transpose_op || !score_type || score_type->getRank() != 3 ||
+        score_type->getDimSize(0) != 1 ||
+        score_type->getDimSize(1) != q_heads ||
+        score_type->getDimSize(2) != key_tokens) {
+        return std::nullopt;
+    }
+    auto dot_op =
+        definingOpSkippingIdentityCustomCalls<mlir::stablehlo::DotGeneralOp>(
+            transpose_op.getOperand());
+    if (!dot_op) {
+        return std::nullopt;
+    }
+    auto dims = dot_op.getDotDimensionNumbers();
+    if (!int64ArrayEquals(dims.getLhsBatchingDimensions(), {1}) ||
+        !int64ArrayEquals(dims.getRhsBatchingDimensions(), {1}) ||
+        !int64ArrayEquals(dims.getLhsContractingDimensions(), {2}) ||
+        !int64ArrayEquals(dims.getRhsContractingDimensions(), {2})) {
+        return std::nullopt;
+    }
+
+    auto lhs_k_match = matchRepeatedCache(dot_op.getLhs(), q_heads);
+    auto rhs_k_match = matchRepeatedCache(dot_op.getRhs(), q_heads);
+    mlir::Value q_value;
+    std::optional<RepeatedCacheMatch> k_match;
+    if (lhs_k_match && !rhs_k_match) {
+        q_value = dot_op.getRhs();
+        k_match = *lhs_k_match;
+    } else if (rhs_k_match && !lhs_k_match) {
+        q_value = dot_op.getLhs();
+        k_match = *rhs_k_match;
+    } else {
+        return std::nullopt;
+    }
+    auto q_type = getStaticRankedTensor(q_value);
+    if (!k_match || k_match->key_tokens != key_tokens ||
+        !q_type || q_type->getRank() != 3 ||
+        q_type->getDimSize(0) != 1 ||
+        q_type->getDimSize(1) != q_heads ||
+        q_type->getDimSize(2) != k_match->head_dim ||
+        !isStaticBf16Tensor(q_value)) {
+        return std::nullopt;
+    }
+
+    return ScorePathMatch{
+        q_value,
+        k_match->cache,
+        *seq_lens,
+        k_match->loc,
+        *scale_bf16_packed};
+}
+
+struct SdpaDecodeMatch {
+    mlir::Value q;
+    mlir::Value k;
+    mlir::Value v;
+    mlir::Value seq_lens;
+    mlir::Value loc;
+    uint32_t scale_bf16_packed = 0;
+};
+
+std::optional<SdpaDecodeMatch> matchSdpaDecodeTranspose(
+    mlir::stablehlo::TransposeOp transpose_op) {
+    auto output_type = getStaticRankedTensor(transpose_op.getResult());
+    if (!output_type || output_type->getRank() != 3 ||
+        output_type->getDimSize(0) != 1 ||
+        !output_type->getElementType().isBF16()) {
+        return std::nullopt;
+    }
+    int64_t q_heads = output_type->getDimSize(1);
+    int64_t head_dim = output_type->getDimSize(2);
+
+    auto value_dot =
+        definingOpSkippingIdentityCustomCalls<mlir::stablehlo::DotGeneralOp>(
+            transpose_op.getOperand());
+    if (!value_dot) {
+        return std::nullopt;
+    }
+    auto dims = value_dot.getDotDimensionNumbers();
+    if (!int64ArrayEquals(dims.getLhsBatchingDimensions(), {1}) ||
+        !int64ArrayEquals(dims.getRhsBatchingDimensions(), {1})) {
+        return std::nullopt;
+    }
+
+    mlir::Value probabilities;
+    auto lhs_v_match = matchRepeatedCache(value_dot.getLhs(), q_heads);
+    auto rhs_v_match = matchRepeatedCache(value_dot.getRhs(), q_heads);
+    std::optional<RepeatedCacheMatch> v_match;
+    if (lhs_v_match && !rhs_v_match &&
+        int64ArrayEquals(dims.getLhsContractingDimensions(), {0}) &&
+        int64ArrayEquals(dims.getRhsContractingDimensions(), {2})) {
+        probabilities = value_dot.getRhs();
+        v_match = *lhs_v_match;
+    } else if (rhs_v_match && !lhs_v_match &&
+               int64ArrayEquals(dims.getLhsContractingDimensions(), {2}) &&
+               int64ArrayEquals(dims.getRhsContractingDimensions(), {0})) {
+        probabilities = value_dot.getLhs();
+        v_match = *rhs_v_match;
+    } else {
+        return std::nullopt;
+    }
+
+    if (!v_match || v_match->head_dim != head_dim) {
+        return std::nullopt;
+    }
+    auto probabilities_type = getStaticRankedTensor(probabilities);
+    if (!probabilities_type || probabilities_type->getRank() != 3 ||
+        probabilities_type->getDimSize(0) != 1 ||
+        probabilities_type->getDimSize(1) != q_heads ||
+        probabilities_type->getDimSize(2) != v_match->key_tokens) {
+        return std::nullopt;
+    }
+    auto masked_scores = peelSoftmaxInput(probabilities);
+    if (!masked_scores) {
+        return std::nullopt;
+    }
+    auto score_match = matchScorePath(*masked_scores, q_heads, v_match->key_tokens);
+    if (!score_match ||
+        score_match->loc != v_match->loc) {
+        return std::nullopt;
+    }
+    auto q_type = getStaticRankedTensor(score_match->q);
+    if (!q_type || q_type->getRank() != 3 ||
+        q_type->getDimSize(0) != 1 ||
+        q_type->getDimSize(1) != q_heads ||
+        q_type->getDimSize(2) != head_dim) {
+        return std::nullopt;
+    }
+
+    return SdpaDecodeMatch{
+        score_match->q,
+        score_match->k,
+        v_match->cache,
+        score_match->seq_lens,
+        v_match->loc,
+        score_match->scale_bf16_packed};
+}
+
+bool isSdpaDecodeTranspose(mlir::stablehlo::TransposeOp transpose_op) {
+    return matchSdpaDecodeTranspose(transpose_op).has_value();
+}
+
+mlir::LogicalResult lowerSingleSdpaDecode(
+    mlir::stablehlo::TransposeOp transpose_op,
+    mlir::PatternRewriter& rewriter) {
+    auto match = matchSdpaDecodeTranspose(transpose_op);
+    if (!match) {
+        return mlir::failure();
+    }
+
+    rewriter.setInsertionPoint(transpose_op);
+    auto backend_config =
+        rewriter.getStringAttr(std::to_string(match->scale_bf16_packed));
+    auto custom_call = rewriter.create<mlir::stablehlo::CustomCallOp>(
+        transpose_op.getLoc(),
+        transpose_op->getResultTypes(),
+        mlir::ValueRange{
+            match->q,
+            match->k,
+            match->v,
+            match->seq_lens,
+            match->loc},
+        kSdpaDecodeTarget,
+        false,
+        backend_config,
+        mlir::stablehlo::CustomCallApiVersion::API_VERSION_ORIGINAL,
+        rewriter.getArrayAttr({}),
+        nullptr,
+        nullptr,
+        nullptr);
+    rewriter.replaceOp(transpose_op, custom_call.getResults());
+    return mlir::success();
+}
+
 bool isNestedInCaseRegion(mlir::Operation* op) {
     return op->getParentOfType<mlir::stablehlo::CaseOp>() != nullptr;
 }
@@ -1103,6 +1545,8 @@ mlir::LogicalResult runCleanupRewritePatterns(
         &context, state, lowerSinglePadToScatter));
     patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::DotGeneralOp>>(
         &context, state, lowerSingleRhsMatmulTranspose, isRhsMatmulTransposeFold));
+    patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::TransposeOp>>(
+        &context, state, lowerSingleSdpaDecode, isSdpaDecodeTranspose));
     mlir::GreedyRewriteConfig config;
     config.enableFolding();
     if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns), config))) {
@@ -1711,6 +2155,82 @@ std::optional<tt::BitwiseBinaryOp::Kind> bitwiseBinaryKind(mlir::Operation* op) 
         .Case<mlir::stablehlo::ShiftRightArithmeticOp>(
             [](auto) { return tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_ARITHMETIC; })
         .Default([](auto) { return std::nullopt; });
+}
+
+std::optional<uint32_t> sdpaDecodeScaleBf16Packed(
+    mlir::stablehlo::CustomCallOp custom_call_op,
+    std::string& error) {
+    auto backend_config = custom_call_op.getBackendConfig();
+    if (!backend_config) {
+        error = "tt.sdpa_decode custom_call requires backend_config";
+        return std::nullopt;
+    }
+    if (auto config = mlir::dyn_cast<mlir::StringAttr>(*backend_config)) {
+        uint64_t value = 0;
+        if (config.getValue().getAsInteger(10, value)) {
+            error = "tt.sdpa_decode string backend_config must be a scale_bf16_packed integer";
+            return std::nullopt;
+        }
+        if (value > std::numeric_limits<uint32_t>::max()) {
+            error = "tt.sdpa_decode scale_bf16_packed is out of range";
+            return std::nullopt;
+        }
+        return static_cast<uint32_t>(value);
+    }
+    auto config = mlir::dyn_cast<mlir::DictionaryAttr>(*backend_config);
+    if (!config) {
+        error = "tt.sdpa_decode custom_call requires string or dictionary backend_config";
+        return std::nullopt;
+    }
+    auto scale = mlir::dyn_cast_or_null<mlir::IntegerAttr>(
+        config.get("scale_bf16_packed"));
+    if (!scale) {
+        error = "tt.sdpa_decode custom_call requires integer scale_bf16_packed";
+        return std::nullopt;
+    }
+    uint64_t value = scale.getValue().getZExtValue();
+    if (value > std::numeric_limits<uint32_t>::max()) {
+        error = "tt.sdpa_decode scale_bf16_packed is out of range";
+        return std::nullopt;
+    }
+    return static_cast<uint32_t>(value);
+}
+
+bool addSdpaDecodeOp(
+    mlir::stablehlo::CustomCallOp custom_call_op,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    if (custom_call_op->getNumResults() != 1 || custom_call_op.getInputs().size() != 5) {
+        error = "tt.sdpa_decode custom_call must have five inputs and one result";
+        return false;
+    }
+    auto scale_bf16_packed = sdpaDecodeScaleBf16Packed(custom_call_op, error);
+    if (!scale_bf16_packed) {
+        return false;
+    }
+
+    uint32_t input_ids[5] = {};
+    for (auto [index, input] : llvm::enumerate(custom_call_op.getInputs())) {
+        if (!addValueDesc(input, executable, value_ids, error, input_ids[index])) {
+            return false;
+        }
+    }
+    uint32_t output_id = 0;
+    if (!addValueDesc(custom_call_op->getResult(0), executable, value_ids, error, output_id)) {
+        return false;
+    }
+
+    auto* op = executable.add_ops();
+    op->set_output_id(output_id);
+    auto* sdpa = op->mutable_sdpa_decode();
+    sdpa->set_q_id(input_ids[0]);
+    sdpa->set_k_id(input_ids[1]);
+    sdpa->set_v_id(input_ids[2]);
+    sdpa->set_seq_lens_id(input_ids[3]);
+    sdpa->set_loc_id(input_ids[4]);
+    sdpa->set_scale_bf16_packed(*scale_bf16_packed);
+    return true;
 }
 
 bool addTopKOp(
@@ -2855,6 +3375,12 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             }
 
             auto call_target = custom_call_op.getCallTargetName();
+            if (call_target == kSdpaDecodeTarget) {
+                if (!addSdpaDecodeOp(custom_call_op, executable, value_ids, error)) {
+                    return false;
+                }
+                continue;
+            }
             if ((call_target == "annotate_device_placement" || call_target == "Sharding") &&
                 !custom_call_op.getHasSideEffect()) {
                 auto inputs = custom_call_op.getInputs();
