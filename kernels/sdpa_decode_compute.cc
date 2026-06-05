@@ -175,7 +175,7 @@ void MAIN {
             cb_k_in,
             cb_qk_im,
             Sq_chunk_t,
-            Sk_chunk_t,
+            Sk_chunk_t_dynamic,
             DHt,
             qk_num_blocks,
             qk_in0_num_subblocks_dynamic,
@@ -193,7 +193,7 @@ void MAIN {
             Sk_chunk_t_dynamic);
         reconfig_data_format(cb_qk_im, cb_cur_max);
         pack_reconfig_data_format(cb_qk_im);
-        sub_exp_block_bcast_cols_inplace(cb_qk_im, cb_cur_max, Sq_chunk_t, Sk_chunk_t);
+        sub_exp_block_bcast_cols_inplace(cb_qk_im, cb_cur_max, Sq_chunk_t, Sk_chunk_t_dynamic);
         reconfig_data_format(cb_qk_im, cb_identity_scale_in);
         pack_reconfig_data_format(cb_cur_sum);
         reduce_c<PoolType::SUM, ReduceDim::REDUCE_ROW, cb_qk_im, cb_identity_scale_in, cb_cur_sum, Sq_chunk_t>(
@@ -206,7 +206,7 @@ void MAIN {
             cb_out_im,
             Sq_chunk_t,
             DHt,
-            Sk_chunk_t,
+            Sk_chunk_t_dynamic,
             out_num_blocks_dynamic,
             out_in0_num_subblocks,
             out_in1_num_subblocks,

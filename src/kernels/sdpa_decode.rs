@@ -278,7 +278,7 @@ fn sdpa_decode_program(key: SdpaDecodeProgramKey) -> io::Result<Program> {
                 CBConfig::new(7, DType::Float16B).with_tiles(1),
                 CBConfig::new(8, DType::Int32).with_tiles(1),
                 CBConfig::new(9, DType::Int32).with_tiles(1),
-                CBConfig::new(10, DType::Float16B).with_tiles(2 * TILE_R),
+                CBConfig::new(10, DType::Float16B).with_tiles(q_tiles.max(2)),
                 CBConfig::new(16, DType::Float16B).with_tiles(out_tiles),
                 CBConfig::new(17, DType::Float16B).with_tiles(1),
                 CBConfig::new(18, DType::Float16B).with_tiles(1),
@@ -354,7 +354,7 @@ fn compute_source(key: &SdpaDecodeProgramKey, st: usize, dht: usize, sk_chunk_t:
     let out_in0_num_subblocks = pnh_t / out_subblock_h;
     let out_in1_num_subblocks = dht / out_subblock_w;
     let mut source = format!(
-        "#include <cstdint>\n#define EXP_APPROX_MODE false\n{}\n{}\n{}",
+        "#include <cstdint>\n#define EXP_APPROX_MODE false\n#define DYNAMIC_CHUNK_SIZE 1\n{}\n{}\n{}",
         SDPA_RUNTIME_HELPERS,
         COMPUTE_COMMON,
         COMPUTE_TEMPLATE
@@ -440,8 +440,9 @@ inline SdpaRuntimeArgs get_runtime_args(
 }
 
 template <uint32_t Sk_chunk_t, uint32_t>
-inline uint32_t get_dynamic_Sk_chunk_t(int) {
-  return Sk_chunk_t;
+inline uint32_t get_dynamic_Sk_chunk_t(int cur_pos) {
+  uint32_t active_tiles = (static_cast<uint32_t>(cur_pos) + 32) / 32;
+  return active_tiles < Sk_chunk_t ? active_tiles : Sk_chunk_t;
 }
 "#;
 
