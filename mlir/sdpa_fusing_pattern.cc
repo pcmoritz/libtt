@@ -11,6 +11,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/stablehlo_utils.h"
 
 namespace libtt::mlir_frontend {
 namespace {
@@ -40,36 +41,6 @@ struct Components {
   mlir::Value loc;
   uint32_t scaleBf16Packed = 0;
 };
-
-bool isIdentityCustomCall(mlir::stablehlo::CustomCallOp customCallOp) {
-  if (!customCallOp || customCallOp->getNumResults() != 1 ||
-      customCallOp.getHasSideEffect()) {
-    return false;
-  }
-  auto callTarget = customCallOp.getCallTargetName();
-  if (callTarget != "annotate_device_placement" && callTarget != "Sharding") {
-    return false;
-  }
-  auto inputs = customCallOp.getInputs();
-  return inputs.size() == 1 &&
-         inputs.front().getType() == customCallOp.getResult(0).getType();
-}
-
-mlir::Value peelIdentityCustomCalls(mlir::Value value) {
-  while (auto customCallOp =
-             value.getDefiningOp<mlir::stablehlo::CustomCallOp>()) {
-    if (!isIdentityCustomCall(customCallOp)) {
-      break;
-    }
-    value = customCallOp.getInputs().front();
-  }
-  return value;
-}
-
-template <typename OpTy>
-OpTy definingOpSkippingIdentityCustomCalls(mlir::Value value) {
-  return peelIdentityCustomCalls(value).template getDefiningOp<OpTy>();
-}
 
 std::optional<mlir::RankedTensorType> getStaticRankedTensor(mlir::Value value) {
   auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
