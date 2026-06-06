@@ -13,6 +13,16 @@ constexpr uint32_t OPERAND_SHAPE[COORD_COUNT] = SCATTER_OPERAND_SHAPE;
 constexpr uint32_t UPDATE_SHAPE[COORD_COUNT] = SCATTER_UPDATE_SHAPE;
 constexpr uint32_t SCATTER_DIM = SCATTER_DIM_ARG;
 constexpr uint32_t UPDATE_COUNT = SCATTER_UPDATE_COUNT;
+constexpr bool OPERAND_RESHAPE_VIEW = SCATTER_OPERAND_RESHAPE_VIEW != 0;
+constexpr uint32_t SOURCE_ROWS = SCATTER_SOURCE_ROWS;
+constexpr uint32_t SOURCE_COLS = SCATTER_SOURCE_COLS;
+constexpr uint32_t SOURCE_TILE_ROWS = SCATTER_SOURCE_TILE_ROWS;
+constexpr uint32_t SOURCE_TILES_PER_ROW = SCATTER_SOURCE_TILES_PER_ROW;
+constexpr bool UPDATE_RESHAPE_VIEW = SCATTER_UPDATE_RESHAPE_VIEW != 0;
+constexpr uint32_t UPDATE_SOURCE_ROWS = SCATTER_UPDATE_SOURCE_ROWS;
+constexpr uint32_t UPDATE_SOURCE_COLS = SCATTER_UPDATE_SOURCE_COLS;
+constexpr uint32_t UPDATE_SOURCE_TILE_ROWS = SCATTER_UPDATE_SOURCE_TILE_ROWS;
+constexpr uint32_t UPDATE_SOURCE_TILES_PER_ROW = SCATTER_UPDATE_SOURCE_TILES_PER_ROW;
 constexpr uint32_t OPERAND_TILE_ROWS = SCATTER_OPERAND_TILE_ROWS;
 constexpr uint32_t OPERAND_TILES_PER_ROW = SCATTER_OPERAND_TILES_PER_ROW;
 constexpr uint32_t UPDATE_TILE_ROWS = SCATTER_UPDATE_TILE_ROWS;
@@ -39,6 +49,15 @@ uint32_t tile_extent(uint32_t logical_dim, uint32_t base, uint32_t tile_dim) {
   }
   uint32_t remaining = logical_dim - base;
   return remaining < tile_dim ? remaining : tile_dim;
+}
+
+void zero_tile(uint32_t cb) {
+  volatile tt_l1_ptr uint32_t *ptr =
+      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_write_ptr(cb));
+  uint32_t words = get_tile_size(cb) / sizeof(uint32_t);
+  for (uint32_t i = 0; i < words; ++i) {
+    ptr[i] = 0;
+  }
 }
 
 void read_tile_to_cb(const InterleavedAddrGenFast<true> &input, uint32_t tile_id,
@@ -107,6 +126,60 @@ Location tensor_location(const uint32_t shape[COORD_COUNT], uint32_t tile_rows,
   }
 }
 
+Location reshape_source_location(uint32_t flat_index, uint32_t rows, uint32_t cols,
+                                 uint32_t tile_rows, uint32_t tiles_per_row) {
+  uint32_t col = flat_index % cols;
+  uint32_t row_major = flat_index / cols;
+  uint32_t row = row_major % rows;
+  uint32_t batch = row_major / rows;
+  uint32_t tile_row = row / TILE_R;
+  uint32_t tile_col = col / TILE_C;
+  uint32_t tile = (batch * tile_rows + tile_row) * tiles_per_row + tile_col;
+  return Location{tile, row % TILE_R, col % TILE_C};
+}
+
+Location operand_location(const uint32_t coords[COORD_COUNT]) {
+  if constexpr (OPERAND_RESHAPE_VIEW) {
+    uint32_t flat = 0;
+    for (uint32_t dim = 0; dim < RANK; ++dim) {
+      flat = flat * OPERAND_SHAPE[dim] + coords[dim];
+    }
+    return reshape_source_location(flat, SOURCE_ROWS, SOURCE_COLS, SOURCE_TILE_ROWS,
+                                   SOURCE_TILES_PER_ROW);
+  } else {
+    return tensor_location(OPERAND_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW,
+                           coords);
+  }
+}
+
+Location update_location(const uint32_t coords[COORD_COUNT]) {
+  if constexpr (UPDATE_RESHAPE_VIEW) {
+    uint32_t flat = 0;
+    for (uint32_t dim = 0; dim < RANK; ++dim) {
+      flat = flat * UPDATE_SHAPE[dim] + coords[dim];
+    }
+    return reshape_source_location(flat, UPDATE_SOURCE_ROWS, UPDATE_SOURCE_COLS,
+                                   UPDATE_SOURCE_TILE_ROWS,
+                                   UPDATE_SOURCE_TILES_PER_ROW);
+  } else {
+    return tensor_location(UPDATE_SHAPE, UPDATE_TILE_ROWS, UPDATE_TILES_PER_ROW,
+                           coords);
+  }
+}
+
+void ensure_operand_tile(const InterleavedAddrGenFast<true> &operand,
+                         uint32_t requested_tile, uint32_t *loaded_tile) {
+  constexpr uint32_t cb_operand = tt::CBIndex::c_0;
+  if (requested_tile == *loaded_tile) {
+    return;
+  }
+  if (*loaded_tile != INVALID_TILE) {
+    cb_pop_front(cb_operand, 1);
+  }
+  read_tile_to_cb(operand, requested_tile, cb_operand);
+  *loaded_tile = requested_tile;
+}
+
 void ensure_index_tile(const InterleavedAddrGenFast<true> &indices,
                        uint32_t requested_tile, uint32_t *loaded_tile) {
   constexpr uint32_t cb_indices = tt::CBIndex::c_1;
@@ -143,12 +216,11 @@ void ensure_update_tile(const InterleavedAddrGenFast<true> &updates,
   *loaded_tile = requested_tile;
 }
 
-void copy_update_element(uint32_t source_row, uint32_t source_col,
-                         uint32_t output_row, uint32_t output_col) {
-  constexpr uint32_t cb_updates = tt::CBIndex::c_2;
+void copy_element(uint32_t source_cb, uint32_t source_row, uint32_t source_col,
+                  uint32_t output_row, uint32_t output_col) {
   constexpr uint32_t cb_output = tt::CBIndex::c_16;
   volatile tt_l1_ptr Element *source =
-      reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_updates));
+      reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(source_cb));
   volatile tt_l1_ptr Element *output =
       reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
   output[tile_element_index(output_row, output_col)] =
@@ -187,7 +259,6 @@ void kernel_main() {
 
   for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
     uint32_t output_tile_id = output_tile_offset + tile;
-    read_operand_tile_to_output(operand, output_tile_id, cb_output);
 
     uint32_t output_matrix_tiles = OPERAND_TILE_ROWS * OPERAND_TILES_PER_ROW;
     uint32_t output_batch = output_tile_id / output_matrix_tiles;
@@ -208,6 +279,30 @@ void kernel_main() {
 
     uint32_t base_coords[COORD_COUNT];
     decode_batch(output_batch, OPERAND_SHAPE, base_coords);
+
+    if constexpr (OPERAND_RESHAPE_VIEW) {
+      cb_reserve_back(cb_output, 1);
+      zero_tile(cb_output);
+      uint32_t loaded_operand_tile = INVALID_TILE;
+      for (uint32_t row = 0; row < row_count; ++row) {
+        uint32_t output_row = output_row_base + row;
+        for (uint32_t col = 0; col < col_count; ++col) {
+          uint32_t output_col = output_col_base + col;
+          uint32_t operand_coords[COORD_COUNT];
+          for (uint32_t dim = 0; dim < RANK; ++dim) {
+            operand_coords[dim] = output_coord(dim, base_coords, output_row, output_col);
+          }
+          Location source = operand_location(operand_coords);
+          ensure_operand_tile(operand, source.tile, &loaded_operand_tile);
+          copy_element(cb_operand, source.row, source.col, row, col);
+        }
+      }
+      if (loaded_operand_tile != INVALID_TILE) {
+        cb_pop_front(cb_operand, 1);
+      }
+    } else {
+      read_operand_tile_to_output(operand, output_tile_id, cb_output);
+    }
 
     uint32_t loaded_index_tile = INVALID_TILE;
     uint32_t loaded_update_tile = INVALID_TILE;
@@ -233,10 +328,9 @@ void kernel_main() {
                                      : output_coord(dim, base_coords, output_row, output_col);
           }
 
-          Location source =
-              tensor_location(UPDATE_SHAPE, UPDATE_TILE_ROWS, UPDATE_TILES_PER_ROW, update_coords);
+          Location source = update_location(update_coords);
           ensure_update_tile(updates, source.tile, &loaded_update_tile);
-          copy_update_element(source.row, source.col, row, col);
+          copy_element(cb_updates, source.row, source.col, row, col);
         }
       }
     }
