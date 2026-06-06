@@ -1505,7 +1505,7 @@ fn device_buffer_for_value<'a>(
 
 struct DeviceDramView<'a> {
     buffer_type: PJRT_Buffer_Type,
-    dims: Vec<i64>,
+    shape: Vec<usize>,
     dram_buffer: &'a DramBuffer,
     source_shape: Option<Vec<usize>>,
 }
@@ -1536,7 +1536,7 @@ fn device_dram_view_for_value<'a>(
         };
         return Ok(DeviceDramView {
             buffer_type: buffer.buffer_type,
-            dims: buffer.dims.clone(),
+            shape: dims_i64_to_usize(&buffer.dims)?,
             dram_buffer,
             source_shape: buffer.source_shape.clone(),
         });
@@ -1571,9 +1571,7 @@ fn device_dram_view_for_value<'a>(
     }
 
     let input_view = device_dram_view_for_value(values, plan, context, input_id, field)?;
-    let source_shape = input_view
-        .source_shape
-        .unwrap_or(dims_i64_to_usize(&input_view.dims)?);
+    let source_shape = input_view.source_shape.unwrap_or(input_view.shape);
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
     if element_count(&source_shape)? != element_count(&output_shape)? {
         return Err(invalid_argument(format!(
@@ -1583,7 +1581,7 @@ fn device_dram_view_for_value<'a>(
     let source_shape = (source_shape != output_shape).then_some(source_shape);
     Ok(DeviceDramView {
         buffer_type: output_desc.element_type,
-        dims: output_desc.dims.clone(),
+        shape: output_shape,
         dram_buffer: input_view.dram_buffer,
         source_shape,
     })
@@ -3056,7 +3054,7 @@ fn execute_gather(
             "TT executable gather currently only supports s32 start_indices",
         ));
     }
-    let operand_shape = dims_i64_to_usize(&operand.dims)?;
+    let operand_shape = operand.shape.clone();
     let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
@@ -3218,9 +3216,9 @@ fn execute_scatter(
         )));
     }
 
-    let operand_shape = dims_i64_to_usize(&operand.dims)?;
+    let operand_shape = operand.shape.clone();
     let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
-    let update_shape = dims_i64_to_usize(&updates.dims)?;
+    let update_shape = updates.shape.clone();
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
     if output_shape != operand_shape {
         return Err(invalid_argument(format!(
