@@ -31,6 +31,17 @@ struct ScorePathMatch {
   uint32_t scaleBf16Packed = 0;
 };
 
+struct MaskSelectMatch {
+  mlir::Value pred;
+  mlir::Value unmaskedValue;
+};
+
+struct DecodeMaskMatch {
+  mlir::Value scaledScores;
+  mlir::Value seqLens;
+  mlir::Value loc;
+};
+
 struct Components {
   mlir::Value q;
   mlir::Value k;
@@ -84,6 +95,11 @@ std::optional<uint32_t> bf16PackedConstant(mlir::Value value) {
   auto bits = dense.getSplatValue<llvm::APFloat>().bitcastToAPInt();
   uint32_t value16 = bits.extractBitsAsZExtValue(16, 0);
   return value16 | (value16 << 16);
+}
+
+bool isNegativeBf16Splat(mlir::Value value) {
+  auto packed = bf16PackedConstant(value);
+  return packed && ((*packed & 0x8000u) != 0);
 }
 
 bool findUniqueS32TensorWithLength(mlir::Value value, int64_t length,
@@ -164,6 +180,41 @@ std::optional<mlir::stablehlo::GatherOp> gatherFromCacheValue(
     }
   }
   return std::nullopt;
+}
+
+std::optional<MaskSelectMatch> matchScoreMaskSelect(mlir::Value value) {
+  value = peelIdentityCustomCalls(value);
+  auto selectOp = value.getDefiningOp<mlir::stablehlo::SelectOp>();
+  if (!selectOp || !isNegativeBf16Splat(selectOp.getOnFalse())) {
+    return std::nullopt;
+  }
+  return MaskSelectMatch{selectOp.getPred(),
+                         peelIdentityCustomCalls(selectOp.getOnTrue())};
+}
+
+std::optional<DecodeMaskMatch> matchDecodeScoreMasks(mlir::Value maskedScores,
+                                                     int64_t keyTokens) {
+  // Decode attention masks are nested as:
+  //   select(seq_len_mask, select(loc_mask, scaled_scores, -large), -large)
+  auto sequenceMask = matchScoreMaskSelect(maskedScores);
+  if (!sequenceMask) {
+    return std::nullopt;
+  }
+  auto seqLens = findUniqueS32TensorWithLength(sequenceMask->pred, 1);
+  if (!seqLens) {
+    return std::nullopt;
+  }
+
+  auto locationMask = matchScoreMaskSelect(sequenceMask->unmaskedValue);
+  if (!locationMask) {
+    return std::nullopt;
+  }
+  auto loc = findUniqueS32TensorWithLength(locationMask->pred, keyTokens);
+  if (!loc) {
+    return std::nullopt;
+  }
+
+  return DecodeMaskMatch{locationMask->unmaskedValue, *seqLens, *loc};
 }
 
 std::optional<RepeatedCacheMatch> matchRepeatedCache(mlir::Value value,
@@ -271,26 +322,13 @@ std::optional<mlir::Value> peelSoftmaxInput(mlir::Value probabilities) {
 std::optional<ScorePathMatch> matchScorePath(mlir::Value maskedScores,
                                              int64_t qHeads,
                                              int64_t keyTokens) {
-  mlir::Value scaledScores = peelIdentityCustomCalls(maskedScores);
-  auto outerMask = scaledScores.getDefiningOp<mlir::stablehlo::SelectOp>();
-  if (!outerMask) {
+  auto masks = matchDecodeScoreMasks(maskedScores, keyTokens);
+  if (!masks) {
     return std::nullopt;
   }
 
-  auto seqLens = findUniqueS32TensorWithLength(outerMask.getPred(), 1);
-  if (!seqLens) {
-    return std::nullopt;
-  }
-
-  for (unsigned depth = 0; depth < 4; ++depth) {
-    auto selectOp = scaledScores.getDefiningOp<mlir::stablehlo::SelectOp>();
-    if (!selectOp) {
-      break;
-    }
-    scaledScores = peelIdentityCustomCalls(selectOp.getOnTrue());
-  }
-
-  auto multiplyOp = scaledScores.getDefiningOp<mlir::stablehlo::MulOp>();
+  auto multiplyOp =
+      masks->scaledScores.getDefiningOp<mlir::stablehlo::MulOp>();
   if (!multiplyOp) {
     return std::nullopt;
   }
@@ -350,11 +388,11 @@ std::optional<ScorePathMatch> matchScorePath(mlir::Value maskedScores,
       qType->getRank() != 3 || qType->getDimSize(0) != 1 ||
       qType->getDimSize(1) != qHeads ||
       qType->getDimSize(2) != kMatch->headDim ||
-      !isStaticBf16Tensor(qValue)) {
+      !isStaticBf16Tensor(qValue) || kMatch->loc != masks->loc) {
     return std::nullopt;
   }
 
-  return ScorePathMatch{qValue, kMatch->cache, *seqLens, kMatch->loc,
+  return ScorePathMatch{qValue, kMatch->cache, masks->seqLens, masks->loc,
                         *scaleBf16Packed};
 }
 
