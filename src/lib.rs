@@ -1511,16 +1511,12 @@ struct DeviceDramView<'a> {
 }
 
 fn reshape_input_id(plan: &executable::Executable, output_id: u32) -> Option<u32> {
-    plan.ops.iter().find_map(|op| {
-        if let executable::Op::Reshape {
+    plan.ops.iter().find_map(|op| match op {
+        executable::Op::Reshape {
             input_id,
             output_id: reshape_output_id,
-        } = op
-        {
-            (*reshape_output_id == output_id).then_some(*input_id)
-        } else {
-            None
-        }
+        } if *reshape_output_id == output_id => Some(*input_id),
+        _ => None,
     })
 }
 
@@ -1802,46 +1798,40 @@ fn execute_reshape(
     let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let same_element_count = element_count(&input_shape)? == element_count(&output_shape)?;
     if input_dtype == output_dtype && same_element_count {
-        if let Some(input) = values
-            .get(input_id as usize)
-            .and_then(|value| value.as_ref())
+        let output_allocation_shape =
+            dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+        let output_tile_count = dram::tiled_shape_tile_count(&output_shape).map_err(io_error)?;
+        if input_dram.num_tiles == output_tile_count
+            && reshape_preserves_tiled_layout(&input_shape, &output_shape)?
         {
-            let output_allocation_shape =
-                dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
-            let output_tile_count =
-                dram::tiled_shape_tile_count(&output_shape).map_err(io_error)?;
-            if input_dram.num_tiles == output_tile_count
-                && reshape_preserves_tiled_layout(&input_shape, &output_shape)?
-            {
-                let mut output_dram = input_dram.clone();
-                output_dram.shape = output_allocation_shape;
-                return store_output_buffer(
-                    values,
-                    plan,
-                    output_id,
-                    output_desc.dims.clone(),
-                    output_dram,
-                    context,
-                    "reshape",
-                );
-            }
+            let mut output_dram = input_dram.clone();
+            output_dram.shape = output_allocation_shape;
+            return store_output_buffer(
+                values,
+                plan,
+                output_id,
+                output_desc.dims.clone(),
+                output_dram,
+                context,
+                "reshape",
+            );
+        }
 
-            if plan.output_ids.contains(&output_id) {
-                let source_shape = input
-                    .source_shape
-                    .clone()
-                    .unwrap_or_else(|| input_shape.clone());
-                return store_output_buffer_with_source_shape(
-                    values,
-                    plan,
-                    output_id,
-                    output_desc.dims.clone(),
-                    input_dram.clone(),
-                    Some(source_shape),
-                    context,
-                    "reshape",
-                );
-            }
+        if plan.output_ids.contains(&output_id) {
+            let source_shape = input
+                .source_shape
+                .clone()
+                .unwrap_or_else(|| input_shape.clone());
+            return store_output_buffer_with_source_shape(
+                values,
+                plan,
+                output_id,
+                output_desc.dims.clone(),
+                input_dram.clone(),
+                Some(source_shape),
+                context,
+                "reshape",
+            );
         }
         if context.lazy_reshape_ids.contains(&output_id) {
             return Ok(());
@@ -2828,13 +2818,12 @@ fn lazy_reshape_ids(plan: &executable::Executable) -> HashSet<u32> {
     let mut visiting = HashSet::new();
     plan.ops
         .iter()
-        .filter_map(|op| {
-            if let executable::Op::Reshape { output_id, .. } = op {
+        .filter_map(|op| match op {
+            executable::Op::Reshape { output_id, .. } => {
                 can_leave_reshape_unmaterialized(plan, *output_id, &mut memo, &mut visiting)
                     .then_some(*output_id)
-            } else {
-                None
             }
+            _ => None,
         })
         .collect()
 }
