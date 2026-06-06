@@ -1,19 +1,21 @@
 #include "mlir/sdpa_fusing_pattern.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <initializer_list>
 #include <optional>
 #include <string>
 
 #include "llvm/ADT/APFloat.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseSet.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 
 namespace libtt::mlir_frontend {
+namespace {
 
-struct SDPADecodeFusing::RepeatedCacheMatch {
+struct RepeatedCacheMatch {
   mlir::Value cache;
   mlir::Value loc;
   int64_t cacheTokens = 0;
@@ -22,7 +24,7 @@ struct SDPADecodeFusing::RepeatedCacheMatch {
   int64_t keyTokens = 0;
 };
 
-struct SDPADecodeFusing::ScorePathMatch {
+struct ScorePathMatch {
   mlir::Value q;
   mlir::Value k;
   mlir::Value seqLens;
@@ -30,7 +32,7 @@ struct SDPADecodeFusing::ScorePathMatch {
   uint32_t scaleBf16Packed = 0;
 };
 
-struct SDPADecodeFusing::Components {
+struct Components {
   mlir::Value q;
   mlir::Value k;
   mlir::Value v;
@@ -39,8 +41,7 @@ struct SDPADecodeFusing::Components {
   uint32_t scaleBf16Packed = 0;
 };
 
-bool SDPADecodeFusing::isIdentityCustomCall(
-    mlir::stablehlo::CustomCallOp customCallOp) {
+bool isIdentityCustomCall(mlir::stablehlo::CustomCallOp customCallOp) {
   if (!customCallOp || customCallOp->getNumResults() != 1 ||
       customCallOp.getHasSideEffect()) {
     return false;
@@ -54,7 +55,7 @@ bool SDPADecodeFusing::isIdentityCustomCall(
          inputs.front().getType() == customCallOp.getResult(0).getType();
 }
 
-mlir::Value SDPADecodeFusing::peelIdentityCustomCalls(mlir::Value value) {
+mlir::Value peelIdentityCustomCalls(mlir::Value value) {
   while (auto customCallOp =
              value.getDefiningOp<mlir::stablehlo::CustomCallOp>()) {
     if (!isIdentityCustomCall(customCallOp)) {
@@ -65,8 +66,12 @@ mlir::Value SDPADecodeFusing::peelIdentityCustomCalls(mlir::Value value) {
   return value;
 }
 
-std::optional<mlir::RankedTensorType>
-SDPADecodeFusing::getStaticRankedTensor(mlir::Value value) {
+template <typename OpTy>
+OpTy definingOpSkippingIdentityCustomCalls(mlir::Value value) {
+  return peelIdentityCustomCalls(value).template getDefiningOp<OpTy>();
+}
+
+std::optional<mlir::RankedTensorType> getStaticRankedTensor(mlir::Value value) {
   auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
   if (!tensor || !tensor.hasStaticShape()) {
     return std::nullopt;
@@ -74,19 +79,18 @@ SDPADecodeFusing::getStaticRankedTensor(mlir::Value value) {
   return tensor;
 }
 
-bool SDPADecodeFusing::int64ArrayEquals(
-    llvm::ArrayRef<int64_t> values, std::initializer_list<int64_t> expected) {
+bool int64ArrayEquals(llvm::ArrayRef<int64_t> values,
+                      std::initializer_list<int64_t> expected) {
   return values.size() == expected.size() &&
          std::equal(values.begin(), values.end(), expected.begin());
 }
 
-bool SDPADecodeFusing::isStaticBf16Tensor(mlir::Value value) {
+bool isStaticBf16Tensor(mlir::Value value) {
   auto tensor = getStaticRankedTensor(value);
   return tensor && tensor->getElementType().isBF16();
 }
 
-bool SDPADecodeFusing::isS32TensorWithLength(mlir::Value value,
-                                             int64_t length) {
+bool isS32TensorWithLength(mlir::Value value, int64_t length) {
   auto tensor = getStaticRankedTensor(value);
   if (!tensor || tensor->getRank() != 1 || tensor->getDimSize(0) != length) {
     return false;
@@ -95,7 +99,7 @@ bool SDPADecodeFusing::isS32TensorWithLength(mlir::Value value,
   return integer && integer.getWidth() == 32 && !integer.isUnsigned();
 }
 
-std::optional<uint32_t> SDPADecodeFusing::bf16PackedConstant(mlir::Value value) {
+std::optional<uint32_t> bf16PackedConstant(mlir::Value value) {
   value = peelIdentityCustomCalls(value);
   while (auto broadcastOp =
              value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
@@ -119,7 +123,7 @@ std::optional<uint32_t> SDPADecodeFusing::bf16PackedConstant(mlir::Value value) 
   return value16 | (value16 << 16);
 }
 
-std::optional<mlir::Value> SDPADecodeFusing::findS32TensorWithLength(
+std::optional<mlir::Value> findS32TensorWithLength(
     mlir::Value value, int64_t length, llvm::DenseSet<mlir::Value> &visited) {
   if (!visited.insert(value).second) {
     return std::nullopt;
@@ -140,14 +144,14 @@ std::optional<mlir::Value> SDPADecodeFusing::findS32TensorWithLength(
   return std::nullopt;
 }
 
-std::optional<mlir::Value> SDPADecodeFusing::findS32TensorWithLength(
-    mlir::Value value, int64_t length) {
+std::optional<mlir::Value> findS32TensorWithLength(mlir::Value value,
+                                                   int64_t length) {
   llvm::DenseSet<mlir::Value> visited;
   return findS32TensorWithLength(value, length, visited);
 }
 
-std::optional<mlir::stablehlo::GatherOp>
-SDPADecodeFusing::gatherFromCacheValue(mlir::Value value) {
+std::optional<mlir::stablehlo::GatherOp> gatherFromCacheValue(
+    mlir::Value value) {
   value = peelIdentityCustomCalls(value);
   if (auto gatherOp = value.getDefiningOp<mlir::stablehlo::GatherOp>()) {
     return gatherOp;
@@ -161,8 +165,8 @@ SDPADecodeFusing::gatherFromCacheValue(mlir::Value value) {
   return std::nullopt;
 }
 
-std::optional<SDPADecodeFusing::RepeatedCacheMatch>
-SDPADecodeFusing::matchRepeatedCache(mlir::Value value, int64_t qHeads) {
+std::optional<RepeatedCacheMatch> matchRepeatedCache(mlir::Value value,
+                                                     int64_t qHeads) {
   value = peelIdentityCustomCalls(value);
   auto reshapeOp = value.getDefiningOp<mlir::stablehlo::ReshapeOp>();
   if (!reshapeOp) {
@@ -240,8 +244,7 @@ SDPADecodeFusing::matchRepeatedCache(mlir::Value value, int64_t qHeads) {
       keyTokens};
 }
 
-std::optional<mlir::Value>
-SDPADecodeFusing::peelSoftmaxInput(mlir::Value probabilities) {
+std::optional<mlir::Value> peelSoftmaxInput(mlir::Value probabilities) {
   auto divOp =
       definingOpSkippingIdentityCustomCalls<mlir::stablehlo::DivOp>(
           probabilities);
@@ -263,9 +266,9 @@ SDPADecodeFusing::peelSoftmaxInput(mlir::Value probabilities) {
   return peelIdentityCustomCalls(subtractOp.getLhs());
 }
 
-std::optional<SDPADecodeFusing::ScorePathMatch>
-SDPADecodeFusing::matchScorePath(mlir::Value maskedScores, int64_t qHeads,
-                                 int64_t keyTokens) {
+std::optional<ScorePathMatch> matchScorePath(mlir::Value maskedScores,
+                                             int64_t qHeads,
+                                             int64_t keyTokens) {
   auto seqLens = findS32TensorWithLength(maskedScores, 1);
   if (!seqLens) {
     return std::nullopt;
@@ -348,8 +351,8 @@ SDPADecodeFusing::matchScorePath(mlir::Value maskedScores, int64_t qHeads,
                         *scaleBf16Packed};
 }
 
-std::optional<SDPADecodeFusing::Components>
-SDPADecodeFusing::matchSdpaDecode(mlir::stablehlo::TransposeOp transposeOp) {
+std::optional<Components> matchSdpaDecode(
+    mlir::stablehlo::TransposeOp transposeOp) {
   if (transposeOp->getParentOfType<mlir::stablehlo::CaseOp>()) {
     return std::nullopt;
   }
@@ -427,10 +430,9 @@ SDPADecodeFusing::matchSdpaDecode(mlir::stablehlo::TransposeOp transposeOp) {
                     scoreMatch->scaleBf16Packed};
 }
 
-mlir::LogicalResult
-SDPADecodeFusing::createSdpaDecodeOp(mlir::PatternRewriter &rewriter,
-                                     mlir::stablehlo::TransposeOp root,
-                                     const Components &components) {
+mlir::LogicalResult createSdpaDecodeOp(mlir::PatternRewriter &rewriter,
+                                       mlir::stablehlo::TransposeOp root,
+                                       const Components &components) {
   rewriter.setInsertionPoint(root);
   auto backendConfig =
       rewriter.getStringAttr(std::to_string(components.scaleBf16Packed));
@@ -448,6 +450,8 @@ SDPADecodeFusing::createSdpaDecodeOp(mlir::PatternRewriter &rewriter,
   rewriter.replaceOp(root, customCall.getResults());
   return mlir::success();
 }
+
+} // namespace
 
 mlir::LogicalResult SDPADecodeFusing::matchAndRewrite(
     mlir::stablehlo::TransposeOp transposeOp,
