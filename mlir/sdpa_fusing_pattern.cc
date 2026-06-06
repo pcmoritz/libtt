@@ -86,6 +86,33 @@ std::optional<uint32_t> bf16PackedConstant(mlir::Value value) {
   return value16 | (value16 << 16);
 }
 
+bool findUniqueS32TensorWithLength(mlir::Value value, int64_t length,
+                                   llvm::DenseSet<mlir::Value> &visited,
+                                   std::optional<mlir::Value> &match) {
+  if (!visited.insert(value).second) {
+    return true;
+  }
+  if (mlir::isa<mlir::BlockArgument>(value) &&
+      isS32TensorWithLength(value, length)) {
+    if (match && *match != value) {
+      return false;
+    }
+    match = value;
+    return true;
+  }
+
+  mlir::Operation *op = value.getDefiningOp();
+  if (!op) {
+    return true;
+  }
+  for (mlir::Value operand : op->getOperands()) {
+    if (!findUniqueS32TensorWithLength(operand, length, visited, match)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::optional<mlir::Value> findS32TensorWithLength(
     mlir::Value value, int64_t length, llvm::DenseSet<mlir::Value> &visited) {
   if (!visited.insert(value).second) {
@@ -95,6 +122,7 @@ std::optional<mlir::Value> findS32TensorWithLength(
       isS32TensorWithLength(value, length)) {
     return value;
   }
+
   mlir::Operation *op = value.getDefiningOp();
   if (!op) {
     return std::nullopt;
@@ -111,6 +139,16 @@ std::optional<mlir::Value> findS32TensorWithLength(mlir::Value value,
                                                    int64_t length) {
   llvm::DenseSet<mlir::Value> visited;
   return findS32TensorWithLength(value, length, visited);
+}
+
+std::optional<mlir::Value> findUniqueS32TensorWithLength(mlir::Value value,
+                                                         int64_t length) {
+  llvm::DenseSet<mlir::Value> visited;
+  std::optional<mlir::Value> match;
+  if (!findUniqueS32TensorWithLength(value, length, visited, match)) {
+    return std::nullopt;
+  }
+  return match;
 }
 
 std::optional<mlir::stablehlo::GatherOp> gatherFromCacheValue(
@@ -233,12 +271,17 @@ std::optional<mlir::Value> peelSoftmaxInput(mlir::Value probabilities) {
 std::optional<ScorePathMatch> matchScorePath(mlir::Value maskedScores,
                                              int64_t qHeads,
                                              int64_t keyTokens) {
-  auto seqLens = findS32TensorWithLength(maskedScores, 1);
+  mlir::Value scaledScores = peelIdentityCustomCalls(maskedScores);
+  auto outerMask = scaledScores.getDefiningOp<mlir::stablehlo::SelectOp>();
+  if (!outerMask) {
+    return std::nullopt;
+  }
+
+  auto seqLens = findUniqueS32TensorWithLength(outerMask.getPred(), 1);
   if (!seqLens) {
     return std::nullopt;
   }
 
-  mlir::Value scaledScores = peelIdentityCustomCalls(maskedScores);
   for (unsigned depth = 0; depth < 4; ++depth) {
     auto selectOp = scaledScores.getDefiningOp<mlir::stablehlo::SelectOp>();
     if (!selectOp) {
