@@ -1715,30 +1715,16 @@ std::optional<uint32_t> sdpaDecodeScaleBf16Packed(
         error = "tt.sdpa_decode custom_call requires backend_config";
         return std::nullopt;
     }
-    if (auto config = mlir::dyn_cast<mlir::StringAttr>(*backend_config)) {
-        uint64_t value = 0;
-        if (config.getValue().getAsInteger(10, value)) {
-            error = "tt.sdpa_decode string backend_config must be a scale_bf16_packed integer";
-            return std::nullopt;
-        }
-        if (value > std::numeric_limits<uint32_t>::max()) {
-            error = "tt.sdpa_decode scale_bf16_packed is out of range";
-            return std::nullopt;
-        }
-        return static_cast<uint32_t>(value);
-    }
-    auto config = mlir::dyn_cast<mlir::DictionaryAttr>(*backend_config);
+    auto config = mlir::dyn_cast<mlir::StringAttr>(*backend_config);
     if (!config) {
-        error = "tt.sdpa_decode custom_call requires string or dictionary backend_config";
+        error = "tt.sdpa_decode custom_call requires string backend_config";
         return std::nullopt;
     }
-    auto scale = mlir::dyn_cast_or_null<mlir::IntegerAttr>(
-        config.get("scale_bf16_packed"));
-    if (!scale) {
-        error = "tt.sdpa_decode custom_call requires integer scale_bf16_packed";
+    uint64_t value = 0;
+    if (config.getValue().getAsInteger(10, value)) {
+        error = "tt.sdpa_decode string backend_config must be a scale_bf16_packed integer";
         return std::nullopt;
     }
-    uint64_t value = scale.getValue().getZExtValue();
     if (value > std::numeric_limits<uint32_t>::max()) {
         error = "tt.sdpa_decode scale_bf16_packed is out of range";
         return std::nullopt;
