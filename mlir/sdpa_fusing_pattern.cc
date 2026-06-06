@@ -102,6 +102,23 @@ bool isNegativeBf16Splat(mlir::Value value) {
   return packed && ((*packed & 0x8000u) != 0);
 }
 
+std::optional<mlir::Value> peelSingleUseIdentityCustomCalls(mlir::Value value) {
+  while (auto customCall =
+             value.getDefiningOp<mlir::stablehlo::CustomCallOp>()) {
+    if (!isIdentityCustomCall(customCall)) {
+      break;
+    }
+    if (!value.hasOneUse()) {
+      return std::nullopt;
+    }
+    value = customCall.getInputs().front();
+  }
+  if (!value.hasOneUse()) {
+    return std::nullopt;
+  }
+  return value;
+}
+
 bool findUniqueS32TensorWithLength(mlir::Value value, int64_t length,
                                    llvm::DenseSet<mlir::Value> &visited,
                                    std::optional<mlir::Value> &match) {
@@ -188,8 +205,11 @@ std::optional<MaskSelectMatch> matchScoreMaskSelect(mlir::Value value) {
   if (!selectOp || !isNegativeBf16Splat(selectOp.getOnFalse())) {
     return std::nullopt;
   }
-  return MaskSelectMatch{selectOp.getPred(),
-                         peelIdentityCustomCalls(selectOp.getOnTrue())};
+  auto unmaskedValue = peelSingleUseIdentityCustomCalls(selectOp.getOnTrue());
+  if (!unmaskedValue) {
+    return std::nullopt;
+  }
+  return MaskSelectMatch{selectOp.getPred(), *unmaskedValue};
 }
 
 std::optional<DecodeMaskMatch> matchDecodeScoreMasks(mlir::Value maskedScores,
@@ -298,9 +318,14 @@ std::optional<RepeatedCacheMatch> matchRepeatedCache(mlir::Value value,
 }
 
 std::optional<mlir::Value> peelSoftmaxInput(mlir::Value probabilities) {
+  // This only peels the softmax arithmetic shell. The surrounding dot/gather
+  // matcher validates that the exposed value is really an attention score path.
+  auto divValue = peelSingleUseIdentityCustomCalls(probabilities);
+  if (!divValue) {
+    return std::nullopt;
+  }
   auto divOp =
-      definingOpSkippingIdentityCustomCalls<mlir::stablehlo::DivOp>(
-          probabilities);
+      divValue->getDefiningOp<mlir::stablehlo::DivOp>();
   if (!divOp) {
     return std::nullopt;
   }
@@ -345,7 +370,11 @@ std::optional<ScorePathMatch> matchScorePath(mlir::Value maskedScores,
     }
     scoreTiles = multiplyOp.getLhs();
   }
-  scoreTiles = peelIdentityCustomCalls(scoreTiles);
+  auto singleUseScoreTiles = peelSingleUseIdentityCustomCalls(scoreTiles);
+  if (!singleUseScoreTiles) {
+    return std::nullopt;
+  }
+  scoreTiles = *singleUseScoreTiles;
 
   auto transposeOp = scoreTiles.getDefiningOp<mlir::stablehlo::TransposeOp>();
   auto scoreType = getStaticRankedTensor(scoreTiles);
@@ -355,9 +384,11 @@ std::optional<ScorePathMatch> matchScorePath(mlir::Value maskedScores,
     return std::nullopt;
   }
 
-  auto dotOp =
-      definingOpSkippingIdentityCustomCalls<mlir::stablehlo::DotGeneralOp>(
-          transposeOp.getOperand());
+  auto dotValue = peelSingleUseIdentityCustomCalls(transposeOp.getOperand());
+  if (!dotValue) {
+    return std::nullopt;
+  }
+  auto dotOp = dotValue->getDefiningOp<mlir::stablehlo::DotGeneralOp>();
   if (!dotOp) {
     return std::nullopt;
   }
@@ -411,9 +442,13 @@ std::optional<Components> matchSdpaDecode(
   int64_t qHeads = outputType->getDimSize(1);
   int64_t headDim = outputType->getDimSize(2);
 
+  auto valueDotValue =
+      peelSingleUseIdentityCustomCalls(transposeOp.getOperand());
+  if (!valueDotValue) {
+    return std::nullopt;
+  }
   auto valueDot =
-      definingOpSkippingIdentityCustomCalls<mlir::stablehlo::DotGeneralOp>(
-          transposeOp.getOperand());
+      valueDotValue->getDefiningOp<mlir::stablehlo::DotGeneralOp>();
   if (!valueDot) {
     return std::nullopt;
   }

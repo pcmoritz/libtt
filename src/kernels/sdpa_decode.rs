@@ -1,6 +1,8 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R};
+use crate::dram::{
+    tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R,
+};
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{Kernel, RuntimeArgsBuilder};
 use std::io;
@@ -81,12 +83,26 @@ pub(crate) fn sdpa_decode(
     name: impl Into<String>,
 ) -> io::Result<DramBuffer> {
     let shape = validate_sdpa_decode_shapes(
-        q, k, v, seq_lens, loc, q_shape, k_shape, v_shape, seq_lens_shape, loc_shape,
+        q,
+        k,
+        v,
+        seq_lens,
+        loc,
+        q_shape,
+        k_shape,
+        v_shape,
+        seq_lens_shape,
+        loc_shape,
         output_shape,
     )?;
     let output_allocation_shape = tiled_allocation_shape(output_shape)?;
     let output_tiles = tiled_shape_tile_count(output_shape)?;
-    let output = device.alloc(output_tiles, DType::Float16B, &output_allocation_shape, name)?;
+    let output = device.alloc(
+        output_tiles,
+        DType::Float16B,
+        &output_allocation_shape,
+        name,
+    )?;
     let cores = select_kv_head_cores(device.cores_ref(), shape.kv_heads)?;
 
     let key = SdpaDecodeProgramKey {
@@ -162,7 +178,8 @@ fn validate_sdpa_decode_shapes(
         )));
     }
     let [q_batch, q_heads, head_dim]: [usize; 3] = q_shape.try_into().expect("rank checked");
-    let [cache_tokens, kv_heads, kv_head_dim]: [usize; 3] = k_shape.try_into().expect("rank checked");
+    let [cache_tokens, kv_heads, kv_head_dim]: [usize; 3] =
+        k_shape.try_into().expect("rank checked");
     if q_batch != 1 || output_shape != [1, q_heads, head_dim] {
         return Err(invalid_input(format!(
             "sdpa_decode currently requires q batch 1 and output [1, q_heads, head_dim], got q={q_shape:?} output={output_shape:?}"
@@ -203,7 +220,11 @@ fn validate_sdpa_decode_shapes(
     })
 }
 
-fn validate_tiled_buffer(buffer: &DramBuffer, logical_shape: &[usize], name: &str) -> io::Result<()> {
+fn validate_tiled_buffer(
+    buffer: &DramBuffer,
+    logical_shape: &[usize],
+    name: &str,
+) -> io::Result<()> {
     let expected_shape = tiled_allocation_shape(logical_shape)?;
     let expected_tiles = tiled_shape_tile_count(logical_shape)?;
     if buffer.shape != expected_shape || buffer.num_tiles != expected_tiles {
