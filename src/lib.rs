@@ -2338,8 +2338,18 @@ fn execute_matmul(
     dimension_numbers: &executable::DotGeneralDimensionNumbers,
     top_k_epilogue: Option<&executable::MatmulTopKEpilogue>,
 ) -> Result<(), *mut PJRT_Error> {
-    let lhs = device_dram_view_for_value(values, plan, context, input_ids[0], "matmul.lhs")?;
-    let rhs = device_dram_view_for_value(values, plan, context, input_ids[1], "matmul.rhs")?;
+    let lhs = device_buffer_for_value(values, input_ids[0], "matmul.lhs")?;
+    let rhs = device_buffer_for_value(values, input_ids[1], "matmul.rhs")?;
+    let Some(lhs_dram) = lhs.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable matmul lhs buffer has no device allocation",
+        ));
+    };
+    let Some(rhs_dram) = rhs.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable matmul rhs buffer has no device allocation",
+        ));
+    };
     let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
     let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
 
@@ -2397,8 +2407,8 @@ fn execute_matmul(
         let matmul_shape = dims_i64_to_usize(&matmul_desc.dims)?;
         let matmul_output = kernels::matmul::matmul_dot_general(
             device,
-            lhs.dram_buffer,
-            rhs.dram_buffer,
+            lhs_dram,
+            rhs_dram,
             &lhs_shape,
             &rhs_shape,
             &matmul_shape,
@@ -2459,8 +2469,8 @@ fn execute_matmul(
     }
     let output_dram = kernels::matmul::matmul_dot_general(
         device,
-        lhs.dram_buffer,
-        rhs.dram_buffer,
+        lhs_dram,
+        rhs_dram,
         &lhs_shape,
         &rhs_shape,
         &output_shape,
