@@ -3171,13 +3171,18 @@ fn execute_gather(
     }
 
     let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
-    let operand_source_shape = operand.source_shape.as_deref();
+    let operand_source_view = kernels::reshape_view::optional_reshape_source_view(
+        operand.source_shape.as_deref(),
+        &operand_shape,
+        "gather reshape view",
+    )
+    .map_err(io_error)?;
     let output_dram = kernels::gather::gather(
         device,
         operand.dram_buffer,
         start_indices_dram,
         &operand_shape,
-        operand_source_shape,
+        operand_source_view,
         &start_indices_shape,
         &output_shape,
         axis,
@@ -3289,18 +3294,28 @@ fn execute_scatter(
     };
 
     let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
-    let operand_source_shape = operand.source_shape.as_deref();
-    let update_source_shape = updates.source_shape.as_deref();
+    let operand_source_view = kernels::reshape_view::optional_reshape_source_view(
+        operand.source_shape.as_deref(),
+        &operand_shape,
+        "scatter reshape view",
+    )
+    .map_err(io_error)?;
+    let update_source_view = kernels::reshape_view::optional_reshape_source_view(
+        updates.source_shape.as_deref(),
+        &update_shape,
+        "scatter update reshape view",
+    )
+    .map_err(io_error)?;
     let output_dram = kernels::scatter::scatter_set(
         device,
         operand.dram_buffer,
         start_indices_dram,
         updates.dram_buffer,
         &operand_shape,
-        operand_source_shape,
+        operand_source_view,
         &start_indices_shape,
         &update_shape,
-        update_source_shape,
+        update_source_view,
         scatter_dim,
         dtype,
         "pjrt_scatter",

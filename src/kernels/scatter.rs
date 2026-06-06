@@ -5,7 +5,7 @@ use crate::dram::{
 };
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
-use crate::kernels::reshape_view::{reshape_source_view, ReshapeSourceView};
+use crate::kernels::reshape_view::ReshapeSourceView;
 use std::io;
 
 const SCATTER_READER: &str = include_str!("../../kernels/scatter_reader.cc");
@@ -79,10 +79,10 @@ pub(crate) fn scatter_set(
     start_indices: &DramBuffer,
     updates: &DramBuffer,
     operand_shape: &[usize],
-    operand_source_shape: Option<&[usize]>,
+    operand_source_view: Option<ReshapeSourceView>,
     start_indices_shape: &[usize],
     update_shape: &[usize],
-    update_source_shape: Option<&[usize]>,
+    update_source_view: Option<ReshapeSourceView>,
     scatter_dim: usize,
     dtype: DType,
     name: impl Into<String>,
@@ -92,19 +92,19 @@ pub(crate) fn scatter_set(
         start_indices,
         updates,
         operand_shape,
-        operand_source_shape,
+        operand_source_view.as_ref(),
         start_indices_shape,
         update_shape,
-        update_source_shape,
+        update_source_view.as_ref(),
         scatter_dim,
         dtype,
     )?;
 
     let shape = scatter_shape(
         operand_shape,
-        operand_source_shape,
+        operand_source_view,
         update_shape,
-        update_source_shape,
+        update_source_view,
         scatter_dim,
     )?;
     let output_tiles = usize::try_from(shape.output_tiles).map_err(|_| {
@@ -140,10 +140,10 @@ fn validate_scatter_buffers(
     start_indices: &DramBuffer,
     updates: &DramBuffer,
     operand_shape: &[usize],
-    operand_source_shape: Option<&[usize]>,
+    operand_source_view: Option<&ReshapeSourceView>,
     start_indices_shape: &[usize],
     update_shape: &[usize],
-    update_source_shape: Option<&[usize]>,
+    update_source_view: Option<&ReshapeSourceView>,
     scatter_dim: usize,
     dtype: DType,
 ) -> io::Result<()> {
@@ -196,13 +196,13 @@ fn validate_scatter_buffers(
 
     validate_allocation(
         operand,
-        operand_source_shape.unwrap_or(operand_shape),
+        operand_source_view.map_or(operand_shape, ReshapeSourceView::source_shape),
         "scatter operand",
     )?;
     validate_allocation(start_indices, start_indices_shape, "scatter start_indices")?;
     validate_allocation(
         updates,
-        update_source_shape.unwrap_or(update_shape),
+        update_source_view.map_or(update_shape, ReshapeSourceView::source_shape),
         "scatter updates",
     )?;
     Ok(())
@@ -228,24 +228,20 @@ fn validate_allocation(buffer: &DramBuffer, logical_shape: &[usize], name: &str)
 
 fn scatter_shape(
     operand_shape: &[usize],
-    operand_source_shape: Option<&[usize]>,
+    operand_source_view: Option<ReshapeSourceView>,
     update_shape: &[usize],
-    update_source_shape: Option<&[usize]>,
+    update_source_view: Option<ReshapeSourceView>,
     scatter_dim: usize,
 ) -> io::Result<ScatterShape> {
     let operand_allocation_shape = tiled_allocation_shape(operand_shape)?;
-    let update_allocation_shape =
-        tiled_allocation_shape(update_source_shape.unwrap_or(update_shape))?;
+    let update_allocation_shape = tiled_allocation_shape(
+        update_source_view
+            .as_ref()
+            .map_or(update_shape, ReshapeSourceView::source_shape),
+    )?;
     let operand_rank = operand_allocation_shape.len();
     let update_rank = update_allocation_shape.len();
     let output_tiles = tiled_shape_tile_count(operand_shape)?;
-    let operand_source_view =
-        optional_reshape_source_view(operand_source_shape, operand_shape, "scatter reshape view")?;
-    let update_source_view = optional_reshape_source_view(
-        update_source_shape,
-        update_shape,
-        "scatter update reshape view",
-    )?;
     Ok(ScatterShape {
         operand_shape: u32_shape(operand_shape, "scatter operand shape")?,
         update_shape: u32_shape(update_shape, "scatter update shape")?,
@@ -271,16 +267,6 @@ fn scatter_shape(
         )?,
         output_tiles: u32_arg(output_tiles, "scatter output tile count")?,
     })
-}
-
-fn optional_reshape_source_view(
-    source_shape: Option<&[usize]>,
-    logical_shape: &[usize],
-    name: &str,
-) -> io::Result<Option<ReshapeSourceView>> {
-    source_shape
-        .map(|source_shape| reshape_source_view(source_shape, logical_shape, name))
-        .transpose()
 }
 
 fn scatter_program(key: ScatterProgramKey) -> io::Result<Program> {

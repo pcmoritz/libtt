@@ -1,8 +1,9 @@
 use crate::dram::{tiled_allocation_shape, TILE_C, TILE_R};
 use std::io;
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct ReshapeSourceView {
+    source_shape: Vec<usize>,
     pub(crate) rows: u32,
     pub(crate) cols: u32,
     pub(crate) tile_rows: u32,
@@ -19,11 +20,28 @@ pub(crate) fn reshape_source_view(
     let rank = allocation_shape.len();
     let (rows, cols) = matrix_dims(source_shape);
     Ok(ReshapeSourceView {
+        source_shape: source_shape.to_vec(),
         rows: u32_value(rows, name)?,
         cols: u32_value(cols, name)?,
         tile_rows: u32_value(allocation_shape[rank - 2] / TILE_R, name)?,
         tiles_per_row: u32_value(allocation_shape[rank - 1] / TILE_C, name)?,
     })
+}
+
+pub(crate) fn optional_reshape_source_view(
+    source_shape: Option<&[usize]>,
+    logical_shape: &[usize],
+    name: &str,
+) -> io::Result<Option<ReshapeSourceView>> {
+    source_shape
+        .map(|source_shape| reshape_source_view(source_shape, logical_shape, name))
+        .transpose()
+}
+
+impl ReshapeSourceView {
+    pub(crate) fn source_shape(&self) -> &[usize] {
+        &self.source_shape
+    }
 }
 
 fn matrix_dims(shape: &[usize]) -> (usize, usize) {

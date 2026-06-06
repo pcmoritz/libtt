@@ -5,7 +5,7 @@ use crate::dram::{
 };
 use crate::hw::CoreCoord;
 use crate::kernels::kernel::{select_worker_cores, split_tile_range, Kernel, RuntimeArgsBuilder};
-use crate::kernels::reshape_view::{reshape_source_view, ReshapeSourceView};
+use crate::kernels::reshape_view::ReshapeSourceView;
 use std::io;
 
 const GATHER_READER: &str = include_str!("../../kernels/gather_reader.cc");
@@ -80,7 +80,7 @@ pub(crate) fn gather(
     operand: &DramBuffer,
     start_indices: &DramBuffer,
     operand_shape: &[usize],
-    operand_source_shape: Option<&[usize]>,
+    operand_source_view: Option<ReshapeSourceView>,
     start_indices_shape: &[usize],
     output_shape: &[usize],
     axis: usize,
@@ -91,7 +91,7 @@ pub(crate) fn gather(
         operand,
         start_indices,
         operand_shape,
-        operand_source_shape,
+        operand_source_view.as_ref(),
         start_indices_shape,
         axis,
         dtype,
@@ -100,7 +100,7 @@ pub(crate) fn gather(
     let output_allocation_shape = tiled_allocation_shape(output_shape)?;
     let shape = gather_shape(
         operand_shape,
-        operand_source_shape,
+        operand_source_view,
         output_shape,
         axis,
         dtype,
@@ -140,7 +140,7 @@ fn validate_gather_buffers(
     operand: &DramBuffer,
     start_indices: &DramBuffer,
     operand_shape: &[usize],
-    operand_source_shape: Option<&[usize]>,
+    operand_source_view: Option<&ReshapeSourceView>,
     start_indices_shape: &[usize],
     axis: usize,
     dtype: DType,
@@ -173,7 +173,7 @@ fn validate_gather_buffers(
 
     validate_allocation(
         operand,
-        operand_source_shape.unwrap_or(operand_shape),
+        operand_source_view.map_or(operand_shape, ReshapeSourceView::source_shape),
         "gather operand",
     )?;
     validate_allocation(start_indices, start_indices_shape, "gather start_indices")?;
@@ -182,19 +182,18 @@ fn validate_gather_buffers(
 
 fn gather_shape(
     operand_shape: &[usize],
-    operand_source_shape: Option<&[usize]>,
+    operand_source_view: Option<ReshapeSourceView>,
     output_shape: &[usize],
     axis: usize,
     dtype: DType,
 ) -> io::Result<GatherShape> {
-    let operand_physical_shape = operand_source_shape.unwrap_or(operand_shape);
+    let operand_physical_shape = operand_source_view
+        .as_ref()
+        .map_or(operand_shape, ReshapeSourceView::source_shape);
     let operand_allocation_shape = tiled_allocation_shape(operand_physical_shape)?;
     let output_allocation_shape = tiled_allocation_shape(output_shape)?;
     let operand_rank = operand_allocation_shape.len();
     let output_rank = output_allocation_shape.len();
-    let operand_source_view = operand_source_shape
-        .map(|source_shape| reshape_source_view(source_shape, operand_shape, "gather reshape view"))
-        .transpose()?;
     let mode = if operand_source_view.is_none()
         && axis == 0
         && operand_shape.len() == 2
