@@ -3184,13 +3184,11 @@ fn execute_gather(
 
     let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
     let operand_source_shape = operand.source_shape.as_deref();
-    let operand_physical_shape = operand_source_shape.unwrap_or(&operand_shape);
     let output_dram = kernels::gather::gather(
         device,
         operand.dram_buffer,
         start_indices_dram,
         &operand_shape,
-        operand_physical_shape,
         operand_source_shape,
         &start_indices_shape,
         &output_shape,

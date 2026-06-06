@@ -25,7 +25,6 @@ struct GatherShape {
     mode: GatherMode,
     axis: u32,
     operand_shape: Vec<u32>,
-    operand_physical_shape: Vec<u32>,
     output_shape: Vec<u32>,
     operand_source_view: Option<ReshapeSourceView>,
     operand_tile_rows: u32,
@@ -81,7 +80,6 @@ pub(crate) fn gather(
     operand: &DramBuffer,
     start_indices: &DramBuffer,
     operand_shape: &[usize],
-    operand_physical_shape: &[usize],
     operand_source_shape: Option<&[usize]>,
     start_indices_shape: &[usize],
     output_shape: &[usize],
@@ -93,7 +91,6 @@ pub(crate) fn gather(
         operand,
         start_indices,
         operand_shape,
-        operand_physical_shape,
         operand_source_shape,
         start_indices_shape,
         axis,
@@ -103,7 +100,6 @@ pub(crate) fn gather(
     let output_allocation_shape = tiled_allocation_shape(output_shape)?;
     let shape = gather_shape(
         operand_shape,
-        operand_physical_shape,
         operand_source_shape,
         output_shape,
         axis,
@@ -144,7 +140,6 @@ fn validate_gather_buffers(
     operand: &DramBuffer,
     start_indices: &DramBuffer,
     operand_shape: &[usize],
-    operand_physical_shape: &[usize],
     operand_source_shape: Option<&[usize]>,
     start_indices_shape: &[usize],
     axis: usize,
@@ -156,13 +151,6 @@ fn validate_gather_buffers(
     if axis >= operand_shape.len() {
         return Err(invalid_input(format!(
             "gather axis {axis} is out of bounds for operand shape {operand_shape:?}"
-        )));
-    }
-    if operand_physical_shape.len() != operand_shape.len() {
-        return Err(invalid_input(format!(
-            "gather operand physical/logical rank mismatch: physical={} logical={}",
-            operand_physical_shape.len(),
-            operand_shape.len()
         )));
     }
     if operand.dtype != dtype {
@@ -185,7 +173,7 @@ fn validate_gather_buffers(
 
     validate_allocation(
         operand,
-        operand_source_shape.unwrap_or(operand_physical_shape),
+        operand_source_shape.unwrap_or(operand_shape),
         "gather operand",
     )?;
     validate_allocation(start_indices, start_indices_shape, "gather start_indices")?;
@@ -194,12 +182,12 @@ fn validate_gather_buffers(
 
 fn gather_shape(
     operand_shape: &[usize],
-    operand_physical_shape: &[usize],
     operand_source_shape: Option<&[usize]>,
     output_shape: &[usize],
     axis: usize,
     dtype: DType,
 ) -> io::Result<GatherShape> {
+    let operand_physical_shape = operand_source_shape.unwrap_or(operand_shape);
     let operand_allocation_shape = tiled_allocation_shape(operand_physical_shape)?;
     let output_allocation_shape = tiled_allocation_shape(output_shape)?;
     let operand_rank = operand_allocation_shape.len();
@@ -216,33 +204,22 @@ fn gather_shape(
     } else {
         GatherMode::Axis
     };
-    let (kernel_operand_shape, kernel_operand_physical_shape, kernel_output_shape, kernel_axis) =
-        match mode {
-            GatherMode::Bf16Rows => (
-                operand_shape.to_vec(),
-                operand_physical_shape.to_vec(),
-                output_shape.to_vec(),
-                axis,
-            ),
-            GatherMode::Axis => {
-                let padded_rank = operand_shape.len().max(3);
-                (
-                    pad_rank(operand_shape, padded_rank),
-                    pad_rank(operand_physical_shape, padded_rank),
-                    pad_rank(output_shape, padded_rank),
-                    axis + padded_rank - operand_shape.len(),
-                )
-            }
-        };
+    let (kernel_operand_shape, kernel_output_shape, kernel_axis) = match mode {
+        GatherMode::Bf16Rows => (operand_shape.to_vec(), output_shape.to_vec(), axis),
+        GatherMode::Axis => {
+            let padded_rank = operand_shape.len().max(3);
+            (
+                pad_rank(operand_shape, padded_rank),
+                pad_rank(output_shape, padded_rank),
+                axis + padded_rank - operand_shape.len(),
+            )
+        }
+    };
 
     Ok(GatherShape {
         mode,
         axis: u32_arg(kernel_axis, "gather axis")?,
         operand_shape: u32_shape(&kernel_operand_shape, "gather operand shape")?,
-        operand_physical_shape: u32_shape(
-            &kernel_operand_physical_shape,
-            "gather operand physical shape",
-        )?,
         output_shape: u32_shape(&kernel_output_shape, "gather output shape")?,
         operand_source_view,
         operand_tile_rows: u32_arg(
@@ -371,7 +348,6 @@ fn gather_reader_source(dtype: DType, shape: &GatherShape) -> io::Result<String>
          #define GATHER_RANK {}\n\
          #define GATHER_AXIS {}\n\
          #define GATHER_OPERAND_SHAPE {}\n\
-         #define GATHER_OPERAND_PHYSICAL_SHAPE {}\n\
          #define GATHER_OUTPUT_SHAPE {}\n\
          #define GATHER_OPERAND_RESHAPE_VIEW {}\n\
          #define GATHER_SOURCE_ROWS {}\n\
@@ -388,7 +364,6 @@ fn gather_reader_source(dtype: DType, shape: &GatherShape) -> io::Result<String>
         shape.operand_shape.len(),
         shape.axis,
         cpp_u32_array(&shape.operand_shape),
-        cpp_u32_array(&shape.operand_physical_shape),
         cpp_u32_array(&shape.output_shape),
         source_view.is_some() as u32,
         source_view.map_or(1, |view| view.rows),
@@ -457,15 +432,8 @@ mod tests {
 
     #[test]
     fn gather_program_splits_bf16_row_tiles_across_cores() {
-        let shape = gather_shape(
-            &[288, 128],
-            &[288, 128],
-            None,
-            &[96, 128],
-            0,
-            DType::Float16B,
-        )
-        .expect("gather shape");
+        let shape =
+            gather_shape(&[288, 128], None, &[96, 128], 0, DType::Float16B).expect("gather shape");
         let program = gather_program(GatherProgramKey {
             cores: vec![CoreCoord { x: 1, y: 2 }, CoreCoord { x: 1, y: 3 }],
             dtype: DType::Float16B,
@@ -485,8 +453,7 @@ mod tests {
 
     #[test]
     fn gather_program_uses_axis_mode_for_non_bf16_rows() {
-        let shape =
-            gather_shape(&[4, 8], &[4, 8], None, &[2, 8], 0, DType::Float32).expect("gather shape");
+        let shape = gather_shape(&[4, 8], None, &[2, 8], 0, DType::Float32).expect("gather shape");
         let program = gather_program(GatherProgramKey {
             cores: vec![CoreCoord { x: 1, y: 2 }],
             dtype: DType::Float32,
@@ -502,7 +469,7 @@ mod tests {
 
     #[test]
     fn gather_program_pads_rank1_axis_shape() {
-        let shape = gather_shape(&[8], &[8], None, &[2], 0, DType::Float32).expect("gather shape");
+        let shape = gather_shape(&[8], None, &[2], 0, DType::Float32).expect("gather shape");
         let program = gather_program(GatherProgramKey {
             cores: vec![CoreCoord { x: 1, y: 2 }],
             dtype: DType::Float32,

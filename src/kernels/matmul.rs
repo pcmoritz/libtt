@@ -184,8 +184,6 @@ struct MatmulOperandView {
     tiles_per_row: u32,
     reshape_source: Option<ReshapeSourceView>,
     shape: [u32; MAX_RANK],
-    physical_shape: [u32; MAX_RANK],
-    reshape_shape: [u32; MAX_RANK],
     batch_dims: [u32; MAX_RANK],
     row_dims: [u32; MAX_RANK],
     col_dims: [u32; MAX_RANK],
@@ -707,8 +705,6 @@ fn operand_view(
         )?,
         reshape_source,
         shape: padded_u32_array(shape, "matmul operand shape")?,
-        physical_shape: padded_u32_array(physical_shape, "matmul operand physical shape")?,
-        reshape_shape: padded_u32_array(shape, "matmul operand reshape shape")?,
         batch_dims: padded_u32_array(batch_dims, "matmul operand batch dimensions")?,
         row_dims: padded_u32_array(row_dims, "matmul operand row dimensions")?,
         col_dims: padded_u32_array(col_dims, "matmul operand column dimensions")?,
@@ -1572,8 +1568,6 @@ fn append_view_args(args: &mut Vec<u32>, view: &MatmulOperandView) {
             .map_or(1, |source| source.tiles_per_row),
     ]);
     args.extend(view.shape);
-    args.extend(view.physical_shape);
-    args.extend(view.reshape_shape);
     args.extend(view.batch_dims);
     args.extend(view.row_dims);
     args.extend(view.col_dims);

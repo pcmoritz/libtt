@@ -13,8 +13,6 @@ constexpr uint32_t AXIS = GATHER_AXIS;
 static_assert(RANK >= 2, "gather reader expects shapes padded to at least rank 2");
 constexpr uint32_t COORD_COUNT = RANK;
 constexpr uint32_t OPERAND_SHAPE[COORD_COUNT] = GATHER_OPERAND_SHAPE;
-constexpr uint32_t OPERAND_PHYSICAL_SHAPE[COORD_COUNT] =
-    GATHER_OPERAND_PHYSICAL_SHAPE;
 constexpr uint32_t OUTPUT_SHAPE[COORD_COUNT] = GATHER_OUTPUT_SHAPE;
 constexpr bool OPERAND_RESHAPE_VIEW = GATHER_OPERAND_RESHAPE_VIEW != 0;
 constexpr uint32_t SOURCE_ROWS = GATHER_SOURCE_ROWS;
@@ -125,8 +123,7 @@ Location operand_location(const uint32_t coords[COORD_COUNT]) {
     return reshape_source_location(flat);
   } else {
     return tensor_location(
-        OPERAND_PHYSICAL_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW,
-        coords);
+        OPERAND_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW, coords);
   }
 }
 
