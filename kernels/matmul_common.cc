@@ -8,7 +8,7 @@ constexpr uint32_t TILE_R = 32, TILE_C = 32;
 constexpr uint32_t FACE_R = 16, FACE_C = 16;
 constexpr uint32_t MAX_RANK = 8;
 constexpr uint32_t INVALID_TILE = 0xffffffffu;
-constexpr uint32_t VIEW_ARG_COUNT = 14 + 4 * MAX_RANK;
+constexpr uint32_t VIEW_ARG_COUNT = 9 + 4 * MAX_RANK;
 constexpr uint32_t VIEW_CONTIGUOUS = 0;
 constexpr uint32_t VIEW_TILED_INDEX_MAP = 4;
 constexpr uint32_t VIEW_TILE_TRANSPOSE = 5;
@@ -16,7 +16,6 @@ constexpr uint32_t VIEW_TILE_TRANSPOSE = 5;
 struct View {
   uint32_t kind, rank, batch_rank, row_rank, col_rank;
   uint32_t logical_rows, logical_cols, tile_rows, tiles_per_row;
-  uint32_t reshape_source, source_rows, source_cols, source_tile_rows, source_tiles_per_row;
   uint32_t shape[MAX_RANK];
   uint32_t batch_dims[MAX_RANK];
   uint32_t row_dims[MAX_RANK];
@@ -30,7 +29,7 @@ void load_array(uint32_t base, uint32_t *target) {
 }
 
 View load_view(uint32_t arg_view_kind) {
-  const uint32_t arg_view_shape = arg_view_kind + 14;
+  const uint32_t arg_view_shape = arg_view_kind + 9;
   const uint32_t arg_view_batch_dims = arg_view_shape + MAX_RANK;
   const uint32_t arg_view_row_dims = arg_view_batch_dims + MAX_RANK;
   const uint32_t arg_view_col_dims = arg_view_row_dims + MAX_RANK;
@@ -44,11 +43,6 @@ View load_view(uint32_t arg_view_kind) {
   view.logical_cols = A(arg_view_kind + 6);
   view.tile_rows = A(arg_view_kind + 7);
   view.tiles_per_row = A(arg_view_kind + 8);
-  view.reshape_source = A(arg_view_kind + 9);
-  view.source_rows = A(arg_view_kind + 10);
-  view.source_cols = A(arg_view_kind + 11);
-  view.source_tile_rows = A(arg_view_kind + 12);
-  view.source_tiles_per_row = A(arg_view_kind + 13);
   load_array(arg_view_shape, view.shape);
   load_array(arg_view_batch_dims, view.batch_dims);
   load_array(arg_view_row_dims, view.row_dims);
@@ -84,21 +78,6 @@ void decompose_into_dims(uint32_t flat, const uint32_t *dims, uint32_t dim_count
 
 uint32_t tile_id_for_indices(const View &view, const uint32_t *indices,
                              uint32_t *row_in_tile, uint32_t *col_in_tile) {
-  if (view.reshape_source != 0) {
-    uint32_t flat = 0;
-    for (uint32_t dim = 0; dim < view.rank; ++dim) {
-      flat = flat * view.shape[dim] + indices[dim];
-    }
-    uint32_t col = flat % view.source_cols;
-    uint32_t row_major = flat / view.source_cols;
-    uint32_t row = row_major % view.source_rows;
-    uint32_t batch = row_major / view.source_rows;
-    *row_in_tile = row % TILE_R;
-    *col_in_tile = col % TILE_C;
-    return (batch * view.source_tile_rows + row / TILE_R) *
-               view.source_tiles_per_row +
-           col / TILE_C;
-  }
   if (view.rank == 1) {
     uint32_t col = indices[0];
     *row_in_tile = 0;

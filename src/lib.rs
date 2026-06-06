@@ -2342,8 +2342,6 @@ fn execute_matmul(
     let rhs = device_dram_view_for_value(values, plan, context, input_ids[1], "matmul.rhs")?;
     let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
     let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
-    let lhs_physical_shape = lhs.source_shape.as_deref().unwrap_or(&lhs_shape);
-    let rhs_physical_shape = rhs.source_shape.as_deref().unwrap_or(&rhs_shape);
 
     if let Some(epilogue) = top_k_epilogue {
         if epilogue.k != 1 {
@@ -2401,9 +2399,7 @@ fn execute_matmul(
             device,
             lhs.dram_buffer,
             rhs.dram_buffer,
-            lhs_physical_shape,
             &lhs_shape,
-            rhs_physical_shape,
             &rhs_shape,
             &matmul_shape,
             &dimension_numbers.lhs_batching_dimensions,
@@ -2465,9 +2461,7 @@ fn execute_matmul(
         device,
         lhs.dram_buffer,
         rhs.dram_buffer,
-        lhs_physical_shape,
         &lhs_shape,
-        rhs_physical_shape,
         &rhs_shape,
         &output_shape,
         &dimension_numbers.lhs_batching_dimensions,
@@ -2695,26 +2689,6 @@ fn reshape_is_same_dtype_same_volume(
     input_desc.element_type == output_desc.element_type && input_elements == output_elements
 }
 
-fn reshape_keeps_innermost_dim(
-    plan: &executable::Executable,
-    input_id: u32,
-    output_id: u32,
-) -> bool {
-    let Some(input_desc) = plan.values.get(input_id as usize) else {
-        return false;
-    };
-    let Some(output_desc) = plan.values.get(output_id as usize) else {
-        return false;
-    };
-    let Some(&input_last) = input_desc.dims.last() else {
-        return false;
-    };
-    let Some(&output_last) = output_desc.dims.last() else {
-        return false;
-    };
-    input_last == output_last
-}
-
 fn tiled_layout_matrix(shape: &[usize]) -> Result<(usize, usize, usize), *mut PJRT_Error> {
     let elements = element_count(shape)?;
     let (rows, cols) = match shape.len() {
@@ -2775,12 +2749,6 @@ fn can_leave_reshape_unmaterialized(
                     }
                     executable::Op::Scatter { input_ids, .. }
                         if input_ids[0] == value_id || input_ids[2] == value_id =>
-                    {
-                        has_lazy_consumer = true;
-                    }
-                    executable::Op::Matmul { input_ids, .. }
-                        if input_ids.contains(&value_id)
-                            && reshape_keeps_innermost_dim(plan, input_id, value_id) =>
                     {
                         has_lazy_consumer = true;
                     }
@@ -5098,8 +5066,6 @@ mod tests {
                     &lhs,
                     &rhs,
                     &lhs_shape,
-                    &lhs_shape,
-                    &rhs_shape,
                     &rhs_shape,
                     &output_shape,
                     &batch_dims,
@@ -5131,8 +5097,6 @@ mod tests {
                     &lhs,
                     &rhs_transposed,
                     &lhs_shape,
-                    &lhs_shape,
-                    &rhs_transposed_shape,
                     &rhs_transposed_shape,
                     &output_shape,
                     &batch_dims,

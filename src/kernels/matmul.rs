@@ -3,7 +3,6 @@ use crate::dispatch::{CBConfig, CompileConfig, MathFidelity, Program};
 use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
 use crate::hw::{CoreCoord, TensixL1};
 use crate::kernels::kernel::{Kernel, RuntimeArgs, RuntimeArgsBuilder};
-use crate::kernels::reshape_view::{reshape_source_view, ReshapeSourceView};
 use crate::log::log;
 use std::env;
 use std::io;
@@ -182,7 +181,6 @@ struct MatmulOperandView {
     logical_cols: u32,
     tile_rows: u32,
     tiles_per_row: u32,
-    reshape_source: Option<ReshapeSourceView>,
     shape: [u32; MAX_RANK],
     batch_dims: [u32; MAX_RANK],
     row_dims: [u32; MAX_RANK],
@@ -310,9 +308,7 @@ pub(crate) fn matmul_dot_general(
     device: &mut Device,
     lhs: &DramBuffer,
     rhs: &DramBuffer,
-    lhs_physical_shape: &[usize],
     lhs_logical_shape: &[usize],
-    rhs_physical_shape: &[usize],
     rhs_logical_shape: &[usize],
     output_logical_shape: &[usize],
     lhs_batching_dimensions: &[i64],
@@ -353,9 +349,7 @@ pub(crate) fn matmul_dot_general(
     let epilogue_kind = epilogue.kind();
 
     let shape = dot_general_shape(
-        lhs_physical_shape,
         lhs_logical_shape,
-        rhs_physical_shape,
         rhs_logical_shape,
         output_logical_shape,
         lhs_batching_dimensions,
@@ -364,8 +358,8 @@ pub(crate) fn matmul_dot_general(
         rhs_contracting_dimensions,
     )?;
     epilogue.validate_shape(&shape)?;
-    validate_tile_count(lhs, tiled_shape_tile_count(lhs_physical_shape)?, "lhs")?;
-    validate_tile_count(rhs, tiled_shape_tile_count(rhs_physical_shape)?, "rhs")?;
+    validate_tile_count(lhs, tiled_shape_tile_count(lhs_logical_shape)?, "lhs")?;
+    validate_tile_count(rhs, tiled_shape_tile_count(rhs_logical_shape)?, "rhs")?;
 
     let logical_mt = ceil32(shape.m) / 32;
     let logical_kt = ceil32(shape.k) / 32;
@@ -467,9 +461,7 @@ struct DotGeneralMatmulShape {
 }
 
 fn dot_general_shape(
-    lhs_physical_shape: &[usize],
     lhs_shape: &[usize],
-    rhs_physical_shape: &[usize],
     rhs_shape: &[usize],
     output_shape: &[usize],
     lhs_batching_dimensions: &[i64],
@@ -574,7 +566,6 @@ fn dot_general_shape(
         k,
         n,
         lhs_view: operand_view(
-            lhs_physical_shape,
             lhs_shape,
             &lhs_dims.batch,
             &lhs_dims.free,
@@ -584,7 +575,6 @@ fn dot_general_shape(
             false,
         )?,
         rhs_view: operand_view(
-            rhs_physical_shape,
             rhs_shape,
             &rhs_dims.batch,
             &rhs_dims.contract,
@@ -594,7 +584,6 @@ fn dot_general_shape(
             true,
         )?,
         output_view: operand_view(
-            output_shape,
             output_shape,
             &output_batch_dims,
             &output_row_dims,
@@ -661,7 +650,6 @@ fn checked_product_of_dims(shape: &[usize], dims: &[usize], name: &str) -> io::R
 }
 
 fn operand_view(
-    physical_shape: &[usize],
     shape: &[usize],
     batch_dims: &[usize],
     row_dims: &[usize],
@@ -670,23 +658,10 @@ fn operand_view(
     logical_cols: usize,
     allow_tile_transpose: bool,
 ) -> io::Result<MatmulOperandView> {
-    let allocation_shape = tiled_allocation_shape(physical_shape)?;
+    let allocation_shape = tiled_allocation_shape(shape)?;
     let rank = shape.len();
-    let reshape_source = (physical_shape != shape)
-        .then(|| reshape_source_view(physical_shape, shape, "matmul reshape view"))
-        .transpose()?;
-    if reshape_source.is_none() && physical_shape.len() != rank {
-        return Err(invalid_input(format!(
-            "matmul operand physical/logical rank mismatch: physical={} logical={rank}",
-            physical_shape.len()
-        )));
-    }
     let allocation_rank = allocation_shape.len();
-    let kind = if reshape_source.is_some() {
-        MatmulViewKind::Generic
-    } else {
-        operand_view_kind(rank, batch_dims, row_dims, col_dims, allow_tile_transpose)
-    };
+    let kind = operand_view_kind(rank, batch_dims, row_dims, col_dims, allow_tile_transpose);
     Ok(MatmulOperandView {
         kind,
         rank: u32_value(rank, "matmul operand rank")?,
@@ -703,7 +678,6 @@ fn operand_view(
             allocation_shape[allocation_rank - 1] / 32,
             "matmul operand source tiles per row",
         )?,
-        reshape_source,
         shape: padded_u32_array(shape, "matmul operand shape")?,
         batch_dims: padded_u32_array(batch_dims, "matmul operand batch dimensions")?,
         row_dims: padded_u32_array(row_dims, "matmul operand row dimensions")?,
@@ -1557,15 +1531,6 @@ fn append_view_args(args: &mut Vec<u32>, view: &MatmulOperandView) {
         view.logical_cols,
         view.tile_rows,
         view.tiles_per_row,
-        view.reshape_source.is_some() as u32,
-        view.reshape_source.as_ref().map_or(1, |source| source.rows),
-        view.reshape_source.as_ref().map_or(1, |source| source.cols),
-        view.reshape_source
-            .as_ref()
-            .map_or(1, |source| source.tile_rows),
-        view.reshape_source
-            .as_ref()
-            .map_or(1, |source| source.tiles_per_row),
     ]);
     args.extend(view.shape);
     args.extend(view.batch_dims);
