@@ -14,6 +14,11 @@ static_assert(RANK >= 2, "gather reader expects shapes padded to at least rank 2
 constexpr uint32_t COORD_COUNT = RANK;
 constexpr uint32_t OPERAND_SHAPE[COORD_COUNT] = GATHER_OPERAND_SHAPE;
 constexpr uint32_t OUTPUT_SHAPE[COORD_COUNT] = GATHER_OUTPUT_SHAPE;
+constexpr bool OPERAND_RESHAPE_VIEW = GATHER_OPERAND_RESHAPE_VIEW != 0;
+constexpr uint32_t SOURCE_ROWS = GATHER_SOURCE_ROWS;
+constexpr uint32_t SOURCE_COLS = GATHER_SOURCE_COLS;
+constexpr uint32_t SOURCE_TILE_ROWS = GATHER_SOURCE_TILE_ROWS;
+constexpr uint32_t SOURCE_TILES_PER_ROW = GATHER_SOURCE_TILES_PER_ROW;
 constexpr uint32_t OPERAND_TILE_ROWS = GATHER_OPERAND_TILE_ROWS;
 constexpr uint32_t OPERAND_TILES_PER_ROW = GATHER_OPERAND_TILES_PER_ROW;
 constexpr uint32_t OUTPUT_TILE_ROWS = GATHER_OUTPUT_TILE_ROWS;
@@ -96,6 +101,30 @@ Location tensor_location(const uint32_t shape[COORD_COUNT], uint32_t tile_rows,
   uint32_t tile_col = col / TILE_C;
   uint32_t tile = (batch * tile_rows + tile_row) * tiles_per_row + tile_col;
   return Location{tile, row % TILE_R, col % TILE_C};
+}
+
+Location reshape_source_location(uint32_t flat_index) {
+  uint32_t col = flat_index % SOURCE_COLS;
+  uint32_t row_major = flat_index / SOURCE_COLS;
+  uint32_t row = row_major % SOURCE_ROWS;
+  uint32_t batch = row_major / SOURCE_ROWS;
+  uint32_t tile_row = row / TILE_R;
+  uint32_t tile_col = col / TILE_C;
+  uint32_t tile = (batch * SOURCE_TILE_ROWS + tile_row) * SOURCE_TILES_PER_ROW + tile_col;
+  return Location{tile, row % TILE_R, col % TILE_C};
+}
+
+Location operand_location(const uint32_t coords[COORD_COUNT]) {
+  if constexpr (OPERAND_RESHAPE_VIEW) {
+    uint32_t flat = 0;
+    for (uint32_t dim = 0; dim < RANK; ++dim) {
+      flat = flat * OPERAND_SHAPE[dim] + coords[dim];
+    }
+    return reshape_source_location(flat);
+  } else {
+    return tensor_location(
+        OPERAND_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW, coords);
+  }
 }
 
 void ensure_tile(const InterleavedAddrGenFast<true> &input, uint32_t requested_tile,
@@ -249,9 +278,7 @@ void run_axis_gather(const InterleavedAddrGenFast<true> &operand,
                   : output_coord(dim, base_coords, output_row, output_col);
         }
 
-        Location source =
-            tensor_location(OPERAND_SHAPE, OPERAND_TILE_ROWS, OPERAND_TILES_PER_ROW,
-                            operand_coords);
+        Location source = operand_location(operand_coords);
         ensure_tile(operand, source.tile, cb_operand, &loaded_operand_tile);
         copy_operand_element(source.row, source.col, row, col);
       }

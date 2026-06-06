@@ -23,6 +23,7 @@ use dram::{allocator_stats, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
+use std::collections::HashSet;
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
@@ -92,6 +93,7 @@ pub struct PJRT_Buffer {
     memory: *mut PJRT_Memory,
     local_hardware_id: usize,
     dram_buffer: Option<DramBuffer>,
+    source_shape: Option<Vec<usize>>,
     deleted: bool,
 }
 
@@ -117,6 +119,7 @@ struct ExecutableMetadata {
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
     executable: Option<executable::Executable>,
+    lazy_reshape_ids: HashSet<u32>,
 }
 
 #[repr(C)]
@@ -373,6 +376,12 @@ fn host_byte_size(dtype: DType, dims: &[usize]) -> Result<usize, *mut PJRT_Error
         .ok_or_else(|| resource_exhausted("host buffer size overflow"))
 }
 
+fn element_count(dims: &[usize]) -> Result<usize, *mut PJRT_Error> {
+    dims.iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| resource_exhausted("shape element count overflow"))
+}
+
 fn padded_host_data(
     data: &[u8],
     dtype: DType,
@@ -559,15 +568,25 @@ fn read_buffer_logical_bytes(buffer: &PJRT_Buffer) -> Result<Vec<u8>, *mut PJRT_
             )
         })?;
     let data = read_buffer_bytes(buffer)?;
-    if data.len() == byte_size {
+    let read_shape = buffer.source_shape.as_deref().unwrap_or(&dims);
+    let read_byte_size = host_byte_size(dtype, read_shape)?;
+    if buffer.source_shape.is_some() && read_byte_size != byte_size {
+        return Err(pjrt_error(
+            format!(
+                "reshape view source byte size {read_byte_size} does not match logical byte size {byte_size}"
+            ),
+            PJRT_Error_Code::PJRT_Error_Code_INTERNAL,
+        ));
+    }
+    if data.len() == read_byte_size {
         return Ok(data);
     }
-    if buffer.dims.len() < 2 && data.len() >= byte_size {
+    if read_shape.len() < 2 && data.len() >= read_byte_size {
         let mut data = data;
-        data.truncate(byte_size);
+        data.truncate(read_byte_size);
         return Ok(data);
     }
-    if let Some(data) = crop_padded_host_data(&data, dtype, &dims, &allocation_shape)? {
+    if let Some(data) = crop_padded_host_data(&data, dtype, read_shape, &allocation_shape)? {
         return Ok(data);
     }
     Err(pjrt_error(
@@ -721,6 +740,10 @@ fn make_executable_metadata(
         .flat_map(|output| output.dims.iter().copied())
         .collect::<Vec<_>>();
     let fingerprint = executable_fingerprint_string(name, outputs);
+    let lazy_reshape_ids = executable
+        .as_ref()
+        .map(lazy_reshape_ids)
+        .unwrap_or_default();
     ExecutableMetadata {
         name: cstring_lossy(name),
         fingerprint,
@@ -732,6 +755,7 @@ fn make_executable_metadata(
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
         executable,
+        lazy_reshape_ids,
     }
 }
 
@@ -1479,6 +1503,90 @@ fn device_buffer_for_value<'a>(
         .ok_or_else(|| invalid_argument(format!("{field} value id {value_id} is not available")))
 }
 
+struct DeviceDramView<'a> {
+    buffer_type: PJRT_Buffer_Type,
+    shape: Vec<usize>,
+    dram_buffer: &'a DramBuffer,
+    source_shape: Option<Vec<usize>>,
+}
+
+fn reshape_input_id(plan: &executable::Executable, output_id: u32) -> Option<u32> {
+    plan.ops.iter().find_map(|op| match op {
+        executable::Op::Reshape {
+            input_id,
+            output_id: reshape_output_id,
+        } if *reshape_output_id == output_id => Some(*input_id),
+        _ => None,
+    })
+}
+
+fn device_dram_view_for_value<'a>(
+    values: &'a [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    context: &OutputContext,
+    value_id: u32,
+    field: &str,
+) -> Result<DeviceDramView<'a>, *mut PJRT_Error> {
+    let index = value_id as usize;
+    if let Some(buffer) = values.get(index).and_then(|value| value.as_ref()) {
+        let Some(dram_buffer) = buffer.dram_buffer.as_ref() else {
+            return Err(failed_precondition(format!(
+                "TT executable {field} buffer has no device allocation"
+            )));
+        };
+        return Ok(DeviceDramView {
+            buffer_type: buffer.buffer_type,
+            shape: dims_i64_to_usize(&buffer.dims)?,
+            dram_buffer,
+            source_shape: buffer.source_shape.clone(),
+        });
+    }
+
+    let Some(input_id) = reshape_input_id(plan, value_id) else {
+        return Err(invalid_argument(format!(
+            "{field} value id {value_id} is not available"
+        )));
+    };
+    if !context.lazy_reshape_ids.contains(&value_id) {
+        return Err(invalid_argument(format!(
+            "{field} reshape value id {value_id} is not materialized"
+        )));
+    }
+
+    let input_desc = plan.values.get(input_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "{field} reshape input value id {input_id} is out of bounds"
+        ))
+    })?;
+    let output_desc = plan.values.get(index).ok_or_else(|| {
+        invalid_argument(format!(
+            "{field} reshape output value id {value_id} is out of bounds"
+        ))
+    })?;
+    if input_desc.element_type != output_desc.element_type {
+        return Err(invalid_argument(format!(
+            "{field} lazy reshape requires matching element types, got {:?} -> {:?}",
+            input_desc.element_type, output_desc.element_type
+        )));
+    }
+
+    let input_view = device_dram_view_for_value(values, plan, context, input_id, field)?;
+    let source_shape = input_view.source_shape.unwrap_or(input_view.shape);
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    if element_count(&source_shape)? != element_count(&output_shape)? {
+        return Err(invalid_argument(format!(
+            "{field} lazy reshape volume mismatch: source {source_shape:?}, output {output_shape:?}"
+        )));
+    }
+    let source_shape = (source_shape != output_shape).then_some(source_shape);
+    Ok(DeviceDramView {
+        buffer_type: output_desc.element_type,
+        shape: output_shape,
+        dram_buffer: input_view.dram_buffer,
+        source_shape,
+    })
+}
+
 fn select_value_input<'a>(
     values: &'a [Option<PJRT_Buffer>],
     plan: &'a executable::Executable,
@@ -1515,10 +1623,11 @@ fn select_value_input<'a>(
     )))
 }
 
-struct OutputContext {
+struct OutputContext<'a> {
     device: *mut PJRT_Device,
     memory: *mut PJRT_Memory,
     local_hardware_id: usize,
+    lazy_reshape_ids: &'a HashSet<u32>,
 }
 
 fn store_output_buffer(
@@ -1527,6 +1636,28 @@ fn store_output_buffer(
     output_id: u32,
     expected_dims: Vec<i64>,
     dram_buffer: DramBuffer,
+    context: &OutputContext,
+    op: &str,
+) -> Result<(), *mut PJRT_Error> {
+    store_output_buffer_with_source_shape(
+        values,
+        plan,
+        output_id,
+        expected_dims,
+        dram_buffer,
+        None,
+        context,
+        op,
+    )
+}
+
+fn store_output_buffer_with_source_shape(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    output_id: u32,
+    expected_dims: Vec<i64>,
+    dram_buffer: DramBuffer,
+    source_shape: Option<Vec<usize>>,
     context: &OutputContext,
     op: &str,
 ) -> Result<(), *mut PJRT_Error> {
@@ -1550,7 +1681,19 @@ fn store_output_buffer(
         )));
     }
     let logical_shape = dims_i64_to_usize(&expected.dims)?;
-    let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
+    let source_shape = source_shape.filter(|shape| shape.as_slice() != logical_shape.as_slice());
+    if let Some(source_shape) = source_shape.as_ref() {
+        let source_elements = element_count(source_shape)?;
+        let logical_elements = element_count(&logical_shape)?;
+        if source_elements != logical_elements {
+            return Err(invalid_argument(format!(
+                "TT executable {op} reshape view volume mismatch: source {source_shape:?}, logical {logical_shape:?}"
+            )));
+        }
+    }
+    let allocation_logical_shape = source_shape.as_deref().unwrap_or(&logical_shape);
+    let allocation_shape =
+        dram::tiled_allocation_shape(allocation_logical_shape).map_err(io_error)?;
     if dram_buffer.shape != allocation_shape {
         return Err(invalid_argument(format!(
             "TT executable {op} output allocation shape mismatch: expected {:?}, got {:?}",
@@ -1564,6 +1707,7 @@ fn store_output_buffer(
         memory: context.memory,
         local_hardware_id: context.local_hardware_id,
         dram_buffer: Some(dram_buffer),
+        source_shape,
         deleted: false,
     });
     Ok(())
@@ -1650,11 +1794,58 @@ fn execute_reshape(
     };
     let input_dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
+    let same_element_count = element_count(&input_shape)? == element_count(&output_shape)?;
+    if input_dtype == output_dtype && same_element_count {
+        let output_allocation_shape =
+            dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+        let output_tile_count = dram::tiled_shape_tile_count(&output_shape).map_err(io_error)?;
+        if input_dram.num_tiles == output_tile_count
+            && reshape_preserves_tiled_layout(&input_shape, &output_shape)?
+        {
+            let mut output_dram = input_dram.clone();
+            output_dram.shape = output_allocation_shape;
+            return store_output_buffer(
+                values,
+                plan,
+                output_id,
+                output_desc.dims.clone(),
+                output_dram,
+                context,
+                "reshape",
+            );
+        }
+
+        if plan.output_ids.contains(&output_id) {
+            let source_shape = input
+                .source_shape
+                .clone()
+                .unwrap_or_else(|| input_shape.clone());
+            return store_output_buffer_with_source_shape(
+                values,
+                plan,
+                output_id,
+                output_desc.dims.clone(),
+                input_dram.clone(),
+                Some(source_shape),
+                context,
+                "reshape",
+            );
+        }
+        if context.lazy_reshape_ids.contains(&output_id) {
+            return Ok(());
+        }
+    }
+
+    let input = device_dram_view_for_value(values, plan, context, input_id, "reshape.operand")?;
+    let input_source_shape = input
+        .source_shape
+        .as_deref()
+        .unwrap_or(input_shape.as_slice());
     let output_dims = output_desc.dims.clone();
     let output_dram = kernels::reshape::reshape(
         device,
-        input_dram,
-        &input_shape,
+        input.dram_buffer,
+        input_source_shape,
         &output_shape,
         input_dtype,
         output_dtype,
@@ -2446,6 +2637,166 @@ fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option
     })
 }
 
+fn op_consumes_value(op: &executable::Op, value_id: u32) -> bool {
+    match op {
+        executable::Op::Parameter { .. }
+        | executable::Op::Constant { .. }
+        | executable::Op::Iota { .. } => false,
+        executable::Op::Concatenate { input_ids, .. }
+        | executable::Op::CustomCall { input_ids, .. }
+        | executable::Op::FusedElementwise { input_ids, .. } => input_ids.contains(&value_id),
+        executable::Op::Reshape { input_id, .. }
+        | executable::Op::Slice { input_id, .. }
+        | executable::Op::Transpose { input_id, .. }
+        | executable::Op::BroadcastInDim { input_id, .. }
+        | executable::Op::TopK { input_id, .. } => *input_id == value_id,
+        executable::Op::Reduce {
+            input_ids,
+            init_value_ids,
+            ..
+        }
+        | executable::Op::ReduceWindow {
+            input_ids,
+            init_value_ids,
+            ..
+        } => input_ids.contains(&value_id) || init_value_ids.contains(&value_id),
+        executable::Op::Matmul { input_ids, .. } | executable::Op::Gather { input_ids, .. } => {
+            input_ids.contains(&value_id)
+        }
+        executable::Op::Scatter { input_ids, .. } | executable::Op::Select { input_ids, .. } => {
+            input_ids.contains(&value_id)
+        }
+        executable::Op::SdpaDecode { input_ids, .. } => input_ids.contains(&value_id),
+    }
+}
+
+fn shape_element_count_i64(dims: &[i64]) -> Option<usize> {
+    dims.iter().try_fold(1usize, |acc, &dim| {
+        let dim = usize::try_from(dim).ok()?;
+        acc.checked_mul(dim)
+    })
+}
+
+fn reshape_is_same_dtype_same_volume(
+    plan: &executable::Executable,
+    input_id: u32,
+    output_id: u32,
+) -> bool {
+    let Some(input_desc) = plan.values.get(input_id as usize) else {
+        return false;
+    };
+    let Some(output_desc) = plan.values.get(output_id as usize) else {
+        return false;
+    };
+    let Some(input_elements) = shape_element_count_i64(&input_desc.dims) else {
+        return false;
+    };
+    let Some(output_elements) = shape_element_count_i64(&output_desc.dims) else {
+        return false;
+    };
+    input_desc.element_type == output_desc.element_type && input_elements == output_elements
+}
+
+fn tiled_layout_matrix_dims(shape: &[usize]) -> Result<(usize, usize), *mut PJRT_Error> {
+    let (rows, cols) = match shape.len() {
+        0 => (1, 1),
+        1 => (1, shape[0]),
+        rank => (shape[rank - 2], shape[rank - 1]),
+    };
+    if rows == 0 || cols == 0 {
+        return Err(invalid_argument(format!(
+            "shape {shape:?} cannot be represented as a tiled matrix"
+        )));
+    }
+    Ok((rows, cols))
+}
+
+fn reshape_preserves_tiled_layout(
+    source_shape: &[usize],
+    logical_shape: &[usize],
+) -> Result<bool, *mut PJRT_Error> {
+    Ok(tiled_layout_matrix_dims(source_shape)? == tiled_layout_matrix_dims(logical_shape)?)
+}
+
+fn can_leave_reshape_unmaterialized(
+    plan: &executable::Executable,
+    value_id: u32,
+    memo: &mut [Option<bool>],
+    visiting: &mut HashSet<u32>,
+) -> bool {
+    let index = value_id as usize;
+    if index >= memo.len() {
+        return false;
+    }
+    if let Some(cached) = memo[index] {
+        return cached;
+    }
+    if !visiting.insert(value_id) {
+        return false;
+    }
+
+    let result = if plan.output_ids.contains(&value_id) {
+        false
+    } else if let Some(input_id) = reshape_input_id(plan, value_id) {
+        if !reshape_is_same_dtype_same_volume(plan, input_id, value_id) {
+            false
+        } else {
+            let mut has_lazy_consumer = false;
+            let mut valid = true;
+            for op in &plan.ops {
+                match op {
+                    executable::Op::Gather { input_ids, .. } if input_ids[0] == value_id => {
+                        has_lazy_consumer = true;
+                    }
+                    executable::Op::Scatter { input_ids, .. }
+                        if input_ids[0] == value_id || input_ids[2] == value_id =>
+                    {
+                        has_lazy_consumer = true;
+                    }
+                    executable::Op::Reshape {
+                        input_id,
+                        output_id,
+                    } if *input_id == value_id => {
+                        if can_leave_reshape_unmaterialized(plan, *output_id, memo, visiting) {
+                            has_lazy_consumer = true;
+                        } else {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    _ if op_consumes_value(op, value_id) => {
+                        valid = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            valid && has_lazy_consumer
+        }
+    } else {
+        false
+    };
+
+    visiting.remove(&value_id);
+    memo[index] = Some(result);
+    result
+}
+
+fn lazy_reshape_ids(plan: &executable::Executable) -> HashSet<u32> {
+    let mut memo = vec![None; plan.values.len()];
+    let mut visiting = HashSet::new();
+    plan.ops
+        .iter()
+        .filter_map(|op| match op {
+            executable::Op::Reshape { output_id, .. } => {
+                can_leave_reshape_unmaterialized(plan, *output_id, &mut memo, &mut visiting)
+                    .then_some(*output_id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2687,7 +3038,8 @@ fn execute_gather(
     dimension_numbers: &executable::GatherDimensionNumbers,
     slice_sizes: &[i64],
 ) -> Result<(), *mut PJRT_Error> {
-    let operand = device_buffer_for_value(values, input_ids[0], "gather.operand")?.clone();
+    let operand =
+        device_dram_view_for_value(values, plan, context, input_ids[0], "gather.operand")?;
     let start_indices =
         device_buffer_for_value(values, input_ids[1], "gather.start_indices")?.clone();
     if start_indices.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
@@ -2695,7 +3047,7 @@ fn execute_gather(
             "TT executable gather currently only supports s32 start_indices",
         ));
     }
-    let operand_shape = dims_i64_to_usize(&operand.dims)?;
+    let operand_shape = operand.shape.clone();
     let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
@@ -2709,11 +3061,6 @@ fn execute_gather(
         )));
     }
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let Some(operand_dram) = operand.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable gather operand buffer has no device allocation",
-        ));
-    };
     let Some(start_indices_dram) = start_indices.dram_buffer.as_ref() else {
         return Err(failed_precondition(
             "TT executable gather start_indices buffer has no device allocation",
@@ -2793,11 +3140,18 @@ fn execute_gather(
     }
 
     let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
+    let operand_source_view = kernels::reshape_view::optional_reshape_source_view(
+        operand.source_shape.as_deref(),
+        &operand_shape,
+        "gather reshape view",
+    )
+    .map_err(io_error)?;
     let output_dram = kernels::gather::gather(
         device,
-        operand_dram,
+        operand.dram_buffer,
         start_indices_dram,
         &operand_shape,
+        operand_source_view,
         &start_indices_shape,
         &output_shape,
         axis,
@@ -2825,10 +3179,12 @@ fn execute_scatter(
     output_id: u32,
     dimension_numbers: &executable::ScatterDimensionNumbers,
 ) -> Result<(), *mut PJRT_Error> {
-    let operand = device_buffer_for_value(values, input_ids[0], "scatter.operand")?.clone();
+    let operand =
+        device_dram_view_for_value(values, plan, context, input_ids[0], "scatter.operand")?;
     let start_indices =
         device_buffer_for_value(values, input_ids[1], "scatter.start_indices")?.clone();
-    let updates = device_buffer_for_value(values, input_ids[2], "scatter.updates")?.clone();
+    let updates =
+        device_dram_view_for_value(values, plan, context, input_ids[2], "scatter.updates")?;
     if start_indices.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_S32 {
         return Err(unimplemented(
             "TT executable scatter currently only supports s32 start_indices",
@@ -2853,9 +3209,9 @@ fn execute_scatter(
         )));
     }
 
-    let operand_shape = dims_i64_to_usize(&operand.dims)?;
+    let operand_shape = operand.shape.clone();
     let start_indices_shape = dims_i64_to_usize(&start_indices.dims)?;
-    let update_shape = dims_i64_to_usize(&updates.dims)?;
+    let update_shape = updates.shape.clone();
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
     if output_shape != operand_shape {
         return Err(invalid_argument(format!(
@@ -2878,17 +3234,13 @@ fn execute_scatter(
                 operand_shape
             )));
         }
-        let Some(updates_dram) = updates.dram_buffer.as_ref() else {
-            return Err(failed_precondition(
-                "TT executable scatter updates buffer has no device allocation",
-            ));
-        };
-        return store_output_buffer(
+        return store_output_buffer_with_source_shape(
             values,
             plan,
             output_id,
             output_desc.dims.clone(),
-            updates_dram.clone(),
+            updates.dram_buffer.clone(),
+            updates.source_shape.clone(),
             context,
             "scatter",
         );
@@ -2904,31 +3256,35 @@ fn execute_scatter(
     )
     .map_err(|err| unimplemented(err.to_string()))?;
 
-    let Some(operand_dram) = operand.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable scatter operand buffer has no device allocation",
-        ));
-    };
     let Some(start_indices_dram) = start_indices.dram_buffer.as_ref() else {
         return Err(failed_precondition(
             "TT executable scatter start_indices buffer has no device allocation",
         ));
     };
-    let Some(updates_dram) = updates.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable scatter updates buffer has no device allocation",
-        ));
-    };
 
     let dtype = pjrt_buffer_type_to_dtype(operand.buffer_type)?;
+    let operand_source_view = kernels::reshape_view::optional_reshape_source_view(
+        operand.source_shape.as_deref(),
+        &operand_shape,
+        "scatter reshape view",
+    )
+    .map_err(io_error)?;
+    let update_source_view = kernels::reshape_view::optional_reshape_source_view(
+        updates.source_shape.as_deref(),
+        &update_shape,
+        "scatter update reshape view",
+    )
+    .map_err(io_error)?;
     let output_dram = kernels::scatter::scatter_set(
         device,
-        operand_dram,
+        operand.dram_buffer,
         start_indices_dram,
-        updates_dram,
+        updates.dram_buffer,
         &operand_shape,
+        operand_source_view,
         &start_indices_shape,
         &update_shape,
+        update_source_view,
         scatter_dim,
         dtype,
         "pjrt_scatter",
@@ -3341,6 +3697,7 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         device: execute_device,
         memory: target_device.default_memory,
         local_hardware_id: target_local_hardware_id,
+        lazy_reshape_ids: &executable.metadata.lazy_reshape_ids,
     };
     let output_buffers = {
         let _guard = match target_device.runtime_lock.lock() {
@@ -3500,6 +3857,7 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         memory: target_memory,
         local_hardware_id,
         dram_buffer: Some(dram_buffer),
+        source_shape: None,
         deleted: false,
     }));
     ptr::null_mut()
