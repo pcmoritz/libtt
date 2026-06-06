@@ -1,8 +1,6 @@
 #include "mlir/sdpa_fusing_pattern.h"
 
-#include <algorithm>
 #include <cstdint>
-#include <initializer_list>
 #include <optional>
 #include <string>
 
@@ -48,12 +46,6 @@ std::optional<mlir::RankedTensorType> getStaticRankedTensor(mlir::Value value) {
     return std::nullopt;
   }
   return tensor;
-}
-
-bool int64ArrayEquals(llvm::ArrayRef<int64_t> values,
-                      std::initializer_list<int64_t> expected) {
-  return values.size() == expected.size() &&
-         std::equal(values.begin(), values.end(), expected.begin());
 }
 
 bool isStaticBf16Tensor(mlir::Value value) {
@@ -165,7 +157,8 @@ std::optional<RepeatedCacheMatch> matchRepeatedCache(mlir::Value value,
   }
 
   mlir::Value gatheredValue = peelIdentityCustomCalls(broadcastOp.getOperand());
-  if (int64ArrayEquals(broadcastOp.getBroadcastDimensions(), {0, 1, 2, 3})) {
+  if (broadcastOp.getBroadcastDimensions() ==
+      llvm::ArrayRef<int64_t>{0, 1, 2, 3}) {
     auto expandOp =
         definingOpSkippingIdentityCustomCalls<mlir::stablehlo::BroadcastInDimOp>(
             gatheredValue);
@@ -174,12 +167,12 @@ std::optional<RepeatedCacheMatch> matchRepeatedCache(mlir::Value value,
         expandType->getDimSize(0) != keyTokens ||
         expandType->getDimSize(2) != 1 ||
         expandType->getDimSize(3) != headDim ||
-        !int64ArrayEquals(expandOp.getBroadcastDimensions(), {0, 1, 3})) {
+        expandOp.getBroadcastDimensions() != llvm::ArrayRef<int64_t>{0, 1, 3}) {
       return std::nullopt;
     }
     gatheredValue = peelIdentityCustomCalls(expandOp.getOperand());
-  } else if (!int64ArrayEquals(broadcastOp.getBroadcastDimensions(),
-                               {0, 1, 3})) {
+  } else if (broadcastOp.getBroadcastDimensions() !=
+             llvm::ArrayRef<int64_t>{0, 1, 3}) {
     return std::nullopt;
   }
 
@@ -288,10 +281,10 @@ std::optional<ScorePathMatch> matchScorePath(mlir::Value maskedScores,
     return std::nullopt;
   }
   auto dims = dotOp.getDotDimensionNumbers();
-  if (!int64ArrayEquals(dims.getLhsBatchingDimensions(), {1}) ||
-      !int64ArrayEquals(dims.getRhsBatchingDimensions(), {1}) ||
-      !int64ArrayEquals(dims.getLhsContractingDimensions(), {2}) ||
-      !int64ArrayEquals(dims.getRhsContractingDimensions(), {2})) {
+  if (dims.getLhsBatchingDimensions() != llvm::ArrayRef<int64_t>{1} ||
+      dims.getRhsBatchingDimensions() != llvm::ArrayRef<int64_t>{1} ||
+      dims.getLhsContractingDimensions() != llvm::ArrayRef<int64_t>{2} ||
+      dims.getRhsContractingDimensions() != llvm::ArrayRef<int64_t>{2}) {
     return std::nullopt;
   }
 
@@ -344,8 +337,8 @@ std::optional<Components> matchSdpaDecode(
     return std::nullopt;
   }
   auto dims = valueDot.getDotDimensionNumbers();
-  if (!int64ArrayEquals(dims.getLhsBatchingDimensions(), {1}) ||
-      !int64ArrayEquals(dims.getRhsBatchingDimensions(), {1})) {
+  if (dims.getLhsBatchingDimensions() != llvm::ArrayRef<int64_t>{1} ||
+      dims.getRhsBatchingDimensions() != llvm::ArrayRef<int64_t>{1}) {
     return std::nullopt;
   }
 
@@ -354,13 +347,13 @@ std::optional<Components> matchSdpaDecode(
   auto rhsVMatch = matchRepeatedCache(valueDot.getRhs(), qHeads);
   std::optional<RepeatedCacheMatch> vMatch;
   if (lhsVMatch && !rhsVMatch &&
-      int64ArrayEquals(dims.getLhsContractingDimensions(), {0}) &&
-      int64ArrayEquals(dims.getRhsContractingDimensions(), {2})) {
+      dims.getLhsContractingDimensions() == llvm::ArrayRef<int64_t>{0} &&
+      dims.getRhsContractingDimensions() == llvm::ArrayRef<int64_t>{2}) {
     probabilities = valueDot.getRhs();
     vMatch = *lhsVMatch;
   } else if (rhsVMatch && !lhsVMatch &&
-             int64ArrayEquals(dims.getLhsContractingDimensions(), {2}) &&
-             int64ArrayEquals(dims.getRhsContractingDimensions(), {0})) {
+             dims.getLhsContractingDimensions() == llvm::ArrayRef<int64_t>{2} &&
+             dims.getRhsContractingDimensions() == llvm::ArrayRef<int64_t>{0}) {
     probabilities = valueDot.getLhs();
     vMatch = *rhsVMatch;
   } else {
