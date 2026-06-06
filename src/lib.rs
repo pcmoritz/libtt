@@ -2697,32 +2697,25 @@ fn reshape_is_same_dtype_same_volume(
     input_desc.element_type == output_desc.element_type && input_elements == output_elements
 }
 
-fn tiled_layout_matrix(shape: &[usize]) -> Result<(usize, usize, usize), *mut PJRT_Error> {
-    let elements = element_count(shape)?;
+fn tiled_layout_matrix_dims(shape: &[usize]) -> Result<(usize, usize), *mut PJRT_Error> {
     let (rows, cols) = match shape.len() {
         0 => (1, 1),
         1 => (1, shape[0]),
         rank => (shape[rank - 2], shape[rank - 1]),
     };
-    let matrix_elements = rows
-        .checked_mul(cols)
-        .ok_or_else(|| invalid_argument(format!("shape {shape:?} matrix dimensions overflow")))?;
-    if matrix_elements == 0 || elements % matrix_elements != 0 {
+    if rows == 0 || cols == 0 {
         return Err(invalid_argument(format!(
             "shape {shape:?} cannot be represented as a tiled matrix"
         )));
     }
-    Ok((elements / matrix_elements, rows, cols))
+    Ok((rows, cols))
 }
 
 fn reshape_preserves_tiled_layout(
     source_shape: &[usize],
     logical_shape: &[usize],
 ) -> Result<bool, *mut PJRT_Error> {
-    Ok(
-        element_count(source_shape)? == element_count(logical_shape)?
-            && tiled_layout_matrix(source_shape)? == tiled_layout_matrix(logical_shape)?,
-    )
+    Ok(tiled_layout_matrix_dims(source_shape)? == tiled_layout_matrix_dims(logical_shape)?)
 }
 
 fn can_leave_reshape_unmaterialized(
