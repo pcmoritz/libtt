@@ -89,10 +89,12 @@ rust_prost_library(
 cc_library(
     name = "mlir_frontend",
     srcs = [
+        "mlir/gqa_matmul_fusing_pattern.cc",
         "mlir/mlir_frontend.cc",
         "mlir/sdpa_fusing_pattern.cc",
     ],
     hdrs = [
+        "mlir/gqa_matmul_fusing_pattern.h",
         "mlir/sdpa_fusing_pattern.h",
         "mlir/stablehlo_utils.h",
     ],
