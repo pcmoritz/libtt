@@ -103,6 +103,16 @@ message MatmulOp {
   repeated int64 lhs_contracting_dimensions = 5;
   repeated int64 rhs_contracting_dimensions = 6;
   MatmulTopKEpilogue top_k_epilogue = 7;
+  MatmulGroupedHeadView lhs_grouped_head_view = 8;
+  MatmulGroupedHeadView rhs_grouped_head_view = 9;
+}
+
+message MatmulGroupedHeadView {
+  // Logical operand shape after GQA/MQA head expansion. The actual operand
+  // buffer keeps the smaller physical KV-head dimension.
+  repeated int64 logical_shape = 1;
+  uint32 grouped_dimension = 2;
+  uint32 group_size = 3;
 }
 
 message MatmulTopKEpilogue {

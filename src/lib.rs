@@ -2135,6 +2135,19 @@ fn execute_top_k(
     )
 }
 
+fn kernel_matmul_grouped_head_view(
+    view: &executable::MatmulGroupedHeadView,
+) -> Result<kernels::matmul::MatmulGroupedHeadView, *mut PJRT_Error> {
+    Ok(kernels::matmul::MatmulGroupedHeadView {
+        logical_shape: dims_i64_to_usize(&view.logical_shape)?,
+        grouped_dimension: usize::try_from(view.grouped_dimension).map_err(|_| {
+            invalid_argument("TT executable matmul grouped dimension does not fit usize")
+        })?,
+        group_size: usize::try_from(view.group_size)
+            .map_err(|_| invalid_argument("TT executable matmul group size does not fit usize"))?,
+    })
+}
+
 fn execute_matmul(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -2144,6 +2157,8 @@ fn execute_matmul(
     output_id: u32,
     dimension_numbers: &executable::DotGeneralDimensionNumbers,
     top_k_epilogue: Option<&executable::MatmulTopKEpilogue>,
+    lhs_grouped_head_view: Option<&executable::MatmulGroupedHeadView>,
+    rhs_grouped_head_view: Option<&executable::MatmulGroupedHeadView>,
 ) -> Result<(), *mut PJRT_Error> {
     let lhs = device_buffer_for_value(values, input_ids[0], "matmul.lhs")?;
     let rhs = device_buffer_for_value(values, input_ids[1], "matmul.rhs")?;
@@ -2159,6 +2174,18 @@ fn execute_matmul(
     };
     let lhs_shape = dims_i64_to_usize(&lhs.dims)?;
     let rhs_shape = dims_i64_to_usize(&rhs.dims)?;
+    let lhs_grouped_head_view = lhs_grouped_head_view
+        .map(kernel_matmul_grouped_head_view)
+        .transpose()?;
+    let rhs_grouped_head_view = rhs_grouped_head_view
+        .map(kernel_matmul_grouped_head_view)
+        .transpose()?;
+    let lhs_logical_shape = lhs_grouped_head_view
+        .as_ref()
+        .map_or(lhs_shape.as_slice(), |view| view.logical_shape.as_slice());
+    let rhs_logical_shape = rhs_grouped_head_view
+        .as_ref()
+        .map_or(rhs_shape.as_slice(), |view| view.logical_shape.as_slice());
 
     if let Some(epilogue) = top_k_epilogue {
         if epilogue.k != 1 {
@@ -2212,17 +2239,21 @@ fn execute_matmul(
         }
 
         let matmul_shape = dims_i64_to_usize(&matmul_desc.dims)?;
-        let matmul_output = kernels::matmul::matmul_dot_general(
+        let matmul_output = kernels::matmul::matmul_dot_general_with_grouped_heads(
             device,
             lhs_dram,
             rhs_dram,
             &lhs_shape,
+            lhs_logical_shape,
             &rhs_shape,
+            rhs_logical_shape,
             &matmul_shape,
             &dimension_numbers.lhs_batching_dimensions,
             &dimension_numbers.rhs_batching_dimensions,
             &dimension_numbers.lhs_contracting_dimensions,
             &dimension_numbers.rhs_contracting_dimensions,
+            lhs_grouped_head_view.as_ref(),
+            rhs_grouped_head_view.as_ref(),
             kernels::matmul::MatmulEpilogue::Top1,
             "pjrt_matmul_top_k",
         )
@@ -2274,17 +2305,21 @@ fn execute_matmul(
             lhs.buffer_type, rhs.buffer_type
         )));
     }
-    let output_dram = kernels::matmul::matmul_dot_general(
+    let output_dram = kernels::matmul::matmul_dot_general_with_grouped_heads(
         device,
         lhs_dram,
         rhs_dram,
         &lhs_shape,
+        lhs_logical_shape,
         &rhs_shape,
+        rhs_logical_shape,
         &output_shape,
         &dimension_numbers.lhs_batching_dimensions,
         &dimension_numbers.rhs_batching_dimensions,
         &dimension_numbers.lhs_contracting_dimensions,
         &dimension_numbers.rhs_contracting_dimensions,
+        lhs_grouped_head_view.as_ref(),
+        rhs_grouped_head_view.as_ref(),
         kernels::matmul::MatmulEpilogue::Store { output_dtype },
         "pjrt_matmul",
     )
@@ -3137,6 +3172,8 @@ fn execute_executable_v1(
                 output_id,
                 dimension_numbers,
                 top_k_epilogue,
+                lhs_grouped_head_view,
+                rhs_grouped_head_view,
             } => execute_matmul(
                 &mut values,
                 plan,
@@ -3146,6 +3183,8 @@ fn execute_executable_v1(
                 *output_id,
                 dimension_numbers,
                 top_k_epilogue.as_ref(),
+                lhs_grouped_head_view.as_ref(),
+                rhs_grouped_head_view.as_ref(),
             )?,
             executable::Op::Constant {
                 packed_value,
@@ -5987,6 +6026,7 @@ mod tests {
                     output_id,
                     dimension_numbers,
                     top_k_epilogue,
+                    ..
                 } = &executable.ops[2]
                 else {
                     panic!("dot_general should lower to Matmul");
@@ -6030,6 +6070,7 @@ mod tests {
                     output_id,
                     dimension_numbers,
                     top_k_epilogue,
+                    ..
                 } = &executable.ops[2]
                 else {
                     panic!("dot_general/top_k should lower to Matmul with top_k epilogue");

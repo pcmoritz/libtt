@@ -8,15 +8,19 @@ constexpr uint32_t TILE_R = 32, TILE_C = 32;
 constexpr uint32_t FACE_R = 16, FACE_C = 16;
 constexpr uint32_t MAX_RANK = 8;
 constexpr uint32_t INVALID_TILE = 0xffffffffu;
-constexpr uint32_t VIEW_ARG_COUNT = 9 + 4 * MAX_RANK;
+constexpr uint32_t VIEW_ARG_COUNT = 11 + 5 * MAX_RANK;
 constexpr uint32_t VIEW_CONTIGUOUS = 0;
 constexpr uint32_t VIEW_TILED_INDEX_MAP = 4;
 constexpr uint32_t VIEW_TILE_TRANSPOSE = 5;
+constexpr uint32_t VIEW_PACKED_HEAD = 6;
+constexpr uint32_t GROUPED_DIM_NONE = 0xffffffffu;
 
 struct View {
   uint32_t kind, rank, batch_rank, row_rank, col_rank;
   uint32_t logical_rows, logical_cols, tile_rows, tiles_per_row;
+  uint32_t grouped_dim, group_size;
   uint32_t shape[MAX_RANK];
+  uint32_t physical_shape[MAX_RANK];
   uint32_t batch_dims[MAX_RANK];
   uint32_t row_dims[MAX_RANK];
   uint32_t col_dims[MAX_RANK];
@@ -29,8 +33,9 @@ void load_array(uint32_t base, uint32_t *target) {
 }
 
 View load_view(uint32_t arg_view_kind) {
-  const uint32_t arg_view_shape = arg_view_kind + 9;
-  const uint32_t arg_view_batch_dims = arg_view_shape + MAX_RANK;
+  const uint32_t arg_view_shape = arg_view_kind + 11;
+  const uint32_t arg_view_physical_shape = arg_view_shape + MAX_RANK;
+  const uint32_t arg_view_batch_dims = arg_view_physical_shape + MAX_RANK;
   const uint32_t arg_view_row_dims = arg_view_batch_dims + MAX_RANK;
   const uint32_t arg_view_col_dims = arg_view_row_dims + MAX_RANK;
   View view;
@@ -43,7 +48,10 @@ View load_view(uint32_t arg_view_kind) {
   view.logical_cols = A(arg_view_kind + 6);
   view.tile_rows = A(arg_view_kind + 7);
   view.tiles_per_row = A(arg_view_kind + 8);
+  view.grouped_dim = A(arg_view_kind + 9);
+  view.group_size = A(arg_view_kind + 10);
   load_array(arg_view_shape, view.shape);
+  load_array(arg_view_physical_shape, view.physical_shape);
   load_array(arg_view_batch_dims, view.batch_dims);
   load_array(arg_view_row_dims, view.row_dims);
   load_array(arg_view_col_dims, view.col_dims);
@@ -78,18 +86,49 @@ void decompose_into_dims(uint32_t flat, const uint32_t *dims, uint32_t dim_count
 
 uint32_t tile_id_for_indices(const View &view, const uint32_t *indices,
                              uint32_t *row_in_tile, uint32_t *col_in_tile) {
+  if (view.kind == VIEW_PACKED_HEAD) {
+    uint32_t physical[MAX_RANK] = {};
+    const uint32_t group_dim = view.col_dims[view.col_rank - 1];
+    uint32_t physical_rank = 0;
+    for (uint32_t dim = 0; dim < view.rank; ++dim) {
+      if (dim == group_dim) {
+        continue;
+      }
+      uint32_t index = indices[dim];
+      if (dim == view.grouped_dim) {
+        index = index * view.group_size + indices[group_dim];
+      }
+      physical[physical_rank++] = index;
+    }
+    uint32_t prefix = 0;
+    for (uint32_t dim = 0; dim + 2 < physical_rank; ++dim) {
+      prefix = prefix * view.physical_shape[dim] + physical[dim];
+    }
+    uint32_t row = physical[physical_rank - 2];
+    uint32_t col = physical[physical_rank - 1];
+    *row_in_tile = row % TILE_R;
+    *col_in_tile = col % TILE_C;
+    return (prefix * view.tile_rows + row / TILE_R) * view.tiles_per_row + col / TILE_C;
+  }
+  auto physical_index = [&](uint32_t dim) -> uint32_t {
+    uint32_t index = indices[dim];
+    if (dim == view.grouped_dim) {
+      index /= view.group_size;
+    }
+    return index;
+  };
   if (view.rank == 1) {
-    uint32_t col = indices[0];
+    uint32_t col = physical_index(0);
     *row_in_tile = 0;
     *col_in_tile = col % TILE_C;
     return col / TILE_C;
   }
   uint32_t prefix = 0;
   for (uint32_t dim = 0; dim + 2 < view.rank; ++dim) {
-    prefix = prefix * view.shape[dim] + indices[dim];
+    prefix = prefix * view.physical_shape[dim] + physical_index(dim);
   }
-  uint32_t row = indices[view.rank - 2];
-  uint32_t col = indices[view.rank - 1];
+  uint32_t row = physical_index(view.rank - 2);
+  uint32_t col = physical_index(view.rank - 1);
   *row_in_tile = row % TILE_R;
   *col_in_tile = col % TILE_C;
   return (prefix * view.tile_rows + row / TILE_R) * view.tiles_per_row + col / TILE_C;
