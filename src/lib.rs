@@ -23,14 +23,14 @@ use dram::{allocator_stats, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
-use std::sync::{Arc as StdArc, Mutex, Once};
+use std::sync::{Mutex, Once};
 
 include!("pjrt_bindings.rs");
 
@@ -119,7 +119,7 @@ struct ExecutableMetadata {
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
     executable: Option<executable::Executable>,
-    lazy_reshape_cache: StdArc<Mutex<HashMap<u32, bool>>>,
+    lazy_reshape_ids: HashSet<u32>,
 }
 
 #[repr(C)]
@@ -740,6 +740,10 @@ fn make_executable_metadata(
         .flat_map(|output| output.dims.iter().copied())
         .collect::<Vec<_>>();
     let fingerprint = executable_fingerprint_string(name, outputs);
+    let lazy_reshape_ids = executable
+        .as_ref()
+        .map(lazy_reshape_ids)
+        .unwrap_or_default();
     ExecutableMetadata {
         name: cstring_lossy(name),
         fingerprint,
@@ -751,7 +755,7 @@ fn make_executable_metadata(
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
         executable,
-        lazy_reshape_cache: StdArc::new(Mutex::new(HashMap::new())),
+        lazy_reshape_ids,
     }
 }
 
@@ -1547,7 +1551,7 @@ fn device_dram_view_for_value<'a>(
             "{field} value id {value_id} is not available"
         )));
     };
-    if !can_leave_reshape_unmaterialized_cached(plan, value_id, &context.lazy_reshape_cache)? {
+    if !context.lazy_reshape_ids.contains(&value_id) {
         return Err(invalid_argument(format!(
             "{field} reshape value id {value_id} is not materialized"
         )));
@@ -1625,11 +1629,11 @@ fn select_value_input<'a>(
     )))
 }
 
-struct OutputContext {
+struct OutputContext<'a> {
     device: *mut PJRT_Device,
     memory: *mut PJRT_Memory,
     local_hardware_id: usize,
-    lazy_reshape_cache: StdArc<Mutex<HashMap<u32, bool>>>,
+    lazy_reshape_ids: &'a HashSet<u32>,
 }
 
 fn store_output_buffer(
@@ -1839,7 +1843,7 @@ fn execute_reshape(
                 );
             }
         }
-        if can_leave_reshape_unmaterialized_cached(plan, output_id, &context.lazy_reshape_cache)? {
+        if context.lazy_reshape_ids.contains(&output_id) {
             return Ok(());
         }
     }
@@ -2749,95 +2753,90 @@ fn reshape_preserves_tiled_layout(
     )
 }
 
-fn can_leave_reshape_unmaterialized(plan: &executable::Executable, value_id: u32) -> bool {
-    fn check(
-        plan: &executable::Executable,
-        value_id: u32,
-        memo: &mut HashMap<u32, bool>,
-        visiting: &mut HashSet<u32>,
-    ) -> bool {
-        if let Some(&cached) = memo.get(&value_id) {
-            return cached;
-        }
-        if !visiting.insert(value_id) {
-            return false;
-        }
+fn can_leave_reshape_unmaterialized(
+    plan: &executable::Executable,
+    value_id: u32,
+    memo: &mut [Option<bool>],
+    visiting: &mut HashSet<u32>,
+) -> bool {
+    let index = value_id as usize;
+    if index >= memo.len() {
+        return false;
+    }
+    if let Some(cached) = memo[index] {
+        return cached;
+    }
+    if !visiting.insert(value_id) {
+        return false;
+    }
 
-        let result = if plan.output_ids.contains(&value_id) {
+    let result = if plan.output_ids.contains(&value_id) {
+        false
+    } else if let Some(input_id) = reshape_input_id(plan, value_id) {
+        if !reshape_is_same_dtype_same_volume(plan, input_id, value_id) {
             false
-        } else if let Some(input_id) = reshape_input_id(plan, value_id) {
-            if !reshape_is_same_dtype_same_volume(plan, input_id, value_id) {
-                false
-            } else {
-                let mut has_lazy_consumer = false;
-                let mut valid = true;
-                for op in &plan.ops {
-                    match op {
-                        executable::Op::Gather { input_ids, .. } if input_ids[0] == value_id => {
+        } else {
+            let mut has_lazy_consumer = false;
+            let mut valid = true;
+            for op in &plan.ops {
+                match op {
+                    executable::Op::Gather { input_ids, .. } if input_ids[0] == value_id => {
+                        has_lazy_consumer = true;
+                    }
+                    executable::Op::Scatter { input_ids, .. }
+                        if input_ids[0] == value_id || input_ids[2] == value_id =>
+                    {
+                        has_lazy_consumer = true;
+                    }
+                    executable::Op::Matmul { input_ids, .. }
+                        if input_ids.contains(&value_id)
+                            && reshape_keeps_innermost_dim(plan, input_id, value_id) =>
+                    {
+                        has_lazy_consumer = true;
+                    }
+                    executable::Op::Reshape {
+                        input_id,
+                        output_id,
+                    } if *input_id == value_id => {
+                        if can_leave_reshape_unmaterialized(plan, *output_id, memo, visiting) {
                             has_lazy_consumer = true;
-                        }
-                        executable::Op::Scatter { input_ids, .. }
-                            if input_ids[0] == value_id || input_ids[2] == value_id =>
-                        {
-                            has_lazy_consumer = true;
-                        }
-                        executable::Op::Matmul { input_ids, .. }
-                            if input_ids.contains(&value_id)
-                                && reshape_keeps_innermost_dim(plan, input_id, value_id) =>
-                        {
-                            has_lazy_consumer = true;
-                        }
-                        executable::Op::Reshape {
-                            input_id,
-                            output_id,
-                        } if *input_id == value_id => {
-                            if check(plan, *output_id, memo, visiting) {
-                                has_lazy_consumer = true;
-                            } else {
-                                valid = false;
-                                break;
-                            }
-                        }
-                        _ if op_consumes_value(op, value_id) => {
+                        } else {
                             valid = false;
                             break;
                         }
-                        _ => {}
                     }
+                    _ if op_consumes_value(op, value_id) => {
+                        valid = false;
+                        break;
+                    }
+                    _ => {}
                 }
-                valid && has_lazy_consumer
             }
-        } else {
-            false
-        };
+            valid && has_lazy_consumer
+        }
+    } else {
+        false
+    };
 
-        visiting.remove(&value_id);
-        memo.insert(value_id, result);
-        result
-    }
-
-    check(plan, value_id, &mut HashMap::new(), &mut HashSet::new())
+    visiting.remove(&value_id);
+    memo[index] = Some(result);
+    result
 }
 
-fn can_leave_reshape_unmaterialized_cached(
-    plan: &executable::Executable,
-    value_id: u32,
-    cache: &Mutex<HashMap<u32, bool>>,
-) -> Result<bool, *mut PJRT_Error> {
-    if let Some(result) = cache
-        .lock()
-        .map_err(|_| failed_precondition("lazy reshape cache lock is poisoned"))?
-        .get(&value_id)
-        .copied()
-    {
-        return Ok(result);
-    }
-    let result = can_leave_reshape_unmaterialized(plan, value_id);
-    cache
-        .lock()
-        .map_err(|_| failed_precondition("lazy reshape cache lock is poisoned"))?
-        .insert(value_id, result);
-    Ok(result)
+fn lazy_reshape_ids(plan: &executable::Executable) -> HashSet<u32> {
+    let mut memo = vec![None; plan.values.len()];
+    let mut visiting = HashSet::new();
+    plan.ops
+        .iter()
+        .filter_map(|op| {
+            if let executable::Op::Reshape { output_id, .. } = op {
+                can_leave_reshape_unmaterialized(plan, *output_id, &mut memo, &mut visiting)
+                    .then_some(*output_id)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn execute_select(
@@ -3725,7 +3724,7 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         device: execute_device,
         memory: target_device.default_memory,
         local_hardware_id: target_local_hardware_id,
-        lazy_reshape_cache: StdArc::clone(&executable.metadata.lazy_reshape_cache),
+        lazy_reshape_ids: &executable.metadata.lazy_reshape_ids,
     };
     let output_buffers = {
         let _guard = match target_device.runtime_lock.lock() {
