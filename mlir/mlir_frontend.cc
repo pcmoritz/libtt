@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -35,6 +36,8 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/executable.pb.h"
+#include "mlir/sdpa_fusing_pattern.h"
+#include "mlir/stablehlo_utils.h"
 #include "stablehlo/dialect/Serialization.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "stablehlo/dialect/VhloOps.h"
@@ -55,6 +58,8 @@ bool TT_MlirAnalyzeProgram(
 namespace {
 
 using mlir::func::FuncOp;
+using libtt::mlir_frontend::definingOpSkippingIdentityCustomCalls;
+using libtt::mlir_frontend::isIdentityCustomCall;
 
 void registerDialects(mlir::MLIRContext& context) {
     mlir::DialectRegistry registry;
@@ -935,20 +940,6 @@ bool isPredicateConvert(mlir::stablehlo::ConvertOp convert_op) {
     return input_type && input_type.getElementType().isInteger(1);
 }
 
-bool isIdentityCustomCall(mlir::stablehlo::CustomCallOp custom_call_op) {
-    if (!custom_call_op || custom_call_op->getNumResults() != 1 ||
-        custom_call_op.getHasSideEffect()) {
-        return false;
-    }
-    auto call_target = custom_call_op.getCallTargetName();
-    if (call_target != "annotate_device_placement" && call_target != "Sharding") {
-        return false;
-    }
-    auto inputs = custom_call_op.getInputs();
-    return inputs.size() == 1 &&
-           inputs.front().getType() == custom_call_op.getResult(0).getType();
-}
-
 bool isLastTwoDimSwap(mlir::stablehlo::TransposeOp transpose_op) {
     if (!transpose_op) {
         return false;
@@ -1103,6 +1094,7 @@ mlir::LogicalResult runCleanupRewritePatterns(
         &context, state, lowerSinglePadToScatter));
     patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::DotGeneralOp>>(
         &context, state, lowerSingleRhsMatmulTranspose, isRhsMatmulTransposeFold));
+    patterns.add<libtt::mlir_frontend::SDPADecodeFusing>(&context);
     mlir::GreedyRewriteConfig config;
     config.enableFolding();
     if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns), config))) {
@@ -1711,6 +1703,68 @@ std::optional<tt::BitwiseBinaryOp::Kind> bitwiseBinaryKind(mlir::Operation* op) 
         .Case<mlir::stablehlo::ShiftRightArithmeticOp>(
             [](auto) { return tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_ARITHMETIC; })
         .Default([](auto) { return std::nullopt; });
+}
+
+std::optional<uint32_t> sdpaDecodeScaleBf16Packed(
+    mlir::stablehlo::CustomCallOp custom_call_op,
+    std::string& error) {
+    auto backend_config = custom_call_op.getBackendConfig();
+    if (!backend_config) {
+        error = "tt.sdpa_decode custom_call requires backend_config";
+        return std::nullopt;
+    }
+    auto config = mlir::dyn_cast<mlir::StringAttr>(*backend_config);
+    if (!config) {
+        error = "tt.sdpa_decode custom_call requires string backend_config";
+        return std::nullopt;
+    }
+    uint64_t value = 0;
+    if (config.getValue().getAsInteger(10, value)) {
+        error = "tt.sdpa_decode string backend_config must be a scale_bf16_packed integer";
+        return std::nullopt;
+    }
+    if (value > std::numeric_limits<uint32_t>::max()) {
+        error = "tt.sdpa_decode scale_bf16_packed is out of range";
+        return std::nullopt;
+    }
+    return static_cast<uint32_t>(value);
+}
+
+bool addSdpaDecodeOp(
+    mlir::stablehlo::CustomCallOp custom_call_op,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    if (custom_call_op->getNumResults() != 1 || custom_call_op.getInputs().size() != 5) {
+        error = "tt.sdpa_decode custom_call must have five inputs and one result";
+        return false;
+    }
+    auto scale_bf16_packed = sdpaDecodeScaleBf16Packed(custom_call_op, error);
+    if (!scale_bf16_packed) {
+        return false;
+    }
+
+    uint32_t input_ids[5] = {};
+    for (auto [index, input] : llvm::enumerate(custom_call_op.getInputs())) {
+        if (!addValueDesc(input, executable, value_ids, error, input_ids[index])) {
+            return false;
+        }
+    }
+    uint32_t output_id = 0;
+    if (!addValueDesc(custom_call_op->getResult(0), executable, value_ids, error, output_id)) {
+        return false;
+    }
+
+    auto* op = executable.add_ops();
+    op->set_output_id(output_id);
+    auto* sdpa = op->mutable_sdpa_decode();
+    sdpa->set_q_id(input_ids[0]);
+    sdpa->set_k_id(input_ids[1]);
+    sdpa->set_v_id(input_ids[2]);
+    sdpa->set_seq_lens_id(input_ids[3]);
+    sdpa->set_loc_id(input_ids[4]);
+    sdpa->set_scale_bf16_packed(*scale_bf16_packed);
+    return true;
 }
 
 bool addTopKOp(
@@ -2855,6 +2909,12 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             }
 
             auto call_target = custom_call_op.getCallTargetName();
+            if (call_target == libtt::mlir_frontend::kSdpaDecodeTarget) {
+                if (!addSdpaDecodeOp(custom_call_op, executable, value_ids, error)) {
+                    return false;
+                }
+                continue;
+            }
             if ((call_target == "annotate_device_placement" || call_target == "Sharding") &&
                 !custom_call_op.getHasSideEffect()) {
                 auto inputs = custom_call_op.getInputs();

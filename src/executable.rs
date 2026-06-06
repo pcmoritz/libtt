@@ -22,7 +22,6 @@ use executable_proto::tt::TensorDesc as ProtoTensorDesc;
 #[cfg(libtt_mlir_frontend)]
 use prost::Message;
 
-#[cfg(libtt_mlir_frontend)]
 #[derive(Clone)]
 pub(crate) struct Executable {
     pub(crate) values: Vec<ValueDesc>,
@@ -30,14 +29,12 @@ pub(crate) struct Executable {
     pub(crate) output_ids: Vec<u32>,
 }
 
-#[cfg(libtt_mlir_frontend)]
 #[derive(Clone)]
 pub(crate) struct ValueDesc {
     pub(crate) dims: Vec<i64>,
     pub(crate) element_type: PJRT_Buffer_Type,
 }
 
-#[cfg(libtt_mlir_frontend)]
 #[derive(Clone)]
 #[allow(dead_code)]
 pub(crate) enum Op {
@@ -134,6 +131,11 @@ pub(crate) enum Op {
         input_ids: Vec<u32>,
         output_id: u32,
         nodes: Vec<FusedElementwiseNode>,
+    },
+    SdpaDecode {
+        input_ids: [u32; 5],
+        output_id: u32,
+        scale_bf16_packed: u32,
     },
 }
 
@@ -584,6 +586,17 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                         .map(parse_fused_elementwise_node)
                         .collect::<Result<Vec<_>, String>>()?,
                 }),
+                Kind::SdpaDecode(sdpa_decode) => Ok(Op::SdpaDecode {
+                    input_ids: [
+                        sdpa_decode.q_id,
+                        sdpa_decode.k_id,
+                        sdpa_decode.v_id,
+                        sdpa_decode.seq_lens_id,
+                        sdpa_decode.loc_id,
+                    ],
+                    output_id: op_desc.output_id,
+                    scale_bf16_packed: sdpa_decode.scale_bf16_packed,
+                }),
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -619,119 +632,4 @@ pub(crate) fn parse_analysis(bytes: &[u8]) -> Result<Analysis, String> {
         outputs,
         executable,
     })
-}
-
-#[cfg(not(libtt_mlir_frontend))]
-#[derive(Clone)]
-pub(crate) struct Executable {
-    pub(crate) values: Vec<ValueDesc>,
-    pub(crate) ops: Vec<Op>,
-    pub(crate) output_ids: Vec<u32>,
-}
-
-#[cfg(not(libtt_mlir_frontend))]
-#[derive(Clone)]
-pub(crate) struct ValueDesc {
-    pub(crate) dims: Vec<i64>,
-    pub(crate) element_type: crate::PJRT_Buffer_Type,
-}
-
-#[cfg(not(libtt_mlir_frontend))]
-#[derive(Clone)]
-#[allow(dead_code)]
-pub(crate) enum Op {
-    Parameter {
-        parameter_index: usize,
-        output_id: u32,
-    },
-    Concatenate {
-        input_ids: Vec<u32>,
-        output_id: u32,
-        dimension: u64,
-    },
-    Reshape {
-        input_id: u32,
-        output_id: u32,
-    },
-    Slice {
-        input_id: u32,
-        output_id: u32,
-        start_indices: Vec<i64>,
-        limit_indices: Vec<i64>,
-        strides: Vec<i64>,
-    },
-    Transpose {
-        input_id: u32,
-        output_id: u32,
-        permutation: Vec<i64>,
-    },
-    CustomCall {
-        input_ids: Vec<u32>,
-        output_id: u32,
-        call_target_name: String,
-        has_side_effect: bool,
-    },
-    Reduce {
-        input_ids: Vec<u32>,
-        init_value_ids: Vec<u32>,
-        output_id: u32,
-        dimensions: Vec<i64>,
-        reducer: ReduceReducer,
-    },
-    ReduceWindow {
-        input_ids: Vec<u32>,
-        init_value_ids: Vec<u32>,
-        output_id: u32,
-        attributes: ReduceWindowAttributes,
-        reducer: ReduceReducer,
-    },
-    Matmul {
-        input_ids: [u32; 2],
-        output_id: u32,
-        dimension_numbers: DotGeneralDimensionNumbers,
-        top_k_epilogue: Option<MatmulTopKEpilogue>,
-    },
-    Constant {
-        packed_value: u32,
-        data: Vec<u8>,
-        output_id: u32,
-    },
-    Select {
-        input_ids: [u32; 3],
-        output_id: u32,
-    },
-    BroadcastInDim {
-        input_id: u32,
-        output_id: u32,
-        broadcast_dimensions: Vec<i64>,
-    },
-    Gather {
-        input_ids: [u32; 2],
-        output_id: u32,
-        dimension_numbers: GatherDimensionNumbers,
-        slice_sizes: Vec<i64>,
-        indices_are_sorted: bool,
-    },
-    Scatter {
-        input_ids: [u32; 3],
-        output_id: u32,
-        dimension_numbers: ScatterDimensionNumbers,
-        indices_are_sorted: bool,
-        unique_indices: bool,
-    },
-    Iota {
-        output_id: u32,
-        iota_dimension: u64,
-    },
-    TopK {
-        input_id: u32,
-        values_id: u32,
-        indices_id: u32,
-        k: u32,
-    },
-    FusedElementwise {
-        input_ids: Vec<u32>,
-        output_id: u32,
-        nodes: Vec<FusedElementwiseNode>,
-    },
 }

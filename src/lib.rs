@@ -2308,6 +2308,85 @@ fn execute_matmul(
     )
 }
 
+fn execute_sdpa_decode(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: [u32; 5],
+    output_id: u32,
+    scale_bf16_packed: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let q = device_buffer_for_value(values, input_ids[0], "sdpa_decode.q")?;
+    let k = device_buffer_for_value(values, input_ids[1], "sdpa_decode.k")?;
+    let v = device_buffer_for_value(values, input_ids[2], "sdpa_decode.v")?;
+    let seq_lens = device_buffer_for_value(values, input_ids[3], "sdpa_decode.seq_lens")?;
+    let loc = device_buffer_for_value(values, input_ids[4], "sdpa_decode.loc")?;
+    let Some(q_dram) = q.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable sdpa_decode q buffer has no device allocation",
+        ));
+    };
+    let Some(k_dram) = k.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable sdpa_decode k buffer has no device allocation",
+        ));
+    };
+    let Some(v_dram) = v.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable sdpa_decode v buffer has no device allocation",
+        ));
+    };
+    let Some(seq_lens_dram) = seq_lens.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable sdpa_decode seq_lens buffer has no device allocation",
+        ));
+    };
+    let Some(loc_dram) = loc.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable sdpa_decode loc buffer has no device allocation",
+        ));
+    };
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable sdpa_decode output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+        return Err(invalid_argument(format!(
+            "TT executable sdpa_decode requires bf16 output, got {:?}",
+            output_desc.element_type
+        )));
+    }
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let output_dram = kernels::sdpa_decode::sdpa_decode(
+        device,
+        q_dram,
+        k_dram,
+        v_dram,
+        seq_lens_dram,
+        loc_dram,
+        &dims_i64_to_usize(&q.dims)?,
+        &dims_i64_to_usize(&k.dims)?,
+        &dims_i64_to_usize(&v.dims)?,
+        &dims_i64_to_usize(&seq_lens.dims)?,
+        &dims_i64_to_usize(&loc.dims)?,
+        &output_shape,
+        scale_bf16_packed,
+        "pjrt_sdpa_decode",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "sdpa_decode",
+    )
+}
+
 fn reduce_init_is_supported(
     plan: &executable::Executable,
     init_value_id: u32,
@@ -3179,6 +3258,19 @@ fn execute_executable_v1(
                 input_ids,
                 *output_id,
                 nodes,
+            )?,
+            executable::Op::SdpaDecode {
+                input_ids,
+                output_id,
+                scale_bf16_packed,
+            } => execute_sdpa_decode(
+                &mut values,
+                plan,
+                device,
+                output_context,
+                *input_ids,
+                *output_id,
+                *scale_bf16_packed,
             )?,
         }
     }

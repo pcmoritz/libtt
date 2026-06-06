@@ -88,7 +88,14 @@ rust_prost_library(
 
 cc_library(
     name = "mlir_frontend",
-    srcs = ["mlir/mlir_frontend.cc"],
+    srcs = [
+        "mlir/mlir_frontend.cc",
+        "mlir/sdpa_fusing_pattern.cc",
+    ],
+    hdrs = [
+        "mlir/sdpa_fusing_pattern.h",
+        "mlir/stablehlo_utils.h",
+    ],
     copts = ["-std=c++17"],
     deps = [
         ":executable_cc_proto",

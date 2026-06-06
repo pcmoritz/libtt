@@ -647,7 +647,9 @@ fn next_allocation_range(
 
 fn allocation_range_size(num_tiles: usize, dtype: DType, bank_count: usize) -> io::Result<u64> {
     if bank_count == 0 {
-        return Err(io::Error::other("dram allocation requires at least one bank"));
+        return Err(io::Error::other(
+            "dram allocation requires at least one bank",
+        ));
     }
     let pages_per_bank = num_tiles.div_ceil(bank_count);
     let allocation_size = (pages_per_bank as u64)
