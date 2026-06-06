@@ -61,8 +61,6 @@ using mlir::func::FuncOp;
 using libtt::mlir_frontend::definingOpSkippingIdentityCustomCalls;
 using libtt::mlir_frontend::isIdentityCustomCall;
 
-std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& error);
-
 void registerDialects(mlir::MLIRContext& context) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::func::FuncDialect>();
