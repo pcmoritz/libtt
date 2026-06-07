@@ -342,8 +342,13 @@ fn gather_program(key: GatherProgramKey) -> io::Result<Program> {
 
 fn gather_reader_source(dtype: DType, shape: &GatherShape) -> io::Result<String> {
     let source_view = shape.operand_source_view.as_ref();
+    let bf16_axis_rows = matches!(shape.mode, GatherMode::Axis)
+        && dtype == DType::Float16B
+        && source_view.is_none()
+        && usize::try_from(shape.axis).ok() == shape.operand_shape.len().checked_sub(2);
     Ok(format!(
         "#define GATHER_BF16_ROWS {}\n\
+         #define GATHER_BF16_AXIS_ROWS {}\n\
          #define GATHER_RANK {}\n\
          #define GATHER_AXIS {}\n\
          #define GATHER_OPERAND_SHAPE {}\n\
@@ -360,6 +365,7 @@ fn gather_reader_source(dtype: DType, shape: &GatherShape) -> io::Result<String>
          #define GATHER_ELEMENT_TYPE {}\n\
          {GATHER_READER}",
         matches!(shape.mode, GatherMode::Bf16Rows) as u32,
+        bf16_axis_rows as u32,
         shape.operand_shape.len(),
         shape.axis,
         cpp_u32_array(&shape.operand_shape),
