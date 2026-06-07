@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <optional>
-#include <string>
 
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
@@ -382,14 +381,19 @@ mlir::LogicalResult createRmsNormOp(mlir::PatternRewriter &rewriter,
                                     mlir::stablehlo::ConvertOp root,
                                     const RmsNormComponents &components) {
   rewriter.setInsertionPoint(root);
-  auto backendConfig = rewriter.getStringAttr(
-      std::to_string(components.scaleBits) + "," +
-      std::to_string(components.biasBits));
+  auto backendConfig = rewriter.getDictionaryAttr({
+      rewriter.getNamedAttr(
+          "scale_bits",
+          rewriter.getI64IntegerAttr(static_cast<int64_t>(components.scaleBits))),
+      rewriter.getNamedAttr(
+          "bias_bits",
+          rewriter.getI64IntegerAttr(static_cast<int64_t>(components.biasBits))),
+  });
   auto customCall = rewriter.create<mlir::stablehlo::CustomCallOp>(
       root.getLoc(), root->getResultTypes(),
       mlir::ValueRange{components.input, components.weight}, kRmsNormTarget,
       /*hasSideEffect=*/false, backendConfig,
-      mlir::stablehlo::CustomCallApiVersion::API_VERSION_ORIGINAL,
+      mlir::stablehlo::CustomCallApiVersion::API_VERSION_TYPED_FFI,
       rewriter.getArrayAttr({}),
       /*calledComputations=*/nullptr,
       /*operandLayouts=*/nullptr,

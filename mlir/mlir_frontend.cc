@@ -1769,41 +1769,23 @@ bool addSdpaDecodeOp(
     return true;
 }
 
-struct RmsNormConfig {
-    uint32_t scale_bits = 0;
-    uint32_t bias_bits = 0;
-};
-
-std::optional<RmsNormConfig> rmsNormConfig(
-    mlir::stablehlo::CustomCallOp custom_call_op,
+std::optional<uint32_t> rmsNormBackendConfigBits(
+    mlir::DictionaryAttr config,
+    llvm::StringRef name,
     std::string& error) {
-    auto backend_config = custom_call_op.getBackendConfig();
-    if (!backend_config) {
-        error = "tt.rms_norm custom_call requires backend_config";
+    auto attr = config.getAs<mlir::IntegerAttr>(name);
+    if (!attr) {
+        error = "tt.rms_norm backend_config missing integer field " + name.str();
         return std::nullopt;
     }
-    auto config = mlir::dyn_cast<mlir::StringAttr>(*backend_config);
-    if (!config) {
-        error = "tt.rms_norm custom_call requires string backend_config";
+
+    uint64_t value = attr.getValue().getLimitedValue(
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1);
+    if (value > std::numeric_limits<uint32_t>::max()) {
+        error = "tt.rms_norm backend_config field " + name.str() + " is out of range";
         return std::nullopt;
     }
-    auto parts = config.getValue().split(',');
-    uint64_t scale_bits = 0;
-    uint64_t bias_bits = 0;
-    if (parts.first.getAsInteger(10, scale_bits) ||
-        parts.second.getAsInteger(10, bias_bits)) {
-        error = "tt.rms_norm string backend_config must be scale_bits,bias_bits";
-        return std::nullopt;
-    }
-    if (scale_bits > std::numeric_limits<uint32_t>::max() ||
-        bias_bits > std::numeric_limits<uint32_t>::max()) {
-        error = "tt.rms_norm backend_config values are out of range";
-        return std::nullopt;
-    }
-    return RmsNormConfig{
-        static_cast<uint32_t>(scale_bits),
-        static_cast<uint32_t>(bias_bits),
-    };
+    return static_cast<uint32_t>(value);
 }
 
 bool addRmsNormOp(
@@ -1815,8 +1797,18 @@ bool addRmsNormOp(
         error = "tt.rms_norm custom_call must have two inputs and one result";
         return false;
     }
-    auto config = rmsNormConfig(custom_call_op, error);
+
+    auto backend_config = custom_call_op.getBackendConfig();
+    auto config = backend_config
+                      ? mlir::dyn_cast<mlir::DictionaryAttr>(*backend_config)
+                      : nullptr;
     if (!config) {
+        error = "tt.rms_norm backend_config must be a dictionary";
+        return false;
+    }
+    auto scale_bits = rmsNormBackendConfigBits(config, "scale_bits", error);
+    auto bias_bits = rmsNormBackendConfigBits(config, "bias_bits", error);
+    if (!scale_bits || !bias_bits) {
         return false;
     }
 
@@ -1834,8 +1826,8 @@ bool addRmsNormOp(
     auto* rms_norm = op->mutable_rms_norm();
     rms_norm->set_input_id(input_id);
     rms_norm->set_weight_id(weight_id);
-    rms_norm->set_scale_bits(config->scale_bits);
-    rms_norm->set_bias_bits(config->bias_bits);
+    rms_norm->set_scale_bits(*scale_bits);
+    rms_norm->set_bias_bits(*bias_bits);
     return true;
 }
 
