@@ -36,6 +36,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/executable.pb.h"
+#include "mlir/rms_norm_fusing_pattern.h"
 #include "mlir/sdpa_fusing_pattern.h"
 #include "mlir/stablehlo_utils.h"
 #include "stablehlo/dialect/Serialization.h"
@@ -1095,6 +1096,7 @@ mlir::LogicalResult runCleanupRewritePatterns(
     patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::DotGeneralOp>>(
         &context, state, lowerSingleRhsMatmulTranspose, isRhsMatmulTransposeFold));
     patterns.add<libtt::mlir_frontend::SDPADecodeFusing>(&context);
+    patterns.add<libtt::mlir_frontend::RMSNormFusing>(&context);
     mlir::GreedyRewriteConfig config;
     config.enableFolding();
     if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns), config))) {
@@ -1767,6 +1769,68 @@ bool addSdpaDecodeOp(
     return true;
 }
 
+std::optional<uint32_t> rmsNormBackendConfigBits(
+    mlir::DictionaryAttr config,
+    llvm::StringRef name,
+    std::string& error) {
+    auto attr = config.getAs<mlir::IntegerAttr>(name);
+    if (!attr) {
+        error = "tt.rms_norm backend_config missing integer field " + name.str();
+        return std::nullopt;
+    }
+
+    uint64_t value = attr.getValue().getLimitedValue(
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1);
+    if (value > std::numeric_limits<uint32_t>::max()) {
+        error = "tt.rms_norm backend_config field " + name.str() + " is out of range";
+        return std::nullopt;
+    }
+    return static_cast<uint32_t>(value);
+}
+
+bool addRmsNormOp(
+    mlir::stablehlo::CustomCallOp custom_call_op,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    if (custom_call_op->getNumResults() != 1 || custom_call_op.getInputs().size() != 2) {
+        error = "tt.rms_norm custom_call must have two inputs and one result";
+        return false;
+    }
+
+    auto backend_config = custom_call_op.getBackendConfig();
+    auto config = backend_config
+                      ? mlir::dyn_cast<mlir::DictionaryAttr>(*backend_config)
+                      : nullptr;
+    if (!config) {
+        error = "tt.rms_norm backend_config must be a dictionary";
+        return false;
+    }
+    auto scale_bits = rmsNormBackendConfigBits(config, "scale_bits", error);
+    auto bias_bits = rmsNormBackendConfigBits(config, "bias_bits", error);
+    if (!scale_bits || !bias_bits) {
+        return false;
+    }
+
+    uint32_t input_id = 0;
+    uint32_t weight_id = 0;
+    uint32_t output_id = 0;
+    if (!addValueDesc(custom_call_op.getInputs()[0], executable, value_ids, error, input_id) ||
+        !addValueDesc(custom_call_op.getInputs()[1], executable, value_ids, error, weight_id) ||
+        !addValueDesc(custom_call_op->getResult(0), executable, value_ids, error, output_id)) {
+        return false;
+    }
+
+    auto* op = executable.add_ops();
+    op->set_output_id(output_id);
+    auto* rms_norm = op->mutable_rms_norm();
+    rms_norm->set_input_id(input_id);
+    rms_norm->set_weight_id(weight_id);
+    rms_norm->set_scale_bits(*scale_bits);
+    rms_norm->set_bias_bits(*bias_bits);
+    return true;
+}
+
 bool addTopKOp(
     mlir::Value operand,
     mlir::Value values,
@@ -2173,7 +2237,6 @@ std::optional<uint32_t> collectFusedElementwiseValue(
         auto operand_element = staticValueElementType(operand);
         if (broadcast_op->getResult(0).hasOneUse() &&
             operand_element && isFusedFloatElementType(*operand_element) &&
-            mlir::isa<mlir::BlockArgument>(operand) &&
             sameTensorShape(value, root_value) &&
             valueElementType(operand) == valueElementType(value) &&
             isLogicalScalarTile(operand)) {
@@ -2911,6 +2974,12 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             auto call_target = custom_call_op.getCallTargetName();
             if (call_target == libtt::mlir_frontend::kSdpaDecodeTarget) {
                 if (!addSdpaDecodeOp(custom_call_op, executable, value_ids, error)) {
+                    return false;
+                }
+                continue;
+            }
+            if (call_target == libtt::mlir_frontend::kRmsNormTarget) {
+                if (!addRmsNormOp(custom_call_op, executable, value_ids, error)) {
                     return false;
                 }
                 continue;

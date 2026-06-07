@@ -248,6 +248,13 @@ message SdpaDecodeOp {
   uint32 scale_bf16_packed = 6;
 }
 
+message RmsNormOp {
+  uint32 input_id = 1;
+  uint32 weight_id = 2;
+  uint32 scale_bits = 3;
+  uint32 bias_bits = 4;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -272,6 +279,7 @@ message Op {
     BitwiseBinaryOp bitwise_binary = 33;
     ReduceWindowOp reduce_window = 34;
     SdpaDecodeOp sdpa_decode = 35;
+    RmsNormOp rms_norm = 36;
   }
 }
 

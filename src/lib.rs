@@ -2578,6 +2578,85 @@ fn execute_sdpa_decode(
     )
 }
 
+fn execute_rms_norm(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: [u32; 2],
+    output_id: u32,
+    scale_bits: u32,
+    bias_bits: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let x = device_buffer_for_value(values, input_ids[0], "rms_norm.input")?;
+    let weight = device_buffer_for_value(values, input_ids[1], "rms_norm.weight")?;
+    let Some(x_dram) = x.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable rms_norm input buffer has no device allocation",
+        ));
+    };
+    let Some(weight_dram) = weight.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable rms_norm weight buffer has no device allocation",
+        ));
+    };
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable rms_norm output id {output_id} is out of bounds"
+        ))
+    })?;
+    if x.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || weight.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+        || output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
+    {
+        return Err(invalid_argument(format!(
+            "TT executable rms_norm requires bf16 input/weight/output, got {:?}/{:?}/{:?}",
+            x.buffer_type, weight.buffer_type, output_desc.element_type
+        )));
+    }
+
+    let input_shape = dims_i64_to_usize(&x.dims)?;
+    let weight_shape = dims_i64_to_usize(&weight.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    if input_shape.len() < 2 {
+        return Err(unimplemented(format!(
+            "TT executable rms_norm requires rank >= 2 input, got {input_shape:?}"
+        )));
+    }
+    if output_shape != input_shape {
+        return Err(invalid_argument(format!(
+            "TT executable rms_norm output shape must match input shape, got input={input_shape:?} output={output_shape:?}"
+        )));
+    }
+    let hidden = *input_shape
+        .last()
+        .ok_or_else(|| invalid_argument("TT executable rms_norm input shape is empty"))?;
+    if weight_shape != [hidden] {
+        return Err(invalid_argument(format!(
+            "TT executable rms_norm weight shape must be [{hidden}], got {weight_shape:?}"
+        )));
+    }
+    let output_dram = kernels::fused_eltwise::rms_norm(
+        device,
+        x_dram,
+        weight_dram,
+        &output_shape,
+        scale_bits,
+        bias_bits,
+        "pjrt_rms_norm",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "rms_norm",
+    )
+}
+
 fn reduce_init_is_supported(
     plan: &executable::Executable,
     init_value_id: u32,
@@ -2667,6 +2746,7 @@ fn op_consumes_value(op: &executable::Op, value_id: u32) -> bool {
             input_ids.contains(&value_id)
         }
         executable::Op::SdpaDecode { input_ids, .. } => input_ids.contains(&value_id),
+        executable::Op::RmsNorm { input_ids, .. } => input_ids.contains(&value_id),
     }
 }
 
@@ -3627,6 +3707,21 @@ fn execute_executable_v1(
                 *input_ids,
                 *output_id,
                 *scale_bf16_packed,
+            )?,
+            executable::Op::RmsNorm {
+                input_ids,
+                output_id,
+                scale_bits,
+                bias_bits,
+            } => execute_rms_norm(
+                &mut values,
+                plan,
+                device,
+                output_context,
+                *input_ids,
+                *output_id,
+                *scale_bits,
+                *bias_bits,
             )?,
         }
     }
