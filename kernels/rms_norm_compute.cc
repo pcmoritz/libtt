@@ -11,7 +11,7 @@
 #include "compute_kernel_api/reconfig_data_format.h"
 #include "compute_kernel_api/tile_move_copy.h"
 #define REDUCE_OP PoolType::SUM
-#define REDUCE_DIM ReduceDim::REDUCE_SCALAR
+#define REDUCE_DIM ReduceDim::REDUCE_ROW
 #include "compute_kernel_api/reduce.h"
 #undef REDUCE_DIM
 #undef REDUCE_OP
@@ -55,12 +55,12 @@ void square_input_tiles() {
 
 void reduce_squared_tiles() {
   reconfig_data_format(cb_work, cb_scaler);
-  ckernel::reduce_init<PoolType::SUM, ReduceDim::REDUCE_SCALAR, true>(
+  ckernel::reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW, true>(
       cb_work, cb_scaler, cb_scale);
 
   tile_regs_acquire();
   for (uint32_t wt = 0; wt < width_tiles; ++wt) {
-    ckernel::reduce_tile<PoolType::SUM, ReduceDim::REDUCE_SCALAR, true>(
+    ckernel::reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW, true>(
         cb_work, cb_scaler, wt, 0, 0);
   }
   ckernel::reduce_uninit<true>();
@@ -80,40 +80,39 @@ void reduce_squared_tiles() {
   cb_push_back(cb_scale, onetile);
 }
 
-void apply_scale() {
-  reconfig_data_format(cb_input, cb_scale);
-  pack_reconfig_data_format(cb_scale, cb_work);
-  mul_tiles_bcast_scalar_init_short(cb_input, cb_scale);
-
-  for (uint32_t base = 0; base < width_tiles; base += block_tiles) {
-    uint32_t tiles = min_u32(block_tiles, width_tiles - base);
-    cb_reserve_back(cb_work, tiles);
-    tile_regs_acquire();
-    for (uint32_t i = 0; i < tiles; ++i) {
-      mul_tiles_bcast_scalar(cb_input, cb_scale, base + i, 0, i);
-    }
-    tile_regs_commit();
-    tile_regs_wait();
-    for (uint32_t i = 0; i < tiles; ++i) {
-      pack_tile(i, cb_work);
-    }
-    tile_regs_release();
-    cb_push_back(cb_work, tiles);
-  }
+void mul_tiles_bcast_rows_dest_reuse_init_short(uint32_t icb) {
+  MATH((llk_math_eltwise_binary_init_with_operands<
+        ELWMUL, BroadcastType::ROW, MATH_FIDELITY,
+        EltwiseBinaryReuseDestType::DEST_TO_SRCA>(icb, icb)));
+  UNPACK((llk_unpack_A_init<BroadcastType::ROW, true,
+                            EltwiseBinaryReuseDestType::DEST_TO_SRCA>(
+      false, false, icb)));
 }
 
-void apply_weight() {
-  reconfig_data_format_srca(cb_scale, cb_work);
-  reconfig_data_format_srcb(cb_input, cb_weight);
-  pack_reconfig_data_format(cb_work, cb_output);
-  mul_bcast_rows_init_short(cb_work, cb_weight);
+void mul_tiles_bcast_rows_dest_reuse(uint32_t icb, uint32_t itile,
+                                     uint32_t idst) {
+  MATH((llk_math_eltwise_binary<
+        ELWMUL, BroadcastType::ROW, DST_ACCUM_MODE, MATH_FIDELITY,
+        EltwiseBinaryReuseDestType::DEST_TO_SRCA>(icb, icb, idst, true)));
+  UNPACK((llk_unpack_A<BroadcastType::ROW, true,
+                       EltwiseBinaryReuseDestType::DEST_TO_SRCA>(icb, itile)));
+}
+
+void apply_scale_and_weight() {
+  reconfig_data_format(cb_input, cb_scale);
+  pack_reconfig_data_format(cb_scale, cb_output);
 
   for (uint32_t base = 0; base < width_tiles; base += block_tiles) {
     uint32_t tiles = min_u32(block_tiles, width_tiles - base);
     cb_reserve_back(cb_output, tiles);
     tile_regs_acquire();
+    mul_bcast_cols_init_short(cb_input, cb_scale);
     for (uint32_t i = 0; i < tiles; ++i) {
-      mul_tiles_bcast_rows(cb_work, cb_weight, base + i, base + i, i);
+      mul_tiles_bcast_cols(cb_input, cb_scale, base + i, 0, i);
+    }
+    mul_tiles_bcast_rows_dest_reuse_init_short(cb_weight);
+    for (uint32_t i = 0; i < tiles; ++i) {
+      mul_tiles_bcast_rows_dest_reuse(cb_weight, base + i, i);
     }
     tile_regs_commit();
     tile_regs_wait();
@@ -139,14 +138,10 @@ void MAIN {
     cb_pop_front(cb_work, width_tiles);
 
     cb_wait_front(cb_scale, onetile);
-    apply_scale();
-
     cb_wait_front(cb_weight, width_tiles);
-    cb_wait_front(cb_work, width_tiles);
-    apply_weight();
+    apply_scale_and_weight();
 
     cb_pop_front(cb_scale, onetile);
-    cb_pop_front(cb_work, width_tiles);
     cb_pop_front(cb_weight, width_tiles);
     cb_pop_front(cb_input, width_tiles);
   }
