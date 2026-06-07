@@ -108,15 +108,13 @@ pub(crate) struct ReducePlan {
     output_allocation_shape: Vec<usize>,
     shape: ReduceKernelShape,
     op: ReduceOp,
-    input_dtype: DType,
-    output_dtype: DType,
+    dtype: DType,
     identity: Option<u32>,
 }
 
 impl ReducePlan {
     pub(crate) fn new(
-        input_dtype: DType,
-        output_dtype: DType,
+        dtype: DType,
         input_shape: &[usize],
         output_shape: &[usize],
         dimensions: &[i64],
@@ -124,7 +122,7 @@ impl ReducePlan {
         identity: Option<u32>,
     ) -> io::Result<Self> {
         let op = ReduceOp::from_reducer(reducer)?;
-        validate_reduce_dtype(input_dtype, output_dtype, op)?;
+        validate_reduce_dtype(dtype, op)?;
         if input_shape.len() < 2 {
             return Err(invalid_input(format!(
                 "reduce kernel requires rank >= 2 input, got {input_shape:?}"
@@ -208,8 +206,7 @@ impl ReducePlan {
                 output_dim1: u32_arg(output_dim1, "output dim1")?,
             },
             op,
-            input_dtype,
-            output_dtype,
+            dtype,
             identity,
         })
     }
@@ -218,6 +215,7 @@ impl ReducePlan {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ReduceProgramKey {
     cores: Vec<CoreCoord>,
+    dtype: DType,
     op: ReduceOp,
     input_shape: Vec<u32>,
     output_shape: Vec<u32>,
@@ -225,8 +223,6 @@ struct ReduceProgramKey {
     input_tiles_per_row: u32,
     shape: ReduceKernelShape,
     identity: Option<u32>,
-    input_dtype: DType,
-    output_dtype: DType,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,7 +255,7 @@ pub(crate) fn reduce(
     let cores = select_worker_cores(device.cores_ref(), partition_count)?;
     let output = device.alloc(
         output_tiles,
-        plan.output_dtype,
+        plan.dtype,
         &plan.output_allocation_shape,
         name,
     )?;
@@ -270,6 +266,7 @@ pub(crate) fn reduce(
         output_addr: u32_addr(output.addr, "output address")?,
         key: ReduceProgramKey {
             cores,
+            dtype: plan.dtype,
             op: plan.op,
             input_shape: u32_shape(&plan.input_shape, "reduce input shape")?,
             output_shape: u32_shape(&plan.output_shape, "reduce output shape")?,
@@ -283,8 +280,6 @@ pub(crate) fn reduce(
             )?,
             shape: plan.shape,
             identity: plan.identity,
-            input_dtype: plan.input_dtype,
-            output_dtype: plan.output_dtype,
         },
         build: reduce_program,
     };
@@ -293,10 +288,10 @@ pub(crate) fn reduce(
 }
 
 fn validate_input(input: &DramBuffer, plan: &ReducePlan) -> io::Result<()> {
-    if input.dtype != plan.input_dtype {
+    if input.dtype != plan.dtype {
         return Err(invalid_input(format!(
             "reduce input requires {:?}, got {:?}",
-            plan.input_dtype, input.dtype
+            plan.dtype, input.dtype
         )));
     }
     let expected_shape = tiled_allocation_shape(&plan.input_shape)?;
@@ -316,16 +311,7 @@ fn validate_input(input: &DramBuffer, plan: &ReducePlan) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_reduce_dtype(input_dtype: DType, output_dtype: DType, op: ReduceOp) -> io::Result<()> {
-    if input_dtype != output_dtype {
-        if input_dtype == DType::Float16B && output_dtype == DType::Float32 && op == ReduceOp::Sum {
-            return Ok(());
-        }
-        return Err(invalid_input(format!(
-            "reduce output dtype {output_dtype:?} is not supported for input dtype {input_dtype:?} and op {op:?}"
-        )));
-    }
-    let dtype = input_dtype;
+fn validate_reduce_dtype(dtype: DType, op: ReduceOp) -> io::Result<()> {
     if op.is_bitwise() {
         if matches!(
             dtype,
@@ -378,7 +364,7 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
                 range.reduce_groups,
                 key.input_tiles_per_row,
                 shape.valid_last_width,
-                key.op.identity_bits(key.input_dtype)?,
+                key.op.identity_bits(key.dtype)?,
             ]
         } else {
             vec![
@@ -411,9 +397,9 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
         )?;
     }
     let runtime_args = runtime_args.build()?;
-    let compute_dtype = reduce_compute_dtype(key.input_dtype, key.output_dtype)?;
+    let compute_dtype = reduce_compute_dtype(key.dtype)?;
     let input_compute_dtype = if use_block_max_row {
-        key.input_dtype
+        key.dtype
     } else {
         compute_dtype
     };
@@ -422,33 +408,30 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
         reader_kernel,
         compute_kernel: reduce_compute_source(
             key.op,
-            compute_dtype,
+            key.dtype,
             use_tiled_last_dim,
             use_block_max_row,
             block_max_row_tiles,
         ),
-        writer_kernel: reduce_writer_source(key.output_dtype, key.op, use_block_max_row)?,
+        writer_kernel: reduce_writer_source(key.dtype, key.op, use_block_max_row)?,
         compile: CompileConfig {
             cbs: vec![
-                CBConfig::new(0, key.input_dtype)
+                CBConfig::new(0, key.dtype)
                     .with_compute_dtype(input_compute_dtype)
                     .with_tiles(if use_block_max_row {
                         block_max_row_tiles as usize
                     } else {
                         2
                     }),
-                CBConfig::new(1, key.input_dtype),
-                CBConfig::new(2, key.input_dtype),
-                CBConfig::new(16, key.output_dtype).with_compute_dtype(compute_dtype),
-                CBConfig::new(17, key.output_dtype).with_tiles(output_tiles),
+                CBConfig::new(1, key.dtype),
+                CBConfig::new(2, key.dtype),
+                CBConfig::new(16, key.dtype).with_compute_dtype(compute_dtype),
+                CBConfig::new(17, key.dtype).with_tiles(output_tiles),
             ],
             dst_accum_mode: true,
             ..CompileConfig::default()
         },
-        name: format!(
-            "reduce_{:?}_{:?}_{:?}",
-            key.op, key.input_dtype, key.output_dtype
-        ),
+        name: format!("reduce_{:?}_{:?}", key.op, key.dtype),
         ..Program::new(runtime_args)
     })
 }
@@ -458,18 +441,13 @@ fn use_tiled_last_dim(key: &ReduceProgramKey) -> bool {
         return false;
     }
     matches!(
-        (key.input_dtype, key.output_dtype, key.op),
-        (
-            DType::Float32,
-            DType::Float32,
-            ReduceOp::Sum | ReduceOp::Max
-        ) | (DType::Float16B, DType::Float32, ReduceOp::Sum)
+        (key.dtype, key.op),
+        (DType::Float32, ReduceOp::Sum | ReduceOp::Max)
     )
 }
 
 fn use_block_max_row(key: &ReduceProgramKey) -> bool {
-    key.input_dtype == DType::Float16B
-        && key.output_dtype == DType::Float16B
+    key.dtype == DType::Float16B
         && key.op == ReduceOp::Max
         && key.shape.reduce_dim as usize == key.input_shape.len().saturating_sub(1)
 }
@@ -509,8 +487,8 @@ fn reduce_reader_source(
         block_max_row_tiles(key),
         key.shape.inner_output_tiles,
         cpp_u32_literal(reduce_identity_bits(key)?),
-        cpp_u32_literal(reduce_one_bits(key.input_dtype)?),
-        reduce_element_type(key.input_dtype, key.op)?,
+        cpp_u32_literal(reduce_one_bits(key.dtype)?),
+        reduce_element_type(key.dtype, key.op)?,
     ))
 }
 
@@ -544,16 +522,12 @@ fn reduce_writer_source(dtype: DType, op: ReduceOp, use_block_max_row: bool) -> 
     ))
 }
 
-fn reduce_compute_dtype(input_dtype: DType, output_dtype: DType) -> io::Result<DType> {
-    match (input_dtype, output_dtype) {
-        (DType::Float16B, DType::Float16B | DType::Float32) => Ok(DType::Float32),
-        (DType::Float32, DType::Float32)
-        | (DType::Int32, DType::Int32)
-        | (DType::UInt32, DType::UInt32)
-        | (DType::UInt16, DType::UInt16)
-        | (DType::UInt8, DType::UInt8) => Ok(input_dtype),
+fn reduce_compute_dtype(dtype: DType) -> io::Result<DType> {
+    match dtype {
+        DType::Float16B => Ok(DType::Float32),
+        DType::Float32 | DType::Int32 | DType::UInt32 | DType::UInt16 | DType::UInt8 => Ok(dtype),
         _ => Err(invalid_input(format!(
-            "reduce compute kernel does not support input/output dtypes {input_dtype:?}/{output_dtype:?}"
+            "reduce compute kernel does not support dtype {dtype:?}"
         ))),
     }
 }
@@ -712,7 +686,7 @@ fn reduce_identity_bits(key: &ReduceProgramKey) -> io::Result<u32> {
     if let Some(identity) = key.identity {
         return Ok(identity);
     }
-    key.op.identity_bits(key.input_dtype)
+    key.op.identity_bits(key.dtype)
 }
 
 fn reduce_one_bits(dtype: DType) -> io::Result<u32> {
@@ -783,7 +757,6 @@ mod tests {
     fn reduce_plan_tracks_partial_last_width_tile() {
         let plan = ReducePlan::new(
             DType::Float32,
-            DType::Float32,
             &[2, 30],
             &[2],
             &[1],
@@ -798,7 +771,6 @@ mod tests {
     #[test]
     fn reduce_plan_keeps_aligned_last_width_tile_unmasked() {
         let plan = ReducePlan::new(
-            DType::Float32,
             DType::Float32,
             &[2, 64],
             &[2],

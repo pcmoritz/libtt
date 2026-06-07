@@ -2075,17 +2075,12 @@ fn execute_reduce(
             "TT executable reduce output id {output_id} is out of bounds"
         ))
     })?;
-    let input_dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
-    let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
-    if output_desc.element_type != input_desc.element_type
-        && !(input_dtype == DType::Float16B
-            && output_dtype == DType::Float32
-            && reducer == executable::ReduceReducer::Add)
-    {
+    if output_desc.element_type != input_desc.element_type {
         return Err(invalid_argument(
             "TT executable reduce input and output element types must match",
         ));
     }
+    let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
     let (kernel_input_shape, kernel_output_shape, kernel_dimensions) =
@@ -2098,7 +2093,6 @@ fn execute_reduce(
                 dimensions.to_vec(),
             )
         };
-    let identity_element_type = output_desc.element_type;
     let bitwise_identity = if matches!(
         reducer,
         executable::ReduceReducer::And | executable::ReduceReducer::Or
@@ -2106,7 +2100,7 @@ fn execute_reduce(
         Some(
             constant_packed_value(plan, *init_value_id)
                 .and_then(|packed_value| {
-                    reduce_identity_from_packed(reducer, identity_element_type, packed_value)
+                    reduce_identity_from_packed(reducer, input_desc.element_type, packed_value)
                 })
                 .ok_or_else(|| {
                     unimplemented(
@@ -2118,7 +2112,7 @@ fn execute_reduce(
         None
     };
     if bitwise_identity.is_none()
-        && !reduce_init_is_supported(plan, *init_value_id, reducer, identity_element_type)
+        && !reduce_init_is_supported(plan, *init_value_id, reducer, input_desc.element_type)
     {
         return Err(unimplemented(
             "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
@@ -2149,8 +2143,7 @@ fn execute_reduce(
         }
     }
     let reduce_plan = kernels::reduce::ReducePlan::new(
-        input_dtype,
-        output_dtype,
+        dtype,
         &kernel_input_shape,
         &kernel_output_shape,
         &kernel_dimensions,
