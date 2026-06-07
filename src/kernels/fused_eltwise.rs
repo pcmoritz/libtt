@@ -1,6 +1,6 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
+use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C};
 use crate::executable::{
     BitwiseBinaryKind, CompareDirection, FusedElementwiseKind, FusedElementwiseNode,
 };
@@ -12,6 +12,8 @@ use std::io;
 
 const WRITER: &str = include_str!("../../kernels/tile_writer.cc");
 const COMPUTE: &str = include_str!("../../kernels/fused_eltwise_compute.cc");
+const RMS_NORM_READER: &str = include_str!("../../kernels/rms_norm_reader.cc");
+const RMS_NORM_COMPUTE: &str = include_str!("../../kernels/rms_norm_compute.cc");
 const HELPER_BINARY_INPUT_DATA_FORMAT: &str =
     include_str!("../../kernels/fused_eltwise_helpers/binary_input_data_format.cc.inc");
 const HELPER_ADD_INPUT: &str = include_str!("../../kernels/fused_eltwise_helpers/add_input.cc.inc");
@@ -568,6 +570,23 @@ struct FusedEltwiseKernel {
     key: FusedEltwiseProgramKey,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct RmsNormProgramKey {
+    cores: Vec<CoreCoord>,
+    width_tiles: u32,
+    group_count: u32,
+    valid_rows: u32,
+    scale_bits: u32,
+    bias_bits: u32,
+}
+
+struct RmsNormKernel {
+    input_addr: u32,
+    weight_addr: u32,
+    output_addr: u32,
+    key: RmsNormProgramKey,
+}
+
 impl Kernel<FusedEltwiseProgramKey> for FusedEltwiseKernel {
     fn program_key(&self) -> FusedEltwiseProgramKey {
         self.key.clone()
@@ -584,6 +603,30 @@ impl Kernel<FusedEltwiseProgramKey> for FusedEltwiseKernel {
             return Some(self.input_addrs[index]);
         }
         None
+    }
+
+    #[inline]
+    fn writer_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        (index == 0).then_some(self.output_addr)
+    }
+}
+
+impl Kernel<RmsNormProgramKey> for RmsNormKernel {
+    fn program_key(&self) -> RmsNormProgramKey {
+        self.key.clone()
+    }
+
+    fn build_program(&self) -> io::Result<Program> {
+        rms_norm_program(self.key.clone())
+    }
+
+    #[inline]
+    fn reader_runtime_arg(&self, _core: CoreCoord, index: usize) -> Option<u32> {
+        match index {
+            0 => Some(self.input_addr),
+            1 => Some(self.weight_addr),
+            _ => None,
+        }
     }
 
     #[inline]
@@ -625,6 +668,97 @@ pub(crate) fn eltwise(
             tile_count,
             output_dtype,
             nodes: nodes.to_vec(),
+        },
+    };
+    kernel.run(device)?;
+    Ok(output)
+}
+
+pub(crate) fn rms_norm(
+    device: &mut Device,
+    input: &DramBuffer,
+    weight: &DramBuffer,
+    output_shape: &[usize],
+    scale_bits: u32,
+    bias_bits: u32,
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
+    if output_shape.len() < 2 {
+        return Err(invalid_input(format!(
+            "rms_norm requires output rank >= 2, got {output_shape:?}"
+        )));
+    }
+    if input.dtype != DType::Float16B || weight.dtype != DType::Float16B {
+        return Err(invalid_input(format!(
+            "rms_norm requires bf16 input and weight, got {:?}/{:?}",
+            input.dtype, weight.dtype
+        )));
+    }
+
+    let allocation_shape = tiled_allocation_shape(output_shape)?;
+    if input.shape != allocation_shape {
+        return Err(invalid_input(format!(
+            "rms_norm input allocation shape {:?} does not match output shape {:?}",
+            input.shape, output_shape
+        )));
+    }
+    let hidden = *output_shape
+        .last()
+        .ok_or_else(|| invalid_input("rms_norm output shape is empty"))?;
+    let weight_shape = [hidden];
+    let weight_allocation_shape = tiled_allocation_shape(&weight_shape)?;
+    if weight.shape != weight_allocation_shape {
+        return Err(invalid_input(format!(
+            "rms_norm weight allocation shape {:?} does not match hidden size {hidden}",
+            weight.shape
+        )));
+    }
+
+    let output_tiles = tiled_shape_tile_count(output_shape)?;
+    if input.num_tiles != output_tiles {
+        return Err(invalid_input(format!(
+            "rms_norm input has {} tiles, expected {output_tiles}",
+            input.num_tiles
+        )));
+    }
+    if weight.num_tiles != tiled_shape_tile_count(&weight_shape)? {
+        return Err(invalid_input(
+            "rms_norm weight tile count does not match hidden size",
+        ));
+    }
+
+    let rank = allocation_shape.len();
+    let width_tiles = allocation_shape[rank - 1] / TILE_C;
+    let rows = output_shape[rank - 2];
+    if rows != 1 {
+        return Err(invalid_input(format!(
+            "rms_norm fused kernel currently supports one row per tile group, got {rows}"
+        )));
+    }
+    if width_tiles == 0 {
+        return Err(invalid_input("rms_norm width tile count must be non-zero"));
+    }
+    if output_tiles % width_tiles != 0 {
+        return Err(invalid_input(format!(
+            "rms_norm output tile count {output_tiles} is not divisible by width tiles {width_tiles}"
+        )));
+    }
+    let group_count = output_tiles / width_tiles;
+    let group_count_u32 = u32_arg(group_count, "rms_norm group count")?;
+    let width_tiles_u32 = u32_arg(width_tiles, "rms_norm width tiles")?;
+    let cores = select_worker_cores(device.cores_ref(), group_count)?;
+    let output = device.alloc(output_tiles, DType::Float16B, &allocation_shape, name)?;
+    let kernel = RmsNormKernel {
+        input_addr: u32_arg(input.addr, "rms_norm input address")?,
+        weight_addr: u32_arg(weight.addr, "rms_norm weight address")?,
+        output_addr: u32_arg(output.addr, "rms_norm output address")?,
+        key: RmsNormProgramKey {
+            cores,
+            width_tiles: width_tiles_u32,
+            group_count: group_count_u32,
+            valid_rows: 1,
+            scale_bits,
+            bias_bits,
         },
     };
     kernel.run(device)?;
@@ -834,6 +968,49 @@ fn fused_eltwise_program(key: FusedEltwiseProgramKey) -> io::Result<Program> {
     })
 }
 
+fn rms_norm_program(key: RmsNormProgramKey) -> io::Result<Program> {
+    let mut runtime_args = RuntimeArgsBuilder::new(0, vec![0], vec![0, 1], Vec::new());
+    for (core_index, &core) in key.cores.iter().enumerate() {
+        let (group_offset, n_groups) =
+            split_tile_range(key.group_count, core_index, key.cores.len())?;
+        let tile_offset = group_offset
+            .checked_mul(key.width_tiles)
+            .ok_or_else(|| invalid_input("rms_norm tile offset overflow"))?;
+        let n_tiles = n_groups
+            .checked_mul(key.width_tiles)
+            .ok_or_else(|| invalid_input("rms_norm tile count overflow"))?;
+        runtime_args.add_core(
+            core,
+            vec![0, tile_offset, n_tiles],
+            vec![0, 0, group_offset, n_groups],
+            vec![n_groups],
+        )?;
+    }
+    let runtime_args = runtime_args.build()?;
+
+    let width_tiles = key.width_tiles as usize;
+    Ok(Program {
+        reader_kernel: rms_norm_reader_source(&key)?,
+        compute_kernel: rms_norm_compute_source(&key),
+        writer_kernel: WRITER.to_owned(),
+        compile: CompileConfig {
+            cbs: vec![
+                CBConfig::new(0, DType::Float16B).with_tiles(width_tiles),
+                CBConfig::new(1, DType::Float16B).with_tiles(width_tiles),
+                CBConfig::new(2, DType::Float16B).with_tiles(1),
+                CBConfig::new(3, DType::Float16B).with_tiles(width_tiles),
+                CBConfig::new(4, DType::Float16B).with_tiles(1),
+                CBConfig::new(16, DType::Float16B).with_tiles(8),
+            ],
+            dst_accum_mode: true,
+            dst_full_sync: true,
+            ..CompileConfig::default()
+        },
+        name: format!("rms_norm_{}", key.width_tiles),
+        ..Program::new(runtime_args)
+    })
+}
+
 fn fused_leaf_nodes<'a>(
     nodes: &'a [FusedElementwiseNode],
     node_cbs: &[Option<u32>],
@@ -849,6 +1026,20 @@ fn fused_leaf_nodes<'a>(
         })
         .map(|(index, node)| Ok((cb_for_node(node_cbs, index)?, node)))
         .collect()
+}
+
+fn rms_norm_reader_source(key: &RmsNormProgramKey) -> io::Result<String> {
+    Ok(format!(
+        "#define RMS_NORM_WIDTH_TILES {}\n#define RMS_NORM_VALID_ROWS {}\n{RMS_NORM_READER}",
+        key.width_tiles, key.valid_rows
+    ))
+}
+
+fn rms_norm_compute_source(key: &RmsNormProgramKey) -> String {
+    RMS_NORM_COMPUTE
+        .replace("RMS_NORM_WIDTH_TILES", &key.width_tiles.to_string())
+        .replace("RMS_NORM_SCALE_BITS", &key.scale_bits.to_string())
+        .replace("RMS_NORM_BIAS_BITS", &key.bias_bits.to_string())
 }
 
 fn reader_source(

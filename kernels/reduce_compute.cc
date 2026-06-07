@@ -3,7 +3,9 @@
 #include "compute_kernel_api/binary_bitwise_sfpu.h"
 #include "compute_kernel_api/binary_max_min.h"
 #include "compute_kernel_api/eltwise_binary_sfpu.h"
+#include "compute_kernel_api/eltwise_unary/binop_with_scalar.h"
 #include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
+#include "compute_kernel_api/eltwise_unary/rsqrt.h"
 #include "compute_kernel_api/pack.h"
 #include "compute_kernel_api/reduce_custom.h"
 #include "compute_kernel_api/tile_move_copy.h"
@@ -99,6 +101,23 @@ void combine_into_accumulator(uint32_t index, uint32_t dst_idx) {
 #endif
 }
 
+void square_pre_reduce_tile(uint32_t dst_idx) {
+#if REDUCE_PRE_SQUARE
+  mul_binary_tile_init();
+  mul_binary_tile(dst_idx, dst_idx, dst_idx);
+#endif
+}
+
+void post_rsqrt_tile() {
+#if REDUCE_POST_RSQRT
+  binop_with_scalar_tile_init();
+  mul_unary_tile(0, REDUCE_POST_SCALE_BITS);
+  add_unary_tile(0, REDUCE_POST_BIAS_BITS);
+  rsqrt_tile_init();
+  rsqrt_tile(0);
+#endif
+}
+
 void MAIN {
   uint32_t reduce_groups = get_arg_val<uint32_t>(0);
   uint32_t count = get_arg_val<uint32_t>(1);
@@ -129,6 +148,7 @@ void MAIN {
         combine_into_accumulator(block, dst_idx);
         cb_pop_front(cb_input, REDUCE_BLOCK_MAX_ROW_TILES);
       }
+      post_rsqrt_tile();
       cb_reserve_back(cb_output, onetile);
       tile_regs_commit();
       tile_regs_wait();
@@ -147,10 +167,12 @@ void MAIN {
         cb_wait_front(cb_input, onetile);
         copy_tile_to_dst_init_short(cb_input);
         copy_tile(cb_input, 0, dst_idx);
+        square_pre_reduce_tile(dst_idx);
         reduce_last_dim_tile(dst_idx);
         combine_into_accumulator(wt, dst_idx);
         cb_pop_front(cb_input, onetile);
       }
+      post_rsqrt_tile();
       cb_reserve_back(cb_output, onetile);
       tile_regs_commit();
       tile_regs_wait();
@@ -171,9 +193,11 @@ void MAIN {
       cb_wait_front(cb_input, onetile);
       copy_tile_to_dst_init_short(cb_input);
       copy_tile(cb_input, 0, dst_idx);
+      square_pre_reduce_tile(dst_idx);
       combine_into_accumulator(index, dst_idx);
       cb_pop_front(cb_input, onetile);
     }
+    post_rsqrt_tile();
     cb_reserve_back(cb_output, onetile);
     tile_regs_commit();
     tile_regs_wait();

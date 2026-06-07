@@ -137,6 +137,12 @@ pub(crate) enum Op {
         output_id: u32,
         scale_bf16_packed: u32,
     },
+    RmsNorm {
+        input_ids: [u32; 2],
+        output_id: u32,
+        scale_bits: u32,
+        bias_bits: u32,
+    },
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -596,6 +602,12 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     ],
                     output_id: op_desc.output_id,
                     scale_bf16_packed: sdpa_decode.scale_bf16_packed,
+                }),
+                Kind::RmsNorm(rms_norm) => Ok(Op::RmsNorm {
+                    input_ids: [rms_norm.input_id, rms_norm.weight_id],
+                    output_id: op_desc.output_id,
+                    scale_bits: rms_norm.scale_bits,
+                    bias_bits: rms_norm.bias_bits,
                 }),
             }
         })
