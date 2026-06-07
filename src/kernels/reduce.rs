@@ -111,14 +111,6 @@ pub(crate) struct ReducePlan {
     input_dtype: DType,
     output_dtype: DType,
     identity: Option<u32>,
-    pre_square: bool,
-    post_rsqrt: Option<ReducePostRsqrt>,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub(crate) struct ReducePostRsqrt {
-    pub(crate) scale_bits: u32,
-    pub(crate) bias_bits: u32,
 }
 
 impl ReducePlan {
@@ -130,8 +122,6 @@ impl ReducePlan {
         dimensions: &[i64],
         reducer: ReduceReducer,
         identity: Option<u32>,
-        pre_square: bool,
-        post_rsqrt: Option<ReducePostRsqrt>,
     ) -> io::Result<Self> {
         let op = ReduceOp::from_reducer(reducer)?;
         validate_reduce_dtype(input_dtype, output_dtype, op)?;
@@ -221,8 +211,6 @@ impl ReducePlan {
             input_dtype,
             output_dtype,
             identity,
-            pre_square,
-            post_rsqrt,
         })
     }
 }
@@ -237,8 +225,6 @@ struct ReduceProgramKey {
     input_tiles_per_row: u32,
     shape: ReduceKernelShape,
     identity: Option<u32>,
-    pre_square: bool,
-    post_rsqrt: Option<ReducePostRsqrt>,
     input_dtype: DType,
     output_dtype: DType,
 }
@@ -297,8 +283,6 @@ pub(crate) fn reduce(
             )?,
             shape: plan.shape,
             identity: plan.identity,
-            pre_square: plan.pre_square,
-            post_rsqrt: plan.post_rsqrt,
             input_dtype: plan.input_dtype,
             output_dtype: plan.output_dtype,
         },
@@ -442,8 +426,6 @@ fn reduce_program(key: ReduceProgramKey) -> io::Result<Program> {
             use_tiled_last_dim,
             use_block_max_row,
             block_max_row_tiles,
-            key.pre_square,
-            key.post_rsqrt,
         ),
         writer_kernel: reduce_writer_source(key.output_dtype, key.op, use_block_max_row)?,
         compile: CompileConfig {
@@ -538,8 +520,6 @@ fn reduce_compute_source(
     use_tiled_last_dim: bool,
     use_block_max_row: bool,
     block_max_row_tiles: u32,
-    pre_square: bool,
-    post_rsqrt: Option<ReducePostRsqrt>,
 ) -> String {
     COMPUTE
         .replace("REDUCE_LAST_DIM_TILED", bool_define(use_tiled_last_dim))
@@ -554,16 +534,6 @@ fn reduce_compute_source(
         .replace("REDUCE_IS_MIN", bool_define(op.is_min()))
         .replace("REDUCE_IS_OR", bool_define(matches!(op, ReduceOp::Or)))
         .replace("REDUCE_IS_BITWISE", bool_define(op.is_bitwise()))
-        .replace("REDUCE_PRE_SQUARE", bool_define(pre_square))
-        .replace("REDUCE_POST_RSQRT", bool_define(post_rsqrt.is_some()))
-        .replace(
-            "REDUCE_POST_SCALE_BITS",
-            &post_rsqrt.map_or(0, |post| post.scale_bits).to_string(),
-        )
-        .replace(
-            "REDUCE_POST_BIAS_BITS",
-            &post_rsqrt.map_or(0, |post| post.bias_bits).to_string(),
-        )
 }
 
 fn reduce_writer_source(dtype: DType, op: ReduceOp, use_block_max_row: bool) -> io::Result<String> {
@@ -819,8 +789,6 @@ mod tests {
             &[1],
             ReduceReducer::Max,
             None,
-            false,
-            None,
         )
         .unwrap();
         assert_eq!(plan.shape.reduce_count, 30);
@@ -836,8 +804,6 @@ mod tests {
             &[2],
             &[1],
             ReduceReducer::Add,
-            None,
-            false,
             None,
         )
         .unwrap();

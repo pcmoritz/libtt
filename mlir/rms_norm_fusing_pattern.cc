@@ -13,6 +13,8 @@
 namespace libtt::mlir_frontend {
 namespace {
 
+constexpr int64_t kTileRows = 32;
+
 struct RmsNormComponents {
   mlir::Value input;
   mlir::Value weight;
@@ -340,7 +342,7 @@ matchRmsNorm(mlir::stablehlo::ConvertOp rootConvert) {
     return std::nullopt;
   }
   int64_t rows = outputType->getDimSize(outputType->getRank() - 2);
-  if (rows != 1) {
+  if (rows < 1 || rows > kTileRows) {
     return std::nullopt;
   }
   int64_t hidden = outputType->getDimSize(outputType->getRank() - 1);

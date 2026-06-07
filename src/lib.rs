@@ -23,7 +23,7 @@ use dram::{allocator_stats, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
@@ -109,32 +109,6 @@ pub struct PJRT_Layouts_SerializedLayout {
 }
 
 #[derive(Clone)]
-struct RuntimeFusionAnalysis {
-    square_reduce_inputs: HashMap<u32, u32>,
-    reduce_post_rsqrt: HashMap<u32, RuntimeReducePostRsqrt>,
-    skipped_fused_outputs: HashSet<u32>,
-    skipped_reshape_outputs: HashSet<u32>,
-}
-
-impl RuntimeFusionAnalysis {
-    fn empty() -> Self {
-        Self {
-            square_reduce_inputs: HashMap::new(),
-            reduce_post_rsqrt: HashMap::new(),
-            skipped_fused_outputs: HashSet::new(),
-            skipped_reshape_outputs: HashSet::new(),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct RuntimeReducePostRsqrt {
-    final_output_id: u32,
-    scale_bits: u32,
-    bias_bits: u32,
-}
-
-#[derive(Clone)]
 struct ExecutableMetadata {
     name: CString,
     fingerprint: CString,
@@ -147,7 +121,6 @@ struct ExecutableMetadata {
     output_memory_kind_sizes: Vec<usize>,
     executable: Option<executable::Executable>,
     lazy_reshape_ids: HashSet<u32>,
-    fusion_analysis: RuntimeFusionAnalysis,
 }
 
 #[repr(C)]
@@ -772,10 +745,6 @@ fn make_executable_metadata(
         .as_ref()
         .map(lazy_reshape_ids)
         .unwrap_or_default();
-    let fusion_analysis = executable
-        .as_ref()
-        .map(runtime_fusion_analysis)
-        .unwrap_or_else(RuntimeFusionAnalysis::empty);
     ExecutableMetadata {
         name: cstring_lossy(name),
         fingerprint,
@@ -788,7 +757,6 @@ fn make_executable_metadata(
         output_memory_kind_sizes,
         executable,
         lazy_reshape_ids,
-        fusion_analysis,
     }
 }
 
@@ -1661,7 +1629,6 @@ struct OutputContext<'a> {
     memory: *mut PJRT_Memory,
     local_hardware_id: usize,
     lazy_reshape_ids: &'a HashSet<u32>,
-    fusion_analysis: &'a RuntimeFusionAnalysis,
 }
 
 fn store_output_buffer(
@@ -2119,22 +2086,7 @@ fn execute_reduce(
         ));
     };
 
-    let pre_square_input = context
-        .fusion_analysis
-        .square_reduce_inputs
-        .get(input_id)
-        .copied();
-    let reduce_input_id = pre_square_input.unwrap_or(*input_id);
-    let pre_square = pre_square_input.is_some()
-        && reducer == executable::ReduceReducer::Add
-        && dimensions.len() == 1;
-    let post_rsqrt = context
-        .fusion_analysis
-        .reduce_post_rsqrt
-        .get(&output_id)
-        .copied();
-
-    let input = device_buffer_for_value(values, reduce_input_id, "reduce.input")?;
+    let input = device_buffer_for_value(values, *input_id, "reduce.input")?;
     let Some(input_dram) = input.dram_buffer.as_ref() else {
         return Err(failed_precondition(
             "TT executable reduce input buffer has no device allocation",
@@ -2142,7 +2094,7 @@ fn execute_reduce(
     };
     let input_desc = plan
         .values
-        .get(reduce_input_id as usize)
+        .get(*input_id as usize)
         .ok_or_else(|| invalid_argument("TT executable reduce input id is out of bounds"))?;
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
@@ -2151,11 +2103,11 @@ fn execute_reduce(
     })?;
     let input_dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
-    let fused_bf16_square_to_f32 = pre_square
-        && reducer == executable::ReduceReducer::Add
-        && input_dtype == DType::Float16B
-        && output_dtype == DType::Float32;
-    if output_desc.element_type != input_desc.element_type && !fused_bf16_square_to_f32 {
+    if output_desc.element_type != input_desc.element_type
+        && !(input_dtype == DType::Float16B
+            && output_dtype == DType::Float32
+            && reducer == executable::ReduceReducer::Add)
+    {
         return Err(invalid_argument(
             "TT executable reduce input and output element types must match",
         ));
@@ -2198,29 +2150,27 @@ fn execute_reduce(
             "TT executable reduce currently requires the StableHLO init value to be the reducer identity",
         ));
     }
-    if !pre_square && post_rsqrt.is_none() {
-        if let [dimension] = dimensions {
-            let reduce_dim = usize::try_from(*dimension).map_err(|_| {
-                invalid_argument(format!(
-                    "TT executable reduce dimension {dimension} is negative"
-                ))
-            })?;
-            if input_shape.get(reduce_dim) == Some(&1) {
-                let input_allocation_shape =
-                    dram::tiled_allocation_shape(&input_shape).map_err(io_error)?;
-                let output_allocation_shape =
-                    dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
-                if input_allocation_shape == output_allocation_shape {
-                    return store_output_buffer(
-                        values,
-                        plan,
-                        output_id,
-                        output_desc.dims.clone(),
-                        input_dram.clone(),
-                        context,
-                        "reduce.alias",
-                    );
-                }
+    if let [dimension] = dimensions {
+        let reduce_dim = usize::try_from(*dimension).map_err(|_| {
+            invalid_argument(format!(
+                "TT executable reduce dimension {dimension} is negative"
+            ))
+        })?;
+        if input_shape.get(reduce_dim) == Some(&1) {
+            let input_allocation_shape =
+                dram::tiled_allocation_shape(&input_shape).map_err(io_error)?;
+            let output_allocation_shape =
+                dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+            if input_allocation_shape == output_allocation_shape {
+                return store_output_buffer(
+                    values,
+                    plan,
+                    output_id,
+                    output_desc.dims.clone(),
+                    input_dram.clone(),
+                    context,
+                    "reduce.alias",
+                );
             }
         }
     }
@@ -2232,43 +2182,15 @@ fn execute_reduce(
         &kernel_dimensions,
         reducer,
         bitwise_identity,
-        pre_square,
-        post_rsqrt.map(|post| kernels::reduce::ReducePostRsqrt {
-            scale_bits: post.scale_bits,
-            bias_bits: post.bias_bits,
-        }),
     )
     .map_err(io_error)?;
-    let mut output_dram = kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
+    let output_dram = kernels::reduce::reduce(device, input_dram, &reduce_plan, "pjrt_reduce")
         .map_err(io_error)?;
-    let (store_output_id, store_dims) = if let Some(post) = post_rsqrt {
-        let final_desc = plan
-            .values
-            .get(post.final_output_id as usize)
-            .ok_or_else(|| {
-                invalid_argument("TT executable fused reduce rsqrt output id is out of bounds")
-            })?;
-        let final_shape = dims_i64_to_usize(&final_desc.dims)?;
-        let final_allocation_shape =
-            dram::tiled_allocation_shape(&final_shape).map_err(io_error)?;
-        let final_tiles = dram::tiled_shape_tile_count(&final_shape).map_err(io_error)?;
-        if final_desc.element_type != output_desc.element_type
-            || final_tiles != output_dram.num_tiles
-        {
-            return Err(invalid_argument(
-                "TT executable fused reduce rsqrt output is not tile-compatible with reduce output",
-            ));
-        }
-        output_dram.shape = final_allocation_shape;
-        (post.final_output_id, final_desc.dims.clone())
-    } else {
-        (output_id, output_desc.dims.clone())
-    };
     store_output_buffer(
         values,
         plan,
-        store_output_id,
-        store_dims,
+        output_id,
+        output_desc.dims.clone(),
         output_dram,
         context,
         "reduce",
@@ -2988,602 +2910,6 @@ fn lazy_reshape_ids(plan: &executable::Executable) -> HashSet<u32> {
         .collect()
 }
 
-fn runtime_fusion_analysis(plan: &executable::Executable) -> RuntimeFusionAnalysis {
-    let mut analysis = RuntimeFusionAnalysis::empty();
-    let mut producers = HashMap::new();
-    let mut consumers = HashMap::<u32, Vec<usize>>::new();
-    let mut packed_constants = HashMap::new();
-    for (op_index, op) in plan.ops.iter().enumerate() {
-        for output_id in op_output_ids(op) {
-            producers.insert(output_id, op_index);
-            if let executable::Op::Constant {
-                packed_value,
-                data,
-                output_id,
-            } = op
-            {
-                if data.is_empty() {
-                    packed_constants.insert(*output_id, *packed_value);
-                }
-            }
-        }
-        for input_id in op_input_ids(op) {
-            consumers.entry(input_id).or_default().push(op_index);
-        }
-    }
-
-    let mut square_outputs = HashMap::<u32, SquareFusedInput>::new();
-    for op in &plan.ops {
-        let executable::Op::FusedElementwise {
-            input_ids,
-            output_id,
-            nodes,
-        } = op
-        else {
-            continue;
-        };
-        if let Some(fusion) = fused_square_input(plan, &producers, &consumers, input_ids, nodes) {
-            square_outputs.insert(*output_id, fusion);
-        }
-    }
-
-    for (square_output_id, fusion) in square_outputs {
-        let mut skipped_reshape_outputs = Vec::new();
-        let Some(reduce_input_id) = skip_reshape_consumers(
-            plan,
-            &consumers,
-            square_output_id,
-            &mut skipped_reshape_outputs,
-        ) else {
-            continue;
-        };
-        let Some(reduce_op_index) = single_consumer_index(&consumers, reduce_input_id) else {
-            continue;
-        };
-        if matches!(
-            &plan.ops[reduce_op_index],
-            executable::Op::Reduce {
-                input_ids,
-                reducer: executable::ReduceReducer::Add,
-                ..
-            } if input_ids.first() == Some(&reduce_input_id)
-        ) {
-            analysis
-                .square_reduce_inputs
-                .insert(reduce_input_id, fusion.input_id);
-            analysis.skipped_fused_outputs.insert(square_output_id);
-            analysis
-                .skipped_fused_outputs
-                .extend(fusion.skipped_fused_outputs);
-            analysis
-                .skipped_reshape_outputs
-                .extend(skipped_reshape_outputs);
-        }
-    }
-
-    for (op_index, op) in plan.ops.iter().enumerate() {
-        let executable::Op::Reduce {
-            input_ids,
-            output_id,
-            dimensions,
-            reducer: executable::ReduceReducer::Add,
-            ..
-        } = op
-        else {
-            continue;
-        };
-        if dimensions.len() != 1
-            || !input_ids
-                .first()
-                .is_some_and(|id| analysis.square_reduce_inputs.contains_key(id))
-        {
-            continue;
-        }
-        if let Some(fusion) = detect_reduce_post_rsqrt(
-            plan,
-            &consumers,
-            &producers,
-            &packed_constants,
-            *output_id,
-            op_index,
-        ) {
-            analysis
-                .skipped_fused_outputs
-                .extend(fusion.skipped_fused_outputs);
-            analysis
-                .skipped_reshape_outputs
-                .extend(fusion.skipped_reshape_outputs);
-            analysis.reduce_post_rsqrt.insert(
-                *output_id,
-                RuntimeReducePostRsqrt {
-                    final_output_id: fusion.final_output_id,
-                    scale_bits: fusion.scale_bits,
-                    bias_bits: fusion.bias_bits,
-                },
-            );
-        }
-    }
-
-    analysis
-}
-
-struct SquareFusedInput {
-    input_id: u32,
-    skipped_fused_outputs: Vec<u32>,
-}
-
-struct ReducePostRsqrtFusion {
-    final_output_id: u32,
-    scale_bits: u32,
-    bias_bits: u32,
-    skipped_fused_outputs: Vec<u32>,
-    skipped_reshape_outputs: Vec<u32>,
-}
-
-enum FusedArg {
-    External(u32),
-    Constant(u32, PJRT_Buffer_Type),
-}
-
-fn fused_square_input(
-    plan: &executable::Executable,
-    producers: &HashMap<u32, usize>,
-    consumers: &HashMap<u32, Vec<usize>>,
-    input_ids: &[u32],
-    nodes: &[executable::FusedElementwiseNode],
-) -> Option<SquareFusedInput> {
-    let root = nodes.last()?;
-    if root.kind != executable::FusedElementwiseKind::Multiply || root.input_nodes.len() != 2 {
-        return None;
-    }
-    let lhs_node = root.input_nodes[0] as usize;
-    let rhs_node = root.input_nodes[1] as usize;
-    if let (Some(lhs), Some(rhs)) = (
-        fused_external_input(input_ids, nodes, lhs_node),
-        fused_external_input(input_ids, nodes, rhs_node),
-    ) {
-        if lhs != rhs {
-            return None;
-        }
-        return converted_square_input(plan, producers, consumers, lhs).or_else(|| {
-            Some(SquareFusedInput {
-                input_id: lhs,
-                skipped_fused_outputs: Vec::new(),
-            })
-        });
-    }
-    let lhs = fused_convert_external_input(input_ids, nodes, lhs_node)?;
-    let rhs = fused_convert_external_input(input_ids, nodes, rhs_node)?;
-    if lhs != rhs || !is_bf16_to_f32_value(plan, lhs, root.element_type)? {
-        return None;
-    }
-    Some(SquareFusedInput {
-        input_id: lhs,
-        skipped_fused_outputs: Vec::new(),
-    })
-}
-
-fn fused_external_input(
-    input_ids: &[u32],
-    nodes: &[executable::FusedElementwiseNode],
-    node_index: usize,
-) -> Option<u32> {
-    let node = nodes.get(node_index)?;
-    (node.kind == executable::FusedElementwiseKind::Input)
-        .then(|| input_ids.get(node.input_index as usize).copied())
-        .flatten()
-}
-
-fn fused_convert_external_input(
-    input_ids: &[u32],
-    nodes: &[executable::FusedElementwiseNode],
-    node_index: usize,
-) -> Option<u32> {
-    let node = nodes.get(node_index)?;
-    if node.kind != executable::FusedElementwiseKind::Convert || node.input_nodes.len() != 1 {
-        return None;
-    }
-    let input_id = fused_external_input(input_ids, nodes, node.input_nodes[0] as usize)?;
-    (node.element_type == PJRT_Buffer_Type::PJRT_Buffer_Type_F32).then_some(input_id)
-}
-
-fn converted_square_input(
-    plan: &executable::Executable,
-    producers: &HashMap<u32, usize>,
-    consumers: &HashMap<u32, Vec<usize>>,
-    value_id: u32,
-) -> Option<SquareFusedInput> {
-    if consumers.get(&value_id)?.len() != 1 {
-        return None;
-    }
-    let op = producers
-        .get(&value_id)
-        .and_then(|&index| plan.ops.get(index))?;
-    let executable::Op::FusedElementwise {
-        input_ids,
-        output_id,
-        nodes,
-    } = op
-    else {
-        return None;
-    };
-    if *output_id != value_id {
-        return None;
-    }
-    let root = nodes.last()?;
-    if root.kind != executable::FusedElementwiseKind::Convert || root.input_nodes.len() != 1 {
-        return None;
-    }
-    let input_id = fused_external_input(input_ids, nodes, root.input_nodes[0] as usize)?;
-    if !is_bf16_to_f32_value(plan, input_id, root.element_type)? {
-        return None;
-    }
-    Some(SquareFusedInput {
-        input_id,
-        skipped_fused_outputs: vec![value_id],
-    })
-}
-
-fn is_bf16_to_f32_value(
-    plan: &executable::Executable,
-    input_id: u32,
-    output_type: PJRT_Buffer_Type,
-) -> Option<bool> {
-    let input = plan.values.get(input_id as usize)?;
-    Some(
-        input.element_type == PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-            && output_type == PJRT_Buffer_Type::PJRT_Buffer_Type_F32,
-    )
-}
-
-fn detect_reduce_post_rsqrt(
-    plan: &executable::Executable,
-    consumers: &HashMap<u32, Vec<usize>>,
-    producers: &HashMap<u32, usize>,
-    packed_constants: &HashMap<u32, u32>,
-    reduce_output_id: u32,
-    reduce_op_index: usize,
-) -> Option<ReducePostRsqrtFusion> {
-    let reduce_output_desc = plan.values.get(reduce_output_id as usize)?;
-    if reduce_output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_F32 {
-        return None;
-    }
-
-    let mut skipped_fused_outputs = Vec::new();
-    let mut skipped_reshape_outputs = Vec::new();
-    let current = skip_reshape_consumers(
-        plan,
-        consumers,
-        reduce_output_id,
-        &mut skipped_reshape_outputs,
-    )?;
-
-    let (scaled_id, scale_bits) = match_scale_fused_consumer(
-        plan,
-        consumers,
-        producers,
-        packed_constants,
-        current,
-        reduce_op_index,
-    )?;
-    skipped_fused_outputs.push(scaled_id);
-    let current = skip_reshape_consumers(plan, consumers, scaled_id, &mut skipped_reshape_outputs)?;
-
-    let (biased_id, bias_bits) =
-        match_add_scalar_fused_consumer(plan, consumers, producers, packed_constants, current)?;
-    skipped_fused_outputs.push(biased_id);
-    let current = skip_reshape_consumers(plan, consumers, biased_id, &mut skipped_reshape_outputs)?;
-
-    let rsqrt_id = match_unary_fused_consumer(
-        plan,
-        consumers,
-        current,
-        executable::FusedElementwiseKind::Rsqrt,
-    )?;
-    skipped_fused_outputs.push(rsqrt_id);
-    let final_output_id =
-        skip_reshape_consumers(plan, consumers, rsqrt_id, &mut skipped_reshape_outputs)?;
-
-    Some(ReducePostRsqrtFusion {
-        final_output_id,
-        scale_bits,
-        bias_bits,
-        skipped_fused_outputs,
-        skipped_reshape_outputs,
-    })
-}
-
-fn skip_reshape_consumers(
-    plan: &executable::Executable,
-    consumers: &HashMap<u32, Vec<usize>>,
-    mut value_id: u32,
-    skipped_outputs: &mut Vec<u32>,
-) -> Option<u32> {
-    loop {
-        let Some(op_index) = single_consumer_index(consumers, value_id) else {
-            return Some(value_id);
-        };
-        let executable::Op::Reshape {
-            input_id,
-            output_id,
-        } = &plan.ops[op_index]
-        else {
-            return Some(value_id);
-        };
-        if *input_id != value_id || !same_tiled_layout(plan, value_id, *output_id)? {
-            return None;
-        }
-        skipped_outputs.push(*output_id);
-        value_id = *output_id;
-    }
-}
-
-fn single_consumer_index(consumers: &HashMap<u32, Vec<usize>>, value_id: u32) -> Option<usize> {
-    match consumers.get(&value_id)?.as_slice() {
-        [index] => Some(*index),
-        _ => None,
-    }
-}
-
-fn same_tiled_layout(plan: &executable::Executable, lhs_id: u32, rhs_id: u32) -> Option<bool> {
-    let lhs = plan.values.get(lhs_id as usize)?;
-    let rhs = plan.values.get(rhs_id as usize)?;
-    if lhs.element_type != rhs.element_type {
-        return Some(false);
-    }
-    let lhs_shape = dims_i64_to_usize(&lhs.dims).ok()?;
-    let rhs_shape = dims_i64_to_usize(&rhs.dims).ok()?;
-    reshape_preserves_tiled_layout(&lhs_shape, &rhs_shape).ok()
-}
-
-fn match_scale_fused_consumer(
-    plan: &executable::Executable,
-    consumers: &HashMap<u32, Vec<usize>>,
-    producers: &HashMap<u32, usize>,
-    packed_constants: &HashMap<u32, u32>,
-    input_id: u32,
-    reduce_op_index: usize,
-) -> Option<(u32, u32)> {
-    let op_index = single_consumer_index(consumers, input_id)?;
-    if op_index == reduce_op_index {
-        return None;
-    }
-    let executable::Op::FusedElementwise {
-        input_ids,
-        output_id,
-        nodes,
-    } = &plan.ops[op_index]
-    else {
-        return None;
-    };
-    let root = nodes.last()?;
-    if root.input_nodes.len() != 2 {
-        return None;
-    }
-    let lhs = fused_arg(input_ids, nodes, root.input_nodes[0] as usize)?;
-    let rhs = fused_arg(input_ids, nodes, root.input_nodes[1] as usize)?;
-    let lhs_external = fused_external_id(&lhs);
-    let rhs_external = fused_external_id(&rhs);
-    let lhs_constant = fused_constant_bits_with_producers(plan, producers, packed_constants, &lhs);
-    let rhs_constant = fused_constant_bits_with_producers(plan, producers, packed_constants, &rhs);
-    match root.kind {
-        executable::FusedElementwiseKind::Divide
-            if lhs_external == Some(input_id)
-                && rhs_constant
-                    .is_some_and(|(_, ty)| ty == PJRT_Buffer_Type::PJRT_Buffer_Type_F32) =>
-        {
-            let divisor = f32::from_bits(rhs_constant?.0);
-            divisor
-                .is_finite()
-                .then_some((*output_id, (1.0f32 / divisor).to_bits()))
-        }
-        executable::FusedElementwiseKind::Multiply
-            if lhs_external == Some(input_id)
-                && rhs_constant
-                    .is_some_and(|(_, ty)| ty == PJRT_Buffer_Type::PJRT_Buffer_Type_F32) =>
-        {
-            Some((*output_id, rhs_constant?.0))
-        }
-        executable::FusedElementwiseKind::Multiply
-            if rhs_external == Some(input_id)
-                && lhs_constant
-                    .is_some_and(|(_, ty)| ty == PJRT_Buffer_Type::PJRT_Buffer_Type_F32) =>
-        {
-            Some((*output_id, lhs_constant?.0))
-        }
-        _ => None,
-    }
-}
-
-fn match_add_scalar_fused_consumer(
-    plan: &executable::Executable,
-    consumers: &HashMap<u32, Vec<usize>>,
-    producers: &HashMap<u32, usize>,
-    packed_constants: &HashMap<u32, u32>,
-    input_id: u32,
-) -> Option<(u32, u32)> {
-    let op_index = single_consumer_index(consumers, input_id)?;
-    let executable::Op::FusedElementwise {
-        input_ids,
-        output_id,
-        nodes,
-    } = &plan.ops[op_index]
-    else {
-        return None;
-    };
-    let root = nodes.last()?;
-    if root.kind != executable::FusedElementwiseKind::Add || root.input_nodes.len() != 2 {
-        return None;
-    }
-    let lhs = fused_arg(input_ids, nodes, root.input_nodes[0] as usize)?;
-    let rhs = fused_arg(input_ids, nodes, root.input_nodes[1] as usize)?;
-    let lhs_external = fused_external_id(&lhs);
-    let rhs_external = fused_external_id(&rhs);
-    let lhs_constant = fused_constant_bits_with_producers(plan, producers, packed_constants, &lhs);
-    let rhs_constant = fused_constant_bits_with_producers(plan, producers, packed_constants, &rhs);
-    if lhs_external == Some(input_id)
-        && rhs_constant.is_some_and(|(_, ty)| ty == PJRT_Buffer_Type::PJRT_Buffer_Type_F32)
-    {
-        return Some((*output_id, rhs_constant?.0));
-    }
-    if rhs_external == Some(input_id)
-        && lhs_constant.is_some_and(|(_, ty)| ty == PJRT_Buffer_Type::PJRT_Buffer_Type_F32)
-    {
-        return Some((*output_id, lhs_constant?.0));
-    }
-    None
-}
-
-fn match_unary_fused_consumer(
-    plan: &executable::Executable,
-    consumers: &HashMap<u32, Vec<usize>>,
-    input_id: u32,
-    kind: executable::FusedElementwiseKind,
-) -> Option<u32> {
-    let op_index = single_consumer_index(consumers, input_id)?;
-    let executable::Op::FusedElementwise {
-        input_ids,
-        output_id,
-        nodes,
-    } = &plan.ops[op_index]
-    else {
-        return None;
-    };
-    let root = nodes.last()?;
-    if root.kind != kind || root.input_nodes.len() != 1 {
-        return None;
-    }
-    match fused_arg(input_ids, nodes, root.input_nodes[0] as usize)? {
-        FusedArg::External(external_id) if external_id == input_id => Some(*output_id),
-        _ => None,
-    }
-}
-
-fn fused_arg(
-    input_ids: &[u32],
-    nodes: &[executable::FusedElementwiseNode],
-    node_index: usize,
-) -> Option<FusedArg> {
-    let node = nodes.get(node_index)?;
-    match node.kind {
-        executable::FusedElementwiseKind::Input => input_ids
-            .get(node.input_index as usize)
-            .copied()
-            .map(FusedArg::External),
-        executable::FusedElementwiseKind::Constant => {
-            Some(FusedArg::Constant(node.packed_value, node.element_type))
-        }
-        _ => None,
-    }
-}
-
-fn fused_external_id(arg: &FusedArg) -> Option<u32> {
-    match arg {
-        FusedArg::External(id) => Some(*id),
-        FusedArg::Constant(_, _) => None,
-    }
-}
-
-fn fused_constant_bits_with_producers(
-    plan: &executable::Executable,
-    producers: &HashMap<u32, usize>,
-    packed_constants: &HashMap<u32, u32>,
-    arg: &FusedArg,
-) -> Option<(u32, PJRT_Buffer_Type)> {
-    match arg {
-        FusedArg::Constant(bits, element_type) => Some((*bits, *element_type)),
-        FusedArg::External(id) => constant_value_bits(plan, producers, packed_constants, *id),
-    }
-}
-
-fn constant_value_bits(
-    plan: &executable::Executable,
-    producers: &HashMap<u32, usize>,
-    packed_constants: &HashMap<u32, u32>,
-    value_id: u32,
-) -> Option<(u32, PJRT_Buffer_Type)> {
-    if let Some(bits) = packed_constants.get(&value_id).copied() {
-        let desc = plan.values.get(value_id as usize)?;
-        return Some((bits, desc.element_type));
-    }
-    match producers
-        .get(&value_id)
-        .and_then(|&index| plan.ops.get(index))?
-    {
-        executable::Op::BroadcastInDim { input_id, .. }
-        | executable::Op::Reshape { input_id, .. } => {
-            constant_value_bits(plan, producers, packed_constants, *input_id)
-        }
-        _ => None,
-    }
-}
-
-fn op_output_ids(op: &executable::Op) -> Vec<u32> {
-    match op {
-        executable::Op::Parameter { output_id, .. }
-        | executable::Op::Concatenate { output_id, .. }
-        | executable::Op::Reshape { output_id, .. }
-        | executable::Op::Slice { output_id, .. }
-        | executable::Op::Transpose { output_id, .. }
-        | executable::Op::CustomCall { output_id, .. }
-        | executable::Op::Reduce { output_id, .. }
-        | executable::Op::ReduceWindow { output_id, .. }
-        | executable::Op::Matmul { output_id, .. }
-        | executable::Op::Constant { output_id, .. }
-        | executable::Op::Select { output_id, .. }
-        | executable::Op::BroadcastInDim { output_id, .. }
-        | executable::Op::Gather { output_id, .. }
-        | executable::Op::Scatter { output_id, .. }
-        | executable::Op::Iota { output_id, .. }
-        | executable::Op::FusedElementwise { output_id, .. }
-        | executable::Op::SdpaDecode { output_id, .. }
-        | executable::Op::RmsNorm { output_id, .. } => vec![*output_id],
-        executable::Op::TopK {
-            values_id,
-            indices_id,
-            ..
-        } => vec![*values_id, *indices_id],
-    }
-}
-
-fn op_input_ids(op: &executable::Op) -> Vec<u32> {
-    match op {
-        executable::Op::Parameter { .. }
-        | executable::Op::Constant { .. }
-        | executable::Op::Iota { .. } => Vec::new(),
-        executable::Op::Reshape { input_id, .. }
-        | executable::Op::Slice { input_id, .. }
-        | executable::Op::Transpose { input_id, .. }
-        | executable::Op::BroadcastInDim { input_id, .. }
-        | executable::Op::TopK { input_id, .. } => vec![*input_id],
-        executable::Op::Concatenate { input_ids, .. }
-        | executable::Op::CustomCall { input_ids, .. }
-        | executable::Op::FusedElementwise { input_ids, .. } => input_ids.clone(),
-        executable::Op::Reduce {
-            input_ids,
-            init_value_ids,
-            ..
-        }
-        | executable::Op::ReduceWindow {
-            input_ids,
-            init_value_ids,
-            ..
-        } => input_ids
-            .iter()
-            .chain(init_value_ids.iter())
-            .copied()
-            .collect(),
-        executable::Op::Matmul { input_ids, .. } | executable::Op::Gather { input_ids, .. } => {
-            input_ids.to_vec()
-        }
-        executable::Op::Scatter { input_ids, .. } | executable::Op::Select { input_ids, .. } => {
-            input_ids.to_vec()
-        }
-        executable::Op::SdpaDecode { input_ids, .. } => input_ids.to_vec(),
-        executable::Op::RmsNorm { input_ids, .. } => input_ids.to_vec(),
-    }
-}
-
 fn execute_select(
     values: &mut [Option<PJRT_Buffer>],
     plan: &executable::Executable,
@@ -4196,24 +3522,14 @@ fn execute_executable_v1(
             executable::Op::Reshape {
                 input_id,
                 output_id,
-            } => {
-                if output_context
-                    .fusion_analysis
-                    .skipped_reshape_outputs
-                    .contains(output_id)
-                {
-                    Ok(())
-                } else {
-                    execute_reshape(
-                        &mut values,
-                        plan,
-                        device,
-                        output_context,
-                        *input_id,
-                        *output_id,
-                    )
-                }
-            }?,
+            } => execute_reshape(
+                &mut values,
+                plan,
+                device,
+                output_context,
+                *input_id,
+                *output_id,
+            )?,
             executable::Op::Slice {
                 input_id,
                 output_id,
@@ -4403,25 +3719,15 @@ fn execute_executable_v1(
                 input_ids,
                 output_id,
                 nodes,
-            } => {
-                if output_context
-                    .fusion_analysis
-                    .skipped_fused_outputs
-                    .contains(output_id)
-                {
-                    Ok(())
-                } else {
-                    execute_fused_elementwise(
-                        &mut values,
-                        plan,
-                        device,
-                        output_context,
-                        input_ids,
-                        *output_id,
-                        nodes,
-                    )
-                }
-            }?,
+            } => execute_fused_elementwise(
+                &mut values,
+                plan,
+                device,
+                output_context,
+                input_ids,
+                *output_id,
+                nodes,
+            )?,
             executable::Op::SdpaDecode {
                 input_ids,
                 output_id,
@@ -4520,7 +3826,6 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
         memory: target_device.default_memory,
         local_hardware_id: target_local_hardware_id,
         lazy_reshape_ids: &executable.metadata.lazy_reshape_ids,
-        fusion_analysis: &executable.metadata.fusion_analysis,
     };
     let output_buffers = {
         let _guard = match target_device.runtime_lock.lock() {

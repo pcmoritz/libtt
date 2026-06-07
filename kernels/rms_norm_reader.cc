@@ -6,6 +6,16 @@ constexpr uint32_t TILE_R = 32;
 constexpr uint32_t TILE_C = 32;
 constexpr uint32_t FACE_ELEMENTS = 16 * 16;
 constexpr uint32_t BF16_ONE_BITS = 0x3f80u;
+
+uint32_t tile_element_index(uint32_t row, uint32_t col) {
+  uint32_t face_row = row / 16;
+  uint32_t face_col = col / 16;
+  uint32_t row_in_face = row % 16;
+  uint32_t col_in_face = col % 16;
+  return ((face_row * 2 + face_col) * FACE_ELEMENTS) + row_in_face * 16 +
+         col_in_face;
+}
+
 void fill_bf16_tile(uint32_t cb, uint32_t value_bits) {
   volatile tt_l1_ptr uint16_t *ptr =
       reinterpret_cast<volatile tt_l1_ptr uint16_t *>(get_write_ptr(cb));
@@ -17,24 +27,36 @@ void fill_bf16_tile(uint32_t cb, uint32_t value_bits) {
 }
 
 void zero_padded_rows(uint32_t tile_addr) {
-  static_assert(RMS_NORM_VALID_ROWS == 1,
-                "rms_norm reader is specialized for decode rows == 1");
-  volatile tt_l1_ptr uint32_t *tile =
-      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(tile_addr);
+  static_assert(RMS_NORM_VALID_ROWS > 0 && RMS_NORM_VALID_ROWS <= TILE_R,
+                "rms_norm valid rows must fit in one tile");
+  if constexpr (RMS_NORM_VALID_ROWS == TILE_R) {
+    return;
+  } else if constexpr (RMS_NORM_VALID_ROWS == 1) {
+    volatile tt_l1_ptr uint32_t *tile =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t *>(tile_addr);
 
-  // Tile layout stores 16x16 faces contiguously. For a single valid row, keep
-  // row 0 in the two top faces and zero the rest with contiguous 32-bit stores.
-  constexpr uint32_t face_words = FACE_ELEMENTS / 2;
-  constexpr uint32_t valid_row_words_per_face = 16 / 2;
-  for (uint32_t face = 0; face < 2; ++face) {
-    uint32_t start = face * face_words + valid_row_words_per_face;
-    uint32_t end = (face + 1) * face_words;
-    for (uint32_t word = start; word < end; ++word) {
+    // Tile layout stores 16x16 faces contiguously. For a single valid row, keep
+    // row 0 in the two top faces and zero the rest with contiguous 32-bit stores.
+    constexpr uint32_t face_words = FACE_ELEMENTS / 2;
+    constexpr uint32_t valid_row_words_per_face = 16 / 2;
+    for (uint32_t face = 0; face < 2; ++face) {
+      uint32_t start = face * face_words + valid_row_words_per_face;
+      uint32_t end = (face + 1) * face_words;
+      for (uint32_t word = start; word < end; ++word) {
+        tile[word] = 0;
+      }
+    }
+    for (uint32_t word = 2 * face_words; word < 4 * face_words; ++word) {
       tile[word] = 0;
     }
-  }
-  for (uint32_t word = 2 * face_words; word < 4 * face_words; ++word) {
-    tile[word] = 0;
+  } else {
+    volatile tt_l1_ptr uint16_t *tile =
+        reinterpret_cast<volatile tt_l1_ptr uint16_t *>(tile_addr);
+    for (uint32_t row = RMS_NORM_VALID_ROWS; row < TILE_R; ++row) {
+      for (uint32_t col = 0; col < TILE_C; ++col) {
+        tile[tile_element_index(row, col)] = 0;
+      }
+    }
   }
 }
 
