@@ -1,8 +1,6 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, Program};
-use crate::dram::{
-    tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C, TILE_R,
-};
+use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, TILE_C};
 use crate::executable::{
     BitwiseBinaryKind, CompareDirection, FusedElementwiseKind, FusedElementwiseNode,
 };
@@ -577,7 +575,6 @@ struct RmsNormProgramKey {
     cores: Vec<CoreCoord>,
     width_tiles: u32,
     group_count: u32,
-    valid_rows: u32,
     scale_bits: u32,
     bias_bits: u32,
 }
@@ -732,9 +729,12 @@ pub(crate) fn rms_norm(
     let rank = allocation_shape.len();
     let width_tiles = allocation_shape[rank - 1] / TILE_C;
     let rows = output_shape[rank - 2];
-    if rows == 0 || rows > TILE_R {
+    if rows == 0 {
+        return Err(invalid_input("rms_norm requires nonzero rows"));
+    }
+    if hidden == 0 || hidden % TILE_C != 0 {
         return Err(invalid_input(format!(
-            "rms_norm fused kernel supports 1..={TILE_R} rows per tile group, got {rows}"
+            "rms_norm fused kernel requires hidden size to be a multiple of {TILE_C}, got {hidden}"
         )));
     }
     if width_tiles == 0 {
@@ -748,7 +748,6 @@ pub(crate) fn rms_norm(
     let group_count = output_tiles / width_tiles;
     let group_count_u32 = u32_arg(group_count, "rms_norm group count")?;
     let width_tiles_u32 = u32_arg(width_tiles, "rms_norm width tiles")?;
-    let valid_rows_u32 = u32_arg(rows, "rms_norm valid rows")?;
     let cores = select_worker_cores(device.cores_ref(), group_count)?;
     let output = device.alloc(output_tiles, DType::Float16B, &allocation_shape, name)?;
     let kernel = RmsNormKernel {
@@ -759,7 +758,6 @@ pub(crate) fn rms_norm(
             cores,
             width_tiles: width_tiles_u32,
             group_count: group_count_u32,
-            valid_rows: valid_rows_u32,
             scale_bits,
             bias_bits,
         },
@@ -1009,7 +1007,7 @@ fn rms_norm_program(key: RmsNormProgramKey) -> io::Result<Program> {
             dst_full_sync: true,
             ..CompileConfig::default()
         },
-        name: format!("rms_norm_{}_rows_{}", key.width_tiles, key.valid_rows),
+        name: format!("rms_norm_{}", key.width_tiles),
         ..Program::new(runtime_args)
     })
 }
@@ -1033,8 +1031,8 @@ fn fused_leaf_nodes<'a>(
 
 fn rms_norm_reader_source(key: &RmsNormProgramKey) -> io::Result<String> {
     Ok(format!(
-        "#define RMS_NORM_WIDTH_TILES {}\n#define RMS_NORM_VALID_ROWS {}\n{RMS_NORM_READER}",
-        key.width_tiles, key.valid_rows
+        "#define RMS_NORM_WIDTH_TILES {}\n{RMS_NORM_READER}",
+        key.width_tiles
     ))
 }
 

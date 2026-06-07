@@ -13,7 +13,7 @@
 namespace libtt::mlir_frontend {
 namespace {
 
-constexpr int64_t kTileRows = 32;
+constexpr int64_t kTileCols = 32;
 
 struct RmsNormComponents {
   mlir::Value input;
@@ -342,10 +342,13 @@ matchRmsNorm(mlir::stablehlo::ConvertOp rootConvert) {
     return std::nullopt;
   }
   int64_t rows = outputType->getDimSize(outputType->getRank() - 2);
-  if (rows < 1 || rows > kTileRows) {
+  if (rows < 1) {
     return std::nullopt;
   }
   int64_t hidden = outputType->getDimSize(outputType->getRank() - 1);
+  if (hidden < 1 || hidden % kTileCols != 0) {
+    return std::nullopt;
+  }
 
   auto rootMul = peelIdentityCustomCalls(rootConvert.getOperand())
                      .getDefiningOp<mlir::stablehlo::MulOp>();
