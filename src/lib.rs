@@ -94,7 +94,6 @@ pub struct PJRT_Buffer {
     local_hardware_id: usize,
     dram_buffer: Option<DramBuffer>,
     source_shape: Option<Vec<usize>>,
-    dependencies: Vec<DramBuffer>,
     deleted: bool,
 }
 
@@ -1662,30 +1661,6 @@ fn store_output_buffer_with_source_shape(
     context: &OutputContext,
     op: &str,
 ) -> Result<(), *mut PJRT_Error> {
-    store_output_buffer_with_source_shape_and_dependencies(
-        values,
-        plan,
-        output_id,
-        expected_dims,
-        dram_buffer,
-        source_shape,
-        Vec::new(),
-        context,
-        op,
-    )
-}
-
-fn store_output_buffer_with_source_shape_and_dependencies(
-    values: &mut [Option<PJRT_Buffer>],
-    plan: &executable::Executable,
-    output_id: u32,
-    expected_dims: Vec<i64>,
-    dram_buffer: DramBuffer,
-    source_shape: Option<Vec<usize>>,
-    dependencies: Vec<DramBuffer>,
-    context: &OutputContext,
-    op: &str,
-) -> Result<(), *mut PJRT_Error> {
     let output_index = output_id as usize;
     let expected = plan.values.get(output_index).ok_or_else(|| {
         invalid_argument(format!(
@@ -1733,7 +1708,6 @@ fn store_output_buffer_with_source_shape_and_dependencies(
         local_hardware_id: context.local_hardware_id,
         dram_buffer: Some(dram_buffer),
         source_shape,
-        dependencies,
         deleted: false,
     });
     Ok(())
@@ -3986,7 +3960,6 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         local_hardware_id,
         dram_buffer: Some(dram_buffer),
         source_shape: None,
-        dependencies: Vec::new(),
         deleted: false,
     }));
     ptr::null_mut()
