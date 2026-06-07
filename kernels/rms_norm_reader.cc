@@ -46,7 +46,6 @@ void kernel_main() {
   for (uint32_t group = 0; group < group_count; ++group) {
     uint32_t base_tile = (group_offset + group) * width_tiles;
     uint32_t input_tile_bytes = get_tile_size(cb_input);
-    uint32_t weight_tile_bytes = get_tile_size(cb_weight);
 
     cb_reserve_back(cb_input, width_tiles);
     uint32_t input_write_ptr = get_write_ptr(cb_input);
@@ -57,12 +56,16 @@ void kernel_main() {
     noc_async_read_barrier();
     cb_push_back(cb_input, width_tiles);
 
-    cb_reserve_back(cb_weight, width_tiles);
-    uint32_t weight_write_ptr = get_write_ptr(cb_weight);
-    for (uint32_t wt = 0; wt < width_tiles; ++wt) {
-      noc_async_read_tile(wt, weight, weight_write_ptr + wt * weight_tile_bytes);
+    if (group == 0) {
+      cb_reserve_back(cb_weight, width_tiles);
+      uint32_t weight_write_ptr = get_write_ptr(cb_weight);
+      uint32_t weight_tile_bytes = get_tile_size(cb_weight);
+      for (uint32_t wt = 0; wt < width_tiles; ++wt) {
+        noc_async_read_tile(wt, weight,
+                            weight_write_ptr + wt * weight_tile_bytes);
+      }
+      noc_async_read_barrier();
+      cb_push_back(cb_weight, width_tiles);
     }
-    noc_async_read_barrier();
-    cb_push_back(cb_weight, width_tiles);
   }
 }

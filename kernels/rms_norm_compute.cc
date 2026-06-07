@@ -142,10 +142,10 @@ void MAIN {
     apply_scale_and_weight();
 
     cb_pop_front(cb_scale, onetile);
-    cb_pop_front(cb_weight, width_tiles);
     cb_pop_front(cb_input, width_tiles);
   }
 
+  cb_pop_front(cb_weight, width_tiles);
   cb_pop_front(cb_scaler, onetile);
 }
 
