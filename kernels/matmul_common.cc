@@ -264,8 +264,8 @@ void fill_tile_transpose_tile_impl(const InterleavedAddrGenFast<true> &input,
 
   uint32_t indices[MAX_RANK] = {};
   decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
-  indices[view.col_dims[0]] = col_base;
-  indices[view.row_dims[0]] = row_base;
+  indices[view.col_dims[0]] = col_tile * TILE_C;
+  indices[view.row_dims[0]] = row_tile * TILE_R;
 
   uint32_t source_row_base = 0;
   uint32_t source_col_base = 0;
@@ -299,5 +299,66 @@ void fill_tile_transpose_tile(const InterleavedAddrGenFast<true> &input, const V
     fill_tile_transpose_tile_impl<sizeof(uint16_t)>(
         input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
   }
+}
+
+uint32_t full_tile_transpose_source_tile(const View &view, uint32_t batch,
+                                         uint32_t row_tile, uint32_t col_tile) {
+  uint32_t indices[MAX_RANK] = {};
+  decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
+  indices[view.col_dims[0]] = col_tile * TILE_C;
+  indices[view.row_dims[0]] = row_tile * TILE_R;
+
+  uint32_t source_row = 0;
+  uint32_t source_col = 0;
+  return tile_id_for_indices(view, indices, &source_row, &source_col);
+}
+
+bool is_full_tile_transpose_tile(const View &view, uint32_t row_tile, uint32_t col_tile) {
+  return (row_tile + 1) * TILE_R <= view.logical_rows &&
+         (col_tile + 1) * TILE_C <= view.logical_cols;
+}
+
+void fill_tile_transpose_block(const InterleavedAddrGenFast<true> &input, const View &view,
+                               uint32_t batch, uint32_t canonical_base,
+                               uint32_t canonical_stride, uint32_t block_h,
+                               uint32_t block_w, uint32_t dst_addr,
+                               uint32_t tile_bytes, uint32_t cb_source) {
+  bool all_full_tiles = true;
+  for (uint32_t h = 0; h < block_h; ++h) {
+    for (uint32_t w = 0; w < block_w; ++w) {
+      uint32_t canonical_tile = canonical_base + h * canonical_stride + w;
+      uint32_t row_tile = canonical_tile / canonical_stride;
+      uint32_t col_tile = canonical_tile - row_tile * canonical_stride;
+      all_full_tiles &= is_full_tile_transpose_tile(view, row_tile, col_tile);
+    }
+  }
+
+  if (!all_full_tiles) {
+    uint32_t l1_addr = dst_addr;
+    for (uint32_t h = 0; h < block_h; ++h) {
+      for (uint32_t w = 0; w < block_w; ++w) {
+        uint32_t canonical_tile = canonical_base + h * canonical_stride + w;
+        uint32_t row_tile = canonical_tile / canonical_stride;
+        uint32_t col_tile = canonical_tile - row_tile * canonical_stride;
+        fill_tile_transpose_tile(
+            input, view, batch, row_tile, col_tile, l1_addr, tile_bytes, cb_source);
+        l1_addr += tile_bytes;
+      }
+    }
+    return;
+  }
+
+  for (uint32_t w = 0; w < block_w; ++w) {
+    for (uint32_t h = 0; h < block_h; ++h) {
+      uint32_t canonical_tile = canonical_base + h * canonical_stride + w;
+      uint32_t row_tile = canonical_tile / canonical_stride;
+      uint32_t col_tile = canonical_tile - row_tile * canonical_stride;
+      uint32_t source_tile =
+          full_tile_transpose_source_tile(view, batch, row_tile, col_tile);
+      uint32_t l1_addr = dst_addr + (h * block_w + w) * tile_bytes;
+      noc_async_read_tile(source_tile, input, l1_addr);
+    }
+  }
+  noc_async_read_barrier();
 }
 }  // namespace
