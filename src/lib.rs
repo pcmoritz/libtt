@@ -23,14 +23,14 @@ use dram::{allocator_stats, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, Once, OnceLock};
 
 include!("pjrt_bindings.rs");
 
@@ -1742,6 +1742,30 @@ fn execute_constant(
     let dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let logical_shape = dims_i64_to_usize(&output_desc.dims)?;
     let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
+    let splat_cache_key = logical_data.is_empty().then(|| ConstantSplatCacheKey {
+        local_hardware_id: device.local_hardware_id,
+        dtype,
+        packed_value,
+        allocation_shape: allocation_shape.clone(),
+    });
+    if let Some(key) = &splat_cache_key {
+        if let Some(output_dram) = constant_splat_cache()
+            .lock()
+            .map_err(|_| failed_precondition("constant splat cache lock is poisoned"))?
+            .get(key)
+            .cloned()
+        {
+            return store_output_buffer(
+                values,
+                plan,
+                output_id,
+                output_desc.dims.clone(),
+                output_dram,
+                context,
+                "constant",
+            );
+        }
+    }
     let data = if logical_data.is_empty() {
         splat_allocation_data(dtype, packed_value, &allocation_shape)?
     } else {
@@ -1758,6 +1782,12 @@ fn execute_constant(
     let output_dram = device
         .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
         .map_err(io_error)?;
+    if let Some(key) = splat_cache_key {
+        constant_splat_cache()
+            .lock()
+            .map_err(|_| failed_precondition("constant splat cache lock is poisoned"))?
+            .insert(key, output_dram.clone());
+    }
     store_output_buffer(
         values,
         plan,
@@ -1767,6 +1797,19 @@ fn execute_constant(
         context,
         "constant",
     )
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ConstantSplatCacheKey {
+    local_hardware_id: usize,
+    dtype: DType,
+    packed_value: u32,
+    allocation_shape: Vec<usize>,
+}
+
+fn constant_splat_cache() -> &'static Mutex<HashMap<ConstantSplatCacheKey, DramBuffer>> {
+    static CACHE: OnceLock<Mutex<HashMap<ConstantSplatCacheKey, DramBuffer>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn execute_reshape(
@@ -1891,14 +1934,6 @@ fn execute_slice(
 
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let slice_plan = kernels::slice::SlicePlan::new(
-        &input_shape,
-        &output_shape,
-        start_indices,
-        limit_indices,
-        strides,
-    )
-    .map_err(io_error)?;
 
     let input = device_buffer_for_value(values, input_id, "slice.operand")?;
     let Some(input_dram) = input.dram_buffer.as_ref() else {
@@ -1907,6 +1942,58 @@ fn execute_slice(
         ));
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
+    let rank = input_shape.len();
+    if input.source_shape.is_none()
+        && start_indices.len() == rank
+        && limit_indices.len() == rank
+        && strides.len() == rank
+        && strides.iter().all(|&stride| stride == 1)
+        && input_shape.len() == output_shape.len()
+        && rank >= 2
+        && start_indices.iter().all(|&start| start == 0)
+        && input_shape[..input_shape.len() - 1] == output_shape[..output_shape.len() - 1]
+        && limit_indices[..rank - 1]
+            .iter()
+            .zip(&input_shape[..rank - 1])
+            .all(|(&limit, &dim)| usize::try_from(limit).ok() == Some(dim))
+    {
+        let batch = input_shape[..rank - 2]
+            .iter()
+            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+            .ok_or_else(|| invalid_argument("slice prefix batch size overflow"))?;
+        let input_tile_rows = input_shape[rank - 2].div_ceil(dram::TILE_R);
+        if batch == 1
+            && input_tile_rows == 1
+            && output_shape[rank - 1] % dram::TILE_C == 0
+            && usize::try_from(limit_indices[rank - 1]).ok() == Some(output_shape[rank - 1])
+        {
+            let output_tile_count =
+                dram::tiled_shape_tile_count(&output_shape).map_err(io_error)?;
+            if output_tile_count <= input_dram.num_tiles {
+                let mut output_dram = input_dram.clone();
+                output_dram.num_tiles = output_tile_count;
+                output_dram.shape =
+                    dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+                return store_output_buffer(
+                    values,
+                    plan,
+                    output_id,
+                    output_desc.dims.clone(),
+                    output_dram,
+                    context,
+                    "slice",
+                );
+            }
+        }
+    }
+    let slice_plan = kernels::slice::SlicePlan::new(
+        &input_shape,
+        &output_shape,
+        start_indices,
+        limit_indices,
+        strides,
+    )
+    .map_err(io_error)?;
     let output_dram = kernels::slice::slice(device, input_dram, &slice_plan, dtype, "pjrt_slice")
         .map_err(io_error)?;
     store_output_buffer(
@@ -2997,7 +3084,7 @@ fn execute_broadcast_in_dim(
     }
     let input_shape = dims_i64_to_usize(&input_desc.dims)?;
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let broadcast_plan = kernels::broadcast::BroadcastInDimPlan::new(
+    kernels::broadcast::validate_broadcast_dimensions(
         &input_shape,
         &output_shape,
         broadcast_dimensions,
@@ -3012,6 +3099,32 @@ fn execute_broadcast_in_dim(
     };
     let dtype = pjrt_buffer_type_to_dtype(input_desc.element_type)?;
     let output_dims = output_desc.dims.clone();
+    if input.source_shape.is_none() && element_count(&input_shape)? == element_count(&output_shape)?
+    {
+        let output_tile_count =
+            dram::tiled_shape_tile_count(&output_shape).map_err(io_error)?;
+        if input_dram.num_tiles == output_tile_count
+            && reshape_preserves_tiled_layout(&input_shape, &output_shape)?
+        {
+            let mut output_dram = input_dram.clone();
+            output_dram.shape = dram::tiled_allocation_shape(&output_shape).map_err(io_error)?;
+            return store_output_buffer(
+                values,
+                plan,
+                output_id,
+                output_dims,
+                output_dram,
+                context,
+                "broadcast_in_dim",
+            );
+        }
+    }
+    let broadcast_plan = kernels::broadcast::BroadcastInDimPlan::new(
+        &input_shape,
+        &output_shape,
+        broadcast_dimensions,
+    )
+    .map_err(io_error)?;
     let output_dram = kernels::broadcast::broadcast_in_dim(
         device,
         input_dram,

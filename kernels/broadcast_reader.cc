@@ -110,6 +110,31 @@ constexpr bool column_fill_broadcast() {
 
 constexpr bool COLUMN_FILL = column_fill_broadcast();
 
+constexpr bool row_fill_broadcast() {
+  if constexpr (OUTPUT_RANK < 2 || INPUT_RANK < 1) {
+    return false;
+  }
+  bool has_col_dim = false;
+  for (uint32_t dim = 0; dim < INPUT_RANK; ++dim) {
+    if (BROADCAST_DIMS[dim] == OUTPUT_RANK - 1) {
+      if (dim != INPUT_RANK - 1 ||
+          INPUT_SHAPE[dim] != OUTPUT_SHAPE[OUTPUT_RANK - 1]) {
+        return false;
+      }
+      has_col_dim = true;
+    } else if (BROADCAST_DIMS[dim] == OUTPUT_RANK - 2 &&
+               INPUT_SHAPE[dim] != 1) {
+      return false;
+    } else if (INPUT_SHAPE[dim] != OUTPUT_SHAPE[BROADCAST_DIMS[dim]] &&
+               INPUT_SHAPE[dim] != 1) {
+      return false;
+    }
+  }
+  return has_col_dim && OUTPUT_SHAPE[OUTPUT_RANK - 2] > 1;
+}
+
+constexpr bool ROW_FILL = row_fill_broadcast();
+
 constexpr bool direct_full_tile_mapping() {
   if constexpr (INPUT_RANK < 2 || OUTPUT_RANK < 2) {
     return false;
@@ -244,6 +269,27 @@ void kernel_main() {
 
     uint32_t base_output_coords[OUTPUT_COORD_COUNT];
     decode_output_batch(output_batch, base_output_coords);
+
+    if constexpr (ROW_FILL) {
+      Location source = input_location(base_output_coords, 0, output_col_base);
+      read_input_tile(input, source.tile, cb_input);
+
+      cb_reserve_back(cb_output, 1);
+      zero_tile(cb_output);
+      volatile tt_l1_ptr Element *input_ptr =
+          reinterpret_cast<volatile tt_l1_ptr Element *>(get_read_ptr(cb_input));
+      volatile tt_l1_ptr Element *output_ptr =
+          reinterpret_cast<volatile tt_l1_ptr Element *>(get_write_ptr(cb_output));
+      for (uint32_t row = 0; row < row_count; ++row) {
+        for (uint32_t col = 0; col < col_count; ++col) {
+          output_ptr[tile_element_index(row, col)] =
+              input_ptr[tile_element_index(source.row, source.col + col)];
+        }
+      }
+      cb_pop_front(cb_input, 1);
+      cb_push_back(cb_output, 1);
+      continue;
+    }
 
     if constexpr (DIRECT_FULL_TILE) {
       Location source = input_location(base_output_coords, output_row_base, output_col_base);

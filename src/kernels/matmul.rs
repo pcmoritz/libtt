@@ -6,11 +6,15 @@ use crate::kernels::kernel::{Kernel, RuntimeArgs, RuntimeArgsBuilder};
 use crate::log::log;
 use std::env;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const MATMUL_READER_SENDER: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_reader_sender.cc")
+);
+const MATMUL_READER_DIRECT_IN0_MCAST: &str = concat!(
+    include_str!("../../kernels/matmul_common.cc"),
+    include_str!("../../kernels/matmul_reader_direct_in0_mcast.cc")
 );
 const MATMUL_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
 const MATMUL_WRITER_SENDER: &str = concat!(
@@ -192,6 +196,7 @@ struct MatmulPlan {
     rows: Vec<u8>,
     cols: Vec<u8>,
     direct_grid: Option<Vec<Vec<CoreCoord>>>,
+    direct_in0_mcast: Option<DirectIn0Mcast>,
     batch_groups: usize,
     batches_per_group: usize,
     mt: usize,
@@ -202,6 +207,11 @@ struct MatmulPlan {
     in0_block_w: usize,
     out_subblock_h: usize,
     out_subblock_w: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectIn0Mcast {
+    rects: [[u32; 5]; 2],
 }
 
 impl MatmulPlan {
@@ -439,7 +449,13 @@ fn log_matmul_plan(plan: &MatmulPlan) {
         grid_cols,
         plan.batch_groups,
         plan.batches_per_group,
-        if plan.direct_grid.is_some() { "direct" } else { "mcast" },
+        if plan.direct_in0_mcast.is_some() {
+            "direct-in0-mcast"
+        } else if plan.direct_grid.is_some() {
+            "direct"
+        } else {
+            "mcast"
+        },
         plan.per_core_m,
         plan.per_core_n,
         plan.in0_block_w,
@@ -900,6 +916,7 @@ fn plan_matmul_with_tile_sizes(
                                     rows: rows.to_vec(),
                                     cols: cols.to_vec(),
                                     direct_grid: None,
+                                    direct_in0_mcast: None,
                                     batch_groups: 1,
                                     batches_per_group: batch_count,
                                     mt,
@@ -949,6 +966,11 @@ fn plan_matmul_with_tile_sizes(
     };
 
     let mut plan = candidate;
+    if mt_base == 1 && batch_count == 1 && nt_base <= 384 {
+        if let Some(mcast_plan) = direct_in0_mcast_plan(&plan, &ordered) {
+            plan = mcast_plan;
+        }
+    }
     let baseline_work = plan_work(&plan);
     if let Some(batched) = plan_direct_matmul(
         mt_base,
@@ -969,6 +991,133 @@ fn plan_matmul_with_tile_sizes(
     }
 
     Ok(plan)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct McastRect {
+    x0: u8,
+    y0: u8,
+    x1: u8,
+    y1: u8,
+}
+
+impl McastRect {
+    fn area(self) -> usize {
+        usize::from(self.x1 - self.x0 + 1) * usize::from(self.y1 - self.y0 + 1)
+    }
+
+    fn args(self) -> [u32; 5] {
+        [
+            self.x0 as u32,
+            self.y0 as u32,
+            self.x1 as u32,
+            self.y1 as u32,
+            self.area() as u32,
+        ]
+    }
+
+    fn disjoint(self, other: Self) -> bool {
+        self.x1 < other.x0 || other.x1 < self.x0 || self.y1 < other.y0 || other.y1 < self.y0
+    }
+
+    fn cores(self) -> Vec<CoreCoord> {
+        let mut cores = Vec::with_capacity(self.area());
+        for x in self.x0..=self.x1 {
+            for y in self.y0..=self.y1 {
+                cores.push(CoreCoord { x, y });
+            }
+        }
+        cores
+    }
+}
+
+fn direct_in0_mcast_plan(plan: &MatmulPlan, available: &[CoreCoord]) -> Option<MatmulPlan> {
+    if plan.batch_groups != 1
+        || plan.per_core_m != 1
+        || plan.per_core_n < 2
+        || plan.direct_in0_mcast.is_some()
+    {
+        return None;
+    }
+    let grid = plan.direct_grid.as_ref()?;
+    let [row] = grid.as_slice() else {
+        return None;
+    };
+    let needed = row.len();
+    if needed <= 1 {
+        return None;
+    }
+    let (rects, cores) = find_exact_mcast_rects(available, needed)?;
+    let mut mcast_plan = plan.clone();
+    mcast_plan.direct_grid = Some(vec![cores]);
+    mcast_plan.direct_in0_mcast = Some(DirectIn0Mcast { rects });
+    Some(mcast_plan)
+}
+
+fn find_exact_mcast_rects(
+    available: &[CoreCoord],
+    needed: usize,
+) -> Option<([[u32; 5]; 2], Vec<CoreCoord>)> {
+    let available_set = available
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut xs = available.iter().map(|core| core.x).collect::<Vec<_>>();
+    xs.sort_unstable();
+    xs.dedup();
+    let mut ys = available.iter().map(|core| core.y).collect::<Vec<_>>();
+    ys.sort_unstable();
+    ys.dedup();
+
+    let mut rects = Vec::new();
+    for x0_index in 0..xs.len() {
+        for x1_index in x0_index..xs.len() {
+            let x0 = xs[x0_index];
+            let x1 = xs[x1_index];
+            if usize::from(x1 - x0 + 1) > needed {
+                continue;
+            }
+            for y0_index in 0..ys.len() {
+                for y1_index in y0_index..ys.len() {
+                    let rect = McastRect {
+                        x0,
+                        y0: ys[y0_index],
+                        x1,
+                        y1: ys[y1_index],
+                    };
+                    let area = rect.area();
+                    if area > needed {
+                        continue;
+                    }
+                    if rect
+                        .cores()
+                        .into_iter()
+                        .all(|core| available_set.contains(&core))
+                    {
+                        rects.push(rect);
+                    }
+                }
+            }
+        }
+    }
+
+    rects.sort_by_key(|rect| (std::cmp::Reverse(rect.area()), rect.x0, rect.y0));
+    for rect in &rects {
+        if rect.area() == needed {
+            return Some(([rect.args(), [0; 5]], rect.cores()));
+        }
+    }
+
+    for (index, first) in rects.iter().copied().enumerate() {
+        for second in rects[index + 1..].iter().copied() {
+            if first.area() + second.area() == needed && first.disjoint(second) {
+                let mut cores = first.cores();
+                cores.extend(second.cores());
+                return Some(([first.args(), second.args()], cores));
+            }
+        }
+    }
+    None
 }
 
 fn plan_direct_matmul(
@@ -997,7 +1146,7 @@ fn plan_direct_matmul(
     if min_batch_groups > max_batch_groups {
         return None;
     }
-
+    let preferred_in0_block_w = preferred_direct_in0_block_w(mt_base, kt, nt_base);
     for batch_groups in min_batch_groups..=max_batch_groups {
         let max_group_cores = cores.len() / batch_groups;
         if max_group_cores == 0 {
@@ -1029,6 +1178,11 @@ fn plan_direct_matmul(
                             continue;
                         }
                         for &in0_block_w in kt_divs {
+                            if preferred_in0_block_w
+                                .is_some_and(|preferred| in0_block_w != preferred)
+                            {
+                                continue;
+                            }
                             let num_blocks = kt / in0_block_w;
                             if in0_block_w > bw_cap
                                 || !fits_l1(
@@ -1090,6 +1244,7 @@ fn plan_direct_matmul(
                                             .map(|row| row.to_vec())
                                             .collect(),
                                     ),
+                                    direct_in0_mcast: None,
                                     batch_groups,
                                     batches_per_group,
                                     mt,
@@ -1110,6 +1265,16 @@ fn plan_direct_matmul(
     }
 
     best
+}
+
+fn preferred_direct_in0_block_w(mt_base: usize, kt: usize, nt_base: usize) -> Option<usize> {
+    if mt_base == 1 && nt_base <= 32 && kt >= 128 {
+        Some(32)
+    } else if mt_base == 1 && (kt >= 256 || nt_base >= 128) && nt_base <= 512 {
+        Some(8)
+    } else {
+        None
+    }
 }
 
 fn plan_work(plan: &MatmulPlan) -> usize {
@@ -1206,7 +1371,11 @@ fn matmul_program(
     )?;
     let top1_epilogue = epilogue == MatmulEpilogueKind::Top1;
     Ok(Program {
-        reader_kernel: MATMUL_READER_SENDER.to_owned(),
+        reader_kernel: if plan.direct_in0_mcast.is_some() {
+            MATMUL_READER_DIRECT_IN0_MCAST.to_owned()
+        } else {
+            MATMUL_READER_SENDER.to_owned()
+        },
         writer_kernel: if top1_epilogue {
             MATMUL_TOP1_WRITER.to_owned()
         } else {
@@ -1323,12 +1492,16 @@ fn lower_runtime_args(
 }
 
 fn matmul_math_fidelity() -> io::Result<MathFidelity> {
-    match env::var("LIBTT_MATMUL_FIDELITY") {
-        Ok(value) => parse_matmul_math_fidelity(&value),
-        Err(env::VarError::NotPresent) => Ok(MathFidelity::HiFi2),
-        Err(env::VarError::NotUnicode(_)) => {
-            Err(invalid_input("LIBTT_MATMUL_FIDELITY must be valid Unicode"))
-        }
+    static VALUE: OnceLock<Result<MathFidelity, String>> = OnceLock::new();
+    match VALUE.get_or_init(|| match env::var("LIBTT_MATMUL_FIDELITY") {
+            Ok(value) => parse_matmul_math_fidelity(&value).map_err(|err| err.to_string()),
+            Err(env::VarError::NotPresent) => Ok(MathFidelity::HiFi2),
+            Err(env::VarError::NotUnicode(_)) => {
+                Err("LIBTT_MATMUL_FIDELITY must be valid Unicode".to_owned())
+            }
+        }) {
+        Ok(value) => Ok(*value),
+        Err(err) => Err(invalid_input(err.clone())),
     }
 }
 
@@ -1364,7 +1537,9 @@ fn reader_args(
     total_batch_count: usize,
     lhs_view: &MatmulOperandView,
 ) -> io::Result<Vec<u32>> {
-    let (w_rect, e_rect, sender) = if plan.direct_grid.is_some() {
+    let (w_rect, e_rect, sender) = if let Some(mcast) = &plan.direct_in0_mcast {
+        (mcast.rects[0], mcast.rects[1], grid[0][0])
+    } else if plan.direct_grid.is_some() {
         ([0, 0, 0, 0, 0], [0, 0, 0, 0, 0], core)
     } else {
         let west_cols = plan
