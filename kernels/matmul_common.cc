@@ -264,8 +264,8 @@ void fill_tile_transpose_tile_impl(const InterleavedAddrGenFast<true> &input,
 
   uint32_t indices[MAX_RANK] = {};
   decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
-  indices[view.col_dims[0]] = col_tile * TILE_C;
-  indices[view.row_dims[0]] = row_tile * TILE_R;
+  indices[view.col_dims[0]] = col_base;
+  indices[view.row_dims[0]] = row_base;
 
   uint32_t source_row_base = 0;
   uint32_t source_col_base = 0;
