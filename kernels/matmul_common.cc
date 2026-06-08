@@ -250,6 +250,16 @@ void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const 
   }
 }
 
+uint32_t tile_transpose_source_tile(const View &view, uint32_t batch, uint32_t row_base,
+                                    uint32_t col_base, uint32_t *source_row,
+                                    uint32_t *source_col) {
+  uint32_t indices[MAX_RANK] = {};
+  decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
+  indices[view.col_dims[0]] = col_base;
+  indices[view.row_dims[0]] = row_base;
+  return tile_id_for_indices(view, indices, source_row, source_col);
+}
+
 template <uint32_t DatumBytes>
 void fill_tile_transpose_tile_impl(const InterleavedAddrGenFast<true> &input,
                                    const View &view, uint32_t batch, uint32_t row_tile,
@@ -262,15 +272,11 @@ void fill_tile_transpose_tile_impl(const InterleavedAddrGenFast<true> &input,
     return;
   }
 
-  uint32_t indices[MAX_RANK] = {};
-  decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
-  indices[view.col_dims[0]] = col_base;
-  indices[view.row_dims[0]] = row_base;
-
   uint32_t source_row_base = 0;
   uint32_t source_col_base = 0;
   uint32_t source_tile =
-      tile_id_for_indices(view, indices, &source_row_base, &source_col_base);
+      tile_transpose_source_tile(view, batch, row_base, col_base, &source_row_base,
+                                 &source_col_base);
   if (row_base + TILE_R <= view.logical_rows && col_base + TILE_C <= view.logical_cols) {
     noc_async_read_tile(source_tile, input, dst_addr);
     noc_async_read_barrier();
@@ -299,18 +305,6 @@ void fill_tile_transpose_tile(const InterleavedAddrGenFast<true> &input, const V
     fill_tile_transpose_tile_impl<sizeof(uint16_t)>(
         input, view, batch, row_tile, col_tile, dst_addr, tile_bytes, cb_source);
   }
-}
-
-uint32_t full_tile_transpose_source_tile(const View &view, uint32_t batch,
-                                         uint32_t row_tile, uint32_t col_tile) {
-  uint32_t indices[MAX_RANK] = {};
-  decompose_into_dims(batch, view.batch_dims, view.batch_rank, view.shape, indices);
-  indices[view.col_dims[0]] = col_tile * TILE_C;
-  indices[view.row_dims[0]] = row_tile * TILE_R;
-
-  uint32_t source_row = 0;
-  uint32_t source_col = 0;
-  return tile_id_for_indices(view, indices, &source_row, &source_col);
 }
 
 bool is_full_tile_transpose_tile(const View &view, uint32_t row_tile, uint32_t col_tile) {
@@ -353,8 +347,10 @@ void fill_tile_transpose_block(const InterleavedAddrGenFast<true> &input, const 
       uint32_t canonical_tile = canonical_base + h * canonical_stride + w;
       uint32_t row_tile = canonical_tile / canonical_stride;
       uint32_t col_tile = canonical_tile - row_tile * canonical_stride;
-      uint32_t source_tile =
-          full_tile_transpose_source_tile(view, batch, row_tile, col_tile);
+      uint32_t source_row = 0;
+      uint32_t source_col = 0;
+      uint32_t source_tile = tile_transpose_source_tile(
+          view, batch, row_tile * TILE_R, col_tile * TILE_C, &source_row, &source_col);
       uint32_t l1_addr = dst_addr + (h * block_w + w) * tile_bytes;
       noc_async_read_tile(source_tile, input, l1_addr);
     }
