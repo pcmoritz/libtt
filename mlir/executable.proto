@@ -127,6 +127,10 @@ message SelectOp {
   uint32 pred_id = 1;
   uint32 on_true_id = 2;
   uint32 on_false_id = 3;
+  bool on_true_is_constant = 4;
+  uint32 on_true_packed_value = 5;
+  bool on_false_is_constant = 6;
+  uint32 on_false_packed_value = 7;
 }
 
 message BroadcastInDimOp {

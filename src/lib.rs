@@ -2742,8 +2742,16 @@ fn op_consumes_value(op: &executable::Op, value_id: u32) -> bool {
         executable::Op::Matmul { input_ids, .. } | executable::Op::Gather { input_ids, .. } => {
             input_ids.contains(&value_id)
         }
-        executable::Op::Scatter { input_ids, .. } | executable::Op::Select { input_ids, .. } => {
-            input_ids.contains(&value_id)
+        executable::Op::Scatter { input_ids, .. } => input_ids.contains(&value_id),
+        executable::Op::Select {
+            input_ids,
+            on_true_packed_value,
+            on_false_packed_value,
+            ..
+        } => {
+            input_ids[0] == value_id
+                || (on_true_packed_value.is_none() && input_ids[1] == value_id)
+                || (on_false_packed_value.is_none() && input_ids[2] == value_id)
         }
         executable::Op::SdpaDecode { input_ids, .. } => input_ids.contains(&value_id),
         executable::Op::RmsNorm { input_ids, .. } => input_ids.contains(&value_id),
@@ -2884,18 +2892,33 @@ fn execute_select(
     context: &OutputContext,
     input_ids: [u32; 3],
     output_id: u32,
+    on_true_packed_value: Option<u32>,
+    on_false_packed_value: Option<u32>,
 ) -> Result<(), *mut PJRT_Error> {
     let [pred_id, true_id, false_id] = input_ids;
     let pred_desc = plan
         .values
         .get(pred_id as usize)
         .ok_or_else(|| invalid_argument("TT executable select.pred value id is out of bounds"))?;
-    let true_desc = plan.values.get(true_id as usize).ok_or_else(|| {
-        invalid_argument("TT executable select.on_true value id is out of bounds")
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable select output id {output_id} is out of bounds"
+        ))
     })?;
-    let false_desc = plan.values.get(false_id as usize).ok_or_else(|| {
-        invalid_argument("TT executable select.on_false value id is out of bounds")
-    })?;
+    let true_desc = if on_true_packed_value.is_some() {
+        output_desc
+    } else {
+        plan.values.get(true_id as usize).ok_or_else(|| {
+            invalid_argument("TT executable select.on_true value id is out of bounds")
+        })?
+    };
+    let false_desc = if on_false_packed_value.is_some() {
+        output_desc
+    } else {
+        plan.values.get(false_id as usize).ok_or_else(|| {
+            invalid_argument("TT executable select.on_false value id is out of bounds")
+        })?
+    };
     if pred_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_PRED {
         return Err(invalid_argument(format!(
             "TT executable select predicate must be PRED, got {:?}",
@@ -2912,11 +2935,6 @@ fn execute_select(
             "TT executable select currently only supports equal-shaped operands",
         ));
     }
-    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
-        invalid_argument(format!(
-            "TT executable select output id {output_id} is out of bounds"
-        ))
-    })?;
     if output_desc.element_type != true_desc.element_type {
         return Err(invalid_argument(format!(
             "TT executable select output must be {:?}, got {:?}",
@@ -2950,8 +2968,16 @@ fn execute_select(
             "TT executable select predicate buffer has no device allocation",
         ));
     };
-    let true_input = select_value_input(values, plan, true_id, value_dtype, "select.on_true")?;
-    let false_input = select_value_input(values, plan, false_id, value_dtype, "select.on_false")?;
+    let true_input = if let Some(packed_value) = on_true_packed_value {
+        kernels::select::SelectInput::Constant(packed_value)
+    } else {
+        select_value_input(values, plan, true_id, value_dtype, "select.on_true")?
+    };
+    let false_input = if let Some(packed_value) = on_false_packed_value {
+        kernels::select::SelectInput::Constant(packed_value)
+    } else {
+        select_value_input(values, plan, false_id, value_dtype, "select.on_false")?
+    };
     let expected_dims = true_desc.dims.clone();
     let shape = dims_i64_to_usize(&expected_dims)?;
     let output_dram = kernels::select::select(
@@ -3601,6 +3627,8 @@ fn execute_executable_v1(
             executable::Op::Select {
                 input_ids,
                 output_id,
+                on_true_packed_value,
+                on_false_packed_value,
             } => {
                 execute_select(
                     &mut values,
@@ -3609,6 +3637,8 @@ fn execute_executable_v1(
                     output_context,
                     *input_ids,
                     *output_id,
+                    *on_true_packed_value,
+                    *on_false_packed_value,
                 )?;
             }
             executable::Op::BroadcastInDim {
@@ -6026,6 +6056,7 @@ mod tests {
                 let executable::Op::Select {
                     input_ids,
                     output_id,
+                    ..
                 } = &executable.ops[3]
                 else {
                     panic!("select should lower to Select");

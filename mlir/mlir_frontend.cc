@@ -1340,6 +1340,59 @@ std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& erro
     return std::nullopt;
 }
 
+std::optional<uint32_t> packedSelectArmValue(mlir::Value value, mlir::Type result_type) {
+    if (value.getType() != result_type) {
+        return std::nullopt;
+    }
+    std::string ignored;
+    return packedConstantValue(value, ignored);
+}
+
+bool isPackedSelectArmUse(mlir::OpOperand& use) {
+    auto select_op = mlir::dyn_cast<mlir::stablehlo::SelectOp>(use.getOwner());
+    if (!select_op) {
+        return false;
+    }
+
+    mlir::Type result_type = select_op.getResult().getType();
+    if (use.getOperandNumber() == 1) {
+        return packedSelectArmValue(select_op.getOnTrue(), result_type).has_value();
+    }
+    if (use.getOperandNumber() == 2) {
+        return packedSelectArmValue(select_op.getOnFalse(), result_type).has_value();
+    }
+    return false;
+}
+
+llvm::DenseSet<mlir::Operation*> elidedSplatConstantProducers(FuncOp func) {
+    llvm::DenseSet<mlir::Operation*> elided;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        func.walk([&](mlir::Operation* op) {
+            if (elided.contains(op) || op->getNumResults() != 1 ||
+                !mlir::isa<mlir::stablehlo::ConstantOp, mlir::stablehlo::BroadcastInDimOp>(op)) {
+                return;
+            }
+
+            mlir::Value result = op->getResult(0);
+            std::string ignored;
+            if (!packedConstantValue(result, ignored).has_value()) {
+                return;
+            }
+
+            for (mlir::OpOperand& use : result.getUses()) {
+                if (!isPackedSelectArmUse(use) && !elided.contains(use.getOwner())) {
+                    return;
+                }
+            }
+            elided.insert(op);
+            changed = true;
+        });
+    }
+    return elided;
+}
+
 void appendLittleEndian(std::vector<uint8_t>& data, uint64_t value, unsigned byte_count) {
     for (unsigned index = 0; index < byte_count; ++index) {
         data.push_back(static_cast<uint8_t>((value >> (index * 8)) & 0xff));
@@ -2626,6 +2679,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
     auto fused_elementwise = buildFusedElementwisePlan(func);
+    auto elided_splat_producers = elidedSplatConstantProducers(func);
     llvm::DenseSet<mlir::Operation*> matmul_top_k_covered_ops;
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
@@ -2663,6 +2717,9 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
         if (fused_elementwise.covered_ops.contains(&op)) {
+            continue;
+        }
+        if (elided_splat_producers.contains(&op)) {
             continue;
         }
         if (matmul_top_k_covered_ops.contains(&op)) {
@@ -2706,13 +2763,24 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
 
         if (auto select_op = mlir::dyn_cast<mlir::stablehlo::SelectOp>(op)) {
             uint32_t pred_id = 0;
-            uint32_t on_true_id = 0;
-            uint32_t on_false_id = 0;
             uint32_t output_id = 0;
+            auto true_packed =
+                packedSelectArmValue(select_op.getOnTrue(), select_op.getResult().getType());
+            auto false_packed =
+                packedSelectArmValue(select_op.getOnFalse(), select_op.getResult().getType());
             if (!addValueDesc(select_op.getPred(), executable, value_ids, error, pred_id) ||
-                !addValueDesc(select_op.getOnTrue(), executable, value_ids, error, on_true_id) ||
-                !addValueDesc(select_op.getOnFalse(), executable, value_ids, error, on_false_id) ||
                 !addValueDesc(select_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            uint32_t on_true_id = output_id;
+            if (!true_packed &&
+                !addValueDesc(select_op.getOnTrue(), executable, value_ids, error, on_true_id)) {
+                return false;
+            }
+            uint32_t on_false_id = output_id;
+            if (!false_packed &&
+                !addValueDesc(select_op.getOnFalse(), executable, value_ids, error, on_false_id)) {
                 return false;
             }
 
@@ -2721,6 +2789,10 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             select->mutable_select()->set_pred_id(pred_id);
             select->mutable_select()->set_on_true_id(on_true_id);
             select->mutable_select()->set_on_false_id(on_false_id);
+            select->mutable_select()->set_on_true_is_constant(true_packed.has_value());
+            select->mutable_select()->set_on_true_packed_value(true_packed.value_or(0));
+            select->mutable_select()->set_on_false_is_constant(false_packed.has_value());
+            select->mutable_select()->set_on_false_packed_value(false_packed.value_or(0));
             continue;
         }
 
