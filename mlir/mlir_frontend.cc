@@ -1366,29 +1366,26 @@ bool isPackedSelectArmUse(mlir::OpOperand& use) {
 
 llvm::DenseSet<mlir::Operation*> elidedSplatConstantProducers(FuncOp func) {
     llvm::DenseSet<mlir::Operation*> elided;
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        func.walk([&](mlir::Operation* op) {
-            if (elided.contains(op) || op->getNumResults() != 1 ||
-                !mlir::isa<mlir::stablehlo::ConstantOp, mlir::stablehlo::BroadcastInDimOp>(op)) {
-                return;
-            }
+    llvm::SmallVector<mlir::Operation*> ops;
+    func.walk([&](mlir::Operation* op) { ops.push_back(op); });
+    for (mlir::Operation* op : llvm::reverse(ops)) {
+        if (op->getNumResults() != 1 ||
+            !mlir::isa<mlir::stablehlo::ConstantOp, mlir::stablehlo::BroadcastInDimOp>(op)) {
+            continue;
+        }
 
-            mlir::Value result = op->getResult(0);
-            std::string ignored;
-            if (!packedConstantValue(result, ignored).has_value()) {
-                return;
-            }
+        mlir::Value result = op->getResult(0);
+        std::string ignored;
+        if (!packedConstantValue(result, ignored).has_value()) {
+            continue;
+        }
 
-            for (mlir::OpOperand& use : result.getUses()) {
-                if (!isPackedSelectArmUse(use) && !elided.contains(use.getOwner())) {
-                    return;
-                }
-            }
-            elided.insert(op);
-            changed = true;
+        bool elidable = llvm::all_of(result.getUses(), [&](mlir::OpOperand& use) {
+            return isPackedSelectArmUse(use) || elided.contains(use.getOwner());
         });
+        if (elidable) {
+            elided.insert(op);
+        }
     }
     return elided;
 }
