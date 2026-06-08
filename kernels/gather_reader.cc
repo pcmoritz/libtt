@@ -8,6 +8,7 @@ constexpr uint32_t FACE_R = 16;
 constexpr uint32_t FACE_C = 16;
 constexpr uint32_t INVALID_TILE = 0xffffffffu;
 constexpr bool BF16_ROWS = GATHER_BF16_ROWS != 0;
+constexpr bool BF16_AXIS_ROWS = GATHER_BF16_AXIS_ROWS != 0;
 constexpr uint32_t RANK = GATHER_RANK;
 constexpr uint32_t AXIS = GATHER_AXIS;
 static_assert(RANK >= 2, "gather reader expects shapes padded to at least rank 2");
@@ -172,6 +173,18 @@ void copy_bf16_row(uint32_t source_l1_addr, uint32_t output_l1_addr, uint32_t so
   }
 }
 
+void copy_bf16_row_partial(uint32_t source_l1_addr, uint32_t output_l1_addr,
+                           uint32_t source_row, uint32_t output_row,
+                           uint32_t col_count) {
+  volatile tt_l1_ptr uint16_t *source =
+      reinterpret_cast<volatile tt_l1_ptr uint16_t *>(source_l1_addr);
+  volatile tt_l1_ptr uint16_t *output =
+      reinterpret_cast<volatile tt_l1_ptr uint16_t *>(output_l1_addr);
+  for (uint32_t col = 0; col < col_count; ++col) {
+    output[tile_element_index(output_row, col)] = source[tile_element_index(source_row, col)];
+  }
+}
+
 // Embedding lookup is a hot LLM path: rank-2 BF16 row gathers can copy a whole
 // tile row from one operand tile instead of doing per-element coordinate decode.
 void run_bf16_rows_gather(const InterleavedAddrGenFast<true> &operand,
@@ -225,6 +238,63 @@ void run_bf16_rows_gather(const InterleavedAddrGenFast<true> &operand,
     }
 
     cb_pop_front(cb_indices, 1);
+  }
+}
+
+// KV-cache head gathers are row gathers inside each [heads, head_dim] tile
+// matrix. Read each head index once and copy the row instead of decoding every
+// element independently.
+void run_bf16_axis_rows_gather(const InterleavedAddrGenFast<true> &operand,
+                               const InterleavedAddrGenFast<true> &indices) {
+  uint32_t output_tile_offset = get_arg_val<uint32_t>(2);
+  uint32_t output_tile_count = get_arg_val<uint32_t>(3);
+
+  constexpr uint32_t cb_operand = tt::CBIndex::c_0;
+  constexpr uint32_t cb_output = tt::CBIndex::c_16;
+
+  for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
+    uint32_t output_tile_id = output_tile_offset + tile;
+    uint32_t output_matrix_tiles = OUTPUT_TILE_ROWS * OUTPUT_TILES_PER_ROW;
+    uint32_t output_batch = output_tile_id / output_matrix_tiles;
+    uint32_t output_matrix_tile = output_tile_id % output_matrix_tiles;
+    uint32_t output_tile_row = output_matrix_tile / OUTPUT_TILES_PER_ROW;
+    uint32_t output_tile_col = output_matrix_tile % OUTPUT_TILES_PER_ROW;
+    uint32_t output_row_base = output_tile_row * TILE_R;
+    uint32_t output_col_base = output_tile_col * TILE_C;
+    uint32_t row_count = tile_extent(OUTPUT_SHAPE[RANK - 2], output_row_base, TILE_R);
+    uint32_t col_count = tile_extent(OUTPUT_SHAPE[RANK - 1], output_col_base, TILE_C);
+
+    uint32_t loaded_index_tile = INVALID_TILE;
+    uint32_t loaded_operand_tile = INVALID_TILE;
+    cb_reserve_back(cb_output, 1);
+    zero_tile(cb_output);
+    uint32_t output_l1_addr = get_write_ptr(cb_output);
+
+    for (uint32_t row = 0; row < row_count; ++row) {
+      uint32_t output_row = output_row_base + row;
+      int32_t gather_index = read_gather_index(indices, output_row, &loaded_index_tile);
+      if (gather_index < 0 ||
+          static_cast<uint32_t>(gather_index) >= OPERAND_SHAPE[RANK - 2]) {
+        continue;
+      }
+
+      uint32_t source_row = static_cast<uint32_t>(gather_index);
+      uint32_t source_tile_row = source_row / TILE_R;
+      uint32_t source_tile =
+          (output_batch * OPERAND_TILE_ROWS + source_tile_row) * OPERAND_TILES_PER_ROW +
+          output_tile_col;
+      ensure_tile(operand, source_tile, cb_operand, &loaded_operand_tile);
+      copy_bf16_row_partial(
+          get_read_ptr(cb_operand), output_l1_addr, source_row % TILE_R, row, col_count);
+    }
+
+    if (loaded_index_tile != INVALID_TILE) {
+      cb_pop_front(tt::CBIndex::c_1, 1);
+    }
+    if (loaded_operand_tile != INVALID_TILE) {
+      cb_pop_front(cb_operand, 1);
+    }
+    cb_push_back(cb_output, 1);
   }
 }
 
@@ -315,6 +385,8 @@ void kernel_main() {
   };
   if constexpr (BF16_ROWS) {
     run_bf16_rows_gather(operand, start_indices);
+  } else if constexpr (BF16_AXIS_ROWS) {
+    run_bf16_axis_rows_gather(operand, start_indices);
   } else {
     run_axis_gather(operand, start_indices);
   }
