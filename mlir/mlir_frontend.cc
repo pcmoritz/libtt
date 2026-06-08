@@ -37,7 +37,6 @@
 #include "mlir/Transforms/Passes.h"
 #include "mlir/executable.pb.h"
 #include "mlir/rms_norm_fusing_pattern.h"
-#include "mlir/select_splat_fusing_pattern.h"
 #include "mlir/sdpa_fusing_pattern.h"
 #include "mlir/stablehlo_utils.h"
 #include "stablehlo/dialect/Serialization.h"
@@ -1130,10 +1129,6 @@ bool runCleanupPasses(mlir::MLIRContext& context, mlir::ModuleOp module, std::st
         error = "failed to run MLIR post-case cleanup passes";
         return false;
     }
-    if (mlir::failed(libtt::mlir_frontend::runSelectSplatFusing(context, module))) {
-        error = "failed to apply late select splat rewrite patterns";
-        return false;
-    }
     return true;
 }
 
@@ -1343,6 +1338,59 @@ std::optional<uint32_t> packedConstantValue(mlir::Value value, std::string& erro
     }
     error = "only bf16/f16/f32 and <=64-bit integer splat constants are currently supported";
     return std::nullopt;
+}
+
+std::optional<uint32_t> packedSelectArmValue(mlir::Value value, mlir::Type result_type) {
+    if (value.getType() != result_type) {
+        return std::nullopt;
+    }
+    std::string ignored;
+    return packedConstantValue(value, ignored);
+}
+
+bool isPackedSelectArmUse(mlir::OpOperand& use) {
+    auto select_op = mlir::dyn_cast<mlir::stablehlo::SelectOp>(use.getOwner());
+    if (!select_op) {
+        return false;
+    }
+
+    mlir::Type result_type = select_op.getResult().getType();
+    if (use.getOperandNumber() == 1) {
+        return packedSelectArmValue(select_op.getOnTrue(), result_type).has_value();
+    }
+    if (use.getOperandNumber() == 2) {
+        return packedSelectArmValue(select_op.getOnFalse(), result_type).has_value();
+    }
+    return false;
+}
+
+llvm::DenseSet<mlir::Operation*> elidedSplatConstantProducers(FuncOp func) {
+    llvm::DenseSet<mlir::Operation*> elided;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        func.walk([&](mlir::Operation* op) {
+            if (elided.contains(op) || op->getNumResults() != 1 ||
+                !mlir::isa<mlir::stablehlo::ConstantOp, mlir::stablehlo::BroadcastInDimOp>(op)) {
+                return;
+            }
+
+            mlir::Value result = op->getResult(0);
+            std::string ignored;
+            if (!packedConstantValue(result, ignored).has_value()) {
+                return;
+            }
+
+            for (mlir::OpOperand& use : result.getUses()) {
+                if (!isPackedSelectArmUse(use) && !elided.contains(use.getOwner())) {
+                    return;
+                }
+            }
+            elided.insert(op);
+            changed = true;
+        });
+    }
+    return elided;
 }
 
 void appendLittleEndian(std::vector<uint8_t>& data, uint64_t value, unsigned byte_count) {
@@ -1710,109 +1758,6 @@ std::optional<tt::BitwiseBinaryOp::Kind> bitwiseBinaryKind(mlir::Operation* op) 
         .Case<mlir::stablehlo::ShiftRightArithmeticOp>(
             [](auto) { return tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_ARITHMETIC; })
         .Default([](auto) { return std::nullopt; });
-}
-
-std::optional<bool> boolBackendConfigField(
-    mlir::DictionaryAttr config,
-    llvm::StringRef name,
-    std::string& error) {
-    auto attr = config.getAs<mlir::BoolAttr>(name);
-    if (!attr) {
-        error = "backend_config missing bool field " + name.str();
-        return std::nullopt;
-    }
-    return attr.getValue();
-}
-
-std::optional<uint32_t> u32BackendConfigField(
-    mlir::DictionaryAttr config,
-    llvm::StringRef name,
-    std::string& error) {
-    auto attr = config.getAs<mlir::IntegerAttr>(name);
-    if (!attr) {
-        error = "backend_config missing integer field " + name.str();
-        return std::nullopt;
-    }
-    uint64_t value = attr.getValue().getLimitedValue(
-        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1);
-    if (value > std::numeric_limits<uint32_t>::max()) {
-        error = "backend_config field " + name.str() + " is out of range";
-        return std::nullopt;
-    }
-    return static_cast<uint32_t>(value);
-}
-
-bool addSelectSplatOp(
-    mlir::stablehlo::CustomCallOp custom_call_op,
-    tt::Executable& executable,
-    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
-    std::string& error) {
-    if (custom_call_op->getNumResults() != 1) {
-        error = "tt.select_splat custom_call must have one result";
-        return false;
-    }
-    auto backend_config = custom_call_op.getBackendConfig();
-    auto config = backend_config
-                      ? mlir::dyn_cast<mlir::DictionaryAttr>(*backend_config)
-                      : nullptr;
-    if (!config) {
-        error = "tt.select_splat backend_config must be a dictionary";
-        return false;
-    }
-
-    auto true_is_constant =
-        boolBackendConfigField(config, "on_true_is_constant", error);
-    auto false_is_constant =
-        boolBackendConfigField(config, "on_false_is_constant", error);
-    auto true_packed =
-        u32BackendConfigField(config, "on_true_packed_value", error);
-    auto false_packed =
-        u32BackendConfigField(config, "on_false_packed_value", error);
-    if (!true_is_constant || !false_is_constant || !true_packed || !false_packed) {
-        return false;
-    }
-
-    auto inputs = custom_call_op.getInputs();
-    size_t expected_inputs = 1 + (*true_is_constant ? 0 : 1) +
-                             (*false_is_constant ? 0 : 1);
-    if (inputs.size() != expected_inputs) {
-        error = "tt.select_splat custom_call input count does not match backend_config";
-        return false;
-    }
-
-    uint32_t output_id = 0;
-    if (!addValueDesc(custom_call_op->getResult(0), executable, value_ids, error, output_id)) {
-        return false;
-    }
-
-    uint32_t pred_id = 0;
-    if (!addValueDesc(inputs[0], executable, value_ids, error, pred_id)) {
-        return false;
-    }
-
-    size_t input_index = 1;
-    uint32_t true_id = output_id;
-    if (!*true_is_constant &&
-        !addValueDesc(inputs[input_index++], executable, value_ids, error, true_id)) {
-        return false;
-    }
-    uint32_t false_id = output_id;
-    if (!*false_is_constant &&
-        !addValueDesc(inputs[input_index++], executable, value_ids, error, false_id)) {
-        return false;
-    }
-
-    auto* op = executable.add_ops();
-    op->set_output_id(output_id);
-    auto* select = op->mutable_select();
-    select->set_pred_id(pred_id);
-    select->set_on_true_id(true_id);
-    select->set_on_false_id(false_id);
-    select->set_on_true_is_constant(*true_is_constant);
-    select->set_on_true_packed_value(*true_packed);
-    select->set_on_false_is_constant(*false_is_constant);
-    select->set_on_false_packed_value(*false_packed);
-    return true;
 }
 
 std::optional<uint32_t> sdpaDecodeScaleBf16Packed(
@@ -2734,6 +2679,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
 
     llvm::DenseMap<mlir::Value, uint32_t> value_ids;
     auto fused_elementwise = buildFusedElementwisePlan(func);
+    auto elided_splat_producers = elidedSplatConstantProducers(func);
     llvm::DenseSet<mlir::Operation*> matmul_top_k_covered_ops;
 
     for (auto [index, argument] : llvm::enumerate(func.getArguments())) {
@@ -2771,6 +2717,9 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
         if (fused_elementwise.covered_ops.contains(&op)) {
+            continue;
+        }
+        if (elided_splat_producers.contains(&op)) {
             continue;
         }
         if (matmul_top_k_covered_ops.contains(&op)) {
@@ -2814,13 +2763,24 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
 
         if (auto select_op = mlir::dyn_cast<mlir::stablehlo::SelectOp>(op)) {
             uint32_t pred_id = 0;
-            uint32_t on_true_id = 0;
-            uint32_t on_false_id = 0;
             uint32_t output_id = 0;
+            auto true_packed =
+                packedSelectArmValue(select_op.getOnTrue(), select_op.getResult().getType());
+            auto false_packed =
+                packedSelectArmValue(select_op.getOnFalse(), select_op.getResult().getType());
             if (!addValueDesc(select_op.getPred(), executable, value_ids, error, pred_id) ||
-                !addValueDesc(select_op.getOnTrue(), executable, value_ids, error, on_true_id) ||
-                !addValueDesc(select_op.getOnFalse(), executable, value_ids, error, on_false_id) ||
                 !addValueDesc(select_op.getResult(), executable, value_ids, error, output_id)) {
+                return false;
+            }
+
+            uint32_t on_true_id = output_id;
+            if (!true_packed &&
+                !addValueDesc(select_op.getOnTrue(), executable, value_ids, error, on_true_id)) {
+                return false;
+            }
+            uint32_t on_false_id = output_id;
+            if (!false_packed &&
+                !addValueDesc(select_op.getOnFalse(), executable, value_ids, error, on_false_id)) {
                 return false;
             }
 
@@ -2829,6 +2789,10 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             select->mutable_select()->set_pred_id(pred_id);
             select->mutable_select()->set_on_true_id(on_true_id);
             select->mutable_select()->set_on_false_id(on_false_id);
+            select->mutable_select()->set_on_true_is_constant(true_packed.has_value());
+            select->mutable_select()->set_on_true_packed_value(true_packed.value_or(0));
+            select->mutable_select()->set_on_false_is_constant(false_packed.has_value());
+            select->mutable_select()->set_on_false_packed_value(false_packed.value_or(0));
             continue;
         }
 
@@ -3080,12 +3044,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             }
 
             auto call_target = custom_call_op.getCallTargetName();
-            if (call_target == libtt::mlir_frontend::kSelectSplatTarget) {
-                if (!addSelectSplatOp(custom_call_op, executable, value_ids, error)) {
-                    return false;
-                }
-                continue;
-            }
             if (call_target == libtt::mlir_frontend::kSdpaDecodeTarget) {
                 if (!addSdpaDecodeOp(custom_call_op, executable, value_ids, error)) {
                     return false;

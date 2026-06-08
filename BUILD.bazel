@@ -92,12 +92,10 @@ cc_library(
         "mlir/mlir_frontend.cc",
         "mlir/rms_norm_fusing_pattern.cc",
         "mlir/sdpa_fusing_pattern.cc",
-        "mlir/select_splat_fusing_pattern.cc",
     ],
     hdrs = [
         "mlir/rms_norm_fusing_pattern.h",
         "mlir/sdpa_fusing_pattern.h",
-        "mlir/select_splat_fusing_pattern.h",
         "mlir/stablehlo_utils.h",
     ],
     copts = ["-std=c++17"],
