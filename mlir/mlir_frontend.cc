@@ -2150,6 +2150,20 @@ std::optional<uint32_t> collectFusedElementwiseValue(
     FusedElementwiseRegion& region,
     llvm::DenseMap<mlir::Value, uint32_t>& node_ids);
 
+mlir::Value peelSingleUseIdentityCustomCallsForFusion(
+    mlir::Value value,
+    FusedElementwiseRegion& region) {
+    while (auto custom_call = value.getDefiningOp<mlir::stablehlo::CustomCallOp>()) {
+        if (!isIdentityCustomCall(custom_call) ||
+            !custom_call.getResult(0).hasOneUse()) {
+            return value;
+        }
+        region.covered_ops.push_back(custom_call);
+        value = custom_call.getOperand(0);
+    }
+    return value;
+}
+
 std::optional<uint32_t> collectFusedElementwiseOp(
     mlir::Operation* op,
     mlir::Value root_value,
@@ -2205,6 +2219,7 @@ std::optional<uint32_t> collectFusedElementwiseValue(
     mlir::Value root_value,
     FusedElementwiseRegion& region,
     llvm::DenseMap<mlir::Value, uint32_t>& node_ids) {
+    value = peelSingleUseIdentityCustomCallsForFusion(value, region);
     auto existing = node_ids.find(value);
     if (existing != node_ids.end()) {
         return existing->second;

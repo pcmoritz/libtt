@@ -55,15 +55,35 @@ void write_output_run(const InterleavedAddrGenFast<true> &out_gen, uint32_t dst_
     bytes -= block_bytes;
   }
 }
+void write_contiguous_single_row_tile(
+    const InterleavedAddrGenFast<true> &out_gen,
+    uint32_t dst_tile,
+    uint32_t src_l1_addr,
+    uint32_t element_bytes) {
+  constexpr uint32_t row = 0;
+  for (uint32_t face_col = 0; face_col < 2; ++face_col) {
+    const uint32_t col = face_col * FACE_C;
+    const uint32_t offset = tile_element_index(row, col) * element_bytes;
+    noc_async_write(
+        src_l1_addr + offset,
+        get_noc_addr(dst_tile, out_gen, offset),
+        FACE_C * element_bytes);
+  }
+}
 void write_output_tile(const InterleavedAddrGenFast<true> &out_gen, const View &output_view,
                        uint32_t batch, uint32_t canonical_row_tile,
                        uint32_t canonical_col_tile, uint32_t output_batch_stride,
                        uint32_t logical_nt, uint32_t src_l1_addr, uint32_t element_bytes,
                        uint32_t cb_scratch) {
   if (output_view.kind == VIEW_CONTIGUOUS) {
-    noc_async_write_tile(batch * output_batch_stride + canonical_row_tile * logical_nt +
-                             canonical_col_tile,
-                         out_gen, src_l1_addr);
+    const uint32_t dst_tile =
+        batch * output_batch_stride + canonical_row_tile * logical_nt + canonical_col_tile;
+    if (output_view.logical_rows == 1 &&
+        (canonical_col_tile + 1) * TILE_C <= output_view.logical_cols) {
+      write_contiguous_single_row_tile(out_gen, dst_tile, src_l1_addr, element_bytes);
+    } else {
+      noc_async_write_tile(dst_tile, out_gen, src_l1_addr);
+    }
     return;
   }
   const uint32_t row_base = canonical_row_tile * TILE_R;

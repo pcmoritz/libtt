@@ -218,7 +218,7 @@ fn broadcast_reader_source(dtype: DType, shape: &BroadcastKernelShape) -> io::Re
     ))
 }
 
-fn validate_broadcast_dimensions(
+pub(crate) fn validate_broadcast_dimensions(
     input_shape: &[usize],
     output_shape: &[usize],
     broadcast_dimensions: &[i64],

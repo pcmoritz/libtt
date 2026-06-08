@@ -24,6 +24,8 @@ constexpr uint32_t OPERAND_TILES_PER_ROW = GATHER_OPERAND_TILES_PER_ROW;
 constexpr uint32_t OUTPUT_TILE_ROWS = GATHER_OUTPUT_TILE_ROWS;
 constexpr uint32_t OUTPUT_TILES_PER_ROW = GATHER_OUTPUT_TILES_PER_ROW;
 using Element = GATHER_ELEMENT_TYPE;
+constexpr bool AXIS1_ROW_GATHER =
+    !BF16_ROWS && RANK == 3 && AXIS == 1 && !OPERAND_RESHAPE_VIEW;
 
 struct Location {
   uint32_t tile;
@@ -172,6 +174,28 @@ void copy_bf16_row(uint32_t source_l1_addr, uint32_t output_l1_addr, uint32_t so
   }
 }
 
+void copy_row_segment(uint32_t source_l1_addr, uint32_t output_l1_addr,
+                      uint32_t source_row, uint32_t output_row,
+                      uint32_t col_count) {
+  volatile tt_l1_ptr Element *source =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(source_l1_addr);
+  volatile tt_l1_ptr Element *output =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(output_l1_addr);
+  for (uint32_t col = 0; col < col_count; ++col) {
+    output[tile_element_index(output_row, col)] =
+        source[tile_element_index(source_row, col)];
+  }
+}
+
+void zero_row_segment(uint32_t output_l1_addr, uint32_t output_row,
+                      uint32_t col_count) {
+  volatile tt_l1_ptr Element *output =
+      reinterpret_cast<volatile tt_l1_ptr Element *>(output_l1_addr);
+  for (uint32_t col = 0; col < col_count; ++col) {
+    output[tile_element_index(output_row, col)] = 0;
+  }
+}
+
 // Embedding lookup is a hot LLM path: rank-2 BF16 row gathers can copy a whole
 // tile row from one operand tile instead of doing per-element coordinate decode.
 void run_bf16_rows_gather(const InterleavedAddrGenFast<true> &operand,
@@ -294,6 +318,61 @@ void run_axis_gather(const InterleavedAddrGenFast<true> &operand,
   }
 }
 
+void run_axis1_row_gather(const InterleavedAddrGenFast<true> &operand,
+                          const InterleavedAddrGenFast<true> &indices) {
+  uint32_t output_tile_offset = get_arg_val<uint32_t>(2);
+  uint32_t output_tile_count = get_arg_val<uint32_t>(3);
+
+  constexpr uint32_t cb_operand = tt::CBIndex::c_0;
+  constexpr uint32_t cb_indices = tt::CBIndex::c_1;
+  constexpr uint32_t cb_output = tt::CBIndex::c_16;
+
+  for (uint32_t tile = 0; tile < output_tile_count; ++tile) {
+    uint32_t output_tile_id = output_tile_offset + tile;
+    uint32_t output_matrix_tiles = OUTPUT_TILE_ROWS * OUTPUT_TILES_PER_ROW;
+    uint32_t output_batch = output_tile_id / output_matrix_tiles;
+    uint32_t output_matrix_tile = output_tile_id % output_matrix_tiles;
+    uint32_t output_tile_row = output_matrix_tile / OUTPUT_TILES_PER_ROW;
+    uint32_t output_tile_col = output_matrix_tile % OUTPUT_TILES_PER_ROW;
+    uint32_t output_row_base = output_tile_row * TILE_R;
+    uint32_t output_col_base = output_tile_col * TILE_C;
+    uint32_t row_count = tile_extent(OUTPUT_SHAPE[1], output_row_base, TILE_R);
+    uint32_t col_count = tile_extent(OUTPUT_SHAPE[2], output_col_base, TILE_C);
+
+    uint32_t loaded_index_tile = INVALID_TILE;
+    uint32_t loaded_operand_tile = INVALID_TILE;
+    cb_reserve_back(cb_output, 1);
+    uint32_t output_l1_addr = get_write_ptr(cb_output);
+
+    for (uint32_t row = 0; row < row_count; ++row) {
+      uint32_t output_row = output_row_base + row;
+      int32_t gather_index = read_gather_index(indices, output_row, &loaded_index_tile);
+      if (gather_index < 0 ||
+          static_cast<uint32_t>(gather_index) >= OPERAND_SHAPE[1]) {
+        zero_row_segment(output_l1_addr, row, col_count);
+        continue;
+      }
+
+      uint32_t operand_row = static_cast<uint32_t>(gather_index);
+      uint32_t operand_tile_row = operand_row / TILE_R;
+      uint32_t operand_tile =
+          (output_batch * OPERAND_TILE_ROWS + operand_tile_row) * OPERAND_TILES_PER_ROW +
+          output_tile_col;
+      ensure_tile(operand, operand_tile, cb_operand, &loaded_operand_tile);
+      copy_row_segment(
+          get_read_ptr(cb_operand), output_l1_addr, operand_row % TILE_R, row, col_count);
+    }
+
+    if (loaded_index_tile != INVALID_TILE) {
+      cb_pop_front(cb_indices, 1);
+    }
+    if (loaded_operand_tile != INVALID_TILE) {
+      cb_pop_front(cb_operand, 1);
+    }
+    cb_push_back(cb_output, 1);
+  }
+}
+
 }  // namespace
 
 void kernel_main() {
@@ -315,6 +394,8 @@ void kernel_main() {
   };
   if constexpr (BF16_ROWS) {
     run_bf16_rows_gather(operand, start_indices);
+  } else if constexpr (AXIS1_ROW_GATHER) {
+    run_axis1_row_gather(operand, start_indices);
   } else {
     run_axis_gather(operand, start_indices);
   }

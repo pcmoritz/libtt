@@ -68,6 +68,22 @@ void read_output_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile_i
   cb_push_back(cb, 1);
 }
 
+constexpr bool last_dim_tile_copy() {
+  if constexpr (RANK < 2) {
+    return false;
+  }
+  for (uint32_t dim = 0; dim < RANK - 1; ++dim) {
+    if (START_INDICES[dim] != 0 || STRIDES[dim] != 1 ||
+        INPUT_SHAPE[dim] != OUTPUT_SHAPE[dim]) {
+      return false;
+    }
+  }
+  return STRIDES[RANK - 1] == 1 && START_INDICES[RANK - 1] % TILE_C == 0 &&
+         OUTPUT_SHAPE[RANK - 1] % TILE_C == 0;
+}
+
+constexpr bool LAST_DIM_TILE_COPY = last_dim_tile_copy();
+
 void copy_element(uint32_t cb_input, uint32_t cb_output, uint32_t source_row,
                   uint32_t source_col, uint32_t output_row, uint32_t output_col) {
   volatile tt_l1_ptr Element *source =
@@ -178,6 +194,15 @@ void kernel_main() {
     uint32_t output_col_base = output_tile_col * TILE_C;
     uint32_t row_count = 1;
     uint32_t col_count = 1;
+
+    if constexpr (LAST_DIM_TILE_COPY) {
+      uint32_t input_tile_col = START_INDICES[RANK - 1] / TILE_C + output_tile_col;
+      uint32_t input_tile =
+          (output_batch * INPUT_TILE_ROWS + output_tile_row) * INPUT_TILES_PER_ROW +
+          input_tile_col;
+      read_output_tile(input, input_tile, cb_output);
+      continue;
+    }
 
     if constexpr (RANK == 1) {
       row_count = 1;
