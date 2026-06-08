@@ -61,6 +61,20 @@ void kernel_main() {
           row_tile++;
         }
         noc_async_read_barrier();
+      } else if (view.kind == VIEW_TILE_TRANSPOSE) {
+        uint32_t canonical_base = cur_block - batch * batch_stride;
+        fill_tile_transpose_block(
+            in0_gen,
+            view,
+            batch,
+            canonical_base,
+            A(3),
+            block_h,
+            block_w,
+            l1_addr,
+            tile_bytes,
+            cb_source);
+        block_bytes += block_tiles * tile_bytes;
       } else {
         uint32_t canonical_base = cur_block - batch * batch_stride;
         for (uint32_t h = 0; h < block_h; h++) {
@@ -68,17 +82,7 @@ void kernel_main() {
             uint32_t canonical_tile = canonical_base + h * A(3) + w;
             uint32_t canonical_row_tile = canonical_tile / A(3);
             uint32_t canonical_col_tile = canonical_tile - canonical_row_tile * A(3);
-            if (view.kind == VIEW_TILE_TRANSPOSE) {
-              fill_tile_transpose_tile(
-                  in0_gen,
-                  view,
-                  batch,
-                  canonical_row_tile,
-                  canonical_col_tile,
-                  l1_addr,
-                  tile_bytes,
-                  cb_source);
-            } else if (view.kind == VIEW_TILED_INDEX_MAP) {
+            if (view.kind == VIEW_TILED_INDEX_MAP) {
               fill_tiled_index_map_tile(
                   in0_gen,
                   view,
