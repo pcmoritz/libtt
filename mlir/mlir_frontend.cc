@@ -2789,10 +2789,12 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             select->mutable_select()->set_pred_id(pred_id);
             select->mutable_select()->set_on_true_id(on_true_id);
             select->mutable_select()->set_on_false_id(on_false_id);
-            select->mutable_select()->set_on_true_is_constant(true_packed.has_value());
-            select->mutable_select()->set_on_true_packed_value(true_packed.value_or(0));
-            select->mutable_select()->set_on_false_is_constant(false_packed.has_value());
-            select->mutable_select()->set_on_false_packed_value(false_packed.value_or(0));
+            if (true_packed) {
+                select->mutable_select()->set_on_true_packed_value(*true_packed);
+            }
+            if (false_packed) {
+                select->mutable_select()->set_on_false_packed_value(*false_packed);
+            }
             continue;
         }
 

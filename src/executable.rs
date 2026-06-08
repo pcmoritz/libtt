@@ -517,12 +517,8 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                 Kind::Select(select) => Ok(Op::Select {
                     input_ids: [select.pred_id, select.on_true_id, select.on_false_id],
                     output_id: op_desc.output_id,
-                    on_true_packed_value: select
-                        .on_true_is_constant
-                        .then_some(select.on_true_packed_value),
-                    on_false_packed_value: select
-                        .on_false_is_constant
-                        .then_some(select.on_false_packed_value),
+                    on_true_packed_value: select.on_true_packed_value,
+                    on_false_packed_value: select.on_false_packed_value,
                 }),
                 Kind::BroadcastInDim(broadcast) => Ok(Op::BroadcastInDim {
                     input_id: broadcast.operand_id,
