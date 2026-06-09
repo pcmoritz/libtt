@@ -2688,14 +2688,10 @@ fn execute_rope(
             "TT executable rope output id {output_id} is out of bounds"
         ))
     })?;
-    if x.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || cos.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || sin.buffer_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-        || output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16
-    {
+    if output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
         return Err(invalid_argument(format!(
-            "TT executable rope requires bf16 input/cos/sin/output, got {:?}/{:?}/{:?}/{:?}",
-            x.buffer_type, cos.buffer_type, sin.buffer_type, output_desc.element_type
+            "TT executable rope requires bf16 output, got {:?}",
+            output_desc.element_type
         )));
     }
 
