@@ -15,6 +15,8 @@
 namespace libtt::mlir_frontend {
 namespace {
 
+constexpr int64_t kTileRows = 32;
+
 struct RepeatedCacheMatch {
   mlir::Value cache;
   mlir::Value loc;
@@ -330,7 +332,8 @@ std::optional<mlir::Value> fusedCacheFromInterleavedKvSplits(
   int64_t cacheTokens = splitType->getDimSize(0);
   int64_t kvHeads = splitType->getDimSize(1) / 2;
   int64_t headDim = splitType->getDimSize(2);
-  if (fusedType->getDimSize(0) * fusedType->getDimSize(1) != cacheTokens ||
+  if (kvHeads > kTileRows / 2 ||
+      fusedType->getDimSize(0) * fusedType->getDimSize(1) != cacheTokens ||
       fusedType->getDimSize(2) != kvHeads ||
       fusedType->getDimSize(3) != 2 ||
       fusedType->getDimSize(4) != headDim) {

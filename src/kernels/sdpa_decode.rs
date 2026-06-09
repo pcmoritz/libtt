@@ -346,9 +346,9 @@ fn validate_sdpa_decode_fused_kv_shapes(
             "sdpa_decode fused KV currently supports exactly {TILE_R} query heads, got {q_heads}"
         )));
     }
-    if kv_heads == 0 || q_heads % kv_heads != 0 || kv_heads > TILE_R {
+    if kv_heads == 0 || q_heads % kv_heads != 0 || kv_heads > TILE_R / 2 {
         return Err(invalid_input(format!(
-            "sdpa_decode fused KV requires 1..={TILE_R} kv heads dividing q heads, got q_heads={q_heads} kv_heads={kv_heads}"
+            "sdpa_decode fused KV requires interleaved K/V rows to fit in one tile and divide q heads, got q_heads={q_heads} kv_heads={kv_heads}"
         )));
     }
     if packing != 2 {
