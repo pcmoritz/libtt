@@ -37,6 +37,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "mlir/executable.pb.h"
 #include "mlir/rms_norm_fusing_pattern.h"
+#include "mlir/rope_fusing_pattern.h"
 #include "mlir/sdpa_fusing_pattern.h"
 #include "mlir/stablehlo_utils.h"
 #include "stablehlo/dialect/Serialization.h"
@@ -1097,6 +1098,7 @@ mlir::LogicalResult runCleanupRewritePatterns(
         &context, state, lowerSingleRhsMatmulTranspose, isRhsMatmulTransposeFold));
     patterns.add<libtt::mlir_frontend::SDPADecodeFusing>(&context);
     patterns.add<libtt::mlir_frontend::RMSNormFusing>(&context);
+    patterns.add<libtt::mlir_frontend::RopeFusing>(&context);
     mlir::GreedyRewriteConfig config;
     config.enableFolding();
     if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns), config))) {
@@ -1828,6 +1830,36 @@ bool addRmsNormOp(
     rms_norm->set_weight_id(weight_id);
     rms_norm->set_scale_bits(*scale_bits);
     rms_norm->set_bias_bits(*bias_bits);
+    return true;
+}
+
+bool addRopeOp(
+    mlir::stablehlo::CustomCallOp custom_call_op,
+    tt::Executable& executable,
+    llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
+    std::string& error) {
+    if (custom_call_op.getInputs().size() != 3) {
+        error = "tt.rope custom_call must have exactly three inputs";
+        return false;
+    }
+
+    uint32_t input_id = 0;
+    uint32_t cos_id = 0;
+    uint32_t sin_id = 0;
+    uint32_t output_id = 0;
+    if (!addValueDesc(custom_call_op.getInputs()[0], executable, value_ids, error, input_id) ||
+        !addValueDesc(custom_call_op.getInputs()[1], executable, value_ids, error, cos_id) ||
+        !addValueDesc(custom_call_op.getInputs()[2], executable, value_ids, error, sin_id) ||
+        !addValueDesc(custom_call_op->getResult(0), executable, value_ids, error, output_id)) {
+        return false;
+    }
+
+    auto* op = executable.add_ops();
+    op->set_output_id(output_id);
+    auto* rope = op->mutable_rope();
+    rope->set_input_id(input_id);
+    rope->set_cos_id(cos_id);
+    rope->set_sin_id(sin_id);
     return true;
 }
 
@@ -2980,6 +3012,12 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             }
             if (call_target == libtt::mlir_frontend::kRmsNormTarget) {
                 if (!addRmsNormOp(custom_call_op, executable, value_ids, error)) {
+                    return false;
+                }
+                continue;
+            }
+            if (call_target == libtt::mlir_frontend::kRopeTarget) {
+                if (!addRopeOp(custom_call_op, executable, value_ids, error)) {
                     return false;
                 }
                 continue;
