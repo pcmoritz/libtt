@@ -83,6 +83,25 @@ void copy_bf16_kv_rows_from_tiles(
   cb_pop_front(cb_temp, 2);
 }
 
+template <typename AddrGen>
+void copy_bf16_fused_kv_rows_from_tile(
+    const AddrGen &kv_gen,
+    uint32_t kv_tile,
+    uint32_t source_row,
+    uint32_t k_dst_addr,
+    uint32_t v_dst_addr,
+    uint32_t dst_row,
+    uint32_t cb_temp) {
+  cb_reserve_back(cb_temp, 1);
+  uint32_t temp_base = get_write_ptr(cb_temp);
+  noc_async_read_tile(kv_tile, kv_gen, temp_base);
+  noc_async_read_barrier();
+  copy_bf16_row_from_l1(temp_base, source_row, k_dst_addr, dst_row);
+  copy_bf16_row_from_l1(temp_base, source_row + 1, v_dst_addr, dst_row);
+  cb_push_back(cb_temp, 1);
+  cb_pop_front(cb_temp, 1);
+}
+
 void write_mask_tile(uint32_t l1_addr, const bool valid[TILE_C]) {
   volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(l1_addr);
   uint32_t mask_words[2][FACE_C / 2];
@@ -142,11 +161,13 @@ void kernel_main() {
       .page_size = get_tile_size(cb_k),
       .data_format = get_dataformat(cb_k),
   };
+#ifndef SDPA_FUSED_KV
   const InterleavedAddrGenFast<true> v_reader = {
       .bank_base_address = v_addr,
       .page_size = get_tile_size(cb_v),
       .data_format = get_dataformat(cb_v),
   };
+#endif
   const InterleavedAddrGenFast<true> seq_reader = {
       .bank_base_address = seq_lens_addr,
       .page_size = get_tile_size(cb_seq),
@@ -177,6 +198,9 @@ void kernel_main() {
   if (active_st > ST) {
     active_st = ST;
   }
+#ifdef SDPA_FUSED_KV
+  uint32_t fused_kv_source_row = cur_kv_head * 2;
+#endif
   uint32_t active_sk_chunk_t = active_st < SK_CHUNK_T ? active_st : SK_CHUNK_T;
   for (uint32_t chunk = 0; chunk < active_st; chunk += active_sk_chunk_t) {
     uint32_t active_kv_tiles = active_sk_chunk_t * DHT;
@@ -221,6 +245,16 @@ void kernel_main() {
         for (uint32_t row = 0; row < TILE_R; ++row) {
           if (valid_rows[sk][row]) {
             uint32_t cache_tile = cache_tiles[row] + d;
+#ifdef SDPA_FUSED_KV
+            copy_bf16_fused_kv_rows_from_tile(
+                k_reader,
+                cache_tile,
+                fused_kv_source_row,
+                k_dst,
+                v_dst,
+                row,
+                cb_temp);
+#else
             copy_bf16_kv_rows_from_tiles(
                 k_reader,
                 v_reader,
@@ -231,6 +265,7 @@ void kernel_main() {
                 v_dst,
                 row,
                 cb_temp);
+#endif
           } else {
             zero_bf16_row(k_dst, row);
             zero_bf16_row(v_dst, row);

@@ -28,6 +28,7 @@ struct SdpaDecodeProgramKey {
     cache_tokens: usize,
     key_tokens: usize,
     scale_bf16_packed: u32,
+    fused_kv_cache: bool,
 }
 
 struct SdpaDecodeKernel {
@@ -95,6 +96,87 @@ pub(crate) fn sdpa_decode(
         loc_shape,
         output_shape,
     )?;
+    run_sdpa_decode(
+        device,
+        q,
+        k,
+        Some(v),
+        seq_lens,
+        loc,
+        output_shape,
+        shape,
+        scale_bf16_packed,
+        false,
+        name,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdpa_decode_fused_kv(
+    device: &mut Device,
+    q: &DramBuffer,
+    fused_kv: &DramBuffer,
+    seq_lens: &DramBuffer,
+    loc: &DramBuffer,
+    q_shape: &[usize],
+    fused_kv_shape: &[usize],
+    fused_kv_source_shape: Option<&[usize]>,
+    seq_lens_shape: &[usize],
+    loc_shape: &[usize],
+    output_shape: &[usize],
+    scale_bf16_packed: u32,
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
+    let shape = validate_sdpa_decode_fused_kv_shapes(
+        q,
+        fused_kv,
+        seq_lens,
+        loc,
+        q_shape,
+        fused_kv_shape,
+        fused_kv_source_shape,
+        seq_lens_shape,
+        loc_shape,
+        output_shape,
+    )?;
+    run_sdpa_decode(
+        device,
+        q,
+        fused_kv,
+        None,
+        seq_lens,
+        loc,
+        output_shape,
+        shape,
+        scale_bf16_packed,
+        true,
+        name,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SdpaDecodeShape {
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    cache_tokens: usize,
+    key_tokens: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sdpa_decode(
+    device: &mut Device,
+    q: &DramBuffer,
+    k_or_fused_kv: &DramBuffer,
+    v: Option<&DramBuffer>,
+    seq_lens: &DramBuffer,
+    loc: &DramBuffer,
+    output_shape: &[usize],
+    shape: SdpaDecodeShape,
+    scale_bf16_packed: u32,
+    fused_kv_cache: bool,
+    name: impl Into<String>,
+) -> io::Result<DramBuffer> {
     let output_allocation_shape = tiled_allocation_shape(output_shape)?;
     let output_tiles = tiled_shape_tile_count(output_shape)?;
     let output = device.alloc(
@@ -113,11 +195,15 @@ pub(crate) fn sdpa_decode(
         cache_tokens: shape.cache_tokens,
         key_tokens: shape.key_tokens,
         scale_bf16_packed,
+        fused_kv_cache,
     };
     let kernel = SdpaDecodeKernel {
         q_addr: u32_addr(q.addr, "q address")?,
-        k_addr: u32_addr(k.addr, "k address")?,
-        v_addr: u32_addr(v.addr, "v address")?,
+        k_addr: u32_addr(k_or_fused_kv.addr, "k/fused_kv address")?,
+        v_addr: match v {
+            Some(v) => u32_addr(v.addr, "v address")?,
+            None => 0,
+        },
         seq_lens_addr: u32_addr(seq_lens.addr, "seq_lens address")?,
         loc_addr: u32_addr(loc.addr, "loc address")?,
         output_addr: u32_addr(output.addr, "sdpa output address")?,
@@ -125,15 +211,6 @@ pub(crate) fn sdpa_decode(
     };
     kernel.run(device)?;
     Ok(output)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SdpaDecodeShape {
-    q_heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    cache_tokens: usize,
-    key_tokens: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -209,6 +286,99 @@ fn validate_sdpa_decode_shapes(
     validate_tiled_buffer(q, q_shape, "q")?;
     validate_tiled_buffer(k, k_shape, "k")?;
     validate_tiled_buffer(v, v_shape, "v")?;
+    validate_tiled_buffer(seq_lens, seq_lens_shape, "seq_lens")?;
+    validate_tiled_buffer(loc, loc_shape, "loc")?;
+    Ok(SdpaDecodeShape {
+        q_heads,
+        kv_heads,
+        head_dim,
+        cache_tokens,
+        key_tokens,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_sdpa_decode_fused_kv_shapes(
+    q: &DramBuffer,
+    fused_kv: &DramBuffer,
+    seq_lens: &DramBuffer,
+    loc: &DramBuffer,
+    q_shape: &[usize],
+    fused_kv_shape: &[usize],
+    fused_kv_source_shape: Option<&[usize]>,
+    seq_lens_shape: &[usize],
+    loc_shape: &[usize],
+    output_shape: &[usize],
+) -> io::Result<SdpaDecodeShape> {
+    if q.dtype != DType::Float16B || fused_kv.dtype != DType::Float16B {
+        return Err(invalid_input(format!(
+            "sdpa_decode fused KV requires bf16 q/fused_kv, got {:?}/{:?}",
+            q.dtype, fused_kv.dtype
+        )));
+    }
+    if seq_lens.dtype != DType::Int32 || loc.dtype != DType::Int32 {
+        return Err(invalid_input(format!(
+            "sdpa_decode fused KV requires s32 seq_lens/loc, got {:?}/{:?}",
+            seq_lens.dtype, loc.dtype
+        )));
+    }
+    if q_shape.len() != 3 || fused_kv_shape.len() != 5 || output_shape.len() != 3 {
+        return Err(invalid_input(format!(
+            "sdpa_decode fused KV requires q/output rank 3 and fused_kv rank 5, got q={q_shape:?} fused_kv={fused_kv_shape:?} output={output_shape:?}"
+        )));
+    }
+    if seq_lens_shape != [1] || loc_shape.len() != 1 {
+        return Err(invalid_input(format!(
+            "sdpa_decode fused KV requires seq_lens=[1] and rank-1 loc, got seq_lens={seq_lens_shape:?} loc={loc_shape:?}"
+        )));
+    }
+
+    let [q_batch, q_heads, head_dim]: [usize; 3] = q_shape.try_into().expect("rank checked");
+    let [pages, page_size, kv_heads, packing, kv_head_dim]: [usize; 5] =
+        fused_kv_shape.try_into().expect("rank checked");
+    if q_batch != 1 || output_shape != [1, q_heads, head_dim] {
+        return Err(invalid_input(format!(
+            "sdpa_decode fused KV currently requires q batch 1 and output [1, q_heads, head_dim], got q={q_shape:?} output={output_shape:?}"
+        )));
+    }
+    if q_heads != TILE_R {
+        return Err(invalid_input(format!(
+            "sdpa_decode fused KV currently supports exactly {TILE_R} query heads, got {q_heads}"
+        )));
+    }
+    if kv_heads == 0 || q_heads % kv_heads != 0 || kv_heads > TILE_R / 2 {
+        return Err(invalid_input(format!(
+            "sdpa_decode fused KV requires interleaved K/V rows to fit in one tile and divide q heads, got q_heads={q_heads} kv_heads={kv_heads}"
+        )));
+    }
+    if packing != 2 {
+        return Err(invalid_input(format!(
+            "sdpa_decode fused KV currently requires BF16 K/V packing dimension 2, got {packing}"
+        )));
+    }
+    if head_dim != kv_head_dim || head_dim == 0 || head_dim % TILE_C != 0 {
+        return Err(invalid_input(format!(
+            "sdpa_decode fused KV requires matching head_dim divisible by {TILE_C}, got q={head_dim} kv={kv_head_dim}"
+        )));
+    }
+    let cache_tokens = pages
+        .checked_mul(page_size)
+        .ok_or_else(|| invalid_input("sdpa_decode fused KV cache token count is too large"))?;
+    let expected_source_shape = [cache_tokens, kv_heads * 2, head_dim];
+    if fused_kv_source_shape != Some(expected_source_shape.as_slice()) {
+        return Err(invalid_input(format!(
+            "sdpa_decode fused KV requires compact source shape {:?}, got {:?}",
+            expected_source_shape, fused_kv_source_shape
+        )));
+    }
+    let key_tokens = loc_shape[0];
+    if key_tokens == 0 || cache_tokens == 0 {
+        return Err(invalid_input(format!(
+            "sdpa_decode fused KV requires non-empty key/cache lengths, got key_tokens={key_tokens} cache_tokens={cache_tokens}"
+        )));
+    }
+    validate_tiled_buffer(q, q_shape, "q")?;
+    validate_tiled_buffer(fused_kv, &expected_source_shape, "fused_kv")?;
     validate_tiled_buffer(seq_lens, seq_lens_shape, "seq_lens")?;
     validate_tiled_buffer(loc, loc_shape, "loc")?;
     Ok(SdpaDecodeShape {
@@ -320,7 +490,8 @@ fn sdpa_decode_program(key: SdpaDecodeProgramKey) -> io::Result<Program> {
             ..CompileConfig::default()
         },
         name: format!(
-            "sdpa_decode_q{}_kv{}_d{}_s{}",
+            "sdpa_decode{}q{}_kv{}_d{}_s{}",
+            if key.fused_kv_cache { "_fused_kv_" } else { "_" },
             key.q_heads, key.kv_heads, key.head_dim, key.key_tokens
         ),
         ..Program::new(runtime_args)
@@ -340,8 +511,13 @@ fn sdpa_key_chunk_tiles(st: usize) -> usize {
 }
 
 fn reader_source(key: &SdpaDecodeProgramKey, st: usize, dht: usize, sk_chunk_t: usize) -> String {
+    let fused_kv_define = if key.fused_kv_cache {
+        "#define SDPA_FUSED_KV 1\n"
+    } else {
+        ""
+    };
     format!(
-        "#define SDPA_ST {st}\n#define SDPA_DHT {dht}\n#define SDPA_SK_CHUNK_T {sk_chunk_t}\n#define SDPA_KV_HEADS {}\n#define SDPA_CACHE_TOKENS {}\n{}",
+        "#define SDPA_ST {st}\n#define SDPA_DHT {dht}\n#define SDPA_SK_CHUNK_T {sk_chunk_t}\n#define SDPA_KV_HEADS {}\n#define SDPA_CACHE_TOKENS {}\n{fused_kv_define}{}",
         key.kv_heads, key.cache_tokens, READER
     )
 }

@@ -133,7 +133,8 @@ pub(crate) enum Op {
         nodes: Vec<FusedElementwiseNode>,
     },
     SdpaDecode {
-        input_ids: [u32; 5],
+        input_ids: [u32; 4],
+        v_id: Option<u32>,
         output_id: u32,
         scale_bf16_packed: u32,
     },
@@ -596,17 +597,20 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                         .map(parse_fused_elementwise_node)
                         .collect::<Result<Vec<_>, String>>()?,
                 }),
-                Kind::SdpaDecode(sdpa_decode) => Ok(Op::SdpaDecode {
-                    input_ids: [
-                        sdpa_decode.q_id,
-                        sdpa_decode.k_id,
-                        sdpa_decode.v_id,
-                        sdpa_decode.seq_lens_id,
-                        sdpa_decode.loc_id,
-                    ],
-                    output_id: op_desc.output_id,
-                    scale_bf16_packed: sdpa_decode.scale_bf16_packed,
-                }),
+                Kind::SdpaDecode(sdpa_decode) => {
+                    let v_id = (!sdpa_decode.fused_kv_cache).then_some(sdpa_decode.v_id);
+                    Ok(Op::SdpaDecode {
+                        input_ids: [
+                            sdpa_decode.q_id,
+                            sdpa_decode.k_id,
+                            sdpa_decode.seq_lens_id,
+                            sdpa_decode.loc_id,
+                        ],
+                        v_id,
+                        output_id: op_desc.output_id,
+                        scale_bf16_packed: sdpa_decode.scale_bf16_packed,
+                    })
+                }
                 Kind::RmsNorm(rms_norm) => Ok(Op::RmsNorm {
                     input_ids: [rms_norm.input_id, rms_norm.weight_id],
                     output_id: op_desc.output_id,

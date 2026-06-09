@@ -1739,8 +1739,9 @@ bool addSdpaDecodeOp(
     tt::Executable& executable,
     llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
     std::string& error) {
-    if (custom_call_op->getNumResults() != 1 || custom_call_op.getInputs().size() != 5) {
-        error = "tt.sdpa_decode custom_call must have five inputs and one result";
+    size_t input_count = custom_call_op.getInputs().size();
+    if (custom_call_op->getNumResults() != 1 || (input_count != 4 && input_count != 5)) {
+        error = "tt.sdpa_decode custom_call must have four or five inputs and one result";
         return false;
     }
     auto scale_bf16_packed = sdpaDecodeScaleBf16Packed(custom_call_op, error);
@@ -1764,9 +1765,15 @@ bool addSdpaDecodeOp(
     auto* sdpa = op->mutable_sdpa_decode();
     sdpa->set_q_id(input_ids[0]);
     sdpa->set_k_id(input_ids[1]);
-    sdpa->set_v_id(input_ids[2]);
-    sdpa->set_seq_lens_id(input_ids[3]);
-    sdpa->set_loc_id(input_ids[4]);
+    if (input_count == 4) {
+        sdpa->set_seq_lens_id(input_ids[2]);
+        sdpa->set_loc_id(input_ids[3]);
+        sdpa->set_fused_kv_cache(true);
+    } else {
+        sdpa->set_v_id(input_ids[2]);
+        sdpa->set_seq_lens_id(input_ids[3]);
+        sdpa->set_loc_id(input_ids[4]);
+    }
     sdpa->set_scale_bf16_packed(*scale_bf16_packed);
     return true;
 }

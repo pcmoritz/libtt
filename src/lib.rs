@@ -2504,29 +2504,33 @@ fn execute_sdpa_decode(
     plan: &executable::Executable,
     device: &mut Device,
     context: &OutputContext,
-    input_ids: [u32; 5],
+    input_ids: [u32; 4],
+    v_id: Option<u32>,
     output_id: u32,
     scale_bf16_packed: u32,
 ) -> Result<(), *mut PJRT_Error> {
     let q = device_buffer_for_value(values, input_ids[0], "sdpa_decode.q")?;
-    let k = device_buffer_for_value(values, input_ids[1], "sdpa_decode.k")?;
-    let v = device_buffer_for_value(values, input_ids[2], "sdpa_decode.v")?;
-    let seq_lens = device_buffer_for_value(values, input_ids[3], "sdpa_decode.seq_lens")?;
-    let loc = device_buffer_for_value(values, input_ids[4], "sdpa_decode.loc")?;
+    let k_or_fused_kv = device_buffer_for_value(values, input_ids[1], "sdpa_decode.k")?;
+    let seq_lens = device_buffer_for_value(values, input_ids[2], "sdpa_decode.seq_lens")?;
+    let loc = device_buffer_for_value(values, input_ids[3], "sdpa_decode.loc")?;
+    let v = v_id
+        .map(|id| device_buffer_for_value(values, id, "sdpa_decode.v"))
+        .transpose()?;
     let Some(q_dram) = q.dram_buffer.as_ref() else {
         return Err(failed_precondition(
             "TT executable sdpa_decode q buffer has no device allocation",
         ));
     };
-    let Some(k_dram) = k.dram_buffer.as_ref() else {
+    let Some(k_or_fused_kv_dram) = k_or_fused_kv.dram_buffer.as_ref() else {
         return Err(failed_precondition(
             "TT executable sdpa_decode k buffer has no device allocation",
         ));
     };
-    let Some(v_dram) = v.dram_buffer.as_ref() else {
-        return Err(failed_precondition(
-            "TT executable sdpa_decode v buffer has no device allocation",
-        ));
+    let v_dram = match v {
+        Some(v) => Some(v.dram_buffer.as_ref().ok_or_else(|| {
+            failed_precondition("TT executable sdpa_decode v buffer has no device allocation")
+        })?),
+        None => None,
     };
     let Some(seq_lens_dram) = seq_lens.dram_buffer.as_ref() else {
         return Err(failed_precondition(
@@ -2550,22 +2554,40 @@ fn execute_sdpa_decode(
         )));
     }
     let output_shape = dims_i64_to_usize(&output_desc.dims)?;
-    let output_dram = kernels::sdpa_decode::sdpa_decode(
-        device,
-        q_dram,
-        k_dram,
-        v_dram,
-        seq_lens_dram,
-        loc_dram,
-        &dims_i64_to_usize(&q.dims)?,
-        &dims_i64_to_usize(&k.dims)?,
-        &dims_i64_to_usize(&v.dims)?,
-        &dims_i64_to_usize(&seq_lens.dims)?,
-        &dims_i64_to_usize(&loc.dims)?,
-        &output_shape,
-        scale_bf16_packed,
-        "pjrt_sdpa_decode",
-    )
+    let output_dram = match (v, v_dram) {
+        (Some(v), Some(v_dram)) => kernels::sdpa_decode::sdpa_decode(
+            device,
+            q_dram,
+            k_or_fused_kv_dram,
+            v_dram,
+            seq_lens_dram,
+            loc_dram,
+            &dims_i64_to_usize(&q.dims)?,
+            &dims_i64_to_usize(&k_or_fused_kv.dims)?,
+            &dims_i64_to_usize(&v.dims)?,
+            &dims_i64_to_usize(&seq_lens.dims)?,
+            &dims_i64_to_usize(&loc.dims)?,
+            &output_shape,
+            scale_bf16_packed,
+            "pjrt_sdpa_decode",
+        ),
+        (None, None) => kernels::sdpa_decode::sdpa_decode_fused_kv(
+            device,
+            q_dram,
+            k_or_fused_kv_dram,
+            seq_lens_dram,
+            loc_dram,
+            &dims_i64_to_usize(&q.dims)?,
+            &dims_i64_to_usize(&k_or_fused_kv.dims)?,
+            k_or_fused_kv.source_shape.as_deref(),
+            &dims_i64_to_usize(&seq_lens.dims)?,
+            &dims_i64_to_usize(&loc.dims)?,
+            &output_shape,
+            scale_bf16_packed,
+            "pjrt_sdpa_decode_fused_kv",
+        ),
+        _ => unreachable!("v and v_dram are derived from the same optional buffer"),
+    }
     .map_err(io_error)?;
     store_output_buffer(
         values,
@@ -2810,7 +2832,9 @@ fn op_consumes_value(op: &executable::Op, value_id: u32) -> bool {
         executable::Op::Scatter { input_ids, .. } | executable::Op::Select { input_ids, .. } => {
             input_ids.contains(&value_id)
         }
-        executable::Op::SdpaDecode { input_ids, .. } => input_ids.contains(&value_id),
+        executable::Op::SdpaDecode {
+            input_ids, v_id, ..
+        } => input_ids.contains(&value_id) || *v_id == Some(value_id),
         executable::Op::RmsNorm { input_ids, .. } => input_ids.contains(&value_id),
         executable::Op::Rope { input_ids, .. } => input_ids.contains(&value_id),
     }
@@ -3763,6 +3787,7 @@ fn execute_executable_v1(
             )?,
             executable::Op::SdpaDecode {
                 input_ids,
+                v_id,
                 output_id,
                 scale_bf16_packed,
             } => execute_sdpa_decode(
@@ -3771,6 +3796,7 @@ fn execute_executable_v1(
                 device,
                 output_context,
                 *input_ids,
+                *v_id,
                 *output_id,
                 *scale_bf16_packed,
             )?,

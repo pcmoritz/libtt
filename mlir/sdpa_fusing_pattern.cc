@@ -7,12 +7,15 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/stablehlo_utils.h"
 
 namespace libtt::mlir_frontend {
 namespace {
+
+constexpr int64_t kTileRows = 32;
 
 struct RepeatedCacheMatch {
   mlir::Value cache;
@@ -46,6 +49,7 @@ struct Components {
   mlir::Value q;
   mlir::Value k;
   mlir::Value v;
+  std::optional<mlir::Value> fusedKvCache;
   mlir::Value seqLens;
   mlir::Value loc;
   uint32_t scaleBf16Packed = 0;
@@ -182,6 +186,160 @@ std::optional<mlir::Value> findUniqueS32TensorWithLength(mlir::Value value,
     return std::nullopt;
   }
   return match;
+}
+
+std::optional<int64_t> i32SplatConstant(mlir::Value value) {
+  value = peelIdentityCustomCalls(value);
+  while (auto broadcastOp =
+             value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
+    value = peelIdentityCustomCalls(broadcastOp.getOperand());
+  }
+  auto constantOp = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
+  if (!constantOp) {
+    return std::nullopt;
+  }
+  auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(constantOp.getValue());
+  if (!dense || !dense.isSplat()) {
+    return std::nullopt;
+  }
+  auto integer = mlir::dyn_cast<mlir::IntegerType>(dense.getElementType());
+  if (!integer || integer.getWidth() != 32 || integer.isUnsigned()) {
+    return std::nullopt;
+  }
+  return dense.getSplatValue<llvm::APInt>().getSExtValue();
+}
+
+bool isIotaDim0(mlir::Value value, int64_t length) {
+  value = peelIdentityCustomCalls(value);
+  auto iotaOp = value.getDefiningOp<mlir::stablehlo::IotaOp>();
+  auto type = getStaticRankedTensor(value);
+  return iotaOp && type && type->getRank() == 1 &&
+         type->getDimSize(0) == length && iotaOp.getIotaDimension() == 0;
+}
+
+bool isIotaTimesTwo(mlir::Value value, int64_t length) {
+  value = peelIdentityCustomCalls(value);
+  auto multiplyOp = value.getDefiningOp<mlir::stablehlo::MulOp>();
+  if (!multiplyOp) {
+    return false;
+  }
+  auto lhsConstant = i32SplatConstant(multiplyOp.getLhs());
+  if (lhsConstant && *lhsConstant == 2 &&
+      isIotaDim0(multiplyOp.getRhs(), length)) {
+    return true;
+  }
+  auto rhsConstant = i32SplatConstant(multiplyOp.getRhs());
+  return rhsConstant && *rhsConstant == 2 &&
+         isIotaDim0(multiplyOp.getLhs(), length);
+}
+
+std::optional<int64_t> strideTwoGatherOffset(mlir::Value startIndices,
+                                             int64_t length) {
+  startIndices = peelIdentityCustomCalls(startIndices);
+  auto broadcastOp =
+      startIndices.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
+  auto broadcastType = getStaticRankedTensor(startIndices);
+  if (!broadcastOp || !broadcastType || broadcastType->getRank() != 2 ||
+      broadcastType->getDimSize(0) != length ||
+      broadcastType->getDimSize(1) != 1 ||
+      broadcastOp.getBroadcastDimensions() != llvm::ArrayRef<int64_t>{0}) {
+    return std::nullopt;
+  }
+
+  mlir::Value vector = peelIdentityCustomCalls(broadcastOp.getOperand());
+  if (isIotaTimesTwo(vector, length)) {
+    return 0;
+  }
+  auto addOp = vector.getDefiningOp<mlir::stablehlo::AddOp>();
+  if (!addOp) {
+    return std::nullopt;
+  }
+  auto lhsConstant = i32SplatConstant(addOp.getLhs());
+  if (lhsConstant && isIotaTimesTwo(addOp.getRhs(), length)) {
+    return *lhsConstant;
+  }
+  auto rhsConstant = i32SplatConstant(addOp.getRhs());
+  if (rhsConstant && isIotaTimesTwo(addOp.getLhs(), length)) {
+    return *rhsConstant;
+  }
+  return std::nullopt;
+}
+
+bool isInterleavedKvSplitGather(mlir::stablehlo::GatherOp gatherOp,
+                                int64_t expectedOffset) {
+  auto resultType = getStaticRankedTensor(gatherOp.getResult());
+  auto operandType = getStaticRankedTensor(gatherOp.getOperand());
+  if (!resultType || !operandType || resultType->getRank() != 3 ||
+      operandType->getRank() != 3 ||
+      !resultType->getElementType().isBF16() ||
+      !operandType->getElementType().isBF16()) {
+    return false;
+  }
+  int64_t cacheTokens = resultType->getDimSize(0);
+  int64_t kvHeads = resultType->getDimSize(1);
+  int64_t headDim = resultType->getDimSize(2);
+  if (cacheTokens <= 0 || kvHeads <= 0 || headDim <= 0 ||
+      operandType->getDimSize(0) != cacheTokens ||
+      operandType->getDimSize(1) != kvHeads * 2 ||
+      operandType->getDimSize(2) != headDim) {
+    return false;
+  }
+
+  auto dims = gatherOp.getDimensionNumbers();
+  if (dims.getOffsetDims() != llvm::ArrayRef<int64_t>{0, 2} ||
+      dims.getCollapsedSliceDims() != llvm::ArrayRef<int64_t>{1} ||
+      dims.getStartIndexMap() != llvm::ArrayRef<int64_t>{1} ||
+      dims.getIndexVectorDim() != 1) {
+    return false;
+  }
+  auto sliceSizes = gatherOp.getSliceSizes();
+  if (sliceSizes.size() != 3 || sliceSizes[0] != cacheTokens ||
+      sliceSizes[1] != 1 || sliceSizes[2] != headDim) {
+    return false;
+  }
+  auto offset = strideTwoGatherOffset(gatherOp.getStartIndices(), kvHeads);
+  return offset && *offset == expectedOffset;
+}
+
+std::optional<mlir::Value> fusedCacheFromInterleavedKvSplits(
+    mlir::Value kCache,
+    mlir::Value vCache) {
+  kCache = peelIdentityCustomCalls(kCache);
+  vCache = peelIdentityCustomCalls(vCache);
+  auto kGather = kCache.getDefiningOp<mlir::stablehlo::GatherOp>();
+  auto vGather = vCache.getDefiningOp<mlir::stablehlo::GatherOp>();
+  if (!kGather || !vGather ||
+      !isInterleavedKvSplitGather(kGather, /*expectedOffset=*/0) ||
+      !isInterleavedKvSplitGather(vGather, /*expectedOffset=*/1)) {
+    return std::nullopt;
+  }
+
+  mlir::Value kOperand = peelIdentityCustomCalls(kGather.getOperand());
+  mlir::Value vOperand = peelIdentityCustomCalls(vGather.getOperand());
+  if (kOperand != vOperand) {
+    return std::nullopt;
+  }
+  auto reshapeOp = kOperand.getDefiningOp<mlir::stablehlo::ReshapeOp>();
+  if (!reshapeOp) {
+    return std::nullopt;
+  }
+  auto splitType = getStaticRankedTensor(kOperand);
+  auto fusedType = getStaticRankedTensor(reshapeOp.getOperand());
+  if (!splitType || !fusedType || fusedType->getRank() != 5 ||
+      !fusedType->getElementType().isBF16()) {
+    return std::nullopt;
+  }
+  int64_t cacheTokens = splitType->getDimSize(0);
+  int64_t kvHeads = splitType->getDimSize(1) / 2;
+  int64_t headDim = splitType->getDimSize(2);
+  if (kvHeads > kTileRows / 2 ||
+      fusedType->getDimSize(0) * fusedType->getDimSize(1) != cacheTokens ||
+      fusedType->getDimSize(2) != kvHeads ||
+      fusedType->getDimSize(3) != 2 ||
+      fusedType->getDimSize(4) != headDim) {
+    return std::nullopt;
+  }
+  return reshapeOp.getOperand();
 }
 
 std::optional<mlir::stablehlo::GatherOp> gatherFromCacheValue(
@@ -495,6 +653,8 @@ std::optional<Components> matchSdpaDecode(
   if (!scoreMatch || scoreMatch->loc != vMatch->loc) {
     return std::nullopt;
   }
+  auto fusedKvCache =
+      fusedCacheFromInterleavedKvSplits(scoreMatch->k, vMatch->cache);
 
   auto qType = getStaticRankedTensor(scoreMatch->q);
   if (!qType || qType->getRank() != 3 || qType->getDimSize(0) != 1 ||
@@ -505,6 +665,7 @@ std::optional<Components> matchSdpaDecode(
   return Components{scoreMatch->q,
                     scoreMatch->k,
                     vMatch->cache,
+                    fusedKvCache,
                     scoreMatch->seqLens,
                     vMatch->loc,
                     scoreMatch->scaleBf16Packed};
@@ -516,10 +677,22 @@ mlir::LogicalResult createSdpaDecodeOp(mlir::PatternRewriter &rewriter,
   rewriter.setInsertionPoint(root);
   auto backendConfig =
       rewriter.getStringAttr(std::to_string(components.scaleBf16Packed));
+  llvm::SmallVector<mlir::Value, 5> inputs;
+  if (components.fusedKvCache) {
+    inputs.push_back(components.q);
+    inputs.push_back(*components.fusedKvCache);
+    inputs.push_back(components.seqLens);
+    inputs.push_back(components.loc);
+  } else {
+    inputs.push_back(components.q);
+    inputs.push_back(components.k);
+    inputs.push_back(components.v);
+    inputs.push_back(components.seqLens);
+    inputs.push_back(components.loc);
+  }
   auto customCall = rewriter.create<mlir::stablehlo::CustomCallOp>(
       root.getLoc(), root->getResultTypes(),
-      mlir::ValueRange{components.q, components.k, components.v,
-                       components.seqLens, components.loc},
+      inputs,
       kSdpaDecodeTarget,
       /*hasSideEffect=*/false, backendConfig,
       mlir::stablehlo::CustomCallApiVersion::API_VERSION_ORIGINAL,

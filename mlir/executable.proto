@@ -240,12 +240,15 @@ message SdpaDecodeOp {
   // The first supported lowering is decode-only BF16 attention with shapes:
   // q=[1, q_heads, head_dim], k/v=[cache_tokens, kv_heads, head_dim],
   // seq_lens=[1], loc=[key_tokens].
+  // If fused_kv_cache is true, k_id is a fused KV cache shaped
+  // [pages, page_size, kv_heads, 2, head_dim] and v_id is unused.
   uint32 q_id = 1;
   uint32 k_id = 2;
   uint32 v_id = 3;
   uint32 seq_lens_id = 4;
   uint32 loc_id = 5;
   uint32 scale_bf16_packed = 6;
+  bool fused_kv_cache = 7;
 }
 
 message RmsNormOp {
