@@ -204,3 +204,44 @@ where
         .try_into()
         .map_err(|_| invalid_input(format!("{name} is out of u32 range")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_u32(blob: &[u8], word: usize) -> u32 {
+        let offset = word * std::mem::size_of::<u32>();
+        u32::from_le_bytes(blob[offset..offset + 4].try_into().expect("u32 word"))
+    }
+
+    #[test]
+    fn rope_runtime_args_match_reader_compute_and_writer_kernels() {
+        let key = RopeProgramKey {
+            cores: vec![CoreCoord { x: 1, y: 1 }, CoreCoord { x: 2, y: 1 }],
+            output_tiles: 5,
+            output_tile_rows: 1,
+            tiles_per_row: 4,
+            half_tiles: 2,
+        };
+        let program = rope_program(key).expect("program");
+        assert_eq!(program.runtime_args.section_sizes(), (12, 20, 8));
+
+        let blobs = program.runtime_args.blobs();
+        assert_eq!(blobs.len(), 2);
+        for (blob, expected_offset, expected_tiles) in [(&blobs[0], 0, 3), (&blobs[1], 3, 2)] {
+            // tile_writer.cc reads output_addr/offset/n_tiles at writer args 0/1/2.
+            assert_eq!(read_u32(blob, 1), expected_offset);
+            assert_eq!(read_u32(blob, 2), expected_tiles);
+
+            // rope_reader.cc reads input/cos/sin/offset/n_tiles at reader args 0..4.
+            let reader_base = 3;
+            assert_eq!(read_u32(blob, reader_base + 3), expected_offset);
+            assert_eq!(read_u32(blob, reader_base + 4), expected_tiles);
+
+            // rope_compute.cc reads tile_offset/n_tiles at compute args 0/1.
+            let compute_base = reader_base + 5;
+            assert_eq!(read_u32(blob, compute_base), expected_offset);
+            assert_eq!(read_u32(blob, compute_base + 1), expected_tiles);
+        }
+    }
+}
