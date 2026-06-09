@@ -137,6 +137,11 @@ pub(crate) enum Op {
         output_id: u32,
         scale_bf16_packed: u32,
     },
+    SdpaDecodeFusedKv {
+        input_ids: [u32; 4],
+        output_id: u32,
+        scale_bf16_packed: u32,
+    },
     RmsNorm {
         input_ids: [u32; 2],
         output_id: u32,
@@ -596,17 +601,32 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                         .map(parse_fused_elementwise_node)
                         .collect::<Result<Vec<_>, String>>()?,
                 }),
-                Kind::SdpaDecode(sdpa_decode) => Ok(Op::SdpaDecode {
-                    input_ids: [
-                        sdpa_decode.q_id,
-                        sdpa_decode.k_id,
-                        sdpa_decode.v_id,
-                        sdpa_decode.seq_lens_id,
-                        sdpa_decode.loc_id,
-                    ],
-                    output_id: op_desc.output_id,
-                    scale_bf16_packed: sdpa_decode.scale_bf16_packed,
-                }),
+                Kind::SdpaDecode(sdpa_decode) => {
+                    if sdpa_decode.fused_kv_cache {
+                        Ok(Op::SdpaDecodeFusedKv {
+                            input_ids: [
+                                sdpa_decode.q_id,
+                                sdpa_decode.k_id,
+                                sdpa_decode.seq_lens_id,
+                                sdpa_decode.loc_id,
+                            ],
+                            output_id: op_desc.output_id,
+                            scale_bf16_packed: sdpa_decode.scale_bf16_packed,
+                        })
+                    } else {
+                        Ok(Op::SdpaDecode {
+                            input_ids: [
+                                sdpa_decode.q_id,
+                                sdpa_decode.k_id,
+                                sdpa_decode.v_id,
+                                sdpa_decode.seq_lens_id,
+                                sdpa_decode.loc_id,
+                            ],
+                            output_id: op_desc.output_id,
+                            scale_bf16_packed: sdpa_decode.scale_bf16_packed,
+                        })
+                    }
+                }
                 Kind::RmsNorm(rms_norm) => Ok(Op::RmsNorm {
                     input_ids: [rms_norm.input_id, rms_norm.weight_id],
                     output_id: op_desc.output_id,

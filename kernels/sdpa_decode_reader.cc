@@ -83,6 +83,25 @@ void copy_bf16_kv_rows_from_tiles(
   cb_pop_front(cb_temp, 2);
 }
 
+template <typename AddrGen>
+void copy_bf16_fused_kv_rows_from_tile(
+    const AddrGen &kv_gen,
+    uint32_t kv_tile,
+    uint32_t source_row,
+    uint32_t k_dst_addr,
+    uint32_t v_dst_addr,
+    uint32_t dst_row,
+    uint32_t cb_temp) {
+  cb_reserve_back(cb_temp, 1);
+  uint32_t temp_base = get_write_ptr(cb_temp);
+  noc_async_read_tile(kv_tile, kv_gen, temp_base);
+  noc_async_read_barrier();
+  copy_bf16_row_from_l1(temp_base, source_row, k_dst_addr, dst_row);
+  copy_bf16_row_from_l1(temp_base, source_row + 1, v_dst_addr, dst_row);
+  cb_push_back(cb_temp, 1);
+  cb_pop_front(cb_temp, 1);
+}
+
 void write_mask_tile(uint32_t l1_addr, const bool valid[TILE_C]) {
   volatile tt_l1_ptr uint32_t *ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(l1_addr);
   uint32_t mask_words[2][FACE_C / 2];
@@ -142,11 +161,13 @@ void kernel_main() {
       .page_size = get_tile_size(cb_k),
       .data_format = get_dataformat(cb_k),
   };
+#ifndef SDPA_FUSED_KV
   const InterleavedAddrGenFast<true> v_reader = {
       .bank_base_address = v_addr,
       .page_size = get_tile_size(cb_v),
       .data_format = get_dataformat(cb_v),
   };
+#endif
   const InterleavedAddrGenFast<true> seq_reader = {
       .bank_base_address = seq_lens_addr,
       .page_size = get_tile_size(cb_seq),
@@ -209,7 +230,11 @@ void kernel_main() {
         bool valid = pos < effective_seq_len && cache_index > 0 &&
                      cache_index < static_cast<int32_t>(CACHE_TOKENS);
         valid_rows[sk][row] = valid;
+#ifdef SDPA_FUSED_KV
         cache_tiles[row] = valid ? static_cast<uint32_t>(cache_index) * DHT : 0;
+#else
+        cache_tiles[row] = valid ? static_cast<uint32_t>(cache_index) * DHT : 0;
+#endif
       }
 
       for (uint32_t d = 0; d < DHT; ++d) {
@@ -221,6 +246,16 @@ void kernel_main() {
         for (uint32_t row = 0; row < TILE_R; ++row) {
           if (valid_rows[sk][row]) {
             uint32_t cache_tile = cache_tiles[row] + d;
+#ifdef SDPA_FUSED_KV
+            copy_bf16_fused_kv_rows_from_tile(
+                k_reader,
+                cache_tile,
+                cur_kv_head * 2,
+                k_dst,
+                v_dst,
+                row,
+                cb_temp);
+#else
             copy_bf16_kv_rows_from_tiles(
                 k_reader,
                 v_reader,
@@ -231,6 +266,7 @@ void kernel_main() {
                 v_dst,
                 row,
                 cb_temp);
+#endif
           } else {
             zero_bf16_row(k_dst, row);
             zero_bf16_row(v_dst, row);
