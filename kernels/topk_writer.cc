@@ -91,21 +91,42 @@ void store_value(uint32_t tile_l1_addr, uint32_t element, uint32_t value_bits) {
 
 void kernel_main() {
   uint32_t input_addr = get_arg_val<uint32_t>(0);
+#if defined(TOPK_PARTIAL)
+  uint32_t partial_pairs_addr = get_arg_val<uint32_t>(1);
+  uint32_t logical_len = get_arg_val<uint32_t>(2);
+  uint32_t tile_start = get_arg_val<uint32_t>(3);
+  uint32_t input_tiles = get_arg_val<uint32_t>(4);
+  uint32_t partial_tile_id = get_arg_val<uint32_t>(5);
+  uint32_t k = 1;
+#else
   uint32_t values_addr = get_arg_val<uint32_t>(1);
   uint32_t indices_addr = get_arg_val<uint32_t>(2);
   uint32_t logical_len = get_arg_val<uint32_t>(3);
   uint32_t input_tiles = get_arg_val<uint32_t>(4);
   uint32_t k = get_arg_val<uint32_t>(5);
+  uint32_t tile_start = 0;
+#endif
 
   constexpr uint32_t cb_input = tt::CBIndex::c_0;
+#if defined(TOPK_PARTIAL)
+  constexpr uint32_t cb_partial_pairs = tt::CBIndex::c_16;
+#else
   constexpr uint32_t cb_values = tt::CBIndex::c_16;
   constexpr uint32_t cb_indices = tt::CBIndex::c_17;
+#endif
 
   const InterleavedAddrGenFast<true> input = {
       .bank_base_address = input_addr,
       .page_size = get_tile_size(cb_input),
       .data_format = get_dataformat(cb_input),
   };
+#if defined(TOPK_PARTIAL)
+  const InterleavedAddrGenFast<true> partial_pairs = {
+      .bank_base_address = partial_pairs_addr,
+      .page_size = get_tile_size(cb_partial_pairs),
+      .data_format = get_dataformat(cb_partial_pairs),
+  };
+#else
   const InterleavedAddrGenFast<true> values = {
       .bank_base_address = values_addr,
       .page_size = get_tile_size(cb_values),
@@ -116,13 +137,15 @@ void kernel_main() {
       .page_size = get_tile_size(cb_indices),
       .data_format = get_dataformat(cb_indices),
   };
+#endif
 
   uint32_t best_keys[MAX_K];
   uint32_t best_values[MAX_K];
   uint32_t best_indices[MAX_K];
   uint32_t count = 0;
 
-  for (uint32_t tile_id = 0; tile_id < input_tiles; ++tile_id) {
+  for (uint32_t tile = 0; tile < input_tiles; ++tile) {
+    uint32_t tile_id = tile_start + tile;
     uint32_t base_index = tile_id * TILE_C;
     if (base_index >= logical_len) {
       break;
@@ -147,6 +170,20 @@ void kernel_main() {
     cb_pop_front(cb_input, 1);
   }
 
+#if defined(TOPK_PARTIAL)
+  cb_reserve_back(cb_partial_pairs, 1);
+  zero_tile(cb_partial_pairs);
+  volatile tt_l1_ptr uint32_t *pair_ptr =
+      reinterpret_cast<volatile tt_l1_ptr uint32_t *>(get_write_ptr(cb_partial_pairs));
+  if (count > 0) {
+    pair_ptr[0] = best_values[0];
+    pair_ptr[1] = best_indices[0];
+  }
+  noc_async_write_tile(partial_tile_id, partial_pairs, get_write_ptr(cb_partial_pairs));
+  noc_async_write_barrier();
+  cb_push_back(cb_partial_pairs, 1);
+  cb_pop_front(cb_partial_pairs, 1);
+#else
   cb_reserve_back(cb_values, 1);
   zero_tile(cb_values);
   uint32_t values_l1_addr = get_write_ptr(cb_values);
@@ -169,4 +206,5 @@ void kernel_main() {
   noc_async_write_barrier();
   cb_push_back(cb_indices, 1);
   cb_pop_front(cb_indices, 1);
+#endif
 }
