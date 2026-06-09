@@ -3,6 +3,8 @@
 #include <optional>
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/Sequence.h"
+#include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/stablehlo_utils.h"
 
@@ -36,21 +38,11 @@ std::optional<mlir::RankedTensorType> staticRankedTensor(mlir::Value value) {
 }
 
 bool allOnes(llvm::ArrayRef<int64_t> values) {
-  for (int64_t value : values) {
-    if (value != 1) {
-      return false;
-    }
-  }
-  return true;
+  return llvm::all_of(values, [](int64_t value) { return value == 1; });
 }
 
 bool isIdentityDimensions(llvm::ArrayRef<int64_t> dimensions) {
-  for (auto [index, dim] : llvm::enumerate(dimensions)) {
-    if (dim != static_cast<int64_t>(index)) {
-      return false;
-    }
-  }
-  return true;
+  return llvm::equal(dimensions, llvm::seq<int64_t>(0, dimensions.size()));
 }
 
 std::optional<mlir::RankedTensorType> validateScaleBroadcast(
