@@ -47,11 +47,10 @@ struct Components {
   mlir::Value q;
   mlir::Value k;
   mlir::Value v;
-  mlir::Value fusedKvCache;
+  std::optional<mlir::Value> fusedKvCache;
   mlir::Value seqLens;
   mlir::Value loc;
   uint32_t scaleBf16Packed = 0;
-  bool useFusedKvCache = false;
 };
 
 std::optional<mlir::RankedTensorType> getStaticRankedTensor(mlir::Value value) {
@@ -663,11 +662,10 @@ std::optional<Components> matchSdpaDecode(
   return Components{scoreMatch->q,
                     scoreMatch->k,
                     vMatch->cache,
-                    fusedKvCache.value_or(mlir::Value{}),
+                    fusedKvCache,
                     scoreMatch->seqLens,
                     vMatch->loc,
-                    scoreMatch->scaleBf16Packed,
-                    fusedKvCache.has_value()};
+                    scoreMatch->scaleBf16Packed};
 }
 
 mlir::LogicalResult createSdpaDecodeOp(mlir::PatternRewriter &rewriter,
@@ -677,9 +675,9 @@ mlir::LogicalResult createSdpaDecodeOp(mlir::PatternRewriter &rewriter,
   auto backendConfig =
       rewriter.getStringAttr(std::to_string(components.scaleBf16Packed));
   llvm::SmallVector<mlir::Value, 5> inputs;
-  if (components.useFusedKvCache) {
+  if (components.fusedKvCache) {
     inputs.push_back(components.q);
-    inputs.push_back(components.fusedKvCache);
+    inputs.push_back(*components.fusedKvCache);
     inputs.push_back(components.seqLens);
     inputs.push_back(components.loc);
   } else {

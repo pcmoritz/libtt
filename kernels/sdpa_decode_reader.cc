@@ -198,6 +198,9 @@ void kernel_main() {
   if (active_st > ST) {
     active_st = ST;
   }
+#ifdef SDPA_FUSED_KV
+  uint32_t fused_kv_source_row = cur_kv_head * 2;
+#endif
   uint32_t active_sk_chunk_t = active_st < SK_CHUNK_T ? active_st : SK_CHUNK_T;
   for (uint32_t chunk = 0; chunk < active_st; chunk += active_sk_chunk_t) {
     uint32_t active_kv_tiles = active_sk_chunk_t * DHT;
@@ -230,11 +233,7 @@ void kernel_main() {
         bool valid = pos < effective_seq_len && cache_index > 0 &&
                      cache_index < static_cast<int32_t>(CACHE_TOKENS);
         valid_rows[sk][row] = valid;
-#ifdef SDPA_FUSED_KV
         cache_tiles[row] = valid ? static_cast<uint32_t>(cache_index) * DHT : 0;
-#else
-        cache_tiles[row] = valid ? static_cast<uint32_t>(cache_index) * DHT : 0;
-#endif
       }
 
       for (uint32_t d = 0; d < DHT; ++d) {
@@ -250,7 +249,7 @@ void kernel_main() {
             copy_bf16_fused_kv_rows_from_tile(
                 k_reader,
                 cache_tile,
-                cur_kv_head * 2,
+                fused_kv_source_row,
                 k_dst,
                 v_dst,
                 row,
