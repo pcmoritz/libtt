@@ -23,14 +23,14 @@ use dram::{allocator_stats, DType, DramBuffer};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, Once, OnceLock};
 
 include!("pjrt_bindings.rs");
 
@@ -1742,6 +1742,30 @@ fn execute_constant(
     let dtype = pjrt_buffer_type_to_dtype(output_desc.element_type)?;
     let logical_shape = dims_i64_to_usize(&output_desc.dims)?;
     let allocation_shape = dram::tiled_allocation_shape(&logical_shape).map_err(io_error)?;
+    let splat_cache_key = logical_data.is_empty().then(|| ConstantSplatCacheKey {
+        local_hardware_id: context.local_hardware_id,
+        dtype,
+        packed_value,
+        allocation_shape: allocation_shape.clone(),
+    });
+    if let Some(key) = &splat_cache_key {
+        if let Some(output_dram) = constant_splat_cache()
+            .lock()
+            .map_err(|_| failed_precondition("constant splat cache lock is poisoned"))?
+            .get(key)
+            .cloned()
+        {
+            return store_output_buffer(
+                values,
+                plan,
+                output_id,
+                output_desc.dims.clone(),
+                output_dram,
+                context,
+                "constant",
+            );
+        }
+    }
     let data = if logical_data.is_empty() {
         splat_allocation_data(dtype, packed_value, &allocation_shape)?
     } else {
@@ -1758,6 +1782,12 @@ fn execute_constant(
     let output_dram = device
         .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
         .map_err(io_error)?;
+    if let Some(key) = splat_cache_key {
+        constant_splat_cache()
+            .lock()
+            .map_err(|_| failed_precondition("constant splat cache lock is poisoned"))?
+            .insert(key, output_dram.clone());
+    }
     store_output_buffer(
         values,
         plan,
@@ -1767,6 +1797,19 @@ fn execute_constant(
         context,
         "constant",
     )
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ConstantSplatCacheKey {
+    local_hardware_id: usize,
+    dtype: DType,
+    packed_value: u32,
+    allocation_shape: Vec<usize>,
+}
+
+fn constant_splat_cache() -> &'static Mutex<HashMap<ConstantSplatCacheKey, DramBuffer>> {
+    static CACHE: OnceLock<Mutex<HashMap<ConstantSplatCacheKey, DramBuffer>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn execute_reshape(
