@@ -255,6 +255,12 @@ message RmsNormOp {
   uint32 bias_bits = 4;
 }
 
+message RopeOp {
+  uint32 input_id = 1;
+  uint32 cos_id = 2;
+  uint32 sin_id = 3;
+}
+
 message Op {
   // Index into Executable.values for the value produced by this op.
   uint32 output_id = 1;
@@ -280,6 +286,7 @@ message Op {
     ReduceWindowOp reduce_window = 34;
     SdpaDecodeOp sdpa_decode = 35;
     RmsNormOp rms_norm = 36;
+    RopeOp rope = 37;
   }
 }
 

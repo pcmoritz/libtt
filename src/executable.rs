@@ -143,6 +143,10 @@ pub(crate) enum Op {
         scale_bits: u32,
         bias_bits: u32,
     },
+    Rope {
+        input_ids: [u32; 3],
+        output_id: u32,
+    },
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -608,6 +612,10 @@ pub(crate) fn parse_proto(executable: ProtoExecutable) -> Result<Executable, Str
                     output_id: op_desc.output_id,
                     scale_bits: rms_norm.scale_bits,
                     bias_bits: rms_norm.bias_bits,
+                }),
+                Kind::Rope(rope) => Ok(Op::Rope {
+                    input_ids: [rope.input_id, rope.cos_id, rope.sin_id],
+                    output_id: op_desc.output_id,
                 }),
             }
         })

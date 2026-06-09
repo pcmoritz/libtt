@@ -2657,6 +2657,71 @@ fn execute_rms_norm(
     )
 }
 
+fn execute_rope(
+    values: &mut [Option<PJRT_Buffer>],
+    plan: &executable::Executable,
+    device: &mut Device,
+    context: &OutputContext,
+    input_ids: [u32; 3],
+    output_id: u32,
+) -> Result<(), *mut PJRT_Error> {
+    let x = device_buffer_for_value(values, input_ids[0], "rope.input")?;
+    let cos = device_buffer_for_value(values, input_ids[1], "rope.cos")?;
+    let sin = device_buffer_for_value(values, input_ids[2], "rope.sin")?;
+    let Some(x_dram) = x.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable rope input buffer has no device allocation",
+        ));
+    };
+    let Some(cos_dram) = cos.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable rope cos buffer has no device allocation",
+        ));
+    };
+    let Some(sin_dram) = sin.dram_buffer.as_ref() else {
+        return Err(failed_precondition(
+            "TT executable rope sin buffer has no device allocation",
+        ));
+    };
+    let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
+        invalid_argument(format!(
+            "TT executable rope output id {output_id} is out of bounds"
+        ))
+    })?;
+    if output_desc.element_type != PJRT_Buffer_Type::PJRT_Buffer_Type_BF16 {
+        return Err(invalid_argument(format!(
+            "TT executable rope requires bf16 output, got {:?}",
+            output_desc.element_type
+        )));
+    }
+
+    let input_shape = dims_i64_to_usize(&x.dims)?;
+    let cos_shape = dims_i64_to_usize(&cos.dims)?;
+    let sin_shape = dims_i64_to_usize(&sin.dims)?;
+    let output_shape = dims_i64_to_usize(&output_desc.dims)?;
+    let output_dram = kernels::rope::rope(
+        device,
+        x_dram,
+        cos_dram,
+        sin_dram,
+        &input_shape,
+        &cos_shape,
+        &sin_shape,
+        &output_shape,
+        "pjrt_rope",
+    )
+    .map_err(io_error)?;
+    store_output_buffer(
+        values,
+        plan,
+        output_id,
+        output_desc.dims.clone(),
+        output_dram,
+        context,
+        "rope",
+    )
+}
+
 fn reduce_init_is_supported(
     plan: &executable::Executable,
     init_value_id: u32,
@@ -2747,6 +2812,7 @@ fn op_consumes_value(op: &executable::Op, value_id: u32) -> bool {
         }
         executable::Op::SdpaDecode { input_ids, .. } => input_ids.contains(&value_id),
         executable::Op::RmsNorm { input_ids, .. } => input_ids.contains(&value_id),
+        executable::Op::Rope { input_ids, .. } => input_ids.contains(&value_id),
     }
 }
 
@@ -3722,6 +3788,17 @@ fn execute_executable_v1(
                 *output_id,
                 *scale_bits,
                 *bias_bits,
+            )?,
+            executable::Op::Rope {
+                input_ids,
+                output_id,
+            } => execute_rope(
+                &mut values,
+                plan,
+                device,
+                output_context,
+                *input_ids,
+                *output_id,
             )?,
         }
     }
