@@ -13,6 +13,7 @@ struct SliceHalf {
   mlir::Value input;
   int64_t start = 0;
   int64_t width = 0;
+  mlir::RankedTensorType type;
 };
 
 struct ScaledHalf {
@@ -43,14 +44,65 @@ bool allOnes(llvm::ArrayRef<int64_t> values) {
   return true;
 }
 
-mlir::Value peelScaleBroadcasts(mlir::Value value) {
+bool isIdentityDimensions(llvm::ArrayRef<int64_t> dimensions) {
+  for (auto [index, dim] : llvm::enumerate(dimensions)) {
+    if (dim != static_cast<int64_t>(index)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<mlir::RankedTensorType> validateScaleBroadcast(
+    mlir::stablehlo::BroadcastInDimOp broadcast,
+    mlir::RankedTensorType expectedResultType) {
+  auto operandType = staticRankedTensor(broadcast.getOperand());
+  auto resultType = staticRankedTensor(broadcast.getResult());
+  if (!operandType || !resultType ||
+      resultType->getElementType() != expectedResultType.getElementType() ||
+      resultType->getShape() != expectedResultType.getShape() ||
+      operandType->getElementType() != expectedResultType.getElementType()) {
+    return std::nullopt;
+  }
+
+  auto dimensions = broadcast.getBroadcastDimensions();
+  if (operandType->getRank() == expectedResultType.getRank()) {
+    if (!isIdentityDimensions(dimensions)) {
+      return std::nullopt;
+    }
+    for (auto [inputDim, outputDim] :
+         llvm::zip(operandType->getShape(), expectedResultType.getShape())) {
+      if (inputDim != outputDim && inputDim != 1) {
+        return std::nullopt;
+      }
+    }
+    return *operandType;
+  }
+
+  if (expectedResultType.getRank() == 3 && operandType->getRank() == 2 &&
+      dimensions == llvm::ArrayRef<int64_t>{0, 2} &&
+      operandType->getDimSize(0) == expectedResultType.getDimSize(0) &&
+      operandType->getDimSize(1) == expectedResultType.getDimSize(2)) {
+    return *operandType;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<mlir::Value> peelScaleBroadcasts(
+    mlir::Value value, mlir::RankedTensorType expectedResultType) {
   while (true) {
     value = peelIdentityCustomCalls(value);
     auto broadcast = value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
     if (!broadcast) {
       return value;
     }
+    auto nextExpectedType = validateScaleBroadcast(broadcast, expectedResultType);
+    if (!nextExpectedType) {
+      return std::nullopt;
+    }
     value = broadcast.getOperand();
+    expectedResultType = *nextExpectedType;
   }
 }
 
@@ -90,7 +142,7 @@ std::optional<SliceHalf> matchHalfSlice(mlir::Value value) {
     return std::nullopt;
   }
 
-  return SliceHalf{slice.getOperand(), start, half};
+  return SliceHalf{slice.getOperand(), start, half, *outputType};
 }
 
 std::optional<ScaledHalf> matchScaledHalf(mlir::Value value) {
@@ -100,10 +152,18 @@ std::optional<ScaledHalf> matchScaledHalf(mlir::Value value) {
     return std::nullopt;
   }
   if (auto half = matchHalfSlice(mul.getLhs())) {
-    return ScaledHalf{*half, peelScaleBroadcasts(mul.getRhs())};
+    auto scale = peelScaleBroadcasts(mul.getRhs(), half->type);
+    if (!scale) {
+      return std::nullopt;
+    }
+    return ScaledHalf{*half, *scale};
   }
   if (auto half = matchHalfSlice(mul.getRhs())) {
-    return ScaledHalf{*half, peelScaleBroadcasts(mul.getLhs())};
+    auto scale = peelScaleBroadcasts(mul.getLhs(), half->type);
+    if (!scale) {
+      return std::nullopt;
+    }
+    return ScaledHalf{*half, *scale};
   }
   return std::nullopt;
 }
