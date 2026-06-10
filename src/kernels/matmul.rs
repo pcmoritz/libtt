@@ -27,7 +27,7 @@ const MATMUL_TOP1_WRITER: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_top1_writer_sender.cc")
 );
-const MATMUL_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
+pub(crate) const MATMUL_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute.cc");
 const NUM_SEMAPHORES: usize = 4;
 const READER_LHS_ADDR_INDEX: usize = 0;
 const WRITER_RHS_ADDR_INDEX: usize = 0;
@@ -367,6 +367,39 @@ pub(crate) fn matmul_dot_general(
     let math_fidelity = matmul_math_fidelity()?;
     let cores = device.cores_arc();
     let name = name.into();
+    if super::matmul_ws::width_sharding_enabled()
+        && epilogue == (MatmulEpilogue::Store { output_dtype: DType::Float16B })
+        && input_dtype == DType::Float16B
+        && shape.batch_count == 1
+        && logical_mt == 1
+        && logical_kt >= 64
+        && logical_nt >= 128
+        && shape.lhs_view.kind == MatmulViewKind::Contiguous
+        && shape.rhs_view.kind == MatmulViewKind::Contiguous
+        && shape.output_view.kind == MatmulViewKind::Contiguous
+    {
+        let ws_key = super::matmul_ws::MatmulWsKey {
+            kt: logical_kt,
+            logical_nt,
+            dtype: input_dtype,
+            math_fidelity,
+        };
+        if let Some(ws_plan) = super::matmul_ws::plan_width_sharded(device, &ws_key) {
+            let sharded = super::matmul_ws::sharded_rhs_for(device, rhs, &ws_plan)?;
+            let output_tiles = tiled_shape_tile_count(output_logical_shape)?;
+            let output_shape = tiled_allocation_shape(output_logical_shape)?;
+            let output = device.alloc(output_tiles, DType::Float16B, &output_shape, name)?;
+            let kernel = super::matmul_ws::MatmulWsKernel {
+                lhs_addr: u32_arg(lhs.addr, "lhs address")?,
+                rhs_addr: u32_arg(sharded.addr, "sharded rhs address")?,
+                output_addr: u32_arg(output.addr, "output address")?,
+                key: ws_key,
+                plan: ws_plan,
+            };
+            kernel.run(device)?;
+            return Ok(MatmulOutput::Store(output));
+        }
+    }
     let key = MatmulProgramKey {
         logical_mt,
         logical_kt,

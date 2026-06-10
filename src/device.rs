@@ -101,6 +101,10 @@ pub struct Device {
     dispatcher: Box<dyn Dispatcher>,
     cached_program_launches: HashMap<usize, CachedProgramLaunch>,
     staged_cached_program: Option<usize>,
+    // Cache of width-sharded copies of matmul RHS weight buffers, keyed by the
+    // source buffer address. The source buffer clone pins its allocation so the
+    // address cannot be reused while the cached shard exists.
+    pub(crate) width_sharded_rhs: HashMap<u64, (DramBuffer, DramBuffer)>,
 }
 
 struct CachedProgramLaunch {
@@ -259,6 +263,7 @@ impl Device {
             dispatcher,
             cached_program_launches: HashMap::new(),
             staged_cached_program: None,
+            width_sharded_rhs: HashMap::new(),
         };
 
         if let Err(err) = info.upload_firmware() {
@@ -402,14 +407,26 @@ impl Device {
         } else {
             (launch.setup.as_slice(), launch.setup_records.as_slice())
         };
-        self.dispatcher
-            .launch(&program, setup, setup_records, &launch.runtime_args)?;
+        if op_profile_enabled() {
+            let start = std::time::Instant::now();
+            self.dispatcher
+                .launch(&program, setup, setup_records, &launch.runtime_args)?;
+            self.dispatcher.finish()?;
+            record_op_profile(&program.name, start.elapsed());
+        } else {
+            self.dispatcher
+                .launch(&program, setup, setup_records, &launch.runtime_args)?;
+        }
         self.staged_cached_program = Some(program_id);
         Ok(())
     }
 
     pub(crate) fn finish_dispatch(&mut self) -> io::Result<()> {
-        self.dispatcher.finish()
+        let result = self.dispatcher.finish();
+        if op_profile_enabled() {
+            dump_op_profile();
+        }
+        result
     }
 
     pub fn alloc(
@@ -444,6 +461,14 @@ impl Device {
 
     pub fn dram_read(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
         self.allocator_mut()?.read_host_data(buf)
+    }
+
+    pub(crate) fn dram_read_raw(&mut self, buf: &DramBuffer) -> io::Result<Vec<u8>> {
+        self.allocator_mut()?.read(buf)
+    }
+
+    pub(crate) fn dram_write_raw(&mut self, buf: &DramBuffer, data: &[u8]) -> io::Result<()> {
+        self.allocator_mut()?.write(buf, data)
     }
 
     fn allocator_mut(&mut self) -> io::Result<&mut Allocator> {
@@ -798,6 +823,50 @@ fn build_bank_noc_table(
 
     Ok(bytes)
 }
+
+fn op_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env::var("LIBTT_OP_PROFILE").as_deref() == Ok("1"))
+}
+
+fn op_profile_map() -> &'static std::sync::Mutex<HashMap<String, (u64, Duration)>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (u64, Duration)>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn record_op_profile(name: &str, elapsed: Duration) {
+    let mut map = op_profile_map().lock().unwrap();
+    let entry = map.entry(name.to_owned()).or_insert((0, Duration::ZERO));
+    entry.0 += 1;
+    entry.1 += elapsed;
+}
+
+fn dump_op_profile() {
+    let mut map = op_profile_map().lock().unwrap();
+    if map.is_empty() {
+        return;
+    }
+    let mut entries: Vec<_> = map.drain().collect();
+    entries.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    let total: Duration = entries.iter().map(|(_, (_, d))| *d).sum();
+    let launches: u64 = entries.iter().map(|(_, (c, _))| *c).sum();
+    eprintln!(
+        "LIBTT_OP_PROFILE_DISPATCH total_ms={:.3} launches={}",
+        total.as_secs_f64() * 1e3,
+        launches
+    );
+    for (name, (count, dur)) in entries {
+        eprintln!(
+            "LIBTT_OP_PROFILE op={} count={} total_ms={:.3} avg_ms={:.3}",
+            name,
+            count,
+            dur.as_secs_f64() * 1e3,
+            dur.as_secs_f64() * 1e3 / count as f64
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

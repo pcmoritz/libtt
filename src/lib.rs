@@ -6679,4 +6679,79 @@ mod tests {
             },
         );
     }
+
+    #[test]
+    fn matmul_width_sharded_matches_reference() {
+        if std::env::var("LIBTT_RUN_DEVICE_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping device test; set LIBTT_RUN_DEVICE_TESTS=1 to run");
+            return;
+        }
+        let mut device = Device::discover()
+            .into_iter()
+            .next()
+            .expect("expected at least one Tenstorrent device");
+
+        for (m, k, n) in [(1usize, 2048usize, 4096usize), (32, 2048, 4416), (17, 2048, 4099)] {
+            let lhs_shape = vec![m, k];
+            let rhs_shape = vec![k, n];
+            let output_shape = vec![m, n];
+            let lhs_values = patterned_values(&lhs_shape);
+            let rhs_values = patterned_values(&rhs_shape);
+            let (lhs, lhs_rounded) = alloc_logical_host_data(
+                &mut device,
+                &lhs_values,
+                DType::Float16B,
+                &lhs_shape,
+                format!("ws_lhs_{m}x{k}x{n}"),
+            );
+            let (rhs, rhs_rounded) = alloc_logical_host_data(
+                &mut device,
+                &rhs_values,
+                DType::Float16B,
+                &rhs_shape,
+                format!("ws_rhs_{m}x{k}x{n}"),
+            );
+            let output = match kernels::matmul::matmul_dot_general(
+                &mut device,
+                &lhs,
+                &rhs,
+                &lhs_shape,
+                &rhs_shape,
+                &output_shape,
+                &[],
+                &[],
+                &[1],
+                &[0],
+                kernels::matmul::MatmulEpilogue::Store {
+                    output_dtype: DType::Float16B,
+                },
+                format!("ws_matmul_{m}x{k}x{n}"),
+            )
+            .expect("width sharded matmul")
+            {
+                kernels::matmul::MatmulOutput::Store(output) => output,
+                kernels::matmul::MatmulOutput::Top1 { .. } => {
+                    panic!("expected stored matmul output")
+                }
+            };
+            device.finish_dispatch().expect("finish ws matmul");
+            let device_values =
+                read_logical_f32_values(&mut device, &output, DType::Float16B, &output_shape);
+
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = 0.0f32;
+                    for inner in 0..k {
+                        acc += lhs_rounded[row * k + inner] * rhs_rounded[inner * n + col];
+                    }
+                    let got = device_values[row * n + col];
+                    let tol = 0.25f32 + 0.08 * acc.abs();
+                    assert!(
+                        (got - acc).abs() <= tol,
+                        "ws matmul {m}x{k}x{n} mismatch at ({row},{col}): got {got}, want {acc}"
+                    );
+                }
+            }
+        }
+    }
 }
