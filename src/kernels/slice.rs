@@ -116,6 +116,7 @@ pub(crate) fn slice(
             dtype, input.dtype
         )));
     }
+    input.require_interleaved("slice input")?;
     let expected_input_shape = tiled_allocation_shape(&plan.input_shape)?;
     if input.shape != expected_input_shape {
         return Err(invalid_input(format!(

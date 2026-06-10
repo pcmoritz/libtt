@@ -234,6 +234,7 @@ fn validate_input(
     logical_shape: &[usize],
     index: usize,
 ) -> io::Result<()> {
+    input.require_interleaved(&format!("concatenate input {index}"))?;
     if input.dtype != dtype {
         return Err(invalid_input(format!(
             "concatenate input {index} requires {dtype:?}, got {:?}",

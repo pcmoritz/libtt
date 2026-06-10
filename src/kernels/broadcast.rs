@@ -76,6 +76,7 @@ pub(crate) fn broadcast_in_dim(
             dtype, input.dtype
         )));
     }
+    input.require_interleaved("broadcast input")?;
     let expected_input_shape = tiled_allocation_shape(&plan.input_shape)?;
     if input.shape != expected_input_shape {
         return Err(invalid_input(format!(

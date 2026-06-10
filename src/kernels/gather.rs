@@ -251,6 +251,7 @@ fn pad_rank(shape: &[usize], rank: usize) -> Vec<usize> {
 }
 
 fn validate_allocation(buffer: &DramBuffer, logical_shape: &[usize], name: &str) -> io::Result<()> {
+    buffer.require_interleaved(name)?;
     let expected_shape = tiled_allocation_shape(logical_shape)?;
     if buffer.shape != expected_shape {
         return Err(invalid_input(format!(

@@ -1,6 +1,6 @@
 use crate::device::Device;
 use crate::dispatch::{CBConfig, CompileConfig, MathFidelity, Program};
-use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer};
+use crate::dram::{tiled_allocation_shape, tiled_shape_tile_count, DType, DramBuffer, DramLayout};
 use crate::hw::{CoreCoord, TensixL1};
 use crate::kernels::kernel::{Kernel, RuntimeArgs, RuntimeArgsBuilder};
 use crate::log::log;
@@ -9,21 +9,30 @@ use std::io;
 use std::sync::Arc;
 
 const MATMUL_READER_SENDER: &str = concat!(
-    include_str!("../../kernels/matmul_common.cc"),
+    include_str!("../../kernels/matmul_common_dense.cc"),
     include_str!("../../kernels/matmul_reader_sender.cc")
 );
 const MATMUL_READER_RECV: &str = include_str!("../../kernels/matmul_reader_recv.cc");
-const MATMUL_WRITER_SENDER: &str = concat!(
+const MATMUL_WRITER_SENDER_DENSE: &str = concat!(
+    include_str!("../../kernels/matmul_common_dense.cc"),
+    include_str!("../../kernels/matmul_writer_common.cc"),
+    include_str!("../../kernels/matmul_writer_sender.cc")
+);
+const MATMUL_WRITER_SENDER_SHARDED: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_writer_common.cc"),
     include_str!("../../kernels/matmul_writer_sender.cc")
 );
 const MATMUL_WRITER_RECV: &str = concat!(
-    include_str!("../../kernels/matmul_common.cc"),
+    include_str!("../../kernels/matmul_common_dense.cc"),
     include_str!("../../kernels/matmul_writer_common.cc"),
     include_str!("../../kernels/matmul_writer_recv.cc")
 );
-const MATMUL_TOP1_WRITER: &str = concat!(
+const MATMUL_TOP1_WRITER_DENSE: &str = concat!(
+    include_str!("../../kernels/matmul_common_dense.cc"),
+    include_str!("../../kernels/matmul_top1_writer_sender.cc")
+);
+const MATMUL_TOP1_WRITER_SHARDED: &str = concat!(
     include_str!("../../kernels/matmul_common.cc"),
     include_str!("../../kernels/matmul_top1_writer_sender.cc")
 );
@@ -31,6 +40,12 @@ const MATMUL_COMPUTE_TEMPLATE: &str = include_str!("../../kernels/matmul_compute
 const NUM_SEMAPHORES: usize = 4;
 const READER_LHS_ADDR_INDEX: usize = 0;
 const WRITER_RHS_ADDR_INDEX: usize = 0;
+const WRITER_STORE_RHS_LAYOUT_KIND_INDEX: usize = 37;
+const WRITER_STORE_RHS_LAYOUT_TILE_ROWS_INDEX: usize = 38;
+const WRITER_STORE_RHS_LAYOUT_TILES_PER_ROW_INDEX: usize = 39;
+const WRITER_TOP1_RHS_LAYOUT_KIND_INDEX: usize = 38;
+const WRITER_TOP1_RHS_LAYOUT_TILE_ROWS_INDEX: usize = 39;
+const WRITER_TOP1_RHS_LAYOUT_TILES_PER_ROW_INDEX: usize = 40;
 const WRITER_OUTPUT_ADDR_INDEX: usize = 18;
 const WRITER_PARTIAL_PAIRS_ADDR_INDEX: usize = 18;
 const MAX_RANK: usize = 8;
@@ -153,6 +168,7 @@ struct MatmulProgramKey {
     input_dtype: DType,
     output_dtype: DType,
     epilogue: MatmulEpilogueKind,
+    rhs_layout_kind: usize,
 }
 
 #[repr(u32)]
@@ -257,6 +273,9 @@ impl MatmulPlan {
 struct MatmulKernel {
     lhs_addr: u32,
     rhs_addr: u32,
+    rhs_layout_kind: u32,
+    rhs_layout_tile_rows: u32,
+    rhs_layout_tiles_per_row: u32,
     epilogue: MatmulRuntimeEpilogue,
     key: MatmulProgramKey,
 }
@@ -281,6 +300,7 @@ impl Kernel<MatmulProgramKey> for MatmulKernel {
             self.key.input_dtype,
             self.key.output_dtype,
             self.key.epilogue,
+            self.key.rhs_layout_kind,
         )
     }
 
@@ -298,7 +318,21 @@ impl Kernel<MatmulProgramKey> for MatmulKernel {
         if index == WRITER_RHS_ADDR_INDEX {
             Some(self.rhs_addr)
         } else {
-            self.epilogue.writer_runtime_arg(index)
+            match (self.key.epilogue, index) {
+                (MatmulEpilogueKind::Store, WRITER_STORE_RHS_LAYOUT_KIND_INDEX)
+                | (MatmulEpilogueKind::Top1, WRITER_TOP1_RHS_LAYOUT_KIND_INDEX) => {
+                    Some(self.rhs_layout_kind)
+                }
+                (MatmulEpilogueKind::Store, WRITER_STORE_RHS_LAYOUT_TILE_ROWS_INDEX)
+                | (MatmulEpilogueKind::Top1, WRITER_TOP1_RHS_LAYOUT_TILE_ROWS_INDEX) => {
+                    Some(self.rhs_layout_tile_rows)
+                }
+                (MatmulEpilogueKind::Store, WRITER_STORE_RHS_LAYOUT_TILES_PER_ROW_INDEX)
+                | (MatmulEpilogueKind::Top1, WRITER_TOP1_RHS_LAYOUT_TILES_PER_ROW_INDEX) => {
+                    Some(self.rhs_layout_tiles_per_row)
+                }
+                _ => self.epilogue.writer_runtime_arg(index),
+            }
         }
     }
 }
@@ -324,6 +358,7 @@ pub(crate) fn matmul_dot_general(
             lhs.dtype, rhs.dtype
         )));
     }
+    lhs.require_interleaved("matmul lhs")?;
     let input_dtype = lhs.dtype;
     let output_dtype = match (input_dtype, epilogue) {
         (
@@ -361,6 +396,10 @@ pub(crate) fn matmul_dot_general(
     validate_tile_count(lhs, tiled_shape_tile_count(lhs_logical_shape)?, "lhs")?;
     validate_tile_count(rhs, tiled_shape_tile_count(rhs_logical_shape)?, "rhs")?;
 
+    let lhs_addr = u32_arg(lhs.addr, "lhs address")?;
+    let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
+    let (rhs_layout_kind, rhs_layout_tile_rows, rhs_layout_tiles_per_row) =
+        rhs.matmul_rhs_runtime_args()?;
     let logical_mt = ceil32(shape.m) / 32;
     let logical_kt = ceil32(shape.k) / 32;
     let logical_nt = ceil32(shape.n) / 32;
@@ -380,9 +419,12 @@ pub(crate) fn matmul_dot_general(
         input_dtype,
         output_dtype,
         epilogue: epilogue_kind,
+        rhs_layout_kind,
     };
-    let lhs_addr = u32_arg(lhs.addr, "lhs address")?;
-    let rhs_addr = u32_arg(rhs.addr, "rhs address")?;
+    let rhs_layout_kind = u32_value(rhs_layout_kind, "rhs DRAM layout kind")?;
+    let rhs_layout_tile_rows = u32_value(rhs_layout_tile_rows, "rhs DRAM layout tile rows")?;
+    let rhs_layout_tiles_per_row =
+        u32_value(rhs_layout_tiles_per_row, "rhs DRAM layout tiles per row")?;
 
     let runtime_epilogue = match epilogue {
         MatmulEpilogue::Store { output_dtype } => {
@@ -418,6 +460,9 @@ pub(crate) fn matmul_dot_general(
     let kernel = MatmulKernel {
         lhs_addr,
         rhs_addr,
+        rhs_layout_kind,
+        rhs_layout_tile_rows,
+        rhs_layout_tiles_per_row,
         epilogue: runtime_epilogue,
         key,
     };
@@ -1166,6 +1211,7 @@ fn matmul_program(
     input_dtype: DType,
     output_dtype: DType,
     epilogue: MatmulEpilogueKind,
+    rhs_layout_kind: usize,
 ) -> io::Result<Program> {
     let input_compute_dtype = if input_dtype == DType::Float32 {
         DType::Float16B
@@ -1203,15 +1249,13 @@ fn matmul_program(
         rhs_view,
         output_view,
         epilogue,
+        rhs_layout_kind,
     )?;
     let top1_epilogue = epilogue == MatmulEpilogueKind::Top1;
+    let writer_sender_kernel = matmul_writer_sender_src(epilogue, rhs_layout_kind);
     Ok(Program {
         reader_kernel: MATMUL_READER_SENDER.to_owned(),
-        writer_kernel: if top1_epilogue {
-            MATMUL_TOP1_WRITER.to_owned()
-        } else {
-            MATMUL_WRITER_SENDER.to_owned()
-        },
+        writer_kernel: writer_sender_kernel.clone(),
         compute_kernel: compute_src(
             plan,
             plan.batches_per_group,
@@ -1219,15 +1263,20 @@ fn matmul_program(
         ),
         reader_recv_kernel: MATMUL_READER_RECV.to_owned(),
         writer_recv_kernel: if top1_epilogue {
-            MATMUL_TOP1_WRITER.to_owned()
+            writer_sender_kernel
         } else {
             MATMUL_WRITER_RECV.to_owned()
         },
         name: format!(
-            "matmul{}_{:?}_{:?}_{}x{}x{}",
+            "matmul{}_{:?}_{:?}{}_{}x{}x{}",
             if top1_epilogue { "_top1" } else { "" },
             input_dtype,
             output_dtype,
+            if rhs_uses_sharded_addr_gen(rhs_layout_kind) {
+                "_rhs_sharded"
+            } else {
+                ""
+            },
             plan.mt * 32,
             plan.kt * 32,
             plan.nt * 32
@@ -1249,6 +1298,31 @@ fn matmul_program(
     })
 }
 
+fn rhs_uses_sharded_addr_gen(rhs_layout_kind: usize) -> bool {
+    rhs_layout_kind == DramLayout::RUNTIME_BANK_SHARDED
+        || rhs_layout_kind == DramLayout::RUNTIME_BANK_SHARDED_TRANSPOSE
+        || rhs_layout_kind == DramLayout::RUNTIME_WIDTH_SHARDED
+        || rhs_layout_kind == DramLayout::RUNTIME_WIDTH_SHARDED_TRANSPOSE
+}
+
+fn matmul_writer_sender_src(epilogue: MatmulEpilogueKind, rhs_layout_kind: usize) -> String {
+    if !rhs_uses_sharded_addr_gen(rhs_layout_kind) {
+        return match epilogue {
+            MatmulEpilogueKind::Store => MATMUL_WRITER_SENDER_DENSE,
+            MatmulEpilogueKind::Top1 => MATMUL_TOP1_WRITER_DENSE,
+        }
+        .to_owned();
+    }
+
+    let mut source = String::new();
+    source.push_str("#define RHS_WIDTH_SHARDED 1\n");
+    source.push_str(match epilogue {
+        MatmulEpilogueKind::Store => MATMUL_WRITER_SENDER_SHARDED,
+        MatmulEpilogueKind::Top1 => MATMUL_TOP1_WRITER_SHARDED,
+    });
+    source
+}
+
 fn lower_runtime_args(
     plan: &MatmulPlan,
     logical_mt: usize,
@@ -1258,12 +1332,28 @@ fn lower_runtime_args(
     rhs_view: &MatmulOperandView,
     output_view: &MatmulOperandView,
     epilogue: MatmulEpilogueKind,
+    rhs_layout_kind: usize,
 ) -> io::Result<RuntimeArgs> {
     let grid = plan_grid(plan);
-    let writer_dynamic_indices = match epilogue {
+    let rhs_sharded = rhs_uses_sharded_addr_gen(rhs_layout_kind);
+    let mut writer_dynamic_indices = match epilogue {
         MatmulEpilogueKind::Store => vec![WRITER_RHS_ADDR_INDEX, WRITER_OUTPUT_ADDR_INDEX],
         MatmulEpilogueKind::Top1 => vec![WRITER_RHS_ADDR_INDEX, WRITER_PARTIAL_PAIRS_ADDR_INDEX],
     };
+    if rhs_sharded {
+        writer_dynamic_indices.extend(match epilogue {
+            MatmulEpilogueKind::Store => [
+                WRITER_STORE_RHS_LAYOUT_KIND_INDEX,
+                WRITER_STORE_RHS_LAYOUT_TILE_ROWS_INDEX,
+                WRITER_STORE_RHS_LAYOUT_TILES_PER_ROW_INDEX,
+            ],
+            MatmulEpilogueKind::Top1 => [
+                WRITER_TOP1_RHS_LAYOUT_KIND_INDEX,
+                WRITER_TOP1_RHS_LAYOUT_TILE_ROWS_INDEX,
+                WRITER_TOP1_RHS_LAYOUT_TILES_PER_ROW_INDEX,
+            ],
+        });
+    }
     let mut runtime_args = RuntimeArgsBuilder::new(
         NUM_SEMAPHORES,
         writer_dynamic_indices,
@@ -1312,6 +1402,7 @@ fn lower_runtime_args(
                 rhs_view,
                 output_view,
                 writer_epilogue,
+                rhs_sharded,
             )?;
             runtime_args.add_core(core, writer, reader, Vec::new())?;
             if epilogue == MatmulEpilogueKind::Top1 {
@@ -1451,6 +1542,7 @@ fn writer_args(
     rhs_view: &MatmulOperandView,
     output_view: &MatmulOperandView,
     epilogue: WriterEpilogue,
+    rhs_sharded: bool,
 ) -> io::Result<Vec<u32>> {
     let mcast = if plan.direct_grid.is_some() || plan.rows.len() <= 1 {
         [0, 0, 0, 0, 0]
@@ -1515,6 +1607,9 @@ fn writer_args(
         u32_value(plan.kt * logical_nt, "rhs batch stride")?,
         u32_value(logical_mt * logical_nt, "output batch stride")?,
     ]);
+    if rhs_sharded {
+        args.extend([0, 0, 0]);
+    }
     append_view_args(&mut args, rhs_view);
     append_view_args(&mut args, output_view);
     Ok(args)
@@ -1740,5 +1835,115 @@ mod tests {
                 .expect("u32 runtime arg"),
         );
         assert_eq!(value as usize, plan.cols.len() - 1);
+    }
+
+    #[test]
+    fn writer_args_use_dense_offsets_unless_rhs_is_sharded() {
+        let plan = plan_matmul(64, 64, 64, 1, &cores(&[1], &[2]), true).expect("plan");
+        let grid = plan_grid(&plan);
+        let core = grid[0][0];
+        let mut rhs_view =
+            operand_view(&[64, 64], &[], &[0], &[1], 64, 64, false).expect("rhs view");
+        rhs_view.kind = MatmulViewKind::TiledIndexMap;
+        let output_view =
+            operand_view(&[64, 64], &[], &[0], &[1], 64, 64, false).expect("output view");
+        let view_arg_count = 9 + 4 * MAX_RANK;
+
+        let dense_store = writer_args(
+            &plan,
+            &grid,
+            0,
+            0,
+            core,
+            2,
+            2,
+            1,
+            0,
+            1,
+            &rhs_view,
+            &output_view,
+            WriterEpilogue::Store,
+            false,
+        )
+        .expect("store writer args");
+        assert_eq!(
+            dense_store[37],
+            MatmulViewKind::TiledIndexMap.runtime_value()
+        );
+        assert_eq!(
+            dense_store[37 + view_arg_count],
+            MatmulViewKind::Contiguous.runtime_value()
+        );
+
+        let sharded_store = writer_args(
+            &plan,
+            &grid,
+            0,
+            0,
+            core,
+            2,
+            2,
+            1,
+            0,
+            1,
+            &rhs_view,
+            &output_view,
+            WriterEpilogue::Store,
+            true,
+        )
+        .expect("sharded store writer args");
+        assert_eq!(sharded_store[WRITER_STORE_RHS_LAYOUT_KIND_INDEX], 0);
+        assert_eq!(sharded_store[WRITER_STORE_RHS_LAYOUT_TILE_ROWS_INDEX], 0);
+        assert_eq!(sharded_store[WRITER_STORE_RHS_LAYOUT_TILES_PER_ROW_INDEX], 0);
+        assert_eq!(
+            sharded_store[WRITER_STORE_RHS_LAYOUT_TILES_PER_ROW_INDEX + 1],
+            MatmulViewKind::TiledIndexMap.runtime_value()
+        );
+
+        let dense_top1 = writer_args(
+            &plan,
+            &grid,
+            0,
+            0,
+            core,
+            2,
+            2,
+            1,
+            0,
+            1,
+            &rhs_view,
+            &output_view,
+            WriterEpilogue::Top1 { partial_tile_id: 7 },
+            false,
+        )
+        .expect("top1 writer args");
+        assert_eq!(dense_top1[32], 7);
+        assert_eq!(dense_top1[38], MatmulViewKind::TiledIndexMap.runtime_value());
+
+        let sharded_top1 = writer_args(
+            &plan,
+            &grid,
+            0,
+            0,
+            core,
+            2,
+            2,
+            1,
+            0,
+            1,
+            &rhs_view,
+            &output_view,
+            WriterEpilogue::Top1 { partial_tile_id: 7 },
+            true,
+        )
+        .expect("sharded top1 writer args");
+        assert_eq!(sharded_top1[32], 7);
+        assert_eq!(sharded_top1[WRITER_TOP1_RHS_LAYOUT_KIND_INDEX], 0);
+        assert_eq!(sharded_top1[WRITER_TOP1_RHS_LAYOUT_TILE_ROWS_INDEX], 0);
+        assert_eq!(sharded_top1[WRITER_TOP1_RHS_LAYOUT_TILES_PER_ROW_INDEX], 0);
+        assert_eq!(
+            sharded_top1[WRITER_TOP1_RHS_LAYOUT_TILES_PER_ROW_INDEX + 1],
+            MatmulViewKind::TiledIndexMap.runtime_value()
+        );
     }
 }

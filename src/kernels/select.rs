@@ -134,6 +134,7 @@ fn validate_buffer(
     expected_tiles: usize,
     name: &str,
 ) -> io::Result<()> {
+    buffer.require_interleaved(name)?;
     if buffer.dtype != dtype {
         return Err(invalid_input(format!(
             "{name} requires {:?} input, got {:?}",

@@ -123,6 +123,7 @@ pub(crate) fn top1_finalize_partials(
     partial_count: usize,
     name: impl Into<String>,
 ) -> io::Result<(DramBuffer, DramBuffer)> {
+    partial_pairs.require_interleaved("top1 partial pairs")?;
     if partial_pairs.dtype != DType::Int32 {
         return Err(invalid_input(format!(
             "top1 final partial pairs must be Int32, got {:?}",
@@ -158,6 +159,7 @@ pub(crate) fn top1_finalize_partials(
 }
 
 fn validate_top_k(input: &DramBuffer, input_shape: &[usize], k: usize) -> io::Result<()> {
+    input.require_interleaved("top_k input")?;
     if !matches!(input.dtype, DType::Float16B | DType::Float32) {
         return Err(invalid_input(format!(
             "top_k currently supports bf16 and f32 inputs, got {:?}",

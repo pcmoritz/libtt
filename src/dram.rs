@@ -10,6 +10,7 @@ pub(crate) const TILE_R: usize = 32;
 pub(crate) const TILE_C: usize = 32;
 const FACE_R: usize = 16;
 const FACE_C: usize = 16;
+pub(crate) const MATMUL_RHS_SHARD_TILES: usize = 4;
 type Shape = Vec<usize>;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -76,6 +77,133 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum DramLayout {
+    Interleaved,
+    BankSharded {
+        shard_tiles: usize,
+    },
+    BankShardedTranspose {
+        shard_tiles: usize,
+        tile_rows: usize,
+        tiles_per_row: usize,
+    },
+    WidthSharded {
+        tile_rows: usize,
+        tiles_per_row: usize,
+    },
+    WidthShardedTranspose {
+        tile_rows: usize,
+        tiles_per_row: usize,
+    },
+}
+
+impl DramLayout {
+    pub(crate) const RUNTIME_INTERLEAVED: usize = 0;
+    pub(crate) const RUNTIME_BANK_SHARDED: usize = 1;
+    pub(crate) const RUNTIME_BANK_SHARDED_TRANSPOSE: usize = 2;
+    pub(crate) const RUNTIME_WIDTH_SHARDED: usize = 3;
+    pub(crate) const RUNTIME_WIDTH_SHARDED_TRANSPOSE: usize = 4;
+
+    pub(crate) fn bank_shard_tiles(self) -> usize {
+        match self {
+            Self::Interleaved => 1,
+            Self::BankSharded { shard_tiles } | Self::BankShardedTranspose { shard_tiles, .. } => {
+                shard_tiles
+            }
+            Self::WidthSharded { .. } | Self::WidthShardedTranspose { .. } => 1,
+        }
+    }
+
+    pub(crate) fn is_interleaved(self) -> bool {
+        matches!(self, Self::Interleaved)
+    }
+
+    pub(crate) fn matmul_rhs_runtime_args(self) -> io::Result<(usize, usize, usize)> {
+        match self {
+            Self::Interleaved => Ok((Self::RUNTIME_INTERLEAVED, 0, 0)),
+            Self::BankSharded { shard_tiles } if shard_tiles == MATMUL_RHS_SHARD_TILES => {
+                Ok((Self::RUNTIME_BANK_SHARDED, 0, 0))
+            }
+            Self::BankShardedTranspose {
+                shard_tiles,
+                tile_rows,
+                tiles_per_row,
+            } if shard_tiles == MATMUL_RHS_SHARD_TILES => Ok((
+                Self::RUNTIME_BANK_SHARDED_TRANSPOSE,
+                tile_rows,
+                tiles_per_row,
+            )),
+            Self::WidthSharded {
+                tile_rows,
+                tiles_per_row,
+            } => Ok((Self::RUNTIME_WIDTH_SHARDED, tile_rows, tiles_per_row)),
+            Self::WidthShardedTranspose {
+                tile_rows,
+                tiles_per_row,
+            } => Ok((
+                Self::RUNTIME_WIDTH_SHARDED_TRANSPOSE,
+                tile_rows,
+                tiles_per_row,
+            )),
+            Self::BankSharded { shard_tiles }
+            | Self::BankShardedTranspose { shard_tiles, .. } => Err(invalid_input(format!(
+                "matmul RHS bank-sharded layout requires shard_tiles={MATMUL_RHS_SHARD_TILES}, got {shard_tiles}"
+            ))),
+        }
+    }
+
+    fn sharded_page_id(self, page: usize) -> usize {
+        match self {
+            Self::BankShardedTranspose {
+                tile_rows,
+                tiles_per_row,
+                ..
+            } if tile_rows > 0 && tiles_per_row > 0 => {
+                let tiles_per_batch = tile_rows * tiles_per_row;
+                let batch = page / tiles_per_batch;
+                let page_in_batch = page - batch * tiles_per_batch;
+                let row = page_in_batch / tiles_per_row;
+                let col = page_in_batch - row * tiles_per_row;
+                batch * tiles_per_batch + col * tile_rows + row
+            }
+            _ => page,
+        }
+    }
+
+    fn validate(self) -> io::Result<()> {
+        match self {
+            Self::Interleaved => Ok(()),
+            Self::BankSharded { shard_tiles } if shard_tiles > 0 => Ok(()),
+            Self::BankShardedTranspose {
+                shard_tiles,
+                tile_rows,
+                tiles_per_row,
+            } if shard_tiles > 0 && tile_rows > 0 && tiles_per_row > 0 => Ok(()),
+            Self::WidthSharded {
+                tile_rows,
+                tiles_per_row,
+            }
+            | Self::WidthShardedTranspose {
+                tile_rows,
+                tiles_per_row,
+            } if tile_rows > 0 && tiles_per_row > 0 => Ok(()),
+            Self::BankSharded { .. }
+            | Self::BankShardedTranspose { .. }
+            | Self::WidthSharded { .. }
+            | Self::WidthShardedTranspose { .. } => Err(invalid_input(
+                "DRAM bank-sharded layout requires shard_tiles > 0",
+            )),
+        }
+    }
+}
+
+impl Default for DramLayout {
+    fn default() -> Self {
+        Self::Interleaved
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DramBuffer {
     pub name: String,
@@ -84,6 +212,7 @@ pub struct DramBuffer {
     pub dtype: DType,
     /// Physical allocation shape. The last two dimensions are tile-aligned.
     pub shape: Shape,
+    pub layout: DramLayout,
     _allocation: Option<Arc<DramAllocation>>,
 }
 
@@ -94,6 +223,7 @@ impl PartialEq for DramBuffer {
             && self.num_tiles == other.num_tiles
             && self.dtype == other.dtype
             && self.shape == other.shape
+            && self.layout == other.layout
     }
 }
 
@@ -106,6 +236,20 @@ impl DramBuffer {
 
     pub(crate) fn size(&self) -> usize {
         self.num_tiles * self.page_size()
+    }
+
+    pub(crate) fn matmul_rhs_runtime_args(&self) -> io::Result<(usize, usize, usize)> {
+        self.layout.matmul_rhs_runtime_args()
+    }
+
+    pub(crate) fn require_interleaved(&self, context: &str) -> io::Result<()> {
+        if self.layout.is_interleaved() {
+            return Ok(());
+        }
+        Err(invalid_input(format!(
+            "{context} requires interleaved DRAM layout, got {:?}",
+            self.layout
+        )))
     }
 }
 
@@ -217,15 +361,33 @@ impl Allocator {
         name: impl Into<String>,
         shape: Shape,
     ) -> io::Result<DramBuffer> {
+        self.alloc_with_layout(num_tiles, dtype, name, shape, DramLayout::Interleaved)
+    }
+
+    pub fn alloc_with_layout(
+        &mut self,
+        num_tiles: usize,
+        dtype: DType,
+        name: impl Into<String>,
+        shape: Shape,
+        layout: DramLayout,
+    ) -> io::Result<DramBuffer> {
+        layout.validate()?;
         validate_allocation_shape(num_tiles, &shape)?;
-        let (addr, allocation_size, _next) =
-            allocate_allocation_range(self.local_hardware_id, num_tiles, dtype, self.bank_count)?;
+        let (addr, allocation_size, _next) = allocate_allocation_range(
+            self.local_hardware_id,
+            num_tiles,
+            dtype,
+            self.bank_count,
+            layout,
+        )?;
         Ok(DramBuffer {
             name: name.into(),
             addr,
             num_tiles,
             dtype,
             shape,
+            layout,
             _allocation: (allocation_size > 0).then(|| {
                 Arc::new(DramAllocation {
                     local_hardware_id: self.local_hardware_id,
@@ -243,8 +405,20 @@ impl Allocator {
         shape: Shape,
         name: impl Into<String>,
     ) -> io::Result<DramBuffer> {
+        self.alloc_write_with_layout(data, dtype, shape, name, DramLayout::Interleaved)
+    }
+
+    pub fn alloc_write_with_layout(
+        &mut self,
+        data: &[u8],
+        dtype: DType,
+        shape: Shape,
+        name: impl Into<String>,
+        layout: DramLayout,
+    ) -> io::Result<DramBuffer> {
         validate_tile_multiple(data.len(), dtype)?;
-        let buf = self.alloc(data.len() / dtype.tile_size(), dtype, name, shape)?;
+        let buf =
+            self.alloc_with_layout(data.len() / dtype.tile_size(), dtype, name, shape, layout)?;
         self.write(&buf, data)?;
         Ok(buf)
     }
@@ -256,9 +430,20 @@ impl Allocator {
         shape: Shape,
         name: impl Into<String>,
     ) -> io::Result<DramBuffer> {
+        self.alloc_for_host_data_with_layout(data, dtype, shape, name, DramLayout::Interleaved)
+    }
+
+    pub(crate) fn alloc_for_host_data_with_layout(
+        &mut self,
+        data: &[u8],
+        dtype: DType,
+        shape: Shape,
+        name: impl Into<String>,
+        layout: DramLayout,
+    ) -> io::Result<DramBuffer> {
         validate_tiled_shape(data, dtype, &shape)?;
         let num_tiles = data.len() / dtype.tile_size();
-        self.alloc(num_tiles, dtype, name, shape)
+        self.alloc_with_layout(num_tiles, dtype, name, shape, layout)
     }
 
     pub fn write(&mut self, buf: &DramBuffer, data: &[u8]) -> io::Result<()> {
@@ -275,8 +460,13 @@ impl Allocator {
         let page_count = data.len().div_ceil(buf.page_size());
 
         for (bank_index, tile) in self.bank_tiles.iter().enumerate() {
-            let bank_data =
-                collect_bank_data(data, buf.page_size(), bank_index, self.bank_tiles.len());
+            let bank_data = collect_bank_data(
+                data,
+                buf.page_size(),
+                bank_index,
+                self.bank_tiles.len(),
+                buf.layout,
+            );
             if bank_data.is_empty() {
                 continue;
             }
@@ -309,9 +499,8 @@ impl Allocator {
         let page_count = buf.size().div_ceil(buf.page_size());
 
         for (bank_index, tile) in self.bank_tiles.iter().enumerate() {
-            let bank_pages = (bank_index..page_count)
-                .step_by(self.bank_tiles.len())
-                .count();
+            let bank_pages =
+                bank_page_count(page_count, bank_index, self.bank_tiles.len(), buf.layout)?;
             if bank_pages == 0 {
                 continue;
             }
@@ -333,6 +522,7 @@ impl Allocator {
                 buf.page_size(),
                 bank_index,
                 self.bank_tiles.len(),
+                buf.layout,
                 &bank_data,
             );
         }
@@ -370,8 +560,9 @@ fn allocate_allocation_range(
     num_tiles: usize,
     dtype: DType,
     bank_count: usize,
+    layout: DramLayout,
 ) -> io::Result<(u64, u64, u64)> {
-    let allocation_size = allocation_range_size(num_tiles, dtype, bank_count)?;
+    let allocation_size = allocation_range_size(num_tiles, dtype, bank_count, layout)?;
     let state = ALLOCATOR_STATE_BY_DEVICE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut state = state.lock().expect("allocator state lock poisoned");
     let device_state = state
@@ -384,7 +575,8 @@ fn allocate_allocation_range(
         return Ok((addr, allocation_size, device_state.next));
     }
 
-    let (addr, next) = next_allocation_range(device_state.next, num_tiles, dtype, bank_count)?;
+    let (addr, next) =
+        next_allocation_range(device_state.next, num_tiles, dtype, bank_count, layout)?;
     device_state.next = next;
     Ok((addr, allocation_size, next))
 }
@@ -580,14 +772,28 @@ fn collect_bank_data(
     page_size: usize,
     bank_index: usize,
     bank_count: usize,
+    layout: DramLayout,
 ) -> Vec<u8> {
     let page_count = data.len().div_ceil(page_size);
-    let mut out = Vec::new();
+    let mut mappings = Vec::new();
+    let mut bank_pages = 0usize;
 
-    for page in (bank_index..page_count).step_by(bank_count) {
+    for page in 0..page_count {
+        let (page_bank, bank_page) = page_bank_mapping(page, bank_count, layout);
+        if page_bank != bank_index {
+            continue;
+        }
+        bank_pages = bank_pages.max(bank_page + 1);
+        mappings.push((page, bank_page));
+    }
+
+    let mut out = vec![0u8; bank_pages * page_size];
+    for (page, bank_page) in mappings {
         let start = page * page_size;
         let end = data.len().min(start + page_size);
-        out.extend_from_slice(&data[start..end]);
+        let len = end - start;
+        let bank_start = bank_page * page_size;
+        out[bank_start..bank_start + len].copy_from_slice(&data[start..end]);
     }
 
     out
@@ -598,16 +804,129 @@ fn scatter_bank_data(
     page_size: usize,
     bank_index: usize,
     bank_count: usize,
+    layout: DramLayout,
     bank_data: &[u8],
 ) {
     let page_count = out.len().div_ceil(page_size);
 
-    for (slot, page) in (bank_index..page_count).step_by(bank_count).enumerate() {
+    for page in 0..page_count {
+        let (page_bank, bank_page) = page_bank_mapping(page, bank_count, layout);
+        if page_bank != bank_index {
+            continue;
+        }
         let out_start = page * page_size;
         let len = (out.len() - out_start).min(page_size);
-        let bank_start = slot * page_size;
+        let bank_start = bank_page * page_size;
         out[out_start..out_start + len].copy_from_slice(&bank_data[bank_start..bank_start + len]);
     }
+}
+
+fn page_bank_mapping(page: usize, bank_count: usize, layout: DramLayout) -> (usize, usize) {
+    if let DramLayout::WidthSharded {
+        tile_rows,
+        tiles_per_row,
+    } = layout
+    {
+        return width_sharded_page_bank_mapping(page, bank_count, tile_rows, tiles_per_row, false);
+    }
+    if let DramLayout::WidthShardedTranspose {
+        tile_rows,
+        tiles_per_row,
+    } = layout
+    {
+        return width_sharded_page_bank_mapping(page, bank_count, tile_rows, tiles_per_row, true);
+    }
+    let shard_tiles = layout.bank_shard_tiles();
+    debug_assert!(bank_count > 0);
+    debug_assert!(shard_tiles > 0);
+    let sharded_page = layout.sharded_page_id(page);
+    let shard_id = sharded_page / shard_tiles;
+    let bank = shard_id % bank_count;
+    let bank_shard = shard_id / bank_count;
+    let page_in_shard = sharded_page - shard_id * shard_tiles;
+    (bank, bank_shard * shard_tiles + page_in_shard)
+}
+
+fn width_sharded_page_bank_mapping(
+    page: usize,
+    bank_count: usize,
+    tile_rows: usize,
+    tiles_per_row: usize,
+    transpose: bool,
+) -> (usize, usize) {
+    debug_assert!(bank_count > 0);
+    debug_assert!(tile_rows > 0);
+    debug_assert!(tiles_per_row > 0);
+    let tiles_per_batch = tile_rows * tiles_per_row;
+    let batch = page / tiles_per_batch;
+    let page_in_batch = page - batch * tiles_per_batch;
+    let physical_row = page_in_batch / tiles_per_row;
+    let physical_col = page_in_batch - physical_row * tiles_per_row;
+    let (logical_rows, logical_cols, logical_row, logical_col) = if transpose {
+        (tiles_per_row, tile_rows, physical_col, physical_row)
+    } else {
+        (tile_rows, tiles_per_row, physical_row, physical_col)
+    };
+    let cols_per_bank = logical_cols.div_ceil(bank_count).max(1);
+    let bank = (logical_col / cols_per_bank).min(bank_count - 1);
+    let local_col = logical_col - bank * cols_per_bank;
+    let bank_page = batch * logical_rows * cols_per_bank + logical_row * cols_per_bank + local_col;
+    (bank, bank_page)
+}
+
+fn bank_page_count(
+    page_count: usize,
+    bank_index: usize,
+    bank_count: usize,
+    layout: DramLayout,
+) -> io::Result<usize> {
+    if bank_count == 0 {
+        return Err(io::Error::other(
+            "dram allocation requires at least one bank",
+        ));
+    }
+    if bank_index >= bank_count {
+        return Err(invalid_input(format!(
+            "bank index {bank_index} is out of range for {bank_count} banks"
+        )));
+    }
+    layout.validate()?;
+    if matches!(
+        layout,
+        DramLayout::BankShardedTranspose { .. }
+            | DramLayout::WidthSharded { .. }
+            | DramLayout::WidthShardedTranspose { .. }
+    ) {
+        return Ok(bank_page_counts_by_mapping(page_count, bank_count, layout)[bank_index]);
+    }
+    let shard_tiles = layout.bank_shard_tiles();
+    let tiles_per_bank_round = bank_count
+        .checked_mul(shard_tiles)
+        .ok_or_else(|| io::Error::other("dram bank layout size overflow"))?;
+    let full_rounds = page_count / tiles_per_bank_round;
+    let rem = page_count % tiles_per_bank_round;
+    let base = full_rounds
+        .checked_mul(shard_tiles)
+        .ok_or_else(|| io::Error::other("dram bank page count overflow"))?;
+    let bank_round_start = bank_index
+        .checked_mul(shard_tiles)
+        .ok_or_else(|| io::Error::other("dram bank layout offset overflow"))?;
+    let extra = rem.saturating_sub(bank_round_start).min(shard_tiles);
+    base.checked_add(extra)
+        .ok_or_else(|| io::Error::other("dram bank page count overflow"))
+}
+
+fn bank_page_counts_by_mapping(
+    page_count: usize,
+    bank_count: usize,
+    layout: DramLayout,
+) -> Vec<usize> {
+    let mut counts = vec![0usize; bank_count];
+    for page in 0..page_count {
+        let (bank, bank_page) = page_bank_mapping(page, bank_count, layout);
+        counts[bank] = counts[bank].max(bank_page + 1);
+    }
+    counts
 }
 
 #[allow(clippy::manual_is_multiple_of)]
@@ -631,8 +950,9 @@ fn next_allocation_range(
     num_tiles: usize,
     dtype: DType,
     bank_count: usize,
+    layout: DramLayout,
 ) -> io::Result<(u64, u64)> {
-    let allocation_size = allocation_range_size(num_tiles, dtype, bank_count)?;
+    let allocation_size = allocation_range_size(num_tiles, dtype, bank_count, layout)?;
     let aligned_end = next
         .checked_add(allocation_size)
         .ok_or_else(|| io::Error::other("dram allocation address overflow"))?;
@@ -645,13 +965,31 @@ fn next_allocation_range(
     Ok((next, aligned_end))
 }
 
-fn allocation_range_size(num_tiles: usize, dtype: DType, bank_count: usize) -> io::Result<u64> {
+fn allocation_range_size(
+    num_tiles: usize,
+    dtype: DType,
+    bank_count: usize,
+    layout: DramLayout,
+) -> io::Result<u64> {
     if bank_count == 0 {
         return Err(io::Error::other(
             "dram allocation requires at least one bank",
         ));
     }
-    let pages_per_bank = num_tiles.div_ceil(bank_count);
+    layout.validate()?;
+    let pages_per_bank = if matches!(
+        layout,
+        DramLayout::BankShardedTranspose { .. }
+            | DramLayout::WidthSharded { .. }
+            | DramLayout::WidthShardedTranspose { .. }
+    ) {
+        bank_page_counts_by_mapping(num_tiles, bank_count, layout)
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+    } else {
+        bank_page_count(num_tiles, 0, bank_count, layout)?
+    };
     let allocation_size = (pages_per_bank as u64)
         .checked_mul(dtype.tile_size() as u64)
         .ok_or_else(|| io::Error::other("dram allocation size overflow"))?;
@@ -805,6 +1143,7 @@ mod tests {
             num_tiles: 3,
             dtype: DType::Float16,
             shape: vec![32, 96],
+            layout: DramLayout::Interleaved,
             _allocation: None,
         };
 
@@ -829,16 +1168,144 @@ mod tests {
     #[test]
     fn collect_bank_data_interleaves_pages() {
         let data = (0u8..10).collect::<Vec<_>>();
-        assert_eq!(collect_bank_data(&data, 2, 0, 2), vec![0, 1, 4, 5, 8, 9]);
-        assert_eq!(collect_bank_data(&data, 2, 1, 2), vec![2, 3, 6, 7]);
+        assert_eq!(
+            collect_bank_data(&data, 2, 0, 2, DramLayout::Interleaved),
+            vec![0, 1, 4, 5, 8, 9]
+        );
+        assert_eq!(
+            collect_bank_data(&data, 2, 1, 2, DramLayout::Interleaved),
+            vec![2, 3, 6, 7]
+        );
     }
 
     #[test]
     fn scatter_bank_data_restores_page_order() {
         let mut out = vec![0u8; 10];
-        scatter_bank_data(&mut out, 2, 0, 2, &[0, 1, 4, 5, 8, 9]);
-        scatter_bank_data(&mut out, 2, 1, 2, &[2, 3, 6, 7]);
+        scatter_bank_data(
+            &mut out,
+            2,
+            0,
+            2,
+            DramLayout::Interleaved,
+            &[0, 1, 4, 5, 8, 9],
+        );
+        scatter_bank_data(&mut out, 2, 1, 2, DramLayout::Interleaved, &[2, 3, 6, 7]);
         assert_eq!(out, (0u8..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn bank_sharded_layout_collects_contiguous_tile_runs() {
+        let data = (0u8..32).collect::<Vec<_>>();
+        let layout = DramLayout::BankSharded { shard_tiles: 2 };
+        assert_eq!(
+            collect_bank_data(&data, 2, 0, 2, layout),
+            vec![0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27]
+        );
+        assert_eq!(
+            collect_bank_data(&data, 2, 1, 2, layout),
+            vec![4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31]
+        );
+    }
+
+    #[test]
+    fn bank_sharded_layout_roundtrips_pages() {
+        let input = (0u8..29).collect::<Vec<_>>();
+        let page_size = 2;
+        let bank_count = 3;
+        let layout = DramLayout::BankSharded { shard_tiles: 2 };
+        let mut out = vec![0u8; input.len()];
+
+        for bank_index in 0..bank_count {
+            let bank_data = collect_bank_data(&input, page_size, bank_index, bank_count, layout);
+            scatter_bank_data(
+                &mut out, page_size, bank_index, bank_count, layout, &bank_data,
+            );
+        }
+
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn transposed_bank_sharded_layout_collects_logical_tile_runs() {
+        let input = (0u8..8).collect::<Vec<_>>();
+        let layout = DramLayout::BankShardedTranspose {
+            shard_tiles: 2,
+            tile_rows: 2,
+            tiles_per_row: 4,
+        };
+
+        assert_eq!(collect_bank_data(&input, 1, 0, 2, layout), vec![0, 4, 2, 6]);
+        assert_eq!(collect_bank_data(&input, 1, 1, 2, layout), vec![1, 5, 3, 7]);
+
+        let mut out = vec![0u8; input.len()];
+        for bank_index in 0..2 {
+            let bank_data = collect_bank_data(&input, 1, bank_index, 2, layout);
+            scatter_bank_data(&mut out, 1, bank_index, 2, layout, &bank_data);
+        }
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn width_sharded_layout_collects_contiguous_n_shards() {
+        let input = (0u8..12).collect::<Vec<_>>();
+        let layout = DramLayout::WidthSharded {
+            tile_rows: 3,
+            tiles_per_row: 4,
+        };
+
+        assert_eq!(
+            collect_bank_data(&input, 1, 0, 2, layout),
+            vec![0, 1, 4, 5, 8, 9]
+        );
+        assert_eq!(
+            collect_bank_data(&input, 1, 1, 2, layout),
+            vec![2, 3, 6, 7, 10, 11]
+        );
+
+        let mut out = vec![0u8; input.len()];
+        for bank_index in 0..2 {
+            let bank_data = collect_bank_data(&input, 1, bank_index, 2, layout);
+            scatter_bank_data(&mut out, 1, bank_index, 2, layout, &bank_data);
+        }
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn transposed_width_sharded_layout_collects_logical_n_shards() {
+        let input = (0u8..12).collect::<Vec<_>>();
+        let layout = DramLayout::WidthShardedTranspose {
+            tile_rows: 4,
+            tiles_per_row: 3,
+        };
+
+        assert_eq!(
+            collect_bank_data(&input, 1, 0, 2, layout),
+            vec![0, 3, 1, 4, 2, 5]
+        );
+        assert_eq!(
+            collect_bank_data(&input, 1, 1, 2, layout),
+            vec![6, 9, 7, 10, 8, 11]
+        );
+
+        let mut out = vec![0u8; input.len()];
+        for bank_index in 0..2 {
+            let bank_data = collect_bank_data(&input, 1, bank_index, 2, layout);
+            scatter_bank_data(&mut out, 1, bank_index, 2, layout, &bank_data);
+        }
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn bank_sharded_allocation_sizes_by_max_bank_pages() {
+        let layout = DramLayout::BankSharded { shard_tiles: 4 };
+        assert_eq!(
+            allocation_range_size(32, DType::Float16, 8, layout).unwrap(),
+            (4 * DType::Float16.tile_size()) as u64
+        );
+        assert_eq!(
+            allocation_range_size(33, DType::Float16, 8, layout).unwrap(),
+            (5 * DType::Float16.tile_size()) as u64
+        );
     }
 
     #[test]
@@ -849,8 +1316,21 @@ mod tests {
         let mut out = vec![0u8; input.len()];
 
         for bank_index in 0..bank_count {
-            let bank_data = collect_bank_data(&input, page_size, bank_index, bank_count);
-            scatter_bank_data(&mut out, page_size, bank_index, bank_count, &bank_data);
+            let bank_data = collect_bank_data(
+                &input,
+                page_size,
+                bank_index,
+                bank_count,
+                DramLayout::Interleaved,
+            );
+            scatter_bank_data(
+                &mut out,
+                page_size,
+                bank_index,
+                bank_count,
+                DramLayout::Interleaved,
+                &bank_data,
+            );
         }
 
         assert_eq!(out, input);
@@ -858,8 +1338,14 @@ mod tests {
 
     #[test]
     fn allocation_range_errors_when_capacity_is_exceeded() {
-        let err = next_allocation_range(Dram::TLB_SIZE_4G, 1, DType::Float16, 1)
-            .expect_err("allocation should exceed the per-bank address space");
+        let err = next_allocation_range(
+            Dram::TLB_SIZE_4G,
+            1,
+            DType::Float16,
+            1,
+            DramLayout::Interleaved,
+        )
+        .expect_err("allocation should exceed the per-bank address space");
         assert!(err.to_string().contains("exceeds per-bank address space"));
     }
 
@@ -868,12 +1354,24 @@ mod tests {
         let local_hardware_id = usize::MAX;
         reset_allocator_for_test(local_hardware_id);
 
-        let (addr, size, _) =
-            allocate_allocation_range(local_hardware_id, 1, DType::Float16, 1).unwrap();
+        let (addr, size, _) = allocate_allocation_range(
+            local_hardware_id,
+            1,
+            DType::Float16,
+            1,
+            DramLayout::Interleaved,
+        )
+        .unwrap();
         free_allocation(local_hardware_id, addr, size);
 
-        let (reused, _, _) =
-            allocate_allocation_range(local_hardware_id, 1, DType::Float16, 1).unwrap();
+        let (reused, _, _) = allocate_allocation_range(
+            local_hardware_id,
+            1,
+            DType::Float16,
+            1,
+            DramLayout::Interleaved,
+        )
+        .unwrap();
         assert_eq!(reused, addr);
 
         reset_allocator_for_test(local_hardware_id);
@@ -895,8 +1393,14 @@ mod tests {
             }
         );
 
-        let (addr, size, _) =
-            allocate_allocation_range(local_hardware_id, 3, DType::Float16, bank_count).unwrap();
+        let (addr, size, _) = allocate_allocation_range(
+            local_hardware_id,
+            3,
+            DType::Float16,
+            bank_count,
+            DramLayout::Interleaved,
+        )
+        .unwrap();
         assert_eq!(
             allocator_stats(local_hardware_id, bank_count),
             AllocatorStats {
@@ -923,14 +1427,21 @@ mod tests {
     fn dram_buffer_clone_frees_on_last_drop() {
         let local_hardware_id = usize::MAX - 1;
         reset_allocator_for_test(local_hardware_id);
-        let (addr, size, _) =
-            allocate_allocation_range(local_hardware_id, 1, DType::Float16, 1).unwrap();
+        let (addr, size, _) = allocate_allocation_range(
+            local_hardware_id,
+            1,
+            DType::Float16,
+            1,
+            DramLayout::Interleaved,
+        )
+        .unwrap();
         let buffer = DramBuffer {
             name: "tmp".to_owned(),
             addr,
             num_tiles: 1,
             dtype: DType::Float16,
             shape: vec![32, 32],
+            layout: DramLayout::Interleaved,
             _allocation: Some(Arc::new(DramAllocation {
                 local_hardware_id,
                 addr,

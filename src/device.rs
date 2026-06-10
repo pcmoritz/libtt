@@ -3,7 +3,7 @@ use crate::cq::{lower_setup_records, FastDispatcher};
 use crate::dispatch::{
     build_dispatch_setup_plan, mcast_rects, DevMsgs, DispatchCommand, Program, SlowDispatcher,
 };
-use crate::dram::{Allocator, DType, DramBuffer};
+use crate::dram::{Allocator, DType, DramBuffer, DramLayout};
 use crate::hw::{align_down, worker_cores, Arc, CoreCoord, Dram, DramTile, TensixL1, TensixMMIO};
 use crate::kernels::kernel::RuntimeArgs;
 use crate::linux::{NocOrdering, TlbWindow};
@@ -423,6 +423,18 @@ impl Device {
             .alloc(num_tiles, dtype, name, shape.to_vec())
     }
 
+    pub fn alloc_with_layout(
+        &mut self,
+        num_tiles: usize,
+        dtype: DType,
+        shape: &[usize],
+        name: impl Into<String>,
+        layout: DramLayout,
+    ) -> io::Result<DramBuffer> {
+        self.allocator_mut()?
+            .alloc_with_layout(num_tiles, dtype, name, shape.to_vec(), layout)
+    }
+
     pub fn alloc_write(
         &mut self,
         data: &[u8],
@@ -436,6 +448,74 @@ impl Device {
             .alloc_for_host_data(data, dtype, shape, name)?;
         self.dram_write(&buffer, data)?;
         Ok(buffer)
+    }
+
+    pub fn alloc_write_with_layout(
+        &mut self,
+        data: &[u8],
+        dtype: DType,
+        shape: &[usize],
+        name: impl Into<String>,
+        layout: DramLayout,
+    ) -> io::Result<DramBuffer> {
+        let shape = shape.to_vec();
+        let buffer = self
+            .allocator_mut()?
+            .alloc_for_host_data_with_layout(data, dtype, shape, name, layout)?;
+        self.dram_write(&buffer, data)?;
+        Ok(buffer)
+    }
+
+    pub fn alloc_write_matmul_rhs(
+        &mut self,
+        data: &[u8],
+        dtype: DType,
+        shape: &[usize],
+        name: impl Into<String>,
+    ) -> io::Result<DramBuffer> {
+        if shape.len() < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "matmul RHS layout requires rank >= 2",
+            ));
+        }
+        self.alloc_write_with_layout(
+            data,
+            dtype,
+            shape,
+            name,
+            DramLayout::WidthSharded {
+                tile_rows: shape[shape.len() - 2] / crate::dram::TILE_R,
+                tiles_per_row: shape[shape.len() - 1] / crate::dram::TILE_C,
+            },
+        )
+    }
+
+    pub fn alloc_write_matmul_rhs_transpose(
+        &mut self,
+        data: &[u8],
+        dtype: DType,
+        shape: &[usize],
+        name: impl Into<String>,
+    ) -> io::Result<DramBuffer> {
+        if shape.len() < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "matmul RHS transpose layout requires rank >= 2",
+            ));
+        }
+        let allocation_shape = crate::dram::tiled_allocation_shape(shape)?;
+        let rank = allocation_shape.len();
+        self.alloc_write_with_layout(
+            data,
+            dtype,
+            shape,
+            name,
+            DramLayout::WidthShardedTranspose {
+                tile_rows: allocation_shape[rank - 2] / crate::dram::TILE_R,
+                tiles_per_row: allocation_shape[rank - 1] / crate::dram::TILE_C,
+            },
+        )
     }
 
     pub fn dram_write(&mut self, buf: &DramBuffer, data: &[u8]) -> io::Result<()> {

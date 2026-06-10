@@ -225,6 +225,7 @@ fn validate_tiled_buffer(
     logical_shape: &[usize],
     name: &str,
 ) -> io::Result<()> {
+    buffer.require_interleaved(&format!("sdpa_decode {name}"))?;
     let expected_shape = tiled_allocation_shape(logical_shape)?;
     let expected_tiles = tiled_shape_tile_count(logical_shape)?;
     if buffer.shape != expected_shape || buffer.num_tiles != expected_tiles {

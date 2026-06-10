@@ -192,6 +192,7 @@ pub(crate) fn reduce_window(
 }
 
 fn validate_input(input: &DramBuffer, plan: &ReduceWindowPlan) -> io::Result<()> {
+    input.require_interleaved("reduce_window input")?;
     if input.dtype != plan.dtype {
         return Err(invalid_input(format!(
             "reduce_window input requires {:?}, got {:?}",

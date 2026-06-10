@@ -1,7 +1,11 @@
 #include <cstdint>
 
 namespace {
+#ifdef RHS_WIDTH_SHARDED
+constexpr uint32_t ARG_RHS_VIEW_KIND = 41;
+#else
 constexpr uint32_t ARG_RHS_VIEW_KIND = 38;
+#endif
 constexpr uint32_t ARG_OUTPUT_VIEW_KIND = ARG_RHS_VIEW_KIND + VIEW_ARG_COUNT;
 constexpr uint32_t BF16_NEG_INF = 0xff80;
 
@@ -146,11 +150,22 @@ void kernel_main() {
   volatile tt_l1_ptr uint32_t *recv_sem = SEM(17);
   *recv_sem = VALID;
 
+  #ifdef RHS_WIDTH_SHARDED
+  const BankShardedAddrGen in1_gen = {
+      .bank_base_address = A(0),
+      .page_size = in1_tile_bytes,
+      .layout_kind = A(38),
+      .layout_tile_rows = A(39),
+      .layout_tiles_per_row = A(40),
+      .data_format = DataFormat::Float16_b,
+  };
+  #else
   const InterleavedAddrGenFast<true> in1_gen = {
       .bank_base_address = A(0),
       .page_size = in1_tile_bytes,
       .data_format = DataFormat::Float16_b,
   };
+  #endif
 
   for (uint32_t local_batch = 0; local_batch < local_batch_count; local_batch++) {
     const uint32_t batch = batch_start + local_batch;
@@ -171,6 +186,29 @@ void kernel_main() {
       } else if (view.kind == VIEW_CONTIGUOUS) {
         for (uint32_t h = 0; h < block_h; h++) {
           uint32_t tile_id = row;
+          #ifdef RHS_WIDTH_SHARDED
+          uint32_t w = 0;
+          while (w < block_w) {
+            if (A(1) + w >= logical_nt) {
+              const uint32_t remaining = block_w - w;
+              l1_addr += remaining * in1_tile_bytes;
+              block_bytes += remaining * in1_tile_bytes;
+              break;
+            }
+            uint32_t run = 1;
+            if (A(2) == 1) {
+              const uint32_t valid_remaining = logical_nt - (A(1) + w);
+              const uint32_t requested =
+                  block_w - w < valid_remaining ? block_w - w : valid_remaining;
+              run = max_contiguous_source_tiles(in1_gen, tile_id, requested);
+            }
+            read_source_run_to_l1(in1_gen, tile_id, l1_addr, run);
+            l1_addr += run * in1_tile_bytes;
+            tile_id += run * A(2);
+            block_bytes += run * in1_tile_bytes;
+            w += run;
+          }
+          #else
           for (uint32_t w = 0; w < block_w; w++) {
             if (A(1) + w < logical_nt) {
               noc_async_read_tile(tile_id, in1_gen, l1_addr);
@@ -179,9 +217,55 @@ void kernel_main() {
             tile_id += A(2);
             block_bytes += in1_tile_bytes;
           }
+          #endif
           row += A(3);
         }
         noc_async_read_barrier();
+      #ifdef RHS_WIDTH_SHARDED
+      } else if (view.kind == VIEW_TILE_TRANSPOSE) {
+        uint32_t canonical_base = cur_block - batch * rhs_batch_stride;
+        for (uint32_t h = 0; h < block_h; h++) {
+          uint32_t w = 0;
+          while (w < block_w) {
+            if (A(1) + w >= logical_nt) {
+              const uint32_t remaining = block_w - w;
+              l1_addr += remaining * in1_tile_bytes;
+              block_bytes += remaining * in1_tile_bytes;
+              break;
+            }
+            const uint32_t canonical_tile = canonical_base + h * A(3) + w;
+            const uint32_t canonical_row_tile = canonical_tile / A(3);
+            const uint32_t canonical_col_tile = canonical_tile - canonical_row_tile * A(3);
+            const uint32_t source_tile =
+                tile_transpose_source_tile(view, batch, canonical_row_tile, canonical_col_tile);
+            const uint32_t valid_remaining = logical_nt - (A(1) + w);
+            const uint32_t requested =
+                block_w - w < valid_remaining ? block_w - w : valid_remaining;
+            const uint32_t run = max_full_tile_transpose_source_tiles(
+                in1_gen, view, source_tile, canonical_row_tile, canonical_col_tile, requested);
+            if (run > 0) {
+              read_source_run_to_l1(in1_gen, source_tile, l1_addr, run);
+              l1_addr += run * in1_tile_bytes;
+              block_bytes += run * in1_tile_bytes;
+              w += run;
+            } else {
+              fill_tile_transpose_tile(
+                  in1_gen,
+                  view,
+                  batch,
+                  canonical_row_tile,
+                  canonical_col_tile,
+                  l1_addr,
+                  in1_tile_bytes,
+                  cb_source);
+              l1_addr += in1_tile_bytes;
+              block_bytes += in1_tile_bytes;
+              w += 1;
+            }
+          }
+        }
+        noc_async_read_barrier();
+      #endif
       } else {
         uint32_t canonical_base = cur_block - batch * rhs_batch_stride;
         for (uint32_t h = 0; h < block_h; h++) {

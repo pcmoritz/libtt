@@ -693,6 +693,8 @@ pub(crate) fn rms_norm(
             input.dtype, weight.dtype
         )));
     }
+    input.require_interleaved("rms_norm input")?;
+    weight.require_interleaved("rms_norm weight")?;
 
     let allocation_shape = tiled_allocation_shape(output_shape)?;
     if input.shape != allocation_shape {
@@ -818,6 +820,7 @@ fn validate_and_collect_inputs<'a>(
                     )));
                 }
                 let buffer = external_inputs[input_index];
+                buffer.require_interleaved(&format!("node[{index}] input"))?;
                 let input_dtype = buffer.dtype;
                 if input_dtype != dtype {
                     return Err(invalid_input(format!(

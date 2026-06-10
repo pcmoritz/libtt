@@ -106,6 +106,7 @@ pub(crate) fn reshape(
 }
 
 fn validate_input(input: &DramBuffer, dtype: DType, logical_shape: &[usize]) -> io::Result<()> {
+    input.require_interleaved("reshape input")?;
     if input.dtype != dtype {
         return Err(invalid_input(format!(
             "reshape input requires {dtype:?}, got {:?}",

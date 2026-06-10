@@ -62,6 +62,7 @@ pub(crate) fn transpose(
 }
 
 fn validate_input(input: &DramBuffer, dtype: DType, logical_shape: &[usize]) -> io::Result<()> {
+    input.require_interleaved("transpose input")?;
     if input.dtype != dtype {
         return Err(invalid_input(format!(
             "transpose input requires {dtype:?}, got {:?}",

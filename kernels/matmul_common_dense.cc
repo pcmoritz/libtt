@@ -12,12 +12,6 @@ constexpr uint32_t VIEW_ARG_COUNT = 9 + 4 * MAX_RANK;
 constexpr uint32_t VIEW_CONTIGUOUS = 0;
 constexpr uint32_t VIEW_TILED_INDEX_MAP = 4;
 constexpr uint32_t VIEW_TILE_TRANSPOSE = 5;
-constexpr uint32_t DRAM_LAYOUT_INTERLEAVED = 0;
-constexpr uint32_t DRAM_LAYOUT_BANK_SHARDED = 1;
-constexpr uint32_t DRAM_LAYOUT_BANK_SHARDED_TRANSPOSE = 2;
-constexpr uint32_t DRAM_LAYOUT_WIDTH_SHARDED = 3;
-constexpr uint32_t DRAM_LAYOUT_WIDTH_SHARDED_TRANSPOSE = 4;
-constexpr uint32_t DRAM_BANK_SHARD_TILES = 4;
 
 struct View {
   uint32_t kind, rank, batch_rank, row_rank, col_rank;
@@ -27,223 +21,6 @@ struct View {
   uint32_t row_dims[MAX_RANK];
   uint32_t col_dims[MAX_RANK];
 };
-
-struct BankShardedAddrGen {
-  uint32_t bank_base_address;
-  uint32_t page_size;
-  uint32_t layout_kind;
-  uint32_t layout_tile_rows;
-  uint32_t layout_tiles_per_row;
-  DataFormat data_format;
-
-  FORCE_INLINE bool is_bank_sharded() const {
-    return layout_kind == DRAM_LAYOUT_BANK_SHARDED ||
-           layout_kind == DRAM_LAYOUT_BANK_SHARDED_TRANSPOSE;
-  }
-
-  FORCE_INLINE bool is_bank_sharded_transpose() const {
-    return layout_kind == DRAM_LAYOUT_BANK_SHARDED_TRANSPOSE;
-  }
-
-  FORCE_INLINE bool is_width_sharded() const {
-    return layout_kind == DRAM_LAYOUT_WIDTH_SHARDED ||
-           layout_kind == DRAM_LAYOUT_WIDTH_SHARDED_TRANSPOSE;
-  }
-
-  FORCE_INLINE bool is_transposed_width_sharded() const {
-    return layout_kind == DRAM_LAYOUT_WIDTH_SHARDED_TRANSPOSE;
-  }
-
-  FORCE_INLINE bool is_sharded() const {
-    return is_bank_sharded() || is_width_sharded();
-  }
-
-  FORCE_INLINE uint32_t bank_sharded_page_id(uint32_t page_id) const {
-    if (!is_bank_sharded_transpose()) {
-      return page_id;
-    }
-    const uint32_t tiles_per_batch = layout_tile_rows * layout_tiles_per_row;
-    const uint32_t batch = page_id / tiles_per_batch;
-    const uint32_t page_in_batch = page_id - batch * tiles_per_batch;
-    const uint32_t row = page_in_batch / layout_tiles_per_row;
-    const uint32_t col = page_in_batch - row * layout_tiles_per_row;
-    return batch * tiles_per_batch + col * layout_tile_rows + row;
-  }
-
-  FORCE_INLINE void logical_coords(uint32_t page_id, uint32_t *batch,
-                                   uint32_t *logical_row,
-                                   uint32_t *logical_col) const {
-    const uint32_t tiles_per_batch = layout_tile_rows * layout_tiles_per_row;
-    *batch = page_id / tiles_per_batch;
-    const uint32_t page_in_batch = page_id - *batch * tiles_per_batch;
-    const uint32_t physical_row = page_in_batch / layout_tiles_per_row;
-    const uint32_t physical_col = page_in_batch - physical_row * layout_tiles_per_row;
-    if (is_transposed_width_sharded()) {
-      *logical_row = physical_col;
-      *logical_col = physical_row;
-    } else {
-      *logical_row = physical_row;
-      *logical_col = physical_col;
-    }
-  }
-
-  FORCE_INLINE uint32_t logical_rows() const {
-    return is_transposed_width_sharded() ? layout_tiles_per_row : layout_tile_rows;
-  }
-
-  FORCE_INLINE uint32_t logical_cols() const {
-    return is_transposed_width_sharded() ? layout_tile_rows : layout_tiles_per_row;
-  }
-
-  FORCE_INLINE uint32_t cols_per_bank() const {
-    return (logical_cols() + NUM_DRAM_BANKS - 1) / NUM_DRAM_BANKS;
-  }
-
-  FORCE_INLINE uint32_t bank_id_for_page(uint32_t page_id) const {
-    if (!is_sharded()) {
-      return 0;
-    }
-    if (is_bank_sharded()) {
-      const uint32_t sharded_page = bank_sharded_page_id(page_id);
-      const uint32_t shard_id = sharded_page / DRAM_BANK_SHARD_TILES;
-      return shard_id % NUM_DRAM_BANKS;
-    }
-    uint32_t batch = 0, logical_row = 0, logical_col = 0;
-    logical_coords(page_id, &batch, &logical_row, &logical_col);
-    const uint32_t bank = logical_col / cols_per_bank();
-    return bank < NUM_DRAM_BANKS ? bank : NUM_DRAM_BANKS - 1;
-  }
-
-  FORCE_INLINE uint32_t bank_page_for_page(uint32_t page_id) const {
-    if (is_bank_sharded()) {
-      const uint32_t sharded_page = bank_sharded_page_id(page_id);
-      const uint32_t shard_id = sharded_page / DRAM_BANK_SHARD_TILES;
-      const uint32_t bank_shard = shard_id / NUM_DRAM_BANKS;
-      const uint32_t page_in_shard = sharded_page - shard_id * DRAM_BANK_SHARD_TILES;
-      return bank_shard * DRAM_BANK_SHARD_TILES + page_in_shard;
-    }
-    uint32_t batch = 0, logical_row = 0, logical_col = 0;
-    logical_coords(page_id, &batch, &logical_row, &logical_col);
-    const uint32_t cols_per_bank_value = cols_per_bank();
-    const uint32_t bank = bank_id_for_page(page_id);
-    const uint32_t local_col = logical_col - bank * cols_per_bank_value;
-    return batch * logical_rows() * cols_per_bank_value +
-           logical_row * cols_per_bank_value + local_col;
-  }
-
-  FORCE_INLINE uint64_t get_noc_addr(uint32_t page_id, uint32_t offset = 0,
-                                     uint8_t noc = noc_index) const {
-    if (!is_sharded()) {
-      const InterleavedAddrGenFast<true> interleaved = {
-          .bank_base_address = bank_base_address,
-          .page_size = page_size,
-          .data_format = data_format,
-      };
-      return interleaved.get_noc_addr(page_id, offset, noc);
-    }
-
-    const uint32_t bank_id = bank_id_for_page(page_id);
-    const uint32_t bank_page = bank_page_for_page(page_id);
-    const uint32_t bank_addr = bank_base_address + bank_page * page_size + offset;
-    return get_noc_addr_from_bank_id<true>(bank_id, bank_addr, noc);
-  }
-
-  FORCE_INLINE uint32_t read_req_vc(uint32_t page_id) const {
-    return is_sharded() ? (bank_id_for_page(page_id) & 0x3) : NOC_UNICAST_WRITE_VC;
-  }
-};
-
-template <typename AddrGen>
-FORCE_INLINE uint32_t read_req_vc_for(const AddrGen &, uint32_t) {
-  return NOC_UNICAST_WRITE_VC;
-}
-
-FORCE_INLINE uint32_t read_req_vc_for(const BankShardedAddrGen &input, uint32_t page_id) {
-  return input.read_req_vc(page_id);
-}
-
-template <typename AddrGen>
-void read_source_to_l1(const AddrGen &input, uint32_t tile_id, uint32_t dst_addr) {
-  noc_async_read<NOC_MAX_BURST_SIZE + 1, false>(
-      input.get_noc_addr(tile_id), dst_addr, input.page_size, noc_index,
-      read_req_vc_for(input, tile_id));
-}
-
-template <typename AddrGen>
-void read_source_run_to_l1(const AddrGen &input, uint32_t tile_id, uint32_t dst_addr,
-                           uint32_t tile_count) {
-  noc_async_read<NOC_MAX_BURST_SIZE + 1, false>(
-      input.get_noc_addr(tile_id), dst_addr, input.page_size * tile_count,
-      noc_index, read_req_vc_for(input, tile_id));
-}
-
-uint32_t max_contiguous_source_tiles(const BankShardedAddrGen &input, uint32_t tile_id,
-                                     uint32_t requested) {
-  if (!input.is_sharded()) {
-    return 1;
-  }
-  if (input.is_bank_sharded()) {
-    const uint32_t sharded_page = input.bank_sharded_page_id(tile_id);
-    const uint32_t page_in_shard = sharded_page % DRAM_BANK_SHARD_TILES;
-    const uint32_t shard_remaining = DRAM_BANK_SHARD_TILES - page_in_shard;
-    return requested < shard_remaining ? requested : shard_remaining;
-  }
-  uint32_t batch = 0, logical_row = 0, logical_col = 0;
-  input.logical_coords(tile_id, &batch, &logical_row, &logical_col);
-  const uint32_t cols_per_bank = input.cols_per_bank();
-  const uint32_t bank =
-      (logical_col / cols_per_bank) < NUM_DRAM_BANKS
-          ? (logical_col / cols_per_bank)
-          : (NUM_DRAM_BANKS - 1);
-  const uint32_t local_col = logical_col - bank * cols_per_bank;
-  const uint32_t bank_remaining = cols_per_bank - local_col;
-  const uint32_t row_remaining = input.logical_cols() - logical_col;
-  const uint32_t remaining =
-      bank_remaining < row_remaining ? bank_remaining : row_remaining;
-  return requested < remaining ? requested : remaining;
-}
-
-void read_source_run_to_l1(const BankShardedAddrGen &input, uint32_t tile_id,
-                           uint32_t dst_addr, uint32_t tile_count) {
-  if (!input.is_sharded()) {
-    const InterleavedAddrGenFast<true> interleaved = {
-        .bank_base_address = input.bank_base_address,
-        .page_size = input.page_size,
-        .data_format = input.data_format,
-    };
-    noc_async_read<NOC_MAX_BURST_SIZE + 1, false>(
-        interleaved.get_noc_addr(tile_id), dst_addr, input.page_size * tile_count,
-        noc_index, NOC_UNICAST_WRITE_VC);
-    return;
-  }
-
-  const uint32_t bank = input.bank_id_for_page(tile_id);
-  const uint32_t bank_page = input.bank_page_for_page(tile_id);
-  const uint32_t bank_addr = input.bank_base_address + bank_page * input.page_size;
-  noc_async_read<NOC_MAX_BURST_SIZE + 1, false>(
-      get_noc_addr_from_bank_id<true>(bank, bank_addr, noc_index), dst_addr,
-      input.page_size * tile_count, noc_index, bank & 0x3);
-}
-
-uint32_t tile_transpose_source_tile(const View &view, uint32_t batch, uint32_t row_tile,
-                                    uint32_t col_tile) {
-  return batch * view.tile_rows * view.tiles_per_row + col_tile * view.tiles_per_row + row_tile;
-}
-
-uint32_t max_full_tile_transpose_source_tiles(const BankShardedAddrGen &input,
-                                              const View &view, uint32_t source_tile,
-                                              uint32_t row_tile, uint32_t col_tile,
-                                              uint32_t requested) {
-  if (row_tile * TILE_R + TILE_R > view.logical_rows || col_tile >= view.logical_cols / TILE_C) {
-    return 0;
-  }
-  const uint32_t full_col_remaining = view.logical_cols / TILE_C - col_tile;
-  uint32_t run = requested < full_col_remaining ? requested : full_col_remaining;
-  if (run == 0) {
-    return 0;
-  }
-  return max_contiguous_source_tiles(input, source_tile, run);
-}
 
 void load_array(uint32_t base, uint32_t *target) {
   for (uint32_t i = 0; i < MAX_RANK; ++i) {
@@ -318,18 +95,17 @@ uint32_t tile_id_for_indices(const View &view, const uint32_t *indices,
   return (prefix * view.tile_rows + row / TILE_R) * view.tiles_per_row + col / TILE_C;
 }
 
-template <typename AddrGen>
-void read_source_tile(const AddrGen &input, uint32_t tile_id, uint32_t cb_source) {
+void read_source_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile_id,
+                      uint32_t cb_source) {
   cb_reserve_back(cb_source, 1);
-  read_source_to_l1(input, tile_id, get_write_ptr(cb_source));
+  noc_async_read_tile(tile_id, input, get_write_ptr(cb_source));
   noc_async_read_barrier();
   cb_push_back(cb_source, 1);
   cb_wait_front(cb_source, 1);
 }
 
-template <typename AddrGen>
-void ensure_source_tile(const AddrGen &input, uint32_t tile_id, uint32_t cb_source,
-                        uint32_t *loaded_tile) {
+void ensure_source_tile(const InterleavedAddrGenFast<true> &input, uint32_t tile_id,
+                        uint32_t cb_source, uint32_t *loaded_tile) {
   if (*loaded_tile == tile_id) {
     return;
   }
@@ -361,8 +137,8 @@ void copy_element_from_source(uint32_t cb_source, uint32_t dst_addr, uint32_t so
   }
 }
 
-template <uint32_t DatumBytes, typename AddrGen>
-void fill_generic_tile_impl(const AddrGen &input, const View &view,
+template <uint32_t DatumBytes>
+void fill_generic_tile_impl(const InterleavedAddrGenFast<true> &input, const View &view,
                             uint32_t batch, uint32_t row_tile, uint32_t col_tile,
                             uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
   zero_tile_at(dst_addr, tile_bytes);
@@ -401,8 +177,7 @@ void fill_generic_tile_impl(const AddrGen &input, const View &view,
   }
 }
 
-template <typename AddrGen>
-void fill_generic_tile(const AddrGen &input, const View &view,
+void fill_generic_tile(const InterleavedAddrGenFast<true> &input, const View &view,
                        uint32_t batch, uint32_t row_tile, uint32_t col_tile,
                        uint32_t dst_addr, uint32_t tile_bytes, uint32_t cb_source) {
   if (tile_bytes == sizeof(uint32_t) * TILE_R * TILE_C) {
@@ -424,8 +199,8 @@ struct TiledIndexMap {
   uint32_t source_col_dim;
 };
 
-template <uint32_t DatumBytes, typename AddrGen>
-void fill_tiled_index_map_tile_impl(const AddrGen &input,
+template <uint32_t DatumBytes>
+void fill_tiled_index_map_tile_impl(const InterleavedAddrGenFast<true> &input,
                                     const View &view, uint32_t batch, uint32_t row_tile,
                                     uint32_t col_tile, uint32_t dst_addr,
                                     uint32_t tile_bytes, uint32_t cb_source) {
@@ -462,8 +237,7 @@ void fill_tiled_index_map_tile_impl(const AddrGen &input,
   }
 }
 
-template <typename AddrGen>
-void fill_tiled_index_map_tile(const AddrGen &input, const View &view,
+void fill_tiled_index_map_tile(const InterleavedAddrGenFast<true> &input, const View &view,
                                uint32_t batch, uint32_t row_tile, uint32_t col_tile,
                                uint32_t dst_addr, uint32_t tile_bytes,
                                uint32_t cb_source) {
@@ -476,8 +250,8 @@ void fill_tiled_index_map_tile(const AddrGen &input, const View &view,
   }
 }
 
-template <uint32_t DatumBytes, typename AddrGen>
-void fill_tile_transpose_tile_impl(const AddrGen &input,
+template <uint32_t DatumBytes>
+void fill_tile_transpose_tile_impl(const InterleavedAddrGenFast<true> &input,
                                    const View &view, uint32_t batch, uint32_t row_tile,
                                    uint32_t col_tile, uint32_t dst_addr,
                                    uint32_t tile_bytes, uint32_t cb_source) {
@@ -498,7 +272,7 @@ void fill_tile_transpose_tile_impl(const AddrGen &input,
   uint32_t source_tile =
       tile_id_for_indices(view, indices, &source_row_base, &source_col_base);
   if (row_base + TILE_R <= view.logical_rows && col_base + TILE_C <= view.logical_cols) {
-    read_source_to_l1(input, source_tile, dst_addr);
+    noc_async_read_tile(source_tile, input, dst_addr);
     noc_async_read_barrier();
     return;
   }
@@ -514,8 +288,7 @@ void fill_tile_transpose_tile_impl(const AddrGen &input,
   cb_pop_front(cb_source, 1);
 }
 
-template <typename AddrGen>
-void fill_tile_transpose_tile(const AddrGen &input, const View &view,
+void fill_tile_transpose_tile(const InterleavedAddrGenFast<true> &input, const View &view,
                               uint32_t batch, uint32_t row_tile, uint32_t col_tile,
                               uint32_t dst_addr, uint32_t tile_bytes,
                               uint32_t cb_source) {

@@ -288,6 +288,7 @@ pub(crate) fn reduce(
 }
 
 fn validate_input(input: &DramBuffer, plan: &ReducePlan) -> io::Result<()> {
+    input.require_interleaved("reduce input")?;
     if input.dtype != plan.dtype {
         return Err(invalid_input(format!(
             "reduce input requires {:?}, got {:?}",

@@ -19,18 +19,18 @@ mod mlir_frontend;
 mod utils;
 
 use device::Device;
-use dram::{allocator_stats, DType, DramBuffer};
+use dram::{allocator_stats, DType, DramBuffer, DramLayout};
 #[cfg(libtt_mlir_frontend)]
 use executable_proto::tt::analysis_result::Status as MlirAnalysisStatus;
 use log::log;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CString};
 use std::io;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 
 include!("pjrt_bindings.rs");
 
@@ -107,6 +107,133 @@ pub struct PJRT_Layouts_SerializedLayout {
     serialized: CString,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TtMemoryLayout {
+    Dense,
+    MatmulRhsBankSharded { shard_tiles: usize },
+    MatmulRhsTransposeBankSharded { shard_tiles: usize },
+}
+
+const MATMUL_RHS_BANK_SHARDED_MIN_FREE_TILES: usize = 1024;
+#[allow(dead_code)]
+const ENABLE_MATMUL_RHS_BANK_SHARDING_ENV: &str = "LIBTT_ENABLE_MATMUL_RHS_BANK_SHARDING";
+
+impl TtMemoryLayout {
+    fn from_dram_layout(layout: DramLayout) -> Self {
+        match layout {
+            DramLayout::Interleaved => Self::Dense,
+            DramLayout::BankSharded { shard_tiles } => Self::MatmulRhsBankSharded { shard_tiles },
+            DramLayout::BankShardedTranspose { shard_tiles, .. } => {
+                Self::MatmulRhsTransposeBankSharded { shard_tiles }
+            }
+            DramLayout::WidthSharded { .. } => Self::MatmulRhsBankSharded {
+                shard_tiles: dram::MATMUL_RHS_SHARD_TILES,
+            },
+            DramLayout::WidthShardedTranspose { .. } => Self::MatmulRhsTransposeBankSharded {
+                shard_tiles: dram::MATMUL_RHS_SHARD_TILES,
+            },
+        }
+    }
+
+    fn to_dram_layout(self, allocation_shape: &[usize]) -> Result<DramLayout, *mut PJRT_Error> {
+        match self {
+            Self::Dense => Ok(DramLayout::Interleaved),
+            Self::MatmulRhsBankSharded { shard_tiles } => {
+                if allocation_shape.len() < 2 {
+                    return Err(invalid_argument("matmul RHS layout requires rank >= 2"));
+                }
+                Ok(DramLayout::BankSharded { shard_tiles })
+            }
+            Self::MatmulRhsTransposeBankSharded { shard_tiles } => {
+                if allocation_shape.len() < 2 {
+                    return Err(invalid_argument(
+                        "matmul RHS transpose layout requires rank >= 2",
+                    ));
+                }
+                let rank = allocation_shape.len();
+                Ok(DramLayout::BankShardedTranspose {
+                    shard_tiles,
+                    tile_rows: allocation_shape[rank - 2] / dram::TILE_R,
+                    tiles_per_row: allocation_shape[rank - 1] / dram::TILE_C,
+                })
+            }
+        }
+    }
+
+    fn xla_layout_string(self, rank: usize) -> String {
+        let mut layout = xla_descending_layout_string(rank);
+        if let Some(tile_dims) = self.xla_tile_dims(rank) {
+            let tile_dims = tile_dims
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            layout.pop();
+            layout.push_str(":T(");
+            layout.push_str(&tile_dims);
+            layout.push_str(")}");
+        }
+        layout
+    }
+
+    fn xla_tile_dims(self, rank: usize) -> Option<Vec<usize>> {
+        match self {
+            Self::Dense => None,
+            Self::MatmulRhsBankSharded { shard_tiles } if rank >= 2 => {
+                let mut tile_dims = vec![1; rank - 2];
+                tile_dims.push(dram::TILE_R);
+                tile_dims.push(dram::TILE_C * shard_tiles);
+                Some(tile_dims)
+            }
+            Self::MatmulRhsTransposeBankSharded { shard_tiles } if rank >= 2 => {
+                let mut tile_dims = vec![1; rank - 2];
+                tile_dims.push(dram::TILE_R * shard_tiles);
+                tile_dims.push(dram::TILE_C);
+                Some(tile_dims)
+            }
+            Self::MatmulRhsBankSharded { .. } | Self::MatmulRhsTransposeBankSharded { .. } => None,
+        }
+    }
+}
+
+fn xla_descending_layout_string(rank: usize) -> String {
+    let dims = (0..rank)
+        .rev()
+        .map(|dim| dim.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{dims}}}")
+}
+
+fn memory_layout_object(layout: TtMemoryLayout, rank: usize) -> PJRT_Layouts_MemoryLayout {
+    PJRT_Layouts_MemoryLayout {
+        serialized: cstring_lossy(layout.xla_layout_string(rank)),
+    }
+}
+
+fn boxed_memory_layout(layout: TtMemoryLayout, rank: usize) -> *mut PJRT_Layouts_MemoryLayout {
+    Box::into_raw(Box::new(memory_layout_object(layout, rank)))
+}
+
+#[allow(dead_code)]
+fn memory_layout_objects(
+    layouts: impl IntoIterator<Item = (TtMemoryLayout, usize)>,
+) -> (
+    Arc<[PJRT_Layouts_MemoryLayout]>,
+    Vec<*mut PJRT_Layouts_MemoryLayout>,
+) {
+    let objects = layouts
+        .into_iter()
+        .map(|(layout, rank)| memory_layout_object(layout, rank))
+        .collect::<Vec<_>>();
+    let objects = Arc::<[PJRT_Layouts_MemoryLayout]>::from(objects);
+    let ptrs = objects
+        .iter()
+        .map(|layout| layout as *const PJRT_Layouts_MemoryLayout as *mut PJRT_Layouts_MemoryLayout)
+        .collect::<Vec<_>>();
+    (objects, ptrs)
+}
+
 #[derive(Clone)]
 struct ExecutableMetadata {
     name: CString,
@@ -118,6 +245,11 @@ struct ExecutableMetadata {
     _output_memory_kinds: Vec<CString>,
     output_memory_kind_ptrs: Vec<*const c_char>,
     output_memory_kind_sizes: Vec<usize>,
+    _output_layout_objects: Arc<[PJRT_Layouts_MemoryLayout]>,
+    output_layout_ptrs: Vec<*mut PJRT_Layouts_MemoryLayout>,
+    _parameter_layout_objects: Arc<[PJRT_Layouts_MemoryLayout]>,
+    parameter_layout_ptrs: Vec<*mut PJRT_Layouts_MemoryLayout>,
+    _parameter_layouts: Vec<TtMemoryLayout>,
     executable: Option<executable::Executable>,
     lazy_reshape_ids: HashSet<u32>,
 }
@@ -357,6 +489,23 @@ unsafe fn checked_i64_slice<'a>(
     len: usize,
     field: &str,
 ) -> Result<&'a [i64], *mut PJRT_Error> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err(invalid_argument(format!(
+            "{field} must not be null when length > 0"
+        )));
+    }
+    // SAFETY: caller owns `ptr` for `len` elements during the call.
+    Ok(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+unsafe fn checked_usize_slice<'a>(
+    ptr: *const usize,
+    len: usize,
+    field: &str,
+) -> Result<&'a [usize], *mut PJRT_Error> {
     if len == 0 {
         return Ok(&[]);
     }
@@ -744,6 +893,21 @@ fn make_executable_metadata(
         .as_ref()
         .map(lazy_reshape_ids)
         .unwrap_or_default();
+    let output_layouts = vec![TtMemoryLayout::Dense; outputs.len()];
+    let (output_layout_objects, output_layout_ptrs) = memory_layout_objects(
+        output_layouts
+            .iter()
+            .zip(outputs.iter())
+            .map(|(layout, output)| (*layout, output.dims.len())),
+    );
+    let parameter_layouts = executable_parameter_layouts(executable.as_ref());
+    let parameter_ranks = executable.as_ref().map(parameter_ranks).unwrap_or_default();
+    let (parameter_layout_objects, parameter_layout_ptrs) = memory_layout_objects(
+        parameter_layouts
+            .iter()
+            .enumerate()
+            .map(|(index, layout)| (*layout, parameter_ranks.get(index).copied().unwrap_or(0))),
+    );
     ExecutableMetadata {
         name: cstring_lossy(name),
         fingerprint,
@@ -754,6 +918,11 @@ fn make_executable_metadata(
         _output_memory_kinds: output_memory_kinds,
         output_memory_kind_ptrs,
         output_memory_kind_sizes,
+        _output_layout_objects: output_layout_objects,
+        output_layout_ptrs,
+        _parameter_layout_objects: parameter_layout_objects,
+        parameter_layout_ptrs,
+        _parameter_layouts: parameter_layouts,
         executable,
         lazy_reshape_ids,
     }
@@ -778,6 +947,28 @@ fn cloned_executable(executable: &PJRT_LoadedExecutable) -> PJRT_Executable {
     PJRT_Executable {
         metadata: executable.metadata.clone(),
     }
+}
+
+#[allow(dead_code)]
+fn parameter_ranks(plan: &executable::Executable) -> Vec<usize> {
+    let mut ranks = Vec::new();
+    for op in &plan.ops {
+        if let executable::Op::Parameter {
+            parameter_index,
+            output_id,
+        } = op
+        {
+            if ranks.len() <= *parameter_index {
+                ranks.resize(parameter_index + 1, 0);
+            }
+            ranks[*parameter_index] = plan
+                .values
+                .get(*output_id as usize)
+                .map(|value| value.dims.len())
+                .unwrap_or(0);
+        }
+    }
+    ranks
 }
 
 #[cfg(libtt_mlir_frontend)]
@@ -1733,6 +1924,7 @@ fn execute_constant(
     packed_value: u32,
     logical_data: &[u8],
     output_id: u32,
+    matmul_rhs_layouts: &HashMap<u32, TtMemoryLayout>,
 ) -> Result<(), *mut PJRT_Error> {
     let output_desc = plan.values.get(output_id as usize).ok_or_else(|| {
         invalid_argument(format!(
@@ -1755,9 +1947,22 @@ fn execute_constant(
         padded_host_data(logical_data, dtype, &logical_shape, &allocation_shape)?
             .unwrap_or_else(|| logical_data.to_vec())
     };
-    let output_dram = device
-        .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
-        .map_err(io_error)?;
+    let output_dram = if let Some(layout) = matmul_rhs_layouts.get(&output_id) {
+        let layout = layout.to_dram_layout(&allocation_shape)?;
+        device
+            .alloc_write_with_layout(
+                &data,
+                dtype,
+                &allocation_shape,
+                "pjrt_constant_matmul_rhs",
+                layout,
+            )
+            .map_err(io_error)?
+    } else {
+        device
+            .alloc_write(&data, dtype, &allocation_shape, "pjrt_constant")
+            .map_err(io_error)?
+    };
     store_output_buffer(
         values,
         plan,
@@ -1951,7 +2156,16 @@ fn execute_fused_elementwise(
         ..
     }) = nodes.last()
     {
-        return execute_constant(values, plan, device, context, *packed_value, &[], output_id);
+        return execute_constant(
+            values,
+            plan,
+            device,
+            context,
+            *packed_value,
+            &[],
+            output_id,
+            &HashMap::new(),
+        );
     }
 
     let mut inputs = Vec::with_capacity(input_ids.len());
@@ -2716,6 +2930,200 @@ fn constant_packed_value(plan: &executable::Executable, value_id: u32) -> Option
     })
 }
 
+#[cfg(test)]
+fn matmul_rhs_constant_ids(plan: &executable::Executable) -> HashSet<u32> {
+    let constant_ids = plan
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            executable::Op::Constant { output_id, .. } => Some(*output_id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    constant_ids
+        .intersection(&matmul_rhs_value_ids(plan))
+        .copied()
+        .collect()
+}
+
+#[allow(dead_code)]
+fn executable_parameter_layouts(plan: Option<&executable::Executable>) -> Vec<TtMemoryLayout> {
+    executable_parameter_layouts_with_rhs_sharding(plan, matmul_rhs_bank_sharding_enabled())
+}
+
+fn executable_parameter_layouts_with_rhs_sharding(
+    plan: Option<&executable::Executable>,
+    enable_matmul_rhs_sharding: bool,
+) -> Vec<TtMemoryLayout> {
+    let Some(plan) = plan else {
+        return Vec::new();
+    };
+    let mut parameter_count = 0usize;
+    let mut parameter_output_ids = Vec::new();
+    for op in &plan.ops {
+        if let executable::Op::Parameter {
+            parameter_index,
+            output_id,
+        } = op
+        {
+            parameter_count = parameter_count.max(parameter_index + 1);
+            parameter_output_ids.push((*parameter_index, *output_id));
+        }
+    }
+
+    let rhs_layouts = if enable_matmul_rhs_sharding {
+        matmul_rhs_value_layouts(plan)
+    } else {
+        HashMap::new()
+    };
+    let mut layouts = vec![TtMemoryLayout::Dense; parameter_count];
+    for (parameter_index, output_id) in parameter_output_ids {
+        if let Some(layout) = rhs_layouts.get(&output_id) {
+            layouts[parameter_index] = *layout;
+        }
+    }
+    layouts
+}
+
+#[allow(dead_code)]
+fn matmul_rhs_bank_sharding_enabled() -> bool {
+    matches!(
+        std::env::var(ENABLE_MATMUL_RHS_BANK_SHARDING_ENV)
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+fn matmul_rhs_value_layouts(plan: &executable::Executable) -> HashMap<u32, TtMemoryLayout> {
+    let rhs_ids = matmul_rhs_value_ids(plan);
+    let mut layouts = HashMap::new();
+    let mut conflicts = HashSet::new();
+    for op in &plan.ops {
+        let executable::Op::Matmul {
+            input_ids,
+            dimension_numbers,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let rhs_id = input_ids[1];
+        if !rhs_ids.contains(&rhs_id) || conflicts.contains(&rhs_id) {
+            continue;
+        }
+        let Some(layout) = matmul_rhs_layout(plan, rhs_id, dimension_numbers) else {
+            continue;
+        };
+        match layouts.get(&rhs_id) {
+            Some(existing) if *existing != layout => {
+                layouts.remove(&rhs_id);
+                conflicts.insert(rhs_id);
+            }
+            Some(_) => {}
+            None => {
+                layouts.insert(rhs_id, layout);
+            }
+        }
+    }
+    layouts
+}
+
+fn matmul_rhs_layout(
+    plan: &executable::Executable,
+    rhs_id: u32,
+    dimension_numbers: &executable::DotGeneralDimensionNumbers,
+) -> Option<TtMemoryLayout> {
+    let rhs_shape = &plan.values.get(rhs_id as usize)?.dims;
+    let rank = rhs_shape.len();
+    if rank < 2 {
+        return None;
+    }
+    let batch_dims = parse_layout_dims(&dimension_numbers.rhs_batching_dimensions, rank)?;
+    let contract_dims = parse_layout_dims(&dimension_numbers.rhs_contracting_dimensions, rank)?;
+    let free_dims = (0..rank)
+        .filter(|dim| !batch_dims.contains(dim) && !contract_dims.contains(dim))
+        .collect::<Vec<_>>();
+    if !batch_dims.iter().copied().eq(0..batch_dims.len())
+        || rank != batch_dims.len() + 2
+        || contract_dims.len() != 1
+        || free_dims.len() != 1
+    {
+        return None;
+    }
+    if contract_dims[0] == rank - 2 && free_dims[0] == rank - 1 {
+        let free_tiles = div_ceil_positive_i64(rhs_shape[free_dims[0]], dram::TILE_C)?;
+        if free_tiles < MATMUL_RHS_BANK_SHARDED_MIN_FREE_TILES {
+            return None;
+        }
+        Some(TtMemoryLayout::MatmulRhsBankSharded {
+            shard_tiles: dram::MATMUL_RHS_SHARD_TILES,
+        })
+    } else if contract_dims[0] == rank - 1 && free_dims[0] == rank - 2 {
+        let free_tiles = div_ceil_positive_i64(rhs_shape[free_dims[0]], dram::TILE_R)?;
+        if free_tiles < MATMUL_RHS_BANK_SHARDED_MIN_FREE_TILES {
+            return None;
+        }
+        Some(TtMemoryLayout::MatmulRhsTransposeBankSharded {
+            shard_tiles: dram::MATMUL_RHS_SHARD_TILES,
+        })
+    } else {
+        None
+    }
+}
+
+fn div_ceil_positive_i64(value: i64, divisor: usize) -> Option<usize> {
+    let value = usize::try_from(value).ok()?;
+    if value == 0 || divisor == 0 {
+        return None;
+    }
+    Some(value.checked_add(divisor - 1)? / divisor)
+}
+
+fn parse_layout_dims(dims: &[i64], rank: usize) -> Option<Vec<usize>> {
+    let mut parsed = Vec::with_capacity(dims.len());
+    let mut seen = vec![false; rank];
+    for &dim in dims {
+        let dim = usize::try_from(dim).ok()?;
+        if dim >= rank || seen[dim] {
+            return None;
+        }
+        seen[dim] = true;
+        parsed.push(dim);
+    }
+    Some(parsed)
+}
+
+fn matmul_rhs_value_ids(plan: &executable::Executable) -> HashSet<u32> {
+    let rhs_ids = plan
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            executable::Op::Matmul { input_ids, .. } => Some(input_ids[1]),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    rhs_ids
+        .into_iter()
+        .filter(|&value_id| {
+            plan.ops.iter().all(|op| {
+                !op_consumes_value(op, value_id) || op_consumes_value_as_matmul_rhs(op, value_id)
+            })
+        })
+        .collect()
+}
+
+fn op_consumes_value_as_matmul_rhs(op: &executable::Op, value_id: u32) -> bool {
+    match op {
+        executable::Op::Matmul { input_ids, .. } => {
+            input_ids[1] == value_id && input_ids[0] != value_id
+        }
+        _ => false,
+    }
+}
+
 fn op_consumes_value(op: &executable::Op, value_id: u32) -> bool {
     match op {
         executable::Op::Parameter { .. }
@@ -3425,6 +3833,7 @@ fn execute_executable_v1(
         .as_ref()
         .ok_or_else(|| failed_precondition("loaded executable has no TT executable payload"))?;
     let mut values = vec![None; plan.values.len()];
+    let matmul_rhs_layouts = matmul_rhs_value_layouts(plan);
 
     for op in &plan.ops {
         match op {
@@ -3596,6 +4005,7 @@ fn execute_executable_v1(
                     *packed_value,
                     data,
                     *output_id,
+                    &matmul_rhs_layouts,
                 )?;
             }
             executable::Op::Select {
@@ -3839,6 +4249,94 @@ pub unsafe extern "C" fn TT_LoadedExecutable_Execute(
     ptr::null_mut()
 }
 
+fn dram_layout_from_device_layout(
+    layout: *const PJRT_Buffer_MemoryLayout,
+    allocation_shape: &[usize],
+) -> Result<DramLayout, *mut PJRT_Error> {
+    if layout.is_null() {
+        return Ok(DramLayout::Interleaved);
+    }
+    let layout = unsafe { checked_ref(layout, "device_layout") }?;
+    match layout.type_ {
+        PJRT_Buffer_MemoryLayout_Type::PJRT_Buffer_MemoryLayout_Type_Tiled => {
+            // SAFETY: `type_` says the active union member is `tiled`.
+            let tiled = unsafe { layout.__bindgen_anon_1.tiled };
+            dram_layout_from_tiled_device_layout(&tiled, allocation_shape)
+        }
+        PJRT_Buffer_MemoryLayout_Type::PJRT_Buffer_MemoryLayout_Type_Strides => {
+            Err(unimplemented("strided device layouts are not supported"))
+        }
+    }
+}
+
+fn dram_layout_from_tiled_device_layout(
+    tiled: &PJRT_Buffer_MemoryLayout_Tiled,
+    allocation_shape: &[usize],
+) -> Result<DramLayout, *mut PJRT_Error> {
+    let rank = allocation_shape.len();
+    let minor_to_major = unsafe {
+        checked_i64_slice(
+            tiled.minor_to_major,
+            tiled.minor_to_major_size,
+            "device_layout.tiled.minor_to_major",
+        )
+    }?;
+    let expected_minor_to_major = (0..rank).rev().map(|dim| dim as i64).collect::<Vec<_>>();
+    if minor_to_major != expected_minor_to_major.as_slice() {
+        return Err(unimplemented(format!(
+            "only descending minor-to-major device layouts are supported, got {minor_to_major:?}"
+        )));
+    }
+    if tiled.num_tiles == 0 {
+        return Ok(DramLayout::Interleaved);
+    }
+    if tiled.num_tiles != 1 {
+        return Err(unimplemented(format!(
+            "only zero or one device layout tile is supported, got {}",
+            tiled.num_tiles
+        )));
+    }
+
+    let tile_dim_sizes = unsafe {
+        checked_usize_slice(
+            tiled.tile_dim_sizes,
+            tiled.num_tiles,
+            "device_layout.tiled.tile_dim_sizes",
+        )
+    }?;
+    let tile_dim_size = tile_dim_sizes[0];
+    let tile_dims = unsafe {
+        checked_i64_slice(
+            tiled.tile_dims,
+            tile_dim_size,
+            "device_layout.tiled.tile_dims",
+        )
+    }?;
+    let tile_dims = tile_dims
+        .iter()
+        .map(|&dim| {
+            usize::try_from(dim)
+                .map_err(|_| invalid_argument("device layout tile dimensions must be >= 0"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let rhs_layout = TtMemoryLayout::MatmulRhsBankSharded {
+        shard_tiles: dram::MATMUL_RHS_SHARD_TILES,
+    };
+    if rhs_layout.xla_tile_dims(rank).as_deref() == Some(tile_dims.as_slice()) {
+        return rhs_layout.to_dram_layout(allocation_shape);
+    }
+    let rhs_transpose_layout = TtMemoryLayout::MatmulRhsTransposeBankSharded {
+        shard_tiles: dram::MATMUL_RHS_SHARD_TILES,
+    };
+    if rhs_transpose_layout.xla_tile_dims(rank).as_deref() == Some(tile_dims.as_slice()) {
+        return rhs_transpose_layout.to_dram_layout(allocation_shape);
+    }
+    Err(unimplemented(format!(
+        "unsupported tiled device layout tile dimensions {tile_dims:?}"
+    )))
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
     args: *mut PJRT_Client_BufferFromHostBuffer_Args,
@@ -3849,9 +4347,6 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
     let Ok(client) = (unsafe { checked_ref(args.client, "client") }) else {
         return invalid_argument("client must not be null");
     };
-    if !args.device_layout.is_null() {
-        return unimplemented("custom device layouts are not supported");
-    }
     match args.host_buffer_semantics {
         PJRT_HostBufferSemantics::PJRT_HostBufferSemantics_kImmutableOnlyDuringCall
         | PJRT_HostBufferSemantics::PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes
@@ -3871,6 +4366,15 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         Ok(shape) => shape,
         Err(err) => return err,
     };
+    let allocation_shape = match dram::tiled_allocation_shape(&shape).map_err(io_error) {
+        Ok(shape) => shape,
+        Err(err) => return err,
+    };
+    let requested_dram_layout =
+        match dram_layout_from_device_layout(args.device_layout, &allocation_shape) {
+            Ok(layout) => layout,
+            Err(err) => return err,
+        };
     if let Err(err) =
         validate_dense_row_major_strides(dtype, &shape, args.byte_strides, args.num_byte_strides)
     {
@@ -3916,8 +4420,8 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
     };
     let local_hardware_id = target_device_ref.local_hardware_id as usize;
     log(format!(
-        "pjrt buffer_from_host_buffer type={:?} dims={:?} local_hardware_id={}",
-        args.type_, dims_i64, local_hardware_id
+        "pjrt buffer_from_host_buffer type={:?} dims={:?} layout={:?} local_hardware_id={}",
+        args.type_, dims_i64, requested_dram_layout, local_hardware_id
     ));
 
     let data = if byte_size == 0 {
@@ -3926,10 +4430,6 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         // SAFETY: caller owns `data` for `byte_size` bytes during the call.
         unsafe { slice::from_raw_parts(args.data.cast::<u8>(), byte_size) }
     };
-    let allocation_shape = match dram::tiled_allocation_shape(&shape).map_err(io_error) {
-        Ok(shape) => shape,
-        Err(err) => return err,
-    };
     let padded_data = match padded_host_data(data, dtype, &shape, &allocation_shape) {
         Ok(data) => data,
         Err(err) => return err,
@@ -3937,7 +4437,13 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
     let allocation_data = padded_data.as_deref().unwrap_or(data);
     let dram_buffer = match with_device(target_device_ref, |device| {
         device
-            .alloc_write(allocation_data, dtype, &allocation_shape, "pjrt")
+            .alloc_write_with_layout(
+                allocation_data,
+                dtype,
+                &allocation_shape,
+                "pjrt",
+                requested_dram_layout,
+            )
             .map_err(io_error)
     }) {
         Ok(buffer) => buffer,
@@ -3955,6 +4461,147 @@ pub unsafe extern "C" fn TT_Client_BufferFromHostBuffer(
         source_shape: None,
         deleted: false,
     }));
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_MemoryLayout_Destroy(
+    args: *mut PJRT_Layouts_MemoryLayout_Destroy_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if args.layout.is_null() {
+        return invalid_argument("layout must not be null");
+    }
+    unsafe {
+        drop(Box::from_raw(args.layout));
+    }
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn TT_Layouts_SerializedLayout_Destroy(
+    layout: *mut PJRT_Layouts_SerializedLayout,
+) {
+    if !layout.is_null() {
+        unsafe {
+            drop(Box::from_raw(layout));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_MemoryLayout_Serialize(
+    args: *mut PJRT_Layouts_MemoryLayout_Serialize_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(layout) = (unsafe { checked_ref(args.layout, "layout") }) else {
+        return invalid_argument("layout must not be null");
+    };
+
+    let serialized_layout = Box::new(PJRT_Layouts_SerializedLayout {
+        serialized: layout.serialized.clone(),
+    });
+    let serialized_layout = Box::into_raw(serialized_layout);
+    let serialized = unsafe { &(*serialized_layout).serialized };
+    args.serialized_bytes = serialized.as_ptr();
+    args.serialized_bytes_size = serialized.as_bytes().len();
+    args.serialized_layout = serialized_layout;
+    args.serialized_layout_deleter = Some(TT_Layouts_SerializedLayout_Destroy);
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_PJRT_Client_GetDefaultLayout(
+    args: *mut PJRT_Layouts_PJRT_Client_GetDefaultLayout_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if args.client.is_null() {
+        return invalid_argument("client must not be null");
+    }
+    args.layout = boxed_memory_layout(TtMemoryLayout::Dense, args.num_dims);
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_PJRT_Topology_GetDefaultLayout(
+    args: *mut PJRT_Layouts_PJRT_Topology_GetDefaultLayout_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    if args.topology_description.is_null() {
+        return invalid_argument("topology_description must not be null");
+    }
+    args.layout = boxed_memory_layout(TtMemoryLayout::Dense, args.num_dims);
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_PJRT_Buffer_MemoryLayout(
+    args: *mut PJRT_Layouts_PJRT_Buffer_MemoryLayout_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(buffer) = (unsafe { checked_ref(args.buffer, "buffer") }) else {
+        return invalid_argument("buffer must not be null");
+    };
+    if buffer.deleted {
+        return failed_precondition("buffer must not be deleted");
+    }
+    let layout = buffer
+        .dram_buffer
+        .as_ref()
+        .map(|buffer| TtMemoryLayout::from_dram_layout(buffer.layout))
+        .unwrap_or(TtMemoryLayout::Dense);
+    args.layout = boxed_memory_layout(layout, buffer.dims.len());
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_PJRT_Executable_GetOutputLayouts(
+    args: *mut PJRT_Layouts_PJRT_Executable_GetOutputLayouts_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.num_outputs = executable.metadata.output_layout_ptrs.len();
+    args.layouts = if executable.metadata.output_layout_ptrs.is_empty() {
+        ptr::null_mut()
+    } else {
+        executable.metadata.output_layout_ptrs.as_ptr().cast_mut()
+    };
+    ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn TT_Layouts_PJRT_Executable_GetParameterLayouts(
+    args: *mut PJRT_Layouts_PJRT_Executable_GetParameterLayouts_Args,
+) -> *mut PJRT_Error {
+    let Ok(args) = (unsafe { checked_mut(args, "args") }) else {
+        return invalid_argument("args must not be null");
+    };
+    let Ok(executable) = (unsafe { checked_ref(args.executable, "executable") }) else {
+        return invalid_argument("executable must not be null");
+    };
+    args.num_parameters = executable.metadata.parameter_layout_ptrs.len();
+    args.layouts = if executable.metadata.parameter_layout_ptrs.is_empty() {
+        ptr::null_mut()
+    } else {
+        executable
+            .metadata
+            .parameter_layout_ptrs
+            .as_ptr()
+            .cast_mut()
+    };
     ptr::null_mut()
 }
 
@@ -4686,11 +5333,39 @@ pub unsafe extern "C" fn TT_TopologyDescription_Fingerprint(
     ptr::null_mut()
 }
 
+fn build_layouts_extension() -> &'static mut PJRT_Layouts_Extension {
+    Box::leak(Box::new(PJRT_Layouts_Extension {
+        base: PJRT_Extension_Base {
+            struct_size: size_of::<PJRT_Layouts_Extension>(),
+            type_: PJRT_Extension_Type::PJRT_Extension_Type_Layouts,
+            next: ptr::null_mut(),
+        },
+        PJRT_Layouts_MemoryLayout_Destroy: Some(TT_Layouts_MemoryLayout_Destroy),
+        PJRT_Layouts_MemoryLayout_Serialize: Some(TT_Layouts_MemoryLayout_Serialize),
+        PJRT_Layouts_PJRT_Client_GetDefaultLayout: Some(TT_Layouts_PJRT_Client_GetDefaultLayout),
+        PJRT_Layouts_PJRT_Buffer_MemoryLayout: Some(TT_Layouts_PJRT_Buffer_MemoryLayout),
+        PJRT_Layouts_PJRT_Topology_GetDefaultLayout: Some(
+            TT_Layouts_PJRT_Topology_GetDefaultLayout,
+        ),
+        PJRT_Layouts_PJRT_Executable_GetOutputLayouts: Some(
+            TT_Layouts_PJRT_Executable_GetOutputLayouts,
+        ),
+        PJRT_Layouts_PJRT_Executable_GetParameterLayouts: Some(
+            TT_Layouts_PJRT_Executable_GetParameterLayouts,
+        ),
+    }))
+}
+
 fn build_pjrt_api() -> PJRT_Api {
     let mut api: PJRT_Api = unsafe { std::mem::zeroed() };
 
     api.struct_size = size_of::<PJRT_Api>();
-    api.extension_start = ptr::null_mut();
+    api.extension_start = if matmul_rhs_bank_sharding_enabled() {
+        let layouts_extension = build_layouts_extension();
+        (&mut layouts_extension.base) as *mut PJRT_Extension_Base
+    } else {
+        ptr::null_mut()
+    };
     api.pjrt_api_version = PJRT_Api_Version {
         struct_size: size_of::<PJRT_Api_Version>(),
         extension_start: ptr::null_mut(),
@@ -4872,6 +5547,300 @@ mod tests {
                 panic!("unexpected PJRT error {code:?}: {detail}");
             }
         }
+    }
+
+    #[test]
+    fn matmul_rhs_constant_ids_selects_only_exclusive_rhs_constants() {
+        let value = executable::ValueDesc {
+            dims: vec![32, 32],
+            element_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+        };
+        let dims = || executable::DotGeneralDimensionNumbers {
+            lhs_batching_dimensions: Vec::new(),
+            rhs_batching_dimensions: Vec::new(),
+            lhs_contracting_dimensions: vec![1],
+            rhs_contracting_dimensions: vec![0],
+        };
+        let matmul = |lhs, rhs, output_id| executable::Op::Matmul {
+            input_ids: [lhs, rhs],
+            output_id,
+            dimension_numbers: dims(),
+            top_k_epilogue: None,
+        };
+        let constant = |output_id| executable::Op::Constant {
+            packed_value: 0,
+            data: vec![0; 2],
+            output_id,
+        };
+
+        let plan = executable::Executable {
+            values: vec![value; 10],
+            ops: vec![
+                constant(0),
+                constant(2),
+                constant(3),
+                constant(4),
+                matmul(1, 0, 6),
+                matmul(1, 2, 7),
+                matmul(5, 2, 8),
+                matmul(1, 3, 9),
+                executable::Op::BroadcastInDim {
+                    input_id: 3,
+                    output_id: 3,
+                    broadcast_dimensions: vec![0, 1],
+                },
+                matmul(4, 4, 9),
+            ],
+            output_ids: vec![6, 7, 8, 9],
+        };
+
+        assert_eq!(matmul_rhs_constant_ids(&plan), HashSet::from([0, 2]));
+    }
+
+    #[test]
+    fn matmul_rhs_parameter_layouts_selects_canonical_rhs_parameters() {
+        let value = executable::ValueDesc {
+            dims: vec![32, 32768],
+            element_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+        };
+        let dims = || executable::DotGeneralDimensionNumbers {
+            lhs_batching_dimensions: Vec::new(),
+            rhs_batching_dimensions: Vec::new(),
+            lhs_contracting_dimensions: vec![1],
+            rhs_contracting_dimensions: vec![0],
+        };
+        let matmul = |lhs, rhs, output_id| executable::Op::Matmul {
+            input_ids: [lhs, rhs],
+            output_id,
+            dimension_numbers: dims(),
+            top_k_epilogue: None,
+        };
+        let parameter = |parameter_index, output_id| executable::Op::Parameter {
+            parameter_index,
+            output_id,
+        };
+
+        let plan = executable::Executable {
+            values: vec![value; 8],
+            ops: vec![
+                parameter(0, 0),
+                parameter(1, 1),
+                parameter(2, 2),
+                matmul(0, 1, 3),
+                matmul(0, 2, 4),
+                executable::Op::BroadcastInDim {
+                    input_id: 2,
+                    output_id: 5,
+                    broadcast_dimensions: vec![0, 1],
+                },
+                matmul(0, 0, 6),
+            ],
+            output_ids: vec![3, 4, 5, 6],
+        };
+
+        let layouts = executable_parameter_layouts_with_rhs_sharding(Some(&plan), true);
+        assert_eq!(
+            layouts,
+            vec![
+                TtMemoryLayout::Dense,
+                TtMemoryLayout::MatmulRhsBankSharded {
+                    shard_tiles: dram::MATMUL_RHS_SHARD_TILES
+                },
+                TtMemoryLayout::Dense,
+            ]
+        );
+        assert_eq!(layouts[1].xla_layout_string(2), "{1,0:T(32,128)}");
+    }
+
+    #[test]
+    fn matmul_rhs_parameter_layouts_selects_transposed_rhs_parameters() {
+        let value = executable::ValueDesc {
+            dims: vec![32768, 32],
+            element_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+        };
+        let dims = || executable::DotGeneralDimensionNumbers {
+            lhs_batching_dimensions: Vec::new(),
+            rhs_batching_dimensions: Vec::new(),
+            lhs_contracting_dimensions: vec![1],
+            rhs_contracting_dimensions: vec![1],
+        };
+        let matmul = |lhs, rhs, output_id| executable::Op::Matmul {
+            input_ids: [lhs, rhs],
+            output_id,
+            dimension_numbers: dims(),
+            top_k_epilogue: None,
+        };
+        let parameter = |parameter_index, output_id| executable::Op::Parameter {
+            parameter_index,
+            output_id,
+        };
+
+        let plan = executable::Executable {
+            values: vec![value; 8],
+            ops: vec![
+                parameter(0, 0),
+                parameter(1, 1),
+                parameter(2, 2),
+                matmul(0, 1, 3),
+                matmul(0, 2, 4),
+                executable::Op::BroadcastInDim {
+                    input_id: 2,
+                    output_id: 5,
+                    broadcast_dimensions: vec![0, 1],
+                },
+                matmul(0, 0, 6),
+            ],
+            output_ids: vec![3, 4, 5, 6],
+        };
+
+        let layouts = executable_parameter_layouts_with_rhs_sharding(Some(&plan), true);
+        assert_eq!(
+            layouts,
+            vec![
+                TtMemoryLayout::Dense,
+                TtMemoryLayout::MatmulRhsTransposeBankSharded {
+                    shard_tiles: dram::MATMUL_RHS_SHARD_TILES
+                },
+                TtMemoryLayout::Dense,
+            ]
+        );
+        assert_eq!(layouts[1].xla_layout_string(2), "{1,0:T(128,32)}");
+    }
+
+    #[test]
+    fn matmul_rhs_parameter_layouts_keep_narrow_rhs_dense() {
+        let value = executable::ValueDesc {
+            dims: vec![32, 128],
+            element_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+        };
+        let plan = executable::Executable {
+            values: vec![value; 4],
+            ops: vec![
+                executable::Op::Parameter {
+                    parameter_index: 0,
+                    output_id: 0,
+                },
+                executable::Op::Parameter {
+                    parameter_index: 1,
+                    output_id: 1,
+                },
+                executable::Op::Matmul {
+                    input_ids: [0, 1],
+                    output_id: 2,
+                    dimension_numbers: executable::DotGeneralDimensionNumbers {
+                        lhs_batching_dimensions: Vec::new(),
+                        rhs_batching_dimensions: Vec::new(),
+                        lhs_contracting_dimensions: vec![1],
+                        rhs_contracting_dimensions: vec![0],
+                    },
+                    top_k_epilogue: None,
+                },
+            ],
+            output_ids: vec![2],
+        };
+
+        let layouts = executable_parameter_layouts_with_rhs_sharding(Some(&plan), true);
+        assert_eq!(layouts, vec![TtMemoryLayout::Dense, TtMemoryLayout::Dense]);
+    }
+
+    #[test]
+    fn matmul_rhs_parameter_layouts_can_disable_rhs_sharding() {
+        let value = executable::ValueDesc {
+            dims: vec![32, 32768],
+            element_type: PJRT_Buffer_Type::PJRT_Buffer_Type_BF16,
+        };
+        let plan = executable::Executable {
+            values: vec![value; 4],
+            ops: vec![
+                executable::Op::Parameter {
+                    parameter_index: 0,
+                    output_id: 0,
+                },
+                executable::Op::Parameter {
+                    parameter_index: 1,
+                    output_id: 1,
+                },
+                executable::Op::Matmul {
+                    input_ids: [0, 1],
+                    output_id: 2,
+                    dimension_numbers: executable::DotGeneralDimensionNumbers {
+                        lhs_batching_dimensions: Vec::new(),
+                        rhs_batching_dimensions: Vec::new(),
+                        lhs_contracting_dimensions: vec![1],
+                        rhs_contracting_dimensions: vec![0],
+                    },
+                    top_k_epilogue: None,
+                },
+            ],
+            output_ids: vec![2],
+        };
+
+        let layouts = executable_parameter_layouts_with_rhs_sharding(Some(&plan), false);
+        assert_eq!(layouts, vec![TtMemoryLayout::Dense, TtMemoryLayout::Dense]);
+    }
+
+    #[test]
+    fn xla_tiled_layout_marker_maps_to_bank_sharded_dram() {
+        let minor_to_major = [1_i64, 0_i64];
+        let tile_dims = [
+            dram::TILE_R as i64,
+            (dram::TILE_C * dram::MATMUL_RHS_SHARD_TILES) as i64,
+        ];
+        let tile_dim_sizes = [tile_dims.len()];
+        let tiled = PJRT_Buffer_MemoryLayout_Tiled {
+            struct_size: size_of::<PJRT_Buffer_MemoryLayout_Tiled>(),
+            extension_start: ptr::null_mut(),
+            minor_to_major: minor_to_major.as_ptr(),
+            minor_to_major_size: minor_to_major.len(),
+            tile_dims: tile_dims.as_ptr(),
+            tile_dim_sizes: tile_dim_sizes.as_ptr(),
+            num_tiles: 1,
+        };
+        let mut layout: PJRT_Buffer_MemoryLayout = unsafe { std::mem::zeroed() };
+        layout.struct_size = size_of::<PJRT_Buffer_MemoryLayout>();
+        layout.extension_start = ptr::null_mut();
+        layout.type_ = PJRT_Buffer_MemoryLayout_Type::PJRT_Buffer_MemoryLayout_Type_Tiled;
+        layout.__bindgen_anon_1.tiled = tiled;
+
+        assert_eq!(
+            unwrap_pjrt_result(dram_layout_from_device_layout(&layout, &[32, 128])),
+            DramLayout::BankSharded {
+                shard_tiles: dram::MATMUL_RHS_SHARD_TILES,
+            }
+        );
+    }
+
+    #[test]
+    fn xla_tiled_layout_marker_maps_to_transposed_bank_sharded_dram() {
+        let minor_to_major = [1_i64, 0_i64];
+        let tile_dims = [
+            (dram::TILE_R * dram::MATMUL_RHS_SHARD_TILES) as i64,
+            dram::TILE_C as i64,
+        ];
+        let tile_dim_sizes = [tile_dims.len()];
+        let tiled = PJRT_Buffer_MemoryLayout_Tiled {
+            struct_size: size_of::<PJRT_Buffer_MemoryLayout_Tiled>(),
+            extension_start: ptr::null_mut(),
+            minor_to_major: minor_to_major.as_ptr(),
+            minor_to_major_size: minor_to_major.len(),
+            tile_dims: tile_dims.as_ptr(),
+            tile_dim_sizes: tile_dim_sizes.as_ptr(),
+            num_tiles: 1,
+        };
+        let mut layout: PJRT_Buffer_MemoryLayout = unsafe { std::mem::zeroed() };
+        layout.struct_size = size_of::<PJRT_Buffer_MemoryLayout>();
+        layout.extension_start = ptr::null_mut();
+        layout.type_ = PJRT_Buffer_MemoryLayout_Type::PJRT_Buffer_MemoryLayout_Type_Tiled;
+        layout.__bindgen_anon_1.tiled = tiled;
+
+        assert_eq!(
+            unwrap_pjrt_result(dram_layout_from_device_layout(&layout, &[128, 32])),
+            DramLayout::BankShardedTranspose {
+                shard_tiles: dram::MATMUL_RHS_SHARD_TILES,
+                tile_rows: 4,
+                tiles_per_row: 1,
+            }
+        );
     }
 
     #[derive(Clone, Copy)]
