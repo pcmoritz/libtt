@@ -1,0 +1,27 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "tt_metal_overlay",
+    hdrs = glob(
+        [
+            "tt_metal/api/**/*.h",
+            "tt_metal/api/**/*.hpp",
+            "tt_metal/hostdevcommon/api/**/*.h",
+            "tt_metal/hostdevcommon/api/**/*.hpp",
+            "tt_stl/**/*.h",
+            "tt_stl/**/*.hpp",
+            "ttnn/api/**/*.h",
+            "ttnn/api/**/*.hpp",
+        ],
+        allow_empty = True,
+    ),
+    includes = [
+        ".",
+        "tt_metal/api",
+        "tt_metal/hostdevcommon/api",
+        "tt_stl",
+        "ttnn/api",
+    ],
+)
