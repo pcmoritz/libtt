@@ -112,6 +112,9 @@ cc_library(
         "tt_metal/common/stable_hash.cpp",
         "tt_metal/common/tt_backend_api_types.cpp",
         "tt_metal/common/work_split.cpp",
+        "tt_metal/distributed/distributed_coordinate_translator.cpp",
+        "tt_metal/impl/per_core_allocation/buffer.cpp",
+        "tt_metal/impl/per_core_allocation/memory_config.cpp",
     ],
     hdrs = glob([
         "tt_metal/api/**/*.h",

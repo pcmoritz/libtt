@@ -6,9 +6,8 @@
 #include <tt-metalium/allocator.hpp>
 #include <tt-metalium/tile.hpp>
 #include <tt-metalium/experimental/pinned_memory.hpp>
-#include <tt-metalium/experimental/tensor/spec/memory_config/memory_config.hpp>
-#include <umd/device/types/xy_pair.hpp>
 
+#include "tt_metal/distributed/distributed_coordinate_translator.hpp"
 #include "tt_metal/distributed/pinned_memory_cache.hpp"
 
 #include <algorithm>
@@ -19,54 +18,7 @@
 #include <utility>
 #include <vector>
 
-namespace tt {
-
-std::string xy_pair::str() const { return "(x=" + std::to_string(x) + ",y=" + std::to_string(y) + ")"; }
-
-std::string cxy_pair::str() const {
-  return "(chip=" + std::to_string(chip) + ",x=" + std::to_string(x) + ",y=" + std::to_string(y) + ")";
-}
-
-}  // namespace tt
-
 namespace tt::tt_metal {
-
-namespace {
-
-bool IsLocalCoordinate(
-    const distributed::MeshShape& global_shape,
-    const distributed::MeshShape& local_shape,
-    const distributed::MeshCoordinate& local_offset,
-    const distributed::MeshCoordinate& coord) {
-  TT_FATAL(
-      coord.dims() == global_shape.dims() && local_shape.dims() == global_shape.dims() &&
-          local_offset.dims() == global_shape.dims(),
-      "Dimension mismatch between global shape {}, local shape {}, local offset {}, and coordinate {}",
-      global_shape,
-      local_shape,
-      local_offset,
-      coord);
-  TT_FATAL(
-      distributed::MeshCoordinateRange(global_shape).contains(coord),
-      "Coordinate {} is outside global shape {}",
-      coord,
-      global_shape);
-  for (size_t dim = 0; dim < coord.dims(); ++dim) {
-    if (local_offset[dim] + local_shape[dim] > global_shape[dim]) {
-      TT_THROW(
-          "Local shape {} at offset {} exceeds global shape {}",
-          local_shape,
-          local_offset,
-          global_shape);
-    }
-    if (coord[dim] < local_offset[dim] || coord[dim] >= local_offset[dim] + local_shape[dim]) {
-      return false;
-    }
-  }
-  return true;
-}
-
-}  // namespace
 
 Tile::Tile(std::array<uint32_t, 2> tile_shape, bool transpose_tile) : tile_shape(tile_shape) {
   static constexpr std::array<std::array<std::array<uint32_t, 2>, 2>, 12> kTileFaceShapes = {{
@@ -178,12 +130,13 @@ DistributedHostBuffer DistributedHostBuffer::create(
     const distributed::MeshShape& local_shape,
     const distributed::MeshCoordinate& local_offset,
     const std::shared_ptr<distributed::multihost::DistributedContext>& context) {
+  DistributedCoordinateTranslator translator(global_shape, local_shape, local_offset);
   std::vector<distributed::MaybeRemote<Shard>> shards(
       global_shape.mesh_size(), distributed::MaybeRemote<Shard>::remote());
 
   size_t shard_index = 0;
   for (const auto& coord : distributed::MeshCoordinateRange(global_shape)) {
-    if (IsLocalCoordinate(global_shape, local_shape, local_offset, coord)) {
+    if (translator.is_local(coord)) {
       shards[shard_index] = distributed::MaybeRemote<Shard>::local(Shard{.is_populated = false});
     }
     ++shard_index;
@@ -341,28 +294,6 @@ const MeshShape& MeshDeviceView::shape() const noexcept {
 }
 
 }  // namespace tt::tt_metal::distributed
-
-namespace tt::tt_metal::experimental::per_core_allocation {
-
-bool is_per_core_allocation(const MemoryConfig& config) { return config.per_core_allocation_; }
-
-void set_per_core_allocation(MemoryConfig& config, bool enable) {
-  if (enable) {
-    TT_FATAL(config.buffer_type_ == BufferType::L1, "per_core_allocation is only supported for L1 buffers");
-    TT_FATAL(config.is_sharded(), "per_core_allocation requires a sharded memory layout");
-    TT_FATAL(!config.created_with_nd_shard_spec_, "per_core_allocation is not supported with NdShardSpec");
-  }
-  config.per_core_allocation_ = enable;
-}
-
-BufferShardingArgs& set_per_core_allocation(BufferShardingArgs& args, bool enable) {
-  args.per_core_allocation_ = enable;
-  return args;
-}
-
-bool is_per_core_allocation(const BufferShardingArgs& args) { return args.per_core_allocation_; }
-
-}  // namespace tt::tt_metal::experimental::per_core_allocation
 
 namespace tt::tt_metal::experimental {
 
