@@ -12,8 +12,6 @@ cc_library(
             "tt_metal/hostdevcommon/api/**/*.hpp",
             "tt_stl/**/*.h",
             "tt_stl/**/*.hpp",
-            "ttnn/api/**/*.h",
-            "ttnn/api/**/*.hpp",
         ],
         allow_empty = True,
     ),
@@ -22,6 +20,5 @@ cc_library(
         "tt_metal/api",
         "tt_metal/hostdevcommon/api",
         "tt_stl",
-        "ttnn/api",
     ],
 )
