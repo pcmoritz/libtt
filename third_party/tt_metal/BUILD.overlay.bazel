@@ -2,9 +2,103 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 
 package(default_visibility = ["//visibility:public"])
 
+genrule(
+    name = "tt_metal_api_flatbuffer_headers",
+    srcs = ["tt_metal/api/tt-metalium/serialized_descriptors/mesh_coordinate.fbs"],
+    outs = ["api/tt-metalium/serialized_descriptors/mesh_coordinate_generated.h"],
+    cmd = "api_fbs=$(location tt_metal/api/tt-metalium/serialized_descriptors/mesh_coordinate.fbs); " +
+          "api_dir=$${api_fbs%/tt-metalium/serialized_descriptors/mesh_coordinate.fbs}; " +
+          "$(location @com_github_google_flatbuffers//:flatc) --keep-prefix --cpp --scoped-enums -I $$api_dir -o $(@D) $$api_fbs",
+    tools = ["@com_github_google_flatbuffers//:flatc"],
+)
+
+genrule(
+    name = "tt_metal_impl_flatbuffer_headers",
+    srcs = [
+        "tt_metal/impl/flatbuffer/base_types.fbs",
+        "tt_metal/impl/flatbuffer/buffer_types.fbs",
+        "tt_metal/impl/flatbuffer/command.fbs",
+        "tt_metal/impl/flatbuffer/light_metal_binary.fbs",
+        "tt_metal/impl/flatbuffer/program_types.fbs",
+    ],
+    outs = [
+        "flatbuffers/base_types_generated.h",
+        "flatbuffers/buffer_types_generated.h",
+        "flatbuffers/command_generated.h",
+        "flatbuffers/light_metal_binary_generated.h",
+        "flatbuffers/program_types_generated.h",
+    ],
+    cmd = "impl_fbs=$(location tt_metal/impl/flatbuffer/base_types.fbs); " +
+          "impl_dir=$${impl_fbs%/base_types.fbs}; " +
+          "mkdir -p $(@D)/flatbuffers; " +
+          "$(location @com_github_google_flatbuffers//:flatc) --keep-prefix --cpp --scoped-enums -I $$impl_dir -o $(@D)/flatbuffers $(SRCS)",
+    tools = ["@com_github_google_flatbuffers//:flatc"],
+)
+
+genrule(
+    name = "tt_metal_distributed_flatbuffer_headers",
+    srcs = [
+        "tt_metal/api/tt-metalium/serialized_descriptors/mesh_coordinate.fbs",
+        "tt_metal/distributed/flatbuffer/h2d_stream_service_descriptor.fbs",
+        "tt_metal/distributed/flatbuffer/hd_socket_descriptor.fbs",
+        "tt_metal/distributed/flatbuffer/socket_peer_descriptor.fbs",
+    ],
+    outs = [
+        "distributed_flatbuffers/h2d_stream_service_descriptor_generated.h",
+        "distributed_flatbuffers/hd_socket_descriptor_generated.h",
+        "distributed_flatbuffers/socket_peer_descriptor_generated.h",
+    ],
+    cmd = "api_fbs=$(location tt_metal/api/tt-metalium/serialized_descriptors/mesh_coordinate.fbs); " +
+          "api_dir=$${api_fbs%/tt-metalium/serialized_descriptors/mesh_coordinate.fbs}; " +
+          "dist_fbs=$(location tt_metal/distributed/flatbuffer/h2d_stream_service_descriptor.fbs); " +
+          "dist_dir=$${dist_fbs%/h2d_stream_service_descriptor.fbs}; " +
+          "mkdir -p $(@D)/distributed_flatbuffers; " +
+          "$(location @com_github_google_flatbuffers//:flatc) --keep-prefix --cpp --scoped-enums -I $$api_dir -I $$dist_dir -o $(@D)/distributed_flatbuffers " +
+          "$(location tt_metal/distributed/flatbuffer/h2d_stream_service_descriptor.fbs) " +
+          "$(location tt_metal/distributed/flatbuffer/hd_socket_descriptor.fbs) " +
+          "$(location tt_metal/distributed/flatbuffer/socket_peer_descriptor.fbs)",
+    tools = ["@com_github_google_flatbuffers//:flatc"],
+)
+
+filegroup(
+    name = "tt_metal_flatbuffer_headers",
+    srcs = [
+        ":tt_metal_api_flatbuffer_headers",
+        ":tt_metal_distributed_flatbuffer_headers",
+        ":tt_metal_impl_flatbuffer_headers",
+    ],
+)
+
+TT_METAL_INCLUDE_DIRS = [
+    ".",
+    "api",
+    "distributed_flatbuffers",
+    "flatbuffers",
+    "tt_metal",
+    "tt_metal/api",
+    "tt_metal/api/tt-metalium",
+    "tt_metal/common",
+    "tt_metal/hostdevcommon/api",
+    "tt_stl",
+]
+
+TT_METAL_HEADER_DEPS = [
+    "@blake3//:blake3",
+    "@com_github_google_flatbuffers//:runtime_cc",
+    "@enchantum//:enchantum",
+    "@fmt//:fmt-header-only",
+    "@nlohmann_json//:nlohmann_json",
+    "@reflect//:reflect_lib",
+    "@simde//:simde",
+    "@taskflow//:taskflow",
+    "@tracy//:tracy",
+    "@tt_logger//:tt-logger",
+    "@tt_umd//:tt-umd",
+]
+
 cc_library(
     name = "tt_metal_overlay",
-    hdrs = glob(
+    hdrs = [":tt_metal_flatbuffer_headers"] + glob(
         [
             "tt_metal/api/**/*.h",
             "tt_metal/api/**/*.hpp",
@@ -15,10 +109,72 @@ cc_library(
         ],
         allow_empty = True,
     ),
-    includes = [
-        ".",
-        "tt_metal/api",
-        "tt_metal/hostdevcommon/api",
-        "tt_stl",
+    includes = TT_METAL_INCLUDE_DIRS,
+    deps = TT_METAL_HEADER_DEPS,
+)
+
+cc_library(
+    name = "tt_metal_common",
+    srcs = [
+        "tt_stl/tt_stl/llvm/llvm_small_vector.cpp",
+        "tt_metal/common/core_assignment.cpp",
+        "tt_metal/common/core_coord.cpp",
+        "tt_metal/common/filesystem_utils.cpp",
+        "tt_metal/common/host_buffer.cpp",
+        "tt_metal/common/memory_pin.cpp",
+        "tt_metal/common/mesh_coord.cpp",
+        "tt_metal/common/shape.cpp",
+        "tt_metal/common/shape2d.cpp",
+        "tt_metal/common/shape_base.cpp",
+        "tt_metal/common/stable_hash.cpp",
+        "tt_metal/common/tt_backend_api_types.cpp",
+        "tt_metal/common/work_split.cpp",
+    ],
+    hdrs = glob([
+        "tt_metal/api/**/*.h",
+        "tt_metal/api/**/*.hpp",
+        "tt_metal/common/**/*.h",
+        "tt_metal/common/**/*.hpp",
+        "tt_metal/distributed/**/*.h",
+        "tt_metal/distributed/**/*.hpp",
+        "tt_metal/hostdevcommon/api/**/*.h",
+        "tt_metal/hostdevcommon/api/**/*.hpp",
+        "tt_stl/**/*.h",
+        "tt_stl/**/*.hpp",
+    ], allow_empty = True) + [":tt_metal_flatbuffer_headers"],
+    copts = ["-std=c++20"],
+    includes = TT_METAL_INCLUDE_DIRS,
+    deps = TT_METAL_HEADER_DEPS,
+)
+
+cc_library(
+    name = "tt_metal_host_tensor_upstream",
+    srcs = [
+        "tt_metal/impl/buffers/buffer_distribution_spec.cpp",
+        "tt_metal/impl/tensor/host_tensor.cpp",
+        "tt_metal/impl/tensor/spec/layout/alignment.cpp",
+        "tt_metal/impl/tensor/spec/layout/layout.cpp",
+        "tt_metal/impl/tensor/spec/layout/page_config.cpp",
+        "tt_metal/impl/tensor/spec/layout/tensor_layout.cpp",
+        "tt_metal/impl/tensor/spec/memory_config/memory_config.cpp",
+        "tt_metal/impl/tensor/spec/tensor_spec.cpp",
+        "tt_metal/impl/tensor/tensor_types.cpp",
+        "tt_metal/impl/tensor/topology/distributed_tensor_configs.cpp",
+        "tt_metal/impl/tensor/topology/tensor_topology.cpp",
+    ],
+    hdrs = glob(
+        [
+            "tt_metal/impl/tensor/**/*.h",
+            "tt_metal/impl/tensor/**/*.hpp",
+        ],
+        allow_empty = True,
+    ),
+    copts = ["-std=c++20"],
+    includes = TT_METAL_INCLUDE_DIRS + [
+        "tt_metal/impl",
+        "tt_metal/impl/tensor",
+    ],
+    deps = [
+        ":tt_metal_common",
     ],
 )

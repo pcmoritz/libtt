@@ -1,0 +1,54 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+config_setting(
+    name = "platform_freebsd",
+    constraint_values = ["@platforms//os:freebsd"],
+)
+
+config_setting(
+    name = "platform_openbsd",
+    constraint_values = ["@platforms//os:openbsd"],
+)
+
+cc_library(
+    name = "runtime_cc",
+    hdrs = glob(["include/flatbuffers/*.h"]),
+    includes = ["include"],
+)
+
+cc_library(
+    name = "flatbuffers",
+    hdrs = [":public_headers"],
+    includes = ["include"],
+    deps = ["//src:flatbuffers"],
+)
+
+cc_binary(
+    name = "flatc",
+    srcs = [
+        "@//third_party/flatbuffers:flatc_cpp_only.cc",
+        "@//third_party/flatbuffers:grpc_stubs.cc",
+        "//src:idl_gen_cpp.cpp",
+        "//src:idl_gen_cpp.h",
+    ],
+    includes = [
+        "include",
+        "src",
+    ],
+    deps = [
+        ":flatbuffers",
+        "//src:flatc_library",
+    ],
+)
+
+filegroup(
+    name = "public_headers",
+    srcs = glob(["include/flatbuffers/*.h"]),
+)
+
+filegroup(
+    name = "flatc_headers",
+    srcs = ["include/flatbuffers/flatc.h"],
+)

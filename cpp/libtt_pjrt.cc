@@ -2,6 +2,11 @@
 
 #include "mlir/executable.pb.h"
 
+#include <tt-metalium/experimental/tensor/host_tensor.hpp>
+#include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
+#include <tt-metalium/experimental/tensor/topology/tensor_topology.hpp>
+#include <tt-metalium/host_buffer.hpp>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -72,7 +77,7 @@ struct PJRT_Buffer {
   std::vector<int64_t> dims;
   PJRT_Device* device;
   PJRT_Memory* memory;
-  std::vector<std::byte> data;
+  std::optional<tt::tt_metal::HostTensor> host_tensor;
   std::vector<int64_t> allocation_dims;
   std::optional<std::vector<int64_t>> source_shape;
   bool deleted;
@@ -482,6 +487,93 @@ PJRT_Error* PaddedHostData(const void* data, size_t byte_size, PJRT_Buffer_Type 
   return nullptr;
 }
 
+std::optional<tt::tt_metal::DataType> MetalDataType(PJRT_Buffer_Type type) {
+  switch (type) {
+    case PJRT_Buffer_Type_PRED:
+    case PJRT_Buffer_Type_U8:
+      return tt::tt_metal::DataType::UINT8;
+    case PJRT_Buffer_Type_U16:
+      return tt::tt_metal::DataType::UINT16;
+    case PJRT_Buffer_Type_S32:
+      return tt::tt_metal::DataType::INT32;
+    case PJRT_Buffer_Type_U32:
+      return tt::tt_metal::DataType::UINT32;
+    case PJRT_Buffer_Type_BF16:
+      return tt::tt_metal::DataType::BFLOAT16;
+    case PJRT_Buffer_Type_F32:
+      return tt::tt_metal::DataType::FLOAT32;
+    default:
+      return std::nullopt;
+  }
+}
+
+PJRT_Error* ShapeFromDims(const std::vector<int64_t>& dims, tt::tt_metal::Shape* out) {
+  tt::tt_metal::Shape::Container values;
+  for (int64_t dim : dims) {
+    if (dim < 0 || dim > std::numeric_limits<uint32_t>::max()) {
+      return InvalidArgument("shape dimensions must fit uint32_t for tt-metal tensors");
+    }
+    values.push_back(static_cast<uint32_t>(dim));
+  }
+  *out = tt::tt_metal::Shape(std::move(values));
+  return nullptr;
+}
+
+PJRT_Error* CreateHostTensor(PJRT_Buffer_Type type, const std::vector<int64_t>& logical_dims,
+                             const std::vector<int64_t>& allocation_dims,
+                             std::vector<std::byte> storage,
+                             std::optional<tt::tt_metal::HostTensor>* out) {
+  const std::optional<tt::tt_metal::DataType> dtype = MetalDataType(type);
+  if (!dtype.has_value()) {
+    return Unimplemented("PJRT buffer type cannot be represented as a tt-metal HostTensor dtype");
+  }
+
+  tt::tt_metal::Shape logical_shape;
+  if (PJRT_Error* error = ShapeFromDims(logical_dims, &logical_shape)) {
+    return error;
+  }
+  tt::tt_metal::Shape padded_shape;
+  if (PJRT_Error* error = ShapeFromDims(allocation_dims, &padded_shape)) {
+    return error;
+  }
+
+  tt::tt_metal::TensorLayout layout = tt::tt_metal::TensorLayout::fromPaddedShape(
+      *dtype,
+      tt::tt_metal::PageConfig(tt::tt_metal::Layout::ROW_MAJOR),
+      tt::tt_metal::MemoryConfig{},
+      logical_shape,
+      padded_shape);
+  tt::tt_metal::TensorSpec spec(logical_shape, std::move(layout));
+  tt::tt_metal::HostBuffer host_buffer(std::move(storage));
+  out->emplace(std::move(host_buffer), std::move(spec), tt::tt_metal::TensorTopology{});
+  return nullptr;
+}
+
+PJRT_Error* HostTensorPhysicalBytes(const PJRT_Buffer& buffer, std::vector<std::byte>* out) {
+  if (!buffer.host_tensor.has_value()) {
+    return FailedPrecondition("buffer has no host tensor storage");
+  }
+  const auto shard = buffer.host_tensor->buffer().get_shard(tt::tt_metal::distributed::MeshCoordinate(0, 0));
+  if (!shard.has_value()) {
+    return Internal("host tensor has no local shard at coordinate (0, 0)");
+  }
+  const auto bytes = shard->view_bytes();
+  out->assign(bytes.begin(), bytes.end());
+  return nullptr;
+}
+
+PJRT_Error* HostTensorPhysicalByteSize(const PJRT_Buffer& buffer, size_t* out) {
+  if (!buffer.host_tensor.has_value()) {
+    return FailedPrecondition("buffer has no host tensor storage");
+  }
+  const auto shard = buffer.host_tensor->buffer().get_shard(tt::tt_metal::distributed::MeshCoordinate(0, 0));
+  if (!shard.has_value()) {
+    return Internal("host tensor has no local shard at coordinate (0, 0)");
+  }
+  *out = shard->view_bytes().size();
+  return nullptr;
+}
+
 PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::byte>* out) {
   if (buffer.deleted) {
     return FailedPrecondition("buffer has been deleted");
@@ -499,17 +591,21 @@ PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::b
   if (buffer.source_shape.has_value() && read_size != logical_size) {
     return Internal("reshape view source byte size does not match logical byte size");
   }
-  if (buffer.data.size() == read_size) {
-    *out = buffer.data;
+  std::vector<std::byte> physical_data;
+  if (PJRT_Error* error = HostTensorPhysicalBytes(buffer, &physical_data)) {
+    return error;
+  }
+  if (physical_data.size() == read_size) {
+    *out = std::move(physical_data);
     return nullptr;
   }
-  if (read_shape.size() < 2 && buffer.data.size() >= read_size) {
-    out->assign(buffer.data.begin(), buffer.data.begin() + static_cast<ptrdiff_t>(read_size));
+  if (read_shape.size() < 2 && physical_data.size() >= read_size) {
+    out->assign(physical_data.begin(), physical_data.begin() + static_cast<ptrdiff_t>(read_size));
     return nullptr;
   }
-  if (read_shape.size() == buffer.allocation_dims.size() && buffer.data.size() > read_size) {
+  if (read_shape.size() == buffer.allocation_dims.size() && physical_data.size() > read_size) {
     out->assign(logical_size, std::byte{0});
-    return CopyBetweenHostShapes(buffer.data, out, buffer.buffer_type, buffer.allocation_dims,
+    return CopyBetweenHostShapes(physical_data, out, buffer.buffer_type, buffer.allocation_dims,
                                  read_shape, read_shape);
   }
   return Internal("readback byte size does not match buffer byte size");
@@ -1292,12 +1388,17 @@ extern "C" PJRT_Error* TT_Client_BufferFromHostBuffer(
           PaddedHostData(args->data, byte_size, args->type, dims, allocation_dims, &storage)) {
     return error;
   }
+  std::optional<tt::tt_metal::HostTensor> host_tensor;
+  if (PJRT_Error* error =
+          CreateHostTensor(args->type, dims, allocation_dims, std::move(storage), &host_tensor)) {
+    return error;
+  }
   auto* buffer = new PJRT_Buffer{
       args->type,
       std::move(dims),
       target_device,
       target_memory,
-      std::move(storage),
+      std::move(host_tensor),
       std::move(allocation_dims),
       std::nullopt,
       false,
@@ -1550,7 +1651,11 @@ extern "C" PJRT_Error* TT_Buffer_OnDeviceSizeInBytes(
   if (args->buffer->deleted) {
     return FailedPrecondition("buffer has been deleted");
   }
-  args->on_device_size_in_bytes = args->buffer->data.size();
+  size_t size = 0;
+  if (PJRT_Error* error = HostTensorPhysicalByteSize(*args->buffer, &size)) {
+    return error;
+  }
+  args->on_device_size_in_bytes = size;
   return nullptr;
 }
 
@@ -1575,7 +1680,7 @@ extern "C" PJRT_Error* TT_Buffer_Delete(PJRT_Buffer_Delete_Args* args) {
     return InvalidArgument("buffer must not be null");
   }
   args->buffer->deleted = true;
-  args->buffer->data.clear();
+  args->buffer->host_tensor.reset();
   return nullptr;
 }
 
@@ -1629,10 +1734,6 @@ extern "C" PJRT_Error* TT_Buffer_CopyRawToHost(PJRT_Buffer_CopyRawToHost_Args* a
   }
   const size_t offset = static_cast<size_t>(args->offset);
   const size_t transfer_size = static_cast<size_t>(args->transfer_size);
-  if (offset > args->buffer->data.size() ||
-      transfer_size > args->buffer->data.size() - offset) {
-    return InvalidArgument("raw host copy range is out of bounds");
-  }
   if (transfer_size > 0 && args->dst == nullptr) {
     return InvalidArgument("dst must not be null for non-empty copies");
   }

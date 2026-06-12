@@ -1,0 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "tt-umd",
+    hdrs = glob([
+        "device/api/**/*.h",
+        "device/api/**/*.hpp",
+    ]),
+    includes = ["device/api"],
+)
+
+alias(
+    name = "firmware",
+    actual = ":tt-umd",
+)

@@ -58,7 +58,19 @@ cc_library(
     deps = [
         ":executable_cc_proto",
         ":mlir_frontend",
+        ":tt_metal_host_tensor",
         "@com_google_protobuf//:protobuf_lite",
+    ],
+)
+
+cc_library(
+    name = "tt_metal_host_tensor",
+    srcs = [
+        "cpp/tt_metal_host_runtime.cc",
+    ],
+    copts = ["-std=c++20"],
+    deps = [
+        "@tt_metal//:tt_metal_host_tensor_upstream",
     ],
 )
 
@@ -79,6 +91,13 @@ cc_test(
     srcs = ["cpp/libtt_pjrt_test.cc"],
     copts = ["-std=c++20"],
     deps = [":tt_pjrt"],
+)
+
+cc_test(
+    name = "tt_metal_host_tensor_test",
+    srcs = ["cpp/tt_metal_host_tensor_test.cc"],
+    copts = ["-std=c++20"],
+    deps = [":tt_metal_host_tensor"],
 )
 
 alias(

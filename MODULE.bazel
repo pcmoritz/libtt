@@ -10,6 +10,127 @@ bazel_dep(name = "rules_shell", version = "0.6.1")
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 http_archive(
+    name = "blake3",
+    build_file = "//third_party/blake3:BUILD.overlay.bazel",
+    sha256 = "b5ee5f5c5e025eb2733ae3af8d4c0e53bb66dff35095decfd377f1083e8ac9be",
+    strip_prefix = "BLAKE3-1.8.4",
+    urls = [
+        "https://github.com/BLAKE3-team/BLAKE3/archive/refs/tags/1.8.4.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "enchantum",
+    build_file = "//third_party/enchantum:BUILD.overlay.bazel",
+    sha256 = "3b3e218706a786493af3949572428562cdbadd92a8a3bb8e1d4fc20fa39460c4",
+    strip_prefix = "enchantum-8ca5b0eb7e7ebe0252e5bc6915083f1dd1b8294e",
+    urls = [
+        "https://github.com/ZXShady/enchantum/archive/8ca5b0eb7e7ebe0252e5bc6915083f1dd1b8294e.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "fmt",
+    build_file = "//third_party/fmt:BUILD.overlay.bazel",
+    sha256 = "ac366b7b4c2e9f0dde63a59b3feb5ee59b67974b14ee5dc9ea8ad78aa2c1ee1e",
+    strip_prefix = "fmt-11.1.4",
+    urls = [
+        "https://github.com/fmtlib/fmt/archive/refs/tags/11.1.4.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "nlohmann_json",
+    build_file = "//third_party/nlohmann_json:BUILD.overlay.bazel",
+    sha256 = "0d8ef5af7f9794e3263480193c491549b2ba6cc74bb018906202ada498a79406",
+    strip_prefix = "json-3.11.3",
+    urls = [
+        "https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "reflect",
+    build_file = "//third_party/reflect:BUILD.overlay.bazel",
+    sha256 = "2991391d326886a20522ee376c04dceb4ad200ffba909bbce9a4cbe655b61ab8",
+    strip_prefix = "reflect-1.2.6",
+    urls = [
+        "https://github.com/boost-ext/reflect/archive/refs/tags/v1.2.6.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "simde",
+    build_file = "//third_party/simde:BUILD.overlay.bazel",
+    sha256 = "ed2a3268658f2f2a9b5367628a85ccd4cf9516460ed8604eed369653d49b25fb",
+    strip_prefix = "simde-0.8.2",
+    urls = [
+        "https://github.com/simd-everywhere/simde/archive/refs/tags/v0.8.2.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "spdlog",
+    build_file = "//third_party/spdlog:BUILD.overlay.bazel",
+    sha256 = "7a80896357f3e8e920e85e92633b14ba0f229c506e6f978578bdc35ba09e9a5d",
+    strip_prefix = "spdlog-1.15.2",
+    urls = [
+        "https://github.com/gabime/spdlog/archive/refs/tags/v1.15.2.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "taskflow",
+    build_file = "//third_party/taskflow:BUILD.overlay.bazel",
+    sha256 = "788b88093fb3788329ebbf7c7ee05d1f8960d974985a301798df01e77e04233b",
+    strip_prefix = "taskflow-3.7.0",
+    urls = [
+        "https://github.com/taskflow/taskflow/archive/refs/tags/v3.7.0.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "tracy",
+    build_file = "//third_party/tracy:BUILD.overlay.bazel",
+    sha256 = "38b5528479e0cfff7acd5d91fa276b93ab350e92c17a6df4767583f28aadc073",
+    strip_prefix = "tracy-4963ee0ec2b732337b84011d72aedd70e5b660e4",
+    urls = [
+        "https://github.com/tenstorrent-metal/tracy/archive/4963ee0ec2b732337b84011d72aedd70e5b660e4.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "tt_logger",
+    build_file = "//third_party/tt_logger:BUILD.overlay.bazel",
+    sha256 = "9f19f5ade2f9c28397fb58548c14020dd5de394b51b25e468e7af509758f6bff",
+    strip_prefix = "tt-logger-1.1.8",
+    urls = [
+        "https://github.com/tenstorrent/tt-logger/archive/refs/tags/v1.1.8.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "tt_umd",
+    build_file = "//third_party/tt_umd:BUILD.overlay.bazel",
+    sha256 = "70f467bfa43d0af63009b87073a3738942261c4ac267c3fe88780c156316a9fa",
+    strip_prefix = "tt-umd-b4a59998020868bb94ba09daeed7e99452476c8f",
+    urls = [
+        "https://github.com/tenstorrent/tt-umd/archive/b4a59998020868bb94ba09daeed7e99452476c8f.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "com_github_google_flatbuffers",
+    build_file = "//third_party/flatbuffers:BUILD.overlay.bazel",
+    patches = ["//third_party/flatbuffers:src_exports.patch"],
+    sha256 = "4157c5cacdb59737c5d627e47ac26b140e9ee28b1102f812b36068aab728c1ed",
+    strip_prefix = "flatbuffers-24.3.25",
+    urls = [
+        "https://github.com/google/flatbuffers/archive/refs/tags/v24.3.25.tar.gz",
+    ],
+)
+
+http_archive(
     name = "tt_metal",
     build_file = "//third_party/tt_metal:BUILD.overlay.bazel",
     sha256 = "b4d05d0e498e626a0d5455f5c6a379aa1b7ac4f1ca76f8f72dad4f7370223bf7",
