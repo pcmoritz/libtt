@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -574,6 +575,52 @@ PJRT_Error* HostTensorPhysicalByteSize(const PJRT_Buffer& buffer, size_t* out) {
   return nullptr;
 }
 
+PJRT_Error* CreatePjrtBufferFromHostBytes(PJRT_Buffer_Type type,
+                                          const std::vector<int64_t>& dims,
+                                          PJRT_Device* target_device,
+                                          PJRT_Memory* target_memory,
+                                          const void* data,
+                                          size_t byte_size,
+                                          PJRT_Buffer** out) {
+  if (out == nullptr) {
+    return InvalidArgument("out must not be null");
+  }
+  *out = nullptr;
+  if (target_device == nullptr) {
+    return InvalidArgument("no target device available");
+  }
+  if (byte_size > 0 && data == nullptr) {
+    return InvalidArgument("data must not be null");
+  }
+
+  std::vector<int64_t> allocation_dims;
+  if (PJRT_Error* error = TiledAllocationDims(dims, &allocation_dims)) {
+    return error;
+  }
+  std::vector<std::byte> storage;
+  if (PJRT_Error* error = PaddedHostData(data, byte_size, type, dims, allocation_dims, &storage)) {
+    return error;
+  }
+  std::optional<tt::tt_metal::HostTensor> host_tensor;
+  if (PJRT_Error* error = CreateHostTensor(type, dims, allocation_dims, std::move(storage),
+                                           &host_tensor)) {
+    return error;
+  }
+
+  *out = new PJRT_Buffer{
+      type,
+      dims,
+      target_device,
+      target_memory != nullptr ? target_memory : target_device->default_memory,
+      std::move(host_tensor),
+      std::move(allocation_dims),
+      std::nullopt,
+      false,
+      0,
+  };
+  return nullptr;
+}
+
 PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::byte>* out) {
   if (buffer.deleted) {
     return FailedPrecondition("buffer has been deleted");
@@ -634,6 +681,38 @@ PJRT_Buffer_Type PjrtBufferTypeFromProto(tt::TensorDesc::ElementType type) {
     default:
       return PJRT_Buffer_Type_INVALID;
   }
+}
+
+PJRT_Error* TensorDescDims(const tt::TensorDesc& tensor, std::vector<int64_t>* out) {
+  out->clear();
+  out->reserve(static_cast<size_t>(tensor.dims_size()));
+  for (int64_t dim : tensor.dims()) {
+    if (dim < 0) {
+      return InvalidArgument("executable tensor shape dimensions must be >= 0");
+    }
+    out->push_back(dim);
+  }
+  return nullptr;
+}
+
+PJRT_Error* TensorDescBufferType(const tt::TensorDesc& tensor, PJRT_Buffer_Type* out) {
+  *out = PjrtBufferTypeFromProto(tensor.element_type());
+  if (*out == PJRT_Buffer_Type_INVALID) {
+    return Unimplemented("executable tensor has unsupported element type");
+  }
+  return nullptr;
+}
+
+bool TensorDescsMatch(const tt::TensorDesc& lhs, const tt::TensorDesc& rhs) {
+  if (lhs.element_type() != rhs.element_type() || lhs.dims_size() != rhs.dims_size()) {
+    return false;
+  }
+  for (int i = 0; i < lhs.dims_size(); ++i) {
+    if (lhs.dims(i) != rhs.dims(i)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 std::string FingerprintString(const std::vector<PJRT_Buffer_Type>& output_types,
@@ -758,32 +837,58 @@ std::vector<int> DiscoverDeviceIds() {
   return ids;
 }
 
+bool HostFallbackEnabled() {
+  const char* value = std::getenv("LIBTT_PJRT_HOST_FALLBACK");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
 PJRT_Client* CreateClient() {
   auto* client = new PJRT_Client;
   client->platform_name = kPlatformName;
   client->platform_version = kPlatformVersion;
 
-  const std::vector<int> discovered_ids = DiscoverDeviceIds();
+  std::vector<int> discovered_ids = DiscoverDeviceIds();
+  const bool host_fallback = discovered_ids.empty() && HostFallbackEnabled();
+  if (host_fallback) {
+    discovered_ids.push_back(0);
+  }
   client->device_descriptions_storage.reserve(discovered_ids.size());
   client->memories_storage.reserve(discovered_ids.size());
   client->devices_storage.reserve(discovered_ids.size());
 
   for (int device_id : discovered_ids) {
     const std::string suffix = std::to_string(device_id);
-    client->device_descriptions_storage.push_back(PJRT_DeviceDescription{
-        device_id,
-        0,
-        "Tenstorrent",
-        "Tenstorrent device /dev/tenstorrent/" + suffix,
-        "TTDevice(id=" + suffix + ")",
-    });
-    client->memories_storage.push_back(PJRT_Memory{
-        device_id,
-        "device",
-        "Tenstorrent device memory " + suffix,
-        "TTMemory(id=" + suffix + ")",
-        {},
-    });
+    if (host_fallback) {
+      client->device_descriptions_storage.push_back(PJRT_DeviceDescription{
+          device_id,
+          0,
+          "Tenstorrent host fallback",
+          "Tenstorrent host fallback device " + suffix,
+          "TTHostFallbackDevice(id=" + suffix + ")",
+      });
+      client->memories_storage.push_back(PJRT_Memory{
+          device_id,
+          "device",
+          "Tenstorrent host fallback memory " + suffix,
+          "TTHostFallbackMemory(id=" + suffix + ")",
+          {},
+      });
+    } else {
+      client->device_descriptions_storage.push_back(PJRT_DeviceDescription{
+          device_id,
+          0,
+          "Tenstorrent",
+          "Tenstorrent device /dev/tenstorrent/" + suffix,
+          "TTDevice(id=" + suffix + ")",
+      });
+      client->memories_storage.push_back(PJRT_Memory{
+          device_id,
+          "device",
+          "Tenstorrent device memory " + suffix,
+          "TTMemory(id=" + suffix + ")",
+          {},
+      });
+    }
   }
 
   for (size_t i = 0; i < discovered_ids.size(); ++i) {
@@ -826,6 +931,187 @@ PJRT_Device* SelectTargetDevice(PJRT_Client* client, PJRT_Device* device, PJRT_M
   }
   if (client != nullptr && !client->addressable_device_ptrs.empty()) {
     return client->addressable_device_ptrs.front();
+  }
+  return nullptr;
+}
+
+PJRT_Device* ExecuteTargetDevice(const PJRT_LoadedExecutable* executable,
+                                 PJRT_LoadedExecutable_Execute_Args* args) {
+  if (args->execute_device != nullptr) {
+    return args->execute_device;
+  }
+  if (!executable->addressable_devices.empty()) {
+    return executable->addressable_devices.front();
+  }
+  if (args->argument_lists != nullptr && args->num_devices > 0 && args->num_args > 0 &&
+      args->argument_lists[0] != nullptr && args->argument_lists[0][0] != nullptr) {
+    return args->argument_lists[0][0]->device;
+  }
+  return nullptr;
+}
+
+std::string OpKindName(tt::Op::KindCase kind) {
+  switch (kind) {
+    case tt::Op::kParameter:
+      return "parameter";
+    case tt::Op::kMatmul:
+      return "matmul";
+    case tt::Op::kConstant:
+      return "constant";
+    case tt::Op::kSelect:
+      return "select";
+    case tt::Op::kBroadcastInDim:
+      return "broadcast_in_dim";
+    case tt::Op::kGather:
+      return "gather";
+    case tt::Op::kIota:
+      return "iota";
+    case tt::Op::kConcatenate:
+      return "concatenate";
+    case tt::Op::kReduce:
+      return "reduce";
+    case tt::Op::kReshape:
+      return "reshape";
+    case tt::Op::kSlice:
+      return "slice";
+    case tt::Op::kTranspose:
+      return "transpose";
+    case tt::Op::kCustomCall:
+      return "custom_call";
+    case tt::Op::kTopK:
+      return "top_k";
+    case tt::Op::kFusedElementwise:
+      return "fused_elementwise";
+    case tt::Op::kScatter:
+      return "scatter";
+    case tt::Op::kBitwiseBinary:
+      return "bitwise_binary";
+    case tt::Op::kReduceWindow:
+      return "reduce_window";
+    case tt::Op::kSdpaDecode:
+      return "sdpa_decode";
+    case tt::Op::kRmsNorm:
+      return "rms_norm";
+    case tt::Op::kRope:
+      return "rope";
+    case tt::Op::KIND_NOT_SET:
+      return "not_set";
+  }
+  return "unknown(" + std::to_string(static_cast<int>(kind)) + ")";
+}
+
+PJRT_Error* ExecuteParameterOnlyProgram(const PJRT_LoadedExecutable* executable,
+                                        PJRT_Buffer* const* arguments,
+                                        size_t num_args,
+                                        PJRT_Device* target_device,
+                                        PJRT_Buffer** outputs) {
+  tt::Executable program;
+  if (executable->metadata.executable_proto.empty() ||
+      !program.ParseFromString(executable->metadata.executable_proto)) {
+    return Internal("failed to parse executable payload");
+  }
+  if (program.output_ids_size() != static_cast<int>(executable->metadata.num_outputs)) {
+    return Internal("executable output metadata does not match executable payload");
+  }
+
+  std::vector<PJRT_Buffer*> values(static_cast<size_t>(program.values_size()), nullptr);
+  for (const tt::Op& op : program.ops()) {
+    if (op.output_id() >= static_cast<uint32_t>(values.size())) {
+      return Internal("executable op output id is out of bounds");
+    }
+    switch (op.kind_case()) {
+      case tt::Op::kParameter: {
+        const size_t parameter_index = static_cast<size_t>(op.parameter().parameter_index());
+        if (parameter_index >= num_args) {
+          return InvalidArgument("executable parameter index exceeds supplied arguments");
+        }
+        if (arguments == nullptr || arguments[parameter_index] == nullptr) {
+          return InvalidArgument("argument buffer must not be null");
+        }
+        PJRT_Buffer* argument = arguments[parameter_index];
+        if (argument->deleted) {
+          return FailedPrecondition("argument buffer has been deleted");
+        }
+        if (target_device != nullptr && argument->device != nullptr && argument->device != target_device) {
+          return InvalidArgument("all input buffers and execute_device must be on the same device");
+        }
+        values[op.output_id()] = argument;
+        break;
+      }
+      case tt::Op::KIND_NOT_SET:
+        return Internal("executable op is missing kind");
+      case tt::Op::kCustomCall: {
+        const tt::CustomCallOp& custom_call = op.custom_call();
+        const bool is_jax_result_sharding =
+            custom_call.call_target_name() == "xla.sdy.FuncResultSharding";
+        if ((custom_call.has_side_effect() && !is_jax_result_sharding) ||
+            custom_call.input_ids_size() != 1) {
+          return Unimplemented("C++ host execution does not support custom_call: " +
+                               custom_call.call_target_name() + " inputs=" +
+                               std::to_string(custom_call.input_ids_size()) + " side_effect=" +
+                               (custom_call.has_side_effect() ? "true" : "false"));
+        }
+        const uint32_t input_id = custom_call.input_ids(0);
+        if (input_id >= static_cast<uint32_t>(values.size()) || values[input_id] == nullptr) {
+          return Internal("custom_call input value was not produced");
+        }
+        if (input_id >= static_cast<uint32_t>(program.values_size())) {
+          return Internal("custom_call input metadata id is out of bounds");
+        }
+        const tt::ValueDesc& input_desc = program.values(input_id);
+        const tt::ValueDesc& output_desc = program.values(op.output_id());
+        if (!input_desc.has_tensor() || !output_desc.has_tensor() ||
+            !TensorDescsMatch(input_desc.tensor(), output_desc.tensor())) {
+          return Unimplemented("C++ host execution only supports identity custom_call ops");
+        }
+        values[op.output_id()] = values[input_id];
+        break;
+      }
+      default:
+        return Unimplemented("C++ host execution does not support op kind: " +
+                             OpKindName(op.kind_case()));
+    }
+  }
+
+  for (int i = 0; i < program.output_ids_size(); ++i) {
+    const uint32_t output_id = program.output_ids(i);
+    if (output_id >= static_cast<uint32_t>(values.size()) || values[output_id] == nullptr) {
+      return Internal("executable output value was not produced");
+    }
+    const tt::ValueDesc& value_desc = program.values(output_id);
+    if (!value_desc.has_tensor()) {
+      return Internal("executable output value is missing tensor metadata");
+    }
+    PJRT_Buffer_Type output_type = PJRT_Buffer_Type_INVALID;
+    if (PJRT_Error* error = TensorDescBufferType(value_desc.tensor(), &output_type)) {
+      return error;
+    }
+    std::vector<int64_t> output_dims;
+    if (PJRT_Error* error = TensorDescDims(value_desc.tensor(), &output_dims)) {
+      return error;
+    }
+
+    size_t output_size = 0;
+    if (PJRT_Error* error = HostByteSize(output_type, output_dims, &output_size)) {
+      return error;
+    }
+    std::vector<std::byte> logical_data;
+    if (PJRT_Error* error = ReadBufferLogicalBytes(*values[output_id], &logical_data)) {
+      return error;
+    }
+    if (logical_data.size() != output_size) {
+      return Internal("identity output byte size does not match executable metadata");
+    }
+    const void* data = logical_data.empty() ? nullptr : logical_data.data();
+    PJRT_Device* output_device = target_device != nullptr ? target_device : values[output_id]->device;
+    PJRT_Memory* output_memory =
+        values[output_id]->memory != nullptr ? values[output_id]->memory
+                                             : (output_device == nullptr ? nullptr : output_device->default_memory);
+    if (PJRT_Error* error = CreatePjrtBufferFromHostBytes(output_type, output_dims, output_device,
+                                                          output_memory, data, logical_data.size(),
+                                                          &outputs[i])) {
+      return error;
+    }
   }
   return nullptr;
 }
@@ -1339,10 +1625,36 @@ extern "C" PJRT_Error* TT_LoadedExecutable_Execute(
   if (args->num_devices != 1) {
     return Unimplemented("only single-device execution is supported");
   }
+  if (args->argument_lists == nullptr && args->num_args > 0) {
+    return InvalidArgument("argument_lists must not be null when num_args > 0");
+  }
+  if (args->argument_lists != nullptr && args->argument_lists[0] == nullptr && args->num_args > 0) {
+    return InvalidArgument("argument_lists[0] must not be null when num_args > 0");
+  }
   if (args->output_lists == nullptr) {
     return InvalidArgument("output_lists must not be null");
   }
-  return Unimplemented("C++ tt-metal op execution is not wired in yet");
+  PJRT_Buffer** device_outputs = args->output_lists[0];
+  if (device_outputs == nullptr) {
+    return InvalidArgument("output_lists[0] must not be null");
+  }
+  PJRT_Device* target_device = ExecuteTargetDevice(args->executable, args);
+  if (target_device == nullptr) {
+    return InvalidArgument("no execute device available");
+  }
+  PJRT_Buffer* const* arguments = args->num_args == 0 ? nullptr : args->argument_lists[0];
+  if (PJRT_Error* error = ExecuteParameterOnlyProgram(args->executable, arguments, args->num_args,
+                                                      target_device, device_outputs)) {
+    for (size_t i = 0; i < args->executable->metadata.num_outputs; ++i) {
+      delete device_outputs[i];
+      device_outputs[i] = nullptr;
+    }
+    return error;
+  }
+  if (args->device_complete_events != nullptr) {
+    args->device_complete_events[0] = ReadyEvent();
+  }
+  return nullptr;
 }
 
 extern "C" PJRT_Error* TT_Client_BufferFromHostBuffer(
@@ -1379,31 +1691,12 @@ extern "C" PJRT_Error* TT_Client_BufferFromHostBuffer(
     return InvalidArgument("no target device available");
   }
   PJRT_Memory* target_memory = args->memory != nullptr ? args->memory : target_device->default_memory;
-  std::vector<int64_t> allocation_dims;
-  if (PJRT_Error* error = TiledAllocationDims(dims, &allocation_dims)) {
+  PJRT_Buffer* buffer = nullptr;
+  if (PJRT_Error* error = CreatePjrtBufferFromHostBytes(args->type, dims, target_device,
+                                                        target_memory, args->data, byte_size,
+                                                        &buffer)) {
     return error;
   }
-  std::vector<std::byte> storage;
-  if (PJRT_Error* error =
-          PaddedHostData(args->data, byte_size, args->type, dims, allocation_dims, &storage)) {
-    return error;
-  }
-  std::optional<tt::tt_metal::HostTensor> host_tensor;
-  if (PJRT_Error* error =
-          CreateHostTensor(args->type, dims, allocation_dims, std::move(storage), &host_tensor)) {
-    return error;
-  }
-  auto* buffer = new PJRT_Buffer{
-      args->type,
-      std::move(dims),
-      target_device,
-      target_memory,
-      std::move(host_tensor),
-      std::move(allocation_dims),
-      std::nullopt,
-      false,
-      0,
-  };
   args->done_with_host_buffer = ReadyEvent();
   args->buffer = buffer;
   return nullptr;
@@ -1695,9 +1988,6 @@ extern "C" PJRT_Error* TT_Buffer_IsDeleted(PJRT_Buffer_IsDeleted_Args* args) {
 extern "C" PJRT_Error* TT_Buffer_ToHostBuffer(PJRT_Buffer_ToHostBuffer_Args* args) {
   if (args == nullptr || args->src == nullptr) {
     return InvalidArgument("src must not be null");
-  }
-  if (args->host_layout != nullptr) {
-    return Unimplemented("custom host layouts are not supported");
   }
   if (args->src->deleted) {
     return FailedPrecondition("buffer has been deleted");
