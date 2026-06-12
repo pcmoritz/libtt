@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -837,58 +836,32 @@ std::vector<int> DiscoverDeviceIds() {
   return ids;
 }
 
-bool HostFallbackEnabled() {
-  const char* value = std::getenv("LIBTT_PJRT_HOST_FALLBACK");
-  return value != nullptr && std::string_view(value) == "1";
-}
-
 PJRT_Client* CreateClient() {
   auto* client = new PJRT_Client;
   client->platform_name = kPlatformName;
   client->platform_version = kPlatformVersion;
 
   std::vector<int> discovered_ids = DiscoverDeviceIds();
-  const bool host_fallback = discovered_ids.empty() && HostFallbackEnabled();
-  if (host_fallback) {
-    discovered_ids.push_back(0);
-  }
   client->device_descriptions_storage.reserve(discovered_ids.size());
   client->memories_storage.reserve(discovered_ids.size());
   client->devices_storage.reserve(discovered_ids.size());
 
   for (int device_id : discovered_ids) {
     const std::string suffix = std::to_string(device_id);
-    if (host_fallback) {
-      client->device_descriptions_storage.push_back(PJRT_DeviceDescription{
-          device_id,
-          0,
-          "Tenstorrent host fallback",
-          "Tenstorrent host fallback device " + suffix,
-          "TTHostFallbackDevice(id=" + suffix + ")",
-      });
-      client->memories_storage.push_back(PJRT_Memory{
-          device_id,
-          "device",
-          "Tenstorrent host fallback memory " + suffix,
-          "TTHostFallbackMemory(id=" + suffix + ")",
-          {},
-      });
-    } else {
-      client->device_descriptions_storage.push_back(PJRT_DeviceDescription{
-          device_id,
-          0,
-          "Tenstorrent",
-          "Tenstorrent device /dev/tenstorrent/" + suffix,
-          "TTDevice(id=" + suffix + ")",
-      });
-      client->memories_storage.push_back(PJRT_Memory{
-          device_id,
-          "device",
-          "Tenstorrent device memory " + suffix,
-          "TTMemory(id=" + suffix + ")",
-          {},
-      });
-    }
+    client->device_descriptions_storage.push_back(PJRT_DeviceDescription{
+        device_id,
+        0,
+        "Tenstorrent",
+        "Tenstorrent device /dev/tenstorrent/" + suffix,
+        "TTDevice(id=" + suffix + ")",
+    });
+    client->memories_storage.push_back(PJRT_Memory{
+        device_id,
+        "device",
+        "Tenstorrent device memory " + suffix,
+        "TTMemory(id=" + suffix + ")",
+        {},
+    });
   }
 
   for (size_t i = 0; i < discovered_ids.size(); ++i) {
