@@ -77,7 +77,6 @@ cc_library(
 cc_shared_library(
     name = "tt_shared",
     deps = [
-        ":mlir_frontend",
         ":tt_pjrt",
     ],
     shared_lib_name = select({

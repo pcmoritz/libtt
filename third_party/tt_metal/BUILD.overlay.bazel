@@ -97,23 +97,6 @@ TT_METAL_HEADER_DEPS = [
 ]
 
 cc_library(
-    name = "tt_metal_overlay",
-    hdrs = [":tt_metal_flatbuffer_headers"] + glob(
-        [
-            "tt_metal/api/**/*.h",
-            "tt_metal/api/**/*.hpp",
-            "tt_metal/hostdevcommon/api/**/*.h",
-            "tt_metal/hostdevcommon/api/**/*.hpp",
-            "tt_stl/**/*.h",
-            "tt_stl/**/*.hpp",
-        ],
-        allow_empty = True,
-    ),
-    includes = TT_METAL_INCLUDE_DIRS,
-    deps = TT_METAL_HEADER_DEPS,
-)
-
-cc_library(
     name = "tt_metal_common",
     srcs = [
         "tt_stl/tt_stl/llvm/llvm_small_vector.cpp",
