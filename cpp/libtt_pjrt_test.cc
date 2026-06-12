@@ -30,6 +30,72 @@ int main() {
   error = api->PJRT_Client_Devices(&devices_args);
   assert(error == nullptr);
 
+  assert(api->PJRT_Client_Compile != nullptr);
+  assert(api->PJRT_LoadedExecutable_GetExecutable != nullptr);
+  assert(api->PJRT_Executable_OutputElementTypes != nullptr);
+  assert(api->PJRT_Executable_OutputDimensions != nullptr);
+
+  const char kFormat[] = "mlir";
+  const char kProgram[] = R"mlir(
+module {
+  func.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    return %arg0 : tensor<2x2xf32>
+  }
+}
+)mlir";
+
+  PJRT_Program program{};
+  program.struct_size = PJRT_Program_STRUCT_SIZE;
+  program.code = const_cast<char*>(kProgram);
+  program.code_size = std::strlen(kProgram);
+  program.format = kFormat;
+  program.format_size = std::strlen(kFormat);
+
+  PJRT_Client_Compile_Args compile_args{};
+  compile_args.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+  compile_args.client = create_args.client;
+  compile_args.program = &program;
+  error = api->PJRT_Client_Compile(&compile_args);
+  assert(error == nullptr);
+  assert(compile_args.executable != nullptr);
+
+  PJRT_LoadedExecutable_GetExecutable_Args get_exec_args{};
+  get_exec_args.struct_size = PJRT_LoadedExecutable_GetExecutable_Args_STRUCT_SIZE;
+  get_exec_args.loaded_executable = compile_args.executable;
+  error = api->PJRT_LoadedExecutable_GetExecutable(&get_exec_args);
+  assert(error == nullptr);
+  assert(get_exec_args.executable != nullptr);
+
+  PJRT_Executable_OutputElementTypes_Args output_types_args{};
+  output_types_args.struct_size = PJRT_Executable_OutputElementTypes_Args_STRUCT_SIZE;
+  output_types_args.executable = get_exec_args.executable;
+  error = api->PJRT_Executable_OutputElementTypes(&output_types_args);
+  assert(error == nullptr);
+  assert(output_types_args.num_output_types == 1);
+  assert(output_types_args.output_types[0] == PJRT_Buffer_Type_F32);
+
+  PJRT_Executable_OutputDimensions_Args output_dims_args{};
+  output_dims_args.struct_size = PJRT_Executable_OutputDimensions_Args_STRUCT_SIZE;
+  output_dims_args.executable = get_exec_args.executable;
+  error = api->PJRT_Executable_OutputDimensions(&output_dims_args);
+  assert(error == nullptr);
+  assert(output_dims_args.num_outputs == 1);
+  assert(output_dims_args.dim_sizes[0] == 2);
+  assert(output_dims_args.dims[0] == 2);
+  assert(output_dims_args.dims[1] == 2);
+
+  PJRT_Executable_Destroy_Args exec_destroy_args{};
+  exec_destroy_args.struct_size = PJRT_Executable_Destroy_Args_STRUCT_SIZE;
+  exec_destroy_args.executable = get_exec_args.executable;
+  error = api->PJRT_Executable_Destroy(&exec_destroy_args);
+  assert(error == nullptr);
+
+  PJRT_LoadedExecutable_Destroy_Args loaded_destroy_args{};
+  loaded_destroy_args.struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE;
+  loaded_destroy_args.executable = compile_args.executable;
+  error = api->PJRT_LoadedExecutable_Destroy(&loaded_destroy_args);
+  assert(error == nullptr);
+
   PJRT_Client_Destroy_Args destroy_args{};
   destroy_args.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
   destroy_args.client = create_args.client;

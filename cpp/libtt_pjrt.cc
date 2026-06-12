@@ -1,16 +1,28 @@
 #include "cpp/libtt_pjrt.h"
 
+#include "mlir/executable.pb.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+extern "C" {
+using TT_MlirAllocOutput = char* (*)(size_t size, void* user_data);
+
+bool TT_MlirAnalyzeProgram(const char* format, size_t format_size, const char* code,
+                           size_t code_size, TT_MlirAllocOutput alloc_output,
+                           void* user_data);
+}
 
 struct PJRT_Error {
   PJRT_Error_Code code;
@@ -61,8 +73,103 @@ struct PJRT_Buffer {
   PJRT_Device* device;
   PJRT_Memory* memory;
   std::vector<std::byte> data;
+  std::vector<int64_t> allocation_dims;
+  std::optional<std::vector<int64_t>> source_shape;
   bool deleted;
   size_t external_reference_count;
+};
+
+struct ExecutableMetadata {
+  std::string name;
+  std::string fingerprint;
+  size_t num_outputs = 0;
+  std::vector<PJRT_Buffer_Type> output_types;
+  std::vector<int64_t> output_dims;
+  std::vector<size_t> output_dim_sizes;
+  std::vector<std::string> output_memory_kinds;
+  std::vector<const char*> output_memory_kind_ptrs;
+  std::vector<size_t> output_memory_kind_sizes;
+  std::string executable_proto;
+
+  ExecutableMetadata() = default;
+
+  ExecutableMetadata(const ExecutableMetadata& other)
+      : name(other.name),
+        fingerprint(other.fingerprint),
+        num_outputs(other.num_outputs),
+        output_types(other.output_types),
+        output_dims(other.output_dims),
+        output_dim_sizes(other.output_dim_sizes),
+        output_memory_kinds(other.output_memory_kinds),
+        output_memory_kind_sizes(other.output_memory_kind_sizes),
+        executable_proto(other.executable_proto) {
+    RefreshMemoryKindPointers();
+  }
+
+  ExecutableMetadata& operator=(const ExecutableMetadata& other) {
+    if (this == &other) {
+      return *this;
+    }
+    name = other.name;
+    fingerprint = other.fingerprint;
+    num_outputs = other.num_outputs;
+    output_types = other.output_types;
+    output_dims = other.output_dims;
+    output_dim_sizes = other.output_dim_sizes;
+    output_memory_kinds = other.output_memory_kinds;
+    output_memory_kind_sizes = other.output_memory_kind_sizes;
+    executable_proto = other.executable_proto;
+    RefreshMemoryKindPointers();
+    return *this;
+  }
+
+  ExecutableMetadata(ExecutableMetadata&& other) noexcept
+      : name(std::move(other.name)),
+        fingerprint(std::move(other.fingerprint)),
+        num_outputs(other.num_outputs),
+        output_types(std::move(other.output_types)),
+        output_dims(std::move(other.output_dims)),
+        output_dim_sizes(std::move(other.output_dim_sizes)),
+        output_memory_kinds(std::move(other.output_memory_kinds)),
+        output_memory_kind_sizes(std::move(other.output_memory_kind_sizes)),
+        executable_proto(std::move(other.executable_proto)) {
+    RefreshMemoryKindPointers();
+  }
+
+  ExecutableMetadata& operator=(ExecutableMetadata&& other) noexcept {
+    if (this == &other) {
+      return *this;
+    }
+    name = std::move(other.name);
+    fingerprint = std::move(other.fingerprint);
+    num_outputs = other.num_outputs;
+    output_types = std::move(other.output_types);
+    output_dims = std::move(other.output_dims);
+    output_dim_sizes = std::move(other.output_dim_sizes);
+    output_memory_kinds = std::move(other.output_memory_kinds);
+    output_memory_kind_sizes = std::move(other.output_memory_kind_sizes);
+    executable_proto = std::move(other.executable_proto);
+    RefreshMemoryKindPointers();
+    return *this;
+  }
+
+  void RefreshMemoryKindPointers() {
+    output_memory_kind_ptrs.clear();
+    output_memory_kind_ptrs.reserve(output_memory_kinds.size());
+    for (const std::string& kind : output_memory_kinds) {
+      output_memory_kind_ptrs.push_back(kind.data());
+    }
+  }
+};
+
+struct PJRT_Executable {
+  ExecutableMetadata metadata;
+};
+
+struct PJRT_LoadedExecutable {
+  ExecutableMetadata metadata;
+  std::vector<PJRT_Device*> addressable_devices;
+  bool deleted;
 };
 
 struct PJRT_ExecuteContext {};
@@ -85,6 +192,9 @@ namespace {
 constexpr const char* kPlatformName = "tt";
 constexpr const char* kPlatformVersion = "libtt cpp pjrt 0.1.0";
 constexpr const char* kDefaultDeviceRoot = "/dev/tenstorrent";
+constexpr const char* kExecutableName = "tt.executable.v1";
+constexpr int64_t kTileRows = 32;
+constexpr int64_t kTileCols = 32;
 
 PJRT_Error* MakePjrtError(PJRT_Error_Code code, std::string message) {
   return new PJRT_Error{code, std::move(message)};
@@ -104,6 +214,10 @@ PJRT_Error* FailedPrecondition(std::string message) {
 
 PJRT_Error* ResourceExhausted(std::string message) {
   return MakePjrtError(PJRT_Error_Code_RESOURCE_EXHAUSTED, std::move(message));
+}
+
+PJRT_Error* Internal(std::string message) {
+  return MakePjrtError(PJRT_Error_Code_INTERNAL, std::move(message));
 }
 
 PJRT_Error* CloneEventError(const PJRT_Event* event) {
@@ -223,6 +337,301 @@ PJRT_Error* ValidateDenseRowMajorStrides(PJRT_Buffer_Type type, const std::vecto
     }
     expected *= dim;
   }
+  return nullptr;
+}
+
+PJRT_Error* RoundUpToTileDim(int64_t value, int64_t tile_dim, int64_t* out) {
+  if (value < 0) {
+    return InvalidArgument("shape dimensions must be >= 0");
+  }
+  const int64_t normalized = std::max<int64_t>(value, 1);
+  if (normalized > std::numeric_limits<int64_t>::max() - (tile_dim - 1)) {
+    return ResourceExhausted("shape dimension overflow");
+  }
+  *out = ((normalized + tile_dim - 1) / tile_dim) * tile_dim;
+  return nullptr;
+}
+
+PJRT_Error* TiledAllocationDims(const std::vector<int64_t>& logical_dims,
+                                std::vector<int64_t>* allocation_dims) {
+  allocation_dims->clear();
+  if (logical_dims.empty()) {
+    *allocation_dims = {kTileRows, kTileCols};
+    return nullptr;
+  }
+  if (logical_dims.size() == 1) {
+    int64_t cols = 0;
+    if (PJRT_Error* error = RoundUpToTileDim(logical_dims[0], kTileCols, &cols)) {
+      return error;
+    }
+    *allocation_dims = {kTileRows, cols};
+    return nullptr;
+  }
+  *allocation_dims = logical_dims;
+  const size_t rank = allocation_dims->size();
+  if (PJRT_Error* error =
+          RoundUpToTileDim((*allocation_dims)[rank - 2], kTileRows, &(*allocation_dims)[rank - 2])) {
+    return error;
+  }
+  if (PJRT_Error* error =
+          RoundUpToTileDim((*allocation_dims)[rank - 1], kTileCols, &(*allocation_dims)[rank - 1])) {
+    return error;
+  }
+  return nullptr;
+}
+
+PJRT_Error* CopyBetweenHostShapes(const std::vector<std::byte>& source,
+                                  std::vector<std::byte>* target,
+                                  PJRT_Buffer_Type type,
+                                  const std::vector<int64_t>& source_shape,
+                                  const std::vector<int64_t>& target_shape,
+                                  const std::vector<int64_t>& copy_shape) {
+  if (source_shape.size() != target_shape.size() || source_shape.size() != copy_shape.size()) {
+    return InvalidArgument("rank must match when copying between padded host shapes");
+  }
+  if (copy_shape.size() < 2) {
+    return InvalidArgument("padded host shape copy requires rank >= 2");
+  }
+  for (size_t i = 0; i < copy_shape.size(); ++i) {
+    if (copy_shape[i] < 0 || copy_shape[i] > source_shape[i] || copy_shape[i] > target_shape[i]) {
+      return InvalidArgument("copy shape exceeds source or target shape");
+    }
+  }
+
+  size_t source_size = 0;
+  size_t target_size = 0;
+  if (PJRT_Error* error = HostByteSize(type, source_shape, &source_size)) {
+    return error;
+  }
+  if (PJRT_Error* error = HostByteSize(type, target_shape, &target_size)) {
+    return error;
+  }
+  if (source.size() != source_size || target->size() != target_size) {
+    return InvalidArgument("host buffer size does not match row-major shape");
+  }
+
+  const size_t rank = copy_shape.size();
+  const size_t copy_rows = static_cast<size_t>(copy_shape[rank - 2]);
+  const size_t copy_cols = static_cast<size_t>(copy_shape[rank - 1]);
+  const size_t source_rows = static_cast<size_t>(source_shape[rank - 2]);
+  const size_t source_cols = static_cast<size_t>(source_shape[rank - 1]);
+  const size_t target_rows = static_cast<size_t>(target_shape[rank - 2]);
+  const size_t target_cols = static_cast<size_t>(target_shape[rank - 1]);
+  size_t batch = 1;
+  for (size_t i = 0; i + 2 < rank; ++i) {
+    const size_t dim = static_cast<size_t>(copy_shape[i]);
+    if (dim != 0 && batch > std::numeric_limits<size_t>::max() / dim) {
+      return ResourceExhausted("shape dimensions overflow");
+    }
+    batch *= dim;
+  }
+
+  const size_t bytes_per_element = BytesPerElement(type);
+  if (bytes_per_element == 0) {
+    return Unimplemented("unsupported PJRT buffer type");
+  }
+  if (copy_cols > std::numeric_limits<size_t>::max() / bytes_per_element) {
+    return ResourceExhausted("shape dimensions overflow");
+  }
+  const size_t row_bytes = copy_cols * bytes_per_element;
+
+  for (size_t batch_index = 0; batch_index < batch; ++batch_index) {
+    for (size_t row = 0; row < copy_rows; ++row) {
+      const size_t source_element = (batch_index * source_rows + row) * source_cols;
+      const size_t target_element = (batch_index * target_rows + row) * target_cols;
+      const size_t source_start = source_element * bytes_per_element;
+      const size_t target_start = target_element * bytes_per_element;
+      std::memcpy(target->data() + target_start, source.data() + source_start, row_bytes);
+    }
+  }
+  return nullptr;
+}
+
+PJRT_Error* PaddedHostData(const void* data, size_t byte_size, PJRT_Buffer_Type type,
+                           const std::vector<int64_t>& logical_dims,
+                           const std::vector<int64_t>& allocation_dims,
+                           std::vector<std::byte>* out) {
+  out->resize(byte_size);
+  if (byte_size > 0) {
+    std::memcpy(out->data(), data, byte_size);
+  }
+  if (logical_dims == allocation_dims) {
+    return nullptr;
+  }
+
+  size_t allocation_size = 0;
+  if (PJRT_Error* error = HostByteSize(type, allocation_dims, &allocation_size)) {
+    return error;
+  }
+  if (byte_size > allocation_size) {
+    return InvalidArgument("logical buffer is larger than allocation buffer");
+  }
+  std::vector<std::byte> padded(allocation_size);
+  if (logical_dims.size() < 2) {
+    if (byte_size > 0) {
+      std::memcpy(padded.data(), out->data(), byte_size);
+    }
+    *out = std::move(padded);
+    return nullptr;
+  }
+  if (PJRT_Error* error =
+          CopyBetweenHostShapes(*out, &padded, type, logical_dims, allocation_dims, logical_dims)) {
+    return error;
+  }
+  *out = std::move(padded);
+  return nullptr;
+}
+
+PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::byte>* out) {
+  if (buffer.deleted) {
+    return FailedPrecondition("buffer has been deleted");
+  }
+  size_t logical_size = 0;
+  if (PJRT_Error* error = HostByteSize(buffer.buffer_type, buffer.dims, &logical_size)) {
+    return error;
+  }
+  const std::vector<int64_t>& read_shape =
+      buffer.source_shape.has_value() ? *buffer.source_shape : buffer.dims;
+  size_t read_size = 0;
+  if (PJRT_Error* error = HostByteSize(buffer.buffer_type, read_shape, &read_size)) {
+    return error;
+  }
+  if (buffer.source_shape.has_value() && read_size != logical_size) {
+    return Internal("reshape view source byte size does not match logical byte size");
+  }
+  if (buffer.data.size() == read_size) {
+    *out = buffer.data;
+    return nullptr;
+  }
+  if (read_shape.size() < 2 && buffer.data.size() >= read_size) {
+    out->assign(buffer.data.begin(), buffer.data.begin() + static_cast<ptrdiff_t>(read_size));
+    return nullptr;
+  }
+  if (read_shape.size() == buffer.allocation_dims.size() && buffer.data.size() > read_size) {
+    out->assign(logical_size, std::byte{0});
+    return CopyBetweenHostShapes(buffer.data, out, buffer.buffer_type, buffer.allocation_dims,
+                                 read_shape, read_shape);
+  }
+  return Internal("readback byte size does not match buffer byte size");
+}
+
+PJRT_Buffer_Type PjrtBufferTypeFromProto(tt::TensorDesc::ElementType type) {
+  switch (type) {
+    case tt::TensorDesc::ELEMENT_TYPE_BF16:
+      return PJRT_Buffer_Type_BF16;
+    case tt::TensorDesc::ELEMENT_TYPE_F16:
+      return PJRT_Buffer_Type_F16;
+    case tt::TensorDesc::ELEMENT_TYPE_F32:
+      return PJRT_Buffer_Type_F32;
+    case tt::TensorDesc::ELEMENT_TYPE_U32:
+      return PJRT_Buffer_Type_U32;
+    case tt::TensorDesc::ELEMENT_TYPE_U16:
+      return PJRT_Buffer_Type_U16;
+    case tt::TensorDesc::ELEMENT_TYPE_U8:
+      return PJRT_Buffer_Type_U8;
+    case tt::TensorDesc::ELEMENT_TYPE_S32:
+      return PJRT_Buffer_Type_S32;
+    case tt::TensorDesc::ELEMENT_TYPE_S8:
+      return PJRT_Buffer_Type_S8;
+    case tt::TensorDesc::ELEMENT_TYPE_PRED:
+      return PJRT_Buffer_Type_PRED;
+    default:
+      return PJRT_Buffer_Type_INVALID;
+  }
+}
+
+std::string FingerprintString(const std::vector<PJRT_Buffer_Type>& output_types,
+                              const std::vector<int64_t>& output_dims,
+                              const std::vector<size_t>& output_dim_sizes) {
+  std::ostringstream fingerprint;
+  fingerprint << "tt:executable_v1:name=" << kExecutableName << ":outputs=";
+  size_t dim_offset = 0;
+  for (size_t i = 0; i < output_types.size(); ++i) {
+    if (i != 0) {
+      fingerprint << ",";
+    }
+    fingerprint << static_cast<uint32_t>(output_types[i]) << ":";
+    for (size_t d = 0; d < output_dim_sizes[i]; ++d) {
+      if (d != 0) {
+        fingerprint << "x";
+      }
+      fingerprint << output_dims[dim_offset + d];
+    }
+    dim_offset += output_dim_sizes[i];
+  }
+  fingerprint << ":v1";
+  return fingerprint.str();
+}
+
+ExecutableMetadata MakeExecutableMetadata(const tt::AnalysisResult& analysis) {
+  ExecutableMetadata metadata;
+  metadata.name = kExecutableName;
+  metadata.num_outputs = static_cast<size_t>(analysis.outputs_size());
+  metadata.output_memory_kinds.assign(metadata.num_outputs, "device");
+  metadata.output_memory_kind_sizes.assign(metadata.num_outputs, std::string_view("device").size());
+  metadata.output_types.reserve(metadata.num_outputs);
+  metadata.output_dim_sizes.reserve(metadata.num_outputs);
+  for (const tt::TensorDesc& tensor : analysis.outputs()) {
+    metadata.output_types.push_back(PjrtBufferTypeFromProto(tensor.element_type()));
+    metadata.output_dim_sizes.push_back(static_cast<size_t>(tensor.dims_size()));
+    for (int64_t dim : tensor.dims()) {
+      metadata.output_dims.push_back(dim);
+    }
+  }
+  metadata.fingerprint =
+      FingerprintString(metadata.output_types, metadata.output_dims, metadata.output_dim_sizes);
+  if (analysis.has_executable()) {
+    metadata.executable_proto = analysis.executable().SerializeAsString();
+  }
+  metadata.RefreshMemoryKindPointers();
+  return metadata;
+}
+
+char* AllocateMlirAnalysisOutput(size_t size, void* user_data) {
+  auto* output = static_cast<std::vector<char>*>(user_data);
+  output->resize(size);
+  return output->data();
+}
+
+PJRT_Error* AnalyzeProgramToMetadata(const PJRT_Program& program, ExecutableMetadata* metadata) {
+  if (program.format == nullptr && program.format_size != 0) {
+    return InvalidArgument("program.format must not be null when size > 0");
+  }
+  if (program.code == nullptr && program.code_size != 0) {
+    return InvalidArgument("program.code must not be null when size > 0");
+  }
+  const std::string_view format(program.format == nullptr ? "" : program.format, program.format_size);
+  if (format != "mlir" && format != "stablehlo") {
+    return Unimplemented("unsupported program format; supported formats are \"mlir\" and \"stablehlo\"");
+  }
+
+  std::vector<char> serialized_analysis;
+  if (!TT_MlirAnalyzeProgram(program.format, program.format_size, program.code, program.code_size,
+                             AllocateMlirAnalysisOutput, &serialized_analysis)) {
+    return Internal("MLIR analysis failed without serialized diagnostics");
+  }
+
+  tt::AnalysisResult analysis;
+  if (!analysis.ParseFromArray(serialized_analysis.data(),
+                               static_cast<int>(serialized_analysis.size()))) {
+    return Internal("failed to parse MLIR analysis result");
+  }
+  if (analysis.status() != tt::AnalysisResult::STATUS_OK) {
+    std::string message = analysis.error_message();
+    if (message.empty()) {
+      message = "MLIR analysis failed";
+    }
+    switch (analysis.status()) {
+      case tt::AnalysisResult::STATUS_PARSE_ERROR:
+        return InvalidArgument(std::move(message));
+      case tt::AnalysisResult::STATUS_UNSUPPORTED:
+        return Unimplemented(std::move(message));
+      default:
+        return Internal(std::move(message));
+    }
+  }
+
+  *metadata = MakeExecutableMetadata(analysis);
   return nullptr;
 }
 
@@ -563,14 +972,31 @@ extern "C" PJRT_Error* TT_Client_Compile(PJRT_Client_Compile_Args* args) {
   if (args == nullptr || args->client == nullptr) {
     return InvalidArgument("client must not be null");
   }
-  return Unimplemented("C++ StableHLO-to-tt-metal execution is not wired in yet");
+  if (args->program == nullptr) {
+    return InvalidArgument("program must not be null");
+  }
+  ExecutableMetadata metadata;
+  if (PJRT_Error* error = AnalyzeProgramToMetadata(*args->program, &metadata)) {
+    return error;
+  }
+  args->executable = new PJRT_LoadedExecutable{
+      std::move(metadata),
+      args->client->addressable_device_ptrs,
+      false,
+  };
+  return nullptr;
 }
 
 extern "C" PJRT_Error* TT_Compile(PJRT_Compile_Args* args) {
-  if (args == nullptr) {
-    return InvalidArgument("args must not be null");
+  if (args == nullptr || args->program == nullptr) {
+    return InvalidArgument("program must not be null");
   }
-  return Unimplemented("C++ StableHLO-to-tt-metal compilation is not wired in yet");
+  ExecutableMetadata metadata;
+  if (PJRT_Error* error = AnalyzeProgramToMetadata(*args->program, &metadata)) {
+    return error;
+  }
+  args->executable = new PJRT_Executable{std::move(metadata)};
+  return nullptr;
 }
 
 extern "C" PJRT_Error* TT_Client_DefaultDeviceAssignment(
@@ -600,6 +1026,227 @@ extern "C" PJRT_Error* TT_Client_DefaultDeviceAssignment(
     args->default_assignment[i] = static_cast<int>(i);
   }
   return nullptr;
+}
+
+extern "C" PJRT_Error* TT_Executable_Destroy(PJRT_Executable_Destroy_Args* args) {
+  if (args == nullptr) {
+    return InvalidArgument("args must not be null");
+  }
+  delete args->executable;
+  args->executable = nullptr;
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_Executable_Name(PJRT_Executable_Name_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  SetStringOut(args->executable->metadata.name, &args->executable_name,
+               &args->executable_name_size);
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_Executable_NumReplicas(
+    PJRT_Executable_NumReplicas_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  args->num_replicas = 1;
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_Executable_NumPartitions(
+    PJRT_Executable_NumPartitions_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  args->num_partitions = 1;
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_Executable_OptimizedProgram(
+    PJRT_Executable_OptimizedProgram_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  if (args->program == nullptr) {
+    return InvalidArgument("program must not be null");
+  }
+  return Unimplemented("optimized program serialization is not exposed");
+}
+
+extern "C" PJRT_Error* TT_Executable_Fingerprint(
+    PJRT_Executable_Fingerprint_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  SetStringOut(args->executable->metadata.fingerprint, &args->executable_fingerprint,
+               &args->executable_fingerprint_size);
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_Executable_GetCompiledMemoryStats(
+    PJRT_Executable_GetCompiledMemoryStats_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  args->generated_code_size_in_bytes = 0;
+  args->argument_size_in_bytes = 0;
+  args->output_size_in_bytes = 0;
+  args->alias_size_in_bytes = 0;
+  args->temp_size_in_bytes = 0;
+  args->host_generated_code_size_in_bytes = 0;
+  args->host_argument_size_in_bytes = 0;
+  args->host_output_size_in_bytes = 0;
+  args->host_alias_size_in_bytes = 0;
+  args->host_temp_size_in_bytes = 0;
+  args->peak_memory_in_bytes = 0;
+  args->total_size_in_bytes = 0;
+  args->total_allocation_bytes = 0;
+  args->indefinite_allocations = 0;
+  args->peak_unpadded_heap_bytes = 0;
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_Executable_NumOutputs(PJRT_Executable_NumOutputs_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  args->num_outputs = args->executable->metadata.num_outputs;
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_Executable_OutputElementTypes(
+    PJRT_Executable_OutputElementTypes_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  args->output_types = args->executable->metadata.output_types.empty()
+                           ? nullptr
+                           : args->executable->metadata.output_types.data();
+  args->num_output_types = args->executable->metadata.output_types.size();
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_Executable_OutputDimensions(
+    PJRT_Executable_OutputDimensions_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  args->dims = args->executable->metadata.output_dims.empty()
+                   ? nullptr
+                   : args->executable->metadata.output_dims.data();
+  args->dim_sizes = args->executable->metadata.output_dim_sizes.empty()
+                        ? nullptr
+                        : args->executable->metadata.output_dim_sizes.data();
+  args->num_outputs = args->executable->metadata.output_dim_sizes.size();
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_Executable_OutputMemoryKinds(
+    PJRT_Executable_OutputMemoryKinds_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  args->memory_kinds = args->executable->metadata.output_memory_kind_ptrs.empty()
+                           ? nullptr
+                           : args->executable->metadata.output_memory_kind_ptrs.data();
+  args->memory_kind_sizes = args->executable->metadata.output_memory_kind_sizes.empty()
+                                ? nullptr
+                                : args->executable->metadata.output_memory_kind_sizes.data();
+  args->num_outputs = args->executable->metadata.output_memory_kind_ptrs.size();
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_LoadedExecutable_Destroy(
+    PJRT_LoadedExecutable_Destroy_Args* args) {
+  if (args == nullptr) {
+    return InvalidArgument("args must not be null");
+  }
+  delete args->executable;
+  args->executable = nullptr;
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_LoadedExecutable_GetExecutable(
+    PJRT_LoadedExecutable_GetExecutable_Args* args) {
+  if (args == nullptr || args->loaded_executable == nullptr) {
+    return InvalidArgument("loaded_executable must not be null");
+  }
+  args->executable = new PJRT_Executable{args->loaded_executable->metadata};
+  return nullptr;
+}
+
+extern "C" void TT_NoopSerializedDeviceAssignmentDeleter(
+    PJRT_DeviceAssignmentSerialized* assignment) {}
+
+extern "C" PJRT_Error* TT_LoadedExecutable_GetDeviceAssignment(
+    PJRT_LoadedExecutable_GetDeviceAssignment_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  args->serialized_bytes = nullptr;
+  args->serialized_bytes_size = 0;
+  args->serialized_device_assignment = nullptr;
+  args->serialized_device_assignment_deleter = TT_NoopSerializedDeviceAssignmentDeleter;
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_LoadedExecutable_AddressableDevices(
+    PJRT_LoadedExecutable_AddressableDevices_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  args->addressable_devices = args->executable->addressable_devices.empty()
+                                  ? nullptr
+                                  : args->executable->addressable_devices.data();
+  args->num_addressable_devices = args->executable->addressable_devices.size();
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_LoadedExecutable_Delete(
+    PJRT_LoadedExecutable_Delete_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  args->executable->deleted = true;
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_LoadedExecutable_IsDeleted(
+    PJRT_LoadedExecutable_IsDeleted_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  args->is_deleted = args->executable->deleted;
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_LoadedExecutable_Fingerprint(
+    PJRT_LoadedExecutable_Fingerprint_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  SetStringOut(args->executable->metadata.fingerprint, &args->executable_fingerprint,
+               &args->executable_fingerprint_size);
+  return nullptr;
+}
+
+extern "C" PJRT_Error* TT_LoadedExecutable_Execute(
+    PJRT_LoadedExecutable_Execute_Args* args) {
+  if (args == nullptr || args->executable == nullptr) {
+    return InvalidArgument("executable must not be null");
+  }
+  if (args->executable->deleted) {
+    return FailedPrecondition("executable has been deleted");
+  }
+  if (args->num_devices != 1) {
+    return Unimplemented("only single-device execution is supported");
+  }
+  if (args->output_lists == nullptr) {
+    return InvalidArgument("output_lists must not be null");
+  }
+  return Unimplemented("C++ tt-metal op execution is not wired in yet");
 }
 
 extern "C" PJRT_Error* TT_Client_BufferFromHostBuffer(
@@ -636,18 +1283,26 @@ extern "C" PJRT_Error* TT_Client_BufferFromHostBuffer(
     return InvalidArgument("no target device available");
   }
   PJRT_Memory* target_memory = args->memory != nullptr ? args->memory : target_device->default_memory;
+  std::vector<int64_t> allocation_dims;
+  if (PJRT_Error* error = TiledAllocationDims(dims, &allocation_dims)) {
+    return error;
+  }
+  std::vector<std::byte> storage;
+  if (PJRT_Error* error =
+          PaddedHostData(args->data, byte_size, args->type, dims, allocation_dims, &storage)) {
+    return error;
+  }
   auto* buffer = new PJRT_Buffer{
       args->type,
       std::move(dims),
       target_device,
       target_memory,
-      std::vector<std::byte>(byte_size),
+      std::move(storage),
+      std::move(allocation_dims),
+      std::nullopt,
       false,
       0,
   };
-  if (byte_size > 0) {
-    std::memcpy(buffer->data.data(), args->data, byte_size);
-  }
   args->done_with_host_buffer = ReadyEvent();
   args->buffer = buffer;
   return nullptr;
@@ -942,18 +1597,22 @@ extern "C" PJRT_Error* TT_Buffer_ToHostBuffer(PJRT_Buffer_ToHostBuffer_Args* arg
   if (args->src->deleted) {
     return FailedPrecondition("buffer has been deleted");
   }
+  std::vector<std::byte> logical_data;
+  if (PJRT_Error* error = ReadBufferLogicalBytes(*args->src, &logical_data)) {
+    return error;
+  }
   if (args->dst == nullptr) {
-    args->dst_size = args->src->data.size();
+    args->dst_size = logical_data.size();
     args->event = ReadyEvent();
     return nullptr;
   }
-  if (args->dst_size < args->src->data.size()) {
+  if (args->dst_size < logical_data.size()) {
     return InvalidArgument("dst buffer is too small");
   }
-  if (!args->src->data.empty()) {
-    std::memcpy(args->dst, args->src->data.data(), args->src->data.size());
+  if (!logical_data.empty()) {
+    std::memcpy(args->dst, logical_data.data(), logical_data.size());
   }
-  args->dst_size = args->src->data.size();
+  args->dst_size = logical_data.size();
   args->event = ReadyEvent();
   return nullptr;
 }
@@ -977,8 +1636,15 @@ extern "C" PJRT_Error* TT_Buffer_CopyRawToHost(PJRT_Buffer_CopyRawToHost_Args* a
   if (transfer_size > 0 && args->dst == nullptr) {
     return InvalidArgument("dst must not be null for non-empty copies");
   }
+  std::vector<std::byte> logical_data;
+  if (PJRT_Error* error = ReadBufferLogicalBytes(*args->buffer, &logical_data)) {
+    return error;
+  }
+  if (offset > logical_data.size() || transfer_size > logical_data.size() - offset) {
+    return InvalidArgument("raw host copy range is out of bounds");
+  }
   if (transfer_size > 0) {
-    std::memcpy(args->dst, args->buffer->data.data() + offset, transfer_size);
+    std::memcpy(args->dst, logical_data.data() + offset, transfer_size);
   }
   args->event = ReadyEvent();
   return nullptr;
@@ -1146,6 +1812,27 @@ PJRT_Api MakePjrtApi() {
   api.PJRT_Memory_DebugString = TT_Memory_DebugString;
   api.PJRT_Memory_ToString = TT_Memory_ToString;
   api.PJRT_Memory_AddressableByDevices = TT_Memory_AddressableByDevices;
+
+  api.PJRT_Executable_Destroy = TT_Executable_Destroy;
+  api.PJRT_Executable_Name = TT_Executable_Name;
+  api.PJRT_Executable_NumReplicas = TT_Executable_NumReplicas;
+  api.PJRT_Executable_NumPartitions = TT_Executable_NumPartitions;
+  api.PJRT_Executable_NumOutputs = TT_Executable_NumOutputs;
+  api.PJRT_Executable_OutputMemoryKinds = TT_Executable_OutputMemoryKinds;
+  api.PJRT_Executable_OptimizedProgram = TT_Executable_OptimizedProgram;
+  api.PJRT_Executable_Fingerprint = TT_Executable_Fingerprint;
+  api.PJRT_Executable_GetCompiledMemoryStats = TT_Executable_GetCompiledMemoryStats;
+  api.PJRT_Executable_OutputElementTypes = TT_Executable_OutputElementTypes;
+  api.PJRT_Executable_OutputDimensions = TT_Executable_OutputDimensions;
+
+  api.PJRT_LoadedExecutable_Destroy = TT_LoadedExecutable_Destroy;
+  api.PJRT_LoadedExecutable_GetExecutable = TT_LoadedExecutable_GetExecutable;
+  api.PJRT_LoadedExecutable_GetDeviceAssignment = TT_LoadedExecutable_GetDeviceAssignment;
+  api.PJRT_LoadedExecutable_AddressableDevices = TT_LoadedExecutable_AddressableDevices;
+  api.PJRT_LoadedExecutable_Delete = TT_LoadedExecutable_Delete;
+  api.PJRT_LoadedExecutable_IsDeleted = TT_LoadedExecutable_IsDeleted;
+  api.PJRT_LoadedExecutable_Execute = TT_LoadedExecutable_Execute;
+  api.PJRT_LoadedExecutable_Fingerprint = TT_LoadedExecutable_Fingerprint;
 
   api.PJRT_Buffer_Destroy = TT_Buffer_Destroy;
   api.PJRT_Buffer_ElementType = TT_Buffer_ElementType;
