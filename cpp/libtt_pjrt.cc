@@ -195,11 +195,25 @@ bool TensorDescsMatch(const tt::TensorDesc& lhs, const tt::TensorDesc& rhs) {
   return true;
 }
 
+uint64_t StableHash64(std::string_view value) {
+  constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ull;
+  constexpr uint64_t kFnvPrime = 1099511628211ull;
+  uint64_t hash = kFnvOffsetBasis;
+  for (unsigned char byte : value) {
+    hash ^= byte;
+    hash *= kFnvPrime;
+  }
+  return hash;
+}
+
 std::string FingerprintString(const std::vector<PJRT_Buffer_Type>& output_types,
                               const std::vector<int64_t>& output_dims,
-                              const std::vector<size_t>& output_dim_sizes) {
+                              const std::vector<size_t>& output_dim_sizes,
+                              std::string_view executable_proto,
+                              std::string_view program_format,
+                              std::string_view program_code) {
   std::ostringstream fingerprint;
-  fingerprint << "tt:executable_v1:name=" << kExecutableName << ":outputs=";
+  fingerprint << "tt:executable_v2:outputs=";
   size_t dim_offset = 0;
   for (size_t i = 0; i < output_types.size(); ++i) {
     if (i != 0) {
@@ -214,11 +228,15 @@ std::string FingerprintString(const std::vector<PJRT_Buffer_Type>& output_types,
     }
     dim_offset += output_dim_sizes[i];
   }
-  fingerprint << ":v1";
+  fingerprint << ":format_hash=" << StableHash64(program_format)
+              << ":program_hash=" << StableHash64(program_code)
+              << ":executable_hash=" << StableHash64(executable_proto);
   return fingerprint.str();
 }
 
-ExecutableMetadata MakeExecutableMetadata(const tt::AnalysisResult& analysis) {
+ExecutableMetadata MakeExecutableMetadata(const tt::AnalysisResult& analysis,
+                                          std::string_view program_format,
+                                          std::string_view program_code) {
   ExecutableMetadata metadata;
   metadata.name = kExecutableName;
   metadata.num_outputs = static_cast<size_t>(analysis.outputs_size());
@@ -233,11 +251,12 @@ ExecutableMetadata MakeExecutableMetadata(const tt::AnalysisResult& analysis) {
       metadata.output_dims.push_back(dim);
     }
   }
-  metadata.fingerprint =
-      FingerprintString(metadata.output_types, metadata.output_dims, metadata.output_dim_sizes);
   if (analysis.has_executable()) {
     metadata.executable_proto = analysis.executable().SerializeAsString();
   }
+  metadata.fingerprint = FingerprintString(metadata.output_types, metadata.output_dims,
+                                           metadata.output_dim_sizes, metadata.executable_proto,
+                                           program_format, program_code);
   return metadata;
 }
 
@@ -255,6 +274,7 @@ PJRT_Error* AnalyzeProgramToMetadata(const PJRT_Program& program, ExecutableMeta
     return InvalidArgument("program.code must not be null when size > 0");
   }
   const std::string_view format(program.format == nullptr ? "" : program.format, program.format_size);
+  const std::string_view code(program.code == nullptr ? "" : program.code, program.code_size);
   if (format != "mlir" && format != "stablehlo") {
     return Unimplemented("unsupported program format; supported formats are \"mlir\" and \"stablehlo\"");
   }
@@ -285,7 +305,7 @@ PJRT_Error* AnalyzeProgramToMetadata(const PJRT_Program& program, ExecutableMeta
     }
   }
 
-  *metadata = MakeExecutableMetadata(analysis);
+  *metadata = MakeExecutableMetadata(analysis, format, code);
   return nullptr;
 }
 

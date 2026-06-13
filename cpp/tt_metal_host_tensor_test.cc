@@ -4,9 +4,18 @@
 #include <tt-metalium/experimental/tensor/topology/tensor_topology.hpp>
 #include <tt-metalium/host_buffer.hpp>
 
-#include <cassert>
 #include <cstddef>
+#include <iostream>
 #include <vector>
+
+#define CHECK(condition)                                                     \
+  do {                                                                       \
+    if (!(condition)) {                                                       \
+      std::cerr << __FILE__ << ":" << __LINE__ << ": check failed: "         \
+                << #condition << "\n";                                       \
+      return 1;                                                              \
+    }                                                                        \
+  } while (false)
 
 int main() {
   tt::tt_metal::Shape logical_shape({2, 3});
@@ -24,13 +33,13 @@ int main() {
   tt::tt_metal::HostTensor tensor(
       tt::tt_metal::HostBuffer(std::move(bytes)), std::move(spec), tt::tt_metal::TensorTopology{});
 
-  assert(tensor.logical_shape() == logical_shape);
-  assert(tensor.padded_shape() == padded_shape);
+  CHECK(tensor.logical_shape() == logical_shape);
+  CHECK(tensor.padded_shape() == padded_shape);
 
   auto shard = tensor.buffer().get_shard(tt::tt_metal::distributed::MeshCoordinate(0, 0));
-  assert(shard.has_value());
+  CHECK(shard.has_value());
   auto view = shard->view_bytes();
-  assert(view.size() == 32 * 32 * sizeof(float));
-  assert(view[0] == std::byte{0x7b});
+  CHECK(view.size() == 32 * 32 * sizeof(float));
+  CHECK(view[0] == std::byte{0x7b});
   return 0;
 }
