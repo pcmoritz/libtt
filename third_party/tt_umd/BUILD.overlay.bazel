@@ -1,0 +1,79 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+genrule(
+    name = "simulation_chip_path_stub",
+    outs = ["simulation_chip_path_stub.cpp"],
+    cmd = "printf '%s\\n' " +
+          "'#include <filesystem>' " +
+          "'#include <string>' " +
+          "'#include \"umd/device/simulation/simulation_chip.hpp\"' " +
+          "'namespace tt::umd {' " +
+          "'std::string SimulationChip::get_soc_descriptor_path_from_simulator_path(const std::filesystem::path& simulator_path) {' " +
+          "'    return (simulator_path.extension() == \".so\") ? (simulator_path.parent_path() / \"soc_descriptor.yaml\").string() : (simulator_path / \"soc_descriptor.yaml\").string();' " +
+          "'}' " +
+          "'}  // namespace tt::umd' " +
+          "> $@",
+)
+
+cc_library(
+    name = "tt-umd",
+    srcs = [
+        ":simulation_chip_path_stub",
+    ] + glob(
+        [
+            "device/**/*.c",
+            "device/**/*.cpp",
+        ],
+        exclude = [
+            "device/chip/sw_emule_chip.cpp",
+            "device/firmware/wormhole_18_3_firmware_info_provider.cpp",
+            "device/pcie/rtl_sim_tlb_handle.cpp",
+            "device/pcie/rtl_sim_tlb_window.cpp",
+            "device/pcie/tt_sim_tlb_handle.cpp",
+            "device/pcie/tt_sim_tlb_window.cpp",
+            "device/simulation/**",
+            "device/tt_device/rtl_simulation_tt_device.cpp",
+            "device/tt_device/simulation_device_factory.cpp",
+            "device/tt_device/tt_sim_tt_device.cpp",
+            "device/warm_reset.cpp",
+            "device/warm_reset_with_recovery.cpp",
+        ],
+    ),
+    hdrs = glob([
+        "device/**/*.h",
+        "device/**/*.hpp",
+        "device/api/**/*.h",
+        "device/api/**/*.hpp",
+        "src/firmware/riscv/**/*.h",
+    ]),
+    copts = [
+        "-std=c++17",
+        "-march=x86-64-v3",
+    ],
+    defines = [
+        "SPDLOG_FMT_EXTERNAL=1",
+    ],
+    includes = [
+        "device",
+        "device/api",
+        "device/common",
+        "src/firmware/riscv",
+    ],
+    linkopts = [
+        "-lhwloc",
+        "-lrt",
+    ],
+    deps = [
+        "@fmt//:fmt-header-only",
+        "@spdlog//:spdlog",
+        "@tt_logger//:tt-logger",
+        "@yaml_cpp//:yaml-cpp",
+    ],
+)
+
+alias(
+    name = "firmware",
+    actual = ":tt-umd",
+)

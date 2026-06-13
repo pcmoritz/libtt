@@ -1,0 +1,31 @@
+--- tt_metal/distributed/distributed_host_buffer.cpp
++++ tt_metal/distributed/distributed_host_buffer.cpp
+@@ -5,8 +5,8 @@
+ #include <tt_stl/span.hpp>
+ #include <tt_stl/indestructible.hpp>
+ #include <tt-metalium/mesh_coord.hpp>
++#include <tt-metalium/distributed_context.hpp>
+ #include <tt-metalium/distributed_host_buffer.hpp>
+-#include <tt-metalium/experimental/fabric/control_plane.hpp>
+
+ #include <vector>
+ #include <functional>
+@@ -24,7 +24,7 @@
+         shape,
+         shape,
+         distributed::MeshCoordinate::zero_coordinate(shape.dims()),
+-        tt::tt_metal::MetalContext::instance().get_control_plane().get_host_local_context());
++        distributed::multihost::DistributedContext::get_current_world());
+ }
+
+ DistributedHostBuffer DistributedHostBuffer::create(
+@@ -54,8 +54,7 @@
+     std::vector<distributed::MaybeRemote<Shard>> shards(
+         mesh_device_view.shape().mesh_size(), distributed::MaybeRemote<Shard>::remote());
+
+-    auto distributed_context =
+-        tt::tt_metal::MetalContext::instance().get_control_plane().get_distributed_context(mesh_device_view.mesh_id());
++    auto distributed_context = distributed::multihost::DistributedContext::get_current_world();
+
+     int shard_index = 0;
+     for (auto maybe_device : mesh_device_view) {

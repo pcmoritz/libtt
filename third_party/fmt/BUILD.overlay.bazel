@@ -1,0 +1,15 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "fmt-header-only",
+    hdrs = glob(["include/fmt/*.h"]),
+    defines = ["FMT_HEADER_ONLY=1"],
+    includes = ["include"],
+)
+
+alias(
+    name = "fmt",
+    actual = ":fmt-header-only",
+)

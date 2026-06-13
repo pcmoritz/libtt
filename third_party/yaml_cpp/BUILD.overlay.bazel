@@ -1,0 +1,24 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "yaml-cpp",
+    srcs = glob([
+        "src/**/*.cpp",
+    ]),
+    hdrs = glob([
+        "include/**/*.h",
+        "src/**/*.h",
+    ]),
+    copts = ["-std=c++17"],
+    includes = [
+        "include",
+        "src",
+    ],
+)
+
+alias(
+    name = "yaml_cpp",
+    actual = ":yaml-cpp",
+)

@@ -1,0 +1,17 @@
+--- src/BUILD.bazel
++++ src/BUILD.bazel
+@@ -12,6 +12,14 @@ filegroup(
+     visibility = ["//visibility:public"],
+ )
+ 
++exports_files(
++    [
++        "idl_gen_cpp.cpp",
++        "idl_gen_cpp.h",
++    ],
++    visibility = ["//visibility:public"],
++)
++
+ cc_library(
+     name = "code_generators",
+     srcs = ["code_generators.cpp"],

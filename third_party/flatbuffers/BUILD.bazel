@@ -1,0 +1,6 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "flatc_cpp_only.cc",
+    "grpc_stubs.cc",
+])

@@ -1,0 +1,12 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "simde",
+    hdrs = glob([
+        "simde/**/*.h",
+        "simde/**/*.hpp",
+    ], allow_empty = True),
+    includes = ["."],
+)

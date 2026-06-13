@@ -1,0 +1,59 @@
+--- tt_metal/distributed/mesh_device.cpp
++++ tt_metal/distributed/mesh_device.cpp
+@@ -339,20 +339,10 @@
+     tt::stl::Span<const std::uint32_t> l1_bank_remap,
+     size_t worker_l1_size) {
+     auto& ctx = MetalContext::instance(context_id);
+-    const auto& mesh_graph = ctx.get_control_plane().get_mesh_graph();
+     auto [scoped_devices, fabric_node_ids, mesh_shape] =
+         [&]() -> std::tuple<std::shared_ptr<ScopedDevices>, std::vector<tt::tt_fabric::FabricNodeId>, MeshShape> {
+         if (config.physical_device_ids().empty()) {
+             auto mapped_devices = ctx.get_system_mesh().get_mapped_devices(config.mesh_shape(), config.offset());
+-            // Validate that none of the fabric node IDs are on switch meshes
+-            for (const auto& fabric_node_id : mapped_devices.fabric_node_ids) {
+-                TT_FATAL(
+-                    !mesh_graph.is_switch_mesh(fabric_node_id.mesh_id),
+-                    "Cannot create devices on tt-switch meshes. Fabric node {} maps to mesh_id {} which is a switch. "
+-                    "Use get_compute_mesh_ids() to get valid compute mesh IDs.",
+-                    fabric_node_id,
+-                    *fabric_node_id.mesh_id);
+-            }
+             auto mapped_devices_full_system_device_ids =
+                 (*ctx.global_distributed_context().size() > 1)
+                     ? ctx.get_system_mesh().get_mapped_devices(std::nullopt).device_ids
+@@ -375,14 +365,7 @@
+         TT_FATAL(config.mesh_shape().has_value(), "Mesh shape must be provided when physical device ids are supplied");
+         const auto& supplied_ids = config.physical_device_ids();
+         for (int supplied_id : supplied_ids) {
+-            auto fabric_node_id = ctx.get_control_plane().get_fabric_node_id_from_physical_chip_id(supplied_id);
+-            TT_FATAL(
+-                !mesh_graph.is_switch_mesh(fabric_node_id.mesh_id),
+-                "Cannot create devices on tt-switch meshes. Device {} maps to mesh_id {} which is a switch. "
+-                "Use get_compute_mesh_ids() to get valid compute mesh IDs.",
+-                supplied_id,
+-                *fabric_node_id.mesh_id);
+-            fabric_node_ids.push_back(fabric_node_id);
++            fabric_node_ids.emplace_back(tt::tt_fabric::MeshId{0}, static_cast<std::uint32_t>(supplied_id));
+         }
+         auto mapped_devices_full_system_device_ids =
+             (*ctx.global_distributed_context().size() > 1)
+@@ -489,18 +472,10 @@
+         !device_ids.empty(), "Cannot create unit meshes with empty device_ids. At least one device ID is required.");
+
+     auto& ctx = MetalContext::instance(context_id);
+-    const auto& mesh_graph = ctx.get_control_plane().get_mesh_graph();
+     std::vector<tt::tt_fabric::FabricNodeId> fabric_node_ids;
+     fabric_node_ids.reserve(device_ids.size());
+     for (const auto& device_id : device_ids) {
+-        auto fabric_node_id = ctx.get_control_plane().get_fabric_node_id_from_physical_chip_id(device_id);
+-        TT_FATAL(
+-            !mesh_graph.is_switch_mesh(fabric_node_id.mesh_id),
+-            "Cannot create devices on tt-switch meshes. Device {} maps to mesh_id {} which is a switch. "
+-            "Use get_compute_mesh_ids() to get valid compute mesh IDs.",
+-            device_id,
+-            *fabric_node_id.mesh_id);
+-        fabric_node_ids.push_back(fabric_node_id);
++        fabric_node_ids.emplace_back(tt::tt_fabric::MeshId{0}, static_cast<std::uint32_t>(device_id));
+     }
+
+     auto mapped_devices_full_system_device_ids = (*ctx.global_distributed_context().size() > 1)

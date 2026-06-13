@@ -1,0 +1,12 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "nlohmann_json",
+    hdrs = glob([
+        "include/nlohmann/**/*.h",
+        "include/nlohmann/**/*.hpp",
+    ], allow_empty = True),
+    includes = ["include"],
+)
