@@ -89,12 +89,12 @@ genrule(
           "llrt_outdir=$$(dirname $(location llrt/hal/generated/dev_msgs.hpp)); " +
           "bash $(location tt_metal/llrt/hal/codegen/codegen.sh) $$root $$outdir; " +
           "mkdir -p $$llrt_outdir; " +
-          "cp $(location hal/generated/dev_msgs.hpp) $(location llrt/hal/generated/dev_msgs.hpp); " +
-          "cp $(location hal/generated/dev_msgs_impl.hpp) $(location llrt/hal/generated/dev_msgs_impl.hpp); " +
-          "cp $(location hal/generated/fabric_telemetry.hpp) $(location llrt/hal/generated/fabric_telemetry.hpp); " +
-          "cp $(location hal/generated/fabric_telemetry_impl.hpp) $(location llrt/hal/generated/fabric_telemetry_impl.hpp); " +
-          "cp $(location hal/generated/realtime_profiler_msgs.hpp) $(location llrt/hal/generated/realtime_profiler_msgs.hpp); " +
-          "cp $(location hal/generated/realtime_profiler_msgs_impl.hpp) $(location llrt/hal/generated/realtime_profiler_msgs_impl.hpp)",
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/dev_msgs.hpp\"' > $(location llrt/hal/generated/dev_msgs.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/dev_msgs_impl.hpp\"' > $(location llrt/hal/generated/dev_msgs_impl.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/fabric_telemetry.hpp\"' > $(location llrt/hal/generated/fabric_telemetry.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/fabric_telemetry_impl.hpp\"' > $(location llrt/hal/generated/fabric_telemetry_impl.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/realtime_profiler_msgs.hpp\"' > $(location llrt/hal/generated/realtime_profiler_msgs.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/realtime_profiler_msgs_impl.hpp\"' > $(location llrt/hal/generated/realtime_profiler_msgs_impl.hpp)",
     tools = [
         "tt_metal/llrt/hal/codegen/codegen.py",
         "tt_metal/llrt/hal/codegen/codegen.sh",
@@ -360,6 +360,7 @@ cc_library(
     srcs = [
         "tt_metal/impl/buffers/buffer_distribution_spec.cpp",
         "tt_metal/impl/tensor/host_tensor.cpp",
+        "tt_metal/impl/tensor/host_tensor_factory.cpp",
         "tt_metal/impl/tensor/spec/layout/alignment.cpp",
         "tt_metal/impl/tensor/spec/layout/layout.cpp",
         "tt_metal/impl/tensor/spec/layout/page_config.cpp",
@@ -495,6 +496,30 @@ TT_METAL_RUNTIME_INCLUDE_DIRS = ["inspector_stubs"] + TT_METAL_INCLUDE_DIRS + [
     "tt_metal/llrt",
     "tt_metal/llrt/hal",
 ]
+
+TTNN_RUNTIME_HDRS = glob(
+    [
+        "ttnn/api/**/*.h",
+        "ttnn/api/**/*.hpp",
+        "ttnn/api/**/*.tpp",
+        "ttnn/core/**/*.h",
+        "ttnn/core/**/*.hpp",
+        "ttnn/core/**/*.tpp",
+        "ttnn/cpp/ttnn/**/*.h",
+        "ttnn/cpp/ttnn/**/*.hpp",
+        "ttnn/cpp/ttnn/**/*.tpp",
+    ],
+    allow_empty = True,
+)
+
+TTNN_RUNTIME_INCLUDE_DIRS = [
+    "ttnn",
+    "ttnn/api",
+    "ttnn/api/ttnn",
+    "ttnn/core",
+    "ttnn/cpp",
+    "ttnn/cpp/ttnn",
+] + TT_METAL_RUNTIME_INCLUDE_DIRS
 
 TT_METAL_RUNTIME_COPTS = [
     "-std=c++20",
@@ -678,12 +703,21 @@ cc_library(
         "tt_metal/distributed/named_shm.cpp",
         "tt_metal/distributed/pcie_core_writer.cpp",
         "tt_metal/distributed/pinned_memory.cpp",
+        "tt_metal/distributed/pinned_memory_cache.cpp",
         "tt_metal/distributed/realtime_profiler_manager.cpp",
         "tt_metal/distributed/sd_mesh_command_queue.cpp",
         "tt_metal/distributed/shm_resource_tracker.cpp",
         "tt_metal/distributed/system_mesh.cpp",
         ":tt_metal_inspector_stub_source",
         "tt_metal/fabric/fabric_types.cpp",
+        "tt_metal/hal.cpp",
+        "tt_metal/impl/allocator/algorithms/free_list_opt.cpp",
+        "tt_metal/impl/allocator/allocator.cpp",
+        "tt_metal/impl/allocator/allocator_state.cpp",
+        "tt_metal/impl/allocator/bank_manager.cpp",
+        "tt_metal/impl/allocator/l1_banking_allocator.cpp",
+        "tt_metal/impl/buffers/buffer.cpp",
+        "tt_metal/impl/buffers/buffer_page_mapping.cpp",
         "tt_metal/impl/buffers/circular_buffer.cpp",
         "tt_metal/impl/buffers/circular_buffer_config.cpp",
         "tt_metal/impl/buffers/dispatch.cpp",
@@ -707,6 +741,7 @@ cc_library(
         "tt_metal/impl/data_format/mxfp4.cpp",
         "tt_metal/impl/data_format/mxfp6.cpp",
         "tt_metal/impl/data_format/mxfp8.cpp",
+        "tt_metal/impl/data_format/tile.cpp",
         "tt_metal/impl/data_format/tilize_utils.cpp",
         "tt_metal/impl/data_format/uint8.cpp",
         "tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp",
@@ -806,11 +841,54 @@ cc_library(
         ":tt_metal_hal_blackhole_upstream",
         ":tt_metal_hal_quasar_upstream",
         ":tt_metal_hal_wormhole_upstream",
-        ":tt_metal_host_tensor_runtime_support_upstream",
         ":tt_metal_host_tensor_upstream",
     ],
     linkopts = [
         "-lnuma",
+    ],
+    alwayslink = True,
+    linkstatic = True,
+)
+
+cc_library(
+    name = "ttnn_tensor_upstream",
+    srcs = [
+        "ttnn/core/async_runtime.cpp",
+        "ttnn/core/cluster.cpp",
+        "ttnn/core/config.cpp",
+        "ttnn/core/core.cpp",
+        "ttnn/core/device_operation_detail.cpp",
+        "ttnn/core/distributed/api.cpp",
+        "ttnn/core/distributed/host_ccl.cpp",
+        "ttnn/core/events.cpp",
+        "ttnn/core/global_circular_buffer.cpp",
+        "ttnn/core/global_semaphore.cpp",
+        "ttnn/core/graph/graph_processor.cpp",
+        "ttnn/core/operation.cpp",
+        "ttnn/core/reports.cpp",
+        "ttnn/core/tensor/host_buffer/functions.cpp",
+        "ttnn/core/tensor/storage.cpp",
+        "ttnn/core/tensor/tensor.cpp",
+        "ttnn/core/tensor/tensor_attributes.cpp",
+        "ttnn/core/tensor/tensor_impl.cpp",
+        "ttnn/core/tensor/tensor_ops.cpp",
+        "ttnn/core/tensor/tensor_utils.cpp",
+        "ttnn/core/tensor/to_string.cpp",
+        "ttnn/core/tensor/unit_mesh/unit_mesh_utils.cpp",
+        "ttnn/cpp/ttnn/operations/core/compute_kernel/compute_kernel_config.cpp",
+        "ttnn/cpp/ttnn/operations/core/core.cpp",
+        "ttnn/cpp/ttnn/operations/core/to_dtype/to_dtype_op.cpp",
+        "ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp",
+        "ttnn/cpp/ttnn/operations/core/to_memory_config/to_memory_config_op.cpp",
+        "ttnn/cpp/ttnn/operations/compute_throttle_utils.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_utils.cpp",
+    ],
+    hdrs = TTNN_RUNTIME_HDRS,
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TTNN_RUNTIME_INCLUDE_DIRS,
+    deps = [
+        ":tt_metal_device_tensor_upstream",
     ],
     linkstatic = True,
 )

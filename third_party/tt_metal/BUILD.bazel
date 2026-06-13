@@ -1,1 +1,19 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
 exports_files(["BUILD.overlay.bazel"])
+
+cc_library(
+    name = "tt_metal_disabled_fabric_compat",
+    srcs = ["stubs/disabled_fabric_compat.cc"],
+    copts = [
+        "-std=c++20",
+        "-DTT_METAL_INSTALL_ROOT=\\\"/usr/libexec/tt-metalium\\\"",
+    ],
+    deps = [
+        "@tt_metal//:tt_metal_device_tensor_upstream",
+    ],
+    alwayslink = True,
+    linkstatic = True,
+)
