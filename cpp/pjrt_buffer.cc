@@ -1,132 +1,33 @@
 #include "cpp/pjrt_buffer.h"
 
-#include <tt-metalium/experimental/tensor/host_tensor.hpp>
+#include <tt-metalium/bfloat16.hpp>
+#include <tt-metalium/experimental/tensor/spec/layout/alignment.hpp>
+#include <tt-metalium/experimental/tensor/spec/layout/page_config.hpp>
 #include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
-#include <tt-metalium/experimental/tensor/topology/tensor_topology.hpp>
-#include <tt-metalium/host_buffer.hpp>
+#include <ttnn/tensor/tensor.hpp>
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
+#include <type_traits>
 #include <utility>
 
-struct PjrtHostBufferStorage {
-  explicit PjrtHostBufferStorage(tt::tt_metal::HostTensor host_tensor)
-      : host_tensor(std::move(host_tensor)) {}
+struct PjrtTensorStorage {
+  explicit PjrtTensorStorage(ttnn::Tensor tensor) : tensor(std::move(tensor)) {}
 
-  tt::tt_metal::HostTensor host_tensor;
+  ttnn::Tensor tensor;
 };
 
 PJRT_Buffer::~PJRT_Buffer() = default;
 
 namespace {
 
-constexpr int64_t kTileRows = 32;
-constexpr int64_t kTileCols = 32;
-
-PJRT_Error* CopyBetweenHostShapes(const std::vector<std::byte>& source,
-                                  std::vector<std::byte>* target,
-                                  PJRT_Buffer_Type type,
-                                  const std::vector<int64_t>& source_shape,
-                                  const std::vector<int64_t>& target_shape,
-                                  const std::vector<int64_t>& copy_shape) {
-  if (source_shape.size() != target_shape.size() || source_shape.size() != copy_shape.size()) {
-    return InvalidArgument("rank must match when copying between padded host shapes");
-  }
-  if (copy_shape.size() < 2) {
-    return InvalidArgument("padded host shape copy requires rank >= 2");
-  }
-  for (size_t i = 0; i < copy_shape.size(); ++i) {
-    if (copy_shape[i] < 0 || copy_shape[i] > source_shape[i] || copy_shape[i] > target_shape[i]) {
-      return InvalidArgument("copy shape exceeds source or target shape");
-    }
-  }
-
-  size_t source_size = 0;
-  size_t target_size = 0;
-  if (PJRT_Error* error = HostByteSize(type, source_shape, &source_size)) {
-    return error;
-  }
-  if (PJRT_Error* error = HostByteSize(type, target_shape, &target_size)) {
-    return error;
-  }
-  if (source.size() != source_size || target->size() != target_size) {
-    return InvalidArgument("host buffer size does not match row-major shape");
-  }
-
-  const size_t rank = copy_shape.size();
-  const size_t copy_rows = static_cast<size_t>(copy_shape[rank - 2]);
-  const size_t copy_cols = static_cast<size_t>(copy_shape[rank - 1]);
-  const size_t source_rows = static_cast<size_t>(source_shape[rank - 2]);
-  const size_t source_cols = static_cast<size_t>(source_shape[rank - 1]);
-  const size_t target_rows = static_cast<size_t>(target_shape[rank - 2]);
-  const size_t target_cols = static_cast<size_t>(target_shape[rank - 1]);
-  size_t batch = 1;
-  for (size_t i = 0; i + 2 < rank; ++i) {
-    const size_t dim = static_cast<size_t>(copy_shape[i]);
-    if (dim != 0 && batch > std::numeric_limits<size_t>::max() / dim) {
-      return ResourceExhausted("shape dimensions overflow");
-    }
-    batch *= dim;
-  }
-
-  const size_t bytes_per_element = BytesPerElement(type);
-  if (bytes_per_element == 0) {
-    return Unimplemented("unsupported PJRT buffer type");
-  }
-  if (copy_cols > std::numeric_limits<size_t>::max() / bytes_per_element) {
-    return ResourceExhausted("shape dimensions overflow");
-  }
-  const size_t row_bytes = copy_cols * bytes_per_element;
-
-  for (size_t batch_index = 0; batch_index < batch; ++batch_index) {
-    for (size_t row = 0; row < copy_rows; ++row) {
-      const size_t source_element = (batch_index * source_rows + row) * source_cols;
-      const size_t target_element = (batch_index * target_rows + row) * target_cols;
-      const size_t source_start = source_element * bytes_per_element;
-      const size_t target_start = target_element * bytes_per_element;
-      std::memcpy(target->data() + target_start, source.data() + source_start, row_bytes);
-    }
-  }
-  return nullptr;
-}
-
-PJRT_Error* PaddedHostData(const void* data, size_t byte_size, PJRT_Buffer_Type type,
-                           const std::vector<int64_t>& logical_dims,
-                           const std::vector<int64_t>& allocation_dims,
-                           std::vector<std::byte>* out) {
-  out->resize(byte_size);
-  if (byte_size > 0) {
-    std::memcpy(out->data(), data, byte_size);
-  }
-  if (logical_dims == allocation_dims) {
-    return nullptr;
-  }
-
-  size_t allocation_size = 0;
-  if (PJRT_Error* error = HostByteSize(type, allocation_dims, &allocation_size)) {
-    return error;
-  }
-  if (byte_size > allocation_size) {
-    return InvalidArgument("logical buffer is larger than allocation buffer");
-  }
-  std::vector<std::byte> padded(allocation_size);
-  if (logical_dims.size() < 2) {
-    if (byte_size > 0) {
-      std::memcpy(padded.data(), out->data(), byte_size);
-    }
-    *out = std::move(padded);
-    return nullptr;
-  }
-  if (PJRT_Error* error =
-          CopyBetweenHostShapes(*out, &padded, type, logical_dims, allocation_dims, logical_dims)) {
-    return error;
-  }
-  *out = std::move(padded);
-  return nullptr;
-}
+constexpr uint32_t kTileRows = 32;
+constexpr uint32_t kTileCols = 32;
 
 std::optional<tt::tt_metal::DataType> MetalDataType(PJRT_Buffer_Type type) {
   switch (type) {
@@ -152,7 +53,7 @@ PJRT_Error* ShapeFromDims(const std::vector<int64_t>& dims, tt::tt_metal::Shape*
   tt::tt_metal::Shape::Container values;
   for (int64_t dim : dims) {
     if (dim < 0 || dim > std::numeric_limits<uint32_t>::max()) {
-      return InvalidArgument("shape dimensions must fit uint32_t for tt-metal tensors");
+      return InvalidArgument("shape dimensions must fit uint32_t for TTNN tensors");
     }
     values.push_back(static_cast<uint32_t>(dim));
   }
@@ -160,20 +61,12 @@ PJRT_Error* ShapeFromDims(const std::vector<int64_t>& dims, tt::tt_metal::Shape*
   return nullptr;
 }
 
-std::vector<int64_t> DimsFromShape(const tt::tt_metal::Shape& shape) {
-  std::vector<int64_t> dims;
-  dims.reserve(shape.size());
-  for (uint32_t dim : shape) {
-    dims.push_back(static_cast<int64_t>(dim));
-  }
-  return dims;
-}
-
-PJRT_Error* CreateTensorSpec(PJRT_Buffer_Type type, const std::vector<int64_t>& logical_dims,
-                             std::optional<tt::tt_metal::TensorSpec>* out) {
+PJRT_Error* CreateTensorSpec(PJRT_Buffer_Type type,
+                             const std::vector<int64_t>& logical_dims,
+                             std::optional<ttnn::TensorSpec>* out) {
   const std::optional<tt::tt_metal::DataType> dtype = MetalDataType(type);
   if (!dtype.has_value()) {
-    return Unimplemented("PJRT buffer type cannot be represented as a tt-metal HostTensor dtype");
+    return Unimplemented("PJRT buffer type cannot be represented as a TTNN Tensor dtype");
   }
 
   tt::tt_metal::Shape logical_shape;
@@ -185,31 +78,82 @@ PJRT_Error* CreateTensorSpec(PJRT_Buffer_Type type, const std::vector<int64_t>& 
       *dtype,
       tt::tt_metal::PageConfig(tt::tt_metal::Layout::ROW_MAJOR),
       tt::tt_metal::MemoryConfig{},
-      tt::tt_metal::Alignment({static_cast<uint32_t>(kTileRows),
-                               static_cast<uint32_t>(kTileCols)}));
+      tt::tt_metal::Alignment({kTileRows, kTileCols}));
   out->emplace(logical_shape, std::move(layout));
   return nullptr;
 }
 
-PJRT_Error* CreateHostTensor(const tt::tt_metal::TensorSpec& spec,
-                             std::vector<std::byte> storage,
-                             std::optional<tt::tt_metal::HostTensor>* out) {
-  tt::tt_metal::HostBuffer host_buffer(std::move(storage));
-  out->emplace(std::move(host_buffer), spec, tt::tt_metal::TensorTopology{});
+template <typename T>
+PJRT_Error* CopyBytesToVector(const void* data, size_t byte_size, std::vector<T>* out) {
+  static_assert(std::is_trivially_copyable_v<T>, "PJRT tensor element type must be trivially copyable");
+  if (byte_size % sizeof(T) != 0) {
+    return InvalidArgument("host buffer byte size is not a multiple of the tensor element size");
+  }
+  out->resize(byte_size / sizeof(T));
+  if (byte_size > 0) {
+    std::memcpy(out->data(), data, byte_size);
+  }
   return nullptr;
 }
 
-PJRT_Error* HostTensorPhysicalBytes(const PJRT_Buffer& buffer, std::vector<std::byte>* out) {
-  if (buffer.storage == nullptr) {
-    return FailedPrecondition("buffer has no host tensor storage");
+template <typename T>
+PJRT_Error* CreateTensorFromBytes(const void* data,
+                                  size_t byte_size,
+                                  const ttnn::TensorSpec& spec,
+                                  std::optional<ttnn::Tensor>* out) {
+  std::vector<T> values;
+  if (PJRT_Error* error = CopyBytesToVector(data, byte_size, &values)) {
+    return error;
   }
-  const auto shard =
-      buffer.storage->host_tensor.buffer().get_shard(tt::tt_metal::distributed::MeshCoordinate(0, 0));
-  if (!shard.has_value()) {
-    return Internal("host tensor has no local shard at coordinate (0, 0)");
+  try {
+    out->emplace(ttnn::Tensor::from_vector(std::move(values), spec));
+  } catch (const std::exception& e) {
+    return Internal(std::string("failed to create TTNN tensor from host buffer: ") + e.what());
   }
-  const auto bytes = shard->view_bytes();
-  out->assign(bytes.begin(), bytes.end());
+  return nullptr;
+}
+
+PJRT_Error* CreateTensorFromBytes(PJRT_Buffer_Type type,
+                                  const void* data,
+                                  size_t byte_size,
+                                  const ttnn::TensorSpec& spec,
+                                  std::optional<ttnn::Tensor>* out) {
+  switch (type) {
+    case PJRT_Buffer_Type_PRED:
+    case PJRT_Buffer_Type_U8:
+      return CreateTensorFromBytes<uint8_t>(data, byte_size, spec, out);
+    case PJRT_Buffer_Type_U16:
+      return CreateTensorFromBytes<uint16_t>(data, byte_size, spec, out);
+    case PJRT_Buffer_Type_S32:
+      return CreateTensorFromBytes<int32_t>(data, byte_size, spec, out);
+    case PJRT_Buffer_Type_U32:
+      return CreateTensorFromBytes<uint32_t>(data, byte_size, spec, out);
+    case PJRT_Buffer_Type_BF16:
+      return CreateTensorFromBytes<bfloat16>(data, byte_size, spec, out);
+    case PJRT_Buffer_Type_F32:
+      return CreateTensorFromBytes<float>(data, byte_size, spec, out);
+    default:
+      return Unimplemented("unsupported TTNN tensor buffer type");
+  }
+}
+
+template <typename T>
+void CopyVectorToBytes(const std::vector<T>& values, std::vector<std::byte>* out) {
+  static_assert(std::is_trivially_copyable_v<T>, "PJRT tensor element type must be trivially copyable");
+  out->resize(values.size() * sizeof(T));
+  if (!values.empty()) {
+    std::memcpy(out->data(), values.data(), out->size());
+  }
+}
+
+template <typename T>
+PJRT_Error* TensorToBytes(const ttnn::Tensor& tensor, std::vector<std::byte>* out) {
+  try {
+    std::vector<T> values = tensor.to_vector<T>();
+    CopyVectorToBytes(values, out);
+  } catch (const std::exception& e) {
+    return Internal(std::string("failed to read TTNN tensor to host buffer: ") + e.what());
+  }
   return nullptr;
 }
 
@@ -337,29 +281,29 @@ PJRT_Error* CreatePjrtBufferFromHostBytes(PJRT_Buffer_Type type,
     return InvalidArgument("data must not be null");
   }
 
-  std::optional<tt::tt_metal::TensorSpec> tensor_spec;
+  size_t expected_byte_size = 0;
+  if (PJRT_Error* error = HostByteSize(type, dims, &expected_byte_size)) {
+    return error;
+  }
+  if (byte_size != expected_byte_size) {
+    return InvalidArgument("host buffer byte size does not match tensor shape");
+  }
+
+  std::optional<ttnn::TensorSpec> tensor_spec;
   if (PJRT_Error* error = CreateTensorSpec(type, dims, &tensor_spec)) {
     return error;
   }
-  std::vector<int64_t> allocation_dims = DimsFromShape(tensor_spec->padded_shape());
-  std::vector<std::byte> storage;
-  if (PJRT_Error* error = PaddedHostData(data, byte_size, type, dims, allocation_dims, &storage)) {
+  std::optional<ttnn::Tensor> tensor;
+  if (PJRT_Error* error = CreateTensorFromBytes(type, data, byte_size, *tensor_spec, &tensor)) {
     return error;
   }
-  std::optional<tt::tt_metal::HostTensor> host_tensor;
-  if (PJRT_Error* error = CreateHostTensor(*tensor_spec, std::move(storage), &host_tensor)) {
-    return error;
-  }
-  auto host_storage = std::make_unique<PjrtHostBufferStorage>(std::move(*host_tensor));
 
   auto buffer = std::make_unique<PJRT_Buffer>();
   buffer->buffer_type = type;
   buffer->dims = dims;
   buffer->device = target_device;
   buffer->memory = target_memory;
-  buffer->storage = std::move(host_storage);
-  buffer->allocation_dims = std::move(allocation_dims);
-  buffer->source_shape = std::nullopt;
+  buffer->storage = std::make_unique<PjrtTensorStorage>(std::move(*tensor));
   buffer->deleted = false;
   buffer->external_reference_count = 0;
   *out = buffer.release();
@@ -376,48 +320,59 @@ PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::b
   if (buffer.deleted) {
     return FailedPrecondition("buffer has been deleted");
   }
-  size_t logical_size = 0;
-  if (PJRT_Error* error = HostByteSize(buffer.buffer_type, buffer.dims, &logical_size)) {
+  if (buffer.storage == nullptr) {
+    return FailedPrecondition("buffer has no TTNN tensor storage");
+  }
+
+  PJRT_Error* error = nullptr;
+  switch (buffer.buffer_type) {
+    case PJRT_Buffer_Type_PRED:
+    case PJRT_Buffer_Type_U8:
+      error = TensorToBytes<uint8_t>(buffer.storage->tensor, out);
+      break;
+    case PJRT_Buffer_Type_U16:
+      error = TensorToBytes<uint16_t>(buffer.storage->tensor, out);
+      break;
+    case PJRT_Buffer_Type_S32:
+      error = TensorToBytes<int32_t>(buffer.storage->tensor, out);
+      break;
+    case PJRT_Buffer_Type_U32:
+      error = TensorToBytes<uint32_t>(buffer.storage->tensor, out);
+      break;
+    case PJRT_Buffer_Type_BF16:
+      error = TensorToBytes<bfloat16>(buffer.storage->tensor, out);
+      break;
+    case PJRT_Buffer_Type_F32:
+      error = TensorToBytes<float>(buffer.storage->tensor, out);
+      break;
+    default:
+      return Unimplemented("unsupported TTNN tensor buffer type");
+  }
+  if (error != nullptr) {
     return error;
   }
-  const std::vector<int64_t>& read_shape =
-      buffer.source_shape.has_value() ? *buffer.source_shape : buffer.dims;
-  size_t read_size = 0;
-  if (PJRT_Error* error = HostByteSize(buffer.buffer_type, read_shape, &read_size)) {
-    return error;
+
+  size_t expected_byte_size = 0;
+  if (PJRT_Error* byte_size_error = HostByteSize(buffer.buffer_type, buffer.dims, &expected_byte_size)) {
+    return byte_size_error;
   }
-  if (buffer.source_shape.has_value() && read_size != logical_size) {
-    return Internal("reshape view source byte size does not match logical byte size");
+  if (out->size() != expected_byte_size) {
+    return Internal("TTNN tensor readback byte size does not match logical byte size");
   }
-  std::vector<std::byte> physical_data;
-  if (PJRT_Error* error = HostTensorPhysicalBytes(buffer, &physical_data)) {
-    return error;
-  }
-  if (physical_data.size() == read_size) {
-    *out = std::move(physical_data);
-    return nullptr;
-  }
-  if (read_shape.size() < 2 && physical_data.size() >= read_size) {
-    out->assign(physical_data.begin(), physical_data.begin() + static_cast<ptrdiff_t>(read_size));
-    return nullptr;
-  }
-  if (read_shape.size() == buffer.allocation_dims.size() && physical_data.size() > read_size) {
-    out->assign(logical_size, std::byte{0});
-    return CopyBetweenHostShapes(physical_data, out, buffer.buffer_type, buffer.allocation_dims,
-                                 read_shape, read_shape);
-  }
-  return Internal("readback byte size does not match buffer byte size");
+  return nullptr;
 }
 
-PJRT_Error* HostTensorPhysicalByteSize(const PJRT_Buffer& buffer, size_t* out) {
+PJRT_Error* TtnnTensorPhysicalByteSize(const PJRT_Buffer& buffer, size_t* out) {
   if (buffer.storage == nullptr) {
-    return FailedPrecondition("buffer has no host tensor storage");
+    return FailedPrecondition("buffer has no TTNN tensor storage");
   }
-  const auto shard =
-      buffer.storage->host_tensor.buffer().get_shard(tt::tt_metal::distributed::MeshCoordinate(0, 0));
-  if (!shard.has_value()) {
-    return Internal("host tensor has no local shard at coordinate (0, 0)");
+  const ttnn::Tensor& tensor = buffer.storage->tensor;
+  const uint64_t physical_volume = tensor.physical_volume();
+  const uint32_t element_size = tensor.element_size();
+  if (element_size != 0 &&
+      physical_volume > std::numeric_limits<size_t>::max() / element_size) {
+    return ResourceExhausted("TTNN tensor physical byte size overflow");
   }
-  *out = shard->view_bytes().size();
+  *out = static_cast<size_t>(physical_volume) * static_cast<size_t>(element_size);
   return nullptr;
 }
