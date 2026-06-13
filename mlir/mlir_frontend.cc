@@ -2433,8 +2433,67 @@ std::optional<int64_t> topKCompositeK(mlir::stablehlo::CompositeOp composite_op)
     return k.getInt();
 }
 
+struct TopKLikeOp {
+    mlir::Operation* op;
+    mlir::Value operand;
+    mlir::Value values;
+    mlir::Value indices;
+    int64_t k;
+};
+
+std::optional<int64_t> topKResultK(mlir::Value values) {
+    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(values.getType());
+    if (!tensor || !tensor.hasStaticShape() || tensor.getRank() < 1) {
+        return std::nullopt;
+    }
+    return tensor.getShape().back();
+}
+
+std::optional<TopKLikeOp> topKLikeOp(mlir::Operation* op) {
+    if (auto composite_op = mlir::dyn_cast<mlir::stablehlo::CompositeOp>(op)) {
+        if (composite_op->getNumOperands() != 1 || composite_op->getNumResults() != 2) {
+            return std::nullopt;
+        }
+        auto k = topKCompositeK(composite_op);
+        if (!k) {
+            return std::nullopt;
+        }
+        return TopKLikeOp{
+            .op = op,
+            .operand = composite_op->getOperand(0),
+            .values = composite_op->getResult(0),
+            .indices = composite_op->getResult(1),
+            .k = *k,
+        };
+    }
+
+    if (auto custom_call = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
+        auto target = custom_call.getCallTargetName();
+        if (target != "chlo.top_k" && target != "mhlo.topk" &&
+            target != "top_k" && target != "TopK") {
+            return std::nullopt;
+        }
+        if (custom_call->getNumOperands() != 1 || custom_call->getNumResults() != 2) {
+            return std::nullopt;
+        }
+        auto k = topKResultK(custom_call->getResult(0));
+        if (!k) {
+            return std::nullopt;
+        }
+        return TopKLikeOp{
+            .op = op,
+            .operand = custom_call->getOperand(0),
+            .values = custom_call->getResult(0),
+            .indices = custom_call->getResult(1),
+            .k = *k,
+        };
+    }
+
+    return std::nullopt;
+}
+
 struct MatmulTopKEpilogueRegion {
-    mlir::stablehlo::CompositeOp top_k;
+    TopKLikeOp top_k;
     mlir::stablehlo::ReshapeOp flatten;
 };
 
@@ -2466,28 +2525,23 @@ std::optional<MatmulTopKEpilogueRegion> collectMatmulTopKEpilogue(
     }
 
     auto* top_k_user = singleUser(flatten.getResult());
-    auto top_k = top_k_user
-        ? mlir::dyn_cast<mlir::stablehlo::CompositeOp>(top_k_user)
-        : nullptr;
-    if (!top_k || top_k->getNumOperands() != 1 ||
-        top_k->getOperand(0) != flatten.getResult() ||
-        top_k->getNumResults() != 2) {
+    auto top_k = top_k_user ? topKLikeOp(top_k_user) : std::nullopt;
+    if (!top_k || top_k->operand != flatten.getResult()) {
         return std::nullopt;
     }
 
-    auto k = topKCompositeK(top_k);
-    if (!k.has_value() || *k != 1) {
+    if (top_k->k != 1) {
         return std::nullopt;
     }
-    if (!isBf16Tensor(top_k->getResult(0)) ||
-        !isS32Tensor(top_k->getResult(1)) ||
-        !isTensorShape(top_k->getResult(0), {1}) ||
-        !isTensorShape(top_k->getResult(1), {1})) {
+    if (!isBf16Tensor(top_k->values) ||
+        !isS32Tensor(top_k->indices) ||
+        !isTensorShape(top_k->values, {1}) ||
+        !isTensorShape(top_k->indices, {1})) {
         return std::nullopt;
     }
 
     return MatmulTopKEpilogueRegion{
-        .top_k = top_k,
+        .top_k = *top_k,
         .flatten = flatten,
     };
 }
@@ -2535,8 +2589,8 @@ bool addMatmulOp(
     if (top_k_epilogue) {
         uint32_t values_id = 0;
         uint32_t indices_id = 0;
-        if (!addValueDesc(top_k_epilogue->top_k->getResult(0), executable, value_ids, error, values_id) ||
-            !addValueDesc(top_k_epilogue->top_k->getResult(1), executable, value_ids, error, indices_id)) {
+        if (!addValueDesc(top_k_epilogue->top_k.values, executable, value_ids, error, values_id) ||
+            !addValueDesc(top_k_epilogue->top_k.indices, executable, value_ids, error, indices_id)) {
             return false;
         }
         op->set_output_id(values_id);
@@ -2783,31 +2837,23 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             continue;
         }
 
-        if (auto composite_op = mlir::dyn_cast<mlir::stablehlo::CompositeOp>(op)) {
-            if (composite_op.getName() != "chlo.top_k") {
-                error = "unsupported stablehlo composite: " + composite_op.getName().str();
-                return false;
-            }
-            if (composite_op->getNumOperands() != 1 || composite_op->getNumResults() != 2) {
-                error = "top_k composite must have one operand and two results";
-                return false;
-            }
-            auto k = topKCompositeK(composite_op);
-            if (!k) {
-                error = "top_k composite is missing k";
-                return false;
-            }
+        if (auto top_k = topKLikeOp(&op)) {
             if (!addTopKOp(
-                    composite_op->getOperand(0),
-                    composite_op->getResult(0),
-                    composite_op->getResult(1),
-                    *k,
+                    top_k->operand,
+                    top_k->values,
+                    top_k->indices,
+                    top_k->k,
                     executable,
                     value_ids,
                     error)) {
                 return false;
             }
             continue;
+        }
+
+        if (auto composite_op = mlir::dyn_cast<mlir::stablehlo::CompositeOp>(op)) {
+            error = "unsupported stablehlo composite: " + composite_op.getName().str();
+            return false;
         }
 
         if (auto concatenate_op = mlir::dyn_cast<mlir::stablehlo::ConcatenateOp>(op)) {
@@ -3006,7 +3052,8 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
 
         if (auto custom_call_op = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
             if (custom_call_op->getNumResults() != 1) {
-                error = "only single-result custom_call ops are currently supported";
+                error = "only single-result custom_call ops are currently supported: " +
+                        custom_call_op.getCallTargetName().str();
                 return false;
             }
 
@@ -3198,7 +3245,7 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
             }
             if (epilogue.has_value()) {
                 matmul_top_k_covered_ops.insert(epilogue->flatten.getOperation());
-                matmul_top_k_covered_ops.insert(epilogue->top_k.getOperation());
+                matmul_top_k_covered_ops.insert(epilogue->top_k.op);
             }
             continue;
         }
