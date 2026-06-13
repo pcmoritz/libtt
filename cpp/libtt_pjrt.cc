@@ -3,6 +3,8 @@
 #include "cpp/pjrt_buffer.h"
 #include "mlir/executable.pb.h"
 
+#include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +15,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -69,80 +72,9 @@ struct ExecutableMetadata {
   std::vector<PJRT_Buffer_Type> output_types;
   std::vector<int64_t> output_dims;
   std::vector<size_t> output_dim_sizes;
-  std::vector<std::string> output_memory_kinds;
   std::vector<const char*> output_memory_kind_ptrs;
   std::vector<size_t> output_memory_kind_sizes;
   std::string executable_proto;
-
-  ExecutableMetadata() = default;
-
-  ExecutableMetadata(const ExecutableMetadata& other)
-      : name(other.name),
-        fingerprint(other.fingerprint),
-        num_outputs(other.num_outputs),
-        output_types(other.output_types),
-        output_dims(other.output_dims),
-        output_dim_sizes(other.output_dim_sizes),
-        output_memory_kinds(other.output_memory_kinds),
-        output_memory_kind_sizes(other.output_memory_kind_sizes),
-        executable_proto(other.executable_proto) {
-    RefreshMemoryKindPointers();
-  }
-
-  ExecutableMetadata& operator=(const ExecutableMetadata& other) {
-    if (this == &other) {
-      return *this;
-    }
-    name = other.name;
-    fingerprint = other.fingerprint;
-    num_outputs = other.num_outputs;
-    output_types = other.output_types;
-    output_dims = other.output_dims;
-    output_dim_sizes = other.output_dim_sizes;
-    output_memory_kinds = other.output_memory_kinds;
-    output_memory_kind_sizes = other.output_memory_kind_sizes;
-    executable_proto = other.executable_proto;
-    RefreshMemoryKindPointers();
-    return *this;
-  }
-
-  ExecutableMetadata(ExecutableMetadata&& other) noexcept
-      : name(std::move(other.name)),
-        fingerprint(std::move(other.fingerprint)),
-        num_outputs(other.num_outputs),
-        output_types(std::move(other.output_types)),
-        output_dims(std::move(other.output_dims)),
-        output_dim_sizes(std::move(other.output_dim_sizes)),
-        output_memory_kinds(std::move(other.output_memory_kinds)),
-        output_memory_kind_sizes(std::move(other.output_memory_kind_sizes)),
-        executable_proto(std::move(other.executable_proto)) {
-    RefreshMemoryKindPointers();
-  }
-
-  ExecutableMetadata& operator=(ExecutableMetadata&& other) noexcept {
-    if (this == &other) {
-      return *this;
-    }
-    name = std::move(other.name);
-    fingerprint = std::move(other.fingerprint);
-    num_outputs = other.num_outputs;
-    output_types = std::move(other.output_types);
-    output_dims = std::move(other.output_dims);
-    output_dim_sizes = std::move(other.output_dim_sizes);
-    output_memory_kinds = std::move(other.output_memory_kinds);
-    output_memory_kind_sizes = std::move(other.output_memory_kind_sizes);
-    executable_proto = std::move(other.executable_proto);
-    RefreshMemoryKindPointers();
-    return *this;
-  }
-
-  void RefreshMemoryKindPointers() {
-    output_memory_kind_ptrs.clear();
-    output_memory_kind_ptrs.reserve(output_memory_kinds.size());
-    for (const std::string& kind : output_memory_kinds) {
-      output_memory_kind_ptrs.push_back(kind.data());
-    }
-  }
 };
 
 struct PJRT_Executable {
@@ -176,6 +108,7 @@ constexpr const char* kPlatformName = "tt";
 constexpr const char* kPlatformVersion = "libtt cpp pjrt 0.1.0";
 constexpr const char* kDefaultDeviceRoot = "/dev/tenstorrent";
 constexpr const char* kExecutableName = "tt.executable.v1";
+constexpr std::string_view kDeviceMemoryKind = "device";
 
 PJRT_Error* CloneEventError(const PJRT_Event* event) {
   if (event == nullptr || !event->error.has_value()) {
@@ -184,10 +117,18 @@ PJRT_Error* CloneEventError(const PJRT_Event* event) {
   return MakePjrtError(event->error->first, event->error->second);
 }
 
-PJRT_Event* ReadyEvent() { return new PJRT_Event{true, std::nullopt}; }
+PJRT_Event* ReadyEvent() {
+  auto event = std::make_unique<PJRT_Event>();
+  event->ready = true;
+  event->error = std::nullopt;
+  return event.release();
+}
 
 PJRT_Event* EventWithError(PJRT_Error_Code code, std::string message) {
-  return new PJRT_Event{true, std::make_pair(code, std::move(message))};
+  auto event = std::make_unique<PJRT_Event>();
+  event->ready = true;
+  event->error = std::make_pair(code, std::move(message));
+  return event.release();
 }
 
 std::string CopyString(std::string_view value) { return std::string(value.data(), value.size()); }
@@ -281,8 +222,8 @@ ExecutableMetadata MakeExecutableMetadata(const tt::AnalysisResult& analysis) {
   ExecutableMetadata metadata;
   metadata.name = kExecutableName;
   metadata.num_outputs = static_cast<size_t>(analysis.outputs_size());
-  metadata.output_memory_kinds.assign(metadata.num_outputs, "device");
-  metadata.output_memory_kind_sizes.assign(metadata.num_outputs, std::string_view("device").size());
+  metadata.output_memory_kind_ptrs.assign(metadata.num_outputs, kDeviceMemoryKind.data());
+  metadata.output_memory_kind_sizes.assign(metadata.num_outputs, kDeviceMemoryKind.size());
   metadata.output_types.reserve(metadata.num_outputs);
   metadata.output_dim_sizes.reserve(metadata.num_outputs);
   for (const tt::TensorDesc& tensor : analysis.outputs()) {
@@ -297,7 +238,6 @@ ExecutableMetadata MakeExecutableMetadata(const tt::AnalysisResult& analysis) {
   if (analysis.has_executable()) {
     metadata.executable_proto = analysis.executable().SerializeAsString();
   }
-  metadata.RefreshMemoryKindPointers();
   return metadata;
 }
 
@@ -362,13 +302,15 @@ std::vector<int> DiscoverDeviceIds() {
       break;
     }
     const std::string name = entry.path().filename().string();
-    if (name.empty() ||
-        !std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isdigit(c); })) {
+    if (name.empty()) {
       continue;
     }
-    try {
-      ids.push_back(std::stoi(name));
-    } catch (...) {
+    int id = 0;
+    const char* begin = name.data();
+    const char* end = begin + name.size();
+    const auto [ptr, parse_ec] = std::from_chars(begin, end, id);
+    if (parse_ec == std::errc() && ptr == end && id >= 0) {
+      ids.push_back(id);
     }
   }
   std::sort(ids.begin(), ids.end());
@@ -377,7 +319,7 @@ std::vector<int> DiscoverDeviceIds() {
 }
 
 PJRT_Client* CreateClient() {
-  auto* client = new PJRT_Client;
+  auto client = std::make_unique<PJRT_Client>();
   client->platform_name = kPlatformName;
   client->platform_version = kPlatformVersion;
 
@@ -439,7 +381,7 @@ PJRT_Client* CreateClient() {
     client->topology.device_description_ptrs.push_back(&description);
   }
 
-  return client;
+  return client.release();
 }
 
 PJRT_Device* SelectTargetDevice(PJRT_Client* client, PJRT_Device* device, PJRT_Memory* memory) {
@@ -738,7 +680,10 @@ extern "C" PJRT_Error* TT_Event_Create(PJRT_Event_Create_Args* args) {
   if (args == nullptr) {
     return InvalidArgument("args must not be null");
   }
-  args->event = new PJRT_Event{false, std::nullopt};
+  auto event = std::make_unique<PJRT_Event>();
+  event->ready = false;
+  event->error = std::nullopt;
+  args->event = event.release();
   return nullptr;
 }
 
@@ -881,11 +826,11 @@ extern "C" PJRT_Error* TT_Client_Compile(PJRT_Client_Compile_Args* args) {
   if (PJRT_Error* error = AnalyzeProgramToMetadata(*args->program, &metadata)) {
     return error;
   }
-  args->executable = new PJRT_LoadedExecutable{
-      std::move(metadata),
-      args->client->addressable_device_ptrs,
-      false,
-  };
+  auto executable = std::make_unique<PJRT_LoadedExecutable>();
+  executable->metadata = std::move(metadata);
+  executable->addressable_devices = args->client->addressable_device_ptrs;
+  executable->deleted = false;
+  args->executable = executable.release();
   return nullptr;
 }
 
@@ -897,7 +842,9 @@ extern "C" PJRT_Error* TT_Compile(PJRT_Compile_Args* args) {
   if (PJRT_Error* error = AnalyzeProgramToMetadata(*args->program, &metadata)) {
     return error;
   }
-  args->executable = new PJRT_Executable{std::move(metadata)};
+  auto executable = std::make_unique<PJRT_Executable>();
+  executable->metadata = std::move(metadata);
+  args->executable = executable.release();
   return nullptr;
 }
 
@@ -1075,7 +1022,9 @@ extern "C" PJRT_Error* TT_LoadedExecutable_GetExecutable(
   if (args == nullptr || args->loaded_executable == nullptr) {
     return InvalidArgument("loaded_executable must not be null");
   }
-  args->executable = new PJRT_Executable{args->loaded_executable->metadata};
+  auto executable = std::make_unique<PJRT_Executable>();
+  executable->metadata = args->loaded_executable->metadata;
+  args->executable = executable.release();
   return nullptr;
 }
 
@@ -1355,7 +1304,8 @@ extern "C" PJRT_Error* TT_Device_GetAttributes(PJRT_Device_GetAttributes_Args* a
   }
   args->attributes = nullptr;
   args->num_attributes = 0;
-  args->device_attributes = new PJRT_Device_Attributes;
+  auto attributes = std::make_unique<PJRT_Device_Attributes>();
+  args->device_attributes = attributes.release();
   args->attributes_deleter = TT_Device_Attributes_Delete;
   return nullptr;
 }
@@ -1604,7 +1554,8 @@ extern "C" PJRT_Error* TT_ExecuteContext_Create(PJRT_ExecuteContext_Create_Args*
   if (args == nullptr) {
     return InvalidArgument("args must not be null");
   }
-  args->context = new PJRT_ExecuteContext;
+  auto context = std::make_unique<PJRT_ExecuteContext>();
+  args->context = context.release();
   return nullptr;
 }
 

@@ -352,17 +352,17 @@ PJRT_Error* CreatePjrtBufferFromHostBytes(PJRT_Buffer_Type type,
   }
   auto host_storage = std::make_unique<PjrtHostBufferStorage>(std::move(*host_tensor));
 
-  *out = new PJRT_Buffer{
-      type,
-      dims,
-      target_device,
-      target_memory,
-      std::move(host_storage),
-      std::move(allocation_dims),
-      std::nullopt,
-      false,
-      0,
-  };
+  auto buffer = std::make_unique<PJRT_Buffer>();
+  buffer->buffer_type = type;
+  buffer->dims = dims;
+  buffer->device = target_device;
+  buffer->memory = target_memory;
+  buffer->storage = std::move(host_storage);
+  buffer->allocation_dims = std::move(allocation_dims);
+  buffer->source_shape = std::nullopt;
+  buffer->deleted = false;
+  buffer->external_reference_count = 0;
+  *out = buffer.release();
   return nullptr;
 }
 

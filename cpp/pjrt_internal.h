@@ -3,6 +3,7 @@
 
 #include "xla/pjrt/c/pjrt_c_api.h"
 
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -12,7 +13,10 @@ struct PJRT_Error {
 };
 
 inline PJRT_Error* MakePjrtError(PJRT_Error_Code code, std::string message) {
-  return new PJRT_Error{code, std::move(message)};
+  auto error = std::make_unique<PJRT_Error>();
+  error->code = code;
+  error->message = std::move(message);
+  return error.release();
 }
 
 inline PJRT_Error* InvalidArgument(std::string message) {
