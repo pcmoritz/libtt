@@ -9,10 +9,6 @@ from pathlib import Path
 import jax
 import ml_dtypes
 import numpy as np
-import torch
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
-from transformers import AutoTokenizer
 
 jax.config.update("jax_use_shardy_partitioner", False)
 
@@ -93,6 +89,7 @@ def parse_args():
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--raw-prompt", action="store_true")
     parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--byte-tokenizer", action="store_true")
     parser.add_argument("--random-weights", action="store_true")
     parser.add_argument("--prompt", default="Write a short sentence about Tenstorrent hardware.")
     parser.add_argument("--max-new-tokens", type=int, default=32)
@@ -155,6 +152,8 @@ def resolve_model_dir(args) -> Path:
     if model_path.exists():
         return model_path
 
+    from huggingface_hub import snapshot_download
+
     allow_patterns = [
         "config.json",
         "generation_config.json",
@@ -181,6 +180,8 @@ def resolve_model_dir(args) -> Path:
 
 
 def load_hf_tokenizer(model_dir: Path) -> HuggingFaceTokenizer:
+    from transformers import AutoTokenizer
+
     return HuggingFaceTokenizer(
         AutoTokenizer.from_pretrained(
             model_dir,
@@ -300,26 +301,53 @@ def safetensor_files(model_dir: Path) -> list[Path]:
     return files
 
 
-def tensor_to_numpy(tensor, np_dtype):
-    tensor = tensor.detach().cpu().contiguous()
-    if np.dtype(np_dtype) == np.dtype(ml_dtypes.bfloat16):
-        if tensor.dtype == torch.bfloat16:
-            int_dtype = torch.uint16 if hasattr(torch, "uint16") else torch.int16
-            return tensor.view(int_dtype).numpy().view(np.uint16).view(ml_dtypes.bfloat16)
-        return tensor.numpy().astype(np_dtype, copy=False)
+def safetensors_dtype(raw_dtype: str):
+    if raw_dtype == "BF16":
+        return np.uint16, ml_dtypes.bfloat16
+    if raw_dtype == "F32":
+        return np.float32, np.float32
+    if raw_dtype == "F16":
+        return np.float16, np.float16
+    if raw_dtype == "I32":
+        return np.int32, np.int32
+    if raw_dtype == "U32":
+        return np.uint32, np.uint32
+    raise ValueError(f"unsupported safetensors dtype {raw_dtype!r}")
 
-    if tensor.dtype == torch.bfloat16:
-        return tensor.to(torch.float32).numpy().astype(np_dtype, copy=False)
-    return tensor.numpy().astype(np_dtype, copy=False)
+
+def load_safetensors_arrays(path: Path, np_dtype):
+    arrays = {}
+    with path.open("rb") as f:
+        header_size = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(header_size).decode("utf-8"))
+
+    data_offset = 8 + header_size
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        storage_dtype, logical_dtype = safetensors_dtype(meta["dtype"])
+        shape = tuple(int(dim) for dim in meta["shape"])
+        start, end = (int(offset) for offset in meta["data_offsets"])
+        expected_bytes = int(np.prod(shape, dtype=np.int64)) * np.dtype(storage_dtype).itemsize
+        if end - start != expected_bytes:
+            raise ValueError(f"tensor {name!r} byte size does not match its shape")
+        raw = np.memmap(
+            path,
+            mode="r",
+            dtype=storage_dtype,
+            offset=data_offset + start,
+            shape=shape,
+        )
+        tensor = raw.view(logical_dtype) if logical_dtype is ml_dtypes.bfloat16 else raw
+        arrays[name] = np.ascontiguousarray(tensor.astype(np_dtype, copy=False))
+    return arrays
 
 
 def load_checkpoint_arrays(model_dir: Path, np_dtype):
     arrays = {}
 
     for path in safetensor_files(model_dir):
-        with safe_open(path, framework="pt", device="cpu") as f:
-            for name in f.keys():
-                arrays[name] = tensor_to_numpy(f.get_tensor(name), np_dtype)
+        arrays.update(load_safetensors_arrays(path, np_dtype))
 
     return arrays
 
@@ -512,8 +540,12 @@ def main():
     else:
         model_dir = resolve_model_dir(args)
         config = load_hf_config(model_dir, args.max_seq_len)
-        tokenizer = load_hf_tokenizer(model_dir)
-        input_ids = tokenizer.encode(args.prompt, args.raw_prompt, args.thinking)
+        if args.byte_tokenizer:
+            tokenizer = ByteTokenizer()
+            input_ids = tokenizer.encode(args.prompt)
+        else:
+            tokenizer = load_hf_tokenizer(model_dir)
+            input_ids = tokenizer.encode(args.prompt, args.raw_prompt, args.thinking)
         weights_host = load_hf_weights(config, model_dir, np_dtype)
 
     if input_ids.size + args.max_new_tokens > config.max_position_embeddings:
