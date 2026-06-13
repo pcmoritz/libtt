@@ -81,7 +81,7 @@ cc_library(
 cc_library(
     name = "ttnn_tensor",
     deps = [
-        "//third_party/tt_metal:tt_metal_disabled_optional_runtime",
+        "//third_party/tt_metal:tt_metal_disabled_fabric_compat",
         "@tt_metal//:ttnn_tensor_upstream",
     ],
     linkstatic = True,
