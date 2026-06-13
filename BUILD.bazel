@@ -76,8 +76,8 @@ cc_library(
     copts = ["-std=c++20"],
     includes = ["third_party/openxla"],
     deps = [
-        "//third_party/tt_metal:tt_metal_disabled_optional_runtime",
-        "@tt_metal//:ttnn_matmul_upstream",
+        "//third_party/tt_metal:tt_metal_disabled_fabric_compat",
+        "@tt_metal//:ttnn_tensor_upstream",
     ],
     linkstatic = True,
 )
@@ -92,16 +92,15 @@ cc_library(
     ],
     copts = ["-std=c++20"],
     includes = ["third_party/openxla"],
-    deps = [":tt_metal_host_tensor"],
+    deps = [":ttnn_tensor"],
     linkstatic = True,
 )
 
 cc_library(
-    name = "tt_metal_host_tensor",
+    name = "ttnn_tensor",
     deps = [
-        "//third_party/tt_metal:tt_metal_disabled_optional_runtime",
-        "@tt_metal//:tt_metal_host_tensor_upstream",
-        "@tt_metal//:tt_metal_device_tensor_upstream",
+        "//third_party/tt_metal:tt_metal_disabled_fabric_compat",
+        "@tt_metal//:ttnn_tensor_upstream",
     ],
     linkstatic = True,
 )
@@ -125,10 +124,10 @@ cc_test(
 )
 
 cc_test(
-    name = "tt_metal_host_tensor_test",
-    srcs = ["cpp/tt_metal_host_tensor_test.cc"],
+    name = "ttnn_tensor_test",
+    srcs = ["cpp/ttnn_tensor_test.cc"],
     copts = ["-std=c++20"],
-    deps = [":tt_metal_host_tensor"],
+    deps = [":ttnn_tensor"],
 )
 
 filegroup(

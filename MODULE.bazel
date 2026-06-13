@@ -165,6 +165,7 @@ http_archive(
         "//third_party/tt_metal:disable_fabric_rtoptions.patch",
         "//third_party/tt_metal:remove_unsupported_sfpi_dyninit_flag.patch",
         "//third_party/tt_metal:split_jit_runtime_asset_root.patch",
+        "//third_party/tt_metal:disable_inspector_runtime.patch",
     ],
     sha256 = "b4d05d0e498e626a0d5455f5c6a379aa1b7ac4f1ca76f8f72dad4f7370223bf7",
     strip_prefix = "tt-metal-16e79a784996b0608f809a186f5816dd07e86d39",

@@ -89,12 +89,12 @@ genrule(
           "llrt_outdir=$$(dirname $(location llrt/hal/generated/dev_msgs.hpp)); " +
           "bash $(location tt_metal/llrt/hal/codegen/codegen.sh) $$root $$outdir; " +
           "mkdir -p $$llrt_outdir; " +
-          "cp $(location hal/generated/dev_msgs.hpp) $(location llrt/hal/generated/dev_msgs.hpp); " +
-          "cp $(location hal/generated/dev_msgs_impl.hpp) $(location llrt/hal/generated/dev_msgs_impl.hpp); " +
-          "cp $(location hal/generated/fabric_telemetry.hpp) $(location llrt/hal/generated/fabric_telemetry.hpp); " +
-          "cp $(location hal/generated/fabric_telemetry_impl.hpp) $(location llrt/hal/generated/fabric_telemetry_impl.hpp); " +
-          "cp $(location hal/generated/realtime_profiler_msgs.hpp) $(location llrt/hal/generated/realtime_profiler_msgs.hpp); " +
-          "cp $(location hal/generated/realtime_profiler_msgs_impl.hpp) $(location llrt/hal/generated/realtime_profiler_msgs_impl.hpp)",
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/dev_msgs.hpp\"' > $(location llrt/hal/generated/dev_msgs.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/dev_msgs_impl.hpp\"' > $(location llrt/hal/generated/dev_msgs_impl.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/fabric_telemetry.hpp\"' > $(location llrt/hal/generated/fabric_telemetry.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/fabric_telemetry_impl.hpp\"' > $(location llrt/hal/generated/fabric_telemetry_impl.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/realtime_profiler_msgs.hpp\"' > $(location llrt/hal/generated/realtime_profiler_msgs.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include \"hal/generated/realtime_profiler_msgs_impl.hpp\"' > $(location llrt/hal/generated/realtime_profiler_msgs_impl.hpp)",
     tools = [
         "tt_metal/llrt/hal/codegen/codegen.py",
         "tt_metal/llrt/hal/codegen/codegen.sh",
@@ -937,18 +937,21 @@ cc_library(
 )
 
 cc_library(
-    name = "ttnn_matmul_upstream",
+    name = "ttnn_tensor_upstream",
     srcs = [
         "ttnn/core/async_runtime.cpp",
+        "ttnn/core/cluster.cpp",
         "ttnn/core/config.cpp",
         "ttnn/core/core.cpp",
         "ttnn/core/device_operation_detail.cpp",
         "ttnn/core/distributed/api.cpp",
+        "ttnn/core/distributed/host_ccl.cpp",
         "ttnn/core/events.cpp",
         "ttnn/core/global_circular_buffer.cpp",
         "ttnn/core/global_semaphore.cpp",
         "ttnn/core/graph/graph_processor.cpp",
         "ttnn/core/operation.cpp",
+        "ttnn/core/reports.cpp",
         "ttnn/core/tensor/host_buffer/functions.cpp",
         "ttnn/core/tensor/storage.cpp",
         "ttnn/core/tensor/tensor.cpp",
@@ -963,6 +966,7 @@ cc_library(
         "ttnn/cpp/ttnn/operations/core/to_dtype/to_dtype_op.cpp",
         "ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp",
         "ttnn/cpp/ttnn/operations/core/to_memory_config/to_memory_config_op.cpp",
+        "ttnn/cpp/ttnn/operations/ccl/ccl_op_fusion.cpp",
         "ttnn/cpp/ttnn/operations/compute_throttle_utils.cpp",
         "ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp",
         "ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_utils.cpp",

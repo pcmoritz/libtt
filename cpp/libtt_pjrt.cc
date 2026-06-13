@@ -1515,7 +1515,7 @@ extern "C" PJRT_Error* TT_Buffer_OnDeviceSizeInBytes(
     return FailedPrecondition("buffer has been deleted");
   }
   size_t size = 0;
-  if (PJRT_Error* error = HostTensorPhysicalByteSize(*args->buffer, &size)) {
+  if (PJRT_Error* error = TtnnTensorPhysicalByteSize(*args->buffer, &size)) {
     return error;
   }
   args->on_device_size_in_bytes = size;

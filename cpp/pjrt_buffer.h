@@ -6,21 +6,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <vector>
 
 struct PJRT_Device;
 struct PJRT_Memory;
-struct PjrtHostBufferStorage;
+struct PjrtTensorStorage;
 
 struct PJRT_Buffer {
   PJRT_Buffer_Type buffer_type;
   std::vector<int64_t> dims;
   PJRT_Device* device;
   PJRT_Memory* memory;
-  std::unique_ptr<PjrtHostBufferStorage> storage;
-  std::vector<int64_t> allocation_dims;
-  std::optional<std::vector<int64_t>> source_shape;
+  std::unique_ptr<PjrtTensorStorage> storage;
   bool deleted;
   size_t external_reference_count;
 
@@ -46,6 +43,6 @@ PJRT_Error* CreatePjrtBufferFromHostBytes(PJRT_Buffer_Type type,
                                           PJRT_Buffer** out);
 void DeletePjrtBufferStorage(PJRT_Buffer* buffer);
 PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::byte>* out);
-PJRT_Error* HostTensorPhysicalByteSize(const PJRT_Buffer& buffer, size_t* out);
+PJRT_Error* TtnnTensorPhysicalByteSize(const PJRT_Buffer& buffer, size_t* out);
 
 #endif  // LIBTT_CPP_PJRT_BUFFER_H_
