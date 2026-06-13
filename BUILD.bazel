@@ -58,9 +58,23 @@ cc_library(
     deps = [
         ":executable_cc_proto",
         ":mlir_frontend",
-        ":tt_metal_host_tensor",
+        ":tt_pjrt_buffer",
         "@com_google_protobuf//:protobuf_lite",
     ],
+    linkstatic = True,
+)
+
+cc_library(
+    name = "tt_pjrt_buffer",
+    srcs = ["cpp/pjrt_buffer.cc"],
+    hdrs = [
+        "cpp/pjrt_buffer.h",
+        "cpp/pjrt_internal.h",
+        "third_party/openxla/xla/pjrt/c/pjrt_c_api.h",
+    ],
+    copts = ["-std=c++20"],
+    includes = ["third_party/openxla"],
+    deps = [":tt_metal_host_tensor"],
     linkstatic = True,
 )
 
