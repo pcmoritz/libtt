@@ -15,13 +15,10 @@
 #include <tt_metal/impl/debug/noc_logging.hpp>
 #include <tt_metal/impl/debug/dprint_server.hpp>
 #include <tt_metal/impl/debug/watcher_server.hpp>
-#include <ttnn/cluster.hpp>
-#include <ttnn/distributed/host_ccl.hpp>
-#include <ttnn/operations/ccl/ccl_op_fusion.hpp>
-#include <ttnn/reports.hpp>
 
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -130,85 +127,6 @@ extern "C" void LibttInspectorProgramCompileFinished(const void*, const void*, u
 extern "C" void LibttInspectorProgramSetBinaryStatus(const void*, unsigned long, int)
     asm("_ZN2tt8tt_metal9Inspector25program_set_binary_statusEPKNS0_6detail11ProgramImplEmNS0_19ProgramBinaryStatusE");
 extern "C" void LibttInspectorProgramSetBinaryStatus(const void*, unsigned long, int) {}
-
-namespace ttnn::distributed::host_ccl {
-
-Tensor all_gather(const Tensor& tensor) { return tensor; }
-
-}  // namespace ttnn::distributed::host_ccl
-
-namespace ttnn::cluster {
-
-tt::tt_metal::ClusterType get_cluster_type() { return tt::tt_metal::ClusterType::N150; }
-std::string serialize_cluster_descriptor() { return {}; }
-
-}  // namespace ttnn::cluster
-
-namespace ttnn::reports {
-
-DeviceInfo get_device_info(tt::tt_metal::distributed::MeshDevice*) { return {}; }
-std::vector<BufferInfo> get_buffers(const std::vector<tt::tt_metal::distributed::MeshDevice*>&) { return {}; }
-std::vector<BufferPageInfo> get_buffer_pages(const std::vector<tt::tt_metal::distributed::MeshDevice*>&) {
-  return {};
-}
-
-}  // namespace ttnn::reports
-
-namespace ttnn::experimental::ccl {
-
-void MatmulFusedOpSignaler::init_all_gather(uint32_t,
-                                            uint32_t,
-                                            uint32_t,
-                                            uint32_t,
-                                            uint32_t,
-                                            bool,
-                                            uint32_t) {}
-
-void MatmulFusedOpSignaler::init_llama_all_gather(uint32_t,
-                                                  uint32_t,
-                                                  uint32_t,
-                                                  uint32_t,
-                                                  uint32_t,
-                                                  uint32_t,
-                                                  uint32_t) {}
-
-void MatmulFusedOpSignaler::init_reduce_scatter(const std::vector<CoreCoord>&,
-                                                const std::vector<uint32_t>&,
-                                                FusedOpSignalerMode) {}
-
-void MatmulFusedOpSignaler::init_llama_rs_cores_rs(const CoreRangeSet&, tt::tt_metal::Program&) {}
-
-void MatmulFusedOpSignaler::init_llama_rs_cores_mm(const CoreRangeSet&,
-                                                   tt::tt_metal::Program&,
-                                                   const tt::tt_metal::IDevice*,
-                                                   int) {}
-
-void MatmulFusedOpSignaler::push_llama_rs_rt_args_for_rs(std::vector<uint32_t>&) const {}
-
-void MatmulFusedOpSignaler::push_llama_rs_rt_args_for_mm(std::vector<uint32_t>&,
-                                                         CoreCoord,
-                                                         tt::tt_metal::NOC,
-                                                         const tt::tt_metal::IDevice*) const {}
-
-void MatmulFusedOpSignaler::init_fused_op(tt::tt_metal::Program&,
-                                          const tt::tt_metal::IDevice*,
-                                          const CoreRange&,
-                                          const std::vector<CoreCoord>&) {}
-
-void MatmulFusedOpSignaler::init_fused_op(tt::tt_metal::Program&,
-                                          const tt::tt_metal::IDevice*,
-                                          const std::variant<CoreRange, CoreRangeSet>&,
-                                          FusedOpSignalerMode) {}
-
-bool MatmulFusedOpSignaler::is_all_gather() const { return false; }
-bool MatmulFusedOpSignaler::is_reduce_scatter() const { return false; }
-bool MatmulFusedOpSignaler::is_llama_reduce_scatter() const { return false; }
-bool MatmulFusedOpSignaler::is_llama_all_gather() const { return false; }
-
-void MatmulFusedOpSignaler::push_matmul_fused_op_rt_args(std::vector<uint32_t>&, uint32_t, uint32_t) {}
-void MatmulFusedOpSignaler::push_matmul_fused_op_rt_args(std::vector<uint32_t>&, bool) {}
-
-}  // namespace ttnn::experimental::ccl
 
 namespace tt {
 
