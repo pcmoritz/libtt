@@ -92,50 +92,6 @@ void WatcherServer::isolated_dump(std::vector<ChipId>&) {}
 
 }  // namespace tt::tt_metal
 
-extern "C" void LibttInspectorMeshWorkloadCreated(const void*)
-    asm("_ZN2tt8tt_metal9Inspector21mesh_workload_createdEPKNS0_11distributed16MeshWorkloadImplE");
-extern "C" void LibttInspectorMeshWorkloadCreated(const void*) {}
-
-extern "C" void LibttInspectorMeshWorkloadDestroyed(const void*)
-    asm("_ZN2tt8tt_metal9Inspector23mesh_workload_destroyedEPKNS0_11distributed16MeshWorkloadImplE");
-extern "C" void LibttInspectorMeshWorkloadDestroyed(const void*) {}
-
-extern "C" void LibttInspectorMeshWorkloadAddProgram(const void*, const void*, unsigned long)
-    asm("_ZN2tt8tt_metal9Inspector25mesh_workload_add_programEPKNS0_11distributed16MeshWorkloadImplERKNS2_19MeshCoordinateRangeEm");
-extern "C" void LibttInspectorMeshWorkloadAddProgram(const void*, const void*, unsigned long) {}
-
-extern "C" void LibttInspectorMeshWorkloadSetProgramBinaryStatus(const void*, unsigned long, int)
-    asm("_ZN2tt8tt_metal9Inspector39mesh_workload_set_program_binary_statusEPKNS0_11distributed16MeshWorkloadImplEmNS0_19ProgramBinaryStatusE");
-extern "C" void LibttInspectorMeshWorkloadSetProgramBinaryStatus(const void*, unsigned long, int) {}
-
-extern "C" void LibttInspectorProgramCreated(const void*)
-    asm("_ZN2tt8tt_metal9Inspector15program_createdEPKNS0_6detail11ProgramImplE");
-extern "C" void LibttInspectorProgramCreated(const void*) {}
-
-extern "C" void LibttInspectorProgramDestroyed(const void*)
-    asm("_ZN2tt8tt_metal9Inspector17program_destroyedEPKNS0_6detail11ProgramImplE");
-extern "C" void LibttInspectorProgramDestroyed(const void*) {}
-
-extern "C" void LibttInspectorProgramKernelCompileFinished(const void*, const void*, const void*, const void*)
-    asm("_ZN2tt8tt_metal9Inspector31program_kernel_compile_finishedEPKNS0_6detail11ProgramImplEPKNS0_7IDeviceERKSt10shared_ptrINS0_6KernelEERKNS0_15JitBuildOptionsE");
-extern "C" void LibttInspectorProgramKernelCompileFinished(const void*, const void*, const void*, const void*) {}
-
-extern "C" void LibttInspectorProgramCompileAlreadyExists(const void*, const void*, unsigned long)
-    asm("_ZN2tt8tt_metal9Inspector30program_compile_already_existsEPKNS0_6detail11ProgramImplEPKNS0_7IDeviceEm");
-extern "C" void LibttInspectorProgramCompileAlreadyExists(const void*, const void*, unsigned long) {}
-
-extern "C" void LibttInspectorProgramCompileStarted(const void*, const void*, unsigned long)
-    asm("_ZN2tt8tt_metal9Inspector23program_compile_startedEPKNS0_6detail11ProgramImplEPKNS0_7IDeviceEm");
-extern "C" void LibttInspectorProgramCompileStarted(const void*, const void*, unsigned long) {}
-
-extern "C" void LibttInspectorProgramCompileFinished(const void*, const void*, unsigned long)
-    asm("_ZN2tt8tt_metal9Inspector24program_compile_finishedEPKNS0_6detail11ProgramImplEPKNS0_7IDeviceEm");
-extern "C" void LibttInspectorProgramCompileFinished(const void*, const void*, unsigned long) {}
-
-extern "C" void LibttInspectorProgramSetBinaryStatus(const void*, unsigned long, int)
-    asm("_ZN2tt8tt_metal9Inspector25program_set_binary_statusEPKNS0_6detail11ProgramImplEmNS0_19ProgramBinaryStatusE");
-extern "C" void LibttInspectorProgramSetBinaryStatus(const void*, unsigned long, int) {}
-
 namespace tt {
 
 void ClearNocData(tt_metal::MetalEnvImpl&, ChipId) {}
