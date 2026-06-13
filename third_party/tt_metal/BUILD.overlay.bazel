@@ -110,6 +110,92 @@ filegroup(
     ],
 )
 
+BLACKHOLE_RUNTIME_PROCS = [
+    ("brisc", "brisc"),
+    ("ncrisc", "ncrisc"),
+    ("ierisc", "ierisc"),
+    ("subordinate_ierisc", "subordinate_ierisc"),
+    ("trisc=0", "trisc0"),
+    ("trisc=1", "trisc1"),
+    ("trisc=2", "trisc2"),
+    ("aerisc", "aerisc"),
+    ("main_aerisc", "main_aerisc"),
+    ("subordinate_aerisc", "subordinate_aerisc"),
+    ("drisc", "drisc"),
+]
+
+BLACKHOLE_RUNTIME_LD_OUTS = [
+    "runtime/hw/toolchain/blackhole/%s_%s.ld" % (kind, proc_file)
+    for kind in ["firmware", "kernel"]
+    for _, proc_file in BLACKHOLE_RUNTIME_PROCS
+]
+
+BLACKHOLE_RUNTIME_OBJ_OUTS = [
+    "runtime/hw/lib/blackhole/noc.o",
+    "runtime/hw/lib/blackhole/substitutes.o",
+    "runtime/hw/lib/blackhole/tdma_xmov.o",
+    "runtime/hw/lib/blackhole/tmu-crt0.o",
+]
+
+genrule(
+    name = "tt_metal_blackhole_runtime_hw_assets",
+    srcs = glob([
+        "tt_metal/hw/firmware/src/tt-1xx/**/*",
+        "tt_metal/hw/inc/**/*",
+        "tt_metal/hw/toolchain/**/*",
+        "tt_metal/tt-llk/common/**/*",
+        "tt_metal/tt-llk/tt_llk_blackhole/**/*",
+    ], allow_empty = True),
+    tools = [
+        "@sfpi//:all_files",
+        "@sfpi//:riscv_gpp",
+    ],
+    outs = BLACKHOLE_RUNTIME_LD_OUTS + BLACKHOLE_RUNTIME_OBJ_OUTS,
+    cmd = """
+set -eu
+main_ld=$(location tt_metal/hw/toolchain/main.ld)
+root=$${main_ld%/tt_metal/hw/toolchain/main.ld}
+toolchain_out="$(RULEDIR)/runtime/hw/toolchain/blackhole"
+lib_out="$(RULEDIR)/runtime/hw/lib/blackhole"
+mkdir -p "$$toolchain_out" "$$lib_out"
+
+for item in \
+  brisc:brisc \
+  ncrisc:ncrisc \
+  ierisc:ierisc \
+  subordinate_ierisc:subordinate_ierisc \
+  trisc=0:trisc0 \
+  trisc=1:trisc1 \
+  trisc=2:trisc2 \
+  aerisc:aerisc \
+  main_aerisc:main_aerisc \
+  subordinate_aerisc:subordinate_aerisc \
+  drisc:drisc; do
+  proc_define=$${item%%:*}
+  proc_file=$${item##*:}
+  proc_define_upper=$$(printf '%s' "$$proc_define" | tr '[:lower:]' '[:upper:]')
+  for kind in firmware kernel; do
+    kind_upper=$$(printf '%s' "$$kind" | tr '[:lower:]' '[:upper:]')
+    gcc -DTYPE_$$kind_upper -DCOMPILE_FOR_$$proc_define_upper -DARCH_BLACKHOLE \
+      -I"$$root/tt_metal/hw/inc/internal/tt-1xx/blackhole" \
+      -E -P -x c -o "$$toolchain_out/$${kind}_$${proc_file}.ld" \
+      "$$root/tt_metal/hw/toolchain/main.ld"
+  done
+done
+
+gpp=$(location @sfpi//:riscv_gpp)
+common_flags="-mcpu=tt-bh -std=c++17 -flto=auto -ffast-math -fno-use-cxa-atexit -fno-exceptions -Wall -Werror -Wno-deprecated-declarations -Wno-unknown-pragmas -Wno-error=multistatement-macros -Wno-error=parentheses -Wno-error=unused-but-set-variable -Wno-unused-variable -Wno-unused-function -Os -fno-tree-loop-distribute-patterns"
+defines="-DTENSIX_FIRMWARE"
+includes="-I. -I.. -I$$root -I$$root/tt_metal -I$$root/tt_metal/api -I$$root/tt_metal/api/tt-metalium -I$$root/tt_metal/hw/inc -I$$root/tt_metal/hw/inc/debug -I$$root/tt_metal/hw/firmware/src/tt-1xx -I$$root/tt_metal/hw/inc/internal/tt-1xx/blackhole -I$$root/tt_metal/hw/inc/internal/tt-1xx/blackhole/blackhole_defines -I$$root/tt_metal/hw/inc/internal/tt-1xx/blackhole/noc -I$$root/tt_metal/hw/inc/internal/tt-1xx/blackhole/overlay -I$$root/tt_metal/third_party/umd/device/blackhole -I$$root/tt_metal/hw/ckernels/blackhole/metal/common -I$$root/tt_metal/hw/ckernels/blackhole/metal/llk_io -I$$root/tt_metal/tt-llk/tt_llk_blackhole/common/inc -I$$root/tt_metal/tt-llk/tt_llk_blackhole/llk_lib"
+
+"$$gpp" $$common_flags $$defines $$includes -c -o "$$lib_out/substitutes.o" "$$root/tt_metal/hw/toolchain/substitutes.cpp"
+"$$gpp" $$common_flags $$defines $$includes -c -o "$$lib_out/tdma_xmov.o" "$$root/tt_metal/hw/firmware/src/tt-1xx/tdma_xmov.c"
+"$$gpp" $$common_flags $$defines $$includes -c -o "$$lib_out/noc.o" "$$root/tt_metal/hw/firmware/src/tt-1xx/blackhole/noc.c"
+"$$gpp" $$common_flags $$defines $$includes -c -o "$$lib_out/tmu-crt0.o" "$$root/tt_metal/hw/toolchain/tmu-crt0.S"
+""",
+    local = True,
+)
+
 genrule(
     name = "tt_metal_inspector_stub_headers",
     outs = [
@@ -360,6 +446,7 @@ cc_library(
     srcs = [
         "tt_metal/impl/buffers/buffer_distribution_spec.cpp",
         "tt_metal/impl/tensor/host_tensor.cpp",
+        "tt_metal/impl/tensor/host_tensor_factory.cpp",
         "tt_metal/impl/tensor/spec/layout/alignment.cpp",
         "tt_metal/impl/tensor/spec/layout/layout.cpp",
         "tt_metal/impl/tensor/spec/layout/page_config.cpp",
@@ -495,6 +582,30 @@ TT_METAL_RUNTIME_INCLUDE_DIRS = ["inspector_stubs"] + TT_METAL_INCLUDE_DIRS + [
     "tt_metal/llrt",
     "tt_metal/llrt/hal",
 ]
+
+TTNN_RUNTIME_HDRS = glob(
+    [
+        "ttnn/api/**/*.h",
+        "ttnn/api/**/*.hpp",
+        "ttnn/api/**/*.tpp",
+        "ttnn/core/**/*.h",
+        "ttnn/core/**/*.hpp",
+        "ttnn/core/**/*.tpp",
+        "ttnn/cpp/ttnn/**/*.h",
+        "ttnn/cpp/ttnn/**/*.hpp",
+        "ttnn/cpp/ttnn/**/*.tpp",
+    ],
+    allow_empty = True,
+)
+
+TTNN_RUNTIME_INCLUDE_DIRS = [
+    "ttnn",
+    "ttnn/api",
+    "ttnn/api/ttnn",
+    "ttnn/core",
+    "ttnn/cpp",
+    "ttnn/cpp/ttnn",
+] + TT_METAL_RUNTIME_INCLUDE_DIRS
 
 TT_METAL_RUNTIME_COPTS = [
     "-std=c++20",
@@ -678,12 +789,21 @@ cc_library(
         "tt_metal/distributed/named_shm.cpp",
         "tt_metal/distributed/pcie_core_writer.cpp",
         "tt_metal/distributed/pinned_memory.cpp",
+        "tt_metal/distributed/pinned_memory_cache.cpp",
         "tt_metal/distributed/realtime_profiler_manager.cpp",
         "tt_metal/distributed/sd_mesh_command_queue.cpp",
         "tt_metal/distributed/shm_resource_tracker.cpp",
         "tt_metal/distributed/system_mesh.cpp",
         ":tt_metal_inspector_stub_source",
         "tt_metal/fabric/fabric_types.cpp",
+        "tt_metal/hal.cpp",
+        "tt_metal/impl/allocator/algorithms/free_list_opt.cpp",
+        "tt_metal/impl/allocator/allocator.cpp",
+        "tt_metal/impl/allocator/allocator_state.cpp",
+        "tt_metal/impl/allocator/bank_manager.cpp",
+        "tt_metal/impl/allocator/l1_banking_allocator.cpp",
+        "tt_metal/impl/buffers/buffer.cpp",
+        "tt_metal/impl/buffers/buffer_page_mapping.cpp",
         "tt_metal/impl/buffers/circular_buffer.cpp",
         "tt_metal/impl/buffers/circular_buffer_config.cpp",
         "tt_metal/impl/buffers/dispatch.cpp",
@@ -707,6 +827,7 @@ cc_library(
         "tt_metal/impl/data_format/mxfp4.cpp",
         "tt_metal/impl/data_format/mxfp6.cpp",
         "tt_metal/impl/data_format/mxfp8.cpp",
+        "tt_metal/impl/data_format/tile.cpp",
         "tt_metal/impl/data_format/tilize_utils.cpp",
         "tt_metal/impl/data_format/uint8.cpp",
         "tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp",
@@ -806,11 +927,60 @@ cc_library(
         ":tt_metal_hal_blackhole_upstream",
         ":tt_metal_hal_quasar_upstream",
         ":tt_metal_hal_wormhole_upstream",
-        ":tt_metal_host_tensor_runtime_support_upstream",
         ":tt_metal_host_tensor_upstream",
     ],
     linkopts = [
         "-lnuma",
+    ],
+    alwayslink = True,
+    linkstatic = True,
+)
+
+cc_library(
+    name = "ttnn_matmul_upstream",
+    srcs = [
+        "ttnn/core/async_runtime.cpp",
+        "ttnn/core/config.cpp",
+        "ttnn/core/core.cpp",
+        "ttnn/core/device_operation_detail.cpp",
+        "ttnn/core/distributed/api.cpp",
+        "ttnn/core/events.cpp",
+        "ttnn/core/global_circular_buffer.cpp",
+        "ttnn/core/global_semaphore.cpp",
+        "ttnn/core/graph/graph_processor.cpp",
+        "ttnn/core/operation.cpp",
+        "ttnn/core/tensor/host_buffer/functions.cpp",
+        "ttnn/core/tensor/storage.cpp",
+        "ttnn/core/tensor/tensor.cpp",
+        "ttnn/core/tensor/tensor_attributes.cpp",
+        "ttnn/core/tensor/tensor_impl.cpp",
+        "ttnn/core/tensor/tensor_ops.cpp",
+        "ttnn/core/tensor/tensor_utils.cpp",
+        "ttnn/core/tensor/to_string.cpp",
+        "ttnn/core/tensor/unit_mesh/unit_mesh_utils.cpp",
+        "ttnn/cpp/ttnn/operations/core/compute_kernel/compute_kernel_config.cpp",
+        "ttnn/cpp/ttnn/operations/core/core.cpp",
+        "ttnn/cpp/ttnn/operations/core/to_dtype/to_dtype_op.cpp",
+        "ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp",
+        "ttnn/cpp/ttnn/operations/core/to_memory_config/to_memory_config_op.cpp",
+        "ttnn/cpp/ttnn/operations/compute_throttle_utils.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_utils.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_batched_hs_dram_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_2d_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_dram_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_optimized_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.cpp",
+    ],
+    hdrs = TTNN_RUNTIME_HDRS,
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TTNN_RUNTIME_INCLUDE_DIRS,
+    deps = [
+        ":tt_metal_device_tensor_upstream",
     ],
     linkstatic = True,
 )

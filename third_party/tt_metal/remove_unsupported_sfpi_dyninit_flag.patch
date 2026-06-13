@@ -1,0 +1,11 @@
+--- tt_metal/jit_build/build.cpp
++++ tt_metal/jit_build/build.cpp
+@@ -141,7 +141,7 @@ void JitBuildEnv::init(
+ 
+     // Flags
+     string common_flags =
+-        "-std=c++17 -ftt-nttp -ftt-constinit -ftt-consteval -ftt-no-dyninit "
++        "-std=c++17 -ftt-nttp -ftt-constinit -ftt-consteval "
+         "-flto=auto -ffast-math "
+         "-fno-exceptions -fno-rtti -fno-use-cxa-atexit ";
+ 

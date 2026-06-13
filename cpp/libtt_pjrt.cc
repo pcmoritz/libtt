@@ -1,6 +1,7 @@
 #include "cpp/libtt_pjrt.h"
 
 #include "cpp/pjrt_buffer.h"
+#include "cpp/tt_metal_matmul_runtime.h"
 #include "mlir/executable.pb.h"
 
 #include <algorithm>
@@ -482,11 +483,15 @@ std::string OpKindName(tt::Op::KindCase kind) {
   return "unknown(" + std::to_string(static_cast<int>(kind)) + ")";
 }
 
-PJRT_Error* ExecuteParameterOnlyProgram(const PJRT_LoadedExecutable* executable,
-                                        PJRT_Buffer* const* arguments,
-                                        size_t num_args,
-                                        PJRT_Device* target_device,
-                                        PJRT_Buffer** outputs) {
+std::vector<int64_t> RepeatedI64ToVector(const google::protobuf::RepeatedField<int64_t>& field) {
+  return std::vector<int64_t>(field.begin(), field.end());
+}
+
+PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
+                           PJRT_Buffer* const* arguments,
+                           size_t num_args,
+                           PJRT_Device* target_device,
+                           PJRT_Buffer** outputs) {
   tt::Executable program;
   if (executable->metadata.executable_proto.empty() ||
       !program.ParseFromString(executable->metadata.executable_proto)) {
@@ -497,6 +502,7 @@ PJRT_Error* ExecuteParameterOnlyProgram(const PJRT_LoadedExecutable* executable,
   }
 
   std::vector<PJRT_Buffer*> values(static_cast<size_t>(program.values_size()), nullptr);
+  std::vector<std::unique_ptr<PJRT_Buffer>> owned_values;
   for (const tt::Op& op : program.ops()) {
     if (op.output_id() >= static_cast<uint32_t>(values.size())) {
       return Internal("executable op output id is out of bounds");
@@ -549,8 +555,82 @@ PJRT_Error* ExecuteParameterOnlyProgram(const PJRT_LoadedExecutable* executable,
         values[op.output_id()] = values[input_id];
         break;
       }
+      case tt::Op::kMatmul: {
+        const tt::MatmulOp& matmul = op.matmul();
+        if (matmul.has_top_k_epilogue()) {
+          return Unimplemented("tt-metal matmul top_k epilogue is not implemented yet");
+        }
+        const uint32_t lhs_id = matmul.lhs_id();
+        const uint32_t rhs_id = matmul.rhs_id();
+        if (lhs_id >= static_cast<uint32_t>(values.size()) || values[lhs_id] == nullptr ||
+            rhs_id >= static_cast<uint32_t>(values.size()) || values[rhs_id] == nullptr) {
+          return Internal("matmul input value was not produced");
+        }
+        if (lhs_id >= static_cast<uint32_t>(program.values_size()) ||
+            rhs_id >= static_cast<uint32_t>(program.values_size())) {
+          return Internal("matmul input metadata id is out of bounds");
+        }
+        const tt::ValueDesc& lhs_desc = program.values(lhs_id);
+        const tt::ValueDesc& rhs_desc = program.values(rhs_id);
+        const tt::ValueDesc& output_desc = program.values(op.output_id());
+        if (!lhs_desc.has_tensor() || !rhs_desc.has_tensor() || !output_desc.has_tensor()) {
+          return Internal("matmul value is missing tensor metadata");
+        }
+
+        TtMetalMatmulRequest request;
+        request.local_hardware_id = target_device == nullptr ? 0 : target_device->local_hardware_id;
+        if (PJRT_Error* error = TensorDescBufferType(lhs_desc.tensor(), &request.lhs.type)) {
+          return error;
+        }
+        if (PJRT_Error* error = TensorDescBufferType(rhs_desc.tensor(), &request.rhs.type)) {
+          return error;
+        }
+        if (PJRT_Error* error = TensorDescBufferType(output_desc.tensor(), &request.output_type)) {
+          return error;
+        }
+        if (PJRT_Error* error = TensorDescDims(lhs_desc.tensor(), &request.lhs.dims)) {
+          return error;
+        }
+        if (PJRT_Error* error = TensorDescDims(rhs_desc.tensor(), &request.rhs.dims)) {
+          return error;
+        }
+        if (PJRT_Error* error = TensorDescDims(output_desc.tensor(), &request.output_dims)) {
+          return error;
+        }
+        if (PJRT_Error* error = ReadBufferLogicalBytes(*values[lhs_id], &request.lhs.data)) {
+          return error;
+        }
+        if (PJRT_Error* error = ReadBufferLogicalBytes(*values[rhs_id], &request.rhs.data)) {
+          return error;
+        }
+        request.lhs_batching_dimensions =
+            RepeatedI64ToVector(matmul.lhs_batching_dimensions());
+        request.rhs_batching_dimensions =
+            RepeatedI64ToVector(matmul.rhs_batching_dimensions());
+        request.lhs_contracting_dimensions =
+            RepeatedI64ToVector(matmul.lhs_contracting_dimensions());
+        request.rhs_contracting_dimensions =
+            RepeatedI64ToVector(matmul.rhs_contracting_dimensions());
+
+        std::vector<std::byte> result_data;
+        if (PJRT_Error* error = ExecuteTtMetalMatmul(request, &result_data)) {
+          return error;
+        }
+        PJRT_Buffer* result_buffer = nullptr;
+        const void* data = result_data.empty() ? nullptr : result_data.data();
+        PJRT_Memory* output_memory =
+            target_device == nullptr ? nullptr : target_device->default_memory;
+        if (PJRT_Error* error = CreatePjrtBufferFromHostBytes(
+                request.output_type, request.output_dims, target_device, output_memory, data,
+                result_data.size(), &result_buffer)) {
+          return error;
+        }
+        values[op.output_id()] = result_buffer;
+        owned_values.emplace_back(result_buffer);
+        break;
+      }
       default:
-        return Unimplemented("C++ host execution does not support op kind: " +
+        return Unimplemented("C++ execution does not support op kind: " +
                              OpKindName(op.kind_case()));
     }
   }
@@ -1132,8 +1212,8 @@ extern "C" PJRT_Error* TT_LoadedExecutable_Execute(
     return InvalidArgument("no execute device available");
   }
   PJRT_Buffer* const* arguments = args->num_args == 0 ? nullptr : args->argument_lists[0];
-  if (PJRT_Error* error = ExecuteParameterOnlyProgram(args->executable, arguments, args->num_args,
-                                                      target_device, device_outputs)) {
+  if (PJRT_Error* error = ExecuteProgram(args->executable, arguments, args->num_args,
+                                         target_device, device_outputs)) {
     for (size_t i = 0; i < args->executable->metadata.num_outputs; ++i) {
       delete device_outputs[i];
       device_outputs[i] = nullptr;

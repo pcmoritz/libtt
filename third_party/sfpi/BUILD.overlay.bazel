@@ -1,0 +1,11 @@
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "all_files",
+    srcs = glob(["**"]),
+)
+
+filegroup(
+    name = "riscv_gpp",
+    srcs = ["compiler/bin/riscv-tt-elf-g++"],
+)
