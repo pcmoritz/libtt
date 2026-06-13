@@ -49,6 +49,27 @@ std::optional<tt::tt_metal::DataType> MetalDataType(PJRT_Buffer_Type type) {
   }
 }
 
+template <typename F>
+PJRT_Error* DispatchByElementType(PJRT_Buffer_Type type, F&& f) {
+  switch (type) {
+    case PJRT_Buffer_Type_PRED:
+    case PJRT_Buffer_Type_U8:
+      return f(uint8_t{});
+    case PJRT_Buffer_Type_U16:
+      return f(uint16_t{});
+    case PJRT_Buffer_Type_S32:
+      return f(int32_t{});
+    case PJRT_Buffer_Type_U32:
+      return f(uint32_t{});
+    case PJRT_Buffer_Type_BF16:
+      return f(bfloat16{});
+    case PJRT_Buffer_Type_F32:
+      return f(float{});
+    default:
+      return Unimplemented("unsupported TTNN tensor buffer type");
+  }
+}
+
 PJRT_Error* ShapeFromDims(const std::vector<int64_t>& dims, tt::tt_metal::Shape* out) {
   tt::tt_metal::Shape::Container values;
   for (int64_t dim : dims) {
@@ -111,30 +132,6 @@ PJRT_Error* CreateTensorFromBytes(const void* data,
     return Internal(std::string("failed to create TTNN tensor from host buffer: ") + e.what());
   }
   return nullptr;
-}
-
-PJRT_Error* CreateTensorFromBytes(PJRT_Buffer_Type type,
-                                  const void* data,
-                                  size_t byte_size,
-                                  const ttnn::TensorSpec& spec,
-                                  std::optional<ttnn::Tensor>* out) {
-  switch (type) {
-    case PJRT_Buffer_Type_PRED:
-    case PJRT_Buffer_Type_U8:
-      return CreateTensorFromBytes<uint8_t>(data, byte_size, spec, out);
-    case PJRT_Buffer_Type_U16:
-      return CreateTensorFromBytes<uint16_t>(data, byte_size, spec, out);
-    case PJRT_Buffer_Type_S32:
-      return CreateTensorFromBytes<int32_t>(data, byte_size, spec, out);
-    case PJRT_Buffer_Type_U32:
-      return CreateTensorFromBytes<uint32_t>(data, byte_size, spec, out);
-    case PJRT_Buffer_Type_BF16:
-      return CreateTensorFromBytes<bfloat16>(data, byte_size, spec, out);
-    case PJRT_Buffer_Type_F32:
-      return CreateTensorFromBytes<float>(data, byte_size, spec, out);
-    default:
-      return Unimplemented("unsupported TTNN tensor buffer type");
-  }
 }
 
 template <typename T>
@@ -294,7 +291,10 @@ PJRT_Error* CreatePjrtBufferFromHostBytes(PJRT_Buffer_Type type,
     return error;
   }
   std::optional<ttnn::Tensor> tensor;
-  if (PJRT_Error* error = CreateTensorFromBytes(type, data, byte_size, *tensor_spec, &tensor)) {
+  if (PJRT_Error* error = DispatchByElementType(type, [&](auto tag) {
+        using Element = decltype(tag);
+        return CreateTensorFromBytes<Element>(data, byte_size, *tensor_spec, &tensor);
+      })) {
     return error;
   }
 
@@ -324,31 +324,10 @@ PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::b
     return FailedPrecondition("buffer has no TTNN tensor storage");
   }
 
-  PJRT_Error* error = nullptr;
-  switch (buffer.buffer_type) {
-    case PJRT_Buffer_Type_PRED:
-    case PJRT_Buffer_Type_U8:
-      error = TensorToBytes<uint8_t>(buffer.storage->tensor, out);
-      break;
-    case PJRT_Buffer_Type_U16:
-      error = TensorToBytes<uint16_t>(buffer.storage->tensor, out);
-      break;
-    case PJRT_Buffer_Type_S32:
-      error = TensorToBytes<int32_t>(buffer.storage->tensor, out);
-      break;
-    case PJRT_Buffer_Type_U32:
-      error = TensorToBytes<uint32_t>(buffer.storage->tensor, out);
-      break;
-    case PJRT_Buffer_Type_BF16:
-      error = TensorToBytes<bfloat16>(buffer.storage->tensor, out);
-      break;
-    case PJRT_Buffer_Type_F32:
-      error = TensorToBytes<float>(buffer.storage->tensor, out);
-      break;
-    default:
-      return Unimplemented("unsupported TTNN tensor buffer type");
-  }
-  if (error != nullptr) {
+  if (PJRT_Error* error = DispatchByElementType(buffer.buffer_type, [&](auto tag) {
+        using Element = decltype(tag);
+        return TensorToBytes<Element>(buffer.storage->tensor, out);
+      })) {
     return error;
   }
 
