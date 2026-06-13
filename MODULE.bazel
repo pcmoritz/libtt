@@ -110,8 +110,19 @@ http_archive(
 )
 
 http_archive(
+    name = "yaml_cpp",
+    build_file = "//third_party/yaml_cpp:BUILD.overlay.bazel",
+    sha256 = "923b2298148581b14ef21d9ce29d83eca102ff671a547dfdbd227245a199bcd8",
+    strip_prefix = "yaml-cpp-2f86d13775d119edbb69af52e5f566fd65c6953b",
+    urls = [
+        "https://github.com/jbeder/yaml-cpp/archive/2f86d13775d119edbb69af52e5f566fd65c6953b.tar.gz",
+    ],
+)
+
+http_archive(
     name = "tt_umd",
     build_file = "//third_party/tt_umd:BUILD.overlay.bazel",
+    patches = ["//third_party/tt_umd:remove_initial_exec_tls.patch"],
     sha256 = "70f467bfa43d0af63009b87073a3738942261c4ac267c3fe88780c156316a9fa",
     strip_prefix = "tt-umd-b4a59998020868bb94ba09daeed7e99452476c8f",
     urls = [
@@ -133,6 +144,16 @@ http_archive(
 http_archive(
     name = "tt_metal",
     build_file = "//third_party/tt_metal:BUILD.overlay.bazel",
+    patches = [
+        "//third_party/tt_metal:wormhole_build_empty_sources.patch",
+        "//third_party/tt_metal:reduce_static_tls.patch",
+        "//third_party/tt_metal:disable_fabric_host_tensor_runtime.patch",
+        "//third_party/tt_metal:disable_fabric_host_buffer.patch",
+        "//third_party/tt_metal:disable_fabric_mesh_device.patch",
+        "//third_party/tt_metal:disable_fabric_system_mesh.patch",
+        "//third_party/tt_metal:disable_fabric_profiler.patch",
+        "//third_party/tt_metal:disable_fabric_rtoptions.patch",
+    ],
     sha256 = "b4d05d0e498e626a0d5455f5c6a379aa1b7ac4f1ca76f8f72dad4f7370223bf7",
     strip_prefix = "tt-metal-16e79a784996b0608f809a186f5816dd07e86d39",
     urls = [

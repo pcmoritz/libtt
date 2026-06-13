@@ -61,17 +61,16 @@ cc_library(
         ":tt_metal_host_tensor",
         "@com_google_protobuf//:protobuf_lite",
     ],
+    linkstatic = True,
 )
 
 cc_library(
     name = "tt_metal_host_tensor",
-    srcs = [
-        "cpp/tt_metal_host_runtime.cc",
-    ],
-    copts = ["-std=c++20"],
     deps = [
+        "@tt_metal//:tt_metal_host_tensor_runtime_support_upstream",
         "@tt_metal//:tt_metal_host_tensor_upstream",
     ],
+    linkstatic = True,
 )
 
 cc_shared_library(

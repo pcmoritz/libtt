@@ -1,0 +1,72 @@
+--- tt_metal/distributed/system_mesh.cpp
++++ tt_metal/distributed/system_mesh.cpp
+@@ -22,6 +22,7 @@
+ #include "tt_metal/distributed/system_mesh_translation_map.hpp"
+ #include "tt_metal/distributed/distributed_coordinate_translator.hpp"
+
++#include "llrt/tt_cluster.hpp"
+ #include "impl/context/metal_context.hpp"
+ #include <tt-metalium/experimental/fabric/control_plane.hpp>
+
+@@ -84,49 +85,28 @@
+ }
+
+ // Implementation of public methods
+-SystemMesh::Impl::Impl(const tt::tt_fabric::ControlPlane& control_plane) :
+-    mesh_id_(control_plane.get_local_mesh_id_bindings()[0]),
++SystemMesh::Impl::Impl(const tt::tt_fabric::ControlPlane& /*control_plane*/) :
++    mesh_id_(tt::tt_fabric::MeshId{0}),
+     coordinate_translator_(
+-        control_plane.get_physical_mesh_shape(
+-            mesh_id_,  //
+-            tt::tt_fabric::MeshScope::GLOBAL),
+-        control_plane.get_physical_mesh_shape(
+-            mesh_id_,  //
+-            tt::tt_fabric::MeshScope::LOCAL),
+-        control_plane.get_local_mesh_offset()),
++        MeshShape(1, std::max<std::size_t>(1, MetalContext::instance().get_cluster().all_chip_ids().size())),
++        MeshShape(1, std::max<std::size_t>(1, MetalContext::instance().get_cluster().all_chip_ids().size())),
++        MeshCoordinate(0, 0)),
+     system_mapped_devices_(initialize_mapped_devices(mesh_id_, coordinate_translator_.global_shape())) {
+     log_debug(
+         LogDistributed,
+-        "SystemMesh: Global shape: {}, Local shape: {}, Local offset: {}",
++        "SystemMesh: fabric disabled, using local-only shape. Global shape: {}, Local shape: {}, Local offset: {}",
+         coordinate_translator_.global_shape(),
+         coordinate_translator_.local_shape(),
+         coordinate_translator_.local_offset());
+
+-    // Get local physical coordinates
+-    const auto local_physical_translation_map = get_system_mesh_coordinate_translation_map(control_plane);
+-    TT_FATAL(
+-        local_physical_translation_map.shape() == coordinate_translator_.local_shape(),
+-        "Local coordinates shape mismatch: {} != {}",
+-        local_physical_translation_map.shape(),
+-        coordinate_translator_.local_shape());
+-
+-    // Populate chip IDs for host-local devices.
+-    for (const auto& local_coord : MeshCoordinateRange(coordinate_translator_.local_shape())) {
+-        TT_FATAL(
+-            local_physical_translation_map.at(local_coord).mesh_id() == mesh_id_,
+-            "Mesh id mismatch for coordinate {}: {} != {}",
+-            local_coord,
+-            local_physical_translation_map.at(local_coord).mesh_id(),
+-            mesh_id_);
+-
+-        const auto global_coord = coordinate_translator_.local_to_global(local_coord);
++    std::size_t linear_index = 0;
++    for (const auto chip_id : MetalContext::instance().get_cluster().all_chip_ids()) {
++        const auto global_coord = MeshCoordinate(0, static_cast<std::uint32_t>(linear_index++));
+         log_debug(
+             LogDistributed,
+-            "SystemMesh: Populating global coordinate {} with physical coordinate {} at local coordinate {}",
++            "SystemMesh: Populating global coordinate {} with physical chip id {}",
+             global_coord,
+-            local_physical_translation_map.at(local_coord),
+-            local_coord);
+-        system_mapped_devices_.at(global_coord).device_id =
+-            MaybeRemote<int>::local(local_physical_translation_map.at(local_coord).chip_id());
++            chip_id);
++        system_mapped_devices_.at(global_coord).device_id = MaybeRemote<int>::local(chip_id);
+     }
+ }

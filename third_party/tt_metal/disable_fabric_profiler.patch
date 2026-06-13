@@ -1,0 +1,20 @@
+--- tt_metal/impl/profiler/profiler.cpp
++++ tt_metal/impl/profiler/profiler.cpp
+@@ -2491,16 +2491,7 @@
+ }
+
+ void DeviceProfiler::dumpRoutingInfo() const {
+-    tt::filesystem::safe_create_directories(noc_trace_data_output_dir);
+-    if (!tt::filesystem::safe_is_directory(noc_trace_data_output_dir).value_or(false)) {
+-        log_error(
+-            tt::LogMetal,
+-            "Could not dump topology to '{}' because the directory path could not be created!",
+-            noc_trace_data_output_dir);
+-        return;
+-    }
+-
+-    tt::tt_metal::dumpRoutingInfo(noc_trace_data_output_dir / "topology.json");
++    log_debug(tt::LogMetal, "Skipping routing info dump because fabric is disabled in the Bazel overlay build.");
+ }
+
+ void DeviceProfiler::dumpClusterCoordinates() const {

@@ -1,0 +1,20 @@
+--- tt_metal/llrt/rtoptions.cpp
++++ tt_metal/llrt/rtoptions.cpp
+@@ -2066,7 +2066,7 @@
+     }
+ }
+
+-void RunTimeOptions::resolve_fabric_node_ids_to_chip_ids(const tt::tt_fabric::ControlPlane& control_plane) {
++void RunTimeOptions::resolve_fabric_node_ids_to_chip_ids(const tt::tt_fabric::ControlPlane& /*control_plane*/) {
+     for (auto& target : feature_targets) {
+         if (!target.node_ids.empty()) {
+             // Clear the chip IDs because the chip ID from fabric node IDs come from the MGD which can change
+@@ -2075,7 +2075,7 @@
+             target.chip_ids.clear();
+             std::unordered_set<int> seen_chip_ids;
+             for (const auto& node_id : target.node_ids) {
+-                ChipId chip_id = control_plane.get_physical_chip_id_from_fabric_node_id(node_id);
++                ChipId chip_id = static_cast<ChipId>(node_id.chip_id);
+                 int chip_id_int = static_cast<int>(chip_id);
+                 if (seen_chip_ids.insert(chip_id_int).second) {
+                     target.chip_ids.push_back(chip_id_int);

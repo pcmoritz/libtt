@@ -29,6 +29,23 @@ int main() {
   devices_args.client = create_args.client;
   error = api->PJRT_Client_Devices(&devices_args);
   assert(error == nullptr);
+  assert(devices_args.num_devices >= 1);
+  assert(devices_args.devices != nullptr);
+
+  PJRT_Client_AddressableDevices_Args addressable_devices_args{};
+  addressable_devices_args.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
+  addressable_devices_args.client = create_args.client;
+  error = api->PJRT_Client_AddressableDevices(&addressable_devices_args);
+  assert(error == nullptr);
+  assert(addressable_devices_args.num_addressable_devices >= 1);
+  assert(addressable_devices_args.addressable_devices != nullptr);
+
+  PJRT_Client_ProcessIndex_Args process_index_args{};
+  process_index_args.struct_size = PJRT_Client_ProcessIndex_Args_STRUCT_SIZE;
+  process_index_args.client = create_args.client;
+  error = api->PJRT_Client_ProcessIndex(&process_index_args);
+  assert(error == nullptr);
+  assert(process_index_args.process_index == 0);
 
   assert(api->PJRT_Client_Compile != nullptr);
   assert(api->PJRT_LoadedExecutable_GetExecutable != nullptr);

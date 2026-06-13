@@ -842,17 +842,24 @@ PJRT_Client* CreateClient() {
   client->platform_version = kPlatformVersion;
 
   std::vector<int> discovered_ids = DiscoverDeviceIds();
+  const bool has_discovered_devices = !discovered_ids.empty();
+  if (discovered_ids.empty()) {
+    discovered_ids.push_back(0);
+  }
   client->device_descriptions_storage.reserve(discovered_ids.size());
   client->memories_storage.reserve(discovered_ids.size());
   client->devices_storage.reserve(discovered_ids.size());
 
   for (int device_id : discovered_ids) {
     const std::string suffix = std::to_string(device_id);
+    const std::string debug_string = has_discovered_devices
+                                         ? "Tenstorrent device /dev/tenstorrent/" + suffix
+                                         : "Tenstorrent logical device " + suffix;
     client->device_descriptions_storage.push_back(PJRT_DeviceDescription{
         device_id,
         0,
         "Tenstorrent",
-        "Tenstorrent device /dev/tenstorrent/" + suffix,
+        debug_string,
         "TTDevice(id=" + suffix + ")",
     });
     client->memories_storage.push_back(PJRT_Memory{

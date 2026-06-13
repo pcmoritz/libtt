@@ -60,6 +60,47 @@ genrule(
     tools = ["@com_github_google_flatbuffers//:flatc"],
 )
 
+genrule(
+    name = "tt_metal_hal_generated_headers",
+    srcs = [
+        "tt_metal/hw/inc/hostdev/dev_msgs.h",
+        "tt_metal/hw/inc/hostdev/fabric_telemetry_msgs.h",
+        "tt_metal/hw/inc/hostdev/realtime_profiler_msgs.h",
+        "tt_metal/llrt/hal/codegen/codegen.py",
+        "tt_metal/llrt/hal/codegen/codegen.sh",
+    ],
+    outs = [
+        "hal/generated/dev_msgs.hpp",
+        "hal/generated/dev_msgs_impl.hpp",
+        "hal/generated/fabric_telemetry.hpp",
+        "hal/generated/fabric_telemetry_impl.hpp",
+        "hal/generated/realtime_profiler_msgs.hpp",
+        "hal/generated/realtime_profiler_msgs_impl.hpp",
+        "llrt/hal/generated/dev_msgs.hpp",
+        "llrt/hal/generated/dev_msgs_impl.hpp",
+        "llrt/hal/generated/fabric_telemetry.hpp",
+        "llrt/hal/generated/fabric_telemetry_impl.hpp",
+        "llrt/hal/generated/realtime_profiler_msgs.hpp",
+        "llrt/hal/generated/realtime_profiler_msgs_impl.hpp",
+    ],
+    cmd = "src=$(location tt_metal/hw/inc/hostdev/dev_msgs.h); " +
+          "root=$${src%/tt_metal/hw/inc/hostdev/dev_msgs.h}; " +
+          "outdir=$$(dirname $(location hal/generated/dev_msgs.hpp)); " +
+          "llrt_outdir=$$(dirname $(location llrt/hal/generated/dev_msgs.hpp)); " +
+          "bash $(location tt_metal/llrt/hal/codegen/codegen.sh) $$root $$outdir; " +
+          "mkdir -p $$llrt_outdir; " +
+          "cp $(location hal/generated/dev_msgs.hpp) $(location llrt/hal/generated/dev_msgs.hpp); " +
+          "cp $(location hal/generated/dev_msgs_impl.hpp) $(location llrt/hal/generated/dev_msgs_impl.hpp); " +
+          "cp $(location hal/generated/fabric_telemetry.hpp) $(location llrt/hal/generated/fabric_telemetry.hpp); " +
+          "cp $(location hal/generated/fabric_telemetry_impl.hpp) $(location llrt/hal/generated/fabric_telemetry_impl.hpp); " +
+          "cp $(location hal/generated/realtime_profiler_msgs.hpp) $(location llrt/hal/generated/realtime_profiler_msgs.hpp); " +
+          "cp $(location hal/generated/realtime_profiler_msgs_impl.hpp) $(location llrt/hal/generated/realtime_profiler_msgs_impl.hpp)",
+    tools = [
+        "tt_metal/llrt/hal/codegen/codegen.py",
+        "tt_metal/llrt/hal/codegen/codegen.sh",
+    ],
+)
+
 filegroup(
     name = "tt_metal_flatbuffer_headers",
     srcs = [
@@ -67,6 +108,183 @@ filegroup(
         ":tt_metal_distributed_flatbuffer_headers",
         ":tt_metal_impl_flatbuffer_headers",
     ],
+)
+
+genrule(
+    name = "tt_metal_inspector_stub_headers",
+    outs = [
+        "inspector_stubs/debug/inspector/data.hpp",
+        "inspector_stubs/debug/inspector/inspector.hpp",
+        "inspector_stubs/impl/debug/inspector/data.hpp",
+        "inspector_stubs/impl/debug/inspector/inspector.hpp",
+        "inspector_stubs/tt_metal/impl/debug/inspector/data.hpp",
+        "inspector_stubs/tt_metal/impl/debug/inspector/inspector.hpp",
+    ],
+    cmd = "mkdir -p $(@D)/inspector_stubs/debug/inspector " +
+          "$(@D)/inspector_stubs/impl/debug/inspector " +
+          "$(@D)/inspector_stubs/tt_metal/impl/debug/inspector; " +
+          "printf '%s\\n' " +
+          "'#pragma once' " +
+          "'namespace tt::tt_metal::inspector {' " +
+          "'class Data {};' " +
+          "'class RpcServer {};' " +
+          "'}  // namespace tt::tt_metal::inspector' " +
+          "> $(@D)/inspector_stubs/debug/inspector/data.hpp; " +
+          "printf '%s\\n' " +
+          "'#pragma once' " +
+          "'#include <memory>' " +
+          "'#include <optional>' " +
+          "'#include <string>' " +
+          "'#include \"debug/inspector/data.hpp\"' " +
+          "'namespace tt::tt_metal {' " +
+          "'class Inspector {' " +
+          "'public:' " +
+          "'    static bool is_enabled() { return false; }' " +
+          "'    static std::unique_ptr<inspector::Data> initialize(std::optional<int>) { return {}; }' " +
+          "'    static void serialize_rpc() {}' " +
+          "'    template <typename... Args> static void program_created(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void program_destroyed(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void program_set_binary_status(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void program_compile_started(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void program_compile_already_exists(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void program_kernel_compile_finished(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void program_compile_finished(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void mesh_device_created(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void mesh_device_destroyed(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void mesh_device_initialized(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void mesh_workload_created(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void mesh_workload_destroyed(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void mesh_workload_add_program(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void mesh_workload_set_program_binary_status(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void emit_debug_entry(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void release_trace(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void set_dispatch_core_info(Args&&...) {}' " +
+          "'    template <typename... Args> static void set_dispatch_s_core_info(Args&&...) {}' " +
+          "'    template <typename... Args> static void set_prefetcher_core_info(Args&&...) {}' " +
+          "'    static void clear_all_core_info() {}' " +
+          "'    static std::string get_kernel_path_from_watcher_kernel_id(int) { return {}; }' " +
+          "'    static void enable_kernel_path_collection() {}' " +
+          "'    static inspector::RpcServer& get_rpc_server() { static inspector::RpcServer server; return server; }' " +
+          "'    template <typename... Args> static void set_build_env_fw_compile_hash(Args&&...) {}' " +
+          "'};' " +
+          "'}  // namespace tt::tt_metal' " +
+          "> $(@D)/inspector_stubs/debug/inspector/inspector.hpp; " +
+          "cp $(@D)/inspector_stubs/debug/inspector/data.hpp $(@D)/inspector_stubs/impl/debug/inspector/data.hpp; " +
+          "cp $(@D)/inspector_stubs/debug/inspector/inspector.hpp $(@D)/inspector_stubs/impl/debug/inspector/inspector.hpp; " +
+          "cp $(@D)/inspector_stubs/debug/inspector/data.hpp $(@D)/inspector_stubs/tt_metal/impl/debug/inspector/data.hpp; " +
+          "cp $(@D)/inspector_stubs/debug/inspector/inspector.hpp $(@D)/inspector_stubs/tt_metal/impl/debug/inspector/inspector.hpp",
+)
+
+genrule(
+    name = "tt_metal_jit_server_stub_headers",
+    outs = [
+        "inspector_stubs/impl/jit_server/jit_compile_rpc_client.hpp",
+        "inspector_stubs/impl/jit_server/remote_compile_coordinator.hpp",
+        "inspector_stubs/impl/jit_server/types.hpp",
+        "inspector_stubs/tt_metal/impl/jit_server/jit_compile_rpc_client.hpp",
+        "inspector_stubs/tt_metal/impl/jit_server/remote_compile_coordinator.hpp",
+        "inspector_stubs/tt_metal/impl/jit_server/types.hpp",
+    ],
+    cmd = "mkdir -p $(@D)/inspector_stubs/impl/jit_server " +
+          "$(@D)/inspector_stubs/tt_metal/impl/jit_server; " +
+          "printf '%s\\n' " +
+          "'#pragma once' " +
+          "'#include <cstdint>' " +
+          "'#include <string>' " +
+          "'#include <vector>' " +
+          "'#include \"jit_build/types.hpp\"' " +
+          "'namespace tt::tt_metal::jit_server {' " +
+          "'using tt::jit_build::GeneratedFile;' " +
+          "'using tt::jit_build::TargetRecipe;' " +
+          "'struct CompileRequest {' " +
+          "'    std::uint64_t build_key = 0;' " +
+          "'    std::string kernel_name;' " +
+          "'    std::string gpp;' " +
+          "'    std::vector<TargetRecipe> targets;' " +
+          "'    std::vector<GeneratedFile> generated_files;' " +
+          "'};' " +
+          "'struct ElfBlob { std::string name; std::vector<std::uint8_t> data; };' " +
+          "'struct FirmwareArtifact {' " +
+          "'    std::string target_name;' " +
+          "'    std::string file_name;' " +
+          "'    bool is_kernel_object = false;' " +
+          "'    std::vector<std::uint8_t> data;' " +
+          "'};' " +
+          "'struct UploadFirmwareRequest { std::uint64_t build_key = 0; std::vector<FirmwareArtifact> artifacts; };' " +
+          "'struct UploadFirmwareResponse { bool success = false; std::string error_message; };' " +
+          "'struct CompileResponse { bool success = false; std::string error_message; std::vector<ElfBlob> elf_blobs; };' " +
+          "'}  // namespace tt::tt_metal::jit_server' " +
+          "> $(@D)/inspector_stubs/impl/jit_server/types.hpp; " +
+          "printf '%s\\n' " +
+          "'#pragma once' " +
+          "'#include <string>' " +
+          "'#include <vector>' " +
+          "'#include \"impl/jit_server/types.hpp\"' " +
+          "'namespace tt::tt_metal::jit_server {' " +
+          "'class JitCompileRpcClient {' " +
+          "'public:' " +
+          "'    explicit JitCompileRpcClient(std::string) {}' " +
+          "'    static bool enabled() { return false; }' " +
+          "'    static std::vector<std::string> endpoints_from_env() { return {}; }' " +
+          "'    static std::string endpoint_from_env() { return {}; }' " +
+          "'    CompileResponse compile(const CompileRequest&) const { return {}; }' " +
+          "'    std::vector<CompileResponse> compile_batch(const std::vector<CompileRequest>&) const { return {}; }' " +
+          "'    UploadFirmwareResponse upload_firmware(const UploadFirmwareRequest&) const { return {}; }' " +
+          "'};' " +
+          "'class JitCompileRpcSession {' " +
+          "'public:' " +
+          "'    explicit JitCompileRpcSession(const std::string&) {}' " +
+          "'    void send(const CompileRequest&) {}' " +
+          "'    CompileResponse send_and_wait(const CompileRequest&) { return {}; }' " +
+          "'    std::vector<CompileResponse> wait_all() { return {}; }' " +
+          "'    UploadFirmwareResponse upload_firmware(const UploadFirmwareRequest&) { return {}; }' " +
+          "'};' " +
+          "'}  // namespace tt::tt_metal::jit_server' " +
+          "> $(@D)/inspector_stubs/impl/jit_server/jit_compile_rpc_client.hpp; " +
+          "printf '%s\\n' " +
+          "'#pragma once' " +
+          "'#include <cstddef>' " +
+          "'#include <cstdint>' " +
+          "'#include <functional>' " +
+          "'#include <string>' " +
+          "'#include <utility>' " +
+          "'#include <vector>' " +
+          "'#include \"impl/jit_server/jit_compile_rpc_client.hpp\"' " +
+          "'#include \"impl/jit_server/types.hpp\"' " +
+          "'#include <umd/device/types/cluster_descriptor_types.hpp>' " +
+          "'namespace tt::tt_metal {' " +
+          "'struct KernelCompileDescriptor {' " +
+          "'    std::size_t kernel_hash = 0;' " +
+          "'    jit_server::CompileRequest request;' " +
+          "'    std::vector<std::string> expected_elf_paths;' " +
+          "'};' " +
+          "'class RemoteCompileCoordinator {' " +
+          "'public:' " +
+          "'    RemoteCompileCoordinator(std::vector<std::string>, ChipId, std::uint64_t) {}' " +
+          "'    void submit(std::size_t, const std::function<KernelCompileDescriptor()>&) {}' " +
+          "'    void finish() {}' " +
+          "'};' " +
+          "'}  // namespace tt::tt_metal' " +
+          "> $(@D)/inspector_stubs/impl/jit_server/remote_compile_coordinator.hpp; " +
+          "cp $(@D)/inspector_stubs/impl/jit_server/types.hpp $(@D)/inspector_stubs/tt_metal/impl/jit_server/types.hpp; " +
+          "cp $(@D)/inspector_stubs/impl/jit_server/jit_compile_rpc_client.hpp $(@D)/inspector_stubs/tt_metal/impl/jit_server/jit_compile_rpc_client.hpp; " +
+          "cp $(@D)/inspector_stubs/impl/jit_server/remote_compile_coordinator.hpp $(@D)/inspector_stubs/tt_metal/impl/jit_server/remote_compile_coordinator.hpp",
+)
+
+genrule(
+    name = "tt_metal_inspector_stub_source",
+    outs = ["inspector_stubs/inspector_stub.cpp"],
+    cmd = "mkdir -p $(@D); " +
+          "printf '%s\\n' " +
+          "'#include <tt-metalium/experimental/inspector.hpp>' " +
+          "'namespace tt::tt_metal::experimental::inspector {' " +
+          "'bool IsEnabled() { return false; }' " +
+          "'bool ShouldCaptureTensorSpecs() { return false; }' " +
+          "'std::optional<tt::tt_metal::distributed::MeshTraceId> GetCurrentMeshTraceId(tt::tt_metal::distributed::MeshDevice*) { return std::nullopt; }' " +
+          "'void EmitMeshWorkloadDebugEntry(tt::tt_metal::distributed::MeshWorkload&, uint64_t, std::string_view, std::vector<TensorSpec>, std::optional<tt::tt_metal::distributed::MeshTraceId>) {}' " +
+          "'void ReleaseTraceDebugEntries(tt::tt_metal::distributed::MeshTraceId) {}' " +
+          "'}  // namespace tt::tt_metal::experimental::inspector' " +
+          "> $(@D)/inspector_stub.cpp",
 )
 
 TT_METAL_INCLUDE_DIRS = [
@@ -119,6 +337,7 @@ cc_library(
     hdrs = glob([
         "tt_metal/api/**/*.h",
         "tt_metal/api/**/*.hpp",
+        "tt_metal/api/**/*.tpp",
         "tt_metal/common/**/*.h",
         "tt_metal/common/**/*.hpp",
         "tt_metal/distributed/**/*.h",
@@ -128,7 +347,10 @@ cc_library(
         "tt_stl/**/*.h",
         "tt_stl/**/*.hpp",
     ], allow_empty = True) + [":tt_metal_flatbuffer_headers"],
-    copts = ["-std=c++20"],
+    copts = [
+        "-std=c++20",
+        "-DTT_METAL_INSTALL_ROOT=\\\"/usr/libexec/tt-metalium\\\"",
+    ],
     includes = TT_METAL_INCLUDE_DIRS,
     deps = TT_METAL_HEADER_DEPS,
 )
@@ -155,7 +377,10 @@ cc_library(
         ],
         allow_empty = True,
     ),
-    copts = ["-std=c++20"],
+    copts = [
+        "-std=c++20",
+        "-DTT_METAL_INSTALL_ROOT=\\\"/usr/libexec/tt-metalium\\\"",
+    ],
     includes = TT_METAL_INCLUDE_DIRS + [
         "tt_metal/impl",
         "tt_metal/impl/tensor",
@@ -163,4 +388,429 @@ cc_library(
     deps = [
         ":tt_metal_common",
     ],
+    linkstatic = True,
+)
+
+TT_METAL_RUNTIME_HDRS = glob(
+    [
+        "tt_metal/distributed/**/*.h",
+        "tt_metal/distributed/**/*.hpp",
+        "tt_metal/distributed/**/*.tpp",
+        "tt_metal/fabric/**/*.h",
+        "tt_metal/fabric/**/*.hpp",
+        "tt_metal/fabric/**/*.tpp",
+        "tt_metal/hw/inc/**/*.h",
+        "tt_metal/hw/inc/**/*.hpp",
+        "tt_metal/detail/**/*.h",
+        "tt_metal/detail/**/*.hpp",
+        "tt_metal/impl/allocator/**/*.h",
+        "tt_metal/impl/allocator/**/*.hpp",
+        "tt_metal/impl/allocator/**/*.tpp",
+        "tt_metal/impl/buffers/**/*.h",
+        "tt_metal/impl/buffers/**/*.hpp",
+        "tt_metal/impl/buffers/**/*.tpp",
+        "tt_metal/impl/context/**/*.h",
+        "tt_metal/impl/context/**/*.hpp",
+        "tt_metal/impl/data_format/**/*.h",
+        "tt_metal/impl/data_format/**/*.hpp",
+        "tt_metal/impl/dataflow_buffer/**/*.h",
+        "tt_metal/impl/dataflow_buffer/**/*.hpp",
+        "tt_metal/impl/debug/**/*.h",
+        "tt_metal/impl/debug/**/*.hpp",
+        "tt_metal/impl/device/**/*.h",
+        "tt_metal/impl/device/**/*.hpp",
+        "tt_metal/impl/device/**/*.tpp",
+        "tt_metal/impl/dispatch/**/*.h",
+        "tt_metal/impl/dispatch/**/*.hpp",
+        "tt_metal/impl/dispatch/**/*.tpp",
+        "tt_metal/impl/event/**/*.h",
+        "tt_metal/impl/event/**/*.hpp",
+        "tt_metal/impl/event/**/*.tpp",
+        "tt_metal/impl/flatbuffer/**/*.h",
+        "tt_metal/impl/flatbuffer/**/*.hpp",
+        "tt_metal/impl/host_api/**/*.h",
+        "tt_metal/impl/host_api/**/*.hpp",
+        "tt_metal/impl/internal/**/*.h",
+        "tt_metal/impl/internal/**/*.hpp",
+        "tt_metal/impl/kernels/**/*.h",
+        "tt_metal/impl/kernels/**/*.hpp",
+        "tt_metal/impl/kernels/**/*.tpp",
+        "tt_metal/impl/lightmetal/**/*.h",
+        "tt_metal/impl/lightmetal/**/*.hpp",
+        "tt_metal/impl/memory_tracking/**/*.h",
+        "tt_metal/impl/memory_tracking/**/*.hpp",
+        "tt_metal/impl/per_core_allocation/**/*.h",
+        "tt_metal/impl/per_core_allocation/**/*.hpp",
+        "tt_metal/impl/profiler/**/*.h",
+        "tt_metal/impl/profiler/**/*.hpp",
+        "tt_metal/impl/program/**/*.h",
+        "tt_metal/impl/program/**/*.hpp",
+        "tt_metal/impl/program/**/*.tpp",
+        "tt_metal/impl/sub_device/**/*.h",
+        "tt_metal/impl/sub_device/**/*.hpp",
+        "tt_metal/impl/sub_device/**/*.tpp",
+        "tt_metal/impl/tensor/**/*.h",
+        "tt_metal/impl/tensor/**/*.hpp",
+        "tt_metal/impl/tensor/**/*.tpp",
+        "tt_metal/impl/threading/**/*.h",
+        "tt_metal/impl/threading/**/*.hpp",
+        "tt_metal/impl/trace/**/*.h",
+        "tt_metal/impl/trace/**/*.hpp",
+        "tt_metal/jit_build/**/*.h",
+        "tt_metal/jit_build/**/*.hpp",
+        "tt_metal/llrt/**/*.h",
+        "tt_metal/llrt/**/*.hpp",
+        "tt_metal/tools/profiler/**/*.h",
+        "tt_metal/tools/profiler/**/*.hpp",
+    ],
+    allow_empty = True,
+) + [
+    ":tt_metal_hal_generated_headers",
+    ":tt_metal_inspector_stub_headers",
+    ":tt_metal_jit_server_stub_headers",
+]
+
+TT_METAL_RUNTIME_INCLUDE_DIRS = ["inspector_stubs"] + TT_METAL_INCLUDE_DIRS + [
+    "tt_metal/distributed",
+    "tt_metal/fabric",
+    "tt_metal/hw/inc",
+    "tt_metal/hw/inc/internal",
+    "tt_metal/hw/inc/internal/dataflow",
+    "tt_metal/hw/inc/internal/debug",
+    "tt_metal/hw/inc/internal/ethernet",
+    "tt_metal/hw/inc/internal/tensor",
+    "tt_metal/impl",
+    "tt_metal/impl/allocator",
+    "tt_metal/impl/buffers",
+    "tt_metal/impl/data_format",
+    "tt_metal/impl/debug",
+    "tt_metal/impl/device",
+    "tt_metal/impl/dispatch",
+    "tt_metal/impl/event",
+    "tt_metal/impl/internal",
+    "tt_metal/impl/kernels",
+    "tt_metal/impl/profiler",
+    "tt_metal/impl/program",
+    "tt_metal/impl/tensor",
+    "tt_metal/llrt",
+    "tt_metal/llrt/hal",
+]
+
+TT_METAL_RUNTIME_COPTS = [
+    "-std=c++20",
+    "-mavx",
+    "-DTT_METAL_INSTALL_ROOT=\\\"/usr/libexec/tt-metalium\\\"",
+]
+
+TT_METAL_HAL_INCLUDE_DIRS = [
+    "tt_metal/llrt",
+    "tt_metal/llrt/hal",
+] + TT_METAL_RUNTIME_INCLUDE_DIRS
+
+TT_METAL_FLATBUFFER_SRCS = [
+    "tt_metal/impl/flatbuffer/base_types_to_flatbuffer.cpp",
+    "tt_metal/impl/flatbuffer/buffer_types_to_flatbuffer.cpp",
+    "tt_metal/impl/flatbuffer/program_types_to_flatbuffer.cpp",
+]
+
+TT_METAL_JIT_BUILD_SRCS = [
+    "tt_metal/jit_build/build.cpp",
+    "tt_metal/jit_build/build_cache_telemetry.cpp",
+    "tt_metal/jit_build/build_env_manager.cpp",
+    "tt_metal/jit_build/data_format.cpp",
+    "tt_metal/jit_build/depend.cpp",
+    "tt_metal/jit_build/genfiles.cpp",
+    "tt_metal/jit_build/jit_build_cache.cpp",
+    "tt_metal/jit_build/jit_build_options.cpp",
+    "tt_metal/jit_build/jit_build_utils.cpp",
+    "tt_metal/jit_build/jit_device_config.cpp",
+    "tt_metal/jit_build/kernel_args.cpp",
+    "tt_metal/jit_build/precompiled.cpp",
+]
+
+cc_library(
+    name = "tt_metal_hal_1xx_common_upstream",
+    srcs = [
+        "tt_metal/llrt/hal/tt-1xx/hal_1xx_common.cpp",
+    ],
+    hdrs = TT_METAL_RUNTIME_HDRS,
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TT_METAL_HAL_INCLUDE_DIRS + [
+        "tt_metal/llrt/hal/tt-1xx",
+    ],
+    deps = [
+        ":tt_metal_common",
+    ],
+    linkstatic = True,
+)
+
+cc_library(
+    name = "tt_metal_hal_wormhole_upstream",
+    srcs = [
+        "tt_metal/llrt/hal/tt-1xx/wormhole/wh_hal.cpp",
+        "tt_metal/llrt/hal/tt-1xx/wormhole/wh_hal_active_eth.cpp",
+        "tt_metal/llrt/hal/tt-1xx/wormhole/wh_hal_idle_eth.cpp",
+        "tt_metal/llrt/hal/tt-1xx/wormhole/wh_hal_tensix.cpp",
+    ],
+    hdrs = TT_METAL_RUNTIME_HDRS,
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TT_METAL_HAL_INCLUDE_DIRS + [
+        "tt_metal/hw/inc/internal/tt-1xx/wormhole",
+        "tt_metal/hw/inc/internal/tt-1xx/wormhole/noc",
+        "tt_metal/hw/inc/internal/tt-1xx/wormhole/wormhole_b0_defines",
+        "tt_metal/hw/inc/internal/tt-1xx",
+        "tt_metal/llrt/hal/tt-1xx",
+    ],
+    deps = [
+        ":tt_metal_hal_1xx_common_upstream",
+        "//tt_metal/hw/inc/internal/tt-1xx/wormhole:rv-wh-hdrs",
+    ],
+    linkstatic = True,
+)
+
+cc_library(
+    name = "tt_metal_hal_blackhole_upstream",
+    srcs = [
+        "tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal.cpp",
+        "tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal_active_eth.cpp",
+        "tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal_dram.cpp",
+        "tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal_idle_eth.cpp",
+        "tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal_tensix.cpp",
+    ],
+    hdrs = TT_METAL_RUNTIME_HDRS,
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TT_METAL_HAL_INCLUDE_DIRS + [
+        "tt_metal/hw/inc/internal/tt-1xx/blackhole",
+        "tt_metal/hw/inc/internal/tt-1xx/blackhole/noc",
+        "tt_metal/hw/inc/internal/tt-1xx",
+        "tt_metal/llrt/hal/tt-1xx",
+    ],
+    deps = [
+        ":tt_metal_hal_1xx_common_upstream",
+    ],
+    linkstatic = True,
+)
+
+cc_library(
+    name = "tt_metal_hal_2xx_common_upstream",
+    srcs = [
+        "tt_metal/llrt/hal/tt-2xx/hal_2xx_common.cpp",
+    ],
+    hdrs = TT_METAL_RUNTIME_HDRS,
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TT_METAL_HAL_INCLUDE_DIRS + [
+        "tt_metal/hw/inc/internal/tt-2xx",
+        "tt_metal/hw/inc/internal/tt-2xx/dataflow_buffer",
+        "tt_metal/llrt/hal/tt-2xx",
+    ],
+    deps = [
+        ":tt_metal_common",
+    ],
+    linkstatic = True,
+)
+
+cc_library(
+    name = "tt_metal_hal_quasar_upstream",
+    srcs = [
+        "tt_metal/llrt/hal/tt-2xx/quasar/qa_hal.cpp",
+        "tt_metal/llrt/hal/tt-2xx/quasar/qa_hal_active_eth.cpp",
+        "tt_metal/llrt/hal/tt-2xx/quasar/qa_hal_idle_eth.cpp",
+        "tt_metal/llrt/hal/tt-2xx/quasar/qa_hal_tensix.cpp",
+    ],
+    hdrs = TT_METAL_RUNTIME_HDRS,
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TT_METAL_HAL_INCLUDE_DIRS + [
+        "tt_metal/hw/inc/internal/tt-2xx/quasar",
+        "tt_metal/hw/inc/internal/tt-2xx/quasar/noc",
+        "tt_metal/hw/inc/internal/tt-2xx/quasar/noc/registers",
+        "tt_metal/hw/inc/internal/tt-2xx/quasar/overlay",
+        "tt_metal/hw/inc/internal/tt-2xx/quasar/overlay/meta",
+        "tt_metal/hw/inc/internal/tt-2xx",
+        "tt_metal/hw/inc/internal/tt-2xx/dataflow_buffer",
+        "tt_metal/llrt/hal/tt-2xx",
+    ],
+    deps = [
+        ":tt_metal_hal_2xx_common_upstream",
+    ],
+    linkstatic = True,
+)
+
+cc_library(
+    name = "tt_metal_host_tensor_runtime_support_upstream",
+    srcs = [
+        "tt_metal/impl/tensor/libtt_fabric_disabled_host_tensor_runtime.cpp",
+    ],
+    hdrs = TT_METAL_RUNTIME_HDRS,
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TT_METAL_RUNTIME_INCLUDE_DIRS,
+    deps = [
+        ":tt_metal_common",
+        ":tt_metal_host_tensor_upstream",
+    ],
+    alwayslink = True,
+    linkstatic = True,
+)
+
+cc_library(
+    name = "tt_metal_device_tensor_upstream",
+    srcs = [
+        "tt_metal/distributed/d2h_socket.cpp",
+        "tt_metal/distributed/dispatch_context.cpp",
+        "tt_metal/distributed/distributed.cpp",
+        "tt_metal/distributed/distributed_host_buffer.cpp",
+        "tt_metal/distributed/dummy_mesh_command_queue.cpp",
+        "tt_metal/distributed/fd_mesh_command_queue.cpp",
+        "tt_metal/distributed/h2d_socket.cpp",
+        "tt_metal/distributed/h2d_stream_service_descriptor.cpp",
+        "tt_metal/distributed/hd_socket_descriptor.cpp",
+        "tt_metal/distributed/inter_process_counter_channel.cpp",
+        "tt_metal/distributed/mesh_buffer.cpp",
+        "tt_metal/distributed/mesh_command_queue_base.cpp",
+        "tt_metal/distributed/mesh_device.cpp",
+        "tt_metal/distributed/mesh_device_view.cpp",
+        "tt_metal/distributed/mesh_event.cpp",
+        "tt_metal/distributed/mesh_socket_serialization.cpp",
+        "tt_metal/distributed/mesh_trace.cpp",
+        "tt_metal/distributed/mesh_workload.cpp",
+        "tt_metal/distributed/mesh_workload_utils.cpp",
+        "tt_metal/distributed/multihost/distributed_context.cpp",
+        "tt_metal/distributed/multihost/single_host_context.cpp",
+        "tt_metal/distributed/named_shm.cpp",
+        "tt_metal/distributed/pcie_core_writer.cpp",
+        "tt_metal/distributed/pinned_memory.cpp",
+        "tt_metal/distributed/realtime_profiler_manager.cpp",
+        "tt_metal/distributed/sd_mesh_command_queue.cpp",
+        "tt_metal/distributed/shm_resource_tracker.cpp",
+        "tt_metal/distributed/system_mesh.cpp",
+        ":tt_metal_inspector_stub_source",
+        "tt_metal/fabric/fabric_types.cpp",
+        "tt_metal/impl/buffers/circular_buffer.cpp",
+        "tt_metal/impl/buffers/circular_buffer_config.cpp",
+        "tt_metal/impl/buffers/dispatch.cpp",
+        "tt_metal/impl/buffers/dram_core_prefetcher_manager.cpp",
+        "tt_metal/impl/buffers/drisc_l1_arena.cpp",
+        "tt_metal/impl/buffers/global_circular_buffer.cpp",
+        "tt_metal/impl/buffers/global_semaphore.cpp",
+        "tt_metal/impl/buffers/semaphore.cpp",
+        "tt_metal/impl/buffers/tensor_accessor_args.cpp",
+        "tt_metal/impl/context/metal_context.cpp",
+        "tt_metal/impl/context/metal_env.cpp",
+        "tt_metal/impl/data_format/bfloat2.cpp",
+        "tt_metal/impl/data_format/bfloat4.cpp",
+        "tt_metal/impl/data_format/bfloat8.cpp",
+        "tt_metal/impl/data_format/bfloat16.cpp",
+        "tt_metal/impl/data_format/bfloat16_utils.cpp",
+        "tt_metal/impl/data_format/blockfloat_common.cpp",
+        "tt_metal/impl/data_format/float8.cpp",
+        "tt_metal/impl/data_format/int8.cpp",
+        "tt_metal/impl/data_format/mx_common.cpp",
+        "tt_metal/impl/data_format/mxfp4.cpp",
+        "tt_metal/impl/data_format/mxfp6.cpp",
+        "tt_metal/impl/data_format/mxfp8.cpp",
+        "tt_metal/impl/data_format/tilize_utils.cpp",
+        "tt_metal/impl/data_format/uint8.cpp",
+        "tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp",
+        "tt_metal/impl/device/device.cpp",
+        "tt_metal/impl/device/device_manager.cpp",
+        "tt_metal/impl/device/dispatch.cpp",
+        "tt_metal/impl/device/experimental/device.cpp",
+        "tt_metal/impl/device/firmware/command_queue_initializer.cpp",
+        "tt_metal/impl/device/firmware/dispatch_kernel_initializer.cpp",
+        "tt_metal/impl/device/firmware/fabric_firmware_initializer.cpp",
+        "tt_metal/impl/device/firmware/firmware_initializer.cpp",
+        "tt_metal/impl/device/firmware/profiler_initializer.cpp",
+        "tt_metal/impl/device/firmware/risc_firmware_initializer.cpp",
+        "tt_metal/impl/device/mock_allocator.cpp",
+        "tt_metal/impl/device/mock_device.cpp",
+        "tt_metal/impl/device/mock_device_util.cpp",
+        "tt_metal/impl/dispatch/command_queue_common.cpp",
+        "tt_metal/impl/dispatch/cq_shared_state.cpp",
+        "tt_metal/impl/dispatch/data_collection.cpp",
+        "tt_metal/impl/dispatch/data_collector.cpp",
+        "tt_metal/impl/dispatch/debug_tools.cpp",
+        "tt_metal/impl/dispatch/device_command.cpp",
+        "tt_metal/impl/dispatch/device_command_calculator.cpp",
+        "tt_metal/impl/dispatch/dispatch_core_common.cpp",
+        "tt_metal/impl/dispatch/dispatch_core_manager.cpp",
+        "tt_metal/impl/dispatch/dispatch_mem_map.cpp",
+        "tt_metal/impl/dispatch/dispatch_query_manager.cpp",
+        "tt_metal/impl/dispatch/dispatch_telemetry.cpp",
+        "tt_metal/impl/dispatch/hardware_command_queue.cpp",
+        "tt_metal/impl/dispatch/host_runtime_commands.cpp",
+        "tt_metal/impl/dispatch/kernel_config/dispatch.cpp",
+        "tt_metal/impl/dispatch/kernel_config/dispatch_s.cpp",
+        "tt_metal/impl/dispatch/kernel_config/fd_kernel.cpp",
+        "tt_metal/impl/dispatch/kernel_config/prefetch.cpp",
+        "tt_metal/impl/dispatch/kernel_config/relay_mux.cpp",
+        "tt_metal/impl/dispatch/launch_message_ring_buffer_state.cpp",
+        "tt_metal/impl/dispatch/realtime_profiler_tracy_handler.cpp",
+        "tt_metal/impl/dispatch/ringbuffer_cache.cpp",
+        "tt_metal/impl/dispatch/simple_trace_allocator.cpp",
+        "tt_metal/impl/dispatch/system_memory_cq_interface.cpp",
+        "tt_metal/impl/dispatch/system_memory_manager.cpp",
+        "tt_metal/impl/dispatch/topology.cpp",
+        "tt_metal/impl/dispatch/util/dispatch_settings.cpp",
+        "tt_metal/impl/dispatch/worker_config_buffer.cpp",
+        "tt_metal/impl/event/dispatch.cpp",
+        "tt_metal/impl/graph/graph_tracking.cpp",
+        "tt_metal/impl/host_api/temp_quasar_api.cpp",
+        "tt_metal/impl/host_api/tt_metal.cpp",
+        "tt_metal/impl/internal/service/service_core_manager.cpp",
+        "tt_metal/impl/kernels/kernel.cpp",
+        "tt_metal/impl/kernels/kernel_types.cpp",
+        "tt_metal/impl/lightmetal/host_api_capture_helpers.cpp",
+        "tt_metal/impl/lightmetal/lightmetal_capture.cpp",
+        "tt_metal/impl/lightmetal/lightmetal_capture_utils.cpp",
+        "tt_metal/impl/memory_tracking/memory_stats_shm.cpp",
+        "tt_metal/impl/memory_tracking/shm_tracking_processor.cpp",
+        "tt_metal/impl/memory_tracking/update_allocator_stats.cpp",
+        "tt_metal/impl/per_core_allocation/buffer.cpp",
+        "tt_metal/impl/per_core_allocation/memory_config.cpp",
+        "tt_metal/impl/per_core_allocation/mesh_buffer.cpp",
+        "tt_metal/impl/profiler/profiler.cpp",
+        "tt_metal/impl/profiler/profiler_analysis.cpp",
+        "tt_metal/impl/profiler/profiler_state_manager.cpp",
+        "tt_metal/impl/profiler/tt_metal_profiler.cpp",
+        "tt_metal/impl/program/dispatch.cpp",
+        "tt_metal/impl/program/program.cpp",
+        "tt_metal/impl/program/program_descriptor_patching.cpp",
+        "tt_metal/impl/program/program_descriptors.cpp",
+        "tt_metal/impl/program/program_device_map.cpp",
+        "tt_metal/impl/sub_device/sub_device.cpp",
+        "tt_metal/impl/sub_device/sub_device_manager.cpp",
+        "tt_metal/impl/sub_device/sub_device_manager_tracker.cpp",
+        "tt_metal/impl/tensor/mesh_tensor.cpp",
+        "tt_metal/impl/tensor/tensor_apis.cpp",
+        "tt_metal/impl/tensor/tensor_impl.cpp",
+        "tt_metal/impl/threading/thread_pool.cpp",
+        "tt_metal/impl/trace/dispatch.cpp",
+        "tt_metal/impl/trace/trace_buffer.cpp",
+        "tt_metal/detail/reports/memory_reporter.cpp",
+        "tt_metal/llrt/core_descriptor.cpp",
+        "tt_metal/llrt/firmware_capability.cpp",
+        "tt_metal/llrt/hal.cpp",
+        "tt_metal/llrt/llrt.cpp",
+        "tt_metal/llrt/metal_soc_descriptor.cpp",
+        "tt_metal/llrt/rtoptions.cpp",
+        "tt_metal/llrt/tlb_config.cpp",
+        "tt_metal/llrt/tt_cluster.cpp",
+        "tt_metal/llrt/tt_elffile.cpp",
+        "tt_metal/llrt/tt_memory.cpp",
+        "tt_metal/llrt/tunnels_from_mmio_device.cpp",
+    ] + TT_METAL_FLATBUFFER_SRCS + TT_METAL_JIT_BUILD_SRCS,
+    hdrs = TT_METAL_RUNTIME_HDRS,
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TT_METAL_RUNTIME_INCLUDE_DIRS,
+    deps = [
+        ":tt_metal_common",
+        ":tt_metal_hal_blackhole_upstream",
+        ":tt_metal_hal_quasar_upstream",
+        ":tt_metal_hal_wormhole_upstream",
+        ":tt_metal_host_tensor_runtime_support_upstream",
+        ":tt_metal_host_tensor_upstream",
+    ],
+    linkopts = [
+        "-lnuma",
+    ],
+    linkstatic = True,
 )
