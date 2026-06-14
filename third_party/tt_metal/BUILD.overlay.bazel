@@ -113,17 +113,17 @@ filegroup(
 )
 
 BLACKHOLE_RUNTIME_PROCS = [
-    ("brisc", "brisc", "BRISC"),
-    ("ncrisc", "ncrisc", "NCRISC"),
-    ("ierisc", "ierisc", "IERISC"),
-    ("subordinate_ierisc", "subordinate_ierisc", "SUBORDINATE_IERISC"),
-    ("trisc=0", "trisc0", "TRISC=0"),
-    ("trisc=1", "trisc1", "TRISC=1"),
-    ("trisc=2", "trisc2", "TRISC=2"),
-    ("aerisc", "aerisc", "AERISC"),
-    ("main_aerisc", "main_aerisc", "MAIN_AERISC"),
-    ("subordinate_aerisc", "subordinate_aerisc", "SUBORDINATE_AERISC"),
-    ("drisc", "drisc", "DRISC"),
+    ("brisc", "BRISC"),
+    ("ncrisc", "NCRISC"),
+    ("ierisc", "IERISC"),
+    ("subordinate_ierisc", "SUBORDINATE_IERISC"),
+    ("trisc0", "TRISC=0"),
+    ("trisc1", "TRISC=1"),
+    ("trisc2", "TRISC=2"),
+    ("aerisc", "AERISC"),
+    ("main_aerisc", "MAIN_AERISC"),
+    ("subordinate_aerisc", "SUBORDINATE_AERISC"),
+    ("drisc", "DRISC"),
 ]
 
 BLACKHOLE_RUNTIME_KINDS = [
@@ -131,10 +131,12 @@ BLACKHOLE_RUNTIME_KINDS = [
     ("kernel", "KERNEL"),
 ]
 
+BLACKHOLE_RUNTIME_LD_DIR = "runtime/hw/toolchain/blackhole"
+
 BLACKHOLE_RUNTIME_LD_OUTS = [
-    "runtime/hw/toolchain/blackhole/%s_%s.ld" % (kind, proc_file)
+    "%s/%s_%s.ld" % (BLACKHOLE_RUNTIME_LD_DIR, kind, proc)
     for kind, _ in BLACKHOLE_RUNTIME_KINDS
-    for _, proc_file, _ in BLACKHOLE_RUNTIME_PROCS
+    for proc, _ in BLACKHOLE_RUNTIME_PROCS
 ]
 
 BLACKHOLE_RUNTIME_OBJS = [
@@ -206,13 +208,10 @@ pkg_tar(
 
 genrule(
     name = "tt_metal_blackhole_runtime_hw_assets",
-    srcs = glob([
-        "tt_metal/hw/firmware/src/tt-1xx/**/*",
-        "tt_metal/hw/inc/**/*",
-        "tt_metal/hw/toolchain/**/*",
-        "tt_metal/tt-llk/common/**/*",
-        "tt_metal/tt-llk/tt_llk_blackhole/**/*",
-    ], allow_empty = True),
+    srcs = [
+        "tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h",
+        "tt_metal/hw/toolchain/main.ld",
+    ],
     tools = [
         "@//third_party/tt_metal:blackhole_runtime_hw_assets.sh",
         "@sfpi//:all_files",
@@ -223,12 +222,14 @@ genrule(
         "bash",
         "'$(location @//third_party/tt_metal:blackhole_runtime_hw_assets.sh)'",
         "'$(location tt_metal/hw/toolchain/main.ld)'",
+        "'$(location tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h)'",
         "'$(location @sfpi//:riscv_gpp)'",
-        "'$(RULEDIR)'",
-        "'%s'" % " ".join(["%s:%s:%s" % proc for proc in BLACKHOLE_RUNTIME_PROCS]),
-        "'%s'" % " ".join(["%s:%s" % kind for kind in BLACKHOLE_RUNTIME_KINDS]),
+        "'$(RULEDIR)/%s'" % BLACKHOLE_RUNTIME_LD_DIR,
+    ] + [
+        "'%s_%s.ld' '%s' '%s'" % (kind, proc, kind_define, proc_define)
+        for kind, kind_define in BLACKHOLE_RUNTIME_KINDS
+        for proc, proc_define in BLACKHOLE_RUNTIME_PROCS
     ]),
-    local = True,
 )
 
 cc_binary(
@@ -322,7 +323,6 @@ kRuntimeArchiveFingerprint:
 .section .note.GNU-stack,"",@progbits
 EOF
 """,
-    local = True,
 )
 
 cc_library(
