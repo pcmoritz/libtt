@@ -87,6 +87,11 @@ PJRT_Error* DispatchByElementType(PJRT_Buffer_Type type, F&& f) {
   }
 }
 
+PJRT_Error* RequireTensor(const PJRT_Buffer& buffer, const ttnn::Tensor** out) {
+  *out = buffer.TtnnTensor();
+  return *out == nullptr ? FailedPrecondition("buffer has been deleted") : nullptr;
+}
+
 PJRT_Error* ShapeFromDims(const std::vector<int64_t>& dims, tt::tt_metal::Shape* out) {
   tt::tt_metal::Shape::Container values;
   for (int64_t dim : dims) {
@@ -169,20 +174,6 @@ PJRT_Error* TensorToBytes(const ttnn::Tensor& tensor, std::vector<std::byte>* ou
     CopyVectorToBytes(values, out);
   } catch (const std::exception& e) {
     return Internal(std::string("failed to read TTNN tensor to host buffer: ") + e.what());
-  }
-  return nullptr;
-}
-
-template <typename T>
-PJRT_Error* CopyTensorToDevice(const ttnn::Tensor& tensor,
-                               const ttnn::TensorSpec& spec,
-                               tt::tt_metal::distributed::MeshDevice* mesh_device,
-                               ttnn::Tensor* out) {
-  try {
-    std::vector<T> values = tensor.to_vector<T>();
-    *out = ttnn::Tensor::from_vector(std::move(values), spec, mesh_device);
-  } catch (const std::exception& e) {
-    return Internal(std::string("failed to copy TTNN tensor to device: ") + e.what());
   }
   return nullptr;
 }
@@ -389,12 +380,9 @@ PJRT_Error* CopyPjrtBufferToTtnnDeviceTensor(
   if (out == nullptr) {
     return InvalidArgument("out must not be null");
   }
-  if (buffer.IsDeleted()) {
-    return FailedPrecondition("buffer has been deleted");
-  }
-  const ttnn::Tensor* tensor = buffer.TtnnTensor();
-  if (tensor == nullptr) {
-    return FailedPrecondition("buffer has no TTNN tensor storage");
+  const ttnn::Tensor* tensor = nullptr;
+  if (PJRT_Error* error = RequireTensor(buffer, &tensor)) {
+    return error;
   }
   if (tensor->storage_type() == tt::tt_metal::StorageType::DEVICE &&
       tensor->layout() == ttnn::TILE_LAYOUT &&
@@ -403,25 +391,22 @@ PJRT_Error* CopyPjrtBufferToTtnnDeviceTensor(
     return nullptr;
   }
 
-  std::optional<ttnn::TensorSpec> tensor_spec;
-  if (PJRT_Error* error = CreateTensorSpec(buffer.buffer_type, buffer.dims,
-                                           tt::tt_metal::Layout::TILE,
-                                           ttnn::DRAM_MEMORY_CONFIG, &tensor_spec)) {
-    return error;
+  try {
+    ttnn::Tensor host_tensor =
+        tensor->storage_type() == tt::tt_metal::StorageType::DEVICE ? tensor->cpu() : *tensor;
+    ttnn::Tensor tiled =
+        host_tensor.layout() == ttnn::TILE_LAYOUT ? host_tensor : host_tensor.to_layout(ttnn::TILE_LAYOUT);
+    *out = tiled.to_device(mesh_device, ttnn::DRAM_MEMORY_CONFIG);
+  } catch (const std::exception& e) {
+    return Internal(std::string("failed to copy TTNN tensor to device: ") + e.what());
   }
-  return DispatchByElementType(buffer.buffer_type, [&](auto tag) {
-    using Element = decltype(tag);
-    return CopyTensorToDevice<Element>(*tensor, *tensor_spec, mesh_device, out);
-  });
+  return nullptr;
 }
 
 PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::byte>* out) {
-  if (buffer.IsDeleted()) {
-    return FailedPrecondition("buffer has been deleted");
-  }
-  const ttnn::Tensor* tensor = buffer.TtnnTensor();
-  if (tensor == nullptr) {
-    return FailedPrecondition("buffer has no TTNN tensor storage");
+  const ttnn::Tensor* tensor = nullptr;
+  if (PJRT_Error* error = RequireTensor(buffer, &tensor)) {
+    return error;
   }
 
   if (PJRT_Error* error = DispatchByElementType(buffer.buffer_type, [&](auto tag) {
@@ -443,12 +428,9 @@ PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::b
 }
 
 PJRT_Error* TtnnTensorPhysicalByteSize(const PJRT_Buffer& buffer, size_t* out) {
-  if (buffer.IsDeleted()) {
-    return FailedPrecondition("buffer has been deleted");
-  }
-  const ttnn::Tensor* tensor = buffer.TtnnTensor();
-  if (tensor == nullptr) {
-    return FailedPrecondition("buffer has no TTNN tensor storage");
+  const ttnn::Tensor* tensor = nullptr;
+  if (PJRT_Error* error = RequireTensor(buffer, &tensor)) {
+    return error;
   }
   const uint64_t physical_volume = tensor->physical_volume();
   const uint32_t element_size = tensor->element_size();
