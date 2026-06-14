@@ -239,9 +239,38 @@ cc_binary(
     deps = ["@llvm_zstd//:zstd"],
 )
 
+filegroup(
+    name = "tt_metal_runtime_sources",
+    srcs = glob([
+        "tt_metal/**",
+        "ttnn/**",
+    ]),
+)
+
 pkg_tar(
-    name = "tt_metal_blackhole_runtime_hw_archive",
-    srcs = [":tt_metal_blackhole_runtime_hw_assets"],
+    name = "sfpi_runtime_archive",
+    srcs = ["@sfpi//:all_files"],
+    extension = "tar",
+    mode = "0755",
+    owner = "0.0",
+    ownername = ".",
+    portable_mtime = True,
+    remap_paths = {
+        "../+http_archive+sfpi/": "runtime/sfpi/",
+        "../sfpi/": "runtime/sfpi/",
+        "external/+http_archive+sfpi/": "runtime/sfpi/",
+        "external/sfpi/": "runtime/sfpi/",
+    },
+    strip_prefix = ".",
+)
+
+pkg_tar(
+    name = "tt_metal_runtime_archive",
+    deps = [":sfpi_runtime_archive"],
+    srcs = [
+        ":tt_metal_blackhole_runtime_hw_assets",
+        ":tt_metal_runtime_sources",
+    ],
     compressor = ":libtt_zstd_compressor",
     compressor_args = "19",
     extension = "tar.zst",
@@ -250,21 +279,24 @@ pkg_tar(
     ownername = ".",
     portable_mtime = True,
     remap_paths = {
+        "../+http_archive+tt_metal/": "",
+        "../tt_metal/": "",
         "external/+http_archive+tt_metal/": "",
+        "external/tt_metal/": "",
     },
     strip_prefix = ".",
 )
 
 genrule(
-    name = "tt_metal_blackhole_runtime_hw_embedded_src",
-    srcs = [":tt_metal_blackhole_runtime_hw_archive"],
+    name = "tt_metal_runtime_embedded_src",
+    srcs = [":tt_metal_runtime_archive"],
     outs = [
         "libtt_embedded_runtime_assets.cc",
         "libtt_embedded_runtime_assets.h",
     ],
     cmd = """
 set -eu
-archive="$(location :tt_metal_blackhole_runtime_hw_archive)"
+archive="$(location :tt_metal_runtime_archive)"
 fingerprint=$$(sha256sum "$$archive" | cut -d ' ' -f 1)
 cc="$(@D)/libtt_embedded_runtime_assets.cc"
 hdr="$(@D)/libtt_embedded_runtime_assets.h"
@@ -276,9 +308,9 @@ cat > "$$hdr" <<'EOF'
 
 namespace libtt::tt_metal_runtime_assets {
 
-extern const unsigned char kBlackholeRuntimeHwArchiveZstd[];
-extern const std::size_t kBlackholeRuntimeHwArchiveZstdSize;
-extern const char kBlackholeRuntimeHwArchiveFingerprint[];
+extern const unsigned char kRuntimeArchiveZstd[];
+extern const std::size_t kRuntimeArchiveZstdSize;
+extern const char kRuntimeArchiveFingerprint[];
 
 }  // namespace libtt::tt_metal_runtime_assets
 EOF
@@ -288,15 +320,14 @@ cat > "$$cc" <<'EOF'
 
 namespace libtt::tt_metal_runtime_assets {
 
-alignas(16) const unsigned char kBlackholeRuntimeHwArchiveZstd[] = {
+alignas(16) const unsigned char kRuntimeArchiveZstd[] = {
 EOF
 od -An -v -t x1 "$$archive" |
   sed 's/^[[:space:]]*//;s/[[:space:]]*$$//;s/[[:space:]][[:space:]]*/, 0x/g;s/^/  0x/;s/$$/,/' >> "$$cc"
 cat >> "$$cc" <<EOF
 };
-const std::size_t kBlackholeRuntimeHwArchiveZstdSize =
-    sizeof(kBlackholeRuntimeHwArchiveZstd);
-const char kBlackholeRuntimeHwArchiveFingerprint[] = "$$fingerprint";
+const std::size_t kRuntimeArchiveZstdSize = sizeof(kRuntimeArchiveZstd);
+const char kRuntimeArchiveFingerprint[] = "$$fingerprint";
 
 }  // namespace libtt::tt_metal_runtime_assets
 EOF
@@ -305,7 +336,7 @@ EOF
 )
 
 cc_library(
-    name = "tt_metal_blackhole_runtime_hw_embedded",
+    name = "tt_metal_runtime_embedded",
     srcs = ["libtt_embedded_runtime_assets.cc"],
     hdrs = ["libtt_embedded_runtime_assets.h"],
     includes = ["."],

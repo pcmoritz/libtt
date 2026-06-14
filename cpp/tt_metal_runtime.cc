@@ -7,40 +7,21 @@
 
 #include <tt_metal/llrt/rtoptions.hpp>
 
+#include <cerrno>
 #include <cstdlib>
-#include <dlfcn.h>
+#include <cstring>
 #include <filesystem>
+#include <fcntl.h>
 #include <map>
+#include <memory>
 #include <mutex>
-#include <optional>
+#include <stdexcept>
 #include <string>
+#include <unistd.h>
 
 namespace {
 
 using tt::tt_metal::distributed::MeshDevice;
-
-bool IsTtMetalRuntimeRoot(const std::filesystem::path& path) {
-  return std::filesystem::is_directory(path / "tt_metal");
-}
-
-bool IsTtMetalRuntimeAssetRoot(const std::filesystem::path& path) {
-  return std::filesystem::is_regular_file(
-             path / "runtime/hw/toolchain/blackhole/firmware_brisc.ld") &&
-         std::filesystem::is_regular_file(
-             path / "runtime/hw/lib/blackhole/tmu-crt0.o");
-}
-
-bool IsSafeRelativePath(const std::filesystem::path& relative_path) {
-  if (relative_path.empty() || relative_path.is_absolute()) {
-    return false;
-  }
-  for (const std::filesystem::path& component : relative_path) {
-    if (component == "..") {
-      return false;
-    }
-  }
-  return true;
-}
 
 struct ArchiveReadDeleter {
   void operator()(archive* value) const {
@@ -50,205 +31,103 @@ struct ArchiveReadDeleter {
   }
 };
 
-bool ExtractEmbeddedRuntimeArchive(const std::filesystem::path& root) {
+class ScopedCurrentDirectory {
+ public:
+  explicit ScopedCurrentDirectory(const std::filesystem::path& path)
+      : original_fd_(open(".", O_RDONLY | O_CLOEXEC)) {
+    if (original_fd_ == -1) {
+      throw std::runtime_error("failed to save current directory: " +
+                               std::string(std::strerror(errno)));
+    }
+    if (chdir(path.c_str()) != 0) {
+      const std::string message =
+          "failed to enter tt-metal runtime directory: " +
+          std::string(std::strerror(errno));
+      close(original_fd_);
+      original_fd_ = -1;
+      throw std::runtime_error(message);
+    }
+  }
+
+  ScopedCurrentDirectory(const ScopedCurrentDirectory&) = delete;
+  ScopedCurrentDirectory& operator=(const ScopedCurrentDirectory&) = delete;
+
+  ~ScopedCurrentDirectory() {
+    if (original_fd_ != -1) {
+      fchdir(original_fd_);
+      close(original_fd_);
+    }
+  }
+
+ private:
+  int original_fd_;
+};
+
+void ExtractEmbeddedRuntimeArchive(const std::filesystem::path& root) {
   namespace embedded = libtt::tt_metal_runtime_assets;
-  if (embedded::kBlackholeRuntimeHwArchiveZstdSize == 0) {
-    return false;
+  if (embedded::kRuntimeArchiveZstdSize == 0) {
+    throw std::runtime_error("embedded tt-metal runtime archive is empty");
   }
 
   std::error_code error;
   std::filesystem::create_directories(root, error);
   if (error) {
-    return false;
+    throw std::runtime_error("failed to create tt-metal runtime directory: " +
+                             error.message());
   }
 
   std::unique_ptr<archive, ArchiveReadDeleter> reader(archive_read_new());
   if (!reader) {
-    return false;
+    throw std::runtime_error("failed to allocate tt-metal runtime archive reader");
   }
+  ScopedCurrentDirectory scoped_runtime_root(root);
   if (archive_read_support_filter_zstd(reader.get()) != ARCHIVE_OK ||
       archive_read_support_format_tar(reader.get()) != ARCHIVE_OK ||
-      archive_read_open_memory(reader.get(),
-                               embedded::kBlackholeRuntimeHwArchiveZstd,
-                               embedded::kBlackholeRuntimeHwArchiveZstdSize) !=
-          ARCHIVE_OK) {
-    return false;
+      archive_read_open_memory(reader.get(), embedded::kRuntimeArchiveZstd,
+                               embedded::kRuntimeArchiveZstdSize) != ARCHIVE_OK) {
+    throw std::runtime_error("failed to open embedded tt-metal runtime archive");
   }
 
   archive_entry* entry = nullptr;
   while (true) {
     const int status = archive_read_next_header(reader.get(), &entry);
     if (status == ARCHIVE_EOF) {
-      return true;
+      return;
     }
     if (status != ARCHIVE_OK || entry == nullptr) {
-      return false;
+      throw std::runtime_error("failed to read embedded tt-metal runtime archive");
     }
 
     const char* pathname = archive_entry_pathname(entry);
     if (pathname == nullptr || pathname[0] == '\0') {
-      return false;
-    }
-    const std::filesystem::path relative_path(pathname);
-    if (!IsSafeRelativePath(relative_path)) {
-      return false;
+      throw std::runtime_error("embedded tt-metal runtime archive has an empty path");
     }
 
-    const mode_t file_type = archive_entry_filetype(entry);
-    if (file_type != AE_IFDIR && file_type != AE_IFREG) {
-      return false;
-    }
-
-    const std::filesystem::path output_path = root / relative_path;
-    const std::string output_path_string = output_path.string();
-    archive_entry_set_pathname(entry, output_path_string.c_str());
-    if (archive_read_extract(reader.get(), entry,
-                             ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM |
-                                 ARCHIVE_EXTRACT_SECURE_SYMLINKS) != ARCHIVE_OK) {
-      return false;
+    constexpr int kExtractFlags = ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM |
+                                  ARCHIVE_EXTRACT_SECURE_SYMLINKS |
+                                  ARCHIVE_EXTRACT_SECURE_NODOTDOT |
+                                  ARCHIVE_EXTRACT_SECURE_NOABSOLUTEPATHS;
+    if (archive_read_extract(reader.get(), entry, kExtractFlags) != ARCHIVE_OK) {
+      throw std::runtime_error("failed to extract embedded tt-metal runtime archive");
     }
   }
 }
 
-std::optional<std::filesystem::path> MaterializeEmbeddedRuntimeAssets() {
+std::filesystem::path MaterializeEmbeddedRuntimeRoot() {
   namespace embedded = libtt::tt_metal_runtime_assets;
-  if (embedded::kBlackholeRuntimeHwArchiveZstdSize == 0) {
-    return std::nullopt;
-  }
-
   std::error_code error;
   const std::filesystem::path temp_root =
       std::filesystem::temp_directory_path(error);
   if (error) {
-    return std::nullopt;
+    throw std::runtime_error("failed to locate temporary directory: " +
+                             error.message());
   }
   const std::filesystem::path root =
       temp_root / ("libtt-tt-metal-runtime-assets-" +
-                   std::string(embedded::kBlackholeRuntimeHwArchiveFingerprint));
+                   std::string(embedded::kRuntimeArchiveFingerprint));
 
-  if (!ExtractEmbeddedRuntimeArchive(root) || !IsTtMetalRuntimeAssetRoot(root)) {
-    return std::nullopt;
-  }
+  ExtractEmbeddedRuntimeArchive(root);
   return root;
-}
-
-bool IsSfpiRoot(const std::filesystem::path& path) {
-  return std::filesystem::is_regular_file(
-             path / "compiler/bin/riscv-tt-elf-g++") &&
-         std::filesystem::is_regular_file(path / "include/sfpi.h");
-}
-
-std::optional<std::filesystem::path> FindSfpiRootInExternal(
-    const std::filesystem::path& external_root) {
-  std::error_code error;
-  if (!std::filesystem::is_directory(external_root, error)) {
-    return std::nullopt;
-  }
-
-  for (const char* repo_name : {"+http_archive+sfpi", "sfpi"}) {
-    const std::filesystem::path candidate = external_root / repo_name;
-    if (IsSfpiRoot(candidate)) {
-      return candidate;
-    }
-  }
-
-  for (std::filesystem::directory_iterator it(external_root, error), end;
-       !error && it != end; it.increment(error)) {
-    if (!std::filesystem::is_directory(it->path(), error)) {
-      continue;
-    }
-    if (it->path().filename().string().find("sfpi") != std::string::npos &&
-        IsSfpiRoot(it->path())) {
-      return it->path();
-    }
-  }
-  return std::nullopt;
-}
-
-std::optional<std::filesystem::path> FindTtMetalRuntimeRootFrom(
-    std::filesystem::path path) {
-  std::error_code error;
-  path = std::filesystem::weakly_canonical(path, error);
-  if (error) {
-    path.clear();
-  }
-  if (path.empty()) {
-    return std::nullopt;
-  }
-  if (!std::filesystem::is_directory(path)) {
-    path = path.parent_path();
-  }
-
-  const std::filesystem::path workspace_bazel_link =
-      path / ("bazel-" + path.filename().string()) / "external" /
-      "+http_archive+tt_metal";
-  if (IsTtMetalRuntimeRoot(workspace_bazel_link)) {
-    return workspace_bazel_link;
-  }
-
-  for (std::filesystem::path current = path; !current.empty();
-       current = current.parent_path()) {
-    if (IsTtMetalRuntimeRoot(current)) {
-      return current;
-    }
-    const std::filesystem::path external_root =
-        current / "external" / "+http_archive+tt_metal";
-    if (IsTtMetalRuntimeRoot(external_root)) {
-      return external_root;
-    }
-    const std::filesystem::path bazel_link =
-        current / ("bazel-" + current.filename().string()) / "external" /
-        "+http_archive+tt_metal";
-    if (IsTtMetalRuntimeRoot(bazel_link)) {
-      return bazel_link;
-    }
-    if (current == current.root_path()) {
-      break;
-    }
-  }
-  return std::nullopt;
-}
-
-std::optional<std::filesystem::path> FindSfpiRootFrom(std::filesystem::path path) {
-  std::error_code error;
-  path = std::filesystem::weakly_canonical(path, error);
-  if (error) {
-    path.clear();
-  }
-  if (path.empty()) {
-    return std::nullopt;
-  }
-  if (!std::filesystem::is_directory(path)) {
-    path = path.parent_path();
-  }
-
-  const std::filesystem::path workspace_external_link =
-      path / ("bazel-" + path.filename().string()) / "external";
-  if (std::optional<std::filesystem::path> root =
-          FindSfpiRootInExternal(workspace_external_link)) {
-    return root;
-  }
-
-  for (std::filesystem::path current = path; !current.empty();
-       current = current.parent_path()) {
-    if (IsSfpiRoot(current)) {
-      return current;
-    }
-    if (std::optional<std::filesystem::path> root =
-            FindSfpiRootInExternal(current / "external")) {
-      return root;
-    }
-    const std::filesystem::path bazel_external_link =
-        current / ("bazel-" + current.filename().string()) / "external";
-    if (std::optional<std::filesystem::path> root =
-            FindSfpiRootInExternal(bazel_external_link)) {
-      return root;
-    }
-    if (current == current.root_path()) {
-      break;
-    }
-  }
-  return std::nullopt;
 }
 
 class MeshDeviceCache {
@@ -278,52 +157,15 @@ MeshDeviceCache& RuntimeDevices() {
 void EnsureTtMetalRuntimeReady() {
   static std::once_flag once;
   std::call_once(once, [] {
-    const bool has_runtime_root_override =
-        std::getenv("TT_METAL_RUNTIME_ROOT") != nullptr;
-    const bool has_runtime_asset_root_override =
-        std::getenv("TT_METAL_RUNTIME_ASSET_ROOT") != nullptr;
-    const bool has_sfpi_root_override =
-        std::getenv("TT_METAL_SFPI_ROOT") != nullptr;
-    bool configured_runtime_root = has_runtime_root_override;
+    const std::filesystem::path runtime_root = MaterializeEmbeddedRuntimeRoot();
+    const std::string runtime_root_string = runtime_root.string();
+    const std::string sfpi_root_string =
+        (runtime_root / "runtime" / "sfpi").string();
 
-    Dl_info info;
-    if (dladdr(reinterpret_cast<void*>(&EnsureTtMetalRuntimeReady), &info) != 0 &&
-        info.dli_fname != nullptr) {
-      if (!has_runtime_root_override) {
-        if (std::optional<std::filesystem::path> root =
-                FindTtMetalRuntimeRootFrom(info.dli_fname)) {
-          tt::llrt::RunTimeOptions::set_root_dir(root->string());
-          configured_runtime_root = true;
-        }
-      }
-      if (!has_sfpi_root_override) {
-        if (std::optional<std::filesystem::path> sfpi_root =
-                FindSfpiRootFrom(info.dli_fname)) {
-          setenv("TT_METAL_SFPI_ROOT", sfpi_root->string().c_str(), 0);
-        }
-      }
-    }
-
-    if (!configured_runtime_root) {
-      if (std::optional<std::filesystem::path> root =
-              FindTtMetalRuntimeRootFrom(std::filesystem::current_path())) {
-        tt::llrt::RunTimeOptions::set_root_dir(root->string());
-      }
-    }
-
-    if (!has_runtime_asset_root_override) {
-      if (std::optional<std::filesystem::path> asset_root =
-              MaterializeEmbeddedRuntimeAssets()) {
-        setenv("TT_METAL_RUNTIME_ASSET_ROOT", asset_root->string().c_str(), 0);
-      }
-    }
-
-    if (!has_sfpi_root_override && std::getenv("TT_METAL_SFPI_ROOT") == nullptr) {
-      if (std::optional<std::filesystem::path> sfpi_root =
-              FindSfpiRootFrom(std::filesystem::current_path())) {
-        setenv("TT_METAL_SFPI_ROOT", sfpi_root->string().c_str(), 0);
-      }
-    }
+    setenv("TT_METAL_RUNTIME_ROOT", runtime_root_string.c_str(), 1);
+    setenv("TT_METAL_RUNTIME_ASSET_ROOT", runtime_root_string.c_str(), 1);
+    setenv("TT_METAL_SFPI_ROOT", sfpi_root_string.c_str(), 1);
+    tt::llrt::RunTimeOptions::set_root_dir(runtime_root_string);
   });
 }
 

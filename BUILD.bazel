@@ -64,7 +64,7 @@ cc_library(
         ":mlir_frontend",
         ":tt_pjrt_buffer",
         ":ttnn_tensor",
-        "@tt_metal//:tt_metal_blackhole_runtime_hw_embedded",
+        "@tt_metal//:tt_metal_runtime_embedded",
         "@com_google_protobuf//:protobuf_lite",
         "@libarchive//:archive",
     ],
