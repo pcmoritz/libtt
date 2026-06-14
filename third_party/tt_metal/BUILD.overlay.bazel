@@ -112,25 +112,28 @@ filegroup(
 )
 
 BLACKHOLE_RUNTIME_PROCS = [
-    ("brisc", "brisc"),
-    ("ncrisc", "ncrisc"),
-    ("ierisc", "ierisc"),
-    ("subordinate_ierisc", "subordinate_ierisc"),
-    ("trisc=0", "trisc0"),
-    ("trisc=1", "trisc1"),
-    ("trisc=2", "trisc2"),
-    ("aerisc", "aerisc"),
-    ("main_aerisc", "main_aerisc"),
-    ("subordinate_aerisc", "subordinate_aerisc"),
-    ("drisc", "drisc"),
+    ("brisc", "brisc", "BRISC"),
+    ("ncrisc", "ncrisc", "NCRISC"),
+    ("ierisc", "ierisc", "IERISC"),
+    ("subordinate_ierisc", "subordinate_ierisc", "SUBORDINATE_IERISC"),
+    ("trisc=0", "trisc0", "TRISC=0"),
+    ("trisc=1", "trisc1", "TRISC=1"),
+    ("trisc=2", "trisc2", "TRISC=2"),
+    ("aerisc", "aerisc", "AERISC"),
+    ("main_aerisc", "main_aerisc", "MAIN_AERISC"),
+    ("subordinate_aerisc", "subordinate_aerisc", "SUBORDINATE_AERISC"),
+    ("drisc", "drisc", "DRISC"),
 ]
 
-BLACKHOLE_RUNTIME_KINDS = ["firmware", "kernel"]
+BLACKHOLE_RUNTIME_KINDS = [
+    ("firmware", "FIRMWARE"),
+    ("kernel", "KERNEL"),
+]
 
 BLACKHOLE_RUNTIME_LD_OUTS = [
     "runtime/hw/toolchain/blackhole/%s_%s.ld" % (kind, proc_file)
-    for kind in BLACKHOLE_RUNTIME_KINDS
-    for _, proc_file in BLACKHOLE_RUNTIME_PROCS
+    for kind, _ in BLACKHOLE_RUNTIME_KINDS
+    for _, proc_file, _ in BLACKHOLE_RUNTIME_PROCS
 ]
 
 BLACKHOLE_RUNTIME_OBJS = [
@@ -164,8 +167,8 @@ genrule(
         "'$(location tt_metal/hw/toolchain/main.ld)'",
         "'$(location @sfpi//:riscv_gpp)'",
         "'$(RULEDIR)'",
-        "'%s'" % " ".join(["%s:%s" % proc for proc in BLACKHOLE_RUNTIME_PROCS]),
-        "'%s'" % " ".join(BLACKHOLE_RUNTIME_KINDS),
+        "'%s'" % " ".join(["%s:%s:%s" % proc for proc in BLACKHOLE_RUNTIME_PROCS]),
+        "'%s'" % " ".join(["%s:%s" % kind for kind in BLACKHOLE_RUNTIME_KINDS]),
     ] + [
         "'%s:%s'" % obj
         for obj in BLACKHOLE_RUNTIME_OBJS

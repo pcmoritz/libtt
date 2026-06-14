@@ -19,14 +19,15 @@ lib_out=$rule_dir/runtime/hw/lib/blackhole
 mkdir -p "$toolchain_out" "$lib_out"
 
 for item in $proc_items; do
-  proc_define=${item%%:*}
-  proc_file=${item##*:}
-  proc_define_upper=$(printf '%s' "$proc_define" | tr '[:lower:]' '[:upper:]')
+  proc_rest=${item#*:}
+  proc_file=${proc_rest%%:*}
+  proc_define_upper=${proc_rest##*:}
   for kind in $kinds; do
-    kind_upper=$(printf '%s' "$kind" | tr '[:lower:]' '[:upper:]')
-    gcc -DTYPE_"$kind_upper" -DCOMPILE_FOR_"$proc_define_upper" -DARCH_BLACKHOLE \
+    kind_name=${kind%%:*}
+    kind_upper=${kind##*:}
+    "$gpp" -DTYPE_"$kind_upper" -DCOMPILE_FOR_"$proc_define_upper" -DARCH_BLACKHOLE \
       -I"$root/tt_metal/hw/inc/internal/tt-1xx/blackhole" \
-      -E -P -x c -o "$toolchain_out/${kind}_${proc_file}.ld" \
+      -E -P -x c -o "$toolchain_out/${kind_name}_${proc_file}.ld" \
       "$root/tt_metal/hw/toolchain/main.ld"
   done
 done
