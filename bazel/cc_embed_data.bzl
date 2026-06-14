@@ -1,75 +1,118 @@
 load("@rules_cc//cc:defs.bzl", "cc_library")
 
-_CC_EMBED_DATA_CMD = """
+_ASM_TEMPLATE = Label("@//:bazel/cc_embed_data.S.tpl")
+_HEADER_TEMPLATE = Label("@//:bazel/cc_embed_data.h.tpl")
+
+def _cc_embed_data_src_impl(ctx):
+    data = ctx.file.src
+    asm = ctx.actions.declare_file(ctx.attr.out_prefix + ".S")
+    hdr = ctx.actions.declare_file(ctx.attr.out_prefix + ".h")
+    fingerprint = ctx.actions.declare_file(ctx.attr.out_prefix + ".sha256")
+
+    substitutions = {
+        "@DATA_SYMBOL@": ctx.attr.data_symbol,
+        "@FINGERPRINT_SYMBOL@": ctx.attr.fingerprint_symbol,
+        "@NAMESPACE_CLOSE@": "}  // namespace %s" % ctx.attr.namespace,
+        "@NAMESPACE_OPEN@": "namespace %s {" % ctx.attr.namespace,
+        "@SIZE_SYMBOL@": ctx.attr.size_symbol,
+    }
+
+    ctx.actions.run_shell(
+        inputs = [data],
+        outputs = [fingerprint],
+        arguments = [data.path, fingerprint.path],
+        command = """
 set -eu
-data="$(location {src})"
-fingerprint=$$(sha256sum "$$data" | cut -d ' ' -f 1)
+fingerprint=$(sha256sum "$1" | cut -d ' ' -f 1)
+printf '%s' "$fingerprint" > "$2"
+""",
+    )
+    ctx.actions.expand_template(
+        template = ctx.file._header_template,
+        output = hdr,
+        substitutions = substitutions,
+    )
 
-cat > "$(@D)/{hdr}" <<'EOF'
-#pragma once
+    asm_substitutions = dict(substitutions)
+    asm_substitutions.update({
+        "@DATA_PATH@": data.path,
+        "@FINGERPRINT_PATH@": fingerprint.path,
+    })
+    ctx.actions.expand_template(
+        template = ctx.file._asm_template,
+        output = asm,
+        substitutions = asm_substitutions,
+    )
 
-#include <cstddef>
+    return [
+        DefaultInfo(files = depset([asm, hdr, fingerprint])),
+        OutputGroupInfo(
+            asm = depset([asm]),
+            fingerprint = depset([fingerprint]),
+            hdr = depset([hdr]),
+        ),
+    ]
 
-{namespace_open}
-
-{extern_c_open}
-
-extern const unsigned char {data_symbol}[];
-extern const std::size_t {size_symbol};
-extern const char {fingerprint_symbol}[];
-
-{extern_c_close}
-
-{namespace_close}
-EOF
-
-cat > "$(@D)/{asm}" <<EOF
-.section .rodata
-.balign 16
-.global {data_symbol}
-{data_symbol}:
-  .incbin "$$data"
-{data_symbol}End:
-.balign 8
-.global {size_symbol}
-{size_symbol}:
-  .quad {data_symbol}End - {data_symbol}
-.global {fingerprint_symbol}
-{fingerprint_symbol}:
-  .asciz "$$fingerprint"
-.section .note.GNU-stack,"",@progbits
-EOF
-"""
+_cc_embed_data_src = rule(
+    implementation = _cc_embed_data_src_impl,
+    attrs = {
+        "data_symbol": attr.string(mandatory = True),
+        "fingerprint_symbol": attr.string(mandatory = True),
+        "namespace": attr.string(mandatory = True),
+        "out_prefix": attr.string(mandatory = True),
+        "size_symbol": attr.string(mandatory = True),
+        "src": attr.label(allow_single_file = True, mandatory = True),
+        "_asm_template": attr.label(
+            allow_single_file = True,
+            default = _ASM_TEMPLATE,
+        ),
+        "_header_template": attr.label(
+            allow_single_file = True,
+            default = _HEADER_TEMPLATE,
+        ),
+    },
+)
 
 def cc_embed_data(name, src, namespace, data_symbol, size_symbol, fingerprint_symbol, out_prefix):
     """Embeds a single data file in a C++ library using assembler .incbin."""
-    asm = out_prefix + ".S"
-    hdr = out_prefix + ".h"
-    cmd = _CC_EMBED_DATA_CMD.format(
-        asm = asm,
-        data_symbol = data_symbol,
-        extern_c_close = "}  // extern \"C\"",
-        extern_c_open = "extern \"C\" {",
-        fingerprint_symbol = fingerprint_symbol,
-        hdr = hdr,
-        namespace_close = "}  // namespace %s" % namespace,
-        namespace_open = "namespace %s {" % namespace,
-        size_symbol = size_symbol,
-        src = src,
-    )
+    generated = name + "_src"
 
-    native.genrule(
-        name = name + "_src",
-        srcs = [src],
-        outs = [asm, hdr],
-        cmd = cmd,
+    _cc_embed_data_src(
+        name = generated,
+        src = src,
+        data_symbol = data_symbol,
+        fingerprint_symbol = fingerprint_symbol,
+        namespace = namespace,
+        out_prefix = out_prefix,
+        size_symbol = size_symbol,
+    )
+    native.filegroup(
+        name = name + "_asm",
+        srcs = [":" + generated],
+        output_group = "asm",
+        visibility = ["//visibility:private"],
+    )
+    native.filegroup(
+        name = name + "_fingerprint",
+        srcs = [":" + generated],
+        output_group = "fingerprint",
+        visibility = ["//visibility:private"],
+    )
+    native.filegroup(
+        name = name + "_hdr",
+        srcs = [":" + generated],
+        output_group = "hdr",
+        visibility = ["//visibility:private"],
     )
 
     cc_library(
         name = name,
-        srcs = [asm],
-        additional_compiler_inputs = [src],
-        hdrs = [hdr],
+        srcs = [":" + name + "_asm"],
+        additional_compiler_inputs = [
+            src,
+            ":" + name + "_fingerprint",
+        ],
+        hdrs = [":" + name + "_hdr"],
         includes = ["."],
         linkstatic = True,
     )

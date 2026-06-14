@@ -4,6 +4,11 @@ load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
+exports_files([
+    "bazel/cc_embed_data.S.tpl",
+    "bazel/cc_embed_data.h.tpl",
+])
+
 proto_library(
     name = "executable_proto",
     srcs = ["mlir/executable.proto"],
