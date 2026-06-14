@@ -1,7 +1,6 @@
 #include "cpp/pjrt_buffer.h"
 
 #include <tt-metalium/bfloat16.hpp>
-#include <tt-metalium/experimental/tensor/spec/layout/alignment.hpp>
 #include <tt-metalium/experimental/tensor/spec/layout/page_config.hpp>
 #include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
 #include <ttnn/tensor/tensor.hpp>
@@ -63,28 +62,34 @@ std::optional<tt::tt_metal::DataType> TtnnDataTypeForPjrtBufferType(PJRT_Buffer_
 
 namespace {
 
-constexpr uint32_t kTileRows = 32;
-constexpr uint32_t kTileCols = 32;
+template <typename F>
+PJRT_Error* DispatchByTtnnDataType(tt::tt_metal::DataType dtype, F&& f) {
+  switch (dtype) {
+    case tt::tt_metal::DataType::UINT8:
+      return f(uint8_t{});
+    case tt::tt_metal::DataType::UINT16:
+      return f(uint16_t{});
+    case tt::tt_metal::DataType::INT32:
+      return f(int32_t{});
+    case tt::tt_metal::DataType::UINT32:
+      return f(uint32_t{});
+    case tt::tt_metal::DataType::BFLOAT16:
+      return f(bfloat16{});
+    case tt::tt_metal::DataType::FLOAT32:
+      return f(float{});
+    default:
+      return Unimplemented("unsupported TTNN tensor dtype");
+  }
+}
 
 template <typename F>
 PJRT_Error* DispatchByElementType(PJRT_Buffer_Type type, F&& f) {
-  switch (type) {
-    case PJRT_Buffer_Type_PRED:
-    case PJRT_Buffer_Type_U8:
-      return f(uint8_t{});
-    case PJRT_Buffer_Type_U16:
-      return f(uint16_t{});
-    case PJRT_Buffer_Type_S32:
-      return f(int32_t{});
-    case PJRT_Buffer_Type_U32:
-      return f(uint32_t{});
-    case PJRT_Buffer_Type_BF16:
-      return f(bfloat16{});
-    case PJRT_Buffer_Type_F32:
-      return f(float{});
-    default:
-      return Unimplemented("unsupported TTNN tensor buffer type");
+  const std::optional<tt::tt_metal::DataType> dtype =
+      TtnnDataTypeForPjrtBufferType(type);
+  if (!dtype.has_value()) {
+    return Unimplemented("unsupported TTNN tensor buffer type");
   }
+  return DispatchByTtnnDataType(*dtype, std::forward<F>(f));
 }
 
 PJRT_Error* RequireTensor(const PJRT_Buffer& buffer, const ttnn::Tensor** out) {
@@ -101,6 +106,28 @@ PJRT_Error* ShapeFromDims(const std::vector<int64_t>& dims, tt::tt_metal::Shape*
     values.push_back(static_cast<uint32_t>(dim));
   }
   *out = tt::tt_metal::Shape(std::move(values));
+  return nullptr;
+}
+
+std::vector<int64_t> DimsFromShape(const tt::tt_metal::Shape& shape) {
+  std::vector<int64_t> dims;
+  dims.reserve(shape.rank());
+  for (size_t i = 0; i < shape.rank(); ++i) {
+    dims.push_back(static_cast<int64_t>(shape[i]));
+  }
+  return dims;
+}
+
+PJRT_Error* ValidateShapeMatchesDims(const tt::tt_metal::Shape& shape,
+                                     const std::vector<int64_t>& dims) {
+  if (shape.rank() != dims.size()) {
+    return InvalidArgument("TTNN tensor rank does not match PJRT buffer rank");
+  }
+  for (size_t i = 0; i < dims.size(); ++i) {
+    if (dims[i] < 0 || static_cast<uint64_t>(dims[i]) != shape[i]) {
+      return InvalidArgument("TTNN tensor shape does not match PJRT buffer shape");
+    }
+  }
   return nullptr;
 }
 
@@ -123,23 +150,28 @@ PJRT_Error* CreateTensorSpec(PJRT_Buffer_Type type,
   tt::tt_metal::TensorLayout tensor_layout(
       *dtype,
       tt::tt_metal::PageConfig(target_layout),
-      std::move(memory_config),
-      tt::tt_metal::Alignment({kTileRows, kTileCols}));
+      std::move(memory_config));
   out->emplace(logical_shape, std::move(tensor_layout));
   return nullptr;
 }
 
-template <typename T>
-PJRT_Error* CopyBytesToVector(const void* data, size_t byte_size, std::vector<T>* out) {
-  static_assert(std::is_trivially_copyable_v<T>, "PJRT tensor element type must be trivially copyable");
-  if (byte_size % sizeof(T) != 0) {
-    return InvalidArgument("host buffer byte size is not a multiple of the tensor element size");
+PJRT_Error* TensorByteSize(uint64_t elements,
+                           uint32_t bytes_per_element,
+                           const char* overflow_message,
+                           size_t* out) {
+  if (bytes_per_element != 0 &&
+      elements > std::numeric_limits<size_t>::max() / bytes_per_element) {
+    return ResourceExhausted(overflow_message);
   }
-  out->resize(byte_size / sizeof(T));
-  if (byte_size > 0) {
-    std::memcpy(out->data(), data, byte_size);
-  }
+  *out = elements * static_cast<size_t>(bytes_per_element);
   return nullptr;
+}
+
+PJRT_Error* TensorLogicalByteSize(const ttnn::Tensor& tensor, size_t* out) {
+  return TensorByteSize(tensor.logical_volume(),
+                        tensor.element_size(),
+                        "TTNN tensor logical byte size overflow",
+                        out);
 }
 
 template <typename T>
@@ -147,9 +179,14 @@ PJRT_Error* CreateTensorFromBytes(const void* data,
                                   size_t byte_size,
                                   const ttnn::TensorSpec& spec,
                                   std::optional<ttnn::Tensor>* out) {
-  std::vector<T> values;
-  if (PJRT_Error* error = CopyBytesToVector(data, byte_size, &values)) {
-    return error;
+  static_assert(std::is_trivially_copyable_v<T>, "PJRT tensor element type must be trivially copyable");
+  if (byte_size % sizeof(T) != 0) {
+    return InvalidArgument("host buffer byte size is not a multiple of the tensor element size");
+  }
+
+  std::vector<T> values(byte_size / sizeof(T));
+  if (byte_size > 0) {
+    std::memcpy(values.data(), data, byte_size);
   }
   try {
     out->emplace(ttnn::Tensor::from_vector(std::move(values), spec));
@@ -160,23 +197,25 @@ PJRT_Error* CreateTensorFromBytes(const void* data,
 }
 
 template <typename T>
-void CopyVectorToBytes(const std::vector<T>& values, std::vector<std::byte>* out) {
-  static_assert(std::is_trivially_copyable_v<T>, "PJRT tensor element type must be trivially copyable");
-  out->resize(values.size() * sizeof(T));
-  if (!values.empty()) {
-    std::memcpy(out->data(), values.data(), out->size());
-  }
-}
-
-template <typename T>
 PJRT_Error* TensorToBytes(const ttnn::Tensor& tensor, std::vector<std::byte>* out) {
+  static_assert(std::is_trivially_copyable_v<T>, "PJRT tensor element type must be trivially copyable");
   try {
     std::vector<T> values = tensor.to_vector<T>();
-    CopyVectorToBytes(values, out);
+    out->resize(values.size() * sizeof(T));
+    if (!values.empty()) {
+      std::memcpy(out->data(), values.data(), out->size());
+    }
   } catch (const std::exception& e) {
     return Internal(std::string("failed to read TTNN tensor to host buffer: ") + e.what());
   }
   return nullptr;
+}
+
+PJRT_Error* TensorPhysicalByteSize(const ttnn::Tensor& tensor, size_t* out) {
+  return TensorByteSize(tensor.physical_volume(),
+                        tensor.element_size(),
+                        "TTNN tensor physical byte size overflow",
+                        out);
 }
 
 }  // namespace
@@ -324,8 +363,9 @@ PJRT_Error* CreatePjrtBufferFromHostBytes(PJRT_Buffer_Type type,
     return error;
   }
 
-  *out =
-      new PJRT_Buffer(type, dims, target_device, target_memory, std::move(*tensor));
+  std::vector<int64_t> tensor_dims = DimsFromShape(tensor->logical_shape());
+  *out = new PJRT_Buffer(type, std::move(tensor_dims), target_device,
+                         target_memory, std::move(*tensor));
   return nullptr;
 }
 
@@ -353,18 +393,13 @@ PJRT_Error* CreatePjrtBufferFromTtnnTensor(PJRT_Buffer_Type type,
   if (tensor.dtype() != *expected_dtype) {
     return InvalidArgument("TTNN tensor dtype does not match PJRT buffer type");
   }
-  const tt::tt_metal::Shape& shape = tensor.logical_shape();
-  if (shape.rank() != dims.size()) {
-    return InvalidArgument("TTNN tensor rank does not match PJRT buffer rank");
-  }
-  for (size_t i = 0; i < dims.size(); ++i) {
-    if (dims[i] < 0 || static_cast<uint64_t>(dims[i]) != shape[i]) {
-      return InvalidArgument("TTNN tensor shape does not match PJRT buffer shape");
-    }
+  if (PJRT_Error* error = ValidateShapeMatchesDims(tensor.logical_shape(), dims)) {
+    return error;
   }
 
-  *out =
-      new PJRT_Buffer(type, dims, target_device, target_memory, std::move(tensor));
+  std::vector<int64_t> tensor_dims = DimsFromShape(tensor.logical_shape());
+  *out = new PJRT_Buffer(type, std::move(tensor_dims), target_device,
+                         target_memory, std::move(tensor));
   return nullptr;
 }
 
@@ -391,9 +426,13 @@ PJRT_Error* CopyPjrtBufferToTtnnDeviceTensor(
 
   try {
     ttnn::Tensor host_tensor =
-        tensor->storage_type() == tt::tt_metal::StorageType::DEVICE ? tensor->cpu() : *tensor;
+        tensor->storage_type() == tt::tt_metal::StorageType::DEVICE
+            ? tensor->cpu()
+            : *tensor;
     ttnn::Tensor tiled =
-        host_tensor.layout() == ttnn::TILE_LAYOUT ? host_tensor : host_tensor.to_layout(ttnn::TILE_LAYOUT);
+        host_tensor.layout() == ttnn::TILE_LAYOUT
+            ? host_tensor
+            : host_tensor.to_layout(ttnn::TILE_LAYOUT);
     *out = tiled.to_device(mesh_device, ttnn::DRAM_MEMORY_CONFIG);
   } catch (const std::exception& e) {
     return Internal(std::string("failed to copy TTNN tensor to device: ") + e.what());
@@ -407,7 +446,7 @@ PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::b
     return error;
   }
 
-  if (PJRT_Error* error = DispatchByElementType(buffer.buffer_type, [&](auto tag) {
+  if (PJRT_Error* error = DispatchByTtnnDataType(tensor->dtype(), [&](auto tag) {
         using Element = decltype(tag);
         return TensorToBytes<Element>(*tensor, out);
       })) {
@@ -415,8 +454,7 @@ PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::b
   }
 
   size_t expected_byte_size = 0;
-  if (PJRT_Error* byte_size_error =
-          HostByteSize(buffer.buffer_type, buffer.dims, &expected_byte_size)) {
+  if (PJRT_Error* byte_size_error = TensorLogicalByteSize(*tensor, &expected_byte_size)) {
     return byte_size_error;
   }
   if (out->size() != expected_byte_size) {
@@ -430,12 +468,5 @@ PJRT_Error* TtnnTensorPhysicalByteSize(const PJRT_Buffer& buffer, size_t* out) {
   if (PJRT_Error* error = RequireTensor(buffer, &tensor)) {
     return error;
   }
-  const uint64_t physical_volume = tensor->physical_volume();
-  const uint32_t element_size = tensor->element_size();
-  if (element_size != 0 &&
-      physical_volume > std::numeric_limits<size_t>::max() / element_size) {
-    return ResourceExhausted("TTNN tensor physical byte size overflow");
-  }
-  *out = static_cast<size_t>(physical_volume) * static_cast<size_t>(element_size);
-  return nullptr;
+  return TensorPhysicalByteSize(*tensor, out);
 }

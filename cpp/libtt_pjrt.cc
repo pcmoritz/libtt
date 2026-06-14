@@ -4,7 +4,7 @@
 #include "cpp/tt_metal_runtime.h"
 #include "mlir/executable.pb.h"
 
-#include <ttnn/operations/matmul/device/matmul_device_operation.hpp>
+#include <ttnn/operations/matmul/matmul.hpp>
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/types.hpp>
 
@@ -591,21 +591,18 @@ PJRT_Error* ExecuteTtnnMatmul(const tt::MatmulOp& matmul,
       return error;
     }
 
-    ttnn::prim::MatmulParams parameters;
-    parameters.output_mem_config = ttnn::DRAM_MEMORY_CONFIG;
-    parameters.output_dtype = output_dtype;
-    const ttnn::prim::MatmulParams attributes =
-        ttnn::prim::create_matmul_attributes(lhs, rhs, parameters, {std::nullopt});
-    std::vector<ttnn::Tensor> results =
-        ttnn::prim::matmul(lhs, rhs, std::nullopt, std::nullopt, attributes);
-    if (results.empty()) {
-      return Internal("TTNN matmul did not produce an output tensor");
-    }
+    ttnn::Tensor result = ttnn::matmul(
+        /*input_tensor_a=*/lhs,
+        /*input_tensor_b=*/rhs,
+        /*transpose_a=*/false,
+        /*transpose_b=*/false,
+        /*memory_config=*/ttnn::DRAM_MEMORY_CONFIG,
+        /*dtype=*/output_dtype);
 
     PJRT_Memory* output_memory =
         target_device == nullptr ? nullptr : target_device->default_memory;
     return CreatePjrtBufferFromTtnnTensor(output_type, output_dims, target_device,
-                                          output_memory, std::move(results.front()), out);
+                                          output_memory, std::move(result), out);
   } catch (const std::exception& e) {
     return Internal(std::string("TTNN matmul failed: ") + e.what());
   } catch (...) {
