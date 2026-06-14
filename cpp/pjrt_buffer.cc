@@ -41,12 +41,7 @@ bool PJRT_Buffer::IsDeleted() const { return !tensor.has_value(); }
 
 void PJRT_Buffer::Delete() { tensor.reset(); }
 
-namespace {
-
-constexpr uint32_t kTileRows = 32;
-constexpr uint32_t kTileCols = 32;
-
-std::optional<tt::tt_metal::DataType> MetalDataType(PJRT_Buffer_Type type) {
+std::optional<tt::tt_metal::DataType> TtnnDataTypeForPjrtBufferType(PJRT_Buffer_Type type) {
   switch (type) {
     case PJRT_Buffer_Type_PRED:
     case PJRT_Buffer_Type_U8:
@@ -65,6 +60,11 @@ std::optional<tt::tt_metal::DataType> MetalDataType(PJRT_Buffer_Type type) {
       return std::nullopt;
   }
 }
+
+namespace {
+
+constexpr uint32_t kTileRows = 32;
+constexpr uint32_t kTileCols = 32;
 
 template <typename F>
 PJRT_Error* DispatchByElementType(PJRT_Buffer_Type type, F&& f) {
@@ -109,7 +109,8 @@ PJRT_Error* CreateTensorSpec(PJRT_Buffer_Type type,
                              tt::tt_metal::Layout target_layout,
                              tt::tt_metal::MemoryConfig memory_config,
                              std::optional<ttnn::TensorSpec>* out) {
-  const std::optional<tt::tt_metal::DataType> dtype = MetalDataType(type);
+  const std::optional<tt::tt_metal::DataType> dtype =
+      TtnnDataTypeForPjrtBufferType(type);
   if (!dtype.has_value()) {
     return Unimplemented("PJRT buffer type cannot be represented as a TTNN Tensor dtype");
   }
@@ -208,10 +209,6 @@ size_t BytesPerElement(PJRT_Buffer_Type type) {
 }
 
 bool IsSupportedBufferType(PJRT_Buffer_Type type) { return BytesPerElement(type) != 0; }
-
-std::optional<tt::tt_metal::DataType> TtnnDataTypeForPjrtBufferType(PJRT_Buffer_Type type) {
-  return MetalDataType(type);
-}
 
 PJRT_Error* CopyDims(const int64_t* dims, size_t num_dims, std::vector<int64_t>* out) {
   out->clear();
@@ -348,7 +345,8 @@ PJRT_Error* CreatePjrtBufferFromTtnnTensor(PJRT_Buffer_Type type,
   if (target_memory == nullptr) {
     return InvalidArgument("no target memory available");
   }
-  const std::optional<tt::tt_metal::DataType> expected_dtype = MetalDataType(type);
+  const std::optional<tt::tt_metal::DataType> expected_dtype =
+      TtnnDataTypeForPjrtBufferType(type);
   if (!expected_dtype.has_value()) {
     return Unimplemented("PJRT buffer type cannot be represented as a TTNN Tensor dtype");
   }

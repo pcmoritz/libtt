@@ -576,11 +576,8 @@ PJRT_Error* ExecuteTtnnMatmul(const tt::MatmulOp& matmul,
   if (PJRT_Error* error = ValidateTtnnCompatibleDotGeneral(matmul, lhs_dims, rhs_dims)) {
     return error;
   }
-  const std::optional<tt::tt_metal::DataType> output_dtype =
-      TtnnDataTypeForPjrtBufferType(output_type);
-  if (!output_dtype.has_value()) {
-    return Unimplemented("TTNN matmul output type cannot be represented as a TTNN Tensor dtype");
-  }
+  const tt::tt_metal::DataType output_dtype =
+      *TtnnDataTypeForPjrtBufferType(output_type);
 
   try {
     std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_device =
@@ -596,7 +593,7 @@ PJRT_Error* ExecuteTtnnMatmul(const tt::MatmulOp& matmul,
 
     ttnn::prim::MatmulParams parameters;
     parameters.output_mem_config = ttnn::DRAM_MEMORY_CONFIG;
-    parameters.output_dtype = *output_dtype;
+    parameters.output_dtype = output_dtype;
     const ttnn::prim::MatmulParams attributes =
         ttnn::prim::create_matmul_attributes(lhs, rhs, parameters, {std::nullopt});
     std::vector<ttnn::Tensor> results =
