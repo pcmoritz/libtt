@@ -153,6 +153,8 @@ http_archive(
     ],
 )
 
+register_toolchains("@sfpi//:sfpi_cc_toolchain_for_blackhole")
+
 http_archive(
     name = "com_github_google_flatbuffers",
     build_file = "//third_party/flatbuffers:BUILD.overlay.bazel",

@@ -1,5 +1,6 @@
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@//third_party/sfpi:sfpi_cc_objects.bzl", "sfpi_cc_objects")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -143,6 +144,66 @@ BLACKHOLE_RUNTIME_OBJS = [
     ("tmu-crt0.o", "tt_metal/hw/toolchain/tmu-crt0.S"),
 ]
 
+BLACKHOLE_RUNTIME_COPTS = [
+    "-mcpu=tt-bh",
+    "-std=c++17",
+    "-flto=auto",
+    "-ffast-math",
+    "-fno-use-cxa-atexit",
+    "-fno-exceptions",
+    "-Wall",
+    "-Werror",
+    "-Wno-deprecated-declarations",
+    "-Wno-unknown-pragmas",
+    "-Wno-error=multistatement-macros",
+    "-Wno-error=parentheses",
+    "-Wno-error=unused-but-set-variable",
+    "-Wno-unused-variable",
+    "-Wno-unused-function",
+    "-Os",
+    "-fno-tree-loop-distribute-patterns",
+]
+
+BLACKHOLE_RUNTIME_INCLUDES = [
+    ".",
+    "tt_metal",
+    "tt_metal/api",
+    "tt_metal/api/tt-metalium",
+    "tt_metal/hw/inc",
+    "tt_metal/hw/inc/debug",
+    "tt_metal/hw/firmware/src/tt-1xx",
+    "tt_metal/hw/inc/internal/tt-1xx/blackhole",
+    "tt_metal/hw/inc/internal/tt-1xx/blackhole/blackhole_defines",
+    "tt_metal/hw/inc/internal/tt-1xx/blackhole/noc",
+    "tt_metal/hw/inc/internal/tt-1xx/blackhole/overlay",
+    "tt_metal/third_party/umd/device/blackhole",
+    "tt_metal/hw/ckernels/blackhole/metal/common",
+    "tt_metal/hw/ckernels/blackhole/metal/llk_io",
+    "tt_metal/tt-llk/tt_llk_blackhole/common/inc",
+    "tt_metal/tt-llk/tt_llk_blackhole/llk_lib",
+]
+
+sfpi_cc_objects(
+    name = "blackhole_runtime_obj_files",
+    hdrs = glob([
+        "tt_metal/hw/firmware/src/tt-1xx/**/*",
+        "tt_metal/hw/inc/**/*",
+        "tt_metal/hw/toolchain/**/*",
+        "tt_metal/tt-llk/common/**/*",
+        "tt_metal/tt-llk/tt_llk_blackhole/**/*",
+    ], allow_empty = True),
+    srcs = [source for _, source in BLACKHOLE_RUNTIME_OBJS],
+    copts = BLACKHOLE_RUNTIME_COPTS,
+    defines = ["TENSIX_FIRMWARE"],
+    includes = BLACKHOLE_RUNTIME_INCLUDES,
+)
+
+pkg_tar(
+    name = "blackhole_runtime_obj_tar",
+    package_dir = "runtime/hw/lib/blackhole",
+    srcs = [":blackhole_runtime_obj_files"],
+)
+
 genrule(
     name = "tt_metal_blackhole_runtime_hw_assets",
     srcs = glob([
@@ -157,10 +218,7 @@ genrule(
         "@sfpi//:all_files",
         "@sfpi//:riscv_gpp",
     ],
-    outs = BLACKHOLE_RUNTIME_LD_OUTS + [
-        "runtime/hw/lib/blackhole/%s" % obj
-        for obj, _ in BLACKHOLE_RUNTIME_OBJS
-    ],
+    outs = BLACKHOLE_RUNTIME_LD_OUTS,
     cmd = " ".join([
         "bash",
         "'$(location @//third_party/tt_metal:blackhole_runtime_hw_assets.sh)'",
@@ -169,9 +227,6 @@ genrule(
         "'$(RULEDIR)'",
         "'%s'" % " ".join(["%s:%s:%s" % proc for proc in BLACKHOLE_RUNTIME_PROCS]),
         "'%s'" % " ".join(["%s:%s" % kind for kind in BLACKHOLE_RUNTIME_KINDS]),
-    ] + [
-        "'%s:%s'" % obj
-        for obj in BLACKHOLE_RUNTIME_OBJS
     ]),
     local = True,
 )
@@ -193,6 +248,7 @@ filegroup(
 
 pkg_tar(
     name = "tt_metal_runtime_archive",
+    deps = [":blackhole_runtime_obj_tar"],
     srcs = [
         "@sfpi//:all_files",
         ":tt_metal_blackhole_runtime_hw_assets",
