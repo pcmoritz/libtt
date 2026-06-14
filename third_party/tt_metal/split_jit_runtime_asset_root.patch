@@ -1,68 +1,25 @@
 --- tt_metal/jit_build/build.cpp
 +++ tt_metal/jit_build/build.cpp
-@@ -85,6 +85,32 @@ void hard_link_or_copy(const std::filesystem::path& target, const std::filesystem::path& link) {
+@@ -85,6 +85,18 @@ void hard_link_or_copy(const std::filesystem::path& target, const std::filesystem::path& link) {
      }
  }
  
-+std::string with_trailing_slash(std::string path) {
-+    if (!path.empty() && path.back() != '/') {
++std::string get_runtime_asset_root(const std::string& source_root) {
++    const char* asset_root = std::getenv("TT_METAL_RUNTIME_ASSET_ROOT");
++    if (asset_root == nullptr || asset_root[0] == '\0') {
++        return source_root;
++    }
++    std::string path = asset_root;
++    if (path.back() != '/') {
 +        path.push_back('/');
 +    }
 +    return path;
 +}
 +
-+std::string get_runtime_asset_root(const std::string& source_root) {
-+    const char* asset_root = std::getenv("TT_METAL_RUNTIME_ASSET_ROOT");
-+    if (asset_root != nullptr && asset_root[0] != '\0') {
-+        return with_trailing_slash(asset_root);
-+    }
-+    return source_root;
-+}
-+
-+std::vector<std::string> get_sfpi_roots(const std::string& source_root) {
-+    std::vector<std::string> roots;
-+    const char* sfpi_root = std::getenv("TT_METAL_SFPI_ROOT");
-+    if (sfpi_root != nullptr && sfpi_root[0] != '\0') {
-+        roots.emplace_back(sfpi_root);
-+    }
-+    roots.push_back(source_root + "runtime/sfpi");
-+    roots.push_back("/opt/tenstorrent/sfpi");
-+    return roots;
-+}
-+
  }  // namespace
  
  std::string get_default_root_path() {
-@@ -122,22 +148,22 @@ void JitBuildEnv::init(
- 
-     // Use local sfpi for development
-     // Use system sfpi for production to avoid packaging it
-     // Ordered by precedence
--    const std::array<std::string, 2> sfpi_roots = {this->root_ + "runtime/sfpi", "/opt/tenstorrent/sfpi"};
-+    const std::vector<std::string> sfpi_roots = get_sfpi_roots(this->root_);
- 
-     bool sfpi_found = false;
--    for (unsigned i = 0; i < 2; ++i) {
--        auto gxx = sfpi_roots[i] + "/compiler/bin/riscv-tt-elf-g++";
-+    for (const std::string& sfpi_root : sfpi_roots) {
-+        auto gxx = sfpi_root + "/compiler/bin/riscv-tt-elf-g++";
-         if (std::filesystem::exists(gxx)) {
-             this->gpp_ += gxx + " ";
--            this->gpp_include_dir_ = sfpi_roots[i] + "/include";
--            log_debug(tt::LogBuildKernels, "Using {} sfpi at {}", i ? "system" : "local", sfpi_roots[i]);
-+            this->gpp_include_dir_ = sfpi_root + "/include";
-+            log_debug(tt::LogBuildKernels, "Using sfpi at {}", sfpi_root);
-             sfpi_found = true;
-             break;
-         }
-     }
-     if (!sfpi_found) {
--        TT_THROW("sfpi not found at {} or {}", sfpi_roots[0], sfpi_roots[1]);
-+        TT_THROW("sfpi not found");
-     }
- 
-     // Flags
-@@ -378,7 +404,8 @@ JitBuildState::JitBuildState(const JitBuildEnv& env, const JitBuiltStateConfig&
+@@ -378,7 +390,8 @@ JitBuildState::JitBuildState(const JitBuildEnv& env, const JitBuiltStateConfig&
          this->lflags_ += common_flags;
      }
  
@@ -72,7 +29,7 @@
  
      // Source files
      {
-@@ -400,7 +427,7 @@ JitBuildState::JitBuildState(const JitBuildEnv& env, const JitBuiltStateConfig&
+@@ -400,7 +413,7 @@ JitBuildState::JitBuildState(const JitBuildEnv& env, const JitBuiltStateConfig&
      {
          auto it = std::back_inserter(this->extra_link_objs_);
          for (const auto& obj : jit_build_query.link_objs(params)) {
