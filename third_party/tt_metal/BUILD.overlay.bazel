@@ -133,10 +133,10 @@ BLACKHOLE_RUNTIME_KINDS = [
 
 BLACKHOLE_RUNTIME_LD_DIR = "runtime/hw/toolchain/blackhole"
 
-BLACKHOLE_RUNTIME_LD_OUTS = [
-    "%s/%s_%s.ld" % (BLACKHOLE_RUNTIME_LD_DIR, kind, proc)
-    for kind, _ in BLACKHOLE_RUNTIME_KINDS
-    for proc, _ in BLACKHOLE_RUNTIME_PROCS
+BLACKHOLE_RUNTIME_LD_SCRIPTS = [
+    ("%s/%s_%s.ld" % (BLACKHOLE_RUNTIME_LD_DIR, kind, proc), kind_define, proc_define)
+    for kind, kind_define in BLACKHOLE_RUNTIME_KINDS
+    for proc, proc_define in BLACKHOLE_RUNTIME_PROCS
 ]
 
 BLACKHOLE_RUNTIME_OBJS = [
@@ -213,22 +213,27 @@ genrule(
         "tt_metal/hw/toolchain/main.ld",
     ],
     tools = [
-        "@//third_party/tt_metal:blackhole_runtime_hw_assets.sh",
         "@sfpi//:all_files",
         "@sfpi//:riscv_gpp",
     ],
-    outs = BLACKHOLE_RUNTIME_LD_OUTS,
-    cmd = " ".join([
-        "bash",
-        "'$(location @//third_party/tt_metal:blackhole_runtime_hw_assets.sh)'",
-        "'$(location tt_metal/hw/toolchain/main.ld)'",
-        "'$(location tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h)'",
-        "'$(location @sfpi//:riscv_gpp)'",
-        "'$(RULEDIR)/%s'" % BLACKHOLE_RUNTIME_LD_DIR,
+    outs = [out for out, _, _ in BLACKHOLE_RUNTIME_LD_SCRIPTS],
+    cmd = "\n".join([
+        "set -euo pipefail",
+        "mkdir -p '$(RULEDIR)/%s'" % BLACKHOLE_RUNTIME_LD_DIR,
     ] + [
-        "'%s_%s.ld' '%s' '%s'" % (kind, proc, kind_define, proc_define)
-        for kind, kind_define in BLACKHOLE_RUNTIME_KINDS
-        for proc, proc_define in BLACKHOLE_RUNTIME_PROCS
+        " ".join([
+            "$(location @sfpi//:riscv_gpp)",
+            "-DTYPE_%s" % type_define,
+            "-DCOMPILE_FOR_%s" % proc_define,
+            "-DARCH_BLACKHOLE",
+            "-I$$(dirname '$(location tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h)')",
+            "-E",
+            "-P",
+            "-x c",
+            "-o '$(RULEDIR)/%s'" % out,
+            "'$(location tt_metal/hw/toolchain/main.ld)'",
+        ])
+        for out, type_define, proc_define in BLACKHOLE_RUNTIME_LD_SCRIPTS
     ]),
 )
 
