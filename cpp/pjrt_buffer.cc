@@ -15,13 +15,25 @@
 #include <type_traits>
 #include <utility>
 
+namespace {
+
+std::vector<int64_t> DimsFromShape(const tt::tt_metal::Shape& shape) {
+  std::vector<int64_t> dims;
+  dims.reserve(shape.rank());
+  for (size_t i = 0; i < shape.rank(); ++i) {
+    dims.push_back(static_cast<int64_t>(shape[i]));
+  }
+  return dims;
+}
+
+}  // namespace
+
 PJRT_Buffer::PJRT_Buffer(PJRT_Buffer_Type buffer_type,
-                         std::vector<int64_t> dims,
                          PJRT_Device* device,
                          PJRT_Memory* memory,
                          ttnn::Tensor tensor)
     : buffer_type(buffer_type),
-      dims(std::move(dims)),
+      dims(DimsFromShape(tensor.logical_shape())),
       device(device),
       memory(memory),
       tensor(std::move(tensor)) {}
@@ -82,16 +94,6 @@ PJRT_Error* DispatchByTtnnDataType(tt::tt_metal::DataType dtype, F&& f) {
   }
 }
 
-template <typename F>
-PJRT_Error* DispatchByElementType(PJRT_Buffer_Type type, F&& f) {
-  const std::optional<tt::tt_metal::DataType> dtype =
-      TtnnDataTypeForPjrtBufferType(type);
-  if (!dtype.has_value()) {
-    return Unimplemented("unsupported TTNN tensor buffer type");
-  }
-  return DispatchByTtnnDataType(*dtype, std::forward<F>(f));
-}
-
 PJRT_Error* RequireTensor(const PJRT_Buffer& buffer, const ttnn::Tensor** out) {
   *out = buffer.TtnnTensor();
   return *out == nullptr ? FailedPrecondition("buffer has been deleted") : nullptr;
@@ -109,15 +111,6 @@ PJRT_Error* ShapeFromDims(const std::vector<int64_t>& dims, tt::tt_metal::Shape*
   return nullptr;
 }
 
-std::vector<int64_t> DimsFromShape(const tt::tt_metal::Shape& shape) {
-  std::vector<int64_t> dims;
-  dims.reserve(shape.rank());
-  for (size_t i = 0; i < shape.rank(); ++i) {
-    dims.push_back(static_cast<int64_t>(shape[i]));
-  }
-  return dims;
-}
-
 PJRT_Error* ValidateShapeMatchesDims(const tt::tt_metal::Shape& shape,
                                      const std::vector<int64_t>& dims) {
   if (shape.rank() != dims.size()) {
@@ -131,24 +124,18 @@ PJRT_Error* ValidateShapeMatchesDims(const tt::tt_metal::Shape& shape,
   return nullptr;
 }
 
-PJRT_Error* CreateTensorSpec(PJRT_Buffer_Type type,
+PJRT_Error* CreateTensorSpec(tt::tt_metal::DataType dtype,
                              const std::vector<int64_t>& logical_dims,
                              tt::tt_metal::Layout target_layout,
                              tt::tt_metal::MemoryConfig memory_config,
                              std::optional<ttnn::TensorSpec>* out) {
-  const std::optional<tt::tt_metal::DataType> dtype =
-      TtnnDataTypeForPjrtBufferType(type);
-  if (!dtype.has_value()) {
-    return Unimplemented("PJRT buffer type cannot be represented as a TTNN Tensor dtype");
-  }
-
   tt::tt_metal::Shape logical_shape;
   if (PJRT_Error* error = ShapeFromDims(logical_dims, &logical_shape)) {
     return error;
   }
 
   tt::tt_metal::TensorLayout tensor_layout(
-      *dtype,
+      dtype,
       tt::tt_metal::PageConfig(target_layout),
       std::move(memory_config));
   out->emplace(logical_shape, std::move(tensor_layout));
@@ -247,8 +234,6 @@ size_t BytesPerElement(PJRT_Buffer_Type type) {
   }
 }
 
-bool IsSupportedBufferType(PJRT_Buffer_Type type) { return BytesPerElement(type) != 0; }
-
 PJRT_Error* CopyDims(const int64_t* dims, size_t num_dims, std::vector<int64_t>* out) {
   out->clear();
   if (num_dims == 0) {
@@ -341,6 +326,11 @@ PJRT_Error* CreatePjrtBufferFromHostBytes(PJRT_Buffer_Type type,
   if (byte_size > 0 && data == nullptr) {
     return InvalidArgument("data must not be null");
   }
+  const std::optional<tt::tt_metal::DataType> dtype =
+      TtnnDataTypeForPjrtBufferType(type);
+  if (!dtype.has_value()) {
+    return Unimplemented("PJRT buffer type cannot be represented as a TTNN Tensor dtype");
+  }
 
   size_t expected_byte_size = 0;
   if (PJRT_Error* error = HostByteSize(type, dims, &expected_byte_size)) {
@@ -351,21 +341,19 @@ PJRT_Error* CreatePjrtBufferFromHostBytes(PJRT_Buffer_Type type,
   }
 
   std::optional<ttnn::TensorSpec> tensor_spec;
-  if (PJRT_Error* error = CreateTensorSpec(type, dims, tt::tt_metal::Layout::ROW_MAJOR,
+  if (PJRT_Error* error = CreateTensorSpec(*dtype, dims, tt::tt_metal::Layout::ROW_MAJOR,
                                            tt::tt_metal::MemoryConfig{}, &tensor_spec)) {
     return error;
   }
   std::optional<ttnn::Tensor> tensor;
-  if (PJRT_Error* error = DispatchByElementType(type, [&](auto tag) {
+  if (PJRT_Error* error = DispatchByTtnnDataType(*dtype, [&](auto tag) {
         using Element = decltype(tag);
         return CreateTensorFromBytes<Element>(data, byte_size, *tensor_spec, &tensor);
       })) {
     return error;
   }
 
-  std::vector<int64_t> tensor_dims = DimsFromShape(tensor->logical_shape());
-  *out = new PJRT_Buffer(type, std::move(tensor_dims), target_device,
-                         target_memory, std::move(*tensor));
+  *out = new PJRT_Buffer(type, target_device, target_memory, std::move(*tensor));
   return nullptr;
 }
 
@@ -397,9 +385,7 @@ PJRT_Error* CreatePjrtBufferFromTtnnTensor(PJRT_Buffer_Type type,
     return error;
   }
 
-  std::vector<int64_t> tensor_dims = DimsFromShape(tensor.logical_shape());
-  *out = new PJRT_Buffer(type, std::move(tensor_dims), target_device,
-                         target_memory, std::move(tensor));
+  *out = new PJRT_Buffer(type, target_device, target_memory, std::move(tensor));
   return nullptr;
 }
 

@@ -1307,9 +1307,6 @@ extern "C" PJRT_Error* TT_Client_BufferFromHostBuffer(
   if (args->device_layout != nullptr) {
     return Unimplemented("custom device layouts are not supported");
   }
-  if (!IsSupportedBufferType(args->type)) {
-    return Unimplemented("unsupported PJRT buffer type");
-  }
 
   std::vector<int64_t> dims;
   if (PJRT_Error* error = CopyDims(args->dims, args->num_dims, &dims)) {

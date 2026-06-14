@@ -19,7 +19,6 @@ struct PJRT_Memory;
 
 struct PJRT_Buffer {
   PJRT_Buffer(PJRT_Buffer_Type buffer_type,
-              std::vector<int64_t> dims,
               PJRT_Device* device,
               PJRT_Memory* memory,
               ttnn::Tensor tensor);
@@ -39,7 +38,6 @@ struct PJRT_Buffer {
 };
 
 size_t BytesPerElement(PJRT_Buffer_Type type);
-bool IsSupportedBufferType(PJRT_Buffer_Type type);
 std::optional<tt::tt_metal::DataType> TtnnDataTypeForPjrtBufferType(PJRT_Buffer_Type type);
 
 PJRT_Error* CopyDims(const int64_t* dims, size_t num_dims, std::vector<int64_t>* out);
