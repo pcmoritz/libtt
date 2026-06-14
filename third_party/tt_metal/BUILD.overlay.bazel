@@ -1,5 +1,6 @@
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@//:bazel/cc_embed_data.bzl", "cc_embed_data")
 load("@//third_party/sfpi:sfpi_cc_objects.bzl", "sfpi_cc_objects")
 
 package(default_visibility = ["//visibility:public"])
@@ -279,64 +280,15 @@ pkg_tar(
     strip_prefix = ".",
 )
 
-genrule(
-    name = "tt_metal_runtime_embedded_src",
-    srcs = [":tt_metal_runtime_archive"],
-    outs = [
-        "libtt_embedded_runtime_assets.S",
-        "libtt_embedded_runtime_assets.h",
-    ],
-    cmd = """
-set -eu
-archive="$(location :tt_metal_runtime_archive)"
-fingerprint=$$(sha256sum "$$archive" | cut -d ' ' -f 1)
-asm="$(@D)/libtt_embedded_runtime_assets.S"
-hdr="$(@D)/libtt_embedded_runtime_assets.h"
-
-cat > "$$hdr" <<'EOF'
-#pragma once
-
-#include <cstddef>
-
-namespace libtt::tt_metal_runtime_assets {
-
-extern "C" {
-
-extern const unsigned char kRuntimeArchiveZstd[];
-extern const std::size_t kRuntimeArchiveZstdSize;
-extern const char kRuntimeArchiveFingerprint[];
-
-}  // extern "C"
-
-}  // namespace libtt::tt_metal_runtime_assets
-EOF
-
-cat > "$$asm" <<EOF
-.section .rodata
-.balign 16
-.global kRuntimeArchiveZstd
-kRuntimeArchiveZstd:
-  .incbin "$$archive"
-kRuntimeArchiveZstdEnd:
-.balign 8
-.global kRuntimeArchiveZstdSize
-kRuntimeArchiveZstdSize:
-  .quad kRuntimeArchiveZstdEnd - kRuntimeArchiveZstd
-.global kRuntimeArchiveFingerprint
-kRuntimeArchiveFingerprint:
-  .asciz "$$fingerprint"
-.section .note.GNU-stack,"",@progbits
-EOF
-""",
-)
-
-cc_library(
+cc_embed_data(
     name = "tt_metal_runtime_embedded",
-    srcs = ["libtt_embedded_runtime_assets.S"],
-    additional_compiler_inputs = [":tt_metal_runtime_archive"],
-    hdrs = ["libtt_embedded_runtime_assets.h"],
+    src = ":tt_metal_runtime_archive",
+    data_symbol = "kRuntimeArchiveZstd",
+    fingerprint_symbol = "kRuntimeArchiveFingerprint",
     includes = ["."],
-    linkstatic = True,
+    namespace = "libtt::tt_metal_runtime_assets",
+    out_prefix = "libtt_embedded_runtime_assets",
+    size_symbol = "kRuntimeArchiveZstdSize",
 )
 
 genrule(
