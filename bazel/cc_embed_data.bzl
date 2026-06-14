@@ -23,8 +23,7 @@ def _cc_embed_data_src_impl(ctx):
         arguments = [data.path, fingerprint.path],
         command = """
 set -eu
-fingerprint=$(sha256sum "$1" | cut -d ' ' -f 1)
-printf '%s' "$fingerprint" > "$2"
+sha256sum "$1" | head -c 64 > "$2"
 """,
     )
     ctx.actions.expand_template(
