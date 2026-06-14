@@ -176,7 +176,6 @@ http_archive(
         "//third_party/tt_metal:disable_fabric_system_mesh.patch",
         "//third_party/tt_metal:disable_fabric_profiler.patch",
         "//third_party/tt_metal:disable_fabric_rtoptions.patch",
-        "//third_party/tt_metal:remove_unsupported_sfpi_dyninit_flag.patch",
         "//third_party/tt_metal:split_jit_runtime_asset_root.patch",
         "//third_party/tt_metal:disable_inspector_runtime.patch",
     ],
