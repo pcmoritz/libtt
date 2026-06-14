@@ -161,7 +161,6 @@ void EnsureTtMetalRuntimeReady() {
     const std::string runtime_root_string = runtime_root.string();
 
     setenv("TT_METAL_RUNTIME_ROOT", runtime_root_string.c_str(), 1);
-    setenv("TT_METAL_RUNTIME_ASSET_ROOT", runtime_root_string.c_str(), 1);
     tt::llrt::RunTimeOptions::set_root_dir(runtime_root_string);
   });
 }
