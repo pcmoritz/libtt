@@ -48,9 +48,13 @@ cc_library(
 
 cc_library(
     name = "tt_pjrt",
-    srcs = ["cpp/libtt_pjrt.cc"],
+    srcs = [
+        "cpp/libtt_pjrt.cc",
+        "cpp/tt_metal_runtime.cc",
+    ],
     hdrs = [
         "cpp/libtt_pjrt.h",
+        "cpp/tt_metal_runtime.h",
         "third_party/openxla/xla/pjrt/c/pjrt_c_api.h",
     ],
     copts = ["-std=c++20"],
@@ -58,27 +62,10 @@ cc_library(
     deps = [
         ":executable_cc_proto",
         ":mlir_frontend",
-        ":tt_metal_matmul_runtime",
         ":tt_pjrt_buffer",
-        "@com_google_protobuf//:protobuf_lite",
-    ],
-    linkstatic = True,
-)
-
-cc_library(
-    name = "tt_metal_matmul_runtime",
-    srcs = ["cpp/tt_metal_matmul_runtime.cc"],
-    hdrs = [
-        "cpp/pjrt_internal.h",
-        "cpp/tt_metal_matmul_runtime.h",
-        "third_party/openxla/xla/pjrt/c/pjrt_c_api.h",
-    ],
-    copts = ["-std=c++20"],
-    includes = ["third_party/openxla"],
-    deps = [
-        "//third_party/tt_metal:tt_metal_disabled_fabric_compat",
+        ":ttnn_tensor",
         "@tt_metal//:tt_metal_blackhole_runtime_hw_embedded",
-        "@tt_metal//:ttnn_tensor_upstream",
+        "@com_google_protobuf//:protobuf_lite",
         "@libarchive//:archive",
     ],
     linkstatic = True,

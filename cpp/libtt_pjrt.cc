@@ -1,14 +1,19 @@
 #include "cpp/libtt_pjrt.h"
 
 #include "cpp/pjrt_buffer.h"
-#include "cpp/tt_metal_matmul_runtime.h"
+#include "cpp/tt_metal_runtime.h"
 #include "mlir/executable.pb.h"
+
+#include <ttnn/operations/matmul/device/matmul_device_operation.hpp>
+#include <ttnn/tensor/tensor.hpp>
+#include <ttnn/types.hpp>
 
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -483,8 +488,132 @@ std::string OpKindName(tt::Op::KindCase kind) {
   return "unknown(" + std::to_string(static_cast<int>(kind)) + ")";
 }
 
-std::vector<int64_t> RepeatedI64ToVector(const google::protobuf::RepeatedField<int64_t>& field) {
-  return std::vector<int64_t>(field.begin(), field.end());
+bool IsPrefixDims(const google::protobuf::RepeatedField<int64_t>& dims) {
+  for (int i = 0; i < dims.size(); ++i) {
+    if (dims.Get(i) != i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsTtnnMatmulType(PJRT_Buffer_Type type) {
+  return type == PJRT_Buffer_Type_BF16 || type == PJRT_Buffer_Type_F32;
+}
+
+PJRT_Error* ValidateTtnnCompatibleDotGeneral(
+    const tt::MatmulOp& matmul,
+    const std::vector<int64_t>& lhs_dims,
+    const std::vector<int64_t>& rhs_dims) {
+  if (lhs_dims.size() < 2 || rhs_dims.size() < 2) {
+    return Unimplemented("TTNN matmul currently requires rank >= 2 inputs");
+  }
+  if (matmul.lhs_contracting_dimensions_size() != 1 ||
+      matmul.rhs_contracting_dimensions_size() != 1) {
+    return Unimplemented("TTNN matmul currently supports a single contracting dimension");
+  }
+  const int64_t lhs_contract = matmul.lhs_contracting_dimensions(0);
+  const int64_t rhs_contract = matmul.rhs_contracting_dimensions(0);
+  if (lhs_contract != static_cast<int64_t>(lhs_dims.size() - 1) ||
+      rhs_contract != static_cast<int64_t>(rhs_dims.size() - 2)) {
+    return Unimplemented(
+        "TTNN matmul currently supports dot_general forms equivalent to [..., M, K] x "
+        "[..., K, N]");
+  }
+  if (matmul.lhs_batching_dimensions_size() != matmul.rhs_batching_dimensions_size()) {
+    return InvalidArgument("dot_general lhs/rhs batching dimension counts must match");
+  }
+  if (!IsPrefixDims(matmul.lhs_batching_dimensions()) ||
+      !IsPrefixDims(matmul.rhs_batching_dimensions())) {
+    return Unimplemented("TTNN matmul currently supports leading prefix batching dimensions");
+  }
+  if (lhs_dims[static_cast<size_t>(lhs_contract)] !=
+      rhs_dims[static_cast<size_t>(rhs_contract)]) {
+    return InvalidArgument("dot_general contracting dimensions must have matching size");
+  }
+  return nullptr;
+}
+
+PJRT_Error* ExecuteTtnnMatmul(const tt::MatmulOp& matmul,
+                              PJRT_Buffer* lhs_buffer,
+                              PJRT_Buffer* rhs_buffer,
+                              const tt::TensorDesc& lhs_desc,
+                              const tt::TensorDesc& rhs_desc,
+                              const tt::TensorDesc& output_desc,
+                              PJRT_Device* target_device,
+                              PJRT_Buffer** out) {
+  PJRT_Buffer_Type lhs_type = PJRT_Buffer_Type_INVALID;
+  PJRT_Buffer_Type rhs_type = PJRT_Buffer_Type_INVALID;
+  PJRT_Buffer_Type output_type = PJRT_Buffer_Type_INVALID;
+  if (PJRT_Error* error = TensorDescBufferType(lhs_desc, &lhs_type)) {
+    return error;
+  }
+  if (PJRT_Error* error = TensorDescBufferType(rhs_desc, &rhs_type)) {
+    return error;
+  }
+  if (PJRT_Error* error = TensorDescBufferType(output_desc, &output_type)) {
+    return error;
+  }
+  if (lhs_type != rhs_type) {
+    return InvalidArgument("TTNN matmul requires matching lhs/rhs input dtypes");
+  }
+  if (!IsTtnnMatmulType(lhs_type) || !IsTtnnMatmulType(output_type)) {
+    return Unimplemented("TTNN matmul supports bf16 and f32 tensors");
+  }
+
+  std::vector<int64_t> lhs_dims;
+  std::vector<int64_t> rhs_dims;
+  std::vector<int64_t> output_dims;
+  if (PJRT_Error* error = TensorDescDims(lhs_desc, &lhs_dims)) {
+    return error;
+  }
+  if (PJRT_Error* error = TensorDescDims(rhs_desc, &rhs_dims)) {
+    return error;
+  }
+  if (PJRT_Error* error = TensorDescDims(output_desc, &output_dims)) {
+    return error;
+  }
+  if (PJRT_Error* error = ValidateTtnnCompatibleDotGeneral(matmul, lhs_dims, rhs_dims)) {
+    return error;
+  }
+  const std::optional<tt::tt_metal::DataType> output_dtype =
+      TtnnDataTypeForPjrtBufferType(output_type);
+  if (!output_dtype.has_value()) {
+    return Unimplemented("TTNN matmul output type cannot be represented as a TTNN Tensor dtype");
+  }
+
+  try {
+    std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_device =
+        GetTtMetalMeshDevice(target_device == nullptr ? 0 : target_device->local_hardware_id);
+    ttnn::Tensor lhs;
+    ttnn::Tensor rhs;
+    if (PJRT_Error* error = CopyPjrtBufferToTtnnDeviceTensor(*lhs_buffer, mesh_device.get(), &lhs)) {
+      return error;
+    }
+    if (PJRT_Error* error = CopyPjrtBufferToTtnnDeviceTensor(*rhs_buffer, mesh_device.get(), &rhs)) {
+      return error;
+    }
+
+    ttnn::prim::MatmulParams parameters;
+    parameters.output_mem_config = ttnn::DRAM_MEMORY_CONFIG;
+    parameters.output_dtype = *output_dtype;
+    const ttnn::prim::MatmulParams attributes =
+        ttnn::prim::create_matmul_attributes(lhs, rhs, parameters, {std::nullopt});
+    std::vector<ttnn::Tensor> results =
+        ttnn::prim::matmul(lhs, rhs, std::nullopt, std::nullopt, attributes);
+    if (results.empty()) {
+      return Internal("TTNN matmul did not produce an output tensor");
+    }
+
+    PJRT_Memory* output_memory =
+        target_device == nullptr ? nullptr : target_device->default_memory;
+    return CreatePjrtBufferFromTtnnTensor(output_type, output_dims, target_device,
+                                          output_memory, std::move(results.front()), out);
+  } catch (const std::exception& e) {
+    return Internal(std::string("TTNN matmul failed: ") + e.what());
+  } catch (...) {
+    return Internal("TTNN matmul failed with unknown exception");
+  }
 }
 
 PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
@@ -577,52 +706,11 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
           return Internal("matmul value is missing tensor metadata");
         }
 
-        TtMetalMatmulRequest request;
-        request.local_hardware_id = target_device == nullptr ? 0 : target_device->local_hardware_id;
-        if (PJRT_Error* error = TensorDescBufferType(lhs_desc.tensor(), &request.lhs.type)) {
-          return error;
-        }
-        if (PJRT_Error* error = TensorDescBufferType(rhs_desc.tensor(), &request.rhs.type)) {
-          return error;
-        }
-        if (PJRT_Error* error = TensorDescBufferType(output_desc.tensor(), &request.output_type)) {
-          return error;
-        }
-        if (PJRT_Error* error = TensorDescDims(lhs_desc.tensor(), &request.lhs.dims)) {
-          return error;
-        }
-        if (PJRT_Error* error = TensorDescDims(rhs_desc.tensor(), &request.rhs.dims)) {
-          return error;
-        }
-        if (PJRT_Error* error = TensorDescDims(output_desc.tensor(), &request.output_dims)) {
-          return error;
-        }
-        if (PJRT_Error* error = ReadBufferLogicalBytes(*values[lhs_id], &request.lhs.data)) {
-          return error;
-        }
-        if (PJRT_Error* error = ReadBufferLogicalBytes(*values[rhs_id], &request.rhs.data)) {
-          return error;
-        }
-        request.lhs_batching_dimensions =
-            RepeatedI64ToVector(matmul.lhs_batching_dimensions());
-        request.rhs_batching_dimensions =
-            RepeatedI64ToVector(matmul.rhs_batching_dimensions());
-        request.lhs_contracting_dimensions =
-            RepeatedI64ToVector(matmul.lhs_contracting_dimensions());
-        request.rhs_contracting_dimensions =
-            RepeatedI64ToVector(matmul.rhs_contracting_dimensions());
-
-        std::vector<std::byte> result_data;
-        if (PJRT_Error* error = ExecuteTtMetalMatmul(request, &result_data)) {
-          return error;
-        }
         PJRT_Buffer* result_buffer = nullptr;
-        const void* data = result_data.empty() ? nullptr : result_data.data();
-        PJRT_Memory* output_memory =
-            target_device == nullptr ? nullptr : target_device->default_memory;
-        if (PJRT_Error* error = CreatePjrtBufferFromHostBytes(
-                request.output_type, request.output_dims, target_device, output_memory, data,
-                result_data.size(), &result_buffer)) {
+        if (PJRT_Error* error = ExecuteTtnnMatmul(matmul, values[lhs_id], values[rhs_id],
+                                                  lhs_desc.tensor(), rhs_desc.tensor(),
+                                                  output_desc.tensor(), target_device,
+                                                  &result_buffer)) {
           return error;
         }
         values[op.output_id()] = result_buffer;
@@ -653,25 +741,16 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
       return error;
     }
 
-    size_t output_size = 0;
-    if (PJRT_Error* error = HostByteSize(output_type, output_dims, &output_size)) {
-      return error;
-    }
-    std::vector<std::byte> logical_data;
-    if (PJRT_Error* error = ReadBufferLogicalBytes(*values[output_id], &logical_data)) {
-      return error;
-    }
-    if (logical_data.size() != output_size) {
-      return Internal("identity output byte size does not match executable metadata");
-    }
-    const void* data = logical_data.empty() ? nullptr : logical_data.data();
     PJRT_Device* output_device = target_device != nullptr ? target_device : values[output_id]->device;
     PJRT_Memory* output_memory =
         values[output_id]->memory != nullptr ? values[output_id]->memory
                                              : (output_device == nullptr ? nullptr : output_device->default_memory);
-    if (PJRT_Error* error = CreatePjrtBufferFromHostBytes(output_type, output_dims, output_device,
-                                                          output_memory, data, logical_data.size(),
-                                                          &outputs[i])) {
+    const ttnn::Tensor* output_tensor = PjrtBufferTtnnTensor(values[output_id]);
+    if (output_tensor == nullptr) {
+      return FailedPrecondition("executable output buffer has no TTNN tensor storage");
+    }
+    if (PJRT_Error* error = CreatePjrtBufferFromTtnnTensor(
+            output_type, output_dims, output_device, output_memory, *output_tensor, &outputs[i])) {
       return error;
     }
   }
