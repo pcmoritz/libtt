@@ -1,4 +1,7 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@//:bazel/cc_embed_data.bzl", "cc_embed_data")
+load("@//third_party/sfpi:sfpi_cc_objects.bzl", "sfpi_cc_objects")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -108,6 +111,183 @@ filegroup(
         ":tt_metal_distributed_flatbuffer_headers",
         ":tt_metal_impl_flatbuffer_headers",
     ],
+)
+
+BLACKHOLE_RUNTIME_PROCS = [
+    ("brisc", "BRISC"),
+    ("ncrisc", "NCRISC"),
+    ("ierisc", "IERISC"),
+    ("subordinate_ierisc", "SUBORDINATE_IERISC"),
+    ("trisc0", "TRISC=0"),
+    ("trisc1", "TRISC=1"),
+    ("trisc2", "TRISC=2"),
+    ("aerisc", "AERISC"),
+    ("main_aerisc", "MAIN_AERISC"),
+    ("subordinate_aerisc", "SUBORDINATE_AERISC"),
+    ("drisc", "DRISC"),
+]
+
+BLACKHOLE_RUNTIME_KINDS = [
+    ("firmware", "FIRMWARE"),
+    ("kernel", "KERNEL"),
+]
+
+BLACKHOLE_RUNTIME_LD_DIR = "runtime/hw/toolchain/blackhole"
+
+BLACKHOLE_RUNTIME_LD_SCRIPTS = [
+    ("%s/%s_%s.ld" % (BLACKHOLE_RUNTIME_LD_DIR, kind, proc), kind_define, proc_define)
+    for kind, kind_define in BLACKHOLE_RUNTIME_KINDS
+    for proc, proc_define in BLACKHOLE_RUNTIME_PROCS
+]
+
+BLACKHOLE_RUNTIME_OBJS = [
+    ("noc.o", "tt_metal/hw/firmware/src/tt-1xx/blackhole/noc.c"),
+    ("substitutes.o", "tt_metal/hw/toolchain/substitutes.cpp"),
+    ("tdma_xmov.o", "tt_metal/hw/firmware/src/tt-1xx/tdma_xmov.c"),
+    ("tmu-crt0.o", "tt_metal/hw/toolchain/tmu-crt0.S"),
+]
+
+BLACKHOLE_RUNTIME_COPTS = [
+    "-mcpu=tt-bh",
+    "-std=c++17",
+    "-flto=auto",
+    "-ffast-math",
+    "-fno-use-cxa-atexit",
+    "-fno-exceptions",
+    "-Wall",
+    "-Werror",
+    "-Wno-deprecated-declarations",
+    "-Wno-unknown-pragmas",
+    "-Wno-error=multistatement-macros",
+    "-Wno-error=parentheses",
+    "-Wno-error=unused-but-set-variable",
+    "-Wno-unused-variable",
+    "-Wno-unused-function",
+    "-Os",
+    "-fno-tree-loop-distribute-patterns",
+]
+
+BLACKHOLE_RUNTIME_INCLUDES = [
+    ".",
+    "tt_metal",
+    "tt_metal/api",
+    "tt_metal/api/tt-metalium",
+    "tt_metal/hw/inc",
+    "tt_metal/hw/inc/debug",
+    "tt_metal/hw/firmware/src/tt-1xx",
+    "tt_metal/hw/inc/internal/tt-1xx/blackhole",
+    "tt_metal/hw/inc/internal/tt-1xx/blackhole/blackhole_defines",
+    "tt_metal/hw/inc/internal/tt-1xx/blackhole/noc",
+    "tt_metal/hw/inc/internal/tt-1xx/blackhole/overlay",
+    "tt_metal/third_party/umd/device/blackhole",
+    "tt_metal/hw/ckernels/blackhole/metal/common",
+    "tt_metal/hw/ckernels/blackhole/metal/llk_io",
+    "tt_metal/tt-llk/tt_llk_blackhole/common/inc",
+    "tt_metal/tt-llk/tt_llk_blackhole/llk_lib",
+]
+
+sfpi_cc_objects(
+    name = "blackhole_runtime_obj_files",
+    hdrs = glob([
+        "tt_metal/hw/firmware/src/tt-1xx/**/*",
+        "tt_metal/hw/inc/**/*",
+        "tt_metal/hw/toolchain/**/*",
+        "tt_metal/tt-llk/common/**/*",
+        "tt_metal/tt-llk/tt_llk_blackhole/**/*",
+    ], allow_empty = True),
+    srcs = [source for _, source in BLACKHOLE_RUNTIME_OBJS],
+    copts = BLACKHOLE_RUNTIME_COPTS,
+    defines = ["TENSIX_FIRMWARE"],
+    includes = BLACKHOLE_RUNTIME_INCLUDES,
+)
+
+pkg_tar(
+    name = "blackhole_runtime_obj_tar",
+    package_dir = "runtime/hw/lib/blackhole",
+    srcs = [":blackhole_runtime_obj_files"],
+)
+
+genrule(
+    name = "tt_metal_blackhole_runtime_hw_assets",
+    srcs = [
+        "tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h",
+        "tt_metal/hw/toolchain/main.ld",
+    ],
+    tools = [
+        "@sfpi//:all_files",
+        "@sfpi//:riscv_gpp",
+    ],
+    outs = [out for out, _, _ in BLACKHOLE_RUNTIME_LD_SCRIPTS],
+    cmd = "\n".join([
+        "set -euo pipefail",
+        "mkdir -p '$(RULEDIR)/%s'" % BLACKHOLE_RUNTIME_LD_DIR,
+    ] + [
+        " ".join([
+            "$(location @sfpi//:riscv_gpp)",
+            "-DTYPE_%s" % type_define,
+            "-DCOMPILE_FOR_%s" % proc_define,
+            "-DARCH_BLACKHOLE",
+            "-I$$(dirname '$(location tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h)')",
+            "-E",
+            "-P",
+            "-x c",
+            "-o '$(RULEDIR)/%s'" % out,
+            "'$(location tt_metal/hw/toolchain/main.ld)'",
+        ])
+        for out, type_define, proc_define in BLACKHOLE_RUNTIME_LD_SCRIPTS
+    ]),
+)
+
+cc_binary(
+    name = "libtt_zstd_compressor",
+    srcs = ["@//third_party/tt_metal:libtt_zstd_compressor.cc"],
+    copts = ["-std=c++17"],
+    deps = ["@llvm_zstd//:zstd"],
+)
+
+filegroup(
+    name = "tt_metal_runtime_sources",
+    srcs = glob([
+        "tt_metal/**",
+        "ttnn/**",
+    ]),
+)
+
+pkg_tar(
+    name = "tt_metal_runtime_archive",
+    deps = [":blackhole_runtime_obj_tar"],
+    srcs = [
+        "@sfpi//:all_files",
+        ":tt_metal_blackhole_runtime_hw_assets",
+        ":tt_metal_runtime_sources",
+    ],
+    compressor = ":libtt_zstd_compressor",
+    compressor_args = "19",
+    extension = "tar.zst",
+    owner = "0.0",
+    ownername = ".",
+    portable_mtime = True,
+    remap_paths = {
+        "../+http_archive+sfpi/": "runtime/sfpi/",
+        "../sfpi/": "runtime/sfpi/",
+        "../+http_archive+tt_metal/": "",
+        "../tt_metal/": "",
+        "external/+http_archive+sfpi/": "runtime/sfpi/",
+        "external/sfpi/": "runtime/sfpi/",
+        "external/+http_archive+tt_metal/": "",
+        "external/tt_metal/": "",
+    },
+    strip_prefix = ".",
+)
+
+cc_embed_data(
+    name = "tt_metal_runtime_embedded",
+    src = ":tt_metal_runtime_archive",
+    data_symbol = "kRuntimeArchiveZstd",
+    fingerprint_symbol = "kRuntimeArchiveFingerprint",
+    namespace = "libtt::tt_metal_runtime_assets",
+    out_prefix = "libtt_embedded_runtime_assets",
+    size_symbol = "kRuntimeArchiveZstdSize",
 )
 
 genrule(
@@ -519,6 +699,8 @@ TTNN_RUNTIME_INCLUDE_DIRS = [
     "ttnn/core",
     "ttnn/cpp",
     "ttnn/cpp/ttnn",
+    "ttnn/cpp/ttnn/operations",
+    "ttnn/cpp/ttnn/operations/data_movement",
 ] + TT_METAL_RUNTIME_INCLUDE_DIRS
 
 TT_METAL_RUNTIME_COPTS = [
@@ -880,9 +1062,140 @@ cc_library(
         "ttnn/cpp/ttnn/operations/core/to_dtype/to_dtype_op.cpp",
         "ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp",
         "ttnn/cpp/ttnn/operations/core/to_memory_config/to_memory_config_op.cpp",
+        "ttnn/cpp/ttnn/operations/ccl/ccl_op_fusion.cpp",
+        "ttnn/cpp/ttnn/operations/ccl/sharding_addrgen_helper.cpp",
         "ttnn/cpp/ttnn/operations/compute_throttle_utils.cpp",
+        "ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op.cpp",
+        "ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp",
+        "ttnn/cpp/ttnn/operations/creation/creation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/clone/clone.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/clone/device/clone_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/clone/device/clone_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/common/common.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/copy/copy.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_default_row_major_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_default_tilized_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_same_memory_config_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/fill_pad/fill_pad.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/move/device/move_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/move/device/move_overlap_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/move/device/move_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/move/device/move_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/move/move.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_writer_multi_core_default_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_writer_multi_core_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_writer_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_sharded_height_only_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_sharded_width_only_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_tile_multicore_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_tile_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/permute/permute.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_higher_dim.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/repeat/repeat.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape_common.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/interleaved_to_sharded/device/interleaved_to_sharded_op.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/interleaved_to_sharded/device/interleaved_to_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/interleaved_to_sharded/interleaved_to_sharded.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/reshard/device/nd_reshard_program_factory_copy_local.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/reshard/device/nd_reshard_program_factory_copy_pages.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/reshard/device/reshard_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/reshard/device/reshard_program_factory_generic.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/reshard/device/reshard_program_factory_same_height.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/reshard/device/reshard_program_factory_same_width.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/reshard/reshard.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/sharded_common.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/sharded_to_interleaved/device/sharded_to_interleaved_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/sharded_to_interleaved/device/sharded_to_interleaved_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/sharded_to_interleaved/sharded_to_interleaved.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/squeeze/squeeze.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_width_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_cn_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_rm_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_interleaved_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_utils.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_rm_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/transpose/transpose.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_block_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_input_and_output_nd_shard_type_and_shard_spec_identical_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_input_and_output_shard_type_and_shard_spec_identical_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_nd_shard_input_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_parallelize_column_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_sub_core_grids_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_single_core_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize/device/untilize_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize/device/untilize_device_operation_types.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_block_interleaved_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_col_interleaved_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_nd_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_single_core_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/untilize_with_unpadding_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/view/view.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/complex/complex.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_utils.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp",
         "ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp",
         "ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_utils.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp",
+        "ttnn/cpp/ttnn/operations/experimental/reshape/view.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/matmul.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_batched_hs_dram_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_2d_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_dram_sharded_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_optimized_program_factory.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/sparse/factory/sparse_matmul_multicore_reuse_mcast_1d_optimized.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/sparse/sparse_matmul_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.cpp",
     ],
     hdrs = TTNN_RUNTIME_HDRS,
     copts = TT_METAL_RUNTIME_COPTS,

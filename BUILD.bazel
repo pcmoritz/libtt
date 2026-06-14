@@ -4,6 +4,11 @@ load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
+exports_files([
+    "bazel/cc_embed_data.S.tpl",
+    "bazel/cc_embed_data.h.tpl",
+])
+
 proto_library(
     name = "executable_proto",
     srcs = ["mlir/executable.proto"],
@@ -48,9 +53,13 @@ cc_library(
 
 cc_library(
     name = "tt_pjrt",
-    srcs = ["cpp/libtt_pjrt.cc"],
+    srcs = [
+        "cpp/libtt_pjrt.cc",
+        "cpp/tt_metal_runtime.cc",
+    ],
     hdrs = [
         "cpp/libtt_pjrt.h",
+        "cpp/tt_metal_runtime.h",
         "third_party/openxla/xla/pjrt/c/pjrt_c_api.h",
     ],
     copts = ["-std=c++20"],
@@ -59,7 +68,10 @@ cc_library(
         ":executable_cc_proto",
         ":mlir_frontend",
         ":tt_pjrt_buffer",
+        ":ttnn_tensor",
+        "@tt_metal//:tt_metal_runtime_embedded",
         "@com_google_protobuf//:protobuf_lite",
+        "@libarchive//:archive",
     ],
     linkstatic = True,
 )
@@ -112,7 +124,9 @@ cc_test(
     deps = [":ttnn_tensor"],
 )
 
-alias(
+filegroup(
     name = "tt",
-    actual = ":tt_shared",
+    srcs = [
+        ":tt_shared",
+    ],
 )

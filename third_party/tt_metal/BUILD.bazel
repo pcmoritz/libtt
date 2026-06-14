@@ -2,7 +2,10 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["BUILD.overlay.bazel"])
+exports_files([
+    "BUILD.overlay.bazel",
+    "libtt_zstd_compressor.cc",
+])
 
 cc_library(
     name = "tt_metal_disabled_fabric_compat",

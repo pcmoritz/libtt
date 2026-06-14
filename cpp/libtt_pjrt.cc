@@ -1,13 +1,19 @@
 #include "cpp/libtt_pjrt.h"
 
 #include "cpp/pjrt_buffer.h"
+#include "cpp/tt_metal_runtime.h"
 #include "mlir/executable.pb.h"
+
+#include <ttnn/operations/matmul/matmul.hpp>
+#include <ttnn/tensor/tensor.hpp>
+#include <ttnn/types.hpp>
 
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -482,11 +488,133 @@ std::string OpKindName(tt::Op::KindCase kind) {
   return "unknown(" + std::to_string(static_cast<int>(kind)) + ")";
 }
 
-PJRT_Error* ExecuteParameterOnlyProgram(const PJRT_LoadedExecutable* executable,
-                                        PJRT_Buffer* const* arguments,
-                                        size_t num_args,
-                                        PJRT_Device* target_device,
-                                        PJRT_Buffer** outputs) {
+bool IsPrefixDims(const google::protobuf::RepeatedField<int64_t>& dims) {
+  for (int i = 0; i < dims.size(); ++i) {
+    if (dims.Get(i) != i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsTtnnMatmulType(PJRT_Buffer_Type type) {
+  return type == PJRT_Buffer_Type_BF16 || type == PJRT_Buffer_Type_F32;
+}
+
+PJRT_Error* ValidateTtnnCompatibleDotGeneral(
+    const tt::MatmulOp& matmul,
+    const std::vector<int64_t>& lhs_dims,
+    const std::vector<int64_t>& rhs_dims) {
+  if (lhs_dims.size() < 2 || rhs_dims.size() < 2) {
+    return Unimplemented("TTNN matmul currently requires rank >= 2 inputs");
+  }
+  if (matmul.lhs_contracting_dimensions_size() != 1 ||
+      matmul.rhs_contracting_dimensions_size() != 1) {
+    return Unimplemented("TTNN matmul currently supports a single contracting dimension");
+  }
+  const int64_t lhs_contract = matmul.lhs_contracting_dimensions(0);
+  const int64_t rhs_contract = matmul.rhs_contracting_dimensions(0);
+  if (lhs_contract != static_cast<int64_t>(lhs_dims.size() - 1) ||
+      rhs_contract != static_cast<int64_t>(rhs_dims.size() - 2)) {
+    return Unimplemented(
+        "TTNN matmul currently supports dot_general forms equivalent to [..., M, K] x "
+        "[..., K, N]");
+  }
+  if (matmul.lhs_batching_dimensions_size() != matmul.rhs_batching_dimensions_size()) {
+    return InvalidArgument("dot_general lhs/rhs batching dimension counts must match");
+  }
+  if (!IsPrefixDims(matmul.lhs_batching_dimensions()) ||
+      !IsPrefixDims(matmul.rhs_batching_dimensions())) {
+    return Unimplemented("TTNN matmul currently supports leading prefix batching dimensions");
+  }
+  if (lhs_dims[static_cast<size_t>(lhs_contract)] !=
+      rhs_dims[static_cast<size_t>(rhs_contract)]) {
+    return InvalidArgument("dot_general contracting dimensions must have matching size");
+  }
+  return nullptr;
+}
+
+PJRT_Error* ExecuteTtnnMatmul(const tt::MatmulOp& matmul,
+                              PJRT_Buffer* lhs_buffer,
+                              PJRT_Buffer* rhs_buffer,
+                              const tt::TensorDesc& lhs_desc,
+                              const tt::TensorDesc& rhs_desc,
+                              const tt::TensorDesc& output_desc,
+                              PJRT_Device* target_device,
+                              PJRT_Buffer** out) {
+  PJRT_Buffer_Type lhs_type = PJRT_Buffer_Type_INVALID;
+  PJRT_Buffer_Type rhs_type = PJRT_Buffer_Type_INVALID;
+  PJRT_Buffer_Type output_type = PJRT_Buffer_Type_INVALID;
+  if (PJRT_Error* error = TensorDescBufferType(lhs_desc, &lhs_type)) {
+    return error;
+  }
+  if (PJRT_Error* error = TensorDescBufferType(rhs_desc, &rhs_type)) {
+    return error;
+  }
+  if (PJRT_Error* error = TensorDescBufferType(output_desc, &output_type)) {
+    return error;
+  }
+  if (lhs_type != rhs_type) {
+    return InvalidArgument("TTNN matmul requires matching lhs/rhs input dtypes");
+  }
+  if (!IsTtnnMatmulType(lhs_type) || !IsTtnnMatmulType(output_type)) {
+    return Unimplemented("TTNN matmul supports bf16 and f32 tensors");
+  }
+
+  std::vector<int64_t> lhs_dims;
+  std::vector<int64_t> rhs_dims;
+  std::vector<int64_t> output_dims;
+  if (PJRT_Error* error = TensorDescDims(lhs_desc, &lhs_dims)) {
+    return error;
+  }
+  if (PJRT_Error* error = TensorDescDims(rhs_desc, &rhs_dims)) {
+    return error;
+  }
+  if (PJRT_Error* error = TensorDescDims(output_desc, &output_dims)) {
+    return error;
+  }
+  if (PJRT_Error* error = ValidateTtnnCompatibleDotGeneral(matmul, lhs_dims, rhs_dims)) {
+    return error;
+  }
+  const tt::tt_metal::DataType output_dtype =
+      *TtnnDataTypeForPjrtBufferType(output_type);
+
+  try {
+    std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_device =
+        GetTtMetalMeshDevice(target_device == nullptr ? 0 : target_device->local_hardware_id);
+    ttnn::Tensor lhs;
+    ttnn::Tensor rhs;
+    if (PJRT_Error* error = CopyPjrtBufferToTtnnDeviceTensor(*lhs_buffer, mesh_device.get(), &lhs)) {
+      return error;
+    }
+    if (PJRT_Error* error = CopyPjrtBufferToTtnnDeviceTensor(*rhs_buffer, mesh_device.get(), &rhs)) {
+      return error;
+    }
+
+    ttnn::Tensor result = ttnn::matmul(
+        /*input_tensor_a=*/lhs,
+        /*input_tensor_b=*/rhs,
+        /*transpose_a=*/false,
+        /*transpose_b=*/false,
+        /*memory_config=*/ttnn::DRAM_MEMORY_CONFIG,
+        /*dtype=*/output_dtype);
+
+    PJRT_Memory* output_memory =
+        target_device == nullptr ? nullptr : target_device->default_memory;
+    return CreatePjrtBufferFromTtnnTensor(output_type, output_dims, target_device,
+                                          output_memory, std::move(result), out);
+  } catch (const std::exception& e) {
+    return Internal(std::string("TTNN matmul failed: ") + e.what());
+  } catch (...) {
+    return Internal("TTNN matmul failed with unknown exception");
+  }
+}
+
+PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
+                           PJRT_Buffer* const* arguments,
+                           size_t num_args,
+                           PJRT_Device* target_device,
+                           PJRT_Buffer** outputs) {
   tt::Executable program;
   if (executable->metadata.executable_proto.empty() ||
       !program.ParseFromString(executable->metadata.executable_proto)) {
@@ -497,6 +625,7 @@ PJRT_Error* ExecuteParameterOnlyProgram(const PJRT_LoadedExecutable* executable,
   }
 
   std::vector<PJRT_Buffer*> values(static_cast<size_t>(program.values_size()), nullptr);
+  std::vector<std::unique_ptr<PJRT_Buffer>> owned_values;
   for (const tt::Op& op : program.ops()) {
     if (op.output_id() >= static_cast<uint32_t>(values.size())) {
       return Internal("executable op output id is out of bounds");
@@ -511,7 +640,7 @@ PJRT_Error* ExecuteParameterOnlyProgram(const PJRT_LoadedExecutable* executable,
           return InvalidArgument("argument buffer must not be null");
         }
         PJRT_Buffer* argument = arguments[parameter_index];
-        if (argument->deleted) {
+        if (argument->IsDeleted()) {
           return FailedPrecondition("argument buffer has been deleted");
         }
         if (target_device != nullptr && argument->device != nullptr && argument->device != target_device) {
@@ -549,8 +678,41 @@ PJRT_Error* ExecuteParameterOnlyProgram(const PJRT_LoadedExecutable* executable,
         values[op.output_id()] = values[input_id];
         break;
       }
+      case tt::Op::kMatmul: {
+        const tt::MatmulOp& matmul = op.matmul();
+        if (matmul.has_top_k_epilogue()) {
+          return Unimplemented("tt-metal matmul top_k epilogue is not implemented yet");
+        }
+        const uint32_t lhs_id = matmul.lhs_id();
+        const uint32_t rhs_id = matmul.rhs_id();
+        if (lhs_id >= static_cast<uint32_t>(values.size()) || values[lhs_id] == nullptr ||
+            rhs_id >= static_cast<uint32_t>(values.size()) || values[rhs_id] == nullptr) {
+          return Internal("matmul input value was not produced");
+        }
+        if (lhs_id >= static_cast<uint32_t>(program.values_size()) ||
+            rhs_id >= static_cast<uint32_t>(program.values_size())) {
+          return Internal("matmul input metadata id is out of bounds");
+        }
+        const tt::ValueDesc& lhs_desc = program.values(lhs_id);
+        const tt::ValueDesc& rhs_desc = program.values(rhs_id);
+        const tt::ValueDesc& output_desc = program.values(op.output_id());
+        if (!lhs_desc.has_tensor() || !rhs_desc.has_tensor() || !output_desc.has_tensor()) {
+          return Internal("matmul value is missing tensor metadata");
+        }
+
+        PJRT_Buffer* result_buffer = nullptr;
+        if (PJRT_Error* error = ExecuteTtnnMatmul(matmul, values[lhs_id], values[rhs_id],
+                                                  lhs_desc.tensor(), rhs_desc.tensor(),
+                                                  output_desc.tensor(), target_device,
+                                                  &result_buffer)) {
+          return error;
+        }
+        values[op.output_id()] = result_buffer;
+        owned_values.emplace_back(result_buffer);
+        break;
+      }
       default:
-        return Unimplemented("C++ host execution does not support op kind: " +
+        return Unimplemented("C++ execution does not support op kind: " +
                              OpKindName(op.kind_case()));
     }
   }
@@ -573,25 +735,16 @@ PJRT_Error* ExecuteParameterOnlyProgram(const PJRT_LoadedExecutable* executable,
       return error;
     }
 
-    size_t output_size = 0;
-    if (PJRT_Error* error = HostByteSize(output_type, output_dims, &output_size)) {
-      return error;
-    }
-    std::vector<std::byte> logical_data;
-    if (PJRT_Error* error = ReadBufferLogicalBytes(*values[output_id], &logical_data)) {
-      return error;
-    }
-    if (logical_data.size() != output_size) {
-      return Internal("identity output byte size does not match executable metadata");
-    }
-    const void* data = logical_data.empty() ? nullptr : logical_data.data();
     PJRT_Device* output_device = target_device != nullptr ? target_device : values[output_id]->device;
     PJRT_Memory* output_memory =
         values[output_id]->memory != nullptr ? values[output_id]->memory
                                              : (output_device == nullptr ? nullptr : output_device->default_memory);
-    if (PJRT_Error* error = CreatePjrtBufferFromHostBytes(output_type, output_dims, output_device,
-                                                          output_memory, data, logical_data.size(),
-                                                          &outputs[i])) {
+    const ttnn::Tensor* output_tensor = values[output_id]->TtnnTensor();
+    if (output_tensor == nullptr) {
+      return FailedPrecondition("executable output buffer has no TTNN tensor storage");
+    }
+    if (PJRT_Error* error = CreatePjrtBufferFromTtnnTensor(
+            output_type, output_dims, output_device, output_memory, *output_tensor, &outputs[i])) {
       return error;
     }
   }
@@ -1132,8 +1285,8 @@ extern "C" PJRT_Error* TT_LoadedExecutable_Execute(
     return InvalidArgument("no execute device available");
   }
   PJRT_Buffer* const* arguments = args->num_args == 0 ? nullptr : args->argument_lists[0];
-  if (PJRT_Error* error = ExecuteParameterOnlyProgram(args->executable, arguments, args->num_args,
-                                                      target_device, device_outputs)) {
+  if (PJRT_Error* error = ExecuteProgram(args->executable, arguments, args->num_args,
+                                         target_device, device_outputs)) {
     for (size_t i = 0; i < args->executable->metadata.num_outputs; ++i) {
       delete device_outputs[i];
       device_outputs[i] = nullptr;
@@ -1153,9 +1306,6 @@ extern "C" PJRT_Error* TT_Client_BufferFromHostBuffer(
   }
   if (args->device_layout != nullptr) {
     return Unimplemented("custom device layouts are not supported");
-  }
-  if (!IsSupportedBufferType(args->type)) {
-    return Unimplemented("unsupported PJRT buffer type");
   }
 
   std::vector<int64_t> dims;
@@ -1431,9 +1581,6 @@ extern "C" PJRT_Error* TT_Buffer_OnDeviceSizeInBytes(
   if (args == nullptr || args->buffer == nullptr) {
     return InvalidArgument("buffer must not be null");
   }
-  if (args->buffer->deleted) {
-    return FailedPrecondition("buffer has been deleted");
-  }
   size_t size = 0;
   if (PJRT_Error* error = TtnnTensorPhysicalByteSize(*args->buffer, &size)) {
     return error;
@@ -1462,8 +1609,7 @@ extern "C" PJRT_Error* TT_Buffer_Delete(PJRT_Buffer_Delete_Args* args) {
   if (args == nullptr || args->buffer == nullptr) {
     return InvalidArgument("buffer must not be null");
   }
-  args->buffer->deleted = true;
-  DeletePjrtBufferStorage(args->buffer);
+  args->buffer->Delete();
   return nullptr;
 }
 
@@ -1471,16 +1617,13 @@ extern "C" PJRT_Error* TT_Buffer_IsDeleted(PJRT_Buffer_IsDeleted_Args* args) {
   if (args == nullptr || args->buffer == nullptr) {
     return InvalidArgument("buffer must not be null");
   }
-  args->is_deleted = args->buffer->deleted;
+  args->is_deleted = args->buffer->IsDeleted();
   return nullptr;
 }
 
 extern "C" PJRT_Error* TT_Buffer_ToHostBuffer(PJRT_Buffer_ToHostBuffer_Args* args) {
   if (args == nullptr || args->src == nullptr) {
     return InvalidArgument("src must not be null");
-  }
-  if (args->src->deleted) {
-    return FailedPrecondition("buffer has been deleted");
   }
   std::vector<std::byte> logical_data;
   if (PJRT_Error* error = ReadBufferLogicalBytes(*args->src, &logical_data)) {
@@ -1505,9 +1648,6 @@ extern "C" PJRT_Error* TT_Buffer_ToHostBuffer(PJRT_Buffer_ToHostBuffer_Args* arg
 extern "C" PJRT_Error* TT_Buffer_CopyRawToHost(PJRT_Buffer_CopyRawToHost_Args* args) {
   if (args == nullptr || args->buffer == nullptr) {
     return InvalidArgument("buffer must not be null");
-  }
-  if (args->buffer->deleted) {
-    return FailedPrecondition("buffer has been deleted");
   }
   if (args->offset < 0 || args->transfer_size < 0) {
     return InvalidArgument("offset and transfer_size must be >= 0");
@@ -1543,7 +1683,7 @@ extern "C" PJRT_Error* TT_Buffer_ReadyEvent(PJRT_Buffer_ReadyEvent_Args* args) {
   if (args == nullptr || args->buffer == nullptr) {
     return InvalidArgument("buffer must not be null");
   }
-  args->event = args->buffer->deleted
+  args->event = args->buffer->IsDeleted()
                     ? EventWithError(PJRT_Error_Code_FAILED_PRECONDITION, "buffer has been deleted")
                     : ReadyEvent();
   return nullptr;

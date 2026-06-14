@@ -4,10 +4,23 @@ bazel_dep(name = "bazel_skylib", version = "1.8.2")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "protobuf", version = "33.4", repo_name = "com_google_protobuf")
 bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "rules_pkg", version = "1.2.0")
 bazel_dep(name = "rules_python", version = "1.7.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "libarchive",
+    build_file = "//third_party/libarchive:BUILD.overlay.bazel",
+    patch_strip = 1,
+    patches = ["//third_party/libarchive:add_bazel_config.patch"],
+    sha256 = "19f917d42d530f98815ac824d90c7eaf648e9d9a50e4f309c812457ffa5496b5",
+    strip_prefix = "libarchive-3.8.1",
+    urls = [
+        "https://github.com/libarchive/libarchive/releases/download/v3.8.1/libarchive-3.8.1.tar.xz",
+    ],
+)
 
 http_archive(
     name = "blake3",
@@ -129,6 +142,18 @@ http_archive(
         "https://github.com/tenstorrent/tt-umd/archive/b4a59998020868bb94ba09daeed7e99452476c8f.tar.gz",
     ],
 )
+
+http_archive(
+    name = "sfpi",
+    build_file = "//third_party/sfpi:BUILD.overlay.bazel",
+    sha256 = "ccf23e9c04352646e9bf905ccf8db0d5c9681207e977f26ce60fa3c61437d828",
+    strip_prefix = "sfpi",
+    urls = [
+        "https://github.com/tenstorrent/sfpi/releases/download/7.58.0/sfpi_7.58.0_x86_64_debian.txz",
+    ],
+)
+
+register_toolchains("@sfpi//:sfpi_cc_toolchain_for_blackhole")
 
 http_archive(
     name = "com_github_google_flatbuffers",
