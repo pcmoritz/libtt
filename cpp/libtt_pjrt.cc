@@ -646,7 +646,7 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
           return InvalidArgument("argument buffer must not be null");
         }
         PJRT_Buffer* argument = arguments[parameter_index];
-        if (argument->deleted) {
+        if (argument->IsDeleted()) {
           return FailedPrecondition("argument buffer has been deleted");
         }
         if (target_device != nullptr && argument->device != nullptr && argument->device != target_device) {
@@ -745,7 +745,7 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
     PJRT_Memory* output_memory =
         values[output_id]->memory != nullptr ? values[output_id]->memory
                                              : (output_device == nullptr ? nullptr : output_device->default_memory);
-    const ttnn::Tensor* output_tensor = PjrtBufferTtnnTensor(values[output_id]);
+    const ttnn::Tensor* output_tensor = values[output_id]->TtnnTensor();
     if (output_tensor == nullptr) {
       return FailedPrecondition("executable output buffer has no TTNN tensor storage");
     }
@@ -1590,9 +1590,6 @@ extern "C" PJRT_Error* TT_Buffer_OnDeviceSizeInBytes(
   if (args == nullptr || args->buffer == nullptr) {
     return InvalidArgument("buffer must not be null");
   }
-  if (args->buffer->deleted) {
-    return FailedPrecondition("buffer has been deleted");
-  }
   size_t size = 0;
   if (PJRT_Error* error = TtnnTensorPhysicalByteSize(*args->buffer, &size)) {
     return error;
@@ -1621,8 +1618,7 @@ extern "C" PJRT_Error* TT_Buffer_Delete(PJRT_Buffer_Delete_Args* args) {
   if (args == nullptr || args->buffer == nullptr) {
     return InvalidArgument("buffer must not be null");
   }
-  args->buffer->deleted = true;
-  DeletePjrtBufferStorage(args->buffer);
+  args->buffer->Delete();
   return nullptr;
 }
 
@@ -1630,16 +1626,13 @@ extern "C" PJRT_Error* TT_Buffer_IsDeleted(PJRT_Buffer_IsDeleted_Args* args) {
   if (args == nullptr || args->buffer == nullptr) {
     return InvalidArgument("buffer must not be null");
   }
-  args->is_deleted = args->buffer->deleted;
+  args->is_deleted = args->buffer->IsDeleted();
   return nullptr;
 }
 
 extern "C" PJRT_Error* TT_Buffer_ToHostBuffer(PJRT_Buffer_ToHostBuffer_Args* args) {
   if (args == nullptr || args->src == nullptr) {
     return InvalidArgument("src must not be null");
-  }
-  if (args->src->deleted) {
-    return FailedPrecondition("buffer has been deleted");
   }
   std::vector<std::byte> logical_data;
   if (PJRT_Error* error = ReadBufferLogicalBytes(*args->src, &logical_data)) {
@@ -1664,9 +1657,6 @@ extern "C" PJRT_Error* TT_Buffer_ToHostBuffer(PJRT_Buffer_ToHostBuffer_Args* arg
 extern "C" PJRT_Error* TT_Buffer_CopyRawToHost(PJRT_Buffer_CopyRawToHost_Args* args) {
   if (args == nullptr || args->buffer == nullptr) {
     return InvalidArgument("buffer must not be null");
-  }
-  if (args->buffer->deleted) {
-    return FailedPrecondition("buffer has been deleted");
   }
   if (args->offset < 0 || args->transfer_size < 0) {
     return InvalidArgument("offset and transfer_size must be >= 0");
@@ -1702,7 +1692,7 @@ extern "C" PJRT_Error* TT_Buffer_ReadyEvent(PJRT_Buffer_ReadyEvent_Args* args) {
   if (args == nullptr || args->buffer == nullptr) {
     return InvalidArgument("buffer must not be null");
   }
-  args->event = args->buffer->deleted
+  args->event = args->buffer->IsDeleted()
                     ? EventWithError(PJRT_Error_Code_FAILED_PRECONDITION, "buffer has been deleted")
                     : ReadyEvent();
   return nullptr;

@@ -11,19 +11,35 @@
 #include <cstring>
 #include <exception>
 #include <limits>
-#include <memory>
 #include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
 
-struct PjrtTensorStorage {
-  explicit PjrtTensorStorage(ttnn::Tensor tensor) : tensor(std::move(tensor)) {}
-
-  ttnn::Tensor tensor;
-};
+PJRT_Buffer::PJRT_Buffer(PJRT_Buffer_Type buffer_type,
+                         std::vector<int64_t> dims,
+                         PJRT_Device* device,
+                         PJRT_Memory* memory,
+                         ttnn::Tensor tensor)
+    : buffer_type(buffer_type),
+      dims(std::move(dims)),
+      device(device),
+      memory(memory),
+      tensor(std::move(tensor)) {}
 
 PJRT_Buffer::~PJRT_Buffer() = default;
+
+ttnn::Tensor* PJRT_Buffer::TtnnTensor() {
+  return IsDeleted() ? nullptr : &*tensor;
+}
+
+const ttnn::Tensor* PJRT_Buffer::TtnnTensor() const {
+  return IsDeleted() ? nullptr : &*tensor;
+}
+
+bool PJRT_Buffer::IsDeleted() const { return !tensor.has_value(); }
+
+void PJRT_Buffer::Delete() { tensor.reset(); }
 
 namespace {
 
@@ -320,15 +336,8 @@ PJRT_Error* CreatePjrtBufferFromHostBytes(PJRT_Buffer_Type type,
     return error;
   }
 
-  auto buffer = std::make_unique<PJRT_Buffer>();
-  buffer->buffer_type = type;
-  buffer->dims = dims;
-  buffer->device = target_device;
-  buffer->memory = target_memory;
-  buffer->storage = std::make_unique<PjrtTensorStorage>(std::move(*tensor));
-  buffer->deleted = false;
-  buffer->external_reference_count = 0;
-  *out = buffer.release();
+  *out =
+      new PJRT_Buffer(type, dims, target_device, target_memory, std::move(*tensor));
   return nullptr;
 }
 
@@ -365,24 +374,9 @@ PJRT_Error* CreatePjrtBufferFromTtnnTensor(PJRT_Buffer_Type type,
     }
   }
 
-  auto buffer = std::make_unique<PJRT_Buffer>();
-  buffer->buffer_type = type;
-  buffer->dims = dims;
-  buffer->device = target_device;
-  buffer->memory = target_memory;
-  buffer->storage = std::make_unique<PjrtTensorStorage>(std::move(tensor));
-  buffer->deleted = false;
-  buffer->external_reference_count = 0;
-  *out = buffer.release();
+  *out =
+      new PJRT_Buffer(type, dims, target_device, target_memory, std::move(tensor));
   return nullptr;
-}
-
-ttnn::Tensor* PjrtBufferTtnnTensor(PJRT_Buffer* buffer) {
-  return buffer == nullptr || buffer->storage == nullptr ? nullptr : &buffer->storage->tensor;
-}
-
-const ttnn::Tensor* PjrtBufferTtnnTensor(const PJRT_Buffer* buffer) {
-  return buffer == nullptr || buffer->storage == nullptr ? nullptr : &buffer->storage->tensor;
 }
 
 PJRT_Error* CopyPjrtBufferToTtnnDeviceTensor(
@@ -395,10 +389,10 @@ PJRT_Error* CopyPjrtBufferToTtnnDeviceTensor(
   if (out == nullptr) {
     return InvalidArgument("out must not be null");
   }
-  if (buffer.deleted) {
+  if (buffer.IsDeleted()) {
     return FailedPrecondition("buffer has been deleted");
   }
-  const ttnn::Tensor* tensor = PjrtBufferTtnnTensor(&buffer);
+  const ttnn::Tensor* tensor = buffer.TtnnTensor();
   if (tensor == nullptr) {
     return FailedPrecondition("buffer has no TTNN tensor storage");
   }
@@ -421,29 +415,25 @@ PJRT_Error* CopyPjrtBufferToTtnnDeviceTensor(
   });
 }
 
-void DeletePjrtBufferStorage(PJRT_Buffer* buffer) {
-  if (buffer != nullptr) {
-    buffer->storage.reset();
-  }
-}
-
 PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::byte>* out) {
-  if (buffer.deleted) {
+  if (buffer.IsDeleted()) {
     return FailedPrecondition("buffer has been deleted");
   }
-  if (buffer.storage == nullptr) {
+  const ttnn::Tensor* tensor = buffer.TtnnTensor();
+  if (tensor == nullptr) {
     return FailedPrecondition("buffer has no TTNN tensor storage");
   }
 
   if (PJRT_Error* error = DispatchByElementType(buffer.buffer_type, [&](auto tag) {
         using Element = decltype(tag);
-        return TensorToBytes<Element>(buffer.storage->tensor, out);
+        return TensorToBytes<Element>(*tensor, out);
       })) {
     return error;
   }
 
   size_t expected_byte_size = 0;
-  if (PJRT_Error* byte_size_error = HostByteSize(buffer.buffer_type, buffer.dims, &expected_byte_size)) {
+  if (PJRT_Error* byte_size_error =
+          HostByteSize(buffer.buffer_type, buffer.dims, &expected_byte_size)) {
     return byte_size_error;
   }
   if (out->size() != expected_byte_size) {
@@ -453,12 +443,15 @@ PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::b
 }
 
 PJRT_Error* TtnnTensorPhysicalByteSize(const PJRT_Buffer& buffer, size_t* out) {
-  if (buffer.storage == nullptr) {
+  if (buffer.IsDeleted()) {
+    return FailedPrecondition("buffer has been deleted");
+  }
+  const ttnn::Tensor* tensor = buffer.TtnnTensor();
+  if (tensor == nullptr) {
     return FailedPrecondition("buffer has no TTNN tensor storage");
   }
-  const ttnn::Tensor& tensor = buffer.storage->tensor;
-  const uint64_t physical_volume = tensor.physical_volume();
-  const uint32_t element_size = tensor.element_size();
+  const uint64_t physical_volume = tensor->physical_volume();
+  const uint32_t element_size = tensor->element_size();
   if (element_size != 0 &&
       physical_volume > std::numeric_limits<size_t>::max() / element_size) {
     return ResourceExhausted("TTNN tensor physical byte size overflow");

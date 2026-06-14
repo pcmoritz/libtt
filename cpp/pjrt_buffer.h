@@ -5,7 +5,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <vector>
 
@@ -17,18 +16,26 @@ class MeshDevice;
 
 struct PJRT_Device;
 struct PJRT_Memory;
-struct PjrtTensorStorage;
 
 struct PJRT_Buffer {
+  PJRT_Buffer(PJRT_Buffer_Type buffer_type,
+              std::vector<int64_t> dims,
+              PJRT_Device* device,
+              PJRT_Memory* memory,
+              ttnn::Tensor tensor);
   PJRT_Buffer_Type buffer_type;
   std::vector<int64_t> dims;
   PJRT_Device* device;
   PJRT_Memory* memory;
-  std::unique_ptr<PjrtTensorStorage> storage;
-  bool deleted;
-  size_t external_reference_count;
+  std::optional<ttnn::Tensor> tensor;
+  size_t external_reference_count = 0;
 
   ~PJRT_Buffer();
+
+  ttnn::Tensor* TtnnTensor();
+  const ttnn::Tensor* TtnnTensor() const;
+  bool IsDeleted() const;
+  void Delete();
 };
 
 size_t BytesPerElement(PJRT_Buffer_Type type);
@@ -55,13 +62,10 @@ PJRT_Error* CreatePjrtBufferFromTtnnTensor(PJRT_Buffer_Type type,
                                            PJRT_Memory* target_memory,
                                            ttnn::Tensor tensor,
                                            PJRT_Buffer** out);
-ttnn::Tensor* PjrtBufferTtnnTensor(PJRT_Buffer* buffer);
-const ttnn::Tensor* PjrtBufferTtnnTensor(const PJRT_Buffer* buffer);
 PJRT_Error* CopyPjrtBufferToTtnnDeviceTensor(
     const PJRT_Buffer& buffer,
     tt::tt_metal::distributed::MeshDevice* mesh_device,
     ttnn::Tensor* out);
-void DeletePjrtBufferStorage(PJRT_Buffer* buffer);
 PJRT_Error* ReadBufferLogicalBytes(const PJRT_Buffer& buffer, std::vector<std::byte>* out);
 PJRT_Error* TtnnTensorPhysicalByteSize(const PJRT_Buffer& buffer, size_t* out);
 
