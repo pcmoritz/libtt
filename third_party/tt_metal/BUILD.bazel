@@ -4,6 +4,7 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "BUILD.overlay.bazel",
+    "blackhole_runtime_hw_assets.sh",
     "libtt_zstd_compressor.cc",
 ])
 

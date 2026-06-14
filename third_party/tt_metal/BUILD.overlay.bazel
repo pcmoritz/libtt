@@ -125,17 +125,19 @@ BLACKHOLE_RUNTIME_PROCS = [
     ("drisc", "drisc"),
 ]
 
+BLACKHOLE_RUNTIME_KINDS = ["firmware", "kernel"]
+
 BLACKHOLE_RUNTIME_LD_OUTS = [
     "runtime/hw/toolchain/blackhole/%s_%s.ld" % (kind, proc_file)
-    for kind in ["firmware", "kernel"]
+    for kind in BLACKHOLE_RUNTIME_KINDS
     for _, proc_file in BLACKHOLE_RUNTIME_PROCS
 ]
 
-BLACKHOLE_RUNTIME_OBJ_OUTS = [
-    "runtime/hw/lib/blackhole/noc.o",
-    "runtime/hw/lib/blackhole/substitutes.o",
-    "runtime/hw/lib/blackhole/tdma_xmov.o",
-    "runtime/hw/lib/blackhole/tmu-crt0.o",
+BLACKHOLE_RUNTIME_OBJS = [
+    ("noc.o", "tt_metal/hw/firmware/src/tt-1xx/blackhole/noc.c"),
+    ("substitutes.o", "tt_metal/hw/toolchain/substitutes.cpp"),
+    ("tdma_xmov.o", "tt_metal/hw/firmware/src/tt-1xx/tdma_xmov.c"),
+    ("tmu-crt0.o", "tt_metal/hw/toolchain/tmu-crt0.S"),
 ]
 
 genrule(
@@ -148,52 +150,26 @@ genrule(
         "tt_metal/tt-llk/tt_llk_blackhole/**/*",
     ], allow_empty = True),
     tools = [
+        "@//third_party/tt_metal:blackhole_runtime_hw_assets.sh",
         "@sfpi//:all_files",
         "@sfpi//:riscv_gpp",
     ],
-    outs = BLACKHOLE_RUNTIME_LD_OUTS + BLACKHOLE_RUNTIME_OBJ_OUTS,
-    cmd = """
-set -eu
-main_ld=$(location tt_metal/hw/toolchain/main.ld)
-root=$${main_ld%/tt_metal/hw/toolchain/main.ld}
-toolchain_out="$(RULEDIR)/runtime/hw/toolchain/blackhole"
-lib_out="$(RULEDIR)/runtime/hw/lib/blackhole"
-mkdir -p "$$toolchain_out" "$$lib_out"
-
-for item in \
-  brisc:brisc \
-  ncrisc:ncrisc \
-  ierisc:ierisc \
-  subordinate_ierisc:subordinate_ierisc \
-  trisc=0:trisc0 \
-  trisc=1:trisc1 \
-  trisc=2:trisc2 \
-  aerisc:aerisc \
-  main_aerisc:main_aerisc \
-  subordinate_aerisc:subordinate_aerisc \
-  drisc:drisc; do
-  proc_define=$${item%%:*}
-  proc_file=$${item##*:}
-  proc_define_upper=$$(printf '%s' "$$proc_define" | tr '[:lower:]' '[:upper:]')
-  for kind in firmware kernel; do
-    kind_upper=$$(printf '%s' "$$kind" | tr '[:lower:]' '[:upper:]')
-    gcc -DTYPE_$$kind_upper -DCOMPILE_FOR_$$proc_define_upper -DARCH_BLACKHOLE \
-      -I"$$root/tt_metal/hw/inc/internal/tt-1xx/blackhole" \
-      -E -P -x c -o "$$toolchain_out/$${kind}_$${proc_file}.ld" \
-      "$$root/tt_metal/hw/toolchain/main.ld"
-  done
-done
-
-gpp=$(location @sfpi//:riscv_gpp)
-common_flags="-mcpu=tt-bh -std=c++17 -flto=auto -ffast-math -fno-use-cxa-atexit -fno-exceptions -Wall -Werror -Wno-deprecated-declarations -Wno-unknown-pragmas -Wno-error=multistatement-macros -Wno-error=parentheses -Wno-error=unused-but-set-variable -Wno-unused-variable -Wno-unused-function -Os -fno-tree-loop-distribute-patterns"
-defines="-DTENSIX_FIRMWARE"
-includes="-I. -I.. -I$$root -I$$root/tt_metal -I$$root/tt_metal/api -I$$root/tt_metal/api/tt-metalium -I$$root/tt_metal/hw/inc -I$$root/tt_metal/hw/inc/debug -I$$root/tt_metal/hw/firmware/src/tt-1xx -I$$root/tt_metal/hw/inc/internal/tt-1xx/blackhole -I$$root/tt_metal/hw/inc/internal/tt-1xx/blackhole/blackhole_defines -I$$root/tt_metal/hw/inc/internal/tt-1xx/blackhole/noc -I$$root/tt_metal/hw/inc/internal/tt-1xx/blackhole/overlay -I$$root/tt_metal/third_party/umd/device/blackhole -I$$root/tt_metal/hw/ckernels/blackhole/metal/common -I$$root/tt_metal/hw/ckernels/blackhole/metal/llk_io -I$$root/tt_metal/tt-llk/tt_llk_blackhole/common/inc -I$$root/tt_metal/tt-llk/tt_llk_blackhole/llk_lib"
-
-"$$gpp" $$common_flags $$defines $$includes -c -o "$$lib_out/substitutes.o" "$$root/tt_metal/hw/toolchain/substitutes.cpp"
-"$$gpp" $$common_flags $$defines $$includes -c -o "$$lib_out/tdma_xmov.o" "$$root/tt_metal/hw/firmware/src/tt-1xx/tdma_xmov.c"
-"$$gpp" $$common_flags $$defines $$includes -c -o "$$lib_out/noc.o" "$$root/tt_metal/hw/firmware/src/tt-1xx/blackhole/noc.c"
-"$$gpp" $$common_flags $$defines $$includes -c -o "$$lib_out/tmu-crt0.o" "$$root/tt_metal/hw/toolchain/tmu-crt0.S"
-""",
+    outs = BLACKHOLE_RUNTIME_LD_OUTS + [
+        "runtime/hw/lib/blackhole/%s" % obj
+        for obj, _ in BLACKHOLE_RUNTIME_OBJS
+    ],
+    cmd = " ".join([
+        "bash",
+        "'$(location @//third_party/tt_metal:blackhole_runtime_hw_assets.sh)'",
+        "'$(location tt_metal/hw/toolchain/main.ld)'",
+        "'$(location @sfpi//:riscv_gpp)'",
+        "'$(RULEDIR)'",
+        "'%s'" % " ".join(["%s:%s" % proc for proc in BLACKHOLE_RUNTIME_PROCS]),
+        "'%s'" % " ".join(BLACKHOLE_RUNTIME_KINDS),
+    ] + [
+        "'%s:%s'" % obj
+        for obj in BLACKHOLE_RUNTIME_OBJS
+    ]),
     local = True,
 )
 
