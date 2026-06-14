@@ -1,5 +1,10 @@
 #include "cpp/tt_metal_matmul_runtime.h"
 
+#include "libtt_embedded_runtime_assets.h"
+
+#include <archive.h>
+#include <archive_entry.h>
+
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/buffer_types.hpp>
 #include <tt-metalium/experimental/tensor/spec/layout/alignment.hpp>
@@ -47,6 +52,122 @@ bool IsTtMetalRuntimeAssetRoot(const std::filesystem::path& path) {
              path / "runtime/hw/toolchain/blackhole/firmware_brisc.ld") &&
          std::filesystem::is_regular_file(
              path / "runtime/hw/lib/blackhole/tmu-crt0.o");
+}
+
+bool IsSafeRelativePath(const std::filesystem::path& relative_path) {
+  if (relative_path.empty() || relative_path.is_absolute()) {
+    return false;
+  }
+  for (const std::filesystem::path& component : relative_path) {
+    if (component == "..") {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct ArchiveReadDeleter {
+  void operator()(archive* value) const {
+    if (value != nullptr) {
+      archive_read_free(value);
+    }
+  }
+};
+
+struct ArchiveWriteDeleter {
+  void operator()(archive* value) const {
+    if (value != nullptr) {
+      archive_write_free(value);
+    }
+  }
+};
+
+bool ExtractEmbeddedRuntimeArchive(const std::filesystem::path& root) {
+  namespace embedded = libtt::tt_metal_runtime_assets;
+  if (embedded::kBlackholeRuntimeHwArchiveZstdSize == 0) {
+    return false;
+  }
+
+  std::error_code error;
+  std::filesystem::create_directories(root, error);
+  if (error) {
+    return false;
+  }
+
+  std::unique_ptr<archive, ArchiveReadDeleter> reader(archive_read_new());
+  std::unique_ptr<archive, ArchiveWriteDeleter> writer(archive_write_disk_new());
+  if (!reader || !writer) {
+    return false;
+  }
+  if (archive_read_support_filter_zstd(reader.get()) != ARCHIVE_OK ||
+      archive_read_support_format_tar(reader.get()) != ARCHIVE_OK ||
+      archive_read_open_memory(reader.get(),
+                               embedded::kBlackholeRuntimeHwArchiveZstd,
+                               embedded::kBlackholeRuntimeHwArchiveZstdSize) !=
+          ARCHIVE_OK) {
+    return false;
+  }
+  if (archive_write_disk_set_options(
+          writer.get(), ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM |
+                            ARCHIVE_EXTRACT_SECURE_SYMLINKS) != ARCHIVE_OK) {
+    return false;
+  }
+
+  archive_entry* entry = nullptr;
+  while (true) {
+    const int status = archive_read_next_header(reader.get(), &entry);
+    if (status == ARCHIVE_EOF) {
+      return true;
+    }
+    if (status != ARCHIVE_OK || entry == nullptr) {
+      return false;
+    }
+
+    const char* pathname = archive_entry_pathname(entry);
+    if (pathname == nullptr || pathname[0] == '\0') {
+      return false;
+    }
+    const std::filesystem::path relative_path(pathname);
+    if (!IsSafeRelativePath(relative_path)) {
+      return false;
+    }
+
+    const mode_t file_type = archive_entry_filetype(entry);
+    if (file_type == AE_IFDIR) {
+      // Continue below and let libarchive create the directory.
+    } else if (file_type != AE_IFREG) {
+      return false;
+    }
+
+    const std::filesystem::path output_path = root / relative_path;
+    const std::string output_path_string = output_path.string();
+    archive_entry_set_pathname(entry, output_path_string.c_str());
+    if (archive_read_extract2(reader.get(), entry, writer.get()) != ARCHIVE_OK) {
+      return false;
+    }
+  }
+}
+
+std::optional<std::filesystem::path> MaterializeEmbeddedRuntimeAssets() {
+  namespace embedded = libtt::tt_metal_runtime_assets;
+  if (embedded::kBlackholeRuntimeHwArchiveZstdSize == 0) {
+    return std::nullopt;
+  }
+
+  std::error_code error;
+  const std::filesystem::path temp_root =
+      std::filesystem::temp_directory_path(error);
+  if (error) {
+    return std::nullopt;
+  }
+  const std::filesystem::path root =
+      temp_root / ("libtt-tt-metal-runtime-assets-" +
+                   std::string(embedded::kBlackholeRuntimeHwArchiveFingerprint));
+
+  if (!ExtractEmbeddedRuntimeArchive(root) || !IsTtMetalRuntimeAssetRoot(root)) {
+    return std::nullopt;
+  }
+  return root;
 }
 
 bool IsSfpiRoot(const std::filesystem::path& path) {
@@ -208,6 +329,7 @@ void EnsureTtMetalRuntimeRoot() {
         std::getenv("TT_METAL_RUNTIME_ASSET_ROOT") != nullptr;
     const bool has_sfpi_root_override =
         std::getenv("TT_METAL_SFPI_ROOT") != nullptr;
+    bool configured_runtime_asset_root = has_runtime_asset_root_override;
 
     Dl_info info;
     if (dladdr(reinterpret_cast<void*>(&EnsureTtMetalRuntimeRoot), &info) != 0 &&
@@ -220,11 +342,17 @@ void EnsureTtMetalRuntimeRoot() {
           found_runtime_root = true;
         }
       }
-      if (!has_runtime_asset_root_override) {
+      if (!configured_runtime_asset_root) {
         if (std::optional<std::filesystem::path> asset_root =
+                MaterializeEmbeddedRuntimeAssets()) {
+          setenv("TT_METAL_RUNTIME_ASSET_ROOT", asset_root->string().c_str(),
+                 0);
+          configured_runtime_asset_root = true;
+        } else if (std::optional<std::filesystem::path> asset_root =
                 FindTtMetalRuntimeAssetRootFrom(info.dli_fname)) {
           setenv("TT_METAL_RUNTIME_ASSET_ROOT", asset_root->string().c_str(),
                  0);
+          configured_runtime_asset_root = true;
         }
       }
       if (!has_sfpi_root_override) {
@@ -245,10 +373,15 @@ void EnsureTtMetalRuntimeRoot() {
       }
     }
 
-    if (!has_runtime_asset_root_override) {
+    if (!configured_runtime_asset_root) {
       if (std::optional<std::filesystem::path> asset_root =
+              MaterializeEmbeddedRuntimeAssets()) {
+        setenv("TT_METAL_RUNTIME_ASSET_ROOT", asset_root->string().c_str(), 0);
+        configured_runtime_asset_root = true;
+      } else if (std::optional<std::filesystem::path> asset_root =
               FindTtMetalRuntimeAssetRootFrom(std::filesystem::current_path())) {
         setenv("TT_METAL_RUNTIME_ASSET_ROOT", asset_root->string().c_str(), 0);
+        configured_runtime_asset_root = true;
       }
     }
 

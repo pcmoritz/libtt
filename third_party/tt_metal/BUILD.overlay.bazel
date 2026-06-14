@@ -1,4 +1,5 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -194,6 +195,121 @@ includes="-I. -I.. -I$$root -I$$root/tt_metal -I$$root/tt_metal/api -I$$root/tt_
 "$$gpp" $$common_flags $$defines $$includes -c -o "$$lib_out/tmu-crt0.o" "$$root/tt_metal/hw/toolchain/tmu-crt0.S"
 """,
     local = True,
+)
+
+genrule(
+    name = "libtt_zstd_compressor_src",
+    outs = ["libtt_zstd_compressor.cc"],
+    cmd = """
+cat > "$@" <<'EOF'
+#include <zstd.h>
+
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <iterator>
+#include <vector>
+
+int main(int argc, char** argv) {
+  int level = 19;
+  if (argc > 1) {
+    level = std::atoi(argv[1]);
+  }
+  std::vector<char> input((std::istreambuf_iterator<char>(std::cin)),
+                          std::istreambuf_iterator<char>());
+  const size_t bound = ZSTD_compressBound(input.size());
+  std::vector<char> output(bound);
+  const size_t compressed_size =
+      ZSTD_compress(output.data(), output.size(), input.data(), input.size(), level);
+  if (ZSTD_isError(compressed_size)) {
+    std::cerr << ZSTD_getErrorName(compressed_size) << "\\n";
+    return 1;
+  }
+  std::cout.write(output.data(), static_cast<std::streamsize>(compressed_size));
+  return std::cout ? 0 : 1;
+}
+EOF
+""",
+)
+
+cc_binary(
+    name = "libtt_zstd_compressor",
+    srcs = ["libtt_zstd_compressor.cc"],
+    copts = ["-std=c++17"],
+    deps = ["@llvm_zstd//:zstd"],
+)
+
+pkg_tar(
+    name = "tt_metal_blackhole_runtime_hw_archive",
+    srcs = [":tt_metal_blackhole_runtime_hw_assets"],
+    compressor = ":libtt_zstd_compressor",
+    compressor_args = "19",
+    extension = "tar.zst",
+    mode = "0644",
+    owner = "0.0",
+    ownername = ".",
+    portable_mtime = True,
+    remap_paths = {
+        "external/+http_archive+tt_metal/": "",
+    },
+    strip_prefix = ".",
+)
+
+genrule(
+    name = "tt_metal_blackhole_runtime_hw_embedded_src",
+    srcs = [":tt_metal_blackhole_runtime_hw_archive"],
+    outs = [
+        "libtt_embedded_runtime_assets.cc",
+        "libtt_embedded_runtime_assets.h",
+    ],
+    cmd = """
+set -eu
+archive="$(location :tt_metal_blackhole_runtime_hw_archive)"
+fingerprint=$$(sha256sum "$$archive" | cut -d ' ' -f 1)
+cc="$(@D)/libtt_embedded_runtime_assets.cc"
+hdr="$(@D)/libtt_embedded_runtime_assets.h"
+
+cat > "$$hdr" <<'EOF'
+#pragma once
+
+#include <cstddef>
+
+namespace libtt::tt_metal_runtime_assets {
+
+extern const unsigned char kBlackholeRuntimeHwArchiveZstd[];
+extern const std::size_t kBlackholeRuntimeHwArchiveZstdSize;
+extern const char kBlackholeRuntimeHwArchiveFingerprint[];
+
+}  // namespace libtt::tt_metal_runtime_assets
+EOF
+
+cat > "$$cc" <<'EOF'
+#include "libtt_embedded_runtime_assets.h"
+
+namespace libtt::tt_metal_runtime_assets {
+
+alignas(16) const unsigned char kBlackholeRuntimeHwArchiveZstd[] = {
+EOF
+od -An -v -t x1 "$$archive" |
+  sed 's/^[[:space:]]*//;s/[[:space:]]*$$//;s/[[:space:]][[:space:]]*/, 0x/g;s/^/  0x/;s/$$/,/' >> "$$cc"
+cat >> "$$cc" <<EOF
+};
+const std::size_t kBlackholeRuntimeHwArchiveZstdSize =
+    sizeof(kBlackholeRuntimeHwArchiveZstd);
+const char kBlackholeRuntimeHwArchiveFingerprint[] = "$$fingerprint";
+
+}  // namespace libtt::tt_metal_runtime_assets
+EOF
+""",
+    local = True,
+)
+
+cc_library(
+    name = "tt_metal_blackhole_runtime_hw_embedded",
+    srcs = ["libtt_embedded_runtime_assets.cc"],
+    hdrs = ["libtt_embedded_runtime_assets.h"],
+    includes = ["."],
+    linkstatic = True,
 )
 
 genrule(

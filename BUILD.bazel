@@ -77,7 +77,9 @@ cc_library(
     includes = ["third_party/openxla"],
     deps = [
         "//third_party/tt_metal:tt_metal_disabled_fabric_compat",
+        "@tt_metal//:tt_metal_blackhole_runtime_hw_embedded",
         "@tt_metal//:ttnn_tensor_upstream",
+        "@libarchive//:archive",
     ],
     linkstatic = True,
 )
@@ -134,6 +136,5 @@ filegroup(
     name = "tt",
     srcs = [
         ":tt_shared",
-        "@tt_metal//:tt_metal_blackhole_runtime_hw_assets",
     ],
 )
