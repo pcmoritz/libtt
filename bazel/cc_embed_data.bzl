@@ -7,32 +7,12 @@ def cc_embed_data(
         data_symbol,
         size_symbol,
         fingerprint_symbol,
-        out_prefix = None,
-        visibility = None,
-        includes = None,
-        testonly = None,
-        tags = None):
+        out_prefix):
     """Embeds a single data file in a C++ library using assembler .incbin."""
-    if out_prefix == None:
-        out_prefix = name
-
     asm = out_prefix + ".S"
     hdr = out_prefix + ".h"
     namespace_open = "namespace %s {" % namespace
     namespace_close = "}  // namespace %s" % namespace
-
-    genrule_kwargs = {}
-    cc_library_kwargs = {}
-    if testonly != None:
-        genrule_kwargs["testonly"] = testonly
-        cc_library_kwargs["testonly"] = testonly
-    if tags != None:
-        genrule_kwargs["tags"] = tags
-        cc_library_kwargs["tags"] = tags
-    if includes != None:
-        cc_library_kwargs["includes"] = includes
-    if visibility != None:
-        cc_library_kwargs["visibility"] = visibility
 
     native.genrule(
         name = name + "_src",
@@ -45,10 +25,8 @@ def cc_embed_data(
 set -eu
 data="$(location {src})"
 fingerprint=$$(sha256sum "$$data" | cut -d ' ' -f 1)
-asm="$(@D)/{asm}"
-hdr="$(@D)/{hdr}"
 
-cat > "$$hdr" <<'EOF'
+cat > "$(@D)/{hdr}" <<'EOF'
 #pragma once
 
 #include <cstddef>
@@ -66,7 +44,7 @@ extern const char {fingerprint_symbol}[];
 {namespace_close}
 EOF
 
-cat > "$$asm" <<EOF
+cat > "$(@D)/{asm}" <<EOF
 .section .rodata
 .balign 16
 .global {data_symbol}
@@ -92,7 +70,6 @@ EOF
             size_symbol = size_symbol,
             src = src,
         ),
-        **genrule_kwargs
     )
 
     cc_library(
@@ -100,6 +77,6 @@ EOF
         srcs = [asm],
         additional_compiler_inputs = [src],
         hdrs = [hdr],
+        includes = ["."],
         linkstatic = True,
-        **cc_library_kwargs
     )

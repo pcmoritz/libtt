@@ -285,7 +285,6 @@ cc_embed_data(
     src = ":tt_metal_runtime_archive",
     data_symbol = "kRuntimeArchiveZstd",
     fingerprint_symbol = "kRuntimeArchiveFingerprint",
-    includes = ["."],
     namespace = "libtt::tt_metal_runtime_assets",
     out_prefix = "libtt_embedded_runtime_assets",
     size_symbol = "kRuntimeArchiveZstdSize",
