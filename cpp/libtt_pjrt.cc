@@ -4,7 +4,29 @@
 #include "cpp/tt_metal_runtime.h"
 #include "mlir/executable.pb.h"
 
+#include <tt-metalium/bfloat16.hpp>
+#include <tt-metalium/experimental/tensor/spec/layout/page_config.hpp>
+#include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
+#include <ttnn/operations/core/core.hpp>
+#include <ttnn/operations/copy/typecast/typecast.hpp>
+#include <ttnn/operations/creation/creation.hpp>
+#include <ttnn/operations/data_movement/concat/concat.hpp>
+#include <ttnn/operations/data_movement/permute/permute.hpp>
+#include <ttnn/operations/data_movement/repeat/repeat.hpp>
+#include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
+#include <ttnn/operations/data_movement/slice/slice.hpp>
+#include <ttnn/operations/eltwise/binary/binary.hpp>
+#include <ttnn/operations/eltwise/binary/binary_composite.hpp>
+#include <ttnn/operations/eltwise/ternary/ternary.hpp>
+#include <ttnn/operations/eltwise/unary/unary.hpp>
+#include <ttnn/operations/embedding/embedding.hpp>
+#include <ttnn/operations/experimental/transformer/rotary_embedding/rotary_embedding.hpp>
 #include <ttnn/operations/matmul/matmul.hpp>
+#include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
+#include <ttnn/operations/reduction/generic/generic_reductions.hpp>
+#include <ttnn/operations/reduction/prod/prod.hpp>
+#include <ttnn/operations/reduction/topk/topk.hpp>
+#include <ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/types.hpp>
 
@@ -15,6 +37,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -22,7 +45,9 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 extern "C" {
@@ -501,6 +526,406 @@ bool IsTtnnMatmulType(PJRT_Buffer_Type type) {
   return type == PJRT_Buffer_Type_BF16 || type == PJRT_Buffer_Type_F32;
 }
 
+bool IsFloatingElementType(tt::TensorDesc::ElementType type) {
+  return type == tt::TensorDesc::ELEMENT_TYPE_BF16 ||
+         type == tt::TensorDesc::ELEMENT_TYPE_F32;
+}
+
+PJRT_Error* TensorDescElementCount(const tt::TensorDesc& desc, uint64_t* out) {
+  std::vector<int64_t> dims;
+  if (PJRT_Error* error = TensorDescDims(desc, &dims)) {
+    return error;
+  }
+  uint64_t count = 1;
+  for (int64_t dim : dims) {
+    if (dim != 0 && count > std::numeric_limits<uint64_t>::max() / static_cast<uint64_t>(dim)) {
+      return ResourceExhausted("executable tensor element count overflow");
+    }
+    count *= static_cast<uint64_t>(dim);
+  }
+  *out = count;
+  return nullptr;
+}
+
+PJRT_Error* ShapeFromTensorDesc(const tt::TensorDesc& desc, ttnn::Shape* out) {
+  ttnn::Shape::Container values;
+  values.reserve(static_cast<size_t>(desc.dims_size()));
+  for (int64_t dim : desc.dims()) {
+    if (dim < 0 || dim > std::numeric_limits<uint32_t>::max()) {
+      return InvalidArgument("shape dimensions must fit uint32_t for TTNN tensors");
+    }
+    values.push_back(static_cast<uint32_t>(dim));
+  }
+  *out = ttnn::Shape(std::move(values));
+  return nullptr;
+}
+
+PJRT_Error* TensorSpecFromDesc(const tt::TensorDesc& desc,
+                               tt::tt_metal::Layout layout,
+                               tt::tt_metal::MemoryConfig memory_config,
+                               std::optional<ttnn::TensorSpec>* out) {
+  PJRT_Buffer_Type type = PJRT_Buffer_Type_INVALID;
+  if (PJRT_Error* error = TensorDescBufferType(desc, &type)) {
+    return error;
+  }
+  std::optional<tt::tt_metal::DataType> dtype = TtnnDataTypeForPjrtBufferType(type);
+  if (!dtype.has_value()) {
+    return Unimplemented("tensor dtype cannot be represented as a TTNN tensor dtype");
+  }
+  ttnn::Shape shape;
+  if (PJRT_Error* error = ShapeFromTensorDesc(desc, &shape)) {
+    return error;
+  }
+  tt::tt_metal::TensorLayout tensor_layout(
+      *dtype, tt::tt_metal::PageConfig(layout), std::move(memory_config));
+  out->emplace(std::move(shape), std::move(tensor_layout));
+  return nullptr;
+}
+
+tt::tt_metal::Layout PreferredDeviceLayout(tt::TensorDesc::ElementType type) {
+  return IsFloatingElementType(type) ? ttnn::TILE_LAYOUT : ttnn::ROW_MAJOR_LAYOUT;
+}
+
+float F32FromBits(uint32_t bits) {
+  float value = 0.0f;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+uint32_t ScaleBf16PackedToF32Bits(uint32_t packed) {
+  const uint32_t bf16_bits = packed & 0xffffu;
+  return bf16_bits << 16;
+}
+
+std::vector<int64_t> TensorShapeVector(const ttnn::Tensor& tensor) {
+  const ttnn::Shape& shape = tensor.logical_shape();
+  std::vector<int64_t> dims;
+  dims.reserve(shape.rank());
+  for (size_t i = 0; i < shape.rank(); ++i) {
+    dims.push_back(static_cast<int64_t>(shape[i]));
+  }
+  return dims;
+}
+
+PJRT_Error* ValidateTensorMatchesDesc(const ttnn::Tensor& tensor,
+                                      const tt::TensorDesc& desc,
+                                      std::string_view context) {
+  PJRT_Buffer_Type type = PJRT_Buffer_Type_INVALID;
+  if (PJRT_Error* error = TensorDescBufferType(desc, &type)) {
+    return error;
+  }
+  const std::optional<tt::tt_metal::DataType> dtype = TtnnDataTypeForPjrtBufferType(type);
+  if (!dtype.has_value()) {
+    return Unimplemented("tensor dtype cannot be represented as a TTNN tensor dtype");
+  }
+  if (tensor.dtype() != *dtype) {
+    return InvalidArgument(std::string(context) + " dtype does not match executable metadata");
+  }
+  if (tensor.logical_shape().rank() != static_cast<size_t>(desc.dims_size())) {
+    return InvalidArgument(std::string(context) + " rank does not match executable metadata");
+  }
+  for (int i = 0; i < desc.dims_size(); ++i) {
+    if (desc.dims(i) < 0 || tensor.logical_shape()[static_cast<size_t>(i)] !=
+                                static_cast<uint64_t>(desc.dims(i))) {
+      return InvalidArgument(std::string(context) + " shape does not match executable metadata");
+    }
+  }
+  return nullptr;
+}
+
+template <typename T>
+PJRT_Error* TensorFromBytePayload(const void* data,
+                                  size_t byte_size,
+                                  const ttnn::TensorSpec& spec,
+                                  tt::tt_metal::distributed::MeshDevice* mesh_device,
+                                  std::optional<ttnn::Tensor>* out) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  if (byte_size % sizeof(T) != 0) {
+    return InvalidArgument("constant byte payload is not a multiple of its element size");
+  }
+  std::vector<T> values(byte_size / sizeof(T));
+  if (byte_size != 0) {
+    std::memcpy(values.data(), data, byte_size);
+  }
+  try {
+    out->emplace(ttnn::Tensor::from_vector(std::move(values), spec, mesh_device));
+  } catch (const std::exception& e) {
+    return Internal(std::string("failed to create TTNN constant tensor: ") + e.what());
+  }
+  return nullptr;
+}
+
+template <typename T>
+PJRT_Error* TensorFromSplat(T value,
+                            uint64_t element_count,
+                            const ttnn::TensorSpec& spec,
+                            tt::tt_metal::distributed::MeshDevice* mesh_device,
+                            std::optional<ttnn::Tensor>* out) {
+  if (element_count > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    return ResourceExhausted("constant tensor element count overflow");
+  }
+  std::vector<T> values(static_cast<size_t>(element_count), value);
+  try {
+    out->emplace(ttnn::Tensor::from_vector(std::move(values), spec, mesh_device));
+  } catch (const std::exception& e) {
+    return Internal(std::string("failed to create TTNN splat constant tensor: ") + e.what());
+  }
+  return nullptr;
+}
+
+PJRT_Error* CreateConstantTensor(const tt::ConstantOp& constant,
+                                 const tt::TensorDesc& output_desc,
+                                 tt::tt_metal::distributed::MeshDevice* mesh_device,
+                                 std::optional<ttnn::Tensor>* out) {
+  std::optional<ttnn::TensorSpec> spec;
+  if (PJRT_Error* error = TensorSpecFromDesc(output_desc,
+                                             PreferredDeviceLayout(output_desc.element_type()),
+                                             ttnn::DRAM_MEMORY_CONFIG,
+                                             &spec)) {
+    return error;
+  }
+  uint64_t element_count = 0;
+  if (PJRT_Error* error = TensorDescElementCount(output_desc, &element_count)) {
+    return error;
+  }
+
+  const std::string& data = constant.data();
+  const void* payload = data.empty() ? nullptr : data.data();
+  const size_t payload_size = data.size();
+  switch (output_desc.element_type()) {
+    case tt::TensorDesc::ELEMENT_TYPE_BF16:
+      if (!data.empty()) {
+        return TensorFromBytePayload<bfloat16>(payload, payload_size, *spec, mesh_device, out);
+      }
+      return TensorFromSplat<bfloat16>(
+          bfloat16(static_cast<uint16_t>(constant.packed_value() & 0xffffu)),
+          element_count, *spec, mesh_device, out);
+    case tt::TensorDesc::ELEMENT_TYPE_F32:
+      if (!data.empty()) {
+        return TensorFromBytePayload<float>(payload, payload_size, *spec, mesh_device, out);
+      }
+      return TensorFromSplat<float>(F32FromBits(constant.packed_value()),
+                                    element_count, *spec, mesh_device, out);
+    case tt::TensorDesc::ELEMENT_TYPE_U32:
+      if (!data.empty()) {
+        return TensorFromBytePayload<uint32_t>(payload, payload_size, *spec, mesh_device, out);
+      }
+      return TensorFromSplat<uint32_t>(constant.packed_value(),
+                                       element_count, *spec, mesh_device, out);
+    case tt::TensorDesc::ELEMENT_TYPE_S32:
+      if (!data.empty()) {
+        return TensorFromBytePayload<int32_t>(payload, payload_size, *spec, mesh_device, out);
+      }
+      return TensorFromSplat<int32_t>(static_cast<int32_t>(constant.packed_value()),
+                                      element_count, *spec, mesh_device, out);
+    case tt::TensorDesc::ELEMENT_TYPE_U16:
+      if (!data.empty()) {
+        return TensorFromBytePayload<uint16_t>(payload, payload_size, *spec, mesh_device, out);
+      }
+      return TensorFromSplat<uint16_t>(static_cast<uint16_t>(constant.packed_value()),
+                                       element_count, *spec, mesh_device, out);
+    case tt::TensorDesc::ELEMENT_TYPE_U8:
+    case tt::TensorDesc::ELEMENT_TYPE_PRED:
+      if (!data.empty()) {
+        return TensorFromBytePayload<uint8_t>(payload, payload_size, *spec, mesh_device, out);
+      }
+      return TensorFromSplat<uint8_t>(static_cast<uint8_t>(constant.packed_value()),
+                                      element_count, *spec, mesh_device, out);
+    default:
+      return Unimplemented("constant element type is not implemented");
+  }
+}
+
+ttnn::Tensor CastTensorIfNeeded(const ttnn::Tensor& tensor,
+                                tt::tt_metal::DataType dtype,
+                                tt::tt_metal::distributed::MeshDevice* mesh_device) {
+  if (tensor.dtype() == dtype) {
+    return tensor;
+  }
+  if (tensor.storage_type() == tt::tt_metal::StorageType::DEVICE) {
+    return ttnn::typecast(tensor, dtype, ttnn::DRAM_MEMORY_CONFIG);
+  }
+  return ttnn::to_dtype(tensor, dtype).to_device(mesh_device, ttnn::DRAM_MEMORY_CONFIG);
+}
+
+ttnn::Tensor ToDeviceTensor(const ttnn::Tensor& tensor,
+                            tt::tt_metal::distributed::MeshDevice* mesh_device,
+                            tt::tt_metal::Layout layout) {
+  ttnn::Tensor result = tensor;
+  if (result.storage_type() != tt::tt_metal::StorageType::DEVICE) {
+    if (result.layout() != layout) {
+      result = result.to_layout(layout);
+    }
+    return result.to_device(mesh_device, ttnn::DRAM_MEMORY_CONFIG);
+  }
+  if (result.layout() != layout) {
+    result = result.to_layout(layout);
+  }
+  if (result.memory_config() != ttnn::DRAM_MEMORY_CONFIG) {
+    result = ttnn::to_memory_config(result, ttnn::DRAM_MEMORY_CONFIG);
+  }
+  return result;
+}
+
+PJRT_Error* ArgumentTensorForParameter(const PJRT_Buffer& buffer,
+                                       const tt::TensorDesc& desc,
+                                       tt::tt_metal::distributed::MeshDevice* mesh_device,
+                                       std::optional<ttnn::Tensor>* out) {
+  const ttnn::Tensor* tensor = buffer.TtnnTensor();
+  if (tensor == nullptr) {
+    return FailedPrecondition("argument buffer has been deleted");
+  }
+  PJRT_Buffer_Type expected_type = PJRT_Buffer_Type_INVALID;
+  if (PJRT_Error* error = TensorDescBufferType(desc, &expected_type)) {
+    return error;
+  }
+  if (buffer.buffer_type != expected_type) {
+    return InvalidArgument("argument buffer dtype does not match executable parameter dtype");
+  }
+  if (buffer.dims.size() != static_cast<size_t>(desc.dims_size())) {
+    return InvalidArgument("argument buffer rank does not match executable parameter rank");
+  }
+  for (int i = 0; i < desc.dims_size(); ++i) {
+    if (buffer.dims[static_cast<size_t>(i)] != desc.dims(i)) {
+      return InvalidArgument("argument buffer shape does not match executable parameter shape");
+    }
+  }
+  try {
+    out->emplace(ToDeviceTensor(*tensor, mesh_device, PreferredDeviceLayout(desc.element_type())));
+  } catch (const std::exception& e) {
+    return Internal(std::string("failed to copy argument tensor to device: ") + e.what());
+  }
+  return nullptr;
+}
+
+PJRT_Error* GetValueTensor(const std::vector<std::optional<ttnn::Tensor>>& values,
+                           uint32_t id,
+                           std::string_view context,
+                           const ttnn::Tensor** out) {
+  if (id >= static_cast<uint32_t>(values.size()) || !values[id].has_value()) {
+    return Internal(std::string(context) + " input value was not produced");
+  }
+  *out = &*values[id];
+  return nullptr;
+}
+
+ttnn::SmallVector<int64_t> Int64SmallVector(
+    const google::protobuf::RepeatedField<int64_t>& values) {
+  ttnn::SmallVector<int64_t> out;
+  out.reserve(static_cast<size_t>(values.size()));
+  for (int64_t value : values) {
+    out.push_back(value);
+  }
+  return out;
+}
+
+ttnn::SmallVector<int32_t> I32SmallVector(
+    const google::protobuf::RepeatedField<int64_t>& values) {
+  ttnn::SmallVector<int32_t> out;
+  out.reserve(static_cast<size_t>(values.size()));
+  for (int64_t value : values) {
+    out.push_back(static_cast<int32_t>(value));
+  }
+  return out;
+}
+
+ttnn::SmallVector<uint32_t> U32SmallVector(const std::vector<int64_t>& values) {
+  ttnn::SmallVector<uint32_t> out;
+  out.reserve(values.size());
+  for (int64_t value : values) {
+    out.push_back(static_cast<uint32_t>(value));
+  }
+  return out;
+}
+
+PJRT_Error* BroadcastTensorInDim(const ttnn::Tensor& input,
+                                 const tt::BroadcastInDimOp& broadcast,
+                                 const tt::TensorDesc& output_desc,
+                                 std::optional<ttnn::Tensor>* out) {
+  std::vector<int64_t> output_dims;
+  if (PJRT_Error* error = TensorDescDims(output_desc, &output_dims)) {
+    return error;
+  }
+  const std::vector<int64_t> input_dims = TensorShapeVector(input);
+  if (broadcast.broadcast_dimensions_size() != static_cast<int>(input_dims.size())) {
+    return Unimplemented("broadcast_in_dim rank-changing input metadata is inconsistent");
+  }
+  std::vector<int64_t> reshaped_dims(output_dims.size(), 1);
+  for (int i = 0; i < broadcast.broadcast_dimensions_size(); ++i) {
+    const int64_t output_dim = broadcast.broadcast_dimensions(i);
+    if (output_dim < 0 || output_dim >= static_cast<int64_t>(output_dims.size())) {
+      return InvalidArgument("broadcast_in_dim dimension is out of bounds");
+    }
+    const int64_t input_dim = input_dims[static_cast<size_t>(i)];
+    if (input_dim != 1 && input_dim != output_dims[static_cast<size_t>(output_dim)]) {
+      return InvalidArgument("broadcast_in_dim input dimension is not broadcast-compatible");
+    }
+    reshaped_dims[static_cast<size_t>(output_dim)] = input_dim;
+  }
+  ttnn::Shape reshaped_shape(U32SmallVector(reshaped_dims));
+  ttnn::Tensor reshaped = ttnn::reshape(input, reshaped_shape, ttnn::DRAM_MEMORY_CONFIG);
+
+  ttnn::SmallVector<uint32_t> repetitions;
+  repetitions.reserve(output_dims.size());
+  bool needs_repeat = false;
+  for (size_t i = 0; i < output_dims.size(); ++i) {
+    if (reshaped_dims[i] <= 0 || output_dims[i] % reshaped_dims[i] != 0) {
+      return InvalidArgument("broadcast_in_dim output shape is not divisible by input shape");
+    }
+    const uint32_t repeat = static_cast<uint32_t>(output_dims[i] / reshaped_dims[i]);
+    repetitions.push_back(repeat);
+    needs_repeat = needs_repeat || repeat != 1;
+  }
+  *out = needs_repeat
+             ? ttnn::repeat(reshaped, repetitions, ttnn::DRAM_MEMORY_CONFIG)
+             : reshaped;
+  return nullptr;
+}
+
+PJRT_Error* BroadcastTrailingDims(const ttnn::Tensor& input,
+                                  const tt::TensorDesc& output_desc,
+                                  std::optional<ttnn::Tensor>* out) {
+  std::vector<int64_t> output_dims;
+  if (PJRT_Error* error = TensorDescDims(output_desc, &output_dims)) {
+    return error;
+  }
+  const std::vector<int64_t> input_dims = TensorShapeVector(input);
+  if (input_dims == output_dims) {
+    *out = input;
+    return nullptr;
+  }
+  if (input_dims.size() > output_dims.size()) {
+    return InvalidArgument("input rank is greater than broadcast output rank");
+  }
+  std::vector<int64_t> reshaped_dims(output_dims.size(), 1);
+  const size_t offset = output_dims.size() - input_dims.size();
+  for (size_t i = 0; i < input_dims.size(); ++i) {
+    const int64_t input_dim = input_dims[i];
+    const int64_t output_dim = output_dims[offset + i];
+    if (input_dim != 1 && input_dim != output_dim) {
+      return InvalidArgument("input shape is not trailing-broadcast-compatible");
+    }
+    reshaped_dims[offset + i] = input_dim;
+  }
+  ttnn::Shape reshaped_shape(U32SmallVector(reshaped_dims));
+  ttnn::Tensor reshaped = ttnn::reshape(input, reshaped_shape, ttnn::DRAM_MEMORY_CONFIG);
+  ttnn::SmallVector<uint32_t> repetitions;
+  repetitions.reserve(output_dims.size());
+  bool needs_repeat = false;
+  for (size_t i = 0; i < output_dims.size(); ++i) {
+    if (reshaped_dims[i] <= 0 || output_dims[i] % reshaped_dims[i] != 0) {
+      return InvalidArgument("broadcast output shape is not divisible by input shape");
+    }
+    const uint32_t repeat = static_cast<uint32_t>(output_dims[i] / reshaped_dims[i]);
+    repetitions.push_back(repeat);
+    needs_repeat = needs_repeat || repeat != 1;
+  }
+  *out = needs_repeat
+             ? ttnn::repeat(reshaped, repetitions, ttnn::DRAM_MEMORY_CONFIG)
+             : reshaped;
+  return nullptr;
+}
+
 PJRT_Error* ValidateTtnnCompatibleDotGeneral(
     const tt::MatmulOp& matmul,
     const std::vector<int64_t>& lhs_dims,
@@ -535,13 +960,13 @@ PJRT_Error* ValidateTtnnCompatibleDotGeneral(
 }
 
 PJRT_Error* ExecuteTtnnMatmul(const tt::MatmulOp& matmul,
-                              PJRT_Buffer* lhs_buffer,
-                              PJRT_Buffer* rhs_buffer,
+                              const ttnn::Tensor& lhs_input,
+                              const ttnn::Tensor& rhs_input,
                               const tt::TensorDesc& lhs_desc,
                               const tt::TensorDesc& rhs_desc,
                               const tt::TensorDesc& output_desc,
-                              PJRT_Device* target_device,
-                              PJRT_Buffer** out) {
+                              tt::tt_metal::distributed::MeshDevice* mesh_device,
+                              std::optional<ttnn::Tensor>* out) {
   PJRT_Buffer_Type lhs_type = PJRT_Buffer_Type_INVALID;
   PJRT_Buffer_Type rhs_type = PJRT_Buffer_Type_INVALID;
   PJRT_Buffer_Type output_type = PJRT_Buffer_Type_INVALID;
@@ -580,34 +1005,474 @@ PJRT_Error* ExecuteTtnnMatmul(const tt::MatmulOp& matmul,
       *TtnnDataTypeForPjrtBufferType(output_type);
 
   try {
-    std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_device =
-        GetTtMetalMeshDevice(target_device == nullptr ? 0 : target_device->local_hardware_id);
-    ttnn::Tensor lhs;
-    ttnn::Tensor rhs;
-    if (PJRT_Error* error = CopyPjrtBufferToTtnnDeviceTensor(*lhs_buffer, mesh_device.get(), &lhs)) {
-      return error;
-    }
-    if (PJRT_Error* error = CopyPjrtBufferToTtnnDeviceTensor(*rhs_buffer, mesh_device.get(), &rhs)) {
-      return error;
-    }
+    ttnn::Tensor lhs = ToDeviceTensor(lhs_input, mesh_device, ttnn::TILE_LAYOUT);
+    ttnn::Tensor rhs = ToDeviceTensor(rhs_input, mesh_device, ttnn::TILE_LAYOUT);
 
-    ttnn::Tensor result = ttnn::matmul(
+    out->emplace(ttnn::matmul(
         /*input_tensor_a=*/lhs,
         /*input_tensor_b=*/rhs,
         /*transpose_a=*/false,
         /*transpose_b=*/false,
         /*memory_config=*/ttnn::DRAM_MEMORY_CONFIG,
-        /*dtype=*/output_dtype);
-
-    PJRT_Memory* output_memory =
-        target_device == nullptr ? nullptr : target_device->default_memory;
-    return CreatePjrtBufferFromTtnnTensor(output_type, output_dims, target_device,
-                                          output_memory, std::move(result), out);
+        /*dtype=*/output_dtype));
   } catch (const std::exception& e) {
     return Internal(std::string("TTNN matmul failed: ") + e.what());
   } catch (...) {
     return Internal("TTNN matmul failed with unknown exception");
   }
+  return nullptr;
+}
+
+PJRT_Error* ExecuteTopK(const tt::TopKOp& top_k,
+                        const ttnn::Tensor& input,
+                        const tt::TensorDesc& values_desc,
+                        const tt::TensorDesc& indices_desc,
+                        tt::tt_metal::distributed::MeshDevice* mesh_device,
+                        std::optional<ttnn::Tensor>* values_out,
+                        std::optional<ttnn::Tensor>* indices_out) {
+  try {
+    ttnn::Tensor tiled_input = ToDeviceTensor(input, mesh_device, ttnn::TILE_LAYOUT);
+    std::vector<ttnn::Tensor> result = ttnn::topk(
+        tiled_input, top_k.k(), -1, true, true, ttnn::DRAM_MEMORY_CONFIG,
+        std::nullopt);
+    if (result.size() != 2) {
+      return Internal("TTNN topk did not return values and indices");
+    }
+    PJRT_Buffer_Type indices_type = PJRT_Buffer_Type_INVALID;
+    if (PJRT_Error* error = TensorDescBufferType(indices_desc, &indices_type)) {
+      return error;
+    }
+    const std::optional<tt::tt_metal::DataType> indices_dtype =
+        TtnnDataTypeForPjrtBufferType(indices_type);
+    if (!indices_dtype.has_value()) {
+      return Unimplemented("top_k indices dtype is not supported");
+    }
+    values_out->emplace(std::move(result[0]));
+    indices_out->emplace(CastTensorIfNeeded(result[1], *indices_dtype, mesh_device));
+    if (PJRT_Error* error = ValidateTensorMatchesDesc(values_out->value(), values_desc, "top_k values")) {
+      return error;
+    }
+    if (PJRT_Error* error = ValidateTensorMatchesDesc(indices_out->value(), indices_desc, "top_k indices")) {
+      return error;
+    }
+  } catch (const std::exception& e) {
+    return Internal(std::string("TTNN top_k failed: ") + e.what());
+  } catch (...) {
+    return Internal("TTNN top_k failed with unknown exception");
+  }
+  return nullptr;
+}
+
+PJRT_Error* ExecuteFusedElementwise(const tt::FusedElementwiseOp& fused,
+                                    const tt::TensorDesc& output_desc,
+                                    const std::vector<std::optional<ttnn::Tensor>>& values,
+                                    tt::tt_metal::distributed::MeshDevice* mesh_device,
+                                    std::optional<ttnn::Tensor>* out) {
+  if (fused.nodes_size() == 0) {
+    return InvalidArgument("fused_elementwise op has no nodes");
+  }
+  std::vector<std::optional<ttnn::Tensor>> node_values(static_cast<size_t>(fused.nodes_size()));
+  auto node_input = [&](uint32_t node_id, const ttnn::Tensor** tensor) -> PJRT_Error* {
+    if (node_id >= static_cast<uint32_t>(node_values.size()) ||
+        !node_values[static_cast<size_t>(node_id)].has_value()) {
+      return Internal("fused_elementwise node input was not produced");
+    }
+    *tensor = &*node_values[static_cast<size_t>(node_id)];
+    return nullptr;
+  };
+
+  try {
+    for (int i = 0; i < fused.nodes_size(); ++i) {
+      const tt::FusedElementwiseOp::Node& node = fused.nodes(i);
+      std::optional<ttnn::Tensor> result;
+      switch (node.kind()) {
+        case tt::FusedElementwiseOp::Node::KIND_INPUT: {
+          if (node.input_index() >= static_cast<uint32_t>(fused.input_ids_size())) {
+            return Internal("fused_elementwise input node index is out of bounds");
+          }
+          const uint32_t input_id = fused.input_ids(static_cast<int>(node.input_index()));
+          const ttnn::Tensor* input = nullptr;
+          if (PJRT_Error* error = GetValueTensor(values, input_id, "fused_elementwise", &input)) {
+            return error;
+          }
+          if (node.single_tile_broadcast()) {
+            if (PJRT_Error* error = BroadcastTrailingDims(*input, output_desc, &result)) {
+              return error;
+            }
+          } else {
+            result = *input;
+          }
+          break;
+        }
+        case tt::FusedElementwiseOp::Node::KIND_CONSTANT: {
+          tt::TensorDesc node_desc = output_desc;
+          node_desc.set_element_type(node.element_type());
+          tt::ConstantOp constant;
+          constant.set_packed_value(node.packed_value());
+          if (PJRT_Error* error = CreateConstantTensor(constant, node_desc, mesh_device, &result)) {
+            return error;
+          }
+          break;
+        }
+        case tt::FusedElementwiseOp::Node::KIND_ADD:
+        case tt::FusedElementwiseOp::Node::KIND_SUBTRACT:
+        case tt::FusedElementwiseOp::Node::KIND_MULTIPLY:
+        case tt::FusedElementwiseOp::Node::KIND_DIVIDE:
+        case tt::FusedElementwiseOp::Node::KIND_MAX:
+        case tt::FusedElementwiseOp::Node::KIND_POWER:
+        case tt::FusedElementwiseOp::Node::KIND_COMPARE: {
+          if (node.input_nodes_size() != 2) {
+            return InvalidArgument("binary fused_elementwise node must have two inputs");
+          }
+          const ttnn::Tensor* lhs = nullptr;
+          const ttnn::Tensor* rhs = nullptr;
+          if (PJRT_Error* error = node_input(node.input_nodes(0), &lhs)) {
+            return error;
+          }
+          if (PJRT_Error* error = node_input(node.input_nodes(1), &rhs)) {
+            return error;
+          }
+          switch (node.kind()) {
+            case tt::FusedElementwiseOp::Node::KIND_ADD:
+              result = ttnn::add(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            case tt::FusedElementwiseOp::Node::KIND_SUBTRACT:
+              result = ttnn::subtract(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            case tt::FusedElementwiseOp::Node::KIND_MULTIPLY:
+              result = ttnn::multiply(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            case tt::FusedElementwiseOp::Node::KIND_DIVIDE:
+              result = ttnn::divide(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            case tt::FusedElementwiseOp::Node::KIND_MAX:
+              result = ttnn::maximum(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            case tt::FusedElementwiseOp::Node::KIND_POWER:
+              result = ttnn::pow(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            case tt::FusedElementwiseOp::Node::KIND_COMPARE:
+              switch (node.compare_direction()) {
+                case tt::FusedElementwiseOp::Node::DIRECTION_EQ:
+                  result = ttnn::eq(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+                  break;
+                case tt::FusedElementwiseOp::Node::DIRECTION_NE:
+                  result = ttnn::ne(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+                  break;
+                case tt::FusedElementwiseOp::Node::DIRECTION_GE:
+                  result = ttnn::ge(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+                  break;
+                case tt::FusedElementwiseOp::Node::DIRECTION_GT:
+                  result = ttnn::gt(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+                  break;
+                case tt::FusedElementwiseOp::Node::DIRECTION_LE:
+                  result = ttnn::le(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+                  break;
+                case tt::FusedElementwiseOp::Node::DIRECTION_LT:
+                  result = ttnn::lt(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
+                  break;
+              }
+              break;
+            default:
+              break;
+          }
+          break;
+        }
+        case tt::FusedElementwiseOp::Node::KIND_NEGATE:
+        case tt::FusedElementwiseOp::Node::KIND_EXPONENTIAL:
+        case tt::FusedElementwiseOp::Node::KIND_RSQRT:
+        case tt::FusedElementwiseOp::Node::KIND_COSINE:
+        case tt::FusedElementwiseOp::Node::KIND_SINE:
+        case tt::FusedElementwiseOp::Node::KIND_CONVERT:
+        case tt::FusedElementwiseOp::Node::KIND_LOG: {
+          if (node.input_nodes_size() != 1) {
+            return InvalidArgument("unary fused_elementwise node must have one input");
+          }
+          const ttnn::Tensor* input = nullptr;
+          if (PJRT_Error* error = node_input(node.input_nodes(0), &input)) {
+            return error;
+          }
+          switch (node.kind()) {
+            case tt::FusedElementwiseOp::Node::KIND_NEGATE:
+              result = ttnn::neg(*input, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            case tt::FusedElementwiseOp::Node::KIND_EXPONENTIAL:
+              result = ttnn::exp(*input, false, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            case tt::FusedElementwiseOp::Node::KIND_RSQRT:
+              result = ttnn::rsqrt(*input, false, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            case tt::FusedElementwiseOp::Node::KIND_COSINE:
+              result = ttnn::cos(*input, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            case tt::FusedElementwiseOp::Node::KIND_SINE:
+              result = ttnn::sin(*input, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            case tt::FusedElementwiseOp::Node::KIND_CONVERT: {
+              PJRT_Buffer_Type type = PjrtBufferTypeFromProto(node.element_type());
+              const std::optional<tt::tt_metal::DataType> dtype =
+                  TtnnDataTypeForPjrtBufferType(type);
+              if (!dtype.has_value()) {
+                return Unimplemented("fused_elementwise convert dtype is not supported");
+              }
+              result = CastTensorIfNeeded(*input, *dtype, mesh_device);
+              break;
+            }
+            case tt::FusedElementwiseOp::Node::KIND_LOG:
+              result = ttnn::log(*input, false, ttnn::DRAM_MEMORY_CONFIG);
+              break;
+            default:
+              break;
+          }
+          break;
+        }
+        default:
+          return Unimplemented("unsupported fused_elementwise node kind");
+      }
+      if (!result.has_value()) {
+        return Internal("fused_elementwise node did not produce a tensor");
+      }
+      node_values[static_cast<size_t>(i)] = std::move(*result);
+    }
+    out->emplace(*node_values.back());
+  } catch (const std::exception& e) {
+    return Internal(std::string("TTNN fused_elementwise failed: ") + e.what());
+  } catch (...) {
+    return Internal("TTNN fused_elementwise failed with unknown exception");
+  }
+  return nullptr;
+}
+
+bool IsEmbeddingGather(const tt::GatherOp& gather,
+                       const tt::TensorDesc& operand_desc,
+                       const tt::TensorDesc& output_desc) {
+  return operand_desc.dims_size() == 2 &&
+         output_desc.dims_size() >= 1 &&
+         gather.collapsed_slice_dims_size() == 1 &&
+         gather.collapsed_slice_dims(0) == 0 &&
+         gather.start_index_map_size() == 1 &&
+         gather.start_index_map(0) == 0 &&
+         gather.operand_batching_dims_size() == 0 &&
+         gather.start_indices_batching_dims_size() == 0 &&
+         gather.slice_sizes_size() == 2 &&
+         gather.slice_sizes(0) == 1 &&
+         gather.slice_sizes(1) == operand_desc.dims(1) &&
+         output_desc.dims(output_desc.dims_size() - 1) == operand_desc.dims(1);
+}
+
+PJRT_Error* ExecuteGather(const tt::GatherOp& gather,
+                          const ttnn::Tensor& operand,
+                          const ttnn::Tensor& start_indices,
+                          const tt::TensorDesc& operand_desc,
+                          const tt::TensorDesc& output_desc,
+                          tt::tt_metal::distributed::MeshDevice* mesh_device,
+                          std::optional<ttnn::Tensor>* out) {
+  if (!IsEmbeddingGather(gather, operand_desc, output_desc)) {
+    return Unimplemented("TTNN execution currently supports embedding-shaped gather ops only");
+  }
+  PJRT_Buffer_Type output_type = PJRT_Buffer_Type_INVALID;
+  if (PJRT_Error* error = TensorDescBufferType(output_desc, &output_type)) {
+    return error;
+  }
+  const std::optional<tt::tt_metal::DataType> output_dtype =
+      TtnnDataTypeForPjrtBufferType(output_type);
+  if (!output_dtype.has_value()) {
+    return Unimplemented("gather output dtype is not supported");
+  }
+
+  try {
+    ttnn::Tensor indices = ToDeviceTensor(start_indices, mesh_device, ttnn::ROW_MAJOR_LAYOUT);
+    indices = CastTensorIfNeeded(indices, tt::tt_metal::DataType::UINT32, mesh_device);
+    ttnn::Tensor weight = ToDeviceTensor(operand, mesh_device, ttnn::ROW_MAJOR_LAYOUT);
+    out->emplace(ttnn::embedding(indices,
+                                 weight,
+                                 std::nullopt,
+                                 ttnn::TILE_LAYOUT,
+                                 ttnn::prim::EmbeddingsType::GENERIC,
+                                 *output_dtype,
+                                 ttnn::DRAM_MEMORY_CONFIG));
+  } catch (const std::exception& e) {
+    return Internal(std::string("TTNN gather/embedding failed: ") + e.what());
+  } catch (...) {
+    return Internal("TTNN gather/embedding failed with unknown exception");
+  }
+  return nullptr;
+}
+
+PJRT_Error* ExecuteReduce(const tt::ReduceOp& reduce,
+                          const ttnn::Tensor& input,
+                          const tt::TensorDesc& output_desc,
+                          std::optional<ttnn::Tensor>* out) {
+  if (reduce.input_ids_size() != 1 || reduce.init_value_ids_size() > 1) {
+    return Unimplemented("TTNN reduce currently supports one input");
+  }
+  ttnn::SmallVector<int> dims;
+  dims.reserve(static_cast<size_t>(reduce.dimensions_size()));
+  for (int64_t dim : reduce.dimensions()) {
+    if (dim < std::numeric_limits<int>::min() || dim > std::numeric_limits<int>::max()) {
+      return InvalidArgument("reduce dimension is out of int range");
+    }
+    dims.push_back(static_cast<int>(dim));
+  }
+  std::optional<std::variant<int, int64_t, ttnn::SmallVector<int>>> dim_arg;
+  if (dims.size() == 1) {
+    dim_arg = dims[0];
+  } else if (!dims.empty()) {
+    dim_arg = dims;
+  }
+  try {
+    switch (reduce.reducer()) {
+      case tt::ReduceOp::REDUCER_ADD:
+        out->emplace(ttnn::sum(input, dim_arg, false, ttnn::DRAM_MEMORY_CONFIG));
+        break;
+      case tt::ReduceOp::REDUCER_MAX:
+        out->emplace(ttnn::max(input, dim_arg, false, ttnn::DRAM_MEMORY_CONFIG));
+        break;
+      case tt::ReduceOp::REDUCER_MIN:
+        out->emplace(ttnn::min(input, dim_arg, false, ttnn::DRAM_MEMORY_CONFIG));
+        break;
+      case tt::ReduceOp::REDUCER_MUL:
+        if (dims.size() != 1) {
+          return Unimplemented("TTNN prod reduce currently supports one dimension");
+        }
+        out->emplace(ttnn::prod(input, static_cast<int64_t>(dims[0]), false,
+                                ttnn::DRAM_MEMORY_CONFIG));
+        break;
+      default:
+        return Unimplemented("TTNN reduce reducer is not implemented");
+    }
+    if (PJRT_Error* error = ValidateTensorMatchesDesc(out->value(), output_desc, "reduce output")) {
+      return error;
+    }
+  } catch (const std::exception& e) {
+    return Internal(std::string("TTNN reduce failed: ") + e.what());
+  } catch (...) {
+    return Internal("TTNN reduce failed with unknown exception");
+  }
+  return nullptr;
+}
+
+PJRT_Error* ExecuteRmsNorm(const tt::RmsNormOp& rms_norm,
+                           const ttnn::Tensor& input,
+                           const ttnn::Tensor& weight,
+                           const tt::TensorDesc& input_desc,
+                           tt::tt_metal::distributed::MeshDevice* mesh_device,
+                           std::optional<ttnn::Tensor>* out) {
+  const float scale = F32FromBits(rms_norm.scale_bits());
+  if (input_desc.dims_size() == 0) {
+    return InvalidArgument("rms_norm input rank must be at least one");
+  }
+  const float expected_scale = 1.0f / static_cast<float>(input_desc.dims(input_desc.dims_size() - 1));
+  if (scale != expected_scale) {
+    return Unimplemented("TTNN rms_norm requires mean scale 1 / hidden_dim");
+  }
+  try {
+    ttnn::Tensor input_tensor = ToDeviceTensor(input, mesh_device, ttnn::TILE_LAYOUT);
+    ttnn::Tensor weight_tensor = ToDeviceTensor(weight, mesh_device, ttnn::TILE_LAYOUT);
+    out->emplace(ttnn::rms_norm(input_tensor,
+                                F32FromBits(rms_norm.bias_bits()),
+                                weight_tensor,
+                                std::nullopt,
+                                std::nullopt,
+                                ttnn::DRAM_MEMORY_CONFIG));
+  } catch (const std::exception& e) {
+    return Internal(std::string("TTNN rms_norm failed: ") + e.what());
+  } catch (...) {
+    return Internal("TTNN rms_norm failed with unknown exception");
+  }
+  return nullptr;
+}
+
+PJRT_Error* ExecuteRope(const tt::RopeOp& rope,
+                        const ttnn::Tensor& input,
+                        const ttnn::Tensor& cos,
+                        const ttnn::Tensor& sin,
+                        tt::tt_metal::distributed::MeshDevice* mesh_device,
+                        std::optional<ttnn::Tensor>* out) {
+  try {
+    ttnn::Tensor input_tensor = ToDeviceTensor(input, mesh_device, ttnn::TILE_LAYOUT);
+    ttnn::Tensor cos_tensor = ToDeviceTensor(cos, mesh_device, ttnn::TILE_LAYOUT);
+    ttnn::Tensor sin_tensor = ToDeviceTensor(sin, mesh_device, ttnn::TILE_LAYOUT);
+    out->emplace(ttnn::experimental::rotary_embedding(
+        input_tensor, cos_tensor, sin_tensor, std::nullopt, ttnn::DRAM_MEMORY_CONFIG));
+  } catch (const std::exception& e) {
+    return Internal(std::string("TTNN rope failed: ") + e.what());
+  } catch (...) {
+    return Internal("TTNN rope failed with unknown exception");
+  }
+  return nullptr;
+}
+
+PJRT_Error* ExecuteSdpaDecode(const tt::SdpaDecodeOp& sdpa,
+                              const ttnn::Tensor& q,
+                              const ttnn::Tensor& k,
+                              const ttnn::Tensor* v,
+                              const ttnn::Tensor& seq_lens,
+                              tt::tt_metal::distributed::MeshDevice* mesh_device,
+                              std::optional<ttnn::Tensor>* out) {
+  if (sdpa.fused_kv_cache()) {
+    return Unimplemented("TTNN fused KV-cache sdpa_decode is not implemented yet");
+  }
+  if (v == nullptr) {
+    return Internal("sdpa_decode value cache is missing");
+  }
+  try {
+    ttnn::Tensor q_tensor = ToDeviceTensor(q, mesh_device, ttnn::TILE_LAYOUT);
+    ttnn::Tensor k_tensor = ToDeviceTensor(k, mesh_device, ttnn::TILE_LAYOUT);
+    ttnn::Tensor v_tensor = ToDeviceTensor(*v, mesh_device, ttnn::TILE_LAYOUT);
+    ttnn::Tensor pos_tensor = ToDeviceTensor(seq_lens, mesh_device, ttnn::ROW_MAJOR_LAYOUT);
+    pos_tensor = CastTensorIfNeeded(pos_tensor, tt::tt_metal::DataType::UINT32, mesh_device);
+    out->emplace(ttnn::transformer::scaled_dot_product_attention_decode(
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        true,
+        std::nullopt,
+        std::vector<uint32_t>{},
+        pos_tensor,
+        std::nullopt,
+        F32FromBits(ScaleBf16PackedToF32Bits(sdpa.scale_bf16_packed())),
+        std::nullopt,
+        ttnn::DRAM_MEMORY_CONFIG));
+  } catch (const std::exception& e) {
+    return Internal(std::string("TTNN sdpa_decode failed: ") + e.what());
+  } catch (...) {
+    return Internal("TTNN sdpa_decode failed with unknown exception");
+  }
+  return nullptr;
+}
+
+PJRT_Error* ExecuteBitwiseBinary(const tt::BitwiseBinaryOp& bitwise,
+                                 const ttnn::Tensor& lhs,
+                                 const ttnn::Tensor& rhs,
+                                 std::optional<ttnn::Tensor>* out) {
+  try {
+    switch (bitwise.kind()) {
+      case tt::BitwiseBinaryOp::KIND_AND:
+        out->emplace(ttnn::bitwise_and(lhs, rhs, ttnn::DRAM_MEMORY_CONFIG));
+        break;
+      case tt::BitwiseBinaryOp::KIND_OR:
+        out->emplace(ttnn::bitwise_or(lhs, rhs, ttnn::DRAM_MEMORY_CONFIG));
+        break;
+      case tt::BitwiseBinaryOp::KIND_XOR:
+        out->emplace(ttnn::bitwise_xor(lhs, rhs, ttnn::DRAM_MEMORY_CONFIG));
+        break;
+      case tt::BitwiseBinaryOp::KIND_SHIFT_LEFT:
+        out->emplace(ttnn::bitwise_left_shift(lhs, rhs, ttnn::DRAM_MEMORY_CONFIG));
+        break;
+      case tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_LOGICAL:
+      case tt::BitwiseBinaryOp::KIND_SHIFT_RIGHT_ARITHMETIC:
+        out->emplace(ttnn::bitwise_right_shift(lhs, rhs, ttnn::DRAM_MEMORY_CONFIG));
+        break;
+      default:
+        return Unimplemented("unknown bitwise_binary kind");
+    }
+  } catch (const std::exception& e) {
+    return Internal(std::string("TTNN bitwise_binary failed: ") + e.what());
+  } catch (...) {
+    return Internal("TTNN bitwise_binary failed with unknown exception");
+  }
+  return nullptr;
 }
 
 PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
@@ -623,12 +1488,20 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
   if (program.output_ids_size() != static_cast<int>(executable->metadata.num_outputs)) {
     return Internal("executable output metadata does not match executable payload");
   }
+  if (target_device == nullptr || target_device->default_memory == nullptr) {
+    return InvalidArgument("no execute device available");
+  }
 
-  std::vector<PJRT_Buffer*> values(static_cast<size_t>(program.values_size()), nullptr);
-  std::vector<std::unique_ptr<PJRT_Buffer>> owned_values;
+  std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_device =
+      GetTtMetalMeshDevice(target_device->local_hardware_id);
+  std::vector<std::optional<ttnn::Tensor>> values(static_cast<size_t>(program.values_size()));
   for (const tt::Op& op : program.ops()) {
     if (op.output_id() >= static_cast<uint32_t>(values.size())) {
       return Internal("executable op output id is out of bounds");
+    }
+    const tt::ValueDesc& output_value_desc = program.values(op.output_id());
+    if (!output_value_desc.has_tensor()) {
+      return Internal("executable op output is missing tensor metadata");
     }
     switch (op.kind_case()) {
       case tt::Op::kParameter: {
@@ -646,7 +1519,19 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
         if (target_device != nullptr && argument->device != nullptr && argument->device != target_device) {
           return InvalidArgument("all input buffers and execute_device must be on the same device");
         }
-        values[op.output_id()] = argument;
+        if (PJRT_Error* error = ArgumentTensorForParameter(
+                *argument, output_value_desc.tensor(), mesh_device.get(),
+                &values[op.output_id()])) {
+          return error;
+        }
+        break;
+      }
+      case tt::Op::kConstant: {
+        if (PJRT_Error* error = CreateConstantTensor(op.constant(), output_value_desc.tensor(),
+                                                     mesh_device.get(),
+                                                     &values[op.output_id()])) {
+          return error;
+        }
         break;
       }
       case tt::Op::KIND_NOT_SET:
@@ -663,8 +1548,9 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
                                (custom_call.has_side_effect() ? "true" : "false"));
         }
         const uint32_t input_id = custom_call.input_ids(0);
-        if (input_id >= static_cast<uint32_t>(values.size()) || values[input_id] == nullptr) {
-          return Internal("custom_call input value was not produced");
+        const ttnn::Tensor* input = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, input_id, "custom_call", &input)) {
+          return error;
         }
         if (input_id >= static_cast<uint32_t>(program.values_size())) {
           return Internal("custom_call input metadata id is out of bounds");
@@ -675,19 +1561,20 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
             !TensorDescsMatch(input_desc.tensor(), output_desc.tensor())) {
           return Unimplemented("C++ host execution only supports identity custom_call ops");
         }
-        values[op.output_id()] = values[input_id];
+        values[op.output_id()] = *input;
         break;
       }
       case tt::Op::kMatmul: {
         const tt::MatmulOp& matmul = op.matmul();
-        if (matmul.has_top_k_epilogue()) {
-          return Unimplemented("tt-metal matmul top_k epilogue is not implemented yet");
-        }
         const uint32_t lhs_id = matmul.lhs_id();
         const uint32_t rhs_id = matmul.rhs_id();
-        if (lhs_id >= static_cast<uint32_t>(values.size()) || values[lhs_id] == nullptr ||
-            rhs_id >= static_cast<uint32_t>(values.size()) || values[rhs_id] == nullptr) {
-          return Internal("matmul input value was not produced");
+        const ttnn::Tensor* lhs = nullptr;
+        const ttnn::Tensor* rhs = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, lhs_id, "matmul", &lhs)) {
+          return error;
+        }
+        if (PJRT_Error* error = GetValueTensor(values, rhs_id, "matmul", &rhs)) {
+          return error;
         }
         if (lhs_id >= static_cast<uint32_t>(program.values_size()) ||
             rhs_id >= static_cast<uint32_t>(program.values_size())) {
@@ -700,15 +1587,343 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
           return Internal("matmul value is missing tensor metadata");
         }
 
-        PJRT_Buffer* result_buffer = nullptr;
-        if (PJRT_Error* error = ExecuteTtnnMatmul(matmul, values[lhs_id], values[rhs_id],
+        std::optional<ttnn::Tensor> matmul_result;
+        if (PJRT_Error* error = ExecuteTtnnMatmul(matmul, *lhs, *rhs,
                                                   lhs_desc.tensor(), rhs_desc.tensor(),
-                                                  output_desc.tensor(), target_device,
-                                                  &result_buffer)) {
+                                                  output_desc.tensor(), mesh_device.get(),
+                                                  &matmul_result)) {
           return error;
         }
-        values[op.output_id()] = result_buffer;
-        owned_values.emplace_back(result_buffer);
+        if (matmul.has_top_k_epilogue()) {
+          const tt::MatmulTopKEpilogue& epilogue = matmul.top_k_epilogue();
+          if (epilogue.indices_id() >= static_cast<uint32_t>(program.values_size())) {
+            return Internal("matmul top_k epilogue indices metadata id is out of bounds");
+          }
+          const tt::ValueDesc& indices_desc = program.values(epilogue.indices_id());
+          if (!indices_desc.has_tensor()) {
+            return Internal("matmul top_k indices value is missing tensor metadata");
+          }
+          tt::TopKOp top_k;
+          top_k.set_operand_id(epilogue.matmul_output_id());
+          top_k.set_indices_id(epilogue.indices_id());
+          top_k.set_k(epilogue.k());
+          if (PJRT_Error* error = ExecuteTopK(top_k, *matmul_result, output_value_desc.tensor(),
+                                              indices_desc.tensor(), mesh_device.get(),
+                                              &values[op.output_id()],
+                                              &values[epilogue.indices_id()])) {
+            return error;
+          }
+        } else {
+          values[op.output_id()] = std::move(*matmul_result);
+        }
+        break;
+      }
+      case tt::Op::kTopK: {
+        const tt::TopKOp& top_k = op.top_k();
+        const ttnn::Tensor* input = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, top_k.operand_id(), "top_k", &input)) {
+          return error;
+        }
+        if (top_k.indices_id() >= static_cast<uint32_t>(program.values_size())) {
+          return Internal("top_k indices metadata id is out of bounds");
+        }
+        const tt::ValueDesc& indices_desc = program.values(top_k.indices_id());
+        if (!indices_desc.has_tensor()) {
+          return Internal("top_k indices value is missing tensor metadata");
+        }
+        if (PJRT_Error* error = ExecuteTopK(top_k, *input, output_value_desc.tensor(),
+                                            indices_desc.tensor(), mesh_device.get(),
+                                            &values[op.output_id()],
+                                            &values[top_k.indices_id()])) {
+          return error;
+        }
+        break;
+      }
+      case tt::Op::kFusedElementwise: {
+        if (PJRT_Error* error = ExecuteFusedElementwise(op.fused_elementwise(),
+                                                        output_value_desc.tensor(),
+                                                        values, mesh_device.get(),
+                                                        &values[op.output_id()])) {
+          return error;
+        }
+        break;
+      }
+      case tt::Op::kReshape: {
+        const ttnn::Tensor* input = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, op.reshape().operand_id(), "reshape", &input)) {
+          return error;
+        }
+        ttnn::Shape shape;
+        if (PJRT_Error* error = ShapeFromTensorDesc(output_value_desc.tensor(), &shape)) {
+          return error;
+        }
+        try {
+          values[op.output_id()] = ttnn::reshape(*input, shape, ttnn::DRAM_MEMORY_CONFIG);
+        } catch (const std::exception& e) {
+          return Internal(std::string("TTNN reshape failed: ") + e.what());
+        }
+        break;
+      }
+      case tt::Op::kSlice: {
+        const tt::SliceOp& slice = op.slice();
+        const ttnn::Tensor* input = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, slice.operand_id(), "slice", &input)) {
+          return error;
+        }
+        try {
+          values[op.output_id()] = ttnn::slice(*input,
+                                               I32SmallVector(slice.start_indices()),
+                                               I32SmallVector(slice.limit_indices()),
+                                               I32SmallVector(slice.strides()),
+                                               ttnn::DRAM_MEMORY_CONFIG);
+        } catch (const std::exception& e) {
+          return Internal(std::string("TTNN slice failed: ") + e.what());
+        }
+        break;
+      }
+      case tt::Op::kTranspose: {
+        const tt::TransposeOp& transpose = op.transpose();
+        const ttnn::Tensor* input = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, transpose.operand_id(), "transpose", &input)) {
+          return error;
+        }
+        try {
+          values[op.output_id()] = ttnn::permute(*input,
+                                                 Int64SmallVector(transpose.permutation()),
+                                                 ttnn::DRAM_MEMORY_CONFIG);
+        } catch (const std::exception& e) {
+          return Internal(std::string("TTNN transpose/permute failed: ") + e.what());
+        }
+        break;
+      }
+      case tt::Op::kConcatenate: {
+        const tt::ConcatenateOp& concatenate = op.concatenate();
+        std::vector<ttnn::Tensor> inputs;
+        inputs.reserve(static_cast<size_t>(concatenate.input_ids_size()));
+        for (uint32_t input_id : concatenate.input_ids()) {
+          const ttnn::Tensor* input = nullptr;
+          if (PJRT_Error* error = GetValueTensor(values, input_id, "concatenate", &input)) {
+            return error;
+          }
+          inputs.push_back(*input);
+        }
+        try {
+          values[op.output_id()] = ttnn::concat(inputs,
+                                                static_cast<int>(concatenate.dimension()),
+                                                ttnn::DRAM_MEMORY_CONFIG);
+        } catch (const std::exception& e) {
+          return Internal(std::string("TTNN concatenate failed: ") + e.what());
+        }
+        break;
+      }
+      case tt::Op::kBroadcastInDim: {
+        const ttnn::Tensor* input = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, op.broadcast_in_dim().operand_id(),
+                                               "broadcast_in_dim", &input)) {
+          return error;
+        }
+        if (PJRT_Error* error = BroadcastTensorInDim(*input, op.broadcast_in_dim(),
+                                                     output_value_desc.tensor(),
+                                                     &values[op.output_id()])) {
+          return error;
+        }
+        break;
+      }
+      case tt::Op::kSelect: {
+        const tt::SelectOp& select = op.select();
+        const ttnn::Tensor* pred = nullptr;
+        const ttnn::Tensor* on_true = nullptr;
+        const ttnn::Tensor* on_false = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, select.pred_id(), "select", &pred)) {
+          return error;
+        }
+        if (PJRT_Error* error = GetValueTensor(values, select.on_true_id(), "select", &on_true)) {
+          return error;
+        }
+        if (PJRT_Error* error = GetValueTensor(values, select.on_false_id(), "select", &on_false)) {
+          return error;
+        }
+        try {
+          ttnn::Tensor pred_tensor = ToDeviceTensor(*pred, mesh_device.get(), on_true->layout());
+          values[op.output_id()] = ttnn::where(pred_tensor, *on_true, *on_false,
+                                               ttnn::DRAM_MEMORY_CONFIG);
+        } catch (const std::exception& e) {
+          return Internal(std::string("TTNN select failed: ") + e.what());
+        }
+        break;
+      }
+      case tt::Op::kGather: {
+        const tt::GatherOp& gather = op.gather();
+        const ttnn::Tensor* operand = nullptr;
+        const ttnn::Tensor* start_indices = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, gather.operand_id(), "gather", &operand)) {
+          return error;
+        }
+        if (PJRT_Error* error = GetValueTensor(values, gather.start_indices_id(), "gather", &start_indices)) {
+          return error;
+        }
+        if (gather.operand_id() >= static_cast<uint32_t>(program.values_size())) {
+          return Internal("gather operand metadata id is out of bounds");
+        }
+        const tt::ValueDesc& operand_desc = program.values(gather.operand_id());
+        if (!operand_desc.has_tensor()) {
+          return Internal("gather operand is missing tensor metadata");
+        }
+        if (PJRT_Error* error = ExecuteGather(gather, *operand, *start_indices,
+                                              operand_desc.tensor(),
+                                              output_value_desc.tensor(),
+                                              mesh_device.get(),
+                                              &values[op.output_id()])) {
+          return error;
+        }
+        break;
+      }
+      case tt::Op::kIota: {
+        const uint64_t dim = op.iota().iota_dimension();
+        std::vector<int64_t> output_dims;
+        if (PJRT_Error* error = TensorDescDims(output_value_desc.tensor(), &output_dims)) {
+          return error;
+        }
+        if (dim >= output_dims.size()) {
+          return InvalidArgument("iota dimension is out of bounds");
+        }
+        PJRT_Buffer_Type output_type = PJRT_Buffer_Type_INVALID;
+        if (PJRT_Error* error = TensorDescBufferType(output_value_desc.tensor(), &output_type)) {
+          return error;
+        }
+        const std::optional<tt::tt_metal::DataType> dtype =
+            TtnnDataTypeForPjrtBufferType(output_type);
+        if (!dtype.has_value()) {
+          return Unimplemented("iota dtype is not supported");
+        }
+        try {
+          ttnn::Tensor range = ttnn::arange(0,
+                                            output_dims[static_cast<size_t>(dim)],
+                                            1,
+                                            *dtype,
+                                            std::ref(*mesh_device),
+                                            ttnn::DRAM_MEMORY_CONFIG);
+          if (output_dims.size() == 1) {
+            values[op.output_id()] = range;
+            break;
+          }
+          std::vector<int64_t> reshaped_dims(output_dims.size(), 1);
+          reshaped_dims[static_cast<size_t>(dim)] = output_dims[static_cast<size_t>(dim)];
+          ttnn::Tensor reshaped = ttnn::reshape(range,
+                                                ttnn::Shape(U32SmallVector(reshaped_dims)),
+                                                ttnn::DRAM_MEMORY_CONFIG);
+          std::optional<ttnn::Tensor> broadcasted;
+          if (PJRT_Error* error = BroadcastTrailingDims(reshaped, output_value_desc.tensor(), &broadcasted)) {
+            return error;
+          }
+          values[op.output_id()] = std::move(*broadcasted);
+        } catch (const std::exception& e) {
+          return Internal(std::string("TTNN iota failed: ") + e.what());
+        }
+        break;
+      }
+      case tt::Op::kReduce: {
+        const tt::ReduceOp& reduce = op.reduce();
+        if (reduce.input_ids_size() != 1) {
+          return Unimplemented("reduce with multiple inputs is not implemented");
+        }
+        const ttnn::Tensor* input = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, reduce.input_ids(0), "reduce", &input)) {
+          return error;
+        }
+        if (PJRT_Error* error = ExecuteReduce(reduce, *input,
+                                              output_value_desc.tensor(),
+                                              &values[op.output_id()])) {
+          return error;
+        }
+        break;
+      }
+      case tt::Op::kRmsNorm: {
+        const tt::RmsNormOp& rms_norm = op.rms_norm();
+        const ttnn::Tensor* input = nullptr;
+        const ttnn::Tensor* weight = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, rms_norm.input_id(), "rms_norm", &input)) {
+          return error;
+        }
+        if (PJRT_Error* error = GetValueTensor(values, rms_norm.weight_id(), "rms_norm", &weight)) {
+          return error;
+        }
+        if (rms_norm.input_id() >= static_cast<uint32_t>(program.values_size())) {
+          return Internal("rms_norm input metadata id is out of bounds");
+        }
+        const tt::ValueDesc& input_desc = program.values(rms_norm.input_id());
+        if (!input_desc.has_tensor()) {
+          return Internal("rms_norm input is missing tensor metadata");
+        }
+        if (PJRT_Error* error = ExecuteRmsNorm(rms_norm, *input, *weight,
+                                               input_desc.tensor(), mesh_device.get(),
+                                               &values[op.output_id()])) {
+          return error;
+        }
+        break;
+      }
+      case tt::Op::kRope: {
+        const tt::RopeOp& rope = op.rope();
+        const ttnn::Tensor* input = nullptr;
+        const ttnn::Tensor* cos = nullptr;
+        const ttnn::Tensor* sin = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, rope.input_id(), "rope", &input)) {
+          return error;
+        }
+        if (PJRT_Error* error = GetValueTensor(values, rope.cos_id(), "rope", &cos)) {
+          return error;
+        }
+        if (PJRT_Error* error = GetValueTensor(values, rope.sin_id(), "rope", &sin)) {
+          return error;
+        }
+        if (PJRT_Error* error = ExecuteRope(rope, *input, *cos, *sin,
+                                            mesh_device.get(),
+                                            &values[op.output_id()])) {
+          return error;
+        }
+        break;
+      }
+      case tt::Op::kSdpaDecode: {
+        const tt::SdpaDecodeOp& sdpa = op.sdpa_decode();
+        const ttnn::Tensor* q = nullptr;
+        const ttnn::Tensor* k = nullptr;
+        const ttnn::Tensor* v = nullptr;
+        const ttnn::Tensor* seq_lens = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, sdpa.q_id(), "sdpa_decode", &q)) {
+          return error;
+        }
+        if (PJRT_Error* error = GetValueTensor(values, sdpa.k_id(), "sdpa_decode", &k)) {
+          return error;
+        }
+        if (!sdpa.fused_kv_cache()) {
+          if (PJRT_Error* error = GetValueTensor(values, sdpa.v_id(), "sdpa_decode", &v)) {
+            return error;
+          }
+        }
+        if (PJRT_Error* error = GetValueTensor(values, sdpa.seq_lens_id(), "sdpa_decode", &seq_lens)) {
+          return error;
+        }
+        if (PJRT_Error* error = ExecuteSdpaDecode(sdpa, *q, *k, v, *seq_lens,
+                                                  mesh_device.get(),
+                                                  &values[op.output_id()])) {
+          return error;
+        }
+        break;
+      }
+      case tt::Op::kBitwiseBinary: {
+        const tt::BitwiseBinaryOp& bitwise = op.bitwise_binary();
+        const ttnn::Tensor* lhs = nullptr;
+        const ttnn::Tensor* rhs = nullptr;
+        if (PJRT_Error* error = GetValueTensor(values, bitwise.lhs_id(), "bitwise_binary", &lhs)) {
+          return error;
+        }
+        if (PJRT_Error* error = GetValueTensor(values, bitwise.rhs_id(), "bitwise_binary", &rhs)) {
+          return error;
+        }
+        if (PJRT_Error* error = ExecuteBitwiseBinary(bitwise, *lhs, *rhs,
+                                                     &values[op.output_id()])) {
+          return error;
+        }
         break;
       }
       default:
@@ -719,7 +1934,7 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
 
   for (int i = 0; i < program.output_ids_size(); ++i) {
     const uint32_t output_id = program.output_ids(i);
-    if (output_id >= static_cast<uint32_t>(values.size()) || values[output_id] == nullptr) {
+    if (output_id >= static_cast<uint32_t>(values.size()) || !values[output_id].has_value()) {
       return Internal("executable output value was not produced");
     }
     const tt::ValueDesc& value_desc = program.values(output_id);
@@ -735,16 +1950,9 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
       return error;
     }
 
-    PJRT_Device* output_device = target_device != nullptr ? target_device : values[output_id]->device;
-    PJRT_Memory* output_memory =
-        values[output_id]->memory != nullptr ? values[output_id]->memory
-                                             : (output_device == nullptr ? nullptr : output_device->default_memory);
-    const ttnn::Tensor* output_tensor = values[output_id]->TtnnTensor();
-    if (output_tensor == nullptr) {
-      return FailedPrecondition("executable output buffer has no TTNN tensor storage");
-    }
+    const ttnn::Tensor* output_tensor = &*values[output_id];
     if (PJRT_Error* error = CreatePjrtBufferFromTtnnTensor(
-            output_type, output_dims, output_device, output_memory, *output_tensor, &outputs[i])) {
+            output_type, output_dims, target_device, target_device->default_memory, *output_tensor, &outputs[i])) {
       return error;
     }
   }

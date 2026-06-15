@@ -3005,12 +3005,65 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto custom_call_op = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
+            auto call_target = custom_call_op.getCallTargetName();
+            if ((call_target == "annotate_device_placement" || call_target == "Sharding" ||
+                 call_target == "xla.sdy.FuncResultSharding") &&
+                !custom_call_op.getHasSideEffect()) {
+                auto inputs = custom_call_op.getInputs();
+                if (inputs.size() != custom_call_op->getNumResults()) {
+                    error = "identity custom_call input and result counts must match";
+                    return false;
+                }
+                for (auto [input, result] :
+                     llvm::zip_equal(inputs, custom_call_op->getResults())) {
+                    if (input.getType() != result.getType()) {
+                        error = "identity custom_call input and result types must match";
+                        return false;
+                    }
+                    uint32_t input_id = 0;
+                    if (!addValueDesc(input, executable, value_ids, error, input_id)) {
+                        return false;
+                    }
+                    value_ids.try_emplace(result, input_id);
+                }
+                continue;
+            }
+
+            if (call_target == "mhlo.topk") {
+                if (custom_call_op.getInputs().size() != 1 ||
+                    custom_call_op->getNumResults() != 2) {
+                    error = "mhlo.topk custom_call must have one input and two results";
+                    return false;
+                }
+                auto values_type = mlir::dyn_cast<mlir::RankedTensorType>(
+                    custom_call_op->getResult(0).getType());
+                if (!values_type || !values_type.hasStaticShape() ||
+                    values_type.getRank() == 0) {
+                    error = "mhlo.topk values result must be a static ranked tensor";
+                    return false;
+                }
+                int64_t k = values_type.getShape().back();
+                if (!addTopKOp(
+                        custom_call_op.getInputs().front(),
+                        custom_call_op->getResult(0),
+                        custom_call_op->getResult(1),
+                        k,
+                        executable,
+                        value_ids,
+                        error)) {
+                    return false;
+                }
+                continue;
+            }
+
             if (custom_call_op->getNumResults() != 1) {
-                error = "only single-result custom_call ops are currently supported";
+                error = "only single-result custom_call ops are currently supported: target=" +
+                        call_target.str() + " inputs=" +
+                        std::to_string(custom_call_op.getInputs().size()) + " results=" +
+                        std::to_string(custom_call_op->getNumResults());
                 return false;
             }
 
-            auto call_target = custom_call_op.getCallTargetName();
             if (call_target == libtt::mlir_frontend::kSdpaDecodeTarget) {
                 if (!addSdpaDecodeOp(custom_call_op, executable, value_ids, error)) {
                     return false;
@@ -3027,25 +3080,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 if (!addRopeOp(custom_call_op, executable, value_ids, error)) {
                     return false;
                 }
-                continue;
-            }
-            if ((call_target == "annotate_device_placement" || call_target == "Sharding") &&
-                !custom_call_op.getHasSideEffect()) {
-                auto inputs = custom_call_op.getInputs();
-                if (inputs.size() != 1) {
-                    error = "identity custom_call op must have exactly one input";
-                    return false;
-                }
-                mlir::Value input = inputs.front();
-                if (input.getType() != custom_call_op.getResult(0).getType()) {
-                    error = "identity custom_call input and result types must match";
-                    return false;
-                }
-                uint32_t input_id = 0;
-                if (!addValueDesc(input, executable, value_ids, error, input_id)) {
-                    return false;
-                }
-                value_ids.try_emplace(custom_call_op.getResult(0), input_id);
                 continue;
             }
 

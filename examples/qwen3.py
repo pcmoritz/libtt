@@ -9,7 +9,6 @@ from pathlib import Path
 import jax
 import ml_dtypes
 import numpy as np
-import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoTokenizer
@@ -17,6 +16,8 @@ from transformers import AutoTokenizer
 jax.config.update("jax_use_shardy_partitioner", False)
 
 import jax.numpy as jnp
+
+torch = None
 
 
 @dataclass(frozen=True)
@@ -301,6 +302,8 @@ def safetensor_files(model_dir: Path) -> list[Path]:
 
 
 def tensor_to_numpy(tensor, np_dtype):
+    if torch is None:
+        raise RuntimeError("loading checkpoint tensors requires torch")
     tensor = tensor.detach().cpu().contiguous()
     if np.dtype(np_dtype) == np.dtype(ml_dtypes.bfloat16):
         if tensor.dtype == torch.bfloat16:
@@ -314,6 +317,12 @@ def tensor_to_numpy(tensor, np_dtype):
 
 
 def load_checkpoint_arrays(model_dir: Path, np_dtype):
+    global torch
+    if torch is None:
+        import torch as torch_module
+
+        torch = torch_module
+
     arrays = {}
 
     for path in safetensor_files(model_dir):
