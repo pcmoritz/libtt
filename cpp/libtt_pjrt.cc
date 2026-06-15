@@ -513,15 +513,6 @@ std::string OpKindName(tt::Op::KindCase kind) {
   return "unknown(" + std::to_string(static_cast<int>(kind)) + ")";
 }
 
-bool IsPrefixDims(const google::protobuf::RepeatedField<int64_t>& dims) {
-  for (int i = 0; i < dims.size(); ++i) {
-    if (dims.Get(i) != i) {
-      return false;
-    }
-  }
-  return true;
-}
-
 bool IsTtnnMatmulType(PJRT_Buffer_Type type) {
   return type == PJRT_Buffer_Type_BF16 || type == PJRT_Buffer_Type_F32;
 }
@@ -582,8 +573,9 @@ PJRT_Error* TensorSpecFromDesc(const tt::TensorDesc& desc,
   return nullptr;
 }
 
-tt::tt_metal::Layout PreferredDeviceLayout(tt::TensorDesc::ElementType type) {
-  return IsFloatingElementType(type) ? ttnn::TILE_LAYOUT : ttnn::ROW_MAJOR_LAYOUT;
+tt::tt_metal::Layout PreferredDeviceLayout(const tt::TensorDesc& desc) {
+  return IsFloatingElementType(desc.element_type()) ? ttnn::TILE_LAYOUT
+                                                    : ttnn::ROW_MAJOR_LAYOUT;
 }
 
 float F32FromBits(uint32_t bits) {
@@ -607,6 +599,53 @@ std::vector<int64_t> TensorShapeVector(const ttnn::Tensor& tensor) {
   return dims;
 }
 
+std::string DimsToString(const std::vector<int64_t>& dims) {
+  std::ostringstream os;
+  os << "[";
+  for (size_t i = 0; i < dims.size(); ++i) {
+    if (i != 0) {
+      os << ", ";
+    }
+    os << dims[i];
+  }
+  os << "]";
+  return os.str();
+}
+
+std::string TensorDescShapeString(const tt::TensorDesc& desc) {
+  std::vector<int64_t> dims;
+  dims.reserve(static_cast<size_t>(desc.dims_size()));
+  for (int64_t dim : desc.dims()) {
+    dims.push_back(dim);
+  }
+  return DimsToString(dims);
+}
+
+std::string ReduceDimsToString(const ttnn::SmallVector<int>& dims) {
+  std::vector<int64_t> values;
+  values.reserve(dims.size());
+  for (int dim : dims) {
+    values.push_back(dim);
+  }
+  return DimsToString(values);
+}
+
+std::string FusedInputShapes(
+    const tt::FusedElementwiseOp& fused,
+    const std::vector<std::optional<ttnn::Tensor>>& values) {
+  std::ostringstream os;
+  os << " inputs";
+  for (uint32_t input_id : fused.input_ids()) {
+    os << " " << input_id << "=";
+    if (input_id >= static_cast<uint32_t>(values.size()) || !values[input_id].has_value()) {
+      os << "<missing>";
+    } else {
+      os << DimsToString(TensorShapeVector(*values[input_id]));
+    }
+  }
+  return os.str();
+}
+
 PJRT_Error* ValidateTensorMatchesDesc(const ttnn::Tensor& tensor,
                                       const tt::TensorDesc& desc,
                                       std::string_view context) {
@@ -622,13 +661,52 @@ PJRT_Error* ValidateTensorMatchesDesc(const ttnn::Tensor& tensor,
     return InvalidArgument(std::string(context) + " dtype does not match executable metadata");
   }
   if (tensor.logical_shape().rank() != static_cast<size_t>(desc.dims_size())) {
-    return InvalidArgument(std::string(context) + " rank does not match executable metadata");
+    return InvalidArgument(std::string(context) + " rank does not match executable metadata: got " +
+                           DimsToString(TensorShapeVector(tensor)) + ", expected " +
+                           TensorDescShapeString(desc));
   }
   for (int i = 0; i < desc.dims_size(); ++i) {
     if (desc.dims(i) < 0 || tensor.logical_shape()[static_cast<size_t>(i)] !=
                                 static_cast<uint64_t>(desc.dims(i))) {
-      return InvalidArgument(std::string(context) + " shape does not match executable metadata");
+      return InvalidArgument(std::string(context) + " shape does not match executable metadata: got " +
+                             DimsToString(TensorShapeVector(tensor)) + ", expected " +
+                             TensorDescShapeString(desc));
     }
+  }
+  return nullptr;
+}
+
+PJRT_Error* ReshapeTensorToDescIfSameVolume(ttnn::Tensor* tensor,
+                                            const tt::TensorDesc& desc,
+                                            std::string_view context) {
+  std::vector<int64_t> desc_dims;
+  if (PJRT_Error* error = TensorDescDims(desc, &desc_dims)) {
+    return error;
+  }
+  if (TensorShapeVector(*tensor) == desc_dims) {
+    return nullptr;
+  }
+  uint64_t desc_volume = 1;
+  for (int64_t dim : desc_dims) {
+    if (dim < 0) {
+      return InvalidArgument(std::string(context) + " has a negative metadata dimension");
+    }
+    desc_volume *= static_cast<uint64_t>(dim);
+  }
+  if (tensor->logical_volume() != desc_volume) {
+    return nullptr;
+  }
+  ttnn::Shape shape;
+  if (PJRT_Error* error = ShapeFromTensorDesc(desc, &shape)) {
+    return error;
+  }
+  try {
+    *tensor = ttnn::reshape(*tensor, shape, ttnn::DRAM_MEMORY_CONFIG);
+  } catch (const std::exception& e) {
+    return Internal(std::string("TTNN ") + std::string(context) +
+                    " metadata reshape failed from " +
+                    DimsToString(TensorShapeVector(*tensor)) + " to " +
+                    TensorDescShapeString(desc) + ": " + e.what());
   }
   return nullptr;
 }
@@ -679,7 +757,7 @@ PJRT_Error* CreateConstantTensor(const tt::ConstantOp& constant,
                                  std::optional<ttnn::Tensor>* out) {
   std::optional<ttnn::TensorSpec> spec;
   if (PJRT_Error* error = TensorSpecFromDesc(output_desc,
-                                             PreferredDeviceLayout(output_desc.element_type()),
+                                             PreferredDeviceLayout(output_desc),
                                              ttnn::DRAM_MEMORY_CONFIG,
                                              &spec)) {
     return error;
@@ -753,16 +831,12 @@ ttnn::Tensor ToDeviceTensor(const ttnn::Tensor& tensor,
                             tt::tt_metal::Layout layout) {
   ttnn::Tensor result = tensor;
   if (result.storage_type() != tt::tt_metal::StorageType::DEVICE) {
-    if (result.layout() != layout) {
-      result = result.to_layout(layout);
-    }
-    return result.to_device(mesh_device, ttnn::DRAM_MEMORY_CONFIG);
+    result = result.to_device(mesh_device, ttnn::DRAM_MEMORY_CONFIG);
+  } else if (result.memory_config() != ttnn::DRAM_MEMORY_CONFIG) {
+    result = ttnn::to_memory_config(result, ttnn::DRAM_MEMORY_CONFIG);
   }
   if (result.layout() != layout) {
-    result = result.to_layout(layout);
-  }
-  if (result.memory_config() != ttnn::DRAM_MEMORY_CONFIG) {
-    result = ttnn::to_memory_config(result, ttnn::DRAM_MEMORY_CONFIG);
+    result = ttnn::to_layout(result, layout, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
   }
   return result;
 }
@@ -791,7 +865,7 @@ PJRT_Error* ArgumentTensorForParameter(const PJRT_Buffer& buffer,
     }
   }
   try {
-    out->emplace(ToDeviceTensor(*tensor, mesh_device, PreferredDeviceLayout(desc.element_type())));
+    out->emplace(ToDeviceTensor(*tensor, mesh_device, PreferredDeviceLayout(desc)));
   } catch (const std::exception& e) {
     return Internal(std::string("failed to copy argument tensor to device: ") + e.what());
   }
@@ -834,6 +908,15 @@ ttnn::SmallVector<uint32_t> U32SmallVector(const std::vector<int64_t>& values) {
   out.reserve(values.size());
   for (int64_t value : values) {
     out.push_back(static_cast<uint32_t>(value));
+  }
+  return out;
+}
+
+ttnn::SmallVector<int64_t> I64SmallVector(const std::vector<int64_t>& values) {
+  ttnn::SmallVector<int64_t> out;
+  out.reserve(values.size());
+  for (int64_t value : values) {
+    out.push_back(value);
   }
   return out;
 }
@@ -926,36 +1009,333 @@ PJRT_Error* BroadcastTrailingDims(const ttnn::Tensor& input,
   return nullptr;
 }
 
-PJRT_Error* ValidateTtnnCompatibleDotGeneral(
-    const tt::MatmulOp& matmul,
-    const std::vector<int64_t>& lhs_dims,
-    const std::vector<int64_t>& rhs_dims) {
-  if (lhs_dims.size() < 2 || rhs_dims.size() < 2) {
-    return Unimplemented("TTNN matmul currently requires rank >= 2 inputs");
+struct DotGeneralPlan {
+  std::vector<int64_t> lhs_permutation;
+  std::vector<int64_t> rhs_permutation;
+  std::vector<int64_t> lhs_canonical_shape;
+  std::vector<int64_t> rhs_canonical_shape;
+};
+
+uint64_t ProductOfDims(const std::vector<int64_t>& shape,
+                       const std::vector<int64_t>& axes) {
+  uint64_t product = 1;
+  for (int64_t axis : axes) {
+    product *= static_cast<uint64_t>(shape[static_cast<size_t>(axis)]);
   }
+  return product;
+}
+
+PJRT_Error* MarkDotGeneralDims(const google::protobuf::RepeatedField<int64_t>& dims,
+                               size_t rank,
+                               std::vector<bool>* used,
+                               std::string_view context) {
+  for (int64_t dim : dims) {
+    if (dim < 0 || static_cast<size_t>(dim) >= rank) {
+      return InvalidArgument(std::string(context) + " dimension is out of bounds");
+    }
+    if ((*used)[static_cast<size_t>(dim)]) {
+      return InvalidArgument(std::string(context) + " dimensions must be unique");
+    }
+    (*used)[static_cast<size_t>(dim)] = true;
+  }
+  return nullptr;
+}
+
+PJRT_Error* MarkDotGeneralDim(int64_t dim,
+                              size_t rank,
+                              std::vector<bool>* used,
+                              std::string_view context) {
+  if (dim < 0 || static_cast<size_t>(dim) >= rank) {
+    return InvalidArgument(std::string(context) + " dimension is out of bounds");
+  }
+  if ((*used)[static_cast<size_t>(dim)]) {
+    return InvalidArgument(std::string(context) + " dimension duplicates a batch dimension");
+  }
+  (*used)[static_cast<size_t>(dim)] = true;
+  return nullptr;
+}
+
+PJRT_Error* BuildDotGeneralPlan(const tt::MatmulOp& matmul,
+                                const std::vector<int64_t>& lhs_dims,
+                                const std::vector<int64_t>& rhs_dims,
+                                const std::vector<int64_t>& output_dims,
+                                DotGeneralPlan* plan) {
   if (matmul.lhs_contracting_dimensions_size() != 1 ||
       matmul.rhs_contracting_dimensions_size() != 1) {
     return Unimplemented("TTNN matmul currently supports a single contracting dimension");
   }
-  const int64_t lhs_contract = matmul.lhs_contracting_dimensions(0);
-  const int64_t rhs_contract = matmul.rhs_contracting_dimensions(0);
-  if (lhs_contract != static_cast<int64_t>(lhs_dims.size() - 1) ||
-      rhs_contract != static_cast<int64_t>(rhs_dims.size() - 2)) {
-    return Unimplemented(
-        "TTNN matmul currently supports dot_general forms equivalent to [..., M, K] x "
-        "[..., K, N]");
-  }
   if (matmul.lhs_batching_dimensions_size() != matmul.rhs_batching_dimensions_size()) {
     return InvalidArgument("dot_general lhs/rhs batching dimension counts must match");
   }
-  if (!IsPrefixDims(matmul.lhs_batching_dimensions()) ||
-      !IsPrefixDims(matmul.rhs_batching_dimensions())) {
-    return Unimplemented("TTNN matmul currently supports leading prefix batching dimensions");
+
+  const size_t lhs_rank = lhs_dims.size();
+  const size_t rhs_rank = rhs_dims.size();
+  const int64_t lhs_contract = matmul.lhs_contracting_dimensions(0);
+  const int64_t rhs_contract = matmul.rhs_contracting_dimensions(0);
+  std::vector<bool> lhs_used(lhs_rank, false);
+  std::vector<bool> rhs_used(rhs_rank, false);
+  if (PJRT_Error* error = MarkDotGeneralDims(matmul.lhs_batching_dimensions(),
+                                             lhs_rank, &lhs_used,
+                                             "dot_general lhs batching")) {
+    return error;
   }
+  if (PJRT_Error* error = MarkDotGeneralDims(matmul.rhs_batching_dimensions(),
+                                             rhs_rank, &rhs_used,
+                                             "dot_general rhs batching")) {
+    return error;
+  }
+  if (PJRT_Error* error = MarkDotGeneralDim(lhs_contract, lhs_rank, &lhs_used,
+                                            "dot_general lhs contracting")) {
+    return error;
+  }
+  if (PJRT_Error* error = MarkDotGeneralDim(rhs_contract, rhs_rank, &rhs_used,
+                                            "dot_general rhs contracting")) {
+    return error;
+  }
+
   if (lhs_dims[static_cast<size_t>(lhs_contract)] !=
       rhs_dims[static_cast<size_t>(rhs_contract)]) {
     return InvalidArgument("dot_general contracting dimensions must have matching size");
   }
+
+  std::vector<int64_t> batch_shape;
+  batch_shape.reserve(static_cast<size_t>(matmul.lhs_batching_dimensions_size()));
+  for (int i = 0; i < matmul.lhs_batching_dimensions_size(); ++i) {
+    const int64_t lhs_batch = matmul.lhs_batching_dimensions(i);
+    const int64_t rhs_batch = matmul.rhs_batching_dimensions(i);
+    if (lhs_dims[static_cast<size_t>(lhs_batch)] !=
+        rhs_dims[static_cast<size_t>(rhs_batch)]) {
+      return InvalidArgument("dot_general batching dimensions must have matching size");
+    }
+    batch_shape.push_back(lhs_dims[static_cast<size_t>(lhs_batch)]);
+  }
+
+  std::vector<int64_t> lhs_free_axes;
+  for (size_t axis = 0; axis < lhs_rank; ++axis) {
+    if (!lhs_used[axis]) {
+      lhs_free_axes.push_back(static_cast<int64_t>(axis));
+    }
+  }
+  std::vector<int64_t> rhs_free_axes;
+  for (size_t axis = 0; axis < rhs_rank; ++axis) {
+    if (!rhs_used[axis]) {
+      rhs_free_axes.push_back(static_cast<int64_t>(axis));
+    }
+  }
+
+  std::vector<int64_t> expected_output = batch_shape;
+  for (int64_t axis : lhs_free_axes) {
+    expected_output.push_back(lhs_dims[static_cast<size_t>(axis)]);
+  }
+  for (int64_t axis : rhs_free_axes) {
+    expected_output.push_back(rhs_dims[static_cast<size_t>(axis)]);
+  }
+  if (expected_output != output_dims) {
+    return InvalidArgument("dot_general output shape does not match dimension numbers: got " +
+                           DimsToString(output_dims) + ", expected " +
+                           DimsToString(expected_output));
+  }
+
+  plan->lhs_permutation.clear();
+  plan->rhs_permutation.clear();
+  plan->lhs_canonical_shape = batch_shape;
+  plan->rhs_canonical_shape = batch_shape;
+  for (int64_t dim : matmul.lhs_batching_dimensions()) {
+    plan->lhs_permutation.push_back(dim);
+  }
+  for (int64_t dim : lhs_free_axes) {
+    plan->lhs_permutation.push_back(dim);
+  }
+  plan->lhs_permutation.push_back(lhs_contract);
+  for (int64_t dim : matmul.rhs_batching_dimensions()) {
+    plan->rhs_permutation.push_back(dim);
+  }
+  plan->rhs_permutation.push_back(rhs_contract);
+  for (int64_t dim : rhs_free_axes) {
+    plan->rhs_permutation.push_back(dim);
+  }
+
+  plan->lhs_canonical_shape.push_back(static_cast<int64_t>(ProductOfDims(lhs_dims, lhs_free_axes)));
+  plan->lhs_canonical_shape.push_back(lhs_dims[static_cast<size_t>(lhs_contract)]);
+  plan->rhs_canonical_shape.push_back(rhs_dims[static_cast<size_t>(rhs_contract)]);
+  plan->rhs_canonical_shape.push_back(static_cast<int64_t>(ProductOfDims(rhs_dims, rhs_free_axes)));
+  return nullptr;
+}
+
+bool IsIdentityPermutation(const std::vector<int64_t>& permutation) {
+  for (size_t i = 0; i < permutation.size(); ++i) {
+    if (permutation[i] != static_cast<int64_t>(i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+ttnn::Tensor CanonicalizeDotGeneralOperand(const ttnn::Tensor& input,
+                                           const std::vector<int64_t>& permutation,
+                                           const std::vector<int64_t>& canonical_shape) {
+  ttnn::Tensor result = input;
+  if (!IsIdentityPermutation(permutation)) {
+    result = ttnn::permute(result, I64SmallVector(permutation), ttnn::DRAM_MEMORY_CONFIG);
+  }
+  if (TensorShapeVector(result) != canonical_shape) {
+    result = ttnn::reshape(result,
+                           ttnn::Shape(U32SmallVector(canonical_shape)),
+                           ttnn::DRAM_MEMORY_CONFIG);
+  }
+  return result;
+}
+
+PJRT_Error* NormalizeReduceDims(size_t rank, ttnn::SmallVector<int>* dims) {
+  if (rank > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return InvalidArgument("reduce input rank is out of int range");
+  }
+  const int int_rank = static_cast<int>(rank);
+  for (int& dim : *dims) {
+    if (dim < 0) {
+      dim += int_rank;
+    }
+    if (dim < 0 || dim >= int_rank) {
+      return InvalidArgument("reduce dimension is out of bounds for input rank");
+    }
+  }
+  std::sort(dims->begin(), dims->end());
+  for (size_t i = 1; i < dims->size(); ++i) {
+    if ((*dims)[i] == (*dims)[i - 1]) {
+      return InvalidArgument("reduce dimensions must be unique");
+    }
+  }
+  return nullptr;
+}
+
+std::vector<int64_t> ReducedShape(const ttnn::Tensor& input,
+                                  const ttnn::SmallVector<int>& dims);
+
+PJRT_Error* CompleteReduceDimsFromOutputShape(const ttnn::Tensor& input,
+                                              const tt::TensorDesc& output_desc,
+                                              ttnn::SmallVector<int>* dims) {
+  std::vector<int64_t> output_dims;
+  if (PJRT_Error* error = TensorDescDims(output_desc, &output_dims)) {
+    return error;
+  }
+  if (ReducedShape(input, *dims) == output_dims) {
+    return nullptr;
+  }
+
+  const size_t rank = input.logical_shape().rank();
+  std::vector<bool> reduced(rank, false);
+  for (int dim : *dims) {
+    if (dim < 0 || static_cast<size_t>(dim) >= rank) {
+      return InvalidArgument("reduce dimension is out of bounds for input rank");
+    }
+    reduced[static_cast<size_t>(dim)] = true;
+  }
+
+  bool changed = false;
+  size_t output_dim = 0;
+  for (size_t axis = 0; axis < rank; ++axis) {
+    if (reduced[axis]) {
+      continue;
+    }
+    if (output_dim < output_dims.size() &&
+        input.logical_shape()[axis] == static_cast<uint64_t>(output_dims[output_dim])) {
+      ++output_dim;
+    } else {
+      dims->push_back(static_cast<int>(axis));
+      reduced[axis] = true;
+      changed = true;
+    }
+  }
+  if (output_dim != output_dims.size()) {
+    return InvalidArgument("reduce dimensions cannot be completed from input/output shapes");
+  }
+  if (changed) {
+    std::sort(dims->begin(), dims->end());
+  }
+  return nullptr;
+}
+
+std::vector<int64_t> ReducedShape(const ttnn::Tensor& input,
+                                  const ttnn::SmallVector<int>& dims) {
+  std::vector<int64_t> shape;
+  const ttnn::Shape& input_shape = input.logical_shape();
+  shape.reserve(input_shape.rank() - dims.size());
+  auto dim = dims.begin();
+  for (size_t axis = 0; axis < input_shape.rank(); ++axis) {
+    if (dim != dims.end() && *dim == static_cast<int>(axis)) {
+      ++dim;
+      continue;
+    }
+    shape.push_back(static_cast<int64_t>(input_shape[axis]));
+  }
+  return shape;
+}
+
+PJRT_Error* ValidateReduceOutputShape(const ttnn::Tensor& input,
+                                      const ttnn::SmallVector<int>& dims,
+                                      const tt::TensorDesc& output_desc) {
+  std::vector<int64_t> output_dims;
+  if (PJRT_Error* error = TensorDescDims(output_desc, &output_dims)) {
+    return error;
+  }
+  const std::vector<int64_t> expected_dims = ReducedShape(input, dims);
+  if (output_dims != expected_dims) {
+    return InvalidArgument("reduce output shape does not match reduce dimensions: got " +
+                           DimsToString(output_dims) + ", expected " +
+                           DimsToString(expected_dims) + ", input " +
+                           DimsToString(TensorShapeVector(input)) + ", dims " +
+                           ReduceDimsToString(dims));
+  }
+  return nullptr;
+}
+
+PJRT_Error* ReshapeSingletonReduceOutput(const ttnn::Tensor& input,
+                                         const ttnn::SmallVector<int>& dims,
+                                         const tt::TensorDesc& output_desc,
+                                         std::optional<ttnn::Tensor>* out) {
+  if (!out->has_value()) {
+    return Internal("reduce output tensor was not produced");
+  }
+  ttnn::Tensor& output = **out;
+  if (output.logical_shape().rank() == static_cast<size_t>(output_desc.dims_size())) {
+    return nullptr;
+  }
+  if (output.logical_shape().rank() != input.logical_shape().rank() ||
+      input.logical_shape().rank() != static_cast<size_t>(output_desc.dims_size() + dims.size())) {
+    return nullptr;
+  }
+
+  std::vector<int64_t> output_dims;
+  if (PJRT_Error* error = TensorDescDims(output_desc, &output_dims)) {
+    return error;
+  }
+  const size_t rank = input.logical_shape().rank();
+  size_t output_dim = 0;
+  auto dim = dims.begin();
+  for (size_t axis = 0; axis < rank; ++axis) {
+    const int64_t actual_dim = static_cast<int64_t>(output.logical_shape()[axis]);
+    if (dim != dims.end() && *dim == static_cast<int>(axis)) {
+      if (actual_dim != 1) {
+        return InvalidArgument("TTNN reduce output kept a non-singleton reduced dimension");
+      }
+      ++dim;
+    } else {
+      if (output_dim >= output_dims.size() ||
+          actual_dim != output_dims[output_dim]) {
+        return InvalidArgument("TTNN reduce output shape does not match expected singleton-reduced shape");
+      }
+      ++output_dim;
+    }
+  }
+  if (output_dim != output_dims.size() || dim != dims.end()) {
+    return InvalidArgument("reduce output shape does not match reduced dimensions");
+  }
+
+  ttnn::Shape output_shape;
+  if (PJRT_Error* error = ShapeFromTensorDesc(output_desc, &output_shape)) {
+    return error;
+  }
+  output = ttnn::reshape(output, output_shape, ttnn::DRAM_MEMORY_CONFIG);
   return nullptr;
 }
 
@@ -998,7 +1378,9 @@ PJRT_Error* ExecuteTtnnMatmul(const tt::MatmulOp& matmul,
   if (PJRT_Error* error = TensorDescDims(output_desc, &output_dims)) {
     return error;
   }
-  if (PJRT_Error* error = ValidateTtnnCompatibleDotGeneral(matmul, lhs_dims, rhs_dims)) {
+  DotGeneralPlan plan;
+  if (PJRT_Error* error = BuildDotGeneralPlan(matmul, lhs_dims, rhs_dims,
+                                              output_dims, &plan)) {
     return error;
   }
   const tt::tt_metal::DataType output_dtype =
@@ -1007,6 +1389,19 @@ PJRT_Error* ExecuteTtnnMatmul(const tt::MatmulOp& matmul,
   try {
     ttnn::Tensor lhs = ToDeviceTensor(lhs_input, mesh_device, ttnn::TILE_LAYOUT);
     ttnn::Tensor rhs = ToDeviceTensor(rhs_input, mesh_device, ttnn::TILE_LAYOUT);
+    lhs = CanonicalizeDotGeneralOperand(lhs, plan.lhs_permutation,
+                                        plan.lhs_canonical_shape);
+    rhs = CanonicalizeDotGeneralOperand(rhs, plan.rhs_permutation,
+                                        plan.rhs_canonical_shape);
+    ttnn::Shape output_shape;
+    if (PJRT_Error* error = ShapeFromTensorDesc(output_desc, &output_shape)) {
+      return error;
+    }
+    ttnn::Tensor output_tensor = ttnn::empty(output_shape,
+                                             output_dtype,
+                                             ttnn::TILE_LAYOUT,
+                                             mesh_device,
+                                             ttnn::DRAM_MEMORY_CONFIG);
 
     out->emplace(ttnn::matmul(
         /*input_tensor_a=*/lhs,
@@ -1014,7 +1409,17 @@ PJRT_Error* ExecuteTtnnMatmul(const tt::MatmulOp& matmul,
         /*transpose_a=*/false,
         /*transpose_b=*/false,
         /*memory_config=*/ttnn::DRAM_MEMORY_CONFIG,
-        /*dtype=*/output_dtype));
+        /*dtype=*/output_dtype,
+        /*program_config=*/std::nullopt,
+        /*activation=*/std::nullopt,
+        /*compute_kernel_config=*/std::nullopt,
+        /*core_grid=*/std::nullopt,
+        /*output_tile=*/std::nullopt,
+        /*optional_output_tensor=*/output_tensor));
+    if (PJRT_Error* error = ValidateTensorMatchesDesc(out->value(), output_desc,
+                                                      "matmul output")) {
+      return error;
+    }
   } catch (const std::exception& e) {
     return Internal(std::string("TTNN matmul failed: ") + e.what());
   } catch (...) {
@@ -1101,6 +1506,10 @@ PJRT_Error* ExecuteFusedElementwise(const tt::FusedElementwiseOp& fused,
             }
           } else {
             result = *input;
+            if (PJRT_Error* error = ReshapeTensorToDescIfSameVolume(&*result, output_desc,
+                                                                    "fused_elementwise input")) {
+              return error;
+            }
           }
           break;
         }
@@ -1171,6 +1580,8 @@ PJRT_Error* ExecuteFusedElementwise(const tt::FusedElementwiseOp& fused,
                 case tt::FusedElementwiseOp::Node::DIRECTION_LT:
                   result = ttnn::lt(*lhs, *rhs, std::nullopt, ttnn::DRAM_MEMORY_CONFIG);
                   break;
+                default:
+                  return InvalidArgument("unsupported fused_elementwise compare direction");
               }
               break;
             default:
@@ -1234,7 +1645,34 @@ PJRT_Error* ExecuteFusedElementwise(const tt::FusedElementwiseOp& fused,
       }
       node_values[static_cast<size_t>(i)] = std::move(*result);
     }
-    out->emplace(*node_values.back());
+    PJRT_Buffer_Type output_type = PJRT_Buffer_Type_INVALID;
+    if (PJRT_Error* error = TensorDescBufferType(output_desc, &output_type)) {
+      return error;
+    }
+    const std::optional<tt::tt_metal::DataType> output_dtype =
+        TtnnDataTypeForPjrtBufferType(output_type);
+    if (!output_dtype.has_value()) {
+      return Unimplemented("fused_elementwise output dtype is not supported");
+    }
+    out->emplace(CastTensorIfNeeded(*node_values.back(), *output_dtype, mesh_device));
+    if (PJRT_Error* error = ReshapeTensorToDescIfSameVolume(&out->value(), output_desc,
+                                                            "fused_elementwise output")) {
+      return error;
+    }
+    std::vector<int64_t> output_dims;
+    if (PJRT_Error* error = TensorDescDims(output_desc, &output_dims)) {
+      return error;
+    }
+    if (TensorShapeVector(out->value()) != output_dims) {
+      return InvalidArgument("fused_elementwise output shape does not match executable metadata: got " +
+                             DimsToString(TensorShapeVector(out->value())) +
+                             ", expected " + TensorDescShapeString(output_desc) +
+                             FusedInputShapes(fused, values));
+    }
+    if (PJRT_Error* error = ValidateTensorMatchesDesc(out->value(), output_desc,
+                                                      "fused_elementwise output")) {
+      return error;
+    }
   } catch (const std::exception& e) {
     return Internal(std::string("TTNN fused_elementwise failed: ") + e.what());
   } catch (...) {
@@ -1314,6 +1752,22 @@ PJRT_Error* ExecuteReduce(const tt::ReduceOp& reduce,
     }
     dims.push_back(static_cast<int>(dim));
   }
+  if (PJRT_Error* error = NormalizeReduceDims(input.logical_shape().rank(), &dims)) {
+    return error;
+  }
+  if (PJRT_Error* error = CompleteReduceDimsFromOutputShape(input, output_desc, &dims)) {
+    return error;
+  }
+  if (PJRT_Error* error = NormalizeReduceDims(input.logical_shape().rank(), &dims)) {
+    return error;
+  }
+  if (PJRT_Error* error = ValidateReduceOutputShape(input, dims, output_desc)) {
+    return error;
+  }
+  if (dims.empty()) {
+    out->emplace(input);
+    return ValidateTensorMatchesDesc(out->value(), output_desc, "reduce output");
+  }
   std::optional<std::variant<int, int64_t, ttnn::SmallVector<int>>> dim_arg;
   if (dims.size() == 1) {
     dim_arg = dims[0];
@@ -1340,6 +1794,9 @@ PJRT_Error* ExecuteReduce(const tt::ReduceOp& reduce,
         break;
       default:
         return Unimplemented("TTNN reduce reducer is not implemented");
+    }
+    if (PJRT_Error* error = ReshapeSingletonReduceOutput(input, dims, output_desc, out)) {
+      return error;
     }
     if (PJRT_Error* error = ValidateTensorMatchesDesc(out->value(), output_desc, "reduce output")) {
       return error;
@@ -1660,7 +2117,10 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
         try {
           values[op.output_id()] = ttnn::reshape(*input, shape, ttnn::DRAM_MEMORY_CONFIG);
         } catch (const std::exception& e) {
-          return Internal(std::string("TTNN reshape failed: ") + e.what());
+          return Internal(std::string("TTNN reshape failed from ") +
+                          DimsToString(TensorShapeVector(*input)) + " to " +
+                          TensorDescShapeString(output_value_desc.tensor()) + ": " +
+                          e.what());
         }
         break;
       }
@@ -1744,9 +2204,18 @@ PJRT_Error* ExecuteProgram(const PJRT_LoadedExecutable* executable,
           return error;
         }
         try {
-          ttnn::Tensor pred_tensor = ToDeviceTensor(*pred, mesh_device.get(), on_true->layout());
-          values[op.output_id()] = ttnn::where(pred_tensor, *on_true, *on_false,
+          ttnn::Tensor true_tensor = ToDeviceTensor(*on_true, mesh_device.get(), ttnn::TILE_LAYOUT);
+          ttnn::Tensor false_tensor = ToDeviceTensor(*on_false, mesh_device.get(), ttnn::TILE_LAYOUT);
+          ttnn::Tensor pred_tensor = ToDeviceTensor(*pred, mesh_device.get(), ttnn::ROW_MAJOR_LAYOUT);
+          pred_tensor = CastTensorIfNeeded(pred_tensor, true_tensor.dtype(), mesh_device.get());
+          pred_tensor = ToDeviceTensor(pred_tensor, mesh_device.get(), ttnn::TILE_LAYOUT);
+          values[op.output_id()] = ttnn::where(pred_tensor, true_tensor, false_tensor,
                                                ttnn::DRAM_MEMORY_CONFIG);
+          if (PJRT_Error* error = ValidateTensorMatchesDesc(values[op.output_id()].value(),
+                                                            output_value_desc.tensor(),
+                                                            "select output")) {
+            return error;
+          }
         } catch (const std::exception& e) {
           return Internal(std::string("TTNN select failed: ") + e.what());
         }
