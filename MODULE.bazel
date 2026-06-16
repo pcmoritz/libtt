@@ -9,6 +9,7 @@ bazel_dep(name = "rules_python", version = "1.7.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 
 http_archive(
     name = "libarchive",
@@ -231,4 +232,25 @@ llvm_configure = use_repo_rule("//:bazel/llvm_configure_repo.bzl", "llvm_configu
 
 llvm_configure(
     name = "llvm-project",
+)
+
+git_repository(
+    name = "tt_xla_src",
+    build_file = "//third_party/tt_xla:tt_xla.BUILD.bazel",
+    commit = "5d20786bd2ae86d4326d4092cd92f7c9580d5733",
+    remote = "https://github.com/tenstorrent/tt-xla.git",
+)
+
+git_repository(
+    name = "tt_mlir_src",
+    build_file = "//third_party/tt_xla:tt_mlir.BUILD.bazel",
+    commit = "464a5f341908d5a3f790e697be5ffa6fd3fb6f32",
+    remote = "https://github.com/tenstorrent/tt-mlir.git",
+)
+
+git_repository(
+    name = "loguru_src",
+    build_file = "//third_party/tt_xla:loguru.BUILD.bazel",
+    commit = "4adaa185883e3c04da25913579c451d3c32cfac1",
+    remote = "https://github.com/emilk/loguru.git",
 )

@@ -1,0 +1,22 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "loguru",
+    srcs = ["loguru.cpp"],
+    hdrs = ["loguru.hpp"],
+    copts = [
+        "-std=c++17",
+        "-Wno-unused-parameter",
+    ],
+    includes = ["."],
+)
+
+filegroup(
+    name = "all_files",
+    srcs = glob(
+        ["**"],
+        exclude = [".git/**"],
+    ),
+)

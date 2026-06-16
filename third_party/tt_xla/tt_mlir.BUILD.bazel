@@ -1,0 +1,72 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "public_headers",
+    hdrs = glob(
+        [
+            "include/**/*.h",
+            "include/**/*.hpp",
+            "runtime/include/**/*.h",
+            "runtime/include/**/*.hpp",
+        ],
+        allow_empty = True,
+    ),
+    includes = [
+        "include",
+        "runtime/include",
+    ],
+    deps = [
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+        "@stablehlo//:stablehlo_ops",
+        "@tt_metal//:ttnn_tensor_upstream",
+    ],
+)
+
+filegroup(
+    name = "flatbuffer_schemas",
+    srcs = glob(
+        [
+            "include/ttmlir/Target/**/*.fbs",
+            "runtime/include/tt/runtime/**/*.fbs",
+        ],
+        allow_empty = True,
+    ),
+)
+
+filegroup(
+    name = "tablegen_sources",
+    srcs = glob(
+        [
+            "include/**/*.td",
+            "lib/**/*.td",
+        ],
+        allow_empty = True,
+    ),
+)
+
+# Native Bazel porting targets. These are intentionally separate placeholders:
+# tt-xla needs both a compiler library and runtime library, and building them
+# requires generated TableGen and FlatBuffer headers that are not checked in.
+cc_library(
+    name = "ttmlir_compiler",
+    deps = [":public_headers"],
+)
+
+cc_library(
+    name = "ttmlir_runtime",
+    deps = [
+        ":public_headers",
+        "@tt_metal//:ttnn_tensor_upstream",
+    ],
+)
+
+filegroup(
+    name = "all_files",
+    srcs = glob(
+        ["**"],
+        exclude = [".git/**"],
+    ),
+)
