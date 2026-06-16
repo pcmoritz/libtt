@@ -701,6 +701,7 @@ TTNN_RUNTIME_INCLUDE_DIRS = [
     "ttnn/cpp/ttnn",
     "ttnn/cpp/ttnn/operations",
     "ttnn/cpp/ttnn/operations/data_movement",
+    "ttnn/cpp/ttnn/operations/reduction",
 ] + TT_METAL_RUNTIME_INCLUDE_DIRS
 
 TT_METAL_RUNTIME_COPTS = [
@@ -1197,9 +1198,14 @@ cc_library(
         "ttnn/cpp/ttnn/operations/matmul/device/sparse/factory/sparse_matmul_multicore_reuse_mcast_1d_optimized.cpp",
         "ttnn/cpp/ttnn/operations/matmul/device/sparse/sparse_matmul_device_operation.cpp",
         "ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.cpp",
+        "ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_device_operation.cpp",
+        "ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_perf_model.cpp",
+        "ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_program_factory.cpp",
     ] + glob(
         [
             "ttnn/cpp/ttnn/operations/data_movement/concat/**/*.cpp",
+            "ttnn/cpp/ttnn/operations/data_movement/gather/**/*.cpp",
+            "ttnn/cpp/ttnn/operations/data_movement/scatter/**/*.cpp",
             "ttnn/cpp/ttnn/operations/data_movement/slice/**/*.cpp",
             "ttnn/cpp/ttnn/operations/data_movement/unsqueeze/**/*.cpp",
             "ttnn/cpp/ttnn/operations/eltwise/ternary/**/*.cpp",
@@ -1210,6 +1216,7 @@ cc_library(
             "ttnn/cpp/ttnn/operations/normalization/layernorm/**/*.cpp",
             "ttnn/cpp/ttnn/operations/normalization/rmsnorm/**/*.cpp",
             "ttnn/cpp/ttnn/operations/normalization/shard_spec_validation.cpp",
+            "ttnn/cpp/ttnn/operations/reduction/accumulation/**/*.cpp",
             "ttnn/cpp/ttnn/operations/reduction/generic/**/*.cpp",
             "ttnn/cpp/ttnn/operations/reduction/prod/**/*.cpp",
             "ttnn/cpp/ttnn/operations/reduction/reduce_op_validation.cpp",

@@ -235,20 +235,13 @@ message BitwiseBinaryOp {
   Kind kind = 3;
 }
 
-message SdpaDecodeOp {
-  // Query, key cache, value cache, sequence lengths, and cache-location vector.
-  // The first supported lowering is decode-only BF16 attention with shapes:
-  // q=[1, q_heads, head_dim], k/v=[cache_tokens, kv_heads, head_dim],
-  // seq_lens=[1], loc=[key_tokens].
-  // If fused_kv_cache is true, k_id is a fused KV cache shaped
-  // [pages, page_size, kv_heads, 2, head_dim] and v_id is unused.
+message PagedSdpaDecodeOp {
   uint32 q_id = 1;
-  uint32 k_id = 2;
-  uint32 v_id = 3;
-  uint32 seq_lens_id = 4;
-  uint32 loc_id = 5;
-  uint32 scale_bf16_packed = 6;
-  bool fused_kv_cache = 7;
+  uint32 fused_kv_cache_id = 2;
+  uint32 page_table_id = 3;
+  uint32 cur_pos_id = 4;
+  float scale = 5;
+  uint32 sliding_window_size = 6;
 }
 
 message RmsNormOp {
@@ -287,9 +280,9 @@ message Op {
     ScatterOp scatter = 32;
     BitwiseBinaryOp bitwise_binary = 33;
     ReduceWindowOp reduce_window = 34;
-    SdpaDecodeOp sdpa_decode = 35;
     RmsNormOp rms_norm = 36;
     RopeOp rope = 37;
+    PagedSdpaDecodeOp paged_sdpa_decode = 38;
   }
 }
 
