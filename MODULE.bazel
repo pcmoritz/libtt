@@ -172,6 +172,7 @@ http_archive(
     patches = [
         "//third_party/tt_metal:wormhole_build_empty_sources.patch",
         "//third_party/tt_metal:reduce_static_tls.patch",
+        "//third_party/tt_metal:use_posix_spawn_for_jit_commands.patch",
         "//third_party/tt_metal:disable_fabric_host_tensor_runtime.patch",
         "//third_party/tt_metal:disable_fabric_host_buffer.patch",
         "//third_party/tt_metal:disable_fabric_mesh_device.patch",
@@ -179,6 +180,7 @@ http_archive(
         "//third_party/tt_metal:disable_fabric_profiler.patch",
         "//third_party/tt_metal:disable_fabric_rtoptions.patch",
         "//third_party/tt_metal:disable_inspector_runtime.patch",
+        "//third_party/tt_metal:fix_integer_where_dtype.patch",
     ],
     sha256 = "b4d05d0e498e626a0d5455f5c6a379aa1b7ac4f1ca76f8f72dad4f7370223bf7",
     strip_prefix = "tt-metal-16e79a784996b0608f809a186f5816dd07e86d39",

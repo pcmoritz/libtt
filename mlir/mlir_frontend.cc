@@ -38,7 +38,6 @@
 #include "mlir/executable.pb.h"
 #include "mlir/rms_norm_fusing_pattern.h"
 #include "mlir/rope_fusing_pattern.h"
-#include "mlir/sdpa_fusing_pattern.h"
 #include "mlir/stablehlo_utils.h"
 #include "stablehlo/dialect/Serialization.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -1096,7 +1095,6 @@ mlir::LogicalResult runCleanupRewritePatterns(
         &context, state, lowerSinglePadToScatter));
     patterns.add(std::make_unique<CleanupPattern<mlir::stablehlo::DotGeneralOp>>(
         &context, state, lowerSingleRhsMatmulTranspose, isRhsMatmulTransposeFold));
-    patterns.add<libtt::mlir_frontend::SDPADecodeFusing>(&context);
     patterns.add<libtt::mlir_frontend::RMSNormFusing>(&context);
     patterns.add<libtt::mlir_frontend::RopeFusing>(&context);
     mlir::GreedyRewriteConfig config;
@@ -1519,10 +1517,6 @@ std::optional<tt::ReduceOp::Reducer> mapReduceReducer(
     if (mlir::isa<mlir::stablehlo::AndOp>(reducer_op)) {
         return tt::ReduceOp::REDUCER_AND;
     }
-    if (mlir::isa<mlir::stablehlo::OrOp>(reducer_op)) {
-        return tt::ReduceOp::REDUCER_OR;
-    }
-
     error = "unsupported reduce reducer: " + reducer_op->getName().getStringRef().str();
     return std::nullopt;
 }
@@ -1581,13 +1575,6 @@ std::optional<tt::ReduceOp::Reducer> mapReduceWindowReducer(
     if (mlir::isa<mlir::stablehlo::MulOp>(reducer_op)) {
         return tt::ReduceOp::REDUCER_MUL;
     }
-    if (mlir::isa<mlir::stablehlo::AndOp>(reducer_op)) {
-        return tt::ReduceOp::REDUCER_AND;
-    }
-    if (mlir::isa<mlir::stablehlo::OrOp>(reducer_op)) {
-        return tt::ReduceOp::REDUCER_OR;
-    }
-
     error = "unsupported reduce_window reducer: " + reducer_op->getName().getStringRef().str();
     return std::nullopt;
 }
@@ -1709,47 +1696,82 @@ std::optional<tt::BitwiseBinaryOp::Kind> bitwiseBinaryKind(mlir::Operation* op) 
         .Default([](auto) { return std::nullopt; });
 }
 
-std::optional<uint32_t> sdpaDecodeScaleBf16Packed(
+std::optional<llvm::StringRef> customCallFrontendStringAttr(
     mlir::stablehlo::CustomCallOp custom_call_op,
-    std::string& error) {
-    auto backend_config = custom_call_op.getBackendConfig();
-    if (!backend_config) {
-        error = "tt.sdpa_decode custom_call requires backend_config";
+    llvm::StringRef name) {
+    auto attrs = custom_call_op->getAttrOfType<mlir::DictionaryAttr>(
+        "mhlo.frontend_attributes");
+    if (!attrs) {
         return std::nullopt;
     }
-    auto config = mlir::dyn_cast<mlir::StringAttr>(*backend_config);
-    if (!config) {
-        error = "tt.sdpa_decode custom_call requires string backend_config";
+    auto attr = mlir::dyn_cast_or_null<mlir::StringAttr>(attrs.get(name));
+    if (!attr) {
+        return std::nullopt;
+    }
+    return attr.getValue();
+}
+
+std::optional<float> requiredCustomCallFloatAttr(
+    mlir::stablehlo::CustomCallOp custom_call_op,
+    llvm::StringRef name,
+    llvm::StringRef target,
+    std::string& error) {
+    auto text_ref = customCallFrontendStringAttr(custom_call_op, name);
+    if (!text_ref) {
+        error = (target + " custom_call requires frontend attribute " + name).str();
+        return std::nullopt;
+    }
+    std::string text = text_ref->str();
+    char* end = nullptr;
+    float value = std::strtof(text.c_str(), &end);
+    if (end != text.c_str() + text.size()) {
+        error = (target + " frontend attribute " + name + " must be a float").str();
+        return std::nullopt;
+    }
+    return value;
+}
+
+std::optional<uint32_t> optionalCustomCallU32Attr(
+    mlir::stablehlo::CustomCallOp custom_call_op,
+    llvm::StringRef name,
+    llvm::StringRef target,
+    std::string& error) {
+    auto text_ref = customCallFrontendStringAttr(custom_call_op, name);
+    if (!text_ref) {
         return std::nullopt;
     }
     uint64_t value = 0;
-    if (config.getValue().getAsInteger(10, value)) {
-        error = "tt.sdpa_decode string backend_config must be a scale_bf16_packed integer";
-        return std::nullopt;
-    }
-    if (value > std::numeric_limits<uint32_t>::max()) {
-        error = "tt.sdpa_decode scale_bf16_packed is out of range";
+    if (text_ref->getAsInteger(10, value) ||
+        value > std::numeric_limits<uint32_t>::max()) {
+        error = (target + " frontend attribute " + name + " must be a uint32").str();
         return std::nullopt;
     }
     return static_cast<uint32_t>(value);
 }
 
-bool addSdpaDecodeOp(
+bool addPagedSdpaDecodeOp(
     mlir::stablehlo::CustomCallOp custom_call_op,
     tt::Executable& executable,
     llvm::DenseMap<mlir::Value, uint32_t>& value_ids,
     std::string& error) {
-    size_t input_count = custom_call_op.getInputs().size();
-    if (custom_call_op->getNumResults() != 1 || (input_count != 4 && input_count != 5)) {
-        error = "tt.sdpa_decode custom_call must have four or five inputs and one result";
+    constexpr llvm::StringLiteral target =
+        "tt.paged_scaled_dot_product_attention_decode_fused_kv";
+    if (custom_call_op->getNumResults() != 1 ||
+        custom_call_op.getInputs().size() != 4) {
+        error = (target + " custom_call must have four inputs and one result").str();
         return false;
     }
-    auto scale_bf16_packed = sdpaDecodeScaleBf16Packed(custom_call_op, error);
-    if (!scale_bf16_packed) {
+    auto scale = requiredCustomCallFloatAttr(custom_call_op, "scale", target, error);
+    if (!scale) {
+        return false;
+    }
+    auto sliding_window_size =
+        optionalCustomCallU32Attr(custom_call_op, "sliding_window_size", target, error);
+    if (!sliding_window_size && !error.empty()) {
         return false;
     }
 
-    uint32_t input_ids[5] = {};
+    uint32_t input_ids[4] = {};
     for (auto [index, input] : llvm::enumerate(custom_call_op.getInputs())) {
         if (!addValueDesc(input, executable, value_ids, error, input_ids[index])) {
             return false;
@@ -1762,19 +1784,15 @@ bool addSdpaDecodeOp(
 
     auto* op = executable.add_ops();
     op->set_output_id(output_id);
-    auto* sdpa = op->mutable_sdpa_decode();
+    auto* sdpa = op->mutable_paged_sdpa_decode();
     sdpa->set_q_id(input_ids[0]);
-    sdpa->set_k_id(input_ids[1]);
-    if (input_count == 4) {
-        sdpa->set_seq_lens_id(input_ids[2]);
-        sdpa->set_loc_id(input_ids[3]);
-        sdpa->set_fused_kv_cache(true);
-    } else {
-        sdpa->set_v_id(input_ids[2]);
-        sdpa->set_seq_lens_id(input_ids[3]);
-        sdpa->set_loc_id(input_ids[4]);
+    sdpa->set_fused_kv_cache_id(input_ids[1]);
+    sdpa->set_page_table_id(input_ids[2]);
+    sdpa->set_cur_pos_id(input_ids[3]);
+    sdpa->set_scale(*scale);
+    if (sliding_window_size) {
+        sdpa->set_sliding_window_size(*sliding_window_size);
     }
-    sdpa->set_scale_bf16_packed(*scale_bf16_packed);
     return true;
 }
 
@@ -1940,9 +1958,6 @@ bool isArgmaxReduceOp(mlir::stablehlo::ReduceOp reduce_op) {
         mapProtoElementType(index_type->getElementType()) != tt::TensorDesc::ELEMENT_TYPE_S32 ||
         mapProtoElementType(indices_type->getElementType()) != tt::TensorDesc::ELEMENT_TYPE_S32 ||
         mapProtoElementType(values_type->getElementType()) != input_element_type) {
-        return false;
-    }
-    if (input_type->getRank() == 2 && input_type->getShape()[0] != 1) {
         return false;
     }
     if (input_type->getRank() > 2) {
@@ -3005,14 +3020,67 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
         }
 
         if (auto custom_call_op = mlir::dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
+            auto call_target = custom_call_op.getCallTargetName();
+            if ((call_target == "annotate_device_placement" || call_target == "Sharding" ||
+                 call_target == "xla.sdy.FuncResultSharding") &&
+                !custom_call_op.getHasSideEffect()) {
+                auto inputs = custom_call_op.getInputs();
+                if (inputs.size() != custom_call_op->getNumResults()) {
+                    error = "identity custom_call input and result counts must match";
+                    return false;
+                }
+                for (auto [input, result] :
+                     llvm::zip_equal(inputs, custom_call_op->getResults())) {
+                    if (input.getType() != result.getType()) {
+                        error = "identity custom_call input and result types must match";
+                        return false;
+                    }
+                    uint32_t input_id = 0;
+                    if (!addValueDesc(input, executable, value_ids, error, input_id)) {
+                        return false;
+                    }
+                    value_ids.try_emplace(result, input_id);
+                }
+                continue;
+            }
+
+            if (call_target == "mhlo.topk") {
+                if (custom_call_op.getInputs().size() != 1 ||
+                    custom_call_op->getNumResults() != 2) {
+                    error = "mhlo.topk custom_call must have one input and two results";
+                    return false;
+                }
+                auto values_type = mlir::dyn_cast<mlir::RankedTensorType>(
+                    custom_call_op->getResult(0).getType());
+                if (!values_type || !values_type.hasStaticShape() ||
+                    values_type.getRank() == 0) {
+                    error = "mhlo.topk values result must be a static ranked tensor";
+                    return false;
+                }
+                int64_t k = values_type.getShape().back();
+                if (!addTopKOp(
+                        custom_call_op.getInputs().front(),
+                        custom_call_op->getResult(0),
+                        custom_call_op->getResult(1),
+                        k,
+                        executable,
+                        value_ids,
+                        error)) {
+                    return false;
+                }
+                continue;
+            }
+
             if (custom_call_op->getNumResults() != 1) {
-                error = "only single-result custom_call ops are currently supported";
+                error = "only single-result custom_call ops are currently supported: target=" +
+                        call_target.str() + " inputs=" +
+                        std::to_string(custom_call_op.getInputs().size()) + " results=" +
+                        std::to_string(custom_call_op->getNumResults());
                 return false;
             }
 
-            auto call_target = custom_call_op.getCallTargetName();
-            if (call_target == libtt::mlir_frontend::kSdpaDecodeTarget) {
-                if (!addSdpaDecodeOp(custom_call_op, executable, value_ids, error)) {
+            if (call_target == "tt.paged_scaled_dot_product_attention_decode_fused_kv") {
+                if (!addPagedSdpaDecodeOp(custom_call_op, executable, value_ids, error)) {
                     return false;
                 }
                 continue;
@@ -3027,25 +3095,6 @@ bool lowerToExecutable(FuncOp func, tt::Executable& executable, std::string& err
                 if (!addRopeOp(custom_call_op, executable, value_ids, error)) {
                     return false;
                 }
-                continue;
-            }
-            if ((call_target == "annotate_device_placement" || call_target == "Sharding") &&
-                !custom_call_op.getHasSideEffect()) {
-                auto inputs = custom_call_op.getInputs();
-                if (inputs.size() != 1) {
-                    error = "identity custom_call op must have exactly one input";
-                    return false;
-                }
-                mlir::Value input = inputs.front();
-                if (input.getType() != custom_call_op.getResult(0).getType()) {
-                    error = "identity custom_call input and result types must match";
-                    return false;
-                }
-                uint32_t input_id = 0;
-                if (!addValueDesc(input, executable, value_ids, error, input_id)) {
-                    return false;
-                }
-                value_ids.try_emplace(custom_call_op.getResult(0), input_id);
                 continue;
             }
 
