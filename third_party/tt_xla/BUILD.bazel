@@ -1,0 +1,22 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "loguru.BUILD.bazel",
+    "tt_mlir_compiler_cold_stubs.cc",
+    "tt_mlir_runtime_cold_stubs.cc",
+    "tt_mlir_runtime_conv_stubs.cc",
+    "tt_mlir_runtime_debug_stubs.cc",
+    "tt_metal_cold_stubs.cc",
+    "tt_metal_runtime_cold_stubs.cc",
+    "tt_mlir.BUILD.bazel",
+    "tt_xla.BUILD.bazel",
+])
+
+cc_library(
+    name = "std_format_compat",
+    hdrs = ["compat/format"],
+    includes = ["compat"],
+    deps = ["@fmt//:fmt-header-only"],
+)

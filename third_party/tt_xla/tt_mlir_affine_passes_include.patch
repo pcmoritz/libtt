@@ -1,0 +1,14 @@
+diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
+index 7795659..f1896da 100644
+--- a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
++++ b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
+@@ -16 +16 @@
+-#include "mlir/Dialect/Affine/Passes.h"
++#include "mlir/Dialect/Affine/Transforms/Passes.h"
+diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+index 0af3ad6..5f61489 100644
+--- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
++++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+@@ -46 +46 @@
+-#include "mlir/Dialect/Affine/Passes.h"
++#include "mlir/Dialect/Affine/Transforms/Passes.h"

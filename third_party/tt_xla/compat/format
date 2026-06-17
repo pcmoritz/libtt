@@ -1,0 +1,10 @@
+#pragma once
+
+#include <fmt/format.h>
+
+namespace std {
+using fmt::format;
+
+template <typename... Args>
+using format_string = fmt::format_string<Args...>;
+}  // namespace std

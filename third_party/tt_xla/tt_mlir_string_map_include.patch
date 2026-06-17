@@ -1,0 +1,12 @@
+diff --git a/include/ttmlir/Dialect/TTNN/Utils/PassOverrides.h b/include/ttmlir/Dialect/TTNN/Utils/PassOverrides.h
+index e328a02..d7fd852 100644
+--- a/include/ttmlir/Dialect/TTNN/Utils/PassOverrides.h
++++ b/include/ttmlir/Dialect/TTNN/Utils/PassOverrides.h
+@@ -8,6 +8,7 @@
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+ #include "ttmlir/Dialect/TTNN/Utils/Conv2dConfigParams.h"
+ 
++#include "llvm/ADT/StringMap.h"
+ #include "llvm/Support/CommandLine.h"
+ 
+ #include <optional>

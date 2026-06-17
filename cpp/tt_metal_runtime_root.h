@@ -1,0 +1,6 @@
+#ifndef LIBTT_CPP_TT_METAL_RUNTIME_ROOT_H_
+#define LIBTT_CPP_TT_METAL_RUNTIME_ROOT_H_
+
+void EnsureTtMetalRuntimeReady();
+
+#endif  // LIBTT_CPP_TT_METAL_RUNTIME_ROOT_H_

@@ -1,0 +1,20 @@
+diff --git a/shardy/dialect/sdy/ir/BUILD b/shardy/dialect/sdy/ir/BUILD
+index b60148b4..a7f6e97f 100644
+--- a/shardy/dialect/sdy/ir/BUILD
++++ b/shardy/dialect/sdy/ir/BUILD
+@@ -21,6 +21,7 @@ td_library(
+         "op_interface.td",
+         "ops.td",
+     ],
++    includes = ["../../../.."],
+     deps = [
+         "@llvm-project//mlir:AttrTdFiles",
+         "@llvm-project//mlir:BuiltinDialectBytecodeTdFiles",
+@@ -144,6 +145,7 @@ cc_library(
+         "utils.h",
+         "verifiers.h",
+     ],
++    includes = ["../../../.."],
+     deps = [
+         ":attrs_inc",
+         ":bytecode_inc",

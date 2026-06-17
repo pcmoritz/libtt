@@ -1,0 +1,1354 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
+
+package(default_visibility = ["//visibility:public"])
+
+_COMMON_FBS = [
+    "debug_info.fbs",
+    "system_desc.fbs",
+    "types.fbs",
+    "version.fbs",
+]
+
+_TTMETAL_FBS = [
+    "binary.fbs",
+    "command.fbs",
+    "program.fbs",
+    "types.fbs",
+]
+
+_TTNN_FBS = [
+    "binary.fbs",
+    "operations/ccl.fbs",
+    "operations/configs.fbs",
+    "operations/conv.fbs",
+    "operations/cpu.fbs",
+    "operations/creation.fbs",
+    "operations/cumsum.fbs",
+    "operations/data_movement.fbs",
+    "operations/deallocate.fbs",
+    "operations/debug.fbs",
+    "operations/eltwise.fbs",
+    "operations/embedding.fbs",
+    "operations/generic_op.fbs",
+    "operations/get_device.fbs",
+    "operations/global_semaphore.fbs",
+    "operations/kv_cache.fbs",
+    "operations/layout.fbs",
+    "operations/load_cached.fbs",
+    "operations/matmul.fbs",
+    "operations/mlir_native.fbs",
+    "operations/normalization.fbs",
+    "operations/pool.fbs",
+    "operations/rand.fbs",
+    "operations/reduction.fbs",
+    "operations/tensor_serialization.fbs",
+    "operations/trace.fbs",
+    "operations/transformer.fbs",
+    "program.fbs",
+    "types.fbs",
+]
+
+_RUNTIME_FBS = ["types.fbs"]
+
+_DISTRIBUTED_FBS = [
+    "command.fbs",
+    "response.fbs",
+]
+
+_FBS_GROUPS = [
+    (
+        "common",
+        "include/ttmlir/Target/Common",
+        "flatbuffers/ttmlir/Target/Common",
+        _COMMON_FBS,
+    ),
+    (
+        "ttmetal",
+        "include/ttmlir/Target/TTMetal",
+        "flatbuffers/ttmlir/Target/TTMetal",
+        _TTMETAL_FBS,
+    ),
+    (
+        "ttnn",
+        "include/ttmlir/Target/TTNN",
+        "flatbuffers/ttmlir/Target/TTNN",
+        _TTNN_FBS,
+    ),
+    (
+        "runtime",
+        "runtime/include/tt/runtime/flatbuffer",
+        "flatbuffers/tt/runtime/flatbuffer",
+        _RUNTIME_FBS,
+    ),
+    (
+        "distributed",
+        "runtime/include/tt/runtime/detail/distributed/flatbuffer",
+        "flatbuffers/tt/runtime/detail/distributed/flatbuffer",
+        _DISTRIBUTED_FBS,
+    ),
+]
+
+_FBS_SRCS = [
+    src_dir + "/" + schema
+    for _, src_dir, _, schemas in _FBS_GROUPS
+    for schema in schemas
+]
+
+_FBS_OUTS = [
+    out_dir + "/" + schema[:-4] + suffix
+    for _, _, out_dir, schemas in _FBS_GROUPS
+    for schema in schemas
+    for suffix in [
+        "_generated.h",
+        "_bfbs_generated.h",
+        "_bfbs_hash_generated.h",
+    ]
+]
+
+_FLATBUFFER_CMDS = "\n".join([
+    """
+mkdir -p "$(@D)/{gen_dir}"
+"$$flatc" \
+  -I "$$ttmlir_include" \
+  -I "$$runtime_include" \
+  --bfbs-gen-embed \
+  --cpp --cpp-std c++17 \
+  --scoped-enums --warnings-as-errors \
+  --keep-prefix \
+  --gen-name-strings \
+  --gen-object-api \
+  -o "$(@D)/{gen_dir}" \
+  "$(location {src_dir}/{schema})"
+python3 "$$sha_script" \
+  tt::target::{namespace} \
+  {base}_bfbs_schema_hash \
+  "$(@D)/{gen_dir}/{base}_bfbs_generated.h" \
+  "$(@D)/{gen_dir}/{base}_bfbs_hash_generated.h"
+""".format(
+        base = schema.split("/")[-1][:-4],
+        gen_dir = out_dir + ("/" + "/".join(schema.split("/")[:-1]) if "/" in schema else ""),
+        namespace = namespace,
+        schema = schema,
+        src_dir = src_dir,
+    )
+    for namespace, src_dir, out_dir, schemas in _FBS_GROUPS
+    for schema in schemas
+])
+
+genrule(
+    name = "flatbuffer_headers",
+    srcs = _FBS_SRCS + ["tools/scripts/sha256-include-gen.py"],
+    outs = _FBS_OUTS,
+    cmd = """
+set -euo pipefail
+flatc="$(location @com_github_google_flatbuffers//:flatc)"
+sha_script="$(location tools/scripts/sha256-include-gen.py)"
+common_types="$(location include/ttmlir/Target/Common/types.fbs)"
+runtime_types="$(location runtime/include/tt/runtime/flatbuffer/types.fbs)"
+ttmlir_include="$$(dirname "$$(dirname "$$(dirname "$$(dirname "$$common_types")")")")"
+runtime_include="$$(dirname "$$(dirname "$$(dirname "$$(dirname "$$runtime_types")")")")"
+""" + _FLATBUFFER_CMDS,
+    tools = ["@com_github_google_flatbuffers//:flatc"],
+)
+
+cc_library(
+    name = "flatbuffer_generated_headers",
+    hdrs = [":flatbuffer_headers"],
+    includes = [
+        "flatbuffers",
+        "flatbuffers/tt/runtime/flatbuffer",
+        "flatbuffers/ttmlir/Target/Common",
+        "flatbuffers/ttmlir/Target/TTNN",
+    ],
+    deps = ["@com_github_google_flatbuffers//:runtime_cc"],
+)
+
+td_library(
+    name = "affine_memory_op_interfaces_td_files",
+    srcs = ["@llvm-project//mlir:include/mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.td"],
+)
+
+td_library(
+    name = "ttmlir_td_files",
+    srcs = glob(
+        [
+            "include/**/*.td",
+            "lib/**/*.td",
+        ],
+        allow_empty = True,
+    ),
+    includes = [
+        "include",
+        "include/ttmlir/Dialect/EmitPy/Interfaces",
+    ],
+    deps = [
+        "@llvm-project//mlir:BuiltinDialectTdFiles",
+        "@llvm-project//mlir:BufferizableOpInterfaceTdFiles",
+        "@llvm-project//mlir:BufferizationTypeInterfacesTdFiles",
+        "@llvm-project//mlir:CallInterfacesTdFiles",
+        "@llvm-project//mlir:ControlFlowInterfacesTdFiles",
+        "@llvm-project//mlir:DestinationStyleOpInterfaceTdFiles",
+        "@llvm-project//mlir:FunctionInterfacesTdFiles",
+        "@llvm-project//mlir:InferIntRangeInterfaceTdFiles",
+        "@llvm-project//mlir:InferTypeOpInterfaceTdFiles",
+        "@llvm-project//mlir:LinalgOpsTdFiles",
+        "@llvm-project//mlir:OpBaseTdFiles",
+        "@llvm-project//mlir:PassBaseTdFiles",
+        "@llvm-project//mlir:SideEffectInterfacesTdFiles",
+        ":affine_memory_op_interfaces_td_files",
+        "@shardy//shardy/dialect/sdy/ir:sdy_td_files",
+        "@stablehlo//:base_td_files",
+    ],
+)
+
+gentbl_cc_library(
+    name = "ttcore_attr_interfaces_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreAttrInterfaces.cpp.inc": ["-gen-attr-interface-defs"],
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreAttrInterfaces.h.inc": ["-gen-attr-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTCore/IR/TTCoreAttrInterfaces.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttcore_ops_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreOps.cpp.inc": ["-gen-op-defs"],
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreOps.h.inc": ["-gen-op-decls"],
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreOpsAttrDefs.cpp.inc": [
+            "-gen-attrdef-defs",
+            "-attrdefs-dialect=ttcore",
+        ],
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreOpsAttrDefs.h.inc": [
+            "-gen-attrdef-decls",
+            "-attrdefs-dialect=ttcore",
+        ],
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreOpsDialect.cpp.inc": [
+            "-gen-dialect-defs",
+            "-dialect=ttcore",
+        ],
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreOpsDialect.h.inc": [
+            "-gen-dialect-decls",
+            "-dialect=ttcore",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttcore_enums_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.cpp.inc": ["-gen-enum-defs"],
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.h.inc": ["-gen-enum-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttcore_types_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.cpp.inc": [
+            "-gen-typedef-defs",
+            "-typedefs-dialect=ttcore",
+        ],
+        "tablegen/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h.inc": [
+            "-gen-typedef-decls",
+            "-typedefs-dialect=ttcore",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_device_operand_interface_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNDeviceOperandInterface.cpp.inc": ["-gen-op-interface-defs"],
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNDeviceOperandInterface.h.inc": ["-gen-op-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/Interfaces/TTNNDeviceOperandInterface.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_distributed_op_interface_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNDistributedOpInterface.cpp.inc": ["-gen-op-interface-defs"],
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNDistributedOpInterface.h.inc": ["-gen-op-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/Interfaces/TTNNDistributedOpInterface.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_op_model_interface_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp.inc": ["-gen-op-interface-defs"],
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNOpModelInterface.h.inc": ["-gen-op-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/Interfaces/TTNNOpModelInterface.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_tensor_spec_interface_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNTensorSpecInterface.cpp.inc": ["-gen-op-interface-defs"],
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNTensorSpecInterface.h.inc": ["-gen-op-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/Interfaces/TTNNTensorSpecInterface.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_workaround_interface_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNWorkaroundInterface.cpp.inc": ["-gen-op-interface-defs"],
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNWorkaroundInterface.h.inc": ["-gen-op-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/Interfaces/TTNNWorkaroundInterface.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_kernel_interface_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNKernelInterface.cpp.inc": ["-gen-attr-interface-defs"],
+        "tablegen/ttmlir/Dialect/TTNN/Interfaces/TTNNKernelInterface.h.inc": ["-gen-attr-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/Interfaces/TTNNKernelInterface.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_ops_interfaces_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOpsInterfaces.cpp.inc": ["-gen-op-interface-defs"],
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOpsInterfaces.h.inc": ["-gen-op-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/IR/TTNNOpsInterfaces.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_ops_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOps.cpp.inc": ["-gen-op-defs"],
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOps.h.inc": ["-gen-op-decls"],
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOpsDialect.cpp.inc": [
+            "-gen-dialect-defs",
+            "-dialect=ttnn",
+        ],
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOpsDialect.h.inc": [
+            "-gen-dialect-decls",
+            "-dialect=ttnn",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/IR/TTNNOps.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_attrs_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOpsAttrDefs.cpp.inc": [
+            "-gen-attrdef-defs",
+            "-attrdefs-dialect=ttnn",
+        ],
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOpsAttrDefs.h.inc": [
+            "-gen-attrdef-decls",
+            "-attrdefs-dialect=ttnn",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_enums_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOpsEnums.cpp.inc": ["-gen-enum-defs"],
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOpsEnums.h.inc": ["-gen-enum-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/IR/TTNNOpsEnums.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_types_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOpsTypes.cpp.inc": [
+            "-gen-typedef-defs",
+            "-typedefs-dialect=ttnn",
+        ],
+        "tablegen/ttmlir/Dialect/TTNN/IR/TTNNOpsTypes.h.inc": [
+            "-gen-typedef-decls",
+            "-typedefs-dialect=ttnn",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/IR/TTNNOpsTypes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttnn_passes_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTNN/Transforms/Passes.h.inc": ["--gen-pass-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTNN/Transforms/Passes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "stablehlo_passes_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/StableHLO/Transforms/Passes.h.inc": ["--gen-pass-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/StableHLO/Transforms/Passes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttir_ops_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROps.cpp.inc": ["-gen-op-defs"],
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROps.h.inc": ["-gen-op-decls"],
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROpsDialect.cpp.inc": [
+            "-gen-dialect-defs",
+            "-dialect=ttir",
+        ],
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROpsDialect.h.inc": [
+            "-gen-dialect-decls",
+            "-dialect=ttir",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTIR/IR/TTIROps.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttir_attrs_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROpsAttrs.cpp.inc": ["-gen-attrdef-defs"],
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROpsAttrs.h.inc": ["-gen-attrdef-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTIR/IR/TTIROpsAttrs.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttir_enums_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROpsEnums.cpp.inc": ["-gen-enum-defs"],
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROpsEnums.h.inc": ["-gen-enum-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTIR/IR/TTIROpsEnums.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttir_types_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROpsTypeDefs.cpp.inc": ["-gen-typedef-defs"],
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROpsTypeDefs.h.inc": ["-gen-typedef-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTIR/IR/TTIROpsTypes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttir_ops_interfaces_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROpsInterfaces.cpp.inc": ["-gen-op-interface-defs"],
+        "tablegen/ttmlir/Dialect/TTIR/IR/TTIROpsInterfaces.h.inc": ["-gen-op-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTIR/IR/TTIROpsInterfaces.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttir_passes_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTIR/Transforms/Passes.h.inc": ["--gen-pass-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTIR/Transforms/Passes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttkernel_ops_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTKernel/IR/TTKernelOps.cpp.inc": ["-gen-op-defs"],
+        "tablegen/ttmlir/Dialect/TTKernel/IR/TTKernelOps.h.inc": ["-gen-op-decls"],
+        "tablegen/ttmlir/Dialect/TTKernel/IR/TTKernelOpsDialect.cpp.inc": [
+            "-gen-dialect-defs",
+            "-dialect=ttkernel",
+        ],
+        "tablegen/ttmlir/Dialect/TTKernel/IR/TTKernelOpsDialect.h.inc": [
+            "-gen-dialect-decls",
+            "-dialect=ttkernel",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttkernel_attrs_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTKernel/IR/TTKernelOpsAttrDefs.cpp.inc": ["-gen-attrdef-defs"],
+        "tablegen/ttmlir/Dialect/TTKernel/IR/TTKernelOpsAttrDefs.h.inc": ["-gen-attrdef-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttkernel_enums_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTKernel/IR/TTKernelOpsEnums.cpp.inc": ["-gen-enum-defs"],
+        "tablegen/ttmlir/Dialect/TTKernel/IR/TTKernelOpsEnums.h.inc": ["-gen-enum-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTKernel/IR/TTKernelOpsEnums.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttkernel_types_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.cpp.inc": [
+            "-gen-typedef-defs",
+            "-typedefs-dialect=ttkernel",
+        ],
+        "tablegen/ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.h.inc": [
+            "-gen-typedef-decls",
+            "-typedefs-dialect=ttkernel",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttkernel_passes_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTKernel/Transforms/Passes.h.inc": ["--gen-pass-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTKernel/Transforms/Passes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttmetal_attr_interfaces_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalAttrInterfaces.cpp.inc": ["-gen-attr-interface-defs"],
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalAttrInterfaces.h.inc": ["-gen-attr-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTMetal/IR/TTMetalAttrInterfaces.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttmetal_ops_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalOps.cpp.inc": ["-gen-op-defs"],
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalOps.h.inc": ["-gen-op-decls"],
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalOpsDialect.cpp.inc": [
+            "-gen-dialect-defs",
+            "-dialect=ttmetal",
+        ],
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalOpsDialect.h.inc": [
+            "-gen-dialect-decls",
+            "-dialect=ttmetal",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTMetal/IR/TTMetalOps.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttmetal_attrs_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalOpsAttrDefs.cpp.inc": ["-gen-attrdef-defs"],
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalOpsAttrDefs.h.inc": ["-gen-attrdef-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTMetal/IR/TTMetalOpsAttrs.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttmetal_enums_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalOpsEnums.cpp.inc": ["-gen-enum-defs"],
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalOpsEnums.h.inc": ["-gen-enum-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTMetal/IR/TTMetalOpsEnums.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttmetal_types_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalOpsTypes.cpp.inc": [
+            "-gen-typedef-defs",
+            "-typedefs-dialect=ttmetal",
+        ],
+        "tablegen/ttmlir/Dialect/TTMetal/IR/TTMetalOpsTypes.h.inc": [
+            "-gen-typedef-decls",
+            "-typedefs-dialect=ttmetal",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTMetal/IR/TTMetalOpsTypes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttmetal_passes_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTMetal/Transforms/Passes.h.inc": ["--gen-pass-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTMetal/Transforms/Passes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "conversion_passes_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Conversion/Passes.h.inc": [
+            "--gen-pass-decls",
+            "-name=TTMLIRConversion",
+            "-DTTMLIR_ENABLE_STABLEHLO",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Conversion/Passes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "d2m_passes_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/D2M/Transforms/Passes.h.inc": ["--gen-pass-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/D2M/Transforms/Passes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "llvm_passes_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/LLVM/Transforms/Passes.h.inc": ["--gen-pass-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/LLVM/Transforms/Passes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "ttcore_passes_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/TTCore/Transforms/Passes.h.inc": ["--gen-pass-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/TTCore/Transforms/Passes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "transforms_passes_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Transforms/Passes.h.inc": ["--gen-pass-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Transforms/Passes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "d2m_ops_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOps.cpp.inc": ["-gen-op-defs"],
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOps.h.inc": ["-gen-op-decls"],
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOpsDialect.cpp.inc": [
+            "-gen-dialect-defs",
+            "-dialect=d2m",
+        ],
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOpsDialect.h.inc": [
+            "-gen-dialect-decls",
+            "-dialect=d2m",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/D2M/IR/D2MOps.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "d2m_generic_region_ops_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.cpp.inc": ["-gen-op-defs"],
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.h.inc": ["-gen-op-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/D2M/IR/D2MGenericRegionOps.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "d2m_attrs_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOpsAttrs.cpp.inc": [
+            "-gen-attrdef-defs",
+            "-attrdefs-dialect=d2m",
+        ],
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOpsAttrs.h.inc": [
+            "-gen-attrdef-decls",
+            "-attrdefs-dialect=d2m",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/D2M/IR/D2MOpsAttrs.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "d2m_enums_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOpsEnums.cpp.inc": ["-gen-enum-defs"],
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOpsEnums.h.inc": ["-gen-enum-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/D2M/IR/D2MOpsEnums.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "d2m_types_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOpsTypeDefs.cpp.inc": [
+            "-gen-typedef-defs",
+            "-typedefs-dialect=d2m",
+        ],
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOpsTypeDefs.h.inc": [
+            "-gen-typedef-decls",
+            "-typedefs-dialect=d2m",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/D2M/IR/D2MOpsTypes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "d2m_ops_interfaces_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOpsInterfaces.cpp.inc": ["-gen-op-interface-defs"],
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MOpsInterfaces.h.inc": ["-gen-op-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/D2M/IR/D2MOpsInterfaces.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "d2m_generic_region_ops_interfaces_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MGenericRegionOpsInterfaces.cpp.inc": ["-gen-op-interface-defs"],
+        "tablegen/ttmlir/Dialect/D2M/IR/D2MGenericRegionOpsInterfaces.h.inc": ["-gen-op-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/D2M/IR/D2MGenericRegionOpsInterfaces.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "debug_ops_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/Debug/IR/DebugOps.cpp.inc": ["-gen-op-defs"],
+        "tablegen/ttmlir/Dialect/Debug/IR/DebugOps.h.inc": ["-gen-op-decls"],
+        "tablegen/ttmlir/Dialect/Debug/IR/DebugOpsDialect.cpp.inc": [
+            "-gen-dialect-defs",
+            "-dialect=debug",
+        ],
+        "tablegen/ttmlir/Dialect/Debug/IR/DebugOpsDialect.h.inc": [
+            "-gen-dialect-decls",
+            "-dialect=debug",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/Debug/IR/DebugOps.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "emitpy_ops_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/EmitPy/IR/EmitPyOps.cpp.inc": ["-gen-op-defs"],
+        "tablegen/ttmlir/Dialect/EmitPy/IR/EmitPyOps.h.inc": ["-gen-op-decls"],
+        "tablegen/ttmlir/Dialect/EmitPy/IR/EmitPyOpsDialect.cpp.inc": [
+            "-gen-dialect-defs",
+            "-dialect=emitpy",
+        ],
+        "tablegen/ttmlir/Dialect/EmitPy/IR/EmitPyOpsDialect.h.inc": [
+            "-gen-dialect-decls",
+            "-dialect=emitpy",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/EmitPy/IR/EmitPyOps.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "emitpy_attrs_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/EmitPy/IR/EmitPyAttrs.cpp.inc": [
+            "-gen-attrdef-defs",
+            "-attrdefs-dialect=emitpy",
+        ],
+        "tablegen/ttmlir/Dialect/EmitPy/IR/EmitPyAttrs.h.inc": [
+            "-gen-attrdef-decls",
+            "-attrdefs-dialect=emitpy",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/EmitPy/IR/EmitPyAttrs.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "emitpy_types_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/EmitPy/IR/EmitPyOpsTypes.cpp.inc": [
+            "-gen-typedef-defs",
+            "-typedefs-dialect=emitpy",
+        ],
+        "tablegen/ttmlir/Dialect/EmitPy/IR/EmitPyOpsTypes.h.inc": [
+            "-gen-typedef-decls",
+            "-typedefs-dialect=emitpy",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/EmitPy/IR/EmitPyTypes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "emitpy_interfaces_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/EmitPy/Interfaces/EmitPyInterfaces.cpp.inc": ["-gen-op-interface-defs"],
+        "tablegen/ttmlir/Dialect/EmitPy/Interfaces/EmitPyInterfaces.h.inc": ["-gen-op-interface-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/EmitPy/Interfaces/EmitPyInterfaces.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "sfpi_ops_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/SFPI/IR/SFPIOps.cpp.inc": ["-gen-op-defs"],
+        "tablegen/ttmlir/Dialect/SFPI/IR/SFPIOps.h.inc": ["-gen-op-decls"],
+        "tablegen/ttmlir/Dialect/SFPI/IR/SFPIOpsDialect.cpp.inc": [
+            "-gen-dialect-defs",
+            "-dialect=sfpi",
+        ],
+        "tablegen/ttmlir/Dialect/SFPI/IR/SFPIOpsDialect.h.inc": [
+            "-gen-dialect-decls",
+            "-dialect=sfpi",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/SFPI/IR/SFPIOps.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "sfpi_attrs_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/SFPI/IR/SFPIOpsAttrs.cpp.inc": [
+            "-gen-attrdef-defs",
+            "-attrdefs-dialect=sfpi",
+        ],
+        "tablegen/ttmlir/Dialect/SFPI/IR/SFPIOpsAttrs.h.inc": [
+            "-gen-attrdef-decls",
+            "-attrdefs-dialect=sfpi",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/SFPI/IR/SFPIOpsAttrs.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "sfpi_enums_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/SFPI/IR/SFPIOpsEnums.cpp.inc": ["-gen-enum-defs"],
+        "tablegen/ttmlir/Dialect/SFPI/IR/SFPIOpsEnums.h.inc": ["-gen-enum-decls"],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/SFPI/IR/SFPIEnums.td",
+    deps = [":ttmlir_td_files"],
+)
+
+gentbl_cc_library(
+    name = "sfpi_types_inc_gen",
+    tbl_outs = {
+        "tablegen/ttmlir/Dialect/SFPI/IR/SFPIOpsTypes.cpp.inc": [
+            "-gen-typedef-defs",
+            "-typedefs-dialect=sfpi",
+        ],
+        "tablegen/ttmlir/Dialect/SFPI/IR/SFPIOpsTypes.h.inc": [
+            "-gen-typedef-decls",
+            "-typedefs-dialect=sfpi",
+        ],
+    },
+    strip_include_prefix = "tablegen",
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "include/ttmlir/Dialect/SFPI/IR/SFPIOpsTypes.td",
+    deps = [":ttmlir_td_files"],
+)
+
+cc_library(
+    name = "public_headers",
+    hdrs = glob(
+        [
+            "include/**/*.h",
+            "include/**/*.hpp",
+            "runtime/include/**/*.h",
+            "runtime/include/**/*.hpp",
+        ],
+        allow_empty = True,
+    ),
+    includes = [
+        "include",
+        "runtime/include",
+    ],
+    defines = [
+        "TTMLIR_ENABLE_OPMODEL",
+        "TTMLIR_ENABLE_STABLEHLO=1",
+    ],
+    deps = [
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:BufferizationInterfaces",
+        "@llvm-project//mlir:ControlFlowInterfaces",
+        "@llvm-project//mlir:DestinationStyleOpInterface",
+        "@llvm-project//mlir:InferTypeOpInterface",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LinalgDialect",
+        "@llvm-project//mlir:MathDialect",
+        "@llvm-project//mlir:SideEffectInterfaces",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:TosaDialect",
+        "@com_github_google_flatbuffers//:runtime_cc",
+        "@llvm-project//mlir:CAPIIR",
+        "@shardy//shardy/dialect/sdy/ir:dialect",
+        "@shardy//shardy/dialect/sdy/ir:register",
+        "@shardy//shardy/dialect/sdy/transforms:passes",
+        "@shardy//shardy/dialect/sdy/transforms/export:passes",
+        "@shardy//shardy/dialect/sdy/transforms/import:passes",
+        "@shardy//shardy/dialect/sdy/transforms/propagation:passes",
+        "@stablehlo//:stablehlo_ops",
+        ":flatbuffer_generated_headers",
+        ":stablehlo_passes_inc_gen",
+        ":ttcore_attr_interfaces_inc_gen",
+        ":ttcore_enums_inc_gen",
+        ":ttcore_ops_inc_gen",
+        ":ttcore_types_inc_gen",
+        ":ttir_attrs_inc_gen",
+        ":ttir_enums_inc_gen",
+        ":ttir_ops_inc_gen",
+        ":ttir_ops_interfaces_inc_gen",
+        ":ttir_passes_inc_gen",
+        ":ttir_types_inc_gen",
+        ":ttkernel_attrs_inc_gen",
+        ":ttkernel_enums_inc_gen",
+        ":ttkernel_ops_inc_gen",
+        ":ttkernel_passes_inc_gen",
+        ":ttkernel_types_inc_gen",
+        ":ttmetal_attr_interfaces_inc_gen",
+        ":ttmetal_attrs_inc_gen",
+        ":ttmetal_enums_inc_gen",
+        ":ttmetal_ops_inc_gen",
+        ":ttmetal_passes_inc_gen",
+        ":ttmetal_types_inc_gen",
+        ":ttnn_attrs_inc_gen",
+        ":ttnn_device_operand_interface_inc_gen",
+        ":ttnn_distributed_op_interface_inc_gen",
+        ":ttnn_enums_inc_gen",
+        ":ttnn_kernel_interface_inc_gen",
+        ":ttnn_op_model_interface_inc_gen",
+        ":ttnn_ops_inc_gen",
+        ":ttnn_ops_interfaces_inc_gen",
+        ":ttnn_passes_inc_gen",
+        ":ttnn_tensor_spec_interface_inc_gen",
+        ":ttnn_types_inc_gen",
+        ":ttnn_workaround_interface_inc_gen",
+        "@tt_metal//:ttnn_tensor_upstream",
+    ],
+)
+
+filegroup(
+    name = "flatbuffer_schemas",
+    srcs = glob(
+        [
+            "include/ttmlir/Target/**/*.fbs",
+            "runtime/include/tt/runtime/**/*.fbs",
+        ],
+        allow_empty = True,
+    ),
+)
+
+filegroup(
+    name = "tablegen_sources",
+    srcs = glob(
+        [
+            "include/**/*.td",
+            "lib/**/*.td",
+        ],
+        allow_empty = True,
+    ),
+)
+
+_EXTRA_TABLEGEN_DEPS = [
+    ":conversion_passes_inc_gen",
+    ":d2m_attrs_inc_gen",
+    ":d2m_enums_inc_gen",
+    ":d2m_generic_region_ops_inc_gen",
+    ":d2m_generic_region_ops_interfaces_inc_gen",
+    ":d2m_ops_inc_gen",
+    ":d2m_ops_interfaces_inc_gen",
+    ":d2m_passes_inc_gen",
+    ":d2m_types_inc_gen",
+    ":debug_ops_inc_gen",
+    ":emitpy_attrs_inc_gen",
+    ":emitpy_interfaces_inc_gen",
+    ":emitpy_ops_inc_gen",
+    ":emitpy_types_inc_gen",
+    ":llvm_passes_inc_gen",
+    ":sfpi_attrs_inc_gen",
+    ":sfpi_enums_inc_gen",
+    ":sfpi_ops_inc_gen",
+    ":sfpi_types_inc_gen",
+    ":transforms_passes_inc_gen",
+    ":ttcore_passes_inc_gen",
+]
+
+_TTMLIR_COMMON_COPTS = [
+    "-std=c++20",
+    "-DTTMLIR_ENABLE_OPMODEL=1",
+    "-DTTMLIR_ENABLE_STABLEHLO=1",
+    "-DTTMLIR_GIT_HASH=unknown",
+    "-DTTMLIR_VERSION_MAJOR=0",
+    "-DTTMLIR_VERSION_MINOR=0",
+    "-DTTMLIR_VERSION_PATCH=0",
+]
+
+_TTMLIR_COMMON_DEPS = [
+    ":flatbuffer_generated_headers",
+    ":public_headers",
+] + _EXTRA_TABLEGEN_DEPS + [
+    "@com_github_google_flatbuffers//:flatbuffers",
+    "@com_github_google_flatbuffers//:runtime_cc",
+    "@fmt//:fmt-header-only",
+    "@llvm-project//llvm:Support",
+    "@llvm-project//mlir:AffineDialect",
+    "@llvm-project//mlir:AffineToStandard",
+    "@llvm-project//mlir:AffineTransforms",
+    "@llvm-project//mlir:AllPassesAndDialects",
+    "@llvm-project//mlir:AllToLLVMIRTranslations",
+    "@llvm-project//mlir:ArithDialect",
+    "@llvm-project//mlir:ArithToLLVM",
+    "@llvm-project//mlir:BufferizationDialect",
+    "@llvm-project//mlir:BufferizationInterfaces",
+    "@llvm-project//mlir:BufferizationPipelines",
+    "@llvm-project//mlir:BufferizationTransforms",
+    "@llvm-project//mlir:CAPIIR",
+    "@llvm-project//mlir:CallOpInterfaces",
+    "@llvm-project//mlir:ComplexToLLVM",
+    "@llvm-project//mlir:ControlFlowDialect",
+    "@llvm-project//mlir:ControlFlowInterfaces",
+    "@llvm-project//mlir:ControlFlowToLLVM",
+    "@llvm-project//mlir:ConversionPasses",
+    "@llvm-project//mlir:DestinationStyleOpInterface",
+    "@llvm-project//mlir:EmitCDialect",
+    "@llvm-project//mlir:EmitCTransforms",
+    "@llvm-project//mlir:FuncDialect",
+    "@llvm-project//mlir:FuncExtensions",
+    "@llvm-project//mlir:FuncTransforms",
+    "@llvm-project//mlir:FuncToLLVM",
+    "@llvm-project//mlir:FunctionInterfaces",
+    "@llvm-project//mlir:GPUCommonTransforms",
+    "@llvm-project//mlir:GPUDialect",
+    "@llvm-project//mlir:GPUToNVVMTransforms",
+    "@llvm-project//mlir:GPUTransforms",
+    "@llvm-project//mlir:IR",
+    "@llvm-project//mlir:IndexToLLVM",
+    "@llvm-project//mlir:InferIntRangeInterface",
+    "@llvm-project//mlir:InferTypeOpInterface",
+    "@llvm-project//mlir:LLVMDialect",
+    "@llvm-project//mlir:LLVMIRTransforms",
+    "@llvm-project//mlir:LinalgDialect",
+    "@llvm-project//mlir:LinalgTransforms",
+    "@llvm-project//mlir:MLProgramDialect",
+    "@llvm-project//mlir:MathDialect",
+    "@llvm-project//mlir:MathToLLVM",
+    "@llvm-project//mlir:MathToLibm",
+    "@llvm-project//mlir:MemRefDialect",
+    "@llvm-project//mlir:MemRefToLLVM",
+    "@llvm-project//mlir:MemRefTransforms",
+    "@llvm-project//mlir:MLIRTargetCpp",
+    "@llvm-project//mlir:MlirOptLib",
+    "@llvm-project//mlir:NVVMDialect",
+    "@llvm-project//mlir:NVVMToLLVM",
+    "@llvm-project//mlir:OpenMPToLLVM",
+    "@llvm-project//mlir:Pass",
+    "@llvm-project//mlir:Parser",
+    "@llvm-project//mlir:QuantOps",
+    "@llvm-project//mlir:SCFDialect",
+    "@llvm-project//mlir:SCFToControlFlow",
+    "@llvm-project//mlir:SCFTransforms",
+    "@llvm-project//mlir:SideEffectInterfaces",
+    "@llvm-project//mlir:Support",
+    "@llvm-project//mlir:TargetLLVMIRTransforms",
+    "@llvm-project//mlir:TensorToLinalg",
+    "@llvm-project//mlir:ToLLVMIRTranslation",
+    "@llvm-project//mlir:TosaToArith",
+    "@llvm-project//mlir:TosaToLinalg",
+    "@llvm-project//mlir:TosaToTensor",
+    "@llvm-project//mlir:TensorDialect",
+    "@llvm-project//mlir:TensorTransforms",
+    "@llvm-project//mlir:TosaDialect",
+    "@llvm-project//mlir:Transforms",
+    "@llvm-project//mlir:UBToLLVM",
+    "@llvm-project//mlir:VectorDialect",
+    "@llvm-project//mlir:VectorTransforms",
+    "@llvm-project//mlir:VectorToLLVM",
+    "@shardy//shardy/dialect/mpmd/ir:register",
+    "@shardy//shardy/dialect/mpmd/transforms:passes",
+    "@shardy//shardy/dialect/sdy/ir:dialect",
+    "@shardy//shardy/dialect/sdy/ir:register",
+    "@shardy//shardy/dialect/sdy/transforms:passes",
+    "@shardy//shardy/dialect/sdy/transforms/export:passes",
+    "@shardy//shardy/dialect/sdy/transforms/import:passes",
+    "@shardy//shardy/dialect/sdy/transforms/propagation:passes",
+    "@stablehlo//:linalg_passes",
+    "@stablehlo//:register",
+    "@stablehlo//:stablehlo_ops",
+    "@stablehlo//:stablehlo_passes",
+]
+
+cc_library(
+    name = "ttmlir_compiler",
+    srcs = [
+        "lib/RegisterAll.cpp",
+        "@//third_party/tt_xla:tt_mlir_compiler_cold_stubs.cc",
+    ] + glob(
+        [
+            "lib/Conversion/StableHLOToTTIR/**/*.cpp",
+            "lib/Conversion/TTIRToLinalg/**/*.cpp",
+            "lib/Conversion/TTIRToTTIRDecomposition/**/*.cpp",
+            "lib/Conversion/TTIRToTTNN/**/*.cpp",
+            "lib/Conversion/TTNNToEmitC/**/*.cpp",
+            "lib/Conversion/TTNNToTTIR/**/*.cpp",
+            "lib/Dialect/Debug/**/*.cpp",
+            "lib/Dialect/EmitPy/**/*.cpp",
+            "lib/Dialect/Linalg/**/*.cpp",
+            "lib/Dialect/LLVM/**/*.cpp",
+            "lib/Dialect/StableHLO/**/*.cpp",
+            "lib/Dialect/TTCore/**/*.cpp",
+            "lib/Dialect/TTIR/**/*.cpp",
+            "lib/Dialect/TTKernel/IR/**/*.cpp",
+            "lib/Dialect/TTMetal/IR/**/*.cpp",
+            "lib/Dialect/TTNN/**/*.cpp",
+            "lib/OpModel/TTNN/**/*.cpp",
+            "lib/Scheduler/**/*.cpp",
+            "lib/Support/**/*.cpp",
+            "lib/Target/TTNN/**/*.cpp",
+            "lib/Transforms/**/*.cpp",
+        ],
+        exclude = [
+            "lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/ConcatenateHeadsOpRewritePattern.cpp",
+            "lib/Dialect/TTNN/Transforms/TTNNToPython.cpp",
+            "lib/Target/Python/**",
+        ],
+        allow_empty = True,
+    ),
+    hdrs = glob(
+        [
+            "include/**/*.h",
+            "include/**/*.hpp",
+            "lib/**/*.h",
+            "lib/**/*.hpp",
+        ],
+        allow_empty = True,
+    ),
+    copts = _TTMLIR_COMMON_COPTS,
+    includes = [
+        "include",
+        "include/ttmlir/OpModel/TTNN",
+        "lib",
+    ],
+    deps = _TTMLIR_COMMON_DEPS,
+    alwayslink = True,
+)
+
+cc_library(
+    name = "ttmlir_runtime",
+    srcs = glob(
+        [
+            "runtime/lib/**/*.cpp",
+        ],
+        exclude = [
+            "runtime/lib/ttmetal/**",
+            "runtime/lib/ttnn/debug/**",
+            "runtime/lib/ttnn/operations/ccl/**",
+            "runtime/lib/ttnn/operations/conv/*.cpp",
+            "runtime/lib/ttnn/operations/conv/**",
+            "runtime/lib/ttnn/operations/cpu/**",
+            "runtime/lib/ttnn/operations/debug/**",
+            "runtime/lib/ttnn/operations/experimental/gelu_bw.cpp",
+            "runtime/lib/ttnn/operations/kv_cache/update_cache.cpp",
+            "runtime/lib/ttnn/operations/normalization/distributed_rms_norm.cpp",
+            "runtime/lib/ttnn/operations/normalization/layer_norm_post_all_gather.cpp",
+            "runtime/lib/ttnn/operations/normalization/layer_norm_pre_all_gather.cpp",
+            "runtime/lib/ttnn/operations/normalization/rms_norm_pre_all_gather.cpp",
+            "runtime/lib/ttnn/operations/pool/**",
+            "runtime/lib/ttnn/operations/rand/**",
+            "runtime/lib/ttnn/operations/tensor_serialization/**",
+        ],
+        allow_empty = True,
+    ) + [
+        "@//third_party/tt_xla:tt_mlir_runtime_cold_stubs.cc",
+        "@//third_party/tt_xla:tt_mlir_runtime_conv_stubs.cc",
+        "@//third_party/tt_xla:tt_mlir_runtime_debug_stubs.cc",
+    ],
+    hdrs = glob(
+        [
+            "runtime/include/**/*.h",
+            "runtime/include/**/*.hpp",
+            "runtime/lib/**/*.h",
+            "runtime/lib/**/*.hpp",
+        ],
+        allow_empty = True,
+    ),
+    copts = _TTMLIR_COMMON_COPTS + [
+        "-DDEVICE_RUNTIME_ENABLED=1",
+        "-DTTMLIR_ENABLE_RUNTIME=1",
+        "-DTT_RUNTIME_ENABLE_DISTRIBUTED=1",
+        "-DTT_RUNTIME_ENABLE_TTNN=1",
+        "-DTARGET_TRIPLE=\\\"x86_64-pc-linux\\\"",
+        "-march=x86-64-v3",
+    ],
+    includes = [
+        "runtime/lib/ttnn",
+        "runtime/include",
+        "include",
+    ],
+    deps = _TTMLIR_COMMON_DEPS + [
+        "@tt_metal//:ttnn_tensor_upstream",
+    ],
+    alwayslink = True,
+)
+
+filegroup(
+    name = "all_files",
+    srcs = glob(
+        ["**"],
+        exclude = [".git/**"],
+    ),
+)

@@ -1,0 +1,131 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "pjrt_c_api",
+    hdrs = glob(["third_party/pjrt_c_api/xla/pjrt/c/*.h"]),
+    includes = ["third_party/pjrt_c_api"],
+)
+
+cc_library(
+    name = "pjrt_headers",
+    hdrs = glob(["pjrt_implementation/inc/**/*.h"]),
+    includes = ["pjrt_implementation/inc"],
+    deps = [
+        ":pjrt_c_api",
+        "@//third_party/tt_xla:std_format_compat",
+        "@tt_mlir_src//:public_headers",
+    ],
+)
+
+cc_library(
+    name = "pjrt_utils",
+    srcs = [
+        "pjrt_implementation/src/utils/callback_worker.cc",
+        "pjrt_implementation/src/utils/data_type_utils.cc",
+        "pjrt_implementation/src/utils/logging.cc",
+    ],
+    copts = [
+        "-std=c++20",
+        "-fno-rtti",
+    ],
+    deps = [
+        ":pjrt_headers",
+        "@loguru_src//:loguru",
+        "@tt_mlir_src//:ttmlir_runtime",
+    ],
+)
+
+cc_library(
+    name = "pjrt_api",
+    srcs = [
+        "pjrt_implementation/src/api/buffer_instance.cc",
+        "pjrt_implementation/src/api/client_instance.cc",
+        "pjrt_implementation/src/api/compile_options.cc",
+        "pjrt_implementation/src/api/compile_options_parser.cc",
+        "pjrt_implementation/src/api/device_description.cc",
+        "pjrt_implementation/src/api/device_instance.cc",
+        "pjrt_implementation/src/api/error_instance.cc",
+        "pjrt_implementation/src/api/event_instance.cc",
+        "pjrt_implementation/src/api/executable_image.cc",
+        "pjrt_implementation/src/api/executable_instance.cc",
+        "pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc",
+        "pjrt_implementation/src/api/loaded_executable_instance.cc",
+        "pjrt_implementation/src/api/memory_instance.cc",
+        "pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc",
+        "pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc",
+        "pjrt_implementation/src/api/module_builder/frontend_passes/shlo_set_proper_sdy_mesh_attribute.cc",
+        "pjrt_implementation/src/api/module_builder/module_builder.cc",
+        "pjrt_implementation/src/api/plugin_attributes.cc",
+        "pjrt_implementation/src/api/serialized_executable_instance.cc",
+        "pjrt_implementation/src/api/so_loaded_executable_instance.cc",
+        "pjrt_implementation/src/api/tensor.cc",
+        "pjrt_implementation/src/api/tensor_pool.cc",
+    ],
+    copts = [
+        "-std=c++20",
+        "-fno-rtti",
+        "-DTTXLA_ENABLE_EMITPY_EXECUTION=0",
+    ],
+    deps = [
+        ":pjrt_headers",
+        ":pjrt_utils",
+        "@com_google_protobuf//:protobuf",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:FuncExtensions",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:MLProgramDialect",
+        "@llvm-project//mlir:MLIRTargetCpp",
+        "@llvm-project//mlir:Parser",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:Support",
+        "@stablehlo//:register",
+        "@stablehlo//:stablehlo_ops",
+        "@stablehlo//:stablehlo_passes",
+        "@tt_mlir_src//:ttmlir_compiler",
+        "@tt_mlir_src//:ttmlir_runtime",
+    ],
+)
+
+cc_library(
+    name = "pjrt_bindings",
+    srcs = [
+        "pjrt_implementation/src/api_bindings.cc",
+        "pjrt_implementation/src/stubs.inc",
+    ],
+    copts = [
+        "-std=c++20",
+        "-fno-rtti",
+    ],
+    deps = [
+        ":pjrt_api",
+        ":pjrt_headers",
+    ],
+)
+
+cc_library(
+    name = "pjrt_plugin",
+    srcs = [
+        "pjrt_implementation/src/dylib_entry_point.cc",
+        "pjrt_implementation/src/dylib_entry_point.cc.inc",
+    ],
+    copts = [
+        "-std=c++20",
+        "-fno-rtti",
+    ],
+    deps = [
+        ":pjrt_bindings",
+    ],
+    alwayslink = True,
+)
+
+filegroup(
+    name = "all_files",
+    srcs = glob(
+        ["**"],
+        exclude = [".git/**"],
+    ),
+)

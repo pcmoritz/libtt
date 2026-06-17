@@ -1,0 +1,57 @@
+diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implementation/src/api/compile_options_parser.cc
+index 7a9f567..c6b4fa7 100644
+--- a/pjrt_implementation/src/api/compile_options_parser.cc
++++ b/pjrt_implementation/src/api/compile_options_parser.cc
+@@ -67,7 +67,7 @@ bool CompileOptionsParser::parseNestedProtobufField(
+     return false;
+   }
+ 
+-  const std::string &data = field.length_delimited();
++  auto data = field.length_delimited();
+   google::protobuf::io::CodedInputStream input(
+       reinterpret_cast<const uint8_t *>(data.data()), data.size());
+ 
+@@ -92,7 +92,7 @@ void CompileOptionsParser::extractDeviceIdsFromComputationDevice(
+     } else if (field.type() ==
+                google::protobuf::UnknownField::TYPE_LENGTH_DELIMITED) {
+       // Packed repeated field
+-      const std::string &packed_data = field.length_delimited();
++      auto packed_data = field.length_delimited();
+       google::protobuf::io::CodedInputStream packed_stream(
+           reinterpret_cast<const uint8_t *>(packed_data.data()),
+           packed_data.size());
+@@ -225,7 +225,7 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+       continue;
+     }
+ 
+-    const std::string &bytes = field.length_delimited();
++    auto bytes = field.length_delimited();
+     google::protobuf::io::CodedInputStream cis(
+         reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size());
+ 
+@@ -248,11 +248,13 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+       if (entry_field.number() == kMapKeyFieldNumber &&
+           entry_field.type() ==
+               google::protobuf::UnknownField::TYPE_LENGTH_DELIMITED) {
+-        key = entry_field.length_delimited();
++        auto key_bytes = entry_field.length_delimited();
++        key.assign(key_bytes.data(), key_bytes.size());
+       } else if (entry_field.number() == kMapValueFieldNumber &&
+                  entry_field.type() ==
+                      google::protobuf::UnknownField::TYPE_LENGTH_DELIMITED) {
+-        const std::string &override_bytes = entry_field.length_delimited();
++        auto override_bytes = entry_field.length_delimited();
+         google::protobuf::io::CodedInputStream override_stream(
+             reinterpret_cast<const uint8_t *>(override_bytes.data()),
+             override_bytes.size());
+@@ -286,7 +288,8 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+         const google::protobuf::UnknownField &value_field =
+             value_fields.field(0);
+         switch (value_field.number()) {
+         case 1: {
+-          value = value_field.length_delimited();
++          auto value_bytes = value_field.length_delimited();
++          value.assign(value_bytes.data(), value_bytes.size());
+           break;
+         }
+         case 2: {

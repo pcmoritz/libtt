@@ -1,0 +1,17 @@
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
+index 7befd8f..f5f5b2d 100644
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/Optimizer.cpp
+@@ -53,9 +53,9 @@ namespace mlir::tt::ttnn {
+ 
+ TTNNOptimizerOptions::TTNNOptimizerOptions(
+     const TTIRToTTNNCommonPipelineOptions &pipelineOptions)
+-    : insertMemReconfig(pipelineOptions.insertMemReconfig),
+-      overrideOutputLayout(pipelineOptions.overrideOutputLayout),
+-      overrideConv2dConfig(pipelineOptions.overrideConv2dConfig),
++    : insertMemReconfig(pipelineOptions.insertMemReconfig.getValue()),
++      overrideOutputLayout(pipelineOptions.overrideOutputLayout.getValue()),
++      overrideConv2dConfig(pipelineOptions.overrideConv2dConfig.getValue()),
+       memoryLayoutAnalysisEnabled(pipelineOptions.memoryLayoutAnalysisEnabled),
+       l1InterleavedFallbackAnalysisEnabled(
+           pipelineOptions.l1InterleavedFallbackAnalysisEnabled),
