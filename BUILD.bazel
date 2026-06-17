@@ -1,6 +1,4 @@
-load("@com_google_protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
-load("@com_google_protobuf//bazel:proto_library.bzl", "proto_library")
-load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library", "cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -9,48 +7,6 @@ exports_files([
     "bazel/cc_embed_data.h.tpl",
     "bazel/libtt_pjrt_exports.lds",
 ])
-
-proto_library(
-    name = "executable_proto",
-    srcs = ["mlir/executable.proto"],
-)
-
-cc_proto_library(
-    name = "executable_cc_proto",
-    deps = [":executable_proto"],
-)
-
-cc_library(
-    name = "mlir_frontend",
-    srcs = [
-        "mlir/mlir_frontend.cc",
-        "mlir/rms_norm_fusing_pattern.cc",
-        "mlir/rope_fusing_pattern.cc",
-        "mlir/sdpa_fusing_pattern.cc",
-    ],
-    hdrs = [
-        "mlir/rms_norm_fusing_pattern.h",
-        "mlir/rope_fusing_pattern.h",
-        "mlir/sdpa_fusing_pattern.h",
-        "mlir/stablehlo_utils.h",
-    ],
-    copts = ["-std=c++17"],
-    deps = [
-        ":executable_cc_proto",
-        "@com_google_protobuf//:protobuf_lite",
-        "@llvm-project//llvm:Support",
-        "@llvm-project//mlir:FuncExtensions",
-        "@llvm-project//mlir:FuncDialect",
-        "@llvm-project//mlir:IR",
-        "@llvm-project//mlir:Parser",
-        "@llvm-project//mlir:Pass",
-        "@llvm-project//mlir:Support",
-        "@llvm-project//mlir:Transforms",
-        "@stablehlo//:stablehlo_ops",
-        "@stablehlo//:stablehlo_serialization",
-        "@stablehlo//:vhlo_ops",
-    ],
-)
 
 cc_library(
     name = "tt_metal_runtime_root",
@@ -69,69 +25,11 @@ cc_library(
 )
 
 cc_library(
-    name = "tt_metal_runtime",
-    srcs = [
-        "cpp/tt_metal_runtime.cc",
-    ],
-    hdrs = [
-        "cpp/tt_metal_runtime.h",
-    ],
-    copts = ["-std=c++20"],
-    deps = [
-        ":tt_metal_runtime_root",
-        ":ttnn_tensor",
-    ],
-    linkstatic = True,
-)
-
-cc_library(
     name = "tt_metal_runtime_auto_setup",
     srcs = ["cpp/tt_metal_runtime_auto_setup.cc"],
     copts = ["-std=c++20"],
     deps = [":tt_metal_runtime_root"],
     alwayslink = True,
-)
-
-cc_library(
-    name = "tt_pjrt",
-    srcs = ["cpp/libtt_pjrt.cc"],
-    hdrs = [
-        "cpp/libtt_pjrt.h",
-        "third_party/openxla/xla/pjrt/c/pjrt_c_api.h",
-    ],
-    copts = ["-std=c++20"],
-    includes = ["third_party/openxla"],
-    deps = [
-        ":executable_cc_proto",
-        ":mlir_frontend",
-        ":tt_metal_runtime",
-        ":tt_pjrt_buffer",
-        "@com_google_protobuf//:protobuf_lite",
-    ],
-    linkstatic = True,
-)
-
-cc_library(
-    name = "tt_pjrt_buffer",
-    srcs = ["cpp/pjrt_buffer.cc"],
-    hdrs = [
-        "cpp/pjrt_buffer.h",
-        "cpp/pjrt_internal.h",
-        "third_party/openxla/xla/pjrt/c/pjrt_c_api.h",
-    ],
-    copts = ["-std=c++20"],
-    includes = ["third_party/openxla"],
-    deps = [":ttnn_tensor"],
-    linkstatic = True,
-)
-
-cc_library(
-    name = "ttnn_tensor",
-    deps = [
-        "//third_party/tt_metal:tt_metal_disabled_fabric_compat",
-        "@tt_metal//:ttnn_tensor_upstream",
-    ],
-    linkstatic = True,
 )
 
 cc_shared_library(
@@ -155,20 +53,6 @@ cc_shared_library(
         ],
         "//conditions:default": [],
     }),
-)
-
-cc_test(
-    name = "tt_pjrt_smoke_test",
-    srcs = ["cpp/libtt_pjrt_test.cc"],
-    copts = ["-std=c++20"],
-    deps = [":tt_pjrt"],
-)
-
-cc_test(
-    name = "ttnn_tensor_test",
-    srcs = ["cpp/ttnn_tensor_test.cc"],
-    copts = ["-std=c++20"],
-    deps = [":ttnn_tensor"],
 )
 
 filegroup(
