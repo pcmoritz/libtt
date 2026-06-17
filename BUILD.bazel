@@ -7,6 +7,7 @@ package(default_visibility = ["//visibility:public"])
 exports_files([
     "bazel/cc_embed_data.S.tpl",
     "bazel/cc_embed_data.h.tpl",
+    "bazel/libtt_pjrt_exports.lds",
 ])
 
 proto_library(
@@ -135,6 +136,10 @@ cc_library(
 
 cc_shared_library(
     name = "tt_shared",
+    additional_linker_inputs = select({
+        "@platforms//os:linux": ["bazel/libtt_pjrt_exports.lds"],
+        "//conditions:default": [],
+    }),
     deps = [
         ":tt_metal_runtime_auto_setup",
         "@tt_xla_src//:pjrt_plugin",
@@ -142,6 +147,13 @@ cc_shared_library(
     shared_lib_name = select({
         "@platforms//os:macos": "libtt.dylib",
         "//conditions:default": "libtt.so",
+    }),
+    user_link_flags = select({
+        "@platforms//os:linux": [
+            "-Wl,--exclude-libs,ALL",
+            "-Wl,--version-script,$(location bazel/libtt_pjrt_exports.lds)",
+        ],
+        "//conditions:default": [],
     }),
 )
 
