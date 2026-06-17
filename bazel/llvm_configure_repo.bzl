@@ -3,10 +3,33 @@
 
 LLVM_TARGETS = [
     "AArch64",
+    "NVPTX",
     "X86",
 ]
 
 MAX_TRAVERSAL_STEPS = 1000000
+
+MLIR_TARGET_CPP_BUILD = """
+
+cc_library(
+    name = "MLIRTargetCpp",
+    srcs = [
+        "lib/Target/Cpp/TranslateRegistration.cpp",
+        "lib/Target/Cpp/TranslateToCpp.cpp",
+    ],
+    hdrs = ["include/mlir/Target/Cpp/CppEmitter.h"],
+    includes = ["include"],
+    deps = [
+        ":ControlFlowDialect",
+        ":EmitCDialect",
+        ":FuncDialect",
+        ":IR",
+        ":Support",
+        ":TranslateLib",
+        "//llvm:Support",
+    ],
+)
+"""
 
 def _overlay_directories(repository_ctx):
     src_root = repository_ctx.path(Label("@llvm-raw//:WORKSPACE")).dirname
@@ -91,6 +114,10 @@ def _targets_bzl(name, values):
 
 def _llvm_configure_impl(repository_ctx):
     _overlay_directories(repository_ctx)
+    repository_ctx.file(
+        "mlir/BUILD.bazel",
+        content = repository_ctx.read("mlir/BUILD.bazel") + MLIR_TARGET_CPP_BUILD,
+    )
 
     vars = _extract_cmake_settings(repository_ctx, "llvm/CMakeLists.txt")
     version = _extract_cmake_settings(repository_ctx, "cmake/Modules/LLVMVersion.cmake")

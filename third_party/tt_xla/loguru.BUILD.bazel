@@ -10,7 +10,9 @@ cc_library(
         "-std=c++17",
         "-Wno-unused-parameter",
     ],
+    include_prefix = "loguru",
     includes = ["."],
+    strip_include_prefix = ".",
 )
 
 filegroup(

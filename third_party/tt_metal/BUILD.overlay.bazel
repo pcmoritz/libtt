@@ -700,7 +700,13 @@ TTNN_RUNTIME_INCLUDE_DIRS = [
     "ttnn/cpp",
     "ttnn/cpp/ttnn",
     "ttnn/cpp/ttnn/operations",
+    "ttnn/cpp/ttnn/operations/ccl",
     "ttnn/cpp/ttnn/operations/data_movement",
+    "ttnn/cpp/ttnn/operations/eltwise",
+    "ttnn/cpp/ttnn/operations/experimental",
+    "ttnn/cpp/ttnn/operations/normalization",
+    "ttnn/cpp/ttnn/operations/reduction",
+    "ttnn/cpp/ttnn/operations/transformer",
 ] + TT_METAL_RUNTIME_INCLUDE_DIRS
 
 TT_METAL_RUNTIME_COPTS = [
@@ -718,6 +724,42 @@ TT_METAL_FLATBUFFER_SRCS = [
     "tt_metal/impl/flatbuffer/base_types_to_flatbuffer.cpp",
     "tt_metal/impl/flatbuffer/buffer_types_to_flatbuffer.cpp",
     "tt_metal/impl/flatbuffer/program_types_to_flatbuffer.cpp",
+]
+
+TTNN_OPERATION_SRC_EXCLUDES = [
+    "ttnn/cpp/ttnn/operations/**/*nanobind*.cpp",
+    "ttnn/cpp/ttnn/operations/**/kernels/**",
+    "ttnn/cpp/ttnn/operations/**/kernels*/**",
+    "ttnn/cpp/ttnn/operations/**/*_kernels/**",
+    "ttnn/cpp/ttnn/operations/**/device/*kernel*/**",
+    "ttnn/cpp/ttnn/operations/**/device/device/**",
+    "ttnn/cpp/ttnn/operations/**/kernel/**",
+    "ttnn/cpp/ttnn/operations/ccl/**",
+    "ttnn/cpp/ttnn/operations/conv/**",
+    "ttnn/cpp/ttnn/operations/examples/**",
+    "ttnn/cpp/ttnn/operations/moreh/**",
+    "ttnn/cpp/ttnn/operations/pool/**",
+    "ttnn/cpp/ttnn/operations/**/test/**",
+    "ttnn/cpp/ttnn/operations/**/tests/**",
+]
+
+TTNN_EXPERIMENTAL_OPERATION_SRCS = [
+    "ttnn/cpp/ttnn/operations/experimental/dropout/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/paged_cache/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/padded_slice/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/reduction/fast_reduce_nc/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/slice_write/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/topk_router_gpt/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/transformer/concatenate_heads/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/transformer/create_qkv_heads/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/transformer/nlp_concat_heads/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/transformer/nlp_concat_heads_decode/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/transformer/nlp_create_qkv_heads/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/transformer/nlp_create_qkv_heads_decode/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/transformer/nlp_create_qkv_heads_falcon7b/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding_llama/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/transformer/split_query_key_value_and_split_heads/**/*.cpp",
 ]
 
 TT_METAL_JIT_BUILD_SRCS = [
@@ -890,6 +932,7 @@ cc_library(
         "tt_metal/distributed/sd_mesh_command_queue.cpp",
         "tt_metal/distributed/shm_resource_tracker.cpp",
         "tt_metal/distributed/system_mesh.cpp",
+        "@//third_party/tt_xla:tt_metal_runtime_cold_stubs.cc",
         ":tt_metal_inspector_stub_source",
         "tt_metal/fabric/fabric_types.cpp",
         "tt_metal/hal.cpp",
@@ -1034,11 +1077,12 @@ cc_library(
 
 cc_library(
     name = "ttnn_tensor_upstream",
-    srcs = [
+    srcs = depset([
         "ttnn/core/async_runtime.cpp",
         "ttnn/core/cluster.cpp",
         "ttnn/core/config.cpp",
         "ttnn/core/core.cpp",
+        "ttnn/core/device.cpp",
         "ttnn/core/device_operation_detail.cpp",
         "ttnn/core/distributed/api.cpp",
         "ttnn/core/distributed/host_ccl.cpp",
@@ -1046,6 +1090,8 @@ cc_library(
         "ttnn/core/global_circular_buffer.cpp",
         "ttnn/core/global_semaphore.cpp",
         "ttnn/core/graph/graph_processor.cpp",
+        "ttnn/core/graph/graph_trace_utils.cpp",
+        "ttnn/core/graph/levelized_graph.cpp",
         "ttnn/core/operation.cpp",
         "ttnn/core/reports.cpp",
         "ttnn/core/tensor/host_buffer/functions.cpp",
@@ -1062,9 +1108,8 @@ cc_library(
         "ttnn/cpp/ttnn/operations/core/to_dtype/to_dtype_op.cpp",
         "ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp",
         "ttnn/cpp/ttnn/operations/core/to_memory_config/to_memory_config_op.cpp",
-        "ttnn/cpp/ttnn/operations/ccl/ccl_op_fusion.cpp",
-        "ttnn/cpp/ttnn/operations/ccl/sharding_addrgen_helper.cpp",
         "ttnn/cpp/ttnn/operations/compute_throttle_utils.cpp",
+        "ttnn/cpp/ttnn/operations/ccl/sharding_addrgen_helper.cpp",
         "ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op.cpp",
         "ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp",
         "ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp",
@@ -1177,6 +1222,7 @@ cc_library(
         "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp",
         "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp",
         "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp",
+        "ttnn/cpp/ttnn/operations/eltwise/quantization/quantization.cpp",
         "ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp",
         "ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp",
         "ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp",
@@ -1196,7 +1242,17 @@ cc_library(
         "ttnn/cpp/ttnn/operations/matmul/device/sparse/factory/sparse_matmul_multicore_reuse_mcast_1d_optimized.cpp",
         "ttnn/cpp/ttnn/operations/matmul/device/sparse/sparse_matmul_device_operation.cpp",
         "ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.cpp",
-    ],
+        "ttnn/cpp/ttnn/operations/moreh/moreh_helper_functions.cpp",
+        "@//third_party/tt_xla:tt_metal_cold_stubs.cc",
+    ] + glob(
+        ["ttnn/cpp/ttnn/operations/**/*.cpp"],
+        exclude = TTNN_OPERATION_SRC_EXCLUDES + [
+            "ttnn/cpp/ttnn/operations/experimental/**",
+        ],
+    ) + glob(
+        TTNN_EXPERIMENTAL_OPERATION_SRCS,
+        exclude = TTNN_OPERATION_SRC_EXCLUDES,
+    )).to_list(),
     hdrs = TTNN_RUNTIME_HDRS,
     copts = TT_METAL_RUNTIME_COPTS,
     includes = TTNN_RUNTIME_INCLUDE_DIRS,

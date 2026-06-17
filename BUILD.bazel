@@ -52,14 +52,50 @@ cc_library(
 )
 
 cc_library(
-    name = "tt_pjrt",
+    name = "tt_metal_runtime_root",
     srcs = [
-        "cpp/libtt_pjrt.cc",
+        "cpp/tt_metal_runtime_root.cc",
+    ],
+    hdrs = [
+        "cpp/tt_metal_runtime_root.h",
+    ],
+    copts = ["-std=c++20"],
+    deps = [
+        "@tt_metal//:tt_metal_runtime_embedded",
+        "@libarchive//:archive",
+    ],
+    linkstatic = True,
+)
+
+cc_library(
+    name = "tt_metal_runtime",
+    srcs = [
         "cpp/tt_metal_runtime.cc",
     ],
     hdrs = [
-        "cpp/libtt_pjrt.h",
         "cpp/tt_metal_runtime.h",
+    ],
+    copts = ["-std=c++20"],
+    deps = [
+        ":tt_metal_runtime_root",
+        ":ttnn_tensor",
+    ],
+    linkstatic = True,
+)
+
+cc_library(
+    name = "tt_metal_runtime_auto_setup",
+    srcs = ["cpp/tt_metal_runtime_auto_setup.cc"],
+    copts = ["-std=c++20"],
+    deps = [":tt_metal_runtime_root"],
+    alwayslink = True,
+)
+
+cc_library(
+    name = "tt_pjrt",
+    srcs = ["cpp/libtt_pjrt.cc"],
+    hdrs = [
+        "cpp/libtt_pjrt.h",
         "third_party/openxla/xla/pjrt/c/pjrt_c_api.h",
     ],
     copts = ["-std=c++20"],
@@ -67,11 +103,9 @@ cc_library(
     deps = [
         ":executable_cc_proto",
         ":mlir_frontend",
+        ":tt_metal_runtime",
         ":tt_pjrt_buffer",
-        ":ttnn_tensor",
-        "@tt_metal//:tt_metal_runtime_embedded",
         "@com_google_protobuf//:protobuf_lite",
-        "@libarchive//:archive",
     ],
     linkstatic = True,
 )
@@ -102,7 +136,8 @@ cc_library(
 cc_shared_library(
     name = "tt_shared",
     deps = [
-        ":tt_pjrt",
+        ":tt_metal_runtime_auto_setup",
+        "@tt_xla_src//:pjrt_plugin",
     ],
     shared_lib_name = select({
         "@platforms//os:macos": "libtt.dylib",

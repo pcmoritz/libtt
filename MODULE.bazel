@@ -238,6 +238,8 @@ git_repository(
     name = "tt_xla_src",
     build_file = "//third_party/tt_xla:tt_xla.BUILD.bazel",
     commit = "5d20786bd2ae86d4326d4092cd92f7c9580d5733",
+    patch_args = ["-p1"],
+    patches = ["//third_party/tt_xla:tt_xla_protobuf_string_view.patch"],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
 
@@ -245,7 +247,31 @@ git_repository(
     name = "tt_mlir_src",
     build_file = "//third_party/tt_xla:tt_mlir.BUILD.bazel",
     commit = "464a5f341908d5a3f790e697be5ffa6fd3fb6f32",
+    patch_args = ["-p1"],
+    patches = [
+        "//third_party/tt_xla:tt_mlir_string_map_include.patch",
+        "//third_party/tt_xla:tt_mlir_pass_option_values.patch",
+        "//third_party/tt_xla:tt_mlir_op_model_dependent_static_assert.patch",
+        "//third_party/tt_xla:tt_mlir_ttir_to_d2m_constructor_names.patch",
+        "//third_party/tt_xla:tt_mlir_d2m_apply_map_values.patch",
+        "//third_party/tt_xla:tt_mlir_affine_passes_include.patch",
+        "//third_party/tt_xla:tt_mlir_mock_device_include.patch",
+        "//third_party/tt_xla:tt_mlir_tt_metal_api_compat.patch",
+        "//third_party/tt_xla:tt_mlir_ttnn_only_register_all.patch",
+        "//third_party/tt_xla:tt_mlir_ttnn_only_runtime_paths.patch",
+    ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
+)
+
+git_repository(
+    name = "shardy",
+    commit = "edfd6730ddfc39da5fbea8b6b202357fdf1cdb90",
+    patch_args = ["-p1"],
+    patches = [
+        "//third_party/tt_xla:shardy_bazel8.patch",
+        "//third_party/tt_xla:shardy_td_includes.patch",
+    ],
+    remote = "https://github.com/openxla/shardy.git",
 )
 
 git_repository(

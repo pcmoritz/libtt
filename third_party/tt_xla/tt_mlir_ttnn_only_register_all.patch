@@ -1,0 +1,31 @@
+diff --git a/lib/RegisterAll.cpp b/lib/RegisterAll.cpp
+index b7a1b6a..7f03c79 100644
+--- a/lib/RegisterAll.cpp
++++ b/lib/RegisterAll.cpp
+@@ -10,7 +10,6 @@
+ #include "ttmlir/Dialect/D2M/IR/D2M.h"
+ #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
+ #include "ttmlir/Dialect/Debug/IR/Debug.h"
+-#include "ttmlir/Dialect/EmitPy/IR/EmitPy.h"
+ #include "ttmlir/Dialect/LLVM/Transforms/Passes.h"
+ #include "ttmlir/Dialect/SFPI/IR/SFPI.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
+@@ -98,7 +97,7 @@ void mlir::tt::registerAllDialects(mlir::DialectRegistry &registry) {
+       mlir::tosa::TosaDialect, mlir::vector::VectorDialect,
+       mlir::memref::MemRefDialect, mlir::emitc::EmitCDialect,
+       mlir::bufferization::BufferizationDialect, mlir::LLVM::LLVMDialect,
+-      mlir::quant::QuantDialect, mlir::tt::emitpy::EmitPyDialect,
++      mlir::quant::QuantDialect,
+       mlir::tt::debug::DebugDialect, mlir::pdl::PDLDialect,
+       mlir::pdl_interp::PDLInterpDialect>();
+ 
+@@ -142,9 +141,6 @@ void mlir::tt::registerAllExtensions(mlir::DialectRegistry &registry) {
+ }
+ 
+ void mlir::tt::registerAllPasses() {
+-  // Register all dialect conversion passes.
+-  mlir::tt::registerTTMLIRConversionPasses();
+-
+   // Registering -remove-dead-values built-in mlir pass to optimize out the
+   // unused OPs/operands after conversion.
+   mlir::registerPass(mlir::createRemoveDeadValuesPass);

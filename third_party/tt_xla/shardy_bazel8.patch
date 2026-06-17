@@ -1,0 +1,162 @@
+diff --git a/shardy/common/BUILD b/shardy/common/BUILD
+index 1cb01861..5bb371fa 100644
+--- a/shardy/common/BUILD
++++ b/shardy/common/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ package(default_visibility = ["//visibility:public"])
+ 
+ cc_library(
+diff --git a/shardy/dialect/mpmd/ir/BUILD b/shardy/dialect/mpmd/ir/BUILD
+index 69f29f27..fece5dd8 100644
+--- a/shardy/dialect/mpmd/ir/BUILD
++++ b/shardy/dialect/mpmd/ir/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The MPMD MLIR dialect.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/mpmd/transforms/BUILD b/shardy/dialect/mpmd/transforms/BUILD
+index 750ca00c..86b13ea2 100644
+--- a/shardy/dialect/mpmd/transforms/BUILD
++++ b/shardy/dialect/mpmd/transforms/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The MPMD dialect passes and pipelines.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/mpmd/transforms/common/BUILD b/shardy/dialect/mpmd/transforms/common/BUILD
+index a2b2e228..32138186 100644
+--- a/shardy/dialect/mpmd/transforms/common/BUILD
++++ b/shardy/dialect/mpmd/transforms/common/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The MPMD common library and passes.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/mpmd/transforms/export/BUILD b/shardy/dialect/mpmd/transforms/export/BUILD
+index 86f3e7f0..9c35b211 100644
+--- a/shardy/dialect/mpmd/transforms/export/BUILD
++++ b/shardy/dialect/mpmd/transforms/export/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The MPMD export passes and pipeline.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/mpmd/transforms/import/BUILD b/shardy/dialect/mpmd/transforms/import/BUILD
+index e0fae3da..bedc037d 100644
+--- a/shardy/dialect/mpmd/transforms/import/BUILD
++++ b/shardy/dialect/mpmd/transforms/import/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The MPMD import passes and pipeline.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/mpmd/transforms/optimize/BUILD b/shardy/dialect/mpmd/transforms/optimize/BUILD
+index a51c2f0d..aa1024b4 100644
+--- a/shardy/dialect/mpmd/transforms/optimize/BUILD
++++ b/shardy/dialect/mpmd/transforms/optimize/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The MPMD optimize passes and pipeline.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/mpmd/transforms/sharding_propagation/BUILD b/shardy/dialect/mpmd/transforms/sharding_propagation/BUILD
+index a9086ad0..47c2834c 100644
+--- a/shardy/dialect/mpmd/transforms/sharding_propagation/BUILD
++++ b/shardy/dialect/mpmd/transforms/sharding_propagation/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The MPMD sharding propagation passes and pipeline.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/sdy/ir/BUILD b/shardy/dialect/sdy/ir/BUILD
+index ce57a60a..b60148b4 100644
+--- a/shardy/dialect/sdy/ir/BUILD
++++ b/shardy/dialect/sdy/ir/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The SDY MLIR dialect.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/sdy/transforms/BUILD b/shardy/dialect/sdy/transforms/BUILD
+index 0fe29203..de45ab4c 100644
+--- a/shardy/dialect/sdy/transforms/BUILD
++++ b/shardy/dialect/sdy/transforms/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The SDY dialect passes and pipelines.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/sdy/transforms/common/BUILD b/shardy/dialect/sdy/transforms/common/BUILD
+index fffdd08c..806e36d9 100644
+--- a/shardy/dialect/sdy/transforms/common/BUILD
++++ b/shardy/dialect/sdy/transforms/common/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The SDY transformations common library.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/sdy/transforms/export/BUILD b/shardy/dialect/sdy/transforms/export/BUILD
+index be00f893..7378ede7 100644
+--- a/shardy/dialect/sdy/transforms/export/BUILD
++++ b/shardy/dialect/sdy/transforms/export/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The SDY export passes and pipeline.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/sdy/transforms/import/BUILD b/shardy/dialect/sdy/transforms/import/BUILD
+index e6637e95..b1e54950 100644
+--- a/shardy/dialect/sdy/transforms/import/BUILD
++++ b/shardy/dialect/sdy/transforms/import/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The SDY import passes and pipeline.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/sdy/transforms/propagation/BUILD b/shardy/dialect/sdy/transforms/propagation/BUILD
+index d22060bc..92459262 100644
+--- a/shardy/dialect/sdy/transforms/propagation/BUILD
++++ b/shardy/dialect/sdy/transforms/propagation/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # The SDY sharding propagation system.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/dialect/sdy/transforms/propagation/debugging/BUILD b/shardy/dialect/sdy/transforms/propagation/debugging/BUILD
+index 1aa83444..1077774e 100644
+--- a/shardy/dialect/sdy/transforms/propagation/debugging/BUILD
++++ b/shardy/dialect/sdy/transforms/propagation/debugging/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # Systems to debug SDY propagation.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/integrations/c/BUILD b/shardy/integrations/c/BUILD
+index 3c2817f8..c2f7c96d 100644
+--- a/shardy/integrations/c/BUILD
++++ b/shardy/integrations/c/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # SDY C APIs.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/integrations/c/mpmd/BUILD b/shardy/integrations/c/mpmd/BUILD
+index a8671336..5a6a3ece 100644
+--- a/shardy/integrations/c/mpmd/BUILD
++++ b/shardy/integrations/c/mpmd/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # MPMD C APIs.
+ 
+ # load("@rules_cc//cc:cc_library.bzl", "cc_library")
+diff --git a/shardy/tools/BUILD b/shardy/tools/BUILD
+index 8ce3b632..c57ffea2 100644
+--- a/shardy/tools/BUILD
++++ b/shardy/tools/BUILD
+@@ -1,3 +1,4 @@
++load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+ # Shardy tools.
+ 
+ # load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
