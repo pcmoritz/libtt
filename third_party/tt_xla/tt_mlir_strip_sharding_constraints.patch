@@ -1,0 +1,51 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp
+index d6fde98..0edc62c 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp
+@@ -23,6 +23,7 @@
+ #include "mlir/Transforms/DialectConversion.h"
+ #include "shardy/dialect/sdy/ir/dialect.h"
+ #include "stablehlo/dialect/StablehloOps.h"
++#include "llvm/ADT/SmallVector.h"
+ 
+ using namespace mlir;
+ using namespace mlir::tt;
+@@ -36,4 +37,29 @@ namespace mlir::tt::ttir {
+ namespace {
++void stripShardingMarkers(Operation *op) {
++  llvm::SmallVector<mlir::sdy::ShardingConstraintOp> constraints;
++  op->walk([&](mlir::sdy::ShardingConstraintOp constraint) {
++    constraints.push_back(constraint);
++  });
++
++  for (mlir::sdy::ShardingConstraintOp constraint : constraints) {
++    constraint.replaceAllUsesWith(constraint.getInput());
++    constraint.erase();
++  }
++
++  llvm::SmallVector<mlir::stablehlo::CustomCallOp> customCalls;
++  op->walk([&](mlir::stablehlo::CustomCallOp customCall) {
++    if (customCall.getCallTargetName() == "Sharding" &&
++        customCall->getNumOperands() == 1 && customCall->getNumResults() == 1) {
++      customCalls.push_back(customCall);
++    }
++  });
++
++  for (mlir::stablehlo::CustomCallOp customCall : customCalls) {
++    customCall.getResult(0).replaceAllUsesWith(customCall.getOperand(0));
++    customCall.erase();
++  }
++}
++
+ struct ConvertStableHLOToTTIRPass
+     : public ttir::impl::ConvertStableHLOToTTIRBase<
+           ConvertStableHLOToTTIRPass> {
+@@ -43,6 +69,8 @@ struct ConvertStableHLOToTTIRPass
+       : Base(options) {}
+ 
+   void runOnOperation() final {
++    stripShardingMarkers(getOperation());
++
+     mlir::ConversionTarget target(getContext());
+ 
+     // Common legal/illegal ops/dialects for both partial and full conversion.

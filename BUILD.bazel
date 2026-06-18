@@ -32,6 +32,20 @@ cc_library(
     alwayslink = True,
 )
 
+cc_library(
+    name = "tt_xla_pjrt_plugin",
+    srcs = ["cpp/tt_xla_pjrt_entrypoint.cc"],
+    copts = [
+        "-std=c++20",
+        "-fno-rtti",
+    ],
+    deps = [
+        "@tt_xla_src//:pjrt_bindings",
+        "@tt_xla_src//:pjrt_headers",
+    ],
+    alwayslink = True,
+)
+
 cc_shared_library(
     name = "tt_shared",
     additional_linker_inputs = select({
@@ -40,7 +54,7 @@ cc_shared_library(
     }),
     deps = [
         ":tt_metal_runtime_auto_setup",
-        "@tt_xla_src//:pjrt_plugin",
+        ":tt_xla_pjrt_plugin",
     ],
     shared_lib_name = select({
         "@platforms//os:macos": "libtt.dylib",
