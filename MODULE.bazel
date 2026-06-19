@@ -242,6 +242,7 @@ git_repository(
     patches = [
         "//third_party/tt_xla:tt_xla_protobuf_string_view.patch",
         "//third_party/tt_xla:tt_xla_disable_cpu_const_eval.patch",
+        "//third_party/tt_xla:tt_xla_disable_trace_global_fp32_acc.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )

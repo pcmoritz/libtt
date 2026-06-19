@@ -2,6 +2,11 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 
 package(default_visibility = ["//visibility:public"])
 
+filegroup(
+    name = "cluster_descriptor_examples",
+    srcs = glob(["tests/cluster_descriptor_examples/*.yaml"]),
+)
+
 genrule(
     name = "simulation_chip_path_stub",
     outs = ["simulation_chip_path_stub.cpp"],

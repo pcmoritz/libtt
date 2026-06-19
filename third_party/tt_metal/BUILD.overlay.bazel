@@ -258,6 +258,7 @@ pkg_tar(
     deps = [":blackhole_runtime_obj_tar"],
     srcs = [
         "@sfpi//:all_files",
+        "@tt_umd//:cluster_descriptor_examples",
         ":tt_metal_blackhole_runtime_hw_assets",
         ":tt_metal_runtime_sources",
     ],
@@ -272,10 +273,14 @@ pkg_tar(
         "../sfpi/": "runtime/sfpi/",
         "../+http_archive+tt_metal/": "",
         "../tt_metal/": "",
+        "../+http_archive+tt_umd/tests/cluster_descriptor_examples/": "tt_metal/third_party/umd/tests/cluster_descriptor_examples/",
+        "../tt_umd/tests/cluster_descriptor_examples/": "tt_metal/third_party/umd/tests/cluster_descriptor_examples/",
         "external/+http_archive+sfpi/": "runtime/sfpi/",
         "external/sfpi/": "runtime/sfpi/",
         "external/+http_archive+tt_metal/": "",
         "external/tt_metal/": "",
+        "external/+http_archive+tt_umd/tests/cluster_descriptor_examples/": "tt_metal/third_party/umd/tests/cluster_descriptor_examples/",
+        "external/tt_umd/tests/cluster_descriptor_examples/": "tt_metal/third_party/umd/tests/cluster_descriptor_examples/",
     },
     strip_prefix = ".",
 )
