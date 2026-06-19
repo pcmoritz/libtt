@@ -263,7 +263,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_tt_metal_api_compat.patch",
         "//third_party/tt_xla:tt_mlir_ttnn_only_register_all.patch",
         "//third_party/tt_xla:tt_mlir_ttnn_only_runtime_paths.patch",
-        "//third_party/tt_xla:tt_mlir_plain_sharding_identity.patch",
         "//third_party/tt_xla:tt_mlir_strip_sharding_constraints.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
