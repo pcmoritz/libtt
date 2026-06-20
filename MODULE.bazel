@@ -106,6 +106,13 @@ http_archive(
 http_archive(
     name = "tracy",
     build_file = "//third_party/tracy:BUILD.overlay.bazel",
+    patches = [
+        "//third_party/tracy:alloc_srcloc_color_header.patch",
+        "//third_party/tracy:alloc_srcloc_color_source.patch",
+        "//third_party/tracy:no_rpmalloc_define.patch",
+    ],
+    patch_args = ["-p0"],
+    patch_tool = "patch",
     sha256 = "38b5528479e0cfff7acd5d91fa276b93ab350e92c17a6df4767583f28aadc073",
     strip_prefix = "tracy-4963ee0ec2b732337b84011d72aedd70e5b660e4",
     urls = [
@@ -178,9 +185,15 @@ http_archive(
         "//third_party/tt_metal:disable_fabric_mesh_device.patch",
         "//third_party/tt_metal:disable_fabric_system_mesh.patch",
         "//third_party/tt_metal:disable_fabric_profiler.patch",
+        "//third_party/tt_metal:skip_mock_device_profiler.patch",
+        "//third_party/tt_metal:profiler_metadata_provider.patch",
+        "//third_party/tt_metal:profiler_metadata_mesh_fallback.patch",
         "//third_party/tt_metal:disable_fabric_rtoptions.patch",
         "//third_party/tt_metal:disable_inspector_runtime.patch",
+        "//third_party/tt_metal:noc_debugging_remove_vendored_umd_include.patch",
     ],
+    patch_args = ["-p0"],
+    patch_tool = "patch",
     sha256 = "4dbd5bedffb6e9c40a2dfc18bcb9774f5a93dfbeacc318fb36e78fea957b1459",
     strip_prefix = "tt-metal-2fb3ce2ca9703bb456701ebe6dddd91b2584989e",
     urls = [
@@ -265,6 +278,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_ttnn_only_register_all.patch",
         "//third_party/tt_xla:tt_mlir_ttnn_only_runtime_paths.patch",
         "//third_party/tt_xla:tt_mlir_strip_sharding_constraints.patch",
+        "//third_party/tt_xla:tt_mlir_allow_tilize_reshard.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

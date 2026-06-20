@@ -1,0 +1,70 @@
+diff --git a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp b/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
+index 9e3d30cc..6e16628f 100644
+--- a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
++++ b/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
+@@ -642,10 +642,15 @@ bool MemoryLayoutPropagation::validateReshard(
+     Operation *consumerOp, llvm::ArrayRef<int64_t> inputShape,
+     TTNNLayoutAttr producerOutputLayout, TTNNLayoutAttr reshardLayout) {
+   if (producerOutputLayout.isTiled() != reshardLayout.isTiled()) {
+-    // Reject reshards that change tiling.
+-    return false;
++    auto result = op_constraint_validation::validateOperation<ToLayoutOp>(
++        consumerOp, /*additionalL1Usage=*/0, inputShape, producerOutputLayout,
++        /*outputDtype=*/std::nullopt, reshardLayout);
++    bool valid = result.isSuccess();
++    TTMLIR_TRACE(ttmlir::LogComponent::GreedyOptimizer,
++                 "  validateReshard(to_layout): {0} -> {1}: {2}",
++                 producerOutputLayout, reshardLayout, valid ? "OK" : "FAILED");
++    return valid;
+   }
+-
+   auto result = op_constraint_validation::validateOperation<ToMemoryConfigOp>(
+       consumerOp, /*additionalL1Usage=*/0, inputShape, producerOutputLayout,
+       reshardLayout);
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+index 5c65e414..f7cc958c 100644
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -4311,6 +4311,10 @@ llvm::Expected<OpConstraints> OpModel<LinearOp>::getOpConstraints(
+     std::optional<DeviceComputeKernelConfigAttr> computeKernelConfig) {
+ #ifdef TTMLIR_ENABLE_OPMODEL
++  if (!inputLayoutA.isTiled() || !inputLayoutB.isTiled()) {
++    return llvm::createStringError("linear op model requires tiled inputs");
++  }
++
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -4371,6 +4375,10 @@ llvm::Expected<size_t> OpModel<LinearOp>::getOpRuntime(
+     std::optional<TTNNLayoutAttr> biasLayout, TTNNLayoutAttr outputLayout,
+     bool transposeA, bool transposeB) {
+ #ifdef TTMLIR_ENABLE_OPMODEL
++  if (!inputLayoutA.isTiled() || !inputLayoutB.isTiled()) {
++    return llvm::createStringError("linear op model requires tiled inputs");
++  }
++
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -4425,6 +4433,10 @@ llvm::Expected<OpConstraints> OpModel<MatmulOp>::getOpConstraints(
+     std::optional<mlir::Attribute> programConfigAttr,
+     std::optional<DeviceComputeKernelConfigAttr> computeKernelConfig) {
+ #ifdef TTMLIR_ENABLE_OPMODEL
++  if (!inputLayoutA.isTiled() || !inputLayoutB.isTiled()) {
++    return llvm::createStringError("matmul op model requires tiled inputs");
++  }
++
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -4478,6 +4490,10 @@ llvm::Expected<size_t> OpModel<MatmulOp>::getOpRuntime(
+     llvm::ArrayRef<int64_t> inputShapeB, TTNNLayoutAttr inputLayoutB,
+     TTNNLayoutAttr outputLayout, bool transposeA, bool transposeB) {
+ #ifdef TTMLIR_ENABLE_OPMODEL
++  if (!inputLayoutA.isTiled() || !inputLayoutB.isTiled()) {
++    return llvm::createStringError("matmul op model requires tiled inputs");
++  }
++
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 

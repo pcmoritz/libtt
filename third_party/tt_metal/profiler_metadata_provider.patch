@@ -1,0 +1,253 @@
+--- tt_metal/api/tt-metalium/tt_metal_profiler.hpp
++++ tt_metal/api/tt-metalium/tt_metal_profiler.hpp
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <functional>
+ #include <optional>
+ #include <tt-metalium/profiler_types.hpp>
+ #include <tt-metalium/profiler_optional_metadata.hpp>
+@@ -69,6 +70,20 @@
+     ProfilerReadState = ProfilerReadState::NORMAL,
+     const std::optional<ProfilerOptionalMetadata>& metadata = {});
+ 
++using ProfilerOptionalMetadataProvider = std::function<std::optional<ProfilerOptionalMetadata>()>;
++
++/**
++ * Register a callback that supplies optional metadata for automatic profiler reads.
++ *
++ * TT-metal owns mid-run and shutdown profiler readout, but higher layers such as
++ * TTNN own mappings from runtime program IDs to user-facing operation names. The
++ * provider keeps that dependency one-way: TT-metal asks for metadata when it
++ * dumps profiler results without depending directly on TTNN.
++ */
++void SetProfilerOptionalMetadataProvider(ProfilerOptionalMetadataProvider provider);
++
++std::optional<ProfilerOptionalMetadata> GetProfilerOptionalMetadata();
++
+ /**
+  * Set the directory for device-side CSV logs produced by the profiler instance in the tt-metal module
+  *
+--- tt_metal/impl/device/firmware/profiler_initializer.cpp
++++ tt_metal/impl/device/firmware/profiler_initializer.cpp
+@@ -88,7 +88,10 @@
+         // Read profiler results from dispatch cores
+         for (auto* dev : devices_) {
+             TT_ASSERT(dev != nullptr, "Device is nullptr");
+-            detail::ReadDeviceProfilerResults(static_cast<IDevice*>(dev), ProfilerReadState::ONLY_DISPATCH_CORES);
++            detail::ReadDeviceProfilerResults(
++                static_cast<IDevice*>(dev),
++                ProfilerReadState::ONLY_DISPATCH_CORES,
++                detail::GetProfilerOptionalMetadata());
+         }
+ 
+         detail::ProfilerSync(ProfilerSyncState::CLOSE_DEVICE);
+--- tt_metal/impl/host_api/tt_metal.cpp
++++ tt_metal/impl/host_api/tt_metal.cpp
+@@ -918,15 +918,15 @@
+     }  // Profiler scope end
+     if (wait_until_cores_done) {
+-        detail::ReadDeviceProfilerResults(device);
++        detail::ReadDeviceProfilerResults(device, ProfilerReadState::NORMAL, detail::GetProfilerOptionalMetadata());
+     }
+ }
+ 
+ void WaitProgramDone(IDevice* device, Program& program, bool read_device_profiler_results) {
+     auto device_id = device->id();
+     std::vector<std::vector<CoreCoord>> logical_cores_used_in_program = program.impl().logical_cores();
+     llrt::internal_::wait_for_idle(device_id, logical_cores_used_in_program);
+     if (read_device_profiler_results) {
+-        detail::ReadDeviceProfilerResults(device);
++        detail::ReadDeviceProfilerResults(device, ProfilerReadState::NORMAL, detail::GetProfilerOptionalMetadata());
+     }
+ }
+ 
+--- tt_metal/impl/profiler/profiler_state_manager.cpp
++++ tt_metal/impl/profiler/profiler_state_manager.cpp
+@@ -7,6 +7,7 @@
+ #include <thread>
+ #include <vector>
+ #include "profiler_state_manager.hpp"
++#include <tt_metal_profiler.hpp>
+ #include <tt_stl/assert.hpp>
+ #include "hostdevcommon/profiler_common.h"
+ #include "context/metal_context.hpp"
+@@ -202,13 +203,14 @@
+                         profiler.pollDebugDumpResults(
+                             device, virtual_cores_map.at(device->id()), /*is_final_poll=*/true);
+                     }
++                    const auto metadata = detail::GetProfilerOptionalMetadata();
+                     constexpr auto state = ProfilerReadState::LAST_FD_READ;
+                     detail::ReadDeviceProfilerResultsInternal(
+                         device->get_mesh_device().get(),
+                         device,
+                         virtual_cores_map.at(device->id()),
+                         state,
+-                        {},
++                        metadata,
+                         was_force_read);
+ 
+                     auto profiler_it = this->device_profiler_map.find(device->id());
+@@ -220,10 +222,10 @@
+                             virtual_cores_map.at(device->id()),
+                             state,
+                             ProfilerDataBufferSource::DRAM_AND_L1,
+-                            {});
++                            metadata);
+                     } else {
+                         profiler.processResults(
+-                            device, virtual_cores_map.at(device->id()), state, ProfilerDataBufferSource::DRAM, {});
++                            device, virtual_cores_map.at(device->id()), state, ProfilerDataBufferSource::DRAM, metadata);
+                     }
+                    // cleanup_device_profilers() handles the final dump
+                }
+--- tt_metal/impl/profiler/tt_metal_profiler.cpp
++++ tt_metal/impl/profiler/tt_metal_profiler.cpp
+@@ -23,6 +23,7 @@
+ #include <optional>
+ #include <ostream>
+ #include <set>
++#include <mutex>
+ #include <string>
+ #include <string_view>
+ #include <thread>
+@@ -73,6 +74,25 @@
+ 
+ namespace detail {
+ 
++namespace {
++std::mutex profiler_optional_metadata_provider_mutex;
++ProfilerOptionalMetadataProvider profiler_optional_metadata_provider;
++}  // namespace
++
++void SetProfilerOptionalMetadataProvider(ProfilerOptionalMetadataProvider provider) {
++    std::scoped_lock<std::mutex> lock(profiler_optional_metadata_provider_mutex);
++    profiler_optional_metadata_provider = std::move(provider);
++}
++
++std::optional<ProfilerOptionalMetadata> GetProfilerOptionalMetadata() {
++    ProfilerOptionalMetadataProvider provider;
++    {
++        std::scoped_lock<std::mutex> lock(profiler_optional_metadata_provider_mutex);
++        provider = profiler_optional_metadata_provider;
++    }
++    return provider ? provider() : std::optional<ProfilerOptionalMetadata>{};
++}
++
+ void setControlBuffer(
+     distributed::MeshDevice* mesh_device,
+     IDevice* device,
+--- ttnn/cpp/tools/profiler/op_profiler_json.cpp
++++ ttnn/cpp/tools/profiler/op_profiler_json.cpp
+@@ -8,10 +8,13 @@
+ 
+ #include "tools/profiler/op_profiler_serialize.hpp"
+ 
++#include <mutex>
+ #include <nlohmann/json.hpp>
+ #include <set>
+ #include <string_view>
+ #include <unordered_set>
++#include <tt-metalium/profiler_optional_metadata.hpp>
++#include <tt-metalium/tt_metal_profiler.hpp>
+ #include <tt-metalium/tt_metal.hpp>
+ #include "ttnn/operation.hpp"
+ #include <enchantum/enchantum.hpp>
+@@ -27,6 +30,15 @@
+ 
+ #if defined(TRACY_ENABLE)
+ 
++void ensure_profiler_metadata_provider_registered() {
++    static std::once_flag register_once;
++    std::call_once(register_once, [] {
++        tt::tt_metal::detail::SetProfilerOptionalMetadataProvider([]() -> std::optional<ProfilerOptionalMetadata> {
++            return ProfilerOptionalMetadata(runtime_id_to_opname_.export_map());
++        });
++    });
++}
++
+ static json tensor_meta_to_json(const TensorMeta& m) {
+     json ret;
+     if (m.is_device) {
+@@ -156,6 +168,11 @@
+     j["program_cache_hit"] = program_cache_hit;
+     j["kernel_info"] = get_kernels_json(device_id, program);
+ 
++    ensure_profiler_metadata_provider_registered();
++
+     auto opname = j["op_code"].template get<std::string>();
+     runtime_id_to_opname_.insert({device_id, program.get_runtime_id()}, opname);
++    runtime_id_to_opname_.insert(
++        {device_id, tt::tt_metal::detail::EncodePerDeviceProgramID(program.get_runtime_id(), device_id, false)},
++        opname);
+     program_hash_to_opname_.insert({device_id, program_hash}, opname);
+--- ttnn/api/tools/profiler/op_profiler_serialize.hpp
++++ ttnn/api/tools/profiler/op_profiler_serialize.hpp
+@@ -78,6 +78,8 @@
+     bool program_cache_hit,
+     const tt::tt_metal::Program& program);
+ 
++void ensure_profiler_metadata_provider_registered();
++
+ #if defined(TRACY_ENABLE)
+ 
+ class thread_safe_cached_ops_map {
+@@ -160,7 +162,7 @@
+     }
+     void insert(KeyType key, std::string opname) {
+         std::scoped_lock<std::mutex> lock(map_mutex);
+-        map.emplace(key, std::move(opname));
++        map[std::move(key)] = std::move(opname);
+     }
+     MapType export_map() {
+         // thread-safe copy of internal map contents
+@@ -188,7 +190,7 @@
+     }
+     void insert(const KeyType& key, std::string opname) {
+         std::scoped_lock<std::mutex> lock(map_mutex);
+-        map.emplace(key, std::move(opname));
++        map[key] = std::move(opname);
+     }
+ 
+ private:
+@@ -267,6 +269,7 @@
+     const char* op_profiler_enable_str = std::getenv("TTNN_OP_PROFILER");
+     if (op_profiler_enable_str != nullptr && op_profiler_enable_str[0] == '1') {
+         op_profiler_is_enabled = true;
++        ensure_profiler_metadata_provider_registered();
+     }
+     return op_profiler_is_enabled;
+ }
+@@ -397,7 +400,10 @@
+     }
+ 
+     // --- Cache hit: fast path, no JSON needed ---
+     auto opname = program_hash_to_opname_.find_if_exists({device_id, program_hash});
+-    runtime_id_to_opname_.insert({device_id, program.get_runtime_id()}, std::move(opname));
++    runtime_id_to_opname_.insert({device_id, program.get_runtime_id()}, opname);
++    runtime_id_to_opname_.insert(
++        {device_id, tt::tt_metal::detail::EncodePerDeviceProgramID(program.get_runtime_id(), device_id, false)},
++        std::move(opname));
+     return fmt::format("{}{}`", cached_ops.at(device_id).at(program_hash), operation_id);
+ }
+--- ttnn/api/ttnn/device_operation.hpp
++++ ttnn/api/ttnn/device_operation.hpp
+@@ -204,8 +204,6 @@
+         return;
+     }
+ 
+-    tt::tt_metal::distributed::EnqueueMeshWorkload(mesh_device->mesh_command_queue(), workload, false);
+-
+     TracyOpMeshWorkload(
+         mesh_device,
+         workload,
+@@ -216,6 +214,8 @@
+         tensor_args,
+         tensor_return_value,
+         program_cache_hit);
++
++    tt::tt_metal::distributed::EnqueueMeshWorkload(mesh_device->mesh_command_queue(), workload, false);
+ }
+ 
+ // Dispatches `fn` to `program_factory` through either the `MeshWorkloadFactoryConcept` directly, or through the adapted

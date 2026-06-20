@@ -1,0 +1,16 @@
+--- tt_metal/impl/profiler/tt_metal_profiler.cpp
++++ tt_metal/impl/profiler/tt_metal_profiler.cpp
+@@ -1185,10 +1185,11 @@
+         const std::vector<CoreCoord> virtual_cores = detail::getVirtualCoresForProfiling(device, state);
+         detail::ReadDeviceProfilerResults(&mesh_device, device, virtual_cores, state, metadata);
+     }
+ 
++    const auto metadata_for_process = metadata.has_value() ? metadata : detail::GetProfilerOptionalMetadata();
+     for (IDevice* device : mesh_device.get_devices()) {
+-        mesh_device.enqueue_to_thread_pool([device, state, &metadata]() {
++        mesh_device.enqueue_to_thread_pool([device, state, metadata_for_process]() {
+             const std::vector<CoreCoord> virtual_cores = detail::getVirtualCoresForProfiling(device, state);
+-            detail::ProcessDeviceProfilerResults(device, virtual_cores, state, metadata);
++            detail::ProcessDeviceProfilerResults(device, virtual_cores, state, metadata_for_process);
+         });
+     }
