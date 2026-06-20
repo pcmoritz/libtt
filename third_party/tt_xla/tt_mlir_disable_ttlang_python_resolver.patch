@@ -1,0 +1,19 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveTTLangKernels.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveTTLangKernels.cpp
+index e2c4f63..364ed17 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNResolveTTLangKernels.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNResolveTTLangKernels.cpp
+@@ -120,10 +120,10 @@ public:
+       return signalPassFailure();
+     }
+ 
+-    if (mlir::failed(resolveTTLangKernelsViaPython(
+-            unresolvedOps, *meshOr, pythonModule, pythonFunction))) {
+-      return signalPassFailure();
+-    }
++    unresolvedOps.front().emitError()
++        << "ttnn.tt_lang_op requires the tt-lang Python resolver, which is "
++           "disabled in this libtt build.";
++    return signalPassFailure();
+   }
+ };
+ 

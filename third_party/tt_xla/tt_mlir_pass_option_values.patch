@@ -9,9 +9,10 @@ index 7befd8f..f5f5b2d 100644
 -    : insertMemReconfig(pipelineOptions.insertMemReconfig),
 -      overrideOutputLayout(pipelineOptions.overrideOutputLayout),
 -      overrideConv2dConfig(pipelineOptions.overrideConv2dConfig),
+-      overrideConv3dConfig(pipelineOptions.overrideConv3dConfig),
 +    : insertMemReconfig(pipelineOptions.insertMemReconfig.getValue()),
 +      overrideOutputLayout(pipelineOptions.overrideOutputLayout.getValue()),
 +      overrideConv2dConfig(pipelineOptions.overrideConv2dConfig.getValue()),
++      overrideConv3dConfig(pipelineOptions.overrideConv3dConfig.getValue()),
        memoryLayoutAnalysisEnabled(pipelineOptions.memoryLayoutAnalysisEnabled),
        l1InterleavedFallbackAnalysisEnabled(
-           pipelineOptions.l1InterleavedFallbackAnalysisEnabled),

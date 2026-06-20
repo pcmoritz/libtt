@@ -1,10 +1,3 @@
-diff --git a/include/ttmlir/OpModel/TTNN/MetalHeaders.h b/include/ttmlir/OpModel/TTNN/MetalHeaders.h
-index 61f645f..a799212 100644
---- a/include/ttmlir/OpModel/TTNN/MetalHeaders.h
-+++ b/include/ttmlir/OpModel/TTNN/MetalHeaders.h
-@@ -15 +15 @@
--#include "tt-metalium/experimental/mock_device.hpp"
-+#include "tt-metalium/experimental/mock_device/mock_device.hpp"
 diff --git a/lib/OpModel/TTNN/SingletonDeviceContext.cpp b/lib/OpModel/TTNN/SingletonDeviceContext.cpp
 index 0319661..577d79a 100644
 --- a/lib/OpModel/TTNN/SingletonDeviceContext.cpp
