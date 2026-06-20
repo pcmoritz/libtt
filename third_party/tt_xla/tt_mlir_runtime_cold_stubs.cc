@@ -8,8 +8,11 @@
 #include "operations/ccl/distribute_tensor.h"
 #include "operations/ccl/mesh_partition.h"
 #include "operations/ccl/moe_expert_token_remap.h"
+#include "operations/ccl/moe_compute.h"
 #include "operations/ccl/moe_gpt.h"
 #include "operations/ccl/point_to_point.h"
+#include "operations/ccl/prepare_moe_compute_w0_w1_weights.h"
+#include "operations/ccl/prepare_moe_compute_w2_weights.h"
 #include "operations/ccl/reduce_scatter.h"
 #include "operations/ccl/selective_reduce_combine.h"
 #include "operations/cpu/cpu.h"
@@ -81,12 +84,26 @@ void run(const ::tt::target::ttnn::MoeExpertTokenRemapOp *, ProgramContext &) {
   unsupported("ttnn.moe_expert_token_remap");
 }
 
+void run(const ::tt::target::ttnn::MoeComputeOp *, ProgramContext &) {
+  unsupported("ttnn.moe_compute");
+}
+
 void run(const ::tt::target::ttnn::MoeGptOp *, ProgramContext &) {
   unsupported("ttnn.moe_gpt");
 }
 
 void run(const ::tt::target::ttnn::PointToPointOp *, ProgramContext &) {
   unsupported("ttnn.point_to_point");
+}
+
+void run(const ::tt::target::ttnn::PrepareMoEComputeW0W1WeightsOp *,
+         ProgramContext &) {
+  unsupported("ttnn.prepare_moe_compute_w0_w1_weights");
+}
+
+void run(const ::tt::target::ttnn::PrepareMoEComputeW2WeightsOp *,
+         ProgramContext &) {
+  unsupported("ttnn.prepare_moe_compute_w2_weights");
 }
 
 void run(const ::tt::target::ttnn::ReduceScatterOp *, ProgramContext &) {

@@ -24,6 +24,7 @@ _TTNN_FBS = [
     "operations/conv.fbs",
     "operations/cpu.fbs",
     "operations/creation.fbs",
+    "operations/cumprod.fbs",
     "operations/cumsum.fbs",
     "operations/data_movement.fbs",
     "operations/deallocate.fbs",
@@ -1263,6 +1264,7 @@ cc_library(
         ],
         exclude = [
             "lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/ConcatenateHeadsOpRewritePattern.cpp",
+            "lib/Dialect/TTNN/Transforms/TTNNResolveTTLangKernelsPython.cpp",
             "lib/Dialect/TTNN/Transforms/TTNNToPython.cpp",
             "lib/Target/Python/**",
         ],

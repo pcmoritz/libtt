@@ -6,6 +6,7 @@
 #include "ttnn/operations/conv/conv_transpose2d/conv_transpose2d.hpp"
 #include "ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.hpp"
 #include "ttnn/operations/experimental/ccl/ring_attention_all_gather_async/device/ring_attention_all_gather_async_device_operation.hpp"
+#include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
 #include "ttnn/operations/experimental/conv3d/conv3d.hpp"
 #include "ttnn/operations/experimental/unary_backward/gelu_backward/gelu_backward.hpp"
 #include "ttnn/operations/pool/generic/generic_pools.hpp"
@@ -68,7 +69,8 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     const std::vector<GlobalSemaphore> &,
     const std::optional<tt::tt_metal::SubDeviceId> &,
     std::optional<ttnn::experimental::ccl::AllGatherFusedOpSignaler> &,
-    CoreCoord, ttnn::ccl::CoreAllocationStrategy) {
+    CoreCoord, ttnn::ccl::CoreAllocationStrategy,
+    std::optional<uint32_t>) {
   unsupported("ttnn::ring_attention_all_gather_async");
 }
 
@@ -190,6 +192,39 @@ ttnn::Tensor conv3d(
 Tensor gelu_bw(const Tensor &, const Tensor &, const std::string &,
                const std::optional<MemoryConfig> &, std::optional<Tensor>) {
   unsupported("ttnn::experimental::gelu_bw");
+}
+
+WeightMemoryConfigs get_weight_mem_configs(MeshDevice *, uint32_t, uint32_t,
+                                           uint32_t, uint32_t, bool,
+                                           uint32_t) {
+  unsupported("ttnn::experimental::get_weight_mem_configs");
+}
+
+Tensor prepare_w0_w1_tensor_for_moe_compute(const Tensor &, const Tensor &,
+                                            uint32_t, uint32_t, uint32_t,
+                                            uint32_t, uint32_t) {
+  unsupported("ttnn::experimental::prepare_w0_w1_tensor_for_moe_compute");
+}
+
+Tensor prepare_w2_tensor_for_moe_compute(const Tensor &, uint32_t, uint32_t,
+                                         uint32_t, uint32_t, uint32_t) {
+  unsupported("ttnn::experimental::prepare_w2_tensor_for_moe_compute");
+}
+
+Tensor prepare_w0_w1_tensor_with_bias(const Tensor &, const Tensor &,
+                                      const Tensor &, const Tensor &, uint32_t,
+                                      uint32_t, uint32_t, uint32_t, uint32_t) {
+  unsupported("ttnn::experimental::prepare_w0_w1_tensor_with_bias");
+}
+
+Tensor prepare_w2_tensor_with_bias(const Tensor &, const Tensor &, uint32_t,
+                                   uint32_t, uint32_t, uint32_t, uint32_t) {
+  unsupported("ttnn::experimental::prepare_w2_tensor_with_bias");
+}
+
+Tensor quantize_weights_via_host(const Tensor &, DataType,
+                                 const std::optional<MemoryConfig> &) {
+  unsupported("ttnn::experimental::quantize_weights_via_host");
 }
 
 } // namespace ttnn::experimental
