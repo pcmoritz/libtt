@@ -1,0 +1,16 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+index 705b58a..53e5674 100644
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -927,7 +927,10 @@ tt_pjrt_status ModuleBuilder::buildTTIRCompileOptions(
+     options.computeCfgMathFidelity = math_fidelity;
+   }
+ 
+-  if (compile_options.fp32_dest_acc_en.has_value()) {
++  // Decode tracing is latency sensitive; keep broad fp32 accumulation scoped to
++  // non-traced programs and rely on TT-MLIR targeted workarounds for decode.
++  if (compile_options.fp32_dest_acc_en.has_value() &&
++      !compile_options.enable_trace) {
+     options.computeCfgFp32DestAccEn = compile_options.fp32_dest_acc_en.value();
+   }
+ 
