@@ -243,6 +243,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_protobuf_string_view.patch",
         "//third_party/tt_xla:tt_xla_disable_cpu_const_eval.patch",
         "//third_party/tt_xla:tt_xla_disable_trace_global_fp32_acc.patch",
+        "//third_party/tt_xla:tt_xla_device_memory_stats.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
