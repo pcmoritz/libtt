@@ -267,7 +267,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_ttnn_only_runtime_paths.patch",
         "//third_party/tt_xla:tt_mlir_strip_sharding_constraints.patch",
         "//third_party/tt_xla:tt_mlir_allow_tilize_reshard.patch",
-        "//third_party/tt_xla:tt_mlir_live_gather_uses_ttnn_gather.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
