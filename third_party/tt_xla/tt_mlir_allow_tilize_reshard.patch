@@ -2,22 +2,31 @@ diff --git a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp b/lib/Dialect
 index 9e3d30cc..6e16628f 100644
 --- a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
 +++ b/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
-@@ -642,10 +642,15 @@ bool MemoryLayoutPropagation::validateReshard(
+@@ -642,10 +642,22 @@ bool MemoryLayoutPropagation::validateReshard(
      Operation *consumerOp, llvm::ArrayRef<int64_t> inputShape,
      TTNNLayoutAttr producerOutputLayout, TTNNLayoutAttr reshardLayout) {
-   if (producerOutputLayout.isTiled() != reshardLayout.isTiled()) {
+-  if (producerOutputLayout.isTiled() != reshardLayout.isTiled()) {
 -    // Reject reshards that change tiling.
 -    return false;
+-  }
+-
++  bool needsLayoutOp =
++      producerOutputLayout.getLayout() != reshardLayout.getLayout() ||
++      producerOutputLayout.getDataType() != reshardLayout.getDataType();
++  if (needsLayoutOp) {
++    std::optional<ttcore::DataType> outputDtype = std::nullopt;
++    if (producerOutputLayout.getDataType() != reshardLayout.getDataType()) {
++      outputDtype = reshardLayout.getDataType();
++    }
 +    auto result = op_constraint_validation::validateOperation<ToLayoutOp>(
 +        consumerOp, /*additionalL1Usage=*/0, inputShape, producerOutputLayout,
-+        /*outputDtype=*/std::nullopt, reshardLayout);
++        outputDtype, reshardLayout);
 +    bool valid = result.isSuccess();
 +    TTMLIR_TRACE(ttmlir::LogComponent::GreedyOptimizer,
 +                 "  validateReshard(to_layout): {0} -> {1}: {2}",
 +                 producerOutputLayout, reshardLayout, valid ? "OK" : "FAILED");
 +    return valid;
-   }
--
++  }
    auto result = op_constraint_validation::validateOperation<ToMemoryConfigOp>(
        consumerOp, /*additionalL1Usage=*/0, inputShape, producerOutputLayout,
        reshardLayout);
