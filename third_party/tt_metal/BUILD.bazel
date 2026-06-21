@@ -1,11 +1,23 @@
 load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "BUILD.overlay.bazel",
+    "libtt_fabric_disabled_host_tensor_runtime.cpp",
     "libtt_zstd_compressor.cc",
 ])
+
+pkg_tar(
+    name = "cluster_descriptor_examples_tar",
+    srcs = ["cluster_descriptor_examples/blackhole_P150.yaml"],
+    extension = "tar",
+    owner = "0.0",
+    ownername = ".",
+    package_dir = "tt_metal/third_party/umd/tests/cluster_descriptor_examples",
+    portable_mtime = True,
+)
 
 cc_library(
     name = "tt_metal_disabled_fabric_compat",

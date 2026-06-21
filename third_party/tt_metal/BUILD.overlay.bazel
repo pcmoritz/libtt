@@ -255,7 +255,10 @@ filegroup(
 
 pkg_tar(
     name = "tt_metal_runtime_archive",
-    deps = [":blackhole_runtime_obj_tar"],
+    deps = [
+        ":blackhole_runtime_obj_tar",
+        "@//third_party/tt_metal:cluster_descriptor_examples_tar",
+    ],
     srcs = [
         "@sfpi//:all_files",
         ":tt_metal_blackhole_runtime_hw_assets",
@@ -887,7 +890,7 @@ cc_library(
 cc_library(
     name = "tt_metal_host_tensor_runtime_support_upstream",
     srcs = [
-        "tt_metal/impl/tensor/libtt_fabric_disabled_host_tensor_runtime.cpp",
+        "@//third_party/tt_metal:libtt_fabric_disabled_host_tensor_runtime.cpp",
     ],
     hdrs = TT_METAL_RUNTIME_HDRS,
     copts = TT_METAL_RUNTIME_COPTS,
