@@ -2,7 +2,7 @@ diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_inp
 index 13cf721..e143f32 100644
 --- a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
 +++ b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
-@@ -76,19 +76,17 @@ void propagateInputRoleAttributes(
+@@ -76,19 +76,25 @@ void propagateInputRoleAttributes(
  void propagateRoleAttribute(mlir::ModuleOp module, mlir::Value argument,
                              mlir::StringAttr role_attr) {
 -  // We are marking only inputs to model's `apply` function, so we expect call
@@ -17,17 +17,25 @@ index 13cf721..e143f32 100644
 -  // is enough to propagate the role for input only once (from the root `apply`
 -  // function) we can ignore the other marks coming from internal `apply` calls.
 +  // Mark calls usually point directly at an `apply` function block argument.
-+  // JAX can also insert unary wrappers such as reshape or @Sharding before the
-+  // tt.mark_* call. Trace through those wrappers to reach the real argument,
-+  // but avoid propagating a role through arbitrary multi-input expressions.
++  // Trace through transparent wrappers observed before tt.mark_* to reach the
++  // real argument, but avoid propagating a role through arbitrary unary ops.
    auto block_argument = mlir::dyn_cast<mlir::BlockArgument>(argument);
    if (!block_argument) {
 -    return;
 +    mlir::Operation *defining_op = argument.getDefiningOp();
-+    if (!defining_op || defining_op->getNumOperands() != 1) {
++    if (auto reshape_op =
++            mlir::dyn_cast_or_null<mlir::stablehlo::ReshapeOp>(defining_op)) {
++      propagateRoleAttribute(module, reshape_op.getOperand(), role_attr);
 +      return;
 +    }
-+    propagateRoleAttribute(module, defining_op->getOperand(0), role_attr);
++    if (auto custom_call_op =
++            mlir::dyn_cast_or_null<mlir::stablehlo::CustomCallOp>(defining_op);
++        custom_call_op && custom_call_op.getCallTargetName() == "Sharding" &&
++        custom_call_op->getNumOperands() == 1 &&
++        custom_call_op->getNumResults() == 1) {
++      propagateRoleAttribute(module, custom_call_op.getOperand(0), role_attr);
++      return;
++    }
 +    return;
    }
  
