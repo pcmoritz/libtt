@@ -1,0 +1,34 @@
+diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
+index 13cf721..e143f32 100644
+--- a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
++++ b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
+@@ -76,19 +76,17 @@ void propagateInputRoleAttributes(
+ void propagateRoleAttribute(mlir::ModuleOp module, mlir::Value argument,
+                             mlir::StringAttr role_attr) {
+-  // We are marking only inputs to model's `apply` function, so we expect call
+-  // op arguments to be block arguments of the FuncOp corresponding to `apply`
+-  // function in the model graph. Sometimes model can be defined as a
+-  // composition of smaller model parts with their own `apply` function, and its
+-  // `apply` function can call `apply` functions of those model parts passing
+-  // them its inputs as arguments. That would lead to multiple mark calls being
+-  // produced for the same input, and those other calls could end up inlined
+-  // into main graph in which case the argument will not be a block argument but
+-  // instead a result of other ops which transform the original input. Since it
+-  // is enough to propagate the role for input only once (from the root `apply`
+-  // function) we can ignore the other marks coming from internal `apply` calls.
++  // Mark calls usually point directly at an `apply` function block argument.
++  // JAX can also insert unary wrappers such as reshape or @Sharding before the
++  // tt.mark_* call. Trace through those wrappers to reach the real argument,
++  // but avoid propagating a role through arbitrary multi-input expressions.
+   auto block_argument = mlir::dyn_cast<mlir::BlockArgument>(argument);
+   if (!block_argument) {
+-    return;
++    mlir::Operation *defining_op = argument.getDefiningOp();
++    if (!defining_op || defining_op->getNumOperands() != 1) {
++      return;
++    }
++    propagateRoleAttribute(module, defining_op->getOperand(0), role_attr);
++    return;
+   }
+ 
+   mlir::Operation *parent_op = block_argument.getOwner()->getParentOp();
