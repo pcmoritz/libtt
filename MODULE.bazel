@@ -243,6 +243,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_protobuf_string_view.patch",
         "//third_party/tt_xla:tt_xla_disable_cpu_const_eval.patch",
         "//third_party/tt_xla:tt_xla_disable_trace_global_fp32_acc.patch",
+        "//third_party/tt_xla:tt_xla_propagate_mark_roles_through_unary_ops.patch",
         "//third_party/tt_xla:tt_xla_device_memory_stats.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
@@ -265,6 +266,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_ttnn_only_register_all.patch",
         "//third_party/tt_xla:tt_mlir_ttnn_only_runtime_paths.patch",
         "//third_party/tt_xla:tt_mlir_strip_sharding_constraints.patch",
+        "//third_party/tt_xla:tt_mlir_allow_tilize_reshard.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
