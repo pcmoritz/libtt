@@ -1332,6 +1332,7 @@ cc_library(
         "-DDEVICE_RUNTIME_ENABLED=1",
         "-DTTMLIR_ENABLE_RUNTIME=1",
         "-DTT_RUNTIME_ENABLE_DISTRIBUTED=1",
+        "-DTT_RUNTIME_ENABLE_PERF_TRACE=1",
         "-DTT_RUNTIME_ENABLE_TTNN=1",
         "-DTARGET_TRIPLE=\\\"x86_64-pc-linux\\\"",
         "-march=x86-64-v3",

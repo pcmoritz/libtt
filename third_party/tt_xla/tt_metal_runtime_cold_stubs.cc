@@ -507,9 +507,3 @@ std::vector<SwitchId> MeshGraph::get_switch_ids() const { return {}; }
 MeshGraphDescriptor::~MeshGraphDescriptor() = default;
 
 } // namespace tt::tt_fabric
-
-namespace tracy {
-
-void SetThreadName(const char *) {}
-
-} // namespace tracy

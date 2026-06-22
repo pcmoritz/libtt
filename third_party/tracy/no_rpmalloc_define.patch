@@ -1,0 +1,66 @@
+--- public/common/TracyAlloc.hpp
++++ public/common/TracyAlloc.hpp
+@@ -3,7 +3,7 @@
+ 
+ #include <stdlib.h>
+ 
+-#if defined TRACY_ENABLE && !defined __EMSCRIPTEN__
++#if defined TRACY_ENABLE && !defined __EMSCRIPTEN__ && !defined TRACY_NO_RPMALLOC
+ #  include "TracyApi.h"
+ #  include "TracyForceInline.hpp"
+ #  include "../client/tracy_rpmalloc.hpp"
+--- public/TracyClient.cpp
++++ public/TracyClient.cpp
+@@ -26,7 +26,9 @@
+ #include "client/TracySysTime.cpp"
+ #include "client/TracySysTrace.cpp"
+ #include "common/TracySocket.cpp"
++#ifndef TRACY_NO_RPMALLOC
+ #include "client/tracy_rpmalloc.cpp"
++#endif
+ #include "client/TracyDxt1.cpp"
+ #include "client/TracyAlloc.cpp"
+ #include "client/TracyOverride.cpp"
+--- public/client/TracyThread.hpp
++++ public/client/TracyThread.hpp
+@@ -7,23 +7,23 @@
+ #  include <pthread.h>
+ #endif
+ 
+-#ifdef TRACY_MANUAL_LIFETIME
++#if defined(TRACY_MANUAL_LIFETIME) && !defined(TRACY_NO_RPMALLOC)
+ #  include "tracy_rpmalloc.hpp"
+ #endif
+ 
+ namespace tracy
+ {
+ 
+-#ifdef TRACY_MANUAL_LIFETIME
++#if defined(TRACY_MANUAL_LIFETIME) && !defined(TRACY_NO_RPMALLOC)
+ extern thread_local bool RpThreadInitDone;
+ #endif
+ 
+ class ThreadExitHandler
+ {
+ public:
+     ~ThreadExitHandler()
+     {
+-#ifdef TRACY_MANUAL_LIFETIME
++#if defined(TRACY_MANUAL_LIFETIME) && !defined(TRACY_NO_RPMALLOC)
+         rpmalloc_thread_finalize( 1 );
+         RpThreadInitDone = false;
+ #endif
+--- public/client/TracyProfiler.cpp
++++ public/client/TracyProfiler.cpp
+@@ -1201,9 +1201,11 @@
+     s_profilerData->~ProfilerData();
+     tracy_free( s_profilerData );
+     s_profilerData = nullptr;
++#ifdef TRACY_USE_RPMALLOC
+     rpmalloc_finalize();
+     RpThreadInitDone = false;
+     RpInitDone.store( 0, std::memory_order_release );
++#endif
+ }
+ TRACY_API bool IsProfilerStarted()
+ {
