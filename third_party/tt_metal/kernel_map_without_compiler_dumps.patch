@@ -1,6 +1,6 @@
 --- tt_metal/jit_build/build.cpp
 +++ tt_metal/jit_build/build.cpp
-@@ -493,10 +493,6 @@ void JitBuildState::compile_one(const string& out_dir, const JitBuildSettings* s
+@@ -521,11 +521,7 @@ void JitBuildState::compile_one(const string& out_dir, const JitBuildSettings* s
      string cmd{"cd " + out_dir + " && " + env_.gpp_};
      string defines = this->defines_;
  
@@ -9,9 +9,10 @@
 -    }
 -
      if (settings) {
+         defines += fmt::format(R"(-DFULL_KERNEL_NAME="\"{}\"" )", settings->get_full_kernel_name());
+ 
          // Append user args
-         if (process_defines_at_compile_) {
-@@ -617,7 +613,6 @@ void JitBuildState::link(const string& out_dir, const JitBuildSettings* settings
+@@ -646,7 +642,6 @@ void JitBuildState::link(const string& out_dir, const JitBuildSettings* settings
      string lflags = this->lflags_;
      if (env_.get_rtoptions().get_build_map_enabled()) {
          lflags += "-Wl,-Map=" + out_dir + this->target_name_ + ".map ";
