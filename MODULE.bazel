@@ -237,7 +237,7 @@ llvm_configure(
 git_repository(
     name = "tt_xla_src",
     build_file = "//third_party/tt_xla:tt_xla.BUILD.bazel",
-    commit = "5d20786bd2ae86d4326d4092cd92f7c9580d5733",
+    commit = "9a570e41d499a3a42ddb2117fe4d050f90d732d3",
     patch_args = ["-p1"],
     patches = [
         "//third_party/tt_xla:tt_xla_protobuf_string_view.patch",
