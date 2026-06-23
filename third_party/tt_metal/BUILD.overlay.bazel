@@ -258,6 +258,7 @@ pkg_tar(
     deps = [":blackhole_runtime_obj_tar"],
     srcs = [
         "@sfpi//:all_files",
+        "@tt_umd//:cluster_descriptor_examples",
         ":tt_metal_blackhole_runtime_hw_assets",
         ":tt_metal_runtime_sources",
     ],
@@ -276,6 +277,10 @@ pkg_tar(
         "external/sfpi/": "runtime/sfpi/",
         "external/+http_archive+tt_metal/": "",
         "external/tt_metal/": "",
+        "../+http_archive+tt_umd/": "tt_metal/third_party/umd/",
+        "../tt_umd/": "tt_metal/third_party/umd/",
+        "external/+http_archive+tt_umd/": "tt_metal/third_party/umd/",
+        "external/tt_umd/": "tt_metal/third_party/umd/",
     },
     strip_prefix = ".",
 )
@@ -320,7 +325,7 @@ genrule(
           "'class Inspector {' " +
           "'public:' " +
           "'    static bool is_enabled() { return false; }' " +
-          "'    static std::unique_ptr<inspector::Data> initialize(std::optional<int>) { return {}; }' " +
+          "'    template <typename... Args> static std::unique_ptr<inspector::Data> initialize(Args&&...) { return {}; }' " +
           "'    static void serialize_rpc() {}' " +
           "'    template <typename... Args> static void program_created(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void program_destroyed(Args&&...) noexcept {}' " +
@@ -440,7 +445,8 @@ genrule(
           "'};' " +
           "'class RemoteCompileCoordinator {' " +
           "'public:' " +
-          "'    RemoteCompileCoordinator(std::vector<std::string>, ChipId, std::uint64_t) {}' " +
+          "'    template <typename... Args>' " +
+          "'    explicit RemoteCompileCoordinator(Args&&...) {}' " +
           "'    void submit(std::size_t, const std::function<KernelCompileDescriptor()>&) {}' " +
           "'    void finish() {}' " +
           "'};' " +
@@ -701,6 +707,7 @@ TTNN_RUNTIME_INCLUDE_DIRS = [
     "ttnn/cpp/ttnn",
     "ttnn/cpp/ttnn/operations",
     "ttnn/cpp/ttnn/operations/ccl",
+    "ttnn/cpp/ttnn/operations/conv",
     "ttnn/cpp/ttnn/operations/data_movement",
     "ttnn/cpp/ttnn/operations/eltwise",
     "ttnn/cpp/ttnn/operations/experimental",
@@ -1111,6 +1118,9 @@ cc_library(
         "ttnn/cpp/ttnn/operations/core/to_memory_config/to_memory_config_op.cpp",
         "ttnn/cpp/ttnn/operations/compute_throttle_utils.cpp",
         "ttnn/cpp/ttnn/operations/ccl/sharding_addrgen_helper.cpp",
+        "ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp",
+        "ttnn/cpp/ttnn/operations/conv/conv_transpose2d/conv_transpose2d.cpp",
+        "ttnn/cpp/ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.cpp",
         "ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op.cpp",
         "ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp",
         "ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp",
