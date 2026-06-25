@@ -1,0 +1,18 @@
+baseline: /tmp/sglang-stable-jit-20260624-195913
+  curl_wall_seconds=559.18
+  first_submit#268=258.865s
+  typecast_total#268=251.506s
+  decode_128=18.10 tok/s
+
+fast_bfloat16_bfp8_pack: /tmp/sglang-stable-jit-20260625-012202
+  curl_wall_seconds=426.02
+  first_submit#268=114.530s
+  typecast_total#268=83.023s
+  decode_128=18.07 tok/s
+
+direct_converter_experiment: /tmp/sglang-stable-jit-20260625-013629
+  curl_wall_seconds=430.70
+  first_submit#268=118.201s
+  typecast_total#268=86.653s
+  decode_128=18.13 tok/s
+  note=not kept; slower than the simpler fast path

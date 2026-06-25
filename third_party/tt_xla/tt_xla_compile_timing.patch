@@ -1,0 +1,628 @@
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+index 79dc959..04b03ee 100644
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -11,12 +11,17 @@
+ #include "api/client_instance.h"
+ 
+ // c++ standard library includes
++#include <atomic>
+ #include <cerrno>
++#include <chrono>
+ #include <cstddef>
++#include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
+ #include <map>
+ #include <optional>
++#include <string>
+ 
+ // system includes
+ #include <unistd.h>
+@@ -43,6 +48,44 @@
+ 
+ namespace tt::pjrt {
+ 
++namespace {
++
++bool compileTimingEnabled() {
++  const char *env = std::getenv("TT_XLA_COMPILE_TIMING");
++  return env != nullptr && !(env[0] == '0' && env[1] == '\0');
++}
++
++class CompilePhaseTimer {
++public:
++  explicit CompilePhaseTimer(std::string label)
++      : m_label(std::move(label)), m_enabled(compileTimingEnabled()),
++        m_start(Clock::now()) {
++    if (m_enabled) {
++      LOG_F(INFO, "[tt-xla compile timing] start %s", m_label.c_str());
++    }
++  }
++
++  ~CompilePhaseTimer() {
++    if (!m_enabled) {
++      return;
++    }
++    const auto elapsed = Clock::now() - m_start;
++    const double elapsed_ms =
++        std::chrono::duration<double, std::milli>(elapsed).count();
++    LOG_F(INFO, "[tt-xla compile timing] done %s: %.3f ms",
++          m_label.c_str(), elapsed_ms);
++  }
++
++private:
++  using Clock = std::chrono::steady_clock;
++
++  std::string m_label;
++  bool m_enabled;
++  Clock::time_point m_start;
++};
++
++} // namespace
++
+ static std::string getRankBindingPath(const std::string &metal_home) {
+   static std::unordered_map<std::string, std::string> rank_binding_paths = {
+       {"2x4_multiprocess",
+@@ -482,9 +525,25 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+ 
+   std::string_view mlir_code(mlir_program->code, mlir_program->code_size);
+ 
+-  std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> compile_result =
+-      m_module_builder->buildModule(mlir_code, m_cached_system_descriptor_path,
+-                                    compile_options, this);
++  static std::atomic<uint64_t> compile_counter{0};
++  const uint64_t compile_id =
++      compile_counter.fetch_add(1, std::memory_order_relaxed);
++  const std::string compile_label =
++      "compile#" + std::to_string(compile_id);
++  CompilePhaseTimer compile_timer(compile_label +
++                                  " ClientInstance::compileMlirProgram");
++  if (compileTimingEnabled()) {
++    LOG_F(INFO,
++          "[tt-xla compile timing] %s input_bytes=%zu custom_options=%zu",
++          compile_label.c_str(), mlir_code.size(), compile_options.size());
++  }
++
++  std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> compile_result;
++  {
++    CompilePhaseTimer timer(compile_label + " ModuleBuilder::buildModule");
++    compile_result = m_module_builder->buildModule(
++        mlir_code, m_cached_system_descriptor_path, compile_options, this);
++  }
+   tt_pjrt_status status = std::get<tt_pjrt_status>(compile_result);
+   if (!tt_pjrt_status_is_ok(status)) {
+     return status;
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+index 0459533..d92abea 100644
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <cstdint>
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+@@ -82,6 +83,40 @@ namespace tt::pjrt::module_builder {
+ 
+ const std::string c_mlir_format_name = "mlir";
+ 
++static bool compileTimingEnabled() {
++  const char *env = std::getenv("TT_XLA_COMPILE_TIMING");
++  return env != nullptr && !(env[0] == '0' && env[1] == '\0');
++}
++
++class CompilePhaseTimer {
++public:
++  explicit CompilePhaseTimer(std::string label)
++      : m_label(std::move(label)), m_enabled(compileTimingEnabled()),
++        m_start(Clock::now()) {
++    if (m_enabled) {
++      LOG_F(INFO, "[tt-xla compile timing] start %s", m_label.c_str());
++    }
++  }
++
++  ~CompilePhaseTimer() {
++    if (!m_enabled) {
++      return;
++    }
++    const auto elapsed = Clock::now() - m_start;
++    const double elapsed_ms =
++        std::chrono::duration<double, std::milli>(elapsed).count();
++    LOG_F(INFO, "[tt-xla compile timing] done %s: %.3f ms",
++          m_label.c_str(), elapsed_ms);
++  }
++
++private:
++  using Clock = std::chrono::steady_clock;
++
++  std::string m_label;
++  bool m_enabled;
++  Clock::time_point m_start;
++};
++
+ // Returns true if the public entry point of the module has at least one
+ // argument.
+ static bool
+@@ -294,6 +329,20 @@ ModuleBuilder::buildModule(
+   DLOG_F(LOG_DEBUG, "ModuleBuilder::buildModule");
+ 
+   auto compile_options = CompileOptions::parse(compile_options_map);
++  static std::atomic<uint64_t> module_counter{0};
++  const uint64_t module_id =
++      module_counter.fetch_add(1, std::memory_order_relaxed);
++  const std::string module_label = "module#" + std::to_string(module_id);
++  CompilePhaseTimer build_timer(module_label + " ModuleBuilder::buildModule");
++  if (compileTimingEnabled()) {
++    LOG_F(INFO,
++          "[tt-xla compile timing] %s input_bytes=%zu backend=%d "
++          "optimization_level=%d enable_trace=%d experimental_weight_dtype=%s",
++          module_label.c_str(), mlir_code.size(),
++          static_cast<int>(compile_options.backend),
++          compile_options.optimization_level, compile_options.enable_trace,
++          compile_options.experimental_weight_dtype.c_str());
++  }
+ 
+   // Construct full name: {model_name}_g{N}
+   // e.g., 1lyr_phi1_bs32_g0
+@@ -770,18 +819,25 @@ tt_pjrt_status ModuleBuilder::runCompilerStableHLOPipeline(
+ 
+   enableVerboseIRPrinting(stablehlo_pipeline_pm);
+ 
+-  if (mlir::failed(stablehlo_pipeline_pm.run(mlir_module.get()))) {
+-    LOG_F(ERROR, "Failed to run stablehlo pipeline");
+-    return tt_pjrt_status::kInternal;
++  {
++    CompilePhaseTimer timer("runCompilerStableHLOPipeline pass_manager");
++    if (mlir::failed(stablehlo_pipeline_pm.run(mlir_module.get()))) {
++      LOG_F(ERROR, "Failed to run stablehlo pipeline");
++      return tt_pjrt_status::kInternal;
++    }
+   }
+ 
+   printModule(mlir_module, export_path, "shlo_compiler", model_name);
+ 
+-  if (!tt_pjrt_status_is_ok(
+-          frontend_passes::setProperSdyMeshAttributeInSpmdMode(
+-              mlir_module, current_mesh_shape))) {
+-    LOG_F(ERROR, "Failed to set proper sdy.mesh attribute in SPMD mode");
+-    return tt_pjrt_status::kInternal;
++  {
++    CompilePhaseTimer timer(
++        "runCompilerStableHLOPipeline setProperSdyMeshAttributeInSpmdMode");
++    if (!tt_pjrt_status_is_ok(
++            frontend_passes::setProperSdyMeshAttributeInSpmdMode(
++                mlir_module, current_mesh_shape))) {
++      LOG_F(ERROR, "Failed to set proper sdy.mesh attribute in SPMD mode");
++      return tt_pjrt_status::kInternal;
++    }
+   }
+ 
+   printModule(mlir_module, export_path, "shlo_set_mesh_attr", model_name);
+@@ -805,12 +861,18 @@ tt_pjrt_status ModuleBuilder::convertFromSHLOToTTIR(
+ 
+   enableVerboseIRPrinting(shlo_to_ttir_pm);
+ 
+-  if (mlir::failed(shlo_to_ttir_pm.run(mlir_module.get()))) {
+-    LOG_F(ERROR, "Failed to convert from SHLO to TTIR module");
+-    return tt_pjrt_status::kInternal;
++  {
++    CompilePhaseTimer timer("convertFromSHLOToTTIR pass_manager");
++    if (mlir::failed(shlo_to_ttir_pm.run(mlir_module.get()))) {
++      LOG_F(ERROR, "Failed to convert from SHLO to TTIR module");
++      return tt_pjrt_status::kInternal;
++    }
+   }
+ 
+-  ttir_mlir = getMlirCode(mlir_module);
++  {
++    CompilePhaseTimer timer("convertFromSHLOToTTIR serialize_mlir");
++    ttir_mlir = getMlirCode(mlir_module);
++  }
+ 
+   printModule(mlir_module, export_path, "ttir", model_name);
+ 
+@@ -1053,14 +1115,21 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+   enableVerboseIRPrinting(ttir_to_ttnn_pm);
+ 
+   // Run the pass manager.
+-  mlir::LogicalResult mlir_result = ttir_to_ttnn_pm.run(mlir_module.get());
++  mlir::LogicalResult mlir_result = mlir::success();
++  {
++    CompilePhaseTimer timer("convertFromTTIRToTTNN pass_manager");
++    mlir_result = ttir_to_ttnn_pm.run(mlir_module.get());
++  }
+ 
+   if (mlir::failed(mlir_result)) {
+     LOG_F(ERROR, "Failed to run TTIRToTTNNCommon pipeline");
+     return tt_pjrt_status::kInternal;
+   }
+ 
+-  ttnn_mlir = getMlirCode(mlir_module);
++  {
++    CompilePhaseTimer timer("convertFromTTIRToTTNN serialize_mlir");
++    ttnn_mlir = getMlirCode(mlir_module);
++  }
+ 
+   printModule(mlir_module, compile_options.export_path, "ttnn",
+               compile_options.export_model_name);
+@@ -1073,12 +1142,18 @@ tt_pjrt_status ModuleBuilder::createFlatbufferBinary(
+     const std::vector<mlir::tt::sharding_utils::MeshSharding> &input_shardings,
+     const std::vector<mlir::tt::sharding_utils::MeshSharding> &output_shardings,
+     tt::runtime::Binary &flatbuffer_binary) {
+-  flatbuffer_binary = mlir::tt::ttnn::ttnnToFlatbuffer(mlir_module.get());
++  {
++    CompilePhaseTimer timer("createFlatbufferBinary ttnnToFlatbuffer");
++    flatbuffer_binary = mlir::tt::ttnn::ttnnToFlatbuffer(mlir_module.get());
++  }
+ 
+-  tt_pjrt_status status = verifyCreatedFlatbufferBinary(
+-      flatbuffer_binary, input_shardings, output_shardings);
+-  if (!tt_pjrt_status_is_ok(status)) {
+-    return status;
++  {
++    CompilePhaseTimer timer("createFlatbufferBinary verify");
++    tt_pjrt_status status = verifyCreatedFlatbufferBinary(
++        flatbuffer_binary, input_shardings, output_shardings);
++    if (!tt_pjrt_status_is_ok(status)) {
++      return status;
++    }
+   }
+   return tt_pjrt_status::kSuccess;
+ }
+@@ -1252,7 +1327,11 @@ ModuleBuilder::buildModuleForTTNNRuntime(
+                                                     runtime_options);
+   enableVerboseIRPrinting(runtime_pm);
+ 
+-  mlir::LogicalResult mlir_result = runtime_pm.run(mlir_module.get());
++  mlir::LogicalResult mlir_result = mlir::success();
++  {
++    CompilePhaseTimer timer("buildModuleForTTNNRuntime runtime_pipeline");
++    mlir_result = runtime_pm.run(mlir_module.get());
++  }
+   if (mlir::failed(mlir_result)) {
+     LOG_F(ERROR, "Failed to run TTNNCommonToRuntime pipeline");
+     return {tt_pjrt_status::kInternal, nullptr};
+@@ -1262,8 +1341,12 @@ ModuleBuilder::buildModuleForTTNNRuntime(
+               compile_options.export_model_name);
+ 
+   tt::runtime::Binary flatbuffer(nullptr);
+-  tt_pjrt_status status = createFlatbufferBinary(mlir_module, input_shardings,
+-                                                 output_shardings, flatbuffer);
++  tt_pjrt_status status;
++  {
++    CompilePhaseTimer timer("buildModuleForTTNNRuntime createFlatbufferBinary");
++    status = createFlatbufferBinary(mlir_module, input_shardings,
++                                    output_shardings, flatbuffer);
++  }
+   if (!tt_pjrt_status_is_ok(status)) {
+     return {status, nullptr};
+   }
+diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
+index 47b8ced..92ba33e 100644
+--- a/pjrt_implementation/src/api/loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
+@@ -11,10 +11,15 @@
+ #include "api/loaded_executable_instance.h"
+ 
+ // c++ standard library includes
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
+ #include <filesystem>
+ #include <mutex>
+ #include <numeric>
+ #include <optional>
++#include <string>
+ #include <unordered_set>
+ 
+ // tracy includes
+@@ -42,6 +47,44 @@
+ 
+ namespace tt::pjrt {
+ 
++namespace {
++
++bool executeTimingEnabled() {
++  const char *env = std::getenv("TT_XLA_COMPILE_TIMING");
++  return env != nullptr && !(env[0] == '0' && env[1] == '\0');
++}
++
++class ExecutePhaseTimer {
++public:
++  explicit ExecutePhaseTimer(std::string label)
++      : m_label(std::move(label)), m_enabled(executeTimingEnabled()),
++        m_start(Clock::now()) {
++    if (m_enabled) {
++      LOG_F(INFO, "[tt-xla execute timing] start %s", m_label.c_str());
++    }
++  }
++
++  ~ExecutePhaseTimer() {
++    if (!m_enabled) {
++      return;
++    }
++    const auto elapsed = Clock::now() - m_start;
++    const double elapsed_ms =
++        std::chrono::duration<double, std::milli>(elapsed).count();
++    LOG_F(INFO, "[tt-xla execute timing] done %s: %.3f ms",
++          m_label.c_str(), elapsed_ms);
++  }
++
++private:
++  using Clock = std::chrono::steady_clock;
++
++  std::string m_label;
++  bool m_enabled;
++  Clock::time_point m_start;
++};
++
++} // namespace
++
+ void LoadedExecutableInstance::bindApi(PJRT_Api *api) {
+   api->PJRT_LoadedExecutable_Destroy = internal::onLoadedExecutableDestroy;
+   api->PJRT_LoadedExecutable_GetExecutable =
+@@ -483,6 +526,23 @@ onLoadedExecutableExecute(PJRT_LoadedExecutable_Execute_Args *args) {
+   LoadedExecutableInstance *instance =
+       LoadedExecutableInstance::unwrap(args->executable);
+ 
++  static std::atomic<uint64_t> execute_counter{0};
++  const uint64_t execute_id =
++      execute_counter.fetch_add(1, std::memory_order_relaxed);
++  const std::string execute_label = "execute#" + std::to_string(execute_id);
++  ExecutePhaseTimer execute_timer(execute_label +
++                                  " PJRT_LoadedExecutable_Execute");
++  if (executeTimingEnabled()) {
++    std::shared_ptr<ExecutableImage> image = instance->getSharedExecutableImage();
++    const CompileOptions &options = image->getCompileOptions();
++    LOG_F(INFO,
++          "[tt-xla execute timing] %s num_args=%zu num_devices=%zu inputs=%zu "
++          "outputs=%zu optimization_level=%d enable_trace=%d",
++          execute_label.c_str(), args->num_args, args->num_devices,
++          image->getNumInputs(), image->getNumOutputs(),
++          options.optimization_level, options.enable_trace);
++  }
++
+   if (instance->isCompileOnly()) {
+     LOG_F(INFO, "Compile-only mode: returning default output buffers "
+                 "(TT_COMPILE_ONLY_SYSTEM_DESC is set).");
+@@ -501,7 +561,13 @@ onLoadedExecutableExecute(PJRT_LoadedExecutable_Execute_Args *args) {
+     return nullptr;
+   }
+ 
+-  tt_pjrt_status status = instance->execute(args);
++  tt_pjrt_status status;
++  {
++    ExecutePhaseTimer timer(execute_label + " instance->execute");
++    status = instance->execute(args);
++  }
++  LOG_F(INFO, "[tt-xla execute timing] %s status=%d", execute_label.c_str(),
++        static_cast<int>(status));
+   return *ErrorInstance::makeError(status).release();
+ }
+ 
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+index f64ed1f..68d4702 100644
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -5,6 +5,13 @@
+ 
+ #include "api/flatbuffer_loaded_executable_instance.h"
+ 
++// c++ standard library includes
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <string>
++
+ // tracy includes
+ #include "tracy/Tracy.hpp"
+ #include "tt/runtime/runtime.h"
+@@ -22,6 +29,44 @@
+ 
+ namespace tt::pjrt {
+ 
++namespace {
++
++bool executeTimingEnabled() {
++  const char *env = std::getenv("TT_XLA_COMPILE_TIMING");
++  return env != nullptr && !(env[0] == '0' && env[1] == '\0');
++}
++
++class ExecutePhaseTimer {
++public:
++  explicit ExecutePhaseTimer(std::string label)
++      : m_label(std::move(label)), m_enabled(executeTimingEnabled()),
++        m_start(Clock::now()) {
++    if (m_enabled) {
++      LOG_F(INFO, "[tt-xla execute timing] start %s", m_label.c_str());
++    }
++  }
++
++  ~ExecutePhaseTimer() {
++    if (!m_enabled) {
++      return;
++    }
++    const auto elapsed = Clock::now() - m_start;
++    const double elapsed_ms =
++        std::chrono::duration<double, std::milli>(elapsed).count();
++    LOG_F(INFO, "[tt-xla execute timing] done %s: %.3f ms",
++          m_label.c_str(), elapsed_ms);
++  }
++
++private:
++  using Clock = std::chrono::steady_clock;
++
++  std::string m_label;
++  bool m_enabled;
++  Clock::time_point m_start;
++};
++
++} // namespace
++
+ std::unique_ptr<FlatbufferLoadedExecutableInstance>
+ FlatbufferLoadedExecutableInstance::createInstance(
+     std::shared_ptr<FlatbufferExecutableImage> executable_image,
+@@ -55,6 +100,9 @@ FlatbufferLoadedExecutableInstance::prepareInputTensor(
+     tt::runtime::Device runtime_device, size_t num_devices,
+     std::uint32_t program_index, size_t arg_index) {
+   ZoneScoped;
++  const std::string arg_label =
++      "flatbuffer_prepare_input[arg#" + std::to_string(arg_index) + "]";
++  ExecutePhaseTimer total_timer(arg_label + " total");
+ 
+   FlatbufferExecutableImage *executable_image =
+       static_cast<FlatbufferExecutableImage *>(m_executable_image.get());
+@@ -62,9 +110,12 @@ FlatbufferLoadedExecutableInstance::prepareInputTensor(
+   tt::runtime::Layout expected_layout = tt::runtime::getLayout(
+       executable_image->getFlatbufferBinary(), program_index, arg_index);
+ 
+-  mlir::FailureOr<std::unordered_map<std::string, std::string>> strategy =
+-      fillStrategyMapFromSharding(
+-          m_executable_image->getInputSharding(arg_index), num_devices);
++  mlir::FailureOr<std::unordered_map<std::string, std::string>> strategy;
++  {
++    ExecutePhaseTimer timer(arg_label + " fillStrategyMapFromSharding");
++    strategy = fillStrategyMapFromSharding(
++        m_executable_image->getInputSharding(arg_index), num_devices);
++  }
+ 
+   if (mlir::failed(strategy)) {
+     LOG_F(ERROR, "Failed to fill strategy map from sharding");
+@@ -74,15 +125,23 @@ FlatbufferLoadedExecutableInstance::prepareInputTensor(
+   bool is_distributed = ::tt::runtime::getCurrentHostRuntime() ==
+                         tt::runtime::HostRuntime::Distributed;
+   if (is_distributed) {
++    ExecutePhaseTimer timer(arg_label + " materializeShellTensors");
+     materializeShellTensors(arg_buffers);
+   }
+ 
+-  PjrtTensor &tensor = PjrtTensor::from_pjrt_buffers(
+-      arg_buffers, m_executable_image->getDevicesMeshShape(), *strategy);
++  PjrtTensor *tensor = nullptr;
++  {
++    ExecutePhaseTimer timer(arg_label + " PjrtTensor::from_pjrt_buffers");
++    tensor = &PjrtTensor::from_pjrt_buffers(
++        arg_buffers, m_executable_image->getDevicesMeshShape(), *strategy);
++  }
+ 
+-  tensor.ensure_layout(runtime_device, expected_layout);
++  {
++    ExecutePhaseTimer timer(arg_label + " ensure_layout");
++    tensor->ensure_layout(runtime_device, expected_layout);
++  }
+ 
+-  return tensor.runtime_tensor();
++  return tensor->runtime_tensor();
+ }
+ 
+ void FlatbufferLoadedExecutableInstance::materializeShellTensors(
+@@ -164,6 +223,20 @@ void FlatbufferLoadedExecutableInstance::releaseResources() {
+ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+     PJRT_LoadedExecutable_Execute_Args *args) {
+   ZoneScoped;
++  static std::atomic<uint64_t> flatbuffer_execute_counter{0};
++  const uint64_t execute_id =
++      flatbuffer_execute_counter.fetch_add(1, std::memory_order_relaxed);
++  const std::string execute_label =
++      "flatbuffer_execute#" + std::to_string(execute_id);
++  ExecutePhaseTimer total_timer(execute_label + " total");
++  if (executeTimingEnabled()) {
++    const CompileOptions &options = m_executable_image->getCompileOptions();
++    LOG_F(INFO,
++          "[tt-xla execute timing] %s num_args=%zu num_devices=%zu "
++          "optimization_level=%d enable_trace=%d",
++          execute_label.c_str(), args->num_args, args->num_devices,
++          options.optimization_level, options.enable_trace);
++  }
+   DLOG_F(LOG_DEBUG, "FlatbufferLoadedExecutableInstance::Execute");
+   LOG_BRINGUP_STAGE("RUNTIME_EXECUTION_START");
+ 
+@@ -179,9 +252,13 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+     return tt_pjrt_status::kInternal;
+   }
+ 
+-  std::optional<tt::runtime::Device> runtime_device =
+-      getOrCreateMeshDevice(args->argument_lists, args->num_args,
+-                            args->num_devices, args->execute_device);
++  std::optional<tt::runtime::Device> runtime_device;
++  {
++    ExecutePhaseTimer timer(execute_label + " getOrCreateMeshDevice");
++    runtime_device = getOrCreateMeshDevice(args->argument_lists, args->num_args,
++                                           args->num_devices,
++                                           args->execute_device);
++  }
+ 
+   if (!runtime_device) {
+     // Logging is done inside `getOrCreateMeshDevice`.
+@@ -193,18 +270,24 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+ 
+   std::vector<tt::runtime::Tensor> input_tensors;
+   input_tensors.reserve(args->num_args);
+-  tt_pjrt_status status = getInputRuntimeTensors(
+-      args->argument_lists, args->num_args, args->num_devices, *runtime_device,
+-      program_index, input_tensors);
++  tt_pjrt_status status;
++  {
++    ExecutePhaseTimer timer(execute_label + " getInputRuntimeTensors");
++    status = getInputRuntimeTensors(args->argument_lists, args->num_args,
++                                    args->num_devices, *runtime_device,
++                                    program_index, input_tensors);
++  }
+   if (!tt_pjrt_status_is_ok(status)) {
+     return status;
+   }
+ 
+   if (m_executable_image->getCompileOptions().export_tensors) {
++    ExecutePhaseTimer timer(execute_label + " dumpInputs");
+     dumpInputs(input_tensors);
+   }
+ 
+   if (m_executable_image->getCompileOptions().dry_run) {
++    ExecutePhaseTimer timer(execute_label + " createDefaultOutputBuffers");
+     status = createDefaultOutputBuffers(args->output_lists, args->num_devices);
+     if (!tt_pjrt_status_is_ok(status)) {
+       return status;
+@@ -213,9 +296,12 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+     FlatbufferExecutableImage *executable_image =
+         static_cast<FlatbufferExecutableImage *>(m_executable_image.get());
+ 
+-    auto r = utils::invoke_noexcept(tt::runtime::submit, *runtime_device,
++    auto r = [&]() {
++      ExecutePhaseTimer timer(execute_label + " tt::runtime::submit");
++      return utils::invoke_noexcept(tt::runtime::submit, *runtime_device,
+                                     executable_image->getFlatbufferBinary(),
+                                     program_index, input_tensors);
++    }();
+ 
+     if (!r) {
+       m_client_instance->closeMeshDevice();
+@@ -232,9 +318,12 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+       return tt_pjrt_status::kInternal;
+     }
+ 
+-    status = fillPJRTOutputLists(output_tensors, args->num_devices,
+-                                 args->output_lists,
+-                                 m_executable_image->getOutputTypes());
++    {
++      ExecutePhaseTimer timer(execute_label + " fillPJRTOutputLists");
++      status = fillPJRTOutputLists(output_tensors, args->num_devices,
++                                   args->output_lists,
++                                   m_executable_image->getOutputTypes());
++    }
+     if (!tt_pjrt_status_is_ok(status)) {
+       return status;
+     }
+@@ -242,6 +331,7 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+ 
+   if (args->device_complete_events) {
+     for (int device_num = 0; device_num < args->num_devices; ++device_num) {
++      ExecutePhaseTimer timer(execute_label + " createDeviceCompleteEvent");
+       std::unique_ptr<EventInstance> device_complete_event =
+           EventInstance::createInstance();
+       EventInstance::markAsReadyAndCallback(device_complete_event.get(),

@@ -93,16 +93,15 @@ index 9e3d30cc..6e16628f 100644
    RankedTensorType newTensorType =
        utils::RankedTensorTypeFactory::create(producerTensorType, outputLayout);
  
-@@ -1464,5 +1468,17 @@ void MemoryLayoutPropagation::insertReshardOp(Operation *consumerOp,
+@@ -1464,5 +1468,16 @@ void MemoryLayoutPropagation::insertReshardOp(Operation *consumerOp,
    Location loc = ttmlir::utils::appendLocationSuffix(consumerOp->getLoc(),
                                                       "_mem_reconfig");
  
 +  bool needsLayoutOp = producerLayout.getLayout() != outputLayout.getLayout() ||
 +                       producerLayout.getDataType() != outputLayout.getDataType();
 +  if (needsLayoutOp) {
-+    ToLayoutOp layoutReconfigOp = builder.create<ToLayoutOp>(
-+        loc, newTensorType, operand,
-+        LayoutAttr::get(consumerOp->getContext(), outputLayout.getLayout()));
++    ToLayoutOp layoutReconfigOp =
++        builder.create<ToLayoutOp>(loc, newTensorType, operand);
 +    consumerOp->setOperand(operandIndex, layoutReconfigOp->getResult(0));
 +    TTMLIR_TRACE(ttmlir::LogComponent::GreedyOptimizer,
 +                 "Inserted layout reconfig op: {0}", layoutReconfigOp);
