@@ -272,6 +272,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_strip_sharding_constraints.patch",
         "//third_party/tt_xla:tt_mlir_allow_tilize_reshard.patch",
         "//third_party/tt_xla:tt_mlir_fast_reject_invalid_rotary_composite.patch",
+        "//third_party/tt_xla:tt_mlir_fast_is_sharded_module.patch",
         "//third_party/tt_xla:tt_mlir_runtime_submit_timing.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",

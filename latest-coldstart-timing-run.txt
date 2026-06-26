@@ -95,3 +95,20 @@ rotary_fast_reject_invalid_typed_op: /tmp/sglang-stable-jit-20260625-182409
   first_submit#268=48.500s
   decode_128=18.14 tok/s
   note=kept; skip expensive rotary_embedding typed-op validation when cache shape must decompose
+
+fast_is_sharded_module_pass_timing: /tmp/sglang-stable-jit-20260625-192342
+  curl_wall_seconds=198.86
+  compile#10=55.884s
+  compile#12=77.919s
+  first_submit#268=48.942s
+  flatten_pass_large_compiles=0.222s;0.205s
+  decode_128=18.08 tok/s
+  note=instrumentation run; output looked correct; avoids constructing default replicated result shardings in isShardedModule
+
+fast_is_sharded_module: /tmp/sglang-stable-jit-20260625-192757
+  curl_wall_seconds=198.81
+  compile#10=56.125s
+  compile#12=77.792s
+  first_submit#268=48.908s
+  decode_128=18.13 tok/s
+  note=kept; output looked correct; cold start improved from 317.74s after rotary fast reject
