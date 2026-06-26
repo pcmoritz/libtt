@@ -58,3 +58,23 @@ simple_lut_bfloat16_bfp8_pack: /tmp/sglang-stable-jit-20260625-140312
   typecast_total#268=44.525s
   decode_128=17.58 tok/s
   note=kept; output looked correct and this is the fastest cold-start result so far
+
+latest_tt_mlir_0427afb: /tmp/sglang-stable-jit-20260625-172839
+  curl_wall_seconds=351.61
+  compile#10=166.239s
+  compile#12=119.799s
+  compile_total=286.038s
+  first_submit#268=49.382s
+  typecast_total#268=42.071s
+  decode_128=18.20 tok/s
+  note=experiment; output looked correct; compiler time did not improve, but total cold start improved via faster submit
+
+latest_tt_mlir_0427afb_rerun: /tmp/sglang-stable-jit-20260625-173716
+  curl_wall_seconds=347.53
+  compile#10=163.268s
+  compile#12=119.437s
+  compile_total=282.704s
+  first_submit#268=48.757s
+  typecast_total#268=41.549s
+  decode_128=18.01 tok/s
+  note=rerun; confirms faster submit is real while compiler time remains noise-level

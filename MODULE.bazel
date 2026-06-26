@@ -257,7 +257,7 @@ git_repository(
 git_repository(
     name = "tt_mlir_src",
     build_file = "//third_party/tt_xla:tt_mlir.BUILD.bazel",
-    commit = "66f435da7fbed89a75309e4f72b9cefe615720ad",
+    commit = "0427afbec14e5792d0823b6e0ed7849cdf727378",
     patch_args = ["-p1"],
     patches = [
         "//third_party/tt_xla:tt_mlir_string_map_include.patch",
