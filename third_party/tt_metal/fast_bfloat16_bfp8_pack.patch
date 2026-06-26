@@ -14,7 +14,7 @@
  #include <tt_stl/assert.hpp>
  #include "blockfloat_common.hpp"
  #include "constants.hpp"
-@@ -328,6 +331,66 @@ uint8_t convert_u32_to_bfp(uint32_t input, uint32_t shared_exp, bool is_exp_a) {
+@@ -328,6 +331,90 @@ uint8_t convert_u32_to_bfp(uint32_t input, uint32_t shared_exp, bool is_exp_a) {
      return mantissa;
  }
  
@@ -28,6 +28,34 @@
 +    const auto face_shape = tile->get_face_shape();
 +    return tile_shape[0] == tt::constants::TILE_HEIGHT && tile_shape[1] == tt::constants::TILE_WIDTH &&
 +           face_shape[0] == tt::constants::FACE_HEIGHT && face_shape[1] == tt::constants::FACE_WIDTH;
++}
++
++const std::array<uint8_t, 256 * 256>& bfloat16_to_bfp8_b_lut() {
++    static const auto table = [] {
++        std::array<uint8_t, 256 * 256> result{};
++        constexpr uint32_t exp = 1;
++        for (uint32_t exp_diff = 0; exp_diff < 255; ++exp_diff) {
++            const uint32_t shared_exp = exp + exp_diff;
++            for (uint32_t sign_mantissa = 0; sign_mantissa < 256; ++sign_mantissa) {
++                const uint32_t sign = (sign_mantissa & 0x80) << 8;
++                const uint32_t mantissa = sign_mantissa & 0x7f;
++                const uint32_t bits = sign | (exp << 7) | mantissa;
++                result[(exp_diff << 8) | sign_mantissa] =
++                    convert_u32_to_bfp<tt::DataFormat::Bfp8_b, false>(bits << 16, shared_exp, false);
++            }
++        }
++        return result;
++    }();
++    return table;
++}
++
++uint8_t pack_bfloat16_as_bfp8_b(uint16_t bits, uint32_t shared_exp) {
++    const uint32_t exp = (bits & 0x7f80) >> 7;
++    if (exp == 0) {
++        return 0;
++    }
++    const uint32_t sign_mantissa = ((bits & 0x8000) >> 8) | (bits & 0x007f);
++    return bfloat16_to_bfp8_b_lut()[((shared_exp - exp) << 8) | sign_mantissa];
 +}
 +
 +std::vector<uint32_t> pack_tiled_bfloat16_as_bfp8_b(tt::stl::Span<const bfloat16> input_data) {
@@ -52,11 +80,9 @@
 +
 +        for (uint32_t row = 0; row < rows_per_tile; ++row) {
 +            const bfloat16* const row_input = tile_input + row * face_width;
-+            std::array<uint16_t, face_width> row_bits;
 +            uint32_t shared_exp = 0;
 +            for (uint32_t col = 0; col < face_width; ++col) {
 +                const uint16_t bits = std::bit_cast<uint16_t>(row_input[col]);
-+                row_bits[col] = bits;
 +                shared_exp = std::max(shared_exp, static_cast<uint32_t>((bits & 0x7f80) >> 7));
 +            }
 +
@@ -64,10 +90,8 @@
 +            for (uint32_t group = 0; group < face_width / 4; ++group) {
 +                uint32_t packed_word = 0;
 +                for (uint32_t i = 0; i < 4; ++i) {
-+                    const uint32_t fp32_bits = static_cast<uint32_t>(row_bits[group * 4 + i]) << 16;
-+                    packed_word |= static_cast<uint32_t>(
-+                                       convert_u32_to_bfp<tt::DataFormat::Bfp8_b, false>(fp32_bits, shared_exp, false))
-+                                   << (i * 8);
++                    const uint16_t bits = std::bit_cast<uint16_t>(row_input[group * 4 + i]);
++                    packed_word |= static_cast<uint32_t>(pack_bfloat16_as_bfp8_b(bits, shared_exp)) << (i * 8);
 +                }
 +                data_output[row * (face_width / 4) + group] = packed_word;
 +            }
@@ -81,7 +105,7 @@
  template <tt::DataFormat BfpFormat>
  std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles(
      tt::stl::Span<const float> fp32_vec,
-@@ -349,6 +412,11 @@ std::vector<uint32_t> pack_as_bfp_tiles(
+@@ -349,6 +436,11 @@ std::vector<uint32_t> pack_as_bfp_tiles(
          BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp8 ||
          BfpFormat == tt::DataFormat::Bfp2_b || BfpFormat == tt::DataFormat::Bfp4_b ||
          BfpFormat == tt::DataFormat::Bfp8_b);

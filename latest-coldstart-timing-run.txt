@@ -16,3 +16,45 @@ direct_converter_experiment: /tmp/sglang-stable-jit-20260625-013629
   typecast_total#268=86.653s
   decode_128=18.13 tok/s
   note=not kept; slower than the simpler fast path
+
+lut_bfloat16_bfp8_pack: /tmp/sglang-stable-jit-20260625-115517
+  curl_wall_seconds=401.65
+  first_submit#268=89.368s
+  typecast_total#268=58.077s
+  decode_128=18.05 tok/s
+  note=experiment; faster but not kept because it made the tt-metal patch harder to review
+
+simplified_lut_bfloat16_bfp8_pack: /tmp/sglang-stable-jit-20260625-121058
+  curl_wall_seconds=401.93
+  first_submit#268=89.597s
+  typecast_total#268=58.271s
+  decode_128=17.70 tok/s
+  note=experiment; not kept
+
+sign_lut_no_row_buffer_bfloat16_bfp8_pack: /tmp/sglang-stable-jit-20260625-122708
+  curl_wall_seconds=391.32
+  first_submit#268=80.624s
+  typecast_total#268=49.474s
+  decode_128=17.76 tok/s
+  note=experiment; fastest LUT variant, not kept because the patch was still more complex
+
+bf16_specialized_converter: /tmp/sglang-stable-jit-20260625-131344
+  curl_wall_seconds=425.58
+  first_submit#268=113.215s
+  typecast_total#268=81.675s
+  decode_128=17.90 tok/s
+  note=experiment; exact match for generic conversion, but not kept because it barely improves startup
+
+simde_bfloat16_bfp8_pack: /tmp/sglang-stable-jit-20260625-134119
+  curl_wall_seconds=623.26
+  first_submit#268=309.416s
+  typecast_total#268=278.797s
+  decode_128=18.05 tok/s
+  note=experiment; output looked correct, but not kept because SIMDe emulation made host packing much slower
+
+simple_lut_bfloat16_bfp8_pack: /tmp/sglang-stable-jit-20260625-140312
+  curl_wall_seconds=388.31
+  first_submit#268=74.810s
+  typecast_total#268=44.525s
+  decode_128=17.58 tok/s
+  note=kept; output looked correct and this is the fastest cold-start result so far
