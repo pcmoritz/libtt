@@ -106,13 +106,26 @@ index 0459533..d92abea 100644
  #include <cstdlib>
  #include <filesystem>
  #include <fstream>
-@@ -82,6 +83,40 @@ namespace tt::pjrt::module_builder {
+@@ -82,6 +83,53 @@ namespace tt::pjrt::module_builder {
  
  const std::string c_mlir_format_name = "mlir";
  
 +static bool compileTimingEnabled() {
 +  const char *env = std::getenv("TT_XLA_COMPILE_TIMING");
 +  return env != nullptr && !(env[0] == '0' && env[1] == '\0');
++}
++
++static bool compilePassTimingEnabled() {
++  const char *env = std::getenv("TT_XLA_COMPILE_PASS_TIMING");
++  return env != nullptr && !(env[0] == '0' && env[1] == '\0');
++}
++
++static void enablePassTiming(mlir::PassManager &pm, const char *label) {
++  if (!compilePassTimingEnabled()) {
++    return;
++  }
++  LOG_F(INFO, "[tt-xla compile timing] enable MLIR pass timing for %s", label);
++  pm.enableTiming();
 +}
 +
 +class CompilePhaseTimer {
@@ -168,9 +181,10 @@ index 0459533..d92abea 100644
  
    // Construct full name: {model_name}_g{N}
    // e.g., 1lyr_phi1_bs32_g0
-@@ -770,18 +819,25 @@ tt_pjrt_status ModuleBuilder::runCompilerStableHLOPipeline(
+@@ -770,18 +819,26 @@ tt_pjrt_status ModuleBuilder::runCompilerStableHLOPipeline(
  
    enableVerboseIRPrinting(stablehlo_pipeline_pm);
++  enablePassTiming(stablehlo_pipeline_pm, "runCompilerStableHLOPipeline");
  
 -  if (mlir::failed(stablehlo_pipeline_pm.run(mlir_module.get()))) {
 -    LOG_F(ERROR, "Failed to run stablehlo pipeline");
@@ -202,9 +216,10 @@ index 0459533..d92abea 100644
    }
  
    printModule(mlir_module, export_path, "shlo_set_mesh_attr", model_name);
-@@ -805,12 +861,18 @@ tt_pjrt_status ModuleBuilder::convertFromSHLOToTTIR(
+@@ -805,12 +861,19 @@ tt_pjrt_status ModuleBuilder::convertFromSHLOToTTIR(
  
    enableVerboseIRPrinting(shlo_to_ttir_pm);
++  enablePassTiming(shlo_to_ttir_pm, "convertFromSHLOToTTIR");
  
 -  if (mlir::failed(shlo_to_ttir_pm.run(mlir_module.get()))) {
 -    LOG_F(ERROR, "Failed to convert from SHLO to TTIR module");
@@ -225,8 +240,9 @@ index 0459533..d92abea 100644
  
    printModule(mlir_module, export_path, "ttir", model_name);
  
-@@ -1053,14 +1115,21 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+@@ -1053,14 +1115,22 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
    enableVerboseIRPrinting(ttir_to_ttnn_pm);
++  enablePassTiming(ttir_to_ttnn_pm, "convertFromTTIRToTTNN");
  
    // Run the pass manager.
 -  mlir::LogicalResult mlir_result = ttir_to_ttnn_pm.run(mlir_module.get());

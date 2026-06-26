@@ -1,0 +1,69 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
+index 8484bcf..15f36bf 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
+@@ -11,6 +11,7 @@
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/IR/Builders.h"
+ #include "mlir/IR/BuiltinOps.h"
++#include "mlir/IR/BuiltinTypes.h"
+ #include "mlir/IR/IRMapping.h"
+ #include "mlir/IR/SymbolTable.h"
+ 
+@@ -77,6 +78,43 @@ extractFlashMlaPrefillArgs(ttcore::CompositeOp compositeOp) {
+   return args;
+ }
+ 
++static bool hasStaticDim(mlir::RankedTensorType type, int64_t dim,
++                         int64_t expected) {
++  int64_t value = type.getShape()[dim < 0 ? type.getRank() + dim : dim];
++  return !mlir::ShapedType::isDynamic(value) && value == expected;
++}
++
++static bool rotaryCacheShapeCanUseTypedOp(ttcore::CompositeOp compositeOp) {
++  auto inputType =
++      dyn_cast<mlir::RankedTensorType>(compositeOp.getInputs()[0].getType());
++  auto cosCacheType =
++      dyn_cast<mlir::RankedTensorType>(compositeOp.getInputs()[1].getType());
++  auto sinCacheType =
++      dyn_cast<mlir::RankedTensorType>(compositeOp.getInputs()[2].getType());
++
++  if (!inputType || !cosCacheType || !sinCacheType || inputType.getRank() == 0 ||
++      cosCacheType.getRank() < 2 || sinCacheType.getRank() < 2) {
++    return true;
++  }
++
++  int64_t headDim = inputType.getShape().back();
++  if (mlir::ShapedType::isDynamic(headDim)) {
++    return true;
++  }
++
++  auto cacheShapeCanUseTypedOp = [headDim](mlir::RankedTensorType type) {
++    return hasStaticDim(type, 0, 1) && hasStaticDim(type, 1, 1) &&
++           hasStaticDim(type, -1, headDim);
++  };
++
++  // The TTNN rotary_embedding op only accepts cache tensors shaped
++  // [1, 1, ..., head_dim]. Other cache layouts should inline the composite
++  // decomposition directly instead of paying for expensive OpModel validation
++  // that is guaranteed to fail.
++  return cacheShapeCanUseTypedOp(cosCacheType) &&
++         cacheShapeCanUseTypedOp(sinCacheType);
++}
++
+ static void registerBuiltinComposites() {
+   auto &registry = getCompositeRegistry();
+   if (!registry.empty()) {
+@@ -110,7 +148,12 @@ static void registerBuiltinComposites() {
+       // Validate
+       [](ttcore::CompositeOp compositeOp,
+          OpBuilder &builder) -> OpValidationResult {
+         TT_assert(compositeOp.getInputs().size() == 3u);
++        if (!rotaryCacheShapeCanUseTypedOp(compositeOp)) {
++          return OpValidationResult::failure(
++              OpValidationResult::ValidationFailed,
++              "rotary_embedding cache shape is not supported by typed op");
++        }
+ 
+         SmallVector<Type> resultTypes(compositeOp.getResultTypes());
+         IsolatedIRValidationWrapper validator(compositeOp.getContext());

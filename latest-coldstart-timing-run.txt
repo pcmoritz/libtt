@@ -78,3 +78,20 @@ latest_tt_mlir_0427afb_rerun: /tmp/sglang-stable-jit-20260625-173716
   typecast_total#268=41.549s
   decode_128=18.01 tok/s
   note=rerun; confirms faster submit is real while compiler time remains noise-level
+
+compile_pass_timing: /tmp/sglang-stable-jit-20260625-180728
+  curl_wall_seconds=348.80
+  compile#10=164.668s
+  compile#12=119.074s
+  compile#10_top_passes=FlattenOrConvertCompositesPass 79.613s; TTNNResolveComposites 31.708s
+  compile#12_top_passes=FlattenOrConvertCompositesPass 43.561s; TTNNResolveComposites 30.776s
+  decode_128=18.02 tok/s
+  note=instrumentation run; output looked correct
+
+rotary_fast_reject_invalid_typed_op: /tmp/sglang-stable-jit-20260625-182409
+  curl_wall_seconds=317.74
+  compile#10=133.659s
+  compile#12=119.442s
+  first_submit#268=48.500s
+  decode_128=18.14 tok/s
+  note=kept; skip expensive rotary_embedding typed-op validation when cache shape must decompose
