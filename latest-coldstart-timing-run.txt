@@ -112,3 +112,21 @@ fast_is_sharded_module: /tmp/sglang-stable-jit-20260625-192757
   first_submit#268=48.908s
   decode_128=18.13 tok/s
   note=kept; output looked correct; cold start improved from 317.74s after rotary fast reject
+
+rotary_cache_seq_len_fast_reject: /tmp/sglang-stable-jit-20260625-202936
+  curl_wall_seconds=170.69
+  compile#10=56.805s
+  compile#12=48.206s
+  first_submit#268=49.584s
+  decode_128=18.17 tok/s
+  note=kept; output looked correct; skips rotary typed-op validation when cache sequence length cannot cover input sequence length
+
+parallel_bfp8_pack_load_cached: /tmp/sglang-stable-jit-20260625-230609
+  curl_wall_seconds=136.29
+  compile#10=56.183s
+  compile#12=48.550s
+  first_submit#268=15.344s
+  typecast_total#268=7.816s
+  load_cached_total#268=13.506s
+  decode_128=17.73 tok/s
+  note=kept; output looked correct; parallelizes host bfloat16->bfp8_b packing on LoadCachedOp cold misses

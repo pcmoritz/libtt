@@ -10,7 +10,7 @@ index 8484bcf..15f36bf 100644
  #include "mlir/IR/IRMapping.h"
  #include "mlir/IR/SymbolTable.h"
  
-@@ -77,6 +78,43 @@ extractFlashMlaPrefillArgs(ttcore::CompositeOp compositeOp) {
+@@ -77,6 +78,58 @@ extractFlashMlaPrefillArgs(ttcore::CompositeOp compositeOp) {
    return args;
  }
  
@@ -18,6 +18,12 @@ index 8484bcf..15f36bf 100644
 +                         int64_t expected) {
 +  int64_t value = type.getShape()[dim < 0 ? type.getRank() + dim : dim];
 +  return !mlir::ShapedType::isDynamic(value) && value == expected;
++}
++
++static bool dimIsDynamicOrAtLeast(mlir::RankedTensorType type, int64_t dim,
++                                  int64_t minimum) {
++  int64_t value = type.getShape()[dim < 0 ? type.getRank() + dim : dim];
++  return mlir::ShapedType::isDynamic(value) || value >= minimum;
 +}
 +
 +static bool rotaryCacheShapeCanUseTypedOp(ttcore::CompositeOp compositeOp) {
@@ -28,25 +34,34 @@ index 8484bcf..15f36bf 100644
 +  auto sinCacheType =
 +      dyn_cast<mlir::RankedTensorType>(compositeOp.getInputs()[2].getType());
 +
-+  if (!inputType || !cosCacheType || !sinCacheType || inputType.getRank() == 0 ||
-+      cosCacheType.getRank() < 2 || sinCacheType.getRank() < 2) {
++  if (!inputType || !cosCacheType || !sinCacheType) {
 +    return true;
++  }
++
++  if (inputType.getRank() != 4 || cosCacheType.getRank() != 4 ||
++      sinCacheType.getRank() != 4) {
++    return false;
 +  }
 +
 +  int64_t headDim = inputType.getShape().back();
-+  if (mlir::ShapedType::isDynamic(headDim)) {
++  int64_t inputSeqLen = inputType.getShape()[inputType.getRank() - 2];
++  if (mlir::ShapedType::isDynamic(headDim) ||
++      mlir::ShapedType::isDynamic(inputSeqLen)) {
 +    return true;
 +  }
 +
-+  auto cacheShapeCanUseTypedOp = [headDim](mlir::RankedTensorType type) {
++  auto cacheShapeCanUseTypedOp = [headDim,
++                                  inputSeqLen](mlir::RankedTensorType type) {
 +    return hasStaticDim(type, 0, 1) && hasStaticDim(type, 1, 1) &&
-+           hasStaticDim(type, -1, headDim);
++           hasStaticDim(type, -1, headDim) &&
++           dimIsDynamicOrAtLeast(type, -2, inputSeqLen);
 +  };
 +
 +  // The TTNN rotary_embedding op only accepts cache tensors shaped
-+  // [1, 1, ..., head_dim]. Other cache layouts should inline the composite
-+  // decomposition directly instead of paying for expensive OpModel validation
-+  // that is guaranteed to fail.
++  // [1, 1, cache_seq_len, head_dim] with cache_seq_len covering the input
++  // sequence. Other cache layouts should inline the composite decomposition
++  // directly instead of paying for expensive OpModel validation that is
++  // guaranteed to fail.
 +  return cacheShapeCanUseTypedOp(cosCacheType) &&
 +         cacheShapeCanUseTypedOp(sinCacheType);
 +}
@@ -54,7 +69,7 @@ index 8484bcf..15f36bf 100644
  static void registerBuiltinComposites() {
    auto &registry = getCompositeRegistry();
    if (!registry.empty()) {
-@@ -110,7 +148,12 @@ static void registerBuiltinComposites() {
+@@ -110,7 +163,12 @@ static void registerBuiltinComposites() {
        // Validate
        [](ttcore::CompositeOp compositeOp,
           OpBuilder &builder) -> OpValidationResult {
