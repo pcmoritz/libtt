@@ -1,0 +1,40 @@
+--- a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
++++ b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
+@@ -716,20 +716,28 @@
+     return false;
+   }
+   auto globalMeshOp = parsedMeshOps[0];
++  auto hasNonReplicatedSharding = [&](mlir::DictionaryAttr attrs) {
++    if (!attrs) {
++      return false;
++    }
++    auto sharding = mlir::dyn_cast_if_present<mlir::sdy::TensorShardingAttr>(
++        attrs.get(mlir::sdy::TensorShardingAttr::name));
++    return sharding && !isFullyReplicatedTensor(sharding, globalMeshOp);
++  };
++
+   for (auto funcOp : module.getOps<mlir::func::FuncOp>()) {
+-    for (auto inSharding :
+-         getInShardingAttrs(funcOp.getContext(), funcOp, globalMeshOp, false)) {
+-      if (!inSharding) {
+-        continue;
+-      }
+-      if (!isFullyReplicatedTensor(inSharding)) {
++    for (auto arg : funcOp.getArguments()) {
++      if (hasNonReplicatedSharding(funcOp.getArgAttrDict(arg.getArgNumber()))) {
+         return true;
+       }
+     }
+ 
+-    for (auto outSharding :
+-         getOutShardingAttrs(funcOp.getContext(), funcOp, globalMeshOp)) {
+-      if (!isFullyReplicatedTensor(outSharding)) {
++    mlir::FunctionType funcType = funcOp.getFunctionType();
++    for (uint32_t i = 0; i < funcType.getNumResults(); i++) {
++      auto resultAttrs = funcOp.getResultAttrs(i);
++      if (!resultAttrs.empty() &&
++          hasNonReplicatedSharding(
++              mlir::DictionaryAttr::get(funcOp.getContext(), resultAttrs))) {
+         return true;
+       }
+     }

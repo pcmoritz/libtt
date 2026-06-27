@@ -1,0 +1,12 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+index 7c5e0a5..aaebfe9 100644
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -1004,6 +1004,7 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+   }
+ 
+   options.optimizationLevel = compile_options.optimization_level;
++  options.eraseInverseOpsEnabled = false;
+   // Map user-facing dtype names to BFPDtype enum values.
+   if (compile_options.experimental_weight_dtype == "bfp_bf8") {
+     options.experimentalWeightDtype = mlir::tt::ttnn::BFPDtype::BFP_BFloat8;

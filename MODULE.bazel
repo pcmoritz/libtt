@@ -180,6 +180,7 @@ http_archive(
         "//third_party/tt_metal:disable_fabric_profiler.patch",
         "//third_party/tt_metal:disable_fabric_rtoptions.patch",
         "//third_party/tt_metal:disable_inspector_runtime.patch",
+        "//third_party/tt_metal:fast_bfloat16_bfp8_pack.patch",
     ],
     sha256 = "6a59d4c18fa7c4ba0da2e0317885e9f556624c3346fb37b976b08875d07d185f",
     strip_prefix = "tt-metal-13adda80c119631d18b0bc06163416ba148c25ab",
@@ -245,6 +246,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_disable_trace_global_fp32_acc.patch",
         "//third_party/tt_xla:tt_xla_propagate_mark_roles_through_unary_ops.patch",
         "//third_party/tt_xla:tt_xla_device_memory_stats.patch",
+        "//third_party/tt_xla:tt_xla_disable_erase_inverse_ops.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -252,7 +254,7 @@ git_repository(
 git_repository(
     name = "tt_mlir_src",
     build_file = "//third_party/tt_xla:tt_mlir.BUILD.bazel",
-    commit = "9660e3dc101c0b799a968ca509e7e00027ee6269",
+    commit = "0427afbec14e5792d0823b6e0ed7849cdf727378",
     patch_args = ["-p1"],
     patches = [
         "//third_party/tt_xla:tt_mlir_string_map_include.patch",
@@ -265,7 +267,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_ttnn_only_register_all.patch",
         "//third_party/tt_xla:tt_mlir_ttnn_only_runtime_paths.patch",
         "//third_party/tt_xla:tt_mlir_strip_sharding_constraints.patch",
-        "//third_party/tt_xla:tt_mlir_allow_tilize_reshard.patch",
+        "//third_party/tt_xla:tt_mlir_fast_is_sharded_module.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
