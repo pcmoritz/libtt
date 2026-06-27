@@ -74,6 +74,15 @@ env -u TT_METAL_RUNTIME_ROOT \
     --disable-radix-cache
 ```
 
+In another terminal, generate 128 tokens:
+
+```bash
+curl -sS http://127.0.0.1:31000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":128}}' \
+  | python3 -m json.tool
+```
+
 Point `PJRT_NAMES_AND_LIBRARY_PATHS` at the `libtt.so` built from this checkout
 if you build in a different directory. Keep `JAX_COMPILATION_CACHE_DIR` stable
 between runs to avoid recompiling the same Qwen3-8B shapes.
