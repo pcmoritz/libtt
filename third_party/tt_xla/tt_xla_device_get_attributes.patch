@@ -1,0 +1,61 @@
+diff --git a/pjrt_implementation/inc/api/device_instance.h b/pjrt_implementation/inc/api/device_instance.h
+--- a/pjrt_implementation/inc/api/device_instance.h
++++ b/pjrt_implementation/inc/api/device_instance.h
+@@ -120,6 +120,9 @@ namespace internal {
+ // Implements PJRT_Device_GetDescription API function.
+ PJRT_Error *onDeviceGetDescription(PJRT_Device_GetDescription_Args *args);
+ 
++// Implements PJRT_Device_GetAttributes API function.
++PJRT_Error *onDeviceGetAttributes(PJRT_Device_GetAttributes_Args *args);
++
+ // Implements PJRT_Device_IsAddressable API function.
+ PJRT_Error *onDeviceIsAddressable(PJRT_Device_IsAddressable_Args *args);
+ 
+diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementation/src/api/device_instance.cc
+--- a/pjrt_implementation/src/api/device_instance.cc
++++ b/pjrt_implementation/src/api/device_instance.cc
+@@ -16,6 +16,14 @@
+ #include "api/memory_instance.h"
+ #include "utils/logging.h"
+ 
++struct PJRT_Device_Attributes {};
++
++namespace {
++void deleteDeviceAttributes(PJRT_Device_Attributes *device_attributes) {
++  delete device_attributes;
++}
++} // namespace
++
+ namespace tt::pjrt {
+ 
+ std::unique_ptr<DeviceInstance> DeviceInstance::createInstance(
+@@ -38,6 +38,7 @@ std::unique_ptr<DeviceInstance> DeviceInstance::createInstance(
+ 
+ void DeviceInstance::bindApi(PJRT_Api *api) {
+   api->PJRT_Device_GetDescription = internal::onDeviceGetDescription;
++  api->PJRT_Device_GetAttributes = internal::onDeviceGetAttributes;
+   api->PJRT_Device_IsAddressable = internal::onDeviceIsAddressable;
+   api->PJRT_Device_LocalHardwareId = internal::onDeviceLocalHardwareId;
+   api->PJRT_Device_AddressableMemories = internal::onDeviceAddressableMemories;
+@@ -55,6 +64,21 @@ PJRT_Error *onDeviceGetDescription(PJRT_Device_GetDescription_Args *args) {
+   return nullptr;
+ }
+ 
++PJRT_Error *onDeviceGetAttributes(PJRT_Device_GetAttributes_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG, "DeviceInstance::PJRT_Device_GetAttributes");
++
++  const auto &attributes =
++      DeviceInstance::unwrap(args->device)->getDeviceDescription().getAttributes();
++
++  args->attributes = attributes.data();
++  args->num_attributes = attributes.size();
++  args->device_attributes = new PJRT_Device_Attributes();
++  args->attributes_deleter = deleteDeviceAttributes;
++
++  return nullptr;
++}
++
+ PJRT_Error *onDeviceIsAddressable(PJRT_Device_IsAddressable_Args *args) {
+   ZoneScoped;
+   DLOG_F(LOG_DEBUG, "DeviceInstance::PJRT_Device_IsAddressable");

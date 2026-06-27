@@ -1,0 +1,132 @@
+diff --git a/pjrt_implementation/inc/api/memory_instance.h b/pjrt_implementation/inc/api/memory_instance.h
+--- a/pjrt_implementation/inc/api/memory_instance.h
++++ b/pjrt_implementation/inc/api/memory_instance.h
+@@ -14,7 +14,8 @@
+ // c++ standard library includes
+ #include <memory>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ 
+ // PJRT C API includes
+@@ -31,6 +32,8 @@ public:
+   createInstance(std::vector<DeviceInstance *> &addressable_by_devices,
+                  size_t id, bool is_host_memory);
+ 
++  ~MemoryInstance();
++
+   // Binds PJRT API functions implementation related to PJRT_Memory structure.
+   static void bindApi(PJRT_Api *api);
+ 
+@@ -46,6 +49,9 @@ public:
+     return reinterpret_cast<MemoryInstance *>(memory);
+   }
+ 
++  void *getUserData(const void *key) const;
++  void setUserData(const void *key, void *data, void (*dtor)(void *));
++
+   // Gets the list of devices that can address this memory.
+   const std::vector<DeviceInstance *> &getAddressableByDevices() const {
+     return m_addressable_by_devices;
+@@ -77,6 +83,14 @@ private:
+   MemoryInstance(std::vector<DeviceInstance *> &addressable_by_devices,
+                  size_t id, bool is_host_memory);
+ 
++  struct UserData {
++    void *data = nullptr;
++    void (*dtor)(void *) = nullptr;
++  };
++
++  // PJRT_Memory C API header. Must remain the first data member.
++  PJRT_Memory m_memory;
++
+   // List of devices that can access this memory.
+   std::vector<DeviceInstance *> m_addressable_by_devices;
+ 
+@@ -90,5 +104,8 @@ private:
+   // Debug string of the memory.
+   std::string m_debug_string;
++
++  // User data attached by the PJRT C API wrapper.
++  std::unordered_map<const void *, UserData> m_user_data;
+ };
+ 
+ namespace internal {
+diff --git a/pjrt_implementation/src/api/memory_instance.cc b/pjrt_implementation/src/api/memory_instance.cc
+--- a/pjrt_implementation/src/api/memory_instance.cc
++++ b/pjrt_implementation/src/api/memory_instance.cc
+@@ -19,6 +19,25 @@
+ #include "utils/assert.h"
+ #include "utils/logging.h"
+ 
++namespace {
++void *getMemoryUserData(PJRT_Memory *memory, const void *key) {
++  return tt::pjrt::MemoryInstance::unwrap(memory)->getUserData(key);
++}
++
++void setMemoryUserData(PJRT_Memory *memory, const void *key, void *data,
++                       void (*dtor)(void *)) {
++  tt::pjrt::MemoryInstance::unwrap(memory)->setUserData(key, data, dtor);
++}
++
++const PJRT_Memory_FunctionTable kMemoryFunctionTable = {
++    PJRT_Memory_FunctionTable_STRUCT_SIZE,
++    nullptr,
++    PJRT_Memory_STRUCT_SIZE,
++    getMemoryUserData,
++    setMemoryUserData,
++};
++} // namespace
++
+ namespace tt::pjrt {
+ 
+ const std::string MemoryInstance::c_host_memory_kind_name = "pinned_host";
+@@ -40,6 +61,14 @@ std::unique_ptr<MemoryInstance> MemoryInstance::createInstance(
+                                                is_host_memory);
+ }
+ 
++MemoryInstance::~MemoryInstance() {
++  for (auto &[_, user_data] : m_user_data) {
++    if (user_data.dtor) {
++      user_data.dtor(user_data.data);
++    }
++  }
++}
++
+ void MemoryInstance::bindApi(PJRT_Api *api) {
+   api->PJRT_Memory_AddressableByDevices =
+       internal::onMemoryAddressableByDevices;
+@@ -50,12 +79,31 @@ void MemoryInstance::bindApi(PJRT_Api *api) {
+ MemoryInstance::MemoryInstance(
+     std::vector<DeviceInstance *> &addressable_by_devices, size_t id,
+     bool is_host_memory)
+-    : m_addressable_by_devices(addressable_by_devices), m_id(id),
+-      m_is_host_memory(is_host_memory) {
++    : m_memory{&kMemoryFunctionTable},
++      m_addressable_by_devices(addressable_by_devices),
++      m_is_host_memory(is_host_memory), m_id(id) {
+   m_debug_string =
+       "MemoryInstance: " + std::to_string(id) + " (" + getMemoryKind() + ")";
+ }
+ 
++void *MemoryInstance::getUserData(const void *key) const {
++  auto it = m_user_data.find(key);
++  return it == m_user_data.end() ? nullptr : it->second.data;
++}
++
++void MemoryInstance::setUserData(const void *key, void *data,
++                                 void (*dtor)(void *)) {
++  auto it = m_user_data.find(key);
++  if (it != m_user_data.end() && it->second.dtor) {
++    it->second.dtor(it->second.data);
++  }
++  if (data == nullptr) {
++    m_user_data.erase(key);
++    return;
++  }
++  m_user_data[key] = UserData{data, dtor};
++}
++
+ DeviceInstance *MemoryInstance::getDevice() {
+   DLOG_F(LOG_DEBUG, "MemoryInstance::getDevice");
+ 
