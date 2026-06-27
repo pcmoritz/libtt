@@ -11,6 +11,20 @@ bazel_dep(name = "rules_shell", version = "0.6.1")
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    python_version = "3.13",
+)
+use_repo(python, "python_3_13")
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "jax_test_pip",
+    python_version = "3.13",
+    requirements_lock = "//:requirements-jax-tests.txt",
+)
+use_repo(pip, "jax_test_pip")
+
 http_archive(
     name = "libarchive",
     build_file = "//third_party/libarchive:BUILD.overlay.bazel",
@@ -20,6 +34,19 @@ http_archive(
     strip_prefix = "libarchive-3.8.1",
     urls = [
         "https://github.com/libarchive/libarchive/releases/download/v3.8.1/libarchive-3.8.1.tar.xz",
+    ],
+)
+
+http_archive(
+    name = "jax_src",
+    build_file = "//third_party/jax:BUILD.overlay.bazel",
+    patch_cmds = [
+        "find tests -name BUILD -delete",
+    ],
+    sha256 = "d46cb98795f2c1ccdf2b081e02d9d74b659063679a80beb001ad17d482a60e17",
+    strip_prefix = "jax-jax-v0.6.2",
+    urls = [
+        "https://github.com/jax-ml/jax/archive/refs/tags/jax-v0.6.2.tar.gz",
     ],
 )
 

@@ -20,6 +20,28 @@ bazel build //:tt
 
 The output is `bazel-bin/libtt.so`.
 
+## JAX Test Suite
+
+There is a Bazel-managed harness for running upstream JAX tests against the
+`libtt.so` built by this checkout. A small smoke subset currently passes:
+
+```bash
+bazel test //tests:jax_smoke_tests --test_output=streamed
+```
+
+The test targets are tagged `manual`, `exclusive`, `no-sandbox`, and
+`requires-tt-device`. The broader runner passes extra pytest arguments through
+with
+`--test_arg`; for example, to collect one upstream JAX test file without opening
+the TT device:
+
+```bash
+bazel test //tests:jax_test_suite \
+  --test_arg=--skip-device-check \
+  --test_arg=--collect-only \
+  --test_arg=tests/lax_numpy_test.py
+```
+
 ## Qwen3 With SGLang-JAX
 
 Build `libtt.so` first:
