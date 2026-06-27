@@ -1,0 +1,71 @@
+load("@jax_test_pip//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_test")
+
+JAX_TEST_ARGS = [
+    "--jax-tests-anchor=$(rlocationpath @jax_src//:jax_tests_anchor)",
+    "--libtt=$(rlocationpath //:tt)",
+]
+
+JAX_TEST_DATA = [
+    "//:tt",
+    "@jax_src//:jax_tests",
+    "@jax_src//:jax_tests_anchor",
+]
+
+JAX_TEST_DEPS = [
+    requirement("absl-py"),
+    requirement("cloudpickle"),
+    requirement("filelock"),
+    requirement("flatbuffers"),
+    requirement("hypothesis"),
+    requirement("jax"),
+    requirement("jaxlib"),
+    requirement("matplotlib"),
+    requirement("mpmath"),
+    requirement("numpy"),
+    requirement("pillow"),
+    requirement("portpicker"),
+    requirement("pytest"),
+    requirement("scipy"),
+]
+
+JAX_TEST_TAGS = [
+    "exclusive",
+    "manual",
+    "no-sandbox",
+    "requires-tt-device",
+]
+
+py_test(
+    name = "jax_smoke_tests",
+    srcs = ["jax_test_suite.py"],
+    args = JAX_TEST_ARGS + [
+        "tests/device_test.py",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant0",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant1",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant2",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant3",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant4",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant5",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant7",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant8",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant9",
+    ],
+    data = JAX_TEST_DATA,
+    deps = JAX_TEST_DEPS,
+    main = "jax_test_suite.py",
+    python_version = "PY3",
+    tags = JAX_TEST_TAGS,
+    timeout = "long",
+)
+
+py_test(
+    name = "jax_test_suite",
+    srcs = ["jax_test_suite.py"],
+    args = JAX_TEST_ARGS,
+    data = JAX_TEST_DATA,
+    deps = JAX_TEST_DEPS,
+    python_version = "PY3",
+    tags = JAX_TEST_TAGS,
+    timeout = "eternal",
+)
