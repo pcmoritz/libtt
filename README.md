@@ -2,7 +2,9 @@
 
 `libtt.so` is a Bazel-built PJRT plugin for Tenstorrent devices. The PJRT
 implementation comes from the pinned `tt-xla` repository, with `tt-mlir` and
-`tt-metal` built through Bazel overlays in this repository.
+`tt-metal` built through Bazel overlays in this repository. Everything needed
+to run Jax code (including the tt-metal runtime and compiler) is bundled into
+the `libtt.so` file. We also apply patches so sglang-jax works out of the box.
 
 The local code in this repository is intentionally small:
 
@@ -79,10 +81,6 @@ In another terminal, generate 128 tokens:
 ```bash
 curl -sS http://127.0.0.1:31000/generate \
   -H 'Content-Type: application/json' \
-  -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":128}}' \
-  | python3 -m json.tool
+  -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":128}}'
 ```
 
-Point `PJRT_NAMES_AND_LIBRARY_PATHS` at the `libtt.so` built from this checkout
-if you build in a different directory. Keep `JAX_COMPILATION_CACHE_DIR` stable
-between runs to avoid recompiling the same Qwen3-8B shapes.
