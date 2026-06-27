@@ -84,5 +84,5 @@ curl -sS http://127.0.0.1:31000/generate \
   -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":128}}'
 ```
 
-On a blackhole chip, the generation speed should be about 18 tokens per second.
+On a blackhole chip, the generation speed should be about 19 tokens per second after some initial warmup.
 
