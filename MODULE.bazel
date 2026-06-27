@@ -179,7 +179,6 @@ http_archive(
         "//third_party/tt_metal:disable_fabric_system_mesh.patch",
         "//third_party/tt_metal:disable_fabric_profiler.patch",
         "//third_party/tt_metal:stable_mock_jit_build_key.patch",
-        "//third_party/tt_metal:rtoptions_respect_false_values.patch",
         "//third_party/tt_metal:disable_fabric_rtoptions.patch",
         "//third_party/tt_metal:disable_inspector_runtime.patch",
         "//third_party/tt_metal:fast_bfloat16_bfp8_pack.patch",
