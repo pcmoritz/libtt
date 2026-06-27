@@ -85,4 +85,3 @@ curl -sS http://127.0.0.1:31000/generate \
 ```
 
 On a blackhole chip, the generation speed should be about 19 tokens per second after some initial warmup.
-
