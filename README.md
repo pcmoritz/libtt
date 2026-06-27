@@ -18,8 +18,7 @@ The local code in this repository is intentionally small:
 bazel build //:tt
 ```
 
-The output is `bazel-bin/libtt.so` on Linux and `bazel-bin/libtt.dylib` on
-macOS.
+The output is `bazel-bin/libtt.so`.
 
 ## Qwen3 With SGLang-JAX
 
@@ -84,5 +83,4 @@ curl -sS http://127.0.0.1:31000/generate \
   -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":128}}'
 ```
 
-On a blackhole chip, the generation speed should be about 18 tokens per second.
-
+On a blackhole chip, the generation speed should be about 19 tokens per second after some initial warmup.
