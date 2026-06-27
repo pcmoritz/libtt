@@ -18,8 +18,7 @@ The local code in this repository is intentionally small:
 bazel build //:tt
 ```
 
-The output is `bazel-bin/libtt.so` on Linux and `bazel-bin/libtt.dylib` on
-macOS.
+The output is `bazel-bin/libtt.so`.
 
 ## Qwen3 With SGLang-JAX
 
