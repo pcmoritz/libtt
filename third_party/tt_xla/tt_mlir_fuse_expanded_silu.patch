@@ -1,12 +1,49 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-index 2f2a3ef..c9175a5 100644
+index 2f2a3ef..f5d7539 100644
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -532,50 +532,95 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+@@ -532,50 +532,131 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
  public:
++  static mlir::Value lookThroughConstantShapeOps(mlir::Value value) {
++    while (Operation *op = value.getDefiningOp()) {
++      if (auto typecastOp = mlir::dyn_cast<TypecastOp>(op)) {
++        value = typecastOp.getInput();
++        continue;
++      }
++      if (auto reshapeOp = mlir::dyn_cast<ReshapeOp>(op)) {
++        value = reshapeOp.getInput();
++        continue;
++      }
++      if (auto broadcastOp = mlir::dyn_cast<BroadcastOp>(op)) {
++        value = broadcastOp.getInput();
++        continue;
++      }
++      break;
++    }
++    return value;
++  }
++
++  static bool isOneValue(mlir::Value value) {
++    value = lookThroughConstantShapeOps(value);
++    if (isFullOpWithValue(value, 1.0f)) {
++      return true;
++    }
++
++    auto constantOp = value.getDefiningOp<ConstantOp>();
++    if (!constantOp) {
++      return false;
++    }
++    auto denseAttr = mlir::dyn_cast<DenseElementsAttr>(constantOp.getValue());
++    if (!denseAttr || !denseAttr.isSplat()) {
++      return false;
++    }
++    return std::abs(denseAttr.getSplatValue<APFloat>().convertToFloat() -
++                    1.0f) < 1e-6f;
++  }
++
 +  std::optional<mlir::Value> matchSigmoidInput(mlir::Value value) const {
 +    value = ttmlir::utils::lookThrough<TypecastOp>(value);
 +    if (auto sigmoidOp = value.getDefiningOp<SigmoidOp>()) {
@@ -27,8 +64,7 @@ index 2f2a3ef..c9175a5 100644
 +      return std::nullopt;
 +    }
 +
-+    mlir::Value one = ttmlir::utils::lookThrough<TypecastOp>(divOp.getLhs());
-+    if (!isFullOpWithValue(one, 1.0f)) {
++    if (!isOneValue(divOp.getLhs())) {
 +      return std::nullopt;
 +    }
 +
@@ -41,9 +77,9 @@ index 2f2a3ef..c9175a5 100644
 +    mlir::Value expValue;
 +    mlir::Value lhs = ttmlir::utils::lookThrough<TypecastOp>(addOp.getLhs());
 +    mlir::Value rhs = ttmlir::utils::lookThrough<TypecastOp>(addOp.getRhs());
-+    if (isFullOpWithValue(lhs, 1.0f)) {
++    if (isOneValue(lhs)) {
 +      expValue = rhs;
-+    } else if (isFullOpWithValue(rhs, 1.0f)) {
++    } else if (isOneValue(rhs)) {
 +      expValue = lhs;
 +    } else {
 +      return std::nullopt;
