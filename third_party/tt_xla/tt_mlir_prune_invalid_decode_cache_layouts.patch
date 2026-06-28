@@ -60,7 +60,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialec
  //===----------------------------------------------------------------------===//
  // RotaryEmbeddingRuleBook
  //===----------------------------------------------------------------------===//
-@@ -128,4 +151,12 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -128,4 +151,19 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    return nullptr;
  }
 
@@ -68,6 +68,13 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialec
 +PagedUpdateCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
 +  if (operandIdx == 0) {
 +    return cacheBufferDramOnlyFilter();
++  }
++  if (operandIdx == 1) {
++    return [](TTNNLayoutAttr layout) -> bool {
++      auto ml = layout.getMemLayout();
++      return layout.hasL1BufferType() && ml &&
++             ml.getValue() == TensorMemoryLayout::HeightSharded;
++    };
 +  }
 +  return nullptr;
 +}
