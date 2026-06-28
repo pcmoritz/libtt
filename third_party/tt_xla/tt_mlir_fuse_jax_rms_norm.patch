@@ -1,0 +1,129 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+index 2f2a3ef..d910e89 100644
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -2620,7 +2620,8 @@ private:
+ 
+ namespace {
+ 
+-// Fuses: (x * rsqrt(mean(x^2) + epsilon)) * gamma -> RMSNormOp
++// Fuses: (x * rsqrt(mean(x^2) + epsilon)) * gamma -> RMSNormOp.
++// Also accepts JAX's sum(x^2) / N mean lowering and x * (rsqrt(...) * gamma).
+ class RMSNormFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+   using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
+ 
+@@ -2657,6 +2658,19 @@ public:
+           });
+     };
+ 
++    auto dropSubtractZero = [&](mlir::Value value) {
++      value = lookThroughSafeOps(value);
++      auto subtract = value.getDefiningOp<SubtractOp>();
++      if (!subtract) {
++        return value;
++      }
++      mlir::Value rhs = lookThroughSafeOps(subtract.getRhs());
++      if (!isFullOpWithValue(rhs, 0.0f)) {
++        return value;
++      }
++      return lookThroughSafeOps(subtract.getLhs());
++    };
++
+     MultiplyOp innerMul =
+         ttmlir::utils::findOpThrough<MultiplyOp, TypecastOp>(outerMul.getLhs());
+     mlir::Value gammaRaw = outerMul.getRhs();
+@@ -2687,32 +2700,62 @@ public:
+       return mlir::failure();
+     }
+ 
+-    MeanOp meanOp = addOp.getLhs().getDefiningOp<MeanOp>();
++    auto getLastDimReductionInput =
++        [&](mlir::Value value) -> std::optional<mlir::Value> {
++      auto checkReduction = [&](auto reductionOp) -> std::optional<mlir::Value> {
++        auto dimArg = reductionOp.getDimArg();
++        if (!dimArg || dimArg->size() != 1) {
++          return std::nullopt;
++        }
++        auto inputType =
++            mlir::cast<RankedTensorType>(reductionOp.getInput().getType());
++        int64_t dim = mlir::cast<mlir::IntegerAttr>((*dimArg)[0]).getInt();
++        int64_t actualDim = dim < 0 ? inputType.getRank() + dim : dim;
++        if (actualDim != inputType.getRank() - 1) {
++          return std::nullopt;
++        }
++        return reductionOp.getInput();
++      };
++
++      value = lookThroughSafeOps(value);
++      if (auto meanOp = value.getDefiningOp<MeanOp>()) {
++        return checkReduction(meanOp);
++      }
++
++      auto divOp = value.getDefiningOp<DivOp>();
++      if (!divOp) {
++        return std::nullopt;
++      }
++      auto sumOp = lookThroughSafeOps(divOp.getLhs()).getDefiningOp<SumOp>();
++      if (!sumOp) {
++        return std::nullopt;
++      }
++      auto sumInputType =
++          mlir::cast<RankedTensorType>(sumOp.getInput().getType());
++      if (sumInputType.getRank() == 0 ||
++          !isFullOpWithValue(lookThroughSafeOps(divOp.getRhs()),
++                             static_cast<float>(sumInputType.getShape().back()),
++                             1e-3f)) {
++        return std::nullopt;
++      }
++      return checkReduction(sumOp);
++    };
++
++    std::optional<mlir::Value> reductionInput =
++        getLastDimReductionInput(addOp.getLhs());
+     mlir::Value epsilon = addOp.getRhs();
+-    if (!meanOp) {
+-      meanOp = addOp.getRhs().getDefiningOp<MeanOp>();
++    if (!reductionInput) {
++      reductionInput = getLastDimReductionInput(addOp.getRhs());
+       epsilon = addOp.getLhs();
+     }
+-    if (!meanOp) {
+-      return mlir::failure();
+-    }
+-
+-    auto dimArg = meanOp.getDimArg();
+-    if (!dimArg || dimArg->size() != 1) {
+-      return mlir::failure();
+-    }
+-    auto meanInputType =
+-        mlir::cast<RankedTensorType>(meanOp.getInput().getType());
+-    int64_t dim = mlir::cast<mlir::IntegerAttr>((*dimArg)[0]).getInt();
+-    int64_t actualDim = dim < 0 ? meanInputType.getRank() + dim : dim;
+-    if (actualDim != meanInputType.getRank() - 1) {
++    if (!reductionInput) {
+       return mlir::failure();
+     }
+ 
+     // Match x^2 as mul(x,x) or pow(x,2).
+-    mlir::Value meanInput = meanOp.getInput();
++    mlir::Value meanInput = *reductionInput;
+     mlir::Value squareInput = nullptr;
+-    mlir::Value x = lookThroughSafeOps(xRaw);
++    mlir::Value x = dropSubtractZero(xRaw);
+ 
+     if (auto sq = meanInput.getDefiningOp<MultiplyOp>()) {
+       if (sq.getLhs() == sq.getRhs()) {
+@@ -2726,6 +2757,11 @@ public:
+     }
+ 
+     if (!squareInput || squareInput != x) {
+-      return mlir::failure();
++      mlir::Value swappedX = dropSubtractZero(gammaRaw);
++      if (squareInput != swappedX) {
++        return mlir::failure();
++      }
++      x = swappedX;
++      gammaRaw = xRaw;
+     }
+ 
+     auto epsFull = epsilon.getDefiningOp<FullOp>();
