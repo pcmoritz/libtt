@@ -287,6 +287,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_prune_invalid_sharded_matmul_layouts.patch",
         "//third_party/tt_xla:tt_mlir_prune_invalid_sharded_norm_concat_layouts.patch",
         "//third_party/tt_xla:tt_mlir_prune_invalid_paged_fill_cache_layouts.patch",
+        "//third_party/tt_xla:tt_mlir_prune_invalid_decode_cache_layouts.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

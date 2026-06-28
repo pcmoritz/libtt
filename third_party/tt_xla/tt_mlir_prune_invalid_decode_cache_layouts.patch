@@ -1,0 +1,111 @@
+diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h
+--- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h
++++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h
+@@ -55,6 +55,13 @@ struct SDPADecodeRuleBook : SDPARuleBook {
+   LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
+ };
+
++/// NLPCreateQKVHeadsDecode: input must be width-sharded with shard widths
++/// that do not split a Qwen decode head. Other candidates trip tt-metal's
++/// "partial heads in shards" validation.
++struct NLPCreateQKVHeadsDecodeRuleBook : SDPARuleBook {
++  LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
++};
++
+ /// RotaryEmbedding / RotaryEmbeddingLlama:
+ /// NULL hint only, no reshards. Rejects width-sharded and block-sharded
+ /// inputs (only height-sharded or interleaved accepted).
+@@ -91,6 +100,10 @@ struct PagedFillCacheRuleBook : OpRuleBook {
+   LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
+ };
+
++struct PagedUpdateCacheRuleBook : OpRuleBook {
++  LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
++};
++
+ } // namespace mlir::tt::ttnn
+
+ #endif // TTMLIR_DIALECT_TTNN_ANALYSIS_OPRULES_TRANSFORMERRULES_H
+diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
+--- a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
++++ b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
+@@ -59,6 +59,30 @@ SDPADecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+   return layout_filter_utils::requireDRAMInterleaved;
+ }
+
++//===----------------------------------------------------------------------===//
++// NLPCreateQKVHeadsDecodeRuleBook
++//===----------------------------------------------------------------------===//
++
++LayoutFilterFn
++NLPCreateQKVHeadsDecodeRuleBook::getInputLayoutFilter(
++    unsigned operandIdx) const {
++  if (operandIdx != 0) {
++    return layout_filter_utils::requireDRAMInterleaved;
++  }
++  return [](TTNNLayoutAttr layout) -> bool {
++    auto ml = layout.getMemLayout();
++    if (!ml || ml.getValue() != TensorMemoryLayout::WidthSharded) {
++      return false;
++    }
++    auto shardShape = layout.getScalarShardShape();
++    if (shardShape.size() < 2 || shardShape[1] <= 0) {
++      return false;
++    }
++    constexpr int64_t qwenHeadDim = 128;
++    return qwenHeadDim % shardShape[1] == 0;
++  };
++}
++
+ //===----------------------------------------------------------------------===//
+ // RotaryEmbeddingRuleBook
+ //===----------------------------------------------------------------------===//
+@@ -128,4 +151,12 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+   return nullptr;
+ }
+
++LayoutFilterFn
++PagedUpdateCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
++  if (operandIdx == 0) {
++    return cacheBufferDramOnlyFilter();
++  }
++  return nullptr;
++}
++
+ } // namespace mlir::tt::ttnn
+diff --git a/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp b/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp
+--- a/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp
++++ b/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp
+@@ -76,6 +76,7 @@ const OpRuleBook &getRuleBook(Operation *op) {
+   static ConcatenateHeadsRuleBook concatHeads;
+   static SDPARuleBook sdpa;
+   static SDPADecodeRuleBook sdpaDecode;
++  static NLPCreateQKVHeadsDecodeRuleBook nlpCreateQKVHeadsDecode;
+   static EmbeddingRuleBook embedding;
+   static TypecastRuleBook typecast;
+   static RotaryEmbeddingRuleBook rotaryEmbedding;
+@@ -84,6 +85,7 @@ const OpRuleBook &getRuleBook(Operation *op) {
+   static MoeRuleBook moe;
+   static FillCacheRuleBook fillCache;
+   static PagedFillCacheRuleBook pagedFillCache;
++  static PagedUpdateCacheRuleBook pagedUpdateCache;
+
+   static llvm::DenseMap<mlir::OperationName, const OpRuleBook *> registry;
+   static std::once_flag initFlag;
+@@ -112,6 +114,8 @@ const OpRuleBook &getRuleBook(Operation *op) {
+     reg(ScaledDotProductAttentionDecodeOp::getOperationName(), &sdpaDecode);
+     reg(PagedScaledDotProductAttentionDecodeOp::getOperationName(),
+         &sdpaDecode);
++    reg(NLPCreateQKVHeadsDecodeOp::getOperationName(),
++        &nlpCreateQKVHeadsDecode);
+     reg(EmbeddingOp::getOperationName(), &embedding);
+     reg(TypecastOp::getOperationName(), &typecast);
+     reg(WhereOp::getOperationName(), &typecast);
+@@ -124,6 +128,7 @@ const OpRuleBook &getRuleBook(Operation *op) {
+     reg(PrepareMoEComputeW2WeightsOp::getOperationName(), &moe);
+     reg(FillCacheOp::getOperationName(), &fillCache);
+     reg(PagedFillCacheOp::getOperationName(), &pagedFillCache);
++    reg(PagedUpdateCacheOp::getOperationName(), &pagedUpdateCache);
+   });
+   auto it = registry.find(op->getName());
+   return it != registry.end() ? *it->second : defaultRules;
