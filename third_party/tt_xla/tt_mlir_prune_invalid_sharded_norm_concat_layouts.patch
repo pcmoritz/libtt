@@ -1,10 +1,17 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 --- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 +++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
-@@ -37,6 +37,11 @@ struct RmsNormRuleBook : OpRuleBook {
+@@ -37,6 +37,18 @@ struct RmsNormRuleBook : OpRuleBook {
    /// block/width sharded, or single-core height-sharded.
    LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
  
++  /// Prefer the one-core height-sharded layout used by Qwen decode Q/K
++  /// tensors. The generic legal-config pruning keeps high-core shardings first
++  /// and can drop this low-core-but-no-reshard candidate.
++  OutputHints
++  getOutputHints(Operation *op,
++                 const std::vector<OpConfig> &legalConfigs) const override;
++
 +  /// tt-metal requires sharded RMSNorm inputs to produce sharded outputs.
 +  bool isValidOutputHintForInputs(
 +      const OpConfig &hint,
@@ -16,10 +23,100 @@ diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h b
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
-@@ -76,6 +76,29 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -3,6 +3,12 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h"
++#include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
++#include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTNN/Analysis/OpRules/LayoutFilterUtils.h"
+ #include "ttmlir/Utils.h"
+ 
++#include "llvm/ADT/STLExtras.h"
++
++#include <algorithm>
++
+@@ -30,6 +36,43 @@ int64_t inputOperandTileHeight(Operation *op, unsigned operandIdx) {
+   return nc * ht;
+ }
+ 
++bool isQwenDecodeHeadRmsNorm(Operation *op) {
++  if (op->getNumResults() == 0) {
++    return false;
++  }
++
++  auto resultType =
++      mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
++  if (!resultType || resultType.getRank() != 4) {
++    return false;
++  }
++
++  ArrayRef<int64_t> shape = resultType.getShape();
++  return shape[0] == 1 && shape[1] == 1 && shape[3] == 128 &&
++         (shape[2] == 8 || shape[2] == 32);
++}
++
++TTNNLayoutAttr getSingleCoreHeightShardedLayout(Operation *op) {
++  auto resultType =
++      mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
++  if (!resultType) {
++    return nullptr;
++  }
++
++  auto seed =
++      mlir::dyn_cast_or_null<TTNNLayoutAttr>(resultType.getEncoding());
++  if (!seed) {
++    return nullptr;
++  }
++
++  ttcore::DeviceAttr deviceAttr = ttcore::lookupDevice(op);
++  return TTNNLayoutAttr::Builder(seed, resultType.getShape())
++      .setBufferType(BufferType::L1)
++      .setMemoryLayout(TensorMemoryLayout::HeightSharded)
++      .setGridShape({1, 1})
++      .buildWithCanonicalCorePlacement(deviceAttr);
++}
++
+ } // namespace
+ 
+ //===----------------------------------------------------------------------===//
+@@ -76,6 +119,65 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    };
  }
  
++OutputHints RmsNormRuleBook::getOutputHints(
++    Operation *op, const std::vector<OpConfig> &legalConfigs) const {
++  OutputHints result = OpRuleBook::getOutputHints(op, legalConfigs);
++
++  if (!isQwenDecodeHeadRmsNorm(op)) {
++    return result;
++  }
++
++  TTNNLayoutAttr layout = getSingleCoreHeightShardedLayout(op);
++  if (!layout) {
++    return result;
++  }
++
++  auto alreadyPresent = [&](const std::vector<OpConfig> &configs) {
++    return llvm::any_of(configs, [&](const OpConfig &config) {
++      return config.outputLayout == layout;
++    });
++  };
++
++  if (!alreadyPresent(result.hints)) {
++    result.hints.insert(result.hints.begin(), OpConfig(layout));
++  }
++
++  result.fallbackHints.erase(
++      std::remove_if(result.fallbackHints.begin(), result.fallbackHints.end(),
++                     [&](const OpConfig &config) {
++                       return config.outputLayout == layout;
++                     }),
++      result.fallbackHints.end());
++
++  return result;
++}
++
 +bool RmsNormRuleBook::isValidOutputHintForInputs(
 +    const OpConfig &hint, llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const {
 +  if (inputLayouts.empty() || !inputLayouts[0]) {
@@ -39,8 +136,11 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +    return false;
 +  }
 +
-+  return inputMem.getValue() == TensorMemoryLayout::HeightSharded ||
-+         outputMem.getValue() != TensorMemoryLayout::HeightSharded;
++  if (inputMem.getValue() == TensorMemoryLayout::HeightSharded) {
++    return outputMem.getValue() == TensorMemoryLayout::HeightSharded &&
++           hint.outputLayout.getGridShape() == inputLayouts[0].getGridShape();
++  }
++  return outputMem.getValue() != TensorMemoryLayout::HeightSharded;
 +}
 +
  LayoutScore RmsNormRuleBook::adjustScore(
