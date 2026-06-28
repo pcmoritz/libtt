@@ -1,8 +1,8 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-index 2f2a3ef..f5d7539 100644
+index 2f2a3ef..e4c8fb2 100644
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -532,50 +532,131 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+@@ -532,50 +532,141 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
@@ -24,6 +24,14 @@ index 2f2a3ef..f5d7539 100644
 +      break;
 +    }
 +    return value;
++  }
++
++  static bool isConstantLikeValue(mlir::Value value) {
++    value = lookThroughConstantShapeOps(value);
++    if (value.getDefiningOp<ConstantOp>()) {
++      return true;
++    }
++    return isFullOpWithValue(value, 1.0f);
 +  }
 +
 +  static bool isOneValue(mlir::Value value) {
@@ -64,7 +72,9 @@ index 2f2a3ef..f5d7539 100644
 +      return std::nullopt;
 +    }
 +
-+    if (!isOneValue(divOp.getLhs())) {
++    mlir::Value numerator =
++        ttmlir::utils::lookThrough<TypecastOp>(divOp.getLhs());
++    if (!isConstantLikeValue(numerator)) {
 +      return std::nullopt;
 +    }
 +
@@ -77,9 +87,9 @@ index 2f2a3ef..f5d7539 100644
 +    mlir::Value expValue;
 +    mlir::Value lhs = ttmlir::utils::lookThrough<TypecastOp>(addOp.getLhs());
 +    mlir::Value rhs = ttmlir::utils::lookThrough<TypecastOp>(addOp.getRhs());
-+    if (isOneValue(lhs)) {
++    if (lhs == numerator || isOneValue(lhs)) {
 +      expValue = rhs;
-+    } else if (isOneValue(rhs)) {
++    } else if (rhs == numerator || isOneValue(rhs)) {
 +      expValue = lhs;
 +    } else {
 +      return std::nullopt;
