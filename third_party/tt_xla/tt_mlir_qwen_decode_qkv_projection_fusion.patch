@@ -129,7 +129,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // SplitQueryKeyValueAndSplitHeadsFusing helpers
  // ============================================================================
 
-@@ -572,6 +581,185 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +581,194 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -168,11 +168,30 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +}
 +
 +std::optional<DecodeQKVHead> matchDecodeQKVHead(SliceStaticOp sliceOp) {
-+  auto headReshapeOp =
++  auto firstReshapeOp =
 +      dyn_cast_or_null<ReshapeOp>(lookThroughTypecasts(sliceOp.getResult()));
-+  if (!headReshapeOp || headReshapeOp.getType().getRank() != 3) {
++  if (!firstReshapeOp) {
 +    return std::nullopt;
 +  }
++
++  // V has no per-head RMSNorm in Qwen decode, so it goes straight from the
++  // projection slice to the rank-4 attention shape.
++  if (firstReshapeOp.getType().getRank() == 4) {
++    ArrayRef<int64_t> sliceShape = sliceOp.getType().getShape();
++    ArrayRef<int64_t> decodeShape = firstReshapeOp.getType().getShape();
++    if (sliceShape.size() != 2 || decodeShape[0] != 1 ||
++        sliceShape[0] != decodeShape[1] ||
++        sliceShape[1] != decodeShape[2] * decodeShape[3]) {
++      return std::nullopt;
++    }
++    return DecodeQKVHead{sliceOp, ReshapeOp(), nullptr, firstReshapeOp,
++                         QKVRole::Value};
++  }
++
++  if (firstReshapeOp.getType().getRank() != 3) {
++    return std::nullopt;
++  }
++  ReshapeOp headReshapeOp = firstReshapeOp;
 +
 +  RMSNormOp rmsNormOp = nullptr;
 +  Operation *next = lookThroughTypecasts(headReshapeOp.getResult());
@@ -193,13 +212,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    return std::nullopt;
 +  }
 +
-+  std::optional<QKVRole> role = findQKVRole(decodeReshapeOp.getResult());
-+  if (!role) {
-+    return std::nullopt;
-+  }
-+
 +  return DecodeQKVHead{sliceOp, headReshapeOp, rmsNormOp, decodeReshapeOp,
-+                       *role};
++                       QKVRole::Value};
 +}
 +
 +std::optional<SmallVector<DecodeQKVHead>>
@@ -226,7 +240,6 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +
 +  SmallVector<std::pair<int64_t, int64_t>> bounds;
 +  std::optional<size_t> sliceDim;
-+  uint8_t seenMask = 0;
 +  for (auto &head : heads) {
 +    auto dimAndBounds =
 +        findSlicedDimensionWithBounds(head.sliceOp, matmulShape);
@@ -239,15 +252,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    } else if (*sliceDim != dim) {
 +      return std::nullopt;
 +    }
-+
-+    uint8_t bit = 1u << static_cast<uint8_t>(head.role);
-+    if (seenMask & bit) {
-+      return std::nullopt;
-+    }
-+    seenMask |= bit;
 +    bounds.push_back({start, end});
 +  }
-+  if (!sliceDim || *sliceDim != matmulShape.size() - 1 || seenMask != 0b111) {
++  if (!sliceDim || *sliceDim != matmulShape.size() - 1) {
 +    return std::nullopt;
 +  }
 +
@@ -271,11 +278,13 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    return std::nullopt;
 +  }
 +
-+  // nlp_create_qkv_heads_decode expects the fused projection in Q,K,V order.
-+  if (sorted[0].role != QKVRole::Query || sorted[1].role != QKVRole::Key ||
-+      sorted[2].role != QKVRole::Value) {
-+    return std::nullopt;
-+  }
++  // TTIR shared-projection fusion sorts Qwen Q/K/V projections by location, so
++  // the fused projection is in Q,K,V slice order by the time this pattern runs.
++  // Avoid forward role tracing here; greedy TTNN fusing may visit this matmul
++  // before downstream SDPA/cache-update patterns have materialized.
++  sorted[0].role = QKVRole::Query;
++  sorted[1].role = QKVRole::Key;
++  sorted[2].role = QKVRole::Value;
 +
 +  DecodeQKVHead *q = findDecodeHeadByRole(sorted, QKVRole::Query);
 +  DecodeQKVHead *k = findDecodeHeadByRole(sorted, QKVRole::Key);
@@ -315,7 +324,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +1009,76 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +1018,76 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
