@@ -1,0 +1,116 @@
+--- a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
++++ b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
+@@ -391,6 +391,58 @@
+   return concatOp.getOperand(0);
+ }
+ 
++ArrayAttr getI32ShapeAttr(OpBuilder &builder, ArrayRef<int64_t> shape) {
++  SmallVector<int32_t> i32Shape;
++  i32Shape.reserve(shape.size());
++  for (int64_t dim : shape) {
++    i32Shape.push_back(static_cast<int32_t>(dim));
++  }
++  return builder.getI32ArrayAttr(i32Shape);
++}
++
++Value reshapeTo(PatternRewriter &rewriter, Location loc, Value value,
++                RankedTensorType type) {
++  auto valueType = mlir::cast<RankedTensorType>(value.getType());
++  if (valueType == type) {
++    return value;
++  }
++  return rewriter.create<ReshapeOp>(loc, type, value,
++                                    getI32ShapeAttr(rewriter, type.getShape()));
++}
++
++// Qwen decode lowers RoPE over rank-3 [tokens, heads, dim] tensors and then
++// immediately reshapes the result to rank 4 for attention. The TTNN
++// rotary_embedding op requires rank 4, so fuse through that reshape.
++ReshapeOp getRank4DecodeReshapeUser(ConcatOp concatOp) {
++  auto inputType = mlir::cast<RankedTensorType>(concatOp.getType());
++  if (inputType.getRank() != 3 || inputType.getShape()[0] != 1 ||
++      !concatOp->hasOneUse()) {
++    return nullptr;
++  }
++
++  auto reshapeOp = dyn_cast<ReshapeOp>(*concatOp->getUsers().begin());
++  if (!reshapeOp) {
++    return nullptr;
++  }
++
++  auto outputType = mlir::cast<RankedTensorType>(reshapeOp.getType());
++  if (outputType.getRank() != 4 || !inputType.hasStaticShape() ||
++      !outputType.hasStaticShape() ||
++      inputType.getNumElements() != outputType.getNumElements() ||
++      inputType.getShape().back() != outputType.getShape().back()) {
++    return nullptr;
++  }
++
++  return reshapeOp;
++}
++
++RankedTensorType getCacheTypeFor(RankedTensorType cacheType,
++                                 RankedTensorType inputType) {
++  SmallVector<int64_t> shape(inputType.getRank(), 1);
++  shape.back() = cacheType.getShape().back();
++  return RankedTensorType::get(shape, cacheType.getElementType());
++}
++
+ // Replace the anchor op with a ttcore.composite "rotary_embedding" that
+ // references a decomposition function.
+ // Detects self-concat cos/sin at the IR level (same as TTNN decomposition's
+@@ -537,10 +589,11 @@
+ 
+   // Must concat on last dimension with exactly 2 operands.
+   auto resultType = mlir::cast<RankedTensorType>(srcOp.getType());
+-  if (resultType.getRank() != 4) {
++  ReshapeOp rank4Reshape = getRank4DecodeReshapeUser(srcOp);
++  if (resultType.getRank() != 4 && !rank4Reshape) {
+     return failure();
+   }
+-  if (srcOp.getDim() != resultType.getRank() - 1) {
++  if (srcOp.getDim() != static_cast<int32_t>(resultType.getRank() - 1)) {
+     return failure();
+   }
+   if (srcOp.getNumOperands() != 2) {
+@@ -608,8 +661,9 @@
+   }
+ 
+   // Input must be 4D.
++  // Qwen decode starts rank-3 and reshapes to 4D immediately after RoPE.
+   auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
+-  if (inputType.getRank() != 4) {
++  if (inputType.getRank() != 4 && !rank4Reshape) {
+     return failure();
+   }
+ 
+@@ -671,8 +725,27 @@
+       srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
+       rewriter.getSI32IntegerAttr(lastDim));
+ 
+-  replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
+-                           resultType);
++  Operation *anchorOp = srcOp.getOperation();
++  RankedTensorType compositeResultType = resultType;
++  Value compositeX = xSource;
++  Value compositeCos = cosFull;
++  Value compositeSin = sinFull;
++
++  if (rank4Reshape) {
++    anchorOp = rank4Reshape.getOperation();
++    compositeResultType = mlir::cast<RankedTensorType>(rank4Reshape.getType());
++    compositeX = reshapeTo(
++        rewriter, srcOp.getLoc(), xSource,
++        RankedTensorType::get(compositeResultType.getShape(),
++                              inputType.getElementType()));
++    compositeCos = reshapeTo(rewriter, srcOp.getLoc(), cosFull,
++                             getCacheTypeFor(cosFullType, compositeResultType));
++    compositeSin = reshapeTo(rewriter, srcOp.getLoc(), sinFull,
++                             getCacheTypeFor(sinFullType, compositeResultType));
++  }
++
++  replaceWithRoPEComposite(anchorOp, rewriter, compositeX, compositeCos,
++                           compositeSin, compositeResultType);
+   return success();
+ }
+ 
