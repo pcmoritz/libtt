@@ -1,0 +1,109 @@
+diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h
+--- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h
++++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h
+@@ -31,6 +31,15 @@ struct MatmulRuleBook : OpRuleBook {
+   /// Reject all sharded RHS inputs (operand 1). LHS and bias are unrestricted.
+   LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
+ 
++  /// Reject sharded LHS layouts that tt-metal matmul cannot consume.
++  bool isValidInputCombination(
++      llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
++
++  /// Reject sharded LHS/output pairings that tt-metal matmul cannot consume.
++  bool isValidOutputHintForInputs(
++      const OpConfig &hint,
++      llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
++
+   /// Apply MatmulProgramConfig + fused activation dedup.
+   void applyOpSpecificAttrs(Operation *op,
+                             const BeamCandidate &candidate) const override;
+diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp
+--- a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp
++++ b/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp
+@@ -28,6 +28,37 @@ static bool isL1Interleaved(const OpConfig &config) {
+          memLayout.getValue() == TensorMemoryLayout::Interleaved;
+ }
+ 
++static bool isShardedLayout(TTNNLayoutAttr layout) {
++  auto memLayout = layout.getMemLayout();
++  return memLayout && isShardedMemoryLayout(memLayout.getValue());
++}
++
++static bool hasAnyShardedLayout(
++    llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) {
++  for (TTNNLayoutAttr layout : inputLayouts) {
++    if (isShardedLayout(layout)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++static bool isSupportedShardedOutputLayout(TTNNLayoutAttr layout) {
++  if (!isShardedLayout(layout)) {
++    return true;
++  }
++
++  auto memLayout = layout.getMemLayout().getValue();
++  if (memLayout == TensorMemoryLayout::WidthSharded) {
++    return false;
++  }
++  if (memLayout == TensorMemoryLayout::BlockSharded) {
++    auto gridShape = layout.getGridShape();
++    return gridShape.size() < 2 || gridShape[0] == 1;
++  }
++  return true;
++}
++
+ static bool isSharded(const OpConfig &config) {
+   if (!config.outputLayout) {
+     return false;
+@@ -39,6 +70,47 @@ static bool isSharded(const OpConfig &config) {
+   auto memLayout = config.outputLayout.getMemLayout();
+   return memLayout && isShardedMemoryLayout(memLayout.getValue());
+ }
+ 
++bool MatmulRuleBook::isValidInputCombination(
++    llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const {
++  if (inputLayouts.empty() || !isShardedLayout(inputLayouts[0])) {
++    return true;
++  }
++
++  // tt-metal's regular matmul path only accepts a sharded LHS when it is
++  // HEIGHT_SHARDED. Width-sharded LHS is only valid for a specialized mcast
++  // path that this optimizer cannot identify from input layouts alone.
++  return inputLayouts[0].getMemLayout().getValue() ==
++         TensorMemoryLayout::HeightSharded;
++}
++
++bool MatmulRuleBook::isValidOutputHintForInputs(
++    const OpConfig &hint, llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const {
++  if (hint.outputLayout && !isSupportedShardedOutputLayout(hint.outputLayout)) {
++    return false;
++  }
++
++  if (inputLayouts.empty() || !hasAnyShardedLayout(inputLayouts)) {
++    return true;
++  }
++
++  // tt-metal matmul rejects interleaved outputs when any input is sharded.
++  if (!hint.outputLayout || !isShardedLayout(hint.outputLayout)) {
++    return false;
++  }
++
++  if (!isShardedLayout(inputLayouts[0])) {
++    return true;
++  }
++
++  // With a sharded LHS, tt-metal also requires matching output buffer type and
++  // memory layout. The generic op model otherwise explores many combinations
++  // that are known to fail backend validation.
++  return hint.outputLayout.getBufferType() ==
++             inputLayouts[0].getBufferType() &&
++         hint.outputLayout.getMemLayout().getValue() ==
++             inputLayouts[0].getMemLayout().getValue();
++}
++
+ static bool hasMatmulProgramConfig(const OpConfig &config) {
+   if (const auto *attrs = std::get_if<MatmulAttrs>(&config.opSpecificAttrs)) {
+     return attrs->matmulProgramConfig.has_value() &&
