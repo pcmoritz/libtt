@@ -1,0 +1,35 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp b/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
+index 96b46d0..d120dcb 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
+@@ -179,7 +179,7 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+ 
+   // Walk the single-use chain from the matmul to its first non-flow user.
+   llvm::SmallVector<Operation *> flowOps;
+-  bool sawCCL = false;
++  bool sawCCL = true;
+   Value cur = matmul.getResult();
+   Operation *exit = nullptr;
+   while (true) {
+@@ -210,9 +210,18 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+   if (!gate || !gate.getResult().hasOneUse()) {
+     return false;
+   }
+-  auto ff2 = mlir::dyn_cast<MatmulOp>(*gate.getResult().getUsers().begin());
+-  if (!ff2 || !matmulReachesResidualAdd(ff2)) {
+-    return false;
++  Operation *ff2 = *gate.getResult().getUsers().begin();
++  if (auto ff2Matmul = mlir::dyn_cast<MatmulOp>(ff2)) {
++    if (!matmulReachesResidualAdd(ff2Matmul)) {
++      return false;
++    }
++  } else {
++    auto ff2Linear = mlir::dyn_cast<LinearOp>(ff2);
++    if (!ff2Linear || !ff2Linear.getBias() ||
++        !isLowerableFloat(getValueDtype(ff2Linear.getBias())) ||
++        !isLowerableFloat(getValueDtype(ff2Linear.getResult()))) {
++      return false;
++    }
+   }
+ 
+   downcastChain(matmul, flowOps);
