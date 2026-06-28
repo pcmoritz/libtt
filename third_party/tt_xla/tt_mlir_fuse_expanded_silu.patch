@@ -1,0 +1,121 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+index 2f2a3ef..c9175a5 100644
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -532,50 +532,95 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+   using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
+ 
+ public:
++  std::optional<mlir::Value> matchSigmoidInput(mlir::Value value) const {
++    value = ttmlir::utils::lookThrough<TypecastOp>(value);
++    if (auto sigmoidOp = value.getDefiningOp<SigmoidOp>()) {
++      if (!sigmoidOp->hasOneUse()) {
++        return std::nullopt;
++      }
++      return ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput());
++    }
++
++    return matchExpandedSigmoidInput(value);
++  }
++
++  std::optional<mlir::Value>
++  matchExpandedSigmoidInput(mlir::Value value) const {
++    auto divOp =
++        ttmlir::utils::lookThrough<TypecastOp>(value).getDefiningOp<DivOp>();
++    if (!divOp || !divOp->hasOneUse()) {
++      return std::nullopt;
++    }
++
++    mlir::Value one = ttmlir::utils::lookThrough<TypecastOp>(divOp.getLhs());
++    if (!isFullOpWithValue(one, 1.0f)) {
++      return std::nullopt;
++    }
++
++    auto addOp = ttmlir::utils::lookThrough<TypecastOp>(divOp.getRhs())
++                     .getDefiningOp<AddOp>();
++    if (!addOp || !addOp->hasOneUse()) {
++      return std::nullopt;
++    }
++
++    mlir::Value expValue;
++    mlir::Value lhs = ttmlir::utils::lookThrough<TypecastOp>(addOp.getLhs());
++    mlir::Value rhs = ttmlir::utils::lookThrough<TypecastOp>(addOp.getRhs());
++    if (isFullOpWithValue(lhs, 1.0f)) {
++      expValue = rhs;
++    } else if (isFullOpWithValue(rhs, 1.0f)) {
++      expValue = lhs;
++    } else {
++      return std::nullopt;
++    }
++
++    auto expOp = expValue.getDefiningOp<ExpOp>();
++    if (!expOp || !expOp->hasOneUse()) {
++      return std::nullopt;
++    }
++    auto negOp = ttmlir::utils::lookThrough<TypecastOp>(expOp.getInput())
++                     .getDefiningOp<NegOp>();
++    return negOp && negOp->hasOneUse()
++               ? std::optional<mlir::Value>(
++                     ttmlir::utils::lookThrough<TypecastOp>(negOp.getInput()))
++               : std::nullopt;
++  }
++
+   mlir::LogicalResult
+   matchAndRewrite(MultiplyOp multiplyOp,
+                   mlir::PatternRewriter &rewriter) const final {
+     mlir::Value lhs =
+         ttmlir::utils::lookThrough<TypecastOp>(multiplyOp.getLhs());
+     mlir::Value rhs =
+         ttmlir::utils::lookThrough<TypecastOp>(multiplyOp.getRhs());
+-
+-    SigmoidOp sigmoidOp = nullptr;
+-    mlir::Value otherOperand;
+-
+-    if (auto lhsSigmoid = lhs.getDefiningOp<SigmoidOp>()) {
+-      sigmoidOp = lhsSigmoid;
+-      otherOperand = rhs;
+-    } else if (auto rhsSigmoid = rhs.getDefiningOp<SigmoidOp>()) {
+-      sigmoidOp = rhsSigmoid;
+-      otherOperand = lhs;
+-    }
+-
+-    if (!sigmoidOp || !sigmoidOp->hasOneUse()) {
++    std::optional<mlir::Value> siluInput;
++
++    if (std::optional<mlir::Value> lhsSigmoidInput = matchSigmoidInput(lhs);
++        lhsSigmoidInput && *lhsSigmoidInput == rhs) {
++      siluInput = *lhsSigmoidInput;
++    } else if (std::optional<mlir::Value> rhsSigmoidInput =
++                   matchSigmoidInput(rhs);
++               rhsSigmoidInput && *rhsSigmoidInput == lhs) {
++      siluInput = *rhsSigmoidInput;
++    } else {
+       return mlir::failure();
+     }
+ 
+-    mlir::Value sigmoidInput =
+-        ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput());
+-    if (sigmoidInput != otherOperand) {
+-      return mlir::failure();
+-    }
+-
+-    auto inputType = sigmoidInput.getType();
++    auto inputType = siluInput->getType();
+     auto outputType = multiplyOp.getResult().getType();
+     auto siluOp =
+-        rewriter.create<SiluOp>(multiplyOp->getLoc(), inputType, otherOperand);
++        rewriter.create<SiluOp>(multiplyOp->getLoc(), inputType, *siluInput);
+ 
+     // If multiply inputs and output are typecasted, we need to add a typecast
+     // after silu to convert back to the multiply output type.
+     if (inputType != outputType) {
+       auto typecastOp = rewriter.create<TypecastOp>(
+           multiplyOp->getLoc(), outputType, siluOp.getResult());
+       rewriter.replaceAllOpUsesWith(multiplyOp, typecastOp);
+     } else {
+       rewriter.replaceAllOpUsesWith(multiplyOp, siluOp);
+     }
+     return mlir::success();
+   }
+ };
