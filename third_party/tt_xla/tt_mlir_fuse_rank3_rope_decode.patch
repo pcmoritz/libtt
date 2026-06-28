@@ -59,6 +59,24 @@
  // Replace the anchor op with a ttcore.composite "rotary_embedding" that
  // references a decomposition function.
  // Detects self-concat cos/sin at the IR level (same as TTNN decomposition's
+@@ -455,7 +507,8 @@ void replaceWithRoPEComposite(Operation *anchorOp,
+ void replaceWithRoPEComposite(Operation *anchorOp,
+                               mlir::PatternRewriter &rewriter, Value xSource,
+                               Value cosInput, Value sinInput,
+-                              RankedTensorType resultType) {
++                              RankedTensorType resultType,
++                              DictionaryAttr compositeAttributes = nullptr) {
+   auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
+   auto cosType = mlir::cast<RankedTensorType>(cosInput.getType());
+   auto sinType = mlir::cast<RankedTensorType>(sinInput.getType());
+@@ -484,6 +537,6 @@ void replaceWithRoPEComposite(Operation *anchorOp,
+       rewriter.getStringAttr("rotary_embedding"),
+       FlatSymbolRefAttr::get(rewriter.getContext(), decompFunc.getName()),
+-      /*composite_attributes=*/nullptr);
++      compositeAttributes);
+ }
+ 
+ } // namespace
 @@ -537,10 +589,11 @@
  
    // Must concat on last dimension with exactly 2 operands.
@@ -87,7 +105,7 @@
      return failure();
    }
  
-@@ -645,14 +701,24 @@
+@@ -645,14 +701,22 @@
    // cos/sin are half-dim. Create concat(half, half) as the composite's
    // cos/sin inputs so that ttnn::RotaryEmbeddingOp promotion can match
    // the expected full-dim shapes. The decomposition body will detect the
@@ -112,7 +130,7 @@
  
    SmallVector<int64_t> cosFullShape(cosHalfType.getShape());
    cosFullShape[lastDim] *= 2;
-@@ -671,8 +737,27 @@
+@@ -671,8 +737,33 @@
        srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
        rewriter.getSI32IntegerAttr(lastDim));
  
@@ -123,6 +141,7 @@
 +  Value compositeX = xSource;
 +  Value compositeCos = cosFull;
 +  Value compositeSin = sinFull;
++  DictionaryAttr compositeAttributes = nullptr;
 +
 +  if (rank4Reshape) {
 +    anchorOp = rank4Reshape.getOperation();
@@ -135,10 +154,15 @@
 +                             getCacheTypeFor(cosFullType, compositeResultType));
 +    compositeSin = reshapeTo(rewriter, srcOp.getLoc(), sinFull,
 +                             getCacheTypeFor(sinFullType, compositeResultType));
++    compositeAttributes = rewriter.getDictionaryAttr({rewriter.getNamedAttr(
++        "token_index",
++        rewriter.getIntegerAttr(
++            rewriter.getIntegerType(32, /*isSigned=*/false), 0))});
 +  }
 +
 +  replaceWithRoPEComposite(anchorOp, rewriter, compositeX, compositeCos,
-+                           compositeSin, compositeResultType);
++                           compositeSin, compositeResultType,
++                           compositeAttributes);
    return success();
  }
  

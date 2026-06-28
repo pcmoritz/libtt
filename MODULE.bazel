@@ -271,6 +271,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_fast_is_sharded_module.patch",
         "//third_party/tt_xla:tt_mlir_fuse_jax_rms_norm.patch",
         "//third_party/tt_xla:tt_mlir_fuse_rank3_rope_decode.patch",
+        "//third_party/tt_xla:tt_mlir_rotary_composite_token_index.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
