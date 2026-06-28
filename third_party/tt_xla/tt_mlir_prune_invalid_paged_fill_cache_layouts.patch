@@ -1,0 +1,13 @@
+diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
+--- a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
++++ b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
+@@ -118,6 +118,9 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+   if (operandIdx == 0) {
+     return cacheBufferDramOnlyFilter();
+   }
++  if (operandIdx == 1 || operandIdx == 2 || operandIdx == 3) {
++    return layout_filter_utils::requireDRAMInterleaved;
++  }
+   return nullptr;
+ }
+ 
