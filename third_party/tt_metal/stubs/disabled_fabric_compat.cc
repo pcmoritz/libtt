@@ -41,9 +41,7 @@
 
 namespace tracy {
 
-#ifndef TRACY_ENABLE
 void SetThreadName(const char*) {}
-#endif
 
 }  // namespace tracy
 
