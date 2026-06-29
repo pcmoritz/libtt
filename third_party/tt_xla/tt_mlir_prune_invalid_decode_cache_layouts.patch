@@ -26,7 +26,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h b/i
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
-@@ -59,6 +59,23 @@ SDPADecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -59,6 +59,22 @@ SDPADecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    return layout_filter_utils::requireDRAMInterleaved;
  }
 
@@ -42,15 +42,14 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialec
 +      return false;
 +    }
 +    auto shardShape = layout.getScalarShardShape();
-+    return shardShape.size() >= 2 && shardShape[1] > 0 &&
-+           128 % shardShape[1] == 0;
++    return shardShape.size() >= 2 && shardShape[1] > 0 && 128 % shardShape[1] == 0;
 +  };
 +}
 +
  //===----------------------------------------------------------------------===//
  // RotaryEmbeddingRuleBook
  //===----------------------------------------------------------------------===//
-@@ -128,4 +144,19 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -128,4 +143,18 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    return nullptr;
  }
 
@@ -62,8 +61,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialec
 +  if (operandIdx == 1) {
 +    return [](TTNNLayoutAttr layout) -> bool {
 +      auto ml = layout.getMemLayout();
-+      return layout.hasL1BufferType() && ml &&
-+             ml.getValue() == TensorMemoryLayout::HeightSharded;
++      return layout.hasL1BufferType() && ml && ml.getValue() == TensorMemoryLayout::HeightSharded;
 +    };
 +  }
 +  return nullptr;
