@@ -2,32 +2,14 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 index 2f2a3ef..e4c8fb2 100644
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -532,50 +532,136 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+@@ -532,50 +532,118 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
  public:
-+  static mlir::Value lookThroughConstantShapeOps(mlir::Value value) {
-+    while (Operation *op = value.getDefiningOp()) {
-+      if (auto typecastOp = mlir::dyn_cast<TypecastOp>(op)) {
-+        value = typecastOp.getInput();
-+        continue;
-+      }
-+      if (auto reshapeOp = mlir::dyn_cast<ReshapeOp>(op)) {
-+        value = reshapeOp.getInput();
-+        continue;
-+      }
-+      if (auto broadcastOp = mlir::dyn_cast<BroadcastOp>(op)) {
-+        value = broadcastOp.getInput();
-+        continue;
-+      }
-+      break;
-+    }
-+    return value;
-+  }
-+
 +  static bool isOneValue(mlir::Value value) {
-+    value = lookThroughConstantShapeOps(value);
++    value = ttmlir::utils::lookThrough<TypecastOp, ReshapeOp, BroadcastOp>(
++        value);
 +    if (value.getDefiningOp<OnesOp>()) {
 +      return true;
 +    }
@@ -82,9 +64,9 @@ index 2f2a3ef..e4c8fb2 100644
 +    mlir::Value expValue;
 +    mlir::Value lhs = ttmlir::utils::lookThrough<TypecastOp>(addOp.getLhs());
 +    mlir::Value rhs = ttmlir::utils::lookThrough<TypecastOp>(addOp.getRhs());
-+    if (lhs == numerator || isOneValue(lhs)) {
++    if (isOneValue(lhs)) {
 +      expValue = rhs;
-+    } else if (rhs == numerator || isOneValue(rhs)) {
++    } else if (isOneValue(rhs)) {
 +      expValue = lhs;
 +    } else {
 +      return std::nullopt;
