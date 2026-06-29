@@ -16,20 +16,18 @@
      MultiplyOp innerMul =
          ttmlir::utils::findOpThrough<MultiplyOp, TypecastOp>(outerMul.getLhs());
      mlir::Value gammaRaw = outerMul.getRhs();
-@@ -2687,32 +2696,62 @@ public:
+@@ -2687,32 +2696,58 @@ public:
        return mlir::failure();
      }
  
 -    MeanOp meanOp = addOp.getLhs().getDefiningOp<MeanOp>();
-+    auto getLastDimReductionInput =
-+        [&](mlir::Value value) -> std::optional<mlir::Value> {
++    auto getLastDimReductionInput = [&](mlir::Value value) -> std::optional<mlir::Value> {
 +      auto checkReduction = [&](auto reductionOp) -> std::optional<mlir::Value> {
 +        auto dimArg = reductionOp.getDimArg();
 +        if (!dimArg || dimArg->size() != 1) {
 +          return std::nullopt;
 +        }
-+        auto inputType =
-+            mlir::cast<RankedTensorType>(reductionOp.getInput().getType());
++        auto inputType = mlir::cast<RankedTensorType>(reductionOp.getInput().getType());
 +        int64_t dim = mlir::cast<mlir::IntegerAttr>((*dimArg)[0]).getInt();
 +        int64_t actualDim = dim < 0 ? inputType.getRank() + dim : dim;
 +        if (actualDim != inputType.getRank() - 1) {
@@ -51,8 +49,7 @@
 +      if (!sumOp) {
 +        return std::nullopt;
 +      }
-+      auto sumInputType =
-+          mlir::cast<RankedTensorType>(sumOp.getInput().getType());
++      auto sumInputType = mlir::cast<RankedTensorType>(sumOp.getInput().getType());
 +      if (sumInputType.getRank() == 0 ||
 +          !isFullOpWithValue(lookThroughSafeOps(divOp.getRhs()),
 +                             static_cast<float>(sumInputType.getShape().back()),
@@ -62,8 +59,7 @@
 +      return checkReduction(sumOp);
 +    };
 +
-+    std::optional<mlir::Value> reductionInput =
-+        getLastDimReductionInput(addOp.getLhs());
++    std::optional<mlir::Value> reductionInput = getLastDimReductionInput(addOp.getLhs());
      mlir::Value epsilon = addOp.getRhs();
 -    if (!meanOp) {
 -      meanOp = addOp.getRhs().getDefiningOp<MeanOp>();
@@ -97,7 +93,7 @@
  
      if (auto sq = meanInput.getDefiningOp<MultiplyOp>()) {
        if (sq.getLhs() == sq.getRhs()) {
-@@ -2726,6 +2757,11 @@ public:
+@@ -2726,7 +2757,12 @@ public:
      }
  
      if (!squareInput || squareInput != x) {

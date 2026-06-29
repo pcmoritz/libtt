@@ -1,19 +1,16 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 --- a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 +++ b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
-@@ -44,6 +44,20 @@ private:
+@@ -44,6 +44,17 @@ private:
    OpValidationConfig validationConfig;
  };
 
-+class NLPDecodeQKVProjectionFusing
-+    : public mlir::OpRewritePattern<MatmulOp> {
++class NLPDecodeQKVProjectionFusing : public mlir::OpRewritePattern<MatmulOp> {
 +public:
-+  NLPDecodeQKVProjectionFusing(mlir::MLIRContext *context,
-+                               const OpValidationConfig &validationConfig = {})
++  NLPDecodeQKVProjectionFusing(mlir::MLIRContext *context, const OpValidationConfig &validationConfig = {})
 +      : OpRewritePattern<MatmulOp>(context), validationConfig(validationConfig) {}
 +
-+  mlir::LogicalResult matchAndRewrite(
-+      MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const override;
++  mlir::LogicalResult matchAndRewrite(MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const override;
 +
 +private:
 +  OpValidationConfig validationConfig;
@@ -36,7 +33,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  #include <type_traits>
 
  namespace mlir::tt::ttir {
-@@ -1809,6 +1811,38 @@ private:
+@@ -1809,6 +1811,35 @@ private:
      return rewriter.create<ConcatOp>(loc, concatType, biases,
                                       rewriter.getSI32IntegerAttr(concatDim));
    }
@@ -60,14 +57,12 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    for (OpType op : candidates.ops) {
 +      order.push_back(getQKVProjectionOrder(op.getOperation()));
 +    }
-+    if (!llvm::is_contained(order, 0) || !llvm::is_contained(order, 1) ||
-+        !llvm::is_contained(order, 2)) {
++    if (!llvm::is_contained(order, 0) || !llvm::is_contained(order, 1) || !llvm::is_contained(order, 2)) {
 +      return;
 +    }
 +
 +    llvm::sort(candidates.ops, [](OpType lhs, OpType rhs) {
-+      return getQKVProjectionOrder(lhs.getOperation()) <
-+             getQKVProjectionOrder(rhs.getOperation());
++      return getQKVProjectionOrder(lhs.getOperation()) < getQKVProjectionOrder(rhs.getOperation());
 +    });
 +    candidates.firstTransposeB = candidates.ops.front().getTransposeB();
 +  }
@@ -86,7 +81,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -572,6 +572,133 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +572,129 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -171,9 +166,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    sortedHeads.push_back({std::get<1>(*dimAndBounds), std::get<2>(*dimAndBounds), head});
 +  }
 +
-+  llvm::sort(sortedHeads, [](const auto &lhs, const auto &rhs) {
-+    return std::get<0>(lhs) < std::get<0>(rhs);
-+  });
++  llvm::sort(sortedHeads, [](const auto &lhs, const auto &rhs) { return std::get<0>(lhs) < std::get<0>(rhs); });
 +
 +  SmallVector<DecodeQKVHead> sorted;
 +  int64_t previousEnd = 0;
@@ -188,9 +181,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    return std::nullopt;
 +  }
 +
-+  DecodeQKVHead &q = sorted[0];
-+  DecodeQKVHead &k = sorted[1];
-+  DecodeQKVHead &v = sorted[2];
++  DecodeQKVHead &q = sorted[0], &k = sorted[1], &v = sorted[2];
 +  if (!q.rmsNormOp || !k.rmsNormOp || v.rmsNormOp) {
 +    return std::nullopt;
 +  }
@@ -220,7 +211,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +956,71 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +956,65 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
@@ -232,9 +223,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    return mlir::failure();
 +  }
 +
-+  DecodeQKVHead &q = (*heads)[0];
-+  DecodeQKVHead &k = (*heads)[1];
-+  DecodeQKVHead &v = (*heads)[2];
++  DecodeQKVHead &q = (*heads)[0], &k = (*heads)[1], &v = (*heads)[2];
 +
 +  auto matmulType = matmulOp.getType();
 +  ArrayRef<int64_t> matmulShape = matmulType.getShape();
@@ -255,9 +244,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +
 +  auto numHeadsAttr = rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(q)[2]));
 +  auto numKVHeadsAttr = rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(k)[2]));
-+  SmallVector<Type> resultTypes{q.decodeReshapeOp.getType(),
-+                                k.decodeReshapeOp.getType(),
-+                                v.decodeReshapeOp.getType()};
++  SmallVector<Type> resultTypes{q.decodeReshapeOp.getType(), k.decodeReshapeOp.getType(), v.decodeReshapeOp.getType()};
 +
 +  IsolatedIRValidationWrapper validator(rewriter.getContext(), validationConfig);
 +  auto validationResult = validator.validateOp<NLPCreateQKVHeadsDecodeOp>(
@@ -283,9 +270,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  rewriter.replaceOp(k.decodeReshapeOp, kNorm.getResult());
 +  rewriter.replaceOp(v.decodeReshapeOp, decodeOp.getValue());
 +
-+  eraseUnusedDecodeQKVHead(rewriter, q);
-+  eraseUnusedDecodeQKVHead(rewriter, k);
-+  eraseUnusedDecodeQKVHead(rewriter, v);
++  for (DecodeQKVHead *head : {&q, &k, &v}) eraseUnusedDecodeQKVHead(rewriter, *head);
 +
 +  return mlir::success();
 +}
