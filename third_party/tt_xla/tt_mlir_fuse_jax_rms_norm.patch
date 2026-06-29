@@ -1,6 +1,6 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -2657,6 +2657,12 @@ public:
+@@ -2657,6 +2657,11 @@ public:
            });
      };
  
@@ -9,11 +9,10 @@
 +      auto subtract = value.getDefiningOp<SubtractOp>();
 +      return subtract && isFullOpWithValue(lookThroughSafeOps(subtract.getRhs()), 0.0f) ? lookThroughSafeOps(subtract.getLhs()) : value;
 +    };
-+
      MultiplyOp innerMul =
          ttmlir::utils::findOpThrough<MultiplyOp, TypecastOp>(outerMul.getLhs());
      mlir::Value gammaRaw = outerMul.getRhs();
-@@ -2687,32 +2693,43 @@ public:
+@@ -2687,32 +2692,40 @@ public:
        return mlir::failure();
      }
  
@@ -28,10 +27,8 @@
 +        if (actualDim != inputType.getRank() - 1) return std::nullopt;
 +        return reductionOp.getInput();
 +      };
-+
 +      value = lookThroughSafeOps(value);
 +      if (auto meanOp = value.getDefiningOp<MeanOp>()) return checkReduction(meanOp);
-+
 +      auto divOp = value.getDefiningOp<DivOp>();
 +      if (!divOp) return std::nullopt;
 +      auto sumOp = lookThroughSafeOps(divOp.getLhs()).getDefiningOp<SumOp>();
@@ -40,7 +37,6 @@
 +      if (sumInputType.getRank() == 0 || !isFullOpWithValue(lookThroughSafeOps(divOp.getRhs()), static_cast<float>(sumInputType.getShape().back()), 1e-3f)) return std::nullopt;
 +      return checkReduction(sumOp);
 +    };
-+
 +    std::optional<mlir::Value> reductionInput = getLastDimReductionInput(addOp.getLhs());
      mlir::Value epsilon = addOp.getRhs();
 -    if (!meanOp) {
@@ -75,7 +71,7 @@
  
      if (auto sq = meanInput.getDefiningOp<MultiplyOp>()) {
        if (sq.getLhs() == sq.getRhs()) {
-@@ -2726,7 +2739,10 @@ public:
+@@ -2726,7 +2735,10 @@ public:
      }
  
      if (!squareInput || squareInput != x) {
