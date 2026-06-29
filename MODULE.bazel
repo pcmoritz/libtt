@@ -250,7 +250,6 @@ git_repository(
         "//third_party/tt_xla:tt_xla_propagate_mark_roles_through_unary_ops.patch",
         "//third_party/tt_xla:tt_xla_device_memory_stats.patch",
         "//third_party/tt_xla:tt_xla_disable_erase_inverse_ops.patch",
-        "//third_party/tt_xla:tt_xla_env_compile_options.patch",
         "//third_party/tt_xla:tt_xla_enable_bf8_activation_dtype_lowering.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
