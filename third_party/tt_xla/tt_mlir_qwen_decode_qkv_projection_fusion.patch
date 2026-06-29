@@ -87,7 +87,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -572,6 +572,139 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +572,137 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -215,9 +215,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +
 +void eraseUnusedDecodeQKVHead(PatternRewriter &rewriter,
 +                              DecodeQKVHead &head) {
-+  for (Operation *op : {head.rmsNormOp.getOperation(),
-+                        head.headReshapeOp.getOperation(),
-+                        head.sliceOp.getOperation()}) {
++  for (Operation *op : {head.rmsNormOp.getOperation(), head.headReshapeOp.getOperation(), head.sliceOp.getOperation()}) {
 +    if (op && op->use_empty()) {
 +      rewriter.eraseOp(op);
 +    }
