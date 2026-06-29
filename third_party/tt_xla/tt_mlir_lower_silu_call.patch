@@ -1,7 +1,7 @@
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
 @@ -36,2 +37,14 @@ namespace mlir::tt::ttir {
- 
+
 +class SiluCallConversionPattern : public OpRewritePattern<mlir::func::CallOp> {
 +  using OpRewritePattern<mlir::func::CallOp>::OpRewritePattern;
 +public:

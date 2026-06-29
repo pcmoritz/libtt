@@ -2,7 +2,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h b/includ
 --- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h
 +++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h
 @@ -33,2 +33,4 @@ struct MatmulRuleBook : OpRuleBook {
- 
+
 +  bool isValidInputCombination(llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
 +  bool isValidOutputHintForInputs(const OpConfig &hint, llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
    /// Apply MatmulProgramConfig + fused activation dedup.
@@ -10,7 +10,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTN
 --- a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp
 @@ -30,2 +30,10 @@ static bool isL1Interleaved(const OpConfig &config) {
- 
+
 +static bool isShardedLayout(TTNNLayoutAttr layout) { auto memLayout = layout.getMemLayout(); return memLayout && isShardedMemoryLayout(memLayout.getValue()); }
 +static bool isSupportedShardedOutputLayout(TTNNLayoutAttr layout) {
 +  if (!isShardedLayout(layout)) return true;
@@ -21,7 +21,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTN
 +}
  static bool isSharded(const OpConfig &config) {
 @@ -42,2 +57,10 @@ static bool isSharded(const OpConfig &config) {
- 
+
 +bool MatmulRuleBook::isValidInputCombination(llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const { return inputLayouts.empty() || !isShardedLayout(inputLayouts[0]) || inputLayouts[0].getMemLayout().getValue() == TensorMemoryLayout::HeightSharded; }
 +bool MatmulRuleBook::isValidOutputHintForInputs(const OpConfig &hint, llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const {
 +  if (hint.outputLayout && !isSupportedShardedOutputLayout(hint.outputLayout)) return false;

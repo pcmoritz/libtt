@@ -1,7 +1,7 @@
 --- a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
 @@ -74,2 +74,11 @@
- 
+
 +  static bool isKVCacheReturnOperand(func::FuncOp funcOp, Value value) {
 +    if (canPropagateDtype(funcOp, value)) return true;
 +    Operation *defOp = value.getDefiningOp();
@@ -27,7 +27,7 @@
 +          newResultTypes[i] = operand.getType();
            continue;
          }
- 
+
 -        // Update local_shape of returned KV cache args to match the new dtype.
 +        auto oldType = mlir::cast<RankedTensorType>(operand.getType());
 +        newResultTypes[i] = ttnn::utils::RankedTensorTypeFactory::create(oldType, targetDtype);

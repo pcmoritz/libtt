@@ -1,7 +1,7 @@
 --- a/pjrt_implementation/src/api/compile_options.cc
 +++ b/pjrt_implementation/src/api/compile_options.cc
 @@ -91,2 +92,10 @@ CompileOptions parseCompileOptions(
- 
+
 +  if (const char *metrics_file = std::getenv("TT_XLA_TTNN_PERF_METRICS_OUTPUT_FILE");
 +      metrics_file && metrics_file[0] != '\0') {
 +    options.ttnn_perf_metrics_enabled = true;

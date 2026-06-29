@@ -1,11 +1,11 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 @@ -2659,2 +2659,3 @@ public:
- 
+
 +    auto dropSubtractZero = [&](mlir::Value value) { value = lookThroughSafeOps(value); auto subtract = value.getDefiningOp<SubtractOp>(); return subtract && isFullOpWithValue(lookThroughSafeOps(subtract.getRhs()), 0.0f) ? lookThroughSafeOps(subtract.getLhs()) : value; };
      MultiplyOp innerMul =
 @@ -2689,28 +2690,28 @@ public:
- 
+
 -    MeanOp meanOp = addOp.getLhs().getDefiningOp<MeanOp>();
 +    auto getLastDimReductionInput = [&](mlir::Value value) -> std::optional<mlir::Value> {
 +      auto checkReduction = [&](auto reductionOp) -> std::optional<mlir::Value> {
@@ -45,14 +45,14 @@
 -      return mlir::failure();
 -    }
 +    if (!reductionInput) return mlir::failure();
- 
+
      // Match x^2 as mul(x,x) or pow(x,2).
 -    mlir::Value meanInput = meanOp.getInput();
 +    mlir::Value meanInput = *reductionInput;
      mlir::Value squareInput = nullptr;
 -    mlir::Value x = lookThroughSafeOps(xRaw);
 +    mlir::Value x = dropSubtractZero(xRaw);
- 
+
 @@ -2728,3 +2732,3 @@ public:
      if (!squareInput || squareInput != x) {
 -      return mlir::failure();
