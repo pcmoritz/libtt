@@ -1,6 +1,6 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -532,50 +532,80 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+@@ -532,50 +532,76 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
@@ -16,11 +16,7 @@
 +
 +  std::optional<mlir::Value> matchSigmoidInput(mlir::Value value) const {
 +    value = ttmlir::utils::lookThrough<TypecastOp>(value);
-+    if (auto sigmoidOp = value.getDefiningOp<SigmoidOp>()) {
-+      if (!sigmoidOp->hasOneUse()) return std::nullopt;
-+      return ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput());
-+    }
-+
++    if (auto sigmoidOp = value.getDefiningOp<SigmoidOp>()) return sigmoidOp->hasOneUse() ? std::optional<mlir::Value>(ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput())) : std::nullopt;
 +    return matchExpandedSigmoidInput(value);
 +  }
 +
