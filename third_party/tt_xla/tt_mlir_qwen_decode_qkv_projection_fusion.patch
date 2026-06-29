@@ -86,24 +86,19 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +869,27 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +869,22 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
 +mlir::LogicalResult NLPDecodeQKVProjectionFusing::matchAndRewrite(MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const {
-+  auto heads = matchDecodeQKVHeads(matmulOp);
-+  if (!heads) return mlir::failure();
++  auto heads = matchDecodeQKVHeads(matmulOp); if (!heads) return mlir::failure();
 +  DecodeQKVHead &q = (*heads)[0], &k = (*heads)[1], &v = (*heads)[2];
-+  ArrayRef<int64_t> matmulShape = matmulOp.getType().getShape();
-+  int64_t batchSize = matmulShape[0], hiddenSize = matmulShape[1];
-+  if (q.decodeReshapeOp.getType().getShape()[1] != batchSize) return mlir::failure();
-+  SmallVector<int64_t> inputShape = {1, 1, batchSize, hiddenSize};
-+  RankedTensorType inputType = utils::RankedTensorTypeFactory::create(matmulOp.getType(), inputShape);
-+  rewriter.setInsertionPointAfter(matmulOp);
++  ArrayRef<int64_t> matmulShape = matmulOp.getType().getShape(); int64_t batchSize = matmulShape[0], hiddenSize = matmulShape[1];
++  if (q.decodeReshapeOp.getType().getShape()[1] != batchSize) { return mlir::failure(); } SmallVector<int64_t> inputShape = {1, 1, batchSize, hiddenSize};
++  RankedTensorType inputType = utils::RankedTensorTypeFactory::create(matmulOp.getType(), inputShape); rewriter.setInsertionPointAfter(matmulOp);
 +  auto inputReshape = rewriter.create<ReshapeOp>(matmulOp.getLoc(), inputType, matmulOp.getResult(), rewriter.getI32ArrayAttr(SmallVector<int32_t>(inputShape.begin(), inputShape.end())));
 +  auto numHeadsAttr = rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(q)[2])), numKVHeadsAttr = rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(k)[2]));
-+  SmallVector<Type> resultTypes{q.decodeReshapeOp.getType(), k.decodeReshapeOp.getType(), v.decodeReshapeOp.getType()};
-+  IsolatedIRValidationWrapper validator(rewriter.getContext(), validationConfig);
++  SmallVector<Type> resultTypes{q.decodeReshapeOp.getType(), k.decodeReshapeOp.getType(), v.decodeReshapeOp.getType()}; IsolatedIRValidationWrapper validator(rewriter.getContext(), validationConfig);
 +  if (!validator.validateOp<NLPCreateQKVHeadsDecodeOp>(matmulOp.getOperation(), matmulOp.getLoc(), resultTypes, inputReshape.getResult(), Value(), numHeadsAttr, numKVHeadsAttr, BoolAttr(), IntegerAttr()).isSuccess()) return mlir::failure();
 +  auto decodeOp = rewriter.create<NLPCreateQKVHeadsDecodeOp>(matmulOp.getLoc(), resultTypes, inputReshape.getResult(), Value(), numHeadsAttr, numKVHeadsAttr, BoolAttr(), IntegerAttr());
 +  auto qNorm = createRank4RMSNorm(rewriter, q.rmsNormOp, decodeOp.getQuery()), kNorm = createRank4RMSNorm(rewriter, k.rmsNormOp, decodeOp.getKey());
