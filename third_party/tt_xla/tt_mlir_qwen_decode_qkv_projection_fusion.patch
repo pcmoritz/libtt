@@ -87,7 +87,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -572,6 +572,141 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +572,139 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -103,8 +103,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +}
 +
 +std::optional<DecodeQKVHead> matchDecodeQKVHead(SliceStaticOp sliceOp) {
-+  auto firstReshapeOp =
-+      dyn_cast_or_null<ReshapeOp>(lookThroughTypecasts(sliceOp.getResult()));
++  auto firstReshapeOp = dyn_cast_or_null<ReshapeOp>(lookThroughTypecasts(sliceOp.getResult()));
 +  if (!firstReshapeOp) {
 +    return std::nullopt;
 +  }
@@ -167,8 +166,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +
 +  SmallVector<std::tuple<int64_t, int64_t, DecodeQKVHead>> sortedHeads;
 +  for (auto &head : heads) {
-+    auto dimAndBounds =
-+        findSlicedDimensionWithBounds(head.sliceOp, matmulShape);
++    auto dimAndBounds = findSlicedDimensionWithBounds(head.sliceOp, matmulShape);
 +    if (!dimAndBounds || std::get<0>(*dimAndBounds) != matmulShape.size() - 1) {
 +      return std::nullopt;
 +    }
