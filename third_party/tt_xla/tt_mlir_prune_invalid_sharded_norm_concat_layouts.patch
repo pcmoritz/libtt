@@ -1,12 +1,11 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 --- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 +++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
-@@ -38,6 +38,10 @@ struct RmsNormRuleBook : OpRuleBook {
+@@ -38,6 +38,9 @@ struct RmsNormRuleBook : OpRuleBook {
    /// are rejected because the sharded layernorm kernel doesn't support them.
    LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
  
 +  OutputHints getOutputHints(Operation *op, const std::vector<OpConfig> &legalConfigs) const override;
-+
 +  bool isValidOutputHintForInputs(const OpConfig &hint, llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
 +
    /// adjustScore reflects kernel-dispatch reality: the generic scorer derives
@@ -26,7 +25,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
  
 +#include "llvm/ADT/STLExtras.h"
 +
-@@ -30,6 +36,32 @@ int64_t inputOperandTileHeight(Operation *op, unsigned operandIdx) {
+@@ -30,6 +36,27 @@ int64_t inputOperandTileHeight(Operation *op, unsigned operandIdx) {
    return nc * ht;
  }
  
@@ -37,8 +36,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +  if (!resultType || resultType.getRank() != 4) return false;
 +
 +  ArrayRef<int64_t> shape = resultType.getShape();
-+  return shape[0] == 1 && shape[1] == 1 && shape[3] == 128 &&
-+         (shape[2] == 8 || shape[2] == 32);
++  return shape[0] == 1 && shape[1] == 1 && shape[3] == 128 && (shape[2] == 8 || shape[2] == 32);
 +}
 +
 +TTNNLayoutAttr getSingleCoreHeightShardedLayout(Operation *op) {
@@ -49,17 +47,13 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +  if (!seed) return nullptr;
 +
 +  ttcore::DeviceAttr deviceAttr = ttcore::lookupDevice(op);
-+  return TTNNLayoutAttr::Builder(seed, resultType.getShape())
-+      .setBufferType(BufferType::L1)
-+      .setMemoryLayout(TensorMemoryLayout::HeightSharded)
-+      .setGridShape({1, 1})
-+      .buildWithCanonicalCorePlacement(deviceAttr);
++  return TTNNLayoutAttr::Builder(seed, resultType.getShape()).setBufferType(BufferType::L1).setMemoryLayout(TensorMemoryLayout::HeightSharded).setGridShape({1, 1}).buildWithCanonicalCorePlacement(deviceAttr);
 +}
 +
  } // namespace
  
  //===----------------------------------------------------------------------===//
-@@ -76,6 +117,36 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -76,6 +112,36 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    };
  }
  

@@ -1,24 +1,20 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h
 --- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h
 +++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h
-@@ -55,6 +55,10 @@ struct SDPADecodeRuleBook : SDPARuleBook {
+@@ -55,6 +55,8 @@ struct SDPADecodeRuleBook : SDPARuleBook {
    LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
  };
 
-+struct NLPCreateQKVHeadsDecodeRuleBook : SDPARuleBook {
-+  LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
-+};
++struct NLPCreateQKVHeadsDecodeRuleBook : SDPARuleBook { LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override; };
 +
  /// RotaryEmbedding / RotaryEmbeddingLlama:
  /// NULL hint only, no reshards. Rejects width-sharded and block-sharded
  /// inputs (only height-sharded or interleaved accepted).
-@@ -91,6 +97,10 @@ struct PagedFillCacheRuleBook : OpRuleBook {
+@@ -91,6 +95,8 @@ struct PagedFillCacheRuleBook : OpRuleBook {
    LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
  };
 
-+struct PagedUpdateCacheRuleBook : OpRuleBook {
-+  LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
-+};
++struct PagedUpdateCacheRuleBook : OpRuleBook { LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override; };
 +
  } // namespace mlir::tt::ttnn
 
@@ -26,27 +22,20 @@ diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h b/i
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
-@@ -59,6 +59,11 @@ SDPADecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -59,6 +59,8 @@ SDPADecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    return layout_filter_utils::requireDRAMInterleaved;
  }
 
-+LayoutFilterFn NLPCreateQKVHeadsDecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
-+  if (operandIdx != 0) return layout_filter_utils::requireDRAMInterleaved;
-+  return [](TTNNLayoutAttr layout) -> bool { auto ml = layout.getMemLayout(); auto shardShape = layout.getScalarShardShape(); return ml && ml.getValue() == TensorMemoryLayout::WidthSharded && shardShape.size() >= 2 && shardShape[1] > 0 && 128 % shardShape[1] == 0; };
-+}
++LayoutFilterFn NLPCreateQKVHeadsDecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const { if (operandIdx != 0) return layout_filter_utils::requireDRAMInterleaved; return [](TTNNLayoutAttr layout) -> bool { auto ml = layout.getMemLayout(); auto shardShape = layout.getScalarShardShape(); return ml && ml.getValue() == TensorMemoryLayout::WidthSharded && shardShape.size() >= 2 && shardShape[1] > 0 && 128 % shardShape[1] == 0; }; }
 +
  //===----------------------------------------------------------------------===//
  // RotaryEmbeddingRuleBook
  //===----------------------------------------------------------------------===//
-@@ -128,4 +138,10 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -128,4 +135,6 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    return nullptr;
  }
 
-+LayoutFilterFn PagedUpdateCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
-+  if (operandIdx == 0) return cacheBufferDramOnlyFilter();
-+  if (operandIdx == 1) return [](TTNNLayoutAttr layout) -> bool { auto ml = layout.getMemLayout(); return layout.hasL1BufferType() && ml && ml.getValue() == TensorMemoryLayout::HeightSharded; };
-+  return nullptr;
-+}
++LayoutFilterFn PagedUpdateCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const { if (operandIdx == 0) return cacheBufferDramOnlyFilter(); if (operandIdx == 1) return [](TTNNLayoutAttr layout) -> bool { auto ml = layout.getMemLayout(); return layout.hasL1BufferType() && ml && ml.getValue() == TensorMemoryLayout::HeightSharded; }; return nullptr; }
 +
  } // namespace mlir::tt::ttnn
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp b/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp
@@ -68,16 +57,15 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp b/lib/Dialect/TTNN
 
    static llvm::DenseMap<mlir::OperationName, const OpRuleBook *> registry;
    static std::once_flag initFlag;
-@@ -112,6 +114,8 @@ const OpRuleBook &getRuleBook(Operation *op) {
+@@ -112,6 +114,7 @@ const OpRuleBook &getRuleBook(Operation *op) {
      reg(ScaledDotProductAttentionDecodeOp::getOperationName(), &sdpaDecode);
      reg(PagedScaledDotProductAttentionDecodeOp::getOperationName(),
          &sdpaDecode);
-+    reg(NLPCreateQKVHeadsDecodeOp::getOperationName(),
-+        &nlpCreateQKVHeadsDecode);
++    reg(NLPCreateQKVHeadsDecodeOp::getOperationName(), &nlpCreateQKVHeadsDecode);
      reg(EmbeddingOp::getOperationName(), &embedding);
      reg(TypecastOp::getOperationName(), &typecast);
      reg(WhereOp::getOperationName(), &typecast);
-@@ -124,6 +128,7 @@ const OpRuleBook &getRuleBook(Operation *op) {
+@@ -124,6 +127,7 @@ const OpRuleBook &getRuleBook(Operation *op) {
      reg(PrepareMoEComputeW2WeightsOp::getOperationName(), &moe);
      reg(FillCacheOp::getOperationName(), &fillCache);
      reg(PagedFillCacheOp::getOperationName(), &pagedFillCache);
