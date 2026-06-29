@@ -43,7 +43,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -572,6 +572,53 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +572,42 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -52,11 +52,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +std::optional<DecodeQKVHead> matchDecodeQKVHead(SliceStaticOp sliceOp) {
 +  auto firstReshapeOp = dyn_cast_or_null<ReshapeOp>(lookThroughTypecasts(sliceOp.getResult()));
 +  if (!firstReshapeOp) return std::nullopt;
-+  if (firstReshapeOp.getType().getRank() == 4) {
-+    ArrayRef<int64_t> sliceShape = sliceOp.getType().getShape(), decodeShape = firstReshapeOp.getType().getShape();
-+    if (sliceShape.size() != 2 || decodeShape[0] != 1 || sliceShape[0] != decodeShape[1] || sliceShape[1] != decodeShape[2] * decodeShape[3]) return std::nullopt;
-+    return DecodeQKVHead{sliceOp, ReshapeOp(), nullptr, firstReshapeOp};
-+  }
++  if (firstReshapeOp.getType().getRank() == 4) { ArrayRef<int64_t> sliceShape = sliceOp.getType().getShape(), decodeShape = firstReshapeOp.getType().getShape(); if (sliceShape.size() != 2 || decodeShape[0] != 1 || sliceShape[0] != decodeShape[1] || sliceShape[1] != decodeShape[2] * decodeShape[3]) return std::nullopt; return DecodeQKVHead{sliceOp, ReshapeOp(), nullptr, firstReshapeOp}; }
 +  if (firstReshapeOp.getType().getRank() != 3) return std::nullopt;
 +  ReshapeOp headReshapeOp = firstReshapeOp;
 +  Operation *next = lookThroughTypecasts(headReshapeOp.getResult());
@@ -65,24 +61,17 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  auto decodeReshapeOp = dyn_cast_or_null<ReshapeOp>(next);
 +  if (!decodeReshapeOp || decodeReshapeOp.getType().getRank() != 4) return std::nullopt;
 +  ArrayRef<int64_t> headShape = headReshapeOp.getType().getShape(), decodeShape = decodeReshapeOp.getType().getShape();
-+  if (decodeShape[0] != 1 || headShape[0] != decodeShape[1] ||
-+      headShape[1] != decodeShape[2] || headShape[2] != decodeShape[3]) return std::nullopt;
++  if (decodeShape[0] != 1 || headShape[0] != decodeShape[1] || headShape[1] != decodeShape[2] || headShape[2] != decodeShape[3]) return std::nullopt;
 +  return DecodeQKVHead{sliceOp, headReshapeOp, rmsNormOp, decodeReshapeOp};
 +}
 +std::optional<SmallVector<DecodeQKVHead>> matchDecodeQKVHeads(MatmulOp matmulOp) {
 +  SmallVector<DecodeQKVHead> heads;
 +  auto matmulShape = matmulOp.getType().getShape();
 +  if (matmulShape.size() != 2) return std::nullopt;
-+  for (Operation *user : matmulOp.getResult().getUsers())
-+    if (auto sliceOp = dyn_cast<SliceStaticOp>(user))
-+      if (auto head = matchDecodeQKVHead(sliceOp)) heads.push_back(*head);
++  for (Operation *user : matmulOp.getResult().getUsers()) if (auto sliceOp = dyn_cast<SliceStaticOp>(user)) if (auto head = matchDecodeQKVHead(sliceOp)) heads.push_back(*head);
 +  if (heads.size() != 3) return std::nullopt;
 +  SmallVector<std::tuple<int64_t, int64_t, DecodeQKVHead>> sortedHeads;
-+  for (auto &head : heads) {
-+    auto dimAndBounds = findSlicedDimensionWithBounds(head.sliceOp, matmulShape);
-+    if (!dimAndBounds || std::get<0>(*dimAndBounds) != matmulShape.size() - 1) return std::nullopt;
-+    sortedHeads.push_back({std::get<1>(*dimAndBounds), std::get<2>(*dimAndBounds), head});
-+  }
++  for (auto &head : heads) { auto dimAndBounds = findSlicedDimensionWithBounds(head.sliceOp, matmulShape); if (!dimAndBounds || std::get<0>(*dimAndBounds) != matmulShape.size() - 1) return std::nullopt; sortedHeads.push_back({std::get<1>(*dimAndBounds), std::get<2>(*dimAndBounds), head}); }
 +  llvm::sort(sortedHeads, [](const auto &lhs, const auto &rhs) { return std::get<0>(lhs) < std::get<0>(rhs); });
 +  SmallVector<DecodeQKVHead> sorted; int64_t previousEnd = 0;
 +  for (auto &[start, end, head] : sortedHeads) { if (start != previousEnd) return std::nullopt; previousEnd = end; sorted.push_back(head); }
@@ -97,7 +86,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +879,27 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +869,27 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
