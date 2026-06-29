@@ -16,10 +16,8 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
  #include "llvm/ADT/SmallSet.h"
  #include "llvm/ADT/TypeSwitch.h"
-+#include "llvm/Support/raw_ostream.h"
  #include <cstdint>
 
-+#include <string>
  #include <type_traits>
 
  namespace mlir::tt::ttir {
