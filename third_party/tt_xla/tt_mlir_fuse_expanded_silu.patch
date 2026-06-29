@@ -1,24 +1,12 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -532,50 +532,70 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+@@ -532,50 +532,57 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
  public:
-+  static bool isOneValue(mlir::Value value) {
-+    value = ttmlir::utils::lookThrough<TypecastOp, ReshapeOp, BroadcastOp>(value);
-+    if (value.getDefiningOp<OnesOp>() || isFullOpWithValue(value, 1.0f)) return true;
-+    auto constantOp = value.getDefiningOp<ConstantOp>();
-+    auto denseAttr = constantOp ? mlir::dyn_cast<DenseElementsAttr>(constantOp.getValue()) : DenseElementsAttr();
-+    return denseAttr && denseAttr.isSplat() && std::abs(denseAttr.getSplatValue<APFloat>().convertToFloat() - 1.0f) < 1e-6f;
-+  }
-+
-+  std::optional<mlir::Value> matchSigmoidInput(mlir::Value value) const {
-+    value = ttmlir::utils::lookThrough<TypecastOp>(value);
-+    if (auto sigmoidOp = value.getDefiningOp<SigmoidOp>()) return sigmoidOp->hasOneUse() ? std::optional<mlir::Value>(ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput())) : std::nullopt;
-+    return matchExpandedSigmoidInput(value);
-+  }
-+
++  static bool isOneValue(mlir::Value value) { value = ttmlir::utils::lookThrough<TypecastOp, ReshapeOp, BroadcastOp>(value); auto constantOp = value.getDefiningOp<ConstantOp>(); auto denseAttr = constantOp ? mlir::dyn_cast<DenseElementsAttr>(constantOp.getValue()) : DenseElementsAttr(); return value.getDefiningOp<OnesOp>() || isFullOpWithValue(value, 1.0f) || (denseAttr && denseAttr.isSplat() && std::abs(denseAttr.getSplatValue<APFloat>().convertToFloat() - 1.0f) < 1e-6f); }
++  std::optional<mlir::Value> matchSigmoidInput(mlir::Value value) const { value = ttmlir::utils::lookThrough<TypecastOp>(value); if (auto sigmoidOp = value.getDefiningOp<SigmoidOp>()) return sigmoidOp->hasOneUse() ? std::optional<mlir::Value>(ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput())) : std::nullopt; return matchExpandedSigmoidInput(value); }
 +  std::optional<mlir::Value> matchExpandedSigmoidInput(mlir::Value value) const {
 +    auto divOp = ttmlir::utils::lookThrough<TypecastOp>(value).getDefiningOp<DivOp>();
 +    if (!divOp || !divOp->hasOneUse()) return std::nullopt;
@@ -34,7 +22,6 @@
 +    auto negOp = ttmlir::utils::lookThrough<TypecastOp>(expOp.getInput()).getDefiningOp<NegOp>();
 +    return negOp && negOp->hasOneUse() ? std::optional<mlir::Value>(ttmlir::utils::lookThrough<TypecastOp>(negOp.getInput())) : std::nullopt;
 +  }
-+
    mlir::LogicalResult
    matchAndRewrite(MultiplyOp multiplyOp,
                    mlir::PatternRewriter &rewriter) const final {

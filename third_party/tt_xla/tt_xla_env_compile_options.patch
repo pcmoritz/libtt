@@ -8,7 +8,7 @@
  #include <filesystem>
  #include <string>
  #include <unordered_map>
-@@ -89,6 +90,15 @@ CompileOptions parseCompileOptions(
+@@ -89,6 +90,14 @@ CompileOptions parseCompileOptions(
        internal::parseStringOption(compile_options, "export_model_name")
            .value_or("");
  
@@ -20,7 +20,6 @@
 +  if (const char *export_path = std::getenv("TT_XLA_EXPORT_PATH"); export_path && export_path[0] != '\0') {
 +    options.export_path = export_path;
 +  }
-+
    if (!options.export_path.has_value() &&
        options.backend != BackendRuntime::TTNNFlatbuffer) {
      ABORT_F("Compile option 'export_path' must be provided when backend is not "

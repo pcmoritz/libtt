@@ -9,7 +9,7 @@
  
          SmallVector<Type> resultTypes(compositeOp.getResultTypes());
          IsolatedIRValidationWrapper validator(compositeOp.getContext());
-@@ -138,16 +140,19 @@ static void registerBuiltinComposites() {
+@@ -138,16 +140,18 @@ static void registerBuiltinComposites() {
              compositeOp.getOperation(), compositeOp.getLoc(), resultTypes,
              compositeOp.getInputs()[0], compositeOp.getInputs()[1],
              compositeOp.getInputs()[2],
@@ -21,7 +21,6 @@
        [](ttcore::CompositeOp compositeOp, OpBuilder &builder) -> Operation * {
 +        IntegerAttr tokenIndexAttr;
 +        if (auto attrs = compositeOp.getCompositeAttributes()) tokenIndexAttr = attrs->getAs<IntegerAttr>("token_index");
-+
          return builder.create<RotaryEmbeddingOp>(
              compositeOp.getLoc(), compositeOp.getResultTypes(),
              compositeOp.getInputs()[0], compositeOp.getInputs()[1],

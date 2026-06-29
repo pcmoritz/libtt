@@ -64,7 +64,7 @@
 -    return failure();
 -  }
  
-@@ -645,14 +668,16 @@
+@@ -645,14 +668,15 @@
    // cos/sin are half-dim. Create concat(half, half) as the composite's
    // cos/sin inputs so that ttnn::RotaryEmbeddingOp promotion can match
    // the expected full-dim shapes. The decomposition body will detect the
@@ -78,12 +78,11 @@
    auto sinHalfType = mlir::cast<RankedTensorType>(sinHalf.getType());
  
 +  if (rank4Reshape && (cosHalfType.getRank() != resultType.getRank() || sinHalfType.getRank() != resultType.getRank())) return failure();
-+
    int64_t lastDim = resultType.getRank() - 1;
  
    SmallVector<int64_t> cosFullShape(cosHalfType.getShape());
    cosFullShape[lastDim] *= 2;
-@@ -671,8 +698,13 @@
+@@ -671,8 +697,13 @@
        srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
        rewriter.getSI32IntegerAttr(lastDim));
  
