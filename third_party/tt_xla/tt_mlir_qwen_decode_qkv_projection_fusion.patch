@@ -87,7 +87,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -572,6 +572,137 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +572,133 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -145,8 +145,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  return DecodeQKVHead{sliceOp, headReshapeOp, rmsNormOp, decodeReshapeOp};
 +}
 +
-+std::optional<SmallVector<DecodeQKVHead>>
-+matchDecodeQKVHeads(MatmulOp matmulOp) {
++std::optional<SmallVector<DecodeQKVHead>> matchDecodeQKVHeads(MatmulOp matmulOp) {
 +  SmallVector<DecodeQKVHead> heads;
 +  auto matmulShape = matmulOp.getType().getShape();
 +  if (matmulShape.size() != 2) {
@@ -170,8 +169,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    if (!dimAndBounds || std::get<0>(*dimAndBounds) != matmulShape.size() - 1) {
 +      return std::nullopt;
 +    }
-+    sortedHeads.push_back(
-+        {std::get<1>(*dimAndBounds), std::get<2>(*dimAndBounds), head});
++    sortedHeads.push_back({std::get<1>(*dimAndBounds), std::get<2>(*dimAndBounds), head});
 +  }
 +
 +  llvm::sort(sortedHeads, [](const auto &lhs, const auto &rhs) {
@@ -206,15 +204,13 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  return sorted;
 +}
 +
-+RMSNormOp createRank4RMSNorm(PatternRewriter &rewriter, RMSNormOp oldOp,
-+                             Value input) {
++RMSNormOp createRank4RMSNorm(PatternRewriter &rewriter, RMSNormOp oldOp, Value input) {
 +  return rewriter.create<RMSNormOp>(
 +      oldOp.getLoc(), input.getType(), input, oldOp.getWeight(),
 +      oldOp.getBias(), oldOp.getEpsilonAttr(), oldOp.getComputeConfigAttr());
 +}
 +
-+void eraseUnusedDecodeQKVHead(PatternRewriter &rewriter,
-+                              DecodeQKVHead &head) {
++void eraseUnusedDecodeQKVHead(PatternRewriter &rewriter, DecodeQKVHead &head) {
 +  for (Operation *op : {head.rmsNormOp.getOperation(), head.headReshapeOp.getOperation(), head.sliceOp.getOperation()}) {
 +    if (op && op->use_empty()) {
 +      rewriter.eraseOp(op);
