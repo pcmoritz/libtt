@@ -30,7 +30,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
  
 +#include "llvm/ADT/STLExtras.h"
 +
-@@ -30,6 +36,43 @@ int64_t inputOperandTileHeight(Operation *op, unsigned operandIdx) {
+@@ -30,6 +36,40 @@ int64_t inputOperandTileHeight(Operation *op, unsigned operandIdx) {
    return nc * ht;
  }
  
@@ -39,8 +39,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +    return false;
 +  }
 +
-+  auto resultType =
-+      mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
++  auto resultType = mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
 +  if (!resultType || resultType.getRank() != 4) {
 +    return false;
 +  }
@@ -51,14 +50,12 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +}
 +
 +TTNNLayoutAttr getSingleCoreHeightShardedLayout(Operation *op) {
-+  auto resultType =
-+      mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
++  auto resultType = mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
 +  if (!resultType) {
 +    return nullptr;
 +  }
 +
-+  auto seed =
-+      mlir::dyn_cast_or_null<TTNNLayoutAttr>(resultType.getEncoding());
++  auto seed = mlir::dyn_cast_or_null<TTNNLayoutAttr>(resultType.getEncoding());
 +  if (!seed) {
 +    return nullptr;
 +  }
