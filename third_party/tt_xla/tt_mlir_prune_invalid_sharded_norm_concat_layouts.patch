@@ -4,7 +4,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h b
 @@ -38,6 +38,8 @@ struct RmsNormRuleBook : OpRuleBook {
    /// are rejected because the sharded layernorm kernel doesn't support them.
    LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
- 
+
 +  OutputHints getOutputHints(Operation *op, const std::vector<OpConfig> &legalConfigs) const override;
 +  bool isValidOutputHintForInputs(const OpConfig &hint, llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
    /// adjustScore reflects kernel-dispatch reality: the generic scorer derives
@@ -15,15 +15,28 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 @@ -3,6 +3,9 @@
  // SPDX-License-Identifier: Apache-2.0
- 
+
  #include "ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h"
  #include "ttmlir/Dialect/TTNN/Analysis/OpRules/LayoutFilterUtils.h"
  #include "ttmlir/Utils.h"
- 
+
+@@ -63,10 +63,9 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+       return true;
+     }
+
+-    // Height-sharded is explicitly rejected by the sharded layernorm kernel
+-    // (layernorm_device_operation.cpp:151).
+     if (value == TensorMemoryLayout::HeightSharded) {
+-      return false;
++      return layout_filter_utils::isFullBboxSharded(layout) &&
++             ttmlir::utils::volume(layout.getGridShape()) == 1;
+     }
+
+     // Block- and width-sharded are accepted, provided the grid is a full
 @@ -76,6 +90,24 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    };
  }
- 
+
 +OutputHints RmsNormRuleBook::getOutputHints(Operation *op, const std::vector<OpConfig> &legalConfigs) const {
 +  OutputHints result = OpRuleBook::getOutputHints(op, legalConfigs); if (op->getNumResults() == 0) return result;
 +  auto resultType = mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType()); if (!resultType || resultType.getRank() != 4) return result;
@@ -49,7 +62,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp b/lib/Diale
 --- a/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp
 @@ -14,10 +14,9 @@ namespace mlir::tt::ttnn {
- 
+
  LayoutFilterFn
  ConcatRuleBook::getInputLayoutFilter(unsigned /*operandIdx*/) const {
 -  // Concat sharded inputs: re-enabled after tt-metal hang fix landed.
@@ -58,10 +71,10 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp b/lib/Diale
 -  return nullptr;
 +  return [](TTNNLayoutAttr layout) -> bool { auto ml = layout.getMemLayout(); return !(ml && ml.getValue() == TensorMemoryLayout::BlockSharded); };
  }
- 
+
  bool ConcatRuleBook::shouldExploreReshards() const { return true; }
 @@ -31,6 +35,7 @@ bool ConcatRuleBook::isValidInputCombination(
- 
+
    // Concat requires all inputs to have the same memory layout type.
    auto firstMem = inputLayouts[0].getMemLayout();
 +  if (firstMem && (firstMem.getValue() == TensorMemoryLayout::BlockSharded || (inputLayouts.size() == 2 && firstMem.getValue() == TensorMemoryLayout::WidthSharded))) return false;
