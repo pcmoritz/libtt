@@ -9,7 +9,7 @@
    Value cur = matmul.getResult();
    Operation *exit = nullptr;
    while (true) {
-@@ -210,9 +210,18 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+@@ -210,9 +210,14 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
    if (!gate || !gate.getResult().hasOneUse()) {
      return false;
    }
@@ -18,16 +18,12 @@
 -    return false;
 +  Operation *ff2 = *gate.getResult().getUsers().begin();
 +  if (auto ff2Matmul = mlir::dyn_cast<MatmulOp>(ff2)) {
-+    if (!matmulReachesResidualAdd(ff2Matmul)) {
-+      return false;
-+    }
++    if (!matmulReachesResidualAdd(ff2Matmul)) return false;
 +  } else {
 +    auto ff2Linear = mlir::dyn_cast<LinearOp>(ff2);
 +    if (!ff2Linear || !ff2Linear.getBias() ||
 +        !isLowerableFloat(getValueDtype(ff2Linear.getBias())) ||
-+        !isLowerableFloat(getValueDtype(ff2Linear.getResult()))) {
-+      return false;
-+    }
++        !isLowerableFloat(getValueDtype(ff2Linear.getResult()))) return false;
    }
  
    downcastChain(matmul, flowOps);

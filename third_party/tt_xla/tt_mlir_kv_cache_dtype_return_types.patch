@@ -1,13 +1,11 @@
 --- a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
-@@ -72,6 +72,19 @@
+@@ -72,6 +72,17 @@
                                           ttcore::g_kvCacheAttrName);
    }
  
 +  static bool isKVCacheReturnOperand(func::FuncOp funcOp, Value value) {
-+    if (canPropagateDtype(funcOp, value)) {
-+      return true;
-+    }
++    if (canPropagateDtype(funcOp, value)) return true;
 +
 +    Operation *defOp = value.getDefiningOp();
 +    return defOp && llvm::TypeSwitch<Operation *, bool>(defOp)
@@ -20,7 +18,7 @@
    static ttcore::LocalShapeAttr
    convertLocalShapeAttr(MLIRContext *ctx, ttcore::LocalShapeAttr attr,
                          ttcore::DataType targetDtype) {
-@@ -119,19 +136,13 @@
+@@ -119,19 +134,13 @@
      Operation *terminator = block.getTerminator();
      if (auto returnOp = mlir::dyn_cast<func::ReturnOp>(terminator)) {
        for (auto [i, operand] : llvm::enumerate(returnOp.getOperands())) {
