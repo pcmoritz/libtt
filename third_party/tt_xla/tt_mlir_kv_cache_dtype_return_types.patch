@@ -1,6 +1,6 @@
 --- a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
-@@ -72,6 +72,25 @@
+@@ -72,6 +72,24 @@
                                           ttcore::g_kvCacheAttrName);
    }
  
@@ -14,19 +14,18 @@
 +      return false;
 +    }
 +
-+    bool result = false;
-+    llvm::TypeSwitch<Operation *>(defOp)
++    return llvm::TypeSwitch<Operation *, bool>(defOp)
 +        .Case<FillCacheOp, UpdateCacheOp, PagedFillCacheOp,
 +              PagedUpdateCacheOp>([&](auto cacheOp) {
-+          result = canPropagateDtype(funcOp, cacheOp.getCache());
-+        });
-+    return result;
++          return canPropagateDtype(funcOp, cacheOp.getCache());
++        })
++        .Default(false);
 +  }
 +
    static ttcore::LocalShapeAttr
    convertLocalShapeAttr(MLIRContext *ctx, ttcore::LocalShapeAttr attr,
                          ttcore::DataType targetDtype) {
-@@ -119,19 +138,14 @@
+@@ -119,19 +137,14 @@
      Operation *terminator = block.getTerminator();
      if (auto returnOp = mlir::dyn_cast<func::ReturnOp>(terminator)) {
        for (auto [i, operand] : llvm::enumerate(returnOp.getOperands())) {

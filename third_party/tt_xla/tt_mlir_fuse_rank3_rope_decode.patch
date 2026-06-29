@@ -117,7 +117,7 @@
  
    SmallVector<int64_t> cosFullShape(cosHalfType.getShape());
    cosFullShape[lastDim] *= 2;
-@@ -671,8 +733,33 @@
+@@ -671,8 +733,31 @@
        srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
        rewriter.getSI32IntegerAttr(lastDim));
  
@@ -142,9 +142,7 @@
 +    compositeSin = reshapeTo(rewriter, srcOp.getLoc(), sinFull,
 +                             getCacheTypeFor(sinFullType, compositeResultType));
 +    compositeAttributes = rewriter.getDictionaryAttr({rewriter.getNamedAttr(
-+        "token_index",
-+        rewriter.getIntegerAttr(
-+            rewriter.getIntegerType(32, /*isSigned=*/false), 0))});
++        "token_index", rewriter.getUI32IntegerAttr(0))});
 +  }
 +
 +  replaceWithRoPEComposite(anchorOp, rewriter, compositeX, compositeCos,
