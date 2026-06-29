@@ -95,7 +95,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -572,6 +572,149 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +572,147 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -174,8 +174,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    return std::nullopt;
 +  }
 +
-+  SmallVector<std::pair<std::pair<int64_t, int64_t>, DecodeQKVHead>>
-+      sortedHeads;
++  SmallVector<std::tuple<int64_t, int64_t, DecodeQKVHead>> sortedHeads;
 +  for (auto &head : heads) {
 +    auto dimAndBounds =
 +        findSlicedDimensionWithBounds(head.sliceOp, matmulShape);
@@ -186,21 +185,20 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    if (dim != matmulShape.size() - 1) {
 +      return std::nullopt;
 +    }
-+    sortedHeads.push_back({{start, end}, head});
++    sortedHeads.push_back({start, end, head});
 +  }
 +
 +  llvm::sort(sortedHeads, [](const auto &lhs, const auto &rhs) {
-+    return lhs.first.first < rhs.first.first;
++    return std::get<0>(lhs) < std::get<0>(rhs);
 +  });
 +
 +  SmallVector<DecodeQKVHead> sorted;
-+  sorted.reserve(sortedHeads.size());
 +  int64_t previousEnd = 0;
-+  for (auto &[bounds, head] : sortedHeads) {
-+    if (bounds.first != previousEnd) {
++  for (auto &[start, end, head] : sortedHeads) {
++    if (start != previousEnd) {
 +      return std::nullopt;
 +    }
-+    previousEnd = bounds.second;
++    previousEnd = end;
 +    sorted.push_back(head);
 +  }
 +  if (previousEnd != matmulShape.back()) {
@@ -245,7 +243,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +964,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +962,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
