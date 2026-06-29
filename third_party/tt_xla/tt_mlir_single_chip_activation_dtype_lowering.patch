@@ -1,15 +1,14 @@
 --- a/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
-@@ -179,7 +179,7 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
- 
-   // Walk the single-use chain from the matmul to its first non-flow user.
-   llvm::SmallVector<Operation *> flowOps;
+@@ -180 +179,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
 -  bool sawCCL = false;
-+  bool sawCCL = true;
-   Value cur = matmul.getResult();
-   Operation *exit = nullptr;
-   while (true) {
-@@ -210,9 +210,11 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+@@ -194 +193,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+-      sawCCL |= isCCLOp(user);
+@@ -202,3 +200,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+-  if (!sawCCL) {
+-    return false;
+-  }
+@@ -210,9 +205,11 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
    if (!gate || !gate.getResult().hasOneUse()) {
      return false;
    }
