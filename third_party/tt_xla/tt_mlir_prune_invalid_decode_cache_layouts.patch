@@ -20,6 +20,18 @@ diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h b/i
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
+@@ -53,10 +53,8 @@
+ LayoutFilterFn
+ SDPADecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+-  // Q (operand 0): kernel asserts "Q tensor buffer type must be DRAM when
+-  // not sharded" -- accept DRAM (any) or L1-sharded; reject L1-interleaved.
+   // K, V, and cache tensors (operand >= 1): must be DRAM-interleaved.
+   if (operandIdx == 0) {
+-    return layout_filter_utils::rejectL1Interleaved;
++    return nullptr;
+   }
+   return layout_filter_utils::requireDRAMInterleaved;
+ }
 @@ -59,6 +59,7 @@ SDPADecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    return layout_filter_utils::requireDRAMInterleaved;
  }
@@ -28,10 +40,15 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialec
  //===----------------------------------------------------------------------===//
  // RotaryEmbeddingRuleBook
  //===----------------------------------------------------------------------===//
-@@ -128,4 +134,5 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -118,7 +134,9 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+   if (operandIdx == 0) {
+     return cacheBufferDramOnlyFilter();
+   }
++  if (operandIdx == 1 || operandIdx == 2 || operandIdx == 3) return layout_filter_utils::requireDRAMInterleaved;
    return nullptr;
  }
-
+-
++
 +LayoutFilterFn PagedUpdateCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const { if (operandIdx == 0) return cacheBufferDramOnlyFilter(); if (operandIdx == 1) return [](TTNNLayoutAttr layout) -> bool { auto ml = layout.getMemLayout(); return layout.hasL1BufferType() && ml && ml.getValue() == TensorMemoryLayout::HeightSharded; }; return nullptr; }
  } // namespace mlir::tt::ttnn
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp b/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp
