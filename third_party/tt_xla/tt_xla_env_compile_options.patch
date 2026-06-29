@@ -1,0 +1,30 @@
+--- a/pjrt_implementation/src/api/compile_options.cc
++++ b/pjrt_implementation/src/api/compile_options.cc
+@@ -7,6 +7,7 @@
+ 
+ // c++ standard library includes
+ #include <algorithm>
++#include <cstdlib>
+ #include <filesystem>
+ #include <string>
+ #include <unordered_map>
+@@ -89,6 +90,19 @@ CompileOptions parseCompileOptions(
+       internal::parseStringOption(compile_options, "export_model_name")
+           .value_or("");
+ 
++  if (const char *metrics_file =
++          std::getenv("TT_XLA_TTNN_PERF_METRICS_OUTPUT_FILE")) {
++    if (metrics_file[0] != '\0') {
++      options.ttnn_perf_metrics_enabled = true;
++      options.ttnn_perf_metrics_output_file = metrics_file;
++    }
++  }
++  if (const char *export_path = std::getenv("TT_XLA_EXPORT_PATH")) {
++    if (export_path[0] != '\0') {
++      options.export_path = export_path;
++    }
++  }
++
+   if (!options.export_path.has_value() &&
+       options.backend != BackendRuntime::TTNNFlatbuffer) {
+     ABORT_F("Compile option 'export_path' must be provided when backend is not "

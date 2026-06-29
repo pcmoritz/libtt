@@ -1,0 +1,37 @@
+--- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
+@@ -131,6 +131,10 @@ static void registerBuiltinComposites() {
+       [](ttcore::CompositeOp compositeOp,
+          OpBuilder &builder) -> OpValidationResult {
+         TT_assert(compositeOp.getInputs().size() == 3u);
++        IntegerAttr tokenIndexAttr;
++        if (auto attrs = compositeOp.getCompositeAttributes()) {
++          tokenIndexAttr = attrs->getAs<IntegerAttr>("token_index");
++        }
+ 
+         SmallVector<Type> resultTypes(compositeOp.getResultTypes());
+         IsolatedIRValidationWrapper validator(compositeOp.getContext());
+@@ -138,16 +142,21 @@ static void registerBuiltinComposites() {
+             compositeOp.getOperation(), compositeOp.getLoc(), resultTypes,
+             compositeOp.getInputs()[0], compositeOp.getInputs()[1],
+             compositeOp.getInputs()[2],
+-            /*token_index=*/mlir::IntegerAttr(),
++            tokenIndexAttr,
+             /*compute_config=*/nullptr);
+       },
+       // Build
+       [](ttcore::CompositeOp compositeOp, OpBuilder &builder) -> Operation * {
++        IntegerAttr tokenIndexAttr;
++        if (auto attrs = compositeOp.getCompositeAttributes()) {
++          tokenIndexAttr = attrs->getAs<IntegerAttr>("token_index");
++        }
++
+         return builder.create<RotaryEmbeddingOp>(
+             compositeOp.getLoc(), compositeOp.getResultTypes(),
+             compositeOp.getInputs()[0], compositeOp.getInputs()[1],
+             compositeOp.getInputs()[2],
+-            /*token_index=*/mlir::IntegerAttr(),
++            tokenIndexAttr,
+             /*compute_config=*/nullptr);
+       }};
+ 

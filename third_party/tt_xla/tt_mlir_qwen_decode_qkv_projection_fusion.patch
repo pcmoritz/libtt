@@ -1,0 +1,415 @@
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
+@@ -44,6 +44,35 @@ private:
+   OpValidationConfig validationConfig;
+ };
+
++// Fuses the decode QKV projection shape used by Qwen-style attention where
++// q/k RMSNorm sit between projection and attention:
++//
++//   matmul -> slice/reshape -> q_rms_norm -> reshape[1,B,H,D]
++//          -> slice/reshape -> k_rms_norm -> reshape[1,B,Hkv,D]
++//          -> slice/reshape ----------------> reshape[1,B,Hkv,D]
++//
++// Replaced with:
++//   matmul -> reshape[1,1,B,QKV] -> nlp_create_qkv_heads_decode
++//          -> q_rms_norm[1,B,H,D]
++//          -> k_rms_norm[1,B,Hkv,D]
++//
++// This keeps normalization on device and removes the per-layer projection
++// slices from the decode loop.
++class NLPDecodeQKVProjectionFusing
++    : public mlir::OpRewritePattern<MatmulOp> {
++public:
++  NLPDecodeQKVProjectionFusing(mlir::MLIRContext *context,
++                               const OpValidationConfig &validationConfig = {})
++      : OpRewritePattern<MatmulOp>(context), validationConfig(validationConfig) {}
++
++  mlir::LogicalResult
++  matchAndRewrite(MatmulOp matmulOp,
++                  mlir::PatternRewriter &rewriter) const override;
++
++private:
++  OpValidationConfig validationConfig;
++};
++
+ // Fuses a SplitQueryKeyValueAndSplitHeadsOp followed by permute [2,0,1,3]
+ // on all three outputs into a single NLPCreateQKVHeadsDecodeOp, which is
+ // optimized for the decode case (S=1).
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -19,8 +19,10 @@
+ #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+ #include "llvm/ADT/SmallSet.h"
+ #include "llvm/ADT/TypeSwitch.h"
++#include "llvm/Support/raw_ostream.h"
+ #include <cstdint>
+
++#include <string>
+ #include <type_traits>
+
+ namespace mlir::tt::ttir {
+@@ -1809,6 +1811,49 @@ private:
+     return rewriter.create<ConcatOp>(loc, concatType, biases,
+                                      rewriter.getSI32IntegerAttr(concatDim));
+   }
++
++  // Shared-LHS fusion iterates SSA users, which is not a semantic ordering.
++  // For Q/K/V projections this can produce V,K,Q, forcing later passes to
++  // reason about a lifted constant in a nonstandard order. Preserve the
++  // projection order encoded in locations when all three are present.
++  static int getQKVProjectionOrder(Operation *op) {
++    std::string loc;
++    llvm::raw_string_ostream os(loc);
++    op->getLoc().print(os);
++    os.flush();
++
++    if (loc.find("/q_proj/") != std::string::npos) {
++      return 0;
++    }
++    if (loc.find("/k_proj/") != std::string::npos) {
++      return 1;
++    }
++    if (loc.find("/v_proj/") != std::string::npos) {
++      return 2;
++    }
++    return -1;
++  }
++
++  static void sortQKVProjectionCandidates(FusionCandidates &candidates) {
++    if (candidates.ops.size() != 3) {
++      return;
++    }
++
++    SmallVector<int, 3> order;
++    for (OpType op : candidates.ops) {
++      order.push_back(getQKVProjectionOrder(op.getOperation()));
++    }
++    if (!llvm::is_contained(order, 0) || !llvm::is_contained(order, 1) ||
++        !llvm::is_contained(order, 2)) {
++      return;
++    }
++
++    llvm::sort(candidates.ops, [](OpType lhs, OpType rhs) {
++      return getQKVProjectionOrder(lhs.getOperation()) <
++             getQKVProjectionOrder(rhs.getOperation());
++    });
++    candidates.firstTransposeB = candidates.ops.front().getTransposeB();
++  }
+
+   // Collect all ops that share the same LHS operand and are compatible
+   // for fusion.
+@@ -1872,6 +1917,8 @@ private:
+       }
+     }
+
++    sortQKVProjectionCandidates(result);
++
+     return result;
+   }
+
+diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
+@@ -15,6 +15,15 @@ namespace mlir::tt::ttnn::fusing {
+ namespace {
+
+ // ============================================================================
++// Common helpers
++// ============================================================================
++
++ArrayAttr getI32ArrayAttr(OpBuilder &builder, ArrayRef<int64_t> values) {
++  SmallVector<int32_t> i32Values(values.begin(), values.end());
++  return builder.getI32ArrayAttr(i32Values);
++}
++
++// ============================================================================
+ // SplitQueryKeyValueAndSplitHeadsFusing helpers
+ // ============================================================================
+
+@@ -572,6 +581,194 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+   return true;
+ }
+
++// ============================================================================
++// NLPDecodeQKVProjectionFusing helpers
++// ============================================================================
++
++struct DecodeQKVHead {
++  SliceStaticOp sliceOp;
++  ReshapeOp headReshapeOp;
++  RMSNormOp rmsNormOp; // nullptr for V
++  ReshapeOp decodeReshapeOp;
++  QKVRole role;
++};
++
++int64_t decodeNumHeads(DecodeQKVHead &head) {
++  return mlir::cast<RankedTensorType>(
++             head.decodeReshapeOp.getResult().getType())
++      .getShape()[2];
++}
++
++int64_t decodeHeadDim(DecodeQKVHead &head) {
++  return mlir::cast<RankedTensorType>(
++             head.decodeReshapeOp.getResult().getType())
++      .getShape()[3];
++}
++
++DecodeQKVHead *findDecodeHeadByRole(SmallVector<DecodeQKVHead> &heads,
++                                    QKVRole role) {
++  for (auto &head : heads) {
++    if (head.role == role) {
++      return &head;
++    }
++  }
++  return nullptr;
++}
++
++std::optional<DecodeQKVHead> matchDecodeQKVHead(SliceStaticOp sliceOp) {
++  auto firstReshapeOp =
++      dyn_cast_or_null<ReshapeOp>(lookThroughTypecasts(sliceOp.getResult()));
++  if (!firstReshapeOp) {
++    return std::nullopt;
++  }
++
++  // V has no per-head RMSNorm in Qwen decode, so it goes straight from the
++  // projection slice to the rank-4 attention shape.
++  if (firstReshapeOp.getType().getRank() == 4) {
++    ArrayRef<int64_t> sliceShape = sliceOp.getType().getShape();
++    ArrayRef<int64_t> decodeShape = firstReshapeOp.getType().getShape();
++    if (sliceShape.size() != 2 || decodeShape[0] != 1 ||
++        sliceShape[0] != decodeShape[1] ||
++        sliceShape[1] != decodeShape[2] * decodeShape[3]) {
++      return std::nullopt;
++    }
++    return DecodeQKVHead{sliceOp, ReshapeOp(), nullptr, firstReshapeOp,
++                         QKVRole::Value};
++  }
++
++  if (firstReshapeOp.getType().getRank() != 3) {
++    return std::nullopt;
++  }
++  ReshapeOp headReshapeOp = firstReshapeOp;
++
++  RMSNormOp rmsNormOp = nullptr;
++  Operation *next = lookThroughTypecasts(headReshapeOp.getResult());
++  if (auto candidate = dyn_cast_or_null<RMSNormOp>(next)) {
++    rmsNormOp = candidate;
++    next = lookThroughTypecasts(rmsNormOp.getResult());
++  }
++
++  auto decodeReshapeOp = dyn_cast_or_null<ReshapeOp>(next);
++  if (!decodeReshapeOp || decodeReshapeOp.getType().getRank() != 4) {
++    return std::nullopt;
++  }
++
++  ArrayRef<int64_t> headShape = headReshapeOp.getType().getShape();
++  ArrayRef<int64_t> decodeShape = decodeReshapeOp.getType().getShape();
++  if (decodeShape[0] != 1 || headShape[0] != decodeShape[1] ||
++      headShape[1] != decodeShape[2] || headShape[2] != decodeShape[3]) {
++    return std::nullopt;
++  }
++
++  return DecodeQKVHead{sliceOp, headReshapeOp, rmsNormOp, decodeReshapeOp,
++                       QKVRole::Value};
++}
++
++std::optional<SmallVector<DecodeQKVHead>>
++matchDecodeQKVHeads(MatmulOp matmulOp) {
++  SmallVector<DecodeQKVHead> heads;
++  auto matmulShape = matmulOp.getType().getShape();
++  if (matmulShape.size() != 2) {
++    return std::nullopt;
++  }
++
++  for (Operation *user : matmulOp.getResult().getUsers()) {
++    auto sliceOp = dyn_cast<SliceStaticOp>(user);
++    if (!sliceOp) {
++      continue;
++    }
++    std::optional<DecodeQKVHead> head = matchDecodeQKVHead(sliceOp);
++    if (head) {
++      heads.push_back(*head);
++    }
++  }
++  if (heads.size() != 3) {
++    return std::nullopt;
++  }
++
++  SmallVector<std::pair<int64_t, int64_t>> bounds;
++  std::optional<size_t> sliceDim;
++  for (auto &head : heads) {
++    auto dimAndBounds =
++        findSlicedDimensionWithBounds(head.sliceOp, matmulShape);
++    if (!dimAndBounds) {
++      return std::nullopt;
++    }
++    auto [dim, start, end] = *dimAndBounds;
++    if (!sliceDim) {
++      sliceDim = dim;
++    } else if (*sliceDim != dim) {
++      return std::nullopt;
++    }
++    bounds.push_back({start, end});
++  }
++  if (!sliceDim || *sliceDim != matmulShape.size() - 1) {
++    return std::nullopt;
++  }
++
++  SmallVector<size_t> indices(heads.size());
++  std::iota(indices.begin(), indices.end(), 0);
++  llvm::sort(indices, [&](size_t a, size_t b) {
++    return bounds[a].first < bounds[b].first;
++  });
++
++  SmallVector<DecodeQKVHead> sorted;
++  sorted.reserve(heads.size());
++  int64_t previousEnd = 0;
++  for (size_t index : indices) {
++    if (bounds[index].first != previousEnd) {
++      return std::nullopt;
++    }
++    previousEnd = bounds[index].second;
++    sorted.push_back(heads[index]);
++  }
++  if (previousEnd != matmulShape.back()) {
++    return std::nullopt;
++  }
++
++  // TTIR shared-projection fusion sorts Qwen Q/K/V projections by location, so
++  // the fused projection is in Q,K,V slice order by the time this pattern runs.
++  // Avoid forward role tracing here; greedy TTNN fusing may visit this matmul
++  // before downstream SDPA/cache-update patterns have materialized.
++  sorted[0].role = QKVRole::Query;
++  sorted[1].role = QKVRole::Key;
++  sorted[2].role = QKVRole::Value;
++
++  DecodeQKVHead *q = findDecodeHeadByRole(sorted, QKVRole::Query);
++  DecodeQKVHead *k = findDecodeHeadByRole(sorted, QKVRole::Key);
++  DecodeQKVHead *v = findDecodeHeadByRole(sorted, QKVRole::Value);
++  if (!q || !k || !v || !q->rmsNormOp || !k->rmsNormOp || v->rmsNormOp) {
++    return std::nullopt;
++  }
++  if (decodeHeadDim(*q) != decodeHeadDim(*k) ||
++      decodeHeadDim(*q) != decodeHeadDim(*v) ||
++      decodeNumHeads(*k) != decodeNumHeads(*v)) {
++    return std::nullopt;
++  }
++
++  return sorted;
++}
++
++RMSNormOp createRank4RMSNorm(PatternRewriter &rewriter, RMSNormOp oldOp,
++                             Value input) {
++  return rewriter.create<RMSNormOp>(
++      oldOp.getLoc(), input.getType(), input, oldOp.getWeight(),
++      oldOp.getBias(), oldOp.getEpsilonAttr(), oldOp.getComputeConfigAttr());
++}
++
++void eraseUnusedDecodeQKVHead(PatternRewriter &rewriter,
++                              DecodeQKVHead &head) {
++  if (head.rmsNormOp && head.rmsNormOp->use_empty()) {
++    rewriter.eraseOp(head.rmsNormOp);
++  }
++  if (head.headReshapeOp && head.headReshapeOp->use_empty()) {
++    rewriter.eraseOp(head.headReshapeOp);
++  }
++  if (head.sliceOp && head.sliceOp->use_empty()) {
++    rewriter.eraseOp(head.sliceOp);
++  }
++}
++
+ // ============================================================================
+ // Step 7: Create fused op
+ // ============================================================================
+@@ -821,6 +1018,76 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+ // ============================================================================
+ // NLPCreateQKVHeadsDecodeFusing
+ // ============================================================================
++
++mlir::LogicalResult NLPDecodeQKVProjectionFusing::matchAndRewrite(
++    MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const {
++  std::optional<SmallVector<DecodeQKVHead>> heads =
++      matchDecodeQKVHeads(matmulOp);
++  if (!heads) {
++    return mlir::failure();
++  }
++
++  DecodeQKVHead *q = findDecodeHeadByRole(*heads, QKVRole::Query);
++  DecodeQKVHead *k = findDecodeHeadByRole(*heads, QKVRole::Key);
++  DecodeQKVHead *v = findDecodeHeadByRole(*heads, QKVRole::Value);
++  assert(q && k && v);
++
++  auto matmulType = matmulOp.getType();
++  ArrayRef<int64_t> matmulShape = matmulType.getShape();
++  int64_t batchSize = matmulShape[0];
++  int64_t hiddenSize = matmulShape[1];
++  if (q->decodeReshapeOp.getType().getShape()[1] != batchSize) {
++    return mlir::failure();
++  }
++
++  SmallVector<int64_t> inputShape = {1, 1, batchSize, hiddenSize};
++  RankedTensorType inputType =
++      utils::RankedTensorTypeFactory::create(matmulType, inputShape);
++
++  rewriter.setInsertionPointAfter(matmulOp);
++  auto inputReshape = rewriter.create<ReshapeOp>(
++      matmulOp.getLoc(), inputType, matmulOp.getResult(),
++      getI32ArrayAttr(rewriter, inputShape));
++
++  auto numHeadsAttr =
++      rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeNumHeads(*q)));
++  auto numKVHeadsAttr =
++      rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeNumHeads(*k)));
++  SmallVector<Type> resultTypes{q->decodeReshapeOp.getType(),
++                                k->decodeReshapeOp.getType(),
++                                v->decodeReshapeOp.getType()};
++
++  IsolatedIRValidationWrapper validator(rewriter.getContext(),
++                                        validationConfig);
++  auto validationResult = validator.validateOp<NLPCreateQKVHeadsDecodeOp>(
++      matmulOp.getOperation(), matmulOp.getLoc(), resultTypes,
++      inputReshape.getResult(),
++      /*batch_offset=*/Value(), numHeadsAttr, numKVHeadsAttr,
++      /*overlap_qk_coregrid=*/BoolAttr(),
++      /*slice_size=*/IntegerAttr());
++  if (!validationResult.isSuccess()) {
++    return mlir::failure();
++  }
++
++  auto decodeOp = rewriter.create<NLPCreateQKVHeadsDecodeOp>(
++      matmulOp.getLoc(), resultTypes, inputReshape.getResult(),
++      /*batch_offset=*/Value(), numHeadsAttr, numKVHeadsAttr,
++      /*overlap_qk_coregrid=*/BoolAttr(),
++      /*slice_size=*/IntegerAttr());
++
++  auto qNorm = createRank4RMSNorm(rewriter, q->rmsNormOp, decodeOp.getQuery());
++  auto kNorm = createRank4RMSNorm(rewriter, k->rmsNormOp, decodeOp.getKey());
++
++  rewriter.replaceOp(q->decodeReshapeOp, qNorm.getResult());
++  rewriter.replaceOp(k->decodeReshapeOp, kNorm.getResult());
++  rewriter.replaceOp(v->decodeReshapeOp, decodeOp.getValue());
++
++  eraseUnusedDecodeQKVHead(rewriter, *q);
++  eraseUnusedDecodeQKVHead(rewriter, *k);
++  eraseUnusedDecodeQKVHead(rewriter, *v);
++
++  return mlir::success();
++}
+
+ mlir::LogicalResult NLPCreateQKVHeadsDecodeFusing::matchAndRewrite(
+     SplitQueryKeyValueAndSplitHeadsOp splitOp,
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -378,6 +378,8 @@ public:
+       patterns.add<fusing::RoPEDecodeFusing>(&getContext());
+       patterns.add<fusing::SDPAFusing>(&getContext(), validationConfig);
+       patterns.add<NLPConcatHeadsDecodeFusing>(&getContext());
++      patterns.add<fusing::NLPDecodeQKVProjectionFusing>(&getContext(),
++                                                         validationConfig);
+       patterns.add<fusing::SplitQueryKeyValueAndSplitHeadsFusing<MatmulOp>>(
+           &getContext(), validationConfig);
+       patterns.add<fusing::SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>>(

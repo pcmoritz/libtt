@@ -1,0 +1,33 @@
+--- ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
+@@ -146,13 +146,19 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
+         }
+     }
++    const bool single_core_height_sharded =
++        a.is_sharded() &&
++        a.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
++        a.shard_spec().has_value() && a.shard_spec().value().grid.num_cores() == 1;
+     if (a.is_sharded()) {
+-        // TODO: Add support for this (should be similar to interleaved)
++        // Multi-core height sharding is not supported. The single-core case is
++        // layout-compatible with the sharded kernel and avoids decode reshards.
+         TT_FATAL(
+-            a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
++            single_core_height_sharded || a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
+             "Height sharded inputs are not supported.");
+         TT_FATAL(
+             operation_attributes.output_mem_config.is_sharded() &&
+-                operation_attributes.output_mem_config.memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
++                (single_core_height_sharded ||
++                 operation_attributes.output_mem_config.memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED),
+             "Sharded inputs require sharded outputs.");
+         if (b.has_value()) {
+             TT_FATAL(b.value().is_sharded(), "residual tensor b should be sharded if input a is sharded");
+@@ -305,6 +310,6 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
+                         Mt);
+                     TT_FATAL(
+-                        a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
++                        single_core_height_sharded || a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
+                         "Height sharded memory layout is not supported, got: {}",
+                         a.memory_config().memory_layout());
+                 } else {
