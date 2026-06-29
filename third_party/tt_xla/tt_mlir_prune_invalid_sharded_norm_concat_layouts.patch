@@ -1,16 +1,14 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 --- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 +++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
-@@ -38,6 +38,16 @@ struct RmsNormRuleBook : OpRuleBook {
+@@ -38,6 +38,14 @@ struct RmsNormRuleBook : OpRuleBook {
    /// are rejected because the sharded layernorm kernel doesn't support them.
    LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
  
-+  /// Prefer the one-core height-sharded Qwen decode Q/K layout.
 +  OutputHints
 +  getOutputHints(Operation *op,
 +                 const std::vector<OpConfig> &legalConfigs) const override;
 +
-+  /// Keep sharded RMSNorm inputs and outputs compatible.
 +  bool isValidOutputHintForInputs(
 +      const OpConfig &hint,
 +      llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
@@ -21,7 +19,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h b
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
-@@ -3,6 +3,12 @@
+@@ -3,6 +3,10 @@
  // SPDX-License-Identifier: Apache-2.0
  
  #include "ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h"
@@ -31,8 +29,6 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
  #include "ttmlir/Utils.h"
  
 +#include "llvm/ADT/STLExtras.h"
-+
-+#include <algorithm>
 +
 @@ -30,6 +36,43 @@ int64_t inputOperandTileHeight(Operation *op, unsigned operandIdx) {
    return nc * ht;
@@ -78,7 +74,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
  } // namespace
  
  //===----------------------------------------------------------------------===//
-@@ -76,6 +119,61 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -76,6 +117,58 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    };
  }
  
@@ -101,12 +97,9 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +    result.hints.insert(result.hints.begin(), OpConfig(layout));
 +  }
 +
-+  result.fallbackHints.erase(
-+      std::remove_if(result.fallbackHints.begin(), result.fallbackHints.end(),
-+                     [&](const OpConfig &config) {
-+                       return config.outputLayout == layout;
-+                     }),
-+      result.fallbackHints.end());
++  llvm::erase_if(result.fallbackHints, [&](const OpConfig &config) {
++    return config.outputLayout == layout;
++  });
 +
 +  return result;
 +}
@@ -143,12 +136,11 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp
-@@ -14,10 +14,13 @@ namespace mlir::tt::ttnn {
+@@ -14,10 +14,12 @@ namespace mlir::tt::ttnn {
  
  LayoutFilterFn
  ConcatRuleBook::getInputLayoutFilter(unsigned /*operandIdx*/) const {
 -  // Concat sharded inputs: re-enabled after tt-metal hang fix landed.
-+  // Block-sharded concat remains unsupported by tt-metal.
    // https://github.com/tenstorrent/tt-metal/issues/39419
    // Fix: https://github.com/tenstorrent/tt-metal/pull/39882
 -  return nullptr;

@@ -18,7 +18,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h b/includ
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp
-@@ -28,6 +28,37 @@ static bool isL1Interleaved(const OpConfig &config) {
+@@ -28,6 +28,32 @@ static bool isL1Interleaved(const OpConfig &config) {
           memLayout.getValue() == TensorMemoryLayout::Interleaved;
  }
  
@@ -29,12 +29,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTN
 +
 +static bool hasAnyShardedLayout(
 +    llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) {
-+  for (TTNNLayoutAttr layout : inputLayouts) {
-+    if (isShardedLayout(layout)) {
-+      return true;
-+    }
-+  }
-+  return false;
++  return llvm::any_of(inputLayouts, isShardedLayout);
 +}
 +
 +static bool isSupportedShardedOutputLayout(TTNNLayoutAttr layout) {
