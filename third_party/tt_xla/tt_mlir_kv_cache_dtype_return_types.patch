@@ -1,6 +1,6 @@
 --- a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
-@@ -72,6 +72,24 @@
+@@ -72,6 +72,20 @@
                                           ttcore::g_kvCacheAttrName);
    }
  
@@ -10,11 +10,7 @@
 +    }
 +
 +    Operation *defOp = value.getDefiningOp();
-+    if (!defOp) {
-+      return false;
-+    }
-+
-+    return llvm::TypeSwitch<Operation *, bool>(defOp)
++    return defOp && llvm::TypeSwitch<Operation *, bool>(defOp)
 +        .Case<FillCacheOp, UpdateCacheOp, PagedFillCacheOp,
 +              PagedUpdateCacheOp>([&](auto cacheOp) {
 +          return canPropagateDtype(funcOp, cacheOp.getCache());
