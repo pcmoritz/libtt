@@ -1,23 +1,22 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -2657,6 +2657,16 @@ public:
+@@ -2657,6 +2657,15 @@ public:
            });
      };
  
 +    auto dropSubtractZero = [&](mlir::Value value) {
 +      value = lookThroughSafeOps(value);
 +      auto subtract = value.getDefiningOp<SubtractOp>();
-+      if (!subtract ||
-+          !isFullOpWithValue(lookThroughSafeOps(subtract.getRhs()), 0.0f)) {
-+        return value;
-+      }
-+      return lookThroughSafeOps(subtract.getLhs());
++      return subtract && isFullOpWithValue(lookThroughSafeOps(subtract.getRhs()),
++                                           0.0f)
++                 ? lookThroughSafeOps(subtract.getLhs())
++                 : value;
 +    };
 +
      MultiplyOp innerMul =
          ttmlir::utils::findOpThrough<MultiplyOp, TypecastOp>(outerMul.getLhs());
      mlir::Value gammaRaw = outerMul.getRhs();
-@@ -2687,32 +2697,62 @@ public:
+@@ -2687,32 +2696,62 @@ public:
        return mlir::failure();
      }
  
