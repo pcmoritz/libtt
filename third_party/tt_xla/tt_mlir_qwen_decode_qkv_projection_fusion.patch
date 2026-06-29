@@ -107,7 +107,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // SplitQueryKeyValueAndSplitHeadsFusing helpers
  // ============================================================================
 
-@@ -572,6 +577,167 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +577,161 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -118,16 +118,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  ReshapeOp decodeReshapeOp;
 +};
 +
-+int64_t decodeNumHeads(DecodeQKVHead &head) {
++ArrayRef<int64_t> decodeShape(DecodeQKVHead &head) {
 +  return mlir::cast<RankedTensorType>(
 +             head.decodeReshapeOp.getResult().getType())
-+      .getShape()[2];
-+}
-+
-+int64_t decodeHeadDim(DecodeQKVHead &head) {
-+  return mlir::cast<RankedTensorType>(
-+             head.decodeReshapeOp.getResult().getType())
-+      .getShape()[3];
++      .getShape();
 +}
 +
 +std::optional<DecodeQKVHead> matchDecodeQKVHead(SliceStaticOp sliceOp) {
@@ -243,9 +237,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  if (!q.rmsNormOp || !k.rmsNormOp || v.rmsNormOp) {
 +    return std::nullopt;
 +  }
-+  if (decodeHeadDim(q) != decodeHeadDim(k) ||
-+      decodeHeadDim(q) != decodeHeadDim(v) ||
-+      decodeNumHeads(k) != decodeNumHeads(v)) {
++  if (decodeShape(q)[3] != decodeShape(k)[3] ||
++      decodeShape(q)[3] != decodeShape(v)[3] ||
++      decodeShape(k)[2] != decodeShape(v)[2]) {
 +    return std::nullopt;
 +  }
 +
@@ -275,15 +269,14 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +987,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +981,74 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
 +
 +mlir::LogicalResult NLPDecodeQKVProjectionFusing::matchAndRewrite(
 +    MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const {
-+  std::optional<SmallVector<DecodeQKVHead>> heads =
-+      matchDecodeQKVHeads(matmulOp);
++  auto heads = matchDecodeQKVHeads(matmulOp);
 +  if (!heads) {
 +    return mlir::failure();
 +  }
@@ -310,9 +303,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +      getI32ArrayAttr(rewriter, inputShape));
 +
 +  auto numHeadsAttr =
-+      rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeNumHeads(q)));
++      rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(q)[2]));
 +  auto numKVHeadsAttr =
-+      rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeNumHeads(k)));
++      rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(k)[2]));
 +  SmallVector<Type> resultTypes{q.decodeReshapeOp.getType(),
 +                                k.decodeReshapeOp.getType(),
 +                                v.decodeReshapeOp.getType()};
