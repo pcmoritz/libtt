@@ -1,8 +1,6 @@
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-@@ -678,6 +678,13 @@ private:
- 
-     if (auto typeAttr = owningFunc.getArgAttrOfType<ttcore::ArgumentTypeAttr>(
+@@ -680,2 +680,9 @@ private:
              arg.getArgNumber(), ttcore::ArgumentTypeAttr::name)) {
 +      auto tensorType = mlir::dyn_cast<RankedTensorType>(arg.getType());
 +      auto nameLoc = mlir::dyn_cast<mlir::NameLoc>(arg.getLoc());
@@ -12,5 +10,3 @@
 +        return false;
 +      }
        return typeAttr.getValue() == ttcore::ArgumentType::Input;
-     }
-     return false;

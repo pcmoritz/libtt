@@ -1,21 +1,15 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 --- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 +++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
-@@ -38,6 +38,8 @@ struct RmsNormRuleBook : OpRuleBook {
-   /// are rejected because the sharded layernorm kernel doesn't support them.
-   LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
+@@ -40,2 +40,4 @@ struct RmsNormRuleBook : OpRuleBook {
 
 +  OutputHints getOutputHints(Operation *op, const std::vector<OpConfig> &legalConfigs) const override;
 +  bool isValidOutputHintForInputs(const OpConfig &hint, llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
    /// adjustScore reflects kernel-dispatch reality: the generic scorer derives
-   /// `coreCount` from the output layout, but for rms_norm with interleaved
-   /// input the kernel runs single- or few-core (parallelism = NC*Ht of input)
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
-@@ -63,10 +63,9 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
-       return true;
-     }
+@@ -65,8 +65,7 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
 
 -    // Height-sharded is explicitly rejected by the sharded layernorm kernel
 -    // (layernorm_device_operation.cpp:151).
@@ -26,9 +20,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
      }
 
      // Block- and width-sharded are accepted, provided the grid is a full
-@@ -76,6 +90,24 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
-   };
- }
+@@ -78,2 +92,20 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
 
 +OutputHints RmsNormRuleBook::getOutputHints(Operation *op, const std::vector<OpConfig> &legalConfigs) const {
 +  OutputHints result = OpRuleBook::getOutputHints(op, legalConfigs); if (op->getNumResults() == 0) return result;
@@ -49,8 +41,6 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +  return outputMem.getValue() != TensorMemoryLayout::HeightSharded;
 +}
  LayoutScore RmsNormRuleBook::adjustScore(
-     Operation *op, LayoutScore base, const OpConfig &config,
-     llvm::ArrayRef<TTNNLayoutAttr> inputLayouts, bool requiresReshard) const {
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp
@@ -66,11 +56,9 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/DataMovementRules.cpp b/lib/Diale
  }
 
  bool ConcatRuleBook::shouldExploreReshards() const { return true; }
-@@ -31,6 +35,7 @@ bool ConcatRuleBook::isValidInputCombination(
+@@ -31,4 +35,5 @@ bool ConcatRuleBook::isValidInputCombination(
 
    // Concat requires all inputs to have the same memory layout type.
    auto firstMem = inputLayouts[0].getMemLayout();
 +  if (firstMem && (firstMem.getValue() == TensorMemoryLayout::BlockSharded || (inputLayouts.size() == 2 && firstMem.getValue() == TensorMemoryLayout::WidthSharded))) return false;
    for (size_t i = 1; i < inputLayouts.size(); ++i) {
-     if (inputLayouts[i].getMemLayout() != firstMem) {
-       return false;

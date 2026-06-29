@@ -8,9 +8,7 @@
 -  if (!sawCCL) {
 -    return false;
 -  }
-@@ -210,9 +205,11 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
-   if (!gate || !gate.getResult().hasOneUse()) {
-     return false;
+@@ -212,5 +207,7 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
    }
 -  auto ff2 = mlir::dyn_cast<MatmulOp>(*gate.getResult().getUsers().begin());
 -  if (!ff2 || !matmulReachesResidualAdd(ff2)) {
@@ -21,5 +19,3 @@
 +  } else if (auto ff2Linear = mlir::dyn_cast<LinearOp>(ff2); !ff2Linear || !ff2Linear.getBias() || !isLowerableFloat(getValueDtype(ff2Linear.getBias())) || !isLowerableFloat(getValueDtype(ff2Linear.getResult()))) {
 +    return false;
    }
- 
-   downcastChain(matmul, flowOps);

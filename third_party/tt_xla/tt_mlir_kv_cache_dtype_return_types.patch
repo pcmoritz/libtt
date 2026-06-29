@@ -1,8 +1,6 @@
 --- a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
-@@ -72,6 +72,15 @@
-                                          ttcore::g_kvCacheAttrName);
-   }
+@@ -74,2 +74,11 @@
  
 +  static bool isKVCacheReturnOperand(func::FuncOp funcOp, Value value) {
 +    if (canPropagateDtype(funcOp, value)) return true;
@@ -14,11 +12,7 @@
 +        .Default(false);
 +  }
    static ttcore::LocalShapeAttr
-   convertLocalShapeAttr(MLIRContext *ctx, ttcore::LocalShapeAttr attr,
-                         ttcore::DataType targetDtype) {
-@@ -119,19 +132,13 @@
-     Operation *terminator = block.getTerminator();
-     if (auto returnOp = mlir::dyn_cast<func::ReturnOp>(terminator)) {
+@@ -121,15 +134,9 @@
        for (auto [i, operand] : llvm::enumerate(returnOp.getOperands())) {
 -        newResultTypes[i] = operand.getType();
 -
@@ -38,5 +32,3 @@
 +        auto oldType = mlir::cast<RankedTensorType>(operand.getType());
 +        newResultTypes[i] = ttnn::utils::RankedTensorTypeFactory::create(oldType, targetDtype);
          if (auto localShapeAttr =
-                 funcOp.getResultAttrOfType<ttcore::LocalShapeAttr>(
-                     i, ttcore::LocalShapeAttr::name)) {

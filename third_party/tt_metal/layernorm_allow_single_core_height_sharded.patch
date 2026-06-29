@@ -1,7 +1,6 @@
 --- ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
-@@ -146,13 +146,17 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
-         }
+@@ -147,10 +147,14 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
      }
 +    const bool single_core_height_sharded =
 +        a.is_sharded() &&
@@ -19,13 +18,8 @@
 +                (single_core_height_sharded ||
 +                 operation_attributes.output_mem_config.memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED),
              "Sharded inputs require sharded outputs.");
-         if (b.has_value()) {
-             TT_FATAL(b.value().is_sharded(), "residual tensor b should be sharded if input a is sharded");
-@@ -305,6 +309,6 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
-                         Mt);
+@@ -306,3 +310,3 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
                      TT_FATAL(
 -                        a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
 +                        single_core_height_sharded || a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
                          "Height sharded memory layout is not supported, got: {}",
-                         a.memory_config().memory_layout());
-                 } else {

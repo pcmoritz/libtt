@@ -1,8 +1,6 @@
 --- a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
 +++ b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
-@@ -391,6 +391,16 @@
-   return concatOp.getOperand(0);
- }
+@@ -393,2 +393,12 @@
 
 +Value reshapeTo(PatternRewriter &rewriter, Location loc, Value value, RankedTensorType type) { if (mlir::cast<RankedTensorType>(value.getType()) == type) return value; return rewriter.create<ReshapeOp>(loc, type, value, rewriter.getI32ArrayAttr(SmallVector<int32_t>(type.getShape().begin(), type.getShape().end()))); }
 +ReshapeOp getRank4DecodeReshapeUser(ConcatOp concatOp) {
@@ -15,27 +13,20 @@
 +}
 +RankedTensorType getCacheTypeFor(RankedTensorType cacheType, RankedTensorType inputType) { SmallVector<int64_t> shape(inputType.getRank(), 1); shape.back() = cacheType.getShape().back(); return RankedTensorType::get(shape, cacheType.getElementType()); }
  // Replace the anchor op with a ttcore.composite "rotary_embedding" that
- // references a decomposition function.
- // Detects self-concat cos/sin at the IR level (same as TTNN decomposition's
-@@ -455,7 +474,8 @@ void replaceWithRoPEComposite(Operation *anchorOp,
- void replaceWithRoPEComposite(Operation *anchorOp,
-                               mlir::PatternRewriter &rewriter, Value xSource,
+@@ -457,3 +476,4 @@ void replaceWithRoPEComposite(Operation *anchorOp,
                                Value cosInput, Value sinInput,
 -                              RankedTensorType resultType) {
 +                              RankedTensorType resultType,
 +                              DictionaryAttr compositeAttributes = nullptr) {
    auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
-   auto cosType = mlir::cast<RankedTensorType>(cosInput.getType());
-   auto sinType = mlir::cast<RankedTensorType>(sinInput.getType());
-@@ -484,6 +504,6 @@ void replaceWithRoPEComposite(Operation *anchorOp,
-       rewriter.getStringAttr("rotary_embedding"),
+@@ -485,5 +505,5 @@ void replaceWithRoPEComposite(Operation *anchorOp,
        FlatSymbolRefAttr::get(rewriter.getContext(), decompFunc.getName()),
 -      /*composite_attributes=*/nullptr);
 +      compositeAttributes);
  }
 
  } // namespace
-@@ -537,10 +556,9 @@
+@@ -537,8 +556,7 @@
 
    // Must concat on last dimension with exactly 2 operands.
    auto resultType = mlir::cast<RankedTensorType>(srcOp.getType());
@@ -47,8 +38,6 @@
 -  if (srcOp.getDim() != resultType.getRank() - 1) {
 +  if (srcOp.getDim() != static_cast<int32_t>(resultType.getRank() - 1)) {
      return failure();
-   }
-   if (srcOp.getNumOperands() != 2) {
 @@ -608,8 +626,7 @@
    }
 
@@ -60,10 +49,7 @@
 -    return failure();
 -  }
 
-@@ -645,14 +662,15 @@
-   // cos/sin are half-dim. Create concat(half, half) as the composite's
-   // cos/sin inputs so that ttnn::RotaryEmbeddingOp promotion can match
-   // the expected full-dim shapes. The decomposition body will detect the
+@@ -648,11 +665,12 @@
    // self-concat and use the half-dim operand directly.
 -  Value cosHalf = get4DEmbeddingInput(subEmb0);
 -  Value sinHalf = get4DEmbeddingInput(subEmb1);
@@ -78,9 +64,7 @@
 
    SmallVector<int64_t> cosFullShape(cosHalfType.getShape());
    cosFullShape[lastDim] *= 2;
-@@ -671,8 +691,13 @@
-       srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
-       rewriter.getSI32IntegerAttr(lastDim));
+@@ -673,6 +693,11 @@
 
 -  replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
 -                           resultType);
@@ -97,18 +81,12 @@
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
-@@ -131,6 +131,8 @@ static void registerBuiltinComposites() {
-       [](ttcore::CompositeOp compositeOp,
-          OpBuilder &builder) -> OpValidationResult {
+@@ -133,2 +133,4 @@ static void registerBuiltinComposites() {
          TT_assert(compositeOp.getInputs().size() == 3u);
 +        IntegerAttr tokenIndexAttr;
 +        if (auto attrs = compositeOp.getCompositeAttributes()) tokenIndexAttr = attrs->getAs<IntegerAttr>("token_index");
 
-         SmallVector<Type> resultTypes(compositeOp.getResultTypes());
-         IsolatedIRValidationWrapper validator(compositeOp.getContext());
-@@ -138,16 +140,18 @@ static void registerBuiltinComposites() {
-             compositeOp.getOperation(), compositeOp.getLoc(), resultTypes,
-             compositeOp.getInputs()[0], compositeOp.getInputs()[1],
+@@ -140,14 +142,16 @@ static void registerBuiltinComposites() {
              compositeOp.getInputs()[2],
 -            /*token_index=*/mlir::IntegerAttr(),
 +            tokenIndexAttr,
@@ -130,11 +108,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
-@@ -21,6 +21,7 @@ getWorkaroundedOp(RotaryEmbeddingOp ropeOp, PatternRewriter &rewriter) {
-     return std::nullopt;
-   }
+@@ -23,2 +23,3 @@ getWorkaroundedOp(RotaryEmbeddingOp ropeOp, PatternRewriter &rewriter) {
 
 +  if (ropeOp.getTokenIndexAttr()) return std::nullopt;
    int64_t originalSeqLen = resultShape[resultShape.size() - 2];
-   if (originalSeqLen % TILE_HEIGHT == 0) {
-     return std::nullopt;

@@ -1,10 +1,6 @@
 --- a/pjrt_implementation/src/api/module_builder/module_builder.cc
 +++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
-@@ -932,6 +932,7 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
-   // Map user-facing dtype names to BFPDtype enum values.
-   if (compile_options.experimental_weight_dtype == "bfp_bf8") {
+@@ -934,2 +934,3 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
      options.experimentalWeightDtype = mlir::tt::ttnn::BFPDtype::BFP_BFloat8;
 +    options.enableActivationDtypeLowering = true;
    } else if (compile_options.experimental_weight_dtype == "bfp_bf4") {
-     options.experimentalWeightDtype = mlir::tt::ttnn::BFPDtype::BFP_BFloat4;
-   } else if (!compile_options.experimental_weight_dtype.empty()) {

@@ -1,29 +1,19 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 --- a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 +++ b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
-@@ -44,6 +44,7 @@ private:
-   OpValidationConfig validationConfig;
- };
+@@ -46,2 +46,3 @@ private:
 
 +class NLPDecodeQKVProjectionFusing : public mlir::OpRewritePattern<MatmulOp> { public: NLPDecodeQKVProjectionFusing(mlir::MLIRContext *context, const OpValidationConfig &validationConfig = {}) : OpRewritePattern<MatmulOp>(context), validationConfig(validationConfig) {} mlir::LogicalResult matchAndRewrite(MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const override; private: OpValidationConfig validationConfig; };
  // Fuses a SplitQueryKeyValueAndSplitHeadsOp followed by permute [2,0,1,3]
- // on all three outputs into a single NLPCreateQKVHeadsDecodeOp, which is
- // optimized for the decode case (S=1).
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -1809,6 +1811,8 @@ private:
-     return rewriter.create<ConcatOp>(loc, concatType, biases,
-                                      rewriter.getSI32IntegerAttr(concatDim));
+@@ -1811,2 +1813,4 @@ private:
    }
 +  static int getQKVProjectionOrder(Operation *op) { std::string loc; llvm::raw_string_ostream(loc) << op->getLoc(); return loc.find("/q_proj/") != std::string::npos ? 0 : loc.find("/k_proj/") != std::string::npos ? 1 : loc.find("/v_proj/") != std::string::npos ? 2 : -1; }
 +  static void sortQKVProjectionCandidates(FusionCandidates &candidates) { if (candidates.ops.size() != 3) return; SmallVector<int, 3> order; for (OpType op : candidates.ops) order.push_back(getQKVProjectionOrder(op.getOperation())); if (!llvm::is_contained(order, 0) || !llvm::is_contained(order, 1) || !llvm::is_contained(order, 2)) return; llvm::sort(candidates.ops, [](OpType lhs, OpType rhs) { return getQKVProjectionOrder(lhs.getOperation()) < getQKVProjectionOrder(rhs.getOperation()); }); candidates.firstTransposeB = candidates.ops.front().getTransposeB(); }
 
-   // Collect all ops that share the same LHS operand and are compatible
-   // for fusion.
-@@ -1872,6 +1881,7 @@ private:
-       }
-     }
+@@ -1874,4 +1883,5 @@ private:
 
 +    sortQKVProjectionCandidates(result);
      return result;
@@ -32,9 +22,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -572,6 +572,32 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
-   return true;
- }
+@@ -574,2 +574,28 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
 
 +struct DecodeQKVHead { SliceStaticOp sliceOp; ReshapeOp headReshapeOp; RMSNormOp rmsNormOp; ReshapeOp decodeReshapeOp; };
 +ArrayRef<int64_t> decodeShape(DecodeQKVHead &head) { return head.decodeReshapeOp.getType().getShape(); }
@@ -63,11 +51,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +RMSNormOp createRank4RMSNorm(PatternRewriter &rewriter, RMSNormOp oldOp, Value input) { return rewriter.create<RMSNormOp>(oldOp.getLoc(), input.getType(), input, oldOp.getWeight(), oldOp.getBias(), oldOp.getEpsilonAttr(), oldOp.getComputeConfigAttr()); }
 +void eraseUnusedDecodeQKVHead(PatternRewriter &rewriter, DecodeQKVHead &head) { for (Operation *op : {head.rmsNormOp.getOperation(), head.headReshapeOp.getOperation(), head.sliceOp.getOperation()}) if (op && op->use_empty()) rewriter.eraseOp(op); }
  // ============================================================================
- // Step 7: Create fused op
- // ============================================================================
-@@ -821,6 +859,22 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
- // ============================================================================
- // NLPCreateQKVHeadsDecodeFusing
+@@ -823,2 +861,18 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
 +mlir::LogicalResult NLPDecodeQKVProjectionFusing::matchAndRewrite(MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const {
 +  auto heads = matchDecodeQKVHeads(matmulOp); if (!heads) return mlir::failure();
@@ -86,16 +70,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  return mlir::success();
 +}
 
- mlir::LogicalResult NLPCreateQKVHeadsDecodeFusing::matchAndRewrite(
-     SplitQueryKeyValueAndSplitHeadsOp splitOp,
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -378,6 +378,7 @@ public:
-       patterns.add<fusing::RoPEDecodeFusing>(&getContext());
-       patterns.add<fusing::SDPAFusing>(&getContext(), validationConfig);
+@@ -380,2 +380,3 @@ public:
        patterns.add<NLPConcatHeadsDecodeFusing>(&getContext());
 +      patterns.add<fusing::NLPDecodeQKVProjectionFusing>(&getContext(), validationConfig);
        patterns.add<fusing::SplitQueryKeyValueAndSplitHeadsFusing<MatmulOp>>(
-           &getContext(), validationConfig);
-       patterns.add<fusing::SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>>(

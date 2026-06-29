@@ -1,8 +1,6 @@
 --- a/pjrt_implementation/src/api/compile_options.cc
 +++ b/pjrt_implementation/src/api/compile_options.cc
-@@ -89,6 +90,14 @@ CompileOptions parseCompileOptions(
-       internal::parseStringOption(compile_options, "export_model_name")
-           .value_or("");
+@@ -91,2 +92,10 @@ CompileOptions parseCompileOptions(
  
 +  if (const char *metrics_file = std::getenv("TT_XLA_TTNN_PERF_METRICS_OUTPUT_FILE");
 +      metrics_file && metrics_file[0] != '\0') {
@@ -13,5 +11,3 @@
 +    options.export_path = export_path;
 +  }
    if (!options.export_path.has_value() &&
-       options.backend != BackendRuntime::TTNNFlatbuffer) {
-     ABORT_F("Compile option 'export_path' must be provided when backend is not "

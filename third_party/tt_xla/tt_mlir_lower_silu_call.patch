@@ -1,8 +1,6 @@
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
-@@ -34,6 +35,18 @@ namespace mlir::tt::ttir {
- 
- namespace {
+@@ -36,2 +37,14 @@ namespace mlir::tt::ttir {
  
 +class SiluCallConversionPattern : public OpRewritePattern<mlir::func::CallOp> {
 +  using OpRewritePattern<mlir::func::CallOp>::OpRewritePattern;
@@ -17,13 +15,7 @@
 +  }
 +};
  template <typename TargetOp>
- class StableHLOToTTIRCompositeOpConversionPattern
-     : public OpConversionPattern<mlir::stablehlo::CompositeOp> {
-@@ -1081,6 +1098,7 @@ createLegalizeStableHLOCompositeToTTIRPass() {
- 
- void populateStableHLOCompositeLegalizationPatterns(
+@@ -1083,2 +1100,3 @@ createLegalizeStableHLOCompositeToTTIRPass() {
      MLIRContext *context, RewritePatternSet &patterns) {
 +  patterns.add<SiluCallConversionPattern>(context);
-   patterns.add<StableHLOToTTIRCompositeOpConversionPattern<ttir::GeluOp>>(
-       context, "tenstorrent.gelu");
    patterns.add<StableHLOToTTIRCompositeOpConversionPattern<ttir::GeluOp>>(
