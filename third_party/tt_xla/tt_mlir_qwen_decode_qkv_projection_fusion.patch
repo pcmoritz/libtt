@@ -37,7 +37,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  #include <type_traits>
 
  namespace mlir::tt::ttir {
-@@ -1809,6 +1811,41 @@ private:
+@@ -1809,6 +1811,38 @@ private:
      return rewriter.create<ConcatOp>(loc, concatType, biases,
                                       rewriter.getSI32IntegerAttr(concatDim));
    }
@@ -46,13 +46,10 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    std::string loc;
 +    llvm::raw_string_ostream(loc) << op->getLoc();
 +
-+    const char *patterns[] = {"/q_proj/", "/k_proj/", "/v_proj/"};
-+    for (auto [index, pattern] : llvm::enumerate(patterns)) {
-+      if (loc.find(pattern) != std::string::npos) {
-+        return index;
-+      }
-+    }
-+    return -1;
++    return loc.find("/q_proj/") != std::string::npos   ? 0
++           : loc.find("/k_proj/") != std::string::npos ? 1
++           : loc.find("/v_proj/") != std::string::npos ? 2
++                                                        : -1;
 +  }
 +
 +  static void sortQKVProjectionCandidates(FusionCandidates &candidates) {
@@ -78,7 +75,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 
    // Collect all ops that share the same LHS operand and are compatible
    // for fusion.
-@@ -1872,6 +1909,8 @@ private:
+@@ -1872,6 +1906,8 @@ private:
        }
      }
 
