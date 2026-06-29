@@ -1,12 +1,5 @@
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
-@@ -9,6 +9,7 @@
- #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
- #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
- 
- #include "mlir/IR/Attributes.h"
- #include "mlir/IR/BuiltinAttributes.h"
- #include "mlir/IR/BuiltinOps.h"
 @@ -34,6 +35,18 @@ namespace mlir::tt::ttir {
  
  namespace {

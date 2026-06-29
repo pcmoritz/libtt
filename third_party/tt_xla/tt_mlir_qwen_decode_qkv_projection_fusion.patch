@@ -12,15 +12,6 @@ diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPattern
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -19,8 +19,10 @@
- #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
- #include "llvm/ADT/SmallSet.h"
- #include "llvm/ADT/TypeSwitch.h"
- #include <cstdint>
-
- #include <type_traits>
-
- namespace mlir::tt::ttir {
 @@ -1809,6 +1811,8 @@ private:
      return rewriter.create<ConcatOp>(loc, concatType, biases,
                                       rewriter.getSI32IntegerAttr(concatDim));

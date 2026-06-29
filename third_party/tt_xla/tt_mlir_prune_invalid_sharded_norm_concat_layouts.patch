@@ -13,13 +13,6 @@ diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h b
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
-@@ -3,6 +3,9 @@
- // SPDX-License-Identifier: Apache-2.0
-
- #include "ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h"
- #include "ttmlir/Dialect/TTNN/Analysis/OpRules/LayoutFilterUtils.h"
- #include "ttmlir/Utils.h"
-
 @@ -63,10 +63,9 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
        return true;
      }
