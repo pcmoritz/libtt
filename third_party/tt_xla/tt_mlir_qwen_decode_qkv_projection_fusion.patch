@@ -95,7 +95,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -572,6 +572,161 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +572,155 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -180,7 +180,6 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  }
 +
 +  SmallVector<std::pair<int64_t, int64_t>> bounds;
-+  std::optional<size_t> sliceDim;
 +  for (auto &head : heads) {
 +    auto dimAndBounds =
 +        findSlicedDimensionWithBounds(head.sliceOp, matmulShape);
@@ -188,15 +187,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +      return std::nullopt;
 +    }
 +    auto [dim, start, end] = *dimAndBounds;
-+    if (!sliceDim) {
-+      sliceDim = dim;
-+    } else if (*sliceDim != dim) {
++    if (dim != matmulShape.size() - 1) {
 +      return std::nullopt;
 +    }
 +    bounds.push_back({start, end});
-+  }
-+  if (!sliceDim || *sliceDim != matmulShape.size() - 1) {
-+    return std::nullopt;
 +  }
 +
 +  SmallVector<size_t> indices(heads.size());
@@ -257,7 +251,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +976,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +970,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================

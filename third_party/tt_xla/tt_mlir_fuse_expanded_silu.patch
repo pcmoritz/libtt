@@ -1,6 +1,6 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -532,50 +532,115 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+@@ -532,50 +532,112 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
@@ -13,14 +13,11 @@
 +    }
 +
 +    auto constantOp = value.getDefiningOp<ConstantOp>();
-+    if (!constantOp) {
-+      return false;
-+    }
-+    auto denseAttr = mlir::dyn_cast<DenseElementsAttr>(constantOp.getValue());
-+    if (!denseAttr || !denseAttr.isSplat()) {
-+      return false;
-+    }
-+    return std::abs(denseAttr.getSplatValue<APFloat>().convertToFloat() -
++    auto denseAttr = constantOp ? mlir::dyn_cast<DenseElementsAttr>(
++                                      constantOp.getValue())
++                                : DenseElementsAttr();
++    return denseAttr && denseAttr.isSplat() &&
++           std::abs(denseAttr.getSplatValue<APFloat>().convertToFloat() -
 +                    1.0f) < 1e-6f;
 +  }
 +
