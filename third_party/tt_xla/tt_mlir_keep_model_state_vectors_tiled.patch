@@ -1,6 +1,6 @@
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-@@ -678,6 +678,14 @@ private:
+@@ -678,6 +678,13 @@ private:
  
      if (auto typeAttr = owningFunc.getArgAttrOfType<ttcore::ArgumentTypeAttr>(
              arg.getArgNumber(), ttcore::ArgumentTypeAttr::name)) {
@@ -8,8 +8,7 @@
 +      auto nameLoc = mlir::dyn_cast<mlir::NameLoc>(arg.getLoc());
 +      if (tensorType && tensorType.getRank() == 1 && nameLoc &&
 +          nameLoc.getName().getValue().starts_with("model_state_leaves[") &&
-+          mlir::isa<mlir::BFloat16Type, mlir::Float32Type>(
-+              tensorType.getElementType())) {
++          mlir::isa<mlir::BFloat16Type, mlir::Float32Type>(tensorType.getElementType())) {
 +        return false;
 +      }
        return typeAttr.getValue() == ttcore::ArgumentType::Input;
