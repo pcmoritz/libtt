@@ -1,47 +1,13 @@
-diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
---- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
-+++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
-@@ -20,14 +20,16 @@ namespace mlir::tt::ttnn {
- //                      : LayerNormMultiCoreProgramFactory
- //
- // The sharded kernel's validator enforces
--// (layernorm_device_operation.cpp:148-173):
--//   - input cannot be HEIGHT_SHARDED
-+// (layernorm_device_operation.cpp:148-173):
-+//   - input cannot be multi-core HEIGHT_SHARDED
- //   - shard grid must be a full rectangular bounding box
- //     (shard_spec.grid.num_cores() == bbox_num_cores)
--//   - output must also be sharded (not height sharded)
-+//   - output must also be sharded
- //
- // Without an input filter, partial-grid sharded candidates reach op-model
- // validation and fail with TT_FATAL. The filter prunes them early.
-+// Qwen decode uses a one-core height-sharded head tensor, which tt-metal
-+// handles through a local patch to avoid extra layout conversions.
- //===----------------------------------------------------------------------===//
- 
- struct RmsNormRuleBook : OpRuleBook {
-@@ -36,6 +38,5 @@ struct RmsNormRuleBook : OpRuleBook {
--  /// RMSNormOp: operand 0 (activation) must be interleaved OR full-bbox
--  /// block/width sharded. Height-sharded inputs and partial-bbox sharded inputs
--  /// are rejected because the sharded layernorm kernel doesn't support them.
-+  /// RMSNormOp: operand 0 (activation) must be interleaved, full-bbox
-+  /// block/width sharded, or single-core height-sharded.
-   LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
- 
-   /// adjustScore reflects kernel-dispatch reality: the generic scorer derives
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
-@@ -63,10 +63,12 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -63,10 +63,10 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
        return true;
      }
  
 -    // Height-sharded is explicitly rejected by the sharded layernorm kernel
 -    // (layernorm_device_operation.cpp:151).
-+    // Multi-core height-sharded RMSNorm remains unsupported. Allow the
-+    // one-core case used by Qwen decode so Q/K can stay in the layout emitted
-+    // by nlp_create_qkv_heads_decode.
++    // Allow the one-core Qwen decode case; multi-core remains unsupported.
      if (value == TensorMemoryLayout::HeightSharded) {
 -      return false;
 +      return layout_filter_utils::isFullBboxSharded(layout) &&

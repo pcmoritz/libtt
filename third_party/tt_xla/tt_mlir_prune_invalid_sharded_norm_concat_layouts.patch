@@ -1,18 +1,16 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 --- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 +++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
-@@ -37,6 +37,18 @@ struct RmsNormRuleBook : OpRuleBook {
-   /// block/width sharded, or single-core height-sharded.
+@@ -38,6 +38,16 @@ struct RmsNormRuleBook : OpRuleBook {
+   /// are rejected because the sharded layernorm kernel doesn't support them.
    LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
  
-+  /// Prefer the one-core height-sharded layout used by Qwen decode Q/K
-+  /// tensors. The generic legal-config pruning keeps high-core shardings first
-+  /// and can drop this low-core-but-no-reshard candidate.
++  /// Prefer the one-core height-sharded Qwen decode Q/K layout.
 +  OutputHints
 +  getOutputHints(Operation *op,
 +                 const std::vector<OpConfig> &legalConfigs) const override;
 +
-+  /// tt-metal requires sharded RMSNorm inputs to produce sharded outputs.
++  /// Keep sharded RMSNorm inputs and outputs compatible.
 +  bool isValidOutputHintForInputs(
 +      const OpConfig &hint,
 +      llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;

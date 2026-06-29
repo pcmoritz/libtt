@@ -2,16 +2,11 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
 index 8a5f0a4e..b066c4c9 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-@@ -678,6 +678,20 @@ private:
+@@ -678,6 +678,15 @@ private:
  
      if (auto typeAttr = owningFunc.getArgAttrOfType<ttcore::ArgumentTypeAttr>(
              arg.getArgNumber(), ttcore::ArgumentTypeAttr::name)) {
-+      // SGLang-JAX keeps RMSNorm scale tensors as rank-1 model_state leaves.
-+      // They are static model weights, but the frontend currently marks them
-+      // as inputs because the BF8 weight annotation skips rank-1 leaves. If
-+      // forced to row-major, each decode step inserts a row-major -> tiled
-+      // conversion before ttnn.rms_norm. Keep these static vectors in the
-+      // default tiled layout while leaving regular runtime inputs row-major.
++      // Keep static rank-1 RMSNorm weights tiled to avoid decode reshards.
 +      auto tensorType = mlir::dyn_cast<RankedTensorType>(arg.getType());
 +      auto nameLoc = mlir::dyn_cast<mlir::NameLoc>(arg.getLoc());
 +      if (tensorType && tensorType.getRank() == 1 && nameLoc &&

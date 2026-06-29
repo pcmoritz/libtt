@@ -1,24 +1,12 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 --- a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 +++ b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
-@@ -44,6 +44,35 @@ private:
+@@ -44,6 +44,23 @@ private:
    OpValidationConfig validationConfig;
  };
 
-+// Fuses the decode QKV projection shape used by Qwen-style attention where
-+// q/k RMSNorm sit between projection and attention:
-+//
-+//   matmul -> slice/reshape -> q_rms_norm -> reshape[1,B,H,D]
-+//          -> slice/reshape -> k_rms_norm -> reshape[1,B,Hkv,D]
-+//          -> slice/reshape ----------------> reshape[1,B,Hkv,D]
-+//
-+// Replaced with:
-+//   matmul -> reshape[1,1,B,QKV] -> nlp_create_qkv_heads_decode
-+//          -> q_rms_norm[1,B,H,D]
-+//          -> k_rms_norm[1,B,Hkv,D]
-+//
-+// This keeps normalization on device and removes the per-layer projection
-+// slices from the decode loop.
++// Fuses Qwen decode matmul -> Q/K/V slice+reshape(+q/k RMSNorm) into
++// nlp_create_qkv_heads_decode followed by rank-4 q/k RMSNorm.
 +class NLPDecodeQKVProjectionFusing
 +    : public mlir::OpRewritePattern<MatmulOp> {
 +public:
@@ -51,15 +39,12 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  #include <type_traits>
 
  namespace mlir::tt::ttir {
-@@ -1809,6 +1811,49 @@ private:
+@@ -1809,6 +1811,46 @@ private:
      return rewriter.create<ConcatOp>(loc, concatType, biases,
                                       rewriter.getSI32IntegerAttr(concatDim));
    }
 +
-+  // Shared-LHS fusion iterates SSA users, which is not a semantic ordering.
-+  // For Q/K/V projections this can produce V,K,Q, forcing later passes to
-+  // reason about a lifted constant in a nonstandard order. Preserve the
-+  // projection order encoded in locations when all three are present.
++  // Preserve Q/K/V projection order when shared-LHS fusion sees all three.
 +  static int getQKVProjectionOrder(Operation *op) {
 +    std::string loc;
 +    llvm::raw_string_ostream os(loc);
@@ -101,7 +86,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 
    // Collect all ops that share the same LHS operand and are compatible
    // for fusion.
-@@ -1872,6 +1917,8 @@ private:
+@@ -1872,6 +1914,8 @@ private:
        }
      }
 
