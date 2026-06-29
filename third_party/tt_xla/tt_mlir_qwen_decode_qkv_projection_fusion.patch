@@ -1,12 +1,10 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 --- a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 +++ b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
-@@ -44,6 +44,23 @@ private:
+@@ -44,6 +44,21 @@ private:
    OpValidationConfig validationConfig;
  };
 
-+// Fuses Qwen decode matmul -> Q/K/V slice+reshape(+q/k RMSNorm) into
-+// nlp_create_qkv_heads_decode followed by rank-4 q/k RMSNorm.
 +class NLPDecodeQKVProjectionFusing
 +    : public mlir::OpRewritePattern<MatmulOp> {
 +public:
@@ -39,12 +37,11 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  #include <type_traits>
 
  namespace mlir::tt::ttir {
-@@ -1809,6 +1811,46 @@ private:
+@@ -1809,6 +1811,45 @@ private:
      return rewriter.create<ConcatOp>(loc, concatType, biases,
                                       rewriter.getSI32IntegerAttr(concatDim));
    }
 +
-+  // Preserve Q/K/V projection order when shared-LHS fusion sees all three.
 +  static int getQKVProjectionOrder(Operation *op) {
 +    std::string loc;
 +    llvm::raw_string_ostream os(loc);
@@ -86,7 +83,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 
    // Collect all ops that share the same LHS operand and are compatible
    // for fusion.
-@@ -1872,6 +1914,8 @@ private:
+@@ -1872,6 +1913,8 @@ private:
        }
      }
 
@@ -110,7 +107,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // SplitQueryKeyValueAndSplitHeadsFusing helpers
  // ============================================================================
 
-@@ -572,6 +577,168 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +577,167 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -240,7 +237,6 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    return std::nullopt;
 +  }
 +
-+  // TTIR shared-projection fusion sorts Qwen projections into Q,K,V order.
 +  DecodeQKVHead &q = sorted[0];
 +  DecodeQKVHead &k = sorted[1];
 +  DecodeQKVHead &v = sorted[2];
@@ -279,7 +275,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +988,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +987,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================

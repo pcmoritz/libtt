@@ -1,16 +1,6 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -2620,7 +2620,8 @@ private:
- 
- namespace {
- 
--// Fuses: (x * rsqrt(mean(x^2) + epsilon)) * gamma -> RMSNormOp
-+// Fuses: (x * rsqrt(mean(x^2) + epsilon)) * gamma -> RMSNormOp.
-+// Also accepts JAX's sum(x^2) / N mean lowering and x * (rsqrt(...) * gamma).
- class RMSNormFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
-   using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
- 
-@@ -2657,6 +2658,19 @@ public:
+@@ -2657,6 +2657,19 @@ public:
            });
      };
  
