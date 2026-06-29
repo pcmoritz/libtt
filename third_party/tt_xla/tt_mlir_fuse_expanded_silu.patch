@@ -1,6 +1,6 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -532,50 +532,57 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+@@ -532,50 +532,49 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
@@ -42,17 +42,11 @@
 -    }
 -
 -    if (!sigmoidOp || !sigmoidOp->hasOneUse()) {
-+    std::optional<mlir::Value> siluInput;
-+    if (std::optional<mlir::Value> lhsSigmoidInput = matchSigmoidInput(lhs);
-+        lhsSigmoidInput && *lhsSigmoidInput == rhs) {
-+      siluInput = *lhsSigmoidInput;
-+    } else if (std::optional<mlir::Value> rhsSigmoidInput =
-+                   matchSigmoidInput(rhs);
-+               rhsSigmoidInput && *rhsSigmoidInput == lhs) {
-+      siluInput = *rhsSigmoidInput;
-+    } else {
-       return mlir::failure();
-     }
+-      return mlir::failure();
+-    }
++    std::optional<mlir::Value> lhsSigmoidInput = matchSigmoidInput(lhs), rhsSigmoidInput = matchSigmoidInput(rhs);
++    mlir::Value siluInput = lhsSigmoidInput && *lhsSigmoidInput == rhs ? rhs : rhsSigmoidInput && *rhsSigmoidInput == lhs ? lhs : mlir::Value();
++    if (!siluInput) return mlir::failure();
  
 -    mlir::Value sigmoidInput =
 -        ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput());
@@ -61,11 +55,11 @@
 -    }
 -
 -    auto inputType = sigmoidInput.getType();
-+    auto inputType = siluInput->getType();
++    auto inputType = siluInput.getType();
      auto outputType = multiplyOp.getResult().getType();
      auto siluOp =
 -        rewriter.create<SiluOp>(multiplyOp->getLoc(), inputType, otherOperand);
-+        rewriter.create<SiluOp>(multiplyOp->getLoc(), inputType, *siluInput);
++        rewriter.create<SiluOp>(multiplyOp->getLoc(), inputType, siluInput);
  
      // If multiply inputs and output are typecasted, we need to add a typecast
      // after silu to convert back to the multiply output type.
