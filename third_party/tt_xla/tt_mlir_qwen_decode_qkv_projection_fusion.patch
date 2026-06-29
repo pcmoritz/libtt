@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 --- a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 +++ b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
-@@ -44,6 +44,21 @@ private:
+@@ -44,6 +44,20 @@ private:
    OpValidationConfig validationConfig;
  };
 
@@ -12,9 +12,8 @@ diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPattern
 +                               const OpValidationConfig &validationConfig = {})
 +      : OpRewritePattern<MatmulOp>(context), validationConfig(validationConfig) {}
 +
-+  mlir::LogicalResult
-+  matchAndRewrite(MatmulOp matmulOp,
-+                  mlir::PatternRewriter &rewriter) const override;
++  mlir::LogicalResult matchAndRewrite(
++      MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const override;
 +
 +private:
 +  OpValidationConfig validationConfig;
@@ -221,7 +220,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +956,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +956,71 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
@@ -246,8 +245,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  }
 +
 +  SmallVector<int64_t> inputShape = {1, 1, batchSize, hiddenSize};
-+  RankedTensorType inputType =
-+      utils::RankedTensorTypeFactory::create(matmulType, inputShape);
++  RankedTensorType inputType = utils::RankedTensorTypeFactory::create(matmulType, inputShape);
 +  SmallVector<int32_t> inputShapeI32(inputShape.begin(), inputShape.end());
 +
 +  rewriter.setInsertionPointAfter(matmulOp);
@@ -255,16 +253,13 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +      matmulOp.getLoc(), inputType, matmulOp.getResult(),
 +      rewriter.getI32ArrayAttr(inputShapeI32));
 +
-+  auto numHeadsAttr =
-+      rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(q)[2]));
-+  auto numKVHeadsAttr =
-+      rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(k)[2]));
++  auto numHeadsAttr = rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(q)[2]));
++  auto numKVHeadsAttr = rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(k)[2]));
 +  SmallVector<Type> resultTypes{q.decodeReshapeOp.getType(),
 +                                k.decodeReshapeOp.getType(),
 +                                v.decodeReshapeOp.getType()};
 +
-+  IsolatedIRValidationWrapper validator(rewriter.getContext(),
-+                                        validationConfig);
++  IsolatedIRValidationWrapper validator(rewriter.getContext(), validationConfig);
 +  auto validationResult = validator.validateOp<NLPCreateQKVHeadsDecodeOp>(
 +      matmulOp.getOperation(), matmulOp.getLoc(), resultTypes,
 +      inputReshape.getResult(),
@@ -300,12 +295,11 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -378,6 +378,8 @@ public:
+@@ -378,6 +378,7 @@ public:
        patterns.add<fusing::RoPEDecodeFusing>(&getContext());
        patterns.add<fusing::SDPAFusing>(&getContext(), validationConfig);
        patterns.add<NLPConcatHeadsDecodeFusing>(&getContext());
-+      patterns.add<fusing::NLPDecodeQKVProjectionFusing>(&getContext(),
-+                                                         validationConfig);
++      patterns.add<fusing::NLPDecodeQKVProjectionFusing>(&getContext(), validationConfig);
        patterns.add<fusing::SplitQueryKeyValueAndSplitHeadsFusing<MatmulOp>>(
            &getContext(), validationConfig);
        patterns.add<fusing::SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>>(

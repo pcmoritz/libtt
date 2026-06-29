@@ -1,17 +1,13 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 --- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
 +++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/NormalizationRules.h
-@@ -38,6 +38,14 @@ struct RmsNormRuleBook : OpRuleBook {
+@@ -38,6 +38,10 @@ struct RmsNormRuleBook : OpRuleBook {
    /// are rejected because the sharded layernorm kernel doesn't support them.
    LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
  
-+  OutputHints
-+  getOutputHints(Operation *op,
-+                 const std::vector<OpConfig> &legalConfigs) const override;
++  OutputHints getOutputHints(Operation *op, const std::vector<OpConfig> &legalConfigs) const override;
 +
-+  bool isValidOutputHintForInputs(
-+      const OpConfig &hint,
-+      llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
++  bool isValidOutputHintForInputs(const OpConfig &hint, llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
 +
    /// adjustScore reflects kernel-dispatch reality: the generic scorer derives
    /// `coreCount` from the output layout, but for rms_norm with interleaved
@@ -71,12 +67,11 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
  } // namespace
  
  //===----------------------------------------------------------------------===//
-@@ -76,6 +117,57 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -76,6 +117,53 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    };
  }
  
-+OutputHints RmsNormRuleBook::getOutputHints(
-+    Operation *op, const std::vector<OpConfig> &legalConfigs) const {
++OutputHints RmsNormRuleBook::getOutputHints(Operation *op, const std::vector<OpConfig> &legalConfigs) const {
 +  OutputHints result = OpRuleBook::getOutputHints(op, legalConfigs);
 +
 +  if (!isQwenDecodeHeadRmsNorm(op)) {
@@ -88,9 +83,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +    return result;
 +  }
 +
-+  auto hasOutputLayout = [&](const OpConfig &config) {
-+    return config.outputLayout == layout;
-+  };
++  auto hasOutputLayout = [&](const OpConfig &config) { return config.outputLayout == layout; };
 +  if (llvm::none_of(result.hints, hasOutputLayout)) {
 +    result.hints.insert(result.hints.begin(), OpConfig(layout));
 +  }
@@ -100,8 +93,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +  return result;
 +}
 +
-+bool RmsNormRuleBook::isValidOutputHintForInputs(
-+    const OpConfig &hint, llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const {
++bool RmsNormRuleBook::isValidOutputHintForInputs(const OpConfig &hint, llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const {
 +  if (inputLayouts.empty() || !inputLayouts[0]) {
 +    return true;
 +  }
