@@ -26,21 +26,15 @@ diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h b/i
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp
-@@ -59,6 +59,22 @@ SDPADecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -59,6 +59,16 @@ SDPADecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    return layout_filter_utils::requireDRAMInterleaved;
  }
 
-+LayoutFilterFn
-+NLPCreateQKVHeadsDecodeRuleBook::getInputLayoutFilter(
-+    unsigned operandIdx) const {
-+  if (operandIdx != 0) {
-+    return layout_filter_utils::requireDRAMInterleaved;
-+  }
++LayoutFilterFn NLPCreateQKVHeadsDecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
++  if (operandIdx != 0) return layout_filter_utils::requireDRAMInterleaved;
 +  return [](TTNNLayoutAttr layout) -> bool {
 +    auto ml = layout.getMemLayout();
-+    if (!ml || ml.getValue() != TensorMemoryLayout::WidthSharded) {
-+      return false;
-+    }
++    if (!ml || ml.getValue() != TensorMemoryLayout::WidthSharded) return false;
 +    auto shardShape = layout.getScalarShardShape();
 +    return shardShape.size() >= 2 && shardShape[1] > 0 && 128 % shardShape[1] == 0;
 +  };
@@ -49,15 +43,12 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialec
  //===----------------------------------------------------------------------===//
  // RotaryEmbeddingRuleBook
  //===----------------------------------------------------------------------===//
-@@ -128,4 +143,18 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -128,4 +143,15 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    return nullptr;
  }
 
-+LayoutFilterFn
-+PagedUpdateCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
-+  if (operandIdx == 0) {
-+    return cacheBufferDramOnlyFilter();
-+  }
++LayoutFilterFn PagedUpdateCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
++  if (operandIdx == 0) return cacheBufferDramOnlyFilter();
 +  if (operandIdx == 1) {
 +    return [](TTNNLayoutAttr layout) -> bool {
 +      auto ml = layout.getMemLayout();

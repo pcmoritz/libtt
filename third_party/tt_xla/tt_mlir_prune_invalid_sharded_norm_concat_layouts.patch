@@ -26,19 +26,15 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
  
 +#include "llvm/ADT/STLExtras.h"
 +
-@@ -30,6 +36,40 @@ int64_t inputOperandTileHeight(Operation *op, unsigned operandIdx) {
+@@ -30,6 +36,32 @@ int64_t inputOperandTileHeight(Operation *op, unsigned operandIdx) {
    return nc * ht;
  }
  
 +bool isQwenDecodeHeadRmsNorm(Operation *op) {
-+  if (op->getNumResults() == 0) {
-+    return false;
-+  }
++  if (op->getNumResults() == 0) return false;
 +
 +  auto resultType = mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
-+  if (!resultType || resultType.getRank() != 4) {
-+    return false;
-+  }
++  if (!resultType || resultType.getRank() != 4) return false;
 +
 +  ArrayRef<int64_t> shape = resultType.getShape();
 +  return shape[0] == 1 && shape[1] == 1 && shape[3] == 128 &&
@@ -47,14 +43,10 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +
 +TTNNLayoutAttr getSingleCoreHeightShardedLayout(Operation *op) {
 +  auto resultType = mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
-+  if (!resultType) {
-+    return nullptr;
-+  }
++  if (!resultType) return nullptr;
 +
 +  auto seed = mlir::dyn_cast_or_null<TTNNLayoutAttr>(resultType.getEncoding());
-+  if (!seed) {
-+    return nullptr;
-+  }
++  if (!seed) return nullptr;
 +
 +  ttcore::DeviceAttr deviceAttr = ttcore::lookupDevice(op);
 +  return TTNNLayoutAttr::Builder(seed, resultType.getShape())
@@ -67,21 +59,17 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
  } // namespace
  
  //===----------------------------------------------------------------------===//
-@@ -76,6 +117,53 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -76,6 +117,41 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    };
  }
  
 +OutputHints RmsNormRuleBook::getOutputHints(Operation *op, const std::vector<OpConfig> &legalConfigs) const {
 +  OutputHints result = OpRuleBook::getOutputHints(op, legalConfigs);
 +
-+  if (!isQwenDecodeHeadRmsNorm(op)) {
-+    return result;
-+  }
++  if (!isQwenDecodeHeadRmsNorm(op)) return result;
 +
 +  TTNNLayoutAttr layout = getSingleCoreHeightShardedLayout(op);
-+  if (!layout) {
-+    return result;
-+  }
++  if (!layout) return result;
 +
 +  auto hasOutputLayout = [&](const OpConfig &config) { return config.outputLayout == layout; };
 +  if (llvm::none_of(result.hints, hasOutputLayout)) {
@@ -94,22 +82,14 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +}
 +
 +bool RmsNormRuleBook::isValidOutputHintForInputs(const OpConfig &hint, llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const {
-+  if (inputLayouts.empty() || !inputLayouts[0]) {
-+    return true;
-+  }
++  if (inputLayouts.empty() || !inputLayouts[0]) return true;
 +
 +  auto inputMem = inputLayouts[0].getMemLayout();
-+  if (!inputMem || !isShardedMemoryLayout(inputMem.getValue())) {
-+    return true;
-+  }
++  if (!inputMem || !isShardedMemoryLayout(inputMem.getValue())) return true;
 +
-+  if (!hint.outputLayout) {
-+    return false;
-+  }
++  if (!hint.outputLayout) return false;
 +  auto outputMem = hint.outputLayout.getMemLayout();
-+  if (!outputMem || !isShardedMemoryLayout(outputMem.getValue())) {
-+    return false;
-+  }
++  if (!outputMem || !isShardedMemoryLayout(outputMem.getValue())) return false;
 +
 +  if (inputMem.getValue() == TensorMemoryLayout::HeightSharded) {
 +    return outputMem.getValue() == TensorMemoryLayout::HeightSharded &&
