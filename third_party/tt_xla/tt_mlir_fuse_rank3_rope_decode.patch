@@ -1,21 +1,17 @@
 --- a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
 +++ b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
-@@ -391,6 +391,50 @@
+@@ -391,6 +391,47 @@
    return concatOp.getOperand(0);
  }
  
-+ArrayAttr getI32ShapeAttr(OpBuilder &builder, ArrayRef<int64_t> shape) {
-+  SmallVector<int32_t> i32Shape(shape.begin(), shape.end());
-+  return builder.getI32ArrayAttr(i32Shape);
-+}
-+
 +Value reshapeTo(PatternRewriter &rewriter, Location loc, Value value,
 +                RankedTensorType type) {
 +  if (mlir::cast<RankedTensorType>(value.getType()) == type) {
 +    return value;
 +  }
++  SmallVector<int32_t> shape(type.getShape().begin(), type.getShape().end());
 +  return rewriter.create<ReshapeOp>(loc, type, value,
-+                                    getI32ShapeAttr(rewriter, type.getShape()));
++                                    rewriter.getI32ArrayAttr(shape));
 +}
 +
 +ReshapeOp getRank4DecodeReshapeUser(ConcatOp concatOp) {
@@ -51,7 +47,7 @@
  // Replace the anchor op with a ttcore.composite "rotary_embedding" that
  // references a decomposition function.
  // Detects self-concat cos/sin at the IR level (same as TTNN decomposition's
-@@ -455,7 +506,8 @@ void replaceWithRoPEComposite(Operation *anchorOp,
+@@ -455,7 +503,8 @@ void replaceWithRoPEComposite(Operation *anchorOp,
  void replaceWithRoPEComposite(Operation *anchorOp,
                                mlir::PatternRewriter &rewriter, Value xSource,
                                Value cosInput, Value sinInput,
@@ -61,7 +57,7 @@
    auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
    auto cosType = mlir::cast<RankedTensorType>(cosInput.getType());
    auto sinType = mlir::cast<RankedTensorType>(sinInput.getType());
-@@ -484,6 +536,6 @@ void replaceWithRoPEComposite(Operation *anchorOp,
+@@ -484,6 +533,6 @@ void replaceWithRoPEComposite(Operation *anchorOp,
        rewriter.getStringAttr("rotary_embedding"),
        FlatSymbolRefAttr::get(rewriter.getContext(), decompFunc.getName()),
 -      /*composite_attributes=*/nullptr);
@@ -69,7 +65,7 @@
  }
  
  } // namespace
-@@ -537,10 +588,11 @@
+@@ -537,10 +585,11 @@
  
    // Must concat on last dimension with exactly 2 operands.
    auto resultType = mlir::cast<RankedTensorType>(srcOp.getType());
@@ -83,7 +79,7 @@
      return failure();
    }
    if (srcOp.getNumOperands() != 2) {
-@@ -608,8 +660,11 @@
+@@ -608,8 +657,11 @@
    }
  
    // Input must be 4D.
@@ -96,7 +92,7 @@
      return failure();
    }
  
-@@ -645,14 +700,22 @@
+@@ -645,14 +697,22 @@
    // cos/sin are half-dim. Create concat(half, half) as the composite's
    // cos/sin inputs so that ttnn::RotaryEmbeddingOp promotion can match
    // the expected full-dim shapes. The decomposition body will detect the
@@ -121,7 +117,7 @@
  
    SmallVector<int64_t> cosFullShape(cosHalfType.getShape());
    cosFullShape[lastDim] *= 2;
-@@ -671,8 +736,33 @@
+@@ -671,8 +733,33 @@
        srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
        rewriter.getSI32IntegerAttr(lastDim));
  
