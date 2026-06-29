@@ -1,31 +1,24 @@
 --- a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
 +++ b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
-@@ -391,6 +391,58 @@
+@@ -391,6 +391,51 @@
    return concatOp.getOperand(0);
  }
  
 +ArrayAttr getI32ShapeAttr(OpBuilder &builder, ArrayRef<int64_t> shape) {
-+  SmallVector<int32_t> i32Shape;
-+  i32Shape.reserve(shape.size());
-+  for (int64_t dim : shape) {
-+    i32Shape.push_back(static_cast<int32_t>(dim));
-+  }
++  SmallVector<int32_t> i32Shape(shape.begin(), shape.end());
 +  return builder.getI32ArrayAttr(i32Shape);
 +}
 +
 +Value reshapeTo(PatternRewriter &rewriter, Location loc, Value value,
 +                RankedTensorType type) {
-+  auto valueType = mlir::cast<RankedTensorType>(value.getType());
-+  if (valueType == type) {
++  if (mlir::cast<RankedTensorType>(value.getType()) == type) {
 +    return value;
 +  }
 +  return rewriter.create<ReshapeOp>(loc, type, value,
 +                                    getI32ShapeAttr(rewriter, type.getShape()));
 +}
 +
-+// Qwen decode lowers RoPE over rank-3 [tokens, heads, dim] tensors and then
-+// immediately reshapes the result to rank 4 for attention. The TTNN
-+// rotary_embedding op requires rank 4, so fuse through that reshape.
++// Fuse rank-3 Qwen decode RoPE through its rank-4 attention reshape.
 +ReshapeOp getRank4DecodeReshapeUser(ConcatOp concatOp) {
 +  auto inputType = mlir::cast<RankedTensorType>(concatOp.getType());
 +  if (inputType.getRank() != 3 || inputType.getShape()[0] != 1 ||
@@ -91,11 +84,10 @@
      return failure();
    }
    if (srcOp.getNumOperands() != 2) {
-@@ -608,8 +661,12 @@
+@@ -608,8 +661,11 @@
    }
  
    // Input must be 4D.
-+  // Qwen decode starts rank-3 and reshapes to 4D immediately after RoPE.
    auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
 -  if (inputType.getRank() != 4) {
 +  if (inputType.getRank() != 4 && !rank4Reshape) {

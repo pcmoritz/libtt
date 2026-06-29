@@ -1,11 +1,9 @@
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
-@@ -21,6 +21,12 @@ getWorkaroundedOp(RotaryEmbeddingOp ropeOp, PatternRewriter &rewriter) {
+@@ -21,6 +21,10 @@ getWorkaroundedOp(RotaryEmbeddingOp ropeOp, PatternRewriter &rewriter) {
      return std::nullopt;
    }
  
-+  // Decode mode supplies an explicit token index. Padding dim -2 in this path
-+  // pads Qwen's KV head count from 8 to 32, then slices it back after RoPE.
 +  if (ropeOp.getTokenIndexAttr()) {
 +    return std::nullopt;
 +  }

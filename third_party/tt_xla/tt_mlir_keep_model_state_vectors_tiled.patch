@@ -1,10 +1,9 @@
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-@@ -678,6 +678,15 @@ private:
+@@ -678,6 +678,14 @@ private:
  
      if (auto typeAttr = owningFunc.getArgAttrOfType<ttcore::ArgumentTypeAttr>(
              arg.getArgNumber(), ttcore::ArgumentTypeAttr::name)) {
-+      // Keep static rank-1 RMSNorm weights tiled to avoid decode reshards.
 +      auto tensorType = mlir::dyn_cast<RankedTensorType>(arg.getType());
 +      auto nameLoc = mlir::dyn_cast<mlir::NameLoc>(arg.getLoc());
 +      if (tensorType && tensorType.getRank() == 1 && nameLoc &&

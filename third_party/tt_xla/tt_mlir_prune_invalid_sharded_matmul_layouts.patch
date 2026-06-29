@@ -1,15 +1,13 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h
 --- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h
 +++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/MatmulRules.h
-@@ -31,6 +31,15 @@ struct MatmulRuleBook : OpRuleBook {
+@@ -31,6 +31,13 @@ struct MatmulRuleBook : OpRuleBook {
    /// Reject all sharded RHS inputs (operand 1). LHS and bias are unrestricted.
    LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
  
-+  /// Reject sharded LHS layouts that tt-metal matmul cannot consume.
 +  bool isValidInputCombination(
 +      llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
 +
-+  /// Reject sharded LHS/output pairings that tt-metal matmul cannot consume.
 +  bool isValidOutputHintForInputs(
 +      const OpConfig &hint,
 +      llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const override;
@@ -58,7 +56,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTN
  static bool isSharded(const OpConfig &config) {
    if (!config.outputLayout) {
      return false;
-@@ -39,7 +70,44 @@ static bool isSharded(const OpConfig &config) {
+@@ -39,7 +70,41 @@ static bool isSharded(const OpConfig &config) {
    auto memLayout = config.outputLayout.getMemLayout();
    return memLayout && isShardedMemoryLayout(memLayout.getValue());
  }
@@ -69,7 +67,6 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTN
 +    return true;
 +  }
 +
-+  // Regular tt-metal matmul only accepts height-sharded LHS.
 +  return inputLayouts[0].getMemLayout().getValue() ==
 +         TensorMemoryLayout::HeightSharded;
 +}
@@ -84,7 +81,6 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTN
 +    return true;
 +  }
 +
-+  // tt-metal matmul rejects interleaved outputs when any input is sharded.
 +  if (!hint.outputLayout || !isShardedLayout(hint.outputLayout)) {
 +    return false;
 +  }
@@ -93,7 +89,6 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTN
 +    return true;
 +  }
 +
-+  // Sharded LHS requires matching output buffer type and memory layout.
 +  return hint.outputLayout.getBufferType() ==
 +             inputLayouts[0].getBufferType() &&
 +         hint.outputLayout.getMemLayout().getValue() ==

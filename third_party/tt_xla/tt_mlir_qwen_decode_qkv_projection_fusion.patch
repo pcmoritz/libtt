@@ -98,30 +98,22 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -15,6 +15,15 @@ namespace mlir::tt::ttnn::fusing {
+@@ -15,6 +15,11 @@ namespace mlir::tt::ttnn::fusing {
  namespace {
 
  // ============================================================================
-+// Common helpers
-+// ============================================================================
-+
 +ArrayAttr getI32ArrayAttr(OpBuilder &builder, ArrayRef<int64_t> values) {
 +  SmallVector<int32_t> i32Values(values.begin(), values.end());
 +  return builder.getI32ArrayAttr(i32Values);
 +}
 +
-+// ============================================================================
  // SplitQueryKeyValueAndSplitHeadsFusing helpers
  // ============================================================================
 
-@@ -572,6 +581,177 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +577,168 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
-+// ============================================================================
-+// NLPDecodeQKVProjectionFusing helpers
-+// ============================================================================
-+
 +struct DecodeQKVHead {
 +  SliceStaticOp sliceOp;
 +  ReshapeOp headReshapeOp;
@@ -148,8 +140,6 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    return std::nullopt;
 +  }
 +
-+  // V has no per-head RMSNorm in Qwen decode, so it goes straight from the
-+  // projection slice to the rank-4 attention shape.
 +  if (firstReshapeOp.getType().getRank() == 4) {
 +    ArrayRef<int64_t> sliceShape = sliceOp.getType().getShape();
 +    ArrayRef<int64_t> decodeShape = firstReshapeOp.getType().getShape();
@@ -250,10 +240,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    return std::nullopt;
 +  }
 +
-+  // TTIR shared-projection fusion sorts Qwen Q/K/V projections by location, so
-+  // the fused projection is in Q,K,V slice order by the time this pattern runs.
-+  // Avoid forward role tracing here; greedy TTNN fusing may visit this matmul
-+  // before downstream SDPA/cache-update patterns have materialized.
++  // TTIR shared-projection fusion sorts Qwen projections into Q,K,V order.
 +  DecodeQKVHead &q = sorted[0];
 +  DecodeQKVHead &k = sorted[1];
 +  DecodeQKVHead &v = sorted[2];
@@ -292,7 +279,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +1001,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +988,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
