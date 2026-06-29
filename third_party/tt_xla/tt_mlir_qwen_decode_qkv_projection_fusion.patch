@@ -37,7 +37,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  #include <type_traits>
 
  namespace mlir::tt::ttir {
-@@ -1809,6 +1811,45 @@ private:
+@@ -1809,6 +1811,43 @@ private:
      return rewriter.create<ConcatOp>(loc, concatType, biases,
                                       rewriter.getSI32IntegerAttr(concatDim));
    }
@@ -48,14 +48,11 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    op->getLoc().print(os);
 +    os.flush();
 +
-+    if (loc.find("/q_proj/") != std::string::npos) {
-+      return 0;
-+    }
-+    if (loc.find("/k_proj/") != std::string::npos) {
-+      return 1;
-+    }
-+    if (loc.find("/v_proj/") != std::string::npos) {
-+      return 2;
++    const char *patterns[] = {"/q_proj/", "/k_proj/", "/v_proj/"};
++    for (auto [index, pattern] : llvm::enumerate(patterns)) {
++      if (loc.find(pattern) != std::string::npos) {
++        return index;
++      }
 +    }
 +    return -1;
 +  }
@@ -83,7 +80,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 
    // Collect all ops that share the same LHS operand and are compatible
    // for fusion.
-@@ -1872,6 +1913,8 @@ private:
+@@ -1872,6 +1911,8 @@ private:
        }
      }
 
