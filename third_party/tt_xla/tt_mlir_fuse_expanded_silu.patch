@@ -1,6 +1,6 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -532,50 +532,112 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+@@ -532,50 +532,110 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
@@ -41,9 +41,7 @@
 +      return std::nullopt;
 +    }
 +
-+    mlir::Value numerator =
-+        ttmlir::utils::lookThrough<TypecastOp>(divOp.getLhs());
-+    if (!isOneValue(numerator)) {
++    if (!isOneValue(ttmlir::utils::lookThrough<TypecastOp>(divOp.getLhs()))) {
 +      return std::nullopt;
 +    }
 +
