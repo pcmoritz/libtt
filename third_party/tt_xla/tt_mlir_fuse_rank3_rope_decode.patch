@@ -117,36 +117,31 @@
  
    SmallVector<int64_t> cosFullShape(cosHalfType.getShape());
    cosFullShape[lastDim] *= 2;
-@@ -671,8 +733,31 @@
+@@ -671,8 +733,26 @@
        srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
        rewriter.getSI32IntegerAttr(lastDim));
  
 -  replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
 -                           resultType);
-+  Operation *anchorOp = srcOp.getOperation();
-+  RankedTensorType compositeResultType = resultType;
-+  Value compositeX = xSource;
-+  Value compositeCos = cosFull;
-+  Value compositeSin = sinFull;
-+  DictionaryAttr compositeAttributes = nullptr;
-+
-+  if (rank4Reshape) {
-+    anchorOp = rank4Reshape.getOperation();
-+    compositeResultType = mlir::cast<RankedTensorType>(rank4Reshape.getType());
-+    compositeX = reshapeTo(
-+        rewriter, srcOp.getLoc(), xSource,
-+        RankedTensorType::get(compositeResultType.getShape(),
-+                              inputType.getElementType()));
-+    compositeCos = reshapeTo(rewriter, srcOp.getLoc(), cosFull,
-+                             getCacheTypeFor(cosFullType, compositeResultType));
-+    compositeSin = reshapeTo(rewriter, srcOp.getLoc(), sinFull,
-+                             getCacheTypeFor(sinFullType, compositeResultType));
-+    compositeAttributes = rewriter.getDictionaryAttr({rewriter.getNamedAttr(
-+        "token_index", rewriter.getUI32IntegerAttr(0))});
++  if (!rank4Reshape) {
++    replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
++                             resultType);
++    return success();
 +  }
 +
-+  replaceWithRoPEComposite(anchorOp, rewriter, compositeX, compositeCos,
-+                           compositeSin, compositeResultType,
++  auto compositeResultType = mlir::cast<RankedTensorType>(rank4Reshape.getType());
++  Value compositeX = reshapeTo(
++      rewriter, srcOp.getLoc(), xSource,
++      RankedTensorType::get(compositeResultType.getShape(),
++                            inputType.getElementType()));
++  Value compositeCos = reshapeTo(rewriter, srcOp.getLoc(), cosFull,
++                                 getCacheTypeFor(cosFullType, compositeResultType));
++  Value compositeSin = reshapeTo(rewriter, srcOp.getLoc(), sinFull,
++                                 getCacheTypeFor(sinFullType, compositeResultType));
++  auto compositeAttributes = rewriter.getDictionaryAttr({rewriter.getNamedAttr(
++      "token_index", rewriter.getUI32IntegerAttr(0))});
++  replaceWithRoPEComposite(rank4Reshape.getOperation(), rewriter, compositeX,
++                           compositeCos, compositeSin, compositeResultType,
 +                           compositeAttributes);
    return success();
  }
