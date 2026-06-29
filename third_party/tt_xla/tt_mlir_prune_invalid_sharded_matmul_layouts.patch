@@ -46,19 +46,16 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTN
  static bool isSharded(const OpConfig &config) {
    if (!config.outputLayout) {
      return false;
-@@ -39,7 +65,41 @@ static bool isSharded(const OpConfig &config) {
+@@ -39,7 +65,38 @@ static bool isSharded(const OpConfig &config) {
    auto memLayout = config.outputLayout.getMemLayout();
    return memLayout && isShardedMemoryLayout(memLayout.getValue());
  }
  
 +bool MatmulRuleBook::isValidInputCombination(
 +    llvm::ArrayRef<TTNNLayoutAttr> inputLayouts) const {
-+  if (inputLayouts.empty() || !isShardedLayout(inputLayouts[0])) {
-+    return true;
-+  }
-+
-+  return inputLayouts[0].getMemLayout().getValue() ==
-+         TensorMemoryLayout::HeightSharded;
++  return inputLayouts.empty() || !isShardedLayout(inputLayouts[0]) ||
++         inputLayouts[0].getMemLayout().getValue() ==
++             TensorMemoryLayout::HeightSharded;
 +}
 +
 +bool MatmulRuleBook::isValidOutputHintForInputs(
