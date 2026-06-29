@@ -1,5 +1,3 @@
-diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-index 8a5f0a4e..b066c4c9 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 @@ -678,6 +678,15 @@ private:

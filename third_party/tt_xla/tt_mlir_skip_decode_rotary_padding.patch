@@ -1,4 +1,3 @@
-diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
 @@ -21,6 +21,12 @@ getWorkaroundedOp(RotaryEmbeddingOp ropeOp, PatternRewriter &rewriter) {

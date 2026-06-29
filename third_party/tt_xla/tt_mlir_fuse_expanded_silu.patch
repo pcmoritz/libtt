@@ -1,5 +1,3 @@
-diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-index 2f2a3ef..e4c8fb2 100644
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 @@ -532,50 +532,118 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {

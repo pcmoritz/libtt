@@ -1,5 +1,3 @@
-diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
-index d57c7b8..1d6e1d7 100644
 --- a/pjrt_implementation/src/api/module_builder/module_builder.cc
 +++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
 @@ -932,6 +932,7 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(

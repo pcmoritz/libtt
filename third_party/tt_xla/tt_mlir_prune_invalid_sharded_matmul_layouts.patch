@@ -58,7 +58,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTN
  static bool isSharded(const OpConfig &config) {
    if (!config.outputLayout) {
      return false;
-@@ -39,6 +70,47 @@ static bool isSharded(const OpConfig &config) {
+@@ -39,7 +70,44 @@ static bool isSharded(const OpConfig &config) {
    auto memLayout = config.outputLayout.getMemLayout();
    return memLayout && isShardedMemoryLayout(memLayout.getValue());
  }
@@ -69,9 +69,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTN
 +    return true;
 +  }
 +
-+  // tt-metal's regular matmul path only accepts a sharded LHS when it is
-+  // HEIGHT_SHARDED. Width-sharded LHS is only valid for a specialized mcast
-+  // path that this optimizer cannot identify from input layouts alone.
++  // Regular tt-metal matmul only accepts height-sharded LHS.
 +  return inputLayouts[0].getMemLayout().getValue() ==
 +         TensorMemoryLayout::HeightSharded;
 +}
@@ -95,9 +93,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/MatmulRules.cpp b/lib/Dialect/TTN
 +    return true;
 +  }
 +
-+  // With a sharded LHS, tt-metal also requires matching output buffer type and
-+  // memory layout. The generic op model otherwise explores many combinations
-+  // that are known to fail backend validation.
++  // Sharded LHS requires matching output buffer type and memory layout.
 +  return hint.outputLayout.getBufferType() ==
 +             inputLayouts[0].getBufferType() &&
 +         hint.outputLayout.getMemLayout().getValue() ==

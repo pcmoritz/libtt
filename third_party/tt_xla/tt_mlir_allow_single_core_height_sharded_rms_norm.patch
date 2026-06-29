@@ -1,4 +1,3 @@
-diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 +++ b/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp
 @@ -63,10 +63,10 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
