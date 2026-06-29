@@ -74,7 +74,7 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
  } // namespace
  
  //===----------------------------------------------------------------------===//
-@@ -76,6 +117,58 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -76,6 +117,57 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    };
  }
  
@@ -91,15 +91,14 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
 +    return result;
 +  }
 +
-+  if (llvm::none_of(result.hints, [&](const OpConfig &config) {
-+        return config.outputLayout == layout;
-+      })) {
++  auto hasOutputLayout = [&](const OpConfig &config) {
++    return config.outputLayout == layout;
++  };
++  if (llvm::none_of(result.hints, hasOutputLayout)) {
 +    result.hints.insert(result.hints.begin(), OpConfig(layout));
 +  }
 +
-+  llvm::erase_if(result.fallbackHints, [&](const OpConfig &config) {
-+    return config.outputLayout == layout;
-+  });
++  llvm::erase_if(result.fallbackHints, hasOutputLayout);
 +
 +  return result;
 +}
