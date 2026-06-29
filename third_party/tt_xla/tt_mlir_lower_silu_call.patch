@@ -6,10 +6,9 @@
 +  using OpRewritePattern<mlir::func::CallOp>::OpRewritePattern;
 +public:
 +  LogicalResult matchAndRewrite(mlir::func::CallOp srcOp, PatternRewriter &rewriter) const override {
-+    if (srcOp.getCallee() != "silu") return failure();
-+    if (srcOp.getNumOperands() != 1 || srcOp.getNumResults() != 1) return rewriter.notifyMatchFailure(srcOp, "silu call must have exactly one operand and one result");
++    if (srcOp.getCallee() != "silu" || srcOp.getNumOperands() != 1 || srcOp.getNumResults() != 1) return failure();
 +    auto outputType = mlir::dyn_cast<RankedTensorType>(srcOp.getResult(0).getType());
-+    if (!outputType) return rewriter.notifyMatchFailure(srcOp, "silu result must be ranked tensor");
++    if (!outputType) return failure();
 +    rewriter.replaceOpWithNewOp<ttir::SiluOp>(srcOp, outputType, srcOp.getOperand(0));
 +    return success();
 +  }
