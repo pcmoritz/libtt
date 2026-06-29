@@ -95,7 +95,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -572,6 +572,147 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +572,145 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -229,21 +229,19 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +
 +void eraseUnusedDecodeQKVHead(PatternRewriter &rewriter,
 +                              DecodeQKVHead &head) {
-+  if (head.rmsNormOp && head.rmsNormOp->use_empty()) {
-+    rewriter.eraseOp(head.rmsNormOp);
-+  }
-+  if (head.headReshapeOp && head.headReshapeOp->use_empty()) {
-+    rewriter.eraseOp(head.headReshapeOp);
-+  }
-+  if (head.sliceOp && head.sliceOp->use_empty()) {
-+    rewriter.eraseOp(head.sliceOp);
++  for (Operation *op : {head.rmsNormOp.getOperation(),
++                        head.headReshapeOp.getOperation(),
++                        head.sliceOp.getOperation()}) {
++    if (op && op->use_empty()) {
++      rewriter.eraseOp(op);
++    }
 +  }
 +}
 +
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +962,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +960,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
