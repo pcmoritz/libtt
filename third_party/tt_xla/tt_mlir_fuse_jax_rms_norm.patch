@@ -1,18 +1,14 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -2657,6 +2657,11 @@ public:
+@@ -2657,6 +2657,7 @@ public:
            });
      };
  
-+    auto dropSubtractZero = [&](mlir::Value value) {
-+      value = lookThroughSafeOps(value);
-+      auto subtract = value.getDefiningOp<SubtractOp>();
-+      return subtract && isFullOpWithValue(lookThroughSafeOps(subtract.getRhs()), 0.0f) ? lookThroughSafeOps(subtract.getLhs()) : value;
-+    };
++    auto dropSubtractZero = [&](mlir::Value value) { value = lookThroughSafeOps(value); auto subtract = value.getDefiningOp<SubtractOp>(); return subtract && isFullOpWithValue(lookThroughSafeOps(subtract.getRhs()), 0.0f) ? lookThroughSafeOps(subtract.getLhs()) : value; };
      MultiplyOp innerMul =
          ttmlir::utils::findOpThrough<MultiplyOp, TypecastOp>(outerMul.getLhs());
      mlir::Value gammaRaw = outerMul.getRhs();
-@@ -2687,32 +2692,33 @@ public:
+@@ -2687,32 +2688,32 @@ public:
        return mlir::failure();
      }
  
@@ -36,8 +32,7 @@
      mlir::Value epsilon = addOp.getRhs();
 -    if (!meanOp) {
 -      meanOp = addOp.getRhs().getDefiningOp<MeanOp>();
-+    if (!reductionInput) {
-+      reductionInput = getLastDimReductionInput(addOp.getRhs());
++    if (!reductionInput) { reductionInput = getLastDimReductionInput(addOp.getRhs());
        epsilon = addOp.getLhs();
      }
 -    if (!meanOp) {
@@ -66,15 +61,12 @@
  
      if (auto sq = meanInput.getDefiningOp<MultiplyOp>()) {
        if (sq.getLhs() == sq.getRhs()) {
-@@ -2726,7 +2735,10 @@ public:
+@@ -2726,7 +2730,7 @@ public:
      }
  
      if (!squareInput || squareInput != x) {
 -      return mlir::failure();
-+      mlir::Value swappedX = dropSubtractZero(gammaRaw);
-+      if (squareInput != swappedX) return mlir::failure();
-+      x = swappedX;
-+      gammaRaw = xRaw;
++      mlir::Value swappedX = dropSubtractZero(gammaRaw); if (squareInput != swappedX) { return mlir::failure(); } x = swappedX; gammaRaw = xRaw;
      }
  
      auto epsFull = epsilon.getDefiningOp<FullOp>();
