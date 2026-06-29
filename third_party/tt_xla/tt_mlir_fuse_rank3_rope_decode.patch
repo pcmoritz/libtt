@@ -53,34 +53,32 @@
  }
  
  } // namespace
-@@ -537,10 +576,11 @@
+@@ -537,10 +576,9 @@
  
    // Must concat on last dimension with exactly 2 operands.
    auto resultType = mlir::cast<RankedTensorType>(srcOp.getType());
 -  if (resultType.getRank() != 4) {
 +  ReshapeOp rank4Reshape = getRank4DecodeReshapeUser(srcOp);
-+  if (resultType.getRank() != 4 && !rank4Reshape) {
-     return failure();
-   }
++  if (resultType.getRank() != 4 && !rank4Reshape) return failure();
+-    return failure();
+-  }
 -  if (srcOp.getDim() != resultType.getRank() - 1) {
 +  if (srcOp.getDim() != static_cast<int32_t>(resultType.getRank() - 1)) {
      return failure();
    }
    if (srcOp.getNumOperands() != 2) {
-@@ -608,8 +648,11 @@
+@@ -608,8 +646,7 @@
    }
  
    // Input must be 4D.
    auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
 -  if (inputType.getRank() != 4) {
-+  if (inputType.getRank() != 4 && !rank4Reshape) {
-+    return failure();
-+  }
-+  if (rank4Reshape && inputType.getNumElements() != resultType.getNumElements()) {
-     return failure();
-   }
++  if (inputType.getRank() != 4 && !rank4Reshape) return failure();
++  if (rank4Reshape && inputType.getNumElements() != resultType.getNumElements()) return failure();
+-    return failure();
+-  }
  
-@@ -645,14 +688,18 @@
+@@ -645,14 +682,16 @@
    // cos/sin are half-dim. Create concat(half, half) as the composite's
    // cos/sin inputs so that ttnn::RotaryEmbeddingOp promotion can match
    // the expected full-dim shapes. The decomposition body will detect the
@@ -93,15 +91,13 @@
    auto cosHalfType = mlir::cast<RankedTensorType>(cosHalf.getType());
    auto sinHalfType = mlir::cast<RankedTensorType>(sinHalf.getType());
  
-+  if (rank4Reshape && (cosHalfType.getRank() != resultType.getRank() || sinHalfType.getRank() != resultType.getRank())) {
-+    return failure();
-+  }
++  if (rank4Reshape && (cosHalfType.getRank() != resultType.getRank() || sinHalfType.getRank() != resultType.getRank())) return failure();
 +
    int64_t lastDim = resultType.getRank() - 1;
  
    SmallVector<int64_t> cosFullShape(cosHalfType.getShape());
    cosFullShape[lastDim] *= 2;
-@@ -671,8 +720,21 @@
+@@ -671,8 +712,20 @@
        srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
        rewriter.getSI32IntegerAttr(lastDim));
  
@@ -117,8 +113,7 @@
 +  Value compositeX = reshapeTo(rewriter, srcOp.getLoc(), xSource, RankedTensorType::get(compositeResultType.getShape(), inputType.getElementType()));
 +  Value compositeCos = reshapeTo(rewriter, srcOp.getLoc(), cosFull, getCacheTypeFor(cosFullType, compositeResultType));
 +  Value compositeSin = reshapeTo(rewriter, srcOp.getLoc(), sinFull, getCacheTypeFor(sinFullType, compositeResultType));
-+  auto compositeAttributes = rewriter.getDictionaryAttr({rewriter.getNamedAttr(
-+      "token_index", rewriter.getUI32IntegerAttr(0))});
++  auto compositeAttributes = rewriter.getDictionaryAttr({rewriter.getNamedAttr("token_index", rewriter.getUI32IntegerAttr(0))});
 +  replaceWithRoPEComposite(rank4Reshape.getOperation(), rewriter, compositeX,
 +                           compositeCos, compositeSin, compositeResultType,
 +                           compositeAttributes);

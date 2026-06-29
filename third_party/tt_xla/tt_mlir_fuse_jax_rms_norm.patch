@@ -16,7 +16,7 @@
      MultiplyOp innerMul =
          ttmlir::utils::findOpThrough<MultiplyOp, TypecastOp>(outerMul.getLhs());
      mlir::Value gammaRaw = outerMul.getRhs();
-@@ -2687,32 +2696,58 @@ public:
+@@ -2687,32 +2696,48 @@ public:
        return mlir::failure();
      }
  
@@ -24,31 +24,21 @@
 +    auto getLastDimReductionInput = [&](mlir::Value value) -> std::optional<mlir::Value> {
 +      auto checkReduction = [&](auto reductionOp) -> std::optional<mlir::Value> {
 +        auto dimArg = reductionOp.getDimArg();
-+        if (!dimArg || dimArg->size() != 1) {
-+          return std::nullopt;
-+        }
++        if (!dimArg || dimArg->size() != 1) return std::nullopt;
 +        auto inputType = mlir::cast<RankedTensorType>(reductionOp.getInput().getType());
 +        int64_t dim = mlir::cast<mlir::IntegerAttr>((*dimArg)[0]).getInt();
 +        int64_t actualDim = dim < 0 ? inputType.getRank() + dim : dim;
-+        if (actualDim != inputType.getRank() - 1) {
-+          return std::nullopt;
-+        }
++        if (actualDim != inputType.getRank() - 1) return std::nullopt;
 +        return reductionOp.getInput();
 +      };
 +
 +      value = lookThroughSafeOps(value);
-+      if (auto meanOp = value.getDefiningOp<MeanOp>()) {
-+        return checkReduction(meanOp);
-+      }
++      if (auto meanOp = value.getDefiningOp<MeanOp>()) return checkReduction(meanOp);
 +
 +      auto divOp = value.getDefiningOp<DivOp>();
-+      if (!divOp) {
-+        return std::nullopt;
-+      }
++      if (!divOp) return std::nullopt;
 +      auto sumOp = lookThroughSafeOps(divOp.getLhs()).getDefiningOp<SumOp>();
-+      if (!sumOp) {
-+        return std::nullopt;
-+      }
++      if (!sumOp) return std::nullopt;
 +      auto sumInputType = mlir::cast<RankedTensorType>(sumOp.getInput().getType());
 +      if (sumInputType.getRank() == 0 ||
 +          !isFullOpWithValue(lookThroughSafeOps(divOp.getRhs()),
@@ -93,15 +83,13 @@
  
      if (auto sq = meanInput.getDefiningOp<MultiplyOp>()) {
        if (sq.getLhs() == sq.getRhs()) {
-@@ -2726,7 +2757,12 @@ public:
+@@ -2726,7 +2747,10 @@ public:
      }
  
      if (!squareInput || squareInput != x) {
 -      return mlir::failure();
 +      mlir::Value swappedX = dropSubtractZero(gammaRaw);
-+      if (squareInput != swappedX) {
-+        return mlir::failure();
-+      }
++      if (squareInput != swappedX) return mlir::failure();
 +      x = swappedX;
 +      gammaRaw = xRaw;
      }
