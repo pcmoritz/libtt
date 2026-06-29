@@ -95,19 +95,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -15,6 +15,11 @@ namespace mlir::tt::ttnn::fusing {
- namespace {
-
- // ============================================================================
-+ArrayAttr getI32ArrayAttr(OpBuilder &builder, ArrayRef<int64_t> values) {
-+  SmallVector<int32_t> i32Values(values.begin(), values.end());
-+  return builder.getI32ArrayAttr(i32Values);
-+}
-+
- // SplitQueryKeyValueAndSplitHeadsFusing helpers
- // ============================================================================
-
-@@ -572,6 +577,161 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +572,161 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -269,7 +257,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +981,74 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +976,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
@@ -296,11 +284,12 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  SmallVector<int64_t> inputShape = {1, 1, batchSize, hiddenSize};
 +  RankedTensorType inputType =
 +      utils::RankedTensorTypeFactory::create(matmulType, inputShape);
++  SmallVector<int32_t> inputShapeI32(inputShape.begin(), inputShape.end());
 +
 +  rewriter.setInsertionPointAfter(matmulOp);
 +  auto inputReshape = rewriter.create<ReshapeOp>(
 +      matmulOp.getLoc(), inputType, matmulOp.getResult(),
-+      getI32ArrayAttr(rewriter, inputShape));
++      rewriter.getI32ArrayAttr(inputShapeI32));
 +
 +  auto numHeadsAttr =
 +      rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(q)[2]));
