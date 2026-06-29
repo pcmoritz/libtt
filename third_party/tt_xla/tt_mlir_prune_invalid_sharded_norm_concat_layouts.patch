@@ -25,45 +25,22 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/NormalizationRules.cpp b/lib/Dial
  
 +#include "llvm/ADT/STLExtras.h"
 +
-@@ -30,6 +36,27 @@ int64_t inputOperandTileHeight(Operation *op, unsigned operandIdx) {
-   return nc * ht;
- }
- 
-+bool isQwenDecodeHeadRmsNorm(Operation *op) {
-+  if (op->getNumResults() == 0) return false;
-+
-+  auto resultType = mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
-+  if (!resultType || resultType.getRank() != 4) return false;
-+
-+  ArrayRef<int64_t> shape = resultType.getShape();
-+  return shape[0] == 1 && shape[1] == 1 && shape[3] == 128 && (shape[2] == 8 || shape[2] == 32);
-+}
-+
-+TTNNLayoutAttr getSingleCoreHeightShardedLayout(Operation *op) {
-+  auto resultType = mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
-+  if (!resultType) return nullptr;
-+
-+  auto seed = mlir::dyn_cast_or_null<TTNNLayoutAttr>(resultType.getEncoding());
-+  if (!seed) return nullptr;
-+
-+  ttcore::DeviceAttr deviceAttr = ttcore::lookupDevice(op);
-+  return TTNNLayoutAttr::Builder(seed, resultType.getShape()).setBufferType(BufferType::L1).setMemoryLayout(TensorMemoryLayout::HeightSharded).setGridShape({1, 1}).buildWithCanonicalCorePlacement(deviceAttr);
-+}
-+
- } // namespace
- 
- //===----------------------------------------------------------------------===//
-@@ -76,6 +112,36 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -76,6 +91,41 @@ RmsNormRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    };
  }
  
 +OutputHints RmsNormRuleBook::getOutputHints(Operation *op, const std::vector<OpConfig> &legalConfigs) const {
 +  OutputHints result = OpRuleBook::getOutputHints(op, legalConfigs);
 +
-+  if (!isQwenDecodeHeadRmsNorm(op)) return result;
++  if (op->getNumResults() == 0) return result;
++  auto resultType = mlir::dyn_cast<RankedTensorType>(op->getResult(0).getType());
++  if (!resultType || resultType.getRank() != 4) return result;
 +
-+  TTNNLayoutAttr layout = getSingleCoreHeightShardedLayout(op);
-+  if (!layout) return result;
++  ArrayRef<int64_t> shape = resultType.getShape();
++  if (shape[0] != 1 || shape[1] != 1 || shape[3] != 128 || (shape[2] != 8 && shape[2] != 32)) return result;
++
++  auto seed = mlir::dyn_cast_or_null<TTNNLayoutAttr>(resultType.getEncoding()); if (!seed) return result;
++  TTNNLayoutAttr layout = TTNNLayoutAttr::Builder(seed, shape).setBufferType(BufferType::L1).setMemoryLayout(TensorMemoryLayout::HeightSharded).setGridShape({1, 1}).buildWithCanonicalCorePlacement(ttcore::lookupDevice(op));
 +
 +  auto hasOutputLayout = [&](const OpConfig &config) { return config.outputLayout == layout; };
 +  if (llvm::none_of(result.hints, hasOutputLayout)) result.hints.insert(result.hints.begin(), OpConfig(layout));

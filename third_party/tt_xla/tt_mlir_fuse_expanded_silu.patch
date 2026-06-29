@@ -1,6 +1,6 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -532,50 +532,76 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+@@ -532,50 +532,70 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
@@ -8,7 +8,6 @@
 +  static bool isOneValue(mlir::Value value) {
 +    value = ttmlir::utils::lookThrough<TypecastOp, ReshapeOp, BroadcastOp>(value);
 +    if (value.getDefiningOp<OnesOp>() || isFullOpWithValue(value, 1.0f)) return true;
-+
 +    auto constantOp = value.getDefiningOp<ConstantOp>();
 +    auto denseAttr = constantOp ? mlir::dyn_cast<DenseElementsAttr>(constantOp.getValue()) : DenseElementsAttr();
 +    return denseAttr && denseAttr.isSplat() && std::abs(denseAttr.getSplatValue<APFloat>().convertToFloat() - 1.0f) < 1e-6f;
@@ -23,17 +22,13 @@
 +  std::optional<mlir::Value> matchExpandedSigmoidInput(mlir::Value value) const {
 +    auto divOp = ttmlir::utils::lookThrough<TypecastOp>(value).getDefiningOp<DivOp>();
 +    if (!divOp || !divOp->hasOneUse()) return std::nullopt;
-+
 +    if (!isOneValue(ttmlir::utils::lookThrough<TypecastOp>(divOp.getLhs()))) return std::nullopt;
-+
 +    auto addOp = ttmlir::utils::lookThrough<TypecastOp>(divOp.getRhs()).getDefiningOp<AddOp>();
 +    if (!addOp || !addOp->hasOneUse()) return std::nullopt;
-+
 +    mlir::Value lhs = ttmlir::utils::lookThrough<TypecastOp>(addOp.getLhs());
 +    mlir::Value rhs = ttmlir::utils::lookThrough<TypecastOp>(addOp.getRhs());
 +    mlir::Value expValue = isOneValue(lhs) ? rhs : isOneValue(rhs) ? lhs : mlir::Value();
 +    if (!expValue) return std::nullopt;
-+
 +    auto expOp = expValue.getDefiningOp<ExpOp>();
 +    if (!expOp || !expOp->hasOneUse()) return std::nullopt;
 +    auto negOp = ttmlir::utils::lookThrough<TypecastOp>(expOp.getInput()).getDefiningOp<NegOp>();
@@ -61,7 +56,6 @@
 -
 -    if (!sigmoidOp || !sigmoidOp->hasOneUse()) {
 +    std::optional<mlir::Value> siluInput;
-+
 +    if (std::optional<mlir::Value> lhsSigmoidInput = matchSigmoidInput(lhs);
 +        lhsSigmoidInput && *lhsSigmoidInput == rhs) {
 +      siluInput = *lhsSigmoidInput;

@@ -1,13 +1,12 @@
 --- a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
 +++ b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
-@@ -391,6 +391,27 @@
+@@ -391,6 +391,26 @@
    return concatOp.getOperand(0);
  }
  
 +Value reshapeTo(PatternRewriter &rewriter, Location loc, Value value, RankedTensorType type) {
 +  if (mlir::cast<RankedTensorType>(value.getType()) == type) return value;
-+  SmallVector<int32_t> shape(type.getShape().begin(), type.getShape().end());
-+  return rewriter.create<ReshapeOp>(loc, type, value, rewriter.getI32ArrayAttr(shape));
++  return rewriter.create<ReshapeOp>(loc, type, value, rewriter.getI32ArrayAttr(SmallVector<int32_t>(type.getShape().begin(), type.getShape().end())));
 +}
 +
 +ReshapeOp getRank4DecodeReshapeUser(ConcatOp concatOp) {
@@ -28,7 +27,7 @@
  // Replace the anchor op with a ttcore.composite "rotary_embedding" that
  // references a decomposition function.
  // Detects self-concat cos/sin at the IR level (same as TTNN decomposition's
-@@ -455,7 +487,8 @@ void replaceWithRoPEComposite(Operation *anchorOp,
+@@ -455,7 +486,8 @@ void replaceWithRoPEComposite(Operation *anchorOp,
  void replaceWithRoPEComposite(Operation *anchorOp,
                                mlir::PatternRewriter &rewriter, Value xSource,
                                Value cosInput, Value sinInput,
@@ -38,7 +37,7 @@
    auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
    auto cosType = mlir::cast<RankedTensorType>(cosInput.getType());
    auto sinType = mlir::cast<RankedTensorType>(sinInput.getType());
-@@ -484,6 +517,6 @@ void replaceWithRoPEComposite(Operation *anchorOp,
+@@ -484,6 +516,6 @@ void replaceWithRoPEComposite(Operation *anchorOp,
        rewriter.getStringAttr("rotary_embedding"),
        FlatSymbolRefAttr::get(rewriter.getContext(), decompFunc.getName()),
 -      /*composite_attributes=*/nullptr);
@@ -46,7 +45,7 @@
  }
  
  } // namespace
-@@ -537,10 +569,9 @@
+@@ -537,10 +568,9 @@
  
    // Must concat on last dimension with exactly 2 operands.
    auto resultType = mlir::cast<RankedTensorType>(srcOp.getType());
@@ -60,7 +59,7 @@
      return failure();
    }
    if (srcOp.getNumOperands() != 2) {
-@@ -608,8 +639,7 @@
+@@ -608,8 +638,7 @@
    }
  
    // Input must be 4D.
@@ -71,7 +70,7 @@
 -    return failure();
 -  }
  
-@@ -645,14 +675,16 @@
+@@ -645,14 +674,16 @@
    // cos/sin are half-dim. Create concat(half, half) as the composite's
    // cos/sin inputs so that ttnn::RotaryEmbeddingOp promotion can match
    // the expected full-dim shapes. The decomposition body will detect the
@@ -90,26 +89,20 @@
  
    SmallVector<int64_t> cosFullShape(cosHalfType.getShape());
    cosFullShape[lastDim] *= 2;
-@@ -671,8 +705,20 @@
+@@ -671,8 +704,14 @@
        srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
        rewriter.getSI32IntegerAttr(lastDim));
  
 -  replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
 -                           resultType);
-+  if (!rank4Reshape) {
-+    replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
-+                             resultType);
-+    return success();
-+  }
++  if (!rank4Reshape) { replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull, resultType); return success(); }
 +
 +  auto compositeResultType = mlir::cast<RankedTensorType>(rank4Reshape.getType());
 +  Value compositeX = reshapeTo(rewriter, srcOp.getLoc(), xSource, RankedTensorType::get(compositeResultType.getShape(), inputType.getElementType()));
 +  Value compositeCos = reshapeTo(rewriter, srcOp.getLoc(), cosFull, getCacheTypeFor(cosFullType, compositeResultType));
 +  Value compositeSin = reshapeTo(rewriter, srcOp.getLoc(), sinFull, getCacheTypeFor(sinFullType, compositeResultType));
 +  auto compositeAttributes = rewriter.getDictionaryAttr({rewriter.getNamedAttr("token_index", rewriter.getUI32IntegerAttr(0))});
-+  replaceWithRoPEComposite(rank4Reshape.getOperation(), rewriter, compositeX,
-+                           compositeCos, compositeSin, compositeResultType,
-+                           compositeAttributes);
++  replaceWithRoPEComposite(rank4Reshape.getOperation(), rewriter, compositeX, compositeCos, compositeSin, compositeResultType, compositeAttributes);
    return success();
  }
  
