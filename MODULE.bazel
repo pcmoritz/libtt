@@ -278,7 +278,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_single_chip_activation_dtype_lowering.patch",
         "//third_party/tt_xla:tt_mlir_fuse_rank3_rope_decode.patch",
         "//third_party/tt_xla:tt_mlir_qwen_decode_qkv_projection_fusion.patch",
-        "//third_party/tt_xla:tt_mlir_prune_invalid_decode_cache_layouts.patch",
         "//third_party/tt_xla:tt_mlir_kv_cache_dtype_return_types.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
