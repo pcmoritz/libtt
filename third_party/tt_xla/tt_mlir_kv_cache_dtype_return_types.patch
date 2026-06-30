@@ -1,0 +1,34 @@
+--- a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
+@@ -74,2 +74,11 @@
+
++  static bool isKVCacheReturnOperand(func::FuncOp funcOp, Value value) {
++    if (canPropagateDtype(funcOp, value)) return true;
++    Operation *defOp = value.getDefiningOp();
++    return defOp && llvm::TypeSwitch<Operation *, bool>(defOp)
++        .Case<FillCacheOp, UpdateCacheOp, PagedFillCacheOp, PagedUpdateCacheOp>([&](auto cacheOp) {
++          return canPropagateDtype(funcOp, cacheOp.getCache());
++        })
++        .Default(false);
++  }
+   static ttcore::LocalShapeAttr
+@@ -121,15 +134,9 @@
+       for (auto [i, operand] : llvm::enumerate(returnOp.getOperands())) {
+-        newResultTypes[i] = operand.getType();
+-
+-        if (!mlir::isa<BlockArgument>(operand)) {
+-          continue;
+-        }
+-
+-        auto blockArg = mlir::cast<BlockArgument>(operand);
+-        if (!funcOp.getArgAttr(blockArg.getArgNumber(),
+-                               ttcore::g_kvCacheAttrName)) {
++        if (!isKVCacheReturnOperand(funcOp, operand)) {
++          newResultTypes[i] = operand.getType();
+           continue;
+         }
+
+-        // Update local_shape of returned KV cache args to match the new dtype.
++        auto oldType = mlir::cast<RankedTensorType>(operand.getType());
++        newResultTypes[i] = ttnn::utils::RankedTensorTypeFactory::create(oldType, targetDtype);
+         if (auto localShapeAttr =

@@ -1,0 +1,11 @@
+--- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp
+@@ -90,5 +90,5 @@ void SdpaDecodeDeviceOperation::validate_on_program_cache_miss(
+         TT_FATAL(
+-            Q_memcfg.buffer_type() == tt::tt_metal::BufferType::DRAM,
+-            "Q tensor buffer type must be DRAM when not sharded but got {}",
+-            Q_memcfg.buffer_type());
++            Q_memcfg.memory_layout() == TensorMemoryLayout::INTERLEAVED,
++            "Q tensor memory layout must be INTERLEAVED when not sharded but got {}",
++            Q_memcfg.memory_layout());
+     }
