@@ -1,14 +1,14 @@
 --- a/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
-@@ -180 +179,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+@@ -180,1 +179,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
 -  bool sawCCL = false;
-@@ -194 +193,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+@@ -194,1 +193,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
 -      sawCCL |= isCCLOp(user);
 @@ -202,3 +200,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
 -  if (!sawCCL) {
 -    return false;
 -  }
-@@ -212,5 +207,7 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+@@ -212,5 +207,10 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
    }
 -  auto ff2 = mlir::dyn_cast<MatmulOp>(*gate.getResult().getUsers().begin());
 -  if (!ff2 || !matmulReachesResidualAdd(ff2)) {
@@ -16,6 +16,9 @@
 +  Operation *ff2 = *gate.getResult().getUsers().begin();
 +  if (auto ff2Matmul = mlir::dyn_cast<MatmulOp>(ff2)) {
 +    if (!matmulReachesResidualAdd(ff2Matmul)) return false;
-+  } else if (auto ff2Linear = mlir::dyn_cast<LinearOp>(ff2); !ff2Linear || !ff2Linear.getBias() || !isLowerableFloat(getValueDtype(ff2Linear.getBias())) || !isLowerableFloat(getValueDtype(ff2Linear.getResult()))) {
++  } else if (auto ff2Linear = mlir::dyn_cast<LinearOp>(ff2);
++             !ff2Linear || !ff2Linear.getBias() ||
++             !isLowerableFloat(getValueDtype(ff2Linear.getBias())) ||
++             !isLowerableFloat(getValueDtype(ff2Linear.getResult()))) {
 +    return false;
    }

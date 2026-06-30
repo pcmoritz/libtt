@@ -1,17 +1,52 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 --- a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 +++ b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
-@@ -46,2 +46,3 @@ private:
+@@ -46,2 +46,18 @@ private:
 
-+class NLPDecodeQKVProjectionFusing : public mlir::OpRewritePattern<MatmulOp> { public: NLPDecodeQKVProjectionFusing(mlir::MLIRContext *context, const OpValidationConfig &validationConfig = {}) : OpRewritePattern<MatmulOp>(context), validationConfig(validationConfig) {} mlir::LogicalResult matchAndRewrite(MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const override; private: OpValidationConfig validationConfig; };
++class NLPDecodeQKVProjectionFusing
++    : public mlir::OpRewritePattern<MatmulOp> {
++public:
++  NLPDecodeQKVProjectionFusing(
++      mlir::MLIRContext *context,
++      const OpValidationConfig &validationConfig = {})
++      : OpRewritePattern<MatmulOp>(context),
++        validationConfig(validationConfig) {}
++
++  mlir::LogicalResult
++  matchAndRewrite(MatmulOp matmulOp,
++                  mlir::PatternRewriter &rewriter) const override;
++
++private:
++  OpValidationConfig validationConfig;
++};
  // Fuses a SplitQueryKeyValueAndSplitHeadsOp followed by permute [2,0,1,3]
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -1811,2 +1813,4 @@ private:
+@@ -1811,2 +1813,24 @@ private:
    }
-+  static int getQKVProjectionOrder(Operation *op) { std::string loc; llvm::raw_string_ostream(loc) << op->getLoc(); return loc.find("/q_proj/") != std::string::npos ? 0 : loc.find("/k_proj/") != std::string::npos ? 1 : loc.find("/v_proj/") != std::string::npos ? 2 : -1; }
-+  static void sortQKVProjectionCandidates(FusionCandidates &candidates) { if (candidates.ops.size() != 3) return; SmallVector<int, 3> order; for (OpType op : candidates.ops) order.push_back(getQKVProjectionOrder(op.getOperation())); if (!llvm::is_contained(order, 0) || !llvm::is_contained(order, 1) || !llvm::is_contained(order, 2)) return; llvm::sort(candidates.ops, [](OpType lhs, OpType rhs) { return getQKVProjectionOrder(lhs.getOperation()) < getQKVProjectionOrder(rhs.getOperation()); }); candidates.firstTransposeB = candidates.ops.front().getTransposeB(); }
++  static int getQKVProjectionOrder(Operation *op) {
++    std::string loc;
++    llvm::raw_string_ostream(loc) << op->getLoc();
++    return loc.find("/q_proj/") != std::string::npos ? 0
++           : loc.find("/k_proj/") != std::string::npos ? 1
++           : loc.find("/v_proj/") != std::string::npos ? 2
++                                                        : -1;
++  }
++  static void sortQKVProjectionCandidates(FusionCandidates &candidates) {
++    if (candidates.ops.size() != 3) return;
++    SmallVector<int, 3> order;
++    for (OpType op : candidates.ops)
++      order.push_back(getQKVProjectionOrder(op.getOperation()));
++    if (!llvm::is_contained(order, 0) || !llvm::is_contained(order, 1) ||
++        !llvm::is_contained(order, 2))
++      return;
++    llvm::sort(candidates.ops, [](OpType lhs, OpType rhs) {
++      return getQKVProjectionOrder(lhs.getOperation()) <
++             getQKVProjectionOrder(rhs.getOperation());
++    });
++    candidates.firstTransposeB = candidates.ops.front().getTransposeB();
++  }
 
 @@ -1874,4 +1883,5 @@ private:
 
@@ -22,50 +57,147 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -574,2 +574,28 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -574,2 +574,96 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
 
-+struct DecodeQKVHead { SliceStaticOp sliceOp; ReshapeOp headReshapeOp; RMSNormOp rmsNormOp; ReshapeOp decodeReshapeOp; };
++struct DecodeQKVHead {
++  SliceStaticOp sliceOp;
++  ReshapeOp headReshapeOp;
++  RMSNormOp rmsNormOp;
++  ReshapeOp decodeReshapeOp;
++};
 +ArrayRef<int64_t> decodeShape(DecodeQKVHead &head) { return head.decodeReshapeOp.getType().getShape(); }
 +std::optional<DecodeQKVHead> matchDecodeQKVHead(SliceStaticOp sliceOp) {
-+  auto firstReshapeOp = dyn_cast_or_null<ReshapeOp>(lookThroughTypecasts(sliceOp.getResult())); if (!firstReshapeOp) return std::nullopt;
-+  if (firstReshapeOp.getType().getRank() == 4) { ArrayRef<int64_t> sliceShape = sliceOp.getType().getShape(), decodeShape = firstReshapeOp.getType().getShape(); if (sliceShape.size() != 2 || decodeShape[0] != 1 || sliceShape[0] != decodeShape[1] || sliceShape[1] != decodeShape[2] * decodeShape[3]) return std::nullopt; return DecodeQKVHead{sliceOp, ReshapeOp(), nullptr, firstReshapeOp}; }
-+  if (firstReshapeOp.getType().getRank() != 3) { return std::nullopt; } ReshapeOp headReshapeOp = firstReshapeOp;
-+  Operation *next = lookThroughTypecasts(headReshapeOp.getResult()); RMSNormOp rmsNormOp = dyn_cast_or_null<RMSNormOp>(next);
++  auto firstReshapeOp =
++      dyn_cast_or_null<ReshapeOp>(lookThroughTypecasts(sliceOp.getResult()));
++  if (!firstReshapeOp) return std::nullopt;
++  if (firstReshapeOp.getType().getRank() == 4) {
++    ArrayRef<int64_t> sliceShape = sliceOp.getType().getShape(),
++                      decodeShape = firstReshapeOp.getType().getShape();
++    if (sliceShape.size() != 2 || decodeShape[0] != 1 ||
++        sliceShape[0] != decodeShape[1] ||
++        sliceShape[1] != decodeShape[2] * decodeShape[3])
++      return std::nullopt;
++    return DecodeQKVHead{sliceOp, ReshapeOp(), nullptr, firstReshapeOp};
++  }
++  if (firstReshapeOp.getType().getRank() != 3) {
++    return std::nullopt;
++  }
++  ReshapeOp headReshapeOp = firstReshapeOp;
++  Operation *next = lookThroughTypecasts(headReshapeOp.getResult());
++  RMSNormOp rmsNormOp = dyn_cast_or_null<RMSNormOp>(next);
 +  if (rmsNormOp) next = lookThroughTypecasts(rmsNormOp.getResult());
-+  auto decodeReshapeOp = dyn_cast_or_null<ReshapeOp>(next); if (!decodeReshapeOp || decodeReshapeOp.getType().getRank() != 4) { return std::nullopt; }
-+  ArrayRef<int64_t> headShape = headReshapeOp.getType().getShape(), decodeShape = decodeReshapeOp.getType().getShape(); if (decodeShape[0] != 1 || headShape[0] != decodeShape[1] || headShape[1] != decodeShape[2] || headShape[2] != decodeShape[3]) { return std::nullopt; }
++  auto decodeReshapeOp = dyn_cast_or_null<ReshapeOp>(next);
++  if (!decodeReshapeOp || decodeReshapeOp.getType().getRank() != 4) {
++    return std::nullopt;
++  }
++  ArrayRef<int64_t> headShape = headReshapeOp.getType().getShape(),
++                    decodeShape = decodeReshapeOp.getType().getShape();
++  if (decodeShape[0] != 1 || headShape[0] != decodeShape[1] ||
++      headShape[1] != decodeShape[2] || headShape[2] != decodeShape[3]) {
++    return std::nullopt;
++  }
 +  return DecodeQKVHead{sliceOp, headReshapeOp, rmsNormOp, decodeReshapeOp};
 +}
 +std::optional<SmallVector<DecodeQKVHead>> matchDecodeQKVHeads(MatmulOp matmulOp) {
 +  SmallVector<DecodeQKVHead> heads;
-+  auto matmulShape = matmulOp.getType().getShape(); if (matmulShape.size() != 2) return std::nullopt;
-+  for (Operation *user : matmulOp.getResult().getUsers()) if (auto sliceOp = dyn_cast<SliceStaticOp>(user)) if (auto head = matchDecodeQKVHead(sliceOp)) heads.push_back(*head);
-+  if (heads.size() != 3) { return std::nullopt; } SmallVector<std::tuple<int64_t, int64_t, DecodeQKVHead>> sortedHeads;
-+  for (auto &head : heads) { auto dimAndBounds = findSlicedDimensionWithBounds(head.sliceOp, matmulShape); if (!dimAndBounds || std::get<0>(*dimAndBounds) != matmulShape.size() - 1) return std::nullopt; sortedHeads.push_back({std::get<1>(*dimAndBounds), std::get<2>(*dimAndBounds), head}); }
-+  llvm::sort(sortedHeads, [](const auto &lhs, const auto &rhs) { return std::get<0>(lhs) < std::get<0>(rhs); }); SmallVector<DecodeQKVHead> sorted; int64_t previousEnd = 0;
-+  for (auto &[start, end, head] : sortedHeads) { if (start != previousEnd) return std::nullopt; previousEnd = end; sorted.push_back(head); }
-+  if (previousEnd != matmulShape.back()) { return std::nullopt; } DecodeQKVHead &q = sorted[0], &k = sorted[1], &v = sorted[2];
-+  if (!q.rmsNormOp || !k.rmsNormOp || v.rmsNormOp) { return std::nullopt; } if (decodeShape(q)[3] != decodeShape(k)[3] || decodeShape(q)[3] != decodeShape(v)[3] || decodeShape(k)[2] != decodeShape(v)[2]) return std::nullopt;
++  auto matmulShape = matmulOp.getType().getShape();
++  if (matmulShape.size() != 2) return std::nullopt;
++  for (Operation *user : matmulOp.getResult().getUsers())
++    if (auto sliceOp = dyn_cast<SliceStaticOp>(user))
++      if (auto head = matchDecodeQKVHead(sliceOp)) heads.push_back(*head);
++  if (heads.size() != 3) {
++    return std::nullopt;
++  }
++  SmallVector<std::tuple<int64_t, int64_t, DecodeQKVHead>> sortedHeads;
++  for (auto &head : heads) {
++    auto dimAndBounds =
++        findSlicedDimensionWithBounds(head.sliceOp, matmulShape);
++    if (!dimAndBounds ||
++        std::get<0>(*dimAndBounds) != matmulShape.size() - 1)
++      return std::nullopt;
++    sortedHeads.push_back(
++        {std::get<1>(*dimAndBounds), std::get<2>(*dimAndBounds), head});
++  }
++  llvm::sort(sortedHeads, [](const auto &lhs, const auto &rhs) {
++    return std::get<0>(lhs) < std::get<0>(rhs);
++  });
++  SmallVector<DecodeQKVHead> sorted;
++  int64_t previousEnd = 0;
++  for (auto &[start, end, head] : sortedHeads) {
++    if (start != previousEnd) return std::nullopt;
++    previousEnd = end;
++    sorted.push_back(head);
++  }
++  if (previousEnd != matmulShape.back()) {
++    return std::nullopt;
++  }
++  DecodeQKVHead &q = sorted[0], &k = sorted[1], &v = sorted[2];
++  if (!q.rmsNormOp || !k.rmsNormOp || v.rmsNormOp) {
++    return std::nullopt;
++  }
++  if (decodeShape(q)[3] != decodeShape(k)[3] ||
++      decodeShape(q)[3] != decodeShape(v)[3] ||
++      decodeShape(k)[2] != decodeShape(v)[2])
++    return std::nullopt;
 +  return sorted;
 +}
-+RMSNormOp createRank4RMSNorm(PatternRewriter &rewriter, RMSNormOp oldOp, Value input) { return rewriter.create<RMSNormOp>(oldOp.getLoc(), input.getType(), input, oldOp.getWeight(), oldOp.getBias(), oldOp.getEpsilonAttr(), oldOp.getComputeConfigAttr()); }
-+void eraseUnusedDecodeQKVHead(PatternRewriter &rewriter, DecodeQKVHead &head) { for (Operation *op : {head.rmsNormOp.getOperation(), head.headReshapeOp.getOperation(), head.sliceOp.getOperation()}) if (op && op->use_empty()) rewriter.eraseOp(op); }
++RMSNormOp createRank4RMSNorm(PatternRewriter &rewriter, RMSNormOp oldOp,
++                             Value input) {
++  return rewriter.create<RMSNormOp>(
++      oldOp.getLoc(), input.getType(), input, oldOp.getWeight(),
++      oldOp.getBias(), oldOp.getEpsilonAttr(), oldOp.getComputeConfigAttr());
++}
++void eraseUnusedDecodeQKVHead(PatternRewriter &rewriter, DecodeQKVHead &head) {
++  for (Operation *op : {head.rmsNormOp.getOperation(),
++                        head.headReshapeOp.getOperation(),
++                        head.sliceOp.getOperation()})
++    if (op && op->use_empty()) rewriter.eraseOp(op);
++}
  // ============================================================================
-@@ -823,2 +861,18 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -823,2 +861,47 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
-+mlir::LogicalResult NLPDecodeQKVProjectionFusing::matchAndRewrite(MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const {
-+  auto heads = matchDecodeQKVHeads(matmulOp); if (!heads) return mlir::failure();
++mlir::LogicalResult NLPDecodeQKVProjectionFusing::matchAndRewrite(
++    MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const {
++  auto heads = matchDecodeQKVHeads(matmulOp);
++  if (!heads) return mlir::failure();
 +  DecodeQKVHead &q = (*heads)[0], &k = (*heads)[1], &v = (*heads)[2];
-+  ArrayRef<int64_t> matmulShape = matmulOp.getType().getShape(); int64_t batchSize = matmulShape[0], hiddenSize = matmulShape[1];
-+  if (q.decodeReshapeOp.getType().getShape()[1] != batchSize) { return mlir::failure(); } SmallVector<int64_t> inputShape = {1, 1, batchSize, hiddenSize};
-+  RankedTensorType inputType = utils::RankedTensorTypeFactory::create(matmulOp.getType(), inputShape); rewriter.setInsertionPointAfter(matmulOp);
-+  auto inputReshape = rewriter.create<ReshapeOp>(matmulOp.getLoc(), inputType, matmulOp.getResult(), rewriter.getI32ArrayAttr(SmallVector<int32_t>(inputShape.begin(), inputShape.end())));
-+  auto numHeadsAttr = rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(q)[2])), numKVHeadsAttr = rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(k)[2]));
-+  SmallVector<Type> resultTypes{q.decodeReshapeOp.getType(), k.decodeReshapeOp.getType(), v.decodeReshapeOp.getType()}; IsolatedIRValidationWrapper validator(rewriter.getContext(), validationConfig);
-+  if (!validator.validateOp<NLPCreateQKVHeadsDecodeOp>(matmulOp.getOperation(), matmulOp.getLoc(), resultTypes, inputReshape.getResult(), Value(), numHeadsAttr, numKVHeadsAttr, BoolAttr(), IntegerAttr()).isSuccess()) return mlir::failure();
-+  auto decodeOp = rewriter.create<NLPCreateQKVHeadsDecodeOp>(matmulOp.getLoc(), resultTypes, inputReshape.getResult(), Value(), numHeadsAttr, numKVHeadsAttr, BoolAttr(), IntegerAttr());
-+  auto qNorm = createRank4RMSNorm(rewriter, q.rmsNormOp, decodeOp.getQuery()), kNorm = createRank4RMSNorm(rewriter, k.rmsNormOp, decodeOp.getKey());
-+  rewriter.replaceOp(q.decodeReshapeOp, qNorm.getResult()); rewriter.replaceOp(k.decodeReshapeOp, kNorm.getResult()); rewriter.replaceOp(v.decodeReshapeOp, decodeOp.getValue());
++  ArrayRef<int64_t> matmulShape = matmulOp.getType().getShape();
++  int64_t batchSize = matmulShape[0], hiddenSize = matmulShape[1];
++  if (q.decodeReshapeOp.getType().getShape()[1] != batchSize) {
++    return mlir::failure();
++  }
++  SmallVector<int64_t> inputShape = {1, 1, batchSize, hiddenSize};
++  RankedTensorType inputType =
++      utils::RankedTensorTypeFactory::create(matmulOp.getType(), inputShape);
++  rewriter.setInsertionPointAfter(matmulOp);
++  auto inputReshape = rewriter.create<ReshapeOp>(
++      matmulOp.getLoc(), inputType, matmulOp.getResult(),
++      rewriter.getI32ArrayAttr(
++          SmallVector<int32_t>(inputShape.begin(), inputShape.end())));
++  auto numHeadsAttr =
++           rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(q)[2])),
++       numKVHeadsAttr =
++      rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeShape(k)[2]));
++  SmallVector<Type> resultTypes{q.decodeReshapeOp.getType(),
++                                k.decodeReshapeOp.getType(),
++                                v.decodeReshapeOp.getType()};
++  IsolatedIRValidationWrapper validator(rewriter.getContext(),
++                                         validationConfig);
++  if (!validator
++           .validateOp<NLPCreateQKVHeadsDecodeOp>(
++               matmulOp.getOperation(), matmulOp.getLoc(), resultTypes,
++               inputReshape.getResult(), Value(), numHeadsAttr, numKVHeadsAttr,
++               BoolAttr(), IntegerAttr())
++           .isSuccess())
++    return mlir::failure();
++  auto decodeOp = rewriter.create<NLPCreateQKVHeadsDecodeOp>(
++      matmulOp.getLoc(), resultTypes, inputReshape.getResult(), Value(),
++      numHeadsAttr, numKVHeadsAttr, BoolAttr(), IntegerAttr());
++  auto qNorm = createRank4RMSNorm(rewriter, q.rmsNormOp, decodeOp.getQuery()),
++       kNorm = createRank4RMSNorm(rewriter, k.rmsNormOp, decodeOp.getKey());
++  rewriter.replaceOp(q.decodeReshapeOp, qNorm.getResult());
++  rewriter.replaceOp(k.decodeReshapeOp, kNorm.getResult());
++  rewriter.replaceOp(v.decodeReshapeOp, decodeOp.getValue());
 +  for (DecodeQKVHead *head : {&q, &k, &v}) eraseUnusedDecodeQKVHead(rewriter, *head);
 +  return mlir::success();
 +}

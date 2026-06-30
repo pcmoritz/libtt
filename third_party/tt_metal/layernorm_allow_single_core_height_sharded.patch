@@ -18,8 +18,9 @@
 +                (single_core_height_sharded ||
 +                 operation_attributes.output_mem_config.memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED),
              "Sharded inputs require sharded outputs.");
-@@ -306,3 +310,3 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
+@@ -306,3 +310,4 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
                      TT_FATAL(
 -                        a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
-+                        single_core_height_sharded || a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
++                        single_core_height_sharded ||
++                            a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
                          "Height sharded memory layout is not supported, got: {}",

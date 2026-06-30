@@ -1,13 +1,17 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h
 --- a/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h
 +++ b/include/ttmlir/Dialect/TTNN/Analysis/OpRules/TransformerRules.h
-@@ -57,2 +57,3 @@ struct SDPADecodeRuleBook : SDPARuleBook {
+@@ -57,2 +57,5 @@ struct SDPADecodeRuleBook : SDPARuleBook {
 
-+struct NLPCreateQKVHeadsDecodeRuleBook : SDPARuleBook { LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override; };
++struct NLPCreateQKVHeadsDecodeRuleBook : SDPARuleBook {
++  LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
++};
  /// RotaryEmbedding / RotaryEmbeddingLlama:
-@@ -93,4 +96,5 @@ struct PagedFillCacheRuleBook : OpRuleBook {
+@@ -93,4 +96,7 @@ struct PagedFillCacheRuleBook : OpRuleBook {
 
-+struct PagedUpdateCacheRuleBook : OpRuleBook { LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override; };
++struct PagedUpdateCacheRuleBook : OpRuleBook {
++  LayoutFilterFn getInputLayoutFilter(unsigned operandIdx) const override;
++};
  } // namespace mlir::tt::ttnn
 
  #endif // TTMLIR_DIALECT_TTNN_ANALYSIS_OPRULES_TRANSFORMERRULES_H
@@ -23,18 +27,39 @@ diff --git a/lib/Dialect/TTNN/Analysis/OpRules/TransformerRules.cpp b/lib/Dialec
 -    return layout_filter_utils::rejectL1Interleaved;
 +    return nullptr;
    }
-@@ -61,2 +61,3 @@ SDPADecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -61,2 +61,13 @@ SDPADecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
 
-+LayoutFilterFn NLPCreateQKVHeadsDecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const { if (operandIdx != 0) return layout_filter_utils::requireDRAMInterleaved; return [](TTNNLayoutAttr layout) -> bool { auto ml = layout.getMemLayout(); auto shardShape = layout.getScalarShardShape(); return ml && ml.getValue() == TensorMemoryLayout::WidthSharded && shardShape.size() >= 2 && shardShape[1] > 0 && 128 % shardShape[1] == 0; }; }
++LayoutFilterFn
++NLPCreateQKVHeadsDecodeRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
++  if (operandIdx != 0) return layout_filter_utils::requireDRAMInterleaved;
++  return [](TTNNLayoutAttr layout) -> bool {
++    auto ml = layout.getMemLayout();
++    auto shardShape = layout.getScalarShardShape();
++    return ml && ml.getValue() == TensorMemoryLayout::WidthSharded &&
++           shardShape.size() >= 2 && shardShape[1] > 0 &&
++           128 % shardShape[1] == 0;
++  };
++}
  //===----------------------------------------------------------------------===//
-@@ -120,5 +136,7 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
+@@ -120,5 +136,18 @@ PagedFillCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
    }
-+  if (operandIdx == 1 || operandIdx == 2 || operandIdx == 3) return layout_filter_utils::requireDRAMInterleaved;
++  if (operandIdx == 1 || operandIdx == 2 || operandIdx == 3)
++    return layout_filter_utils::requireDRAMInterleaved;
    return nullptr;
  }
 -
 +
-+LayoutFilterFn PagedUpdateCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const { if (operandIdx == 0) return cacheBufferDramOnlyFilter(); if (operandIdx == 1) return [](TTNNLayoutAttr layout) -> bool { auto ml = layout.getMemLayout(); return layout.hasL1BufferType() && ml && ml.getValue() == TensorMemoryLayout::HeightSharded; }; return nullptr; }
++LayoutFilterFn
++PagedUpdateCacheRuleBook::getInputLayoutFilter(unsigned operandIdx) const {
++  if (operandIdx == 0) return cacheBufferDramOnlyFilter();
++  if (operandIdx == 1)
++    return [](TTNNLayoutAttr layout) -> bool {
++      auto ml = layout.getMemLayout();
++      return layout.hasL1BufferType() && ml &&
++             ml.getValue() == TensorMemoryLayout::HeightSharded;
++    };
++  return nullptr;
++}
  } // namespace mlir::tt::ttnn
 diff --git a/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp b/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp
 --- a/lib/Dialect/TTNN/Analysis/OpRules/OpRuleBook.cpp

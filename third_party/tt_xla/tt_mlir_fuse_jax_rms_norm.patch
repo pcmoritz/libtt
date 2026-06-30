@@ -1,17 +1,31 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -2659,2 +2659,3 @@ public:
+@@ -2659,2 +2659,11 @@ public:
 
-+    auto dropSubtractZero = [&](mlir::Value value) { value = lookThroughSafeOps(value); auto subtract = value.getDefiningOp<SubtractOp>(); return subtract && isFullOpWithValue(lookThroughSafeOps(subtract.getRhs()), 0.0f) ? lookThroughSafeOps(subtract.getLhs()) : value; };
++    auto dropSubtractZero = [&](mlir::Value value) {
++      value = lookThroughSafeOps(value);
++      auto subtract = value.getDefiningOp<SubtractOp>();
++      return subtract &&
++                     isFullOpWithValue(lookThroughSafeOps(subtract.getRhs()),
++                                       0.0f)
++                 ? lookThroughSafeOps(subtract.getLhs())
++                 : value;
++    };
      MultiplyOp innerMul =
-@@ -2689,28 +2690,28 @@ public:
+@@ -2689,28 +2690,41 @@ public:
 
 -    MeanOp meanOp = addOp.getLhs().getDefiningOp<MeanOp>();
 +    auto getLastDimReductionInput = [&](mlir::Value value) -> std::optional<mlir::Value> {
 +      auto checkReduction = [&](auto reductionOp) -> std::optional<mlir::Value> {
-+        auto dimArg = reductionOp.getDimArg(); if (!dimArg || dimArg->size() != 1) return std::nullopt;
-+        auto inputType = mlir::cast<RankedTensorType>(reductionOp.getInput().getType()); int64_t dim = mlir::cast<mlir::IntegerAttr>((*dimArg)[0]).getInt();
-+        return (dim < 0 ? inputType.getRank() + dim : dim) == inputType.getRank() - 1 ? std::optional<mlir::Value>(reductionOp.getInput()) : std::nullopt;
++        auto dimArg = reductionOp.getDimArg();
++        if (!dimArg || dimArg->size() != 1) return std::nullopt;
++        auto inputType =
++            mlir::cast<RankedTensorType>(reductionOp.getInput().getType());
++        int64_t dim = mlir::cast<mlir::IntegerAttr>((*dimArg)[0]).getInt();
++        return (dim < 0 ? inputType.getRank() + dim : dim) ==
++                       inputType.getRank() - 1
++                   ? std::optional<mlir::Value>(reductionOp.getInput())
++                   : std::nullopt;
 +      };
 +      value = lookThroughSafeOps(value);
 +      if (auto meanOp = value.getDefiningOp<MeanOp>()) return checkReduction(meanOp);
@@ -20,13 +34,20 @@
 +      auto sumOp = lookThroughSafeOps(divOp.getLhs()).getDefiningOp<SumOp>();
 +      if (!sumOp) return std::nullopt;
 +      auto sumInputType = mlir::cast<RankedTensorType>(sumOp.getInput().getType());
-+      return sumInputType.getRank() != 0 && isFullOpWithValue(lookThroughSafeOps(divOp.getRhs()), static_cast<float>(sumInputType.getShape().back()), 1e-3f) ? checkReduction(sumOp) : std::nullopt;
++      return sumInputType.getRank() != 0 &&
++                     isFullOpWithValue(
++                         lookThroughSafeOps(divOp.getRhs()),
++                         static_cast<float>(sumInputType.getShape().back()),
++                         1e-3f)
++                 ? checkReduction(sumOp)
++                 : std::nullopt;
 +    };
 +    std::optional<mlir::Value> reductionInput = getLastDimReductionInput(addOp.getLhs());
      mlir::Value epsilon = addOp.getRhs();
 -    if (!meanOp) {
 -      meanOp = addOp.getRhs().getDefiningOp<MeanOp>();
-+    if (!reductionInput) { reductionInput = getLastDimReductionInput(addOp.getRhs());
++    if (!reductionInput) {
++      reductionInput = getLastDimReductionInput(addOp.getRhs());
        epsilon = addOp.getLhs();
      }
 -    if (!meanOp) {
@@ -53,8 +74,13 @@
 -    mlir::Value x = lookThroughSafeOps(xRaw);
 +    mlir::Value x = dropSubtractZero(xRaw);
 
-@@ -2728,3 +2732,3 @@ public:
+@@ -2728,3 +2732,8 @@ public:
      if (!squareInput || squareInput != x) {
 -      return mlir::failure();
-+      mlir::Value swappedX = dropSubtractZero(gammaRaw); if (squareInput != swappedX) { return mlir::failure(); } x = swappedX; gammaRaw = xRaw;
++      mlir::Value swappedX = dropSubtractZero(gammaRaw);
++      if (squareInput != swappedX) {
++        return mlir::failure();
++      }
++      x = swappedX;
++      gammaRaw = xRaw;
      }
