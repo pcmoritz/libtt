@@ -272,7 +272,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_ttnn_only_runtime_paths.patch",
         "//third_party/tt_xla:tt_mlir_strip_sharding_constraints.patch",
         "//third_party/tt_xla:tt_mlir_fast_is_sharded_module.patch",
-        "//third_party/tt_xla:tt_mlir_keep_model_state_vectors_tiled.patch",
         "//third_party/tt_xla:tt_mlir_fuse_jax_rms_norm.patch",
         "//third_party/tt_xla:tt_mlir_lower_silu_call.patch",
         "//third_party/tt_xla:tt_mlir_single_chip_activation_dtype_lowering.patch",
