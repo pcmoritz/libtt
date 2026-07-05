@@ -1,0 +1,20 @@
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
+@@ -36,2 +37,14 @@ namespace mlir::tt::ttir {
+
++class SiluCallConversionPattern : public OpRewritePattern<mlir::func::CallOp> {
++  using OpRewritePattern<mlir::func::CallOp>::OpRewritePattern;
++public:
++  LogicalResult matchAndRewrite(mlir::func::CallOp srcOp, PatternRewriter &rewriter) const override {
++    if (srcOp.getCallee() != "silu" || srcOp.getNumOperands() != 1 || srcOp.getNumResults() != 1) return failure();
++    auto outputType = mlir::dyn_cast<RankedTensorType>(srcOp.getResult(0).getType());
++    if (!outputType) return failure();
++    rewriter.replaceOpWithNewOp<ttir::SiluOp>(srcOp, outputType, srcOp.getOperand(0));
++    return success();
++  }
++};
+ template <typename TargetOp>
+@@ -1083,2 +1100,3 @@ createLegalizeStableHLOCompositeToTTIRPass() {
+     MLIRContext *context, RewritePatternSet &patterns) {
++  patterns.add<SiluCallConversionPattern>(context);
+   patterns.add<StableHLOToTTIRCompositeOpConversionPattern<ttir::GeluOp>>(
