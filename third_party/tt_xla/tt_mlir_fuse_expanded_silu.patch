@@ -1,0 +1,111 @@
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -14,6 +14,7 @@
+ #include "mlir/IR/Attributes.h"
+ #include "mlir/IR/BuiltinAttributes.h"
+ #include "mlir/IR/BuiltinTypes.h"
++#include "mlir/IR/Matchers.h"
+ #include "mlir/IR/Operation.h"
+ #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+ #include "llvm/ADT/SmallSet.h"
+@@ -532,6 +532,58 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+   using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
+ 
++  static mlir::Value lookThroughSplatViewOps(mlir::Value value) {
++    while (Operation *op = value.getDefiningOp()) {
++      if (auto typecastOp = mlir::dyn_cast<TypecastOp>(op)) {
++        value = typecastOp.getInput();
++        continue;
++      }
++      if (auto reshapeOp = mlir::dyn_cast<ReshapeOp>(op)) {
++        value = reshapeOp.getInput();
++        continue;
++      }
++      if (auto broadcastOp = mlir::dyn_cast<BroadcastOp>(op)) {
++        value = broadcastOp.getInput();
++        continue;
++      }
++      break;
++    }
++    return value;
++  }
++
++  static bool isOneLike(mlir::Value value) {
++    value = lookThroughSplatViewOps(value);
++    return isFullOpWithValue(value, 1.0f) ||
++           mlir::isa_and_nonnull<OnesOp>(value.getDefiningOp()) ||
++           mlir::matchPattern(value, mlir::m_OneFloat()) ||
++           mlir::matchPattern(value, mlir::m_One());
++  }
++
++  static mlir::Value matchExpandedSigmoidInput(mlir::Value value) {
++    auto divOp = lookThroughSplatViewOps(value).getDefiningOp<DivOp>();
++    if (!divOp || !isOneLike(divOp.getLhs())) {
++      return {};
++    }
++    auto addOp = lookThroughSplatViewOps(divOp.getRhs()).getDefiningOp<AddOp>();
++    if (!addOp) {
++      return {};
++    }
++    mlir::Value expValue;
++    if (isOneLike(addOp.getLhs())) {
++      expValue = addOp.getRhs();
++    } else if (isOneLike(addOp.getRhs())) {
++      expValue = addOp.getLhs();
++    } else {
++      return {};
++    }
++    auto expOp = lookThroughSplatViewOps(expValue).getDefiningOp<ExpOp>();
++    auto negOp = expOp ? lookThroughSplatViewOps(expOp.getInput())
++                             .getDefiningOp<NegOp>()
++                       : nullptr;
++    return negOp ? ttmlir::utils::lookThrough<TypecastOp>(negOp.getInput())
++                 : mlir::Value();
++  }
++
+ public:
+   mlir::LogicalResult
+   matchAndRewrite(MultiplyOp multiplyOp,
+@@ -543,21 +595,23 @@ public:
+ 
+-    SigmoidOp sigmoidOp = nullptr;
+-    mlir::Value otherOperand;
+-
+-    if (auto lhsSigmoid = lhs.getDefiningOp<SigmoidOp>()) {
+-      sigmoidOp = lhsSigmoid;
+-      otherOperand = rhs;
+-    } else if (auto rhsSigmoid = rhs.getDefiningOp<SigmoidOp>()) {
+-      sigmoidOp = rhsSigmoid;
+-      otherOperand = lhs;
+-    }
+-
+-    if (!sigmoidOp || !sigmoidOp->hasOneUse()) {
+-      return mlir::failure();
+-    }
+-
++    mlir::Value sigmoidInput;
++    mlir::Value otherOperand;
++
++    if (auto sigmoidOp = lhs.getDefiningOp<SigmoidOp>();
++        sigmoidOp && sigmoidOp->hasOneUse()) {
++      sigmoidInput =
++          ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput());
++      otherOperand = rhs;
++    } else if (auto sigmoidOp = rhs.getDefiningOp<SigmoidOp>();
++               sigmoidOp && sigmoidOp->hasOneUse()) {
++      sigmoidInput =
++          ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput());
++      otherOperand = lhs;
++    } else if ((sigmoidInput = matchExpandedSigmoidInput(lhs))) {
++      otherOperand = rhs;
++    } else if ((sigmoidInput = matchExpandedSigmoidInput(rhs))) {
++      otherOperand = lhs;
++    }
++
+-    mlir::Value sigmoidInput =
+-        ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput());
+-    if (sigmoidInput != otherOperand) {
++    if (!sigmoidInput || sigmoidInput != otherOperand) {
+       return mlir::failure();
+     }
