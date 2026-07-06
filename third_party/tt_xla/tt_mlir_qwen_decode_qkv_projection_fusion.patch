@@ -37,10 +37,61 @@ diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPattern
  // Fuses a SplitQueryKeyValueAndSplitHeadsOp followed by permute [2,0,1,3]
  // on all three outputs into a single NLPCreateQKVHeadsDecodeOp, which is
  // optimized for the decode case (S=1).
+diff --git a/include/ttmlir/Utils.h b/include/ttmlir/Utils.h
+--- a/include/ttmlir/Utils.h
++++ b/include/ttmlir/Utils.h
+@@ -41,6 +41,45 @@ enum InputDimensions {
+ enum OutputDimensions { OUTPUT_BATCH = 0, OUTPUT_SEQ = 1, OUTPUT_HIDDEN = 2 };
+ } // namespace transformer
+-
+-template <typename T>
++
++enum class QKVProjectionRole {
++  Unknown = -1,
++  Query = 0,
++  Key = 1,
++  Value = 2,
++};
++
++inline QKVProjectionRole getQKVProjectionRole(mlir::Operation *op) {
++  auto checkName = [](mlir::NameLoc nameLoc) {
++    llvm::StringRef name = nameLoc.getName().strref();
++    if (name.contains("/q_proj/")) {
++      return QKVProjectionRole::Query;
++    }
++    if (name.contains("/k_proj/")) {
++      return QKVProjectionRole::Key;
++    }
++    if (name.contains("/v_proj/")) {
++      return QKVProjectionRole::Value;
++    }
++    return QKVProjectionRole::Unknown;
++  };
++
++  mlir::Location loc = op->getLoc();
++  if (auto nameLoc = mlir::dyn_cast<mlir::NameLoc>(loc)) {
++    return checkName(nameLoc);
++  }
++  if (auto fusedLoc = mlir::dyn_cast<mlir::FusedLoc>(loc)) {
++    for (mlir::Location childLoc : fusedLoc.getLocations()) {
++      if (auto nameLoc = mlir::dyn_cast<mlir::NameLoc>(childLoc)) {
++        QKVProjectionRole role = checkName(nameLoc);
++        if (role != QKVProjectionRole::Unknown) {
++          return role;
++        }
++      }
++    }
++  }
++  return QKVProjectionRole::Unknown;
++}
++
++template <typename T>
+ T alignUp(const T val, const T alignment) {
+   assert(val >= 0 && alignment > 0);
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -1809,6 +1809,63 @@ private:
+@@ -1809,6 +1809,35 @@ private:
      return rewriter.create<ConcatOp>(loc, concatType, biases,
                                       rewriter.getSI32IntegerAttr(concatDim));
    }
@@ -50,35 +101,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +  // reason about a lifted constant in a nonstandard order. Preserve the
 +  // projection order encoded in locations when all three are present.
 +  static int getQKVProjectionOrder(Operation *op) {
-+    auto checkName = [](NameLoc nameLoc) {
-+      llvm::StringRef name = nameLoc.getName().strref();
-+      if (name.contains("/q_proj/")) {
-+        return 0;
-+      }
-+      if (name.contains("/k_proj/")) {
-+        return 1;
-+      }
-+      if (name.contains("/v_proj/")) {
-+        return 2;
-+      }
-+      return -1;
-+    };
-+
-+    Location loc = op->getLoc();
-+    if (auto nameLoc = mlir::dyn_cast<NameLoc>(loc)) {
-+      return checkName(nameLoc);
-+    }
-+    if (auto fusedLoc = mlir::dyn_cast<FusedLoc>(loc)) {
-+      for (Location childLoc : fusedLoc.getLocations()) {
-+        if (auto nameLoc = mlir::dyn_cast<NameLoc>(childLoc)) {
-+          int order = checkName(nameLoc);
-+          if (order != -1) {
-+            return order;
-+          }
-+        }
-+      }
-+    }
-+    return -1;
++    return static_cast<int>(ttmlir::utils::getQKVProjectionRole(op));
 +  }
 +
 +  static void sortQKVProjectionCandidates(FusionCandidates &candidates) {
@@ -116,14 +139,15 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -5,5 +5,6 @@
+@@ -5,5 +5,7 @@
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h"
 
 +#include "ttmlir/Conversion/TTIRToTTNN/Utils.h"
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
  #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
++#include "ttmlir/Utils.h"
 
-@@ -572,6 +573,206 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +573,170 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -148,45 +172,6 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  return mlir::cast<RankedTensorType>(
 +             head.decodeReshapeOp.getResult().getType())
 +      .getShape()[3];
-+}
-+
-+enum class QKVProjectionRole {
-+  Unknown = -1,
-+  Query = 0,
-+  Key = 1,
-+  Value = 2,
-+};
-+
-+QKVProjectionRole getQKVProjectionRole(Operation *op) {
-+  auto checkName = [](NameLoc nameLoc) {
-+    llvm::StringRef name = nameLoc.getName().strref();
-+    if (name.contains("/q_proj/")) {
-+      return QKVProjectionRole::Query;
-+    }
-+    if (name.contains("/k_proj/")) {
-+      return QKVProjectionRole::Key;
-+    }
-+    if (name.contains("/v_proj/")) {
-+      return QKVProjectionRole::Value;
-+    }
-+    return QKVProjectionRole::Unknown;
-+  };
-+
-+  Location loc = op->getLoc();
-+  if (auto nameLoc = mlir::dyn_cast<NameLoc>(loc)) {
-+    return checkName(nameLoc);
-+  }
-+  if (auto fusedLoc = mlir::dyn_cast<FusedLoc>(loc)) {
-+    for (Location childLoc : fusedLoc.getLocations()) {
-+      if (auto nameLoc = mlir::dyn_cast<NameLoc>(childLoc)) {
-+        QKVProjectionRole role = checkName(nameLoc);
-+        if (role != QKVProjectionRole::Unknown) {
-+          return role;
-+        }
-+      }
-+    }
-+  }
-+  return QKVProjectionRole::Unknown;
 +}
 +
 +std::optional<DecodeQKVHead> matchDecodeQKVHead(SliceStaticOp sliceOp) {
@@ -303,6 +288,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  // TTIR shared-projection fusion sorts Qwen Q/K/V projections by location.
 +  // Verify that invariant here as well: if the location heuristic did not fire,
 +  // offset order alone is not enough to distinguish Q from K safely.
++  using ttmlir::utils::QKVProjectionRole;
++  using ttmlir::utils::getQKVProjectionRole;
 +  if (getQKVProjectionRole(q.sliceOp) != QKVProjectionRole::Query ||
 +      getQKVProjectionRole(k.sliceOp) != QKVProjectionRole::Key ||
 +      getQKVProjectionRole(v.sliceOp) != QKVProjectionRole::Value) {
