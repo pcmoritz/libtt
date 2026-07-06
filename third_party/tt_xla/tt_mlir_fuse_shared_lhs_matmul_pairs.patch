@@ -1,0 +1,11 @@
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -1688,7 +1688,7 @@
+     bool allSameTransposeB = true;
+     bool firstTransposeB = false;
+ 
+-    bool isValid() const { return ops.size() >= 3; }
++    bool isValid() const { return ops.size() >= 2; }
+ 
+     bool getTargetTransposeB() const {
+       return allSameTransposeB ? firstTransposeB : false;
