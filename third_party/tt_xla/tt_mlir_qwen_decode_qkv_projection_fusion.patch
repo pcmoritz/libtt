@@ -123,7 +123,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
  #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
 
-@@ -572,6 +573,163 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +573,206 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -148,6 +148,45 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  return mlir::cast<RankedTensorType>(
 +             head.decodeReshapeOp.getResult().getType())
 +      .getShape()[3];
++}
++
++enum class QKVProjectionRole {
++  Unknown = -1,
++  Query = 0,
++  Key = 1,
++  Value = 2,
++};
++
++QKVProjectionRole getQKVProjectionRole(Operation *op) {
++  auto checkName = [](NameLoc nameLoc) {
++    llvm::StringRef name = nameLoc.getName().strref();
++    if (name.contains("/q_proj/")) {
++      return QKVProjectionRole::Query;
++    }
++    if (name.contains("/k_proj/")) {
++      return QKVProjectionRole::Key;
++    }
++    if (name.contains("/v_proj/")) {
++      return QKVProjectionRole::Value;
++    }
++    return QKVProjectionRole::Unknown;
++  };
++
++  Location loc = op->getLoc();
++  if (auto nameLoc = mlir::dyn_cast<NameLoc>(loc)) {
++    return checkName(nameLoc);
++  }
++  if (auto fusedLoc = mlir::dyn_cast<FusedLoc>(loc)) {
++    for (Location childLoc : fusedLoc.getLocations()) {
++      if (auto nameLoc = mlir::dyn_cast<NameLoc>(childLoc)) {
++        QKVProjectionRole role = checkName(nameLoc);
++        if (role != QKVProjectionRole::Unknown) {
++          return role;
++        }
++      }
++    }
++  }
++  return QKVProjectionRole::Unknown;
 +}
 +
 +std::optional<DecodeQKVHead> matchDecodeQKVHead(SliceStaticOp sliceOp) {
@@ -258,13 +297,17 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    return {};
 +  }
 +
-+  // TTIR shared-projection fusion sorts Qwen Q/K/V projections by location, so
-+  // the fused projection is in Q,K,V slice order by the time this pattern runs.
-+  // Avoid forward role tracing here; greedy TTNN fusing may visit this matmul
-+  // before downstream SDPA/cache-update patterns have materialized.
 +  DecodeQKVHead &q = sorted[0];
 +  DecodeQKVHead &k = sorted[1];
 +  DecodeQKVHead &v = sorted[2];
++  // TTIR shared-projection fusion sorts Qwen Q/K/V projections by location.
++  // Verify that invariant here as well: if the location heuristic did not fire,
++  // offset order alone is not enough to distinguish Q from K safely.
++  if (getQKVProjectionRole(q.sliceOp) != QKVProjectionRole::Query ||
++      getQKVProjectionRole(k.sliceOp) != QKVProjectionRole::Key ||
++      getQKVProjectionRole(v.sliceOp) != QKVProjectionRole::Value) {
++    return {};
++  }
 +  if (!q.rmsNormOp || !k.rmsNormOp || v.rmsNormOp) {
 +    return {};
 +  }
@@ -287,7 +330,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +979,66 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +1022,66 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
