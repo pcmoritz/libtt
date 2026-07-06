@@ -8,11 +8,11 @@
  #include "mlir/IR/Operation.h"
  #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
  #include "llvm/ADT/SmallSet.h"
-@@ -532,6 +532,58 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+@@ -532,6 +532,59 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
-+  static mlir::Value lookThroughSplatViewOps(mlir::Value value) {
++  static mlir::Value lookThroughSplatConstantViewOps(mlir::Value value) {
 +    while (Operation *op = value.getDefiningOp()) {
 +      if (auto typecastOp = mlir::dyn_cast<TypecastOp>(op)) {
 +        value = typecastOp.getInput();
@@ -32,16 +32,18 @@
 +  }
 +
 +  static bool isOneLike(mlir::Value value) {
-+    return mlir::matchPattern(lookThroughSplatViewOps(value),
++    return mlir::matchPattern(lookThroughSplatConstantViewOps(value),
 +                              mlir::m_OneFloat());
 +  }
 +
 +  static mlir::Value matchExpandedSigmoidInput(mlir::Value value) {
-+    auto divOp = lookThroughSplatViewOps(value).getDefiningOp<DivOp>();
++    auto divOp =
++        ttmlir::utils::lookThrough<TypecastOp>(value).getDefiningOp<DivOp>();
 +    if (!divOp || !isOneLike(divOp.getLhs())) {
 +      return {};
 +    }
-+    auto addOp = lookThroughSplatViewOps(divOp.getRhs()).getDefiningOp<AddOp>();
++    auto addOp = ttmlir::utils::lookThrough<TypecastOp>(divOp.getRhs())
++                     .getDefiningOp<AddOp>();
 +    if (!addOp) {
 +      return {};
 +    }
@@ -53,10 +55,12 @@
 +    } else {
 +      return {};
 +    }
-+    auto expOp = lookThroughSplatViewOps(expValue).getDefiningOp<ExpOp>();
-+    auto negOp = expOp ? lookThroughSplatViewOps(expOp.getInput())
-+                             .getDefiningOp<NegOp>()
-+                       : nullptr;
++    auto expOp = ttmlir::utils::lookThrough<TypecastOp>(expValue)
++                     .getDefiningOp<ExpOp>();
++    auto negOp =
++        expOp ? ttmlir::utils::lookThrough<TypecastOp>(expOp.getInput())
++                    .getDefiningOp<NegOp>()
++              : nullptr;
 +    return negOp ? ttmlir::utils::lookThrough<TypecastOp>(negOp.getInput())
 +                 : mlir::Value();
 +  }
@@ -64,7 +68,7 @@
  public:
    mlir::LogicalResult
    matchAndRewrite(MultiplyOp multiplyOp,
-@@ -543,21 +595,23 @@ public:
+@@ -543,21 +596,19 @@ public:
  
 -    SigmoidOp sigmoidOp = nullptr;
 -    mlir::Value otherOperand;
@@ -81,22 +85,18 @@
 -      return mlir::failure();
 -    }
 -
-+    mlir::Value sigmoidInput;
-+    mlir::Value otherOperand;
++    auto matchSigmoidLike = [](mlir::Value value) -> mlir::Value {
++      if (auto sigmoidOp = value.getDefiningOp<SigmoidOp>();
++          sigmoidOp && sigmoidOp->hasOneUse()) {
++        return ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput());
++      }
++      return matchExpandedSigmoidInput(value);
++    };
 +
-+    if (auto sigmoidOp = lhs.getDefiningOp<SigmoidOp>();
-+        sigmoidOp && sigmoidOp->hasOneUse()) {
-+      sigmoidInput =
-+          ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput());
-+      otherOperand = rhs;
-+    } else if (auto sigmoidOp = rhs.getDefiningOp<SigmoidOp>();
-+               sigmoidOp && sigmoidOp->hasOneUse()) {
-+      sigmoidInput =
-+          ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput());
-+      otherOperand = lhs;
-+    } else if ((sigmoidInput = matchExpandedSigmoidInput(lhs))) {
-+      otherOperand = rhs;
-+    } else if ((sigmoidInput = matchExpandedSigmoidInput(rhs))) {
++    mlir::Value sigmoidInput = matchSigmoidLike(lhs);
++    mlir::Value otherOperand = rhs;
++    if (!sigmoidInput) {
++      sigmoidInput = matchSigmoidLike(rhs);
 +      otherOperand = lhs;
 +    }
 +
