@@ -113,23 +113,14 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -15,6 +15,15 @@ namespace mlir::tt::ttnn::fusing {
- namespace {
+@@ -5,5 +5,6 @@
+ #include "ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h"
 
- // ============================================================================
-+// Common helpers
-+// ============================================================================
-+
-+ArrayAttr getI32ArrayAttr(OpBuilder &builder, ArrayRef<int64_t> values) {
-+  SmallVector<int32_t> i32Values(values.begin(), values.end());
-+  return builder.getI32ArrayAttr(i32Values);
-+}
-+
-+// ============================================================================
- // SplitQueryKeyValueAndSplitHeadsFusing helpers
- // ============================================================================
++#include "ttmlir/Conversion/TTIRToTTNN/Utils.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+ #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
 
-@@ -572,6 +581,177 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +573,164 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -291,23 +282,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +      oldOp.getBias(), oldOp.getEpsilonAttr(), oldOp.getComputeConfigAttr());
 +}
 +
-+void eraseUnusedDecodeQKVHead(PatternRewriter &rewriter,
-+                              DecodeQKVHead &head) {
-+  if (head.rmsNormOp && head.rmsNormOp->use_empty()) {
-+    rewriter.eraseOp(head.rmsNormOp);
-+  }
-+  if (head.headReshapeOp && head.headReshapeOp->use_empty()) {
-+    rewriter.eraseOp(head.headReshapeOp);
-+  }
-+  if (head.sliceOp && head.sliceOp->use_empty()) {
-+    rewriter.eraseOp(head.sliceOp);
-+  }
-+}
-+
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +1001,75 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +980,67 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
@@ -324,8 +302,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  DecodeQKVHead &k = (*heads)[1];
 +  DecodeQKVHead &v = (*heads)[2];
 +
-+  auto matmulType = matmulOp.getType();
-+  ArrayRef<int64_t> matmulShape = matmulType.getShape();
++  ArrayRef<int64_t> matmulShape = matmulOp.getType().getShape();
 +  int64_t batchSize = matmulShape[0];
 +  int64_t hiddenSize = matmulShape[1];
 +  if (q.decodeReshapeOp.getType().getShape()[1] != batchSize) {
@@ -333,13 +310,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  }
 +
 +  SmallVector<int64_t> inputShape = {1, 1, batchSize, hiddenSize};
-+  RankedTensorType inputType =
-+      utils::RankedTensorTypeFactory::create(matmulType, inputShape);
-+
 +  rewriter.setInsertionPointAfter(matmulOp);
-+  auto inputReshape = rewriter.create<ReshapeOp>(
-+      matmulOp.getLoc(), inputType, matmulOp.getResult(),
-+      getI32ArrayAttr(rewriter, inputShape));
++  auto inputReshape = ttir_to_ttnn::utils::generateReshape(
++      matmulOp.getResult(), inputShape, rewriter, matmulOp.getLoc());
 +
 +  auto numHeadsAttr =
 +      rewriter.getUI32IntegerAttr(static_cast<uint32_t>(decodeNumHeads(q)));
@@ -358,6 +331,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +      /*overlap_qk_coregrid=*/BoolAttr(),
 +      /*slice_size=*/IntegerAttr());
 +  if (!validationResult.isSuccess()) {
++    rewriter.eraseOp(inputReshape);
 +    return mlir::failure();
 +  }
 +
@@ -373,10 +347,6 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  rewriter.replaceOp(q.decodeReshapeOp, qNorm.getResult());
 +  rewriter.replaceOp(k.decodeReshapeOp, kNorm.getResult());
 +  rewriter.replaceOp(v.decodeReshapeOp, decodeOp.getValue());
-+
-+  eraseUnusedDecodeQKVHead(rewriter, q);
-+  eraseUnusedDecodeQKVHead(rewriter, k);
-+  eraseUnusedDecodeQKVHead(rewriter, v);
 +
 +  return mlir::success();
 +}
