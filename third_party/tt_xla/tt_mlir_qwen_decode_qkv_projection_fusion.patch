@@ -40,18 +40,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPattern
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -19,8 +19,10 @@
- #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
- #include "llvm/ADT/SmallSet.h"
- #include "llvm/ADT/TypeSwitch.h"
-+#include "llvm/Support/raw_ostream.h"
- #include <cstdint>
-
-+#include <string>
- #include <type_traits>
-
- namespace mlir::tt::ttir {
-@@ -1809,6 +1811,49 @@ private:
+@@ -1809,6 +1809,63 @@ private:
      return rewriter.create<ConcatOp>(loc, concatType, biases,
                                       rewriter.getSI32IntegerAttr(concatDim));
    }
@@ -61,19 +50,33 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +  // reason about a lifted constant in a nonstandard order. Preserve the
 +  // projection order encoded in locations when all three are present.
 +  static int getQKVProjectionOrder(Operation *op) {
-+    std::string loc;
-+    llvm::raw_string_ostream os(loc);
-+    op->getLoc().print(os);
-+    os.flush();
++    auto checkName = [](NameLoc nameLoc) {
++      llvm::StringRef name = nameLoc.getName().strref();
++      if (name.contains("/q_proj/")) {
++        return 0;
++      }
++      if (name.contains("/k_proj/")) {
++        return 1;
++      }
++      if (name.contains("/v_proj/")) {
++        return 2;
++      }
++      return -1;
++    };
 +
-+    if (loc.find("/q_proj/") != std::string::npos) {
-+      return 0;
++    Location loc = op->getLoc();
++    if (auto nameLoc = mlir::dyn_cast<NameLoc>(loc)) {
++      return checkName(nameLoc);
 +    }
-+    if (loc.find("/k_proj/") != std::string::npos) {
-+      return 1;
-+    }
-+    if (loc.find("/v_proj/") != std::string::npos) {
-+      return 2;
++    if (auto fusedLoc = mlir::dyn_cast<FusedLoc>(loc)) {
++      for (Location childLoc : fusedLoc.getLocations()) {
++        if (auto nameLoc = mlir::dyn_cast<NameLoc>(childLoc)) {
++          int order = checkName(nameLoc);
++          if (order != -1) {
++            return order;
++          }
++        }
++      }
 +    }
 +    return -1;
 +  }
@@ -101,7 +104,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 
    // Collect all ops that share the same LHS operand and are compatible
    // for fusion.
-@@ -1872,6 +1917,8 @@ private:
+@@ -1872,6 +1929,8 @@ private:
        }
      }
 
