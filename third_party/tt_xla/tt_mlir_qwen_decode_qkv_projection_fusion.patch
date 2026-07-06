@@ -91,7 +91,7 @@ diff --git a/include/ttmlir/Utils.h b/include/ttmlir/Utils.h
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -1809,6 +1809,35 @@ private:
+@@ -1809,6 +1809,36 @@ private:
      return rewriter.create<ConcatOp>(loc, concatType, biases,
                                       rewriter.getSI32IntegerAttr(concatDim));
    }
@@ -118,10 +118,11 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +      return;
 +    }
 +
-+    llvm::sort(candidates.ops, [](OpType lhs, OpType rhs) {
-+      return getQKVProjectionOrder(lhs.getOperation()) <
-+             getQKVProjectionOrder(rhs.getOperation());
-+    });
++    SmallVector<OpType, 3> sorted(order.size());
++    for (size_t i = 0; i < order.size(); ++i) {
++      sorted[order[i]] = candidates.ops[i];
++    }
++    candidates.ops.assign(sorted.begin(), sorted.end());
 +    candidates.firstTransposeB = candidates.ops.front().getTransposeB();
 +  }
 
@@ -162,13 +163,13 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  ReshapeOp decodeReshapeOp;
 +};
 +
-+int64_t decodeNumHeads(DecodeQKVHead &head) {
++int64_t decodeNumHeads(DecodeQKVHead head) {
 +  return mlir::cast<RankedTensorType>(
 +             head.decodeReshapeOp.getResult().getType())
 +      .getShape()[2];
 +}
 +
-+int64_t decodeHeadDim(DecodeQKVHead &head) {
++int64_t decodeHeadDim(DecodeQKVHead head) {
 +  return mlir::cast<RankedTensorType>(
 +             head.decodeReshapeOp.getResult().getType())
 +      .getShape()[3];
