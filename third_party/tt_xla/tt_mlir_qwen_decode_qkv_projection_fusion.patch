@@ -123,7 +123,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
  #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
 
-@@ -572,6 +573,164 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+@@ -572,6 +573,163 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
 
@@ -197,12 +197,11 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  return DecodeQKVHead{sliceOp, headReshapeOp, rmsNormOp, decodeReshapeOp};
 +}
 +
-+std::optional<SmallVector<DecodeQKVHead>>
-+matchDecodeQKVHeads(MatmulOp matmulOp) {
++SmallVector<DecodeQKVHead> matchDecodeQKVHeads(MatmulOp matmulOp) {
 +  SmallVector<DecodeQKVHead> heads;
 +  auto matmulShape = matmulOp.getType().getShape();
 +  if (matmulShape.size() != 2) {
-+    return std::nullopt;
++    return {};
 +  }
 +
 +  for (Operation *user : matmulOp.getResult().getUsers()) {
@@ -216,7 +215,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    }
 +  }
 +  if (heads.size() != 3) {
-+    return std::nullopt;
++    return {};
 +  }
 +
 +  SmallVector<std::pair<int64_t, int64_t>> bounds;
@@ -225,18 +224,18 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +    auto dimAndBounds =
 +        findSlicedDimensionWithBounds(head.sliceOp, matmulShape);
 +    if (!dimAndBounds) {
-+      return std::nullopt;
++      return {};
 +    }
 +    auto [dim, start, end] = *dimAndBounds;
 +    if (!sliceDim) {
 +      sliceDim = dim;
 +    } else if (*sliceDim != dim) {
-+      return std::nullopt;
++      return {};
 +    }
 +    bounds.push_back({start, end});
 +  }
 +  if (!sliceDim || *sliceDim != matmulShape.size() - 1) {
-+    return std::nullopt;
++    return {};
 +  }
 +
 +  SmallVector<size_t> indices(heads.size());
@@ -250,13 +249,13 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  int64_t previousEnd = 0;
 +  for (size_t index : indices) {
 +    if (bounds[index].first != previousEnd) {
-+      return std::nullopt;
++      return {};
 +    }
 +    previousEnd = bounds[index].second;
 +    sorted.push_back(heads[index]);
 +  }
 +  if (previousEnd != matmulShape.back()) {
-+    return std::nullopt;
++    return {};
 +  }
 +
 +  // TTIR shared-projection fusion sorts Qwen Q/K/V projections by location, so
@@ -267,12 +266,12 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +  DecodeQKVHead &k = sorted[1];
 +  DecodeQKVHead &v = sorted[2];
 +  if (!q.rmsNormOp || !k.rmsNormOp || v.rmsNormOp) {
-+    return std::nullopt;
++    return {};
 +  }
 +  if (decodeHeadDim(q) != decodeHeadDim(k) ||
 +      decodeHeadDim(q) != decodeHeadDim(v) ||
 +      decodeNumHeads(k) != decodeNumHeads(v)) {
-+    return std::nullopt;
++    return {};
 +  }
 +
 +  return sorted;
@@ -288,22 +287,21 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +980,67 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +979,66 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
 +
 +mlir::LogicalResult NLPDecodeQKVProjectionFusing::matchAndRewrite(
 +    MatmulOp matmulOp, mlir::PatternRewriter &rewriter) const {
-+  std::optional<SmallVector<DecodeQKVHead>> heads =
-+      matchDecodeQKVHeads(matmulOp);
-+  if (!heads) {
++  SmallVector<DecodeQKVHead> heads = matchDecodeQKVHeads(matmulOp);
++  if (heads.empty()) {
 +    return mlir::failure();
 +  }
 +
-+  DecodeQKVHead &q = (*heads)[0];
-+  DecodeQKVHead &k = (*heads)[1];
-+  DecodeQKVHead &v = (*heads)[2];
++  DecodeQKVHead &q = heads[0];
++  DecodeQKVHead &k = heads[1];
++  DecodeQKVHead &v = heads[2];
 +
 +  ArrayRef<int64_t> matmulShape = matmulOp.getType().getShape();
 +  int64_t batchSize = matmulShape[0];
