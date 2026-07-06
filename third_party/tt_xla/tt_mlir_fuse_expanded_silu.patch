@@ -32,11 +32,8 @@
 +  }
 +
 +  static bool isOneLike(mlir::Value value) {
-+    value = lookThroughSplatViewOps(value);
-+    return isFullOpWithValue(value, 1.0f) ||
-+           mlir::isa_and_nonnull<OnesOp>(value.getDefiningOp()) ||
-+           mlir::matchPattern(value, mlir::m_OneFloat()) ||
-+           mlir::matchPattern(value, mlir::m_One());
++    return mlir::matchPattern(lookThroughSplatViewOps(value),
++                              mlir::m_OneFloat());
 +  }
 +
 +  static mlir::Value matchExpandedSigmoidInput(mlir::Value value) {
