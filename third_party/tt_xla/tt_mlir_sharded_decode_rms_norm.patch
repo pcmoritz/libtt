@@ -53,7 +53,7 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
  void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
    ProgramTensorPool &tensorPool = context.getTensorPool();
  
-@@ -35,14 +77,27 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
+@@ -35,14 +77,29 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  
@@ -65,26 +65,28 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 -      /*program_config=*/std::nullopt,        // Use default
 -      /*compute_kernel_config=*/computeConfig // Use default
 -  );
-+  ::ttnn::Tensor output;
-+  if (std::optional<::ttnn::MemoryConfig> shardConfig =
-+          createDecodeRMSNormShardConfig(input)) {
-+    ::ttnn::Tensor shardedInput = ::ttnn::to_memory_config(input, *shardConfig);
-+    auto programConfig = ::ttnn::prim::create_layernorm_program_config(
-+        shardedInput.shard_spec(), shardedInput.tensor_spec().tile().get_height(),
-+        shardedInput.tensor_spec().tile().get_width());
-+    ::ttnn::Tensor shardedOutput = ::ttnn::rms_norm(
-+        shardedInput, epsilon, weight, bias,
-+        /*residual_input_tensor=*/std::nullopt, *shardConfig, programConfig,
-+        computeConfig);
++  std::optional<::ttnn::MemoryConfig> shardConfig =
++      createDecodeRMSNormShardConfig(input);
++  ::ttnn::Tensor rmsInput = input;
++  std::optional<::ttnn::MemoryConfig> rmsMemoryConfig = memoryConfig;
++  std::optional<::ttnn::prim::LayerNormProgramConfig> programConfig =
++      std::nullopt;
++
++  if (shardConfig) {
++    rmsInput = ::ttnn::to_memory_config(input, *shardConfig);
++    rmsMemoryConfig = *shardConfig;
++    programConfig = ::ttnn::prim::create_layernorm_program_config(
++        rmsInput.shard_spec(), rmsInput.tensor_spec().tile().get_height(),
++        rmsInput.tensor_spec().tile().get_width());
++  }
++
++  ::ttnn::Tensor output = ::ttnn::rms_norm(
++      rmsInput, epsilon, weight, bias,
++      /*residual_input_tensor=*/std::nullopt, rmsMemoryConfig, programConfig,
++      computeConfig);
++  if (shardConfig) {
 +    output = ::ttnn::to_memory_config(
-+        shardedOutput, memoryConfig.value_or(input.memory_config()));
-+  } else {
-+    output = ::ttnn::rms_norm(
-+        input, epsilon, weight, bias,
-+        /*residual_input_tensor=*/std::nullopt,
-+        memoryConfig,
-+        /*program_config=*/std::nullopt,
-+        /*compute_kernel_config=*/computeConfig);
++        output, memoryConfig.value_or(input.memory_config()));
 +  }
  
    tensorPool.insertTTNNTensorAndValidate(op->out(), output);
