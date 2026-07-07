@@ -1,7 +1,7 @@
 diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
 --- a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
 +++ b/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
-@@ -3,10 +3,47 @@
+@@ -3,10 +3,52 @@
  // SPDX-License-Identifier: Apache-2.0
  
  #include "operations/normalization/rms_norm.h"
@@ -27,7 +27,9 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +    return std::nullopt;
 +  }
 +
-+  constexpr uint32_t kShardCores = 8;
++  constexpr uint32_t kShardGridWidth = 8;
++  constexpr uint32_t kShardGridHeight = 2;
++  constexpr uint32_t kShardCores = kShardGridWidth * kShardGridHeight;
 +  const uint32_t width = static_cast<uint32_t>(shape[-1]);
 +  const uint32_t shardWidth = width / kShardCores;
 +  if (width % kShardCores != 0 ||
@@ -36,7 +38,9 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +  }
 +
 +  const auto grid = ::tt::tt_metal::CoreRangeSet(
-+      {::tt::tt_metal::CoreRange({0, 0}, {kShardCores - 1, 0})});
++      {::tt::tt_metal::CoreRange({0, 0},
++                                  {kShardGridWidth - 1,
++                                   kShardGridHeight - 1})});
 +  return ::ttnn::operations::data_movement::create_sharded_memory_config(
 +      shape, grid, ::ttnn::operations::data_movement::ShardStrategy::WIDTH,
 +      ::tt::tt_metal::ShardOrientation::ROW_MAJOR,
@@ -49,7 +53,7 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
  void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
    ProgramTensorPool &tensorPool = context.getTensorPool();
  
-@@ -35,14 +72,27 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
+@@ -35,14 +77,27 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  
