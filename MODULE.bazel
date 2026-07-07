@@ -280,6 +280,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_qwen_decode_qkv_projection_fusion.patch",
         "//third_party/tt_xla:tt_mlir_kv_cache_dtype_return_types.patch",
         "//third_party/tt_xla:tt_mlir_sharded_decode_rms_norm.patch",
+        "//third_party/tt_xla:tt_mlir_fuse_logits_matmul_untilize.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
