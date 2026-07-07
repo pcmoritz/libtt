@@ -106,6 +106,8 @@ http_archive(
 http_archive(
     name = "tracy",
     build_file = "//third_party/tracy:BUILD.overlay.bazel",
+    patch_args = ["-p1"],
+    patches = ["//third_party/tracy:no_rpmalloc_for_dlopen.patch"],
     sha256 = "171ffc00974781d547eab7732f99ac6d0fc67561d8ba1cba14dc6a8db2bb49a2",
     strip_prefix = "tracy-b3437e6b8bd383af24511db6d82a96e5933b6f64",
     urls = [
@@ -184,6 +186,7 @@ http_archive(
         "//third_party/tt_metal:fast_bfloat16_bfp8_pack.patch",
         "//third_party/tt_metal:sdpa_decode_allow_l1_interleaved_q.patch",
         "//third_party/tt_metal:layernorm_allow_single_core_height_sharded.patch",
+        "//third_party/tt_metal:profiler_skip_mock_devices.patch",
     ],
     sha256 = "6a59d4c18fa7c4ba0da2e0317885e9f556624c3346fb37b976b08875d07d185f",
     strip_prefix = "tt-metal-13adda80c119631d18b0bc06163416ba148c25ab",
@@ -279,6 +282,8 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_fuse_rank3_rope_decode.patch",
         "//third_party/tt_xla:tt_mlir_qwen_decode_qkv_projection_fusion.patch",
         "//third_party/tt_xla:tt_mlir_kv_cache_dtype_return_types.patch",
+        "//third_party/tt_xla:tt_mlir_sharded_decode_rms_norm.patch",
+        "//third_party/tt_xla:tt_mlir_named_profiler_readback.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

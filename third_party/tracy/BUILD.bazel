@@ -1,1 +1,4 @@
-exports_files(["BUILD.overlay.bazel"])
+exports_files([
+    "BUILD.overlay.bazel",
+    "no_rpmalloc_for_dlopen.patch",
+])

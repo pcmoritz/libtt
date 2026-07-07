@@ -4,9 +4,25 @@ package(default_visibility = ["//visibility:public"])
 
 cc_library(
     name = "tracy",
+    srcs = ["public/TracyClient.cpp"],
     hdrs = glob([
         "public/**/*.h",
         "public/**/*.hpp",
     ], allow_empty = True),
-    includes = ["public"],
+    textual_hdrs = glob([
+        "public/client/**/*.cpp",
+        "public/common/**/*.cpp",
+        "public/libbacktrace/**/*.cpp",
+    ], allow_empty = True),
+    copts = [
+        "-DTRACY_ENABLE",
+        "-DTRACY_DELAYED_INIT",
+        "-DTRACY_NO_CALLSTACK",
+        "-DTRACY_NO_RPMALLOC",
+        "-DTRACY_NO_SYSTEM_TRACING",
+    ],
+    includes = [
+        ".",
+        "public",
+    ],
 )

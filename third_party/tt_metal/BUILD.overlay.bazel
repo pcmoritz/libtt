@@ -720,6 +720,11 @@ TT_METAL_RUNTIME_COPTS = [
     "-std=c++20",
     "-mavx",
     "-DTT_METAL_INSTALL_ROOT=\\\"/usr/libexec/tt-metalium\\\"",
+    "-DTRACY_ENABLE",
+    "-DTRACY_DELAYED_INIT",
+    "-DTRACY_NO_CALLSTACK",
+    "-DTRACY_NO_RPMALLOC",
+    "-DTRACY_NO_SYSTEM_TRACING",
 ]
 
 TT_METAL_HAL_INCLUDE_DIRS = [

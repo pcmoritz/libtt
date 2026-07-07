@@ -1,0 +1,13 @@
+diff --git a/public/common/TracyAlloc.hpp b/public/common/TracyAlloc.hpp
+index 48a8bb3..889ef45 100644
+--- a/public/common/TracyAlloc.hpp
++++ b/public/common/TracyAlloc.hpp
+@@ -3,7 +3,7 @@
+ 
+ #include <stdlib.h>
+ 
+-#if defined TRACY_ENABLE && !defined __EMSCRIPTEN__
++#if defined TRACY_ENABLE && !defined __EMSCRIPTEN__ && !defined TRACY_NO_RPMALLOC
+ #  include "TracyApi.h"
+ #  include "TracyForceInline.hpp"
+ #  include "../client/tracy_rpmalloc.hpp"
