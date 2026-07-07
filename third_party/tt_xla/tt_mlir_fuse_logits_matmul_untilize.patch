@@ -1,0 +1,204 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -2094,5 +2094,144 @@ ::mlir::LogicalResult ToLayoutOp::verify() {
+ 
+ namespace {
++static inline int64_t divUp(int64_t a, int64_t b) { return (a + b - 1) / b; }
++
++static int64_t largestDivisorUpTo(int64_t value, int64_t maxDivisor) {
++  for (int64_t d = std::min(value, maxDivisor); d >= 1; --d) {
++    if (value % d == 0) {
++      return d;
++    }
++  }
++  return 1;
++}
++
++static int64_t getMaxSubblockSize(DeviceComputeKernelConfigAttr computeConfig) {
++  int64_t maxSubblockSize = 8;
++  if (!computeConfig) {
++    return maxSubblockSize;
++  }
++  if (auto dstFullSyncAttr = computeConfig.getDstFullSyncEn()) {
++    if (dstFullSyncAttr.getValue()) {
++      maxSubblockSize *= 2;
++    }
++  }
++  if (auto fp32DestAccAttr = computeConfig.getFp32DestAccEn()) {
++    if (fp32DestAccAttr.getValue()) {
++      maxSubblockSize /= 2;
++    }
++  }
++  return maxSubblockSize;
++}
++
++static MatmulMultiCoreReuseMultiCast1DProgramConfigAttr
++withUntilizeOut(MatmulMultiCoreReuseMultiCast1DProgramConfigAttr config) {
++  if (config.getUntilizeOut()) {
++    return config;
++  }
++
++  uint64_t outSubblockH = config.getOutSubblockH();
++  uint64_t outSubblockW = config.getOutSubblockW();
++  return MatmulMultiCoreReuseMultiCast1DProgramConfigAttr::get(
++      config.getContext(), config.getComputeWithStorageGridSize(),
++      config.getIn0BlockW(), outSubblockH, outSubblockW,
++      /*out_block_h=*/outSubblockH, /*out_block_w=*/outSubblockW,
++      config.getPerCoreM(), config.getPerCoreN(), config.getFuseBatch(),
++      config.getFusedActivation(), config.getMcastIn0(), config.getGatherIn0(),
++      config.getHopCores(), config.getNumGlobalCbReceivers(),
++      /*untilize_out=*/true);
++}
++
++static MatmulMultiCoreReuseMultiCast1DProgramConfigAttr
++createDecodeLogitsMatmulConfig(ttnn::MatmulOp matmulOp) {
++  auto resultType = mlir::dyn_cast<RankedTensorType>(matmulOp.getType());
++  auto aType = mlir::dyn_cast<RankedTensorType>(matmulOp.getA().getType());
++  auto bType = mlir::dyn_cast<RankedTensorType>(matmulOp.getB().getType());
++  if (!resultType || !aType || !bType) {
++    return nullptr;
++  }
++
++  llvm::ArrayRef<int64_t> outShape = resultType.getShape();
++  llvm::ArrayRef<int64_t> aShape = aType.getShape();
++  llvm::ArrayRef<int64_t> bShape = bType.getShape();
++  if (outShape.size() < 2 || aShape.size() < 2 || bShape.size() < 2) {
++    return nullptr;
++  }
++
++  const int64_t M = outShape[outShape.size() - 2];
++  const int64_t N = outShape[outShape.size() - 1];
++  const int64_t K = matmulOp.getTransposeA()
++                        ? aShape[aShape.size() - 2]
++                        : aShape[aShape.size() - 1];
++  constexpr int64_t kMinLogitsWidth = 4096;
++  if (M <= 0 || N < kMinLogitsWidth || K <= 0 || M > TILE_HEIGHT) {
++    return nullptr;
++  }
++
++  bool fuseBatch = true;
++  for (size_t i = 0; i < bShape.size() - 2; ++i) {
++    if (bShape[i] != 1) {
++      fuseBatch = false;
++      break;
++    }
++  }
++  if (!fuseBatch) {
++    return nullptr;
++  }
++
++  MLIRContext *ctx = matmulOp.getContext();
++  ttcore::DeviceAttr deviceAttr = ttcore::lookupDevice(matmulOp.getOperation());
++  llvm::ArrayRef<int64_t> workerGridShape =
++      deviceAttr.getWorkerGrid().getShape();
++  if (workerGridShape.size() < 2) {
++    return nullptr;
++  }
++  const int64_t gridY = workerGridShape[workerGridShape.size() - 2];
++  const int64_t gridX = workerGridShape[workerGridShape.size() - 1];
++  if (gridX <= 0 || gridY <= 0) {
++    return nullptr;
++  }
++
++  const int64_t Mt = divUp(M, TILE_HEIGHT);
++  const int64_t Nt = divUp(N, TILE_WIDTH);
++  const int64_t Kt = divUp(K, TILE_WIDTH);
++  const int64_t numCores = gridX * gridY;
++  const int64_t perCoreM = Mt;
++  const int64_t perCoreN = divUp(Nt, numCores);
++  if (perCoreN <= 0 || Kt <= 0) {
++    return nullptr;
++  }
++
++  const int64_t in0BlockW = (Kt % 2 == 0) ? 2 : 1;
++  const int64_t outSubblockH = 1;
++  const int64_t outSubblockW = largestDivisorUpTo(
++      perCoreN, getMaxSubblockSize(matmulOp.getComputeConfigAttr()));
++
++  auto gridAttr = CoreCoordAttr::get(ctx, gridX, gridY);
++  auto hopCoresAttr = CoreRangeSetAttr::get(ctx, {});
++  return MatmulMultiCoreReuseMultiCast1DProgramConfigAttr::get(
++      ctx, gridAttr, static_cast<uint64_t>(in0BlockW),
++      static_cast<uint64_t>(outSubblockH),
++      static_cast<uint64_t>(outSubblockW),
++      /*out_block_h=*/static_cast<uint64_t>(outSubblockH),
++      /*out_block_w=*/static_cast<uint64_t>(outSubblockW),
++      static_cast<uint64_t>(perCoreM), static_cast<uint64_t>(perCoreN),
++      /*fuse_batch=*/true, /*fusedActivation=*/nullptr,
++      /*mcast_in0=*/true, /*gather_in0=*/false, hopCoresAttr,
++      /*num_global_cb_receivers=*/0, /*untilize_out=*/true);
++}
++
++static MatmulMultiCoreReuseMultiCast1DProgramConfigAttr
++getUntilizeOutConfig(ttnn::MatmulOp matmulOp) {
++  if (auto existing = mlir::dyn_cast_if_present<
++          MatmulMultiCoreReuseMultiCast1DProgramConfigAttr>(
++          matmulOp.getMatmulProgramConfigAttr())) {
++    return withUntilizeOut(existing);
++  }
++  if (matmulOp.getMatmulProgramConfigAttr() || matmulOp.getActivation()) {
++    return nullptr;
++  }
++  return createDecodeLogitsMatmulConfig(matmulOp);
++}
++
+ // ToLayoutOp can be folded if its input has the same layout as the output of
+ // ToLayoutOp.
+ mlir::OpFoldResult foldIdentityToLayoutOp(ttnn::ToLayoutOp op) {
+@@ -2347,6 +2486,55 @@ void mlir::tt::ttnn::ToLayoutOp::getCanonicalizationPatterns(
+     rewriter.replaceAllOpUsesWith(toLayoutOp, zerosOp);
+     rewriter.eraseOp(toLayoutOp);
+     return mlir::success();
++  });
++
++  // Fold the decode logits projection's trailing untilize into the 1D matmul
++  // program config. ArgMax requires row-major logits, and tt-metal can produce
++  // that layout directly when untilize_out is set.
++  patterns.add(+[](mlir::tt::ttnn::ToLayoutOp toLayoutOp,
++                   mlir::PatternRewriter &rewriter) {
++    if (!toLayoutOp->hasOneUse()) {
++      return failure();
++    }
++
++    auto argMaxOp =
++        mlir::dyn_cast<mlir::tt::ttnn::ArgMaxOp>(*toLayoutOp->user_begin());
++    if (!argMaxOp || argMaxOp.getInput() != toLayoutOp.getResult()) {
++      return failure();
++    }
++
++    auto matmulOp = toLayoutOp.getInput().getDefiningOp<ttnn::MatmulOp>();
++    if (!matmulOp || !matmulOp->hasOneUse() || toLayoutOp.hasDtypeChange()) {
++      return failure();
++    }
++
++    auto inputLayout = mlir::dyn_cast<TTNNLayoutAttr>(
++        mlir::cast<RankedTensorType>(toLayoutOp.getInput().getType())
++            .getEncoding());
++    auto outputLayout = mlir::dyn_cast<TTNNLayoutAttr>(
++        mlir::cast<RankedTensorType>(toLayoutOp.getResult().getType())
++            .getEncoding());
++    if (!inputLayout || !outputLayout ||
++        inputLayout.getLayout() != Layout::Tile ||
++        outputLayout.getLayout() != Layout::RowMajor ||
++        inputLayout.getBufferType() != outputLayout.getBufferType() ||
++        inputLayout.getMemLayoutOpt() != outputLayout.getMemLayoutOpt()) {
++      return failure();
++    }
++
++    auto programConfig = getUntilizeOutConfig(matmulOp);
++    if (!programConfig) {
++      return failure();
++    }
++
++    auto newMatmul = rewriter.create<ttnn::MatmulOp>(
++        matmulOp.getLoc(), toLayoutOp.getType(), matmulOp.getA(),
++        matmulOp.getB(), matmulOp.getTransposeA(), matmulOp.getTransposeB(),
++        programConfig, matmulOp.getActivationAttr());
++    newMatmul.setComputeConfigAttr(matmulOp.getComputeConfigAttr());
++    rewriter.replaceOp(toLayoutOp, newMatmul.getResult());
++    rewriter.eraseOp(matmulOp);
++    return success();
+   });
+ }
+ 
