@@ -510,6 +510,8 @@ MeshGraphDescriptor::~MeshGraphDescriptor() = default;
 
 namespace tracy {
 
+#if !defined(TRACY_ENABLE)
 void SetThreadName(const char *) {}
+#endif
 
 } // namespace tracy
