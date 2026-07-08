@@ -2,7 +2,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 index 0afbf0f..59c7fce 100644
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -959,6 +959,24 @@ def TTNN_ArgMaxOp : TTNN_Op<"argmax"> {
+@@ -959,6 +959,23 @@ def TTNN_ArgMaxOp : TTNN_Op<"argmax"> {
    let hasVerifier = 1;
  }
  
@@ -17,8 +17,7 @@ index 0afbf0f..59c7fce 100644
 +  let arguments = (ins AnyRankedTensor:$input,
 +                       AnyRankedTensor:$norm_weight,
 +                       AnyRankedTensor:$lm_head_weight,
-+                       DefaultValuedAttr<F32Attr, "1e-12">:$epsilon,
-+                       DefaultValuedAttr<BoolAttr, "true">:$transpose_b);
++                       DefaultValuedAttr<F32Attr, "1e-12">:$epsilon);
 +
 +  let results = (outs AnyRankedTensor:$result);
 +
@@ -31,7 +30,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/reduction.fbs b/include/ttmli
 index e3fa8a1..08575ae 100644
 --- a/include/ttmlir/Target/TTNN/operations/reduction.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/reduction.fbs
-@@ -27,6 +27,16 @@ table ReductionArgMaxOp {
+@@ -27,6 +27,15 @@ table ReductionArgMaxOp {
    memcfg: tt.target.ttnn.MemoryConfig;
  }
  
@@ -41,7 +40,6 @@ index e3fa8a1..08575ae 100644
 +  lm_head_weight: tt.target.ttnn.TensorRef;
 +  out: tt.target.ttnn.TensorRef;
 +  epsilon: float;
-+  transpose_b: bool = true;
 +  memcfg: tt.target.ttnn.MemoryConfig;
 +}
 +
@@ -64,7 +62,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 index ac04b7e..b1eab1c 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -338,6 +338,93 @@ public:
+@@ -338,6 +338,92 @@ public:
  
  #endif // TTMLIR_ENABLE_OPMODEL
  
@@ -138,8 +136,7 @@ index ac04b7e..b1eab1c 100644
 +    rewriter.setInsertionPoint(rmsNormOp);
 +    auto fusedOp = rewriter.create<LMHeadSamplingOp>(
 +        argMaxOp.getLoc(), argMaxOp.getResult().getType(), rmsNormOp.getInput(),
-+        rmsNormOp.getWeight(), matmulOp.getB(), rmsNormOp.getEpsilon(),
-+        matmulOp.getTransposeB());
++        rmsNormOp.getWeight(), matmulOp.getB(), rmsNormOp.getEpsilon());
 +    if (auto weightDtype =
 +            matmulOp->getAttrOfType<mlir::StringAttr>("ttcore.weight_dtype")) {
 +      fusedOp->setAttr("ttcore.weight_dtype", weightDtype);
@@ -256,7 +253,7 @@ index 8160ec9..3580c56 100644
 +
 +  return ::tt::target::ttnn::CreateLMHeadSamplingOp(
 +      *cache.fbb, input, normWeight, lmHeadWeight, output,
-+      op.getEpsilon().convertToFloat(), op.getTransposeB(), memoryConfig);
++      op.getEpsilon().convertToFloat(), memoryConfig);
 +}
 +
  template <typename ReductionOp>
@@ -279,16 +276,16 @@ new file mode 100644
 index 0000000..e27790e
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/reduction/lm_head_sampling.cpp
-@@ -0,0 +1,577 @@
+@@ -0,0 +1,573 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
 +
-+#include "operations/reduction/lm_head_sampling.h"
-+
 +#include "tt/runtime/detail/ttnn/operations/utils.h"
 +#include "tt/runtime/detail/ttnn/ttnn.h"
++#include "tt/runtime/detail/ttnn/types/types.h"
 +#include "tt/runtime/detail/ttnn/utils.h"
++#include "ttmlir/Target/TTNN/program_generated.h"
 +#include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
 +#include "ttnn/operations/data_movement/common/common.hpp"
 +#include "ttnn/operations/generic/generic_op.hpp"
@@ -734,9 +731,8 @@ index 0000000..e27790e
 +  return result;
 +}
 +
-+std::optional<::ttnn::Tensor> tryRunShardedSamplingFallback(
++std::optional<::ttnn::Tensor> tryRunShardedSampling(
 +    const ::ttnn::Tensor &normalized, const ::ttnn::Tensor &lmHeadWeight,
-+    bool transposeWeight,
 +    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig) {
 +  auto fail = []() -> std::optional<::ttnn::Tensor> {
 +    return std::nullopt;
@@ -752,8 +748,7 @@ index 0000000..e27790e
 +  if (weightShape.rank() < 2) {
 +    return fail();
 +  }
-+  const uint32_t vocab = static_cast<uint32_t>(
-+      transposeWeight ? weightShape[-2] : weightShape[-1]);
++  const uint32_t vocab = static_cast<uint32_t>(weightShape[-2]);
 +  if (vocab == 0) {
 +    return fail();
 +  }
@@ -780,7 +775,7 @@ index 0000000..e27790e
 +
 +  ::ttnn::Tensor logits = ::ttnn::matmul(
 +      shardedNormalized, lmHeadWeight,
-+      /*transpose_a=*/false, /*transpose_b=*/transposeWeight,
++      /*transpose_a=*/false, /*transpose_b=*/true,
 +      /*memory_config=*/logitsMemoryConfig,
 +      /*dtype=*/::ttnn::DataType::BFLOAT16,
 +      /*program_config=*/std::nullopt, /*activation=*/std::nullopt,
@@ -833,15 +828,13 @@ index 0000000..e27790e
 +      /*compute_kernel_config=*/std::nullopt);
 +
 +  if (std::optional<::ttnn::Tensor> sampledOutput =
-+          tryRunShardedSamplingFallback(normalized, lmHeadWeight,
-+                                        op->transpose_b(),
-+                                        outputMemoryConfig)) {
++          tryRunShardedSampling(normalized, lmHeadWeight, outputMemoryConfig)) {
 +    tensorPool.insertTTNNTensorAndValidate(op->out(), *sampledOutput);
 +    return;
 +  }
 +  ::ttnn::Tensor logits = ::ttnn::matmul(
 +      normalized, lmHeadWeight,
-+      /*transpose_a=*/false, /*transpose_b=*/op->transpose_b(),
++      /*transpose_a=*/false, /*transpose_b=*/true,
 +      /*memory_config=*/::ttnn::DRAM_MEMORY_CONFIG,
 +      /*dtype=*/::ttnn::DataType::BFLOAT16,
 +      /*program_config=*/std::nullopt, /*activation=*/std::nullopt,
@@ -857,41 +850,20 @@ index 0000000..e27790e
 +}
 +
 +} // namespace tt::runtime::ttnn::operations::reduction
-diff --git a/runtime/lib/ttnn/operations/reduction/lm_head_sampling.h b/runtime/lib/ttnn/operations/reduction/lm_head_sampling.h
-new file mode 100644
-index 0000000..e138fee
---- /dev/null
-+++ b/runtime/lib/ttnn/operations/reduction/lm_head_sampling.h
-@@ -0,0 +1,16 @@
-+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-+//
-+// SPDX-License-Identifier: Apache-2.0
-+
-+#ifndef RUNTIME_LIB_TTNN_OPERATIONS_REDUCTION_LM_HEAD_SAMPLING_H
-+#define RUNTIME_LIB_TTNN_OPERATIONS_REDUCTION_LM_HEAD_SAMPLING_H
-+
-+#include "tt/runtime/detail/ttnn/types/types.h"
-+#include "ttmlir/Target/TTNN/program_generated.h"
-+
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+index 6cf28dd..e78e745 100644
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -133,3 +133,7 @@
+ #include <cstring>
+-
 +namespace tt::runtime::ttnn::operations::reduction {
 +void run(const ::tt::target::ttnn::LMHeadSamplingOp *op,
 +         ProgramContext &context);
 +} // namespace tt::runtime::ttnn::operations::reduction
 +
-+#endif // RUNTIME_LIB_TTNN_OPERATIONS_REDUCTION_LM_HEAD_SAMPLING_H
-diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
-index 6cf28dd..e78e745 100644
---- a/runtime/lib/ttnn/program_executor.cpp
-+++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -97,6 +97,7 @@
- #include "operations/reduction/argmax.h"
- #include "operations/reduction/cumprod.h"
- #include "operations/reduction/cumsum.h"
-+#include "operations/reduction/lm_head_sampling.h"
- #include "operations/reduction/prod.h"
- #include "operations/reduction/reduction.h"
- #include "operations/reduction/sampling.h"
-@@ -368,6 +369,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+ namespace tt::runtime::ttnn {
+@@ -368,6 +372,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
      return operations::reduction::run(op->type_as_ReductionArgMaxOp(),
                                        getContext());
    }
