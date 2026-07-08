@@ -62,32 +62,20 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 index ac04b7e..b1eab1c 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -338,6 +338,92 @@ public:
+@@ -338,6 +338,94 @@ public:
  
  #endif // TTMLIR_ENABLE_OPMODEL
  
 +class LMHeadSamplingFusing : public mlir::OpRewritePattern<ArgMaxOp> {
-+  using LMHeadSamplingFusing::OpRewritePattern<ArgMaxOp>::OpRewritePattern;
++  using OpRewritePattern::OpRewritePattern;
 +
 +  static bool hasOnlyExpectedUsers(Value value, Operation *expectedUser) {
 +    for (Operation *user : value.getUsers()) {
-+      if (user != expectedUser && !mlir::isa<DeallocateOp>(user)) {
++      if (user != expectedUser) {
 +        return false;
 +      }
 +    }
 +    return true;
-+  }
-+
-+  static void eraseDeallocateUsers(Value value, PatternRewriter &rewriter) {
-+    SmallVector<DeallocateOp> deallocs;
-+    for (Operation *user : value.getUsers()) {
-+      if (auto dealloc = mlir::dyn_cast<DeallocateOp>(user)) {
-+        deallocs.push_back(dealloc);
-+      }
-+    }
-+    for (DeallocateOp dealloc : deallocs) {
-+      rewriter.eraseOp(dealloc);
-+    }
 +  }
 +
 +  static bool isDecodeLMHeadTail(ArgMaxOp argMaxOp, MatmulOp matmulOp,
@@ -112,8 +100,24 @@ index ac04b7e..b1eab1c 100644
 +        logitsType.getRank() != 2) {
 +      return false;
 +    }
-+    return inputType.getShape()[inputType.getRank() - 2] == 1 &&
-+           logitsType.getShape()[0] == 1;
++    constexpr int64_t kDecodeSequenceLength = 1;
++    constexpr int64_t kMinShardWidth = 2048;
++    constexpr int64_t kShardCores = 16;
++    constexpr int64_t kTileWidth = 32;
++    const ArrayRef<int64_t> inputShape = inputType.getShape();
++    const ArrayRef<int64_t> logitsShape = logitsType.getShape();
++    const int64_t sequenceLength = inputShape[inputType.getRank() - 2];
++    const int64_t hidden = inputShape.back();
++    const int64_t batch = logitsShape[0];
++    const int64_t vocab = logitsShape[1];
++    if (ShapedType::isDynamic(sequenceLength) ||
++        ShapedType::isDynamic(hidden) || ShapedType::isDynamic(batch) ||
++        ShapedType::isDynamic(vocab)) {
++      return false;
++    }
++    return sequenceLength == kDecodeSequenceLength && batch == 1 &&
++           hidden >= kMinShardWidth &&
++           hidden % (kShardCores * kTileWidth) == 0 && vocab > 0;
 +  }
 +
 +public:
@@ -143,9 +147,7 @@ index ac04b7e..b1eab1c 100644
 +    }
 +
 +    rewriter.replaceOp(argMaxOp, fusedOp.getResult());
-+    eraseDeallocateUsers(matmulOp.getResult(), rewriter);
 +    rewriter.eraseOp(matmulOp);
-+    eraseDeallocateUsers(rmsNormOp.getResult(), rewriter);
 +    rewriter.eraseOp(rmsNormOp);
 +
 +    return success();
@@ -276,7 +278,7 @@ new file mode 100644
 index 0000000..e27790e
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/reduction/lm_head_sampling.cpp
-@@ -0,0 +1,573 @@
+@@ -0,0 +1,504 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -309,28 +311,13 @@ index 0000000..e27790e
 +namespace tt::runtime::ttnn::operations::reduction {
 +namespace {
 +
-+std::optional<::ttnn::MemoryConfig>
-+createDecodeRMSNormShardConfig(const ::ttnn::Tensor &input) {
-+  if (input.is_sharded() || input.layout() != ::ttnn::Layout::TILE ||
-+      input.storage_type() != ::ttnn::StorageType::DEVICE) {
-+    return std::nullopt;
-+  }
-+
-+  constexpr uint32_t kDecodeSequenceLength = 1;
-+  constexpr uint32_t kMinShardWidth = 2048;
++::ttnn::MemoryConfig createDecodeRMSNormShardConfig(
++    const ::ttnn::Tensor &input) {
 +  const ::ttnn::Shape &shape = input.logical_shape();
-+  if (shape.rank() < 2 || shape[-2] != kDecodeSequenceLength ||
-+      shape[-1] < kMinShardWidth) {
-+    return std::nullopt;
-+  }
-+
 +  constexpr uint32_t kShardGridWidth = 8;
 +  constexpr uint32_t kShardGridHeight = 2;
 +  constexpr uint32_t kShardCores = kShardGridWidth * kShardGridHeight;
 +  const uint32_t width = static_cast<uint32_t>(shape[-1]);
-+  if (width % (kShardCores * tt::constants::TILE_WIDTH) != 0) {
-+    return std::nullopt;
-+  }
 +  const uint32_t shardWidth = width / kShardCores;
 +
 +  const auto grid = ::tt::tt_metal::CoreRangeSet(
@@ -379,11 +366,6 @@ index 0000000..e27790e
 +
 +uint32_t roundUp(uint32_t value, uint32_t alignment) {
 +  return ((value + alignment - 1) / alignment) * alignment;
-+}
-+
-+bool hasTile(const ::ttnn::Tensor &tensor, uint32_t height, uint32_t width) {
-+  const auto tile = tensor.tensor_spec().tile();
-+  return tile.get_height() == height && tile.get_width() == width;
 +}
 +
 +::tt::tt_metal::CoreRangeSet singleCoreSet(::tt::tt_metal::CoreCoord core) {
@@ -731,28 +713,11 @@ index 0000000..e27790e
 +  return result;
 +}
 +
-+std::optional<::ttnn::Tensor> tryRunShardedSampling(
++::ttnn::Tensor runShardedSampling(
 +    const ::ttnn::Tensor &normalized, const ::ttnn::Tensor &lmHeadWeight,
 +    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig) {
-+  auto fail = []() -> std::optional<::ttnn::Tensor> {
-+    return std::nullopt;
-+  };
-+  if (normalized.storage_type() != ::ttnn::StorageType::DEVICE ||
-+      lmHeadWeight.storage_type() != ::ttnn::StorageType::DEVICE ||
-+      normalized.layout() != ::ttnn::Layout::TILE ||
-+      lmHeadWeight.layout() != ::ttnn::Layout::TILE) {
-+    return fail();
-+  }
-+
 +  const ::ttnn::Shape &weightShape = lmHeadWeight.logical_shape();
-+  if (weightShape.rank() < 2) {
-+    return fail();
-+  }
 +  const uint32_t vocab = static_cast<uint32_t>(weightShape[-2]);
-+  if (vocab == 0) {
-+    return fail();
-+  }
-+
 +  auto device = normalized.device();
 +  const auto fullGrid = device->compute_with_storage_grid_size();
 +  const uint32_t maxCores = fullGrid.x * fullGrid.y;
@@ -763,9 +728,6 @@ index 0000000..e27790e
 +  const auto logitsMemoryConfig =
 +      widthShardL1(grid, {tt::constants::TILE_HEIGHT, nPerCore});
 +  const ::ttnn::Shape &inputShape = normalized.logical_shape();
-+  if (inputShape.rank() < 2 || inputShape[-1] == 0) {
-+    return fail();
-+  }
 +  const uint32_t hidden = static_cast<uint32_t>(inputShape[-1]);
 +  const uint32_t hiddenPerCore = paddedShardWidth(hidden, usedCores);
 +  const auto inputMemoryConfig =
@@ -781,11 +743,6 @@ index 0000000..e27790e
 +      /*program_config=*/std::nullopt, /*activation=*/std::nullopt,
 +      /*compute_kernel_config=*/std::nullopt, /*core_grid=*/std::nullopt,
 +      /*output_tile=*/std::nullopt, /*optional_output_tensor=*/std::nullopt);
-+  if (!logits.is_sharded() || logits.layout() != ::ttnn::Layout::TILE ||
-+      !hasTile(logits, tt::constants::TILE_HEIGHT,
-+               tt::constants::TILE_WIDTH)) {
-+    return fail();
-+  }
 +  return runShardedArgmaxSampling(logits, vocab, nPerCore, outputMemoryConfig);
 +}
 +
@@ -805,46 +762,22 @@ index 0000000..e27790e
 +  std::optional<::ttnn::MemoryConfig> outputMemoryConfig =
 +      ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(op->memcfg());
 +
-+  std::optional<::ttnn::MemoryConfig> shardConfig =
++  const ::ttnn::MemoryConfig shardConfig =
 +      createDecodeRMSNormShardConfig(input);
-+  ::ttnn::Tensor rmsInput = input;
-+  std::optional<::ttnn::MemoryConfig> rmsMemoryConfig = std::nullopt;
++  ::ttnn::Tensor rmsInput = ::ttnn::to_memory_config(input, shardConfig);
 +  std::optional<::ttnn::prim::LayerNormProgramConfig> programConfig =
-+      std::nullopt;
++      ::ttnn::prim::create_layernorm_program_config(
++          rmsInput.shard_spec(), rmsInput.tensor_spec().tile().get_height(),
++          rmsInput.tensor_spec().tile().get_width());
 +
-+  if (shardConfig) {
-+    rmsInput = ::ttnn::to_memory_config(input, *shardConfig);
-+    rmsMemoryConfig = *shardConfig;
-+    programConfig = ::ttnn::prim::create_layernorm_program_config(
-+        rmsInput.shard_spec(), rmsInput.tensor_spec().tile().get_height(),
-+        rmsInput.tensor_spec().tile().get_width());
-+  }
-+
-+  std::optional<::ttnn::Tensor> weight = normWeight;
 +  ::ttnn::Tensor normalized = ::ttnn::rms_norm(
-+      rmsInput, op->epsilon(), weight,
++      rmsInput, op->epsilon(), std::optional<::ttnn::Tensor>(normWeight),
 +      /*bias=*/std::nullopt, /*residual_input_tensor=*/std::nullopt,
-+      rmsMemoryConfig, programConfig,
++      shardConfig, programConfig,
 +      /*compute_kernel_config=*/std::nullopt);
 +
-+  if (std::optional<::ttnn::Tensor> sampledOutput =
-+          tryRunShardedSampling(normalized, lmHeadWeight, outputMemoryConfig)) {
-+    tensorPool.insertTTNNTensorAndValidate(op->out(), *sampledOutput);
-+    return;
-+  }
-+  ::ttnn::Tensor logits = ::ttnn::matmul(
-+      normalized, lmHeadWeight,
-+      /*transpose_a=*/false, /*transpose_b=*/true,
-+      /*memory_config=*/::ttnn::DRAM_MEMORY_CONFIG,
-+      /*dtype=*/::ttnn::DataType::BFLOAT16,
-+      /*program_config=*/std::nullopt, /*activation=*/std::nullopt,
-+      /*compute_kernel_config=*/std::nullopt, /*core_grid=*/std::nullopt,
-+      /*output_tile=*/std::nullopt, /*optional_output_tensor=*/std::nullopt);
-+  ::ttnn::Tensor output = ::ttnn::argmax(
-+      logits,
-+      /*dim=*/1, /*keepdim=*/false, /*sub_core_grids=*/std::nullopt,
-+      /*memory_config_arg=*/outputMemoryConfig,
-+      /*optional_output_tensor=*/std::nullopt);
++  ::ttnn::Tensor output =
++      runShardedSampling(normalized, lmHeadWeight, outputMemoryConfig);
 +
 +  tensorPool.insertTTNNTensorAndValidate(op->out(), output);
 +}
