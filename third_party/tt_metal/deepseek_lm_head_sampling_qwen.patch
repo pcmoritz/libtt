@@ -1,0 +1,158 @@
+diff -ruN models/demos/deepseek_v3_b1/micro_ops/sampling/kernels/sampling_kernel.cpp models/demos/deepseek_v3_b1/micro_ops/sampling/kernels/sampling_kernel.cpp
+--- models/demos/deepseek_v3_b1/micro_ops/sampling/kernels/sampling_kernel.cpp
++++ models/demos/deepseek_v3_b1/micro_ops/sampling/kernels/sampling_kernel.cpp
+@@ -60,8 +60,8 @@ void kernel_main() {
+         get_named_compile_time_arg_val("sampling_mesh_local_send_slot_offset"),
+         get_named_compile_time_arg_val("sampling_sender_idx"),
+         0,
+-        0xFFFFFFFF,
+-        0,
++        get_named_compile_time_arg_val("sampling_scores_cb"),
++        get_named_compile_time_arg_val("sampling_scores_num_pages"),
+         0xFFFFFFFF,
+         0,
+         get_named_compile_time_arg_val("sampling_winner_cb"),
+@@ -82,7 +82,11 @@ void kernel_main() {
+         get_named_compile_time_arg_val("sampling_scores_scratch_stage2_offset"),
+         get_named_compile_time_arg_val("sampling_indices_scratch_stage2_offset"),
+         get_named_compile_time_arg_val("sampling_scores_scratch_addr"),
+-        get_named_compile_time_arg_val("sampling_indices_scratch_addr")>;
++        get_named_compile_time_arg_val("sampling_indices_scratch_addr"),
++        get_named_compile_time_arg_val("sampling_implicit_indices"),
++        get_named_compile_time_arg_val("sampling_index_base"),
++        get_named_compile_time_arg_val("sampling_scores_tile_width"),
++        get_named_compile_time_arg_val("sampling_scores_tile_hw")>;
+ 
+     deepseek_b1_ops::TopKSampling::ReaderArgs args{
+         .scores_addr = get_common_arg_val<uint32_t>(ncrisc_rt_arg_idx++),
+@@ -134,4 +138,5 @@ void kernel_main() {
+     deepseek_b1_ops::TopKSampling::WriterArgs args{
+         .final_noc_x = get_common_arg_val<uint32_t>(brisc_rt_arg_idx++),
+         .final_noc_y = get_common_arg_val<uint32_t>(brisc_rt_arg_idx++),
++        .output_addr = get_common_arg_val<uint32_t>(brisc_rt_arg_idx++),
+     };
+diff -ruN models/demos/deepseek_v3_b1/unified_kernels/sampling.hpp models/demos/deepseek_v3_b1/unified_kernels/sampling.hpp
+--- models/demos/deepseek_v3_b1/unified_kernels/sampling.hpp
++++ models/demos/deepseek_v3_b1/unified_kernels/sampling.hpp
+@@ -930,7 +930,11 @@ struct TopKSampling {
+         uint32_t ScoresScratchStage2Offset = 0,
+         uint32_t IndicesScratchStage2Offset = 0,
+         uint32_t ScoresScratchAddr = 0,
+-        uint32_t IndicesScratchAddr = 0>
++        uint32_t IndicesScratchAddr = 0,
++        uint32_t ImplicitIndices = 0,
++        uint32_t IndexBase = 0,
++        uint32_t ScoresTileWidth = 0,
++        uint32_t ScoresTileHW = 0>
+     struct ReaderCTArgs {
+         static constexpr uint32_t num_values = NumValues;
+         static constexpr uint32_t topk_k = TopK;
+@@ -985,6 +989,10 @@ struct TopKSampling {
+         static constexpr uint32_t indices_scratch_stage2_offset = IndicesScratchStage2Offset;
+         static constexpr uint32_t scores_scratch_addr = ScoresScratchAddr;
+         static constexpr uint32_t indices_scratch_addr = IndicesScratchAddr;
++        static constexpr bool implicit_indices = ImplicitIndices == 1;
++        static constexpr uint32_t index_base = IndexBase;
++        static constexpr uint32_t scores_tile_width = ScoresTileWidth;
++        static constexpr uint32_t scores_tile_hw = ScoresTileHW;
+     };
+ 
+     template <
+@@ -1136,6 +1144,7 @@ struct TopKSampling {
+     struct WriterArgs {
+         uint32_t final_noc_x;
+         uint32_t final_noc_y;
++        uint32_t output_addr;
+         uint32_t socket_config_addr = 0;
+         // Optional persistent-mode next-iteration signal routing (BRISC path).
+         uint32_t persistent_enable = 0;
+@@ -1326,7 +1334,12 @@ namespace TopKSampling {
+             uint32_t final_noc_x,
+             uint32_t final_noc_y) {
+             const uint64_t final_noc_base = get_noc_addr(final_noc_x, final_noc_y, 0);
+-            const uint64_t dst_sem_noc_addr = final_noc_base | static_cast<uint64_t>(CTArgs::receiver_semaphore_addr);
++#if defined(SAMPLING_PROGRAM_SEMAPHORES)
++            const uint32_t receiver_semaphore_addr = get_semaphore(CTArgs::receiver_semaphore_addr);
++#else
++            const uint32_t receiver_semaphore_addr = CTArgs::receiver_semaphore_addr;
++#endif
++            const uint64_t dst_sem_noc_addr = final_noc_base | static_cast<uint64_t>(receiver_semaphore_addr);
+             noc_async_write_one_packet<true, true>(
+                 local_scores_addr, final_noc_base | dst_scores_l1_addr, CTArgs::topk_scores_slot_bytes);
+             noc_async_write_one_packet<true, true>(
+@@ -1538,7 +1551,26 @@ struct TopKSampling {
+                     auto scores_ptr = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scores_dst);
+                     auto indices_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(indices_dst);
+-                    noc_async_read(get_noc_addr(scores_src), scores_dst, CTArgs::num_values * sizeof(uint16_t));
+-                    noc_async_read(get_noc_addr(indices_src), indices_dst, CTArgs::num_values * sizeof(uint32_t));
++                    if constexpr (CTArgs::scores_tile_hw == 0) {
++                        noc_async_read(get_noc_addr(scores_src), scores_dst, CTArgs::num_values * sizeof(uint16_t));
++                    } else {
++                        auto tiled_scores_ptr = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scores_src);
++                        for (uint32_t i = 0; i < CTArgs::num_values; ++i) {
++                            const uint32_t tile = i / CTArgs::scores_tile_width;
++                            const uint32_t col = i - tile * CTArgs::scores_tile_width;
++                            const uint32_t face_col = col / ELEMS_PER_FACE_ROW;
++                            const uint32_t face_col_offset = col - face_col * ELEMS_PER_FACE_ROW;
++                            scores_ptr[i] = tiled_scores_ptr[tile * CTArgs::scores_tile_hw +
++                                                            face_col * FACE_ELEMS + face_col_offset];
++                        }
++                    }
++                    if constexpr (CTArgs::implicit_indices) {
++                        for (uint32_t i = 0; i < CTArgs::num_values; ++i) {
++                            indices_ptr[i] = CTArgs::index_base + i;
++                        }
++                    } else {
++                        noc_async_read(
++                            get_noc_addr(indices_src), indices_dst, CTArgs::num_values * sizeof(uint32_t));
++                    }
+ 
+                     noc_async_read_barrier();
+ 
+@@ -1595,7 +1627,12 @@ namespace TopKSampling {
+             // Output goes to the winner CB in split layout [K scores | K indices].
+             // The argmax is global_scores[0] / global_indices[0] (descending order).
+             if constexpr (IsFinalCore) {
+-                auto recv_sem_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(CTArgs::receiver_semaphore_addr);
++#if defined(SAMPLING_PROGRAM_SEMAPHORES)
++                const uint32_t receiver_semaphore_addr = get_semaphore(CTArgs::receiver_semaphore_addr);
++#else
++                const uint32_t receiver_semaphore_addr = CTArgs::receiver_semaphore_addr;
++#endif
++                auto recv_sem_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(receiver_semaphore_addr);
+                 {
+                     DeviceZoneScopedN("SP-PHASE2WAIT");
+                     wait_and_reset_semaphore(recv_sem_ptr, CTArgs::expected_remote_incs + 1);
+@@ -1650,4 +1687,9 @@ namespace TopKSampling {
+                                 CTArgs::stage1_local_slot_idx * CTArgs::topk_indices_slot_bytes,
+                             global_scores,
+                             global_indices);
+-                        auto global_sem_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(args.global_sem_addr);
++#if defined(SAMPLING_PROGRAM_SEMAPHORES)
++                        const uint32_t global_sem_addr = get_semaphore(args.global_sem_addr);
++#else
++                        const uint32_t global_sem_addr = args.global_sem_addr;
++#endif
++                        auto global_sem_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(global_sem_addr);
+@@ -1690,9 +1732,13 @@ namespace TopKSampling {
+                                 CTArgs::stage2_local_slot_idx * CTArgs::topk_indices_slot_bytes,
+                             global_scores,
+                             global_indices);
+-
+-                        auto global_stage2_sem_ptr =
+-                            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(args.global_stage2_sem_addr);
++#if defined(SAMPLING_PROGRAM_SEMAPHORES)
++                        const uint32_t global_stage2_sem_addr = get_semaphore(args.global_stage2_sem_addr);
++#else
++                        const uint32_t global_stage2_sem_addr = args.global_stage2_sem_addr;
++#endif
++                        auto global_stage2_sem_ptr =
++                            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(global_stage2_sem_addr);
+                         {
+                             DeviceZoneScopedN("SP-MESH2WAIT");
+                             wait_and_reset_semaphore(global_stage2_sem_ptr, CTArgs::stage2_expected_remote_incs);
+@@ -1832,3 +1879,3 @@ namespace TopKSampling {
+                             DeviceZoneScopedN("SP-FC-FINISH");
+-                            auto output_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(CTArgs::output_addr);
++                            auto output_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(args.output_addr);
+                             output_ptr[0] = selected_index;
