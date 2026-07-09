@@ -1,0 +1,821 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+index 0afbf0f..59c7fce 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -959,6 +959,23 @@ def TTNN_ArgMaxOp : TTNN_Op<"argmax"> {
+   let hasVerifier = 1;
+ }
+ 
++def TTNN_LMHeadSamplingOp : TTNN_Op<"lm_head_sampling", [OpModelExempt]> {
++  let summary = "Fused decode LM-head sampling op.";
++  let description = [{
++    Decode-only fused LM-head sampling. It consumes the final hidden state,
++    applies RMSNorm with the supplied weight, projects through the LM-head
++    weight, and returns the argmax token id.
++  }];
++
++  let arguments = (ins AnyRankedTensor:$input,
++                       AnyRankedTensor:$norm_weight,
++                       AnyRankedTensor:$lm_head_weight,
++                       DefaultValuedAttr<F32Attr, "1e-12">:$epsilon);
++
++  let results = (outs AnyRankedTensor:$result);
++
++}
++
+ def TTNN_ProdOp : TTNN_Op<"prod"> {
+   let summary = "Product reduction op.";
+   let description = [{
+diff --git a/include/ttmlir/Target/TTNN/operations/reduction.fbs b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+index e3fa8a1..08575ae 100644
+--- a/include/ttmlir/Target/TTNN/operations/reduction.fbs
++++ b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+@@ -27,6 +27,15 @@ table ReductionArgMaxOp {
+   memcfg: tt.target.ttnn.MemoryConfig;
+ }
+ 
++table LMHeadSamplingOp {
++  input: tt.target.ttnn.TensorRef;
++  norm_weight: tt.target.ttnn.TensorRef;
++  lm_head_weight: tt.target.ttnn.TensorRef;
++  out: tt.target.ttnn.TensorRef;
++  epsilon: float;
++  memcfg: tt.target.ttnn.MemoryConfig;
++}
++
+ table ReductionProdOp {
+   in: tt.target.ttnn.TensorRef;
+   out: tt.target.ttnn.TensorRef;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+index 073d72f..3d755da 100644
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -89,6 +89,7 @@ union OpType {
+   LayerNormPreAllGatherOp,
+   LayerNormPostAllGatherOp,
+   LinearOp,
++  LMHeadSamplingOp,
+   LoadCachedOp,
+   // ANCHOR: adding_an_op_matmul_fbs_op_type
+   MatmulOp,
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+index ac04b7e..b1eab1c 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -338,6 +338,89 @@ public:
+ 
+ #endif // TTMLIR_ENABLE_OPMODEL
+ 
++class LMHeadSamplingFusing : public mlir::OpRewritePattern<ArgMaxOp> {
++  using OpRewritePattern::OpRewritePattern;
++
++  static bool hasOnlyExpectedUsers(Value value, Operation *expectedUser) {
++    return value.hasOneUse() && *value.user_begin() == expectedUser;
++  }
++
++  static bool isDecodeLMHeadTail(ArgMaxOp argMaxOp, MatmulOp matmulOp,
++                                 RMSNormOp rmsNormOp) {
++    if (!argMaxOp.getDim() ||
++        (*argMaxOp.getDim() != 1 && *argMaxOp.getDim() != -1) ||
++        argMaxOp.getKeepDim()) {
++      return false;
++    }
++    if (matmulOp.getTransposeA() || !matmulOp.getTransposeB() ||
++        matmulOp.getActivation()) {
++      return false;
++    }
++    if (!rmsNormOp.getWeight() || rmsNormOp.getBias()) {
++      return false;
++    }
++    auto inputType =
++        mlir::dyn_cast<RankedTensorType>(rmsNormOp.getInput().getType());
++    auto logitsType =
++        mlir::dyn_cast<RankedTensorType>(matmulOp.getResult().getType());
++    if (!inputType || !logitsType || inputType.getRank() < 2 ||
++        logitsType.getRank() != 2) {
++      return false;
++    }
++    constexpr int64_t kDecodeSequenceLength = 1;
++    constexpr int64_t kMinShardWidth = 2048;
++    constexpr int64_t kShardCores = 16;
++    constexpr int64_t kTileWidth = 32;
++    const ArrayRef<int64_t> inputShape = inputType.getShape();
++    const ArrayRef<int64_t> logitsShape = logitsType.getShape();
++    const int64_t sequenceLength = inputShape[inputType.getRank() - 2];
++    const int64_t hidden = inputShape.back();
++    const int64_t batch = logitsShape[0];
++    const int64_t vocab = logitsShape[1];
++    if (ShapedType::isDynamic(sequenceLength) ||
++        ShapedType::isDynamic(hidden) || ShapedType::isDynamic(batch) ||
++        ShapedType::isDynamic(vocab)) {
++      return false;
++    }
++    return sequenceLength == kDecodeSequenceLength && batch == 1 &&
++           hidden >= kMinShardWidth &&
++           hidden % (kShardCores * kTileWidth) == 0 && vocab > 0;
++  }
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(ArgMaxOp argMaxOp,
++                  mlir::PatternRewriter &rewriter) const override {
++    auto matmulOp = argMaxOp.getInput().getDefiningOp<MatmulOp>();
++    if (!matmulOp) {
++      return failure();
++    }
++
++    auto rmsNormOp = matmulOp.getA().getDefiningOp<RMSNormOp>();
++    if (!rmsNormOp ||
++        !isDecodeLMHeadTail(argMaxOp, matmulOp, rmsNormOp) ||
++        !hasOnlyExpectedUsers(matmulOp.getResult(), argMaxOp) ||
++        !hasOnlyExpectedUsers(rmsNormOp.getResult(), matmulOp)) {
++      return failure();
++    }
++
++    rewriter.setInsertionPoint(rmsNormOp);
++    auto fusedOp = rewriter.create<LMHeadSamplingOp>(
++        argMaxOp.getLoc(), argMaxOp.getResult().getType(), rmsNormOp.getInput(),
++        rmsNormOp.getWeight(), matmulOp.getB(), rmsNormOp.getEpsilon());
++    if (auto weightDtype =
++            matmulOp->getAttrOfType<mlir::StringAttr>("ttcore.weight_dtype")) {
++      fusedOp->setAttr("ttcore.weight_dtype", weightDtype);
++    }
++
++    rewriter.replaceOp(argMaxOp, fusedOp.getResult());
++    rewriter.eraseOp(matmulOp);
++    rewriter.eraseOp(rmsNormOp);
++
++    return success();
++  }
++};
++
+ class TTNNFusingPass : public impl::TTNNFusingBase<TTNNFusingPass> {
+ public:
+   using impl::TTNNFusingBase<TTNNFusingPass>::TTNNFusingBase;
+@@ -354,7 +441,8 @@ public:
+         TTNNMatmulAndLinearWithActivation<MatmulOp, SiluOp>,
+         TTNNMatmulAndLinearWithActivation<LinearOp, SiluOp>,
+         TTNNMatmulAndLinearWithActivation<MatmulOp, GeluOp>,
+-        TTNNMatmulAndLinearWithActivation<LinearOp, GeluOp>>(&getContext());
++        TTNNMatmulAndLinearWithActivation<LinearOp, GeluOp>,
++        LMHeadSamplingFusing>(&getContext());
+ 
+ #ifdef TTMLIR_ENABLE_OPMODEL
+     if (enableOpConstraints) {
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp b/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp
+index b45965a..a93c230 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp
+@@ -25,9 +25,27 @@ static bool isLegalWeightDtype(ttcore::DataType dtype) {
+          dtype == ttcore::DataType::BFloat16;
+ }
+ 
+-// Template pattern to rewrite Matmul/Linear operations to use a specified
+-// weight dtype. This pattern matches ops where the weight (B operand) is
+-// bf16/f32, and inserts a typecast operation to convert it to the target dtype.
++template <typename OpTy>
++static auto getWeightOperand(OpTy op) {
++  return op.getB();
++}
++
++static auto getWeightOperand(LMHeadSamplingOp op) {
++  return op.getLmHeadWeight();
++}
++
++template <typename OpTy>
++static void setWeightOperand(OpTy op, mlir::Value weight) {
++  op.getBMutable().assign(weight);
++}
++
++static void setWeightOperand(LMHeadSamplingOp op, mlir::Value weight) {
++  op.getLmHeadWeightMutable().assign(weight);
++}
++
++// Template pattern to rewrite ops with a matmul weight operand to use a
++// specified weight dtype. This pattern matches ops where the weight is bf16/f32,
++// and inserts a typecast operation to convert it to the target dtype.
+ //
+ // The effective dtype is resolved per-op: if the op carries a
+ // "ttcore.weight_dtype" discardable attribute (propagated from function args
+@@ -42,8 +63,7 @@ public:
+ 
+   mlir::LogicalResult
+   matchAndRewrite(OpTy op, mlir::PatternRewriter &rewriter) const override {
+-    // Get the weight operand (B operand).
+-    auto weight = op.getB();
++    auto weight = getWeightOperand(op);
+ 
+     // Check if weight traces to constant/parameter arguments.
+     if (!ttcore::valueTracesToConstantArgs(weight)) {
+@@ -137,6 +157,6 @@ public:
+     // defeating per-op overrides (e.g. bf16 overridden by global bfp_bf8).
+     // The attribute is discardable and harmless in the final IR.
+-    rewriter.modifyOpInPlace(op, [&]() { op.getBMutable().assign(newWeight); });
++    rewriter.modifyOpInPlace(op, [&]() { setWeightOperand(op, newWeight); });
+ 
+     return mlir::success();
+   }
+@@ -168,7 +188,8 @@ public:
+     mlir::RewritePatternSet patterns(&getContext());
+     patterns.add<WeightDtypeConversionPattern<MatmulOp>,
+                  WeightDtypeConversionPattern<LinearOp>,
+-                 WeightDtypeConversionPattern<SparseMatmulOp>>(&getContext(),
++                 WeightDtypeConversionPattern<SparseMatmulOp>,
++                 WeightDtypeConversionPattern<LMHeadSamplingOp>>(&getContext(),
+                                                                globalDtype);
+ 
+     if (failed(
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+index 8160ec9..3580c56 100644
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -2655,6 +2655,24 @@ createReductionArgMaxOp(FlatbufferObjectCache &cache, ReductionOp op) {
+       *cache.fbb, in, output, dim, op.getKeepDim(), memoryConfig);
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::LMHeadSamplingOp>
++createOp(FlatbufferObjectCache &cache, LMHeadSamplingOp op) {
++  auto input = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getInput()));
++  auto normWeight = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getNormWeight()));
++  auto lmHeadWeight = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getLmHeadWeight()));
++  auto output =
++      cache.getOrCreateNoSharding(op.getResult(), tensorValueToFlatbuffer,
++                                  /*local_shape*/ std::nullopt);
++  auto memoryConfig = toFlatbuffer(cache, op.getMemoryConfigAttr());
++
++  return ::tt::target::ttnn::CreateLMHeadSamplingOp(
++      *cache.fbb, input, normWeight, lmHeadWeight, output,
++      op.getEpsilon().convertToFloat(), memoryConfig);
++}
++
+ template <typename ReductionOp>
+ ::flatbuffers::Offset<::tt::target::ttnn::ReductionProdOp>
+ createReductionProdOp(FlatbufferObjectCache &cache, ReductionOp op) {
+@@ -4559,6 +4579,11 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createReductionArgMaxOp(cache, argMaxOp),
+                            debugString, locInfo);
+   }
++  if (auto lmHeadSamplingOp = dyn_cast<LMHeadSamplingOp>(op);
++      lmHeadSamplingOp) {
++    return createOperation(cache, createOp(cache, lmHeadSamplingOp),
++                           debugString, locInfo);
++  }
+   if (auto prodOp = dyn_cast<ProdOp>(op); prodOp) {
+     return createOperation(cache, createReductionProdOp(cache, prodOp),
+                            debugString, locInfo);
+diff --git a/runtime/lib/ttnn/operations/reduction/lm_head_sampling.cpp b/runtime/lib/ttnn/operations/reduction/lm_head_sampling.cpp
+new file mode 100644
+index 0000000..e27790e
+--- /dev/null
++++ b/runtime/lib/ttnn/operations/reduction/lm_head_sampling.cpp
+@@ -0,0 +1,495 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#include "tt/runtime/detail/ttnn/operations/utils.h"
++#include "tt/runtime/detail/ttnn/ttnn.h"
++#include "tt/runtime/detail/ttnn/types/types.h"
++#include "tt/runtime/detail/ttnn/utils.h"
++#include "ttmlir/Target/TTNN/program_generated.h"
++#include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
++#include "ttnn/operations/generic/generic_op.hpp"
++#include "ttnn/operations/normalization/layernorm/device/layernorm_common.hpp"
++#include "ttnn/tensor/tensor_ops.hpp"
++#include "ttnn/tensor/tensor_utils.hpp"
++
++#include <tt-metalium/constants.hpp>
++#include <tt-metalium/experimental/tensor/tensor_types.hpp>
++#include <tt-metalium/program_descriptors.hpp>
++#include <tt-metalium/tile.hpp>
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <optional>
++#include <variant>
++#include <vector>
++
++namespace tt::runtime::ttnn::operations::reduction {
++namespace {
++
++::ttnn::MemoryConfig createDecodeRMSNormShardConfig(
++    const ::ttnn::Tensor &input) {
++  const ::ttnn::Shape &shape = input.logical_shape();
++  constexpr uint32_t kShardGridWidth = 8;
++  constexpr uint32_t kShardGridHeight = 2;
++  constexpr uint32_t kShardCores = kShardGridWidth * kShardGridHeight;
++  const uint32_t width = static_cast<uint32_t>(shape[-1]);
++  const uint32_t shardWidth = width / kShardCores;
++
++  const auto grid = ::tt::tt_metal::CoreRangeSet(
++      {::tt::tt_metal::CoreRange({0, 0},
++                                  {kShardGridWidth - 1,
++                                   kShardGridHeight - 1})});
++  return ::ttnn::operations::data_movement::create_sharded_memory_config(
++      shape, grid, ::ttnn::operations::data_movement::ShardStrategy::WIDTH,
++      ::tt::tt_metal::ShardOrientation::ROW_MAJOR,
++      std::array<uint32_t, 2>{tt::constants::TILE_HEIGHT, shardWidth},
++      ::ttnn::Layout::TILE);
++}
++
++constexpr uint32_t kSamplingWinnerCb = 3;
++constexpr uint32_t kSamplingTopkInScoresCb = 4;
++constexpr uint32_t kSamplingTopkInIndicesCb = 5;
++constexpr uint32_t kSamplingTopkOutScoresCb = 6;
++constexpr uint32_t kSamplingTopkOutIndicesCb = 14;
++constexpr uint32_t kMatmulOutCb = 16;
++constexpr uint32_t kSamplingMaskCb = 17;
++constexpr uint32_t kSamplingSoftmaxInCb = 24;
++constexpr uint32_t kSamplingSoftmaxOutCb = 25;
++constexpr uint32_t kSamplingSoftmaxExpCb = 26;
++constexpr uint32_t kSamplingSoftmaxSubCb = 27;
++constexpr uint32_t kSamplingMaxCb = 28;
++constexpr uint32_t kSamplingSumCb = 29;
++constexpr uint32_t kSamplingScalerCb = 31;
++constexpr uint32_t kSamplingProbsOutCb = 32;
++constexpr uint32_t kSamplingRandCb = 33;
++constexpr uint32_t kSamplingReceiverSemaphore = 0;
++constexpr uint32_t kSamplingLocalReadySemaphore = 1;
++constexpr uint32_t kSamplingGlobalSemaphore = 2;
++constexpr uint32_t kSamplingGlobalStage2Semaphore = 3;
++
++uint32_t floatToBits(float value) {
++  uint32_t bits;
++  std::memcpy(&bits, &value, sizeof(bits));
++  return bits;
++}
++
++uint32_t packedBfloat16(float value) {
++  const uint32_t bits = floatToBits(value);
++  const uint32_t bf16 = (bits + 0x8000u) >> 16;
++  return (bf16 << 16) | bf16;
++}
++
++uint32_t roundUp(uint32_t value, uint32_t alignment) {
++  return ((value + alignment - 1) / alignment) * alignment;
++}
++
++::tt::tt_metal::CoreRangeSet singleCoreSet(::tt::tt_metal::CoreCoord core) {
++  return ::tt::tt_metal::CoreRangeSet(
++      ::tt::tt_metal::CoreRange(core, core));
++}
++
++::tt::tt_metal::CoreRangeSet
++coreSetFromCores(const std::vector<::tt::tt_metal::CoreCoord> &cores) {
++  std::vector<::tt::tt_metal::CoreRange> ranges;
++  ranges.reserve(cores.size());
++  for (const auto &core : cores) {
++    ranges.emplace_back(core, core);
++  }
++  return ::tt::tt_metal::CoreRangeSet(std::move(ranges));
++}
++
++::ttnn::MemoryConfig heightShardL1(::tt::tt_metal::CoreCoord core,
++                                   std::array<uint32_t, 2> shardShape) {
++  return ::ttnn::MemoryConfig(
++      ::ttnn::TensorMemoryLayout::HEIGHT_SHARDED, ::ttnn::BufferType::L1,
++      ::tt::tt_metal::ShardSpec(singleCoreSet(core), shardShape,
++                                ::tt::tt_metal::ShardOrientation::ROW_MAJOR));
++}
++
++::ttnn::MemoryConfig widthShardL1(const ::tt::tt_metal::CoreRangeSet &grid,
++                                  std::array<uint32_t, 2> shardShape) {
++  return ::ttnn::MemoryConfig(
++      ::ttnn::TensorMemoryLayout::WIDTH_SHARDED, ::ttnn::BufferType::L1,
++      ::tt::tt_metal::ShardSpec(grid, shardShape,
++                                ::tt::tt_metal::ShardOrientation::ROW_MAJOR));
++}
++
++::ttnn::Tensor createDeviceTensor(
++    const ::ttnn::Shape &shape, ::ttnn::DataType dtype, ::ttnn::Layout layout,
++    std::optional<::tt::tt_metal::Tile> tile,
++    const ::ttnn::MemoryConfig &memoryConfig,
++    ::tt::tt_metal::distributed::MeshDevice *device) {
++  const ::tt::tt_metal::PageConfig pageConfig(layout, tile);
++  return ::tt::tt_metal::create_device_tensor(
++      ::ttnn::TensorSpec(
++          shape, ::tt::tt_metal::TensorLayout(dtype, pageConfig, memoryConfig)),
++      device);
++}
++
++using NamedArgs = ::tt::tt_metal::KernelDescriptor::NamedCompileTimeArgs;
++
++void add(NamedArgs &args, const std::string &name, uint32_t value) {
++  args.emplace_back(name, value);
++}
++
++::tt::tt_metal::CBDescriptor makeScratchCb(
++    uint32_t cb, ::ttnn::DataType dtype, uint32_t pageSize,
++    uint32_t totalSize, const ::tt::tt_metal::CoreRangeSet &cores,
++    std::optional<::tt::tt_metal::TileDescriptor> tile = std::nullopt) {
++  ::tt::tt_metal::CBDescriptor desc;
++  desc.total_size = totalSize;
++  desc.core_ranges = cores;
++  desc.format_descriptors.push_back(
++      ::tt::tt_metal::CBFormatDescriptor{
++          static_cast<uint8_t>(cb),
++          ::tt::tt_metal::datatype_to_dataformat_converter(dtype), pageSize,
++          tile});
++  return desc;
++}
++
++::tt::tt_metal::KernelDescriptor makeSamplingKernel(
++    const ::tt::tt_metal::CoreCoord &core, const NamedArgs &namedArgs,
++    ::tt::tt_metal::KernelDescriptor::ConfigDescriptor config,
++    const ::tt::tt_metal::KernelDescriptor::RTArgList &commonArgs) {
++  ::tt::tt_metal::KernelDescriptor kernel;
++  kernel.kernel_source =
++      "models/demos/deepseek_v3_b1/micro_ops/sampling/kernels/"
++      "sampling_kernel.cpp";
++  kernel.source_type =
++      ::tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
++  kernel.core_ranges = singleCoreSet(core);
++  kernel.named_compile_time_args = namedArgs;
++  kernel.defines = {{"SAMPLING_PROGRAM_SEMAPHORES", "1"}};
++  kernel.config = std::move(config);
++  kernel.emplace_common_runtime_args(commonArgs);
++  return kernel;
++}
++
++::tt::tt_metal::CoreRangeSet rowWiseCorePrefix(
++    ::tt::tt_metal::CoreCoord gridSize, uint32_t numCores) {
++  std::vector<::tt::tt_metal::CoreRange> ranges;
++  const uint32_t fullRows = numCores / gridSize.x;
++  const uint32_t tail = numCores % gridSize.x;
++  if (fullRows > 0) {
++    ranges.emplace_back(::tt::tt_metal::CoreCoord{0, 0},
++                        ::tt::tt_metal::CoreCoord{gridSize.x - 1,
++                                                  fullRows - 1});
++  }
++  if (tail > 0) {
++    ranges.emplace_back(::tt::tt_metal::CoreCoord{0, fullRows},
++                        ::tt::tt_metal::CoreCoord{tail - 1, fullRows});
++  }
++  return ::tt::tt_metal::CoreRangeSet(std::move(ranges));
++}
++
++uint32_t paddedShardWidth(uint32_t width, uint32_t cores) {
++  return roundUp((width + cores - 1) / cores, tt::constants::TILE_WIDTH);
++}
++
++void addSamplingCommonNamedArgs(
++    NamedArgs &args, uint32_t numSenders,
++    uint32_t topkScoresSlotBytes, uint32_t winnerPageBytes,
++    uint32_t phase2ScoresByteOffset, uint32_t phase2IndicesByteOffset,
++    uint32_t receiverSemaphoreAddr, uint32_t localReadySemaphoreAddr,
++    uint32_t scoresCb, uint32_t scoresNumPages, uint32_t scoresTileWidth,
++    uint32_t scoresTileHW) {
++  add(args, "sampling_topk_k", 1);
++  add(args, "sampling_winner_page_bytes", winnerPageBytes);
++  add(args, "sampling_num_senders", numSenders);
++  add(args, "sampling_expected_remote_incs", numSenders - 1);
++  add(args, "sampling_receiver_semaphore_addr", receiverSemaphoreAddr);
++  add(args, "sampling_local_ready_semaphore_addr", localReadySemaphoreAddr);
++  add(args, "sampling_mesh_mode", 0);
++  add(args, "sampling_stage1_sender", 0);
++  add(args, "sampling_stage1_receiver", 0);
++  add(args, "sampling_stage2_sender", 0);
++  add(args, "sampling_stage2_receiver", 0);
++  add(args, "sampling_stage1_slot_base_offset", 0);
++  add(args, "sampling_stage1_num_slots", 0);
++  add(args, "sampling_stage1_expected_remote_incs", 0);
++  add(args, "sampling_stage1_local_slot_offset", 0);
++  add(args, "sampling_stage2_slot_base_offset", 0);
++  add(args, "sampling_stage2_num_slots", 0);
++  add(args, "sampling_stage2_expected_remote_incs", 0);
++  add(args, "sampling_stage2_local_slot_offset", 0);
++  add(args, "sampling_mesh_local_send_slot_offset", 0);
++  add(args, "sampling_winner_cb", kSamplingWinnerCb);
++  add(args, "sampling_softmax_in_cb", kSamplingSoftmaxInCb);
++  add(args, "sampling_softmax_out_cb", kSamplingSoftmaxOutCb);
++  add(args, "sampling_softmax_exp_cb", kSamplingSoftmaxExpCb);
++  add(args, "sampling_softmax_sub_cb", kSamplingSoftmaxSubCb);
++  add(args, "sampling_max_cb", kSamplingMaxCb);
++  add(args, "sampling_sum_cb", kSamplingSumCb);
++  add(args, "sampling_scaler_cb", kSamplingScalerCb);
++  add(args, "sampling_probs_out_cb", kSamplingProbsOutCb);
++  add(args, "sampling_rand_cb", kSamplingRandCb);
++  add(args, "sampling_seed", 2005);
++  add(args, "sampling_inv_temp_bf16", packedBfloat16(1.0f));
++  add(args, "sampling_p_bf16", floatToBits(1.0f));
++  add(args, "sampling_topk_scores_slot_bytes", topkScoresSlotBytes);
++  add(args, "sampling_topk_in_scores_cb", kSamplingTopkInScoresCb);
++  add(args, "sampling_topk_in_indices_cb", kSamplingTopkInIndicesCb);
++  add(args, "sampling_topk_out_scores_cb", kSamplingTopkOutScoresCb);
++  add(args, "sampling_topk_out_indices_cb", kSamplingTopkOutIndicesCb);
++  add(args, "sampling_phase2_scores_byte_offset", phase2ScoresByteOffset);
++  add(args, "sampling_phase2_indices_byte_offset", phase2IndicesByteOffset);
++  add(args, "sampling_mesh_stage_scores_cb", 0xFFFFFFFFu);
++  add(args, "sampling_mesh_stage_indices_cb", 0xFFFFFFFFu);
++  add(args, "sampling_scores_scratch_stage2_offset", 0);
++  add(args, "sampling_indices_scratch_stage2_offset", 0);
++  add(args, "sampling_scores_scratch_addr", 0);
++  add(args, "sampling_indices_scratch_addr", 0);
++  add(args, "sampling_scores_cb", scoresCb);
++  add(args, "sampling_scores_num_pages", scoresNumPages);
++  add(args, "sampling_scores_tile_width", scoresTileWidth);
++  add(args, "sampling_scores_tile_hw", scoresTileHW);
++  add(args, "sampling_implicit_indices", 1);
++  add(args, "sampling_loop_mcast_start_x", 0);
++  add(args, "sampling_loop_mcast_start_y", 0);
++  add(args, "sampling_loop_mcast_end_x", 0);
++  add(args, "sampling_loop_mcast_end_y", 0);
++  add(args, "sampling_loop_num_dests", 0);
++  add(args, "sampling_num_internal_iterations", 1);
++  add(args, "sampling_output_addr", 0);
++  add(args, "sampling_rand_output_addr", 0);
++  add(args, "sampling_enable_metadata", 0);
++  add(args, "sampling_copy_probabilities", 0);
++  add(args, "sampling_metadata_address", 0);
++  add(args, "sampling_copy_probabilities_to_q", 0);
++  add(args, "sampling_p_bcast_cb", kSamplingSoftmaxSubCb);
++  add(args, "sampling_rand_bcast_cb", kSamplingSumCb);
++  add(args, "sampling_mask_cb", kSamplingMaskCb);
++  add(args, "sampling_stage1_row_elements", 0);
++  add(args, "sampling_stage1_num_input_tiles", 0);
++  add(args, "sampling_stage2_row_elements", 0);
++  add(args, "sampling_stage2_num_input_tiles", 0);
++}
++
++::ttnn::Tensor runShardedArgmaxSampling(
++    const ::ttnn::Tensor &scores, uint32_t vocab, uint32_t nPerCore,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig) {
++  const auto &scoreShard = *scores.shard_spec();
++  auto device = scores.device();
++  const std::vector<::tt::tt_metal::CoreCoord> samplingCores =
++      ::tt::tt_metal::corerange_to_cores(scoreShard.grid, std::nullopt,
++                                         /*row_wise=*/true);
++  const ::tt::tt_metal::CoreCoord finalCore = samplingCores.front();
++  const auto samplingGrid = coreSetFromCores(samplingCores);
++  const auto finalCoreSet = singleCoreSet(finalCore);
++
++  const auto outputIndexMemConfig = heightShardL1(finalCore, {1, 1});
++  ::ttnn::Tensor outputIndex = createDeviceTensor(
++      ::ttnn::Shape({1, 1}), ::ttnn::DataType::UINT32,
++      ::ttnn::Layout::ROW_MAJOR, std::nullopt, outputIndexMemConfig, device);
++
++  const uint32_t samplingMinAlignment = 32;
++  const uint32_t samplingL1Alignment = 16;
++  const uint32_t bf16TileSize = 2 * 32 * 32;
++  const uint32_t uint32TileSize = 4 * 32 * 32;
++  const uint32_t topkScoresSlotBytes =
++      roundUp(samplingMinAlignment * 2, samplingL1Alignment);
++  const uint32_t topkIndicesSlotBytes =
++      roundUp(samplingMinAlignment * 4, samplingL1Alignment);
++  const uint32_t winnerPageBytes =
++      topkScoresSlotBytes + topkIndicesSlotBytes;
++  const uint32_t phase1Tiles = (nPerCore + 1023) / 1024;
++  const uint32_t phase2Tiles =
++      (samplingMinAlignment * samplingCores.size() + 1023) / 1024;
++  const uint32_t totalInputTiles = phase1Tiles + phase2Tiles;
++  const uint32_t phase2ScoresByteOffset = phase1Tiles * bf16TileSize;
++  const uint32_t phase2IndicesByteOffset = phase1Tiles * uint32TileSize;
++  const auto scoreTile = scores.tensor_spec().tile();
++  const uint32_t scoreTileWidth = scoreTile.get_width();
++  const uint32_t scoreTileHW = scoreTile.get_height() * scoreTileWidth;
++  const uint32_t scoresNumPages =
++      (nPerCore + scoreTileWidth - 1) / scoreTileWidth;
++
++  ::tt::tt_metal::ProgramDescriptor program;
++  program.semaphores.push_back({
++      .id = kSamplingReceiverSemaphore,
++      .core_type = ::tt::CoreType::WORKER,
++      .core_ranges = samplingGrid,
++      .initial_value = 0,
++  });
++  program.semaphores.push_back({
++      .id = kSamplingLocalReadySemaphore,
++      .core_type = ::tt::CoreType::WORKER,
++      .core_ranges = samplingGrid,
++      .initial_value = 0,
++  });
++  program.semaphores.push_back({
++      .id = kSamplingGlobalSemaphore,
++      .core_type = ::tt::CoreType::WORKER,
++      .core_ranges = samplingGrid,
++      .initial_value = 0,
++  });
++  program.semaphores.push_back({
++      .id = kSamplingGlobalStage2Semaphore,
++      .core_type = ::tt::CoreType::WORKER,
++      .core_ranges = samplingGrid,
++      .initial_value = 0,
++  });
++  program.cbs.push_back(::tt::tt_metal::cb_descriptor_from_sharded_tensor(
++      kMatmulOutCb, scores));
++  program.cbs.push_back(makeScratchCb(
++      kSamplingWinnerCb, ::ttnn::DataType::UINT32, winnerPageBytes,
++      winnerPageBytes, samplingGrid));
++  for (uint32_t cb :
++       {kSamplingSoftmaxInCb, kSamplingSoftmaxOutCb, kSamplingSoftmaxExpCb,
++        kSamplingSoftmaxSubCb, kSamplingMaxCb, kSamplingSumCb,
++        kSamplingScalerCb, kSamplingProbsOutCb, kSamplingRandCb,
++        kSamplingMaskCb}) {
++    program.cbs.push_back(makeScratchCb(cb, ::ttnn::DataType::BFLOAT16,
++                                        bf16TileSize, bf16TileSize,
++                                        finalCoreSet));
++  }
++  program.cbs.push_back(makeScratchCb(
++      kSamplingTopkInScoresCb, ::ttnn::DataType::BFLOAT16, bf16TileSize,
++      totalInputTiles * bf16TileSize, samplingGrid));
++  program.cbs.push_back(makeScratchCb(
++      kSamplingTopkInIndicesCb, ::ttnn::DataType::UINT32, uint32TileSize,
++      totalInputTiles * uint32TileSize, samplingGrid));
++  program.cbs.push_back(makeScratchCb(
++      kSamplingTopkOutScoresCb, ::ttnn::DataType::BFLOAT16, bf16TileSize,
++      bf16TileSize, samplingGrid));
++  program.cbs.push_back(makeScratchCb(
++      kSamplingTopkOutIndicesCb, ::ttnn::DataType::UINT32, uint32TileSize,
++      uint32TileSize, samplingGrid));
++
++  const auto finalCorePhys = device->worker_core_from_logical_core(finalCore);
++  NamedArgs baseArgs;
++  addSamplingCommonNamedArgs(
++      baseArgs, samplingCores.size(), topkScoresSlotBytes,
++      winnerPageBytes, phase2ScoresByteOffset, phase2IndicesByteOffset,
++      kSamplingReceiverSemaphore, kSamplingLocalReadySemaphore,
++      kMatmulOutCb, scoresNumPages, scoreTileWidth, scoreTileHW);
++
++  ::tt::tt_metal::KernelDescriptor::RTArgList ncriscArgs;
++  ncriscArgs.push_back(scores.mesh_tensor());
++  ncriscArgs.push_back(0u);
++  ncriscArgs.push_back(outputIndex.mesh_tensor());
++  ncriscArgs.push_back(finalCorePhys.x);
++  ncriscArgs.push_back(finalCorePhys.y);
++  ncriscArgs.push_back(kSamplingGlobalSemaphore);
++  ncriscArgs.push_back(kSamplingGlobalStage2Semaphore);
++
++  ::tt::tt_metal::KernelDescriptor::RTArgList briscArgs;
++  briscArgs.push_back(finalCorePhys.x);
++  briscArgs.push_back(finalCorePhys.y);
++  briscArgs.push_back(outputIndex.mesh_tensor());
++
++  for (uint32_t i = 0; i < samplingCores.size(); ++i) {
++    const auto &core = samplingCores[i];
++    const uint32_t start = i * nPerCore;
++    const uint32_t valid = start < vocab ? std::min(nPerCore, vocab - start) : 0;
++    NamedArgs coreArgs = baseArgs;
++    add(coreArgs, "sampling_is_active_core", valid > 0 ? 1 : 0);
++    add(coreArgs, "sampling_is_final_core", core == finalCore ? 1 : 0);
++    add(coreArgs, "sampling_mesh_sender_core", 0);
++    add(coreArgs, "sampling_sender_idx", i);
++    add(coreArgs, "sampling_index_base", start);
++    add(coreArgs, "sampling_num_values", std::max<uint32_t>(valid, 1));
++
++    program.kernels.push_back(makeSamplingKernel(
++        core, coreArgs,
++        ::tt::tt_metal::DataMovementConfigDescriptor{
++            ::tt::tt_metal::DataMovementProcessor::RISCV_1,
++            ::tt::tt_metal::NOC::RISCV_0_default,
++            ::tt::tt_metal::NOC_MODE::DM_DYNAMIC_NOC},
++        ncriscArgs));
++    program.kernels.push_back(makeSamplingKernel(
++        core, coreArgs,
++        ::tt::tt_metal::DataMovementConfigDescriptor{
++            ::tt::tt_metal::DataMovementProcessor::RISCV_0,
++            ::tt::tt_metal::NOC::RISCV_1_default,
++            ::tt::tt_metal::NOC_MODE::DM_DYNAMIC_NOC},
++        briscArgs));
++    program.kernels.push_back(makeSamplingKernel(
++        core, coreArgs,
++        ::tt::tt_metal::ComputeConfigDescriptor{
++            ::tt::tt_metal::MathFidelity::LoFi,
++            /*fp32_dest_acc_en=*/true, /*dst_full_sync_en=*/false, {},
++            /*bfp8_pack_precise=*/false, /*math_approx_mode=*/false},
++        {}));
++  }
++
++  ::ttnn::Tensor result = ::ttnn::generic_op({scores, outputIndex}, program);
++  if (outputMemoryConfig && result.memory_config() != *outputMemoryConfig) {
++    result = ::ttnn::to_memory_config(result, *outputMemoryConfig);
++  }
++  return result;
++}
++
++::ttnn::Tensor runShardedSampling(
++    const ::ttnn::Tensor &normalized, const ::ttnn::Tensor &lmHeadWeight,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig) {
++  const ::ttnn::Shape &weightShape = lmHeadWeight.logical_shape();
++  const uint32_t vocab = static_cast<uint32_t>(weightShape[-2]);
++  auto device = normalized.device();
++  const auto fullGrid = device->compute_with_storage_grid_size();
++  const uint32_t maxCores = fullGrid.x * fullGrid.y;
++  const uint32_t nPerCore = paddedShardWidth(vocab, maxCores);
++  const uint32_t usedCores =
++      std::min(maxCores, (vocab + nPerCore - 1) / nPerCore);
++  const auto grid = rowWiseCorePrefix(fullGrid, usedCores);
++  const auto logitsMemoryConfig =
++      widthShardL1(grid, {tt::constants::TILE_HEIGHT, nPerCore});
++  const ::ttnn::Shape &inputShape = normalized.logical_shape();
++  const uint32_t hidden = static_cast<uint32_t>(inputShape[-1]);
++  const uint32_t hiddenPerCore = paddedShardWidth(hidden, usedCores);
++  const auto inputMemoryConfig =
++      widthShardL1(grid, {tt::constants::TILE_HEIGHT, hiddenPerCore});
++  ::ttnn::Tensor shardedNormalized =
++      ::ttnn::to_memory_config(normalized, inputMemoryConfig);
++  ::ttnn::Tensor logits = ::ttnn::matmul(
++      shardedNormalized, lmHeadWeight,
++      /*transpose_a=*/false, /*transpose_b=*/true,
++      /*memory_config=*/logitsMemoryConfig,
++      /*dtype=*/::ttnn::DataType::BFLOAT16,
++      /*program_config=*/std::nullopt, /*activation=*/std::nullopt,
++      /*compute_kernel_config=*/std::nullopt, /*core_grid=*/std::nullopt,
++      /*output_tile=*/std::nullopt, /*optional_output_tensor=*/std::nullopt);
++  return runShardedArgmaxSampling(logits, vocab, nPerCore, outputMemoryConfig);
++}
++
++} // namespace
++
++void run(const ::tt::target::ttnn::LMHeadSamplingOp *op,
++         ProgramContext &context) {
++  ProgramTensorPool &tensorPool = context.getTensorPool();
++
++  const ::ttnn::Tensor &input =
++      tensorPool.getTTNNTensorAndValidate(op->input());
++  const ::ttnn::Tensor &normWeight =
++      tensorPool.getTTNNTensorAndValidate(op->norm_weight());
++  const ::ttnn::Tensor &lmHeadWeight =
++      tensorPool.getTTNNTensorAndValidate(op->lm_head_weight());
++
++  std::optional<::ttnn::MemoryConfig> outputMemoryConfig =
++      ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(op->memcfg());
++
++  const ::ttnn::MemoryConfig shardConfig =
++      createDecodeRMSNormShardConfig(input);
++  ::ttnn::Tensor rmsInput = ::ttnn::to_memory_config(input, shardConfig);
++  std::optional<::ttnn::prim::LayerNormProgramConfig> programConfig =
++      ::ttnn::prim::create_layernorm_program_config(
++          rmsInput.shard_spec(), rmsInput.tensor_spec().tile().get_height(),
++          rmsInput.tensor_spec().tile().get_width());
++
++  ::ttnn::Tensor normalized = ::ttnn::rms_norm(
++      rmsInput, op->epsilon(), std::optional<::ttnn::Tensor>(normWeight),
++      /*bias=*/std::nullopt, /*residual_input_tensor=*/std::nullopt,
++      shardConfig, programConfig,
++      /*compute_kernel_config=*/std::nullopt);
++
++  ::ttnn::Tensor output =
++      runShardedSampling(normalized, lmHeadWeight, outputMemoryConfig);
++
++  tensorPool.insertTTNNTensorAndValidate(op->out(), output);
++}
++
++} // namespace tt::runtime::ttnn::operations::reduction
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+index 6cf28dd..e78e745 100644
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -133,3 +133,7 @@
+ #include <cstring>
+-
++namespace tt::runtime::ttnn::operations::reduction {
++void run(const ::tt::target::ttnn::LMHeadSamplingOp *op,
++         ProgramContext &context);
++} // namespace tt::runtime::ttnn::operations::reduction
++
+ namespace tt::runtime::ttnn {
+@@ -368,6 +372,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+     return operations::reduction::run(op->type_as_ReductionArgMaxOp(),
+                                       getContext());
+   }
++  case ::tt::target::ttnn::OpType::LMHeadSamplingOp: {
++    return operations::reduction::run(op->type_as_LMHeadSamplingOp(),
++                                      getContext());
++  }
+   case ::tt::target::ttnn::OpType::ReductionProdOp: {
+     return operations::reduction::run(op->type_as_ReductionProdOp(),
+                                       getContext());
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+index f2862cb..1f26a21 100644
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -1246,6 +1246,10 @@ std::vector<tt::runtime::TensorRef> getOpOutputRefs(OpContext opContextHandle) {
+     tensorRefs = {opContext.type_as_ReductionArgMaxOp()->out()};
+     break;
+   }
++  case ::tt::target::ttnn::OpType::LMHeadSamplingOp: {
++    tensorRefs = {opContext.type_as_LMHeadSamplingOp()->out()};
++    break;
++  }
+   case ::tt::target::ttnn::OpType::ReductionProdOp: {
+     tensorRefs = {opContext.type_as_ReductionProdOp()->out()};
+     break;
+@@ -1761,6 +1765,12 @@ std::vector<tt::runtime::TensorRef> getOpInputRefs(OpContext opContextHandle) {
+     tensorRefs = {opContext.type_as_ReductionArgMaxOp()->in()};
+     break;
+   }
++  case ::tt::target::ttnn::OpType::LMHeadSamplingOp: {
++    tensorRefs = {opContext.type_as_LMHeadSamplingOp()->input(),
++                  opContext.type_as_LMHeadSamplingOp()->norm_weight(),
++                  opContext.type_as_LMHeadSamplingOp()->lm_head_weight()};
++    break;
++  }
+   case ::tt::target::ttnn::OpType::ReductionProdOp: {
+     tensorRefs = {opContext.type_as_ReductionProdOp()->in()};
+     break;
