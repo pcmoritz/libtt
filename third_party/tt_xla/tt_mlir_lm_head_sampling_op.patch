@@ -278,7 +278,7 @@ new file mode 100644
 index 0000000..e27790e
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/reduction/lm_head_sampling.cpp
-@@ -0,0 +1,504 @@
+@@ -0,0 +1,495 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -450,13 +450,6 @@ index 0000000..e27790e
 +  return kernel;
 +}
 +
-+::tt::tt_metal::CoreRangeSet
-+fullComputeGrid(::tt::tt_metal::distributed::MeshDevice *device) {
-+  const auto grid = device->compute_with_storage_grid_size();
-+  return ::tt::tt_metal::CoreRangeSet(
-+      ::tt::tt_metal::CoreRange({0, 0}, {grid.x - 1, grid.y - 1}));
-+}
-+
 +::tt::tt_metal::CoreRangeSet rowWiseCorePrefix(
 +    ::tt::tt_metal::CoreCoord gridSize, uint32_t numCores) {
 +  std::vector<::tt::tt_metal::CoreRange> ranges;
@@ -483,8 +476,8 @@ index 0000000..e27790e
 +    uint32_t topkScoresSlotBytes, uint32_t winnerPageBytes,
 +    uint32_t phase2ScoresByteOffset, uint32_t phase2IndicesByteOffset,
 +    uint32_t receiverSemaphoreAddr, uint32_t localReadySemaphoreAddr,
-+    uint32_t outputAddress, uint32_t scoresCb, uint32_t scoresNumPages,
-+    uint32_t scoresTileWidth, uint32_t scoresTileHW) {
++    uint32_t scoresCb, uint32_t scoresNumPages, uint32_t scoresTileWidth,
++    uint32_t scoresTileHW) {
 +  add(args, "sampling_topk_k", 1);
 +  add(args, "sampling_winner_page_bytes", winnerPageBytes);
 +  add(args, "sampling_num_senders", numSenders);
@@ -542,7 +535,7 @@ index 0000000..e27790e
 +  add(args, "sampling_loop_mcast_end_y", 0);
 +  add(args, "sampling_loop_num_dests", 0);
 +  add(args, "sampling_num_internal_iterations", 1);
-+  add(args, "sampling_output_addr", outputAddress);
++  add(args, "sampling_output_addr", 0);
 +  add(args, "sampling_rand_output_addr", 0);
 +  add(args, "sampling_enable_metadata", 0);
 +  add(args, "sampling_copy_probabilities", 0);
@@ -597,29 +590,28 @@ index 0000000..e27790e
 +      (nPerCore + scoreTileWidth - 1) / scoreTileWidth;
 +
 +  ::tt::tt_metal::ProgramDescriptor program;
-+  const auto semaphoreGrid = fullComputeGrid(device);
 +  program.semaphores.push_back({
 +      .id = kSamplingReceiverSemaphore,
 +      .core_type = ::tt::CoreType::WORKER,
-+      .core_ranges = semaphoreGrid,
++      .core_ranges = samplingGrid,
 +      .initial_value = 0,
 +  });
 +  program.semaphores.push_back({
 +      .id = kSamplingLocalReadySemaphore,
 +      .core_type = ::tt::CoreType::WORKER,
-+      .core_ranges = semaphoreGrid,
++      .core_ranges = samplingGrid,
 +      .initial_value = 0,
 +  });
 +  program.semaphores.push_back({
 +      .id = kSamplingGlobalSemaphore,
 +      .core_type = ::tt::CoreType::WORKER,
-+      .core_ranges = semaphoreGrid,
++      .core_ranges = samplingGrid,
 +      .initial_value = 0,
 +  });
 +  program.semaphores.push_back({
 +      .id = kSamplingGlobalStage2Semaphore,
 +      .core_type = ::tt::CoreType::WORKER,
-+      .core_ranges = semaphoreGrid,
++      .core_ranges = samplingGrid,
 +      .initial_value = 0,
 +  });
 +  program.cbs.push_back(::tt::tt_metal::cb_descriptor_from_sharded_tensor(
@@ -655,7 +647,6 @@ index 0000000..e27790e
 +      baseArgs, samplingCores.size(), topkScoresSlotBytes,
 +      winnerPageBytes, phase2ScoresByteOffset, phase2IndicesByteOffset,
 +      kSamplingReceiverSemaphore, kSamplingLocalReadySemaphore,
-+      static_cast<uint32_t>(outputIndex.buffer()->address()),
 +      kMatmulOutCb, scoresNumPages, scoreTileWidth, scoreTileHW);
 +
 +  ::tt::tt_metal::KernelDescriptor::RTArgList ncriscArgs;
@@ -670,6 +661,7 @@ index 0000000..e27790e
 +  ::tt::tt_metal::KernelDescriptor::RTArgList briscArgs;
 +  briscArgs.push_back(finalCorePhys.x);
 +  briscArgs.push_back(finalCorePhys.y);
++  briscArgs.push_back(outputIndex.mesh_tensor());
 +
 +  for (uint32_t i = 0; i < samplingCores.size(); ++i) {
 +    const auto &core = samplingCores[i];
@@ -734,7 +726,6 @@ index 0000000..e27790e
 +      widthShardL1(grid, {tt::constants::TILE_HEIGHT, hiddenPerCore});
 +  ::ttnn::Tensor shardedNormalized =
 +      ::ttnn::to_memory_config(normalized, inputMemoryConfig);
-+
 +  ::ttnn::Tensor logits = ::ttnn::matmul(
 +      shardedNormalized, lmHeadWeight,
 +      /*transpose_a=*/false, /*transpose_b=*/true,

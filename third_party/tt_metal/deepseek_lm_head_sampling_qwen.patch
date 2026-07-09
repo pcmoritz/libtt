@@ -25,6 +25,12 @@ diff -ruN models/demos/deepseek_v3_b1/micro_ops/sampling/kernels/sampling_kernel
  
      deepseek_b1_ops::TopKSampling::ReaderArgs args{
          .scores_addr = get_common_arg_val<uint32_t>(ncrisc_rt_arg_idx++),
+@@ -134,4 +138,5 @@ void kernel_main() {
+     deepseek_b1_ops::TopKSampling::WriterArgs args{
+         .final_noc_x = get_common_arg_val<uint32_t>(brisc_rt_arg_idx++),
+         .final_noc_y = get_common_arg_val<uint32_t>(brisc_rt_arg_idx++),
++        .output_addr = get_common_arg_val<uint32_t>(brisc_rt_arg_idx++),
+     };
 diff -ruN models/demos/deepseek_v3_b1/unified_kernels/sampling.hpp models/demos/deepseek_v3_b1/unified_kernels/sampling.hpp
 --- models/demos/deepseek_v3_b1/unified_kernels/sampling.hpp
 +++ models/demos/deepseek_v3_b1/unified_kernels/sampling.hpp
@@ -52,6 +58,14 @@ diff -ruN models/demos/deepseek_v3_b1/unified_kernels/sampling.hpp models/demos/
      };
  
      template <
+@@ -1136,6 +1144,7 @@ struct TopKSampling {
+     struct WriterArgs {
+         uint32_t final_noc_x;
+         uint32_t final_noc_y;
++        uint32_t output_addr;
+         uint32_t socket_config_addr = 0;
+         // Optional persistent-mode next-iteration signal routing (BRISC path).
+         uint32_t persistent_enable = 0;
 @@ -1326,7 +1334,12 @@ namespace TopKSampling {
              uint32_t final_noc_x,
              uint32_t final_noc_y) {
@@ -137,3 +151,8 @@ diff -ruN models/demos/deepseek_v3_b1/unified_kernels/sampling.hpp models/demos/
                          {
                              DeviceZoneScopedN("SP-MESH2WAIT");
                              wait_and_reset_semaphore(global_stage2_sem_ptr, CTArgs::stage2_expected_remote_incs);
+@@ -1832,3 +1879,3 @@ namespace TopKSampling {
+                             DeviceZoneScopedN("SP-FC-FINISH");
+-                            auto output_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(CTArgs::output_addr);
++                            auto output_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(args.output_addr);
+                             output_ptr[0] = selected_index;
