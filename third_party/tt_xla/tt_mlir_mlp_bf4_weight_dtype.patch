@@ -1,0 +1,134 @@
+--- a/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp
+@@ -25,6 +25,31 @@
+          dtype == ttcore::DataType::BFloat16;
+ }
+ 
++// Transformer MLP projections are substantially rectangular: their expanded
++// dimension is typically 2-8x the hidden width. Attention projections are
++// square or at most 2x, while vocabulary projections are much wider.
++static bool isMLPProjectionWeight(RankedTensorType weightType) {
++  if (weightType.getRank() < 2) {
++    return false;
++  }
++
++  ArrayRef<int64_t> shape = weightType.getShape();
++  int64_t dim0 = shape[shape.size() - 2];
++  int64_t dim1 = shape.back();
++  if (ShapedType::isDynamic(dim0) || ShapedType::isDynamic(dim1)) {
++    return false;
++  }
++
++  int64_t narrow = dim0 < dim1 ? dim0 : dim1;
++  int64_t wide = dim0 < dim1 ? dim1 : dim0;
++  constexpr int64_t kMinHiddenWidth = 2048;
++  return narrow >= kMinHiddenWidth && wide >= 2 * narrow &&
++         wide <= 8 * narrow;
++}
++
+ // Template pattern to rewrite Matmul/Linear operations to use a specified
+ // weight dtype. This pattern matches ops where the weight (B operand) is
+ // bf16/f32, and inserts a typecast operation to convert it to the target dtype.
++//
++// When MLP BFP4 conversion is enabled, a BFP8 annotation is selectively
++// overridden for rectangular transformer MLP projections.
+@@ -37,8 +62,10 @@
+ class WeightDtypeConversionPattern : public mlir::OpRewritePattern<OpTy> {
+ public:
+   WeightDtypeConversionPattern(mlir::MLIRContext *ctx,
+-                               std::optional<ttcore::DataType> targetDtype)
+-      : mlir::OpRewritePattern<OpTy>(ctx), targetDtype(targetDtype) {}
++                               std::optional<ttcore::DataType> targetDtype,
++                               bool mlpBFP4)
++      : mlir::OpRewritePattern<OpTy>(ctx), targetDtype(targetDtype),
++        mlpBFP4(mlpBFP4) {}
+ 
+   mlir::LogicalResult
+   matchAndRewrite(OpTy op, mlir::PatternRewriter &rewriter) const override {
+@@ -50,10 +77,16 @@
+       return mlir::failure();
+     }
+ 
++    auto weightType = mlir::cast<RankedTensorType>(weight.getType());
++
+     // Resolve effective dtype: per-op annotation takes priority over global.
+     std::optional<ttcore::DataType> effectiveDtype = targetDtype;
+-    if (auto dtypeStrAttr = op->template getAttrOfType<mlir::StringAttr>(
+-            "ttcore.weight_dtype")) {
++    auto dtypeStrAttr = op->template getAttrOfType<mlir::StringAttr>(
++        "ttcore.weight_dtype");
++    if (mlpBFP4 && isMLPProjectionWeight(weightType) &&
++        (!dtypeStrAttr || dtypeStrAttr.getValue() == "bfp_bf8")) {
++      effectiveDtype = ttcore::DataType::BFP_BFloat4;
++    } else if (dtypeStrAttr) {
+       auto perOpDtype = ttcore::DataTypeStringToEnum(dtypeStrAttr.getValue());
+       if (perOpDtype && isLegalWeightDtype(*perOpDtype)) {
+         effectiveDtype = perOpDtype;
+@@ -70,7 +103,6 @@
+     }
+ 
+     ttcore::DataType dtype = *effectiveDtype;
+-    auto weightType = weight.getType();
+ 
+     // Check if weight is already the target dtype or is convertible (bf16/f32).
+     mlir::Type elType = weightType.getElementType();
+@@ -144,6 +176,7 @@
+ 
+ private:
+   std::optional<ttcore::DataType> targetDtype;
++  bool mlpBFP4;
+ };
+ 
+ // Only block formats (bfp_bf8, bfp_bf4) are supported as global overrides
+@@ -165,11 +198,12 @@
+       globalDtype = bfpDtypeToDataType(targetDtype);
+     }
+ 
+     mlir::RewritePatternSet patterns(&getContext());
+     patterns.add<WeightDtypeConversionPattern<MatmulOp>,
+                  WeightDtypeConversionPattern<LinearOp>,
+                  WeightDtypeConversionPattern<SparseMatmulOp>>(&getContext(),
+-                                                               globalDtype);
++                                                               globalDtype,
++                                                               mlpBFP4.getValue());
+ 
+     if (failed(
+             mlir::applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+diff --git a/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h b/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
+--- a/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
++++ b/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
+@@ -439,6 +439,11 @@ struct TTIRToTTNNCommonPipelineOptions
+           clEnumValN(BFPDtype::BFP_BFloat4, "bfp_bf4", "BFP BFloat4 format")),
+       llvm::cl::init(BFPDtype::None)};
+ 
++  Option<bool> mlpBFP4{
++      *this, "mlp-bfp4",
++      llvm::cl::desc("Use BFP4 for rectangular transformer MLP weights"),
++      llvm::cl::init(false)};
++
+   Option<BFPDtype> experimentalKVCacheDtype{
+       *this, "experimental-kv-cache-dtype",
+       llvm::cl::desc("Experimental: Target dtype for KV cache conversion."),
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+@@ -512,6 +512,8 @@ def TTNNWeightDtypeConversion: Pass<"ttnn-weight-dtype-conversion", "::mlir::M
+     Option<"targetDtype", "target-dtype", "::mlir::tt::ttnn::BFPDtype",
+            /*default=*/"::mlir::tt::ttnn::BFPDtype::None",
+            "Target data type for weight conversion (bfp_bf8, bfp_bf4).">,
++    Option<"mlpBFP4", "mlp-bfp4", "bool", /*default=*/"false",
++           "Use BFP4 for rectangular transformer MLP weights.">,
+   ];
+ }
+ 
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -434,6 +434,7 @@ void createTTIRToTTNNBackendPipeline(
+     {
+       TTNNWeightDtypeConversionOptions convOpts;
+       convOpts.targetDtype = options.experimentalWeightDtype;
++      convOpts.mlpBFP4 = options.mlpBFP4;
+       devicePm.addPass(createTTNNWeightDtypeConversion(convOpts));
+     }
+ 
