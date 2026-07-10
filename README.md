@@ -42,7 +42,9 @@ git switch codex/qwen3-tt-sglang
 ```
 
 Install or activate the Python environment for that checkout, then start a
-Qwen3-8B server with the TT backend:
+Qwen3-8B server with the TT backend. At optimization level 1, BFP8 weight
+conversion keeps attention and vocabulary projections at BFP8 while using
+BFP4 for the bandwidth-heavy rectangular MLP projections:
 
 ```bash
 cd "$SGLANG_JAX_DIR"
@@ -52,7 +54,7 @@ env -u TT_METAL_RUNTIME_ROOT \
   PJRT_NAMES_AND_LIBRARY_PATHS="tt:$LIBTT_DIR/bazel-bin/libtt.so" \
   JAX_PLATFORMS=tt \
   JAX_USE_SHARDY_PARTITIONER=false \
-  JAX_COMPILATION_CACHE_DIR=/tmp/sglang-jax-qwen3-8b-jax-cache \
+  JAX_COMPILATION_CACHE_DIR=/tmp/sglang-jax-qwen3-8b-mlp-bf4-cache \
   SGLANG_TT_HOST_WEIGHT_LOAD=1 \
   SGLANG_TT_OPTIMIZATION_LEVEL=1 \
   SGLANG_TT_EXPERIMENTAL_WEIGHT_DTYPE=bfp_bf8 \
@@ -83,4 +85,5 @@ curl -sS http://127.0.0.1:31000/generate \
   -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":128}}'
 ```
 
-On a blackhole chip, the generation speed should be about 19 tokens per second after some initial warmup.
+On a blackhole chip, the generation speed should be about 24.7 tokens per
+second after the initial compilation and warmup.

@@ -251,6 +251,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_device_memory_stats.patch",
         "//third_party/tt_xla:tt_xla_disable_erase_inverse_ops.patch",
         "//third_party/tt_xla:tt_xla_enable_bf8_activation_dtype_lowering.patch",
+        "//third_party/tt_xla:tt_xla_mlp_bf4_weight_dtype.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -280,6 +281,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_qwen_decode_qkv_projection_fusion.patch",
         "//third_party/tt_xla:tt_mlir_kv_cache_dtype_return_types.patch",
         "//third_party/tt_xla:tt_mlir_sharded_decode_rms_norm.patch",
+        "//third_party/tt_xla:tt_mlir_mlp_bf4_weight_dtype.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
