@@ -521,7 +521,7 @@ index 0000000..5764b8f
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
-index 7c87d0e..deebe6b 100644
+index 7c87d0e..1669eb0 100644
 --- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 @@ -686,6 +686,9 @@ void validate_dram_sender_global_cb_gather_in0_geometry_recv_contig(
@@ -534,14 +534,15 @@ index 7c87d0e..deebe6b 100644
      const auto& config = operation_attributes.program_config.value();
  
      return std::visit(
-@@ -751,6 +754,28 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
+@@ -751,6 +754,29 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
          "Inputs to matmul must be tilized");
      validate_matmul_matrix_dimensions(a_shape, b_shape, a_shape_padded, b_shape_padded, in0_tile, in1_tile);
  
 +    if (attributes.fused_swiglu) {
 +        TT_FATAL(!attributes.transpose_a && !attributes.transpose_b, "SwiGLU matmul does not support transpose");
-+        TT_FATAL(a_shape.size() == 2 && b_shape.size() == 2 && a_shape[-2] == 1,
-+                 "SwiGLU matmul currently supports decode matrices only");
++        TT_FATAL(a_shape.size() == 2 && b_shape.size() == 2 && a_shape[-2] > 0 &&
++                     a_shape[-2] <= TILE_HEIGHT && a_shape_padded[-2] == TILE_HEIGHT,
++                 "SwiGLU matmul supports a single tile row only");
 +        TT_FATAL(b_shape[-1] % (2 * TILE_WIDTH * 96) == 0,
 +                 "SwiGLU matmul half width must divide evenly across 96 cores");
 +        TT_FATAL(input_tensor_a.dtype() == DataType::BFLOAT16 &&
@@ -563,7 +564,7 @@ index 7c87d0e..deebe6b 100644
      const bool is_optional_output_tensor =
          !optional_output_tensors.empty() && optional_output_tensors.at(0).has_value();
  
-@@ -1820,8 +1845,13 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
+@@ -1820,8 +1846,13 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
      const auto& input_tensor_b = input_tensors.at(1);
  
      // Use the compute_matmul_output_shape function to get the output shape
@@ -578,7 +579,7 @@ index 7c87d0e..deebe6b 100644
  
      const auto& a_shape_padded =
          operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
-@@ -2280,7 +2310,8 @@ MatmulParams create_matmul_attributes(
+@@ -2280,7 +2311,8 @@ MatmulParams create_matmul_attributes(
          parameters.transpose_b,
          output_tile,
          parameters.global_cb,
@@ -613,10 +614,10 @@ index 7e17139..8ffaa3f 100644
  
  struct MatmulInputs {
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-index d0e9c98..03496db 100644
+index d0e9c98..702e24b 100644
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -350,6 +350,25 @@ Tensor matmul(
+@@ -350,6 +350,28 @@ Tensor matmul(
          optional_output_tensor);
  }
  
@@ -629,7 +630,10 @@ index d0e9c98..03496db 100644
 +    ttnn::prim::MatmulParams params;
 +    params.output_mem_config = memory_config.value_or(ttnn::DRAM_MEMORY_CONFIG);
 +    params.output_dtype = dtype;
-+    params.compute_kernel_config = compute_kernel_config;
++    auto swiglu_compute_kernel_config = compute_kernel_config.value_or(DeviceComputeKernelConfig{});
++    swiglu_compute_kernel_config.fp32_dest_acc_en = false;
++    swiglu_compute_kernel_config.packer_l1_acc = true;
++    params.compute_kernel_config = swiglu_compute_kernel_config;
 +    params.fused_swiglu = true;
 +    auto attributes = ttnn::prim::create_matmul_attributes(
 +        input_tensor_a, input_tensor_b, params, {std::nullopt});

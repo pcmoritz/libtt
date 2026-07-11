@@ -29,7 +29,7 @@ index cb557b9..7b0eedd 100644
    // scalars in IR, hence check that the output is at least 1D tensor of size 1.
    if (expectedOutputShape.size() == 0) {
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-index 87f1f72..7cdab3b 100644
+index ac04b7e..3343a62 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 @@ -8,6 +8,7 @@
@@ -40,7 +40,7 @@ index 87f1f72..7cdab3b 100644
  
  #ifdef TTMLIR_ENABLE_OPMODEL
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
-@@ -174,6 +175,84 @@ private:
+@@ -174,6 +175,87 @@ private:
    }
  };
  
@@ -84,13 +84,16 @@ index 87f1f72..7cdab3b 100644
 +    ArrayRef<int64_t> inputShape = inputType.getShape();
 +    ArrayRef<int64_t> outputShape = outputType.getShape();
 +    if (inputShape.size() != 2 || outputShape.size() != 2 ||
-+        inputShape[0] != 1 || inputShape[1] != 2 * outputShape[1] ||
++        inputShape[0] < 1 || inputShape[0] > 32 ||
++        outputShape[0] != inputShape[0] ||
++        inputShape[1] != 2 * outputShape[1] ||
 +        outputShape[1] % 32 != 0) {
 +      return failure();
 +    }
 +
 +    int64_t half = outputShape[1];
-+    auto isHalfSlice = [](SliceStaticOp slice, int64_t begin, int64_t end) {
++    auto isHalfSlice = [](SliceStaticOp slice, int64_t rows, int64_t begin,
++                          int64_t end) {
 +      auto begins = llvm::cantFail(
 +          ttmlir::utils::getIntegerVector<int64_t>(slice.getBegins()));
 +      auto ends = llvm::cantFail(
@@ -98,11 +101,11 @@ index 87f1f72..7cdab3b 100644
 +      auto steps = llvm::cantFail(
 +          ttmlir::utils::getIntegerVector<int64_t>(slice.getStep()));
 +      return begins.size() == 2 && ends.size() == 2 && steps.size() == 2 &&
-+             begins[0] == 0 && begins[1] == begin && ends[0] == 1 &&
++             begins[0] == 0 && begins[1] == begin && ends[0] == rows &&
 +             ends[1] == end && steps[0] == 1 && steps[1] == 1;
 +    };
-+    if (!isHalfSlice(otherSlice, 0, half) ||
-+        !isHalfSlice(activatedSlice, half, 2 * half)) {
++    if (!isHalfSlice(otherSlice, inputShape[0], 0, half) ||
++        !isHalfSlice(activatedSlice, inputShape[0], half, 2 * half)) {
 +      return failure();
 +    }
 +
@@ -122,20 +125,20 @@ index 87f1f72..7cdab3b 100644
 +  }
 +};
 +
- // Fuse a single-use SiLU producer into BinaryNg's per-input activation. This
- // turns the SwiGLU activation from two device programs into one while keeping
- // the existing sliced gate/up tensors and output layout unchanged.
-@@ -381,7 +460,7 @@ public:
+ #ifdef TTMLIR_ENABLE_OPMODEL
+ 
+ // ============================================================================
+@@ -346,7 +428,7 @@ public:
      RewritePatternSet patterns(&getContext());
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
--    patterns.add<TTNNMultiplyWithSilu,
-+    patterns.add<TTNNMatmulWithSwiGLUEpilogue, TTNNMultiplyWithSilu,
+-    patterns.add<
++    patterns.add<TTNNMatmulWithSwiGLUEpilogue,
          TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
          TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
          TTNNMatmulAndLinearWithActivation<MatmulOp, SigmoidOp>,
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-index ac44d2c..6a23b91 100644
+index 8160ec9..6819e90 100644
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 @@ -562,7 +562,7 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
