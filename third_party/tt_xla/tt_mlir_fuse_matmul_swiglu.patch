@@ -1,4 +1,35 @@
+diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/Target/TTNN/operations/matmul.fbs
+index 7966cee..accaf4a 100644
+--- a/include/ttmlir/Target/TTNN/operations/matmul.fbs
++++ b/include/ttmlir/Target/TTNN/operations/matmul.fbs
+@@ -70,6 +70,7 @@ table MatmulOp {
+   matmul_program_config: tt.target.ttnn.MatmulProgramConfig;
+   activation: string;
+   compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
++  fused_swiglu: bool = false;
+ }
+ // ANCHOR_END: adding_an_op_matmul_fbs
+ 
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+index cb557b9..7b0eedd 100644
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -2614,6 +2614,13 @@ std::optional<int64_t> getMatmulInnerDim(::mlir::RankedTensorType inputA,
+     expectedOutputShape.push_back(inputBShape[inputBShape.size() - 1]);
+   }
+ 
++  if (getOperation()->hasAttr("ttnn.fused_swiglu")) {
++    if (expectedOutputShape.empty() || expectedOutputShape.back() % 2 != 0) {
++      return emitOpError("SwiGLU matmul requires an even output width");
++    }
++    expectedOutputShape.back() /= 2;
++  }
++
+   // Check the case of a vector-vector product. At this moment we don't support
+   // scalars in IR, hence check that the output is at least 1D tensor of size 1.
+   if (expectedOutputShape.size() == 0) {
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+index 87f1f72..7cdab3b 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 @@ -8,6 +8,7 @@
@@ -9,7 +40,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  
  #ifdef TTMLIR_ENABLE_OPMODEL
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
-@@ -174,6 +174,99 @@
+@@ -174,6 +175,84 @@ private:
    }
  };
  
@@ -58,32 +89,20 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +      return failure();
 +    }
 +
-+    auto beginsA = llvm::cantFail(ttmlir::utils::getIntegerVector<int64_t>(
-+        activatedSlice.getBegins()));
-+    auto endsA = llvm::cantFail(
-+        ttmlir::utils::getIntegerVector<int64_t>(activatedSlice.getEnds()));
-+    auto stepsA = llvm::cantFail(
-+        ttmlir::utils::getIntegerVector<int64_t>(activatedSlice.getStep()));
-+    auto beginsB = llvm::cantFail(
-+        ttmlir::utils::getIntegerVector<int64_t>(otherSlice.getBegins()));
-+    auto endsB = llvm::cantFail(
-+        ttmlir::utils::getIntegerVector<int64_t>(otherSlice.getEnds()));
-+    auto stepsB = llvm::cantFail(
-+        ttmlir::utils::getIntegerVector<int64_t>(otherSlice.getStep()));
-+    if (beginsA.size() != 2 || endsA.size() != 2 || stepsA.size() != 2 ||
-+        beginsB.size() != 2 || endsB.size() != 2 || stepsB.size() != 2 ||
-+        beginsA[0] != 0 || beginsB[0] != 0 || endsA[0] != 1 ||
-+        endsB[0] != 1 || stepsA[0] != 1 || stepsA[1] != 1 ||
-+        stepsB[0] != 1 || stepsB[1] != 1) {
-+      return failure();
-+    }
-+
 +    int64_t half = outputShape[1];
-+    bool gateFirst = beginsA[1] == 0 && endsA[1] == half &&
-+                     beginsB[1] == half && endsB[1] == 2 * half;
-+    bool gateSecond = beginsB[1] == 0 && endsB[1] == half &&
-+                      beginsA[1] == half && endsA[1] == 2 * half;
-+    if (!gateFirst && !gateSecond) {
++    auto isHalfSlice = [](SliceStaticOp slice, int64_t begin, int64_t end) {
++      auto begins = llvm::cantFail(
++          ttmlir::utils::getIntegerVector<int64_t>(slice.getBegins()));
++      auto ends = llvm::cantFail(
++          ttmlir::utils::getIntegerVector<int64_t>(slice.getEnds()));
++      auto steps = llvm::cantFail(
++          ttmlir::utils::getIntegerVector<int64_t>(slice.getStep()));
++      return begins.size() == 2 && ends.size() == 2 && steps.size() == 2 &&
++             begins[0] == 0 && begins[1] == begin && ends[0] == 1 &&
++             ends[1] == end && steps[0] == 1 && steps[1] == 1;
++    };
++    if (!isHalfSlice(otherSlice, 0, half) ||
++        !isHalfSlice(activatedSlice, half, 2 * half)) {
 +      return failure();
 +    }
 +
@@ -93,9 +112,6 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +    state.addAttributes(matmulOp->getAttrs());
 +    mlir::Operation *fused = rewriter.create(state);
 +    fused->setAttr("ttnn.fused_swiglu", rewriter.getUnitAttr());
-+    if (gateFirst) {
-+      fused->setAttr("ttnn.swiglu_gate_first", rewriter.getUnitAttr());
-+    }
 +
 +    rewriter.replaceOp(multiplyOp, fused->getResult(0));
 +    rewriter.eraseOp(siluOp);
@@ -109,7 +125,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  // Fuse a single-use SiLU producer into BinaryNg's per-input activation. This
  // turns the SwiGLU activation from two device programs into one while keeping
  // the existing sliced gate/up tensors and output layout unchanged.
-@@ -381,7 +474,7 @@
+@@ -381,7 +460,7 @@ public:
      RewritePatternSet patterns(&getContext());
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
@@ -118,52 +134,24 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
          TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
          TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
          TTNNMatmulAndLinearWithActivation<MatmulOp, SigmoidOp>,
-diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
---- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
-+++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -2614,6 +2614,13 @@
-     expectedOutputShape.push_back(inputBShape[inputBShape.size() - 1]);
-   }
- 
-+  if (getOperation()->hasAttr("ttnn.fused_swiglu")) {
-+    if (expectedOutputShape.empty() || expectedOutputShape.back() % 2 != 0) {
-+      return emitOpError("SwiGLU matmul requires an even output width");
-+    }
-+    expectedOutputShape.back() /= 2;
-+  }
-+
-   // Check the case of a vector-vector product. At this moment we don't support
-   // scalars in IR, hence check that the output is at least 1D tensor of size 1.
-   if (expectedOutputShape.size() == 0) {
-diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/Target/TTNN/operations/matmul.fbs
---- a/include/ttmlir/Target/TTNN/operations/matmul.fbs
-+++ b/include/ttmlir/Target/TTNN/operations/matmul.fbs
-@@ -70,6 +70,8 @@
-   matmul_program_config: tt.target.ttnn.MatmulProgramConfig;
-   activation: string;
-   compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
-+  fused_swiglu: bool = false;
-+  swiglu_gate_first: bool = false;
- }
- // ANCHOR_END: adding_an_op_matmul_fbs
- 
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+index ac44d2c..6a23b91 100644
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -562,7 +562,8 @@
+@@ -562,7 +562,7 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
    return ::tt::target::ttnn::CreateMatmulOp(
        *cache.fbb, a, b, output, op.getTransposeA(), op.getTransposeB(),
        matmulProgramConfigType, matmulProgramConfigDesc, activation,
 -      computeConfig.value_or(0));
-+      computeConfig.value_or(0), op->hasAttr("ttnn.fused_swiglu"),
-+      op->hasAttr("ttnn.swiglu_gate_first"));
++      computeConfig.value_or(0), op->hasAttr("ttnn.fused_swiglu"));
  }
  // ANCHOR_END: adding_an_op_matmul_serialize_to_binary
  
 diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/operations/matmul/matmul.cpp
+index dfe05ba..f196225 100644
 --- a/runtime/lib/ttnn/operations/matmul/matmul.cpp
 +++ b/runtime/lib/ttnn/operations/matmul/matmul.cpp
-@@ -72,12 +72,19 @@
+@@ -72,12 +72,18 @@ void run(const ::tt::target::ttnn::MatmulOp *op, ProgramContext &context) {
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  
@@ -176,8 +164,7 @@ diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/op
 +  ::ttnn::Tensor output;
 +  if (op->fused_swiglu()) {
 +    output = ::ttnn::matmul_swiglu(
-+        lhs, rhs, op->swiglu_gate_first(), outputMemoryConfig, outputDataType,
-+        computeConfig);
++        lhs, rhs, outputMemoryConfig, outputDataType, computeConfig);
 +  } else {
 +    output = ::ttnn::matmul(
 +        lhs, rhs, op->transpose_a(), op->transpose_b(), outputMemoryConfig,
