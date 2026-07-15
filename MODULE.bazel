@@ -182,6 +182,7 @@ http_archive(
         "//third_party/tt_metal:disable_inspector_runtime.patch",
         "//third_party/tt_metal:noc_debugging_use_public_umd_include.patch",
         "//third_party/tt_metal:fast_bfloat16_bfp8_pack.patch",
+        "//third_party/tt_metal:matmul_swiglu_epilogue.patch",
         "//third_party/tt_metal:sdpa_decode_allow_l1_interleaved_q.patch",
         "//third_party/tt_metal:layernorm_allow_single_core_height_sharded.patch",
     ],
@@ -280,6 +281,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_qwen_decode_qkv_projection_fusion.patch",
         "//third_party/tt_xla:tt_mlir_kv_cache_dtype_return_types.patch",
         "//third_party/tt_xla:tt_mlir_sharded_decode_rms_norm.patch",
+        "//third_party/tt_xla:tt_mlir_fuse_matmul_swiglu.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
