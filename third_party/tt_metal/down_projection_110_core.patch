@@ -1,0 +1,470 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
+index 7d68dcf..bf12d29 100644
+--- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
+@@ -465,4 +465,218 @@ ProgramDescriptor MatmulSwiGLUProgramFactory::create_descriptor(
+     return desc;
+ }
+
++ProgramDescriptor MatmulDownProjectionProgramFactory::create_descriptor(
++    const ttnn::prim::MatmulParams& operation_attributes,
++    const ttnn::prim::MatmulInputs& tensor_args,
++    std::vector<ttnn::Tensor>& tensor_return_value,
++    const std::optional<CoreRangeSet>& /*core_range_set*/) {
++    const auto& a = tensor_args.input_tensors.at(0).mesh_tensor();
++    const auto& b = tensor_args.input_tensors.at(1).mesh_tensor();
++    const auto& residual = tensor_args.optional_input_tensors.at(0).value().mesh_tensor();
++    const auto& output = tensor_return_value.at(0).mesh_tensor();
++
++    constexpr uint32_t grid_x = 11;
++    constexpr uint32_t grid_y = 10;
++    constexpr uint32_t num_cores = grid_x * grid_y;
++    constexpr uint32_t in0_block_w = 4;
++    constexpr uint32_t wide_per_core_N = 2;
++
++    const uint32_t Kt = a.padded_shape()[-1] / TILE_WIDTH;
++    const uint32_t Nt = b.padded_shape()[-1] / TILE_WIDTH;
++    const uint32_t num_wide_cores = Nt - num_cores;
++    const uint32_t num_narrow_cores = num_cores - num_wide_cores;
++    const uint32_t num_blocks = Kt / in0_block_w;
++
++    TT_FATAL(Kt == 384 && Nt == 128, "Specialized down projection requires Kt=384 and Nt=128");
++    TT_FATAL(Kt % in0_block_w == 0, "Down-projection K tiles must divide by the K block width");
++    TT_FATAL(num_wide_cores == 18 && num_narrow_cores == 92, "Unexpected uneven-N worker split");
++
++    const CoreRangeSet all_cores(CoreRange(CoreCoord(0, 0), CoreCoord(grid_x - 1, grid_y - 1)));
++    const CoreRangeSet wide_cores(std::vector<CoreRange>{
++        CoreRange(CoreCoord(0, 0), CoreCoord(grid_x - 1, 0)),
++        CoreRange(CoreCoord(0, 1), CoreCoord(6, 1)),
++    });
++    const CoreRangeSet narrow_cores(std::vector<CoreRange>{
++        CoreRange(CoreCoord(7, 1), CoreCoord(grid_x - 1, 1)),
++        CoreRange(CoreCoord(0, 2), CoreCoord(grid_x - 1, grid_y - 1)),
++    });
++    const auto in0_format = tt_metal::datatype_to_dataformat_converter(a.dtype());
++    const auto in1_format = tt_metal::datatype_to_dataformat_converter(b.dtype());
++    const auto output_format = tt_metal::datatype_to_dataformat_converter(output.dtype());
++    const uint32_t in0_tile_size = tt::tile_size(in0_format);
++    const uint32_t in1_tile_size = tt::tile_size(in1_format);
++    const uint32_t output_tile_size = tt::tile_size(output_format);
++
++    TT_FATAL(operation_attributes.compute_kernel_config.has_value(), "Down-projection compute config is required");
++    auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
++        get_compute_kernel_config_args(a.mutable_device().arch(), operation_attributes.compute_kernel_config.value());
++    const auto partial_format = fp32_dest_acc_en ? tt::DataFormat::Float32 : output_format;
++    const uint32_t partial_tile_size = tt::tile_size(partial_format);
++
++    ProgramDescriptor desc;
++    auto add_cb_on = [&](const CoreRangeSet& cores, uint32_t index, uint32_t tiles,
++                         tt::DataFormat format, uint32_t page_size) {
++        desc.cbs.push_back(CBDescriptor{
++            .total_size = tiles * page_size,
++            .core_ranges = cores,
++            .format_descriptors = {{CBFormatDescriptor{
++                .buffer_index = index,
++                .data_format = format,
++                .page_size = page_size,
++            }}},
++        });
++    };
++    auto add_cb = [&](uint32_t index, uint32_t tiles, tt::DataFormat format, uint32_t page_size) {
++        add_cb_on(all_cores, index, tiles, format, page_size);
++    };
++    add_cb(tt::CBIndex::c_0, 2 * in0_block_w, in0_format, in0_tile_size);
++    add_cb(tt::CBIndex::c_1, 2 * in0_block_w * wide_per_core_N, in1_format, in1_tile_size);
++    add_cb(tt::CBIndex::c_2, wide_per_core_N, output_format, output_tile_size);
++    add_cb_on(wide_cores, tt::CBIndex::c_3, wide_per_core_N, partial_format, partial_tile_size);
++    add_cb_on(narrow_cores, tt::CBIndex::c_3, 1, partial_format, partial_tile_size);
++    add_cb(tt::CBIndex::c_16, wide_per_core_N, output_format, output_tile_size);
++
++    constexpr uint32_t sender_sem_id = 0;
++    constexpr uint32_t receiver_sem_id = 1;
++    const CoreCoord sender_core(0, 0);
++    const CoreRangeSet sender_cores(CoreRange(sender_core, sender_core));
++    const CoreRangeSet receiver_cores(std::vector<CoreRange>{
++        CoreRange(CoreCoord(1, 0), CoreCoord(grid_x - 1, 0)),
++        CoreRange(CoreCoord(0, 1), CoreCoord(grid_x - 1, grid_y - 1)),
++    });
++    auto* device = &a.mutable_device();
++    const auto sender_physical = device->worker_core_from_logical_core(sender_core);
++    auto mcast_start = device->worker_core_from_logical_core(CoreCoord(0, 0));
++    auto mcast_end = device->worker_core_from_logical_core(CoreCoord(grid_x - 1, grid_y - 1));
++    const auto in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
++    const auto in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
++    if (in0_noc == tt::tt_metal::NOC::NOC_1) {
++        std::swap(mcast_start, mcast_end);
++    }
++
++    std::vector<uint32_t> in0_sender_compile_args;
++    tt::tt_metal::TensorAccessorArgs(a).append_to(in0_sender_compile_args);
++    KernelDescriptor in0_sender_desc;
++    in0_sender_desc.kernel_source =
++        "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp";
++    in0_sender_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
++    in0_sender_desc.core_ranges = sender_cores;
++    in0_sender_desc.compile_time_args = in0_sender_compile_args;
++    in0_sender_desc.named_compile_time_args = {
++        {"cb_in0", tt::CBIndex::c_0},
++        {"Kt", Kt},
++        {"in0_mcast_w", in0_block_w},
++        {"num_dests", num_cores - 1},
++        {"sender_sem", sender_sem_id},
++        {"receiver_sem", receiver_sem_id},
++    };
++    in0_sender_desc.config = tt::tt_metal::DataMovementConfigDescriptor{
++        .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc};
++    in0_sender_desc.emplace_runtime_args(
++        sender_core,
++        {a,
++         static_cast<uint32_t>(mcast_start.x),
++         static_cast<uint32_t>(mcast_start.y),
++         static_cast<uint32_t>(mcast_end.x),
++         static_cast<uint32_t>(mcast_end.y)});
++
++    KernelDescriptor in0_receiver_desc;
++    in0_receiver_desc.kernel_source =
++        "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp";
++    in0_receiver_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
++    in0_receiver_desc.core_ranges = receiver_cores;
++    in0_receiver_desc.named_compile_time_args = {
++        {"cb_in0", tt::CBIndex::c_0},
++        {"Kt", Kt},
++        {"in0_mcast_w", in0_block_w},
++        {"sender_sem", sender_sem_id},
++        {"receiver_sem", receiver_sem_id},
++    };
++    in0_receiver_desc.config = tt::tt_metal::DataMovementConfigDescriptor{
++        .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc};
++
++    std::vector<uint32_t> reader_compile_time_args;
++    tt::tt_metal::TensorAccessorArgs(b).append_to(reader_compile_time_args);
++    tt::tt_metal::TensorAccessorArgs(residual).append_to(reader_compile_time_args);
++    tt::tt_metal::TensorAccessorArgs(output).append_to(reader_compile_time_args);
++    auto make_reader_desc = [&](const CoreRangeSet& cores, uint32_t per_core_N) {
++        KernelDescriptor reader_desc;
++        reader_desc.kernel_source =
++            "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_down_projection.cpp";
++        reader_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
++        reader_desc.core_ranges = cores;
++        reader_desc.compile_time_args = reader_compile_time_args;
++        reader_desc.named_compile_time_args = {
++            {"cb_weights", tt::CBIndex::c_1},
++            {"cb_residual", tt::CBIndex::c_2},
++            {"cb_out", tt::CBIndex::c_16},
++            {"Kt", Kt},
++            {"Nt", Nt},
++            {"per_core_N", per_core_N},
++            {"in0_block_w", in0_block_w},
++        };
++        reader_desc.config = tt::tt_metal::DataMovementConfigDescriptor{
++            .processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = in1_noc};
++        return reader_desc;
++    };
++    auto wide_reader_desc = make_reader_desc(wide_cores, wide_per_core_N);
++    auto narrow_reader_desc = make_reader_desc(narrow_cores, 1);
++
++    for (uint32_t i = 0; i < num_cores; ++i) {
++        const CoreCoord core{i % grid_x, i / grid_x};
++        const uint32_t n_start = i < num_wide_cores ? wide_per_core_N * i : i + num_wide_cores;
++        auto& reader_desc = i < num_wide_cores ? wide_reader_desc : narrow_reader_desc;
++        reader_desc.emplace_runtime_args(core, {b, residual, output, n_start});
++        if (core != sender_core) {
++            in0_receiver_desc.emplace_runtime_args(
++                core,
++                {static_cast<uint32_t>(sender_physical.x), static_cast<uint32_t>(sender_physical.y)});
++        }
++    }
++
++    auto make_compute_desc = [&](const CoreRangeSet& cores, uint32_t per_core_N) {
++        KernelDescriptor compute_desc;
++        compute_desc.kernel_source =
++            "ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_down_projection.cpp";
++        compute_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
++        compute_desc.core_ranges = cores;
++        compute_desc.compile_time_args = {
++            in0_block_w,
++            in0_block_w,
++            in0_block_w * per_core_N,
++            per_core_N,
++            num_blocks,
++        };
++        compute_desc.named_compile_time_args = {
++            {"cb_in0", tt::CBIndex::c_0},
++            {"cb_weights", tt::CBIndex::c_1},
++            {"cb_residual", tt::CBIndex::c_2},
++            {"cb_partials", tt::CBIndex::c_3},
++            {"cb_out", tt::CBIndex::c_16},
++        };
++        compute_desc.defines = {{"PACKER_L1_ACC", "1"}};
++        if (fp32_dest_acc_en) {
++            compute_desc.defines.emplace_back("FP32_DEST_ACC_EN", "1");
++        }
++        compute_desc.config = ComputeConfigDescriptor{
++            .math_fidelity = math_fidelity,
++            .fp32_dest_acc_en = fp32_dest_acc_en,
++            .dst_full_sync_en = dst_full_sync_en,
++            .math_approx_mode = math_approx_mode};
++        return compute_desc;
++    };
++
++    desc.semaphores.push_back(tt::tt_metal::SemaphoreDescriptor{
++        .id = sender_sem_id, .core_ranges = all_cores, .initial_value = 0});
++    desc.semaphores.push_back(tt::tt_metal::SemaphoreDescriptor{
++        .id = receiver_sem_id, .core_ranges = all_cores, .initial_value = 0});
++    desc.kernels.push_back(std::move(in0_sender_desc));
++    desc.kernels.push_back(std::move(in0_receiver_desc));
++    desc.kernels.push_back(std::move(wide_reader_desc));
++    desc.kernels.push_back(std::move(narrow_reader_desc));
++    desc.kernels.push_back(make_compute_desc(wide_cores, wide_per_core_N));
++    desc.kernels.push_back(make_compute_desc(narrow_cores, 1));
++    return desc;
++}
++
+ }  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
+index 46fdb50..d12db9b 100644
+--- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
+@@ -26,4 +26,12 @@ struct MatmulSwiGLUProgramFactory {
+         const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
+ };
+
++struct MatmulDownProjectionProgramFactory {
++    static tt::tt_metal::ProgramDescriptor create_descriptor(
++        const ttnn::prim::MatmulParams& operation_attributes,
++        const ttnn::prim::MatmulInputs& tensor_args,
++        std::vector<ttnn::Tensor>& tensor_return_value,
++        const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
++};
++
+ }  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_down_projection.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_down_projection.cpp
+new file mode 100644
+index 0000000..a2dab67
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_down_projection.cpp
+@@ -0,0 +1,94 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++#include <cstdint>
++#include "api/compute/compute_kernel_hw_startup.h"
++#include "api/compute/eltwise_binary.h"
++#include "api/compute/matmul.h"
++#include "api/compute/tile_move_copy.h"
++#include "api/dataflow/circular_buffer.h"
++#include "api/compute/compute_kernel_api.h"
++
++namespace {
++
++template <uint32_t in0_block_w, uint32_t in0_block_tiles,
++          uint32_t in1_block_tiles, uint32_t per_core_N,
++          uint32_t num_blocks>
++FORCE_INLINE void down_projection(
++    uint32_t cb_in0, uint32_t cb_weights, uint32_t cb_residual,
++    uint32_t cb_partials, uint32_t cb_out) {
++    PACK((pack_reconfig_data_format(cb_partials)));
++    PACK((llk_pack_reconfig_l1_acc(0)));
++
++    for (uint32_t block = 0; block < num_blocks; ++block) {
++        cb_reserve_back(cb_partials, per_core_N);
++        tile_regs_acquire();
++        cb_wait_front(cb_in0, in0_block_tiles);
++        cb_wait_front(cb_weights, in1_block_tiles);
++        for (uint32_t k = 0; k < in0_block_w; ++k) {
++            matmul_block(
++                cb_in0, cb_weights, k, k * per_core_N, 0,
++                /*transpose=*/0, per_core_N, 1, in0_block_w);
++        }
++        cb_pop_front(cb_in0, in0_block_tiles);
++        cb_pop_front(cb_weights, in1_block_tiles);
++        tile_regs_commit();
++        tile_regs_wait();
++        for (uint32_t i = 0; i < per_core_N; ++i) {
++            pack_tile(i, cb_partials);
++        }
++        tile_regs_release();
++        cb_push_back(cb_partials, per_core_N);
++
++        if (block == 0) {
++            PACK((llk_pack_reconfig_l1_acc(1)));
++        }
++        if (block + 1 < num_blocks) {
++            cb_wait_front(cb_partials, per_core_N);
++            cb_pop_front(cb_partials, per_core_N);
++        }
++    }
++
++    PACK((llk_pack_reconfig_l1_acc(0)));
++    PACK((pack_reconfig_data_format(cb_out)));
++    reconfig_data_format(cb_weights, cb_partials, cb_in0, cb_residual);
++    add_tiles_init(cb_partials, cb_residual);
++    cb_wait_front(cb_partials, per_core_N);
++    cb_wait_front(cb_residual, per_core_N);
++    tile_regs_acquire();
++    for (uint32_t i = 0; i < per_core_N; ++i) {
++        add_tiles(cb_partials, cb_residual, i, i, i);
++    }
++    cb_pop_front(cb_partials, per_core_N);
++    cb_pop_front(cb_residual, per_core_N);
++    tile_regs_commit();
++    tile_regs_wait();
++    cb_reserve_back(cb_out, per_core_N);
++    for (uint32_t i = 0; i < per_core_N; ++i) {
++        pack_tile(i, cb_out);
++    }
++    cb_push_back(cb_out, per_core_N);
++    tile_regs_release();
++}
++
++}  // namespace
++
++void kernel_main() {
++    constexpr uint32_t in0_block_w = get_compile_time_arg_val(0);
++    constexpr uint32_t in0_block_tiles = get_compile_time_arg_val(1);
++    constexpr uint32_t in1_block_tiles = get_compile_time_arg_val(2);
++    constexpr uint32_t per_core_N = get_compile_time_arg_val(3);
++    constexpr uint32_t num_blocks = get_compile_time_arg_val(4);
++
++    constexpr uint32_t cb_in0 = get_named_compile_time_arg_val("cb_in0");
++    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
++    constexpr uint32_t cb_residual = get_named_compile_time_arg_val("cb_residual");
++    constexpr uint32_t cb_partials = get_named_compile_time_arg_val("cb_partials");
++    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
++
++    compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in0, cb_weights, cb_out);
++    matmul_block_init(cb_in0, cb_weights, 0, per_core_N, 1, in0_block_w);
++    down_projection<in0_block_w, in0_block_tiles, in1_block_tiles,
++                    per_core_N, num_blocks>(
++        cb_in0, cb_weights, cb_residual, cb_partials, cb_out);
++}
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_down_projection.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_down_projection.cpp
+new file mode 100644
+index 0000000..ca1df85
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_down_projection.cpp
+@@ -0,0 +1,64 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++#include <cstdint>
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++#include "api/dataflow/circular_buffer.h"
++
++void kernel_main() {
++    const uint32_t weight_addr = get_arg_val<uint32_t>(0);
++    const uint32_t residual_addr = get_arg_val<uint32_t>(1);
++    const uint32_t output_addr = get_arg_val<uint32_t>(2);
++    const uint32_t n_start = get_arg_val<uint32_t>(3);
++
++    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
++    constexpr uint32_t cb_residual = get_named_compile_time_arg_val("cb_residual");
++    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
++    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
++    constexpr uint32_t Nt = get_named_compile_time_arg_val("Nt");
++    constexpr uint32_t per_core_N = get_named_compile_time_arg_val("per_core_N");
++    constexpr uint32_t in0_block_w = get_named_compile_time_arg_val("in0_block_w");
++    constexpr uint32_t in1_block_tiles = in0_block_w * per_core_N;
++
++    constexpr auto weight_args = TensorAccessorArgs<0>();
++    constexpr auto residual_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
++    constexpr auto output_args = TensorAccessorArgs<residual_args.next_compile_time_args_offset()>();
++    const auto weight = TensorAccessor(weight_args, weight_addr);
++    const auto residual = TensorAccessor(residual_args, residual_addr);
++    const auto output = TensorAccessor(output_args, output_addr);
++
++    for (uint32_t k0 = 0; k0 < Kt; k0 += in0_block_w) {
++        cb_reserve_back(cb_weights, in1_block_tiles);
++        uint32_t weights_ptr = get_write_ptr(cb_weights);
++        for (uint32_t k = 0; k < in0_block_w; ++k) {
++            const uint32_t row = (k0 + k) * Nt + n_start;
++            for (uint32_t n = 0; n < per_core_N; ++n) {
++                const uint32_t local = (k * per_core_N + n) * get_tile_size(cb_weights);
++                noc_async_read_tile(row + n, weight, weights_ptr + local);
++            }
++        }
++        noc_async_read_barrier();
++        cb_push_back(cb_weights, in1_block_tiles);
++    }
++
++    cb_reserve_back(cb_residual, per_core_N);
++    uint32_t residual_ptr = get_write_ptr(cb_residual);
++    for (uint32_t n = 0; n < per_core_N; ++n) {
++        noc_async_read_tile(
++            n_start + n, residual, residual_ptr + n * get_tile_size(cb_residual));
++    }
++    noc_async_read_barrier();
++    cb_push_back(cb_residual, per_core_N);
++
++    Noc noc;
++    CircularBuffer out_cb(cb_out);
++    const uint32_t page_bytes = get_local_cb_interface(cb_out).fifo_page_size;
++    for (uint32_t n = 0; n < per_core_N; ++n) {
++        out_cb.wait_front(1);
++        noc.async_write(out_cb, output, page_bytes, {}, {.page_id = n_start + n});
++        noc.async_writes_flushed();
++        out_cb.pop_front(1);
++    }
++    noc.async_write_barrier();
++}
+diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+index 1669eb0..7547879 100644
+--- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+@@ -5,4 +5,5 @@
+ #include "ttnn/operations/matmul/device/matmul_device_operation.hpp"
+
++#include <cstdlib>
+ #include <string_view>
+
+@@ -687,8 +688,36 @@ void validate_dram_sender_global_cb_gather_in0_geometry_recv_contig(
+
+ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_factory(
+-    const operation_attributes_t& operation_attributes, const tensor_args_t& /*tensor_args*/) {
++    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+     if (operation_attributes.fused_swiglu) {
+         return MatmulSwiGLUProgramFactory{};
+     }
++    const char* down_projection_setting = std::getenv("TT_METAL_DOWN_PROJECTION_110_CORES");
++    const bool down_projection_enabled =
++        down_projection_setting == nullptr ||
++        !(down_projection_setting[0] == '0' && down_projection_setting[1] == '\0');
++    const auto& input_a = tensor_args.input_tensors.at(0);
++    const auto& input_b = tensor_args.input_tensors.at(1);
++    const auto& a_shape = input_a.logical_shape();
++    const auto& b_shape = input_b.logical_shape();
++    const bool has_residual =
++        tensor_args.optional_input_tensors.size() == 1 && tensor_args.optional_input_tensors[0].has_value();
++    if (down_projection_enabled && input_a.device()->arch() == tt::ARCH::BLACKHOLE &&
++        !operation_attributes.transpose_a && !operation_attributes.transpose_b &&
++        a_shape.rank() == 2 && b_shape.rank() == 2 && a_shape[-2] == 1 && a_shape[-1] == 12288 &&
++        b_shape[-2] == 12288 && b_shape[-1] == 4096 && has_residual &&
++        input_a.dtype() == DataType::BFLOAT16 && input_b.dtype() == DataType::BFLOAT8_B &&
++        operation_attributes.output_dtype == DataType::BFLOAT16 &&
++        input_a.memory_config() == DRAM_MEMORY_CONFIG && input_b.memory_config() == DRAM_MEMORY_CONFIG &&
++        operation_attributes.output_mem_config == DRAM_MEMORY_CONFIG) {
++        const auto& residual = tensor_args.optional_input_tensors[0].value();
++        TT_FATAL(
++            residual.dtype() == DataType::BFLOAT16 && residual.memory_config() == DRAM_MEMORY_CONFIG &&
++                residual.logical_shape().rank() == 2 && residual.logical_shape()[-2] == 1 &&
++                residual.logical_shape()[-1] == 4096,
++            "Specialized down projection requires a BF16 DRAM-interleaved residual matching the output");
++        auto grid = input_a.device()->compute_with_storage_grid_size();
++        TT_FATAL(grid.x >= 11 && grid.y >= 10, "Specialized down projection requires an 11x10 worker grid");
++        return MatmulDownProjectionProgramFactory{};
++    }
+     const auto& config = operation_attributes.program_config.value();
+
+diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
+index 8469a7d..092eec7 100644
+--- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
+@@ -22,6 +22,7 @@ struct MatmulDeviceOperation {
+     using tensor_return_value_t = std::vector<Tensor>;
+
+     using program_factory_t = std::variant<
++        MatmulDownProjectionProgramFactory,
+         MatmulSwiGLUProgramFactory,
+         MatmulMultiCoreProgramFactory,
+         MatmulMultiCoreReuseOptimizedProgramFactory,
