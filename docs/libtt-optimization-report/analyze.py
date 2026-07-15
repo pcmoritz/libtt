@@ -29,6 +29,7 @@ N_WARMUP = 2
 N_SAMPLES = 32
 TOKENS = 128
 UPSTREAM_RAW_DIR = Path("/tmp/libtt-ttis-baseline-20260715")
+LATEST_MAIN_STREAMING_DIR = Path("/tmp/libtt-prefill-rebench-20260715")
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ VARIANTS = [
     Variant("V6", "a718685", "SiLU fused into binary multiply", Path("/tmp/libtt-branch-bench-20260711/fused-silu-multiply")),
     Variant("V7", "ce99831", "True matmul-SwiGLU epilogue", Path("/tmp/libtt-branch-bench-20260711/matmul-swiglu-epilogue")),
     Variant("V8", "caa5428", "Fallback-free prefill-capable epilogue", Path("/tmp/libtt-branch-bench-20260711/prefill-bf16-no-fallback")),
+    Variant("V9", "627a32d", "Latest main with traced short-prompt prefill", Path("/tmp/libtt-report-main-627a32d/raw")),
 ]
 
 
@@ -82,7 +84,7 @@ def write_throughput_svg(summaries: list[dict]) -> None:
     width, height = 980, 520
     left, right, top, bottom = 90, 25, 40, 105
     plot_w, plot_h = width - left - right, height - top - bottom
-    y_min, y_max = 15.0, 24.5
+    y_min, y_max = 15.0, 27.5
 
     def x(i: int) -> float:
         return left + i * plot_w / (len(summaries) - 1)
@@ -96,7 +98,7 @@ def write_throughput_svg(summaries: list[dict]) -> None:
         '<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1}.grid{stroke:#dbe4ee;stroke-width:1}.line{fill:none;stroke:#006d77;stroke-width:4}.ci{stroke:#e29578;stroke-width:3}.dot{fill:#006d77;stroke:white;stroke-width:2}.label{font-size:14px}.small{font-size:12px;fill:#526174}.title{font-size:21px;font-weight:700}</style>',
         '<text x="90" y="27" class="title">Qwen3-8B end-to-end generation throughput</text>',
     ]
-    for tick in range(15, 25):
+    for tick in range(15, 28):
         yy = y(tick)
         parts.append(f'<line x1="{left}" y1="{yy:.1f}" x2="{width-right}" y2="{yy:.1f}" class="grid"/>')
         parts.append(f'<text x="{left-12}" y="{yy+5:.1f}" text-anchor="end" class="label">{tick}</text>')
@@ -126,7 +128,7 @@ def write_incremental_svg(summaries: list[dict]) -> None:
     width, height = 980, 500
     left, right, top, bottom = 90, 25, 45, 100
     plot_w, plot_h = width - left - right, height - top - bottom
-    y_min, y_max = -3.0, 15.0
+    y_min, y_max = -3.0, 24.0
     bar_slot = plot_w / len(rows)
 
     def y(v: float) -> float:
@@ -139,7 +141,7 @@ def write_incremental_svg(summaries: list[dict]) -> None:
         '<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1.2}.grid{stroke:#dbe4ee;stroke-width:1}.pos{fill:#006d77}.neg{fill:#c84b31}.neutral{fill:#8395a7}.label{font-size:14px}.small{font-size:12px;fill:#526174}.value{font-size:13px;font-weight:700}.title{font-size:21px;font-weight:700}</style>',
         '<text x="90" y="29" class="title">Incremental effect of each cumulative revision</text>',
     ]
-    for tick in (-2, 0, 2, 4, 6, 8, 10, 12, 14):
+    for tick in (-2, 0, 4, 8, 12, 16, 20, 24):
         yy = y(tick)
         parts.append(f'<line x1="{left}" y1="{yy:.1f}" x2="{width-right}" y2="{yy:.1f}" class="grid"/>')
         parts.append(f'<text x="{left-12}" y="{yy+5:.1f}" text-anchor="end" class="label">{tick}%</text>')
@@ -175,7 +177,7 @@ def write_upstream_comparison_svg(summaries: list[dict], upstream: dict) -> None
             "class": "baseline",
         },
         {
-            "label": "libtt V8",
+            "label": f'libtt {summaries[-1]["variant"]}',
             "detail": summaries[-1]["commit"],
             "mean": summaries[-1]["mean_tps"],
             "low": summaries[-1]["ci_low_tps"],
@@ -284,9 +286,12 @@ def analyze_upstream(summaries: list[dict]) -> dict:
         0.95, len(throughputs) - 1, loc=mean, scale=stats.sem(throughputs)
     )
     v0 = summaries[0]
-    v8 = summaries[-1]
+    latest = summaries[-1]
     v0_values = [float(row["throughput_tokens_s"]) for row in samples_for_variant("V0")]
-    v8_values = [float(row["throughput_tokens_s"]) for row in samples_for_variant("V8")]
+    latest_values = [
+        float(row["throughput_tokens_s"])
+        for row in samples_for_variant(latest["variant"])
+    ]
     summary = {
         "implementation": "upstream tt-inference-server",
         "release": "v0.10.0",
@@ -305,9 +310,12 @@ def analyze_upstream(summaries: list[dict]) -> dict:
         "mean_latency_s": statistics.mean(latencies),
         "stddev_latency_s": statistics.stdev(latencies),
         "upstream_speedup_vs_libtt_v0_pct": 100.0 * (mean / v0["mean_tps"] - 1.0),
-        "upstream_speedup_vs_libtt_v8_pct": 100.0 * (mean / v8["mean_tps"] - 1.0),
+        "upstream_speedup_vs_libtt_latest_pct": 100.0
+        * (mean / latest["mean_tps"] - 1.0),
         "welch_p_vs_libtt_v0": float(stats.ttest_ind(throughputs, v0_values, equal_var=False).pvalue),
-        "welch_p_vs_libtt_v8": float(stats.ttest_ind(throughputs, v8_values, equal_var=False).pvalue),
+        "welch_p_vs_libtt_latest": float(
+            stats.ttest_ind(throughputs, latest_values, equal_var=False).pvalue
+        ),
         "completion_text_sha256_12": next(iter(hashes)),
     }
     with (DATA_DIR / "upstream-tt-inference-samples.csv").open("w", newline="") as f:
@@ -333,6 +341,144 @@ def analyze_upstream(summaries: list[dict]) -> dict:
         json.dumps(manifest, indent=2) + "\n"
     )
     return summary
+
+
+def analyze_latest_main_streaming() -> None:
+    metric_names = (
+        "ttft_s",
+        "total_s",
+        "decode_tps",
+        "mean_itl_s",
+        "p95_itl_s",
+    )
+    by_config: dict[str, dict[str, list[float]]] = {}
+    sample_rows: list[dict] = []
+    hashes: dict[str, set[str]] = {}
+
+    for config, trace_decode_only in (("baseline", True), ("optimized", False)):
+        paths = sorted((LATEST_MAIN_STREAMING_DIR / config).glob("run_*.json"))
+        records = [json.loads(path.read_text()) for path in paths]
+        retained = [
+            (path, record)
+            for path, record in zip(paths, records)
+            if record["phase"] == "retained"
+        ]
+        if len(records) != N_WARMUP + N_SAMPLES or len(retained) != N_SAMPLES:
+            raise RuntimeError(
+                f"latest-main streaming {config}: expected {N_WARMUP + N_SAMPLES} "
+                f"total and {N_SAMPLES} retained files, found {len(records)} and "
+                f"{len(retained)}"
+            )
+
+        values = {metric: [] for metric in metric_names}
+        hashes[config] = set()
+        for sample_index, (path, record) in enumerate(retained, 1):
+            if (
+                record["completion_tokens"] != TOKENS
+                or record["stream_chunks"] != TOKENS
+            ):
+                raise RuntimeError(f"{path}: incomplete streaming response")
+            hashes[config].add(record["completion_text_sha256_12"])
+            for metric in metric_names:
+                values[metric].append(float(record[metric]))
+            sample_rows.append(
+                {
+                    "configuration": config,
+                    "trace_decode_only": str(trace_decode_only).lower(),
+                    "sample": sample_index,
+                    "source_file": path.name,
+                    "ttft_s": f'{record["ttft_s"]:.9f}',
+                    "total_s": f'{record["total_s"]:.9f}',
+                    "decode_tps": f'{record["decode_tps"]:.9f}',
+                    "mean_itl_s": f'{record["mean_itl_s"]:.9f}',
+                    "p95_itl_s": f'{record["p95_itl_s"]:.9f}',
+                    "completion_text_sha256_12": record[
+                        "completion_text_sha256_12"
+                    ],
+                }
+            )
+        if len(hashes[config]) != 1:
+            raise RuntimeError(
+                f"latest-main streaming {config}: non-deterministic output {hashes[config]}"
+            )
+        by_config[config] = values
+
+    if hashes["baseline"] != hashes["optimized"]:
+        raise RuntimeError(
+            "latest-main streaming trace configurations returned different completions"
+        )
+
+    summary_rows: list[dict] = []
+    for config, trace_decode_only in (("baseline", True), ("optimized", False)):
+        row: dict[str, object] = {
+            "configuration": config,
+            "trace_decode_only": str(trace_decode_only).lower(),
+            "n": N_SAMPLES,
+        }
+        for metric in metric_names:
+            values = by_config[config][metric]
+            mean = statistics.mean(values)
+            ci_low, ci_high = stats.t.interval(
+                0.95,
+                len(values) - 1,
+                loc=mean,
+                scale=stats.sem(values),
+            )
+            row[f"mean_{metric}"] = mean
+            row[f"stddev_{metric}"] = statistics.stdev(values)
+            row[f"ci_low_{metric}"] = ci_low
+            row[f"ci_high_{metric}"] = ci_high
+        row["completion_text_sha256_12"] = next(iter(hashes[config]))
+        if config == "optimized":
+            baseline_ttft = statistics.mean(by_config["baseline"]["ttft_s"])
+            optimized_ttft = statistics.mean(by_config["optimized"]["ttft_s"])
+            baseline_decode = statistics.mean(by_config["baseline"]["decode_tps"])
+            optimized_decode = statistics.mean(by_config["optimized"]["decode_tps"])
+            row["ttft_change_vs_baseline_pct"] = 100.0 * (
+                optimized_ttft / baseline_ttft - 1.0
+            )
+            row["ttft_speedup_vs_baseline"] = baseline_ttft / optimized_ttft
+            row["ttft_welch_p"] = float(
+                stats.ttest_ind(
+                    by_config["optimized"]["ttft_s"],
+                    by_config["baseline"]["ttft_s"],
+                    equal_var=False,
+                ).pvalue
+            )
+            row["decode_change_vs_baseline_pct"] = 100.0 * (
+                optimized_decode / baseline_decode - 1.0
+            )
+            row["decode_welch_p"] = float(
+                stats.ttest_ind(
+                    by_config["optimized"]["decode_tps"],
+                    by_config["baseline"]["decode_tps"],
+                    equal_var=False,
+                ).pvalue
+            )
+        else:
+            row["ttft_change_vs_baseline_pct"] = math.nan
+            row["ttft_speedup_vs_baseline"] = math.nan
+            row["ttft_welch_p"] = math.nan
+            row["decode_change_vs_baseline_pct"] = math.nan
+            row["decode_welch_p"] = math.nan
+        summary_rows.append(row)
+
+    with (DATA_DIR / "latest-main-streaming-samples.csv").open(
+        "w", newline=""
+    ) as f:
+        writer = csv.DictWriter(
+            f, fieldnames=list(sample_rows[0]), lineterminator="\n"
+        )
+        writer.writeheader()
+        writer.writerows(sample_rows)
+    with (DATA_DIR / "latest-main-streaming-summary.csv").open(
+        "w", newline=""
+    ) as f:
+        writer = csv.DictWriter(
+            f, fieldnames=list(summary_rows[0]), lineterminator="\n"
+        )
+        writer.writeheader()
+        writer.writerows(summary_rows)
 
 
 def samples_for_variant(variant: str) -> list[dict]:
@@ -403,7 +549,7 @@ def main() -> None:
         })
         previous = throughputs
 
-    # Holm's step-down correction controls family-wise error across the eight
+    # Holm's step-down correction controls family-wise error across the nine
     # planned adjacent-revision comparisons while preserving the raw Welch p.
     tested = sorted(summaries[1:], key=lambda row: row["welch_p_value"])
     running_max = 0.0
@@ -426,6 +572,7 @@ def main() -> None:
     write_incremental_svg(summaries)
     upstream = analyze_upstream(summaries)
     write_upstream_comparison_svg(summaries, upstream)
+    analyze_latest_main_streaming()
 
 
 if __name__ == "__main__":

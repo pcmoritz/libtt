@@ -1,0 +1,38 @@
+{
+  "variant": "V9",
+  "libtt_main_commit": "627a32dbe91281cfe4d5401958a0eaa5af30d4f7",
+  "compiled_source_commit": "ddfa23a198efe6b9ec7c873da7f25780e513bb5f",
+  "source_equivalence": "627a32d changes only README.md relative to ddfa23a; compiled libtt sources are identical",
+  "libtt_so_sha256": "250a2c404dbead1b8ad5490a3e78a5a2011f86b865b83483f346865a3278e637",
+  "sglang_jax_commit": "24eb823ed97e58ef83ab04b33cab8283ed003acb",
+  "hardware": "Tenstorrent Blackhole P150",
+  "firmware": "19.6.0",
+  "benchmark_date": "2026-07-15",
+  "request": {
+    "text": "The capital of France is",
+    "temperature": 0,
+    "max_new_tokens": 128
+  },
+  "server": {
+    "model": "Qwen/Qwen3-8B",
+    "dtype": "bfloat16",
+    "weight_lowering": "bfp_bf8",
+    "optimization_level": 1,
+    "trace_decode_only": false,
+    "radix_cache": false,
+    "overlap_schedule": false
+  },
+  "sampling": {
+    "cpu_fast_path": false,
+    "fused_fast_path": false
+  },
+  "samples": {
+    "warmups_discarded": 2,
+    "retained_generate_requests": 32,
+    "retained_streaming_requests_per_trace_setting": 32
+  },
+  "raw_directories": {
+    "generate": "/tmp/libtt-report-main-627a32d/raw",
+    "streaming_ab": "/tmp/libtt-prefill-rebench-20260715"
+  }
+}

@@ -23,13 +23,13 @@
 <text x="241.7" y="169.2" text-anchor="middle" class="value">16.265</text>
 <text x="241.7" y="419" text-anchor="middle" class="label">libtt V0</text>
 <text x="241.7" y="438" text-anchor="middle" class="small">7482967</text>
-<rect x="451.3" y="87.2" width="147.3" height="302.8" rx="4" class="libtt"/>
-<line x1="525.0" y1="85.9" x2="525.0" y2="88.5" class="ci"/>
-<line x1="518.0" y1="85.9" x2="532.0" y2="85.9" class="ci"/>
-<line x1="518.0" y1="88.5" x2="532.0" y2="88.5" class="ci"/>
-<text x="525.0" y="74.2" text-anchor="middle" class="value">23.698</text>
-<text x="525.0" y="419" text-anchor="middle" class="label">libtt V8</text>
-<text x="525.0" y="438" text-anchor="middle" class="small">caa5428</text>
+<rect x="451.3" y="56.2" width="147.3" height="333.8" rx="4" class="libtt"/>
+<line x1="525.0" y1="54.4" x2="525.0" y2="58.0" class="ci"/>
+<line x1="518.0" y1="54.4" x2="532.0" y2="54.4" class="ci"/>
+<line x1="518.0" y1="58.0" x2="532.0" y2="58.0" class="ci"/>
+<text x="525.0" y="43.2" text-anchor="middle" class="value">26.123</text>
+<text x="525.0" y="419" text-anchor="middle" class="label">libtt V9</text>
+<text x="525.0" y="438" text-anchor="middle" class="small">627a32d</text>
 <rect x="734.7" y="81.4" width="147.3" height="308.6" rx="4" class="upstream"/>
 <line x1="808.3" y1="79.5" x2="808.3" y2="83.3" class="ci"/>
 <line x1="801.3" y1="79.5" x2="815.3" y2="79.5" class="ci"/>
