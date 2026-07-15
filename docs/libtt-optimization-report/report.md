@@ -2,7 +2,7 @@
 title: "Accelerating Qwen3-8B Decode on Tenstorrent Blackhole"
 subtitle: "A technical and statistical report on libtt's model-path optimizations"
 author: "libtt performance study"
-date: "11 July 2026"
+date: "15 July 2026"
 lang: en-US
 documentclass: scrreprt
 classoption:
@@ -37,6 +37,12 @@ abstract: |
   discarded, and 32 independent 128-token requests retained per revision.
   Mean end-to-end generation throughput rises from 16.265 to 23.698 tokens/s,
   a 45.70% cumulative gain and a 31.36% reduction in mean request latency.
+  A separate 32-request reference run of Tenstorrent's upstream
+  tt-inference-server v0.10.0 on the same P150, model, prompt, token count, and
+  cache-disabled serial workload measured 24.148 tokens/s (95% CI
+  23.999--24.296). That is 1.90% above the final libtt mean, with a small
+  measurement-scope caveat: the upstream number uses loopback client wall
+  time while libtt reports request-local server time.
   The largest narrow change is runtime width-sharding of decode RMSNorm
   (+13.61%); a true Dst-resident matmul-SwiGLU epilogue adds +2.73%. The study
   also records two important negative results: generic two-way shared-LHS
@@ -65,6 +71,14 @@ increase**. Mean end-to-end latency for the fixed 128-token response falls from
 7.870 s to 5.402 s, a **31.36% latency reduction**. An auxiliary streaming run
 on the final revision measured **25.790 pure decode tokens/s** (20 samples,
 95% CI 25.657--25.923) after separating time to first token.
+
+For an external reference, the same 128-token request was also run through
+Tenstorrent's upstream tt-inference-server v0.10.0 runtime. Its 32 retained
+requests averaged **24.148 tokens/s** (95% CI 23.999--24.296) and 5.302 s mean
+client-observed latency. It is **48.47% faster than libtt V0** and **1.90%
+faster than libtt V8** on this end-to-end workload. The latter difference is
+small but measurable in these samples; it is not assigned to a particular
+kernel because the two servers use different frontends and execution paths.
 
 The principal findings are:
 
@@ -95,6 +109,10 @@ The principal findings are:
 7. Extending the matcher to the one-tile-row prefill case and removing the old
    fallback changes the mean by -0.19% (p = 0.53). It is therefore a code and
    coverage simplification with no detectable performance cost.
+8. The final libtt line nearly reaches the upstream server reference: the gap
+   falls from 48.47% at V0 to 1.90% at V8. Upstream remains slightly faster in
+   the non-streaming end-to-end comparison, while libtt's separate final-only
+   decode cross-check reaches 25.790 tok/s.
 
 ![Cumulative throughput across the benchmarked revisions.](figures/throughput.svg){#fig:throughput width=100%}
 
@@ -122,6 +140,12 @@ Sampling-path branches are intentionally excluded. The benchmark forces
 model rather than token selection. Experimental branches that change the
 numeric contract, such as `agent/qwen3-mlp-bfp4`, require a separate quality
 and performance study rather than being mixed into the BF8-weight sequence.
+
+The tt-inference-server result is an **external reference**, not V9 in the
+cumulative sequence. It uses the same model and user-visible request, but a
+vLLM/TT-Transformers path rather than SGLang-JAX/StableHLO/TT-XLA. It is
+therefore reported separately and does not change any per-optimization
+attribution.
 
 ## Cumulative rather than factorial attribution
 
@@ -176,6 +200,30 @@ This layering explains why libtt's changes appear as patches to TT-XLA,
 TT-MLIR, and TT-Metal rather than only to libtt's thin PJRT surface. A graph
 pattern has to be recognized in TTIR, represented in TTNN/FlatBuffer, selected
 by the TTNN runtime, and finally executed by a suitable Metal program.
+
+### Reference stack: tt-inference-server
+
+The external baseline enters the Tenstorrent stack by a different route.
+Tenstorrent's tt-inference-server supplies an OpenAI-compatible HTTP service
+around vLLM. For Qwen3-8B in release v0.10.0, vLLM invokes the official
+TT-Transformers Qwen implementation, which constructs TTNN operations and
+TT-Metal programs directly rather than tracing JAX to StableHLO and compiling
+it through TT-XLA/TT-MLIR.[^ttis]
+
+```text
+libtt path:     SGLang-JAX → JAX/StableHLO → libtt/PJRT
+                            → TT-XLA/TT-MLIR → TTNN → TT-Metal → P150
+
+upstream path:  OpenAI API → vLLM → TT-Transformers
+                            → TTNN → TT-Metal → P150
+```
+
+This makes the upstream result valuable as a system-level reference: model,
+hardware, prompt, output length, request concurrency, and cache policy can be
+held constant while the frontend and model implementation differ. It is not a
+kernel-isolation experiment. A gap can come from prefill, model graph choices,
+layout policy, TTNN operation selection, trace handling, or serving overhead,
+not just the SwiGLU epilogue studied here.
 
 ## Blackhole and the Tensix execution model
 
@@ -466,7 +514,8 @@ detectable throughput regression.
 | Serving frontend | `/home/pcmoritz/sglang-jax` |
 | PJRT plugin | revision-specific `bazel-bin/libtt.so` |
 | Final report revision | `caa5428fb86c9ffc6a9dda8685126c5ac4353013` |
-| Benchmark date | 11 July 2026 (America/Los_Angeles) |
+| libtt benchmark date | 11 July 2026 (America/Los_Angeles) |
+| Upstream reference date | 15 July 2026 (America/Los_Angeles) |
 
 V0--V4 were rebuilt and collected in one sequential benchmark session. V5--V8
 use the first 32 retained observations from the existing 40-observation runs
@@ -502,8 +551,8 @@ env -u TT_METAL_RUNTIME_ROOT \
   --disable-overlap-schedule --disable-radix-cache
 ```
 
-Disabling radix cache ensures every request executes the 32-token prompt
-prefill rather than reusing a prefix. Disabling overlap schedule removes
+Disabling radix cache ensures every request executes the five-token logical
+prompt prefill (one padded 32-row tile) rather than reusing a prefix. Disabling overlap schedule removes
 cross-request scheduler overlap. The maximum of two running requests is a
 server capacity setting; requests were issued serially. Fused greedy sampling
 is explicitly disabled so improvements reflect the model path.
@@ -534,6 +583,69 @@ where (L_j) is SGLang's `meta_info.e2e_latency`. This includes request-local
 prefill, decode, and serving overhead, so it is intentionally an end-to-end
 generation metric rather than a kernel-only number.
 
+## Upstream reference configuration
+
+The external reference used the official tt-inference-server v0.10.0 checkout
+at commit `4be69a67c718` and its release container:
+
+```text
+ghcr.io/tenstorrent/tt-inference-server/
+  vllm-tt-metal-src-release-ubuntu-22.04-amd64:
+  0.10.0-e867533-22be241
+```
+
+The tag identifies TT-Metal commit `e867533` and vLLM commit `22be241`; the
+server reported vLLM `0.1.dev11678+g22be24130`. Release v0.10.0 includes the
+Qwen3-8B runtime for P300 but not a P150 device entry. The local launcher
+checkout therefore had one runtime-relevant model-spec addition: a P150
+`DeviceModelSpec` with maximum concurrency 32 and context 40,960. A second
+local launcher change allowed the public Hugging Face repository to be used
+without an access token. The release container itself was unmodified.
+
+The server was launched as follows:
+
+```bash
+cd /home/pcmoritz/tt-metal/tt-inference-server-p150
+python3 run.py \
+  --model Qwen3-8B --workflow server --device p150 \
+  --docker-server --no-auth --service-port 8000 \
+  --vllm-override-args '{"no-enable-prefix-caching": true}' \
+  --skip-system-sw-validation
+```
+
+The explicit negative vLLM option matters. This release's JSON-to-CLI adapter
+omits boolean `false`, so `{"enable_prefix_caching": false}` does not disable
+the cache. Both the API process and engine log confirmed
+`enable_prefix_caching=False` for the retained run. The KMD version gate was
+skipped because the host has KMD 2.3.0 while the launcher declares a strict
+minimum of 2.5.0; device initialization, model warm-up, trace capture, and all
+34 measured requests completed successfully. Firmware was 19.6.0 in both
+experiments.
+
+After the server's built-in model warm-up and nine background trace-capture
+requests completed, `benchmark_upstream.py` sent 34 serial requests over one
+persistent loopback connection:
+
+```json
+{
+  "model": "Qwen/Qwen3-8B",
+  "prompt": "The capital of France is",
+  "temperature": 0,
+  "max_tokens": 128
+}
+```
+
+This is the OpenAI-completions equivalent of the README request. It naturally
+returned 128 tokens with `finish_reason="length"`; no `ignore_eos` override was
+needed. The first two requests were discarded and 32 retained. The API reports
+token counts but no request latency, so the collector measures monotonic client
+wall time from request send through reading the complete response. Thus the
+upstream result includes loopback HTTP and response serialization that the
+libtt server-reported `e2e_latency` may exclude. At approximately 5.3 seconds
+per request this is a small absolute term, but the clocks are not identical and
+the 1.90% cross-stack difference should not be interpreted as a kernel-only
+effect.
+
 ## Statistical treatment
 
 For each revision the report gives the arithmetic mean, sample standard
@@ -542,6 +654,12 @@ the mean. Adjacent revisions are compared with a two-sided Welch t-test, which
 does not assume equal variance. Eight planned adjacent comparisons create a
 multiple-testing family, so Holm's step-down method controls family-wise error.
 Raw and adjusted p-values are preserved in `data/summary.csv`.
+
+The upstream reference is summarized with the same descriptive statistics and
+a separate Welch comparison against V0 and V8. Those p-values are preserved in
+`data/upstream-tt-inference-summary.csv` and are not added to the eight-test
+Holm family, because this is a separately collected external comparison rather
+than another cumulative libtt revision.
 
 The tests assume independent observations. Sequential accelerator timings can
 exhibit autocorrelation and thermal drift, so p-values should be read as
@@ -578,6 +696,33 @@ is not statistically distinguishable from zero. In contrast, V4's confidence
 interval sits below V3's and its adjusted p-value is small. The data therefore
 support “V8 preserves V7 performance,” but not “every fusion improved
 performance.”
+
+## Upstream tt-inference-server reference
+
+Table: Same Qwen3-8B prompt and 128-token serial workload on the same P150, with two warm-ups discarded and 32 requests retained. The upstream clock is client-observed; libtt uses server-reported request latency.
+
+| Implementation | Revision | Mean ± SD (tok/s) | 95% CI | Mean latency |
+|:--|:--|--:|:--:|--:|
+| libtt V0 | `7482967` | 16.265 ± 0.128 | [16.218, 16.311] | 7.870 s |
+| libtt V8 | `caa5428` | 23.698 ± 0.274 | [23.599, 23.797] | 5.402 s |
+| TTIS v0.10.0 | `4be69a6` | **24.148 ± 0.412** | [23.999, 24.296] | **5.302 s** |
+
+![External serving-stack reference on the same model workload.](figures/upstream-comparison.svg){#fig:upstream width=100%}
+
+The upstream mean is 0.450 tok/s above V8. A separate two-sided Welch test
+gives p = $3.87\times10^{-6}$ for that comparison in these windows; upstream
+versus V0 gives p = $4.21\times10^{-47}$. The confidence intervals and test
+show that the observed difference is larger than request-to-request noise in
+these runs. They do not identify its cause, and they do not remove two design
+limitations: the stacks were measured four days apart, and the upstream clock
+contains loopback client overhead while the libtt clock is request-local.
+
+The system-level conclusion is therefore narrower and more useful: the libtt
+optimization sequence raises throughput from 16.265 tok/s to within 1.90% of
+the official v0.10.0 TT-Transformers serving path on this workload. The
+external reference does not alter the +45.70% internal attribution. All 32
+upstream completions were identical and returned exactly five prompt plus 128
+completion tokens; their completion-text SHA-256 prefix is `37becb7c58d6`.
 
 ## Pure decode cross-check
 
@@ -706,8 +851,9 @@ precision mode from being represented as part of the final model-path speedup.
 # Limitations and follow-up work
 
 1. **One model and shape.** Results apply to Qwen3-8B, serial batch-one-style
-   generation, a 32-token prompt, and 128 generated tokens. Larger batch,
-   longer context, or multi-user continuous batching can move the bottleneck.
+   generation, a five-token prompt padded to one 32-row tile, and 128 generated
+   tokens. Larger batch, longer context, or multi-user continuous batching can
+   move the bottleneck.
 2. **End-to-end metric.** The primary metric contains short prefill and server
    overhead. The streaming cross-check isolates final decode, but only on V8.
 3. **Sequential ordering.** Revisions were not randomized or interleaved.
@@ -725,6 +871,16 @@ precision mode from being represented as part of the final model-path speedup.
 7. **The V1 bundle is not decomposed.** Its +22.58% cannot be divided among
    RMSNorm, RoPE, KV dtype, SDPA layout, and BF8-enabling changes without
    constructing additional cherry-picked revisions.
+8. **Cross-stack clocks differ slightly.** tt-inference-server is timed at the
+   loopback client while libtt supplies server-side request latency. The
+   upstream number includes additional HTTP and JSON-response work, and the
+   two stacks were measured four days apart. The comparison is suitable as a
+   serving reference, not as sub-percent kernel attribution.
+9. **P150 is locally enabled upstream.** The v0.10.0 runtime image is official
+   and unmodified, but the release's host model spec does not list Qwen3-8B on
+   P150. The benchmark adds that device entry locally and skips a strict KMD
+   version gate. Results should be repeated on a release with first-class P150
+   support when one is available.
 
 The most promising next optimization is to keep more of the MLP pipeline on
 chip: consume the SwiGLU output directly in a compatible down-projection path,
@@ -740,6 +896,13 @@ The report bundle contains:
 - `data/samples.csv`: all 288 retained per-request observations;
 - `data/summary.csv`: descriptive statistics, speedups, raw Welch p-values,
   Holm-adjusted p-values, and output hashes;
+- `data/upstream-tt-inference-samples.csv`: 32 retained upstream reference
+  observations;
+- `data/upstream-tt-inference-summary.csv` and
+  `data/upstream-tt-inference-manifest.json`: external-reference statistics
+  and exact server/request metadata;
+- `benchmark_upstream.py`: the persistent-connection OpenAI-completions
+  collector used for the upstream reference;
 - `analyze.py`: the exact analysis and SVG generation code;
 - `figures/*.svg`: resolution-independent figures;
 - `style.css` and `Makefile`: HTML, LaTeX, and PDF build paths.
@@ -750,6 +913,14 @@ benchmark host:
 ```bash
 /home/pcmoritz/sglang-jax/.venv/bin/python \
   docs/libtt-optimization-report/analyze.py
+```
+
+To recollect the upstream reference after launching the server with the command
+in its methodology section:
+
+```bash
+python3 docs/libtt-optimization-report/benchmark_upstream.py \
+  --output-dir /tmp/libtt-ttis-baseline-20260715
 ```
 
 To build a self-contained HTML report:
@@ -779,7 +950,13 @@ principles:
 - recognize framework-generated algebra before lowering;
 - choose layouts that expose decode's width parallelism; and
 - place fusion at the producer epilogue so intermediate values never cross an
-  avoidable memory boundary.
+avoidable memory boundary.
+
+On the same external workload, upstream tt-inference-server v0.10.0 reaches
+24.148 tokens/s. The optimized libtt line is therefore within 1.90% of that
+reference, compared with a 48.47% gap at V0. This cross-stack number is a
+serving-system baseline rather than an additional optimization step, and the
+report preserves its different timing scope explicitly.
 
 The final matmul-SwiGLU implementation is faster because it follows the third
 principle literally: gate and up values remain in Dst until `silu(gate) * up`
@@ -801,3 +978,4 @@ speedup.
 [^memconfig]: Tenstorrent, [`ttnn.to_memory_config`](https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/api/ttnn.to_memory_config.html).
 [^bfp8]: Tenstorrent, [TTNN BFLOAT8_B description and limitations](https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html#limitation-of-bfloat8-b).
 [^packer]: Tenstorrent, [`pack_reconfig_l1_acc`](https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/pack_unpack/pack_tile.html).
+[^ttis]: Tenstorrent, [tt-inference-server v0.10.0 release](https://github.com/tenstorrent/tt-inference-server/releases/tag/v0.10.0) and [repository](https://github.com/tenstorrent/tt-inference-server).

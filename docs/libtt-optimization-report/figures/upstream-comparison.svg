@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="510" viewBox="0 0 980 510">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1.2}.grid{stroke:#dbe4ee;stroke-width:1}.baseline{fill:#8395a7}.libtt{fill:#006d77}.upstream{fill:#e29578}.ci{stroke:#172033;stroke-width:3}.label{font-size:14px}.small{font-size:12px;fill:#526174}.value{font-size:16px;font-weight:700}.title{font-size:21px;font-weight:700}</style>
+<text x="100" y="29" class="title">Same-prompt 128-token serving comparison</text>
+<line x1="100" y1="390.0" x2="950" y2="390.0" class="grid"/>
+<text x="88" y="395.0" text-anchor="end" class="label">0</text>
+<line x1="100" y1="326.1" x2="950" y2="326.1" class="grid"/>
+<text x="88" y="331.1" text-anchor="end" class="label">5</text>
+<line x1="100" y1="262.2" x2="950" y2="262.2" class="grid"/>
+<text x="88" y="267.2" text-anchor="end" class="label">10</text>
+<line x1="100" y1="198.3" x2="950" y2="198.3" class="grid"/>
+<text x="88" y="203.3" text-anchor="end" class="label">15</text>
+<line x1="100" y1="134.4" x2="950" y2="134.4" class="grid"/>
+<text x="88" y="139.4" text-anchor="end" class="label">20</text>
+<line x1="100" y1="70.6" x2="950" y2="70.6" class="grid"/>
+<text x="88" y="75.6" text-anchor="end" class="label">25</text>
+<line x1="100" y1="45" x2="100" y2="390" class="axis"/>
+<line x1="100" y1="390" x2="950" y2="390" class="axis"/>
+<rect x="168.0" y="182.2" width="147.3" height="207.8" rx="4" class="baseline"/>
+<line x1="241.7" y1="181.6" x2="241.7" y2="182.8" class="ci"/>
+<line x1="234.7" y1="181.6" x2="248.7" y2="181.6" class="ci"/>
+<line x1="234.7" y1="182.8" x2="248.7" y2="182.8" class="ci"/>
+<text x="241.7" y="169.2" text-anchor="middle" class="value">16.265</text>
+<text x="241.7" y="419" text-anchor="middle" class="label">libtt V0</text>
+<text x="241.7" y="438" text-anchor="middle" class="small">7482967</text>
+<rect x="451.3" y="87.2" width="147.3" height="302.8" rx="4" class="libtt"/>
+<line x1="525.0" y1="85.9" x2="525.0" y2="88.5" class="ci"/>
+<line x1="518.0" y1="85.9" x2="532.0" y2="85.9" class="ci"/>
+<line x1="518.0" y1="88.5" x2="532.0" y2="88.5" class="ci"/>
+<text x="525.0" y="74.2" text-anchor="middle" class="value">23.698</text>
+<text x="525.0" y="419" text-anchor="middle" class="label">libtt V8</text>
+<text x="525.0" y="438" text-anchor="middle" class="small">caa5428</text>
+<rect x="734.7" y="81.4" width="147.3" height="308.6" rx="4" class="upstream"/>
+<line x1="808.3" y1="79.5" x2="808.3" y2="83.3" class="ci"/>
+<line x1="801.3" y1="79.5" x2="815.3" y2="79.5" class="ci"/>
+<line x1="801.3" y1="83.3" x2="815.3" y2="83.3" class="ci"/>
+<text x="808.3" y="68.4" text-anchor="middle" class="value">24.148</text>
+<text x="808.3" y="419" text-anchor="middle" class="label">tt-inference-server</text>
+<text x="808.3" y="438" text-anchor="middle" class="small">v0.10.0</text>
+<text transform="translate(25 217.5) rotate(-90)" text-anchor="middle" class="label">tokens/s (mean and 95% t interval)</text>
+<text x="100" y="468" class="small">32 retained requests each. libtt: server-reported request latency; upstream: loopback client wall clock.</text>
+<text x="100" y="488" class="small">The upstream interval therefore includes a small amount of HTTP and response-serialization overhead.</text>
+</svg>

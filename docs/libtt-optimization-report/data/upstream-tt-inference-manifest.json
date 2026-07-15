@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-07-15T10:18:46.960509+00:00",
+  "base_url": "http://127.0.0.1:8000",
+  "endpoint": "/v1/completions",
+  "request": {
+    "model": "Qwen/Qwen3-8B",
+    "prompt": "The capital of France is",
+    "temperature": 0,
+    "max_tokens": 128
+  },
+  "warmups": 2,
+  "retained_samples": 32,
+  "timing_scope": "client wall clock: request send through complete response read",
+  "models": {
+    "object": "list",
+    "data": [
+      {
+        "id": "Qwen/Qwen3-8B",
+        "object": "model",
+        "created": 1784110726,
+        "owned_by": "vllm",
+        "root": "Qwen/Qwen3-8B",
+        "parent": null,
+        "max_model_len": 40960,
+        "permission": [
+          {
+            "id": "modelperm-2bb8a70343db493aa381c3da1588f2fd",
+            "object": "model_permission",
+            "created": 1784110726,
+            "allow_create_engine": false,
+            "allow_sampling": true,
+            "allow_logprobs": true,
+            "allow_search_indices": false,
+            "allow_view": true,
+            "allow_fine_tuning": false,
+            "organization": "*",
+            "group": null,
+            "is_blocking": false
+          }
+        ]
+      }
+    ]
+  },
+  "vllm_api_version": {
+    "version": "0.1.dev11678+g22be24130"
+  },
+  "tt_inference_server": {
+    "release": "v0.10.0",
+    "commit": "4be69a67c7183bf76052d4a6f64a42ac93b71ac5",
+    "container_image": "ghcr.io/tenstorrent/tt-inference-server/vllm-tt-metal-src-release-ubuntu-22.04-amd64:0.10.0-e867533-22be241",
+    "prefix_caching": "disabled with --no-enable-prefix-caching",
+    "hardware": "Blackhole P150"
+  }
+}
