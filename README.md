@@ -34,7 +34,7 @@ Then check out the SGLang-JAX TT backend branch from
 [pcmoritz/sglang-jax#1](https://github.com/pcmoritz/sglang-jax/pull/1):
 
 ```bash
-export SGLANG_JAX_DIR=/tmp/sglang-jax
+export SGLANG_JAX_DIR="$HOME/sglang-jax"
 git clone git@github.com:pcmoritz/sglang-jax.git "$SGLANG_JAX_DIR"
 cd "$SGLANG_JAX_DIR"
 git fetch origin pull/1/head:codex/qwen3-tt-sglang
@@ -56,6 +56,11 @@ env -u TT_METAL_RUNTIME_ROOT \
   SGLANG_TT_HOST_WEIGHT_LOAD=1 \
   SGLANG_TT_OPTIMIZATION_LEVEL=1 \
   SGLANG_TT_EXPERIMENTAL_WEIGHT_DTYPE=bfp_bf8 \
+  SGLANG_TT_TRACE_DECODE_ONLY=false \
+  SGLANG_TT_FP32_DEST_ACC_EN=false \
+  SGLANG_TT_FUSED_GREEDY_SAMPLING=0 \
+  SGLANG_TT_CPU_SAMPLING=0 \
+  TT_RUNTIME_TRACE_REGION_SIZE=200000000 \
   .venv/bin/python -m sgl_jax.launch_server \
     --model-path Qwen/Qwen3-8B \
     --host 127.0.0.1 \
@@ -75,6 +80,22 @@ env -u TT_METAL_RUNTIME_ROOT \
     --disable-radix-cache
 ```
 
+`SGLANG_TT_TRACE_DECODE_ONLY=false` records and replays the fixed-shape
+prefill graph as well as the decode graph. This avoids dispatching the model's
+prefill operations individually from the host. The trace-compatible
+accumulator setting is made explicit, and both optional sampling fast paths
+remain disabled in the command above.
+
+Because the example disables precompilation and server warmup, the first two
+requests can spend substantial time compiling programs and capturing traces.
+Warm each input bucket before measuring it. With the five-token prompt below,
+SGLang-JAX pads prefill to one 32-token tile. In a 32-sample streaming run on a
+P150, after two warmups, time to first token averaged 58.52 ms (95% CI
+58.38--58.66 ms) and decode averaged 25.96 tokens/s (95% CI 25.80--26.13
+tokens/s). The same libtt build with decode-only tracing averaged 610.50 ms to
+first token, so tracing prefill reduced that latency by 90.42% without changing
+the deterministic completion.
+
 In another terminal, generate 128 tokens:
 
 ```bash
@@ -83,4 +104,5 @@ curl -sS http://127.0.0.1:31000/generate \
   -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":128}}'
 ```
 
-On a blackhole chip, the generation speed should be about 19 tokens per second after some initial warmup.
+On a P150, generation should be about 26 tokens per second after the compile
+and trace-capture warmups.
