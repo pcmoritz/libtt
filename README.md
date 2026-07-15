@@ -57,10 +57,6 @@ env -u TT_METAL_RUNTIME_ROOT \
   SGLANG_TT_OPTIMIZATION_LEVEL=1 \
   SGLANG_TT_EXPERIMENTAL_WEIGHT_DTYPE=bfp_bf8 \
   SGLANG_TT_TRACE_DECODE_ONLY=false \
-  SGLANG_TT_FP32_DEST_ACC_EN=false \
-  SGLANG_TT_FUSED_GREEDY_SAMPLING=0 \
-  SGLANG_TT_CPU_SAMPLING=0 \
-  TT_RUNTIME_TRACE_REGION_SIZE=200000000 \
   .venv/bin/python -m sgl_jax.launch_server \
     --model-path Qwen/Qwen3-8B \
     --host 127.0.0.1 \
@@ -82,9 +78,7 @@ env -u TT_METAL_RUNTIME_ROOT \
 
 `SGLANG_TT_TRACE_DECODE_ONLY=false` records and replays the fixed-shape
 prefill graph as well as the decode graph. This avoids dispatching the model's
-prefill operations individually from the host. The trace-compatible
-accumulator setting is made explicit, and both optional sampling fast paths
-remain disabled in the command above.
+prefill operations individually from the host.
 
 Because the example disables precompilation and server warmup, the first two
 requests can spend substantial time compiling programs and capturing traces.
