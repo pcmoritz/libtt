@@ -2,7 +2,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 index 8affb04..7d68dcf 100644
 --- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
-@@ -241,4 +241,218 @@ ProgramDescriptor MatmulMultiCoreProgramFactory::create_descriptor(
+@@ -5,3 +5,4 @@
+ #include "ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp"
++#include <cstdlib>
+ #include <map>
+ #include <string>
+@@ -241,4 +242,228 @@ ProgramDescriptor MatmulMultiCoreProgramFactory::create_descriptor(
      return desc;
  }
  
@@ -19,8 +24,17 @@ index 8affb04..7d68dcf 100644
 +    constexpr uint32_t num_cores = 96;
 +    constexpr uint32_t group0_y = 8;
 +    constexpr uint32_t group1_x = 8;
-+    constexpr uint32_t in0_block_w = 2;
 +    constexpr uint32_t in0_mcast_w = 2;
++    uint32_t in0_block_w = 2;
++    if (const char* value = std::getenv("TT_METAL_SWIGLU_IN0_BLOCK_W")) {
++        char* end = nullptr;
++        const unsigned long parsed = std::strtoul(value, &end, 10);
++        TT_FATAL(
++            end != value && *end == '\0' &&
++                (parsed == 2 || parsed == 4 || parsed == 8 || parsed == 16),
++            "TT_METAL_SWIGLU_IN0_BLOCK_W must be one of 2, 4, 8, or 16");
++        in0_block_w = static_cast<uint32_t>(parsed);
++    }
 +
 +    const uint32_t Kt = a.padded_shape()[-1] / TILE_WIDTH;
 +    const uint32_t fused_Nt = b.padded_shape()[-1] / TILE_WIDTH;
@@ -33,6 +47,7 @@ index 8affb04..7d68dcf 100644
 +    TT_FATAL(half_Nt % num_cores == 0, "SwiGLU output tiles must divide across 96 cores");
 +    TT_FATAL(Kt % in0_block_w == 0, "SwiGLU K tiles must divide by the K block width");
 +    TT_FATAL(Kt % in0_mcast_w == 0, "SwiGLU K tiles must divide by the multicast width");
++    TT_FATAL(in0_block_w >= in0_mcast_w, "SwiGLU K block must cover at least one multicast block");
 +    TT_FATAL(combined_per_core_N == 8, "SwiGLU gate and up outputs must exactly fill the 8-tile DST");
 +
 +    const CoreRangeSet all_cores(std::vector<CoreRange>{
@@ -58,7 +73,7 @@ index 8affb04..7d68dcf 100644
 +            }}},
 +        });
 +    };
-+    add_cb(tt::CBIndex::c_0, 2 * in0_mcast_w, in0_format, in0_tile_size);
++    add_cb(tt::CBIndex::c_0, 2 * in0_block_w, in0_format, in0_tile_size);
 +    add_cb(tt::CBIndex::c_1, 2 * in1_block_num_tiles, in1_format, in1_tile_size);
 +    add_cb(tt::CBIndex::c_3, combined_per_core_N, output_format, output_tile_size);
 +    add_cb(tt::CBIndex::c_16, per_core_N, output_format, output_tile_size);
