@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en-US" xml:lang="en-US">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <meta name="author" content="libtt performance study" />
+  <meta name="dcterms.date" content="2026-07-11" />
+  <meta name="keywords" content="Tenstorrent, Blackhole, libtt, TT-Metalium, TTNN, TT-MLIR, JAX, Qwen3, LLM inference, kernel fusion" />
+  <title>Accelerating Qwen3-8B Decode on Tenstorrent Blackhole</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    span.underline{text-decoration: underline;}
+    div.column{display: inline-block; vertical-align: top; width: 50%;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    ul.task-list{list-style: none;}
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+  <style type="text/css">:root {
+--ink: #172033;
+--muted: #526174;
+--accent: #006d77;
+--accent-2: #e29578;
+--paper: #ffffff;
+--wash: #f4f7fa;
+--rule: #dbe4ee;
+}
+html { background: #e9eef3; }
+body {
+box-sizing: border-box;
+max-width: 1080px;
+margin: 28px auto;
+padding: 72px 88px;
+color: var(--ink);
+background: var(--paper);
+box-shadow: 0 10px 35px rgba(23, 32, 51, .12);
+font: 17px/1.62 "Charter", "Bitstream Charter", "Iowan Old Style", Georgia, serif;
+text-rendering: optimizeLegibility;
+}
+h1, h2, h3, h4, #TOC, table, figcaption, code {
+font-family: Inter, "Helvetica Neue", Arial, sans-serif;
+}
+h1 { margin-top: 2.5em; padding-bottom: .24em; color: var(--accent); border-bottom: 2px solid var(--accent); font-size: 2em; }
+h2 { margin-top: 2em; color: #1f4f5a; font-size: 1.45em; }
+h3 { margin-top: 1.6em; color: #315a68; font-size: 1.15em; }
+h1.title { margin-top: 0; border: 0; color: var(--ink); font-size: 2.65em; line-height: 1.08; }
+.subtitle { color: var(--accent); font-size: 1.35em; }
+.author, .date { color: var(--muted); }
+#TOC {
+margin: 3em 0;
+padding: 1.6em 2em;
+background: var(--wash);
+border-left: 5px solid var(--accent);
+}
+#TOC a { color: var(--ink); text-decoration: none; }
+#TOC a:hover { color: var(--accent); }
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+strong { color: #103f48; }
+blockquote { margin-left: 0; padding: .2em 1.2em; color: var(--muted); border-left: 4px solid var(--accent-2); }
+table { width: 100%; margin: 1.5em 0 2em; border-collapse: collapse; font-size: .84em; line-height: 1.4; }
+thead { border-top: 2px solid var(--ink); border-bottom: 1px solid var(--ink); }
+tbody { border-bottom: 2px solid var(--ink); }
+th, td { padding: .62em .55em; vertical-align: top; }
+th { text-align: left; color: #103f48; }
+tbody tr:nth-child(even) { background: var(--wash); }
+caption { margin: .8em 0; color: var(--muted); text-align: left; }
+figure { margin: 2.2em 0; }
+figure img, p > img { display: block; width: 100%; height: auto; margin: 1.2em auto; }
+figcaption { margin-top: .8em; color: var(--muted); font-size: .88em; text-align: center; }
+pre {
+overflow-x: auto;
+padding: 1.15em 1.3em;
+color: #eef6f7;
+background: #172b34;
+border-radius: 7px;
+font-size: .82em;
+line-height: 1.5;
+}
+code { font-size: .88em; }
+p code, li code, td code { padding: .12em .32em; color: #174f5b; background: #edf4f5; border-radius: 3px; }
+.abstract { margin: 2.5em 0; padding: 1.5em 1.8em; background: #f4faf9; border: 1px solid #cce2df; }
+.abstract-title { color: var(--accent); font-family: Inter, Arial, sans-serif; }
+@media (max-width: 800px) {
+body { margin: 0; padding: 35px 24px; box-shadow: none; }
+h1.title { font-size: 2em; }
+table { display: block; overflow-x: auto; }
+}
+@media print {
+@page { size: A4; margin: 20mm 18mm 22mm; }
+html { background: white; }
+body { max-width: none; margin: 0; padding: 0; box-shadow: none; font-size: 10.5pt; }
+h1, h2, h3 { break-after: avoid-page; }
+table, figure, pre { break-inside: avoid-page; }
+a { color: var(--ink); text-decoration: none; }
+pre { white-space: pre-wrap; }
+}
+</style>
+
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Accelerating Qwen3-8B Decode on Tenstorrent Blackhole</h1>
+<p class="subtitle">A technical and statistical report on libtt’s model-path optimizations</p>
+<p class="author">libtt performance study</p>
+<p class="date">11 July 2026</p>
+</header>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#executive-summary"><span class="toc-section-number">1</span> Executive summary</a></li>
+<li><a href="#scope-and-interpretation"><span class="toc-section-number">2</span> Scope and interpretation</a>
+<ul>
+<li><a href="#what-each-optimization-means-in-this-report"><span class="toc-section-number">2.1</span> What “each optimization” means in this report</a></li>
+<li><a href="#cumulative-rather-than-factorial-attribution"><span class="toc-section-number">2.2</span> Cumulative rather than factorial attribution</a></li>
+</ul></li>
+<li><a href="#tenstorrent-technical-background"><span class="toc-section-number">3</span> Tenstorrent technical background</a>
+<ul>
+<li><a href="#end-to-end-software-stack"><span class="toc-section-number">3.1</span> End-to-end software stack</a></li>
+<li><a href="#blackhole-and-the-tensix-execution-model"><span class="toc-section-number">3.2</span> Blackhole and the Tensix execution model</a>
+<ul>
+<li><a href="#tiles-faces-and-padding"><span class="toc-section-number">3.2.1</span> Tiles, faces, and padding</a></li>
+<li><a href="#dst-registers-and-why-epilogues-matter"><span class="toc-section-number">3.2.2</span> Dst registers and why epilogues matter</a></li>
+<li><a href="#dram-l1-interleaving-and-sharding"><span class="toc-section-number">3.2.3</span> DRAM, L1, interleaving, and sharding</a></li>
+<li><a href="#bf16-and-bfp8-weights"><span class="toc-section-number">3.2.4</span> BF16 and BFP8 weights</a></li>
+</ul></li>
+<li><a href="#why-autoregressive-decode-is-special"><span class="toc-section-number">3.3</span> Why autoregressive decode is special</a></li>
+</ul></li>
+<li><a href="#optimization-sequence"><span class="toc-section-number">4</span> Optimization sequence</a>
+<ul>
+<li><a href="#v0-documented-baseline-7482967"><span class="toc-section-number">4.1</span> V0 — documented baseline (<code>7482967</code>)</a></li>
+<li><a href="#v1-decode-foundation-bundle-9978a9b"><span class="toc-section-number">4.2</span> V1 — decode foundation bundle (<code>9978a9b</code>)</a></li>
+<li><a href="#v2-expanded-silu-recognition-10459b5"><span class="toc-section-number">4.3</span> V2 — expanded-SiLU recognition (<code>10459b5</code>)</a></li>
+<li><a href="#v3-qwen-decode-qkv-projection-fusion-3fe072b"><span class="toc-section-number">4.4</span> V3 — Qwen decode QKV projection fusion (<code>3fe072b</code>)</a></li>
+<li><a href="#v4-two-way-shared-lhs-matmul-fusion-83baa8d"><span class="toc-section-number">4.5</span> V4 — two-way shared-LHS matmul fusion (<code>83baa8d</code>)</a></li>
+<li><a href="#v5-decode-rmsnorm-runtime-sharding-e534690"><span class="toc-section-number">4.6</span> V5 — decode RMSNorm runtime sharding (<code>e534690</code>)</a></li>
+<li><a href="#v6-silu-fused-into-binary-multiply-a718685"><span class="toc-section-number">4.7</span> V6 — SiLU fused into binary multiply (<code>a718685</code>)</a></li>
+<li><a href="#v7-true-dst-resident-matmul-swiglu-epilogue-ce99831"><span class="toc-section-number">4.8</span> V7 — true Dst-resident matmul-SwiGLU epilogue (<code>ce99831</code>)</a></li>
+<li><a href="#v8-prefill-capable-fallback-free-simplification-caa5428"><span class="toc-section-number">4.9</span> V8 — prefill-capable, fallback-free simplification (<code>caa5428</code>)</a></li>
+</ul></li>
+<li><a href="#benchmark-methodology"><span class="toc-section-number">5</span> Benchmark methodology</a>
+<ul>
+<li><a href="#system-and-software"><span class="toc-section-number">5.1</span> System and software</a></li>
+<li><a href="#server-configuration"><span class="toc-section-number">5.2</span> Server configuration</a></li>
+<li><a href="#request-and-sample-policy"><span class="toc-section-number">5.3</span> Request and sample policy</a></li>
+<li><a href="#statistical-treatment"><span class="toc-section-number">5.4</span> Statistical treatment</a></li>
+</ul></li>
+<li><a href="#results"><span class="toc-section-number">6</span> Results</a>
+<ul>
+<li><a href="#primary-throughput-results"><span class="toc-section-number">6.1</span> Primary throughput results</a></li>
+<li><a href="#pure-decode-cross-check"><span class="toc-section-number">6.2</span> Pure decode cross-check</a></li>
+<li><a href="#correctness-and-numeric-stability-checks"><span class="toc-section-number">6.3</span> Correctness and numeric stability checks</a></li>
+</ul></li>
+<li><a href="#reading-the-results-mechanistically"><span class="toc-section-number">7</span> Reading the results mechanistically</a>
+<ul>
+<li><a href="#launch-reduction-is-not-the-same-as-traffic-reduction"><span class="toc-section-number">7.1</span> Launch reduction is not the same as traffic reduction</a></li>
+<li><a href="#why-rmsnorm-sharding-is-unusually-large"><span class="toc-section-number">7.2</span> Why RMSNorm sharding is unusually large</a></li>
+<li><a href="#why-the-final-simplification-is-safe-for-performance"><span class="toc-section-number">7.3</span> Why the final simplification is safe for performance</a></li>
+</ul></li>
+<li><a href="#historical-optimization-inventory"><span class="toc-section-number">8</span> Historical optimization inventory</a></li>
+<li><a href="#limitations-and-follow-up-work"><span class="toc-section-number">9</span> Limitations and follow-up work</a></li>
+<li><a href="#reproduction-and-report-generation"><span class="toc-section-number">10</span> Reproduction and report generation</a></li>
+<li><a href="#conclusion"><span class="toc-section-number">11</span> Conclusion</a></li>
+</ul>
+</nav>
+<h1 data-number="1" id="executive-summary"><span class="header-section-number">1</span> Executive summary</h1>
+<p>The optimized branch <code>agent/qwen3-matmul-swiglu-epilogue-simplify</code> delivers <strong>23.698 tokens/s</strong> on the report workload, compared with <strong>16.265 tokens/s</strong> at the documented pre-optimization baseline. This is a <strong>45.70% throughput increase</strong>. Mean end-to-end latency for the fixed 128-token response falls from 7.870 s to 5.402 s, a <strong>31.36% latency reduction</strong>. An auxiliary streaming run on the final revision measured <strong>25.790 pure decode tokens/s</strong> (20 samples, 95% CI 25.657–25.923) after separating time to first token.</p>
+<p>The principal findings are:</p>
+<ol type="1">
+<li>The initial decode-foundation bundle is decisive: it improves throughput by 22.58%. It combines compiler recognition of JAX RMSNorm and rank-3 RoPE, fixes KV-cache dtype propagation, enables BF8 activation lowering, and relaxes TTNN constraints needed by decode-specific layouts. Because these landed in one commit, the study attributes only their aggregate effect.</li>
+<li>Recognizing JAX’s <em>expanded</em> SiLU graph adds 3.30%, and fusing Qwen’s decode QKV projection adds another 1.15%.</li>
+<li>Broadening shared-LHS matmul fusion from three consumers to two is a statistically clear <strong>-1.69% regression</strong> in isolation. The combined gate/up representation is nevertheless an important enabler for the later SwiGLU epilogue. This is a useful distinction: an intermediate compiler form can be strategically valuable while being locally slower until its consumer is fused.</li>
+<li>Runtime width-sharding of single-token RMSNorm over 16 cores is the largest single-purpose win at <strong>+13.61%</strong>.</li>
+<li>Folding SiLU into a still-separate binary multiply is not enough. Its mean effect is -0.65%; the raw Welch test is nominally significant, but the result is not significant after correcting the eight adjacent comparisons (Holm-adjusted p = 0.053). The optimization avoids one intermediate, but it still writes and rereads the full gate/up matmul result.</li>
+<li>The true matmul-SwiGLU epilogue is the successful fusion boundary. It keeps four gate and four up tiles together in the eight-tile Dst register set on each of 96 cores, applies SiLU and multiplication before packing, and writes only the half-width result. It contributes <strong>+2.73%</strong>.</li>
+<li>Extending the matcher to the one-tile-row prefill case and removing the old fallback changes the mean by -0.19% (p = 0.53). It is therefore a code and coverage simplification with no detectable performance cost.</li>
+</ol>
+<figure>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTIwIiB2aWV3Qm94PSIwIDAgOTgwIDUyMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SW50ZXIsSGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTcyMDMzfS5heGlze3N0cm9rZTojNzE4MDk2O3N0cm9rZS13aWR0aDoxfS5ncmlke3N0cm9rZTojZGJlNGVlO3N0cm9rZS13aWR0aDoxfS5saW5le2ZpbGw6bm9uZTtzdHJva2U6IzAwNmQ3NztzdHJva2Utd2lkdGg6NH0uY2l7c3Ryb2tlOiNlMjk1Nzg7c3Ryb2tlLXdpZHRoOjN9LmRvdHtmaWxsOiMwMDZkNzc7c3Ryb2tlOndoaXRlO3N0cm9rZS13aWR0aDoyfS5sYWJlbHtmb250LXNpemU6MTRweH0uc21hbGx7Zm9udC1zaXplOjEycHg7ZmlsbDojNTI2MTc0fS50aXRsZXtmb250LXNpemU6MjFweDtmb250LXdlaWdodDo3MDB9PC9zdHlsZT4KPHRleHQgeD0iOTAiIHk9IjI3IiBjbGFzcz0idGl0bGUiPlF3ZW4zLThCIGVuZC10by1lbmQgZ2VuZXJhdGlvbiB0aHJvdWdocHV0PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSI0MTUuMCIgeDI9Ijk1NSIgeTI9IjQxNS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iNDIwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MTU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjM3NS41IiB4Mj0iOTU1IiB5Mj0iMzc1LjUiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIzODAuNSIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xNjwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzM2LjEiIHgyPSI5NTUiIHkyPSIzMzYuMSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM0MS4xIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE3PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIyOTYuNiIgeDI9Ijk1NSIgeTI9IjI5Ni42IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMzAxLjYiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MTg8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjI1Ny4xIiB4Mj0iOTU1IiB5Mj0iMjU3LjEiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIyNjIuMSIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xOTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjE3LjYiIHgyPSI5NTUiIHkyPSIyMTcuNiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjIyMi42IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjIwPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIxNzguMiIgeDI9Ijk1NSIgeTI9IjE3OC4yIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMTgzLjIiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjE8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjEzOC43IiB4Mj0iOTU1IiB5Mj0iMTM4LjciIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxNDMuNyIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMjwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iOTkuMiIgeDI9Ijk1NSIgeTI9Ijk5LjIiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxMDQuMiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMzwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iNTkuNyIgeDI9Ijk1NSIgeTI9IjU5LjciIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSI2NC43IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI0PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSI0MCIgeDI9IjkwIiB5Mj0iNDE1IiBjbGFzcz0iYXhpcyIvPgo8bGluZSB4MT0iOTAiIHkxPSI0MTUiIHgyPSI5NTUiIHkyPSI0MTUiIGNsYXNzPSJheGlzIi8+Cjxwb2x5bGluZSBwb2ludHM9IjkwLjAsMzY1LjEgMTk4LjEsMjIwLjEgMzA2LjIsMTk0LjEgNDE0LjQsMTg0LjggNTIyLjUsMTk4LjcgNjMwLjYsODguNyA3MzguOCw5NC43IDg0Ni45LDY5LjkgOTU1LjAsNzEuNyIgY2xhc3M9ImxpbmUiLz4KPGxpbmUgeDE9IjkwLjAiIHkxPSIzNjMuMyIgeDI9IjkwLjAiIHkyPSIzNjYuOSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI4NC4wIiB5MT0iMzYzLjMiIHgyPSI5Ni4wIiB5Mj0iMzYzLjMiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iODQuMCIgeTE9IjM2Ni45IiB4Mj0iOTYuMCIgeTI9IjM2Ni45IiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iOTAuMCIgY3k9IjM2NS4xIiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9IjkwLjAiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMDwvdGV4dD4KPHRleHQgeD0iOTAuMCIgeT0iNDYyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPjc0ODI5Njc8L3RleHQ+CjxsaW5lIHgxPSIxOTguMSIgeTE9IjIxNi4xIiB4Mj0iMTk4LjEiIHkyPSIyMjQuMSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIxOTIuMSIgeTE9IjIxNi4xIiB4Mj0iMjA0LjEiIHkyPSIyMTYuMSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIxOTIuMSIgeTE9IjIyNC4xIiB4Mj0iMjA0LjEiIHkyPSIyMjQuMSIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjE5OC4xIiBjeT0iMjIwLjEiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iMTk4LjEiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMTwvdGV4dD4KPHRleHQgeD0iMTk4LjEiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj45OTc4YTliPC90ZXh0Pgo8bGluZSB4MT0iMzA2LjIiIHkxPSIxOTAuMSIgeDI9IjMwNi4yIiB5Mj0iMTk4LjEiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMzAwLjIiIHkxPSIxOTAuMSIgeDI9IjMxMi4yIiB5Mj0iMTkwLjEiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMzAwLjIiIHkxPSIxOTguMSIgeDI9IjMxMi4yIiB5Mj0iMTk4LjEiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSIzMDYuMiIgY3k9IjE5NC4xIiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9IjMwNi4yIiB5PSI0NDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+VjI8L3RleHQ+Cjx0ZXh0IHg9IjMwNi4yIiB5PSI0NjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+MTA0NTliNTwvdGV4dD4KPGxpbmUgeDE9IjQxNC40IiB5MT0iMTgwLjYiIHgyPSI0MTQuNCIgeTI9IjE4OS4wIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjQwOC40IiB5MT0iMTgwLjYiIHgyPSI0MjAuNCIgeTI9IjE4MC42IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjQwOC40IiB5MT0iMTg5LjAiIHgyPSI0MjAuNCIgeTI9IjE4OS4wIiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iNDE0LjQiIGN5PSIxODQuOCIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSI0MTQuNCIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYzPC90ZXh0Pgo8dGV4dCB4PSI0MTQuNCIgeT0iNDYyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPjNmZTA3MmI8L3RleHQ+CjxsaW5lIHgxPSI1MjIuNSIgeTE9IjE5NC4yIiB4Mj0iNTIyLjUiIHkyPSIyMDMuMyIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI1MTYuNSIgeTE9IjE5NC4yIiB4Mj0iNTI4LjUiIHkyPSIxOTQuMiIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI1MTYuNSIgeTE9IjIwMy4zIiB4Mj0iNTI4LjUiIHkyPSIyMDMuMyIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjUyMi41IiBjeT0iMTk4LjciIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iNTIyLjUiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNDwvdGV4dD4KPHRleHQgeD0iNTIyLjUiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj44M2JhYThkPC90ZXh0Pgo8bGluZSB4MT0iNjMwLjYiIHkxPSI4NS40IiB4Mj0iNjMwLjYiIHkyPSI5Mi4xIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjYyNC42IiB5MT0iODUuNCIgeDI9IjYzNi42IiB5Mj0iODUuNCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI2MjQuNiIgeTE9IjkyLjEiIHgyPSI2MzYuNiIgeTI9IjkyLjEiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI2MzAuNiIgY3k9Ijg4LjciIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iNjMwLjYiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNTwvdGV4dD4KPHRleHQgeD0iNjMwLjYiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5lNTM0NjkwPC90ZXh0Pgo8bGluZSB4MT0iNzM4LjgiIHkxPSI5MC41IiB4Mj0iNzM4LjgiIHkyPSI5OS4wIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjczMi44IiB5MT0iOTAuNSIgeDI9Ijc0NC44IiB5Mj0iOTAuNSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3MzIuOCIgeTE9Ijk5LjAiIHgyPSI3NDQuOCIgeTI9Ijk5LjAiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI3MzguOCIgY3k9Ijk0LjciIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iNzM4LjgiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNjwvdGV4dD4KPHRleHQgeD0iNzM4LjgiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5hNzE4Njg1PC90ZXh0Pgo8bGluZSB4MT0iODQ2LjkiIHkxPSI2NS40IiB4Mj0iODQ2LjkiIHkyPSI3NC4zIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijg0MC45IiB5MT0iNjUuNCIgeDI9Ijg1Mi45IiB5Mj0iNjUuNCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI4NDAuOSIgeTE9Ijc0LjMiIHgyPSI4NTIuOSIgeTI9Ijc0LjMiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI4NDYuOSIgY3k9IjY5LjkiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iODQ2LjkiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNzwvdGV4dD4KPHRleHQgeD0iODQ2LjkiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5jZTk5ODMxPC90ZXh0Pgo8bGluZSB4MT0iOTU1LjAiIHkxPSI2Ny44IiB4Mj0iOTU1LjAiIHkyPSI3NS42IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijk0OS4wIiB5MT0iNjcuOCIgeDI9Ijk2MS4wIiB5Mj0iNjcuOCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI5NDkuMCIgeTE9Ijc1LjYiIHgyPSI5NjEuMCIgeTI9Ijc1LjYiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI5NTUuMCIgY3k9IjcxLjciIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iOTU1LjAiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WODwvdGV4dD4KPHRleHQgeD0iOTU1LjAiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5jYWE1NDI4PC90ZXh0Pgo8dGV4dCB0cmFuc2Zvcm09InRyYW5zbGF0ZSgyMyAyMjcuNSkgcm90YXRlKC05MCkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+dG9rZW5zL3MgKG1lYW4gYW5kIDk1JSB0IGludGVydmFsKTwvdGV4dD4KPHRleHQgeD0iOTAiIHk9IjUwNSIgY2xhc3M9InNtYWxsIj4zMiByZXRhaW5lZCByZXF1ZXN0cyBwZXIgcmV2aXNpb247IHR3byBjb21waWxlL3dhcm0tdXAgcmVxdWVzdHMgZXhjbHVkZWQ7IDEyOCBnZW5lcmF0ZWQgdG9rZW5zL3JlcXVlc3QuPC90ZXh0Pgo8L3N2Zz4K" id="fig:throughput" style="width:100.0%" alt /><figcaption>Cumulative throughput across the benchmarked revisions.</figcaption>
+</figure>
+<h1 data-number="2" id="scope-and-interpretation"><span class="header-section-number">2</span> Scope and interpretation</h1>
+<h2 data-number="2.1" id="what-each-optimization-means-in-this-report"><span class="header-section-number">2.1</span> What “each optimization” means in this report</h2>
+<p>The primary experiment covers every cumulative model-path optimization in the current, runnable Qwen3-8B serving line from commit <code>7482967</code> through commit <code>caa5428</code>. This is the sequence for which the same command in the current <code>README.md</code>, the same Qwen3-8B model, and the same TT-XLA/TTNN execution path remain meaningful. Each row is a real Git revision, not a feature flag applied to a shared binary.</p>
+<p>libtt also has an older, locally implemented PJRT/compiler/runtime history. Those optimizations are inventoried in <a href="#historical-optimization-inventory">the historical section</a>, but they are not assigned fabricated apples-to-oranges speedups. The local runtime was removed when libtt moved to upstream TT-XLA and TT-MLIR; older commits use different server entry points, model sizes, operation coverage, and runtime architecture. The present README benchmark cannot execute them without porting modern SGLang-JAX backward across that architectural boundary.</p>
+<p>Sampling-path branches are intentionally excluded. The benchmark forces <code>SGLANG_TT_FUSED_GREEDY_SAMPLING=0</code>, honoring the study’s focus on the main model rather than token selection. Experimental branches that change the numeric contract, such as <code>agent/qwen3-mlp-bfp4</code>, require a separate quality and performance study rather than being mixed into the BF8-weight sequence.</p>
+<h2 data-number="2.2" id="cumulative-rather-than-factorial-attribution"><span class="header-section-number">2.2</span> Cumulative rather than factorial attribution</h2>
+<p>For variant <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>i</mi><annotation encoding="application/x-tex">i</annotation></semantics></math>, the reported incremental speedup is</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>S</mi><mi>i</mi></msub><mo>=</mo><mn>100</mn><mrow><mo stretchy="true" form="prefix">(</mo><mfrac><msub><mover><mi>T</mi><mo accent="true">‾</mo></mover><mi>i</mi></msub><msub><mover><mi>T</mi><mo accent="true">‾</mo></mover><mrow><mi>i</mi><mo>−</mo><mn>1</mn></mrow></msub></mfrac><mo>−</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo>,</mo></mrow><annotation encoding="application/x-tex">
+S_i = 100\left(\frac{\bar{T}_i}{\bar{T}_{i-1}} - 1\right),
+</annotation></semantics></math></p>
+<p>where <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mover><mi>T</mi><mo accent="true">‾</mo></mover><mi>i</mi></msub><annotation encoding="application/x-tex">\bar{T}_i</annotation></semantics></math> is the arithmetic mean of the 32 per-request throughput measurements. Cumulative speedup replaces <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mover><mi>T</mi><mo accent="true">‾</mo></mover><mrow><mi>i</mi><mo>−</mo><mn>1</mn></mrow></msub><annotation encoding="application/x-tex">\bar{T}_{i-1}</annotation></semantics></math> with the V0 mean. This answers “what did this commit add to the stack immediately below it?” It does not claim that the effects commute: compiler and kernel fusions frequently interact, as V4 and V7 demonstrate.</p>
+<h1 data-number="3" id="tenstorrent-technical-background"><span class="header-section-number">3</span> Tenstorrent technical background</h1>
+<h2 data-number="3.1" id="end-to-end-software-stack"><span class="header-section-number">3.1</span> End-to-end software stack</h2>
+<figure>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTIwIiBoZWlnaHQ9IjQ3MCIgdmlld0JveD0iMCAwIDExMjAgNDcwIj4KICA8ZGVmcz4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0idG9wIiB4MT0iMCIgeDI9IjEiPgogICAgICA8c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNlN2Y1ZjMiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiNkOGViZjQiLz4KICAgIDwvbGluZWFyR3JhZGllbnQ+CiAgICA8bGluZWFyR3JhZGllbnQgaWQ9ImRldmljZSIgeDE9IjAiIHgyPSIxIj4KICAgICAgPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZmZmMmRmIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjZmRlMmRjIi8+CiAgICA8L2xpbmVhckdyYWRpZW50PgogICAgPG1hcmtlciBpZD0iYXJyb3ciIG1hcmtlcldpZHRoPSI4IiBtYXJrZXJIZWlnaHQ9IjgiIHJlZlg9IjciIHJlZlk9IjQiIG9yaWVudD0iYXV0byI+CiAgICAgIDxwYXRoIGQ9Ik0wLDAgTDgsNCBMMCw4IFoiIGZpbGw9IiM1MzY1N2EiLz4KICAgIDwvbWFya2VyPgogIDwvZGVmcz4KICA8c3R5bGU+CiAgICB0ZXh0e2ZvbnQtZmFtaWx5OkludGVyLEhlbHZldGljYSxBcmlhbCxzYW5zLXNlcmlmO2ZpbGw6IzE3MjAzM30udGl0bGV7Zm9udC1zaXplOjIycHg7Zm9udC13ZWlnaHQ6NzAwfS5uYW1le2ZvbnQtc2l6ZToxN3B4O2ZvbnQtd2VpZ2h0OjcwMH0uYm9keXtmb250LXNpemU6MTNweDtmaWxsOiM1MjYxNzR9LmJveHtzdHJva2U6IzhhYTBiNTtzdHJva2Utd2lkdGg6MS40O3J4OjEyfS5hcnJvd3tzdHJva2U6IzUzNjU3YTtzdHJva2Utd2lkdGg6MjttYXJrZXItZW5kOnVybCgjYXJyb3cpfS5iYW5ke2ZvbnQtc2l6ZToxNHB4O2ZvbnQtd2VpZ2h0OjcwMDtsZXR0ZXItc3BhY2luZzouOHB4O2ZpbGw6IzAwNmQ3N30KICA8L3N0eWxlPgogIDxyZWN0IHdpZHRoPSIxMTIwIiBoZWlnaHQ9IjQ3MCIgZmlsbD0iI2ZmZiIvPgogIDx0ZXh0IHg9IjM1IiB5PSIzMiIgY2xhc3M9InRpdGxlIj5saWJ0dCBzZXJ2aW5nLCBjb21waWxhdGlvbiwgYW5kIGV4ZWN1dGlvbiBzdGFjazwvdGV4dD4KICA8dGV4dCB4PSIzNSIgeT0iNjciIGNsYXNzPSJiYW5kIj5IT1NUIMK3IFJFUVVFU1QgQU5EIEdSQVBIIExBWUVSUzwvdGV4dD4KICA8Zz4KICAgIDxyZWN0IHg9IjM1IiB5PSI4NSIgd2lkdGg9IjE2NSIgaGVpZ2h0PSI5NiIgY2xhc3M9ImJveCIgZmlsbD0idXJsKCN0b3ApIi8+CiAgICA8dGV4dCB4PSIxMTgiIHk9IjExMiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlNHTGFuZy1KQVg8L3RleHQ+CiAgICA8dGV4dCB4PSIxMTgiIHk9IjEzNiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPkhUVFAsIHRva2VuaXplciwgc2NoZWR1bGVyPC90ZXh0PgogICAgPHRleHQgeD0iMTE4IiB5PSIxNTYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5Rd2VuIG1vZGVsICsgcGFnZWQgS1YgY2FjaGU8L3RleHQ+CgogICAgPHJlY3QgeD0iMjI1IiB5PSI4NSIgd2lkdGg9IjE1MCIgaGVpZ2h0PSI5NiIgY2xhc3M9ImJveCIgZmlsbD0idXJsKCN0b3ApIi8+CiAgICA8dGV4dCB4PSIzMDAiIHk9IjExMiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPkpBWDwvdGV4dD4KICAgIDx0ZXh0IHg9IjMwMCIgeT0iMTM2IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+aml0IC8gdHJhY2luZzwvdGV4dD4KICAgIDx0ZXh0IHg9IjMwMCIgeT0iMTU2IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+U3RhYmxlSExPIGdyYXBoPC90ZXh0PgoKICAgIDxyZWN0IHg9IjQwMCIgeT0iODUiIHdpZHRoPSIxNDUiIGhlaWdodD0iOTYiIGNsYXNzPSJib3giIGZpbGw9InVybCgjdG9wKSIvPgogICAgPHRleHQgeD0iNDcyIiB5PSIxMTIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5saWJ0dCBQSlJUPC90ZXh0PgogICAgPHRleHQgeD0iNDcyIiB5PSIxMzYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5kZXZpY2UgKyBidWZmZXIgQVBJPC90ZXh0PgogICAgPHRleHQgeD0iNDcyIiB5PSIxNTYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5jb21waWxlIC8gbG9hZCAvIGV4ZWN1dGU8L3RleHQ+CgogICAgPHJlY3QgeD0iNTcwIiB5PSI4NSIgd2lkdGg9IjE1MCIgaGVpZ2h0PSI5NiIgY2xhc3M9ImJveCIgZmlsbD0idXJsKCN0b3ApIi8+CiAgICA8dGV4dCB4PSI2NDUiIHk9IjExMiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlRULVhMQTwvdGV4dD4KICAgIDx0ZXh0IHg9IjY0NSIgeT0iMTM2IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+UEpSVCBpbXBsZW1lbnRhdGlvbjwvdGV4dD4KICAgIDx0ZXh0IHg9IjY0NSIgeT0iMTU2IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+ZnJvbnRlbmQgaW50ZWdyYXRpb248L3RleHQ+CgogICAgPHJlY3QgeD0iNzQ1IiB5PSI4NSIgd2lkdGg9IjE1NSIgaGVpZ2h0PSI5NiIgY2xhc3M9ImJveCIgZmlsbD0idXJsKCN0b3ApIi8+CiAgICA8dGV4dCB4PSI4MjIiIHk9IjExMiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlRULU1MSVI8L3RleHQ+CiAgICA8dGV4dCB4PSI4MjIiIHk9IjEzNiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPlN0YWJsZUhMTyDihpIgVFRJUiDihpIgVFROTjwvdGV4dD4KICAgIDx0ZXh0IHg9IjgyMiIgeT0iMTU2IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+ZnVzaW9uLCBsYXlvdXQsIHNoYXJkaW5nPC90ZXh0PgoKICAgIDxyZWN0IHg9IjkyNSIgeT0iODUiIHdpZHRoPSIxNjAiIGhlaWdodD0iOTYiIGNsYXNzPSJib3giIGZpbGw9InVybCgjdG9wKSIvPgogICAgPHRleHQgeD0iMTAwNSIgeT0iMTEyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+RmxhdEJ1ZmZlcjwvdGV4dD4KICAgIDx0ZXh0IHg9IjEwMDUiIHk9IjEzNiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnNlcmlhbGl6ZWQgVFROTiBwcm9ncmFtPC90ZXh0PgogICAgPHRleHQgeD0iMTAwNSIgeT0iMTU2IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+cnVudGltZSBvcGVyYXRpb24gZ3JhcGg8L3RleHQ+CiAgPC9nPgogIDxsaW5lIHgxPSIyMDAiIHkxPSIxMzMiIHgyPSIyMTgiIHkyPSIxMzMiIGNsYXNzPSJhcnJvdyIvPgogIDxsaW5lIHgxPSIzNzUiIHkxPSIxMzMiIHgyPSIzOTMiIHkyPSIxMzMiIGNsYXNzPSJhcnJvdyIvPgogIDxsaW5lIHgxPSI1NDUiIHkxPSIxMzMiIHgyPSI1NjMiIHkyPSIxMzMiIGNsYXNzPSJhcnJvdyIvPgogIDxsaW5lIHgxPSI3MjAiIHkxPSIxMzMiIHgyPSI3MzgiIHkyPSIxMzMiIGNsYXNzPSJhcnJvdyIvPgogIDxsaW5lIHgxPSI5MDAiIHkxPSIxMzMiIHgyPSI5MTgiIHkyPSIxMzMiIGNsYXNzPSJhcnJvdyIvPgoKICA8dGV4dCB4PSIzNSIgeT0iMjMwIiBjbGFzcz0iYmFuZCI+QkxBQ0tIT0xFIERFVklDRSDCtyBSVU5USU1FIEFORCBLRVJORUwgTEFZRVJTPC90ZXh0PgogIDxyZWN0IHg9IjM1IiB5PSIyNDgiIHdpZHRoPSIxMDUwIiBoZWlnaHQ9IjE4NSIgcng9IjE2IiBmaWxsPSJ1cmwoI2RldmljZSkiIHN0cm9rZT0iI2M5OWI4NCIgc3Ryb2tlLXdpZHRoPSIxLjUiLz4KCiAgPHJlY3QgeD0iNjAiIHk9IjI3NSIgd2lkdGg9IjE5MCIgaGVpZ2h0PSIxMzAiIGNsYXNzPSJib3giIGZpbGw9IiNmZmZhZjQiLz4KICA8dGV4dCB4PSIxNTUiIHk9IjMwMyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlRUTk4gcnVudGltZTwvdGV4dD4KICA8dGV4dCB4PSIxNTUiIHk9IjMyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPm9wZXJhdGlvbiBkaXNwYXRjaCArIHRyYWNlPC90ZXh0PgogIDx0ZXh0IHg9IjE1NSIgeT0iMzUwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+dGVuc29yIGxheW91dHMgLyBtZW1vcnkgY29uZmlnPC90ZXh0PgogIDx0ZXh0IHg9IjE1NSIgeT0iMzcxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+cHJvZ3JhbS1mYWN0b3J5IHNlbGVjdGlvbjwvdGV4dD4KCiAgPHJlY3QgeD0iMjg1IiB5PSIyNzUiIHdpZHRoPSIxOTAiIGhlaWdodD0iMTMwIiBjbGFzcz0iYm94IiBmaWxsPSIjZmZmYWY0Ii8+CiAgPHRleHQgeD0iMzgwIiB5PSIzMDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVC1NZXRhbGl1bTwvdGV4dD4KICA8dGV4dCB4PSIzODAiIHk9IjMyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPmNvbW1hbmQgcXVldWVzICsgcHJvZ3JhbXM8L3RleHQ+CiAgPHRleHQgeD0iMzgwIiB5PSIzNTAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5jb3JlIGdyaWRzIC8gc2VtYXBob3JlczwvdGV4dD4KICA8dGV4dCB4PSIzODAiIHk9IjM3MSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPk5vQyBkYXRhIG1vdmVtZW50PC90ZXh0PgoKICA8cmVjdCB4PSI1MTAiIHk9IjI3NSIgd2lkdGg9IjI2MCIgaGVpZ2h0PSIxMzAiIGNsYXNzPSJib3giIGZpbGw9IiNmZmZhZjQiLz4KICA8dGV4dCB4PSI2NDAiIHk9IjMwMyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlRlbnNpeCB3b3JrZXIgY29yZXM8L3RleHQ+CiAgPHRleHQgeD0iNjQwIiB5PSIzMjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5yZWFkZXIgUklTQy1WIOKGkiBjaXJjdWxhciBidWZmZXJzPC90ZXh0PgogIDx0ZXh0IHg9IjY0MCIgeT0iMzUwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+bWF0cml4L3ZlY3RvciBlbmdpbmVzIOKGkiBEc3Q8L3RleHQ+CiAgPHRleHQgeD0iNjQwIiB5PSIzNzEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5wYWNrZXIg4oaSIEwxOyB3cml0ZXIg4oaSIERSQU08L3RleHQ+CgogIDxyZWN0IHg9IjgwNSIgeT0iMjc1IiB3aWR0aD0iMjUwIiBoZWlnaHQ9IjEzMCIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmFmNCIvPgogIDx0ZXh0IHg9IjkzMCIgeT0iMzAzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+TWVtb3J5IGhpZXJhcmNoeTwvdGV4dD4KICA8dGV4dCB4PSI5MzAiIHk9IjMyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPkRzdCByZWdpc3RlcnMgwrcgc2hvcnRlc3QgbGlmZXRpbWU8L3RleHQ+CiAgPHRleHQgeD0iOTMwIiB5PSIzNTAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5wZXItY29yZSBMMSBTUkFNIMK3IGNpcmN1bGFyIGJ1ZmZlcnM8L3RleHQ+CiAgPHRleHQgeD0iOTMwIiB5PSIzNzEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5HRERSNiBEUkFNIMK3IHdlaWdodHMgYW5kIHRlbnNvcnM8L3RleHQ+CiAgPHRleHQgeD0iOTMwIiB5PSIzOTIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5Ob0MgbGlua3MgY29yZXMsIFNSQU0sIGFuZCBEUkFNPC90ZXh0PgoKICA8bGluZSB4MT0iMjUwIiB5MT0iMzQwIiB4Mj0iMjc4IiB5Mj0iMzQwIiBjbGFzcz0iYXJyb3ciLz4KICA8bGluZSB4MT0iNDc1IiB5MT0iMzQwIiB4Mj0iNTAzIiB5Mj0iMzQwIiBjbGFzcz0iYXJyb3ciLz4KICA8bGluZSB4MT0iNzcwIiB5MT0iMzQwIiB4Mj0iNzk4IiB5Mj0iMzQwIiBjbGFzcz0iYXJyb3ciLz4KICA8cGF0aCBkPSJNMTAwNSAxODEgTDEwMDUgMjIwIEwxNTUgMjIwIEwxNTUgMjY4IiBmaWxsPSJub25lIiBjbGFzcz0iYXJyb3ciLz4KPC9zdmc+Cg==" id="fig:stack" style="width:100.0%" alt /><figcaption>The software and hardware layers involved in a libtt generation request.</figcaption>
+</figure>
+<p>The request crosses the following layers:</p>
+<ol type="1">
+<li><strong>SGLang-JAX</strong> accepts HTTP requests, tokenizes the prompt, schedules prefill/decode batches, owns the paged KV cache, and runs the JAX Qwen model. Its documented architecture separates the HTTP server, tokenizer manager, scheduler, model runner, and detokenizer manager.<a href="#fn1" class="footnote-ref" id="fnref1" role="doc-noteref"><sup>1</sup></a></li>
+<li><strong>JAX</strong> traces the model computation and presents a StableHLO graph. StableHLO is a portable, ML-oriented operation set between frameworks and compilers.<a href="#fn2" class="footnote-ref" id="fnref2" role="doc-noteref"><sup>2</sup></a></li>
+<li><strong>libtt</strong> is loaded as the <code>tt</code> PJRT plugin. PJRT deliberately makes device implementations opaque to frameworks: JAX calls a uniform compile, buffer, transfer, and execute interface while libtt/TT-XLA supplies the Tenstorrent-specific implementation.<a href="#fn3" class="footnote-ref" id="fnref3" role="doc-noteref"><sup>3</sup></a></li>
+<li><strong>TT-XLA and TT-MLIR</strong> lower StableHLO through TTIR and TTNN dialects. TTIR carries tensor computation in a hardware-aware compiler IR; TTNN IR selects runtime operations, layouts, memory configurations, and device data types. The compiler serializes an executable FlatBuffer consumed by the TTNN runtime. Tenstorrent’s official stack description identifies TT-XLA as the JAX/PyTorch PJRT frontend and TT-MLIR as the compiler that performs fusion, sharding, and layout lowering.<a href="#fn4" class="footnote-ref" id="fnref4" role="doc-noteref"><sup>4</sup></a></li>
+<li><strong>TTNN</strong> is the high-level device-operation library. A TTNN matmul, RMSNorm, SDPA, or layout conversion selects a validated device operation and a program factory.</li>
+<li><strong>TT-Metalium</strong> creates command-queue programs containing per-core dataflow and compute kernels. It manages core ranges, circular buffers, semaphores, NoC transfers, and runtime arguments.</li>
+<li><strong>Blackhole Tensix cores</strong> execute those programs against device DRAM and per-core L1 SRAM.</li>
+</ol>
+<p>This layering explains why libtt’s changes appear as patches to TT-XLA, TT-MLIR, and TT-Metal rather than only to libtt’s thin PJRT surface. A graph pattern has to be recognized in TTIR, represented in TTNN/FlatBuffer, selected by the TTNN runtime, and finally executed by a suitable Metal program.</p>
+<h2 data-number="3.2" id="blackhole-and-the-tensix-execution-model"><span class="header-section-number">3.2</span> Blackhole and the Tensix execution model</h2>
+<p>The test system contains a Blackhole P150. Current P150 firmware exposes 120 Tensix cores; Blackhole integrates GDDR6 memory, a two-dimensional NoC, and independent SRAM-rich worker cores.<a href="#fn5" class="footnote-ref" id="fnref5" role="doc-noteref"><sup>5</sup></a> The report’s specialized SwiGLU program intentionally uses 96 workers, laid out within an 11-by-9-capable worker grid, rather than assuming every exposed core is available.</p>
+<p>A Tensix core behaves more like a small dataflow computer than a conventional GPU streaming multiprocessor. A typical program has:</p>
+<ul>
+<li>a <strong>reader data-movement kernel</strong> that fetches tiles from DRAM or another core over the NoC into L1 circular buffers;</li>
+<li>a <strong>compute kernel</strong> that unpacks tiles into compute registers, invokes the matrix/vector engines, and produces result tiles;</li>
+<li>a <strong>writer data-movement kernel</strong> that drains result circular buffers to the destination tensor.</li>
+</ul>
+<p>Circular buffers are bounded producer/consumer queues shared by the core’s threads. The standard protocol reserves space at the back, pushes produced tiles, waits for tiles at the front, and pops consumed tiles.<a href="#fn6" class="footnote-ref" id="fnref6" role="doc-noteref"><sup>6</sup></a> Reader, compute, and writer kernels can therefore overlap on different data. Tenstorrent’s matmul lab describes the same three-kernel pipeline and the NoC path from DRAM to fast core-local SRAM.<a href="#fn7" class="footnote-ref" id="fnref7" role="doc-noteref"><sup>7</sup></a></p>
+<h3 data-number="3.2.1" id="tiles-faces-and-padding"><span class="header-section-number">3.2.1</span> Tiles, faces, and padding</h3>
+<p>TTNN’s default tile is 32 by 32 elements. It is divided into four 16-by-16 faces because the matrix engine operates natively on 16-by-16 pieces. Tile layout pads the final two tensor dimensions to tile boundaries.<a href="#fn8" class="footnote-ref" id="fnref8" role="doc-noteref"><sup>8</sup></a> Consequently, batch-one decode still presents one full tile row to many operations: the logical sequence length is one, but the physical compute unit is a 32-row tile. Optimizations must reason about both logical shapes and padded tile shapes.</p>
+<h3 data-number="3.2.2" id="dst-registers-and-why-epilogues-matter"><span class="header-section-number">3.2.2</span> Dst registers and why epilogues matter</h3>
+<p>The Dst register set is the compute kernel’s primary workspace. Matrix-engine results land in Dst; the vector engine can read and modify them; the packer moves them back to an L1 circular buffer. Conversely, the unpacker loads L1 tiles into Dst. The TT-Metal documentation explicitly identifies Dst as the matrix destination and vector source/destination, with <code>pack_tile</code> moving a result back to L1.<a href="#fn9" class="footnote-ref" id="fnref9" role="doc-noteref"><sup>9</sup></a></p>
+<p>Every boundary crossed after Dst costs work: pack, reserve/push a circular buffer, possibly write through the NoC to DRAM, launch another operation, read the tensor again, and unpack. A true epilogue wins by applying the consumer while producer values are already resident in Dst. Merely placing two TTNN operations in one graph region is not equivalent if the first operation’s full output is still materialized.</p>
+<h3 data-number="3.2.3" id="dram-l1-interleaving-and-sharding"><span class="header-section-number">3.2.3</span> DRAM, L1, interleaving, and sharding</h3>
+<p>Weights and large persistent tensors live in device DRAM. L1 is smaller and faster, and exists independently on each worker. A tensor’s TTNN <code>MemoryConfig</code> specifies both buffer location and layout:</p>
+<ul>
+<li><strong>interleaved</strong> storage distributes pages through memory banks;</li>
+<li><strong>height sharding</strong> splits rows across core L1s;</li>
+<li><strong>width sharding</strong> splits columns across core L1s;</li>
+<li><strong>block sharding</strong> partitions both dimensions.</li>
+</ul>
+<p>TTNN documents L1 sharding as distributing one shard to each core’s L1, with a core grid, shard shape, strategy, and orientation defining the mapping.<a href="#fn10" class="footnote-ref" id="fnref10" role="doc-noteref"><sup>10</sup></a> <code>ttnn.to_memory_config</code> performs interleaved/sharded and DRAM/L1 conversions.<a href="#fn11" class="footnote-ref" id="fnref11" role="doc-noteref"><sup>11</sup></a> Sharding helps only when the parallel operation saves more than those conversion costs. V5 is a successful example because RMSNorm’s reduction and affine work benefit enough from 16-way width sharding even after conversion in and out.</p>
+<h3 data-number="3.2.4" id="bf16-and-bfp8-weights"><span class="header-section-number">3.2.4</span> BF16 and BFP8 weights</h3>
+<p>The benchmark keeps activations and outputs in BF16 but asks TT-XLA to lower eligible model weights to <code>bfp_bf8</code> (<code>BFLOAT8_B</code>). BFLOAT8_B is a block-floating format: groups of 16 values share an exponent.<a href="#fn12" class="footnote-ref" id="fnref12" role="doc-noteref"><sup>12</sup></a> It reduces weight bytes and therefore decode’s dominant DRAM traffic, at the cost of precision and a different reduction path. The SwiGLU kernel is deliberately specialized for BF16 input/output and BFLOAT8_B weights; it uses BF16 packer-L1 accumulation instead of FP32 Dst accumulation.</p>
+<p>Packer-L1 accumulation stores partial sums in an L1 circular-buffer slot and adds later Dst values into that slot. TT-Metal exposes this explicitly as an L1-accumulation mode of the packer.<a href="#fn13" class="footnote-ref" id="fnref13" role="doc-noteref"><sup>13</sup></a> It permits a K dimension larger than the Dst capacity while reserving all eight Dst tiles for paired gate/up outputs.</p>
+<h2 data-number="3.3" id="why-autoregressive-decode-is-special"><span class="header-section-number">3.3</span> Why autoregressive decode is special</h2>
+<p>Prefill processes many prompt tokens at once and exposes a large matmul M dimension. Decode processes one new token per active sequence, so at batch one most projections are logically <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">1\times K</annotation></semantics></math> by <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">K\times N</annotation></semantics></math>. The weights are revisited for every token, arithmetic intensity is low, and launch/data-motion overheads are a larger fraction of token time. The 32-row tile padding also makes naive kernels perform work on rows that are not logically populated.</p>
+<p>For a simplified Qwen decoder layer,</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mtable><mtr><mtd columnalign="right"><mi>u</mi></mtd><mtd columnalign="left"><mo>=</mo><mo>RMSNorm</mo><mo stretchy="false" form="prefix">(</mo><mi>h</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>h</mi><mi>′</mi></mtd><mtd columnalign="left"><mo>=</mo><mi>h</mi><mo>+</mo><mo>Attention</mo><mo stretchy="false" form="prefix">(</mo><mi>Q</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo><mi>K</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo><mi>V</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>;</mo><mspace width="0.167em"></mspace><msub><mi>K</mi><mrow><mi>c</mi><mi>a</mi><mi>c</mi><mi>h</mi><mi>e</mi></mrow></msub><mo>,</mo><msub><mi>V</mi><mrow><mi>c</mi><mi>a</mi><mi>c</mi><mi>h</mi><mi>e</mi></mrow></msub><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>v</mi></mtd><mtd columnalign="left"><mo>=</mo><mo>RMSNorm</mo><mo stretchy="false" form="prefix">(</mo><mi>h</mi><mi>′</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>g</mi></mtd><mtd columnalign="left"><mo>=</mo><mi>v</mi><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mo>,</mo><mspace width="2.0em"></mspace><mi>r</mi><mo>=</mo><mi>v</mi><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><msub><mi>h</mi><mrow><mi>n</mi><mi>e</mi><mi>x</mi><mi>t</mi></mrow></msub></mtd><mtd columnalign="left"><mo>=</mo><mi>h</mi><mi>′</mi><mo>+</mo><mo minsize="1.2" maxsize="1.2" stretchy="false" form="prefix">(</mo><mo>SiLU</mo><mo stretchy="false" form="prefix">(</mo><mi>g</mi><mo stretchy="false" form="postfix">)</mo><mo>⊙</mo><mi>r</mi><mo minsize="1.2" maxsize="1.2" stretchy="false" form="postfix">)</mo><msub><mi>W</mi><mrow><mi>d</mi><mi>o</mi><mi>w</mi><mi>n</mi></mrow></msub><mi>.</mi></mtd></mtr></mtable><annotation encoding="application/x-tex">
+\begin{aligned}
+u &amp;= \operatorname{RMSNorm}(h),\\
+h&#39; &amp;= h + \operatorname{Attention}(Q(u),K(u),V(u);\,K_{cache},V_{cache}),\\
+v &amp;= \operatorname{RMSNorm}(h&#39;),\\
+g &amp;= v W_{gate}, \qquad r = v W_{up},\\
+h_{next} &amp;= h&#39; + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
+\end{aligned}
+</annotation></semantics></math></p>
+<p>The repeatedly executed hot path therefore contains RMSNorm reductions, QKV projection/splitting, RoPE, paged-cache attention, paired gate/up matmuls, SiLU/multiply, a down projection, and residual additions. The optimizations in this report either recognize these graphs, choose decode-appropriate layouts, or eliminate materialization between their operations.</p>
+<h1 data-number="4" id="optimization-sequence"><span class="header-section-number">4</span> Optimization sequence</h1>
+<h2 data-number="4.1" id="v0-documented-baseline-7482967"><span class="header-section-number">4.1</span> V0 — documented baseline (<code>7482967</code>)</h2>
+<p>V0 is the last documentation-only commit before the present decode series. It already includes the upstream TT-XLA/TT-MLIR architecture, Qwen3 SGLang-JAX support, BF8 weight lowering, fast tilize patches, and reduced cold-compile work. It is therefore a strong, runnable baseline—not the project’s original unoptimized runtime.</p>
+<h2 data-number="4.2" id="v1-decode-foundation-bundle-9978a9b"><span class="header-section-number">4.2</span> V1 — decode foundation bundle (<code>9978a9b</code>)</h2>
+<p>This commit introduces several mutually dependent changes:</p>
+<ul>
+<li>a TTIR matcher collapses JAX’s decomposed RMSNorm expression into a TTNN RMSNorm operation;</li>
+<li>RoPE fusion accepts the rank-3 decode shapes produced by JAX, reshaping to the rank-4 composite form and back;</li>
+<li>KV-cache dtype conversion propagates return types through cache-update ops;</li>
+<li>single-chip activation dtype lowering and TT-XLA compile options enable BF8 activation/weight lowering in the intended regions;</li>
+<li>TT-Metal layernorm validation accepts the single-core height-sharded decode case;</li>
+<li>SDPA decode accepts an L1-interleaved, non-sharded query tensor;</li>
+<li>SiLU lowering bridges the JAX call form used at this point in the sequence.</li>
+</ul>
+<p>The aggregate gain is <strong>+22.58%</strong>. No sub-feature number is claimed because they are not separate commits and several are enabling correctness/layout conditions for the others.</p>
+<h2 data-number="4.3" id="v2-expanded-silu-recognition-10459b5"><span class="header-section-number">4.3</span> V2 — expanded-SiLU recognition (<code>10459b5</code>)</h2>
+<p>JAX does not necessarily preserve SiLU as a named operation. The observed StableHLO/TTIR graph expresses it as</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>SiLU</mo><mo stretchy="false" form="prefix">(</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mi>x</mi><mspace width="0.167em"></mspace><mi>σ</mi><mo stretchy="false" form="prefix">(</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mfrac><mi>x</mi><mrow><mn>1</mn><mo>+</mo><mo>exp</mo><mo stretchy="false" form="prefix">(</mo><mo>−</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo></mrow></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">
+\operatorname{SiLU}(x) = x\,\sigma(x) = \frac{x}{1 + \exp(-x)},
+</annotation></semantics></math></p>
+<p>with typecasts, reshapes, broadcasts, and splatted constants around the scalar one. V2 looks through those view-like operations, proves the constant is one, matches divide/add/exp/neg, and replaces the outer multiply with a SiLU op. It removes a chain of elementwise launches and intermediates while retaining a strict same-input check for <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math> and the sigmoid-like expression. The measured increment is <strong>+3.30%</strong>.</p>
+<h2 data-number="4.4" id="v3-qwen-decode-qkv-projection-fusion-3fe072b"><span class="header-section-number">4.4</span> V3 — Qwen decode QKV projection fusion (<code>3fe072b</code>)</h2>
+<p>V3 recognizes the exact decode projection structure:</p>
+<pre class="text"><code>matmul → Q slice/reshape → Q RMSNorm → [1, B, Hq, D]
+       → K slice/reshape → K RMSNorm → [1, B, Hkv, D]
+       → V slice/reshape             → [1, B, Hkv, D]</code></pre>
+<p>The pattern verifies rank, contiguous Q/K/V bounds, head counts, head dimension, and operation roles. It then reshapes the projection once, invokes <code>nlp_create_qkv_heads_decode</code>, and recreates Q/K RMSNorm at rank four. This avoids materialized slices and reshapes in the decode loop. The measured gain is <strong>+1.15%</strong>.</p>
+<h2 data-number="4.5" id="v4-two-way-shared-lhs-matmul-fusion-83baa8d"><span class="header-section-number">4.5</span> V4 — two-way shared-LHS matmul fusion (<code>83baa8d</code>)</h2>
+<p>TTIR already fused groups of at least three matmuls that share a left-hand operand. V4 changes the validity threshold from three to two. That admits Qwen’s paired gate/up projections, conceptually transforming</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mo>,</mo><mspace width="0.278em"></mspace><mi>x</mi><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mspace width="1.0em"></mspace><mo>→</mo><mspace width="1.0em"></mspace><mi>x</mi><mspace width="0.167em"></mspace><mo stretchy="false" form="prefix">[</mo><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mspace width="0.278em"></mspace><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mo stretchy="false" form="postfix">]</mo><mi>.</mi></mrow><annotation encoding="application/x-tex">
+xW_{gate},\;xW_{up}
+\quad\longrightarrow\quad
+x\,[W_{gate}\;W_{up}].
+</annotation></semantics></math></p>
+<p>The result is a <strong>-1.69% regression</strong> (Holm-adjusted p = <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>8.81</mn><mo>×</mo><msup><mn>10</mn><mrow><mo>−</mo><mn>5</mn></mrow></msup></mrow><annotation encoding="application/x-tex">8.81\times10^{-5}</annotation></semantics></math>). The likely mechanism is visible from the graph: V4 reduces launch/input-read duplication but still writes the doubled-width projection and then slices/reads it for SwiGLU. Wider output handling and the chosen matmul geometry cost more than the saved launch on this shape.</p>
+<p>This result does not make V4 useless. V7 consumes precisely the combined gate/up representation and removes its expensive output boundary. V4 is an enabler whose isolated form is slower.</p>
+<h2 data-number="4.6" id="v5-decode-rmsnorm-runtime-sharding-e534690"><span class="header-section-number">4.6</span> V5 — decode RMSNorm runtime sharding (<code>e534690</code>)</h2>
+<p>V5 detects a device-resident, tiled, unsharded RMSNorm input with logical sequence length one and width at least 2048. If the width divides evenly into 16 tile-aligned shards, it:</p>
+<ol type="1">
+<li>constructs an 8-by-2, row-major core grid;</li>
+<li>width-shards the input into the 16 cores’ L1 memories;</li>
+<li>derives the layernorm program configuration from the shard specification;</li>
+<li>runs TTNN RMSNorm in the sharded configuration; and</li>
+<li>converts the output back to the requested/original memory configuration.</li>
+</ol>
+<p>The measured increment is <strong>+13.61%</strong>, the largest narrow optimization in the study. At sequence length one, the generic interleaved path leaves too little parallel work in the height dimension. Width sharding exposes the hidden-size reduction across cores and more than repays two memory-config conversions.</p>
+<h2 data-number="4.7" id="v6-silu-fused-into-binary-multiply-a718685"><span class="header-section-number">4.7</span> V6 — SiLU fused into binary multiply (<code>a718685</code>)</h2>
+<p>The TTNN fusing pass detects a single-use SiLU feeding either side of a multiply. It removes the standalone SiLU op, marks the relevant BinaryNg input with a unary SiLU activation, extends the FlatBuffer enum, and calls TTNN <code>multiply</code> with a per-input activation list.</p>
+<p>This is a legitimate elementwise fusion, but not a matmul epilogue. The full combined gate/up projection still reaches memory before BinaryNg consumes it. The observed effect is <strong>-0.65%</strong>. Its raw Welch p-value is 0.0266, but the Holm-adjusted p-value is 0.0533, so the experiment does not establish a family-wise-significant regression. It certainly provides no evidence of a speedup.</p>
+<h2 data-number="4.8" id="v7-true-dst-resident-matmul-swiglu-epilogue-ce99831"><span class="header-section-number">4.8</span> V7 — true Dst-resident matmul-SwiGLU epilogue (<code>ce99831</code>)</h2>
+<p>V7 adds a TT-MLIR pattern, TTNN <code>matmul_swiglu</code> operation, and dedicated TT-Metal program. Its contract is intentionally narrow:</p>
+<ul>
+<li>BF16 activation and output;</li>
+<li>BFLOAT8_B weight matrix;</li>
+<li>DRAM-interleaved tensors;</li>
+<li>no transpose, bias, or caller-provided output;</li>
+<li>one physical tile row;</li>
+<li>a grid supporting the selected 96 workers;</li>
+<li>half of the output tile width divisible across those workers.</li>
+</ul>
+<p>For Qwen3-8B, each worker owns four gate-output tiles and four corresponding up-output tiles. Together they exactly fill the eight-tile Dst register set. The program:</p>
+<ol type="1">
+<li>uses two sender cores to multicast activation K blocks over the NoC;</li>
+<li>has each of 96 workers read its paired gate/up BF8 weight tiles;</li>
+<li>accumulates each K block into all eight Dst slots;</li>
+<li>packs partial sums into L1 with BF16 packer-L1 accumulation;</li>
+<li>reloads the final four gate and four up partials into Dst;</li>
+<li>applies SiLU to Dst slots 0–3;</li>
+<li>multiplies each by slots 4–7 in place; and</li>
+<li>packs only four final BF16 tiles.</li>
+</ol>
+<p>The critical difference from V6 is that the full gate/up matmul output never becomes a standalone tensor. The epilogue halves output traffic at the producer boundary and avoids a second operation’s read/unpack path. The measured gain is <strong>+2.73%</strong>.</p>
+<h2 data-number="4.9" id="v8-prefill-capable-fallback-free-simplification-caa5428"><span class="header-section-number">4.9</span> V8 — prefill-capable, fallback-free simplification (<code>caa5428</code>)</h2>
+<p>V8 generalizes the compiler matcher from decode-only naming/shape assumptions to any supported one-tile-row input, covering short prefill as well as decode. It removes the V6 SiLU-multiply patch and its fallback path, leaving the true matmul epilogue as the single implementation for the matched form. Validation remains in TTNN/TT-Metal, where unsupported dtype/layout/shape combinations are rejected rather than silently taking a slower path.</p>
+<p>The measured difference is <strong>-0.19%</strong>, p = 0.532. The result is statistically neutral and its confidence interval overlaps V7’s closely. V8 therefore achieves the intended simplification and broader match coverage without a detectable throughput regression.</p>
+<h1 data-number="5" id="benchmark-methodology"><span class="header-section-number">5</span> Benchmark methodology</h1>
+<h2 data-number="5.1" id="system-and-software"><span class="header-section-number">5.1</span> System and software</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Item</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Accelerator</td>
+<td>Tenstorrent Blackhole P150</td>
+</tr>
+<tr class="even">
+<td>Firmware observed at startup</td>
+<td>19.6.0</td>
+</tr>
+<tr class="odd">
+<td>Host CPU</td>
+<td>Intel Core Ultra 9 185H, 22 logical CPUs online</td>
+</tr>
+<tr class="even">
+<td>Host OS/kernel</td>
+<td>Linux 6.8.0-124-generic, x86-64</td>
+</tr>
+<tr class="odd">
+<td>Model</td>
+<td><code>Qwen/Qwen3-8B</code></td>
+</tr>
+<tr class="even">
+<td>Model dtype</td>
+<td>BF16</td>
+</tr>
+<tr class="odd">
+<td>Weight-lowering request</td>
+<td><code>bfp_bf8</code></td>
+</tr>
+<tr class="even">
+<td>Attention backend</td>
+<td>TT</td>
+</tr>
+<tr class="odd">
+<td>Serving frontend</td>
+<td><code>/home/pcmoritz/sglang-jax</code></td>
+</tr>
+<tr class="even">
+<td>PJRT plugin</td>
+<td>revision-specific <code>bazel-bin/libtt.so</code></td>
+</tr>
+<tr class="odd">
+<td>Final report revision</td>
+<td><code>caa5428fb86c9ffc6a9dda8685126c5ac4353013</code></td>
+</tr>
+<tr class="even">
+<td>Benchmark date</td>
+<td>11 July 2026 (America/Los_Angeles)</td>
+</tr>
+</tbody>
+</table>
+<p>V0–V4 were rebuilt and collected in one sequential benchmark session. V5–V8 use the first 32 retained observations from the existing 40-observation runs collected earlier on the same date, host, accelerator, model, server command, and sampling-disabled configuration. All raw observations used in the report are normalized into <code>data/samples.csv</code>.</p>
+<h2 data-number="5.2" id="server-configuration"><span class="header-section-number">5.2</span> Server configuration</h2>
+<p>Each revision was checked out, built with its revision-appropriate Bazel target (<code>//:tt</code>, producing <code>bazel-bin/libtt.so</code>), and served with the README command. The effective command was:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true"></a><span class="fu">env</span> -u TT_METAL_RUNTIME_ROOT <span class="kw">\</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true"></a>  <span class="va">PYTHONPATH=</span>/home/pcmoritz/sglang-jax/python <span class="kw">\</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true"></a>  <span class="va">PJRT_NAMES_AND_LIBRARY_PATHS=</span>tt:/home/pcmoritz/libtt/bazel-bin/libtt.so <span class="kw">\</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true"></a>  <span class="va">JAX_PLATFORMS=</span>tt <span class="kw">\</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true"></a>  <span class="va">JAX_USE_SHARDY_PARTITIONER=</span>false <span class="kw">\</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true"></a>  <span class="va">JAX_COMPILATION_CACHE_DIR=</span>/tmp/sglang-jax-qwen3-8b-jax-cache <span class="kw">\</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true"></a>  <span class="va">SGLANG_TT_HOST_WEIGHT_LOAD=</span>1 <span class="kw">\</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true"></a>  <span class="va">SGLANG_TT_OPTIMIZATION_LEVEL=</span>1 <span class="kw">\</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true"></a>  <span class="va">SGLANG_TT_EXPERIMENTAL_WEIGHT_DTYPE=</span>bfp_bf8 <span class="kw">\</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true"></a>  <span class="va">SGLANG_TT_FUSED_GREEDY_SAMPLING=</span>0 <span class="kw">\</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true"></a>  <span class="ex">/home/pcmoritz/sglang-jax/.venv/bin/python</span> -m sgl_jax.launch_server <span class="kw">\</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true"></a>  <span class="ex">--model-path</span> Qwen/Qwen3-8B <span class="kw">\</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true"></a>  <span class="ex">--host</span> 127.0.0.1 --port 31000 <span class="kw">\</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true"></a>  <span class="ex">--device</span> tt --dtype bfloat16 --attention-backend tt <span class="kw">\</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true"></a>  <span class="ex">--max-running-requests</span> 2 --max-total-tokens 1024 <span class="kw">\</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true"></a>  <span class="ex">--max-prefill-tokens</span> 256 --chunked-prefill-size 256 <span class="kw">\</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true"></a>  <span class="ex">--page-size</span> 32 --watchdog-timeout 1200 <span class="kw">\</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true"></a>  <span class="ex">--disable-precompile</span> --skip-server-warmup <span class="kw">\</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true"></a>  <span class="ex">--disable-overlap-schedule</span> --disable-radix-cache</span></code></pre></div>
+<p>Disabling radix cache ensures every request executes the 32-token prompt prefill rather than reusing a prefix. Disabling overlap schedule removes cross-request scheduler overlap. The maximum of two running requests is a server capacity setting; requests were issued serially. Fused greedy sampling is explicitly disabled so improvements reflect the model path.</p>
+<h2 data-number="5.3" id="request-and-sample-policy"><span class="header-section-number">5.3</span> Request and sample policy</h2>
+<p>The identical request was issued 34 times per revision:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true"></a><span class="ex">curl</span> -fsS http://127.0.0.1:31000/generate <span class="kw">\</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true"></a>  <span class="ex">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="kw">\</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true"></a>  <span class="ex">-d</span> <span class="st">&#39;{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true"></a><span class="st">    &quot;text&quot;: &quot;The capital of France is&quot;,</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true"></a><span class="st">    &quot;sampling_params&quot;: {&quot;temperature&quot;: 0, &quot;max_new_tokens&quot;: 128}</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true"></a><span class="st">  }&#39;</span></span></code></pre></div>
+<p>The first two responses were discarded. They contain graph compilation, TT-Metal kernel compilation, trace setup, and cache population; they are not steady-state samples. The next 32 complete responses form the analysis window. Every retained request returned exactly 128 token IDs.</p>
+<p>For request (j), throughput is</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>j</mi></msub><mo>=</mo><mfrac><mn>128</mn><msub><mi>L</mi><mi>j</mi></msub></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">T_j = \frac{128}{L_j},</annotation></semantics></math></p>
+<p>where (L_j) is SGLang’s <code>meta_info.e2e_latency</code>. This includes request-local prefill, decode, and serving overhead, so it is intentionally an end-to-end generation metric rather than a kernel-only number.</p>
+<h2 data-number="5.4" id="statistical-treatment"><span class="header-section-number">5.4</span> Statistical treatment</h2>
+<p>For each revision the report gives the arithmetic mean, sample standard deviation, median, range, and a two-sided 95% Student-t confidence interval for the mean. Adjacent revisions are compared with a two-sided Welch t-test, which does not assume equal variance. Eight planned adjacent comparisons create a multiple-testing family, so Holm’s step-down method controls family-wise error. Raw and adjusted p-values are preserved in <code>data/summary.csv</code>.</p>
+<p>The tests assume independent observations. Sequential accelerator timings can exhibit autocorrelation and thermal drift, so p-values should be read as descriptive evidence for this run, not as a universal hardware guarantee. The effect sizes and confidence intervals are more important than crossing a single threshold.</p>
+<h1 data-number="6" id="results"><span class="header-section-number">6</span> Results</h1>
+<h2 data-number="6.1" id="primary-throughput-results"><span class="header-section-number">6.1</span> Primary throughput results</h2>
+<table>
+<caption>End-to-end 128-token generation results, 32 retained requests per revision. “Holm p” is the multiplicity-adjusted p-value for the comparison with the preceding row.</caption>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Variant</th>
+<th style="text-align: left;">Commit</th>
+<th style="text-align: right;">Mean ± SD (tok/s)</th>
+<th style="text-align: center;">95% CI</th>
+<th style="text-align: right;">Incremental</th>
+<th style="text-align: right;">vs. V0</th>
+<th style="text-align: right;">Holm p</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">V0</td>
+<td style="text-align: left;"><code>7482967</code></td>
+<td style="text-align: right;">16.265 ± 0.128</td>
+<td style="text-align: center;">[16.218, 16.311]</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">0.00%</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">V1</td>
+<td style="text-align: left;"><code>9978a9b</code></td>
+<td style="text-align: right;">19.938 ± 0.283</td>
+<td style="text-align: center;">[19.836, 20.040]</td>
+<td style="text-align: right;"><strong>+22.58%</strong></td>
+<td style="text-align: right;">+22.58%</td>
+<td style="text-align: right;">2.33e-44</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">V2</td>
+<td style="text-align: left;"><code>10459b5</code></td>
+<td style="text-align: right;">20.596 ± 0.279</td>
+<td style="text-align: center;">[20.495, 20.696]</td>
+<td style="text-align: right;"><strong>+3.30%</strong></td>
+<td style="text-align: right;">+26.63%</td>
+<td style="text-align: right;">1.09e-12</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">V3</td>
+<td style="text-align: left;"><code>3fe072b</code></td>
+<td style="text-align: right;">20.832 ± 0.293</td>
+<td style="text-align: center;">[20.726, 20.938]</td>
+<td style="text-align: right;"><strong>+1.15%</strong></td>
+<td style="text-align: right;">+28.08%</td>
+<td style="text-align: right;">0.00481</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">V4</td>
+<td style="text-align: left;"><code>83baa8d</code></td>
+<td style="text-align: right;">20.479 ± 0.321</td>
+<td style="text-align: center;">[20.363, 20.594]</td>
+<td style="text-align: right;"><strong>-1.69%</strong></td>
+<td style="text-align: right;">+25.91%</td>
+<td style="text-align: right;">8.81e-5</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">V5</td>
+<td style="text-align: left;"><code>e534690</code></td>
+<td style="text-align: right;">23.265 ± 0.235</td>
+<td style="text-align: center;">[23.181, 23.350]</td>
+<td style="text-align: right;"><strong>+13.61%</strong></td>
+<td style="text-align: right;">+43.04%</td>
+<td style="text-align: right;">2.85e-42</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">V6</td>
+<td style="text-align: left;"><code>a718685</code></td>
+<td style="text-align: right;">23.113 ± 0.296</td>
+<td style="text-align: center;">[23.007, 23.220]</td>
+<td style="text-align: right;">-0.65%</td>
+<td style="text-align: right;">+42.11%</td>
+<td style="text-align: right;">0.0533</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">V7</td>
+<td style="text-align: left;"><code>ce99831</code></td>
+<td style="text-align: right;">23.744 ± 0.311</td>
+<td style="text-align: center;">[23.632, 23.856]</td>
+<td style="text-align: right;"><strong>+2.73%</strong></td>
+<td style="text-align: right;">+45.98%</td>
+<td style="text-align: right;">5.90e-11</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">V8</td>
+<td style="text-align: left;"><code>caa5428</code></td>
+<td style="text-align: right;">23.698 ± 0.274</td>
+<td style="text-align: center;">[23.599, 23.797]</td>
+<td style="text-align: right;">-0.19%</td>
+<td style="text-align: right;"><strong>+45.70%</strong></td>
+<td style="text-align: right;">0.532</td>
+</tr>
+</tbody>
+</table>
+<figure>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTAwIiB2aWV3Qm94PSIwIDAgOTgwIDUwMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SW50ZXIsSGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTcyMDMzfS5heGlze3N0cm9rZTojNzE4MDk2O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkYmU0ZWU7c3Ryb2tlLXdpZHRoOjF9LnBvc3tmaWxsOiMwMDZkNzd9Lm5lZ3tmaWxsOiNjODRiMzF9Lm5ldXRyYWx7ZmlsbDojODM5NWE3fS5sYWJlbHtmb250LXNpemU6MTRweH0uc21hbGx7Zm9udC1zaXplOjEycHg7ZmlsbDojNTI2MTc0fS52YWx1ZXtmb250LXNpemU6MTNweDtmb250LXdlaWdodDo3MDB9LnRpdGxle2ZvbnQtc2l6ZToyMXB4O2ZvbnQtd2VpZ2h0OjcwMH08L3N0eWxlPgo8dGV4dCB4PSI5MCIgeT0iMjkiIGNsYXNzPSJ0aXRsZSI+SW5jcmVtZW50YWwgZWZmZWN0IG9mIGVhY2ggY3VtdWxhdGl2ZSByZXZpc2lvbjwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzgwLjMiIHgyPSI5NTUiIHkyPSIzODAuMyIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM4NS4zIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPi0yJTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzQwLjgiIHgyPSI5NTUiIHkyPSIzNDAuOCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM0NS44IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjAlPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIzMDEuNCIgeDI9Ijk1NSIgeTI9IjMwMS40IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMzA2LjQiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MiU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjI2MS45IiB4Mj0iOTU1IiB5Mj0iMjYxLjkiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIyNjYuOSIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj40JTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjIyLjUiIHgyPSI5NTUiIHkyPSIyMjIuNSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjIyNy41IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjYlPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIxODMuMSIgeDI9Ijk1NSIgeTI9IjE4My4xIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMTg4LjEiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+OCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjE0My42IiB4Mj0iOTU1IiB5Mj0iMTQzLjYiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxNDguNiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xMCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjEwNC4yIiB4Mj0iOTU1IiB5Mj0iMTA0LjIiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxMDkuMiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xMiU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjY0LjciIHgyPSI5NTUiIHkyPSI2NC43IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iNjkuNyIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xNCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjM0MC44IiB4Mj0iOTU1IiB5Mj0iMzQwLjgiIGNsYXNzPSJheGlzIi8+CjxyZWN0IHg9IjEwOS41IiB5PSItMTA0LjUiIHdpZHRoPSI2OS4yIiBoZWlnaHQ9IjQ0NS40IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSIxNDQuMSIgeT0iLTExMi41IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPisyMi41OCU8L3RleHQ+Cjx0ZXh0IHg9IjE0NC4xIiB5PSI0MjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+VjE8L3RleHQ+Cjx0ZXh0IHg9IjE0NC4xIiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+OTk3OGE5YjwvdGV4dD4KPHJlY3QgeD0iMjE3LjYiIHk9IjI3NS44IiB3aWR0aD0iNjkuMiIgaGVpZ2h0PSI2NS4xIiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSIyNTIuMiIgeT0iMjY3LjgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzMuMzAlPC90ZXh0Pgo8dGV4dCB4PSIyNTIuMiIgeT0iNDI5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYyPC90ZXh0Pgo8dGV4dCB4PSIyNTIuMiIgeT0iNDQ4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPjEwNDU5YjU8L3RleHQ+CjxyZWN0IHg9IjMyNS43IiB5PSIzMTguMiIgd2lkdGg9IjY5LjIiIGhlaWdodD0iMjIuNiIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iMzYwLjMiIHk9IjMxMC4yIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPisxLjE1JTwvdGV4dD4KPHRleHQgeD0iMzYwLjMiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMzwvdGV4dD4KPHRleHQgeD0iMzYwLjMiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj4zZmUwNzJiPC90ZXh0Pgo8cmVjdCB4PSI0MzMuOCIgeT0iMzQwLjgiIHdpZHRoPSI2OS4yIiBoZWlnaHQ9IjMzLjQiIHJ4PSIzIiBjbGFzcz0ibmVnIi8+Cjx0ZXh0IHg9IjQ2OC40IiB5PSIzOTIuMyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4tMS42OSU8L3RleHQ+Cjx0ZXh0IHg9IjQ2OC40IiB5PSI0MjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+VjQ8L3RleHQ+Cjx0ZXh0IHg9IjQ2OC40IiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+ODNiYWE4ZDwvdGV4dD4KPHJlY3QgeD0iNTQyLjAiIHk9IjcyLjUiIHdpZHRoPSI2OS4yIiBoZWlnaHQ9IjI2OC40IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSI1NzYuNiIgeT0iNjQuNSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4rMTMuNjElPC90ZXh0Pgo8dGV4dCB4PSI1NzYuNiIgeT0iNDI5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlY1PC90ZXh0Pgo8dGV4dCB4PSI1NzYuNiIgeT0iNDQ4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPmU1MzQ2OTA8L3RleHQ+CjxyZWN0IHg9IjY1MC4xIiB5PSIzNDAuOCIgd2lkdGg9IjY5LjIiIGhlaWdodD0iMTIuOSIgcng9IjMiIGNsYXNzPSJuZXV0cmFsIi8+Cjx0ZXh0IHg9IjY4NC43IiB5PSIzNzEuNyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4tMC42NSU8L3RleHQ+Cjx0ZXh0IHg9IjY4NC43IiB5PSI0MjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+VjY8L3RleHQ+Cjx0ZXh0IHg9IjY4NC43IiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+YTcxODY4NTwvdGV4dD4KPHJlY3QgeD0iNzU4LjIiIHk9IjI4Ny4wIiB3aWR0aD0iNjkuMiIgaGVpZ2h0PSI1My44IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSI3OTIuOCIgeT0iMjc5LjAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzIuNzMlPC90ZXh0Pgo8dGV4dCB4PSI3OTIuOCIgeT0iNDI5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlY3PC90ZXh0Pgo8dGV4dCB4PSI3OTIuOCIgeT0iNDQ4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPmNlOTk4MzE8L3RleHQ+CjxyZWN0IHg9Ijg2Ni4zIiB5PSIzNDAuOCIgd2lkdGg9IjY5LjIiIGhlaWdodD0iMy44IiByeD0iMyIgY2xhc3M9Im5ldXRyYWwiLz4KPHRleHQgeD0iOTAwLjkiIHk9IjM2Mi43IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPi0wLjE5JTwvdGV4dD4KPHRleHQgeD0iOTAwLjkiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WODwvdGV4dD4KPHRleHQgeD0iOTAwLjkiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5jYWE1NDI4PC90ZXh0Pgo8dGV4dCB0cmFuc2Zvcm09InRyYW5zbGF0ZSgyMyAyMjIuNSkgcm90YXRlKC05MCkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+dGhyb3VnaHB1dCBjaGFuZ2UgdnMuIHByZWNlZGluZyByZXZpc2lvbjwvdGV4dD4KPHRleHQgeD0iOTAiIHk9IjQ4MiIgY2xhc3M9InNtYWxsIj5UZWFsL3JlZDogSG9sbS1hZGp1c3RlZCBwJmx0OzAuMDU7IGdyYXk6IG5vdCBzdGF0aXN0aWNhbGx5IGRpc3Rpbmd1aXNoYWJsZSBmcm9tIHRoZSBwcmVjZWRpbmcgcmV2aXNpb24uPC90ZXh0Pgo8L3N2Zz4K" id="fig:incremental" style="width:100.0%" alt /><figcaption>Incremental speedup or regression introduced by each revision.</figcaption>
+</figure>
+<p>The final mean is slightly below V7, but the difference is only 0.046 tok/s and is not statistically distinguishable from zero. In contrast, V4’s confidence interval sits below V3’s and its adjusted p-value is small. The data therefore support “V8 preserves V7 performance,” but not “every fusion improved performance.”</p>
+<h2 data-number="6.2" id="pure-decode-cross-check"><span class="header-section-number">6.2</span> Pure decode cross-check</h2>
+<p>The <code>/generate</code> response reports one end-to-end latency. A separate streaming run on V8 recorded the first token and remaining token intervals. After two warm-ups, 20 retained observations yielded:</p>
+<table>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Metric</th>
+<th style="text-align: right;">Mean ± SD</th>
+<th style="text-align: center;">95% CI</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">Time to first token</td>
+<td style="text-align: right;">0.6105 ± 0.0043 s</td>
+<td style="text-align: center;">[0.6085, 0.6125] s</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Total streaming time</td>
+<td style="text-align: right;">5.5355 ± 0.0544 s</td>
+<td style="text-align: center;">[5.5100, 5.5610] s</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">Pure decode throughput</td>
+<td style="text-align: right;">25.790 ± 0.284 tok/s</td>
+<td style="text-align: center;">[25.657, 25.923] tok/s</td>
+</tr>
+</tbody>
+</table>
+<p>The 25.79 tok/s number is higher than the 23.70 end-to-end metric because it excludes prompt processing and first-token latency. It is a useful description of the final decoder but is not used for inter-revision attribution because the full streaming experiment was not repeated for every revision.</p>
+<h2 data-number="6.3" id="correctness-and-numeric-stability-checks"><span class="header-section-number">6.3</span> Correctness and numeric stability checks</h2>
+<p>Within every variant, all 32 retained requests produced the same 128 token IDs. The SHA-256 prefixes of those ID sequences were:</p>
+<table>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Variants</th>
+<th style="text-align: left;">Token-ID hash prefix</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">V0–V1</td>
+<td style="text-align: left;"><code>68e10a82edac</code></td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">V2–V3</td>
+<td style="text-align: left;"><code>1ab55f92178d</code></td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">V4–V6</td>
+<td style="text-align: left;"><code>808d3949246a</code></td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">V7–V8</td>
+<td style="text-align: left;"><code>2eb88f74c7d9</code></td>
+</tr>
+</tbody>
+</table>
+<p>The transitions align with compiler/numeric changes and do not imply request nondeterminism. Greedy decoding is sensitive to tiny logit reorderings: BF8 lowering, operation reassociation, reduction order, or a new kernel can change a later argmax. This performance report verifies shape/completion and within-variant determinism; it is not a model-quality evaluation. A production decision should add perplexity and task-level quality suites.</p>
+<h1 data-number="7" id="reading-the-results-mechanistically"><span class="header-section-number">7</span> Reading the results mechanistically</h1>
+<h2 data-number="7.1" id="launch-reduction-is-not-the-same-as-traffic-reduction"><span class="header-section-number">7.1</span> Launch reduction is not the same as traffic reduction</h2>
+<p>V4, V6, and V7 form the clearest controlled lesson in the study:</p>
+<pre class="text"><code>V4: combine two matmuls
+    → fewer launches/input reads
+    → still materialize doubled gate/up output
+    → -1.69%
+
+V6: combine SiLU with the following multiply
+    → remove standalone SiLU output
+    → still materialize and reread matmul output
+    → -0.65% observed; adjusted result inconclusive
+
+V7: make SwiGLU the matmul epilogue
+    → gate/up stay in Dst
+    → write only final half-width tensor
+    → +2.73%</code></pre>
+<p>At batch-one decode, model weights and intermediate tiles dominate movement. Eliminating an operation launch is helpful only if the fused program does not create a worse geometry or preserve the same expensive tensor boundary. The successful fusion boundary is producer-side, before packing the matmul result.</p>
+<h2 data-number="7.2" id="why-rmsnorm-sharding-is-unusually-large"><span class="header-section-number">7.2</span> Why RMSNorm sharding is unusually large</h2>
+<p>RMSNorm performs square, reduction over hidden width, reciprocal square root, and affine scaling. With logical height one, a generic height-parallel scheme cannot occupy many cores. V5’s width sharding creates 16 independent L1 shards and selects a sharded layernorm program. The hidden width is large and repeats in every decoder layer, so this local change compounds across the model.</p>
+<p>The implementation is also conservative: it activates only for a device, tiled, unsharded tensor; sequence length one; width at least 2048; and a width divisible into 16 tile-aligned shards. Prefill and already-sharded cases retain their prior behavior.</p>
+<h2 data-number="7.3" id="why-the-final-simplification-is-safe-for-performance"><span class="header-section-number">7.3</span> Why the final simplification is safe for performance</h2>
+<p>V8 does not rewrite the TT-Metal compute loop that produced V7’s speedup. It changes compiler matching/coverage and deletes the V6 fallback. The retained V7 and V8 output hashes are identical, their mean difference is small, and the adjusted p-value is 0.532. Those three signals support the claim that the code simplification preserves both the observed token sequence and runtime performance for this workload.</p>
+<h1 data-number="8" id="historical-optimization-inventory"><span class="header-section-number">8</span> Historical optimization inventory</h1>
+<p>Before the upstream TT-XLA/TT-MLIR transition, libtt implemented substantially more of the compiler and runtime locally. The following first-parent commits are performance-relevant milestones. They remain important engineering context even though the modern README benchmark cannot isolate them.</p>
+<table>
+<colgroup>
+<col style="width: 33%"></col>
+<col style="width: 33%"></col>
+<col style="width: 33%"></col>
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Commit</th>
+<th style="text-align: left;">Historical optimization</th>
+<th style="text-align: left;">Technical intent</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;"><code>701dc4e</code></td>
+<td style="text-align: left;">Fast dispatch</td>
+<td style="text-align: left;">Replace slow command submission with the device fast-dispatch path.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>f4df790</code></td>
+<td style="text-align: left;">Optimized matmul</td>
+<td style="text-align: left;">Introduce the first performance-oriented tiled matmul implementation.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>0f39cae</code></td>
+<td style="text-align: left;">Parallel binary elementwise</td>
+<td style="text-align: left;">Divide elementwise tiles across cores.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>6f052ba</code></td>
+<td style="text-align: left;">Qwen3 model optimization</td>
+<td style="text-align: left;">Add model-specific graph/runtime improvements in the local stack.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>8678414</code></td>
+<td style="text-align: left;">DRAM/broadcast fast paths</td>
+<td style="text-align: left;">Specialize common broadcast/data-movement forms.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>1d80118</code></td>
+<td style="text-align: left;">Deferred finish and batched CQ writes</td>
+<td style="text-align: left;">Avoid host synchronization after each dispatch and batch command-queue writes.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>1875113</code></td>
+<td style="text-align: left;">Fused elementwise lowering</td>
+<td style="text-align: left;">Compile elementwise expression trees as fewer device programs.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>2778027</code></td>
+<td style="text-align: left;">Matmul top-1 epilogue</td>
+<td style="text-align: left;">Perform top-1 selection at the logits matmul producer boundary.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>9fc9a36</code></td>
+<td style="text-align: left;">Cached decode attention</td>
+<td style="text-align: left;">Specialize attention for autoregressive KV-cache reuse.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>29f685a</code></td>
+<td style="text-align: left;">Allocator locking split</td>
+<td style="text-align: left;">Reduce lock scope around runtime readback/allocation work.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>d1b422e</code></td>
+<td style="text-align: left;">Reshape optimization</td>
+<td style="text-align: left;">Turn eligible reshapes into views or cheaper movement.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>65cd673</code></td>
+<td style="text-align: left;">Transpose into matmul</td>
+<td style="text-align: left;">Fold operand transpose into matmul reads.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>f05995a</code></td>
+<td style="text-align: left;">Fused SDPA decode</td>
+<td style="text-align: left;">Replace decomposed attention with a decode SDPA device operation.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>f7ba52b</code></td>
+<td style="text-align: left;">Lazy reshape propagation</td>
+<td style="text-align: left;">Carry views through gather/scatter instead of materializing.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>a23a624</code></td>
+<td style="text-align: left;">Fused RMSNorm</td>
+<td style="text-align: left;">Replace decomposed normalization with a dedicated kernel.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>eee55b7</code></td>
+<td style="text-align: left;">Tile-transpose matmul reads</td>
+<td style="text-align: left;">Improve source tile lookup and NoC reads for transposed operands.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>119aab5</code></td>
+<td style="text-align: left;">Fused RoPE</td>
+<td style="text-align: left;">Collapse rotary embedding’s elementwise/reshape graph.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>f2e705f</code></td>
+<td style="text-align: left;">SDPA over interleaved KV cache</td>
+<td style="text-align: left;">Avoid cache layout conversion before decode attention.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>08423ec</code></td>
+<td style="text-align: left;">Parallel BF16 top-1</td>
+<td style="text-align: left;">Spread logits argmax/top-1 work across cores.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><code>94734cc</code></td>
+<td style="text-align: left;">TT-MLIR tilize patches</td>
+<td style="text-align: left;">Reduce layout-conversion overhead after the upstream-stack transition.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><code>eb8c90d</code></td>
+<td style="text-align: left;">Cold-compile optimization</td>
+<td style="text-align: left;">Remove/avoid expensive host/compiler work on the first execution.</td>
+</tr>
+</tbody>
+</table>
+<p>Several exploratory branches also record useful negative or orthogonal work: residual-as-bias experiments, slice-free SwiGLU, sampling fusion, logits untilize/top-1 fusion, DRAM-sharded matmul, and BFP4 MLP weights. Only changes that survive in the V0–V8 ancestry are assigned numbers in the primary table. This prevents an abandoned prototype, a sampling optimization, or a changed precision mode from being represented as part of the final model-path speedup.</p>
+<h1 data-number="9" id="limitations-and-follow-up-work"><span class="header-section-number">9</span> Limitations and follow-up work</h1>
+<ol type="1">
+<li><strong>One model and shape.</strong> Results apply to Qwen3-8B, serial batch-one-style generation, a 32-token prompt, and 128 generated tokens. Larger batch, longer context, or multi-user continuous batching can move the bottleneck.</li>
+<li><strong>End-to-end metric.</strong> The primary metric contains short prefill and server overhead. The streaming cross-check isolates final decode, but only on V8.</li>
+<li><strong>Sequential ordering.</strong> Revisions were not randomized or interleaved. Thermal state and background load can create drift. A publication-grade follow-up would use randomized blocks with repeated server restarts.</li>
+<li><strong>Autocorrelation.</strong> Welch/t intervals treat requests as independent. A blocked bootstrap over time or heteroskedasticity/autocorrelation-consistent model would be more conservative if long runs show serial correlation.</li>
+<li><strong>One accelerator.</strong> The specialized epilogue assumes Blackhole’s available grid and the Qwen3-8B tile geometry. Wormhole, multi-chip, or another MLP width requires its own program configuration.</li>
+<li><strong>Quality is not measured.</strong> Token determinism is checked within variants, but cross-variant hashes differ. Perplexity and downstream evaluations are necessary before changing precision or reduction order in production.</li>
+<li><strong>The V1 bundle is not decomposed.</strong> Its +22.58% cannot be divided among RMSNorm, RoPE, KV dtype, SDPA layout, and BF8-enabling changes without constructing additional cherry-picked revisions.</li>
+</ol>
+<p>The most promising next optimization is to keep more of the MLP pipeline on chip: consume the SwiGLU output directly in a compatible down-projection path, or retain a sharded layout between them. That requires coordinating output shards and down-projection weight distribution; simply attaching more unary work to BinaryNg is unlikely to reproduce V7’s producer-side benefit.</p>
+<h1 data-number="10" id="reproduction-and-report-generation"><span class="header-section-number">10</span> Reproduction and report generation</h1>
+<p>The report bundle contains:</p>
+<ul>
+<li><code>report.md</code>: this source document;</li>
+<li><code>data/samples.csv</code>: all 288 retained per-request observations;</li>
+<li><code>data/summary.csv</code>: descriptive statistics, speedups, raw Welch p-values, Holm-adjusted p-values, and output hashes;</li>
+<li><code>analyze.py</code>: the exact analysis and SVG generation code;</li>
+<li><code>figures/*.svg</code>: resolution-independent figures;</li>
+<li><code>style.css</code> and <code>Makefile</code>: HTML, LaTeX, and PDF build paths.</li>
+</ul>
+<p>To recompute statistics from the raw <code>/tmp</code> JSON directories used on the benchmark host:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true"></a><span class="ex">/home/pcmoritz/sglang-jax/.venv/bin/python</span> <span class="kw">\</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true"></a>  <span class="ex">docs/libtt-optimization-report/analyze.py</span></span></code></pre></div>
+<p>To build a self-contained HTML report:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true"></a><span class="fu">make</span> -C docs/libtt-optimization-report html</span></code></pre></div>
+<p>For a typeset PDF, install a XeLaTeX distribution and <code>rsvg-convert</code> (commonly packaged as <code>librsvg2-bin</code>), then run:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true"></a><span class="fu">make</span> -C docs/libtt-optimization-report pdf</span></code></pre></div>
+<p>The <code>pdf-html</code> target is an alternative for environments with WeasyPrint. SVG figures, vector text, booktabs-style tables, controlled page geometry, microtypography, numbered headings, and a generated table of contents are preserved by the PDF route.</p>
+<h1 data-number="11" id="conclusion"><span class="header-section-number">11</span> Conclusion</h1>
+<p>The current libtt optimization line improves the documented Qwen3-8B serving workload by <strong>45.70%</strong>, from 16.265 to 23.698 tokens/s. The data favor three principles:</p>
+<ul>
+<li>recognize framework-generated algebra before lowering;</li>
+<li>choose layouts that expose decode’s width parallelism; and</li>
+<li>place fusion at the producer epilogue so intermediate values never cross an avoidable memory boundary.</li>
+</ul>
+<p>The final matmul-SwiGLU implementation is faster because it follows the third principle literally: gate and up values remain in Dst until <code>silu(gate) * up</code> is complete. The fallback-free simplification retains that performance. Just as importantly, the report preserves the regressions and neutral results, which prevents operation-count reduction from being mistaken for device-level speedup.</p>
+<section class="footnotes" role="doc-endnotes">
+<hr />
+<ol>
+<li id="fn1" role="doc-endnote"><p><a href="https://github.com/sgl-project/sglang-jax">SGLang-JAX project and architecture</a>, including its <a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/architecture/project-core-structure.md">core-structure documentation</a>.<a href="#fnref1" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn2" role="doc-endnote"><p>OpenXLA, <a href="https://openxla.org/stablehlo/spec">StableHLO specification</a>.<a href="#fnref2" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn3" role="doc-endnote"><p>OpenXLA, <a href="https://openxla.org/xla/pjrt">PJRT — Uniform Device API</a>.<a href="#fnref3" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn4" role="doc-endnote"><p>Tenstorrent, <a href="https://github.com/tenstorrent/tt-forge">TT-Forge architecture and subprojects</a>.<a href="#fnref4" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn5" role="doc-endnote"><p>Tenstorrent, <a href="https://docs.tenstorrent.com/tt-system-firmware/boards/tenstorrent/tt_blackhole/doc/index.html">Blackhole PCIe card documentation</a> and <a href="https://docs.tenstorrent.com/tt-system-firmware/release/release-notes-19.5.html">P150 core-count firmware note</a>.<a href="#fnref5" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn6" role="doc-endnote"><p>Tenstorrent, <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html">Circular Buffer APIs</a>.<a href="#fnref6" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn7" role="doc-endnote"><p>Tenstorrent, <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/labs/matmul/lab1/lab1.html">Single Core Matrix Multiplication lab</a>.<a href="#fnref7" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn8" role="doc-endnote"><p>Tenstorrent, <a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html">TTNN Tensor: layout, tiles, and faces</a>.<a href="#fnref8" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn9" role="doc-endnote"><p>Tenstorrent, <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html">Compute engines and data flow within Tensix</a>.<a href="#fnref9" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn10" role="doc-endnote"><p>Tenstorrent, <a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html#tensor-sharding">TTNN Tensor sharding</a>.<a href="#fnref10" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn11" role="doc-endnote"><p>Tenstorrent, <a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/api/ttnn.to_memory_config.html"><code>ttnn.to_memory_config</code></a>.<a href="#fnref11" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn12" role="doc-endnote"><p>Tenstorrent, <a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html#limitation-of-bfloat8-b">TTNN BFLOAT8_B description and limitations</a>.<a href="#fnref12" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn13" role="doc-endnote"><p>Tenstorrent, <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/pack_unpack/pack_tile.html"><code>pack_reconfig_l1_acc</code></a>.<a href="#fnref13" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+</body>
+</html>

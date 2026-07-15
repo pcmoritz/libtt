@@ -1,0 +1,1355 @@
+% Options for packages loaded elsewhere
+\PassOptionsToPackage{unicode}{hyperref}
+\PassOptionsToPackage{hyphens}{url}
+\PassOptionsToPackage{dvipsnames,svgnames*,x11names*}{xcolor}
+%
+\documentclass[
+  11pt,
+  american,
+  11pt,
+  oneside]{scrreprt}
+\usepackage{lmodern}
+\usepackage{amssymb,amsmath}
+\usepackage{ifxetex,ifluatex}
+\ifnum 0\ifxetex 1\fi\ifluatex 1\fi=0 % if pdftex
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{textcomp} % provide euro and other symbols
+\else % if luatex or xetex
+  \usepackage{unicode-math}
+  \defaultfontfeatures{Scale=MatchLowercase}
+  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+\fi
+% Use upquote if available, for straight quotes in verbatim environments
+\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+\IfFileExists{microtype.sty}{% use microtype if available
+  \usepackage[]{microtype}
+  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+}{}
+\makeatletter
+\@ifundefined{KOMAClassName}{% if non-KOMA class
+  \IfFileExists{parskip.sty}{%
+    \usepackage{parskip}
+  }{% else
+    \setlength{\parindent}{0pt}
+    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+}{% if KOMA class
+  \KOMAoptions{parskip=half}}
+\makeatother
+\usepackage{xcolor}
+\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+\IfFileExists{bookmark.sty}{\usepackage{bookmark}}{\usepackage{hyperref}}
+\hypersetup{
+  pdftitle={Accelerating Qwen3-8B Decode on Tenstorrent Blackhole},
+  pdfauthor={libtt performance study},
+  pdflang={en-US},
+  pdfkeywords={Tenstorrent, Blackhole, libtt, TT-Metalium, TTNN, TT-MLIR, JAX, Qwen3, LLM
+inference, kernel fusion},
+  colorlinks=true,
+  linkcolor=MidnightBlue,
+  filecolor=Maroon,
+  citecolor=Blue,
+  urlcolor=MidnightBlue,
+  pdfcreator={LaTeX via pandoc}}
+\urlstyle{same} % disable monospaced font for URLs
+\usepackage[margin=25mm]{geometry}
+\usepackage{color}
+\usepackage{fancyvrb}
+\newcommand{\VerbBar}{|}
+\newcommand{\VERB}{\Verb[commandchars=\\\{\}]}
+\DefineVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\{\}}
+% Add ',fontsize=\small' for more characters per line
+\newenvironment{Shaded}{}{}
+\newcommand{\AlertTok}[1]{\textcolor[rgb]{1.00,0.00,0.00}{\textbf{#1}}}
+\newcommand{\AnnotationTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\newcommand{\AttributeTok}[1]{\textcolor[rgb]{0.49,0.56,0.16}{#1}}
+\newcommand{\BaseNTok}[1]{\textcolor[rgb]{0.25,0.63,0.44}{#1}}
+\newcommand{\BuiltInTok}[1]{#1}
+\newcommand{\CharTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\CommentTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textit{#1}}}
+\newcommand{\CommentVarTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\newcommand{\ConstantTok}[1]{\textcolor[rgb]{0.53,0.00,0.00}{#1}}
+\newcommand{\ControlFlowTok}[1]{\textcolor[rgb]{0.00,0.44,0.13}{\textbf{#1}}}
+\newcommand{\DataTypeTok}[1]{\textcolor[rgb]{0.56,0.13,0.00}{#1}}
+\newcommand{\DecValTok}[1]{\textcolor[rgb]{0.25,0.63,0.44}{#1}}
+\newcommand{\DocumentationTok}[1]{\textcolor[rgb]{0.73,0.13,0.13}{\textit{#1}}}
+\newcommand{\ErrorTok}[1]{\textcolor[rgb]{1.00,0.00,0.00}{\textbf{#1}}}
+\newcommand{\ExtensionTok}[1]{#1}
+\newcommand{\FloatTok}[1]{\textcolor[rgb]{0.25,0.63,0.44}{#1}}
+\newcommand{\FunctionTok}[1]{\textcolor[rgb]{0.02,0.16,0.49}{#1}}
+\newcommand{\ImportTok}[1]{#1}
+\newcommand{\InformationTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\newcommand{\KeywordTok}[1]{\textcolor[rgb]{0.00,0.44,0.13}{\textbf{#1}}}
+\newcommand{\NormalTok}[1]{#1}
+\newcommand{\OperatorTok}[1]{\textcolor[rgb]{0.40,0.40,0.40}{#1}}
+\newcommand{\OtherTok}[1]{\textcolor[rgb]{0.00,0.44,0.13}{#1}}
+\newcommand{\PreprocessorTok}[1]{\textcolor[rgb]{0.74,0.48,0.00}{#1}}
+\newcommand{\RegionMarkerTok}[1]{#1}
+\newcommand{\SpecialCharTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\SpecialStringTok}[1]{\textcolor[rgb]{0.73,0.40,0.53}{#1}}
+\newcommand{\StringTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\VariableTok}[1]{\textcolor[rgb]{0.10,0.09,0.49}{#1}}
+\newcommand{\VerbatimStringTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\WarningTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\usepackage{longtable,booktabs}
+% Correct order of tables after \paragraph or \subparagraph
+\usepackage{etoolbox}
+\makeatletter
+\patchcmd\longtable{\par}{\if@noskipsec\mbox{}\fi\par}{}{}
+\makeatother
+% Allow footnotes in longtable head/foot
+\IfFileExists{footnotehyper.sty}{\usepackage{footnotehyper}}{\usepackage{footnote}}
+\makesavenoteenv{longtable}
+\usepackage{graphicx}
+\makeatletter
+\def\maxwidth{\ifdim\Gin@nat@width>\linewidth\linewidth\else\Gin@nat@width\fi}
+\def\maxheight{\ifdim\Gin@nat@height>\textheight\textheight\else\Gin@nat@height\fi}
+\makeatother
+% Scale images if necessary, so that they will not overflow the page
+% margins by default, and it is still possible to overwrite the defaults
+% using explicit options in \includegraphics[width, height, ...]{}
+\setkeys{Gin}{width=\maxwidth,height=\maxheight,keepaspectratio}
+% Set default figure placement to htbp
+\makeatletter
+\def\fps@figure{htbp}
+\makeatother
+\setlength{\emergencystretch}{3em} % prevent overfull lines
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\setcounter{secnumdepth}{3}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\definecolor{MidnightBlue}{HTML}{005F73}
+\setlength{\emergencystretch}{3em}
+\ifxetex
+  % Load polyglossia as late as possible: uses bidi with RTL langages (e.g. Hebrew, Arabic)
+  \usepackage{polyglossia}
+  \setmainlanguage[variant=american]{english}
+\else
+  \usepackage[shorthands=off,main=american]{babel}
+\fi
+
+\title{Accelerating Qwen3-8B Decode on Tenstorrent Blackhole}
+\usepackage{etoolbox}
+\makeatletter
+\providecommand{\subtitle}[1]{% add subtitle to \maketitle
+  \apptocmd{\@title}{\par {\large #1 \par}}{}{}
+}
+\makeatother
+\subtitle{A technical and statistical report on libtt's model-path
+optimizations}
+\author{libtt performance study}
+\date{11 July 2026}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+This report explains and measures the cumulative Qwen3-8B decode
+optimizations implemented in libtt's current TT-XLA/TT-MLIR/TTNN
+execution path. Nine revisions were evaluated with the serving command
+documented in \texttt{README.md}, greedy-sampling fusion disabled, two
+compile/warm-up requests discarded, and 32 independent 128-token
+requests retained per revision. Mean end-to-end generation throughput
+rises from 16.265 to 23.698 tokens/s, a 45.70\% cumulative gain and a
+31.36\% reduction in mean request latency. The largest narrow change is
+runtime width-sharding of decode RMSNorm (+13.61\%); a true Dst-resident
+matmul-SwiGLU epilogue adds +2.73\%. The study also records two
+important negative results: generic two-way shared-LHS matmul fusion
+regresses by 1.69\%, and fusing SiLU into a separate binary multiply has
+a -0.65\% observed effect that is not significant after Holm correction.
+The final fallback-free simplification is performance-neutral.
+\end{abstract}
+
+{
+\hypersetup{linkcolor=}
+\setcounter{tocdepth}{3}
+\tableofcontents
+}
+\hypertarget{executive-summary}{%
+\chapter{Executive summary}\label{executive-summary}}
+
+The optimized branch
+\texttt{agent/qwen3-matmul-swiglu-epilogue-simplify} delivers
+\textbf{23.698 tokens/s} on the report workload, compared with
+\textbf{16.265 tokens/s} at the documented pre-optimization baseline.
+This is a \textbf{45.70\% throughput increase}. Mean end-to-end latency
+for the fixed 128-token response falls from 7.870 s to 5.402 s, a
+\textbf{31.36\% latency reduction}. An auxiliary streaming run on the
+final revision measured \textbf{25.790 pure decode tokens/s} (20
+samples, 95\% CI 25.657--25.923) after separating time to first token.
+
+The principal findings are:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  The initial decode-foundation bundle is decisive: it improves
+  throughput by 22.58\%. It combines compiler recognition of JAX RMSNorm
+  and rank-3 RoPE, fixes KV-cache dtype propagation, enables BF8
+  activation lowering, and relaxes TTNN constraints needed by
+  decode-specific layouts. Because these landed in one commit, the study
+  attributes only their aggregate effect.
+\item
+  Recognizing JAX's \emph{expanded} SiLU graph adds 3.30\%, and fusing
+  Qwen's decode QKV projection adds another 1.15\%.
+\item
+  Broadening shared-LHS matmul fusion from three consumers to two is a
+  statistically clear \textbf{-1.69\% regression} in isolation. The
+  combined gate/up representation is nevertheless an important enabler
+  for the later SwiGLU epilogue. This is a useful distinction: an
+  intermediate compiler form can be strategically valuable while being
+  locally slower until its consumer is fused.
+\item
+  Runtime width-sharding of single-token RMSNorm over 16 cores is the
+  largest single-purpose win at \textbf{+13.61\%}.
+\item
+  Folding SiLU into a still-separate binary multiply is not enough. Its
+  mean effect is -0.65\%; the raw Welch test is nominally significant,
+  but the result is not significant after correcting the eight adjacent
+  comparisons (Holm-adjusted p = 0.053). The optimization avoids one
+  intermediate, but it still writes and rereads the full gate/up matmul
+  result.
+\item
+  The true matmul-SwiGLU epilogue is the successful fusion boundary. It
+  keeps four gate and four up tiles together in the eight-tile Dst
+  register set on each of 96 cores, applies SiLU and multiplication
+  before packing, and writes only the half-width result. It contributes
+  \textbf{+2.73\%}.
+\item
+  Extending the matcher to the one-tile-row prefill case and removing
+  the old fallback changes the mean by -0.19\% (p = 0.53). It is
+  therefore a code and coverage simplification with no detectable
+  performance cost.
+\end{enumerate}
+
+\begin{figure}
+\hypertarget{fig:throughput}{%
+\centering
+\includegraphics[width=1\textwidth,height=\textheight]{figures/throughput.svg}
+\caption{Cumulative throughput across the benchmarked
+revisions.}\label{fig:throughput}
+}
+\end{figure}
+
+\hypertarget{scope-and-interpretation}{%
+\chapter{Scope and interpretation}\label{scope-and-interpretation}}
+
+\hypertarget{what-each-optimization-means-in-this-report}{%
+\section{What ``each optimization'' means in this
+report}\label{what-each-optimization-means-in-this-report}}
+
+The primary experiment covers every cumulative model-path optimization
+in the current, runnable Qwen3-8B serving line from commit
+\texttt{7482967} through commit \texttt{caa5428}. This is the sequence
+for which the same command in the current \texttt{README.md}, the same
+Qwen3-8B model, and the same TT-XLA/TTNN execution path remain
+meaningful. Each row is a real Git revision, not a feature flag applied
+to a shared binary.
+
+libtt also has an older, locally implemented PJRT/compiler/runtime
+history. Those optimizations are inventoried in
+\protect\hyperlink{historical-optimization-inventory}{the historical
+section}, but they are not assigned fabricated apples-to-oranges
+speedups. The local runtime was removed when libtt moved to upstream
+TT-XLA and TT-MLIR; older commits use different server entry points,
+model sizes, operation coverage, and runtime architecture. The present
+README benchmark cannot execute them without porting modern SGLang-JAX
+backward across that architectural boundary.
+
+Sampling-path branches are intentionally excluded. The benchmark forces
+\texttt{SGLANG\_TT\_FUSED\_GREEDY\_SAMPLING=0}, honoring the study's
+focus on the main model rather than token selection. Experimental
+branches that change the numeric contract, such as
+\texttt{agent/qwen3-mlp-bfp4}, require a separate quality and
+performance study rather than being mixed into the BF8-weight sequence.
+
+\hypertarget{cumulative-rather-than-factorial-attribution}{%
+\section{Cumulative rather than factorial
+attribution}\label{cumulative-rather-than-factorial-attribution}}
+
+For variant \(i\), the reported incremental speedup is
+
+\[
+S_i = 100\left(\frac{\bar{T}_i}{\bar{T}_{i-1}} - 1\right),
+\]
+
+where \(\bar{T}_i\) is the arithmetic mean of the 32 per-request
+throughput measurements. Cumulative speedup replaces \(\bar{T}_{i-1}\)
+with the V0 mean. This answers ``what did this commit add to the stack
+immediately below it?'' It does not claim that the effects commute:
+compiler and kernel fusions frequently interact, as V4 and V7
+demonstrate.
+
+\hypertarget{tenstorrent-technical-background}{%
+\chapter{Tenstorrent technical
+background}\label{tenstorrent-technical-background}}
+
+\hypertarget{end-to-end-software-stack}{%
+\section{End-to-end software stack}\label{end-to-end-software-stack}}
+
+\begin{figure}
+\hypertarget{fig:stack}{%
+\centering
+\includegraphics[width=1\textwidth,height=\textheight]{figures/stack.svg}
+\caption{The software and hardware layers involved in a libtt generation
+request.}\label{fig:stack}
+}
+\end{figure}
+
+The request crosses the following layers:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{SGLang-JAX} accepts HTTP requests, tokenizes the prompt,
+  schedules prefill/decode batches, owns the paged KV cache, and runs
+  the JAX Qwen model. Its documented architecture separates the HTTP
+  server, tokenizer manager, scheduler, model runner, and detokenizer
+  manager.\footnote{\href{https://github.com/sgl-project/sglang-jax}{SGLang-JAX
+    project and architecture}, including its
+    \href{https://github.com/sgl-project/sglang-jax/blob/main/docs/architecture/project-core-structure.md}{core-structure
+    documentation}.}
+\item
+  \textbf{JAX} traces the model computation and presents a StableHLO
+  graph. StableHLO is a portable, ML-oriented operation set between
+  frameworks and compilers.\footnote{OpenXLA,
+    \href{https://openxla.org/stablehlo/spec}{StableHLO specification}.}
+\item
+  \textbf{libtt} is loaded as the \texttt{tt} PJRT plugin. PJRT
+  deliberately makes device implementations opaque to frameworks: JAX
+  calls a uniform compile, buffer, transfer, and execute interface while
+  libtt/TT-XLA supplies the Tenstorrent-specific
+  implementation.\footnote{OpenXLA,
+    \href{https://openxla.org/xla/pjrt}{PJRT --- Uniform Device API}.}
+\item
+  \textbf{TT-XLA and TT-MLIR} lower StableHLO through TTIR and TTNN
+  dialects. TTIR carries tensor computation in a hardware-aware compiler
+  IR; TTNN IR selects runtime operations, layouts, memory
+  configurations, and device data types. The compiler serializes an
+  executable FlatBuffer consumed by the TTNN runtime. Tenstorrent's
+  official stack description identifies TT-XLA as the JAX/PyTorch PJRT
+  frontend and TT-MLIR as the compiler that performs fusion, sharding,
+  and layout lowering.\footnote{Tenstorrent,
+    \href{https://github.com/tenstorrent/tt-forge}{TT-Forge architecture
+    and subprojects}.}
+\item
+  \textbf{TTNN} is the high-level device-operation library. A TTNN
+  matmul, RMSNorm, SDPA, or layout conversion selects a validated device
+  operation and a program factory.
+\item
+  \textbf{TT-Metalium} creates command-queue programs containing
+  per-core dataflow and compute kernels. It manages core ranges,
+  circular buffers, semaphores, NoC transfers, and runtime arguments.
+\item
+  \textbf{Blackhole Tensix cores} execute those programs against device
+  DRAM and per-core L1 SRAM.
+\end{enumerate}
+
+This layering explains why libtt's changes appear as patches to TT-XLA,
+TT-MLIR, and TT-Metal rather than only to libtt's thin PJRT surface. A
+graph pattern has to be recognized in TTIR, represented in
+TTNN/FlatBuffer, selected by the TTNN runtime, and finally executed by a
+suitable Metal program.
+
+\hypertarget{blackhole-and-the-tensix-execution-model}{%
+\section{Blackhole and the Tensix execution
+model}\label{blackhole-and-the-tensix-execution-model}}
+
+The test system contains a Blackhole P150. Current P150 firmware exposes
+120 Tensix cores; Blackhole integrates GDDR6 memory, a two-dimensional
+NoC, and independent SRAM-rich worker cores.\footnote{Tenstorrent,
+  \href{https://docs.tenstorrent.com/tt-system-firmware/boards/tenstorrent/tt_blackhole/doc/index.html}{Blackhole
+  PCIe card documentation} and
+  \href{https://docs.tenstorrent.com/tt-system-firmware/release/release-notes-19.5.html}{P150
+  core-count firmware note}.} The report's specialized SwiGLU program
+intentionally uses 96 workers, laid out within an 11-by-9-capable worker
+grid, rather than assuming every exposed core is available.
+
+A Tensix core behaves more like a small dataflow computer than a
+conventional GPU streaming multiprocessor. A typical program has:
+
+\begin{itemize}
+\tightlist
+\item
+  a \textbf{reader data-movement kernel} that fetches tiles from DRAM or
+  another core over the NoC into L1 circular buffers;
+\item
+  a \textbf{compute kernel} that unpacks tiles into compute registers,
+  invokes the matrix/vector engines, and produces result tiles;
+\item
+  a \textbf{writer data-movement kernel} that drains result circular
+  buffers to the destination tensor.
+\end{itemize}
+
+Circular buffers are bounded producer/consumer queues shared by the
+core's threads. The standard protocol reserves space at the back, pushes
+produced tiles, waits for tiles at the front, and pops consumed
+tiles.\footnote{Tenstorrent,
+  \href{https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html}{Circular
+  Buffer APIs}.} Reader, compute, and writer kernels can therefore
+overlap on different data. Tenstorrent's matmul lab describes the same
+three-kernel pipeline and the NoC path from DRAM to fast core-local
+SRAM.\footnote{Tenstorrent,
+  \href{https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/labs/matmul/lab1/lab1.html}{Single
+  Core Matrix Multiplication lab}.}
+
+\hypertarget{tiles-faces-and-padding}{%
+\subsection{Tiles, faces, and padding}\label{tiles-faces-and-padding}}
+
+TTNN's default tile is 32 by 32 elements. It is divided into four
+16-by-16 faces because the matrix engine operates natively on 16-by-16
+pieces. Tile layout pads the final two tensor dimensions to tile
+boundaries.\footnote{Tenstorrent,
+  \href{https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html}{TTNN
+  Tensor: layout, tiles, and faces}.} Consequently, batch-one decode
+still presents one full tile row to many operations: the logical
+sequence length is one, but the physical compute unit is a 32-row tile.
+Optimizations must reason about both logical shapes and padded tile
+shapes.
+
+\hypertarget{dst-registers-and-why-epilogues-matter}{%
+\subsection{Dst registers and why epilogues
+matter}\label{dst-registers-and-why-epilogues-matter}}
+
+The Dst register set is the compute kernel's primary workspace.
+Matrix-engine results land in Dst; the vector engine can read and modify
+them; the packer moves them back to an L1 circular buffer. Conversely,
+the unpacker loads L1 tiles into Dst. The TT-Metal documentation
+explicitly identifies Dst as the matrix destination and vector
+source/destination, with \texttt{pack\_tile} moving a result back to
+L1.\footnote{Tenstorrent,
+  \href{https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html}{Compute
+  engines and data flow within Tensix}.}
+
+Every boundary crossed after Dst costs work: pack, reserve/push a
+circular buffer, possibly write through the NoC to DRAM, launch another
+operation, read the tensor again, and unpack. A true epilogue wins by
+applying the consumer while producer values are already resident in Dst.
+Merely placing two TTNN operations in one graph region is not equivalent
+if the first operation's full output is still materialized.
+
+\hypertarget{dram-l1-interleaving-and-sharding}{%
+\subsection{DRAM, L1, interleaving, and
+sharding}\label{dram-l1-interleaving-and-sharding}}
+
+Weights and large persistent tensors live in device DRAM. L1 is smaller
+and faster, and exists independently on each worker. A tensor's TTNN
+\texttt{MemoryConfig} specifies both buffer location and layout:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{interleaved} storage distributes pages through memory banks;
+\item
+  \textbf{height sharding} splits rows across core L1s;
+\item
+  \textbf{width sharding} splits columns across core L1s;
+\item
+  \textbf{block sharding} partitions both dimensions.
+\end{itemize}
+
+TTNN documents L1 sharding as distributing one shard to each core's L1,
+with a core grid, shard shape, strategy, and orientation defining the
+mapping.\footnote{Tenstorrent,
+  \href{https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html\#tensor-sharding}{TTNN
+  Tensor sharding}.} \texttt{ttnn.to\_memory\_config} performs
+interleaved/sharded and DRAM/L1 conversions.\footnote{Tenstorrent,
+  \href{https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/api/ttnn.to_memory_config.html}{\texttt{ttnn.to\_memory\_config}}.}
+Sharding helps only when the parallel operation saves more than those
+conversion costs. V5 is a successful example because RMSNorm's reduction
+and affine work benefit enough from 16-way width sharding even after
+conversion in and out.
+
+\hypertarget{bf16-and-bfp8-weights}{%
+\subsection{BF16 and BFP8 weights}\label{bf16-and-bfp8-weights}}
+
+The benchmark keeps activations and outputs in BF16 but asks TT-XLA to
+lower eligible model weights to \texttt{bfp\_bf8} (\texttt{BFLOAT8\_B}).
+BFLOAT8\_B is a block-floating format: groups of 16 values share an
+exponent.\footnote{Tenstorrent,
+  \href{https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html\#limitation-of-bfloat8-b}{TTNN
+  BFLOAT8\_B description and limitations}.} It reduces weight bytes and
+therefore decode's dominant DRAM traffic, at the cost of precision and a
+different reduction path. The SwiGLU kernel is deliberately specialized
+for BF16 input/output and BFLOAT8\_B weights; it uses BF16 packer-L1
+accumulation instead of FP32 Dst accumulation.
+
+Packer-L1 accumulation stores partial sums in an L1 circular-buffer slot
+and adds later Dst values into that slot. TT-Metal exposes this
+explicitly as an L1-accumulation mode of the packer.\footnote{Tenstorrent,
+  \href{https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/pack_unpack/pack_tile.html}{\texttt{pack\_reconfig\_l1\_acc}}.}
+It permits a K dimension larger than the Dst capacity while reserving
+all eight Dst tiles for paired gate/up outputs.
+
+\hypertarget{why-autoregressive-decode-is-special}{%
+\section{Why autoregressive decode is
+special}\label{why-autoregressive-decode-is-special}}
+
+Prefill processes many prompt tokens at once and exposes a large matmul
+M dimension. Decode processes one new token per active sequence, so at
+batch one most projections are logically \(1\times K\) by \(K\times N\).
+The weights are revisited for every token, arithmetic intensity is low,
+and launch/data-motion overheads are a larger fraction of token time.
+The 32-row tile padding also makes naive kernels perform work on rows
+that are not logically populated.
+
+For a simplified Qwen decoder layer,
+
+\[
+\begin{aligned}
+u &= \operatorname{RMSNorm}(h),\\
+h' &= h + \operatorname{Attention}(Q(u),K(u),V(u);\,K_{cache},V_{cache}),\\
+v &= \operatorname{RMSNorm}(h'),\\
+g &= v W_{gate}, \qquad r = v W_{up},\\
+h_{next} &= h' + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
+\end{aligned}
+\]
+
+The repeatedly executed hot path therefore contains RMSNorm reductions,
+QKV projection/splitting, RoPE, paged-cache attention, paired gate/up
+matmuls, SiLU/multiply, a down projection, and residual additions. The
+optimizations in this report either recognize these graphs, choose
+decode-appropriate layouts, or eliminate materialization between their
+operations.
+
+\hypertarget{optimization-sequence}{%
+\chapter{Optimization sequence}\label{optimization-sequence}}
+
+\hypertarget{v0-documented-baseline-7482967}{%
+\section{\texorpdfstring{V0 --- documented baseline
+(\texttt{7482967})}{V0 --- documented baseline (7482967)}}\label{v0-documented-baseline-7482967}}
+
+V0 is the last documentation-only commit before the present decode
+series. It already includes the upstream TT-XLA/TT-MLIR architecture,
+Qwen3 SGLang-JAX support, BF8 weight lowering, fast tilize patches, and
+reduced cold-compile work. It is therefore a strong, runnable
+baseline---not the project's original unoptimized runtime.
+
+\hypertarget{v1-decode-foundation-bundle-9978a9b}{%
+\section{\texorpdfstring{V1 --- decode foundation bundle
+(\texttt{9978a9b})}{V1 --- decode foundation bundle (9978a9b)}}\label{v1-decode-foundation-bundle-9978a9b}}
+
+This commit introduces several mutually dependent changes:
+
+\begin{itemize}
+\tightlist
+\item
+  a TTIR matcher collapses JAX's decomposed RMSNorm expression into a
+  TTNN RMSNorm operation;
+\item
+  RoPE fusion accepts the rank-3 decode shapes produced by JAX,
+  reshaping to the rank-4 composite form and back;
+\item
+  KV-cache dtype conversion propagates return types through cache-update
+  ops;
+\item
+  single-chip activation dtype lowering and TT-XLA compile options
+  enable BF8 activation/weight lowering in the intended regions;
+\item
+  TT-Metal layernorm validation accepts the single-core height-sharded
+  decode case;
+\item
+  SDPA decode accepts an L1-interleaved, non-sharded query tensor;
+\item
+  SiLU lowering bridges the JAX call form used at this point in the
+  sequence.
+\end{itemize}
+
+The aggregate gain is \textbf{+22.58\%}. No sub-feature number is
+claimed because they are not separate commits and several are enabling
+correctness/layout conditions for the others.
+
+\hypertarget{v2-expanded-silu-recognition-10459b5}{%
+\section{\texorpdfstring{V2 --- expanded-SiLU recognition
+(\texttt{10459b5})}{V2 --- expanded-SiLU recognition (10459b5)}}\label{v2-expanded-silu-recognition-10459b5}}
+
+JAX does not necessarily preserve SiLU as a named operation. The
+observed StableHLO/TTIR graph expresses it as
+
+\[
+\operatorname{SiLU}(x) = x\,\sigma(x) = \frac{x}{1 + \exp(-x)},
+\]
+
+with typecasts, reshapes, broadcasts, and splatted constants around the
+scalar one. V2 looks through those view-like operations, proves the
+constant is one, matches divide/add/exp/neg, and replaces the outer
+multiply with a SiLU op. It removes a chain of elementwise launches and
+intermediates while retaining a strict same-input check for \(x\) and
+the sigmoid-like expression. The measured increment is \textbf{+3.30\%}.
+
+\hypertarget{v3-qwen-decode-qkv-projection-fusion-3fe072b}{%
+\section{\texorpdfstring{V3 --- Qwen decode QKV projection fusion
+(\texttt{3fe072b})}{V3 --- Qwen decode QKV projection fusion (3fe072b)}}\label{v3-qwen-decode-qkv-projection-fusion-3fe072b}}
+
+V3 recognizes the exact decode projection structure:
+
+\begin{verbatim}
+matmul → Q slice/reshape → Q RMSNorm → [1, B, Hq, D]
+       → K slice/reshape → K RMSNorm → [1, B, Hkv, D]
+       → V slice/reshape             → [1, B, Hkv, D]
+\end{verbatim}
+
+The pattern verifies rank, contiguous Q/K/V bounds, head counts, head
+dimension, and operation roles. It then reshapes the projection once,
+invokes \texttt{nlp\_create\_qkv\_heads\_decode}, and recreates Q/K
+RMSNorm at rank four. This avoids materialized slices and reshapes in
+the decode loop. The measured gain is \textbf{+1.15\%}.
+
+\hypertarget{v4-two-way-shared-lhs-matmul-fusion-83baa8d}{%
+\section{\texorpdfstring{V4 --- two-way shared-LHS matmul fusion
+(\texttt{83baa8d})}{V4 --- two-way shared-LHS matmul fusion (83baa8d)}}\label{v4-two-way-shared-lhs-matmul-fusion-83baa8d}}
+
+TTIR already fused groups of at least three matmuls that share a
+left-hand operand. V4 changes the validity threshold from three to two.
+That admits Qwen's paired gate/up projections, conceptually transforming
+
+\[
+xW_{gate},\;xW_{up}
+\quad\longrightarrow\quad
+x\,[W_{gate}\;W_{up}].
+\]
+
+The result is a \textbf{-1.69\% regression} (Holm-adjusted p =
+\(8.81\times10^{-5}\)). The likely mechanism is visible from the graph:
+V4 reduces launch/input-read duplication but still writes the
+doubled-width projection and then slices/reads it for SwiGLU. Wider
+output handling and the chosen matmul geometry cost more than the saved
+launch on this shape.
+
+This result does not make V4 useless. V7 consumes precisely the combined
+gate/up representation and removes its expensive output boundary. V4 is
+an enabler whose isolated form is slower.
+
+\hypertarget{v5-decode-rmsnorm-runtime-sharding-e534690}{%
+\section{\texorpdfstring{V5 --- decode RMSNorm runtime sharding
+(\texttt{e534690})}{V5 --- decode RMSNorm runtime sharding (e534690)}}\label{v5-decode-rmsnorm-runtime-sharding-e534690}}
+
+V5 detects a device-resident, tiled, unsharded RMSNorm input with
+logical sequence length one and width at least 2048. If the width
+divides evenly into 16 tile-aligned shards, it:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  constructs an 8-by-2, row-major core grid;
+\item
+  width-shards the input into the 16 cores' L1 memories;
+\item
+  derives the layernorm program configuration from the shard
+  specification;
+\item
+  runs TTNN RMSNorm in the sharded configuration; and
+\item
+  converts the output back to the requested/original memory
+  configuration.
+\end{enumerate}
+
+The measured increment is \textbf{+13.61\%}, the largest narrow
+optimization in the study. At sequence length one, the generic
+interleaved path leaves too little parallel work in the height
+dimension. Width sharding exposes the hidden-size reduction across cores
+and more than repays two memory-config conversions.
+
+\hypertarget{v6-silu-fused-into-binary-multiply-a718685}{%
+\section{\texorpdfstring{V6 --- SiLU fused into binary multiply
+(\texttt{a718685})}{V6 --- SiLU fused into binary multiply (a718685)}}\label{v6-silu-fused-into-binary-multiply-a718685}}
+
+The TTNN fusing pass detects a single-use SiLU feeding either side of a
+multiply. It removes the standalone SiLU op, marks the relevant BinaryNg
+input with a unary SiLU activation, extends the FlatBuffer enum, and
+calls TTNN \texttt{multiply} with a per-input activation list.
+
+This is a legitimate elementwise fusion, but not a matmul epilogue. The
+full combined gate/up projection still reaches memory before BinaryNg
+consumes it. The observed effect is \textbf{-0.65\%}. Its raw Welch
+p-value is 0.0266, but the Holm-adjusted p-value is 0.0533, so the
+experiment does not establish a family-wise-significant regression. It
+certainly provides no evidence of a speedup.
+
+\hypertarget{v7-true-dst-resident-matmul-swiglu-epilogue-ce99831}{%
+\section{\texorpdfstring{V7 --- true Dst-resident matmul-SwiGLU epilogue
+(\texttt{ce99831})}{V7 --- true Dst-resident matmul-SwiGLU epilogue (ce99831)}}\label{v7-true-dst-resident-matmul-swiglu-epilogue-ce99831}}
+
+V7 adds a TT-MLIR pattern, TTNN \texttt{matmul\_swiglu} operation, and
+dedicated TT-Metal program. Its contract is intentionally narrow:
+
+\begin{itemize}
+\tightlist
+\item
+  BF16 activation and output;
+\item
+  BFLOAT8\_B weight matrix;
+\item
+  DRAM-interleaved tensors;
+\item
+  no transpose, bias, or caller-provided output;
+\item
+  one physical tile row;
+\item
+  a grid supporting the selected 96 workers;
+\item
+  half of the output tile width divisible across those workers.
+\end{itemize}
+
+For Qwen3-8B, each worker owns four gate-output tiles and four
+corresponding up-output tiles. Together they exactly fill the eight-tile
+Dst register set. The program:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  uses two sender cores to multicast activation K blocks over the NoC;
+\item
+  has each of 96 workers read its paired gate/up BF8 weight tiles;
+\item
+  accumulates each K block into all eight Dst slots;
+\item
+  packs partial sums into L1 with BF16 packer-L1 accumulation;
+\item
+  reloads the final four gate and four up partials into Dst;
+\item
+  applies SiLU to Dst slots 0--3;
+\item
+  multiplies each by slots 4--7 in place; and
+\item
+  packs only four final BF16 tiles.
+\end{enumerate}
+
+The critical difference from V6 is that the full gate/up matmul output
+never becomes a standalone tensor. The epilogue halves output traffic at
+the producer boundary and avoids a second operation's read/unpack path.
+The measured gain is \textbf{+2.73\%}.
+
+\hypertarget{v8-prefill-capable-fallback-free-simplification-caa5428}{%
+\section{\texorpdfstring{V8 --- prefill-capable, fallback-free
+simplification
+(\texttt{caa5428})}{V8 --- prefill-capable, fallback-free simplification (caa5428)}}\label{v8-prefill-capable-fallback-free-simplification-caa5428}}
+
+V8 generalizes the compiler matcher from decode-only naming/shape
+assumptions to any supported one-tile-row input, covering short prefill
+as well as decode. It removes the V6 SiLU-multiply patch and its
+fallback path, leaving the true matmul epilogue as the single
+implementation for the matched form. Validation remains in
+TTNN/TT-Metal, where unsupported dtype/layout/shape combinations are
+rejected rather than silently taking a slower path.
+
+The measured difference is \textbf{-0.19\%}, p = 0.532. The result is
+statistically neutral and its confidence interval overlaps V7's closely.
+V8 therefore achieves the intended simplification and broader match
+coverage without a detectable throughput regression.
+
+\hypertarget{benchmark-methodology}{%
+\chapter{Benchmark methodology}\label{benchmark-methodology}}
+
+\hypertarget{system-and-software}{%
+\section{System and software}\label{system-and-software}}
+
+\begin{longtable}[]{@{}ll@{}}
+\toprule
+Item & Value\tabularnewline
+\midrule
+\endhead
+Accelerator & Tenstorrent Blackhole P150\tabularnewline
+Firmware observed at startup & 19.6.0\tabularnewline
+Host CPU & Intel Core Ultra 9 185H, 22 logical CPUs
+online\tabularnewline
+Host OS/kernel & Linux 6.8.0-124-generic, x86-64\tabularnewline
+Model & \texttt{Qwen/Qwen3-8B}\tabularnewline
+Model dtype & BF16\tabularnewline
+Weight-lowering request & \texttt{bfp\_bf8}\tabularnewline
+Attention backend & TT\tabularnewline
+Serving frontend & \texttt{/home/pcmoritz/sglang-jax}\tabularnewline
+PJRT plugin & revision-specific
+\texttt{bazel-bin/libtt.so}\tabularnewline
+Final report revision &
+\texttt{caa5428fb86c9ffc6a9dda8685126c5ac4353013}\tabularnewline
+Benchmark date & 11 July 2026 (America/Los\_Angeles)\tabularnewline
+\bottomrule
+\end{longtable}
+
+V0--V4 were rebuilt and collected in one sequential benchmark session.
+V5--V8 use the first 32 retained observations from the existing
+40-observation runs collected earlier on the same date, host,
+accelerator, model, server command, and sampling-disabled configuration.
+All raw observations used in the report are normalized into
+\texttt{data/samples.csv}.
+
+\hypertarget{server-configuration}{%
+\section{Server configuration}\label{server-configuration}}
+
+Each revision was checked out, built with its revision-appropriate Bazel
+target (\texttt{//:tt}, producing \texttt{bazel-bin/libtt.so}), and
+served with the README command. The effective command was:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\FunctionTok{env}\NormalTok{ {-}u TT\_METAL\_RUNTIME\_ROOT }\KeywordTok{\textbackslash{}}
+  \VariableTok{PYTHONPATH=}\NormalTok{/home/pcmoritz/sglang{-}jax/python }\KeywordTok{\textbackslash{}}
+  \VariableTok{PJRT\_NAMES\_AND\_LIBRARY\_PATHS=}\NormalTok{tt:/home/pcmoritz/libtt/bazel{-}bin/libtt.so }\KeywordTok{\textbackslash{}}
+  \VariableTok{JAX\_PLATFORMS=}\NormalTok{tt }\KeywordTok{\textbackslash{}}
+  \VariableTok{JAX\_USE\_SHARDY\_PARTITIONER=}\NormalTok{false }\KeywordTok{\textbackslash{}}
+  \VariableTok{JAX\_COMPILATION\_CACHE\_DIR=}\NormalTok{/tmp/sglang{-}jax{-}qwen3{-}8b{-}jax{-}cache }\KeywordTok{\textbackslash{}}
+  \VariableTok{SGLANG\_TT\_HOST\_WEIGHT\_LOAD=}\NormalTok{1 }\KeywordTok{\textbackslash{}}
+  \VariableTok{SGLANG\_TT\_OPTIMIZATION\_LEVEL=}\NormalTok{1 }\KeywordTok{\textbackslash{}}
+  \VariableTok{SGLANG\_TT\_EXPERIMENTAL\_WEIGHT\_DTYPE=}\NormalTok{bfp\_bf8 }\KeywordTok{\textbackslash{}}
+  \VariableTok{SGLANG\_TT\_FUSED\_GREEDY\_SAMPLING=}\NormalTok{0 }\KeywordTok{\textbackslash{}}
+  \ExtensionTok{/home/pcmoritz/sglang{-}jax/.venv/bin/python}\NormalTok{ {-}m sgl\_jax.launch\_server }\KeywordTok{\textbackslash{}}
+  \ExtensionTok{{-}{-}model{-}path}\NormalTok{ Qwen/Qwen3{-}8B }\KeywordTok{\textbackslash{}}
+  \ExtensionTok{{-}{-}host}\NormalTok{ 127.0.0.1 {-}{-}port 31000 }\KeywordTok{\textbackslash{}}
+  \ExtensionTok{{-}{-}device}\NormalTok{ tt {-}{-}dtype bfloat16 {-}{-}attention{-}backend tt }\KeywordTok{\textbackslash{}}
+  \ExtensionTok{{-}{-}max{-}running{-}requests}\NormalTok{ 2 {-}{-}max{-}total{-}tokens 1024 }\KeywordTok{\textbackslash{}}
+  \ExtensionTok{{-}{-}max{-}prefill{-}tokens}\NormalTok{ 256 {-}{-}chunked{-}prefill{-}size 256 }\KeywordTok{\textbackslash{}}
+  \ExtensionTok{{-}{-}page{-}size}\NormalTok{ 32 {-}{-}watchdog{-}timeout 1200 }\KeywordTok{\textbackslash{}}
+  \ExtensionTok{{-}{-}disable{-}precompile}\NormalTok{ {-}{-}skip{-}server{-}warmup }\KeywordTok{\textbackslash{}}
+  \ExtensionTok{{-}{-}disable{-}overlap{-}schedule}\NormalTok{ {-}{-}disable{-}radix{-}cache}
+\end{Highlighting}
+\end{Shaded}
+
+Disabling radix cache ensures every request executes the 32-token prompt
+prefill rather than reusing a prefix. Disabling overlap schedule removes
+cross-request scheduler overlap. The maximum of two running requests is
+a server capacity setting; requests were issued serially. Fused greedy
+sampling is explicitly disabled so improvements reflect the model path.
+
+\hypertarget{request-and-sample-policy}{%
+\section{Request and sample policy}\label{request-and-sample-policy}}
+
+The identical request was issued 34 times per revision:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\ExtensionTok{curl}\NormalTok{ {-}fsS http://127.0.0.1:31000/generate }\KeywordTok{\textbackslash{}}
+  \ExtensionTok{{-}H} \StringTok{\textquotesingle{}Content{-}Type: application/json\textquotesingle{}} \KeywordTok{\textbackslash{}}
+  \ExtensionTok{{-}d} \StringTok{\textquotesingle{}\{}
+\StringTok{    "text": "The capital of France is",}
+\StringTok{    "sampling\_params": \{"temperature": 0, "max\_new\_tokens": 128\}}
+\StringTok{  \}\textquotesingle{}}
+\end{Highlighting}
+\end{Shaded}
+
+The first two responses were discarded. They contain graph compilation,
+TT-Metal kernel compilation, trace setup, and cache population; they are
+not steady-state samples. The next 32 complete responses form the
+analysis window. Every retained request returned exactly 128 token IDs.
+
+For request (j), throughput is
+
+\[T_j = \frac{128}{L_j},\]
+
+where (L\_j) is SGLang's \texttt{meta\_info.e2e\_latency}. This includes
+request-local prefill, decode, and serving overhead, so it is
+intentionally an end-to-end generation metric rather than a kernel-only
+number.
+
+\hypertarget{statistical-treatment}{%
+\section{Statistical treatment}\label{statistical-treatment}}
+
+For each revision the report gives the arithmetic mean, sample standard
+deviation, median, range, and a two-sided 95\% Student-t confidence
+interval for the mean. Adjacent revisions are compared with a two-sided
+Welch t-test, which does not assume equal variance. Eight planned
+adjacent comparisons create a multiple-testing family, so Holm's
+step-down method controls family-wise error. Raw and adjusted p-values
+are preserved in \texttt{data/summary.csv}.
+
+The tests assume independent observations. Sequential accelerator
+timings can exhibit autocorrelation and thermal drift, so p-values
+should be read as descriptive evidence for this run, not as a universal
+hardware guarantee. The effect sizes and confidence intervals are more
+important than crossing a single threshold.
+
+\hypertarget{results}{%
+\chapter{Results}\label{results}}
+
+\hypertarget{primary-throughput-results}{%
+\section{Primary throughput results}\label{primary-throughput-results}}
+
+\begingroup\small
+
+\begin{longtable}[]{@{}llrcrrr@{}}
+\caption{End-to-end 128-token generation results, 32 retained requests
+per revision. ``Holm p'' is the multiplicity-adjusted p-value for the
+comparison with the preceding row.}\tabularnewline
+\toprule
+Variant & Commit & Mean ± SD (tok/s) & 95\% CI & Incremental & vs.~V0 &
+Holm p\tabularnewline
+\midrule
+\endfirsthead
+\toprule
+Variant & Commit & Mean ± SD (tok/s) & 95\% CI & Incremental & vs.~V0 &
+Holm p\tabularnewline
+\midrule
+\endhead
+V0 & \texttt{7482967} & 16.265 ± 0.128 & {[}16.218, 16.311{]} & --- &
+0.00\% & ---\tabularnewline
+V1 & \texttt{9978a9b} & 19.938 ± 0.283 & {[}19.836, 20.040{]} &
+\textbf{+22.58\%} & +22.58\% & 2.33e-44\tabularnewline
+V2 & \texttt{10459b5} & 20.596 ± 0.279 & {[}20.495, 20.696{]} &
+\textbf{+3.30\%} & +26.63\% & 1.09e-12\tabularnewline
+V3 & \texttt{3fe072b} & 20.832 ± 0.293 & {[}20.726, 20.938{]} &
+\textbf{+1.15\%} & +28.08\% & 0.00481\tabularnewline
+V4 & \texttt{83baa8d} & 20.479 ± 0.321 & {[}20.363, 20.594{]} &
+\textbf{-1.69\%} & +25.91\% & 8.81e-5\tabularnewline
+V5 & \texttt{e534690} & 23.265 ± 0.235 & {[}23.181, 23.350{]} &
+\textbf{+13.61\%} & +43.04\% & 2.85e-42\tabularnewline
+V6 & \texttt{a718685} & 23.113 ± 0.296 & {[}23.007, 23.220{]} & -0.65\%
+& +42.11\% & 0.0533\tabularnewline
+V7 & \texttt{ce99831} & 23.744 ± 0.311 & {[}23.632, 23.856{]} &
+\textbf{+2.73\%} & +45.98\% & 5.90e-11\tabularnewline
+V8 & \texttt{caa5428} & 23.698 ± 0.274 & {[}23.599, 23.797{]} & -0.19\%
+& \textbf{+45.70\%} & 0.532\tabularnewline
+\bottomrule
+\end{longtable}
+
+\endgroup
+
+\begin{figure}
+\hypertarget{fig:incremental}{%
+\centering
+\includegraphics[width=1\textwidth,height=\textheight]{figures/incremental-speedup.svg}
+\caption{Incremental speedup or regression introduced by each
+revision.}\label{fig:incremental}
+}
+\end{figure}
+
+The final mean is slightly below V7, but the difference is only 0.046
+tok/s and is not statistically distinguishable from zero. In contrast,
+V4's confidence interval sits below V3's and its adjusted p-value is
+small. The data therefore support ``V8 preserves V7 performance,'' but
+not ``every fusion improved performance.''
+
+\hypertarget{pure-decode-cross-check}{%
+\section{Pure decode cross-check}\label{pure-decode-cross-check}}
+
+The \texttt{/generate} response reports one end-to-end latency. A
+separate streaming run on V8 recorded the first token and remaining
+token intervals. After two warm-ups, 20 retained observations yielded:
+
+\begin{longtable}[]{@{}lrc@{}}
+\toprule
+Metric & Mean ± SD & 95\% CI\tabularnewline
+\midrule
+\endhead
+Time to first token & 0.6105 ± 0.0043 s & {[}0.6085, 0.6125{]}
+s\tabularnewline
+Total streaming time & 5.5355 ± 0.0544 s & {[}5.5100, 5.5610{]}
+s\tabularnewline
+Pure decode throughput & 25.790 ± 0.284 tok/s & {[}25.657, 25.923{]}
+tok/s\tabularnewline
+\bottomrule
+\end{longtable}
+
+The 25.79 tok/s number is higher than the 23.70 end-to-end metric
+because it excludes prompt processing and first-token latency. It is a
+useful description of the final decoder but is not used for
+inter-revision attribution because the full streaming experiment was not
+repeated for every revision.
+
+\hypertarget{correctness-and-numeric-stability-checks}{%
+\section{Correctness and numeric stability
+checks}\label{correctness-and-numeric-stability-checks}}
+
+Within every variant, all 32 retained requests produced the same 128
+token IDs. The SHA-256 prefixes of those ID sequences were:
+
+\begin{longtable}[]{@{}ll@{}}
+\toprule
+Variants & Token-ID hash prefix\tabularnewline
+\midrule
+\endhead
+V0--V1 & \texttt{68e10a82edac}\tabularnewline
+V2--V3 & \texttt{1ab55f92178d}\tabularnewline
+V4--V6 & \texttt{808d3949246a}\tabularnewline
+V7--V8 & \texttt{2eb88f74c7d9}\tabularnewline
+\bottomrule
+\end{longtable}
+
+The transitions align with compiler/numeric changes and do not imply
+request nondeterminism. Greedy decoding is sensitive to tiny logit
+reorderings: BF8 lowering, operation reassociation, reduction order, or
+a new kernel can change a later argmax. This performance report verifies
+shape/completion and within-variant determinism; it is not a
+model-quality evaluation. A production decision should add perplexity
+and task-level quality suites.
+
+\hypertarget{reading-the-results-mechanistically}{%
+\chapter{Reading the results
+mechanistically}\label{reading-the-results-mechanistically}}
+
+\hypertarget{launch-reduction-is-not-the-same-as-traffic-reduction}{%
+\section{Launch reduction is not the same as traffic
+reduction}\label{launch-reduction-is-not-the-same-as-traffic-reduction}}
+
+V4, V6, and V7 form the clearest controlled lesson in the study:
+
+\begin{verbatim}
+V4: combine two matmuls
+    → fewer launches/input reads
+    → still materialize doubled gate/up output
+    → -1.69%
+
+V6: combine SiLU with the following multiply
+    → remove standalone SiLU output
+    → still materialize and reread matmul output
+    → -0.65% observed; adjusted result inconclusive
+
+V7: make SwiGLU the matmul epilogue
+    → gate/up stay in Dst
+    → write only final half-width tensor
+    → +2.73%
+\end{verbatim}
+
+At batch-one decode, model weights and intermediate tiles dominate
+movement. Eliminating an operation launch is helpful only if the fused
+program does not create a worse geometry or preserve the same expensive
+tensor boundary. The successful fusion boundary is producer-side, before
+packing the matmul result.
+
+\hypertarget{why-rmsnorm-sharding-is-unusually-large}{%
+\section{Why RMSNorm sharding is unusually
+large}\label{why-rmsnorm-sharding-is-unusually-large}}
+
+RMSNorm performs square, reduction over hidden width, reciprocal square
+root, and affine scaling. With logical height one, a generic
+height-parallel scheme cannot occupy many cores. V5's width sharding
+creates 16 independent L1 shards and selects a sharded layernorm
+program. The hidden width is large and repeats in every decoder layer,
+so this local change compounds across the model.
+
+The implementation is also conservative: it activates only for a device,
+tiled, unsharded tensor; sequence length one; width at least 2048; and a
+width divisible into 16 tile-aligned shards. Prefill and already-sharded
+cases retain their prior behavior.
+
+\hypertarget{why-the-final-simplification-is-safe-for-performance}{%
+\section{Why the final simplification is safe for
+performance}\label{why-the-final-simplification-is-safe-for-performance}}
+
+V8 does not rewrite the TT-Metal compute loop that produced V7's
+speedup. It changes compiler matching/coverage and deletes the V6
+fallback. The retained V7 and V8 output hashes are identical, their mean
+difference is small, and the adjusted p-value is 0.532. Those three
+signals support the claim that the code simplification preserves both
+the observed token sequence and runtime performance for this workload.
+
+\hypertarget{historical-optimization-inventory}{%
+\chapter{Historical optimization
+inventory}\label{historical-optimization-inventory}}
+
+Before the upstream TT-XLA/TT-MLIR transition, libtt implemented
+substantially more of the compiler and runtime locally. The following
+first-parent commits are performance-relevant milestones. They remain
+important engineering context even though the modern README benchmark
+cannot isolate them.
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+\begin{minipage}[b]{0.30\columnwidth}\raggedright
+Commit\strut
+\end{minipage} & \begin{minipage}[b]{0.30\columnwidth}\raggedright
+Historical optimization\strut
+\end{minipage} & \begin{minipage}[b]{0.30\columnwidth}\raggedright
+Technical intent\strut
+\end{minipage}\tabularnewline
+\midrule
+\endhead
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{701dc4e}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Fast dispatch\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Replace slow command submission with the device fast-dispatch
+path.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{f4df790}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Optimized matmul\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Introduce the first performance-oriented tiled matmul
+implementation.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{0f39cae}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Parallel binary elementwise\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Divide elementwise tiles across cores.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{6f052ba}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Qwen3 model optimization\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Add model-specific graph/runtime improvements in the local stack.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{8678414}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+DRAM/broadcast fast paths\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Specialize common broadcast/data-movement forms.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{1d80118}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Deferred finish and batched CQ writes\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Avoid host synchronization after each dispatch and batch command-queue
+writes.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{1875113}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Fused elementwise lowering\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Compile elementwise expression trees as fewer device programs.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{2778027}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Matmul top-1 epilogue\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Perform top-1 selection at the logits matmul producer boundary.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{9fc9a36}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Cached decode attention\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Specialize attention for autoregressive KV-cache reuse.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{29f685a}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Allocator locking split\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Reduce lock scope around runtime readback/allocation work.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{d1b422e}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Reshape optimization\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Turn eligible reshapes into views or cheaper movement.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{65cd673}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Transpose into matmul\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Fold operand transpose into matmul reads.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{f05995a}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Fused SDPA decode\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Replace decomposed attention with a decode SDPA device operation.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{f7ba52b}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Lazy reshape propagation\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Carry views through gather/scatter instead of materializing.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{a23a624}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Fused RMSNorm\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Replace decomposed normalization with a dedicated kernel.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{eee55b7}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Tile-transpose matmul reads\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Improve source tile lookup and NoC reads for transposed operands.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{119aab5}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Fused RoPE\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Collapse rotary embedding's elementwise/reshape graph.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{f2e705f}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+SDPA over interleaved KV cache\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Avoid cache layout conversion before decode attention.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{08423ec}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Parallel BF16 top-1\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Spread logits argmax/top-1 work across cores.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{94734cc}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+TT-MLIR tilize patches\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Reduce layout-conversion overhead after the upstream-stack
+transition.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+\texttt{eb8c90d}\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Cold-compile optimization\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Remove/avoid expensive host/compiler work on the first execution.\strut
+\end{minipage}\tabularnewline
+\bottomrule
+\end{longtable}
+
+Several exploratory branches also record useful negative or orthogonal
+work: residual-as-bias experiments, slice-free SwiGLU, sampling fusion,
+logits untilize/top-1 fusion, DRAM-sharded matmul, and BFP4 MLP weights.
+Only changes that survive in the V0--V8 ancestry are assigned numbers in
+the primary table. This prevents an abandoned prototype, a sampling
+optimization, or a changed precision mode from being represented as part
+of the final model-path speedup.
+
+\hypertarget{limitations-and-follow-up-work}{%
+\chapter{Limitations and follow-up
+work}\label{limitations-and-follow-up-work}}
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{One model and shape.} Results apply to Qwen3-8B, serial
+  batch-one-style generation, a 32-token prompt, and 128 generated
+  tokens. Larger batch, longer context, or multi-user continuous
+  batching can move the bottleneck.
+\item
+  \textbf{End-to-end metric.} The primary metric contains short prefill
+  and server overhead. The streaming cross-check isolates final decode,
+  but only on V8.
+\item
+  \textbf{Sequential ordering.} Revisions were not randomized or
+  interleaved. Thermal state and background load can create drift. A
+  publication-grade follow-up would use randomized blocks with repeated
+  server restarts.
+\item
+  \textbf{Autocorrelation.} Welch/t intervals treat requests as
+  independent. A blocked bootstrap over time or
+  heteroskedasticity/autocorrelation-consistent model would be more
+  conservative if long runs show serial correlation.
+\item
+  \textbf{One accelerator.} The specialized epilogue assumes Blackhole's
+  available grid and the Qwen3-8B tile geometry. Wormhole, multi-chip,
+  or another MLP width requires its own program configuration.
+\item
+  \textbf{Quality is not measured.} Token determinism is checked within
+  variants, but cross-variant hashes differ. Perplexity and downstream
+  evaluations are necessary before changing precision or reduction order
+  in production.
+\item
+  \textbf{The V1 bundle is not decomposed.} Its +22.58\% cannot be
+  divided among RMSNorm, RoPE, KV dtype, SDPA layout, and BF8-enabling
+  changes without constructing additional cherry-picked revisions.
+\end{enumerate}
+
+The most promising next optimization is to keep more of the MLP pipeline
+on chip: consume the SwiGLU output directly in a compatible
+down-projection path, or retain a sharded layout between them. That
+requires coordinating output shards and down-projection weight
+distribution; simply attaching more unary work to BinaryNg is unlikely
+to reproduce V7's producer-side benefit.
+
+\hypertarget{reproduction-and-report-generation}{%
+\chapter{Reproduction and report
+generation}\label{reproduction-and-report-generation}}
+
+The report bundle contains:
+
+\begin{itemize}
+\tightlist
+\item
+  \texttt{report.md}: this source document;
+\item
+  \texttt{data/samples.csv}: all 288 retained per-request observations;
+\item
+  \texttt{data/summary.csv}: descriptive statistics, speedups, raw Welch
+  p-values, Holm-adjusted p-values, and output hashes;
+\item
+  \texttt{analyze.py}: the exact analysis and SVG generation code;
+\item
+  \texttt{figures/*.svg}: resolution-independent figures;
+\item
+  \texttt{style.css} and \texttt{Makefile}: HTML, LaTeX, and PDF build
+  paths.
+\end{itemize}
+
+To recompute statistics from the raw \texttt{/tmp} JSON directories used
+on the benchmark host:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\ExtensionTok{/home/pcmoritz/sglang{-}jax/.venv/bin/python} \KeywordTok{\textbackslash{}}
+  \ExtensionTok{docs/libtt{-}optimization{-}report/analyze.py}
+\end{Highlighting}
+\end{Shaded}
+
+To build a self-contained HTML report:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\FunctionTok{make}\NormalTok{ {-}C docs/libtt{-}optimization{-}report html}
+\end{Highlighting}
+\end{Shaded}
+
+For a typeset PDF, install a XeLaTeX distribution and
+\texttt{rsvg-convert} (commonly packaged as \texttt{librsvg2-bin}), then
+run:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\FunctionTok{make}\NormalTok{ {-}C docs/libtt{-}optimization{-}report pdf}
+\end{Highlighting}
+\end{Shaded}
+
+The \texttt{pdf-html} target is an alternative for environments with
+WeasyPrint. SVG figures, vector text, booktabs-style tables, controlled
+page geometry, microtypography, numbered headings, and a generated table
+of contents are preserved by the PDF route.
+
+\hypertarget{conclusion}{%
+\chapter{Conclusion}\label{conclusion}}
+
+The current libtt optimization line improves the documented Qwen3-8B
+serving workload by \textbf{45.70\%}, from 16.265 to 23.698 tokens/s.
+The data favor three principles:
+
+\begin{itemize}
+\tightlist
+\item
+  recognize framework-generated algebra before lowering;
+\item
+  choose layouts that expose decode's width parallelism; and
+\item
+  place fusion at the producer epilogue so intermediate values never
+  cross an avoidable memory boundary.
+\end{itemize}
+
+The final matmul-SwiGLU implementation is faster because it follows the
+third principle literally: gate and up values remain in Dst until
+\texttt{silu(gate)\ *\ up} is complete. The fallback-free simplification
+retains that performance. Just as importantly, the report preserves the
+regressions and neutral results, which prevents operation-count
+reduction from being mistaken for device-level speedup.
+
+\end{document}
