@@ -39,10 +39,10 @@
 \IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
 \IfFileExists{bookmark.sty}{\usepackage{bookmark}}{\usepackage{hyperref}}
 \hypersetup{
-  pdftitle={libtt: A Self-Contained JAX Runtime for Tenstorrent Accelerators},
+  pdftitle={libtt: An Open-Source TPU-Style XLA Stack for Tenstorrent Accelerators},
   pdfauthor={libtt Project},
   pdflang={en-US},
-  pdfkeywords={libtt, Tenstorrent, PJRT, TT-MLIR, TT-Metalium, Blackhole, Qwen3, LLM
+  pdfkeywords={libtt, Tenstorrent, XLA, PJRT, TT-MLIR, TT-Metalium, Blackhole, Qwen3, PyTorch, TorchTPU, LLM
 inference, compiler optimization, kernel fusion},
   hidelinks,
   pdfcreator={LaTeX via pandoc}}
@@ -99,7 +99,8 @@ inference, compiler optimization, kernel fusion},
   \usepackage[shorthands=off,main=american]{babel}
 \fi
 
-\title{libtt: A Self-Contained JAX Runtime for Tenstorrent Accelerators}
+\title{libtt: An Open-Source TPU-Style XLA Stack for Tenstorrent
+Accelerators}
 \usepackage{etoolbox}
 \makeatletter
 \providecommand{\subtitle}[1]{% add subtitle to \maketitle
@@ -117,53 +118,64 @@ inference, compiler optimization, kernel fusion},
 \section*{Abstract}\label{abstract}}
 \addcontentsline{toc}{section}{Abstract}
 
-libtt packages a Tenstorrent PJRT backend, compiler, runtime, device
-kernels, and runtime assets in one shared library. It runs upstream
-SGLang-JAX and other JAX software without a separate compiler or
-TT-Metal installation on the target. We describe the StableHLO and
-TT-MLIR compilation path and a sequence of graph, layout, runtime, and
-kernel optimizations for Qwen3-8B inference. The sequence raises
-128-token generation from 16.265 to 26.123 tokens/s. A shape-specific
-down projection reaches 27.753 decode tokens/s. On the same Blackhole
-P150 and workload, this is 11.51\% faster than the measured
-tt-inference-server reference. These results show that a stable
-framework boundary can preserve the upstream JAX stack while
-concentrating performance work in the compiler and lower runtime. The
-architecture is not specific to inference and can support training as
-its operation and collective coverage grows.
+libtt is an open-source, TPU-style XLA software stack for Tenstorrent
+accelerators. It packages a PJRT plugin, compiler, runtime, device
+kernels, and runtime assets in one shared library and accepts programs
+through the StableHLO boundary. We demonstrate the backend with upstream
+SGLang-JAX; the boundary is not tied to JAX and provides a path for
+other XLA frontends, including future PyTorch and TorchTPU integration.
+We describe the TT-MLIR compilation path and a sequence of graph,
+layout, runtime, and kernel optimizations for Qwen3-8B inference. The
+sequence raises 128-token generation from 16.265 to 26.123 tokens/s. A
+shape-specific down projection reaches 27.753 decode tokens/s. On the
+same Blackhole P150 and workload, this is 11.51\% faster than the
+measured tt-inference-server reference. The result shows that a stable
+XLA boundary can preserve upstream framework code while concentrating
+hardware-specific work in the compiler and lower runtime.
 
 \hypertarget{introduction}{%
 \section{Introduction}\label{introduction}}
 
-libtt provides a self-contained JAX runtime for Tenstorrent
-accelerators. Its integration boundary is PJRT {[}3{]} and StableHLO
-{[}4{]}: SGLang-JAX retains its tokenizer, scheduler, model, and paged
-KV cache, while libtt compiles and executes the resulting graphs. This
-arrangement is intended to support SGLang-JAX {[}5{]} and the broader
-JAX/TPU software ecosystem with few changes above the compiler boundary.
+This report asks whether Tenstorrent accelerators can support programs
+from the XLA ecosystem through a standard compiler boundary---without a
+device-specific model or serving-engine fork---while retaining
+hardware-specific performance. libtt's answer is an open-source,
+self-contained XLA stack built around PJRT {[}6{]} and StableHLO
+{[}7{]}. It compiles and executes framework programs while keeping
+Tenstorrent-specific code below that boundary.
 
-The boundary has two practical advantages. First, we can follow upstream
-JAX and SGLang-JAX instead of maintaining a separate Tenstorrent model
-and inference engine. Second, we can obtain performance in TT-MLIR
-{[}18{]}, TTNN {[}21{]}, TT-Metalium {[}16{]}, and device kernels, where
-graph structure, layout, precision, and data movement remain visible.
-The same boundary can carry training graphs in the future; this report
-measures inference only.
+The implementation evaluated here uses JAX. Upstream SGLang-JAX retains
+its tokenizer, scheduler, Qwen model, and paged KV cache {[}9{]}, while
+libtt compiles and executes the exported StableHLO. JAX is the
+demonstrated frontend, not the architectural boundary. Google's
+announced TorchTPU design captures PyTorch graphs with Dynamo,
+translates PyTorch operations to StableHLO, and uses XLA as its primary
+backend compiler {[}2{]}. This gives libtt a path to support PyTorch as
+that interface becomes available. The required adapter and operation
+coverage have not yet been implemented or measured.
 
-We began with a functional but relatively unoptimized backend that ran
-upstream SGLang-JAX at 16.265 tokens/s. We then added semantic recovery,
-layout policy, runtime tracing, and device-kernel specializations below
-PJRT. The established sequence reaches 26.123 tokens/s, a 60.61\%
-increase. A subsequent 110-core down projection reaches 27.753 decode
-tokens/s and exceeds the matched tt-inference-server v0.10.0 decode
-result by 11.51\% {[}15{]}.
+The XLA boundary has two practical advantages. First, framework and
+serving code can remain close to upstream instead of being replaced by a
+Tenstorrent-specific model and inference engine. Second, performance
+work can reside in TT-MLIR {[}23{]}, TTNN {[}26{]}, TT-Metalium
+{[}21{]}, and device kernels, where graph structure, layout, precision,
+and data movement remain visible. The same boundary can carry inference
+or training graphs; this report measures inference only.
 
-The main result is architectural as well as numerical. A compiler
-rewrite, runtime change, and device kernel can be developed and measured
-together in one build without modifying the SGLang scheduler or Qwen
-model {[}26{]}. The following sections describe the system boundary, the
-compiler and runtime representations, the individual optimizations, and
-their measured effects.
+The report makes four contributions. First, it describes a single
+\texttt{libtt.so} artifact containing the Tenstorrent PJRT backend,
+compiler, runtime, kernels, and runtime assets. Second, it demonstrates
+this XLA boundary with upstream SGLang-JAX and identifies the future
+PyTorch/TorchTPU path. Third, it presents compiler and kernel
+optimizations that cross StableHLO, TT-MLIR, TTNN, and TT-Metal without
+modifying the SGLang scheduler or Qwen model {[}31{]}. Finally, it
+measures a 60.61\% improvement from 16.265 to 26.123 tokens/s; a
+subsequent 110-core down projection reaches 27.753 decode tokens/s,
+11.51\% above the matched tt-inference-server v0.10.0 reference
+{[}20{]}.
+
+The following sections describe the system boundary, compiler and
+runtime representations, individual optimizations, and measured effects.
 
 \hypertarget{tenstorrent-hardware-and-software-stack}{%
 \section{Tenstorrent hardware and software
@@ -182,7 +194,7 @@ model}\label{blackhole-and-the-tensix-execution-model}}
 
 The benchmark uses a Blackhole P150. The Blackhole processor exposed by
 current P150 firmware has 120 Tensix cores, 180 MB of SRAM (1.5 MB per
-core), and up to 32 GB of GDDR6 memory {[}8{]}. The host reaches the
+core), and up to 32 GB of GDDR6 memory {[}12{]}. The host reaches the
 card over PCIe. Device DRAM is distinct from host memory, and the SRAM
 local to a Tensix core is explicitly managed working storage rather than
 a hardware cache.
@@ -191,7 +203,7 @@ Tensix cores communicate through a two-dimensional network on chip. A
 typical TT-Metalium program assigns a reader data-movement kernel, a
 compute kernel, and a writer data-movement kernel to each participating
 core. The three kernels exchange tiles through circular buffers in local
-SRAM and can overlap memory traffic with arithmetic {[}16, 17{]}. Matrix
+SRAM and can overlap memory traffic with arithmetic {[}21, 22{]}. Matrix
 and vector results pass through the unpacker, SrcA/SrcB and Dst
 registers, and the packer before returning to L1.
 
@@ -200,6 +212,93 @@ than a token activation, so every layer repeatedly streams weights from
 GDDR6. Core count, NoC multicast, circular-buffer capacity, and the
 number of times an intermediate is packed or written to DRAM directly
 determine token latency.
+
+\hypertarget{why-the-tpu-software-architecture-fits-tenstorrent}{%
+\subsection{Why the TPU software architecture fits
+Tenstorrent}\label{why-the-tpu-software-architecture-fits-tenstorrent}}
+
+The relevant similarity between TPU and Tenstorrent is not
+instruction-set compatibility but their physical data and communication
+contracts. First, matrix-ready formats are tiled in device DRAM, not
+created only as temporary register fragments inside one kernel.
+
+XLA/TPU assigns physical tiled layouts to buffers. Its documented TPU
+formats include a common \texttt{8x128} tile and a BF16
+\texttt{(8,128)(2,1)} format, with padding when logical dimensions do
+not fill a tile {[}8{]}. Tenstorrent uses a 32-by-32 tile for most
+Tensix compute and data movement. Tile-layout tensors are padded and can
+reside in DRAM or L1; the matrix engine operates on 16-by-16 faces
+{[}18, 27{]}. Decode can therefore stream complete tiles from GDDR6 into
+per-core L1 without reconstructing them from a row-major DRAM buffer.
+
+A conventional GPU interface can keep row-major or strided device memory
+across operator boundaries. CUDA's tensor-span model directly represents
+a row-major layout, from which a kernel can load a tiled view {[}5{]}.
+Tensor Cores are still tiled internally and some libraries use packed
+formats; the difference is that tiling need not persist in DRAM between
+operations.
+
+Second, both architectures expose a geometric interconnect. TPU slices
+connect chips through high-speed ICI in two- or three-dimensional
+topologies {[}3{]}. A Tenstorrent processor uses a high-bandwidth
+two-dimensional torus NoC to join Tensix cores, DRAM controllers, and
+I/O nodes; hardware multicast can deliver one transfer directly into the
+L1 of several cores {[}16{]}. The scales differ: ICI is an inter-chip
+fabric, while the NoC discussed here is on-chip and cross-device
+Tenstorrent links form a separate level. In both cases, coordinates and
+routes are visible performance constraints, so placement, sharding,
+multicast, and collective schedules belong in the compiler and runtime
+rather than being hidden behind a uniform memory abstraction.
+
+\begingroup\small
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+\begin{minipage}[b]{0.30\columnwidth}\raggedright
+Execution path\strut
+\end{minipage} & \begin{minipage}[b]{0.30\columnwidth}\raggedright
+Physical device-memory contract\strut
+\end{minipage} & \begin{minipage}[b]{0.30\columnwidth}\raggedright
+Software consequence\strut
+\end{minipage}\tabularnewline
+\midrule
+\endhead
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+XLA on TPU\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Padded TPU tile formats.\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+The compiler owns layout, fusion, and data movement.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+libtt on Tenstorrent\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+The main matrix path uses tiles in DRAM and L1; TT-MLIR and TTNN carry
+layout, memory, and sharding.\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Propagate layouts and avoid retiles between operations.\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+Conventional GPU operator path\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Row-major or strided global-memory tensors can remain between
+operations; kernels tile on load.\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+Tiling can stay inside an operation or generated kernel.\strut
+\end{minipage}\tabularnewline
+\bottomrule
+\end{longtable}
+
+\endgroup
+
+The TPU software architecture---a stable graph boundary followed by
+compiler-owned physical layout, topology-aware communication, and
+execution---is therefore a closer fit for Tenstorrent than an
+operator-at-a-time GPU integration. StableHLO preserves logical tensors
+above libtt; TT-MLIR chooses their tile, padding, memory, and shard
+representation below it. GPUs also benefit from graph compilers; the
+distinction is how persistently physical layout and interconnect
+topology shape the program between operations.
 
 \hypertarget{runtime-and-operator-layers}{%
 \subsection{Runtime and operator
@@ -220,34 +319,34 @@ Responsibility\strut
 TT-UMD\strut
 \end{minipage} & \begin{minipage}[t]{0.47\columnwidth}\raggedright
 Discovers devices and provides the user-mode PCIe, memory, and command
-transport used by higher runtimes {[}24{]}.\strut
+transport used by higher runtimes {[}29{]}.\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.47\columnwidth}\raggedright
 TT-Metalium\strut
 \end{minipage} & \begin{minipage}[t]{0.47\columnwidth}\raggedright
 Allocates device resources, builds command programs, and compiles and
-dispatches reader, compute, and writer kernels {[}16, 17{]}.\strut
+dispatches reader, compute, and writer kernels {[}21, 22{]}.\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.47\columnwidth}\raggedright
 TTNN\strut
 \end{minipage} & \begin{minipage}[t]{0.47\columnwidth}\raggedright
 Provides Python and C++ tensor operations, tensor layouts, memory
 configurations, sharding, program selection, and tracing on top of
-TT-Metalium {[}21{]}.\strut
+TT-Metalium {[}26{]}.\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.47\columnwidth}\raggedright
 TT-Transformers\strut
 \end{minipage} & \begin{minipage}[t]{0.47\columnwidth}\raggedright
 Implements Transformer structure, model configuration, paged attention,
 KV-cache behavior, prefill/decode paths, and device-specific layouts
-with TTNN calls {[}23{]}.\strut
+with TTNN calls {[}28{]}.\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.47\columnwidth}\raggedright
 TT vLLM backend and TTIS\strut
 \end{minipage} & \begin{minipage}[t]{0.47\columnwidth}\raggedright
 Connects model implementations to the serving scheduler, request
 batching, cache allocation, model loading, and OpenAI-compatible service
-{[}11, 15{]}.\strut
+{[}15, 20{]}.\strut
 \end{minipage}\tabularnewline
 \bottomrule
 \end{longtable}
@@ -264,7 +363,7 @@ state, and determines when host and device tensors cross the boundary.
 Tenstorrent uses vLLM for scheduling, continuous batching, paged
 attention, and the OpenAI-compatible server. Its current integration
 guide describes a TT platform backend/plugin and a maintained vLLM fork
-{[}11{]}. The backend supplies platform configuration, model
+{[}15{]}. The backend supplies platform configuration, model
 registration, model loading, worker and device initialization, KV-cache
 management, input preparation, execution, and TT engine behavior. The
 plugin reduces the amount of code that must live directly inside a vLLM
@@ -289,7 +388,7 @@ class. The documented integration contract requires:
   model registration and configuration in the TT vLLM backend; and
 \item
   for new model types or inputs, possible changes to the platform,
-  loader, worker, model runner, or engine {[}11{]}.
+  loader, worker, model runner, or engine {[}15{]}.
 \end{enumerate}
 
 The v0.10.0 artifact measured in this report pinned TT-Metal commit
@@ -298,7 +397,7 @@ release, the TT platform code was carried in the Tenstorrent vLLM path.
 Current upstream code is increasingly packaged as a plugin, but the
 model-facing interface and TT-specific execution logic described above
 remain. We distinguish this packaging change from the v0.10.0
-performance measurement {[}15{]}.
+performance measurement {[}20{]}.
 
 \begin{figure}
 \hypertarget{fig:reference-stack}{%
@@ -318,7 +417,7 @@ model. The Qwen/Llama model source imports both libraries. Host tokens,
 positions, padding, checkpoint values, and some output processing use
 \texttt{torch.Tensor}, while \texttt{ttnn.from\_torch} creates TTNN
 tensors for device execution and \texttt{ttnn.to\_torch} returns
-selected outputs to the host {[}23{]}. The vLLM generator similarly
+selected outputs to the host {[}28{]}. The vLLM generator similarly
 accepts PyTorch token and page-table tensors, allocates the paged KV
 cache as TTNN tensors, and calls model-specific prefill and decode
 methods.
@@ -351,14 +450,15 @@ Serving engine\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 vLLM with a TT platform backend/plugin\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
-Upstream SGLang-JAX remains above PJRT\strut
+The measured SGLang-JAX engine remains above PJRT\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Model\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 TT-Transformers implements a TT-specific Transformer and generator\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
-The upstream JAX Qwen model is traced to StableHLO\strut
+The measured upstream JAX Qwen model is exported through XLA to
+StableHLO\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Framework/device boundary\strut
@@ -366,7 +466,7 @@ Framework/device boundary\strut
 Python generator methods and explicit PyTorch/TTNN tensor
 conversion\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
-PJRT and StableHLO\strut
+XLA's StableHLO and PJRT interfaces\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Paged KV cache\strut
@@ -399,7 +499,7 @@ The direct TTNN approach gives the model author explicit control at
 every layer. libtt instead preserves a stable compiler boundary and
 attempts to recover the same hardware-specific performance below it. The
 comparison in this report tests whether that lower-stack approach can
-remain close to the upstream JAX ecosystem without giving up decode
+keep an XLA frontend close to upstream without giving up decode
 performance.
 
 \hypertarget{system-organization}{%
@@ -409,7 +509,7 @@ performance.
 \hypertarget{fig:stack}{%
 \centering
 \includegraphics[width=1\textwidth,height=\textheight]{figures/stack.svg}
-\caption{libtt serving, compilation, runtime, and device
+\caption{libtt XLA boundary, compilation, runtime, and device
 layers.}\label{fig:stack}
 }
 \end{figure}
@@ -418,13 +518,14 @@ layers.}\label{fig:stack}
 \subsection{Deployment and frontend
 boundary}\label{deployment-and-frontend-boundary}}
 
-PJRT lets frameworks call device-specific plugins through one interface
-{[}3{]}. libtt implements that interface for Tenstorrent:
+PJRT lets XLA frontends call device-specific compiler and runtime
+plugins through one interface {[}6{]}. libtt implements that interface
+for Tenstorrent:
 
 \begin{minipage}{\linewidth}
 
 \begin{verbatim}
-JAX process
+XLA frontend process (JAX in the measured path)
   `-- dynamically loads libtt.so through PJRT
        |-- compiles StableHLO for Tenstorrent
        |-- allocates and transfers device buffers
@@ -442,37 +543,40 @@ applied patch series.
 
 The compiler and TT-Metal runtime do not need to be installed on the
 target. With compatible drivers and firmware, \texttt{libtt.so} contains
-the software needed to compile and run JAX programs. This is the
-intended similarity to \texttt{libtpu.so} {[}7{]}.
+the software needed to compile and run StableHLO programs. This is the
+intended similarity to \texttt{libtpu.so} {[}11{]}.
 
-libtt treats PJRT and StableHLO as the integration boundary. SGLang-JAX
-keeps its model, tokenizer, scheduler, paged KV cache, and inference
-engine. The Tenstorrent-specific work stays below that boundary instead
-of requiring a forked Qwen implementation or a rewritten serving layer.
+libtt treats PJRT and StableHLO as the integration boundary. In the
+measured path, SGLang-JAX keeps its model, tokenizer, scheduler, paged
+KV cache, and inference engine. The Tenstorrent-specific work stays
+below that boundary instead of requiring a forked Qwen implementation or
+a rewritten serving layer. A future PyTorch path can reach the same
+boundary through TorchTPU once the backend interface and required
+operation coverage are available {[}2{]}.
 
 This provides two advantages:
 
 \begin{itemize}
 \tightlist
 \item
-  upstream SGLang-JAX and JAX/TPU code can be reused with small
-  configuration changes; and
+  XLA frontend code can stay upstream, as demonstrated here with
+  SGLang-JAX; and
 \item
   performance can be added in TT-MLIR, TTNN, TT-Metal, and device
   kernels, where layout, fusion, precision, and data movement are
   visible.
 \end{itemize}
 
-We evaluate inference, but PJRT and StableHLO are not
-inference-specific. Training support can use the same architecture by
-adding the required operations, collective behavior, optimizer graphs,
-and numerical validation below the existing JAX frontend.
+We evaluate inference, but PJRT and StableHLO are neither framework- nor
+inference-specific. JAX or PyTorch training support can use the same
+boundary after the required operations, collective behavior, optimizer
+graphs, and numerical validation are available.
 
 \hypertarget{integrated-build}{%
 \subsection{Integrated build}\label{integrated-build}}
 
 libtt uses Bazel modules and repository rules {[}1{]} to pin TT-UMD
-{[}24{]}, SFPI {[}12{]}, TT-Metal, LLVM, StableHLO, TT-XLA {[}25{]},
+{[}29{]}, SFPI {[}17{]}, TT-Metal, LLVM, StableHLO, TT-XLA {[}30{]},
 TT-MLIR, Shardy, and supporting C++ libraries. Bazel overlays add
 targets for projects that use another build system. The \texttt{//:tt}
 target produces \texttt{bazel-bin/libtt.so}.
@@ -493,8 +597,8 @@ This organization has three practical effects:
 \end{itemize}
 
 Tenstorrent's compiler overview describes the same open path from
-framework frontends through TT-MLIR dialects to TT-Metalium {[}14,
-19{]}. libtt builds a pinned part of that path as one artifact.
+framework frontends through TT-MLIR dialects to TT-Metalium {[}19,
+24{]}. libtt builds a pinned part of that path as one artifact.
 
 \hypertarget{cross-layer-optimization}{%
 \subsection{Cross-layer optimization}\label{cross-layer-optimization}}
@@ -525,15 +629,19 @@ The matmul-SwiGLU epilogue crosses six layers:
 These steps form one patch concept even though they touch several
 abstraction levels and two upstream repositories.
 
-\hypertarget{the-framework-boundary-jax-stablehlo-and-pjrt}{%
-\subsection{The framework boundary: JAX, StableHLO, and
-PJRT}\label{the-framework-boundary-jax-stablehlo-and-pjrt}}
+\hypertarget{the-xla-boundary-stablehlo-and-pjrt}{%
+\subsection{The XLA boundary: StableHLO and
+PJRT}\label{the-xla-boundary-stablehlo-and-pjrt}}
 
-Upstream SGLang-JAX owns serving, tokenization, scheduling, the JAX Qwen
-model, and the paged KV cache {[}5{]}. JAX traces each shape-specific
-computation to StableHLO, a portable operation set between frameworks
-and compilers {[}4{]}. PJRT hides the device-specific compiler and
-runtime from JAX {[}3{]}.
+StableHLO is a portable operation set between framework frontends and
+compilers {[}7{]}. PJRT hides the device-specific compiler and runtime
+behind one plugin interface {[}6{]}. These are the libtt boundary; JAX
+is one producer of the input program.
+
+In the path measured here, upstream SGLang-JAX owns serving,
+tokenization, scheduling, the JAX Qwen model, and the paged KV cache
+{[}9{]}. JAX traces each shape-specific computation through XLA and
+exports StableHLO. The steady-state request path is:
 
 The steady-state request path is:
 
@@ -546,12 +654,19 @@ SGLang-JAX → JAX trace → StableHLO → libtt/PJRT
 \texttt{libtt.so} accepts StableHLO and executes a serialized TTNN
 program.
 
+TorchTPU defines a corresponding future PyTorch path: Dynamo captures
+the PyTorch graph, TorchTPU translates its operations to StableHLO, and
+XLA serves as the backend compiler {[}2{]}. Connecting this path to
+libtt will require a compatible backend adapter and sufficient compiler
+and runtime operation coverage. It is an architectural target, not a
+result measured in this report.
+
 \hypertarget{tt-mlir-ir-levels}{%
 \subsection{TT-MLIR IR levels}\label{tt-mlir-ir-levels}}
 
-MLIR supports dialects at different abstraction levels {[}2{]}. TT-MLIR
+MLIR supports dialects at different abstraction levels {[}4{]}. TT-MLIR
 uses them for model semantics, layouts, tiled computation, device
-kernels, and host/device control {[}19{]}. Each optimization should use
+kernels, and host/device control {[}24{]}. Each optimization should use
 the highest level that still has the information it needs.
 
 \begin{longtable}[]{@{}lll@{}}
@@ -581,7 +696,7 @@ Relationship to current libtt optimizations\strut
 StableHLO\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Framework-portable tensor graph with specified operation semantics
-{[}4{]}.\strut
+{[}7{]}.\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Input to TT-XLA/TT-MLIR. Framework algebra such as expanded SiLU is
 visible here and after import, but libtt's patches generally match it in
@@ -592,7 +707,7 @@ TTIR\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Hardware-aware, high-level tensor IR. It preserves named tensor
 operations while permitting fusion and canonicalization before a
-concrete runtime API is chosen {[}19{]}.\strut
+concrete runtime API is chosen {[}24{]}.\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 JAX RMSNorm recognition, expanded-SiLU recovery, shared-LHS matmul
 grouping, role propagation, and part of QKV/RoPE fusion.\strut
@@ -602,7 +717,7 @@ TTNN dialect\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 High-level tensor IR designed to model the TTNN library closely. Its
 types and attributes carry tiled layouts, memory spaces, sharding, and
-device data types {[}19, 20{]}.\strut
+device data types {[}24, 25{]}.\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 QKV composite fusion, \texttt{matmul\_swiglu}, layout selection, cache
 return types, and lowering to the serialized TTNN operation graph.\strut
@@ -621,7 +736,7 @@ D2M dialect\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Generic tensor/memref computation analogous to \texttt{linalg.generic},
 augmented with grids, sharded tensors, circular buffers, and explicit
-data movement {[}19{]}.\strut
+data movement {[}24{]}.\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 An alternative direct-to-metal route. The measured custom SwiGLU and
 down-projection kernels are hand-written TT-Metal/TTNN patches, so they
@@ -632,7 +747,7 @@ TTKernel dialect\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Low-level device-kernel IR exposing circular buffers, tile registers,
 NoC transactions, and synchronization with an intended near one-to-one
-mapping to TT-Metal kernels {[}19{]}.\strut
+mapping to TT-Metal kernels {[}24{]}.\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Relevant to generated direct-to-metal kernels; not the representation of
 the hand-written C++ kernels measured here.\strut
@@ -641,7 +756,7 @@ the hand-written C++ kernels measured here.\strut
 TTMetal dialect\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Host/device interop IR for allocation, transfers, program creation, and
-enqueue operations {[}19{]}.\strut
+enqueue operations {[}24{]}.\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Part of the direct-to-metal compiler route. The measured TTNN route
 instead invokes TT-Metal host APIs from the TTNN runtime.\strut
@@ -684,7 +799,7 @@ compiler still emits a normal RMSNorm.
 kernels}\label{tt-metal-programs-and-tensix-kernels}}
 
 TT-Metalium uses cooperative dataflow rather than a GPU thread hierarchy
-{[}17{]}. A program usually has:
+{[}22{]}. A program usually has:
 
 \begin{itemize}
 \tightlist
@@ -700,12 +815,12 @@ TT-Metalium uses cooperative dataflow rather than a GPU thread hierarchy
 \end{itemize}
 
 Circular buffers are bounded queues shared by the threads of a Tensix
-core {[}9{]}. Reader, compute, and writer kernels can overlap on
+core {[}13{]}. Reader, compute, and writer kernels can overlap on
 different tiles when their buffer and semaphore protocols are correct.
 
 The compute engine exposes SrcA, SrcB, and Dst register sets. Matrix
 results land in Dst; vector operations can transform them; the packer
-writes them to an L1 circular buffer {[}10{]}. With 16-bit Dst storage
+writes them to an L1 circular buffer {[}14{]}. With 16-bit Dst storage
 and double buffering enabled, the active half contains eight 32-by-32
 tiles. That capacity determines the successful SwiGLU geometry: four
 gate and four up tiles fill Dst exactly.
@@ -715,7 +830,7 @@ gate and four up tiles fill Dst exactly.
 weights}\label{tiles-memory-and-low-precision-weights}}
 
 TTNN's standard tile is 32 by 32 elements with four 16-by-16 faces
-{[}13{]}. Final dimensions are padded, so batch-one decode still
+{[}18{]}. Final dimensions are padded, so batch-one decode still
 presents a full tile row. Kernels must account for both the logical and
 padded shapes.
 
@@ -723,10 +838,10 @@ Large weights reside in device DRAM; L1 is smaller, faster, and private
 to each worker. TTNN \texttt{MemoryConfig} values describe interleaved
 or sharded storage and DRAM or L1 placement. TT-MLIR layout attributes
 similarly encode how a logical tensor maps to devices, cores, physical
-shards, memory space, and padding {[}20{]}.
+shards, memory space, and padding {[}25{]}.
 
 We use BF16 activations and outputs with BFLOAT8\_B weights. BFLOAT8\_B
-is block floating point: 16 values share an exponent {[}22{]}. It
+is block floating point: 16 values share an exponent {[}27{]}. It
 reduces the dominant weight traffic in batch-one decode, with a
 precision and packing trade-off. The custom matmuls use BF16 packer-L1
 accumulation: partial sums are packed into an L1 slot and reloaded for
@@ -736,7 +851,7 @@ group.
 \hypertarget{decode-bottlenecks}{%
 \subsection{Decode bottlenecks}\label{decode-bottlenecks}}
 
-Qwen3 is a decoder-only Transformer family {[}26{]}. A simplified layer
+Qwen3 is a decoder-only Transformer family {[}31{]}. A simplified layer
 is:
 
 \[
@@ -749,7 +864,7 @@ h_{next} &= h' + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 \end{aligned}
 \]
 
-RMSNorm and SwiGLU are standard model concepts {[}6, 27{]}. Prefill
+RMSNorm and SwiGLU are standard model concepts {[}10, 32{]}. Prefill
 shares each weight read across many rows. Serial decode applies a
 logical \(1\times K\) by \(K\times N\) projection for every token, so
 weight traffic and intermediate materialization dominate. The main
@@ -1392,7 +1507,7 @@ Benchmark date & 15 July 2026, America/Los\_Angeles\tabularnewline
 \end{longtable}
 
 The P150 exposes 120 Tensix workers in this firmware configuration
-{[}8{]}. The SwiGLU program uses 96; the new down projection uses 110.
+{[}12{]}. The SwiGLU program uses 96; the new down projection uses 110.
 Results are single-device and shape-specific.
 
 \hypertarget{serving-command}{%
@@ -1490,7 +1605,7 @@ sequence}\label{established-concept-sequence}}
 
 V0 is the functional baseline: it runs upstream SGLang-JAX but has few
 model-specific performance optimizations. V1 through V9 add compiler,
-runtime, and kernel changes below the JAX/PJRT boundary. Commit IDs are
+runtime, and kernel changes below the XLA/PJRT boundary. Commit IDs are
 recorded in the CSV files.
 
 \begingroup\small
@@ -1798,18 +1913,19 @@ end-to-end measurement supports the causal attribution.
 reference}\label{upstream-tt-inference-server-reference}}
 
 Tenstorrent's tt-inference-server is an OpenAI-compatible service built
-around vLLM and TT-Transformers {[}15{]}. It enters the stack above TTNN
-rather than through JAX, StableHLO, and TT-MLIR:
+around vLLM and TT-Transformers {[}20{]}. It enters the stack above TTNN
+rather than through the XLA, StableHLO, and TT-MLIR path:
 
 \begin{verbatim}
-libtt:  SGLang-JAX → JAX/StableHLO → PJRT/TT-XLA/TT-MLIR → TTNN → TT-Metal
-TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-Metal
+libtt:  SGLang-JAX → JAX/XLA → StableHLO/PJRT → TT-XLA/TT-MLIR → TTNN → TT-Metal
+TTIS:   OpenAI API → vLLM → TT-Transformers                    → TTNN → TT-Metal
 \end{verbatim}
 
 The two stacks use different porting strategies. TTIS uses TT-specific
 code in the inference engine, transformer implementation, TTNN, and
-TT-Metal. libtt keeps SGLang-JAX and the JAX model largely unchanged,
-then optimizes the compiler, runtime, and kernels below PJRT.
+TT-Metal. libtt keeps the measured SGLang-JAX frontend and JAX model
+largely unchanged, then optimizes the compiler, runtime, and kernels
+below the XLA/PJRT boundary.
 
 Both runs use the same P150, Qwen3-8B model, prompt, 128-token output,
 serial request policy, disabled prefix cache, and persistent loopback
@@ -2017,10 +2133,13 @@ contract.
 \hypertarget{conclusions}{%
 \section{Conclusions}\label{conclusions}}
 
-With \texttt{libtt.so}, we keep the SGLang-JAX and JAX/TPU-facing layers
-close to upstream while packaging the PJRT backend, compiler, runtime,
-kernels, and runtime assets in one artifact. One Bazel graph makes the
-lower stack available for cross-layer optimization.
+With \texttt{libtt.so}, we keep the XLA-facing framework layers close to
+upstream while packaging the PJRT backend, compiler, runtime, kernels,
+and runtime assets in one artifact. The report demonstrates that
+boundary with SGLang-JAX; the same StableHLO interface provides a path
+to PyTorch through TorchTPU once the required adapter and operation
+coverage exist. One Bazel graph makes the lower stack available for
+cross-layer optimization.
 
 We started with a functional backend that runs upstream SGLang-JAX at
 16.265 tokens/s. Compiler, runtime, and kernel changes improve
@@ -2029,10 +2148,10 @@ reaches 27.753 decode tokens/s. Under the matched benchmark conditions,
 libtt is 11.51\% faster than the TTIS decode mean even though TTIS also
 uses TT-specific transformer and inference-engine layers.
 
-We measured inference. The same PJRT/StableHLO architecture can be
-extended to training without replacing the JAX frontend, once the
-required operations, collectives, optimizer graphs, and validation are
-added.
+We measured JAX inference. The PJRT/StableHLO architecture is not tied
+to JAX or inference and can support JAX or PyTorch training once the
+required operations, collectives, optimizer graphs, frontend adapter,
+and validation are added.
 
 \hypertarget{references}{%
 \section*{References}\label{references}}
@@ -2044,6 +2163,13 @@ added.
 \item
   Bazel Project, ``Hermeticity.''
   \url{https://bazel.build/concepts/hermeticity}
+\item
+  Google, ``TorchTPU: Running PyTorch Natively on TPUs at Google
+  Scale,'' Google Developers Blog, 2026.
+  \url{https://developers.googleblog.com/torchtpu-running-pytorch-natively-on-tpus-at-google-scale/}
+\item
+  Google Cloud, ``TPU Architecture.''
+  \url{https://docs.cloud.google.com/tpu/docs/system-architecture-tpu-vm}
 \item
   C. Lattner, M. Amini, U. Bondhugula, A. Cohen, A. Davis, J. Pienaar,
   R. Riddle, T. Shpeisman, N. Vasilache, and O. Zinenko, ``MLIR: Scaling
@@ -2059,11 +2185,17 @@ added.
     \url{https://doi.org/10.1109/CGO51591.2021.9370308}
   \end{enumerate}
 \item
+  NVIDIA, ``CUDA Tile C++ API Reference: General Principles.''
+  \url{https://docs.nvidia.com/cuda/cuda-tile-cpp-api-reference/general_principles.html}
+\item
   OpenXLA Project, ``PJRT---Uniform Device API.''
   \url{https://openxla.org/xla/pjrt}
 \item
   OpenXLA Project, ``StableHLO Specification.''
   \url{https://openxla.org/stablehlo/spec}
+\item
+  OpenXLA Project, ``Tiled Layout.''
+  \url{https://openxla.org/xla/tiled_layout}
 \item
   SGLang Project, ``SGLang-JAX.''
   \url{https://github.com/sgl-project/sglang-jax}
@@ -2086,6 +2218,10 @@ added.
 \item
   Tenstorrent, ``Integrating TT Models into vLLM.''
   \url{https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/LLMs/vLLM_integration.md}
+\item
+  Tenstorrent, ``Multicast for Improved Data Reuse in Multi-Core Matrix
+  Multiplication.''
+  \url{https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/labs/matmul/lab3/lab3.html}
 \item
   Tenstorrent, ``SFPI.'' \url{https://github.com/tenstorrent/sfpi}
 \item

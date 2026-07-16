@@ -12,7 +12,7 @@ $(REPORT).html: $(REPORT).md style.css figures/throughput.svg figures/incrementa
 		--from=markdown+tex_math_dollars \
 		--to=html5 --standalone --number-sections --no-highlight --mathml \
 		--self-contained --css=style.css \
-		--metadata pagetitle="libtt: A Self-Contained JAX Runtime for Tenstorrent Accelerators" \
+		--metadata pagetitle="libtt: An Open-Source TPU-Style XLA Stack for Tenstorrent Accelerators" \
 		-o $@
 	sed -i 's/[[:space:]]\+$$//' $@
 

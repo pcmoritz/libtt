@@ -23,19 +23,30 @@
     .boundary{font-size:15px;font-weight:700;fill:#111111}
   </style>
   <rect width="1120" height="650" fill="#fff"/>
-  <text x="35" y="30" class="title">libtt: one PJRT artifact from framework IR to Tensix execution</text>
+  <text x="35" y="30" class="title">libtt: one XLA/PJRT artifact from StableHLO to Tensix execution</text>
 
-  <text x="35" y="61" class="band">UPSTREAM FRONTEND · OUTSIDE LIBTT · LARGELY UNCHANGED</text>
+  <text x="35" y="61" class="band">XLA FRONTENDS · OUTSIDE LIBTT · LARGELY UNCHANGED</text>
   <rect x="35" y="76" width="225" height="72" class="box" fill="url(#host)"/>
   <text x="147" y="103" text-anchor="middle" class="name">SGLang-JAX</text>
-  <text x="147" y="126" text-anchor="middle" class="body">serving · scheduling · Qwen model · KV cache</text>
+  <text x="147" y="126" text-anchor="middle" class="small">serving · scheduler · model · KV cache</text>
   <rect x="295" y="76" width="205" height="72" class="box" fill="url(#host)"/>
   <text x="397" y="103" text-anchor="middle" class="name">JAX</text>
-  <text x="397" y="126" text-anchor="middle" class="body">shape tracing · StableHLO export</text>
+  <text x="397" y="126" text-anchor="middle" class="body">measured · StableHLO export</text>
   <line x1="260" y1="112" x2="288" y2="112" class="arrow"/>
 
+  <rect x="535" y="76" width="265" height="72" class="box" fill="url(#host)" stroke-dasharray="6 5"/>
+  <text x="667" y="103" text-anchor="middle" class="name">PyTorch / TorchTPU</text>
+  <text x="667" y="126" text-anchor="middle" class="body">future · Dynamo → StableHLO</text>
+
+  <rect x="835" y="76" width="250" height="72" class="box" fill="url(#host)"/>
+  <text x="960" y="103" text-anchor="middle" class="name">Common XLA boundary</text>
+  <text x="960" y="126" text-anchor="middle" class="body">StableHLO program · PJRT plugin</text>
+  <path d="M500 112 L520 112 L520 64 L960 64 L960 69" fill="none" class="arrow"/>
+  <line x1="800" y1="112" x2="828" y2="112" class="branch"/>
+  <line x1="960" y1="148" x2="960" y2="168" class="arrow"/>
+
   <rect x="25" y="175" width="1070" height="316" rx="18" fill="url(#plugin)" stroke="#333333" stroke-width="2"/>
-  <text x="48" y="202" class="boundary">libtt.so · pinned compiler, runtime, kernels, and embedded TT-Metal assets</text>
+  <text x="48" y="202" class="boundary">libtt.so · XLA backend with pinned compiler, runtime, kernels, and TT-Metal assets</text>
 
   <text x="48" y="232" class="band">COMPILE PATH · TT-XLA AND TT-MLIR</text>
   <rect x="48" y="247" width="150" height="82" class="box" fill="#ffffff"/>
