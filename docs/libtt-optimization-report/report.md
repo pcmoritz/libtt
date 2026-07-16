@@ -310,6 +310,11 @@ directory, sets `TT_METAL_RUNTIME_ROOT` before PJRT starts, links the upstream
 plugin, and exports only the PJRT entry points. Most code comes from pinned
 open-source dependencies and the applied patch series.
 
+Today, libtt is a set of patches on pinned versions of TT-XLA, TT-MLIR, and
+TT-Metal/TTNN. The patches cover the build, compiler passes, runtime choices,
+and device kernels. Keeping the patches in one repository makes them easy to
+compare with upstream code and lets one change span all three projects.
+
 The compiler and TT-Metal runtime do not need to be installed on the target.
 With compatible drivers and firmware, `libtt.so` contains the software needed
 to compile and run StableHLO programs. This is the intended similarity to
@@ -321,6 +326,13 @@ inference engine. The Tenstorrent-specific work stays below that boundary
 instead of requiring a forked Qwen implementation or a rewritten serving
 layer. A future PyTorch path can reach the same boundary through TorchTPU once
 the backend interface and required operation coverage are available [2].
+
+The SGLang-JAX prototype uses a small TT integration patch. It adds the TT
+attention backend, device selection, weight annotations and loading, and
+KV-cache support [33]. The scheduler, tokenizer, and Qwen model structure stay
+close to upstream. Most of the JAX software does not change. It only needs a
+small device integration layer, not a new framework, serving engine, or
+Transformer implementation.
 
 This provides two advantages:
 
@@ -336,10 +348,11 @@ numerical validation are available.
 
 ## Integrated build
 
-libtt uses Bazel modules and repository rules [1] to pin TT-UMD [29], SFPI [17],
-TT-Metal, LLVM, StableHLO, TT-XLA [30], TT-MLIR, Shardy, and supporting C++
-libraries. Bazel overlays add targets for projects that use another build
-system. The `//:tt` target produces `bazel-bin/libtt.so`.
+libtt uses one Bazel build for the whole stack. Bazel pins TT-UMD [29], SFPI
+[17], TT-Metal, LLVM, StableHLO, TT-XLA [30], TT-MLIR, Shardy, and supporting
+C++ libraries [1]. It applies the libtt patches and adds build targets where
+needed. The `//:tt` target builds the compiler, runtime, kernels, and runtime
+assets, then links them into `bazel-bin/libtt.so`.
 
 This organization has three practical effects:
 
@@ -1231,3 +1244,5 @@ are added.
 32. B. Zhang and R. Sennrich, “Root Mean Square Layer Normalization,”
     *Advances in Neural Information Processing Systems 32*, 2019.
     <https://proceedings.neurips.cc/paper/2019/hash/1e8a19426224ca89e83cef47f1e7f53b-Abstract.html>
+33. P. Moritz, “Add TT backend for Qwen3 serving,” SGLang-JAX pull request
+    no. 1, 2026. <https://github.com/pcmoritz/sglang-jax/pull/1>

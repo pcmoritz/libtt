@@ -268,8 +268,10 @@ pre { white-space: pre-wrap; }
        |-- loads and executes serialized TTNN programs
        `-- initializes the embedded TT-Metal runtime assets</code></pre>
 <p>libtt’s C++ glue extracts the embedded archive to a fingerprinted temporary directory, sets <code>TT_METAL_RUNTIME_ROOT</code> before PJRT starts, links the upstream plugin, and exports only the PJRT entry points. Most code comes from pinned open-source dependencies and the applied patch series.</p>
+<p>Today, libtt is a set of patches on pinned versions of TT-XLA, TT-MLIR, and TT-Metal/TTNN. The patches cover the build, compiler passes, runtime choices, and device kernels. Keeping the patches in one repository makes them easy to compare with upstream code and lets one change span all three projects.</p>
 <p>The compiler and TT-Metal runtime do not need to be installed on the target. With compatible drivers and firmware, <code>libtt.so</code> contains the software needed to compile and run StableHLO programs. This is the intended similarity to <code>libtpu.so</code> [11].</p>
 <p>libtt treats PJRT and StableHLO as the integration boundary. In the measured path, SGLang-JAX keeps its model, tokenizer, scheduler, paged KV cache, and inference engine. The Tenstorrent-specific work stays below that boundary instead of requiring a forked Qwen implementation or a rewritten serving layer. A future PyTorch path can reach the same boundary through TorchTPU once the backend interface and required operation coverage are available [2].</p>
+<p>The SGLang-JAX prototype uses a small TT integration patch. It adds the TT attention backend, device selection, weight annotations and loading, and KV-cache support [33]. The scheduler, tokenizer, and Qwen model structure stay close to upstream. Most of the JAX software does not change. It only needs a small device integration layer, not a new framework, serving engine, or Transformer implementation.</p>
 <p>This provides two advantages:</p>
 <ul>
 <li>XLA frontend code can stay upstream, as demonstrated here with SGLang-JAX; and</li>
@@ -277,7 +279,7 @@ pre { white-space: pre-wrap; }
 </ul>
 <p>We evaluate inference, but PJRT and StableHLO are neither framework- nor inference-specific. JAX or PyTorch training support can use the same boundary after the required operations, collective behavior, optimizer graphs, and numerical validation are available.</p>
 <h2 data-number="3.2" id="integrated-build"><span class="header-section-number">3.2</span> Integrated build</h2>
-<p>libtt uses Bazel modules and repository rules [1] to pin TT-UMD [29], SFPI [17], TT-Metal, LLVM, StableHLO, TT-XLA [30], TT-MLIR, Shardy, and supporting C++ libraries. Bazel overlays add targets for projects that use another build system. The <code>//:tt</code> target produces <code>bazel-bin/libtt.so</code>.</p>
+<p>libtt uses one Bazel build for the whole stack. Bazel pins TT-UMD [29], SFPI [17], TT-Metal, LLVM, StableHLO, TT-XLA [30], TT-MLIR, Shardy, and supporting C++ libraries [1]. It applies the libtt patches and adds build targets where needed. The <code>//:tt</code> target builds the compiler, runtime, kernels, and runtime assets, then links them into <code>bazel-bin/libtt.so</code>.</p>
 <p>This organization has three practical effects:</p>
 <ul>
 <li>Source revisions, overlays, patches, toolchains, and link rules are inputs to one build.</li>
@@ -1161,6 +1163,7 @@ matmul-SwiGLU epilogue:
 <li>Tenstorrent, “TT-XLA.” <a href="https://github.com/tenstorrent/tt-xla" class="uri">https://github.com/tenstorrent/tt-xla</a></li>
 <li>A. Yang et al., “Qwen3 Technical Report,” arXiv:2505.09388, 2025. <a href="https://arxiv.org/abs/2505.09388" class="uri">https://arxiv.org/abs/2505.09388</a></li>
 <li>B. Zhang and R. Sennrich, “Root Mean Square Layer Normalization,” <em>Advances in Neural Information Processing Systems 32</em>, 2019. <a href="https://proceedings.neurips.cc/paper/2019/hash/1e8a19426224ca89e83cef47f1e7f53b-Abstract.html" class="uri">https://proceedings.neurips.cc/paper/2019/hash/1e8a19426224ca89e83cef47f1e7f53b-Abstract.html</a></li>
+<li>P. Moritz, “Add TT backend for Qwen3 serving,” SGLang-JAX pull request no. 1, 2026. <a href="https://github.com/pcmoritz/sglang-jax/pull/1" class="uri">https://github.com/pcmoritz/sglang-jax/pull/1</a></li>
 </ol>
 </body>
 </html>
