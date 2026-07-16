@@ -61,18 +61,20 @@ while mapping logical tensors onto tiled device memory, topology-aware
 communication, and specialized kernels. It must expose enough of the hardware
 for optimization without requiring each framework, serving engine, or model to
 be ported by hand.
-libtt explores a TPU-style solution for Tenstorrent: an open-source XLA stack
-that accepts StableHLO through PJRT and packages the compiler, runtime, device
-kernels, and runtime assets in one shared library. We demonstrate it with
-upstream SGLang-JAX and Qwen3-8B; the XLA boundary also provides an
-architectural path for future PyTorch and TorchTPU integration. A sequence of
-graph, layout, runtime, and kernel optimizations raises 128-token generation
-from 16.265 to 26.123 tokens/s. A shape-specific down projection reaches 27.753
-decode tokens/s, 11.51% faster than the measured tt-inference-server reference
-on the same Blackhole P150 and workload. The result shows that a stable XLA
-boundary can keep the upper software stack close to upstream while
-concentrating hardware-specific performance work in the compiler and lower
-runtime.
+libtt adopts the TPU software boundary for Tenstorrent. StableHLO and PJRT let
+it reuse software from the JAX ecosystem above the compiler rather than porting
+each framework and model, while MLIR supplies mature infrastructure for
+lowering logical tensors onto tiled memory and topology-aware execution. The
+same XLA boundary provides an architectural path to PyTorch through TorchTPU.
+libtt packages the open-source compiler, runtime, device kernels, and runtime
+assets in one shared library. We demonstrate it with upstream SGLang-JAX and
+Qwen3-8B. A sequence of graph, layout, runtime, and kernel optimizations raises
+128-token generation from 16.265 to 26.123 tokens/s. A shape-specific down
+projection reaches 27.753 decode tokens/s, 11.51% faster than the measured
+tt-inference-server reference on the same Blackhole P150 and workload. The
+result shows that a stable XLA boundary can keep the upper software stack close
+to upstream while concentrating hardware-specific performance work in the
+compiler and lower runtime.
 
 # Introduction
 
@@ -382,8 +384,6 @@ scheduling, the JAX Qwen model, and the paged KV cache [9]. JAX traces each
 shape-specific computation through XLA and exports StableHLO. The steady-state
 request path is:
 
-The steady-state request path is:
-
 ```text
 SGLang-JAX → JAX trace → StableHLO → libtt/PJRT
             → TT-XLA → TT-MLIR → TTNN executable
@@ -394,9 +394,15 @@ SGLang-JAX → JAX trace → StableHLO → libtt/PJRT
 
 TorchTPU defines a corresponding future PyTorch path: Dynamo captures the
 PyTorch graph, TorchTPU translates its operations to StableHLO, and XLA serves
-as the backend compiler [2]. Connecting this path to libtt will require a
-compatible backend adapter and sufficient compiler and runtime operation
-coverage. It is an architectural target, not a result measured in this report.
+as the backend compiler [2]. TorchTPU retains `torch.compile` and Dynamo as the
+PyTorch entry point but deliberately routes static compilation through XLA
+rather than Inductor. The relevant comparison is therefore not XLA versus
+`torch.compile`; it is XLA/MLIR versus Inductor as the accelerator backend.
+TorchTPU's choice is evidence that XLA/MLIR is a mature foundation for tiled,
+topology-aware accelerators, not a general benchmark of compiler quality.
+Connecting this path to libtt will require a compatible backend adapter and
+sufficient compiler and runtime operation coverage. It is an architectural
+target, not a result measured in this report.
 
 ## TT-MLIR IR levels
 
