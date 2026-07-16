@@ -8,7 +8,9 @@ It also analyzes the separately collected upstream tt-inference-server
 baseline and the current SwiGLU-blocking/down-projection experiments.  The
 final optimized configuration is included as the last stage of the cumulative
 sequence using streaming end-to-end throughput; the report identifies the
-clock change at that boundary.
+clock change at that boundary.  A separate 2026-07-16 dataset decomposes the
+foundation bundle with repeated baseline/full windows and leave-one-concept-out
+builds.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ SWIGLU_BLOCK_4_DIR = Path("/tmp/libtt-down-110-final-20260715/disabled")
 DOWN_PROJECTION_110_DIR = Path(
     "/tmp/libtt-down-110-final-fixed-20260715/enabled"
 )
+FOUNDATION_RAW_DIR = Path("/tmp/libtt-foundation-bench-20260716")
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,59 @@ FINAL_VARIANT = Variant(
     "SwiGLU blocking and 110-core down projection",
     "MLP kernels",
     DOWN_PROJECTION_110_DIR,
+)
+
+
+@dataclass(frozen=True)
+class FoundationConfiguration:
+    name: str
+    group: str
+    omitted_concept: str
+
+
+FOUNDATION_CONFIGURATIONS = (
+    FoundationConfiguration(
+        "baseline_compat",
+        "baseline",
+        "all foundation performance concepts",
+    ),
+    FoundationConfiguration(
+        "baseline_b",
+        "baseline",
+        "all foundation performance concepts",
+    ),
+    FoundationConfiguration("full_a", "full foundation", "none"),
+    FoundationConfiguration("full_b", "full foundation", "none"),
+    FoundationConfiguration(
+        "no_rmsnorm",
+        "without RMSNorm recognition",
+        "JAX RMSNorm recognition",
+    ),
+    FoundationConfiguration(
+        "no_silu",
+        "without SiLU call lowering",
+        "SiLU call lowering",
+    ),
+    FoundationConfiguration(
+        "no_rope",
+        "without rank-3 RoPE fusion",
+        "rank-3 decode RoPE fusion",
+    ),
+    FoundationConfiguration(
+        "no_kv_dtype",
+        "without KV-cache result typing",
+        "KV-cache result typing",
+    ),
+    FoundationConfiguration(
+        "no_bf8_activation",
+        "without BF8 activation lowering",
+        "BF8 activation lowering",
+    ),
+    FoundationConfiguration(
+        "no_layout_admission",
+        "without decode layout admission",
+        "decode layout admission",
+    ),
 )
 
 
@@ -943,6 +999,253 @@ def analyze_current_kernel_experiments() -> None:
         writer.writerows(summary_rows)
 
 
+def write_foundation_ablation_svg(summary_rows: list[dict]) -> None:
+    rows = [
+        row
+        for row in summary_rows
+        if row["group"] not in ("baseline", "full foundation")
+    ]
+    width, height = 980, 500
+    left, right, top, bottom = 310, 40, 55, 55
+    plot_w, plot_h = width - left - right, height - top - bottom
+    x_min, x_max = -17.0, 2.0
+    row_h = plot_h / len(rows)
+
+    def x(value: float) -> float:
+        return left + (value - x_min) * plot_w / (x_max - x_min)
+
+    zero = x(0.0)
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1.2}.grid{stroke:#d0d0d0;stroke-width:1}.loss{fill:#444}.gain{fill:#aaa}.label{font-size:14px}.small{font-size:12px;fill:#444}.value{font-size:13px;font-weight:700}.inverse{fill:#fff}.title{font-size:21px;font-weight:700}</style>',
+        '<text x="40" y="31" class="title">Foundation concept leave-one-out results</text>',
+    ]
+    for tick in (-16, -12, -8, -4, 0):
+        xx = x(tick)
+        parts.append(
+            f'<line x1="{xx:.1f}" y1="{top}" x2="{xx:.1f}" '
+            f'y2="{height-bottom}" class="grid"/>'
+        )
+        parts.append(
+            f'<text x="{xx:.1f}" y="{height-bottom+24}" '
+            f'text-anchor="middle" class="label">{tick}%</text>'
+        )
+    parts.append(
+        f'<line x1="{zero:.1f}" y1="{top}" x2="{zero:.1f}" '
+        f'y2="{height-bottom}" class="axis"/>'
+    )
+    for index, row in enumerate(rows):
+        value = float(row["throughput_change_vs_full_pct"])
+        yy = top + index * row_h + row_h * 0.2
+        bar_h = row_h * 0.6
+        value_x = x(value)
+        rect_x = min(zero, value_x)
+        rect_w = max(abs(zero - value_x), 1.0)
+        klass = "loss" if value < 0 else "gain"
+        inverse = value < -10.0
+        anchor = "start" if inverse or value >= 0 else "end"
+        text_x = value_x + 8 if inverse or value >= 0 else value_x - 8
+        value_class = "value inverse" if inverse else "value"
+        parts.extend(
+            [
+                f'<text x="{left-15}" y="{yy+bar_h*0.68:.1f}" '
+                f'text-anchor="end" class="label">{esc(row["omitted_concept"])}</text>',
+                f'<rect x="{rect_x:.1f}" y="{yy:.1f}" width="{rect_w:.1f}" '
+                f'height="{bar_h:.1f}" rx="3" class="{klass}"/>',
+                f'<text x="{text_x:.1f}" y="{yy+bar_h*0.68:.1f}" '
+                f'text-anchor="{anchor}" class="{value_class}">{value:+.2f}%</text>',
+            ]
+        )
+    parts.append(
+        '<text x="310" y="486" class="small">Change in mean throughput when the concept is omitted; 32 retained requests per omission.</text>'
+    )
+    parts.append("</svg>")
+    (FIGURE_DIR / "foundation-ablation.svg").write_text(
+        "\n".join(parts) + "\n"
+    )
+
+
+def analyze_foundation_ablation() -> None:
+    values_by_group: dict[str, list[float]] = {}
+    hashes_by_group: dict[str, set[str]] = {}
+    sample_rows: list[dict] = []
+
+    for config in FOUNDATION_CONFIGURATIONS:
+        paths = sorted((FOUNDATION_RAW_DIR / config.name).glob("run_*.json"))
+        if len(paths) != N_WARMUP + N_SAMPLES:
+            raise RuntimeError(
+                f"foundation {config.name}: expected {N_WARMUP + N_SAMPLES} "
+                f"files, found {len(paths)}"
+            )
+        retained = paths[N_WARMUP:]
+        config_hashes: set[str] = set()
+        values_by_group.setdefault(config.group, [])
+        hashes_by_group.setdefault(config.group, set())
+        for sample_index, path in enumerate(retained, 1):
+            payload = json.loads(path.read_text())
+            meta = payload["meta_info"]
+            if (
+                meta["completion_tokens"] != TOKENS
+                or len(payload["output_ids"]) != TOKENS
+            ):
+                raise RuntimeError(f"{path}: incomplete foundation response")
+            latency = float(meta["e2e_latency"])
+            throughput = TOKENS / latency
+            output_hash = token_hash(payload["output_ids"])
+            config_hashes.add(output_hash)
+            values_by_group[config.group].append(throughput)
+            hashes_by_group[config.group].add(output_hash)
+            sample_rows.append(
+                {
+                    "configuration": config.name,
+                    "group": config.group,
+                    "omitted_concept": config.omitted_concept,
+                    "sample": sample_index,
+                    "source_file": path.name,
+                    "e2e_latency_s": f"{latency:.9f}",
+                    "throughput_tokens_s": f"{throughput:.9f}",
+                    "completion_tokens": meta["completion_tokens"],
+                    "output_sha256_12": output_hash,
+                }
+            )
+        if len(config_hashes) != 1:
+            raise RuntimeError(
+                f"foundation {config.name}: non-deterministic output "
+                f"{config_hashes}"
+            )
+
+    full_values = values_by_group["full foundation"]
+    baseline_values = values_by_group["baseline"]
+    full_mean = statistics.mean(full_values)
+    baseline_mean = statistics.mean(baseline_values)
+    group_order = list(dict.fromkeys(c.group for c in FOUNDATION_CONFIGURATIONS))
+    omitted_by_group = {
+        config.group: config.omitted_concept
+        for config in FOUNDATION_CONFIGURATIONS
+    }
+    summary_rows: list[dict] = []
+    for group in group_order:
+        values = values_by_group[group]
+        mean = statistics.mean(values)
+        ci_low, ci_high = stats.t.interval(
+            0.95,
+            len(values) - 1,
+            loc=mean,
+            scale=stats.sem(values),
+        )
+        hashes = hashes_by_group[group]
+        summary_rows.append(
+            {
+                "group": group,
+                "omitted_concept": omitted_by_group[group],
+                "n": len(values),
+                "mean_tps": mean,
+                "stddev_tps": statistics.stdev(values),
+                "median_tps": statistics.median(values),
+                "min_tps": min(values),
+                "max_tps": max(values),
+                "ci_low_tps": ci_low,
+                "ci_high_tps": ci_high,
+                "throughput_change_vs_full_pct": 100.0
+                * (mean / full_mean - 1.0),
+                "marginal_tps_loss_vs_full": full_mean - mean,
+                "marginal_loss_share_of_total_gain_pct": 100.0
+                * (full_mean - mean)
+                / (full_mean - baseline_mean),
+                "full_speedup_over_configuration_pct": 100.0
+                * (full_mean / mean - 1.0),
+                "speedup_vs_baseline_pct": 100.0
+                * (mean / baseline_mean - 1.0),
+                "output_sha256_12": ";".join(sorted(hashes)),
+            }
+        )
+
+    with (DATA_DIR / "foundation-ablation-samples.csv").open(
+        "w", newline=""
+    ) as f:
+        writer = csv.DictWriter(
+            f, fieldnames=list(sample_rows[0]), lineterminator="\n"
+        )
+        writer.writeheader()
+        writer.writerows(sample_rows)
+    with (DATA_DIR / "foundation-ablation-summary.csv").open(
+        "w", newline=""
+    ) as f:
+        writer = csv.DictWriter(
+            f, fieldnames=list(summary_rows[0]), lineterminator="\n"
+        )
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    manifest = {
+        "schema_version": 1,
+        "benchmark_date": "2026-07-16",
+        "hardware": "Tenstorrent Blackhole P150",
+        "firmware_observed_at_startup": "19.6.0",
+        "libtt_foundation_commit": "9978a9b2017de067d0892f67811e5bb7ffc3cc7e",
+        "functional_baseline_commit": "7482967",
+        "baseline_compatibility_note": (
+            "The baseline keeps the build-only NoC public-UMD include patch "
+            "from 9978a9b; all six performance concepts are removed."
+        ),
+        "sglang_jax": {
+            "path": "/home/pcmoritz/sglang-jax",
+            "commit": "24eb823ed97e58ef83ab04b33cab8283ed003acb",
+            "dirty_files_preserved": [
+                "python/sgl_jax/srt/managers/tp_worker.py",
+                "python/sgl_jax/srt/model_executor/model_runner.py",
+                "python/sgl_jax/srt/layers/attention/tt_sdpa.py.bak",
+                "python/sgl_jax/srt/utils/jax_utils.py.ttxla.bak",
+                "python/sgl_jax/srt/utils/mesh_utils.py.ttxla.bak",
+                "python/sgl_jax/srt/utils/weight_utils.py.ttxla.bak",
+                "python/uv.lock",
+                "tt-deps",
+                "tt-metal-deps/",
+            ],
+        },
+        "request": {
+            "text": "The capital of France is",
+            "temperature": 0,
+            "max_new_tokens": TOKENS,
+        },
+        "sampling": {
+            "warmups_per_configuration": N_WARMUP,
+            "retained_per_configuration": N_SAMPLES,
+            "retained_full_total": len(full_values),
+            "retained_baseline_total": len(baseline_values),
+            "trace_decode_only": True,
+            "timing": "SGLang server-reported end-to-end latency",
+        },
+        "concepts": {
+            "JAX RMSNorm recognition": [
+                "tt_mlir_fuse_jax_rms_norm.patch"
+            ],
+            "SiLU call lowering": ["tt_mlir_lower_silu_call.patch"],
+            "rank-3 decode RoPE fusion": [
+                "tt_mlir_fuse_rank3_rope_decode.patch"
+            ],
+            "KV-cache result typing": [
+                "tt_mlir_kv_cache_dtype_return_types.patch"
+            ],
+            "BF8 activation lowering": [
+                "tt_xla_enable_bf8_activation_dtype_lowering.patch",
+                "tt_mlir_single_chip_activation_dtype_lowering.patch",
+            ],
+            "decode layout admission": [
+                "sdpa_decode_allow_l1_interleaved_q.patch",
+                "layernorm_allow_single_core_height_sharded.patch",
+            ],
+        },
+        "build_only_patch": "noc_debugging_use_public_umd_include.patch",
+        "raw_directory": str(FOUNDATION_RAW_DIR),
+    }
+    (DATA_DIR / "foundation-ablation-manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n"
+    )
+    write_foundation_ablation_svg(summary_rows)
+
+
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FIGURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1041,6 +1344,7 @@ def main() -> None:
     write_upstream_comparison_svg(upstream)
     analyze_latest_main_streaming()
     analyze_current_kernel_experiments()
+    analyze_foundation_ablation()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "benchmark_date": "2026-07-16",
+  "hardware": "Tenstorrent Blackhole P150",
+  "firmware_observed_at_startup": "19.6.0",
+  "libtt_foundation_commit": "9978a9b2017de067d0892f67811e5bb7ffc3cc7e",
+  "functional_baseline_commit": "7482967",
+  "baseline_compatibility_note": "The baseline keeps the build-only NoC public-UMD include patch from 9978a9b; all six performance concepts are removed.",
+  "sglang_jax": {
+    "path": "/home/pcmoritz/sglang-jax",
+    "commit": "24eb823ed97e58ef83ab04b33cab8283ed003acb",
+    "dirty_files_preserved": [
+      "python/sgl_jax/srt/managers/tp_worker.py",
+      "python/sgl_jax/srt/model_executor/model_runner.py",
+      "python/sgl_jax/srt/layers/attention/tt_sdpa.py.bak",
+      "python/sgl_jax/srt/utils/jax_utils.py.ttxla.bak",
+      "python/sgl_jax/srt/utils/mesh_utils.py.ttxla.bak",
+      "python/sgl_jax/srt/utils/weight_utils.py.ttxla.bak",
+      "python/uv.lock",
+      "tt-deps",
+      "tt-metal-deps/"
+    ]
+  },
+  "request": {
+    "text": "The capital of France is",
+    "temperature": 0,
+    "max_new_tokens": 128
+  },
+  "sampling": {
+    "warmups_per_configuration": 2,
+    "retained_per_configuration": 32,
+    "retained_full_total": 64,
+    "retained_baseline_total": 64,
+    "trace_decode_only": true,
+    "timing": "SGLang server-reported end-to-end latency"
+  },
+  "concepts": {
+    "JAX RMSNorm recognition": [
+      "tt_mlir_fuse_jax_rms_norm.patch"
+    ],
+    "SiLU call lowering": [
+      "tt_mlir_lower_silu_call.patch"
+    ],
+    "rank-3 decode RoPE fusion": [
+      "tt_mlir_fuse_rank3_rope_decode.patch"
+    ],
+    "KV-cache result typing": [
+      "tt_mlir_kv_cache_dtype_return_types.patch"
+    ],
+    "BF8 activation lowering": [
+      "tt_xla_enable_bf8_activation_dtype_lowering.patch",
+      "tt_mlir_single_chip_activation_dtype_lowering.patch"
+    ],
+    "decode layout admission": [
+      "sdpa_decode_allow_l1_interleaved_q.patch",
+      "layernorm_allow_single_core_height_sharded.patch"
+    ]
+  },
+  "build_only_patch": "noc_debugging_use_public_umd_include.patch",
+  "raw_directory": "/tmp/libtt-foundation-bench-20260716"
+}

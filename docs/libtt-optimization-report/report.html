@@ -410,69 +410,74 @@ h_{next} &amp;= h&#39; + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 <tr class="odd">
 <td style="text-align: left;">Recover JAX RMSNorm</td>
 <td style="text-align: left;">TTIR graph rewrite</td>
-<td style="text-align: right;">Included in +22.58% foundation bundle</td>
+<td style="text-align: right;">+19.28% marginal foundation effect</td>
 </tr>
 <tr class="even">
+<td style="text-align: left;">Lower SiLU calls</td>
+<td style="text-align: left;">StableHLO-to-TTIR rewrite</td>
+<td style="text-align: right;">No positive decode effect detected</td>
+</tr>
+<tr class="odd">
 <td style="text-align: left;">Recognize expanded SiLU</td>
 <td style="text-align: left;">TTIR graph rewrite</td>
 <td style="text-align: right;">+3.30%</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;">Fuse rank-3 decode RoPE</td>
 <td style="text-align: left;">TTIR/TTNN composite resolution</td>
-<td style="text-align: right;">Included in foundation bundle</td>
+<td style="text-align: right;">+2.89% marginal foundation effect</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;">Fuse Qwen decode QKV structure</td>
 <td style="text-align: left;">TTIR ordering + TTNN fusion</td>
 <td style="text-align: right;">+1.15%</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;">Preserve KV-cache result types</td>
 <td style="text-align: left;">TTNN type inference</td>
-<td style="text-align: right;">Included in foundation bundle</td>
-</tr>
-<tr class="even">
-<td style="text-align: left;">Enable BF8 activation/weight path</td>
-<td style="text-align: left;">Compile options, TTNN lowering, host packing</td>
-<td style="text-align: right;">Foundation/baseline; not isolated</td>
+<td style="text-align: right;">+0.54% marginal; near measured drift</td>
 </tr>
 <tr class="odd">
-<td style="text-align: left;">Permit decode layouts</td>
-<td style="text-align: left;">TTNN/TT-Metal validation</td>
-<td style="text-align: right;">Included in foundation bundle</td>
+<td style="text-align: left;">Enable BF8 activation lowering</td>
+<td style="text-align: left;">Compile options and TTNN lowering</td>
+<td style="text-align: right;">+0.26% marginal; near measured drift</td>
 </tr>
 <tr class="even">
+<td style="text-align: left;">Permit decode layouts</td>
+<td style="text-align: left;">TTNN/TT-Metal validation</td>
+<td style="text-align: right;">No positive decode effect detected</td>
+</tr>
+<tr class="odd">
 <td style="text-align: left;">Width-shard decode RMSNorm</td>
 <td style="text-align: left;">TTNN runtime policy</td>
 <td style="text-align: right;">+13.61%</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;">Combine two shared-LHS matmuls</td>
 <td style="text-align: left;">TTIR fusion</td>
 <td style="text-align: right;">-1.69%; enables epilogue</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;">True matmul-SwiGLU epilogue</td>
 <td style="text-align: left;">TTNN IR/FlatBuffer/runtime + TT-Metal</td>
 <td style="text-align: right;">+2.73%</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;">Generalize and remove fallback</td>
 <td style="text-align: left;">TTNN matching/runtime simplification</td>
 <td style="text-align: right;">-0.19%</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;">Sweep SwiGLU K blocking</td>
 <td style="text-align: left;">TT-Metal program and CB geometry</td>
 <td style="text-align: right;">+0.27%</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;">Specialize down projection</td>
 <td style="text-align: left;">TTNN program selection + TT-Metal</td>
 <td style="text-align: right;">+5.96% pure decode</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;">Trace one-tile prefill</td>
 <td style="text-align: left;">TTNN/TT-Metal runtime trace</td>
 <td style="text-align: right;">-90.44% TTFT; +10.23% E2E</td>
@@ -481,6 +486,7 @@ h_{next} &amp;= h&#39; + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 </table>
 <p>Patch index:</p>
 <pre class="text"><code>RMSNorm graph       tt_mlir_fuse_jax_rms_norm.patch
+SiLU call           tt_mlir_lower_silu_call.patch
 expanded SiLU       tt_mlir_fuse_expanded_silu.patch
 decode RoPE         tt_mlir_fuse_rank3_rope_decode.patch
 QKV structure       tt_mlir_qwen_decode_qkv_projection_fusion.patch
@@ -494,35 +500,37 @@ shared-LHS pair     tt_mlir_fuse_shared_lhs_matmul_pairs.patch
 SwiGLU vertical     tt_mlir_fuse_matmul_swiglu.patch
                     matmul_swiglu_epilogue.patch
 down projection     down_projection_110_core.patch</code></pre>
-<p>The +22.58% foundation figure combines patches that were not measured separately. The blocking and down-projection tests use a direct streaming clock. Their final configuration forms the last stage of the cumulative sequence using streaming end-to-end throughput; the same-build A/B tests below isolate the effects of the two kernel changes.</p>
+<p>The original foundation measurement combined these patches into one +22.58% stage. A new leave-one-concept-out experiment below separates their marginal effects and measures a fresh total gain of +24.03%. The effects overlap and do not add to the total. The blocking and down-projection tests use a direct streaming clock. Their final configuration forms the last stage of the cumulative sequence using streaming end-to-end throughput; the same-build A/B tests below isolate the effects of the two kernel changes.</p>
 <p>The first group recovers model semantics in TTIR and TTNN before lowerings discard the algebra and graph roles needed to recognize them.</p>
 <h2 data-number="4.1" id="rmsnorm-recognition"><span class="header-section-number">4.1</span> RMSNorm recognition</h2>
-<p>JAX can lower RMSNorm to square, reduce, epsilon addition, reciprocal square root, scaling, and reshapes. A TTIR pattern proves this structure and replaces it with one RMSNorm operation while the algebra and use-def graph are still available. TTNN can then apply its normalization and layout logic. Recognition is part of the foundation bundle and enables the later runtime-sharding patch.</p>
-<h2 data-number="4.2" id="expanded-silu-recognition"><span class="header-section-number">4.2</span> Expanded-SiLU recognition</h2>
+<p>JAX can lower RMSNorm to square, reduce, epsilon addition, reciprocal square root, scaling, and reshapes. A TTIR pattern proves this structure and replaces it with one RMSNorm operation while the algebra and use-def graph are still available. TTNN can then apply its normalization and layout logic. Removing this patch from the otherwise complete foundation lowers throughput from 19.894 to 16.678 tokens/s. Restoring it gives a +19.28% marginal speedup. It also enables the later runtime-sharding patch.</p>
+<h2 data-number="4.2" id="silu-call-lowering"><span class="header-section-number">4.2</span> SiLU call lowering</h2>
+<p>Some JAX graphs contain a function call named <code>silu</code>. The foundation patch replaces that call with a TTIR SiLU operation during StableHLO legalization. Removing the patch changes throughput by +0.45%, so this exact graph does not show a positive decode effect. The patch remains useful for graph coverage.</p>
+<h2 data-number="4.3" id="expanded-silu-recognition"><span class="header-section-number">4.3</span> Expanded-SiLU recognition</h2>
 <p>The graph represents</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>SiLU</mo><mo stretchy="false" form="prefix">(</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mi>x</mi><mspace width="0.167em"></mspace><mi>σ</mi><mo stretchy="false" form="prefix">(</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mfrac><mi>x</mi><mrow><mn>1</mn><mo>+</mo><mo>exp</mo><mo stretchy="false" form="prefix">(</mo><mo>−</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo></mrow></mfrac></mrow><annotation encoding="application/x-tex">
 \operatorname{SiLU}(x)=x\,\sigma(x)=\frac{x}{1+\exp(-x)}
 </annotation></semantics></math></p>
-<p>with casts, broadcasts, reshapes, and a splatted scalar one. <code>tt_mlir_fuse_expanded_silu.patch</code> looks through view-like operations, verifies the constant and shared input, and replaces the tree with SiLU. The isolated gain is +3.30%.</p>
-<h2 data-number="4.3" id="rank-3-rope-and-qkv-projection-structure"><span class="header-section-number">4.3</span> Rank-3 RoPE and QKV projection structure</h2>
+<p>with casts, broadcasts, reshapes, and a splatted scalar one. This is separate from the foundation call-lowering patch. The later <code>tt_mlir_fuse_expanded_silu.patch</code> looks through view-like operations, verifies the constant and shared input, and replaces the tree with SiLU. The isolated gain is +3.30%.</p>
+<h2 data-number="4.4" id="rank-3-rope-and-qkv-projection-structure"><span class="header-section-number">4.4</span> Rank-3 RoPE and QKV projection structure</h2>
 <p>Qwen projects Q, K, and V together, applies per-head RMSNorm to Q and K, reshapes them by head count, and applies rotary position embedding. Two patches recover this structure:</p>
 <ul>
 <li><code>tt_mlir_fuse_rank3_rope_decode.patch</code> accepts JAX’s rank-3 decode form, temporarily maps it to the existing rank-4 composite, and restores the expected result shape.</li>
 <li><code>tt_mlir_qwen_decode_qkv_projection_fusion.patch</code> orders projection roles, validates contiguous Q/K/V bounds, head counts, and head dimensions, and replaces materialized slices/reshapes with <code>nlp_create_qkv_heads_decode</code>. Q and K RMSNorm are recreated on the fused rank-4 results.</li>
 </ul>
-<p>TTIR supplies candidate ordering and role information; TTNN owns the composite operation and runtime contract. QKV fusion adds +1.15%. Rank-3 RoPE is part of the foundation bundle.</p>
-<h2 data-number="4.4" id="kv-cache-dtype-and-role-propagation"><span class="header-section-number">4.4</span> KV-cache dtype and role propagation</h2>
-<p>KV-cache update operations are stateful boundaries. Their return types must carry the selected device dtype, and graph-role metadata must survive unary operations so later fusions can still identify query, key, and value paths. The TT-MLIR and TT-XLA patches keep the low-precision fused graph typed and recognizable. They are enabling changes rather than isolated speedups.</p>
+<p>TTIR supplies candidate ordering and role information; TTNN owns the composite operation and runtime contract. QKV fusion adds +1.15%. Removing rank-3 RoPE fusion from the foundation lowers throughput by 2.81%; restoring it gives a +2.89% marginal speedup.</p>
+<h2 data-number="4.5" id="kv-cache-dtype-and-role-propagation"><span class="header-section-number">4.5</span> KV-cache dtype and role propagation</h2>
+<p>KV-cache update operations are stateful boundaries. Their return types must carry the selected device dtype, and graph-role metadata must survive unary operations so later fusions can still identify query, key, and value paths. The TT-MLIR and TT-XLA patches keep the low-precision fused graph typed and recognizable. Removing KV-cache return-type preservation lowers throughput by 0.54%; restoring it gives a +0.54% marginal speedup.</p>
 <p>The next group selects precision and layout after the graph operations have been recovered.</p>
-<h2 data-number="4.5" id="bf8-lowering-and-fast-host-packing"><span class="header-section-number">4.5</span> BF8 lowering and fast host packing</h2>
+<h2 data-number="4.6" id="bf8-lowering-and-fast-host-packing"><span class="header-section-number">4.6</span> BF8 lowering and fast host packing</h2>
 <p>We request <code>bfp_bf8</code> for eligible weights. TT-XLA enables single-chip lowering, TT-MLIR assigns the device dtype, and TTNN/TT-Metal consume BFLOAT8_B tiles. <code>fast_bfloat16_bfp8_pack.patch</code> speeds conversion of BF16 host weights to 32-by-32 BFP8 tiles.</p>
 <p>These changes attack two different phases:</p>
 <ul>
 <li>BF8 storage reduces steady-state device weight traffic during decode.</li>
 <li>faster packing reduces model-load and preparation cost on the host.</li>
 </ul>
-<p>We did not isolate these effects from the foundation bundle.</p>
-<h2 data-number="4.6" id="width-sharded-decode-rmsnorm"><span class="header-section-number">4.6</span> Width-sharded decode RMSNorm</h2>
+<p>BF8 weights and fast host packing already existed in the functional baseline. The foundation adds single-chip activation lowering through one TT-XLA patch and one TT-MLIR patch. Removing those two patches together lowers throughput by 0.25%; restoring them gives a +0.26% marginal speedup.</p>
+<h2 data-number="4.7" id="width-sharded-decode-rmsnorm"><span class="header-section-number">4.7</span> Width-sharded decode RMSNorm</h2>
 <p>The default logical height of RMSNorm during batch-one decode is one. A generic height-parallel program cannot occupy many cores. At run time, we recognize a device-resident, tiled, unsharded input with sequence length one and width at least 2048. When the width divides into 16 tile-aligned shards, it:</p>
 <ol type="1">
 <li>creates an 8-by-2 row-major core grid;</li>
@@ -532,15 +540,15 @@ down projection     down_projection_110_core.patch</code></pre>
 <li>restores the requested output memory configuration.</li>
 </ol>
 <p>The two conversions cost less than the width-parallel reduction saves. The isolated gain is +13.61%. This is runtime policy, not a new IR operation: the compiler identifies RMSNorm, while the runtime knows the tensor and device geometry.</p>
-<h2 data-number="4.7" id="decode-specific-validation-changes"><span class="header-section-number">4.7</span> Decode-specific validation changes</h2>
+<h2 data-number="4.8" id="decode-specific-validation-changes"><span class="header-section-number">4.8</span> Decode-specific validation changes</h2>
 <p>Two small TT-Metal patches admit layouts selected by the optimized graph:</p>
 <ul>
 <li>SDPA decode accepts an L1-interleaved query rather than requiring the prior sharded form.</li>
 <li>layernorm accepts the single-core height-sharded case produced on the decode path.</li>
 </ul>
-<p>These narrow changes remove conversions while keeping shape and layout checks. Their performance effect is part of the foundation bundle.</p>
+<p>These narrow changes keep shape and layout checks while admitting layouts used by other optimized paths. Removing both changes throughput by +0.66% in this experiment, so no positive decode effect is detected for the measured graph. Their role is compatibility rather than the source of the foundation speedup.</p>
 <p>The MLP experiments test which intermediate and data-movement boundaries must be removed for fusion to improve decode throughput.</p>
-<h2 data-number="4.8" id="shared-lhs-gateup-projection"><span class="header-section-number">4.8</span> Shared-LHS gate/up projection</h2>
+<h2 data-number="4.9" id="shared-lhs-gateup-projection"><span class="header-section-number">4.9</span> Shared-LHS gate/up projection</h2>
 <p>Qwen’s two first MLP projections share an activation:</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mo>,</mo><mspace width="0.278em"></mspace><mi>x</mi><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mspace width="1.0em"></mspace><mo>→</mo><mspace width="1.0em"></mspace><mi>x</mi><mo stretchy="false" form="prefix">[</mo><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mspace width="0.278em"></mspace><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mo stretchy="false" form="postfix">]</mo><mi>.</mi></mrow><annotation encoding="application/x-tex">
 xW_{gate},\;xW_{up}
@@ -548,12 +556,12 @@ xW_{gate},\;xW_{up}
 x[W_{gate}\;W_{up}].
 </annotation></semantics></math></p>
 <p><code>tt_mlir_fuse_shared_lhs_matmul_pairs.patch</code> changes TTIR fusion eligibility so a pair can be combined. This removes duplicate activation reads and launches, but writes a doubled-width output that SwiGLU slices and rereads. Throughput changes by -1.69%. The representation becomes useful when the epilogue consumes it without materializing the combined output.</p>
-<h2 data-number="4.9" id="consumer-side-silu-fusion"><span class="header-section-number">4.9</span> Consumer-side SiLU fusion</h2>
+<h2 data-number="4.10" id="consumer-side-silu-fusion"><span class="header-section-number">4.10</span> Consumer-side SiLU fusion</h2>
 <p>An intermediate experiment placed SiLU as a unary activation on the following TTNN multiply. That removes one elementwise operation but retains the expensive boundary:</p>
 <pre class="text"><code>combined matmul → pack full gate/up tensor → memory
                 → read/unpack → SiLU + multiply → pack result</code></pre>
 <p>Throughput changes by -0.65%. Removing an operation does not help when the same large intermediate is still written and read.</p>
-<h2 data-number="4.10" id="dst-resident-matmul-swiglu-epilogue"><span class="header-section-number">4.10</span> Dst-resident matmul-SwiGLU epilogue</h2>
+<h2 data-number="4.11" id="dst-resident-matmul-swiglu-epilogue"><span class="header-section-number">4.11</span> Dst-resident matmul-SwiGLU epilogue</h2>
 <p>Two patches implement the producer-side epilogue:</p>
 <ul>
 <li><code>tt_mlir_fuse_matmul_swiglu.patch</code> recognizes the TTNN graph, introduces the fused matmul semantic, extends the FlatBuffer representation, serializes it, and invokes the corresponding runtime path.</li>
@@ -572,10 +580,10 @@ x[W_{gate}\;W_{up}].
 <li>only four final BF16 tiles are packed and written.</li>
 </ol>
 <p>The doubled-width gate/up tensor is never materialized. End-to-end throughput improves by +2.73%.</p>
-<h2 data-number="4.11" id="prefill-coverage-and-fallback-removal"><span class="header-section-number">4.11</span> Prefill coverage and fallback removal</h2>
+<h2 data-number="4.12" id="prefill-coverage-and-fallback-removal"><span class="header-section-number">4.12</span> Prefill coverage and fallback removal</h2>
 <p>We then generalized the matcher from decode-specific naming to any supported one-tile-row input, which includes short prefill. The older consumer-side SiLU-multiply fallback was removed; validation remains at the TTNN/TT-Metal boundary, where unsupported dtype, layout, shape, and hardware combinations fail explicitly.</p>
 <p>Throughput changes by -0.19%. The change removes code and adds prefill coverage without changing the fast kernel or completion hash.</p>
-<h2 data-number="4.12" id="swiglu-k-blocking-sweep"><span class="header-section-number">4.12</span> SwiGLU K-blocking sweep</h2>
+<h2 data-number="4.13" id="swiglu-k-blocking-sweep"><span class="header-section-number">4.13</span> SwiGLU K-blocking sweep</h2>
 <p>The initial epilogue uses <code>in0_block_w = 2</code>. Every two K tiles it packs eight partial tiles into L1 and later reloads them. Larger blocks reduce partial traffic but need larger activation and weight circular buffers.</p>
 <p><code>matmul_swiglu_epilogue.patch</code> now exposes <code>TT_METAL_SWIGLU_IN0_BLOCK_W={2,4,8,16}</code> and sizes the circular buffers from the chosen value. The 32-sample test compares width 4 with width 2 while disabling the new down-projection specialization:</p>
 <table>
@@ -603,7 +611,7 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The intervals overlap and the measured change is small, so width two remains the default. Widths 8 and 16 remain available for experiments. Wider blocks also change accumulation order and can change greedy token sequences.</p>
-<h2 data-number="4.13" id="core-fused-residual-down-projection"><span class="header-section-number">4.13</span> 110-core fused-residual down projection</h2>
+<h2 data-number="4.14" id="core-fused-residual-down-projection"><span class="header-section-number">4.14</span> 110-core fused-residual down projection</h2>
 <p>The second MLP matmul has the exact decode shape <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mn>12288</mn></mrow><annotation encoding="application/x-tex">1\times12288</annotation></semantics></math> by <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>12288</mn><mo>×</mo><mn>4096</mn></mrow><annotation encoding="application/x-tex">12288\times4096</annotation></semantics></math>. The generic program used 64 cores and achieved only 246.2 GB/s of effective BFP8 weight bandwidth, well below the SwiGLU kernel. <code>down_projection_110_core.patch</code> adds an exact-shape Blackhole program selected only for BF16 activation/output, BFLOAT8_B weights, a BF16 residual, DRAM-interleaved tensors, and an 11-by-10 worker grid.</p>
 <p>The program avoids a K split and cross-core reduction. It partitions the 128 output tile columns across 110 workers:</p>
 <ul>
@@ -616,7 +624,7 @@ x[W_{gate}\;W_{up}].
 </ul>
 <p>Wide and narrow workers need different partial-result circular buffers. An early version gave narrow workers a two-tile ring even though they produced one tile. Partial sums alternated slots and corrupted output. Separate one- and two-tile rings fixed the bug.</p>
 <p>The exact-shape specialization is enabled by default. <code>TT_METAL_DOWN_PROJECTION_110_CORES=0</code> selects the generic program in the same binary for A/B measurement.</p>
-<h2 data-number="4.14" id="runtime-trace-capture-for-short-prefill"><span class="header-section-number">4.14</span> Runtime trace capture for short prefill</h2>
+<h2 data-number="4.15" id="runtime-trace-capture-for-short-prefill"><span class="header-section-number">4.15</span> Runtime trace capture for short prefill</h2>
 <p>Decode replays a recorded TT-Metal command sequence while refreshing request-dependent buffers. Previously, the five-token prompt, padded to one 32-row tile, ran as separate host submissions.</p>
 <p>Setting <code>SGLANG_TT_TRACE_DECODE_ONLY=false</code> records the fixed-shape prefill sequence too. In a same-binary 32-sample A/B test:</p>
 <table>
@@ -650,7 +658,7 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>Tracing removes about 560 ms before the first token while pure decode changes by +0.36%. In the primary cumulative benchmark, it adds +10.23% end-to-end throughput for a 128-token response.</p>
-<h2 data-number="4.15" id="packaging-build-and-startup-changes"><span class="header-section-number">4.15</span> Packaging, build, and startup changes</h2>
+<h2 data-number="4.16" id="packaging-build-and-startup-changes"><span class="header-section-number">4.16</span> Packaging, build, and startup changes</h2>
 <p>Other patches make the single-library deployment buildable and keep startup cost manageable. They are not decode optimizations.</p>
 <table>
 <caption>Non-model patch groups in the current libtt build.</caption>
@@ -761,7 +769,7 @@ x[W_{gate}\;W_{up}].
 </tr>
 <tr class="even">
 <td style="text-align: left;">Benchmark date</td>
-<td style="text-align: left;">15 July 2026, America/Los_Angeles</td>
+<td style="text-align: left;">15–16 July 2026, America/Los_Angeles</td>
 </tr>
 </tbody>
 </table>
@@ -788,6 +796,7 @@ x[W_{gate}\;W_{up}].
   --disable-precompile --skip-server-warmup \
   --disable-overlap-schedule --disable-radix-cache</code></pre>
 <p>Requests are serial despite the capacity of two. Radix caching and overlap scheduling are disabled so every request executes the same prompt prefill and does not overlap another request. Optional CPU/fused sampling paths remain at their disabled defaults; this report concerns the main model path.</p>
+<p>The foundation decomposition uses the same command with <code>SGLANG_TT_TRACE_DECODE_ONLY=true</code>. V0 and V1 predate fixed-shape prefill tracing, so this reproduces the timing scope of the original +22.58% measurement. All foundation variants use that setting.</p>
 <h2 data-number="5.3" id="request-and-sample-policy"><span class="header-section-number">5.3</span> Request and sample policy</h2>
 <p>We send the same request 34 times in the primary sequence:</p>
 <pre class="json"><code>{
@@ -927,7 +936,112 @@ x[W_{gate}\;W_{up}].
 </figure>
 <p>The negative and near-zero rows explain the final design: shared-LHS fusion materializes too much data, consumer-side SiLU leaves the producer boundary, and fallback removal changes coverage rather than the kernel.</p>
 <p>V0 through V9 use the server-reported request latency from the README benchmark. V10 uses the loopback streaming end-to-end clock needed for the kernel A/B and external-server comparison. The clocks have the same request scope but are collected independently, so the V10 incremental value is the change between stage means, not the isolated kernel effect.</p>
-<h2 data-number="6.2" id="isolating-the-final-mlp-kernel-stage"><span class="header-section-number">6.2</span> Isolating the final MLP-kernel stage</h2>
+<h2 data-number="6.2" id="decomposing-the-foundation"><span class="header-section-number">6.2</span> Decomposing the foundation</h2>
+<p>We repeated the V0/V1 comparison and built six leave-one-concept-out variants from the V1 foundation. The full foundation and functional baseline each have two separate 32-request windows, for 64 retained requests each. Every omission has 32 retained requests. All builds keep the NoC public-include patch because it only fixes the build.</p>
+<table style="width:100%;">
+<caption>Fresh foundation decomposition. Change versus full is the throughput change when the concept is omitted. Marginal speedup is full divided by the omission. Gain share is the omitted throughput loss divided by the total 3.854-token/s foundation gain; it is descriptive and non-additive.</caption>
+<colgroup>
+<col style="width: 13%"></col>
+<col style="width: 13%"></col>
+<col style="width: 13%"></col>
+<col style="width: 18%"></col>
+<col style="width: 13%"></col>
+<col style="width: 13%"></col>
+<col style="width: 13%"></col>
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Configuration</th>
+<th style="text-align: right;">N</th>
+<th style="text-align: right;">Mean ± SD (tok/s)</th>
+<th style="text-align: center;">95% CI</th>
+<th style="text-align: right;">Change vs. full</th>
+<th style="text-align: right;">Marginal speedup</th>
+<th style="text-align: right;">Gain share</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">Functional baseline</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">16.039 ± 0.177</td>
+<td style="text-align: center;">[15.995, 16.084]</td>
+<td style="text-align: right;">-19.37%</td>
+<td style="text-align: right;">+24.03%</td>
+<td style="text-align: right;">100.0%</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Full foundation</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">19.894 ± 0.265</td>
+<td style="text-align: center;">[19.827, 19.960]</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">Without JAX RMSNorm recognition</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">16.678 ± 0.164</td>
+<td style="text-align: center;">[16.619, 16.737]</td>
+<td style="text-align: right;">-16.16%</td>
+<td style="text-align: right;">+19.28%</td>
+<td style="text-align: right;">83.4%</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Without rank-3 decode RoPE fusion</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">19.335 ± 0.259</td>
+<td style="text-align: center;">[19.242, 19.429]</td>
+<td style="text-align: right;">-2.81%</td>
+<td style="text-align: right;">+2.89%</td>
+<td style="text-align: right;">14.5%</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">Without KV-cache result typing</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">19.786 ± 0.289</td>
+<td style="text-align: center;">[19.682, 19.890]</td>
+<td style="text-align: right;">-0.54%</td>
+<td style="text-align: right;">+0.54%</td>
+<td style="text-align: right;">2.8%</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Without BF8 activation lowering</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">19.843 ± 0.255</td>
+<td style="text-align: center;">[19.751, 19.935]</td>
+<td style="text-align: right;">-0.25%</td>
+<td style="text-align: right;">+0.26%</td>
+<td style="text-align: right;">1.3%</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">Without SiLU call lowering</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">19.983 ± 0.292</td>
+<td style="text-align: center;">[19.878, 20.088]</td>
+<td style="text-align: right;">+0.45%</td>
+<td style="text-align: right;">-0.45%</td>
+<td style="text-align: right;">-2.3%</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Without decode layout admission</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">20.024 ± 0.234</td>
+<td style="text-align: center;">[19.940, 20.108]</td>
+<td style="text-align: right;">+0.66%</td>
+<td style="text-align: right;">-0.65%</td>
+<td style="text-align: right;">-3.4%</td>
+</tr>
+</tbody>
+</table>
+<figure>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTAwIiB2aWV3Qm94PSIwIDAgOTgwIDUwMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkMGQwZDA7c3Ryb2tlLXdpZHRoOjF9Lmxvc3N7ZmlsbDojNDQ0fS5nYWlue2ZpbGw6I2FhYX0ubGFiZWx7Zm9udC1zaXplOjE0cHh9LnNtYWxse2ZvbnQtc2l6ZToxMnB4O2ZpbGw6IzQ0NH0udmFsdWV7Zm9udC1zaXplOjEzcHg7Zm9udC13ZWlnaHQ6NzAwfS5pbnZlcnNle2ZpbGw6I2ZmZn0udGl0bGV7Zm9udC1zaXplOjIxcHg7Zm9udC13ZWlnaHQ6NzAwfTwvc3R5bGU+Cjx0ZXh0IHg9IjQwIiB5PSIzMSIgY2xhc3M9InRpdGxlIj5Gb3VuZGF0aW9uIGNvbmNlcHQgbGVhdmUtb25lLW91dCByZXN1bHRzPC90ZXh0Pgo8bGluZSB4MT0iMzQzLjIiIHkxPSI1NSIgeDI9IjM0My4yIiB5Mj0iNDQ1IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSIzNDMuMiIgeT0iNDY5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPi0xNiU8L3RleHQ+CjxsaW5lIHgxPSI0NzUuOCIgeTE9IjU1IiB4Mj0iNDc1LjgiIHkyPSI0NDUiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9IjQ3NS44IiB5PSI0NjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+LTEyJTwvdGV4dD4KPGxpbmUgeDE9IjYwOC40IiB5MT0iNTUiIHgyPSI2MDguNCIgeTI9IjQ0NSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNjA4LjQiIHk9IjQ2OSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj4tOCU8L3RleHQ+CjxsaW5lIHgxPSI3NDEuMSIgeTE9IjU1IiB4Mj0iNzQxLjEiIHkyPSI0NDUiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc0MS4xIiB5PSI0NjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+LTQlPC90ZXh0Pgo8bGluZSB4MT0iODczLjciIHkxPSI1NSIgeDI9Ijg3My43IiB5Mj0iNDQ1IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI4NzMuNyIgeT0iNDY5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPjAlPC90ZXh0Pgo8bGluZSB4MT0iODczLjciIHkxPSI1NSIgeDI9Ijg3My43IiB5Mj0iNDQ1IiBjbGFzcz0iYXhpcyIvPgo8dGV4dCB4PSIyOTUiIHk9Ijk0LjUiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+SkFYIFJNU05vcm0gcmVjb2duaXRpb248L3RleHQ+CjxyZWN0IHg9IjMzNy43IiB5PSI2OC4wIiB3aWR0aD0iNTM2LjAiIGhlaWdodD0iMzkuMCIgcng9IjMiIGNsYXNzPSJsb3NzIi8+Cjx0ZXh0IHg9IjM0NS43IiB5PSI5NC41IiB0ZXh0LWFuY2hvcj0ic3RhcnQiIGNsYXNzPSJ2YWx1ZSBpbnZlcnNlIj4tMTYuMTYlPC90ZXh0Pgo8dGV4dCB4PSIyOTUiIHk9IjE1OS41IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPlNpTFUgY2FsbCBsb3dlcmluZzwvdGV4dD4KPHJlY3QgeD0iODczLjciIHk9IjEzMy4wIiB3aWR0aD0iMTQuOSIgaGVpZ2h0PSIzOS4wIiByeD0iMyIgY2xhc3M9ImdhaW4iLz4KPHRleHQgeD0iODk2LjYiIHk9IjE1OS41IiB0ZXh0LWFuY2hvcj0ic3RhcnQiIGNsYXNzPSJ2YWx1ZSI+KzAuNDUlPC90ZXh0Pgo8dGV4dCB4PSIyOTUiIHk9IjIyNC41IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPnJhbmstMyBkZWNvZGUgUm9QRSBmdXNpb248L3RleHQ+CjxyZWN0IHg9Ijc4MC43IiB5PSIxOTguMCIgd2lkdGg9IjkzLjAiIGhlaWdodD0iMzkuMCIgcng9IjMiIGNsYXNzPSJsb3NzIi8+Cjx0ZXh0IHg9Ijc3Mi43IiB5PSIyMjQuNSIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9InZhbHVlIj4tMi44MSU8L3RleHQ+Cjx0ZXh0IHg9IjI5NSIgeT0iMjg5LjUiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+S1YtY2FjaGUgcmVzdWx0IHR5cGluZzwvdGV4dD4KPHJlY3QgeD0iODU1LjciIHk9IjI2My4wIiB3aWR0aD0iMTguMCIgaGVpZ2h0PSIzOS4wIiByeD0iMyIgY2xhc3M9Imxvc3MiLz4KPHRleHQgeD0iODQ3LjciIHk9IjI4OS41IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0idmFsdWUiPi0wLjU0JTwvdGV4dD4KPHRleHQgeD0iMjk1IiB5PSIzNTQuNSIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj5CRjggYWN0aXZhdGlvbiBsb3dlcmluZzwvdGV4dD4KPHJlY3QgeD0iODY1LjIiIHk9IjMyOC4wIiB3aWR0aD0iOC40IiBoZWlnaHQ9IjM5LjAiIHJ4PSIzIiBjbGFzcz0ibG9zcyIvPgo8dGV4dCB4PSI4NTcuMiIgeT0iMzU0LjUiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJ2YWx1ZSI+LTAuMjUlPC90ZXh0Pgo8dGV4dCB4PSIyOTUiIHk9IjQxOS41IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPmRlY29kZSBsYXlvdXQgYWRtaXNzaW9uPC90ZXh0Pgo8cmVjdCB4PSI4NzMuNyIgeT0iMzkzLjAiIHdpZHRoPSIyMS43IiBoZWlnaHQ9IjM5LjAiIHJ4PSIzIiBjbGFzcz0iZ2FpbiIvPgo8dGV4dCB4PSI5MDMuNCIgeT0iNDE5LjUiIHRleHQtYW5jaG9yPSJzdGFydCIgY2xhc3M9InZhbHVlIj4rMC42NiU8L3RleHQ+Cjx0ZXh0IHg9IjMxMCIgeT0iNDg2IiBjbGFzcz0ic21hbGwiPkNoYW5nZSBpbiBtZWFuIHRocm91Z2hwdXQgd2hlbiB0aGUgY29uY2VwdCBpcyBvbWl0dGVkOyAzMiByZXRhaW5lZCByZXF1ZXN0cyBwZXIgb21pc3Npb24uPC90ZXh0Pgo8L3N2Zz4K" id="fig:foundation-ablation" style="width:100.0%" alt /><figcaption>Throughput change when each foundation concept is omitted.</figcaption>
+</figure>
+<p>RMSNorm recognition explains most of the gain. Its 3.216-token/s marginal loss is 83.4% of the total baseline-to-foundation difference. Rank-3 RoPE fusion is the second clear contributor at 0.558 tokens/s, or 14.5% of the total. The KV-cache and BF8 activation effects are small. SiLU call lowering and layout admission show no positive decode effect in this graph; they provide graph and layout coverage.</p>
+<p>The shares sum to 96.3%, not 100%, because patches interact and each omission is measured with all other foundation patches present. This is not an additive or factorial allocation. The two full-window means are 19.832 and 19.955 tokens/s; the baseline means are 16.043 and 16.036 tokens/s. The fresh total gain is +24.03%. The old +22.58% result used a 16.265-token/s baseline. The new full mean is only 0.22% below the old 19.938-token/s result, while the new baseline is 1.38% lower.</p>
+<p>All configurations return 128 tokens and are deterministic within each window. The no-RMSNorm output has a different token hash from the other configurations, although both completions are coherent. This test therefore does not establish equal model quality.</p>
+<h2 data-number="6.3" id="isolating-the-final-mlp-kernel-stage"><span class="header-section-number">6.3</span> Isolating the final MLP-kernel stage</h2>
 <p>The V10 result combines the SwiGLU blocking choice and the 110-core down projection with the preceding compiler, runtime, and kernel optimizations. The same-build measurements below separate their effects.</p>
 <table>
 <caption>Current-branch streaming results, 32 retained samples per configuration. Width 4 is compared with width 2; the down projection is compared with the same width-4 binary/configuration with the specialization disabled.</caption>
@@ -972,7 +1086,7 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The down projection cuts mean decode time from 38.179 to 36.032 ms/token, a 2.147 ms/token saving. Streaming end-to-end throughput rises by 5.88%, from 26.085 to 27.619 tokens/s. TTFT remains about 58 ms.</p>
-<h2 data-number="6.3" id="device-profile-of-the-down-projection"><span class="header-section-number">6.3</span> Device profile of the down projection</h2>
+<h2 data-number="6.4" id="device-profile-of-the-down-projection"><span class="header-section-number">6.4</span> Device profile of the down projection</h2>
 <p>The direct TT-Metal profile identifies 36 occurrences per token, matching the 36 Qwen3-8B decoder layers. Exactly those operation positions change from 64 to 110 workers.</p>
 <table>
 <thead>
@@ -1011,7 +1125,7 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The projected kernel saving is close to the observed 2.147 ms/token. The new program reaches about 92% of the previously measured 375.1 GB/s SwiGLU effective bandwidth. This agreement between operation profile and end-to-end measurement supports the causal attribution.</p>
-<h2 data-number="6.4" id="upstream-tt-inference-server-reference"><span class="header-section-number">6.4</span> Upstream tt-inference-server reference</h2>
+<h2 data-number="6.5" id="upstream-tt-inference-server-reference"><span class="header-section-number">6.5</span> Upstream tt-inference-server reference</h2>
 <p>Tenstorrent’s tt-inference-server is an OpenAI-compatible service built around vLLM and TT-Transformers [20]. It enters the stack above TTNN rather than through the XLA, StableHLO, and TT-MLIR path:</p>
 <pre class="text"><code>libtt:  SGLang-JAX → JAX/XLA → StableHLO/PJRT → TT-XLA/TT-MLIR → TTNN → TT-Metal
 TTIS:   OpenAI API → vLLM → TT-Transformers                    → TTNN → TT-Metal</code></pre>
@@ -1051,7 +1165,7 @@ TTIS:   OpenAI API → vLLM → TT-Transformers                    → TTNN → 
 <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTEwIiB2aWV3Qm94PSIwIDAgOTgwIDUxMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkMGQwZDA7c3Ryb2tlLXdpZHRoOjF9LmxpYnR0e2ZpbGw6IzMzM30udXBzdHJlYW17ZmlsbDojYWFhfS5jaXtzdHJva2U6IzExMTtzdHJva2Utd2lkdGg6Mi41fS5sYWJlbHtmb250LXNpemU6MTRweH0uc21hbGx7Zm9udC1zaXplOjEycHg7ZmlsbDojNDQ0fS52YWx1ZXtmb250LXNpemU6MTVweDtmb250LXdlaWdodDo3MDB9LnRpdGxle2ZvbnQtc2l6ZToyMXB4O2ZvbnQtd2VpZ2h0OjcwMH0ubGVnZW5ke2ZvbnQtc2l6ZToxM3B4fTwvc3R5bGU+Cjx0ZXh0IHg9IjEwMCIgeT0iMjkiIGNsYXNzPSJ0aXRsZSI+U2FtZS1jbG9jayBRd2VuMy04QiBzdHJlYW1pbmcgY29tcGFyaXNvbjwvdGV4dD4KPHJlY3QgeD0iNjA4IiB5PSIxNiIgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiByeD0iMiIgY2xhc3M9ImxpYnR0Ii8+Cjx0ZXh0IHg9IjYzMSIgeT0iMjkiIGNsYXNzPSJsZWdlbmQiPmxpYnR0IDM3ZDU0NjA8L3RleHQ+CjxyZWN0IHg9Ijc2MCIgeT0iMTYiIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgcng9IjIiIGNsYXNzPSJ1cHN0cmVhbSIvPgo8dGV4dCB4PSI3ODMiIHk9IjI5IiBjbGFzcz0ibGVnZW5kIj5UVElTIHYwLjEwLjA8L3RleHQ+CjxsaW5lIHgxPSIxMDAiIHkxPSIzOTUuMCIgeDI9Ijk1MCIgeTI9IjM5NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI4OCIgeT0iNDAwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MDwvdGV4dD4KPGxpbmUgeDE9IjEwMCIgeTE9IjM0MC4wIiB4Mj0iOTUwIiB5Mj0iMzQwLjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSIzNDUuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj41PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMjg1LjAiIHgyPSI5NTAiIHkyPSIyODUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjI5MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjEwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMjMwLjAiIHgyPSI5NTAiIHkyPSIyMzAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjIzNS4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE1PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMTc1LjAiIHgyPSI5NTAiIHkyPSIxNzUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjE4MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjIwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMTIwLjAiIHgyPSI5NTAiIHkyPSIxMjAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjEyNS4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI1PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iNjUuMCIgeDI9Ijk1MCIgeTI9IjY1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSI3MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjMwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iNjUiIHgyPSIxMDAiIHkyPSIzOTUiIGNsYXNzPSJheGlzIi8+CjxsaW5lIHgxPSIxMDAiIHkxPSIzOTUiIHgyPSI5NTAiIHkyPSIzOTUiIGNsYXNzPSJheGlzIi8+CjxyZWN0IHg9IjE4OC41IiB5PSI4OS43IiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjMwNS4zIiByeD0iNCIgY2xhc3M9ImxpYnR0Ii8+CjxsaW5lIHgxPSIyNDQuNSIgeTE9Ijg4LjQiIHgyPSIyNDQuNSIgeTI9IjkxLjAiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMjM3LjUiIHkxPSI4OC40IiB4Mj0iMjUxLjUiIHkyPSI4OC40IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjIzNy41IiB5MT0iOTEuMCIgeDI9IjI1MS41IiB5Mj0iOTEuMCIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjI0NC41IiB5PSI3Ny43IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPjI3Ljc1MzwvdGV4dD4KPHJlY3QgeD0iMzI0LjUiIHk9IjEyMS4yIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjI3My44IiByeD0iNCIgY2xhc3M9InVwc3RyZWFtIi8+CjxsaW5lIHgxPSIzODAuNSIgeTE9IjExOS4xIiB4Mj0iMzgwLjUiIHkyPSIxMjMuMyIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzMuNSIgeTE9IjExOS4xIiB4Mj0iMzg3LjUiIHkyPSIxMTkuMSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzMuNSIgeTE9IjEyMy4zIiB4Mj0iMzg3LjUiIHkyPSIxMjMuMyIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjM4MC41IiB5PSIxMDkuMiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNC44ODc8L3RleHQ+Cjx0ZXh0IHg9IjMxMi41IiB5PSI0MjQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+UHVyZSBkZWNvZGU8L3RleHQ+CjxyZWN0IHg9IjYxMy41IiB5PSI5MS4yIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjMwMy44IiByeD0iNCIgY2xhc3M9ImxpYnR0Ii8+CjxsaW5lIHgxPSI2NjkuNSIgeTE9Ijg5LjkiIHgyPSI2NjkuNSIgeTI9IjkyLjUiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNjYyLjUiIHkxPSI4OS45IiB4Mj0iNjc2LjUiIHkyPSI4OS45IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjY2Mi41IiB5MT0iOTIuNSIgeDI9IjY3Ni41IiB5Mj0iOTIuNSIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjY2OS41IiB5PSI3OS4yIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPjI3LjYxOTwvdGV4dD4KPHJlY3QgeD0iNzQ5LjUiIHk9IjEyMi41IiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjI3Mi41IiByeD0iNCIgY2xhc3M9InVwc3RyZWFtIi8+CjxsaW5lIHgxPSI4MDUuNSIgeTE9IjEyMC40IiB4Mj0iODA1LjUiIHkyPSIxMjQuNSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3OTguNSIgeTE9IjEyMC40IiB4Mj0iODEyLjUiIHkyPSIxMjAuNCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3OTguNSIgeTE9IjEyNC41IiB4Mj0iODEyLjUiIHkyPSIxMjQuNSIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjgwNS41IiB5PSIxMTAuNSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNC43NzY8L3RleHQ+Cjx0ZXh0IHg9IjczNy41IiB5PSI0MjQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+U3RyZWFtaW5nIEUyRTwvdGV4dD4KPHRleHQgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoMjUgMjMwLjApIHJvdGF0ZSgtOTApIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPnRva2Vucy9zIChtZWFuIGFuZCA5NSUgdCBpbnRlcnZhbCk8L3RleHQ+Cjx0ZXh0IHg9IjEwMCIgeT0iNDYyIiBjbGFzcz0ic21hbGwiPjMyIHJldGFpbmVkIHNlcmlhbCByZXF1ZXN0cyBwZXIgaW1wbGVtZW50YXRpb247IHR3byB3YXJtLXVwczsgMTI4IGdlbmVyYXRlZCB0b2tlbnMvcmVxdWVzdC48L3RleHQ+Cjx0ZXh0IHg9IjEwMCIgeT0iNDgyIiBjbGFzcz0ic21hbGwiPkJvdGggdXNlIHRoZSBzYW1lIGxvb3BiYWNrIHN0cmVhbWluZyBjbG9jazogMTI3IGludGVyLXRva2VuIGludGVydmFscyBmb3IgZGVjb2RlIGFuZCByZXF1ZXN0LXRvLWxhc3QtdG9rZW4gZm9yIEUyRS48L3RleHQ+Cjwvc3ZnPgo=" id="fig:upstream" style="width:100.0%" alt /><figcaption>External serving-stack reference on the same model workload.</figcaption>
 </figure>
 <p>Under these conditions, libtt is 11.51% faster in pure decode and 11.48% faster end to end. Mean TTFT is 7.78% lower, and mean request-to-last-token latency falls from 5.169 to 4.635 seconds. This compares complete serving stacks, not individual kernels; their model implementations, frontends, and trace strategies differ. The result shows that lower-stack compiler and kernel optimization can match and exceed a stack that also modifies the transformer and inference-engine layers. The tested TTIS artifact is the official v0.10.0 runtime image.</p>
-<h2 data-number="6.5" id="correctness-and-numeric-behavior"><span class="header-section-number">6.5</span> Correctness and numeric behavior</h2>
+<h2 data-number="6.6" id="correctness-and-numeric-behavior"><span class="header-section-number">6.6</span> Correctness and numeric behavior</h2>
 <p>All 32 requests in each configuration are deterministic. Algebra and reduction changes can alter the token hash. The current kernel hashes are:</p>
 <table>
 <thead>
@@ -1106,7 +1220,7 @@ matmul-SwiGLU epilogue:
 <ol type="1">
 <li><strong>One model and decode regime.</strong> Results apply to Qwen3-8B, a five-token prompt padded to one tile, serial 128-token generation, and a single P150. Other batches, contexts, and scheduling policies may have different limits.</li>
 <li><strong>Cumulative attribution is ordered.</strong> The established stages are real cumulative builds, not a factorial experiment. Patch effects can interact.</li>
-<li><strong>The foundation group is not decomposed.</strong> Its +22.58% covers several compiler, dtype, validation, and layout changes.</li>
+<li><strong>Foundation effects interact.</strong> The leave-one-concept-out measurements are marginal effects in the complete foundation, not an additive or factorial allocation. Small effects are also close to sequential drift.</li>
 <li><strong>Two metric families.</strong> The older cumulative sequence uses server-reported request latency. The current kernel and TTIS comparison uses the same streaming client clock. The two families are not directly interchangeable.</li>
 <li><strong>Sequential sampling.</strong> Configurations were not randomized or interleaved. Thermal and background drift can remain.</li>
 <li><strong>Profile naming required positional alignment.</strong> The final profiling CSV lacked operation names. Its 854 rows align with an earlier named trace, and the 36 changed positions match the down projections.</li>

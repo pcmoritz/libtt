@@ -517,13 +517,14 @@ Table: Current model-path optimization concepts, implementation levels, and meas
 
 | Concept | Principal level / IR | Measured effect |
 |:--|:--|--:|
-| Recover JAX RMSNorm | TTIR graph rewrite | Included in +22.58% foundation bundle |
+| Recover JAX RMSNorm | TTIR graph rewrite | +19.28% marginal foundation effect |
+| Lower SiLU calls | StableHLO-to-TTIR rewrite | No positive decode effect detected |
 | Recognize expanded SiLU | TTIR graph rewrite | +3.30% |
-| Fuse rank-3 decode RoPE | TTIR/TTNN composite resolution | Included in foundation bundle |
+| Fuse rank-3 decode RoPE | TTIR/TTNN composite resolution | +2.89% marginal foundation effect |
 | Fuse Qwen decode QKV structure | TTIR ordering + TTNN fusion | +1.15% |
-| Preserve KV-cache result types | TTNN type inference | Included in foundation bundle |
-| Enable BF8 activation/weight path | Compile options, TTNN lowering, host packing | Foundation/baseline; not isolated |
-| Permit decode layouts | TTNN/TT-Metal validation | Included in foundation bundle |
+| Preserve KV-cache result types | TTNN type inference | +0.54% marginal; near measured drift |
+| Enable BF8 activation lowering | Compile options and TTNN lowering | +0.26% marginal; near measured drift |
+| Permit decode layouts | TTNN/TT-Metal validation | No positive decode effect detected |
 | Width-shard decode RMSNorm | TTNN runtime policy | +13.61% |
 | Combine two shared-LHS matmuls | TTIR fusion | -1.69%; enables epilogue |
 | True matmul-SwiGLU epilogue | TTNN IR/FlatBuffer/runtime + TT-Metal | +2.73% |
@@ -540,6 +541,7 @@ Patch index:
 
 ```text
 RMSNorm graph       tt_mlir_fuse_jax_rms_norm.patch
+SiLU call           tt_mlir_lower_silu_call.patch
 expanded SiLU       tt_mlir_fuse_expanded_silu.patch
 decode RoPE         tt_mlir_fuse_rank3_rope_decode.patch
 QKV structure       tt_mlir_qwen_decode_qkv_projection_fusion.patch
@@ -557,11 +559,13 @@ down projection     down_projection_110_core.patch
 
 \endgroup
 
-The +22.58% foundation figure combines patches that were not measured
-separately. The blocking and down-projection tests use a direct streaming
-clock. Their final configuration forms the last stage of the cumulative
-sequence using streaming end-to-end throughput; the same-build A/B tests below
-isolate the effects of the two kernel changes.
+The original foundation measurement combined these patches into one +22.58%
+stage. A new leave-one-concept-out experiment below separates their marginal
+effects and measures a fresh total gain of +24.03%. The effects overlap and do
+not add to the total. The blocking and down-projection tests use a direct
+streaming clock. Their final configuration forms the last stage of the
+cumulative sequence using streaming end-to-end throughput; the same-build A/B
+tests below isolate the effects of the two kernel changes.
 
 The first group recovers model semantics in TTIR and TTNN before lowerings
 discard the algebra and graph roles needed to recognize them.
@@ -571,8 +575,17 @@ discard the algebra and graph roles needed to recognize them.
 JAX can lower RMSNorm to square, reduce, epsilon addition, reciprocal square
 root, scaling, and reshapes. A TTIR pattern proves this structure and replaces
 it with one RMSNorm operation while the algebra and use-def graph are still
-available. TTNN can then apply its normalization and layout logic. Recognition
-is part of the foundation bundle and enables the later runtime-sharding patch.
+available. TTNN can then apply its normalization and layout logic. Removing
+this patch from the otherwise complete foundation lowers throughput from
+19.894 to 16.678 tokens/s. Restoring it gives a +19.28% marginal speedup. It
+also enables the later runtime-sharding patch.
+
+## SiLU call lowering
+
+Some JAX graphs contain a function call named `silu`. The foundation patch
+replaces that call with a TTIR SiLU operation during StableHLO legalization.
+Removing the patch changes throughput by +0.45%, so this exact graph does not
+show a positive decode effect. The patch remains useful for graph coverage.
 
 ## Expanded-SiLU recognition
 
@@ -582,7 +595,8 @@ $$
 \operatorname{SiLU}(x)=x\,\sigma(x)=\frac{x}{1+\exp(-x)}
 $$
 
-with casts, broadcasts, reshapes, and a splatted scalar one.
+with casts, broadcasts, reshapes, and a splatted scalar one. This is separate
+from the foundation call-lowering patch. The later
 `tt_mlir_fuse_expanded_silu.patch` looks through view-like operations, verifies
 the constant and shared input, and replaces the tree with SiLU. The isolated
 gain is +3.30%.
@@ -602,8 +616,9 @@ recover this structure:
   Q and K RMSNorm are recreated on the fused rank-4 results.
 
 TTIR supplies candidate ordering and role information; TTNN owns the composite
-operation and runtime contract. QKV fusion adds +1.15%. Rank-3 RoPE is part
-of the foundation bundle.
+operation and runtime contract. QKV fusion adds +1.15%. Removing rank-3 RoPE
+fusion from the foundation lowers throughput by 2.81%; restoring it gives a
++2.89% marginal speedup.
 
 ## KV-cache dtype and role propagation
 
@@ -611,7 +626,8 @@ KV-cache update operations are stateful boundaries. Their return types must
 carry the selected device dtype, and graph-role metadata must survive unary
 operations so later fusions can still identify query, key, and value paths.
 The TT-MLIR and TT-XLA patches keep the low-precision fused graph typed and
-recognizable. They are enabling changes rather than isolated speedups.
+recognizable. Removing KV-cache return-type preservation lowers throughput by
+0.54%; restoring it gives a +0.54% marginal speedup.
 
 The next group selects precision and layout after the graph operations have
 been recovered.
@@ -628,7 +644,10 @@ These changes attack two different phases:
 - BF8 storage reduces steady-state device weight traffic during decode.
 - faster packing reduces model-load and preparation cost on the host.
 
-We did not isolate these effects from the foundation bundle.
+BF8 weights and fast host packing already existed in the functional baseline.
+The foundation adds single-chip activation lowering through one TT-XLA patch
+and one TT-MLIR patch. Removing those two patches together lowers throughput by
+0.25%; restoring them gives a +0.26% marginal speedup.
 
 ## Width-sharded decode RMSNorm
 
@@ -657,8 +676,10 @@ Two small TT-Metal patches admit layouts selected by the optimized graph:
 - layernorm accepts the single-core height-sharded case produced on the decode
   path.
 
-These narrow changes remove conversions while keeping shape and layout checks.
-Their performance effect is part of the foundation bundle.
+These narrow changes keep shape and layout checks while admitting layouts used
+by other optimized paths. Removing both changes throughput by +0.66% in this
+experiment, so no positive decode effect is detected for the measured graph.
+Their role is compatibility rather than the source of the foundation speedup.
 
 The MLP experiments test which intermediate and data-movement boundaries must
 be removed for fusion to improve decode throughput.
@@ -841,7 +862,7 @@ These patches keep the integrated build loadable and remove unused subsystems.
 | Serving frontend | `/home/pcmoritz/sglang-jax` at `24eb823ed97e` |
 | Established main snapshot | `627a32d` |
 | Current kernel snapshot | `37d5460` |
-| Benchmark date | 15 July 2026, America/Los_Angeles |
+| Benchmark date | 15--16 July 2026, America/Los_Angeles |
 
 The P150 exposes 120 Tensix workers in this firmware configuration [12]. The
 SwiGLU program uses 96; the new down projection uses 110. Results are
@@ -877,6 +898,11 @@ Requests are serial despite the capacity of two. Radix caching and overlap
 scheduling are disabled so every request executes the same prompt prefill and
 does not overlap another request. Optional CPU/fused sampling paths remain at
 their disabled defaults; this report concerns the main model path.
+
+The foundation decomposition uses the same command with
+`SGLANG_TT_TRACE_DECODE_ONLY=true`. V0 and V1 predate fixed-shape prefill
+tracing, so this reproduces the timing scope of the original +22.58%
+measurement. All foundation variants use that setting.
 
 ## Request and sample policy
 
@@ -965,6 +991,51 @@ benchmark. V10 uses the loopback streaming end-to-end clock needed for the
 kernel A/B and external-server comparison. The clocks have the same request
 scope but are collected independently, so the V10 incremental value is the
 change between stage means, not the isolated kernel effect.
+
+\clearpage
+
+## Decomposing the foundation
+
+We repeated the V0/V1 comparison and built six leave-one-concept-out variants
+from the V1 foundation. The full foundation and functional baseline each have
+two separate 32-request windows, for 64 retained requests each. Every
+omission has 32 retained requests. All builds keep the NoC public-include patch
+because it only fixes the build.
+
+Table: Fresh foundation decomposition. Change versus full is the throughput change when the concept is omitted. Marginal speedup is full divided by the omission. Gain share is the omitted throughput loss divided by the total 3.854-token/s foundation gain; it is descriptive and non-additive.
+
+| Configuration | N | Mean ± SD (tok/s) | 95% CI | Change vs. full | Marginal speedup | Gain share |
+|:--|--:|--:|:--:|--:|--:|--:|
+| Functional baseline | 64 | 16.039 ± 0.177 | [15.995, 16.084] | -19.37% | +24.03% | 100.0% |
+| Full foundation | 64 | 19.894 ± 0.265 | [19.827, 19.960] | — | — | — |
+| Without JAX RMSNorm recognition | 32 | 16.678 ± 0.164 | [16.619, 16.737] | -16.16% | +19.28% | 83.4% |
+| Without rank-3 decode RoPE fusion | 32 | 19.335 ± 0.259 | [19.242, 19.429] | -2.81% | +2.89% | 14.5% |
+| Without KV-cache result typing | 32 | 19.786 ± 0.289 | [19.682, 19.890] | -0.54% | +0.54% | 2.8% |
+| Without BF8 activation lowering | 32 | 19.843 ± 0.255 | [19.751, 19.935] | -0.25% | +0.26% | 1.3% |
+| Without SiLU call lowering | 32 | 19.983 ± 0.292 | [19.878, 20.088] | +0.45% | -0.45% | -2.3% |
+| Without decode layout admission | 32 | 20.024 ± 0.234 | [19.940, 20.108] | +0.66% | -0.65% | -3.4% |
+
+![Throughput change when each foundation concept is omitted.](figures/foundation-ablation.svg){#fig:foundation-ablation width=100%}
+
+RMSNorm recognition explains most of the gain. Its 3.216-token/s marginal loss
+is 83.4% of the total baseline-to-foundation difference. Rank-3 RoPE fusion is
+the second clear contributor at 0.558 tokens/s, or 14.5% of the total. The
+KV-cache and BF8 activation effects are small. SiLU call lowering and layout
+admission show no positive decode effect in this graph; they provide graph and
+layout coverage.
+
+The shares sum to 96.3%, not 100%, because patches interact and each omission
+is measured with all other foundation patches present. This is not an additive
+or factorial allocation. The two full-window means are 19.832 and 19.955
+tokens/s; the baseline means are 16.043 and 16.036 tokens/s. The fresh total
+gain is +24.03%. The old +22.58% result used a 16.265-token/s baseline. The new
+full mean is only 0.22% below the old 19.938-token/s result, while the new
+baseline is 1.38% lower.
+
+All configurations return 128 tokens and are deterministic within each
+window. The no-RMSNorm output has a different token hash from the other
+configurations, although both completions are coherent. This test therefore
+does not establish equal model quality.
 
 ## Isolating the final MLP-kernel stage
 
@@ -1113,8 +1184,9 @@ the final producer-side design.
    Other batches, contexts, and scheduling policies may have different limits.
 2. **Cumulative attribution is ordered.** The established stages are real
    cumulative builds, not a factorial experiment. Patch effects can interact.
-3. **The foundation group is not decomposed.** Its +22.58% covers several
-   compiler, dtype, validation, and layout changes.
+3. **Foundation effects interact.** The leave-one-concept-out measurements are
+   marginal effects in the complete foundation, not an additive or factorial
+   allocation. Small effects are also close to sequential drift.
 4. **Two metric families.** The older cumulative sequence uses server-reported
    request latency. The current kernel and TTIS comparison uses the same
    streaming client clock. The two families are not directly interchangeable.

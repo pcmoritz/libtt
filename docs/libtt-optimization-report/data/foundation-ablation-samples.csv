@@ -1,0 +1,321 @@
+configuration,group,omitted_concept,sample,source_file,e2e_latency_s,throughput_tokens_s,completion_tokens,output_sha256_12
+baseline_compat,baseline,all foundation performance concepts,1,run_03.json,7.929907560,16.141423973,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,2,run_04.json,7.948438168,16.103792632,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,3,run_05.json,7.846039057,16.313964164,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,4,run_06.json,7.848656893,16.308522815,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,5,run_07.json,7.954473972,16.091573176,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,6,run_08.json,7.931249142,16.138693630,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,7,run_09.json,8.008109570,15.983797286,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,8,run_10.json,7.939005613,16.122925998,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,9,run_11.json,7.841559887,16.323282847,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,10,run_12.json,7.833409309,16.340267047,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,11,run_13.json,7.856076479,16.293120407,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,12,run_14.json,7.850575686,16.304536779,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,13,run_15.json,8.105436087,15.791870867,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,14,run_16.json,7.949796438,16.101041202,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,15,run_17.json,8.037327528,15.925691662,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,16,run_18.json,8.114513874,15.774204344,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,17,run_19.json,7.996740818,16.006521021,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,18,run_20.json,8.042134523,15.916172457,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,19,run_21.json,8.005674839,15.988658367,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,20,run_22.json,7.883814335,16.235795842,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,21,run_23.json,7.881566286,16.240426757,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,22,run_24.json,7.976476192,16.047186365,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,23,run_25.json,8.027399540,15.945387963,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,24,run_26.json,7.998374939,16.003250782,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,25,run_27.json,8.106192589,15.790397107,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,26,run_28.json,8.072168827,15.856952790,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,27,run_29.json,8.090393305,15.821233304,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,28,run_30.json,8.080907583,15.839804958,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,29,run_31.json,8.051704407,15.897255231,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,30,run_32.json,8.019667149,15.960762165,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,31,run_33.json,8.059976101,15.880940390,128,68e10a82edac
+baseline_compat,baseline,all foundation performance concepts,32,run_34.json,8.062165260,15.876628160,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,1,run_03.json,8.124312878,15.755178552,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,2,run_04.json,8.090381861,15.821255684,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,3,run_05.json,8.098042250,15.806289478,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,4,run_06.json,8.068801165,15.863570980,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,5,run_07.json,7.905305147,16.191658338,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,6,run_08.json,7.875443459,16.253053009,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,7,run_09.json,8.043218136,15.914028171,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,8,run_10.json,7.893931627,16.214987163,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,9,run_11.json,7.942975998,16.114866775,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,10,run_12.json,7.980939865,16.038211309,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,11,run_13.json,8.136688471,15.731215526,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,12,run_14.json,8.069911003,15.861389295,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,13,run_15.json,8.062628508,15.875715950,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,14,run_16.json,8.007561922,15.984890438,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,15,run_17.json,7.913037777,16.175835830,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,16,run_18.json,7.934538126,16.132003901,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,17,run_19.json,7.888964415,16.225196778,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,18,run_20.json,7.977788448,16.044546785,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,19,run_21.json,8.039374352,15.921636984,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,20,run_22.json,7.953567266,16.093407613,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,21,run_23.json,7.964686871,16.070939395,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,22,run_24.json,8.113068819,15.777013958,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,23,run_25.json,7.892451763,16.218027533,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,24,run_26.json,8.044176579,15.912132056,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,25,run_27.json,8.009746075,15.980531568,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,26,run_28.json,7.855634212,16.294037698,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,27,run_29.json,7.871136665,16.261946075,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,28,run_30.json,7.877912283,16.247959536,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,29,run_31.json,7.889177799,16.224757923,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,30,run_32.json,8.076192617,15.849052402,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,31,run_33.json,7.868955374,16.266453922,128,68e10a82edac
+baseline_b,baseline,all foundation performance concepts,32,run_34.json,7.983489752,16.033088784,128,68e10a82edac
+full_a,full foundation,none,1,run_03.json,6.377114058,20.071775233,128,68e10a82edac
+full_a,full foundation,none,2,run_04.json,6.444850206,19.860818468,128,68e10a82edac
+full_a,full foundation,none,3,run_05.json,6.472986937,19.774487614,128,68e10a82edac
+full_a,full foundation,none,4,run_06.json,6.541796207,19.566491517,128,68e10a82edac
+full_a,full foundation,none,5,run_07.json,6.500839710,19.689764047,128,68e10a82edac
+full_a,full foundation,none,6,run_08.json,6.559845924,19.512653418,128,68e10a82edac
+full_a,full foundation,none,7,run_09.json,6.416951418,19.947166756,128,68e10a82edac
+full_a,full foundation,none,8,run_10.json,6.472126484,19.777116581,128,68e10a82edac
+full_a,full foundation,none,9,run_11.json,6.438619614,19.880037598,128,68e10a82edac
+full_a,full foundation,none,10,run_12.json,6.523340940,19.621847328,128,68e10a82edac
+full_a,full foundation,none,11,run_13.json,6.334404230,20.207109517,128,68e10a82edac
+full_a,full foundation,none,12,run_14.json,6.324372768,20.239161208,128,68e10a82edac
+full_a,full foundation,none,13,run_15.json,6.436848879,19.885506466,128,68e10a82edac
+full_a,full foundation,none,14,run_16.json,6.350094795,20.157179401,128,68e10a82edac
+full_a,full foundation,none,15,run_17.json,6.491172075,19.719089021,128,68e10a82edac
+full_a,full foundation,none,16,run_18.json,6.511555195,19.657362361,128,68e10a82edac
+full_a,full foundation,none,17,run_19.json,6.465562820,19.797193772,128,68e10a82edac
+full_a,full foundation,none,18,run_20.json,6.362903357,20.116602882,128,68e10a82edac
+full_a,full foundation,none,19,run_21.json,6.509532213,19.663471323,128,68e10a82edac
+full_a,full foundation,none,20,run_22.json,6.370937109,20.091235843,128,68e10a82edac
+full_a,full foundation,none,21,run_23.json,6.465782404,19.796521442,128,68e10a82edac
+full_a,full foundation,none,22,run_24.json,6.313548803,20.273859281,128,68e10a82edac
+full_a,full foundation,none,23,run_25.json,6.418967962,19.940900274,128,68e10a82edac
+full_a,full foundation,none,24,run_26.json,6.522776365,19.623545685,128,68e10a82edac
+full_a,full foundation,none,25,run_27.json,6.452370644,19.837670070,128,68e10a82edac
+full_a,full foundation,none,26,run_28.json,6.312380314,20.277612190,128,68e10a82edac
+full_a,full foundation,none,27,run_29.json,6.569528580,19.483894232,128,68e10a82edac
+full_a,full foundation,none,28,run_30.json,6.574783802,19.468320762,128,68e10a82edac
+full_a,full foundation,none,29,run_31.json,6.511173248,19.658515465,128,68e10a82edac
+full_a,full foundation,none,30,run_32.json,6.502533436,19.684635421,128,68e10a82edac
+full_a,full foundation,none,31,run_33.json,6.466681480,19.793769090,128,68e10a82edac
+full_a,full foundation,none,32,run_34.json,6.546669483,19.551926415,128,68e10a82edac
+full_b,full foundation,none,1,run_03.json,6.593337297,19.413537367,128,68e10a82edac
+full_b,full foundation,none,2,run_04.json,6.522731781,19.623679817,128,68e10a82edac
+full_b,full foundation,none,3,run_05.json,6.473668814,19.772404750,128,68e10a82edac
+full_b,full foundation,none,4,run_06.json,6.348861456,20.161095165,128,68e10a82edac
+full_b,full foundation,none,5,run_07.json,6.337023258,20.198758121,128,68e10a82edac
+full_b,full foundation,none,6,run_08.json,6.324397564,20.239081858,128,68e10a82edac
+full_b,full foundation,none,7,run_09.json,6.322290659,20.245826537,128,68e10a82edac
+full_b,full foundation,none,8,run_10.json,6.395333290,20.014594110,128,68e10a82edac
+full_b,full foundation,none,9,run_11.json,6.399007320,20.003102605,128,68e10a82edac
+full_b,full foundation,none,10,run_12.json,6.418237448,19.943169919,128,68e10a82edac
+full_b,full foundation,none,11,run_13.json,6.332243681,20.214004143,128,68e10a82edac
+full_b,full foundation,none,12,run_14.json,6.383156300,20.052775460,128,68e10a82edac
+full_b,full foundation,none,13,run_15.json,6.360959768,20.122749500,128,68e10a82edac
+full_b,full foundation,none,14,run_16.json,6.454169035,19.832142497,128,68e10a82edac
+full_b,full foundation,none,15,run_17.json,6.331896305,20.215113109,128,68e10a82edac
+full_b,full foundation,none,16,run_18.json,6.331855059,20.215244792,128,68e10a82edac
+full_b,full foundation,none,17,run_19.json,6.316945791,20.262956851,128,68e10a82edac
+full_b,full foundation,none,18,run_20.json,6.322910547,20.243841668,128,68e10a82edac
+full_b,full foundation,none,19,run_21.json,6.341979980,20.182971311,128,68e10a82edac
+full_b,full foundation,none,20,run_22.json,6.575859785,19.465135235,128,68e10a82edac
+full_b,full foundation,none,21,run_23.json,6.445082426,19.860102872,128,68e10a82edac
+full_b,full foundation,none,22,run_24.json,6.540691376,19.569796623,128,68e10a82edac
+full_b,full foundation,none,23,run_25.json,6.516248703,19.643203603,128,68e10a82edac
+full_b,full foundation,none,24,run_26.json,6.389857292,20.031746273,128,68e10a82edac
+full_b,full foundation,none,25,run_27.json,6.333780050,20.209100882,128,68e10a82edac
+full_b,full foundation,none,26,run_28.json,6.435827732,19.888661619,128,68e10a82edac
+full_b,full foundation,none,27,run_29.json,6.568612814,19.486610587,128,68e10a82edac
+full_b,full foundation,none,28,run_30.json,6.526453495,19.612489401,128,68e10a82edac
+full_b,full foundation,none,29,run_31.json,6.358803749,20.129572330,128,68e10a82edac
+full_b,full foundation,none,30,run_32.json,6.553376675,19.531915584,128,68e10a82edac
+full_b,full foundation,none,31,run_33.json,6.415845871,19.950603954,128,68e10a82edac
+full_b,full foundation,none,32,run_34.json,6.328216076,20.226869384,128,68e10a82edac
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,1,run_03.json,7.563239813,16.923964223,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,2,run_04.json,7.736327887,16.545317349,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,3,run_05.json,7.588862896,16.866822046,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,4,run_06.json,7.562841415,16.924855748,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,5,run_07.json,7.724318266,16.571041689,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,6,run_08.json,7.735489130,16.547111352,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,7,run_09.json,7.681677818,16.663026363,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,8,run_10.json,7.602374077,16.836845794,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,9,run_11.json,7.558860779,16.933768692,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,10,run_12.json,7.568379879,16.912470310,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,11,run_13.json,7.638798475,16.756561966,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,12,run_14.json,7.715048075,16.590953000,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,13,run_15.json,7.654973507,16.721155192,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,14,run_16.json,7.608670235,16.822913341,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,15,run_17.json,7.715135574,16.590764837,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,16,run_18.json,7.662806511,16.704062646,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,17,run_19.json,7.527685642,17.003898155,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,18,run_20.json,7.763471603,16.487469336,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,19,run_21.json,7.785218000,16.441414999,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,20,run_22.json,7.761983395,16.490630486,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,21,run_23.json,7.805485249,16.398724221,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,22,run_24.json,7.668387890,16.691904718,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,23,run_25.json,7.662754774,16.704175427,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,24,run_26.json,7.710951567,16.599767084,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,25,run_27.json,7.663135529,16.703345455,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,26,run_28.json,7.700664997,16.621941098,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,27,run_29.json,7.791994810,16.427115664,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,28,run_30.json,7.729152203,16.560677891,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,29,run_31.json,7.727495432,16.564228491,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,30,run_32.json,7.725064278,16.569441418,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,31,run_33.json,7.627374411,16.781659469,128,9e9b8c4846c0
+no_rmsnorm,without RMSNorm recognition,JAX RMSNorm recognition,32,run_34.json,7.646944046,16.738712776,128,9e9b8c4846c0
+no_silu,without SiLU call lowering,SiLU call lowering,1,run_03.json,6.552043676,19.535889308,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,2,run_04.json,6.434969187,19.891315138,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,3,run_05.json,6.313879251,20.272798212,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,4,run_06.json,6.551383734,19.537857223,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,5,run_07.json,6.308696508,20.289452794,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,6,run_08.json,6.309924841,20.285503112,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,7,run_09.json,6.308235884,20.290934321,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,8,run_10.json,6.319152355,20.255881296,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,9,run_11.json,6.454741001,19.830385135,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,10,run_12.json,6.456502438,19.824975091,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,11,run_13.json,6.352422714,20.149792569,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,12,run_14.json,6.558569670,19.516450453,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,13,run_15.json,6.484761000,19.738584044,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,14,run_16.json,6.300009966,20.317428178,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,15,run_17.json,6.389780998,20.031985452,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,16,run_18.json,6.305021763,20.301278063,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,17,run_19.json,6.295887709,20.330731094,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,18,run_20.json,6.302717924,20.308698809,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,19,run_21.json,6.328943729,20.224543853,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,20,run_22.json,6.346070051,20.169963295,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,21,run_23.json,6.395536661,20.013957668,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,22,run_24.json,6.303041220,20.307657135,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,23,run_25.json,6.307816267,20.292284141,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,24,run_26.json,6.523235321,19.622165030,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,25,run_27.json,6.489568472,19.723961702,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,26,run_28.json,6.463532686,19.803411882,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,27,run_29.json,6.504657745,19.678206758,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,28,run_30.json,6.375414133,20.077127121,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,29,run_31.json,6.429030180,19.909690329,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,30,run_32.json,6.509172440,19.664558158,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,31,run_33.json,6.555750847,19.524842080,128,68e10a82edac
+no_silu,without SiLU call lowering,SiLU call lowering,32,run_34.json,6.485311270,19.736909252,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,1,run_03.json,6.671391249,19.186402840,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,2,run_04.json,6.761554003,18.930559446,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,3,run_05.json,6.575258017,19.466916686,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,4,run_06.json,6.550445318,19.540656212,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,5,run_07.json,6.529105186,19.604524103,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,6,run_08.json,6.553472757,19.531629220,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,7,run_09.json,6.543445349,19.561560184,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,8,run_10.json,6.554211140,19.529428832,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,9,run_11.json,6.537635326,19.578944620,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,10,run_12.json,6.689524174,19.134395314,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,11,run_13.json,6.772108316,18.901056218,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,12,run_14.json,6.568410635,19.487210394,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,13,run_15.json,6.580839396,19.450406294,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,14,run_16.json,6.536835432,19.581340441,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,15,run_17.json,6.652382374,19.241227098,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,16,run_18.json,6.576413631,19.463495938,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,17,run_19.json,6.562832355,19.503774143,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,18,run_20.json,6.769680023,18.907836052,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,19,run_21.json,6.628969908,19.309184048,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,20,run_22.json,6.720956087,19.044909436,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,21,run_23.json,6.740813494,18.988806042,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,22,run_24.json,6.753630877,18.952768124,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,23,run_25.json,6.743374348,18.981594881,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,24,run_26.json,6.754853249,18.949338393,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,25,run_27.json,6.578317881,19.457861770,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,26,run_28.json,6.705515385,19.088763899,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,27,run_29.json,6.534979582,19.586901290,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,28,run_30.json,6.528680325,19.605799892,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,29,run_31.json,6.540816784,19.569421408,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,30,run_32.json,6.575138330,19.467271039,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,31,run_33.json,6.541613340,19.567038487,128,68e10a82edac
+no_rope,without rank-3 RoPE fusion,rank-3 decode RoPE fusion,32,run_34.json,6.542776346,19.563560364,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,1,run_03.json,6.386816263,20.041284221,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,2,run_04.json,6.498481035,19.696910602,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,3,run_05.json,6.535524607,19.585267856,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,4,run_06.json,6.580528498,19.451325231,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,5,run_07.json,6.588055372,19.429102029,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,6,run_08.json,6.571712494,19.477419336,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,7,run_09.json,6.582595587,19.445217060,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,8,run_10.json,6.490176201,19.722114784,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,9,run_11.json,6.501876116,19.686625479,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,10,run_12.json,6.513895750,19.650299132,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,11,run_13.json,6.357703209,20.133056828,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,12,run_14.json,6.493787766,19.711146194,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,13,run_15.json,6.326989412,20.230790927,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,14,run_16.json,6.482645512,19.745025356,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,15,run_17.json,6.569558382,19.483805845,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,16,run_18.json,6.451283932,19.841011705,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,17,run_19.json,6.422364950,19.930352914,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,18,run_20.json,6.423400879,19.927138663,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,19,run_21.json,6.578292370,19.457937228,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,20,run_22.json,6.562290668,19.505384090,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,21,run_23.json,6.590442181,19.422065545,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,22,run_24.json,6.569799423,19.483090998,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,23,run_25.json,6.520448446,19.630551649,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,24,run_26.json,6.330221176,20.220462514,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,25,run_27.json,6.438940048,19.879048266,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,26,run_28.json,6.324490547,20.238784301,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,27,run_29.json,6.335658312,20.203109716,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,28,run_30.json,6.333675146,20.209435604,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,29,run_31.json,6.360453129,20.124352370,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,30,run_32.json,6.327763319,20.228316634,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,31,run_33.json,6.501656532,19.687290364,128,68e10a82edac
+no_kv_dtype,without KV-cache result typing,KV-cache result typing,32,run_34.json,6.507660866,19.669125764,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,1,run_03.json,6.612679720,19.356751789,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,2,run_04.json,6.471209526,19.779918960,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,3,run_05.json,6.460432529,19.812914912,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,4,run_06.json,6.544483185,19.558458076,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,5,run_07.json,6.495995283,19.704447805,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,6,run_08.json,6.625235319,19.320068471,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,7,run_09.json,6.616215944,19.346406024,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,8,run_10.json,6.348051786,20.163666635,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,9,run_11.json,6.356022358,20.138381018,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,10,run_12.json,6.440701485,19.873611641,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,11,run_13.json,6.375023603,20.078357032,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,12,run_14.json,6.374428034,20.080232975,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,13,run_15.json,6.373466969,20.083260905,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,14,run_16.json,6.397150517,20.008908602,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,15,run_17.json,6.374964952,20.078541757,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,16,run_18.json,6.375936747,20.075481468,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,17,run_19.json,6.371425867,20.089694626,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,18,run_20.json,6.435080290,19.890971710,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,19,run_21.json,6.395453691,20.014217314,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,20,run_22.json,6.507747412,19.668864186,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,21,run_23.json,6.557100296,19.520823874,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,22,run_24.json,6.508476257,19.666661587,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,23,run_25.json,6.553154945,19.532576456,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,24,run_26.json,6.455810785,19.827099067,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,25,run_27.json,6.541087627,19.568611107,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,26,run_28.json,6.377594233,20.070264011,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,27,run_29.json,6.377730131,20.069836347,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,28,run_30.json,6.380803347,20.060170020,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,29,run_31.json,6.379639626,20.063829231,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,30,run_32.json,6.439115047,19.878508003,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,31,run_33.json,6.495578766,19.705711317,128,68e10a82edac
+no_bf8_activation,without BF8 activation lowering,BF8 activation lowering,32,run_34.json,6.436584234,19.886324072,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,1,run_03.json,6.328628778,20.225550349,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,2,run_04.json,6.327878952,20.227946990,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,3,run_05.json,6.320787430,20.250641462,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,4,run_06.json,6.347273588,20.166138772,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,5,run_07.json,6.426780701,19.916659049,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,6,run_08.json,6.356644630,20.136409606,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,7,run_09.json,6.328408718,20.226253661,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,8,run_10.json,6.301996231,20.311024524,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,9,run_11.json,6.340026855,20.189188929,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,10,run_12.json,6.411423683,19.964364598,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,11,run_13.json,6.428256989,19.912085069,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,12,run_14.json,6.531866550,19.596236238,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,13,run_15.json,6.460252523,19.813466971,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,14,run_16.json,6.393279791,20.021022728,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,15,run_17.json,6.411589146,19.963849381,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,16,run_18.json,6.298011780,20.323874339,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,17,run_19.json,6.307962179,20.291814752,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,18,run_20.json,6.325628042,20.235144897,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,19,run_21.json,6.456549883,19.824829409,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,20,run_22.json,6.351628065,20.152313499,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,21,run_23.json,6.372841597,20.085231691,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,22,run_24.json,6.393437862,20.020527728,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,23,run_25.json,6.314383030,20.271180794,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,24,run_26.json,6.311538935,20.280315360,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,25,run_27.json,6.534226418,19.589158964,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,26,run_28.json,6.556231260,19.523411380,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,27,run_29.json,6.527347565,19.609803022,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,28,run_30.json,6.467731237,19.790556426,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,29,run_31.json,6.417701960,19.944833962,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,30,run_32.json,6.437783480,19.882619601,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,31,run_33.json,6.439508200,19.877294357,128,68e10a82edac
+no_layout_admission,without decode layout admission,decode layout admission,32,run_34.json,6.353987217,20.144831211,128,68e10a82edac

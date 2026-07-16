@@ -916,7 +916,14 @@ Recover JAX RMSNorm\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 TTIR graph rewrite\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedleft
-Included in +22.58\% foundation bundle\strut
++19.28\% marginal foundation effect\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.30\columnwidth}\raggedright
+Lower SiLU calls\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+StableHLO-to-TTIR rewrite\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedleft
+No positive decode effect detected\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Recognize expanded SiLU\strut
@@ -930,7 +937,7 @@ Fuse rank-3 decode RoPE\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 TTIR/TTNN composite resolution\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedleft
-Included in foundation bundle\strut
++2.89\% marginal foundation effect\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Fuse Qwen decode QKV structure\strut
@@ -944,21 +951,21 @@ Preserve KV-cache result types\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 TTNN type inference\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedleft
-Included in foundation bundle\strut
++0.54\% marginal; near measured drift\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.30\columnwidth}\raggedright
-Enable BF8 activation/weight path\strut
+Enable BF8 activation lowering\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
-Compile options, TTNN lowering, host packing\strut
+Compile options and TTNN lowering\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedleft
-Foundation/baseline; not isolated\strut
++0.26\% marginal; near measured drift\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Permit decode layouts\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
 TTNN/TT-Metal validation\strut
 \end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedleft
-Included in foundation bundle\strut
+No positive decode effect detected\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.30\columnwidth}\raggedright
 Width-shard decode RMSNorm\strut
@@ -1020,6 +1027,7 @@ Patch index:
 
 \begin{verbatim}
 RMSNorm graph       tt_mlir_fuse_jax_rms_norm.patch
+SiLU call           tt_mlir_lower_silu_call.patch
 expanded SiLU       tt_mlir_fuse_expanded_silu.patch
 decode RoPE         tt_mlir_fuse_rank3_rope_decode.patch
 QKV structure       tt_mlir_qwen_decode_qkv_projection_fusion.patch
@@ -1037,12 +1045,14 @@ down projection     down_projection_110_core.patch
 
 \endgroup
 
-The +22.58\% foundation figure combines patches that were not measured
-separately. The blocking and down-projection tests use a direct
-streaming clock. Their final configuration forms the last stage of the
-cumulative sequence using streaming end-to-end throughput; the
-same-build A/B tests below isolate the effects of the two kernel
-changes.
+The original foundation measurement combined these patches into one
++22.58\% stage. A new leave-one-concept-out experiment below separates
+their marginal effects and measures a fresh total gain of +24.03\%. The
+effects overlap and do not add to the total. The blocking and
+down-projection tests use a direct streaming clock. Their final
+configuration forms the last stage of the cumulative sequence using
+streaming end-to-end throughput; the same-build A/B tests below isolate
+the effects of the two kernel changes.
 
 The first group recovers model semantics in TTIR and TTNN before
 lowerings discard the algebra and graph roles needed to recognize them.
@@ -1054,8 +1064,19 @@ JAX can lower RMSNorm to square, reduce, epsilon addition, reciprocal
 square root, scaling, and reshapes. A TTIR pattern proves this structure
 and replaces it with one RMSNorm operation while the algebra and use-def
 graph are still available. TTNN can then apply its normalization and
-layout logic. Recognition is part of the foundation bundle and enables
-the later runtime-sharding patch.
+layout logic. Removing this patch from the otherwise complete foundation
+lowers throughput from 19.894 to 16.678 tokens/s. Restoring it gives a
++19.28\% marginal speedup. It also enables the later runtime-sharding
+patch.
+
+\hypertarget{silu-call-lowering}{%
+\subsection{SiLU call lowering}\label{silu-call-lowering}}
+
+Some JAX graphs contain a function call named \texttt{silu}. The
+foundation patch replaces that call with a TTIR SiLU operation during
+StableHLO legalization. Removing the patch changes throughput by
++0.45\%, so this exact graph does not show a positive decode effect. The
+patch remains useful for graph coverage.
 
 \hypertarget{expanded-silu-recognition}{%
 \subsection{Expanded-SiLU recognition}\label{expanded-silu-recognition}}
@@ -1066,7 +1087,8 @@ The graph represents
 \operatorname{SiLU}(x)=x\,\sigma(x)=\frac{x}{1+\exp(-x)}
 \]
 
-with casts, broadcasts, reshapes, and a splatted scalar one.
+with casts, broadcasts, reshapes, and a splatted scalar one. This is
+separate from the foundation call-lowering patch. The later
 \texttt{tt\_mlir\_fuse\_expanded\_silu.patch} looks through view-like
 operations, verifies the constant and shared input, and replaces the
 tree with SiLU. The isolated gain is +3.30\%.
@@ -1095,7 +1117,8 @@ patches recover this structure:
 
 TTIR supplies candidate ordering and role information; TTNN owns the
 composite operation and runtime contract. QKV fusion adds +1.15\%.
-Rank-3 RoPE is part of the foundation bundle.
+Removing rank-3 RoPE fusion from the foundation lowers throughput by
+2.81\%; restoring it gives a +2.89\% marginal speedup.
 
 \hypertarget{kv-cache-dtype-and-role-propagation}{%
 \subsection{KV-cache dtype and role
@@ -1105,8 +1128,9 @@ KV-cache update operations are stateful boundaries. Their return types
 must carry the selected device dtype, and graph-role metadata must
 survive unary operations so later fusions can still identify query, key,
 and value paths. The TT-MLIR and TT-XLA patches keep the low-precision
-fused graph typed and recognizable. They are enabling changes rather
-than isolated speedups.
+fused graph typed and recognizable. Removing KV-cache return-type
+preservation lowers throughput by 0.54\%; restoring it gives a +0.54\%
+marginal speedup.
 
 The next group selects precision and layout after the graph operations
 have been recovered.
@@ -1131,7 +1155,11 @@ These changes attack two different phases:
   faster packing reduces model-load and preparation cost on the host.
 \end{itemize}
 
-We did not isolate these effects from the foundation bundle.
+BF8 weights and fast host packing already existed in the functional
+baseline. The foundation adds single-chip activation lowering through
+one TT-XLA patch and one TT-MLIR patch. Removing those two patches
+together lowers throughput by 0.25\%; restoring them gives a +0.26\%
+marginal speedup.
 
 \hypertarget{width-sharded-decode-rmsnorm}{%
 \subsection{Width-sharded decode
@@ -1181,8 +1209,11 @@ graph:
   decode path.
 \end{itemize}
 
-These narrow changes remove conversions while keeping shape and layout
-checks. Their performance effect is part of the foundation bundle.
+These narrow changes keep shape and layout checks while admitting
+layouts used by other optimized paths. Removing both changes throughput
+by +0.66\% in this experiment, so no positive decode effect is detected
+for the measured graph. Their role is compatibility rather than the
+source of the foundation speedup.
 
 The MLP experiments test which intermediate and data-movement boundaries
 must be removed for fusion to improve decode throughput.
@@ -1513,7 +1544,7 @@ Serving frontend & \texttt{/home/pcmoritz/sglang-jax} at
 \texttt{24eb823ed97e}\tabularnewline
 Established main snapshot & \texttt{627a32d}\tabularnewline
 Current kernel snapshot & \texttt{37d5460}\tabularnewline
-Benchmark date & 15 July 2026, America/Los\_Angeles\tabularnewline
+Benchmark date & 15--16 July 2026, America/Los\_Angeles\tabularnewline
 \bottomrule
 \end{longtable}
 
@@ -1554,6 +1585,11 @@ overlap scheduling are disabled so every request executes the same
 prompt prefill and does not overlap another request. Optional CPU/fused
 sampling paths remain at their disabled defaults; this report concerns
 the main model path.
+
+The foundation decomposition uses the same command with
+\texttt{SGLANG\_TT\_TRACE\_DECODE\_ONLY=true}. V0 and V1 predate
+fixed-shape prefill tracing, so this reproduces the timing scope of the
+original +22.58\% measurement. All foundation variants use that setting.
 
 \hypertarget{request-and-sample-policy}{%
 \subsection{Request and sample policy}\label{request-and-sample-policy}}
@@ -1831,6 +1867,212 @@ benchmark. V10 uses the loopback streaming end-to-end clock needed for
 the kernel A/B and external-server comparison. The clocks have the same
 request scope but are collected independently, so the V10 incremental
 value is the change between stage means, not the isolated kernel effect.
+
+\clearpage
+
+\hypertarget{decomposing-the-foundation}{%
+\subsection{Decomposing the
+foundation}\label{decomposing-the-foundation}}
+
+We repeated the V0/V1 comparison and built six leave-one-concept-out
+variants from the V1 foundation. The full foundation and functional
+baseline each have two separate 32-request windows, for 64 retained
+requests each. Every omission has 32 retained requests. All builds keep
+the NoC public-include patch because it only fixes the build.
+
+\begin{longtable}[]{@{}lrrcrrr@{}}
+\caption{Fresh foundation decomposition. Change versus full is the
+throughput change when the concept is omitted. Marginal speedup is full
+divided by the omission. Gain share is the omitted throughput loss
+divided by the total 3.854-token/s foundation gain; it is descriptive
+and non-additive.}\tabularnewline
+\toprule
+\begin{minipage}[b]{0.11\columnwidth}\raggedright
+Configuration\strut
+\end{minipage} & \begin{minipage}[b]{0.11\columnwidth}\raggedleft
+N\strut
+\end{minipage} & \begin{minipage}[b]{0.11\columnwidth}\raggedleft
+Mean ± SD (tok/s)\strut
+\end{minipage} & \begin{minipage}[b]{0.15\columnwidth}\centering
+95\% CI\strut
+\end{minipage} & \begin{minipage}[b]{0.11\columnwidth}\raggedleft
+Change vs.~full\strut
+\end{minipage} & \begin{minipage}[b]{0.11\columnwidth}\raggedleft
+Marginal speedup\strut
+\end{minipage} & \begin{minipage}[b]{0.11\columnwidth}\raggedleft
+Gain share\strut
+\end{minipage}\tabularnewline
+\midrule
+\endfirsthead
+\toprule
+\begin{minipage}[b]{0.11\columnwidth}\raggedright
+Configuration\strut
+\end{minipage} & \begin{minipage}[b]{0.11\columnwidth}\raggedleft
+N\strut
+\end{minipage} & \begin{minipage}[b]{0.11\columnwidth}\raggedleft
+Mean ± SD (tok/s)\strut
+\end{minipage} & \begin{minipage}[b]{0.15\columnwidth}\centering
+95\% CI\strut
+\end{minipage} & \begin{minipage}[b]{0.11\columnwidth}\raggedleft
+Change vs.~full\strut
+\end{minipage} & \begin{minipage}[b]{0.11\columnwidth}\raggedleft
+Marginal speedup\strut
+\end{minipage} & \begin{minipage}[b]{0.11\columnwidth}\raggedleft
+Gain share\strut
+\end{minipage}\tabularnewline
+\midrule
+\endhead
+\begin{minipage}[t]{0.11\columnwidth}\raggedright
+Functional baseline\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+64\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+16.039 ± 0.177\strut
+\end{minipage} & \begin{minipage}[t]{0.15\columnwidth}\centering
+{[}15.995, 16.084{]}\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+-19.37\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
++24.03\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+100.0\%\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.11\columnwidth}\raggedright
+Full foundation\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+64\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+19.894 ± 0.265\strut
+\end{minipage} & \begin{minipage}[t]{0.15\columnwidth}\centering
+{[}19.827, 19.960{]}\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+---\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+---\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+---\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.11\columnwidth}\raggedright
+Without JAX RMSNorm recognition\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+32\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+16.678 ± 0.164\strut
+\end{minipage} & \begin{minipage}[t]{0.15\columnwidth}\centering
+{[}16.619, 16.737{]}\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+-16.16\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
++19.28\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+83.4\%\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.11\columnwidth}\raggedright
+Without rank-3 decode RoPE fusion\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+32\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+19.335 ± 0.259\strut
+\end{minipage} & \begin{minipage}[t]{0.15\columnwidth}\centering
+{[}19.242, 19.429{]}\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+-2.81\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
++2.89\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+14.5\%\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.11\columnwidth}\raggedright
+Without KV-cache result typing\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+32\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+19.786 ± 0.289\strut
+\end{minipage} & \begin{minipage}[t]{0.15\columnwidth}\centering
+{[}19.682, 19.890{]}\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+-0.54\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
++0.54\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+2.8\%\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.11\columnwidth}\raggedright
+Without BF8 activation lowering\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+32\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+19.843 ± 0.255\strut
+\end{minipage} & \begin{minipage}[t]{0.15\columnwidth}\centering
+{[}19.751, 19.935{]}\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+-0.25\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
++0.26\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+1.3\%\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.11\columnwidth}\raggedright
+Without SiLU call lowering\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+32\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+19.983 ± 0.292\strut
+\end{minipage} & \begin{minipage}[t]{0.15\columnwidth}\centering
+{[}19.878, 20.088{]}\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
++0.45\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+-0.45\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+-2.3\%\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.11\columnwidth}\raggedright
+Without decode layout admission\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+32\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+20.024 ± 0.234\strut
+\end{minipage} & \begin{minipage}[t]{0.15\columnwidth}\centering
+{[}19.940, 20.108{]}\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
++0.66\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+-0.65\%\strut
+\end{minipage} & \begin{minipage}[t]{0.11\columnwidth}\raggedleft
+-3.4\%\strut
+\end{minipage}\tabularnewline
+\bottomrule
+\end{longtable}
+
+\begin{figure}
+\hypertarget{fig:foundation-ablation}{%
+\centering
+\includegraphics[width=1\textwidth,height=\textheight]{figures/foundation-ablation.svg}
+\caption{Throughput change when each foundation concept is
+omitted.}\label{fig:foundation-ablation}
+}
+\end{figure}
+
+RMSNorm recognition explains most of the gain. Its 3.216-token/s
+marginal loss is 83.4\% of the total baseline-to-foundation difference.
+Rank-3 RoPE fusion is the second clear contributor at 0.558 tokens/s, or
+14.5\% of the total. The KV-cache and BF8 activation effects are small.
+SiLU call lowering and layout admission show no positive decode effect
+in this graph; they provide graph and layout coverage.
+
+The shares sum to 96.3\%, not 100\%, because patches interact and each
+omission is measured with all other foundation patches present. This is
+not an additive or factorial allocation. The two full-window means are
+19.832 and 19.955 tokens/s; the baseline means are 16.043 and 16.036
+tokens/s. The fresh total gain is +24.03\%. The old +22.58\% result used
+a 16.265-token/s baseline. The new full mean is only 0.22\% below the
+old 19.938-token/s result, while the new baseline is 1.38\% lower.
+
+All configurations return 128 tokens and are deterministic within each
+window. The no-RMSNorm output has a different token hash from the other
+configurations, although both completions are coherent. This test
+therefore does not establish equal model quality.
 
 \hypertarget{isolating-the-final-mlp-kernel-stage}{%
 \subsection{Isolating the final MLP-kernel
@@ -2126,8 +2368,10 @@ work}\label{limitations-and-future-work}}
   real cumulative builds, not a factorial experiment. Patch effects can
   interact.
 \item
-  \textbf{The foundation group is not decomposed.} Its +22.58\% covers
-  several compiler, dtype, validation, and layout changes.
+  \textbf{Foundation effects interact.} The leave-one-concept-out
+  measurements are marginal effects in the complete foundation, not an
+  additive or factorial allocation. Small effects are also close to
+  sequential drift.
 \item
   \textbf{Two metric families.} The older cumulative sequence uses
   server-reported request latency. The current kernel and TTIS

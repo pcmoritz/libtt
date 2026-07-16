@@ -9,6 +9,8 @@ and publication artifacts.
 - `report.html`, `report.tex`, and `report.pdf`: generated report artifacts;
 - `data/samples.csv` and `data/summary.csv`: 32-sample optimization sequence,
   including the final streaming end-to-end MLP-kernel stage;
+- `data/foundation-ablation-*`: fresh 64-sample baseline/full comparison and
+  32-sample leave-one-concept-out foundation measurements;
 - `data/current-kernel-samples.csv` and
   `data/current-kernel-summary.csv`: blocking and down-projection A/B data;
 - `data/current-kernel-manifest.json`: current experiment provenance;
@@ -24,12 +26,24 @@ and publication artifacts.
 ## Regenerate statistics and figures
 
 The raw benchmark directories referenced by `analyze.py` must be available
-under `/tmp`. From the repository root, run:
+under `/tmp`, including `/tmp/libtt-foundation-bench-20260716` for the
+foundation decomposition. From the repository root, run:
 
 ```bash
 /home/pcmoritz/sglang-jax/.venv/bin/python \
   docs/libtt-optimization-report/analyze.py
 ```
+
+## Foundation decomposition
+
+The foundation experiment uses commit `9978a9b` and the Qwen3-8B server
+command from the repository README, with
+`SGLANG_TT_TRACE_DECODE_ONLY=true` to match the original V0/V1 timing scope.
+Each server run records two warmups followed by 32 retained requests. The raw
+directory has two full-foundation runs, two functional-baseline runs, and one
+run for each leave-one-concept-out build. The baseline keeps the build-only NoC
+public-include patch. Exact patch groups and source provenance are recorded in
+`data/foundation-ablation-manifest.json`.
 
 ## Build the report
 
