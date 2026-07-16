@@ -7,7 +7,8 @@ and publication artifacts.
 
 - `report.md`: canonical report source;
 - `report.html`, `report.tex`, and `report.pdf`: generated report artifacts;
-- `data/samples.csv` and `data/summary.csv`: established 32-sample sequence;
+- `data/samples.csv` and `data/summary.csv`: 32-sample optimization sequence,
+  including the final streaming end-to-end MLP-kernel stage;
 - `data/current-kernel-samples.csv` and
   `data/current-kernel-summary.csv`: blocking and down-projection A/B data;
 - `data/current-kernel-manifest.json`: current experiment provenance;

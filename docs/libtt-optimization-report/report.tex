@@ -134,12 +134,12 @@ architectural path to PyTorch through TorchTPU. libtt packages the
 open-source compiler, runtime, device kernels, and runtime assets in one
 shared library. We demonstrate it with upstream SGLang-JAX and Qwen3-8B.
 A sequence of graph, layout, runtime, and kernel optimizations raises
-128-token generation from 16.265 to 26.123 tokens/s. A shape-specific
-down projection reaches 27.753 decode tokens/s, 11.51\% faster than the
-measured tt-inference-server reference on the same Blackhole P150 and
-workload. The result shows that a stable XLA boundary can keep the upper
-software stack close to upstream while concentrating hardware-specific
-performance work in the compiler and lower runtime.
+measured 128-token end-to-end generation from 16.265 to 27.619 tokens/s,
+a 69.81\% improvement, and delivers 27.753 decode tokens/s, 11.51\%
+faster than the measured tt-inference-server reference on the same
+Blackhole P150 and workload. The result shows that a stable XLA boundary
+can keep the upper software stack close to upstream while concentrating
+hardware-specific performance work in the compiler and lower runtime.
 
 \hypertarget{introduction}{%
 \section{Introduction}\label{introduction}}
@@ -177,10 +177,9 @@ this XLA boundary with upstream SGLang-JAX and identifies the future
 PyTorch/TorchTPU path. Third, it presents compiler and kernel
 optimizations that cross StableHLO, TT-MLIR, TTNN, and TT-Metal without
 modifying the SGLang scheduler or Qwen model {[}31{]}. Finally, it
-measures a 60.61\% improvement from 16.265 to 26.123 tokens/s; a
-subsequent 110-core down projection reaches 27.753 decode tokens/s,
-11.51\% above the matched tt-inference-server v0.10.0 reference
-{[}20{]}.
+measures a 69.81\% end-to-end improvement from 16.265 to 27.619 tokens/s
+and 27.753 decode tokens/s, 11.51\% above the matched
+tt-inference-server v0.10.0 reference {[}20{]}.
 
 The following sections describe the system boundary, compiler and
 runtime representations, individual optimizations, and measured effects.
@@ -1043,8 +1042,11 @@ down projection     down_projection_110_core.patch
 \endgroup
 
 The +22.58\% foundation figure combines patches that were not measured
-separately. The blocking and down-projection tests use a streaming
-decode clock, so they remain outside the cumulative sequence.
+separately. The blocking and down-projection tests use a direct
+streaming clock. Their final configuration forms the last stage of the
+cumulative sequence using streaming end-to-end throughput; the
+same-build A/B tests below isolate the effects of the two kernel
+changes.
 
 The first group recovers model semantics in TTIR and TTNN before
 lowerings discard the algebra and graph roles needed to recognize them.
@@ -1612,12 +1614,11 @@ dependence.
 \hypertarget{results}{%
 \section{Results}\label{results}}
 
-\hypertarget{established-concept-sequence}{%
-\subsection{Established concept
-sequence}\label{established-concept-sequence}}
+\hypertarget{optimization-sequence}{%
+\subsection{Optimization sequence}\label{optimization-sequence}}
 
 V0 is the functional baseline: it runs upstream SGLang-JAX but has few
-model-specific performance optimizations. V1 through V9 add compiler,
+model-specific performance optimizations. V1 through V10 add compiler,
 runtime, and kernel changes below the XLA/PJRT boundary. Commit IDs are
 recorded in the CSV files.
 
@@ -1788,6 +1789,19 @@ Fixed-shape prefill trace\strut
 \end{minipage} & \begin{minipage}[t]{0.13\columnwidth}\raggedleft
 +60.61\%\strut
 \end{minipage}\tabularnewline
+\begin{minipage}[t]{0.13\columnwidth}\raggedright
+V10\strut
+\end{minipage} & \begin{minipage}[t]{0.13\columnwidth}\raggedright
+SwiGLU blocking and 110-core down projection\strut
+\end{minipage} & \begin{minipage}[t]{0.13\columnwidth}\raggedleft
+27.619 ± 0.322\strut
+\end{minipage} & \begin{minipage}[t]{0.18\columnwidth}\centering
+{[}27.503, 27.735{]}\strut
+\end{minipage} & \begin{minipage}[t]{0.13\columnwidth}\raggedleft
++5.73\%\strut
+\end{minipage} & \begin{minipage}[t]{0.13\columnwidth}\raggedleft
++69.81\%\strut
+\end{minipage}\tabularnewline
 \bottomrule
 \end{longtable}
 
@@ -1806,7 +1820,7 @@ concepts.}\label{fig:throughput}
 \hypertarget{fig:incremental}{%
 \centering
 \includegraphics[width=1\textwidth,height=\textheight]{figures/incremental-speedup.svg}
-\caption{Incremental effect of each concept in the established
+\caption{Incremental effect of each concept in the optimization
 sequence.}\label{fig:incremental}
 }
 \end{figure}
@@ -1816,9 +1830,19 @@ fusion materializes too much data, consumer-side SiLU leaves the
 producer boundary, and fallback removal changes coverage rather than the
 kernel.
 
-\hypertarget{current-kernel-ab-experiments}{%
-\subsection{Current kernel A/B
-experiments}\label{current-kernel-ab-experiments}}
+V0 through V9 use the server-reported request latency from the README
+benchmark. V10 uses the loopback streaming end-to-end clock needed for
+the kernel A/B and external-server comparison. The clocks have the same
+request scope but are collected independently, so the V10 incremental
+value is the change between stage means, not the isolated kernel effect.
+
+\hypertarget{isolating-the-final-mlp-kernel-stage}{%
+\subsection{Isolating the final MLP-kernel
+stage}\label{isolating-the-final-mlp-kernel-stage}}
+
+The V10 result combines the SwiGLU blocking choice and the 110-core down
+projection with the preceding compiler, runtime, and kernel
+optimizations. The same-build measurements below separate their effects.
 
 \begin{longtable}[]{@{}lrcrr@{}}
 \caption{Current-branch streaming results, 32 retained samples per
@@ -2155,11 +2179,11 @@ coverage exist. One Bazel graph makes the lower stack available for
 cross-layer optimization.
 
 We started with a functional backend that runs upstream SGLang-JAX at
-16.265 tokens/s. Compiler, runtime, and kernel changes improve
-end-to-end throughput by 60.61\%, and the 110-core down projection
-reaches 27.753 decode tokens/s. Under the matched benchmark conditions,
-libtt is 11.51\% faster than the TTIS decode mean even though TTIS also
-uses TT-specific transformer and inference-engine layers.
+16.265 tokens/s. Compiler, runtime, and kernel changes raise measured
+end-to-end throughput by 69.81\% to 27.619 tokens/s and deliver 27.753
+decode tokens/s. Under the matched benchmark conditions, libtt is
+11.51\% faster than the TTIS decode mean even though TTIS also uses
+TT-specific transformer and inference-engine layers.
 
 We measured JAX inference. The PJRT/StableHLO architecture is not tied
 to JAX or inference and can support JAX or PyTorch training once the

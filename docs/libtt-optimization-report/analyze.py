@@ -5,9 +5,10 @@ The benchmark driver intentionally records two warm-up requests before the
 32-request analysis window.  This script consumes the raw SGLang JSON files,
 checks the retained outputs, and writes publication-ready CSV/SVG artifacts.
 It also analyzes the separately collected upstream tt-inference-server
-baseline and the current SwiGLU-blocking/down-projection experiments.  Those
-experiments are not inserted into the older cumulative libtt sequence because
-they use a direct streaming decode clock.
+baseline and the current SwiGLU-blocking/down-projection experiments.  The
+final optimized configuration is included as the last stage of the cumulative
+sequence using streaming end-to-end throughput; the report identifies the
+clock change at that boundary.
 """
 
 from __future__ import annotations
@@ -121,6 +122,14 @@ VARIANTS = [
     ),
 ]
 
+FINAL_VARIANT = Variant(
+    "V10",
+    "37d5460",
+    "SwiGLU blocking and 110-core down projection",
+    "MLP kernels",
+    DOWN_PROJECTION_110_DIR,
+)
+
 
 def retained_json(variant: Variant) -> list[tuple[Path, dict]]:
     paths = [Path(p) for p in sorted(glob.glob(str(variant.raw_dir / "run_*.json")))]
@@ -140,6 +149,96 @@ def token_hash(output_ids: list[int]) -> str:
     return hashlib.sha256(encoded).hexdigest()[:12]
 
 
+def append_final_streaming_stage(
+    samples: list[dict],
+    summaries: list[dict],
+    baseline_mean: float,
+    previous: list[float],
+) -> list[float]:
+    """Append the final kernel configuration using streaming E2E throughput."""
+
+    paths = sorted(FINAL_VARIANT.raw_dir.glob("run_*.json"))
+    records = [(path, json.loads(path.read_text())) for path in paths]
+    retained = [
+        (path, record)
+        for path, record in records
+        if record["phase"] == "retained"
+    ][:N_SAMPLES]
+    if len(retained) != N_SAMPLES:
+        raise RuntimeError(
+            f"{FINAL_VARIANT.label}: expected {N_SAMPLES} retained files, "
+            f"found {len(retained)}"
+        )
+
+    throughputs: list[float] = []
+    hashes: set[str] = set()
+    for sample_index, (path, record) in enumerate(retained, 1):
+        if (
+            record["completion_tokens"] != TOKENS
+            or record["stream_chunks"] != TOKENS
+        ):
+            raise RuntimeError(f"{path}: incomplete streaming response")
+        latency = float(record["total_s"])
+        throughput = TOKENS / latency
+        output_hash = record["completion_text_sha256_12"]
+        throughputs.append(throughput)
+        hashes.add(output_hash)
+        samples.append(
+            {
+                "variant": FINAL_VARIANT.label,
+                "commit": FINAL_VARIANT.commit,
+                "sample": sample_index,
+                "source_file": path.name,
+                "e2e_latency_s": f"{latency:.9f}",
+                "throughput_tokens_s": f"{throughput:.9f}",
+                "completion_tokens": record["completion_tokens"],
+                "output_sha256_12": output_hash,
+            }
+        )
+    if len(hashes) != 1:
+        raise RuntimeError(
+            f"{FINAL_VARIANT.label}: retained requests are not deterministic: "
+            f"{hashes}"
+        )
+
+    mean = statistics.mean(throughputs)
+    stddev = statistics.stdev(throughputs)
+    ci_low, ci_high = stats.t.interval(
+        0.95,
+        len(throughputs) - 1,
+        loc=mean,
+        scale=stats.sem(throughputs),
+    )
+    summaries.append(
+        {
+            "variant": FINAL_VARIANT.label,
+            "commit": FINAL_VARIANT.commit,
+            "optimization": FINAL_VARIANT.optimization,
+            "plot_label": FINAL_VARIANT.plot_label,
+            "n": len(throughputs),
+            "mean_tps": mean,
+            "stddev_tps": stddev,
+            "median_tps": statistics.median(throughputs),
+            "min_tps": min(throughputs),
+            "max_tps": max(throughputs),
+            "ci_low_tps": ci_low,
+            "ci_high_tps": ci_high,
+            "incremental_speedup_pct": 100.0
+            * (mean / statistics.mean(previous) - 1.0),
+            "cumulative_speedup_pct": 100.0 * (mean / baseline_mean - 1.0),
+            "welch_p_value": float(
+                stats.ttest_ind(
+                    throughputs,
+                    previous,
+                    equal_var=False,
+                ).pvalue
+            ),
+            "output_sha256_12": next(iter(hashes)),
+        }
+    )
+    return throughputs
+
+
 def esc(value: object) -> str:
     return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -148,7 +247,7 @@ def write_throughput_svg(summaries: list[dict]) -> None:
     width, height = 980, 520
     left, right, top, bottom = 90, 25, 40, 105
     plot_w, plot_h = width - left - right, height - top - bottom
-    y_min, y_max = 15.0, 27.5
+    y_min, y_max = 15.0, 29.0
 
     def x(i: int) -> float:
         return left + i * plot_w / (len(summaries) - 1)
@@ -162,7 +261,7 @@ def write_throughput_svg(summaries: list[dict]) -> None:
         '<style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1}.grid{stroke:#d0d0d0;stroke-width:1}.line{fill:none;stroke:#111;stroke-width:3}.ci{stroke:#666;stroke-width:2}.dot{fill:#111;stroke:white;stroke-width:1.5}.label{font-size:14px}.small{font-size:12px;fill:#444}.title{font-size:21px;font-weight:700}</style>',
         '<text x="90" y="27" class="title">Qwen3-8B end-to-end generation throughput</text>',
     ]
-    for tick in range(15, 28):
+    for tick in range(15, 30):
         yy = y(tick)
         parts.append(f'<line x1="{left}" y1="{yy:.1f}" x2="{width-right}" y2="{yy:.1f}" class="grid"/>')
         parts.append(f'<text x="{left-12}" y="{yy+5:.1f}" text-anchor="end" class="label">{tick}</text>')
@@ -182,7 +281,7 @@ def write_throughput_svg(summaries: list[dict]) -> None:
             f'<text x="{xx:.1f}" y="{height-bottom+47}" text-anchor="middle" class="small">{esc(row["plot_label"])}</text>',
         ])
     parts.append(f'<text transform="translate(23 {top+plot_h/2}) rotate(-90)" text-anchor="middle" class="label">tokens/s (mean and 95% t interval)</text>')
-    parts.append('<text x="90" y="505" class="small">32 retained requests per revision; two compile/warm-up requests excluded; 128 generated tokens/request.</text>')
+    parts.append('<text x="90" y="505" class="small">32 retained requests per stage; two compile/warm-up requests excluded; V10 uses the streaming E2E clock.</text>')
     parts.append('</svg>')
     (FIGURE_DIR / "throughput.svg").write_text("\n".join(parts) + "\n")
 
@@ -908,8 +1007,17 @@ def main() -> None:
         })
         previous = throughputs
 
-    # Holm's step-down correction controls family-wise error across the nine
-    # planned adjacent-revision comparisons while preserving the raw Welch p.
+    assert baseline_mean is not None
+    assert previous is not None
+    previous = append_final_streaming_stage(
+        samples,
+        summaries,
+        baseline_mean,
+        previous,
+    )
+
+    # Holm's step-down correction controls family-wise error across the
+    # adjacent-stage comparisons while preserving the raw Welch p.
     tested = sorted(summaries[1:], key=lambda row: row["welch_p_value"])
     running_max = 0.0
     for rank, row in enumerate(tested):

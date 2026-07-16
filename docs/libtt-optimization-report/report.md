@@ -69,12 +69,12 @@ same XLA boundary provides an architectural path to PyTorch through TorchTPU.
 libtt packages the open-source compiler, runtime, device kernels, and runtime
 assets in one shared library. We demonstrate it with upstream SGLang-JAX and
 Qwen3-8B. A sequence of graph, layout, runtime, and kernel optimizations raises
-128-token generation from 16.265 to 26.123 tokens/s. A shape-specific down
-projection reaches 27.753 decode tokens/s, 11.51% faster than the measured
-tt-inference-server reference on the same Blackhole P150 and workload. The
-result shows that a stable XLA boundary can keep the upper software stack close
-to upstream while concentrating hardware-specific performance work in the
-compiler and lower runtime.
+measured 128-token end-to-end generation from 16.265 to 27.619 tokens/s, a
+69.81% improvement, and delivers 27.753 decode tokens/s, 11.51% faster than the
+measured tt-inference-server reference on the same Blackhole P150 and workload.
+The result shows that a stable XLA boundary can keep the upper software stack
+close to upstream while concentrating hardware-specific performance work in
+the compiler and lower runtime.
 
 # Introduction
 
@@ -108,9 +108,9 @@ and runtime assets. Second, it demonstrates this XLA boundary with upstream
 SGLang-JAX and identifies the future PyTorch/TorchTPU path. Third, it presents
 compiler and kernel optimizations that cross StableHLO, TT-MLIR, TTNN, and
 TT-Metal without modifying the SGLang scheduler or Qwen model [31]. Finally, it
-measures a 60.61% improvement from 16.265 to 26.123 tokens/s; a subsequent
-110-core down projection reaches 27.753 decode tokens/s, 11.51% above the
-matched tt-inference-server v0.10.0 reference [20].
+measures a 69.81% end-to-end improvement from 16.265 to 27.619 tokens/s and
+27.753 decode tokens/s, 11.51% above the matched tt-inference-server v0.10.0
+reference [20].
 
 The following sections describe the system boundary, compiler and runtime
 representations, individual optimizations, and measured effects.
@@ -561,8 +561,10 @@ down projection     down_projection_110_core.patch
 \endgroup
 
 The +22.58% foundation figure combines patches that were not measured
-separately. The blocking and down-projection tests use a streaming decode clock,
-so they remain outside the cumulative sequence.
+separately. The blocking and down-projection tests use a direct streaming
+clock. Their final configuration forms the last stage of the cumulative
+sequence using streaming end-to-end throughput; the same-build A/B tests below
+isolate the effects of the two kernel changes.
 
 The first group recovers model semantics in TTIR and TTNN before lowerings
 discard the algebra and graph roles needed to recognize them.
@@ -926,10 +928,10 @@ remove sequential drift, autocorrelation, or model and shape dependence.
 
 # Results
 
-## Established concept sequence
+## Optimization sequence
 
 V0 is the functional baseline: it runs upstream SGLang-JAX but has few
-model-specific performance optimizations. V1 through V9 add compiler, runtime,
+model-specific performance optimizations. V1 through V10 add compiler, runtime,
 and kernel changes below the XLA/PJRT boundary. Commit IDs are recorded in the
 CSV files.
 
@@ -949,18 +951,29 @@ Table: End-to-end 128-token generation, 32 retained requests per measurement sta
 | V7 | Dst-resident matmul-SwiGLU epilogue | 23.744 ± 0.311 | [23.632, 23.856] | +2.73% | +45.98% |
 | V8 | Prefill-capable, fallback-free path | 23.698 ± 0.274 | [23.599, 23.797] | -0.19% | +45.70% |
 | V9 | Fixed-shape prefill trace | 26.123 ± 0.394 | [25.981, 26.265] | +10.23% | +60.61% |
+| V10 | SwiGLU blocking and 110-core down projection | 27.619 ± 0.322 | [27.503, 27.735] | +5.73% | +69.81% |
 
 \endgroup
 
 ![Cumulative throughput across the measured concepts.](figures/throughput.svg){#fig:throughput width=100%}
 
-![Incremental effect of each concept in the established sequence.](figures/incremental-speedup.svg){#fig:incremental width=100%}
+![Incremental effect of each concept in the optimization sequence.](figures/incremental-speedup.svg){#fig:incremental width=100%}
 
 The negative and near-zero rows explain the final design: shared-LHS fusion
 materializes too much data, consumer-side SiLU leaves the producer boundary,
 and fallback removal changes coverage rather than the kernel.
 
-## Current kernel A/B experiments
+V0 through V9 use the server-reported request latency from the README
+benchmark. V10 uses the loopback streaming end-to-end clock needed for the
+kernel A/B and external-server comparison. The clocks have the same request
+scope but are collected independently, so the V10 incremental value is the
+change between stage means, not the isolated kernel effect.
+
+## Isolating the final MLP-kernel stage
+
+The V10 result combines the SwiGLU blocking choice and the 110-core down
+projection with the preceding compiler, runtime, and kernel optimizations. The
+same-build measurements below separate their effects.
 
 Table: Current-branch streaming results, 32 retained samples per configuration. Width 4 is compared with width 2; the down projection is compared with the same width-4 binary/configuration with the specialization disabled.
 
@@ -1138,8 +1151,8 @@ TorchTPU once the required adapter and operation coverage exist. One Bazel
 graph makes the lower stack available for cross-layer optimization.
 
 We started with a functional backend that runs upstream SGLang-JAX at
-16.265 tokens/s. Compiler, runtime, and kernel changes improve end-to-end
-throughput by 60.61%, and the 110-core down projection reaches 27.753 decode
+16.265 tokens/s. Compiler, runtime, and kernel changes raise measured
+end-to-end throughput by 69.81% to 27.619 tokens/s and deliver 27.753 decode
 tokens/s. Under the matched benchmark conditions, libtt is 11.51% faster than
 the TTIS decode mean even though TTIS also uses TT-specific transformer and
 inference-engine layers.
