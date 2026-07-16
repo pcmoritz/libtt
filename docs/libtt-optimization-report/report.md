@@ -63,7 +63,10 @@ established optimization line raises end-to-end throughput from 16.265 to
 26.123 tokens/s (+60.61%). A newer 110-core down-projection specialization adds
 5.96% pure decode throughput in a same-build 32-sample A/B test, reaching 27.753
 tokens/s and reducing the projection kernel from 217.188 to 154.932 microseconds
-per layer. In contrast, widening the SwiGLU K block from two to four tiles
+per layer. Against a same-clock 32-sample tt-inference-server v0.10.0 run, the
+current build is 11.51% faster in pure decode and 11.48% faster in streaming
+end-to-end throughput. In contrast, widening the SwiGLU K block from two to
+four tiles
 changes throughput by only +0.27% (p = 0.45). The results show why an open,
 centrally built stack is useful: profitable inference work crosses graph
 semantics, layout policy, runtime dispatch, data movement, and device
@@ -117,13 +120,13 @@ The measured work supports six conclusions:
    trace-only A/B test finds no significant decode change.
 
 The established main snapshot reaches 26.123 tokens/s, up 60.61% from the
-documented baseline. Tenstorrent's tt-inference-server v0.10.0 reference
-reaches 24.148 tokens/s on the same P150, model, prompt, output length, and
-serial cache-disabled workload. The established libtt result is 8.18% higher,
-subject to a timing-scope caveat: the reference uses loopback-client time while
-the original libtt sequence uses server-reported request time. The newer
-down-projection experiment uses a streaming client clock and is therefore
-reported separately, not appended to the older cumulative series.
+documented baseline. The current 110-core down-projection build reaches 27.753
+decode tokens/s and 27.619 streaming end-to-end tokens/s. A refreshed
+Tenstorrent tt-inference-server v0.10.0 reference, measured with the same
+loopback streaming token-arrival clock, reaches 24.887 decode tokens/s and
+24.776 end-to-end tokens/s on the same P150, model, prompt, output length, and
+serial cache-disabled workload. Current libtt is therefore 11.51% faster in
+pure decode and 11.48% faster end to end in this single-request comparison.
 
 ![libtt's serving, compilation, runtime, and device layers.](figures/stack.svg){#fig:stack width=100%}
 
@@ -878,24 +881,30 @@ libtt:  SGLang-JAX → JAX/StableHLO → PJRT/TT-XLA/TT-MLIR → TTNN → TT-Met
 TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-Metal
 ```
 
-The v0.10.0 reference uses the same P150, Qwen3-8B model, prompt, 128-token
-output, serial request policy, and disabled prefix cache.
+The tested v0.10.0 reference uses the same P150, Qwen3-8B model, prompt,
+128-token output, serial request policy, and disabled prefix cache. The updated
+comparison also uses the same persistent loopback streaming collector on both
+sides. Pure decode is 127 divided by the interval from the first to the last
+token arrival; streaming end-to-end throughput is 128 divided by the interval
+from request send to the last token arrival. Two warm-up requests precede each
+32-request analysis window.
 
-| Implementation | Mean ± SD (tok/s) | 95% CI | Mean latency |
-|:--|--:|:--:|--:|
-| libtt documented baseline | 16.265 ± 0.128 | [16.218, 16.311] | 7.870 s |
-| libtt established main | **26.123 ± 0.394** | [25.981, 26.265] | **4.901 s** |
-| TTIS v0.10.0 | 24.148 ± 0.412 | [23.999, 24.296] | 5.302 s |
+| Implementation | Pure decode mean ± SD [95% CI] (tok/s) | Streaming E2E mean ± SD [95% CI] (tok/s) | TTFT mean ± SD |
+|:--|--:|--:|--:|
+| libtt current (`37d5460`) | **27.753 ± 0.330 [27.634, 27.872]** | **27.619 ± 0.322 [27.503, 27.735]** | **58.45 ± 1.50 ms** |
+| TTIS v0.10.0 | 24.887 ± 0.532 [24.695, 25.079] | 24.776 ± 0.524 [24.587, 24.964] | 63.38 ± 2.10 ms |
 
 ![External serving-stack reference on the same model workload.](figures/upstream-comparison.svg){#fig:upstream width=100%}
 
-Established-main libtt is 8.18% above the recorded upstream mean. The
-comparison is system-level, not a kernel attribution: the model
-implementations, serving frontends, trace strategies, and clocks differ. In
-particular, TTIS is measured at the loopback client while the older libtt
-sequence uses request-local server time. The current streaming kernel results
-are not inserted into this table because their endpoint and collection window
-also differ.
+Current libtt is 11.51% faster in pure decode
+($p=2.77\times10^{-31}$) and 11.48% faster in streaming end-to-end throughput
+($p=2.02\times10^{-31}$). Mean TTFT is 7.78% lower
+($p=2.43\times10^{-15}$), and mean request-to-last-token latency falls from
+5.169 to 4.635 seconds. The comparison is system-level, not a kernel
+attribution: the model implementations, serving frontends, and trace strategies
+still differ even though the workload and measurement clock now match. The
+tested artifact remains the official v0.10.0 runtime image; newer release
+numbers are not substituted unless the same Qwen3-8B/P150 workload is rerun.
 
 ## Correctness and numeric behavior
 
@@ -986,10 +995,11 @@ build makes such experiments cheap; the report makes their outcomes durable.
 3. **The foundation group is not decomposed.** Its +22.58% covers several
    compiler, dtype, validation, and layout changes. Isolating them would require
    additional compatible builds.
-4. **Two metric families.** The older sequence uses server-reported request
-   latency; the current kernel experiments use streaming client timing and a
-   pure decode clock. Their absolute means should not be subtracted as if they
-   came from one randomized block.
+4. **Two metric families.** The older cumulative sequence uses server-reported
+   request latency. The current kernel and TTIS comparison uses the same
+   streaming client timing and pure-decode clock on both sides. The older and
+   newer libtt means should still not be subtracted as if they came from one
+   randomized block.
 5. **Sequential sampling.** Configurations were not randomized or interleaved.
    Thermal and background drift can remain. Repeated randomized server blocks
    would strengthen publication-grade inference.
@@ -1005,7 +1015,9 @@ build makes such experiments cheap; the report makes their outcomes durable.
    not evidence of equivalent perplexity or task accuracy.
 9. **External reference scope.** The TTIS v0.10.0 image is official, but P150
    model metadata was added locally because that release listed Qwen3-8B on
-   P300 rather than P150. The runtime image itself was unchanged.
+   P300 rather than P150. The runtime image itself was unchanged. Both current
+   rows use an identical loopback streaming collector, but they remain
+   different serving and model stacks.
 
 The most promising next MLP experiment is now an on-chip boundary between the
 SwiGLU output and down projection: either preserve a compatible sharded layout
@@ -1024,7 +1036,8 @@ The report directory contains:
 - `data/current-kernel-manifest.json`: exact current experiment provenance;
 - `data/down-projection-profile-summary.csv`: per-operation profile summary;
 - `data/latest-main-streaming-*`: direct prefill trace A/B data;
-- `data/upstream-tt-inference-*`: TTIS observations and manifest;
+- `data/upstream-tt-inference-*`: streaming TTIS observations, same-clock
+  comparison statistics, and manifest;
 - `analyze.py`: statistics and SVG generation;
 - `benchmark_upstream.py`: upstream reference collector;
 - `figures/*.svg`: vector figures; and
@@ -1071,8 +1084,9 @@ cross-layer matmul-SwiGLU representation removes the correct materialization;
 and a program-factory/kernel specialization raises down-projection bandwidth by
 40.2%. The established line improves end-to-end Qwen3-8B throughput by 60.61%.
 The newest down projection adds another 5.96% to pure decode in a same-build
-A/B test, while the blocking sweep correctly remains an experimental knob
-after failing to show a significant gain.
+A/B test and puts current libtt 11.51% above the matched TTIS pure-decode mean,
+while the blocking sweep correctly remains an experimental knob after failing
+to show a significant gain.
 
 The central lesson is architectural: inference performance is a property of
 the path through IR, layout, runtime, data movement, and arithmetic—not of any

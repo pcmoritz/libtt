@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Collect the upstream tt-inference-server baseline used by the report.
+"""Collect the streaming tt-inference-server baseline used by the report.
 
-The client uses one persistent loopback HTTP connection.  It records the
-wall-clock interval from sending each request through reading the complete
-OpenAI-compatible response, then validates that exactly 128 tokens were
-generated.  The first two runs are labeled as warm-ups; the next 32 are the
-analysis window.
+The client uses one persistent loopback HTTP connection and records both time
+to first token and token arrival times.  This gives TTIS the same measurement
+scope as the current libtt benchmark: pure decode is measured between the
+first and last generated token, while streaming end-to-end throughput includes
+TTFT.  The first two requests are warm-ups; the next 32 form the analysis
+window.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import argparse
 import hashlib
 import http.client
 import json
+import statistics
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +59,15 @@ def get_json(base_url: str, path: str, timeout: float) -> dict:
         conn.close()
 
 
+def percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    position = fraction * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -68,17 +79,26 @@ def main() -> None:
         "prompt": PROMPT,
         "temperature": 0,
         "max_tokens": args.tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
     }
     encoded = json.dumps(request_payload, separators=(",", ":")).encode()
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "base_url": args.base_url,
         "endpoint": "/v1/completions",
         "request": request_payload,
         "warmups": args.warmups,
         "retained_samples": args.samples,
-        "timing_scope": "client wall clock: request send through complete response read",
+        "timing_scope": "loopback streaming client token-arrival clock",
+        "definitions": {
+            "ttft_s": "request send to first non-empty completion chunk",
+            "total_s": "request send to final non-empty completion chunk",
+            "decode_tps": "(completion_tokens - 1) / (last_token_time - first_token_time)",
+            "e2e_tps": "completion_tokens / total_s",
+            "itl_s": "arrival-time delta between consecutive non-empty completion chunks",
+        },
         "vllm_api_version": get_json(args.base_url, "/version", args.timeout),
         "models": get_json(args.base_url, "/v1/models", args.timeout),
     }
@@ -94,43 +114,100 @@ def main() -> None:
                 "POST",
                 prefix + "/v1/completions",
                 body=encoded,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                },
             )
-            http_response = conn.getresponse()
-            body = http_response.read()
-            end_ns = time.perf_counter_ns()
-            latency_s = (end_ns - start_ns) / 1e9
-            if http_response.status != 200:
-                raise RuntimeError(
-                    f"run {run_index}: HTTP {http_response.status}: {body.decode(errors='replace')}"
-                )
+            response = conn.getresponse()
+            if response.status != 200:
+                body = response.read().decode(errors="replace")
+                raise RuntimeError(f"run {run_index}: HTTP {response.status}: {body}")
 
-            response_payload = json.loads(body)
-            completion_tokens = response_payload["usage"]["completion_tokens"]
+            chunk_times_ns: list[int] = []
+            chunk_texts: list[str] = []
+            usage: dict | None = None
+            finish_reason: str | None = None
+            while True:
+                raw_line = response.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode().strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    # Drain the terminating HTTP chunk before reusing the
+                    # persistent connection for the next serial request.
+                    response.read()
+                    break
+                event = json.loads(data)
+                if event.get("usage"):
+                    usage = event["usage"]
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                if choice.get("finish_reason") is not None:
+                    finish_reason = choice["finish_reason"]
+                text = choice.get("text") or ""
+                if text:
+                    chunk_times_ns.append(time.perf_counter_ns())
+                    chunk_texts.append(text)
+
+            if usage is None or not chunk_times_ns:
+                raise RuntimeError(f"run {run_index}: incomplete streaming response")
+            completion_tokens = int(usage["completion_tokens"])
             if completion_tokens != args.tokens:
                 raise RuntimeError(
-                    f"run {run_index}: expected {args.tokens} completion tokens, got {completion_tokens}"
+                    f"run {run_index}: expected {args.tokens} tokens, "
+                    f"got {completion_tokens}"
                 )
-            completion_text = response_payload["choices"][0]["text"]
+            if len(chunk_times_ns) != completion_tokens:
+                raise RuntimeError(
+                    f"run {run_index}: expected one non-empty chunk per token; "
+                    f"got {len(chunk_times_ns)} chunks for {completion_tokens} tokens"
+                )
+
+            ttft_s = (chunk_times_ns[0] - start_ns) / 1e9
+            total_s = (chunk_times_ns[-1] - start_ns) / 1e9
+            decode_elapsed_s = (chunk_times_ns[-1] - chunk_times_ns[0]) / 1e9
+            itls_s = [
+                (right - left) / 1e9
+                for left, right in zip(chunk_times_ns, chunk_times_ns[1:])
+            ]
             phase = "warmup" if run_index <= args.warmups else "retained"
             record = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "run_index": run_index,
                 "phase": phase,
                 "started_utc": started_utc,
-                "client_latency_s": latency_s,
-                "throughput_tokens_s": completion_tokens / latency_s,
+                "prompt_tokens": usage["prompt_tokens"],
+                "completion_tokens": completion_tokens,
+                "stream_chunks": len(chunk_times_ns),
+                "finish_reason": finish_reason,
+                "ttft_s": ttft_s,
+                "total_s": total_s,
+                "decode_elapsed_s": decode_elapsed_s,
+                "decode_tps": (completion_tokens - 1) / decode_elapsed_s,
+                "e2e_tps": completion_tokens / total_s,
+                "mean_itl_s": statistics.mean(itls_s),
+                "median_itl_s": statistics.median(itls_s),
+                "p95_itl_s": percentile(itls_s, 0.95),
+                "min_itl_s": min(itls_s),
+                "max_itl_s": max(itls_s),
                 "completion_text_sha256_12": hashlib.sha256(
-                    completion_text.encode()
+                    "".join(chunk_texts).encode()
                 ).hexdigest()[:12],
-                "request": request_payload,
-                "response": response_payload,
+                "chunk_texts": chunk_texts,
+                "inter_token_latencies_s": itls_s,
             }
             output_path = args.output_dir / f"run_{run_index:02d}.json"
             output_path.write_text(json.dumps(record, indent=2) + "\n")
             print(
                 f"{run_index:02d}/{total} {phase:8s} "
-                f"{latency_s:.6f} s {completion_tokens / latency_s:.6f} tok/s",
+                f"TTFT={ttft_s:.6f}s total={total_s:.6f}s "
+                f"decode={record['decode_tps']:.6f} tok/s",
                 flush=True,
             )
     finally:

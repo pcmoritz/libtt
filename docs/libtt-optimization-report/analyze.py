@@ -30,7 +30,7 @@ FIGURE_DIR = HERE / "figures"
 N_WARMUP = 2
 N_SAMPLES = 32
 TOKENS = 128
-UPSTREAM_RAW_DIR = Path("/tmp/libtt-ttis-baseline-20260715")
+UPSTREAM_RAW_DIR = Path("/tmp/libtt-ttis-streaming-20260715-retry")
 LATEST_MAIN_STREAMING_DIR = Path("/tmp/libtt-prefill-rebench-20260715")
 SWIGLU_BLOCK_2_DIR = Path("/tmp/libtt-swiglu-width2-final-20260715")
 SWIGLU_BLOCK_4_DIR = Path("/tmp/libtt-down-110-final-20260715/disabled")
@@ -140,10 +140,6 @@ def token_hash(output_ids: list[int]) -> str:
     return hashlib.sha256(encoded).hexdigest()[:12]
 
 
-def text_hash(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()[:12]
-
-
 def esc(value: object) -> str:
     return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -234,38 +230,22 @@ def write_incremental_svg(summaries: list[dict]) -> None:
     (FIGURE_DIR / "incremental-speedup.svg").write_text("\n".join(parts) + "\n")
 
 
-def write_upstream_comparison_svg(summaries: list[dict], upstream: dict) -> None:
-    rows = [
-        {
-            "label": "libtt V0",
-            "detail": summaries[0]["commit"],
-            "mean": summaries[0]["mean_tps"],
-            "low": summaries[0]["ci_low_tps"],
-            "high": summaries[0]["ci_high_tps"],
-            "class": "baseline",
-        },
-        {
-            "label": f'libtt {summaries[-1]["variant"]}',
-            "detail": summaries[-1]["commit"],
-            "mean": summaries[-1]["mean_tps"],
-            "low": summaries[-1]["ci_low_tps"],
-            "high": summaries[-1]["ci_high_tps"],
-            "class": "libtt",
-        },
-        {
-            "label": "tt-inference-server",
-            "detail": "v0.10.0",
-            "mean": upstream["mean_tps"],
-            "low": upstream["ci_low_tps"],
-            "high": upstream["ci_high_tps"],
-            "class": "upstream",
-        },
-    ]
+def write_upstream_comparison_svg(comparison: dict) -> None:
+    groups = (
+        ("Pure decode", "decode_tps"),
+        ("Streaming E2E", "e2e_tps"),
+    )
+    implementations = (
+        ("libtt", "37d5460", comparison["libtt"], "libtt"),
+        ("tt-inference-server", "v0.10.0", comparison["ttis"], "upstream"),
+    )
     width, height = 980, 510
-    left, right, top, bottom = 100, 30, 45, 120
+    left, right, top, bottom = 100, 30, 65, 115
     plot_w, plot_h = width - left - right, height - top - bottom
-    y_min, y_max = 0.0, 27.0
-    slot = plot_w / len(rows)
+    y_min, y_max = 0.0, 30.0
+    group_slot = plot_w / len(groups)
+    bar_w = 112
+    gap = 24
 
     def y(value: float) -> float:
         return top + (y_max - value) * plot_h / (y_max - y_min)
@@ -273,131 +253,274 @@ def write_upstream_comparison_svg(summaries: list[dict], upstream: dict) -> None
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1.2}.grid{stroke:#dbe4ee;stroke-width:1}.baseline{fill:#8395a7}.libtt{fill:#006d77}.upstream{fill:#e29578}.ci{stroke:#172033;stroke-width:3}.label{font-size:14px}.small{font-size:12px;fill:#526174}.value{font-size:16px;font-weight:700}.title{font-size:21px;font-weight:700}</style>',
-        '<text x="100" y="29" class="title">Same-prompt 128-token serving comparison</text>',
+        '<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1.2}.grid{stroke:#dbe4ee;stroke-width:1}.libtt{fill:#006d77}.upstream{fill:#e29578}.ci{stroke:#172033;stroke-width:3}.label{font-size:14px}.small{font-size:12px;fill:#526174}.value{font-size:15px;font-weight:700}.title{font-size:21px;font-weight:700}.legend{font-size:13px}</style>',
+        '<text x="100" y="29" class="title">Same-clock Qwen3-8B streaming comparison</text>',
+        '<rect x="608" y="16" width="16" height="16" rx="2" class="libtt"/>',
+        '<text x="631" y="29" class="legend">libtt 37d5460</text>',
+        '<rect x="760" y="16" width="16" height="16" rx="2" class="upstream"/>',
+        '<text x="783" y="29" class="legend">TTIS v0.10.0</text>',
     ]
-    for tick in (0, 5, 10, 15, 20, 25):
+    for tick in (0, 5, 10, 15, 20, 25, 30):
         yy = y(tick)
-        parts.append(f'<line x1="{left}" y1="{yy:.1f}" x2="{width-right}" y2="{yy:.1f}" class="grid"/>')
-        parts.append(f'<text x="{left-12}" y="{yy+5:.1f}" text-anchor="end" class="label">{tick}</text>')
-    parts.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{height-bottom}" class="axis"/>')
-    parts.append(f'<line x1="{left}" y1="{height-bottom}" x2="{width-right}" y2="{height-bottom}" class="axis"/>')
-    for i, row in enumerate(rows):
-        center = left + (i + 0.5) * slot
-        bar_w = slot * 0.52
-        bar_y = y(row["mean"])
-        ci_top, ci_bottom = y(row["high"]), y(row["low"])
-        parts.extend([
-            f'<rect x="{center-bar_w/2:.1f}" y="{bar_y:.1f}" width="{bar_w:.1f}" height="{height-bottom-bar_y:.1f}" rx="4" class="{row["class"]}"/>',
-            f'<line x1="{center:.1f}" y1="{ci_top:.1f}" x2="{center:.1f}" y2="{ci_bottom:.1f}" class="ci"/>',
-            f'<line x1="{center-7:.1f}" y1="{ci_top:.1f}" x2="{center+7:.1f}" y2="{ci_top:.1f}" class="ci"/>',
-            f'<line x1="{center-7:.1f}" y1="{ci_bottom:.1f}" x2="{center+7:.1f}" y2="{ci_bottom:.1f}" class="ci"/>',
-            f'<text x="{center:.1f}" y="{bar_y-13:.1f}" text-anchor="middle" class="value">{row["mean"]:.3f}</text>',
-            f'<text x="{center:.1f}" y="{height-bottom+29}" text-anchor="middle" class="label">{esc(row["label"])}</text>',
-            f'<text x="{center:.1f}" y="{height-bottom+48}" text-anchor="middle" class="small">{esc(row["detail"])}</text>',
-        ])
-    parts.append(f'<text transform="translate(25 {top+plot_h/2}) rotate(-90)" text-anchor="middle" class="label">tokens/s (mean and 95% t interval)</text>')
-    parts.append('<text x="100" y="468" class="small">32 retained requests each. libtt: server-reported request latency; upstream: loopback client wall clock.</text>')
-    parts.append('<text x="100" y="488" class="small">The upstream interval therefore includes a small amount of HTTP and response-serialization overhead.</text>')
+        parts.append(
+            f'<line x1="{left}" y1="{yy:.1f}" x2="{width-right}" '
+            f'y2="{yy:.1f}" class="grid"/>'
+        )
+        parts.append(
+            f'<text x="{left-12}" y="{yy+5:.1f}" text-anchor="end" '
+            f'class="label">{tick}</text>'
+        )
+    parts.append(
+        f'<line x1="{left}" y1="{top}" x2="{left}" '
+        f'y2="{height-bottom}" class="axis"/>'
+    )
+    parts.append(
+        f'<line x1="{left}" y1="{height-bottom}" x2="{width-right}" '
+        f'y2="{height-bottom}" class="axis"/>'
+    )
+    for group_index, (group_label, metric) in enumerate(groups):
+        group_center = left + (group_index + 0.5) * group_slot
+        centers = (
+            group_center - (bar_w + gap) / 2,
+            group_center + (bar_w + gap) / 2,
+        )
+        for center, (_, _, values, klass) in zip(centers, implementations):
+            metric_values = values[metric]
+            bar_y = y(metric_values["mean"])
+            ci_top = y(metric_values["ci_high"])
+            ci_bottom = y(metric_values["ci_low"])
+            parts.extend(
+                [
+                    f'<rect x="{center-bar_w/2:.1f}" y="{bar_y:.1f}" '
+                    f'width="{bar_w}" height="{height-bottom-bar_y:.1f}" '
+                    f'rx="4" class="{klass}"/>',
+                    f'<line x1="{center:.1f}" y1="{ci_top:.1f}" '
+                    f'x2="{center:.1f}" y2="{ci_bottom:.1f}" class="ci"/>',
+                    f'<line x1="{center-7:.1f}" y1="{ci_top:.1f}" '
+                    f'x2="{center+7:.1f}" y2="{ci_top:.1f}" class="ci"/>',
+                    f'<line x1="{center-7:.1f}" y1="{ci_bottom:.1f}" '
+                    f'x2="{center+7:.1f}" y2="{ci_bottom:.1f}" class="ci"/>',
+                    f'<text x="{center:.1f}" y="{bar_y-12:.1f}" '
+                    f'text-anchor="middle" class="value">'
+                    f'{metric_values["mean"]:.3f}</text>',
+                ]
+            )
+        parts.append(
+            f'<text x="{group_center:.1f}" y="{height-bottom+29}" '
+            f'text-anchor="middle" class="label">{esc(group_label)}</text>'
+        )
+    parts.append(
+        f'<text transform="translate(25 {top+plot_h/2}) rotate(-90)" '
+        'text-anchor="middle" class="label">tokens/s '
+        '(mean and 95% t interval)</text>'
+    )
+    parts.append(
+        '<text x="100" y="462" class="small">32 retained serial requests '
+        'per implementation; two warm-ups; 128 generated tokens/request.</text>'
+    )
+    parts.append(
+        '<text x="100" y="482" class="small">Both use the same loopback '
+        'streaming clock: 127 inter-token intervals for decode and request-to-last-token for E2E.</text>'
+    )
     parts.append('</svg>')
-    (FIGURE_DIR / "upstream-comparison.svg").write_text("\n".join(parts) + "\n")
+    (FIGURE_DIR / "upstream-comparison.svg").write_text(
+        "\n".join(parts) + "\n"
+    )
 
 
-def analyze_upstream(summaries: list[dict]) -> dict:
-    paths = sorted(UPSTREAM_RAW_DIR.glob("run_*.json"))
-    records = [json.loads(path.read_text()) for path in paths]
-    retained = [(path, row) for path, row in zip(paths, records) if row["phase"] == "retained"]
-    if len(records) != N_WARMUP + N_SAMPLES or len(retained) != N_SAMPLES:
+def analyze_upstream() -> dict:
+    """Analyze TTIS and current libtt with the same streaming client clock."""
+
+    manifest = json.loads((UPSTREAM_RAW_DIR / "manifest.json").read_text())
+    request = manifest["request"]
+    if (
+        request["model"] != "Qwen/Qwen3-8B"
+        or request["prompt"] != "The capital of France is"
+        or request["temperature"] != 0
+        or request["max_tokens"] != TOKENS
+        or request.get("stream") is not True
+    ):
+        raise RuntimeError("upstream manifest does not match the report workload")
+
+    metric_names = ("decode_tps", "e2e_tps", "ttft_s", "total_s")
+    values: dict[str, dict[str, list[float]]] = {
+        "ttis": {metric: [] for metric in metric_names},
+        "libtt": {metric: [] for metric in metric_names},
+    }
+    hashes: dict[str, set[str]] = {"ttis": set(), "libtt": set()}
+    samples: list[dict] = []
+
+    ttis_paths = sorted(UPSTREAM_RAW_DIR.glob("run_*.json"))
+    ttis_records = [json.loads(path.read_text()) for path in ttis_paths]
+    ttis_retained = [
+        (path, record)
+        for path, record in zip(ttis_paths, ttis_records)
+        if record["phase"] == "retained"
+    ]
+    if (
+        len(ttis_records) != N_WARMUP + N_SAMPLES
+        or len(ttis_retained) != N_SAMPLES
+    ):
         raise RuntimeError(
-            f"upstream: expected {N_WARMUP + N_SAMPLES} total and {N_SAMPLES} retained files, "
-            f"found {len(records)} and {len(retained)}"
+            f"upstream: expected {N_WARMUP + N_SAMPLES} total and "
+            f"{N_SAMPLES} retained files, found {len(ttis_records)} and "
+            f"{len(ttis_retained)}"
         )
 
-    samples: list[dict] = []
-    throughputs: list[float] = []
-    latencies: list[float] = []
-    hashes: set[str] = set()
-    for sample_index, (path, record) in enumerate(retained, 1):
-        request = record["request"]
-        response = record["response"]
-        completion_tokens = response["usage"]["completion_tokens"]
+    for sample_index, (path, record) in enumerate(ttis_retained, 1):
         if (
-            request["model"] != "Qwen/Qwen3-8B"
-            or request["prompt"] != "The capital of France is"
-            or request["temperature"] != 0
-            or request["max_tokens"] != TOKENS
-            or completion_tokens != TOKENS
+            record["completion_tokens"] != TOKENS
+            or record["stream_chunks"] != TOKENS
+            or record["prompt_tokens"] != 5
         ):
-            raise RuntimeError(f"{path}: request does not match the report workload")
-        latency = float(record["client_latency_s"])
-        throughput = TOKENS / latency
-        output_hash = text_hash(response["choices"][0]["text"])
-        latencies.append(latency)
-        throughputs.append(throughput)
-        hashes.add(output_hash)
-        samples.append({
-            "implementation": "upstream tt-inference-server",
-            "release": "v0.10.0",
-            "sample": sample_index,
-            "source_file": path.name,
-            "client_latency_s": f"{latency:.9f}",
-            "throughput_tokens_s": f"{throughput:.9f}",
-            "prompt_tokens": response["usage"]["prompt_tokens"],
-            "completion_tokens": completion_tokens,
-            "completion_text_sha256_12": output_hash,
-        })
-    if len(hashes) != 1:
-        raise RuntimeError(f"upstream: retained completions are not deterministic: {hashes}")
+            raise RuntimeError(f"{path}: incomplete or mismatched streaming response")
+        row_values = {
+            "decode_tps": float(record["decode_tps"]),
+            "e2e_tps": TOKENS / float(record["total_s"]),
+            "ttft_s": float(record["ttft_s"]),
+            "total_s": float(record["total_s"]),
+        }
+        for metric, value in row_values.items():
+            values["ttis"][metric].append(value)
+        hashes["ttis"].add(record["completion_text_sha256_12"])
+        samples.append(
+            {
+                "implementation": "upstream tt-inference-server",
+                "release": "v0.10.0",
+                "sample": sample_index,
+                "source_file": path.name,
+                "ttft_s": f'{row_values["ttft_s"]:.9f}',
+                "total_s": f'{row_values["total_s"]:.9f}',
+                "decode_tps": f'{row_values["decode_tps"]:.9f}',
+                "e2e_tps": f'{row_values["e2e_tps"]:.9f}',
+                "prompt_tokens": record["prompt_tokens"],
+                "completion_tokens": record["completion_tokens"],
+                "completion_text_sha256_12": record[
+                    "completion_text_sha256_12"
+                ],
+            }
+        )
 
-    mean = statistics.mean(throughputs)
-    ci_low, ci_high = stats.t.interval(
-        0.95, len(throughputs) - 1, loc=mean, scale=stats.sem(throughputs)
-    )
-    v0 = summaries[0]
-    latest = summaries[-1]
-    v0_values = [float(row["throughput_tokens_s"]) for row in samples_for_variant("V0")]
-    latest_values = [
-        float(row["throughput_tokens_s"])
-        for row in samples_for_variant(latest["variant"])
-    ]
-    summary = {
+    libtt_paths = sorted(DOWN_PROJECTION_110_DIR.glob("run_*.json"))
+    libtt_records = [json.loads(path.read_text()) for path in libtt_paths]
+    libtt_retained = [
+        record for record in libtt_records if record["phase"] == "retained"
+    ][:N_SAMPLES]
+    if len(libtt_retained) != N_SAMPLES:
+        raise RuntimeError(
+            f"libtt comparison: expected {N_SAMPLES} retained files, "
+            f"found {len(libtt_retained)}"
+        )
+    for record in libtt_retained:
+        if (
+            record["completion_tokens"] != TOKENS
+            or record["stream_chunks"] != TOKENS
+        ):
+            raise RuntimeError("libtt comparison contains an incomplete response")
+        row_values = {
+            "decode_tps": float(record["decode_tps"]),
+            "e2e_tps": TOKENS / float(record["total_s"]),
+            "ttft_s": float(record["ttft_s"]),
+            "total_s": float(record["total_s"]),
+        }
+        for metric, value in row_values.items():
+            values["libtt"][metric].append(value)
+        hashes["libtt"].add(record["completion_text_sha256_12"])
+
+    if len(hashes["ttis"]) != 1 or len(hashes["libtt"]) != 1:
+        raise RuntimeError(f"non-deterministic comparison outputs: {hashes}")
+
+    described: dict[str, dict[str, dict[str, float]]] = {}
+    for implementation in ("ttis", "libtt"):
+        described[implementation] = {}
+        for metric in metric_names:
+            metric_values = values[implementation][metric]
+            mean = statistics.mean(metric_values)
+            ci_low, ci_high = stats.t.interval(
+                0.95,
+                len(metric_values) - 1,
+                loc=mean,
+                scale=stats.sem(metric_values),
+            )
+            described[implementation][metric] = {
+                "mean": mean,
+                "stddev": statistics.stdev(metric_values),
+                "median": statistics.median(metric_values),
+                "min": min(metric_values),
+                "max": max(metric_values),
+                "ci_low": float(ci_low),
+                "ci_high": float(ci_high),
+            }
+
+    comparison: dict[str, float] = {}
+    for metric in ("decode_tps", "e2e_tps"):
+        comparison[f"libtt_{metric}_speedup_pct"] = 100.0 * (
+            described["libtt"][metric]["mean"]
+            / described["ttis"][metric]["mean"]
+            - 1.0
+        )
+        comparison[f"{metric}_welch_p"] = float(
+            stats.ttest_ind(
+                values["libtt"][metric],
+                values["ttis"][metric],
+                equal_var=False,
+            ).pvalue
+        )
+    for metric in ("ttft_s", "total_s"):
+        comparison[f"libtt_{metric}_reduction_pct"] = 100.0 * (
+            1.0
+            - described["libtt"][metric]["mean"]
+            / described["ttis"][metric]["mean"]
+        )
+        comparison[f"{metric}_welch_p"] = float(
+            stats.ttest_ind(
+                values["libtt"][metric],
+                values["ttis"][metric],
+                equal_var=False,
+            ).pvalue
+        )
+
+    summary: dict[str, object] = {
         "implementation": "upstream tt-inference-server",
         "release": "v0.10.0",
         "server_commit": "4be69a67c7183bf76052d4a6f64a42ac93b71ac5",
         "container_image": "0.10.0-e867533-22be241",
         "tt_metal_commit": "e867533",
         "vllm_commit": "22be241",
-        "n": len(throughputs),
-        "mean_tps": mean,
-        "stddev_tps": statistics.stdev(throughputs),
-        "median_tps": statistics.median(throughputs),
-        "min_tps": min(throughputs),
-        "max_tps": max(throughputs),
-        "ci_low_tps": ci_low,
-        "ci_high_tps": ci_high,
-        "mean_latency_s": statistics.mean(latencies),
-        "stddev_latency_s": statistics.stdev(latencies),
-        "upstream_speedup_vs_libtt_v0_pct": 100.0 * (mean / v0["mean_tps"] - 1.0),
-        "upstream_speedup_vs_libtt_latest_pct": 100.0
-        * (mean / latest["mean_tps"] - 1.0),
-        "welch_p_vs_libtt_v0": float(stats.ttest_ind(throughputs, v0_values, equal_var=False).pvalue),
-        "welch_p_vs_libtt_latest": float(
-            stats.ttest_ind(throughputs, latest_values, equal_var=False).pvalue
-        ),
-        "completion_text_sha256_12": next(iter(hashes)),
+        "n": N_SAMPLES,
     }
-    with (DATA_DIR / "upstream-tt-inference-samples.csv").open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(samples[0]), lineterminator="\n")
+    for metric in metric_names:
+        for statistic, value in described["ttis"][metric].items():
+            summary[f"{statistic}_{metric}"] = value
+    summary.update(comparison)
+    summary["libtt_commit"] = "37d5460"
+    summary["completion_text_sha256_12"] = next(iter(hashes["ttis"]))
+
+    with (DATA_DIR / "upstream-tt-inference-samples.csv").open(
+        "w", newline=""
+    ) as f:
+        writer = csv.DictWriter(
+            f, fieldnames=list(samples[0]), lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(samples)
-    with (DATA_DIR / "upstream-tt-inference-summary.csv").open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(summary), lineterminator="\n")
+    with (DATA_DIR / "upstream-tt-inference-summary.csv").open(
+        "w", newline=""
+    ) as f:
+        writer = csv.DictWriter(
+            f, fieldnames=list(summary), lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerow(summary)
-    manifest = json.loads((UPSTREAM_RAW_DIR / "manifest.json").read_text())
-    if "server_version" in manifest:
-        # The /version endpoint belongs to the embedded vLLM API server.
-        manifest["vllm_api_version"] = manifest.pop("server_version")
+
+    manifest["schema_version"] = 2
+    manifest["timing_scope"] = "loopback streaming client token-arrival clock"
+    manifest["definitions"] = {
+        "ttft_s": "request send to first non-empty completion chunk",
+        "total_s": "request send to final non-empty completion chunk",
+        "decode_tps": "127 / (last token arrival - first token arrival)",
+        "e2e_tps": "128 / (last token arrival - request send)",
+    }
     manifest["tt_inference_server"] = {
         "release": "v0.10.0",
         "commit": "4be69a67c7183bf76052d4a6f64a42ac93b71ac5",
@@ -405,10 +528,21 @@ def analyze_upstream(summaries: list[dict]) -> dict:
         "prefix_caching": "disabled with --no-enable-prefix-caching",
         "hardware": "Blackhole P150",
     }
+    manifest["libtt_comparison"] = {
+        "branch": "agent/qwen3-swiglu-blocking-down-projection",
+        "commit": "37d5460",
+        "source_directory": str(DOWN_PROJECTION_110_DIR),
+        "collector": "same loopback streaming token-arrival clock",
+        "retained_samples": N_SAMPLES,
+    }
     (DATA_DIR / "upstream-tt-inference-manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n"
     )
-    return summary
+    return {
+        "ttis": described["ttis"],
+        "libtt": described["libtt"],
+        "comparison": comparison,
+    }
 
 
 def analyze_latest_main_streaming() -> None:
@@ -710,11 +844,6 @@ def analyze_current_kernel_experiments() -> None:
         writer.writerows(summary_rows)
 
 
-def samples_for_variant(variant: str) -> list[dict]:
-    with (DATA_DIR / "samples.csv").open(newline="") as f:
-        return [row for row in csv.DictReader(f) if row["variant"] == variant]
-
-
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FIGURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -800,8 +929,8 @@ def main() -> None:
 
     write_throughput_svg(summaries)
     write_incremental_svg(summaries)
-    upstream = analyze_upstream(summaries)
-    write_upstream_comparison_svg(summaries, upstream)
+    upstream = analyze_upstream()
+    write_upstream_comparison_svg(upstream)
     analyze_latest_main_streaming()
     analyze_current_kernel_experiments()
 
