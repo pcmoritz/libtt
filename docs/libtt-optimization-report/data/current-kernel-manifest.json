@@ -1,0 +1,43 @@
+{
+  "benchmark_date": "2026-07-15",
+  "hardware": "Tenstorrent Blackhole P150",
+  "libtt_branch": "agent/qwen3-swiglu-blocking-down-projection",
+  "libtt_commit": "37d5460",
+  "base_commit": "627a32d",
+  "model": "Qwen/Qwen3-8B",
+  "prompt": "The capital of France is",
+  "completion_tokens": 128,
+  "temperature": 0,
+  "samples_per_configuration": 32,
+  "endpoint": "/v1/completions",
+  "streaming": true,
+  "metrics": {
+    "decode_tps": "127 inter-token intervals divided by elapsed decode time",
+    "e2e_tps": "128 completion tokens divided by loopback-client total time",
+    "ttft_s": "loopback request send to first non-empty completion chunk"
+  },
+  "configurations": [
+    {
+      "name": "k_block_2",
+      "source_directory": "/tmp/libtt-swiglu-width2-final-20260715",
+      "TT_METAL_SWIGLU_IN0_BLOCK_W": 2,
+      "TT_METAL_DOWN_PROJECTION_110_CORES": 0,
+      "collector_warmups": 2
+    },
+    {
+      "name": "k_block_4",
+      "source_directory": "/tmp/libtt-down-110-final-20260715/disabled",
+      "TT_METAL_SWIGLU_IN0_BLOCK_W": 4,
+      "TT_METAL_DOWN_PROJECTION_110_CORES": 0,
+      "collector_warmups": 2
+    },
+    {
+      "name": "110_core_specialization",
+      "source_directory": "/tmp/libtt-down-110-final-fixed-20260715/enabled",
+      "TT_METAL_SWIGLU_IN0_BLOCK_W": 4,
+      "TT_METAL_DOWN_PROJECTION_110_CORES": 1,
+      "collector_warmups": 0,
+      "warmup_note": "Compilation and trace warmup completed before the retained collector was started."
+    }
+  ]
+}

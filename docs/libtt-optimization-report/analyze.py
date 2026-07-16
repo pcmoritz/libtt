@@ -5,7 +5,9 @@ The benchmark driver intentionally records two warm-up requests before the
 32-request analysis window.  This script consumes the raw SGLang JSON files,
 checks the retained outputs, and writes publication-ready CSV/SVG artifacts.
 It also analyzes the separately collected upstream tt-inference-server
-baseline.  That baseline is not inserted into the cumulative libtt sequence.
+baseline and the current SwiGLU-blocking/down-projection experiments.  Those
+experiments are not inserted into the older cumulative libtt sequence because
+they use a direct streaming decode clock.
 """
 
 from __future__ import annotations
@@ -30,6 +32,11 @@ N_SAMPLES = 32
 TOKENS = 128
 UPSTREAM_RAW_DIR = Path("/tmp/libtt-ttis-baseline-20260715")
 LATEST_MAIN_STREAMING_DIR = Path("/tmp/libtt-prefill-rebench-20260715")
+SWIGLU_BLOCK_2_DIR = Path("/tmp/libtt-swiglu-width2-final-20260715")
+SWIGLU_BLOCK_4_DIR = Path("/tmp/libtt-down-110-final-20260715/disabled")
+DOWN_PROJECTION_110_DIR = Path(
+    "/tmp/libtt-down-110-final-fixed-20260715/enabled"
+)
 
 
 @dataclass(frozen=True)
@@ -37,20 +44,81 @@ class Variant:
     label: str
     commit: str
     optimization: str
+    plot_label: str
     raw_dir: Path
 
 
 VARIANTS = [
-    Variant("V0", "7482967", "Documented serving baseline", Path("/tmp/libtt-report-bench/v0_7482967")),
-    Variant("V1", "9978a9b", "Decode foundation bundle", Path("/tmp/libtt-report-bench/v1_9978a9b")),
-    Variant("V2", "10459b5", "Expanded-SiLU recognition", Path("/tmp/libtt-report-bench/v2_10459b5")),
-    Variant("V3", "3fe072b", "QKV projection fusion", Path("/tmp/libtt-report-bench/v3_3fe072b")),
-    Variant("V4", "83baa8d", "Two-way shared-LHS matmul fusion", Path("/tmp/libtt-report-bench/v4_83baa8d")),
-    Variant("V5", "e534690", "Decode RMSNorm runtime sharding", Path("/tmp/libtt-branch-bench-20260711/main")),
-    Variant("V6", "a718685", "SiLU fused into binary multiply", Path("/tmp/libtt-branch-bench-20260711/fused-silu-multiply")),
-    Variant("V7", "ce99831", "True matmul-SwiGLU epilogue", Path("/tmp/libtt-branch-bench-20260711/matmul-swiglu-epilogue")),
-    Variant("V8", "caa5428", "Fallback-free prefill-capable epilogue", Path("/tmp/libtt-branch-bench-20260711/prefill-bf16-no-fallback")),
-    Variant("V9", "627a32d", "Latest main with traced short-prompt prefill", Path("/tmp/libtt-report-main-627a32d/raw")),
+    Variant(
+        "V0",
+        "7482967",
+        "Documented serving baseline",
+        "baseline",
+        Path("/tmp/libtt-report-bench/v0_7482967"),
+    ),
+    Variant(
+        "V1",
+        "9978a9b",
+        "Decode foundation bundle",
+        "decode foundation",
+        Path("/tmp/libtt-report-bench/v1_9978a9b"),
+    ),
+    Variant(
+        "V2",
+        "10459b5",
+        "Expanded-SiLU recognition",
+        "SiLU graph",
+        Path("/tmp/libtt-report-bench/v2_10459b5"),
+    ),
+    Variant(
+        "V3",
+        "3fe072b",
+        "QKV projection fusion",
+        "QKV graph",
+        Path("/tmp/libtt-report-bench/v3_3fe072b"),
+    ),
+    Variant(
+        "V4",
+        "83baa8d",
+        "Two-way shared-LHS matmul fusion",
+        "shared LHS",
+        Path("/tmp/libtt-report-bench/v4_83baa8d"),
+    ),
+    Variant(
+        "V5",
+        "e534690",
+        "Decode RMSNorm runtime sharding",
+        "RMSNorm shard",
+        Path("/tmp/libtt-branch-bench-20260711/main"),
+    ),
+    Variant(
+        "V6",
+        "a718685",
+        "SiLU fused into binary multiply",
+        "SiLU multiply",
+        Path("/tmp/libtt-branch-bench-20260711/fused-silu-multiply"),
+    ),
+    Variant(
+        "V7",
+        "ce99831",
+        "True matmul-SwiGLU epilogue",
+        "Dst SwiGLU",
+        Path("/tmp/libtt-branch-bench-20260711/matmul-swiglu-epilogue"),
+    ),
+    Variant(
+        "V8",
+        "caa5428",
+        "Fallback-free prefill-capable epilogue",
+        "one path",
+        Path("/tmp/libtt-branch-bench-20260711/prefill-bf16-no-fallback"),
+    ),
+    Variant(
+        "V9",
+        "627a32d",
+        "Latest main with traced short-prompt prefill",
+        "prefill trace",
+        Path("/tmp/libtt-report-main-627a32d/raw"),
+    ),
 ]
 
 
@@ -115,7 +183,7 @@ def write_throughput_svg(summaries: list[dict]) -> None:
             f'<line x1="{xx-6:.1f}" y1="{lo:.1f}" x2="{xx+6:.1f}" y2="{lo:.1f}" class="ci"/>',
             f'<circle cx="{xx:.1f}" cy="{y(row["mean_tps"]):.1f}" r="7" class="dot"/>',
             f'<text x="{xx:.1f}" y="{height-bottom+28}" text-anchor="middle" class="label">{esc(row["variant"])}</text>',
-            f'<text x="{xx:.1f}" y="{height-bottom+47}" text-anchor="middle" class="small">{esc(row["commit"])}</text>',
+            f'<text x="{xx:.1f}" y="{height-bottom+47}" text-anchor="middle" class="small">{esc(row["plot_label"])}</text>',
         ])
     parts.append(f'<text transform="translate(23 {top+plot_h/2}) rotate(-90)" text-anchor="middle" class="label">tokens/s (mean and 95% t interval)</text>')
     parts.append('<text x="90" y="505" class="small">32 retained requests per revision; two compile/warm-up requests excluded; 128 generated tokens/request.</text>')
@@ -158,7 +226,7 @@ def write_incremental_svg(summaries: list[dict]) -> None:
             f'<rect x="{xx:.1f}" y="{rect_y:.1f}" width="{bw:.1f}" height="{max(rect_h, 1):.1f}" rx="3" class="{klass}"/>',
             f'<text x="{xx+bw/2:.1f}" y="{value_y:.1f}" text-anchor="middle" class="value">{value:+.2f}%</text>',
             f'<text x="{xx+bw/2:.1f}" y="{height-bottom+29}" text-anchor="middle" class="label">{esc(row["variant"])}</text>',
-            f'<text x="{xx+bw/2:.1f}" y="{height-bottom+48}" text-anchor="middle" class="small">{esc(row["commit"])}</text>',
+            f'<text x="{xx+bw/2:.1f}" y="{height-bottom+48}" text-anchor="middle" class="small">{esc(row["plot_label"])}</text>',
         ])
     parts.append(f'<text transform="translate(23 {top+plot_h/2}) rotate(-90)" text-anchor="middle" class="label">throughput change vs. preceding revision</text>')
     parts.append('<text x="90" y="482" class="small">Teal/red: Holm-adjusted p&lt;0.05; gray: not statistically distinguishable from the preceding revision.</text>')
@@ -481,6 +549,167 @@ def analyze_latest_main_streaming() -> None:
         writer.writerows(summary_rows)
 
 
+def analyze_current_kernel_experiments() -> None:
+    """Analyze same-build streaming A/B tests for the current kernel patches."""
+
+    configurations = (
+        {
+            "experiment": "swiglu_k_blocking",
+            "configuration": "k_block_2",
+            "raw_dir": SWIGLU_BLOCK_2_DIR,
+            "swiglu_in0_block_w": 2,
+            "down_projection_110_cores": False,
+            "baseline": None,
+        },
+        {
+            "experiment": "swiglu_k_blocking",
+            "configuration": "k_block_4",
+            "raw_dir": SWIGLU_BLOCK_4_DIR,
+            "swiglu_in0_block_w": 4,
+            "down_projection_110_cores": False,
+            "baseline": "k_block_2",
+        },
+        {
+            "experiment": "down_projection",
+            "configuration": "110_core_specialization",
+            "raw_dir": DOWN_PROJECTION_110_DIR,
+            "swiglu_in0_block_w": 4,
+            "down_projection_110_cores": True,
+            "baseline": "k_block_4",
+        },
+    )
+    metric_names = ("ttft_s", "total_s", "decode_tps", "e2e_tps")
+    values_by_configuration: dict[str, dict[str, list[float]]] = {}
+    hashes: dict[str, set[str]] = {}
+    sample_rows: list[dict] = []
+
+    for config in configurations:
+        paths = sorted(config["raw_dir"].glob("run_*.json"))
+        records = [json.loads(path.read_text()) for path in paths]
+        retained = [
+            (path, record)
+            for path, record in zip(paths, records)
+            if record["phase"] == "retained"
+        ][:N_SAMPLES]
+        if len(retained) != N_SAMPLES:
+            raise RuntimeError(
+                f'{config["configuration"]}: expected {N_SAMPLES} retained '
+                f"files, found {len(retained)}"
+            )
+
+        values = {metric: [] for metric in metric_names}
+        hashes[config["configuration"]] = set()
+        for sample_index, (path, record) in enumerate(retained, 1):
+            if (
+                record["completion_tokens"] != TOKENS
+                or record["stream_chunks"] != TOKENS
+            ):
+                raise RuntimeError(f"{path}: incomplete streaming response")
+            e2e_tps = TOKENS / float(record["total_s"])
+            row_values = {
+                "ttft_s": float(record["ttft_s"]),
+                "total_s": float(record["total_s"]),
+                "decode_tps": float(record["decode_tps"]),
+                "e2e_tps": e2e_tps,
+            }
+            for metric, value in row_values.items():
+                values[metric].append(value)
+            hashes[config["configuration"]].add(
+                record["completion_text_sha256_12"]
+            )
+            sample_rows.append(
+                {
+                    "experiment": config["experiment"],
+                    "configuration": config["configuration"],
+                    "sample": sample_index,
+                    "source_file": path.name,
+                    "swiglu_in0_block_w": config["swiglu_in0_block_w"],
+                    "down_projection_110_cores": str(
+                        config["down_projection_110_cores"]
+                    ).lower(),
+                    "ttft_s": f'{row_values["ttft_s"]:.9f}',
+                    "total_s": f'{row_values["total_s"]:.9f}',
+                    "decode_tps": f'{row_values["decode_tps"]:.9f}',
+                    "e2e_tps": f'{row_values["e2e_tps"]:.9f}',
+                    "completion_text_sha256_12": record[
+                        "completion_text_sha256_12"
+                    ],
+                }
+            )
+        if len(hashes[config["configuration"]]) != 1:
+            raise RuntimeError(
+                f'{config["configuration"]}: non-deterministic output '
+                f'{hashes[config["configuration"]]}'
+            )
+        values_by_configuration[config["configuration"]] = values
+
+    summary_rows: list[dict] = []
+    for config in configurations:
+        configuration = config["configuration"]
+        row: dict[str, object] = {
+            "experiment": config["experiment"],
+            "configuration": configuration,
+            "n": N_SAMPLES,
+            "swiglu_in0_block_w": config["swiglu_in0_block_w"],
+            "down_projection_110_cores": str(
+                config["down_projection_110_cores"]
+            ).lower(),
+        }
+        for metric in metric_names:
+            values = values_by_configuration[configuration][metric]
+            mean = statistics.mean(values)
+            ci_low, ci_high = stats.t.interval(
+                0.95,
+                len(values) - 1,
+                loc=mean,
+                scale=stats.sem(values),
+            )
+            row[f"mean_{metric}"] = mean
+            row[f"stddev_{metric}"] = statistics.stdev(values)
+            row[f"ci_low_{metric}"] = ci_low
+            row[f"ci_high_{metric}"] = ci_high
+        row["completion_text_sha256_12"] = next(iter(hashes[configuration]))
+        baseline = config["baseline"]
+        if baseline is None:
+            row["baseline_configuration"] = ""
+            row["decode_change_pct"] = math.nan
+            row["decode_welch_p"] = math.nan
+            row["e2e_change_pct"] = math.nan
+            row["e2e_welch_p"] = math.nan
+        else:
+            row["baseline_configuration"] = baseline
+            for metric in ("decode", "e2e"):
+                metric_name = f"{metric}_tps"
+                current_values = values_by_configuration[configuration][
+                    metric_name
+                ]
+                baseline_values = values_by_configuration[baseline][metric_name]
+                row[f"{metric}_change_pct"] = 100.0 * (
+                    statistics.mean(current_values)
+                    / statistics.mean(baseline_values)
+                    - 1.0
+                )
+                row[f"{metric}_welch_p"] = float(
+                    stats.ttest_ind(
+                        current_values, baseline_values, equal_var=False
+                    ).pvalue
+                )
+        summary_rows.append(row)
+
+    with (DATA_DIR / "current-kernel-samples.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=list(sample_rows[0]), lineterminator="\n"
+        )
+        writer.writeheader()
+        writer.writerows(sample_rows)
+    with (DATA_DIR / "current-kernel-summary.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=list(summary_rows[0]), lineterminator="\n"
+        )
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+
 def samples_for_variant(variant: str) -> list[dict]:
     with (DATA_DIR / "samples.csv").open(newline="") as f:
         return [row for row in csv.DictReader(f) if row["variant"] == variant]
@@ -534,6 +763,7 @@ def main() -> None:
             "variant": variant.label,
             "commit": variant.commit,
             "optimization": variant.optimization,
+            "plot_label": variant.plot_label,
             "n": len(throughputs),
             "mean_tps": mean,
             "stddev_tps": stddev,
@@ -573,6 +803,7 @@ def main() -> None:
     upstream = analyze_upstream(summaries)
     write_upstream_comparison_svg(summaries, upstream)
     analyze_latest_main_streaming()
+    analyze_current_kernel_experiments()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 ---
-title: "Accelerating Qwen3-8B Decode on Tenstorrent Blackhole"
-subtitle: "A technical and statistical report on libtt's model-path optimizations"
-author: "libtt performance study"
+title: "From StableHLO to Tensix"
+subtitle: "libtt as a hermetic, full-stack runtime for Tenstorrent accelerators"
+author: "libtt technical report"
 date: "15 July 2026"
 lang: en-US
 documentclass: scrreprt
@@ -26,546 +26,709 @@ header-includes:
     \usepackage{longtable}
     \usepackage{graphicx}
     \usepackage{xcolor}
+    \usepackage{caption}
     \definecolor{MidnightBlue}{HTML}{005F73}
+    \definecolor{AccentOrange}{HTML}{E29578}
     \setlength{\emergencystretch}{3em}
+    \setkomafont{disposition}{\color{MidnightBlue}}
     ```
-abstract: |
-  This report explains and measures the cumulative Qwen3-8B decode
-  optimizations implemented in libtt's current TT-XLA/TT-MLIR/TTNN execution
-  path. Ten revisions were evaluated with the serving command documented in
-  `README.md`, the default sampling path unchanged, two compile/warm-up requests
-  discarded, and 32 independent 128-token requests retained per revision.
-  Mean end-to-end generation throughput rises from 16.265 to 26.123 tokens/s,
-  a 60.61% cumulative gain and a 37.73% reduction in mean request latency.
-  A separate 32-request reference run of Tenstorrent's upstream
-  tt-inference-server v0.10.0 on the same P150, model, prompt, token count, and
-  cache-disabled serial workload measured 24.148 tokens/s (95% CI
-  23.999--24.296). Latest-main libtt is 8.18% faster than that reference, with
-  a small measurement-scope caveat: the upstream number uses loopback client
-  wall time while libtt reports request-local server time.
-  The largest narrow change is runtime width-sharding of decode RMSNorm
-  (+13.61%); a true Dst-resident matmul-SwiGLU epilogue adds +2.73%. The study
-  also records two important negative results: generic two-way shared-LHS
-  matmul fusion regresses by 1.69%, and fusing SiLU into a separate binary
-  multiply has a -0.65% observed effect that is not significant after Holm
-  correction. The fallback-free simplification is performance-neutral. Finally,
-  tracing the fixed-shape short-prompt prefill graph reduces time to first token
-  by 90.44% and raises end-to-end throughput by another 10.23%.
 keywords:
-  - Tenstorrent
-  - Blackhole
   - libtt
-  - TT-Metalium
-  - TTNN
+  - Tenstorrent
+  - PJRT
   - TT-MLIR
-  - JAX
+  - TT-Metalium
+  - Blackhole
   - Qwen3
   - LLM inference
+  - compiler optimization
   - kernel fusion
 ---
 
-# Executive summary
+# Abstract {-}
 
-Latest upstream `main` at `627a32d` delivers **26.123 tokens/s** on the report
-workload, compared with **16.265 tokens/s** at the documented pre-optimization
-baseline. This is a **60.61% throughput increase**. Mean end-to-end latency for
-the fixed 128-token response falls from
-7.870 s to 4.901 s, a **37.73% latency reduction**. A 32-sample streaming run
-on latest main measured **59.15 ms time to first token** (95% CI
-57.82--60.48 ms) and **26.079 pure decode tokens/s** (95% CI
-25.949--26.210) after separating prompt processing from decode.
+libtt packages the Tenstorrent JAX execution stack as one PJRT shared library.
+Its pinned TT-XLA frontend, TT-MLIR compiler, TTNN runtime, TT-Metal host code,
+device kernels, and runtime assets are built together and linked into
+`libtt.so`; the target system does not need a separate compiler or TT-Metal
+installation. This report describes that architecture, relates it to Google's
+`libtpu.so` deployment model, and maps libtt's optimizations onto the StableHLO,
+TTIR, TTNN, D2M, TTKernel, TTMetal, runtime, and kernel levels of the stack.
+The organization follows patches and optimization concepts, rather than Git
+commits, because the important changes are vertical slices: a SwiGLU epilogue,
+for example, begins as graph recognition, becomes a TTNN operation and
+serialized attribute, selects a runtime program factory, and ends as a
+Dst-resident Tensix kernel. On Qwen3-8B decode on a Blackhole P150, the
+established optimization line raises end-to-end throughput from 16.265 to
+26.123 tokens/s (+60.61%). A newer 110-core down-projection specialization adds
+5.96% pure decode throughput in a same-build 32-sample A/B test, reaching 27.753
+tokens/s and reducing the projection kernel from 217.188 to 154.932 microseconds
+per layer. In contrast, widening the SwiGLU K block from two to four tiles
+changes throughput by only +0.27% (p = 0.45). The results show why an open,
+centrally built stack is useful: profitable inference work crosses graph
+semantics, layout policy, runtime dispatch, data movement, and device
+arithmetic, and those layers must be changed and measured together.
 
-For an external reference, the same 128-token request was also run through
-Tenstorrent's upstream tt-inference-server v0.10.0 runtime. Its 32 retained
-requests averaged **24.148 tokens/s** (95% CI 23.999--24.296) and 5.302 s mean
-client-observed latency. It is **48.47% faster than libtt V0**, while latest-main
-libtt V9 is **8.18% faster than the upstream reference** on this end-to-end
-workload. The cross-stack difference is not assigned to a particular kernel
-because the two servers use different frontends, clocks, and execution paths.
+# Executive summary {-}
 
-The principal findings are:
+libtt is a self-contained Tenstorrent backend for JAX. Its public deployment
+surface is a single file, `libtt.so`, loaded through PJRT. Internally that file
+contains the TT-XLA PJRT implementation, the TT-MLIR compiler, the TTNN and
+TT-Metal runtime code, and a compressed archive of the TT-Metal device-runtime
+assets. The archive is materialized automatically on first load. This resembles
+the role of Google's `libtpu.so`, which combines the TPU compiler, driver, and
+hardware communication logic behind a shared-library boundary [1]. The analogy
+is architectural, not an assertion that the implementations are related.
 
-1. The initial decode-foundation bundle is decisive: it improves throughput by
-   22.58%. It combines compiler recognition of JAX RMSNorm and rank-3 RoPE,
-   fixes KV-cache dtype propagation, enables BF8 activation lowering, and
-   relaxes TTNN constraints needed by decode-specific layouts. Because these
-   landed in one commit, the study attributes only their aggregate effect.
-2. Recognizing JAX's *expanded* SiLU graph adds 3.30%, and fusing Qwen's decode
-   QKV projection adds another 1.15%.
-3. Broadening shared-LHS matmul fusion from three consumers to two is a
-   statistically clear **-1.69% regression** in isolation. The combined
-   gate/up representation is nevertheless an important enabler for the later
-   SwiGLU epilogue. This is a useful distinction: an intermediate compiler
-   form can be strategically valuable while being locally slower until its
-   consumer is fused.
-4. Runtime width-sharding of single-token RMSNorm over 16 cores is the largest
-   single-purpose win at **+13.61%**.
-5. Folding SiLU into a still-separate binary multiply is not enough. Its mean
-   effect is -0.65%; the raw Welch test is nominally significant, but the result
-   is not significant after correcting the nine adjacent comparisons
-   (Holm-adjusted p = 0.053). The optimization avoids one intermediate, but it
-   still writes and rereads the full gate/up matmul result.
-6. The true matmul-SwiGLU epilogue is the successful fusion boundary. It keeps
-   four gate and four up tiles together in the eight-tile Dst register set on
-   each of 96 cores, applies SiLU and multiplication before packing, and writes
-   only the half-width result. It contributes **+2.73%**.
-7. Extending the matcher to the one-tile-row prefill case and removing the old
-   fallback changes the mean by -0.19% (p = 0.53). It is therefore a code and
-   coverage simplification with no detectable performance cost.
-8. Latest main traces the fixed-shape short-prompt prefill graph as well as
-   decode. It adds **10.23%** end-to-end throughput over V8. A direct same-binary
-   A/B run reduces TTFT from 618.84 to 59.15 ms (**-90.44%**, or 10.46x faster)
-   while decode changes by only +0.36% (p = 0.278).
-9. The final libtt line now exceeds the older upstream server reference:
-   latest-main libtt is 8.18% faster on the report workload. The comparison
-   remains system-level because the serving stacks and timing scopes differ.
+The second design choice is equally important: the complete open stack is
+assembled by one Bazel build. libtt pins upstream revisions, supplies Bazel
+overlays for projects that are not otherwise part of the same build graph, and
+applies a visible patch series at fetch time. The result is close to the
+hermetic-build ideal described by Bazel—tools and dependencies are explicit
+inputs rather than assumptions about the host [2]. For performance engineering,
+this gives a human or coding agent one place to change every layer from compiler
+pattern matching to device dataflow, rebuild one artifact, and run one serving
+benchmark.
 
-![Cumulative throughput across the benchmarked revisions.](figures/throughput.svg){#fig:throughput width=100%}
+The measured work supports six conclusions:
 
-# Scope and interpretation
+1. **Recovering model semantics is foundational.** JAX frequently presents
+   RMSNorm and SiLU as primitive arithmetic. TTIR and TTNN patterns recover
+   those operations, expose Qwen's QKV structure, and preserve cache dtypes.
+   The decode-foundation patch group contributes +22.58%; expanded-SiLU
+   recognition adds +3.30%; and QKV projection fusion adds +1.15%.
+2. **Layout policy can dominate a small kernel.** Runtime width-sharding of
+   one-token RMSNorm across 16 cores adds +13.61%, the largest isolated gain in
+   the established sequence.
+3. **Fusion is valuable only at the right materialization boundary.** Combining
+   the gate/up matmuls alone regresses by 1.69%, and fusing SiLU with a still
+   separate multiply is inconclusive at -0.65%. A true producer-side
+   matmul-SwiGLU epilogue keeps gate/up tiles in Dst and adds +2.73%.
+4. **More blocking is not automatically better.** Increasing the fused
+   SwiGLU K block from two to four tiles yields +0.27% in the 32-sample test
+   (p = 0.45). Widths 4, 8, and 16 remain experimental; two stays the default.
+5. **Core geometry remains a major decode lever.** A specialized 110-core down
+   projection replaces a 64-core program, raises effective BFP8 weight
+   bandwidth from 246.2 to 345.2 GB/s, lowers kernel time by 28.7%, and improves
+   pure decode throughput by 5.96%.
+6. **Trace capture matters outside the token loop.** Recording the fixed-shape
+   one-tile prefill graph reduces mean time to first token from 618.84 to 59.15
+   ms. The primary 128-token benchmark improves by 10.23%, while a direct
+   trace-only A/B test finds no significant decode change.
 
-## What “each optimization” means in this report
+The established main snapshot reaches 26.123 tokens/s, up 60.61% from the
+documented baseline. Tenstorrent's tt-inference-server v0.10.0 reference
+reaches 24.148 tokens/s on the same P150, model, prompt, output length, and
+serial cache-disabled workload. The established libtt result is 8.18% higher,
+subject to a timing-scope caveat: the reference uses loopback-client time while
+the original libtt sequence uses server-reported request time. The newer
+down-projection experiment uses a streaming client clock and is therefore
+reported separately, not appended to the older cumulative series.
 
-The primary experiment covers every cumulative model-path optimization in the
-current, runnable Qwen3-8B serving line from commit `7482967` through latest
-upstream main at `627a32d`. V8 is the final pre-merge optimization branch
-revision; V9 is the merged main snapshot with traced prefill enabled by its
-documented server command. This is the sequence for which the same command in
-the current `README.md`, the same Qwen3-8B model, and the same TT-XLA/TTNN
-execution path remain meaningful. Each row is a real Git revision, not a
-feature flag applied to a shared binary.
+![libtt's serving, compilation, runtime, and device layers.](figures/stack.svg){#fig:stack width=100%}
 
-libtt also has an older, locally implemented PJRT/compiler/runtime history.
-Those optimizations are inventoried in [the historical section](#historical-optimization-inventory),
-but they are not assigned fabricated apples-to-oranges speedups. The local
-runtime was removed when libtt moved to upstream TT-XLA and TT-MLIR; older
-commits use different server entry points, model sizes, operation coverage,
-and runtime architecture. The present README benchmark cannot execute them
-without porting modern SGLang-JAX backward across that architectural boundary.
+# Purpose and design philosophy
 
-Sampling-path branches are intentionally excluded. The optional CPU and fused
-sampling fast paths remain disabled by their defaults, honoring the study's
-focus on the main model rather than token selection. Experimental branches that
-change the numeric contract, such as `agent/qwen3-mlp-bfp4`, require a separate
-quality and performance study rather than being mixed into the BF8-weight
-sequence.
+## What libtt is
 
-The tt-inference-server result is an **external reference**, not V10 in the
-cumulative sequence. It uses the same model and user-visible request, but a
-vLLM/TT-Transformers path rather than SGLang-JAX/StableHLO/TT-XLA. It is
-therefore reported separately and does not change any per-optimization
-attribution.
-
-## Cumulative rather than factorial attribution
-
-For variant $i$, the reported incremental speedup is
-
-$$
-S_i = 100\left(\frac{\bar{T}_i}{\bar{T}_{i-1}} - 1\right),
-$$
-
-where $\bar{T}_i$ is the arithmetic mean of the 32 per-request throughput
-measurements. Cumulative speedup replaces $\bar{T}_{i-1}$ with the V0 mean.
-This answers “what did this commit add to the stack immediately below it?” It
-does not claim that the effects commute: compiler and kernel fusions frequently
-interact, as V4 and V7 demonstrate.
-
-# Tenstorrent technical background
-
-## End-to-end software stack
-
-![The software and hardware layers involved in a libtt generation request.](figures/stack.svg){#fig:stack width=100%}
-
-The request crosses the following layers:
-
-1. **SGLang-JAX** accepts HTTP requests, tokenizes the prompt, schedules
-   prefill/decode batches, owns the paged KV cache, and runs the JAX Qwen model.
-   Its documented architecture separates the HTTP server, tokenizer manager,
-   scheduler, model runner, and detokenizer manager.[^sglang]
-2. **JAX** traces the model computation and presents a StableHLO graph.
-   StableHLO is a portable, ML-oriented operation set between frameworks and
-   compilers.[^stablehlo]
-3. **libtt** is loaded as the `tt` PJRT plugin. PJRT deliberately makes device
-   implementations opaque to frameworks: JAX calls a uniform compile, buffer,
-   transfer, and execute interface while libtt/TT-XLA supplies the
-   Tenstorrent-specific implementation.[^pjrt]
-4. **TT-XLA and TT-MLIR** lower StableHLO through TTIR and TTNN dialects. TTIR
-   carries tensor computation in a hardware-aware compiler IR; TTNN IR selects
-   runtime operations, layouts, memory configurations, and device data types.
-   The compiler serializes an executable FlatBuffer consumed by the TTNN
-   runtime. Tenstorrent's official stack description identifies TT-XLA as the
-   JAX/PyTorch PJRT frontend and TT-MLIR as the compiler that performs fusion,
-   sharding, and layout lowering.[^ttforge]
-5. **TTNN** is the high-level device-operation library. A TTNN matmul,
-   RMSNorm, SDPA, or layout conversion selects a validated device operation and
-   a program factory.
-6. **TT-Metalium** creates command-queue programs containing per-core dataflow
-   and compute kernels. It manages core ranges, circular buffers, semaphores,
-   NoC transfers, and runtime arguments.
-7. **Blackhole Tensix cores** execute those programs against device DRAM and
-   per-core L1 SRAM.
-
-This layering explains why libtt's changes appear as patches to TT-XLA,
-TT-MLIR, and TT-Metal rather than only to libtt's thin PJRT surface. A graph
-pattern has to be recognized in TTIR, represented in TTNN/FlatBuffer, selected
-by the TTNN runtime, and finally executed by a suitable Metal program.
-
-### Reference stack: tt-inference-server
-
-The external baseline enters the Tenstorrent stack by a different route.
-Tenstorrent's tt-inference-server supplies an OpenAI-compatible HTTP service
-around vLLM. For Qwen3-8B in release v0.10.0, vLLM invokes the official
-TT-Transformers Qwen implementation, which constructs TTNN operations and
-TT-Metal programs directly rather than tracing JAX to StableHLO and compiling
-it through TT-XLA/TT-MLIR.[^ttis]
+PJRT defines a uniform device interface through which frameworks call opaque,
+device-specific plugins [3]. libtt implements that boundary for Tenstorrent:
 
 ```text
-libtt path:     SGLang-JAX → JAX/StableHLO → libtt/PJRT
-                            → TT-XLA/TT-MLIR → TTNN → TT-Metal → P150
-
-upstream path:  OpenAI API → vLLM → TT-Transformers
-                            → TTNN → TT-Metal → P150
+JAX process
+  `-- dynamically loads libtt.so through PJRT
+       |-- compiles StableHLO for Tenstorrent
+       |-- allocates and transfers device buffers
+       |-- loads and executes serialized TTNN programs
+       `-- initializes the embedded TT-Metal runtime assets
 ```
 
-This makes the upstream result valuable as a system-level reference: model,
-hardware, prompt, output length, request concurrency, and cache policy can be
-held constant while the frontend and model implementation differ. It is not a
-kernel-isolation experiment. A gap can come from prefill, model graph choices,
-layout policy, TTNN operation selection, trace handling, or serving overhead,
-not just the SwiGLU epilogue studied here.
+The repository's own C++ is intentionally small. One library extracts the
+embedded runtime archive to a fingerprinted temporary directory and sets
+`TT_METAL_RUNTIME_ROOT`; an always-linked constructor performs that setup
+before PJRT initialization; and the final shared-library rule links the
+upstream plugin while exporting only the PJRT entry points. Most functionality
+comes from pinned open-source dependencies, Bazel overlays, and libtt's patch
+series.
 
-## Blackhole and the Tensix execution model
+The deployment contract is therefore stronger than “a plugin that finds an
+installed SDK.” The TT compiler and TT-Metal runtime do not need to be installed
+on the target. Given a compatible driver/firmware environment and `libtt.so`,
+the software stack needed to compile and run a JAX program travels with the
+plugin. This is the specific sense in which libtt follows the `libtpu.so`
+model [1].
 
-The test system contains a Blackhole P150. Current P150 firmware exposes 120
-Tensix cores; Blackhole integrates GDDR6 memory, a two-dimensional NoC, and
-independent SRAM-rich worker cores.[^blackhole] The report's specialized
-SwiGLU program intentionally uses 96 workers, laid out within an 11-by-9-capable
-worker grid, rather than assuming every exposed core is available.
+## One build graph for the complete open stack
 
-A Tensix core behaves more like a small dataflow computer than a conventional
-GPU streaming multiprocessor. A typical program has:
+libtt uses Bazel modules and repository rules to pin TT-UMD, SFPI, TT-Metal,
+LLVM, StableHLO, TT-XLA, TT-MLIR, Shardy, and supporting C++ libraries. Bazel
+overlays define targets where upstream projects use another build system; patch
+lists adapt and optimize those sources before compilation. The `//:tt` target
+then produces `bazel-bin/libtt.so`.
 
-- a **reader data-movement kernel** that fetches tiles from DRAM or another
-  core over the NoC into L1 circular buffers;
-- a **compute kernel** that unpacks tiles into compute registers, invokes the
-  matrix/vector engines, and produces result tiles;
-- a **writer data-movement kernel** that drains result circular buffers to the
-  destination tensor.
+This organization has three practical effects:
 
-Circular buffers are bounded producer/consumer queues shared by the core's
-threads. The standard protocol reserves space at the back, pushes produced
-tiles, waits for tiles at the front, and pops consumed tiles.[^cb] Reader,
-compute, and writer kernels can therefore overlap on different data.
-Tenstorrent's matmul lab describes the same three-kernel pipeline and the NoC
-path from DRAM to fast core-local SRAM.[^matmullab]
+- **Reproducible scope.** A source revision, overlay, patch, compiler toolchain,
+  and link rule are all reviewable inputs to the same build.
+- **Atomic cross-layer changes.** A compiler rewrite, FlatBuffer schema update,
+  runtime handler, TTNN program factory, and Metal kernel can be built and
+  tested as one change instead of coordinating installed components.
+- **Agent-friendly iteration.** An agent can inspect the model graph, compiler
+  pass, runtime dispatch, and kernel code in one workspace; modify the smallest
+  appropriate abstraction; rebuild one target; and run the README benchmark.
+  The important property is not automation alone but the absence of opaque or
+  separately versioned layers between diagnosis and implementation.
 
-### Tiles, faces, and padding
+The open-source nature of TT-XLA, TT-MLIR, TTNN, TT-Metal, and the surrounding
+toolchain is what makes the last point technically meaningful. Tenstorrent's
+own compiler overview describes a similarly open chain from framework
+frontends through TT-MLIR dialects to TT-Metalium [6, 7]. libtt turns a pinned
+slice of that chain into one distributable artifact.
 
-TTNN's default tile is 32 by 32 elements. It is divided into four 16-by-16
-faces because the matrix engine operates natively on 16-by-16 pieces. Tile
-layout pads the final two tensor dimensions to tile boundaries.[^tensor]
-Consequently, batch-one decode still presents one full tile row to many
-operations: the logical sequence length is one, but the physical compute unit
-is a 32-row tile. Optimizations must reason about both logical shapes and padded
-tile shapes.
+## Cross-cutting optimization as the design test
 
-### Dst registers and why epilogues matter
+The matmul-SwiGLU epilogue is the clearest test of the architecture. No single
+layer can implement it correctly:
 
-The Dst register set is the compute kernel's primary workspace. Matrix-engine
-results land in Dst; the vector engine can read and modify them; the packer
-moves them back to an L1 circular buffer. Conversely, the unpacker loads L1
-tiles into Dst. The TT-Metal documentation explicitly identifies Dst as the
-matrix destination and vector source/destination, with `pack_tile` moving a
-result back to L1.[^dst]
+1. A graph pass must prove that a paired gate/up matmul feeds the exact
+   `silu(gate) * up` expression.
+2. TTNN IR needs an operation-level representation that preserves the fused
+   semantic through lowering.
+3. The serialized executable needs to carry the new matmul attribute.
+4. The runtime must dispatch that operation into TTNN.
+5. TTNN must select a program factory only for supported shapes, dtypes,
+   layouts, and hardware.
+6. Reader, compute, and writer kernels must keep the paired tiles resident in
+   Dst and emit only the half-width final result.
 
-Every boundary crossed after Dst costs work: pack, reserve/push a circular
-buffer, possibly write through the NoC to DRAM, launch another operation, read
-the tensor again, and unpack. A true epilogue wins by applying the consumer
-while producer values are already resident in Dst. Merely placing two TTNN
-operations in one graph region is not equivalent if the first operation's full
-output is still materialized.
+libtt makes those six steps one patch concept, even though they touch two
+upstream repositories and several abstraction levels. Organizing this report
+by that concept is more informative than organizing it by the commits used to
+collect intermediate measurements.
 
-### DRAM, L1, interleaving, and sharding
+# Compilation and execution architecture
 
-Weights and large persistent tensors live in device DRAM. L1 is smaller and
-faster, and exists independently on each worker. A tensor's TTNN
-`MemoryConfig` specifies both buffer location and layout:
+## The framework boundary: JAX, StableHLO, and PJRT
 
-- **interleaved** storage distributes pages through memory banks;
-- **height sharding** splits rows across core L1s;
-- **width sharding** splits columns across core L1s;
-- **block sharding** partitions both dimensions.
+SGLang-JAX owns HTTP serving, tokenization, scheduling, the JAX Qwen model, and
+the paged KV cache [15]. JAX traces each shape-specialized computation and hands
+the plugin StableHLO. StableHLO is a portable high-level operation set between
+ML frameworks and compilers [4]; PJRT is the API boundary that keeps the
+device-specific compiler and runtime opaque to JAX [3].
 
-TTNN documents L1 sharding as distributing one shard to each core's L1, with a
-core grid, shard shape, strategy, and orientation defining the mapping.[^sharding]
-`ttnn.to_memory_config` performs interleaved/sharded and DRAM/L1 conversions.[^memconfig]
-Sharding helps only when the parallel operation saves more than those conversion
-costs. V5 is a successful example because RMSNorm's reduction and affine work
-benefit enough from 16-way width sharding even after conversion in and out.
+The steady-state request path is:
 
-### BF16 and BFP8 weights
+```text
+SGLang-JAX → JAX trace → StableHLO → libtt/PJRT
+            → TT-XLA → TT-MLIR → TTNN executable
+            → TTNN runtime → TT-Metal programs → Blackhole
+```
 
-The benchmark keeps activations and outputs in BF16 but asks TT-XLA to lower
-eligible model weights to `bfp_bf8` (`BFLOAT8_B`). BFLOAT8_B is a block-floating
-format: groups of 16 values share an exponent.[^bfp8] It reduces weight bytes
-and therefore decode's dominant DRAM traffic, at the cost of precision and a
-different reduction path. The SwiGLU kernel is deliberately specialized for
-BF16 input/output and BFLOAT8_B weights; it uses BF16 packer-L1 accumulation
-instead of FP32 Dst accumulation.
+Compilation and execution are both behind `libtt.so`. StableHLO is the incoming
+contract; a serialized TTNN program is the principal executable artifact in
+the measured path.
 
-Packer-L1 accumulation stores partial sums in an L1 circular-buffer slot and
-adds later Dst values into that slot. TT-Metal exposes this explicitly as an
-L1-accumulation mode of the packer.[^packer] It permits a K dimension larger
-than the Dst capacity while reserving all eight Dst tiles for paired gate/up
-outputs.
+## Why TT-MLIR has several IRs
 
-## Why autoregressive decode is special
+MLIR is designed around extensible dialects at different abstraction levels
+[5]. TT-MLIR uses that capability to represent model semantics, layouts,
+generic tiled computation, device kernels, and host/device orchestration at
+different points in lowering [7]. The distinctions matter because an
+optimization should live at the highest level that still contains the
+information it needs.
 
-Prefill processes many prompt tokens at once and exposes a large matmul M
-dimension. Decode processes one new token per active sequence, so at batch one
-most projections are logically $1\times K$ by $K\times N$. The weights are
-revisited for every token, arithmetic intensity is low, and launch/data-motion
-overheads are a larger fraction of token time. The 32-row tile padding also
-makes naive kernels perform work on rows that are not logically populated.
+Table: The TT-MLIR IR ladder and where libtt's measured path uses it.
 
-For a simplified Qwen decoder layer,
+| Representation | Abstraction and purpose | Relationship to current libtt optimizations |
+|:--|:--|:--|
+| **StableHLO** | Framework-portable tensor graph with specified operation semantics [4]. | Input to TT-XLA/TT-MLIR. Framework algebra such as expanded SiLU is visible here and after import, but libtt's patches generally match it in TTIR/TTNN passes. |
+| **TTIR** | Hardware-aware, high-level tensor IR. It preserves named tensor operations while permitting fusion and canonicalization before a concrete runtime API is chosen [7]. | JAX RMSNorm recognition, expanded-SiLU recovery, shared-LHS matmul grouping, role propagation, and part of QKV/RoPE fusion. |
+| **TTNN dialect** | High-level tensor IR designed to model the TTNN library closely. Its types and attributes carry tiled layouts, memory spaces, sharding, and device data types [7, 8]. | QKV composite fusion, `matmul_swiglu`, layout selection, cache return types, and lowering to the serialized TTNN operation graph. |
+| **TTNN FlatBuffer** | Serialized executable operation graph consumed by the TTNN runtime. It is an artifact rather than an MLIR dialect. | Carries operation parameters such as the fused-SwiGLU matmul flag across the compiler/runtime boundary. |
+| **D2M dialect** | Generic tensor/memref computation analogous to `linalg.generic`, augmented with grids, sharded tensors, circular buffers, and explicit data movement [7]. | An alternative direct-to-metal route. The measured custom SwiGLU and down-projection kernels are hand-written TT-Metal/TTNN patches, so they do **not** pass through D2M. |
+| **TTKernel dialect** | Low-level device-kernel IR exposing circular buffers, tile registers, NoC transactions, and synchronization with an intended near one-to-one mapping to TT-Metal kernels [7]. | Relevant to generated direct-to-metal kernels; not the representation of the hand-written C++ kernels measured here. |
+| **TTMetal dialect** | Host/device interop IR for allocation, transfers, program creation, and enqueue operations [7]. | Part of the direct-to-metal compiler route. The measured TTNN route instead invokes TT-Metal host APIs from the TTNN runtime. |
+
+The main lowering branch in this report is therefore:
+
+```text
+StableHLO → TTIR → TTNN dialect → TTNN FlatBuffer
+                                      ↓
+                              TTNN C++ runtime
+                                      ↓
+                       TT-Metal host + C++ kernels
+```
+
+TT-MLIR also supports the lower-level branch:
+
+```text
+TTIR → D2M → TTKernel + TTMetal → generated device/host program
+```
+
+Both branches belong in a technical description of TT-MLIR; only the first is
+the execution path for the benchmarked libtt patches. This distinction avoids
+calling a C++ program-factory change a “TTKernel IR optimization” when no such
+IR was involved.
+
+## TTNN runtime and the serialized executable
+
+TTNN IR models operations such as matmul, RMSNorm, SDPA, reshape, and memory
+configuration. Lowering serializes these into a FlatBuffer. At execution time,
+the embedded TTNN runtime deserializes the graph, creates tensors, chooses
+memory configurations, and invokes TTNN operations. A TTNN operation validates
+its contract and selects a device-operation program factory.
+
+This runtime layer is where dynamic facts can be used without obscuring graph
+semantics. The decode RMSNorm patch, for example, observes the actual input
+tensor and creates a 16-core width-sharded memory configuration. The compiler
+still emits RMSNorm; the runtime chooses the layout specialization.
+
+## TT-Metal programs and Tensix kernels
+
+TT-Metalium exposes a cooperative dataflow model rather than a conventional
+GPU thread hierarchy [9]. A typical program uses:
+
+- a reader data-movement kernel to fetch tiles from DRAM or another core into
+  L1 circular buffers;
+- a compute kernel to unpack tiles, drive matrix/vector engines, and create
+  result tiles; and
+- a writer data-movement kernel to drain result buffers to their destination.
+
+Circular buffers are bounded producer/consumer queues shared between the
+threads of a Tensix core [11]. Readers, compute, and writers can overlap on
+different tiles, provided that reserve/push/wait/pop and semaphore protocols
+are correct.
+
+The compute engine exposes SrcA, SrcB, and Dst register sets. Matrix results
+land in Dst; vector operations can transform them; the packer writes them to an
+L1 circular buffer [10]. With 16-bit Dst storage and double buffering enabled,
+the active half contains eight 32-by-32 tiles. That capacity determines the
+successful SwiGLU geometry: four gate and four up tiles fill Dst exactly.
+
+## Tiles, memory, and low-precision weights
+
+TTNN's standard tile is 32 by 32 elements and contains four 16-by-16 faces
+[12]. Shapes are padded in their final two dimensions, so logical batch-one
+decode still presents a full tile row to many kernels. A useful optimization
+must reason about both logical shape—one valid token—and physical tile shape.
+
+Large weights reside in device DRAM; L1 is smaller, faster, and private to each
+worker. TTNN `MemoryConfig` values describe interleaved or sharded storage and
+DRAM or L1 placement. TT-MLIR layout attributes similarly encode how a logical
+tensor maps to devices, cores, physical shards, memory space, and padding [8].
+
+The benchmark uses BF16 activations and outputs with BFLOAT8_B weights.
+BFLOAT8_B is block floating point: 16 values share an exponent [13]. It reduces
+the dominant weight traffic in batch-one decode, with a precision and packing
+trade-off. The custom matmuls use BF16 packer-L1 accumulation: partial sums are
+packed into an L1 slot and reloaded for later K blocks, leaving Dst available
+for the current block's tile group.
+
+## Why autoregressive decode is bandwidth-sensitive
+
+Qwen3 is a decoder-only Transformer family [16]. For a simplified layer,
 
 $$
 \begin{aligned}
 u &= \operatorname{RMSNorm}(h),\\
-h' &= h + \operatorname{Attention}(Q(u),K(u),V(u);\,K_{cache},V_{cache}),\\
+h' &= h + \operatorname{Attention}(Q(u),K(u),V(u);K_{cache},V_{cache}),\\
 v &= \operatorname{RMSNorm}(h'),\\
-g &= v W_{gate}, \qquad r = v W_{up},\\
+g &= vW_{gate}, \qquad r = vW_{up},\\
 h_{next} &= h' + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 \end{aligned}
 $$
 
-The repeatedly executed hot path therefore contains RMSNorm reductions, QKV
-projection/splitting, RoPE, paged-cache attention, paired gate/up matmuls,
-SiLU/multiply, a down projection, and residual additions. The optimizations in
-this report either recognize these graphs, choose decode-appropriate layouts,
-or eliminate materialization between their operations.
+RMSNorm and SwiGLU are standard model concepts [17, 18]. During prefill, many
+prompt rows share each weight read. During serial decode, a projection is
+logically $1\times K$ by $K\times N$ for every new token. Weights are reread at
+each layer and token, arithmetic intensity is low, and launch/materialization
+overhead becomes visible. This is why the principal wins below expose more
+width parallelism, reduce DRAM traffic, or remove an intermediate before it is
+packed from Dst.
 
-# Optimization sequence
+# Optimization map by patch and concept
 
-## V0 — documented baseline (`7482967`)
+The table below is the roadmap for the rest of the report. Git revisions remain
+in the data files for provenance, but the technical unit is the patch concept
+and its location in the stack.
 
-V0 is the last documentation-only commit before the present decode series. It
-already includes the upstream TT-XLA/TT-MLIR architecture, Qwen3 SGLang-JAX
-support, BF8 weight lowering, fast tilize patches, and reduced cold-compile
-work. It is therefore a strong, runnable baseline—not the project's original
-unoptimized runtime.
+\begingroup\footnotesize
 
-## V1 — decode foundation bundle (`9978a9b`)
+Table: Current model-path optimization concepts, implementation levels, and measured effects.
 
-This commit introduces several mutually dependent changes:
+| Concept | Principal level / IR | Measured effect |
+|:--|:--|--:|
+| Recover JAX RMSNorm | TTIR graph rewrite | Included in +22.58% foundation bundle |
+| Recognize expanded SiLU | TTIR graph rewrite | +3.30% |
+| Fuse rank-3 decode RoPE | TTIR/TTNN composite resolution | Included in foundation bundle |
+| Fuse Qwen decode QKV structure | TTIR ordering + TTNN fusion | +1.15% |
+| Preserve KV-cache result types | TTNN type inference | Included in foundation bundle |
+| Enable BF8 activation/weight path | Compile options, TTNN lowering, host packing | Foundation/baseline; not isolated |
+| Permit decode layouts | TTNN/TT-Metal validation | Included in foundation bundle |
+| Width-shard decode RMSNorm | TTNN runtime policy | +13.61% |
+| Combine two shared-LHS matmuls | TTIR fusion | -1.69%; enables epilogue |
+| True matmul-SwiGLU epilogue | TTNN IR/FlatBuffer/runtime + TT-Metal | +2.73% |
+| Generalize and remove fallback | TTNN matching/runtime simplification | -0.19%, p = 0.53 |
+| Sweep SwiGLU K blocking | TT-Metal program and CB geometry | +0.27%, p = 0.45 |
+| Specialize down projection | TTNN program selection + TT-Metal | +5.96% pure decode |
+| Trace one-tile prefill | TTNN/TT-Metal runtime trace | -90.44% TTFT; +10.23% E2E |
 
-- a TTIR matcher collapses JAX's decomposed RMSNorm expression into a TTNN
-  RMSNorm operation;
-- RoPE fusion accepts the rank-3 decode shapes produced by JAX, reshaping to
-  the rank-4 composite form and back;
-- KV-cache dtype conversion propagates return types through cache-update ops;
-- single-chip activation dtype lowering and TT-XLA compile options enable BF8
-  activation/weight lowering in the intended regions;
-- TT-Metal layernorm validation accepts the single-core height-sharded decode
-  case;
-- SDPA decode accepts an L1-interleaved, non-sharded query tensor;
-- SiLU lowering bridges the JAX call form used at this point in the sequence.
+\endgroup
 
-The aggregate gain is **+22.58%**. No sub-feature number is claimed because
-they are not separate commits and several are enabling correctness/layout
-conditions for the others.
+The corresponding patch index is compact enough to keep the mapping explicit:
 
-## V2 — expanded-SiLU recognition (`10459b5`)
-
-JAX does not necessarily preserve SiLU as a named operation. The observed
-StableHLO/TTIR graph expresses it as
-
-$$
-\operatorname{SiLU}(x) = x\,\sigma(x) = \frac{x}{1 + \exp(-x)},
-$$
-
-with typecasts, reshapes, broadcasts, and splatted constants around the scalar
-one. V2 looks through those view-like operations, proves the constant is one,
-matches divide/add/exp/neg, and replaces the outer multiply with a SiLU op. It
-removes a chain of elementwise launches and intermediates while retaining a
-strict same-input check for $x$ and the sigmoid-like expression. The measured
-increment is **+3.30%**.
-
-## V3 — Qwen decode QKV projection fusion (`3fe072b`)
-
-V3 recognizes the exact decode projection structure:
+\begingroup\scriptsize
 
 ```text
-matmul → Q slice/reshape → Q RMSNorm → [1, B, Hq, D]
-       → K slice/reshape → K RMSNorm → [1, B, Hkv, D]
-       → V slice/reshape             → [1, B, Hkv, D]
+RMSNorm graph       tt_mlir_fuse_jax_rms_norm.patch
+expanded SiLU       tt_mlir_fuse_expanded_silu.patch
+decode RoPE         tt_mlir_fuse_rank3_rope_decode.patch
+QKV structure       tt_mlir_qwen_decode_qkv_projection_fusion.patch
+KV-cache types      tt_mlir_kv_cache_dtype_return_types.patch
+BF8 path            tt_mlir_single_chip_activation_dtype_lowering.patch
+                    fast_bfloat16_bfp8_pack.patch
+decode layouts      sdpa_decode_allow_l1_interleaved_q.patch
+                    layernorm_allow_single_core_height_sharded.patch
+RMSNorm sharding    tt_mlir_sharded_decode_rms_norm.patch
+shared-LHS pair     tt_mlir_fuse_shared_lhs_matmul_pairs.patch
+SwiGLU vertical     tt_mlir_fuse_matmul_swiglu.patch
+                    matmul_swiglu_epilogue.patch
+down projection     down_projection_110_core.patch
 ```
 
-The pattern verifies rank, contiguous Q/K/V bounds, head counts, head
-dimension, and operation roles. It then reshapes the projection once, invokes
-`nlp_create_qkv_heads_decode`, and recreates Q/K RMSNorm at rank four. This
-avoids materialized slices and reshapes in the decode loop. The measured gain
-is **+1.15%**.
+\endgroup
 
-## V4 — two-way shared-LHS matmul fusion (`83baa8d`)
+The +22.58% foundation figure is aggregate because its dependent patches were
+not isolated. The current blocking and down-projection A/B tests use a streaming
+decode clock and therefore remain separate from the cumulative sequence.
 
-TTIR already fused groups of at least three matmuls that share a left-hand
-operand. V4 changes the validity threshold from three to two. That admits
-Qwen's paired gate/up projections, conceptually transforming
+# Recovering model semantics in TTIR and TTNN
+
+## RMSNorm recognition
+
+Framework tracing does not guarantee that a named model operation survives as
+one StableHLO op. JAX RMSNorm can arrive as square, reduce, epsilon addition,
+reciprocal square root, scaling, and reshapes. The RMSNorm fusion patch proves
+that structure and replaces it with one semantic normalization operation.
+
+This is the right level for the rewrite. TTIR still exposes tensor algebra and
+use-def structure, but the replacement can later benefit from TTNN's dedicated
+normalization operation, layout analysis, and runtime program selection.
+Matching later in TT-Metal would be impossible because the arithmetic would
+already be split into independent programs.
+
+RMSNorm recognition is part of the foundation bundle rather than an isolated
+measurement. It also enables the later runtime-sharding patch: a runtime cannot
+choose a specialized RMSNorm layout if the compiler never recovered RMSNorm.
+
+## Expanded-SiLU recognition
+
+The observed graph represents
+
+$$
+\operatorname{SiLU}(x)=x\,\sigma(x)=\frac{x}{1+\exp(-x)}
+$$
+
+with casts, broadcasts, reshapes, and a splatted scalar one around the core
+arithmetic. `tt_mlir_fuse_expanded_silu.patch` looks through view-like
+operations, proves the constant and the shared input, and replaces the expanded
+tree with a SiLU operation. It removes elementwise launches and intermediates
+without relying on fragile source-level names. The isolated improvement is
+**+3.30%**.
+
+## Rank-3 RoPE and QKV projection structure
+
+Decode Q, K, and V are not three unrelated slices. Qwen projects them together,
+applies per-head RMSNorm to Q and K, reshapes into query and KV head counts, and
+then applies rotary position embedding. Two patch concepts recover this shape:
+
+- `tt_mlir_fuse_rank3_rope_decode.patch` accepts JAX's rank-3 decode form,
+  temporarily maps it to the existing rank-4 composite, and restores the
+  expected result shape.
+- `tt_mlir_qwen_decode_qkv_projection_fusion.patch` orders projection roles,
+  validates contiguous Q/K/V bounds, head counts, and head dimensions, and
+  replaces materialized slices/reshapes with `nlp_create_qkv_heads_decode`.
+  Q and K RMSNorm are recreated on the fused rank-4 results.
+
+The QKV concept crosses TTIR and TTNN: TTIR supplies candidate ordering and
+role information; TTNN owns the composite operation and runtime contract. Its
+isolated gain is **+1.15%**. Rank-3 RoPE belongs to the foundation bundle.
+
+## KV-cache dtype and role propagation
+
+KV-cache update operations are stateful boundaries. Their return types must
+carry the selected device dtype, and graph-role metadata must survive unary
+operations so later fusions can still identify query, key, and value paths.
+The relevant TT-MLIR and TT-XLA patches are primarily correctness/enabling
+work: they keep a low-precision, fused graph well typed and recognizable.
+
+These patches illustrate why optimization accounting should not be reduced to
+“one commit, one speedup.” A type-inference fix may add no direct throughput yet
+be required for the layout and kernel that do.
+
+# Layout, precision, and runtime policy
+
+## BF8 lowering and fast host packing
+
+The server requests `bfp_bf8` for eligible weights. TT-XLA compile-option
+patches enable the intended single-chip lowering; TT-MLIR assigns the device
+dtype; TTNN and TT-Metal consume BFLOAT8_B tiles. The
+`fast_bfloat16_bfp8_pack.patch` concept accelerates creation of standard
+32-by-32 BFP8 tiles from BF16 host weights.
+
+These changes attack two different phases:
+
+- BF8 storage reduces steady-state device weight traffic during decode.
+- faster packing reduces model-load and preparation cost on the host.
+
+The cumulative measurements do not isolate either effect from the foundation
+and pre-existing baseline. The report therefore describes their mechanism but
+does not invent a per-patch speedup.
+
+## Width-sharded decode RMSNorm
+
+The default logical height of RMSNorm during batch-one decode is one. A generic
+height-parallel program cannot occupy many cores. The runtime patch recognizes
+a device-resident, tiled, unsharded input with sequence length one and width at
+least 2048. When the width divides into 16 tile-aligned shards, it:
+
+1. creates an 8-by-2 row-major core grid;
+2. width-shards the tensor into the cores' L1 memories;
+3. derives the layernorm program configuration from that shard specification;
+4. executes sharded RMSNorm; and
+5. restores the requested output memory configuration.
+
+The conversion cost is paid twice, but the width-parallel reduction and affine
+work more than repay it. The isolated throughput gain is **+13.61%**. This is a
+runtime specialization rather than a new IR operation: the compiler has
+already identified RMSNorm, while the runtime knows the concrete tensor and
+device geometry.
+
+## Decode-specific validation changes
+
+Two small TT-Metal patches admit layouts selected by the optimized graph:
+
+- SDPA decode accepts an L1-interleaved query rather than requiring the prior
+  sharded form.
+- layernorm accepts the single-core height-sharded case produced on the decode
+  path.
+
+They are deliberately narrow validation changes, not general relaxations. Their
+performance contribution is inseparable from the foundation bundle; their
+engineering value is removing avoidable conversions while retaining shape and
+layout checks.
+
+# The MLP as a vertical optimization slice
+
+## Shared-LHS gate/up projection
+
+Qwen's two first MLP projections share an activation:
 
 $$
 xW_{gate},\;xW_{up}
 \quad\longrightarrow\quad
-x\,[W_{gate}\;W_{up}].
+x[W_{gate}\;W_{up}].
 $$
 
-The result is a **-1.69% regression** (Holm-adjusted p =
-$8.81\times10^{-5}$). The likely mechanism is visible from the graph: V4
-reduces launch/input-read duplication but still writes the doubled-width
-projection and then slices/reads it for SwiGLU. Wider output handling and the
-chosen matmul geometry cost more than the saved launch on this shape.
+`tt_mlir_fuse_shared_lhs_matmul_pairs.patch` changes TTIR fusion eligibility so
+a pair, rather than only a group of at least three, can be combined. This
+reduces duplicate activation reads and launches, but creates a doubled-width
+output that the following SwiGLU still slices and rereads. In isolation it
+**regresses throughput by 1.69%** (Holm-adjusted p =
+$8.81\times10^{-5}$).
 
-This result does not make V4 useless. V7 consumes precisely the combined
-gate/up representation and removes its expensive output boundary. V4 is an
-enabler whose isolated form is slower.
+The representation is nevertheless useful: the true epilogue consumes exactly
+this paired result. It is an enabling IR transformation whose standalone
+materialization is more expensive than two separate projections.
 
-## V5 — decode RMSNorm runtime sharding (`e534690`)
+## Why consumer-side SiLU fusion is insufficient
 
-V5 detects a device-resident, tiled, unsharded RMSNorm input with logical
-sequence length one and width at least 2048. If the width divides evenly into
-16 tile-aligned shards, it:
+An intermediate experiment placed SiLU as a unary activation on the following
+TTNN multiply. That removes one elementwise operation but retains the expensive
+boundary:
 
-1. constructs an 8-by-2, row-major core grid;
-2. width-shards the input into the 16 cores' L1 memories;
-3. derives the layernorm program configuration from the shard specification;
-4. runs TTNN RMSNorm in the sharded configuration; and
-5. converts the output back to the requested/original memory configuration.
+```text
+combined matmul → pack full gate/up tensor → memory
+                → read/unpack → SiLU + multiply → pack result
+```
 
-The measured increment is **+13.61%**, the largest narrow optimization in the
-study. At sequence length one, the generic interleaved path leaves too little
-parallel work in the height dimension. Width sharding exposes the hidden-size
-reduction across cores and more than repays two memory-config conversions.
-
-## V6 — SiLU fused into binary multiply (`a718685`)
-
-The TTNN fusing pass detects a single-use SiLU feeding either side of a
-multiply. It removes the standalone SiLU op, marks the relevant BinaryNg input
-with a unary SiLU activation, extends the FlatBuffer enum, and calls TTNN
-`multiply` with a per-input activation list.
-
-This is a legitimate elementwise fusion, but not a matmul epilogue. The full
-combined gate/up projection still reaches memory before BinaryNg consumes it.
-The observed effect is **-0.65%**. Its raw Welch p-value is 0.0266, but the
+The measured effect is **-0.65%**. Its raw Welch p-value is 0.0266, but the
 Holm-adjusted p-value is 0.0533, so the experiment does not establish a
-family-wise-significant regression. It certainly provides no evidence of a
-speedup.
+family-wise-significant regression—and provides no evidence of a speedup. It
+demonstrates that operation-count reduction is not the same as traffic
+reduction.
 
-## V7 — true Dst-resident matmul-SwiGLU epilogue (`ce99831`)
+## True Dst-resident matmul-SwiGLU epilogue
 
-V7 adds a TT-MLIR pattern, TTNN `matmul_swiglu` operation, and dedicated
-TT-Metal program. Its contract is intentionally narrow:
+The successful concept is implemented by two patches:
 
-- BF16 activation and output;
-- BFLOAT8_B weight matrix;
-- DRAM-interleaved tensors;
-- no transpose, bias, or caller-provided output;
-- one physical tile row;
-- a grid supporting the selected 96 workers;
-- half of the output tile width divisible across those workers.
+- `tt_mlir_fuse_matmul_swiglu.patch` recognizes the TTNN graph, introduces the
+  fused matmul semantic, extends the FlatBuffer representation, serializes it,
+  and invokes the corresponding runtime path.
+- `matmul_swiglu_epilogue.patch` adds TTNN validation, a program factory, and
+  the TT-Metal reader/receiver/sender/compute kernels.
 
-For Qwen3-8B, each worker owns four gate-output tiles and four corresponding
-up-output tiles. Together they exactly fill the eight-tile Dst register set.
-The program:
+The contract is intentionally specialized: one physical tile row, BF16
+activation/output, BFLOAT8_B weights, DRAM-interleaved tensors, no transpose or
+bias, and a grid that can supply 96 workers. For Qwen3-8B, each worker owns four
+gate tiles and four corresponding up tiles—exactly the eight active 16-bit Dst
+slots.
 
-1. uses two sender cores to multicast activation K blocks over the NoC;
-2. has each of 96 workers read its paired gate/up BF8 weight tiles;
-3. accumulates each K block into all eight Dst slots;
-4. packs partial sums into L1 with BF16 packer-L1 accumulation;
-5. reloads the final four gate and four up partials into Dst;
-6. applies SiLU to Dst slots 0--3;
-7. multiplies each by slots 4--7 in place; and
-8. packs only four final BF16 tiles.
+The program performs the following sequence:
 
-The critical difference from V6 is that the full gate/up matmul output never
-becomes a standalone tensor. The epilogue halves output traffic at the producer
-boundary and avoids a second operation's read/unpack path. The measured gain
-is **+2.73%**.
+1. two sender cores multicast activation K blocks over the NoC;
+2. each of 96 workers reads its paired gate/up weight tiles;
+3. the matrix engine accumulates all eight output tiles;
+4. partial K results use BF16 packer-L1 accumulation;
+5. final gate/up partials are loaded together into Dst;
+6. SiLU transforms Dst slots 0–3;
+7. each gate tile multiplies its corresponding up tile in place; and
+8. only four final BF16 tiles are packed and written.
 
-## V8 — prefill-capable, fallback-free simplification (`caa5428`)
+The full doubled-width gate/up tensor never exists as a TTNN tensor. This
+producer-side boundary contributes **+2.73%** end-to-end throughput.
 
-V8 generalizes the compiler matcher from decode-only naming/shape assumptions
-to any supported one-tile-row input, covering short prefill as well as decode.
-It removes the V6 SiLU-multiply patch and its fallback path, leaving the true
-matmul epilogue as the single implementation for the matched form. Validation
-remains in TTNN/TT-Metal, where unsupported dtype/layout/shape combinations are
-rejected rather than silently taking a slower path.
+## Prefill coverage and fallback removal
 
-The measured difference is **-0.19%**, p = 0.532. The result is statistically
-neutral and its confidence interval overlaps V7's closely. V8 therefore
-achieves the intended simplification and broader match coverage without a
-detectable throughput regression.
+The matcher was then generalized from decode-specific naming to any supported
+one-tile-row input, which includes short prefill. The older consumer-side
+SiLU-multiply fallback was removed; validation remains at the TTNN/TT-Metal
+boundary, where unsupported dtype, layout, shape, and hardware combinations
+fail explicitly.
 
-## V9 — latest main with traced short-prompt prefill (`627a32d`)
+The change is performance-neutral: **-0.19%, p = 0.532**. It simplifies the
+implementation and broadens coverage without changing the fast kernel or the
+observed completion hash.
 
-V9 is the latest upstream-main serving snapshot. It contains the merged
-matmul-SwiGLU epilogue and sets `SGLANG_TT_TRACE_DECODE_ONLY=false` in the
-documented Qwen3 command. SGLang-JAX therefore records and replays the
-fixed-shape prefill graph instead of dispatching its operations individually
-from the host. Decode was already traced; this change targets the first-token
-path.
+## SwiGLU K-blocking sweep
 
-On the primary 128-token workload, V9 reaches **26.123 tok/s**, a **10.23%**
-increase over V8, while mean request latency falls from 5.402 to 4.901 s
-(-9.27%). The completion-token hash is unchanged from V8. Because V8 and V9
-were collected in separate sessions, a second experiment toggled only
-`SGLANG_TT_TRACE_DECODE_ONLY` on the same latest-main binary. Across 32 retained
-requests per setting, full tracing reduced mean TTFT from 618.84 to 59.15 ms
-(-90.44%, or 10.46x faster). Decode throughput changed from 25.986 to
-26.079 tok/s (+0.36%, Welch p = 0.278), providing no evidence of decode
-degradation.
+The initial epilogue uses `in0_block_w = 2`. Every two K tiles it packs eight
+partial-result tiles into L1, then resumes packer-L1 accumulation. A plausible
+hypothesis was that widths 4, 8, or 16 would reduce synchronization and partial
+traffic enough to win, at the cost of larger activation and weight circular
+buffers.
+
+`matmul_swiglu_epilogue.patch` now exposes
+`TT_METAL_SWIGLU_IN0_BLOCK_W={2,4,8,16}` and sizes the circular buffers from the
+chosen value. The 32-sample test compares width 4 with width 2 while disabling
+the new down-projection specialization:
+
+| K block | Pure decode mean ± SD | 95% CI | Change | Welch p |
+|--:|--:|:--:|--:|--:|
+| 2 tiles | 26.122 ± 0.402 tok/s | [25.977, 26.267] | — | — |
+| 4 tiles | 26.192 ± 0.338 tok/s | [26.071, 26.314] | +0.27% | 0.452 |
+
+The confidence intervals overlap closely and the observed difference is small.
+There is no defensible speedup, so width two remains the default. Widths 8 and
+16 are retained for controlled experiments, not selected in production. Wider
+blocks also change accumulation order and therefore can change greedy token
+sequences even when the output remains deterministic.
+
+## A 110-core fused-residual down projection
+
+The second MLP matmul has the exact decode shape
+$1\times12288$ by $12288\times4096$. The generic program used 64 cores and
+achieved only 246.2 GB/s of effective BFP8 weight bandwidth, well below the
+SwiGLU kernel. `down_projection_110_core.patch` adds an exact-shape Blackhole
+program selected only for BF16 activation/output, BFLOAT8_B weights, a BF16
+residual, DRAM-interleaved tensors, and an 11-by-10 worker grid.
+
+The design avoids a K split and its cross-core partial reduction. It partitions
+the 128 output tile columns unevenly across all 110 workers:
+
+- 18 wide workers each compute two N tiles, covering columns 0–35;
+- 92 narrow workers each compute one N tile, covering columns 36–127;
+- one activation sender multicasts to the other 109 workers;
+- weights are read exactly once;
+- K is processed four tiles at a time with packer-L1 accumulation; and
+- the residual addition occurs in the final compute kernel before output.
+
+Wide and narrow workers require distinct partial-result circular-buffer
+descriptors. An early version allocated a two-tile ring on narrow workers even
+though they produced one tile; partial accumulations alternated slots and
+corrupted output. Separating the one- and two-tile rings fixed the accumulation
+protocol. The corrected path is deterministic and produces coherent text.
+
+The specialization is enabled by default for its exact contract.
+`TT_METAL_DOWN_PROJECTION_110_CORES=0` selects the generic fallback in the same
+binary, which makes the A/B comparison independent of compilation drift.
+
+# Runtime trace capture for short prefill
+
+Decode already executes as a recorded TT-Metal trace: a stable command sequence
+is replayed while request-dependent buffers are refreshed. Before the prefill
+change, the five-token prompt—padded to one 32-row tile—was compiled but its
+operations were submitted separately from the host.
+
+Setting `SGLANG_TT_TRACE_DECODE_ONLY=false` records the fixed-shape prefill
+sequence too. In a same-binary 32-sample A/B test:
+
+| Metric | Decode-only trace | Prefill + decode trace | Change |
+|:--|--:|--:|--:|
+| Time to first token | 618.84 ± 4.76 ms | **59.15 ± 3.70 ms** | **-90.44% (10.46x)** |
+| Total streaming time | 5.5067 ± 0.0598 s | **4.9299 ± 0.0680 s** | **-10.48%** |
+| Pure decode throughput | 25.986 ± 0.315 tok/s | 26.079 ± 0.362 tok/s | +0.36%, p = 0.278 |
+
+The mechanism and data agree: about 560 ms disappears before the first token,
+while decode is statistically unchanged. In the primary cumulative benchmark,
+the full-trace configuration adds **+10.23%** end-to-end throughput for a
+128-token response.
+
+# Packaging, build, and startup patch concepts
+
+Not every libtt patch is a steady-state model optimization. A second class
+makes the single-library deployment possible or keeps compilation/startup
+tractable. These changes should be evaluated by buildability, artifact
+self-containment, load time, and cold start—not assigned fabricated decode
+speedups.
+
+\begingroup\small
+
+Table: Non-model patch groups in the current libtt build.
+
+| Concept | Representative files | Purpose |
+|:--|:--|:--|
+| Embedded runtime assets | `tt_metal_runtime_root.cc`, `tt_metal_runtime_auto_setup.cc`, Bazel embed rules | Compress TT-Metal runtime files into `libtt.so`, extract to a fingerprinted temporary root, and initialize before PJRT. |
+| Static integration and symbol hygiene | `BUILD.bazel`, `libtt_pjrt_exports.lds` | Link the upstream plugin and internal libraries into one shared object while exposing only PJRT ABI symbols. |
+| Bazel overlays | `third_party/*/BUILD.overlay.bazel`, `tt_xla.BUILD.bazel`, `tt_mlir.BUILD.bazel` | Bring separately built upstream projects into one central graph with pinned sources and toolchains. |
+| Remove unused fabric/runtime surfaces | `disable_fabric_*.patch`, `disable_inspector_runtime.patch` | Exclude components unnecessary for the single-chip libtt artifact and avoid unresolved or duplicated runtime dependencies. |
+| Linkability and TLS constraints | `reduce_static_tls.patch`, `remove_initial_exec_tls.patch`, public-UMD include patch | Make large statically integrated components safe to load as a PJRT shared library. |
+| Compiler/runtime trimming | TTNN-only registration/runtime patches, cold stubs, disabled TT-Lang resolver, fast sharded-module check | Avoid bringing unused compiler/runtime paths into the artifact and reduce cold compilation work. |
+| API/version compatibility | protobuf, Shardy, affine, constructor-name, map/include patches | Reconcile pinned revisions inside one build without relying on a preinstalled matching stack. |
+
+\endgroup
+
+These are architectural enablers of agentic development as much as deployment
+features. A single build can be less convenient if it is slow, fragile, or
+polluted by unused subsystems; the integration patches keep the full-stack
+workspace practical.
 
 # Benchmark methodology
 
-## System and software
+## Hardware and software
 
 | Item | Value |
-|---|---|
+|:--|:--|
 | Accelerator | Tenstorrent Blackhole P150 |
 | Firmware observed at startup | 19.6.0 |
 | Host CPU | Intel Core Ultra 9 185H, 22 logical CPUs online |
 | Host OS/kernel | Linux 6.8.0-124-generic, x86-64 |
 | Model | `Qwen/Qwen3-8B` |
-| Model dtype | BF16 |
+| Model/activation dtype | BF16 |
 | Weight-lowering request | `bfp_bf8` |
 | Attention backend | TT |
 | Serving frontend | `/home/pcmoritz/sglang-jax` at `24eb823ed97e` |
-| PJRT plugin | revision-specific `bazel-bin/libtt.so` |
-| Final report revision | `627a32dbe91281cfe4d5401958a0eaa5af30d4f7` |
-| libtt benchmark dates | 11 and 15 July 2026 (America/Los_Angeles) |
-| Upstream reference date | 15 July 2026 (America/Los_Angeles) |
+| Established main snapshot | `627a32d` |
+| Current kernel snapshot | `37d5460` |
+| Benchmark date | 15 July 2026, America/Los_Angeles |
 
-V0--V4 were rebuilt and collected in one sequential benchmark session. V5--V8
-use the first 32 retained observations from the existing 40-observation runs
-collected earlier on the same date, host, accelerator, model, server command,
-and sampling configuration. V9 was collected on 15 July from latest upstream
-main with its documented full-prefill tracing setting. All raw observations
-used in the report are normalized into `data/samples.csv`.
+The P150 exposes 120 Tensix workers in this firmware configuration [14]. The
+SwiGLU program uses 96; the new down projection uses 110. Results are
+single-device and shape-specific.
 
-Commit `627a32d` changes only `README.md` relative to its `ddfa23a` parent; the
-compiled libtt sources are identical. V9 used the already-built parent artifact
-with SHA-256 `250a2c404dbead1b8ad5490a3e78a5a2011f86b865b83483f346865a3278e637`.
-A validation rebuild from `627a32d` was attempted, but the pinned SFPI archive
-URL returned HTTP 404 after the local external-repository cache had been
-cleaned. The failed rebuild was not used for measurement. The SGLang-JAX
-checkout also contained disabled-by-default experimental sampling/export
-helpers; neither corresponding fast path was enabled in these runs.
+## Serving command
 
-## Server configuration
-
-Each revision was checked out, built with its revision-appropriate Bazel target
-(`//:tt`, producing `bazel-bin/libtt.so`), and served with the README command.
-The effective command was:
+The server uses the command documented in the repository README:
 
 ```bash
 env -u TT_METAL_RUNTIME_ROOT \
@@ -589,407 +752,290 @@ env -u TT_METAL_RUNTIME_ROOT \
   --disable-overlap-schedule --disable-radix-cache
 ```
 
-V0--V8 used SGLang-JAX's default decode-only tracing. V9 uses
-`SGLANG_TT_TRACE_DECODE_ONLY=false`, matching latest main's README and tracing
-the one-tile prefill graph too. Disabling radix cache ensures every request
-executes the five-token logical prompt prefill (one padded 32-row tile) rather
-than reusing a prefix. Disabling overlap schedule removes cross-request
-scheduler overlap. The maximum of two running requests is a server capacity
-setting; requests were issued serially. Optional sampling fast paths remain
-disabled by default, so improvements reflect the model path.
+Requests are serial despite the capacity of two. Radix caching and overlap
+scheduling are disabled so every request executes the same prompt prefill and
+does not overlap another request. Optional CPU/fused sampling paths remain at
+their disabled defaults; this report concerns the main model path.
 
 ## Request and sample policy
 
-The identical request was issued 34 times per revision:
-
-```bash
-curl -fsS http://127.0.0.1:31000/generate \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "text": "The capital of France is",
-    "sampling_params": {"temperature": 0, "max_new_tokens": 128}
-  }'
-```
-
-The first two responses were discarded. They contain graph compilation,
-TT-Metal kernel compilation, trace setup, and cache population; they are not
-steady-state samples. The next 32 complete responses form the analysis window.
-Every retained request returned exactly 128 token IDs.
-
-For request (j), throughput is
-
-$$T_j = \frac{128}{L_j},$$
-
-where (L_j) is SGLang's `meta_info.e2e_latency`. This includes request-local
-prefill, decode, and serving overhead, so it is intentionally an end-to-end
-generation metric rather than a kernel-only number.
-
-## Upstream reference configuration
-
-The external reference used the official tt-inference-server v0.10.0 checkout
-at commit `4be69a67c718` and its release container:
-
-```text
-ghcr.io/tenstorrent/tt-inference-server/
-  vllm-tt-metal-src-release-ubuntu-22.04-amd64:
-  0.10.0-e867533-22be241
-```
-
-The tag identifies TT-Metal commit `e867533` and vLLM commit `22be241`; the
-server reported vLLM `0.1.dev11678+g22be24130`. Release v0.10.0 includes the
-Qwen3-8B runtime for P300 but not a P150 device entry. The local launcher
-checkout therefore had one runtime-relevant model-spec addition: a P150
-`DeviceModelSpec` with maximum concurrency 32 and context 40,960. A second
-local launcher change allowed the public Hugging Face repository to be used
-without an access token. The release container itself was unmodified.
-
-The server was launched as follows:
-
-```bash
-cd /home/pcmoritz/tt-metal/tt-inference-server-p150
-python3 run.py \
-  --model Qwen3-8B --workflow server --device p150 \
-  --docker-server --no-auth --service-port 8000 \
-  --vllm-override-args '{"no-enable-prefix-caching": true}' \
-  --skip-system-sw-validation
-```
-
-The explicit negative vLLM option matters. This release's JSON-to-CLI adapter
-omits boolean `false`, so `{"enable_prefix_caching": false}` does not disable
-the cache. Both the API process and engine log confirmed
-`enable_prefix_caching=False` for the retained run. The KMD version gate was
-skipped because the host has KMD 2.3.0 while the launcher declares a strict
-minimum of 2.5.0; device initialization, model warm-up, trace capture, and all
-34 measured requests completed successfully. Firmware was 19.6.0 in both
-experiments.
-
-After the server's built-in model warm-up and nine background trace-capture
-requests completed, `benchmark_upstream.py` sent 34 serial requests over one
-persistent loopback connection:
+The primary sequence sends the same request 34 times:
 
 ```json
 {
-  "model": "Qwen/Qwen3-8B",
-  "prompt": "The capital of France is",
-  "temperature": 0,
-  "max_tokens": 128
+  "text": "The capital of France is",
+  "sampling_params": {"temperature": 0, "max_new_tokens": 128}
 }
 ```
 
-This is the OpenAI-completions equivalent of the README request. It naturally
-returned 128 tokens with `finish_reason="length"`; no `ignore_eos` override was
-needed. The first two requests were discarded and 32 retained. The API reports
-token counts but no request latency, so the collector measures monotonic client
-wall time from request send through reading the complete response. Thus the
-upstream result includes loopback HTTP and response serialization that the
-libtt server-reported `e2e_latency` may exclude. At approximately 5.3 seconds
-per request this is a small absolute term, but the clocks are not identical and
-the 8.18% cross-stack difference should not be interpreted as a kernel-only
-effect.
+The first two requests are discarded because they include graph compilation,
+TT-Metal kernel compilation, trace setup, and cache population. The next 32
+complete requests form the analysis window. Primary throughput is
+
+$$T_j=\frac{128}{L_j},$$
+
+where $L_j$ is SGLang's server-reported end-to-end latency.
+
+The current kernel experiment uses the streaming completions endpoint and 32
+retained requests per configuration. Pure decode throughput is 127 inter-token
+intervals divided by the elapsed time from first to last token. Streaming
+end-to-end throughput is 128 divided by loopback-client total time. The exact
+per-request observations are in `data/current-kernel-samples.csv`.
 
 ## Statistical treatment
 
-For each revision the report gives the arithmetic mean, sample standard
-deviation, median, range, and a two-sided 95% Student-t confidence interval for
-the mean. Adjacent revisions are compared with a two-sided Welch t-test, which
-does not assume equal variance. Nine planned adjacent comparisons create a
-multiple-testing family, so Holm's step-down method controls family-wise error.
-Raw and adjusted p-values are preserved in `data/summary.csv`.
+Means, sample standard deviations, and two-sided 95% Student-t intervals are
+reported. Same-metric configurations use a two-sided Welch t-test, which does
+not assume equal variance. The nine planned adjacent comparisons in the older
+cumulative sequence use Holm's step-down correction. The two new kernel A/B
+tests are separately planned experiments and retain raw Welch p-values.
 
-The upstream reference is summarized with the same descriptive statistics and
-a separate Welch comparison against V0 and V9. Those p-values are preserved in
-`data/upstream-tt-inference-summary.csv` and are not added to the nine-test
-Holm family, because this is a separately collected external comparison rather
-than another cumulative libtt revision.
-
-The tests assume independent observations. Sequential accelerator timings can
-exhibit autocorrelation and thermal drift, so p-values should be read as
-descriptive evidence for this run, not as a universal hardware guarantee. The
-effect sizes and confidence intervals are more important than crossing a
-single threshold.
+These statistics quantify request-to-request variation within the recorded
+windows. They do not remove sequential drift, autocorrelation, or shape/model
+dependence. Effect sizes and mechanistic profiles are more informative than a
+threshold alone.
 
 # Results
 
-## Primary throughput results
+## Established concept sequence
+
+The sequence below is chronological only because incremental attribution needs
+a predecessor. The report's technical discussion is organized by the patch
+concepts above, and commit identifiers remain in the CSV provenance rather than
+serving as section headings.
 
 \begingroup\small
 
-Table: End-to-end 128-token generation results, 32 retained requests per revision. “Holm p” is the multiplicity-adjusted p-value for the comparison with the preceding row.
+Table: End-to-end 128-token generation, 32 retained requests per measurement stage.
 
-| Variant | Commit | Mean ± SD (tok/s) | 95% CI | Incremental | vs. V0 | Holm p |
+| Stage | Concept introduced | Mean ± SD (tok/s) | 95% CI | Incremental | vs. baseline | Holm p |
 |:--|:--|--:|:--:|--:|--:|--:|
-| V0 | `7482967` | 16.265 ± 0.128 | [16.218, 16.311] | — | 0.00% | — |
-| V1 | `9978a9b` | 19.938 ± 0.283 | [19.836, 20.040] | **+22.58%** | +22.58% | 2.33e-44 |
-| V2 | `10459b5` | 20.596 ± 0.279 | [20.495, 20.696] | **+3.30%** | +26.63% | 1.09e-12 |
-| V3 | `3fe072b` | 20.832 ± 0.293 | [20.726, 20.938] | **+1.15%** | +28.08% | 0.00481 |
-| V4 | `83baa8d` | 20.479 ± 0.321 | [20.363, 20.594] | **-1.69%** | +25.91% | 8.81e-5 |
-| V5 | `e534690` | 23.265 ± 0.235 | [23.181, 23.350] | **+13.61%** | +43.04% | 2.85e-42 |
-| V6 | `a718685` | 23.113 ± 0.296 | [23.007, 23.220] | -0.65% | +42.11% | 0.0533 |
-| V7 | `ce99831` | 23.744 ± 0.311 | [23.632, 23.856] | **+2.73%** | +45.98% | 5.90e-11 |
-| V8 | `caa5428` | 23.698 ± 0.274 | [23.599, 23.797] | -0.19% | **+45.70%** | 0.532 |
-| V9 | `627a32d` | **26.123 ± 0.394** | [25.981, 26.265] | **+10.23%** | **+60.61%** | 5.54e-34 |
+| V0 | Documented serving baseline | 16.265 ± 0.128 | [16.218, 16.311] | — | 0.00% | — |
+| V1 | Decode foundation: semantic recovery, dtype, and layout | 19.938 ± 0.283 | [19.836, 20.040] | **+22.58%** | +22.58% | 2.62e-44 |
+| V2 | Expanded-SiLU recognition | 20.596 ± 0.279 | [20.495, 20.696] | **+3.30%** | +26.63% | 1.09e-12 |
+| V3 | QKV projection fusion | 20.832 ± 0.293 | [20.726, 20.938] | **+1.15%** | +28.08% | 0.00481 |
+| V4 | Two-way shared-LHS matmul | 20.479 ± 0.321 | [20.363, 20.594] | **-1.69%** | +25.91% | 8.81e-5 |
+| V5 | Decode RMSNorm width sharding | 23.265 ± 0.235 | [23.181, 23.350] | **+13.61%** | +43.04% | 3.25e-42 |
+| V6 | Consumer-side SiLU/multiply fusion | 23.113 ± 0.296 | [23.007, 23.220] | -0.65% | +42.11% | 0.0533 |
+| V7 | Dst-resident matmul-SwiGLU epilogue | 23.744 ± 0.311 | [23.632, 23.856] | **+2.73%** | +45.98% | 5.90e-11 |
+| V8 | Prefill-capable, fallback-free path | 23.698 ± 0.274 | [23.599, 23.797] | -0.19% | +45.70% | 0.532 |
+| V9 | Fixed-shape prefill trace | **26.123 ± 0.394** | [25.981, 26.265] | **+10.23%** | **+60.61%** | 5.54e-34 |
 
 \endgroup
 
-![Incremental speedup or regression introduced by each revision.](figures/incremental-speedup.svg){#fig:incremental width=100%}
+![Cumulative throughput across the measured concepts.](figures/throughput.svg){#fig:throughput width=100%}
 
-V8 is slightly below V7, but the difference is only 0.046 tok/s and is not
-statistically distinguishable from zero. V9 then improves by 2.425 tok/s over
-V8. Its confidence interval does not overlap V8's, and the adjusted p-value is
-small. The direct trace-only A/B cross-check below supports attributing this
-latest-main gain to prefill tracing rather than decode. V4 remains a clear
-counterexample to the idea that every fusion improves performance.
+![Incremental effect of each concept in the established sequence.](figures/incremental-speedup.svg){#fig:incremental width=100%}
+
+The negative and neutral rows are important. Shared-LHS fusion creates a useful
+representation but materializes it inefficiently; consumer-side SiLU fusion
+does not remove the producer boundary; and fallback removal changes coverage,
+not the kernel. A concept count that retained only successful experiments would
+hide the evidence that led to the final fusion boundary.
+
+## Current kernel A/B experiments
+
+Table: Current-branch streaming results, 32 retained samples per configuration. Width 4 is compared with width 2; the down projection is compared with the same width-4 binary/configuration with the specialization disabled.
+
+| Configuration | Pure decode mean ± SD | 95% CI | Streaming E2E mean ± SD | Change in decode | Welch p |
+|:--|--:|:--:|--:|--:|--:|
+| SwiGLU K block 2, generic down | 26.122 ± 0.402 | [25.977, 26.267] | 26.016 ± 0.396 | — | — |
+| SwiGLU K block 4, generic down | 26.192 ± 0.338 | [26.071, 26.314] | 26.085 ± 0.333 | +0.27% | 0.452 |
+| K block 4, 110-core down | **27.753 ± 0.330** | **[27.634, 27.872]** | **27.619 ± 0.322** | **+5.96%** | **3.74e-27** |
+
+The down-projection result is both statistically and practically clear. Mean
+decode time falls from 38.179 to 36.032 ms/token, saving 2.147 ms/token. The
+streaming end-to-end comparison improves by 5.88% (p = $3.52\times10^{-27}$),
+from 26.085 to 27.619 tokens/s. TTFT remains approximately 58 ms, as expected
+for a decode-kernel change.
+
+## Device profile of the down projection
+
+The direct TT-Metal profile identifies 36 occurrences per token, matching the
+36 Qwen3-8B decoder layers. Exactly those operation positions change from 64
+to 110 workers.
+
+| Metric | Generic program | 110-core specialization | Change |
+|:--|--:|--:|--:|
+| Workers | 64 | 110 | +71.9% |
+| Mean kernel time/layer | 217.188 µs | 154.932 µs | **-28.66%** |
+| Effective BFP8 weight bandwidth | 246.2 GB/s | 345.2 GB/s | **+40.18%** |
+| Projected 36-layer saving | — | 2.241 ms/token | — |
+
+The projected kernel saving is close to the observed 2.147 ms/token. The new
+program reaches about 92% of the previously measured 375.1 GB/s SwiGLU
+effective bandwidth. This agreement between operation profile and end-to-end
+measurement supports the causal attribution.
 
 ## Upstream tt-inference-server reference
 
-Table: Same Qwen3-8B prompt and 128-token serial workload on the same P150, with two warm-ups discarded and 32 requests retained. The upstream clock is client-observed; libtt uses server-reported request latency.
+Tenstorrent's tt-inference-server is an OpenAI-compatible service built around
+vLLM and TT-Transformers [19]. It enters the stack above TTNN rather than through
+JAX, StableHLO, and TT-MLIR:
 
-| Implementation | Revision | Mean ± SD (tok/s) | 95% CI | Mean latency |
-|:--|:--|--:|:--:|--:|
-| libtt V0 | `7482967` | 16.265 ± 0.128 | [16.218, 16.311] | 7.870 s |
-| libtt V9 | `627a32d` | **26.123 ± 0.394** | [25.981, 26.265] | **4.901 s** |
-| TTIS v0.10.0 | `4be69a6` | 24.148 ± 0.412 | [23.999, 24.296] | 5.302 s |
+```text
+libtt:  SGLang-JAX → JAX/StableHLO → PJRT/TT-XLA/TT-MLIR → TTNN → TT-Metal
+TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-Metal
+```
+
+The v0.10.0 reference uses the same P150, Qwen3-8B model, prompt, 128-token
+output, serial request policy, and disabled prefix cache.
+
+| Implementation | Mean ± SD (tok/s) | 95% CI | Mean latency |
+|:--|--:|:--:|--:|
+| libtt documented baseline | 16.265 ± 0.128 | [16.218, 16.311] | 7.870 s |
+| libtt established main | **26.123 ± 0.394** | [25.981, 26.265] | **4.901 s** |
+| TTIS v0.10.0 | 24.148 ± 0.412 | [23.999, 24.296] | 5.302 s |
 
 ![External serving-stack reference on the same model workload.](figures/upstream-comparison.svg){#fig:upstream width=100%}
 
-Latest-main libtt is 1.975 tok/s above the upstream mean, or 8.18% faster using
-the upstream mean as denominator. A separate two-sided Welch test gives
-p = $3.10\times10^{-28}$ for that comparison in these windows; upstream versus
-V0 gives p = $4.21\times10^{-47}$. The confidence intervals and tests show that
-the observed differences are larger than request-to-request noise in these
-runs. They do not identify every cause, and they do not remove a key design
-limitation: the upstream clock contains loopback client overhead while the
-libtt primary clock is request-local. The latest-main libtt and upstream runs
-were collected on the same date, but not interleaved.
+Established-main libtt is 8.18% above the recorded upstream mean. The
+comparison is system-level, not a kernel attribution: the model
+implementations, serving frontends, trace strategies, and clocks differ. In
+particular, TTIS is measured at the loopback client while the older libtt
+sequence uses request-local server time. The current streaming kernel results
+are not inserted into this table because their endpoint and collection window
+also differ.
 
-The system-level conclusion is therefore narrower and more useful: the libtt
-optimization sequence raises throughput from 16.265 to 26.123 tok/s and now
-exceeds the recorded v0.10.0 TT-Transformers serving path by 8.18% on this
-workload. The external reference does not alter the +60.61% internal
-attribution. All 32
-upstream completions were identical and returned exactly five prompt plus 128
-completion tokens; their completion-text SHA-256 prefix is `37becb7c58d6`.
+## Correctness and numeric behavior
 
-## Latest-main prefill/decode cross-check
+All 32 requests within every configuration are deterministic. The established
+sequence changes token hash when graph algebra or reduction order changes. The
+current kernel experiment produces these deterministic completion-text hashes:
 
-The `/generate` response reports one end-to-end latency. A separate streaming
-experiment on the same latest-main binary recorded the first token and all 127
-subsequent token intervals. It used two discarded warm-ups and 32 retained
-requests for each trace configuration:
-
-| Metric | Decode-only trace | Prefill + decode trace | Change |
-|:--|--:|--:|--:|
-| Time to first token | 0.61884 ± 0.00476 s, CI [0.61712, 0.62056] | **0.05915 ± 0.00370 s**, CI [0.05782, 0.06048] | **-90.44% (10.46x faster)** |
-| Total streaming time | 5.5067 ± 0.0598 s, CI [5.4852, 5.5283] | **4.9299 ± 0.0680 s**, CI [4.9054, 4.9544] | **-10.48%** |
-| Pure decode throughput | 25.986 ± 0.315 tok/s, CI [25.873, 26.100] | 26.079 ± 0.362 tok/s, CI [25.949, 26.210] | +0.36% (p = 0.278) |
-
-The direct toggle isolates the new optimization: traced prefill removes about
-560 ms before the first streamed token, while decode throughput is not
-statistically distinguishable between configurations. Both settings returned
-the same completion-text SHA-256 prefix, `5119e79e42b5`.
-
-## Correctness and numeric stability checks
-
-Within every variant, all 32 retained requests produced the same 128 token IDs.
-The SHA-256 prefixes of those ID sequences were:
-
-| Variants | Token-ID hash prefix |
+| Configuration | SHA-256 prefix |
 |:--|:--|
-| V0--V1 | `68e10a82edac` |
-| V2--V3 | `1ab55f92178d` |
-| V4--V6 | `808d3949246a` |
-| V7--V9 | `2eb88f74c7d9` |
+| SwiGLU block 2, generic down | `5119e79e42b5` |
+| SwiGLU block 4, generic down | `c917933082e3` |
+| SwiGLU block 4, 110-core down | `c041ccb1901d` |
 
-The transitions align with compiler/numeric changes and do not imply request
-nondeterminism. Greedy decoding is sensitive to tiny logit reorderings: BF8
-lowering, operation reassociation, reduction order, or a new kernel can change
-a later argmax. This performance report verifies shape/completion and
-within-variant determinism; it is not a model-quality evaluation. A production
-decision should add perplexity and task-level quality suites.
+The specialized result is coherent—for example, it continues “Paris. The
+capital of Germany is Berlin. The capital of Italy is Rome…”—but determinism
+and plausibility are not a quality evaluation. BF8 arithmetic, reassociation,
+and reduction order can perturb logits and later greedy choices. Perplexity and
+task-level evaluation remain necessary before treating a changed token stream
+as production-equivalent.
 
-# Reading the results mechanistically
+# Engineering interpretation
 
-## Launch reduction is not the same as traffic reduction
+## Choose the abstraction by the information it preserves
 
-V4, V6, and V7 form the clearest controlled lesson in the study:
+The optimization map suggests a practical rule:
+
+- use **TTIR** when the problem is algebraic recognition or graph structure;
+- use **TTNN IR** when the compiler needs a named runtime operation, layout, or
+  device dtype;
+- use the **TTNN runtime** when the choice depends on concrete tensor and device
+  state;
+- use a **TT-Metal program factory** for core topology, circular buffers,
+  multicast, and program selection; and
+- use **device kernels** for Dst lifetime, pack/unpack traffic, tile arithmetic,
+  and synchronization.
+
+Moving a change lower too early loses semantic information. Keeping it too high
+cannot control the data movement that determines decode performance.
+
+## Fusion should be described by the eliminated boundary
+
+“Fused” is not a performance explanation. The MLP experiments distinguish
+three boundaries:
 
 ```text
-V4: combine two matmuls
-    → fewer launches/input reads
-    → still materialize doubled gate/up output
-    → -1.69%
+shared-LHS matmul:
+  removes duplicate activation work, retains doubled output       → -1.69%
 
-V6: combine SiLU with the following multiply
-    → remove standalone SiLU output
-    → still materialize and reread matmul output
-    → -0.65% observed; adjusted result inconclusive
+SiLU on BinaryNg input:
+  removes one elementwise intermediate, retains matmul output     → -0.65%
 
-V7: make SwiGLU the matmul epilogue
-    → gate/up stay in Dst
-    → write only final half-width tensor
-    → +2.73%
+matmul-SwiGLU epilogue:
+  keeps gate/up in Dst and writes only the final half-width result → +2.73%
 ```
 
-At batch-one decode, model weights and intermediate tiles dominate movement.
-Eliminating an operation launch is helpful only if the fused program does not
-create a worse geometry or preserve the same expensive tensor boundary. The
-successful fusion boundary is producer-side, before packing the matmul result.
+The useful description is what no longer crosses Dst, L1, DRAM, or an operation
+launch boundary.
 
-## Why RMSNorm sharding is unusually large
+## Geometry can beat a more complicated reduction
 
-RMSNorm performs square, reduction over hidden width, reciprocal square root,
-and affine scaling. With logical height one, a generic height-parallel scheme
-cannot occupy many cores. V5's width sharding creates 16 independent L1 shards
-and selects a sharded layernorm program. The hidden width is large and repeats
-in every decoder layer, so this local change compounds across the model.
+The original down-projection recommendation considered a 2D K/N partition with
+cross-core reduction to employ more workers. Profiling showed the actual target
+was weight bandwidth. Uneven N partitioning uses 110 workers without rereading
+weights or reducing partials across cores. The solution is simpler and reaches
+345.2 GB/s—close enough to the SwiGLU reference to deliver most of the expected
+benefit.
 
-The implementation is also conservative: it activates only for a device,
-tiled, unsharded tensor; sequence length one; width at least 2048; and a width
-divisible into 16 tile-aligned shards. Prefill and already-sharded cases retain
-their prior behavior.
+## Negative results belong in the design record
 
-## Why the final simplification is safe for performance
+Wider SwiGLU blocking was plausible from code inspection: fewer partial packs
+should reduce synchronization. The measured null result says another cost—CB
+footprint, overlap, or the non-dominance of those packs—offsets that saving.
+Keeping the knob while retaining the measured default is more useful than
+silently selecting the largest block.
 
-V8 does not rewrite the TT-Metal compute loop that produced V7's speedup. It
-changes compiler matching/coverage and deletes the V6 fallback. The retained
-V7 and V8 output hashes are identical, their mean difference is small, and the
-adjusted p-value is 0.532. Those three signals support the claim that the code
-simplification preserves both the observed token sequence and runtime
-performance for this workload.
-
-## Why prefill tracing changes TTFT rather than decode
-
-Decode already runs as a recorded TT-Metal trace: a fixed command sequence is
-replayed while request-dependent buffers are refreshed. Before V9, the short
-prefill graph was compiled but its operations were still submitted separately
-from the host. For a five-token prompt padded to one tile, host dispatch is a
-large fraction of first-token latency.
-
-V9 records that fixed-shape prefill command sequence too. It does not change
-the decoder kernels, weight formats, or token-selection path. The direct A/B
-result matches that mechanism: TTFT falls by 90.44%, total 128-token latency
-falls by 10.48%, and the +0.36% decode-throughput difference is statistically
-inconclusive.
-
-# Historical optimization inventory
-
-Before the upstream TT-XLA/TT-MLIR transition, libtt implemented substantially
-more of the compiler and runtime locally. The following first-parent commits
-are performance-relevant milestones. They remain important engineering context
-even though the modern README benchmark cannot isolate them.
-
-| Commit | Historical optimization | Technical intent |
-|:--|:--|:--|
-| `701dc4e` | Fast dispatch | Replace slow command submission with the device fast-dispatch path. |
-| `f4df790` | Optimized matmul | Introduce the first performance-oriented tiled matmul implementation. |
-| `0f39cae` | Parallel binary elementwise | Divide elementwise tiles across cores. |
-| `6f052ba` | Qwen3 model optimization | Add model-specific graph/runtime improvements in the local stack. |
-| `8678414` | DRAM/broadcast fast paths | Specialize common broadcast/data-movement forms. |
-| `1d80118` | Deferred finish and batched CQ writes | Avoid host synchronization after each dispatch and batch command-queue writes. |
-| `1875113` | Fused elementwise lowering | Compile elementwise expression trees as fewer device programs. |
-| `2778027` | Matmul top-1 epilogue | Perform top-1 selection at the logits matmul producer boundary. |
-| `9fc9a36` | Cached decode attention | Specialize attention for autoregressive KV-cache reuse. |
-| `29f685a` | Allocator locking split | Reduce lock scope around runtime readback/allocation work. |
-| `d1b422e` | Reshape optimization | Turn eligible reshapes into views or cheaper movement. |
-| `65cd673` | Transpose into matmul | Fold operand transpose into matmul reads. |
-| `f05995a` | Fused SDPA decode | Replace decomposed attention with a decode SDPA device operation. |
-| `f7ba52b` | Lazy reshape propagation | Carry views through gather/scatter instead of materializing. |
-| `a23a624` | Fused RMSNorm | Replace decomposed normalization with a dedicated kernel. |
-| `eee55b7` | Tile-transpose matmul reads | Improve source tile lookup and NoC reads for transposed operands. |
-| `119aab5` | Fused RoPE | Collapse rotary embedding's elementwise/reshape graph. |
-| `f2e705f` | SDPA over interleaved KV cache | Avoid cache layout conversion before decode attention. |
-| `08423ec` | Parallel BF16 top-1 | Spread logits argmax/top-1 work across cores. |
-| `94734cc` | TT-MLIR tilize patches | Reduce layout-conversion overhead after the upstream-stack transition. |
-| `eb8c90d` | Cold-compile optimization | Remove/avoid expensive host/compiler work on the first execution. |
-
-Several exploratory branches also record useful negative or orthogonal work:
-residual-as-bias experiments, slice-free SwiGLU, sampling fusion, logits
-untilize/top-1 fusion, DRAM-sharded matmul, and BFP4 MLP weights. Only changes
-that survive in the V0--V9 serving line are assigned numbers in the primary
-table.
-This prevents an abandoned prototype, a sampling optimization, or a changed
-precision mode from being represented as part of the final model-path speedup.
+The same principle applies to shared-LHS and consumer-side fusion. The central
+build makes such experiments cheap; the report makes their outcomes durable.
 
 # Limitations and follow-up work
 
-1. **One model and shape.** Results apply to Qwen3-8B, serial batch-one-style
-   generation, a five-token prompt padded to one 32-row tile, and 128 generated
-   tokens. Larger batch, longer context, or multi-user continuous batching can
-   move the bottleneck.
-2. **End-to-end metric.** The primary metric contains short prefill and server
-   overhead. The streaming cross-check isolates prefill and final decode, but
-   only on latest main.
-3. **Sequential ordering.** Revisions were not randomized or interleaved.
-   Thermal state and background load can create drift. A publication-grade
-   follow-up would use randomized blocks with repeated server restarts.
-4. **Autocorrelation.** Welch/t intervals treat requests as independent. A
-   blocked bootstrap over time or heteroskedasticity/autocorrelation-consistent
-   model would be more conservative if long runs show serial correlation.
-5. **One accelerator.** The specialized epilogue assumes Blackhole's available
-   grid and the Qwen3-8B tile geometry. Wormhole, multi-chip, or another MLP
-   width requires its own program configuration.
-6. **Quality is not measured.** Token determinism is checked within variants,
-   but cross-variant hashes differ. Perplexity and downstream evaluations are
-   necessary before changing precision or reduction order in production.
-7. **The V1 bundle is not decomposed.** Its +22.58% cannot be divided among
-   RMSNorm, RoPE, KV dtype, SDPA layout, and BF8-enabling changes without
-   constructing additional cherry-picked revisions.
-8. **Cross-stack clocks differ slightly.** tt-inference-server is timed at the
-   loopback client while libtt supplies server-side request latency. The
-   upstream number includes additional HTTP and JSON-response work.
-   Latest-main libtt and the upstream reference were measured on the same date
-   but in separate, non-interleaved sessions. The comparison is suitable as a
-   serving reference, not as sub-percent kernel attribution.
-9. **P150 is locally enabled upstream.** The v0.10.0 runtime image is official
-   and unmodified, but the release's host model spec does not list Qwen3-8B on
-   P150. The benchmark adds that device entry locally and skips a strict KMD
-   version gate. Results should be repeated on a release with first-class P150
-   support when one is available.
+1. **One model and decode regime.** Results apply to Qwen3-8B, a five-token
+   prompt padded to one tile, serial 128-token generation, and a single P150.
+   Larger batches, context lengths, or continuous batching can move the
+   bottleneck.
+2. **Cumulative attribution is ordered.** The established stages are real
+   cumulative builds, not a factorial experiment. Patch effects can interact;
+   the shared-LHS representation and SwiGLU epilogue demonstrate this directly.
+3. **The foundation group is not decomposed.** Its +22.58% covers several
+   compiler, dtype, validation, and layout changes. Isolating them would require
+   additional compatible builds.
+4. **Two metric families.** The older sequence uses server-reported request
+   latency; the current kernel experiments use streaming client timing and a
+   pure decode clock. Their absolute means should not be subtracted as if they
+   came from one randomized block.
+5. **Sequential sampling.** Configurations were not randomized or interleaved.
+   Thermal and background drift can remain. Repeated randomized server blocks
+   would strengthen publication-grade inference.
+6. **Profile naming required positional alignment.** The final profiling CSV
+   lacked operation names because of metadata capture behavior. Its 854-row
+   structure aligned exactly with an earlier named trace, and the 36 changed
+   positions match the down projections, but a repeated named profile would be
+   preferable.
+7. **Shape-specific kernels.** The 96-core epilogue and 110-core down projection
+   are guarded for Blackhole and exact Qwen3-8B decode geometry. Other models,
+   Wormhole, and multi-chip execution need different configurations.
+8. **Quality is unmeasured.** Deterministic coherent completion is a smoke test,
+   not evidence of equivalent perplexity or task accuracy.
+9. **External reference scope.** The TTIS v0.10.0 image is official, but P150
+   model metadata was added locally because that release listed Qwen3-8B on
+   P300 rather than P150. The runtime image itself was unchanged.
 
-The most promising next optimization is to keep more of the MLP pipeline on
-chip: consume the SwiGLU output directly in a compatible down-projection path,
-or retain a sharded layout between them. That requires coordinating output
-shards and down-projection weight distribution; simply attaching more unary
-work to BinaryNg is unlikely to reproduce V7's producer-side benefit.
+The most promising next MLP experiment is now an on-chip boundary between the
+SwiGLU output and down projection: either preserve a compatible sharded layout
+or consume the output without a DRAM round trip. Unlike the completed 110-core
+specialization, that change would require coordinated producer/consumer shard
+contracts and is therefore another full vertical slice.
 
 # Reproduction and report generation
 
-The report bundle contains:
+The report directory contains:
 
-- `report.md`: this source document;
-- `data/samples.csv`: all 320 retained per-request observations;
-- `data/summary.csv`: descriptive statistics, speedups, raw Welch p-values,
-  Holm-adjusted p-values, and output hashes;
-- `data/upstream-tt-inference-samples.csv`: 32 retained upstream reference
-  observations;
-- `data/upstream-tt-inference-summary.csv` and
-  `data/upstream-tt-inference-manifest.json`: external-reference statistics
-  and exact server/request metadata;
-- `data/latest-main-streaming-samples.csv` and
-  `data/latest-main-streaming-summary.csv`: the 32-sample-per-setting direct
-  prefill-trace A/B cross-check;
-- `data/latest-main-manifest.json`: latest-main commit, binary, server, request,
-  and raw-data provenance;
-- `benchmark_upstream.py`: the persistent-connection OpenAI-completions
-  collector used for the upstream reference;
-- `analyze.py`: the exact analysis and SVG generation code;
-- `figures/*.svg`: resolution-independent figures;
-- `style.css` and `Makefile`: HTML, LaTeX, and PDF build paths.
+- `report.md`: canonical source;
+- `data/samples.csv` and `data/summary.csv`: established 32-sample sequence;
+- `data/current-kernel-samples.csv` and
+  `data/current-kernel-summary.csv`: the blocking/down-projection A/B data;
+- `data/current-kernel-manifest.json`: exact current experiment provenance;
+- `data/down-projection-profile-summary.csv`: per-operation profile summary;
+- `data/latest-main-streaming-*`: direct prefill trace A/B data;
+- `data/upstream-tt-inference-*`: TTIS observations and manifest;
+- `analyze.py`: statistics and SVG generation;
+- `benchmark_upstream.py`: upstream reference collector;
+- `figures/*.svg`: vector figures; and
+- `Makefile` and `style.css`: HTML, LaTeX, and PDF generation.
 
-To recompute statistics from the raw `/tmp` JSON directories used on the
-benchmark host:
+To regenerate statistics when the raw `/tmp` benchmark directories are
+available:
 
 ```bash
 /home/pcmoritz/sglang-jax/.venv/bin/python \
   docs/libtt-optimization-report/analyze.py
-```
-
-To recollect the upstream reference after launching the server with the command
-in its methodology section:
-
-```bash
-python3 docs/libtt-optimization-report/benchmark_upstream.py \
-  --output-dir /tmp/libtt-ttis-baseline-20260715
 ```
 
 To build a self-contained HTML report:
@@ -998,55 +1044,82 @@ To build a self-contained HTML report:
 make -C docs/libtt-optimization-report html
 ```
 
-For a typeset PDF, install a XeLaTeX distribution and `rsvg-convert`
-(commonly packaged as `librsvg2-bin`), then run:
+To produce the typeset PDF with vector figures:
 
 ```bash
 make -C docs/libtt-optimization-report pdf
 ```
 
-The `pdf-html` target is an alternative for environments with WeasyPrint. SVG
-figures, vector text, booktabs-style tables, controlled page geometry,
-microtypography, numbered headings, and a generated table of contents are
-preserved by the PDF route.
+The PDF path uses Pandoc, XeLaTeX, `booktabs`, `microtype`, controlled page
+geometry, numbered sections, a generated table of contents, and SVG-to-vector
+conversion. Generated HTML, LaTeX, and PDF artifacts are versioned with the
+source so the report can be reviewed without installing the toolchain.
 
 # Conclusion
 
-The current libtt optimization line improves the documented Qwen3-8B serving
-workload by **60.61%**, from 16.265 to 26.123 tokens/s. The data favor four
-principles:
+libtt is best understood not as a thin adapter but as a deployable slice of an
+open accelerator stack. One `libtt.so` contains the PJRT backend, compiler,
+runtime, and runtime assets; one Bazel graph pins and builds them; and one patch
+surface reaches from StableHLO/TTIR semantics to Tensix dataflow. That structure
+is deliberately similar to the operational role of `libtpu.so`, while retaining
+the distinctive advantage that libtt's complete Tenstorrent stack can be
+inspected and changed.
 
-- recognize framework-generated algebra before lowering;
-- choose layouts that expose decode's width parallelism;
-- place fusion at the producer epilogue so intermediate values never cross an
-  avoidable memory boundary; and
-- trace stable command sequences so short prefill does not pay
-  operation-by-operation host dispatch cost.
+The performance record validates that architecture. Graph recovery enables
+dedicated operations; layout policy exposes decode width parallelism; a
+cross-layer matmul-SwiGLU representation removes the correct materialization;
+and a program-factory/kernel specialization raises down-projection bandwidth by
+40.2%. The established line improves end-to-end Qwen3-8B throughput by 60.61%.
+The newest down projection adds another 5.96% to pure decode in a same-build
+A/B test, while the blocking sweep correctly remains an experimental knob
+after failing to show a significant gain.
 
-On the same external workload, upstream tt-inference-server v0.10.0 reaches
-24.148 tokens/s. Latest-main libtt is therefore 8.18% faster than that recorded
-reference, compared with a 48.47% deficit at V0. This cross-stack number is a
-serving-system baseline rather than an additional optimization step, and the
-report preserves its different timing scope explicitly.
+The central lesson is architectural: inference performance is a property of
+the path through IR, layout, runtime, data movement, and arithmetic—not of any
+one layer in isolation. libtt's self-contained build and open patch surface make
+that path a tractable unit of agentic development.
 
-The final matmul-SwiGLU implementation is faster because it follows the third
-principle literally: gate and up values remain in Dst until `silu(gate) * up`
-is complete. The fallback-free simplification retains that performance. Just
-as importantly, the report preserves the regressions and neutral results,
-which prevents operation-count reduction from being mistaken for device-level
-speedup.
+# Bibliography {-}
 
-[^sglang]: [SGLang-JAX project and architecture](https://github.com/sgl-project/sglang-jax), including its [core-structure documentation](https://github.com/sgl-project/sglang-jax/blob/main/docs/architecture/project-core-structure.md).
-[^stablehlo]: OpenXLA, [StableHLO specification](https://openxla.org/stablehlo/spec).
-[^pjrt]: OpenXLA, [PJRT — Uniform Device API](https://openxla.org/xla/pjrt).
-[^ttforge]: Tenstorrent, [TT-Forge architecture and subprojects](https://github.com/tenstorrent/tt-forge).
-[^blackhole]: Tenstorrent, [Blackhole PCIe card documentation](https://docs.tenstorrent.com/tt-system-firmware/boards/tenstorrent/tt_blackhole/doc/index.html) and [P150 core-count firmware note](https://docs.tenstorrent.com/tt-system-firmware/release/release-notes-19.5.html).
-[^cb]: Tenstorrent, [Circular Buffer APIs](https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html).
-[^matmullab]: Tenstorrent, [Single Core Matrix Multiplication lab](https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/labs/matmul/lab1/lab1.html).
-[^tensor]: Tenstorrent, [TTNN Tensor: layout, tiles, and faces](https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html).
-[^dst]: Tenstorrent, [Compute engines and data flow within Tensix](https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html).
-[^sharding]: Tenstorrent, [TTNN Tensor sharding](https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html#tensor-sharding).
-[^memconfig]: Tenstorrent, [`ttnn.to_memory_config`](https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/api/ttnn.to_memory_config.html).
-[^bfp8]: Tenstorrent, [TTNN BFLOAT8_B description and limitations](https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html#limitation-of-bfloat8-b).
-[^packer]: Tenstorrent, [`pack_reconfig_l1_acc`](https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/pack_unpack/pack_tile.html).
-[^ttis]: Tenstorrent, [tt-inference-server v0.10.0 release](https://github.com/tenstorrent/tt-inference-server/releases/tag/v0.10.0) and [repository](https://github.com/tenstorrent/tt-inference-server).
+1. Z. Tan, B. Kang, and A. Narasimham, “A Developer's Guide to Debugging JAX
+   on Cloud TPUs,” Google Developers Blog, 2026. Describes `libtpu.so` as the
+   shared library containing the XLA compiler, TPU driver, and hardware
+   communication logic. <https://developers.googleblog.com/a-developers-guide-to-debugging-jax-on-cloud-tpus-essential-tools-and-techniques/>
+2. Bazel Project, “Hermeticity.” <https://bazel.build/concepts/hermeticity>
+3. OpenXLA Project, “PJRT—Uniform Device API.”
+   <https://openxla.org/xla/pjrt>
+4. OpenXLA Project, “StableHLO Specification.”
+   <https://openxla.org/stablehlo/spec>
+5. C. Lattner et al., “MLIR: Scaling Compiler Infrastructure for
+   Domain-Specific Computation,” *2021 IEEE/ACM International Symposium on
+   Code Generation and Optimization*, pp. 2–14, 2021.
+   <https://doi.org/10.1109/CGO51591.2021.9370308>
+6. Tenstorrent, “TT-Forge: Open-Source AI Compiler Stack.”
+   <https://github.com/tenstorrent/tt-forge>
+7. Tenstorrent, “TT-MLIR: Architecture and Dialect Overview.”
+   <https://docs.tenstorrent.com/tt-mlir/overview.html>
+8. Tenstorrent, “TT-MLIR Tensor Layout.”
+   <https://docs.tenstorrent.com/tt-mlir/specs/tensor-layout.html>
+9. Tenstorrent, “TT-Metalium Getting Started and Programming Model.”
+   <https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/get_started/get_started.html>
+10. Tenstorrent, “Compute Engines and Data Flow within Tensix.”
+    <https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html>
+11. Tenstorrent, “Circular Buffer APIs.”
+    <https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html>
+12. Tenstorrent, “Tiles.”
+    <https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/tiles.html>
+13. Tenstorrent, “TTNN Tensor: Layout, Sharding, and BFLOAT8_B.”
+    <https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html>
+14. Tenstorrent, “Blackhole PCIe Card Documentation” and firmware release
+    notes. <https://docs.tenstorrent.com/tt-system-firmware/boards/tenstorrent/tt_blackhole/doc/index.html>
+15. SGLang Project, “SGLang-JAX.”
+    <https://github.com/sgl-project/sglang-jax>
+16. A. Yang et al., “Qwen3 Technical Report,” arXiv:2505.09388, 2025.
+    <https://arxiv.org/abs/2505.09388>
+17. B. Zhang and R. Sennrich, “Root Mean Square Layer Normalization,”
+    *Advances in Neural Information Processing Systems 32*, 2019.
+    <https://proceedings.neurips.cc/paper/2019/hash/1e8a19426224ca89e83cef47f1e7f53b-Abstract.html>
+18. N. Shazeer, “GLU Variants Improve Transformer,” arXiv:2002.05202, 2020.
+    <https://arxiv.org/abs/2002.05202>
+19. Tenstorrent, “tt-inference-server v0.10.0.”
+    <https://github.com/tenstorrent/tt-inference-server/releases/tag/v0.10.0>

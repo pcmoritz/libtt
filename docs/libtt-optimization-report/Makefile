@@ -12,7 +12,7 @@ $(REPORT).html: $(REPORT).md style.css figures/throughput.svg figures/incrementa
 		--from=markdown+tex_math_dollars \
 		--to=html5 --standalone --toc --number-sections --mathml \
 		--self-contained --css=style.css \
-		--metadata pagetitle="Accelerating Qwen3-8B Decode on Tenstorrent Blackhole" \
+		--metadata pagetitle="From StableHLO to Tensix: libtt as a Hermetic Full-Stack Runtime" \
 		-o $@
 	sed -i 's/[[:space:]]\+$$//' $@
 

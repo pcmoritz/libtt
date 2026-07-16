@@ -1,7 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="470" viewBox="0 0 1120 470">
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="650" viewBox="0 0 1120 650">
   <defs>
-    <linearGradient id="top" x1="0" x2="1">
+    <linearGradient id="host" x1="0" x2="1">
       <stop offset="0" stop-color="#e7f5f3"/><stop offset="1" stop-color="#d8ebf4"/>
+    </linearGradient>
+    <linearGradient id="plugin" x1="0" x2="1">
+      <stop offset="0" stop-color="#f5fbfa"/><stop offset="1" stop-color="#eef5f9"/>
     </linearGradient>
     <linearGradient id="device" x1="0" x2="1">
       <stop offset="0" stop-color="#fff2df"/><stop offset="1" stop-color="#fde2dc"/>
@@ -11,78 +14,92 @@
     </marker>
   </defs>
   <style>
-    text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.title{font-size:22px;font-weight:700}.name{font-size:17px;font-weight:700}.body{font-size:13px;fill:#526174}.box{stroke:#8aa0b5;stroke-width:1.4;rx:12}.arrow{stroke:#53657a;stroke-width:2;marker-end:url(#arrow)}.band{font-size:14px;font-weight:700;letter-spacing:.8px;fill:#006d77}
+    text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}
+    .title{font-size:22px;font-weight:700}.name{font-size:16px;font-weight:700}
+    .body{font-size:12.5px;fill:#526174}.small{font-size:11.5px;fill:#526174}
+    .box{stroke:#8aa0b5;stroke-width:1.35;rx:10}.arrow{stroke:#53657a;stroke-width:2;marker-end:url(#arrow)}
+    .branch{stroke:#8395a7;stroke-width:1.6;stroke-dasharray:6 5;marker-end:url(#arrow)}
+    .band{font-size:13px;font-weight:700;letter-spacing:.8px;fill:#006d77}
+    .boundary{font-size:15px;font-weight:700;fill:#006d77}
   </style>
-  <rect width="1120" height="470" fill="#fff"/>
-  <text x="35" y="32" class="title">libtt serving, compilation, and execution stack</text>
-  <text x="35" y="67" class="band">HOST · REQUEST AND GRAPH LAYERS</text>
-  <g>
-    <rect x="35" y="85" width="165" height="96" class="box" fill="url(#top)"/>
-    <text x="118" y="112" text-anchor="middle" class="name">SGLang-JAX</text>
-    <text x="118" y="136" text-anchor="middle" class="body">HTTP, tokenizer, scheduler</text>
-    <text x="118" y="156" text-anchor="middle" class="body">Qwen model + paged KV cache</text>
+  <rect width="1120" height="650" fill="#fff"/>
+  <text x="35" y="30" class="title">libtt: one PJRT artifact from framework IR to Tensix execution</text>
 
-    <rect x="225" y="85" width="150" height="96" class="box" fill="url(#top)"/>
-    <text x="300" y="112" text-anchor="middle" class="name">JAX</text>
-    <text x="300" y="136" text-anchor="middle" class="body">jit / tracing</text>
-    <text x="300" y="156" text-anchor="middle" class="body">StableHLO graph</text>
+  <text x="35" y="61" class="band">FRONTEND · OUTSIDE THE PLUGIN</text>
+  <rect x="35" y="76" width="225" height="72" class="box" fill="url(#host)"/>
+  <text x="147" y="103" text-anchor="middle" class="name">SGLang-JAX</text>
+  <text x="147" y="126" text-anchor="middle" class="body">serving · scheduling · Qwen model · KV cache</text>
+  <rect x="295" y="76" width="205" height="72" class="box" fill="url(#host)"/>
+  <text x="397" y="103" text-anchor="middle" class="name">JAX</text>
+  <text x="397" y="126" text-anchor="middle" class="body">shape tracing · StableHLO export</text>
+  <line x1="260" y1="112" x2="288" y2="112" class="arrow"/>
 
-    <rect x="400" y="85" width="145" height="96" class="box" fill="url(#top)"/>
-    <text x="472" y="112" text-anchor="middle" class="name">libtt PJRT</text>
-    <text x="472" y="136" text-anchor="middle" class="body">device + buffer API</text>
-    <text x="472" y="156" text-anchor="middle" class="body">compile / load / execute</text>
+  <rect x="25" y="175" width="1070" height="316" rx="18" fill="url(#plugin)" stroke="#006d77" stroke-width="2"/>
+  <text x="48" y="202" class="boundary">libtt.so · pinned compiler, runtime, kernels, and embedded TT-Metal assets</text>
 
-    <rect x="570" y="85" width="150" height="96" class="box" fill="url(#top)"/>
-    <text x="645" y="112" text-anchor="middle" class="name">TT-XLA</text>
-    <text x="645" y="136" text-anchor="middle" class="body">PJRT implementation</text>
-    <text x="645" y="156" text-anchor="middle" class="body">frontend integration</text>
+  <text x="48" y="232" class="band">COMPILE PATH · TT-XLA AND TT-MLIR</text>
+  <rect x="48" y="247" width="150" height="82" class="box" fill="#ffffff"/>
+  <text x="123" y="274" text-anchor="middle" class="name">PJRT / TT-XLA</text>
+  <text x="123" y="297" text-anchor="middle" class="body">plugin API</text>
+  <text x="123" y="315" text-anchor="middle" class="body">StableHLO import</text>
 
-    <rect x="745" y="85" width="155" height="96" class="box" fill="url(#top)"/>
-    <text x="822" y="112" text-anchor="middle" class="name">TT-MLIR</text>
-    <text x="822" y="136" text-anchor="middle" class="body">StableHLO → TTIR → TTNN</text>
-    <text x="822" y="156" text-anchor="middle" class="body">fusion, layout, sharding</text>
+  <rect x="230" y="247" width="130" height="82" class="box" fill="#ffffff"/>
+  <text x="295" y="274" text-anchor="middle" class="name">TTIR</text>
+  <text x="295" y="297" text-anchor="middle" class="body">tensor semantics</text>
+  <text x="295" y="315" text-anchor="middle" class="body">graph fusion</text>
 
-    <rect x="925" y="85" width="160" height="96" class="box" fill="url(#top)"/>
-    <text x="1005" y="112" text-anchor="middle" class="name">FlatBuffer</text>
-    <text x="1005" y="136" text-anchor="middle" class="body">serialized TTNN program</text>
-    <text x="1005" y="156" text-anchor="middle" class="body">runtime operation graph</text>
-  </g>
-  <line x1="200" y1="133" x2="218" y2="133" class="arrow"/>
-  <line x1="375" y1="133" x2="393" y2="133" class="arrow"/>
-  <line x1="545" y1="133" x2="563" y2="133" class="arrow"/>
-  <line x1="720" y1="133" x2="738" y2="133" class="arrow"/>
-  <line x1="900" y1="133" x2="918" y2="133" class="arrow"/>
+  <rect x="392" y="247" width="145" height="82" class="box" fill="#ffffff"/>
+  <text x="464" y="274" text-anchor="middle" class="name">TTNN dialect</text>
+  <text x="464" y="297" text-anchor="middle" class="body">ops · dtype · layout</text>
+  <text x="464" y="315" text-anchor="middle" class="body">runtime contract</text>
 
-  <text x="35" y="230" class="band">BLACKHOLE DEVICE · RUNTIME AND KERNEL LAYERS</text>
-  <rect x="35" y="248" width="1050" height="185" rx="16" fill="url(#device)" stroke="#c99b84" stroke-width="1.5"/>
+  <rect x="569" y="247" width="150" height="82" class="box" fill="#ffffff"/>
+  <text x="644" y="274" text-anchor="middle" class="name">TTNN FlatBuffer</text>
+  <text x="644" y="297" text-anchor="middle" class="body">serialized executable</text>
+  <text x="644" y="315" text-anchor="middle" class="body">measured path</text>
 
-  <rect x="60" y="275" width="190" height="130" class="box" fill="#fffaf4"/>
-  <text x="155" y="303" text-anchor="middle" class="name">TTNN runtime</text>
-  <text x="155" y="329" text-anchor="middle" class="body">operation dispatch + trace</text>
-  <text x="155" y="350" text-anchor="middle" class="body">tensor layouts / memory config</text>
-  <text x="155" y="371" text-anchor="middle" class="body">program-factory selection</text>
+  <line x1="198" y1="288" x2="223" y2="288" class="arrow"/>
+  <line x1="360" y1="288" x2="385" y2="288" class="arrow"/>
+  <line x1="537" y1="288" x2="562" y2="288" class="arrow"/>
 
-  <rect x="285" y="275" width="190" height="130" class="box" fill="#fffaf4"/>
-  <text x="380" y="303" text-anchor="middle" class="name">TT-Metalium</text>
-  <text x="380" y="329" text-anchor="middle" class="body">command queues + programs</text>
-  <text x="380" y="350" text-anchor="middle" class="body">core grids / semaphores</text>
-  <text x="380" y="371" text-anchor="middle" class="body">NoC data movement</text>
+  <rect x="765" y="239" width="300" height="98" class="box" fill="#f7f7f8"/>
+  <text x="915" y="264" text-anchor="middle" class="name">Direct-to-Metal branch</text>
+  <text x="915" y="287" text-anchor="middle" class="body">D2M → TTKernel + TTMetal</text>
+  <text x="915" y="307" text-anchor="middle" class="small">generic tiled compute → device/host IR</text>
+  <text x="915" y="324" text-anchor="middle" class="small">not used by the measured hand-written kernels</text>
+  <path d="M295 329 L295 352 L745 352 L745 288 L758 288" fill="none" class="branch"/>
 
-  <rect x="510" y="275" width="260" height="130" class="box" fill="#fffaf4"/>
-  <text x="640" y="303" text-anchor="middle" class="name">Tensix worker cores</text>
-  <text x="640" y="329" text-anchor="middle" class="body">reader RISC-V → circular buffers</text>
-  <text x="640" y="350" text-anchor="middle" class="body">matrix/vector engines → Dst</text>
-  <text x="640" y="371" text-anchor="middle" class="body">packer → L1; writer → DRAM</text>
+  <text x="48" y="380" class="band">EXECUTION PATH · EMBEDDED TTNN AND TT-METAL RUNTIME</text>
+  <rect x="48" y="394" width="195" height="72" class="box" fill="#ffffff"/>
+  <text x="145" y="421" text-anchor="middle" class="name">TTNN runtime</text>
+  <text x="145" y="444" text-anchor="middle" class="body">deserialize · tensor policy · trace</text>
 
-  <rect x="805" y="275" width="250" height="130" class="box" fill="#fffaf4"/>
-  <text x="930" y="303" text-anchor="middle" class="name">Memory hierarchy</text>
-  <text x="930" y="329" text-anchor="middle" class="body">Dst registers · shortest lifetime</text>
-  <text x="930" y="350" text-anchor="middle" class="body">per-core L1 SRAM · circular buffers</text>
-  <text x="930" y="371" text-anchor="middle" class="body">GDDR6 DRAM · weights and tensors</text>
-  <text x="930" y="392" text-anchor="middle" class="body">NoC links cores, SRAM, and DRAM</text>
+  <rect x="277" y="394" width="210" height="72" class="box" fill="#ffffff"/>
+  <text x="382" y="421" text-anchor="middle" class="name">Program factories</text>
+  <text x="382" y="444" text-anchor="middle" class="body">guards · core grids · circular buffers</text>
 
-  <line x1="250" y1="340" x2="278" y2="340" class="arrow"/>
-  <line x1="475" y1="340" x2="503" y2="340" class="arrow"/>
-  <line x1="770" y1="340" x2="798" y2="340" class="arrow"/>
-  <path d="M1005 181 L1005 220 L155 220 L155 268" fill="none" class="arrow"/>
+  <rect x="521" y="394" width="205" height="72" class="box" fill="#ffffff"/>
+  <text x="623" y="421" text-anchor="middle" class="name">TT-Metal runtime</text>
+  <text x="623" y="444" text-anchor="middle" class="body">queues · programs · NoC arguments</text>
+
+  <rect x="760" y="394" width="305" height="72" class="box" fill="#ffffff"/>
+  <text x="912" y="421" text-anchor="middle" class="name">Reader · compute · writer kernels</text>
+  <text x="912" y="444" text-anchor="middle" class="body">hand-written C++ compiled into the artifact</text>
+
+  <path d="M644 329 L644 365 L145 365 L145 387" fill="none" class="arrow"/>
+  <line x1="243" y1="430" x2="270" y2="430" class="arrow"/>
+  <line x1="487" y1="430" x2="514" y2="430" class="arrow"/>
+  <line x1="726" y1="430" x2="753" y2="430" class="arrow"/>
+
+  <text x="35" y="528" class="band">BLACKHOLE DEVICE</text>
+  <rect x="35" y="544" width="1050" height="82" rx="14" fill="url(#device)" stroke="#c99b84" stroke-width="1.5"/>
+  <text x="155" y="574" text-anchor="middle" class="name">GDDR6 DRAM</text>
+  <text x="155" y="599" text-anchor="middle" class="body">weights · persistent tensors</text>
+  <text x="435" y="574" text-anchor="middle" class="name">2D NoC + per-core L1</text>
+  <text x="435" y="599" text-anchor="middle" class="body">multicast · circular buffers · shards</text>
+  <text x="775" y="574" text-anchor="middle" class="name">Tensix engines</text>
+  <text x="775" y="599" text-anchor="middle" class="body">unpacker · matrix/vector · Dst · packer</text>
+  <text x="1000" y="574" text-anchor="middle" class="name">120 workers</text>
+  <text x="1000" y="599" text-anchor="middle" class="body">P150 firmware configuration</text>
+  <path d="M912 466 L912 515 L775 515 L775 537" fill="none" class="arrow"/>
 </svg>
