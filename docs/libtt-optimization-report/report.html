@@ -281,7 +281,7 @@ pre { white-space: pre-wrap; }
 </ul>
 <p>We evaluate inference, but PJRT and StableHLO are neither framework- nor inference-specific. JAX or PyTorch training support can use the same boundary after the required operations, collective behavior, optimizer graphs, and numerical validation are available.</p>
 <h2 data-number="3.2" id="integrated-build"><span class="header-section-number">3.2</span> Integrated build</h2>
-<p>libtt uses one Bazel build for the whole stack. Bazel pins TT-UMD [29], SFPI [17], TT-Metal, LLVM, StableHLO, TT-XLA [30], TT-MLIR, Shardy, and supporting C++ libraries [1]. It applies the libtt patches and adds build targets where needed. The <code>//:tt</code> target builds the compiler, runtime, kernels, and runtime assets, then links them into <code>bazel-bin/libtt.so</code>.</p>
+<p>libtt uses one Bazel build for the whole stack. Bazel pins TT-UMD [29], SFPI [17], TT-Metal, LLVM, StableHLO, TT-XLA [30], TT-MLIR, Shardy [36], and supporting C++ libraries [1]. It applies the libtt patches and adds build targets where needed. The <code>//:tt</code> target builds the compiler, runtime, kernels, and runtime assets, then links them into <code>bazel-bin/libtt.so</code>.</p>
 <p>This organization has three practical effects:</p>
 <ul>
 <li>Source revisions, overlays, patches, toolchains, and link rules are inputs to one build.</li>
@@ -1092,19 +1092,12 @@ matmul-SwiGLU epilogue:
 <h2 data-number="7.4" id="unsuccessful-transformations"><span class="header-section-number">7.4</span> Unsuccessful transformations</h2>
 <p>Wider SwiGLU blocks reduce partial packs but add CB pressure or reduce overlap. The four-tile result changes throughput by only +0.27%, so two remains the default and the larger values remain experimental. Shared-LHS and consumer-side fusion are kept in the record for the same reason: their measured costs explain the final producer-side design.</p>
 <h1 data-number="8" id="limitations-and-future-work"><span class="header-section-number">8</span> Limitations and future work</h1>
-<ol type="1">
-<li><strong>One model and decode regime.</strong> Results apply to Qwen3-8B, a five-token prompt padded to one tile, serial 128-token generation, and a single P150. Other batches, contexts, and scheduling policies may have different limits.</li>
-<li><strong>Cumulative attribution is ordered.</strong> The measured configurations are real cumulative builds, not a factorial experiment. Feature effects can interact.</li>
-<li><strong>Initial feature effects interact.</strong> The leave-one-feature-out measurements are marginal effects in the complete feature set, not an additive or factorial allocation. Small effects are also close to sequential drift.</li>
-<li><strong>Two metric families.</strong> The older cumulative sequence uses server-reported request latency. The current kernel and TTIS comparison uses the same streaming client clock. The two families are not directly interchangeable.</li>
-<li><strong>Sequential sampling.</strong> Configurations were not randomized or interleaved. Thermal and background drift can remain.</li>
-<li><strong>Profile naming required positional alignment.</strong> The final profiling CSV lacked operation names. Its 854 rows align with an earlier named trace, and the 36 changed positions match the down projections.</li>
-<li><strong>Shape-specific kernels.</strong> The 96-core epilogue and 110-core down projection target Blackhole and exact Qwen3-8B decode shapes.</li>
-<li><strong>Quality is unmeasured.</strong> Deterministic coherent completion is a smoke test, not evidence of equivalent perplexity or task accuracy.</li>
-<li><strong>External reference scope.</strong> The TTIS v0.10.0 image is official, but P150 model metadata was added locally because that release listed Qwen3-8B on P300. The runtime image was unchanged. Both rows use the same collector but different serving and model stacks.</li>
-<li><strong>Training is not measured.</strong> The PJRT/StableHLO boundary can carry training graphs, but operation coverage, collectives, optimizer execution, and numerical quality still need implementation and validation.</li>
-</ol>
-<p>The next MLP experiment is to keep the SwiGLU output on chip for the down projection. That requires a shared producer/consumer sharding contract.</p>
+<h2 data-number="8.1" id="more-models-and-workloads"><span class="header-section-number">8.1</span> More models and workloads</h2>
+<p>This report evaluates one model, Qwen3-8B, in one batch-one decode workload. Several fast paths are specialized for its tensor shapes. The next step is to support a broader set of model families, batch sizes, prompt lengths, and serving workloads without adding model-specific code above XLA. This requires more StableHLO and TT-MLIR operation coverage, reusable kernel specializations, and layout policies that select an implementation from tensor shape and device geometry. Each new model also needs numerical validation with perplexity and task-level evaluations, not only deterministic generation.</p>
+<h2 data-number="8.2" id="training"><span class="header-section-number">8.2</span> Training</h2>
+<p>PJRT and StableHLO can represent training programs as well as inference programs [6, 7]. libtt still needs the operation coverage and runtime support for backward graphs, optimizer updates, optimizer state, checkpointing, and training collectives. It also needs memory planning for saved activations and numerical validation over full training runs. JAX is the first path available through the current XLA boundary. PyTorch training can use the same lower stack after the TorchTPU frontend and required operations are available [2].</p>
+<h2 data-number="8.3" id="multi-card-and-distributed-execution"><span class="header-section-number">8.3</span> Multi-card and distributed execution</h2>
+<p>The current implementation and measurements use one P150. Supporting multiple cards requires coordinated work across the stack: XLA and Shardy must partition the graph, PJRT must expose the device mesh, TT-MLIR must preserve sharding and layout decisions, and the runtime must execute collectives over Tenstorrent’s inter-card links [6, 12, 36]. The system then needs topology-aware tensor, data, and pipeline parallelism, overlap between communication and computation, and multi-host coordination. This is important both for larger inference models and for training. Tenstorrent’s direct card links and Galaxy topologies make this a natural extension of the TPU-style architecture [34].</p>
 <h1 data-number="9" id="conclusions"><span class="header-section-number">9</span> Conclusions</h1>
 <p>With <code>libtt.so</code>, we keep the XLA-facing framework layers close to upstream while packaging the PJRT backend, compiler, runtime, kernels, and runtime assets in one artifact. The report demonstrates that boundary with SGLang-JAX; the same StableHLO interface provides a path to PyTorch through TorchTPU once the required adapter and operation coverage exist. One Bazel graph makes the lower stack available for cross-layer optimization.</p>
 <p>We started with a functional backend that runs upstream SGLang-JAX at 16.265 tokens/s. Compiler, runtime, and kernel changes raise measured end-to-end throughput by 69.81% to 27.619 tokens/s and deliver 27.753 decode tokens/s. Under the matched benchmark conditions, libtt is 11.51% faster than the TTIS decode mean even though TTIS also uses TT-specific transformer and inference-engine layers.</p>
@@ -1152,6 +1145,7 @@ matmul-SwiGLU epilogue:
 <li><a href="https://docs.tenstorrent.com/systems/galaxy-blackhole/index.html" class="uri">https://docs.tenstorrent.com/systems/galaxy-blackhole/index.html</a></li>
 </ol></li>
 <li>libtt Project, “libtt: XLA backend for Tenstorrent devices,” GitHub repository, 2026. <a href="https://github.com/pcmoritz/libtt" class="uri">https://github.com/pcmoritz/libtt</a></li>
+<li>OpenXLA Project, “Shardy: A Tensor Partitioning System for MLIR.” <a href="https://github.com/openxla/shardy" class="uri">https://github.com/openxla/shardy</a></li>
 </ol>
 </body>
 </html>
