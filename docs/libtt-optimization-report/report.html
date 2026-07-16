@@ -290,7 +290,7 @@ pre { white-space: pre-wrap; }
 </ul>
 <p>Tenstorrent’s compiler overview describes the same open path from framework frontends through TT-MLIR dialects to TT-Metalium [19, 24]. libtt builds a pinned part of that path as one artifact.</p>
 <h2 data-number="3.3" id="cross-layer-optimization"><span class="header-section-number">3.3</span> Cross-layer optimization</h2>
-<p>The matmul-SwiGLU epilogue crosses six layers:</p>
+<p>The matmul-SwiGLU epilogue is an example of a cross-cutting optimization. It cannot be implemented only as a graph rewrite or only as a device kernel. It needs coordinated changes across six layers:</p>
 <ol type="1">
 <li>A graph pass must prove that a paired gate/up matmul feeds the exact <code>silu(gate) * up</code> expression.</li>
 <li>TTNN IR needs an operation-level representation that preserves the fused semantic through lowering.</li>
@@ -299,16 +299,8 @@ pre { white-space: pre-wrap; }
 <li>TTNN must select a program factory only for supported shapes, dtypes, layouts, and hardware.</li>
 <li>Reader, compute, and writer kernels must keep the paired tiles resident in Dst and emit only the half-width final result.</li>
 </ol>
-<p>These steps form one patch concept even though they touch several abstraction levels and two upstream repositories.</p>
-<h2 data-number="3.4" id="the-xla-boundary-stablehlo-and-pjrt"><span class="header-section-number">3.4</span> The XLA boundary: StableHLO and PJRT</h2>
-<p>StableHLO is a portable operation set between framework frontends and compilers [7]. PJRT hides the device-specific compiler and runtime behind one plugin interface [6]. These are the libtt boundary; JAX is one producer of the input program.</p>
-<p>In the path measured here, upstream SGLang-JAX owns serving, tokenization, scheduling, the JAX Qwen model, and the paged KV cache [9]. JAX traces each shape-specific computation through XLA and exports StableHLO. The steady-state request path is:</p>
-<pre class="text"><code>SGLang-JAX → JAX trace → StableHLO → libtt/PJRT
-            → TT-XLA → TT-MLIR → TTNN executable
-            → TTNN runtime → TT-Metal programs → Blackhole</code></pre>
-<p><code>libtt.so</code> accepts StableHLO and executes a serialized TTNN program.</p>
-<p>TorchTPU defines a corresponding future PyTorch path: Dynamo captures the PyTorch graph, TorchTPU translates its operations to StableHLO, and XLA serves as the backend compiler [2]. TorchTPU retains <code>torch.compile</code> and Dynamo as the PyTorch entry point but deliberately routes static compilation through XLA rather than Inductor. The relevant comparison is therefore not XLA versus <code>torch.compile</code>; it is XLA/MLIR versus Inductor as the accelerator backend. TorchTPU’s choice is evidence that XLA/MLIR is a mature foundation for tiled, topology-aware accelerators, not a general benchmark of compiler quality. Connecting this path to libtt will require a compatible backend adapter and sufficient compiler and runtime operation coverage. It is an architectural target, not a result measured in this report.</p>
-<h2 data-number="3.5" id="tt-mlir-ir-levels"><span class="header-section-number">3.5</span> TT-MLIR IR levels</h2>
+<p>The full stack is open source, so libtt can change all of these layers and test them together in one build. This is what makes cross-cutting optimizations such as matmul-SwiGLU practical. The six changes form one patch concept even though they touch several abstraction levels and two upstream repositories.</p>
+<h2 data-number="3.4" id="tt-mlir-ir-levels"><span class="header-section-number">3.4</span> TT-MLIR IR levels</h2>
 <p>MLIR supports dialects at different abstraction levels [4]. TT-MLIR uses them for model semantics, layouts, tiled computation, device kernels, and host/device control [24]. Each optimization should use the highest level that still has the information it needs.</p>
 <table>
 <caption>The TT-MLIR IR ladder and where libtt’s measured path uses it.</caption>
@@ -371,9 +363,9 @@ pre { white-space: pre-wrap; }
 <p>TT-MLIR also supports the lower-level branch:</p>
 <pre class="text"><code>TTIR → D2M → TTKernel + TTMetal → generated device/host program</code></pre>
 <p>Only the first branch runs the benchmarked patches. Their hand-written C++ program factories and kernels are not TTKernel IR optimizations.</p>
-<h2 data-number="3.6" id="ttnn-runtime-and-the-serialized-executable"><span class="header-section-number">3.6</span> TTNN runtime and the serialized executable</h2>
+<h2 data-number="3.5" id="ttnn-runtime-and-the-serialized-executable"><span class="header-section-number">3.5</span> TTNN runtime and the serialized executable</h2>
 <p>TTNN IR models operations such as matmul, RMSNorm, SDPA, and reshape. Lowering serializes them into a FlatBuffer. The runtime deserializes the graph, creates tensors, sets memory configurations, validates each operation, and selects a program factory. The RMSNorm patch uses the concrete input shape here to choose a 16-core width-sharded layout; the compiler still emits a normal RMSNorm.</p>
-<h2 data-number="3.7" id="tt-metal-programs-and-tensix-kernels"><span class="header-section-number">3.7</span> TT-Metal programs and Tensix kernels</h2>
+<h2 data-number="3.6" id="tt-metal-programs-and-tensix-kernels"><span class="header-section-number">3.6</span> TT-Metal programs and Tensix kernels</h2>
 <p>TT-Metalium uses cooperative dataflow rather than a GPU thread hierarchy [22]. A program usually has:</p>
 <ul>
 <li>a reader data-movement kernel to fetch tiles from DRAM or another core into L1 circular buffers;</li>
@@ -382,11 +374,11 @@ pre { white-space: pre-wrap; }
 </ul>
 <p>Circular buffers are bounded queues shared by the threads of a Tensix core [13]. Reader, compute, and writer kernels can overlap on different tiles when their buffer and semaphore protocols are correct.</p>
 <p>The compute engine exposes SrcA, SrcB, and Dst register sets. Matrix results land in Dst; vector operations can transform them; the packer writes them to an L1 circular buffer [14]. With 16-bit Dst storage and double buffering enabled, the active half contains eight 32-by-32 tiles. That capacity determines the successful SwiGLU geometry: four gate and four up tiles fill Dst exactly.</p>
-<h2 data-number="3.8" id="tiles-memory-and-low-precision-weights"><span class="header-section-number">3.8</span> Tiles, memory, and low-precision weights</h2>
+<h2 data-number="3.7" id="tiles-memory-and-low-precision-weights"><span class="header-section-number">3.7</span> Tiles, memory, and low-precision weights</h2>
 <p>TTNN’s standard tile is 32 by 32 elements with four 16-by-16 faces [18]. Final dimensions are padded, so batch-one decode still presents a full tile row. Kernels must account for both the logical and padded shapes.</p>
 <p>Large weights reside in device DRAM; L1 is smaller, faster, and private to each worker. TTNN <code>MemoryConfig</code> values describe interleaved or sharded storage and DRAM or L1 placement. TT-MLIR layout attributes similarly encode how a logical tensor maps to devices, cores, physical shards, memory space, and padding [25].</p>
 <p>We use BF16 activations and outputs with BFLOAT8_B weights. BFLOAT8_B is block floating point: 16 values share an exponent [27]. It reduces the dominant weight traffic in batch-one decode, with a precision and packing trade-off. The custom matmuls use BF16 packer-L1 accumulation: partial sums are packed into an L1 slot and reloaded for later K blocks, leaving Dst available for the current block’s tile group.</p>
-<h2 data-number="3.9" id="decode-bottlenecks"><span class="header-section-number">3.9</span> Decode bottlenecks</h2>
+<h2 data-number="3.8" id="decode-bottlenecks"><span class="header-section-number">3.8</span> Decode bottlenecks</h2>
 <p>Qwen3 is a decoder-only Transformer family [31]. A simplified layer is:</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mtable><mtr><mtd columnalign="right"><mi>u</mi></mtd><mtd columnalign="left"><mo>=</mo><mo>RMSNorm</mo><mo stretchy="false" form="prefix">(</mo><mi>h</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>h</mi><mi>′</mi></mtd><mtd columnalign="left"><mo>=</mo><mi>h</mi><mo>+</mo><mo>Attention</mo><mo stretchy="false" form="prefix">(</mo><mi>Q</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo><mi>K</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo><mi>V</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>;</mo><msub><mi>K</mi><mrow><mi>c</mi><mi>a</mi><mi>c</mi><mi>h</mi><mi>e</mi></mrow></msub><mo>,</mo><msub><mi>V</mi><mrow><mi>c</mi><mi>a</mi><mi>c</mi><mi>h</mi><mi>e</mi></mrow></msub><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>v</mi></mtd><mtd columnalign="left"><mo>=</mo><mo>RMSNorm</mo><mo stretchy="false" form="prefix">(</mo><mi>h</mi><mi>′</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>g</mi></mtd><mtd columnalign="left"><mo>=</mo><mi>v</mi><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mo>,</mo><mspace width="2.0em"></mspace><mi>r</mi><mo>=</mo><mi>v</mi><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><msub><mi>h</mi><mrow><mi>n</mi><mi>e</mi><mi>x</mi><mi>t</mi></mrow></msub></mtd><mtd columnalign="left"><mo>=</mo><mi>h</mi><mi>′</mi><mo>+</mo><mo minsize="1.2" maxsize="1.2" stretchy="false" form="prefix">(</mo><mo>SiLU</mo><mo stretchy="false" form="prefix">(</mo><mi>g</mi><mo stretchy="false" form="postfix">)</mo><mo>⊙</mo><mi>r</mi><mo minsize="1.2" maxsize="1.2" stretchy="false" form="postfix">)</mo><msub><mi>W</mi><mrow><mi>d</mi><mi>o</mi><mi>w</mi><mi>n</mi></mrow></msub><mi>.</mi></mtd></mtr></mtable><annotation encoding="application/x-tex">
 \begin{aligned}

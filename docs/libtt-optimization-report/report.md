@@ -379,7 +379,9 @@ pinned part of that path as one artifact.
 
 ## Cross-layer optimization
 
-The matmul-SwiGLU epilogue crosses six layers:
+The matmul-SwiGLU epilogue is an example of a cross-cutting optimization. It
+cannot be implemented only as a graph rewrite or only as a device kernel. It
+needs coordinated changes across six layers:
 
 1. A graph pass must prove that a paired gate/up matmul feeds the exact
    `silu(gate) * up` expression.
@@ -392,40 +394,10 @@ The matmul-SwiGLU epilogue crosses six layers:
 6. Reader, compute, and writer kernels must keep the paired tiles resident in
    Dst and emit only the half-width final result.
 
-These steps form one patch concept even though they touch several abstraction
-levels and two upstream repositories.
-
-## The XLA boundary: StableHLO and PJRT
-
-StableHLO is a portable operation set between framework frontends and
-compilers [7]. PJRT hides the device-specific compiler and runtime behind one
-plugin interface [6]. These are the libtt boundary; JAX is one producer of the
-input program.
-
-In the path measured here, upstream SGLang-JAX owns serving, tokenization,
-scheduling, the JAX Qwen model, and the paged KV cache [9]. JAX traces each
-shape-specific computation through XLA and exports StableHLO. The steady-state
-request path is:
-
-```text
-SGLang-JAX → JAX trace → StableHLO → libtt/PJRT
-            → TT-XLA → TT-MLIR → TTNN executable
-            → TTNN runtime → TT-Metal programs → Blackhole
-```
-
-`libtt.so` accepts StableHLO and executes a serialized TTNN program.
-
-TorchTPU defines a corresponding future PyTorch path: Dynamo captures the
-PyTorch graph, TorchTPU translates its operations to StableHLO, and XLA serves
-as the backend compiler [2]. TorchTPU retains `torch.compile` and Dynamo as the
-PyTorch entry point but deliberately routes static compilation through XLA
-rather than Inductor. The relevant comparison is therefore not XLA versus
-`torch.compile`; it is XLA/MLIR versus Inductor as the accelerator backend.
-TorchTPU's choice is evidence that XLA/MLIR is a mature foundation for tiled,
-topology-aware accelerators, not a general benchmark of compiler quality.
-Connecting this path to libtt will require a compatible backend adapter and
-sufficient compiler and runtime operation coverage. It is an architectural
-target, not a result measured in this report.
+The full stack is open source, so libtt can change all of these layers and test
+them together in one build. This is what makes cross-cutting optimizations such
+as matmul-SwiGLU practical. The six changes form one patch concept even though
+they touch several abstraction levels and two upstream repositories.
 
 ## TT-MLIR IR levels
 
