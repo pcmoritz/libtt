@@ -84,6 +84,8 @@ model or serving-engine fork—while retaining hardware-specific performance.
 libtt's answer is an open-source, self-contained XLA stack built around PJRT
 [6] and StableHLO [7]. It compiles and executes framework programs while
 keeping Tenstorrent-specific code below that boundary.
+The source code, patches, and build files are available in the public libtt
+GitHub repository [35].
 
 The implementation evaluated here uses JAX. Upstream SGLang-JAX retains its
 tokenizer, scheduler, Qwen model, and paged KV cache [9], while libtt compiles
@@ -1230,3 +1232,5 @@ are added.
     no. 1, 2026. <https://github.com/pcmoritz/sglang-jax/pull/1>
 34. Tenstorrent, “Tenstorrent Galaxy (Blackhole) User Guide,” version 1.4,
     2026. <https://docs.tenstorrent.com/systems/galaxy-blackhole/index.html>
+35. libtt Project, “libtt: XLA backend for Tenstorrent devices,” GitHub
+    repository, 2026. <https://github.com/pcmoritz/libtt>
