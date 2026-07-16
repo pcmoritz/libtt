@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="980" height="520" viewBox="0 0 980 520">
 <rect width="100%" height="100%" fill="#ffffff"/>
-<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1}.grid{stroke:#dbe4ee;stroke-width:1}.line{fill:none;stroke:#006d77;stroke-width:4}.ci{stroke:#e29578;stroke-width:3}.dot{fill:#006d77;stroke:white;stroke-width:2}.label{font-size:14px}.small{font-size:12px;fill:#526174}.title{font-size:21px;font-weight:700}</style>
+<style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1}.grid{stroke:#d0d0d0;stroke-width:1}.line{fill:none;stroke:#111;stroke-width:3}.ci{stroke:#666;stroke-width:2}.dot{fill:#111;stroke:white;stroke-width:1.5}.label{font-size:14px}.small{font-size:12px;fill:#444}.title{font-size:21px;font-weight:700}</style>
 <text x="90" y="27" class="title">Qwen3-8B end-to-end generation throughput</text>
 <line x1="90" y1="415.0" x2="955" y2="415.0" class="grid"/>
 <text x="78" y="420.0" text-anchor="end" class="label">15</text>

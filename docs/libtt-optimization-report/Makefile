@@ -10,9 +10,9 @@ html: $(REPORT).html
 $(REPORT).html: $(REPORT).md style.css figures/throughput.svg figures/incremental-speedup.svg figures/upstream-comparison.svg figures/stack.svg
 	$(PANDOC) $(REPORT).md \
 		--from=markdown+tex_math_dollars \
-		--to=html5 --standalone --toc --number-sections --mathml \
+		--to=html5 --standalone --number-sections --no-highlight --mathml \
 		--self-contained --css=style.css \
-		--metadata pagetitle="From StableHLO to Tensix: libtt as a Hermetic Full-Stack Runtime" \
+		--metadata pagetitle="libtt: A Self-Contained JAX Runtime for Tenstorrent Accelerators" \
 		-o $@
 	sed -i 's/[[:space:]]\+$$//' $@
 
@@ -21,7 +21,7 @@ tex: $(REPORT).tex
 $(REPORT).tex: $(REPORT).md figures/throughput.svg figures/incremental-speedup.svg figures/upstream-comparison.svg figures/stack.svg
 	$(PANDOC) $(REPORT).md \
 		--from=markdown+tex_math_dollars \
-		--to=latex --standalone --toc --number-sections \
+		--to=latex --standalone --number-sections --no-highlight \
 		-o $@
 
 pdf: $(REPORT).pdf
@@ -31,7 +31,7 @@ $(REPORT).pdf: $(REPORT).md figures/throughput.svg figures/incremental-speedup.s
 	@command -v rsvg-convert >/dev/null || (echo "rsvg-convert is required (for example, librsvg2-bin)"; exit 1)
 	$(PANDOC) $(REPORT).md \
 		--from=markdown+tex_math_dollars \
-		--pdf-engine=xelatex --toc --number-sections \
+		--pdf-engine=xelatex --number-sections --no-highlight \
 		-o $@
 
 pdf-html: $(REPORT).html

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="980" height="500" viewBox="0 0 980 500">
 <rect width="100%" height="100%" fill="#ffffff"/>
-<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1.2}.grid{stroke:#dbe4ee;stroke-width:1}.pos{fill:#006d77}.neg{fill:#c84b31}.label{font-size:14px}.small{font-size:12px;fill:#526174}.value{font-size:13px;font-weight:700}.title{font-size:21px;font-weight:700}</style>
+<style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1.2}.grid{stroke:#d0d0d0;stroke-width:1}.pos{fill:#333}.neg{fill:#aaa}.label{font-size:14px}.small{font-size:12px;fill:#444}.value{font-size:13px;font-weight:700}.title{font-size:21px;font-weight:700}</style>
 <text x="90" y="29" class="title">Incremental throughput change</text>
 <line x1="90" y1="386.9" x2="955" y2="386.9" class="grid"/>
 <text x="78" y="391.9" text-anchor="end" class="label">-2%</text>

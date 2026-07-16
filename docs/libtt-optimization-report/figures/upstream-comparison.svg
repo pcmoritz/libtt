@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="980" height="510" viewBox="0 0 980 510">
 <rect width="100%" height="100%" fill="#ffffff"/>
-<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1.2}.grid{stroke:#dbe4ee;stroke-width:1}.libtt{fill:#006d77}.upstream{fill:#e29578}.ci{stroke:#172033;stroke-width:3}.label{font-size:14px}.small{font-size:12px;fill:#526174}.value{font-size:15px;font-weight:700}.title{font-size:21px;font-weight:700}.legend{font-size:13px}</style>
+<style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1.2}.grid{stroke:#d0d0d0;stroke-width:1}.libtt{fill:#333}.upstream{fill:#aaa}.ci{stroke:#111;stroke-width:2.5}.label{font-size:14px}.small{font-size:12px;fill:#444}.value{font-size:15px;font-weight:700}.title{font-size:21px;font-weight:700}.legend{font-size:13px}</style>
 <text x="100" y="29" class="title">Same-clock Qwen3-8B streaming comparison</text>
 <rect x="608" y="16" width="16" height="16" rx="2" class="libtt"/>
 <text x="631" y="29" class="legend">libtt 37d5460</text>

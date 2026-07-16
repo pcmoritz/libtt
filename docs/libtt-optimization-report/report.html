@@ -4,10 +4,10 @@
   <meta charset="utf-8" />
   <meta name="generator" content="pandoc" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
-  <meta name="author" content="libtt technical report" />
+  <meta name="author" content="libtt Project" />
   <meta name="dcterms.date" content="2026-07-15" />
   <meta name="keywords" content="libtt, Tenstorrent, PJRT, TT-MLIR, TT-Metalium, Blackhole, Qwen3, LLM inference, compiler optimization, kernel fusion" />
-  <title>From StableHLO to Tensix: libtt as a Hermetic Full-Stack Runtime</title>
+  <title>libtt: A Self-Contained JAX Runtime for Tenstorrent Accelerators</title>
   <style>
     code{white-space: pre-wrap;}
     span.smallcaps{font-variant: small-caps;}
@@ -15,140 +15,76 @@
     div.column{display: inline-block; vertical-align: top; width: 50%;}
     div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
     ul.task-list{list-style: none;}
-    pre > code.sourceCode { white-space: pre; position: relative; }
-    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
-    pre > code.sourceCode > span:empty { height: 1.2em; }
-    code.sourceCode > span { color: inherit; text-decoration: inherit; }
-    div.sourceCode { margin: 1em 0; }
-    pre.sourceCode { margin: 0; }
-    @media screen {
-    div.sourceCode { overflow: auto; }
-    }
-    @media print {
-    pre > code.sourceCode { white-space: pre-wrap; }
-    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
-    }
-    pre.numberSource code
-      { counter-reset: source-line 0; }
-    pre.numberSource code > span
-      { position: relative; left: -4em; counter-increment: source-line; }
-    pre.numberSource code > span > a:first-child::before
-      { content: counter(source-line);
-        position: relative; left: -1em; text-align: right; vertical-align: baseline;
-        border: none; display: inline-block;
-        -webkit-touch-callout: none; -webkit-user-select: none;
-        -khtml-user-select: none; -moz-user-select: none;
-        -ms-user-select: none; user-select: none;
-        padding: 0 4px; width: 4em;
-        color: #aaaaaa;
-      }
-    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
-    div.sourceCode
-      {   }
-    @media screen {
-    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
-    }
-    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
-    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
-    code span.at { color: #7d9029; } /* Attribute */
-    code span.bn { color: #40a070; } /* BaseN */
-    code span.bu { } /* BuiltIn */
-    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
-    code span.ch { color: #4070a0; } /* Char */
-    code span.cn { color: #880000; } /* Constant */
-    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
-    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
-    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
-    code span.dt { color: #902000; } /* DataType */
-    code span.dv { color: #40a070; } /* DecVal */
-    code span.er { color: #ff0000; font-weight: bold; } /* Error */
-    code span.ex { } /* Extension */
-    code span.fl { color: #40a070; } /* Float */
-    code span.fu { color: #06287e; } /* Function */
-    code span.im { } /* Import */
-    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
-    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
-    code span.op { color: #666666; } /* Operator */
-    code span.ot { color: #007020; } /* Other */
-    code span.pp { color: #bc7a00; } /* Preprocessor */
-    code span.sc { color: #4070a0; } /* SpecialChar */
-    code span.ss { color: #bb6688; } /* SpecialString */
-    code span.st { color: #4070a0; } /* String */
-    code span.va { color: #19177c; } /* Variable */
-    code span.vs { color: #4070a0; } /* VerbatimString */
-    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
   </style>
   <style type="text/css">:root {
---ink: #172033;
---muted: #526174;
---accent: #006d77;
---accent-2: #e29578;
+--ink: #111111;
+--muted: #4a4a4a;
 --paper: #ffffff;
---wash: #f4f7fa;
---rule: #dbe4ee;
+--wash: #f3f3f3;
+--rule: #777777;
 }
-html { background: #e9eef3; }
+html { background: #ededed; }
 body {
 box-sizing: border-box;
-max-width: 1080px;
-margin: 28px auto;
-padding: 72px 88px;
+max-width: 900px;
+margin: 24px auto;
+padding: 64px 76px;
 color: var(--ink);
 background: var(--paper);
-box-shadow: 0 10px 35px rgba(23, 32, 51, .12);
-font: 17px/1.62 "Charter", "Bitstream Charter", "Iowan Old Style", Georgia, serif;
+font: 16px/1.5 "Times New Roman", Times, serif;
 text-rendering: optimizeLegibility;
 }
-h1, h2, h3, h4, #TOC, table, figcaption, code {
-font-family: Inter, "Helvetica Neue", Arial, sans-serif;
+h1, h2, h3, h4, table, figcaption, code {
+font-family: "Helvetica Neue", Arial, sans-serif;
 }
-h1 { margin-top: 2.5em; padding-bottom: .24em; color: var(--accent); border-bottom: 2px solid var(--accent); font-size: 2em; }
-h2 { margin-top: 2em; color: #1f4f5a; font-size: 1.45em; }
-h3 { margin-top: 1.6em; color: #315a68; font-size: 1.15em; }
-h1.title { margin-top: 0; border: 0; color: var(--ink); font-size: 2.65em; line-height: 1.08; }
-.subtitle { color: var(--accent); font-size: 1.35em; }
-.author, .date { color: var(--muted); }
-#TOC {
-margin: 3em 0;
-padding: 1.6em 2em;
-background: var(--wash);
-border-left: 5px solid var(--accent);
+h1 { margin: 2.2em 0 .7em; font-size: 1.55em; letter-spacing: .01em; }
+h2 { margin: 1.8em 0 .55em; font-size: 1.15em; }
+h3 { margin: 1.4em 0 .45em; font-size: 1em; }
+h1.title {
+max-width: 760px;
+margin: 0 0 .35em;
+font-size: 2.15em;
+line-height: 1.12;
 }
-#TOC a { color: var(--ink); text-decoration: none; }
-#TOC a:hover { color: var(--accent); }
-a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
-strong { color: #103f48; }
-blockquote { margin-left: 0; padding: .2em 1.2em; color: var(--muted); border-left: 4px solid var(--accent-2); }
-table { width: 100%; margin: 1.5em 0 2em; border-collapse: collapse; font-size: .84em; line-height: 1.4; }
+.subtitle {
+margin: 0 0 1.8em;
+color: var(--muted);
+font: 700 .8em/1.3 "Helvetica Neue", Arial, sans-serif;
+letter-spacing: .12em;
+text-transform: uppercase;
+}
+.author, .date { margin: .15em 0; color: var(--ink); }
+a { color: var(--ink); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+blockquote { margin-left: 0; padding: .15em 1em; color: var(--muted); border-left: 2px solid var(--rule); }
+table { width: 100%; margin: 1.3em 0 1.8em; border-collapse: collapse; font-size: .82em; line-height: 1.35; }
 thead { border-top: 2px solid var(--ink); border-bottom: 1px solid var(--ink); }
 tbody { border-bottom: 2px solid var(--ink); }
-th, td { padding: .62em .55em; vertical-align: top; }
-th { text-align: left; color: #103f48; }
-tbody tr:nth-child(even) { background: var(--wash); }
-caption { margin: .8em 0; color: var(--muted); text-align: left; }
-figure { margin: 2.2em 0; }
-figure img, p > img { display: block; width: 100%; height: auto; margin: 1.2em auto; }
-figcaption { margin-top: .8em; color: var(--muted); font-size: .88em; text-align: center; }
+th, td { padding: .5em .45em; vertical-align: top; }
+th { text-align: left; }
+caption { margin: .7em 0; color: var(--ink); text-align: left; }
+figure { margin: 1.8em 0; }
+figure img, p > img { display: block; width: 100%; height: auto; margin: 1em auto; }
+figcaption { margin-top: .65em; color: var(--ink); font-size: .82em; text-align: center; }
 pre {
 overflow-x: auto;
-padding: 1.15em 1.3em;
-color: #eef6f7;
-background: #172b34;
-border-radius: 7px;
+padding: .8em 1em;
+color: var(--ink);
+background: var(--wash);
+border: 1px solid #cccccc;
 font-size: .82em;
-line-height: 1.5;
+line-height: 1.4;
 }
 code { font-size: .88em; }
-p code, li code, td code { padding: .12em .32em; color: #174f5b; background: #edf4f5; border-radius: 3px; }
-.abstract { margin: 2.5em 0; padding: 1.5em 1.8em; background: #f4faf9; border: 1px solid #cce2df; }
-.abstract-title { color: var(--accent); font-family: Inter, Arial, sans-serif; }
+p code, li code, td code { padding: .08em .22em; color: var(--ink); background: var(--wash); }
+.abstract { margin: 2em 0; padding: .9em 0; border-top: 1px solid var(--ink); border-bottom: 1px solid var(--ink); }
+.abstract-title { font-family: "Helvetica Neue", Arial, sans-serif; }
 @media (max-width: 800px) {
-body { margin: 0; padding: 35px 24px; box-shadow: none; }
-h1.title { font-size: 2em; }
+body { margin: 0; padding: 32px 24px; }
+h1.title { font-size: 1.8em; }
 table { display: block; overflow-x: auto; }
 }
 @media print {
-@page { size: A4; margin: 20mm 18mm 22mm; }
+@page { size: Letter; margin: 0.9in 0.85in; }
 html { background: white; }
 body { max-width: none; margin: 0; padding: 0; box-shadow: none; font-size: 10.5pt; }
 h1, h2, h3 { break-after: avoid-page; }
@@ -161,108 +97,24 @@ pre { white-space: pre-wrap; }
 </head>
 <body>
 <header id="title-block-header">
-<h1 class="title">From StableHLO to Tensix</h1>
-<p class="subtitle">libtt as a hermetic, full-stack runtime for Tenstorrent accelerators</p>
-<p class="author">libtt technical report</p>
+<h1 class="title">libtt: A Self-Contained JAX Runtime for Tenstorrent Accelerators</h1>
+<p class="subtitle">libtt Technical Report</p>
+<p class="author">libtt Project</p>
 <p class="date">15 July 2026</p>
 </header>
-<nav id="TOC" role="doc-toc">
-<ul>
-<li><a href="#abstract">Abstract</a></li>
-<li><a href="#executive-summary">Executive summary</a></li>
-<li><a href="#design"><span class="toc-section-number">1</span> Design</a>
-<ul>
-<li><a href="#deployment-model"><span class="toc-section-number">1.1</span> Deployment model</a></li>
-<li><a href="#upstream-compatible-frontend"><span class="toc-section-number">1.2</span> Upstream-compatible frontend</a></li>
-<li><a href="#one-build-graph"><span class="toc-section-number">1.3</span> One build graph</a></li>
-<li><a href="#cross-layer-changes"><span class="toc-section-number">1.4</span> Cross-layer changes</a></li>
-</ul></li>
-<li><a href="#compilation-and-execution-architecture"><span class="toc-section-number">2</span> Compilation and execution architecture</a>
-<ul>
-<li><a href="#the-framework-boundary-jax-stablehlo-and-pjrt"><span class="toc-section-number">2.1</span> The framework boundary: JAX, StableHLO, and PJRT</a></li>
-<li><a href="#tt-mlir-ir-levels"><span class="toc-section-number">2.2</span> TT-MLIR IR levels</a></li>
-<li><a href="#ttnn-runtime-and-the-serialized-executable"><span class="toc-section-number">2.3</span> TTNN runtime and the serialized executable</a></li>
-<li><a href="#tt-metal-programs-and-tensix-kernels"><span class="toc-section-number">2.4</span> TT-Metal programs and Tensix kernels</a></li>
-<li><a href="#tiles-memory-and-low-precision-weights"><span class="toc-section-number">2.5</span> Tiles, memory, and low-precision weights</a></li>
-<li><a href="#decode-bottlenecks"><span class="toc-section-number">2.6</span> Decode bottlenecks</a></li>
-</ul></li>
-<li><a href="#optimization-map-by-patch-and-concept"><span class="toc-section-number">3</span> Optimization map by patch and concept</a></li>
-<li><a href="#recovering-model-semantics-in-ttir-and-ttnn"><span class="toc-section-number">4</span> Recovering model semantics in TTIR and TTNN</a>
-<ul>
-<li><a href="#rmsnorm-recognition"><span class="toc-section-number">4.1</span> RMSNorm recognition</a></li>
-<li><a href="#expanded-silu-recognition"><span class="toc-section-number">4.2</span> Expanded-SiLU recognition</a></li>
-<li><a href="#rank-3-rope-and-qkv-projection-structure"><span class="toc-section-number">4.3</span> Rank-3 RoPE and QKV projection structure</a></li>
-<li><a href="#kv-cache-dtype-and-role-propagation"><span class="toc-section-number">4.4</span> KV-cache dtype and role propagation</a></li>
-</ul></li>
-<li><a href="#layout-precision-and-runtime-policy"><span class="toc-section-number">5</span> Layout, precision, and runtime policy</a>
-<ul>
-<li><a href="#bf8-lowering-and-fast-host-packing"><span class="toc-section-number">5.1</span> BF8 lowering and fast host packing</a></li>
-<li><a href="#width-sharded-decode-rmsnorm"><span class="toc-section-number">5.2</span> Width-sharded decode RMSNorm</a></li>
-<li><a href="#decode-specific-validation-changes"><span class="toc-section-number">5.3</span> Decode-specific validation changes</a></li>
-</ul></li>
-<li><a href="#mlp-optimizations"><span class="toc-section-number">6</span> MLP optimizations</a>
-<ul>
-<li><a href="#shared-lhs-gateup-projection"><span class="toc-section-number">6.1</span> Shared-LHS gate/up projection</a></li>
-<li><a href="#consumer-side-silu-fusion"><span class="toc-section-number">6.2</span> Consumer-side SiLU fusion</a></li>
-<li><a href="#dst-resident-matmul-swiglu-epilogue"><span class="toc-section-number">6.3</span> Dst-resident matmul-SwiGLU epilogue</a></li>
-<li><a href="#prefill-coverage-and-fallback-removal"><span class="toc-section-number">6.4</span> Prefill coverage and fallback removal</a></li>
-<li><a href="#swiglu-k-blocking-sweep"><span class="toc-section-number">6.5</span> SwiGLU K-blocking sweep</a></li>
-<li><a href="#core-fused-residual-down-projection"><span class="toc-section-number">6.6</span> 110-core fused-residual down projection</a></li>
-</ul></li>
-<li><a href="#runtime-trace-capture-for-short-prefill"><span class="toc-section-number">7</span> Runtime trace capture for short prefill</a></li>
-<li><a href="#packaging-build-and-startup-patch-concepts"><span class="toc-section-number">8</span> Packaging, build, and startup patch concepts</a></li>
-<li><a href="#benchmark-methodology"><span class="toc-section-number">9</span> Benchmark methodology</a>
-<ul>
-<li><a href="#hardware-and-software"><span class="toc-section-number">9.1</span> Hardware and software</a></li>
-<li><a href="#serving-command"><span class="toc-section-number">9.2</span> Serving command</a></li>
-<li><a href="#request-and-sample-policy"><span class="toc-section-number">9.3</span> Request and sample policy</a></li>
-<li><a href="#reported-statistics"><span class="toc-section-number">9.4</span> Reported statistics</a></li>
-</ul></li>
-<li><a href="#results"><span class="toc-section-number">10</span> Results</a>
-<ul>
-<li><a href="#established-concept-sequence"><span class="toc-section-number">10.1</span> Established concept sequence</a></li>
-<li><a href="#current-kernel-ab-experiments"><span class="toc-section-number">10.2</span> Current kernel A/B experiments</a></li>
-<li><a href="#device-profile-of-the-down-projection"><span class="toc-section-number">10.3</span> Device profile of the down projection</a></li>
-<li><a href="#upstream-tt-inference-server-reference"><span class="toc-section-number">10.4</span> Upstream tt-inference-server reference</a></li>
-<li><a href="#correctness-and-numeric-behavior"><span class="toc-section-number">10.5</span> Correctness and numeric behavior</a></li>
-</ul></li>
-<li><a href="#engineering-rules"><span class="toc-section-number">11</span> Engineering rules</a>
-<ul>
-<li><a href="#match-the-abstraction-to-the-information"><span class="toc-section-number">11.1</span> Match the abstraction to the information</a></li>
-<li><a href="#name-the-removed-boundary"><span class="toc-section-number">11.2</span> Name the removed boundary</a></li>
-<li><a href="#down-projection-geometry"><span class="toc-section-number">11.3</span> Down-projection geometry</a></li>
-<li><a href="#keep-negative-results"><span class="toc-section-number">11.4</span> Keep negative results</a></li>
-</ul></li>
-<li><a href="#limitations-and-follow-up-work"><span class="toc-section-number">12</span> Limitations and follow-up work</a></li>
-<li><a href="#conclusion"><span class="toc-section-number">13</span> Conclusion</a></li>
-<li><a href="#bibliography">Bibliography</a></li>
-</ul>
-</nav>
 <h1 class="unnumbered" data-number id="abstract">Abstract</h1>
-<p>libtt packages the Tenstorrent JAX stack as one PJRT shared library. Its goal is to run SGLang-JAX [21] and the broader JAX/TPU software ecosystem with few or no changes above the compiler boundary. It builds and pins TT-XLA [1], TT-MLIR [2], TTNN [3], TT-Metalium [4], device kernels, and runtime assets in <code>libtt.so</code>. The target needs compatible drivers and firmware, but no separate compiler or TT-Metal installation.</p>
-<p>This approach has two advantages. libtt can stay close to upstream SGLang-JAX instead of reimplementing the model or inference engine, and it can recover performance below that boundary through StableHLO/MLIR transformations, runtime policy, and device kernels. The same boundary can support training in the future, although this report measures inference only. The report maps the changes to the TT-MLIR IR levels, runtime, and kernels where they are made.</p>
-<p>The report follows that development sequence. A functional baseline first runs upstream SGLang-JAX at 16.265 tokens/s. Compiler, runtime, and kernel patches raise end-to-end throughput to 26.123 tokens/s (+60.61%). A 110-core down projection then reaches 27.753 decode tokens/s. Against a matched 32-sample tt-inference-server v0.10.0 run [25], current libtt is 11.51% faster in pure decode and 11.48% faster end to end.</p>
-<h1 class="unnumbered" data-number id="executive-summary">Executive summary</h1>
-<p><code>libtt.so</code> contains the TT-XLA PJRT implementation, TT-MLIR compiler, TTNN and TT-Metal runtime code, and a compressed archive of TT-Metal runtime assets. It extracts the archive on first load. This deployment model resembles Google’s <code>libtpu.so</code>, which contains the TPU compiler, driver, and hardware communication code [7].</p>
-<p>One Bazel build pins the source revisions, applies the patch series, and builds the shared library. Its tools and dependencies are explicit inputs, following Bazel’s definition of a hermetic build [8]. A compiler rewrite, runtime change, and device kernel can therefore be built and benchmarked together.</p>
-<p>The upper stack remains close to upstream SGLang-JAX and its JAX/TPU-oriented interfaces. This avoids a separate Tenstorrent model implementation and major changes to the scheduler or inference engine. Performance work instead happens in TT-MLIR, TTNN, TT-Metal, and the compiled graph.</p>
-<p>The measurements follow the implementation sequence. V0 is a functional, relatively unoptimized backend that runs upstream SGLang-JAX. V1 through V9 add compiler, runtime, and kernel optimizations while keeping the upper stack largely unchanged. The final comparison uses the optimized backend against the TTIS reference stack.</p>
-<p>The measured work supports six conclusions:</p>
-<ol type="1">
-<li><strong>Recover model semantics before lowering.</strong> TTIR and TTNN patterns recover RMSNorm, SiLU, and QKV structure from primitive JAX operations. The foundation group adds 22.58%; SiLU recognition adds 3.30%; QKV fusion adds 1.15%.</li>
-<li><strong>Use the runtime for shape-dependent layouts.</strong> Width-sharding one-token RMSNorm across 16 cores adds 13.61%.</li>
-<li><strong>Fuse at the producer boundary.</strong> Combining gate/up matmuls alone changes throughput by -1.69%. Consumer-side SiLU fusion changes it by -0.65%. A matmul-SwiGLU epilogue that keeps both results in Dst adds 2.73%.</li>
-<li><strong>Measure blocking choices.</strong> Increasing the SwiGLU K block from two to four tiles changes throughput by +0.27%, so two remains the default.</li>
-<li><strong>Use more cores without rereading weights.</strong> The 110-core down projection raises effective BFP8 bandwidth from 246.2 to 345.2 GB/s, cuts kernel time by 28.7%, and adds 5.96% pure decode throughput.</li>
-<li><strong>Trace short prefill.</strong> Capturing the one-tile prefill graph reduces mean time to first token from 618.84 to 59.15 ms and improves the primary 128-token benchmark by 10.23%. Pure decode changes by +0.36%.</li>
-</ol>
-<p>The current build reaches 27.753 decode tokens/s and 27.619 streaming end-to-end tokens/s. The matched TTIS reference, which uses TT-specific transformer and inference-engine layers, reaches 24.887 and 24.776 tokens/s, respectively.</p>
+<p>libtt packages a Tenstorrent PJRT backend, compiler, runtime, device kernels, and runtime assets in one shared library. It runs upstream SGLang-JAX and other JAX software without a separate compiler or TT-Metal installation on the target. We describe the StableHLO and TT-MLIR compilation path and a sequence of graph, layout, runtime, and kernel optimizations for Qwen3-8B inference. The sequence raises 128-token generation from 16.265 to 26.123 tokens/s. A shape-specific down projection reaches 27.753 decode tokens/s. On the same Blackhole P150 and workload, this is 11.51% faster than the measured tt-inference-server reference. These results show that a stable framework boundary can preserve the upstream JAX stack while concentrating performance work in the compiler and lower runtime. The architecture is not specific to inference and can support training as its operation and collective coverage grows.</p>
+<h1 data-number="1" id="introduction"><span class="header-section-number">1</span> Introduction</h1>
+<p>libtt provides a self-contained JAX runtime for Tenstorrent accelerators. Its integration boundary is PJRT [3] and StableHLO [4]: SGLang-JAX retains its tokenizer, scheduler, model, and paged KV cache, while libtt compiles and executes the resulting graphs. This arrangement is intended to support SGLang-JAX [5] and the broader JAX/TPU software ecosystem with few changes above the compiler boundary.</p>
+<p>The boundary has two practical advantages. First, we can follow upstream JAX and SGLang-JAX instead of maintaining a separate Tenstorrent model and inference engine. Second, we can obtain performance in TT-MLIR [17], TTNN [20], TT-Metalium [15], and device kernels, where graph structure, layout, precision, and data movement remain visible. The same boundary can carry training graphs in the future; this report measures inference only.</p>
+<p>We began with a functional but relatively unoptimized backend that ran upstream SGLang-JAX at 16.265 tokens/s. We then added semantic recovery, layout policy, runtime tracing, and device-kernel specializations below PJRT. The established sequence reaches 26.123 tokens/s, a 60.61% increase. A subsequent 110-core down projection reaches 27.753 decode tokens/s and exceeds the matched tt-inference-server v0.10.0 decode result by 11.51% [14].</p>
+<p>The main result is architectural as well as numerical. A compiler rewrite, runtime change, and device kernel can be developed and measured together in one build without modifying the SGLang scheduler or Qwen model [24]. The following sections describe the system boundary, the compiler and runtime representations, the individual optimizations, and their measured effects.</p>
 <figure>
-<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTIwIiBoZWlnaHQ9IjY1MCIgdmlld0JveD0iMCAwIDExMjAgNjUwIj4KICA8ZGVmcz4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iaG9zdCIgeDE9IjAiIHgyPSIxIj4KICAgICAgPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZTdmNWYzIi8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjZDhlYmY0Ii8+CiAgICA8L2xpbmVhckdyYWRpZW50PgogICAgPGxpbmVhckdyYWRpZW50IGlkPSJwbHVnaW4iIHgxPSIwIiB4Mj0iMSI+CiAgICAgIDxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iI2Y1ZmJmYSIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iI2VlZjVmOSIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iZGV2aWNlIiB4MT0iMCIgeDI9IjEiPgogICAgICA8c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNmZmYyZGYiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiNmZGUyZGMiLz4KICAgIDwvbGluZWFyR3JhZGllbnQ+CiAgICA8bWFya2VyIGlkPSJhcnJvdyIgbWFya2VyV2lkdGg9IjgiIG1hcmtlckhlaWdodD0iOCIgcmVmWD0iNyIgcmVmWT0iNCIgb3JpZW50PSJhdXRvIj4KICAgICAgPHBhdGggZD0iTTAsMCBMOCw0IEwwLDggWiIgZmlsbD0iIzUzNjU3YSIvPgogICAgPC9tYXJrZXI+CiAgPC9kZWZzPgogIDxzdHlsZT4KICAgIHRleHR7Zm9udC1mYW1pbHk6SW50ZXIsSGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTcyMDMzfQogICAgLnRpdGxle2ZvbnQtc2l6ZToyMnB4O2ZvbnQtd2VpZ2h0OjcwMH0ubmFtZXtmb250LXNpemU6MTZweDtmb250LXdlaWdodDo3MDB9CiAgICAuYm9keXtmb250LXNpemU6MTIuNXB4O2ZpbGw6IzUyNjE3NH0uc21hbGx7Zm9udC1zaXplOjExLjVweDtmaWxsOiM1MjYxNzR9CiAgICAuYm94e3N0cm9rZTojOGFhMGI1O3N0cm9rZS13aWR0aDoxLjM1O3J4OjEwfS5hcnJvd3tzdHJva2U6IzUzNjU3YTtzdHJva2Utd2lkdGg6MjttYXJrZXItZW5kOnVybCgjYXJyb3cpfQogICAgLmJyYW5jaHtzdHJva2U6IzgzOTVhNztzdHJva2Utd2lkdGg6MS42O3N0cm9rZS1kYXNoYXJyYXk6NiA1O21hcmtlci1lbmQ6dXJsKCNhcnJvdyl9CiAgICAuYmFuZHtmb250LXNpemU6MTNweDtmb250LXdlaWdodDo3MDA7bGV0dGVyLXNwYWNpbmc6LjhweDtmaWxsOiMwMDZkNzd9CiAgICAuYm91bmRhcnl7Zm9udC1zaXplOjE1cHg7Zm9udC13ZWlnaHQ6NzAwO2ZpbGw6IzAwNmQ3N30KICA8L3N0eWxlPgogIDxyZWN0IHdpZHRoPSIxMTIwIiBoZWlnaHQ9IjY1MCIgZmlsbD0iI2ZmZiIvPgogIDx0ZXh0IHg9IjM1IiB5PSIzMCIgY2xhc3M9InRpdGxlIj5saWJ0dDogb25lIFBKUlQgYXJ0aWZhY3QgZnJvbSBmcmFtZXdvcmsgSVIgdG8gVGVuc2l4IGV4ZWN1dGlvbjwvdGV4dD4KCiAgPHRleHQgeD0iMzUiIHk9IjYxIiBjbGFzcz0iYmFuZCI+VVBTVFJFQU0gRlJPTlRFTkQgwrcgT1VUU0lERSBMSUJUVCDCtyBMQVJHRUxZIFVOQ0hBTkdFRDwvdGV4dD4KICA8cmVjdCB4PSIzNSIgeT0iNzYiIHdpZHRoPSIyMjUiIGhlaWdodD0iNzIiIGNsYXNzPSJib3giIGZpbGw9InVybCgjaG9zdCkiLz4KICA8dGV4dCB4PSIxNDciIHk9IjEwMyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlNHTGFuZy1KQVg8L3RleHQ+CiAgPHRleHQgeD0iMTQ3IiB5PSIxMjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5zZXJ2aW5nIMK3IHNjaGVkdWxpbmcgwrcgUXdlbiBtb2RlbCDCtyBLViBjYWNoZTwvdGV4dD4KICA8cmVjdCB4PSIyOTUiIHk9Ijc2IiB3aWR0aD0iMjA1IiBoZWlnaHQ9IjcyIiBjbGFzcz0iYm94IiBmaWxsPSJ1cmwoI2hvc3QpIi8+CiAgPHRleHQgeD0iMzk3IiB5PSIxMDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5KQVg8L3RleHQ+CiAgPHRleHQgeD0iMzk3IiB5PSIxMjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5zaGFwZSB0cmFjaW5nIMK3IFN0YWJsZUhMTyBleHBvcnQ8L3RleHQ+CiAgPGxpbmUgeDE9IjI2MCIgeTE9IjExMiIgeDI9IjI4OCIgeTI9IjExMiIgY2xhc3M9ImFycm93Ii8+CgogIDxyZWN0IHg9IjI1IiB5PSIxNzUiIHdpZHRoPSIxMDcwIiBoZWlnaHQ9IjMxNiIgcng9IjE4IiBmaWxsPSJ1cmwoI3BsdWdpbikiIHN0cm9rZT0iIzAwNmQ3NyIgc3Ryb2tlLXdpZHRoPSIyIi8+CiAgPHRleHQgeD0iNDgiIHk9IjIwMiIgY2xhc3M9ImJvdW5kYXJ5Ij5saWJ0dC5zbyDCtyBwaW5uZWQgY29tcGlsZXIsIHJ1bnRpbWUsIGtlcm5lbHMsIGFuZCBlbWJlZGRlZCBUVC1NZXRhbCBhc3NldHM8L3RleHQ+CgogIDx0ZXh0IHg9IjQ4IiB5PSIyMzIiIGNsYXNzPSJiYW5kIj5DT01QSUxFIFBBVEggwrcgVFQtWExBIEFORCBUVC1NTElSPC90ZXh0PgogIDxyZWN0IHg9IjQ4IiB5PSIyNDciIHdpZHRoPSIxNTAiIGhlaWdodD0iODIiIGNsYXNzPSJib3giIGZpbGw9IiNmZmZmZmYiLz4KICA8dGV4dCB4PSIxMjMiIHk9IjI3NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlBKUlQgLyBUVC1YTEE8L3RleHQ+CiAgPHRleHQgeD0iMTIzIiB5PSIyOTciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5wbHVnaW4gQVBJPC90ZXh0PgogIDx0ZXh0IHg9IjEyMyIgeT0iMzE1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+U3RhYmxlSExPIGltcG9ydDwvdGV4dD4KCiAgPHJlY3QgeD0iMjMwIiB5PSIyNDciIHdpZHRoPSIxMzAiIGhlaWdodD0iODIiIGNsYXNzPSJib3giIGZpbGw9IiNmZmZmZmYiLz4KICA8dGV4dCB4PSIyOTUiIHk9IjI3NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlRUSVI8L3RleHQ+CiAgPHRleHQgeD0iMjk1IiB5PSIyOTciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij50ZW5zb3Igc2VtYW50aWNzPC90ZXh0PgogIDx0ZXh0IHg9IjI5NSIgeT0iMzE1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+Z3JhcGggZnVzaW9uPC90ZXh0PgoKICA8cmVjdCB4PSIzOTIiIHk9IjI0NyIgd2lkdGg9IjE0NSIgaGVpZ2h0PSI4MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjQ2NCIgeT0iMjc0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+VFROTiBkaWFsZWN0PC90ZXh0PgogIDx0ZXh0IHg9IjQ2NCIgeT0iMjk3IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+b3BzIMK3IGR0eXBlIMK3IGxheW91dDwvdGV4dD4KICA8dGV4dCB4PSI0NjQiIHk9IjMxNSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnJ1bnRpbWUgY29udHJhY3Q8L3RleHQ+CgogIDxyZWN0IHg9IjU2OSIgeT0iMjQ3IiB3aWR0aD0iMTUwIiBoZWlnaHQ9IjgyIiBjbGFzcz0iYm94IiBmaWxsPSIjZmZmZmZmIi8+CiAgPHRleHQgeD0iNjQ0IiB5PSIyNzQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVE5OIEZsYXRCdWZmZXI8L3RleHQ+CiAgPHRleHQgeD0iNjQ0IiB5PSIyOTciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5zZXJpYWxpemVkIGV4ZWN1dGFibGU8L3RleHQ+CiAgPHRleHQgeD0iNjQ0IiB5PSIzMTUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5tZWFzdXJlZCBwYXRoPC90ZXh0PgoKICA8bGluZSB4MT0iMTk4IiB5MT0iMjg4IiB4Mj0iMjIzIiB5Mj0iMjg4IiBjbGFzcz0iYXJyb3ciLz4KICA8bGluZSB4MT0iMzYwIiB5MT0iMjg4IiB4Mj0iMzg1IiB5Mj0iMjg4IiBjbGFzcz0iYXJyb3ciLz4KICA8bGluZSB4MT0iNTM3IiB5MT0iMjg4IiB4Mj0iNTYyIiB5Mj0iMjg4IiBjbGFzcz0iYXJyb3ciLz4KCiAgPHJlY3QgeD0iNzY1IiB5PSIyMzkiIHdpZHRoPSIzMDAiIGhlaWdodD0iOTgiIGNsYXNzPSJib3giIGZpbGw9IiNmN2Y3ZjgiLz4KICA8dGV4dCB4PSI5MTUiIHk9IjI2NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPkRpcmVjdC10by1NZXRhbCBicmFuY2g8L3RleHQ+CiAgPHRleHQgeD0iOTE1IiB5PSIyODciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5EMk0g4oaSIFRUS2VybmVsICsgVFRNZXRhbDwvdGV4dD4KICA8dGV4dCB4PSI5MTUiIHk9IjMwNyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5nZW5lcmljIHRpbGVkIGNvbXB1dGUg4oaSIGRldmljZS9ob3N0IElSPC90ZXh0PgogIDx0ZXh0IHg9IjkxNSIgeT0iMzI0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPm5vdCB1c2VkIGJ5IHRoZSBtZWFzdXJlZCBoYW5kLXdyaXR0ZW4ga2VybmVsczwvdGV4dD4KICA8cGF0aCBkPSJNMjk1IDMyOSBMMjk1IDM1MiBMNzQ1IDM1MiBMNzQ1IDI4OCBMNzU4IDI4OCIgZmlsbD0ibm9uZSIgY2xhc3M9ImJyYW5jaCIvPgoKICA8dGV4dCB4PSI0OCIgeT0iMzgwIiBjbGFzcz0iYmFuZCI+RVhFQ1VUSU9OIFBBVEggwrcgRU1CRURERUQgVFROTiBBTkQgVFQtTUVUQUwgUlVOVElNRTwvdGV4dD4KICA8cmVjdCB4PSI0OCIgeT0iMzk0IiB3aWR0aD0iMTk1IiBoZWlnaHQ9IjcyIiBjbGFzcz0iYm94IiBmaWxsPSIjZmZmZmZmIi8+CiAgPHRleHQgeD0iMTQ1IiB5PSI0MjEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVE5OIHJ1bnRpbWU8L3RleHQ+CiAgPHRleHQgeD0iMTQ1IiB5PSI0NDQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5kZXNlcmlhbGl6ZSDCtyB0ZW5zb3IgcG9saWN5IMK3IHRyYWNlPC90ZXh0PgoKICA8cmVjdCB4PSIyNzciIHk9IjM5NCIgd2lkdGg9IjIxMCIgaGVpZ2h0PSI3MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjM4MiIgeT0iNDIxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+UHJvZ3JhbSBmYWN0b3JpZXM8L3RleHQ+CiAgPHRleHQgeD0iMzgyIiB5PSI0NDQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5ndWFyZHMgwrcgY29yZSBncmlkcyDCtyBjaXJjdWxhciBidWZmZXJzPC90ZXh0PgoKICA8cmVjdCB4PSI1MjEiIHk9IjM5NCIgd2lkdGg9IjIwNSIgaGVpZ2h0PSI3MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjYyMyIgeT0iNDIxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+VFQtTWV0YWwgcnVudGltZTwvdGV4dD4KICA8dGV4dCB4PSI2MjMiIHk9IjQ0NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnF1ZXVlcyDCtyBwcm9ncmFtcyDCtyBOb0MgYXJndW1lbnRzPC90ZXh0PgoKICA8cmVjdCB4PSI3NjAiIHk9IjM5NCIgd2lkdGg9IjMwNSIgaGVpZ2h0PSI3MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjkxMiIgeT0iNDIxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+UmVhZGVyIMK3IGNvbXB1dGUgwrcgd3JpdGVyIGtlcm5lbHM8L3RleHQ+CiAgPHRleHQgeD0iOTEyIiB5PSI0NDQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5oYW5kLXdyaXR0ZW4gQysrIGNvbXBpbGVkIGludG8gdGhlIGFydGlmYWN0PC90ZXh0PgoKICA8cGF0aCBkPSJNNjQ0IDMyOSBMNjQ0IDM2NSBMMTQ1IDM2NSBMMTQ1IDM4NyIgZmlsbD0ibm9uZSIgY2xhc3M9ImFycm93Ii8+CiAgPGxpbmUgeDE9IjI0MyIgeTE9IjQzMCIgeDI9IjI3MCIgeTI9IjQzMCIgY2xhc3M9ImFycm93Ii8+CiAgPGxpbmUgeDE9IjQ4NyIgeTE9IjQzMCIgeDI9IjUxNCIgeTI9IjQzMCIgY2xhc3M9ImFycm93Ii8+CiAgPGxpbmUgeDE9IjcyNiIgeTE9IjQzMCIgeDI9Ijc1MyIgeTI9IjQzMCIgY2xhc3M9ImFycm93Ii8+CgogIDx0ZXh0IHg9IjM1IiB5PSI1MjgiIGNsYXNzPSJiYW5kIj5CTEFDS0hPTEUgREVWSUNFPC90ZXh0PgogIDxyZWN0IHg9IjM1IiB5PSI1NDQiIHdpZHRoPSIxMDUwIiBoZWlnaHQ9IjgyIiByeD0iMTQiIGZpbGw9InVybCgjZGV2aWNlKSIgc3Ryb2tlPSIjYzk5Yjg0IiBzdHJva2Utd2lkdGg9IjEuNSIvPgogIDx0ZXh0IHg9IjE1NSIgeT0iNTc0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+R0REUjYgRFJBTTwvdGV4dD4KICA8dGV4dCB4PSIxNTUiIHk9IjU5OSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPndlaWdodHMgwrcgcGVyc2lzdGVudCB0ZW5zb3JzPC90ZXh0PgogIDx0ZXh0IHg9IjQzNSIgeT0iNTc0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+MkQgTm9DICsgcGVyLWNvcmUgTDE8L3RleHQ+CiAgPHRleHQgeD0iNDM1IiB5PSI1OTkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5tdWx0aWNhc3QgwrcgY2lyY3VsYXIgYnVmZmVycyDCtyBzaGFyZHM8L3RleHQ+CiAgPHRleHQgeD0iNzc1IiB5PSI1NzQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UZW5zaXggZW5naW5lczwvdGV4dD4KICA8dGV4dCB4PSI3NzUiIHk9IjU5OSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnVucGFja2VyIMK3IG1hdHJpeC92ZWN0b3IgwrcgRHN0IMK3IHBhY2tlcjwvdGV4dD4KICA8dGV4dCB4PSIxMDAwIiB5PSI1NzQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj4xMjAgd29ya2VyczwvdGV4dD4KICA8dGV4dCB4PSIxMDAwIiB5PSI1OTkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5QMTUwIGZpcm13YXJlIGNvbmZpZ3VyYXRpb248L3RleHQ+CiAgPHBhdGggZD0iTTkxMiA0NjYgTDkxMiA1MTUgTDc3NSA1MTUgTDc3NSA1MzciIGZpbGw9Im5vbmUiIGNsYXNzPSJhcnJvdyIvPgo8L3N2Zz4K" id="fig:stack" style="width:100.0%" alt /><figcaption>libtt’s serving, compilation, runtime, and device layers.</figcaption>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTIwIiBoZWlnaHQ9IjY1MCIgdmlld0JveD0iMCAwIDExMjAgNjUwIj4KICA8ZGVmcz4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iaG9zdCIgeDE9IjAiIHgyPSIxIj4KICAgICAgPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZjVmNWY1Ii8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjZThlOGU4Ii8+CiAgICA8L2xpbmVhckdyYWRpZW50PgogICAgPGxpbmVhckdyYWRpZW50IGlkPSJwbHVnaW4iIHgxPSIwIiB4Mj0iMSI+CiAgICAgIDxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iI2ZmZmZmZiIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iI2YwZjBmMCIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iZGV2aWNlIiB4MT0iMCIgeDI9IjEiPgogICAgICA8c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNlZWVlZWUiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiNkOGQ4ZDgiLz4KICAgIDwvbGluZWFyR3JhZGllbnQ+CiAgICA8bWFya2VyIGlkPSJhcnJvdyIgbWFya2VyV2lkdGg9IjgiIG1hcmtlckhlaWdodD0iOCIgcmVmWD0iNyIgcmVmWT0iNCIgb3JpZW50PSJhdXRvIj4KICAgICAgPHBhdGggZD0iTTAsMCBMOCw0IEwwLDggWiIgZmlsbD0iIzQ0NDQ0NCIvPgogICAgPC9tYXJrZXI+CiAgPC9kZWZzPgogIDxzdHlsZT4KICAgIHRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExMTExfQogICAgLnRpdGxle2ZvbnQtc2l6ZToyMnB4O2ZvbnQtd2VpZ2h0OjcwMH0ubmFtZXtmb250LXNpemU6MTZweDtmb250LXdlaWdodDo3MDB9CiAgICAuYm9keXtmb250LXNpemU6MTIuNXB4O2ZpbGw6IzQ0NDQ0NH0uc21hbGx7Zm9udC1zaXplOjExLjVweDtmaWxsOiM0NDQ0NDR9CiAgICAuYm94e3N0cm9rZTojNzc3Nzc3O3N0cm9rZS13aWR0aDoxLjM1O3J4OjEwfS5hcnJvd3tzdHJva2U6IzQ0NDQ0NDtzdHJva2Utd2lkdGg6MjttYXJrZXItZW5kOnVybCgjYXJyb3cpfQogICAgLmJyYW5jaHtzdHJva2U6Izc3Nzc3NztzdHJva2Utd2lkdGg6MS42O3N0cm9rZS1kYXNoYXJyYXk6NiA1O21hcmtlci1lbmQ6dXJsKCNhcnJvdyl9CiAgICAuYmFuZHtmb250LXNpemU6MTNweDtmb250LXdlaWdodDo3MDA7bGV0dGVyLXNwYWNpbmc6LjhweDtmaWxsOiMxMTExMTF9CiAgICAuYm91bmRhcnl7Zm9udC1zaXplOjE1cHg7Zm9udC13ZWlnaHQ6NzAwO2ZpbGw6IzExMTExMX0KICA8L3N0eWxlPgogIDxyZWN0IHdpZHRoPSIxMTIwIiBoZWlnaHQ9IjY1MCIgZmlsbD0iI2ZmZiIvPgogIDx0ZXh0IHg9IjM1IiB5PSIzMCIgY2xhc3M9InRpdGxlIj5saWJ0dDogb25lIFBKUlQgYXJ0aWZhY3QgZnJvbSBmcmFtZXdvcmsgSVIgdG8gVGVuc2l4IGV4ZWN1dGlvbjwvdGV4dD4KCiAgPHRleHQgeD0iMzUiIHk9IjYxIiBjbGFzcz0iYmFuZCI+VVBTVFJFQU0gRlJPTlRFTkQgwrcgT1VUU0lERSBMSUJUVCDCtyBMQVJHRUxZIFVOQ0hBTkdFRDwvdGV4dD4KICA8cmVjdCB4PSIzNSIgeT0iNzYiIHdpZHRoPSIyMjUiIGhlaWdodD0iNzIiIGNsYXNzPSJib3giIGZpbGw9InVybCgjaG9zdCkiLz4KICA8dGV4dCB4PSIxNDciIHk9IjEwMyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlNHTGFuZy1KQVg8L3RleHQ+CiAgPHRleHQgeD0iMTQ3IiB5PSIxMjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5zZXJ2aW5nIMK3IHNjaGVkdWxpbmcgwrcgUXdlbiBtb2RlbCDCtyBLViBjYWNoZTwvdGV4dD4KICA8cmVjdCB4PSIyOTUiIHk9Ijc2IiB3aWR0aD0iMjA1IiBoZWlnaHQ9IjcyIiBjbGFzcz0iYm94IiBmaWxsPSJ1cmwoI2hvc3QpIi8+CiAgPHRleHQgeD0iMzk3IiB5PSIxMDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5KQVg8L3RleHQ+CiAgPHRleHQgeD0iMzk3IiB5PSIxMjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5zaGFwZSB0cmFjaW5nIMK3IFN0YWJsZUhMTyBleHBvcnQ8L3RleHQ+CiAgPGxpbmUgeDE9IjI2MCIgeTE9IjExMiIgeDI9IjI4OCIgeTI9IjExMiIgY2xhc3M9ImFycm93Ii8+CgogIDxyZWN0IHg9IjI1IiB5PSIxNzUiIHdpZHRoPSIxMDcwIiBoZWlnaHQ9IjMxNiIgcng9IjE4IiBmaWxsPSJ1cmwoI3BsdWdpbikiIHN0cm9rZT0iIzMzMzMzMyIgc3Ryb2tlLXdpZHRoPSIyIi8+CiAgPHRleHQgeD0iNDgiIHk9IjIwMiIgY2xhc3M9ImJvdW5kYXJ5Ij5saWJ0dC5zbyDCtyBwaW5uZWQgY29tcGlsZXIsIHJ1bnRpbWUsIGtlcm5lbHMsIGFuZCBlbWJlZGRlZCBUVC1NZXRhbCBhc3NldHM8L3RleHQ+CgogIDx0ZXh0IHg9IjQ4IiB5PSIyMzIiIGNsYXNzPSJiYW5kIj5DT01QSUxFIFBBVEggwrcgVFQtWExBIEFORCBUVC1NTElSPC90ZXh0PgogIDxyZWN0IHg9IjQ4IiB5PSIyNDciIHdpZHRoPSIxNTAiIGhlaWdodD0iODIiIGNsYXNzPSJib3giIGZpbGw9IiNmZmZmZmYiLz4KICA8dGV4dCB4PSIxMjMiIHk9IjI3NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlBKUlQgLyBUVC1YTEE8L3RleHQ+CiAgPHRleHQgeD0iMTIzIiB5PSIyOTciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5wbHVnaW4gQVBJPC90ZXh0PgogIDx0ZXh0IHg9IjEyMyIgeT0iMzE1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+U3RhYmxlSExPIGltcG9ydDwvdGV4dD4KCiAgPHJlY3QgeD0iMjMwIiB5PSIyNDciIHdpZHRoPSIxMzAiIGhlaWdodD0iODIiIGNsYXNzPSJib3giIGZpbGw9IiNmZmZmZmYiLz4KICA8dGV4dCB4PSIyOTUiIHk9IjI3NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlRUSVI8L3RleHQ+CiAgPHRleHQgeD0iMjk1IiB5PSIyOTciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij50ZW5zb3Igc2VtYW50aWNzPC90ZXh0PgogIDx0ZXh0IHg9IjI5NSIgeT0iMzE1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+Z3JhcGggZnVzaW9uPC90ZXh0PgoKICA8cmVjdCB4PSIzOTIiIHk9IjI0NyIgd2lkdGg9IjE0NSIgaGVpZ2h0PSI4MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjQ2NCIgeT0iMjc0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+VFROTiBkaWFsZWN0PC90ZXh0PgogIDx0ZXh0IHg9IjQ2NCIgeT0iMjk3IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+b3BzIMK3IGR0eXBlIMK3IGxheW91dDwvdGV4dD4KICA8dGV4dCB4PSI0NjQiIHk9IjMxNSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnJ1bnRpbWUgY29udHJhY3Q8L3RleHQ+CgogIDxyZWN0IHg9IjU2OSIgeT0iMjQ3IiB3aWR0aD0iMTUwIiBoZWlnaHQ9IjgyIiBjbGFzcz0iYm94IiBmaWxsPSIjZmZmZmZmIi8+CiAgPHRleHQgeD0iNjQ0IiB5PSIyNzQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVE5OIEZsYXRCdWZmZXI8L3RleHQ+CiAgPHRleHQgeD0iNjQ0IiB5PSIyOTciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5zZXJpYWxpemVkIGV4ZWN1dGFibGU8L3RleHQ+CiAgPHRleHQgeD0iNjQ0IiB5PSIzMTUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5tZWFzdXJlZCBwYXRoPC90ZXh0PgoKICA8bGluZSB4MT0iMTk4IiB5MT0iMjg4IiB4Mj0iMjIzIiB5Mj0iMjg4IiBjbGFzcz0iYXJyb3ciLz4KICA8bGluZSB4MT0iMzYwIiB5MT0iMjg4IiB4Mj0iMzg1IiB5Mj0iMjg4IiBjbGFzcz0iYXJyb3ciLz4KICA8bGluZSB4MT0iNTM3IiB5MT0iMjg4IiB4Mj0iNTYyIiB5Mj0iMjg4IiBjbGFzcz0iYXJyb3ciLz4KCiAgPHJlY3QgeD0iNzY1IiB5PSIyMzkiIHdpZHRoPSIzMDAiIGhlaWdodD0iOTgiIGNsYXNzPSJib3giIGZpbGw9IiNmN2Y3ZjciLz4KICA8dGV4dCB4PSI5MTUiIHk9IjI2NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPkRpcmVjdC10by1NZXRhbCBicmFuY2g8L3RleHQ+CiAgPHRleHQgeD0iOTE1IiB5PSIyODciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5EMk0g4oaSIFRUS2VybmVsICsgVFRNZXRhbDwvdGV4dD4KICA8dGV4dCB4PSI5MTUiIHk9IjMwNyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5nZW5lcmljIHRpbGVkIGNvbXB1dGUg4oaSIGRldmljZS9ob3N0IElSPC90ZXh0PgogIDx0ZXh0IHg9IjkxNSIgeT0iMzI0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPm5vdCB1c2VkIGJ5IHRoZSBtZWFzdXJlZCBoYW5kLXdyaXR0ZW4ga2VybmVsczwvdGV4dD4KICA8cGF0aCBkPSJNMjk1IDMyOSBMMjk1IDM1MiBMNzQ1IDM1MiBMNzQ1IDI4OCBMNzU4IDI4OCIgZmlsbD0ibm9uZSIgY2xhc3M9ImJyYW5jaCIvPgoKICA8dGV4dCB4PSI0OCIgeT0iMzgwIiBjbGFzcz0iYmFuZCI+RVhFQ1VUSU9OIFBBVEggwrcgRU1CRURERUQgVFROTiBBTkQgVFQtTUVUQUwgUlVOVElNRTwvdGV4dD4KICA8cmVjdCB4PSI0OCIgeT0iMzk0IiB3aWR0aD0iMTk1IiBoZWlnaHQ9IjcyIiBjbGFzcz0iYm94IiBmaWxsPSIjZmZmZmZmIi8+CiAgPHRleHQgeD0iMTQ1IiB5PSI0MjEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVE5OIHJ1bnRpbWU8L3RleHQ+CiAgPHRleHQgeD0iMTQ1IiB5PSI0NDQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5kZXNlcmlhbGl6ZSDCtyB0ZW5zb3IgcG9saWN5IMK3IHRyYWNlPC90ZXh0PgoKICA8cmVjdCB4PSIyNzciIHk9IjM5NCIgd2lkdGg9IjIxMCIgaGVpZ2h0PSI3MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjM4MiIgeT0iNDIxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+UHJvZ3JhbSBmYWN0b3JpZXM8L3RleHQ+CiAgPHRleHQgeD0iMzgyIiB5PSI0NDQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5ndWFyZHMgwrcgY29yZSBncmlkcyDCtyBjaXJjdWxhciBidWZmZXJzPC90ZXh0PgoKICA8cmVjdCB4PSI1MjEiIHk9IjM5NCIgd2lkdGg9IjIwNSIgaGVpZ2h0PSI3MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjYyMyIgeT0iNDIxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+VFQtTWV0YWwgcnVudGltZTwvdGV4dD4KICA8dGV4dCB4PSI2MjMiIHk9IjQ0NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnF1ZXVlcyDCtyBwcm9ncmFtcyDCtyBOb0MgYXJndW1lbnRzPC90ZXh0PgoKICA8cmVjdCB4PSI3NjAiIHk9IjM5NCIgd2lkdGg9IjMwNSIgaGVpZ2h0PSI3MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjkxMiIgeT0iNDIxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+UmVhZGVyIMK3IGNvbXB1dGUgwrcgd3JpdGVyIGtlcm5lbHM8L3RleHQ+CiAgPHRleHQgeD0iOTEyIiB5PSI0NDQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5oYW5kLXdyaXR0ZW4gQysrIGNvbXBpbGVkIGludG8gdGhlIGFydGlmYWN0PC90ZXh0PgoKICA8cGF0aCBkPSJNNjQ0IDMyOSBMNjQ0IDM2NSBMMTQ1IDM2NSBMMTQ1IDM4NyIgZmlsbD0ibm9uZSIgY2xhc3M9ImFycm93Ii8+CiAgPGxpbmUgeDE9IjI0MyIgeTE9IjQzMCIgeDI9IjI3MCIgeTI9IjQzMCIgY2xhc3M9ImFycm93Ii8+CiAgPGxpbmUgeDE9IjQ4NyIgeTE9IjQzMCIgeDI9IjUxNCIgeTI9IjQzMCIgY2xhc3M9ImFycm93Ii8+CiAgPGxpbmUgeDE9IjcyNiIgeTE9IjQzMCIgeDI9Ijc1MyIgeTI9IjQzMCIgY2xhc3M9ImFycm93Ii8+CgogIDx0ZXh0IHg9IjM1IiB5PSI1MjgiIGNsYXNzPSJiYW5kIj5CTEFDS0hPTEUgREVWSUNFPC90ZXh0PgogIDxyZWN0IHg9IjM1IiB5PSI1NDQiIHdpZHRoPSIxMDUwIiBoZWlnaHQ9IjgyIiByeD0iMTQiIGZpbGw9InVybCgjZGV2aWNlKSIgc3Ryb2tlPSIjNzc3Nzc3IiBzdHJva2Utd2lkdGg9IjEuNSIvPgogIDx0ZXh0IHg9IjE1NSIgeT0iNTc0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+R0REUjYgRFJBTTwvdGV4dD4KICA8dGV4dCB4PSIxNTUiIHk9IjU5OSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPndlaWdodHMgwrcgcGVyc2lzdGVudCB0ZW5zb3JzPC90ZXh0PgogIDx0ZXh0IHg9IjQzNSIgeT0iNTc0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+MkQgTm9DICsgcGVyLWNvcmUgTDE8L3RleHQ+CiAgPHRleHQgeD0iNDM1IiB5PSI1OTkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5tdWx0aWNhc3QgwrcgY2lyY3VsYXIgYnVmZmVycyDCtyBzaGFyZHM8L3RleHQ+CiAgPHRleHQgeD0iNzc1IiB5PSI1NzQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UZW5zaXggZW5naW5lczwvdGV4dD4KICA8dGV4dCB4PSI3NzUiIHk9IjU5OSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnVucGFja2VyIMK3IG1hdHJpeC92ZWN0b3IgwrcgRHN0IMK3IHBhY2tlcjwvdGV4dD4KICA8dGV4dCB4PSIxMDAwIiB5PSI1NzQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj4xMjAgd29ya2VyczwvdGV4dD4KICA8dGV4dCB4PSIxMDAwIiB5PSI1OTkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5QMTUwIGZpcm13YXJlIGNvbmZpZ3VyYXRpb248L3RleHQ+CiAgPHBhdGggZD0iTTkxMiA0NjYgTDkxMiA1MTUgTDc3NSA1MTUgTDc3NSA1MzciIGZpbGw9Im5vbmUiIGNsYXNzPSJhcnJvdyIvPgo8L3N2Zz4K" id="fig:stack" style="width:100.0%" alt /><figcaption>libtt serving, compilation, runtime, and device layers.</figcaption>
 </figure>
-<h1 data-number="1" id="design"><span class="header-section-number">1</span> Design</h1>
-<h2 data-number="1.1" id="deployment-model"><span class="header-section-number">1.1</span> Deployment model</h2>
-<p>PJRT lets frameworks call device-specific plugins through one interface [9]. libtt implements that interface for Tenstorrent:</p>
+<h1 data-number="2" id="system-organization"><span class="header-section-number">2</span> System organization</h1>
+<h2 data-number="2.1" id="deployment-and-frontend-boundary"><span class="header-section-number">2.1</span> Deployment and frontend boundary</h2>
+<p>PJRT lets frameworks call device-specific plugins through one interface [3]. libtt implements that interface for Tenstorrent:</p>
 <pre class="text"><code>JAX process
   `-- dynamically loads libtt.so through PJRT
        |-- compiles StableHLO for Tenstorrent
@@ -271,24 +123,23 @@ pre { white-space: pre-wrap; }
        `-- initializes the embedded TT-Metal runtime assets</code></pre>
 <p>libtt’s C++ glue extracts the embedded archive to a fingerprinted temporary directory, sets <code>TT_METAL_RUNTIME_ROOT</code> before PJRT starts, links the upstream plugin, and exports only the PJRT entry points. Most code comes from pinned open-source dependencies and the applied patch series.</p>
 <p>The compiler and TT-Metal runtime do not need to be installed on the target. With compatible drivers and firmware, <code>libtt.so</code> contains the software needed to compile and run JAX programs. This is the intended similarity to <code>libtpu.so</code> [7].</p>
-<h2 data-number="1.2" id="upstream-compatible-frontend"><span class="header-section-number">1.2</span> Upstream-compatible frontend</h2>
 <p>libtt treats PJRT and StableHLO as the integration boundary. SGLang-JAX keeps its model, tokenizer, scheduler, paged KV cache, and inference engine. The Tenstorrent-specific work stays below that boundary instead of requiring a forked Qwen implementation or a rewritten serving layer.</p>
 <p>This provides two advantages:</p>
 <ul>
 <li>upstream SGLang-JAX and JAX/TPU code can be reused with small configuration changes; and</li>
 <li>performance can be added in TT-MLIR, TTNN, TT-Metal, and device kernels, where layout, fusion, precision, and data movement are visible.</li>
 </ul>
-<p>The report evaluates inference, but PJRT and StableHLO are not inference-specific. Training support can use the same architecture by adding the required operations, collective behavior, optimizer graphs, and numerical validation below the existing JAX frontend.</p>
-<h2 data-number="1.3" id="one-build-graph"><span class="header-section-number">1.3</span> One build graph</h2>
-<p>libtt uses Bazel modules and repository rules to pin TT-UMD [5], SFPI [6], TT-Metal, LLVM, StableHLO, TT-XLA, TT-MLIR, Shardy, and supporting C++ libraries. Bazel overlays add targets for projects that use another build system. The <code>//:tt</code> target produces <code>bazel-bin/libtt.so</code>.</p>
+<p>We evaluate inference, but PJRT and StableHLO are not inference-specific. Training support can use the same architecture by adding the required operations, collective behavior, optimizer graphs, and numerical validation below the existing JAX frontend.</p>
+<h2 data-number="2.2" id="integrated-build"><span class="header-section-number">2.2</span> Integrated build</h2>
+<p>libtt uses Bazel modules and repository rules [1] to pin TT-UMD [22], SFPI [11], TT-Metal, LLVM, StableHLO, TT-XLA [23], TT-MLIR, Shardy, and supporting C++ libraries. Bazel overlays add targets for projects that use another build system. The <code>//:tt</code> target produces <code>bazel-bin/libtt.so</code>.</p>
 <p>This organization has three practical effects:</p>
 <ul>
 <li>Source revisions, overlays, patches, toolchains, and link rules are inputs to one build.</li>
 <li>Compiler, schema, runtime, program-factory, and kernel changes can be tested together.</li>
 <li>An agent can inspect and edit every layer in one workspace, rebuild one target, and run one benchmark.</li>
 </ul>
-<p>Tenstorrent’s compiler overview describes the same open path from framework frontends through TT-MLIR dialects to TT-Metalium [12, 13]. libtt builds a pinned part of that path as one artifact.</p>
-<h2 data-number="1.4" id="cross-layer-changes"><span class="header-section-number">1.4</span> Cross-layer changes</h2>
+<p>Tenstorrent’s compiler overview describes the same open path from framework frontends through TT-MLIR dialects to TT-Metalium [13, 18]. libtt builds a pinned part of that path as one artifact.</p>
+<h2 data-number="2.3" id="cross-layer-optimization"><span class="header-section-number">2.3</span> Cross-layer optimization</h2>
 <p>The matmul-SwiGLU epilogue crosses six layers:</p>
 <ol type="1">
 <li>A graph pass must prove that a paired gate/up matmul feeds the exact <code>silu(gate) * up</code> expression.</li>
@@ -299,16 +150,15 @@ pre { white-space: pre-wrap; }
 <li>Reader, compute, and writer kernels must keep the paired tiles resident in Dst and emit only the half-width final result.</li>
 </ol>
 <p>These steps form one patch concept even though they touch several abstraction levels and two upstream repositories.</p>
-<h1 data-number="2" id="compilation-and-execution-architecture"><span class="header-section-number">2</span> Compilation and execution architecture</h1>
-<h2 data-number="2.1" id="the-framework-boundary-jax-stablehlo-and-pjrt"><span class="header-section-number">2.1</span> The framework boundary: JAX, StableHLO, and PJRT</h2>
-<p>Upstream SGLang-JAX owns serving, tokenization, scheduling, the JAX Qwen model, and the paged KV cache [21]. JAX traces each shape-specific computation to StableHLO, a portable operation set between frameworks and compilers [10]. PJRT hides the device-specific compiler and runtime from JAX [9].</p>
+<h2 data-number="2.4" id="the-framework-boundary-jax-stablehlo-and-pjrt"><span class="header-section-number">2.4</span> The framework boundary: JAX, StableHLO, and PJRT</h2>
+<p>Upstream SGLang-JAX owns serving, tokenization, scheduling, the JAX Qwen model, and the paged KV cache [5]. JAX traces each shape-specific computation to StableHLO, a portable operation set between frameworks and compilers [4]. PJRT hides the device-specific compiler and runtime from JAX [3].</p>
 <p>The steady-state request path is:</p>
 <pre class="text"><code>SGLang-JAX → JAX trace → StableHLO → libtt/PJRT
             → TT-XLA → TT-MLIR → TTNN executable
             → TTNN runtime → TT-Metal programs → Blackhole</code></pre>
 <p><code>libtt.so</code> accepts StableHLO and executes a serialized TTNN program.</p>
-<h2 data-number="2.2" id="tt-mlir-ir-levels"><span class="header-section-number">2.2</span> TT-MLIR IR levels</h2>
-<p>MLIR supports dialects at different abstraction levels [11]. TT-MLIR uses them for model semantics, layouts, tiled computation, device kernels, and host/device control [13]. Each optimization should use the highest level that still has the information it needs.</p>
+<h2 data-number="2.5" id="tt-mlir-ir-levels"><span class="header-section-number">2.5</span> TT-MLIR IR levels</h2>
+<p>MLIR supports dialects at different abstraction levels [2]. TT-MLIR uses them for model semantics, layouts, tiled computation, device kernels, and host/device control [18]. Each optimization should use the highest level that still has the information it needs.</p>
 <table>
 <caption>The TT-MLIR IR ladder and where libtt’s measured path uses it.</caption>
 <colgroup>
@@ -325,38 +175,38 @@ pre { white-space: pre-wrap; }
 </thead>
 <tbody>
 <tr class="odd">
-<td style="text-align: left;"><strong>StableHLO</strong></td>
-<td style="text-align: left;">Framework-portable tensor graph with specified operation semantics [10].</td>
+<td style="text-align: left;">StableHLO</td>
+<td style="text-align: left;">Framework-portable tensor graph with specified operation semantics [4].</td>
 <td style="text-align: left;">Input to TT-XLA/TT-MLIR. Framework algebra such as expanded SiLU is visible here and after import, but libtt’s patches generally match it in TTIR/TTNN passes.</td>
 </tr>
 <tr class="even">
-<td style="text-align: left;"><strong>TTIR</strong></td>
-<td style="text-align: left;">Hardware-aware, high-level tensor IR. It preserves named tensor operations while permitting fusion and canonicalization before a concrete runtime API is chosen [13].</td>
+<td style="text-align: left;">TTIR</td>
+<td style="text-align: left;">Hardware-aware, high-level tensor IR. It preserves named tensor operations while permitting fusion and canonicalization before a concrete runtime API is chosen [18].</td>
 <td style="text-align: left;">JAX RMSNorm recognition, expanded-SiLU recovery, shared-LHS matmul grouping, role propagation, and part of QKV/RoPE fusion.</td>
 </tr>
 <tr class="odd">
-<td style="text-align: left;"><strong>TTNN dialect</strong></td>
-<td style="text-align: left;">High-level tensor IR designed to model the TTNN library closely. Its types and attributes carry tiled layouts, memory spaces, sharding, and device data types [13, 14].</td>
+<td style="text-align: left;">TTNN dialect</td>
+<td style="text-align: left;">High-level tensor IR designed to model the TTNN library closely. Its types and attributes carry tiled layouts, memory spaces, sharding, and device data types [18, 19].</td>
 <td style="text-align: left;">QKV composite fusion, <code>matmul_swiglu</code>, layout selection, cache return types, and lowering to the serialized TTNN operation graph.</td>
 </tr>
 <tr class="even">
-<td style="text-align: left;"><strong>TTNN FlatBuffer</strong></td>
+<td style="text-align: left;">TTNN FlatBuffer</td>
 <td style="text-align: left;">Serialized executable operation graph consumed by the TTNN runtime. It is an artifact rather than an MLIR dialect.</td>
 <td style="text-align: left;">Carries operation parameters such as the fused-SwiGLU matmul flag across the compiler/runtime boundary.</td>
 </tr>
 <tr class="odd">
-<td style="text-align: left;"><strong>D2M dialect</strong></td>
-<td style="text-align: left;">Generic tensor/memref computation analogous to <code>linalg.generic</code>, augmented with grids, sharded tensors, circular buffers, and explicit data movement [13].</td>
-<td style="text-align: left;">An alternative direct-to-metal route. The measured custom SwiGLU and down-projection kernels are hand-written TT-Metal/TTNN patches, so they do <strong>not</strong> pass through D2M.</td>
+<td style="text-align: left;">D2M dialect</td>
+<td style="text-align: left;">Generic tensor/memref computation analogous to <code>linalg.generic</code>, augmented with grids, sharded tensors, circular buffers, and explicit data movement [18].</td>
+<td style="text-align: left;">An alternative direct-to-metal route. The measured custom SwiGLU and down-projection kernels are hand-written TT-Metal/TTNN patches, so they do not pass through D2M.</td>
 </tr>
 <tr class="even">
-<td style="text-align: left;"><strong>TTKernel dialect</strong></td>
-<td style="text-align: left;">Low-level device-kernel IR exposing circular buffers, tile registers, NoC transactions, and synchronization with an intended near one-to-one mapping to TT-Metal kernels [13].</td>
+<td style="text-align: left;">TTKernel dialect</td>
+<td style="text-align: left;">Low-level device-kernel IR exposing circular buffers, tile registers, NoC transactions, and synchronization with an intended near one-to-one mapping to TT-Metal kernels [18].</td>
 <td style="text-align: left;">Relevant to generated direct-to-metal kernels; not the representation of the hand-written C++ kernels measured here.</td>
 </tr>
 <tr class="odd">
-<td style="text-align: left;"><strong>TTMetal dialect</strong></td>
-<td style="text-align: left;">Host/device interop IR for allocation, transfers, program creation, and enqueue operations [13].</td>
+<td style="text-align: left;">TTMetal dialect</td>
+<td style="text-align: left;">Host/device interop IR for allocation, transfers, program creation, and enqueue operations [18].</td>
 <td style="text-align: left;">Part of the direct-to-metal compiler route. The measured TTNN route instead invokes TT-Metal host APIs from the TTNN runtime.</td>
 </tr>
 </tbody>
@@ -370,23 +220,23 @@ pre { white-space: pre-wrap; }
 <p>TT-MLIR also supports the lower-level branch:</p>
 <pre class="text"><code>TTIR → D2M → TTKernel + TTMetal → generated device/host program</code></pre>
 <p>Only the first branch runs the benchmarked patches. Their hand-written C++ program factories and kernels are not TTKernel IR optimizations.</p>
-<h2 data-number="2.3" id="ttnn-runtime-and-the-serialized-executable"><span class="header-section-number">2.3</span> TTNN runtime and the serialized executable</h2>
+<h2 data-number="2.6" id="ttnn-runtime-and-the-serialized-executable"><span class="header-section-number">2.6</span> TTNN runtime and the serialized executable</h2>
 <p>TTNN IR models operations such as matmul, RMSNorm, SDPA, and reshape. Lowering serializes them into a FlatBuffer. The runtime deserializes the graph, creates tensors, sets memory configurations, validates each operation, and selects a program factory. The RMSNorm patch uses the concrete input shape here to choose a 16-core width-sharded layout; the compiler still emits a normal RMSNorm.</p>
-<h2 data-number="2.4" id="tt-metal-programs-and-tensix-kernels"><span class="header-section-number">2.4</span> TT-Metal programs and Tensix kernels</h2>
-<p>TT-Metalium uses cooperative dataflow rather than a GPU thread hierarchy [15]. A program usually has:</p>
+<h2 data-number="2.7" id="tt-metal-programs-and-tensix-kernels"><span class="header-section-number">2.7</span> TT-Metal programs and Tensix kernels</h2>
+<p>TT-Metalium uses cooperative dataflow rather than a GPU thread hierarchy [16]. A program usually has:</p>
 <ul>
 <li>a reader data-movement kernel to fetch tiles from DRAM or another core into L1 circular buffers;</li>
 <li>a compute kernel to unpack tiles, drive matrix/vector engines, and create result tiles; and</li>
 <li>a writer data-movement kernel to drain result buffers to their destination.</li>
 </ul>
-<p>Circular buffers are bounded queues shared by the threads of a Tensix core [17]. Reader, compute, and writer kernels can overlap on different tiles when their buffer and semaphore protocols are correct.</p>
-<p>The compute engine exposes SrcA, SrcB, and Dst register sets. Matrix results land in Dst; vector operations can transform them; the packer writes them to an L1 circular buffer [16]. With 16-bit Dst storage and double buffering enabled, the active half contains eight 32-by-32 tiles. That capacity determines the successful SwiGLU geometry: four gate and four up tiles fill Dst exactly.</p>
-<h2 data-number="2.5" id="tiles-memory-and-low-precision-weights"><span class="header-section-number">2.5</span> Tiles, memory, and low-precision weights</h2>
-<p>TTNN’s standard tile is 32 by 32 elements with four 16-by-16 faces [18]. Final dimensions are padded, so batch-one decode still presents a full tile row. Kernels must account for both the logical and padded shapes.</p>
-<p>Large weights reside in device DRAM; L1 is smaller, faster, and private to each worker. TTNN <code>MemoryConfig</code> values describe interleaved or sharded storage and DRAM or L1 placement. TT-MLIR layout attributes similarly encode how a logical tensor maps to devices, cores, physical shards, memory space, and padding [14].</p>
-<p>The benchmark uses BF16 activations and outputs with BFLOAT8_B weights. BFLOAT8_B is block floating point: 16 values share an exponent [19]. It reduces the dominant weight traffic in batch-one decode, with a precision and packing trade-off. The custom matmuls use BF16 packer-L1 accumulation: partial sums are packed into an L1 slot and reloaded for later K blocks, leaving Dst available for the current block’s tile group.</p>
-<h2 data-number="2.6" id="decode-bottlenecks"><span class="header-section-number">2.6</span> Decode bottlenecks</h2>
-<p>Qwen3 is a decoder-only Transformer family [22]. A simplified layer is:</p>
+<p>Circular buffers are bounded queues shared by the threads of a Tensix core [9]. Reader, compute, and writer kernels can overlap on different tiles when their buffer and semaphore protocols are correct.</p>
+<p>The compute engine exposes SrcA, SrcB, and Dst register sets. Matrix results land in Dst; vector operations can transform them; the packer writes them to an L1 circular buffer [10]. With 16-bit Dst storage and double buffering enabled, the active half contains eight 32-by-32 tiles. That capacity determines the successful SwiGLU geometry: four gate and four up tiles fill Dst exactly.</p>
+<h2 data-number="2.8" id="tiles-memory-and-low-precision-weights"><span class="header-section-number">2.8</span> Tiles, memory, and low-precision weights</h2>
+<p>TTNN’s standard tile is 32 by 32 elements with four 16-by-16 faces [12]. Final dimensions are padded, so batch-one decode still presents a full tile row. Kernels must account for both the logical and padded shapes.</p>
+<p>Large weights reside in device DRAM; L1 is smaller, faster, and private to each worker. TTNN <code>MemoryConfig</code> values describe interleaved or sharded storage and DRAM or L1 placement. TT-MLIR layout attributes similarly encode how a logical tensor maps to devices, cores, physical shards, memory space, and padding [19].</p>
+<p>We use BF16 activations and outputs with BFLOAT8_B weights. BFLOAT8_B is block floating point: 16 values share an exponent [21]. It reduces the dominant weight traffic in batch-one decode, with a precision and packing trade-off. The custom matmuls use BF16 packer-L1 accumulation: partial sums are packed into an L1 slot and reloaded for later K blocks, leaving Dst available for the current block’s tile group.</p>
+<h2 data-number="2.9" id="decode-bottlenecks"><span class="header-section-number">2.9</span> Decode bottlenecks</h2>
+<p>Qwen3 is a decoder-only Transformer family [24]. A simplified layer is:</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mtable><mtr><mtd columnalign="right"><mi>u</mi></mtd><mtd columnalign="left"><mo>=</mo><mo>RMSNorm</mo><mo stretchy="false" form="prefix">(</mo><mi>h</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>h</mi><mi>′</mi></mtd><mtd columnalign="left"><mo>=</mo><mi>h</mi><mo>+</mo><mo>Attention</mo><mo stretchy="false" form="prefix">(</mo><mi>Q</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo><mi>K</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo><mi>V</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>;</mo><msub><mi>K</mi><mrow><mi>c</mi><mi>a</mi><mi>c</mi><mi>h</mi><mi>e</mi></mrow></msub><mo>,</mo><msub><mi>V</mi><mrow><mi>c</mi><mi>a</mi><mi>c</mi><mi>h</mi><mi>e</mi></mrow></msub><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>v</mi></mtd><mtd columnalign="left"><mo>=</mo><mo>RMSNorm</mo><mo stretchy="false" form="prefix">(</mo><mi>h</mi><mi>′</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>g</mi></mtd><mtd columnalign="left"><mo>=</mo><mi>v</mi><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mo>,</mo><mspace width="2.0em"></mspace><mi>r</mi><mo>=</mo><mi>v</mi><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><msub><mi>h</mi><mrow><mi>n</mi><mi>e</mi><mi>x</mi><mi>t</mi></mrow></msub></mtd><mtd columnalign="left"><mo>=</mo><mi>h</mi><mi>′</mi><mo>+</mo><mo minsize="1.2" maxsize="1.2" stretchy="false" form="prefix">(</mo><mo>SiLU</mo><mo stretchy="false" form="prefix">(</mo><mi>g</mi><mo stretchy="false" form="postfix">)</mo><mo>⊙</mo><mi>r</mi><mo minsize="1.2" maxsize="1.2" stretchy="false" form="postfix">)</mo><msub><mi>W</mi><mrow><mi>d</mi><mi>o</mi><mi>w</mi><mi>n</mi></mrow></msub><mi>.</mi></mtd></mtr></mtable><annotation encoding="application/x-tex">
 \begin{aligned}
 u &amp;= \operatorname{RMSNorm}(h),\\
@@ -396,9 +246,9 @@ g &amp;= vW_{gate}, \qquad r = vW_{up},\\
 h_{next} &amp;= h&#39; + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 \end{aligned}
 </annotation></semantics></math></p>
-<p>RMSNorm and SwiGLU are standard model concepts [23, 24]. Prefill shares each weight read across many rows. Serial decode applies a logical <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">1\times K</annotation></semantics></math> by <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">K\times N</annotation></semantics></math> projection for every token, so weight traffic and intermediate materialization dominate. The main optimizations add width parallelism, reduce DRAM traffic, or avoid packing an intermediate from Dst.</p>
-<h1 data-number="3" id="optimization-map-by-patch-and-concept"><span class="header-section-number">3</span> Optimization map by patch and concept</h1>
-<p>Git revisions remain in the data files. The table groups changes by patch concept and implementation level.</p>
+<p>RMSNorm and SwiGLU are standard model concepts [6, 25]. Prefill shares each weight read across many rows. Serial decode applies a logical <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">1\times K</annotation></semantics></math> by <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">K\times N</annotation></semantics></math> projection for every token, so weight traffic and intermediate materialization dominate. The main optimizations add width parallelism, reduce DRAM traffic, or avoid packing an intermediate from Dst.</p>
+<h1 data-number="3" id="optimization-of-the-model-path"><span class="header-section-number">3</span> Optimization of the model path</h1>
+<p>We group the changes by engineering concept and implementation level rather than by commit. Git revisions remain in the data files.</p>
 <table>
 <caption>Current model-path optimization concepts, implementation levels, and measured effects.</caption>
 <colgroup>
@@ -502,35 +352,35 @@ SwiGLU vertical     tt_mlir_fuse_matmul_swiglu.patch
                     matmul_swiglu_epilogue.patch
 down projection     down_projection_110_core.patch</code></pre>
 <p>The +22.58% foundation figure combines patches that were not measured separately. The blocking and down-projection tests use a streaming decode clock, so they remain outside the cumulative sequence.</p>
-<h1 data-number="4" id="recovering-model-semantics-in-ttir-and-ttnn"><span class="header-section-number">4</span> Recovering model semantics in TTIR and TTNN</h1>
-<h2 data-number="4.1" id="rmsnorm-recognition"><span class="header-section-number">4.1</span> RMSNorm recognition</h2>
+<p>The first group recovers model semantics in TTIR and TTNN before lowerings discard the algebra and graph roles needed to recognize them.</p>
+<h2 data-number="3.1" id="rmsnorm-recognition"><span class="header-section-number">3.1</span> RMSNorm recognition</h2>
 <p>JAX can lower RMSNorm to square, reduce, epsilon addition, reciprocal square root, scaling, and reshapes. A TTIR pattern proves this structure and replaces it with one RMSNorm operation while the algebra and use-def graph are still available. TTNN can then apply its normalization and layout logic. Recognition is part of the foundation bundle and enables the later runtime-sharding patch.</p>
-<h2 data-number="4.2" id="expanded-silu-recognition"><span class="header-section-number">4.2</span> Expanded-SiLU recognition</h2>
+<h2 data-number="3.2" id="expanded-silu-recognition"><span class="header-section-number">3.2</span> Expanded-SiLU recognition</h2>
 <p>The graph represents</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>SiLU</mo><mo stretchy="false" form="prefix">(</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mi>x</mi><mspace width="0.167em"></mspace><mi>σ</mi><mo stretchy="false" form="prefix">(</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mfrac><mi>x</mi><mrow><mn>1</mn><mo>+</mo><mo>exp</mo><mo stretchy="false" form="prefix">(</mo><mo>−</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo></mrow></mfrac></mrow><annotation encoding="application/x-tex">
 \operatorname{SiLU}(x)=x\,\sigma(x)=\frac{x}{1+\exp(-x)}
 </annotation></semantics></math></p>
-<p>with casts, broadcasts, reshapes, and a splatted scalar one. <code>tt_mlir_fuse_expanded_silu.patch</code> looks through view-like operations, verifies the constant and shared input, and replaces the tree with SiLU. The isolated gain is <strong>+3.30%</strong>.</p>
-<h2 data-number="4.3" id="rank-3-rope-and-qkv-projection-structure"><span class="header-section-number">4.3</span> Rank-3 RoPE and QKV projection structure</h2>
+<p>with casts, broadcasts, reshapes, and a splatted scalar one. <code>tt_mlir_fuse_expanded_silu.patch</code> looks through view-like operations, verifies the constant and shared input, and replaces the tree with SiLU. The isolated gain is +3.30%.</p>
+<h2 data-number="3.3" id="rank-3-rope-and-qkv-projection-structure"><span class="header-section-number">3.3</span> Rank-3 RoPE and QKV projection structure</h2>
 <p>Qwen projects Q, K, and V together, applies per-head RMSNorm to Q and K, reshapes them by head count, and applies rotary position embedding. Two patches recover this structure:</p>
 <ul>
 <li><code>tt_mlir_fuse_rank3_rope_decode.patch</code> accepts JAX’s rank-3 decode form, temporarily maps it to the existing rank-4 composite, and restores the expected result shape.</li>
 <li><code>tt_mlir_qwen_decode_qkv_projection_fusion.patch</code> orders projection roles, validates contiguous Q/K/V bounds, head counts, and head dimensions, and replaces materialized slices/reshapes with <code>nlp_create_qkv_heads_decode</code>. Q and K RMSNorm are recreated on the fused rank-4 results.</li>
 </ul>
-<p>TTIR supplies candidate ordering and role information; TTNN owns the composite operation and runtime contract. QKV fusion adds <strong>+1.15%</strong>. Rank-3 RoPE is part of the foundation bundle.</p>
-<h2 data-number="4.4" id="kv-cache-dtype-and-role-propagation"><span class="header-section-number">4.4</span> KV-cache dtype and role propagation</h2>
+<p>TTIR supplies candidate ordering and role information; TTNN owns the composite operation and runtime contract. QKV fusion adds +1.15%. Rank-3 RoPE is part of the foundation bundle.</p>
+<h2 data-number="3.4" id="kv-cache-dtype-and-role-propagation"><span class="header-section-number">3.4</span> KV-cache dtype and role propagation</h2>
 <p>KV-cache update operations are stateful boundaries. Their return types must carry the selected device dtype, and graph-role metadata must survive unary operations so later fusions can still identify query, key, and value paths. The TT-MLIR and TT-XLA patches keep the low-precision fused graph typed and recognizable. They are enabling changes rather than isolated speedups.</p>
-<h1 data-number="5" id="layout-precision-and-runtime-policy"><span class="header-section-number">5</span> Layout, precision, and runtime policy</h1>
-<h2 data-number="5.1" id="bf8-lowering-and-fast-host-packing"><span class="header-section-number">5.1</span> BF8 lowering and fast host packing</h2>
-<p>The server requests <code>bfp_bf8</code> for eligible weights. TT-XLA enables single-chip lowering, TT-MLIR assigns the device dtype, and TTNN/TT-Metal consume BFLOAT8_B tiles. <code>fast_bfloat16_bfp8_pack.patch</code> speeds conversion of BF16 host weights to 32-by-32 BFP8 tiles.</p>
+<p>The next group selects precision and layout after the graph operations have been recovered.</p>
+<h2 data-number="3.5" id="bf8-lowering-and-fast-host-packing"><span class="header-section-number">3.5</span> BF8 lowering and fast host packing</h2>
+<p>We request <code>bfp_bf8</code> for eligible weights. TT-XLA enables single-chip lowering, TT-MLIR assigns the device dtype, and TTNN/TT-Metal consume BFLOAT8_B tiles. <code>fast_bfloat16_bfp8_pack.patch</code> speeds conversion of BF16 host weights to 32-by-32 BFP8 tiles.</p>
 <p>These changes attack two different phases:</p>
 <ul>
 <li>BF8 storage reduces steady-state device weight traffic during decode.</li>
 <li>faster packing reduces model-load and preparation cost on the host.</li>
 </ul>
-<p>The measurements do not isolate these effects from the foundation bundle.</p>
-<h2 data-number="5.2" id="width-sharded-decode-rmsnorm"><span class="header-section-number">5.2</span> Width-sharded decode RMSNorm</h2>
-<p>The default logical height of RMSNorm during batch-one decode is one. A generic height-parallel program cannot occupy many cores. The runtime patch recognizes a device-resident, tiled, unsharded input with sequence length one and width at least 2048. When the width divides into 16 tile-aligned shards, it:</p>
+<p>We did not isolate these effects from the foundation bundle.</p>
+<h2 data-number="3.6" id="width-sharded-decode-rmsnorm"><span class="header-section-number">3.6</span> Width-sharded decode RMSNorm</h2>
+<p>The default logical height of RMSNorm during batch-one decode is one. A generic height-parallel program cannot occupy many cores. At run time, we recognize a device-resident, tiled, unsharded input with sequence length one and width at least 2048. When the width divides into 16 tile-aligned shards, it:</p>
 <ol type="1">
 <li>creates an 8-by-2 row-major core grid;</li>
 <li>width-shards the tensor into the cores’ L1 memories;</li>
@@ -538,29 +388,29 @@ down projection     down_projection_110_core.patch</code></pre>
 <li>executes sharded RMSNorm; and</li>
 <li>restores the requested output memory configuration.</li>
 </ol>
-<p>The two conversions cost less than the width-parallel reduction saves. The isolated gain is <strong>+13.61%</strong>. This is runtime policy, not a new IR operation: the compiler identifies RMSNorm, while the runtime knows the tensor and device geometry.</p>
-<h2 data-number="5.3" id="decode-specific-validation-changes"><span class="header-section-number">5.3</span> Decode-specific validation changes</h2>
+<p>The two conversions cost less than the width-parallel reduction saves. The isolated gain is +13.61%. This is runtime policy, not a new IR operation: the compiler identifies RMSNorm, while the runtime knows the tensor and device geometry.</p>
+<h2 data-number="3.7" id="decode-specific-validation-changes"><span class="header-section-number">3.7</span> Decode-specific validation changes</h2>
 <p>Two small TT-Metal patches admit layouts selected by the optimized graph:</p>
 <ul>
 <li>SDPA decode accepts an L1-interleaved query rather than requiring the prior sharded form.</li>
 <li>layernorm accepts the single-core height-sharded case produced on the decode path.</li>
 </ul>
 <p>These narrow changes remove conversions while keeping shape and layout checks. Their performance effect is part of the foundation bundle.</p>
-<h1 data-number="6" id="mlp-optimizations"><span class="header-section-number">6</span> MLP optimizations</h1>
-<h2 data-number="6.1" id="shared-lhs-gateup-projection"><span class="header-section-number">6.1</span> Shared-LHS gate/up projection</h2>
+<p>The MLP experiments test which intermediate and data-movement boundaries must be removed for fusion to improve decode throughput.</p>
+<h2 data-number="3.8" id="shared-lhs-gateup-projection"><span class="header-section-number">3.8</span> Shared-LHS gate/up projection</h2>
 <p>Qwen’s two first MLP projections share an activation:</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mo>,</mo><mspace width="0.278em"></mspace><mi>x</mi><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mspace width="1.0em"></mspace><mo>→</mo><mspace width="1.0em"></mspace><mi>x</mi><mo stretchy="false" form="prefix">[</mo><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mspace width="0.278em"></mspace><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mo stretchy="false" form="postfix">]</mo><mi>.</mi></mrow><annotation encoding="application/x-tex">
 xW_{gate},\;xW_{up}
 \quad\longrightarrow\quad
 x[W_{gate}\;W_{up}].
 </annotation></semantics></math></p>
-<p><code>tt_mlir_fuse_shared_lhs_matmul_pairs.patch</code> changes TTIR fusion eligibility so a pair can be combined. This removes duplicate activation reads and launches, but writes a doubled-width output that SwiGLU slices and rereads. Throughput changes by <strong>-1.69%</strong>. The representation becomes useful when the epilogue consumes it without materializing the combined output.</p>
-<h2 data-number="6.2" id="consumer-side-silu-fusion"><span class="header-section-number">6.2</span> Consumer-side SiLU fusion</h2>
+<p><code>tt_mlir_fuse_shared_lhs_matmul_pairs.patch</code> changes TTIR fusion eligibility so a pair can be combined. This removes duplicate activation reads and launches, but writes a doubled-width output that SwiGLU slices and rereads. Throughput changes by -1.69%. The representation becomes useful when the epilogue consumes it without materializing the combined output.</p>
+<h2 data-number="3.9" id="consumer-side-silu-fusion"><span class="header-section-number">3.9</span> Consumer-side SiLU fusion</h2>
 <p>An intermediate experiment placed SiLU as a unary activation on the following TTNN multiply. That removes one elementwise operation but retains the expensive boundary:</p>
 <pre class="text"><code>combined matmul → pack full gate/up tensor → memory
                 → read/unpack → SiLU + multiply → pack result</code></pre>
-<p>Throughput changes by <strong>-0.65%</strong>. Removing an operation does not help when the same large intermediate is still written and read.</p>
-<h2 data-number="6.3" id="dst-resident-matmul-swiglu-epilogue"><span class="header-section-number">6.3</span> Dst-resident matmul-SwiGLU epilogue</h2>
+<p>Throughput changes by -0.65%. Removing an operation does not help when the same large intermediate is still written and read.</p>
+<h2 data-number="3.10" id="dst-resident-matmul-swiglu-epilogue"><span class="header-section-number">3.10</span> Dst-resident matmul-SwiGLU epilogue</h2>
 <p>Two patches implement the producer-side epilogue:</p>
 <ul>
 <li><code>tt_mlir_fuse_matmul_swiglu.patch</code> recognizes the TTNN graph, introduces the fused matmul semantic, extends the FlatBuffer representation, serializes it, and invokes the corresponding runtime path.</li>
@@ -578,11 +428,11 @@ x[W_{gate}\;W_{up}].
 <li>each gate tile multiplies its corresponding up tile in place; and</li>
 <li>only four final BF16 tiles are packed and written.</li>
 </ol>
-<p>The doubled-width gate/up tensor is never materialized. End-to-end throughput improves by <strong>+2.73%</strong>.</p>
-<h2 data-number="6.4" id="prefill-coverage-and-fallback-removal"><span class="header-section-number">6.4</span> Prefill coverage and fallback removal</h2>
-<p>The matcher was then generalized from decode-specific naming to any supported one-tile-row input, which includes short prefill. The older consumer-side SiLU-multiply fallback was removed; validation remains at the TTNN/TT-Metal boundary, where unsupported dtype, layout, shape, and hardware combinations fail explicitly.</p>
-<p>Throughput changes by <strong>-0.19%</strong>. The change removes code and adds prefill coverage without changing the fast kernel or completion hash.</p>
-<h2 data-number="6.5" id="swiglu-k-blocking-sweep"><span class="header-section-number">6.5</span> SwiGLU K-blocking sweep</h2>
+<p>The doubled-width gate/up tensor is never materialized. End-to-end throughput improves by +2.73%.</p>
+<h2 data-number="3.11" id="prefill-coverage-and-fallback-removal"><span class="header-section-number">3.11</span> Prefill coverage and fallback removal</h2>
+<p>We then generalized the matcher from decode-specific naming to any supported one-tile-row input, which includes short prefill. The older consumer-side SiLU-multiply fallback was removed; validation remains at the TTNN/TT-Metal boundary, where unsupported dtype, layout, shape, and hardware combinations fail explicitly.</p>
+<p>Throughput changes by -0.19%. The change removes code and adds prefill coverage without changing the fast kernel or completion hash.</p>
+<h2 data-number="3.12" id="swiglu-k-blocking-sweep"><span class="header-section-number">3.12</span> SwiGLU K-blocking sweep</h2>
 <p>The initial epilogue uses <code>in0_block_w = 2</code>. Every two K tiles it packs eight partial tiles into L1 and later reloads them. Larger blocks reduce partial traffic but need larger activation and weight circular buffers.</p>
 <p><code>matmul_swiglu_epilogue.patch</code> now exposes <code>TT_METAL_SWIGLU_IN0_BLOCK_W={2,4,8,16}</code> and sizes the circular buffers from the chosen value. The 32-sample test compares width 4 with width 2 while disabling the new down-projection specialization:</p>
 <table>
@@ -610,7 +460,7 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The intervals overlap and the measured change is small, so width two remains the default. Widths 8 and 16 remain available for experiments. Wider blocks also change accumulation order and can change greedy token sequences.</p>
-<h2 data-number="6.6" id="core-fused-residual-down-projection"><span class="header-section-number">6.6</span> 110-core fused-residual down projection</h2>
+<h2 data-number="3.13" id="core-fused-residual-down-projection"><span class="header-section-number">3.13</span> 110-core fused-residual down projection</h2>
 <p>The second MLP matmul has the exact decode shape <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mn>12288</mn></mrow><annotation encoding="application/x-tex">1\times12288</annotation></semantics></math> by <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>12288</mn><mo>×</mo><mn>4096</mn></mrow><annotation encoding="application/x-tex">12288\times4096</annotation></semantics></math>. The generic program used 64 cores and achieved only 246.2 GB/s of effective BFP8 weight bandwidth, well below the SwiGLU kernel. <code>down_projection_110_core.patch</code> adds an exact-shape Blackhole program selected only for BF16 activation/output, BFLOAT8_B weights, a BF16 residual, DRAM-interleaved tensors, and an 11-by-10 worker grid.</p>
 <p>The program avoids a K split and cross-core reduction. It partitions the 128 output tile columns across 110 workers:</p>
 <ul>
@@ -623,7 +473,7 @@ x[W_{gate}\;W_{up}].
 </ul>
 <p>Wide and narrow workers need different partial-result circular buffers. An early version gave narrow workers a two-tile ring even though they produced one tile. Partial sums alternated slots and corrupted output. Separate one- and two-tile rings fixed the bug.</p>
 <p>The exact-shape specialization is enabled by default. <code>TT_METAL_DOWN_PROJECTION_110_CORES=0</code> selects the generic program in the same binary for A/B measurement.</p>
-<h1 data-number="7" id="runtime-trace-capture-for-short-prefill"><span class="header-section-number">7</span> Runtime trace capture for short prefill</h1>
+<h2 data-number="3.14" id="runtime-trace-capture-for-short-prefill"><span class="header-section-number">3.14</span> Runtime trace capture for short prefill</h2>
 <p>Decode replays a recorded TT-Metal command sequence while refreshing request-dependent buffers. Previously, the five-token prompt, padded to one 32-row tile, ran as separate host submissions.</p>
 <p>Setting <code>SGLANG_TT_TRACE_DECODE_ONLY=false</code> records the fixed-shape prefill sequence too. In a same-binary 32-sample A/B test:</p>
 <table>
@@ -639,14 +489,14 @@ x[W_{gate}\;W_{up}].
 <tr class="odd">
 <td style="text-align: left;">Time to first token</td>
 <td style="text-align: right;">618.84 ± 4.76 ms</td>
-<td style="text-align: right;"><strong>59.15 ± 3.70 ms</strong></td>
-<td style="text-align: right;"><strong>-90.44% (10.46x)</strong></td>
+<td style="text-align: right;">59.15 ± 3.70 ms</td>
+<td style="text-align: right;">-90.44% (10.46x)</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">Total streaming time</td>
 <td style="text-align: right;">5.5067 ± 0.0598 s</td>
-<td style="text-align: right;"><strong>4.9299 ± 0.0680 s</strong></td>
-<td style="text-align: right;"><strong>-10.48%</strong></td>
+<td style="text-align: right;">4.9299 ± 0.0680 s</td>
+<td style="text-align: right;">-10.48%</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Pure decode throughput</td>
@@ -656,8 +506,8 @@ x[W_{gate}\;W_{up}].
 </tr>
 </tbody>
 </table>
-<p>Tracing removes about 560 ms before the first token while pure decode changes by +0.36%. In the primary cumulative benchmark, it adds <strong>+10.23%</strong> end-to-end throughput for a 128-token response.</p>
-<h1 data-number="8" id="packaging-build-and-startup-patch-concepts"><span class="header-section-number">8</span> Packaging, build, and startup patch concepts</h1>
+<p>Tracing removes about 560 ms before the first token while pure decode changes by +0.36%. In the primary cumulative benchmark, it adds +10.23% end-to-end throughput for a 128-token response.</p>
+<h2 data-number="3.15" id="packaging-build-and-startup-changes"><span class="header-section-number">3.15</span> Packaging, build, and startup changes</h2>
 <p>Other patches make the single-library deployment buildable and keep startup cost manageable. They are not decode optimizations.</p>
 <table>
 <caption>Non-model patch groups in the current libtt build.</caption>
@@ -712,8 +562,8 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>These patches keep the integrated build loadable and remove unused subsystems.</p>
-<h1 data-number="9" id="benchmark-methodology"><span class="header-section-number">9</span> Benchmark methodology</h1>
-<h2 data-number="9.1" id="hardware-and-software"><span class="header-section-number">9.1</span> Hardware and software</h2>
+<h1 data-number="4" id="experimental-method"><span class="header-section-number">4</span> Experimental method</h1>
+<h2 data-number="4.1" id="hardware-and-software"><span class="header-section-number">4.1</span> Hardware and software</h2>
 <table>
 <thead>
 <tr class="header">
@@ -772,43 +622,48 @@ x[W_{gate}\;W_{up}].
 </tr>
 </tbody>
 </table>
-<p>The P150 exposes 120 Tensix workers in this firmware configuration [20]. The SwiGLU program uses 96; the new down projection uses 110. Results are single-device and shape-specific.</p>
-<h2 data-number="9.2" id="serving-command"><span class="header-section-number">9.2</span> Serving command</h2>
-<p>The server uses the command documented in the repository README:</p>
-<div class="sourceCode" id="cb7"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true"></a><span class="fu">env</span> -u TT_METAL_RUNTIME_ROOT <span class="kw">\</span></span>
-<span id="cb7-2"><a href="#cb7-2" aria-hidden="true"></a>  <span class="va">PYTHONPATH=</span>/home/pcmoritz/sglang-jax/python <span class="kw">\</span></span>
-<span id="cb7-3"><a href="#cb7-3" aria-hidden="true"></a>  <span class="va">PJRT_NAMES_AND_LIBRARY_PATHS=</span>tt:/home/pcmoritz/libtt/bazel-bin/libtt.so <span class="kw">\</span></span>
-<span id="cb7-4"><a href="#cb7-4" aria-hidden="true"></a>  <span class="va">JAX_PLATFORMS=</span>tt <span class="kw">\</span></span>
-<span id="cb7-5"><a href="#cb7-5" aria-hidden="true"></a>  <span class="va">JAX_USE_SHARDY_PARTITIONER=</span>false <span class="kw">\</span></span>
-<span id="cb7-6"><a href="#cb7-6" aria-hidden="true"></a>  <span class="va">JAX_COMPILATION_CACHE_DIR=</span>/tmp/sglang-jax-qwen3-8b-jax-cache <span class="kw">\</span></span>
-<span id="cb7-7"><a href="#cb7-7" aria-hidden="true"></a>  <span class="va">SGLANG_TT_HOST_WEIGHT_LOAD=</span>1 <span class="kw">\</span></span>
-<span id="cb7-8"><a href="#cb7-8" aria-hidden="true"></a>  <span class="va">SGLANG_TT_OPTIMIZATION_LEVEL=</span>1 <span class="kw">\</span></span>
-<span id="cb7-9"><a href="#cb7-9" aria-hidden="true"></a>  <span class="va">SGLANG_TT_EXPERIMENTAL_WEIGHT_DTYPE=</span>bfp_bf8 <span class="kw">\</span></span>
-<span id="cb7-10"><a href="#cb7-10" aria-hidden="true"></a>  <span class="va">SGLANG_TT_TRACE_DECODE_ONLY=</span>false <span class="kw">\</span></span>
-<span id="cb7-11"><a href="#cb7-11" aria-hidden="true"></a>  <span class="ex">/home/pcmoritz/sglang-jax/.venv/bin/python</span> -m sgl_jax.launch_server <span class="kw">\</span></span>
-<span id="cb7-12"><a href="#cb7-12" aria-hidden="true"></a>  <span class="ex">--model-path</span> Qwen/Qwen3-8B <span class="kw">\</span></span>
-<span id="cb7-13"><a href="#cb7-13" aria-hidden="true"></a>  <span class="ex">--host</span> 127.0.0.1 --port 31000 <span class="kw">\</span></span>
-<span id="cb7-14"><a href="#cb7-14" aria-hidden="true"></a>  <span class="ex">--device</span> tt --dtype bfloat16 --attention-backend tt <span class="kw">\</span></span>
-<span id="cb7-15"><a href="#cb7-15" aria-hidden="true"></a>  <span class="ex">--max-running-requests</span> 2 --max-total-tokens 1024 <span class="kw">\</span></span>
-<span id="cb7-16"><a href="#cb7-16" aria-hidden="true"></a>  <span class="ex">--max-prefill-tokens</span> 256 --chunked-prefill-size 256 <span class="kw">\</span></span>
-<span id="cb7-17"><a href="#cb7-17" aria-hidden="true"></a>  <span class="ex">--page-size</span> 32 --watchdog-timeout 1200 <span class="kw">\</span></span>
-<span id="cb7-18"><a href="#cb7-18" aria-hidden="true"></a>  <span class="ex">--disable-precompile</span> --skip-server-warmup <span class="kw">\</span></span>
-<span id="cb7-19"><a href="#cb7-19" aria-hidden="true"></a>  <span class="ex">--disable-overlap-schedule</span> --disable-radix-cache</span></code></pre></div>
+<p>The P150 exposes 120 Tensix workers in this firmware configuration [8]. The SwiGLU program uses 96; the new down projection uses 110. Results are single-device and shape-specific.</p>
+<h2 data-number="4.2" id="serving-command"><span class="header-section-number">4.2</span> Serving command</h2>
+<p>We launch the server with the command documented in the repository README:</p>
+<pre class="bash"><code>env -u TT_METAL_RUNTIME_ROOT \
+  PYTHONPATH=/home/pcmoritz/sglang-jax/python \
+  PJRT_NAMES_AND_LIBRARY_PATHS=tt:/home/pcmoritz/libtt/bazel-bin/libtt.so \
+  JAX_PLATFORMS=tt \
+  JAX_USE_SHARDY_PARTITIONER=false \
+  JAX_COMPILATION_CACHE_DIR=/tmp/sglang-jax-qwen3-8b-jax-cache \
+  SGLANG_TT_HOST_WEIGHT_LOAD=1 \
+  SGLANG_TT_OPTIMIZATION_LEVEL=1 \
+  SGLANG_TT_EXPERIMENTAL_WEIGHT_DTYPE=bfp_bf8 \
+  SGLANG_TT_TRACE_DECODE_ONLY=false \
+  /home/pcmoritz/sglang-jax/.venv/bin/python -m sgl_jax.launch_server \
+  --model-path Qwen/Qwen3-8B \
+  --host 127.0.0.1 --port 31000 \
+  --device tt --dtype bfloat16 --attention-backend tt \
+  --max-running-requests 2 --max-total-tokens 1024 \
+  --max-prefill-tokens 256 --chunked-prefill-size 256 \
+  --page-size 32 --watchdog-timeout 1200 \
+  --disable-precompile --skip-server-warmup \
+  --disable-overlap-schedule --disable-radix-cache</code></pre>
 <p>Requests are serial despite the capacity of two. Radix caching and overlap scheduling are disabled so every request executes the same prompt prefill and does not overlap another request. Optional CPU/fused sampling paths remain at their disabled defaults; this report concerns the main model path.</p>
-<h2 data-number="9.3" id="request-and-sample-policy"><span class="header-section-number">9.3</span> Request and sample policy</h2>
-<p>The primary sequence sends the same request 34 times:</p>
-<div class="sourceCode" id="cb8"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true"></a><span class="fu">{</span></span>
-<span id="cb8-2"><a href="#cb8-2" aria-hidden="true"></a>  <span class="dt">&quot;text&quot;</span><span class="fu">:</span> <span class="st">&quot;The capital of France is&quot;</span><span class="fu">,</span></span>
-<span id="cb8-3"><a href="#cb8-3" aria-hidden="true"></a>  <span class="dt">&quot;sampling_params&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="fu">,</span> <span class="dt">&quot;max_new_tokens&quot;</span><span class="fu">:</span> <span class="dv">128</span><span class="fu">}</span></span>
-<span id="cb8-4"><a href="#cb8-4" aria-hidden="true"></a><span class="fu">}</span></span></code></pre></div>
+<h2 data-number="4.3" id="request-and-sample-policy"><span class="header-section-number">4.3</span> Request and sample policy</h2>
+<p>We send the same request 34 times in the primary sequence:</p>
+<pre class="json"><code>{
+  &quot;text&quot;: &quot;The capital of France is&quot;,
+  &quot;sampling_params&quot;: {&quot;temperature&quot;: 0, &quot;max_new_tokens&quot;: 128}
+}</code></pre>
 <p>The first two requests are discarded because they include graph compilation, TT-Metal kernel compilation, trace setup, and cache population. The next 32 complete requests form the analysis window. Primary throughput is</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>j</mi></msub><mo>=</mo><mfrac><mn>128</mn><msub><mi>L</mi><mi>j</mi></msub></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">T_j=\frac{128}{L_j},</annotation></semantics></math></p>
 <p>where <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>L</mi><mi>j</mi></msub><annotation encoding="application/x-tex">L_j</annotation></semantics></math> is SGLang’s server-reported end-to-end latency.</p>
-<p>The current kernel experiment uses the streaming completions endpoint and 32 retained requests per configuration. Pure decode throughput is 127 inter-token intervals divided by the elapsed time from first to last token. Streaming end-to-end throughput is 128 divided by loopback-client total time. The exact per-request observations are in <code>data/current-kernel-samples.csv</code>.</p>
-<h2 data-number="9.4" id="reported-statistics"><span class="header-section-number">9.4</span> Reported statistics</h2>
+<p>For the current kernel experiment, we use the streaming completions endpoint and 32 retained requests per configuration. Pure decode throughput is 127 inter-token intervals divided by the elapsed time from first to last token. Streaming end-to-end throughput is 128 divided by loopback-client total time. The exact per-request observations are in <code>data/current-kernel-samples.csv</code>.</p>
+<h2 data-number="4.4" id="performance-quantities-and-statistics"><span class="header-section-number">4.4</span> Performance quantities and statistics</h2>
+<p>For a kernel that appears once in each of the 36 decoder layers, the projected change in token latency is</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Δ</mi><mi>C</mi><mo>=</mo><mn>36</mn><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>t</mi><mrow><mi>o</mi><mi>l</mi><mi>d</mi></mrow></msub><mo>−</mo><msub><mi>t</mi><mrow><mi>n</mi><mi>e</mi><mi>w</mi></mrow></msub><mo stretchy="true" form="postfix">)</mo></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\Delta C = 36\left(t_{old}-t_{new}\right).
+</annotation></semantics></math></p>
+<p>For the down projection, the measured per-layer difference predicts a 2.241-ms/token reduction; the streaming measurement gives 2.147 ms/token. We compute effective weight bandwidth as <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>B</mi><mrow><mi>e</mi><mi>f</mi><mi>f</mi></mrow></msub><mo>=</mo><msub><mi>S</mi><mi>W</mi></msub><mi>/</mi><msub><mi>t</mi><mi>k</mi></msub></mrow><annotation encoding="application/x-tex">B_{eff}=S_W/t_k</annotation></semantics></math>, where <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>S</mi><mi>W</mi></msub><annotation encoding="application/x-tex">S_W</annotation></semantics></math> is the packed BFP8 weight size and <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>t</mi><mi>k</mi></msub><annotation encoding="application/x-tex">t_k</annotation></semantics></math> is device kernel time. These quantities let us compare a kernel profile with the end-to-end result without treating the kernel speedup as the model speedup.</p>
 <p>Tables report the mean, sample standard deviation, and two-sided 95% Student-t interval. These describe variation within each recorded window but do not remove sequential drift, autocorrelation, or model and shape dependence.</p>
-<h1 data-number="10" id="results"><span class="header-section-number">10</span> Results</h1>
-<h2 data-number="10.1" id="established-concept-sequence"><span class="header-section-number">10.1</span> Established concept sequence</h2>
+<h1 data-number="5" id="results"><span class="header-section-number">5</span> Results</h1>
+<h2 data-number="5.1" id="established-concept-sequence"><span class="header-section-number">5.1</span> Established concept sequence</h2>
 <p>V0 is the functional baseline: it runs upstream SGLang-JAX but has few model-specific performance optimizations. V1 through V9 add compiler, runtime, and kernel changes below the JAX/PJRT boundary. Commit IDs are recorded in the CSV files.</p>
 <table>
 <caption>End-to-end 128-token generation, 32 retained requests per measurement stage.</caption>
@@ -844,7 +699,7 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: left;">Decode foundation: semantic recovery, dtype, and layout</td>
 <td style="text-align: right;">19.938 ± 0.283</td>
 <td style="text-align: center;">[19.836, 20.040]</td>
-<td style="text-align: right;"><strong>+22.58%</strong></td>
+<td style="text-align: right;">+22.58%</td>
 <td style="text-align: right;">+22.58%</td>
 </tr>
 <tr class="odd">
@@ -852,7 +707,7 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: left;">Expanded-SiLU recognition</td>
 <td style="text-align: right;">20.596 ± 0.279</td>
 <td style="text-align: center;">[20.495, 20.696]</td>
-<td style="text-align: right;"><strong>+3.30%</strong></td>
+<td style="text-align: right;">+3.30%</td>
 <td style="text-align: right;">+26.63%</td>
 </tr>
 <tr class="even">
@@ -860,7 +715,7 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: left;">QKV projection fusion</td>
 <td style="text-align: right;">20.832 ± 0.293</td>
 <td style="text-align: center;">[20.726, 20.938]</td>
-<td style="text-align: right;"><strong>+1.15%</strong></td>
+<td style="text-align: right;">+1.15%</td>
 <td style="text-align: right;">+28.08%</td>
 </tr>
 <tr class="odd">
@@ -868,7 +723,7 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: left;">Two-way shared-LHS matmul</td>
 <td style="text-align: right;">20.479 ± 0.321</td>
 <td style="text-align: center;">[20.363, 20.594]</td>
-<td style="text-align: right;"><strong>-1.69%</strong></td>
+<td style="text-align: right;">-1.69%</td>
 <td style="text-align: right;">+25.91%</td>
 </tr>
 <tr class="even">
@@ -876,7 +731,7 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: left;">Decode RMSNorm width sharding</td>
 <td style="text-align: right;">23.265 ± 0.235</td>
 <td style="text-align: center;">[23.181, 23.350]</td>
-<td style="text-align: right;"><strong>+13.61%</strong></td>
+<td style="text-align: right;">+13.61%</td>
 <td style="text-align: right;">+43.04%</td>
 </tr>
 <tr class="odd">
@@ -892,7 +747,7 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: left;">Dst-resident matmul-SwiGLU epilogue</td>
 <td style="text-align: right;">23.744 ± 0.311</td>
 <td style="text-align: center;">[23.632, 23.856]</td>
-<td style="text-align: right;"><strong>+2.73%</strong></td>
+<td style="text-align: right;">+2.73%</td>
 <td style="text-align: right;">+45.98%</td>
 </tr>
 <tr class="odd">
@@ -906,21 +761,21 @@ x[W_{gate}\;W_{up}].
 <tr class="even">
 <td style="text-align: left;">V9</td>
 <td style="text-align: left;">Fixed-shape prefill trace</td>
-<td style="text-align: right;"><strong>26.123 ± 0.394</strong></td>
+<td style="text-align: right;">26.123 ± 0.394</td>
 <td style="text-align: center;">[25.981, 26.265]</td>
-<td style="text-align: right;"><strong>+10.23%</strong></td>
-<td style="text-align: right;"><strong>+60.61%</strong></td>
+<td style="text-align: right;">+10.23%</td>
+<td style="text-align: right;">+60.61%</td>
 </tr>
 </tbody>
 </table>
 <figure>
-<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTIwIiB2aWV3Qm94PSIwIDAgOTgwIDUyMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SW50ZXIsSGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTcyMDMzfS5heGlze3N0cm9rZTojNzE4MDk2O3N0cm9rZS13aWR0aDoxfS5ncmlke3N0cm9rZTojZGJlNGVlO3N0cm9rZS13aWR0aDoxfS5saW5le2ZpbGw6bm9uZTtzdHJva2U6IzAwNmQ3NztzdHJva2Utd2lkdGg6NH0uY2l7c3Ryb2tlOiNlMjk1Nzg7c3Ryb2tlLXdpZHRoOjN9LmRvdHtmaWxsOiMwMDZkNzc7c3Ryb2tlOndoaXRlO3N0cm9rZS13aWR0aDoyfS5sYWJlbHtmb250LXNpemU6MTRweH0uc21hbGx7Zm9udC1zaXplOjEycHg7ZmlsbDojNTI2MTc0fS50aXRsZXtmb250LXNpemU6MjFweDtmb250LXdlaWdodDo3MDB9PC9zdHlsZT4KPHRleHQgeD0iOTAiIHk9IjI3IiBjbGFzcz0idGl0bGUiPlF3ZW4zLThCIGVuZC10by1lbmQgZ2VuZXJhdGlvbiB0aHJvdWdocHV0PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSI0MTUuMCIgeDI9Ijk1NSIgeTI9IjQxNS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iNDIwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MTU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjM4NS4wIiB4Mj0iOTU1IiB5Mj0iMzg1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIzOTAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xNjwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzU1LjAiIHgyPSI5NTUiIHkyPSIzNTUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM2MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE3PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIzMjUuMCIgeDI9Ijk1NSIgeTI9IjMyNS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMzMwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MTg8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjI5NS4wIiB4Mj0iOTU1IiB5Mj0iMjk1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIzMDAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xOTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjY1LjAiIHgyPSI5NTUiIHkyPSIyNjUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjI3MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjIwPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIyMzUuMCIgeDI9Ijk1NSIgeTI9IjIzNS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMjQwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjE8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjIwNS4wIiB4Mj0iOTU1IiB5Mj0iMjA1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIyMTAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMjwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMTc1LjAiIHgyPSI5NTUiIHkyPSIxNzUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjE4MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjIzPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIxNDUuMCIgeDI9Ijk1NSIgeTI9IjE0NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMTUwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjQ8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjExNS4wIiB4Mj0iOTU1IiB5Mj0iMTE1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxMjAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iODUuMCIgeDI9Ijk1NSIgeTI9Ijg1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSI5MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI2PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSI1NS4wIiB4Mj0iOTU1IiB5Mj0iNTUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjYwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+Mjc8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjQwIiB4Mj0iOTAiIHkyPSI0MTUiIGNsYXNzPSJheGlzIi8+CjxsaW5lIHgxPSI5MCIgeTE9IjQxNSIgeDI9Ijk1NSIgeTI9IjQxNSIgY2xhc3M9ImF4aXMiLz4KPHBvbHlsaW5lIHBvaW50cz0iOTAuMCwzNzcuMSAxODYuMSwyNjYuOSAyODIuMiwyNDcuMSAzNzguMywyNDAuMCA0NzQuNCwyNTAuNiA1NzAuNiwxNjcuMCA2NjYuNywxNzEuNiA3NjIuOCwxNTIuNyA4NTguOSwxNTQuMSA5NTUuMCw4MS4zIiBjbGFzcz0ibGluZSIvPgo8bGluZSB4MT0iOTAuMCIgeTE9IjM3NS43IiB4Mj0iOTAuMCIgeTI9IjM3OC40IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijg0LjAiIHkxPSIzNzUuNyIgeDI9Ijk2LjAiIHkyPSIzNzUuNyIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI4NC4wIiB5MT0iMzc4LjQiIHgyPSI5Ni4wIiB5Mj0iMzc4LjQiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI5MC4wIiBjeT0iMzc3LjEiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iOTAuMCIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYwPC90ZXh0Pgo8dGV4dCB4PSI5MC4wIiB5PSI0NjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+YmFzZWxpbmU8L3RleHQ+CjxsaW5lIHgxPSIxODYuMSIgeTE9IjI2My44IiB4Mj0iMTg2LjEiIHkyPSIyNjkuOSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIxODAuMSIgeTE9IjI2My44IiB4Mj0iMTkyLjEiIHkyPSIyNjMuOCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIxODAuMSIgeTE9IjI2OS45IiB4Mj0iMTkyLjEiIHkyPSIyNjkuOSIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjE4Ni4xIiBjeT0iMjY2LjkiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iMTg2LjEiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMTwvdGV4dD4KPHRleHQgeD0iMTg2LjEiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5kZWNvZGUgZm91bmRhdGlvbjwvdGV4dD4KPGxpbmUgeDE9IjI4Mi4yIiB5MT0iMjQ0LjEiIHgyPSIyODIuMiIgeTI9IjI1MC4yIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjI3Ni4yIiB5MT0iMjQ0LjEiIHgyPSIyODguMiIgeTI9IjI0NC4xIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjI3Ni4yIiB5MT0iMjUwLjIiIHgyPSIyODguMiIgeTI9IjI1MC4yIiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iMjgyLjIiIGN5PSIyNDcuMSIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSIyODIuMiIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYyPC90ZXh0Pgo8dGV4dCB4PSIyODIuMiIgeT0iNDYyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPlNpTFUgZ3JhcGg8L3RleHQ+CjxsaW5lIHgxPSIzNzguMyIgeTE9IjIzNi45IiB4Mj0iMzc4LjMiIHkyPSIyNDMuMiIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzIuMyIgeTE9IjIzNi45IiB4Mj0iMzg0LjMiIHkyPSIyMzYuOSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzIuMyIgeTE9IjI0My4yIiB4Mj0iMzg0LjMiIHkyPSIyNDMuMiIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjM3OC4zIiBjeT0iMjQwLjAiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iMzc4LjMiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMzwvdGV4dD4KPHRleHQgeD0iMzc4LjMiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5RS1YgZ3JhcGg8L3RleHQ+CjxsaW5lIHgxPSI0NzQuNCIgeTE9IjI0Ny4yIiB4Mj0iNDc0LjQiIHkyPSIyNTQuMSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI0NjguNCIgeTE9IjI0Ny4yIiB4Mj0iNDgwLjQiIHkyPSIyNDcuMiIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI0NjguNCIgeTE9IjI1NC4xIiB4Mj0iNDgwLjQiIHkyPSIyNTQuMSIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjQ3NC40IiBjeT0iMjUwLjYiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iNDc0LjQiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNDwvdGV4dD4KPHRleHQgeD0iNDc0LjQiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5zaGFyZWQgTEhTPC90ZXh0Pgo8bGluZSB4MT0iNTcwLjYiIHkxPSIxNjQuNSIgeDI9IjU3MC42IiB5Mj0iMTY5LjYiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNTY0LjYiIHkxPSIxNjQuNSIgeDI9IjU3Ni42IiB5Mj0iMTY0LjUiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNTY0LjYiIHkxPSIxNjkuNiIgeDI9IjU3Ni42IiB5Mj0iMTY5LjYiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI1NzAuNiIgY3k9IjE2Ny4wIiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9IjU3MC42IiB5PSI0NDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+VjU8L3RleHQ+Cjx0ZXh0IHg9IjU3MC42IiB5PSI0NjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+Uk1TTm9ybSBzaGFyZDwvdGV4dD4KPGxpbmUgeDE9IjY2Ni43IiB5MT0iMTY4LjQiIHgyPSI2NjYuNyIgeTI9IjE3NC44IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjY2MC43IiB5MT0iMTY4LjQiIHgyPSI2NzIuNyIgeTI9IjE2OC40IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjY2MC43IiB5MT0iMTc0LjgiIHgyPSI2NzIuNyIgeTI9IjE3NC44IiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iNjY2LjciIGN5PSIxNzEuNiIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSI2NjYuNyIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlY2PC90ZXh0Pgo8dGV4dCB4PSI2NjYuNyIgeT0iNDYyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPlNpTFUgbXVsdGlwbHk8L3RleHQ+CjxsaW5lIHgxPSI3NjIuOCIgeTE9IjE0OS4zIiB4Mj0iNzYyLjgiIHkyPSIxNTYuMCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3NTYuOCIgeTE9IjE0OS4zIiB4Mj0iNzY4LjgiIHkyPSIxNDkuMyIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3NTYuOCIgeTE9IjE1Ni4wIiB4Mj0iNzY4LjgiIHkyPSIxNTYuMCIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9Ijc2Mi44IiBjeT0iMTUyLjciIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iNzYyLjgiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNzwvdGV4dD4KPHRleHQgeD0iNzYyLjgiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5Ec3QgU3dpR0xVPC90ZXh0Pgo8bGluZSB4MT0iODU4LjkiIHkxPSIxNTEuMSIgeDI9Ijg1OC45IiB5Mj0iMTU3LjAiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iODUyLjkiIHkxPSIxNTEuMSIgeDI9Ijg2NC45IiB5Mj0iMTUxLjEiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iODUyLjkiIHkxPSIxNTcuMCIgeDI9Ijg2NC45IiB5Mj0iMTU3LjAiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI4NTguOSIgY3k9IjE1NC4xIiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9Ijg1OC45IiB5PSI0NDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+Vjg8L3RleHQ+Cjx0ZXh0IHg9Ijg1OC45IiB5PSI0NjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+b25lIHBhdGg8L3RleHQ+CjxsaW5lIHgxPSI5NTUuMCIgeTE9Ijc3LjEiIHgyPSI5NTUuMCIgeTI9Ijg1LjYiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iOTQ5LjAiIHkxPSI3Ny4xIiB4Mj0iOTYxLjAiIHkyPSI3Ny4xIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijk0OS4wIiB5MT0iODUuNiIgeDI9Ijk2MS4wIiB5Mj0iODUuNiIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9Ijk1NS4wIiBjeT0iODEuMyIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSI5NTUuMCIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlY5PC90ZXh0Pgo8dGV4dCB4PSI5NTUuMCIgeT0iNDYyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPnByZWZpbGwgdHJhY2U8L3RleHQ+Cjx0ZXh0IHRyYW5zZm9ybT0idHJhbnNsYXRlKDIzIDIyNy41KSByb3RhdGUoLTkwKSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj50b2tlbnMvcyAobWVhbiBhbmQgOTUlIHQgaW50ZXJ2YWwpPC90ZXh0Pgo8dGV4dCB4PSI5MCIgeT0iNTA1IiBjbGFzcz0ic21hbGwiPjMyIHJldGFpbmVkIHJlcXVlc3RzIHBlciByZXZpc2lvbjsgdHdvIGNvbXBpbGUvd2FybS11cCByZXF1ZXN0cyBleGNsdWRlZDsgMTI4IGdlbmVyYXRlZCB0b2tlbnMvcmVxdWVzdC48L3RleHQ+Cjwvc3ZnPgo=" id="fig:throughput" style="width:100.0%" alt /><figcaption>Cumulative throughput across the measured concepts.</figcaption>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTIwIiB2aWV3Qm94PSIwIDAgOTgwIDUyMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxfS5ncmlke3N0cm9rZTojZDBkMGQwO3N0cm9rZS13aWR0aDoxfS5saW5le2ZpbGw6bm9uZTtzdHJva2U6IzExMTtzdHJva2Utd2lkdGg6M30uY2l7c3Ryb2tlOiM2NjY7c3Ryb2tlLXdpZHRoOjJ9LmRvdHtmaWxsOiMxMTE7c3Ryb2tlOndoaXRlO3N0cm9rZS13aWR0aDoxLjV9LmxhYmVse2ZvbnQtc2l6ZToxNHB4fS5zbWFsbHtmb250LXNpemU6MTJweDtmaWxsOiM0NDR9LnRpdGxle2ZvbnQtc2l6ZToyMXB4O2ZvbnQtd2VpZ2h0OjcwMH08L3N0eWxlPgo8dGV4dCB4PSI5MCIgeT0iMjciIGNsYXNzPSJ0aXRsZSI+UXdlbjMtOEIgZW5kLXRvLWVuZCBnZW5lcmF0aW9uIHRocm91Z2hwdXQ8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjQxNS4wIiB4Mj0iOTU1IiB5Mj0iNDE1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSI0MjAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xNTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzg1LjAiIHgyPSI5NTUiIHkyPSIzODUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM5MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE2PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIzNTUuMCIgeDI9Ijk1NSIgeTI9IjM1NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMzYwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MTc8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjMyNS4wIiB4Mj0iOTU1IiB5Mj0iMzI1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIzMzAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xODwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjk1LjAiIHgyPSI5NTUiIHkyPSIyOTUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjMwMC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE5PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIyNjUuMCIgeDI9Ijk1NSIgeTI9IjI2NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMjcwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjA8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjIzNS4wIiB4Mj0iOTU1IiB5Mj0iMjM1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIyNDAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjA1LjAiIHgyPSI5NTUiIHkyPSIyMDUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjIxMC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjIyPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIxNzUuMCIgeDI9Ijk1NSIgeTI9IjE3NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMTgwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjM8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjE0NS4wIiB4Mj0iOTU1IiB5Mj0iMTQ1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxNTAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNDwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMTE1LjAiIHgyPSI5NTUiIHkyPSIxMTUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjEyMC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI1PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSI4NS4wIiB4Mj0iOTU1IiB5Mj0iODUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjkwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjY8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjU1LjAiIHgyPSI5NTUiIHkyPSI1NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iNjAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNzwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iNDAiIHgyPSI5MCIgeTI9IjQxNSIgY2xhc3M9ImF4aXMiLz4KPGxpbmUgeDE9IjkwIiB5MT0iNDE1IiB4Mj0iOTU1IiB5Mj0iNDE1IiBjbGFzcz0iYXhpcyIvPgo8cG9seWxpbmUgcG9pbnRzPSI5MC4wLDM3Ny4xIDE4Ni4xLDI2Ni45IDI4Mi4yLDI0Ny4xIDM3OC4zLDI0MC4wIDQ3NC40LDI1MC42IDU3MC42LDE2Ny4wIDY2Ni43LDE3MS42IDc2Mi44LDE1Mi43IDg1OC45LDE1NC4xIDk1NS4wLDgxLjMiIGNsYXNzPSJsaW5lIi8+CjxsaW5lIHgxPSI5MC4wIiB5MT0iMzc1LjciIHgyPSI5MC4wIiB5Mj0iMzc4LjQiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iODQuMCIgeTE9IjM3NS43IiB4Mj0iOTYuMCIgeTI9IjM3NS43IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijg0LjAiIHkxPSIzNzguNCIgeDI9Ijk2LjAiIHkyPSIzNzguNCIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjkwLjAiIGN5PSIzNzcuMSIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSI5MC4wIiB5PSI0NDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+VjA8L3RleHQ+Cjx0ZXh0IHg9IjkwLjAiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5iYXNlbGluZTwvdGV4dD4KPGxpbmUgeDE9IjE4Ni4xIiB5MT0iMjYzLjgiIHgyPSIxODYuMSIgeTI9IjI2OS45IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjE4MC4xIiB5MT0iMjYzLjgiIHgyPSIxOTIuMSIgeTI9IjI2My44IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjE4MC4xIiB5MT0iMjY5LjkiIHgyPSIxOTIuMSIgeTI9IjI2OS45IiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iMTg2LjEiIGN5PSIyNjYuOSIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSIxODYuMSIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYxPC90ZXh0Pgo8dGV4dCB4PSIxODYuMSIgeT0iNDYyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPmRlY29kZSBmb3VuZGF0aW9uPC90ZXh0Pgo8bGluZSB4MT0iMjgyLjIiIHkxPSIyNDQuMSIgeDI9IjI4Mi4yIiB5Mj0iMjUwLjIiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMjc2LjIiIHkxPSIyNDQuMSIgeDI9IjI4OC4yIiB5Mj0iMjQ0LjEiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMjc2LjIiIHkxPSIyNTAuMiIgeDI9IjI4OC4yIiB5Mj0iMjUwLjIiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSIyODIuMiIgY3k9IjI0Ny4xIiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9IjI4Mi4yIiB5PSI0NDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+VjI8L3RleHQ+Cjx0ZXh0IHg9IjI4Mi4yIiB5PSI0NjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+U2lMVSBncmFwaDwvdGV4dD4KPGxpbmUgeDE9IjM3OC4zIiB5MT0iMjM2LjkiIHgyPSIzNzguMyIgeTI9IjI0My4yIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjM3Mi4zIiB5MT0iMjM2LjkiIHgyPSIzODQuMyIgeTI9IjIzNi45IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjM3Mi4zIiB5MT0iMjQzLjIiIHgyPSIzODQuMyIgeTI9IjI0My4yIiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iMzc4LjMiIGN5PSIyNDAuMCIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSIzNzguMyIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYzPC90ZXh0Pgo8dGV4dCB4PSIzNzguMyIgeT0iNDYyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPlFLViBncmFwaDwvdGV4dD4KPGxpbmUgeDE9IjQ3NC40IiB5MT0iMjQ3LjIiIHgyPSI0NzQuNCIgeTI9IjI1NC4xIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjQ2OC40IiB5MT0iMjQ3LjIiIHgyPSI0ODAuNCIgeTI9IjI0Ny4yIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjQ2OC40IiB5MT0iMjU0LjEiIHgyPSI0ODAuNCIgeTI9IjI1NC4xIiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iNDc0LjQiIGN5PSIyNTAuNiIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSI0NzQuNCIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlY0PC90ZXh0Pgo8dGV4dCB4PSI0NzQuNCIgeT0iNDYyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPnNoYXJlZCBMSFM8L3RleHQ+CjxsaW5lIHgxPSI1NzAuNiIgeTE9IjE2NC41IiB4Mj0iNTcwLjYiIHkyPSIxNjkuNiIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI1NjQuNiIgeTE9IjE2NC41IiB4Mj0iNTc2LjYiIHkyPSIxNjQuNSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI1NjQuNiIgeTE9IjE2OS42IiB4Mj0iNTc2LjYiIHkyPSIxNjkuNiIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjU3MC42IiBjeT0iMTY3LjAiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iNTcwLjYiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNTwvdGV4dD4KPHRleHQgeD0iNTcwLjYiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5STVNOb3JtIHNoYXJkPC90ZXh0Pgo8bGluZSB4MT0iNjY2LjciIHkxPSIxNjguNCIgeDI9IjY2Ni43IiB5Mj0iMTc0LjgiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNjYwLjciIHkxPSIxNjguNCIgeDI9IjY3Mi43IiB5Mj0iMTY4LjQiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNjYwLjciIHkxPSIxNzQuOCIgeDI9IjY3Mi43IiB5Mj0iMTc0LjgiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI2NjYuNyIgY3k9IjE3MS42IiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9IjY2Ni43IiB5PSI0NDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+VjY8L3RleHQ+Cjx0ZXh0IHg9IjY2Ni43IiB5PSI0NjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+U2lMVSBtdWx0aXBseTwvdGV4dD4KPGxpbmUgeDE9Ijc2Mi44IiB5MT0iMTQ5LjMiIHgyPSI3NjIuOCIgeTI9IjE1Ni4wIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijc1Ni44IiB5MT0iMTQ5LjMiIHgyPSI3NjguOCIgeTI9IjE0OS4zIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijc1Ni44IiB5MT0iMTU2LjAiIHgyPSI3NjguOCIgeTI9IjE1Ni4wIiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iNzYyLjgiIGN5PSIxNTIuNyIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSI3NjIuOCIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlY3PC90ZXh0Pgo8dGV4dCB4PSI3NjIuOCIgeT0iNDYyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPkRzdCBTd2lHTFU8L3RleHQ+CjxsaW5lIHgxPSI4NTguOSIgeTE9IjE1MS4xIiB4Mj0iODU4LjkiIHkyPSIxNTcuMCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI4NTIuOSIgeTE9IjE1MS4xIiB4Mj0iODY0LjkiIHkyPSIxNTEuMSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI4NTIuOSIgeTE9IjE1Ny4wIiB4Mj0iODY0LjkiIHkyPSIxNTcuMCIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9Ijg1OC45IiBjeT0iMTU0LjEiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iODU4LjkiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WODwvdGV4dD4KPHRleHQgeD0iODU4LjkiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5vbmUgcGF0aDwvdGV4dD4KPGxpbmUgeDE9Ijk1NS4wIiB5MT0iNzcuMSIgeDI9Ijk1NS4wIiB5Mj0iODUuNiIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI5NDkuMCIgeTE9Ijc3LjEiIHgyPSI5NjEuMCIgeTI9Ijc3LjEiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iOTQ5LjAiIHkxPSI4NS42IiB4Mj0iOTYxLjAiIHkyPSI4NS42IiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iOTU1LjAiIGN5PSI4MS4zIiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9Ijk1NS4wIiB5PSI0NDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+Vjk8L3RleHQ+Cjx0ZXh0IHg9Ijk1NS4wIiB5PSI0NjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+cHJlZmlsbCB0cmFjZTwvdGV4dD4KPHRleHQgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoMjMgMjI3LjUpIHJvdGF0ZSgtOTApIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPnRva2Vucy9zIChtZWFuIGFuZCA5NSUgdCBpbnRlcnZhbCk8L3RleHQ+Cjx0ZXh0IHg9IjkwIiB5PSI1MDUiIGNsYXNzPSJzbWFsbCI+MzIgcmV0YWluZWQgcmVxdWVzdHMgcGVyIHJldmlzaW9uOyB0d28gY29tcGlsZS93YXJtLXVwIHJlcXVlc3RzIGV4Y2x1ZGVkOyAxMjggZ2VuZXJhdGVkIHRva2Vucy9yZXF1ZXN0LjwvdGV4dD4KPC9zdmc+Cg==" id="fig:throughput" style="width:100.0%" alt /><figcaption>Cumulative throughput across the measured concepts.</figcaption>
 </figure>
 <figure>
-<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTAwIiB2aWV3Qm94PSIwIDAgOTgwIDUwMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SW50ZXIsSGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTcyMDMzfS5heGlze3N0cm9rZTojNzE4MDk2O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkYmU0ZWU7c3Ryb2tlLXdpZHRoOjF9LnBvc3tmaWxsOiMwMDZkNzd9Lm5lZ3tmaWxsOiNjODRiMzF9LmxhYmVse2ZvbnQtc2l6ZToxNHB4fS5zbWFsbHtmb250LXNpemU6MTJweDtmaWxsOiM1MjYxNzR9LnZhbHVle2ZvbnQtc2l6ZToxM3B4O2ZvbnQtd2VpZ2h0OjcwMH0udGl0bGV7Zm9udC1zaXplOjIxcHg7Zm9udC13ZWlnaHQ6NzAwfTwvc3R5bGU+Cjx0ZXh0IHg9IjkwIiB5PSIyOSIgY2xhc3M9InRpdGxlIj5JbmNyZW1lbnRhbCB0aHJvdWdocHV0IGNoYW5nZTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzg2LjkiIHgyPSI5NTUiIHkyPSIzODYuOSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM5MS45IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPi0yJTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzYwLjYiIHgyPSI5NTUiIHkyPSIzNjAuNiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM2NS42IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjAlPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIzMDguMCIgeDI9Ijk1NSIgeTI9IjMwOC4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMzEzLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+NCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjI1NS40IiB4Mj0iOTU1IiB5Mj0iMjU1LjQiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIyNjAuNCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj44JTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjAyLjgiIHgyPSI5NTUiIHkyPSIyMDIuOCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjIwNy44IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjEyJTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMTUwLjIiIHgyPSI5NTUiIHkyPSIxNTAuMiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjE1NS4yIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE2JTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iOTcuNiIgeDI9Ijk1NSIgeTI9Ijk3LjYiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxMDIuNiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjQ1LjAiIHgyPSI5NTUiIHkyPSI0NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iNTAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjM2MC42IiB4Mj0iOTU1IiB5Mj0iMzYwLjYiIGNsYXNzPSJheGlzIi8+CjxyZWN0IHg9IjEwNy4zIiB5PSI2My42IiB3aWR0aD0iNjEuNSIgaGVpZ2h0PSIyOTYuOSIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iMTM4LjEiIHk9IjU1LjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzIyLjU4JTwvdGV4dD4KPHRleHQgeD0iMTM4LjEiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMTwvdGV4dD4KPHRleHQgeD0iMTM4LjEiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5kZWNvZGUgZm91bmRhdGlvbjwvdGV4dD4KPHJlY3QgeD0iMjAzLjQiIHk9IjMxNy4yIiB3aWR0aD0iNjEuNSIgaGVpZ2h0PSI0My40IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSIyMzQuMiIgeT0iMzA5LjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzMuMzAlPC90ZXh0Pgo8dGV4dCB4PSIyMzQuMiIgeT0iNDI5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYyPC90ZXh0Pgo8dGV4dCB4PSIyMzQuMiIgeT0iNDQ4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPlNpTFUgZ3JhcGg8L3RleHQ+CjxyZWN0IHg9IjI5OS41IiB5PSIzNDUuNSIgd2lkdGg9IjYxLjUiIGhlaWdodD0iMTUuMSIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iMzMwLjMiIHk9IjMzNy41IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPisxLjE1JTwvdGV4dD4KPHRleHQgeD0iMzMwLjMiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMzwvdGV4dD4KPHRleHQgeD0iMzMwLjMiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5RS1YgZ3JhcGg8L3RleHQ+CjxyZWN0IHg9IjM5NS42IiB5PSIzNjAuNiIgd2lkdGg9IjYxLjUiIGhlaWdodD0iMjIuMyIgcng9IjMiIGNsYXNzPSJuZWciLz4KPHRleHQgeD0iNDI2LjQiIHk9IjQwMC44IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPi0xLjY5JTwvdGV4dD4KPHRleHQgeD0iNDI2LjQiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNDwvdGV4dD4KPHRleHQgeD0iNDI2LjQiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5zaGFyZWQgTEhTPC90ZXh0Pgo8cmVjdCB4PSI0OTEuNyIgeT0iMTgxLjYiIHdpZHRoPSI2MS41IiBoZWlnaHQ9IjE3OC45IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSI1MjIuNSIgeT0iMTczLjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzEzLjYxJTwvdGV4dD4KPHRleHQgeD0iNTIyLjUiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNTwvdGV4dD4KPHRleHQgeD0iNTIyLjUiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5STVNOb3JtIHNoYXJkPC90ZXh0Pgo8cmVjdCB4PSI1ODcuOSIgeT0iMzYwLjYiIHdpZHRoPSI2MS41IiBoZWlnaHQ9IjguNiIgcng9IjMiIGNsYXNzPSJuZWciLz4KPHRleHQgeD0iNjE4LjYiIHk9IjM4Ny4xIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPi0wLjY1JTwvdGV4dD4KPHRleHQgeD0iNjE4LjYiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNjwvdGV4dD4KPHRleHQgeD0iNjE4LjYiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5TaUxVIG11bHRpcGx5PC90ZXh0Pgo8cmVjdCB4PSI2ODQuMCIgeT0iMzI0LjciIHdpZHRoPSI2MS41IiBoZWlnaHQ9IjM1LjkiIHJ4PSIzIiBjbGFzcz0icG9zIi8+Cjx0ZXh0IHg9IjcxNC43IiB5PSIzMTYuNyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4rMi43MyU8L3RleHQ+Cjx0ZXh0IHg9IjcxNC43IiB5PSI0MjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+Vjc8L3RleHQ+Cjx0ZXh0IHg9IjcxNC43IiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+RHN0IFN3aUdMVTwvdGV4dD4KPHJlY3QgeD0iNzgwLjEiIHk9IjM2MC42IiB3aWR0aD0iNjEuNSIgaGVpZ2h0PSIyLjUiIHJ4PSIzIiBjbGFzcz0ibmVnIi8+Cjx0ZXh0IHg9IjgxMC44IiB5PSIzODEuMSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4tMC4xOSU8L3RleHQ+Cjx0ZXh0IHg9IjgxMC44IiB5PSI0MjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+Vjg8L3RleHQ+Cjx0ZXh0IHg9IjgxMC44IiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+b25lIHBhdGg8L3RleHQ+CjxyZWN0IHg9Ijg3Ni4yIiB5PSIyMjYuMCIgd2lkdGg9IjYxLjUiIGhlaWdodD0iMTM0LjUiIHJ4PSIzIiBjbGFzcz0icG9zIi8+Cjx0ZXh0IHg9IjkwNi45IiB5PSIyMTguMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4rMTAuMjMlPC90ZXh0Pgo8dGV4dCB4PSI5MDYuOSIgeT0iNDI5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlY5PC90ZXh0Pgo8dGV4dCB4PSI5MDYuOSIgeT0iNDQ4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPnByZWZpbGwgdHJhY2U8L3RleHQ+Cjx0ZXh0IHRyYW5zZm9ybT0idHJhbnNsYXRlKDIzIDIyMi41KSByb3RhdGUoLTkwKSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj50aHJvdWdocHV0IGNoYW5nZSB2cy4gcHJlY2VkaW5nIHN0YWdlPC90ZXh0Pgo8dGV4dCB4PSI5MCIgeT0iNDgyIiBjbGFzcz0ic21hbGwiPkJhcnMgc2hvdyB0aGUgbWVhc3VyZWQgdGhyb3VnaHB1dCBjaGFuZ2UgZnJvbSB0aGUgcHJlY2VkaW5nIHN0YWdlLjwvdGV4dD4KPC9zdmc+Cg==" id="fig:incremental" style="width:100.0%" alt /><figcaption>Incremental effect of each concept in the established sequence.</figcaption>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTAwIiB2aWV3Qm94PSIwIDAgOTgwIDUwMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkMGQwZDA7c3Ryb2tlLXdpZHRoOjF9LnBvc3tmaWxsOiMzMzN9Lm5lZ3tmaWxsOiNhYWF9LmxhYmVse2ZvbnQtc2l6ZToxNHB4fS5zbWFsbHtmb250LXNpemU6MTJweDtmaWxsOiM0NDR9LnZhbHVle2ZvbnQtc2l6ZToxM3B4O2ZvbnQtd2VpZ2h0OjcwMH0udGl0bGV7Zm9udC1zaXplOjIxcHg7Zm9udC13ZWlnaHQ6NzAwfTwvc3R5bGU+Cjx0ZXh0IHg9IjkwIiB5PSIyOSIgY2xhc3M9InRpdGxlIj5JbmNyZW1lbnRhbCB0aHJvdWdocHV0IGNoYW5nZTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzg2LjkiIHgyPSI5NTUiIHkyPSIzODYuOSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM5MS45IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPi0yJTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzYwLjYiIHgyPSI5NTUiIHkyPSIzNjAuNiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM2NS42IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjAlPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIzMDguMCIgeDI9Ijk1NSIgeTI9IjMwOC4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMzEzLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+NCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjI1NS40IiB4Mj0iOTU1IiB5Mj0iMjU1LjQiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIyNjAuNCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj44JTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjAyLjgiIHgyPSI5NTUiIHkyPSIyMDIuOCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjIwNy44IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjEyJTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMTUwLjIiIHgyPSI5NTUiIHkyPSIxNTAuMiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjE1NS4yIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE2JTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iOTcuNiIgeDI9Ijk1NSIgeTI9Ijk3LjYiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxMDIuNiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjQ1LjAiIHgyPSI5NTUiIHkyPSI0NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iNTAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjM2MC42IiB4Mj0iOTU1IiB5Mj0iMzYwLjYiIGNsYXNzPSJheGlzIi8+CjxyZWN0IHg9IjEwNy4zIiB5PSI2My42IiB3aWR0aD0iNjEuNSIgaGVpZ2h0PSIyOTYuOSIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iMTM4LjEiIHk9IjU1LjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzIyLjU4JTwvdGV4dD4KPHRleHQgeD0iMTM4LjEiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMTwvdGV4dD4KPHRleHQgeD0iMTM4LjEiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5kZWNvZGUgZm91bmRhdGlvbjwvdGV4dD4KPHJlY3QgeD0iMjAzLjQiIHk9IjMxNy4yIiB3aWR0aD0iNjEuNSIgaGVpZ2h0PSI0My40IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSIyMzQuMiIgeT0iMzA5LjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzMuMzAlPC90ZXh0Pgo8dGV4dCB4PSIyMzQuMiIgeT0iNDI5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYyPC90ZXh0Pgo8dGV4dCB4PSIyMzQuMiIgeT0iNDQ4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPlNpTFUgZ3JhcGg8L3RleHQ+CjxyZWN0IHg9IjI5OS41IiB5PSIzNDUuNSIgd2lkdGg9IjYxLjUiIGhlaWdodD0iMTUuMSIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iMzMwLjMiIHk9IjMzNy41IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPisxLjE1JTwvdGV4dD4KPHRleHQgeD0iMzMwLjMiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMzwvdGV4dD4KPHRleHQgeD0iMzMwLjMiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5RS1YgZ3JhcGg8L3RleHQ+CjxyZWN0IHg9IjM5NS42IiB5PSIzNjAuNiIgd2lkdGg9IjYxLjUiIGhlaWdodD0iMjIuMyIgcng9IjMiIGNsYXNzPSJuZWciLz4KPHRleHQgeD0iNDI2LjQiIHk9IjQwMC44IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPi0xLjY5JTwvdGV4dD4KPHRleHQgeD0iNDI2LjQiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNDwvdGV4dD4KPHRleHQgeD0iNDI2LjQiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5zaGFyZWQgTEhTPC90ZXh0Pgo8cmVjdCB4PSI0OTEuNyIgeT0iMTgxLjYiIHdpZHRoPSI2MS41IiBoZWlnaHQ9IjE3OC45IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSI1MjIuNSIgeT0iMTczLjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzEzLjYxJTwvdGV4dD4KPHRleHQgeD0iNTIyLjUiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNTwvdGV4dD4KPHRleHQgeD0iNTIyLjUiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5STVNOb3JtIHNoYXJkPC90ZXh0Pgo8cmVjdCB4PSI1ODcuOSIgeT0iMzYwLjYiIHdpZHRoPSI2MS41IiBoZWlnaHQ9IjguNiIgcng9IjMiIGNsYXNzPSJuZWciLz4KPHRleHQgeD0iNjE4LjYiIHk9IjM4Ny4xIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPi0wLjY1JTwvdGV4dD4KPHRleHQgeD0iNjE4LjYiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNjwvdGV4dD4KPHRleHQgeD0iNjE4LjYiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5TaUxVIG11bHRpcGx5PC90ZXh0Pgo8cmVjdCB4PSI2ODQuMCIgeT0iMzI0LjciIHdpZHRoPSI2MS41IiBoZWlnaHQ9IjM1LjkiIHJ4PSIzIiBjbGFzcz0icG9zIi8+Cjx0ZXh0IHg9IjcxNC43IiB5PSIzMTYuNyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4rMi43MyU8L3RleHQ+Cjx0ZXh0IHg9IjcxNC43IiB5PSI0MjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+Vjc8L3RleHQ+Cjx0ZXh0IHg9IjcxNC43IiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+RHN0IFN3aUdMVTwvdGV4dD4KPHJlY3QgeD0iNzgwLjEiIHk9IjM2MC42IiB3aWR0aD0iNjEuNSIgaGVpZ2h0PSIyLjUiIHJ4PSIzIiBjbGFzcz0ibmVnIi8+Cjx0ZXh0IHg9IjgxMC44IiB5PSIzODEuMSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4tMC4xOSU8L3RleHQ+Cjx0ZXh0IHg9IjgxMC44IiB5PSI0MjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+Vjg8L3RleHQ+Cjx0ZXh0IHg9IjgxMC44IiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+b25lIHBhdGg8L3RleHQ+CjxyZWN0IHg9Ijg3Ni4yIiB5PSIyMjYuMCIgd2lkdGg9IjYxLjUiIGhlaWdodD0iMTM0LjUiIHJ4PSIzIiBjbGFzcz0icG9zIi8+Cjx0ZXh0IHg9IjkwNi45IiB5PSIyMTguMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4rMTAuMjMlPC90ZXh0Pgo8dGV4dCB4PSI5MDYuOSIgeT0iNDI5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlY5PC90ZXh0Pgo8dGV4dCB4PSI5MDYuOSIgeT0iNDQ4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPnByZWZpbGwgdHJhY2U8L3RleHQ+Cjx0ZXh0IHRyYW5zZm9ybT0idHJhbnNsYXRlKDIzIDIyMi41KSByb3RhdGUoLTkwKSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj50aHJvdWdocHV0IGNoYW5nZSB2cy4gcHJlY2VkaW5nIHN0YWdlPC90ZXh0Pgo8dGV4dCB4PSI5MCIgeT0iNDgyIiBjbGFzcz0ic21hbGwiPkJhcnMgc2hvdyB0aGUgbWVhc3VyZWQgdGhyb3VnaHB1dCBjaGFuZ2UgZnJvbSB0aGUgcHJlY2VkaW5nIHN0YWdlLjwvdGV4dD4KPC9zdmc+Cg==" id="fig:incremental" style="width:100.0%" alt /><figcaption>Incremental effect of each concept in the established sequence.</figcaption>
 </figure>
 <p>The negative and near-zero rows explain the final design: shared-LHS fusion materializes too much data, consumer-side SiLU leaves the producer boundary, and fallback removal changes coverage rather than the kernel.</p>
-<h2 data-number="10.2" id="current-kernel-ab-experiments"><span class="header-section-number">10.2</span> Current kernel A/B experiments</h2>
+<h2 data-number="5.2" id="current-kernel-ab-experiments"><span class="header-section-number">5.2</span> Current kernel A/B experiments</h2>
 <table>
 <caption>Current-branch streaming results, 32 retained samples per configuration. Width 4 is compared with width 2; the down projection is compared with the same width-4 binary/configuration with the specialization disabled.</caption>
 <colgroup>
@@ -956,15 +811,15 @@ x[W_{gate}\;W_{up}].
 </tr>
 <tr class="odd">
 <td style="text-align: left;">K block 4, 110-core down</td>
-<td style="text-align: right;"><strong>27.753 ± 0.330</strong></td>
-<td style="text-align: center;"><strong>[27.634, 27.872]</strong></td>
-<td style="text-align: right;"><strong>27.619 ± 0.322</strong></td>
-<td style="text-align: right;"><strong>+5.96%</strong></td>
+<td style="text-align: right;">27.753 ± 0.330</td>
+<td style="text-align: center;">[27.634, 27.872]</td>
+<td style="text-align: right;">27.619 ± 0.322</td>
+<td style="text-align: right;">+5.96%</td>
 </tr>
 </tbody>
 </table>
 <p>The down projection cuts mean decode time from 38.179 to 36.032 ms/token, a 2.147 ms/token saving. Streaming end-to-end throughput rises by 5.88%, from 26.085 to 27.619 tokens/s. TTFT remains about 58 ms.</p>
-<h2 data-number="10.3" id="device-profile-of-the-down-projection"><span class="header-section-number">10.3</span> Device profile of the down projection</h2>
+<h2 data-number="5.3" id="device-profile-of-the-down-projection"><span class="header-section-number">5.3</span> Device profile of the down projection</h2>
 <p>The direct TT-Metal profile identifies 36 occurrences per token, matching the 36 Qwen3-8B decoder layers. Exactly those operation positions change from 64 to 110 workers.</p>
 <table>
 <thead>
@@ -986,13 +841,13 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: left;">Mean kernel time/layer</td>
 <td style="text-align: right;">217.188 µs</td>
 <td style="text-align: right;">154.932 µs</td>
-<td style="text-align: right;"><strong>-28.66%</strong></td>
+<td style="text-align: right;">-28.66%</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Effective BFP8 weight bandwidth</td>
 <td style="text-align: right;">246.2 GB/s</td>
 <td style="text-align: right;">345.2 GB/s</td>
-<td style="text-align: right;"><strong>+40.18%</strong></td>
+<td style="text-align: right;">+40.18%</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">Projected 36-layer saving</td>
@@ -1003,8 +858,8 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The projected kernel saving is close to the observed 2.147 ms/token. The new program reaches about 92% of the previously measured 375.1 GB/s SwiGLU effective bandwidth. This agreement between operation profile and end-to-end measurement supports the causal attribution.</p>
-<h2 data-number="10.4" id="upstream-tt-inference-server-reference"><span class="header-section-number">10.4</span> Upstream tt-inference-server reference</h2>
-<p>Tenstorrent’s tt-inference-server is an OpenAI-compatible service built around vLLM and TT-Transformers [25]. It enters the stack above TTNN rather than through JAX, StableHLO, and TT-MLIR:</p>
+<h2 data-number="5.4" id="upstream-tt-inference-server-reference"><span class="header-section-number">5.4</span> Upstream tt-inference-server reference</h2>
+<p>Tenstorrent’s tt-inference-server is an OpenAI-compatible service built around vLLM and TT-Transformers [14]. It enters the stack above TTNN rather than through JAX, StableHLO, and TT-MLIR:</p>
 <pre class="text"><code>libtt:  SGLang-JAX → JAX/StableHLO → PJRT/TT-XLA/TT-MLIR → TTNN → TT-Metal
 TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-Metal</code></pre>
 <p>The two stacks use different porting strategies. TTIS uses TT-specific code in the inference engine, transformer implementation, TTNN, and TT-Metal. libtt keeps SGLang-JAX and the JAX model largely unchanged, then optimizes the compiler, runtime, and kernels below PJRT.</p>
@@ -1027,9 +882,9 @@ TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-M
 <tbody>
 <tr class="odd">
 <td style="text-align: left;">libtt current (<code>37d5460</code>)</td>
-<td style="text-align: right;"><strong>27.753 ± 0.330 [27.634, 27.872]</strong></td>
-<td style="text-align: right;"><strong>27.619 ± 0.322 [27.503, 27.735]</strong></td>
-<td style="text-align: right;"><strong>58.45 ± 1.50 ms</strong></td>
+<td style="text-align: right;">27.753 ± 0.330 [27.634, 27.872]</td>
+<td style="text-align: right;">27.619 ± 0.322 [27.503, 27.735]</td>
+<td style="text-align: right;">58.45 ± 1.50 ms</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">TTIS v0.10.0</td>
@@ -1040,10 +895,10 @@ TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-M
 </tbody>
 </table>
 <figure>
-<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTEwIiB2aWV3Qm94PSIwIDAgOTgwIDUxMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SW50ZXIsSGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTcyMDMzfS5heGlze3N0cm9rZTojNzE4MDk2O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkYmU0ZWU7c3Ryb2tlLXdpZHRoOjF9LmxpYnR0e2ZpbGw6IzAwNmQ3N30udXBzdHJlYW17ZmlsbDojZTI5NTc4fS5jaXtzdHJva2U6IzE3MjAzMztzdHJva2Utd2lkdGg6M30ubGFiZWx7Zm9udC1zaXplOjE0cHh9LnNtYWxse2ZvbnQtc2l6ZToxMnB4O2ZpbGw6IzUyNjE3NH0udmFsdWV7Zm9udC1zaXplOjE1cHg7Zm9udC13ZWlnaHQ6NzAwfS50aXRsZXtmb250LXNpemU6MjFweDtmb250LXdlaWdodDo3MDB9LmxlZ2VuZHtmb250LXNpemU6MTNweH08L3N0eWxlPgo8dGV4dCB4PSIxMDAiIHk9IjI5IiBjbGFzcz0idGl0bGUiPlNhbWUtY2xvY2sgUXdlbjMtOEIgc3RyZWFtaW5nIGNvbXBhcmlzb248L3RleHQ+CjxyZWN0IHg9IjYwOCIgeT0iMTYiIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgcng9IjIiIGNsYXNzPSJsaWJ0dCIvPgo8dGV4dCB4PSI2MzEiIHk9IjI5IiBjbGFzcz0ibGVnZW5kIj5saWJ0dCAzN2Q1NDYwPC90ZXh0Pgo8cmVjdCB4PSI3NjAiIHk9IjE2IiB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHJ4PSIyIiBjbGFzcz0idXBzdHJlYW0iLz4KPHRleHQgeD0iNzgzIiB5PSIyOSIgY2xhc3M9ImxlZ2VuZCI+VFRJUyB2MC4xMC4wPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMzk1LjAiIHgyPSI5NTAiIHkyPSIzOTUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjQwMC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjA8L3RleHQ+CjxsaW5lIHgxPSIxMDAiIHkxPSIzNDAuMCIgeDI9Ijk1MCIgeTI9IjM0MC4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI4OCIgeT0iMzQ1LjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+NTwvdGV4dD4KPGxpbmUgeDE9IjEwMCIgeTE9IjI4NS4wIiB4Mj0iOTUwIiB5Mj0iMjg1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSIyOTAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xMDwvdGV4dD4KPGxpbmUgeDE9IjEwMCIgeTE9IjIzMC4wIiB4Mj0iOTUwIiB5Mj0iMjMwLjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSIyMzUuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xNTwvdGV4dD4KPGxpbmUgeDE9IjEwMCIgeTE9IjE3NS4wIiB4Mj0iOTUwIiB5Mj0iMTc1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSIxODAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMDwvdGV4dD4KPGxpbmUgeDE9IjEwMCIgeTE9IjEyMC4wIiB4Mj0iOTUwIiB5Mj0iMTIwLjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSIxMjUuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNTwvdGV4dD4KPGxpbmUgeDE9IjEwMCIgeTE9IjY1LjAiIHgyPSI5NTAiIHkyPSI2NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI4OCIgeT0iNzAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4zMDwvdGV4dD4KPGxpbmUgeDE9IjEwMCIgeTE9IjY1IiB4Mj0iMTAwIiB5Mj0iMzk1IiBjbGFzcz0iYXhpcyIvPgo8bGluZSB4MT0iMTAwIiB5MT0iMzk1IiB4Mj0iOTUwIiB5Mj0iMzk1IiBjbGFzcz0iYXhpcyIvPgo8cmVjdCB4PSIxODguNSIgeT0iODkuNyIgd2lkdGg9IjExMiIgaGVpZ2h0PSIzMDUuMyIgcng9IjQiIGNsYXNzPSJsaWJ0dCIvPgo8bGluZSB4MT0iMjQ0LjUiIHkxPSI4OC40IiB4Mj0iMjQ0LjUiIHkyPSI5MS4wIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjIzNy41IiB5MT0iODguNCIgeDI9IjI1MS41IiB5Mj0iODguNCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIyMzcuNSIgeTE9IjkxLjAiIHgyPSIyNTEuNSIgeTI9IjkxLjAiIGNsYXNzPSJjaSIvPgo8dGV4dCB4PSIyNDQuNSIgeT0iNzcuNyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNy43NTM8L3RleHQ+CjxyZWN0IHg9IjMyNC41IiB5PSIxMjEuMiIgd2lkdGg9IjExMiIgaGVpZ2h0PSIyNzMuOCIgcng9IjQiIGNsYXNzPSJ1cHN0cmVhbSIvPgo8bGluZSB4MT0iMzgwLjUiIHkxPSIxMTkuMSIgeDI9IjM4MC41IiB5Mj0iMTIzLjMiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMzczLjUiIHkxPSIxMTkuMSIgeDI9IjM4Ny41IiB5Mj0iMTE5LjEiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMzczLjUiIHkxPSIxMjMuMyIgeDI9IjM4Ny41IiB5Mj0iMTIzLjMiIGNsYXNzPSJjaSIvPgo8dGV4dCB4PSIzODAuNSIgeT0iMTA5LjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+MjQuODg3PC90ZXh0Pgo8dGV4dCB4PSIzMTIuNSIgeT0iNDI0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlB1cmUgZGVjb2RlPC90ZXh0Pgo8cmVjdCB4PSI2MTMuNSIgeT0iOTEuMiIgd2lkdGg9IjExMiIgaGVpZ2h0PSIzMDMuOCIgcng9IjQiIGNsYXNzPSJsaWJ0dCIvPgo8bGluZSB4MT0iNjY5LjUiIHkxPSI4OS45IiB4Mj0iNjY5LjUiIHkyPSI5Mi41IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjY2Mi41IiB5MT0iODkuOSIgeDI9IjY3Ni41IiB5Mj0iODkuOSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI2NjIuNSIgeTE9IjkyLjUiIHgyPSI2NzYuNSIgeTI9IjkyLjUiIGNsYXNzPSJjaSIvPgo8dGV4dCB4PSI2NjkuNSIgeT0iNzkuMiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNy42MTk8L3RleHQ+CjxyZWN0IHg9Ijc0OS41IiB5PSIxMjIuNSIgd2lkdGg9IjExMiIgaGVpZ2h0PSIyNzIuNSIgcng9IjQiIGNsYXNzPSJ1cHN0cmVhbSIvPgo8bGluZSB4MT0iODA1LjUiIHkxPSIxMjAuNCIgeDI9IjgwNS41IiB5Mj0iMTI0LjUiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNzk4LjUiIHkxPSIxMjAuNCIgeDI9IjgxMi41IiB5Mj0iMTIwLjQiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNzk4LjUiIHkxPSIxMjQuNSIgeDI9IjgxMi41IiB5Mj0iMTI0LjUiIGNsYXNzPSJjaSIvPgo8dGV4dCB4PSI4MDUuNSIgeT0iMTEwLjUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+MjQuNzc2PC90ZXh0Pgo8dGV4dCB4PSI3MzcuNSIgeT0iNDI0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlN0cmVhbWluZyBFMkU8L3RleHQ+Cjx0ZXh0IHRyYW5zZm9ybT0idHJhbnNsYXRlKDI1IDIzMC4wKSByb3RhdGUoLTkwKSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj50b2tlbnMvcyAobWVhbiBhbmQgOTUlIHQgaW50ZXJ2YWwpPC90ZXh0Pgo8dGV4dCB4PSIxMDAiIHk9IjQ2MiIgY2xhc3M9InNtYWxsIj4zMiByZXRhaW5lZCBzZXJpYWwgcmVxdWVzdHMgcGVyIGltcGxlbWVudGF0aW9uOyB0d28gd2FybS11cHM7IDEyOCBnZW5lcmF0ZWQgdG9rZW5zL3JlcXVlc3QuPC90ZXh0Pgo8dGV4dCB4PSIxMDAiIHk9IjQ4MiIgY2xhc3M9InNtYWxsIj5Cb3RoIHVzZSB0aGUgc2FtZSBsb29wYmFjayBzdHJlYW1pbmcgY2xvY2s6IDEyNyBpbnRlci10b2tlbiBpbnRlcnZhbHMgZm9yIGRlY29kZSBhbmQgcmVxdWVzdC10by1sYXN0LXRva2VuIGZvciBFMkUuPC90ZXh0Pgo8L3N2Zz4K" id="fig:upstream" style="width:100.0%" alt /><figcaption>External serving-stack reference on the same model workload.</figcaption>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTEwIiB2aWV3Qm94PSIwIDAgOTgwIDUxMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkMGQwZDA7c3Ryb2tlLXdpZHRoOjF9LmxpYnR0e2ZpbGw6IzMzM30udXBzdHJlYW17ZmlsbDojYWFhfS5jaXtzdHJva2U6IzExMTtzdHJva2Utd2lkdGg6Mi41fS5sYWJlbHtmb250LXNpemU6MTRweH0uc21hbGx7Zm9udC1zaXplOjEycHg7ZmlsbDojNDQ0fS52YWx1ZXtmb250LXNpemU6MTVweDtmb250LXdlaWdodDo3MDB9LnRpdGxle2ZvbnQtc2l6ZToyMXB4O2ZvbnQtd2VpZ2h0OjcwMH0ubGVnZW5ke2ZvbnQtc2l6ZToxM3B4fTwvc3R5bGU+Cjx0ZXh0IHg9IjEwMCIgeT0iMjkiIGNsYXNzPSJ0aXRsZSI+U2FtZS1jbG9jayBRd2VuMy04QiBzdHJlYW1pbmcgY29tcGFyaXNvbjwvdGV4dD4KPHJlY3QgeD0iNjA4IiB5PSIxNiIgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiByeD0iMiIgY2xhc3M9ImxpYnR0Ii8+Cjx0ZXh0IHg9IjYzMSIgeT0iMjkiIGNsYXNzPSJsZWdlbmQiPmxpYnR0IDM3ZDU0NjA8L3RleHQ+CjxyZWN0IHg9Ijc2MCIgeT0iMTYiIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgcng9IjIiIGNsYXNzPSJ1cHN0cmVhbSIvPgo8dGV4dCB4PSI3ODMiIHk9IjI5IiBjbGFzcz0ibGVnZW5kIj5UVElTIHYwLjEwLjA8L3RleHQ+CjxsaW5lIHgxPSIxMDAiIHkxPSIzOTUuMCIgeDI9Ijk1MCIgeTI9IjM5NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI4OCIgeT0iNDAwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MDwvdGV4dD4KPGxpbmUgeDE9IjEwMCIgeTE9IjM0MC4wIiB4Mj0iOTUwIiB5Mj0iMzQwLjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSIzNDUuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj41PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMjg1LjAiIHgyPSI5NTAiIHkyPSIyODUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjI5MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjEwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMjMwLjAiIHgyPSI5NTAiIHkyPSIyMzAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjIzNS4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE1PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMTc1LjAiIHgyPSI5NTAiIHkyPSIxNzUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjE4MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjIwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMTIwLjAiIHgyPSI5NTAiIHkyPSIxMjAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjEyNS4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI1PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iNjUuMCIgeDI9Ijk1MCIgeTI9IjY1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSI3MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjMwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iNjUiIHgyPSIxMDAiIHkyPSIzOTUiIGNsYXNzPSJheGlzIi8+CjxsaW5lIHgxPSIxMDAiIHkxPSIzOTUiIHgyPSI5NTAiIHkyPSIzOTUiIGNsYXNzPSJheGlzIi8+CjxyZWN0IHg9IjE4OC41IiB5PSI4OS43IiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjMwNS4zIiByeD0iNCIgY2xhc3M9ImxpYnR0Ii8+CjxsaW5lIHgxPSIyNDQuNSIgeTE9Ijg4LjQiIHgyPSIyNDQuNSIgeTI9IjkxLjAiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMjM3LjUiIHkxPSI4OC40IiB4Mj0iMjUxLjUiIHkyPSI4OC40IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjIzNy41IiB5MT0iOTEuMCIgeDI9IjI1MS41IiB5Mj0iOTEuMCIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjI0NC41IiB5PSI3Ny43IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPjI3Ljc1MzwvdGV4dD4KPHJlY3QgeD0iMzI0LjUiIHk9IjEyMS4yIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjI3My44IiByeD0iNCIgY2xhc3M9InVwc3RyZWFtIi8+CjxsaW5lIHgxPSIzODAuNSIgeTE9IjExOS4xIiB4Mj0iMzgwLjUiIHkyPSIxMjMuMyIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzMuNSIgeTE9IjExOS4xIiB4Mj0iMzg3LjUiIHkyPSIxMTkuMSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzMuNSIgeTE9IjEyMy4zIiB4Mj0iMzg3LjUiIHkyPSIxMjMuMyIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjM4MC41IiB5PSIxMDkuMiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNC44ODc8L3RleHQ+Cjx0ZXh0IHg9IjMxMi41IiB5PSI0MjQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+UHVyZSBkZWNvZGU8L3RleHQ+CjxyZWN0IHg9IjYxMy41IiB5PSI5MS4yIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjMwMy44IiByeD0iNCIgY2xhc3M9ImxpYnR0Ii8+CjxsaW5lIHgxPSI2NjkuNSIgeTE9Ijg5LjkiIHgyPSI2NjkuNSIgeTI9IjkyLjUiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNjYyLjUiIHkxPSI4OS45IiB4Mj0iNjc2LjUiIHkyPSI4OS45IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjY2Mi41IiB5MT0iOTIuNSIgeDI9IjY3Ni41IiB5Mj0iOTIuNSIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjY2OS41IiB5PSI3OS4yIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPjI3LjYxOTwvdGV4dD4KPHJlY3QgeD0iNzQ5LjUiIHk9IjEyMi41IiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjI3Mi41IiByeD0iNCIgY2xhc3M9InVwc3RyZWFtIi8+CjxsaW5lIHgxPSI4MDUuNSIgeTE9IjEyMC40IiB4Mj0iODA1LjUiIHkyPSIxMjQuNSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3OTguNSIgeTE9IjEyMC40IiB4Mj0iODEyLjUiIHkyPSIxMjAuNCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3OTguNSIgeTE9IjEyNC41IiB4Mj0iODEyLjUiIHkyPSIxMjQuNSIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjgwNS41IiB5PSIxMTAuNSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNC43NzY8L3RleHQ+Cjx0ZXh0IHg9IjczNy41IiB5PSI0MjQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+U3RyZWFtaW5nIEUyRTwvdGV4dD4KPHRleHQgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoMjUgMjMwLjApIHJvdGF0ZSgtOTApIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPnRva2Vucy9zIChtZWFuIGFuZCA5NSUgdCBpbnRlcnZhbCk8L3RleHQ+Cjx0ZXh0IHg9IjEwMCIgeT0iNDYyIiBjbGFzcz0ic21hbGwiPjMyIHJldGFpbmVkIHNlcmlhbCByZXF1ZXN0cyBwZXIgaW1wbGVtZW50YXRpb247IHR3byB3YXJtLXVwczsgMTI4IGdlbmVyYXRlZCB0b2tlbnMvcmVxdWVzdC48L3RleHQ+Cjx0ZXh0IHg9IjEwMCIgeT0iNDgyIiBjbGFzcz0ic21hbGwiPkJvdGggdXNlIHRoZSBzYW1lIGxvb3BiYWNrIHN0cmVhbWluZyBjbG9jazogMTI3IGludGVyLXRva2VuIGludGVydmFscyBmb3IgZGVjb2RlIGFuZCByZXF1ZXN0LXRvLWxhc3QtdG9rZW4gZm9yIEUyRS48L3RleHQ+Cjwvc3ZnPgo=" id="fig:upstream" style="width:100.0%" alt /><figcaption>External serving-stack reference on the same model workload.</figcaption>
 </figure>
-<p>Current libtt is 11.51% faster in pure decode and 11.48% faster end to end. Mean TTFT is 7.78% lower, and mean request-to-last-token latency falls from 5.169 to 4.635 seconds. This compares complete serving stacks, not individual kernels; their model implementations, frontends, and trace strategies differ. The result shows that lower-stack compiler and kernel optimization can match and exceed a stack that also modifies the transformer and inference-engine layers. The tested TTIS artifact is the official v0.10.0 runtime image.</p>
-<h2 data-number="10.5" id="correctness-and-numeric-behavior"><span class="header-section-number">10.5</span> Correctness and numeric behavior</h2>
+<p>Under these conditions, libtt is 11.51% faster in pure decode and 11.48% faster end to end. Mean TTFT is 7.78% lower, and mean request-to-last-token latency falls from 5.169 to 4.635 seconds. This compares complete serving stacks, not individual kernels; their model implementations, frontends, and trace strategies differ. The result shows that lower-stack compiler and kernel optimization can match and exceed a stack that also modifies the transformer and inference-engine layers. The tested TTIS artifact is the official v0.10.0 runtime image.</p>
+<h2 data-number="5.5" id="correctness-and-numeric-behavior"><span class="header-section-number">5.5</span> Correctness and numeric behavior</h2>
 <p>All 32 requests in each configuration are deterministic. Algebra and reduction changes can alter the token hash. The current kernel hashes are:</p>
 <table>
 <thead>
@@ -1068,18 +923,18 @@ TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-M
 </tbody>
 </table>
 <p>Determinism and coherent text do not establish model quality. BF8 arithmetic, reassociation, and reduction order can change logits and greedy choices. Perplexity and task-level evaluation are still required.</p>
-<h1 data-number="11" id="engineering-rules"><span class="header-section-number">11</span> Engineering rules</h1>
-<h2 data-number="11.1" id="match-the-abstraction-to-the-information"><span class="header-section-number">11.1</span> Match the abstraction to the information</h2>
-<p>Use each level for the information it retains:</p>
+<h1 data-number="6" id="discussion"><span class="header-section-number">6</span> Discussion</h1>
+<h2 data-number="6.1" id="placement-of-transformations"><span class="header-section-number">6.1</span> Placement of transformations</h2>
+<p>We place each transformation at the highest level that retains the information it needs:</p>
 <ul>
-<li>use <strong>TTIR</strong> when the problem is algebraic recognition or graph structure;</li>
-<li>use <strong>TTNN IR</strong> when the compiler needs a named runtime operation, layout, or device dtype;</li>
-<li>use the <strong>TTNN runtime</strong> when the choice depends on concrete tensor and device state;</li>
-<li>use a <strong>TT-Metal program factory</strong> for core topology, circular buffers, multicast, and program selection; and</li>
-<li>use <strong>device kernels</strong> for Dst lifetime, pack/unpack traffic, tile arithmetic, and synchronization.</li>
+<li>use TTIR when the problem is algebraic recognition or graph structure;</li>
+<li>use TTNN IR when the compiler needs a named runtime operation, layout, or device dtype;</li>
+<li>use the TTNN runtime when the choice depends on concrete tensor and device state;</li>
+<li>use a TT-Metal program factory for core topology, circular buffers, multicast, and program selection; and</li>
+<li>use device kernels for Dst lifetime, pack/unpack traffic, tile arithmetic, and synchronization.</li>
 </ul>
 <p>Lower levels lose graph semantics; higher levels cannot control device data movement.</p>
-<h2 data-number="11.2" id="name-the-removed-boundary"><span class="header-section-number">11.2</span> Name the removed boundary</h2>
+<h2 data-number="6.2" id="fusion-boundaries-and-intermediate-storage"><span class="header-section-number">6.2</span> Fusion boundaries and intermediate storage</h2>
 <p>The MLP experiments remove different boundaries:</p>
 <pre class="text"><code>shared-LHS matmul:
   removes duplicate activation work, retains doubled output       → -1.69%
@@ -1090,11 +945,11 @@ SiLU on BinaryNg input:
 matmul-SwiGLU epilogue:
   keeps gate/up in Dst and writes only the final half-width result → +2.73%</code></pre>
 <p>Fusion should name the Dst, L1, DRAM, or launch boundary it removes.</p>
-<h2 data-number="11.3" id="down-projection-geometry"><span class="header-section-number">11.3</span> Down-projection geometry</h2>
+<h2 data-number="6.3" id="down-projection-geometry"><span class="header-section-number">6.3</span> Down-projection geometry</h2>
 <p>Profiling identified weight bandwidth as the down-projection limit. Uneven N partitioning uses 110 workers without rereading weights or reducing partials across cores. It reaches 345.2 GB/s with less complexity than a 2D K/N split.</p>
-<h2 data-number="11.4" id="keep-negative-results"><span class="header-section-number">11.4</span> Keep negative results</h2>
+<h2 data-number="6.4" id="unsuccessful-transformations"><span class="header-section-number">6.4</span> Unsuccessful transformations</h2>
 <p>Wider SwiGLU blocks reduce partial packs but add CB pressure or reduce overlap. The four-tile result changes throughput by only +0.27%, so two remains the default and the larger values remain experimental. Shared-LHS and consumer-side fusion are kept in the record for the same reason: their measured costs explain the final producer-side design.</p>
-<h1 data-number="12" id="limitations-and-follow-up-work"><span class="header-section-number">12</span> Limitations and follow-up work</h1>
+<h1 data-number="7" id="limitations-and-future-work"><span class="header-section-number">7</span> Limitations and future work</h1>
 <ol type="1">
 <li><strong>One model and decode regime.</strong> Results apply to Qwen3-8B, a five-token prompt padded to one tile, serial 128-token generation, and a single P150. Other batches, contexts, and scheduling policies may have different limits.</li>
 <li><strong>Cumulative attribution is ordered.</strong> The established stages are real cumulative builds, not a factorial experiment. Patch effects can interact.</li>
@@ -1108,37 +963,40 @@ matmul-SwiGLU epilogue:
 <li><strong>Training is not measured.</strong> The PJRT/StableHLO boundary can carry training graphs, but operation coverage, collectives, optimizer execution, and numerical quality still need implementation and validation.</li>
 </ol>
 <p>The next MLP experiment is to keep the SwiGLU output on chip for the down projection. That requires a shared producer/consumer sharding contract.</p>
-<h1 data-number="13" id="conclusion"><span class="header-section-number">13</span> Conclusion</h1>
-<p><code>libtt.so</code> keeps the SGLang-JAX and JAX/TPU-facing layers close to upstream while packaging the PJRT backend, compiler, runtime, kernels, and runtime assets in one artifact. One Bazel graph makes the lower stack available for cross-layer optimization.</p>
-<p>The sequence starts with a functional backend that runs upstream SGLang-JAX at 16.265 tokens/s. Compiler, runtime, and kernel changes improve end-to-end throughput by 60.61%, and the 110-core down projection reaches 27.753 decode tokens/s. Current libtt is 11.51% faster than the matched TTIS decode mean even though TTIS also uses TT-specific transformer and inference-engine layers.</p>
-<p>This report measures inference. The same PJRT/StableHLO architecture can be extended to training without replacing the JAX frontend, once the required operations, collectives, optimizer graphs, and validation are added.</p>
-<h1 class="unnumbered" data-number id="bibliography">Bibliography</h1>
+<h1 data-number="8" id="conclusions"><span class="header-section-number">8</span> Conclusions</h1>
+<p>With <code>libtt.so</code>, we keep the SGLang-JAX and JAX/TPU-facing layers close to upstream while packaging the PJRT backend, compiler, runtime, kernels, and runtime assets in one artifact. One Bazel graph makes the lower stack available for cross-layer optimization.</p>
+<p>We started with a functional backend that runs upstream SGLang-JAX at 16.265 tokens/s. Compiler, runtime, and kernel changes improve end-to-end throughput by 60.61%, and the 110-core down projection reaches 27.753 decode tokens/s. Under the matched benchmark conditions, libtt is 11.51% faster than the TTIS decode mean even though TTIS also uses TT-specific transformer and inference-engine layers.</p>
+<p>We measured inference. The same PJRT/StableHLO architecture can be extended to training without replacing the JAX frontend, once the required operations, collectives, optimizer graphs, and validation are added.</p>
+<h1 class="unnumbered" data-number id="references">References</h1>
 <ol type="1">
-<li>Tenstorrent, “TT-XLA.” <a href="https://github.com/tenstorrent/tt-xla" class="uri">https://github.com/tenstorrent/tt-xla</a></li>
-<li>Tenstorrent, “TT-MLIR.” <a href="https://github.com/tenstorrent/tt-mlir" class="uri">https://github.com/tenstorrent/tt-mlir</a></li>
-<li>Tenstorrent, “TT-NN Documentation.” <a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/" class="uri">https://docs.tenstorrent.com/tt-metal/latest/ttnn/</a></li>
-<li>Tenstorrent, “TT-Metalium Documentation.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/</a></li>
-<li>Tenstorrent, “TT-UMD: User-Mode Driver for Tenstorrent Hardware.” <a href="https://github.com/tenstorrent/tt-umd" class="uri">https://github.com/tenstorrent/tt-umd</a></li>
-<li>Tenstorrent, “SFPI.” <a href="https://github.com/tenstorrent/sfpi" class="uri">https://github.com/tenstorrent/sfpi</a></li>
-<li>Z. Tan, B. Kang, and A. Narasimham, “A Developer’s Guide to Debugging JAX on Cloud TPUs,” Google Developers Blog, 2026. Describes <code>libtpu.so</code> as the shared library containing the XLA compiler, TPU driver, and hardware communication logic. <a href="https://developers.googleblog.com/a-developers-guide-to-debugging-jax-on-cloud-tpus-essential-tools-and-techniques/" class="uri">https://developers.googleblog.com/a-developers-guide-to-debugging-jax-on-cloud-tpus-essential-tools-and-techniques/</a></li>
 <li>Bazel Project, “Hermeticity.” <a href="https://bazel.build/concepts/hermeticity" class="uri">https://bazel.build/concepts/hermeticity</a></li>
+<li>C. Lattner, M. Amini, U. Bondhugula, A. Cohen, A. Davis, J. Pienaar, R. Riddle, T. Shpeisman, N. Vasilache, and O. Zinenko, “MLIR: Scaling Compiler Infrastructure for Domain-Specific Computation,” <em>2021 IEEE/ACM International Symposium on Code Generation and Optimization</em>, pp. 2–14,
+<ol start="2021" type="1">
+<li><a href="https://doi.org/10.1109/CGO51591.2021.9370308" class="uri">https://doi.org/10.1109/CGO51591.2021.9370308</a></li>
+</ol></li>
 <li>OpenXLA Project, “PJRT—Uniform Device API.” <a href="https://openxla.org/xla/pjrt" class="uri">https://openxla.org/xla/pjrt</a></li>
 <li>OpenXLA Project, “StableHLO Specification.” <a href="https://openxla.org/stablehlo/spec" class="uri">https://openxla.org/stablehlo/spec</a></li>
-<li>C. Lattner et al., “MLIR: Scaling Compiler Infrastructure for Domain-Specific Computation,” <em>2021 IEEE/ACM International Symposium on Code Generation and Optimization</em>, pp. 2–14, 2021. <a href="https://doi.org/10.1109/CGO51591.2021.9370308" class="uri">https://doi.org/10.1109/CGO51591.2021.9370308</a></li>
+<li>SGLang Project, “SGLang-JAX.” <a href="https://github.com/sgl-project/sglang-jax" class="uri">https://github.com/sgl-project/sglang-jax</a></li>
+<li>N. Shazeer, “GLU Variants Improve Transformer,” arXiv:2002.05202, 2020. <a href="https://arxiv.org/abs/2002.05202" class="uri">https://arxiv.org/abs/2002.05202</a></li>
+<li>Z. Tan, B. Kang, and A. Narasimham, “A Developer’s Guide to Debugging JAX on Cloud TPUs,” Google Developers Blog, 2026. <a href="https://developers.googleblog.com/a-developers-guide-to-debugging-jax-on-cloud-tpus-essential-tools-and-techniques/" class="uri">https://developers.googleblog.com/a-developers-guide-to-debugging-jax-on-cloud-tpus-essential-tools-and-techniques/</a></li>
+<li>Tenstorrent, “Blackhole PCIe Card Documentation” and firmware release notes. <a href="https://docs.tenstorrent.com/tt-system-firmware/boards/tenstorrent/tt_blackhole/doc/index.html" class="uri">https://docs.tenstorrent.com/tt-system-firmware/boards/tenstorrent/tt_blackhole/doc/index.html</a></li>
+<li>Tenstorrent, “Circular Buffer APIs.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html</a></li>
+<li>Tenstorrent, “Compute Engines and Data Flow within Tensix.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html</a></li>
+<li>Tenstorrent, “SFPI.” <a href="https://github.com/tenstorrent/sfpi" class="uri">https://github.com/tenstorrent/sfpi</a></li>
+<li>Tenstorrent, “Tiles.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/tiles.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/tiles.html</a></li>
 <li>Tenstorrent, “TT-Forge: Open-Source AI Compiler Stack.” <a href="https://github.com/tenstorrent/tt-forge" class="uri">https://github.com/tenstorrent/tt-forge</a></li>
+<li>Tenstorrent, “tt-inference-server v0.10.0.” <a href="https://github.com/tenstorrent/tt-inference-server/releases/tag/v0.10.0" class="uri">https://github.com/tenstorrent/tt-inference-server/releases/tag/v0.10.0</a></li>
+<li>Tenstorrent, “TT-Metalium Documentation.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/</a></li>
+<li>Tenstorrent, “TT-Metalium Getting Started and Programming Model.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/get_started/get_started.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/get_started/get_started.html</a></li>
+<li>Tenstorrent, “TT-MLIR.” <a href="https://github.com/tenstorrent/tt-mlir" class="uri">https://github.com/tenstorrent/tt-mlir</a></li>
 <li>Tenstorrent, “TT-MLIR: Architecture and Dialect Overview.” <a href="https://docs.tenstorrent.com/tt-mlir/overview.html" class="uri">https://docs.tenstorrent.com/tt-mlir/overview.html</a></li>
 <li>Tenstorrent, “TT-MLIR Tensor Layout.” <a href="https://docs.tenstorrent.com/tt-mlir/specs/tensor-layout.html" class="uri">https://docs.tenstorrent.com/tt-mlir/specs/tensor-layout.html</a></li>
-<li>Tenstorrent, “TT-Metalium Getting Started and Programming Model.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/get_started/get_started.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/get_started/get_started.html</a></li>
-<li>Tenstorrent, “Compute Engines and Data Flow within Tensix.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html</a></li>
-<li>Tenstorrent, “Circular Buffer APIs.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html</a></li>
-<li>Tenstorrent, “Tiles.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/tiles.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/tiles.html</a></li>
+<li>Tenstorrent, “TT-NN Documentation.” <a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/" class="uri">https://docs.tenstorrent.com/tt-metal/latest/ttnn/</a></li>
 <li>Tenstorrent, “TTNN Tensor: Layout, Sharding, and BFLOAT8_B.” <a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html</a></li>
-<li>Tenstorrent, “Blackhole PCIe Card Documentation” and firmware release notes. <a href="https://docs.tenstorrent.com/tt-system-firmware/boards/tenstorrent/tt_blackhole/doc/index.html" class="uri">https://docs.tenstorrent.com/tt-system-firmware/boards/tenstorrent/tt_blackhole/doc/index.html</a></li>
-<li>SGLang Project, “SGLang-JAX.” <a href="https://github.com/sgl-project/sglang-jax" class="uri">https://github.com/sgl-project/sglang-jax</a></li>
+<li>Tenstorrent, “TT-UMD: User-Mode Driver for Tenstorrent Hardware.” <a href="https://github.com/tenstorrent/tt-umd" class="uri">https://github.com/tenstorrent/tt-umd</a></li>
+<li>Tenstorrent, “TT-XLA.” <a href="https://github.com/tenstorrent/tt-xla" class="uri">https://github.com/tenstorrent/tt-xla</a></li>
 <li>A. Yang et al., “Qwen3 Technical Report,” arXiv:2505.09388, 2025. <a href="https://arxiv.org/abs/2505.09388" class="uri">https://arxiv.org/abs/2505.09388</a></li>
 <li>B. Zhang and R. Sennrich, “Root Mean Square Layer Normalization,” <em>Advances in Neural Information Processing Systems 32</em>, 2019. <a href="https://proceedings.neurips.cc/paper/2019/hash/1e8a19426224ca89e83cef47f1e7f53b-Abstract.html" class="uri">https://proceedings.neurips.cc/paper/2019/hash/1e8a19426224ca89e83cef47f1e7f53b-Abstract.html</a></li>
-<li>N. Shazeer, “GLU Variants Improve Transformer,” arXiv:2002.05202, 2020. <a href="https://arxiv.org/abs/2002.05202" class="uri">https://arxiv.org/abs/2002.05202</a></li>
-<li>Tenstorrent, “tt-inference-server v0.10.0.” <a href="https://github.com/tenstorrent/tt-inference-server/releases/tag/v0.10.0" class="uri">https://github.com/tenstorrent/tt-inference-server/releases/tag/v0.10.0</a></li>
 </ol>
 </body>
 </html>

@@ -159,7 +159,7 @@ def write_throughput_svg(summaries: list[dict]) -> None:
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1}.grid{stroke:#dbe4ee;stroke-width:1}.line{fill:none;stroke:#006d77;stroke-width:4}.ci{stroke:#e29578;stroke-width:3}.dot{fill:#006d77;stroke:white;stroke-width:2}.label{font-size:14px}.small{font-size:12px;fill:#526174}.title{font-size:21px;font-weight:700}</style>',
+        '<style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1}.grid{stroke:#d0d0d0;stroke-width:1}.line{fill:none;stroke:#111;stroke-width:3}.ci{stroke:#666;stroke-width:2}.dot{fill:#111;stroke:white;stroke-width:1.5}.label{font-size:14px}.small{font-size:12px;fill:#444}.title{font-size:21px;font-weight:700}</style>',
         '<text x="90" y="27" class="title">Qwen3-8B end-to-end generation throughput</text>',
     ]
     for tick in range(15, 28):
@@ -202,7 +202,7 @@ def write_incremental_svg(summaries: list[dict]) -> None:
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1.2}.grid{stroke:#dbe4ee;stroke-width:1}.pos{fill:#006d77}.neg{fill:#c84b31}.label{font-size:14px}.small{font-size:12px;fill:#526174}.value{font-size:13px;font-weight:700}.title{font-size:21px;font-weight:700}</style>',
+        '<style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1.2}.grid{stroke:#d0d0d0;stroke-width:1}.pos{fill:#333}.neg{fill:#aaa}.label{font-size:14px}.small{font-size:12px;fill:#444}.value{font-size:13px;font-weight:700}.title{font-size:21px;font-weight:700}</style>',
         '<text x="90" y="29" class="title">Incremental throughput change</text>',
     ]
     for tick in (-2, 0, 4, 8, 12, 16, 20, 24):
@@ -253,7 +253,7 @@ def write_upstream_comparison_svg(comparison: dict) -> None:
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1.2}.grid{stroke:#dbe4ee;stroke-width:1}.libtt{fill:#006d77}.upstream{fill:#e29578}.ci{stroke:#172033;stroke-width:3}.label{font-size:14px}.small{font-size:12px;fill:#526174}.value{font-size:15px;font-weight:700}.title{font-size:21px;font-weight:700}.legend{font-size:13px}</style>',
+        '<style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1.2}.grid{stroke:#d0d0d0;stroke-width:1}.libtt{fill:#333}.upstream{fill:#aaa}.ci{stroke:#111;stroke-width:2.5}.label{font-size:14px}.small{font-size:12px;fill:#444}.value{font-size:15px;font-weight:700}.title{font-size:21px;font-weight:700}.legend{font-size:13px}</style>',
         '<text x="100" y="29" class="title">Same-clock Qwen3-8B streaming comparison</text>',
         '<rect x="608" y="16" width="16" height="16" rx="2" class="libtt"/>',
         '<text x="631" y="29" class="legend">libtt 37d5460</text>',

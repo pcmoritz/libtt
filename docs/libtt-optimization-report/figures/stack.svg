@@ -1,26 +1,26 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="650" viewBox="0 0 1120 650">
   <defs>
     <linearGradient id="host" x1="0" x2="1">
-      <stop offset="0" stop-color="#e7f5f3"/><stop offset="1" stop-color="#d8ebf4"/>
+      <stop offset="0" stop-color="#f5f5f5"/><stop offset="1" stop-color="#e8e8e8"/>
     </linearGradient>
     <linearGradient id="plugin" x1="0" x2="1">
-      <stop offset="0" stop-color="#f5fbfa"/><stop offset="1" stop-color="#eef5f9"/>
+      <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#f0f0f0"/>
     </linearGradient>
     <linearGradient id="device" x1="0" x2="1">
-      <stop offset="0" stop-color="#fff2df"/><stop offset="1" stop-color="#fde2dc"/>
+      <stop offset="0" stop-color="#eeeeee"/><stop offset="1" stop-color="#d8d8d8"/>
     </linearGradient>
     <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-      <path d="M0,0 L8,4 L0,8 Z" fill="#53657a"/>
+      <path d="M0,0 L8,4 L0,8 Z" fill="#444444"/>
     </marker>
   </defs>
   <style>
-    text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}
+    text{font-family:Helvetica,Arial,sans-serif;fill:#111111}
     .title{font-size:22px;font-weight:700}.name{font-size:16px;font-weight:700}
-    .body{font-size:12.5px;fill:#526174}.small{font-size:11.5px;fill:#526174}
-    .box{stroke:#8aa0b5;stroke-width:1.35;rx:10}.arrow{stroke:#53657a;stroke-width:2;marker-end:url(#arrow)}
-    .branch{stroke:#8395a7;stroke-width:1.6;stroke-dasharray:6 5;marker-end:url(#arrow)}
-    .band{font-size:13px;font-weight:700;letter-spacing:.8px;fill:#006d77}
-    .boundary{font-size:15px;font-weight:700;fill:#006d77}
+    .body{font-size:12.5px;fill:#444444}.small{font-size:11.5px;fill:#444444}
+    .box{stroke:#777777;stroke-width:1.35;rx:10}.arrow{stroke:#444444;stroke-width:2;marker-end:url(#arrow)}
+    .branch{stroke:#777777;stroke-width:1.6;stroke-dasharray:6 5;marker-end:url(#arrow)}
+    .band{font-size:13px;font-weight:700;letter-spacing:.8px;fill:#111111}
+    .boundary{font-size:15px;font-weight:700;fill:#111111}
   </style>
   <rect width="1120" height="650" fill="#fff"/>
   <text x="35" y="30" class="title">libtt: one PJRT artifact from framework IR to Tensix execution</text>
@@ -34,7 +34,7 @@
   <text x="397" y="126" text-anchor="middle" class="body">shape tracing · StableHLO export</text>
   <line x1="260" y1="112" x2="288" y2="112" class="arrow"/>
 
-  <rect x="25" y="175" width="1070" height="316" rx="18" fill="url(#plugin)" stroke="#006d77" stroke-width="2"/>
+  <rect x="25" y="175" width="1070" height="316" rx="18" fill="url(#plugin)" stroke="#333333" stroke-width="2"/>
   <text x="48" y="202" class="boundary">libtt.so · pinned compiler, runtime, kernels, and embedded TT-Metal assets</text>
 
   <text x="48" y="232" class="band">COMPILE PATH · TT-XLA AND TT-MLIR</text>
@@ -62,7 +62,7 @@
   <line x1="360" y1="288" x2="385" y2="288" class="arrow"/>
   <line x1="537" y1="288" x2="562" y2="288" class="arrow"/>
 
-  <rect x="765" y="239" width="300" height="98" class="box" fill="#f7f7f8"/>
+  <rect x="765" y="239" width="300" height="98" class="box" fill="#f7f7f7"/>
   <text x="915" y="264" text-anchor="middle" class="name">Direct-to-Metal branch</text>
   <text x="915" y="287" text-anchor="middle" class="body">D2M → TTKernel + TTMetal</text>
   <text x="915" y="307" text-anchor="middle" class="small">generic tiled compute → device/host IR</text>
@@ -92,7 +92,7 @@
   <line x1="726" y1="430" x2="753" y2="430" class="arrow"/>
 
   <text x="35" y="528" class="band">BLACKHOLE DEVICE</text>
-  <rect x="35" y="544" width="1050" height="82" rx="14" fill="url(#device)" stroke="#c99b84" stroke-width="1.5"/>
+  <rect x="35" y="544" width="1050" height="82" rx="14" fill="url(#device)" stroke="#777777" stroke-width="1.5"/>
   <text x="155" y="574" text-anchor="middle" class="name">GDDR6 DRAM</text>
   <text x="155" y="599" text-anchor="middle" class="body">weights · persistent tensors</text>
   <text x="435" y="574" text-anchor="middle" class="name">2D NoC + per-core L1</text>
