@@ -7,7 +7,7 @@ all: html
 
 html: $(REPORT).html
 
-$(REPORT).html: $(REPORT).md style.css figures/throughput.svg figures/incremental-speedup.svg figures/upstream-comparison.svg figures/stack.svg
+$(REPORT).html: $(REPORT).md style.css figures/throughput.svg figures/incremental-speedup.svg figures/upstream-comparison.svg figures/stack.svg figures/reference-stack.svg
 	$(PANDOC) $(REPORT).md \
 		--from=markdown+tex_math_dollars \
 		--to=html5 --standalone --number-sections --no-highlight --mathml \
@@ -18,7 +18,7 @@ $(REPORT).html: $(REPORT).md style.css figures/throughput.svg figures/incrementa
 
 tex: $(REPORT).tex
 
-$(REPORT).tex: $(REPORT).md figures/throughput.svg figures/incremental-speedup.svg figures/upstream-comparison.svg figures/stack.svg
+$(REPORT).tex: $(REPORT).md figures/throughput.svg figures/incremental-speedup.svg figures/upstream-comparison.svg figures/stack.svg figures/reference-stack.svg
 	$(PANDOC) $(REPORT).md \
 		--from=markdown+tex_math_dollars \
 		--to=latex --standalone --number-sections --no-highlight \
@@ -26,7 +26,7 @@ $(REPORT).tex: $(REPORT).md figures/throughput.svg figures/incremental-speedup.s
 
 pdf: $(REPORT).pdf
 
-$(REPORT).pdf: $(REPORT).md figures/throughput.svg figures/incremental-speedup.svg figures/upstream-comparison.svg figures/stack.svg
+$(REPORT).pdf: $(REPORT).md figures/throughput.svg figures/incremental-speedup.svg figures/upstream-comparison.svg figures/stack.svg figures/reference-stack.svg
 	@command -v xelatex >/dev/null || (echo "xelatex is required (for example, texlive-xetex)"; exit 1)
 	@command -v rsvg-convert >/dev/null || (echo "rsvg-convert is required (for example, librsvg2-bin)"; exit 1)
 	$(PANDOC) $(REPORT).md \

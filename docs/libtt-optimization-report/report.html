@@ -106,14 +106,122 @@ pre { white-space: pre-wrap; }
 <p>libtt packages a Tenstorrent PJRT backend, compiler, runtime, device kernels, and runtime assets in one shared library. It runs upstream SGLang-JAX and other JAX software without a separate compiler or TT-Metal installation on the target. We describe the StableHLO and TT-MLIR compilation path and a sequence of graph, layout, runtime, and kernel optimizations for Qwen3-8B inference. The sequence raises 128-token generation from 16.265 to 26.123 tokens/s. A shape-specific down projection reaches 27.753 decode tokens/s. On the same Blackhole P150 and workload, this is 11.51% faster than the measured tt-inference-server reference. These results show that a stable framework boundary can preserve the upstream JAX stack while concentrating performance work in the compiler and lower runtime. The architecture is not specific to inference and can support training as its operation and collective coverage grows.</p>
 <h1 data-number="1" id="introduction"><span class="header-section-number">1</span> Introduction</h1>
 <p>libtt provides a self-contained JAX runtime for Tenstorrent accelerators. Its integration boundary is PJRT [3] and StableHLO [4]: SGLang-JAX retains its tokenizer, scheduler, model, and paged KV cache, while libtt compiles and executes the resulting graphs. This arrangement is intended to support SGLang-JAX [5] and the broader JAX/TPU software ecosystem with few changes above the compiler boundary.</p>
-<p>The boundary has two practical advantages. First, we can follow upstream JAX and SGLang-JAX instead of maintaining a separate Tenstorrent model and inference engine. Second, we can obtain performance in TT-MLIR [17], TTNN [20], TT-Metalium [15], and device kernels, where graph structure, layout, precision, and data movement remain visible. The same boundary can carry training graphs in the future; this report measures inference only.</p>
-<p>We began with a functional but relatively unoptimized backend that ran upstream SGLang-JAX at 16.265 tokens/s. We then added semantic recovery, layout policy, runtime tracing, and device-kernel specializations below PJRT. The established sequence reaches 26.123 tokens/s, a 60.61% increase. A subsequent 110-core down projection reaches 27.753 decode tokens/s and exceeds the matched tt-inference-server v0.10.0 decode result by 11.51% [14].</p>
-<p>The main result is architectural as well as numerical. A compiler rewrite, runtime change, and device kernel can be developed and measured together in one build without modifying the SGLang scheduler or Qwen model [24]. The following sections describe the system boundary, the compiler and runtime representations, the individual optimizations, and their measured effects.</p>
+<p>The boundary has two practical advantages. First, we can follow upstream JAX and SGLang-JAX instead of maintaining a separate Tenstorrent model and inference engine. Second, we can obtain performance in TT-MLIR [18], TTNN [21], TT-Metalium [16], and device kernels, where graph structure, layout, precision, and data movement remain visible. The same boundary can carry training graphs in the future; this report measures inference only.</p>
+<p>We began with a functional but relatively unoptimized backend that ran upstream SGLang-JAX at 16.265 tokens/s. We then added semantic recovery, layout policy, runtime tracing, and device-kernel specializations below PJRT. The established sequence reaches 26.123 tokens/s, a 60.61% increase. A subsequent 110-core down projection reaches 27.753 decode tokens/s and exceeds the matched tt-inference-server v0.10.0 decode result by 11.51% [15].</p>
+<p>The main result is architectural as well as numerical. A compiler rewrite, runtime change, and device kernel can be developed and measured together in one build without modifying the SGLang scheduler or Qwen model [26]. The following sections describe the system boundary, the compiler and runtime representations, the individual optimizations, and their measured effects.</p>
+<h1 data-number="2" id="tenstorrent-hardware-and-software-stack"><span class="header-section-number">2</span> Tenstorrent hardware and software stack</h1>
+<p>The performance comparison later in this report involves more than two kernel libraries. The reference TTIS path includes a serving engine, a Tenstorrent-specific engine backend, a model-specific implementation, TTNN, TT-Metalium, the user-mode driver, firmware, and the device. This section separates those layers and identifies the code required to join them.</p>
+<h2 data-number="2.1" id="blackhole-and-the-tensix-execution-model"><span class="header-section-number">2.1</span> Blackhole and the Tensix execution model</h2>
+<p>The benchmark uses a Blackhole P150. The Blackhole processor exposed by current P150 firmware has 120 Tensix cores, 180 MB of SRAM (1.5 MB per core), and up to 32 GB of GDDR6 memory [8]. The host reaches the card over PCIe. Device DRAM is distinct from host memory, and the SRAM local to a Tensix core is explicitly managed working storage rather than a hardware cache.</p>
+<p>Tensix cores communicate through a two-dimensional network on chip. A typical TT-Metalium program assigns a reader data-movement kernel, a compute kernel, and a writer data-movement kernel to each participating core. The three kernels exchange tiles through circular buffers in local SRAM and can overlap memory traffic with arithmetic [16, 17]. Matrix and vector results pass through the unpacker, SrcA/SrcB and Dst registers, and the packer before returning to L1.</p>
+<p>These details matter for batch-one decode. The weights are much larger than a token activation, so every layer repeatedly streams weights from GDDR6. Core count, NoC multicast, circular-buffer capacity, and the number of times an intermediate is packed or written to DRAM directly determine token latency.</p>
+<h2 data-number="2.2" id="runtime-and-operator-layers"><span class="header-section-number">2.2</span> Runtime and operator layers</h2>
+<p>The software stack exposes the device at several levels:</p>
+<table>
+<colgroup>
+<col style="width: 50%"></col>
+<col style="width: 50%"></col>
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Layer</th>
+<th style="text-align: left;">Responsibility</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">TT-UMD</td>
+<td style="text-align: left;">Discovers devices and provides the user-mode PCIe, memory, and command transport used by higher runtimes [24].</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">TT-Metalium</td>
+<td style="text-align: left;">Allocates device resources, builds command programs, and compiles and dispatches reader, compute, and writer kernels [16, 17].</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">TTNN</td>
+<td style="text-align: left;">Provides Python and C++ tensor operations, tensor layouts, memory configurations, sharding, program selection, and tracing on top of TT-Metalium [21].</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">TT-Transformers</td>
+<td style="text-align: left;">Implements Transformer structure, model configuration, paged attention, KV-cache behavior, prefill/decode paths, and device-specific layouts with TTNN calls [23].</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">TT vLLM backend and TTIS</td>
+<td style="text-align: left;">Connects model implementations to the serving scheduler, request batching, cache allocation, model loading, and OpenAI-compatible service [11, 15].</td>
+</tr>
+</tbody>
+</table>
+<p>TTNN is therefore an operator library and direct runtime interface, not a framework compiler boundary by itself. It exposes preoptimized operations and selects TT-Metalium programs, but a caller using TTNN directly still constructs the model, chooses layouts and shapes, manages state, and determines when host and device tensors cross the boundary.</p>
+<h2 data-number="2.3" id="how-ttis-reaches-ttnn"><span class="header-section-number">2.3</span> How TTIS reaches TTNN</h2>
+<p>Tenstorrent uses vLLM for scheduling, continuous batching, paged attention, and the OpenAI-compatible server. Its current integration guide describes a TT platform backend/plugin and a maintained vLLM fork [11]. The backend supplies platform configuration, model registration, model loading, worker and device initialization, KV-cache management, input preparation, execution, and TT engine behavior. The plugin reduces the amount of code that must live directly inside a vLLM fork, but these Tenstorrent-specific engine responsibilities remain.</p>
+<p>Adding a model requires more than registering a generic Hugging Face class. The documented integration contract requires:</p>
+<ol type="1">
+<li>a TTNN paged-attention implementation using the TT cache-fill, cache-update, and paged decode operations;</li>
+<li>a TT-Transformers generator with initialization, KV-cache allocation, prefill, decode, trace warm-up, output, and capability interfaces;</li>
+<li>fixed-shape padding and trace behavior compatible with the TTNN execution path;</li>
+<li>model registration and configuration in the TT vLLM backend; and</li>
+<li>for new model types or inputs, possible changes to the platform, loader, worker, model runner, or engine [11].</li>
+</ol>
+<p>The v0.10.0 artifact measured in this report pinned TT-Metal commit <code>e867533</code> and Tenstorrent vLLM commit <code>22be241</code>. In that release, the TT platform code was carried in the Tenstorrent vLLM path. Current upstream code is increasingly packaged as a plugin, but the model-facing interface and TT-specific execution logic described above remain. We distinguish this packaging change from the v0.10.0 performance measurement [15].</p>
+<figure>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDgwIiBoZWlnaHQ9IjY4MCIgdmlld0JveD0iMCAwIDEwODAgNjgwIj4KICA8ZGVmcz4KICAgIDxtYXJrZXIgaWQ9ImFycm93IiBtYXJrZXJXaWR0aD0iOCIgbWFya2VySGVpZ2h0PSI4IiByZWZYPSI3IiByZWZZPSI0IiBvcmllbnQ9ImF1dG8iPgogICAgICA8cGF0aCBkPSJNMCwwIEw4LDQgTDAsOCBaIiBmaWxsPSIjNDQ0NDQ0Ii8+CiAgICA8L21hcmtlcj4KICA8L2RlZnM+CiAgPHN0eWxlPgogICAgdGV4dHtmb250LWZhbWlseTpIZWx2ZXRpY2EsQXJpYWwsc2Fucy1zZXJpZjtmaWxsOiMxMTExMTF9CiAgICAudGl0bGV7Zm9udC1zaXplOjIycHg7Zm9udC13ZWlnaHQ6NzAwfQogICAgLm5hbWV7Zm9udC1zaXplOjE2cHg7Zm9udC13ZWlnaHQ6NzAwfQogICAgLmJvZHl7Zm9udC1zaXplOjEyLjVweDtmaWxsOiMzMzMzMzN9CiAgICAuc21hbGx7Zm9udC1zaXplOjExLjVweDtmaWxsOiM0NDQ0NDR9CiAgICAuYmFuZHtmb250LXNpemU6MTJweDtmb250LXdlaWdodDo3MDA7bGV0dGVyLXNwYWNpbmc6LjhweDtmaWxsOiMyMjIyMjJ9CiAgICAuYm94e2ZpbGw6I2Y3ZjdmNztzdHJva2U6IzY2NjY2NjtzdHJva2Utd2lkdGg6MS4zfQogICAgLm1vZGVse2ZpbGw6I2U3ZTdlNztzdHJva2U6IzMzMzMzMztzdHJva2Utd2lkdGg6MS44fQogICAgLmRldmljZXtmaWxsOiNkZGRkZGQ7c3Ryb2tlOiM1NTU1NTU7c3Ryb2tlLXdpZHRoOjEuNH0KICAgIC5hcnJvd3tzdHJva2U6IzQ0NDQ0NDtzdHJva2Utd2lkdGg6MjttYXJrZXItZW5kOnVybCgjYXJyb3cpfQogIDwvc3R5bGU+CgogIDxyZWN0IHdpZHRoPSIxMDgwIiBoZWlnaHQ9IjY4MCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjQwIiB5PSIzMiIgY2xhc3M9InRpdGxlIj5SZWZlcmVuY2UgVFRJUyBwYXRoIGFuZCBpdHMgZXhwbGljaXQgaW50ZWdyYXRpb24gbGF5ZXJzPC90ZXh0PgoKICA8dGV4dCB4PSI0MCIgeT0iNjUiIGNsYXNzPSJiYW5kIj5TRVJWSU5HIEFORCBFTkdJTkU8L3RleHQ+CiAgPHJlY3QgeD0iNDAiIHk9Ijc4IiB3aWR0aD0iMTAwMCIgaGVpZ2h0PSI2NCIgcng9IjgiIGNsYXNzPSJib3giLz4KICA8dGV4dCB4PSI1NDAiIHk9IjEwNCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPnR0LWluZmVyZW5jZS1zZXJ2ZXIgwrcgT3BlbkFJIHNlcnZpY2UgwrcgbW9kZWwgYW5kIGltYWdlIHNlbGVjdGlvbjwvdGV4dD4KICA8dGV4dCB4PSI1NDAiIHk9IjEyNiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnBpbnMgdGhlIHNlcnZpbmcgYXJ0aWZhY3QsIFRULU1ldGFsIHJldmlzaW9uLCBhbmQgVGVuc3RvcnJlbnQgdkxMTSBpbXBsZW1lbnRhdGlvbjwvdGV4dD4KCiAgPGxpbmUgeDE9IjU0MCIgeTE9IjE0MiIgeDI9IjU0MCIgeTI9IjE2NiIgY2xhc3M9ImFycm93Ii8+CiAgPHJlY3QgeD0iNDAiIHk9IjE3NCIgd2lkdGg9IjEwMDAiIGhlaWdodD0iODIiIHJ4PSI4IiBjbGFzcz0iYm94Ii8+CiAgPHRleHQgeD0iNTQwIiB5PSIyMDEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj52TExNICsgVGVuc3RvcnJlbnQgcGxhdGZvcm0gYmFja2VuZCAvIHBsdWdpbjwvdGV4dD4KICA8dGV4dCB4PSI1NDAiIHk9IjIyNCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnNjaGVkdWxlciDCtyBwbGF0Zm9ybSBjb25maWd1cmF0aW9uIMK3IG1vZGVsIHJlZ2lzdHJ5IMK3IGxvYWRlciDCtyB3b3JrZXIgwrcgbW9kZWwgcnVubmVyIMK3IGVuZ2luZTwvdGV4dD4KICA8dGV4dCB4PSI1NDAiIHk9IjI0NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5wcmVwYXJlcyBmaXhlZC1zaGFwZSBpbnB1dHMsIG93bnMgS1YtY2FjaGUgaW50ZWdyYXRpb24sIGFuZCBjYWxscyB0aGUgVFQgbW9kZWwgaW50ZXJmYWNlPC90ZXh0PgoKICA8dGV4dCB4PSI0MCIgeT0iMjg3IiBjbGFzcz0iYmFuZCI+TU9ERUwtU1BFQ0lGSUMgUE9SVDwvdGV4dD4KICA8bGluZSB4MT0iNTQwIiB5MT0iMjU2IiB4Mj0iNTQwIiB5Mj0iMjk2IiBjbGFzcz0iYXJyb3ciLz4KICA8cmVjdCB4PSI0MCIgeT0iMzA0IiB3aWR0aD0iMTAwMCIgaGVpZ2h0PSIxNjQiIHJ4PSIxMCIgY2xhc3M9Im1vZGVsIi8+CiAgPHRleHQgeD0iNTQwIiB5PSIzMzEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVC1UcmFuc2Zvcm1lcnMgbW9kZWwgYW5kIHZMTE0gZ2VuZXJhdG9yPC90ZXh0PgogIDx0ZXh0IHg9IjU0MCIgeT0iMzUzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+YXR0ZW50aW9uIGFuZCBNTFAgc3RydWN0dXJlIMK3IHBhZ2VkIEtWIGNhY2hlIMK3IHByZWZpbGwvZGVjb2RlIG1vZGVzIMK3IGxheW91dHMgwrcgc2hhcmRpbmcgwrcgdHJhY2Ugc2hhcGVzPC90ZXh0PgoKICA8cmVjdCB4PSI3MiIgeT0iMzc1IiB3aWR0aD0iNDEwIiBoZWlnaHQ9IjcwIiByeD0iNyIgY2xhc3M9ImJveCIvPgogIDx0ZXh0IHg9IjI3NyIgeT0iNDAxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+UHlUb3JjaCBob3N0IHRlbnNvcnMgYW5kIHV0aWxpdGllczwvdGV4dD4KICA8dGV4dCB4PSIyNzciIHk9IjQyNCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj53ZWlnaHRzIMK3IHRva2VucyDCtyBwYWRkaW5nIMK3IHBvc2l0aW9ucyDCtyBob3N0IG91dHB1dDwvdGV4dD4KCiAgPHJlY3QgeD0iNTk4IiB5PSIzNzUiIHdpZHRoPSI0MTAiIGhlaWdodD0iNzAiIHJ4PSI3IiBjbGFzcz0iYm94Ii8+CiAgPHRleHQgeD0iODAzIiB5PSI0MDEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVE5OIHRlbnNvcnMgYW5kIGRldmljZSBvcGVyYXRpb25zPC90ZXh0PgogIDx0ZXh0IHg9IjgwMyIgeT0iNDI0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPm1hdG11bCDCtyBub3JtYWxpemF0aW9uIMK3IHBhZ2VkIGF0dGVudGlvbiDCtyBjb2xsZWN0aXZlcyDCtyB0cmFjZTwvdGV4dD4KCiAgPGxpbmUgeDE9IjQ4MiIgeTE9IjQwMiIgeDI9IjU5MCIgeTI9IjQwMiIgY2xhc3M9ImFycm93Ii8+CiAgPHRleHQgeD0iNTM2IiB5PSIzOTMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+ZnJvbV90b3JjaDwvdGV4dD4KICA8bGluZSB4MT0iNTk4IiB5MT0iNDI4IiB4Mj0iNDkwIiB5Mj0iNDI4IiBjbGFzcz0iYXJyb3ciLz4KICA8dGV4dCB4PSI1NDQiIHk9IjQ0NSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj50b190b3JjaDwvdGV4dD4KCiAgPHRleHQgeD0iNDAiIHk9IjUwMCIgY2xhc3M9ImJhbmQiPlJVTlRJTUUsIEtFUk5FTFMsIEFORCBIQVJEV0FSRTwvdGV4dD4KICA8cGF0aCBkPSJNNTQwIDQ2OCBMNTQwIDQ4MiBMMzIwIDQ4MiBMMzIwIDUwOCIgZmlsbD0ibm9uZSIgY2xhc3M9ImFycm93Ii8+CiAgPHJlY3QgeD0iNDAiIHk9IjUxNiIgd2lkdGg9IjMxMCIgaGVpZ2h0PSI2NiIgcng9IjgiIGNsYXNzPSJib3giLz4KICA8dGV4dCB4PSIxOTUiIHk9IjU0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlRUTk4gb3BlcmF0b3IgbGlicmFyeTwvdGV4dD4KICA8dGV4dCB4PSIxOTUiIHk9IjU2NSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj50ZW5zb3IgQVBJIMK3IG9wIHNlbGVjdGlvbiDCtyBwcm9ncmFtIGZhY3RvcmllczwvdGV4dD4KCiAgPGxpbmUgeDE9IjM1MCIgeTE9IjU0OSIgeDI9IjM4MCIgeTI9IjU0OSIgY2xhc3M9ImFycm93Ii8+CiAgPHJlY3QgeD0iMzg4IiB5PSI1MTYiIHdpZHRoPSIzMTAiIGhlaWdodD0iNjYiIHJ4PSI4IiBjbGFzcz0iYm94Ii8+CiAgPHRleHQgeD0iNTQzIiB5PSI1NDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVC1NZXRhbGl1bTwvdGV4dD4KICA8dGV4dCB4PSI1NDMiIHk9IjU2NSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5ydW50aW1lIMK3IGNvbW1hbmQgcXVldWVzIMK3IHJlYWRlci9jb21wdXRlL3dyaXRlciBrZXJuZWxzPC90ZXh0PgoKICA8bGluZSB4MT0iNjk4IiB5MT0iNTQ5IiB4Mj0iNzI4IiB5Mj0iNTQ5IiBjbGFzcz0iYXJyb3ciLz4KICA8cmVjdCB4PSI3MzYiIHk9IjUxNiIgd2lkdGg9IjMwNCIgaGVpZ2h0PSI2NiIgcng9IjgiIGNsYXNzPSJib3giLz4KICA8dGV4dCB4PSI4ODgiIHk9IjU0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlRULVVNRCBhbmQgZmlybXdhcmU8L3RleHQ+CiAgPHRleHQgeD0iODg4IiB5PSI1NjUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+ZGV2aWNlIGRpc2NvdmVyeSDCtyBQQ0llIMK3IG1lbW9yeSBhbmQgY29tbWFuZCB0cmFuc3BvcnQ8L3RleHQ+CgogIDxsaW5lIHgxPSI4ODgiIHkxPSI1ODIiIHgyPSI4ODgiIHkyPSI2MDYiIGNsYXNzPSJhcnJvdyIvPgogIDxyZWN0IHg9IjQwIiB5PSI2MTQiIHdpZHRoPSIxMDAwIiBoZWlnaHQ9IjQ4IiByeD0iOCIgY2xhc3M9ImRldmljZSIvPgogIDx0ZXh0IHg9IjU0MCIgeT0iNjQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+QmxhY2tob2xlIFAxNTAgwrcgMTIwIFRlbnNpeCBjb3JlcyDCtyBOb0MgwrcgcGVyLWNvcmUgTDEgwrcgR0REUjY8L3RleHQ+Cjwvc3ZnPgo=" id="fig:reference-stack" style="width:100.0%" alt /><figcaption>The reference TTIS path from serving through the model port and lower runtime.</figcaption>
+</figure>
+<h2 data-number="2.4" id="pytorch-and-ttnn-in-the-same-model-implementation"><span class="header-section-number">2.4</span> PyTorch and TTNN in the same model implementation</h2>
+<p>TT-Transformers intentionally uses PyTorch and TTNN in the same Python model. The Qwen/Llama model source imports both libraries. Host tokens, positions, padding, checkpoint values, and some output processing use <code>torch.Tensor</code>, while <code>ttnn.from_torch</code> creates TTNN tensors for device execution and <code>ttnn.to_torch</code> returns selected outputs to the host [23]. The vLLM generator similarly accepts PyTorch token and page-table tensors, allocates the paged KV cache as TTNN tensors, and calls model-specific prefill and decode methods.</p>
+<p>This does not mean that the main Transformer matmuls execute in PyTorch on the CPU. Those operations use TTNN and TT-Metalium. It does mean that the reference path contains a hand-written, Tenstorrent-specific upper model layer that decides where the PyTorch/TTNN conversions occur and encodes padding, trace shapes, cache layout, dtype, sharding, collectives, and model-specific fast paths. Supporting a new architecture requires extending this model port and its serving adapter.</p>
+<h2 data-number="2.5" id="contrast-with-the-libtt-boundary"><span class="header-section-number">2.5</span> Contrast with the libtt boundary</h2>
+<table>
+<colgroup>
+<col style="width: 33%"></col>
+<col style="width: 33%"></col>
+<col style="width: 33%"></col>
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Concern</th>
+<th style="text-align: left;">TTIS and TT-Transformers path</th>
+<th style="text-align: left;">libtt path</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">Serving engine</td>
+<td style="text-align: left;">vLLM with a TT platform backend/plugin</td>
+<td style="text-align: left;">Upstream SGLang-JAX remains above PJRT</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Model</td>
+<td style="text-align: left;">TT-Transformers implements a TT-specific Transformer and generator</td>
+<td style="text-align: left;">The upstream JAX Qwen model is traced to StableHLO</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">Framework/device boundary</td>
+<td style="text-align: left;">Python generator methods and explicit PyTorch/TTNN tensor conversion</td>
+<td style="text-align: left;">PJRT and StableHLO</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Paged KV cache</td>
+<td style="text-align: left;">Coordinated by vLLM backend code and TT-Transformers TTNN operations</td>
+<td style="text-align: left;">Expressed by SGLang-JAX and lowered through TT-XLA/TT-MLIR</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">Performance work</td>
+<td style="text-align: left;">TT-specific engine, model, TTNN, program, and kernel code</td>
+<td style="text-align: left;">TT-MLIR transformations, TTNN runtime policy, and TT-Metalium kernels</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Deployment</td>
+<td style="text-align: left;">Versioned server images pin compatible TT-Metal and vLLM revisions</td>
+<td style="text-align: left;">One <code>libtt.so</code> pins and contains the compiler and runtime stack</td>
+</tr>
+</tbody>
+</table>
+<p>The direct TTNN approach gives the model author explicit control at every layer. libtt instead preserves a stable compiler boundary and attempts to recover the same hardware-specific performance below it. The comparison in this report tests whether that lower-stack approach can remain close to the upstream JAX ecosystem without giving up decode performance.</p>
+<h1 data-number="3" id="system-organization"><span class="header-section-number">3</span> System organization</h1>
 <figure>
 <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMTIwIiBoZWlnaHQ9IjY1MCIgdmlld0JveD0iMCAwIDExMjAgNjUwIj4KICA8ZGVmcz4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iaG9zdCIgeDE9IjAiIHgyPSIxIj4KICAgICAgPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZjVmNWY1Ii8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjZThlOGU4Ii8+CiAgICA8L2xpbmVhckdyYWRpZW50PgogICAgPGxpbmVhckdyYWRpZW50IGlkPSJwbHVnaW4iIHgxPSIwIiB4Mj0iMSI+CiAgICAgIDxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iI2ZmZmZmZiIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iI2YwZjBmMCIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iZGV2aWNlIiB4MT0iMCIgeDI9IjEiPgogICAgICA8c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNlZWVlZWUiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiNkOGQ4ZDgiLz4KICAgIDwvbGluZWFyR3JhZGllbnQ+CiAgICA8bWFya2VyIGlkPSJhcnJvdyIgbWFya2VyV2lkdGg9IjgiIG1hcmtlckhlaWdodD0iOCIgcmVmWD0iNyIgcmVmWT0iNCIgb3JpZW50PSJhdXRvIj4KICAgICAgPHBhdGggZD0iTTAsMCBMOCw0IEwwLDggWiIgZmlsbD0iIzQ0NDQ0NCIvPgogICAgPC9tYXJrZXI+CiAgPC9kZWZzPgogIDxzdHlsZT4KICAgIHRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExMTExfQogICAgLnRpdGxle2ZvbnQtc2l6ZToyMnB4O2ZvbnQtd2VpZ2h0OjcwMH0ubmFtZXtmb250LXNpemU6MTZweDtmb250LXdlaWdodDo3MDB9CiAgICAuYm9keXtmb250LXNpemU6MTIuNXB4O2ZpbGw6IzQ0NDQ0NH0uc21hbGx7Zm9udC1zaXplOjExLjVweDtmaWxsOiM0NDQ0NDR9CiAgICAuYm94e3N0cm9rZTojNzc3Nzc3O3N0cm9rZS13aWR0aDoxLjM1O3J4OjEwfS5hcnJvd3tzdHJva2U6IzQ0NDQ0NDtzdHJva2Utd2lkdGg6MjttYXJrZXItZW5kOnVybCgjYXJyb3cpfQogICAgLmJyYW5jaHtzdHJva2U6Izc3Nzc3NztzdHJva2Utd2lkdGg6MS42O3N0cm9rZS1kYXNoYXJyYXk6NiA1O21hcmtlci1lbmQ6dXJsKCNhcnJvdyl9CiAgICAuYmFuZHtmb250LXNpemU6MTNweDtmb250LXdlaWdodDo3MDA7bGV0dGVyLXNwYWNpbmc6LjhweDtmaWxsOiMxMTExMTF9CiAgICAuYm91bmRhcnl7Zm9udC1zaXplOjE1cHg7Zm9udC13ZWlnaHQ6NzAwO2ZpbGw6IzExMTExMX0KICA8L3N0eWxlPgogIDxyZWN0IHdpZHRoPSIxMTIwIiBoZWlnaHQ9IjY1MCIgZmlsbD0iI2ZmZiIvPgogIDx0ZXh0IHg9IjM1IiB5PSIzMCIgY2xhc3M9InRpdGxlIj5saWJ0dDogb25lIFBKUlQgYXJ0aWZhY3QgZnJvbSBmcmFtZXdvcmsgSVIgdG8gVGVuc2l4IGV4ZWN1dGlvbjwvdGV4dD4KCiAgPHRleHQgeD0iMzUiIHk9IjYxIiBjbGFzcz0iYmFuZCI+VVBTVFJFQU0gRlJPTlRFTkQgwrcgT1VUU0lERSBMSUJUVCDCtyBMQVJHRUxZIFVOQ0hBTkdFRDwvdGV4dD4KICA8cmVjdCB4PSIzNSIgeT0iNzYiIHdpZHRoPSIyMjUiIGhlaWdodD0iNzIiIGNsYXNzPSJib3giIGZpbGw9InVybCgjaG9zdCkiLz4KICA8dGV4dCB4PSIxNDciIHk9IjEwMyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlNHTGFuZy1KQVg8L3RleHQ+CiAgPHRleHQgeD0iMTQ3IiB5PSIxMjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5zZXJ2aW5nIMK3IHNjaGVkdWxpbmcgwrcgUXdlbiBtb2RlbCDCtyBLViBjYWNoZTwvdGV4dD4KICA8cmVjdCB4PSIyOTUiIHk9Ijc2IiB3aWR0aD0iMjA1IiBoZWlnaHQ9IjcyIiBjbGFzcz0iYm94IiBmaWxsPSJ1cmwoI2hvc3QpIi8+CiAgPHRleHQgeD0iMzk3IiB5PSIxMDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5KQVg8L3RleHQ+CiAgPHRleHQgeD0iMzk3IiB5PSIxMjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5zaGFwZSB0cmFjaW5nIMK3IFN0YWJsZUhMTyBleHBvcnQ8L3RleHQ+CiAgPGxpbmUgeDE9IjI2MCIgeTE9IjExMiIgeDI9IjI4OCIgeTI9IjExMiIgY2xhc3M9ImFycm93Ii8+CgogIDxyZWN0IHg9IjI1IiB5PSIxNzUiIHdpZHRoPSIxMDcwIiBoZWlnaHQ9IjMxNiIgcng9IjE4IiBmaWxsPSJ1cmwoI3BsdWdpbikiIHN0cm9rZT0iIzMzMzMzMyIgc3Ryb2tlLXdpZHRoPSIyIi8+CiAgPHRleHQgeD0iNDgiIHk9IjIwMiIgY2xhc3M9ImJvdW5kYXJ5Ij5saWJ0dC5zbyDCtyBwaW5uZWQgY29tcGlsZXIsIHJ1bnRpbWUsIGtlcm5lbHMsIGFuZCBlbWJlZGRlZCBUVC1NZXRhbCBhc3NldHM8L3RleHQ+CgogIDx0ZXh0IHg9IjQ4IiB5PSIyMzIiIGNsYXNzPSJiYW5kIj5DT01QSUxFIFBBVEggwrcgVFQtWExBIEFORCBUVC1NTElSPC90ZXh0PgogIDxyZWN0IHg9IjQ4IiB5PSIyNDciIHdpZHRoPSIxNTAiIGhlaWdodD0iODIiIGNsYXNzPSJib3giIGZpbGw9IiNmZmZmZmYiLz4KICA8dGV4dCB4PSIxMjMiIHk9IjI3NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlBKUlQgLyBUVC1YTEE8L3RleHQ+CiAgPHRleHQgeD0iMTIzIiB5PSIyOTciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5wbHVnaW4gQVBJPC90ZXh0PgogIDx0ZXh0IHg9IjEyMyIgeT0iMzE1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+U3RhYmxlSExPIGltcG9ydDwvdGV4dD4KCiAgPHJlY3QgeD0iMjMwIiB5PSIyNDciIHdpZHRoPSIxMzAiIGhlaWdodD0iODIiIGNsYXNzPSJib3giIGZpbGw9IiNmZmZmZmYiLz4KICA8dGV4dCB4PSIyOTUiIHk9IjI3NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlRUSVI8L3RleHQ+CiAgPHRleHQgeD0iMjk1IiB5PSIyOTciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij50ZW5zb3Igc2VtYW50aWNzPC90ZXh0PgogIDx0ZXh0IHg9IjI5NSIgeT0iMzE1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+Z3JhcGggZnVzaW9uPC90ZXh0PgoKICA8cmVjdCB4PSIzOTIiIHk9IjI0NyIgd2lkdGg9IjE0NSIgaGVpZ2h0PSI4MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjQ2NCIgeT0iMjc0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+VFROTiBkaWFsZWN0PC90ZXh0PgogIDx0ZXh0IHg9IjQ2NCIgeT0iMjk3IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+b3BzIMK3IGR0eXBlIMK3IGxheW91dDwvdGV4dD4KICA8dGV4dCB4PSI0NjQiIHk9IjMxNSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnJ1bnRpbWUgY29udHJhY3Q8L3RleHQ+CgogIDxyZWN0IHg9IjU2OSIgeT0iMjQ3IiB3aWR0aD0iMTUwIiBoZWlnaHQ9IjgyIiBjbGFzcz0iYm94IiBmaWxsPSIjZmZmZmZmIi8+CiAgPHRleHQgeD0iNjQ0IiB5PSIyNzQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVE5OIEZsYXRCdWZmZXI8L3RleHQ+CiAgPHRleHQgeD0iNjQ0IiB5PSIyOTciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5zZXJpYWxpemVkIGV4ZWN1dGFibGU8L3RleHQ+CiAgPHRleHQgeD0iNjQ0IiB5PSIzMTUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5tZWFzdXJlZCBwYXRoPC90ZXh0PgoKICA8bGluZSB4MT0iMTk4IiB5MT0iMjg4IiB4Mj0iMjIzIiB5Mj0iMjg4IiBjbGFzcz0iYXJyb3ciLz4KICA8bGluZSB4MT0iMzYwIiB5MT0iMjg4IiB4Mj0iMzg1IiB5Mj0iMjg4IiBjbGFzcz0iYXJyb3ciLz4KICA8bGluZSB4MT0iNTM3IiB5MT0iMjg4IiB4Mj0iNTYyIiB5Mj0iMjg4IiBjbGFzcz0iYXJyb3ciLz4KCiAgPHJlY3QgeD0iNzY1IiB5PSIyMzkiIHdpZHRoPSIzMDAiIGhlaWdodD0iOTgiIGNsYXNzPSJib3giIGZpbGw9IiNmN2Y3ZjciLz4KICA8dGV4dCB4PSI5MTUiIHk9IjI2NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPkRpcmVjdC10by1NZXRhbCBicmFuY2g8L3RleHQ+CiAgPHRleHQgeD0iOTE1IiB5PSIyODciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5EMk0g4oaSIFRUS2VybmVsICsgVFRNZXRhbDwvdGV4dD4KICA8dGV4dCB4PSI5MTUiIHk9IjMwNyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5nZW5lcmljIHRpbGVkIGNvbXB1dGUg4oaSIGRldmljZS9ob3N0IElSPC90ZXh0PgogIDx0ZXh0IHg9IjkxNSIgeT0iMzI0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPm5vdCB1c2VkIGJ5IHRoZSBtZWFzdXJlZCBoYW5kLXdyaXR0ZW4ga2VybmVsczwvdGV4dD4KICA8cGF0aCBkPSJNMjk1IDMyOSBMMjk1IDM1MiBMNzQ1IDM1MiBMNzQ1IDI4OCBMNzU4IDI4OCIgZmlsbD0ibm9uZSIgY2xhc3M9ImJyYW5jaCIvPgoKICA8dGV4dCB4PSI0OCIgeT0iMzgwIiBjbGFzcz0iYmFuZCI+RVhFQ1VUSU9OIFBBVEggwrcgRU1CRURERUQgVFROTiBBTkQgVFQtTUVUQUwgUlVOVElNRTwvdGV4dD4KICA8cmVjdCB4PSI0OCIgeT0iMzk0IiB3aWR0aD0iMTk1IiBoZWlnaHQ9IjcyIiBjbGFzcz0iYm94IiBmaWxsPSIjZmZmZmZmIi8+CiAgPHRleHQgeD0iMTQ1IiB5PSI0MjEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVE5OIHJ1bnRpbWU8L3RleHQ+CiAgPHRleHQgeD0iMTQ1IiB5PSI0NDQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5kZXNlcmlhbGl6ZSDCtyB0ZW5zb3IgcG9saWN5IMK3IHRyYWNlPC90ZXh0PgoKICA8cmVjdCB4PSIyNzciIHk9IjM5NCIgd2lkdGg9IjIxMCIgaGVpZ2h0PSI3MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjM4MiIgeT0iNDIxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+UHJvZ3JhbSBmYWN0b3JpZXM8L3RleHQ+CiAgPHRleHQgeD0iMzgyIiB5PSI0NDQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5ndWFyZHMgwrcgY29yZSBncmlkcyDCtyBjaXJjdWxhciBidWZmZXJzPC90ZXh0PgoKICA8cmVjdCB4PSI1MjEiIHk9IjM5NCIgd2lkdGg9IjIwNSIgaGVpZ2h0PSI3MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjYyMyIgeT0iNDIxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+VFQtTWV0YWwgcnVudGltZTwvdGV4dD4KICA8dGV4dCB4PSI2MjMiIHk9IjQ0NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnF1ZXVlcyDCtyBwcm9ncmFtcyDCtyBOb0MgYXJndW1lbnRzPC90ZXh0PgoKICA8cmVjdCB4PSI3NjAiIHk9IjM5NCIgd2lkdGg9IjMwNSIgaGVpZ2h0PSI3MiIgY2xhc3M9ImJveCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjkxMiIgeT0iNDIxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+UmVhZGVyIMK3IGNvbXB1dGUgwrcgd3JpdGVyIGtlcm5lbHM8L3RleHQ+CiAgPHRleHQgeD0iOTEyIiB5PSI0NDQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5oYW5kLXdyaXR0ZW4gQysrIGNvbXBpbGVkIGludG8gdGhlIGFydGlmYWN0PC90ZXh0PgoKICA8cGF0aCBkPSJNNjQ0IDMyOSBMNjQ0IDM2NSBMMTQ1IDM2NSBMMTQ1IDM4NyIgZmlsbD0ibm9uZSIgY2xhc3M9ImFycm93Ii8+CiAgPGxpbmUgeDE9IjI0MyIgeTE9IjQzMCIgeDI9IjI3MCIgeTI9IjQzMCIgY2xhc3M9ImFycm93Ii8+CiAgPGxpbmUgeDE9IjQ4NyIgeTE9IjQzMCIgeDI9IjUxNCIgeTI9IjQzMCIgY2xhc3M9ImFycm93Ii8+CiAgPGxpbmUgeDE9IjcyNiIgeTE9IjQzMCIgeDI9Ijc1MyIgeTI9IjQzMCIgY2xhc3M9ImFycm93Ii8+CgogIDx0ZXh0IHg9IjM1IiB5PSI1MjgiIGNsYXNzPSJiYW5kIj5CTEFDS0hPTEUgREVWSUNFPC90ZXh0PgogIDxyZWN0IHg9IjM1IiB5PSI1NDQiIHdpZHRoPSIxMDUwIiBoZWlnaHQ9IjgyIiByeD0iMTQiIGZpbGw9InVybCgjZGV2aWNlKSIgc3Ryb2tlPSIjNzc3Nzc3IiBzdHJva2Utd2lkdGg9IjEuNSIvPgogIDx0ZXh0IHg9IjE1NSIgeT0iNTc0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+R0REUjYgRFJBTTwvdGV4dD4KICA8dGV4dCB4PSIxNTUiIHk9IjU5OSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPndlaWdodHMgwrcgcGVyc2lzdGVudCB0ZW5zb3JzPC90ZXh0PgogIDx0ZXh0IHg9IjQzNSIgeT0iNTc0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+MkQgTm9DICsgcGVyLWNvcmUgTDE8L3RleHQ+CiAgPHRleHQgeD0iNDM1IiB5PSI1OTkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5tdWx0aWNhc3QgwrcgY2lyY3VsYXIgYnVmZmVycyDCtyBzaGFyZHM8L3RleHQ+CiAgPHRleHQgeD0iNzc1IiB5PSI1NzQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UZW5zaXggZW5naW5lczwvdGV4dD4KICA8dGV4dCB4PSI3NzUiIHk9IjU5OSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnVucGFja2VyIMK3IG1hdHJpeC92ZWN0b3IgwrcgRHN0IMK3IHBhY2tlcjwvdGV4dD4KICA8dGV4dCB4PSIxMDAwIiB5PSI1NzQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj4xMjAgd29ya2VyczwvdGV4dD4KICA8dGV4dCB4PSIxMDAwIiB5PSI1OTkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJib2R5Ij5QMTUwIGZpcm13YXJlIGNvbmZpZ3VyYXRpb248L3RleHQ+CiAgPHBhdGggZD0iTTkxMiA0NjYgTDkxMiA1MTUgTDc3NSA1MTUgTDc3NSA1MzciIGZpbGw9Im5vbmUiIGNsYXNzPSJhcnJvdyIvPgo8L3N2Zz4K" id="fig:stack" style="width:100.0%" alt /><figcaption>libtt serving, compilation, runtime, and device layers.</figcaption>
 </figure>
-<h1 data-number="2" id="system-organization"><span class="header-section-number">2</span> System organization</h1>
-<h2 data-number="2.1" id="deployment-and-frontend-boundary"><span class="header-section-number">2.1</span> Deployment and frontend boundary</h2>
+<h2 data-number="3.1" id="deployment-and-frontend-boundary"><span class="header-section-number">3.1</span> Deployment and frontend boundary</h2>
 <p>PJRT lets frameworks call device-specific plugins through one interface [3]. libtt implements that interface for Tenstorrent:</p>
 <pre class="text"><code>JAX process
   `-- dynamically loads libtt.so through PJRT
@@ -130,16 +238,16 @@ pre { white-space: pre-wrap; }
 <li>performance can be added in TT-MLIR, TTNN, TT-Metal, and device kernels, where layout, fusion, precision, and data movement are visible.</li>
 </ul>
 <p>We evaluate inference, but PJRT and StableHLO are not inference-specific. Training support can use the same architecture by adding the required operations, collective behavior, optimizer graphs, and numerical validation below the existing JAX frontend.</p>
-<h2 data-number="2.2" id="integrated-build"><span class="header-section-number">2.2</span> Integrated build</h2>
-<p>libtt uses Bazel modules and repository rules [1] to pin TT-UMD [22], SFPI [11], TT-Metal, LLVM, StableHLO, TT-XLA [23], TT-MLIR, Shardy, and supporting C++ libraries. Bazel overlays add targets for projects that use another build system. The <code>//:tt</code> target produces <code>bazel-bin/libtt.so</code>.</p>
+<h2 data-number="3.2" id="integrated-build"><span class="header-section-number">3.2</span> Integrated build</h2>
+<p>libtt uses Bazel modules and repository rules [1] to pin TT-UMD [24], SFPI [12], TT-Metal, LLVM, StableHLO, TT-XLA [25], TT-MLIR, Shardy, and supporting C++ libraries. Bazel overlays add targets for projects that use another build system. The <code>//:tt</code> target produces <code>bazel-bin/libtt.so</code>.</p>
 <p>This organization has three practical effects:</p>
 <ul>
 <li>Source revisions, overlays, patches, toolchains, and link rules are inputs to one build.</li>
 <li>Compiler, schema, runtime, program-factory, and kernel changes can be tested together.</li>
 <li>An agent can inspect and edit every layer in one workspace, rebuild one target, and run one benchmark.</li>
 </ul>
-<p>Tenstorrent’s compiler overview describes the same open path from framework frontends through TT-MLIR dialects to TT-Metalium [13, 18]. libtt builds a pinned part of that path as one artifact.</p>
-<h2 data-number="2.3" id="cross-layer-optimization"><span class="header-section-number">2.3</span> Cross-layer optimization</h2>
+<p>Tenstorrent’s compiler overview describes the same open path from framework frontends through TT-MLIR dialects to TT-Metalium [14, 19]. libtt builds a pinned part of that path as one artifact.</p>
+<h2 data-number="3.3" id="cross-layer-optimization"><span class="header-section-number">3.3</span> Cross-layer optimization</h2>
 <p>The matmul-SwiGLU epilogue crosses six layers:</p>
 <ol type="1">
 <li>A graph pass must prove that a paired gate/up matmul feeds the exact <code>silu(gate) * up</code> expression.</li>
@@ -150,15 +258,15 @@ pre { white-space: pre-wrap; }
 <li>Reader, compute, and writer kernels must keep the paired tiles resident in Dst and emit only the half-width final result.</li>
 </ol>
 <p>These steps form one patch concept even though they touch several abstraction levels and two upstream repositories.</p>
-<h2 data-number="2.4" id="the-framework-boundary-jax-stablehlo-and-pjrt"><span class="header-section-number">2.4</span> The framework boundary: JAX, StableHLO, and PJRT</h2>
+<h2 data-number="3.4" id="the-framework-boundary-jax-stablehlo-and-pjrt"><span class="header-section-number">3.4</span> The framework boundary: JAX, StableHLO, and PJRT</h2>
 <p>Upstream SGLang-JAX owns serving, tokenization, scheduling, the JAX Qwen model, and the paged KV cache [5]. JAX traces each shape-specific computation to StableHLO, a portable operation set between frameworks and compilers [4]. PJRT hides the device-specific compiler and runtime from JAX [3].</p>
 <p>The steady-state request path is:</p>
 <pre class="text"><code>SGLang-JAX → JAX trace → StableHLO → libtt/PJRT
             → TT-XLA → TT-MLIR → TTNN executable
             → TTNN runtime → TT-Metal programs → Blackhole</code></pre>
 <p><code>libtt.so</code> accepts StableHLO and executes a serialized TTNN program.</p>
-<h2 data-number="2.5" id="tt-mlir-ir-levels"><span class="header-section-number">2.5</span> TT-MLIR IR levels</h2>
-<p>MLIR supports dialects at different abstraction levels [2]. TT-MLIR uses them for model semantics, layouts, tiled computation, device kernels, and host/device control [18]. Each optimization should use the highest level that still has the information it needs.</p>
+<h2 data-number="3.5" id="tt-mlir-ir-levels"><span class="header-section-number">3.5</span> TT-MLIR IR levels</h2>
+<p>MLIR supports dialects at different abstraction levels [2]. TT-MLIR uses them for model semantics, layouts, tiled computation, device kernels, and host/device control [19]. Each optimization should use the highest level that still has the information it needs.</p>
 <table>
 <caption>The TT-MLIR IR ladder and where libtt’s measured path uses it.</caption>
 <colgroup>
@@ -181,12 +289,12 @@ pre { white-space: pre-wrap; }
 </tr>
 <tr class="even">
 <td style="text-align: left;">TTIR</td>
-<td style="text-align: left;">Hardware-aware, high-level tensor IR. It preserves named tensor operations while permitting fusion and canonicalization before a concrete runtime API is chosen [18].</td>
+<td style="text-align: left;">Hardware-aware, high-level tensor IR. It preserves named tensor operations while permitting fusion and canonicalization before a concrete runtime API is chosen [19].</td>
 <td style="text-align: left;">JAX RMSNorm recognition, expanded-SiLU recovery, shared-LHS matmul grouping, role propagation, and part of QKV/RoPE fusion.</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">TTNN dialect</td>
-<td style="text-align: left;">High-level tensor IR designed to model the TTNN library closely. Its types and attributes carry tiled layouts, memory spaces, sharding, and device data types [18, 19].</td>
+<td style="text-align: left;">High-level tensor IR designed to model the TTNN library closely. Its types and attributes carry tiled layouts, memory spaces, sharding, and device data types [19, 20].</td>
 <td style="text-align: left;">QKV composite fusion, <code>matmul_swiglu</code>, layout selection, cache return types, and lowering to the serialized TTNN operation graph.</td>
 </tr>
 <tr class="even">
@@ -196,17 +304,17 @@ pre { white-space: pre-wrap; }
 </tr>
 <tr class="odd">
 <td style="text-align: left;">D2M dialect</td>
-<td style="text-align: left;">Generic tensor/memref computation analogous to <code>linalg.generic</code>, augmented with grids, sharded tensors, circular buffers, and explicit data movement [18].</td>
+<td style="text-align: left;">Generic tensor/memref computation analogous to <code>linalg.generic</code>, augmented with grids, sharded tensors, circular buffers, and explicit data movement [19].</td>
 <td style="text-align: left;">An alternative direct-to-metal route. The measured custom SwiGLU and down-projection kernels are hand-written TT-Metal/TTNN patches, so they do not pass through D2M.</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">TTKernel dialect</td>
-<td style="text-align: left;">Low-level device-kernel IR exposing circular buffers, tile registers, NoC transactions, and synchronization with an intended near one-to-one mapping to TT-Metal kernels [18].</td>
+<td style="text-align: left;">Low-level device-kernel IR exposing circular buffers, tile registers, NoC transactions, and synchronization with an intended near one-to-one mapping to TT-Metal kernels [19].</td>
 <td style="text-align: left;">Relevant to generated direct-to-metal kernels; not the representation of the hand-written C++ kernels measured here.</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">TTMetal dialect</td>
-<td style="text-align: left;">Host/device interop IR for allocation, transfers, program creation, and enqueue operations [18].</td>
+<td style="text-align: left;">Host/device interop IR for allocation, transfers, program creation, and enqueue operations [19].</td>
 <td style="text-align: left;">Part of the direct-to-metal compiler route. The measured TTNN route instead invokes TT-Metal host APIs from the TTNN runtime.</td>
 </tr>
 </tbody>
@@ -220,10 +328,10 @@ pre { white-space: pre-wrap; }
 <p>TT-MLIR also supports the lower-level branch:</p>
 <pre class="text"><code>TTIR → D2M → TTKernel + TTMetal → generated device/host program</code></pre>
 <p>Only the first branch runs the benchmarked patches. Their hand-written C++ program factories and kernels are not TTKernel IR optimizations.</p>
-<h2 data-number="2.6" id="ttnn-runtime-and-the-serialized-executable"><span class="header-section-number">2.6</span> TTNN runtime and the serialized executable</h2>
+<h2 data-number="3.6" id="ttnn-runtime-and-the-serialized-executable"><span class="header-section-number">3.6</span> TTNN runtime and the serialized executable</h2>
 <p>TTNN IR models operations such as matmul, RMSNorm, SDPA, and reshape. Lowering serializes them into a FlatBuffer. The runtime deserializes the graph, creates tensors, sets memory configurations, validates each operation, and selects a program factory. The RMSNorm patch uses the concrete input shape here to choose a 16-core width-sharded layout; the compiler still emits a normal RMSNorm.</p>
-<h2 data-number="2.7" id="tt-metal-programs-and-tensix-kernels"><span class="header-section-number">2.7</span> TT-Metal programs and Tensix kernels</h2>
-<p>TT-Metalium uses cooperative dataflow rather than a GPU thread hierarchy [16]. A program usually has:</p>
+<h2 data-number="3.7" id="tt-metal-programs-and-tensix-kernels"><span class="header-section-number">3.7</span> TT-Metal programs and Tensix kernels</h2>
+<p>TT-Metalium uses cooperative dataflow rather than a GPU thread hierarchy [17]. A program usually has:</p>
 <ul>
 <li>a reader data-movement kernel to fetch tiles from DRAM or another core into L1 circular buffers;</li>
 <li>a compute kernel to unpack tiles, drive matrix/vector engines, and create result tiles; and</li>
@@ -231,12 +339,12 @@ pre { white-space: pre-wrap; }
 </ul>
 <p>Circular buffers are bounded queues shared by the threads of a Tensix core [9]. Reader, compute, and writer kernels can overlap on different tiles when their buffer and semaphore protocols are correct.</p>
 <p>The compute engine exposes SrcA, SrcB, and Dst register sets. Matrix results land in Dst; vector operations can transform them; the packer writes them to an L1 circular buffer [10]. With 16-bit Dst storage and double buffering enabled, the active half contains eight 32-by-32 tiles. That capacity determines the successful SwiGLU geometry: four gate and four up tiles fill Dst exactly.</p>
-<h2 data-number="2.8" id="tiles-memory-and-low-precision-weights"><span class="header-section-number">2.8</span> Tiles, memory, and low-precision weights</h2>
-<p>TTNN’s standard tile is 32 by 32 elements with four 16-by-16 faces [12]. Final dimensions are padded, so batch-one decode still presents a full tile row. Kernels must account for both the logical and padded shapes.</p>
-<p>Large weights reside in device DRAM; L1 is smaller, faster, and private to each worker. TTNN <code>MemoryConfig</code> values describe interleaved or sharded storage and DRAM or L1 placement. TT-MLIR layout attributes similarly encode how a logical tensor maps to devices, cores, physical shards, memory space, and padding [19].</p>
-<p>We use BF16 activations and outputs with BFLOAT8_B weights. BFLOAT8_B is block floating point: 16 values share an exponent [21]. It reduces the dominant weight traffic in batch-one decode, with a precision and packing trade-off. The custom matmuls use BF16 packer-L1 accumulation: partial sums are packed into an L1 slot and reloaded for later K blocks, leaving Dst available for the current block’s tile group.</p>
-<h2 data-number="2.9" id="decode-bottlenecks"><span class="header-section-number">2.9</span> Decode bottlenecks</h2>
-<p>Qwen3 is a decoder-only Transformer family [24]. A simplified layer is:</p>
+<h2 data-number="3.8" id="tiles-memory-and-low-precision-weights"><span class="header-section-number">3.8</span> Tiles, memory, and low-precision weights</h2>
+<p>TTNN’s standard tile is 32 by 32 elements with four 16-by-16 faces [13]. Final dimensions are padded, so batch-one decode still presents a full tile row. Kernels must account for both the logical and padded shapes.</p>
+<p>Large weights reside in device DRAM; L1 is smaller, faster, and private to each worker. TTNN <code>MemoryConfig</code> values describe interleaved or sharded storage and DRAM or L1 placement. TT-MLIR layout attributes similarly encode how a logical tensor maps to devices, cores, physical shards, memory space, and padding [20].</p>
+<p>We use BF16 activations and outputs with BFLOAT8_B weights. BFLOAT8_B is block floating point: 16 values share an exponent [22]. It reduces the dominant weight traffic in batch-one decode, with a precision and packing trade-off. The custom matmuls use BF16 packer-L1 accumulation: partial sums are packed into an L1 slot and reloaded for later K blocks, leaving Dst available for the current block’s tile group.</p>
+<h2 data-number="3.9" id="decode-bottlenecks"><span class="header-section-number">3.9</span> Decode bottlenecks</h2>
+<p>Qwen3 is a decoder-only Transformer family [26]. A simplified layer is:</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mtable><mtr><mtd columnalign="right"><mi>u</mi></mtd><mtd columnalign="left"><mo>=</mo><mo>RMSNorm</mo><mo stretchy="false" form="prefix">(</mo><mi>h</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>h</mi><mi>′</mi></mtd><mtd columnalign="left"><mo>=</mo><mi>h</mi><mo>+</mo><mo>Attention</mo><mo stretchy="false" form="prefix">(</mo><mi>Q</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo><mi>K</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo><mi>V</mi><mo stretchy="false" form="prefix">(</mo><mi>u</mi><mo stretchy="false" form="postfix">)</mo><mo>;</mo><msub><mi>K</mi><mrow><mi>c</mi><mi>a</mi><mi>c</mi><mi>h</mi><mi>e</mi></mrow></msub><mo>,</mo><msub><mi>V</mi><mrow><mi>c</mi><mi>a</mi><mi>c</mi><mi>h</mi><mi>e</mi></mrow></msub><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>v</mi></mtd><mtd columnalign="left"><mo>=</mo><mo>RMSNorm</mo><mo stretchy="false" form="prefix">(</mo><mi>h</mi><mi>′</mi><mo stretchy="false" form="postfix">)</mo><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><mi>g</mi></mtd><mtd columnalign="left"><mo>=</mo><mi>v</mi><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mo>,</mo><mspace width="2.0em"></mspace><mi>r</mi><mo>=</mo><mi>v</mi><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mo>,</mo></mtd></mtr><mtr><mtd columnalign="right"><msub><mi>h</mi><mrow><mi>n</mi><mi>e</mi><mi>x</mi><mi>t</mi></mrow></msub></mtd><mtd columnalign="left"><mo>=</mo><mi>h</mi><mi>′</mi><mo>+</mo><mo minsize="1.2" maxsize="1.2" stretchy="false" form="prefix">(</mo><mo>SiLU</mo><mo stretchy="false" form="prefix">(</mo><mi>g</mi><mo stretchy="false" form="postfix">)</mo><mo>⊙</mo><mi>r</mi><mo minsize="1.2" maxsize="1.2" stretchy="false" form="postfix">)</mo><msub><mi>W</mi><mrow><mi>d</mi><mi>o</mi><mi>w</mi><mi>n</mi></mrow></msub><mi>.</mi></mtd></mtr></mtable><annotation encoding="application/x-tex">
 \begin{aligned}
 u &amp;= \operatorname{RMSNorm}(h),\\
@@ -246,8 +354,8 @@ g &amp;= vW_{gate}, \qquad r = vW_{up},\\
 h_{next} &amp;= h&#39; + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 \end{aligned}
 </annotation></semantics></math></p>
-<p>RMSNorm and SwiGLU are standard model concepts [6, 25]. Prefill shares each weight read across many rows. Serial decode applies a logical <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">1\times K</annotation></semantics></math> by <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">K\times N</annotation></semantics></math> projection for every token, so weight traffic and intermediate materialization dominate. The main optimizations add width parallelism, reduce DRAM traffic, or avoid packing an intermediate from Dst.</p>
-<h1 data-number="3" id="optimization-of-the-model-path"><span class="header-section-number">3</span> Optimization of the model path</h1>
+<p>RMSNorm and SwiGLU are standard model concepts [6, 27]. Prefill shares each weight read across many rows. Serial decode applies a logical <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">1\times K</annotation></semantics></math> by <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">K\times N</annotation></semantics></math> projection for every token, so weight traffic and intermediate materialization dominate. The main optimizations add width parallelism, reduce DRAM traffic, or avoid packing an intermediate from Dst.</p>
+<h1 data-number="4" id="optimization-of-the-model-path"><span class="header-section-number">4</span> Optimization of the model path</h1>
 <p>We group the changes by engineering concept and implementation level rather than by commit. Git revisions remain in the data files.</p>
 <table>
 <caption>Current model-path optimization concepts, implementation levels, and measured effects.</caption>
@@ -353,25 +461,25 @@ SwiGLU vertical     tt_mlir_fuse_matmul_swiglu.patch
 down projection     down_projection_110_core.patch</code></pre>
 <p>The +22.58% foundation figure combines patches that were not measured separately. The blocking and down-projection tests use a streaming decode clock, so they remain outside the cumulative sequence.</p>
 <p>The first group recovers model semantics in TTIR and TTNN before lowerings discard the algebra and graph roles needed to recognize them.</p>
-<h2 data-number="3.1" id="rmsnorm-recognition"><span class="header-section-number">3.1</span> RMSNorm recognition</h2>
+<h2 data-number="4.1" id="rmsnorm-recognition"><span class="header-section-number">4.1</span> RMSNorm recognition</h2>
 <p>JAX can lower RMSNorm to square, reduce, epsilon addition, reciprocal square root, scaling, and reshapes. A TTIR pattern proves this structure and replaces it with one RMSNorm operation while the algebra and use-def graph are still available. TTNN can then apply its normalization and layout logic. Recognition is part of the foundation bundle and enables the later runtime-sharding patch.</p>
-<h2 data-number="3.2" id="expanded-silu-recognition"><span class="header-section-number">3.2</span> Expanded-SiLU recognition</h2>
+<h2 data-number="4.2" id="expanded-silu-recognition"><span class="header-section-number">4.2</span> Expanded-SiLU recognition</h2>
 <p>The graph represents</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>SiLU</mo><mo stretchy="false" form="prefix">(</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mi>x</mi><mspace width="0.167em"></mspace><mi>σ</mi><mo stretchy="false" form="prefix">(</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mfrac><mi>x</mi><mrow><mn>1</mn><mo>+</mo><mo>exp</mo><mo stretchy="false" form="prefix">(</mo><mo>−</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo></mrow></mfrac></mrow><annotation encoding="application/x-tex">
 \operatorname{SiLU}(x)=x\,\sigma(x)=\frac{x}{1+\exp(-x)}
 </annotation></semantics></math></p>
 <p>with casts, broadcasts, reshapes, and a splatted scalar one. <code>tt_mlir_fuse_expanded_silu.patch</code> looks through view-like operations, verifies the constant and shared input, and replaces the tree with SiLU. The isolated gain is +3.30%.</p>
-<h2 data-number="3.3" id="rank-3-rope-and-qkv-projection-structure"><span class="header-section-number">3.3</span> Rank-3 RoPE and QKV projection structure</h2>
+<h2 data-number="4.3" id="rank-3-rope-and-qkv-projection-structure"><span class="header-section-number">4.3</span> Rank-3 RoPE and QKV projection structure</h2>
 <p>Qwen projects Q, K, and V together, applies per-head RMSNorm to Q and K, reshapes them by head count, and applies rotary position embedding. Two patches recover this structure:</p>
 <ul>
 <li><code>tt_mlir_fuse_rank3_rope_decode.patch</code> accepts JAX’s rank-3 decode form, temporarily maps it to the existing rank-4 composite, and restores the expected result shape.</li>
 <li><code>tt_mlir_qwen_decode_qkv_projection_fusion.patch</code> orders projection roles, validates contiguous Q/K/V bounds, head counts, and head dimensions, and replaces materialized slices/reshapes with <code>nlp_create_qkv_heads_decode</code>. Q and K RMSNorm are recreated on the fused rank-4 results.</li>
 </ul>
 <p>TTIR supplies candidate ordering and role information; TTNN owns the composite operation and runtime contract. QKV fusion adds +1.15%. Rank-3 RoPE is part of the foundation bundle.</p>
-<h2 data-number="3.4" id="kv-cache-dtype-and-role-propagation"><span class="header-section-number">3.4</span> KV-cache dtype and role propagation</h2>
+<h2 data-number="4.4" id="kv-cache-dtype-and-role-propagation"><span class="header-section-number">4.4</span> KV-cache dtype and role propagation</h2>
 <p>KV-cache update operations are stateful boundaries. Their return types must carry the selected device dtype, and graph-role metadata must survive unary operations so later fusions can still identify query, key, and value paths. The TT-MLIR and TT-XLA patches keep the low-precision fused graph typed and recognizable. They are enabling changes rather than isolated speedups.</p>
 <p>The next group selects precision and layout after the graph operations have been recovered.</p>
-<h2 data-number="3.5" id="bf8-lowering-and-fast-host-packing"><span class="header-section-number">3.5</span> BF8 lowering and fast host packing</h2>
+<h2 data-number="4.5" id="bf8-lowering-and-fast-host-packing"><span class="header-section-number">4.5</span> BF8 lowering and fast host packing</h2>
 <p>We request <code>bfp_bf8</code> for eligible weights. TT-XLA enables single-chip lowering, TT-MLIR assigns the device dtype, and TTNN/TT-Metal consume BFLOAT8_B tiles. <code>fast_bfloat16_bfp8_pack.patch</code> speeds conversion of BF16 host weights to 32-by-32 BFP8 tiles.</p>
 <p>These changes attack two different phases:</p>
 <ul>
@@ -379,7 +487,7 @@ down projection     down_projection_110_core.patch</code></pre>
 <li>faster packing reduces model-load and preparation cost on the host.</li>
 </ul>
 <p>We did not isolate these effects from the foundation bundle.</p>
-<h2 data-number="3.6" id="width-sharded-decode-rmsnorm"><span class="header-section-number">3.6</span> Width-sharded decode RMSNorm</h2>
+<h2 data-number="4.6" id="width-sharded-decode-rmsnorm"><span class="header-section-number">4.6</span> Width-sharded decode RMSNorm</h2>
 <p>The default logical height of RMSNorm during batch-one decode is one. A generic height-parallel program cannot occupy many cores. At run time, we recognize a device-resident, tiled, unsharded input with sequence length one and width at least 2048. When the width divides into 16 tile-aligned shards, it:</p>
 <ol type="1">
 <li>creates an 8-by-2 row-major core grid;</li>
@@ -389,7 +497,7 @@ down projection     down_projection_110_core.patch</code></pre>
 <li>restores the requested output memory configuration.</li>
 </ol>
 <p>The two conversions cost less than the width-parallel reduction saves. The isolated gain is +13.61%. This is runtime policy, not a new IR operation: the compiler identifies RMSNorm, while the runtime knows the tensor and device geometry.</p>
-<h2 data-number="3.7" id="decode-specific-validation-changes"><span class="header-section-number">3.7</span> Decode-specific validation changes</h2>
+<h2 data-number="4.7" id="decode-specific-validation-changes"><span class="header-section-number">4.7</span> Decode-specific validation changes</h2>
 <p>Two small TT-Metal patches admit layouts selected by the optimized graph:</p>
 <ul>
 <li>SDPA decode accepts an L1-interleaved query rather than requiring the prior sharded form.</li>
@@ -397,7 +505,7 @@ down projection     down_projection_110_core.patch</code></pre>
 </ul>
 <p>These narrow changes remove conversions while keeping shape and layout checks. Their performance effect is part of the foundation bundle.</p>
 <p>The MLP experiments test which intermediate and data-movement boundaries must be removed for fusion to improve decode throughput.</p>
-<h2 data-number="3.8" id="shared-lhs-gateup-projection"><span class="header-section-number">3.8</span> Shared-LHS gate/up projection</h2>
+<h2 data-number="4.8" id="shared-lhs-gateup-projection"><span class="header-section-number">4.8</span> Shared-LHS gate/up projection</h2>
 <p>Qwen’s two first MLP projections share an activation:</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mo>,</mo><mspace width="0.278em"></mspace><mi>x</mi><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mspace width="1.0em"></mspace><mo>→</mo><mspace width="1.0em"></mspace><mi>x</mi><mo stretchy="false" form="prefix">[</mo><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mspace width="0.278em"></mspace><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mo stretchy="false" form="postfix">]</mo><mi>.</mi></mrow><annotation encoding="application/x-tex">
 xW_{gate},\;xW_{up}
@@ -405,12 +513,12 @@ xW_{gate},\;xW_{up}
 x[W_{gate}\;W_{up}].
 </annotation></semantics></math></p>
 <p><code>tt_mlir_fuse_shared_lhs_matmul_pairs.patch</code> changes TTIR fusion eligibility so a pair can be combined. This removes duplicate activation reads and launches, but writes a doubled-width output that SwiGLU slices and rereads. Throughput changes by -1.69%. The representation becomes useful when the epilogue consumes it without materializing the combined output.</p>
-<h2 data-number="3.9" id="consumer-side-silu-fusion"><span class="header-section-number">3.9</span> Consumer-side SiLU fusion</h2>
+<h2 data-number="4.9" id="consumer-side-silu-fusion"><span class="header-section-number">4.9</span> Consumer-side SiLU fusion</h2>
 <p>An intermediate experiment placed SiLU as a unary activation on the following TTNN multiply. That removes one elementwise operation but retains the expensive boundary:</p>
 <pre class="text"><code>combined matmul → pack full gate/up tensor → memory
                 → read/unpack → SiLU + multiply → pack result</code></pre>
 <p>Throughput changes by -0.65%. Removing an operation does not help when the same large intermediate is still written and read.</p>
-<h2 data-number="3.10" id="dst-resident-matmul-swiglu-epilogue"><span class="header-section-number">3.10</span> Dst-resident matmul-SwiGLU epilogue</h2>
+<h2 data-number="4.10" id="dst-resident-matmul-swiglu-epilogue"><span class="header-section-number">4.10</span> Dst-resident matmul-SwiGLU epilogue</h2>
 <p>Two patches implement the producer-side epilogue:</p>
 <ul>
 <li><code>tt_mlir_fuse_matmul_swiglu.patch</code> recognizes the TTNN graph, introduces the fused matmul semantic, extends the FlatBuffer representation, serializes it, and invokes the corresponding runtime path.</li>
@@ -429,10 +537,10 @@ x[W_{gate}\;W_{up}].
 <li>only four final BF16 tiles are packed and written.</li>
 </ol>
 <p>The doubled-width gate/up tensor is never materialized. End-to-end throughput improves by +2.73%.</p>
-<h2 data-number="3.11" id="prefill-coverage-and-fallback-removal"><span class="header-section-number">3.11</span> Prefill coverage and fallback removal</h2>
+<h2 data-number="4.11" id="prefill-coverage-and-fallback-removal"><span class="header-section-number">4.11</span> Prefill coverage and fallback removal</h2>
 <p>We then generalized the matcher from decode-specific naming to any supported one-tile-row input, which includes short prefill. The older consumer-side SiLU-multiply fallback was removed; validation remains at the TTNN/TT-Metal boundary, where unsupported dtype, layout, shape, and hardware combinations fail explicitly.</p>
 <p>Throughput changes by -0.19%. The change removes code and adds prefill coverage without changing the fast kernel or completion hash.</p>
-<h2 data-number="3.12" id="swiglu-k-blocking-sweep"><span class="header-section-number">3.12</span> SwiGLU K-blocking sweep</h2>
+<h2 data-number="4.12" id="swiglu-k-blocking-sweep"><span class="header-section-number">4.12</span> SwiGLU K-blocking sweep</h2>
 <p>The initial epilogue uses <code>in0_block_w = 2</code>. Every two K tiles it packs eight partial tiles into L1 and later reloads them. Larger blocks reduce partial traffic but need larger activation and weight circular buffers.</p>
 <p><code>matmul_swiglu_epilogue.patch</code> now exposes <code>TT_METAL_SWIGLU_IN0_BLOCK_W={2,4,8,16}</code> and sizes the circular buffers from the chosen value. The 32-sample test compares width 4 with width 2 while disabling the new down-projection specialization:</p>
 <table>
@@ -460,7 +568,7 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The intervals overlap and the measured change is small, so width two remains the default. Widths 8 and 16 remain available for experiments. Wider blocks also change accumulation order and can change greedy token sequences.</p>
-<h2 data-number="3.13" id="core-fused-residual-down-projection"><span class="header-section-number">3.13</span> 110-core fused-residual down projection</h2>
+<h2 data-number="4.13" id="core-fused-residual-down-projection"><span class="header-section-number">4.13</span> 110-core fused-residual down projection</h2>
 <p>The second MLP matmul has the exact decode shape <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mn>12288</mn></mrow><annotation encoding="application/x-tex">1\times12288</annotation></semantics></math> by <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>12288</mn><mo>×</mo><mn>4096</mn></mrow><annotation encoding="application/x-tex">12288\times4096</annotation></semantics></math>. The generic program used 64 cores and achieved only 246.2 GB/s of effective BFP8 weight bandwidth, well below the SwiGLU kernel. <code>down_projection_110_core.patch</code> adds an exact-shape Blackhole program selected only for BF16 activation/output, BFLOAT8_B weights, a BF16 residual, DRAM-interleaved tensors, and an 11-by-10 worker grid.</p>
 <p>The program avoids a K split and cross-core reduction. It partitions the 128 output tile columns across 110 workers:</p>
 <ul>
@@ -473,7 +581,7 @@ x[W_{gate}\;W_{up}].
 </ul>
 <p>Wide and narrow workers need different partial-result circular buffers. An early version gave narrow workers a two-tile ring even though they produced one tile. Partial sums alternated slots and corrupted output. Separate one- and two-tile rings fixed the bug.</p>
 <p>The exact-shape specialization is enabled by default. <code>TT_METAL_DOWN_PROJECTION_110_CORES=0</code> selects the generic program in the same binary for A/B measurement.</p>
-<h2 data-number="3.14" id="runtime-trace-capture-for-short-prefill"><span class="header-section-number">3.14</span> Runtime trace capture for short prefill</h2>
+<h2 data-number="4.14" id="runtime-trace-capture-for-short-prefill"><span class="header-section-number">4.14</span> Runtime trace capture for short prefill</h2>
 <p>Decode replays a recorded TT-Metal command sequence while refreshing request-dependent buffers. Previously, the five-token prompt, padded to one 32-row tile, ran as separate host submissions.</p>
 <p>Setting <code>SGLANG_TT_TRACE_DECODE_ONLY=false</code> records the fixed-shape prefill sequence too. In a same-binary 32-sample A/B test:</p>
 <table>
@@ -507,7 +615,7 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>Tracing removes about 560 ms before the first token while pure decode changes by +0.36%. In the primary cumulative benchmark, it adds +10.23% end-to-end throughput for a 128-token response.</p>
-<h2 data-number="3.15" id="packaging-build-and-startup-changes"><span class="header-section-number">3.15</span> Packaging, build, and startup changes</h2>
+<h2 data-number="4.15" id="packaging-build-and-startup-changes"><span class="header-section-number">4.15</span> Packaging, build, and startup changes</h2>
 <p>Other patches make the single-library deployment buildable and keep startup cost manageable. They are not decode optimizations.</p>
 <table>
 <caption>Non-model patch groups in the current libtt build.</caption>
@@ -562,8 +670,8 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>These patches keep the integrated build loadable and remove unused subsystems.</p>
-<h1 data-number="4" id="experimental-method"><span class="header-section-number">4</span> Experimental method</h1>
-<h2 data-number="4.1" id="hardware-and-software"><span class="header-section-number">4.1</span> Hardware and software</h2>
+<h1 data-number="5" id="experimental-method"><span class="header-section-number">5</span> Experimental method</h1>
+<h2 data-number="5.1" id="hardware-and-software"><span class="header-section-number">5.1</span> Hardware and software</h2>
 <table>
 <thead>
 <tr class="header">
@@ -623,7 +731,7 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The P150 exposes 120 Tensix workers in this firmware configuration [8]. The SwiGLU program uses 96; the new down projection uses 110. Results are single-device and shape-specific.</p>
-<h2 data-number="4.2" id="serving-command"><span class="header-section-number">4.2</span> Serving command</h2>
+<h2 data-number="5.2" id="serving-command"><span class="header-section-number">5.2</span> Serving command</h2>
 <p>We launch the server with the command documented in the repository README:</p>
 <pre class="bash"><code>env -u TT_METAL_RUNTIME_ROOT \
   PYTHONPATH=/home/pcmoritz/sglang-jax/python \
@@ -645,7 +753,7 @@ x[W_{gate}\;W_{up}].
   --disable-precompile --skip-server-warmup \
   --disable-overlap-schedule --disable-radix-cache</code></pre>
 <p>Requests are serial despite the capacity of two. Radix caching and overlap scheduling are disabled so every request executes the same prompt prefill and does not overlap another request. Optional CPU/fused sampling paths remain at their disabled defaults; this report concerns the main model path.</p>
-<h2 data-number="4.3" id="request-and-sample-policy"><span class="header-section-number">4.3</span> Request and sample policy</h2>
+<h2 data-number="5.3" id="request-and-sample-policy"><span class="header-section-number">5.3</span> Request and sample policy</h2>
 <p>We send the same request 34 times in the primary sequence:</p>
 <pre class="json"><code>{
   &quot;text&quot;: &quot;The capital of France is&quot;,
@@ -655,15 +763,15 @@ x[W_{gate}\;W_{up}].
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>j</mi></msub><mo>=</mo><mfrac><mn>128</mn><msub><mi>L</mi><mi>j</mi></msub></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">T_j=\frac{128}{L_j},</annotation></semantics></math></p>
 <p>where <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>L</mi><mi>j</mi></msub><annotation encoding="application/x-tex">L_j</annotation></semantics></math> is SGLang’s server-reported end-to-end latency.</p>
 <p>For the current kernel experiment, we use the streaming completions endpoint and 32 retained requests per configuration. Pure decode throughput is 127 inter-token intervals divided by the elapsed time from first to last token. Streaming end-to-end throughput is 128 divided by loopback-client total time. The exact per-request observations are in <code>data/current-kernel-samples.csv</code>.</p>
-<h2 data-number="4.4" id="performance-quantities-and-statistics"><span class="header-section-number">4.4</span> Performance quantities and statistics</h2>
+<h2 data-number="5.4" id="performance-quantities-and-statistics"><span class="header-section-number">5.4</span> Performance quantities and statistics</h2>
 <p>For a kernel that appears once in each of the 36 decoder layers, the projected change in token latency is</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Δ</mi><mi>C</mi><mo>=</mo><mn>36</mn><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>t</mi><mrow><mi>o</mi><mi>l</mi><mi>d</mi></mrow></msub><mo>−</mo><msub><mi>t</mi><mrow><mi>n</mi><mi>e</mi><mi>w</mi></mrow></msub><mo stretchy="true" form="postfix">)</mo></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">
 \Delta C = 36\left(t_{old}-t_{new}\right).
 </annotation></semantics></math></p>
 <p>For the down projection, the measured per-layer difference predicts a 2.241-ms/token reduction; the streaming measurement gives 2.147 ms/token. We compute effective weight bandwidth as <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>B</mi><mrow><mi>e</mi><mi>f</mi><mi>f</mi></mrow></msub><mo>=</mo><msub><mi>S</mi><mi>W</mi></msub><mi>/</mi><msub><mi>t</mi><mi>k</mi></msub></mrow><annotation encoding="application/x-tex">B_{eff}=S_W/t_k</annotation></semantics></math>, where <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>S</mi><mi>W</mi></msub><annotation encoding="application/x-tex">S_W</annotation></semantics></math> is the packed BFP8 weight size and <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>t</mi><mi>k</mi></msub><annotation encoding="application/x-tex">t_k</annotation></semantics></math> is device kernel time. These quantities let us compare a kernel profile with the end-to-end result without treating the kernel speedup as the model speedup.</p>
 <p>Tables report the mean, sample standard deviation, and two-sided 95% Student-t interval. These describe variation within each recorded window but do not remove sequential drift, autocorrelation, or model and shape dependence.</p>
-<h1 data-number="5" id="results"><span class="header-section-number">5</span> Results</h1>
-<h2 data-number="5.1" id="established-concept-sequence"><span class="header-section-number">5.1</span> Established concept sequence</h2>
+<h1 data-number="6" id="results"><span class="header-section-number">6</span> Results</h1>
+<h2 data-number="6.1" id="established-concept-sequence"><span class="header-section-number">6.1</span> Established concept sequence</h2>
 <p>V0 is the functional baseline: it runs upstream SGLang-JAX but has few model-specific performance optimizations. V1 through V9 add compiler, runtime, and kernel changes below the JAX/PJRT boundary. Commit IDs are recorded in the CSV files.</p>
 <table>
 <caption>End-to-end 128-token generation, 32 retained requests per measurement stage.</caption>
@@ -775,7 +883,7 @@ x[W_{gate}\;W_{up}].
 <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTAwIiB2aWV3Qm94PSIwIDAgOTgwIDUwMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkMGQwZDA7c3Ryb2tlLXdpZHRoOjF9LnBvc3tmaWxsOiMzMzN9Lm5lZ3tmaWxsOiNhYWF9LmxhYmVse2ZvbnQtc2l6ZToxNHB4fS5zbWFsbHtmb250LXNpemU6MTJweDtmaWxsOiM0NDR9LnZhbHVle2ZvbnQtc2l6ZToxM3B4O2ZvbnQtd2VpZ2h0OjcwMH0udGl0bGV7Zm9udC1zaXplOjIxcHg7Zm9udC13ZWlnaHQ6NzAwfTwvc3R5bGU+Cjx0ZXh0IHg9IjkwIiB5PSIyOSIgY2xhc3M9InRpdGxlIj5JbmNyZW1lbnRhbCB0aHJvdWdocHV0IGNoYW5nZTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzg2LjkiIHgyPSI5NTUiIHkyPSIzODYuOSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM5MS45IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPi0yJTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzYwLjYiIHgyPSI5NTUiIHkyPSIzNjAuNiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM2NS42IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjAlPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIzMDguMCIgeDI9Ijk1NSIgeTI9IjMwOC4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMzEzLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+NCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjI1NS40IiB4Mj0iOTU1IiB5Mj0iMjU1LjQiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIyNjAuNCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj44JTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjAyLjgiIHgyPSI5NTUiIHkyPSIyMDIuOCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjIwNy44IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjEyJTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMTUwLjIiIHgyPSI5NTUiIHkyPSIxNTAuMiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjE1NS4yIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE2JTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iOTcuNiIgeDI9Ijk1NSIgeTI9Ijk3LjYiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxMDIuNiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjQ1LjAiIHgyPSI5NTUiIHkyPSI0NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iNTAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjM2MC42IiB4Mj0iOTU1IiB5Mj0iMzYwLjYiIGNsYXNzPSJheGlzIi8+CjxyZWN0IHg9IjEwNy4zIiB5PSI2My42IiB3aWR0aD0iNjEuNSIgaGVpZ2h0PSIyOTYuOSIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iMTM4LjEiIHk9IjU1LjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzIyLjU4JTwvdGV4dD4KPHRleHQgeD0iMTM4LjEiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMTwvdGV4dD4KPHRleHQgeD0iMTM4LjEiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5kZWNvZGUgZm91bmRhdGlvbjwvdGV4dD4KPHJlY3QgeD0iMjAzLjQiIHk9IjMxNy4yIiB3aWR0aD0iNjEuNSIgaGVpZ2h0PSI0My40IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSIyMzQuMiIgeT0iMzA5LjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzMuMzAlPC90ZXh0Pgo8dGV4dCB4PSIyMzQuMiIgeT0iNDI5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYyPC90ZXh0Pgo8dGV4dCB4PSIyMzQuMiIgeT0iNDQ4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPlNpTFUgZ3JhcGg8L3RleHQ+CjxyZWN0IHg9IjI5OS41IiB5PSIzNDUuNSIgd2lkdGg9IjYxLjUiIGhlaWdodD0iMTUuMSIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iMzMwLjMiIHk9IjMzNy41IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPisxLjE1JTwvdGV4dD4KPHRleHQgeD0iMzMwLjMiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMzwvdGV4dD4KPHRleHQgeD0iMzMwLjMiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5RS1YgZ3JhcGg8L3RleHQ+CjxyZWN0IHg9IjM5NS42IiB5PSIzNjAuNiIgd2lkdGg9IjYxLjUiIGhlaWdodD0iMjIuMyIgcng9IjMiIGNsYXNzPSJuZWciLz4KPHRleHQgeD0iNDI2LjQiIHk9IjQwMC44IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPi0xLjY5JTwvdGV4dD4KPHRleHQgeD0iNDI2LjQiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNDwvdGV4dD4KPHRleHQgeD0iNDI2LjQiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5zaGFyZWQgTEhTPC90ZXh0Pgo8cmVjdCB4PSI0OTEuNyIgeT0iMTgxLjYiIHdpZHRoPSI2MS41IiBoZWlnaHQ9IjE3OC45IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSI1MjIuNSIgeT0iMTczLjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzEzLjYxJTwvdGV4dD4KPHRleHQgeD0iNTIyLjUiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNTwvdGV4dD4KPHRleHQgeD0iNTIyLjUiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5STVNOb3JtIHNoYXJkPC90ZXh0Pgo8cmVjdCB4PSI1ODcuOSIgeT0iMzYwLjYiIHdpZHRoPSI2MS41IiBoZWlnaHQ9IjguNiIgcng9IjMiIGNsYXNzPSJuZWciLz4KPHRleHQgeD0iNjE4LjYiIHk9IjM4Ny4xIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPi0wLjY1JTwvdGV4dD4KPHRleHQgeD0iNjE4LjYiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNjwvdGV4dD4KPHRleHQgeD0iNjE4LjYiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5TaUxVIG11bHRpcGx5PC90ZXh0Pgo8cmVjdCB4PSI2ODQuMCIgeT0iMzI0LjciIHdpZHRoPSI2MS41IiBoZWlnaHQ9IjM1LjkiIHJ4PSIzIiBjbGFzcz0icG9zIi8+Cjx0ZXh0IHg9IjcxNC43IiB5PSIzMTYuNyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4rMi43MyU8L3RleHQ+Cjx0ZXh0IHg9IjcxNC43IiB5PSI0MjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+Vjc8L3RleHQ+Cjx0ZXh0IHg9IjcxNC43IiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+RHN0IFN3aUdMVTwvdGV4dD4KPHJlY3QgeD0iNzgwLjEiIHk9IjM2MC42IiB3aWR0aD0iNjEuNSIgaGVpZ2h0PSIyLjUiIHJ4PSIzIiBjbGFzcz0ibmVnIi8+Cjx0ZXh0IHg9IjgxMC44IiB5PSIzODEuMSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4tMC4xOSU8L3RleHQ+Cjx0ZXh0IHg9IjgxMC44IiB5PSI0MjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+Vjg8L3RleHQ+Cjx0ZXh0IHg9IjgxMC44IiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+b25lIHBhdGg8L3RleHQ+CjxyZWN0IHg9Ijg3Ni4yIiB5PSIyMjYuMCIgd2lkdGg9IjYxLjUiIGhlaWdodD0iMTM0LjUiIHJ4PSIzIiBjbGFzcz0icG9zIi8+Cjx0ZXh0IHg9IjkwNi45IiB5PSIyMTguMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4rMTAuMjMlPC90ZXh0Pgo8dGV4dCB4PSI5MDYuOSIgeT0iNDI5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlY5PC90ZXh0Pgo8dGV4dCB4PSI5MDYuOSIgeT0iNDQ4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPnByZWZpbGwgdHJhY2U8L3RleHQ+Cjx0ZXh0IHRyYW5zZm9ybT0idHJhbnNsYXRlKDIzIDIyMi41KSByb3RhdGUoLTkwKSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj50aHJvdWdocHV0IGNoYW5nZSB2cy4gcHJlY2VkaW5nIHN0YWdlPC90ZXh0Pgo8dGV4dCB4PSI5MCIgeT0iNDgyIiBjbGFzcz0ic21hbGwiPkJhcnMgc2hvdyB0aGUgbWVhc3VyZWQgdGhyb3VnaHB1dCBjaGFuZ2UgZnJvbSB0aGUgcHJlY2VkaW5nIHN0YWdlLjwvdGV4dD4KPC9zdmc+Cg==" id="fig:incremental" style="width:100.0%" alt /><figcaption>Incremental effect of each concept in the established sequence.</figcaption>
 </figure>
 <p>The negative and near-zero rows explain the final design: shared-LHS fusion materializes too much data, consumer-side SiLU leaves the producer boundary, and fallback removal changes coverage rather than the kernel.</p>
-<h2 data-number="5.2" id="current-kernel-ab-experiments"><span class="header-section-number">5.2</span> Current kernel A/B experiments</h2>
+<h2 data-number="6.2" id="current-kernel-ab-experiments"><span class="header-section-number">6.2</span> Current kernel A/B experiments</h2>
 <table>
 <caption>Current-branch streaming results, 32 retained samples per configuration. Width 4 is compared with width 2; the down projection is compared with the same width-4 binary/configuration with the specialization disabled.</caption>
 <colgroup>
@@ -819,7 +927,7 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The down projection cuts mean decode time from 38.179 to 36.032 ms/token, a 2.147 ms/token saving. Streaming end-to-end throughput rises by 5.88%, from 26.085 to 27.619 tokens/s. TTFT remains about 58 ms.</p>
-<h2 data-number="5.3" id="device-profile-of-the-down-projection"><span class="header-section-number">5.3</span> Device profile of the down projection</h2>
+<h2 data-number="6.3" id="device-profile-of-the-down-projection"><span class="header-section-number">6.3</span> Device profile of the down projection</h2>
 <p>The direct TT-Metal profile identifies 36 occurrences per token, matching the 36 Qwen3-8B decoder layers. Exactly those operation positions change from 64 to 110 workers.</p>
 <table>
 <thead>
@@ -858,8 +966,8 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The projected kernel saving is close to the observed 2.147 ms/token. The new program reaches about 92% of the previously measured 375.1 GB/s SwiGLU effective bandwidth. This agreement between operation profile and end-to-end measurement supports the causal attribution.</p>
-<h2 data-number="5.4" id="upstream-tt-inference-server-reference"><span class="header-section-number">5.4</span> Upstream tt-inference-server reference</h2>
-<p>Tenstorrent’s tt-inference-server is an OpenAI-compatible service built around vLLM and TT-Transformers [14]. It enters the stack above TTNN rather than through JAX, StableHLO, and TT-MLIR:</p>
+<h2 data-number="6.4" id="upstream-tt-inference-server-reference"><span class="header-section-number">6.4</span> Upstream tt-inference-server reference</h2>
+<p>Tenstorrent’s tt-inference-server is an OpenAI-compatible service built around vLLM and TT-Transformers [15]. It enters the stack above TTNN rather than through JAX, StableHLO, and TT-MLIR:</p>
 <pre class="text"><code>libtt:  SGLang-JAX → JAX/StableHLO → PJRT/TT-XLA/TT-MLIR → TTNN → TT-Metal
 TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-Metal</code></pre>
 <p>The two stacks use different porting strategies. TTIS uses TT-specific code in the inference engine, transformer implementation, TTNN, and TT-Metal. libtt keeps SGLang-JAX and the JAX model largely unchanged, then optimizes the compiler, runtime, and kernels below PJRT.</p>
@@ -898,7 +1006,7 @@ TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-M
 <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTEwIiB2aWV3Qm94PSIwIDAgOTgwIDUxMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkMGQwZDA7c3Ryb2tlLXdpZHRoOjF9LmxpYnR0e2ZpbGw6IzMzM30udXBzdHJlYW17ZmlsbDojYWFhfS5jaXtzdHJva2U6IzExMTtzdHJva2Utd2lkdGg6Mi41fS5sYWJlbHtmb250LXNpemU6MTRweH0uc21hbGx7Zm9udC1zaXplOjEycHg7ZmlsbDojNDQ0fS52YWx1ZXtmb250LXNpemU6MTVweDtmb250LXdlaWdodDo3MDB9LnRpdGxle2ZvbnQtc2l6ZToyMXB4O2ZvbnQtd2VpZ2h0OjcwMH0ubGVnZW5ke2ZvbnQtc2l6ZToxM3B4fTwvc3R5bGU+Cjx0ZXh0IHg9IjEwMCIgeT0iMjkiIGNsYXNzPSJ0aXRsZSI+U2FtZS1jbG9jayBRd2VuMy04QiBzdHJlYW1pbmcgY29tcGFyaXNvbjwvdGV4dD4KPHJlY3QgeD0iNjA4IiB5PSIxNiIgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiByeD0iMiIgY2xhc3M9ImxpYnR0Ii8+Cjx0ZXh0IHg9IjYzMSIgeT0iMjkiIGNsYXNzPSJsZWdlbmQiPmxpYnR0IDM3ZDU0NjA8L3RleHQ+CjxyZWN0IHg9Ijc2MCIgeT0iMTYiIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgcng9IjIiIGNsYXNzPSJ1cHN0cmVhbSIvPgo8dGV4dCB4PSI3ODMiIHk9IjI5IiBjbGFzcz0ibGVnZW5kIj5UVElTIHYwLjEwLjA8L3RleHQ+CjxsaW5lIHgxPSIxMDAiIHkxPSIzOTUuMCIgeDI9Ijk1MCIgeTI9IjM5NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI4OCIgeT0iNDAwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MDwvdGV4dD4KPGxpbmUgeDE9IjEwMCIgeTE9IjM0MC4wIiB4Mj0iOTUwIiB5Mj0iMzQwLjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSIzNDUuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj41PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMjg1LjAiIHgyPSI5NTAiIHkyPSIyODUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjI5MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjEwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMjMwLjAiIHgyPSI5NTAiIHkyPSIyMzAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjIzNS4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE1PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMTc1LjAiIHgyPSI5NTAiIHkyPSIxNzUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjE4MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjIwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMTIwLjAiIHgyPSI5NTAiIHkyPSIxMjAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjEyNS4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI1PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iNjUuMCIgeDI9Ijk1MCIgeTI9IjY1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSI3MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjMwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iNjUiIHgyPSIxMDAiIHkyPSIzOTUiIGNsYXNzPSJheGlzIi8+CjxsaW5lIHgxPSIxMDAiIHkxPSIzOTUiIHgyPSI5NTAiIHkyPSIzOTUiIGNsYXNzPSJheGlzIi8+CjxyZWN0IHg9IjE4OC41IiB5PSI4OS43IiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjMwNS4zIiByeD0iNCIgY2xhc3M9ImxpYnR0Ii8+CjxsaW5lIHgxPSIyNDQuNSIgeTE9Ijg4LjQiIHgyPSIyNDQuNSIgeTI9IjkxLjAiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMjM3LjUiIHkxPSI4OC40IiB4Mj0iMjUxLjUiIHkyPSI4OC40IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjIzNy41IiB5MT0iOTEuMCIgeDI9IjI1MS41IiB5Mj0iOTEuMCIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjI0NC41IiB5PSI3Ny43IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPjI3Ljc1MzwvdGV4dD4KPHJlY3QgeD0iMzI0LjUiIHk9IjEyMS4yIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjI3My44IiByeD0iNCIgY2xhc3M9InVwc3RyZWFtIi8+CjxsaW5lIHgxPSIzODAuNSIgeTE9IjExOS4xIiB4Mj0iMzgwLjUiIHkyPSIxMjMuMyIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzMuNSIgeTE9IjExOS4xIiB4Mj0iMzg3LjUiIHkyPSIxMTkuMSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzMuNSIgeTE9IjEyMy4zIiB4Mj0iMzg3LjUiIHkyPSIxMjMuMyIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjM4MC41IiB5PSIxMDkuMiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNC44ODc8L3RleHQ+Cjx0ZXh0IHg9IjMxMi41IiB5PSI0MjQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+UHVyZSBkZWNvZGU8L3RleHQ+CjxyZWN0IHg9IjYxMy41IiB5PSI5MS4yIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjMwMy44IiByeD0iNCIgY2xhc3M9ImxpYnR0Ii8+CjxsaW5lIHgxPSI2NjkuNSIgeTE9Ijg5LjkiIHgyPSI2NjkuNSIgeTI9IjkyLjUiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNjYyLjUiIHkxPSI4OS45IiB4Mj0iNjc2LjUiIHkyPSI4OS45IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjY2Mi41IiB5MT0iOTIuNSIgeDI9IjY3Ni41IiB5Mj0iOTIuNSIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjY2OS41IiB5PSI3OS4yIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPjI3LjYxOTwvdGV4dD4KPHJlY3QgeD0iNzQ5LjUiIHk9IjEyMi41IiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjI3Mi41IiByeD0iNCIgY2xhc3M9InVwc3RyZWFtIi8+CjxsaW5lIHgxPSI4MDUuNSIgeTE9IjEyMC40IiB4Mj0iODA1LjUiIHkyPSIxMjQuNSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3OTguNSIgeTE9IjEyMC40IiB4Mj0iODEyLjUiIHkyPSIxMjAuNCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3OTguNSIgeTE9IjEyNC41IiB4Mj0iODEyLjUiIHkyPSIxMjQuNSIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjgwNS41IiB5PSIxMTAuNSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNC43NzY8L3RleHQ+Cjx0ZXh0IHg9IjczNy41IiB5PSI0MjQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+U3RyZWFtaW5nIEUyRTwvdGV4dD4KPHRleHQgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoMjUgMjMwLjApIHJvdGF0ZSgtOTApIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPnRva2Vucy9zIChtZWFuIGFuZCA5NSUgdCBpbnRlcnZhbCk8L3RleHQ+Cjx0ZXh0IHg9IjEwMCIgeT0iNDYyIiBjbGFzcz0ic21hbGwiPjMyIHJldGFpbmVkIHNlcmlhbCByZXF1ZXN0cyBwZXIgaW1wbGVtZW50YXRpb247IHR3byB3YXJtLXVwczsgMTI4IGdlbmVyYXRlZCB0b2tlbnMvcmVxdWVzdC48L3RleHQ+Cjx0ZXh0IHg9IjEwMCIgeT0iNDgyIiBjbGFzcz0ic21hbGwiPkJvdGggdXNlIHRoZSBzYW1lIGxvb3BiYWNrIHN0cmVhbWluZyBjbG9jazogMTI3IGludGVyLXRva2VuIGludGVydmFscyBmb3IgZGVjb2RlIGFuZCByZXF1ZXN0LXRvLWxhc3QtdG9rZW4gZm9yIEUyRS48L3RleHQ+Cjwvc3ZnPgo=" id="fig:upstream" style="width:100.0%" alt /><figcaption>External serving-stack reference on the same model workload.</figcaption>
 </figure>
 <p>Under these conditions, libtt is 11.51% faster in pure decode and 11.48% faster end to end. Mean TTFT is 7.78% lower, and mean request-to-last-token latency falls from 5.169 to 4.635 seconds. This compares complete serving stacks, not individual kernels; their model implementations, frontends, and trace strategies differ. The result shows that lower-stack compiler and kernel optimization can match and exceed a stack that also modifies the transformer and inference-engine layers. The tested TTIS artifact is the official v0.10.0 runtime image.</p>
-<h2 data-number="5.5" id="correctness-and-numeric-behavior"><span class="header-section-number">5.5</span> Correctness and numeric behavior</h2>
+<h2 data-number="6.5" id="correctness-and-numeric-behavior"><span class="header-section-number">6.5</span> Correctness and numeric behavior</h2>
 <p>All 32 requests in each configuration are deterministic. Algebra and reduction changes can alter the token hash. The current kernel hashes are:</p>
 <table>
 <thead>
@@ -923,8 +1031,8 @@ TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-M
 </tbody>
 </table>
 <p>Determinism and coherent text do not establish model quality. BF8 arithmetic, reassociation, and reduction order can change logits and greedy choices. Perplexity and task-level evaluation are still required.</p>
-<h1 data-number="6" id="discussion"><span class="header-section-number">6</span> Discussion</h1>
-<h2 data-number="6.1" id="placement-of-transformations"><span class="header-section-number">6.1</span> Placement of transformations</h2>
+<h1 data-number="7" id="discussion"><span class="header-section-number">7</span> Discussion</h1>
+<h2 data-number="7.1" id="placement-of-transformations"><span class="header-section-number">7.1</span> Placement of transformations</h2>
 <p>We place each transformation at the highest level that retains the information it needs:</p>
 <ul>
 <li>use TTIR when the problem is algebraic recognition or graph structure;</li>
@@ -934,7 +1042,7 @@ TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-M
 <li>use device kernels for Dst lifetime, pack/unpack traffic, tile arithmetic, and synchronization.</li>
 </ul>
 <p>Lower levels lose graph semantics; higher levels cannot control device data movement.</p>
-<h2 data-number="6.2" id="fusion-boundaries-and-intermediate-storage"><span class="header-section-number">6.2</span> Fusion boundaries and intermediate storage</h2>
+<h2 data-number="7.2" id="fusion-boundaries-and-intermediate-storage"><span class="header-section-number">7.2</span> Fusion boundaries and intermediate storage</h2>
 <p>The MLP experiments remove different boundaries:</p>
 <pre class="text"><code>shared-LHS matmul:
   removes duplicate activation work, retains doubled output       → -1.69%
@@ -945,11 +1053,11 @@ SiLU on BinaryNg input:
 matmul-SwiGLU epilogue:
   keeps gate/up in Dst and writes only the final half-width result → +2.73%</code></pre>
 <p>Fusion should name the Dst, L1, DRAM, or launch boundary it removes.</p>
-<h2 data-number="6.3" id="down-projection-geometry"><span class="header-section-number">6.3</span> Down-projection geometry</h2>
+<h2 data-number="7.3" id="down-projection-geometry"><span class="header-section-number">7.3</span> Down-projection geometry</h2>
 <p>Profiling identified weight bandwidth as the down-projection limit. Uneven N partitioning uses 110 workers without rereading weights or reducing partials across cores. It reaches 345.2 GB/s with less complexity than a 2D K/N split.</p>
-<h2 data-number="6.4" id="unsuccessful-transformations"><span class="header-section-number">6.4</span> Unsuccessful transformations</h2>
+<h2 data-number="7.4" id="unsuccessful-transformations"><span class="header-section-number">7.4</span> Unsuccessful transformations</h2>
 <p>Wider SwiGLU blocks reduce partial packs but add CB pressure or reduce overlap. The four-tile result changes throughput by only +0.27%, so two remains the default and the larger values remain experimental. Shared-LHS and consumer-side fusion are kept in the record for the same reason: their measured costs explain the final producer-side design.</p>
-<h1 data-number="7" id="limitations-and-future-work"><span class="header-section-number">7</span> Limitations and future work</h1>
+<h1 data-number="8" id="limitations-and-future-work"><span class="header-section-number">8</span> Limitations and future work</h1>
 <ol type="1">
 <li><strong>One model and decode regime.</strong> Results apply to Qwen3-8B, a five-token prompt padded to one tile, serial 128-token generation, and a single P150. Other batches, contexts, and scheduling policies may have different limits.</li>
 <li><strong>Cumulative attribution is ordered.</strong> The established stages are real cumulative builds, not a factorial experiment. Patch effects can interact.</li>
@@ -963,7 +1071,7 @@ matmul-SwiGLU epilogue:
 <li><strong>Training is not measured.</strong> The PJRT/StableHLO boundary can carry training graphs, but operation coverage, collectives, optimizer execution, and numerical quality still need implementation and validation.</li>
 </ol>
 <p>The next MLP experiment is to keep the SwiGLU output on chip for the down projection. That requires a shared producer/consumer sharding contract.</p>
-<h1 data-number="8" id="conclusions"><span class="header-section-number">8</span> Conclusions</h1>
+<h1 data-number="9" id="conclusions"><span class="header-section-number">9</span> Conclusions</h1>
 <p>With <code>libtt.so</code>, we keep the SGLang-JAX and JAX/TPU-facing layers close to upstream while packaging the PJRT backend, compiler, runtime, kernels, and runtime assets in one artifact. One Bazel graph makes the lower stack available for cross-layer optimization.</p>
 <p>We started with a functional backend that runs upstream SGLang-JAX at 16.265 tokens/s. Compiler, runtime, and kernel changes improve end-to-end throughput by 60.61%, and the 110-core down projection reaches 27.753 decode tokens/s. Under the matched benchmark conditions, libtt is 11.51% faster than the TTIS decode mean even though TTIS also uses TT-specific transformer and inference-engine layers.</p>
 <p>We measured inference. The same PJRT/StableHLO architecture can be extended to training without replacing the JAX frontend, once the required operations, collectives, optimizer graphs, and validation are added.</p>
@@ -979,9 +1087,10 @@ matmul-SwiGLU epilogue:
 <li>SGLang Project, “SGLang-JAX.” <a href="https://github.com/sgl-project/sglang-jax" class="uri">https://github.com/sgl-project/sglang-jax</a></li>
 <li>N. Shazeer, “GLU Variants Improve Transformer,” arXiv:2002.05202, 2020. <a href="https://arxiv.org/abs/2002.05202" class="uri">https://arxiv.org/abs/2002.05202</a></li>
 <li>Z. Tan, B. Kang, and A. Narasimham, “A Developer’s Guide to Debugging JAX on Cloud TPUs,” Google Developers Blog, 2026. <a href="https://developers.googleblog.com/a-developers-guide-to-debugging-jax-on-cloud-tpus-essential-tools-and-techniques/" class="uri">https://developers.googleblog.com/a-developers-guide-to-debugging-jax-on-cloud-tpus-essential-tools-and-techniques/</a></li>
-<li>Tenstorrent, “Blackhole PCIe Card Documentation” and firmware release notes. <a href="https://docs.tenstorrent.com/tt-system-firmware/boards/tenstorrent/tt_blackhole/doc/index.html" class="uri">https://docs.tenstorrent.com/tt-system-firmware/boards/tenstorrent/tt_blackhole/doc/index.html</a></li>
+<li>Tenstorrent, “Blackhole PCIe Cards.” <a href="https://docs.tenstorrent.com/aibs/blackhole/index.html" class="uri">https://docs.tenstorrent.com/aibs/blackhole/index.html</a></li>
 <li>Tenstorrent, “Circular Buffer APIs.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/circular_buffers/circular_buffers.html</a></li>
 <li>Tenstorrent, “Compute Engines and Data Flow within Tensix.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.html</a></li>
+<li>Tenstorrent, “Integrating TT Models into vLLM.” <a href="https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/LLMs/vLLM_integration.md" class="uri">https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/LLMs/vLLM_integration.md</a></li>
 <li>Tenstorrent, “SFPI.” <a href="https://github.com/tenstorrent/sfpi" class="uri">https://github.com/tenstorrent/sfpi</a></li>
 <li>Tenstorrent, “Tiles.” <a href="https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/tiles.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/advanced_topics/tiles.html</a></li>
 <li>Tenstorrent, “TT-Forge: Open-Source AI Compiler Stack.” <a href="https://github.com/tenstorrent/tt-forge" class="uri">https://github.com/tenstorrent/tt-forge</a></li>
@@ -993,6 +1102,7 @@ matmul-SwiGLU epilogue:
 <li>Tenstorrent, “TT-MLIR Tensor Layout.” <a href="https://docs.tenstorrent.com/tt-mlir/specs/tensor-layout.html" class="uri">https://docs.tenstorrent.com/tt-mlir/specs/tensor-layout.html</a></li>
 <li>Tenstorrent, “TT-NN Documentation.” <a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/" class="uri">https://docs.tenstorrent.com/tt-metal/latest/ttnn/</a></li>
 <li>Tenstorrent, “TTNN Tensor: Layout, Sharding, and BFLOAT8_B.” <a href="https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html" class="uri">https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html</a></li>
+<li>Tenstorrent, “TT-Transformers Model Implementation and vLLM Generator.” <a href="https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers" class="uri">https://github.com/tenstorrent/tt-metal/tree/main/models/tt_transformers</a></li>
 <li>Tenstorrent, “TT-UMD: User-Mode Driver for Tenstorrent Hardware.” <a href="https://github.com/tenstorrent/tt-umd" class="uri">https://github.com/tenstorrent/tt-umd</a></li>
 <li>Tenstorrent, “TT-XLA.” <a href="https://github.com/tenstorrent/tt-xla" class="uri">https://github.com/tenstorrent/tt-xla</a></li>
 <li>A. Yang et al., “Qwen3 Technical Report,” arXiv:2505.09388, 2025. <a href="https://arxiv.org/abs/2505.09388" class="uri">https://arxiv.org/abs/2505.09388</a></li>
