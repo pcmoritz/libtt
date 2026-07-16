@@ -47,24 +47,26 @@ keywords:
 
 # Abstract {-}
 
-libtt packages the Tenstorrent JAX stack as one PJRT shared library. It builds
-and pins TT-XLA [1], TT-MLIR [2], TTNN [3], TT-Metalium [4], device kernels,
-and runtime assets in `libtt.so`. The target needs compatible drivers and
-firmware, but no separate compiler or TT-Metal installation.
+libtt packages the Tenstorrent JAX stack as one PJRT shared library. Its goal is
+to run SGLang-JAX [21] and the broader JAX/TPU software ecosystem with few or
+no changes above the compiler boundary. It builds and pins TT-XLA [1], TT-MLIR
+[2], TTNN [3], TT-Metalium [4], device kernels, and runtime assets in
+`libtt.so`. The target needs compatible drivers and firmware, but no separate
+compiler or TT-Metal installation.
 
-This report maps libtt's optimizations to StableHLO, TTIR, TTNN, D2M,
-TTKernel, TTMetal, the runtime, and device kernels. It is organized by patch
-concept because one optimization often crosses several levels. For example,
-the SwiGLU epilogue starts as graph recognition and ends as a Dst-resident
-Tensix kernel.
+This approach has two advantages. libtt can stay close to upstream SGLang-JAX
+instead of reimplementing the model or inference engine, and it can recover
+performance below that boundary through StableHLO/MLIR transformations,
+runtime policy, and device kernels. The same boundary can support training in
+the future, although this report measures inference only. The report maps the
+changes to the TT-MLIR IR levels, runtime, and kernels where they are made.
 
-On Qwen3-8B decode on a Blackhole P150, the established optimization line
-raises end-to-end throughput from 16.265 to 26.123 tokens/s (+60.61%). A
-110-core down projection adds 5.96% pure decode throughput, reaches 27.753
-tokens/s, and cuts kernel time from 217.188 to 154.932 microseconds per layer.
-Against a matched 32-sample tt-inference-server v0.10.0 run [25], current
-libtt is 11.51% faster in pure decode and 11.48% faster end to end. Increasing
-the SwiGLU K block from two to four tiles changes throughput by only +0.27%.
+The report follows that development sequence. A functional baseline first runs
+upstream SGLang-JAX at 16.265 tokens/s. Compiler, runtime, and kernel patches
+raise end-to-end throughput to 26.123 tokens/s (+60.61%). A 110-core down
+projection then reaches 27.753 decode tokens/s. Against a matched 32-sample
+tt-inference-server v0.10.0 run [25], current libtt is 11.51% faster in pure
+decode and 11.48% faster end to end.
 
 # Executive summary {-}
 
@@ -78,6 +80,17 @@ One Bazel build pins the source revisions, applies the patch series, and builds
 the shared library. Its tools and dependencies are explicit inputs, following
 Bazel's definition of a hermetic build [8]. A compiler rewrite, runtime change,
 and device kernel can therefore be built and benchmarked together.
+
+The upper stack remains close to upstream SGLang-JAX and its JAX/TPU-oriented
+interfaces. This avoids a separate Tenstorrent model implementation and major
+changes to the scheduler or inference engine. Performance work instead happens
+in TT-MLIR, TTNN, TT-Metal, and the compiled graph.
+
+The measurements follow the implementation sequence. V0 is a functional,
+relatively unoptimized backend that runs upstream SGLang-JAX. V1 through V9 add
+compiler, runtime, and kernel optimizations while keeping the upper stack
+largely unchanged. The final comparison uses the optimized backend against the
+TTIS reference stack.
 
 The measured work supports six conclusions:
 
@@ -99,8 +112,9 @@ The measured work supports six conclusions:
    128-token benchmark by 10.23%. Pure decode changes by +0.36%.
 
 The current build reaches 27.753 decode tokens/s and 27.619 streaming
-end-to-end tokens/s. The matched TTIS reference reaches 24.887 and 24.776
-tokens/s, respectively.
+end-to-end tokens/s. The matched TTIS reference, which uses TT-specific
+transformer and inference-engine layers, reaches 24.887 and 24.776 tokens/s,
+respectively.
 
 ![libtt's serving, compilation, runtime, and device layers.](figures/stack.svg){#fig:stack width=100%}
 
@@ -129,6 +143,25 @@ The compiler and TT-Metal runtime do not need to be installed on the target.
 With compatible drivers and firmware, `libtt.so` contains the software needed
 to compile and run JAX programs. This is the intended similarity to
 `libtpu.so` [7].
+
+## Upstream-compatible frontend
+
+libtt treats PJRT and StableHLO as the integration boundary. SGLang-JAX keeps
+its model, tokenizer, scheduler, paged KV cache, and inference engine. The
+Tenstorrent-specific work stays below that boundary instead of requiring a
+forked Qwen implementation or a rewritten serving layer.
+
+This provides two advantages:
+
+- upstream SGLang-JAX and JAX/TPU code can be reused with small configuration
+  changes; and
+- performance can be added in TT-MLIR, TTNN, TT-Metal, and device kernels,
+  where layout, fusion, precision, and data movement are visible.
+
+The report evaluates inference, but PJRT and StableHLO are not
+inference-specific. Training support can use the same architecture by adding
+the required operations, collective behavior, optimizer graphs, and numerical
+validation below the existing JAX frontend.
 
 ## One build graph
 
@@ -172,10 +205,10 @@ levels and two upstream repositories.
 
 ## The framework boundary: JAX, StableHLO, and PJRT
 
-SGLang-JAX owns serving, tokenization, scheduling, the JAX Qwen model, and the
-paged KV cache [21]. JAX traces each shape-specific computation to StableHLO,
-a portable operation set between frameworks and compilers [10]. PJRT hides the
-device-specific compiler and runtime from JAX [9].
+Upstream SGLang-JAX owns serving, tokenization, scheduling, the JAX Qwen model,
+and the paged KV cache [21]. JAX traces each shape-specific computation to
+StableHLO, a portable operation set between frameworks and compilers [10]. PJRT
+hides the device-specific compiler and runtime from JAX [9].
 
 The steady-state request path is:
 
@@ -694,8 +727,10 @@ remove sequential drift, autocorrelation, or model and shape dependence.
 
 ## Established concept sequence
 
-The chronological sequence provides the incremental measurements. Commit IDs
-are recorded in the CSV files.
+V0 is the functional baseline: it runs upstream SGLang-JAX but has few
+model-specific performance optimizations. V1 through V9 add compiler, runtime,
+and kernel changes below the JAX/PJRT boundary. Commit IDs are recorded in the
+CSV files.
 
 \begingroup\small
 
@@ -767,6 +802,11 @@ libtt:  SGLang-JAX → JAX/StableHLO → PJRT/TT-XLA/TT-MLIR → TTNN → TT-Met
 TTIS:   OpenAI API → vLLM → TT-Transformers                → TTNN → TT-Metal
 ```
 
+The two stacks use different porting strategies. TTIS uses TT-specific code in
+the inference engine, transformer implementation, TTNN, and TT-Metal. libtt
+keeps SGLang-JAX and the JAX model largely unchanged, then optimizes the
+compiler, runtime, and kernels below PJRT.
+
 Both runs use the same P150, Qwen3-8B model, prompt, 128-token output, serial
 request policy, disabled prefix cache, and persistent loopback collector. Pure
 decode uses the 127 intervals from first to last token. End-to-end throughput
@@ -784,7 +824,9 @@ Current libtt is 11.51% faster in pure decode and 11.48% faster end to end.
 Mean TTFT is 7.78% lower, and mean request-to-last-token latency falls from
 5.169 to 4.635 seconds. This compares complete serving stacks, not individual
 kernels; their model implementations, frontends, and trace strategies differ.
-The tested TTIS artifact is the official v0.10.0 runtime image.
+The result shows that lower-stack compiler and kernel optimization can match
+and exceed a stack that also modifies the transformer and inference-engine
+layers. The tested TTIS artifact is the official v0.10.0 runtime image.
 
 ## Correctness and numeric behavior
 
@@ -876,62 +918,29 @@ the final producer-side design.
    model metadata was added locally because that release listed Qwen3-8B on
    P300. The runtime image was unchanged. Both rows use the same collector but
    different serving and model stacks.
+10. **Training is not measured.** The PJRT/StableHLO boundary can carry training
+    graphs, but operation coverage, collectives, optimizer execution, and
+    numerical quality still need implementation and validation.
 
 The next MLP experiment is to keep the SwiGLU output on chip for the down
 projection. That requires a shared producer/consumer sharding contract.
 
-# Reproduction and report generation
-
-The report directory contains:
-
-- `report.md`: canonical source;
-- `data/samples.csv` and `data/summary.csv`: established 32-sample sequence;
-- `data/current-kernel-samples.csv` and
-  `data/current-kernel-summary.csv`: the blocking/down-projection A/B data;
-- `data/current-kernel-manifest.json`: exact current experiment provenance;
-- `data/down-projection-profile-summary.csv`: per-operation profile summary;
-- `data/latest-main-streaming-*`: direct prefill trace A/B data;
-- `data/upstream-tt-inference-*`: streaming TTIS observations, same-clock
-  comparison statistics, and manifest;
-- `analyze.py`: statistics and SVG generation;
-- `benchmark_upstream.py`: upstream reference collector;
-- `figures/*.svg`: vector figures; and
-- `Makefile` and `style.css`: HTML, LaTeX, and PDF generation.
-
-To regenerate statistics when the raw `/tmp` benchmark directories are
-available:
-
-```bash
-/home/pcmoritz/sglang-jax/.venv/bin/python \
-  docs/libtt-optimization-report/analyze.py
-```
-
-To build a self-contained HTML report:
-
-```bash
-make -C docs/libtt-optimization-report html
-```
-
-To produce the typeset PDF with vector figures:
-
-```bash
-make -C docs/libtt-optimization-report pdf
-```
-
-The PDF build uses Pandoc, XeLaTeX, `booktabs`, `microtype`, and vector SVG
-conversion. Generated HTML, LaTeX, and PDF files are versioned with the source.
-
 # Conclusion
 
-`libtt.so` contains the PJRT backend, compiler, runtime, kernels, and runtime
-assets. One Bazel graph pins and builds the stack, and its patch surface reaches
-from TTIR graph rewrites to Tensix kernels.
+`libtt.so` keeps the SGLang-JAX and JAX/TPU-facing layers close to upstream
+while packaging the PJRT backend, compiler, runtime, kernels, and runtime assets
+in one artifact. One Bazel graph makes the lower stack available for
+cross-layer optimization.
 
-The established changes improve Qwen3-8B end-to-end throughput by 60.61%.
-The 110-core down projection adds 5.96% pure decode throughput, raises weight
-bandwidth by 40.2%, and puts current libtt 11.51% above the matched TTIS decode
-mean. These gains come from changes at several levels: semantic recovery,
-layout policy, runtime dispatch, core geometry, and device dataflow.
+The sequence starts with a functional backend that runs upstream SGLang-JAX at
+16.265 tokens/s. Compiler, runtime, and kernel changes improve end-to-end
+throughput by 60.61%, and the 110-core down projection reaches 27.753 decode
+tokens/s. Current libtt is 11.51% faster than the matched TTIS decode mean even
+though TTIS also uses TT-specific transformer and inference-engine layers.
+
+This report measures inference. The same PJRT/StableHLO architecture can be
+extended to training without replacing the JAX frontend, once the required
+operations, collectives, optimizer graphs, and validation are added.
 
 # Bibliography {-}
 
