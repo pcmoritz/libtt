@@ -202,7 +202,7 @@ pre { white-space: pre-wrap; }
 <li>model registration and configuration in the TT vLLM backend; and</li>
 <li>for new model types or inputs, possible changes to the platform, loader, worker, model runner, or engine [15].</li>
 </ol>
-<p>The v0.10.0 artifact measured in this report pinned TT-Metal commit <code>e867533</code> and Tenstorrent vLLM commit <code>22be241</code>. In that release, the TT platform code was carried in the Tenstorrent vLLM path. Current upstream code is increasingly packaged as a plugin, but the model-facing interface and TT-specific execution logic described above remain. We distinguish this packaging change from the v0.10.0 performance measurement [20].</p>
+<p>The v0.10.0 artifact measured in this report used TT-Metal source snapshot <code>e867533</code> and Tenstorrent vLLM source snapshot <code>22be241</code>. In that release, the TT platform code was carried in the Tenstorrent vLLM path. Current upstream code is increasingly packaged as a plugin, but the model-facing interface and TT-specific execution logic described above remain. We distinguish this packaging change from the v0.10.0 performance measurement [20].</p>
 <figure>
 <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDgwIiBoZWlnaHQ9IjY4MCIgdmlld0JveD0iMCAwIDEwODAgNjgwIj4KICA8ZGVmcz4KICAgIDxtYXJrZXIgaWQ9ImFycm93IiBtYXJrZXJXaWR0aD0iOCIgbWFya2VySGVpZ2h0PSI4IiByZWZYPSI3IiByZWZZPSI0IiBvcmllbnQ9ImF1dG8iPgogICAgICA8cGF0aCBkPSJNMCwwIEw4LDQgTDAsOCBaIiBmaWxsPSIjNDQ0NDQ0Ii8+CiAgICA8L21hcmtlcj4KICA8L2RlZnM+CiAgPHN0eWxlPgogICAgdGV4dHtmb250LWZhbWlseTpIZWx2ZXRpY2EsQXJpYWwsc2Fucy1zZXJpZjtmaWxsOiMxMTExMTF9CiAgICAudGl0bGV7Zm9udC1zaXplOjIycHg7Zm9udC13ZWlnaHQ6NzAwfQogICAgLm5hbWV7Zm9udC1zaXplOjE2cHg7Zm9udC13ZWlnaHQ6NzAwfQogICAgLmJvZHl7Zm9udC1zaXplOjEyLjVweDtmaWxsOiMzMzMzMzN9CiAgICAuc21hbGx7Zm9udC1zaXplOjExLjVweDtmaWxsOiM0NDQ0NDR9CiAgICAuYmFuZHtmb250LXNpemU6MTJweDtmb250LXdlaWdodDo3MDA7bGV0dGVyLXNwYWNpbmc6LjhweDtmaWxsOiMyMjIyMjJ9CiAgICAuYm94e2ZpbGw6I2Y3ZjdmNztzdHJva2U6IzY2NjY2NjtzdHJva2Utd2lkdGg6MS4zfQogICAgLm1vZGVse2ZpbGw6I2U3ZTdlNztzdHJva2U6IzMzMzMzMztzdHJva2Utd2lkdGg6MS44fQogICAgLmRldmljZXtmaWxsOiNkZGRkZGQ7c3Ryb2tlOiM1NTU1NTU7c3Ryb2tlLXdpZHRoOjEuNH0KICAgIC5hcnJvd3tzdHJva2U6IzQ0NDQ0NDtzdHJva2Utd2lkdGg6MjttYXJrZXItZW5kOnVybCgjYXJyb3cpfQogIDwvc3R5bGU+CgogIDxyZWN0IHdpZHRoPSIxMDgwIiBoZWlnaHQ9IjY4MCIgZmlsbD0iI2ZmZmZmZiIvPgogIDx0ZXh0IHg9IjQwIiB5PSIzMiIgY2xhc3M9InRpdGxlIj5SZWZlcmVuY2UgVFRJUyBwYXRoIGFuZCBpdHMgZXhwbGljaXQgaW50ZWdyYXRpb24gbGF5ZXJzPC90ZXh0PgoKICA8dGV4dCB4PSI0MCIgeT0iNjUiIGNsYXNzPSJiYW5kIj5TRVJWSU5HIEFORCBFTkdJTkU8L3RleHQ+CiAgPHJlY3QgeD0iNDAiIHk9Ijc4IiB3aWR0aD0iMTAwMCIgaGVpZ2h0PSI2NCIgcng9IjgiIGNsYXNzPSJib3giLz4KICA8dGV4dCB4PSI1NDAiIHk9IjEwNCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPnR0LWluZmVyZW5jZS1zZXJ2ZXIgwrcgT3BlbkFJIHNlcnZpY2UgwrcgbW9kZWwgYW5kIGltYWdlIHNlbGVjdGlvbjwvdGV4dD4KICA8dGV4dCB4PSI1NDAiIHk9IjEyNiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnBpbnMgdGhlIHNlcnZpbmcgYXJ0aWZhY3QsIFRULU1ldGFsIHJldmlzaW9uLCBhbmQgVGVuc3RvcnJlbnQgdkxMTSBpbXBsZW1lbnRhdGlvbjwvdGV4dD4KCiAgPGxpbmUgeDE9IjU0MCIgeTE9IjE0MiIgeDI9IjU0MCIgeTI9IjE2NiIgY2xhc3M9ImFycm93Ii8+CiAgPHJlY3QgeD0iNDAiIHk9IjE3NCIgd2lkdGg9IjEwMDAiIGhlaWdodD0iODIiIHJ4PSI4IiBjbGFzcz0iYm94Ii8+CiAgPHRleHQgeD0iNTQwIiB5PSIyMDEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj52TExNICsgVGVuc3RvcnJlbnQgcGxhdGZvcm0gYmFja2VuZCAvIHBsdWdpbjwvdGV4dD4KICA8dGV4dCB4PSI1NDAiIHk9IjIyNCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImJvZHkiPnNjaGVkdWxlciDCtyBwbGF0Zm9ybSBjb25maWd1cmF0aW9uIMK3IG1vZGVsIHJlZ2lzdHJ5IMK3IGxvYWRlciDCtyB3b3JrZXIgwrcgbW9kZWwgcnVubmVyIMK3IGVuZ2luZTwvdGV4dD4KICA8dGV4dCB4PSI1NDAiIHk9IjI0NCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5wcmVwYXJlcyBmaXhlZC1zaGFwZSBpbnB1dHMsIG93bnMgS1YtY2FjaGUgaW50ZWdyYXRpb24sIGFuZCBjYWxscyB0aGUgVFQgbW9kZWwgaW50ZXJmYWNlPC90ZXh0PgoKICA8dGV4dCB4PSI0MCIgeT0iMjg3IiBjbGFzcz0iYmFuZCI+TU9ERUwtU1BFQ0lGSUMgUE9SVDwvdGV4dD4KICA8bGluZSB4MT0iNTQwIiB5MT0iMjU2IiB4Mj0iNTQwIiB5Mj0iMjk2IiBjbGFzcz0iYXJyb3ciLz4KICA8cmVjdCB4PSI0MCIgeT0iMzA0IiB3aWR0aD0iMTAwMCIgaGVpZ2h0PSIxNjQiIHJ4PSIxMCIgY2xhc3M9Im1vZGVsIi8+CiAgPHRleHQgeD0iNTQwIiB5PSIzMzEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVC1UcmFuc2Zvcm1lcnMgbW9kZWwgYW5kIHZMTE0gZ2VuZXJhdG9yPC90ZXh0PgogIDx0ZXh0IHg9IjU0MCIgeT0iMzUzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0iYm9keSI+YXR0ZW50aW9uIGFuZCBNTFAgc3RydWN0dXJlIMK3IHBhZ2VkIEtWIGNhY2hlIMK3IHByZWZpbGwvZGVjb2RlIG1vZGVzIMK3IGxheW91dHMgwrcgc2hhcmRpbmcgwrcgdHJhY2Ugc2hhcGVzPC90ZXh0PgoKICA8cmVjdCB4PSI3MiIgeT0iMzc1IiB3aWR0aD0iNDEwIiBoZWlnaHQ9IjcwIiByeD0iNyIgY2xhc3M9ImJveCIvPgogIDx0ZXh0IHg9IjI3NyIgeT0iNDAxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+UHlUb3JjaCBob3N0IHRlbnNvcnMgYW5kIHV0aWxpdGllczwvdGV4dD4KICA8dGV4dCB4PSIyNzciIHk9IjQyNCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj53ZWlnaHRzIMK3IHRva2VucyDCtyBwYWRkaW5nIMK3IHBvc2l0aW9ucyDCtyBob3N0IG91dHB1dDwvdGV4dD4KCiAgPHJlY3QgeD0iNTk4IiB5PSIzNzUiIHdpZHRoPSI0MTAiIGhlaWdodD0iNzAiIHJ4PSI3IiBjbGFzcz0iYm94Ii8+CiAgPHRleHQgeD0iODAzIiB5PSI0MDEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVE5OIHRlbnNvcnMgYW5kIGRldmljZSBvcGVyYXRpb25zPC90ZXh0PgogIDx0ZXh0IHg9IjgwMyIgeT0iNDI0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPm1hdG11bCDCtyBub3JtYWxpemF0aW9uIMK3IHBhZ2VkIGF0dGVudGlvbiDCtyBjb2xsZWN0aXZlcyDCtyB0cmFjZTwvdGV4dD4KCiAgPGxpbmUgeDE9IjQ4MiIgeTE9IjQwMiIgeDI9IjU5MCIgeTI9IjQwMiIgY2xhc3M9ImFycm93Ii8+CiAgPHRleHQgeD0iNTM2IiB5PSIzOTMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+ZnJvbV90b3JjaDwvdGV4dD4KICA8bGluZSB4MT0iNTk4IiB5MT0iNDI4IiB4Mj0iNDkwIiB5Mj0iNDI4IiBjbGFzcz0iYXJyb3ciLz4KICA8dGV4dCB4PSI1NDQiIHk9IjQ0NSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj50b190b3JjaDwvdGV4dD4KCiAgPHRleHQgeD0iNDAiIHk9IjUwMCIgY2xhc3M9ImJhbmQiPlJVTlRJTUUsIEtFUk5FTFMsIEFORCBIQVJEV0FSRTwvdGV4dD4KICA8cGF0aCBkPSJNNTQwIDQ2OCBMNTQwIDQ4MiBMMzIwIDQ4MiBMMzIwIDUwOCIgZmlsbD0ibm9uZSIgY2xhc3M9ImFycm93Ii8+CiAgPHJlY3QgeD0iNDAiIHk9IjUxNiIgd2lkdGg9IjMxMCIgaGVpZ2h0PSI2NiIgcng9IjgiIGNsYXNzPSJib3giLz4KICA8dGV4dCB4PSIxOTUiIHk9IjU0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlRUTk4gb3BlcmF0b3IgbGlicmFyeTwvdGV4dD4KICA8dGV4dCB4PSIxOTUiIHk9IjU2NSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj50ZW5zb3IgQVBJIMK3IG9wIHNlbGVjdGlvbiDCtyBwcm9ncmFtIGZhY3RvcmllczwvdGV4dD4KCiAgPGxpbmUgeDE9IjM1MCIgeTE9IjU0OSIgeDI9IjM4MCIgeTI9IjU0OSIgY2xhc3M9ImFycm93Ii8+CiAgPHJlY3QgeD0iMzg4IiB5PSI1MTYiIHdpZHRoPSIzMTAiIGhlaWdodD0iNjYiIHJ4PSI4IiBjbGFzcz0iYm94Ii8+CiAgPHRleHQgeD0iNTQzIiB5PSI1NDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJuYW1lIj5UVC1NZXRhbGl1bTwvdGV4dD4KICA8dGV4dCB4PSI1NDMiIHk9IjU2NSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5ydW50aW1lIMK3IGNvbW1hbmQgcXVldWVzIMK3IHJlYWRlci9jb21wdXRlL3dyaXRlciBrZXJuZWxzPC90ZXh0PgoKICA8bGluZSB4MT0iNjk4IiB5MT0iNTQ5IiB4Mj0iNzI4IiB5Mj0iNTQ5IiBjbGFzcz0iYXJyb3ciLz4KICA8cmVjdCB4PSI3MzYiIHk9IjUxNiIgd2lkdGg9IjMwNCIgaGVpZ2h0PSI2NiIgcng9IjgiIGNsYXNzPSJib3giLz4KICA8dGV4dCB4PSI4ODgiIHk9IjU0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9Im5hbWUiPlRULVVNRCBhbmQgZmlybXdhcmU8L3RleHQ+CiAgPHRleHQgeD0iODg4IiB5PSI1NjUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+ZGV2aWNlIGRpc2NvdmVyeSDCtyBQQ0llIMK3IG1lbW9yeSBhbmQgY29tbWFuZCB0cmFuc3BvcnQ8L3RleHQ+CgogIDxsaW5lIHgxPSI4ODgiIHkxPSI1ODIiIHgyPSI4ODgiIHkyPSI2MDYiIGNsYXNzPSJhcnJvdyIvPgogIDxyZWN0IHg9IjQwIiB5PSI2MTQiIHdpZHRoPSIxMDAwIiBoZWlnaHQ9IjQ4IiByeD0iOCIgY2xhc3M9ImRldmljZSIvPgogIDx0ZXh0IHg9IjU0MCIgeT0iNjQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibmFtZSI+QmxhY2tob2xlIFAxNTAgwrcgMTIwIFRlbnNpeCBjb3JlcyDCtyBOb0MgwrcgcGVyLWNvcmUgTDEgwrcgR0REUjY8L3RleHQ+Cjwvc3ZnPgo=" id="fig:reference-stack" style="width:100.0%" alt /><figcaption>The reference TTIS path from serving through the model port and lower runtime.</figcaption>
 </figure>
@@ -251,7 +251,7 @@ pre { white-space: pre-wrap; }
 </tr>
 <tr class="even">
 <td style="text-align: left;">Deployment</td>
-<td style="text-align: left;">Versioned server images pin compatible TT-Metal and vLLM revisions</td>
+<td style="text-align: left;">Server images pin compatible TT-Metal and vLLM revisions</td>
 <td style="text-align: left;">One <code>libtt.so</code> pins and contains the compiler and runtime stack</td>
 </tr>
 </tbody>
@@ -270,7 +270,7 @@ pre { white-space: pre-wrap; }
        |-- loads and executes serialized TTNN programs
        `-- initializes the embedded TT-Metal runtime assets</code></pre>
 <p>libtt’s C++ glue extracts the embedded archive to a fingerprinted temporary directory, sets <code>TT_METAL_RUNTIME_ROOT</code> before PJRT starts, links the upstream plugin, and exports only the PJRT entry points. Most code comes from pinned open-source dependencies and the applied patch series.</p>
-<p>Today, libtt is a set of patches on pinned versions of TT-XLA, TT-MLIR, and TT-Metal/TTNN. The patches cover the build, compiler passes, runtime choices, and device kernels. Keeping the patches in one repository makes them easy to compare with upstream code and lets one change span all three projects.</p>
+<p>Today, libtt is a set of patches on pinned source snapshots of TT-XLA, TT-MLIR, and TT-Metal/TTNN. The patches cover the build, compiler passes, runtime choices, and device kernels. Keeping the patches in one repository makes them easy to compare with upstream code and lets one change span all three projects.</p>
 <p>The compiler and TT-Metal runtime do not need to be installed on the target. With compatible drivers and firmware, <code>libtt.so</code> contains the software needed to compile and run StableHLO programs. This is the intended similarity to <code>libtpu.so</code> [11].</p>
 <p>libtt treats PJRT and StableHLO as the integration boundary. In the measured path, SGLang-JAX keeps its model, tokenizer, scheduler, paged KV cache, and inference engine. The Tenstorrent-specific work stays below that boundary instead of requiring a forked Qwen implementation or a rewritten serving layer. A future PyTorch path can reach the same boundary through TorchTPU once the backend interface and required operation coverage are available [2].</p>
 <p>The SGLang-JAX prototype uses a small TT integration patch. It adds the TT attention backend, device selection, weight annotations and loading, and KV-cache support [33]. The scheduler, tokenizer, and Qwen model structure stay close to upstream. Most of the JAX software does not change. It only needs a small device integration layer, not a new framework, serving engine, or Transformer implementation.</p>
@@ -391,9 +391,9 @@ h_{next} &amp;= h&#39; + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 </annotation></semantics></math></p>
 <p>RMSNorm and SwiGLU are standard model concepts [10, 32]. Prefill shares each weight read across many rows. Serial decode applies a logical <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">1\times K</annotation></semantics></math> by <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">K\times N</annotation></semantics></math> projection for every token, so weight traffic and intermediate materialization dominate. The main optimizations add width parallelism, reduce DRAM traffic, or avoid packing an intermediate from Dst.</p>
 <h1 data-number="4" id="optimization-of-the-model-path"><span class="header-section-number">4</span> Optimization of the model path</h1>
-<p>We group the changes by engineering concept and implementation level rather than by commit. Git revisions remain in the data files.</p>
+<p>Each subsection below describes one implemented feature, the layer where it is implemented, and its measured effect.</p>
 <table>
-<caption>Current model-path optimization concepts, implementation levels, and measured effects.</caption>
+<caption>Implemented model-path features, implementation levels, and measured effects.</caption>
 <colgroup>
 <col style="width: 33%"></col>
 <col style="width: 33%"></col>
@@ -401,7 +401,7 @@ h_{next} &amp;= h&#39; + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 </colgroup>
 <thead>
 <tr class="header">
-<th style="text-align: left;">Concept</th>
+<th style="text-align: left;">Feature</th>
 <th style="text-align: left;">Principal level / IR</th>
 <th style="text-align: right;">Measured effect</th>
 </tr>
@@ -410,7 +410,7 @@ h_{next} &amp;= h&#39; + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 <tr class="odd">
 <td style="text-align: left;">Recover JAX RMSNorm</td>
 <td style="text-align: left;">TTIR graph rewrite</td>
-<td style="text-align: right;">+19.28% marginal foundation effect</td>
+<td style="text-align: right;">+19.28% marginal effect</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">Lower SiLU calls</td>
@@ -425,7 +425,7 @@ h_{next} &amp;= h&#39; + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 <tr class="even">
 <td style="text-align: left;">Fuse rank-3 decode RoPE</td>
 <td style="text-align: left;">TTIR/TTNN composite resolution</td>
-<td style="text-align: right;">+2.89% marginal foundation effect</td>
+<td style="text-align: right;">+2.89% marginal effect</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Fuse Qwen decode QKV structure</td>
@@ -443,19 +443,29 @@ h_{next} &amp;= h&#39; + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 <td style="text-align: right;">+0.26% marginal; near measured drift</td>
 </tr>
 <tr class="even">
+<td style="text-align: left;">Pack BF8 host weights directly</td>
+<td style="text-align: left;">TTNN host conversion</td>
+<td style="text-align: right;">Model preparation only; not measured</td>
+</tr>
+<tr class="odd">
 <td style="text-align: left;">Permit decode layouts</td>
 <td style="text-align: left;">TTNN/TT-Metal validation</td>
 <td style="text-align: right;">No positive decode effect detected</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td style="text-align: left;">Width-shard decode RMSNorm</td>
 <td style="text-align: left;">TTNN runtime policy</td>
 <td style="text-align: right;">+13.61%</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td style="text-align: left;">Combine two shared-LHS matmuls</td>
 <td style="text-align: left;">TTIR fusion</td>
 <td style="text-align: right;">-1.69%; enables epilogue</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Fuse SiLU into the following multiply</td>
+<td style="text-align: left;">TTNN operation fusion</td>
+<td style="text-align: right;">-0.65%</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">True matmul-SwiGLU epilogue</td>
@@ -484,53 +494,36 @@ h_{next} &amp;= h&#39; + \bigl(\operatorname{SiLU}(g)\odot r\bigr)W_{down}.
 </tr>
 </tbody>
 </table>
-<p>Patch index:</p>
-<pre class="text"><code>RMSNorm graph       tt_mlir_fuse_jax_rms_norm.patch
-SiLU call           tt_mlir_lower_silu_call.patch
-expanded SiLU       tt_mlir_fuse_expanded_silu.patch
-decode RoPE         tt_mlir_fuse_rank3_rope_decode.patch
-QKV structure       tt_mlir_qwen_decode_qkv_projection_fusion.patch
-KV-cache types      tt_mlir_kv_cache_dtype_return_types.patch
-BF8 path            tt_mlir_single_chip_activation_dtype_lowering.patch
-                    fast_bfloat16_bfp8_pack.patch
-decode layouts      sdpa_decode_allow_l1_interleaved_q.patch
-                    layernorm_allow_single_core_height_sharded.patch
-RMSNorm sharding    tt_mlir_sharded_decode_rms_norm.patch
-shared-LHS pair     tt_mlir_fuse_shared_lhs_matmul_pairs.patch
-SwiGLU vertical     tt_mlir_fuse_matmul_swiglu.patch
-                    matmul_swiglu_epilogue.patch
-down projection     down_projection_110_core.patch</code></pre>
-<p>The original foundation measurement combined these patches into one +22.58% stage. A new leave-one-concept-out experiment below separates their marginal effects and measures a fresh total gain of +24.03%. The effects overlap and do not add to the total. The blocking and down-projection tests use a direct streaming clock. Their final configuration forms the last stage of the cumulative sequence using streaming end-to-end throughput; the same-build A/B tests below isolate the effects of the two kernel changes.</p>
-<p>The first group recovers model semantics in TTIR and TTNN before lowerings discard the algebra and graph roles needed to recognize them.</p>
+<p>The initial features were also measured in a separate leave-one-feature-out experiment. The functional baseline averages 16.039 tokens/s and the complete set averages 19.894 tokens/s, a +24.03% gain. Baseline and complete-set results each contain 64 retained requests; each omission contains 32. The marginal effects interact and therefore do not add to the total.</p>
 <h2 data-number="4.1" id="rmsnorm-recognition"><span class="header-section-number">4.1</span> RMSNorm recognition</h2>
-<p>JAX can lower RMSNorm to square, reduce, epsilon addition, reciprocal square root, scaling, and reshapes. A TTIR pattern proves this structure and replaces it with one RMSNorm operation while the algebra and use-def graph are still available. TTNN can then apply its normalization and layout logic. Removing this patch from the otherwise complete foundation lowers throughput from 19.894 to 16.678 tokens/s. Restoring it gives a +19.28% marginal speedup. It also enables the later runtime-sharding patch.</p>
+<p>JAX can lower RMSNorm to square, reduce, epsilon addition, reciprocal square root, scaling, and reshapes. The <a href="../../third_party/tt_xla/tt_mlir_fuse_jax_rms_norm.patch">RMSNorm recognition patch</a> proves this structure and replaces it with one TTIR RMSNorm operation while the algebra and use-def graph are still available. TTNN can then apply its normalization and layout logic. This recognition also enables runtime width sharding.</p>
+<p><strong>Measured effect.</strong> Removing RMSNorm recognition from the otherwise complete feature set lowers throughput from 19.894 to 16.678 tokens/s. Restoring it gives a +19.28% marginal speedup and accounts for 83.4% of the measured initial gain. The omitted build remains deterministic but produces a different token sequence, so this test does not establish equal model quality.</p>
 <h2 data-number="4.2" id="silu-call-lowering"><span class="header-section-number">4.2</span> SiLU call lowering</h2>
-<p>Some JAX graphs contain a function call named <code>silu</code>. The foundation patch replaces that call with a TTIR SiLU operation during StableHLO legalization. Removing the patch changes throughput by +0.45%, so this exact graph does not show a positive decode effect. The patch remains useful for graph coverage.</p>
+<p>Some JAX graphs contain a function call named <code>silu</code>. The SiLU call-lowering feature replaces that call with a TTIR SiLU operation during StableHLO legalization.</p>
+<p><strong>Measured effect.</strong> Removing the rewrite changes throughput by +0.45%, so this graph shows no positive decode effect. The feature remains useful for graph coverage.</p>
 <h2 data-number="4.3" id="expanded-silu-recognition"><span class="header-section-number">4.3</span> Expanded-SiLU recognition</h2>
 <p>The graph represents</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>SiLU</mo><mo stretchy="false" form="prefix">(</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mi>x</mi><mspace width="0.167em"></mspace><mi>σ</mi><mo stretchy="false" form="prefix">(</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo><mo>=</mo><mfrac><mi>x</mi><mrow><mn>1</mn><mo>+</mo><mo>exp</mo><mo stretchy="false" form="prefix">(</mo><mo>−</mo><mi>x</mi><mo stretchy="false" form="postfix">)</mo></mrow></mfrac></mrow><annotation encoding="application/x-tex">
 \operatorname{SiLU}(x)=x\,\sigma(x)=\frac{x}{1+\exp(-x)}
 </annotation></semantics></math></p>
-<p>with casts, broadcasts, reshapes, and a splatted scalar one. This is separate from the foundation call-lowering patch. The later <code>tt_mlir_fuse_expanded_silu.patch</code> looks through view-like operations, verifies the constant and shared input, and replaces the tree with SiLU. The isolated gain is +3.30%.</p>
-<h2 data-number="4.4" id="rank-3-rope-and-qkv-projection-structure"><span class="header-section-number">4.4</span> Rank-3 RoPE and QKV projection structure</h2>
-<p>Qwen projects Q, K, and V together, applies per-head RMSNorm to Q and K, reshapes them by head count, and applies rotary position embedding. Two patches recover this structure:</p>
-<ul>
-<li><code>tt_mlir_fuse_rank3_rope_decode.patch</code> accepts JAX’s rank-3 decode form, temporarily maps it to the existing rank-4 composite, and restores the expected result shape.</li>
-<li><code>tt_mlir_qwen_decode_qkv_projection_fusion.patch</code> orders projection roles, validates contiguous Q/K/V bounds, head counts, and head dimensions, and replaces materialized slices/reshapes with <code>nlp_create_qkv_heads_decode</code>. Q and K RMSNorm are recreated on the fused rank-4 results.</li>
-</ul>
-<p>TTIR supplies candidate ordering and role information; TTNN owns the composite operation and runtime contract. QKV fusion adds +1.15%. Removing rank-3 RoPE fusion from the foundation lowers throughput by 2.81%; restoring it gives a +2.89% marginal speedup.</p>
-<h2 data-number="4.5" id="kv-cache-dtype-and-role-propagation"><span class="header-section-number">4.5</span> KV-cache dtype and role propagation</h2>
-<p>KV-cache update operations are stateful boundaries. Their return types must carry the selected device dtype, and graph-role metadata must survive unary operations so later fusions can still identify query, key, and value paths. The TT-MLIR and TT-XLA patches keep the low-precision fused graph typed and recognizable. Removing KV-cache return-type preservation lowers throughput by 0.54%; restoring it gives a +0.54% marginal speedup.</p>
-<p>The next group selects precision and layout after the graph operations have been recovered.</p>
-<h2 data-number="4.6" id="bf8-lowering-and-fast-host-packing"><span class="header-section-number">4.6</span> BF8 lowering and fast host packing</h2>
-<p>We request <code>bfp_bf8</code> for eligible weights. TT-XLA enables single-chip lowering, TT-MLIR assigns the device dtype, and TTNN/TT-Metal consume BFLOAT8_B tiles. <code>fast_bfloat16_bfp8_pack.patch</code> speeds conversion of BF16 host weights to 32-by-32 BFP8 tiles.</p>
-<p>These changes attack two different phases:</p>
-<ul>
-<li>BF8 storage reduces steady-state device weight traffic during decode.</li>
-<li>faster packing reduces model-load and preparation cost on the host.</li>
-</ul>
-<p>BF8 weights and fast host packing already existed in the functional baseline. The foundation adds single-chip activation lowering through one TT-XLA patch and one TT-MLIR patch. Removing those two patches together lowers throughput by 0.25%; restoring them gives a +0.26% marginal speedup.</p>
-<h2 data-number="4.7" id="width-sharded-decode-rmsnorm"><span class="header-section-number">4.7</span> Width-sharded decode RMSNorm</h2>
+<p>with casts, broadcasts, reshapes, and a splatted scalar one. The <a href="../../third_party/tt_xla/tt_mlir_fuse_expanded_silu.patch">expanded-SiLU patch</a> looks through view-like operations, verifies the constant and shared input, and replaces the tree with SiLU.</p>
+<p><strong>Measured effect.</strong> End-to-end throughput improves by +3.30%.</p>
+<h2 data-number="4.4" id="rank-3-decode-rope"><span class="header-section-number">4.4</span> Rank-3 decode RoPE</h2>
+<p>Qwen applies rotary position embedding after reshaping Q and K by head count. The <a href="../../third_party/tt_xla/tt_mlir_fuse_rank3_rope_decode.patch">rank-3 RoPE patch</a> accepts JAX’s rank-3 decode form, temporarily maps it to the existing rank-4 composite, and restores the expected result shape. TTIR identifies the pattern, while TTNN owns the composite operation and runtime contract.</p>
+<p><strong>Measured effect.</strong> Omitting the fusion lowers throughput by 2.81%; restoring it gives a +2.89% marginal speedup and accounts for 14.5% of the measured initial gain.</p>
+<h2 data-number="4.5" id="qkv-projection-structure"><span class="header-section-number">4.5</span> QKV projection structure</h2>
+<p>Qwen projects Q, K, and V together and applies per-head RMSNorm to Q and K. The <a href="../../third_party/tt_xla/tt_mlir_qwen_decode_qkv_projection_fusion.patch">QKV projection patch</a> orders projection roles, validates contiguous Q/K/V bounds, head counts, and head dimensions, and replaces materialized slices and reshapes with <code>nlp_create_qkv_heads_decode</code>. Q and K RMSNorm are recreated on the fused rank-4 results.</p>
+<p><strong>Measured effect.</strong> End-to-end throughput improves by +1.15%.</p>
+<h2 data-number="4.6" id="kv-cache-dtype-and-role-propagation"><span class="header-section-number">4.6</span> KV-cache dtype and role propagation</h2>
+<p>KV-cache update operations are stateful boundaries. Their return types must carry the selected device dtype, and graph-role metadata must survive unary operations so later fusions can still identify query, key, and value paths. The <a href="../../third_party/tt_xla/tt_mlir_kv_cache_dtype_return_types.patch">KV-cache typing patch</a> preserves result types across cache updates. TT-XLA role propagation keeps later query, key, and value paths recognizable.</p>
+<p><strong>Measured effect.</strong> Removing KV-cache result typing lowers throughput by 0.54%; restoring it gives a +0.54% marginal speedup. This change is close to the observed sequential drift.</p>
+<h2 data-number="4.7" id="bf8-activation-lowering"><span class="header-section-number">4.7</span> BF8 activation lowering</h2>
+<p>We request <code>bfp_bf8</code> for eligible weights. BF8 weight storage and host packing already exist in the functional baseline. The new feature enables activation lowering on one chip through the <a href="../../third_party/tt_xla/tt_xla_enable_bf8_activation_dtype_lowering.patch">TT-XLA dtype patch</a> and <a href="../../third_party/tt_xla/tt_mlir_single_chip_activation_dtype_lowering.patch">TT-MLIR dtype patch</a>. TTNN and TT-Metal then consume the selected BFLOAT8_B tiles.</p>
+<p><strong>Measured effect.</strong> Removing both activation-lowering changes reduces throughput by 0.25%; restoring them gives a +0.26% marginal speedup. This change is close to the observed sequential drift.</p>
+<h2 data-number="4.8" id="fast-bf8-host-packing"><span class="header-section-number">4.8</span> Fast BF8 host packing</h2>
+<p>The <a href="../../third_party/tt_metal/fast_bfloat16_bfp8_pack.patch">fast BF8 packing patch</a> accelerates conversion of BF16 host weights to 32-by-32 BFP8 tiles. This reduces model preparation time but does not change the steady-state decode graph.</p>
+<p><strong>Measured effect.</strong> Decode throughput is not affected; model-load time was not measured in this report.</p>
+<h2 data-number="4.9" id="width-sharded-decode-rmsnorm"><span class="header-section-number">4.9</span> Width-sharded decode RMSNorm</h2>
 <p>The default logical height of RMSNorm during batch-one decode is one. A generic height-parallel program cannot occupy many cores. At run time, we recognize a device-resident, tiled, unsharded input with sequence length one and width at least 2048. When the width divides into 16 tile-aligned shards, it:</p>
 <ol type="1">
 <li>creates an 8-by-2 row-major core grid;</li>
@@ -539,33 +532,37 @@ down projection     down_projection_110_core.patch</code></pre>
 <li>executes sharded RMSNorm; and</li>
 <li>restores the requested output memory configuration.</li>
 </ol>
-<p>The two conversions cost less than the width-parallel reduction saves. The isolated gain is +13.61%. This is runtime policy, not a new IR operation: the compiler identifies RMSNorm, while the runtime knows the tensor and device geometry.</p>
-<h2 data-number="4.8" id="decode-specific-validation-changes"><span class="header-section-number">4.8</span> Decode-specific validation changes</h2>
-<p>Two small TT-Metal patches admit layouts selected by the optimized graph:</p>
+<p>The two conversions cost less than the width-parallel reduction saves. This is runtime policy, not a new IR operation: the compiler identifies RMSNorm, while the runtime knows the tensor and device geometry.</p>
+<p><strong>Measured effect.</strong> End-to-end throughput improves by +13.61%.</p>
+<h2 data-number="4.10" id="decode-layout-admission"><span class="header-section-number">4.10</span> Decode layout admission</h2>
+<p>Two TT-Metal changes admit layouts selected by the optimized graph:</p>
 <ul>
-<li>SDPA decode accepts an L1-interleaved query rather than requiring the prior sharded form.</li>
-<li>layernorm accepts the single-core height-sharded case produced on the decode path.</li>
+<li>The <a href="../../third_party/tt_metal/sdpa_decode_allow_l1_interleaved_q.patch">SDPA layout patch</a> allows SDPA decode to consume an L1-interleaved query.</li>
+<li>The <a href="../../third_party/tt_metal/layernorm_allow_single_core_height_sharded.patch">layernorm layout patch</a> allows the single-core height-sharded layout produced on the decode path.</li>
 </ul>
-<p>These narrow changes keep shape and layout checks while admitting layouts used by other optimized paths. Removing both changes throughput by +0.66% in this experiment, so no positive decode effect is detected for the measured graph. Their role is compatibility rather than the source of the foundation speedup.</p>
-<p>The MLP experiments test which intermediate and data-movement boundaries must be removed for fusion to improve decode throughput.</p>
-<h2 data-number="4.9" id="shared-lhs-gateup-projection"><span class="header-section-number">4.9</span> Shared-LHS gate/up projection</h2>
+<p>These narrow changes keep shape and layout checks while admitting layouts used by other optimized paths.</p>
+<p><strong>Measured effect.</strong> Removing both changes increases throughput by 0.66%, so the measured graph shows no positive decode effect. Their role is layout coverage.</p>
+<p>Across this initial feature set, the marginal throughput losses account for 96.3% of the baseline-to-complete-set difference. The remainder comes from feature interactions and sequential drift. The individual percentages should therefore not be added as if they were independent.</p>
+<h2 data-number="4.11" id="shared-lhs-gateup-projection"><span class="header-section-number">4.11</span> Shared-LHS gate/up projection</h2>
 <p>Qwen’s two first MLP projections share an activation:</p>
 <p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mo>,</mo><mspace width="0.278em"></mspace><mi>x</mi><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mspace width="1.0em"></mspace><mo>→</mo><mspace width="1.0em"></mspace><mi>x</mi><mo stretchy="false" form="prefix">[</mo><msub><mi>W</mi><mrow><mi>g</mi><mi>a</mi><mi>t</mi><mi>e</mi></mrow></msub><mspace width="0.278em"></mspace><msub><mi>W</mi><mrow><mi>u</mi><mi>p</mi></mrow></msub><mo stretchy="false" form="postfix">]</mo><mi>.</mi></mrow><annotation encoding="application/x-tex">
 xW_{gate},\;xW_{up}
 \quad\longrightarrow\quad
 x[W_{gate}\;W_{up}].
 </annotation></semantics></math></p>
-<p><code>tt_mlir_fuse_shared_lhs_matmul_pairs.patch</code> changes TTIR fusion eligibility so a pair can be combined. This removes duplicate activation reads and launches, but writes a doubled-width output that SwiGLU slices and rereads. Throughput changes by -1.69%. The representation becomes useful when the epilogue consumes it without materializing the combined output.</p>
-<h2 data-number="4.10" id="consumer-side-silu-fusion"><span class="header-section-number">4.10</span> Consumer-side SiLU fusion</h2>
+<p>The <a href="../../third_party/tt_xla/tt_mlir_fuse_shared_lhs_matmul_pairs.patch">shared-LHS patch</a> changes TTIR fusion eligibility so a pair can be combined. This removes duplicate activation reads and launches, but writes a doubled-width output that SwiGLU slices and rereads. Throughput falls because the representation still materializes too much data. It becomes useful when the epilogue consumes it directly.</p>
+<p><strong>Measured effect.</strong> End-to-end throughput changes by -1.69%.</p>
+<h2 data-number="4.12" id="consumer-side-silu-fusion"><span class="header-section-number">4.12</span> Consumer-side SiLU fusion</h2>
 <p>An intermediate experiment placed SiLU as a unary activation on the following TTNN multiply. That removes one elementwise operation but retains the expensive boundary:</p>
 <pre class="text"><code>combined matmul → pack full gate/up tensor → memory
                 → read/unpack → SiLU + multiply → pack result</code></pre>
-<p>Throughput changes by -0.65%. Removing an operation does not help when the same large intermediate is still written and read.</p>
-<h2 data-number="4.11" id="dst-resident-matmul-swiglu-epilogue"><span class="header-section-number">4.11</span> Dst-resident matmul-SwiGLU epilogue</h2>
+<p>Removing an operation does not help when the same large intermediate is still written and read.</p>
+<p><strong>Measured effect.</strong> End-to-end throughput changes by -0.65%.</p>
+<h2 data-number="4.13" id="dst-resident-matmul-swiglu-epilogue"><span class="header-section-number">4.13</span> Dst-resident matmul-SwiGLU epilogue</h2>
 <p>Two patches implement the producer-side epilogue:</p>
 <ul>
-<li><code>tt_mlir_fuse_matmul_swiglu.patch</code> recognizes the TTNN graph, introduces the fused matmul semantic, extends the FlatBuffer representation, serializes it, and invokes the corresponding runtime path.</li>
-<li><code>matmul_swiglu_epilogue.patch</code> adds TTNN validation, a program factory, and the TT-Metal reader/receiver/sender/compute kernels.</li>
+<li>The <a href="../../third_party/tt_xla/tt_mlir_fuse_matmul_swiglu.patch">compiler and runtime patch</a> recognizes the TTNN graph, introduces the fused matmul semantic, extends the FlatBuffer representation, serializes it, and invokes the corresponding runtime path.</li>
+<li>The <a href="../../third_party/tt_metal/matmul_swiglu_epilogue.patch">TT-Metal epilogue patch</a> adds TTNN validation, a program factory, and the TT-Metal reader/receiver/sender/compute kernels.</li>
 </ul>
 <p>The contract supports one physical tile row, BF16 activation/output, BFLOAT8_B weights, DRAM-interleaved tensors, no transpose or bias, and a grid that can supply 96 workers. For Qwen3-8B, each worker owns four gate tiles and four corresponding up tiles—exactly the eight active 16-bit Dst slots.</p>
 <p>The program performs the following sequence:</p>
@@ -579,13 +576,15 @@ x[W_{gate}\;W_{up}].
 <li>each gate tile multiplies its corresponding up tile in place; and</li>
 <li>only four final BF16 tiles are packed and written.</li>
 </ol>
-<p>The doubled-width gate/up tensor is never materialized. End-to-end throughput improves by +2.73%.</p>
-<h2 data-number="4.12" id="prefill-coverage-and-fallback-removal"><span class="header-section-number">4.12</span> Prefill coverage and fallback removal</h2>
+<p>The doubled-width gate/up tensor is never materialized.</p>
+<p><strong>Measured effect.</strong> End-to-end throughput improves by +2.73%.</p>
+<h2 data-number="4.14" id="prefill-coverage-and-fallback-removal"><span class="header-section-number">4.14</span> Prefill coverage and fallback removal</h2>
 <p>We then generalized the matcher from decode-specific naming to any supported one-tile-row input, which includes short prefill. The older consumer-side SiLU-multiply fallback was removed; validation remains at the TTNN/TT-Metal boundary, where unsupported dtype, layout, shape, and hardware combinations fail explicitly.</p>
-<p>Throughput changes by -0.19%. The change removes code and adds prefill coverage without changing the fast kernel or completion hash.</p>
-<h2 data-number="4.13" id="swiglu-k-blocking-sweep"><span class="header-section-number">4.13</span> SwiGLU K-blocking sweep</h2>
+<p>The change removes code and adds prefill coverage without changing the fast kernel or completion hash.</p>
+<p><strong>Measured effect.</strong> End-to-end throughput changes by -0.19%.</p>
+<h2 data-number="4.15" id="swiglu-k-blocking-sweep"><span class="header-section-number">4.15</span> SwiGLU K-blocking sweep</h2>
 <p>The initial epilogue uses <code>in0_block_w = 2</code>. Every two K tiles it packs eight partial tiles into L1 and later reloads them. Larger blocks reduce partial traffic but need larger activation and weight circular buffers.</p>
-<p><code>matmul_swiglu_epilogue.patch</code> now exposes <code>TT_METAL_SWIGLU_IN0_BLOCK_W={2,4,8,16}</code> and sizes the circular buffers from the chosen value. The 32-sample test compares width 4 with width 2 while disabling the new down-projection specialization:</p>
+<p>The <a href="../../third_party/tt_metal/matmul_swiglu_epilogue.patch">TT-Metal epilogue patch</a> exposes <code>TT_METAL_SWIGLU_IN0_BLOCK_W={2,4,8,16}</code> and sizes the circular buffers from the chosen value. The 32-sample test compares width 4 with width 2 while disabling the new down-projection specialization:</p>
 <table>
 <thead>
 <tr class="header">
@@ -611,8 +610,9 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The intervals overlap and the measured change is small, so width two remains the default. Widths 8 and 16 remain available for experiments. Wider blocks also change accumulation order and can change greedy token sequences.</p>
-<h2 data-number="4.14" id="core-fused-residual-down-projection"><span class="header-section-number">4.14</span> 110-core fused-residual down projection</h2>
-<p>The second MLP matmul has the exact decode shape <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mn>12288</mn></mrow><annotation encoding="application/x-tex">1\times12288</annotation></semantics></math> by <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>12288</mn><mo>×</mo><mn>4096</mn></mrow><annotation encoding="application/x-tex">12288\times4096</annotation></semantics></math>. The generic program used 64 cores and achieved only 246.2 GB/s of effective BFP8 weight bandwidth, well below the SwiGLU kernel. <code>down_projection_110_core.patch</code> adds an exact-shape Blackhole program selected only for BF16 activation/output, BFLOAT8_B weights, a BF16 residual, DRAM-interleaved tensors, and an 11-by-10 worker grid.</p>
+<p><strong>Measured effect.</strong> Pure decode throughput changes by +0.27% for four-tile blocks relative to two-tile blocks.</p>
+<h2 data-number="4.16" id="core-fused-residual-down-projection"><span class="header-section-number">4.16</span> 110-core fused-residual down projection</h2>
+<p>The second MLP matmul has the exact decode shape <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>×</mo><mn>12288</mn></mrow><annotation encoding="application/x-tex">1\times12288</annotation></semantics></math> by <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>12288</mn><mo>×</mo><mn>4096</mn></mrow><annotation encoding="application/x-tex">12288\times4096</annotation></semantics></math>. The generic program used 64 cores and achieved only 246.2 GB/s of effective BFP8 weight bandwidth, well below the SwiGLU kernel. The <a href="../../third_party/tt_metal/down_projection_110_core.patch">down-projection patch</a> adds an exact-shape Blackhole program selected only for BF16 activation/output, BFLOAT8_B weights, a BF16 residual, DRAM-interleaved tensors, and an 11-by-10 worker grid.</p>
 <p>The program avoids a K split and cross-core reduction. It partitions the 128 output tile columns across 110 workers:</p>
 <ul>
 <li>18 wide workers each compute two N tiles, covering columns 0–35;</li>
@@ -622,9 +622,10 @@ x[W_{gate}\;W_{up}].
 <li>K is processed four tiles at a time with packer-L1 accumulation; and</li>
 <li>the residual addition occurs in the final compute kernel before output.</li>
 </ul>
-<p>Wide and narrow workers need different partial-result circular buffers. An early version gave narrow workers a two-tile ring even though they produced one tile. Partial sums alternated slots and corrupted output. Separate one- and two-tile rings fixed the bug.</p>
+<p>Wide and narrow workers need different partial-result circular buffers. An early implementation gave narrow workers a two-tile ring even though they produced one tile. Partial sums alternated slots and corrupted output. Separate one- and two-tile rings fixed the bug.</p>
 <p>The exact-shape specialization is enabled by default. <code>TT_METAL_DOWN_PROJECTION_110_CORES=0</code> selects the generic program in the same binary for A/B measurement.</p>
-<h2 data-number="4.15" id="runtime-trace-capture-for-short-prefill"><span class="header-section-number">4.15</span> Runtime trace capture for short prefill</h2>
+<p><strong>Measured effect.</strong> Pure decode throughput improves by +5.96%, from 26.192 to 27.753 tokens/s. Streaming end-to-end throughput improves by +5.88%.</p>
+<h2 data-number="4.17" id="runtime-trace-capture-for-short-prefill"><span class="header-section-number">4.17</span> Runtime trace capture for short prefill</h2>
 <p>Decode replays a recorded TT-Metal command sequence while refreshing request-dependent buffers. Previously, the five-token prompt, padded to one 32-row tile, ran as separate host submissions.</p>
 <p>Setting <code>SGLANG_TT_TRACE_DECODE_ONLY=false</code> records the fixed-shape prefill sequence too. In a same-binary 32-sample A/B test:</p>
 <table>
@@ -657,8 +658,8 @@ x[W_{gate}\;W_{up}].
 </tr>
 </tbody>
 </table>
-<p>Tracing removes about 560 ms before the first token while pure decode changes by +0.36%. In the primary cumulative benchmark, it adds +10.23% end-to-end throughput for a 128-token response.</p>
-<h2 data-number="4.16" id="packaging-build-and-startup-changes"><span class="header-section-number">4.16</span> Packaging, build, and startup changes</h2>
+<p><strong>Measured effect.</strong> Tracing removes about 560 ms before the first token, reducing TTFT by 90.44%. Pure decode changes by +0.36%, while 128-token end-to-end throughput improves by +10.23%.</p>
+<h2 data-number="4.18" id="packaging-build-and-startup-changes"><span class="header-section-number">4.18</span> Packaging, build, and startup changes</h2>
 <p>Other patches make the single-library deployment buildable and keep startup cost manageable. They are not decode optimizations.</p>
 <table>
 <caption>Non-model patch groups in the current libtt build.</caption>
@@ -706,9 +707,9 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: left;">Avoid bringing unused compiler/runtime paths into the artifact and reduce cold compilation work.</td>
 </tr>
 <tr class="odd">
-<td style="text-align: left;">API/version compatibility</td>
+<td style="text-align: left;">API compatibility</td>
 <td style="text-align: left;">protobuf, Shardy, affine, constructor-name, map/include patches</td>
-<td style="text-align: left;">Reconcile pinned revisions inside one build without relying on a preinstalled matching stack.</td>
+<td style="text-align: left;">Reconcile pinned source snapshots inside one build without relying on a preinstalled matching stack.</td>
 </tr>
 </tbody>
 </table>
@@ -757,15 +758,7 @@ x[W_{gate}\;W_{up}].
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Serving frontend</td>
-<td style="text-align: left;"><code>/home/pcmoritz/sglang-jax</code> at <code>24eb823ed97e</code></td>
-</tr>
-<tr class="even">
-<td style="text-align: left;">Established main snapshot</td>
-<td style="text-align: left;"><code>627a32d</code></td>
-</tr>
-<tr class="odd">
-<td style="text-align: left;">Current kernel snapshot</td>
-<td style="text-align: left;"><code>37d5460</code></td>
+<td style="text-align: left;"><code>/home/pcmoritz/sglang-jax</code></td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">Benchmark date</td>
@@ -796,7 +789,7 @@ x[W_{gate}\;W_{up}].
   --disable-precompile --skip-server-warmup \
   --disable-overlap-schedule --disable-radix-cache</code></pre>
 <p>Requests are serial despite the capacity of two. Radix caching and overlap scheduling are disabled so every request executes the same prompt prefill and does not overlap another request. Optional CPU/fused sampling paths remain at their disabled defaults; this report concerns the main model path.</p>
-<p>The foundation decomposition uses the same command with <code>SGLANG_TT_TRACE_DECODE_ONLY=true</code>. V0 and V1 predate fixed-shape prefill tracing, so this reproduces the timing scope of the original +22.58% measurement. All foundation variants use that setting.</p>
+<p>The leave-one-feature-out measurements use the same command with <code>SGLANG_TT_TRACE_DECODE_ONLY=true</code> to exclude the later prefill-trace feature. The baseline and complete feature set each use two 32-request windows. Every feature omission uses one 32-request window.</p>
 <h2 data-number="5.3" id="request-and-sample-policy"><span class="header-section-number">5.3</span> Request and sample policy</h2>
 <p>We send the same request 34 times in the primary sequence:</p>
 <pre class="json"><code>{
@@ -815,22 +808,20 @@ x[W_{gate}\;W_{up}].
 <p>For the down projection, the measured per-layer difference predicts a 2.241-ms/token reduction; the streaming measurement gives 2.147 ms/token. We compute effective weight bandwidth as <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>B</mi><mrow><mi>e</mi><mi>f</mi><mi>f</mi></mrow></msub><mo>=</mo><msub><mi>S</mi><mi>W</mi></msub><mi>/</mi><msub><mi>t</mi><mi>k</mi></msub></mrow><annotation encoding="application/x-tex">B_{eff}=S_W/t_k</annotation></semantics></math>, where <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>S</mi><mi>W</mi></msub><annotation encoding="application/x-tex">S_W</annotation></semantics></math> is the packed BFP8 weight size and <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>t</mi><mi>k</mi></msub><annotation encoding="application/x-tex">t_k</annotation></semantics></math> is device kernel time. These quantities let us compare a kernel profile with the end-to-end result without treating the kernel speedup as the model speedup.</p>
 <p>Tables report the mean, sample standard deviation, and two-sided 95% Student-t interval. These describe variation within each recorded window but do not remove sequential drift, autocorrelation, or model and shape dependence.</p>
 <h1 data-number="6" id="results"><span class="header-section-number">6</span> Results</h1>
-<h2 data-number="6.1" id="optimization-sequence"><span class="header-section-number">6.1</span> Optimization sequence</h2>
-<p>V0 is the functional baseline: it runs upstream SGLang-JAX but has few model-specific performance optimizations. V1 through V10 add compiler, runtime, and kernel changes below the XLA/PJRT boundary. Commit IDs are recorded in the CSV files.</p>
+<h2 data-number="6.1" id="cumulative-end-to-end-performance"><span class="header-section-number">6.1</span> Cumulative end-to-end performance</h2>
+<p>The cumulative measurement starts with upstream SGLang-JAX running on the functional backend. Each following row adds the named compiler, runtime, or kernel feature below the XLA/PJRT boundary.</p>
 <table>
-<caption>End-to-end 128-token generation, 32 retained requests per measurement stage.</caption>
+<caption>End-to-end 128-token generation, 32 retained requests per configuration.</caption>
 <colgroup>
-<col style="width: 15%"></col>
-<col style="width: 15%"></col>
-<col style="width: 15%"></col>
-<col style="width: 21%"></col>
-<col style="width: 15%"></col>
-<col style="width: 15%"></col>
+<col style="width: 18%"></col>
+<col style="width: 18%"></col>
+<col style="width: 25%"></col>
+<col style="width: 18%"></col>
+<col style="width: 18%"></col>
 </colgroup>
 <thead>
 <tr class="header">
-<th style="text-align: left;">Stage</th>
-<th style="text-align: left;">Concept introduced</th>
+<th style="text-align: left;">Optimization set</th>
 <th style="text-align: right;">Mean ± SD (tok/s)</th>
 <th style="text-align: center;">95% CI</th>
 <th style="text-align: right;">Incremental</th>
@@ -839,23 +830,20 @@ x[W_{gate}\;W_{up}].
 </thead>
 <tbody>
 <tr class="odd">
-<td style="text-align: left;">V0</td>
-<td style="text-align: left;">Documented serving baseline</td>
+<td style="text-align: left;">Functional baseline</td>
 <td style="text-align: right;">16.265 ± 0.128</td>
 <td style="text-align: center;">[16.218, 16.311]</td>
 <td style="text-align: right;">—</td>
 <td style="text-align: right;">0.00%</td>
 </tr>
 <tr class="even">
-<td style="text-align: left;">V1</td>
-<td style="text-align: left;">Decode foundation: semantic recovery, dtype, and layout</td>
+<td style="text-align: left;">Complete initial feature set</td>
 <td style="text-align: right;">19.938 ± 0.283</td>
 <td style="text-align: center;">[19.836, 20.040]</td>
 <td style="text-align: right;">+22.58%</td>
 <td style="text-align: right;">+22.58%</td>
 </tr>
 <tr class="odd">
-<td style="text-align: left;">V2</td>
 <td style="text-align: left;">Expanded-SiLU recognition</td>
 <td style="text-align: right;">20.596 ± 0.279</td>
 <td style="text-align: center;">[20.495, 20.696]</td>
@@ -863,7 +851,6 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: right;">+26.63%</td>
 </tr>
 <tr class="even">
-<td style="text-align: left;">V3</td>
 <td style="text-align: left;">QKV projection fusion</td>
 <td style="text-align: right;">20.832 ± 0.293</td>
 <td style="text-align: center;">[20.726, 20.938]</td>
@@ -871,7 +858,6 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: right;">+28.08%</td>
 </tr>
 <tr class="odd">
-<td style="text-align: left;">V4</td>
 <td style="text-align: left;">Two-way shared-LHS matmul</td>
 <td style="text-align: right;">20.479 ± 0.321</td>
 <td style="text-align: center;">[20.363, 20.594]</td>
@@ -879,7 +865,6 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: right;">+25.91%</td>
 </tr>
 <tr class="even">
-<td style="text-align: left;">V5</td>
 <td style="text-align: left;">Decode RMSNorm width sharding</td>
 <td style="text-align: right;">23.265 ± 0.235</td>
 <td style="text-align: center;">[23.181, 23.350]</td>
@@ -887,7 +872,6 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: right;">+43.04%</td>
 </tr>
 <tr class="odd">
-<td style="text-align: left;">V6</td>
 <td style="text-align: left;">Consumer-side SiLU/multiply fusion</td>
 <td style="text-align: right;">23.113 ± 0.296</td>
 <td style="text-align: center;">[23.007, 23.220]</td>
@@ -895,7 +879,6 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: right;">+42.11%</td>
 </tr>
 <tr class="even">
-<td style="text-align: left;">V7</td>
 <td style="text-align: left;">Dst-resident matmul-SwiGLU epilogue</td>
 <td style="text-align: right;">23.744 ± 0.311</td>
 <td style="text-align: center;">[23.632, 23.856]</td>
@@ -903,15 +886,13 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: right;">+45.98%</td>
 </tr>
 <tr class="odd">
-<td style="text-align: left;">V8</td>
-<td style="text-align: left;">Prefill-capable, fallback-free path</td>
+<td style="text-align: left;">Generalized fallback-free epilogue</td>
 <td style="text-align: right;">23.698 ± 0.274</td>
 <td style="text-align: center;">[23.599, 23.797]</td>
 <td style="text-align: right;">-0.19%</td>
 <td style="text-align: right;">+45.70%</td>
 </tr>
 <tr class="even">
-<td style="text-align: left;">V9</td>
 <td style="text-align: left;">Fixed-shape prefill trace</td>
 <td style="text-align: right;">26.123 ± 0.394</td>
 <td style="text-align: center;">[25.981, 26.265]</td>
@@ -919,8 +900,7 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: right;">+60.61%</td>
 </tr>
 <tr class="odd">
-<td style="text-align: left;">V10</td>
-<td style="text-align: left;">SwiGLU blocking and 110-core down projection</td>
+<td style="text-align: left;">SwiGLU blocking and down projection</td>
 <td style="text-align: right;">27.619 ± 0.322</td>
 <td style="text-align: center;">[27.503, 27.735]</td>
 <td style="text-align: right;">+5.73%</td>
@@ -929,120 +909,15 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <figure>
-<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTIwIiB2aWV3Qm94PSIwIDAgOTgwIDUyMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxfS5ncmlke3N0cm9rZTojZDBkMGQwO3N0cm9rZS13aWR0aDoxfS5saW5le2ZpbGw6bm9uZTtzdHJva2U6IzExMTtzdHJva2Utd2lkdGg6M30uY2l7c3Ryb2tlOiM2NjY7c3Ryb2tlLXdpZHRoOjJ9LmRvdHtmaWxsOiMxMTE7c3Ryb2tlOndoaXRlO3N0cm9rZS13aWR0aDoxLjV9LmxhYmVse2ZvbnQtc2l6ZToxNHB4fS5zbWFsbHtmb250LXNpemU6MTJweDtmaWxsOiM0NDR9LnRpdGxle2ZvbnQtc2l6ZToyMXB4O2ZvbnQtd2VpZ2h0OjcwMH08L3N0eWxlPgo8dGV4dCB4PSI5MCIgeT0iMjciIGNsYXNzPSJ0aXRsZSI+UXdlbjMtOEIgZW5kLXRvLWVuZCBnZW5lcmF0aW9uIHRocm91Z2hwdXQ8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjQxNS4wIiB4Mj0iOTU1IiB5Mj0iNDE1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSI0MjAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xNTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzg4LjIiIHgyPSI5NTUiIHkyPSIzODguMiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM5My4yIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE2PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIzNjEuNCIgeDI9Ijk1NSIgeTI9IjM2MS40IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMzY2LjQiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MTc8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjMzNC42IiB4Mj0iOTU1IiB5Mj0iMzM0LjYiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIzMzkuNiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xODwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzA3LjkiIHgyPSI5NTUiIHkyPSIzMDcuOSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjMxMi45IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE5PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIyODEuMSIgeDI9Ijk1NSIgeTI9IjI4MS4xIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMjg2LjEiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjA8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjI1NC4zIiB4Mj0iOTU1IiB5Mj0iMjU0LjMiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIyNTkuMyIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjI3LjUiIHgyPSI5NTUiIHkyPSIyMjcuNSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjIzMi41IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjIyPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIyMDAuNyIgeDI9Ijk1NSIgeTI9IjIwMC43IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMjA1LjciIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjM8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjE3My45IiB4Mj0iOTU1IiB5Mj0iMTczLjkiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxNzguOSIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNDwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMTQ3LjEiIHgyPSI5NTUiIHkyPSIxNDcuMSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjE1Mi4xIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI1PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIxMjAuNCIgeDI9Ijk1NSIgeTI9IjEyMC40IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMTI1LjQiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjY8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjkzLjYiIHgyPSI5NTUiIHkyPSI5My42IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iOTguNiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNzwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iNjYuOCIgeDI9Ijk1NSIgeTI9IjY2LjgiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSI3MS44IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI4PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSI0MC4wIiB4Mj0iOTU1IiB5Mj0iNDAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjQ1LjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+Mjk8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjQwIiB4Mj0iOTAiIHkyPSI0MTUiIGNsYXNzPSJheGlzIi8+CjxsaW5lIHgxPSI5MCIgeTE9IjQxNSIgeDI9Ijk1NSIgeTI9IjQxNSIgY2xhc3M9ImF4aXMiLz4KPHBvbHlsaW5lIHBvaW50cz0iOTAuMCwzODEuMSAxNzYuNSwyODIuNyAyNjMuMCwyNjUuMSAzNDkuNSwyNTguOCA0MzYuMCwyNjguMiA1MjIuNSwxOTMuNiA2MDkuMCwxOTcuNyA2OTUuNSwxODAuOCA3ODIuMCwxODIuMCA4NjguNSwxMTcuMSA5NTUuMCw3Ny4wIiBjbGFzcz0ibGluZSIvPgo8bGluZSB4MT0iOTAuMCIgeTE9IjM3OS45IiB4Mj0iOTAuMCIgeTI9IjM4Mi40IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijg0LjAiIHkxPSIzNzkuOSIgeDI9Ijk2LjAiIHkyPSIzNzkuOSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI4NC4wIiB5MT0iMzgyLjQiIHgyPSI5Ni4wIiB5Mj0iMzgyLjQiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI5MC4wIiBjeT0iMzgxLjEiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iOTAuMCIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYwPC90ZXh0Pgo8dGV4dCB4PSI5MC4wIiB5PSI0NjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+YmFzZWxpbmU8L3RleHQ+CjxsaW5lIHgxPSIxNzYuNSIgeTE9IjI4MC4wIiB4Mj0iMTc2LjUiIHkyPSIyODUuNSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIxNzAuNSIgeTE9IjI4MC4wIiB4Mj0iMTgyLjUiIHkyPSIyODAuMCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIxNzAuNSIgeTE9IjI4NS41IiB4Mj0iMTgyLjUiIHkyPSIyODUuNSIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjE3Ni41IiBjeT0iMjgyLjciIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iMTc2LjUiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMTwvdGV4dD4KPHRleHQgeD0iMTc2LjUiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5kZWNvZGUgZm91bmRhdGlvbjwvdGV4dD4KPGxpbmUgeDE9IjI2My4wIiB5MT0iMjYyLjQiIHgyPSIyNjMuMCIgeTI9IjI2Ny44IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjI1Ny4wIiB5MT0iMjYyLjQiIHgyPSIyNjkuMCIgeTI9IjI2Mi40IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjI1Ny4wIiB5MT0iMjY3LjgiIHgyPSIyNjkuMCIgeTI9IjI2Ny44IiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iMjYzLjAiIGN5PSIyNjUuMSIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSIyNjMuMCIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYyPC90ZXh0Pgo8dGV4dCB4PSIyNjMuMCIgeT0iNDYyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPlNpTFUgZ3JhcGg8L3RleHQ+CjxsaW5lIHgxPSIzNDkuNSIgeTE9IjI1Ni4wIiB4Mj0iMzQ5LjUiIHkyPSIyNjEuNiIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNDMuNSIgeTE9IjI1Ni4wIiB4Mj0iMzU1LjUiIHkyPSIyNTYuMCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNDMuNSIgeTE9IjI2MS42IiB4Mj0iMzU1LjUiIHkyPSIyNjEuNiIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjM0OS41IiBjeT0iMjU4LjgiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iMzQ5LjUiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMzwvdGV4dD4KPHRleHQgeD0iMzQ5LjUiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5RS1YgZ3JhcGg8L3RleHQ+CjxsaW5lIHgxPSI0MzYuMCIgeTE9IjI2NS4xIiB4Mj0iNDM2LjAiIHkyPSIyNzEuMyIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI0MzAuMCIgeTE9IjI2NS4xIiB4Mj0iNDQyLjAiIHkyPSIyNjUuMSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI0MzAuMCIgeTE9IjI3MS4zIiB4Mj0iNDQyLjAiIHkyPSIyNzEuMyIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjQzNi4wIiBjeT0iMjY4LjIiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iNDM2LjAiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNDwvdGV4dD4KPHRleHQgeD0iNDM2LjAiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5zaGFyZWQgTEhTPC90ZXh0Pgo8bGluZSB4MT0iNTIyLjUiIHkxPSIxOTEuMyIgeDI9IjUyMi41IiB5Mj0iMTk1LjkiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNTE2LjUiIHkxPSIxOTEuMyIgeDI9IjUyOC41IiB5Mj0iMTkxLjMiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNTE2LjUiIHkxPSIxOTUuOSIgeDI9IjUyOC41IiB5Mj0iMTk1LjkiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI1MjIuNSIgY3k9IjE5My42IiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9IjUyMi41IiB5PSI0NDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+VjU8L3RleHQ+Cjx0ZXh0IHg9IjUyMi41IiB5PSI0NjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+Uk1TTm9ybSBzaGFyZDwvdGV4dD4KPGxpbmUgeDE9IjYwOS4wIiB5MT0iMTk0LjgiIHgyPSI2MDkuMCIgeTI9IjIwMC41IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjYwMy4wIiB5MT0iMTk0LjgiIHgyPSI2MTUuMCIgeTI9IjE5NC44IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjYwMy4wIiB5MT0iMjAwLjUiIHgyPSI2MTUuMCIgeTI9IjIwMC41IiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iNjA5LjAiIGN5PSIxOTcuNyIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSI2MDkuMCIgeT0iNDQzIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlY2PC90ZXh0Pgo8dGV4dCB4PSI2MDkuMCIgeT0iNDYyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPlNpTFUgbXVsdGlwbHk8L3RleHQ+CjxsaW5lIHgxPSI2OTUuNSIgeTE9IjE3Ny44IiB4Mj0iNjk1LjUiIHkyPSIxODMuOCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI2ODkuNSIgeTE9IjE3Ny44IiB4Mj0iNzAxLjUiIHkyPSIxNzcuOCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI2ODkuNSIgeTE9IjE4My44IiB4Mj0iNzAxLjUiIHkyPSIxODMuOCIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjY5NS41IiBjeT0iMTgwLjgiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iNjk1LjUiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNzwvdGV4dD4KPHRleHQgeD0iNjk1LjUiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5Ec3QgU3dpR0xVPC90ZXh0Pgo8bGluZSB4MT0iNzgyLjAiIHkxPSIxNzkuNCIgeDI9Ijc4Mi4wIiB5Mj0iMTg0LjciIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNzc2LjAiIHkxPSIxNzkuNCIgeDI9Ijc4OC4wIiB5Mj0iMTc5LjQiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNzc2LjAiIHkxPSIxODQuNyIgeDI9Ijc4OC4wIiB5Mj0iMTg0LjciIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI3ODIuMCIgY3k9IjE4Mi4wIiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9Ijc4Mi4wIiB5PSI0NDMiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+Vjg8L3RleHQ+Cjx0ZXh0IHg9Ijc4Mi4wIiB5PSI0NjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+b25lIHBhdGg8L3RleHQ+CjxsaW5lIHgxPSI4NjguNSIgeTE9IjExMy4zIiB4Mj0iODY4LjUiIHkyPSIxMjAuOSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI4NjIuNSIgeTE9IjExMy4zIiB4Mj0iODc0LjUiIHkyPSIxMTMuMyIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI4NjIuNSIgeTE9IjEyMC45IiB4Mj0iODc0LjUiIHkyPSIxMjAuOSIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9Ijg2OC41IiBjeT0iMTE3LjEiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iODY4LjUiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WOTwvdGV4dD4KPHRleHQgeD0iODY4LjUiIHk9IjQ2MiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5wcmVmaWxsIHRyYWNlPC90ZXh0Pgo8bGluZSB4MT0iOTU1LjAiIHkxPSI3My45IiB4Mj0iOTU1LjAiIHkyPSI4MC4xIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijk0OS4wIiB5MT0iNzMuOSIgeDI9Ijk2MS4wIiB5Mj0iNzMuOSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI5NDkuMCIgeTE9IjgwLjEiIHgyPSI5NjEuMCIgeTI9IjgwLjEiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI5NTUuMCIgY3k9Ijc3LjAiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iOTU1LjAiIHk9IjQ0MyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMTA8L3RleHQ+Cjx0ZXh0IHg9Ijk1NS4wIiB5PSI0NjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+TUxQIGtlcm5lbHM8L3RleHQ+Cjx0ZXh0IHRyYW5zZm9ybT0idHJhbnNsYXRlKDIzIDIyNy41KSByb3RhdGUoLTkwKSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj50b2tlbnMvcyAobWVhbiBhbmQgOTUlIHQgaW50ZXJ2YWwpPC90ZXh0Pgo8dGV4dCB4PSI5MCIgeT0iNTA1IiBjbGFzcz0ic21hbGwiPjMyIHJldGFpbmVkIHJlcXVlc3RzIHBlciBzdGFnZTsgdHdvIGNvbXBpbGUvd2FybS11cCByZXF1ZXN0cyBleGNsdWRlZDsgVjEwIHVzZXMgdGhlIHN0cmVhbWluZyBFMkUgY2xvY2suPC90ZXh0Pgo8L3N2Zz4K" id="fig:throughput" style="width:100.0%" alt /><figcaption>Cumulative throughput across the measured concepts.</figcaption>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTIwIiB2aWV3Qm94PSIwIDAgOTgwIDUyMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxfS5ncmlke3N0cm9rZTojZDBkMGQwO3N0cm9rZS13aWR0aDoxfS5saW5le2ZpbGw6bm9uZTtzdHJva2U6IzExMTtzdHJva2Utd2lkdGg6M30uY2l7c3Ryb2tlOiM2NjY7c3Ryb2tlLXdpZHRoOjJ9LmRvdHtmaWxsOiMxMTE7c3Ryb2tlOndoaXRlO3N0cm9rZS13aWR0aDoxLjV9LmxhYmVse2ZvbnQtc2l6ZToxNHB4fS5zbWFsbHtmb250LXNpemU6MTJweDtmaWxsOiM0NDR9LnRpdGxle2ZvbnQtc2l6ZToyMXB4O2ZvbnQtd2VpZ2h0OjcwMH08L3N0eWxlPgo8dGV4dCB4PSI5MCIgeT0iMjciIGNsYXNzPSJ0aXRsZSI+UXdlbjMtOEIgZW5kLXRvLWVuZCBnZW5lcmF0aW9uIHRocm91Z2hwdXQ8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjQxNS4wIiB4Mj0iOTU1IiB5Mj0iNDE1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSI0MjAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xNTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzg4LjIiIHgyPSI5NTUiIHkyPSIzODguMiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM5My4yIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE2PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIzNjEuNCIgeDI9Ijk1NSIgeTI9IjM2MS40IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMzY2LjQiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MTc8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjMzNC42IiB4Mj0iOTU1IiB5Mj0iMzM0LjYiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIzMzkuNiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4xODwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzA3LjkiIHgyPSI5NTUiIHkyPSIzMDcuOSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjMxMi45IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE5PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIyODEuMSIgeDI9Ijk1NSIgeTI9IjI4MS4xIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMjg2LjEiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjA8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjI1NC4zIiB4Mj0iOTU1IiB5Mj0iMjU0LjMiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIyNTkuMyIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjI3LjUiIHgyPSI5NTUiIHkyPSIyMjcuNSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjIzMi41IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjIyPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIyMDAuNyIgeDI9Ijk1NSIgeTI9IjIwMC43IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMjA1LjciIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjM8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjE3My45IiB4Mj0iOTU1IiB5Mj0iMTczLjkiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxNzguOSIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNDwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMTQ3LjEiIHgyPSI5NTUiIHkyPSIxNDcuMSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjE1Mi4xIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI1PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIxMjAuNCIgeDI9Ijk1NSIgeTI9IjEyMC40IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMTI1LjQiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MjY8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjkzLjYiIHgyPSI5NTUiIHkyPSI5My42IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iOTguNiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNzwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iNjYuOCIgeDI9Ijk1NSIgeTI9IjY2LjgiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSI3MS44IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI4PC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSI0MC4wIiB4Mj0iOTU1IiB5Mj0iNDAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjQ1LjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+Mjk8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjQwIiB4Mj0iOTAiIHkyPSI0MTUiIGNsYXNzPSJheGlzIi8+CjxsaW5lIHgxPSI5MCIgeTE9IjQxNSIgeDI9Ijk1NSIgeTI9IjQxNSIgY2xhc3M9ImF4aXMiLz4KPHBvbHlsaW5lIHBvaW50cz0iOTAuMCwzODEuMSAxNzYuNSwyODIuNyAyNjMuMCwyNjUuMSAzNDkuNSwyNTguOCA0MzYuMCwyNjguMiA1MjIuNSwxOTMuNiA2MDkuMCwxOTcuNyA2OTUuNSwxODAuOCA3ODIuMCwxODIuMCA4NjguNSwxMTcuMSA5NTUuMCw3Ny4wIiBjbGFzcz0ibGluZSIvPgo8bGluZSB4MT0iOTAuMCIgeTE9IjM3OS45IiB4Mj0iOTAuMCIgeTI9IjM4Mi40IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijg0LjAiIHkxPSIzNzkuOSIgeDI9Ijk2LjAiIHkyPSIzNzkuOSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI4NC4wIiB5MT0iMzgyLjQiIHgyPSI5Ni4wIiB5Mj0iMzgyLjQiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI5MC4wIiBjeT0iMzgxLjEiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iOTAuMCIgeT0iNDQ2IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPmJhc2VsaW5lPC90ZXh0Pgo8bGluZSB4MT0iMTc2LjUiIHkxPSIyODAuMCIgeDI9IjE3Ni41IiB5Mj0iMjg1LjUiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMTcwLjUiIHkxPSIyODAuMCIgeDI9IjE4Mi41IiB5Mj0iMjgwLjAiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMTcwLjUiIHkxPSIyODUuNSIgeDI9IjE4Mi41IiB5Mj0iMjg1LjUiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSIxNzYuNSIgY3k9IjI4Mi43IiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9IjE3Ni41IiB5PSI0NDYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+Y29tcGlsZXI8L3RleHQ+CjxsaW5lIHgxPSIyNjMuMCIgeTE9IjI2Mi40IiB4Mj0iMjYzLjAiIHkyPSIyNjcuOCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIyNTcuMCIgeTE9IjI2Mi40IiB4Mj0iMjY5LjAiIHkyPSIyNjIuNCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIyNTcuMCIgeTE9IjI2Ny44IiB4Mj0iMjY5LjAiIHkyPSIyNjcuOCIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjI2My4wIiBjeT0iMjY1LjEiIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iMjYzLjAiIHk9IjQ0NiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5TaUxVIGdyYXBoPC90ZXh0Pgo8bGluZSB4MT0iMzQ5LjUiIHkxPSIyNTYuMCIgeDI9IjM0OS41IiB5Mj0iMjYxLjYiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMzQzLjUiIHkxPSIyNTYuMCIgeDI9IjM1NS41IiB5Mj0iMjU2LjAiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMzQzLjUiIHkxPSIyNjEuNiIgeDI9IjM1NS41IiB5Mj0iMjYxLjYiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSIzNDkuNSIgY3k9IjI1OC44IiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9IjM0OS41IiB5PSI0NDYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+UUtWIGdyYXBoPC90ZXh0Pgo8bGluZSB4MT0iNDM2LjAiIHkxPSIyNjUuMSIgeDI9IjQzNi4wIiB5Mj0iMjcxLjMiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNDMwLjAiIHkxPSIyNjUuMSIgeDI9IjQ0Mi4wIiB5Mj0iMjY1LjEiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNDMwLjAiIHkxPSIyNzEuMyIgeDI9IjQ0Mi4wIiB5Mj0iMjcxLjMiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI0MzYuMCIgY3k9IjI2OC4yIiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9IjQzNi4wIiB5PSI0NDYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+c2hhcmVkIExIUzwvdGV4dD4KPGxpbmUgeDE9IjUyMi41IiB5MT0iMTkxLjMiIHgyPSI1MjIuNSIgeTI9IjE5NS45IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjUxNi41IiB5MT0iMTkxLjMiIHgyPSI1MjguNSIgeTI9IjE5MS4zIiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjUxNi41IiB5MT0iMTk1LjkiIHgyPSI1MjguNSIgeTI9IjE5NS45IiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iNTIyLjUiIGN5PSIxOTMuNiIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSI1MjIuNSIgeT0iNDQ2IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPlJNU05vcm0gc2hhcmQ8L3RleHQ+CjxsaW5lIHgxPSI2MDkuMCIgeTE9IjE5NC44IiB4Mj0iNjA5LjAiIHkyPSIyMDAuNSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI2MDMuMCIgeTE9IjE5NC44IiB4Mj0iNjE1LjAiIHkyPSIxOTQuOCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI2MDMuMCIgeTE9IjIwMC41IiB4Mj0iNjE1LjAiIHkyPSIyMDAuNSIgY2xhc3M9ImNpIi8+CjxjaXJjbGUgY3g9IjYwOS4wIiBjeT0iMTk3LjciIHI9IjciIGNsYXNzPSJkb3QiLz4KPHRleHQgeD0iNjA5LjAiIHk9IjQ0NiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5TaUxVIG11bHRpcGx5PC90ZXh0Pgo8bGluZSB4MT0iNjk1LjUiIHkxPSIxNzcuOCIgeDI9IjY5NS41IiB5Mj0iMTgzLjgiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNjg5LjUiIHkxPSIxNzcuOCIgeDI9IjcwMS41IiB5Mj0iMTc3LjgiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNjg5LjUiIHkxPSIxODMuOCIgeDI9IjcwMS41IiB5Mj0iMTgzLjgiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI2OTUuNSIgY3k9IjE4MC44IiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9IjY5NS41IiB5PSI0NDYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+RHN0IFN3aUdMVTwvdGV4dD4KPGxpbmUgeDE9Ijc4Mi4wIiB5MT0iMTc5LjQiIHgyPSI3ODIuMCIgeTI9IjE4NC43IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijc3Ni4wIiB5MT0iMTc5LjQiIHgyPSI3ODguMCIgeTI9IjE3OS40IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9Ijc3Ni4wIiB5MT0iMTg0LjciIHgyPSI3ODguMCIgeTI9IjE4NC43IiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iNzgyLjAiIGN5PSIxODIuMCIgcj0iNyIgY2xhc3M9ImRvdCIvPgo8dGV4dCB4PSI3ODIuMCIgeT0iNDQ2IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPm9uZSBwYXRoPC90ZXh0Pgo8bGluZSB4MT0iODY4LjUiIHkxPSIxMTMuMyIgeDI9Ijg2OC41IiB5Mj0iMTIwLjkiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iODYyLjUiIHkxPSIxMTMuMyIgeDI9Ijg3NC41IiB5Mj0iMTEzLjMiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iODYyLjUiIHkxPSIxMjAuOSIgeDI9Ijg3NC41IiB5Mj0iMTIwLjkiIGNsYXNzPSJjaSIvPgo8Y2lyY2xlIGN4PSI4NjguNSIgY3k9IjExNy4xIiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9Ijg2OC41IiB5PSI0NDYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+cHJlZmlsbCB0cmFjZTwvdGV4dD4KPGxpbmUgeDE9Ijk1NS4wIiB5MT0iNzMuOSIgeDI9Ijk1NS4wIiB5Mj0iODAuMSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI5NDkuMCIgeTE9IjczLjkiIHgyPSI5NjEuMCIgeTI9IjczLjkiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iOTQ5LjAiIHkxPSI4MC4xIiB4Mj0iOTYxLjAiIHkyPSI4MC4xIiBjbGFzcz0iY2kiLz4KPGNpcmNsZSBjeD0iOTU1LjAiIGN5PSI3Ny4wIiByPSI3IiBjbGFzcz0iZG90Ii8+Cjx0ZXh0IHg9Ijk1NS4wIiB5PSI0NDYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+TUxQIGtlcm5lbHM8L3RleHQ+Cjx0ZXh0IHRyYW5zZm9ybT0idHJhbnNsYXRlKDIzIDIyNy41KSByb3RhdGUoLTkwKSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj50b2tlbnMvcyAobWVhbiBhbmQgOTUlIHQgaW50ZXJ2YWwpPC90ZXh0Pgo8dGV4dCB4PSI5MCIgeT0iNTA1IiBjbGFzcz0ic21hbGwiPjMyIHJldGFpbmVkIHJlcXVlc3RzIHBlciBjb25maWd1cmF0aW9uOyB0d28gY29tcGlsZS93YXJtLXVwIHJlcXVlc3RzIGV4Y2x1ZGVkOyB0aGUgZmluYWwgcG9pbnQgdXNlcyB0aGUgc3RyZWFtaW5nIEUyRSBjbG9jay48L3RleHQ+Cjwvc3ZnPgo=" id="fig:throughput" style="width:100.0%" alt /><figcaption>Cumulative throughput across the measured feature sets.</figcaption>
 </figure>
 <figure>
-<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTAwIiB2aWV3Qm94PSIwIDAgOTgwIDUwMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkMGQwZDA7c3Ryb2tlLXdpZHRoOjF9LnBvc3tmaWxsOiMzMzN9Lm5lZ3tmaWxsOiNhYWF9LmxhYmVse2ZvbnQtc2l6ZToxNHB4fS5zbWFsbHtmb250LXNpemU6MTJweDtmaWxsOiM0NDR9LnZhbHVle2ZvbnQtc2l6ZToxM3B4O2ZvbnQtd2VpZ2h0OjcwMH0udGl0bGV7Zm9udC1zaXplOjIxcHg7Zm9udC13ZWlnaHQ6NzAwfTwvc3R5bGU+Cjx0ZXh0IHg9IjkwIiB5PSIyOSIgY2xhc3M9InRpdGxlIj5JbmNyZW1lbnRhbCB0aHJvdWdocHV0IGNoYW5nZTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzg2LjkiIHgyPSI5NTUiIHkyPSIzODYuOSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM5MS45IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPi0yJTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzYwLjYiIHgyPSI5NTUiIHkyPSIzNjAuNiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM2NS42IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjAlPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIzMDguMCIgeDI9Ijk1NSIgeTI9IjMwOC4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMzEzLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+NCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjI1NS40IiB4Mj0iOTU1IiB5Mj0iMjU1LjQiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIyNjAuNCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj44JTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjAyLjgiIHgyPSI5NTUiIHkyPSIyMDIuOCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjIwNy44IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjEyJTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMTUwLjIiIHgyPSI5NTUiIHkyPSIxNTAuMiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjE1NS4yIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE2JTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iOTcuNiIgeDI9Ijk1NSIgeTI9Ijk3LjYiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxMDIuNiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjQ1LjAiIHgyPSI5NTUiIHkyPSI0NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iNTAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjM2MC42IiB4Mj0iOTU1IiB5Mj0iMzYwLjYiIGNsYXNzPSJheGlzIi8+CjxyZWN0IHg9IjEwNS42IiB5PSI2My42IiB3aWR0aD0iNTUuNCIgaGVpZ2h0PSIyOTYuOSIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iMTMzLjIiIHk9IjU1LjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzIyLjU4JTwvdGV4dD4KPHRleHQgeD0iMTMzLjIiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMTwvdGV4dD4KPHRleHQgeD0iMTMzLjIiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5kZWNvZGUgZm91bmRhdGlvbjwvdGV4dD4KPHJlY3QgeD0iMTkyLjEiIHk9IjMxNy4yIiB3aWR0aD0iNTUuNCIgaGVpZ2h0PSI0My40IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSIyMTkuOCIgeT0iMzA5LjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzMuMzAlPC90ZXh0Pgo8dGV4dCB4PSIyMTkuOCIgeT0iNDI5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlYyPC90ZXh0Pgo8dGV4dCB4PSIyMTkuOCIgeT0iNDQ4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPlNpTFUgZ3JhcGg8L3RleHQ+CjxyZWN0IHg9IjI3OC42IiB5PSIzNDUuNSIgd2lkdGg9IjU1LjQiIGhlaWdodD0iMTUuMSIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iMzA2LjIiIHk9IjMzNy41IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPisxLjE1JTwvdGV4dD4KPHRleHQgeD0iMzA2LjIiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMzwvdGV4dD4KPHRleHQgeD0iMzA2LjIiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5RS1YgZ3JhcGg8L3RleHQ+CjxyZWN0IHg9IjM2NS4xIiB5PSIzNjAuNiIgd2lkdGg9IjU1LjQiIGhlaWdodD0iMjIuMyIgcng9IjMiIGNsYXNzPSJuZWciLz4KPHRleHQgeD0iMzkyLjgiIHk9IjQwMC44IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPi0xLjY5JTwvdGV4dD4KPHRleHQgeD0iMzkyLjgiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNDwvdGV4dD4KPHRleHQgeD0iMzkyLjgiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5zaGFyZWQgTEhTPC90ZXh0Pgo8cmVjdCB4PSI0NTEuNiIgeT0iMTgxLjYiIHdpZHRoPSI1NS40IiBoZWlnaHQ9IjE3OC45IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSI0NzkuMiIgeT0iMTczLjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzEzLjYxJTwvdGV4dD4KPHRleHQgeD0iNDc5LjIiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNTwvdGV4dD4KPHRleHQgeD0iNDc5LjIiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5STVNOb3JtIHNoYXJkPC90ZXh0Pgo8cmVjdCB4PSI1MzguMSIgeT0iMzYwLjYiIHdpZHRoPSI1NS40IiBoZWlnaHQ9IjguNiIgcng9IjMiIGNsYXNzPSJuZWciLz4KPHRleHQgeD0iNTY1LjgiIHk9IjM4Ny4xIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPi0wLjY1JTwvdGV4dD4KPHRleHQgeD0iNTY1LjgiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WNjwvdGV4dD4KPHRleHQgeD0iNTY1LjgiIHk9IjQ0OCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5TaUxVIG11bHRpcGx5PC90ZXh0Pgo8cmVjdCB4PSI2MjQuNiIgeT0iMzI0LjciIHdpZHRoPSI1NS40IiBoZWlnaHQ9IjM1LjkiIHJ4PSIzIiBjbGFzcz0icG9zIi8+Cjx0ZXh0IHg9IjY1Mi4yIiB5PSIzMTYuNyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4rMi43MyU8L3RleHQ+Cjx0ZXh0IHg9IjY1Mi4yIiB5PSI0MjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+Vjc8L3RleHQ+Cjx0ZXh0IHg9IjY1Mi4yIiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+RHN0IFN3aUdMVTwvdGV4dD4KPHJlY3QgeD0iNzExLjEiIHk9IjM2MC42IiB3aWR0aD0iNTUuNCIgaGVpZ2h0PSIyLjUiIHJ4PSIzIiBjbGFzcz0ibmVnIi8+Cjx0ZXh0IHg9IjczOC44IiB5PSIzODEuMSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4tMC4xOSU8L3RleHQ+Cjx0ZXh0IHg9IjczOC44IiB5PSI0MjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+Vjg8L3RleHQ+Cjx0ZXh0IHg9IjczOC44IiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+b25lIHBhdGg8L3RleHQ+CjxyZWN0IHg9Ijc5Ny42IiB5PSIyMjYuMCIgd2lkdGg9IjU1LjQiIGhlaWdodD0iMTM0LjUiIHJ4PSIzIiBjbGFzcz0icG9zIi8+Cjx0ZXh0IHg9IjgyNS4yIiB5PSIyMTguMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4rMTAuMjMlPC90ZXh0Pgo8dGV4dCB4PSI4MjUuMiIgeT0iNDI5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPlY5PC90ZXh0Pgo8dGV4dCB4PSI4MjUuMiIgeT0iNDQ4IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPnByZWZpbGwgdHJhY2U8L3RleHQ+CjxyZWN0IHg9Ijg4NC4xIiB5PSIyODUuMyIgd2lkdGg9IjU1LjQiIGhlaWdodD0iNzUuMyIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iOTExLjgiIHk9IjI3Ny4zIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPis1LjczJTwvdGV4dD4KPHRleHQgeD0iOTExLjgiIHk9IjQyOSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj5WMTA8L3RleHQ+Cjx0ZXh0IHg9IjkxMS44IiB5PSI0NDgiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+TUxQIGtlcm5lbHM8L3RleHQ+Cjx0ZXh0IHRyYW5zZm9ybT0idHJhbnNsYXRlKDIzIDIyMi41KSByb3RhdGUoLTkwKSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj50aHJvdWdocHV0IGNoYW5nZSB2cy4gcHJlY2VkaW5nIHN0YWdlPC90ZXh0Pgo8dGV4dCB4PSI5MCIgeT0iNDgyIiBjbGFzcz0ic21hbGwiPkJhcnMgc2hvdyB0aGUgbWVhc3VyZWQgdGhyb3VnaHB1dCBjaGFuZ2UgZnJvbSB0aGUgcHJlY2VkaW5nIHN0YWdlLjwvdGV4dD4KPC9zdmc+Cg==" id="fig:incremental" style="width:100.0%" alt /><figcaption>Incremental effect of each concept in the optimization sequence.</figcaption>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTAwIiB2aWV3Qm94PSIwIDAgOTgwIDUwMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkMGQwZDA7c3Ryb2tlLXdpZHRoOjF9LnBvc3tmaWxsOiMzMzN9Lm5lZ3tmaWxsOiNhYWF9LmxhYmVse2ZvbnQtc2l6ZToxNHB4fS5zbWFsbHtmb250LXNpemU6MTJweDtmaWxsOiM0NDR9LnZhbHVle2ZvbnQtc2l6ZToxM3B4O2ZvbnQtd2VpZ2h0OjcwMH0udGl0bGV7Zm9udC1zaXplOjIxcHg7Zm9udC13ZWlnaHQ6NzAwfTwvc3R5bGU+Cjx0ZXh0IHg9IjkwIiB5PSIyOSIgY2xhc3M9InRpdGxlIj5JbmNyZW1lbnRhbCB0aHJvdWdocHV0IGNoYW5nZTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzg2LjkiIHgyPSI5NTUiIHkyPSIzODYuOSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM5MS45IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPi0yJTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMzYwLjYiIHgyPSI5NTUiIHkyPSIzNjAuNiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjM2NS42IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjAlPC90ZXh0Pgo8bGluZSB4MT0iOTAiIHkxPSIzMDguMCIgeDI9Ijk1NSIgeTI9IjMwOC4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iMzEzLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+NCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjI1NS40IiB4Mj0iOTU1IiB5Mj0iMjU1LjQiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIyNjAuNCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj44JTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMjAyLjgiIHgyPSI5NTUiIHkyPSIyMDIuOCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjIwNy44IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjEyJTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iMTUwLjIiIHgyPSI5NTUiIHkyPSIxNTAuMiIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNzgiIHk9IjE1NS4yIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE2JTwvdGV4dD4KPGxpbmUgeDE9IjkwIiB5MT0iOTcuNiIgeDI9Ijk1NSIgeTI9Ijk3LjYiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc4IiB5PSIxMDIuNiIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yMCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjQ1LjAiIHgyPSI5NTUiIHkyPSI0NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI3OCIgeT0iNTAuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj4yNCU8L3RleHQ+CjxsaW5lIHgxPSI5MCIgeTE9IjM2MC42IiB4Mj0iOTU1IiB5Mj0iMzYwLjYiIGNsYXNzPSJheGlzIi8+CjxyZWN0IHg9IjEwNS42IiB5PSI2My42IiB3aWR0aD0iNTUuNCIgaGVpZ2h0PSIyOTYuOSIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iMTMzLjIiIHk9IjU1LjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzIyLjU4JTwvdGV4dD4KPHRleHQgeD0iMTMzLjIiIHk9IjQzMSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5jb21waWxlcjwvdGV4dD4KPHJlY3QgeD0iMTkyLjEiIHk9IjMxNy4yIiB3aWR0aD0iNTUuNCIgaGVpZ2h0PSI0My40IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSIyMTkuOCIgeT0iMzA5LjIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzMuMzAlPC90ZXh0Pgo8dGV4dCB4PSIyMTkuOCIgeT0iNDMxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPlNpTFUgZ3JhcGg8L3RleHQ+CjxyZWN0IHg9IjI3OC42IiB5PSIzNDUuNSIgd2lkdGg9IjU1LjQiIGhlaWdodD0iMTUuMSIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iMzA2LjIiIHk9IjMzNy41IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPisxLjE1JTwvdGV4dD4KPHRleHQgeD0iMzA2LjIiIHk9IjQzMSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5RS1YgZ3JhcGg8L3RleHQ+CjxyZWN0IHg9IjM2NS4xIiB5PSIzNjAuNiIgd2lkdGg9IjU1LjQiIGhlaWdodD0iMjIuMyIgcng9IjMiIGNsYXNzPSJuZWciLz4KPHRleHQgeD0iMzkyLjgiIHk9IjQwMC44IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPi0xLjY5JTwvdGV4dD4KPHRleHQgeD0iMzkyLjgiIHk9IjQzMSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5zaGFyZWQgTEhTPC90ZXh0Pgo8cmVjdCB4PSI0NTEuNiIgeT0iMTgxLjYiIHdpZHRoPSI1NS40IiBoZWlnaHQ9IjE3OC45IiByeD0iMyIgY2xhc3M9InBvcyIvPgo8dGV4dCB4PSI0NzkuMiIgeT0iMTczLjYiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJ2YWx1ZSI+KzEzLjYxJTwvdGV4dD4KPHRleHQgeD0iNDc5LjIiIHk9IjQzMSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5STVNOb3JtIHNoYXJkPC90ZXh0Pgo8cmVjdCB4PSI1MzguMSIgeT0iMzYwLjYiIHdpZHRoPSI1NS40IiBoZWlnaHQ9IjguNiIgcng9IjMiIGNsYXNzPSJuZWciLz4KPHRleHQgeD0iNTY1LjgiIHk9IjM4Ny4xIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPi0wLjY1JTwvdGV4dD4KPHRleHQgeD0iNTY1LjgiIHk9IjQzMSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5TaUxVIG11bHRpcGx5PC90ZXh0Pgo8cmVjdCB4PSI2MjQuNiIgeT0iMzI0LjciIHdpZHRoPSI1NS40IiBoZWlnaHQ9IjM1LjkiIHJ4PSIzIiBjbGFzcz0icG9zIi8+Cjx0ZXh0IHg9IjY1Mi4yIiB5PSIzMTYuNyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4rMi43MyU8L3RleHQ+Cjx0ZXh0IHg9IjY1Mi4yIiB5PSI0MzEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+RHN0IFN3aUdMVTwvdGV4dD4KPHJlY3QgeD0iNzExLjEiIHk9IjM2MC42IiB3aWR0aD0iNTUuNCIgaGVpZ2h0PSIyLjUiIHJ4PSIzIiBjbGFzcz0ibmVnIi8+Cjx0ZXh0IHg9IjczOC44IiB5PSIzODEuMSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4tMC4xOSU8L3RleHQ+Cjx0ZXh0IHg9IjczOC44IiB5PSI0MzEiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJzbWFsbCI+b25lIHBhdGg8L3RleHQ+CjxyZWN0IHg9Ijc5Ny42IiB5PSIyMjYuMCIgd2lkdGg9IjU1LjQiIGhlaWdodD0iMTM0LjUiIHJ4PSIzIiBjbGFzcz0icG9zIi8+Cjx0ZXh0IHg9IjgyNS4yIiB5PSIyMTguMCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4rMTAuMjMlPC90ZXh0Pgo8dGV4dCB4PSI4MjUuMiIgeT0iNDMxIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ic21hbGwiPnByZWZpbGwgdHJhY2U8L3RleHQ+CjxyZWN0IHg9Ijg4NC4xIiB5PSIyODUuMyIgd2lkdGg9IjU1LjQiIGhlaWdodD0iNzUuMyIgcng9IjMiIGNsYXNzPSJwb3MiLz4KPHRleHQgeD0iOTExLjgiIHk9IjI3Ny4zIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPis1LjczJTwvdGV4dD4KPHRleHQgeD0iOTExLjgiIHk9IjQzMSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InNtYWxsIj5NTFAga2VybmVsczwvdGV4dD4KPHRleHQgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoMjMgMjIyLjUpIHJvdGF0ZSgtOTApIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPnRocm91Z2hwdXQgY2hhbmdlIHZzLiBwcmVjZWRpbmcgY29uZmlndXJhdGlvbjwvdGV4dD4KPHRleHQgeD0iOTAiIHk9IjQ4MiIgY2xhc3M9InNtYWxsIj5CYXJzIHNob3cgdGhlIG1lYXN1cmVkIHRocm91Z2hwdXQgY2hhbmdlIGZyb20gdGhlIHByZWNlZGluZyBjb25maWd1cmF0aW9uLjwvdGV4dD4KPC9zdmc+Cg==" id="fig:incremental" style="width:100.0%" alt /><figcaption>Incremental effect of each feature in the optimization sequence.</figcaption>
 </figure>
 <p>The negative and near-zero rows explain the final design: shared-LHS fusion materializes too much data, consumer-side SiLU leaves the producer boundary, and fallback removal changes coverage rather than the kernel.</p>
-<p>V0 through V9 use the server-reported request latency from the README benchmark. V10 uses the loopback streaming end-to-end clock needed for the kernel A/B and external-server comparison. The clocks have the same request scope but are collected independently, so the V10 incremental value is the change between stage means, not the isolated kernel effect.</p>
-<h2 data-number="6.2" id="decomposing-the-foundation"><span class="header-section-number">6.2</span> Decomposing the foundation</h2>
-<p>We repeated the V0/V1 comparison and built six leave-one-concept-out variants from the V1 foundation. The full foundation and functional baseline each have two separate 32-request windows, for 64 retained requests each. Every omission has 32 retained requests. All builds keep the NoC public-include patch because it only fixes the build.</p>
-<table style="width:100%;">
-<caption>Fresh foundation decomposition. Change versus full is the throughput change when the concept is omitted. Marginal speedup is full divided by the omission. Gain share is the omitted throughput loss divided by the total 3.854-token/s foundation gain; it is descriptive and non-additive.</caption>
-<colgroup>
-<col style="width: 13%"></col>
-<col style="width: 13%"></col>
-<col style="width: 13%"></col>
-<col style="width: 18%"></col>
-<col style="width: 13%"></col>
-<col style="width: 13%"></col>
-<col style="width: 13%"></col>
-</colgroup>
-<thead>
-<tr class="header">
-<th style="text-align: left;">Configuration</th>
-<th style="text-align: right;">N</th>
-<th style="text-align: right;">Mean ± SD (tok/s)</th>
-<th style="text-align: center;">95% CI</th>
-<th style="text-align: right;">Change vs. full</th>
-<th style="text-align: right;">Marginal speedup</th>
-<th style="text-align: right;">Gain share</th>
-</tr>
-</thead>
-<tbody>
-<tr class="odd">
-<td style="text-align: left;">Functional baseline</td>
-<td style="text-align: right;">64</td>
-<td style="text-align: right;">16.039 ± 0.177</td>
-<td style="text-align: center;">[15.995, 16.084]</td>
-<td style="text-align: right;">-19.37%</td>
-<td style="text-align: right;">+24.03%</td>
-<td style="text-align: right;">100.0%</td>
-</tr>
-<tr class="even">
-<td style="text-align: left;">Full foundation</td>
-<td style="text-align: right;">64</td>
-<td style="text-align: right;">19.894 ± 0.265</td>
-<td style="text-align: center;">[19.827, 19.960]</td>
-<td style="text-align: right;">—</td>
-<td style="text-align: right;">—</td>
-<td style="text-align: right;">—</td>
-</tr>
-<tr class="odd">
-<td style="text-align: left;">Without JAX RMSNorm recognition</td>
-<td style="text-align: right;">32</td>
-<td style="text-align: right;">16.678 ± 0.164</td>
-<td style="text-align: center;">[16.619, 16.737]</td>
-<td style="text-align: right;">-16.16%</td>
-<td style="text-align: right;">+19.28%</td>
-<td style="text-align: right;">83.4%</td>
-</tr>
-<tr class="even">
-<td style="text-align: left;">Without rank-3 decode RoPE fusion</td>
-<td style="text-align: right;">32</td>
-<td style="text-align: right;">19.335 ± 0.259</td>
-<td style="text-align: center;">[19.242, 19.429]</td>
-<td style="text-align: right;">-2.81%</td>
-<td style="text-align: right;">+2.89%</td>
-<td style="text-align: right;">14.5%</td>
-</tr>
-<tr class="odd">
-<td style="text-align: left;">Without KV-cache result typing</td>
-<td style="text-align: right;">32</td>
-<td style="text-align: right;">19.786 ± 0.289</td>
-<td style="text-align: center;">[19.682, 19.890]</td>
-<td style="text-align: right;">-0.54%</td>
-<td style="text-align: right;">+0.54%</td>
-<td style="text-align: right;">2.8%</td>
-</tr>
-<tr class="even">
-<td style="text-align: left;">Without BF8 activation lowering</td>
-<td style="text-align: right;">32</td>
-<td style="text-align: right;">19.843 ± 0.255</td>
-<td style="text-align: center;">[19.751, 19.935]</td>
-<td style="text-align: right;">-0.25%</td>
-<td style="text-align: right;">+0.26%</td>
-<td style="text-align: right;">1.3%</td>
-</tr>
-<tr class="odd">
-<td style="text-align: left;">Without SiLU call lowering</td>
-<td style="text-align: right;">32</td>
-<td style="text-align: right;">19.983 ± 0.292</td>
-<td style="text-align: center;">[19.878, 20.088]</td>
-<td style="text-align: right;">+0.45%</td>
-<td style="text-align: right;">-0.45%</td>
-<td style="text-align: right;">-2.3%</td>
-</tr>
-<tr class="even">
-<td style="text-align: left;">Without decode layout admission</td>
-<td style="text-align: right;">32</td>
-<td style="text-align: right;">20.024 ± 0.234</td>
-<td style="text-align: center;">[19.940, 20.108]</td>
-<td style="text-align: right;">+0.66%</td>
-<td style="text-align: right;">-0.65%</td>
-<td style="text-align: right;">-3.4%</td>
-</tr>
-</tbody>
-</table>
-<figure>
-<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTAwIiB2aWV3Qm94PSIwIDAgOTgwIDUwMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkMGQwZDA7c3Ryb2tlLXdpZHRoOjF9Lmxvc3N7ZmlsbDojNDQ0fS5nYWlue2ZpbGw6I2FhYX0ubGFiZWx7Zm9udC1zaXplOjE0cHh9LnNtYWxse2ZvbnQtc2l6ZToxMnB4O2ZpbGw6IzQ0NH0udmFsdWV7Zm9udC1zaXplOjEzcHg7Zm9udC13ZWlnaHQ6NzAwfS5pbnZlcnNle2ZpbGw6I2ZmZn0udGl0bGV7Zm9udC1zaXplOjIxcHg7Zm9udC13ZWlnaHQ6NzAwfTwvc3R5bGU+Cjx0ZXh0IHg9IjQwIiB5PSIzMSIgY2xhc3M9InRpdGxlIj5Gb3VuZGF0aW9uIGNvbmNlcHQgbGVhdmUtb25lLW91dCByZXN1bHRzPC90ZXh0Pgo8bGluZSB4MT0iMzQzLjIiIHkxPSI1NSIgeDI9IjM0My4yIiB5Mj0iNDQ1IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSIzNDMuMiIgeT0iNDY5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPi0xNiU8L3RleHQ+CjxsaW5lIHgxPSI0NzUuOCIgeTE9IjU1IiB4Mj0iNDc1LjgiIHkyPSI0NDUiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9IjQ3NS44IiB5PSI0NjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+LTEyJTwvdGV4dD4KPGxpbmUgeDE9IjYwOC40IiB5MT0iNTUiIHgyPSI2MDguNCIgeTI9IjQ0NSIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iNjA4LjQiIHk9IjQ2OSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9ImxhYmVsIj4tOCU8L3RleHQ+CjxsaW5lIHgxPSI3NDEuMSIgeTE9IjU1IiB4Mj0iNzQxLjEiIHkyPSI0NDUiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijc0MS4xIiB5PSI0NjkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+LTQlPC90ZXh0Pgo8bGluZSB4MT0iODczLjciIHkxPSI1NSIgeDI9Ijg3My43IiB5Mj0iNDQ1IiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI4NzMuNyIgeT0iNDY5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPjAlPC90ZXh0Pgo8bGluZSB4MT0iODczLjciIHkxPSI1NSIgeDI9Ijg3My43IiB5Mj0iNDQ1IiBjbGFzcz0iYXhpcyIvPgo8dGV4dCB4PSIyOTUiIHk9Ijk0LjUiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+SkFYIFJNU05vcm0gcmVjb2duaXRpb248L3RleHQ+CjxyZWN0IHg9IjMzNy43IiB5PSI2OC4wIiB3aWR0aD0iNTM2LjAiIGhlaWdodD0iMzkuMCIgcng9IjMiIGNsYXNzPSJsb3NzIi8+Cjx0ZXh0IHg9IjM0NS43IiB5PSI5NC41IiB0ZXh0LWFuY2hvcj0ic3RhcnQiIGNsYXNzPSJ2YWx1ZSBpbnZlcnNlIj4tMTYuMTYlPC90ZXh0Pgo8dGV4dCB4PSIyOTUiIHk9IjE1OS41IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPlNpTFUgY2FsbCBsb3dlcmluZzwvdGV4dD4KPHJlY3QgeD0iODczLjciIHk9IjEzMy4wIiB3aWR0aD0iMTQuOSIgaGVpZ2h0PSIzOS4wIiByeD0iMyIgY2xhc3M9ImdhaW4iLz4KPHRleHQgeD0iODk2LjYiIHk9IjE1OS41IiB0ZXh0LWFuY2hvcj0ic3RhcnQiIGNsYXNzPSJ2YWx1ZSI+KzAuNDUlPC90ZXh0Pgo8dGV4dCB4PSIyOTUiIHk9IjIyNC41IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPnJhbmstMyBkZWNvZGUgUm9QRSBmdXNpb248L3RleHQ+CjxyZWN0IHg9Ijc4MC43IiB5PSIxOTguMCIgd2lkdGg9IjkzLjAiIGhlaWdodD0iMzkuMCIgcng9IjMiIGNsYXNzPSJsb3NzIi8+Cjx0ZXh0IHg9Ijc3Mi43IiB5PSIyMjQuNSIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9InZhbHVlIj4tMi44MSU8L3RleHQ+Cjx0ZXh0IHg9IjI5NSIgeT0iMjg5LjUiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+S1YtY2FjaGUgcmVzdWx0IHR5cGluZzwvdGV4dD4KPHJlY3QgeD0iODU1LjciIHk9IjI2My4wIiB3aWR0aD0iMTguMCIgaGVpZ2h0PSIzOS4wIiByeD0iMyIgY2xhc3M9Imxvc3MiLz4KPHRleHQgeD0iODQ3LjciIHk9IjI4OS41IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0idmFsdWUiPi0wLjU0JTwvdGV4dD4KPHRleHQgeD0iMjk1IiB5PSIzNTQuNSIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj5CRjggYWN0aXZhdGlvbiBsb3dlcmluZzwvdGV4dD4KPHJlY3QgeD0iODY1LjIiIHk9IjMyOC4wIiB3aWR0aD0iOC40IiBoZWlnaHQ9IjM5LjAiIHJ4PSIzIiBjbGFzcz0ibG9zcyIvPgo8dGV4dCB4PSI4NTcuMiIgeT0iMzU0LjUiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJ2YWx1ZSI+LTAuMjUlPC90ZXh0Pgo8dGV4dCB4PSIyOTUiIHk9IjQxOS41IiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPmRlY29kZSBsYXlvdXQgYWRtaXNzaW9uPC90ZXh0Pgo8cmVjdCB4PSI4NzMuNyIgeT0iMzkzLjAiIHdpZHRoPSIyMS43IiBoZWlnaHQ9IjM5LjAiIHJ4PSIzIiBjbGFzcz0iZ2FpbiIvPgo8dGV4dCB4PSI5MDMuNCIgeT0iNDE5LjUiIHRleHQtYW5jaG9yPSJzdGFydCIgY2xhc3M9InZhbHVlIj4rMC42NiU8L3RleHQ+Cjx0ZXh0IHg9IjMxMCIgeT0iNDg2IiBjbGFzcz0ic21hbGwiPkNoYW5nZSBpbiBtZWFuIHRocm91Z2hwdXQgd2hlbiB0aGUgY29uY2VwdCBpcyBvbWl0dGVkOyAzMiByZXRhaW5lZCByZXF1ZXN0cyBwZXIgb21pc3Npb24uPC90ZXh0Pgo8L3N2Zz4K" id="fig:foundation-ablation" style="width:100.0%" alt /><figcaption>Throughput change when each foundation concept is omitted.</figcaption>
-</figure>
-<p>RMSNorm recognition explains most of the gain. Its 3.216-token/s marginal loss is 83.4% of the total baseline-to-foundation difference. Rank-3 RoPE fusion is the second clear contributor at 0.558 tokens/s, or 14.5% of the total. The KV-cache and BF8 activation effects are small. SiLU call lowering and layout admission show no positive decode effect in this graph; they provide graph and layout coverage.</p>
-<p>The shares sum to 96.3%, not 100%, because patches interact and each omission is measured with all other foundation patches present. This is not an additive or factorial allocation. The two full-window means are 19.832 and 19.955 tokens/s; the baseline means are 16.043 and 16.036 tokens/s. The fresh total gain is +24.03%. The old +22.58% result used a 16.265-token/s baseline. The new full mean is only 0.22% below the old 19.938-token/s result, while the new baseline is 1.38% lower.</p>
-<p>All configurations return 128 tokens and are deterministic within each window. The no-RMSNorm output has a different token hash from the other configurations, although both completions are coherent. This test therefore does not establish equal model quality.</p>
-<h2 data-number="6.3" id="isolating-the-final-mlp-kernel-stage"><span class="header-section-number">6.3</span> Isolating the final MLP-kernel stage</h2>
-<p>The V10 result combines the SwiGLU blocking choice and the 110-core down projection with the preceding compiler, runtime, and kernel optimizations. The same-build measurements below separate their effects.</p>
+<p>All configurations through fixed-shape prefill tracing use the server-reported request latency from the README benchmark. The final MLP-kernel configuration uses the loopback streaming end-to-end clock needed for the kernel A/B and external-server comparison. The clocks cover the same request but were collected independently, so the final cumulative value is not the isolated kernel effect.</p>
+<h2 data-number="6.2" id="mlp-kernel-measurements"><span class="header-section-number">6.2</span> MLP kernel measurements</h2>
+<p>The same-build measurements below separate SwiGLU blocking from the fused-residual down projection.</p>
 <table>
 <caption>Current-branch streaming results, 32 retained samples per configuration. Width 4 is compared with width 2; the down projection is compared with the same width-4 binary/configuration with the specialization disabled.</caption>
 <colgroup>
@@ -1086,7 +961,7 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The down projection cuts mean decode time from 38.179 to 36.032 ms/token, a 2.147 ms/token saving. Streaming end-to-end throughput rises by 5.88%, from 26.085 to 27.619 tokens/s. TTFT remains about 58 ms.</p>
-<h2 data-number="6.4" id="device-profile-of-the-down-projection"><span class="header-section-number">6.4</span> Device profile of the down projection</h2>
+<h2 data-number="6.3" id="device-profile-of-the-down-projection"><span class="header-section-number">6.3</span> Device profile of the down projection</h2>
 <p>The direct TT-Metal profile identifies 36 occurrences per token, matching the 36 Qwen3-8B decoder layers. Exactly those operation positions change from 64 to 110 workers.</p>
 <table>
 <thead>
@@ -1125,7 +1000,7 @@ x[W_{gate}\;W_{up}].
 </tbody>
 </table>
 <p>The projected kernel saving is close to the observed 2.147 ms/token. The new program reaches about 92% of the previously measured 375.1 GB/s SwiGLU effective bandwidth. This agreement between operation profile and end-to-end measurement supports the causal attribution.</p>
-<h2 data-number="6.5" id="upstream-tt-inference-server-reference"><span class="header-section-number">6.5</span> Upstream tt-inference-server reference</h2>
+<h2 data-number="6.4" id="upstream-tt-inference-server-reference"><span class="header-section-number">6.4</span> Upstream tt-inference-server reference</h2>
 <p>Tenstorrent’s tt-inference-server is an OpenAI-compatible service built around vLLM and TT-Transformers [20]. It enters the stack above TTNN rather than through the XLA, StableHLO, and TT-MLIR path:</p>
 <pre class="text"><code>libtt:  SGLang-JAX → JAX/XLA → StableHLO/PJRT → TT-XLA/TT-MLIR → TTNN → TT-Metal
 TTIS:   OpenAI API → vLLM → TT-Transformers                    → TTNN → TT-Metal</code></pre>
@@ -1148,7 +1023,7 @@ TTIS:   OpenAI API → vLLM → TT-Transformers                    → TTNN → 
 </thead>
 <tbody>
 <tr class="odd">
-<td style="text-align: left;">libtt current (<code>37d5460</code>)</td>
+<td style="text-align: left;">libtt current</td>
 <td style="text-align: right;">27.753 ± 0.330 [27.634, 27.872]</td>
 <td style="text-align: right;">27.619 ± 0.322 [27.503, 27.735]</td>
 <td style="text-align: right;">58.45 ± 1.50 ms</td>
@@ -1162,10 +1037,10 @@ TTIS:   OpenAI API → vLLM → TT-Transformers                    → TTNN → 
 </tbody>
 </table>
 <figure>
-<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTEwIiB2aWV3Qm94PSIwIDAgOTgwIDUxMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkMGQwZDA7c3Ryb2tlLXdpZHRoOjF9LmxpYnR0e2ZpbGw6IzMzM30udXBzdHJlYW17ZmlsbDojYWFhfS5jaXtzdHJva2U6IzExMTtzdHJva2Utd2lkdGg6Mi41fS5sYWJlbHtmb250LXNpemU6MTRweH0uc21hbGx7Zm9udC1zaXplOjEycHg7ZmlsbDojNDQ0fS52YWx1ZXtmb250LXNpemU6MTVweDtmb250LXdlaWdodDo3MDB9LnRpdGxle2ZvbnQtc2l6ZToyMXB4O2ZvbnQtd2VpZ2h0OjcwMH0ubGVnZW5ke2ZvbnQtc2l6ZToxM3B4fTwvc3R5bGU+Cjx0ZXh0IHg9IjEwMCIgeT0iMjkiIGNsYXNzPSJ0aXRsZSI+U2FtZS1jbG9jayBRd2VuMy04QiBzdHJlYW1pbmcgY29tcGFyaXNvbjwvdGV4dD4KPHJlY3QgeD0iNjA4IiB5PSIxNiIgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiByeD0iMiIgY2xhc3M9ImxpYnR0Ii8+Cjx0ZXh0IHg9IjYzMSIgeT0iMjkiIGNsYXNzPSJsZWdlbmQiPmxpYnR0IDM3ZDU0NjA8L3RleHQ+CjxyZWN0IHg9Ijc2MCIgeT0iMTYiIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgcng9IjIiIGNsYXNzPSJ1cHN0cmVhbSIvPgo8dGV4dCB4PSI3ODMiIHk9IjI5IiBjbGFzcz0ibGVnZW5kIj5UVElTIHYwLjEwLjA8L3RleHQ+CjxsaW5lIHgxPSIxMDAiIHkxPSIzOTUuMCIgeDI9Ijk1MCIgeTI9IjM5NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI4OCIgeT0iNDAwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MDwvdGV4dD4KPGxpbmUgeDE9IjEwMCIgeTE9IjM0MC4wIiB4Mj0iOTUwIiB5Mj0iMzQwLjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSIzNDUuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj41PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMjg1LjAiIHgyPSI5NTAiIHkyPSIyODUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjI5MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjEwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMjMwLjAiIHgyPSI5NTAiIHkyPSIyMzAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjIzNS4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE1PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMTc1LjAiIHgyPSI5NTAiIHkyPSIxNzUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjE4MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjIwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMTIwLjAiIHgyPSI5NTAiIHkyPSIxMjAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjEyNS4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI1PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iNjUuMCIgeDI9Ijk1MCIgeTI9IjY1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSI3MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjMwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iNjUiIHgyPSIxMDAiIHkyPSIzOTUiIGNsYXNzPSJheGlzIi8+CjxsaW5lIHgxPSIxMDAiIHkxPSIzOTUiIHgyPSI5NTAiIHkyPSIzOTUiIGNsYXNzPSJheGlzIi8+CjxyZWN0IHg9IjE4OC41IiB5PSI4OS43IiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjMwNS4zIiByeD0iNCIgY2xhc3M9ImxpYnR0Ii8+CjxsaW5lIHgxPSIyNDQuNSIgeTE9Ijg4LjQiIHgyPSIyNDQuNSIgeTI9IjkxLjAiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMjM3LjUiIHkxPSI4OC40IiB4Mj0iMjUxLjUiIHkyPSI4OC40IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjIzNy41IiB5MT0iOTEuMCIgeDI9IjI1MS41IiB5Mj0iOTEuMCIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjI0NC41IiB5PSI3Ny43IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPjI3Ljc1MzwvdGV4dD4KPHJlY3QgeD0iMzI0LjUiIHk9IjEyMS4yIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjI3My44IiByeD0iNCIgY2xhc3M9InVwc3RyZWFtIi8+CjxsaW5lIHgxPSIzODAuNSIgeTE9IjExOS4xIiB4Mj0iMzgwLjUiIHkyPSIxMjMuMyIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzMuNSIgeTE9IjExOS4xIiB4Mj0iMzg3LjUiIHkyPSIxMTkuMSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzMuNSIgeTE9IjEyMy4zIiB4Mj0iMzg3LjUiIHkyPSIxMjMuMyIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjM4MC41IiB5PSIxMDkuMiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNC44ODc8L3RleHQ+Cjx0ZXh0IHg9IjMxMi41IiB5PSI0MjQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+UHVyZSBkZWNvZGU8L3RleHQ+CjxyZWN0IHg9IjYxMy41IiB5PSI5MS4yIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjMwMy44IiByeD0iNCIgY2xhc3M9ImxpYnR0Ii8+CjxsaW5lIHgxPSI2NjkuNSIgeTE9Ijg5LjkiIHgyPSI2NjkuNSIgeTI9IjkyLjUiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNjYyLjUiIHkxPSI4OS45IiB4Mj0iNjc2LjUiIHkyPSI4OS45IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjY2Mi41IiB5MT0iOTIuNSIgeDI9IjY3Ni41IiB5Mj0iOTIuNSIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjY2OS41IiB5PSI3OS4yIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPjI3LjYxOTwvdGV4dD4KPHJlY3QgeD0iNzQ5LjUiIHk9IjEyMi41IiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjI3Mi41IiByeD0iNCIgY2xhc3M9InVwc3RyZWFtIi8+CjxsaW5lIHgxPSI4MDUuNSIgeTE9IjEyMC40IiB4Mj0iODA1LjUiIHkyPSIxMjQuNSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3OTguNSIgeTE9IjEyMC40IiB4Mj0iODEyLjUiIHkyPSIxMjAuNCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3OTguNSIgeTE9IjEyNC41IiB4Mj0iODEyLjUiIHkyPSIxMjQuNSIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjgwNS41IiB5PSIxMTAuNSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNC43NzY8L3RleHQ+Cjx0ZXh0IHg9IjczNy41IiB5PSI0MjQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+U3RyZWFtaW5nIEUyRTwvdGV4dD4KPHRleHQgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoMjUgMjMwLjApIHJvdGF0ZSgtOTApIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPnRva2Vucy9zIChtZWFuIGFuZCA5NSUgdCBpbnRlcnZhbCk8L3RleHQ+Cjx0ZXh0IHg9IjEwMCIgeT0iNDYyIiBjbGFzcz0ic21hbGwiPjMyIHJldGFpbmVkIHNlcmlhbCByZXF1ZXN0cyBwZXIgaW1wbGVtZW50YXRpb247IHR3byB3YXJtLXVwczsgMTI4IGdlbmVyYXRlZCB0b2tlbnMvcmVxdWVzdC48L3RleHQ+Cjx0ZXh0IHg9IjEwMCIgeT0iNDgyIiBjbGFzcz0ic21hbGwiPkJvdGggdXNlIHRoZSBzYW1lIGxvb3BiYWNrIHN0cmVhbWluZyBjbG9jazogMTI3IGludGVyLXRva2VuIGludGVydmFscyBmb3IgZGVjb2RlIGFuZCByZXF1ZXN0LXRvLWxhc3QtdG9rZW4gZm9yIEUyRS48L3RleHQ+Cjwvc3ZnPgo=" id="fig:upstream" style="width:100.0%" alt /><figcaption>External serving-stack reference on the same model workload.</figcaption>
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5ODAiIGhlaWdodD0iNTEwIiB2aWV3Qm94PSIwIDAgOTgwIDUxMCI+CjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiNmZmZmZmYiLz4KPHN0eWxlPnRleHR7Zm9udC1mYW1pbHk6SGVsdmV0aWNhLEFyaWFsLHNhbnMtc2VyaWY7ZmlsbDojMTExfS5heGlze3N0cm9rZTojNTU1O3N0cm9rZS13aWR0aDoxLjJ9LmdyaWR7c3Ryb2tlOiNkMGQwZDA7c3Ryb2tlLXdpZHRoOjF9LmxpYnR0e2ZpbGw6IzMzM30udXBzdHJlYW17ZmlsbDojYWFhfS5jaXtzdHJva2U6IzExMTtzdHJva2Utd2lkdGg6Mi41fS5sYWJlbHtmb250LXNpemU6MTRweH0uc21hbGx7Zm9udC1zaXplOjEycHg7ZmlsbDojNDQ0fS52YWx1ZXtmb250LXNpemU6MTVweDtmb250LXdlaWdodDo3MDB9LnRpdGxle2ZvbnQtc2l6ZToyMXB4O2ZvbnQtd2VpZ2h0OjcwMH0ubGVnZW5ke2ZvbnQtc2l6ZToxM3B4fTwvc3R5bGU+Cjx0ZXh0IHg9IjEwMCIgeT0iMjkiIGNsYXNzPSJ0aXRsZSI+U2FtZS1jbG9jayBRd2VuMy04QiBzdHJlYW1pbmcgY29tcGFyaXNvbjwvdGV4dD4KPHJlY3QgeD0iNjA4IiB5PSIxNiIgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiByeD0iMiIgY2xhc3M9ImxpYnR0Ii8+Cjx0ZXh0IHg9IjYzMSIgeT0iMjkiIGNsYXNzPSJsZWdlbmQiPmxpYnR0IGN1cnJlbnQ8L3RleHQ+CjxyZWN0IHg9Ijc2MCIgeT0iMTYiIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgcng9IjIiIGNsYXNzPSJ1cHN0cmVhbSIvPgo8dGV4dCB4PSI3ODMiIHk9IjI5IiBjbGFzcz0ibGVnZW5kIj5UVElTIHYwLjEwLjA8L3RleHQ+CjxsaW5lIHgxPSIxMDAiIHkxPSIzOTUuMCIgeDI9Ijk1MCIgeTI9IjM5NS4wIiBjbGFzcz0iZ3JpZCIvPgo8dGV4dCB4PSI4OCIgeT0iNDAwLjAiIHRleHQtYW5jaG9yPSJlbmQiIGNsYXNzPSJsYWJlbCI+MDwvdGV4dD4KPGxpbmUgeDE9IjEwMCIgeTE9IjM0MC4wIiB4Mj0iOTUwIiB5Mj0iMzQwLjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSIzNDUuMCIgdGV4dC1hbmNob3I9ImVuZCIgY2xhc3M9ImxhYmVsIj41PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMjg1LjAiIHgyPSI5NTAiIHkyPSIyODUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjI5MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjEwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMjMwLjAiIHgyPSI5NTAiIHkyPSIyMzAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjIzNS4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjE1PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMTc1LjAiIHgyPSI5NTAiIHkyPSIxNzUuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjE4MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjIwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iMTIwLjAiIHgyPSI5NTAiIHkyPSIxMjAuMCIgY2xhc3M9ImdyaWQiLz4KPHRleHQgeD0iODgiIHk9IjEyNS4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjI1PC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iNjUuMCIgeDI9Ijk1MCIgeTI9IjY1LjAiIGNsYXNzPSJncmlkIi8+Cjx0ZXh0IHg9Ijg4IiB5PSI3MC4wIiB0ZXh0LWFuY2hvcj0iZW5kIiBjbGFzcz0ibGFiZWwiPjMwPC90ZXh0Pgo8bGluZSB4MT0iMTAwIiB5MT0iNjUiIHgyPSIxMDAiIHkyPSIzOTUiIGNsYXNzPSJheGlzIi8+CjxsaW5lIHgxPSIxMDAiIHkxPSIzOTUiIHgyPSI5NTAiIHkyPSIzOTUiIGNsYXNzPSJheGlzIi8+CjxyZWN0IHg9IjE4OC41IiB5PSI4OS43IiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjMwNS4zIiByeD0iNCIgY2xhc3M9ImxpYnR0Ii8+CjxsaW5lIHgxPSIyNDQuNSIgeTE9Ijg4LjQiIHgyPSIyNDQuNSIgeTI9IjkxLjAiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iMjM3LjUiIHkxPSI4OC40IiB4Mj0iMjUxLjUiIHkyPSI4OC40IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjIzNy41IiB5MT0iOTEuMCIgeDI9IjI1MS41IiB5Mj0iOTEuMCIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjI0NC41IiB5PSI3Ny43IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPjI3Ljc1MzwvdGV4dD4KPHJlY3QgeD0iMzI0LjUiIHk9IjEyMS4yIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjI3My44IiByeD0iNCIgY2xhc3M9InVwc3RyZWFtIi8+CjxsaW5lIHgxPSIzODAuNSIgeTE9IjExOS4xIiB4Mj0iMzgwLjUiIHkyPSIxMjMuMyIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzMuNSIgeTE9IjExOS4xIiB4Mj0iMzg3LjUiIHkyPSIxMTkuMSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSIzNzMuNSIgeTE9IjEyMy4zIiB4Mj0iMzg3LjUiIHkyPSIxMjMuMyIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjM4MC41IiB5PSIxMDkuMiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNC44ODc8L3RleHQ+Cjx0ZXh0IHg9IjMxMi41IiB5PSI0MjQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+UHVyZSBkZWNvZGU8L3RleHQ+CjxyZWN0IHg9IjYxMy41IiB5PSI5MS4yIiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjMwMy44IiByeD0iNCIgY2xhc3M9ImxpYnR0Ii8+CjxsaW5lIHgxPSI2NjkuNSIgeTE9Ijg5LjkiIHgyPSI2NjkuNSIgeTI9IjkyLjUiIGNsYXNzPSJjaSIvPgo8bGluZSB4MT0iNjYyLjUiIHkxPSI4OS45IiB4Mj0iNjc2LjUiIHkyPSI4OS45IiBjbGFzcz0iY2kiLz4KPGxpbmUgeDE9IjY2Mi41IiB5MT0iOTIuNSIgeDI9IjY3Ni41IiB5Mj0iOTIuNSIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjY2OS41IiB5PSI3OS4yIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0idmFsdWUiPjI3LjYxOTwvdGV4dD4KPHJlY3QgeD0iNzQ5LjUiIHk9IjEyMi41IiB3aWR0aD0iMTEyIiBoZWlnaHQ9IjI3Mi41IiByeD0iNCIgY2xhc3M9InVwc3RyZWFtIi8+CjxsaW5lIHgxPSI4MDUuNSIgeTE9IjEyMC40IiB4Mj0iODA1LjUiIHkyPSIxMjQuNSIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3OTguNSIgeTE9IjEyMC40IiB4Mj0iODEyLjUiIHkyPSIxMjAuNCIgY2xhc3M9ImNpIi8+CjxsaW5lIHgxPSI3OTguNSIgeTE9IjEyNC41IiB4Mj0iODEyLjUiIHkyPSIxMjQuNSIgY2xhc3M9ImNpIi8+Cjx0ZXh0IHg9IjgwNS41IiB5PSIxMTAuNSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgY2xhc3M9InZhbHVlIj4yNC43NzY8L3RleHQ+Cjx0ZXh0IHg9IjczNy41IiB5PSI0MjQiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGNsYXNzPSJsYWJlbCI+U3RyZWFtaW5nIEUyRTwvdGV4dD4KPHRleHQgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoMjUgMjMwLjApIHJvdGF0ZSgtOTApIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBjbGFzcz0ibGFiZWwiPnRva2Vucy9zIChtZWFuIGFuZCA5NSUgdCBpbnRlcnZhbCk8L3RleHQ+Cjx0ZXh0IHg9IjEwMCIgeT0iNDYyIiBjbGFzcz0ic21hbGwiPjMyIHJldGFpbmVkIHNlcmlhbCByZXF1ZXN0cyBwZXIgaW1wbGVtZW50YXRpb247IHR3byB3YXJtLXVwczsgMTI4IGdlbmVyYXRlZCB0b2tlbnMvcmVxdWVzdC48L3RleHQ+Cjx0ZXh0IHg9IjEwMCIgeT0iNDgyIiBjbGFzcz0ic21hbGwiPkJvdGggdXNlIHRoZSBzYW1lIGxvb3BiYWNrIHN0cmVhbWluZyBjbG9jazogMTI3IGludGVyLXRva2VuIGludGVydmFscyBmb3IgZGVjb2RlIGFuZCByZXF1ZXN0LXRvLWxhc3QtdG9rZW4gZm9yIEUyRS48L3RleHQ+Cjwvc3ZnPgo=" id="fig:upstream" style="width:100.0%" alt /><figcaption>External serving-stack reference on the same model workload.</figcaption>
 </figure>
 <p>Under these conditions, libtt is 11.51% faster in pure decode and 11.48% faster end to end. Mean TTFT is 7.78% lower, and mean request-to-last-token latency falls from 5.169 to 4.635 seconds. This compares complete serving stacks, not individual kernels; their model implementations, frontends, and trace strategies differ. The result shows that lower-stack compiler and kernel optimization can match and exceed a stack that also modifies the transformer and inference-engine layers. The tested TTIS artifact is the official v0.10.0 runtime image.</p>
-<h2 data-number="6.6" id="correctness-and-numeric-behavior"><span class="header-section-number">6.6</span> Correctness and numeric behavior</h2>
+<h2 data-number="6.5" id="correctness-and-numeric-behavior"><span class="header-section-number">6.5</span> Correctness and numeric behavior</h2>
 <p>All 32 requests in each configuration are deterministic. Algebra and reduction changes can alter the token hash. The current kernel hashes are:</p>
 <table>
 <thead>
@@ -1219,8 +1094,8 @@ matmul-SwiGLU epilogue:
 <h1 data-number="8" id="limitations-and-future-work"><span class="header-section-number">8</span> Limitations and future work</h1>
 <ol type="1">
 <li><strong>One model and decode regime.</strong> Results apply to Qwen3-8B, a five-token prompt padded to one tile, serial 128-token generation, and a single P150. Other batches, contexts, and scheduling policies may have different limits.</li>
-<li><strong>Cumulative attribution is ordered.</strong> The established stages are real cumulative builds, not a factorial experiment. Patch effects can interact.</li>
-<li><strong>Foundation effects interact.</strong> The leave-one-concept-out measurements are marginal effects in the complete foundation, not an additive or factorial allocation. Small effects are also close to sequential drift.</li>
+<li><strong>Cumulative attribution is ordered.</strong> The measured configurations are real cumulative builds, not a factorial experiment. Feature effects can interact.</li>
+<li><strong>Initial feature effects interact.</strong> The leave-one-feature-out measurements are marginal effects in the complete feature set, not an additive or factorial allocation. Small effects are also close to sequential drift.</li>
 <li><strong>Two metric families.</strong> The older cumulative sequence uses server-reported request latency. The current kernel and TTIS comparison uses the same streaming client clock. The two families are not directly interchangeable.</li>
 <li><strong>Sequential sampling.</strong> Configurations were not randomized or interleaved. Thermal and background drift can remain.</li>
 <li><strong>Profile naming required positional alignment.</strong> The final profiling CSV lacked operation names. Its 854 rows align with an earlier named trace, and the 36 changed positions match the down projections.</li>

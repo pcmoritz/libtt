@@ -6,10 +6,10 @@ The benchmark driver intentionally records two warm-up requests before the
 checks the retained outputs, and writes publication-ready CSV/SVG artifacts.
 It also analyzes the separately collected upstream tt-inference-server
 baseline and the current SwiGLU-blocking/down-projection experiments.  The
-final optimized configuration is included as the last stage of the cumulative
-sequence using streaming end-to-end throughput; the report identifies the
-clock change at that boundary.  A separate 2026-07-16 dataset decomposes the
-foundation bundle with repeated baseline/full windows and leave-one-concept-out
+final optimized configuration is included in the cumulative sequence using
+streaming end-to-end throughput; the report identifies the clock change at
+that boundary.  A separate 2026-07-16 dataset attributes the initial compiler
+features with repeated baseline/complete-set windows and leave-one-feature-out
 builds.
 """
 
@@ -40,93 +40,93 @@ SWIGLU_BLOCK_4_DIR = Path("/tmp/libtt-down-110-final-20260715/disabled")
 DOWN_PROJECTION_110_DIR = Path(
     "/tmp/libtt-down-110-final-fixed-20260715/enabled"
 )
-FOUNDATION_RAW_DIR = Path("/tmp/libtt-foundation-bench-20260716")
+FEATURE_ATTRIBUTION_RAW_DIR = Path("/tmp/libtt-foundation-bench-20260716")
 
 
 @dataclass(frozen=True)
-class Variant:
-    label: str
-    commit: str
+class Configuration:
+    name: str
+    source_revision: str
     optimization: str
     plot_label: str
     raw_dir: Path
 
 
-VARIANTS = [
-    Variant(
-        "V0",
+CONFIGURATIONS = [
+    Configuration(
+        "baseline",
         "7482967",
-        "Documented serving baseline",
+        "Functional baseline",
         "baseline",
         Path("/tmp/libtt-report-bench/v0_7482967"),
     ),
-    Variant(
-        "V1",
+    Configuration(
+        "compiler-features",
         "9978a9b",
-        "Decode foundation bundle",
-        "decode foundation",
+        "RMSNorm, RoPE, dtype, and layout support",
+        "compiler",
         Path("/tmp/libtt-report-bench/v1_9978a9b"),
     ),
-    Variant(
-        "V2",
+    Configuration(
+        "expanded-silu",
         "10459b5",
         "Expanded-SiLU recognition",
         "SiLU graph",
         Path("/tmp/libtt-report-bench/v2_10459b5"),
     ),
-    Variant(
-        "V3",
+    Configuration(
+        "qkv-fusion",
         "3fe072b",
         "QKV projection fusion",
         "QKV graph",
         Path("/tmp/libtt-report-bench/v3_3fe072b"),
     ),
-    Variant(
-        "V4",
+    Configuration(
+        "shared-lhs",
         "83baa8d",
         "Two-way shared-LHS matmul fusion",
         "shared LHS",
         Path("/tmp/libtt-report-bench/v4_83baa8d"),
     ),
-    Variant(
-        "V5",
+    Configuration(
+        "rmsnorm-sharding",
         "e534690",
         "Decode RMSNorm runtime sharding",
         "RMSNorm shard",
         Path("/tmp/libtt-branch-bench-20260711/main"),
     ),
-    Variant(
-        "V6",
+    Configuration(
+        "consumer-silu",
         "a718685",
         "SiLU fused into binary multiply",
         "SiLU multiply",
         Path("/tmp/libtt-branch-bench-20260711/fused-silu-multiply"),
     ),
-    Variant(
-        "V7",
+    Configuration(
+        "matmul-swiglu",
         "ce99831",
         "True matmul-SwiGLU epilogue",
         "Dst SwiGLU",
         Path("/tmp/libtt-branch-bench-20260711/matmul-swiglu-epilogue"),
     ),
-    Variant(
-        "V8",
+    Configuration(
+        "generalized-epilogue",
         "caa5428",
         "Fallback-free prefill-capable epilogue",
         "one path",
         Path("/tmp/libtt-branch-bench-20260711/prefill-bf16-no-fallback"),
     ),
-    Variant(
-        "V9",
+    Configuration(
+        "prefill-trace",
         "627a32d",
-        "Latest main with traced short-prompt prefill",
+        "Fixed-shape prefill trace",
         "prefill trace",
         Path("/tmp/libtt-report-main-627a32d/raw"),
     ),
 ]
 
-FINAL_VARIANT = Variant(
-    "V10",
+FINAL_CONFIGURATION = Configuration(
+    "mlp-kernels",
     "37d5460",
     "SwiGLU blocking and 110-core down projection",
     "MLP kernels",
@@ -135,51 +135,51 @@ FINAL_VARIANT = Variant(
 
 
 @dataclass(frozen=True)
-class FoundationConfiguration:
+class FeatureAttributionConfiguration:
     name: str
     group: str
     omitted_concept: str
 
 
-FOUNDATION_CONFIGURATIONS = (
-    FoundationConfiguration(
+FEATURE_ATTRIBUTION_CONFIGURATIONS = (
+    FeatureAttributionConfiguration(
         "baseline_compat",
         "baseline",
-        "all foundation performance concepts",
+        "all initial compiler features",
     ),
-    FoundationConfiguration(
+    FeatureAttributionConfiguration(
         "baseline_b",
         "baseline",
-        "all foundation performance concepts",
+        "all initial compiler features",
     ),
-    FoundationConfiguration("full_a", "full foundation", "none"),
-    FoundationConfiguration("full_b", "full foundation", "none"),
-    FoundationConfiguration(
+    FeatureAttributionConfiguration("full_a", "complete feature set", "none"),
+    FeatureAttributionConfiguration("full_b", "complete feature set", "none"),
+    FeatureAttributionConfiguration(
         "no_rmsnorm",
         "without RMSNorm recognition",
         "JAX RMSNorm recognition",
     ),
-    FoundationConfiguration(
+    FeatureAttributionConfiguration(
         "no_silu",
         "without SiLU call lowering",
         "SiLU call lowering",
     ),
-    FoundationConfiguration(
+    FeatureAttributionConfiguration(
         "no_rope",
         "without rank-3 RoPE fusion",
         "rank-3 decode RoPE fusion",
     ),
-    FoundationConfiguration(
+    FeatureAttributionConfiguration(
         "no_kv_dtype",
         "without KV-cache result typing",
         "KV-cache result typing",
     ),
-    FoundationConfiguration(
+    FeatureAttributionConfiguration(
         "no_bf8_activation",
         "without BF8 activation lowering",
         "BF8 activation lowering",
     ),
-    FoundationConfiguration(
+    FeatureAttributionConfiguration(
         "no_layout_admission",
         "without decode layout admission",
         "decode layout admission",
@@ -187,11 +187,17 @@ FOUNDATION_CONFIGURATIONS = (
 )
 
 
-def retained_json(variant: Variant) -> list[tuple[Path, dict]]:
-    paths = [Path(p) for p in sorted(glob.glob(str(variant.raw_dir / "run_*.json")))]
+def retained_json(configuration: Configuration) -> list[tuple[Path, dict]]:
+    paths = [
+        Path(p)
+        for p in sorted(glob.glob(str(configuration.raw_dir / "run_*.json")))
+    ]
     retained = paths[N_WARMUP : N_WARMUP + N_SAMPLES]
     if len(retained) != N_SAMPLES:
-        raise RuntimeError(f"{variant.label}: expected {N_SAMPLES} retained files, found {len(retained)}")
+        raise RuntimeError(
+            f"{configuration.name}: expected {N_SAMPLES} retained files, "
+            f"found {len(retained)}"
+        )
     rows = [(path, json.loads(path.read_text())) for path in retained]
     for path, payload in rows:
         meta = payload["meta_info"]
@@ -205,7 +211,7 @@ def token_hash(output_ids: list[int]) -> str:
     return hashlib.sha256(encoded).hexdigest()[:12]
 
 
-def append_final_streaming_stage(
+def append_final_streaming_configuration(
     samples: list[dict],
     summaries: list[dict],
     baseline_mean: float,
@@ -213,7 +219,7 @@ def append_final_streaming_stage(
 ) -> list[float]:
     """Append the final kernel configuration using streaming E2E throughput."""
 
-    paths = sorted(FINAL_VARIANT.raw_dir.glob("run_*.json"))
+    paths = sorted(FINAL_CONFIGURATION.raw_dir.glob("run_*.json"))
     records = [(path, json.loads(path.read_text())) for path in paths]
     retained = [
         (path, record)
@@ -222,7 +228,7 @@ def append_final_streaming_stage(
     ][:N_SAMPLES]
     if len(retained) != N_SAMPLES:
         raise RuntimeError(
-            f"{FINAL_VARIANT.label}: expected {N_SAMPLES} retained files, "
+            f"{FINAL_CONFIGURATION.name}: expected {N_SAMPLES} retained files, "
             f"found {len(retained)}"
         )
 
@@ -241,8 +247,8 @@ def append_final_streaming_stage(
         hashes.add(output_hash)
         samples.append(
             {
-                "variant": FINAL_VARIANT.label,
-                "commit": FINAL_VARIANT.commit,
+                "configuration": FINAL_CONFIGURATION.name,
+                "source_revision": FINAL_CONFIGURATION.source_revision,
                 "sample": sample_index,
                 "source_file": path.name,
                 "e2e_latency_s": f"{latency:.9f}",
@@ -253,7 +259,7 @@ def append_final_streaming_stage(
         )
     if len(hashes) != 1:
         raise RuntimeError(
-            f"{FINAL_VARIANT.label}: retained requests are not deterministic: "
+            f"{FINAL_CONFIGURATION.name}: retained requests are not deterministic: "
             f"{hashes}"
         )
 
@@ -267,10 +273,10 @@ def append_final_streaming_stage(
     )
     summaries.append(
         {
-            "variant": FINAL_VARIANT.label,
-            "commit": FINAL_VARIANT.commit,
-            "optimization": FINAL_VARIANT.optimization,
-            "plot_label": FINAL_VARIANT.plot_label,
+            "configuration": FINAL_CONFIGURATION.name,
+            "source_revision": FINAL_CONFIGURATION.source_revision,
+            "optimization": FINAL_CONFIGURATION.optimization,
+            "plot_label": FINAL_CONFIGURATION.plot_label,
             "n": len(throughputs),
             "mean_tps": mean,
             "stddev_tps": stddev,
@@ -333,11 +339,10 @@ def write_throughput_svg(summaries: list[dict]) -> None:
             f'<line x1="{xx-6:.1f}" y1="{hi:.1f}" x2="{xx+6:.1f}" y2="{hi:.1f}" class="ci"/>',
             f'<line x1="{xx-6:.1f}" y1="{lo:.1f}" x2="{xx+6:.1f}" y2="{lo:.1f}" class="ci"/>',
             f'<circle cx="{xx:.1f}" cy="{y(row["mean_tps"]):.1f}" r="7" class="dot"/>',
-            f'<text x="{xx:.1f}" y="{height-bottom+28}" text-anchor="middle" class="label">{esc(row["variant"])}</text>',
-            f'<text x="{xx:.1f}" y="{height-bottom+47}" text-anchor="middle" class="small">{esc(row["plot_label"])}</text>',
+            f'<text x="{xx:.1f}" y="{height-bottom+31}" text-anchor="middle" class="small">{esc(row["plot_label"])}</text>',
         ])
     parts.append(f'<text transform="translate(23 {top+plot_h/2}) rotate(-90)" text-anchor="middle" class="label">tokens/s (mean and 95% t interval)</text>')
-    parts.append('<text x="90" y="505" class="small">32 retained requests per stage; two compile/warm-up requests excluded; V10 uses the streaming E2E clock.</text>')
+    parts.append('<text x="90" y="505" class="small">32 retained requests per configuration; two compile/warm-up requests excluded; the final point uses the streaming E2E clock.</text>')
     parts.append('</svg>')
     (FIGURE_DIR / "throughput.svg").write_text("\n".join(parts) + "\n")
 
@@ -376,11 +381,10 @@ def write_incremental_svg(summaries: list[dict]) -> None:
         parts.extend([
             f'<rect x="{xx:.1f}" y="{rect_y:.1f}" width="{bw:.1f}" height="{max(rect_h, 1):.1f}" rx="3" class="{klass}"/>',
             f'<text x="{xx+bw/2:.1f}" y="{value_y:.1f}" text-anchor="middle" class="value">{value:+.2f}%</text>',
-            f'<text x="{xx+bw/2:.1f}" y="{height-bottom+29}" text-anchor="middle" class="label">{esc(row["variant"])}</text>',
-            f'<text x="{xx+bw/2:.1f}" y="{height-bottom+48}" text-anchor="middle" class="small">{esc(row["plot_label"])}</text>',
+            f'<text x="{xx+bw/2:.1f}" y="{height-bottom+31}" text-anchor="middle" class="small">{esc(row["plot_label"])}</text>',
         ])
-    parts.append(f'<text transform="translate(23 {top+plot_h/2}) rotate(-90)" text-anchor="middle" class="label">throughput change vs. preceding stage</text>')
-    parts.append('<text x="90" y="482" class="small">Bars show the measured throughput change from the preceding stage.</text>')
+    parts.append(f'<text transform="translate(23 {top+plot_h/2}) rotate(-90)" text-anchor="middle" class="label">throughput change vs. preceding configuration</text>')
+    parts.append('<text x="90" y="482" class="small">Bars show the measured throughput change from the preceding configuration.</text>')
     parts.append('</svg>')
     (FIGURE_DIR / "incremental-speedup.svg").write_text("\n".join(parts) + "\n")
 
@@ -391,7 +395,7 @@ def write_upstream_comparison_svg(comparison: dict) -> None:
         ("Streaming E2E", "e2e_tps"),
     )
     implementations = (
-        ("libtt", "37d5460", comparison["libtt"], "libtt"),
+        ("libtt", "current", comparison["libtt"], "libtt"),
         ("tt-inference-server", "v0.10.0", comparison["ttis"], "upstream"),
     )
     width, height = 980, 510
@@ -411,7 +415,7 @@ def write_upstream_comparison_svg(comparison: dict) -> None:
         '<style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1.2}.grid{stroke:#d0d0d0;stroke-width:1}.libtt{fill:#333}.upstream{fill:#aaa}.ci{stroke:#111;stroke-width:2.5}.label{font-size:14px}.small{font-size:12px;fill:#444}.value{font-size:15px;font-weight:700}.title{font-size:21px;font-weight:700}.legend{font-size:13px}</style>',
         '<text x="100" y="29" class="title">Same-clock Qwen3-8B streaming comparison</text>',
         '<rect x="608" y="16" width="16" height="16" rx="2" class="libtt"/>',
-        '<text x="631" y="29" class="legend">libtt 37d5460</text>',
+        '<text x="631" y="29" class="legend">libtt current</text>',
         '<rect x="760" y="16" width="16" height="16" rx="2" class="upstream"/>',
         '<text x="783" y="29" class="legend">TTIS v0.10.0</text>',
     ]
@@ -999,83 +1003,19 @@ def analyze_current_kernel_experiments() -> None:
         writer.writerows(summary_rows)
 
 
-def write_foundation_ablation_svg(summary_rows: list[dict]) -> None:
-    rows = [
-        row
-        for row in summary_rows
-        if row["group"] not in ("baseline", "full foundation")
-    ]
-    width, height = 980, 500
-    left, right, top, bottom = 310, 40, 55, 55
-    plot_w, plot_h = width - left - right, height - top - bottom
-    x_min, x_max = -17.0, 2.0
-    row_h = plot_h / len(rows)
-
-    def x(value: float) -> float:
-        return left + (value - x_min) * plot_w / (x_max - x_min)
-
-    zero = x(0.0)
-    parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
-        '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1.2}.grid{stroke:#d0d0d0;stroke-width:1}.loss{fill:#444}.gain{fill:#aaa}.label{font-size:14px}.small{font-size:12px;fill:#444}.value{font-size:13px;font-weight:700}.inverse{fill:#fff}.title{font-size:21px;font-weight:700}</style>',
-        '<text x="40" y="31" class="title">Foundation concept leave-one-out results</text>',
-    ]
-    for tick in (-16, -12, -8, -4, 0):
-        xx = x(tick)
-        parts.append(
-            f'<line x1="{xx:.1f}" y1="{top}" x2="{xx:.1f}" '
-            f'y2="{height-bottom}" class="grid"/>'
-        )
-        parts.append(
-            f'<text x="{xx:.1f}" y="{height-bottom+24}" '
-            f'text-anchor="middle" class="label">{tick}%</text>'
-        )
-    parts.append(
-        f'<line x1="{zero:.1f}" y1="{top}" x2="{zero:.1f}" '
-        f'y2="{height-bottom}" class="axis"/>'
-    )
-    for index, row in enumerate(rows):
-        value = float(row["throughput_change_vs_full_pct"])
-        yy = top + index * row_h + row_h * 0.2
-        bar_h = row_h * 0.6
-        value_x = x(value)
-        rect_x = min(zero, value_x)
-        rect_w = max(abs(zero - value_x), 1.0)
-        klass = "loss" if value < 0 else "gain"
-        inverse = value < -10.0
-        anchor = "start" if inverse or value >= 0 else "end"
-        text_x = value_x + 8 if inverse or value >= 0 else value_x - 8
-        value_class = "value inverse" if inverse else "value"
-        parts.extend(
-            [
-                f'<text x="{left-15}" y="{yy+bar_h*0.68:.1f}" '
-                f'text-anchor="end" class="label">{esc(row["omitted_concept"])}</text>',
-                f'<rect x="{rect_x:.1f}" y="{yy:.1f}" width="{rect_w:.1f}" '
-                f'height="{bar_h:.1f}" rx="3" class="{klass}"/>',
-                f'<text x="{text_x:.1f}" y="{yy+bar_h*0.68:.1f}" '
-                f'text-anchor="{anchor}" class="{value_class}">{value:+.2f}%</text>',
-            ]
-        )
-    parts.append(
-        '<text x="310" y="486" class="small">Change in mean throughput when the concept is omitted; 32 retained requests per omission.</text>'
-    )
-    parts.append("</svg>")
-    (FIGURE_DIR / "foundation-ablation.svg").write_text(
-        "\n".join(parts) + "\n"
-    )
-
-
-def analyze_foundation_ablation() -> None:
+def analyze_feature_attribution() -> None:
     values_by_group: dict[str, list[float]] = {}
     hashes_by_group: dict[str, set[str]] = {}
     sample_rows: list[dict] = []
 
-    for config in FOUNDATION_CONFIGURATIONS:
-        paths = sorted((FOUNDATION_RAW_DIR / config.name).glob("run_*.json"))
+    for config in FEATURE_ATTRIBUTION_CONFIGURATIONS:
+        paths = sorted(
+            (FEATURE_ATTRIBUTION_RAW_DIR / config.name).glob("run_*.json")
+        )
         if len(paths) != N_WARMUP + N_SAMPLES:
             raise RuntimeError(
-                f"foundation {config.name}: expected {N_WARMUP + N_SAMPLES} "
+                f"feature attribution {config.name}: expected "
+                f"{N_WARMUP + N_SAMPLES} "
                 f"files, found {len(paths)}"
             )
         retained = paths[N_WARMUP:]
@@ -1089,7 +1029,7 @@ def analyze_foundation_ablation() -> None:
                 meta["completion_tokens"] != TOKENS
                 or len(payload["output_ids"]) != TOKENS
             ):
-                raise RuntimeError(f"{path}: incomplete foundation response")
+                raise RuntimeError(f"{path}: incomplete feature-attribution response")
             latency = float(meta["e2e_latency"])
             throughput = TOKENS / latency
             output_hash = token_hash(payload["output_ids"])
@@ -1111,18 +1051,20 @@ def analyze_foundation_ablation() -> None:
             )
         if len(config_hashes) != 1:
             raise RuntimeError(
-                f"foundation {config.name}: non-deterministic output "
+                f"feature attribution {config.name}: non-deterministic output "
                 f"{config_hashes}"
             )
 
-    full_values = values_by_group["full foundation"]
+    full_values = values_by_group["complete feature set"]
     baseline_values = values_by_group["baseline"]
     full_mean = statistics.mean(full_values)
     baseline_mean = statistics.mean(baseline_values)
-    group_order = list(dict.fromkeys(c.group for c in FOUNDATION_CONFIGURATIONS))
+    group_order = list(
+        dict.fromkeys(c.group for c in FEATURE_ATTRIBUTION_CONFIGURATIONS)
+    )
     omitted_by_group = {
         config.group: config.omitted_concept
-        for config in FOUNDATION_CONFIGURATIONS
+        for config in FEATURE_ATTRIBUTION_CONFIGURATIONS
     }
     summary_rows: list[dict] = []
     for group in group_order:
@@ -1183,15 +1125,15 @@ def analyze_foundation_ablation() -> None:
         "benchmark_date": "2026-07-16",
         "hardware": "Tenstorrent Blackhole P150",
         "firmware_observed_at_startup": "19.6.0",
-        "libtt_foundation_commit": "9978a9b2017de067d0892f67811e5bb7ffc3cc7e",
-        "functional_baseline_commit": "7482967",
+        "complete_feature_set_source_revision": "9978a9b2017de067d0892f67811e5bb7ffc3cc7e",
+        "functional_baseline_source_revision": "7482967",
         "baseline_compatibility_note": (
             "The baseline keeps the build-only NoC public-UMD include patch "
-            "from 9978a9b; all six performance concepts are removed."
+            "from the complete feature set; all six performance features are removed."
         ),
         "sglang_jax": {
             "path": "/home/pcmoritz/sglang-jax",
-            "commit": "24eb823ed97e58ef83ab04b33cab8283ed003acb",
+            "source_revision": "24eb823ed97e58ef83ab04b33cab8283ed003acb",
             "dirty_files_preserved": [
                 "python/sgl_jax/srt/managers/tp_worker.py",
                 "python/sgl_jax/srt/model_executor/model_runner.py",
@@ -1238,12 +1180,11 @@ def analyze_foundation_ablation() -> None:
             ],
         },
         "build_only_patch": "noc_debugging_use_public_umd_include.patch",
-        "raw_directory": str(FOUNDATION_RAW_DIR),
+        "raw_directory": str(FEATURE_ATTRIBUTION_RAW_DIR),
     }
     (DATA_DIR / "foundation-ablation-manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n"
     )
-    write_foundation_ablation_svg(summary_rows)
 
 
 def main() -> None:
@@ -1254,8 +1195,8 @@ def main() -> None:
     previous: list[float] | None = None
     baseline_mean: float | None = None
 
-    for variant in VARIANTS:
-        retained = retained_json(variant)
+    for configuration in CONFIGURATIONS:
+        retained = retained_json(configuration)
         throughputs: list[float] = []
         hashes: set[str] = set()
         for sample_index, (path, payload) in enumerate(retained, 1):
@@ -1265,8 +1206,8 @@ def main() -> None:
             throughputs.append(throughput)
             hashes.add(output_hash)
             samples.append({
-                "variant": variant.label,
-                "commit": variant.commit,
+                "configuration": configuration.name,
+                "source_revision": configuration.source_revision,
                 "sample": sample_index,
                 "source_file": path.name,
                 "e2e_latency_s": f"{latency:.9f}",
@@ -1275,7 +1216,10 @@ def main() -> None:
                 "output_sha256_12": output_hash,
             })
         if len(hashes) != 1:
-            raise RuntimeError(f"{variant.label}: retained requests are not token-deterministic: {hashes}")
+            raise RuntimeError(
+                f"{configuration.name}: retained requests are not "
+                f"token-deterministic: {hashes}"
+            )
 
         mean = statistics.mean(throughputs)
         stddev = statistics.stdev(throughputs)
@@ -1291,10 +1235,10 @@ def main() -> None:
             incremental = 100.0 * (mean / statistics.mean(previous) - 1.0)
             p_value = float(stats.ttest_ind(throughputs, previous, equal_var=False).pvalue)
         summaries.append({
-            "variant": variant.label,
-            "commit": variant.commit,
-            "optimization": variant.optimization,
-            "plot_label": variant.plot_label,
+            "configuration": configuration.name,
+            "source_revision": configuration.source_revision,
+            "optimization": configuration.optimization,
+            "plot_label": configuration.plot_label,
             "n": len(throughputs),
             "mean_tps": mean,
             "stddev_tps": stddev,
@@ -1312,7 +1256,7 @@ def main() -> None:
 
     assert baseline_mean is not None
     assert previous is not None
-    previous = append_final_streaming_stage(
+    previous = append_final_streaming_configuration(
         samples,
         summaries,
         baseline_mean,
@@ -1320,7 +1264,7 @@ def main() -> None:
     )
 
     # Holm's step-down correction controls family-wise error across the
-    # adjacent-stage comparisons while preserving the raw Welch p.
+    # adjacent-configuration comparisons while preserving the raw Welch p.
     tested = sorted(summaries[1:], key=lambda row: row["welch_p_value"])
     running_max = 0.0
     for rank, row in enumerate(tested):
@@ -1344,7 +1288,7 @@ def main() -> None:
     write_upstream_comparison_svg(upstream)
     analyze_latest_main_streaming()
     analyze_current_kernel_experiments()
-    analyze_foundation_ablation()
+    analyze_feature_attribution()
 
 
 if __name__ == "__main__":

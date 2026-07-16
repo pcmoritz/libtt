@@ -3,7 +3,7 @@
 <style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1.2}.grid{stroke:#d0d0d0;stroke-width:1}.libtt{fill:#333}.upstream{fill:#aaa}.ci{stroke:#111;stroke-width:2.5}.label{font-size:14px}.small{font-size:12px;fill:#444}.value{font-size:15px;font-weight:700}.title{font-size:21px;font-weight:700}.legend{font-size:13px}</style>
 <text x="100" y="29" class="title">Same-clock Qwen3-8B streaming comparison</text>
 <rect x="608" y="16" width="16" height="16" rx="2" class="libtt"/>
-<text x="631" y="29" class="legend">libtt 37d5460</text>
+<text x="631" y="29" class="legend">libtt current</text>
 <rect x="760" y="16" width="16" height="16" rx="2" class="upstream"/>
 <text x="783" y="29" class="legend">TTIS v0.10.0</text>
 <line x1="100" y1="395.0" x2="950" y2="395.0" class="grid"/>

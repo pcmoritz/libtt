@@ -3,12 +3,12 @@
   "benchmark_date": "2026-07-16",
   "hardware": "Tenstorrent Blackhole P150",
   "firmware_observed_at_startup": "19.6.0",
-  "libtt_foundation_commit": "9978a9b2017de067d0892f67811e5bb7ffc3cc7e",
-  "functional_baseline_commit": "7482967",
-  "baseline_compatibility_note": "The baseline keeps the build-only NoC public-UMD include patch from 9978a9b; all six performance concepts are removed.",
+  "complete_feature_set_source_revision": "9978a9b2017de067d0892f67811e5bb7ffc3cc7e",
+  "functional_baseline_source_revision": "7482967",
+  "baseline_compatibility_note": "The baseline keeps the build-only NoC public-UMD include patch from the complete feature set; all six performance features are removed.",
   "sglang_jax": {
     "path": "/home/pcmoritz/sglang-jax",
-    "commit": "24eb823ed97e58ef83ab04b33cab8283ed003acb",
+    "source_revision": "24eb823ed97e58ef83ab04b33cab8283ed003acb",
     "dirty_files_preserved": [
       "python/sgl_jax/srt/managers/tp_worker.py",
       "python/sgl_jax/srt/model_executor/model_runner.py",

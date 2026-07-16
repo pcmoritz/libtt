@@ -39,68 +39,57 @@
 <line x1="84.0" y1="379.9" x2="96.0" y2="379.9" class="ci"/>
 <line x1="84.0" y1="382.4" x2="96.0" y2="382.4" class="ci"/>
 <circle cx="90.0" cy="381.1" r="7" class="dot"/>
-<text x="90.0" y="443" text-anchor="middle" class="label">V0</text>
-<text x="90.0" y="462" text-anchor="middle" class="small">baseline</text>
+<text x="90.0" y="446" text-anchor="middle" class="small">baseline</text>
 <line x1="176.5" y1="280.0" x2="176.5" y2="285.5" class="ci"/>
 <line x1="170.5" y1="280.0" x2="182.5" y2="280.0" class="ci"/>
 <line x1="170.5" y1="285.5" x2="182.5" y2="285.5" class="ci"/>
 <circle cx="176.5" cy="282.7" r="7" class="dot"/>
-<text x="176.5" y="443" text-anchor="middle" class="label">V1</text>
-<text x="176.5" y="462" text-anchor="middle" class="small">decode foundation</text>
+<text x="176.5" y="446" text-anchor="middle" class="small">compiler</text>
 <line x1="263.0" y1="262.4" x2="263.0" y2="267.8" class="ci"/>
 <line x1="257.0" y1="262.4" x2="269.0" y2="262.4" class="ci"/>
 <line x1="257.0" y1="267.8" x2="269.0" y2="267.8" class="ci"/>
 <circle cx="263.0" cy="265.1" r="7" class="dot"/>
-<text x="263.0" y="443" text-anchor="middle" class="label">V2</text>
-<text x="263.0" y="462" text-anchor="middle" class="small">SiLU graph</text>
+<text x="263.0" y="446" text-anchor="middle" class="small">SiLU graph</text>
 <line x1="349.5" y1="256.0" x2="349.5" y2="261.6" class="ci"/>
 <line x1="343.5" y1="256.0" x2="355.5" y2="256.0" class="ci"/>
 <line x1="343.5" y1="261.6" x2="355.5" y2="261.6" class="ci"/>
 <circle cx="349.5" cy="258.8" r="7" class="dot"/>
-<text x="349.5" y="443" text-anchor="middle" class="label">V3</text>
-<text x="349.5" y="462" text-anchor="middle" class="small">QKV graph</text>
+<text x="349.5" y="446" text-anchor="middle" class="small">QKV graph</text>
 <line x1="436.0" y1="265.1" x2="436.0" y2="271.3" class="ci"/>
 <line x1="430.0" y1="265.1" x2="442.0" y2="265.1" class="ci"/>
 <line x1="430.0" y1="271.3" x2="442.0" y2="271.3" class="ci"/>
 <circle cx="436.0" cy="268.2" r="7" class="dot"/>
-<text x="436.0" y="443" text-anchor="middle" class="label">V4</text>
-<text x="436.0" y="462" text-anchor="middle" class="small">shared LHS</text>
+<text x="436.0" y="446" text-anchor="middle" class="small">shared LHS</text>
 <line x1="522.5" y1="191.3" x2="522.5" y2="195.9" class="ci"/>
 <line x1="516.5" y1="191.3" x2="528.5" y2="191.3" class="ci"/>
 <line x1="516.5" y1="195.9" x2="528.5" y2="195.9" class="ci"/>
 <circle cx="522.5" cy="193.6" r="7" class="dot"/>
-<text x="522.5" y="443" text-anchor="middle" class="label">V5</text>
-<text x="522.5" y="462" text-anchor="middle" class="small">RMSNorm shard</text>
+<text x="522.5" y="446" text-anchor="middle" class="small">RMSNorm shard</text>
 <line x1="609.0" y1="194.8" x2="609.0" y2="200.5" class="ci"/>
 <line x1="603.0" y1="194.8" x2="615.0" y2="194.8" class="ci"/>
 <line x1="603.0" y1="200.5" x2="615.0" y2="200.5" class="ci"/>
 <circle cx="609.0" cy="197.7" r="7" class="dot"/>
-<text x="609.0" y="443" text-anchor="middle" class="label">V6</text>
-<text x="609.0" y="462" text-anchor="middle" class="small">SiLU multiply</text>
+<text x="609.0" y="446" text-anchor="middle" class="small">SiLU multiply</text>
 <line x1="695.5" y1="177.8" x2="695.5" y2="183.8" class="ci"/>
 <line x1="689.5" y1="177.8" x2="701.5" y2="177.8" class="ci"/>
 <line x1="689.5" y1="183.8" x2="701.5" y2="183.8" class="ci"/>
 <circle cx="695.5" cy="180.8" r="7" class="dot"/>
-<text x="695.5" y="443" text-anchor="middle" class="label">V7</text>
-<text x="695.5" y="462" text-anchor="middle" class="small">Dst SwiGLU</text>
+<text x="695.5" y="446" text-anchor="middle" class="small">Dst SwiGLU</text>
 <line x1="782.0" y1="179.4" x2="782.0" y2="184.7" class="ci"/>
 <line x1="776.0" y1="179.4" x2="788.0" y2="179.4" class="ci"/>
 <line x1="776.0" y1="184.7" x2="788.0" y2="184.7" class="ci"/>
 <circle cx="782.0" cy="182.0" r="7" class="dot"/>
-<text x="782.0" y="443" text-anchor="middle" class="label">V8</text>
-<text x="782.0" y="462" text-anchor="middle" class="small">one path</text>
+<text x="782.0" y="446" text-anchor="middle" class="small">one path</text>
 <line x1="868.5" y1="113.3" x2="868.5" y2="120.9" class="ci"/>
 <line x1="862.5" y1="113.3" x2="874.5" y2="113.3" class="ci"/>
 <line x1="862.5" y1="120.9" x2="874.5" y2="120.9" class="ci"/>
 <circle cx="868.5" cy="117.1" r="7" class="dot"/>
-<text x="868.5" y="443" text-anchor="middle" class="label">V9</text>
-<text x="868.5" y="462" text-anchor="middle" class="small">prefill trace</text>
+<text x="868.5" y="446" text-anchor="middle" class="small">prefill trace</text>
 <line x1="955.0" y1="73.9" x2="955.0" y2="80.1" class="ci"/>
 <line x1="949.0" y1="73.9" x2="961.0" y2="73.9" class="ci"/>
 <line x1="949.0" y1="80.1" x2="961.0" y2="80.1" class="ci"/>
 <circle cx="955.0" cy="77.0" r="7" class="dot"/>
-<text x="955.0" y="443" text-anchor="middle" class="label">V10</text>
-<text x="955.0" y="462" text-anchor="middle" class="small">MLP kernels</text>
+<text x="955.0" y="446" text-anchor="middle" class="small">MLP kernels</text>
 <text transform="translate(23 227.5) rotate(-90)" text-anchor="middle" class="label">tokens/s (mean and 95% t interval)</text>
-<text x="90" y="505" class="small">32 retained requests per stage; two compile/warm-up requests excluded; V10 uses the streaming E2E clock.</text>
+<text x="90" y="505" class="small">32 retained requests per configuration; two compile/warm-up requests excluded; the final point uses the streaming E2E clock.</text>
 </svg>
