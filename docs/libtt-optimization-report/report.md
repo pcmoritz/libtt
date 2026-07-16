@@ -145,53 +145,63 @@ intermediate is packed or written to DRAM directly determine token latency.
 
 ## Why the TPU software architecture fits Tenstorrent
 
-The relevant similarity between TPU and Tenstorrent is not instruction-set
-compatibility but their physical data and communication contracts. First,
-matrix-ready formats are tiled in device DRAM, not created only as temporary
-register fragments inside one kernel.
+TPUs and Tenstorrent accelerators have two important things in common. Their
+main matrix paths use tiled tensors in device DRAM, and their systems connect
+chips with fast direct links. Both features make compiler support central to
+performance.
 
-XLA/TPU assigns physical tiled layouts to buffers. Its documented TPU formats
-include a common `8x128` tile and a BF16 `(8,128)(2,1)` format, with padding
-when logical dimensions do not fill a tile [8]. Tenstorrent uses a 32-by-32
-tile for most Tensix compute and data movement. Tile-layout tensors are padded
-and can reside in DRAM or L1; the matrix engine operates on 16-by-16 faces
-[18, 27]. Decode can therefore stream complete tiles from GDDR6 into per-core
-L1 without reconstructing them from a row-major DRAM buffer.
+First, the physical layout of a tensor matters across operations. XLA assigns
+tiled layouts to TPU buffers and pads shapes that do not fill a tile [8].
+Tenstorrent uses 32-by-32 tiles for most Tensix matrix compute and data
+movement. Tiled tensors can be stored in DRAM or L1 [18, 27]. The compiler and
+runtime must choose the tile layout, padding, memory location, and sharding,
+then keep compatible layouts between producers and consumers. If every
+operation changes the layout, the extra reads, writes, and conversions can
+remove much of the accelerator's benefit.
 
-A conventional GPU interface can keep row-major or strided device memory
-across operator boundaries. CUDA's tensor-span model directly represents a
-row-major layout, from which a kernel can load a tiled view [5]. Tensor Cores
-are still tiled internally and some libraries use packed formats; the
-difference is that tiling need not persist in DRAM between operations.
+This makes a compiler a basic part of a fast TPU or Tenstorrent path. It must
+plan physical layouts across the graph, not only select an arithmetic kernel.
+The optimizations in this report follow that model: StableHLO keeps logical
+tensors above the device boundary, while TT-MLIR and TTNN carry the tiled
+physical layout below it.
 
-Second, both architectures expose a geometric interconnect. TPU slices connect
-chips through high-speed ICI in two- or three-dimensional topologies [3]. A
-Tenstorrent processor uses a high-bandwidth two-dimensional torus NoC to join
-Tensix cores, DRAM controllers, and I/O nodes; hardware multicast can deliver
-one transfer directly into the L1 of several cores [16]. The scales differ:
-ICI is an inter-chip fabric, while the NoC discussed here is on-chip and
-cross-device Tenstorrent links form a separate level. In both cases,
-coordinates and routes are visible performance constraints, so placement,
-sharding, multicast, and collective schedules belong in the compiler and
-runtime rather than being hidden behind a uniform memory abstraction.
+The common GPU path is different. GPU tensors can stay row-major or strided in
+global memory. A CUDA kernel can read that array directly and load tiles into
+registers or shared memory for its own work [5]. The next kernel can read the
+same row-major or strided buffer. It does not first need a persistent tiled
+DRAM layout. This is why eager GPU execution can be efficient: each operation
+can launch an optimized kernel on the existing data without a layout
+conversion before every launch. GPU graph compilers still improve fusion,
+launch overhead, and scheduling, but a whole-graph compiler is less central to
+the basic execution model.
+
+Second, TPU and Tenstorrent systems both provide fast links between chips. TPU
+slices connect chips through high-speed ICI in two- or three-dimensional
+topologies [3]. A Blackhole P150 card has four 800 Gbps ports that connect
+directly to other Blackhole cards [12]. Tenstorrent Galaxy systems connect
+Blackhole chips in grid or torus topologies [34]. These links let the system
+act as a mesh of accelerators rather than a set of unrelated PCIe devices.
+
+At this scale, the compiler and runtime must decide how to shard tensors, place
+work, and schedule collectives over the chip topology. This report benchmarks
+one P150, so it does not measure multi-chip execution. The interconnect still
+supports the same long-term software design: graph compilation above a device
+mesh with explicit layout, placement, and communication.
 
 \begingroup\small
 
-| Execution path | Physical device-memory contract | Software consequence |
+| Execution path | Device data and links | Software consequence |
 |:--|:--|:--|
-| XLA on TPU | Padded TPU tile formats. | The compiler owns layout, fusion, and data movement. |
-| libtt on Tenstorrent | The main matrix path uses tiles in DRAM and L1; TT-MLIR and TTNN carry layout, memory, and sharding. | Propagate layouts and avoid retiles between operations. |
-| Conventional GPU operator path | Row-major or strided global-memory tensors can remain between operations; kernels tile on load. | Tiling can stay inside an operation or generated kernel. |
+| XLA on TPU | Tiled buffers in device memory; chips linked by high-speed ICI. | The compiler plans layout, sharding, communication, and execution. |
+| libtt on Tenstorrent | The main matrix path uses tiles in DRAM and L1; Blackhole cards have direct high-speed links. | Keep layouts across operations and plan work over the device mesh. |
+| Eager GPU path | Row-major or strided buffers can remain in global memory; kernels tile on load. | Optimized kernels can run directly on existing buffers without a graph-wide layout plan. |
 
 \endgroup
 
-The TPU software architecture—a stable graph boundary followed by
-compiler-owned physical layout, topology-aware communication, and execution—is
-therefore a closer fit for Tenstorrent than an operator-at-a-time GPU
-integration. StableHLO preserves logical tensors above libtt; TT-MLIR chooses
-their tile, padding, memory, and shard representation below it. GPUs also
-benefit from graph compilers; the distinction is how persistently physical
-layout and interconnect topology shape the program between operations.
+This is why the TPU software architecture fits Tenstorrent. Both need software
+that starts from a graph, assigns tiled physical layouts, and plans execution
+over a connected set of chips. A GPU-style eager interface can also work, but
+it leaves more layout and communication decisions to model and operator code.
 
 ## Runtime and operator layers
 
@@ -1246,3 +1256,5 @@ are added.
     <https://proceedings.neurips.cc/paper/2019/hash/1e8a19426224ca89e83cef47f1e7f53b-Abstract.html>
 33. P. Moritz, “Add TT backend for Qwen3 serving,” SGLang-JAX pull request
     no. 1, 2026. <https://github.com/pcmoritz/sglang-jax/pull/1>
+34. Tenstorrent, “Tenstorrent Galaxy (Blackhole) User Guide,” version 1.4,
+    2026. <https://docs.tenstorrent.com/systems/galaxy-blackhole/index.html>
