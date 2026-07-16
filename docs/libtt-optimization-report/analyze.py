@@ -202,8 +202,8 @@ def write_incremental_svg(summaries: list[dict]) -> None:
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1.2}.grid{stroke:#dbe4ee;stroke-width:1}.pos{fill:#006d77}.neg{fill:#c84b31}.neutral{fill:#8395a7}.label{font-size:14px}.small{font-size:12px;fill:#526174}.value{font-size:13px;font-weight:700}.title{font-size:21px;font-weight:700}</style>',
-        '<text x="90" y="29" class="title">Incremental effect of each cumulative revision</text>',
+        '<style>text{font-family:Inter,Helvetica,Arial,sans-serif;fill:#172033}.axis{stroke:#718096;stroke-width:1.2}.grid{stroke:#dbe4ee;stroke-width:1}.pos{fill:#006d77}.neg{fill:#c84b31}.label{font-size:14px}.small{font-size:12px;fill:#526174}.value{font-size:13px;font-weight:700}.title{font-size:21px;font-weight:700}</style>',
+        '<text x="90" y="29" class="title">Incremental throughput change</text>',
     ]
     for tick in (-2, 0, 4, 8, 12, 16, 20, 24):
         yy = y(tick)
@@ -216,7 +216,7 @@ def write_incremental_svg(summaries: list[dict]) -> None:
         bw = bar_slot * 0.64
         yy = y(value)
         rect_y, rect_h = min(yy, zero), abs(zero - yy)
-        klass = "neutral" if row["holm_adjusted_p"] >= 0.05 else ("pos" if value >= 0 else "neg")
+        klass = "pos" if value >= 0 else "neg"
         value_y = yy - 8 if value >= 0 else yy + 18
         parts.extend([
             f'<rect x="{xx:.1f}" y="{rect_y:.1f}" width="{bw:.1f}" height="{max(rect_h, 1):.1f}" rx="3" class="{klass}"/>',
@@ -224,8 +224,8 @@ def write_incremental_svg(summaries: list[dict]) -> None:
             f'<text x="{xx+bw/2:.1f}" y="{height-bottom+29}" text-anchor="middle" class="label">{esc(row["variant"])}</text>',
             f'<text x="{xx+bw/2:.1f}" y="{height-bottom+48}" text-anchor="middle" class="small">{esc(row["plot_label"])}</text>',
         ])
-    parts.append(f'<text transform="translate(23 {top+plot_h/2}) rotate(-90)" text-anchor="middle" class="label">throughput change vs. preceding revision</text>')
-    parts.append('<text x="90" y="482" class="small">Teal/red: Holm-adjusted p&lt;0.05; gray: not statistically distinguishable from the preceding revision.</text>')
+    parts.append(f'<text transform="translate(23 {top+plot_h/2}) rotate(-90)" text-anchor="middle" class="label">throughput change vs. preceding stage</text>')
+    parts.append('<text x="90" y="482" class="small">Bars show the measured throughput change from the preceding stage.</text>')
     parts.append('</svg>')
     (FIGURE_DIR / "incremental-speedup.svg").write_text("\n".join(parts) + "\n")
 
