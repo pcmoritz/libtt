@@ -137,14 +137,10 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -5,5 +5,7 @@
- #include "ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h"
-
-+#include "ttmlir/Conversion/TTIRToTTNN/Utils.h"
- #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+@@ -9,2 +9,3 @@
+ #include "ttmlir/Dialect/TTNN/Transforms/Fusing/DecodeLayoutTransform.h"
  #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
 +#include "ttmlir/Utils.h"
-
 @@ -572,6 +573,163 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
@@ -309,7 +305,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +1022,63 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +1022,65 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
@@ -361,7 +357,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +      /*overlap_qk_coregrid=*/BoolAttr(),
 +      /*slice_size=*/IntegerAttr());
 +
++  rewriter.setInsertionPoint(q.decodeReshapeOp);
 +  auto qNorm = createRank4RMSNorm(rewriter, q.rmsNormOp, decodeOp.getQuery());
++  rewriter.setInsertionPoint(k.decodeReshapeOp);
 +  auto kNorm = createRank4RMSNorm(rewriter, k.rmsNormOp, decodeOp.getKey());
 +
 +  rewriter.replaceOp(q.decodeReshapeOp, qNorm.getResult());
@@ -376,12 +374,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -378,6 +378,8 @@ public:
-       patterns.add<fusing::RoPEDecodeFusing>(&getContext());
-       patterns.add<fusing::SDPAFusing>(&getContext(), validationConfig);
+@@ -473,3 +473,5 @@ public:
        patterns.add<NLPConcatHeadsDecodeFusing>(&getContext());
 +      patterns.add<fusing::NLPDecodeQKVProjectionFusing>(&getContext(),
 +                                                         validationConfig);
        patterns.add<fusing::SplitQueryKeyValueAndSplitHeadsFusing<MatmulOp>>(
            &getContext(), validationConfig);
-       patterns.add<fusing::SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>>(

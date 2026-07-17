@@ -6,6 +6,7 @@
 #include <tt-metalium/experimental/fabric/routing_table_generator.hpp>
 #include <tt-metalium/experimental/fabric/topology_mapper.hpp>
 #include <tt-metalium/experimental/inspector_config.hpp>
+#include <tt-metalium/internal/cluster.hpp>
 
 #include "tt_metal/fabric/channel_trimming_export.hpp"
 #include "tt_metal/fabric/fabric_builder_context.hpp"
@@ -88,6 +89,15 @@ void add_config_callback(ConfigCallback) {}
 PhysicalSystemDescriptor::~PhysicalSystemDescriptor() = default;
 
 } // namespace tt::tt_metal
+
+namespace tt::tt_metal::internal {
+
+AsicID get_chip_unique_id_from_fabric_node_id(uint32_t mesh_id,
+                                              uint32_t chip_id) {
+  return AsicID{(static_cast<uint64_t>(mesh_id) << 32) | chip_id};
+}
+
+} // namespace tt::tt_metal::internal
 
 namespace tt {
 

@@ -534,10 +534,8 @@ index 7c87d0e..1669eb0 100644
      const auto& config = operation_attributes.program_config.value();
  
      return std::visit(
-@@ -751,6 +754,29 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
-         "Inputs to matmul must be tilized");
+@@ -2125,3 +2128,26 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
      validate_matmul_matrix_dimensions(a_shape, b_shape, a_shape_padded, b_shape_padded, in0_tile, in1_tile);
- 
 +    if (attributes.fused_swiglu) {
 +        TT_FATAL(!attributes.transpose_a && !attributes.transpose_b, "SwiGLU matmul does not support transpose");
 +        TT_FATAL(a_shape.size() == 2 && b_shape.size() == 2 && a_shape[-2] > 0 &&
@@ -554,17 +552,16 @@ index 7c87d0e..1669eb0 100644
 +                     attributes.output_mem_config == DRAM_MEMORY_CONFIG,
 +                 "SwiGLU matmul currently requires DRAM-interleaved tensors");
 +        TT_FATAL(optional_input_tensors.size() == 1 && !optional_input_tensors[0].has_value() &&
-+                     optional_output_tensors.size() == 1 && !optional_output_tensors[0].has_value(),
++                     args.optional_output_tensors.size() == 1 && !args.optional_output_tensors[0].has_value(),
 +                 "SwiGLU matmul does not support bias or caller-provided output");
 +        auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
 +        TT_FATAL(grid.x >= 11 && grid.y >= 9, "SwiGLU matmul requires at least an 11x9 worker grid");
 +        return;
 +    }
 +
-     const bool is_optional_output_tensor =
-         !optional_output_tensors.empty() && optional_output_tensors.at(0).has_value();
- 
-@@ -1820,8 +1846,13 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
+     validate_matmul_bfloat4_tile_dims(input_tensor_a, input_tensor_b, in0_tile, in1_tile);
+     validate_matmul_optional_tensors(attributes, args);
+@@ -2280,8 +2306,13 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
      const auto& input_tensor_b = input_tensors.at(1);
  
      // Use the compute_matmul_output_shape function to get the output shape
@@ -579,7 +576,7 @@ index 7c87d0e..1669eb0 100644
  
      const auto& a_shape_padded =
          operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
-@@ -2280,7 +2311,8 @@ MatmulParams create_matmul_attributes(
+@@ -2754,7 +2785,8 @@ MatmulParams create_matmul_attributes(
          parameters.transpose_b,
          output_tile,
          parameters.global_cb,

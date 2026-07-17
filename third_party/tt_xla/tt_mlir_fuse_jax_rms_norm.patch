@@ -84,3 +84,12 @@
 +      x = swappedX;
 +      gammaRaw = xRaw;
      }
+@@ -2965,2 +2974,4 @@ public:
+     mlir::Value gamma = lookThroughSafeOps(gammaRaw);
+     llvm::SmallVector<int64_t> normalizedShape{normalizedDimSize};
++
++    rewriter.setInsertionPoint(outerMul);
+@@ -3006,3 +3017 @@ public:
+-    rewriter.setInsertionPoint(outerMul);
+-
+     // Create RMSNormOp with output shape and dtype matching input.

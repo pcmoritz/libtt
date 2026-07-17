@@ -1,13 +1,10 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
-@@ -64,5 +64,6 @@
-     CoreRangeSet hop_cores;
-     std::size_t num_global_cb_receivers{};
+@@ -67,2 +67,3 @@
      bool untilize_out{};
      std::optional<CoreRangeSet> allowed_worker_cores = std::nullopt;
 +    bool balance_per_core_N{};
- };
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
@@ -157,9 +154,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
              } else {
                  // padding args (READER)
                  mm_in1_sender_writer_args.push_back(out_block_w);
-@@ -3858,10 +3889,10 @@
- 
-             mm_in1_sender_writer_args.push_back(bias_tensor.has_value() ? (std::uint32_t)bias_tensor->address() : 0);
+@@ -3858,11 +3889,11 @@
+             // Bias base address placeholder; rebound to a tensor binding via in1_sender_variant[18] below.
+             mm_in1_sender_writer_args.push_back(
+                 bias_tensor.has_value() ? (std::uint32_t)bias_tensor->address() : 0);  // smuggled-rta-ok
              mm_in1_sender_writer_args.push_back(
 -                bias_tensor.has_value() ? (std::uint32_t)per_core_N * output_idx_x : 0);  // in3_tensor_start_tile_id
 +                bias_tensor.has_value() ? (std::uint32_t)core_n_start : 0);  // in3_tensor_start_tile_id

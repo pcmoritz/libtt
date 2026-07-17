@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#include "operations/conv/conv1d.h"
 #include "operations/conv/conv3d.h"
 #include "operations/conv/conv2d.h"
 #include "operations/conv/conv_transpose2d.h"
@@ -19,6 +20,10 @@ namespace {
                            " is not linked in this libtt build");
 }
 } // namespace
+
+void run(const ::tt::target::ttnn::Conv1dOp *, ProgramContext &) {
+  unsupported("ttnn Conv1dOp");
+}
 
 void run(const ::tt::target::ttnn::Conv2dOp *, ProgramContext &) {
   unsupported("ttnn Conv2dOp");

@@ -106,10 +106,10 @@ http_archive(
 http_archive(
     name = "tracy",
     build_file = "//third_party/tracy:BUILD.overlay.bazel",
-    sha256 = "171ffc00974781d547eab7732f99ac6d0fc67561d8ba1cba14dc6a8db2bb49a2",
-    strip_prefix = "tracy-b3437e6b8bd383af24511db6d82a96e5933b6f64",
+    sha256 = "d038332ad0529d9bc331489495584758e9f30f359577e27b5a917220f589f20d",
+    strip_prefix = "tracy-27221a69789f24d492135093e096b978b4ca3a68",
     urls = [
-        "https://github.com/tenstorrent-metal/tracy/archive/b3437e6b8bd383af24511db6d82a96e5933b6f64.tar.gz",
+        "https://github.com/tenstorrent-metal/tracy/archive/27221a69789f24d492135093e096b978b4ca3a68.tar.gz",
     ],
 )
 
@@ -137,20 +137,20 @@ http_archive(
     name = "tt_umd",
     build_file = "//third_party/tt_umd:BUILD.overlay.bazel",
     patches = ["//third_party/tt_umd:remove_initial_exec_tls.patch"],
-    sha256 = "8f240d2c984ae8b783b935acb5d3b8a79514304187465c594f6d4aec0835ec65",
-    strip_prefix = "tt-umd-3d6c4909f06f801b441a78931f0eea9c6619e6e2",
+    sha256 = "5d13c886dce663ed782e50b4fdb47c89f3956f97489f7782f953e8f4779152fc",
+    strip_prefix = "tt-umd-bc77ac2f7382ffeb9fa5430055f0854d53979489",
     urls = [
-        "https://github.com/tenstorrent/tt-umd/archive/3d6c4909f06f801b441a78931f0eea9c6619e6e2.tar.gz",
+        "https://github.com/tenstorrent/tt-umd/archive/bc77ac2f7382ffeb9fa5430055f0854d53979489.tar.gz",
     ],
 )
 
 http_archive(
     name = "sfpi",
     build_file = "//third_party/sfpi:BUILD.overlay.bazel",
-    sha256 = "87acd854b973b571aa754abcfef0afbaebeb9aa456c02aa0eeb783c1a22c0a73",
+    sha256 = "e10185760ec9c75a5d248e8a08b992fd67d6b7d1d57e2ccef80de5cb5c17d47a",
     strip_prefix = "sfpi",
     urls = [
-        "https://github.com/tenstorrent/sfpi/releases/download/7.60.0-shft-39709/sfpi_7.60.0-shft-39709_x86_64_debian.txz",
+        "https://github.com/tenstorrent/sfpi/releases/download/7.67.0/sfpi_7.67.0_x86_64_debian.txz",
     ],
 )
 
@@ -187,10 +187,10 @@ http_archive(
         "//third_party/tt_metal:sdpa_decode_allow_l1_interleaved_q.patch",
         "//third_party/tt_metal:layernorm_allow_single_core_height_sharded.patch",
     ],
-    sha256 = "6a59d4c18fa7c4ba0da2e0317885e9f556624c3346fb37b976b08875d07d185f",
-    strip_prefix = "tt-metal-13adda80c119631d18b0bc06163416ba148c25ab",
+    sha256 = "f56e21da4f169ce51d15d30962921a6f1f270ad6f21d10b2512ad4c1bc293981",
+    strip_prefix = "tt-metal-e07514c48bb29d04451d1a42eaf1f9f6e977d33a",
     urls = [
-        "https://github.com/tenstorrent/tt-metal/archive/13adda80c119631d18b0bc06163416ba148c25ab.tar.gz",
+        "https://github.com/tenstorrent/tt-metal/archive/e07514c48bb29d04451d1a42eaf1f9f6e977d33a.tar.gz",
     ],
 )
 
@@ -260,7 +260,7 @@ git_repository(
 git_repository(
     name = "tt_mlir_src",
     build_file = "//third_party/tt_xla:tt_mlir.BUILD.bazel",
-    commit = "0427afbec14e5792d0823b6e0ed7849cdf727378",
+    commit = "752750eb0e096d84aedc5c56fb29c4be238e2f82",
     patch_args = ["-p1"],
     patches = [
         "//third_party/tt_xla:tt_mlir_string_map_include.patch",

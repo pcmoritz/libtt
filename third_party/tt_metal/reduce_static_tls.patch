@@ -39,7 +39,11 @@ diff -ruN tt_metal/impl/event/dispatch.cpp tt_metal/impl/event/dispatch.cpp
 diff -ruN tt_metal/impl/program/dispatch.cpp tt_metal/impl/program/dispatch.cpp
 --- tt_metal/impl/program/dispatch.cpp
 +++ tt_metal/impl/program/dispatch.cpp
-@@ -476,7 +476,7 @@
+@@ -465,2 +465,2 @@
+ void fill_runtime_args_watcher_pattern(uint32_t* dst, uint32_t num_words) {
+-    thread_local static std::mt19937 gen(std::random_device{}());
++    std::mt19937 gen(std::random_device{}());
+@@ -520,7 +520,7 @@
          std::is_same_v<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd> or
          std::is_same_v<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>);
 
@@ -48,7 +52,7 @@ diff -ruN tt_metal/impl/program/dispatch.cpp tt_metal/impl/program/dispatch.cpp
          [](uint32_t num_packed_cmds, uint32_t runtime_args_len, bool is_unicast, bool no_stride) {
              uint32_t l1_alignment = MetalContext::instance().hal().get_alignment(HalMemType::L1);
              uint32_t sub_cmd_sizeB =
-@@ -487,7 +487,7 @@
+@@ -531,7 +531,7 @@
                  (no_stride ? 1 : num_packed_cmds) * tt::align(runtime_args_len * sizeof(uint32_t), l1_alignment);
              return dispatch_cmd_sizeB + aligned_runtime_data_sizeB;
          };
@@ -57,12 +61,3 @@ diff -ruN tt_metal/impl/program/dispatch.cpp tt_metal/impl/program/dispatch.cpp
                                                                 uint32_t /*runtime_args_len*/,
                                                                 bool is_unicast) {
          uint32_t l1_alignment = MetalContext::instance().hal().get_alignment(HalMemType::L1);
-@@ -535,7 +535,7 @@
-             uint32_t total_words = (calculator.write_offset_bytes() - data_offset) / sizeof(uint32_t);
-             uint32_t* command_start_ptr =
-                 reinterpret_cast<uint32_t*>(command_obj.data()) + (data_offset / sizeof(uint32_t));
--            thread_local static std::mt19937 gen(std::random_device{}());
-+            std::mt19937 gen(std::random_device{}());
-             std::uniform_int_distribution<int> dist(0, 65535);
-             for (uint32_t count = 0; count < total_words; count++) {
-                 uint16_t rnd = static_cast<uint16_t>(dist(gen));
