@@ -193,30 +193,29 @@ Tensor gelu_bw(const Tensor &, const Tensor &, const std::string &,
 }
 
 WeightMemoryConfigs get_weight_mem_configs(MeshDevice *, uint32_t, uint32_t,
-                                           uint32_t, uint32_t, bool,
-                                           uint32_t) {
+                                           uint32_t, uint32_t, bool) {
   unsupported("ttnn::experimental::get_weight_mem_configs");
 }
 
 Tensor prepare_w0_w1_tensor_for_moe_compute(const Tensor &, const Tensor &,
                                             uint32_t, uint32_t, uint32_t,
-                                            uint32_t, uint32_t) {
+                                            uint32_t) {
   unsupported("ttnn::experimental::prepare_w0_w1_tensor_for_moe_compute");
 }
 
 Tensor prepare_w2_tensor_for_moe_compute(const Tensor &, uint32_t, uint32_t,
-                                         uint32_t, uint32_t, uint32_t) {
+                                         uint32_t, uint32_t) {
   unsupported("ttnn::experimental::prepare_w2_tensor_for_moe_compute");
 }
 
 Tensor prepare_w0_w1_tensor_with_bias(const Tensor &, const Tensor &,
                                       const Tensor &, const Tensor &, uint32_t,
-                                      uint32_t, uint32_t, uint32_t, uint32_t) {
+                                      uint32_t, uint32_t, uint32_t) {
   unsupported("ttnn::experimental::prepare_w0_w1_tensor_with_bias");
 }
 
 Tensor prepare_w2_tensor_with_bias(const Tensor &, const Tensor &, uint32_t,
-                                   uint32_t, uint32_t, uint32_t, uint32_t) {
+                                   uint32_t, uint32_t, uint32_t) {
   unsupported("ttnn::experimental::prepare_w2_tensor_with_bias");
 }
 
@@ -226,15 +225,6 @@ Tensor quantize_weights_via_host(const Tensor &, DataType,
 }
 
 } // namespace ttnn::experimental
-
-namespace ttnn::experimental::prim {
-
-ttsl::hash::hash_t RingAttentionAllGatherAsyncDeviceOperation::compute_program_hash(
-    const operation_attributes_t &, const tensor_args_t &) {
-  return 0;
-}
-
-} // namespace ttnn::experimental::prim
 
 namespace ttnn::experimental::ccl {
 

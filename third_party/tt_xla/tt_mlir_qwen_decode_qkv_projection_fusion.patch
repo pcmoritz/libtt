@@ -137,14 +137,10 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -5,5 +5,7 @@
- #include "ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h"
-
-+#include "ttmlir/Conversion/TTIRToTTNN/Utils.h"
- #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+@@ -9,2 +9,3 @@
+ #include "ttmlir/Dialect/TTNN/Transforms/Fusing/DecodeLayoutTransform.h"
  #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
 +#include "ttmlir/Utils.h"
-
 @@ -572,6 +573,163 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
@@ -376,12 +372,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -378,6 +378,8 @@ public:
-       patterns.add<fusing::RoPEDecodeFusing>(&getContext());
-       patterns.add<fusing::SDPAFusing>(&getContext(), validationConfig);
+@@ -473,3 +473,5 @@ public:
        patterns.add<NLPConcatHeadsDecodeFusing>(&getContext());
 +      patterns.add<fusing::NLPDecodeQKVProjectionFusing>(&getContext(),
 +                                                         validationConfig);
        patterns.add<fusing::SplitQueryKeyValueAndSplitHeadsFusing<MatmulOp>>(
            &getContext(), validationConfig);
-       patterns.add<fusing::SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>>(
