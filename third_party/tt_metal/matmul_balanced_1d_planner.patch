@@ -1,0 +1,177 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
+--- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
+@@ -64,5 +64,6 @@
+     CoreRangeSet hop_cores;
+     std::size_t num_global_cb_receivers{};
+     bool untilize_out{};
+     std::optional<CoreRangeSet> allowed_worker_cores = std::nullopt;
++    bool balance_per_core_N{};
+ };
+diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+@@ -306,7 +306,7 @@
+     const std::optional<const CoreCoord> compute_with_storage_grid_size,
+     const std::optional<const ttnn::DeviceComputeKernelConfig> compute_kernel_config,
+     const tt::tt_metal::DataType output_dtype,
+-    const bool /*all_dram_interleaved*/,
++    const bool all_dram_interleaved,
+     const std::optional<tt::tt_metal::ShardSpec>& user_shard_spec = std::nullopt) {
+     using namespace tt;
+     auto* device = input_tensor_a.device();
+@@ -320,6 +320,11 @@
+     const auto M = utilities::get_M_dim(a_shape_padded, /*tile=*/std::nullopt, fuse_batch);
+     const auto K = utilities::get_K_dim(a_shape_padded, /*tile=*/std::nullopt);
+     const auto N = utilities::get_N_dim(b_shape_padded, /*tile=*/std::nullopt);
++    const uint32_t num_cores = grid_size.x * grid_size.y;
++    const uint32_t n_tiles = N / in1_tile.get_width();
++    const bool balance_per_core_N =
++        all_dram_interleaved && !user_shard_spec.has_value() && mcast_in0 && !out_sharded &&
++        M == in0_tile.get_height() && n_tiles > num_cores && n_tiles < 2 * num_cores;
+     uint32_t per_core_M, per_core_N;
+ 
+     // If user provided a shard spec (BLOCK_SHARDED on 1D grid), derive per_core values from it
+@@ -358,7 +363,8 @@
+         per_core_M = div_up(div_up(M, grid_size.x * grid_size.y), in0_tile.get_height());
+         per_core_N = N / in1_tile.get_width();
+     }
+-    uint32_t in0_block_w = K / in0_tile.get_width() % 2 == 0 ? 2 : 1;
++    const uint32_t k_tiles = K / in0_tile.get_width();
++    uint32_t in0_block_w = balance_per_core_N && k_tiles % 4 == 0 ? 4 : (k_tiles % 2 == 0 ? 2 : 1);
+     bool per_core_N_equals_subblock_w_constraint = out_sharded && !mcast_in0;
+     bool per_core_M_equals_subblock_h_constraint = out_sharded && mcast_in0;
+     bool fp32_dest_acc_en = get_fp32_dest_acc_en(compute_kernel_config);
+@@ -398,5 +404,6 @@
+         .per_core_N = per_core_N,
+         .fuse_batch = fuse_batch,
+         .fused_activation = fused_activation,
+-        .mcast_in0 = mcast_in0};
++        .mcast_in0 = mcast_in0,
++        .balance_per_core_N = balance_per_core_N};
+ }
+diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
+@@ -2910,6 +2910,7 @@
+     uint32_t out_block_w,
+     uint32_t per_core_M,
+     uint32_t per_core_N,
++    bool balance_per_core_N,
+     std::optional<UnaryWithParam> fused_activation,
+     const MeshTensor& in0_tensor,
+     const MeshTensor& in1_tensor,
+@@ -3035,6 +3036,18 @@
+ 
+     uint32_t num_blocks_y = ((M - 1) / per_core_M) + 1;
+     uint32_t num_blocks_x = ((N - 1) / per_core_N) + 1;
++    const uint32_t available_cores = compute_with_storage_grid_size.x * compute_with_storage_grid_size.y;
++    const uint32_t num_wide_cores = balance_per_core_N ? N - available_cores : 0;
++    if (balance_per_core_N) {
++        TT_FATAL(per_core_N == 2, "Balanced-N 1D matmul currently requires per_core_N == 2");
++        TT_FATAL(
++            N > available_cores && N < 2 * available_cores,
++            "Balanced-N 1D matmul requires one or two N tiles per worker");
++        TT_FATAL(
++            !in0_is_sharded && !in1_is_sharded && !output_is_sharded,
++            "Balanced-N 1D matmul currently requires interleaved tensors");
++        num_blocks_x = available_cores;
++    }
+     uint32_t num_blocks_total = num_blocks_y * num_blocks_x;
+     uint32_t num_cores_with_work = num_blocks_total;
+ 
+@@ -3743,6 +3756,24 @@
+         const auto& core = cores[i];
+         uint32_t output_idx_x = i % num_blocks_x;
+         uint32_t output_idx_y = i / num_blocks_x;
++        const bool balanced_narrow_core = balance_per_core_N && i >= num_wide_cores;
++        const uint32_t core_per_core_N = balanced_narrow_core ? per_core_N - 1 : per_core_N;
++        const uint32_t core_n_start =
++            balance_per_core_N ? i + std::min(i, num_wide_cores) : output_idx_x * per_core_N;
++        const bool partial_output_block =
++            balance_per_core_N ? balanced_narrow_core : output_idx_x == num_blocks_x - 1;
++        const uint32_t core_last_out_block_w =
++            core_per_core_N % out_block_w == 0 ? out_block_w : core_per_core_N % out_block_w;
++        const uint32_t core_last_out_num_blocks_w = ((core_per_core_N - 1) / out_block_w) + 1;
++        const uint32_t core_last_block_num_nonzero_subblocks_w =
++            ((core_last_out_block_w - 1) / out_subblock_w) + 1;
++        const uint32_t core_last_subblock_w =
++            core_last_out_block_w % out_subblock_w == 0 ? out_subblock_w : core_last_out_block_w % out_subblock_w;
++        const uint32_t core_padded_subblock_tiles_addr_skip =
++            output_single_tile_size * (out_subblock_w - core_last_subblock_w);
++        const uint32_t core_padded_block_tiles_w_skip =
++            (out_subblock_w * out_subblock_h) *
++            (out_block_w / out_subblock_w - core_last_block_num_nonzero_subblocks_w);
+ 
+         if (in0_is_sharded) {
+             std::vector<uint32_t> mm_in0_sender_args;
+@@ -3811,7 +3842,7 @@
+                 // READER
+                 // in1 tensor args
+                 (std::uint32_t)in1_tensor.address(),
+-                (std::uint32_t)in1_tensor_start_tile_id_stride * output_idx_x,  // in1_tensor_start_tile_id
++                (std::uint32_t)core_n_start * in1_tensor_stride_w,  // in1_tensor_start_tile_id
+                 // in1 mcast args
+                 (std::uint32_t)0,  // in1_mcast_dest_noc_start_x
+                 (std::uint32_t)0,  // in1_mcast_dest_noc_start_y
+@@ -3824,23 +3855,23 @@
+                 // WRITER
+                 // out tensor args
+                 (std::uint32_t)out_tensor.address(),
+-                ((std::uint32_t)output_idx_x * per_core_N) +
++                (std::uint32_t)core_n_start +
+                     (output_idx_y * per_core_M * N)  // out_tensor_start_tile_id
+             };
+ 
+-            if (output_idx_x == num_blocks_x - 1) {
++            if (partial_output_block) {
+                 // padding args (READER)
+-                mm_in1_sender_writer_args.push_back(last_out_block_w);
++                mm_in1_sender_writer_args.push_back(core_last_out_block_w);
+ 
+                 // padding args (WRITER)
+                 mm_in1_sender_writer_args.push_back(in0_last_block_num_nonzero_subblocks_h);
+                 mm_in1_sender_writer_args.push_back(in0_last_subblock_of_last_block_h);
+                 mm_in1_sender_writer_args.push_back(in0_last_block_padded_block_tiles_h_skip);
+                 mm_in1_sender_writer_args.push_back(out_block_w / out_subblock_w);  // out_num_nonzero_subblocks_w
+-                mm_in1_sender_writer_args.push_back(last_block_num_nonzero_subblocks_w);
+-                mm_in1_sender_writer_args.push_back(last_subblock_of_last_block_w);
+-                mm_in1_sender_writer_args.push_back(last_block_padded_subblock_tiles_addr_skip);
+-                mm_in1_sender_writer_args.push_back(last_block_padded_block_tiles_w_skip);
++                mm_in1_sender_writer_args.push_back(core_last_block_num_nonzero_subblocks_w);
++                mm_in1_sender_writer_args.push_back(core_last_subblock_w);
++                mm_in1_sender_writer_args.push_back(core_padded_subblock_tiles_addr_skip);
++                mm_in1_sender_writer_args.push_back(core_padded_block_tiles_w_skip);
+             } else {
+                 // padding args (READER)
+                 mm_in1_sender_writer_args.push_back(out_block_w);
+@@ -3858,10 +3889,10 @@
+ 
+             mm_in1_sender_writer_args.push_back(bias_tensor.has_value() ? (std::uint32_t)bias_tensor->address() : 0);
+             mm_in1_sender_writer_args.push_back(
+-                bias_tensor.has_value() ? (std::uint32_t)per_core_N * output_idx_x : 0);  // in3_tensor_start_tile_id
++                bias_tensor.has_value() ? (std::uint32_t)core_n_start : 0);  // in3_tensor_start_tile_id
+             if (!output_is_sharded) {
+-                if (output_idx_x == num_blocks_x - 1) {
+-                    mm_in1_sender_writer_args.push_back(last_out_num_blocks_w);
++                if (partial_output_block) {
++                    mm_in1_sender_writer_args.push_back(core_last_out_num_blocks_w);
+                 } else {
+                     mm_in1_sender_writer_args.push_back(out_num_blocks_x);
+                 }
+@@ -5112,6 +5143,7 @@
+     auto out_block_w = program_config.out_block_w;
+     auto per_core_M = program_config.per_core_M;
+     auto per_core_N = program_config.per_core_N;
++    auto balance_per_core_N = program_config.balance_per_core_N;
+     auto mcast_in0 = program_config.mcast_in0;
+     auto gather_in0 = program_config.gather_in0;
+ 
+@@ -5226,6 +5258,7 @@
+             out_block_w,
+             per_core_M,
+             per_core_N,
++            balance_per_core_N,
+             program_config.fused_activation,
+             in0_tensor,
+             in1_tensor,
