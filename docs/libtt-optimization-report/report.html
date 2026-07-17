@@ -628,7 +628,7 @@ x[W_{gate}\;W_{up}].
 <h2 data-number="4.17" id="generic-wide-n-matmul-planning"><span class="header-section-number">4.17</span> Generic wide-N matmul planning</h2>
 <p>The current upstream <a href="../../third_party/tt_metal/matmul_balanced_1d_planner.patch">matmul planner patch</a> improves single-tile-row matmuls whose output has more N tiles than available workers. It distributes one or two N tiles per worker when needed, keeps the efficient 108-worker language-model head layout, and chooses larger K blocks for wide outputs. It uses a four-tile K block for narrower wide-N shapes and an eight-tile block for very wide-N shapes, then reduces the width when K divisibility or L1 capacity requires it.</p>
 <p>The planner uses tensor shape, layout, sharding, and device-grid information. It does not identify Qwen or a named projection, and it does not need an environment variable. This lets the same planner decision apply to other matmuls with similar geometry.</p>
-<p>The fresh current-stack measurement includes this planner together with the MLP specialization above. It reaches 30.410 decode tokens/s and 30.236 streaming end-to-end tokens/s. We report the combined current endpoint rather than treating measurements from different dates as an isolated planner A/B.</p>
+<p>The fresh current-stack measurement includes this planner together with the 110-core fused-residual down projection above. It reaches 30.410 decode tokens/s and 30.236 streaming end-to-end tokens/s. We report the combined current endpoint rather than treating measurements from different dates as an isolated planner A/B.</p>
 <h2 data-number="4.18" id="runtime-trace-capture-for-short-prefill"><span class="header-section-number">4.18</span> Runtime trace capture for short prefill</h2>
 <p>Decode replays a recorded TT-Metal command sequence while refreshing request-dependent buffers. Previously, the five-token prompt, padded to one 32-row tile, ran as separate host submissions.</p>
 <p>Setting <code>SGLANG_TT_TRACE_DECODE_ONLY=false</code> records the fixed-shape prefill sequence too. In a same-binary 32-sample A/B test:</p>
@@ -904,7 +904,7 @@ x[W_{gate}\;W_{up}].
 <td style="text-align: right;">+60.61%</td>
 </tr>
 <tr class="odd">
-<td style="text-align: left;">MLP specialization and generic wide-N planner</td>
+<td style="text-align: left;">110-core down projection and generic wide-N planning</td>
 <td style="text-align: right;">30.236 ± 0.241</td>
 <td style="text-align: center;">[30.149, 30.323]</td>
 <td style="text-align: right;">+15.75%</td>

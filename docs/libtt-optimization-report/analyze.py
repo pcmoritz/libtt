@@ -135,7 +135,7 @@ CONFIGURATIONS = [
 FINAL_CONFIGURATION = Configuration(
     "current-stack",
     LIBTT_COMPARISON_COMMIT,
-    "MLP specialization and generic wide-N planner",
+    "110-core down projection and generic wide-N planning",
     "current stack",
     LIBTT_COMPARISON_RAW_DIR,
 )

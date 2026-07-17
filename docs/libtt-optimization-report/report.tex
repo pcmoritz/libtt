@@ -1431,10 +1431,10 @@ does not need an environment variable. This lets the same planner
 decision apply to other matmuls with similar geometry.
 
 The fresh current-stack measurement includes this planner together with
-the MLP specialization above. It reaches 30.410 decode tokens/s and
-30.236 streaming end-to-end tokens/s. We report the combined current
-endpoint rather than treating measurements from different dates as an
-isolated planner A/B.
+the 110-core fused-residual down projection above. It reaches 30.410
+decode tokens/s and 30.236 streaming end-to-end tokens/s. We report the
+combined current endpoint rather than treating measurements from
+different dates as an isolated planner A/B.
 
 \hypertarget{runtime-trace-capture-for-short-prefill}{%
 \subsection{Runtime trace capture for short
@@ -1844,7 +1844,7 @@ Fixed-shape prefill trace\strut
 +60.61\%\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.16\columnwidth}\raggedright
-MLP specialization and generic wide-N planner\strut
+110-core down projection and generic wide-N planning\strut
 \end{minipage} & \begin{minipage}[t]{0.16\columnwidth}\raggedleft
 30.236 ± 0.241\strut
 \end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\centering

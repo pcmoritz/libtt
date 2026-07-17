@@ -846,9 +846,10 @@ environment variable. This lets the same planner decision apply to other
 matmuls with similar geometry.
 
 The fresh current-stack measurement includes this planner together with the
-MLP specialization above. It reaches 30.410 decode tokens/s and 30.236
-streaming end-to-end tokens/s. We report the combined current endpoint rather
-than treating measurements from different dates as an isolated planner A/B.
+110-core fused-residual down projection above. It reaches 30.410 decode
+tokens/s and 30.236 streaming end-to-end tokens/s. We report the combined
+current endpoint rather than treating measurements from different dates as an
+isolated planner A/B.
 
 ## Runtime trace capture for short prefill
 
@@ -1018,7 +1019,7 @@ Table: End-to-end 128-token generation, 32 retained requests per configuration.
 | Dst-resident matmul-SwiGLU epilogue | 23.744 ± 0.311 | [23.632, 23.856] | +2.73% | +45.98% |
 | Generalized fallback-free epilogue | 23.698 ± 0.274 | [23.599, 23.797] | -0.19% | +45.70% |
 | Fixed-shape prefill trace | 26.123 ± 0.394 | [25.981, 26.265] | +10.23% | +60.61% |
-| MLP specialization and generic wide-N planner | 30.236 ± 0.241 | [30.149, 30.323] | +15.75% | +85.90% |
+| 110-core down projection and generic wide-N planning | 30.236 ± 0.241 | [30.149, 30.323] | +15.75% | +85.90% |
 
 \endgroup
 
