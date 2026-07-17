@@ -20,29 +20,41 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
      const std::optional<tt::tt_metal::ShardSpec>& user_shard_spec = std::nullopt) {
      using namespace tt;
      auto* device = input_tensor_a.device();
-@@ -320,6 +320,11 @@
+@@ -320,6 +320,12 @@
      const auto M = utilities::get_M_dim(a_shape_padded, /*tile=*/std::nullopt, fuse_batch);
      const auto K = utilities::get_K_dim(a_shape_padded, /*tile=*/std::nullopt);
      const auto N = utilities::get_N_dim(b_shape_padded, /*tile=*/std::nullopt);
 +    const uint32_t num_cores = grid_size.x * grid_size.y;
 +    const uint32_t n_tiles = N / in1_tile.get_width();
-+    const bool balance_per_core_N =
++    const bool wide_n_matmul =
 +        all_dram_interleaved && !user_shard_spec.has_value() && mcast_in0 && !out_sharded &&
-+        M == in0_tile.get_height() && n_tiles > num_cores && n_tiles < 2 * num_cores;
++        M == in0_tile.get_height() && n_tiles > num_cores;
++    const bool balance_per_core_N = wide_n_matmul && n_tiles < 2 * num_cores;
      uint32_t per_core_M, per_core_N;
  
      // If user provided a shard spec (BLOCK_SHARDED on 1D grid), derive per_core values from it
-@@ -358,7 +363,8 @@
+@@ -358,7 +364,11 @@
          per_core_M = div_up(div_up(M, grid_size.x * grid_size.y), in0_tile.get_height());
          per_core_N = N / in1_tile.get_width();
      }
 -    uint32_t in0_block_w = K / in0_tile.get_width() % 2 == 0 ? 2 : 1;
 +    const uint32_t k_tiles = K / in0_tile.get_width();
-+    uint32_t in0_block_w = balance_per_core_N && k_tiles % 4 == 0 ? 4 : (k_tiles % 2 == 0 ? 2 : 1);
++    uint32_t in0_block_w = balance_per_core_N ? 4 : (wide_n_matmul ? 8 : 2);
++    while (k_tiles % in0_block_w != 0) {
++        in0_block_w /= 2;
++    }
      bool per_core_N_equals_subblock_w_constraint = out_sharded && !mcast_in0;
      bool per_core_M_equals_subblock_h_constraint = out_sharded && mcast_in0;
      bool fp32_dest_acc_en = get_fp32_dest_acc_en(compute_kernel_config);
-@@ -398,5 +404,6 @@
+@@ -374,5 +384,6 @@
+         per_core_N,
+         in0_block_w,
+         utilities::estimate_interm_tile_size(compute_kernel_config, output_dtype),
+-        /*adjust_in0_block_w=*/false);
++        /*adjust_in0_block_w=*/wide_n_matmul);
++    in0_block_w = mutlti_dim_per_core_factor[2];
+     uint32_t out_block_h = mutlti_dim_per_core_factor[0];
+@@ -398,5 +409,6 @@
          .per_core_N = per_core_N,
          .fuse_batch = fuse_batch,
          .fused_activation = fused_activation,
