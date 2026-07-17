@@ -109,7 +109,7 @@ Accelerators}
 \makeatother
 \subtitle{libtt Technical Report}
 \author{libtt Project}
-\date{15 July 2026}
+\date{17 July 2026}
 
 \begin{document}
 \maketitle
@@ -133,13 +133,14 @@ topology-aware execution. The same XLA boundary provides an
 architectural path to PyTorch through TorchTPU. libtt packages the
 open-source compiler, runtime, device kernels, and runtime assets in one
 shared library. We demonstrate it with upstream SGLang-JAX and Qwen3-8B.
-A sequence of graph, layout, runtime, and kernel optimizations raises
-measured 128-token end-to-end generation from 16.265 to 27.619 tokens/s,
-a 69.81\% improvement, and delivers 27.753 decode tokens/s, 11.51\%
-faster than the measured tt-inference-server reference on the same
-Blackhole P150 and workload. The result shows that a stable XLA boundary
-can keep the upper software stack close to upstream while concentrating
-hardware-specific performance work in the compiler and lower runtime.
+A measured sequence of graph, layout, runtime, and kernel optimizations
+raises 128-token end-to-end generation from 16.265 to 30.236 tokens/s,
+an 85.90\% improvement. The current stack delivers 30.410 decode
+tokens/s, 18.63\% faster than the measured tt-inference-server reference
+on the same Blackhole P150 and workload. The result shows that a stable
+XLA boundary can keep the upper software stack close to upstream while
+concentrating hardware-specific performance work in the compiler and
+lower runtime.
 
 \hypertarget{introduction}{%
 \section{Introduction}\label{introduction}}
@@ -179,9 +180,9 @@ this XLA boundary with upstream SGLang-JAX and identifies the future
 PyTorch/TorchTPU path. Third, it presents compiler and kernel
 optimizations that cross StableHLO, TT-MLIR, TTNN, and TT-Metal without
 modifying the SGLang scheduler or Qwen model {[}31{]}. Finally, it
-measures a 69.81\% end-to-end improvement from 16.265 to 27.619 tokens/s
-and 27.753 decode tokens/s, 11.51\% above the matched
-tt-inference-server v0.10.0 reference {[}20{]}.
+measures an 85.90\% end-to-end improvement from 16.265 to 30.236
+tokens/s. The current stack reaches 30.410 decode tokens/s, 18.63\%
+above the matched tt-inference-server v0.10.0 reference {[}20{]}.
 
 The following sections describe the system boundary, compiler and
 runtime representations, individual optimizations, and measured effects.
@@ -1410,6 +1411,31 @@ program in the same binary for A/B measurement.
 from 26.192 to 27.753 tokens/s. Streaming end-to-end throughput improves
 by +5.88\%.
 
+\hypertarget{generic-wide-n-matmul-planning}{%
+\subsection{Generic wide-N matmul
+planning}\label{generic-wide-n-matmul-planning}}
+
+The current upstream
+\href{../../third_party/tt_metal/matmul_balanced_1d_planner.patch}{matmul
+planner patch} improves single-tile-row matmuls whose output has more N
+tiles than available workers. It distributes one or two N tiles per
+worker when needed, keeps the efficient 108-worker language-model head
+layout, and chooses larger K blocks for wide outputs. It uses a
+four-tile K block for narrower wide-N shapes and an eight-tile block for
+very wide-N shapes, then reduces the width when K divisibility or L1
+capacity requires it.
+
+The planner uses tensor shape, layout, sharding, and device-grid
+information. It does not identify Qwen or a named projection, and it
+does not need an environment variable. This lets the same planner
+decision apply to other matmuls with similar geometry.
+
+The fresh current-stack measurement includes this planner together with
+the MLP specialization above. It reaches 30.410 decode tokens/s and
+30.236 streaming end-to-end tokens/s. We report the combined current
+endpoint rather than treating measurements from different dates as an
+isolated planner A/B.
+
 \hypertarget{runtime-trace-capture-for-short-prefill}{%
 \subsection{Runtime trace capture for short
 prefill}\label{runtime-trace-capture-for-short-prefill}}
@@ -1563,7 +1589,7 @@ Model/activation dtype & BF16\tabularnewline
 Weight-lowering request & \texttt{bfp\_bf8}\tabularnewline
 Attention backend & TT\tabularnewline
 Serving frontend & \texttt{/home/pcmoritz/sglang-jax}\tabularnewline
-Benchmark date & 15--16 July 2026, America/Los\_Angeles\tabularnewline
+Benchmark date & 15--17 July 2026, America/Los\_Angeles\tabularnewline
 \bottomrule
 \end{longtable}
 
@@ -1818,15 +1844,15 @@ Fixed-shape prefill trace\strut
 +60.61\%\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.16\columnwidth}\raggedright
-SwiGLU blocking and down projection\strut
+MLP specialization and generic wide-N planner\strut
 \end{minipage} & \begin{minipage}[t]{0.16\columnwidth}\raggedleft
-27.619 ± 0.322\strut
+30.236 ± 0.241\strut
 \end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\centering
-{[}27.503, 27.735{]}\strut
+{[}30.149, 30.323{]}\strut
 \end{minipage} & \begin{minipage}[t]{0.16\columnwidth}\raggedleft
-+5.73\%\strut
++15.75\%\strut
 \end{minipage} & \begin{minipage}[t]{0.16\columnwidth}\raggedleft
-+69.81\%\strut
++85.90\%\strut
 \end{minipage}\tabularnewline
 \bottomrule
 \end{longtable}
@@ -1858,19 +1884,20 @@ kernel.
 
 All configurations through fixed-shape prefill tracing use the
 server-reported request latency from the README benchmark. The final
-MLP-kernel configuration uses the loopback streaming end-to-end clock
-needed for the kernel A/B and external-server comparison. The clocks
-cover the same request but were collected independently, so the final
+current-stack configuration uses the loopback streaming end-to-end clock
+needed for the kernel and external-server comparisons. The clocks cover
+the same request but were collected independently, so the final
 cumulative value is not the isolated kernel effect.
 
 \hypertarget{mlp-kernel-measurements}{%
 \subsection{MLP kernel measurements}\label{mlp-kernel-measurements}}
 
-The same-build measurements below separate SwiGLU blocking from the
-fused-residual down projection.
+These earlier same-build measurements separate SwiGLU blocking from the
+fused-residual down projection. The later external comparison uses a
+fresh build rebased onto current upstream main.
 
 \begin{longtable}[]{@{}lrcrr@{}}
-\caption{Current-branch streaming results, 32 retained samples per
+\caption{MLP-kernel streaming results, 32 retained samples per
 configuration. Width 4 is compared with width 2; the down projection is
 compared with the same width-4 binary/configuration with the
 specialization disabled.}\tabularnewline
@@ -1989,11 +2016,14 @@ TT-Metal. libtt keeps the measured SGLang-JAX frontend and JAX model
 largely unchanged, then optimizes the compiler, runtime, and kernels
 below the XLA/PJRT boundary.
 
-Both runs use the same P150, Qwen3-8B model, prompt, 128-token output,
-serial request policy, disabled prefix cache, and persistent loopback
-collector. Pure decode uses the 127 intervals from first to last token.
-End-to-end throughput uses request send to last token. Each run has two
-warm-ups and 32 retained requests.
+Both runs were collected on 17 July 2026. They use the same P150,
+Qwen3-8B model, prompt, 128-token output, serial request policy,
+disabled prefix cache, and persistent loopback collector. Pure decode
+uses the 127 intervals from first to last token. End-to-end throughput
+uses request send to last token. Each run has two warm-ups and 32
+retained requests. The libtt build is source revision \texttt{93c96b3},
+rebased onto upstream main \texttt{f70de96}. TTIS is the official
+v0.10.0 image.
 
 \begin{longtable}[]{@{}lrrr@{}}
 \toprule
@@ -2011,20 +2041,20 @@ TTFT mean ± SD\strut
 \begin{minipage}[t]{0.22\columnwidth}\raggedright
 libtt current\strut
 \end{minipage} & \begin{minipage}[t]{0.22\columnwidth}\raggedleft
-27.753 ± 0.330 {[}27.634, 27.872{]}\strut
+30.410 ± 0.246 {[}30.321, 30.498{]}\strut
 \end{minipage} & \begin{minipage}[t]{0.22\columnwidth}\raggedleft
-27.619 ± 0.322 {[}27.503, 27.735{]}\strut
+30.236 ± 0.241 {[}30.149, 30.323{]}\strut
 \end{minipage} & \begin{minipage}[t]{0.22\columnwidth}\raggedleft
-58.45 ± 1.50 ms\strut
+57.02 ± 0.65 ms\strut
 \end{minipage}\tabularnewline
 \begin{minipage}[t]{0.22\columnwidth}\raggedright
 TTIS v0.10.0\strut
 \end{minipage} & \begin{minipage}[t]{0.22\columnwidth}\raggedleft
-24.887 ± 0.532 {[}24.695, 25.079{]}\strut
+25.634 ± 0.702 {[}25.381, 25.888{]}\strut
 \end{minipage} & \begin{minipage}[t]{0.22\columnwidth}\raggedleft
-24.776 ± 0.524 {[}24.587, 24.964{]}\strut
+25.500 ± 0.691 {[}25.251, 25.749{]}\strut
 \end{minipage} & \begin{minipage}[t]{0.22\columnwidth}\raggedleft
-63.38 ± 2.10 ms\strut
+65.36 ± 2.89 ms\strut
 \end{minipage}\tabularnewline
 \bottomrule
 \end{longtable}
@@ -2038,9 +2068,9 @@ workload.}\label{fig:upstream}
 }
 \end{figure}
 
-Under these conditions, libtt is 11.51\% faster in pure decode and
-11.48\% faster end to end. Mean TTFT is 7.78\% lower, and mean
-request-to-last-token latency falls from 5.169 to 4.635 seconds. This
+Under these conditions, libtt is 18.63\% faster in pure decode and
+18.58\% faster end to end. Mean TTFT is 12.77\% lower, and mean
+request-to-last-token latency falls from 5.023 to 4.234 seconds. This
 compares complete serving stacks, not individual kernels; their model
 implementations, frontends, and trace strategies differ. The result
 shows that lower-stack compiler and kernel optimization can match and
@@ -2063,6 +2093,8 @@ Configuration & SHA-256 prefix\tabularnewline
 SwiGLU block 2, generic down & \texttt{5119e79e42b5}\tabularnewline
 SwiGLU block 4, generic down & \texttt{c917933082e3}\tabularnewline
 SwiGLU block 4, 110-core down & \texttt{c041ccb1901d}\tabularnewline
+Current rebased libtt comparison & \texttt{d2848e7c8a40}\tabularnewline
+TTIS v0.10.0 comparison & \texttt{37becb7c58d6}\tabularnewline
 \bottomrule
 \end{longtable}
 
@@ -2195,11 +2227,11 @@ coverage exist. One Bazel graph makes the lower stack available for
 cross-layer optimization.
 
 We started with a functional backend that runs upstream SGLang-JAX at
-16.265 tokens/s. Compiler, runtime, and kernel changes raise measured
-end-to-end throughput by 69.81\% to 27.619 tokens/s and deliver 27.753
-decode tokens/s. Under the matched benchmark conditions, libtt is
-11.51\% faster than the TTIS decode mean even though TTIS also uses
-TT-specific transformer and inference-engine layers.
+16.265 tokens/s. The current stack reaches 30.236 end-to-end tokens/s
+and 30.410 decode tokens/s. This is an 85.90\% end-to-end improvement
+over the functional baseline and 18.63\% faster than the TTIS decode
+mean, even though TTIS also uses TT-specific transformer and
+inference-engine layers.
 
 We measured JAX inference. The PJRT/StableHLO architecture is not tied
 to JAX or inference and can support JAX or PyTorch training once the

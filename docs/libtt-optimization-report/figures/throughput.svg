@@ -4,92 +4,98 @@
 <text x="90" y="27" class="title">Qwen3-8B end-to-end generation throughput</text>
 <line x1="90" y1="415.0" x2="955" y2="415.0" class="grid"/>
 <text x="78" y="420.0" text-anchor="end" class="label">15</text>
-<line x1="90" y1="388.2" x2="955" y2="388.2" class="grid"/>
-<text x="78" y="393.2" text-anchor="end" class="label">16</text>
-<line x1="90" y1="361.4" x2="955" y2="361.4" class="grid"/>
-<text x="78" y="366.4" text-anchor="end" class="label">17</text>
-<line x1="90" y1="334.6" x2="955" y2="334.6" class="grid"/>
-<text x="78" y="339.6" text-anchor="end" class="label">18</text>
-<line x1="90" y1="307.9" x2="955" y2="307.9" class="grid"/>
-<text x="78" y="312.9" text-anchor="end" class="label">19</text>
-<line x1="90" y1="281.1" x2="955" y2="281.1" class="grid"/>
-<text x="78" y="286.1" text-anchor="end" class="label">20</text>
-<line x1="90" y1="254.3" x2="955" y2="254.3" class="grid"/>
-<text x="78" y="259.3" text-anchor="end" class="label">21</text>
-<line x1="90" y1="227.5" x2="955" y2="227.5" class="grid"/>
-<text x="78" y="232.5" text-anchor="end" class="label">22</text>
-<line x1="90" y1="200.7" x2="955" y2="200.7" class="grid"/>
-<text x="78" y="205.7" text-anchor="end" class="label">23</text>
-<line x1="90" y1="173.9" x2="955" y2="173.9" class="grid"/>
-<text x="78" y="178.9" text-anchor="end" class="label">24</text>
-<line x1="90" y1="147.1" x2="955" y2="147.1" class="grid"/>
-<text x="78" y="152.1" text-anchor="end" class="label">25</text>
-<line x1="90" y1="120.4" x2="955" y2="120.4" class="grid"/>
-<text x="78" y="125.4" text-anchor="end" class="label">26</text>
-<line x1="90" y1="93.6" x2="955" y2="93.6" class="grid"/>
-<text x="78" y="98.6" text-anchor="end" class="label">27</text>
-<line x1="90" y1="66.8" x2="955" y2="66.8" class="grid"/>
-<text x="78" y="71.8" text-anchor="end" class="label">28</text>
+<line x1="90" y1="392.9" x2="955" y2="392.9" class="grid"/>
+<text x="78" y="397.9" text-anchor="end" class="label">16</text>
+<line x1="90" y1="370.9" x2="955" y2="370.9" class="grid"/>
+<text x="78" y="375.9" text-anchor="end" class="label">17</text>
+<line x1="90" y1="348.8" x2="955" y2="348.8" class="grid"/>
+<text x="78" y="353.8" text-anchor="end" class="label">18</text>
+<line x1="90" y1="326.8" x2="955" y2="326.8" class="grid"/>
+<text x="78" y="331.8" text-anchor="end" class="label">19</text>
+<line x1="90" y1="304.7" x2="955" y2="304.7" class="grid"/>
+<text x="78" y="309.7" text-anchor="end" class="label">20</text>
+<line x1="90" y1="282.6" x2="955" y2="282.6" class="grid"/>
+<text x="78" y="287.6" text-anchor="end" class="label">21</text>
+<line x1="90" y1="260.6" x2="955" y2="260.6" class="grid"/>
+<text x="78" y="265.6" text-anchor="end" class="label">22</text>
+<line x1="90" y1="238.5" x2="955" y2="238.5" class="grid"/>
+<text x="78" y="243.5" text-anchor="end" class="label">23</text>
+<line x1="90" y1="216.5" x2="955" y2="216.5" class="grid"/>
+<text x="78" y="221.5" text-anchor="end" class="label">24</text>
+<line x1="90" y1="194.4" x2="955" y2="194.4" class="grid"/>
+<text x="78" y="199.4" text-anchor="end" class="label">25</text>
+<line x1="90" y1="172.4" x2="955" y2="172.4" class="grid"/>
+<text x="78" y="177.4" text-anchor="end" class="label">26</text>
+<line x1="90" y1="150.3" x2="955" y2="150.3" class="grid"/>
+<text x="78" y="155.3" text-anchor="end" class="label">27</text>
+<line x1="90" y1="128.2" x2="955" y2="128.2" class="grid"/>
+<text x="78" y="133.2" text-anchor="end" class="label">28</text>
+<line x1="90" y1="106.2" x2="955" y2="106.2" class="grid"/>
+<text x="78" y="111.2" text-anchor="end" class="label">29</text>
+<line x1="90" y1="84.1" x2="955" y2="84.1" class="grid"/>
+<text x="78" y="89.1" text-anchor="end" class="label">30</text>
+<line x1="90" y1="62.1" x2="955" y2="62.1" class="grid"/>
+<text x="78" y="67.1" text-anchor="end" class="label">31</text>
 <line x1="90" y1="40.0" x2="955" y2="40.0" class="grid"/>
-<text x="78" y="45.0" text-anchor="end" class="label">29</text>
+<text x="78" y="45.0" text-anchor="end" class="label">32</text>
 <line x1="90" y1="40" x2="90" y2="415" class="axis"/>
 <line x1="90" y1="415" x2="955" y2="415" class="axis"/>
-<polyline points="90.0,381.1 176.5,282.7 263.0,265.1 349.5,258.8 436.0,268.2 522.5,193.6 609.0,197.7 695.5,180.8 782.0,182.0 868.5,117.1 955.0,77.0" class="line"/>
-<line x1="90.0" y1="379.9" x2="90.0" y2="382.4" class="ci"/>
-<line x1="84.0" y1="379.9" x2="96.0" y2="379.9" class="ci"/>
-<line x1="84.0" y1="382.4" x2="96.0" y2="382.4" class="ci"/>
-<circle cx="90.0" cy="381.1" r="7" class="dot"/>
+<polyline points="90.0,387.1 176.5,306.1 263.0,291.6 349.5,286.4 436.0,294.1 522.5,232.7 609.0,236.0 695.5,222.1 782.0,223.1 868.5,169.6 955.0,78.9" class="line"/>
+<line x1="90.0" y1="386.1" x2="90.0" y2="388.1" class="ci"/>
+<line x1="84.0" y1="386.1" x2="96.0" y2="386.1" class="ci"/>
+<line x1="84.0" y1="388.1" x2="96.0" y2="388.1" class="ci"/>
+<circle cx="90.0" cy="387.1" r="7" class="dot"/>
 <text x="90.0" y="446" text-anchor="middle" class="small">baseline</text>
-<line x1="176.5" y1="280.0" x2="176.5" y2="285.5" class="ci"/>
-<line x1="170.5" y1="280.0" x2="182.5" y2="280.0" class="ci"/>
-<line x1="170.5" y1="285.5" x2="182.5" y2="285.5" class="ci"/>
-<circle cx="176.5" cy="282.7" r="7" class="dot"/>
+<line x1="176.5" y1="303.8" x2="176.5" y2="308.3" class="ci"/>
+<line x1="170.5" y1="303.8" x2="182.5" y2="303.8" class="ci"/>
+<line x1="170.5" y1="308.3" x2="182.5" y2="308.3" class="ci"/>
+<circle cx="176.5" cy="306.1" r="7" class="dot"/>
 <text x="176.5" y="446" text-anchor="middle" class="small">compiler</text>
-<line x1="263.0" y1="262.4" x2="263.0" y2="267.8" class="ci"/>
-<line x1="257.0" y1="262.4" x2="269.0" y2="262.4" class="ci"/>
-<line x1="257.0" y1="267.8" x2="269.0" y2="267.8" class="ci"/>
-<circle cx="263.0" cy="265.1" r="7" class="dot"/>
+<line x1="263.0" y1="289.3" x2="263.0" y2="293.8" class="ci"/>
+<line x1="257.0" y1="289.3" x2="269.0" y2="289.3" class="ci"/>
+<line x1="257.0" y1="293.8" x2="269.0" y2="293.8" class="ci"/>
+<circle cx="263.0" cy="291.6" r="7" class="dot"/>
 <text x="263.0" y="446" text-anchor="middle" class="small">SiLU graph</text>
-<line x1="349.5" y1="256.0" x2="349.5" y2="261.6" class="ci"/>
-<line x1="343.5" y1="256.0" x2="355.5" y2="256.0" class="ci"/>
-<line x1="343.5" y1="261.6" x2="355.5" y2="261.6" class="ci"/>
-<circle cx="349.5" cy="258.8" r="7" class="dot"/>
+<line x1="349.5" y1="284.0" x2="349.5" y2="288.7" class="ci"/>
+<line x1="343.5" y1="284.0" x2="355.5" y2="284.0" class="ci"/>
+<line x1="343.5" y1="288.7" x2="355.5" y2="288.7" class="ci"/>
+<circle cx="349.5" cy="286.4" r="7" class="dot"/>
 <text x="349.5" y="446" text-anchor="middle" class="small">QKV graph</text>
-<line x1="436.0" y1="265.1" x2="436.0" y2="271.3" class="ci"/>
-<line x1="430.0" y1="265.1" x2="442.0" y2="265.1" class="ci"/>
-<line x1="430.0" y1="271.3" x2="442.0" y2="271.3" class="ci"/>
-<circle cx="436.0" cy="268.2" r="7" class="dot"/>
+<line x1="436.0" y1="291.6" x2="436.0" y2="296.7" class="ci"/>
+<line x1="430.0" y1="291.6" x2="442.0" y2="291.6" class="ci"/>
+<line x1="430.0" y1="296.7" x2="442.0" y2="296.7" class="ci"/>
+<circle cx="436.0" cy="294.1" r="7" class="dot"/>
 <text x="436.0" y="446" text-anchor="middle" class="small">shared LHS</text>
-<line x1="522.5" y1="191.3" x2="522.5" y2="195.9" class="ci"/>
-<line x1="516.5" y1="191.3" x2="528.5" y2="191.3" class="ci"/>
-<line x1="516.5" y1="195.9" x2="528.5" y2="195.9" class="ci"/>
-<circle cx="522.5" cy="193.6" r="7" class="dot"/>
+<line x1="522.5" y1="230.8" x2="522.5" y2="234.5" class="ci"/>
+<line x1="516.5" y1="230.8" x2="528.5" y2="230.8" class="ci"/>
+<line x1="516.5" y1="234.5" x2="528.5" y2="234.5" class="ci"/>
+<circle cx="522.5" cy="232.7" r="7" class="dot"/>
 <text x="522.5" y="446" text-anchor="middle" class="small">RMSNorm shard</text>
-<line x1="609.0" y1="194.8" x2="609.0" y2="200.5" class="ci"/>
-<line x1="603.0" y1="194.8" x2="615.0" y2="194.8" class="ci"/>
-<line x1="603.0" y1="200.5" x2="615.0" y2="200.5" class="ci"/>
-<circle cx="609.0" cy="197.7" r="7" class="dot"/>
+<line x1="609.0" y1="233.7" x2="609.0" y2="238.4" class="ci"/>
+<line x1="603.0" y1="233.7" x2="615.0" y2="233.7" class="ci"/>
+<line x1="603.0" y1="238.4" x2="615.0" y2="238.4" class="ci"/>
+<circle cx="609.0" cy="236.0" r="7" class="dot"/>
 <text x="609.0" y="446" text-anchor="middle" class="small">SiLU multiply</text>
-<line x1="695.5" y1="177.8" x2="695.5" y2="183.8" class="ci"/>
-<line x1="689.5" y1="177.8" x2="701.5" y2="177.8" class="ci"/>
-<line x1="689.5" y1="183.8" x2="701.5" y2="183.8" class="ci"/>
-<circle cx="695.5" cy="180.8" r="7" class="dot"/>
+<line x1="695.5" y1="219.7" x2="695.5" y2="224.6" class="ci"/>
+<line x1="689.5" y1="219.7" x2="701.5" y2="219.7" class="ci"/>
+<line x1="689.5" y1="224.6" x2="701.5" y2="224.6" class="ci"/>
+<circle cx="695.5" cy="222.1" r="7" class="dot"/>
 <text x="695.5" y="446" text-anchor="middle" class="small">Dst SwiGLU</text>
-<line x1="782.0" y1="179.4" x2="782.0" y2="184.7" class="ci"/>
-<line x1="776.0" y1="179.4" x2="788.0" y2="179.4" class="ci"/>
-<line x1="776.0" y1="184.7" x2="788.0" y2="184.7" class="ci"/>
-<circle cx="782.0" cy="182.0" r="7" class="dot"/>
+<line x1="782.0" y1="221.0" x2="782.0" y2="225.3" class="ci"/>
+<line x1="776.0" y1="221.0" x2="788.0" y2="221.0" class="ci"/>
+<line x1="776.0" y1="225.3" x2="788.0" y2="225.3" class="ci"/>
+<circle cx="782.0" cy="223.1" r="7" class="dot"/>
 <text x="782.0" y="446" text-anchor="middle" class="small">one path</text>
-<line x1="868.5" y1="113.3" x2="868.5" y2="120.9" class="ci"/>
-<line x1="862.5" y1="113.3" x2="874.5" y2="113.3" class="ci"/>
-<line x1="862.5" y1="120.9" x2="874.5" y2="120.9" class="ci"/>
-<circle cx="868.5" cy="117.1" r="7" class="dot"/>
+<line x1="868.5" y1="166.5" x2="868.5" y2="172.8" class="ci"/>
+<line x1="862.5" y1="166.5" x2="874.5" y2="166.5" class="ci"/>
+<line x1="862.5" y1="172.8" x2="874.5" y2="172.8" class="ci"/>
+<circle cx="868.5" cy="169.6" r="7" class="dot"/>
 <text x="868.5" y="446" text-anchor="middle" class="small">prefill trace</text>
-<line x1="955.0" y1="73.9" x2="955.0" y2="80.1" class="ci"/>
-<line x1="949.0" y1="73.9" x2="961.0" y2="73.9" class="ci"/>
-<line x1="949.0" y1="80.1" x2="961.0" y2="80.1" class="ci"/>
-<circle cx="955.0" cy="77.0" r="7" class="dot"/>
-<text x="955.0" y="446" text-anchor="middle" class="small">MLP kernels</text>
+<line x1="955.0" y1="77.0" x2="955.0" y2="80.8" class="ci"/>
+<line x1="949.0" y1="77.0" x2="961.0" y2="77.0" class="ci"/>
+<line x1="949.0" y1="80.8" x2="961.0" y2="80.8" class="ci"/>
+<circle cx="955.0" cy="78.9" r="7" class="dot"/>
+<text x="955.0" y="446" text-anchor="middle" class="small">current stack</text>
 <text transform="translate(23 227.5) rotate(-90)" text-anchor="middle" class="label">tokens/s (mean and 95% t interval)</text>
 <text x="90" y="505" class="small">32 retained requests per configuration; two compile/warm-up requests excluded; the final point uses the streaming E2E clock.</text>
 </svg>

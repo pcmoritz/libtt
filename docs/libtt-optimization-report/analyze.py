@@ -33,7 +33,14 @@ FIGURE_DIR = HERE / "figures"
 N_WARMUP = 2
 N_SAMPLES = 32
 TOKENS = 128
-UPSTREAM_RAW_DIR = Path("/tmp/libtt-ttis-streaming-20260715-retry")
+UPSTREAM_RAW_DIR = Path("/tmp/libtt-ttis-streaming-20260717")
+LIBTT_COMPARISON_RAW_DIR = Path("/tmp/libtt-report-rebased-20260717")
+LIBTT_COMPARISON_BRANCH = "agent/libtt-technical-report"
+LIBTT_COMPARISON_COMMIT = "93c96b3"
+LIBTT_COMPARISON_BASE_MAIN = "f70de96"
+LIBTT_COMPARISON_BINARY_SHA256 = (
+    "a221a5316fe356870d818b2ef692ed67a8acc419cdf3b59067352ac38bfa55d9"
+)
 LATEST_MAIN_STREAMING_DIR = Path("/tmp/libtt-prefill-rebench-20260715")
 SWIGLU_BLOCK_2_DIR = Path("/tmp/libtt-swiglu-width2-final-20260715")
 SWIGLU_BLOCK_4_DIR = Path("/tmp/libtt-down-110-final-20260715/disabled")
@@ -126,11 +133,11 @@ CONFIGURATIONS = [
 ]
 
 FINAL_CONFIGURATION = Configuration(
-    "mlp-kernels",
-    "37d5460",
-    "SwiGLU blocking and 110-core down projection",
-    "MLP kernels",
-    DOWN_PROJECTION_110_DIR,
+    "current-stack",
+    LIBTT_COMPARISON_COMMIT,
+    "MLP specialization and generic wide-N planner",
+    "current stack",
+    LIBTT_COMPARISON_RAW_DIR,
 )
 
 
@@ -309,7 +316,7 @@ def write_throughput_svg(summaries: list[dict]) -> None:
     width, height = 980, 520
     left, right, top, bottom = 90, 25, 40, 105
     plot_w, plot_h = width - left - right, height - top - bottom
-    y_min, y_max = 15.0, 29.0
+    y_min, y_max = 15.0, 32.0
 
     def x(i: int) -> float:
         return left + i * plot_w / (len(summaries) - 1)
@@ -323,7 +330,7 @@ def write_throughput_svg(summaries: list[dict]) -> None:
         '<style>text{font-family:Helvetica,Arial,sans-serif;fill:#111}.axis{stroke:#555;stroke-width:1}.grid{stroke:#d0d0d0;stroke-width:1}.line{fill:none;stroke:#111;stroke-width:3}.ci{stroke:#666;stroke-width:2}.dot{fill:#111;stroke:white;stroke-width:1.5}.label{font-size:14px}.small{font-size:12px;fill:#444}.title{font-size:21px;font-weight:700}</style>',
         '<text x="90" y="27" class="title">Qwen3-8B end-to-end generation throughput</text>',
     ]
-    for tick in range(15, 30):
+    for tick in range(15, 33):
         yy = y(tick)
         parts.append(f'<line x1="{left}" y1="{yy:.1f}" x2="{width-right}" y2="{yy:.1f}" class="grid"/>')
         parts.append(f'<text x="{left-12}" y="{yy+5:.1f}" text-anchor="end" class="label">{tick}</text>')
@@ -401,7 +408,7 @@ def write_upstream_comparison_svg(comparison: dict) -> None:
     width, height = 980, 510
     left, right, top, bottom = 100, 30, 65, 115
     plot_w, plot_h = width - left - right, height - top - bottom
-    y_min, y_max = 0.0, 30.0
+    y_min, y_max = 0.0, 35.0
     group_slot = plot_w / len(groups)
     bar_w = 112
     gap = 24
@@ -419,7 +426,7 @@ def write_upstream_comparison_svg(comparison: dict) -> None:
         '<rect x="760" y="16" width="16" height="16" rx="2" class="upstream"/>',
         '<text x="783" y="29" class="legend">TTIS v0.10.0</text>',
     ]
-    for tick in (0, 5, 10, 15, 20, 25, 30):
+    for tick in (0, 5, 10, 15, 20, 25, 30, 35):
         yy = y(tick)
         parts.append(
             f'<line x1="{left}" y1="{yy:.1f}" x2="{width-right}" '
@@ -560,20 +567,23 @@ def analyze_upstream() -> dict:
             }
         )
 
-    libtt_paths = sorted(DOWN_PROJECTION_110_DIR.glob("run_*.json"))
+    libtt_paths = sorted(LIBTT_COMPARISON_RAW_DIR.glob("run_*.json"))
     libtt_records = [json.loads(path.read_text()) for path in libtt_paths]
     libtt_retained = [
-        record for record in libtt_records if record["phase"] == "retained"
-    ][:N_SAMPLES]
+        (path, record)
+        for path, record in zip(libtt_paths, libtt_records)
+        if record["phase"] == "retained"
+    ]
     if len(libtt_retained) != N_SAMPLES:
         raise RuntimeError(
             f"libtt comparison: expected {N_SAMPLES} retained files, "
             f"found {len(libtt_retained)}"
         )
-    for record in libtt_retained:
+    for sample_index, (path, record) in enumerate(libtt_retained, 1):
         if (
             record["completion_tokens"] != TOKENS
             or record["stream_chunks"] != TOKENS
+            or record["prompt_tokens"] != 5
         ):
             raise RuntimeError("libtt comparison contains an incomplete response")
         row_values = {
@@ -585,6 +595,23 @@ def analyze_upstream() -> dict:
         for metric, value in row_values.items():
             values["libtt"][metric].append(value)
         hashes["libtt"].add(record["completion_text_sha256_12"])
+        samples.append(
+            {
+                "implementation": "libtt",
+                "release": LIBTT_COMPARISON_COMMIT,
+                "sample": sample_index,
+                "source_file": path.name,
+                "ttft_s": f'{row_values["ttft_s"]:.9f}',
+                "total_s": f'{row_values["total_s"]:.9f}',
+                "decode_tps": f'{row_values["decode_tps"]:.9f}',
+                "e2e_tps": f'{row_values["e2e_tps"]:.9f}',
+                "prompt_tokens": record["prompt_tokens"],
+                "completion_tokens": record["completion_tokens"],
+                "completion_text_sha256_12": record[
+                    "completion_text_sha256_12"
+                ],
+            }
+        )
 
     if len(hashes["ttis"]) != 1 or len(hashes["libtt"]) != 1:
         raise RuntimeError(f"non-deterministic comparison outputs: {hashes}")
@@ -651,8 +678,10 @@ def analyze_upstream() -> dict:
     for metric in metric_names:
         for statistic, value in described["ttis"][metric].items():
             summary[f"{statistic}_{metric}"] = value
+        for statistic, value in described["libtt"][metric].items():
+            summary[f"libtt_{statistic}_{metric}"] = value
     summary.update(comparison)
-    summary["libtt_commit"] = "37d5460"
+    summary["libtt_commit"] = LIBTT_COMPARISON_COMMIT
     summary["completion_text_sha256_12"] = next(iter(hashes["ttis"]))
 
     with (DATA_DIR / "upstream-tt-inference-samples.csv").open(
@@ -688,9 +717,13 @@ def analyze_upstream() -> dict:
         "hardware": "Blackhole P150",
     }
     manifest["libtt_comparison"] = {
-        "branch": "agent/qwen3-swiglu-blocking-down-projection",
-        "commit": "37d5460",
-        "source_directory": str(DOWN_PROJECTION_110_DIR),
+        "branch": LIBTT_COMPARISON_BRANCH,
+        "commit": LIBTT_COMPARISON_COMMIT,
+        "upstream_main": LIBTT_COMPARISON_BASE_MAIN,
+        "source_directory": str(LIBTT_COMPARISON_RAW_DIR),
+        "binary_sha256": LIBTT_COMPARISON_BINARY_SHA256,
+        "sfpi_archive": "sfpi_7.60.0_x86_64_debian.txz",
+        "sfpi_sha256": "b90b019df3b7b092f265d62076f8338ed1353f97162e982f4b38533ba4f731ee",
         "collector": "same loopback streaming token-arrival clock",
         "retained_samples": N_SAMPLES,
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect the streaming tt-inference-server baseline used by the report.
+"""Collect a streaming server baseline used by the report.
 
 The client uses one persistent loopback HTTP connection and records both time
 to first token and token arrival times.  This gives TTIS the same measurement
@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=32)
     parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--skip-server-metadata",
+        action="store_true",
+        help="do not query the vLLM-specific /version and /v1/models endpoints",
+    )
     return parser.parse_args()
 
 
@@ -99,9 +104,12 @@ def main() -> None:
             "e2e_tps": "completion_tokens / total_s",
             "itl_s": "arrival-time delta between consecutive non-empty completion chunks",
         },
-        "vllm_api_version": get_json(args.base_url, "/version", args.timeout),
-        "models": get_json(args.base_url, "/v1/models", args.timeout),
     }
+    if not args.skip_server_metadata:
+        manifest["vllm_api_version"] = get_json(
+            args.base_url, "/version", args.timeout
+        )
+        manifest["models"] = get_json(args.base_url, "/v1/models", args.timeout)
     (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
     conn, prefix = connection(args.base_url, args.timeout)

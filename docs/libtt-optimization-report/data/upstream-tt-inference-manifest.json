@@ -1,5 +1,6 @@
 {
-  "created_utc": "2026-07-15T14:09:53.560247+00:00",
+  "schema_version": 2,
+  "created_utc": "2026-07-17T17:26:54.299204+00:00",
   "base_url": "http://127.0.0.1:8000",
   "endpoint": "/v1/completions",
   "request": {
@@ -14,14 +15,46 @@
   },
   "warmups": 2,
   "retained_samples": 32,
+  "timing_scope": "loopback streaming client token-arrival clock",
   "definitions": {
     "ttft_s": "request send to first non-empty completion chunk",
     "total_s": "request send to final non-empty completion chunk",
     "decode_tps": "127 / (last token arrival - first token arrival)",
     "e2e_tps": "128 / (last token arrival - request send)"
   },
-  "schema_version": 2,
-  "timing_scope": "loopback streaming client token-arrival clock",
+  "vllm_api_version": {
+    "version": "0.1.dev11678+g22be24130"
+  },
+  "models": {
+    "object": "list",
+    "data": [
+      {
+        "id": "Qwen/Qwen3-8B",
+        "object": "model",
+        "created": 1784309214,
+        "owned_by": "vllm",
+        "root": "Qwen/Qwen3-8B",
+        "parent": null,
+        "max_model_len": 40960,
+        "permission": [
+          {
+            "id": "modelperm-12aae9a1c86146c1a5c16fb1303ae165",
+            "object": "model_permission",
+            "created": 1784309214,
+            "allow_create_engine": false,
+            "allow_sampling": true,
+            "allow_logprobs": true,
+            "allow_search_indices": false,
+            "allow_view": true,
+            "allow_fine_tuning": false,
+            "organization": "*",
+            "group": null,
+            "is_blocking": false
+          }
+        ]
+      }
+    ]
+  },
   "tt_inference_server": {
     "release": "v0.10.0",
     "commit": "4be69a67c7183bf76052d4a6f64a42ac93b71ac5",
@@ -30,9 +63,13 @@
     "hardware": "Blackhole P150"
   },
   "libtt_comparison": {
-    "branch": "agent/qwen3-swiglu-blocking-down-projection",
-    "commit": "37d5460",
-    "source_directory": "/tmp/libtt-down-110-final-fixed-20260715/enabled",
+    "branch": "agent/libtt-technical-report",
+    "commit": "93c96b3",
+    "upstream_main": "f70de96",
+    "source_directory": "/tmp/libtt-report-rebased-20260717",
+    "binary_sha256": "a221a5316fe356870d818b2ef692ed67a8acc419cdf3b59067352ac38bfa55d9",
+    "sfpi_archive": "sfpi_7.60.0_x86_64_debian.txz",
+    "sfpi_sha256": "b90b019df3b7b092f265d62076f8338ed1353f97162e982f4b38533ba4f731ee",
     "collector": "same loopback streaming token-arrival clock",
     "retained_samples": 32
   }

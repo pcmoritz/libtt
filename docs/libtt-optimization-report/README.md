@@ -8,7 +8,7 @@ and publication artifacts.
 - `report.md`: canonical report source;
 - `report.html`, `report.tex`, and `report.pdf`: generated report artifacts;
 - `data/samples.csv` and `data/summary.csv`: 32-sample cumulative optimization
-  measurements, including the final streaming end-to-end MLP configuration;
+  measurements, including the final current-stack measurement;
 - `data/foundation-ablation-*`: 64-sample baseline/complete-set comparison and
   32-sample leave-one-feature-out measurements;
 - `data/current-kernel-samples.csv` and
@@ -16,10 +16,10 @@ and publication artifacts.
 - `data/current-kernel-manifest.json`: current experiment provenance;
 - `data/down-projection-profile-summary.csv`: per-operation profile summary;
 - `data/latest-main-streaming-*`: direct prefill trace A/B data;
-- `data/upstream-tt-inference-*`: streaming TTIS observations, same-clock
-  comparison statistics, and manifest;
+- `data/upstream-tt-inference-*`: matched streaming libtt and TTIS observations,
+  same-clock comparison statistics, and manifest;
 - `analyze.py`: statistics and SVG generation;
-- `benchmark_upstream.py`: upstream TTIS collector;
+- `benchmark_upstream.py`: matched streaming benchmark collector;
 - `figures/*.svg`: vector figures; and
 - `Makefile` and `style.css`: report build files.
 
@@ -44,6 +44,39 @@ two functional-baseline runs, and one run for each leave-one-feature-out
 configuration. The baseline keeps the build-only NoC public-include patch.
 Exact feature groups and source provenance are recorded in
 `data/foundation-ablation-manifest.json`.
+
+## Current libtt and TTIS comparison
+
+The current comparison uses Qwen3-8B, a 128-token greedy completion, two
+warmups, and 32 retained requests for each stack. Prefix caching is disabled.
+Both measurements use the same persistent loopback streaming client and the
+same Blackhole P150, with a device reset between stacks.
+
+Collect the libtt samples after starting the SGLang-JAX server with the command
+from the repository README:
+
+```bash
+/home/pcmoritz/sglang-jax/.venv/bin/python \
+  docs/libtt-optimization-report/benchmark_upstream.py \
+  --base-url http://127.0.0.1:31000 \
+  --output-dir /tmp/libtt-report-rebased-20260717 \
+  --warmups 2 --samples 32 --tokens 128 --timeout 1200 \
+  --skip-server-metadata
+```
+
+Collect the TTIS samples after starting the official v0.10.0 server with
+prefix caching disabled:
+
+```bash
+/home/pcmoritz/sglang-jax/.venv/bin/python \
+  docs/libtt-optimization-report/benchmark_upstream.py \
+  --base-url http://127.0.0.1:8000 \
+  --output-dir /tmp/libtt-ttis-streaming-20260717 \
+  --warmups 2 --samples 32 --tokens 128 --timeout 1200
+```
+
+The exact source revisions, binary digest, server image, request, and summary
+statistics are recorded in `data/upstream-tt-inference-manifest.json`.
 
 ## Build the report
 
