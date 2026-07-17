@@ -305,7 +305,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  // ============================================================================
  // Step 7: Create fused op
  // ============================================================================
-@@ -821,6 +1022,63 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
+@@ -821,6 +1022,65 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  // ============================================================================
  // NLPCreateQKVHeadsDecodeFusing
  // ============================================================================
@@ -357,7 +357,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +      /*overlap_qk_coregrid=*/BoolAttr(),
 +      /*slice_size=*/IntegerAttr());
 +
++  rewriter.setInsertionPoint(q.decodeReshapeOp);
 +  auto qNorm = createRank4RMSNorm(rewriter, q.rmsNormOp, decodeOp.getQuery());
++  rewriter.setInsertionPoint(k.decodeReshapeOp);
 +  auto kNorm = createRank4RMSNorm(rewriter, k.rmsNormOp, decodeOp.getKey());
 +
 +  rewriter.replaceOp(q.decodeReshapeOp, qNorm.getResult());

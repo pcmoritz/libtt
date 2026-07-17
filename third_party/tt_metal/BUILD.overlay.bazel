@@ -785,6 +785,7 @@ TT_METAL_JIT_BUILD_SRCS = [
     "tt_metal/jit_build/jit_build_utils.cpp",
     "tt_metal/jit_build/jit_device_config.cpp",
     "tt_metal/jit_build/kernel_args.cpp",
+    "tt_metal/jit_build/kernel_signature_parser.cpp",
     "tt_metal/jit_build/precompiled.cpp",
 ]
 
@@ -1025,6 +1026,7 @@ cc_library(
         "tt_metal/impl/dispatch/util/dispatch_settings.cpp",
         "tt_metal/impl/dispatch/worker_config_buffer.cpp",
         "tt_metal/impl/event/dispatch.cpp",
+        "tt_metal/impl/emulation/emule_live_ranges.cpp",
         "tt_metal/impl/graph/graph_tracking.cpp",
         "tt_metal/impl/host_api/temp_quasar_api.cpp",
         "tt_metal/impl/host_api/tt_metal.cpp",
@@ -1045,6 +1047,7 @@ cc_library(
         "tt_metal/impl/profiler/profiler_state_manager.cpp",
         "tt_metal/impl/profiler/tt_metal_profiler.cpp",
         "tt_metal/impl/program/dispatch.cpp",
+        "tt_metal/impl/program/kernel_compile_utils.cpp",
         "tt_metal/impl/program/program.cpp",
         "tt_metal/impl/program/program_descriptor_patching.cpp",
         "tt_metal/impl/program/program_descriptors.cpp",

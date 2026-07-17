@@ -1,4 +1,5 @@
 #include "operations/ccl/aggregate_tensor.h"
+#include "operations/ccl/allocate_moe_compute_semaphore.h"
 #include "operations/ccl/all_gather.h"
 #include "operations/ccl/all_reduce.h"
 #include "operations/ccl/all_reduce_async.h"
@@ -42,6 +43,11 @@ namespace {
 } // namespace
 
 namespace tt::runtime::ttnn::operations::ccl {
+
+void run(const ::tt::target::ttnn::AllocateMoeComputeSemaphoreOp *,
+         ProgramContext &) {
+  unsupported("ttnn.allocate_moe_compute_semaphore");
+}
 
 void run(const ::tt::target::ttnn::AggregateTensorOp *, ProgramContext &) {
   unsupported("ttnn.aggregate_tensor");

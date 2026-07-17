@@ -1,10 +1,12 @@
 #include "ttnn/operations/ccl/ccl_common.hpp"
 #include "ttnn/operations/ccl/ccl_op_fusion.hpp"
 #include "ttnn/operations/ccl/mesh_partition/mesh_partition.hpp"
+#include "ttnn/operations/conv/conv1d/conv1d.hpp"
 #include "ttnn/operations/conv/conv2d/conv2d.hpp"
 #include "ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.hpp"
 #include "ttnn/operations/conv/conv2d/prepare_conv2d_weights.hpp"
 #include "ttnn/operations/experimental/ccl/ring_attention_all_gather_async/device/ring_attention_all_gather_async_device_operation.hpp"
+#include "ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp"
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
 #include "ttnn/operations/experimental/conv3d/conv3d.hpp"
 #include "ttnn/operations/experimental/unary_backward/gelu_backward/gelu_backward.hpp"
@@ -46,6 +48,18 @@ Conv2dResultWithOptions conv2d(
   unsupported("ttnn::conv2d");
 }
 
+Conv1dResult conv1d(
+    const Tensor &, const Tensor &, MeshDevice *, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t,
+    std::variant<std::array<uint32_t, 2>, uint32_t>, uint32_t, uint32_t,
+    const std::optional<const DataType> &, const std::optional<const Tensor> &,
+    const std::optional<const Conv1dConfig> &,
+    const std::optional<const DeviceComputeKernelConfig> &,
+    const std::optional<const MemoryConfig> &,
+    const std::optional<const Conv1dSliceConfig> &, bool, bool) {
+  unsupported("ttnn::conv1d");
+}
+
 void ring_attention_all_gather_async_multi_core_with_workers_helper(
     tt::tt_metal::ProgramDescriptor &, const std::vector<Tensor> &,
     const MeshCoordinate &, std::optional<MeshCoordinate>,
@@ -55,7 +69,7 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     const std::optional<tt::tt_metal::SubDeviceId> &,
     std::optional<ttnn::experimental::ccl::AllGatherFusedOpSignaler> &,
     CoreCoord, ttnn::ccl::CoreAllocationStrategy,
-    std::optional<uint32_t>) {
+    std::optional<uint32_t>, std::optional<uint32_t>) {
   unsupported("ttnn::ring_attention_all_gather_async");
 }
 
@@ -190,6 +204,11 @@ ttnn::Tensor conv3d(
 Tensor gelu_bw(const Tensor &, const Tensor &, const std::string &,
                const std::optional<MemoryConfig> &, std::optional<Tensor>) {
   unsupported("ttnn::experimental::gelu_bw");
+}
+
+CoreCoord get_moe_tilize_drain_core(MeshDevice *, uint32_t, uint32_t,
+                                    uint32_t, const CoreRangeSet &) {
+  unsupported("ttnn::experimental::get_moe_tilize_drain_core");
 }
 
 WeightMemoryConfigs get_weight_mem_configs(MeshDevice *, uint32_t, uint32_t,
