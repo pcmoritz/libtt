@@ -1,0 +1,59 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -6820,7 +6820,16 @@ public:
+     RankedTensorType updateType =
+         mlir::cast<RankedTensorType>(updateTensor.getType());
+     ArrayRef<int64_t> updateShape = updateType.getShape();
+ 
++    // JAX represents a full-tensor .at[:].set(update) as a scatter with no
++    // indexed dimensions. With replacement semantics, it is just the update.
++    if (scatterDimsToOperandDims.empty() &&
++        *scatterReduceType == ttcore::ReduceType::Invalid &&
++        inputType == updateType) {
++      rewriter.replaceOp(srcOp, updateTensor);
++      return success();
++    }
++
+     // Single-dimensional scatter.
+     if (scatterDimsToOperandDims.size() == 1) {
+       // Process indices to match update tensor shape.
+@@ -6959,12 +6968,14 @@ private:
+     // Checks that apply to single dimensional scatter.
+ 
+-    if (!multiDimensionalScatter && indexShape.size() > updateShape.size()) {
++    if (scatterDimsToOperandDims.size() == 1 &&
++        indexShape.size() > updateShape.size()) {
+       return rewriter.notifyMatchFailure(
+           op, "TTIR scatter requires indices.rank <= updates.rank. Please add "
+               "support for rank promotion if needed.");
+     }
+ 
+-    if (!multiDimensionalScatter && indexVectorDim < indexShape.size() &&
++    if (scatterDimsToOperandDims.size() == 1 &&
++        indexVectorDim < indexShape.size() &&
+         indexShape[indexVectorDim] != 1) {
+       return rewriter.notifyMatchFailure(
+           op, "TTIR single-dimensional scatter requires an index vector with "
+diff --git a/test/ttmlir/Conversion/StableHLOToTTIR/scatter_op.mlir b/test/ttmlir/Conversion/StableHLOToTTIR/scatter_op.mlir
+--- a/test/ttmlir/Conversion/StableHLOToTTIR/scatter_op.mlir
++++ b/test/ttmlir/Conversion/StableHLOToTTIR/scatter_op.mlir
+@@ -46,7 +46,18 @@ module @jit_scatter attributes {} {
+             stablehlo.return %arg4 : tensor<f32>
+         }) : (tensor<1x4x128x128xf32>, tensor<1xi32>, tensor<4x128x128xf32>) -> tensor<1x4x128x128xf32>
+         return %result : tensor<1x4x128x128xf32>
+     }
++
++    func.func public @test_scatter_full_update(%arg0: tensor<32x2048xbf16>, %arg1: tensor<32x2048xbf16>) -> tensor<32x2048xbf16> {
++        // CHECK-LABEL: func.func public @test_scatter_full_update
++        // CHECK-NEXT: return %arg1 : tensor<32x2048xbf16>
++        %indices = stablehlo.constant dense<> : tensor<0xi32>
++        %result = "stablehlo.scatter"(%arg0, %indices, %arg1) <{indices_are_sorted = true, scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = [0, 1]>, unique_indices = true}> ({
++        ^bb0(%arg2: tensor<bf16>, %arg3: tensor<bf16>):
++            stablehlo.return %arg3 : tensor<bf16>
++        }) : (tensor<32x2048xbf16>, tensor<0xi32>, tensor<32x2048xbf16>) -> tensor<32x2048xbf16>
++        return %result : tensor<32x2048xbf16>
++    }
+ 
+     func.func public @test_scatter_simple_2(%arg0: tensor<32x32xi32>, %arg1: tensor<1x1xi32>, %arg2: tensor<1x32xi32>) -> tensor<32x32xi32> {
+         // CHECK-LABEL: func.func public @test_scatter_simple_2

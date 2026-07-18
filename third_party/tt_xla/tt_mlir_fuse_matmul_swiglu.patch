@@ -87,7 +87,7 @@ index ac04b7e..3343a62 100644
 +        inputShape[0] < 1 || inputShape[0] > 32 ||
 +        outputShape[0] != inputShape[0] ||
 +        inputShape[1] != 2 * outputShape[1] ||
-+        outputShape[1] % 32 != 0) {
++        outputShape[1] % (32 * 96) != 0) {
 +      return failure();
 +    }
 +
