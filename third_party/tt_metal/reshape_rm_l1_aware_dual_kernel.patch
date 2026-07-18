@@ -1,0 +1,17 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
+@@ -57,8 +57,12 @@ ProgramDescriptor ReshapeViewRMProgramFactory::create_descriptor(
+     const uint32_t cb_size0 = source_read_size_bytes;
+     const uint32_t cb_size1 = ((dest_page_size_bytes - 1) & MASK_64) + 80;
+ 
++    const uint64_t dual_kernel_cb_end =
++        device->allocator()->get_base_allocator_addr(HalMemType::L1) +
++        2ULL * (2ULL * cb_size0 + cb_size1);
+     bool can_use_dual_kernel =
+-        (source_page_size_bytes % dest_page_size_bytes == 0 || dest_page_size_bytes % source_page_size_bytes == 0);
++        (source_page_size_bytes % dest_page_size_bytes == 0 || dest_page_size_bytes % source_page_size_bytes == 0) &&
++        dual_kernel_cb_end <= device->l1_size_per_core();
+ 
+     constexpr uint32_t src0_cb_index = 0;
+     constexpr uint32_t src1_cb_index = 1;
