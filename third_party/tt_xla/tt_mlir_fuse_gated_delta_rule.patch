@@ -117,67 +117,6 @@ index a55a301..280a7d4 100644
    GetDeviceOp,
    GlobalAvgPool2dOp,
    GroupNormOp,
-diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-index 80b1da9..5ef1067 100644
---- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-+++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10005,6 +10005,48 @@ static void addCacheOpsConversionPattern(MLIRContext *ctx,
-   patterns.add<StableHLOSamplingConversionPattern>(typeConverter, ctx);
- }
- 
-+namespace {
-+class StableHLOGatedDeltaRuleOpConversionPattern
-+    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
-+  using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
-+
-+public:
-+  LogicalResult
-+  matchAndRewrite(mlir::stablehlo::CustomCallOp srcOp,
-+                  mlir::stablehlo::CustomCallOp::Adaptor adaptor,
-+                  ConversionPatternRewriter &rewriter) const override {
-+    if (adaptor.getCallTargetName() != "tt.gated_delta_rule") {
-+      return failure();
-+    }
-+    if (adaptor.getOperands().size() != 13 || srcOp.getNumResults() != 2) {
-+      return rewriter.notifyMatchFailure(
-+          srcOp, "tt.gated_delta_rule requires 13 operands and two results");
-+    }
-+
-+    SmallVector<Type> resultTypes;
-+    resultTypes.reserve(srcOp.getNumResults());
-+    for (Type type : srcOp.getResultTypes()) {
-+      Type converted = getTypeConverter()->convertType(type);
-+      if (!converted) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "failed to convert gated delta rule result type");
-+      }
-+      resultTypes.push_back(converted);
-+    }
-+
-+    rewriter.replaceOpWithNewOp<ttir::GatedDeltaRuleOp>(
-+        srcOp, resultTypes, adaptor.getOperands());
-+    return success();
-+  }
-+};
-+} // namespace
-+
-+static void addGatedDeltaRuleOpConversionPattern(
-+    MLIRContext *ctx, RewritePatternSet &patterns,
-+    TypeConverter &typeConverter) {
-+  patterns.add<StableHLOGatedDeltaRuleOpConversionPattern>(typeConverter, ctx);
-+}
-+
- namespace {
- // This pattern recognizes and converts
- // `stablehlo.custom_call @tt.tt_lang_op` to `ttir.tt_lang_op`. The op carries
-@@ -10627,6 +10669,7 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
-                                                         typeConverter);
-   addSparseMatmulOpConversionPattern(ctx, patterns, typeConverter);
-   addAllToAllOpsConversionPattern(ctx, patterns, typeConverter);
-+  addGatedDeltaRuleOpConversionPattern(ctx, patterns, typeConverter);
-   addTTLangOpConversionPattern(ctx, patterns, typeConverter);
- }
- 
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 index 2627344..59da13c 100644
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
@@ -230,7 +169,7 @@ index 2627344..59da13c 100644
             SplitQueryKeyValueAndSplitHeadsOpConversionPattern,
             GeluBackwardOpConversionPattern,
 diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
-index ec7bfe8..55618d2 100644
+index ec7bfe8..adc3da5 100644
 --- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
 +++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
 @@ -20,7 +20,9 @@
@@ -251,7 +190,7 @@ index ec7bfe8..55618d2 100644
  #include "stablehlo/conversions/linalg/transforms/Passes.h"
  #include "stablehlo/transforms/Passes.h"
  #include "stablehlo/transforms/optimization/Passes.h"
-@@ -57,6 +60,235 @@ namespace mlir::tt::ttir {
+@@ -57,6 +60,227 @@ namespace mlir::tt::ttir {
  
  #ifdef TTMLIR_ENABLE_STABLEHLO
  
@@ -421,15 +360,7 @@ index ec7bfe8..55618d2 100644
 +      identity32};
 +  SmallVector<Type> resultTypes = {loop.getResult(1).getType(),
 +                                   loop.getResult(2).getType()};
-+  auto fused = builder.create<::mlir::stablehlo::CustomCallOp>(
-+      loc, resultTypes, operands, builder.getStringAttr("tt.gated_delta_rule"),
-+      /*has_side_effect=*/nullptr,
-+      /*backend_config=*/nullptr,
-+      /*api_version=*/nullptr,
-+      /*called_computations=*/nullptr,
-+      /*operand_layouts=*/nullptr,
-+      /*result_layouts=*/nullptr,
-+      /*output_operand_aliases=*/nullptr);
++  auto fused = builder.create<GatedDeltaRuleOp>(loc, resultTypes, operands);
 +
 +  auto inductionType = cast<RankedTensorType>(loop->getOperand(0).getType());
 +  auto finalInductionAttr = DenseElementsAttr::get(
@@ -487,7 +418,7 @@ index ec7bfe8..55618d2 100644
  void createStableHLOToTTIRPipeline(
      OpPassManager &pm, const StableHLOToTTIRPipelineOptions &options) {
    if (options.arithDialectConversionsEnabled) {
-@@ -81,6 +313,7 @@ void createStableHLOToTTIRPipeline(
+@@ -81,6 +305,7 @@ void createStableHLOToTTIRPipeline(
      pm.addPass(::mlir::stablehlo::createStablehloLegalizeCompositeToCallPass());
    }
    pm.addPass(mlir::createInlinerPass());
@@ -543,10 +474,10 @@ index 1ac1985..f4eb7b4 100644
      return createOperation(cache, createOp(cache, flashMlaPrefillOp),
 diff --git a/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp b/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
 new file mode 100644
-index 0000000..3a51939
+index 0000000..3bbe67c
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,404 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -894,13 +825,10 @@ index 0000000..3a51939
 +
 +  ::ttnn::Tensor lowerMask4D =
 +      reshape(lowerMask, {numHeads, 1, kChunkSize, kChunkSize});
-+  ::ttnn::Tensor causalMask4D =
-+      reshape(lowerTriangular, {1, 1, kChunkSize, kChunkSize});
-+  ::ttnn::Tensor combinedMask = multiply(lowerMask4D, causalMask4D);
 +  ::ttnn::Tensor key4DTranspose =
 +      ::ttnn::transpose(key4D, 2, 3, kDram);
 +  ::ttnn::Tensor intraAttention =
-+      multiply(matmul(query4D, key4DTranspose), combinedMask);
++      multiply(matmul(query4D, key4DTranspose), lowerMask4D);
 +
 +  ::ttnn::Tensor lowerUnit4D =
 +      reshape(lowerUnit, {numHeads, 1, kChunkSize, kChunkSize});
