@@ -1,0 +1,131 @@
+diff --git a/include/ttmlir/Target/TTNN/operations/eltwise.fbs b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+--- a/include/ttmlir/Target/TTNN/operations/eltwise.fbs
++++ b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+@@ -20,5 +20,7 @@ enum EltwiseBinaryOpType: uint32 {
+   Divide,
+   LogicalAnd,
+   LogicalOr,
+-  LogicalXor
++  LogicalXor,
++  MultiplySiluLhs,
++  MultiplySiluRhs
+ }
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -173,3 +173,38 @@ private:
+     return false;
+   }
+ };
++
++// Fuse a single-use SiLU producer into BinaryNg's per-input activation. This
++// turns the SwiGLU activation from two device programs into one while keeping
++// the existing sliced gate/up tensors and output layout unchanged.
++class TTNNMultiplyWithSilu : public mlir::OpRewritePattern<MultiplyOp> {
++public:
++  using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(MultiplyOp multiplyOp,
++                  mlir::PatternRewriter &rewriter) const final {
++    SiluOp lhsSilu = multiplyOp.getLhs().getDefiningOp<SiluOp>();
++    SiluOp rhsSilu = multiplyOp.getRhs().getDefiningOp<SiluOp>();
++    if ((!lhsSilu && !rhsSilu) || (lhsSilu && rhsSilu)) {
++      return failure();
++    }
++
++    SiluOp siluOp = lhsSilu ? lhsSilu : rhsSilu;
++    if (!siluOp.getResult().hasOneUse()) {
++      return failure();
++    }
++
++    rewriter.modifyOpInPlace(multiplyOp, [&]() {
++      if (lhsSilu) {
++        multiplyOp.getLhsMutable().assign(siluOp.getInput());
++        multiplyOp->setAttr("ttnn.fused_silu_lhs", rewriter.getUnitAttr());
++      } else {
++        multiplyOp.getRhsMutable().assign(siluOp.getInput());
++        multiplyOp->setAttr("ttnn.fused_silu_rhs", rewriter.getUnitAttr());
++      }
++    });
++    rewriter.eraseOp(siluOp);
++    return success();
++  }
++};
+@@ -346,7 +381,7 @@ public:
+     RewritePatternSet patterns(&getContext());
+     // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
+     // https://github.com/tenstorrent/tt-metal/issues/30973
+-    patterns.add<
++    patterns.add<TTNNMultiplyWithSilu,
+         TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
+         TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
+         TTNNMatmulAndLinearWithActivation<MatmulOp, SigmoidOp>,
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -2039,7 +2039,13 @@ createEltwiseBinaryOp(FlatbufferObjectCache &cache, EltwiseBinaryOp op) {
+   if constexpr (std::is_same_v<EltwiseBinaryOp, AddOp>) {
+     type = ::tt::target::ttnn::EltwiseBinaryOpType::Add;
+   } else if constexpr (std::is_same_v<EltwiseBinaryOp, MultiplyOp>) {
+-    type = ::tt::target::ttnn::EltwiseBinaryOpType::Multiply;
++    if (op->hasAttr("ttnn.fused_silu_lhs")) {
++      type = ::tt::target::ttnn::EltwiseBinaryOpType::MultiplySiluLhs;
++    } else if (op->hasAttr("ttnn.fused_silu_rhs")) {
++      type = ::tt::target::ttnn::EltwiseBinaryOpType::MultiplySiluRhs;
++    } else {
++      type = ::tt::target::ttnn::EltwiseBinaryOpType::Multiply;
++    }
+   } else if constexpr (std::is_same_v<EltwiseBinaryOp, LogicalRightShiftOp>) {
+     type = ::tt::target::ttnn::EltwiseBinaryOpType::LogicalRightShift;
+   } else if constexpr (std::is_same_v<EltwiseBinaryOp, SubtractOp>) {
+diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
+--- a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
+@@ -5,4 +5,5 @@
+ #include "tt/runtime/detail/common/logger.h"
+ #include "tt/runtime/detail/ttnn/operations/utils.h"
+ #include "tt/runtime/detail/ttnn/ttnn.h"
++#include "ttnn/operations/eltwise/unary/common/unary_op_types.hpp"
+ #include "tt/runtime/detail/ttnn/utils.h"
+@@ -51,6 +52,40 @@ void run(const ::tt::target::ttnn::EltwiseBinaryOp *op,
+     });
+     break;
+   }
++  case ::tt::target::ttnn::EltwiseBinaryOpType::MultiplySiluLhs: {
++    runEltwiseBinaryOp(
++        op, tensorPool,
++        [](const auto &lhs, const auto &rhs, const auto &outputDtype,
++           const auto &memoryConfig) {
++          using EltwiseUnary =
++              ::ttnn::operations::unary::EltwiseUnaryWithParam;
++          const EltwiseUnary silu{
++              ::ttnn::operations::unary::UnaryOpType::SILU};
++          const ::ttsl::Span<const EltwiseUnary> noActivations;
++          const ::ttsl::Span<const EltwiseUnary> lhsSilu(&silu, 1);
++          return ::ttnn::multiply(
++              lhs, rhs, outputDtype, memoryConfig, std::nullopt,
++              noActivations, lhsSilu, noActivations);
++        });
++    break;
++  }
++  case ::tt::target::ttnn::EltwiseBinaryOpType::MultiplySiluRhs: {
++    runEltwiseBinaryOp(
++        op, tensorPool,
++        [](const auto &lhs, const auto &rhs, const auto &outputDtype,
++           const auto &memoryConfig) {
++          using EltwiseUnary =
++              ::ttnn::operations::unary::EltwiseUnaryWithParam;
++          const EltwiseUnary silu{
++              ::ttnn::operations::unary::UnaryOpType::SILU};
++          const ::ttsl::Span<const EltwiseUnary> noActivations;
++          const ::ttsl::Span<const EltwiseUnary> rhsSilu(&silu, 1);
++          return ::ttnn::multiply(
++              lhs, rhs, outputDtype, memoryConfig, std::nullopt,
++              noActivations, noActivations, rhsSilu);
++        });
++    break;
++  }
+   case ::tt::target::ttnn::EltwiseBinaryOpType::LogicalRightShift: {
+     runEltwiseBinaryOp(op, tensorPool, [](auto &&...args) {
+       return ::ttnn::logical_right_shift(std::forward<decltype(args)>(args)...);
