@@ -88,25 +88,27 @@ diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pip
 index ec7bfe8..2761e9d 100644
 --- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
 +++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
-@@ -20,7 +20,9 @@
+@@ -20,7 +20,10 @@
  #include "mlir/Dialect/Linalg/Passes.h"
  #include "mlir/Dialect/SCF/Transforms/Passes.h"
  #include "mlir/InitAllDialects.h"
 +#include "mlir/IR/BuiltinAttributes.h"
++#include "mlir/IR/Matchers.h"
  #include "mlir/InitAllPasses.h"
 +#include "mlir/Transforms/RegionUtils.h"
  #include "mlir/Pass/PassManager.h"
  #include "mlir/Pass/PassRegistry.h"
  #include "mlir/Tools/mlir-opt/MlirOptMain.h"
-@@ -33,6 +35,7 @@
+@@ -33,6 +36,8 @@
  #include "ttmlir/Transforms/Passes.h"
++#include "ttmlir/Utils.h"
  
  #ifdef TTMLIR_ENABLE_STABLEHLO
 +#include "stablehlo/dialect/StablehloOps.h"
  #include "stablehlo/conversions/linalg/transforms/Passes.h"
  #include "stablehlo/transforms/Passes.h"
  #include "stablehlo/transforms/optimization/Passes.h"
-@@ -57,6 +60,866 @@ namespace mlir::tt::ttir {
+@@ -57,6 +60,842 @@ namespace mlir::tt::ttir {
  
  #ifdef TTMLIR_ENABLE_STABLEHLO
  
@@ -216,6 +218,12 @@ index ec7bfe8..2761e9d 100644
 +  return type && type.hasStaticShape() && type.getShape() == shape;
 +}
 +
++Value stripRecurrentViews(Value value) {
++  return ttmlir::utils::lookThrough<
++      ::mlir::stablehlo::BroadcastInDimOp,
++      ::mlir::stablehlo::ReshapeOp>(value);
++}
++
 +struct QwenGatedDeltaMatch {
 +  int64_t sequenceLength;
 +  Value query;
@@ -252,22 +260,13 @@ index ec7bfe8..2761e9d 100644
 +};
 +
 +Value findStatePoolIndices(Value value, int64_t batch) {
-+  for (int depth = 0; depth < 6; ++depth) {
-+    auto type = dyn_cast<RankedTensorType>(value.getType());
-+    if (!type || !type.hasStaticShape()) {
-+      return {};
-+    }
-+    if (type.getRank() == 1 && type.getDimSize(0) == batch &&
-+        type.getElementType().isInteger(32)) {
-+      return value;
-+    }
-+    Operation *definition = value.getDefiningOp();
-+    if (!definition || definition->getNumOperands() != 1) {
-+      return {};
-+    }
-+    value = definition->getOperand(0);
-+  }
-+  return {};
++  value = stripRecurrentViews(value);
++  auto type = dyn_cast<RankedTensorType>(value.getType());
++  return type && type.hasStaticShape() && type.getRank() == 1 &&
++                 type.getDimSize(0) == batch &&
++                 type.getElementType().isInteger(32)
++             ? value
++             : Value();
 +}
 +
 +LogicalResult fuseStatePoolUpdate(::mlir::stablehlo::ScatterOp scatter) {
@@ -331,17 +330,8 @@ index ec7bfe8..2761e9d 100644
 +  }
 +};
 +
-+Value stripBroadcasts(Value value) {
-+  // JAX expands each recurrence broadcast through two rank-increasing ops.
-+  // Follow that exact, narrow chain and stop before the source computation.
-+  for (int i = 0; i < 2; ++i) {
-+    Operation *definition = value.getDefiningOp();
-+    if (!definition || definition->getNumOperands() != 1) {
-+      break;
-+    }
-+    value = definition->getOperand(0);
-+  }
-+  return value;
++bool isOneLike(Value value) {
++  return matchPattern(stripRecurrentViews(value), m_OneFloat());
 +}
 +
 +Value matchExpandedSilu(Value input) {
@@ -358,16 +348,18 @@ index ec7bfe8..2761e9d 100644
 +      return multiply.getResult();
 +    }
 +    auto divide = sigmoid.getDefiningOp<::mlir::stablehlo::DivOp>();
-+    if (!divide) {
++    if (!divide || !isOneLike(divide.getLhs())) {
 +      continue;
 +    }
 +    auto denominator = divide.getRhs().getDefiningOp<::mlir::stablehlo::AddOp>();
 +    if (!denominator) {
 +      continue;
 +    }
-+    for (Value candidate : {denominator.getLhs(), denominator.getRhs()}) {
++    for (auto [one, candidate] :
++         {std::pair{denominator.getLhs(), denominator.getRhs()},
++          std::pair{denominator.getRhs(), denominator.getLhs()}}) {
 +      auto exponential = candidate.getDefiningOp<::mlir::stablehlo::ExpOp>();
-+      if (!exponential) {
++      if (!isOneLike(one) || !exponential) {
 +        continue;
 +      }
 +      auto negate = exponential.getOperand()
@@ -415,19 +407,12 @@ index ec7bfe8..2761e9d 100644
 +  SmallVector<int64_t> windowShape = {batch, channels, 4};
 +  SmallVector<int64_t> stateShape = {batch, channels, 3};
 +
-+  Value weight;
-+  Value window;
-+  for (auto [weightCandidate, windowCandidate] :
-+       {std::pair{dot.getLhs(), dot.getRhs()},
-+        std::pair{dot.getRhs(), dot.getLhs()}}) {
-+    if (hasShape(weightCandidate, weightShape) &&
-+        hasShape(windowCandidate, windowShape)) {
-+      weight = weightCandidate;
-+      window = windowCandidate;
-+      break;
-+    }
++  Value weight = dot.getLhs();
++  Value window = dot.getRhs();
++  if (!hasShape(weight, weightShape)) {
++    std::swap(weight, window);
 +  }
-+  if (!window) {
++  if (!hasShape(weight, weightShape) || !hasShape(window, windowShape)) {
 +    return std::nullopt;
 +  }
 +  auto concatenate =
@@ -437,14 +422,7 @@ index ec7bfe8..2761e9d 100644
 +      !hasShape(concatenate.getInputs()[0], stateShape)) {
 +    return std::nullopt;
 +  }
-+  Value input = concatenate.getInputs()[1];
-+  if (auto broadcast =
-+          input.getDefiningOp<::mlir::stablehlo::BroadcastInDimOp>()) {
-+    input = broadcast.getOperand();
-+  } else if (auto reshape =
-+                 input.getDefiningOp<::mlir::stablehlo::ReshapeOp>()) {
-+    input = reshape.getOperand();
-+  }
++  Value input = stripRecurrentViews(concatenate.getInputs()[1]);
 +  if (!hasShape(input, inputShape)) {
 +    return std::nullopt;
 +  }
@@ -464,8 +442,8 @@ index ec7bfe8..2761e9d 100644
 +    return std::nullopt;
 +  }
 +  Value statePool = gather.getOperand();
-+  Value stateIndices = stripBroadcasts(gather.getStartIndices());
-+  Value hasInitialState = stripBroadcasts(stateSelect.getPred());
++  Value stateIndices = stripRecurrentViews(gather.getStartIndices());
++  Value hasInitialState = stripRecurrentViews(stateSelect.getPred());
 +  auto poolType = dyn_cast<RankedTensorType>(statePool.getType());
 +  if (!poolType || !poolType.hasStaticShape() || poolType.getRank() != 3 ||
 +      poolType.getDimSize(0) < 2 || poolType.getDimSize(1) != channels ||
@@ -553,7 +531,7 @@ index ec7bfe8..2761e9d 100644
 +  for (auto [state, decayValue] :
 +       {std::pair{multiply.getLhs(), multiply.getRhs()},
 +        std::pair{multiply.getRhs(), multiply.getLhs()}}) {
-+    Value decay = stripBroadcasts(decayValue);
++    Value decay = stripRecurrentViews(decayValue);
 +    if (hasShape(state, stateShape) && hasShape(decay, scalarShape)) {
 +      return std::pair{state, decay};
 +    }
@@ -574,7 +552,7 @@ index ec7bfe8..2761e9d 100644
 +        std::pair{multiply.getRhs(), multiply.getLhs()}}) {
 +    auto subtract =
 +        deltaValue.getDefiningOp<::mlir::stablehlo::SubtractOp>();
-+    Value beta = stripBroadcasts(betaValue);
++    Value beta = stripRecurrentViews(betaValue);
 +    if (!subtract || !hasShape(beta, scalarShape) ||
 +        !hasShape(subtract.getLhs(), vectorShape)) {
 +      continue;
@@ -614,8 +592,8 @@ index ec7bfe8..2761e9d 100644
 +  }
 +
 +  Value statePool = gather.getOperand();
-+  Value stateIndices = stripBroadcasts(gather.getStartIndices());
-+  Value hasInitialState = stripBroadcasts(initialSelect.getPred());
++  Value stateIndices = stripRecurrentViews(gather.getStartIndices());
++  Value hasInitialState = stripRecurrentViews(initialSelect.getPred());
 +  auto poolType = dyn_cast<RankedTensorType>(statePool.getType());
 +  if (!poolType || !poolType.hasStaticShape() || poolType.getRank() != 4 ||
 +      poolType.getDimSize(0) < 2 || poolType.getDimSize(1) != numHeads ||
@@ -684,8 +662,8 @@ index ec7bfe8..2761e9d 100644
 +    for (auto [keyValue, scaledDeltaValue] :
 +         {std::pair{outer.getLhs(), outer.getRhs()},
 +          std::pair{outer.getRhs(), outer.getLhs()}}) {
-+      Value key = stripBroadcasts(keyValue);
-+      Value scaledDelta = stripBroadcasts(scaledDeltaValue);
++      Value key = stripRecurrentViews(keyValue);
++      Value scaledDelta = stripRecurrentViews(scaledDeltaValue);
 +      if (!hasShape(key, vectorShape) ||
 +          !hasShape(scaledDelta, vectorShape)) {
 +        continue;
@@ -973,7 +951,7 @@ index ec7bfe8..2761e9d 100644
  void createStableHLOToTTIRPipeline(
      OpPassManager &pm, const StableHLOToTTIRPipelineOptions &options) {
    if (options.arithDialectConversionsEnabled) {
-@@ -81,6 +944,10 @@ void createStableHLOToTTIRPipeline(
+@@ -81,6 +922,10 @@ void createStableHLOToTTIRPipeline(
      pm.addPass(::mlir::stablehlo::createStablehloLegalizeCompositeToCallPass());
    }
    pm.addPass(mlir::createInlinerPass());
