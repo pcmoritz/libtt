@@ -471,10 +471,10 @@ index 0000000000000000000000000000000000000000..4861f17b4ea25188766f657f03c464b6
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..598ac696bdb1eac7617e47719b4fcfd5a977740e
+index 0000000000000000000000000000000000000000..bfef0e471f7bead5b506ee6b3d78082ab88a0641
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,303 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -555,13 +555,7 @@ index 0000000000000000000000000000000000000000..598ac696bdb1eac7617e47719b4fcfd5
 +}
 +
 +void check_shape(const Tensor& tensor, std::initializer_list<uint32_t> expected, const char* name) {
-+    const auto& shape = tensor.logical_shape();
-+    TT_FATAL(shape.rank() == expected.size(), "{} rank mismatch", name);
-+    size_t dim = 0;
-+    for (uint32_t value : expected) {
-+        TT_FATAL(static_cast<uint32_t>(shape[dim]) == value, "{} dimension {} mismatch", name, dim);
-+        ++dim;
-+    }
++    TT_FATAL(tensor.logical_shape() == Shape(expected), "{} shape mismatch", name);
 +}
 +
 +void DecodeOperation::validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t& in) {

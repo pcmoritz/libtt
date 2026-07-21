@@ -1,6 +1,6 @@
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
 new file mode 100644
-index 0000000..f2ba067
+index 0000000000000000000000000000000000000000..1a0288fc293cffd92b3060ffc852d84e10f67bb4
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
 @@ -0,0 +1,81 @@
@@ -87,7 +87,7 @@ index 0000000..f2ba067
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp
 new file mode 100644
-index 0000000..7e48ea7
+index 0000000000000000000000000000000000000000..dafb9778090fcb155b09a491ac46185e23355c9a
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp
 @@ -0,0 +1,15 @@
@@ -108,10 +108,10 @@ index 0000000..7e48ea7
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
 new file mode 100644
-index 0000000..2855b46
+index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c68be6f167
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,217 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -187,12 +187,14 @@ index 0000000..2855b46
 +};
 +
 +void validate_tensor(const Tensor& tensor, const char* name) {
-+    TT_FATAL(
-+        tensor.storage_type() == StorageType::DEVICE,
-+        "{} must be on device", name);
++    TT_FATAL(tensor.storage_type() == StorageType::DEVICE, "{} must be on device", name);
 +    TT_FATAL(tensor.buffer() != nullptr, "{} must be allocated", name);
 +    TT_FATAL(tensor.layout() == Layout::TILE, "{} must be tiled", name);
 +    TT_FATAL(!tensor.is_sharded(), "{} must be interleaved", name);
++}
++
++void check_shape(const Tensor& tensor, std::initializer_list<uint32_t> expected, const char* name) {
++    TT_FATAL(tensor.logical_shape() == Shape(expected), "{} shape mismatch", name);
 +}
 +
 +void StatePoolUpdateOperation::validate_on_program_cache_miss(
@@ -209,14 +211,11 @@ index 0000000..2855b46
 +
 +    const auto& pool_shape = inputs.state_pool.logical_shape();
 +    const auto& update_shape = inputs.updates.logical_shape();
-+    const auto& index_shape = inputs.state_indices.logical_shape();
 +    TT_FATAL(
 +        pool_shape.rank() >= 2 && pool_shape.rank() == update_shape.rank(),
 +        "state pool and updates must have the same rank of at least two");
-+    TT_FATAL(
-+        index_shape.rank() == 1 && index_shape[0] == update_shape[0] &&
-+            update_shape[0] <= 32,
-+        "state indices must contain one tile-row of update indices");
++    TT_FATAL(update_shape[0] <= 32, "updates must fit in one tile row");
++    check_shape(inputs.state_indices, {update_shape[0]}, "state indices");
 +    for (uint32_t dim = 1; dim < pool_shape.rank(); ++dim) {
 +        TT_FATAL(
 +            pool_shape[dim] == update_shape[dim],

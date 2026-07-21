@@ -1,6 +1,6 @@
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
 new file mode 100644
-index 0000000..6e90d41
+index 0000000000000000000000000000000000000000..319385ff2c493681ca4984cc19b05cc1f978d069
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
 @@ -0,0 +1,55 @@
@@ -61,7 +61,7 @@ index 0000000..6e90d41
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
 new file mode 100644
-index 0000000..5b4943d
+index 0000000000000000000000000000000000000000..0bfdf22a32bb1ebd2935aeeb53cfeeac652ef7b3
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
 @@ -0,0 +1,179 @@
@@ -246,7 +246,7 @@ index 0000000..5b4943d
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp
 new file mode 100644
-index 0000000..74b0853
+index 0000000000000000000000000000000000000000..1b7ed9ce3bf2d3bd7c6a668de2135882ce9cdff6
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp
 @@ -0,0 +1,31 @@
@@ -283,7 +283,7 @@ index 0000000..74b0853
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
 new file mode 100644
-index 0000000..2bb849b
+index 0000000000000000000000000000000000000000..fdc2b2c7240e8faf4275793f5f8f55c88edf70f8
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
 @@ -0,0 +1,19 @@
@@ -308,10 +308,10 @@ index 0000000..2bb849b
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
 new file mode 100644
-index 0000000..7510ca6
+index 0000000000000000000000000000000000000000..1339b00e5302452c98f5f9fafdbd8929423f5ee4
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,258 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -396,6 +396,10 @@ index 0000000..7510ca6
 +        "{} must be interleaved", name);
 +}
 +
++void check_shape(const Tensor& tensor, std::initializer_list<uint32_t> expected, const char* name) {
++    TT_FATAL(tensor.logical_shape() == Shape(expected), "{} shape mismatch", name);
++}
++
 +void ConvOperation::validate_on_program_cache_miss(
 +    const operation_attributes_t&, const tensor_args_t& in) {
 +    validate_tensor(in.input, DataType::BFLOAT16, "input");
@@ -407,9 +411,6 @@ index 0000000..7510ca6
 +
 +    const auto& input_shape = in.input.logical_shape();
 +    const auto& state_shape = in.state.logical_shape();
-+    const auto& weight_shape = in.weight.logical_shape();
-+    const auto& index_shape = in.state_indices.logical_shape();
-+    const auto& flag_shape = in.has_initial_state.logical_shape();
 +    TT_FATAL(input_shape.rank() == 2, "input must have rank 2");
 +    const uint32_t batch_size = input_shape[0];
 +    const uint32_t channels = input_shape[1];
@@ -419,16 +420,9 @@ index 0000000..7510ca6
 +        state_shape.rank() == 3 && state_shape[0] >= 2 &&
 +            state_shape[1] == channels && state_shape[2] == 3,
 +        "state must have shape [slots, channels, 3]");
-+    TT_FATAL(
-+        weight_shape.rank() == 2 && weight_shape[0] == channels &&
-+            weight_shape[1] == 4,
-+        "weight must have shape [channels, 4]");
-+    TT_FATAL(
-+        index_shape.rank() == 1 && index_shape[0] == batch_size,
-+        "state indices must have shape [batch]");
-+    TT_FATAL(
-+        flag_shape.rank() == 1 && flag_shape[0] == batch_size,
-+        "initial-state mask must have shape [batch]");
++    check_shape(in.weight, {channels, 4}, "weight");
++    check_shape(in.state_indices, {batch_size}, "state indices");
++    check_shape(in.has_initial_state, {batch_size}, "initial-state mask");
 +}
 +
 +ConvOperation::spec_return_value_t ConvOperation::compute_output_specs(
