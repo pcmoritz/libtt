@@ -1,0 +1,319 @@
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
+new file mode 100644
+index 0000000..60dc75b
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
+@@ -0,0 +1,69 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#include <stdint.h>
++
++#include "api/dataflow/circular_buffer.h"
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++#include "recurrent_utils.hpp"
++
++void kernel_main() {
++    constexpr uint32_t batch_size = get_compile_time_arg_val(0);
++    constexpr uint32_t pages_per_slice = get_compile_time_arg_val(1);
++    constexpr uint32_t num_workers = get_compile_time_arg_val(2);
++    constexpr uint32_t tile_bytes = get_compile_time_arg_val(3);
++
++    const uint32_t worker = get_arg_val<uint32_t>(0);
++    const uint32_t state_pool_address = get_arg_val<uint32_t>(1);
++    const uint32_t state_indices_address = get_arg_val<uint32_t>(2);
++    const uint32_t updates_address = get_arg_val<uint32_t>(3);
++
++    constexpr auto state_pool_args = TensorAccessorArgs<4>();
++    constexpr auto state_indices_args =
++        TensorAccessorArgs<state_pool_args.next_compile_time_args_offset()>();
++    constexpr auto updates_args =
++        TensorAccessorArgs<state_indices_args.next_compile_time_args_offset()>();
++    const auto state_pool =
++        TensorAccessor(state_pool_args, state_pool_address, tile_bytes);
++    const auto state_indices =
++        TensorAccessor(state_indices_args, state_indices_address, 4096);
++    const auto updates = TensorAccessor(updates_args, updates_address, tile_bytes);
++
++    CircularBuffer data_cb(tt::CBIndex::c_0);
++    CircularBuffer indices_cb(tt::CBIndex::c_1);
++    Noc noc;
++
++    indices_cb.reserve_back(1);
++    noc.async_read(
++        state_indices, indices_cb, 4096,
++        {.page_id = 0}, {.offset_bytes = 0});
++    noc.async_read_barrier();
++    indices_cb.push_back(1);
++    indices_cb.wait_front(1);
++    const uint32_t total_pages = batch_size * pages_per_slice;
++    for (uint32_t work = worker; work < total_pages; work += num_workers) {
++        const uint32_t batch = work / pages_per_slice;
++        const uint32_t page = work % pages_per_slice;
++        const uint32_t slot = read_index(indices_cb.get_read_ptr(), batch);
++        if (slot == 0) {
++            continue;
++        }
++
++        data_cb.reserve_back(1);
++        noc.async_read(
++            updates, data_cb, tile_bytes,
++            {.page_id = batch * pages_per_slice + page},
++            {.offset_bytes = 0});
++        noc.async_read_barrier();
++        data_cb.push_back(1);
++        data_cb.wait_front(1);
++        noc.async_write(
++            data_cb, state_pool, tile_bytes,
++            {.offset_bytes = 0},
++            {.page_id = slot * pages_per_slice + page});
++        noc.async_write_barrier();
++        data_cb.pop_front(1);
++    }
++    indices_cb.pop_front(1);
++}
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..dafb9778090fcb155b09a491ac46185e23355c9a
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp
+@@ -0,0 +1,15 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include "ttnn/tensor/tensor.hpp"
++
++namespace ttnn::transformer {
++
++Tensor state_pool_update(
++    const Tensor& state_pool,
++    const Tensor& state_indices,
++    const Tensor& updates);
++
++}  // namespace ttnn::transformer
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c68be6f167
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
+@@ -0,0 +1,217 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#include "ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp"
++
++#include <algorithm>
++#include <variant>
++
++#include <tt-metalium/host_api.hpp>
++#include <tt-metalium/tensor_accessor_args.hpp>
++#include <tt-metalium/work_split.hpp>
++#include "ttnn/device.hpp"
++#include "ttnn/device_operation.hpp"
++#include "ttnn/operation.hpp"
++
++using namespace tt::tt_metal;
++
++namespace ttnn::prim {
++namespace {
++
++struct StatePoolUpdateParams {};
++
++struct StatePoolUpdateInputs {
++    Tensor state_pool;
++    Tensor state_indices;
++    Tensor updates;
++};
++
++struct StatePoolUpdateSharedVariables {
++    KernelHandle kernel_id;
++    uint32_t grid_y;
++    uint32_t num_workers;
++};
++
++struct StatePoolUpdateProgramFactory {
++    using shared_variables_t = StatePoolUpdateSharedVariables;
++    using cached_program_t = device_operation::CachedProgram<shared_variables_t>;
++    using operation_attributes_t = StatePoolUpdateParams;
++    using tensor_args_t = StatePoolUpdateInputs;
++    using tensor_return_value_t = Tensor;
++
++    static cached_program_t create(
++        const operation_attributes_t&, const tensor_args_t&,
++        tensor_return_value_t&);
++    static void override_runtime_arguments(
++        cached_program_t&, const operation_attributes_t&, const tensor_args_t&,
++        tensor_return_value_t&);
++};
++
++struct StatePoolUpdateOperation {
++    using operation_attributes_t = StatePoolUpdateParams;
++    using tensor_args_t = StatePoolUpdateInputs;
++    using spec_return_value_t = TensorSpec;
++    using tensor_return_value_t = Tensor;
++    using program_factory_t = std::variant<StatePoolUpdateProgramFactory>;
++
++    static void validate_on_program_cache_miss(
++        const operation_attributes_t&, const tensor_args_t&);
++    static void validate_on_program_cache_hit(
++        const operation_attributes_t& attrs, const tensor_args_t& inputs) {
++        validate_on_program_cache_miss(attrs, inputs);
++    }
++    static spec_return_value_t compute_output_specs(
++        const operation_attributes_t&, const tensor_args_t& inputs) {
++        return inputs.state_pool.tensor_spec();
++    }
++    static tensor_return_value_t create_output_tensors(
++        const operation_attributes_t&, const tensor_args_t& inputs) {
++        return inputs.state_pool;
++    }
++    static ttsl::hash::hash_t compute_program_hash(
++        const operation_attributes_t&, const tensor_args_t&);
++};
++
++void validate_tensor(const Tensor& tensor, const char* name) {
++    TT_FATAL(tensor.storage_type() == StorageType::DEVICE, "{} must be on device", name);
++    TT_FATAL(tensor.buffer() != nullptr, "{} must be allocated", name);
++    TT_FATAL(tensor.layout() == Layout::TILE, "{} must be tiled", name);
++    TT_FATAL(!tensor.is_sharded(), "{} must be interleaved", name);
++}
++
++void check_shape(const Tensor& tensor, std::initializer_list<uint32_t> expected, const char* name) {
++    TT_FATAL(tensor.logical_shape() == Shape(expected), "{} shape mismatch", name);
++}
++
++void StatePoolUpdateOperation::validate_on_program_cache_miss(
++    const operation_attributes_t&, const tensor_args_t& inputs) {
++    validate_tensor(inputs.state_pool, "state pool");
++    validate_tensor(inputs.state_indices, "state indices");
++    validate_tensor(inputs.updates, "updates");
++    TT_FATAL(
++        inputs.state_indices.dtype() == DataType::INT32,
++        "state indices must be int32");
++    TT_FATAL(
++        inputs.state_pool.dtype() == inputs.updates.dtype(),
++        "state pool and updates must have the same dtype");
++
++    const auto& pool_shape = inputs.state_pool.logical_shape();
++    const auto& update_shape = inputs.updates.logical_shape();
++    TT_FATAL(
++        pool_shape.rank() >= 2 && pool_shape.rank() == update_shape.rank(),
++        "state pool and updates must have the same rank of at least two");
++    TT_FATAL(update_shape[0] <= 32, "updates must fit in one tile row");
++    check_shape(inputs.state_indices, {update_shape[0]}, "state indices");
++    for (uint32_t dim = 1; dim < pool_shape.rank(); ++dim) {
++        TT_FATAL(
++            pool_shape[dim] == update_shape[dim],
++            "state pool and update slices must match");
++    }
++    TT_FATAL(
++        inputs.state_pool.buffer()->num_pages() % pool_shape[0] == 0 &&
++            inputs.updates.buffer()->num_pages() % update_shape[0] == 0 &&
++            inputs.state_pool.buffer()->num_pages() / pool_shape[0] ==
++                inputs.updates.buffer()->num_pages() / update_shape[0],
++        "state pool and update slices must have the same page count");
++}
++
++ttsl::hash::hash_t StatePoolUpdateOperation::compute_program_hash(
++    const operation_attributes_t&, const tensor_args_t& inputs) {
++    return operation::hash_operation<StatePoolUpdateOperation>(
++        inputs.state_pool, inputs.state_indices, inputs.updates);
++}
++
++StatePoolUpdateProgramFactory::cached_program_t
++StatePoolUpdateProgramFactory::create(
++    const operation_attributes_t&, const tensor_args_t& inputs,
++    tensor_return_value_t&) {
++    const uint32_t batch_size = inputs.updates.logical_shape()[0];
++    const uint32_t pages_per_slice =
++        inputs.updates.buffer()->num_pages() / batch_size;
++    const uint32_t total_pages = batch_size * pages_per_slice;
++    const uint32_t tile_bytes = inputs.updates.buffer()->page_size();
++
++    Program program;
++    auto* device = inputs.state_pool.device();
++    const CoreCoord grid = device->compute_with_storage_grid_size();
++    const uint32_t num_workers = std::min(
++        total_pages, static_cast<uint32_t>(grid.x * grid.y));
++    CoreRangeSet cores = num_cores_to_corerangeset(num_workers, grid);
++
++    CircularBufferConfig data_config(
++        tile_bytes,
++        {{tt::CBIndex::c_0,
++          datatype_to_dataformat_converter(inputs.updates.dtype())}});
++    data_config.set_page_size(tt::CBIndex::c_0, tile_bytes);
++    CreateCircularBuffer(program, cores, data_config);
++    CircularBufferConfig indices_config(
++        4096, {{tt::CBIndex::c_1, tt::DataFormat::Int32}});
++    indices_config.set_page_size(tt::CBIndex::c_1, 4096);
++    CreateCircularBuffer(program, cores, indices_config);
++
++    std::vector<uint32_t> compile_args = {
++        batch_size, pages_per_slice, num_workers, tile_bytes};
++    TensorAccessorArgs(inputs.state_pool.buffer()).append_to(compile_args);
++    TensorAccessorArgs(inputs.state_indices.buffer()).append_to(compile_args);
++    TensorAccessorArgs(inputs.updates.buffer()).append_to(compile_args);
++
++    auto kernel = CreateKernel(
++        program,
++        "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/"
++        "kernels/dataflow/state_pool_update.cpp",
++        cores,
++        DataMovementConfig{
++            .processor = DataMovementProcessor::RISCV_0,
++            .noc = NOC::RISCV_0_default,
++            .compile_args = compile_args});
++
++    for (uint32_t worker = 0; worker < num_workers; ++worker) {
++        const CoreCoord core{worker / grid.y, worker % grid.y};
++        SetRuntimeArgs(
++            program, kernel, core,
++            {worker, inputs.state_pool.buffer()->address(),
++             inputs.state_indices.buffer()->address(),
++             inputs.updates.buffer()->address()});
++    }
++
++    return cached_program_t{
++        std::move(program),
++        {.kernel_id = kernel,
++         .grid_y = static_cast<uint32_t>(grid.y),
++         .num_workers = num_workers}};
++}
++
++void StatePoolUpdateProgramFactory::override_runtime_arguments(
++    cached_program_t& cached, const operation_attributes_t&,
++    const tensor_args_t& inputs, tensor_return_value_t&) {
++    for (uint32_t worker = 0; worker < cached.shared_variables.num_workers;
++         ++worker) {
++        CoreCoord core{
++            worker / cached.shared_variables.grid_y,
++            worker % cached.shared_variables.grid_y};
++        auto& args = GetRuntimeArgs(
++            cached.program, cached.shared_variables.kernel_id, core);
++        args[1] = inputs.state_pool.buffer()->address();
++        args[2] = inputs.state_indices.buffer()->address();
++        args[3] = inputs.updates.buffer()->address();
++    }
++}
++
++}  // namespace
++}  // namespace ttnn::prim
++
++namespace ttnn::transformer {
++
++Tensor state_pool_update(
++    const Tensor& state_pool,
++    const Tensor& state_indices,
++    const Tensor& updates) {
++    using Op = prim::StatePoolUpdateOperation;
++    return device_operation::launch<Op>(
++        {},
++        {.state_pool = state_pool,
++         .state_indices = state_indices,
++         .updates = updates});
++}
++
++}  // namespace ttnn::transformer

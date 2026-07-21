@@ -1,0 +1,911 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+index 0daed56..d9a7c70 100644
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6335,6 +6335,81 @@ def TTIR_ScaledDotProductAttentionOp : TTIR_NamedOp<"scaled_dot_product_attentio
+   let hasVerifier = 1;
+ }
+ 
++def TTIR_GatedDeltaRuleOp : TTIR_NamedOp<"gated_delta_rule"> {
++  let summary = "Chunked gated delta rule operation.";
++  let description = [{
++    Computes the Qwen3.5 Gated DeltaNet recurrence as a chunked operation. The
++    inputs use the logical JAX layout and the implementation performs the
++    sequence-independent preprocessing before dispatching the TT-Metal
++    inter-chunk scan kernel.
++
++    This operation supports packed ragged request batches, sequence lengths up
++    to 128, 128-wide key and value heads, and a recurrent state shaped
++    `[B, H, 128, 128]`.
++  }];
++
++  let arguments = (ins AnyRankedTensor:$query,
++                       AnyRankedTensor:$key,
++                       AnyRankedTensor:$value,
++                       AnyRankedTensor:$beta_logits,
++                       AnyRankedTensor:$gate_logits,
++                       AnyRankedTensor:$valid_mask,
++                       AnyRankedTensor:$request_indices,
++                       AnyRankedTensor:$decay,
++                       AnyRankedTensor:$dt_bias,
++                       AnyRankedTensor:$initial_state,
++                       AnyRankedTensor:$upper_triangular,
++                       AnyRankedTensor:$lower_triangular,
++                       AnyRankedTensor:$identity,
++                       AnyRankedTensor:$identity_32);
++
++  let results = (outs AnyRankedTensor:$final_state,
++                      AnyRankedTensor:$output);
++}
++
++def TTIR_GatedDeltaDecodeOp : TTIR_NamedOp<"gated_delta_decode"> {
++  let summary = "One preprocessed gated delta rule decode step.";
++  let description = [{
++    Fuses the recurrent gated delta rule math after request state has been
++    gathered. Inputs use B-by-H vectors and B-by-H recurrent state.
++  }];
++
++  let arguments = (ins AnyRankedTensor:$query,
++                       AnyRankedTensor:$key,
++                       AnyRankedTensor:$value,
++                       AnyRankedTensor:$beta,
++                       AnyRankedTensor:$decay,
++                       AnyRankedTensor:$state_pool,
++                       AnyRankedTensor:$state_indices,
++                       AnyRankedTensor:$has_initial_state);
++
++  let results = (outs AnyRankedTensor:$final_state_pool,
++                      AnyRankedTensor:$output);
++}
++
++def TTIR_CausalConv1dUpdateOp : TTIR_NamedOp<"causal_conv1d_update"> {
++  let summary = "One fused depthwise causal convolution decode step.";
++
++  let arguments = (ins AnyRankedTensor:$input,
++                       AnyRankedTensor:$state_pool,
++                       AnyRankedTensor:$weight,
++                       AnyRankedTensor:$state_indices,
++                       AnyRankedTensor:$has_initial_state);
++
++  let results = (outs AnyRankedTensor:$final_state_pool,
++                      AnyRankedTensor:$output);
++}
++
++def TTIR_StatePoolUpdateOp : TTIR_NamedOp<"state_pool_update"> {
++  let summary = "Update leading slices of a recurrent state pool in place.";
++
++  let arguments = (ins AnyRankedTensor:$state_pool,
++                       AnyRankedTensor:$state_indices,
++                       AnyRankedTensor:$updates);
++
++  let results = (outs AnyRankedTensor:$final_state_pool);
++}
++
+ def TTIR_GlobalAvgPool2dOp: TTIR_NamedOp<"global_avg_pool2d">{
+   let summary = "A global average pooling 2d operation";
+   let description = [{
+diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+index ec7bfe8..2761e9d 100644
+--- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
++++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+@@ -20,7 +20,10 @@
+ #include "mlir/Dialect/Linalg/Passes.h"
+ #include "mlir/Dialect/SCF/Transforms/Passes.h"
+ #include "mlir/InitAllDialects.h"
++#include "mlir/IR/BuiltinAttributes.h"
++#include "mlir/IR/Matchers.h"
+ #include "mlir/InitAllPasses.h"
++#include "mlir/Transforms/RegionUtils.h"
+ #include "mlir/Pass/PassManager.h"
+ #include "mlir/Pass/PassRegistry.h"
+ #include "mlir/Tools/mlir-opt/MlirOptMain.h"
+@@ -33,6 +36,8 @@
+ #include "ttmlir/Transforms/Passes.h"
++#include "ttmlir/Utils.h"
+ 
+ #ifdef TTMLIR_ENABLE_STABLEHLO
++#include "stablehlo/dialect/StablehloOps.h"
+ #include "stablehlo/conversions/linalg/transforms/Passes.h"
+ #include "stablehlo/transforms/Passes.h"
+ #include "stablehlo/transforms/optimization/Passes.h"
+@@ -57,6 +60,789 @@ namespace mlir::tt::ttir {
+ 
+ #ifdef TTMLIR_ENABLE_STABLEHLO
+ 
++namespace {
++
++constexpr int64_t kGatedDeltaChunkSize = 128;
++constexpr int64_t kMaxSearchsortedIterations = 16;
++
++std::optional<int64_t> getScalarInt(Value value) {
++  auto constant = value.getDefiningOp<::mlir::stablehlo::ConstantOp>();
++  if (!constant) {
++    return std::nullopt;
++  }
++  auto elements = dyn_cast<DenseIntElementsAttr>(constant.getValue());
++  if (!elements || elements.getNumElements() != 1) {
++    return std::nullopt;
++  }
++  return (*elements.value_begin<llvm::APInt>()).getSExtValue();
++}
++
++LogicalResult unrollSearchsorted(::mlir::stablehlo::WhileOp loop) {
++  if (loop.getNumOperands() != 3) {
++    return failure();
++  }
++  auto counterType = dyn_cast<RankedTensorType>(loop.getOperand()[0].getType());
++  auto rangeType = dyn_cast<RankedTensorType>(loop.getOperand()[1].getType());
++  if (!counterType || !rangeType || counterType.getRank() != 0 ||
++      rangeType.getRank() != 1 || !counterType.getElementType().isInteger(32) ||
++      rangeType.getElementType() != counterType.getElementType() ||
++      loop.getOperand()[2].getType() != rangeType) {
++    return failure();
++  }
++
++  Block &condition = loop.getCond().front();
++  auto conditionReturn =
++      dyn_cast<::mlir::stablehlo::ReturnOp>(condition.getTerminator());
++  auto compare = conditionReturn && conditionReturn.getNumOperands() == 1
++                     ? conditionReturn.getOperand(0)
++                           .getDefiningOp<::mlir::stablehlo::CompareOp>()
++                     : nullptr;
++  auto counter = compare ? dyn_cast<BlockArgument>(compare.getLhs())
++                         : BlockArgument();
++  std::optional<int64_t> initial = getScalarInt(loop.getOperand()[0]);
++  std::optional<int64_t> bound = compare ? getScalarInt(compare.getRhs())
++                                         : std::nullopt;
++  if (!counter || counter.getOwner() != &condition ||
++      counter.getArgNumber() != 0 ||
++      compare.getComparisonDirection() !=
++          ::mlir::stablehlo::ComparisonDirection::LT ||
++      !initial || !bound || *initial > *bound) {
++    return failure();
++  }
++
++  Block &body = loop.getBody().front();
++  auto bodyReturn =
++      dyn_cast<::mlir::stablehlo::ReturnOp>(body.getTerminator());
++  auto increment = bodyReturn
++                       ? bodyReturn.getOperand(0)
++                             .getDefiningOp<::mlir::stablehlo::AddOp>()
++                       : nullptr;
++  std::optional<int64_t> step =
++      increment && increment.getLhs() == body.getArgument(0)
++          ? getScalarInt(increment.getRhs())
++          : std::nullopt;
++  int64_t iterations = *bound - *initial;
++  if (!bodyReturn || step != 1 || iterations == 0 ||
++      iterations > kMaxSearchsortedIterations) {
++    return failure();
++  }
++
++  OpBuilder builder(loop);
++  SmallVector<Value> carried(loop.getOperands());
++  for (int64_t iteration = 0; iteration < iterations; ++iteration) {
++    IRMapping mapping;
++    for (auto [argument, value] : llvm::zip(body.getArguments(), carried)) {
++      mapping.map(argument, value);
++    }
++    for (Operation &operation : body.without_terminator()) {
++      builder.clone(operation, mapping);
++    }
++    for (auto [result, value] : llvm::zip(carried, bodyReturn.getOperands())) {
++      result = mapping.lookupOrDefault(value);
++    }
++  }
++  loop.replaceAllUsesWith(carried);
++  loop.erase();
++  return success();
++}
++
++struct UnrollSearchsortedPass
++    : public PassWrapper<UnrollSearchsortedPass,
++                         OperationPass<ModuleOp>> {
++  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(UnrollSearchsortedPass)
++
++  void runOnOperation() final {
++    SmallVector<::mlir::stablehlo::WhileOp> loops;
++    getOperation().walk<WalkOrder::PostOrder>(
++        [&](::mlir::stablehlo::WhileOp loop) { loops.push_back(loop); });
++    for (::mlir::stablehlo::WhileOp loop : loops) {
++      (void)unrollSearchsorted(loop);
++    }
++  }
++};
++
++bool hasShape(Value value, ArrayRef<int64_t> shape) {
++  auto type = dyn_cast<RankedTensorType>(value.getType());
++  return type && type.hasStaticShape() && type.getShape() == shape;
++}
++
++Value stripRecurrentViews(Value value) {
++  return ttmlir::utils::lookThrough<
++      ::mlir::stablehlo::BroadcastInDimOp,
++      ::mlir::stablehlo::ReshapeOp>(value);
++}
++
++struct QwenGatedDeltaMatch {
++  int64_t sequenceLength;
++  Value query;
++  Value key;
++  Value value;
++  Value betaLogits;
++  Value gateLogits;
++  Value validMask;
++  Value requestIndices;
++  Value decay;
++  Value dtBias;
++};
++
++struct QwenGatedDeltaDecodeMatch {
++  Value query;
++  Value key;
++  Value value;
++  Value beta;
++  Value decay;
++  Value statePool;
++  Value stateIndices;
++  Value hasInitialState;
++  Value output;
++};
++
++struct QwenCausalConv1dUpdateMatch {
++  Value input;
++  Value statePool;
++  Value weight;
++  Value stateIndices;
++  Value hasInitialState;
++  Value output;
++};
++
++Value findStatePoolIndices(Value value, int64_t batch) {
++  value = stripRecurrentViews(value);
++  auto type = dyn_cast<RankedTensorType>(value.getType());
++  return type && type.hasStaticShape() && type.getRank() == 1 &&
++                 type.getDimSize(0) == batch &&
++                 type.getElementType().isInteger(32)
++             ? value
++             : Value();
++}
++
++template <typename OpTy>
++OpTy findRecurrentUser(Value value) {
++  for (Operation *user : value.getUsers()) {
++    if (auto match = dyn_cast<OpTy>(user)) {
++      return match;
++    }
++  }
++  return {};
++}
++
++Value matchUpdatedState(StatePoolUpdateOp update) {
++  auto select =
++      update.getUpdates().getDefiningOp<::mlir::stablehlo::SelectOp>();
++  if (!select) {
++    return {};
++  }
++  auto readsPool = [&](Value value) {
++    auto gather = value.getDefiningOp<::mlir::stablehlo::GatherOp>();
++    return gather && gather.getOperand() == update.getStatePool();
++  };
++  if (readsPool(select.getOnTrue())) {
++    return select.getOnFalse();
++  }
++  return readsPool(select.getOnFalse()) ? select.getOnTrue() : Value();
++}
++
++Value matchStatePoolRead(Value state, Value statePool, int64_t batch) {
++  auto select = state.getDefiningOp<::mlir::stablehlo::SelectOp>();
++  if (!select) {
++    return {};
++  }
++  auto gather = select.getOnTrue()
++                    .getDefiningOp<::mlir::stablehlo::GatherOp>();
++  if (!gather) {
++    gather = select.getOnFalse()
++                 .getDefiningOp<::mlir::stablehlo::GatherOp>();
++  }
++  Value predicate = stripRecurrentViews(select.getPred());
++  return gather && gather.getOperand() == statePool &&
++                 hasShape(predicate, {batch})
++             ? predicate
++             : Value();
++}
++
++::mlir::stablehlo::OptimizationBarrierOp
++matchRecurrentBarrier(Value state, Value output) {
++  if (!state.hasOneUse() || !output.hasOneUse()) {
++    return {};
++  }
++  auto barrier = dyn_cast<::mlir::stablehlo::OptimizationBarrierOp>(
++      *state.user_begin());
++  return barrier && barrier->getNumOperands() == 2 &&
++                 barrier->getOperand(0) == state &&
++                 barrier->getOperand(1) == output
++             ? barrier
++             : ::mlir::stablehlo::OptimizationBarrierOp();
++}
++
++LogicalResult fuseStatePoolUpdate(::mlir::stablehlo::ScatterOp scatter) {
++  if (scatter.getInputs().size() != 1 || scatter.getUpdates().size() != 1) {
++    return failure();
++  }
++  ArrayRef<int64_t> scatterDims =
++      scatter.getScatterDimensionNumbers().getScatterDimsToOperandDims();
++  if (scatterDims.size() != 1 || scatterDims[0] != 0) {
++    return failure();
++  }
++
++  Value statePool = scatter.getInputs()[0];
++  Value updates = scatter.getUpdates()[0];
++  auto poolType = dyn_cast<RankedTensorType>(statePool.getType());
++  auto updateType = dyn_cast<RankedTensorType>(updates.getType());
++  if (!poolType || !updateType || !poolType.hasStaticShape() ||
++      !updateType.hasStaticShape() || poolType.getRank() < 2 ||
++      poolType.getRank() != updateType.getRank() ||
++      poolType.getElementType() != updateType.getElementType()) {
++    return failure();
++  }
++  int64_t batch = updateType.getDimSize(0);
++  if (batch <= 0 || batch > 32 || poolType.getDimSize(0) < 2 ||
++      poolType.getDimSize(0) > batch + 1) {
++    return failure();
++  }
++  for (int64_t dim = 1; dim < poolType.getRank(); ++dim) {
++    if (poolType.getDimSize(dim) != updateType.getDimSize(dim)) {
++      return failure();
++    }
++  }
++
++  Value stateIndices =
++      findStatePoolIndices(scatter.getScatterIndices(), batch);
++  if (!stateIndices) {
++    return failure();
++  }
++
++  OpBuilder builder(scatter);
++  auto fused = builder.create<StatePoolUpdateOp>(
++      scatter.getLoc(), scatter.getResult(0).getType(), statePool,
++      stateIndices, updates);
++  scatter.getResult(0).replaceAllUsesWith(fused.getFinalStatePool());
++  scatter.erase();
++  return success();
++}
++
++struct FuseStatePoolUpdatesPass
++    : public PassWrapper<FuseStatePoolUpdatesPass, OperationPass<ModuleOp>> {
++  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseStatePoolUpdatesPass)
++  void runOnOperation() final {
++    SmallVector<::mlir::stablehlo::ScatterOp> scatters;
++    getOperation().walk<WalkOrder::PostOrder>(
++        [&](::mlir::stablehlo::ScatterOp scatter) {
++          scatters.push_back(scatter);
++        });
++    for (::mlir::stablehlo::ScatterOp scatter : scatters) {
++      (void)fuseStatePoolUpdate(scatter);
++    }
++  }
++};
++
++bool isOneLike(Value value) {
++  return matchPattern(stripRecurrentViews(value), m_OneFloat());
++}
++
++Value matchExpandedSilu(Value input) {
++  for (Operation *user : input.getUsers()) {
++    auto multiply = dyn_cast<::mlir::stablehlo::MulOp>(user);
++    if (!multiply) {
++      continue;
++    }
++    Value sigmoid = multiply.getLhs() == input ? multiply.getRhs()
++                                               : multiply.getLhs();
++    auto logistic =
++        sigmoid.getDefiningOp<::mlir::stablehlo::LogisticOp>();
++    if (logistic && logistic.getOperand() == input) {
++      return multiply.getResult();
++    }
++    auto divide = sigmoid.getDefiningOp<::mlir::stablehlo::DivOp>();
++    if (!divide || !isOneLike(divide.getLhs())) {
++      continue;
++    }
++    auto denominator = divide.getRhs().getDefiningOp<::mlir::stablehlo::AddOp>();
++    if (!denominator) {
++      continue;
++    }
++    for (auto [one, candidate] :
++         {std::pair{denominator.getLhs(), denominator.getRhs()},
++          std::pair{denominator.getRhs(), denominator.getLhs()}}) {
++      auto exponential = candidate.getDefiningOp<::mlir::stablehlo::ExpOp>();
++      if (!isOneLike(one) || !exponential) {
++        continue;
++      }
++      auto negate = exponential.getOperand()
++                        .getDefiningOp<::mlir::stablehlo::NegOp>();
++      if (negate && negate.getOperand() == input) {
++        return multiply.getResult();
++      }
++    }
++  }
++  return {};
++}
++
++std::optional<QwenCausalConv1dUpdateMatch>
++matchQwenCausalConv1dUpdate(StatePoolUpdateOp stateUpdate) {
++  Value statePool = stateUpdate.getStatePool();
++  auto poolType = dyn_cast<RankedTensorType>(statePool.getType());
++  if (!poolType || !poolType.hasStaticShape() || poolType.getRank() != 3 ||
++      !poolType.getElementType().isBF16() || poolType.getDimSize(0) < 2 ||
++      poolType.getDimSize(2) != 3) {
++    return std::nullopt;
++  }
++  int64_t batch =
++      cast<RankedTensorType>(stateUpdate.getUpdates().getType()).getDimSize(0);
++  int64_t channels = poolType.getDimSize(1);
++  if (batch <= 0 || batch > 32 || channels <= 0 || channels % 32 != 0 ||
++      !hasShape(stateUpdate.getStateIndices(), {batch})) {
++    return std::nullopt;
++  }
++  SmallVector<int64_t> inputShape = {batch, channels};
++  SmallVector<int64_t> weightShape = {channels, 4};
++  SmallVector<int64_t> windowShape = {batch, channels, 4};
++  SmallVector<int64_t> stateShape = {batch, channels, 3};
++
++  Value updatedState = matchUpdatedState(stateUpdate);
++  if (!updatedState) {
++    return std::nullopt;
++  }
++  auto slice =
++      updatedState.getDefiningOp<::mlir::stablehlo::SliceOp>();
++  if (!slice || !hasShape(updatedState, stateShape) ||
++      !hasShape(slice.getOperand(), windowShape)) {
++    return std::nullopt;
++  }
++  Value window = slice.getOperand();
++  auto concatenate =
++      window.getDefiningOp<::mlir::stablehlo::ConcatenateOp>();
++  if (!concatenate || concatenate.getDimension() != 2 ||
++      concatenate.getInputs().size() != 2 ||
++      !hasShape(concatenate.getInputs()[0], stateShape)) {
++    return std::nullopt;
++  }
++  Value input = stripRecurrentViews(concatenate.getInputs()[1]);
++  Value hasInitialState =
++      matchStatePoolRead(concatenate.getInputs()[0], statePool, batch);
++  if (!hasShape(input, inputShape) || !hasInitialState) {
++    return std::nullopt;
++  }
++
++  auto dot = findRecurrentUser<::mlir::stablehlo::DotGeneralOp>(window);
++  if (!dot) {
++    return std::nullopt;
++  }
++  Value weight = dot.getLhs() == window ? dot.getRhs() : dot.getLhs();
++  auto dotType = dyn_cast<RankedTensorType>(dot.getType());
++  if ((dot.getLhs() != window && dot.getRhs() != window) ||
++      !hasShape(weight, weightShape) || !dotType ||
++      !dotType.hasStaticShape() || dotType.getRank() != 2 ||
++      !dotType.getElementType().isBF16() ||
++      (dotType.getShape() != ArrayRef<int64_t>({batch, channels}) &&
++       dotType.getShape() != ArrayRef<int64_t>({channels, batch}))) {
++    return std::nullopt;
++  }
++
++  Value activationInput = dot.getResult();
++  if (dot->hasOneUse()) {
++    Operation *user = *dot->user_begin();
++    if (isa<::mlir::stablehlo::TransposeOp,
++            ::mlir::stablehlo::ReshapeOp>(user)) {
++      activationInput = user->getResult(0);
++    }
++  }
++  Value output = matchExpandedSilu(activationInput);
++  if (!output) {
++    return std::nullopt;
++  }
++  return QwenCausalConv1dUpdateMatch{
++      input, statePool, weight, stateUpdate.getStateIndices(),
++      hasInitialState, output};
++}
++
++LogicalResult fuseQwenCausalConv1dUpdate(StatePoolUpdateOp stateUpdate) {
++  auto match = matchQwenCausalConv1dUpdate(stateUpdate);
++  auto barrier =
++      match ? matchRecurrentBarrier(stateUpdate.getFinalStatePool(),
++                                    match->output)
++            : ::mlir::stablehlo::OptimizationBarrierOp();
++  if (!match || !barrier) {
++    return failure();
++  }
++
++  OpBuilder builder(stateUpdate);
++  SmallVector<Type> resultTypes = {barrier->getResult(0).getType(),
++                                   barrier->getResult(1).getType()};
++  SmallVector<Value> operands = {
++      match->input, match->statePool, match->weight, match->stateIndices,
++      match->hasInitialState};
++  auto fused = builder.create<CausalConv1dUpdateOp>(
++      stateUpdate.getLoc(), resultTypes, operands);
++  barrier->setOperand(0, fused.getFinalStatePool());
++  barrier->setOperand(1, fused.getOutput());
++  return success();
++}
++
++std::optional<std::pair<Value, Value>>
++matchDecodeStateMid(Value value, ArrayRef<int64_t> stateShape,
++                    ArrayRef<int64_t> scalarShape) {
++  auto multiply = value.getDefiningOp<::mlir::stablehlo::MulOp>();
++  if (!multiply) {
++    return std::nullopt;
++  }
++  for (auto [state, decayValue] :
++       {std::pair{multiply.getLhs(), multiply.getRhs()},
++        std::pair{multiply.getRhs(), multiply.getLhs()}}) {
++    Value decay = stripRecurrentViews(decayValue);
++    if (hasShape(state, stateShape) && hasShape(decay, scalarShape)) {
++      return std::pair{state, decay};
++    }
++  }
++  return std::nullopt;
++}
++
++std::optional<std::pair<Value, Value>>
++matchDecodeScaledDelta(Value value, Value stateMid, Value key,
++                       ArrayRef<int64_t> vectorShape,
++                       ArrayRef<int64_t> scalarShape) {
++  auto multiply = value.getDefiningOp<::mlir::stablehlo::MulOp>();
++  if (!multiply) {
++    return std::nullopt;
++  }
++  for (auto [deltaValue, betaValue] :
++       {std::pair{multiply.getLhs(), multiply.getRhs()},
++        std::pair{multiply.getRhs(), multiply.getLhs()}}) {
++    auto subtract =
++        deltaValue.getDefiningOp<::mlir::stablehlo::SubtractOp>();
++    Value beta = stripRecurrentViews(betaValue);
++    if (!subtract || !hasShape(beta, scalarShape) ||
++        !hasShape(subtract.getLhs(), vectorShape)) {
++      continue;
++    }
++    auto stateRead =
++        subtract.getRhs().getDefiningOp<::mlir::stablehlo::DotGeneralOp>();
++    if (stateRead && stateRead.getLhs() == stateMid &&
++        stateRead.getRhs() == key) {
++      return std::pair{subtract.getLhs(), beta};
++    }
++  }
++  return std::nullopt;
++}
++
++std::optional<QwenGatedDeltaDecodeMatch>
++matchQwenGatedDeltaDecode(StatePoolUpdateOp stateUpdate) {
++  Value finalState = matchUpdatedState(stateUpdate);
++  if (!finalState) {
++    return std::nullopt;
++  }
++  auto outputDot =
++      findRecurrentUser<::mlir::stablehlo::DotGeneralOp>(finalState);
++  if (!outputDot || (outputDot.getLhs() != finalState &&
++                     outputDot.getRhs() != finalState)) {
++    return std::nullopt;
++  }
++  Value query = outputDot.getLhs() == finalState ? outputDot.getRhs()
++                                                  : outputDot.getLhs();
++  auto outputType = dyn_cast<RankedTensorType>(outputDot.getType());
++  auto stateType = dyn_cast<RankedTensorType>(finalState.getType());
++  if (!outputType || !stateType || !outputType.hasStaticShape() ||
++      !stateType.hasStaticShape() || outputType.getRank() != 3 ||
++      stateType.getRank() != 4) {
++    return std::nullopt;
++  }
++
++  int64_t batch = outputType.getDimSize(0);
++  int64_t numHeads = outputType.getDimSize(1);
++  SmallVector<int64_t> vectorShape = {batch, numHeads, kGatedDeltaChunkSize};
++  SmallVector<int64_t> scalarShape = {batch, numHeads};
++  SmallVector<int64_t> stateShape = {
++      batch, numHeads, kGatedDeltaChunkSize, kGatedDeltaChunkSize};
++  if (batch <= 0 || numHeads <= 0 ||
++      outputType.getShape() != ArrayRef<int64_t>(vectorShape) ||
++      stateType.getShape() != ArrayRef<int64_t>(stateShape) ||
++      !hasShape(query, vectorShape) ||
++      !hasShape(stateUpdate.getStateIndices(), {batch})) {
++    return std::nullopt;
++  }
++  auto add = finalState.getDefiningOp<::mlir::stablehlo::AddOp>();
++  if (!add) {
++    return std::nullopt;
++  }
++
++  for (auto [stateMid, outerValue] :
++       {std::pair{add.getLhs(), add.getRhs()},
++        std::pair{add.getRhs(), add.getLhs()}}) {
++    auto stateMatch = matchDecodeStateMid(stateMid, stateShape, scalarShape);
++    auto outer = outerValue.getDefiningOp<::mlir::stablehlo::MulOp>();
++    if (!stateMatch || !outer) {
++      continue;
++    }
++
++    for (auto [keyValue, scaledDeltaValue] :
++         {std::pair{outer.getLhs(), outer.getRhs()},
++          std::pair{outer.getRhs(), outer.getLhs()}}) {
++      Value key = stripRecurrentViews(keyValue);
++      Value scaledDelta = stripRecurrentViews(scaledDeltaValue);
++      if (!hasShape(key, vectorShape) ||
++          !hasShape(scaledDelta, vectorShape)) {
++        continue;
++      }
++      auto deltaMatch = matchDecodeScaledDelta(
++          scaledDelta, stateMid, key, vectorShape, scalarShape);
++      if (deltaMatch) {
++        Value statePool = stateUpdate.getStatePool();
++        Value hasInitialState =
++            matchStatePoolRead(stateMatch->first, statePool, batch);
++        if (!hasInitialState) {
++          continue;
++        }
++        return QwenGatedDeltaDecodeMatch{
++            query, key, deltaMatch->first, deltaMatch->second,
++            stateMatch->second, statePool, stateUpdate.getStateIndices(),
++            hasInitialState, outputDot.getResult()};
++      }
++    }
++  }
++  return std::nullopt;
++}
++
++LogicalResult fuseQwenGatedDeltaDecode(StatePoolUpdateOp stateUpdate) {
++  auto match = matchQwenGatedDeltaDecode(stateUpdate);
++  auto barrier =
++      match ? matchRecurrentBarrier(stateUpdate.getFinalStatePool(),
++                                    match->output)
++            : ::mlir::stablehlo::OptimizationBarrierOp();
++  if (!match || !barrier || !barrier->getResult(1).hasOneUse()) {
++    return failure();
++  }
++  auto outputConvert = dyn_cast<::mlir::stablehlo::ConvertOp>(
++      *barrier->getResult(1).user_begin());
++  if (!outputConvert ||
++      !cast<RankedTensorType>(outputConvert.getType())
++           .getElementType()
++           .isBF16()) {
++    return failure();
++  }
++
++  OpBuilder builder(stateUpdate);
++  SmallVector<Type> resultTypes = {barrier->getResult(0).getType(),
++                                   barrier->getResult(1).getType()};
++  SmallVector<Value> operands = {
++      match->query, match->key, match->value, match->beta, match->decay,
++      match->statePool, match->stateIndices, match->hasInitialState};
++  auto fused = builder.create<GatedDeltaDecodeOp>(
++      stateUpdate.getLoc(), resultTypes, operands);
++  barrier->setOperand(0, fused.getFinalStatePool());
++  barrier->setOperand(1, fused.getOutput());
++
++  return success();
++}
++
++bool isDefinedOutside(Operation *ancestor, Value value) {
++  if (auto argument = dyn_cast<BlockArgument>(value)) {
++    return !ancestor->isAncestor(argument.getOwner()->getParentOp());
++  }
++  Operation *definition = value.getDefiningOp();
++  return definition && !ancestor->isAncestor(definition);
++}
++
++std::optional<QwenGatedDeltaMatch>
++matchQwenGatedDeltaLoop(::mlir::stablehlo::WhileOp loop) {
++  if (loop.getNumOperands() != 3 || !loop.getCond().hasOneBlock() ||
++      !loop.getBody().hasOneBlock() || !hasShape(loop->getOperand(0), {})) {
++    return std::nullopt;
++  }
++
++  auto stateType = dyn_cast<RankedTensorType>(loop->getOperand(1).getType());
++  auto outputType = dyn_cast<RankedTensorType>(loop->getOperand(2).getType());
++  if (!stateType || !outputType || !stateType.hasStaticShape() ||
++      !outputType.hasStaticShape() || stateType.getRank() != 4 ||
++      outputType.getRank() != 3) {
++    return std::nullopt;
++  }
++  int64_t sequenceLength = outputType.getDimSize(0);
++  int64_t numHeads = outputType.getDimSize(1);
++  int64_t batchSize = stateType.getDimSize(0);
++  if (sequenceLength <= 0 || sequenceLength > kGatedDeltaChunkSize ||
++      batchSize <= 0 || numHeads <= 0 ||
++      outputType.getDimSize(2) != kGatedDeltaChunkSize ||
++      stateType.getShape() !=
++          ArrayRef<int64_t>({batchSize, numHeads, kGatedDeltaChunkSize,
++                             kGatedDeltaChunkSize})) {
++    return std::nullopt;
++  }
++
++  SmallVector<Value> qkv;
++  SmallVector<Value> gateInputs;
++  Value validMask;
++  Value requestIndices;
++  loop.getBody().walk([&](::mlir::stablehlo::DynamicSliceOp slice) {
++    Value input = slice->getOperand(0);
++    if (hasShape(input,
++                 {sequenceLength, numHeads, kGatedDeltaChunkSize})) {
++      qkv.push_back(input);
++    } else if (hasShape(input, {sequenceLength, numHeads})) {
++      gateInputs.push_back(input);
++    } else if (hasShape(input, {sequenceLength}) &&
++               cast<RankedTensorType>(input.getType())
++                   .getElementType()
++                   .isInteger(1)) {
++      validMask = input;
++    } else if (hasShape(input, {sequenceLength}) &&
++               cast<RankedTensorType>(input.getType())
++                   .getElementType()
++                   .isInteger(32)) {
++      requestIndices = input;
++    }
++  });
++  if (qkv.size() != 3 || gateInputs.size() != 2 || !validMask ||
++      !requestIndices) {
++    return std::nullopt;
++  }
++
++  SmallVector<Value> headVectors;
++  loop.getBody().walk([&](Operation *op) {
++    for (Value operand : op->getOperands()) {
++      auto type = dyn_cast<RankedTensorType>(operand.getType());
++      if (type && type.hasStaticShape() &&
++          type.getShape() == ArrayRef<int64_t>({numHeads}) &&
++          type.getElementType().isF32() && isDefinedOutside(loop, operand) &&
++          !llvm::is_contained(headVectors, operand)) {
++        headVectors.push_back(operand);
++      }
++    }
++  });
++  if (headVectors.size() != 2) {
++    return std::nullopt;
++  }
++
++  Value decay;
++  for (Value candidate : headVectors) {
++    if (llvm::any_of(candidate.getUsers(), [&](Operation *user) {
++          return loop->isAncestor(user) &&
++                 isa<::mlir::stablehlo::NegOp>(user);
++        })) {
++      decay = candidate;
++      break;
++    }
++  }
++  if (!decay) {
++    return std::nullopt;
++  }
++  Value dtBias = headVectors[headVectors[0] == decay ? 1 : 0];
++
++  unsigned dotCount = 0;
++  unsigned exponentialCount = 0;
++  loop.getBody().walk([&](Operation *op) {
++    StringRef name = op->getName().getStringRef();
++    dotCount += name == "stablehlo.dot_general";
++    exponentialCount += name == "stablehlo.exponential";
++  });
++  if (dotCount < 2 || exponentialCount < 1) {
++    return std::nullopt;
++  }
++
++  return QwenGatedDeltaMatch{sequenceLength, qkv[0], qkv[1], qkv[2],
++                             gateInputs[0], gateInputs[1], validMask,
++                             requestIndices, decay, dtBias};
++}
++
++Value createMaskConstant(OpBuilder &builder, Location loc, int64_t size,
++                         function_ref<float(int64_t, int64_t)> getValue) {
++  SmallVector<float> values;
++  values.reserve(size * size);
++  for (int64_t row = 0; row < size; ++row) {
++    for (int64_t column = 0; column < size; ++column) {
++      values.push_back(getValue(row, column));
++    }
++  }
++  auto type = RankedTensorType::get({1, size, size}, builder.getF32Type());
++  auto value = DenseElementsAttr::get(type, ArrayRef<float>(values));
++  return builder.create<::mlir::stablehlo::ConstantOp>(loc, value);
++}
++
++LogicalResult fuseQwenGatedDeltaLoop(::mlir::stablehlo::WhileOp loop) {
++  std::optional<QwenGatedDeltaMatch> match = matchQwenGatedDeltaLoop(loop);
++  if (!match) {
++    return failure();
++  }
++
++  OpBuilder builder(loop);
++  Location loc = loop.getLoc();
++  Value upperTriangular = createMaskConstant(
++      builder, loc, kGatedDeltaChunkSize,
++      [](int64_t row, int64_t column) { return column >= row ? 1.0f : 0.0f; });
++  Value lowerTriangular = createMaskConstant(
++      builder, loc, kGatedDeltaChunkSize,
++      [](int64_t row, int64_t column) { return column <= row ? 1.0f : 0.0f; });
++  Value identity = createMaskConstant(
++      builder, loc, kGatedDeltaChunkSize,
++      [](int64_t row, int64_t column) { return column == row ? 1.0f : 0.0f; });
++  Value identity32 = createMaskConstant(
++      builder, loc, 32,
++      [](int64_t row, int64_t column) { return column == row ? 1.0f : 0.0f; });
++
++  SmallVector<Value> operands = {
++      match->query,          match->key,
++      match->value,          match->betaLogits,
++      match->gateLogits,     match->validMask,
++      match->requestIndices, match->decay,
++      match->dtBias,
++      loop->getOperand(1),   upperTriangular,
++      lowerTriangular,       identity,
++      identity32};
++  SmallVector<Type> resultTypes = {loop.getResult(1).getType(),
++                                   loop.getResult(2).getType()};
++  auto fused = builder.create<GatedDeltaRuleOp>(loc, resultTypes, operands);
++
++  auto inductionType = cast<RankedTensorType>(loop->getOperand(0).getType());
++  auto finalInductionAttr = DenseElementsAttr::get(
++      inductionType,
++      builder.getIntegerAttr(inductionType.getElementType(),
++                             match->sequenceLength));
++  Value finalInduction = builder.create<::mlir::stablehlo::ConstantOp>(
++      loc, finalInductionAttr);
++  loop.getResult(0).replaceAllUsesWith(finalInduction);
++  loop.getResult(1).replaceAllUsesWith(fused.getResult(0));
++  loop.getResult(2).replaceAllUsesWith(fused.getResult(1));
++  loop.erase();
++  return success();
++}
++
++struct FuseQwenGatedDeltaLoopPass
++    : public PassWrapper<FuseQwenGatedDeltaLoopPass,
++                         OperationPass<ModuleOp>> {
++  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseQwenGatedDeltaLoopPass)
++
++  void runOnOperation() final {
++    SmallVector<::mlir::stablehlo::WhileOp> loops;
++    getOperation().walk<WalkOrder::PostOrder>(
++        [&](::mlir::stablehlo::WhileOp loop) { loops.push_back(loop); });
++    bool fusedGatedDelta = false;
++    for (::mlir::stablehlo::WhileOp loop : loops) {
++      if (succeeded(fuseQwenGatedDeltaLoop(loop))) {
++        fusedGatedDelta = true;
++      }
++    }
++
++    SmallVector<StatePoolUpdateOp> stateUpdates;
++    getOperation().walk<WalkOrder::PostOrder>(
++        [&](StatePoolUpdateOp update) { stateUpdates.push_back(update); });
++    for (StatePoolUpdateOp update : stateUpdates) {
++      if (succeeded(fuseQwenCausalConv1dUpdate(update))) {
++        fusedGatedDelta = true;
++        continue;
++      }
++      if (succeeded(fuseQwenGatedDeltaDecode(update))) {
++        fusedGatedDelta = true;
++      }
++    }
++    if (!fusedGatedDelta) {
++      return;
++    }
++
++    IRRewriter rewriter(&getContext());
++    (void)runRegionDCE(rewriter, getOperation()->getRegions());
++  }
++};
++
++} // namespace
++
+ void createStableHLOToTTIRPipeline(
+     OpPassManager &pm, const StableHLOToTTIRPipelineOptions &options) {
+   if (options.arithDialectConversionsEnabled) {
+@@ -81,6 +869,10 @@ void createStableHLOToTTIRPipeline(
+     pm.addPass(::mlir::stablehlo::createStablehloLegalizeCompositeToCallPass());
+   }
+   pm.addPass(mlir::createInlinerPass());
++  pm.addPass(std::make_unique<FuseStatePoolUpdatesPass>());
++  pm.addPass(std::make_unique<FuseQwenGatedDeltaLoopPass>());
++  pm.addPass(mlir::createCanonicalizerPass());
++  pm.addPass(std::make_unique<UnrollSearchsortedPass>());
+ 
+   ttir::ConvertStableHLOToTTIROptions passOptions;
+   passOptions.enablePartialConversion = options.enableCPUFallback;

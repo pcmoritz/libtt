@@ -1,0 +1,49 @@
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
+new file mode 100644
+index 0000000..b2f3a19
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
+@@ -0,0 +1,43 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <stdint.h>
++
++#include "api/dataflow/dataflow_api.h"
++
++constexpr uint32_t tile_elements = 1024;
++
++FORCE_INLINE uint32_t tile_offset(uint32_t row, uint32_t column) {
++    const uint32_t face = (row / 16) * 2 + column / 16;
++    return face * 256 + (row % 16) * 16 + column % 16;
++}
++
++FORCE_INLINE uint32_t read_int32_tile(uint32_t address, uint32_t row, uint32_t column) {
++    const volatile tt_l1_ptr uint32_t* tile =
++        reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(address);
++    return tile[tile_offset(row, column)];
++}
++
++FORCE_INLINE bool read_bfloat16_tile(uint32_t address, uint32_t row, uint32_t column) {
++    const volatile tt_l1_ptr uint16_t* tile =
++        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(address);
++    return tile[tile_offset(row, column)] != 0;
++}
++
++FORCE_INLINE uint32_t read_index(uint32_t address, uint32_t batch) {
++    return read_int32_tile(address, 0, batch);
++}
++
++FORCE_INLINE bool read_flag(uint32_t address, uint32_t batch) {
++    return read_bfloat16_tile(address, 0, batch);
++}
++
++template <typename T>
++FORCE_INLINE void zero_tiles(uint32_t address, uint32_t tiles) {
++    volatile tt_l1_ptr T* data = reinterpret_cast<volatile tt_l1_ptr T*>(address);
++    for (uint32_t i = 0; i < tiles * tile_elements; ++i) {
++        data[i] = 0;
++    }
++}
