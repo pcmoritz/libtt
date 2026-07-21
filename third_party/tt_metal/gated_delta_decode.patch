@@ -170,10 +170,10 @@ index 0000000000000000000000000000000000000000..c8ec4d66150d30324c40eae58d01df05
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..6bbd10bb0140a9f9bafd5f897847bf94461e903f
+index 0000000..76662c3
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,180 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -182,16 +182,14 @@ index 0000000000000000000000000000000000000000..6bbd10bb0140a9f9bafd5f897847bf94
 +#include "api/dataflow/circular_buffer.h"
 +#include "api/dataflow/dataflow_api.h"
 +#include "api/dataflow/noc.h"
++#include "recurrent_utils.hpp"
 +
 +namespace {
 +
 +FORCE_INLINE void make_scalar_tile(uint32_t address, uint32_t row, uint32_t column) {
 +    volatile tt_l1_ptr uint32_t* tile = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(address);
-+    const uint32_t face = (row / 16) * 2 + column / 16;
-+    const uint32_t element = tile[face * 256 + (row % 16) * 16 + column % 16];
-+    for (uint32_t i = 0; i < 1024; ++i) {
-+        tile[i] = 0;
-+    }
++    const uint32_t element = read_int32_tile(address, row, column);
++    zero_tiles<uint32_t>(address, 1);
 +    tile[0] = element;
 +    tile[256] = element;
 +    tile[512] = element;
@@ -202,37 +200,10 @@ index 0000000000000000000000000000000000000000..6bbd10bb0140a9f9bafd5f897847bf94
 +    volatile tt_l1_ptr uint32_t* source = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(source_address);
 +    volatile tt_l1_ptr uint32_t* destination =
 +        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(destination_address);
-+    for (uint32_t i = 0; i < 1024; ++i) {
-+        destination[i] = 0;
-+    }
++    zero_tiles<uint32_t>(destination_address, 1);
 +    for (uint32_t i = 0; i < 16; ++i) {
 +        destination[i * 16] = source[i];
 +        destination[512 + i * 16] = source[256 + i];
-+    }
-+}
-+
-+FORCE_INLINE uint32_t tile_element_offset(uint32_t row, uint32_t column) {
-+    const uint32_t face = (row / 16) * 2 + column / 16;
-+    return face * 256 + (row % 16) * 16 + column % 16;
-+}
-+
-+FORCE_INLINE uint32_t read_int32_tile(uint32_t address, uint32_t row, uint32_t column) {
-+    const volatile tt_l1_ptr uint32_t* tile =
-+        reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(address);
-+    return tile[tile_element_offset(row, column)];
-+}
-+
-+FORCE_INLINE bool read_bfloat16_tile(uint32_t address, uint32_t row, uint32_t column) {
-+    const volatile tt_l1_ptr uint16_t* tile =
-+        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(address);
-+    return tile[tile_element_offset(row, column)] != 0;
-+}
-+
-+FORCE_INLINE void zero_tiles(uint32_t address, uint32_t tiles) {
-+    volatile tt_l1_ptr uint32_t* data =
-+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(address);
-+    for (uint32_t i = 0; i < tiles * 1024; ++i) {
-+        data[i] = 0;
 +    }
 +}
 +
@@ -304,9 +275,9 @@ index 0000000000000000000000000000000000000000..6bbd10bb0140a9f9bafd5f897847bf94
 +    const uint32_t head = work % num_heads;
 +
 +    const uint32_t state_slot =
-+        read_int32_tile(state_indices_cb.get_write_ptr(), 0, batch);
++        read_index(state_indices_cb.get_write_ptr(), batch);
 +    const bool has_state =
-+        read_bfloat16_tile(has_initial_state_cb.get_write_ptr(), 0, batch);
++        read_flag(has_initial_state_cb.get_write_ptr(), batch);
 +
 +    const uint32_t state_base = (state_slot * num_heads + head) * state_tiles;
 +    state_cb.reserve_back(state_tiles);
@@ -365,7 +336,7 @@ index 0000000000000000000000000000000000000000..6bbd10bb0140a9f9bafd5f897847bf94
 +    noc.async_read_barrier();
 +
 +    if (!has_state) {
-+        zero_tiles(state_cb.get_write_ptr(), state_tiles);
++        zero_tiles<uint32_t>(state_cb.get_write_ptr(), state_tiles);
 +    }
 +    state_cb.push_back(state_tiles);
 +    query_cb.push_back(kt);

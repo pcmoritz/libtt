@@ -186,6 +186,7 @@ http_archive(
         "//third_party/tt_metal:matmul_balanced_1d_planner.patch",
         "//third_party/tt_metal:sdpa_decode_allow_l1_interleaved_q.patch",
         "//third_party/tt_metal:layernorm_allow_single_core_height_sharded.patch",
+        "//third_party/tt_metal:recurrent_dataflow_utils.patch",
         "//third_party/tt_metal:gated_delta_decode.patch",
         "//third_party/tt_metal:causal_conv1d_update.patch",
         "//third_party/tt_metal:state_pool_update.patch",
