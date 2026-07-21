@@ -1,0 +1,74 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+index d8901fdf18e3b676755d2633a737b280ec4bb1a5..0fa6263d65602efacc299c1c73f8bea876aac9b5 100644
+--- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+@@ -60,6 +60,7 @@ public:
+   void erase(const MainProgramKey &key);
+   void erase(const MainProgramKey &key,
+              const CaptureExecuteProgramKey &captureExecuteKey);
++  void clear();
+
+   uint64_t getGenerationId() const { return generationId; }
+
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+index 95de41448f921849a40039d782f9808f7be9ea4f..724df293e54e6499ace643856806d192a289eb87 100644
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -13,6 +13,7 @@
+ #include "tt/runtime/types.h"
+ #include "tt/runtime/workarounds.h"
+ #include "ttnn/tensor/tensor_impl.hpp"
++#include "ttnn/operations/data_movement/copy/copy.hpp"
+
+ namespace tt::runtime::ttnn::operations::trace {
+
+@@ -40,8 +41,7 @@ static void copyTensorFromDeviceToDevice(const ::ttnn::Tensor &srcTensor,
+   LOG_ASSERT(srcTensor.storage_type() == ::ttnn::StorageType::DEVICE &&
+                  dstTensor.storage_type() == ::ttnn::StorageType::DEVICE,
+              "srcTensor must be on device and dstTensor must be on device");
+-  ::ttnn::Tensor hostSrcTensor = ::ttnn::from_device(srcTensor);
+-  ::tt::tt_metal::copy_to_device(hostSrcTensor, dstTensor);
++  ::ttnn::copy(srcTensor, dstTensor);
+ }
+
+ static void runTraceProgramAndCaptureTrace(
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+index 6d6f44dce6c6df47a8f8ceb87b15eaf57cab3d58..127d07f5e5d8f344e8a03c4707b8a77e25632722 100644
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -2446,6 +2446,20 @@ submit(Device deviceHandle, Binary executableHandle, std::uint32_t programIndex,
+       "Device memory state before submit");
+ #endif
+
++  // TT-Metal traces retain addresses used by temporary tensors. A stateful
++  // Gated Delta prefill allocates buffers outside the decode trace, so release
++  // cached traces before running it. Decode will capture a fresh trace after
++  // prefill and replay it for the rest of the request.
++  const ::tt::target::ttnn::Program *program =
++      utils::getProgram(executableHandle, programIndex);
++  for (const ::tt::target::ttnn::Operation *op : *program->operations()) {
++    if (op->type_type() == ::tt::target::ttnn::OpType::GatedDeltaRuleOp) {
++      deviceHandle.getTraceCache()->as<TraceCache>(DeviceRuntime::TTNN)
++          .clear();
++      break;
++    }
++  }
++
+   std::unique_ptr<ProgramExecutor> executor = std::make_unique<ProgramExecutor>(
+       deviceHandle, executableHandle, programIndex, inputs);
+
+diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/trace_cache.cpp
+index 2000485e384b0aeae496f7d68e6e6d65fce7914d..b4cd6666ea2248b901a86b76dd0f78b32c4fcdef 100644
+--- a/runtime/lib/ttnn/types/trace_cache.cpp
++++ b/runtime/lib/ttnn/types/trace_cache.cpp
+@@ -76,4 +76,10 @@ void TraceCache::erase(const MainProgramKey &key,
+   outerIt->second.erase(captureExecuteKey);
+ }
+
++void TraceCache::clear() {
++  while (!cache.empty()) {
++    erase(cache.begin()->first);
++  }
++}
++
+ } // namespace tt::runtime::ttnn
