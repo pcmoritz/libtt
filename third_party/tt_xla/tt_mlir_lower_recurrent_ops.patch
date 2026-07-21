@@ -61,7 +61,7 @@ index 386d007..9b50021 100644
 +                        AnyRankedTensor:$output);
 +}
 +
-+def TTNN_StatePoolUpdateOp : TTNN_Op<"state_pool_update", [OpModelExempt]> {
++def TTNN_StatePoolUpdateOp : TTNN_InplaceOp<"state_pool_update", [OpModelExempt]> {
 +    let summary = "Update leading slices of a recurrent state pool in place.";
 +
 +    let arguments = (ins

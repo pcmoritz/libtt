@@ -108,7 +108,7 @@ index ec7bfe8..2761e9d 100644
  #include "stablehlo/conversions/linalg/transforms/Passes.h"
  #include "stablehlo/transforms/Passes.h"
  #include "stablehlo/transforms/optimization/Passes.h"
-@@ -57,6 +60,842 @@ namespace mlir::tt::ttir {
+@@ -57,6 +60,789 @@ namespace mlir::tt::ttir {
  
  #ifdef TTMLIR_ENABLE_STABLEHLO
  
@@ -246,7 +246,7 @@ index ec7bfe8..2761e9d 100644
 +  Value statePool;
 +  Value stateIndices;
 +  Value hasInitialState;
-+  Value finalStatePool;
++  Value output;
 +};
 +
 +struct QwenCausalConv1dUpdateMatch {
@@ -255,7 +255,6 @@ index ec7bfe8..2761e9d 100644
 +  Value weight;
 +  Value stateIndices;
 +  Value hasInitialState;
-+  Value finalStatePool;
 +  Value output;
 +};
 +
@@ -267,6 +266,64 @@ index ec7bfe8..2761e9d 100644
 +                 type.getElementType().isInteger(32)
 +             ? value
 +             : Value();
++}
++
++template <typename OpTy>
++OpTy findRecurrentUser(Value value) {
++  for (Operation *user : value.getUsers()) {
++    if (auto match = dyn_cast<OpTy>(user)) {
++      return match;
++    }
++  }
++  return {};
++}
++
++Value matchUpdatedState(StatePoolUpdateOp update) {
++  auto select =
++      update.getUpdates().getDefiningOp<::mlir::stablehlo::SelectOp>();
++  if (!select) {
++    return {};
++  }
++  auto readsPool = [&](Value value) {
++    auto gather = value.getDefiningOp<::mlir::stablehlo::GatherOp>();
++    return gather && gather.getOperand() == update.getStatePool();
++  };
++  if (readsPool(select.getOnTrue())) {
++    return select.getOnFalse();
++  }
++  return readsPool(select.getOnFalse()) ? select.getOnTrue() : Value();
++}
++
++Value matchStatePoolRead(Value state, Value statePool, int64_t batch) {
++  auto select = state.getDefiningOp<::mlir::stablehlo::SelectOp>();
++  if (!select) {
++    return {};
++  }
++  auto gather = select.getOnTrue()
++                    .getDefiningOp<::mlir::stablehlo::GatherOp>();
++  if (!gather) {
++    gather = select.getOnFalse()
++                 .getDefiningOp<::mlir::stablehlo::GatherOp>();
++  }
++  Value predicate = stripRecurrentViews(select.getPred());
++  return gather && gather.getOperand() == statePool &&
++                 hasShape(predicate, {batch})
++             ? predicate
++             : Value();
++}
++
++::mlir::stablehlo::OptimizationBarrierOp
++matchRecurrentBarrier(Value state, Value output) {
++  if (!state.hasOneUse() || !output.hasOneUse()) {
++    return {};
++  }
++  auto barrier = dyn_cast<::mlir::stablehlo::OptimizationBarrierOp>(
++      *state.user_begin());
++  return barrier && barrier->getNumOperands() == 2 &&
++                 barrier->getOperand(0) == state &&
++                 barrier->getOperand(1) == output
++             ? barrier
++             : ::mlir::stablehlo::OptimizationBarrierOp();
 +}
 +
 +LogicalResult fuseStatePoolUpdate(::mlir::stablehlo::ScatterOp scatter) {
@@ -373,33 +430,19 @@ index ec7bfe8..2761e9d 100644
 +}
 +
 +std::optional<QwenCausalConv1dUpdateMatch>
-+matchQwenCausalConv1dUpdate(::mlir::stablehlo::DotGeneralOp dot) {
-+  auto dotType = dyn_cast<RankedTensorType>(dot.getType());
-+  if (!dotType || !dotType.hasStaticShape() || dotType.getRank() != 2 ||
-+      !dotType.getElementType().isBF16()) {
++matchQwenCausalConv1dUpdate(StatePoolUpdateOp stateUpdate) {
++  Value statePool = stateUpdate.getStatePool();
++  auto poolType = dyn_cast<RankedTensorType>(statePool.getType());
++  if (!poolType || !poolType.hasStaticShape() || poolType.getRank() != 3 ||
++      !poolType.getElementType().isBF16() || poolType.getDimSize(0) < 2 ||
++      poolType.getDimSize(2) != 3) {
 +    return std::nullopt;
 +  }
-+  Value activationInput = dot.getResult();
-+  if (dot->hasOneUse()) {
-+    auto transpose = dyn_cast<::mlir::stablehlo::TransposeOp>(*dot->user_begin());
-+    if (transpose) {
-+      activationInput = transpose.getResult();
-+    } else if (auto reshape =
-+                   dyn_cast<::mlir::stablehlo::ReshapeOp>(*dot->user_begin())) {
-+      activationInput = reshape.getResult();
-+    }
-+  }
-+  Value output = matchExpandedSilu(activationInput);
-+  if (!output || !output.hasOneUse()) {
-+    return std::nullopt;
-+  }
-+
-+  int64_t firstDim = dotType.getDimSize(0);
-+  int64_t secondDim = dotType.getDimSize(1);
-+  bool outputIsBatchMajor = firstDim <= 32 && secondDim % 32 == 0;
-+  int64_t batch = outputIsBatchMajor ? firstDim : secondDim;
-+  int64_t channels = outputIsBatchMajor ? secondDim : firstDim;
-+  if (batch <= 0 || batch > 32 || channels <= 0 || channels % 32 != 0) {
++  int64_t batch =
++      cast<RankedTensorType>(stateUpdate.getUpdates().getType()).getDimSize(0);
++  int64_t channels = poolType.getDimSize(1);
++  if (batch <= 0 || batch > 32 || channels <= 0 || channels % 32 != 0 ||
++      !hasShape(stateUpdate.getStateIndices(), {batch})) {
 +    return std::nullopt;
 +  }
 +  SmallVector<int64_t> inputShape = {batch, channels};
@@ -407,14 +450,17 @@ index ec7bfe8..2761e9d 100644
 +  SmallVector<int64_t> windowShape = {batch, channels, 4};
 +  SmallVector<int64_t> stateShape = {batch, channels, 3};
 +
-+  Value weight = dot.getLhs();
-+  Value window = dot.getRhs();
-+  if (!hasShape(weight, weightShape)) {
-+    std::swap(weight, window);
-+  }
-+  if (!hasShape(weight, weightShape) || !hasShape(window, windowShape)) {
++  Value updatedState = matchUpdatedState(stateUpdate);
++  if (!updatedState) {
 +    return std::nullopt;
 +  }
++  auto slice =
++      updatedState.getDefiningOp<::mlir::stablehlo::SliceOp>();
++  if (!slice || !hasShape(updatedState, stateShape) ||
++      !hasShape(slice.getOperand(), windowShape)) {
++    return std::nullopt;
++  }
++  Value window = slice.getOperand();
 +  auto concatenate =
 +      window.getDefiningOp<::mlir::stablehlo::ConcatenateOp>();
 +  if (!concatenate || concatenate.getDimension() != 2 ||
@@ -423,101 +469,64 @@ index ec7bfe8..2761e9d 100644
 +    return std::nullopt;
 +  }
 +  Value input = stripRecurrentViews(concatenate.getInputs()[1]);
-+  if (!hasShape(input, inputShape)) {
++  Value hasInitialState =
++      matchStatePoolRead(concatenate.getInputs()[0], statePool, batch);
++  if (!hasShape(input, inputShape) || !hasInitialState) {
 +    return std::nullopt;
 +  }
 +
-+  auto stateSelect = concatenate.getInputs()[0]
-+                         .getDefiningOp<::mlir::stablehlo::SelectOp>();
-+  if (!stateSelect) {
++  auto dot = findRecurrentUser<::mlir::stablehlo::DotGeneralOp>(window);
++  if (!dot) {
 +    return std::nullopt;
 +  }
-+  auto gather = stateSelect.getOnTrue()
-+                    .getDefiningOp<::mlir::stablehlo::GatherOp>();
-+  if (!gather) {
-+    gather = stateSelect.getOnFalse()
-+                 .getDefiningOp<::mlir::stablehlo::GatherOp>();
-+  }
-+  if (!gather) {
-+    return std::nullopt;
-+  }
-+  Value statePool = gather.getOperand();
-+  Value stateIndices = stripRecurrentViews(gather.getStartIndices());
-+  Value hasInitialState = stripRecurrentViews(stateSelect.getPred());
-+  auto poolType = dyn_cast<RankedTensorType>(statePool.getType());
-+  if (!poolType || !poolType.hasStaticShape() || poolType.getRank() != 3 ||
-+      poolType.getDimSize(0) < 2 || poolType.getDimSize(1) != channels ||
-+      poolType.getDimSize(2) != 3 || !hasShape(stateIndices, {batch}) ||
-+      !hasShape(hasInitialState, {batch})) {
++  Value weight = dot.getLhs() == window ? dot.getRhs() : dot.getLhs();
++  auto dotType = dyn_cast<RankedTensorType>(dot.getType());
++  if ((dot.getLhs() != window && dot.getRhs() != window) ||
++      !hasShape(weight, weightShape) || !dotType ||
++      !dotType.hasStaticShape() || dotType.getRank() != 2 ||
++      !dotType.getElementType().isBF16() ||
++      (dotType.getShape() != ArrayRef<int64_t>({batch, channels}) &&
++       dotType.getShape() != ArrayRef<int64_t>({channels, batch}))) {
 +    return std::nullopt;
 +  }
 +
-+  Value finalStatePool;
-+  for (Operation *windowUser : window.getUsers()) {
-+    auto slice = dyn_cast<::mlir::stablehlo::SliceOp>(windowUser);
-+    if (!slice || !hasShape(slice.getResult(), stateShape)) {
-+      continue;
-+    }
-+    for (Operation *sliceUser : slice.getResult().getUsers()) {
-+      auto select = dyn_cast<::mlir::stablehlo::SelectOp>(sliceUser);
-+      if (!select) {
-+        continue;
-+      }
-+      for (Operation *selectUser : select.getResult().getUsers()) {
-+        auto scatter = dyn_cast<::mlir::stablehlo::ScatterOp>(selectUser);
-+        if (scatter && scatter.getInputs().size() == 1 &&
-+            scatter.getUpdates().size() == 1 &&
-+            scatter.getInputs()[0] == statePool &&
-+            scatter.getUpdates()[0] == select.getResult()) {
-+          finalStatePool = scatter.getResult(0);
-+          break;
-+        }
-+      }
++  Value activationInput = dot.getResult();
++  if (dot->hasOneUse()) {
++    Operation *user = *dot->user_begin();
++    if (isa<::mlir::stablehlo::TransposeOp,
++            ::mlir::stablehlo::ReshapeOp>(user)) {
++      activationInput = user->getResult(0);
 +    }
 +  }
-+  if (!finalStatePool) {
++  Value output = matchExpandedSilu(activationInput);
++  if (!output) {
 +    return std::nullopt;
 +  }
 +  return QwenCausalConv1dUpdateMatch{
-+      input, statePool, weight, stateIndices, hasInitialState,
-+      finalStatePool, output};
++      input, statePool, weight, stateUpdate.getStateIndices(),
++      hasInitialState, output};
 +}
 +
-+LogicalResult
-+fuseQwenCausalConv1dUpdate(::mlir::stablehlo::DotGeneralOp dot) {
-+  auto match = matchQwenCausalConv1dUpdate(dot);
-+  if (!match) {
-+    return failure();
-+  }
-+  auto outputBarrier = dyn_cast<::mlir::stablehlo::OptimizationBarrierOp>(
-+      *match->output.user_begin());
-+  if (!outputBarrier) {
-+    return failure();
-+  }
-+  std::optional<unsigned> stateResultIndex;
-+  std::optional<unsigned> outputResultIndex;
-+  for (auto [index, operand] : llvm::enumerate(outputBarrier.getOperands())) {
-+    if (operand == match->finalStatePool) {
-+      stateResultIndex = index;
-+    } else if (operand == match->output) {
-+      outputResultIndex = index;
-+    }
-+  }
-+  if (!stateResultIndex || !outputResultIndex) {
++LogicalResult fuseQwenCausalConv1dUpdate(StatePoolUpdateOp stateUpdate) {
++  auto match = matchQwenCausalConv1dUpdate(stateUpdate);
++  auto barrier =
++      match ? matchRecurrentBarrier(stateUpdate.getFinalStatePool(),
++                                    match->output)
++            : ::mlir::stablehlo::OptimizationBarrierOp();
++  if (!match || !barrier) {
 +    return failure();
 +  }
 +
-+  OpBuilder builder(dot);
-+  SmallVector<Type> resultTypes = {
-+      outputBarrier->getResult(*stateResultIndex).getType(),
-+      outputBarrier->getResult(*outputResultIndex).getType()};
++  OpBuilder builder(stateUpdate);
++  SmallVector<Type> resultTypes = {barrier->getResult(0).getType(),
++                                   barrier->getResult(1).getType()};
 +  SmallVector<Value> operands = {
 +      match->input, match->statePool, match->weight, match->stateIndices,
 +      match->hasInitialState};
 +  auto fused = builder.create<CausalConv1dUpdateOp>(
-+      dot.getLoc(), resultTypes, operands);
-+  outputBarrier->setOperand(*stateResultIndex, fused.getFinalStatePool());
-+  outputBarrier->setOperand(*outputResultIndex, fused.getOutput());
++      stateUpdate.getLoc(), resultTypes, operands);
++  barrier->setOperand(0, fused.getFinalStatePool());
++  barrier->setOperand(1, fused.getOutput());
 +  return success();
 +}
 +
@@ -567,65 +576,22 @@ index ec7bfe8..2761e9d 100644
 +  return std::nullopt;
 +}
 +
-+struct DecodeStatePoolMatch {
-+  Value statePool;
-+  Value stateIndices;
-+  Value hasInitialState;
-+  Value finalStatePool;
-+};
-+
-+std::optional<DecodeStatePoolMatch>
-+matchDecodeStatePool(Value initialState, Value finalState, int64_t batch,
-+                     int64_t numHeads) {
-+  auto initialSelect = initialState.getDefiningOp<::mlir::stablehlo::SelectOp>();
-+  if (!initialSelect) {
-+    return std::nullopt;
-+  }
-+  auto gather = initialSelect.getOnTrue()
-+                    .getDefiningOp<::mlir::stablehlo::GatherOp>();
-+  if (!gather) {
-+    gather = initialSelect.getOnFalse()
-+                 .getDefiningOp<::mlir::stablehlo::GatherOp>();
-+  }
-+  if (!gather) {
-+    return std::nullopt;
-+  }
-+
-+  Value statePool = gather.getOperand();
-+  Value stateIndices = stripRecurrentViews(gather.getStartIndices());
-+  Value hasInitialState = stripRecurrentViews(initialSelect.getPred());
-+  auto poolType = dyn_cast<RankedTensorType>(statePool.getType());
-+  if (!poolType || !poolType.hasStaticShape() || poolType.getRank() != 4 ||
-+      poolType.getDimSize(0) < 2 || poolType.getDimSize(1) != numHeads ||
-+      !hasShape(stateIndices, {batch}) ||
-+      !hasShape(hasInitialState, {batch})) {
-+    return std::nullopt;
-+  }
-+
-+  for (Operation *user : finalState.getUsers()) {
-+    auto select = dyn_cast<::mlir::stablehlo::SelectOp>(user);
-+    if (!select || (select.getOnTrue() != finalState &&
-+                    select.getOnFalse() != finalState)) {
-+      continue;
-+    }
-+    for (Operation *selectUser : select.getResult().getUsers()) {
-+      auto scatter = dyn_cast<::mlir::stablehlo::ScatterOp>(selectUser);
-+      if (scatter && scatter.getInputs().size() == 1 &&
-+          scatter.getUpdates().size() == 1 &&
-+          scatter.getInputs()[0] == statePool &&
-+          scatter.getUpdates()[0] == select.getResult()) {
-+        return DecodeStatePoolMatch{statePool, stateIndices,
-+                                    hasInitialState, scatter.getResult(0)};
-+      }
-+    }
-+  }
-+  return std::nullopt;
-+}
-+
 +std::optional<QwenGatedDeltaDecodeMatch>
-+matchQwenGatedDeltaDecode(::mlir::stablehlo::DotGeneralOp outputDot) {
++matchQwenGatedDeltaDecode(StatePoolUpdateOp stateUpdate) {
++  Value finalState = matchUpdatedState(stateUpdate);
++  if (!finalState) {
++    return std::nullopt;
++  }
++  auto outputDot =
++      findRecurrentUser<::mlir::stablehlo::DotGeneralOp>(finalState);
++  if (!outputDot || (outputDot.getLhs() != finalState &&
++                     outputDot.getRhs() != finalState)) {
++    return std::nullopt;
++  }
++  Value query = outputDot.getLhs() == finalState ? outputDot.getRhs()
++                                                  : outputDot.getLhs();
 +  auto outputType = dyn_cast<RankedTensorType>(outputDot.getType());
-+  auto stateType = dyn_cast<RankedTensorType>(outputDot.getLhs().getType());
++  auto stateType = dyn_cast<RankedTensorType>(finalState.getType());
 +  if (!outputType || !stateType || !outputType.hasStaticShape() ||
 +      !stateType.hasStaticShape() || outputType.getRank() != 3 ||
 +      stateType.getRank() != 4) {
@@ -641,10 +607,10 @@ index ec7bfe8..2761e9d 100644
 +  if (batch <= 0 || numHeads <= 0 ||
 +      outputType.getShape() != ArrayRef<int64_t>(vectorShape) ||
 +      stateType.getShape() != ArrayRef<int64_t>(stateShape) ||
-+      !hasShape(outputDot.getRhs(), vectorShape)) {
++      !hasShape(query, vectorShape) ||
++      !hasShape(stateUpdate.getStateIndices(), {batch})) {
 +    return std::nullopt;
 +  }
-+  Value finalState = outputDot.getLhs();
 +  auto add = finalState.getDefiningOp<::mlir::stablehlo::AddOp>();
 +  if (!add) {
 +    return std::nullopt;
@@ -671,51 +637,33 @@ index ec7bfe8..2761e9d 100644
 +      auto deltaMatch = matchDecodeScaledDelta(
 +          scaledDelta, stateMid, key, vectorShape, scalarShape);
 +      if (deltaMatch) {
-+        auto poolMatch = matchDecodeStatePool(
-+            stateMatch->first, finalState, batch, numHeads);
-+        if (!poolMatch) {
++        Value statePool = stateUpdate.getStatePool();
++        Value hasInitialState =
++            matchStatePoolRead(stateMatch->first, statePool, batch);
++        if (!hasInitialState) {
 +          continue;
 +        }
 +        return QwenGatedDeltaDecodeMatch{
-+            outputDot.getRhs(), key, deltaMatch->first, deltaMatch->second,
-+            stateMatch->second, poolMatch->statePool,
-+            poolMatch->stateIndices, poolMatch->hasInitialState,
-+            poolMatch->finalStatePool};
++            query, key, deltaMatch->first, deltaMatch->second,
++            stateMatch->second, statePool, stateUpdate.getStateIndices(),
++            hasInitialState, outputDot.getResult()};
 +      }
 +    }
 +  }
 +  return std::nullopt;
 +}
 +
-+LogicalResult
-+fuseQwenGatedDeltaDecode(::mlir::stablehlo::DotGeneralOp outputDot) {
-+  auto match = matchQwenGatedDeltaDecode(outputDot);
-+  if (!match) {
-+    return failure();
-+  }
-+  if (!outputDot->hasOneUse()) {
-+    return failure();
-+  }
-+  auto outputBarrier = dyn_cast<::mlir::stablehlo::OptimizationBarrierOp>(
-+      *outputDot->user_begin());
-+  if (!outputBarrier) {
-+    return failure();
-+  }
-+  std::optional<unsigned> stateResultIndex;
-+  std::optional<unsigned> outputResultIndex;
-+  for (auto [index, operand] : llvm::enumerate(outputBarrier.getOperands())) {
-+    if (operand == match->finalStatePool) {
-+      stateResultIndex = index;
-+    } else if (operand == outputDot.getResult()) {
-+      outputResultIndex = index;
-+    }
-+  }
-+  if (!stateResultIndex || !outputResultIndex ||
-+      !outputBarrier->getResult(*outputResultIndex).hasOneUse()) {
++LogicalResult fuseQwenGatedDeltaDecode(StatePoolUpdateOp stateUpdate) {
++  auto match = matchQwenGatedDeltaDecode(stateUpdate);
++  auto barrier =
++      match ? matchRecurrentBarrier(stateUpdate.getFinalStatePool(),
++                                    match->output)
++            : ::mlir::stablehlo::OptimizationBarrierOp();
++  if (!match || !barrier || !barrier->getResult(1).hasOneUse()) {
 +    return failure();
 +  }
 +  auto outputConvert = dyn_cast<::mlir::stablehlo::ConvertOp>(
-+      *outputBarrier->getResult(*outputResultIndex).user_begin());
++      *barrier->getResult(1).user_begin());
 +  if (!outputConvert ||
 +      !cast<RankedTensorType>(outputConvert.getType())
 +           .getElementType()
@@ -723,17 +671,16 @@ index ec7bfe8..2761e9d 100644
 +    return failure();
 +  }
 +
-+  OpBuilder builder(outputDot);
-+  SmallVector<Type> resultTypes = {
-+      outputBarrier->getResult(*stateResultIndex).getType(),
-+      outputBarrier->getResult(*outputResultIndex).getType()};
++  OpBuilder builder(stateUpdate);
++  SmallVector<Type> resultTypes = {barrier->getResult(0).getType(),
++                                   barrier->getResult(1).getType()};
 +  SmallVector<Value> operands = {
 +      match->query, match->key, match->value, match->beta, match->decay,
 +      match->statePool, match->stateIndices, match->hasInitialState};
 +  auto fused = builder.create<GatedDeltaDecodeOp>(
-+      outputDot.getLoc(), resultTypes, operands);
-+  outputBarrier->setOperand(*stateResultIndex, fused.getFinalStatePool());
-+  outputBarrier->setOperand(*outputResultIndex, fused.getOutput());
++      stateUpdate.getLoc(), resultTypes, operands);
++  barrier->setOperand(0, fused.getFinalStatePool());
++  barrier->setOperand(1, fused.getOutput());
 +
 +  return success();
 +}
@@ -925,15 +872,15 @@ index ec7bfe8..2761e9d 100644
 +      }
 +    }
 +
-+    SmallVector<::mlir::stablehlo::DotGeneralOp> dots;
++    SmallVector<StatePoolUpdateOp> stateUpdates;
 +    getOperation().walk<WalkOrder::PostOrder>(
-+        [&](::mlir::stablehlo::DotGeneralOp dot) { dots.push_back(dot); });
-+    for (::mlir::stablehlo::DotGeneralOp dot : dots) {
-+      if (succeeded(fuseQwenCausalConv1dUpdate(dot))) {
++        [&](StatePoolUpdateOp update) { stateUpdates.push_back(update); });
++    for (StatePoolUpdateOp update : stateUpdates) {
++      if (succeeded(fuseQwenCausalConv1dUpdate(update))) {
 +        fusedGatedDelta = true;
 +        continue;
 +      }
-+      if (succeeded(fuseQwenGatedDeltaDecode(dot))) {
++      if (succeeded(fuseQwenGatedDeltaDecode(update))) {
 +        fusedGatedDelta = true;
 +      }
 +    }
@@ -951,14 +898,14 @@ index ec7bfe8..2761e9d 100644
  void createStableHLOToTTIRPipeline(
      OpPassManager &pm, const StableHLOToTTIRPipelineOptions &options) {
    if (options.arithDialectConversionsEnabled) {
-@@ -81,6 +922,10 @@ void createStableHLOToTTIRPipeline(
+@@ -81,6 +869,10 @@ void createStableHLOToTTIRPipeline(
      pm.addPass(::mlir::stablehlo::createStablehloLegalizeCompositeToCallPass());
    }
    pm.addPass(mlir::createInlinerPass());
++  pm.addPass(std::make_unique<FuseStatePoolUpdatesPass>());
 +  pm.addPass(std::make_unique<FuseQwenGatedDeltaLoopPass>());
 +  pm.addPass(mlir::createCanonicalizerPass());
 +  pm.addPass(std::make_unique<UnrollSearchsortedPass>());
-+  pm.addPass(std::make_unique<FuseStatePoolUpdatesPass>());
  
    ttir::ConvertStableHLOToTTIROptions passOptions;
    passOptions.enablePartialConversion = options.enableCPUFallback;
