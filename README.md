@@ -12,6 +12,10 @@ The local code in this repository is intentionally small:
 - it links the upstream `tt-xla` PJRT plugin into the final shared library;
 - it hides internal symbols so the shared object only exports the PJRT entrypoints.
 
+## Design documents
+
+- [General graph fusion for TT-MLIR and TTNN](docs/design/general_fusion.md)
+
 ## Build
 
 ```bash
