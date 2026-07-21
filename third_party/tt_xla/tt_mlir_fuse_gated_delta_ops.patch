@@ -216,21 +216,20 @@ index 26273440e82884fff47b81d01636e321d878100b..3e57c653905226309f038bc5d05a86c9
             SplitQueryKeyValueAndSplitHeadsOpConversionPattern,
             GeluBackwardOpConversionPattern,
 diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
-index ec7bfe825c4f48b3e1f2783f8cf6c8829a747aaa..01011c4bc6d5bd85947ea8358203171f1cefaf79 100644
+index ec7bfe825c4f48b3e1f2783f8cf6c8829a747aaa..dd77dd66ae8a7bc854b0459e5e6f98b05c7831b8 100644
 --- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
 +++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
-@@ -20,7 +20,10 @@
+@@ -20,7 +20,9 @@
  #include "mlir/Dialect/Linalg/Passes.h"
  #include "mlir/Dialect/SCF/Transforms/Passes.h"
  #include "mlir/InitAllDialects.h"
 +#include "mlir/IR/BuiltinAttributes.h"
  #include "mlir/InitAllPasses.h"
-+#include "mlir/Interfaces/SideEffectInterfaces.h"
 +#include "mlir/Transforms/RegionUtils.h"
  #include "mlir/Pass/PassManager.h"
  #include "mlir/Pass/PassRegistry.h"
  #include "mlir/Tools/mlir-opt/MlirOptMain.h"
-@@ -33,6 +36,7 @@
+@@ -33,6 +35,7 @@
  #include "ttmlir/Transforms/Passes.h"
 
  #ifdef TTMLIR_ENABLE_STABLEHLO
@@ -238,7 +237,7 @@ index ec7bfe825c4f48b3e1f2783f8cf6c8829a747aaa..01011c4bc6d5bd85947ea8358203171f
  #include "stablehlo/conversions/linalg/transforms/Passes.h"
  #include "stablehlo/transforms/Passes.h"
  #include "stablehlo/transforms/optimization/Passes.h"
-@@ -57,6 +61,585 @@ namespace mlir::tt::ttir {
+@@ -57,6 +60,573 @@ namespace mlir::tt::ttir {
 
  #ifdef TTMLIR_ENABLE_STABLEHLO
 
@@ -332,13 +331,6 @@ index ec7bfe825c4f48b3e1f2783f8cf6c8829a747aaa..01011c4bc6d5bd85947ea8358203171f
 +    : public PassWrapper<UnrollSearchsortedPass,
 +                         OperationPass<ModuleOp>> {
 +  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(UnrollSearchsortedPass)
-+
-+  StringRef getArgument() const final {
-+    return "stablehlo-unroll-searchsorted";
-+  }
-+  StringRef getDescription() const final {
-+    return "Unroll small statically bounded JAX searchsorted loops";
-+  }
 +
 +  void runOnOperation() final {
 +    SmallVector<::mlir::stablehlo::WhileOp> loops;
@@ -786,11 +778,6 @@ index ec7bfe825c4f48b3e1f2783f8cf6c8829a747aaa..01011c4bc6d5bd85947ea8358203171f
 +                         OperationPass<ModuleOp>> {
 +  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseQwenGatedDeltaLoopPass)
 +
-+  StringRef getArgument() const final { return "stablehlo-fuse-qwen-gdn"; }
-+  StringRef getDescription() const final {
-+    return "Fuse the Qwen Gated DeltaNet recurrence before loop lowering";
-+  }
-+
 +  void runOnOperation() final {
 +    SmallVector<::mlir::stablehlo::WhileOp> loops;
 +    getOperation().walk<WalkOrder::PostOrder>(
@@ -824,7 +811,7 @@ index ec7bfe825c4f48b3e1f2783f8cf6c8829a747aaa..01011c4bc6d5bd85947ea8358203171f
  void createStableHLOToTTIRPipeline(
      OpPassManager &pm, const StableHLOToTTIRPipelineOptions &options) {
    if (options.arithDialectConversionsEnabled) {
-@@ -81,6 +664,9 @@ void createStableHLOToTTIRPipeline(
+@@ -81,6 +651,9 @@ void createStableHLOToTTIRPipeline(
      pm.addPass(::mlir::stablehlo::createStablehloLegalizeCompositeToCallPass());
    }
    pm.addPass(mlir::createInlinerPass());
@@ -908,10 +895,10 @@ index 1ac198525683bf2d010d0e090b0c135fe13697d1..8a3eb08b72b9b010c3f211716b9ccb01
      return createOperation(cache, createOp(cache, flashMlaPrefillOp),
 diff --git a/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp b/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..88613e0cf7af2043ebb0ab901c7748cc9bf885a9
+index 0000000000000000000000000000000000000000..539ce56f4b73319f5b94d1e6d0d769a13702d791
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
-@@ -0,0 +1,533 @@
+@@ -0,0 +1,531 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -927,7 +914,6 @@ index 0000000000000000000000000000000000000000..88613e0cf7af2043ebb0ab901c7748cc
 +#include "ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp"
 +#include "ttnn/operations/transformer/gated_delta_attn/gated_delta_attn.hpp"
 +
-+#include <array>
 +#include <cmath>
 +
 +namespace tt::runtime::ttnn::operations::transformer {
@@ -1420,13 +1406,12 @@ index 0000000000000000000000000000000000000000..88613e0cf7af2043ebb0ab901c7748cc
 +      ::ttnn::Shape{1, numHeads, 1, kChunkSize},
 +      ::ttnn::DataType::BFLOAT16, ::ttnn::Layout::TILE,
 +      query.device(), kDram);
-+  std::vector<::ttnn::Tensor> results =
++  ::ttnn::Tensor activeOutput =
 +      ::ttnn::transformer::gated_delta_decode(
 +          queryActive, keyActive, valueActive, betaActive, decayActive,
 +          tiledStatePool, outputBuffer, activeIndices, activeStateFlag);
 +  ::ttnn::Tensor updatedStatePool = ::ttnn::to_layout(
-+      results[1], statePool.layout(), statePool.dtype(), kDram);
-+  ::ttnn::Tensor activeOutput = results[0];
++      tiledStatePool, statePool.layout(), statePool.dtype(), kDram);
 +
 +  auto outputMemoryConfig =
 +      ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(

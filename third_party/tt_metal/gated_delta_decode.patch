@@ -1,6 +1,6 @@
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
 new file mode 100644
-index 0000000..f02bd9f
+index 0000000000000000000000000000000000000000..c8ec4d66150d30324c40eae58d01df05e4c75f63
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
 @@ -0,0 +1,164 @@
@@ -170,7 +170,7 @@ index 0000000..f02bd9f
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 new file mode 100644
-index 0000000..4996063
+index 0000000000000000000000000000000000000000..6bbd10bb0140a9f9bafd5f897847bf94461e903f
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 @@ -0,0 +1,209 @@
@@ -385,7 +385,7 @@ index 0000000..4996063
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
 new file mode 100644
-index 0000000..8b39696
+index 0000000000000000000000000000000000000000..4861f17b4ea25188766f657f03c464b6104b53f9
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
 @@ -0,0 +1,80 @@
@@ -471,7 +471,7 @@ index 0000000..8b39696
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 new file mode 100644
-index 0000000..bc98788
+index 0000000000000000000000000000000000000000..598ac696bdb1eac7617e47719b4fcfd5a977740e
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 @@ -0,0 +1,309 @@
@@ -523,7 +523,7 @@ index 0000000..bc98788
 +    using cached_program_t = device_operation::CachedProgram<shared_variables_t>;
 +    using operation_attributes_t = DecodeParams;
 +    using tensor_args_t = DecodeInputs;
-+    using tensor_return_value_t = std::vector<Tensor>;
++    using tensor_return_value_t = Tensor;
 +
 +    static cached_program_t create(
 +        const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
@@ -534,8 +534,8 @@ index 0000000..bc98788
 +struct DecodeOperation {
 +    using operation_attributes_t = DecodeParams;
 +    using tensor_args_t = DecodeInputs;
-+    using spec_return_value_t = std::vector<TensorSpec>;
-+    using tensor_return_value_t = std::vector<Tensor>;
++    using spec_return_value_t = TensorSpec;
++    using tensor_return_value_t = Tensor;
 +    using program_factory_t = std::variant<DecodeProgramFactory>;
 +
 +    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
@@ -598,12 +598,12 @@ index 0000000..bc98788
 +
 +DecodeOperation::spec_return_value_t DecodeOperation::compute_output_specs(
 +    const operation_attributes_t&, const tensor_args_t& in) {
-+    return {in.output.tensor_spec(), in.state.tensor_spec()};
++    return in.output.tensor_spec();
 +}
 +
 +DecodeOperation::tensor_return_value_t DecodeOperation::create_output_tensors(
 +    const operation_attributes_t&, const tensor_args_t& in) {
-+    return {in.output, in.state};
++    return in.output;
 +}
 +
 +ttsl::hash::hash_t DecodeOperation::compute_program_hash(
@@ -614,7 +614,7 @@ index 0000000..bc98788
 +}
 +
 +DecodeProgramFactory::cached_program_t DecodeProgramFactory::create(
-+    const operation_attributes_t&, const tensor_args_t& in, tensor_return_value_t& outputs) {
++    const operation_attributes_t&, const tensor_args_t& in, tensor_return_value_t& output) {
 +    constexpr uint32_t kt = 4;
 +    constexpr uint32_t vt = 4;
 +    constexpr uint32_t state_tiles = kt * vt;
@@ -666,8 +666,8 @@ index 0000000..bc98788
 +
 +    std::vector<uint32_t> writer_args = {
 +        kt, vt, batch_size, num_heads, num_workers};
-+    TensorAccessorArgs(outputs[0].buffer()).append_to(writer_args);
-+    TensorAccessorArgs(outputs[1].buffer()).append_to(writer_args);
++    TensorAccessorArgs(output.buffer()).append_to(writer_args);
++    TensorAccessorArgs(in.state.buffer()).append_to(writer_args);
 +    TensorAccessorArgs(in.state_indices.buffer()).append_to(writer_args);
 +
 +    const std::string kernel_dir =
@@ -718,7 +718,7 @@ index 0000000..bc98788
 +            program,
 +            writer,
 +            core,
-+            {worker, outputs[0].buffer()->address(), outputs[1].buffer()->address(),
++            {worker, output.buffer()->address(), in.state.buffer()->address(),
 +             in.state_indices.buffer()->address()});
 +        SetRuntimeArgs(program, compute, core, {worker});
 +    }
@@ -735,7 +735,7 @@ index 0000000..bc98788
 +    cached_program_t& cached,
 +    const operation_attributes_t&,
 +    const tensor_args_t& in,
-+    tensor_return_value_t& outputs) {
++    tensor_return_value_t& output) {
 +    for (uint32_t worker = 0; worker < cached.shared_variables.num_workers; ++worker) {
 +        CoreCoord core{worker / cached.shared_variables.grid_y, worker % cached.shared_variables.grid_y};
 +        auto& reader_args = GetRuntimeArgs(cached.program, cached.shared_variables.reader_kernel_id, core);
@@ -748,8 +748,8 @@ index 0000000..bc98788
 +        reader_args[7] = in.state_indices.buffer()->address();
 +        reader_args[8] = in.has_initial_state.buffer()->address();
 +        auto& writer_args = GetRuntimeArgs(cached.program, cached.shared_variables.writer_kernel_id, core);
-+        writer_args[1] = outputs[0].buffer()->address();
-+        writer_args[2] = outputs[1].buffer()->address();
++        writer_args[1] = output.buffer()->address();
++        writer_args[2] = in.state.buffer()->address();
 +        writer_args[3] = in.state_indices.buffer()->address();
 +    }
 +}
@@ -759,7 +759,7 @@ index 0000000..bc98788
 +
 +namespace ttnn::transformer {
 +
-+std::vector<Tensor> gated_delta_decode(
++Tensor gated_delta_decode(
 +    const Tensor& query,
 +    const Tensor& key,
 +    const Tensor& value,
@@ -786,16 +786,14 @@ index 0000000..bc98788
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
 new file mode 100644
-index 0000000..0b1966f
+index 0000000000000000000000000000000000000000..e2e401c05c74e64ff5e748b50d78d94c071ba3c6
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,25 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#pragma once
-+
-+#include <vector>
 +
 +#include "ttnn/tensor/tensor.hpp"
 +
@@ -805,7 +803,7 @@ index 0000000..0b1966f
 +// state_mid = decay * state
 +// state' = state_mid + k^T * (beta * (v - k * state_mid))
 +// output = q * state'
-+std::vector<Tensor> gated_delta_decode(
++Tensor gated_delta_decode(
 +    const Tensor& query,
 +    const Tensor& key,
 +    const Tensor& value,

@@ -106,10 +106,10 @@ index 668640dbeab4c50e23a78c82dea709bbb693ba53..d7cd4272e6d09028a026d18e742b6c2d
             SplitQueryKeyValueAndSplitHeadsOpConversionPattern,
             GeluBackwardOpConversionPattern,
 diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
-index f1c6853430326a5c4d362dad1f1f7e39a369ca33..88898fcb2ea92f48cb4f24d41dade8fe7fb55b07 100644
+index c5518ce6f0b364f2b33c1e5a71120f167699976e..2761e9d94e542081a6744a2a576742a5b6a9d43a 100644
 --- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
 +++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
-@@ -209,6 +209,93 @@ struct QwenCausalConv1dUpdateMatch {
+@@ -201,6 +201,86 @@ struct QwenCausalConv1dUpdateMatch {
    Value output;
  };
 
@@ -181,13 +181,6 @@ index f1c6853430326a5c4d362dad1f1f7e39a369ca33..88898fcb2ea92f48cb4f24d41dade8fe
 +struct FuseStatePoolUpdatesPass
 +    : public PassWrapper<FuseStatePoolUpdatesPass, OperationPass<ModuleOp>> {
 +  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseStatePoolUpdatesPass)
-+
-+  StringRef getArgument() const final {
-+    return "stablehlo-fuse-state-pool-updates";
-+  }
-+  StringRef getDescription() const final {
-+    return "Keep recurrent state pool updates in the input buffers";
-+  }
 +  void runOnOperation() final {
 +    SmallVector<::mlir::stablehlo::ScatterOp> scatters;
 +    getOperation().walk<WalkOrder::PostOrder>(
@@ -203,7 +196,7 @@ index f1c6853430326a5c4d362dad1f1f7e39a369ca33..88898fcb2ea92f48cb4f24d41dade8fe
  Value stripBroadcasts(Value value) {
    // JAX expands each recurrence broadcast through two rank-increasing ops.
    // Follow that exact, narrow chain and stop before the source computation.
-@@ -880,6 +967,7 @@ void createStableHLOToTTIRPipeline(
+@@ -867,6 +947,7 @@ void createStableHLOToTTIRPipeline(
    pm.addPass(std::make_unique<FuseQwenGatedDeltaLoopPass>());
    pm.addPass(mlir::createCanonicalizerPass());
    pm.addPass(std::make_unique<UnrollSearchsortedPass>());
@@ -373,7 +366,7 @@ index 9b5b8da5508f9d5de557866eaed54ec1f1dc4bee..95de41448f921849a40039d782f9808f
      // across trace executions, so their versions are expected to match.
      // Regular inputs live on host and change between executions, so a version
 diff --git a/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp b/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
-index 88088da97afbe20de733deddc79592a031323dfd..b560eb123d50d3351062b327717073022018838b 100644
+index 8f0674585b9abe78fb70ed8461838faf25cafe01..307a3c51a16aae7ef315b2954dfe9b5b9f4b71f5 100644
 --- a/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
 +++ b/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
 @@ -10,8 +10,10 @@
@@ -386,8 +379,8 @@ index 88088da97afbe20de733deddc79592a031323dfd..b560eb123d50d3351062b32771707302
 +#include "ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp"
  #include "ttnn/operations/transformer/gated_delta_attn/gated_delta_attn.hpp"
 
- #include <array>
-@@ -552,4 +554,25 @@ void run(const ::tt::target::ttnn::CausalConv1dUpdateOp *op,
+ #include <cmath>
+@@ -550,4 +552,25 @@ void run(const ::tt::target::ttnn::CausalConv1dUpdateOp *op,
    tensorPool.insertTTNNTensorAndValidate(op->output(), output);
  }
 
