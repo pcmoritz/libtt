@@ -45,7 +45,7 @@ index be4911b..17bc201 100644
 +                         AnyRankedTensor:$value,
 +                         AnyRankedTensor:$beta,
 +                         AnyRankedTensor:$decay,
-+                         AnyRankedTensor:$state_pool,
++                         Arg<AnyRankedTensor, "state pool", [MemWrite]>:$state_pool,
 +                         AnyRankedTensor:$state_indices,
 +                         AnyRankedTensor:$has_initial_state);
 +
@@ -96,7 +96,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 index 59da13c..86163f8 100644
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3402,6 +3402,35 @@
+@@ -3402,6 +3402,34 @@
  };
  } // namespace
 
@@ -118,7 +118,6 @@ index 59da13c..86163f8 100644
 +      }
 +      resultTypes.push_back(converted);
 +    }
-+
 +    rewriter.replaceOpWithNewOp<ttnn::GatedDeltaDecodeOp>(
 +        op, resultTypes, adaptor.getQuery(), adaptor.getKey(),
 +        adaptor.getValue(), adaptor.getBeta(), adaptor.getDecay(),
@@ -132,7 +131,7 @@ index 59da13c..86163f8 100644
  namespace {
  class PagedFlashMultiLatentAttentionDecodeOpConversionPattern
      : public OpConversionPattern<ttir::PagedFlashMultiLatentAttentionDecodeOp> {
-@@ -3918,6 +3946,7 @@
+@@ -3918,6 +3942,7 @@
             PagedScaledDotProductAttentionDecodeOpConversionPattern,
             ChunkedScaledDotProductAttentionOpConversionPattern,
             GatedDeltaRuleOpConversionPattern,
@@ -378,15 +377,15 @@ index e612e7f..1d516e6 100644
 +  OpBuilder builder(outputDot);
 +  SmallVector<Type> resultTypes = {
 +      outputBarrier->getResult(*stateResultIndex).getType(),
-+      outputConvert.getType()};
++      outputBarrier->getResult(*outputResultIndex).getType()};
 +  SmallVector<Value> operands = {
 +      match->query, match->key, match->value, match->beta, match->decay,
 +      match->statePool, match->stateIndices, match->hasInitialState};
 +  auto fused = builder.create<GatedDeltaDecodeOp>(
 +      outputDot.getLoc(), resultTypes, operands);
-+  outputBarrier->getResult(*stateResultIndex)
-+      .replaceAllUsesWith(fused.getFinalStatePool());
-+  outputConvert.getResult().replaceAllUsesWith(fused.getOutput());
++  outputBarrier->setOperand(*stateResultIndex, fused.getFinalStatePool());
++  outputBarrier->setOperand(*outputResultIndex, fused.getOutput());
++
 +  return success();
 +}
 +
@@ -450,7 +449,7 @@ index f4eb7b4..43cda3c 100644
  ::flatbuffers::Offset<::tt::target::ttnn::FlashMlaPrefillOp>
  createOp(FlatbufferObjectCache &cache, FlashMlaPrefillOp op) {
    auto query = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5027,6 +5046,11 @@
+@@ -5027,6 +5043,11 @@
      return createOperation(cache, createOp(cache, gatedDeltaRuleOp),
                             debugString, locInfo);
    }

@@ -1,0 +1,49 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+--- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+@@ -60,6 +60,7 @@ public:
+   void erase(const MainProgramKey &key);
+   void erase(const MainProgramKey &key,
+              const CaptureExecuteProgramKey &captureExecuteKey);
++  void clear();
+ 
+   uint64_t getGenerationId() const { return generationId; }
+ 
+diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/trace_cache.cpp
+--- a/runtime/lib/ttnn/types/trace_cache.cpp
++++ b/runtime/lib/ttnn/types/trace_cache.cpp
+@@ -72,4 +72,10 @@ void TraceCache::erase(const MainProgramKey &key,
+   outerIt->second.erase(captureExecuteKey);
+ }
+ 
++void TraceCache::clear() {
++  while (!cache.empty()) {
++    erase(cache.begin()->first);
++  }
++}
++
+ } // namespace tt::runtime::ttnn
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -2443,6 +2443,20 @@ submit(Device deviceHandle, Binary executableHandle, std::uint32_t programIndex,
+       "Device memory state before submit");
+ #endif
+ 
++  // TT-Metal traces retain addresses used by temporary tensors. A stateful
++  // Gated Delta prefill allocates buffers outside the decode trace, so release
++  // cached traces before running it. Decode will capture a fresh trace after
++  // prefill and replay it for the rest of the request.
++  const ::tt::target::ttnn::Program *program =
++      utils::getProgram(executableHandle, programIndex);
++  for (const ::tt::target::ttnn::Operation *op : *program->operations()) {
++    if (op->type_type() == ::tt::target::ttnn::OpType::GatedDeltaRuleOp) {
++      deviceHandle.getTraceCache()->as<TraceCache>(DeviceRuntime::TTNN)
++          .clear();
++      break;
++    }
++  }
++
+   std::unique_ptr<ProgramExecutor> executor = std::make_unique<ProgramExecutor>(
+       deviceHandle, executableHandle, programIndex, inputs);
+ 

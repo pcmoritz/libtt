@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..f02bd9f
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,164 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -37,8 +37,6 @@ index 0000000..f02bd9f
 +    constexpr uint32_t scaled_delta = tt::CBIndex::c_10;
 +    constexpr uint32_t state_new = tt::CBIndex::c_11;
 +    constexpr uint32_t output = tt::CBIndex::c_12;
-+    constexpr uint32_t outer = tt::CBIndex::c_13;
-+    constexpr uint32_t state_output = tt::CBIndex::c_14;
 +
 +    // Configure the FP32 unpack/pack paths before the first compute API call.
 +    mm_init(key, state, value_read);
@@ -114,26 +112,15 @@ index 0000000..f02bd9f
 +    cb_reserve_back(state_new, state_tiles);
 +    for (uint32_t row = 0; row < kt; ++row) {
 +        for (uint32_t column = 0; column < vt; ++column) {
-+            cb_reserve_back(outer, 1);
-+            mm_init(key_transposed, scaled_delta, outer);
 +            tile_regs_acquire();
++            copy_tile_to_dst_init_short(state_mid);
++            copy_tile(state_mid, row * vt + column, 0);
++            mm_init_short(key_transposed, scaled_delta);
 +            matmul_tiles(key_transposed, scaled_delta, row, column, 0);
-+            tile_regs_commit();
-+            tile_regs_wait();
-+            pack_tile(0, outer);
-+            tile_regs_release();
-+            cb_push_back(outer, 1);
-+
-+            cb_wait_front(outer, 1);
-+            binary_op_init_common(state_mid, outer, state_new);
-+            add_tiles_init(state_mid, outer);
-+            tile_regs_acquire();
-+            add_tiles(state_mid, outer, row * vt + column, 0, 0);
 +            tile_regs_commit();
 +            tile_regs_wait();
 +            pack_tile(0, state_new, row * vt + column);
 +            tile_regs_release();
-+            cb_pop_front(outer, 1);
 +        }
 +    }
 +    cb_push_back(state_new, state_tiles);
@@ -172,21 +159,7 @@ index 0000000..f02bd9f
 +    }
 +    cb_push_back(output, vt);
 +    cb_pop_front(value_read, vt);
-+
-+    // Give the writer its own copy after the output matmul has finished reading.
-+    copy_tile_to_dst_init_short(state_new);
-+    pack_reconfig_data_format(output, state_output);
-+    cb_reserve_back(state_output, state_tiles);
-+    for (uint32_t tile = 0; tile < state_tiles; ++tile) {
-+        tile_regs_acquire();
-+        copy_tile(state_new, tile, 0);
-+        tile_regs_commit();
-+        tile_regs_wait();
-+        pack_tile(0, state_output, tile);
-+        tile_regs_release();
-+    }
-+    cb_push_back(state_output, state_tiles);
-+    cb_pop_front(state_new, state_tiles);
++    pack_reconfig_data_format(output, state_mid);
 +
 +    cb_pop_front(query, kt);
 +    cb_pop_front(key, kt);
@@ -200,7 +173,7 @@ new file mode 100644
 index 0000000..4996063
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,209 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -317,27 +290,23 @@ index 0000000..4996063
 +    CircularBuffer has_initial_state_cb(tt::CBIndex::c_17);
 +    Noc noc;
 +
++    // Metadata is shared by every head handled by this core.
++    state_indices_cb.reserve_back(1);
++    has_initial_state_cb.reserve_back(1);
++    noc.async_read(state_indices, state_indices_cb, index_tile_bytes,
++                   {.page_id = 0}, {.offset_bytes = 0});
++    noc.async_read(has_initial_state, has_initial_state_cb, flag_tile_bytes,
++                   {.page_id = 0}, {.offset_bytes = 0});
++    noc.async_read_barrier();
++
 +    for (uint32_t work = worker; work < batch_size * num_heads; work += num_workers) {
 +    const uint32_t batch = work / num_heads;
 +    const uint32_t head = work % num_heads;
 +
-+    state_indices_cb.reserve_back(1);
-+    noc.async_read(state_indices, state_indices_cb, index_tile_bytes,
-+                   {.page_id = 0}, {.offset_bytes = 0});
-+    noc.async_read_barrier();
 +    const uint32_t state_slot =
 +        read_int32_tile(state_indices_cb.get_write_ptr(), 0, batch);
-+    state_indices_cb.push_back(1);
-+    state_indices_cb.pop_front(1);
-+
-+    has_initial_state_cb.reserve_back(1);
-+    noc.async_read(has_initial_state, has_initial_state_cb, flag_tile_bytes,
-+                   {.page_id = 0}, {.offset_bytes = 0});
-+    noc.async_read_barrier();
 +    const bool has_state =
 +        read_bfloat16_tile(has_initial_state_cb.get_write_ptr(), 0, batch);
-+    has_initial_state_cb.push_back(1);
-+    has_initial_state_cb.pop_front(1);
 +
 +    const uint32_t state_base = (state_slot * num_heads + head) * state_tiles;
 +    state_cb.reserve_back(state_tiles);
@@ -350,11 +319,7 @@ index 0000000..4996063
 +                {.page_id = state_base + tile},
 +                {.offset_bytes = tile * tile_bytes});
 +        }
-+        noc.async_read_barrier();
-+    } else {
-+        zero_tiles(state_cb.get_write_ptr(), state_tiles);
 +    }
-+    state_cb.push_back(state_tiles);
 +
 +    const uint32_t vector_base = (batch * num_heads + head) * kt;
 +    query_cb.reserve_back(kt);
@@ -366,8 +331,6 @@ index 0000000..4996063
 +            {.page_id = vector_base + tile},
 +            {.offset_bytes = tile * tile_bytes});
 +    }
-+    noc.async_read_barrier();
-+    query_cb.push_back(kt);
 +
 +    key_cb.reserve_back(kt);
 +    key_transposed_cb.reserve_back(kt);
@@ -379,14 +342,6 @@ index 0000000..4996063
 +            {.page_id = vector_base + tile},
 +            {.offset_bytes = tile * tile_bytes});
 +    }
-+    noc.async_read_barrier();
-+    for (uint32_t tile = 0; tile < kt; ++tile) {
-+        transpose_row_tile(
-+            key_cb.get_write_ptr() + tile * tile_bytes,
-+            key_transposed_cb.get_write_ptr() + tile * tile_bytes);
-+    }
-+    key_cb.push_back(kt);
-+    key_transposed_cb.push_back(kt);
 +
 +    const uint32_t value_base = (batch * num_heads + head) * vt;
 +    value_cb.reserve_back(vt);
@@ -398,8 +353,6 @@ index 0000000..4996063
 +            {.page_id = value_base + tile},
 +            {.offset_bytes = tile * tile_bytes});
 +    }
-+    noc.async_read_barrier();
-+    value_cb.push_back(vt);
 +
 +    const uint32_t scalar_page =
 +        (batch / 32) * ((num_heads + 31) / 32) + head / 32;
@@ -407,13 +360,25 @@ index 0000000..4996063
 +    const uint32_t scalar_column = head % 32;
 +    beta_cb.reserve_back(1);
 +    noc.async_read(beta, beta_cb, tile_bytes, {.page_id = scalar_page}, {.offset_bytes = 0});
-+    noc.async_read_barrier();
-+    make_scalar_tile(beta_cb.get_write_ptr(), scalar_row, scalar_column);
-+    beta_cb.push_back(1);
-+
 +    decay_cb.reserve_back(1);
 +    noc.async_read(decay, decay_cb, tile_bytes, {.page_id = scalar_page}, {.offset_bytes = 0});
 +    noc.async_read_barrier();
++
++    if (!has_state) {
++        zero_tiles(state_cb.get_write_ptr(), state_tiles);
++    }
++    state_cb.push_back(state_tiles);
++    query_cb.push_back(kt);
++    for (uint32_t tile = 0; tile < kt; ++tile) {
++        transpose_row_tile(
++            key_cb.get_write_ptr() + tile * tile_bytes,
++            key_transposed_cb.get_write_ptr() + tile * tile_bytes);
++    }
++    key_cb.push_back(kt);
++    key_transposed_cb.push_back(kt);
++    value_cb.push_back(vt);
++    make_scalar_tile(beta_cb.get_write_ptr(), scalar_row, scalar_column);
++    beta_cb.push_back(1);
 +    make_scalar_tile(decay_cb.get_write_ptr(), scalar_row, scalar_column);
 +    decay_cb.push_back(1);
 +    }
@@ -423,7 +388,7 @@ new file mode 100644
 index 0000000..8b39696
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,80 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -449,60 +414,59 @@ index 0000000..8b39696
 +    const uint32_t state_indices_address = get_arg_val<uint32_t>(3);
 +
 +    constexpr auto output_args = TensorAccessorArgs<5>();
-+    constexpr auto state_args = TensorAccessorArgs<output_args.next_compile_time_args_offset()>();
-+    constexpr auto state_indices_args = TensorAccessorArgs<state_args.next_compile_time_args_offset()>();
++    constexpr auto state_args =
++        TensorAccessorArgs<output_args.next_compile_time_args_offset()>();
++    constexpr auto state_indices_args =
++        TensorAccessorArgs<state_args.next_compile_time_args_offset()>();
 +    const auto output = TensorAccessor(output_args, output_address, output_tile_bytes);
 +    const auto state = TensorAccessor(state_args, state_address, state_tile_bytes);
-+    constexpr uint32_t index_tile_bytes = 4096;
 +    const auto state_indices =
-+        TensorAccessor(state_indices_args, state_indices_address, index_tile_bytes);
++        TensorAccessor(state_indices_args, state_indices_address, 4096);
 +
 +    CircularBuffer output_cb(tt::CBIndex::c_12);
-+    CircularBuffer state_cb(tt::CBIndex::c_14);
++    CircularBuffer state_cb(tt::CBIndex::c_11);
 +    CircularBuffer state_indices_cb(tt::CBIndex::c_29);
 +    Noc noc;
 +
 +    for (uint32_t work = worker; work < batch_size * num_heads; work += num_workers) {
-+    const uint32_t batch = work / num_heads;
-+    const uint32_t head = work % num_heads;
-+    const uint32_t vector_base = (batch * num_heads + head) * vt;
-+    output_cb.wait_front(vt);
-+    for (uint32_t tile = 0; tile < vt; ++tile) {
-+        noc.async_write(
-+            output_cb,
-+            output,
-+            output_tile_bytes,
-+            {.offset_bytes = tile * output_tile_bytes},
-+            {.page_id = vector_base + tile});
-+    }
-+    noc.async_write_barrier();
-+    output_cb.pop_front(vt);
++        const uint32_t batch = work / num_heads;
++        const uint32_t head = work % num_heads;
++        const uint32_t vector_base = (batch * num_heads + head) * vt;
 +
-+    state_indices_cb.reserve_back(1);
-+    noc.async_read(state_indices, state_indices_cb, index_tile_bytes,
-+                   {.page_id = 0}, {.offset_bytes = 0});
-+    noc.async_read_barrier();
-+    const volatile tt_l1_ptr uint32_t* index_tile =
-+        reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(
-+            state_indices_cb.get_write_ptr());
-+    const uint32_t index_face = batch / 16;
-+    const uint32_t index_offset = index_face * 256 + batch % 16;
-+    const uint32_t state_slot = index_tile[index_offset];
-+    state_indices_cb.push_back(1);
-+    state_indices_cb.pop_front(1);
++        state_indices_cb.reserve_back(1);
++        noc.async_read(
++            state_indices, state_indices_cb, 4096,
++            {.page_id = 0}, {.offset_bytes = 0});
++        noc.async_read_barrier();
++        const volatile tt_l1_ptr uint32_t* index_tile =
++            reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(
++                state_indices_cb.get_write_ptr());
++        const uint32_t index_offset =
++            (batch / 16) * 256 + batch % 16;
++        const uint32_t state_slot = index_tile[index_offset];
++        state_indices_cb.push_back(1);
++        state_indices_cb.pop_front(1);
 +
-+    const uint32_t state_base = (state_slot * num_heads + head) * state_tiles;
-+    state_cb.wait_front(state_tiles);
-+    for (uint32_t tile = 0; tile < state_tiles; ++tile) {
-+        noc.async_write(
-+            state_cb,
-+            state,
-+            state_tile_bytes,
-+            {.offset_bytes = tile * state_tile_bytes},
-+            {.page_id = state_base + tile});
-+    }
-+    noc.async_write_barrier();
-+    state_cb.pop_front(state_tiles);
++        const uint32_t state_base =
++            (state_slot * num_heads + head) * state_tiles;
++
++        output_cb.wait_front(vt);
++        state_cb.wait_front(state_tiles);
++        for (uint32_t tile = 0; tile < vt; ++tile) {
++            noc.async_write(
++                output_cb, output, output_tile_bytes,
++                {.offset_bytes = tile * output_tile_bytes},
++                {.page_id = vector_base + tile});
++        }
++        for (uint32_t tile = 0; state_slot != 0 && tile < state_tiles; ++tile) {
++            noc.async_write(
++                state_cb, state, state_tile_bytes,
++                {.offset_bytes = tile * state_tile_bytes},
++                {.page_id = state_base + tile});
++        }
++        noc.async_write_barrier();
++        output_cb.pop_front(vt);
++        state_cb.pop_front(state_tiles);
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
@@ -510,7 +474,7 @@ new file mode 100644
 index 0000000..bc98788
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,309 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -639,10 +603,7 @@ index 0000000..bc98788
 +
 +DecodeOperation::tensor_return_value_t DecodeOperation::create_output_tensors(
 +    const operation_attributes_t&, const tensor_args_t& in) {
-+    return {
-+        in.output,
-+        create_device_tensor(in.state.tensor_spec(), in.state.device()),
-+    };
++    return {in.output, in.state};
 +}
 +
 +ttsl::hash::hash_t DecodeOperation::compute_program_hash(
@@ -686,10 +647,8 @@ index 0000000..bc98788
 +    make_cb(8, vt);           // delta
 +    make_cb(9, kt);           // transposed key
 +    make_cb(10, vt);          // scaled delta
-+    make_cb(11, state_tiles); // updated state used by output matmul
++    make_cb(11, state_tiles); // updated state
 +    make_cb(12, vt, tt::DataFormat::Float16_b); // output
-+    make_cb(13, 1);           // outer-product tile
-+    make_cb(14, state_tiles); // updated state for writer
 +    make_cb(15, 1, tt::DataFormat::Int32);      // state index (reader)
 +    make_cb(17, 1, tt::DataFormat::Float16_b);  // has-initial-state flag
 +    make_cb(29, 1, tt::DataFormat::Int32);      // state index (writer)

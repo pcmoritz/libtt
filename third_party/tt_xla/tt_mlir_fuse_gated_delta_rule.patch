@@ -176,17 +176,18 @@ diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pip
 index ec7bfe8..e612e7f 100644
 --- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
 +++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
-@@ -20,7 +20,9 @@
+@@ -20,7 +20,10 @@
  #include "mlir/Dialect/Linalg/Passes.h"
  #include "mlir/Dialect/SCF/Transforms/Passes.h"
  #include "mlir/InitAllDialects.h"
 +#include "mlir/IR/BuiltinAttributes.h"
  #include "mlir/InitAllPasses.h"
 +#include "mlir/Interfaces/SideEffectInterfaces.h"
++#include "mlir/Transforms/RegionUtils.h"
  #include "mlir/Pass/PassManager.h"
  #include "mlir/Pass/PassRegistry.h"
  #include "mlir/Tools/mlir-opt/MlirOptMain.h"
-@@ -33,6 +35,7 @@
+@@ -33,6 +36,7 @@
  #include "ttmlir/Transforms/Passes.h"
  
  #ifdef TTMLIR_ENABLE_STABLEHLO
@@ -194,7 +195,7 @@ index ec7bfe8..e612e7f 100644
  #include "stablehlo/conversions/linalg/transforms/Passes.h"
  #include "stablehlo/transforms/Passes.h"
  #include "stablehlo/transforms/optimization/Passes.h"
-@@ -57,6 +60,342 @@ namespace mlir::tt::ttir {
+@@ -57,6 +61,334 @@ namespace mlir::tt::ttir {
  
  #ifdef TTMLIR_ENABLE_STABLEHLO
  
@@ -519,16 +520,8 @@ index ec7bfe8..e612e7f 100644
 +      return;
 +    }
 +
-+    bool erased;
-+    do {
-+      erased = false;
-+      getOperation().walk<WalkOrder::PostOrder>([&](Operation *op) {
-+        if (op != getOperation() && isOpTriviallyDead(op)) {
-+          op->erase();
-+          erased = true;
-+        }
-+      });
-+    } while (erased);
++    IRRewriter rewriter(&getContext());
++    (void)runRegionDCE(rewriter, getOperation()->getRegions());
 +  }
 +};
 +
@@ -537,11 +530,12 @@ index ec7bfe8..e612e7f 100644
  void createStableHLOToTTIRPipeline(
      OpPassManager &pm, const StableHLOToTTIRPipelineOptions &options) {
    if (options.arithDialectConversionsEnabled) {
-@@ -81,6 +420,8 @@ void createStableHLOToTTIRPipeline(
+@@ -81,6 +413,9 @@ void createStableHLOToTTIRPipeline(
      pm.addPass(::mlir::stablehlo::createStablehloLegalizeCompositeToCallPass());
    }
    pm.addPass(mlir::createInlinerPass());
 +  pm.addPass(std::make_unique<FuseQwenGatedDeltaLoopPass>());
++  pm.addPass(mlir::createCanonicalizerPass());
 +  pm.addPass(std::make_unique<UnrollSearchsortedPass>());
  
    ttir::ConvertStableHLOToTTIROptions passOptions;
