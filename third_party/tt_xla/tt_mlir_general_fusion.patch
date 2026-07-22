@@ -5,10 +5,10 @@ diff --git a/include/ttmlir/Dialect/TTIR/Transforms/Passes.td b/include/ttmlir/D
               "enable-permute-slice-after-matmul-fusion",
               "bool", /*default=*/"true",
               "Push a matmul/linear output slice into the operand producing the sliced dim">,
-+      Option<"ropeFusionEnabled",
-+             "enable-rope-fusion",
++      Option<"specializedFusionEnabled",
++             "enable-specialized-fusion",
 +             "bool", /*default=*/"true",
-+             "Fuse primitive rotary embedding graphs into a named composite">,
++             "Fuse primitive graphs into specialized named operations">,
    ];
  }
 
@@ -38,16 +38,30 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
 
    auto shardMemref =
        MemRefType::get(shardShape, memrefType.getElementType(),
-@@ -89,7 +92,7 @@ static ttnn::TTNNLayoutAttr getTTNNLayoutFromDeviceLayout(MLIRContext *ctx,
+@@ -89,7 +92,14 @@ static ttnn::TTNNLayoutAttr getTTNNLayoutFromDeviceLayout(MLIRContext *ctx,
      auto virtMap = d2m::utils::getVirtualGridForwardMapping(memrefValue);
 
      if (!virtMap) {
 -      ttnnGridShape.assign(gridShape.begin(), gridShape.end());
+-      memLayoutEnum = ttnn::TensorMemoryLayout::BlockSharded;
 +      ttnnGridShape = ttcore::collapseGridTo2D(gridShape);
-       memLayoutEnum = ttnn::TensorMemoryLayout::BlockSharded;
++      if (bufferType == ttnn::BufferType::DRAM && ttnnGridShape[0] == 1) {
++        memLayoutEnum = ttnn::TensorMemoryLayout::WidthSharded;
++      } else if (bufferType == ttnn::BufferType::DRAM &&
++                 ttnnGridShape[1] == 1) {
++        memLayoutEnum = ttnn::TensorMemoryLayout::HeightSharded;
++      } else {
++        memLayoutEnum = ttnn::TensorMemoryLayout::BlockSharded;
++      }
      } else {
        auto physicalGrid = d2m::utils::getPhysicalGridShape(memrefValue);
-@@ -464,10 +467,6 @@ materializeIntermediateTensor(memref::AllocOp op, IRRewriter &rewriter,
+@@ -307 +307 @@ static SmallVector<mlir::Attribute> createKernelDescriptors(
+-    const ttmetal::MathFidelity mathFidelity,
++    const ttmetal::MathFidelity mathFidelity, bool fp32DestAccum,
+@@ -347 +347 @@ static SmallVector<mlir::Attribute> createKernelDescriptors(
+-          /*fp32DestAccum*/ false,
++          fp32DestAccum,
+@@ -464,10 +477,6 @@ materializeIntermediateTensor(memref::AllocOp op, IRRewriter &rewriter,
        auto castLayoutAttr =
            mlir::cast<ttnn::TTNNLayoutAttr>(castResultType.getEncoding());
 
@@ -58,6 +72,17 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
        TT_assertv(castLayoutAttr.getBufferType() ==
                       convertedLayoutAttr.getBufferType(),
                   "ttnn_metal_layout_cast and converted type must have the same "
+@@ -731,4 +740,9 @@ static LogicalResult convertGenericOp(
+   const auto arch = ttcore::getOpChipDescAttr(op).getArch().getValue();
++  bool fp32DestAccum = llvm::any_of(op.getInputsAndOutputs(), [](Value value) {
++    return ttcore::getNumberOfBits(ttcore::elementTypeToDataType(
++               ttcore::getOperandInnerElementType(value))) == 32;
++  });
+   SmallVector<mlir::Attribute> kernelDescriptors = createKernelDescriptors(
+       rewriter, op.getThreads(), coreRangeSet, opSymTable, mathFidelity,
+-      semIndexMap, additionalArgMapping, cbOperandIndexToPortMapping, arch);
++      fp32DestAccum, semIndexMap, additionalArgMapping,
++      cbOperandIndexToPortMapping, arch);
 @@ -1049,6 +1048,21 @@ static LogicalResult cleanupAndVerify(ModuleOp moduleOp,
        return;
      }
@@ -145,13 +170,15 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
    static void copyVirtualGridAttrs(d2m::EmptyOp dst, d2m::EmptyOp src) {
      if (auto attr = src.getVirtualGridInverseMappingAttr()) {
        dst.setVirtualGridInverseMappingAttr(attr);
-@@ -320,34 +336,53 @@ protected:
+@@ -320,34 +336,55 @@ protected:
      bool isTTNN = isTTNNTensor(value.getType());
      if (isTTNN) {
        assert(ttnnMode && "Unexpected TTNN tensor as op operand");
 +      auto ttnnTensorType =
 +          mlir::cast<mlir::RankedTensorType>(value.getType());
        auto metalTensorType = getMetalTensorFromTTNNTensor(rewriter, value);
++      auto requestedMetalRank = noCollapse ? 2 * ttnnTensorType.getRank()
++                                           : metalTensorType.getRank();
 -      auto metalCastOp = rewriter.create<ttir::TTNNMetalLayoutCastOp>(
 -          value.getLoc(), metalTensorType, value);
 +      ttir::TTNNMetalLayoutCastOp metalCastOp;
@@ -221,7 +248,30 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
          }
        }
 
-@@ -368,12 +403,23 @@ protected:
+@@ -354,10 +391,15 @@ protected:
+-      ttcore::MemorySpace metalTensorMemSpace =
+-          mlir::cast<ttcore::MetalLayoutAttr>(metalTensorType.getEncoding())
+-              .getMemorySpace();
+-      if (metalTensorMemSpace == ttcore::MemorySpace::DeviceL1) {
+-        // Reblock L1 operand to unit grid to align with other operands while
+-        // preserving original TTNN tensor shape. These views will be removed in
+-        // GridSelection by insertTTNNDRAMViews().
++      auto metalTensorLayout =
++          mlir::cast<ttcore::MetalLayoutAttr>(metalTensorType.getEncoding());
++      ttcore::MemorySpace metalTensorMemSpace =
++          metalTensorLayout.getMemorySpace();
++      bool needsF32DRAMView =
++          metalTensorLayout.getMemoryLayout() ==
++              ttcore::TensorMemoryLayout::Interleaved &&
++          mlir::isa<Float32Type>(
++              ttcore::getOperandInnerElementType(metalValue));
++      if (metalTensorMemSpace == ttcore::MemorySpace::DeviceL1 ||
++          needsF32DRAMView) {
++        // Keep f32 DRAM backing interleaved while selecting a worker grid.
+         llvm::SmallVector<int64_t> unitGrid(
+             metalTensorType.getShape().size() / 2, 1);
+         auto [newTensorShape, reblockMap] =
+@@ -368,12 +412,21 @@ protected:
              newTensorShape, metalTensorType.getElementType(),
              metalTensorType.getEncoding());
          auto unitReblockingView = rewriter.create<d2m::ViewLayoutOp>(
@@ -233,9 +283,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +      }
 +      bool hasRequestedTiling =
 +          tiled == mlir::isa<ttcore::TileType>(metalTensorType.getElementType());
-+      bool hasRequestedRank =
-+          !noCollapse ||
-+          metalTensorType.getRank() == 2 * ttnnTensorType.getRank();
++      bool hasRequestedRank = metalTensorType.getRank() == requestedMetalRank;
 +      if (metalTensorMemSpace == memSpace && hasRequestedTiling &&
 +          hasRequestedRank) {
 +        return metalValue;
@@ -249,7 +297,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      }
 
      auto tensorType = mlir::cast<mlir::RankedTensorType>(value.getType());
-@@ -422,8 +468,9 @@ protected:
+@@ -422,8 +473,9 @@ protected:
      llvm::SmallVector<int64_t> shardedShape =
          layout.getDeviceShape(placeholderTensorGrid, tileShape);
 
@@ -261,7 +309,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 
      // For ND tensors (logicalShape.size() > 2), set placeholder virtual grid
      // mappings on the EmptyOp.  These will be replaced when GridSelection
-@@ -1234,7 +1281,8 @@ private:
+@@ -1234,7 +1286,8 @@ private:
 
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
@@ -271,7 +319,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      const std::size_t numInputs = inputs.size();
      const std::size_t numOutputs = outputs.size();
      const std::size_t numOperands = (numInputs + numOutputs);
-@@ -1610,7 +1658,7 @@ private:
+@@ -1610,7 +1663,7 @@ private:
 
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
@@ -280,7 +328,144 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      assert(inputs.size() == 1);
      assert(outputs.size() == 1);
 
-@@ -2936,11 +2984,11 @@ public:
+@@ -2140,11 +2193,22 @@ private:
+     const bool hasScaler = isFloat;
+     SmallVector<mlir::Value> newInputs(origInputs.begin(), origInputs.end());
+     if (hasScaler) {
+       newInputs.emplace_back(this->createScaler(rewriter, loc, inputTensorType,
+                                                 getScaleValue(op)));
+     }
+-    bool noCollapse = (inputTensorType.getRank() > 2);
+-
++    mlir::ArrayAttr reductionDims = getDimArg(op);
++    bool reducesOnlyLastDim =
++        reductionDims.size() == 1 &&
++        normalizeReductionDimIndex(
++            mlir::cast<mlir::IntegerAttr>(reductionDims[0]).getInt(),
++            inputTensorType.getRank()) == inputTensorType.getRank() - 1;
++    bool noCollapse = inputTensorType.getRank() > 2 && !reducesOnlyLastDim;
++    int64_t tileWidth = ttcore::TileType::getDefaultShape()[1];
++    ttcore::OOBVal oobVal =
++        reducesOnlyLastDim && inputTensorType.getShape().back() % tileWidth == 0
++            ? ttcore::OOBVal::Undef
++            : getReductionOOBVal();
++
+     auto [inputs, outputs] = toLayoutOperandsAndResults(
+         rewriter, {newInputs, origOutputs},
+-        /*tiled*/ true, noCollapse, getReductionOOBVal());
++        /*tiled=*/true, noCollapse, oobVal);
+@@ -2156,11 +2220,12 @@ private:
+     const std::size_t physicalRank =
+         ttcore::getDeviceLayout(outputs[0]).getRank() / 2;
+     assertPhysicalIteratorRankForReduction(physicalRank);
+ 
+-    SmallVector<mlir::AffineMap> indexingMaps =
+-        getAffineMapsArray(rewriter, op, numOperands, physicalRank, hasScaler);
+-    SmallVector<mlir::Attribute> iteratorTypes =
+-        getIteratorTypesArray(rewriter, op, physicalRank);
++    SmallVector<mlir::AffineMap> indexingMaps = getAffineMapsArray(
++        rewriter, op, numOperands, physicalRank, hasScaler,
++        reducesOnlyLastDim);
++    SmallVector<mlir::Attribute> iteratorTypes = getIteratorTypesArray(
++        rewriter, op, physicalRank, reducesOnlyLastDim);
+ 
+     // Create 'd2m.generic' accepting extended operands.
+     auto generic = rewriter.create<d2m::GenericOp>(
+@@ -2187,14 +2252,15 @@ private:
+         // Create 'linalg.generic' accepting 'blockArgs'.
+ 
+         SmallVector<mlir::AffineMap> linalgIndexingMaps = getAffineMapsArray(
+-            rewriter, op, numOperands, physicalRank, hasScaler);
++            rewriter, op, numOperands, physicalRank, hasScaler,
++            reducesOnlyLastDim);
+         SmallVector<mlir::utils::IteratorType> linalgIteratorTypes =
+             iteratorTypeTTIRToLinalg(rewriter, iteratorTypes);
+ 
+         // Propagate attributes.
+ 
+-        auto reduceDimAttr =
+-            d2m::ReduceDimAttr::get(ctx, dimArgAsReduceDim(op, physicalRank));
++        auto reduceDimAttr = d2m::ReduceDimAttr::get(
++            ctx, dimArgAsReduceDim(op, physicalRank, reducesOnlyLastDim));
+ 
+         auto linalgGeneric = rewriter.create<mlir::linalg::GenericOp>(
+             loc,
+@@ -2257,7 +2323,8 @@ private:
+ 
+   static SmallVector<mlir::AffineMap>
+   getAffineMapsArray(mlir::OpBuilder &builder, ConcreteOp op, std::size_t arity,
+-                     std::size_t rank, bool hasScaler) {
++                     std::size_t rank, bool hasScaler,
++                     bool collapsedLastDimReduction) {
+     mlir::ArrayAttr dimArg = getDimArg(op);
+ 
+     mlir::AffineExpr zero =
+@@ -2264,7 +2331,8 @@ private:
+         mlir::getAffineConstantExpr(0, builder.getContext());
+ 
+     mlir::MutableAffineMap accumulator(builder.getMultiDimIdentityMap(rank));
+-    forAllDims(rank, dimArg, [&](std::size_t index, bool dropped) {
++    forAllDims(rank, dimArg, collapsedLastDimReduction,
++               [&](std::size_t index, bool dropped) {
+       if (dropped) {
+         accumulator.setResult(index, zero);
+       }
+@@ -2288,7 +2356,7 @@ private:
+ 
+   static SmallVector<mlir::Attribute>
+   getIteratorTypesArray(mlir::OpBuilder &builder, ConcreteOp op,
+-                        std::size_t rank) {
++                        std::size_t rank, bool collapsedLastDimReduction) {
+     mlir::ArrayAttr dimArg = getDimArg(op);
+ 
+     auto parallel = ttcore::IteratorTypeAttr::get(
+@@ -2297,7 +2365,8 @@ private:
+         builder.getContext(), ttcore::IteratorType::Reduction);
+ 
+     SmallVector<mlir::Attribute> iterators(rank, parallel);
+-    forAllDims(rank, dimArg, [&](std::size_t index, bool dropped) {
++    forAllDims(rank, dimArg, collapsedLastDimReduction,
++               [&](std::size_t index, bool dropped) {
+       if (dropped) {
+         iterators[index] = reduction;
+       }
+@@ -2326,9 +2395,10 @@ private:
+   /// Map `dim_arg` to a `ReduceDim` over the last two (tile C/R) dimensions.
+   /// Outer-only reductions should have matched
+   /// `D2MNamedAccumReductionRewriter`.
+-  static d2m::ReduceDim dimArgAsReduceDim(ConcreteOp op, std::size_t rank) {
++  static d2m::ReduceDim dimArgAsReduceDim(ConcreteOp op, std::size_t rank,
++                                          bool collapsedLastDimReduction) {
+     SmallVector<bool> dims(rank, false);
+-    forAllDims(rank, getDimArg(op),
++    forAllDims(rank, getDimArg(op), collapsedLastDimReduction,
+                [&](std::size_t index, bool dropped) { dims[index] = dropped; });
+ 
+     bool reduceSecondToLast = dims[rank - 2]; // "C" in tile terminology
+@@ -2354,13 +2424,18 @@ private:
+ 
+   template <typename F>
+-  static void forAllDims(std::size_t rank, mlir::ArrayAttr dimArg, F &&fn) {
++  static void forAllDims(std::size_t rank, mlir::ArrayAttr dimArg,
++                         bool collapsedLastDimReduction, F &&fn) {
+     SmallVector<bool> dims(rank, false);
+-    for (auto reduceDim : dimArg) {
+-      int64_t dim = mlir::cast<IntegerAttr>(reduceDim).getInt();
+-      dims[normalizeReductionDimIndex(dim, rank)] = true;
++    if (collapsedLastDimReduction) {
++      dims.back() = true;
++    } else {
++      for (auto reduceDim : dimArg) {
++        int64_t dim = mlir::cast<IntegerAttr>(reduceDim).getInt();
++        dims[normalizeReductionDimIndex(dim, rank)] = true;
++      }
+     }
+     for (std::size_t d = 0; d < rank; ++d) {
+       std::forward<F>(fn)(d, dims[d]);
+     }
+   }
+ };
+@@ -2936,11 +3000,11 @@ public:
    D2MConcatRewriter(const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
                      ttcore::MemorySpace defaultInputMemSpace,
                      ttcore::MemorySpace defaultOutputMemSpace,
@@ -294,7 +479,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                                 enableMulticastInference) {}
 
    LogicalResult
-@@ -3042,9 +3090,12 @@ public:
+@@ -3042,9 +3095,12 @@ public:
 
      auto origOutputs = createDpsOutputs(loc, rewriter, {effectiveOutputType});
 
@@ -308,7 +493,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 
      auto compositeView = rewriter.create<d2m::CompositeViewOp>(
          loc, outputs[0].getType(), inputs, dim, logicalSizesAttr);
-@@ -4695,12 +4746,13 @@ public:
+@@ -4695,12 +4751,13 @@ public:
                                    mlir::MLIRContext *ctx,
                                    ttcore::MemorySpace defaultInputMemSpace,
                                    ttcore::MemorySpace defaultOutputMemSpace,
@@ -324,11 +509,13 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 
    LogicalResult
    matchAndRewrite(TensorManipulationOp op,
-@@ -4715,6 +4767,85 @@ public:
+@@ -4715,6 +4772,81 @@ public:
      }
 
      TensorManipulationInfo info = LogicalInfoFn(op);
-+    if (ttnnMode && preferCollapsedViews && info.canBeTilized) {
++    if (ttnnMode && preferCollapsedViews &&
++        (info.canBeTilized ||
++         std::is_same_v<TensorManipulationOp, ttir::ReshapeOp>)) {
 +      if constexpr (std::is_same_v<TensorManipulationOp,
 +                                   ttir::SliceStaticOp>) {
 +        auto begins = extractFromIntegerArrayAttr<int32_t>(op.getBegins());
@@ -377,14 +564,9 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +      }
 +
 +      if constexpr (std::is_same_v<TensorManipulationOp, ttir::ReshapeOp>) {
-+        auto inputType =
-+            mlir::cast<RankedTensorType>(op.getInput().getType());
 +        auto resultType =
 +            mlir::cast<RankedTensorType>(op.getResult().getType());
-+        if (inputType.getRank() >= 2 && resultType.getRank() >= 2 &&
-+            inputType.getShape().take_back(2) ==
-+                resultType.getShape().take_back(2)) {
-+          Value input = createOptimalLayoutOp(
++        Value input = createOptimalLayoutOp(
 +              adaptor.getInput(), memorySpaces[0], /*tiled=*/true,
 +              /*noCollapse=*/false, rewriter);
 +          auto inputMetalType =
@@ -403,14 +585,13 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +                                                  resultType));
 +            return success();
 +          }
-+        }
 +      }
 +    }
 +
      AffineMap deviceMap =
          projectLogicalMapToUnitDeviceSpace(rewriter, info.map);
 
-@@ -4797,6 +4928,9 @@ public:
+@@ -4797,6 +4929,9 @@ public:
      return AffineMap::get(outputDeviceRank, 0, deviceExprs,
                            builder.getContext());
    }
@@ -420,7 +601,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  };
  } // namespace
 
-@@ -4833,22 +4967,31 @@ static TensorManipulationInfo sliceLogicalInfo(ttir::SliceStaticOp op) {
+@@ -4833,22 +4968,31 @@ static TensorManipulationInfo sliceLogicalInfo(ttir::SliceStaticOp op) {
    assert(begins.size() ==
           static_cast<size_t>(op.getResult().getType().getRank()));
 
@@ -462,7 +643,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
    return {map, canBeTilized};
  }
 
-@@ -6029,6 +6172,65 @@ public:
+@@ -6029,6 +6173,70 @@ public:
 
      if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
        signalPassFailure();
@@ -470,7 +651,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +    }
 +
 +    // Internal TTNN casts are representational bridges that keep producer and
-+    // consumer Metal values connected for fusion.  Function results, however,
++    // consumer Metal values connected for fusion. Function results, however,
 +    // must own a concrete buffer in the surrounding TTNN layout.
 +    D2MNamedRewriterCommon boundaryLayout(
 +        ttcore::MemorySpace::DeviceDRAM,
@@ -492,6 +673,11 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +        if (!sourceType || !resultType ||
 +            !mlir::isa_and_nonnull<ttcore::MetalLayoutAttr>(
 +                sourceType.getEncoding())) {
++          continue;
++        }
++        // F32 DRAM values retain their virtual-grid mapping across this cast.
++        if (mlir::isa<Float32Type>(
++                ttcore::getOperandInnerElementType(castOp.getInput()))) {
 +          continue;
 +        }
 +        Type elementType = sourceType.getElementType();
@@ -591,6 +777,34 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
  }
 
  } // namespace mlir::tt
+diff --git a/include/ttmlir/Dialect/D2M/Transforms/Passes.td b/include/ttmlir/Dialect/D2M/Transforms/Passes.td
+--- a/include/ttmlir/Dialect/D2M/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/D2M/Transforms/Passes.td
+@@ -69,6 +69,8 @@ def D2MGenericFusion : Pass<"d2m-generic-fusion", "::mlir::ModuleOp"> {
+   list<Option> options = [
+     Option<"enableEltwiseReductionFusion", "enable-eltwise-reduction-fusion", "bool", "false",
+            "Enable fusion of an elementwise d2m.generic producer into a reduction d2m.generic consumer (single reduction dim).">,
++    Option<"enableElementwiseFusion", "enable-elementwise-fusion", "bool", "true",
++           "Enable fusion between elementwise d2m.generic operations.">,
+   ];
+
+   let dependentDialects = [
+diff --git a/lib/Dialect/D2M/Analysis/GridAnalysis.cpp b/lib/Dialect/D2M/Analysis/GridAnalysis.cpp
+--- a/lib/Dialect/D2M/Analysis/GridAnalysis.cpp
++++ b/lib/Dialect/D2M/Analysis/GridAnalysis.cpp
+@@ -19,6 +19,12 @@ namespace mlir::tt::d2m {
+
+ bool GridAnalysis::isTTNNOperand(Value operand) {
+   while (auto view = operand.getDefiningOp<d2m::ViewLayoutOp>()) {
++    auto type = mlir::cast<RankedTensorType>(view.getType());
++    auto layout = mlir::cast<ttcore::MetalLayoutAttr>(type.getEncoding());
++    if (layout.getMemorySpace() == ttcore::MemorySpace::DeviceDRAM &&
++        mlir::isa<Float32Type>(
++            ttcore::getOperandInnerElementType(view.getResult())))
++      return false;
+     operand = view.getInput();
+   }
+   return operand.getDefiningOp<ttir::TTNNMetalLayoutCastOp>() != nullptr;
 diff --git a/lib/Dialect/D2M/IR/D2MOps.cpp b/lib/Dialect/D2M/IR/D2MOps.cpp
 --- a/lib/Dialect/D2M/IR/D2MOps.cpp
 +++ b/lib/Dialect/D2M/IR/D2MOps.cpp
@@ -625,6 +839,33 @@ diff --git a/lib/Dialect/D2M/IR/D2MOps.cpp b/lib/Dialect/D2M/IR/D2MOps.cpp
        isTiled ? nullptr : rewriter.getDenseI64ArrayAttr(logicalSizes));
    mlir::bufferization::replaceOpWithBufferizedValues(rewriter, *this,
                                                       newOp.getResult());
+@@ -2658,11 +2673,17 @@ static void repairParallelizedRegionTypes(d2m::GenericOp genericOp,
+     } else if (auto tensorEmptyOp =
+                    mlir::dyn_cast<tensor::EmptyOp>(&clonedOp)) {
+       Value associatedOperand = d2m::GenericOp::findAssocOperand(tensorEmptyOp);
++      Type newEmptyType = tensorEmptyOp.getType();
+-      if (associatedOperand) {
+-        Type newEmptyType = d2m::utils::cloneWithShardShape(
+-            associatedOperand, tensorEmptyOp.getType());
+-        if (newEmptyType != tensorEmptyOp.getType()) {
+-          tensorEmptyOp.getResult().setType(
+-              cast<RankedTensorType>(newEmptyType));
+-        }
++      if (auto blockingMapAttr =
++              tensorEmptyOp->getAttrOfType<mlir::AffineMapAttr>(
++                  "d2m.blocking_map")) {
++        newEmptyType = getTypeFromBlockingMap(
++            genericOp, blockingMapAttr.getValue(), tensorEmptyOp.getType());
++      } else if (associatedOperand) {
++        newEmptyType = d2m::utils::cloneWithShardShape(
++            associatedOperand, tensorEmptyOp.getType());
++      }
++      if (newEmptyType != tensorEmptyOp.getType()) {
++        tensorEmptyOp.getResult().setType(
++            cast<RankedTensorType>(newEmptyType));
+       }
+     } else if (auto remoteLoadOp =
+
 diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
 --- a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
 +++ b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
@@ -639,6 +880,21 @@ diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipeli
    pm.addPass(ttir::createTTIRMoveReshapeToConstant());
    pm.addPass(ttir::createTTIRFoldConstantReshapeBroadcast());
    pm.addPass(ttir::createTTIRReductionForceKeepDim());
+@@ -111,6 +113,14 @@ void createD2MFrontendPipeline(OpPassManager &pm,
+   }
+   pm.addPass(tt::createTTIRToD2MPass(toD2MOptions));
+   pm.addPass(d2m::createD2MScalarizeConstTensors());
++  if (options.enableElementwiseFusion) {
++    d2m::D2MGenericFusionOptions fusionOptions;
++    fusionOptions.enableElementwiseFusion = false;
++    fusionOptions.enableEltwiseReductionFusion = true;
++    pm.addPass(d2m::createD2MGenericFusion(fusionOptions));
++    pm.addPass(mlir::createCanonicalizerPass());
++  }
++
+   d2m::D2MGridSelectionOptions gridOptOptions;
+   {
+     gridOptOptions.overrideDeviceShape =
 diff --git a/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp b/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp
 --- a/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp
 +++ b/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp
@@ -837,6 +1093,51 @@ diff --git a/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp b/lib/Dia
    } else {
      // This value is only used to determine if we need the guard to skip the
      // padded portions of the output shards.
+diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
+--- a/lib/Dialect/D2M/Transforms/GenericFusion.cpp
++++ b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
+@@ -189,5 +189,13 @@ static bool isElementwiseFusable(OpOperand *fusionTargetOperand,
+     return false;
+   }
+-
++  // Fused broadcast intermediates are not yet lowered correctly.
++  if (checkProducer &&
++      llvm::any_of(producer.getDpsInputOperands(), [&](OpOperand *operand) {
++        return !producer.getIndexingMap(operand->getOperandNumber())
++                    .isPermutation();
++      })) {
++    return false;
++  }
++
+   return passesSharedFusionShapeChecks(fusionTargetOperand, producer, consumer);
+ }
+@@ -579,9 +587,14 @@ static FailureOr<GenericOp> fuseGenericPair(
+   // Tag inner linalg.generic ops with their output blocking map so that the
+   // allocator's reblocking can derive the correct shape for intermediate
+   // buffers that have no associated generic operand.
+   for (Operation &op : fusedBlock) {
+     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(&op)) {
+       AffineMap outputMap = linalgOp.getIndexingMapsArray().back();
+-      op.setAttr("d2m.blocking_map", AffineMapAttr::get(outputMap));
++      auto blockingMapAttr = AffineMapAttr::get(outputMap);
++      op.setAttr("d2m.blocking_map", blockingMapAttr);
++      for (OpOperand &init : linalgOp.getDpsInitsMutable()) {
++        if (auto emptyOp = init.get().getDefiningOp<tensor::EmptyOp>())
++          emptyOp->setAttr("d2m.blocking_map", blockingMapAttr);
++      }
+     }
+   }
+@@ -756,7 +769,9 @@ class D2MGenericFusion
+   void runOnOperation() override {
+     MLIRContext *ctx = &getContext();
+     RewritePatternSet patterns(ctx);
+-    patterns.add<FuseD2MElementwiseOpsPattern>(ctx);
++    if (enableElementwiseFusion) {
++      patterns.add<FuseD2MElementwiseOpsPattern>(ctx);
++    }
+     if (enableEltwiseReductionFusion) {
+       patterns.add<FuseD2MEltwiseReductionOpsPattern>(ctx);
+     }
 diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Transforms/GridSelection.cpp
 --- a/lib/Dialect/D2M/Transforms/GridSelection.cpp
 +++ b/lib/Dialect/D2M/Transforms/GridSelection.cpp
@@ -1059,6 +1360,87 @@ diff --git a/lib/Dialect/D2M/Transforms/LowerToLayout/Plan.cpp b/lib/Dialect/D2M
    }
 
    // DRAM → L1: DMA the tensor into an L1 buffer with the target's layout.
+diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
+--- a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
++++ b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
+@@ -1282,1 +1282,2 @@ void emitDstCopyNest(PatternRewriter &rewriter, Operation *loopNestOrOp,
+-    const bool useInPlace = !cloneLoopNest || access.isMemref();
++    const bool useInPlace =
++        (!cloneLoopNest && access.guardIVs.empty()) || access.isMemref();
+diff --git a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
+--- a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
++++ b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
+@@ -371,5 +371,20 @@ computeDSTPackingForRegion(d2m::GenericOp generic,
+   if (!singleTileOutputValues.empty()) {
+-    generic.emitOpError(
+-        "expected all linalg.generic outputs in a region to have shard size 1");
+-    return std::nullopt;
++    // A single-tile reduction can follow a multi-tile producer without shared
++    // outer tiling. Each linalg op keeps its own phase-2 packing.
++    results.numOuterLoopIters = 1;
++    results.numTilesPerResult = pendingResults.front().shardSizeTiles;
++    for (Value outputValue : singleTileOutputValues) {
++      results.perResult.try_emplace(
++          outputValue, DSTPackingPerResultInfo{/*numDstFlips=*/1,
++                                               /*numTilesPerFlip=*/1,
++                                               /*numTilesPerResult=*/1});
++    }
++    for (const PendingDSTPackingResult &pending : pendingResults) {
++      results.perResult.try_emplace(
++          pending.outputValue,
++          DSTPackingPerResultInfo{pending.numDstFlips,
++                                  pending.numTilesPerFlip,
++                                  pending.shardSizeTiles});
++    }
++    return results;
+   }
+
+diff --git a/lib/Dialect/D2M/Utils/GridSelectionUtils.cpp b/lib/Dialect/D2M/Utils/GridSelectionUtils.cpp
+--- a/lib/Dialect/D2M/Utils/GridSelectionUtils.cpp
++++ b/lib/Dialect/D2M/Utils/GridSelectionUtils.cpp
+@@ -228,6 +228,18 @@ static llvm::SmallVector<int64_t> computeOptimalVirtualGrid(
+   return grid;
+ }
+
++static bool needsF32DRAMGrid(mlir::RankedTensorType tensorType) {
++  auto layout =
++      mlir::cast<ttcore::MetalLayoutAttr>(tensorType.getEncoding());
++  if (layout.getMemorySpace() != ttcore::MemorySpace::DeviceDRAM ||
++      layout.getMemoryLayout() != ttcore::TensorMemoryLayout::Interleaved)
++    return false;
++  Type elementType = tensorType.getElementType();
++  if (auto tileType = mlir::dyn_cast<ttcore::TileType>(elementType))
++    elementType = tileType.getElementType();
++  return mlir::isa<Float32Type>(elementType);
++}
++
+ bool shouldImplementAsVirtualGrid(mlir::RankedTensorType tensorType,
+                                   ArrayRef<int64_t> physicalShape,
+                                   ArrayRef<int64_t> targetGrid) {
+@@ -236,7 +248,8 @@ bool shouldImplementAsVirtualGrid(mlir::RankedTensorType tensorType,
+   ttcore::MetalLayoutAttr layout =
+       mlir::cast<ttcore::MetalLayoutAttr>(tensorType.getEncoding());
+
+-  if (layout.getMemoryLayout() == ttcore::TensorMemoryLayout::Interleaved) {
++  if (layout.getMemoryLayout() == ttcore::TensorMemoryLayout::Interleaved &&
++      !needsF32DRAMGrid(tensorType)) {
+     return false;
+   }
+
+@@ -260,5 +273,13 @@ llvm::SmallVector<int64_t> computeOptimalGrid(
+                                               ArrayRef<int64_t> physicalShape,
+                                               ArrayRef<int64_t> targetGrid) {
++  if (needsF32DRAMGrid(tensorType)) {
++    llvm::SmallVector<int64_t> oneDimensionalTarget = {1, targetGrid.back()};
++    auto grid =
++        computeOptimalVirtualGrid(physicalShape, oneDimensionalTarget);
++    if (!grid.empty())
++      return grid;
++  }
++
+   if (shouldImplementAsVirtualGrid(tensorType, physicalShape, targetGrid)) {
+     auto virtualGrid = computeOptimalVirtualGrid(physicalShape, targetGrid);
+     if (!virtualGrid.empty()) {
 diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
 --- a/lib/Dialect/D2M/Utils/Utils.cpp
 +++ b/lib/Dialect/D2M/Utils/Utils.cpp
@@ -1104,17 +1486,45 @@ diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
      return {affineApply(gridY, index), affineApply(gridX, index),
              affineApply(offset, index)};
    }
+diff --git a/lib/Dialect/TTCore/IR/Utils.cpp b/lib/Dialect/TTCore/IR/Utils.cpp
+--- a/lib/Dialect/TTCore/IR/Utils.cpp
++++ b/lib/Dialect/TTCore/IR/Utils.cpp
+@@ -154,8 +154,8 @@ Type getOperandInnerElementType(const mlir::Value operand) {
+   auto elemType = operand.getType();
+-  if (auto memRefType = mlir::dyn_cast<MemRefType>(elemType);
+-      memRefType != nullptr) {
+-    elemType = memRefType.getElementType();
++  if (auto shapedType = mlir::dyn_cast<ShapedType>(elemType);
++      shapedType != nullptr) {
++    elemType = shapedType.getElementType();
+   }
+   // We could have a memref of tiles, so this needs to be the second query.
+   if (auto tileType = mlir::dyn_cast<ttcore::TileType>(elemType);
+       tileType != nullptr) {
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3784,9 +3784,11 @@ public:
+@@ -3775,18 +3775,22 @@ public:
+       if (permuteSliceAfterMatmulEnabled) {
+         patterns.add<PermuteSliceAfterMatmulPattern>(&getContext());
+       }
+-      patterns.add<RMSNormFusionPattern>(&getContext());
+-      patterns.add<NormalizeRMSNormFusionPattern>(&getContext());
++      if (specializedFusionEnabled) {
++        patterns.add<RMSNormFusionPattern>(&getContext());
++        patterns.add<NormalizeRMSNormFusionPattern>(&getContext());
++      }
+
+       patterns.add<GeluFusionPattern>(&getContext());
+       patterns.add<Relu6FusionPattern>(&getContext());
+       patterns.add<SiluFusionPattern>(&getContext());
        patterns.add<HardsigmoidFusionPattern>(&getContext());
        patterns.add<MishFusingPattern>(&getContext());
        patterns.add<ReshapeBroadcastReshapeToRepeatPattern>(&getContext());
 -      patterns.add<fusing::RoPERotateHalfFusingPattern>(&getContext());
 -      patterns.add<fusing::RoPEComplexRotationFusingPattern>(&getContext());
 -      patterns.add<fusing::RoPEInterleavedPairFusingPattern>(&getContext());
-+      if (ropeFusionEnabled) {
++      if (specializedFusionEnabled) {
 +        patterns.add<fusing::RoPERotateHalfFusingPattern>(&getContext());
 +        patterns.add<fusing::RoPEComplexRotationFusingPattern>(&getContext());
 +        patterns.add<fusing::RoPEInterleavedPairFusingPattern>(&getContext());
@@ -1161,10 +1571,11 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 --- a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 @@ -44,6 +44,8 @@ public:
+   static bool isAllowedToBeFused(Operation *op) {
      if (!op) {
        return false;
      }
-+    if (mlir::isa<ConcatOp, ReshapeOp, SliceStaticOp>(op))
++    if (mlir::isa<ConcatOp, ReshapeOp, SliceStaticOp, SumOp, MeanOp>(op))
 +      return true;
      // Eltwise unary ops.
      if (mlir::isa<AbsOp, CbrtOp, CeilOp, SignOp, CosOp, ExpOp, ErfOp, ErfcOp,
