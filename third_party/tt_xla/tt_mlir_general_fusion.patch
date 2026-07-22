@@ -450,12 +450,12 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
    return {map, canBeTilized};
  }
 
-@@ -6029,6 +6171,65 @@ public:
+@@ -6029,6 +6171,51 @@ public:
 
      if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
        signalPassFailure();
 +      return;
-+    }
+     }
 +
 +    // Internal TTNN casts are representational bridges that keep producer and
 +    // consumer Metal values connected for fusion.  Function results, however,
@@ -500,20 +500,6 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +        castOp.getInputMutable().assign(toLayout.getResult(0));
 +      }
 +    });
-+
-+    // Reusing the Metal input of a TTNN-to-Metal-to-TTNN round trip can leave
-+    // the outer, representational cast unused.  Drop only those dead casts;
-+    // broader canonicalization may change live DRAM layouts before grid
-+    // selection.
-+    llvm::SmallVector<ttir::TTNNMetalLayoutCastOp> deadCasts;
-+    module.walk([&](ttir::TTNNMetalLayoutCastOp castOp) {
-+      if (castOp->use_empty()) {
-+        deadCasts.push_back(castOp);
-+      }
-+    });
-+    for (ttir::TTNNMetalLayoutCastOp castOp : deadCasts) {
-+      castOp.erase();
-     }
    }
  };
 diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
