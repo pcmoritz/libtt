@@ -1096,22 +1096,52 @@ diff --git a/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp b/lib/Dia
 diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
 --- a/lib/Dialect/D2M/Transforms/GenericFusion.cpp
 +++ b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
-@@ -189,5 +189,13 @@ static bool isElementwiseFusable(OpOperand *fusionTargetOperand,
-     return false;
-   }
--
-+  // Fused broadcast intermediates are not yet lowered correctly.
-+  if (checkProducer &&
-+      llvm::any_of(producer.getDpsInputOperands(), [&](OpOperand *operand) {
-+        return !producer.getIndexingMap(operand->getOperandNumber())
-+                    .isPermutation();
-+      })) {
-+    return false;
+@@ -13,5 +13,6 @@
+ #include "mlir/Dialect/Affine/IR/AffineOps.h"
+ #include "mlir/Dialect/Linalg/IR/Linalg.h"
++#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+ #include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/IR/AsmState.h"
+ #include "mlir/IR/PatternMatch.h"
+@@ -576,2 +577,37 @@ static FailureOr<GenericOp> fuseGenericPair(
+   rewriter.setInsertionPointToEnd(&fusedBlock);
+   rewriter.create<YieldOp>(fusedOp.getLoc(), fusedYields);
++  // Keep all-parallel chains as one linalg.generic. Besides producing less
++  // IR, this lets values flow directly through DST instead of round-tripping
++  // through an L1 scratch CB between elementwise operations.
++  bool changed = true;
++  while (changed) {
++    changed = false;
++    for (auto consumerOp :
++         llvm::make_early_inc_range(fusedBlock.getOps<linalg::GenericOp>())) {
++      if (consumerOp.getNumReductionLoops() != 0)
++        continue;
++      for (OpOperand &operand : consumerOp->getOpOperands()) {
++        if (!linalg::areElementwiseOpsFusable(&operand))
++          continue;
++
++        auto producerOp = operand.get().getDefiningOp<linalg::GenericOp>();
++        rewriter.setInsertionPoint(consumerOp);
++        FailureOr<linalg::ElementwiseOpFusionResult> fusion =
++            linalg::fuseElementwiseOps(rewriter, &operand);
++        if (failed(fusion))
++          continue;
++
++        for (auto [original, replacement] : fusion->replacements)
++          original.replaceAllUsesWith(replacement);
++        rewriter.eraseOp(consumerOp);
++        if (llvm::all_of(producerOp->getResults(),
++                         [](Value result) { return result.use_empty(); }))
++          rewriter.eraseOp(producerOp);
++        changed = true;
++        break;
++      }
++      if (changed)
++        break;
++    }
 +  }
 +
-   return passesSharedFusionShapeChecks(fusionTargetOperand, producer, consumer);
- }
-@@ -579,9 +587,14 @@ static FailureOr<GenericOp> fuseGenericPair(
+@@ -579,9 +622,14 @@ static FailureOr<GenericOp> fuseGenericPair(
    // Tag inner linalg.generic ops with their output blocking map so that the
    // allocator's reblocking can derive the correct shape for intermediate
    // buffers that have no associated generic operand.
@@ -1127,7 +1157,7 @@ diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Tran
 +      }
      }
    }
-@@ -756,7 +769,9 @@ class D2MGenericFusion
+@@ -756,7 +804,9 @@ class D2MGenericFusion
    void runOnOperation() override {
      MLIRContext *ctx = &getContext();
      RewritePatternSet patterns(ctx);
@@ -1360,6 +1390,44 @@ diff --git a/lib/Dialect/D2M/Transforms/LowerToLayout/Plan.cpp b/lib/Dialect/D2M
    }
 
    // DRAM → L1: DMA the tensor into an L1 buffer with the target's layout.
+diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp
+--- a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp
++++ b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp
+@@ -68,1 +68,9 @@ collectDstAccessesScheduled(GenericOp op, Region &region,
+             getAccumClassificationOperandIndices(computeOp);
++        auto bcastLoad = mlir::isa<d2m::TileBcastOp>(computeOp)
++                             ? computeOp->getOperand(0)
++                                   .getDefiningOp<affine::AffineLoadOp>()
++                             : affine::AffineLoadOp{};
++        const bool inlineBcast =
++            bcastLoad && notDstMemspace(bcastLoad) && computeOp->hasOneUse() &&
++            (*computeOp->getUsers().begin())
++                ->hasTrait<D2MGenericRegionComputeOpTrait>();
+@@ -75,4 +83,10 @@ collectDstAccessesScheduled(GenericOp op, Region &region,
+-          ++numLoads;
+-
+           Value operand = computeOp->getOperand(operandIdx);
++          Operation *producer = operand.getDefiningOp();
++          if (!mlir::isa_and_nonnull<d2m::TileBcastOp>(producer) ||
++              dstIntermediates.contains(producer)) {
++            ++numLoads;
++          }
++          if (inlineBcast && operandIdx == 0) {
++            continue;
++          }
+           if (auto affineLoad = operand.getDefiningOp<affine::AffineLoadOp>();
+@@ -147,2 +161,9 @@ collectDstAccessesScheduled(GenericOp op, Region &region,
+-            dstIntermediates[computeOp] = {allocatedIndex,
+-                                           outermostInnerComputeLoop};
++            if (inlineBcast) {
++              recordDstAccess(
++                  bcastLoad, mlir::cast<d2m::TileBcastOp>(computeOp),
++                  copyInfos, allocatedIndex, outermostInnerComputeLoop,
++                  /*emitGuard=*/true);
++            } else {
++              dstIntermediates[computeOp] = {allocatedIndex,
++                                             outermostInnerComputeLoop};
++            }
 diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
 --- a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
 +++ b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
@@ -1367,6 +1435,26 @@ diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib
 -    const bool useInPlace = !cloneLoopNest || access.isMemref();
 +    const bool useInPlace =
 +        (!cloneLoopNest && access.guardIVs.empty()) || access.isMemref();
+@@ -1338,2 +1339,19 @@ void emitDstCopyNest(PatternRewriter &rewriter, Operation *loopNestOrOp,
+           rewriter.setInsertionPoint(copyLoop);
++        } else if (isBcastGuard) {
++          for (Value guardIV : access.guardIVs) {
++            irMapper.map(guardIV,
++                         getFirstIterationValue(rewriter, loadStoreLoc,
++                                                guardIV));
++          }
++          // Unit-trip indices are invariant even when they are omitted from
++          // the guard list. Map them before hoisting the broadcast.
++          for (Value index : access.getAffineIndices()) {
++            auto loop = dyn_cast_or_null<affine::AffineForOp>(
++                getLoopOpForIV(index));
++            if (!irMapper.contains(index) && loop &&
++                tryGetConstantAffineTripCount(loop).value_or(0) == 1) {
++              irMapper.map(index, getFirstIterationValue(
++                                      rewriter, loadStoreLoc, index));
++            }
++          }
+         }
 diff --git a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
 --- a/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
 +++ b/lib/Dialect/D2M/Utils/DstRegisterAnalysis.cpp
