@@ -267,7 +267,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_pass_option_values.patch",
         "//third_party/tt_xla:tt_mlir_op_model_dependent_static_assert.patch",
         "//third_party/tt_xla:tt_mlir_ttir_to_d2m_constructor_names.patch",
-        "//third_party/tt_xla:tt_mlir_d2m_apply_map_values.patch",
         "//third_party/tt_xla:tt_mlir_affine_passes_include.patch",
         "//third_party/tt_xla:tt_mlir_mock_device_include.patch",
         "//third_party/tt_xla:tt_mlir_disable_ttlang_python_resolver.patch",
