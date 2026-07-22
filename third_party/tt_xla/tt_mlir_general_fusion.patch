@@ -1135,20 +1135,7 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
    if (options.enableFusing) {
      pm.addPass(mlir::tt::ttir::createTTIRFusing(fusingOptions));
    }
-@@ -207,6 +208,12 @@ void createTTNNResolveCompositesPass(
-     OpPassManager &pm, const TTIRToTTNNCommonPipelineOptions &options) {
-   CompositeResolution resolution = options.compositeResolution;
-
-+  // General fusion operates on primitive graphs. Composite decompositions
-+  // provide those graphs while keeping named operations available as the
-+  // fallback when D2M subgraphs are disabled.
-+  if (options.enableCreateD2MSubgraphs)
-+    resolution = CompositeResolution::Inline;
-+
- #ifdef TTMLIR_ENABLE_OPMODEL
-   const bool canValidate = options.optimizerPassEnabled;
- #else
-@@ -738,6 +745,8 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
+@@ -738,6 +739,8 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
    // only works on top-level modules (doesn't run module has a parent op).
    ttmetal::D2MPipelineOptions ttmetalOptions;
    ttmetalOptions.ttnnMode = true;
