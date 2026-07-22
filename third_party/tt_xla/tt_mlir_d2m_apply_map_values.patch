@@ -1,18 +1,7 @@
 diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
-index d401528..168c67a 100644
 --- a/lib/Dialect/D2M/Utils/Utils.cpp
 +++ b/lib/Dialect/D2M/Utils/Utils.cpp
-@@ -853,7 +853,8 @@ template <typename Builder>
- SmallVector<Value> applyMap(Builder &builder, Location loc, AffineMap map,
-                             ValueRange index, bool isRemote) {
-   auto affineApply = [&](AffineMap map, ValueRange index) {
--    return builder.template create<affine::AffineApplyOp>(loc, map, index);
-+    return builder.template create<affine::AffineApplyOp>(loc, map, index)
-+        .getResult();
-   };
- 
-   if (isRemote) {
-@@ -862,9 +863,9 @@ SmallVector<Value> applyMap(Builder &builder, Location loc, AffineMap map,
+@@ -897,9 +897,9 @@ SmallVector<Value> applyMap(Builder &builder, Location loc, AffineMap map,
      // Break the map into respective gridY, gridX, offset "single result"
      // parts. AffineApply only supports single result affine maps.
      map = map.dropResults(0); // Drop the device index.
