@@ -450,58 +450,6 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
    return {map, canBeTilized};
  }
 
-@@ -6029,6 +6171,51 @@ public:
-
-     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
-       signalPassFailure();
-+      return;
-     }
-+
-+    // Internal TTNN casts are representational bridges that keep producer and
-+    // consumer Metal values connected for fusion.  Function results, however,
-+    // must own a concrete buffer in the surrounding TTNN layout.
-+    D2MNamedRewriterCommon boundaryLayout(
-+        ttcore::MemorySpace::DeviceDRAM,
-+        ttcore::MemorySpace::DeviceDRAM,
-+        /*ttnnMode=*/true,
-+        /*collapseTensors=*/true,
-+        /*enableMulticastInference=*/false);
-+    module.walk([&](func::ReturnOp returnOp) {
-+      for (OpOperand &operand : returnOp->getOpOperands()) {
-+        auto castOp =
-+            operand.get().getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
-+        if (!castOp) {
-+          continue;
-+        }
-+        auto sourceType =
-+            mlir::dyn_cast<RankedTensorType>(castOp.getInput().getType());
-+        auto resultType =
-+            mlir::dyn_cast<RankedTensorType>(castOp.getResult().getType());
-+        if (!sourceType || !resultType ||
-+            !mlir::isa_and_nonnull<ttcore::MetalLayoutAttr>(
-+                sourceType.getEncoding())) {
-+          continue;
-+        }
-+        Type elementType = sourceType.getElementType();
-+        if (!mlir::isa<ttcore::TileType>(elementType)) {
-+          elementType = ttcore::TileType::get(
-+              elementType, ttcore::TileType::getDefaultShape());
-+        }
-+        OpBuilder builder(castOp);
-+        RankedTensorType boundaryType =
-+            boundaryLayout.getMetalTensorFromTTNNTensor(builder, resultType,
-+                                                         elementType);
-+        auto output = builder.create<d2m::EmptyOp>(
-+            castOp.getLoc(), boundaryType,
-+            /*virtualGridInverseMapping=*/nullptr,
-+            /*virtualGridForwardMapping=*/nullptr);
-+        auto toLayout = builder.create<d2m::ToLayoutOp>(
-+            castOp.getLoc(), castOp.getInput(), output);
-+        castOp.getInputMutable().assign(toLayout.getResult(0));
-+      }
-+    });
-   }
- };
 diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
 --- a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
 +++ b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
@@ -1020,6 +968,48 @@ diff --git a/lib/Dialect/D2M/Transforms/LowerToLayout/Plan.cpp b/lib/Dialect/D2M
    }
 
    // DRAM → L1: DMA the tensor into an L1 buffer with the target's layout.
+diff --git a/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp b/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp
+--- a/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp
++++ b/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp
+@@ -13,2 +13,3 @@
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
++#include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
+ #include "ttmlir/Utils.h"
+@@ -256,2 +257,3 @@ public:
+     SmallVector<std::pair<unsigned, Value>> replacements;
++    bool changed = false;
+
+@@ -259,3 +261,6 @@ public:
+     for (OpOperand &opOperand : returnOp->getOpOperands()) {
+-      Operation *definingOp = opOperand.get().getDefiningOp();
++      auto castOp =
++          opOperand.get().getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
++      Value view = castOp ? castOp.getInput() : opOperand.get();
++      Operation *definingOp = view.getDefiningOp();
+       if (!isViewOp(definingOp)) {
+@@ -264,2 +271,17 @@ public:
+
++      if (castOp) {
++        rewriter.setInsertionPoint(castOp);
++        auto output = rewriter.create<d2m::EmptyOp>(
++            castOp.getLoc(), mlir::cast<RankedTensorType>(view.getType()),
++            /*virtualGridInverseMapping=*/nullptr,
++            /*virtualGridForwardMapping=*/nullptr);
++        auto materialized = rewriter.create<d2m::ToLayoutOp>(
++            castOp.getLoc(), view, output);
++        rewriter.modifyOpInPlace(castOp, [&]() {
++          castOp.getInputMutable().assign(materialized.getResult(0));
++        });
++        changed = true;
++        continue;
++      }
++
+       // Insert a generic op to materialize the view before returning. This
+@@ -274,3 +296,3 @@ public:
+
+-    if (replacements.empty()) {
++    if (!changed && replacements.empty()) {
+       return failure();
 diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
 --- a/lib/Dialect/D2M/Utils/Utils.cpp
 +++ b/lib/Dialect/D2M/Utils/Utils.cpp
