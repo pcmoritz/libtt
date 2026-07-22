@@ -249,19 +249,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      }
 
      auto tensorType = mlir::cast<mlir::RankedTensorType>(value.getType());
-@@ -422,8 +468,9 @@ protected:
-     llvm::SmallVector<int64_t> shardedShape =
-         layout.getDeviceShape(placeholderTensorGrid, tileShape);
-
--    auto emptyOp = rewriter.create<d2m::EmptyOp>(value.getLoc(), shardedShape,
--                                                 elementType, layout);
-+    auto layoutType = RankedTensorType::get(shardedShape, elementType, layout);
-+    auto emptyOp = rewriter.create<d2m::EmptyOp>(value.getLoc(), layoutType,
-+                                                 nullptr, nullptr);
-
-     // For ND tensors (logicalShape.size() > 2), set placeholder virtual grid
-     // mappings on the EmptyOp.  These will be replaced when GridSelection
-@@ -1234,7 +1281,8 @@ private:
+@@ -1234,7 +1280,8 @@ private:
 
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
@@ -271,7 +259,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      const std::size_t numInputs = inputs.size();
      const std::size_t numOutputs = outputs.size();
      const std::size_t numOperands = (numInputs + numOutputs);
-@@ -1610,7 +1658,7 @@ private:
+@@ -1610,7 +1657,7 @@ private:
 
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
@@ -280,7 +268,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      assert(inputs.size() == 1);
      assert(outputs.size() == 1);
 
-@@ -2936,11 +2984,11 @@ public:
+@@ -2936,11 +2983,11 @@ public:
    D2MConcatRewriter(const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
                      ttcore::MemorySpace defaultInputMemSpace,
                      ttcore::MemorySpace defaultOutputMemSpace,
@@ -294,7 +282,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                                 enableMulticastInference) {}
 
    LogicalResult
-@@ -3042,9 +3090,12 @@ public:
+@@ -3042,9 +3089,12 @@ public:
 
      auto origOutputs = createDpsOutputs(loc, rewriter, {effectiveOutputType});
 
@@ -308,7 +296,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 
      auto compositeView = rewriter.create<d2m::CompositeViewOp>(
          loc, outputs[0].getType(), inputs, dim, logicalSizesAttr);
-@@ -4695,12 +4746,13 @@ public:
+@@ -4695,12 +4745,13 @@ public:
                                    mlir::MLIRContext *ctx,
                                    ttcore::MemorySpace defaultInputMemSpace,
                                    ttcore::MemorySpace defaultOutputMemSpace,
@@ -324,7 +312,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 
    LogicalResult
    matchAndRewrite(TensorManipulationOp op,
-@@ -4715,6 +4767,85 @@ public:
+@@ -4715,6 +4766,85 @@ public:
      }
 
      TensorManipulationInfo info = LogicalInfoFn(op);
@@ -410,7 +398,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      AffineMap deviceMap =
          projectLogicalMapToUnitDeviceSpace(rewriter, info.map);
 
-@@ -4797,6 +4928,9 @@ public:
+@@ -4797,6 +4927,9 @@ public:
      return AffineMap::get(outputDeviceRank, 0, deviceExprs,
                            builder.getContext());
    }
@@ -420,7 +408,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  };
  } // namespace
 
-@@ -4833,22 +4967,31 @@ static TensorManipulationInfo sliceLogicalInfo(ttir::SliceStaticOp op) {
+@@ -4833,22 +4966,31 @@ static TensorManipulationInfo sliceLogicalInfo(ttir::SliceStaticOp op) {
    assert(begins.size() ==
           static_cast<size_t>(op.getResult().getType().getRank()));
 
@@ -462,7 +450,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
    return {map, canBeTilized};
  }
 
-@@ -6029,6 +6172,65 @@ public:
+@@ -6029,6 +6171,65 @@ public:
 
      if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
        signalPassFailure();
