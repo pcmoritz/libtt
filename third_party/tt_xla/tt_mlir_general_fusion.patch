@@ -795,33 +795,20 @@ diff --git a/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp b/lib/Dia
 
                OpBuilder elseBuilder = ifOp.getElseBodyBuilder();
                emitIfElseChain(elseBuilder, inputIdx + 1, boundary);
-@@ -525,11 +555,26 @@ static LogicalResult expandCompositeViewsInGeneric(IRRewriter &rewriter,
+@@ -525,11 +555,14 @@ static LogicalResult expandCompositeViewsInGeneric(IRRewriter &rewriter,
    const bool isTiled =
        mlir::isa<ttcore::TileType>(compositeSourceType.getElementType());
 
--  const int32_t compositeDim = compositeView.getDim();
-+  const int32_t originalCompositeDim = compositeView.getDim();
+   const int32_t compositeDim = compositeView.getDim();
 +  AffineMap sourceRemapping =
 +      getCompositeSourceRemapping(compositeSource, compositeView);
-+  int32_t compositeDim = originalCompositeDim;
-+  const auto originalCompositeType =
-+      mlir::cast<MemRefType>(compositeView.getResult().getType());
-+  const int64_t originalGridRank = originalCompositeType.getRank() / 2;
-+  const int64_t sourceGridRank = compositeSourceType.getRank() / 2;
-+  if (!isTiled && sourceGridRank != originalGridRank) {
-+    // Default tensor collapsing folds all leading logical dimensions into the
-+    // physical row dimension and preserves the last logical dimension as the
-+    // physical column dimension.
-+    TT_assert(sourceGridRank == 2);
-+    compositeDim = compositeDim == originalGridRank - 1 ? 1 : 0;
-+  }
    LogicalResult result = success();
    if (isTiled) {
 -    result = expandCompositeDMAReadTiled(rewriter, clonedCompositeRead,
 -                                         expandedGenericInputs, compositeDim);
 +    result = expandCompositeDMAReadTiled(
 +        rewriter, clonedCompositeRead, expandedGenericInputs, compositeView,
-+        sourceRemapping, originalCompositeDim);
++        sourceRemapping, compositeDim);
    } else {
      // This value is only used to determine if we need the guard to skip the
      // padded portions of the output shards.
