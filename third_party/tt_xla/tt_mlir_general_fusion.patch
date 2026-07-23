@@ -301,82 +301,102 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                                 enableMulticastInference) {}
 
    LogicalResult
-@@ -3042,9 +3089,73 @@ public:
+@@ -3042,9 +3089,93 @@ public:
 
      auto origOutputs = createDpsOutputs(loc, rewriter, {effectiveOutputType});
 
-+    const bool useCollapsedTiledLayout =
-+        ttnnMode && !concatRowMajor && dim == rank - 1;
-     auto [inputs, outputs] = toLayoutOperandsAndResults(
-         rewriter, {effectiveInputs, origOutputs},
--        /*tiled=*/!concatRowMajor, /*noCollapse=*/true);
-+        /*tiled=*/!concatRowMajor,
-+        /*noCollapse=*/!useCollapsedTiledLayout);
-+
-+    // A tiled width concat can be represented by having each producer write
-+    // directly into its portion of the concat output.  Besides removing the
-+    // concat copy, this gives the enclosing subgraph the same allocation
-+    // boundary as a destination-style concat kernel.
-+    if (useCollapsedTiledLayout) {
-+      SmallVector<d2m::GenericOp> producers;
-+      producers.reserve(inputs.size());
-+      for (Value input : inputs) {
-+        auto producer = input.getDefiningOp<d2m::GenericOp>();
++    // A collapsed concat needs no DMA expansion when its producers can write
++    // directly into a shared function result.  Keep all other concats in the
++    // original uncollapsed representation.
++    SmallVector<d2m::GenericOp> producers;
++    if (ttnnMode && !concatRowMajor && dim == rank - 1 &&
++        llvm::all_of(op->getUsers(),
++                     [](Operation *user) {
++                       return mlir::isa<func::ReturnOp>(user);
++                     })) {
++      producers.reserve(effectiveInputs.size());
++      for (Value input : effectiveInputs) {
++        auto cast = input.getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
++        auto inputType =
++            cast ? mlir::dyn_cast<RankedTensorType>(cast.getInput().getType())
++                 : nullptr;
++        auto layout =
++            inputType ? mlir::dyn_cast_if_present<ttcore::MetalLayoutAttr>(
++                            inputType.getEncoding())
++                      : nullptr;
++        auto producer =
++            cast ? cast.getInput().getDefiningOp<d2m::GenericOp>() : nullptr;
 +        if (!producer || producer->getNumResults() != 1 ||
 +            producer.getOutputs().size() != 1 ||
-+            producer->getBlock() != op->getBlock()) {
++            producer->getBlock() != op->getBlock() || !layout ||
++            layout.getMemorySpace() != memorySpaces[0] ||
++            !mlir::isa<ttcore::TileType>(inputType.getElementType())) {
 +          producers.clear();
 +          break;
 +        }
 +        producers.push_back(producer);
 +      }
++    }
 +
++    const bool directWrite = producers.size() == effectiveInputs.size();
+     auto [inputs, outputs] = toLayoutOperandsAndResults(
+         rewriter, {effectiveInputs, origOutputs},
+-        /*tiled=*/!concatRowMajor, /*noCollapse=*/true);
++        /*tiled=*/!concatRowMajor,
++        /*noCollapse=*/!directWrite);
++
++    // A tiled width concat can be represented by having each producer write
++    // directly into its portion of the concat output.  Besides removing the
++    // concat copy, this gives the enclosing subgraph the same allocation
++    // boundary as a destination-style concat kernel.
++    if (directWrite) {
++      for (auto [input, producer] : llvm::zip_equal(inputs, producers)) {
++        TT_assert(input.getDefiningOp<d2m::GenericOp>() == producer);
++      }
 +      auto outputCast =
 +          outputs[0].getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
 +      Operation *outputEmpty =
 +          outputCast ? outputCast.getInput().getDefiningOp() : nullptr;
-+      if (!mlir::isa_and_nonnull<ttir::EmptyOp, d2m::EmptyOp>(outputEmpty)) {
-+        outputEmpty = nullptr;
-+      }
-+      if (!producers.empty() && outputEmpty) {
-+        Operation *insertBefore = producers.front();
-+        for (d2m::GenericOp producer : producers) {
-+          if (producer->isBeforeInBlock(insertBefore)) {
-+            insertBefore = producer;
-+          }
-+        }
-+        outputEmpty->moveBefore(insertBefore);
-+        outputCast->moveBefore(insertBefore);
++      TT_assert(
++          (mlir::isa_and_nonnull<ttir::EmptyOp, d2m::EmptyOp>(outputEmpty)));
 +
-+        rewriter.setInsertionPoint(insertBefore);
-+        int64_t offset = 0;
-+        for (auto [input, producer] : llvm::zip_equal(inputs, producers)) {
-+          auto inputType = mlir::cast<RankedTensorType>(input.getType());
-+          SmallVector<AffineExpr> exprs;
-+          for (unsigned i = 0; i < inputType.getRank(); ++i) {
-+            exprs.push_back(rewriter.getAffineDimExpr(i));
-+          }
-+          exprs.back() = exprs.back() + offset;
-+          auto remapping = AffineMap::get(
-+              inputType.getRank(), 0, exprs, rewriter.getContext());
-+          auto view = rewriter.create<d2m::ViewLayoutOp>(
-+              loc, inputType, outputs[0], remapping,
-+              /*reinterpretLayout=*/false);
-+
-+          Value oldOutput = producer.getOutputs().front();
-+          producer.getOutputsMutable().assign(view.getResult());
-+          oldOutput.replaceUsesWithIf(view.getResult(), [&](OpOperand &use) {
-+            return producer->isProperAncestor(use.getOwner());
-+          });
-+          offset += inputType.getShape().back();
++      Operation *insertBefore = producers.front();
++      for (d2m::GenericOp producer : producers) {
++        if (producer->isBeforeInBlock(insertBefore)) {
++          insertBefore = producer;
 +        }
-+        rewriter.setInsertionPoint(op);
 +      }
++      outputEmpty->moveBefore(insertBefore);
++      outputCast->moveBefore(insertBefore);
++
++      rewriter.setInsertionPoint(insertBefore);
++      int64_t offset = 0;
++      for (auto [input, producer] : llvm::zip_equal(inputs, producers)) {
++        auto inputType = mlir::cast<RankedTensorType>(input.getType());
++        SmallVector<AffineExpr> exprs;
++        for (unsigned i = 0; i < inputType.getRank(); ++i) {
++          exprs.push_back(rewriter.getAffineDimExpr(i));
++        }
++        exprs.back() = exprs.back() + offset;
++        auto remapping = AffineMap::get(inputType.getRank(), 0, exprs,
++                                        rewriter.getContext());
++        auto view = rewriter.create<d2m::ViewLayoutOp>(
++            loc, inputType, outputs[0], remapping,
++            /*reinterpretLayout=*/false);
++
++        Value oldOutput = producer.getOutputs().front();
++        producer.getOutputsMutable().assign(view.getResult());
++        oldOutput.replaceUsesWithIf(view.getResult(), [&](OpOperand &use) {
++          return producer->isProperAncestor(use.getOwner());
++        });
++        offset += inputType.getShape().back();
++      }
++      rewriter.setInsertionPoint(op);
 +    }
 
      auto compositeView = rewriter.create<d2m::CompositeViewOp>(
          loc, outputs[0].getType(), inputs, dim, logicalSizesAttr);
-@@ -4695,12 +4745,13 @@ public:
+@@ -4695,12 +4826,13 @@ public:
                                    mlir::MLIRContext *ctx,
                                    ttcore::MemorySpace defaultInputMemSpace,
                                    ttcore::MemorySpace defaultOutputMemSpace,
@@ -392,7 +412,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 
    LogicalResult
    matchAndRewrite(TensorManipulationOp op,
-@@ -4715,6 +4766,85 @@ public:
+@@ -4715,6 +4847,85 @@ public:
      }
 
      TensorManipulationInfo info = LogicalInfoFn(op);
@@ -478,7 +498,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      AffineMap deviceMap =
          projectLogicalMapToUnitDeviceSpace(rewriter, info.map);
 
-@@ -4797,6 +4927,9 @@ public:
+@@ -4797,6 +5008,9 @@ public:
      return AffineMap::get(outputDeviceRank, 0, deviceExprs,
                            builder.getContext());
    }
@@ -488,7 +508,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  };
  } // namespace
 
-@@ -4833,22 +4966,31 @@ static TensorManipulationInfo sliceLogicalInfo(ttir::SliceStaticOp op) {
+@@ -4833,22 +5047,31 @@ static TensorManipulationInfo sliceLogicalInfo(ttir::SliceStaticOp op) {
    assert(begins.size() ==
           static_cast<size_t>(op.getResult().getType().getRank()));
 
@@ -515,7 +535,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +        step[rank - 2] == 1 && step[rank - 1] == 1 &&
 +        isTileAlignedOrFull(rank - 2, tileShape[0]) &&
 +        isTileAlignedOrFull(rank - 1, tileShape[1]);
-+  }
+   }
 +
 +  SmallVector<AffineExpr> exprs;
 +  for (size_t d = 0; d < begins.size(); d++) {
@@ -525,7 +545,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +      offset /= tileShape[d - (rank - 2)];
 +    }
 +    exprs.push_back(getAffineDimExpr(d, ctx) * step[d] + offset);
-   }
++  }
 +  AffineMap map = AffineMap::get(exprs.size(), 0, exprs, ctx);
    return {map, canBeTilized};
  }
@@ -641,188 +661,6 @@ diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipeli
    pm.addPass(ttir::createTTIRMoveReshapeToConstant());
    pm.addPass(ttir::createTTIRFoldConstantReshapeBroadcast());
    pm.addPass(ttir::createTTIRReductionForceKeepDim());
-diff --git a/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp b/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp
---- a/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp
-+++ b/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp
-@@ -6,6 +6,7 @@
- #include "ttmlir/Dialect/D2M/IR/D2MOps.h"
- #include "ttmlir/Dialect/D2M/Transforms/Passes.h"
- #include "ttmlir/Dialect/D2M/Utils/Utils.h"
-+#include "ttmlir/AffineMapUtils.h"
-
- #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
- #include "mlir/Dialect/Arith/IR/Arith.h"
-@@ -17,21 +18,36 @@ namespace mlir::tt::d2m {
- #define GEN_PASS_DEF_D2MEXPANDDMAREADCOMPOSITEVIEW
- #include "ttmlir/Dialect/D2M/Transforms/Passes.h.inc"
-
--static LogicalResult expandCompositeDMAReadTiled(IRRewriter &rewriter,
--                                                 DMAReadOp dmaRead,
--                                                 ValueRange expandedInputs,
--                                                 const int32_t concatDim) {
-+static AffineMap getCompositeSourceRemapping(Value source,
-+                                             CompositeViewOp compositeView) {
-+  if (source == compositeView.getResult()) {
-+    auto type = mlir::cast<MemRefType>(source.getType());
-+    return AffineMap::getMultiDimIdentityMap(type.getRank(),
-+                                             type.getContext());
-+  }
-+  auto view = source.getDefiningOp<ViewLayoutOp>();
-+  TT_assert(view);
-+  return getCompositeSourceRemapping(view.getInput(), compositeView)
-+      .compose(view.getRemapping());
-+}
-+
-+static LogicalResult expandCompositeDMAReadTiled(
-+    IRRewriter &rewriter, DMAReadOp dmaRead, ValueRange expandedInputs,
-+    CompositeViewOp compositeView, AffineMap sourceRemapping,
-+    const int32_t concatDim) {
-   TT_assert(dmaRead.isShardLevel());
-   ttcore::DeviceAttr device = ttcore::lookupDevice(dmaRead);
-
-   int64_t gridRank = static_cast<int64_t>(dmaRead.getSrcIndices().size());
--  TT_assert((concatDim >= 0 && concatDim < gridRank));
--
--  auto compositeType = mlir::cast<MemRefType>(dmaRead.getSrc().getType());
--  TT_assert(compositeType.getRank() == 2 * gridRank);
-+  auto compositeType =
-+      mlir::cast<MemRefType>(compositeView.getResult().getType());
-+  const int64_t compositeGridRank = compositeType.getRank() / 2;
-+  TT_assert((concatDim >= 0 && concatDim < compositeGridRank));
-+  TT_assert(sourceRemapping.getNumDims() >= 2 * gridRank);
-+  TT_assert(sourceRemapping.getNumResults() == 2 * compositeGridRank);
-
-   const int64_t concatGridDim = concatDim;
--  const int64_t concatShardDim = concatDim + gridRank;
-+  const int64_t concatShardDim = concatDim + compositeGridRank;
-
-   // Number of tiles in the composite view's concat dim, potentially aligned-up.
-   auto compositeDeviceShape = compositeType.getShape();
-@@ -55,8 +71,9 @@ static LogicalResult expandCompositeDMAReadTiled(IRRewriter &rewriter,
-     inputExtents.push_back(inputExtent);
-     inputMemoryMaps.push_back(
-         utils::getMemoryMap(device, input, /*isRemote=*/true));
--    inputShardShapes.emplace_back(inputDeviceShape.drop_front(gridRank).begin(),
--                                  inputDeviceShape.drop_front(gridRank).end());
-+    inputShardShapes.emplace_back(
-+        inputDeviceShape.drop_front(compositeGridRank).begin(),
-+        inputDeviceShape.drop_front(compositeGridRank).end());
-   }
-   TT_assert(totalInputExtent <= compositeExtent);
-
-@@ -74,12 +91,15 @@ static LogicalResult expandCompositeDMAReadTiled(IRRewriter &rewriter,
-   TT_assert(outputShardShape.size() == static_cast<size_t>(gridRank));
-
-   auto emitDMAReadForInput = [&](OpBuilder &builder, Location innerLoc,
--                                 ValueRange shardIters, Value globalConcatIdx,
-+                                 ValueRange shardIters,
-+                                 ValueRange compositeFullIdx,
-+                                 Value globalConcatIdx,
-                                  const int inputIdx,
-                                  const int64_t pieceOffset) {
-     // Calculate the full index (grid x shard) of the current input tile.
--    SmallVector<Value> inputFullIdx(2 * gridRank);
--    for (int dim = 0; dim < gridRank; dim++) {
-+    SmallVector<Value> inputFullIdx(2 * compositeGridRank);
-+    auto compositeDeviceShape = compositeType.getShape();
-+    for (int dim = 0; dim < compositeGridRank; dim++) {
-       Value globalDimIdx = nullptr;
-       if (dim == concatGridDim) {
-         // Shift-back the output's tile index with this input's cumulative
-@@ -94,14 +114,14 @@ static LogicalResult expandCompositeDMAReadTiled(IRRewriter &rewriter,
-               innerLoc, globalConcatIdx, offsetVal);
-         }
-       } else {
--        // Otherwise it's just: grid_idx * tiles_per_shard + shard_idx.
--        Value outShardExtent = builder.create<arith::ConstantOp>(
-+        Value compositeShardExtent = builder.create<arith::ConstantOp>(
-             innerLoc, builder.getIndexType(),
--            builder.getIndexAttr(outputShardShape[dim]));
-+            builder.getIndexAttr(
-+                compositeDeviceShape[dim + compositeGridRank]));
-         Value baseIdx = builder.create<arith::MulIOp>(
--            innerLoc, gridIndices[dim], outShardExtent);
--        globalDimIdx =
--            builder.create<arith::AddIOp>(innerLoc, baseIdx, shardIters[dim]);
-+            innerLoc, compositeFullIdx[dim], compositeShardExtent);
-+        globalDimIdx = builder.create<arith::AddIOp>(
-+            innerLoc, baseIdx, compositeFullIdx[dim + compositeGridRank]);
-       }
-
-       Value inShardExtent = builder.create<arith::ConstantOp>(
-@@ -115,7 +135,7 @@ static LogicalResult expandCompositeDMAReadTiled(IRRewriter &rewriter,
-           builder.create<arith::RemSIOp>(innerLoc, globalDimIdx, inShardExtent);
-
-       inputFullIdx[dim] = inputGridIdx;
--      inputFullIdx[dim + gridRank] = inputShardIdx;
-+      inputFullIdx[dim + compositeGridRank] = inputShardIdx;
-     }
-
-     SmallVector<Value> remoteIndices = utils::applyMap(
-@@ -137,15 +157,20 @@ static LogicalResult expandCompositeDMAReadTiled(IRRewriter &rewriter,
-   scf::buildLoopNest(
-       rewriter, loc, lbs, ubs, steps,
-       [&](OpBuilder &loopBuilder, Location innerLoc, ValueRange shardIters) {
--        // Global index along the concat dim of a given tile:
--        // idx = grid_idx * tiles_per_shard + shard_idx
-+        SmallVector<Value> sourceFullIdx;
-+        sourceFullIdx.append(gridIndices.begin(), gridIndices.end());
-+        sourceFullIdx.append(shardIters.begin(), shardIters.end());
-+        SmallVector<Value> compositeFullIdx =
-+            ttmlir::utils::fullyApplyAffineMap(
-+                loopBuilder, innerLoc, sourceRemapping, sourceFullIdx);
-+
-         Value concatShardExtent = loopBuilder.create<arith::ConstantOp>(
--            innerLoc, loopBuilder.getIndexType(),
--            loopBuilder.getIndexAttr(outputShardShape[concatDim]));
-+            innerLoc, loopBuilder.getIndexType(), loopBuilder.getIndexAttr(
-+                compositeType.getShape()[concatShardDim]));
-         Value baseConcatIdx = loopBuilder.create<arith::MulIOp>(
--            innerLoc, gridIndices[concatGridDim], concatShardExtent);
-+            innerLoc, compositeFullIdx[concatGridDim], concatShardExtent);
-         Value globalConcatIdx = loopBuilder.create<arith::AddIOp>(
--            innerLoc, baseConcatIdx, shardIters[concatDim]);
-+            innerLoc, baseConcatIdx, compositeFullIdx[concatShardDim]);
-
-         // Recursively generate the if-else chain for all inputs.
-         std::function<void(OpBuilder &, const int, const int64_t)>
-@@ -154,7 +182,8 @@ static LogicalResult expandCompositeDMAReadTiled(IRRewriter &rewriter,
-               // Base case: reaching the end of the chain (the last 'else').
-               if (inputIdx + 1 == static_cast<int>(expandedInputs.size())) {
-                 emitDMAReadForInput(builder, innerLoc, shardIters,
--                                    globalConcatIdx, inputIdx, startOffset);
-+                                    compositeFullIdx, globalConcatIdx, inputIdx,
-+                                    startOffset);
-                 return;
-               }
-
-@@ -174,7 +203,8 @@ static LogicalResult expandCompositeDMAReadTiled(IRRewriter &rewriter,
-
-               OpBuilder thenBuilder = ifOp.getThenBodyBuilder();
-               emitDMAReadForInput(thenBuilder, innerLoc, shardIters,
--                                  globalConcatIdx, inputIdx, startOffset);
-+                                  compositeFullIdx, globalConcatIdx, inputIdx,
-+                                  startOffset);
-
-               OpBuilder elseBuilder = ifOp.getElseBodyBuilder();
-               emitIfElseChain(elseBuilder, inputIdx + 1, boundary);
-@@ -525,11 +555,14 @@ static LogicalResult expandCompositeViewsInGeneric(IRRewriter &rewriter,
-   const bool isTiled =
-       mlir::isa<ttcore::TileType>(compositeSourceType.getElementType());
-
-   const int32_t compositeDim = compositeView.getDim();
-+  AffineMap sourceRemapping =
-+      getCompositeSourceRemapping(compositeSource, compositeView);
-   LogicalResult result = success();
-   if (isTiled) {
--    result = expandCompositeDMAReadTiled(rewriter, clonedCompositeRead,
--                                         expandedGenericInputs, compositeDim);
-+    result = expandCompositeDMAReadTiled(
-+        rewriter, clonedCompositeRead, expandedGenericInputs, compositeView,
-+        sourceRemapping, compositeDim);
-   } else {
-     // This value is only used to determine if we need the guard to skip the
-     // padded portions of the output shards.
 diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Transforms/GridSelection.cpp
 --- a/lib/Dialect/D2M/Transforms/GridSelection.cpp
 +++ b/lib/Dialect/D2M/Transforms/GridSelection.cpp
@@ -1119,7 +957,7 @@ diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3784,9 +3784,11 @@ public:
+@@ -3676,9 +3676,11 @@ public:
        patterns.add<HardsigmoidFusionPattern>(&getContext());
        patterns.add<MishFusingPattern>(&getContext());
        patterns.add<ReshapeBroadcastReshapeToRepeatPattern>(&getContext());
@@ -1187,7 +1025,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
          for (Operation *op : group) {
            visitedOps.insert(op);
          }
-@@ -134,6 +141,7 @@ private:
+@@ -134,6 +139,7 @@ private:
        for (Value operand : cur->getOperands()) {
          Operation *producer = operand.getDefiningOp();
          if (!producer || !isAllowedToBeFused(producer) ||
@@ -1195,11 +1033,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
              visitedOps.contains(producer) || fusionSet.contains(producer)) {
            continue;
          }
-
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -23,6 +23,10 @@
+@@ -23,6 +23,10 @@ namespace mlir::tt::ttnn {
  using TraceSmallString = llvm::SmallString<64>;
 
  namespace {
