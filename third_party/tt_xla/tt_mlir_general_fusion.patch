@@ -1008,7 +1008,7 @@ diff --git a/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp b/lib/Dialect
  class MaterializeReturnViewPattern : public OpRewritePattern<func::ReturnOp> {
  public:
    using OpRewritePattern<func::ReturnOp>::OpRewritePattern;
-@@ -254,14 +285,49 @@ public:
+@@ -254,14 +285,62 @@ public:
                                  PatternRewriter &rewriter) const override {
      rewriter.setInsertionPoint(returnOp);
      SmallVector<std::pair<unsigned, Value>> replacements;
@@ -1042,6 +1042,19 @@ diff --git a/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp b/lib/Dialect
 +          }
 +        }
 +
++        if (mlir::isa<MemRefType>(view.getType())) {
++          rewriter.setInsertionPoint(castOp);
++          std::optional<Value> materialized =
++              materializeView(rewriter, castOp.getLoc(), view);
++          if (materialized) {
++            rewriter.modifyOpInPlace(castOp, [&]() {
++              castOp.getInputMutable().assign(*materialized);
++            });
++            changed = true;
++          }
++          continue;
++        }
++
 +        rewriter.setInsertionPoint(castOp);
 +        auto output = rewriter.create<d2m::EmptyOp>(
 +            castOp.getLoc(), mlir::cast<RankedTensorType>(view.getType()),
@@ -1059,7 +1072,7 @@ diff --git a/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp b/lib/Dialect
        // Insert a generic op to materialize the view before returning. This
        // ensures the tensor transformation represented by the view actually
        // occurs, rather than just being a symbolic operation.
-@@ -272,7 +338,7 @@ public:
+@@ -272,7 +351,7 @@ public:
        }
      }
 
@@ -1127,7 +1140,15 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
-@@ -44,6 +44,8 @@ public:
+@@ -19,6 +19,7 @@
+ #include "llvm/ADT/DenseSet.h"
+ #include "llvm/ADT/SetVector.h"
+ #include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/TypeSwitch.h"
+
+ namespace mlir::tt::ttnn {
+ #define GEN_PASS_DEF_TTNNCREATED2MSUBGRAPHS
+@@ -44,6 +45,8 @@ public:
      if (!op) {
        return false;
      }
@@ -1136,7 +1157,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      // Eltwise unary ops.
      if (mlir::isa<AbsOp, CbrtOp, CeilOp, SignOp, CosOp, ExpOp, ErfOp, ErfcOp,
                    FloorOp, GeluOp, IsFiniteOp, LogicalNotOp, BitwiseNotOp,
-@@ -72,4 +74,7 @@ private:
+@@ -70,6 +73,9 @@ public:
+
+ private:
    static bool isFusionGroupExit(Operation *op) {
 +    if (mlir::isa<ConcatOp>(op)) {
 +      return true;
@@ -1144,3 +1167,36 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (!isAllowedToBeFused(op)) {
        return false;
      }
+@@ -98,7 +104,23 @@ private:
+     for (Operation *exitOp : exitOps) {
+       FusionGroup group = buildFusionGroup(exitOp);
+
+-      if (group.size() >= 2) {
++      bool hasCompute = llvm::any_of(group, [](Operation *op) {
++        return !mlir::isa<ReshapeOp, SliceStaticOp>(op);
++      });
++      bool hasShardedOutputs =
++          llvm::all_of(group.back()->getResultTypes(), [](Type type) {
++            auto tensorType = mlir::dyn_cast<RankedTensorType>(type);
++            if (!tensorType) {
++              return false;
++            }
++            return llvm::TypeSwitch<Attribute, bool>(tensorType.getEncoding())
++                .Case<TTNNLayoutAttr, TTNNNDLayoutAttr>([](auto layout) {
++                  return layout.getMemLayout().getValue() !=
++                         TensorMemoryLayout::Interleaved;
++                })
++                .Default(false);
++          });
++      if (group.size() >= 2 && hasCompute && hasShardedOutputs) {
+         for (Operation *op : group) {
+           visitedOps.insert(op);
+         }
+@@ -134,6 +156,7 @@ private:
+       for (Value operand : cur->getOperands()) {
+         Operation *producer = operand.getDefiningOp();
+         if (!producer || !isAllowedToBeFused(producer) ||
++            mlir::isa<ConcatOp>(producer) ||
+             visitedOps.contains(producer) || fusionSet.contains(producer)) {
+           continue;
+         }
