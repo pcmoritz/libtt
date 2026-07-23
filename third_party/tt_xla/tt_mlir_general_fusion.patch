@@ -58,7 +58,26 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
        TT_assertv(castLayoutAttr.getBufferType() ==
                       convertedLayoutAttr.getBufferType(),
                   "ttnn_metal_layout_cast and converted type must have the same "
-@@ -1049,6 +1048,21 @@ static LogicalResult cleanupAndVerify(ModuleOp moduleOp,
+@@ -744,9 +743,17 @@ static LogicalResult convertSingleGeneric(d2m::GenericOp op,
+     ios.push_back(ios.front());
+   }
+
++  SmallVector<int64_t> outputIndices;
++  for (size_t i = op.getInputs().size(); i < op.getInputsAndOutputs().size();
++       ++i) {
++    outputIndices.push_back(i);
++  }
++
+   rewriter.setInsertionPoint(op);
+-  rewriter.replaceOpWithNewOp<ttnn::GenericOp>(
++  auto generic = rewriter.replaceOpWithNewOp<ttnn::GenericOp>(
+       op, ios, ttnnGenericAdditionalArgs, program);
++  generic->setAttr("ttnn.d2m_output_indices",
++                   rewriter.getDenseI64ArrayAttr(outputIndices));
+   return success();
+ }
+
+@@ -1049,6 +1056,21 @@ static LogicalResult cleanupAndVerify(ModuleOp moduleOp,
        return;
      }
      Value resolved = findIOTensor(op.getOperand(), valueMapping);
@@ -740,7 +759,7 @@ diff --git a/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp b/lib/Dia
      }
 
      SmallVector<Value> remoteIndices = utils::applyMap(
-@@ -137,15 +157,23 @@ static LogicalResult expandCompositeDMAReadTiled(IRRewriter &rewriter,
+@@ -137,15 +157,20 @@ static LogicalResult expandCompositeDMAReadTiled(IRRewriter &rewriter,
    scf::buildLoopNest(
        rewriter, loc, lbs, ubs, steps,
        [&](OpBuilder &loopBuilder, Location innerLoc, ValueRange shardIters) {
@@ -1140,15 +1159,7 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
-@@ -19,6 +19,7 @@
- #include "llvm/ADT/DenseSet.h"
- #include "llvm/ADT/SetVector.h"
- #include "llvm/ADT/SmallVector.h"
-+#include "llvm/ADT/TypeSwitch.h"
-
- namespace mlir::tt::ttnn {
- #define GEN_PASS_DEF_TTNNCREATED2MSUBGRAPHS
-@@ -44,6 +45,8 @@ public:
+@@ -44,6 +44,8 @@ public:
      if (!op) {
        return false;
      }
@@ -1157,7 +1168,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      // Eltwise unary ops.
      if (mlir::isa<AbsOp, CbrtOp, CeilOp, SignOp, CosOp, ExpOp, ErfOp, ErfcOp,
                    FloorOp, GeluOp, IsFiniteOp, LogicalNotOp, BitwiseNotOp,
-@@ -70,6 +73,9 @@ public:
+@@ -70,6 +72,9 @@ public:
 
  private:
    static bool isFusionGroupExit(Operation *op) {
@@ -1167,32 +1178,16 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (!isAllowedToBeFused(op)) {
        return false;
      }
-@@ -98,7 +104,23 @@ private:
+@@ -98,7 +103,7 @@ private:
      for (Operation *exitOp : exitOps) {
        FusionGroup group = buildFusionGroup(exitOp);
 
 -      if (group.size() >= 2) {
-+      bool hasCompute = llvm::any_of(group, [](Operation *op) {
-+        return !mlir::isa<ReshapeOp, SliceStaticOp>(op);
-+      });
-+      bool hasShardedOutputs =
-+          llvm::all_of(group.back()->getResultTypes(), [](Type type) {
-+            auto tensorType = mlir::dyn_cast<RankedTensorType>(type);
-+            if (!tensorType) {
-+              return false;
-+            }
-+            return llvm::TypeSwitch<Attribute, bool>(tensorType.getEncoding())
-+                .Case<TTNNLayoutAttr, TTNNNDLayoutAttr>([](auto layout) {
-+                  return layout.getMemLayout().getValue() !=
-+                         TensorMemoryLayout::Interleaved;
-+                })
-+                .Default(false);
-+          });
-+      if (group.size() >= 2 && hasCompute && hasShardedOutputs) {
++      if (group.size() >= 2 && mlir::isa<ConcatOp>(group.back())) {
          for (Operation *op : group) {
            visitedOps.insert(op);
          }
-@@ -134,6 +156,7 @@ private:
+@@ -134,6 +141,7 @@ private:
        for (Value operand : cur->getOperands()) {
          Operation *producer = operand.getDefiningOp();
          if (!producer || !isAllowedToBeFused(producer) ||
@@ -1200,3 +1195,235 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
              visitedOps.contains(producer) || fusionSet.contains(producer)) {
            continue;
          }
+
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -23,6 +23,10 @@
+ using TraceSmallString = llvm::SmallString<64>;
+
+ namespace {
++constexpr llvm::StringLiteral g_TraceScratchAttr = "ttnn.trace_scratch";
++constexpr llvm::StringLiteral g_D2MOutputIndicesAttr =
++    "ttnn.d2m_output_indices";
++
+ // GlobalSemaphore values are pass-through handles into the trace wrapper:
+ // they are part of the trace function signature so device kernels can use
+ // them, but they have no host-side representation, no persistent device
+@@ -35,6 +39,21 @@ inline bool isSemaphoreType(mlir::Type type) {
+ inline bool isSemaphoreValue(mlir::Value value) {
+   return isSemaphoreType(value.getType());
+ }
++
++bool isD2MGenericDestination(
++    mlir::Value value,
++    const llvm::SmallPtrSetImpl<mlir::Operation *> &opsToHoist) {
++  return llvm::any_of(value.getUses(), [&](mlir::OpOperand &use) {
++    auto generic = mlir::dyn_cast<ttnn::GenericOp>(use.getOwner());
++    if (!generic || !opsToHoist.contains(generic)) {
++      return false;
++    }
++    auto indices =
++        generic->getAttrOfType<mlir::DenseI64ArrayAttr>(g_D2MOutputIndicesAttr);
++    return indices && llvm::is_contained(indices.asArrayRef(),
++                                         use.getOperandNumber());
++  });
++}
+ } // namespace
+
+ class TTNNTraceHoistTransform
+@@ -142,12 +161,14 @@ private:
+   // Tensor inputs come first, followed by semaphore inputs.
+   void collectFunctionBoundary(llvm::ArrayRef<Operation *> opsToHoist,
+                                llvm::SmallVector<mlir::Value> &inputs,
+-                               llvm::SmallVector<mlir::Value> &outputs) {
++                               llvm::SmallVector<mlir::Value> &outputs,
++                               llvm::SmallVector<mlir::Value> &scratch) {
+
+     // Create set for quick lookup
+     llvm::SmallPtrSet<Operation *, 16> opSet(opsToHoist.begin(),
+                                              opsToHoist.end());
+     llvm::SmallPtrSet<mlir::Value, 16> seenInputs;
++    llvm::SmallPtrSet<mlir::Value, 16> seenScratch;
+
+     // Collect inputs: operands that come from outside the operation set
+     for (Operation *op : opsToHoist) {
+@@ -158,6 +179,13 @@ private:
+         }
+         Operation *definingOp = operand.getDefiningOp();
+         if (!definingOp || !opSet.contains(definingOp)) {
++          if (mlir::isa_and_nonnull<ttnn::EmptyOp, ttnn::AllocOp>(definingOp) &&
++              isD2MGenericDestination(operand, opSet)) {
++            if (seenScratch.insert(operand).second) {
++              scratch.push_back(operand);
++            }
++            continue;
++          }
+           if (seenInputs.insert(operand).second) {
+             inputs.push_back(operand);
+           }
+@@ -257,18 +285,36 @@ private:
+     llvm::SmallVector<mlir::Type> inputTypes;
+     llvm::SmallVector<mlir::Value> outputs;
+     llvm::SmallVector<mlir::Type> outputTypes;
++    llvm::SmallVector<mlir::Value> scratch;
+
+-    collectFunctionBoundary(opsToHoist, inputs, outputs);
++    collectFunctionBoundary(opsToHoist, inputs, outputs, scratch);
+
++    llvm::SmallVector<mlir::Value> traceInputs;
++    for (mlir::Value input : inputs) {
++      if (!isSemaphoreValue(input)) {
++        traceInputs.push_back(input);
++      }
++    }
++    const size_t scratchBegin = traceInputs.size();
++    traceInputs.append(scratch);
+     for (mlir::Value input : inputs) {
++      if (isSemaphoreValue(input)) {
++        traceInputs.push_back(input);
++      }
++    }
++
++    for (mlir::Value input : traceInputs) {
+       inputTypes.push_back(input.getType());
+     }
+     for (mlir::Value output : outputs) {
+       outputTypes.push_back(output.getType());
+     }
++    for (mlir::Value value : scratch) {
++      outputTypes.push_back(value.getType());
++    }
+
+     llvm::SmallVector<mlir::DictionaryAttr> inputAttrs =
+-        getInputAttrs(context, inputs);
++        getInputAttrs(context, traceInputs);
+
+     TraceSmallString traceFuncName = getTraceFuncName(funcOp, traceFuncIndex);
+
+@@ -282,6 +328,9 @@ private:
+                                    ttmlir::utils::FunctionType::TraceMain);
+
+     traceFuncOp.setAllArgAttrs(inputAttrs);
++    for (size_t i = scratchBegin; i < scratchBegin + scratch.size(); ++i) {
++      traceFuncOp.setArgAttr(i, g_TraceScratchAttr, builder.getUnitAttr());
++    }
+     traceFuncOp.setPrivate();
+
+     // Build the body of the new function
+@@ -291,8 +340,8 @@ private:
+     // maps original input values to trace function input
+     // arguments/intermediates
+     llvm::DenseMap<mlir::Value, mlir::Value> valueMap;
+-    for (size_t i = 0; i < inputs.size(); i++) {
+-      valueMap.insert({inputs[i], traceFuncOp.getArgument(i)});
++    for (size_t i = 0; i < traceInputs.size(); i++) {
++      valueMap.insert({traceInputs[i], traceFuncOp.getArgument(i)});
+     }
+
+     for (Operation *op : opsToHoist) {
+@@ -336,6 +385,9 @@ private:
+             "Could not map output value in hoisted function");
+       }
+     }
++    for (mlir::Value value : scratch) {
++      returnValues.push_back(valueMap.at(value));
++    }
+     builder.create<func::ReturnOp>(funcOp.getLoc(), returnValues);
+
+     return mlir::success();
+@@ -368,9 +420,15 @@ private:
+     // allocation strategy.
+     llvm::SmallVector<mlir::Type> inputTypes;
+     llvm::SmallVector<mlir::Type> traceInputSlotTypes;
++    llvm::SmallVector<mlir::DictionaryAttr> inputAttrs;
+     for (size_t i = 0; i < traceFunc.getNumArguments(); i++) {
+       mlir::Value traceFuncArg = traceFunc.getArgument(i);
+
++      if (traceFunc.getArgAttr(i, g_TraceScratchAttr)) {
++        continue;
++      }
++
++      inputAttrs.push_back(traceFunc.getArgAttrDict(i));
+       if (isSemaphoreValue(traceFuncArg)) {
+         inputTypes.push_back(traceFuncArg.getType());
+         continue;
+@@ -447,8 +505,8 @@ private:
+     ttmlir::utils::setFunctionType(
+         runAndCaptureTraceFunc,
+         ttmlir::utils::FunctionType::TraceRunAndCapture);
+-    if (traceFunc.getAllArgAttrs()) {
+-      runAndCaptureTraceFunc.setAllArgAttrs(traceFunc.getAllArgAttrs());
++    if (!inputAttrs.empty()) {
++      runAndCaptureTraceFunc.setAllArgAttrs(inputAttrs);
+     }
+     runAndCaptureTraceFunc.setPrivate();
+
+@@ -470,10 +528,22 @@ private:
+     llvm::SmallVector<mlir::Value> traceInputSlots;
+     llvm::SmallVector<mlir::Value> traceCallArgs;
+     llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> hostToSlotTransfers;
+-    for (size_t i = 0; i < runAndCaptureTraceFunc.getNumArguments(); i++) {
+-      mlir::Value funcArg = runAndCaptureTraceFunc.getArgument(i);
++    size_t captureArgIndex = 0;
++    for (size_t i = 0; i < traceFunc.getNumArguments(); i++) {
++      mlir::Value traceFuncArg = traceFunc.getArgument(i);
++
++      if (traceFunc.getArgAttr(i, g_TraceScratchAttr)) {
++        auto tensorType = mlir::cast<RankedTensorType>(traceFuncArg.getType());
++        auto empty = builder.create<ttnn::EmptyOp>(
++            runAndCaptureTraceFunc.getLoc(), tensorType, deviceOp,
++            ttnn::ShapeAttr::get(context, tensorType.getShape()));
++        traceCallArgs.push_back(empty);
++        continue;
++      }
+
+-      if (isSemaphoreValue(funcArg)) {
++      mlir::Value funcArg =
++          runAndCaptureTraceFunc.getArgument(captureArgIndex++);
++      if (isSemaphoreValue(traceFuncArg)) {
+         traceCallArgs.push_back(funcArg);
+         continue;
+       }
+@@ -735,12 +805,16 @@ private:
+     llvm::SmallVector<mlir::Value> inputs;
+     llvm::SmallVector<mlir::Value> outputs;
+     llvm::SmallVector<mlir::Type> outputTypes;
++    llvm::SmallVector<mlir::Value> scratch;
+
+-    collectFunctionBoundary(opsToHoist, inputs, outputs);
++    collectFunctionBoundary(opsToHoist, inputs, outputs, scratch);
+
+     for (mlir::Value output : outputs) {
+       outputTypes.push_back(output.getType());
+     }
++    for (mlir::Value value : scratch) {
++      outputTypes.push_back(value.getType());
++    }
+
+     auto captureTraceSymbolAttr =
+         mlir::SymbolRefAttr::get(context, captureTraceFuncName);
+@@ -813,10 +887,23 @@ private:
+       outputs[i].replaceAllUsesWith(traceOp->getResult(i));
+     }
+
++    llvm::SmallPtrSet<Operation *, 16> opSet(opsToHoist.begin(),
++                                             opsToHoist.end());
++    for (auto [i, value] : llvm::enumerate(scratch)) {
++      value.replaceUsesWithIf(
++          traceOp->getResult(outputs.size() + i),
++          [&](OpOperand &use) { return !opSet.contains(use.getOwner()); });
++    }
++
+     // Remove the original ops in reverse order (to avoid dependency issues)
+     for (auto it = opsToHoist.rbegin(); it != opsToHoist.rend(); it++) {
+       rewriter.eraseOp(*it);
+     }
++    for (mlir::Value value : scratch) {
++      if (value.use_empty()) {
++        rewriter.eraseOp(value.getDefiningOp());
++      }
++    }
+
+     return mlir::success();
+   }
