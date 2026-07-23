@@ -282,7 +282,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                                 enableMulticastInference) {}
 
    LogicalResult
-@@ -3042,9 +3089,12 @@ public:
+@@ -3042,9 +3089,73 @@ public:
 
      auto origOutputs = createDpsOutputs(loc, rewriter, {effectiveOutputType});
 
@@ -293,6 +293,67 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 -        /*tiled=*/!concatRowMajor, /*noCollapse=*/true);
 +        /*tiled=*/!concatRowMajor,
 +        /*noCollapse=*/!useCollapsedTiledLayout);
++
++    // A tiled width concat can be represented by having each producer write
++    // directly into its portion of the concat output.  Besides removing the
++    // concat copy, this gives the enclosing subgraph the same allocation
++    // boundary as a destination-style concat kernel.
++    if (useCollapsedTiledLayout) {
++      SmallVector<d2m::GenericOp> producers;
++      producers.reserve(inputs.size());
++      for (Value input : inputs) {
++        auto producer = input.getDefiningOp<d2m::GenericOp>();
++        if (!producer || producer->getNumResults() != 1 ||
++            producer.getOutputs().size() != 1 ||
++            producer->getBlock() != op->getBlock()) {
++          producers.clear();
++          break;
++        }
++        producers.push_back(producer);
++      }
++
++      auto outputCast =
++          outputs[0].getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
++      Operation *outputEmpty =
++          outputCast ? outputCast.getInput().getDefiningOp() : nullptr;
++      if (!mlir::isa_and_nonnull<ttir::EmptyOp, d2m::EmptyOp>(outputEmpty)) {
++        outputEmpty = nullptr;
++      }
++      if (!producers.empty() && outputEmpty) {
++        Operation *insertBefore = producers.front();
++        for (d2m::GenericOp producer : producers) {
++          if (producer->isBeforeInBlock(insertBefore)) {
++            insertBefore = producer;
++          }
++        }
++        outputEmpty->moveBefore(insertBefore);
++        outputCast->moveBefore(insertBefore);
++
++        rewriter.setInsertionPoint(insertBefore);
++        int64_t offset = 0;
++        for (auto [input, producer] : llvm::zip_equal(inputs, producers)) {
++          auto inputType = mlir::cast<RankedTensorType>(input.getType());
++          SmallVector<AffineExpr> exprs;
++          for (unsigned i = 0; i < inputType.getRank(); ++i) {
++            exprs.push_back(rewriter.getAffineDimExpr(i));
++          }
++          exprs.back() = exprs.back() + offset;
++          auto remapping = AffineMap::get(
++              inputType.getRank(), 0, exprs, rewriter.getContext());
++          auto view = rewriter.create<d2m::ViewLayoutOp>(
++              loc, inputType, outputs[0], remapping,
++              /*reinterpretLayout=*/false);
++
++          Value oldOutput = producer.getOutputs().front();
++          producer.getOutputsMutable().assign(view.getResult());
++          oldOutput.replaceUsesWithIf(view.getResult(), [&](OpOperand &use) {
++            return producer->isProperAncestor(use.getOwner());
++          });
++          offset += inputType.getShape().back();
++        }
++        rewriter.setInsertionPoint(op);
++      }
++    }
 
      auto compositeView = rewriter.create<d2m::CompositeViewOp>(
          loc, outputs[0].getType(), inputs, dim, logicalSizesAttr);
@@ -902,15 +963,58 @@ diff --git a/lib/Dialect/D2M/Transforms/LowerToLayout/Plan.cpp b/lib/Dialect/D2M
 diff --git a/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp b/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp
 --- a/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp
 +++ b/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp
-@@ -13,2 +13,3 @@
+@@ -11,6 +11,7 @@
+ #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
  #include "ttmlir/Dialect/TTCore/IR/Utils.h"
 +#include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
  #include "ttmlir/Utils.h"
-@@ -256,2 +257,3 @@ public:
+
+ #include "mlir/Dialect/Arith/IR/Arith.h"
+@@ -246,6 +247,36 @@ std::optional<Value> materializeView(OpBuilder &builder, Location loc,
+   return std::nullopt;
+ }
+
++// Return the allocation shared by every piece of a composite view.  Generic
++// results alias their destination operands, and view_layout preserves that
++// backing allocation.
++Value getSharedBackingStorage(CompositeViewOp compositeView) {
++  Value shared;
++  for (Value input : compositeView.getInputs()) {
++    Value current = input;
++    if (auto generic = current.getDefiningOp<GenericOp>()) {
++      auto result = mlir::cast<OpResult>(current);
++      if (result.getResultNumber() >= generic.getOutputs().size()) {
++        return {};
++      }
++      current = generic.getOutputs()[result.getResultNumber()];
++    }
++    while (auto view = current.getDefiningOp<ViewLayoutOp>()) {
++      current = view.getInput();
++    }
++    if (shared && shared != current) {
++      return {};
++    }
++    shared = current;
++  }
++
++  auto sharedType = mlir::dyn_cast_if_present<ShapedType>(shared.getType());
++  auto resultType =
++      mlir::cast<ShapedType>(compositeView.getResult().getType());
++  return sharedType && sharedType.getShape() == resultType.getShape() ? shared
++                                                                     : Value{};
++}
++
+ class MaterializeReturnViewPattern : public OpRewritePattern<func::ReturnOp> {
+ public:
+   using OpRewritePattern<func::ReturnOp>::OpRewritePattern;
+@@ -254,14 +285,49 @@ public:
+                                 PatternRewriter &rewriter) const override {
+     rewriter.setInsertionPoint(returnOp);
      SmallVector<std::pair<unsigned, Value>> replacements;
 +    bool changed = false;
 
-@@ -259,3 +261,6 @@ public:
+     // Inspect each return operand to determine if it needs materialization.
      for (OpOperand &opOperand : returnOp->getOpOperands()) {
 -      Operation *definingOp = opOperand.get().getDefiningOp();
 +      auto castOp =
@@ -918,9 +1022,26 @@ diff --git a/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp b/lib/Dialect
 +      Value view = castOp ? castOp.getInput() : opOperand.get();
 +      Operation *definingOp = view.getDefiningOp();
        if (!isViewOp(definingOp)) {
-@@ -264,2 +271,17 @@ public:
+         continue;
+       }
 
 +      if (castOp) {
++        if (auto compositeView = mlir::dyn_cast<CompositeViewOp>(definingOp)) {
++          Value backing = getSharedBackingStorage(compositeView);
++          if (backing) {
++            // Keep the tensor-level composite alive until bufferization, when
++            // its destination-style producers become side-effecting.  The
++            // memref-level cast can then return their shared allocation.
++            if (mlir::isa<MemRefType>(view.getType())) {
++              rewriter.modifyOpInPlace(castOp, [&]() {
++                castOp.getInputMutable().assign(backing);
++              });
++              changed = true;
++            }
++            continue;
++          }
++        }
++
 +        rewriter.setInsertionPoint(castOp);
 +        auto output = rewriter.create<d2m::EmptyOp>(
 +            castOp.getLoc(), mlir::cast<RankedTensorType>(view.getType()),
@@ -936,11 +1057,17 @@ diff --git a/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp b/lib/Dialect
 +      }
 +
        // Insert a generic op to materialize the view before returning. This
-@@ -274,3 +296,3 @@ public:
+       // ensures the tensor transformation represented by the view actually
+       // occurs, rather than just being a symbolic operation.
+@@ -272,7 +338,7 @@ public:
+       }
+     }
 
 -    if (replacements.empty()) {
 +    if (!changed && replacements.empty()) {
        return failure();
+     }
+
 diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
 --- a/lib/Dialect/D2M/Utils/Utils.cpp
 +++ b/lib/Dialect/D2M/Utils/Utils.cpp
@@ -1009,3 +1136,107 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      // Eltwise unary ops.
      if (mlir::isa<AbsOp, CbrtOp, CeilOp, SignOp, CosOp, ExpOp, ErfOp, ErfcOp,
                    FloorOp, GeluOp, IsFiniteOp, LogicalNotOp, BitwiseNotOp,
+@@ -72,6 +74,9 @@ private:
+   static bool isFusionGroupExit(Operation *op) {
++    if (mlir::isa<ConcatOp>(op)) {
++      return true;
++    }
+     if (!isAllowedToBeFused(op)) {
+       return false;
+     }
+@@ -83,6 +88,91 @@ private:
+     return true;
+   }
+
++  static bool isExpandedRoPEFusionGroup(llvm::ArrayRef<Operation *> group) {
++    auto concat = mlir::dyn_cast<ConcatOp>(group.back());
++    if (!concat || concat.getNumOperands() != 2) {
++      return false;
++    }
++
++    auto sub = concat.getOperand(0).getDefiningOp<SubtractOp>();
++    auto add = concat.getOperand(1).getDefiningOp<AddOp>();
++    if (!sub || !add) {
++      return false;
++    }
++
++    auto matchTerm = [](Value value, SliceStaticOp &slice, Value &scale,
++                        bool &isFirst) {
++      auto mul = value.getDefiningOp<MultiplyOp>();
++      if (!mul) {
++        return false;
++      }
++      auto lhsSlice = mul.getLhs().getDefiningOp<SliceStaticOp>();
++      auto rhsSlice = mul.getRhs().getDefiningOp<SliceStaticOp>();
++      if (static_cast<bool>(lhsSlice) == static_cast<bool>(rhsSlice)) {
++        return false;
++      }
++      slice = lhsSlice ? lhsSlice : rhsSlice;
++      scale = lhsSlice ? mul.getRhs() : mul.getLhs();
++
++      auto shape = slice.getInput().getType().getShape();
++      auto begins = slice.getBegins();
++      auto ends = slice.getEnds();
++      auto steps = slice.getStep();
++      if (shape.empty() || begins.size() != shape.size() ||
++          ends.size() != shape.size() || steps.size() != shape.size()) {
++        return false;
++      }
++      auto get = [](ArrayAttr values, size_t dim) {
++        return mlir::cast<IntegerAttr>(values[dim]).getInt();
++      };
++      for (size_t dim = 0; dim + 1 < shape.size(); ++dim) {
++        if (get(begins, dim) != 0 || get(ends, dim) != shape[dim] ||
++            get(steps, dim) != 1) {
++          return false;
++        }
++      }
++      size_t dim = shape.size() - 1;
++      int64_t width = shape[dim];
++      int64_t begin = get(begins, dim);
++      int64_t end = get(ends, dim);
++      bool first = width % 2 == 0 && begin == 0 && end == width / 2;
++      bool second =
++          width % 2 == 0 && begin == width / 2 && end == width;
++      if (get(steps, dim) != 1 || (!first && !second)) {
++        return false;
++      }
++      isFirst = first;
++      return true;
++    };
++
++    SliceStaticOp subLhsSlice, subRhsSlice, addLhsSlice, addRhsSlice;
++    Value subLhsScale, subRhsScale, addLhsScale, addRhsScale;
++    bool subLhsFirst, subRhsFirst, addLhsFirst, addRhsFirst;
++    if (!matchTerm(sub.getLhs(), subLhsSlice, subLhsScale, subLhsFirst) ||
++        !matchTerm(sub.getRhs(), subRhsSlice, subRhsScale, subRhsFirst) ||
++        !matchTerm(add.getLhs(), addLhsSlice, addLhsScale, addLhsFirst) ||
++        !matchTerm(add.getRhs(), addRhsSlice, addRhsScale, addRhsFirst)) {
++      return false;
++    }
++
++    Value input = subLhsSlice.getInput();
++    if (subRhsSlice.getInput() != input || addLhsSlice.getInput() != input ||
++        addRhsSlice.getInput() != input) {
++      return false;
++    }
++
++    return subLhsFirst && !subRhsFirst &&
++           ((!addLhsFirst && addRhsFirst &&
++             addLhsScale == subLhsScale && addRhsScale == subRhsScale) ||
++            (addLhsFirst && !addRhsFirst &&
++             addLhsScale == subRhsScale && addRhsScale == subLhsScale));
++  }
++
+   void analyze(Operation *rootOp) {
+     // Find all fusion group exit ops by walking backwards.
+     // Build out each fusion group backwards from the found exit ops.
+@@ -98,6 +188,6 @@ private:
+     for (Operation *exitOp : exitOps) {
+       FusionGroup group = buildFusionGroup(exitOp);
+
+-      if (group.size() >= 2) {
++      if (isExpandedRoPEFusionGroup(group)) {
+         for (Operation *op : group) {
+           visitedOps.insert(op);
+         }
