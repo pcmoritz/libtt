@@ -58,26 +58,20 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
        TT_assertv(castLayoutAttr.getBufferType() ==
                       convertedLayoutAttr.getBufferType(),
                   "ttnn_metal_layout_cast and converted type must have the same "
-@@ -744,9 +743,17 @@ static LogicalResult convertSingleGeneric(d2m::GenericOp op,
+@@ -744,9 +743,11 @@ static LogicalResult convertSingleGeneric(d2m::GenericOp op,
      ios.push_back(ios.front());
    }
 
-+  SmallVector<int64_t> outputIndices;
-+  for (size_t i = op.getInputs().size(); i < op.getInputsAndOutputs().size();
-+       ++i) {
-+    outputIndices.push_back(i);
-+  }
-+
    rewriter.setInsertionPoint(op);
 -  rewriter.replaceOpWithNewOp<ttnn::GenericOp>(
 +  auto generic = rewriter.replaceOpWithNewOp<ttnn::GenericOp>(
        op, ios, ttnnGenericAdditionalArgs, program);
-+  generic->setAttr("ttnn.d2m_output_indices",
-+                   rewriter.getDenseI64ArrayAttr(outputIndices));
++  generic->setAttr("ttnn.d2m_num_outputs",
++                   rewriter.getI64IntegerAttr(op.getOutputs().size()));
    return success();
  }
 
-@@ -1049,6 +1056,21 @@ static LogicalResult cleanupAndVerify(ModuleOp moduleOp,
+@@ -1049,6 +1050,21 @@ static LogicalResult cleanupAndVerify(ModuleOp moduleOp,
        return;
      }
      Value resolved = findIOTensor(op.getOperand(), valueMapping);
@@ -102,15 +96,6 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
 diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 --- a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 +++ b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
-@@ -70,7 +70,7 @@ bool isOuterReduction(TTIRReductionOp op) {
- }
-
- class D2MNamedRewriterCommon {
--protected:
-+public:
-   using base = D2MNamedRewriterCommon;
-
-   D2MNamedRewriterCommon(ttcore::MemorySpace defaultInputMemSpace,
 @@ -217,9 +217,9 @@ protected:
    }
 
@@ -1041,8 +1026,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 
  namespace {
 +constexpr llvm::StringLiteral g_TraceScratchAttr = "ttnn.trace_scratch";
-+constexpr llvm::StringLiteral g_D2MOutputIndicesAttr =
-+    "ttnn.d2m_output_indices";
++constexpr llvm::StringLiteral g_D2MNumOutputsAttr =
++    "ttnn.d2m_num_outputs";
 +
  // GlobalSemaphore values are pass-through handles into the trace wrapper:
  // they are part of the trace function signature so device kernels can use
@@ -1060,10 +1045,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +    if (!generic || !opsToHoist.contains(generic)) {
 +      return false;
 +    }
-+    auto indices =
-+        generic->getAttrOfType<mlir::DenseI64ArrayAttr>(g_D2MOutputIndicesAttr);
-+    return indices && llvm::is_contained(indices.asArrayRef(),
-+                                         use.getOperandNumber());
++    auto numOutputs =
++        generic->getAttrOfType<mlir::IntegerAttr>(g_D2MNumOutputsAttr);
++    return numOutputs && llvm::is_contained(
++        generic.getInputsAndOutputs().take_back(numOutputs.getInt()), value);
 +  });
 +}
  } // namespace
