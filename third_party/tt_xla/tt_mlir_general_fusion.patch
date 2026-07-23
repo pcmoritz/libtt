@@ -1136,7 +1136,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      // Eltwise unary ops.
      if (mlir::isa<AbsOp, CbrtOp, CeilOp, SignOp, CosOp, ExpOp, ErfOp, ErfcOp,
                    FloorOp, GeluOp, IsFiniteOp, LogicalNotOp, BitwiseNotOp,
-@@ -72,6 +74,9 @@ private:
+@@ -72,4 +74,7 @@ private:
    static bool isFusionGroupExit(Operation *op) {
 +    if (mlir::isa<ConcatOp>(op)) {
 +      return true;
@@ -1144,99 +1144,3 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
      if (!isAllowedToBeFused(op)) {
        return false;
      }
-@@ -83,6 +88,91 @@ private:
-     return true;
-   }
-
-+  static bool isExpandedRoPEFusionGroup(llvm::ArrayRef<Operation *> group) {
-+    auto concat = mlir::dyn_cast<ConcatOp>(group.back());
-+    if (!concat || concat.getNumOperands() != 2) {
-+      return false;
-+    }
-+
-+    auto sub = concat.getOperand(0).getDefiningOp<SubtractOp>();
-+    auto add = concat.getOperand(1).getDefiningOp<AddOp>();
-+    if (!sub || !add) {
-+      return false;
-+    }
-+
-+    auto matchTerm = [](Value value, SliceStaticOp &slice, Value &scale,
-+                        bool &isFirst) {
-+      auto mul = value.getDefiningOp<MultiplyOp>();
-+      if (!mul) {
-+        return false;
-+      }
-+      auto lhsSlice = mul.getLhs().getDefiningOp<SliceStaticOp>();
-+      auto rhsSlice = mul.getRhs().getDefiningOp<SliceStaticOp>();
-+      if (static_cast<bool>(lhsSlice) == static_cast<bool>(rhsSlice)) {
-+        return false;
-+      }
-+      slice = lhsSlice ? lhsSlice : rhsSlice;
-+      scale = lhsSlice ? mul.getRhs() : mul.getLhs();
-+
-+      auto shape = slice.getInput().getType().getShape();
-+      auto begins = slice.getBegins();
-+      auto ends = slice.getEnds();
-+      auto steps = slice.getStep();
-+      if (shape.empty() || begins.size() != shape.size() ||
-+          ends.size() != shape.size() || steps.size() != shape.size()) {
-+        return false;
-+      }
-+      auto get = [](ArrayAttr values, size_t dim) {
-+        return mlir::cast<IntegerAttr>(values[dim]).getInt();
-+      };
-+      for (size_t dim = 0; dim + 1 < shape.size(); ++dim) {
-+        if (get(begins, dim) != 0 || get(ends, dim) != shape[dim] ||
-+            get(steps, dim) != 1) {
-+          return false;
-+        }
-+      }
-+      size_t dim = shape.size() - 1;
-+      int64_t width = shape[dim];
-+      int64_t begin = get(begins, dim);
-+      int64_t end = get(ends, dim);
-+      bool first = width % 2 == 0 && begin == 0 && end == width / 2;
-+      bool second =
-+          width % 2 == 0 && begin == width / 2 && end == width;
-+      if (get(steps, dim) != 1 || (!first && !second)) {
-+        return false;
-+      }
-+      isFirst = first;
-+      return true;
-+    };
-+
-+    SliceStaticOp subLhsSlice, subRhsSlice, addLhsSlice, addRhsSlice;
-+    Value subLhsScale, subRhsScale, addLhsScale, addRhsScale;
-+    bool subLhsFirst, subRhsFirst, addLhsFirst, addRhsFirst;
-+    if (!matchTerm(sub.getLhs(), subLhsSlice, subLhsScale, subLhsFirst) ||
-+        !matchTerm(sub.getRhs(), subRhsSlice, subRhsScale, subRhsFirst) ||
-+        !matchTerm(add.getLhs(), addLhsSlice, addLhsScale, addLhsFirst) ||
-+        !matchTerm(add.getRhs(), addRhsSlice, addRhsScale, addRhsFirst)) {
-+      return false;
-+    }
-+
-+    Value input = subLhsSlice.getInput();
-+    if (subRhsSlice.getInput() != input || addLhsSlice.getInput() != input ||
-+        addRhsSlice.getInput() != input) {
-+      return false;
-+    }
-+
-+    return subLhsFirst && !subRhsFirst &&
-+           ((!addLhsFirst && addRhsFirst &&
-+             addLhsScale == subLhsScale && addRhsScale == subRhsScale) ||
-+            (addLhsFirst && !addRhsFirst &&
-+             addLhsScale == subRhsScale && addRhsScale == subLhsScale));
-+  }
-+
-   void analyze(Operation *rootOp) {
-     // Find all fusion group exit ops by walking backwards.
-     // Build out each fusion group backwards from the found exit ops.
-@@ -98,6 +188,6 @@ private:
-     for (Operation *exitOp : exitOps) {
-       FusionGroup group = buildFusionGroup(exitOp);
-
--      if (group.size() >= 2) {
-+      if (isExpandedRoPEFusionGroup(group)) {
-         for (Operation *op : group) {
-           visitedOps.insert(op);
-         }
