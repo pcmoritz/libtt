@@ -686,9 +686,6 @@ diff --git a/lib/Dialect/D2M/Transforms/ExpandDMAReadCompositeView.cpp b/lib/Dia
 -        // Global index along the concat dim of a given tile:
 -        // idx = grid_idx * tiles_per_shard + shard_idx
 +        SmallVector<Value> sourceFullIdx;
-+        sourceFullIdx.append(
-+            sourceRemapping.getNumDims() - 2 * gridRank,
-+            loopBuilder.create<arith::ConstantIndexOp>(innerLoc, 0));
 +        sourceFullIdx.append(gridIndices.begin(), gridIndices.end());
 +        sourceFullIdx.append(shardIters.begin(), shardIters.end());
 +        SmallVector<Value> compositeFullIdx =
@@ -836,72 +833,6 @@ diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Tran
    } else if (auto castOp =
                   ttnnOperand.getDefiningOp<ttir::TTNNMetalLayoutCastOp>()) {
      optimizeTTNNMetalLayoutCastOpGrid(castOp, info.selectedGrid, builder);
-diff --git a/lib/Dialect/D2M/Transforms/LowerDMAToFullyIndexedForm.cpp b/lib/Dialect/D2M/Transforms/LowerDMAToFullyIndexedForm.cpp
---- a/lib/Dialect/D2M/Transforms/LowerDMAToFullyIndexedForm.cpp
-+++ b/lib/Dialect/D2M/Transforms/LowerDMAToFullyIndexedForm.cpp
-@@ -77,6 +77,18 @@ static size_t getElementSizeBytes(MemRefType memref) {
-                   : elementType.getIntOrFloatBitWidth() / 8;
- }
-
-+static void padIndicesToMapDomain(SmallVectorImpl<Value> &indices,
-+                                  AffineMap map, OpBuilder &builder,
-+                                  Location loc) {
-+  TT_assert(indices.size() <= map.getNumDims());
-+  if (indices.size() == map.getNumDims()) {
-+    return;
-+  }
-+  Value zero = builder.create<arith::ConstantOp>(
-+      loc, builder.getIndexType(), builder.getIndexAttr(0));
-+  indices.insert(indices.begin(), map.getNumDims() - indices.size(), zero);
-+}
-+
- // Calculates coalescing factor using analytical method with sampling fallback.
- // Mirrors the logic from GenericLowerDMAs::analyzeStream.
- static size_t calculateCoalescingFactorWithFallback(
-@@ -90,10 +102,17 @@ static size_t calculateCoalescingFactorWithFallback(
-   SmallVector<int64_t> fullShape;
-   fullShape.append(gridShape.begin(), gridShape.end());
-   fullShape.append(shardShape.begin(), shardShape.end());
-+  TT_assert(fullShape.size() <= memoryMap.getNumDims());
-+  unsigned numGridDims = gridShape.size();
-+  if (fullShape.size() != memoryMap.getNumDims()) {
-+    size_t padding = memoryMap.getNumDims() - fullShape.size();
-+    fullShape.insert(fullShape.begin(), padding, 1);
-+    numGridDims += padding;
-+  }
-
-   // Try analytical method first
-   size_t coalescingFactor = ttmlir::utils::computeCoalescingFactorAnalytically(
--      memoryMap, fullShape, gridShape.size(), elemSizeBytes);
-+      memoryMap, fullShape, numGridDims, elemSizeBytes);
-
-   // Determine if we should fallback to sampling
-   size_t analyticalChunkSize = coalescingFactor * elemSizeBytes;
-@@ -111,7 +130,7 @@ static size_t calculateCoalescingFactorWithFallback(
-     }
-
-     size_t sampledCoalescingFactor = ttmlir::utils::calculateCoalescingFactor(
--        memoryMap, fullShape, elemSizeBytes, gridShape.size());
-+        memoryMap, fullShape, elemSizeBytes, numGridDims);
-
-     if (debugCoalescingInference) {
-       if (coalescingFactor == sampledCoalescingFactor) {
-@@ -316,6 +335,7 @@ public:
-               llvm::to_vector(llvm::concat<Value>(gridIndices, iters));
-           SmallVector<Value> localIndices = llvm::to_vector(iters);
-
-+          padIndicesToMapDomain(remoteIndices, remoteMemoryMap, b, l);
-           remoteIndices =
-               utils::applyMap(b, l, remoteMemoryMap, remoteIndices, true);
-           localIndices =
-@@ -416,6 +436,7 @@ public:
-               llvm::to_vector(llvm::concat<Value>(gridIndices, iters));
-           SmallVector<Value> localIndices = llvm::to_vector(iters);
-
-+          padIndicesToMapDomain(remoteIndices, remoteMemoryMap, b, l);
-           remoteIndices =
-               utils::applyMap(b, l, remoteMemoryMap, remoteIndices, true);
-           localIndices =
 diff --git a/lib/Dialect/D2M/Transforms/LowerToLayout/LowerToLayout.cpp b/lib/Dialect/D2M/Transforms/LowerToLayout/LowerToLayout.cpp
 --- a/lib/Dialect/D2M/Transforms/LowerToLayout/LowerToLayout.cpp
 +++ b/lib/Dialect/D2M/Transforms/LowerToLayout/LowerToLayout.cpp
@@ -1013,36 +944,7 @@ diff --git a/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp b/lib/Dialect
 diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
 --- a/lib/Dialect/D2M/Utils/Utils.cpp
 +++ b/lib/Dialect/D2M/Utils/Utils.cpp
-@@ -741,17 +741,25 @@ getMemoryMapImpl(ttcore::DeviceAttr device, MemRefType memrefType,
-     }
-     }
-   } else if (mlir::isa<ttcore::InterleavedLayoutAttr>(memrefType.getLayout())) {
-+    auto interleavedLayout =
-+        mlir::cast<ttcore::InterleavedLayoutAttr>(memrefType.getLayout());
-
-     if (view) {
-+      if (affineMap.getNumDims() != view->getNumResults()) {
-+        unsigned gridRank = interleavedLayout.getGridShape(memrefType).size();
-+        unsigned shardRank = interleavedLayout.getShardShape(memrefType).size();
-+        TT_assert(view->getNumResults() >= gridRank + shardRank);
-+        SmallVector<AffineExpr> results(view->getResults().take_front(gridRank));
-+        llvm::append_range(results, view->getResults().take_back(shardRank));
-+        view = AffineMap::get(view->getNumDims(), view->getNumSymbols(), results,
-+                              view->getContext());
-+      }
-       affineMap = affineMap.compose(*view);
-     }
-
-     assert(memorySpace == ttcore::MemorySpace::DeviceDRAM &&
-            "interleavedLayoutAttr only supported for deviceDRAM memory space");
-
--    auto interleavedLayout =
--        mlir::cast<ttcore::InterleavedLayoutAttr>(memrefType.getLayout());
--
-     int64_t elementSizeBytes =
-         ttcore::getElementSizeBytes(memrefType.getElementType());
-     pageSize = mlir::isa<ttcore::TileType>(memrefType.getElementType())
-@@ -898,9 +906,9 @@ SmallVector<Value> applyMap(Builder &builder, Location loc, AffineMap map,
+@@ -898,9 +898,9 @@ SmallVector<Value> applyMap(Builder &builder, Location loc, AffineMap map,
      // Break the map into respective gridY, gridX, offset "single result"
      // parts. AffineApply only supports single result affine maps.
      map = map.dropResults(0); // Drop the device index.
