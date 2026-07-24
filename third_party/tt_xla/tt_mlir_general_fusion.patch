@@ -27,7 +27,7 @@ index 386d007..23044cf 100644
      let description = [{
        Generic operation capable of running a program with custom kernels. Each kernel is described with a
 diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
-index 12ac5d5..a783032 100644
+index 12ac5d5..44537fb 100644
 --- a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 +++ b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 @@ -320,9 +320,21 @@ protected:
@@ -101,7 +101,7 @@ index 12ac5d5..a783032 100644
      assert(inputs.size() == 1);
      assert(outputs.size() == 1);
 
-@@ -2928,6 +2952,117 @@ private:
+@@ -2928,6 +2952,121 @@ private:
  } // namespace
 
  namespace {
@@ -168,6 +168,10 @@ index 12ac5d5..a783032 100644
 +        return rewriter.notifyMatchFailure(op,
 +                                           "inputs cannot write concat output");
 +      }
++      if (llvm::is_contained(producers, producer)) {
++        return rewriter.notifyMatchFailure(op,
++                                           "requires distinct producers");
++      }
 +      producers.push_back(producer);
 +    }
 +
@@ -219,7 +223,7 @@ index 12ac5d5..a783032 100644
  class D2MConcatRewriter final
      : public mlir::OpConversionPattern<ttir::ConcatOp>,
        D2MNamedRewriterCommon {
-@@ -4798,6 +4933,76 @@ public:
+@@ -4798,6 +4937,76 @@ public:
                            builder.getContext());
    }
  };
@@ -296,7 +300,7 @@ index 12ac5d5..a783032 100644
  } // namespace
 
  static TensorManipulationInfo rearrangeLogicalInfo(ttir::RearrangeOp op) {
-@@ -5921,6 +6126,14 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -5921,6 +6130,14 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
      D2MAllGatherRewriter
    >(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, ttnnMode, collapseTensors, enableMulticastInference);
 
