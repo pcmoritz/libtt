@@ -1032,29 +1032,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  // GlobalSemaphore values are pass-through handles into the trace wrapper:
  // they are part of the trace function signature so device kernels can use
  // them, but they have no host-side representation, no persistent device
-@@ -35,6 +39,21 @@ inline bool isSemaphoreType(mlir::Type type) {
- inline bool isSemaphoreValue(mlir::Value value) {
-   return isSemaphoreType(value.getType());
- }
-+
-+bool isD2MGenericDestination(
-+    mlir::Value value,
-+    const llvm::SmallPtrSetImpl<mlir::Operation *> &opsToHoist) {
-+  return llvm::any_of(value.getUses(), [&](mlir::OpOperand &use) {
-+    auto generic = mlir::dyn_cast<ttnn::GenericOp>(use.getOwner());
-+    if (!generic || !opsToHoist.contains(generic)) {
-+      return false;
-+    }
-+    auto numOutputs =
-+        generic->getAttrOfType<mlir::IntegerAttr>(g_D2MNumOutputsAttr);
-+    return numOutputs && llvm::is_contained(
-+        generic.getInputsAndOutputs().take_back(numOutputs.getInt()), value);
-+  });
-+}
- } // namespace
-
- class TTNNTraceHoistTransform
-@@ -142,12 +161,14 @@ private:
+@@ -142,12 +146,31 @@ private:
    // Tensor inputs come first, followed by semaphore inputs.
    void collectFunctionBoundary(llvm::ArrayRef<Operation *> opsToHoist,
                                 llvm::SmallVector<mlir::Value> &inputs,
@@ -1067,24 +1045,37 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
                                               opsToHoist.end());
      llvm::SmallPtrSet<mlir::Value, 16> seenInputs;
 +    llvm::SmallPtrSet<mlir::Value, 16> seenScratch;
++
++    for (Operation *op : opsToHoist) {
++      auto generic = mlir::dyn_cast<ttnn::GenericOp>(op);
++      auto numOutputs =
++          op->getAttrOfType<mlir::IntegerAttr>(g_D2MNumOutputsAttr);
++      if (!generic || !numOutputs) {
++        continue;
++      }
++      for (Value output : generic.getInputsAndOutputs().take_back(
++               numOutputs.getInt())) {
++        Operation *definingOp = output.getDefiningOp();
++        if (mlir::isa_and_nonnull<ttnn::EmptyOp, ttnn::AllocOp>(definingOp) &&
++            seenScratch.insert(output).second) {
++          scratch.push_back(output);
++        }
++      }
++    }
 
      // Collect inputs: operands that come from outside the operation set
      for (Operation *op : opsToHoist) {
-@@ -158,6 +179,13 @@ private:
+@@ -158,6 +181,9 @@ private:
          }
          Operation *definingOp = operand.getDefiningOp();
          if (!definingOp || !opSet.contains(definingOp)) {
-+          if (mlir::isa_and_nonnull<ttnn::EmptyOp, ttnn::AllocOp>(definingOp) &&
-+              isD2MGenericDestination(operand, opSet)) {
-+            if (seenScratch.insert(operand).second) {
-+              scratch.push_back(operand);
-+            }
++          if (seenScratch.contains(operand)) {
 +            continue;
 +          }
            if (seenInputs.insert(operand).second) {
              inputs.push_back(operand);
            }
-@@ -257,18 +285,36 @@ private:
+@@ -257,18 +283,36 @@ private:
      llvm::SmallVector<mlir::Type> inputTypes;
      llvm::SmallVector<mlir::Value> outputs;
      llvm::SmallVector<mlir::Type> outputTypes;
@@ -1123,7 +1114,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 
      TraceSmallString traceFuncName = getTraceFuncName(funcOp, traceFuncIndex);
 
-@@ -282,6 +328,9 @@ private:
+@@ -282,6 +326,9 @@ private:
                                     ttmlir::utils::FunctionType::TraceMain);
 
      traceFuncOp.setAllArgAttrs(inputAttrs);
@@ -1133,7 +1124,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      traceFuncOp.setPrivate();
 
      // Build the body of the new function
-@@ -291,8 +340,8 @@ private:
+@@ -291,8 +338,8 @@ private:
      // maps original input values to trace function input
      // arguments/intermediates
      llvm::DenseMap<mlir::Value, mlir::Value> valueMap;
@@ -1144,7 +1135,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      }
 
      for (Operation *op : opsToHoist) {
-@@ -336,6 +385,9 @@ private:
+@@ -336,6 +383,9 @@ private:
              "Could not map output value in hoisted function");
        }
      }
@@ -1154,7 +1145,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      builder.create<func::ReturnOp>(funcOp.getLoc(), returnValues);
 
      return mlir::success();
-@@ -368,9 +420,15 @@ private:
+@@ -368,9 +418,15 @@ private:
      // allocation strategy.
      llvm::SmallVector<mlir::Type> inputTypes;
      llvm::SmallVector<mlir::Type> traceInputSlotTypes;
@@ -1170,7 +1161,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
        if (isSemaphoreValue(traceFuncArg)) {
          inputTypes.push_back(traceFuncArg.getType());
          continue;
-@@ -447,8 +505,8 @@ private:
+@@ -447,8 +503,8 @@ private:
      ttmlir::utils::setFunctionType(
          runAndCaptureTraceFunc,
          ttmlir::utils::FunctionType::TraceRunAndCapture);
@@ -1181,7 +1172,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      }
      runAndCaptureTraceFunc.setPrivate();
 
-@@ -470,10 +528,22 @@ private:
+@@ -470,10 +526,22 @@ private:
      llvm::SmallVector<mlir::Value> traceInputSlots;
      llvm::SmallVector<mlir::Value> traceCallArgs;
      llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> hostToSlotTransfers;
@@ -1207,7 +1198,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
          traceCallArgs.push_back(funcArg);
          continue;
        }
-@@ -735,12 +805,16 @@ private:
+@@ -735,12 +803,16 @@ private:
      llvm::SmallVector<mlir::Value> inputs;
      llvm::SmallVector<mlir::Value> outputs;
      llvm::SmallVector<mlir::Type> outputTypes;
@@ -1225,7 +1216,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 
      auto captureTraceSymbolAttr =
          mlir::SymbolRefAttr::get(context, captureTraceFuncName);
-@@ -813,10 +887,23 @@ private:
+@@ -813,10 +885,23 @@ private:
        outputs[i].replaceAllUsesWith(traceOp->getResult(i));
      }
 
