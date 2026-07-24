@@ -102,10 +102,9 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
    RankedTensorType
 -  getMetalTensorFromTTNNTensor(mlir::ConversionPatternRewriter &rewriter,
 -                               Value value) const {
--    auto tensorType = mlir::cast<mlir::RankedTensorType>(value.getType());
-+  getMetalTensorFromTTNNTensor(mlir::OpBuilder &rewriter,
-+                               RankedTensorType tensorType,
++  getMetalTensorFromTTNNTensor(mlir::OpBuilder &rewriter, Value value,
 +                               Type elementTypeOverride = {}) const {
+     auto tensorType = mlir::cast<mlir::RankedTensorType>(value.getType());
      Attribute ttnnLayout = tensorType.getEncoding();
 
      auto [memSpace, elementType, memLayout] = [&]()
@@ -125,7 +124,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      llvm::SmallVector<int64_t> dimAlignments(tensorType.getShape().size(), 1);
      if (dimAlignments.size() == 1) {
        dimAlignments[0] = ttcore::TileType::getDefaultShape()[1];
-@@ -264,14 +273,21 @@ protected:
+@@ -264,14 +273,14 @@ protected:
      }
 
      llvm::SmallVector<int64_t> unshardedShape =
@@ -139,17 +138,10 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      return mlir::RankedTensorType::get(shardedShape, elementType, metalLayout);
    }
 
-+  RankedTensorType
-+  getMetalTensorFromTTNNTensor(mlir::OpBuilder &rewriter,
-+                               Value value) const {
-+    return getMetalTensorFromTTNNTensor(
-+        rewriter, mlir::cast<mlir::RankedTensorType>(value.getType()));
-+  }
-+
    static void copyVirtualGridAttrs(d2m::EmptyOp dst, d2m::EmptyOp src) {
      if (auto attr = src.getVirtualGridInverseMappingAttr()) {
        dst.setVirtualGridInverseMappingAttr(attr);
-@@ -320,34 +336,53 @@ protected:
+@@ -320,34 +329,53 @@ protected:
      bool isTTNN = isTTNNTensor(value.getType());
      if (isTTNN) {
        assert(ttnnMode && "Unexpected TTNN tensor as op operand");
@@ -225,7 +217,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
          }
        }
 
-@@ -368,12 +403,23 @@ protected:
+@@ -368,12 +396,23 @@ protected:
              newTensorShape, metalTensorType.getElementType(),
              metalTensorType.getEncoding());
          auto unitReblockingView = rewriter.create<d2m::ViewLayoutOp>(
@@ -253,7 +245,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      }
 
      auto tensorType = mlir::cast<mlir::RankedTensorType>(value.getType());
-@@ -1234,7 +1280,8 @@ private:
+@@ -1234,7 +1273,8 @@ private:
 
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
@@ -263,7 +255,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      const std::size_t numInputs = inputs.size();
      const std::size_t numOutputs = outputs.size();
      const std::size_t numOperands = (numInputs + numOutputs);
-@@ -1610,7 +1657,7 @@ private:
+@@ -1610,7 +1650,7 @@ private:
 
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
@@ -272,7 +264,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      assert(inputs.size() == 1);
      assert(outputs.size() == 1);
 
-@@ -2936,11 +2983,11 @@ public:
+@@ -2936,11 +2976,11 @@ public:
    D2MConcatRewriter(const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
                      ttcore::MemorySpace defaultInputMemSpace,
                      ttcore::MemorySpace defaultOutputMemSpace,
@@ -286,7 +278,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                                 enableMulticastInference) {}
 
    LogicalResult
-@@ -3042,9 +3089,93 @@ public:
+@@ -3042,9 +3082,93 @@ public:
 
      auto origOutputs = createDpsOutputs(loc, rewriter, {effectiveOutputType});
 
@@ -381,7 +373,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 
      auto compositeView = rewriter.create<d2m::CompositeViewOp>(
          loc, outputs[0].getType(), inputs, dim, logicalSizesAttr);
-@@ -4695,12 +4826,13 @@ public:
+@@ -4695,12 +4819,13 @@ public:
                                    mlir::MLIRContext *ctx,
                                    ttcore::MemorySpace defaultInputMemSpace,
                                    ttcore::MemorySpace defaultOutputMemSpace,
@@ -397,7 +389,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 
    LogicalResult
    matchAndRewrite(TensorManipulationOp op,
-@@ -4715,6 +4847,85 @@ public:
+@@ -4715,6 +4840,85 @@ public:
      }
 
      TensorManipulationInfo info = LogicalInfoFn(op);
@@ -424,7 +416,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +          auto resultType =
 +              mlir::cast<RankedTensorType>(op.getResult().getType());
 +          auto resultMetalType = getMetalTensorFromTTNNTensor(
-+              rewriter, resultType, inputMetalType.getElementType());
++              rewriter, op.getResult(), inputMetalType.getElementType());
 +          const unsigned physicalRank = resultMetalType.getRank() / 2;
 +          TT_assert(inputMetalType.getRank() == resultMetalType.getRank());
 +
@@ -463,7 +455,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +          auto inputMetalType =
 +              mlir::cast<RankedTensorType>(input.getType());
 +          auto resultMetalType = getMetalTensorFromTTNNTensor(
-+              rewriter, resultType, inputMetalType.getElementType());
++              rewriter, op.getResult(), inputMetalType.getElementType());
 +          if (ttmlir::utils::volume<int64_t>(inputMetalType.getShape()) ==
 +              ttmlir::utils::volume<int64_t>(resultMetalType.getShape())) {
 +            AffineMap remapping = ttmlir::utils::calculateReblockMap(
@@ -483,7 +475,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      AffineMap deviceMap =
          projectLogicalMapToUnitDeviceSpace(rewriter, info.map);
 
-@@ -4797,6 +5008,9 @@ public:
+@@ -4797,6 +5001,9 @@ public:
      return AffineMap::get(outputDeviceRank, 0, deviceExprs,
                            builder.getContext());
    }
@@ -493,7 +485,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  };
  } // namespace
 
-@@ -4833,22 +5047,31 @@ static TensorManipulationInfo sliceLogicalInfo(ttir::SliceStaticOp op) {
+@@ -4833,22 +5040,31 @@ static TensorManipulationInfo sliceLogicalInfo(ttir::SliceStaticOp op) {
    assert(begins.size() ==
           static_cast<size_t>(op.getResult().getType().getRank()));
 
