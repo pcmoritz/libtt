@@ -58,8 +58,7 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
        TT_assertv(castLayoutAttr.getBufferType() ==
                       convertedLayoutAttr.getBufferType(),
                   "ttnn_metal_layout_cast and converted type must have the same "
-@@ -744,9 +743,11 @@ static LogicalResult convertSingleGeneric(d2m::GenericOp op,
-     ios.push_back(ios.front());
+@@ -745,8 +744,10 @@ static LogicalResult convertSingleGeneric(d2m::GenericOp op,
    }
 
    rewriter.setInsertionPoint(op);
@@ -71,32 +70,10 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
    return success();
  }
 
-@@ -1049,6 +1050,21 @@ static LogicalResult cleanupAndVerify(ModuleOp moduleOp,
-       return;
-     }
-     Value resolved = findIOTensor(op.getOperand(), valueMapping);
-+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
-+    if (resolved.getType() != resultType) {
-+      auto resolvedType = mlir::cast<RankedTensorType>(resolved.getType());
-+      auto resolvedLayout =
-+          mlir::cast<ttnn::TTNNLayoutAttr>(resolvedType.getEncoding());
-+      auto resultLayout =
-+          mlir::cast<ttnn::TTNNLayoutAttr>(resultType.getEncoding());
-+      TT_assertv(resolvedLayout.getMemref() == resultLayout.getMemref(),
-+                 "exit cast must preserve the physical buffer layout");
-+      auto emptyOp = resolved.getDefiningOp<ttnn::EmptyOp>();
-+      TT_assertv(emptyOp, "exit cast result must be backed by ttnn.empty");
-+      resolved.setType(resultType);
-+      emptyOp.setShapeAttr(
-+          ttnn::ShapeAttr::get(moduleOp.getContext(), resultType.getShape()));
-+    }
-     op.getResult().replaceAllUsesWith(resolved);
-   });
-
 diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 --- a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 +++ b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
-@@ -217,9 +217,9 @@ protected:
+@@ -217,8 +217,8 @@ protected:
    }
 
    RankedTensorType
@@ -107,7 +84,6 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      auto tensorType = mlir::cast<mlir::RankedTensorType>(value.getType());
      Attribute ttnnLayout = tensorType.getEncoding();
 
-     auto [memSpace, elementType, memLayout] = [&]()
 @@ -235,6 +235,15 @@ protected:
 
      auto optimalGrid = getGridForTTNNTensor(tensorType);
@@ -124,7 +100,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      llvm::SmallVector<int64_t> dimAlignments(tensorType.getShape().size(), 1);
      if (dimAlignments.size() == 1) {
        dimAlignments[0] = ttcore::TileType::getDefaultShape()[1];
-@@ -264,14 +273,14 @@ protected:
+@@ -264,10 +273,10 @@ protected:
      }
 
      llvm::SmallVector<int64_t> unshardedShape =
@@ -137,10 +113,6 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 
      return mlir::RankedTensorType::get(shardedShape, elementType, metalLayout);
    }
-
-   static void copyVirtualGridAttrs(d2m::EmptyOp dst, d2m::EmptyOp src) {
-     if (auto attr = src.getVirtualGridInverseMappingAttr()) {
-       dst.setVirtualGridInverseMappingAttr(attr);
 @@ -320,34 +329,53 @@ protected:
      bool isTTNN = isTTNNTensor(value.getType());
      if (isTTNN) {
@@ -278,19 +250,15 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
                                 enableMulticastInference) {}
 
    LogicalResult
-@@ -3042,9 +3082,93 @@ public:
+@@ -3042,9 +3082,84 @@ public:
 
      auto origOutputs = createDpsOutputs(loc, rewriter, {effectiveOutputType});
 
 +    // A collapsed concat needs no DMA expansion when its producers can write
-+    // directly into a shared function result.  Keep all other concats in the
++    // directly into the shared concat output. Keep all other concats in the
 +    // original uncollapsed representation.
 +    SmallVector<d2m::GenericOp> producers;
-+    if (ttnnMode && !concatRowMajor && dim == rank - 1 &&
-+        llvm::all_of(op->getUsers(),
-+                     [](Operation *user) {
-+                       return mlir::isa<func::ReturnOp>(user);
-+                     })) {
++    if (ttnnMode && !concatRowMajor && dim == rank - 1) {
 +      producers.reserve(effectiveInputs.size());
 +      for (Value input : effectiveInputs) {
 +        auto cast = input.getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
@@ -323,9 +291,9 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +        /*noCollapse=*/!directWrite);
 +
 +    // A tiled width concat can be represented by having each producer write
-+    // directly into its portion of the concat output.  Besides removing the
-+    // concat copy, this gives the enclosing subgraph the same allocation
-+    // boundary as a destination-style concat kernel.
++    // directly into its portion of the concat output. Besides removing the
++    // concat copy, this preserves the same allocation boundary as a
++    // destination-style concat kernel.
 +    if (directWrite) {
 +      for (auto [input, producer] : llvm::zip_equal(inputs, producers)) {
 +        TT_assert(input.getDefiningOp<d2m::GenericOp>() == producer);
@@ -337,12 +305,11 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +      TT_assert(
 +          (mlir::isa_and_nonnull<ttir::EmptyOp, d2m::EmptyOp>(outputEmpty)));
 +
-+      Operation *insertBefore = producers.front();
-+      for (d2m::GenericOp producer : producers) {
-+        if (producer->isBeforeInBlock(insertBefore)) {
-+          insertBefore = producer;
-+        }
-+      }
++      Operation *insertBefore =
++          *llvm::min_element(producers, [](d2m::GenericOp lhs,
++                                          d2m::GenericOp rhs) {
++            return lhs->isBeforeInBlock(rhs);
++          });
 +      outputEmpty->moveBefore(insertBefore);
 +      outputCast->moveBefore(insertBefore);
 +
@@ -350,13 +317,9 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 +      int64_t offset = 0;
 +      for (auto [input, producer] : llvm::zip_equal(inputs, producers)) {
 +        auto inputType = mlir::cast<RankedTensorType>(input.getType());
-+        SmallVector<AffineExpr> exprs;
-+        for (unsigned i = 0; i < inputType.getRank(); ++i) {
-+          exprs.push_back(rewriter.getAffineDimExpr(i));
-+        }
-+        exprs.back() = exprs.back() + offset;
-+        auto remapping = AffineMap::get(inputType.getRank(), 0, exprs,
-+                                        rewriter.getContext());
++        auto remapping = ttmlir::utils::applyOffsetsToAffineMapResults(
++            rewriter.getMultiDimIdentityMap(inputType.getRank()), {offset},
++            inputType.getRank() - 1);
 +        auto view = rewriter.create<d2m::ViewLayoutOp>(
 +            loc, inputType, outputs[0], remapping,
 +            /*reinterpretLayout=*/false);
@@ -373,7 +336,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 
      auto compositeView = rewriter.create<d2m::CompositeViewOp>(
          loc, outputs[0].getType(), inputs, dim, logicalSizesAttr);
-@@ -4695,12 +4819,13 @@ public:
+@@ -4695,12 +4810,13 @@ public:
                                    mlir::MLIRContext *ctx,
                                    ttcore::MemorySpace defaultInputMemSpace,
                                    ttcore::MemorySpace defaultOutputMemSpace,
@@ -389,7 +352,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 
    LogicalResult
    matchAndRewrite(TensorManipulationOp op,
-@@ -4715,6 +4840,85 @@ public:
+@@ -4715,6 +4831,85 @@ public:
      }
 
      TensorManipulationInfo info = LogicalInfoFn(op);
@@ -475,7 +438,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      AffineMap deviceMap =
          projectLogicalMapToUnitDeviceSpace(rewriter, info.map);
 
-@@ -4797,6 +5001,9 @@ public:
+@@ -4797,6 +4992,9 @@ public:
      return AffineMap::get(outputDeviceRank, 0, deviceExprs,
                            builder.getContext());
    }
@@ -485,7 +448,7 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  };
  } // namespace
 
-@@ -4833,22 +5040,31 @@ static TensorManipulationInfo sliceLogicalInfo(ttir::SliceStaticOp op) {
+@@ -4833,22 +5031,31 @@ static TensorManipulationInfo sliceLogicalInfo(ttir::SliceStaticOp op) {
    assert(begins.size() ==
           static_cast<size_t>(op.getResult().getType().getRank()));
 
@@ -530,62 +493,43 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
 diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
 --- a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
 +++ b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
-@@ -17,6 +17,8 @@
- #include "mlir/Transforms/DialectConversion.h"
- #include "llvm/ADT/STLExtras.h"
+@@ -19,7 +19,7 @@
 
-+#include <type_traits>
-+
  namespace {
 
- template <typename SrcOp, typename DestOp>
-@@ -251,6 +253,35 @@ public:
-   }
- };
+-template <typename SrcOp, typename DestOp>
++template <typename SrcOp, typename DestOp, bool preserveAttrs = false>
+ class TTNNToTTIROpConversionPattern : public mlir::OpConversionPattern<SrcOp> {
+   using mlir::OpConversionPattern<SrcOp>::OpConversionPattern;
+   using Adaptor = typename SrcOp::Adaptor;
+@@ -31,8 +31,14 @@ public:
+     auto outputType = mlir::cast<mlir::RankedTensorType>(
+         this->getTypeConverter()->convertType(srcOp.getResult().getType()));
 
-+template <typename SrcOp, typename DestOp>
-+class TTNNToTTIRStructuralConversionPattern
-+    : public mlir::OpConversionPattern<SrcOp> {
-+public:
-+  using mlir::OpConversionPattern<SrcOp>::OpConversionPattern;
-+
-+  mlir::LogicalResult
-+  matchAndRewrite(SrcOp srcOp, typename SrcOp::Adaptor adaptor,
-+                  mlir::ConversionPatternRewriter &rewriter) const override {
-+    auto outputType = mlir::cast<mlir::RankedTensorType>(
-+        this->getTypeConverter()->convertType(srcOp.getResult().getType()));
-+    if constexpr (std::is_same_v<SrcOp, mlir::tt::ttnn::ConcatOp>) {
+-    rewriter.replaceOpWithNewOp<DestOp>(srcOp, outputType,
+-                                        adaptor.getOperands());
++    if constexpr (preserveAttrs) {
 +      rewriter.replaceOpWithNewOp<DestOp>(
-+          srcOp, outputType, adaptor.getInputs(), srcOp.getDimAttr());
-+    } else if constexpr (std::is_same_v<SrcOp,
-+                                        mlir::tt::ttnn::ReshapeOp>) {
-+      rewriter.replaceOpWithNewOp<DestOp>(
-+          srcOp, outputType, adaptor.getInput(), srcOp.getShapeAttr());
++          srcOp, mlir::TypeRange{outputType}, adaptor.getOperands(),
++          srcOp->getAttrs());
 +    } else {
-+      static_assert(
-+          std::is_same_v<SrcOp, mlir::tt::ttnn::SliceStaticOp>);
-+      rewriter.replaceOpWithNewOp<DestOp>(
-+          srcOp, outputType, adaptor.getInput(), srcOp.getBeginsAttr(),
-+          srcOp.getEndsAttr(), srcOp.getStepAttr());
++      rewriter.replaceOpWithNewOp<DestOp>(srcOp, outputType,
++                                          adaptor.getOperands());
 +    }
-+    return mlir::success();
-+  }
-+};
-+
- static void
- addElementwiseUnaryOpsConversionPatterns(mlir::MLIRContext *ctx,
-                                          mlir::RewritePatternSet &patterns,
-@@ -407,6 +438,14 @@ void populateTTNNToTTIRPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+
+     return mlir::success();
+   }
+@@ -407,6 +413,14 @@ void populateTTNNToTTIRPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
    patterns.add<TTNNMatmulToTTIRMatmulConversionPattern>(typeConverter, ctx);
    patterns.add<TTNNFullOpToTTIRFullOpConversionPattern>(typeConverter, ctx);
    patterns.add<TTNNToLayoutToTTIRToLayoutConversionPattern>(typeConverter, ctx);
 +  patterns.add<
-+      TTNNToTTIRStructuralConversionPattern<mlir::tt::ttnn::ConcatOp,
-+                                            mlir::tt::ttir::ConcatOp>,
-+      TTNNToTTIRStructuralConversionPattern<mlir::tt::ttnn::ReshapeOp,
-+                                            mlir::tt::ttir::ReshapeOp>,
-+      TTNNToTTIRStructuralConversionPattern<mlir::tt::ttnn::SliceStaticOp,
-+                                            mlir::tt::ttir::SliceStaticOp>>(
++      TTNNToTTIROpConversionPattern<mlir::tt::ttnn::ConcatOp,
++                                    mlir::tt::ttir::ConcatOp, true>,
++      TTNNToTTIROpConversionPattern<mlir::tt::ttnn::ReshapeOp,
++                                    mlir::tt::ttir::ReshapeOp, true>,
++      TTNNToTTIROpConversionPattern<mlir::tt::ttnn::SliceStaticOp,
++                                    mlir::tt::ttir::SliceStaticOp, true>>(
 +      typeConverter, ctx);
  }
 
@@ -805,116 +749,72 @@ diff --git a/lib/Dialect/D2M/Transforms/MaterializeViewReturns.cpp b/lib/Dialect
  #include "ttmlir/Utils.h"
 
  #include "mlir/Dialect/Arith/IR/Arith.h"
-@@ -246,6 +247,36 @@ std::optional<Value> materializeView(OpBuilder &builder, Location loc,
+@@ -246,6 +247,55 @@ std::optional<Value> materializeView(OpBuilder &builder, Location loc,
    return std::nullopt;
  }
 
-+// Return the allocation shared by every piece of a composite view.  Generic
-+// results alias their destination operands, and view_layout preserves that
-+// backing allocation.
++Value getBackingStorage(Value value) {
++  if (auto generic = value.getDefiningOp<GenericOp>()) {
++    value =
++        generic.getOutputs()[mlir::cast<OpResult>(value).getResultNumber()];
++  }
++  while (auto view = value.getDefiningOp<ViewLayoutOp>()) {
++    value = view.getInput();
++  }
++  return value;
++}
++
++// Return the allocation shared by every piece of a composite view.
 +Value getSharedBackingStorage(CompositeViewOp compositeView) {
-+  Value shared;
-+  for (Value input : compositeView.getInputs()) {
-+    Value current = input;
-+    if (auto generic = current.getDefiningOp<GenericOp>()) {
-+      auto result = mlir::cast<OpResult>(current);
-+      if (result.getResultNumber() >= generic.getOutputs().size()) {
-+        return {};
-+      }
-+      current = generic.getOutputs()[result.getResultNumber()];
-+    }
-+    while (auto view = current.getDefiningOp<ViewLayoutOp>()) {
-+      current = view.getInput();
-+    }
-+    if (shared && shared != current) {
-+      return {};
-+    }
-+    shared = current;
++  Value shared = getBackingStorage(compositeView.getInputs().front());
++  if (llvm::any_of(compositeView.getInputs().drop_front(), [&](Value input) {
++        return getBackingStorage(input) != shared;
++      })) {
++    return {};
 +  }
 +
-+  auto sharedType = mlir::dyn_cast_if_present<ShapedType>(shared.getType());
-+  auto resultType =
-+      mlir::cast<ShapedType>(compositeView.getResult().getType());
-+  return sharedType && sharedType.getShape() == resultType.getShape() ? shared
-+                                                                     : Value{};
++  auto sharedType = mlir::cast<ShapedType>(shared.getType());
++  auto resultType = mlir::cast<ShapedType>(compositeView.getType());
++  return sharedType.getShape() == resultType.getShape() ? shared : Value{};
 +}
++
++class MaterializeSharedCompositeViewPattern
++    : public OpRewritePattern<ttir::TTNNMetalLayoutCastOp> {
++public:
++  using OpRewritePattern<ttir::TTNNMetalLayoutCastOp>::OpRewritePattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::TTNNMetalLayoutCastOp castOp,
++                  PatternRewriter &rewriter) const override {
++    auto compositeView =
++        castOp.getInput().getDefiningOp<CompositeViewOp>();
++    if (!compositeView ||
++        !mlir::isa<MemRefType>(compositeView.getType())) {
++      return failure();
++    }
++    Value backing = getSharedBackingStorage(compositeView);
++    if (!backing) {
++      return failure();
++    }
++    rewriter.modifyOpInPlace(
++        castOp, [&]() { castOp.getInputMutable().assign(backing); });
++    return success();
++  }
++};
 +
  class MaterializeReturnViewPattern : public OpRewritePattern<func::ReturnOp> {
  public:
    using OpRewritePattern<func::ReturnOp>::OpRewritePattern;
-@@ -254,14 +285,62 @@ public:
-                                 PatternRewriter &rewriter) const override {
-     rewriter.setInsertionPoint(returnOp);
-     SmallVector<std::pair<unsigned, Value>> replacements;
-+    bool changed = false;
+@@ -325,7 +375,8 @@ public:
 
-     // Inspect each return operand to determine if it needs materialization.
-     for (OpOperand &opOperand : returnOp->getOpOperands()) {
--      Operation *definingOp = opOperand.get().getDefiningOp();
-+      auto castOp =
-+          opOperand.get().getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
-+      Value view = castOp ? castOp.getInput() : opOperand.get();
-+      Operation *definingOp = view.getDefiningOp();
-       if (!isViewOp(definingOp)) {
-         continue;
-       }
-
-+      if (castOp) {
-+        if (auto compositeView = mlir::dyn_cast<CompositeViewOp>(definingOp)) {
-+          Value backing = getSharedBackingStorage(compositeView);
-+          if (backing) {
-+            // Keep the tensor-level composite alive until bufferization, when
-+            // its destination-style producers become side-effecting.  The
-+            // memref-level cast can then return their shared allocation.
-+            if (mlir::isa<MemRefType>(view.getType())) {
-+              rewriter.modifyOpInPlace(castOp, [&]() {
-+                castOp.getInputMutable().assign(backing);
-+              });
-+              changed = true;
-+            }
-+            continue;
-+          }
-+        }
-+
-+        if (mlir::isa<MemRefType>(view.getType())) {
-+          rewriter.setInsertionPoint(castOp);
-+          std::optional<Value> materialized =
-+              materializeView(rewriter, castOp.getLoc(), view);
-+          if (materialized) {
-+            rewriter.modifyOpInPlace(castOp, [&]() {
-+              castOp.getInputMutable().assign(*materialized);
-+            });
-+            changed = true;
-+          }
-+          continue;
-+        }
-+
-+        rewriter.setInsertionPoint(castOp);
-+        auto output = rewriter.create<d2m::EmptyOp>(
-+            castOp.getLoc(), mlir::cast<RankedTensorType>(view.getType()),
-+            /*virtualGridInverseMapping=*/nullptr,
-+            /*virtualGridForwardMapping=*/nullptr);
-+        auto materialized = rewriter.create<d2m::ToLayoutOp>(
-+            castOp.getLoc(), view, output);
-+        rewriter.modifyOpInPlace(castOp, [&]() {
-+          castOp.getInputMutable().assign(materialized.getResult(0));
-+        });
-+        changed = true;
-+        continue;
-+      }
-+
-       // Insert a generic op to materialize the view before returning. This
-       // ensures the tensor transformation represented by the view actually
-       // occurs, rather than just being a symbolic operation.
-@@ -272,7 +351,7 @@ public:
-       }
-     }
-
--    if (replacements.empty()) {
-+    if (!changed && replacements.empty()) {
-       return failure();
-     }
-
+   void runOnOperation() final {
+     RewritePatternSet patterns(&getContext());
+-    patterns.add<MaterializeReturnViewPattern,
++    patterns.add<MaterializeSharedCompositeViewPattern,
++                 MaterializeReturnViewPattern,
+                  MaterializeToHostViewPattern<d2m::ToHostOp>,
+                  MaterializeToHostViewPattern<d2m::ToLayoutOp>>(&getContext());
+     walkAndApplyPatterns(getOperation(), std::move(patterns));
 diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
 --- a/lib/Dialect/D2M/Utils/Utils.cpp
 +++ b/lib/Dialect/D2M/Utils/Utils.cpp
@@ -934,7 +834,7 @@ diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3676,9 +3676,11 @@ public:
+@@ -3755,9 +3755,11 @@ public:
        patterns.add<HardsigmoidFusionPattern>(&getContext());
        patterns.add<MishFusingPattern>(&getContext());
        patterns.add<ReshapeBroadcastReshapeToRepeatPattern>(&getContext());
@@ -1010,6 +910,22 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
              visitedOps.contains(producer) || fusionSet.contains(producer)) {
            continue;
          }
+@@ -185,11 +191,10 @@ public:
+       return;
+     }
+
+-    IRRewriter rewriter(&getContext());
+-    for (unsigned groupIdx = 0; groupIdx < fusionGroups.size(); ++groupIdx) {
+-      if (failed(wrapFusionGroup(fusionGroups[groupIdx], rewriter, groupIdx))) {
+-        signalPassFailure();
+-        return;
++    for (const auto &fusionGroup : fusionGroups) {
++      for (Operation *op : fusionGroup) {
++        op->setAttr("ttnn.hoist_generic_via_d2m",
++                    UnitAttr::get(&getContext()));
+       }
+     }
+   }
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
@@ -1077,14 +993,14 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +    collectFunctionBoundary(opsToHoist, inputs, outputs, scratch);
 
 +    llvm::SmallVector<mlir::Value> traceInputs;
-+    for (mlir::Value input : inputs) {
+     for (mlir::Value input : inputs) {
 +      if (!isSemaphoreValue(input)) {
 +        traceInputs.push_back(input);
 +      }
 +    }
 +    const size_t scratchBegin = traceInputs.size();
 +    traceInputs.append(scratch);
-     for (mlir::Value input : inputs) {
++    for (mlir::Value input : inputs) {
 +      if (isSemaphoreValue(input)) {
 +        traceInputs.push_back(input);
 +      }
