@@ -27,7 +27,7 @@ index 386d007..23044cf 100644
      let description = [{
        Generic operation capable of running a program with custom kernels. Each kernel is described with a
 diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
-index 12ac5d5..a6dbf11 100644
+index 12ac5d5..a783032 100644
 --- a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 +++ b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 @@ -320,9 +320,21 @@ protected:
@@ -101,133 +101,135 @@ index 12ac5d5..a6dbf11 100644
      assert(inputs.size() == 1);
      assert(outputs.size() == 1);
 
-@@ -2936,11 +2960,11 @@ public:
-   D2MConcatRewriter(const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
-                     ttcore::MemorySpace defaultInputMemSpace,
-                     ttcore::MemorySpace defaultOutputMemSpace,
--                    bool /*ttnnMode*/, bool /*collapseTensors*/,
-+                    bool ttnnMode, bool /*collapseTensors*/,
-                     bool enableMulticastInference)
-       : OpConversionPattern<ttir::ConcatOp>(typeConverter, ctx),
-         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
--                               /*ttnnMode=*/false, /*collapseTensors=*/false,
-+                               ttnnMode, /*collapseTensors=*/false,
-                                enableMulticastInference) {}
+@@ -2928,6 +2952,117 @@ private:
+ } // namespace
 
-   LogicalResult
-@@ -3042,16 +3066,86 @@ public:
-
-     auto origOutputs = createDpsOutputs(loc, rewriter, {effectiveOutputType});
-
-+    // A collapsed concat needs no DMA expansion when its producers can write
-+    // directly into the shared concat output. Keep all other concats in the
-+    // original uncollapsed representation.
+ namespace {
++template <typename Op>
++class D2MCollapsedOpRewriter : public OpConversionPattern<Op>,
++                               protected D2MNamedRewriterCommon {
++public:
++  D2MCollapsedOpRewriter(const TypeConverter &typeConverter,
++                         mlir::MLIRContext *ctx,
++                         ttcore::MemorySpace defaultInputMemSpace,
++                         ttcore::MemorySpace defaultOutputMemSpace,
++                         bool enableMulticastInference)
++      : OpConversionPattern<Op>(typeConverter, ctx, PatternBenefit(2)),
++        D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
++                               /*ttnnMode=*/true, /*collapseTensors=*/false,
++                               enableMulticastInference) {}
++};
++
++class D2MCollapsedConcatRewriter final
++    : public D2MCollapsedOpRewriter<ttir::ConcatOp> {
++public:
++  using D2MCollapsedOpRewriter<ttir::ConcatOp>::D2MCollapsedOpRewriter;
++
++  LogicalResult
++  matchAndRewrite(ttir::ConcatOp op, ttir::ConcatOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const final {
++    auto outType = mlir::cast<RankedTensorType>(op.getResult().getType());
++    const int64_t rank = outType.getRank();
++    int32_t dim = op.getDim();
++    if (dim < 0) {
++      dim += rank;
++    }
++
++    if (adaptor.getOperands().size() <= 1 || dim != rank - 1) {
++      return rewriter.notifyMatchFailure(op,
++                                         "not a collapsed width concat");
++    }
++    constexpr auto tileShape = ttcore::TileType::getDefaultShape();
++    for (Value input : op.getInputs().drop_back()) {
++      auto inputType = mlir::cast<RankedTensorType>(input.getType());
++      if (inputType.getShape()[dim] % tileShape[1] != 0) {
++        return rewriter.notifyMatchFailure(op,
++                                           "requires row-major concat");
++      }
++    }
++
 +    SmallVector<d2m::GenericOp> producers;
-+    if (ttnnMode && !concatRowMajor && dim == rank - 1) {
-+      producers.reserve(effectiveInputs.size());
-+      for (Value input : effectiveInputs) {
-+        auto cast = input.getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
-+        auto inputType =
-+            cast ? mlir::dyn_cast<RankedTensorType>(cast.getInput().getType())
-+                 : nullptr;
-+        auto layout =
-+            inputType ? mlir::dyn_cast_if_present<ttcore::MetalLayoutAttr>(
-+                            inputType.getEncoding())
-+                      : nullptr;
-+        auto producer =
-+            cast ? cast.getInput().getDefiningOp<d2m::GenericOp>() : nullptr;
-+        if (!producer || producer.getOutputs().size() != 1 ||
-+            producer->getBlock() != op->getBlock() || !layout ||
-+            layout.getMemorySpace() != memorySpaces[0] ||
-+            !mlir::isa<ttcore::TileType>(inputType.getElementType())) {
-+          producers.clear();
-+          break;
-+        }
-+        producers.push_back(producer);
++    producers.reserve(adaptor.getOperands().size());
++    for (Value input : adaptor.getOperands()) {
++      auto cast = input.getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
++      auto inputType =
++          cast ? mlir::dyn_cast<RankedTensorType>(cast.getInput().getType())
++               : nullptr;
++      auto layout =
++          inputType ? mlir::dyn_cast_if_present<ttcore::MetalLayoutAttr>(
++                          inputType.getEncoding())
++                    : nullptr;
++      auto producer =
++          cast ? cast.getInput().getDefiningOp<d2m::GenericOp>() : nullptr;
++      if (!producer || producer.getOutputs().size() != 1 ||
++          producer->getBlock() != op->getBlock() || !layout ||
++          layout.getMemorySpace() != memorySpaces[0] ||
++          !mlir::isa<ttcore::TileType>(inputType.getElementType())) {
++        return rewriter.notifyMatchFailure(op,
++                                           "inputs cannot write concat output");
 +      }
++      producers.push_back(producer);
 +    }
 +
-+    const bool directWrite = producers.size() == effectiveInputs.size();
-     auto [inputs, outputs] = toLayoutOperandsAndResults(
-         rewriter, {effectiveInputs, origOutputs},
--        /*tiled=*/!concatRowMajor, /*noCollapse=*/true);
-+        /*tiled=*/!concatRowMajor,
-+        /*noCollapse=*/!directWrite);
++    auto loc = op.getLoc();
++    auto origOutputs = createDpsOutputs(loc, rewriter, {outType});
++    auto [inputs, outputs] = toLayoutOperandsAndResults(
++        rewriter, {adaptor.getOperands(), origOutputs},
++        /*tiled=*/true, /*noCollapse=*/false);
 +
-+    // A tiled width concat can be represented by having each producer write
-+    // directly into its portion of the concat output. Besides removing the
-+    // concat copy, this preserves the same allocation boundary as a
-+    // destination-style concat kernel.
-+    if (directWrite) {
-+      auto outputCast = mlir::cast<ttir::TTNNMetalLayoutCastOp>(
-+          outputs[0].getDefiningOp());
-+      Operation *outputEmpty = outputCast.getInput().getDefiningOp();
-+      TT_assert((mlir::isa<ttir::EmptyOp, d2m::EmptyOp>(outputEmpty)));
++    auto outputCast = mlir::cast<ttir::TTNNMetalLayoutCastOp>(
++        outputs[0].getDefiningOp());
++    Operation *outputEmpty = outputCast.getInput().getDefiningOp();
++    TT_assert((mlir::isa<ttir::EmptyOp, d2m::EmptyOp>(outputEmpty)));
 +
-+      Operation *insertBefore =
-+          *llvm::min_element(producers, [](d2m::GenericOp lhs,
-+                                          d2m::GenericOp rhs) {
-+            return lhs->isBeforeInBlock(rhs);
-+          });
-+      outputEmpty->moveBefore(insertBefore);
-+      outputCast->moveBefore(insertBefore);
-+
-+      rewriter.setInsertionPoint(insertBefore);
-+      int64_t offset = 0;
-+      for (auto [input, producer] : llvm::zip_equal(inputs, producers)) {
-+        auto inputType = mlir::cast<RankedTensorType>(input.getType());
-+        auto remapping = ttmlir::utils::applyOffsetsToAffineMapResults(
-+            rewriter.getMultiDimIdentityMap(inputType.getRank()), {offset},
-+            inputType.getRank() - 1);
-+        auto view = rewriter.create<d2m::ViewLayoutOp>(
-+            loc, inputType, outputs[0], remapping,
-+            /*reinterpretLayout=*/false);
-
--    auto compositeView = rewriter.create<d2m::CompositeViewOp>(
--        loc, outputs[0].getType(), inputs, dim, logicalSizesAttr);
-+        Value oldOutput = producer.getOutputs().front();
-+        producer.getOutputsMutable().assign(view.getResult());
-+        oldOutput.replaceUsesWithIf(view.getResult(), [&](OpOperand &use) {
-+          return producer->isProperAncestor(use.getOwner());
++    Operation *insertBefore =
++        *llvm::min_element(producers, [](d2m::GenericOp lhs,
++                                        d2m::GenericOp rhs) {
++          return lhs->isBeforeInBlock(rhs);
 +        });
-+        offset += inputType.getShape().back();
-+      }
-+      rewriter.setInsertionPoint(op);
++    outputEmpty->moveBefore(insertBefore);
++    outputCast->moveBefore(insertBefore);
++
++    rewriter.setInsertionPoint(insertBefore);
++    int64_t offset = 0;
++    for (auto [input, producer] : llvm::zip_equal(inputs, producers)) {
++      auto inputType = mlir::cast<RankedTensorType>(input.getType());
++      auto remapping = ttmlir::utils::applyOffsetsToAffineMapResults(
++          rewriter.getMultiDimIdentityMap(inputType.getRank()), {offset},
++          inputType.getRank() - 1);
++      auto view = rewriter.create<d2m::ViewLayoutOp>(
++          loc, inputType, outputs[0], remapping,
++          /*reinterpretLayout=*/false);
++
++      Value oldOutput = producer.getOutputs().front();
++      producer.getOutputsMutable().assign(view.getResult());
++      oldOutput.replaceUsesWithIf(view.getResult(), [&](OpOperand &use) {
++        return producer->isProperAncestor(use.getOwner());
++      });
++      offset += inputType.getShape().back();
 +    }
-
--    auto result = unLayoutResult(rewriter, compositeView->getResult(0),
--                                 effectiveOutputType)
--                      ->getResult(0);
-+    Value concatResult = outputs[0];
-+    if (!directWrite) {
-+      concatResult = rewriter.create<d2m::CompositeViewOp>(
-+          loc, outputs[0].getType(), inputs, dim, logicalSizesAttr);
-+    }
-+    Value result =
-+        unLayoutResult(rewriter, concatResult, effectiveOutputType)->getResult(0);
-
-     if (transposeRowMajor) {
-       auto postTranspose = rewriter.create<ttir::PermuteOp>(
-@@ -4798,6 +4892,85 @@ public:
++
++    rewriter.setInsertionPoint(op);
++    Value result = unLayoutResult(rewriter, outputs[0], outType)->getResult(0);
++    rewriter.replaceOp(op, result);
++    return success();
++  }
++};
++
+ class D2MConcatRewriter final
+     : public mlir::OpConversionPattern<ttir::ConcatOp>,
+       D2MNamedRewriterCommon {
+@@ -4798,6 +4933,76 @@ public:
                            builder.getContext());
    }
  };
 +
 +template <typename TensorManipulationOp>
 +class D2MCollapsedViewRewriter
-+    : public OpConversionPattern<TensorManipulationOp>,
-+      D2MNamedRewriterCommon {
++    : public D2MCollapsedOpRewriter<TensorManipulationOp> {
 +public:
-+  D2MCollapsedViewRewriter(const TypeConverter &typeConverter,
-+                           mlir::MLIRContext *ctx,
-+                           ttcore::MemorySpace defaultInputMemSpace,
-+                           ttcore::MemorySpace defaultOutputMemSpace,
-+                           bool enableMulticastInference)
-+      : OpConversionPattern<TensorManipulationOp>(typeConverter, ctx,
-+                                                  PatternBenefit(2)),
-+        D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
-+                               /*ttnnMode=*/true, /*collapseTensors=*/false,
-+                               enableMulticastInference) {}
++  using D2MCollapsedOpRewriter<
++      TensorManipulationOp>::D2MCollapsedOpRewriter;
 +
 +  LogicalResult
 +  matchAndRewrite(TensorManipulationOp op,
@@ -263,13 +265,13 @@ index 12ac5d5..a6dbf11 100644
 +      }
 +    }
 +
-+    Value input = createOptimalLayoutOp(
-+        adaptor.getInput(), memorySpaces[0], /*tiled=*/true,
++    Value input = this->createOptimalLayoutOp(
++        adaptor.getInput(), this->memorySpaces[0], /*tiled=*/true,
 +        /*noCollapse=*/false, rewriter);
 +    auto inputType = mlir::cast<RankedTensorType>(input.getType());
 +    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
 +    auto resultMetalType =
-+        getMetalTensorFromTTNNTensor(rewriter, op.getResult());
++        this->getMetalTensorFromTTNNTensor(rewriter, op.getResult());
 +    AffineMap remapping;
 +    if constexpr (std::is_same_v<TensorManipulationOp, ttir::ReshapeOp>) {
 +      remapping = ttmlir::utils::calculateReblockMap(
@@ -287,19 +289,20 @@ index 12ac5d5..a6dbf11 100644
 +        op.getLoc(), resultMetalType, input, remapping,
 +        /*reinterpretLayout=*/false);
 +    rewriter.replaceOp(
-+        op, unLayoutResult(rewriter, view.getResult(), resultType));
++        op, this->unLayoutResult(rewriter, view.getResult(), resultType));
 +    return success();
 +  }
 +};
  } // namespace
 
  static TensorManipulationInfo rearrangeLogicalInfo(ttir::RearrangeOp op) {
-@@ -5921,6 +6094,13 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -5921,6 +6126,14 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
      D2MAllGatherRewriter
    >(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, ttnnMode, collapseTensors, enableMulticastInference);
 
 +  if (ttnnMode && collapseTensors) {
 +    patterns.add<
++      D2MCollapsedConcatRewriter,
 +      D2MCollapsedViewRewriter<ttir::ReshapeOp>,
 +      D2MCollapsedViewRewriter<ttir::SliceStaticOp>
 +    >(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, enableMulticastInference);
