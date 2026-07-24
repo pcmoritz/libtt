@@ -279,6 +279,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_fuse_shared_lhs_matmul_pairs.patch",
         "//third_party/tt_xla:tt_mlir_single_chip_activation_dtype_lowering.patch",
         "//third_party/tt_xla:tt_mlir_fuse_rank3_rope_decode.patch",
+        "//third_party/tt_xla:tt_mlir_general_fusion.patch",
         "//third_party/tt_xla:tt_mlir_qwen_decode_qkv_projection_fusion.patch",
         "//third_party/tt_xla:tt_mlir_kv_cache_dtype_return_types.patch",
         "//third_party/tt_xla:tt_mlir_sharded_decode_rms_norm.patch",

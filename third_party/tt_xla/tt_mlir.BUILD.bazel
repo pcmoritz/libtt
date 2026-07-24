@@ -1003,6 +1003,27 @@ gentbl_cc_library(
     deps = [":ttmlir_td_files"],
 )
 
+genrule(
+    name = "ttkernel_llk_headers",
+    srcs = glob(["include/ttmlir/Target/TTKernel/LLKs/experimental_*.h"]),
+    outs = [
+        src[:-2] + "_generated.h"
+        for src in glob(["include/ttmlir/Target/TTKernel/LLKs/experimental_*.h"])
+    ],
+    cmd = """
+for src in $(SRCS); do
+  name=$$(basename "$$src" .h)
+  out="$(@D)/include/ttmlir/Target/TTKernel/LLKs/$${name}_generated.h"
+  mkdir -p "$$(dirname "$$out")"
+  printf '// Auto-generated from %s - Do not edit directly\n' "$$src" > "$$out"
+  printf 'static constexpr char %s_generated[] = R"TTMLIR_STR_DELIM(\n' "$$name" >> "$$out"
+  cat "$$src" >> "$$out"
+  printf ')TTMLIR_STR_DELIM";\n' >> "$$out"
+  printf 'static constexpr unsigned int %s_generated_len = sizeof(%s_generated) - 1;\n' "$$name" "$$name" >> "$$out"
+done
+""",
+)
+
 cc_library(
     name = "public_headers",
     hdrs = glob(
@@ -1013,7 +1034,7 @@ cc_library(
             "runtime/include/**/*.hpp",
         ],
         allow_empty = True,
-    ),
+    ) + [":ttkernel_llk_headers"],
     includes = [
         "include",
         "runtime/include",
@@ -1240,12 +1261,20 @@ cc_library(
         "@//third_party/tt_xla:tt_mlir_compiler_cold_stubs.cc",
     ] + glob(
         [
+            "lib/Conversion/ArithToD2MTileOps/**/*.cpp",
+            "lib/Conversion/D2MToTTKernel/**/*.cpp",
+            "lib/Conversion/D2MToTTMetal/**/*.cpp",
+            "lib/Conversion/D2MToTTNN/**/*.cpp",
+            "lib/Conversion/MathToD2MTileOps/**/*.cpp",
             "lib/Conversion/StableHLOToTTIR/**/*.cpp",
+            "lib/Conversion/TTIRToD2M/**/*.cpp",
             "lib/Conversion/TTIRToLinalg/**/*.cpp",
             "lib/Conversion/TTIRToTTIRDecomposition/**/*.cpp",
             "lib/Conversion/TTIRToTTNN/**/*.cpp",
+            "lib/Conversion/TTKernelToEmitC/**/*.cpp",
             "lib/Conversion/TTNNToEmitC/**/*.cpp",
             "lib/Conversion/TTNNToTTIR/**/*.cpp",
+            "lib/Dialect/D2M/**/*.cpp",
             "lib/Dialect/Debug/**/*.cpp",
             "lib/Dialect/EmitPy/**/*.cpp",
             "lib/Dialect/Linalg/**/*.cpp",
@@ -1253,13 +1282,14 @@ cc_library(
             "lib/Dialect/StableHLO/**/*.cpp",
             "lib/Dialect/TTCore/**/*.cpp",
             "lib/Dialect/TTIR/**/*.cpp",
-            "lib/Dialect/TTKernel/IR/**/*.cpp",
+            "lib/Dialect/TTKernel/**/*.cpp",
             "lib/Dialect/TTMetal/IR/**/*.cpp",
             "lib/Dialect/TTNN/**/*.cpp",
             "lib/OpModel/TTNN/**/*.cpp",
             "lib/Scheduler/**/*.cpp",
             "lib/Support/**/*.cpp",
             "lib/Target/TTNN/**/*.cpp",
+            "lib/Target/TTKernel/**/*.cpp",
             "lib/Transforms/**/*.cpp",
         ],
         exclude = [
