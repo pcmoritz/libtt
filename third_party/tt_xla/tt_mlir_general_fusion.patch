@@ -27,7 +27,7 @@ index 386d007..23044cf 100644
      let description = [{
        Generic operation capable of running a program with custom kernels. Each kernel is described with a
 diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
-index 12ac5d5..22cb9fb 100644
+index 12ac5d5..a6dbf11 100644
 --- a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 +++ b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 @@ -320,9 +320,21 @@ protected:
@@ -208,109 +208,106 @@ index 12ac5d5..22cb9fb 100644
 
      if (transposeRowMajor) {
        auto postTranspose = rewriter.create<ttir::PermuteOp>(
-@@ -4695,12 +4789,13 @@ public:
-                                   mlir::MLIRContext *ctx,
-                                   ttcore::MemorySpace defaultInputMemSpace,
-                                   ttcore::MemorySpace defaultOutputMemSpace,
--                                  bool ttnnMode, bool /*collapseTensors*/,
-+                                  bool ttnnMode, bool collapseTensors,
-                                   bool enableMulticastInference)
-       : OpConversionPattern<TensorManipulationOp>(typeConverter, ctx),
-         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
-                                ttnnMode, /*collapse*/ false,
--                               enableMulticastInference) {}
-+                               enableMulticastInference),
-+        preferCollapsedViews(collapseTensors) {}
-
-   LogicalResult
-   matchAndRewrite(TensorManipulationOp op,
-@@ -4715,6 +4810,76 @@ public:
-     }
-
-     TensorManipulationInfo info = LogicalInfoFn(op);
-+    if (ttnnMode && preferCollapsedViews) {
-+      auto rewriteCollapsedView = [&](auto getRemapping) {
-+        Value input = createOptimalLayoutOp(
-+            adaptor.getInput(), memorySpaces[0], /*tiled=*/true,
-+            /*noCollapse=*/false, rewriter);
-+        auto inputMetalType = mlir::cast<RankedTensorType>(input.getType());
-+        auto resultType =
-+            mlir::cast<RankedTensorType>(op.getResult().getType());
-+        auto resultMetalType =
-+            getMetalTensorFromTTNNTensor(rewriter, op.getResult());
-+        auto view = rewriter.create<d2m::ViewLayoutOp>(
-+            op.getLoc(), resultMetalType, input,
-+            getRemapping(inputMetalType, resultMetalType),
-+            /*reinterpretLayout=*/false);
-+        rewriter.replaceOp(
-+            op, unLayoutResult(rewriter, view.getResult(), resultType));
-+        return success();
-+      };
+@@ -4798,6 +4892,85 @@ public:
+                           builder.getContext());
+   }
+ };
 +
-+      if constexpr (std::is_same_v<TensorManipulationOp,
-+                                   ttir::SliceStaticOp>) {
-+        auto begins = extractFromIntegerArrayAttr<int32_t>(op.getBegins());
-+        auto ends = extractFromIntegerArrayAttr<int32_t>(op.getEnds());
-+        auto steps = extractFromIntegerArrayAttr<int32_t>(op.getStep());
-+        auto inputType =
-+            mlir::cast<RankedTensorType>(op.getInput().getType());
-+        const size_t rank = inputType.getRank();
-+        constexpr auto tileShape = ttcore::TileType::getDefaultShape();
-+        bool onlySlicesWidth =
-+            rank >= 2 && steps.back() == 1 &&
-+            begins.back() % tileShape[1] == 0 &&
-+            ends.back() % tileShape[1] == 0;
-+        for (size_t dim = 0; dim + 1 < rank; ++dim) {
-+          onlySlicesWidth &= begins[dim] == 0 && steps[dim] == 1 &&
-+                             ends[dim] == inputType.getShape()[dim];
-+        }
-+        if (onlySlicesWidth) {
-+          return rewriteCollapsedView(
-+              [&](RankedTensorType inputMetalType,
-+                  RankedTensorType resultMetalType) {
-+                TT_assert(inputMetalType.getRank() ==
-+                          resultMetalType.getRank());
-+                AffineMap remapping = rewriter.getMultiDimIdentityMap(
-+                    resultMetalType.getRank());
-+                return ttmlir::utils::applyOffsetsToAffineMapResults(
-+                    remapping, {begins.back() / tileShape[1]},
-+                    resultMetalType.getRank() - 1);
-+              });
-+        }
++template <typename TensorManipulationOp>
++class D2MCollapsedViewRewriter
++    : public OpConversionPattern<TensorManipulationOp>,
++      D2MNamedRewriterCommon {
++public:
++  D2MCollapsedViewRewriter(const TypeConverter &typeConverter,
++                           mlir::MLIRContext *ctx,
++                           ttcore::MemorySpace defaultInputMemSpace,
++                           ttcore::MemorySpace defaultOutputMemSpace,
++                           bool enableMulticastInference)
++      : OpConversionPattern<TensorManipulationOp>(typeConverter, ctx,
++                                                  PatternBenefit(2)),
++        D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
++                               /*ttnnMode=*/true, /*collapseTensors=*/false,
++                               enableMulticastInference) {}
++
++  LogicalResult
++  matchAndRewrite(TensorManipulationOp op,
++                  typename TensorManipulationOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    if constexpr (std::is_same_v<TensorManipulationOp, ttir::ReshapeOp>) {
++      auto inputType = mlir::cast<RankedTensorType>(op.getInput().getType());
++      auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
++      if (inputType.getRank() < 2 || resultType.getRank() < 2 ||
++          inputType.getShape().take_back(2) !=
++              resultType.getShape().take_back(2)) {
++        return rewriter.notifyMatchFailure(op,
++                                           "not a supported collapsed view");
 +      }
-+
-+      if constexpr (std::is_same_v<TensorManipulationOp, ttir::ReshapeOp>) {
-+        auto inputType =
-+            mlir::cast<RankedTensorType>(op.getInput().getType());
-+        auto resultType =
-+            mlir::cast<RankedTensorType>(op.getResult().getType());
-+        if (inputType.getRank() >= 2 && resultType.getRank() >= 2 &&
-+            inputType.getShape().take_back(2) ==
-+                resultType.getShape().take_back(2)) {
-+          return rewriteCollapsedView(
-+              [&](RankedTensorType inputMetalType,
-+                  RankedTensorType resultMetalType) {
-+                return ttmlir::utils::calculateReblockMap(
-+                    inputMetalType.getShape(), resultMetalType.getShape(),
-+                    rewriter.getContext());
-+              });
-+        }
++    } else {
++      auto begins = extractFromIntegerArrayAttr<int32_t>(op.getBegins());
++      auto ends = extractFromIntegerArrayAttr<int32_t>(op.getEnds());
++      auto steps = extractFromIntegerArrayAttr<int32_t>(op.getStep());
++      auto inputType = mlir::cast<RankedTensorType>(op.getInput().getType());
++      const size_t rank = inputType.getRank();
++      constexpr auto tileShape = ttcore::TileType::getDefaultShape();
++      bool onlySlicesWidth =
++          rank >= 2 && steps.back() == 1 &&
++          begins.back() % tileShape[1] == 0 &&
++          ends.back() % tileShape[1] == 0;
++      for (size_t dim = 0; dim + 1 < rank; ++dim) {
++        onlySlicesWidth &= begins[dim] == 0 && steps[dim] == 1 &&
++                           ends[dim] == inputType.getShape()[dim];
++      }
++      if (!onlySlicesWidth) {
++        return rewriter.notifyMatchFailure(op,
++                                           "not a supported collapsed view");
 +      }
 +    }
 +
-     AffineMap deviceMap =
-         projectLogicalMapToUnitDeviceSpace(rewriter, info.map);
-
-@@ -4797,6 +4962,9 @@ public:
-     return AffineMap::get(outputDeviceRank, 0, deviceExprs,
-                           builder.getContext());
-   }
-+
-+private:
-+  bool preferCollapsedViews;
- };
++    Value input = createOptimalLayoutOp(
++        adaptor.getInput(), memorySpaces[0], /*tiled=*/true,
++        /*noCollapse=*/false, rewriter);
++    auto inputType = mlir::cast<RankedTensorType>(input.getType());
++    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
++    auto resultMetalType =
++        getMetalTensorFromTTNNTensor(rewriter, op.getResult());
++    AffineMap remapping;
++    if constexpr (std::is_same_v<TensorManipulationOp, ttir::ReshapeOp>) {
++      remapping = ttmlir::utils::calculateReblockMap(
++          inputType.getShape(), resultMetalType.getShape(),
++          rewriter.getContext());
++    } else {
++      TT_assert(inputType.getRank() == resultMetalType.getRank());
++      auto begins = extractFromIntegerArrayAttr<int32_t>(op.getBegins());
++      constexpr auto tileShape = ttcore::TileType::getDefaultShape();
++      remapping = ttmlir::utils::applyOffsetsToAffineMapResults(
++          rewriter.getMultiDimIdentityMap(resultMetalType.getRank()),
++          {begins.back() / tileShape[1]}, resultMetalType.getRank() - 1);
++    }
++    auto view = rewriter.create<d2m::ViewLayoutOp>(
++        op.getLoc(), resultMetalType, input, remapping,
++        /*reinterpretLayout=*/false);
++    rewriter.replaceOp(
++        op, unLayoutResult(rewriter, view.getResult(), resultType));
++    return success();
++  }
++};
  } // namespace
 
+ static TensorManipulationInfo rearrangeLogicalInfo(ttir::RearrangeOp op) {
+@@ -5921,6 +6094,13 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+     D2MAllGatherRewriter
+   >(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, ttnnMode, collapseTensors, enableMulticastInference);
+
++  if (ttnnMode && collapseTensors) {
++    patterns.add<
++      D2MCollapsedViewRewriter<ttir::ReshapeOp>,
++      D2MCollapsedViewRewriter<ttir::SliceStaticOp>
++    >(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, enableMulticastInference);
++  }
++
+   // Handle SliceStatic cases that need a transpose-based rewrite to satisfy
+   // NoC alignment before the generic SliceStatic lowering consumes them.
+   patterns.add<D2MSliceStaticOpNoCConstraintsRewriter>(typeConverter, ctx);
 diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
 index c482273..9ab797d 100644
 --- a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
