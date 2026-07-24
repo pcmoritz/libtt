@@ -27,10 +27,10 @@ index 386d007..23044cf 100644
      let description = [{
        Generic operation capable of running a program with custom kernels. Each kernel is described with a
 diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
-index 12ac5d5..0bdcb84 100644
+index 12ac5d5..22cb9fb 100644
 --- a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 +++ b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
-@@ -320,9 +320,26 @@ protected:
+@@ -320,9 +320,21 @@ protected:
      bool isTTNN = isTTNNTensor(value.getType());
      if (isTTNN) {
        assert(ttnnMode && "Unexpected TTNN tensor as op operand");
@@ -41,25 +41,20 @@ index 12ac5d5..0bdcb84 100644
 -          value.getLoc(), metalTensorType, value);
 +      auto metalCastOp =
 +          value.getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
-+      auto producerType =
-+          metalCastOp
-+              ? mlir::dyn_cast<RankedTensorType>(metalCastOp.getInput().getType())
-+              : nullptr;
-+      bool reuseMetalInput =
-+          producerType && mlir::isa_and_nonnull<ttcore::MetalLayoutAttr>(
-+                              producerType.getEncoding());
-+      if (reuseMetalInput) {
-+        metalTensorType = producerType;
++      Value metalValue;
++      if (metalCastOp) {
++        metalValue = metalCastOp.getInput();
++        metalTensorType =
++            mlir::cast<RankedTensorType>(metalValue.getType());
 +      } else {
 +        metalCastOp = rewriter.create<ttir::TTNNMetalLayoutCastOp>(
 +            value.getLoc(), metalTensorType, value);
++        metalValue = metalCastOp;
 +      }
-+      Value metalValue =
-+          reuseMetalInput ? metalCastOp.getInput() : metalCastOp.getResult();
 
        // Propagate both VGM maps for height/width sharded TTNN layouts
        // so that downstream passes (GenericOp::build, getMemoryMap, etc.)
-@@ -368,12 +385,23 @@ protected:
+@@ -368,12 +380,23 @@ protected:
              newTensorShape, metalTensorType.getElementType(),
              metalTensorType.getEncoding());
          auto unitReblockingView = rewriter.create<d2m::ViewLayoutOp>(
@@ -68,7 +63,9 @@ index 12ac5d5..0bdcb84 100644
              /*reinterpretLayout=*/false);
 -        return unitReblockingView.getResult();
 +        metalValue = unitReblockingView.getResult();
-+      }
+       }
+-      // For DRAM operands, we can return the metal cast result directly.
+-      return metalCastOp->getResult(0);
 +      bool hasRequestedTiling =
 +          tiled == mlir::isa<ttcore::TileType>(metalTensorType.getElementType());
 +      bool hasRequestedRank =
@@ -77,9 +74,7 @@ index 12ac5d5..0bdcb84 100644
 +      if (metalTensorMemSpace == memSpace && hasRequestedTiling &&
 +          hasRequestedRank) {
 +        return metalValue;
-       }
--      // For DRAM operands, we can return the metal cast result directly.
--      return metalCastOp->getResult(0);
++      }
 +
 +      // Stage TTNN operands in the requested memory space before computation.
 +      logicalType = ttnnTensorType;
@@ -87,7 +82,7 @@ index 12ac5d5..0bdcb84 100644
      }
 
      auto tensorType = mlir::cast<mlir::RankedTensorType>(value.getType());
-@@ -1234,7 +1262,8 @@ private:
+@@ -1234,7 +1257,8 @@ private:
 
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
@@ -97,7 +92,7 @@ index 12ac5d5..0bdcb84 100644
      const std::size_t numInputs = inputs.size();
      const std::size_t numOutputs = outputs.size();
      const std::size_t numOperands = (numInputs + numOutputs);
-@@ -1610,7 +1639,7 @@ private:
+@@ -1610,7 +1634,7 @@ private:
 
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
@@ -106,7 +101,7 @@ index 12ac5d5..0bdcb84 100644
      assert(inputs.size() == 1);
      assert(outputs.size() == 1);
 
-@@ -2936,11 +2965,11 @@ public:
+@@ -2936,11 +2960,11 @@ public:
    D2MConcatRewriter(const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
                      ttcore::MemorySpace defaultInputMemSpace,
                      ttcore::MemorySpace defaultOutputMemSpace,
@@ -120,7 +115,7 @@ index 12ac5d5..0bdcb84 100644
                                 enableMulticastInference) {}
 
    LogicalResult
-@@ -3042,16 +3071,89 @@ public:
+@@ -3042,16 +3066,86 @@ public:
 
      auto origOutputs = createDpsOutputs(loc, rewriter, {effectiveOutputType});
 
@@ -203,20 +198,17 @@ index 12ac5d5..0bdcb84 100644
 -    auto result = unLayoutResult(rewriter, compositeView->getResult(0),
 -                                 effectiveOutputType)
 -                      ->getResult(0);
-+    Value result;
-+    if (directWrite) {
-+      result = unLayoutResult(rewriter, outputs[0], effectiveOutputType)
-+                   ->getResult(0);
-+    } else {
-+      auto compositeView = rewriter.create<d2m::CompositeViewOp>(
++    Value concatResult = outputs[0];
++    if (!directWrite) {
++      concatResult = rewriter.create<d2m::CompositeViewOp>(
 +          loc, outputs[0].getType(), inputs, dim, logicalSizesAttr);
-+      result = unLayoutResult(rewriter, compositeView, effectiveOutputType)
-+                   ->getResult(0);
 +    }
++    Value result =
++        unLayoutResult(rewriter, concatResult, effectiveOutputType)->getResult(0);
 
      if (transposeRowMajor) {
        auto postTranspose = rewriter.create<ttir::PermuteOp>(
-@@ -4695,12 +4797,13 @@ public:
+@@ -4695,12 +4789,13 @@ public:
                                    mlir::MLIRContext *ctx,
                                    ttcore::MemorySpace defaultInputMemSpace,
                                    ttcore::MemorySpace defaultOutputMemSpace,
@@ -232,11 +224,11 @@ index 12ac5d5..0bdcb84 100644
 
    LogicalResult
    matchAndRewrite(TensorManipulationOp op,
-@@ -4715,6 +4818,74 @@ public:
+@@ -4715,6 +4810,76 @@ public:
      }
 
      TensorManipulationInfo info = LogicalInfoFn(op);
-+    if (ttnnMode && preferCollapsedViews && info.canBeTilized) {
++    if (ttnnMode && preferCollapsedViews) {
 +      auto rewriteCollapsedView = [&](auto getRemapping) {
 +        Value input = createOptimalLayoutOp(
 +            adaptor.getInput(), memorySpaces[0], /*tiled=*/true,
@@ -263,7 +255,11 @@ index 12ac5d5..0bdcb84 100644
 +        auto inputType =
 +            mlir::cast<RankedTensorType>(op.getInput().getType());
 +        const size_t rank = inputType.getRank();
-+        bool onlySlicesWidth = rank >= 2 && steps.back() == 1;
++        constexpr auto tileShape = ttcore::TileType::getDefaultShape();
++        bool onlySlicesWidth =
++            rank >= 2 && steps.back() == 1 &&
++            begins.back() % tileShape[1] == 0 &&
++            ends.back() % tileShape[1] == 0;
 +        for (size_t dim = 0; dim + 1 < rank; ++dim) {
 +          onlySlicesWidth &= begins[dim] == 0 && steps[dim] == 1 &&
 +                             ends[dim] == inputType.getShape()[dim];
@@ -276,8 +272,6 @@ index 12ac5d5..0bdcb84 100644
 +                          resultMetalType.getRank());
 +                AffineMap remapping = rewriter.getMultiDimIdentityMap(
 +                    resultMetalType.getRank());
-+                constexpr auto tileShape =
-+                    ttcore::TileType::getDefaultShape();
 +                return ttmlir::utils::applyOffsetsToAffineMapResults(
 +                    remapping, {begins.back() / tileShape[1]},
 +                    resultMetalType.getRank() - 1);
@@ -307,7 +301,7 @@ index 12ac5d5..0bdcb84 100644
      AffineMap deviceMap =
          projectLogicalMapToUnitDeviceSpace(rewriter, info.map);
 
-@@ -4797,6 +4968,9 @@ public:
+@@ -4797,6 +4962,9 @@ public:
      return AffineMap::get(outputDeviceRank, 0, deviceExprs,
                            builder.getContext());
    }
@@ -316,48 +310,6 @@ index 12ac5d5..0bdcb84 100644
 +  bool preferCollapsedViews;
  };
  } // namespace
-
-@@ -4833,22 +5007,31 @@ static TensorManipulationInfo sliceLogicalInfo(ttir::SliceStaticOp op) {
-   assert(begins.size() ==
-          static_cast<size_t>(op.getResult().getType().getRank()));
-
--  SmallVector<AffineExpr> exprs;
--  for (size_t d = 0; d < begins.size(); d++) {
--    exprs.push_back(getAffineDimExpr(d, ctx) * step[d] + begins[d]);
--  }
--  AffineMap map = AffineMap::get(exprs.size(), 0, exprs, ctx);
-   bool canBeTilized = false;
-   size_t rank = begins.size();
-   if (rank >= 2) {
-     ArrayRef<int64_t> inputShape = op.getInput().getType().getShape();
-+    constexpr auto tileShape = ttcore::TileType::getDefaultShape();
-+    auto isTileAlignedOrFull = [&](size_t dim, int64_t tile) {
-+      return (begins[dim] == 0 && ends[dim] == inputShape[dim]) ||
-+             (begins[dim] % tile == 0 && ends[dim] % tile == 0);
-+    };
-     canBeTilized =
--        begins[rank - 2] == 0 &&
--        ends[rank - 2] == static_cast<int32_t>(inputShape[rank - 2]) &&
--        step[rank - 2] == 1 && begins[rank - 1] == 0 &&
--        ends[rank - 1] == static_cast<int32_t>(inputShape[rank - 1]) &&
--        step[rank - 1] == 1;
-+        step[rank - 2] == 1 && step[rank - 1] == 1 &&
-+        isTileAlignedOrFull(rank - 2, tileShape[0]) &&
-+        isTileAlignedOrFull(rank - 1, tileShape[1]);
-+  }
-+
-+  SmallVector<AffineExpr> exprs;
-+  for (size_t d = 0; d < begins.size(); d++) {
-+    int64_t offset = begins[d];
-+    if (canBeTilized && d >= rank - 2) {
-+      constexpr auto tileShape = ttcore::TileType::getDefaultShape();
-+      offset /= tileShape[d - (rank - 2)];
-+    }
-+    exprs.push_back(getAffineDimExpr(d, ctx) * step[d] + offset);
-   }
-+  AffineMap map = AffineMap::get(exprs.size(), 0, exprs, ctx);
-   return {map, canBeTilized};
- }
 
 diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
 index c482273..9ab797d 100644
@@ -554,7 +506,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 index 99777ee..7511dff 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -60,7 +60,8 @@ private:
+@@ -60,6 +60,7 @@ private:
      shouldHoist &= !::mlir::isa<mlir::tt::ttnn::CaptureOrExecuteTraceOp>(op);
      shouldHoist &= !::mlir::isa<mlir::tt::ttnn::GetDeviceOp>(op);
      shouldHoist &=
