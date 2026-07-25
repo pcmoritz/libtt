@@ -436,7 +436,7 @@ index 98743ae..58893b4 100644
        patterns.add<fusing::TopKFusingPattern>(&getContext());
 
 diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
-index d721b1f..9e36f4d 100644
+index d721b1f..d3fcd8b 100644
 --- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 +++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 @@ -48,7 +48,8 @@ void createTTNNPipelineTTIRPasses(
@@ -449,6 +449,25 @@ index d721b1f..9e36f4d 100644
    if (options.enableFusing) {
      pm.addPass(mlir::tt::ttir::createTTIRFusing(fusingOptions));
    }
+@@ -473,7 +476,6 @@ void createTTIRToTTNNBackendPipeline(
+                "enabled. Automatically enabling Optimizer as a dependency.\n";
+       }
+       options.optimizerPassEnabled = true;
+-      devicePm.addPass(tt::ttnn::createTTNNCreateD2MSubgraphs());
+     }
+ 
+     // Const-eval pass which should pick up any const-evalable ops created in
+@@ -495,9 +497,10 @@ void createTTIRToTTNNBackendPipeline(
+     devicePm.addPass(mlir::tt::ttnn::createTTNNPrepareConv3dWeights());
+ 
+     if (options.enableCreateD2MSubgraphs) {
++      devicePm.addPass(createTTNNCreateD2MSubgraphs());
+       TTNNPipelineD2MPassOptions d2mOptions;
+       d2mOptions.enableElementwiseFusion = options.enableD2MElementwiseFusion;
+       createTTNNPipelineD2MPass(devicePm, d2mOptions);
+       devicePm.addPass(createTTNNCollaspeD2M());
+       devicePm.addPass(createCanonicalizerPass());
+     }
 @@ -738,6 +739,8 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
    // only works on top-level modules (doesn't run module has a parent op).
    ttmetal::D2MPipelineOptions ttmetalOptions;
@@ -462,7 +481,15 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
 index 4a4753e..3e26a1c 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
-@@ -44,6 +44,8 @@ public:
+@@ -14,6 +14,7 @@
+ #include "mlir/IR/Builders.h"
+ #include "mlir/IR/BuiltinOps.h"
+ #include "mlir/IR/IRMapping.h"
++#include "mlir/IR/OperationSupport.h"
+ #include "mlir/IR/SymbolTable.h"
+ 
+ #include "llvm/ADT/DenseSet.h"
+@@ -44,6 +45,8 @@ public:
      if (!op) {
        return false;
      }
@@ -471,7 +498,7 @@ index 4a4753e..3e26a1c 100644
      // Eltwise unary ops.
      if (mlir::isa<AbsOp, CbrtOp, CeilOp, SignOp, CosOp, ExpOp, ErfOp, ErfcOp,
                    FloorOp, GeluOp, IsFiniteOp, LogicalNotOp, BitwiseNotOp,
-@@ -70,17 +72,7 @@ public:
+@@ -70,17 +73,7 @@ public:
 
  private:
    static bool isFusionGroupExit(Operation *op) {
@@ -490,22 +517,91 @@ index 4a4753e..3e26a1c 100644
    }
 
    void analyze(Operation *rootOp) {
-@@ -185,11 +177,10 @@ public:
+@@ -185,19 +178,22 @@ public:
        return;
      }
-
--    IRRewriter rewriter(&getContext());
--    for (unsigned groupIdx = 0; groupIdx < fusionGroups.size(); ++groupIdx) {
+ 
+     IRRewriter rewriter(&getContext());
++    SmallVector<func::FuncOp> outlinedFuncs;
+     for (unsigned groupIdx = 0; groupIdx < fusionGroups.size(); ++groupIdx) {
 -      if (failed(wrapFusionGroup(fusionGroups[groupIdx], rewriter, groupIdx))) {
--        signalPassFailure();
--        return;
-+    for (const auto &fusionGroup : fusionGroups) {
-+      for (Operation *op : fusionGroup) {
-+        op->setAttr("ttnn.hoist_generic_via_d2m",
-+                    UnitAttr::get(&getContext()));
++      if (failed(wrapFusionGroup(fusionGroups[groupIdx], rewriter, groupIdx,
++                                 outlinedFuncs))) {
+         signalPassFailure();
+         return;
        }
      }
    }
+ 
+ private:
+   LogicalResult wrapFusionGroup(llvm::ArrayRef<Operation *> fusionGroup,
+-                                IRRewriter &rewriter, unsigned groupIdx) {
++                                IRRewriter &rewriter, unsigned groupIdx,
++                                SmallVectorImpl<func::FuncOp> &outlinedFuncs) {
+     if (fusionGroup.empty()) {
+       return success();
+     }
+ 
+@@ -296,6 +292,19 @@ private:
+                     [&](Value v) { return mapping.lookup(v); });
+     rewriter.create<func::ReturnOp>(loc, returnValues);
+ 
++    auto equivalent =
++        llvm::find_if(outlinedFuncs, [&](func::FuncOp candidate) {
++          return OperationEquivalence::isRegionEquivalentTo(
++              &candidate.getBody(), &funcOp.getBody(),
++              OperationEquivalence::IgnoreLocations);
++        });
++    if (equivalent == outlinedFuncs.end()) {
++      outlinedFuncs.push_back(funcOp);
++    } else {
++      funcOp.erase();
++      funcOp = *equivalent;
++    }
++
+     // Place subgraph after all its operands: after last input definer and after
+     // the empty output buffers we just created (so output buffers dominate).
+     if (lastEmptyOp) {
+@@ -309,7 +318,7 @@ private:
+     }
+     auto dispatchOp = rewriter.create<D2MSubgraphOp>(
+         loc, outputTypes, inputs.getArrayRef(), outputBuffers,
+-        SymbolRefAttr::get(rewriter.getContext(), funcName));
++        SymbolRefAttr::get(rewriter.getContext(), funcOp.getName()));
+ 
+     for (auto [origOutput, dispatchResult] :
+          llvm::zip(outputs, dispatchOp.getResults())) {
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp b/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp
+index 5ecc945..27e33f8 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNCollaspeD2M.cpp
+@@ -10,7 +10,7 @@
+ #include "mlir/IR/BuiltinOps.h"
+ #include "mlir/IR/IRMapping.h"
+ 
+-#include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/SetVector.h"
+ 
+ namespace mlir::tt::ttnn {
+ #define GEN_PASS_DEF_TTNNCOLLASPED2M
+@@ -25,7 +25,7 @@ public:
+ 
+   void runOnOperation() final {
+     ModuleOp moduleOp = getOperation();
+-    SmallVector<func::FuncOp> funcsToDelete;
++    llvm::SetVector<func::FuncOp> funcsToDelete;
+ 
+     moduleOp.walk([&](D2MSubgraphOp dispatchOp) {
+       func::FuncOp mainFunc = dispatchOp.getD2MMainFunc();
+@@ -33,7 +33,7 @@ public:
+         signalPassFailure();
+         return;
+       }
+-      funcsToDelete.push_back(mainFunc);
++      funcsToDelete.insert(mainFunc);
+     });
+ 
+     for (func::FuncOp func : funcsToDelete) {
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 index 99777ee..7511dff 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
