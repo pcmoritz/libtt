@@ -364,6 +364,18 @@ index 65fd915..10d8806 100644
  }
  
  mlir::tt::ttcore::DeviceAttr d2m::GenericOp::getDevice() {
+diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
+index 85cfe53..1f3395e 100644
+--- a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
++++ b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
+@@ -129,6 +129,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
+     fusionOptions.enableEltwiseReductionFusion =
+         options.enableEltwiseReductionFusion;
+     pm.addPass(d2m::createD2MGenericFusion(fusionOptions));
++    pm.addPass(d2m::createD2MGridSelection(gridOptOptions));
+   }
+   pm.addPass(mlir::createCanonicalizerPass());
+   createTTIRBufferizationPipeline(pm, options);
 diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Transforms/GridSelection.cpp
 index e1c883c..039eba7 100644
 --- a/lib/Dialect/D2M/Transforms/GridSelection.cpp
