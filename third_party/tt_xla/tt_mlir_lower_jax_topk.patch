@@ -10,24 +10,23 @@ index 774619b9..516829bb 100644
  
      auto dictAttr = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
          srcOp->getDiscardableAttr("mhlo.attributes"));
-@@ -9574,13 +9573,22 @@ public:
+@@ -9574,13 +9573,21 @@ public:
      int32_t kValueI32 = static_cast<int32_t>(kValueI64.getSExtValue());
      kAttr = IntegerAttr::get(rewriter.getIntegerType(32), kValueI32);
  
-+    // JAX's mhlo.topk carries only k; largest and sorted are implicit.
++    // mhlo.topk defaults largest to true and always returns ordered results.
      auto largestAttr = dictAttr.getAs<BoolAttr>("largest");
-+    auto sortedAttr = BoolAttr::get(rewriter.getContext(), !largestAttr);
      if (!largestAttr) {
 -      return rewriter.notifyMatchFailure(
 -          srcOp, "Missing largest attribute in mhlo.attributes");
-+      largestAttr = BoolAttr::get(rewriter.getContext(), true);
++      largestAttr = rewriter.getBoolAttr(true);
      }
  
 -    rewriter.replaceOpWithNewOp<ttir::TopKOp>(srcOp, resultTypes, input, kAttr,
 -                                              dimAttr, largestAttr, sortedAttr);
 +    auto topK = rewriter.create<ttir::TopKOp>(
 +        srcOp.getLoc(), resultTypes, input, kAttr, dimAttr, largestAttr,
-+        sortedAttr);
++        rewriter.getBoolAttr(true));
 +    Value values = topK.getValues();
 +    auto inputType = cast<RankedTensorType>(input.getType());
 +    if (inputType.getElementType().isF32()) {
