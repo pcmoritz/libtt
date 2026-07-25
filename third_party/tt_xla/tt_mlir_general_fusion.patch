@@ -12,7 +12,7 @@ index 7ade810..9a9aa65 100644
 +             "Fuse primitive rotary embedding graphs into a named composite">,
    ];
  }
-
+ 
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 index 386d007..23044cf 100644
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
@@ -20,7 +20,7 @@ index 386d007..23044cf 100644
 @@ -3612,7 +3612,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
    let hasVerifier = 1;
  }
-
+ 
 -def TTNN_GenericOp : TTNN_Op<"generic", [AttrSizedOperandSegments, MemoryEffects<[MemRead, MemWrite]>, TTCore_NonCacheableTrait, OpModelExempt]> {
 +def TTNN_GenericOp : TTNN_InplaceOp<"generic", [AttrSizedOperandSegments, TTCore_NonCacheableTrait, OpModelExempt]> {
      let summary = "Generic operation.";
@@ -51,7 +51,7 @@ index 12ac5d5..44537fb 100644
 +            value.getLoc(), metalTensorType, value);
 +        metalValue = metalCastOp;
 +      }
-
+ 
        // Propagate both VGM maps for height/width sharded TTNN layouts
        // so that downstream passes (GenericOp::build, getMemoryMap, etc.)
 @@ -368,12 +380,23 @@ protected:
@@ -63,9 +63,7 @@ index 12ac5d5..44537fb 100644
              /*reinterpretLayout=*/false);
 -        return unitReblockingView.getResult();
 +        metalValue = unitReblockingView.getResult();
-       }
--      // For DRAM operands, we can return the metal cast result directly.
--      return metalCastOp->getResult(0);
++      }
 +      bool hasRequestedTiling =
 +          tiled == mlir::isa<ttcore::TileType>(metalTensorType.getElementType());
 +      bool hasRequestedRank =
@@ -74,16 +72,18 @@ index 12ac5d5..44537fb 100644
 +      if (metalTensorMemSpace == memSpace && hasRequestedTiling &&
 +          hasRequestedRank) {
 +        return metalValue;
-+      }
+       }
+-      // For DRAM operands, we can return the metal cast result directly.
+-      return metalCastOp->getResult(0);
 +
 +      // Stage TTNN operands in the requested memory space before computation.
 +      logicalType = ttnnTensorType;
 +      value = metalValue;
      }
-
+ 
      auto tensorType = mlir::cast<mlir::RankedTensorType>(value.getType());
 @@ -1234,7 +1257,8 @@ private:
-
+ 
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
 -                                   /*tiled*/ true, isImplicitBcast);
@@ -93,17 +93,17 @@ index 12ac5d5..44537fb 100644
      const std::size_t numOutputs = outputs.size();
      const std::size_t numOperands = (numInputs + numOutputs);
 @@ -1610,7 +1634,7 @@ private:
-
+ 
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
 -                                   /*tiled=*/true, /*noCollapse=*/true);
 +                                   /*tiled=*/true, /*noCollapse=*/false);
      assert(inputs.size() == 1);
      assert(outputs.size() == 1);
-
+ 
 @@ -2928,6 +2952,121 @@ private:
  } // namespace
-
+ 
  namespace {
 +template <typename Op>
 +class D2MCollapsedOpRewriter : public OpConversionPattern<Op>,
@@ -298,12 +298,12 @@ index 12ac5d5..44537fb 100644
 +  }
 +};
  } // namespace
-
+ 
  static TensorManipulationInfo rearrangeLogicalInfo(ttir::RearrangeOp op) {
 @@ -5921,6 +6130,14 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
      D2MAllGatherRewriter
    >(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, ttnnMode, collapseTensors, enableMulticastInference);
-
+ 
 +  if (ttnnMode && collapseTensors) {
 +    patterns.add<
 +      D2MCollapsedConcatRewriter,
@@ -322,13 +322,13 @@ index c482273..9ab797d 100644
 @@ -31,8 +31,9 @@ public:
      auto outputType = mlir::cast<mlir::RankedTensorType>(
          this->getTypeConverter()->convertType(srcOp.getResult().getType()));
-
+ 
 -    rewriter.replaceOpWithNewOp<DestOp>(srcOp, outputType,
 -                                        adaptor.getOperands());
 +    rewriter.replaceOpWithNewOp<DestOp>(
 +        srcOp, mlir::TypeRange{outputType}, adaptor.getOperands(),
 +        srcOp->getAttrs());
-
+ 
      return mlir::success();
    }
 @@ -407,6 +408,14 @@ void populateTTNNToTTIRPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
@@ -344,7 +344,7 @@ index c482273..9ab797d 100644
 +                                    mlir::tt::ttir::SliceStaticOp>>(
 +      typeConverter, ctx);
  }
-
+ 
  } // namespace mlir::tt
 diff --git a/lib/Dialect/D2M/IR/D2MOps.cpp b/lib/Dialect/D2M/IR/D2MOps.cpp
 index 65fd915..10d8806 100644
@@ -362,7 +362,7 @@ index 65fd915..10d8806 100644
 +    }
 +  }
  }
-
+ 
  mlir::tt::ttcore::DeviceAttr d2m::GenericOp::getDevice() {
 diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Transforms/GridSelection.cpp
 index e1c883c..039eba7 100644
@@ -386,7 +386,7 @@ index b6e4d3d..2558763 100644
 @@ -341,6 +341,15 @@ Plan canonicalize(const PlanState &src, const PlanState &tgt,
      updateStateFromOutput(current, output);
    }
-
+ 
 +  // Same-grid DRAM copies can write directly to the target.
 +  if (needsDramBounce(current, tgt) &&
 +      current.getGridShape() == tgt.getGridShape() &&
@@ -434,7 +434,7 @@ index 98743ae..58893b4 100644
 +      }
        patterns.add<fusing::SDPAFusingPattern>(&getContext());
        patterns.add<fusing::TopKFusingPattern>(&getContext());
-
+ 
 diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 index d721b1f..9e36f4d 100644
 --- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
@@ -459,58 +459,43 @@ index d721b1f..9e36f4d 100644
    ttmetal::createD2MFrontendPipeline(pm, ttmetalOptions);
    ttmetal::createD2MBackendPipeline(pm, ttmetalOptions);
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
-index 4a4753e..3e26a1c 100644
+index 4a4753e..2962f00 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
-@@ -44,6 +44,8 @@ public:
-     if (!op) {
-       return false;
-     }
-+    if (mlir::isa<ReshapeOp, SliceStaticOp>(op))
-+      return true;
-     // Eltwise unary ops.
-     if (mlir::isa<AbsOp, CbrtOp, CeilOp, SignOp, CosOp, ExpOp, ErfOp, ErfcOp,
-                   FloorOp, GeluOp, IsFiniteOp, LogicalNotOp, BitwiseNotOp,
-@@ -70,17 +72,7 @@ public:
-
+@@ -70,6 +70,9 @@ public:
+ 
  private:
    static bool isFusionGroupExit(Operation *op) {
--    if (!isAllowedToBeFused(op)) {
--      return false;
--    }
--    for (Value result : op->getResults()) {
--      for (Operation *user : result.getUsers()) {
--        if (isAllowedToBeFused(user)) {
--          return false;
--        }
--      }
--    }
--    return true;
-+    return mlir::isa<ConcatOp>(op);
-   }
-
-   void analyze(Operation *rootOp) {
-@@ -185,11 +177,10 @@ public:
-       return;
++    if (mlir::isa<ConcatOp>(op)) {
++      return true;
++    }
+     if (!isAllowedToBeFused(op)) {
+       return false;
      }
-
--    IRRewriter rewriter(&getContext());
--    for (unsigned groupIdx = 0; groupIdx < fusionGroups.size(); ++groupIdx) {
--      if (failed(wrapFusionGroup(fusionGroups[groupIdx], rewriter, groupIdx))) {
--        signalPassFailure();
--        return;
-+    for (const auto &fusionGroup : fusionGroups) {
-+      for (Operation *op : fusionGroup) {
-+        op->setAttr("ttnn.hoist_generic_via_d2m",
-+                    UnitAttr::get(&getContext()));
-       }
-     }
-   }
+@@ -124,6 +127,7 @@ private:
+   FusionGroup buildFusionGroup(Operation *exitOp) {
+     llvm::DenseSet<Operation *> fusionSet;
+     llvm::SmallVector<Operation *> stack;
++    const bool allowViews = mlir::isa<ConcatOp>(exitOp);
+ 
+     fusionSet.insert(exitOp);
+     stack.push_back(exitOp);
+@@ -133,7 +137,9 @@ private:
+ 
+       for (Value operand : cur->getOperands()) {
+         Operation *producer = operand.getDefiningOp();
+-        if (!producer || !isAllowedToBeFused(producer) ||
++        if (!producer ||
++            (!isAllowedToBeFused(producer) &&
++             !(allowViews && mlir::isa<ReshapeOp, SliceStaticOp>(producer))) ||
+             visitedOps.contains(producer) || fusionSet.contains(producer)) {
+           continue;
+         }
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 index 99777ee..7511dff 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -60,6 +60,7 @@ private:
+@@ -60,7 +60,8 @@ private:
      shouldHoist &= !::mlir::isa<mlir::tt::ttnn::CaptureOrExecuteTraceOp>(op);
      shouldHoist &= !::mlir::isa<mlir::tt::ttnn::GetDeviceOp>(op);
      shouldHoist &=
@@ -519,3 +504,4 @@ index 99777ee..7511dff 100644
 +        !op->hasTrait<mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>();
      return shouldHoist;
    }
+ 
