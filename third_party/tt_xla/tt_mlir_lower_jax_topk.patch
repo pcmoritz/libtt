@@ -1,0 +1,51 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index 63bb79e..a46cba5 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9549,3 +9549,3 @@ public:
+     IntegerAttr dimAttr = IntegerAttr::get(rewriter.getIntegerType(32), -1);
+-    auto sortedAttr = BoolAttr::get(rewriter.getContext(), false);
++    auto sortedAttr = BoolAttr::get(rewriter.getContext(), true);
+
+@@ -9575,6 +9575,6 @@ public:
+
++    // mhlo.topk defaults largest to true and always returns ordered results.
+     auto largestAttr = dictAttr.getAs<BoolAttr>("largest");
+     if (!largestAttr) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "Missing largest attribute in mhlo.attributes");
++      largestAttr = rewriter.getBoolAttr(true);
+     }
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+index 98b3f6c..4ba80b5 100644
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -1656,3 +1656,3 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
+
+-// Input is forced to BFloat16 unless it is already BFloat16 or BFP_BFloat8.
++// Unsupported 32-bit integers use Float32; other unsupported types use BFloat16.
+ // Issue page: https://github.com/tenstorrent/tt-metal/issues/40086
+@@ -1665,1 +1665,3 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
+       ttcore::elementTypeToDataType(inputElementType);
++  bool inputUsesFloat32 =
++      inputDataType == ttcore::DataType::Float32 || inputElementType.isInteger(32);
+@@ -1670,6 +1672,8 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
+   if (!inputDataType || (*inputDataType != ttcore::DataType::BFloat16 &&
+-                         *inputDataType != ttcore::DataType::BFP_BFloat8)) {
+-    inputWorkaround.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;
+-    outputValuesWorkaround.tensorDataTypeWorkaround =
+-        ttcore::DataType::BFloat16;
++                         *inputDataType != ttcore::DataType::BFP_BFloat8 &&
++                         *inputDataType != ttcore::DataType::Float32)) {
++    auto workaroundDataType = inputUsesFloat32 ? ttcore::DataType::Float32
++                                               : ttcore::DataType::BFloat16;
++    inputWorkaround.tensorDataTypeWorkaround = workaroundDataType;
++    outputValuesWorkaround.tensorDataTypeWorkaround = workaroundDataType;
+   } else {
+@@ -1688,3 +1692,4 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
+   int64_t paddedDimSize = paddedShape[dimIndex];
+-  bool useUint16Indices =
+-      paddedDimSize <= std::numeric_limits<uint16_t>::max(); // 65535
++  bool useUint16Indices = !inputUsesFloat32 &&
++                          paddedDimSize <=
++                              std::numeric_limits<uint16_t>::max(); // 65535
