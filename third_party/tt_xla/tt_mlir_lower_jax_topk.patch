@@ -1,19 +1,13 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-index 774619b9..516829bb 100644
+index 63bb79e..a46cba5 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -9547,7 +9547,7 @@ public:
-     }
-     auto input = adaptor.getOperands()[0];
+@@ -9549,3 +9549,3 @@ public:
      IntegerAttr dimAttr = IntegerAttr::get(rewriter.getIntegerType(32), -1);
 -    auto sortedAttr = BoolAttr::get(rewriter.getContext(), false);
 +    auto sortedAttr = BoolAttr::get(rewriter.getContext(), true);
 
-     auto dictAttr = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
-         srcOp->getDiscardableAttr("mhlo.attributes"));
-@@ -9574,13 +9574,13 @@ public:
-     int32_t kValueI32 = static_cast<int32_t>(kValueI64.getSExtValue());
-     kAttr = IntegerAttr::get(rewriter.getIntegerType(32), kValueI32);
+@@ -9575,6 +9575,6 @@ public:
 
 +    // mhlo.topk defaults largest to true and always returns ordered results.
      auto largestAttr = dictAttr.getAs<BoolAttr>("largest");
@@ -22,49 +16,29 @@ index 774619b9..516829bb 100644
 -          srcOp, "Missing largest attribute in mhlo.attributes");
 +      largestAttr = rewriter.getBoolAttr(true);
      }
-
-     rewriter.replaceOpWithNewOp<ttir::TopKOp>(srcOp, resultTypes, input, kAttr,
-                                               dimAttr, largestAttr, sortedAttr);
-     return success();
-   }
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-index 98b3f6c..29d45af 100644
+index 98b3f6c..4ba80b5 100644
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -1654,7 +1654,7 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
- // TopK op pads the dimension to tile size, and uses UInt32 for indices if
- // padded dimension size > uint16_t::max
+@@ -1656,3 +1656,3 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
 
 -// Input is forced to BFloat16 unless it is already BFloat16 or BFP_BFloat8.
 +// Input is forced to BFloat16 unless it is natively supported.
  // Issue page: https://github.com/tenstorrent/tt-metal/issues/40086
- TTNNOperandsWorkarounds
- TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
-@@ -1663,12 +1663,14 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
-   auto inputElementType = inputType.getElementType();
-   std::optional<ttcore::DataType> inputDataType =
+@@ -1665,2 +1665,3 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
        ttcore::elementTypeToDataType(inputElementType);
 +  bool inputIsFloat32 = inputDataType == ttcore::DataType::Float32;
 
-   wa::TTNNOperandWorkarounds inputWorkaround;
-   wa::TTNNOperandWorkarounds outputValuesWorkaround;
-
+@@ -1670,3 +1671,4 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
    if (!inputDataType || (*inputDataType != ttcore::DataType::BFloat16 &&
 -                         *inputDataType != ttcore::DataType::BFP_BFloat8)) {
 +                         *inputDataType != ttcore::DataType::BFP_BFloat8 &&
-+                         !inputIsFloat32)) {
++                         *inputDataType != ttcore::DataType::Float32)) {
      inputWorkaround.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;
-     outputValuesWorkaround.tensorDataTypeWorkaround =
-         ttcore::DataType::BFloat16;
-@@ -1686,8 +1688,9 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
-   auto inputShape = inputType.getShape();
-   auto paddedShape = utils::getTilePaddedShape(inputShape);
+@@ -1688,3 +1690,4 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
    int64_t paddedDimSize = paddedShape[dimIndex];
 -  bool useUint16Indices =
 -      paddedDimSize <= std::numeric_limits<uint16_t>::max(); // 65535
 +  bool useUint16Indices = !inputIsFloat32 &&
 +                          paddedDimSize <=
 +                              std::numeric_limits<uint16_t>::max(); // 65535
-
-   wa::TTNNOperandWorkarounds outputIndicesWorkaround;
-   if (useUint16Indices) {

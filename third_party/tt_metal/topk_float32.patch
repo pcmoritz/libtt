@@ -1,10 +1,8 @@
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
-index 0fd7eed..772b4e3 100644
+index 0fd7eed..e272193 100644
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
-@@ -35,9 +35,8 @@ namespace ttnn::prim {
-  *    - Ensures sufficient work to justify parallel execution overhead
-  *    - Dimension size must be a power of 2 for bitonic sort
+@@ -37,5 +37,4 @@ namespace ttnn::prim {
   *
 - * 2. OUTPUT DATA TYPE: Must support 16-bit indices (dimension size < 65536)
 - *    - Multi-core implementation currently only supports UInt16 indices
@@ -12,31 +10,19 @@ index 0fd7eed..772b4e3 100644
 + * 2. DIMENSION LIMIT: Dimension size must be less than 65536
 + *    - Larger dimensions force single-core execution
   *
-  * 3. K VALUE LIMIT: K <= 64
-  *    - Multi-core algorithm has optimized paths for small K values
-@@ -65,8 +64,7 @@ TopKDeviceOperation::program_factory_t TopKDeviceOperation::select_program_facto
-     // Check requirement #1: Minimum dimension size for multi-core efficiency
-     bool multicore_supported = (input_tensor.padded_shape()[args.dim] >= ttnn::prim::constants::multi_core_min_width);
+@@ -67,4 +66,3 @@ TopKDeviceOperation::program_factory_t TopKDeviceOperation::select_program_facto
 
 -    // Apply requirement #2: Multi-core implementation constraint
 -    // Multi-core only supports UInt16 indices (dimension size must fit in 16 bits)
 +    // Apply requirement #2: Multi-core dimension constraint
      multicore_supported &= (input_shape[args.dim] < std::numeric_limits<uint16_t>::max());
-     // Dimension size must be a power of two for bitonic sort
-     multicore_supported &= is_power_of_two(input_shape[args.dim]);
-@@ -82,7 +80,8 @@ TopKDeviceOperation::program_factory_t TopKDeviceOperation::select_program_facto
-         // Determine data formats for memory cost calculation
-         const tt::DataFormat value_cb_data_format =
+@@ -84,3 +82,4 @@ TopKDeviceOperation::program_factory_t TopKDeviceOperation::select_program_facto
              tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
 -        const tt::DataFormat index_cb_data_format = tt::DataFormat::UInt16;  // Multi-core always uses UInt16
 +        const tt::DataFormat index_cb_data_format =
 +            input_tensor.dtype() == DataType::FLOAT32 ? tt::DataFormat::UInt32 : tt::DataFormat::UInt16;
 
-         // Calculate tile sizes for memory cost analysis
-         const uint32_t value_tile_size = tile_size(value_cb_data_format);
-@@ -154,8 +153,9 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
-     // Data type validation
-     const auto input_tensor_dtype = input_tensor.dtype();
+@@ -156,4 +155,5 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
      TT_FATAL(
 -        input_tensor_dtype == DataType::BFLOAT16 || input_tensor_dtype == DataType::BFLOAT8_B,
 -        "Input tensor must be BFLOAT16, or BFLOAT8_B, got: {}",
@@ -44,72 +30,48 @@ index 0fd7eed..772b4e3 100644
 +            input_tensor_dtype == DataType::FLOAT32,
 +        "Input tensor must be BFLOAT16, BFLOAT8_B, or FLOAT32, got: {}",
          input_tensor_dtype);
-
-     // Optional indices tensor validation (for pre-allocated indices)
-@@ -165,20 +165,22 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
-             indices_tensor_dtype == DataType::UINT16 || indices_tensor_dtype == DataType::UINT32,
-             "Optional input tensor must be UINT16, or UINT32, got: {}",
+@@ -167,2 +167,5 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
              indices_tensor_dtype);
 +        TT_FATAL(
 +            input_tensor_dtype != DataType::FLOAT32 || indices_tensor_dtype == DataType::UINT32,
 +            "Optional input tensor must be UINT32 when input is FLOAT32");
      }
-
-     // Preallocated output tensor validation
-     if (preallocated_outputs.has_value()) {
-         const auto output_tensor0_dtype = std::get<0>(preallocated_outputs.value()).dtype();  // Values tensor
+@@ -173,6 +176,2 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
          const auto output_tensor1_dtype = std::get<1>(preallocated_outputs.value()).dtype();  // Indices tensor
 -        TT_FATAL(
 -            output_tensor0_dtype == DataType::BFLOAT16 || output_tensor0_dtype == DataType::BFLOAT8_B,
 -            "Preallocated output tensor must be BFLOAT16 or BFLOAT8_B got: {}",
 -            output_tensor0_dtype);
          TT_FATAL(
-             output_tensor1_dtype == DataType::UINT16 || output_tensor1_dtype == DataType::UINT32,
-             "Preallocated indices tensor must be UINT16 or UINT32 got: {}",
+@@ -181,2 +180,5 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
              output_tensor1_dtype);
 +        TT_FATAL(
 +            input_tensor_dtype != DataType::FLOAT32 || output_tensor1_dtype == DataType::UINT32,
 +            "Preallocated indices tensor must be UINT32 when input is FLOAT32");
          TT_FATAL(
-             output_tensor0_dtype == input_tensor_dtype,
-             "Preallocated output tensor dtype must match input tensor dtype. Got output: {}, input: {}",
-@@ -200,7 +202,8 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
-     // Execution feasibility validation
-     // Verify that the operation can be executed with available hardware resources
+@@ -202,3 +204,4 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
      bool can_run = false;
 -    bool uint16_output = (input_shape[args.dim] <= std::numeric_limits<uint16_t>::max());
 +    bool uint16_output = input_tensor_dtype != DataType::FLOAT32 &&
 +                         input_shape[args.dim] <= std::numeric_limits<uint16_t>::max();
 
-     // Try multi-core execution first if dimension is large enough
-     if (input_shape[args.dim] >= ttnn::prim::constants::multi_core_min_width) {
-@@ -208,7 +211,8 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
-
-         // Set up data formats for memory cost calculations
+@@ -210,3 +213,4 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
          tt::DataFormat value_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
 -        tt::DataFormat index_cb_data_format = tt::DataFormat::UInt16;
 +        tt::DataFormat index_cb_data_format =
 +            uint16_output ? tt::DataFormat::UInt16 : tt::DataFormat::UInt32;
 
-         uint32_t value_tile_size = tile_size(value_cb_data_format);
-         uint32_t index_tile_size = tile_size(index_cb_data_format);
-@@ -264,7 +268,8 @@ TopKDeviceOperation::spec_return_value_t TopKDeviceOperation::compute_output_spe
-
-     ttnn::Shape input_shape = input_tensor.padded_shape();
+@@ -266,3 +270,4 @@ TopKDeviceOperation::spec_return_value_t TopKDeviceOperation::compute_output_spe
      // Choose index data type based on dimension size (16-bit vs 32-bit indices)
 -    const bool uint16_output = (input_shape[args.dim] <= std::numeric_limits<uint16_t>::max());  // 65535
 +    const bool uint16_output = input_tensor.dtype() != DataType::FLOAT32 &&
 +                               input_shape[args.dim] <= std::numeric_limits<uint16_t>::max();  // 65535
 
-     // Create values tensor specification (same data type as input)
-     const auto values_spec = TensorSpec(
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp
-index aad67a0..92a293b 100644
+index aad67a0..ed1744b 100644
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp
-@@ -456,8 +456,17 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKMultiCoreProgramFactory
-     compute_local_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-     compute_local_desc.core_ranges = local_cores_range_set;  // Runs on all local processing cores
+@@ -458,4 +458,13 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKMultiCoreProgramFactory
      compute_local_desc.compile_time_args = compute_args;
 +    std::vector<tt::tt_metal::UnpackToDestMode> local_unpack_to_dest_mode(
 +        NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
@@ -123,11 +85,7 @@ index aad67a0..92a293b 100644
          .dst_full_sync_en = false,
 +        .unpack_to_dest_mode = std::move(local_unpack_to_dest_mode),
      };
-
-     // Final compute - Global TopK Bitonic Merge
-@@ -485,8 +494,17 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKMultiCoreProgramFactory
-     compute_final_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-     compute_final_desc.core_ranges = final_cores_range_set;  // Runs only on final aggregation core
+@@ -487,4 +496,13 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKMultiCoreProgramFactory
      compute_final_desc.compile_time_args = compute_args_final;
 +    std::vector<tt::tt_metal::UnpackToDestMode> final_unpack_to_dest_mode(
 +        NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
@@ -141,24 +99,16 @@ index aad67a0..92a293b 100644
          .dst_full_sync_en = false,
 +        .unpack_to_dest_mode = std::move(final_unpack_to_dest_mode),
      };
-
-     uint32_t core_id = 0;            // Width offset counter for core assignment
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp
-index 47ff32a..fcf9e6a 100644
+index 47ff32a..3f935c7 100644
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp
-@@ -28,7 +28,7 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKSingleCoreProgramFactor
-
-     // Determine index output format based on dimension size constraints
+@@ -30,3 +30,3 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKSingleCoreProgramFactor
      const ttnn::Shape input_shape = input_tensor.padded_shape();
 -    const bool uint16_output = (input_shape[args.dim] < std::numeric_limits<uint16_t>::max());
 +    const bool uint16_output = index_tensor.dtype() == DataType::UINT16;
 
-     ProgramDescriptor desc;
-
-@@ -247,9 +247,18 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKSingleCoreProgramFactor
-     compute_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-     compute_desc.core_ranges = core_range;
+@@ -249,2 +249,10 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKSingleCoreProgramFactor
      compute_desc.compile_time_args = compute_args;
 +    std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(
 +        NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
@@ -169,9 +119,7 @@ index 47ff32a..fcf9e6a 100644
 +        unpack_to_dest_mode[output_val_cb_index] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
 +    }
      compute_desc.config = ComputeConfigDescriptor{
-         .fp32_dest_acc_en = !uint16_output,
+@@ -252,2 +260,3 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKSingleCoreProgramFactor
          .dst_full_sync_en = false,
 +        .unpack_to_dest_mode = std::move(unpack_to_dest_mode),
      };
-
-     uint32_t id = 0;  // Offset for the next core in the group
