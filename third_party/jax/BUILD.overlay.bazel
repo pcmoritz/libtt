@@ -1,0 +1,11 @@
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "jax_tests",
+    srcs = glob(["tests/**"]),
+)
+
+filegroup(
+    name = "jax_tests_anchor",
+    srcs = ["tests/lax_numpy_test.py"],
+)
