@@ -379,26 +379,6 @@ index e1c883c..039eba7 100644
      insertViewForTTNNDRAMTensor(ttnnOperand, info.selectedGrid, builder);
    } else if (auto castOp =
                   ttnnOperand.getDefiningOp<ttir::TTNNMetalLayoutCastOp>()) {
-diff --git a/lib/Dialect/D2M/Transforms/LowerToLayout/Plan.cpp b/lib/Dialect/D2M/Transforms/LowerToLayout/Plan.cpp
-index b6e4d3d..2558763 100644
---- a/lib/Dialect/D2M/Transforms/LowerToLayout/Plan.cpp
-+++ b/lib/Dialect/D2M/Transforms/LowerToLayout/Plan.cpp
-@@ -341,6 +341,15 @@ Plan canonicalize(const PlanState &src, const PlanState &tgt,
-     updateStateFromOutput(current, output);
-   }
- 
-+  // Same-grid DRAM copies can write directly to the target.
-+  if (needsDramBounce(current, tgt) &&
-+      current.getGridShape() == tgt.getGridShape() &&
-+      current.type.getElementType() == tgt.type.getElementType()) {
-+    auto output = makeOutputSpec(tgt.type, tgt.vgmForward, tgt.vgmInverse);
-+    plan.push_back(RebufferStep{output});
-+    updateStateFromOutput(current, output);
-+  }
-+
-   // DRAM → DRAM materialization: stage through an equivalent L1 buffer before
-   // doing format/grid/VGM changes, then let the normal L1 → DRAM rule below
-   // write into the final target buffer.
 diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
 index ec54958..3c64ee4 100644
 --- a/lib/Dialect/D2M/Utils/Utils.cpp
