@@ -1,0 +1,56 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -108,6 +108,12 @@ getPaddingOrDefault(mlir::DenseIntElementsAttr attr, size_t numSpatialDims) {
+   }
+   return llvm::SmallVector<int64_t>(numSpatialDims * 2, 0);
+ }
++
++static bool hasUnsupportedFloatType(Type type) {
++  return mlir::isa<FloatType>(type) &&
++         type.getIntOrFloatBitWidth() != 16 &&
++         type.getIntOrFloatBitWidth() != 32;
++}
+ 
+ // Typical initialization values for reduction ops.
+ enum TypicalInitReductionValue {
+@@ -302,5 +308,10 @@ private:
+                           mlir::stablehlo::ReduceOp::Adaptor adaptor,
+                           ConversionPatternRewriter &rewriter) const {
++    if (srcOp.getInputs().size() != 1) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "variadic stablehlo.reduce is not supported");
++    }
++
+     if (!srcOp.getBody().hasOneBlock()) {
+       return rewriter.notifyMatchFailure(
+           srcOp,
+@@ -723,5 +734,14 @@ public:
+   matchAndRewrite(mlir::stablehlo::DotGeneralOp srcOp,
+                   mlir::stablehlo::DotGeneralOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    Type lhsType =
++        mlir::cast<ShapedType>(srcOp.getLhs().getType()).getElementType();
++    Type rhsType =
++        mlir::cast<ShapedType>(srcOp.getRhs().getType()).getElementType();
++    if (hasUnsupportedFloatType(lhsType) ||
++        hasUnsupportedFloatType(rhsType)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "only 16- and 32-bit float inputs are supported");
++    }
+ 
+     auto outputType = mlir::cast<RankedTensorType>(
+@@ -1262,3 +1282,8 @@ private:
+                           ConversionPatternRewriter &rewriter) const {
++    if (hasUnsupportedFloatType(srcOp.getValue().getElementType())) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "only 16- and 32-bit float constants are supported");
++    }
++
+     if (isa<DenseElementsAttr, DenseResourceElementsAttr>(srcOp.getValue()) &&
+         !srcOp.getValue().getElementType().isIntOrFloat()) {
+@@ -2653,3 +2678,3 @@ public:
+     int64_t inputRank = firstInputType.getRank();
+-    if (inputRank > 5) {
++    if (inputRank == 0 || inputRank > 5) {
+       return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
