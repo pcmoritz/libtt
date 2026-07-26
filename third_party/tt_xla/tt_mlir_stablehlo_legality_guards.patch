@@ -14,6 +14,66 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
  // Typical initialization values for reduction ops.
  enum TypicalInitReductionValue {
+@@ -133,30 +139,14 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+   float desiredF32;
+   double desiredF64;
+-  int32_t desiredI32;
+-  int64_t desiredI64;
+-  int8_t desiredI8;
+-  bool desiredI1;
+   if (desired == TypicalInitReductionValue::NEG_INF) {
+     desiredF32 = -std::numeric_limits<float>::infinity();
+     desiredF64 = -std::numeric_limits<double>::infinity();
+-    desiredI32 = std::numeric_limits<int32_t>::min();
+-    desiredI64 = std::numeric_limits<int64_t>::min();
+-    desiredI8 = std::numeric_limits<int8_t>::min();
+-    desiredI1 = false;
+   } else if (desired == TypicalInitReductionValue::ZERO) {
+     desiredF32 = 0.0;
+     desiredF64 = 0.0;
+-    desiredI32 = 0;
+-    desiredI64 = 0;
+-    desiredI8 = 0;
+-    desiredI1 = false;
+   } else if (desired == TypicalInitReductionValue::ONE) {
+     desiredF32 = 1.0;
+     desiredF64 = 1.0;
+-    desiredI32 = 1;
+-    desiredI64 = 1;
+-    desiredI8 = 1;
+-    desiredI1 = true;
+   } else {
+     return false;
+   }
+@@ -178,15 +168,17 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+   if (initValueOp.getResult().getType().getElementType().isF64()) {
+     return *initValueOp.getValue().value_begin<double>() == desiredF64;
+   }
+-  if (initValueOp.getResult().getType().getElementType().isInteger(32)) {
+-    return *initValueOp.getValue().value_begin<int32_t>() == desiredI32;
+-  }
+-  if (initValueOp.getResult().getType().getElementType().isInteger(64)) {
+-    return *initValueOp.getValue().value_begin<int64_t>() == desiredI64;
+-  }
+-  if (initValueOp.getResult().getType().getElementType().isInteger(8)) {
+-    return *initValueOp.getValue().value_begin<uint8_t>() == desiredI8;
+-  }
+-  if (initValueOp.getResult().getType().getElementType().isInteger(1)) {
+-    return *initValueOp.getValue().value_begin<bool>() == desiredI1;
++  if (auto integerType = mlir::dyn_cast<IntegerType>(
++          initValueOp.getResult().getType().getElementType())) {
++    llvm::APInt value =
++        *initValueOp.getValue().value_begin<llvm::APInt>();
++    if (desired == TypicalInitReductionValue::ZERO) {
++      return value.isZero();
++    }
++    if (desired == TypicalInitReductionValue::ONE) {
++      return value.isOne();
++    }
++    return integerType.isUnsigned() || integerType.getWidth() == 1
++               ? value.isZero()
++               : value.isMinSignedValue();
+   }
 @@ -302,5 +308,10 @@ private:
                            mlir::stablehlo::ReduceOp::Adaptor adaptor,
                            ConversionPatternRewriter &rewriter) const {
@@ -54,3 +114,23 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    if (inputRank > 5) {
 +    if (inputRank == 0 || inputRank > 5) {
        return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
+@@ -2740,4 +2765,9 @@ public:
+       if (dimension) {
++        if (firstInputType.getElementType().isInteger(8)) {
++          return rewriter.notifyMatchFailure(
++              srcOp, "8-bit cumulative reductions are not supported");
++        }
++
+         mlir::RankedTensorType resultType = cast<RankedTensorType>(
+             getTypeConverter()->convertType(srcOp.getResult(0).getType()));
+         rewriter.replaceOpWithNewOp<ttir::CumSumOp>(
+@@ -2752,4 +2782,9 @@ public:
+       if (cumprodDimension) {
++        if (firstInputType.getElementType().isInteger(8)) {
++          return rewriter.notifyMatchFailure(
++              srcOp, "8-bit cumulative reductions are not supported");
++        }
++
+         mlir::RankedTensorType resultType = cast<RankedTensorType>(
+             getTypeConverter()->convertType(srcOp.getResult(0).getType()));
+         rewriter.replaceOpWithNewOp<ttir::CumProdOp>(
