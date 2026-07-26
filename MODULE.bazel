@@ -293,6 +293,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_ttir_to_d2m_constructor_names.patch",
         "//third_party/tt_xla:tt_mlir_preserve_float_self_comparisons.patch",
         "//third_party/tt_xla:tt_mlir_lower_jax_topk.patch",
+        "//third_party/tt_xla:tt_mlir_lower_jax_pad.patch",
         "//third_party/tt_xla:tt_mlir_affine_passes_include.patch",
         "//third_party/tt_xla:tt_mlir_mock_device_include.patch",
         "//third_party/tt_xla:tt_mlir_disable_ttlang_python_resolver.patch",

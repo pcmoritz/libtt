@@ -1,0 +1,91 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -7790,2 +7790,8 @@
+ public:
++  StableHLOToTTIROpPadOpConversionPattern(TypeConverter &typeConverter,
++                                          MLIRContext *ctx)
++      : OpConversionPattern(typeConverter, ctx) {
++    setHasBoundedRewriteRecursion();
++  }
++
+   LogicalResult
+@@ -7794,2 +7800,37 @@
+                   ConversionPatternRewriter &rewriter) const override {
++    if (!getConstantValueDefiningOp(adaptor.getPaddingValue())) {
++      auto inputType =
++          mlir::cast<RankedTensorType>(adaptor.getOperand().getType());
++      auto outputType = mlir::cast<RankedTensorType>(
++          getTypeConverter()->convertType(srcOp.getResult().getType()));
++      auto valueType = mlir::cast<RankedTensorType>(
++          adaptor.getPaddingValue().getType());
++      auto zeroAttr = DenseElementsAttr::get(
++          valueType, rewriter.getZeroAttr(valueType.getElementType()));
++      Value zero = rewriter.create<ttir::ConstantOp>(
++          srcOp.getLoc(), valueType, zeroAttr);
++
++      auto pad = [&](Value input, RankedTensorType resultType) {
++        return rewriter
++            .create<mlir::stablehlo::PadOp>(
++                srcOp.getLoc(), resultType, input, zero,
++                srcOp.getEdgePaddingLowAttr(),
++                srcOp.getEdgePaddingHighAttr(),
++                srcOp.getInteriorPaddingAttr())
++            .getResult();
++      };
++
++      Value padded = pad(adaptor.getOperand(), outputType);
++      Value ones = rewriter.create<ttir::OnesOp>(
++          srcOp.getLoc(), inputType,
++          llvm::to_vector_of<int32_t>(inputType.getShape()));
++      Value maskValues = pad(ones, outputType);
++      auto maskType = outputType.clone(rewriter.getI1Type());
++      Value mask = rewriter.create<ttir::NotEqualOp>(
++          srcOp.getLoc(), maskType, maskValues, zero);
++
++      rewriter.replaceOpWithNewOp<ttir::WhereOp>(
++          srcOp, outputType, mask, padded, adaptor.getPaddingValue());
++      return success();
++    }
+ 
+@@ -7821,2 +7862,26 @@
+     }
++
++    auto isNegative = [](int64_t edge) { return edge < 0; };
++    if (sum != 0 &&
++        (llvm::any_of(srcOp.getEdgePaddingLow(), isNegative) ||
++         llvm::any_of(srcOp.getEdgePaddingHigh(), isNegative))) {
++      SmallVector<int64_t> expandedShape(outputType.getShape());
++      for (auto [dim, low, high] :
++           llvm::enumerate(srcOp.getEdgePaddingLow(),
++                           srcOp.getEdgePaddingHigh())) {
++        expandedShape[dim] -= low + high;
++      }
++      auto expandedType = outputType.clone(expandedShape);
++      SmallVector<int64_t> noEdgePadding(outputType.getRank(), 0);
++      Value expanded = rewriter.create<mlir::stablehlo::PadOp>(
++          srcOp.getLoc(), expandedType, adaptor.getOperand(),
++          adaptor.getPaddingValue(), noEdgePadding, noEdgePadding,
++          srcOp.getInteriorPaddingAttr());
++      rewriter.replaceOpWithNewOp<mlir::stablehlo::PadOp>(
++          srcOp, outputType, expanded, adaptor.getPaddingValue(),
++          srcOp.getEdgePaddingLowAttr(), srcOp.getEdgePaddingHighAttr(),
++          noEdgePadding);
++      return success();
++    }
++
+     if (sum != 0) {
+@@ -7843,2 +7908,2 @@
+-      size_t current_index = 0;
++      size_t current_index = counters.size() - 1;
+       while (current_index < counters.size() &&
+@@ -7851,3 +7916,3 @@
+           counters[current_index] = lowerbounds[current_index];
+-          current_index++;
++          current_index--;
+           if (current_index < counters.size()) {
+@@ -7861,3 +7926,3 @@
+         if (reset) {
+-          current_index = 0;
++          current_index = counters.size() - 1;
+         }
