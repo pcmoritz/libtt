@@ -292,6 +292,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_op_model_dependent_static_assert.patch",
         "//third_party/tt_xla:tt_mlir_ttir_to_d2m_constructor_names.patch",
         "//third_party/tt_xla:tt_mlir_preserve_float_self_comparisons.patch",
+        "//third_party/tt_xla:tt_mlir_stablehlo_reduce_arity_guard.patch",
         "//third_party/tt_xla:tt_mlir_lower_jax_topk.patch",
         "//third_party/tt_xla:tt_mlir_lower_jax_pad.patch",
         "//third_party/tt_xla:tt_mlir_dynamic_update_slice_device.patch",
