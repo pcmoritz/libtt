@@ -1,10 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-index 63bb79e..89ef4d0 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -7788,11 +7788,92 @@ class StableHLOToTTIROpPadOpConversionPattern
-   using OpConversionPattern<mlir::stablehlo::PadOp>::OpConversionPattern;
- 
+@@ -7790,2 +7790,8 @@
  public:
 +  StableHLOToTTIROpPadOpConversionPattern(TypeConverter &typeConverter,
 +                                          MLIRContext *ctx)
@@ -13,46 +10,8 @@ index 63bb79e..89ef4d0 100644
 +  }
 +
    LogicalResult
-   matchAndRewrite(mlir::stablehlo::PadOp srcOp,
-                   mlir::stablehlo::PadOp::Adaptor adaptor,
+@@ -7794,2 +7800,37 @@
                    ConversionPatternRewriter &rewriter) const override {
-+    if (llvm::any_of(srcOp.getEdgePaddingLow(),
-+                     [](int64_t value) { return value < 0; }) ||
-+        llvm::any_of(srcOp.getEdgePaddingHigh(),
-+                     [](int64_t value) { return value < 0; })) {
-+      auto outputType = mlir::cast<RankedTensorType>(
-+          getTypeConverter()->convertType(srcOp.getResult().getType()));
-+      SmallVector<int64_t> low;
-+      SmallVector<int64_t> high;
-+      SmallVector<int64_t> paddedShape(outputType.getShape());
-+      SmallVector<int32_t> begins;
-+      SmallVector<int32_t> ends;
-+      for (auto [dim, lowPad, highPad] :
-+           llvm::enumerate(srcOp.getEdgePaddingLow(),
-+                           srcOp.getEdgePaddingHigh())) {
-+        int64_t lowCrop = std::max(-lowPad, int64_t{0});
-+        int64_t highCrop = std::max(-highPad, int64_t{0});
-+        low.push_back(std::max(lowPad, int64_t{0}));
-+        high.push_back(std::max(highPad, int64_t{0}));
-+        paddedShape[dim] += lowCrop + highCrop;
-+        begins.push_back(lowCrop);
-+        ends.push_back(paddedShape[dim] - highCrop);
-+      }
-+
-+      auto paddedType = RankedTensorType::get(
-+          paddedShape, outputType.getElementType(), outputType.getEncoding());
-+      Value padded = rewriter.create<mlir::stablehlo::PadOp>(
-+          srcOp.getLoc(), paddedType, adaptor.getOperand(),
-+          adaptor.getPaddingValue(), low, high,
-+          srcOp.getInteriorPaddingAttr());
-+      rewriter.replaceOpWithNewOp<ttir::SliceStaticOp>(
-+          srcOp, outputType, padded, rewriter.getI32ArrayAttr(begins),
-+          rewriter.getI32ArrayAttr(ends),
-+          rewriter.getI32ArrayAttr(
-+              SmallVector<int32_t>(outputType.getRank(), 1)));
-+      return success();
-+    }
-+
 +    if (!getConstantValueDefiningOp(adaptor.getPaddingValue())) {
 +      auto inputType =
 +          mlir::cast<RankedTensorType>(adaptor.getOperand().getType());
@@ -65,7 +24,7 @@ index 63bb79e..89ef4d0 100644
 +      Value zero = rewriter.create<ttir::ConstantOp>(
 +          srcOp.getLoc(), valueType, zeroAttr);
 +
-+      auto pad = [&](Value input, RankedTensorType resultType) -> Value {
++      auto pad = [&](Value input, RankedTensorType resultType) {
 +        return rewriter
 +            .create<mlir::stablehlo::PadOp>(
 +                srcOp.getLoc(), resultType, input, zero,
@@ -80,9 +39,7 @@ index 63bb79e..89ef4d0 100644
 +          srcOp.getLoc(), inputType,
 +          llvm::to_vector_of<int32_t>(inputType.getShape()));
 +      Value maskValues = pad(ones, outputType);
-+      auto maskType =
-+          RankedTensorType::get(outputType.getShape(), rewriter.getI1Type(),
-+                                outputType.getEncoding());
++      auto maskType = outputType.clone(rewriter.getI1Type());
 +      Value mask = rewriter.create<ttir::NotEqualOp>(
 +          srcOp.getLoc(), maskType, maskValues, zero);
 +
@@ -91,37 +48,44 @@ index 63bb79e..89ef4d0 100644
 +      return success();
 +    }
  
-     LogicalResult legalityResult =
-         checkConversionLegality(srcOp, adaptor, rewriter);
-     if (!legalityResult.succeeded()) {
-@@ -7843,23 +7924,21 @@ public:
+@@ -7821,2 +7862,26 @@
+     }
++
++    auto isNegative = [](int64_t edge) { return edge < 0; };
++    if (sum != 0 &&
++        (llvm::any_of(srcOp.getEdgePaddingLow(), isNegative) ||
++         llvm::any_of(srcOp.getEdgePaddingHigh(), isNegative))) {
++      SmallVector<int64_t> expandedShape(outputType.getShape());
++      for (auto [dim, low, high] :
++           llvm::enumerate(srcOp.getEdgePaddingLow(),
++                           srcOp.getEdgePaddingHigh())) {
++        expandedShape[dim] -= low + high;
++      }
++      auto expandedType = outputType.clone(expandedShape);
++      SmallVector<int64_t> noEdgePadding(outputType.getRank(), 0);
++      Value expanded = rewriter.create<mlir::stablehlo::PadOp>(
++          srcOp.getLoc(), expandedType, adaptor.getOperand(),
++          adaptor.getPaddingValue(), noEdgePadding, noEdgePadding,
++          srcOp.getInteriorPaddingAttr());
++      rewriter.replaceOpWithNewOp<mlir::stablehlo::PadOp>(
++          srcOp, outputType, expanded, adaptor.getPaddingValue(),
++          srcOp.getEdgePaddingLowAttr(), srcOp.getEdgePaddingHighAttr(),
++          noEdgePadding);
++      return success();
++    }
++
+     if (sum != 0) {
+@@ -7843,2 +7908,2 @@
 -      size_t current_index = 0;
--      while (current_index < counters.size() &&
--             counters[counters.size() - 1] <
--                 upperbounds[upperbounds.size() - 1]) {
-+      int64_t current_index = counters.size() - 1;
-+      while (current_index >= 0) {
-         counters[current_index] += steps[current_index];
-         bool reset = false;
--        while (current_index < counters.size() &&
-+        while (current_index >= 0 &&
-                counters[current_index] >= upperbounds[current_index]) {
++      size_t current_index = counters.size() - 1;
+       while (current_index < counters.size() &&
+@@ -7851,3 +7916,3 @@
            counters[current_index] = lowerbounds[current_index];
 -          current_index++;
--          if (current_index < counters.size()) {
 +          current_index--;
-+          if (current_index >= 0) {
-             counters[current_index] += steps[current_index];
-           }
-           reset = true;
-         }
--        if (current_index >= counters.size()) {
-+        if (current_index < 0) {
-           break;
-         }
+           if (current_index < counters.size()) {
+@@ -7861,3 +7926,3 @@
          if (reset) {
 -          current_index = 0;
 +          current_index = counters.size() - 1;
          }
-         flatIndices.append(counters.begin(), counters.end());
-         numIndices++;
