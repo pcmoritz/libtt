@@ -27,10 +27,9 @@ index 63bb79e..89ef4d0 100644
 +      SmallVector<int64_t> paddedShape(outputType.getShape());
 +      SmallVector<int32_t> begins;
 +      SmallVector<int32_t> ends;
-+      for (auto [dim, pads] :
-+           llvm::enumerate(llvm::zip(srcOp.getEdgePaddingLow(),
-+                                     srcOp.getEdgePaddingHigh()))) {
-+        auto [lowPad, highPad] = pads;
++      for (auto [dim, lowPad, highPad] :
++           llvm::enumerate(srcOp.getEdgePaddingLow(),
++                           srcOp.getEdgePaddingHigh())) {
 +        int64_t lowCrop = std::max(-lowPad, int64_t{0});
 +        int64_t highCrop = std::max(-highPad, int64_t{0});
 +        low.push_back(std::max(lowPad, int64_t{0}));
