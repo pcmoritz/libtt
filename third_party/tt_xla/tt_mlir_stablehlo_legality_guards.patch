@@ -85,14 +85,12 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (!srcOp.getBody().hasOneBlock()) {
        return rewriter.notifyMatchFailure(
            srcOp,
-@@ -723,5 +734,14 @@ public:
+@@ -723,5 +734,12 @@ public:
    matchAndRewrite(mlir::stablehlo::DotGeneralOp srcOp,
                    mlir::stablehlo::DotGeneralOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
-+    Type lhsType =
-+        mlir::cast<ShapedType>(srcOp.getLhs().getType()).getElementType();
-+    Type rhsType =
-+        mlir::cast<ShapedType>(srcOp.getRhs().getType()).getElementType();
++    Type lhsType = getElementTypeOrSelf(srcOp.getLhs());
++    Type rhsType = getElementTypeOrSelf(srcOp.getRhs());
 +    if (hasUnsupportedFloatType(lhsType) ||
 +        hasUnsupportedFloatType(rhsType)) {
 +      return rewriter.notifyMatchFailure(
