@@ -1,0 +1,73 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -7241,12 +7241,6 @@ private:
+ 
+     // Checks that apply to single dimensional scatter.
+ 
+-    if (!multiDimensionalScatter && indexShape.size() > updateShape.size()) {
+-      return rewriter.notifyMatchFailure(
+-          op, "TTIR scatter requires indices.rank <= updates.rank. Please add "
+-              "support for rank promotion if needed.");
+-    }
+-
+     if (!multiDimensionalScatter && indexVectorDim != 1u) {
+       return rewriter.notifyMatchFailure(
+           op,
+@@ -7319,6 +7313,23 @@ private:
+     return flatIndices;
+   }
+ 
++  Value clampScatterIndex(Location loc, PatternRewriter &rewriter, Value index,
++                          int64_t dimSize, Value &validIndices) const {
++    auto indexType = mlir::cast<RankedTensorType>(index.getType());
++    Value clamped = rewriter.create<ttir::ClampScalarOp>(
++        loc, indexType, index, rewriter.getI32IntegerAttr(0),
++        rewriter.getI32IntegerAttr(dimSize - 1));
++    auto validType = indexType.clone(rewriter.getI1Type());
++    Value isValid = rewriter.create<ttir::EqualOp>(
++        loc, validType, index, clamped);
++    if (validIndices) {
++      isValid = rewriter.create<ttir::LogicalAndOp>(
++          loc, validType, validIndices, isValid);
++    }
++    validIndices = isValid;
++    return clamped;
++  }
++
+   /// Computes flattened 1D indices for multi-dimensional scatter.
+   ///
+   /// Handles both cases:
+@@ -7495,6 +7506,7 @@ private:
+     // b) window-only: use window offset only
+     // c) both scatter-indexed and window: add scatter index + window offset
+     llvm::SmallVector<Value> indexSlices;
++    Value validIndices;
+     size_t windowIdxPos = 0;
+     for (int64_t operandDim = 0; operandDim < operandRank; ++operandDim) {
+       bool isScatterDim = scatterDimToIdxPos.count(operandDim);
+@@ -7542,11 +7554,23 @@ private:
+         }
+       }
+ 
+-      indexSlices.push_back(dimIndex);
++      if (isScatterDim) {
++        dimIndex = clampScatterIndex(loc, rewriter, dimIndex,
++                                     operandShape[operandDim], validIndices);
++      }
++      indexSlices.push_back(dimIndex);
+     }
+ 
+     Value flatIndices = computeFlatIndicesFromSlices(
+         loc, rewriter, indexSlices, operandShape, indicesType.getElementType());
++    auto flatIndicesType =
++        mlir::cast<RankedTensorType>(flatIndices.getType());
++    Value outOfBounds = rewriter.create<ttir::FullOp>(
++        loc, flatIndicesType,
++        rewriter.getI32IntegerAttr(
++            static_cast<int32_t>(ttmlir::utils::volume(operandShape))));
++    flatIndices = rewriter.create<ttir::WhereOp>(
++        loc, flatIndicesType, validIndices, flatIndices, outOfBounds);
+ 
+     // Flatten the computed indices to 1D.
+     return ttir::utils::flattenTensor(rewriter, loc, flatIndices,

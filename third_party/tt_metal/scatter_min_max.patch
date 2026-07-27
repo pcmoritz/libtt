@@ -1,0 +1,49 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp
+@@ -19,6 +19,6 @@ namespace {
+ namespace CMAKE_UNIQUE_NAMESPACE {
+ 
+-constexpr std::string_view ALLOWED_REDUCTIONS[] = {"add", "multiply"};
++constexpr std::string_view ALLOWED_REDUCTIONS[] = {"add", "multiply", "amin", "amax"};
+ 
+ // validate dimension constraints before sending down to device operation working on the last dimension
+ // inputs are validated according to
+@@ -64,7 +64,7 @@ void validate_inputs(
+         TT_FATAL(
+             std::find(std::begin(ALLOWED_REDUCTIONS), std::end(ALLOWED_REDUCTIONS), *opt_reduction_string) !=
+                 std::end(ALLOWED_REDUCTIONS),
+-            "reduce must be either 'add' or 'multiply' (case-sensitive), got {}",
++            "unsupported scatter reduction '{}'",
+             *opt_reduction_string);
+     }
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
+@@ -33,7 +33,7 @@ struct df_to_std<DataFormat::Float16_b> {
+ 
+ template <>
+ struct df_to_std<DataFormat::Int32> {
+-    using std_type = uint32_t;
++    using std_type = int32_t;
+ };
+ 
+ template <>
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
+@@ -81,10 +81,11 @@ FORCE_INLINE void scatter_along_chunk(
+     // partial stick length and offset)
+     for (uint32_t index_in_index_chunk = 0; index_in_index_chunk < index_chunk_size; ++index_in_index_chunk) {
+         volatile index_type& index_value = index_l1_read_ptr[index_in_index_chunk];
+-        if (index_value < input_offset || index_value >= input_offset + input_chunk_size) {
++        if (index_value < static_cast<index_type>(input_offset) ||
++            index_value >= static_cast<index_type>(input_offset + input_chunk_size)) {
+             continue;
+         }
+-        if (index_value >= input_stick_size) {
++        if (index_value >= static_cast<index_type>(input_stick_size)) {
+             continue;
+         }
+         volatile number_type& source_value = source_l1_read_ptr[index_in_index_chunk];

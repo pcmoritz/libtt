@@ -1,0 +1,35 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+@@ -776,7 +776,15 @@ std::pair<std::string, std::string> get_op_init_and_func_default(
+             return {"log_with_base_tile_init();", fmt::format("log_with_base_tile({}, 0x3fb8aa3bu);", idst)};
+         case UnaryOpType::ABS: return {"abs_tile_init();", fmt::format("abs_tile({});", idst)};
+         case UnaryOpType::ABS_INT32: return {"abs_tile_init();", fmt::format("abs_tile_int32({});", idst)};
+-        case UnaryOpType::SIGN: return {"sign_tile_init();", fmt::format("sign_tile({});", idst)};
++        case UnaryOpType::SIGN:
++            if (input_dtype == DataType::INT32) {
++                return {
++                    "clamp_tile_init();", fmt::format("clamp_tile_int32({}, 0xffffffffu, 1u);", idst)};
++            }
++            if (input_dtype == DataType::UINT32) {
++                return {"nez_tile_init();", fmt::format("nez_tile_uint32({});", idst)};
++            }
++            return {"sign_tile_init();", fmt::format("sign_tile({});", idst)};
+         case UnaryOpType::SQUARE:
+             TT_FATAL(
+                 input_dtype.has_value(), "Missing input dtype: Expected a valid input dtype, but none was provided.");
+@@ -934,7 +942,13 @@ std::map<std::string, std::string> get_defines_impl(
+     std::pair<std::string, std::string> op_init_and_name = get_op_init_and_func(op_type, params, idst, input_dtype);
+     std::map<std::string, std::string> defines = {
+         {init_def, op_init_and_name.first}, {func_def, op_init_and_name.second}};
+-    update_macro_defines(op_type, defines);
++    if (op_type == UnaryOpType::SIGN && input_dtype == DataType::INT32) {
++        update_macro_defines(UnaryOpType::CLAMP_TSS, defines);
++    } else if (op_type == UnaryOpType::SIGN && input_dtype == DataType::UINT32) {
++        update_macro_defines(UnaryOpType::NEZ, defines);
++    } else {
++        update_macro_defines(op_type, defines);
++    }
+     return defines;
+ }
+ }  // namespace
