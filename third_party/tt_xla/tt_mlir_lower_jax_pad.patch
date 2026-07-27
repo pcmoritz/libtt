@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -7790,2 +7790,8 @@
+@@ -7790,3 +7790,9 @@
  public:
 +  StableHLOToTTIROpPadOpConversionPattern(TypeConverter &typeConverter,
 +                                          MLIRContext *ctx)
@@ -10,6 +10,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  }
 +
    LogicalResult
+   matchAndRewrite(mlir::stablehlo::PadOp srcOp,
 @@ -7794,2 +7800,37 @@
                    ConversionPatternRewriter &rewriter) const override {
 +    if (!getConstantValueDefiningOp(adaptor.getPaddingValue())) {

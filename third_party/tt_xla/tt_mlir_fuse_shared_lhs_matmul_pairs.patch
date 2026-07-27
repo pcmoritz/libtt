@@ -13,3 +13,11 @@
  
      bool getTargetTransposeB() const {
        return allSameTransposeB ? firstTransposeB : false;
+@@ -2043,5 +2043,6 @@
+     for (Operation *user : sharedLHS.getUsers()) {
+       auto op = dyn_cast<OpType>(user);
+-      if (!op || op.getA() != sharedLHS) {
++      if (!op || op.getA() != sharedLHS ||
++          llvm::is_contained(result.ops, op)) {
+         continue;
+       }
