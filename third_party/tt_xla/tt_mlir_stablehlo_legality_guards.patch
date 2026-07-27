@@ -132,3 +132,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
          mlir::RankedTensorType resultType = cast<RankedTensorType>(
              getTypeConverter()->convertType(srcOp.getResult(0).getType()));
          rewriter.replaceOpWithNewOp<ttir::CumProdOp>(
+@@ -4246,6 +4281,7 @@ public:
+     // Get indices of elements larger than one which correspond to spatial dims
+     // (H, W)
+     auto spatialDims = getIndicesofElementsLargerThanOne(windowDims);
+-    if (spatialDims.empty()) {
+-      return rewriter.notifyMatchFailure(srcOp, "No elements larger than one");
++    if (operandType.getRank() != 4 || spatialDims.size() != 2) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "only 4D operands with two spatial dimensions are supported");
+     }
