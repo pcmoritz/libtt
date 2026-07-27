@@ -74,10 +74,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +               ? value.isZero()
 +               : value.isMinSignedValue();
    }
-@@ -302,5 +308,10 @@ private:
+@@ -302,5 +308,11 @@ private:
                            mlir::stablehlo::ReduceOp::Adaptor adaptor,
                            ConversionPatternRewriter &rewriter) const {
-+    if (srcOp.getInputs().size() != 1) {
++    if (srcOp.getInputs().size() != 1 &&
++        !isArgMax(srcOp, adaptor, rewriter)) {
 +      return rewriter.notifyMatchFailure(
 +          srcOp, "variadic stablehlo.reduce is not supported");
 +    }
