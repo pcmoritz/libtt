@@ -1,0 +1,36 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -5307,6 +5308,9 @@ class StableHLOGatherToEmbeddingPattern
+     size_t remainingIndexedDims =
+         startIndexMap.size() - fullIndexedDims - singletonIndexedDims;
+-    if (partialIndexedDims && (remainingIndexedDims != 1)) {
++    IndexedDimInfo info = computeIndexedDimInfo(srcOp);
++    if (partialIndexedDims &&
++        (partialIndexedDims != 1 || info.startIndexMap.empty() ||
++         sliceSizes[info.startIndexMap.back()] == 1)) {
+       return rewriter.notifyMatchFailure(
+           srcOp,
+           "Did not satisfy slice conditions for dimensions in startIndexMap");
+@@ -5403,6 +5407,9 @@ class StableHLOGatherToEmbeddingPattern
+       auto flattenedIndices = flattenStartIndices(
+           rewriter, inputPermuted.getType().getShape(), srcOp.getOperand(),
+           startIndices, originalStartIndexMap, indexVectorDim);
+-      startIndices = mlir::cast<mlir::TypedValue<mlir::RankedTensorType>>(
+-          flattenedIndices.getResult());
++      auto flattenedType =
++          mlir::cast<RankedTensorType>(flattenedIndices.getType())
++              .clone(rewriter.getI32Type());
++      startIndices = rewriter.create<ttir::TypecastOp>(
++          srcOp.getLoc(), flattenedType, flattenedIndices);
+     } else if (originalStartIndexMap.size() != numIndexingDims) {
+@@ -5431,7 +5438,8 @@ class StableHLOGatherToEmbeddingPattern
+     return GatherOperands{mlir::cast<mlir::TypedValue<mlir::RankedTensorType>>(
+                               reshapedInput.getResult()),
+                           startIndices, std::move(newOutputShape),
+-                          startIndexMap[0]};
++                          needsExpansion ? originalStartIndexMap[actualIndexedDim]
++                                         : startIndexMap[0]};
+   }
+ 
+   // In StableHLO, startIndexMap attribute refers to which dims of input
