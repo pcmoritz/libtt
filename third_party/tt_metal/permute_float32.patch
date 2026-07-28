@@ -1,0 +1,36 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/compute/transpose_xw_tiled.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/compute/transpose_xw_tiled.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/compute/transpose_xw_tiled.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/compute/transpose_xw_tiled.cpp
+@@ -43,6 +43,7 @@ void kernel_main() {
+             compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
+             compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
+-            compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(1);
++            compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
++            compute_kernel_lib::tilize_config::Fp32Mode::Lossless>(1);
+ 
+         // transpose input
+         dfb_tilize_exp.wait_front(1);
+diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
+@@ -815,6 +815,12 @@ tt::tt_metal::ProgramDescriptor PermuteDeviceOperation::MultiCoreTiledGeneric::
+     bool fp32_dest_acc_en = cb_data_format == tt::DataFormat::Float32 || cb_data_format == tt::DataFormat::Int32 ||
+                             cb_data_format == tt::DataFormat::UInt32;
+ 
++    std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(
++        NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
++    if (cb_data_format == tt::DataFormat::Float32) {
++        unpack_to_dest_mode[src0_cb_index] = unpack_to_dest_mode[src1_cb_index] =
++            tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
++    }
+     KernelDescriptor compute_desc;
+     compute_desc.kernel_source =
+         "ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/compute/transpose_xw_tiled.cpp";
+@@ -823,6 +829,7 @@ tt::tt_metal::ProgramDescriptor PermuteDeviceOperation::MultiCoreTiledGeneric::
+     compute_desc.compile_time_args = std::move(compute_kernel_args);
+     compute_desc.config = ComputeConfigDescriptor{
+         .fp32_dest_acc_en = fp32_dest_acc_en,
++        .unpack_to_dest_mode = std::move(unpack_to_dest_mode),
+     };
+ 
+     std::vector<uint32_t> writer_compile_time_args = {};
