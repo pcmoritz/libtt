@@ -2,7 +2,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 index 0fc4cf7..d18197c 100644
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -62,6 +62,21 @@ foldConsecutiveDataCastOps(T op, ::mlir::PatternRewriter &rewriter) {
+@@ -62,6 +62,16 @@ foldConsecutiveDataCastOps(T op, ::mlir::PatternRewriter &rewriter) {
      return ::mlir::failure();
    }
  
@@ -10,14 +10,9 @@ index 0fc4cf7..d18197c 100644
 +      ttnn::getDtypeFromValue(previousDataCastOp.getInput());
 +  ttcore::DataTypeAttr intermediateDtype =
 +      ttnn::getDtypeFromValue(op.getInput());
-+  ttcore::DataTypeAttr outputDtype = ttnn::getDtypeFromValue(op.getResult());
-+  if (!inputDtype || !intermediateDtype || !outputDtype) {
-+    return ::mlir::failure();
-+  }
-+  if (ttcore::isNarrowingConversion(inputDtype.getValue(),
-+                                    intermediateDtype.getValue()) &&
-+      !ttcore::isNarrowingConversion(intermediateDtype.getValue(),
-+                                     outputDtype.getValue())) {
++  if (inputDtype && intermediateDtype &&
++      ttcore::isNarrowingConversion(inputDtype.getValue(),
++                                    intermediateDtype.getValue())) {
 +    return ::mlir::failure();
 +  }
 +
