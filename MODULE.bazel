@@ -303,7 +303,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_preserve_narrowing_typecasts.patch",
         "//third_party/tt_xla:tt_mlir_gelu_precision.patch",
         "//third_party/tt_xla:tt_mlir_zero_sized_buffer_cast.patch",
-        "//third_party/tt_xla:tt_mlir_batched_gather_windows.patch",
         "//third_party/tt_xla:tt_mlir_affine_passes_include.patch",
         "//third_party/tt_xla:tt_mlir_mock_device_include.patch",
         "//third_party/tt_xla:tt_mlir_disable_ttlang_python_resolver.patch",
