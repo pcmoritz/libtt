@@ -1,0 +1,21 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+index 0fc4cf7..d18197c 100644
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -62,6 +62,16 @@ foldConsecutiveDataCastOps(T op, ::mlir::PatternRewriter &rewriter) {
+     return ::mlir::failure();
+   }
+ 
++  ttcore::DataTypeAttr inputDtype =
++      ttnn::getDtypeFromValue(previousDataCastOp.getInput());
++  ttcore::DataTypeAttr intermediateDtype =
++      ttnn::getDtypeFromValue(op.getInput());
++  if (inputDtype && intermediateDtype &&
++      ttcore::isNarrowingConversion(inputDtype.getValue(),
++                                    intermediateDtype.getValue())) {
++    return ::mlir::failure();
++  }
++
+   // Replace the previous op with the merged data type cast op.
+   Value foldedTypecastOp = rewriter.replaceOpWithNewOp<T>(
+       previousDataCastOp, op.getType(), previousDataCastOp.getInput());
