@@ -1,0 +1,54 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1010,3 +1010,4 @@ def TTNN_EmbeddingOp : TTNN_Op<"embedding"> {
+       wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+-        return wa::TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds();
++        return wa::TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds(
++            getWeight().getType().getElementType().isF32());
+       }
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -252,1 +252,2 @@ public:
+-  static TTNNOperandsWorkarounds createEmbeddingOpOperandsWorkarounds();
++  static TTNNOperandsWorkarounds
++  createEmbeddingOpOperandsWorkarounds(bool isFloat32);
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -140,3 +140,2 @@ TTNNOperandsWorkaroundsFactory::createPool2DWithIndicesOpOperandsWorkarounds() {
+-// and the weight operand to use the bf16 data type. Since the output of the
+-// embedding operation follows the same format as the weight operand, the same
+-// workaround is applied to the output operand.
++// and supports bf16 and f32 weights. Other types are converted to bf16; the
++// output uses the weight dtype.
+@@ -147,8 +147,8 @@ TTNNOperandsWorkaroundsFactory::createPool2DWithIndicesOpOperandsWorkarounds() {
+ // Metal issue weight operand workaround:
+ // TBD
+ TTNNOperandsWorkarounds
+-TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds() {
+-  // Create input and bf16 workarounds.
++TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds(
++    bool isFloat32) {
+   TTNNOperandWorkarounds inputRowMajorInt32Workaround;
+   inputRowMajorInt32Workaround.tensorLayoutWorkaround = Layout::RowMajor;
+   inputRowMajorInt32Workaround.tensorDataTypeWorkaround =
+@@ -156,11 +156,13 @@ TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds() {
+   TTNNOperandWorkarounds weightRowMajorBf16Workaround;
+   weightRowMajorBf16Workaround.tensorLayoutWorkaround = Layout::RowMajor;
+-  weightRowMajorBf16Workaround.tensorDataTypeWorkaround =
+-      ttcore::DataType::BFloat16;
+   TTNNOperandWorkarounds outputTiledBf16Workaround;
+   outputTiledBf16Workaround.tensorLayoutWorkaround = Layout::Tile;
+-  outputTiledBf16Workaround.tensorDataTypeWorkaround =
+-      ttcore::DataType::BFloat16;
++  if (!isFloat32) {
++    weightRowMajorBf16Workaround.tensorDataTypeWorkaround =
++        ttcore::DataType::BFloat16;
++    outputTiledBf16Workaround.tensorDataTypeWorkaround =
++        ttcore::DataType::BFloat16;
++  }
+   return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds(0, 0)
+       .addInputOperandWorkaround(inputRowMajorInt32Workaround)
+       .addInputOperandWorkaround(weightRowMajorBf16Workaround)

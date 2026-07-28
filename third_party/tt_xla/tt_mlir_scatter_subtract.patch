@@ -1,0 +1,32 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -4075,1 +4075,13 @@ getReduceTypeFromRegion(Region &region) {
++static bool isSubtractReduction(Region &region) {
++  if (!region.hasOneBlock()) {
++    return false;
++  }
++  Block &block = region.front();
++  auto subtract = mlir::dyn_cast_or_null<mlir::stablehlo::SubtractOp>(
++      block.getTerminator()->getOperand(0).getDefiningOp());
++  return block.getNumArguments() == 2 && subtract &&
++         subtract->getOperand(0) == block.getArgument(0) &&
++         subtract->getOperand(1) == block.getArgument(1);
++}
++
+ static llvm::ErrorOr<ttcore::ReduceType> getReduceType(Operation *op) {
+@@ -7119,2 +7131,5 @@ public:
+     // Convert reduceType stablehlo attribute into ttir attribute.
+-    llvm::ErrorOr<ttcore::ReduceType> scatterReduceType = getReduceType(srcOp);
++    bool subtractReduction =
++        isSubtractReduction(srcOp.getUpdateComputation());
++    llvm::ErrorOr<ttcore::ReduceType> scatterReduceType =
++        subtractReduction ? ttcore::ReduceType::Sum : getReduceType(srcOp);
+@@ -7131,3 +7146,7 @@ public:
+     RankedTensorType updateType =
+         mlir::cast<RankedTensorType>(updateTensor.getType());
+     ArrayRef<int64_t> updateShape = updateType.getShape();
++    if (subtractReduction) {
++      updateTensor = rewriter.create<ttir::NegOp>(
++          srcOp.getLoc(), updateType, updateTensor);
++    }
