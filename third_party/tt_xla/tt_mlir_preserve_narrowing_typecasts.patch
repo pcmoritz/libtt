@@ -1,22 +1,3 @@
-diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-index 47220e8..52cd0e5 100644
---- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-+++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -228,8 +228,12 @@ public:
-     auto outputType = mlir::cast<RankedTensorType>(
-         this->getTypeConverter()->convertType(srcOp.getResult().getType()));
- 
--    rewriter.replaceOpWithNewOp<DestOp>(srcOp, outputType,
--                                        adaptor.getOperands());
-+    DestOp destOp = rewriter.replaceOpWithNewOp<DestOp>(
-+        srcOp, outputType, adaptor.getOperands());
-+    if (mlir::isa<ttir::TypecastOp>(destOp.getOperation())) {
-+      destOp->setAttr("conservative_folding",
-+                      rewriter.getBoolAttr(true));
-+    }
- 
-     return success();
-   }
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 index 0fc4cf7..d18197c 100644
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
