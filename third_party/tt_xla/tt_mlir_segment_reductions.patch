@@ -107,15 +107,22 @@ index 1111111..2222222 100644
        // Process indices to match update tensor shape.
        int32_t dim = scatterDimsToOperandDims[0];
        Value finalIndexTensor =
-@@ -7146,7 +7153,7 @@ public:
-     }
- 
-     // Multi-dimensional scatter.
+@@ -7146,7 +7153,5 @@ public:
+-    }
+-
+-    // Multi-dimensional scatter.
 -    if (scatterDimsToOperandDims.size() > 1) {
-+    if (flatten) {
++    } else {
++      // Multi-dimensional scatter.
        // Always scatter along dimension 0 for flattened tensors.
        constexpr int32_t SCATTER_DIMENSION = 0;
  
+@@ -7174,5 +7179,3 @@ public:
+       return success();
+     }
+-
+-    return failure();
+   }
 @@ -7242,9 +7250,10 @@ private:
      // Checks that apply to single dimensional scatter.
  
