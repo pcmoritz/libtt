@@ -300,6 +300,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_lower_jax_pad.patch",
         "//third_party/tt_xla:tt_mlir_dynamic_update_slice_device.patch",
         "//third_party/tt_xla:tt_mlir_stablehlo_scatter_oob.patch",
+        "//third_party/tt_xla:tt_mlir_segment_reductions.patch",
         "//third_party/tt_xla:tt_mlir_preserve_narrowing_typecasts.patch",
         "//third_party/tt_xla:tt_mlir_gelu_precision.patch",
         "//third_party/tt_xla:tt_mlir_affine_passes_include.patch",

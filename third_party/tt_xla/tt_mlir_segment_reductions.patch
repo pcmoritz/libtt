@@ -1,0 +1,176 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index 1111111..2222222 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -258,19 +258,23 @@ public:
+ 
+     if (mlir::isa<mlir::stablehlo::AddOp>(innerOp)) {
+       return matchAndRewriteInternal<mlir::tt::ttir::SumOp>(srcOp, adaptor,
+-                                                            rewriter);
++                                                            rewriter,
++                                                            ttcore::ReduceType::Sum);
+     }
+     if (mlir::isa<mlir::stablehlo::MaxOp>(innerOp)) {
+       return matchAndRewriteInternal<mlir::tt::ttir::MaxOp>(srcOp, adaptor,
+-                                                            rewriter);
++                                                            rewriter,
++                                                            ttcore::ReduceType::Max);
+     }
+     if (mlir::isa<mlir::stablehlo::MinOp>(innerOp)) {
+       return matchAndRewriteInternal<mlir::tt::ttir::MinOp>(srcOp, adaptor,
+-                                                            rewriter);
++                                                            rewriter,
++                                                            ttcore::ReduceType::Min);
+     }
+     if (mlir::isa<mlir::stablehlo::MulOp>(innerOp)) {
+       return matchAndRewriteInternal<mlir::tt::ttir::ProdOp>(srcOp, adaptor,
+-                                                             rewriter);
++                                                             rewriter,
++                                                             ttcore::ReduceType::Prod);
+     }
+     if (mlir::isa<mlir::stablehlo::AndOp>(innerOp)) {
+       return matchAndRewriteInternal<mlir::tt::ttir::ReduceAndOp>(
+@@ -338,10 +342,61 @@ private:
+   LogicalResult
+   matchAndRewriteInternal(mlir::stablehlo::ReduceOp &srcOp,
+                           mlir::stablehlo::ReduceOp::Adaptor &adaptor,
+-                          ConversionPatternRewriter &rewriter) const {
++                          ConversionPatternRewriter &rewriter,
++                          ttcore::ReduceType reduceType =
++                              ttcore::ReduceType::Invalid) const {
+     auto outputType = mlir::cast<RankedTensorType>(
+         getTypeConverter()->convertType(srcOp.getResultTypes().front()));
+ 
++    Value input = adaptor.getInputs().front();
++    auto inputType = mlir::cast<RankedTensorType>(input.getType());
++    auto init = srcOp.getInitValues()
++                    .front()
++                    .getDefiningOp<mlir::stablehlo::ConstantOp>();
++    // Native FPU reductions truncate F32 inputs to TF32. Reduce leading
++    // dimensions with the row-major scatter kernel to preserve F32 values.
++    if (reduceType != ttcore::ReduceType::Invalid && init &&
++        srcOp.getDimensions() == ArrayRef<int64_t>{0} &&
++        inputType.getRank() == outputType.getRank() + 1 &&
++        inputType.getDimSize(0) > 1 &&
++        inputType.getElementType().isF32() &&
++        outputType.getNumElements() > 0) {
++      int64_t inputVolume = inputType.getNumElements();
++      int64_t outputVolume = outputType.getNumElements();
++      if (inputVolume > std::numeric_limits<int32_t>::max()) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "reduction input exceeds 32-bit scatter index range");
++      }
++
++      Value source =
++          ttir::utils::flattenTensor(rewriter, srcOp.getLoc(), input);
++      auto indicesType =
++          RankedTensorType::get({inputVolume}, rewriter.getI32Type());
++      Value indices = rewriter.create<ttir::ArangeOp>(
++          srcOp.getLoc(), indicesType, 0, inputVolume, 1, 0);
++      Value modulus = rewriter.create<ttir::FullOp>(
++          srcOp.getLoc(), indicesType,
++          rewriter.getI32IntegerAttr(static_cast<int32_t>(outputVolume)));
++      indices = rewriter.create<ttir::RemainderOp>(
++          srcOp.getLoc(), indicesType, indices, modulus);
++
++      auto flatOutputType =
++          RankedTensorType::get({outputVolume}, outputType.getElementType());
++      auto initValue = mlir::cast<DenseElementsAttr>(init.getValue())
++                           .getSplatValue<Attribute>();
++      Value result = rewriter.create<ttir::FullOp>(
++          srcOp.getLoc(), flatOutputType, initValue);
++      result = rewriter.create<ttir::ScatterOp>(
++          srcOp.getLoc(), flatOutputType, result, indices, source,
++          rewriter.getI32IntegerAttr(0),
++          ttcore::ReduceTypeAttr::get(rewriter.getContext(), reduceType));
++      rewriter.replaceOpWithNewOp<ttir::ReshapeOp>(
++          srcOp, outputType, result,
++          rewriter.getI32ArrayAttr(
++              llvm::to_vector_of<int32_t>(outputType.getShape())));
++      return success();
++    }
++
+     // Can't reuse the original dimensions attribute because it uses i64 type.
+     mlir::ArrayAttr dimArg = rewriter.getI32ArrayAttr(
+         llvm::SmallVector<int32_t>(srcOp.getDimensions()));
+@@ -7010,6 +7010,11 @@ public:
+     auto operandType = mlir::cast<RankedTensorType>(operand.getType());
+     auto updateType = mlir::cast<RankedTensorType>(update.getType());
+ 
++    // embedding_backward only supports BF16 and would narrow F32 updates.
++    if (operandType.getElementType().isF32()) {
++      return failure();
++    }
++
+     if (operandType.getRank() != 2) {
+       return rewriter.notifyMatchFailure(
+           srcOp, "EmbeddingBackward requires 2D weight table (operand)");
+@@ -7128,7 +7133,10 @@ public:
+     ArrayRef<int64_t> updateShape = updateType.getShape();
+ 
+     // Single-dimensional scatter.
+-    if (scatterDimsToOperandDims.size() == 1) {
++    bool flatten = scatterDimsToOperandDims.size() > 1 ||
++                   inputType.getElementType().isF32() ||
++                   inputType.getRank() != updateType.getRank();
++    if (!flatten) {
+       // Process indices to match update tensor shape.
+       int32_t dim = scatterDimsToOperandDims[0];
+       Value finalIndexTensor =
+@@ -7146,7 +7153,7 @@ public:
+     }
+ 
+     // Multi-dimensional scatter.
+-    if (scatterDimsToOperandDims.size() > 1) {
++    if (flatten) {
+       // Always scatter along dimension 0 for flattened tensors.
+       constexpr int32_t SCATTER_DIMENSION = 0;
+ 
+@@ -7242,9 +7250,10 @@ private:
+     // Checks that apply to single dimensional scatter.
+ 
+-    if (!multiDimensionalScatter && indexVectorDim != 1u) {
++    if (!multiDimensionalScatter &&
++        indexVectorDim + 1 != indexShape.size()) {
+       return rewriter.notifyMatchFailure(
+           op,
+-          "TTIR single dimensional scatter requires index_vector_dim to be 1");
++          "TTIR single dimensional scatter requires a trailing index vector");
+     }
+ 
+     return success();
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+index 1111111..2222222 100644
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -922,5 +922,8 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
++  // Float32 cannot represent the INT32_MAX identity used by min.
++  bool supportsInt32 =
++      inputType.isInteger(32) && mlir::isa<ttnn::MinOp>(op);
+   TTNNOperandWorkarounds operandWorkaround;
+-  if (!inputType.isF32() && !inputType.isBF16()) {
++  if (!inputType.isF32() && !inputType.isBF16() && !supportsInt32) {
+     operandWorkaround.tensorDataTypeWorkaround =
+         mlir::tt::ttcore::DataType::Float32;
+   }
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+index 1111111..2222222 100644
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+@@ -96,9 +96,14 @@ private:
+   // Identifies function input arguments that are candidates for RowMajor layout
+-  // propagation. Currently restricted to integer tensor types only.
++  // propagation. F32 inputs are also eligible when the function uses scatter.
+   llvm::SmallVector<Value> identifyInputArguments(func::FuncOp func) {
+     llvm::SmallVector<Value> rowMajorCandidates;
++    bool hasScatter = false;
++    func.walk([&](ttnn::ScatterOp) { hasScatter = true; });
+     for (BlockArgument arg : func.getArguments()) {
+-      if (isInputArgument(arg, func) && hasIntegerElementType(arg)) {
++      auto type = mlir::dyn_cast<RankedTensorType>(arg.getType());
++      if (isInputArgument(arg, func) &&
++          (hasIntegerElementType(arg) ||
++           (hasScatter && type && type.getElementType().isF32()))) {
+         rowMajorCandidates.push_back(arg);
+       }
+     }
