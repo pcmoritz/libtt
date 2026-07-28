@@ -61,37 +61,3 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 +  const std::lock_guard<std::mutex> lock(execution_mutex);
 +
    tt_pjrt_status status = instance->execute(args);
-diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
---- a/pjrt_implementation/src/api/module_builder/module_builder.cc
-+++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
-@@ -83,3 +83,19 @@
- const std::string c_mlir_format_name = "mlir";
--
-+
-+static bool moduleHasZeroSizedTensor(mlir::ModuleOp module) {
-+  return module
-+      .walk([](mlir::Operation *op) {
-+        auto hasZeroElements = [](mlir::Type type) {
-+          auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(type);
-+          return tensorType && tensorType.hasStaticShape() &&
-+                 tensorType.getNumElements() == 0;
-+        };
-+        return llvm::any_of(op->getOperandTypes(), hasZeroElements) ||
-+                       llvm::any_of(op->getResultTypes(), hasZeroElements)
-+                   ? mlir::WalkResult::interrupt()
-+                   : mlir::WalkResult::advance();
-+      })
-+      .wasInterrupted();
-+}
-+
- // Returns true if the public entry point of the module has at least one
-@@ -325,3 +341,8 @@
-   }
--
-+
-+  if (moduleHasZeroSizedTensor(*mlir_module)) {
-+    LOG_F(ERROR, "Zero-sized tensors are not supported");
-+    return {tt_pjrt_status::kInvalidArgument, nullptr};
-+  }
-+
-   status = runFrontendSHLOPipeline(mlir_module, compile_options.export_path,
