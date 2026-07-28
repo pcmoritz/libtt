@@ -47,7 +47,7 @@ index 1111111..2222222 100644
  
 -    if (!multiDimensionalScatter && indexVectorDim != 1u) {
 +    if (!multiDimensionalScatter &&
-+        indexVectorDim + 1 != indexShape.size()) {
++        indexVectorDim != indexShape.size() - 1) {
        return rewriter.notifyMatchFailure(
            op,
 -          "TTIR single dimensional scatter requires index_vector_dim to be 1");
@@ -87,14 +87,15 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagati
 index 1111111..2222222 100644
 --- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 +++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
-@@ -96,9 +96,14 @@ private:
+@@ -96,9 +96,15 @@ private:
    // Identifies function input arguments that are candidates for RowMajor layout
 -  // propagation. Currently restricted to integer tensor types only.
 +  // propagation. F32 inputs are also eligible when the function uses scatter.
    llvm::SmallVector<Value> identifyInputArguments(func::FuncOp func) {
      llvm::SmallVector<Value> rowMajorCandidates;
-+    bool hasScatter = false;
-+    func.walk([&](ttnn::ScatterOp) { hasScatter = true; });
++    bool hasScatter =
++        func.walk([](ttnn::ScatterOp) { return WalkResult::interrupt(); })
++            .wasInterrupted();
      for (BlockArgument arg : func.getArguments()) {
 -      if (isInputArgument(arg, func) && hasIntegerElementType(arg)) {
 +      auto type = mlir::dyn_cast<RankedTensorType>(arg.getType());
