@@ -2,35 +2,21 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 index 1111111..2222222 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -258,19 +258,23 @@ public:
- 
-     if (mlir::isa<mlir::stablehlo::AddOp>(innerOp)) {
-       return matchAndRewriteInternal<mlir::tt::ttir::SumOp>(srcOp, adaptor,
--                                                            rewriter);
-+                                                            rewriter,
-+                                                            ttcore::ReduceType::Sum);
-     }
-     if (mlir::isa<mlir::stablehlo::MaxOp>(innerOp)) {
-       return matchAndRewriteInternal<mlir::tt::ttir::MaxOp>(srcOp, adaptor,
--                                                            rewriter);
-+                                                            rewriter,
-+                                                            ttcore::ReduceType::Max);
-     }
-     if (mlir::isa<mlir::stablehlo::MinOp>(innerOp)) {
-       return matchAndRewriteInternal<mlir::tt::ttir::MinOp>(srcOp, adaptor,
--                                                            rewriter);
-+                                                            rewriter,
-+                                                            ttcore::ReduceType::Min);
-     }
-     if (mlir::isa<mlir::stablehlo::MulOp>(innerOp)) {
-       return matchAndRewriteInternal<mlir::tt::ttir::ProdOp>(srcOp, adaptor,
--                                                             rewriter);
-+                                                             rewriter,
-+                                                             ttcore::ReduceType::Prod);
-     }
-     if (mlir::isa<mlir::stablehlo::AndOp>(innerOp)) {
-       return matchAndRewriteInternal<mlir::tt::ttir::ReduceAndOp>(
-@@ -337,5 +341,77 @@ private:
+@@ -337,5 +337,90 @@ private:
++  template <typename DestOp>
++  static constexpr ttcore::ReduceType getReduceTypeForOp() {
++    if constexpr (std::is_same_v<DestOp, ttir::SumOp>) {
++      return ttcore::ReduceType::Sum;
++    } else if constexpr (std::is_same_v<DestOp, ttir::MaxOp>) {
++      return ttcore::ReduceType::Max;
++    } else if constexpr (std::is_same_v<DestOp, ttir::MinOp>) {
++      return ttcore::ReduceType::Min;
++    } else if constexpr (std::is_same_v<DestOp, ttir::ProdOp>) {
++      return ttcore::ReduceType::Prod;
++    }
++    return ttcore::ReduceType::Invalid;
++  }
++
 +  bool isSegmentScatter(mlir::stablehlo::ReduceOp &srcOp,
 +                        mlir::stablehlo::ReduceOp::Adaptor &adaptor,
 +                        ttcore::ReduceType reduceType) const {
@@ -102,10 +88,8 @@ index 1111111..2222222 100644
    LogicalResult
    matchAndRewriteInternal(mlir::stablehlo::ReduceOp &srcOp,
                            mlir::stablehlo::ReduceOp::Adaptor &adaptor,
--                          ConversionPatternRewriter &rewriter) const {
-+                          ConversionPatternRewriter &rewriter,
-+                          ttcore::ReduceType reduceType =
-+                              ttcore::ReduceType::Invalid) const {
+                           ConversionPatternRewriter &rewriter) const {
++    constexpr ttcore::ReduceType reduceType = getReduceTypeForOp<DestOp>();
 +    if (isSegmentScatter(srcOp, adaptor, reduceType)) {
 +      return lowerAsSegmentScatter(srcOp, adaptor, rewriter, reduceType);
 +    }
