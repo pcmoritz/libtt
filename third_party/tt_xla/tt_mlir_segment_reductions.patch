@@ -30,7 +30,75 @@ index 1111111..2222222 100644
      }
      if (mlir::isa<mlir::stablehlo::AndOp>(innerOp)) {
        return matchAndRewriteInternal<mlir::tt::ttir::ReduceAndOp>(
-@@ -338,10 +342,61 @@ private:
+@@ -337,5 +341,77 @@ private:
++  bool isSegmentScatter(mlir::stablehlo::ReduceOp &srcOp,
++                        mlir::stablehlo::ReduceOp::Adaptor &adaptor,
++                        ttcore::ReduceType reduceType) const {
++    auto outputType = mlir::cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResultTypes().front()));
++    auto inputType =
++        mlir::cast<RankedTensorType>(adaptor.getInputs().front().getType());
++    auto init = srcOp.getInitValues()
++                    .front()
++                    .getDefiningOp<mlir::stablehlo::ConstantOp>();
++    // Native FPU reductions truncate F32 inputs to TF32.
++    return reduceType != ttcore::ReduceType::Invalid && init &&
++           srcOp.getDimensions() == ArrayRef<int64_t>{0} &&
++           inputType.getRank() == outputType.getRank() + 1 &&
++           inputType.getDimSize(0) > 1 &&
++           inputType.getElementType().isF32() &&
++           outputType.getNumElements() > 0;
++  }
++
++  LogicalResult lowerAsSegmentScatter(
++      mlir::stablehlo::ReduceOp &srcOp,
++      mlir::stablehlo::ReduceOp::Adaptor &adaptor,
++      ConversionPatternRewriter &rewriter,
++      ttcore::ReduceType reduceType) const {
++    auto outputType = mlir::cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResultTypes().front()));
++    Value input = adaptor.getInputs().front();
++    auto inputType = mlir::cast<RankedTensorType>(input.getType());
++    auto init = srcOp.getInitValues()
++                    .front()
++                    .getDefiningOp<mlir::stablehlo::ConstantOp>();
++    int64_t inputVolume = inputType.getNumElements();
++    int64_t outputVolume = outputType.getNumElements();
++    if (inputVolume > std::numeric_limits<int32_t>::max()) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "reduction input exceeds 32-bit scatter index range");
++    }
++
++    Value source =
++        ttir::utils::flattenTensor(rewriter, srcOp.getLoc(), input);
++    auto indicesType =
++        RankedTensorType::get({inputVolume}, rewriter.getI32Type());
++    Value indices = rewriter.create<ttir::ArangeOp>(
++        srcOp.getLoc(), indicesType, 0, inputVolume, 1, 0);
++    Value modulus = rewriter.create<ttir::FullOp>(
++        srcOp.getLoc(), indicesType,
++        rewriter.getI32IntegerAttr(static_cast<int32_t>(outputVolume)));
++    indices = rewriter.create<ttir::RemainderOp>(
++        srcOp.getLoc(), indicesType, indices, modulus);
++
++    auto flatOutputType =
++        RankedTensorType::get({outputVolume}, outputType.getElementType());
++    auto initValue = mlir::cast<DenseElementsAttr>(init.getValue())
++                         .getSplatValue<Attribute>();
++    Value result = rewriter.create<ttir::FullOp>(
++        srcOp.getLoc(), flatOutputType, initValue);
++    result = rewriter.create<ttir::ScatterOp>(
++        srcOp.getLoc(), flatOutputType, result, indices, source,
++        rewriter.getI32IntegerAttr(0),
++        ttcore::ReduceTypeAttr::get(rewriter.getContext(), reduceType));
++    rewriter.replaceOpWithNewOp<ttir::ReshapeOp>(
++        srcOp, outputType, result,
++        rewriter.getI32ArrayAttr(
++            llvm::to_vector_of<int32_t>(outputType.getShape())));
++    return success();
++  }
++
+   template <typename DestOp>
    LogicalResult
    matchAndRewriteInternal(mlir::stablehlo::ReduceOp &srcOp,
                            mlir::stablehlo::ReduceOp::Adaptor &adaptor,
@@ -38,61 +106,9 @@ index 1111111..2222222 100644
 +                          ConversionPatternRewriter &rewriter,
 +                          ttcore::ReduceType reduceType =
 +                              ttcore::ReduceType::Invalid) const {
-     auto outputType = mlir::cast<RankedTensorType>(
-         getTypeConverter()->convertType(srcOp.getResultTypes().front()));
- 
-+    Value input = adaptor.getInputs().front();
-+    auto inputType = mlir::cast<RankedTensorType>(input.getType());
-+    auto init = srcOp.getInitValues()
-+                    .front()
-+                    .getDefiningOp<mlir::stablehlo::ConstantOp>();
-+    // Native FPU reductions truncate F32 inputs to TF32. Reduce leading
-+    // dimensions with the row-major scatter kernel to preserve F32 values.
-+    if (reduceType != ttcore::ReduceType::Invalid && init &&
-+        srcOp.getDimensions() == ArrayRef<int64_t>{0} &&
-+        inputType.getRank() == outputType.getRank() + 1 &&
-+        inputType.getDimSize(0) > 1 &&
-+        inputType.getElementType().isF32() &&
-+        outputType.getNumElements() > 0) {
-+      int64_t inputVolume = inputType.getNumElements();
-+      int64_t outputVolume = outputType.getNumElements();
-+      if (inputVolume > std::numeric_limits<int32_t>::max()) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "reduction input exceeds 32-bit scatter index range");
-+      }
-+
-+      Value source =
-+          ttir::utils::flattenTensor(rewriter, srcOp.getLoc(), input);
-+      auto indicesType =
-+          RankedTensorType::get({inputVolume}, rewriter.getI32Type());
-+      Value indices = rewriter.create<ttir::ArangeOp>(
-+          srcOp.getLoc(), indicesType, 0, inputVolume, 1, 0);
-+      Value modulus = rewriter.create<ttir::FullOp>(
-+          srcOp.getLoc(), indicesType,
-+          rewriter.getI32IntegerAttr(static_cast<int32_t>(outputVolume)));
-+      indices = rewriter.create<ttir::RemainderOp>(
-+          srcOp.getLoc(), indicesType, indices, modulus);
-+
-+      auto flatOutputType =
-+          RankedTensorType::get({outputVolume}, outputType.getElementType());
-+      auto initValue = mlir::cast<DenseElementsAttr>(init.getValue())
-+                           .getSplatValue<Attribute>();
-+      Value result = rewriter.create<ttir::FullOp>(
-+          srcOp.getLoc(), flatOutputType, initValue);
-+      result = rewriter.create<ttir::ScatterOp>(
-+          srcOp.getLoc(), flatOutputType, result, indices, source,
-+          rewriter.getI32IntegerAttr(0),
-+          ttcore::ReduceTypeAttr::get(rewriter.getContext(), reduceType));
-+      rewriter.replaceOpWithNewOp<ttir::ReshapeOp>(
-+          srcOp, outputType, result,
-+          rewriter.getI32ArrayAttr(
-+              llvm::to_vector_of<int32_t>(outputType.getShape())));
-+      return success();
++    if (isSegmentScatter(srcOp, adaptor, reduceType)) {
++      return lowerAsSegmentScatter(srcOp, adaptor, rewriter, reduceType);
 +    }
-+
-     // Can't reuse the original dimensions attribute because it uses i64 type.
-     mlir::ArrayAttr dimArg = rewriter.getI32ArrayAttr(
-         llvm::SmallVector<int32_t>(srcOp.getDimensions()));
 @@ -7010,6 +7010,11 @@ public:
      auto operandType = mlir::cast<RankedTensorType>(operand.getType());
      auto updateType = mlir::cast<RankedTensorType>(update.getType());
