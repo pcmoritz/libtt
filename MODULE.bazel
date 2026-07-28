@@ -215,6 +215,7 @@ http_archive(
         "//third_party/tt_metal:accurate_fp32_reductions.patch",
         "//third_party/tt_metal:embedding_float32.patch",
         "//third_party/tt_metal:permute_float32.patch",
+        "//third_party/tt_metal:layout_zero_volume.patch",
     ],
     sha256 = "f56e21da4f169ce51d15d30962921a6f1f270ad6f21d10b2512ad4c1bc293981",
     strip_prefix = "tt-metal-e07514c48bb29d04451d1a42eaf1f9f6e977d33a",

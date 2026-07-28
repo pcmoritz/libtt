@@ -1,0 +1,46 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
+@@ -7,4 +7,5 @@
+ #include "device/tilize_device_operation.hpp"
+ #include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/creation/creation.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
+ #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+@@ -48,4 +49,12 @@ ttnn::Tensor tilize(
+     bool use_multicore,
+     bool use_low_perf,
+     const std::optional<CoreRangeSet>& sub_core_grids) {
++    if (input_tensor.logical_volume() == 0) {
++        return ttnn::empty(
++            input_tensor.logical_shape(),
++            output_dtype.value_or(input_tensor.dtype()),
++            TILE_LAYOUT,
++            input_tensor.device(),
++            memory_config.value_or(input_tensor.memory_config()));
++    }
+     tt::DataFormat input_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
+@@ -7,4 +7,5 @@
+ #include "device/untilize_device_operation.hpp"
+ #include "ttnn/operation.hpp"
++#include "ttnn/operations/creation/creation.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
+ #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+@@ -45,3 +46,14 @@ ttnn::Tensor untilize(
+     bool use_multicore,
+     const std::optional<CoreRangeSet>& sub_core_grids) {
++    if (input_tensor.logical_volume() == 0) {
++        return ttnn::empty(
++            input_tensor.logical_shape(),
++            input_tensor.dtype() == DataType::BFLOAT8_B
++                ? DataType::BFLOAT16
++                : input_tensor.dtype(),
++            ROW_MAJOR_LAYOUT,
++            input_tensor.device(),
++            memory_config.value_or(input_tensor.memory_config()));
++    }
++
+     // If the input tensor is not sharded, on DRAM and logical shape != padded shape, then unpad the input tensor.

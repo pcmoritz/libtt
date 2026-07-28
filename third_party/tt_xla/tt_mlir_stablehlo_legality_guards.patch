@@ -143,3 +143,28 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      return rewriter.notifyMatchFailure(
 +          srcOp, "only 4D operands with two spatial dimensions are supported");
      }
+@@ -6981,3 +7017,13 @@ public:
+   matchAndRewrite(mlir::stablehlo::ScatterOp srcOp,
+                   mlir::stablehlo::ScatterOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    auto scatterDims =
++        adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims();
++    Block &updateBlock = srcOp.getUpdateComputation().front();
++    if (scatterDims.empty() && srcOp.getUpdates().size() == 1 &&
++        srcOp.getUpdates()[0].getType() == srcOp.getResult(0).getType() &&
++        updateBlock.getTerminator()->getOperand(0) ==
++            updateBlock.getArgument(1)) {
++      rewriter.replaceOp(srcOp, adaptor.getUpdates()[0]);
++      return success();
++    }
+@@ -7083,5 +7129,10 @@ private:
+     ArrayRef<int64_t> scatterDimsToOperandDims =
+         adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims();
++    if (scatterDimsToOperandDims.empty()) {
++      return rewriter.notifyMatchFailure(
++          op, "scatter_dims_to_operand_dims must not be empty");
++    }
++
+     if (!llvm::is_sorted(scatterDimsToOperandDims)) {
+       return rewriter.notifyMatchFailure(
+           op,
