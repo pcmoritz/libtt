@@ -10,6 +10,12 @@ bazel_dep(name = "rules_shell", version = "0.6.1")
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
+xla_profiler_headers_repository = use_repo_rule(
+    "//third_party/tt_xla:xla_profiler_headers.bzl",
+    "xla_profiler_headers_repository",
+)
+
+xla_profiler_headers_repository(name = "xla_profiler_headers")
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(python_version = "3.13")
