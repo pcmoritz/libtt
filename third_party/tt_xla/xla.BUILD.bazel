@@ -1,0 +1,11 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "pjrt_profiler_c_api",
+    hdrs = [
+        "xla/backends/profiler/plugin/profiler_c_api.h",
+        "xla/pjrt/c/pjrt_c_api_profiler_extension.h",
+    ],
+)

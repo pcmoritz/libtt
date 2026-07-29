@@ -12,6 +12,7 @@ exports_files([
     "tt_metal_runtime_cold_stubs.cc",
     "tt_mlir.BUILD.bazel",
     "tt_xla.BUILD.bazel",
+    "xla.BUILD.bazel",
 ])
 
 cc_library(

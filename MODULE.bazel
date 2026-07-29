@@ -46,6 +46,20 @@ http_archive(
     ],
 )
 
+# Version last synced into tt-xla's PJRT C API fork.
+http_archive(
+    name = "xla",
+    build_file = "//third_party/tt_xla:xla.BUILD.bazel",
+    patch_cmds = [
+        "find xla \\( -name BUILD -o -name BUILD.bazel \\) -delete",
+    ],
+    sha256 = "d8b987d0e3f250bef62e6b73ba09437c99a76bbe649f81ef9348c11225a70309",
+    strip_prefix = "xla-9af6ffc202a18bc40d1014c6e43f21a533909277",
+    urls = [
+        "https://github.com/openxla/xla/archive/9af6ffc202a18bc40d1014c6e43f21a533909277.tar.gz",
+    ],
+)
+
 http_archive(
     name = "blake3",
     build_file = "//third_party/blake3:BUILD.overlay.bazel",
@@ -215,6 +229,7 @@ http_archive(
         "//third_party/tt_metal:accurate_fp32_reductions.patch",
         "//third_party/tt_metal:embedding_float32.patch",
         "//third_party/tt_metal:permute_float32.patch",
+        "//third_party/tt_metal:layout_zero_volume.patch",
     ],
     sha256 = "f56e21da4f169ce51d15d30962921a6f1f270ad6f21d10b2512ad4c1bc293981",
     strip_prefix = "tt-metal-e07514c48bb29d04451d1a42eaf1f9f6e977d33a",

@@ -61,3 +61,70 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 +  const std::lock_guard<std::mutex> lock(execution_mutex);
 +
    tt_pjrt_status status = instance->execute(args);
+diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/api_bindings.cc
+--- a/pjrt_implementation/src/api_bindings.cc
++++ b/pjrt_implementation/src/api_bindings.cc
+@@ -21,3 +21,4 @@
+ #include "api/memory_instance.h"
+ #include "api/plugin_attributes.h"
+ #include "utils/logging.h"
++#include "xla/pjrt/c/pjrt_c_api_profiler_extension.h"
+@@ -25,7 +26,56 @@
+ namespace tt::pjrt {
+-
++namespace {
++
++// JAX 0.7.1 crashes if a PJRT plugin has no profiler extension. Advertise a
++// no-op device profiler so its host and Python profilers can still run.
++
++PLUGIN_Profiler_Error *createProfiler(PLUGIN_Profiler_Create_Args *args) {
++  args->profiler = nullptr;
++  return nullptr;
++}
++
++PLUGIN_Profiler_Error *profilerSuccess(PLUGIN_Profiler_Destroy_Args *) {
++  return nullptr;
++}
++PLUGIN_Profiler_Error *profilerSuccess(PLUGIN_Profiler_Start_Args *) {
++  return nullptr;
++}
++PLUGIN_Profiler_Error *profilerSuccess(PLUGIN_Profiler_Stop_Args *) {
++  return nullptr;
++}
++
++PLUGIN_Profiler_Error *
++collectProfilerData(PLUGIN_Profiler_CollectData_Args *args) {
++  args->buffer_size_in_bytes = 0;
++  return nullptr;
++}
++
++PLUGIN_Profiler_Api profilerApi{
++    .struct_size = PLUGIN_Profiler_Api_STRUCT_SIZE,
++    .priv = nullptr,
++    .error_destroy = nullptr,
++    .error_message = nullptr,
++    .error_get_code = nullptr,
++    .create = createProfiler,
++    .destroy = profilerSuccess,
++    .start = profilerSuccess,
++    .stop = profilerSuccess,
++    .collect_data = collectProfilerData,
++};
++
++PJRT_Profiler_Extension profilerExtension{
++    .struct_size = PJRT_Profiler_Extension_STRUCT_SIZE,
++    .type = PJRT_Extension_Type_Profiler,
++    .next = nullptr,
++    .profiler_api = &profilerApi,
++    .traceme_context_id = 0,
++};
++
++} // namespace
++
+ void bindApi(PJRT_Api *api) {
+   api->struct_size = PJRT_Api_STRUCT_SIZE;
+-  api->extension_start = nullptr;
++  api->extension_start =
++      reinterpret_cast<PJRT_Extension_Base *>(&profilerExtension);
+   api->pjrt_api_version.major_version = PJRT_API_MAJOR;
+   api->pjrt_api_version.minor_version = PJRT_API_MINOR;
