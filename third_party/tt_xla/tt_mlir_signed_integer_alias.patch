@@ -1,0 +1,69 @@
+diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
+index 6b4077c6..8cff02b0 100644
+--- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
++++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
+@@ -206,9 +206,12 @@ static DataType elementTypeToDataTypeImpl(mlir::Type elementType) {
+     case 1:
+       return DataType::Bool;
++    // TTNN has no signed 8- or 16-bit tensor dtype.
+     case 8:
+-      return DataType::UInt8;
++      return (intType.isSigned() || intType.isSignless()) ? DataType::Int32
++                                                          : DataType::UInt8;
+     case 16:
+-      return DataType::UInt16;
++      return (intType.isSigned() || intType.isSignless()) ? DataType::Int32
++                                                          : DataType::UInt16;
+     case 32:
+     case 64:
+       return (intType.isSigned() || intType.isSignless()) ? DataType::Int32
+diff --git a/runtime/lib/common/utils.cpp b/runtime/lib/common/utils.cpp
+index 81e64390..225ac22c 100644
+--- a/runtime/lib/common/utils.cpp
++++ b/runtime/lib/common/utils.cpp
+@@ -273,9 +273,9 @@ getUnsupportedDataTypeAlias(::tt::target::DataType unsupportedDataType) {
+   case ::tt::target::DataType::UInt64:
+     return ::tt::target::DataType::UInt32;
+   case ::tt::target::DataType::Int16:
+-    return ::tt::target::DataType::UInt16;
++    return ::tt::target::DataType::Int32;
+   case ::tt::target::DataType::Int8:
+-    return ::tt::target::DataType::UInt8;
++    return ::tt::target::DataType::Int32;
+   case ::tt::target::DataType::Bool:
+     return ::tt::target::DataType::BFloat16;
+   case ::tt::target::DataType::Float16:
+@@ -329,6 +329,16 @@ void handleBufferCast(const void *oldBuffer, void *newBuffer,
+     detail::handleIntegerBufferCast<uint32_t, int64_t>(
+         static_cast<const uint32_t *>(oldBuffer),
+         static_cast<int64_t *>(newBuffer), numElements);
++  } else if (oldDataType == tt::target::DataType::Int16 &&
++             newDataType == tt::target::DataType::Int32) {
++    detail::handleIntegerBufferCast<int16_t, int32_t>(
++        static_cast<const int16_t *>(oldBuffer),
++        static_cast<int32_t *>(newBuffer), numElements);
++  } else if (oldDataType == tt::target::DataType::Int32 &&
++             newDataType == tt::target::DataType::Int16) {
++    detail::handleIntegerBufferCast<int32_t, int16_t>(
++        static_cast<const int32_t *>(oldBuffer),
++        static_cast<int16_t *>(newBuffer), numElements);
+   } else if (oldDataType == tt::target::DataType::Int16 &&
+              newDataType == tt::target::DataType::UInt16) {
+     detail::handleIntegerBufferCast<int16_t, uint16_t>(
+@@ -339,6 +349,16 @@ void handleBufferCast(const void *oldBuffer, void *newBuffer,
+     detail::handleIntegerBufferCast<uint16_t, int16_t>(
+         static_cast<const uint16_t *>(oldBuffer),
+         static_cast<int16_t *>(newBuffer), numElements);
++  } else if (oldDataType == tt::target::DataType::Int8 &&
++             newDataType == tt::target::DataType::Int32) {
++    detail::handleIntegerBufferCast<int8_t, int32_t>(
++        static_cast<const int8_t *>(oldBuffer),
++        static_cast<int32_t *>(newBuffer), numElements);
++  } else if (oldDataType == tt::target::DataType::Int32 &&
++             newDataType == tt::target::DataType::Int8) {
++    detail::handleIntegerBufferCast<int32_t, int8_t>(
++        static_cast<const int32_t *>(oldBuffer),
++        static_cast<int8_t *>(newBuffer), numElements);
+   } else if (oldDataType == tt::target::DataType::Int8 &&
+              newDataType == tt::target::DataType::UInt8) {
+     detail::handleIntegerBufferCast<int8_t, uint8_t>(
