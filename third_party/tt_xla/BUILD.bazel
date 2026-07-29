@@ -20,3 +20,9 @@ cc_library(
     includes = ["compat"],
     deps = ["@fmt//:fmt-header-only"],
 )
+
+cc_library(
+    name = "pjrt_profiler_c_api",
+    hdrs = glob(["profiler_api/**/*.h"]),
+    includes = ["profiler_api"],
+)
