@@ -61,3 +61,94 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 +  const std::lock_guard<std::mutex> lock(execution_mutex);
 +
    tt_pjrt_status status = instance->execute(args);
+diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/api_bindings.cc
+--- a/pjrt_implementation/src/api_bindings.cc
++++ b/pjrt_implementation/src/api_bindings.cc
+@@ -25,7 +25,85 @@
+ namespace tt::pjrt {
+-
++namespace {
++
++// JAX 0.7.1 crashes if a PJRT plugin has no profiler extension. Advertise a
++// no-op device profiler so its host and Python profilers can still run.
++
++struct Profiler;
++struct ProfilerError;
++struct ProfilerErrorDestroyArgs;
++struct ProfilerErrorMessageArgs;
++struct ProfilerErrorGetCodeArgs;
++struct ProfilerDestroyArgs;
++struct ProfilerStartArgs;
++struct ProfilerStopArgs;
++
++struct ProfilerCreateArgs {
++  size_t struct_size;
++  const char *options;
++  size_t options_size;
++  Profiler *profiler;
++};
++
++struct ProfilerCollectDataArgs {
++  size_t struct_size;
++  Profiler *profiler;
++  uint8_t *buffer;
++  size_t buffer_size_in_bytes;
++};
++
++struct ProfilerApi {
++  size_t struct_size;
++  void *priv;
++  void (*error_destroy)(ProfilerErrorDestroyArgs *);
++  void (*error_message)(ProfilerErrorMessageArgs *);
++  ProfilerError *(*error_get_code)(ProfilerErrorGetCodeArgs *);
++  ProfilerError *(*create)(ProfilerCreateArgs *);
++  ProfilerError *(*destroy)(ProfilerDestroyArgs *);
++  ProfilerError *(*start)(ProfilerStartArgs *);
++  ProfilerError *(*stop)(ProfilerStopArgs *);
++  ProfilerError *(*collect_data)(ProfilerCollectDataArgs *);
++};
++
++struct ProfilerExtension {
++  PJRT_Extension_Base base;
++  ProfilerApi *profiler_api;
++  int64_t traceme_context_id;
++};
++
++ProfilerError *createProfiler(ProfilerCreateArgs *args) {
++  args->profiler = nullptr;
++  return nullptr;
++}
++
++ProfilerError *profilerSuccess(ProfilerDestroyArgs *) { return nullptr; }
++ProfilerError *profilerSuccess(ProfilerStartArgs *) { return nullptr; }
++ProfilerError *profilerSuccess(ProfilerStopArgs *) { return nullptr; }
++
++ProfilerError *collectProfilerData(ProfilerCollectDataArgs *args) {
++  args->buffer_size_in_bytes = 0;
++  return nullptr;
++}
++
++ProfilerApi profilerApi{
++    sizeof(ProfilerApi), nullptr, nullptr,         nullptr, nullptr,
++    createProfiler,       profilerSuccess, profilerSuccess, profilerSuccess,
++    collectProfilerData,
++};
++
++ProfilerExtension profilerExtension{
++    {
++        sizeof(ProfilerExtension),
++        PJRT_Extension_Type_Profiler,
++        nullptr,
++    },
++    &profilerApi,
++    0,
++};
++
++} // namespace
++
+ void bindApi(PJRT_Api *api) {
+   api->struct_size = PJRT_Api_STRUCT_SIZE;
+-  api->extension_start = nullptr;
++  api->extension_start = &profilerExtension.base;
+   api->pjrt_api_version.major_version = PJRT_API_MAJOR;
+   api->pjrt_api_version.minor_version = PJRT_API_MINOR;
