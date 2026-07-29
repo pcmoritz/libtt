@@ -50,7 +50,9 @@ http_archive(
 http_archive(
     name = "xla",
     build_file = "//third_party/tt_xla:xla.BUILD.bazel",
-    patch_cmds = ["find xla -name BUILD -delete"],
+    patch_cmds = [
+        "find xla \\( -name BUILD -o -name BUILD.bazel \\) -delete",
+    ],
     sha256 = "d8b987d0e3f250bef62e6b73ba09437c99a76bbe649f81ef9348c11225a70309",
     strip_prefix = "xla-9af6ffc202a18bc40d1014c6e43f21a533909277",
     urls = [

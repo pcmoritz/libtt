@@ -69,7 +69,7 @@ diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/a
  #include "api/plugin_attributes.h"
  #include "utils/logging.h"
 +#include "xla/pjrt/c/pjrt_c_api_profiler_extension.h"
-@@ -25,7 +26,50 @@
+@@ -25,7 +26,56 @@
  namespace tt::pjrt {
 -
 +namespace {
@@ -99,18 +99,24 @@ diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/a
 +}
 +
 +PLUGIN_Profiler_Api profilerApi{
-+    PLUGIN_Profiler_Api_STRUCT_SIZE, nullptr, nullptr,         nullptr,
-+    nullptr,                         createProfiler,
-+    profilerSuccess,                 profilerSuccess,
-+    profilerSuccess,                 collectProfilerData,
++    .struct_size = PLUGIN_Profiler_Api_STRUCT_SIZE,
++    .priv = nullptr,
++    .error_destroy = nullptr,
++    .error_message = nullptr,
++    .error_get_code = nullptr,
++    .create = createProfiler,
++    .destroy = profilerSuccess,
++    .start = profilerSuccess,
++    .stop = profilerSuccess,
++    .collect_data = collectProfilerData,
 +};
 +
 +PJRT_Profiler_Extension profilerExtension{
-+    PJRT_Profiler_Extension_STRUCT_SIZE,
-+    PJRT_Extension_Type_Profiler,
-+    nullptr,
-+    &profilerApi,
-+    0,
++    .struct_size = PJRT_Profiler_Extension_STRUCT_SIZE,
++    .type = PJRT_Extension_Type_Profiler,
++    .next = nullptr,
++    .profiler_api = &profilerApi,
++    .traceme_context_id = 0,
 +};
 +
 +} // namespace
