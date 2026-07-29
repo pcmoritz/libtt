@@ -10,12 +10,6 @@ bazel_dep(name = "rules_shell", version = "0.6.1")
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
-xla_profiler_headers_repository = use_repo_rule(
-    "//third_party/tt_xla:xla_profiler_headers.bzl",
-    "xla_profiler_headers_repository",
-)
-
-xla_profiler_headers_repository(name = "xla_profiler_headers")
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(python_version = "3.13")
@@ -49,6 +43,18 @@ http_archive(
     strip_prefix = "jax-jax-v0.7.1",
     urls = [
         "https://github.com/jax-ml/jax/archive/refs/tags/jax-v0.7.1.tar.gz",
+    ],
+)
+
+# Version last synced into tt-xla's PJRT C API fork.
+http_archive(
+    name = "xla",
+    build_file = "//third_party/tt_xla:xla.BUILD.bazel",
+    patch_cmds = ["find xla -name BUILD -delete"],
+    sha256 = "d8b987d0e3f250bef62e6b73ba09437c99a76bbe649f81ef9348c11225a70309",
+    strip_prefix = "xla-9af6ffc202a18bc40d1014c6e43f21a533909277",
+    urls = [
+        "https://github.com/openxla/xla/archive/9af6ffc202a18bc40d1014c6e43f21a533909277.tar.gz",
     ],
 )
 

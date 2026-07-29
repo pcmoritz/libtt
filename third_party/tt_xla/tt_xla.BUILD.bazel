@@ -103,7 +103,7 @@ cc_library(
     deps = [
         ":pjrt_api",
         ":pjrt_headers",
-        "@xla_profiler_headers//:pjrt_profiler_c_api",
+        "@xla//:pjrt_profiler_c_api",
     ],
 )
 
