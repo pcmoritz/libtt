@@ -45,6 +45,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    } else {
      return false;
    }
+@@ -164,4 +154,5 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+-  if (initValueOp.getResult().getType().getElementType().isBF16()) {
++  if (initValueOp.getResult().getType().getElementType().isBF16() ||
++      initValueOp.getResult().getType().getElementType().isF16()) {
+     const llvm::APFloat &value =
+         *initValueOp.getValue().value_begin<llvm::APFloat>();
+     if (desired == TypicalInitReductionValue::NEG_INF) {
 @@ -178,15 +168,17 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
    if (initValueOp.getResult().getType().getElementType().isF64()) {
      return *initValueOp.getValue().value_begin<double>() == desiredF64;
