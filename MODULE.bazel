@@ -331,6 +331,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_uint8_device_untilize.patch",
         "//third_party/tt_xla:tt_mlir_signed_integer_alias.patch",
         "//third_party/tt_xla:tt_mlir_remove_bitwise_not_workaround.patch",
+        "//third_party/tt_xla:tt_mlir_arithmetic_right_shift.patch",
         "//third_party/tt_xla:tt_mlir_affine_passes_include.patch",
         "//third_party/tt_xla:tt_mlir_mock_device_include.patch",
         "//third_party/tt_xla:tt_mlir_disable_ttlang_python_resolver.patch",
