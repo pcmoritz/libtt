@@ -224,6 +224,8 @@ http_archive(
         "//third_party/tt_metal:sdpa_decode_allow_l1_interleaved_q.patch",
         "//third_party/tt_metal:layernorm_allow_single_core_height_sharded.patch",
         "//third_party/tt_metal:topk_float32.patch",
+        "//third_party/tt_metal:topk_stable_llk.patch",
+        "//third_party/tt_metal:topk_stable.patch",
         "//third_party/tt_metal:sign_integer.patch",
         "//third_party/tt_metal:scatter_min_max.patch",
         "//third_party/tt_metal:accurate_fp32_reductions.patch",
