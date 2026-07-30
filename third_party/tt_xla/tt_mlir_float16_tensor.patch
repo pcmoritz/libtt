@@ -1,0 +1,219 @@
+diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
+--- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
++++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
+@@ -232,7 +232,7 @@ inline Type dataTypeToElementType(mlir::MLIRContext *context, DataType dtype) {
+   case DataType::Float32:
+     return Float32Type::get(context);
+   case DataType::Float16:
+-    return BFloat16Type::get(context);
++    return Float16Type::get(context);
+   case DataType::BFloat16:
+     return BFloat16Type::get(context);
+   case DataType::BFP_Float8:
+diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
+--- a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
++++ b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
+@@ -36,6 +36,8 @@ public:
+           }
+ 
+-          elementType =
+-              mlir::tt::ttcore::toTTMLIRSupportedDataType(elementType);
++          elementType = elementType.isF16()
++                            ? Float32Type::get(type.getContext())
++                            : mlir::tt::ttcore::toTTMLIRSupportedDataType(
++                                  elementType);
+           if (!elementType) {
+             return {};
+@@ -45,6 +47,16 @@ public:
+                                              type.getEncoding());
+         });
+   }
++
++  void preserveFloat16() {
++    addConversion(
++        [](RankedTensorType type) -> std::optional<RankedTensorType> {
++          if (type.getElementType().isF16()) {
++            return type;
++          }
++          return {};
++        });
++  }
+ };
+ 
+ // TODO(milant): https://github.com/tenstorrent/tt-mlir/issues/2847
+@@ -143,6 +155,9 @@ struct ElementTypeNormalization
+       ElementTypeNormalization>::ElementTypeNormalizationBase;
+ 
+   void runOnOperation() final {
++    if (canPreserveFloat16()) {
++      converter.preserveFloat16();
++    }
+     // Check that all types are supported by TTMLIR.
+     if (!checkSupportedTypes()) {
+       signalPassFailure();
+@@ -164,6 +179,35 @@ private:
+     return converter.convertType(type) != nullptr;
+   }
+ 
++  bool canPreserveFloat16() {
++    bool found = false;
++    WalkResult result = getOperation()->walk([&](Operation *op) {
++      auto hasFloat16 = [](TypeRange types) {
++        return llvm::any_of(types, [](Type type) {
++          auto shapedType = mlir::dyn_cast<ShapedType>(type);
++          return shapedType && shapedType.getElementType().isF16();
++        });
++      };
++
++      bool touchesFloat16;
++      if (auto funcOp = mlir::dyn_cast<func::FuncOp>(op)) {
++        touchesFloat16 = hasFloat16(funcOp.getArgumentTypes()) ||
++                         hasFloat16(funcOp.getResultTypes());
++      } else {
++        touchesFloat16 = hasFloat16(op->getOperandTypes()) ||
++                         hasFloat16(op->getResultTypes());
++      }
++      if (!touchesFloat16) {
++        return WalkResult::advance();
++      }
++      found = true;
++      return mlir::isa<func::FuncOp, func::ReturnOp, ScatterOp, ReshapeOp>(op)
++                 ? WalkResult::advance()
++                 : WalkResult::interrupt();
++    });
++    return found && !result.wasInterrupted();
++  }
++
+   bool isLegal(mlir::Operation *op) const {
+     auto isTypeLegal = [this](mlir::Type type) { return isLegal(type); };
+ 
+diff --git a/lib/OpModel/TTNN/Conversion.cpp b/lib/OpModel/TTNN/Conversion.cpp
+--- a/lib/OpModel/TTNN/Conversion.cpp
++++ b/lib/OpModel/TTNN/Conversion.cpp
+@@ -24,6 +24,8 @@ namespace conversion {
+ ::tt::tt_metal::DataType getDataType(const ttcore::DataType dataType) {
+   switch (dataType) {
+   case ttcore::DataType::Float32:
+     return ::tt::tt_metal::DataType::FLOAT32;
++  case ttcore::DataType::Float16:
++    return ::tt::tt_metal::DataType::FLOAT16;
+   case ttcore::DataType::BFloat16:
+     return ::tt::tt_metal::DataType::BFLOAT16;
+@@ -47,5 +49,7 @@ ttcore::DataType getDataType(const ::tt::tt_metal::DataType dataType) {
+   switch (dataType) {
+   case ::tt::tt_metal::DataType::FLOAT32:
+     return ttcore::DataType::Float32;
++  case ::tt::tt_metal::DataType::FLOAT16:
++    return ttcore::DataType::Float16;
+   case ::tt::tt_metal::DataType::BFLOAT16:
+     return ttcore::DataType::BFloat16;
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -249,7 +249,8 @@ TTNNOperandsWorkaroundsFactory::createScatterOpOperandsWorkarounds(
+   auto needsRowMajor = [](ttnn::TTNNLayoutAttr layout,
+                           mlir::RankedTensorType type) {
+     return layout.isTiled() &&
+-           (type.getElementType().isF32() || type.getElementType().isBF16() ||
++           (type.getElementType().isF32() || type.getElementType().isF16() ||
++            type.getElementType().isBF16() ||
+             type.getElementType().isInteger(32));
+   };
+ 
+diff --git a/runtime/lib/common/utils.cpp b/runtime/lib/common/utils.cpp
+--- a/runtime/lib/common/utils.cpp
++++ b/runtime/lib/common/utils.cpp
+@@ -215,4 +215,5 @@ bool isSupportedDataType(::tt::target::DataType dataType) {
+   switch (dataType) {
+   case ::tt::target::DataType::Float32:
++  case ::tt::target::DataType::Float16:
+   case ::tt::target::DataType::BFloat16:
+   case ::tt::target::DataType::BFP_Float8:
+@@ -227,6 +228,5 @@ bool isSupportedDataType(::tt::target::DataType dataType) {
+   case ::tt::target::DataType::UInt8:
+   case ::tt::target::DataType::Int32:
+     return true;
+-  case ::tt::target::DataType::Float16:
+   case ::tt::target::DataType::Float64:
+   case ::tt::target::DataType::Int64:
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -149,5 +149,8 @@ createOwnedTTNNTensor(const void *data, const std::vector<std::uint32_t> &shape,
+   switch (ttnnDataType) {
+   case ::ttnn::DataType::FLOAT32:
+     return utils::createTTNNTensor<float>(src, ttnnShape, ttnnDataType);
++  case ::ttnn::DataType::FLOAT16:
++    return utils::createTTNNTensor<::tt::tt_metal::float16>(
++        src, ttnnShape, ttnnDataType);
+   case ::ttnn::DataType::BFLOAT16:
+     return utils::createTTNNTensor<bfloat16>(src, ttnnShape, ttnnDataType);
+@@ -265,6 +268,9 @@ createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
+   case ::tt::target::DataType::Float32:
+     return utils::createRuntimeTensorFromTTNN(
+         utils::createBorrowedTTNNTensor<float>(data, ttnnShape));
++  case ::tt::target::DataType::Float16:
++    return utils::createRuntimeTensorFromTTNN(
++        utils::createBorrowedTTNNTensor<::tt::tt_metal::float16>(data, ttnnShape));
+   case ::tt::target::DataType::BFloat16:
+     return utils::createRuntimeTensorFromTTNN(
+         utils::createBorrowedTTNNTensor<bfloat16>(data, ttnnShape));
+@@ -474,5 +476,12 @@ std::vector<std::byte> getTensorDataBuffer(::tt::runtime::Tensor tensor) {
+     std::memcpy(dataVec.data(), dataPtr, dataVec.size());
+     return dataVec;
+   }
++  case target::DataType::Float16: {
++    auto vec = ttnnTensor.to_vector<::tt::tt_metal::float16>();
++    dataPtr = vec.data();
++    LOG_ASSERT(dataPtr != nullptr);
++    std::memcpy(dataVec.data(), dataPtr, dataVec.size());
++    return dataVec;
++  }
+   case target::DataType::BFloat16: {
+     auto vec = ttnnTensor.to_vector<bfloat16>();
+diff --git a/runtime/lib/ttnn/operations/utils/utils.cpp b/runtime/lib/ttnn/operations/utils/utils.cpp
+--- a/runtime/lib/ttnn/operations/utils/utils.cpp
++++ b/runtime/lib/ttnn/operations/utils/utils.cpp
+@@ -521,7 +521,8 @@ static ::ttnn::Tensor toTTNNTensorImpl(
+   LOG_ASSERT(numElements * elementSize == input->size(), "Invalid data size");
+   std::vector<T> dataVec(numElements);
+   for (size_t i = 0; i < numElements; i++) {
+-    if constexpr (std::is_same_v<T, bfloat16>) {
++    if constexpr (std::is_same_v<T, bfloat16> ||
++                  std::is_same_v<T, ::tt::tt_metal::float16>) {
+       uint16_t raw =
+           ::flatbuffers::IndirectHelper<uint16_t>::Read(input->data(), i);
+-      dataVec[i] = std::bit_cast<bfloat16>(raw);
++      dataVec[i] = std::bit_cast<T>(raw);
+@@ -549,6 +550,10 @@ static ::ttnn::Tensor toTTNNTensorImpl(
+     return toTTNNTensorImpl<bfloat16>(input, shape, outputDataType, device,
+                                       layout, memoryConfig);
+   }
++  case ::ttnn::DataType::FLOAT16: {
++    return toTTNNTensorImpl<::tt::tt_metal::float16>(
++        input, shape, outputDataType, device, layout, memoryConfig);
++  }
+   case ::ttnn::DataType::UINT32: {
+     return toTTNNTensorImpl<uint32_t>(input, shape, outputDataType, device,
+                                       layout, memoryConfig);
+diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
+--- a/runtime/lib/ttnn/utils/utils.cpp
++++ b/runtime/lib/ttnn/utils/utils.cpp
+@@ -174,6 +174,8 @@ getReduceType(uint32_t reduceType) {
+ ::ttnn::DataType toTTNNDataType(::tt::target::DataType dataType) {
+   switch (dataType) {
+   case ::tt::target::DataType::Float32:
+     return ::ttnn::DataType::FLOAT32;
++  case ::tt::target::DataType::Float16:
++    return ::ttnn::DataType::FLOAT16;
+   case ::tt::target::DataType::BFloat16:
+     return ::ttnn::DataType::BFLOAT16;
+@@ -198,6 +200,8 @@ std::optional<::ttnn::DataType>
+ ::tt::target::DataType fromTTNNDataType(::ttnn::DataType dataType) {
+   switch (dataType) {
+   case ::ttnn::DataType::FLOAT32:
+     return ::tt::target::DataType::Float32;
++  case ::ttnn::DataType::FLOAT16:
++    return ::tt::target::DataType::Float16;
+   case ::ttnn::DataType::BFLOAT16:
+     return ::tt::target::DataType::BFloat16;
