@@ -1,6 +1,15 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -5114,7 +5114,7 @@ class StableHLOGatherToEmbeddingPattern
+    * transformation:
+    * - start indices tensor isn't 1D when we are indexing multiple dims
+    * - operandBatchingDims and startIndicesBatchingDims are none
+-   * - sliceSizes are fullDim for dimensions we are not indexing
++   * - non-indexed dimensions are sliced from zero when needed
+    * - for dimensions we are indexing, sliceSizes must fit into one of:
+    *   - all sliceSizes are 1
+    *   - all sliceSizes are fullDim except one which can be anything
 @@ -5307,6 +5308,9 @@ class StableHLOGatherToEmbeddingPattern
      size_t remainingIndexedDims =
          startIndexMap.size() - fullIndexedDims - singletonIndexedDims;
@@ -12,7 +21,48 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp,
            "Did not satisfy slice conditions for dimensions in startIndexMap");
-@@ -5403,6 +5407,9 @@ class StableHLOGatherToEmbeddingPattern
+@@ -5330,9 +5334,5 @@ class StableHLOGatherToEmbeddingPattern
+         } else if (sliceSizes[i] != 1) {
+           partialIndexedDims++;
+         }
+-      } else if (sliceSizes[i] != inputShape[i]) {
+-        return rewriter.notifyMatchFailure(
+-            srcOp, "Did not satisfy sliceSizes[i] = inputShape[i] for dims not "
+-                   "in startIndexMap");
+       }
+     }
+@@ -5380,6 +5380,29 @@ class StableHLOGatherToEmbeddingPattern
+     // Use adapted operands for building new ops (type-converted values).
+-    auto input = adaptor.getOperands()[0];
++    Value input = adaptor.getOperands()[0];
++    auto inputType = mlir::cast<RankedTensorType>(input.getType());
++    auto inputShape = inputType.getShape();
++    SmallVector<int64_t> slicedShape(inputShape);
++    bool needsInputSlice = false;
++    for (size_t dim = 0; dim < inputShape.size(); ++dim) {
++      if (!llvm::is_contained(originalStartIndexMap, dim) &&
++          sliceSizes[dim] != inputShape[dim]) {
++        slicedShape[dim] = sliceSizes[dim];
++        needsInputSlice = true;
++      }
++    }
++    if (needsInputSlice) {
++      SmallVector<int32_t> begins(inputShape.size(), 0);
++      SmallVector<int32_t> ends(slicedShape.begin(), slicedShape.end());
++      SmallVector<int32_t> steps(inputShape.size(), 1);
++      input = rewriter.create<ttir::SliceStaticOp>(
++          ttmlir::utils::appendLocationSuffix(srcOp->getLoc(), "_sliceInput"),
++          RankedTensorType::get(slicedShape, inputType.getElementType(),
++                                inputType.getEncoding()),
++          input, rewriter.getI32ArrayAttr(begins),
++          rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
++    }
++
+     auto inputPermuted = permuteInput(
+         rewriter,
+         ttmlir::utils::appendLocationSuffix(srcOp->getLoc(), "_permuteInput"),
+         mlir::cast<mlir::TypedValue<mlir::RankedTensorType>>(input),
+@@ -5403,6 +5426,9 @@ class StableHLOGatherToEmbeddingPattern
        auto flattenedIndices = flattenStartIndices(
            rewriter, inputPermuted.getType().getShape(), srcOp.getOperand(),
            startIndices, originalStartIndexMap, indexVectorDim);
@@ -24,7 +74,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      startIndices = rewriter.create<ttir::TypecastOp>(
 +          srcOp.getLoc(), flattenedType, flattenedIndices);
      } else if (originalStartIndexMap.size() != numIndexingDims) {
-@@ -5431,7 +5438,8 @@ class StableHLOGatherToEmbeddingPattern
+@@ -5431,7 +5457,8 @@ class StableHLOGatherToEmbeddingPattern
      return GatherOperands{mlir::cast<mlir::TypedValue<mlir::RankedTensorType>>(
                                reshapedInput.getResult()),
                            startIndices, std::move(newOutputShape),
