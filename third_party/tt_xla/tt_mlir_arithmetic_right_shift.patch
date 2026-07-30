@@ -1,0 +1,216 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+index 319791f2..e5d9a106 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -597,6 +597,14 @@ def TTNN_LogicalRightShiftOp: TTNN_ElementwiseBinaryOp<"logical_right_shift">{
+   let hasVerifier = 1;
+ }
+
++def TTNN_BitwiseRightShiftOp :
++    TTNN_ElementwiseBinaryCompositeOp<"bitwise_right_shift"> {
++  let summary = "Eltwise arithmetic right shift operation";
++  let description = [{
++    Performs an elementwise arithmetic right shift.
++  }];
++}
++
+ def TTNN_SubtractOp : TTNN_ElementwiseBinaryOp<"subtract"> {
+     let summary = "Eltwise subtract.";
+     let description = [{
+diff --git a/include/ttmlir/OpModel/TTNN/TTNNOpModel.h b/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
+index 4e80d22e..9dc02a58 100644
+--- a/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
++++ b/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
+@@ -287,6 +287,10 @@ struct OpModel<BitwiseAndOp> : BinaryCompositeOpModel<BitwiseAndOp> {};
+ template <>
+ struct OpModel<LogicalLeftShiftOp>
+     : BinaryCompositeOpModel<LogicalLeftShiftOp> {};
++
++template <>
++struct OpModel<BitwiseRightShiftOp>
++    : BinaryCompositeOpModel<BitwiseRightShiftOp> {};
+
+ template <>
+ struct OpModel<BitwiseOrOp> : BinaryCompositeOpModel<BitwiseOrOp> {};
+diff --git a/include/ttmlir/Target/TTNN/operations/eltwise.fbs b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+index 75b50182..60ebd5f5 100644
+--- a/include/ttmlir/Target/TTNN/operations/eltwise.fbs
++++ b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+@@ -37,7 +37,8 @@ enum EltwiseBinaryCompositeOpType: uint32 {
+   BitwiseAnd,
+   BitwiseOr,
+   BitwiseXor,
+-  LogicalLeftShift
++  LogicalLeftShift,
++  BitwiseRightShift
+ }
+
+ table EltwiseBinaryCompositeOp {
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index 38e47fd2..337b9db0 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9995,6 +9995,9 @@ addElementwiseBinaryOpsConversionPatterns(MLIRContext *ctx,
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::ShiftRightLogicalOp,
+       mlir::tt::ttir::LogicalRightShiftOp>>(typeConverter, ctx);
++  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
++      mlir::stablehlo::ShiftRightArithmeticOp,
++      mlir::tt::ttir::RightShiftOp>>(typeConverter, ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::ShiftLeftOp, mlir::tt::ttir::LogicalLeftShiftOp>>(
+       typeConverter, ctx);
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+index 9d4616f7..80add8db 100644
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -3754,5 +3754,6 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            ElementwiseBinaryOpConversionPattern<ttir::AddOp, ttnn::AddOp>,
+            ElementwiseBinaryOpConversionPattern<ttir::LogicalRightShiftOp, ttnn::LogicalRightShiftOp>,
++           ElementwiseOpConversionPattern<ttir::RightShiftOp, ttnn::BitwiseRightShiftOp>,
+            ElementwiseBinaryOpConversionPattern<ttir::SubtractOp, ttnn::SubtractOp>,
+            ElementwiseBinaryOpConversionPattern<ttir::MultiplyOp, ttnn::MultiplyOp>,
+            ElementwiseBinaryOpConversionPattern<ttir::DivOp, ttnn::DivideOp>,
+diff --git a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
+index e42a727f..3f8c20d9 100644
+--- a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
++++ b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
+@@ -5625,5 +5625,7 @@ void populateTTNNToEmitCPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+       EltwiseBinaryOpConversionPattern<mlir::tt::ttnn::LogicalXorOp>,
+       EltwiseBinaryCompositeOpConversionPattern<mlir::tt::ttnn::BitwiseAndOp>,
++      EltwiseBinaryCompositeOpConversionPattern<
++          mlir::tt::ttnn::BitwiseRightShiftOp>,
+       EltwiseBinaryCompositeOpConversionPattern<mlir::tt::ttnn::BitwiseOrOp>,
+       EltwiseBinaryCompositeOpConversionPattern<mlir::tt::ttnn::BitwiseXorOp>,
+       EltwiseBinaryOpConversionPattern<mlir::tt::ttnn::EqualOp>,
+diff --git a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
+index 294ca215..812c5e14 100644
+--- a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
++++ b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
+@@ -5423,6 +5423,8 @@ void populateTTNNToEmitPyPatterns(MLIRContext *ctx,
+                EltwiseBinaryOpConversionPattern<mlir::tt::ttnn::NotEqualOp>,
+                EltwiseBinaryOpConversionPattern<mlir::tt::ttnn::SubtractOp>,
+                EltwiseBinaryCompositeOpConversionPattern<mlir::tt::ttnn::BitwiseAndOp>,
++               EltwiseBinaryCompositeOpConversionPattern<
++                   mlir::tt::ttnn::BitwiseRightShiftOp>,
+                EltwiseBinaryCompositeOpConversionPattern<mlir::tt::ttnn::BitwiseOrOp>,
+                EltwiseBinaryCompositeOpConversionPattern<mlir::tt::ttnn::BitwiseXorOp>,
+                EltwiseBinaryCompositeOpConversionPattern<mlir::tt::ttnn::LogicalLeftShiftOp>,
+diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
+index 21775ae4..50b9e00c 100644
+--- a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
++++ b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
+@@ -374,5 +374,8 @@ static void addElementwiseOpsConversionPatterns(
+       TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::BitwiseXorOp,
+                                              mlir::tt::ttir::BitwiseXorOp>,
++      TTNNToTTIRElementwiseConversionPattern<
++          mlir::tt::ttnn::BitwiseRightShiftOp,
++          mlir::tt::ttir::RightShiftOp>,
+       TTNNToTTIRElementwiseConversionPattern<
+           mlir::tt::ttnn::LogicalRightShiftOp,
+           mlir::tt::ttir::LogicalRightShiftOp>,
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+index e3de44aa..a588e36e 100644
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -529,7 +529,8 @@ binaryOpDTypeWorkaround(mlir::Operation *op, mlir::Type elementType) {
+   mlir::tt::ttcore::DataType dType =
+       mlir::tt::ttcore::elementTypeToDataType(elementType);
+
+-  if (isa<ttnn::LogicalRightShiftOp, ttnn::LogicalLeftShiftOp>(op)) {
++  if (isa<ttnn::LogicalRightShiftOp, ttnn::LogicalLeftShiftOp,
++          ttnn::BitwiseRightShiftOp>(op)) {
+     if (dType == mlir::tt::ttcore::DataType::UInt32 ||
+         dType == mlir::tt::ttcore::DataType::Int32) {
+       return {};
+diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+index 72f96725..a8fc3a93 100644
+--- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
++++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+@@ -973,6 +973,22 @@ LogicalLeftShiftOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
+   return detail::getBinaryOpRuntime(*this, inputs, opConfig);
+ }
+
++//===----------------------------------------------------------------------===//
++// BitwiseRightShiftOp - TTNN Op Model Interface
++//===----------------------------------------------------------------------===//
++
++llvm::Expected<op_model::OpConstraints>
++BitwiseRightShiftOp::getOpConstraints(const std::vector<TTNNLayoutAttr> &inputs,
++                                      const OpConfig &opConfig) {
++  return detail::getBinaryOpConstraints(*this, inputs, opConfig);
++}
++
++llvm::Expected<size_t>
++BitwiseRightShiftOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
++                                  const OpConfig &opConfig) {
++  return detail::getBinaryOpRuntime(*this, inputs, opConfig);
++}
++
+ //===----------------------------------------------------------------------===//
+ // SubtractOp - TTNN Op Model Interface
+ //===----------------------------------------------------------------------===//
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+index f44551bc..af0dd267 100644
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -451,6 +451,8 @@ auto getOpSymbol() {
+     return WRAP_OP(::ttnn::logical_right_shift);
+   } else if constexpr (std::is_same_v<OpTy, LogicalLeftShiftOp>) {
+     return WRAP_OP(::ttnn::logical_left_shift);
++  } else if constexpr (std::is_same_v<OpTy, BitwiseRightShiftOp>) {
++    return WRAP_OP(::ttnn::bitwise_right_shift);
+   } else if constexpr (std::is_same_v<OpTy, DivideOp>) {
+     return WRAP_OP(::ttnn::divide);
+   } else if constexpr (std::is_same_v<OpTy, EqualOp>) {
+@@ -1448,6 +1450,7 @@ template struct BinaryCompositeOpModel<BitwiseAndOp>;
+ template struct BinaryCompositeOpModel<BitwiseOrOp>;
+ template struct BinaryCompositeOpModel<BitwiseXorOp>;
+ template struct BinaryCompositeOpModel<LogicalLeftShiftOp>;
++template struct BinaryCompositeOpModel<BitwiseRightShiftOp>;
+ template struct BinaryCompositeOpModel<Atan2Op>;
+
+ //===----------------------------------------------------------------------===//
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+index 66479617..8f4d8a49 100644
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -2123,6 +2123,9 @@ createEltwiseBinaryCompositeOp(FlatbufferObjectCache &cache,
+   } else if constexpr (std::is_same_v<EltwiseBinaryCompositeOp,
+                                       LogicalLeftShiftOp>) {
+     type = ::tt::target::ttnn::EltwiseBinaryCompositeOpType::LogicalLeftShift;
++  } else if constexpr (std::is_same_v<EltwiseBinaryCompositeOp,
++                                      BitwiseRightShiftOp>) {
++    type = ::tt::target::ttnn::EltwiseBinaryCompositeOpType::BitwiseRightShift;
+   } else if (std::is_same_v<EltwiseBinaryCompositeOp, RemainderOp>) {
+     type = ::tt::target::ttnn::EltwiseBinaryCompositeOpType::Remainder;
+   } else if (std::is_same_v<EltwiseBinaryCompositeOp, PowTensorOp>) {
+@@ -4337,5 +4340,11 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+                            debugString, locInfo);
+   }
++  if (auto bitwiseRightShiftOp = dyn_cast<BitwiseRightShiftOp>(op);
++      bitwiseRightShiftOp) {
++    return createOperation(
++        cache, createEltwiseBinaryCompositeOp(cache, bitwiseRightShiftOp),
++        debugString, locInfo);
++  }
+   if (auto logicalLeftShiftOp = dyn_cast<LogicalLeftShiftOp>(op);
+       logicalLeftShiftOp) {
+     return createOperation(
+diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
+index b2cef7cb..f416b8cf 100644
+--- a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
+@@ -76,6 +76,12 @@ void run(const ::tt::target::ttnn::EltwiseBinaryCompositeOp *op,
+     });
+     break;
+   }
++  case ::tt::target::ttnn::EltwiseBinaryCompositeOpType::BitwiseRightShift: {
++    runEltwiseBinaryCompositeOp(op, tensorPool, [](auto &&...args) {
++      return ::ttnn::bitwise_right_shift(std::forward<decltype(args)>(args)...);
++    });
++    break;
++  }
+   case ::tt::target::ttnn::EltwiseBinaryCompositeOpType::Remainder: {
+     runEltwiseBinaryCompositeOp(
+         op, tensorPool,
