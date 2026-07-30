@@ -51,7 +51,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dial
      // Check that all types are supported by TTMLIR.
      if (!checkSupportedTypes()) {
        signalPassFailure();
-@@ -164,6 +179,35 @@ private:
+@@ -164,6 +179,36 @@ private:
      return converter.convertType(type) != nullptr;
    }
  
@@ -77,7 +77,8 @@ diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dial
 +        return WalkResult::advance();
 +      }
 +      found = true;
-+      return mlir::isa<func::FuncOp, func::ReturnOp, ScatterOp, ReshapeOp>(op)
++      return mlir::isa<func::FuncOp, func::ReturnOp, DotGeneralOp, ReshapeOp,
++                       ScatterOp, TypecastOp>(op)
 +                 ? WalkResult::advance()
 +                 : WalkResult::interrupt();
 +    });
