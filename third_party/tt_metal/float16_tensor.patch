@@ -8,7 +8,7 @@ diff --git tt_metal/api/tt-metalium/experimental/tensor/tensor_types.hpp tt_meta
  #include <cstdint>
  #include <memory>
  #include <optional>
-@@ -24,6 +25,14 @@ namespace tt::tt_metal {
+@@ -24,6 +25,15 @@ namespace tt::tt_metal {
  
  static constexpr std::uint8_t VERSION_ID = 5;
  
@@ -18,6 +18,7 @@ diff --git tt_metal/api/tt-metalium/experimental/tensor/tensor_types.hpp tt_meta
 +    constexpr float16() = default;
 +    explicit constexpr float16(uint16_t bits) : bits(bits) {}
 +    float16(float value) : bits(std::bit_cast<uint16_t>(static_cast<_Float16>(value))) {}
++    operator float() const { return static_cast<float>(std::bit_cast<_Float16>(bits)); }
 +};
 +
  enum class DataType {
@@ -561,27 +562,6 @@ diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_where.h
  
  #ifdef DISABLE_SFPLOADMACRO
      int offset3 = (dst_index_out * 32) << 1;
-diff --git tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_where.h tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_where.h
---- tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_where.h
-+++ tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_where.h
-@@ -19,14 +19,15 @@ inline void _calculate_where_(
-     const std::uint32_t dst_index_in0, const std::uint32_t dst_index_in1, const std::uint32_t dst_index_in2, const std::uint32_t dst_index_out)
- {
-     static_assert(
--        data_format == DataFormat::Float32 || data_format == DataFormat::Float16_b || data_format == DataFormat::Int32 || data_format == DataFormat::UInt32,
--        "Unsupported data format for _calculate_where_(). Only Float32, Int32, UInt32, and Float16_b are allowed.");
-+        data_format == DataFormat::Float32 || data_format == DataFormat::Float16 ||
-+            data_format == DataFormat::Float16_b || data_format == DataFormat::Int32 || data_format == DataFormat::UInt32,
-+        "Unsupported data format for _calculate_where_().");
- 
-     int offset0 = (dst_index_in0 * 32) << 1;
-     int offset1 = (dst_index_in1 * 32) << 1;
-     int offset2 = (dst_index_in2 * 32) << 1;
- 
-     constexpr InstrModLoadStore mod0 = data_format == DataFormat::Float16_b ? InstrModLoadStore::LO16 : InstrModLoadStore::INT32;
- 
- #ifdef DISABLE_SFPLOADMACRO
-     int offset3 = (dst_index_out * 32) << 1;
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
@@ -829,8 +809,8 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
  
 +    const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en ||
-+                                  (input.device()->arch() == ARCH::BLACKHOLE &&
-+                                   (input.dtype() == DataType::FLOAT16 || output.dtype() == DataType::FLOAT16));
++                                  input.dtype() == DataType::FLOAT16 ||
++                                  output.dtype() == DataType::FLOAT16;
      uint32_t packed_scalar1 = 0;
      uint32_t packed_scalar2 = 0;
  
@@ -854,26 +834,24 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -1171,6 +1171,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
+@@ -1171,6 +1171,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
      // loading fp32 tiles into a DST configured for bf16 produces tile-aligned corruption
      // for broadcast multiply (issue 43196).
      bool fp32_dest_acc_en = c_data_format == tt::DataFormat::UInt32 || c_data_format == tt::DataFormat::Int32 ||
-+                            (tt::tt_metal::hal::get_arch() == tt::ARCH::BLACKHOLE &&
-+                             (a_data_format == tt::DataFormat::Float16 ||
-+                              b_data_format == tt::DataFormat::Float16 || c_data_format == tt::DataFormat::Float16)) ||
++                            a_data_format == tt::DataFormat::Float16 ||
++                            b_data_format == tt::DataFormat::Float16 || c_data_format == tt::DataFormat::Float16 ||
                              c_data_format == tt::DataFormat::Float32 || a_data_format == tt::DataFormat::Float32 ||
                              b_data_format == tt::DataFormat::Float32 ||
                              (a_data_format == tt::DataFormat::Int32 && b_data_format == tt::DataFormat::Int32) ||
 diff --git tt_metal/jit_build/data_format.cpp tt_metal/jit_build/data_format.cpp
 --- tt_metal/jit_build/data_format.cpp
 +++ tt_metal/jit_build/data_format.cpp
-@@ -276,7 +276,8 @@ DataFormat get_single_pack_src_format(
+@@ -276,7 +276,7 @@ DataFormat get_single_pack_src_format(
          } else if (is_exp_b_format(data_format) || (data_format == DataFormat::Float32)) {
              pack_src_format = data_format;
          } else if (data_format == DataFormat::Float16) {
 -            pack_src_format = DataFormat::Float16_b;
-+            pack_src_format =
-+                arch == tt::ARCH::BLACKHOLE ? DataFormat::Float16 : DataFormat::Float16_b;
++            pack_src_format = DataFormat::Float16;
          } else if (data_format == DataFormat::UInt32) {
              pack_src_format = DataFormat::UInt32;
          } else if (data_format == DataFormat::Int32) {
@@ -897,7 +875,7 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
  #include "ckernel_sfpu_typecast.h"
  #include "llk_math_eltwise_unary_sfpu_macros.h"
  #endif
-@@ -91,7 +92,25 @@ ALWI void typecast_tile(uint32_t idst) {
+@@ -91,7 +92,23 @@ ALWI void typecast_tile(uint32_t idst) {
              VectorMode::RC));
      }
  #else
@@ -910,7 +888,6 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
 +            (APPROX, 8 /* ITERATIONS */),
 +            idst,
 +            VectorMode::RC));
-+#ifdef ARCH_BLACKHOLE
 +    } else if constexpr (in_format == DataFormat::Float16 && out_format == DataFormat::Float32) {
 +        MATH(SFPU_UNARY_CALL(
 +            DST_SYNC_MODE,
@@ -919,7 +896,6 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
 +            (APPROX, 8 /* ITERATIONS */),
 +            idst,
 +            VectorMode::RC));
-+#endif
 +    } else if constexpr (in_format == DataFormat::Float16_b && out_format == DataFormat::UInt16) {
          MATH(SFPU_UNARY_CALL(
              DST_SYNC_MODE,
@@ -1160,6 +1136,34 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device
      uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
  
      bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp
+@@ -24,3 +24,4 @@ void ProdAllDeviceOperation::validate_on_program_cache_miss(
+     TT_FATAL(
+-        input.dtype() == tt::tt_metal::DataType::BFLOAT16 || input.dtype() == tt::tt_metal::DataType::FLOAT32 ||
++        input.dtype() == tt::tt_metal::DataType::BFLOAT16 || input.dtype() == tt::tt_metal::DataType::FLOAT16 ||
++            input.dtype() == tt::tt_metal::DataType::FLOAT32 ||
+             input.dtype() == tt::tt_metal::DataType::BFLOAT8_B || input.dtype() == tt::tt_metal::DataType::BFLOAT4_B,
+diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_device_operation.cpp
+@@ -37,3 +37,4 @@ void ProdNcDeviceOperation::validate_on_program_cache_miss(
+     TT_FATAL(
+-        input.dtype() == tt::tt_metal::DataType::BFLOAT16 || input.dtype() == tt::tt_metal::DataType::FLOAT32 ||
++        input.dtype() == tt::tt_metal::DataType::BFLOAT16 || input.dtype() == tt::tt_metal::DataType::FLOAT16 ||
++            input.dtype() == tt::tt_metal::DataType::FLOAT32 ||
+             input.dtype() == tt::tt_metal::DataType::BFLOAT8_B,
+diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/prod_op_all.cpp ttnn/cpp/ttnn/operations/reduction/prod/device/prod_op_all.cpp
+--- ttnn/cpp/ttnn/operations/reduction/prod/device/prod_op_all.cpp
++++ ttnn/cpp/ttnn/operations/reduction/prod/device/prod_op_all.cpp
+@@ -16,3 +16,6 @@ tt::tt_metal::Tensor prod_all(const tt::tt_metal::Tensor& input, const tt::tt_me
+                 result, result.dtype(), result.layout(), result.device(), output_mem_config);
++        case tt::tt_metal::DataType::FLOAT16:
++            return ttnn::prod_result_computation_WH_B0<tt::tt_metal::float16>(
++                result, result.dtype(), result.layout(), result.device(), output_mem_config);
+         case tt::tt_metal::DataType::BFLOAT16:
+             return ttnn::prod_result_computation_WH_B0<bfloat16>(
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp

@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10120,6 +10120,62 @@ public:
+@@ -10120,6 +10120,55 @@ public:
  };
  } // namespace
  
@@ -16,17 +16,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  matchAndRewrite(mlir::stablehlo::ReducePrecisionOp srcOp,
 +                  mlir::stablehlo::ReducePrecisionOp::Adaptor adaptor,
 +                  ConversionPatternRewriter &rewriter) const override {
-+    auto resultType = dyn_cast<RankedTensorType>(
++    auto resultType = mlir::cast<RankedTensorType>(
 +        getTypeConverter()->convertType(srcOp.getType()));
-+    if (!resultType) {
-+      return rewriter.notifyMatchFailure(srcOp,
-+                                         "failed to convert result type");
-+    }
-+
-+    auto inputType = dyn_cast<FloatType>(resultType.getElementType());
-+    if (!inputType) {
-+      return rewriter.notifyMatchFailure(srcOp, "expected floating-point input");
-+    }
++    auto inputType = mlir::cast<FloatType>(resultType.getElementType());
 +
 +    int exponentBits = srcOp.getExponentBits();
 +    int mantissaBits = srcOp.getMantissaBits();
