@@ -1,0 +1,72 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10120,6 +10120,62 @@ public:
+ };
+ } // namespace
+ 
++namespace {
++class StableHLOToTTIRReducePrecisionOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::ReducePrecisionOp> {
++  using OpConversionPattern<
++      mlir::stablehlo::ReducePrecisionOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::ReducePrecisionOp srcOp,
++                  mlir::stablehlo::ReducePrecisionOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto resultType = dyn_cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getType()));
++    if (!resultType) {
++      return rewriter.notifyMatchFailure(srcOp,
++                                         "failed to convert result type");
++    }
++
++    auto inputType = dyn_cast<FloatType>(resultType.getElementType());
++    if (!inputType) {
++      return rewriter.notifyMatchFailure(srcOp, "expected floating-point input");
++    }
++
++    int exponentBits = srcOp.getExponentBits();
++    int mantissaBits = srcOp.getMantissaBits();
++    Type reducedElementType;
++    if (exponentBits == 5 && mantissaBits == 10) {
++      reducedElementType = rewriter.getF16Type();
++    } else if (exponentBits == 8 && mantissaBits == 7) {
++      reducedElementType = rewriter.getBF16Type();
++    } else if (exponentBits == 8 && mantissaBits == 23) {
++      reducedElementType = rewriter.getF32Type();
++    } else {
++      return rewriter.notifyMatchFailure(
++          srcOp, "requested floating-point format is not supported");
++    }
++
++    int inputMantissaBits = inputType.getFPMantissaWidth() - 1;
++    int inputExponentBits =
++        inputType.getWidth() - inputMantissaBits - /*sign=*/1;
++    if (exponentBits >= inputExponentBits &&
++        mantissaBits >= inputMantissaBits) {
++      rewriter.replaceOp(srcOp, adaptor.getOperand());
++      return success();
++    }
++
++    auto reducedType = resultType.clone(reducedElementType);
++    Value reduced = rewriter.create<ttir::TypecastOp>(
++        srcOp.getLoc(), reducedType, adaptor.getOperand(), true);
++    rewriter.replaceOpWithNewOp<ttir::TypecastOp>(
++        srcOp, resultType, reduced, true);
++    return success();
++  }
++};
++} // namespace
++
+ static void
+ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+                                          RewritePatternSet &patterns,
+@@ -10179,3 +10235,5 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+ 
+   patterns.add<StableHLOToTTIROpRoundOpConversionPattern>(typeConverter, ctx);
++  patterns.add<StableHLOToTTIRReducePrecisionOpConversionPattern>(
++      typeConverter, ctx);
+ }

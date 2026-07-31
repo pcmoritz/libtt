@@ -1,0 +1,204 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -7237,6 +7237,24 @@ public:
+     RankedTensorType updateType =
+         mlir::cast<RankedTensorType>(updateTensor.getType());
+     ArrayRef<int64_t> updateShape = updateType.getShape();
++    SmallVector<int64_t> inputPermutation;
++    if (!adaptor.getScatterDimensionNumbers().getInputBatchingDims().empty()) {
++      auto permutation = getBatchedScatterPermutation(srcOp);
++      if (failed(permutation)) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "unsupported scatter batching dimensions");
++      }
++      inputPermutation = *permutation;
++      if (!llvm::equal(inputPermutation,
++                       llvm::seq<int64_t>(0, inputType.getRank()))) {
++        inputShape =
++            ttmlir::utils::applyPermutation(inputShape, inputPermutation);
++        inputType = inputType.clone(inputShape);
++        inputTensor = rewriter.create<ttir::PermuteOp>(
++            srcOp.getLoc(), inputType, inputTensor,
++            rewriter.getDenseI64ArrayAttr(inputPermutation));
++      }
++    }
+     if (subtractReduction) {
+       updateTensor = rewriter.create<ttir::NegOp>(
+           srcOp.getLoc(), updateType, updateTensor);
+@@ -7245,18 +7263,38 @@ public:
+     // Single-dimensional scatter.
+-    bool flatten = scatterDimsToOperandDims.size() > 1 ||
+-                   inputType.getElementType().isF32() ||
+-                   inputType.getRank() != updateType.getRank();
++    bool flatten =
++        inputPermutation.empty() &&
++        (scatterDimsToOperandDims.size() > 1 ||
++         inputType.getElementType().isF32() ||
++         inputType.getRank() != updateType.getRank());
+     if (!flatten) {
+       // Process indices to match update tensor shape.
+       int32_t dim = scatterDimsToOperandDims[0];
++      if (!inputPermutation.empty()) {
++        dim = llvm::find(inputPermutation, dim) - inputPermutation.begin();
++      }
+       Value finalIndexTensor =
+           extractElementWiseScatterIndices(srcOp, rewriter);
+ 
++      if (isSineScatterApply(srcOp.getUpdateComputation())) {
++        Value transformed = rewriter.create<ttir::SinOp>(
++            srcOp.getLoc(), inputType, inputTensor);
++        updateTensor = rewriter.create<ttir::GatherOp>(
++            srcOp.getLoc(), updateType, transformed, finalIndexTensor,
++            rewriter.getI32IntegerAttr(dim));
++      }
++
+       // Create ScatterOp.
+-      rewriter.replaceOpWithNewOp<ttir::ScatterOp>(
+-          srcOp, outputType, inputTensor, finalIndexTensor, updateTensor,
++      Value result = rewriter.create<ttir::ScatterOp>(
++          srcOp.getLoc(), inputType, inputTensor, finalIndexTensor, updateTensor,
+           rewriter.getI32IntegerAttr(dim),
+           ttcore::ReduceTypeAttr::get(rewriter.getContext(),
+                                       *scatterReduceType));
++      if (!inputPermutation.empty()) {
++        result = rewriter.create<ttir::PermuteOp>(
++            srcOp.getLoc(), outputType, result,
++            rewriter.getDenseI64ArrayAttr(
++                ttmlir::utils::inversePermutation(inputPermutation)));
++      }
++      rewriter.replaceOp(srcOp, result);
+       return success();
+     } else {
+@@ -7266,5 +7304,15 @@ public:
+       Value flattenedUpdate = ttir::utils::flattenTensor(
+           rewriter, srcOp.getLoc(), updateTensor, "_update_flatten");
+ 
++      if (isSineScatterApply(srcOp.getUpdateComputation())) {
++        Value transformed = rewriter.create<ttir::SinOp>(
++            srcOp.getLoc(), inputType, inputTensor);
++        Value flattenedTransformed = ttir::utils::flattenTensor(
++            rewriter, srcOp.getLoc(), transformed, "_transformed_flatten");
++        flattenedUpdate = rewriter.create<ttir::GatherOp>(
++            srcOp.getLoc(), flattenedUpdate.getType(), flattenedTransformed,
++            flattenedIndices, rewriter.getI32IntegerAttr(SCATTER_DIMENSION));
++      }
++
+       // Scatter scalars on flattened tensors.
+       Value scatterResult = rewriter.create<ttir::ScatterOp>(
+@@ -7292,6 +7340,103 @@ public:
+   }
+ 
+ private:
++  static bool isSineScatterApply(Region &region) {
++    if (!region.hasOneBlock()) {
++      return false;
++    }
++    Block &block = region.front();
++    if (block.getNumArguments() != 2 ||
++        block.getTerminator()->getNumOperands() != 1) {
++      return false;
++    }
++    auto sine = block.getTerminator()
++                    ->getOperand(0)
++                    .getDefiningOp<mlir::stablehlo::SineOp>();
++    return sine && sine.getOperand() == block.getArgument(0);
++  }
++
++  FailureOr<SmallVector<int64_t>>
++  getBatchedScatterPermutation(mlir::stablehlo::ScatterOp op) const {
++    auto dims = op.getScatterDimensionNumbers();
++    ArrayRef<int64_t> inputBatchDims = dims.getInputBatchingDims();
++    ArrayRef<int64_t> indexBatchDims = dims.getScatterIndicesBatchingDims();
++    auto inputType =
++        mlir::cast<RankedTensorType>(op.getInputs()[0].getType());
++    auto updateType =
++        mlir::cast<RankedTensorType>(op.getUpdates()[0].getType());
++    if (inputType.getRank() != updateType.getRank() ||
++        inputBatchDims.size() != indexBatchDims.size() ||
++        dims.getScatterDimsToOperandDims().size() != 1) {
++      return failure();
++    }
++
++    llvm::DenseMap<int64_t, int64_t> batchDimMap;
++    for (auto [inputDim, indexDim] :
++         llvm::zip(inputBatchDims, indexBatchDims)) {
++      batchDimMap[indexDim] = inputDim;
++    }
++
++    llvm::DenseSet<int64_t> updateWindowDims(
++        dims.getUpdateWindowDims().begin(), dims.getUpdateWindowDims().end());
++    SmallVector<int64_t> updateScatterDims;
++    for (int64_t dim = 0; dim < updateType.getRank(); ++dim) {
++      if (!updateWindowDims.contains(dim)) {
++        updateScatterDims.push_back(dim);
++      }
++    }
++
++    SmallVector<int64_t> scatterIndexDims;
++    auto indexType =
++        mlir::cast<RankedTensorType>(op.getScatterIndices().getType());
++    for (int64_t dim = 0; dim < indexType.getRank(); ++dim) {
++      if (dim != dims.getIndexVectorDim()) {
++        scatterIndexDims.push_back(dim);
++      }
++    }
++    if (updateScatterDims.size() != scatterIndexDims.size()) {
++      return failure();
++    }
++
++    SmallVector<int64_t> permutation(inputType.getRank(), -1);
++    int64_t scatterDim = dims.getScatterDimsToOperandDims()[0];
++    for (auto [updateDim, indexDim] :
++         llvm::zip(updateScatterDims, scatterIndexDims)) {
++      auto batchDim = batchDimMap.find(indexDim);
++      int64_t inputDim =
++          batchDim == batchDimMap.end() ? scatterDim : batchDim->second;
++      if (llvm::is_contained(permutation, inputDim)) {
++        return failure();
++      }
++      permutation[updateDim] = inputDim;
++    }
++
++    llvm::DenseSet<int64_t> nonWindowDims(
++        dims.getInsertedWindowDims().begin(),
++        dims.getInsertedWindowDims().end());
++    nonWindowDims.insert(inputBatchDims.begin(), inputBatchDims.end());
++    SmallVector<int64_t> inputWindowDims;
++    for (int64_t dim = 0; dim < inputType.getRank(); ++dim) {
++      if (!nonWindowDims.contains(dim)) {
++        inputWindowDims.push_back(dim);
++      }
++    }
++    if (inputWindowDims.size() != dims.getUpdateWindowDims().size()) {
++      return failure();
++    }
++    for (auto [updateDim, inputDim] :
++         llvm::zip(dims.getUpdateWindowDims(), inputWindowDims)) {
++      if (permutation[updateDim] != -1 ||
++          llvm::is_contained(permutation, inputDim)) {
++        return failure();
++      }
++      permutation[updateDim] = inputDim;
++    }
++    if (llvm::is_contained(permutation, -1)) {
++      return failure();
++    }
++    return permutation;
++  }
++
+   LogicalResult checkBasicLegality(mlir::stablehlo::ScatterOp &op,
+                                    mlir::stablehlo::ScatterOp::Adaptor adaptor,
+                                    ConversionPatternRewriter &rewriter) const {
+@@ -7306,11 +7451,1 @@ private:
+-    auto inputBatchingDims =
+-        adaptor.getScatterDimensionNumbers().getInputBatchingDims();
+-    auto scatterIndicesBatchingDims =
+-        adaptor.getScatterDimensionNumbers().getScatterIndicesBatchingDims();
+-    if (!inputBatchingDims.empty() || !scatterIndicesBatchingDims.empty()) {
+-      return rewriter.notifyMatchFailure(
+-          op, "Scatter doesn't currently support scatter with batching "
+-              "dimensions");
+-    }
+-
+     ArrayRef<int64_t> insertedWindowDims =

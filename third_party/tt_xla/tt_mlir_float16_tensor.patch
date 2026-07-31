@@ -10,84 +10,6 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/
    case DataType::BFloat16:
      return BFloat16Type::get(context);
    case DataType::BFP_Float8:
-diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
---- a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
-+++ b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
-@@ -36,6 +36,8 @@ public:
-           }
- 
--          elementType =
--              mlir::tt::ttcore::toTTMLIRSupportedDataType(elementType);
-+          elementType = elementType.isF16()
-+                            ? Float32Type::get(type.getContext())
-+                            : mlir::tt::ttcore::toTTMLIRSupportedDataType(
-+                                  elementType);
-           if (!elementType) {
-             return {};
-@@ -45,6 +47,16 @@ public:
-                                              type.getEncoding());
-         });
-   }
-+
-+  void preserveFloat16() {
-+    addConversion(
-+        [](RankedTensorType type) -> std::optional<RankedTensorType> {
-+          if (type.getElementType().isF16()) {
-+            return type;
-+          }
-+          return {};
-+        });
-+  }
- };
- 
- // TODO(milant): https://github.com/tenstorrent/tt-mlir/issues/2847
-@@ -143,6 +155,9 @@ struct ElementTypeNormalization
-       ElementTypeNormalization>::ElementTypeNormalizationBase;
- 
-   void runOnOperation() final {
-+    if (canPreserveFloat16()) {
-+      converter.preserveFloat16();
-+    }
-     // Check that all types are supported by TTMLIR.
-     if (!checkSupportedTypes()) {
-       signalPassFailure();
-@@ -164,6 +179,36 @@ private:
-     return converter.convertType(type) != nullptr;
-   }
- 
-+  bool canPreserveFloat16() {
-+    bool found = false;
-+    WalkResult result = getOperation()->walk([&](Operation *op) {
-+      auto hasFloat16 = [](TypeRange types) {
-+        return llvm::any_of(types, [](Type type) {
-+          auto shapedType = mlir::dyn_cast<ShapedType>(type);
-+          return shapedType && shapedType.getElementType().isF16();
-+        });
-+      };
-+
-+      bool touchesFloat16;
-+      if (auto funcOp = mlir::dyn_cast<func::FuncOp>(op)) {
-+        touchesFloat16 = hasFloat16(funcOp.getArgumentTypes()) ||
-+                         hasFloat16(funcOp.getResultTypes());
-+      } else {
-+        touchesFloat16 = hasFloat16(op->getOperandTypes()) ||
-+                         hasFloat16(op->getResultTypes());
-+      }
-+      if (!touchesFloat16) {
-+        return WalkResult::advance();
-+      }
-+      found = true;
-+      return mlir::isa<func::FuncOp, func::ReturnOp, DotGeneralOp, ReshapeOp,
-+                       ScatterOp, TypecastOp>(op)
-+                 ? WalkResult::advance()
-+                 : WalkResult::interrupt();
-+    });
-+    return found && !result.wasInterrupted();
-+  }
-+
-   bool isLegal(mlir::Operation *op) const {
-     auto isTypeLegal = [this](mlir::Type type) { return isLegal(type); };
- 
 diff --git a/lib/OpModel/TTNN/Conversion.cpp b/lib/OpModel/TTNN/Conversion.cpp
 --- a/lib/OpModel/TTNN/Conversion.cpp
 +++ b/lib/OpModel/TTNN/Conversion.cpp
@@ -137,6 +59,18 @@ diff --git a/runtime/lib/common/utils.cpp b/runtime/lib/common/utils.cpp
 -  case ::tt::target::DataType::Float16:
    case ::tt::target::DataType::Float64:
    case ::tt::target::DataType::Int64:
+diff --git a/runtime/include/tt/runtime/detail/ttnn/debug_apis.h b/runtime/include/tt/runtime/detail/ttnn/debug_apis.h
+--- a/runtime/include/tt/runtime/detail/ttnn/debug_apis.h
++++ b/runtime/include/tt/runtime/detail/ttnn/debug_apis.h
+@@ -31,6 +31,8 @@ inline std::string toString(const ::ttnn::DataType &dtype) {
+   switch (dtype) {
+   case ::ttnn::DataType::FLOAT32:
+     return "FLOAT32";
++  case ::ttnn::DataType::FLOAT16:
++    return "FLOAT16";
+   case ::ttnn::DataType::BFLOAT16:
+     return "BFLOAT16";
+   case ::ttnn::DataType::BFLOAT8_B:
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
@@ -200,6 +134,18 @@ diff --git a/runtime/lib/ttnn/operations/utils/utils.cpp b/runtime/lib/ttnn/oper
 diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 --- a/runtime/lib/ttnn/utils/utils.cpp
 +++ b/runtime/lib/ttnn/utils/utils.cpp
+@@ -82,6 +82,7 @@ bool canTilizeDataTypeOnDevice(const ::ttnn::DataType &dataType) {
+   return dataType == ::ttnn::DataType::BFLOAT16 ||
++         dataType == ::ttnn::DataType::FLOAT16 ||
+          dataType == ::ttnn::DataType::FLOAT32 ||
+          dataType == ::ttnn::DataType::UINT32 ||
+          dataType == ::ttnn::DataType::UINT16 ||
+@@ -113,6 +114,7 @@ bool canUntilizeDataTypeOnDevice(const ::ttnn::DataType &dataType) {
+   return dataType == ::ttnn::DataType::BFLOAT16 ||
++         dataType == ::ttnn::DataType::FLOAT16 ||
+          dataType == ::ttnn::DataType::FLOAT32 ||
+          dataType == ::ttnn::DataType::UINT32 ||
+          dataType == ::ttnn::DataType::UINT16 ||
 @@ -174,6 +174,8 @@ getReduceType(uint32_t reduceType) {
  ::ttnn::DataType toTTNNDataType(::tt::target::DataType dataType) {
    switch (dataType) {
