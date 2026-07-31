@@ -61,6 +61,14 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 +  const std::lock_guard<std::mutex> lock(execution_mutex);
 +
    tt_pjrt_status status = instance->execute(args);
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -220,4 +220,3 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+     if (!r) {
+-      m_client_instance->closeMeshDevice();
+       return tt_pjrt_status::kInternal;
+     }
 diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/api_bindings.cc
 --- a/pjrt_implementation/src/api_bindings.cc
 +++ b/pjrt_implementation/src/api_bindings.cc

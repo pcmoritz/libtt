@@ -607,19 +607,6 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy
  
  // Enum values that are not dispatched to binary_ng (e.g. ADDALPHA -> ADD).
  inline constexpr std::array<DT, 0> unsupported{};
-diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
---- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-@@ -41,7 +41,8 @@ bool is_binary_sfpu_op(BinaryOpType val, DataType a, DataType b, bool fast_and_a
-         case GT:
-         case LT:
-         case GE:
--        case LE: return a == b && (a == FLOAT32 || a == BFLOAT16 || a == INT32 || a == UINT16 || a == UINT32);
-+        case LE:
-+            return a == b && (a == FLOAT32 || a == FLOAT16 || a == BFLOAT16 || a == INT32 || a == UINT16 || a == UINT32);
-         case LCM:
-         case GCD: return (a == INT32 && b == INT32);
-         case LEFT_SHIFT:
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
