@@ -164,3 +164,19 @@ diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 +    return ::tt::target::DataType::Float16;
    case ::ttnn::DataType::BFLOAT16:
      return ::tt::target::DataType::BFloat16;
+ diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+@@ -506,8 +506,12 @@ class TTNNDecomposeLayouts
+   bool layoutChangeNeedsHost(TTNNLayoutAttr input,
+                              TTNNLayoutAttr output) const {
+     if (!hasLayoutChange(input, output)) {
+       return false;
+     }
++    if (input.getDataType() == ttcore::DataType::Float16 &&
++        output.getDataType() == ttcore::DataType::Float16) {
++      return false;
++    }
+     return !isOnDeviceLayoutChangeSupportedForDataType(input.getDataType()) &&
+            !isOnDeviceLayoutChangeSupportedForDataType(output.getDataType());
+   }

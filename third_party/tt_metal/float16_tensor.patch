@@ -394,6 +394,29 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_op
                  input_tensor_a.dtype() == tt::tt_metal::DataType::UINT32 or
                  input_tensor_a.dtype() == tt::tt_metal::DataType::INT32 or
                  input_tensor_a.dtype() == tt::tt_metal::DataType::FLOAT32,
+diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+--- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
++++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+@@ -11,4 +11,5 @@
+ #include "ttnn/distributed/types.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
+ #include "ttnn/operations/data_movement/pad/pad.hpp"
+ #include "ttnn/operations/data_movement/tilize/tilize.hpp"
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
+@@ -86,2 +87,13 @@ Tensor to_layout_impl(
+         TT_THROW("ttnn::to_layout: Unsupported layout conversion from {} to {}!", tensor_arg.layout(), layout);
+     }
++    const DataType output_dtype = dtype.value_or(tensor_arg.dtype());
++    if (tt::tt_metal::is_device_tensor(tensor_arg) && tensor_arg.dtype() == DataType::FLOAT16 &&
++        (output_dtype == DataType::FLOAT16 || output_dtype == DataType::FLOAT32)) {
++        auto tensor = ttnn::typecast(tensor_arg, DataType::FLOAT32);
++        tensor = to_layout_impl(
++            tensor, layout, DataType::FLOAT32, memory_config, sub_core_grids, pad_value);
++        if (output_dtype == DataType::FLOAT32) {
++            return tensor;
++        }
++        return ttnn::typecast(tensor, DataType::FLOAT16);
++    }
 diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
@@ -746,7 +769,14 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_facto
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
-@@ -62,7 +62,7 @@ tt::tt_metal::ProgramDescriptor TypecastProgramFactory::create_descriptor(
+@@ -29,2 +29,5 @@ tt::tt_metal::ProgramDescriptor TypecastProgramFactory::create_descriptor(
+-    const tt::DataFormat cb_data_format_input = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
++    const tt::DataFormat cb_data_format_input =
++        args.input_dtype == DataType::FLOAT16 && args.output_dtype == DataType::FLOAT32
++            ? tt::DataFormat::UInt16
++            : tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
+     const uint32_t single_tile_size_input = tt::tile_size(cb_data_format_input);
+@@ -62,7 +64,7 @@ tt::tt_metal::ProgramDescriptor TypecastProgramFactory::create_descriptor(
          }}},
      });
  
@@ -767,7 +797,16 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factor
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
-@@ -111,7 +111,7 @@ tt::tt_metal::ProgramDescriptor TypecastRMChunkedProgramFactory::create_descripto
+@@ -78,7 +78,10 @@ tt::tt_metal::ProgramDescriptor TypecastRowMajorChunkedProgramFactory::create_descriptor(
+-    const tt::DataFormat cb_data_format_input = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
++    const tt::DataFormat cb_data_format_input =
++        input_dtype == DataType::FLOAT16 && output_dtype == DataType::FLOAT32
++            ? tt::DataFormat::UInt16
++            : tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
+     const uint32_t input_element_size = tt::datum_size(cb_data_format_input);
+     const tt::DataFormat cb_data_format_output = tt::tt_metal::datatype_to_dataformat_converter(output.dtype());
+     const uint32_t output_element_size = tt::datum_size(cb_data_format_output);
+@@ -111,7 +114,7 @@ tt::tt_metal::ProgramDescriptor TypecastRowMajorChunkedProgramFactory::create_descriptor(
      (void)num_cores;
  
      constexpr uint8_t input_cb_index = tt::CBIndex::c_0;
@@ -896,7 +935,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ca
 +#include "internal/tt-1xx/float16_conversion.h"
  
  using namespace sfpi;
-@@ -17,8 +18,26 @@ inline void cast_fp32_to_fp16a() {
+@@ -17,8 +18,22 @@ inline void cast_fp32_to_fp16a() {
  #pragma GCC unroll 8
      for (int d = 0; d < ITERATIONS; d++) {
          sfpi::vFloat x = sfpi::dst_reg[0];
@@ -910,17 +949,13 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ca
 +template <bool APPROXIMATION_MODE, int ITERATIONS>
 +inline void cast_fp16a_to_fp32() {
 +    for (int d = 0; d < ITERATIONS; d++) {
-+        sfpi::vFloat x = sfpi::dst_reg[0].mode<sfpi::DataLayout::F16a>();
-+        sfpi::vUInt bits = sfpi::as<sfpi::vUInt>(x);
-+        sfpi::vUInt magnitude = bits & 0x7fffffffU;
-+
-+        v_if(magnitude >= 0x47800000U) {
-+            x = sfpi::as<sfpi::vFloat>(
-+                (bits & 0x807fffffU) | 0x7f800000U);
-+        }
-+        v_endif;
-+
-+        sfpi::dst_reg[0].mode<sfpi::DataLayout::F32>() = x;
++        // In 32-bit DST mode, UInt16 tiles are unpacked into the low half of
++        // each word. Loading U16 would apply the 16-bit DST lane swizzle.
++        sfpi::vUInt bits(
++            sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>());
++        bits &= 0xffffU;
++        sfpi::dst_reg[0].mode<sfpi::DataLayout::F32>() =
++            sfpi::as<sfpi::vFloat>(float16_to_float32_bits(bits));
 +        sfpi::dst_reg++;
 +    }
 +}
@@ -928,7 +963,7 @@ diff --git tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h tt_metal/hw/inc/
 new file mode 100644
 --- /dev/null
 +++ tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,85 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -982,6 +1017,35 @@ new file mode 100644
 +    v_else { rounded = 0U; }
 +    v_endif;
 +    return sfpi::as<sfpi::vFloat>(rounded | sign);
++}
++
++// Expands raw IEEE Float16 bits into exact Float32 bits.
++sfpi_inline sfpi::vUInt float16_to_float32_bits(sfpi::vUInt bits) {
++    sfpi::vUInt sign = (bits & 0x8000U) << 16;
++    sfpi::vUInt exponent = (bits >> 10) & 0x1fU;
++    sfpi::vUInt mantissa = bits & 0x3ffU;
++    sfpi::vUInt result;
++
++    v_if(exponent == 0U) {
++        result = sign;
++        v_if(mantissa != 0U) {
++            sfpi::vUInt leadingZeros =
++                sfpi::vUInt(0U) + sfpi::lz(mantissa);
++            sfpi::vUInt shift = leadingZeros - 21U;
++            result = sign |
++                     ((sfpi::vUInt(134U) - leadingZeros) << 23) |
++                     (((mantissa << shift) & 0x3ffU) << 13);
++        }
++        v_endif;
++    }
++    v_elseif(exponent == 0x1fU) {
++        result = sign | 0x7f800000U | (mantissa << 13);
++    }
++    v_else {
++        result = sign | ((exponent + 112U) << 23) | (mantissa << 13);
++    }
++    v_endif;
++    return result;
 +}
 +
 +}  // namespace ckernel::sfpu
@@ -1066,63 +1130,6 @@ diff --git tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_A.h tt_metal/tt-l
 +        if (should_unpack_to_dest(unpack_to_dest, unpack_src_format, unpack_dst_format))
          {
              unpack_to_dest_tile_done(unp_cfg_context, unpack_dst_format);
-diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.hpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.hpp
---- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.hpp
-+++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.hpp
-@@ -4,6 +4,8 @@
- 
- #pragma once
- 
-+#include <utility>
-+
- #include <tt-metalium/host_api.hpp>
- #include "ttnn/tensor/tensor.hpp"
- 
-@@ -10,4 +12,15 @@ namespace ttnn::prim::detail {
- 
- uint32_t get_packed_value(const tt::tt_metal::Tensor& tensor, const tt::tt_metal::PadValue& pad_value);
- 
-+inline std::pair<tt::DataFormat, tt::DataFormat> get_cb_formats(
-+    tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
-+    if (input_dtype == tt::tt_metal::DataType::FLOAT16 &&
-+        output_dtype == tt::tt_metal::DataType::FLOAT16) {
-+        // Padding changes layout but not FP16 values, so move their raw bits.
-+        return {tt::DataFormat::UInt16, tt::DataFormat::UInt16};
-+    }
-+    return {tt::tt_metal::datatype_to_dataformat_converter(input_dtype),
-+            tt::tt_metal::datatype_to_dataformat_converter(output_dtype)};
-+}
-+
- }  // namespace ttnn::prim::detail
-diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
---- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
-@@ -32,10 +32,8 @@ ProgramDescriptor TilizeWithValPaddingSingleCoreFactory::create_descriptor(
- 
-     Buffer* src0_buffer = a.buffer();
- 
--    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
-+    auto [input_cb_data_format, output_cb_data_format] = detail::get_cb_formats(a.dtype(), output.dtype());
-     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
--
--    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
-     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
- 
-     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
-diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
---- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
-@@ -24,9 +24,8 @@ ProgramDescriptor TilizeWithValPaddingMultiCoreDefaultFactory::create_descriptor(
-     const TilizeWithValPaddingParams& operation_attributes, const Tensor& input_tensor, Tensor& tensor_return_value) {
-     const Tensor& a = input_tensor;
-     const Tensor& output = tensor_return_value;
--    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
-+    auto [input_cb_data_format, output_cb_data_format] = detail::get_cb_formats(a.dtype(), output.dtype());
-     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
--    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
-     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
- 
-     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
 diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp
@@ -1151,31 +1158,40 @@ diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/prod_op_all.cpp ttnn/c
 +                result, result.dtype(), result.layout(), result.device(), output_mem_config);
          case tt::tt_metal::DataType::BFLOAT16:
              return ttnn::prod_result_computation_WH_B0<bfloat16>(
-diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
---- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
-@@ -83,9 +83,8 @@ ProgramDescriptor TilizeWithValPaddingMultiCoreBlockInterleavedFactory::create_descriptor(
-     const Tensor& output = tensor_return_value;
-     const auto& sub_core_grids = operation_attributes.sub_core_grids;
+diff --git ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
+@@ -7,6 +7,7 @@
+ #include "ttnn/operations/data_movement/slice/device/slice_device_operation.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
+ #include "ttnn/operations/data_movement/copy/copy.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
+ #include "ttnn/operations/experimental/reshape/view.hpp"
+ #include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
+ #include "ttnn/operations/data_movement/transpose/device/transpose_utils.hpp"
+@@ -341,6 +342,25 @@ ttnn::Tensor slice(
+         }
+     }
  
--    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
-+    auto [input_cb_data_format, output_cb_data_format] = detail::get_cb_formats(a.dtype(), output.dtype());
-     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
--    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
-     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
- 
-     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
-diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
---- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
-@@ -27,9 +27,8 @@ ProgramDescriptor TilizeWithValPaddingMultiCoreShardedFactory::create_descriptor(
-     bool src_sharded = a.memory_config().is_sharded();
-     bool out_sharded = output.memory_config().is_sharded();
- 
--    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
-+    auto [input_cb_data_format, output_cb_data_format] = detail::get_cb_formats(a.dtype(), output.dtype());
-     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
--    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
-     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
- 
-     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
++    if (rm_only && input.layout() == Layout::TILE && input.dtype() == DataType::FLOAT16) {
++        auto fp32 = ttnn::typecast(input, DataType::FLOAT32);
++        auto output = ttnn::slice<T>(
++            fp32,
++            begins,
++            ends,
++            step,
++            output_memory_config,
++            std::nullopt,
++            pad_value,
++            sub_core_grids);
++        return ttnn::typecast(
++            output,
++            DataType::FLOAT16,
++            output_memory_config,
++            optional_output_tensor,
++            sub_core_grids);
++    }
++
+     if (rm_only) {
+         if (!no_step) {
+             TT_FATAL(input.dtype() != DataType::BFLOAT8_B, "Strided slice is not supported for BFLOAT8 tensors");
