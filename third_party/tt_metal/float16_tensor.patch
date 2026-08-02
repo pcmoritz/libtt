@@ -145,39 +145,23 @@ diff --git tt_metal/impl/tensor/host_tensor_factory.cpp tt_metal/impl/tensor/hos
  template std::vector<float> HostTensor::to_vector() const;
 +template std::vector<float16> HostTensor::to_vector() const;
  template std::vector<bfloat16> HostTensor::to_vector() const;
+diff --git tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
+--- tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
++++ tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
+@@ -94,2 +94,4 @@ auto dispatch(DataType dtype, Func&& func, Args&&... args) {
+         case DataType::BFLOAT16:
+             return (std::forward<Func>(func)).template operator()<bfloat16>(std::forward<Args>(args)...);
++        case DataType::FLOAT16:
++            return (std::forward<Func>(func)).template operator()<float16>(std::forward<Args>(args)...);
 diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
 --- tt_metal/impl/tensor/tensor_apis.cpp
 +++ tt_metal/impl/tensor/tensor_apis.cpp
-@@ -619,1 +619,4 @@ HostTensor to_row_major_layout(const HostTensor& tensor) {
-+    if (tensor.dtype() == DataType::FLOAT16) {
-+        return CMAKE_UNIQUE_NAMESPACE::to_row_major_layout_impl<float16>(tensor);
-+    }
-     return tensor_impl::dispatch(tensor.dtype(), [&]<typename T>() {
-@@ -639,1 +642,4 @@ HostTensor to_tile_layout(const HostTensor& tensor, const Tile& tile) {
-+    if (tensor.dtype() == DataType::FLOAT16) {
-+        return CMAKE_UNIQUE_NAMESPACE::to_tile_layout_impl<float16>(tensor, tile);
-+    }
-     return tensor_impl::dispatch(tensor.dtype(), [&]<typename T>() {
-@@ -1048,2 +1054,6 @@ HostTensor pad(
-     TT_FATAL(tensor.layout() == Layout::ROW_MAJOR, "Tensor layout must be ROW_MAJOR for padding");
-+    if (tensor.dtype() == DataType::FLOAT16) {
-+        return CMAKE_UNIQUE_NAMESPACE::pad_impl<float16>(
-+            tensor, output_padded_shape, input_tensor_start, pad_value);
-+    }
-     return tensor_impl::dispatch(tensor.dtype(), [&]<typename T>() {
-@@ -1084,2 +1094,6 @@ HostTensor unpad(
-     TT_FATAL(tensor.layout() == Layout::ROW_MAJOR, "Tensor layout must be ROW_MAJOR for unpadding");
-+    if (tensor.dtype() == DataType::FLOAT16) {
-+        return CMAKE_UNIQUE_NAMESPACE::unpad_impl<float16>(
-+            tensor, output_tensor_start, output_tensor_end);
-+    }
-     return tensor_impl::dispatch(tensor.dtype(), [&]<typename T>() {
-@@ -1305,2 +1319,4 @@ void validate_datatype(DataType dtype) {
+@@ -1305,2 +1305,4 @@ void validate_datatype(DataType dtype) {
          TT_FATAL(dtype == DataType::BFLOAT16, "Incorrect data type {}", dtype);
 +    } else if constexpr (std::is_same_v<BaseType, float16>) {
 +        TT_FATAL(dtype == DataType::FLOAT16, "Incorrect data type {}", dtype);
      } else if constexpr (std::is_same_v<BaseType, uint16_t>) {
-@@ -1369,2 +1385,3 @@ INSTANTIATE_HOST_BUFFER_FUNCTIONS(uint32_t)
+@@ -1369,2 +1371,3 @@ INSTANTIATE_HOST_BUFFER_FUNCTIONS(uint32_t)
  INSTANTIATE_HOST_BUFFER_FUNCTIONS(bfloat16)
 +INSTANTIATE_HOST_BUFFER_FUNCTIONS(float16)
  INSTANTIATE_HOST_BUFFER_FUNCTIONS(uint16_t)
