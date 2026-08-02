@@ -13,6 +13,21 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/compute
 diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
+@@ -666,2 +666,7 @@ tt::tt_metal::ProgramDescriptor PermuteDeviceOperation::MultiCoreTiledGeneric::
+                 break;
++            case DataType::FLOAT16: {
++                auto value = float16(pad_value).bits;
++                padding_val_packed = pack_two_uint16_into_uint32({value, value});
++                break;
++            }
+             case DataType::UINT16:
+@@ -721,2 +726,5 @@ tt::tt_metal::ProgramDescriptor PermuteDeviceOperation::MultiCoreTiledGeneric::
+-    tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
++    // Permute is bit-preserving, so use UInt16 to avoid FP16 conversion.
++    tt::DataFormat cb_data_format = input_tensor.dtype() == DataType::FLOAT16
++                                        ? tt::DataFormat::UInt16
++                                        : tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
+     uint32_t input_page_size = detail::tile_size(tensor_return_value) + misalignment;
 @@ -815,6 +815,12 @@ tt::tt_metal::ProgramDescriptor PermuteDeviceOperation::MultiCoreTiledGeneric::
      bool fp32_dest_acc_en = cb_data_format == tt::DataFormat::Float32 || cb_data_format == tt::DataFormat::Int32 ||
                              cb_data_format == tt::DataFormat::UInt32;

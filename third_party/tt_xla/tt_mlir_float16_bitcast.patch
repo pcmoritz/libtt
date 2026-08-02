@@ -1,22 +1,16 @@
 diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
 --- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
 +++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
-@@ -205,7 +205,8 @@ inline std::optional<DataType> elementTypeToDataTypeImpl(Type elementType) {
-     switch (intType.getWidth()) {
-     case 1:
+@@ -207,3 +207,4 @@ inline std::optional<DataType> elementTypeToDataTypeImpl(Type elementType) {
        return DataType::Bool;
 -    // TTNN has no signed 8- or 16-bit tensor dtype.
 +    // TTNN has no signed narrow-integer tensor dtype.
 +    case 4:
      case 8:
-       return (intType.isSigned() || intType.isSignless()) ? DataType::Int32
-                                                           : DataType::UInt8;
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -234,6 +234,108 @@ public:
- };
- } // namespace
+@@ -236,2 +236,104 @@ public:
  
 +namespace {
 +class StableHLOToTTIRBitcastConvertOpConversionPattern
@@ -121,17 +115,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +} // namespace
 +
  namespace {
- class StableHLOToTTIRReduceOpConversionPattern
-     : public OpConversionPattern<mlir::stablehlo::ReduceOp> {
-@@ -10190,9 +10292,8 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
- 
-   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+@@ -10192,5 +10294,4 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
        mlir::stablehlo::AbsOp, mlir::tt::ttir::AbsOp>>(typeConverter, ctx);
 -  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
 -      mlir::stablehlo::BitcastConvertOp, mlir::tt::ttir::BitcastConvertOp>>(
 -      typeConverter, ctx);
 +  patterns.add<StableHLOToTTIRBitcastConvertOpConversionPattern>(typeConverter,
 +                                                                 ctx);
-   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
-       mlir::stablehlo::CbrtOp, mlir::tt::ttir::CbrtOp>>(typeConverter, ctx);
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<

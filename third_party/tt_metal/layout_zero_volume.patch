@@ -47,15 +47,11 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp ttnn/cpp
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-@@ -5,4 +5,5 @@
- #include "typecast.hpp"
+@@ -6,2 +6,3 @@
  #include "ttnn/operations/copy/typecast/device/typecast_device_op.hpp"
 +#include "ttnn/operations/creation/creation.hpp"
  #include "ttnn/operations/core/core.hpp"  // for to_dtype
- #include "ttnn/tensor/tensor_utils.hpp"   // for is_cpu_tensor
-@@ -25,6 +26,17 @@ inline Tensor typecast_impl(
-         // For host tensors, memory_config is not applicable, so we ignore it
-         return ttnn::to_dtype(input_tensor, output_dtype);
+@@ -27,3 +28,14 @@ inline Tensor typecast_impl(
      }
 -
 +    if (input_tensor.logical_volume() == 0) {
@@ -71,4 +67,3 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/ope
 +    }
 +
      // Device tensor path
-     DataType input_dtype = input_tensor.dtype();

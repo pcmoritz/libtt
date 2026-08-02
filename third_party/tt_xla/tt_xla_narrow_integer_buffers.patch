@@ -1,14 +1,10 @@
 diff --git a/pjrt_implementation/src/utils/data_type_utils.cc b/pjrt_implementation/src/utils/data_type_utils.cc
 --- a/pjrt_implementation/src/utils/data_type_utils.cc
 +++ b/pjrt_implementation/src/utils/data_type_utils.cc
-@@ -112,6 +112,10 @@ convertPJRTToRuntimeDataType(PJRT_Buffer_Type pjrt_data_type) {
-     return tt::target::DataType::Int16;
-   case PJRT_Buffer_Type_S8:
+@@ -114,2 +114,6 @@ convertPJRTToRuntimeDataType(PJRT_Buffer_Type pjrt_data_type) {
      return tt::target::DataType::Int8;
 +  case PJRT_Buffer_Type_S4:
 +    return tt::target::DataType::Int8;
 +  case PJRT_Buffer_Type_U4:
 +    return tt::target::DataType::UInt8;
    case PJRT_Buffer_Type_U64:
-     return tt::target::DataType::UInt64;
-   case PJRT_Buffer_Type_PRED:
