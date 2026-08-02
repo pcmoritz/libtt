@@ -835,3 +835,13 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untili
 +    }
 +
      bool fp32_dest_acc_en = input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
+@@ -32,1 +32,6 @@ struct df_to_std<DataFormat::Float16_b> {
+ };
++
++template <>
++struct df_to_std<DataFormat::Float16> {
++    using std_type = uint16_t;
++};

@@ -1,20 +1,8 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -7239,2 +7239,32 @@ public:
+@@ -7239,2 +7239,20 @@ public:
      ArrayRef<int64_t> updateShape = updateType.getShape();
-+    RankedTensorType workOutputType = outputType;
-+    bool usesFloat32Transport = inputType.getElementType().isF16();
-+    if (usesFloat32Transport) {
-+      Type float32 = rewriter.getF32Type();
-+      inputType = inputType.clone(float32);
-+      updateType = updateType.clone(float32);
-+      workOutputType = outputType.clone(float32);
-+      inputTensor = rewriter.create<ttir::TypecastOp>(
-+          srcOp.getLoc(), inputType, inputTensor);
-+      updateTensor = rewriter.create<ttir::TypecastOp>(
-+          srcOp.getLoc(), updateType, updateTensor);
-+    }
 +    SmallVector<int64_t> inputPermutation;
 +    if (!adaptor.getScatterDimensionNumbers().getInputBatchingDims().empty()) {
 +      auto permutation = getBatchedScatterPermutation(srcOp);
@@ -34,7 +22,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      }
 +    }
      if (subtractReduction) {
-@@ -7245,5 +7275,7 @@ public:
+@@ -7245,5 +7263,8 @@ public:
      // Single-dimensional scatter.
 -    bool flatten = scatterDimsToOperandDims.size() > 1 ||
 -                   inputType.getElementType().isF32() ||
@@ -45,13 +33,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +         inputType.getElementType().isF32() ||
 +         inputType.getRank() != updateType.getRank());
      if (!flatten) {
-@@ -7251,2 +7282,5 @@ public:
+@@ -7251,2 +7271,5 @@ public:
        int32_t dim = scatterDimsToOperandDims[0];
 +      if (!inputPermutation.empty()) {
 +        dim = llvm::find(inputPermutation, dim) - inputPermutation.begin();
 +      }
        Value finalIndexTensor =
-@@ -7254,5 +7288,13 @@ public:
+@@ -7254,5 +7277,13 @@ public:
  
 +      if (isSineScatterApply(srcOp.getUpdateComputation())) {
 +        Value transformed = rewriter.create<ttir::SinOp>(
@@ -67,21 +55,17 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      Value result = rewriter.create<ttir::ScatterOp>(
 +          srcOp.getLoc(), inputType, inputTensor, finalIndexTensor, updateTensor,
            rewriter.getI32IntegerAttr(dim),
-@@ -7260,2 +7302,13 @@ public:
+@@ -7260,2 +7291,9 @@ public:
                                        *scatterReduceType));
 +      if (!inputPermutation.empty()) {
 +        result = rewriter.create<ttir::PermuteOp>(
-+            srcOp.getLoc(), workOutputType, result,
++            srcOp.getLoc(), outputType, result,
 +            rewriter.getDenseI64ArrayAttr(
 +                ttmlir::utils::inversePermutation(inputPermutation)));
 +      }
-+      if (usesFloat32Transport) {
-+        result = rewriter.create<ttir::TypecastOp>(srcOp.getLoc(), outputType,
-+                                                   result);
-+      }
 +      rewriter.replaceOp(srcOp, result);
        return success();
-@@ -7268,2 +7321,12 @@ public:
+@@ -7268,2 +7306,12 @@ public:
  
 +      if (isSineScatterApply(srcOp.getUpdateComputation())) {
 +        Value transformed = rewriter.create<ttir::SinOp>(
@@ -94,17 +78,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      }
 +
        // Scatter scalars on flattened tensors.
-@@ -7287,5 +7350,9 @@ public:
-                                        scatterResult, inputShape);
- 
-+      if (usesFloat32Transport) {
-+        reshapedResult = rewriter.create<ttir::TypecastOp>(
-+            srcOp.getLoc(), outputType, reshapedResult);
-+      }
-       rewriter.replaceOp(srcOp, reshapedResult);
-       return success();
-     }
-@@ -7294,2 +7361,99 @@ public:
+@@ -7294,2 +7342,99 @@ public:
  private:
 +  static bool isSineScatterApply(Region &region) {
 +    if (!region.hasOneBlock()) {
@@ -204,7 +178,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  }
 +
    LogicalResult checkBasicLegality(mlir::stablehlo::ScatterOp &op,
-@@ -7306,11 +7470,1 @@ private:
+@@ -7306,11 +7451,1 @@ private:
 -    auto inputBatchingDims =
 -        adaptor.getScatterDimensionNumbers().getInputBatchingDims();
 -    auto scatterIndicesBatchingDims =
