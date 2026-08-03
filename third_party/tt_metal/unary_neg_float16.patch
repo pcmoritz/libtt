@@ -5,8 +5,8 @@ diff --git a/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory
      const auto& input = tensor_args.input;
      const auto& ops_chain = operation_attributes.op_chain;
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
-+    const bool is_fp16_neg = input.dtype() == DataType::FLOAT16 && ops_chain.size() == 1 &&
-+                             ops_chain[0].type() == unary::UnaryOpType::NEG;
++    const bool is_fp16_neg = input.dtype() == DataType::FLOAT16 && output.dtype() == DataType::FLOAT16 &&
++                             ops_chain.size() == 1 && ops_chain[0].type() == unary::UnaryOpType::NEG;
  
      const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en ||
 -                                  input.dtype() == DataType::FLOAT16 ||
