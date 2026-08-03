@@ -58,8 +58,7 @@ diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.c
 diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -862,5 +862,13 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
-                                                                     : DataType::BFLOAT16;
+@@ -863,8 +863,16 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
      const auto c_dtype = c.dtype();
 +    const bool is_fp16_comparison =
 +        a_dtype == DataType::FLOAT16 && b_dtype == DataType::FLOAT16 &&
@@ -72,7 +71,11 @@ diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program
      const auto a_data_format = datatype_to_dataformat_converter(a_dtype);
      const auto b_data_format = datatype_to_dataformat_converter(b_dtype);
      const auto c_data_format = datatype_to_dataformat_converter(c_dtype);
-@@ -1173,8 +1180,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
+ 
+     uint32_t a_single_tile_size = tt::tile_size(a_data_format);
+     uint32_t b_single_tile_size = tt::tile_size(b_data_format);
+     uint32_t c_single_tile_size = tt::tile_size(c_data_format);
+@@ -1173,8 +1181,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
      // loading fp32 tiles into a DST configured for bf16 produces tile-aligned corruption
      // for broadcast multiply (issue 43196).
      bool fp32_dest_acc_en = c_data_format == tt::DataFormat::UInt32 || c_data_format == tt::DataFormat::Int32 ||
@@ -84,7 +87,20 @@ diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program
                              c_data_format == tt::DataFormat::Float32 || a_data_format == tt::DataFormat::Float32 ||
                              b_data_format == tt::DataFormat::Float32 ||
                              (a_data_format == tt::DataFormat::Int32 && b_data_format == tt::DataFormat::Int32) ||
-@@ -1192,7 +1199,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
+@@ -1183,6 +1192,12 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
+                             // accumulation regardless of the (possibly narrow, e.g. uint8) output format.
+                             operation_attributes.is_quant_op;
+ 
++    // The generic fp32-dest comparison path requires UnpackToDestFp32, which does not support Float16 inputs.
++    TT_FATAL(
++        !is_fp16_comparison || !fp32_dest_acc_en,
++        "FP16 comparisons do not support 32-bit output dtype {}",
++        c_dtype);
++
+     uint32_t src0_cb_index = tt::CBIndex::c_0;
+     uint32_t src1_cb_index = tt::CBIndex::c_1;
+     uint32_t src0interim_cb_index = tt::CBIndex::c_3;
+@@ -1192,7 +1207,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
  
      std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
  
