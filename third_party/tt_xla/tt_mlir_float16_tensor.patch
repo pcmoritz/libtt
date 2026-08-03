@@ -113,3 +113,25 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp b/lib/Dialect/
 +      return false;
 +    }
      return !isOnDeviceLayoutChangeSupportedForDataType(input.getDataType()) &&
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -7178,2 +7178,13 @@ public:
+     ArrayRef<int64_t> updateShape = updateType.getShape();
++    bool usesFloat32Transport = inputType.getElementType().isF16();
++    if (usesFloat32Transport) {
++      Type float32 = rewriter.getF32Type();
++      inputType = inputType.clone(float32);
++      updateType = updateType.clone(float32);
++      inputTensor = rewriter.create<ttir::TypecastOp>(
++          srcOp.getLoc(), inputType, inputTensor);
++      updateTensor = rewriter.create<ttir::TypecastOp>(
++          srcOp.getLoc(), updateType, updateTensor);
++    }
+     if (subtractReduction) {
+@@ -7230,1 +7241,5 @@ public:
++      if (usesFloat32Transport) {
++        reshapedResult = rewriter.create<ttir::TypecastOp>(
++            srcOp.getLoc(), outputType, reshapedResult);
++      }
+       rewriter.replaceOp(srcOp, reshapedResult);

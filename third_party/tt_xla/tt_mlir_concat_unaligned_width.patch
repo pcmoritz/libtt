@@ -24,7 +24,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttml
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -434,2 +434,36 @@ TTNNOperandsWorkaroundsFactory::createReshapeOpOperandsWorkarounds(
+@@ -434,2 +434,42 @@ TTNNOperandsWorkaroundsFactory::createReshapeOpOperandsWorkarounds(
  }
 +
 +TTNNOperandsWorkarounds
@@ -46,13 +46,19 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 +    }
 +  }
 +
-+  if (!hasPartialTile) {
++  bool isFloat16 = inputType.getElementType().isF16();
++  if (!hasPartialTile && !isFloat16) {
 +    return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds(
 +        inputs.size(), /*outputSize=*/1);
 +  }
 +
 +  TTNNOperandWorkarounds workaround;
-+  workaround.tensorLayoutWorkaround = Layout::RowMajor;
++  if (hasPartialTile) {
++    workaround.tensorLayoutWorkaround = Layout::RowMajor;
++  }
++  if (isFloat16) {
++    workaround.tensorDataTypeWorkaround = ttcore::DataType::Float32;
++  }
 +  auto workarounds = TTNNOperandsWorkarounds::
 +      createEmptyTTNNOperandsWorkarounds();
 +  for (size_t i = 0; i < inputs.size(); ++i) {
