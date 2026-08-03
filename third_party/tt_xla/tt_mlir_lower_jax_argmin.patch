@@ -98,7 +98,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
          false /* keep_dim */, dimArg);
  
      srcOp->getResults().back().replaceAllUsesWith(newOp->getResults().front());
-@@ -384,6 +404,58 @@
+@@ -384,6 +404,53 @@
      return success();
    }
  
@@ -113,7 +113,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    if (mlir::isa<FloatType>(elementType)) {
 +      reversedInput =
 +          rewriter.create<ttir::NegOp>(srcOp->getLoc(), inputType, input);
-+    } else if (auto integerType = mlir::dyn_cast<IntegerType>(elementType)) {
++    } else {
++      auto integerType = mlir::cast<IntegerType>(elementType);
 +      if (integerType.getWidth() == 1) {
 +        reversedInput = rewriter.create<ttir::LogicalNotOp>(
 +            srcOp->getLoc(), inputType, input);
@@ -121,12 +122,6 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        reversedInput = rewriter.create<ttir::BitwiseNotOp>(
 +            srcOp->getLoc(), inputType, input);
 +      }
-+    } else {
-+      return failure();
-+    }
-+
-+    if (srcOp.getDimensions().size() != 1) {
-+      return failure();
 +    }
 +    int64_t dimension = srcOp.getDimensions().front();
 +    int64_t rank = inputType.getRank();
@@ -157,17 +152,26 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // This function verify all the required conditions to convert stablehlo
    // reduce op to TTIR argmax op
    // 1. Two inputs values ot the op.
-@@ -420,6 +492,36 @@
+@@ -420,6 +487,45 @@
      return true;
    }
  
 +  bool isArgMin(mlir::stablehlo::ReduceOp &srcOp,
 +                mlir::stablehlo::ReduceOp::Adaptor &adaptor,
 +                ConversionPatternRewriter &rewriter) const {
++    if (srcOp.getDimensions().size() != 1) {
++      return false;
++    }
++
 +    auto inputType = mlir::cast<RankedTensorType>(
-+        srcOp.getInputs().front().getType());
++        adaptor.getInputs().front().getType());
++    mlir::Type elementType = inputType.getElementType();
++    if (!mlir::isa<FloatType>(elementType) &&
++        !mlir::isa<IntegerType>(elementType)) {
++      return false;
++    }
++
 +    bool hasUnitReductionDimension =
-+        srcOp.getDimensions().size() == 1 &&
 +        inputType.getDimSize(srcOp.getDimensions().front()) == 1;
 +
 +    if (!hasUnitReductionDimension &&
@@ -194,7 +198,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Validate the inputs.
    bool hasValidArgMaxInputs(mlir::OperandRange inputs) const {
      if (inputs.size() != 2) {
-@@ -478,6 +580,22 @@
+@@ -478,6 +584,22 @@
      return true;
    }
  
@@ -217,7 +221,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Validate reducer body.
    bool hasValidArgMaxReducerBody(mlir::Region &body) const {
      auto &blocks = body.getBlocks();
-@@ -496,13 +614,29 @@
+@@ -496,13 +618,29 @@
      if (verifyTorchOpArgMaxPattern(firstOp)) {
        return true;
      }
@@ -248,7 +252,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Pattern match the ops for tt-torch ArgMax op.
    // The pattern is as follows:
    //  stablehlo.compare (GE)
-@@ -580,14 +714,15 @@
+@@ -580,14 +718,15 @@
    // stablehlo.select / stablehlo.maximum
    // stablehlo.select
    // stablehlo.return
