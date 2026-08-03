@@ -328,7 +328,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_embedding_float32.patch",
         "//third_party/tt_xla:tt_mlir_mixed_advanced_gather.patch",
         "//third_party/tt_xla:tt_mlir_scatter_subtract.patch",
-        "//third_party/tt_xla:tt_mlir_scatter_apply.patch",
         "//third_party/tt_xla:tt_mlir_preserve_narrowing_typecasts.patch",
         "//third_party/tt_xla:tt_mlir_gelu_precision.patch",
         "//third_party/tt_xla:tt_mlir_convert_normalized_float_constants.patch",
