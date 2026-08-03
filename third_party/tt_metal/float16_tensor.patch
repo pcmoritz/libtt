@@ -241,18 +241,17 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
 diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
-@@ -52,7 +52,8 @@ ProgramDescriptor RepeatProgramFactoryLastDim::create_descriptor(
+@@ -7 +7,2 @@
+ #include <cstdint>
++#include <numeric>
+@@ -52,7 +53,3 @@ ProgramDescriptor RepeatProgramFactoryLastDim::create_descriptor(
      const uint32_t responsibility = ((number_of_pages - 1) / num_cores_total) + 1;
 -    const uint32_t cb_size_bytes = READ_ALIGNMENT * 2 + (source_page_size_bytes & 0xF) == 0 ? source_page_size_bytes
 -                                   : (source_page_size_bytes & 0x7) == 0                    ? source_page_size_bytes * 2
 -                                   : (source_page_size_bytes & 0x3) == 0                    ? source_page_size_bytes * 4
-+    const uint32_t cb_size_bytes =
-+        READ_ALIGNMENT * 2 + ((source_page_size_bytes & 0xF) == 0 ? source_page_size_bytes
-+                              : (source_page_size_bytes & 0x7) == 0 ? source_page_size_bytes * 2
-+                              : (source_page_size_bytes & 0x3) == 0 ? source_page_size_bytes * 4
-                                    : (source_page_size_bytes & 0x1) == 0                    ? source_page_size_bytes * 8
+-                                   : (source_page_size_bytes & 0x1) == 0                    ? source_page_size_bytes * 8
 -                                                                         : source_page_size_bytes * 16;
-+                                                                                           : source_page_size_bytes * 16);
++    const uint32_t cb_size_bytes = READ_ALIGNMENT * 2 + std::lcm(source_page_size_bytes, READ_ALIGNMENT);
      constexpr uint32_t src0_cb_index = 0;
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
