@@ -1,0 +1,46 @@
+diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation/inc/api/buffer_instance.h
+--- a/pjrt_implementation/inc/api/buffer_instance.h
++++ b/pjrt_implementation/inc/api/buffer_instance.h
+@@ -322,6 +322,9 @@ PJRT_Error *onBufferDevice(PJRT_Buffer_Device_Args *args);
+ // Implements PJRT_Buffer_Memory API function.
+ PJRT_Error *onBufferMemory(PJRT_Buffer_Memory_Args *args);
+ 
++// Implements PJRT_Buffer_UnsafePointer API function.
++PJRT_Error *onBufferUnsafePointer(PJRT_Buffer_UnsafePointer_Args *args);
++
+ // Implements PJRT_Buffer_ReadyEvent API function.
+ PJRT_Error *onBufferReadyEvent(PJRT_Buffer_ReadyEvent_Args *args);
+ 
+diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
+--- a/pjrt_implementation/src/api/buffer_instance.cc
++++ b/pjrt_implementation/src/api/buffer_instance.cc
+@@ -113,6 +113,7 @@ void BufferInstance::bindApi(PJRT_Api *api) {
+   api->PJRT_Buffer_IsOnCpu = internal::onBufferIsOnCpu;
+   api->PJRT_Buffer_Device = internal::onBufferDevice;
+   api->PJRT_Buffer_ReadyEvent = internal::onBufferReadyEvent;
++  api->PJRT_Buffer_UnsafePointer = internal::onBufferUnsafePointer;
+   api->PJRT_Buffer_Memory = internal::onBufferMemory;
+ }
+ 
+@@ -729,6 +730,21 @@ PJRT_Error *onBufferDevice(PJRT_Buffer_Device_Args *args) {
+   return nullptr;
+ }
+ 
++PJRT_Error *onBufferUnsafePointer(PJRT_Buffer_UnsafePointer_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG, "BufferInstance::PJRT_Buffer_UnsafePointer");
++
++  BufferInstance *buffer = BufferInstance::unwrap(args->buffer);
++  const PjrtTensor *tensor = buffer->getPjrtTensor().get();
++  if (tensor == nullptr || buffer->isDataDeleted()) {
++    return *ErrorInstance::makeError(tt_pjrt_status::kInvalidArgument)
++                .release();
++  }
++
++  args->buffer_pointer = reinterpret_cast<uintptr_t>(tensor);
++  return nullptr;
++}
++
+ PJRT_Error *onBufferMemory(PJRT_Buffer_Memory_Args *args) {
+   ZoneScoped;
+   DLOG_F(LOG_DEBUG, "BufferInstance::PJRT_Buffer_Memory");

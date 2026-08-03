@@ -31,7 +31,9 @@ def main() -> int:
 
     os.environ.pop("TT_METAL_RUNTIME_ROOT", None)
     os.environ["PJRT_NAMES_AND_LIBRARY_PATHS"] = f"tt:{libtt}"
-    os.environ["JAX_PLATFORMS"] = "tt"
+    # Keep TT as the default while making CPU available to upstream tests that
+    # explicitly exercise default-device and cross-backend behavior.
+    os.environ["JAX_PLATFORMS"] = "tt,cpu"
     os.environ["JAX_USE_SHARDY_PARTITIONER"] = "false"
     os.environ.setdefault(
         "JAX_COMPILATION_CACHE_DIR",
