@@ -1,0 +1,18 @@
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp b/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+@@ -116,10 +116,12 @@
+     const auto& input = tensor_args.input;
+     const auto& ops_chain = operation_attributes.op_chain;
+     TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
++    const bool is_fp16_neg = input.dtype() == DataType::FLOAT16 && output.dtype() == DataType::FLOAT16 &&
++                             ops_chain.size() == 1 && ops_chain[0].type() == unary::UnaryOpType::NEG;
+ 
+     const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en ||
+-                                  input.dtype() == DataType::FLOAT16 ||
+-                                  output.dtype() == DataType::FLOAT16;
++                                  (!is_fp16_neg &&
++                                   (input.dtype() == DataType::FLOAT16 || output.dtype() == DataType::FLOAT16));
+     uint32_t packed_scalar1 = 0;
+     uint32_t packed_scalar2 = 0;
+ 

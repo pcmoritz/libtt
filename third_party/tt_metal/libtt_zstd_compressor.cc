@@ -6,7 +6,7 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-  int level = 19;
+  int level = 9;
   if (argc > 1) {
     level = std::atoi(argv[1]);
   }
