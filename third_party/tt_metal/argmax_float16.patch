@@ -1,0 +1,83 @@
+diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp b/ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp
+@@ -17,6 +17,9 @@
+     if (tensor_args.input.layout() != Layout::ROW_MAJOR) {
+         return false;
+     }
++    if (tensor_args.input.dtype() == DataType::FLOAT16) {
++        return false;
++    }
+     if (!args.dim.has_value()) {
+         return true;
+     }
+@@ -93,10 +96,11 @@
+ 
+     if (input_layout == Layout::ROW_MAJOR) {
+         TT_FATAL(
+-            input_tensor_a.dtype() == DataType::BFLOAT16 || input_tensor_a.dtype() == DataType::FLOAT32 ||
+-                input_tensor_a.dtype() == DataType::INT32 || input_tensor_a.dtype() == DataType::UINT32 ||
+-                input_tensor_a.dtype() == DataType::UINT16,
+-            "Only BFLOAT16, FLOAT32, INT32, UINT32, and UINT16 are supported for inputs with ROW_MAJOR layout, got {}",
++            input_tensor_a.dtype() == DataType::BFLOAT16 || input_tensor_a.dtype() == DataType::FLOAT16 ||
++                input_tensor_a.dtype() == DataType::FLOAT32 || input_tensor_a.dtype() == DataType::INT32 ||
++                input_tensor_a.dtype() == DataType::UINT32 || input_tensor_a.dtype() == DataType::UINT16,
++            "Only BFLOAT16, FLOAT16, FLOAT32, INT32, UINT32, and UINT16 are supported for inputs with ROW_MAJOR "
++            "layout, got {}",
+             input_tensor_a.dtype());
+     } else {
+         TT_FATAL(
+diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp b/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp
+--- ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp
++++ ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp
+@@ -15,6 +15,9 @@
+ inline constexpr uint16_t MIN_UINT16 = 0x0000;      // Representation of minimum uint16 value
+ inline constexpr uint16_t MAX_UINT16 = 0xFFFF;      // Representation of maximum uint16 value
+ 
++inline constexpr uint16_t NEG_INF_FLOAT16 = 0xFC00;
++inline constexpr uint16_t FLOAT16_SIGN_MASK = 0x8000;
++
+ /**
+  * @brief Returns a typed volatile L1 memory pointer based on the specified data format.
+  *
+@@ -39,6 +42,8 @@
+ auto get_tt_l1_ptr_based_on_data_format(const uint32_t addr) {
+     if constexpr (data_format == DataFormat::Float16_b) {
+         return reinterpret_cast<volatile tt_l1_ptr uint16_t*>(addr);
++    } else if constexpr (data_format == DataFormat::Float16) {
++        return reinterpret_cast<volatile tt_l1_ptr uint16_t*>(addr);
+     } else if constexpr (data_format == DataFormat::UInt16) {
+         return reinterpret_cast<volatile tt_l1_ptr uint16_t*>(addr);
+     } else if constexpr (data_format == DataFormat::Float32) {
+@@ -79,6 +84,8 @@
+     // Check for supported datatypes
+     if constexpr (data_format == DataFormat::Float16_b) {
+         return uint16_t{NEG_INF_BFLOAT16};
++    } else if constexpr (data_format == DataFormat::Float16) {
++        return uint16_t{NEG_INF_FLOAT16};
+     } else if constexpr (data_format == DataFormat::UInt16) {
+         return uint16_t{MIN_UINT16};
+     } else if constexpr (data_format == DataFormat::Float32) {
+@@ -94,6 +101,13 @@
+     }
+ }
+ 
++inline bool float16_greater(uint16_t a, uint16_t b) {
++    if ((a ^ b) & FLOAT16_SIGN_MASK) {
++        return (a & FLOAT16_SIGN_MASK) == 0;
++    }
++    return (a & FLOAT16_SIGN_MASK) ? a < b : a > b;
++}
++
+ /**
+  * @brief Helper function to calculate the index for argmax operations.
+  *
+@@ -178,6 +192,8 @@
+ 
+     if constexpr (data_format == DataFormat::Float16_b) {
+         update_max_if_greater(max_val, max_idx, val, index, bfloat16_greater);
++    } else if constexpr (data_format == DataFormat::Float16) {
++        update_max_if_greater(max_val, max_idx, val, index, float16_greater);
+     } else if constexpr (data_format == DataFormat::Float32) {
+         update_max_if_greater(max_val, max_idx, val, index, float32_greater);
+     } else if constexpr (data_format == DataFormat::UInt16) {

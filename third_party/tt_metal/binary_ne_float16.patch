@@ -1,0 +1,309 @@
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+@@ -499,5 +499,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+                     fmt::format("lt_int_tile<DataFormat::{}>", *int_data_format)};
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"lt_binary_tile_init();", "lt_binary_tile_float16"};
++            }
+             return {"lt_binary_tile_init();", "lt_binary_tile"};
+         case GT:
+             if (int_data_format) {
+@@ -506,5 +509,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+                     fmt::format("gt_int_tile<DataFormat::{}>", *int_data_format)};
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"gt_binary_tile_init();", "gt_binary_tile_float16"};
++            }
+             return {"gt_binary_tile_init();", "gt_binary_tile"};
+         case GE:
+             if (int_data_format) {
+@@ -513,5 +519,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+                     fmt::format("ge_int_tile<DataFormat::{}>", *int_data_format)};
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"ge_binary_tile_init();", "ge_binary_tile_float16"};
++            }
+             return {"ge_binary_tile_init();", "ge_binary_tile"};
+         case LE:
+             if (int_data_format) {
+@@ -520,5 +529,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+                     fmt::format("le_int_tile<DataFormat::{}>", *int_data_format)};
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"le_binary_tile_init();", "le_binary_tile_float16"};
++            }
+             return {"le_binary_tile_init();", "le_binary_tile"};
+         case EQ:
+             if (int_data_format) {
+@@ -527,5 +539,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+                     fmt::format("eq_int_tile<DataFormat::{}>", *int_data_format)};
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"eq_binary_tile_init();", "eq_binary_tile_float16"};
++            }
+             return {"eq_binary_tile_init();", "eq_binary_tile"};
+         case NE:
+             if (int_data_format) {
+@@ -534,5 +549,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+                     fmt::format("ne_int_tile<DataFormat::{}>", *int_data_format)};
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"ne_binary_tile_init();", "ne_binary_tile_float16"};
++            }
+             return {"ne_binary_tile_init();", "ne_binary_tile"};
+         case WHERE: {
+             const char* data_format = (dtype == DataType::INT32)     ? "Int32"
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+@@ -862,5 +862,13 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
+                                                                     : DataType::BFLOAT16;
+     const auto c_dtype = c.dtype();
++    const bool is_fp16_comparison =
++        a_dtype == DataType::FLOAT16 && b_dtype == DataType::FLOAT16 &&
++        (operation_attributes.binary_op_type == BinaryOpType::EQ ||
++         operation_attributes.binary_op_type == BinaryOpType::NE ||
++         operation_attributes.binary_op_type == BinaryOpType::LT ||
++         operation_attributes.binary_op_type == BinaryOpType::GT ||
++         operation_attributes.binary_op_type == BinaryOpType::LE ||
++         operation_attributes.binary_op_type == BinaryOpType::GE);
+     const auto a_data_format = datatype_to_dataformat_converter(a_dtype);
+     const auto b_data_format = datatype_to_dataformat_converter(b_dtype);
+     const auto c_data_format = datatype_to_dataformat_converter(c_dtype);
+@@ -1173,8 +1180,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
+     // loading fp32 tiles into a DST configured for bf16 produces tile-aligned corruption
+     // for broadcast multiply (issue 43196).
+     bool fp32_dest_acc_en = c_data_format == tt::DataFormat::UInt32 || c_data_format == tt::DataFormat::Int32 ||
+-                            a_data_format == tt::DataFormat::Float16 ||
+-                            b_data_format == tt::DataFormat::Float16 || c_data_format == tt::DataFormat::Float16 ||
++                            (!is_fp16_comparison &&
++                             (a_data_format == tt::DataFormat::Float16 || b_data_format == tt::DataFormat::Float16 ||
++                              c_data_format == tt::DataFormat::Float16)) ||
+                             c_data_format == tt::DataFormat::Float32 || a_data_format == tt::DataFormat::Float32 ||
+                             b_data_format == tt::DataFormat::Float32 ||
+                             (a_data_format == tt::DataFormat::Int32 && b_data_format == tt::DataFormat::Int32) ||
+@@ -1192,7 +1199,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
+ 
+     std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
+ 
+-    if (is_sfpu_op) {
++    if (is_sfpu_op && !is_fp16_comparison) {
+         if (op_type != BinaryOpType::POWER) {
+             unpack_to_dest_mode[src0_cb_index] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
+             unpack_to_dest_mode[src1_cb_index] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+@@ -42,4 +42,6 @@ bool is_binary_sfpu_op(BinaryOpType val, DataType a, DataType b, bool fast_and_ap
+         case GE:
+-        case LE: return a == b && (a == FLOAT32 || a == BFLOAT16 || a == INT32 || a == UINT16 || a == UINT32);
++        case LE:
++            return a == b &&
++                   (a == FLOAT32 || a == BFLOAT16 || a == FLOAT16 || a == INT32 || a == UINT16 || a == UINT32);
+         case LCM:
+         case GCD: return (a == INT32 && b == INT32);
+diff --git a/tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h b/tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h
+--- tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h
++++ tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h
+@@ -226,5 +226,77 @@ ALWI void ge_binary_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
+         VectorMode::RC)));
+ }
++
++ALWI void eq_binary_tile_float16(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        calculate_binary_comp_fp16,
++        (APPROX, 8 /* ITERATIONS */, SfpuType::eq),
++        idst0,
++        idst1,
++        odst,
++        VectorMode::RC)));
++}
++
++ALWI void ne_binary_tile_float16(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        calculate_binary_comp_fp16,
++        (APPROX, 8 /* ITERATIONS */, SfpuType::ne),
++        idst0,
++        idst1,
++        odst,
++        VectorMode::RC)));
++}
++
++ALWI void lt_binary_tile_float16(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        calculate_binary_comp_fp16,
++        (APPROX, 8 /* ITERATIONS */, SfpuType::lt),
++        idst0,
++        idst1,
++        odst,
++        VectorMode::RC)));
++}
++
++ALWI void gt_binary_tile_float16(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        calculate_binary_comp_fp16,
++        (APPROX, 8 /* ITERATIONS */, SfpuType::gt),
++        idst0,
++        idst1,
++        odst,
++        VectorMode::RC)));
++}
++
++ALWI void le_binary_tile_float16(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        calculate_binary_comp_fp16,
++        (APPROX, 8 /* ITERATIONS */, SfpuType::le),
++        idst0,
++        idst1,
++        odst,
++        VectorMode::RC)));
++}
++
++ALWI void ge_binary_tile_float16(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        calculate_binary_comp_fp16,
++        (APPROX, 8 /* ITERATIONS */, SfpuType::ge),
++        idst0,
++        idst1,
++        odst,
++        VectorMode::RC)));
++}
+ #endif
+ 
+ /**
+diff --git a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h b/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
+@@ -187,6 +187,57 @@ inline void calculate_binary_comp_fp32(const uint dst_index_in0, const uint dst_i
+     }
+ }
+ 
++// Native Float16 comparisons. SFPI lowers the vector comparisons to SFPU
++// instructions. Magnitude and zero predicates restore NaN and signed-zero
++// semantics around the native comparison without widening
++// either input to Float32.
++template <bool APPROXIMATION_MODE, int ITERATIONS, SfpuType RELATIONAL_OP>
++inline void calculate_binary_comp_fp16(
++    const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
++    static_assert(is_fp32_compare_v<RELATIONAL_OP>, "Supported operation types: eq, ne, lt, gt, le, ge");
++
++    constexpr uint dst_tile_size_sfpi = 32;
++    const sfpi::vFloat infinity = sfpi::sFloat16b(0x7f80);
++
++#pragma GCC unroll 8
++    for (int d = 0; d < ITERATIONS; d++) {
++        const sfpi::vFloat a = sfpi::dst_reg[dst_index_in0 * dst_tile_size_sfpi];
++        const sfpi::vFloat b = sfpi::dst_reg[dst_index_in1 * dst_tile_size_sfpi];
++        const sfpi::vFloat abs_sum = sfpi::abs(a) + sfpi::abs(b);
++
++        sfpi::vFloat result = RELATIONAL_OP == SfpuType::ne ? 1.0f : 0.0f;
++        if constexpr (RELATIONAL_OP == SfpuType::eq || RELATIONAL_OP == SfpuType::ne) {
++            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a == b))) {
++                result = RELATIONAL_OP == SfpuType::eq ? 1.0f : 0.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::lt) {
++            v_if((abs_sum <= infinity) && (abs_sum != 0.0f) && (a < b)) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::gt) {
++            v_if((abs_sum <= infinity) && (abs_sum != 0.0f) && (a > b)) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::le) {
++            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a <= b))) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::ge) {
++            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a >= b))) {
++                result = 1.0f;
++            }
++            v_endif;
++        }
++
++        sfpi::dst_reg[dst_index_out * dst_tile_size_sfpi] = result;
++        sfpi::dst_reg++;
++    }
++}
++
+ // Int32 relational comparisons. Normalize to LT(a, b) or GE(a, b):
+ //   lt(a,b) = LT(a,b)           gt(a,b) = LT(b,a)
+ //   ge(a,b) = GE(a,b)           le(a,b) = GE(b,a)
+diff --git a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h b/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
+--- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
++++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
+@@ -187,6 +187,57 @@ inline void calculate_binary_comp_fp32(const uint dst_index_in0, const uint dst_i
+     }
+ }
+ 
++// Native Float16 comparisons. SFPI lowers the vector comparisons to SFPU
++// instructions. Magnitude and zero predicates restore NaN and signed-zero
++// semantics around the native comparison without widening
++// either input to Float32.
++template <bool APPROXIMATION_MODE, int ITERATIONS, SfpuType RELATIONAL_OP>
++inline void calculate_binary_comp_fp16(
++    const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
++    static_assert(is_fp32_compare_v<RELATIONAL_OP>, "Supported operation types: eq, ne, lt, gt, le, ge");
++
++    constexpr uint dst_tile_size_sfpi = 32;
++    const sfpi::vFloat infinity = sfpi::sFloat16b(0x7f80);
++
++#pragma GCC unroll 8
++    for (int d = 0; d < ITERATIONS; d++) {
++        const sfpi::vFloat a = sfpi::dst_reg[dst_index_in0 * dst_tile_size_sfpi];
++        const sfpi::vFloat b = sfpi::dst_reg[dst_index_in1 * dst_tile_size_sfpi];
++        const sfpi::vFloat abs_sum = sfpi::abs(a) + sfpi::abs(b);
++
++        sfpi::vFloat result = RELATIONAL_OP == SfpuType::ne ? 1.0f : 0.0f;
++        if constexpr (RELATIONAL_OP == SfpuType::eq || RELATIONAL_OP == SfpuType::ne) {
++            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a == b))) {
++                result = RELATIONAL_OP == SfpuType::eq ? 1.0f : 0.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::lt) {
++            v_if((abs_sum <= infinity) && (abs_sum != 0.0f) && (a < b)) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::gt) {
++            v_if((abs_sum <= infinity) && (abs_sum != 0.0f) && (a > b)) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::le) {
++            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a <= b))) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::ge) {
++            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a >= b))) {
++                result = 1.0f;
++            }
++            v_endif;
++        }
++
++        sfpi::dst_reg[dst_index_out * dst_tile_size_sfpi] = result;
++        sfpi::dst_reg++;
++    }
++}
++
+ // Int32 relational comparisons. Normalize to LT(a, b) or GE(a, b):
+ //   lt(a,b) = LT(a,b)           gt(a,b) = LT(b,a)
+ //   ge(a,b) = GE(a,b)           le(a,b) = GE(b,a)
