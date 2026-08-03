@@ -1,0 +1,164 @@
+diff --git a/pjrt_implementation/inc/api/error_instance.h b/pjrt_implementation/inc/api/error_instance.h
+--- a/pjrt_implementation/inc/api/error_instance.h
++++ b/pjrt_implementation/inc/api/error_instance.h
+@@ -31,6 +31,10 @@ public:
+   // Creates new error instance.
+   static std::unique_ptr<ErrorInstance> makeError(tt_pjrt_status status);
+ 
++  // Creates a new error instance with a caller-provided diagnostic.
++  static std::unique_ptr<ErrorInstance> makeError(tt_pjrt_status status,
++                                                  std::string message);
++
+   // Binds PJRT API functions implementation related to PJRT_Error structure.
+   static void bindApi(PJRT_Api *api);
+ 
+@@ -53,6 +57,7 @@ private:
+ private:
+   // Constructs error instance from the given status.
+   ErrorInstance(tt_pjrt_status status);
++  ErrorInstance(tt_pjrt_status status, std::string message);
+ 
+   // Error status.
+   const tt_pjrt_status m_status;
+diff --git a/pjrt_implementation/src/api/error_instance.cc b/pjrt_implementation/src/api/error_instance.cc
+--- a/pjrt_implementation/src/api/error_instance.cc
++++ b/pjrt_implementation/src/api/error_instance.cc
+@@ -25,6 +25,20 @@ std::unique_ptr<ErrorInstance> ErrorInstance::makeError(tt_pjrt_status status) {
+   return std::make_unique<make_unique_enabler>(status);
+ }
+ 
++std::unique_ptr<ErrorInstance>
++ErrorInstance::makeError(tt_pjrt_status status, std::string message) {
++  if (tt_pjrt_status_is_ok(status)) {
++    return nullptr;
++  }
++
++  struct make_unique_enabler : public ErrorInstance {
++    make_unique_enabler(tt_pjrt_status status, std::string message)
++        : ErrorInstance(status, std::move(message)) {}
++  };
++
++  return std::make_unique<make_unique_enabler>(status, std::move(message));
++}
++
+ ErrorInstance::ErrorInstance(tt_pjrt_status status)
+     : m_status(status),
+       m_message(
+@@ -32,6 +46,9 @@ ErrorInstance::ErrorInstance(tt_pjrt_status status)
+               ? "OK"
+               : ("Error code: " + std::to_string(static_cast<int>(status)))) {}
+ 
++ErrorInstance::ErrorInstance(tt_pjrt_status status, std::string message)
++    : m_status(status), m_message(std::move(message)) {}
++
+ void ErrorInstance::bindApi(PJRT_Api *api) {
+   api->PJRT_Error_Destroy = internal::onErrorDestroy;
+   api->PJRT_Error_Message = internal::onErrorMessage;
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -17,6 +17,7 @@
+ #include <map>
+ #include <mutex>
+ #include <optional>
++#include <unordered_set>
+ 
+ // system includes
+ #include <unistd.h>
+@@ -832,6 +833,86 @@ PJRT_Error *
+   return nullptr;
+ }
+ 
++static std::unique_ptr<ErrorInstance> validateCompileOptions(
++    const std::unordered_map<std::string, std::string> &compile_options) {
++  // TT-specific options consumed by CompileOptions::parse().
++  static const std::unordered_set<std::string> supported_options = {
++      "optimization_level",
++      "experimental_weight_dtype",
++      "experimental-kv-cache-dtype",
++      "math_fidelity",
++      "fp32_dest_acc_en",
++      "experimental_enable_fusing_conv2d_with_multiply_pattern",
++      "backend",
++      "enable_trace",
++      "export_tensors",
++      "enable_const_eval",
++      "enable_const_eval_on_cpu",
++      "enable_const_eval_inputs_to_system_memory",
++      "experimental_enable_permute_matmul_fusion",
++      "codegen_try_recover_structure",
++      "codegen_split_files",
++      "experimental-enable-dram-space-saving-optimization",
++      "enable_create_d2m_subgraphs",
++      "ttnn_perf_metrics_enabled",
++      "ttnn_perf_metrics_output_file",
++      "dry_run",
++      "export_path",
++      "export_model_name",
++      // Common XLA/JAX options that are safe for this backend to accept even
++      // though they do not affect TT code generation.
++      "xla_embed_ir_in_executable",
++      "xla_dump_max_hlo_modules",
++      "xla_gpu_auto_spmd_partitioning_memory_budget_ratio",
++      "exec_time_optimization_effort",
++      "memory_fitting_level",
++      "fdo_profile",
++      "xla_gpu_enable_command_buffer",
++      "xla_gpu_enable_latency_hiding_scheduler",
++      "xla_gpu_enable_triton_gemm",
++      "xla_dump_to",
++      "xla_gpu_experimental_dump_fdo_profiles",
++      "xla_gpu_graph_min_graph_size",
++      "xla_allow_excess_precision",
++  };
++
++  static const std::unordered_set<std::string> bool_options = {
++      "fp32_dest_acc_en",
++      "experimental_enable_fusing_conv2d_with_multiply_pattern",
++      "enable_trace",
++      "export_tensors",
++      "enable_const_eval",
++      "enable_const_eval_on_cpu",
++      "enable_const_eval_inputs_to_system_memory",
++      "experimental_enable_permute_matmul_fusion",
++      "codegen_try_recover_structure",
++      "codegen_split_files",
++      "experimental-enable-dram-space-saving-optimization",
++      "enable_create_d2m_subgraphs",
++      "ttnn_perf_metrics_enabled",
++      "dry_run",
++      "xla_embed_ir_in_executable",
++      "xla_allow_excess_precision",
++  };
++
++  for (const auto &[key, value] : compile_options) {
++    if (!supported_options.contains(key)) {
++      return ErrorInstance::makeError(
++          tt_pjrt_status::kInvalidArgument,
++          "No such compile option: '" + key + "'");
++    }
++    if (bool_options.contains(key) && value != "true" && value != "false" &&
++        value != "1" && value != "0" && value != "yes" && value != "no" &&
++        value != "on" && value != "off") {
++      return ErrorInstance::makeError(
++          tt_pjrt_status::kInvalidArgument,
++          "'" + value + "' is not a valid bool value.");
++    }
++  }
++  return nullptr;
++}
++
+ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+   ZoneScoped;
+   DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Client_Compile");
+@@ -848,6 +929,10 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+     return *ErrorInstance::makeError(compile_options_status).release();
+   }
+ 
++  if (auto error = validateCompileOptions(compile_options_map)) {
++    return *error.release();
++  }
++
+   std::string_view program_format(args->program->format,
+                                   args->program->format_size);
+   if (program_format != module_builder::c_mlir_format_name) {
