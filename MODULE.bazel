@@ -303,7 +303,6 @@ git_repository(
         "//third_party/tt_xla:tt_xla_pjrt_abort_guards.patch",
         "//third_party/tt_xla:tt_xla_disable_erase_inverse_ops.patch",
         "//third_party/tt_xla:tt_xla_enable_bf8_activation_dtype_lowering.patch",
-        "//third_party/tt_xla:tt_xla_narrow_integer_buffers.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -336,7 +335,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_signed_integer_alias.patch",
         "//third_party/tt_xla:tt_mlir_float16_tensor.patch",
         "//third_party/tt_xla:tt_mlir_concat_unaligned_width.patch",
-        "//third_party/tt_xla:tt_mlir_float16_bitcast.patch",
         "//third_party/tt_xla:tt_mlir_remainder_semantics.patch",
         "//third_party/tt_xla:tt_mlir_reduce_precision.patch",
         "//third_party/tt_xla:tt_mlir_remove_bitwise_not_workaround.patch",
