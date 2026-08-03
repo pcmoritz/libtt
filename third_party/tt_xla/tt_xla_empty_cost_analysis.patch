@@ -1,0 +1,43 @@
+diff --git a/pjrt_implementation/inc/api/executable_instance.h b/pjrt_implementation/inc/api/executable_instance.h
+--- a/pjrt_implementation/inc/api/executable_instance.h
++++ b/pjrt_implementation/inc/api/executable_instance.h
+@@ -113,5 +113,9 @@ PJRT_Error *onExecutableSizeOfGeneratedCodeInBytes(
+ PJRT_Error *onExecutableFingerprint(PJRT_Executable_Fingerprint_Args *args);
+ 
++// Implements PJRT_Executable_GetCostAnalysis API function.
++PJRT_Error *
++onExecutableGetCostAnalysis(PJRT_Executable_GetCostAnalysis_Args *args);
++
+ } // namespace internal
+ 
+ } // namespace tt::pjrt
+diff --git a/pjrt_implementation/src/api/executable_instance.cc b/pjrt_implementation/src/api/executable_instance.cc
+--- a/pjrt_implementation/src/api/executable_instance.cc
++++ b/pjrt_implementation/src/api/executable_instance.cc
+@@ -49,5 +49,7 @@ void ExecutableInstance::bindApi(PJRT_Api *api) {
+       internal::onExecutableSizeOfGeneratedCodeInBytes;
+   api->PJRT_Executable_Fingerprint = internal::onExecutableFingerprint;
++  api->PJRT_Executable_GetCostAnalysis =
++      internal::onExecutableGetCostAnalysis;
+   api->PJRT_Executable_OutputElementTypes =
+       internal::onExecutableOutputElementTypes;
+   api->PJRT_Executable_OutputDimensions =
+@@ -180,6 +182,18 @@ PJRT_Error *onExecutableFingerprint(PJRT_Executable_Fingerprint_Args *args) {
+   return nullptr;
+ }
+ 
++PJRT_Error *
++onExecutableGetCostAnalysis(PJRT_Executable_GetCostAnalysis_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG, "ExecutableInstance::PJRT_Executable_GetCostAnalysis");
++
++  // Cost estimates are optional. Return a valid empty result until the TT
++  // compiler exposes platform-specific estimates.
++  args->num_properties = 0;
++  args->properties = nullptr;
++  return nullptr;
++}
++
+ PJRT_Error *
+ onExecutableOutputElementTypes(PJRT_Executable_OutputElementTypes_Args *args) {
+   ZoneScoped;
