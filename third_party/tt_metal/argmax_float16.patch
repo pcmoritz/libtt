@@ -1,17 +1,7 @@
 diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp b/ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp
-@@ -17,6 +17,9 @@
-     if (tensor_args.input.layout() != Layout::ROW_MAJOR) {
-         return false;
-     }
-+    if (tensor_args.input.dtype() == DataType::FLOAT16) {
-+        return false;
-+    }
-     if (!args.dim.has_value()) {
-         return true;
-     }
-@@ -93,10 +96,11 @@
+@@ -93,10 +93,11 @@
  
      if (input_layout == Layout::ROW_MAJOR) {
          TT_FATAL(
@@ -81,3 +71,44 @@ diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_com
      } else if constexpr (data_format == DataFormat::Float32) {
          update_max_if_greater(max_val, max_idx, val, index, float32_greater);
      } else if constexpr (data_format == DataFormat::UInt16) {
+diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp b/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp
+--- ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp
++++ ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp
+@@ -77,6 +77,13 @@
+                         return bfloat16_greater(a, b);
+                     });
+-
++
++            } else if constexpr (data_format == DataFormat::Float16) {
++                uint16_t val = in_vals[i - red_dim_offset];
++                process_value_comparison<data_format, uint16_t, reduce_all>(
++                    val, max_val, max_idx, i, outer_idx, j, inner_dim_units, red_dim_units, [](uint16_t a, uint16_t b) {
++                        return float16_greater(a, b);
++                    });
++
+             } else if constexpr (data_format == DataFormat::UInt16) {
+                 uint16_t val = in_vals[i - red_dim_offset];
+                 process_value_comparison<data_format, uint16_t, reduce_all>(
+@@ -129,6 +136,7 @@
+  * @tparam num_cores Number of cores that participated in the reduction operation
+  * @tparam data_format Data format of the values being compared. Supported formats:
+  *                     - DataFormat::Float16_b: 16-bit bfloat16 floating point
++ *                     - DataFormat::Float16: 16-bit IEEE 754 floating point
+  *                     - DataFormat::UInt16: 16-bit unsigned integer
+  *                     - DataFormat::Float32: 32-bit IEEE 754 floating point
+  *                     - DataFormat::Int32: 32-bit signed integer
+@@ -170,6 +178,13 @@
+                     return bfloat16_greater(a, b);
+                 });
+-
++
++        } else if constexpr (data_format == DataFormat::Float16) {
++            volatile tt_l1_ptr auto i_red_vals =
++                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(red_val_cb_local_base_addr + i * red_val_size_per_core);
++
++            process_core_data<data_format>(
++                inner_idx, i_red_vals, i_red_idxs, max_val, max_idx, float16_greater);
++
+         } else if constexpr (data_format == DataFormat::UInt16) {
+             volatile tt_l1_ptr auto i_red_vals =
+                 reinterpret_cast<volatile tt_l1_ptr uint16_t*>(red_val_cb_local_base_addr + i * red_val_size_per_core);
