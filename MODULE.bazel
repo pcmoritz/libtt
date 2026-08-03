@@ -235,7 +235,7 @@ http_archive(
         "//third_party/tt_metal:float16_tensor.patch",
         "//third_party/tt_metal:argmax_float16.patch",
         "//third_party/tt_metal:unary_neg_float16.patch",
-        "//third_party/tt_metal:binary_ne_float16.patch",
+        "//third_party/tt_metal:binary_comparison_float16.patch",
         "//third_party/tt_metal:arange_float16.patch",
         "//third_party/tt_metal:concat_unaligned_width.patch",
         "//third_party/tt_metal:binary_ng_output_cb.patch",
