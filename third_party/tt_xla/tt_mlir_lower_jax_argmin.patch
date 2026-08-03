@@ -98,7 +98,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
          false /* keep_dim */, dimArg);
  
      srcOp->getResults().back().replaceAllUsesWith(newOp->getResults().front());
-@@ -384,6 +404,53 @@
+@@ -384,6 +404,55 @@
      return success();
    }
  
@@ -123,6 +123,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +            srcOp->getLoc(), inputType, input);
 +      }
 +    }
++    // TODO: Remove this permutation once tt-metal supports row-major argmax
++    // reductions on non-last dimensions.
 +    int64_t dimension = srcOp.getDimensions().front();
 +    int64_t rank = inputType.getRank();
 +    if (dimension != rank - 1) {
@@ -152,7 +154,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // This function verify all the required conditions to convert stablehlo
    // reduce op to TTIR argmax op
    // 1. Two inputs values ot the op.
-@@ -420,6 +487,45 @@
+@@ -420,6 +489,45 @@
      return true;
    }
  
@@ -198,7 +200,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Validate the inputs.
    bool hasValidArgMaxInputs(mlir::OperandRange inputs) const {
      if (inputs.size() != 2) {
-@@ -478,6 +584,22 @@
+@@ -478,6 +586,22 @@
      return true;
    }
  
@@ -221,7 +223,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Validate reducer body.
    bool hasValidArgMaxReducerBody(mlir::Region &body) const {
      auto &blocks = body.getBlocks();
-@@ -496,13 +618,29 @@
+@@ -496,13 +620,29 @@
      if (verifyTorchOpArgMaxPattern(firstOp)) {
        return true;
      }
@@ -252,7 +254,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Pattern match the ops for tt-torch ArgMax op.
    // The pattern is as follows:
    //  stablehlo.compare (GE)
-@@ -580,14 +718,15 @@
+@@ -580,14 +720,15 @@
    // stablehlo.select / stablehlo.maximum
    // stablehlo.select
    // stablehlo.return
