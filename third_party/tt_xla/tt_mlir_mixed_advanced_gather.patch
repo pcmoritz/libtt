@@ -84,3 +84,66 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    }
  
    // In StableHLO, startIndexMap attribute refers to which dims of input
+@@ -5998,7 +5998,8 @@ public:
+ 
+-    // The indexed dimension must be collapsed (slice size 1).
+-    if (sliceSizes[indexedDim] != 1) {
++    bool windowedGather = sliceSizes[indexedDim] != 1;
++    if (windowedGather &&
++        operandBatchingDims.size() + 1 != operandShape.size()) {
+       return rewriter.notifyMatchFailure(
+-          srcOp, "Slice size for indexed dimension must be 1");
++          srcOp, "Unsupported batched gather window");
+     }
+ 
+@@ -6040,2 +6041,24 @@ public:
++    int64_t gatherDim =
++        windowedGather ? offsetDims.front() : indexedDim;
+     auto operand = adaptor.getOperands()[0];
++    if (windowedGather) {
++      SmallVector<int64_t> permutation(outputType.getRank(), indexedDim);
++      for (auto [operandDim, startDim] :
++           llvm::zip_equal(operandBatchingDims, startIndicesBatchingDims)) {
++        int64_t indicesDim = startDim - (startDim > indexVectorDim);
++        int64_t outputDim = indicesDim + (indicesDim >= gatherDim);
++        permutation[outputDim] = operandDim;
++      }
++      if (!llvm::equal(permutation,
++                       llvm::seq<int64_t>(0, permutation.size()))) {
++        auto operandType = mlir::cast<RankedTensorType>(operand.getType());
++        auto permutedShape = ttmlir::utils::applyPermutation(
++            operandType.getShape(), permutation);
++        operand = rewriter.create<ttir::PermuteOp>(
++            srcOp.getLoc(),
++            RankedTensorType::get(permutedShape, operandType.getElementType(),
++                                  operandType.getEncoding()),
++            operand, permutation);
++      }
++    }
+     auto startIndices = adaptor.getOperands()[1];
+@@ -6097,9 +6120,24 @@ public:
+       }
+     }
+ 
++    if (windowedGather) {
++      auto indicesType = mlir::cast<RankedTensorType>(indices.getType());
++      indices = rewriter.create<ttir::ClampScalarOp>(
++          srcOp.getLoc(), indicesType, indices, rewriter.getI32IntegerAttr(0),
++          rewriter.getI32IntegerAttr(operandShape[indexedDim] -
++                                     sliceSizes[indexedDim]));
++      Value offsets = rewriter.create<ttir::ArangeOp>(
++          srcOp.getLoc(), indicesType, /*start=*/0,
++          /*end=*/sliceSizes[indexedDim], /*step=*/1,
++          /*arange_dimension=*/gatherDim);
++      indices =
++          rewriter.create<ttir::AddOp>(srcOp.getLoc(), indicesType, indices,
++                                       offsets);
++    }
++
+     // Step 3: Create gather_dim with the appropriate dimension.
+     rewriter.replaceOpWithNewOp<ttir::GatherOp>(
+         srcOp, outputType, operand, indices,
+-        rewriter.getI32IntegerAttr(static_cast<int32_t>(indexedDim)));
++        rewriter.getI32IntegerAttr(static_cast<int32_t>(gatherDim)));
+ 
+     return success();
