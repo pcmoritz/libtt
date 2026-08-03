@@ -1,0 +1,106 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
+@@ -30,2 +30,3 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
+     uint32_t single_page_size;
++    uint32_t scratch_offset = 0;
+     const uint32_t common_align_len = std::max(input_tensors[0].buffer()->alignment(), output.buffer()->alignment());
+@@ -34,2 +35,10 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
+         single_page_size = tt::align(output.element_size() * output.padded_shape()[-1], common_align_len);
++        if (dim == output.padded_shape().rank() - 1) {
++            scratch_offset = single_page_size;
++            uint32_t scratch_page_size = 0;
++            for (const Tensor& input : input_tensors) {
++                scratch_page_size = std::max<uint32_t>(scratch_page_size, input.buffer()->page_size());
++            }
++            single_page_size += tt::align(scratch_page_size, common_align_len);
++        }
+     } else {
+@@ -140,2 +149,3 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
+     std::vector<uint32_t> page_size_per_tensor(num_input_tensors);
++    std::vector<uint32_t> copy_size_per_tensor(num_input_tensors);
+ 
+@@ -176,2 +186,5 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
+             page_size_per_tensor[i] = buffer->page_size();
++            copy_size_per_tensor[i] = dim == num_dims - 1
++                                          ? input_tensors[i].padded_shape()[-1] * input_tensors[i].element_size()
++                                          : buffer->page_size();
+             if (dim == num_dims - 1) {
+@@ -200,5 +213,12 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
+     // Data is 32 byte aligned
+     KernelDescriptor::CompileTimeArgs reader_compile_time_args = {src0_cb_index, num_input_tensors};
++    if (rm_layout && dim == num_dims - 1) {
++        reader_compile_time_args.push_back(scratch_offset);
++    }
+     reader_compile_time_args.insert(
+         reader_compile_time_args.end(), page_size_per_tensor.cbegin(), page_size_per_tensor.cend());
++    if (rm_layout && dim == num_dims - 1) {
++        reader_compile_time_args.insert(
++            reader_compile_time_args.end(), copy_size_per_tensor.cbegin(), copy_size_per_tensor.cend());
++    }
+     for (uint32_t i = 0; i < num_input_tensors; ++i) {
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
+@@ -205,3 +205,4 @@ MassagedConcat build_non_aligned_last_dim_concat(
+         auto last_dim = tensors.front().logical_shape().rank() - 1;
+-        if (dim == last_dim) {
++        if (dim == last_dim &&
++            tensors.front().layout() != ttnn::ROW_MAJOR_LAYOUT) {
+             bool res = !dim_aligned(tensors, dim);
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
+@@ -445,10 +445,2 @@ Tensor ConcatOperation::invoke(
+     }
+-    if (input_tensors[0].layout() == Layout::ROW_MAJOR && normalized_dim == ref_rank - 1) {
+-        for (const auto& input_tensor : input_tensors) {
+-            TT_FATAL(
+-                (input_tensor.padded_shape()[dim] * input_tensor.element_size()) % input_tensor.buffer()->alignment() ==
+-                    0,
+-                "Current concat implementation requires aligned last dim when concatting on last dim");
+-        }
+-    }
+     // Determine target layout by checking all inputs
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
+@@ -21,5 +21,13 @@ void kernel_main() {
+     constexpr uint32_t num_tensors = get_compile_time_arg_val(1);
+-    constexpr uint32_t page_size_base_idx = 2;
++#ifdef WIDTH_CONCAT
++    constexpr uint32_t scratch_offset = get_compile_time_arg_val(2);
++    constexpr uint32_t page_size_base_idx = 3;
++    constexpr uint32_t copy_size_base_idx = page_size_base_idx + num_tensors;
+     constexpr auto tensor_accessor_args =
+-        make_tensor_accessor_args_tuple<num_tensors, page_size_base_idx + num_tensors>();
++        make_tensor_accessor_args_tuple<num_tensors, copy_size_base_idx + num_tensors>();
++#else
++    constexpr uint32_t page_size_base_idx = 2;
++    constexpr auto tensor_accessor_args =
++        make_tensor_accessor_args_tuple<num_tensors, page_size_base_idx + num_tensors>();
++#endif
+ 
+@@ -53,2 +55,3 @@ void kernel_main() {
+ #ifdef WIDTH_CONCAT
++        const uint32_t scratch_addr = l1_write_addr + scratch_offset;
+         // For width concat we know we start at curr_tensor=0
+@@ -57,5 +60,6 @@ void kernel_main() {
+             auto page_size = kernel_compile_time_args[page_size_base_idx + curr_tensor];
++            auto copy_size = kernel_compile_time_args[copy_size_base_idx + curr_tensor];
+             noc.async_read(
+                 abstract_tensor_accessor_wrappers[curr_tensor],
+-                CoreLocalMem<uint8_t>(l1_write_addr),
++                CoreLocalMem<uint8_t>(scratch_addr),
+                 page_size,
+@@ -63,3 +67,9 @@ void kernel_main() {
+                 {});
++            noc.async_read_barrier();
++            auto* src = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(scratch_addr);
++            auto* dst = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(l1_write_addr);
++            for (uint32_t byte = 0; byte < copy_size; ++byte) {
++                dst[byte] = src[byte];
++            }
+-            l1_write_addr += page_size;
++            l1_write_addr += copy_size;
+             page_id_per_tensor[curr_tensor]++;

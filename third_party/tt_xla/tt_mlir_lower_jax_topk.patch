@@ -23,12 +23,12 @@ index 98b3f6c..4ba80b5 100644
 @@ -1656,3 +1656,3 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
 
 -// Input is forced to BFloat16 unless it is already BFloat16 or BFP_BFloat8.
-+// Unsupported 32-bit integers use Float32; other unsupported types use BFloat16.
++// Float16 and unsupported 32-bit integers use Float32; other unsupported types use BFloat16.
  // Issue page: https://github.com/tenstorrent/tt-metal/issues/40086
 @@ -1665,1 +1665,3 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
        ttcore::elementTypeToDataType(inputElementType);
-+  bool inputUsesFloat32 =
-+      inputDataType == ttcore::DataType::Float32 || inputElementType.isInteger(32);
++  bool inputUsesFloat32 = inputDataType == ttcore::DataType::Float32 ||
++                          inputElementType.isF16() || inputElementType.isInteger(32);
 @@ -1670,6 +1672,8 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
    if (!inputDataType || (*inputDataType != ttcore::DataType::BFloat16 &&
 -                         *inputDataType != ttcore::DataType::BFP_BFloat8)) {

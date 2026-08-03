@@ -1,0 +1,8 @@
+diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
+--- a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
+@@ -88,3 +88,3 @@ void run(const ::tt::target::ttnn::EltwiseBinaryCompositeOp *op,
+            const std::optional<::ttnn::MemoryConfig> &memCfg) {
+-          return ::ttnn::remainder(lhs, rhs, std::nullopt, memCfg);
++          return ::ttnn::fmod(lhs, rhs, memCfg);
+         });
