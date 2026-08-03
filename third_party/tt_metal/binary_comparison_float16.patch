@@ -188,51 +188,59 @@ diff --git a/tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h b/tt_metal/hw/inc
 diff --git a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h b/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
-@@ -187,6 +187,57 @@ inline void calculate_binary_comp_fp32(const uint dst_index_in0, const uint dst_i
+@@ -187,6 +187,65 @@ inline void calculate_binary_comp_fp32(const uint dst_index_in0, const uint dst_i
      }
  }
  
-+// Native Float16 comparisons. SFPI lowers the vector comparisons to SFPU
-+// instructions. Magnitude and zero predicates restore NaN and signed-zero
-+// semantics around the native comparison without widening
-+// either input to Float32.
++// Native Float16 comparisons stay in SFPU. Per-operand magnitude checks reject
++// NaNs without overflowing on large finite values; combined magnitude bits
++// preserve signed-zero semantics without an FP16 add.
 +template <bool APPROXIMATION_MODE, int ITERATIONS, SfpuType RELATIONAL_OP>
 +inline void calculate_binary_comp_fp16(
 +    const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
 +    static_assert(is_fp32_compare_v<RELATIONAL_OP>, "Supported operation types: eq, ne, lt, gt, le, ge");
 +
 +    constexpr uint dst_tile_size_sfpi = 32;
-+    const sfpi::vFloat infinity = sfpi::sFloat16b(0x7f80);
++    const sfpi::vUInt infinity_bits = sfpi::as<sfpi::vUInt>(sfpi::vFloat(sfpi::sFloat16b(0x7f80)));
 +
 +#pragma GCC unroll 8
 +    for (int d = 0; d < ITERATIONS; d++) {
 +        const sfpi::vFloat a = sfpi::dst_reg[dst_index_in0 * dst_tile_size_sfpi];
 +        const sfpi::vFloat b = sfpi::dst_reg[dst_index_in1 * dst_tile_size_sfpi];
-+        const sfpi::vFloat abs_sum = sfpi::abs(a) + sfpi::abs(b);
++        const sfpi::vFloat abs_a = sfpi::abs(a);
++        const sfpi::vFloat abs_b = sfpi::abs(b);
++        const sfpi::vUInt abs_a_bits = sfpi::as<sfpi::vUInt>(abs_a);
++        const sfpi::vUInt abs_b_bits = sfpi::as<sfpi::vUInt>(abs_b);
++        const sfpi::vUInt magnitude_bits = abs_a_bits | abs_b_bits;
 +
 +        sfpi::vFloat result = RELATIONAL_OP == SfpuType::ne ? 1.0f : 0.0f;
 +        if constexpr (RELATIONAL_OP == SfpuType::eq || RELATIONAL_OP == SfpuType::ne) {
-+            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a == b))) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a == b))) {
 +                result = RELATIONAL_OP == SfpuType::eq ? 1.0f : 0.0f;
 +            }
 +            v_endif;
 +        } else if constexpr (RELATIONAL_OP == SfpuType::lt) {
-+            v_if((abs_sum <= infinity) && (abs_sum != 0.0f) && (a < b)) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
++                 (a < b)) {
 +                result = 1.0f;
 +            }
 +            v_endif;
 +        } else if constexpr (RELATIONAL_OP == SfpuType::gt) {
-+            v_if((abs_sum <= infinity) && (abs_sum != 0.0f) && (a > b)) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
++                 (a > b)) {
 +                result = 1.0f;
 +            }
 +            v_endif;
 +        } else if constexpr (RELATIONAL_OP == SfpuType::le) {
-+            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a <= b))) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a <= b))) {
 +                result = 1.0f;
 +            }
 +            v_endif;
 +        } else if constexpr (RELATIONAL_OP == SfpuType::ge) {
-+            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a >= b))) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a >= b))) {
 +                result = 1.0f;
 +            }
 +            v_endif;
@@ -249,51 +257,59 @@ diff --git a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_
 diff --git a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h b/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
-@@ -187,6 +187,57 @@ inline void calculate_binary_comp_fp32(const uint dst_index_in0, const uint dst_i
+@@ -187,6 +187,65 @@ inline void calculate_binary_comp_fp32(const uint dst_index_in0, const uint dst_i
      }
  }
  
-+// Native Float16 comparisons. SFPI lowers the vector comparisons to SFPU
-+// instructions. Magnitude and zero predicates restore NaN and signed-zero
-+// semantics around the native comparison without widening
-+// either input to Float32.
++// Native Float16 comparisons stay in SFPU. Per-operand magnitude checks reject
++// NaNs without overflowing on large finite values; combined magnitude bits
++// preserve signed-zero semantics without an FP16 add.
 +template <bool APPROXIMATION_MODE, int ITERATIONS, SfpuType RELATIONAL_OP>
 +inline void calculate_binary_comp_fp16(
 +    const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
 +    static_assert(is_fp32_compare_v<RELATIONAL_OP>, "Supported operation types: eq, ne, lt, gt, le, ge");
 +
 +    constexpr uint dst_tile_size_sfpi = 32;
-+    const sfpi::vFloat infinity = sfpi::sFloat16b(0x7f80);
++    const sfpi::vUInt infinity_bits = sfpi::as<sfpi::vUInt>(sfpi::vFloat(sfpi::sFloat16b(0x7f80)));
 +
 +#pragma GCC unroll 8
 +    for (int d = 0; d < ITERATIONS; d++) {
 +        const sfpi::vFloat a = sfpi::dst_reg[dst_index_in0 * dst_tile_size_sfpi];
 +        const sfpi::vFloat b = sfpi::dst_reg[dst_index_in1 * dst_tile_size_sfpi];
-+        const sfpi::vFloat abs_sum = sfpi::abs(a) + sfpi::abs(b);
++        const sfpi::vFloat abs_a = sfpi::abs(a);
++        const sfpi::vFloat abs_b = sfpi::abs(b);
++        const sfpi::vUInt abs_a_bits = sfpi::as<sfpi::vUInt>(abs_a);
++        const sfpi::vUInt abs_b_bits = sfpi::as<sfpi::vUInt>(abs_b);
++        const sfpi::vUInt magnitude_bits = abs_a_bits | abs_b_bits;
 +
 +        sfpi::vFloat result = RELATIONAL_OP == SfpuType::ne ? 1.0f : 0.0f;
 +        if constexpr (RELATIONAL_OP == SfpuType::eq || RELATIONAL_OP == SfpuType::ne) {
-+            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a == b))) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a == b))) {
 +                result = RELATIONAL_OP == SfpuType::eq ? 1.0f : 0.0f;
 +            }
 +            v_endif;
 +        } else if constexpr (RELATIONAL_OP == SfpuType::lt) {
-+            v_if((abs_sum <= infinity) && (abs_sum != 0.0f) && (a < b)) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
++                 (a < b)) {
 +                result = 1.0f;
 +            }
 +            v_endif;
 +        } else if constexpr (RELATIONAL_OP == SfpuType::gt) {
-+            v_if((abs_sum <= infinity) && (abs_sum != 0.0f) && (a > b)) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
++                 (a > b)) {
 +                result = 1.0f;
 +            }
 +            v_endif;
 +        } else if constexpr (RELATIONAL_OP == SfpuType::le) {
-+            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a <= b))) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a <= b))) {
 +                result = 1.0f;
 +            }
 +            v_endif;
 +        } else if constexpr (RELATIONAL_OP == SfpuType::ge) {
-+            v_if((abs_sum <= infinity) && ((abs_sum == 0.0f) || (a >= b))) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a >= b))) {
 +                result = 1.0f;
 +            }
 +            v_endif;
