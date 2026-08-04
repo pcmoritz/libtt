@@ -1,53 +1,26 @@
 diff --git a/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp b/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -118,3 +118,10 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
+@@ -118,3 +118,13 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
      const auto& input = tensor_args.input;
      const auto& ops_chain = operation_attributes.op_chain;
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
-+    const bool is_fp16_neg = input.dtype() == DataType::FLOAT16 && output.dtype() == DataType::FLOAT16 &&
-+                             ops_chain.size() == 1 && ops_chain[0].type() == unary::UnaryOpType::NEG;
-+    const auto compute_kernel_path = get_compute_kernel_path(ops_chain[0].type(), input.dtype());
-+    const bool convert_fp16_input = input.dtype() == DataType::FLOAT16 && !is_fp16_neg &&
-+                                     ops_chain[0].type() != unary::UnaryOpType::BITCAST &&
-+                                     ops_chain[0].type() != unary::UnaryOpType::ABS &&
-+                                     compute_kernel_path == "eltwise_sfpu.cpp";
-@@ -122,3 +129,3 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
-     const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en ||
--                                  input.dtype() == DataType::FLOAT16 ||
--                                  output.dtype() == DataType::FLOAT16;
-+                                  (!is_fp16_neg &&
-+                                   (input.dtype() == DataType::FLOAT16 || output.dtype() == DataType::FLOAT16));
-@@ -132 +139,2 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
++    auto compute_ops_chain = ops_chain;
++    if (input.dtype() == DataType::FLOAT16 && ops_chain[0].type() != UnaryOpType::TYPECAST &&
++        ops_chain[0].type() != UnaryOpType::BITCAST &&
++        get_compute_kernel_path(ops_chain[0].type(), input.dtype()) == "eltwise_sfpu.cpp") {
++        compute_ops_chain.insert(
++            compute_ops_chain.begin(),
++            EltwiseUnaryWithParam{
++                UnaryOpType::TYPECAST,
++                {static_cast<int>(DataType::FLOAT16), static_cast<int>(DataType::FLOAT32)}});
++    }
+@@ -132 +142,4 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
 -    DataFormat cb_data_format = datatype_to_dataformat_converter(input.dtype());
 +    DataFormat cb_data_format =
-+        convert_fp16_input ? DataFormat::UInt16 : datatype_to_dataformat_converter(input.dtype());
-@@ -189,2 +197,5 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
-     CMAKE_UNIQUE_NAMESPACE::pack_first_op_scalars(
-         ops_chain[0], input.dtype(), packed_scalar1, packed_scalar2, unary_defines);
-+    if (convert_fp16_input) {
-+        unary_defines["FP16_INPUT_CONVERSION"] = "1";
-+    }
-@@ -192,3 +203,3 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
-     const std::string compute_path = fmt::format(
-         "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/compute/{}",
--        get_compute_kernel_path(ops_chain[0].type(), input.dtype()));
-+        compute_kernel_path);
-diff --git a/ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/compute/eltwise_sfpu.cpp b/ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/compute/eltwise_sfpu.cpp
---- ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/compute/eltwise_sfpu.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/compute/eltwise_sfpu.cpp
-@@ -7,6 +7,7 @@
- #include "api/compute/tile_move_copy.h"
- #include "api/compute/eltwise_unary/eltwise_unary.h"
- #include "api/compute/eltwise_unary/sfpu_split_includes.h"
-+#include "api/compute/eltwise_unary/typecast.h"
- #include "api/compute/eltwise_unary/trigonometry.h"
- #include "api/compute/mul_int_sfpu.h"
- #include "api/compute/eltwise_unary/rpow.h"
-@@ -33 +34,6 @@ void kernel_main() {
-         copy_tile(cb_input, 0, 0);
-+#ifdef FP16_INPUT_CONVERSION
-+        typecast_tile<
-+            static_cast<uint32_t>(DataFormat::Float16),
-+            static_cast<uint32_t>(DataFormat::Float32)>(0);
-+#endif
++        input.dtype() == DataType::FLOAT16 && compute_ops_chain[0].type() == UnaryOpType::TYPECAST
++            ? DataFormat::UInt16
++            : datatype_to_dataformat_converter(input.dtype());
+@@ -187 +200 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
+-    std::map<std::string, std::string> unary_defines = get_block_defines(ops_chain, "0", "0", input.dtype());
++    std::map<std::string, std::string> unary_defines = get_block_defines(compute_ops_chain, "0", "0", input.dtype());
