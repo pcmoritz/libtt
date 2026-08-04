@@ -218,26 +218,6 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_op
                  input_tensor_a.dtype() == tt::tt_metal::DataType::BFLOAT16 or
 +                input_tensor_a.dtype() == tt::tt_metal::DataType::FLOAT16 or
                  input_tensor_a.dtype() == tt::tt_metal::DataType::UINT32 or
-diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
---- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
-+++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
-@@ -11,2 +11,3 @@
- #include "ttnn/distributed/types.hpp"
-+#include "ttnn/operations/copy/typecast/typecast.hpp"
- #include "ttnn/operations/data_movement/pad/pad.hpp"
-@@ -87,1 +88,12 @@ Tensor to_layout_impl(
-     }
-+    const DataType output_dtype = dtype.value_or(tensor_arg.dtype());
-+    if (tt::tt_metal::is_device_tensor(tensor_arg) && tensor_arg.dtype() == DataType::FLOAT16 &&
-+        (output_dtype == DataType::FLOAT16 || output_dtype == DataType::FLOAT32)) {
-+        auto tensor = ttnn::typecast(tensor_arg, DataType::FLOAT32);
-+        tensor = to_layout_impl(
-+            tensor, layout, DataType::FLOAT32, memory_config, sub_core_grids, pad_value);
-+        if (output_dtype == DataType::FLOAT32) {
-+            return tensor;
-+        }
-+        return ttnn::typecast(tensor, DataType::FLOAT16);
-+    }
 diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
