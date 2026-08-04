@@ -1,0 +1,79 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10129,6 +10129,65 @@ public:
+ };
+ } // namespace
+-
++
++namespace {
++class StableHLOToTTIRRoundNearestEvenOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::RoundNearestEvenOp> {
++  using OpConversionPattern<
++      mlir::stablehlo::RoundNearestEvenOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::RoundNearestEvenOp srcOp,
++                  mlir::stablehlo::RoundNearestEvenOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto resultType = dyn_cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResult().getType()));
++    if (!resultType ||
++        !mlir::isa<mlir::FloatType>(resultType.getElementType())) {
++      return rewriter.notifyMatchFailure(srcOp, "expected a floating tensor");
++    }
++
++    auto loc = srcOp.getLoc();
++    auto elementType = resultType.getElementType();
++    auto constant = [&](double value) {
++      return rewriter.create<ttir::ConstantOp>(
++          loc, resultType,
++          DenseElementsAttr::get(
++              resultType,
++              SmallVector<Attribute>{
++                  mlir::FloatAttr::get(elementType, value)}));
++    };
++
++    // floor(x + 0.5) rounds ties up; move odd tie results down to even.
++    Value half = constant(0.5);
++    Value one = constant(1.0);
++    Value two = constant(2.0);
++    Value shifted = rewriter.create<ttir::AddOp>(
++        loc, resultType, adaptor.getOperand(), half);
++    Value rounded = rewriter.create<ttir::FloorOp>(loc, resultType, shifted);
++    Value halfRounded =
++        rewriter.create<ttir::MultiplyOp>(loc, resultType, rounded, half);
++    Value evenRounded = rewriter.create<ttir::MultiplyOp>(
++        loc, resultType,
++        rewriter.create<ttir::FloorOp>(loc, resultType, halfRounded), two);
++
++    auto predicateType = resultType.clone(rewriter.getI1Type());
++    Value isOdd = rewriter.create<ttir::NotEqualOp>(
++        loc, predicateType, rounded, evenRounded);
++    Value isTie = rewriter.create<ttir::EqualOp>(
++        loc, predicateType, shifted, rounded);
++    Value adjust = rewriter.create<ttir::LogicalAndOp>(
++        loc, predicateType, isTie, isOdd);
++    Value roundedDown =
++        rewriter.create<ttir::SubtractOp>(loc, resultType, rounded, one);
++
++    rewriter.replaceOpWithNewOp<ttir::WhereOp>(
++        srcOp, resultType, adjust, roundedDown, rounded);
++    return success();
++  }
++};
++} // namespace
++
+ namespace {
+ class StableHLOToTTIRReducePrecisionOpConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::ReducePrecisionOp> {
+@@ -10237,5 +10296,7 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+-
++
+   patterns.add<StableHLOToTTIROpRoundOpConversionPattern>(typeConverter, ctx);
++  patterns.add<StableHLOToTTIRRoundNearestEvenOpConversionPattern>(
++      typeConverter, ctx);
+   patterns.add<StableHLOToTTIRReducePrecisionOpConversionPattern>(
+       typeConverter, ctx);
+ }
