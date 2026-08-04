@@ -346,6 +346,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_concat_unaligned_width.patch",
         "//third_party/tt_xla:tt_mlir_remainder_semantics.patch",
         "//third_party/tt_xla:tt_mlir_reduce_precision.patch",
+        "//third_party/tt_xla:tt_mlir_round_nearest_even.patch",
         "//third_party/tt_xla:tt_mlir_remove_bitwise_not_workaround.patch",
         "//third_party/tt_xla:tt_mlir_lower_jax_argmin.patch",
         "//third_party/tt_xla:tt_mlir_arithmetic_right_shift.patch",
