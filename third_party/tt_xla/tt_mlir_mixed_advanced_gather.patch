@@ -102,14 +102,16 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
 
      // All non-batch, non-indexed dimensions must have full slice sizes.
-@@ -5983,11 +6010,10 @@
+@@ -5983,11 +6010,12 @@
          getTypeConverter()->convertType(srcOp.getResult().getType()));
      auto outputShape = outputType.getShape();
++    bool needsOutputReshape = outputShape.size() != operandShape.size();
++    SmallVector<int64_t> gatherShape(
++        needsOutputReshape ? operandShape : outputShape);
 
 -    // Output rank must match operand rank for gather_dim semantics.
 -    if (static_cast<int64_t>(outputShape.size()) !=
 -        static_cast<int64_t>(operandShape.size())) {
-+    bool needsOutputReshape = outputShape.size() != operandShape.size();
 +    if (needsOutputReshape && windowedGather) {
        return rewriter.notifyMatchFailure(
 -          srcOp, "Output rank must match operand rank for gather_dim");
@@ -117,7 +119,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
 
      // Build the gather_dim index tensor. We need it to have the same rank
-@@ -5995,7 +6021,29 @@
+@@ -5995,7 +6023,29 @@
      //
      // Step 1: Reshape start_indices to remove index_vector_dim.
      // e.g. 256x1x1 with index_vector_dim=2 -> 256x1
@@ -147,70 +149,96 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto startIndices = adaptor.getOperands()[1];
 
      SmallVector<int64_t> reshapedIndicesShape;
-@@ -6018,6 +6066,61 @@
-               llvm::to_vector_of<int32_t>(reshapedIndicesShape)));
+@@ -6005,29 +6055,49 @@
+         reshapedIndicesShape.push_back(startIndicesShape[i]);
+       }
      }
-
++    SmallVector<int64_t> indicesShape(reshapedIndicesShape);
++
 +    // ttir.gather requires equal-rank operands. Flatten the non-batch index
 +    // dimensions into the indexed operand dimension, gather, then restore the
 +    // StableHLO output shape.
 +    if (needsOutputReshape) {
-+      SmallVector<int64_t> gatherShape(operandShape);
-+      SmallVector<int64_t> flattenedIndicesShape(operandShape.size(), 1);
-+      SmallVector<bool> isBatchDim(reshapedIndicesShape.size(), false);
++      indicesShape.assign(operandShape.size(), 1);
 +      for (auto [operandDim, startDim] :
 +           llvm::zip_equal(operandBatchingDims, startIndicesBatchingDims)) {
 +        int64_t indicesDim = startDim - (startDim > indexVectorDim);
-+        flattenedIndicesShape[operandDim] =
-+            reshapedIndicesShape[indicesDim];
-+        isBatchDim[indicesDim] = true;
++        indicesShape[operandDim] = reshapedIndicesShape[indicesDim];
 +      }
 +
 +      int64_t flattenedIndexSize = 1;
 +      for (auto [dim, size] : llvm::enumerate(reshapedIndicesShape)) {
-+        if (!isBatchDim[dim]) {
++        int64_t startDim = static_cast<int64_t>(dim) +
++                           (dim >= static_cast<size_t>(indexVectorDim));
++        if (!llvm::is_contained(startIndicesBatchingDims, startDim)) {
 +          flattenedIndexSize *= size;
 +        }
 +      }
 +      gatherShape[indexedDim] = flattenedIndexSize;
-+      flattenedIndicesShape[indexedDim] = flattenedIndexSize;
-+
-+      auto indicesType = mlir::cast<RankedTensorType>(indices.getType());
-+      auto flattenedIndicesType = RankedTensorType::get(
-+          flattenedIndicesShape, indicesType.getElementType(),
-+          indicesType.getEncoding());
-+      indices = rewriter.create<ttir::ReshapeOp>(
-+          srcOp.getLoc(), flattenedIndicesType, indices,
-+          rewriter.getI32ArrayAttr(
-+              llvm::to_vector_of<int32_t>(flattenedIndicesShape)));
-+
-+      if (flattenedIndicesShape != gatherShape) {
-+        auto gatherIndicesType = RankedTensorType::get(
-+            gatherShape, indicesType.getElementType(),
-+            indicesType.getEncoding());
-+        indices = rewriter.create<ttir::BroadcastOp>(
-+            srcOp.getLoc(), gatherIndicesType, indices,
-+            rewriter.getDenseI64ArrayAttr(
-+                ttmlir::utils::getBroadcastDimensions<int64_t>(
-+                    flattenedIndicesShape, gatherShape)));
-+      }
-+
-+      auto gatherType = RankedTensorType::get(
-+          gatherShape, outputType.getElementType(), outputType.getEncoding());
-+      Value gather = rewriter.create<ttir::GatherOp>(
-+          srcOp.getLoc(), gatherType, operand, indices,
-+          rewriter.getI32IntegerAttr(static_cast<int32_t>(indexedDim)));
-+      rewriter.replaceOpWithNewOp<ttir::ReshapeOp>(
-+          srcOp, outputType, gather,
-+          rewriter.getI32ArrayAttr(llvm::to_vector_of<int32_t>(outputShape)));
-+      return success();
++      indicesShape[indexedDim] = flattenedIndexSize;
 +    }
-+
+
+     Value indices = startIndices;
+-    if (static_cast<int64_t>(reshapedIndicesShape.size()) !=
+-        static_cast<int64_t>(startIndicesShape.size())) {
+-      auto reshapedIndicesType = RankedTensorType::get(
+-          reshapedIndicesShape, startIndicesType.getElementType(),
++    if (indicesShape != startIndicesShape) {
++      auto indicesType = RankedTensorType::get(
++          indicesShape, startIndicesType.getElementType(),
+           startIndicesType.getEncoding());
+       indices = rewriter.create<ttir::ReshapeOp>(
+-          srcOp.getLoc(), reshapedIndicesType, startIndices,
++          srcOp.getLoc(), indicesType, startIndices,
+           rewriter.getI32ArrayAttr(
+-              llvm::to_vector_of<int32_t>(reshapedIndicesShape)));
++              llvm::to_vector_of<int32_t>(indicesShape)));
+     }
+
      // Step 2: If the output has more dimensions than our reshaped indices
      // (due to offset dims), we need to unsqueeze and broadcast.
      // e.g. indices: 256x1, output: 256x1x3 -> unsqueeze to 256x1x1,
-@@ -6054,10 +6157,25 @@
+     // then broadcast to 256x1x3.
+-    int64_t outputRank = static_cast<int64_t>(outputShape.size());
+-    int64_t indicesRank = static_cast<int64_t>(reshapedIndicesShape.size());
+-
+-    if (indicesRank < outputRank) {
++    if (indicesShape.size() < gatherShape.size()) {
+       // Insert size-1 dimensions for each offset dim position.
+-      SmallVector<int64_t> unsqueezedShape(reshapedIndicesShape);
++      SmallVector<int64_t> unsqueezedShape(indicesShape);
+       for (int64_t od : offsetDims) {
+         unsqueezedShape.insert(unsqueezedShape.begin() + od, 1);
        }
+@@ -6040,24 +6110,50 @@
+           srcOp.getLoc(), unsqueezedType, indices,
+           rewriter.getI32ArrayAttr(
+               llvm::to_vector_of<int32_t>(unsqueezedShape)));
++      indicesShape = std::move(unsqueezedShape);
++    }
+
+-      // Broadcast to match output shape.
+-      if (unsqueezedShape != SmallVector<int64_t>(outputShape)) {
+-        auto broadcastDims = ttmlir::utils::getBroadcastDimensions<int64_t>(
+-            unsqueezedShape, outputShape);
+-        auto broadcastType =
+-            RankedTensorType::get(outputShape, indicesType.getElementType(),
+-                                  indicesType.getEncoding());
+-        indices = rewriter.create<ttir::BroadcastOp>(
+-            srcOp.getLoc(), broadcastType, indices,
+-            rewriter.getDenseI64ArrayAttr(broadcastDims));
+-      }
++    // Broadcast to match the gather shape.
++    if (indicesShape != gatherShape) {
++      auto indicesType = mlir::cast<RankedTensorType>(indices.getType());
++      auto broadcastDims = ttmlir::utils::getBroadcastDimensions<int64_t>(
++          indicesShape, gatherShape);
++      auto broadcastType =
++          RankedTensorType::get(gatherShape, indicesType.getElementType(),
++                                indicesType.getEncoding());
++      indices = rewriter.create<ttir::BroadcastOp>(
++          srcOp.getLoc(), broadcastType, indices,
++          rewriter.getDenseI64ArrayAttr(broadcastDims));
      }
 
 +    if (windowedGather) {
@@ -229,10 +257,21 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
 +
      // Step 3: Create gather_dim with the appropriate dimension.
-     rewriter.replaceOpWithNewOp<ttir::GatherOp>(
-         srcOp, outputType, operand, indices,
+-    rewriter.replaceOpWithNewOp<ttir::GatherOp>(
+-        srcOp, outputType, operand, indices,
 -        rewriter.getI32IntegerAttr(static_cast<int32_t>(indexedDim)));
++    auto gatherType = RankedTensorType::get(
++        gatherShape, outputType.getElementType(), outputType.getEncoding());
++    Value gather = rewriter.create<ttir::GatherOp>(
++        srcOp.getLoc(), gatherType, operand, indices,
 +        rewriter.getI32IntegerAttr(static_cast<int32_t>(gatherDim)));
++
++    if (needsOutputReshape) {
++      gather = rewriter.create<ttir::ReshapeOp>(
++          srcOp.getLoc(), outputType, gather,
++          rewriter.getI32ArrayAttr(llvm::to_vector_of<int32_t>(outputShape)));
++    }
++    rewriter.replaceOp(srcOp, gather);
 
      return success();
    }
