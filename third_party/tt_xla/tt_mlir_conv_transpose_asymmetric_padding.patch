@@ -37,7 +37,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -2329,18 +2329,16 @@ public:
+@@ -2329,18 +2329,15 @@ public:
      }
      auto paddingAttr = *maybePaddingAttr;
  
@@ -47,19 +47,18 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 -                "padding_top/padding_left must equal "
 -                "padding_bottom/padding_right "
 -                "for the op to execute as expected.";
-+    if (paddingAttr[0] == paddingAttr[2] &&
-+        paddingAttr[1] == paddingAttr[3]) {
-+      paddingAttr = rewriter.getDenseI32ArrayAttr(
-+          {paddingAttr[0], paddingAttr[1]});
-+    } else {
++    SmallVector<int32_t> padding{paddingAttr[0], paddingAttr[1]};
++    if (paddingAttr[0] != paddingAttr[2] ||
++        paddingAttr[1] != paddingAttr[3]) {
 +      // Reorder (pT, pL, pB, pR) to TTNN's (pT, pB, pL, pR).
-+      paddingAttr = rewriter.getDenseI32ArrayAttr(
-+          {paddingAttr[0], paddingAttr[2], paddingAttr[1], paddingAttr[3]});
++      padding = {paddingAttr[0], paddingAttr[2], paddingAttr[1],
++                 paddingAttr[3]};
      }
  
 -    // Padding only supports 2 values in TTNN.
 -    auto reducedPaddingAttr =
 -        rewriter.getDenseI32ArrayAttr({paddingAttr[0], paddingAttr[1]});
++    paddingAttr = rewriter.getDenseI32ArrayAttr(padding);
 -
      auto outputPaddingAttr =
          attrToDenseI32ArrayAttr(adaptor.getOutputPadding(), rewriter);
@@ -124,57 +123,44 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
 --- a/lib/OpModel/TTNN/TTNNOpModel.cpp
 +++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
-@@ -265,6 +265,17 @@ reorderPool2dPadding(llvm::ArrayRef<int32_t> padding) {
-   };
- }
- 
-+// ConvTranspose2d stores four-sided padding in tt-metal's
-+// [top, bottom, left, right] order.
-+std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>>
-+convertConvTranspose2dPadding(llvm::ArrayRef<int32_t> padding) {
-+  if (padding.size() == 2) {
-+    return conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(padding);
-+  }
-+  assert(padding.size() == 4);
-+  return conversion::convertLLVMArrayRefToStdArray<uint32_t, 4>(padding);
-+}
-+
- /**
-  * @brief Convenience wrapper to get a DataType from a TTNNLayout attr that
-  * may be a nullptr. Returns std::nullopt if layout is nullptr
-@@ -695,7 +706,7 @@ llvm::Expected<::ttnn::TensorSpec> getPrepareConv2dWeightsOpOutputTensorSpec(
+@@ -695,7 +695,9 @@ llvm::Expected<::ttnn::TensorSpec> getPrepareConv2dWeightsOpOutputTensorSpec(
          input_width,
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(stride),
 -        detail::reorderPool2dPadding(padding), outputPaddingArr,
-+        detail::convertConvTranspose2dPadding(padding), outputPaddingArr,
++        conversion::convertLLVMArrayRefToMultiSizeStdArray<uint32_t, 2, 4>(
++            padding),
++        outputPaddingArr,
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation),
          hasBias, groups, device, *inputDtype, outputDtype,
          conv2dConfigConverted,
-@@ -795,7 +806,7 @@ getPrepareConv2dBiasOpOutputTensorSpec(
+@@ -795,7 +797,8 @@ getPrepareConv2dBiasOpOutputTensorSpec(
          in_channels, out_channels, batch_size, input_height, input_width,
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(stride),
 -        detail::reorderPool2dPadding(padding),
-+        detail::convertConvTranspose2dPadding(padding),
++        conversion::convertLLVMArrayRefToMultiSizeStdArray<uint32_t, 2, 4>(
++            padding),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation),
          groups, device, *inputDtype, outputDtype, conv2dConfigConverted,
          /*compute_config_=*/std::nullopt,
-@@ -5662,7 +5673,7 @@ llvm::Expected<OpConstraints> OpModel<ConvTranspose2dOp>::getOpConstraints(
+@@ -5662,7 +5665,8 @@ llvm::Expected<OpConstraints> OpModel<ConvTranspose2dOp>::getOpConstraints(
          in_channels, out_channels, batch_size, input_height, input_width,
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(stride),
 -        conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(padding),
-+        detail::convertConvTranspose2dPadding(padding),
++        conversion::convertLLVMArrayRefToMultiSizeStdArray<uint32_t, 2, 4>(
++            padding),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(output_padding),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation),
          groups, outputDtype, biasSpec, conv2dConfigConverted,
-@@ -5744,7 +5755,7 @@ llvm::Expected<size_t> OpModel<ConvTranspose2dOp>::getOpRuntime(
+@@ -5744,7 +5748,8 @@ llvm::Expected<size_t> OpModel<ConvTranspose2dOp>::getOpRuntime(
          in_channels, out_channels, batch_size, input_height, input_width,
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(stride),
 -        conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(padding),
-+        detail::convertConvTranspose2dPadding(padding),
++        conversion::convertLLVMArrayRefToMultiSizeStdArray<uint32_t, 2, 4>(
++            padding),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(output_padding),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation),
          groups, outputDtype, biasSpec, conv2dConfigConverted,
