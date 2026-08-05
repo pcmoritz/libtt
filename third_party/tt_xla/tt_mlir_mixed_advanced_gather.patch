@@ -273,7 +273,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    SmallVector<int64_t> permutation(outputType.getRank(), indexedDim);
 +    for (auto [operandDim, startDim] :
 +         llvm::zip_equal(operandBatchingDims, startIndicesBatchingDims)) {
++      // Remove the index-vector axis from the start_indices dimension.
 +      int64_t indicesDim = startDim - (startDim > indexVectorDim);
++      // Leave room for the gather-window axis in the output.
 +      int64_t outputDim = indicesDim + (indicesDim >= gatherDim);
 +      permutation[outputDim] = operandDim;
 +    }
