@@ -834,3 +834,211 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untili
 +    }
 +
      bool fp32_dest_acc_en = input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
+diff --git ttnn/cpp/ttnn/operations/conv/conv2d/conv2d.cpp ttnn/cpp/ttnn/operations/conv/conv2d/conv2d.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv2d/conv2d.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv2d/conv2d.cpp
+@@ -25,2 +25,3 @@
+ #include "ttnn/operations/conv/conv2d/prepare_conv2d_weights.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
+ #include "ttnn/operations/data_movement/move/move.hpp"
+@@ -901,4 +902,18 @@ Conv2dResultWithOptions conv2d(
+     using namespace operations::conv::conv2d;
+     using operations::conv::Conv2dExecutionPath;
+     using operations::conv::determine_conv2d_execution_path;
++    const bool fp16_output = dtype.value_or(input_tensor.dtype()) == DataType::FLOAT16;
++    Tensor conv_input = input_tensor;
++    if (conv_input.dtype() == DataType::FLOAT16) {
++        conv_input = tt::tt_metal::is_device_tensor(conv_input) ? ttnn::typecast(ttnn::typecast(conv_input, DataType::FLOAT32), DataType::BFLOAT16)
++                                                               : ttnn::to_dtype(conv_input, DataType::BFLOAT16);
++    }
++    const std::optional<const DataType> conv_dtype = fp16_output ? DataType::BFLOAT16 : dtype;
++    auto restore_output_dtype = [fp16_output](Conv2dResult result) {
++        if (fp16_output) {
++            auto output = ttnn::typecast(std::get<0>(result), DataType::FLOAT32);
++            std::get<0>(result) = ttnn::typecast(output, DataType::FLOAT16);
++        }
++        return result;
++    };
+     // Determine execution path based on configuration and input properties
+@@ -905 +919 @@ Conv2dResultWithOptions conv2d(
+-    Conv2dExecutionPath path = determine_conv2d_execution_path(input_tensor, slice_config_);
++    Conv2dExecutionPath path = determine_conv2d_execution_path(conv_input, slice_config_);
+@@ -910,3 +924,3 @@ Conv2dResultWithOptions conv2d(
+         return result_to_result_with_options(
+-            conv2d_L1(
++            restore_output_dtype(conv2d_L1(
+-                input_tensor,
++                conv_input,
+@@ -925 +939 @@ Conv2dResultWithOptions conv2d(
+-                dtype,
++                conv_dtype,
+@@ -929 +943 @@ Conv2dResultWithOptions conv2d(
+-                memory_config),
++                memory_config)),
+@@ -936,3 +950,3 @@ Conv2dResultWithOptions conv2d(
+     return result_to_result_with_options(
+-        conv2d_DRAM(
++        restore_output_dtype(conv2d_DRAM(
+-            input_tensor,
++            conv_input,
+@@ -951 +965 @@ Conv2dResultWithOptions conv2d(
+-            dtype,
++            conv_dtype,
+@@ -956 +970 @@ Conv2dResultWithOptions conv2d(
+-            slice_config_),
++            slice_config_)),
+diff --git ttnn/cpp/ttnn/operations/conv/conv_transpose2d/conv_transpose2d.cpp ttnn/cpp/ttnn/operations/conv/conv_transpose2d/conv_transpose2d.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv_transpose2d/conv_transpose2d.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv_transpose2d/conv_transpose2d.cpp
+@@ -18,2 +18,3 @@
+ #include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
+ #include "ttnn/operations/data_movement/move/move.hpp"
+@@ -1258,2 +1259,16 @@ ConvTranspose2dResultWithOptions conv_transpose2d(
+     using namespace operations::conv::conv_transpose2d;
++    const bool fp16_output = dtype.value_or(input_tensor.dtype()) == DataType::FLOAT16;
++    Tensor conv_input = input_tensor;
++    if (conv_input.dtype() == DataType::FLOAT16) {
++        conv_input = tt::tt_metal::is_device_tensor(conv_input) ? ttnn::typecast(ttnn::typecast(conv_input, DataType::FLOAT32), DataType::BFLOAT16)
++                                                               : ttnn::to_dtype(conv_input, DataType::BFLOAT16);
++    }
++    const std::optional<const DataType> conv_dtype = fp16_output ? DataType::BFLOAT16 : dtype;
++    auto restore_output_dtype = [fp16_output](ConvTranspose2dResult result) {
++        if (fp16_output) {
++            auto output = ttnn::typecast(std::get<0>(result), DataType::FLOAT32);
++            std::get<0>(result) = ttnn::typecast(output, DataType::FLOAT16);
++        }
++        return result;
++    };
+     // Determine execution path based on configuration and input properties
+@@ -1260 +1274 @@ ConvTranspose2dResultWithOptions conv_transpose2d(
+-    ConvT2dExecutionPath path = determine_conv_transpose2d_execution_path(input_tensor, dram_slice_config_);
++    ConvT2dExecutionPath path = determine_conv_transpose2d_execution_path(conv_input, dram_slice_config_);
+@@ -1264,3 +1278,3 @@ ConvTranspose2dResultWithOptions conv_transpose2d(
+         return result_to_result_with_options(
+-            conv_transpose2d_DRAM(
++            restore_output_dtype(conv_transpose2d_DRAM(
+-                input_tensor,
++                conv_input,
+@@ -1280 +1294 @@ ConvTranspose2dResultWithOptions conv_transpose2d(
+-                dtype,
++                conv_dtype,
+@@ -1286 +1300 @@ ConvTranspose2dResultWithOptions conv_transpose2d(
+-                mirror_kernel),
++                mirror_kernel)),
+@@ -1291,3 +1305,3 @@ ConvTranspose2dResultWithOptions conv_transpose2d(
+     return result_to_result_with_options(
+-        conv_transpose2d_L1(
++        restore_output_dtype(conv_transpose2d_L1(
+-            input_tensor,
++            conv_input,
+@@ -1307 +1321 @@ ConvTranspose2dResultWithOptions conv_transpose2d(
+-            dtype,
++            conv_dtype,
+@@ -1312 +1326 @@ ConvTranspose2dResultWithOptions conv_transpose2d(
+-            mirror_kernel),
++            mirror_kernel)),
+diff --git ttnn/cpp/ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.cpp ttnn/cpp/ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.cpp
+@@ -153,6 +153,8 @@ Tensor transform_weights_for_conv_transpose2d(const Tensor& conv_weight_tensor,
+     switch (conv_weight_tensor.dtype()) {
+         case DataType::BFLOAT16:
+             return _transform_weights_for_conv_transpose2d<::bfloat16>(to_mirror_tensor, mirror_kernel);
++        case DataType::FLOAT16:
++            return _transform_weights_for_conv_transpose2d<tt::tt_metal::float16>(to_mirror_tensor, mirror_kernel);
+         case DataType::FLOAT32: return _transform_weights_for_conv_transpose2d<float>(to_mirror_tensor, mirror_kernel);
+         case DataType::UINT32:
+             return _transform_weights_for_conv_transpose2d<uint32_t>(to_mirror_tensor, mirror_kernel);
+diff --git ttnn/cpp/ttnn/operations/conv/conv2d/prepare_conv2d_weights.cpp ttnn/cpp/ttnn/operations/conv/conv2d/prepare_conv2d_weights.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv2d/prepare_conv2d_weights.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv2d/prepare_conv2d_weights.cpp
+@@ -289 +289 @@ Tensor to_weight_interleaved_mm_layout(const Tensor& conv_weight_tensor, DataTyp
+-        auto output_buffer = std::vector<T>(output_shape.volume(), T(0));
++        auto output_buffer = std::vector<T>(output_shape.volume(), T{});
+@@ -395,4 +395,5 @@ Tensor convert_conv_weight_tensor_to_interleaved_mm_layout(
+         to_w_interleaved_mm_layout_map = {
+             {DataType::BFLOAT16, &to_weight_interleaved_mm_layout<bfloat16>},
++            {DataType::FLOAT16, &to_weight_interleaved_mm_layout<tt::tt_metal::float16>},
+             {DataType::FLOAT32, &to_weight_interleaved_mm_layout<float>},
+             {DataType::UINT32, &to_weight_interleaved_mm_layout<uint32_t>}};
+@@ -411,4 +412,5 @@ Tensor convert_conv_weight_tensor_to_tiled_layout(
+         to_w_tile_layout_map = {
+             {DataType::BFLOAT16, &to_weight_tile_layout<bfloat16>},
++            {DataType::FLOAT16, &to_weight_tile_layout<tt::tt_metal::float16>},
+             {DataType::FLOAT32, &to_weight_tile_layout<float>},
+             {DataType::UINT32, &to_weight_tile_layout<uint32_t>}};
+@@ -476 +478 @@ Tensor to_weight_tile_layout_block_sharded(
+-        auto output_buffer = std::vector<T>(output_shape.volume(), T(0));  // Initialize with zeros
++        auto output_buffer = std::vector<T>(output_shape.volume(), T{});  // Initialize with zeros
+@@ -555,4 +557,5 @@ Tensor convert_conv_weight_tensor_to_tiled_layout_block_sharded(
+         to_w_tile_layout_map = {
+             {DataType::BFLOAT16, &to_weight_tile_layout_block_sharded<bfloat16>},
++            {DataType::FLOAT16, &to_weight_tile_layout_block_sharded<tt::tt_metal::float16>},
+             {DataType::FLOAT32, &to_weight_tile_layout_block_sharded<float>},
+             {DataType::UINT32, &to_weight_tile_layout_block_sharded<uint32_t>}};
+@@ -615,6 +618,7 @@ Tensor convert_conv_bias_tensor_to_tiled_layout_block_sharded(
+         std::function<Tensor(const Tensor&, uint32_t num_channel_shards, DataType output_dtype)>>
+         to_b_tile_layout_map = {
+             {DataType::BFLOAT16, &to_bias_tile_layout_block_sharded<bfloat16>},
++            {DataType::FLOAT16, &to_bias_tile_layout_block_sharded<tt::tt_metal::float16>},
+             {DataType::FLOAT32, &to_bias_tile_layout_block_sharded<float>},
+             {DataType::UINT32, &to_bias_tile_layout_block_sharded<uint32_t>},
+         };
+@@ -634,4 +638,5 @@ Tensor convert_conv_weight_tensor_to_special_padding_tiled_layout(
+         to_w_tile_layout_map = {
+             {DataType::BFLOAT16, &to_weight_special_padding_tile_layout<bfloat16>},
++            {DataType::FLOAT16, &to_weight_special_padding_tile_layout<tt::tt_metal::float16>},
+             {DataType::FLOAT32, &to_weight_special_padding_tile_layout<float>},
+             {DataType::UINT32, &to_weight_special_padding_tile_layout<uint32_t>}};
+@@ -781,6 +786,7 @@ Tensor convert_conv_weight_tensor_to_grouped_layout(
+                 {DataType::INT32, &conv_group_weight_zero_pad_helper<int32_t>},
+                 {DataType::FLOAT32, &conv_group_weight_zero_pad_helper<float>},
+                 {DataType::BFLOAT16, &conv_group_weight_zero_pad_helper<bfloat16>},
++                {DataType::FLOAT16, &conv_group_weight_zero_pad_helper<tt::tt_metal::float16>},
+                 {DataType::UINT16, &conv_group_weight_zero_pad_helper<uint16_t>},
+                 {DataType::BFLOAT8_B, &conv_group_weight_zero_pad_helper<float>},
+                 {DataType::UINT32, &conv_group_weight_zero_pad_helper<uint32_t>},
+@@ -888,6 +894,7 @@ Tensor convert_conv_weight_tensor_to_grouped_layout_for_conv_transpose2d(
+                 {DataType::INT32, &conv_transpose2d_group_weight_zero_pad_helper<int32_t>},
+                 {DataType::FLOAT32, &conv_transpose2d_group_weight_zero_pad_helper<float>},
+                 {DataType::BFLOAT16, &conv_transpose2d_group_weight_zero_pad_helper<bfloat16>},
++                {DataType::FLOAT16, &conv_transpose2d_group_weight_zero_pad_helper<tt::tt_metal::float16>},
+                 {DataType::UINT16, &conv_transpose2d_group_weight_zero_pad_helper<uint16_t>},
+                 {DataType::BFLOAT8_B, &conv_transpose2d_group_weight_zero_pad_helper<float>},
+                 {DataType::UINT32, &conv_transpose2d_group_weight_zero_pad_helper<uint32_t>},
+@@ -932,7 +939,8 @@ Tensor convert_conv_weight_tensor_to_depthwise_layout(
+         to_w_tile_layout_map = {
+             {DataType::INT32, &conv_depthwise_weight_bcast_helper<int32_t>},
+             {DataType::FLOAT32, &conv_depthwise_weight_bcast_helper<float>},
+             {DataType::BFLOAT16, &conv_depthwise_weight_bcast_helper<bfloat16>},
++            {DataType::FLOAT16, &conv_depthwise_weight_bcast_helper<tt::tt_metal::float16>},
+             {DataType::UINT16, &conv_depthwise_weight_bcast_helper<uint16_t>},
+             {DataType::BFLOAT8_B, &conv_depthwise_weight_bcast_helper<float>},
+             {DataType::UINT32, &conv_depthwise_weight_bcast_helper<uint32_t>},
+@@ -1663,3 +1671,6 @@ static ttnn::Tensor prepare_conv_weights_internal(
+     if (params.weights_bias_dtype.has_value()) {
+-        weight_tensor_ = ttnn::to_dtype(weight_tensor_, params.weights_bias_dtype.value());
++        const DataType weights_dtype = params.weights_bias_dtype == DataType::FLOAT16
++                                               ? DataType::BFLOAT16
++                                               : params.weights_bias_dtype.value();
++        weight_tensor_ = ttnn::to_dtype(weight_tensor_, weights_dtype);
+     }
+diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
+--- tt_metal/impl/tensor/tensor_apis.cpp
++++ tt_metal/impl/tensor/tensor_apis.cpp
+@@ -1202,3 +1202,7 @@ tt::tt_metal::DistributedHostBuffer transform_buffers(
+             std::transform(data.begin(), data.end(), output_vector.begin(), [](SrcType value) {
+-                return static_cast<DstType>(value);
++                if constexpr (std::is_same_v<SrcType, float16> || std::is_same_v<DstType, float16>) {
++                    return static_cast<DstType>(static_cast<float>(value));
++                } else {
++                    return static_cast<DstType>(value);
++                }
+             });
+@@ -1223 +1227,4 @@ HostTensor to_dtype(const HostTensor& input_tensor, DataType dtype) {
+-    auto output_storage = [src_type, dst_type = dtype, &input_tensor, &input_buffer]() {
++    auto output_storage = src_type == DataType::FLOAT16 && dtype == DataType::BFLOAT16
++                              ? CMAKE_UNIQUE_NAMESPACE::transform_buffers<float16, bfloat16>(
++                                    input_tensor.tensor_spec(), input_buffer)
++                              : [src_type, dst_type = dtype, &input_tensor, &input_buffer]() {
