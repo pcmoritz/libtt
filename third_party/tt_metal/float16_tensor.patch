@@ -418,7 +418,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_de
 -            input_tensor_a.dtype() == DataType::FLOAT32 or input_tensor_a.dtype() == DataType::INT32,
 -        "Can only work with bfloat16/float32 or int32/uint32 tensors");
 +            input_tensor_a.dtype() == DataType::FLOAT32 or input_tensor_a.dtype() == DataType::FLOAT16 or
-+            input_tensor_a.dtype() == DataType::INT32,
++            input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::INT32,
 +        "Unsupported dtype {}", input_tensor_a.dtype());
  }
 diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp
@@ -937,6 +937,18 @@ diff --git ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common
 +    const tt::tt_metal::DataType partial_dtype =
 +        packer_l1_acc && fp32_dest_acc_en ? DataType::FLOAT32 : output_datatype;
      const tt::DataFormat partial_df = datatype_to_dataformat_converter(partial_dtype);
+@@ -305,8 +303,8 @@ std::vector<CBInfo> get_cb_info(
+     // Reader indices CB
+-    // Worst case is 1 uint16 index per output row (segment headers and discontinuity markers
+-    // empirically stay below this bound for supported configs). When the factory has the real
++    // Reserve four uint16 values per output row for block headers and discontinuities.
++    // When the factory has the real
+     // DRAM config buffer it passes its actual per-core page size so the predicted CB footprint
+     // matches the CB the factory creates; auto-shard estimation passes std::nullopt.
+     const uint32_t reader_indices_worst_case_page_size =
+-        pconfig.per_core_out_matrix_height_ntile * tt::constants::TILE_HEIGHT * sizeof(uint16_t);
++        4 * pconfig.per_core_out_matrix_height_ntile * tt::constants::TILE_HEIGHT * sizeof(uint16_t);
+     if (reader_indices_actual_page_size.has_value()) {
 @@ -334,2 +331,2 @@ std::vector<CBInfo> get_cb_info(
          .page_size = l1_scratchpad_CB_size,
 -        .data_format = tt::DataFormat::Float16_b});
