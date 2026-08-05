@@ -1,0 +1,138 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -2891,51 +2891,43 @@ public:
+             : rewriter.getDenseBoolArrayAttr(
+                   SmallVector<bool>(numSpatialDims, false));
+
+-    // Negative padding handling strategy:
+-    // 1. Convolution ops don't support negative padding directly, so we split
+-    // the operation into two steps when negative padding is detected
+-    // 2. First, run convolution with padding clamped to zero (resulting in a
+-    // larger intermediate output than the final desired shape)
+-    // 3. Then, slice the intermediate output to achieve the effect of negative
+-    // padding (cropping edges based on the magnitude of negative padding
+-    // values)
+-    //
+-    // Example: padding=[-1, -1] means "crop 1 pixel from each edge of the
+-    // output"
+-    //   - Run conv with padding=[0, 0] to get larger intermediate result
+-    //   - Slice [1:-1, 1:-1] to remove the edges and get final output
+-    // This pattern only handles negative padding.
++    // Convolution ops do not support negative padding. Crop the input by the
++    // negative amount and clamp the convolution padding to zero.
+     ArrayRef<int64_t> paddingArray = paddingAttr.asArrayRef();
+     bool hasNegativePadding =
+         llvm::any_of(paddingArray, [](int64_t p) { return p < 0; });
+     if (!hasNegativePadding) {
+       return failure();
+     }
++    if (llvm::any_of(inputDilationAttr.asArrayRef(),
++                     [](int64_t dilation) { return dilation != 1; })) {
++      return failure();
++    }
+
+-    SmallVector<int64_t> adjustedPadding = llvm::to_vector(llvm::map_range(
++    SmallVector<int64_t> clampedPadding = llvm::to_vector(llvm::map_range(
+         paddingArray, [](int64_t p) { return std::max<int64_t>(p, 0); }));
+
+-    paddingAttr = rewriter.getDenseI64ArrayAttr(adjustedPadding);
+-
+-    // Calculate intermediate output shape for convolution when negative padding
+-    // exists.
+-    SmallVector<int64_t> intermediateOutputShape(outputType.getShape().begin(),
+-                                                 outputType.getShape().end());
+-    auto spatialDims = dimNums.getOutputSpatialDimensions();
+-    for (size_t i = 0; i < numSpatialDims; i++) {
+-      int64_t padLow = paddingArray[2 * i];
+-      int64_t padHigh = paddingArray[2 * i + 1];
+-
+-      if (padLow < 0) {
+-        intermediateOutputShape[spatialDims[i]] -= padLow;
+-      }
+-      if (padHigh < 0) {
+-        intermediateOutputShape[spatialDims[i]] -= padHigh;
+-      }
++    Value input = adaptor.getLhs();
++    auto inputType = mlir::cast<RankedTensorType>(input.getType());
++    SmallVector<int32_t> inputSliceBegins(inputType.getRank(), 0);
++    SmallVector<int32_t> inputSliceEnds(inputType.getShape().begin(),
++                                        inputType.getShape().end());
++    SmallVector<int32_t> inputSliceSteps(inputType.getRank(), 1);
++    SmallVector<int64_t> slicedShape(inputType.getShape());
++    auto inputSpatialDims = dimNums.getInputSpatialDimensions();
++    for (size_t i = 0; i < numSpatialDims; ++i) {
++      int32_t lowCrop = std::max<int64_t>(-paddingArray[2 * i], 0);
++      int32_t highCrop = std::max<int64_t>(-paddingArray[2 * i + 1], 0);
++      int64_t dim = inputSpatialDims[i];
++      inputSliceBegins[dim] = lowCrop;
++      inputSliceEnds[dim] -= highCrop;
++      slicedShape[dim] -= lowCrop + highCrop;
+     }
+-
+-    RankedTensorType intermediateOutputType = RankedTensorType::get(
+-        intermediateOutputShape, outputType.getElementType());
++    input = rewriter.create<ttir::SliceStaticOp>(
++        srcOp.getLoc(), inputType.clone(slicedShape), input,
++        rewriter.getI32ArrayAttr(inputSliceBegins),
++        rewriter.getI32ArrayAttr(inputSliceEnds),
++        rewriter.getI32ArrayAttr(inputSliceSteps));
+
+     // Convert padding to DenseIntElementsAttr with shape [numSpatialDims, 2].
+     mlir::DenseIntElementsAttr stablehloPaddingAttr =
+@@ -2943,7 +2935,7 @@ public:
+             mlir::RankedTensorType::get(
+                 {static_cast<int64_t>(numSpatialDims), 2},
+                 rewriter.getI64Type()),
+-            adjustedPadding);
++            clampedPadding);
+
+     // Create StableHLO ConvDimensionNumbersAttr.
+     mlir::stablehlo::ConvDimensionNumbersAttr stablehloDimNums =
+@@ -2960,44 +2952,14 @@ public:
+
+     mlir::stablehlo::ConvolutionOp convOp =
+         mlir::stablehlo::ConvolutionOp::create(
+-            rewriter, srcOp.getLoc(), intermediateOutputType, adaptor.getLhs(),
++            rewriter, srcOp.getLoc(), outputType, input,
+             adaptor.getRhs(), windowStridesAttr, stablehloPaddingAttr,
+             inputDilationAttr, kernelDilationAttr, windowReversalAttr,
+             stablehloDimNums, adaptor.getFeatureGroupCount(),
+             adaptor.getBatchGroupCount(),
+             /*precisionConfig=*/nullptr);
+
+-    auto convOutputType = cast<RankedTensorType>(convOp.getResult().getType());
+-    auto convOutputShape = convOutputType.getShape();
+-
+-    SmallVector<int32_t> sliceBegins(convOutputShape.size(), 0);
+-    SmallVector<int32_t> sliceEnds(convOutputShape.begin(),
+-                                   convOutputShape.end());
+-    SmallVector<int32_t> sliceSteps(convOutputShape.size(), 1);
+-
+-    // Adjust slice parameters for spatial dimensions with negative padding.
+-    for (size_t i = 0; i < numSpatialDims; i++) {
+-      int64_t padLow = paddingArray[2 * i];
+-      int64_t padHigh = paddingArray[2 * i + 1];
+-
+-      if (padLow < 0 || padHigh < 0) {
+-        int64_t spatialDim = spatialDims[i];
+-        sliceBegins[spatialDim] =
+-            std::abs(std::min(static_cast<int64_t>(0), padLow));
+-        sliceEnds[spatialDim] =
+-            convOutputShape[spatialDim] -
+-            std::abs(std::min(static_cast<int64_t>(0), padHigh));
+-      }
+-    }
+-
+-    // Create slice operation to crop the output.
+-    auto sliceOp = rewriter.create<ttir::SliceStaticOp>(
+-        srcOp.getLoc(), outputType, convOp.getResult(),
+-        rewriter.getI32ArrayAttr(sliceBegins),
+-        rewriter.getI32ArrayAttr(sliceEnds),
+-        rewriter.getI32ArrayAttr(sliceSteps));
+-
+-    rewriter.replaceOp(srcOp, sliceOp.getResult());
++    rewriter.replaceOp(srcOp, convOp);
+     return success();
+   }
+ };
