@@ -87,7 +87,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto startIndices = adaptor.getOperands()[1];
 -
      SmallVector<int64_t> reshapedIndicesShape;
-@@ -6164,25 +6180,40 @@ public:
+@@ -6164,25 +6180,46 @@ public:
      }
 +    SmallVector<int64_t> indicesShape(reshapedIndicesShape);
 +
@@ -96,19 +96,25 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    // StableHLO output shape.
 +    if (needsOutputReshape) {
 +      indicesShape.assign(operandShape.size(), 1);
-+      for (auto [operandDim, startDim] :
-+           llvm::zip_equal(operandBatchingDims, startIndicesBatchingDims)) {
-+        int64_t indicesDim = startDim - (startDim > indexVectorDim);
-+        indicesShape[operandDim] = reshapedIndicesShape[indicesDim];
-+      }
-+
++      SmallVector<int64_t> indicesOrder;
 +      int64_t flattenedIndexSize = 1;
 +      for (auto [dim, size] : llvm::enumerate(reshapedIndicesShape)) {
 +        int64_t startDim = static_cast<int64_t>(dim) +
 +                           (dim >= static_cast<size_t>(indexVectorDim));
-+        if (!llvm::is_contained(startIndicesBatchingDims, startDim)) {
++        auto batchDim = llvm::find(startIndicesBatchingDims, startDim);
++        if (batchDim == startIndicesBatchingDims.end()) {
++          indicesOrder.push_back(indexedDim);
 +          flattenedIndexSize *= size;
++        } else {
++          int64_t operandDim = operandBatchingDims[std::distance(
++              startIndicesBatchingDims.begin(), batchDim)];
++          indicesOrder.push_back(operandDim);
++          indicesShape[operandDim] = size;
 +        }
++      }
++      if (!llvm::is_sorted(indicesOrder)) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Flattened indices require a dimension permutation");
 +      }
 +      gatherShape[indexedDim] = flattenedIndexSize;
 +      indicesShape[indexedDim] = flattenedIndexSize;
@@ -144,7 +150,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    if (indicesShape.size() < gatherShape.size()) {
 +      SmallVector<int64_t> unsqueezedShape(indicesShape);
        for (int64_t od : offsetDims) {
-@@ -6199,21 +6230,30 @@ public:
+@@ -6199,21 +6236,30 @@ public:
                llvm::to_vector_of<int32_t>(unsqueezedShape)));
 +      indicesShape = std::move(unsqueezedShape);
 +    }
@@ -189,7 +195,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    rewriter.replaceOp(srcOp, gather);
 +
      return success();
-@@ -6220,6 +6260,126 @@ class StableHLOGatherWindowToGatherDimPattern
+@@ -6220,6 +6266,126 @@ class StableHLOGatherWindowToGatherDimPattern
    }
  };
 
@@ -316,7 +322,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  // Converts stablehlo.gather to ttir.slice_dynamic when the gather is
  // semantically a dynamic slice. This is the case when:
  // - No batching dims
-@@ -10421,2 +10581,3 @@ static void addGatherOpConversionPattern
+@@ -10421,2 +10587,3 @@ static void addGatherOpConversionPattern
    patterns.add<StableHLOGatherToGatherDimPattern>(typeConverter, ctx);
 +  patterns.add<StableHLOGatherWindowToGatherDimPattern>(typeConverter, ctx);
    patterns.add<StableHLOGatherToSliceRepeatConcatPattern>(typeConverter, ctx);
