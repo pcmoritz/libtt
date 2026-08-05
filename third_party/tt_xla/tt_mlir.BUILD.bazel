@@ -1315,6 +1315,13 @@ cc_library(
         ],
         allow_empty = True,
     ) + [
+        "runtime/lib/ttnn/operations/conv/conv1d.cpp",
+        "runtime/lib/ttnn/operations/conv/conv2d.cpp",
+        "runtime/lib/ttnn/operations/conv/conv_transpose2d.cpp",
+        "runtime/lib/ttnn/operations/conv/prepare_conv2d_bias.cpp",
+        "runtime/lib/ttnn/operations/conv/prepare_conv2d_weights.cpp",
+        "runtime/lib/ttnn/operations/conv/prepare_conv_transpose2d_bias.cpp",
+        "runtime/lib/ttnn/operations/conv/prepare_conv_transpose2d_weights.cpp",
         "@//third_party/tt_xla:tt_mlir_runtime_cold_stubs.cc",
         "@//third_party/tt_xla:tt_mlir_runtime_conv_stubs.cc",
         "@//third_party/tt_xla:tt_mlir_runtime_debug_stubs.cc",
