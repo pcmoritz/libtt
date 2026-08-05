@@ -1,0 +1,217 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -2341,16 +2341,10 @@ private:
+     mlir::Value newConv;
+     if (isTransposed) {
+       // [TODO](mmanzoor) Verify the implementation of transposed convolution
+       // for tt-xla. https://github.com/tenstorrent/tt-mlir/issues/3293
+-      // stablehlo.convolution op doesn't have output_padding
+-      // attribute. So Torch-MLIR adds output_padding with padding attribute for
+-      // transposed convolution during lowering.
+-      // https://github.com/llvm/torch-mlir/blob/main/lib/Conversion/TorchToStablehlo/Linear.cpp
+-      auto outputPaddingAttr = rewriter.getDenseI32ArrayAttr(
+-          {static_cast<int32_t>(paddingMatrix[SPATIAL_DIM_HEIGHT][1] -
+-                                paddingMatrix[SPATIAL_DIM_HEIGHT][0]),
+-           static_cast<int32_t>(paddingMatrix[SPATIAL_DIM_WIDTH][1] -
+-                                paddingMatrix[SPATIAL_DIM_WIDTH][0])});
++      // StableHLO represents output padding through asymmetric padding.
++      // Preserve that asymmetry directly instead of using output_padding.
++      auto outputPaddingAttr = rewriter.getDenseI32ArrayAttr({0, 0});
+       // Recomputing padding attribute based on Torch-MLIR lowering of
+       // conv_transposed2d op: [top, left, bottom, right].
+       // https://github.com/llvm/torch-mlir/blob/main/lib/Conversion/TorchToStablehlo/Linear.cpp
+@@ -2368,10 +2362,10 @@ private:
+                                paddingMatrix[SPATIAL_DIM_WIDTH][0]),
+           static_cast<int32_t>((weightType.getShape()[kernelHeightDim] - 1) *
+                                    rhsDilation[SPATIAL_DIM_HEIGHT] -
+-                               paddingMatrix[SPATIAL_DIM_HEIGHT][0]),
++                               paddingMatrix[SPATIAL_DIM_HEIGHT][1]),
+           static_cast<int32_t>((weightType.getShape()[kernelWidthDim] - 1) *
+                                    rhsDilation[SPATIAL_DIM_WIDTH] -
+-                               paddingMatrix[SPATIAL_DIM_WIDTH][0]),
++                               paddingMatrix[SPATIAL_DIM_WIDTH][1]),
+       });
+       // Input dilation (lhs dilation) is used for stride for transposed
+       // convolution.
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -2329,18 +2329,16 @@ public:
+     }
+     auto paddingAttr = *maybePaddingAttr;
+ 
+-    if (paddingAttr[0] != paddingAttr[2] || paddingAttr[1] != paddingAttr[3]) {
+-      return op.emitOpError()
+-             << "TTNN only supports padding height/width attributes. Thus, "
+-                "padding_top/padding_left must equal "
+-                "padding_bottom/padding_right "
+-                "for the op to execute as expected.";
++    if (paddingAttr[0] == paddingAttr[2] &&
++        paddingAttr[1] == paddingAttr[3]) {
++      paddingAttr = rewriter.getDenseI32ArrayAttr(
++          {paddingAttr[0], paddingAttr[1]});
++    } else {
++      // Reorder (pT, pL, pB, pR) to TTNN's (pT, pB, pL, pR).
++      paddingAttr = rewriter.getDenseI32ArrayAttr(
++          {paddingAttr[0], paddingAttr[2], paddingAttr[1], paddingAttr[3]});
+     }
+ 
+-    // Padding only supports 2 values in TTNN.
+-    auto reducedPaddingAttr =
+-        rewriter.getDenseI32ArrayAttr({paddingAttr[0], paddingAttr[1]});
+-
+     auto outputPaddingAttr =
+         attrToDenseI32ArrayAttr(adaptor.getOutputPadding(), rewriter);
+     if (auto error = outputPaddingAttr.takeError()) {
+@@ -2364,6 +2361,6 @@ public:
+         adaptor.getWeight(), adaptor.getBias(), device, inChannelsAttr,
+         outChannelsAttr, batchSizeAttr, inputHeightAttr, inputWidthAttr,
+-        kernelSizeAttr, *strideAttr, reducedPaddingAttr, *outputPaddingAttr,
++        kernelSizeAttr, *strideAttr, paddingAttr, *outputPaddingAttr,
+         *dilationAttr, groupsAttr, conv2dConfigAttr,
+         /*compute_config=*/nullptr,
+         /*conv2d_slice_config=*/nullptr);
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -1180,9 +1180,18 @@ mlir::LogicalResult mlir::tt::ttnn::ConvTranspose2dOp::verify() {
+   int32_t Hin = getInputHeight();
+   int32_t Win = getInputWidth();
+ 
+-  int32_t expectedHOut = (Hin - 1) * stride[0] - 2 * padding[0] +
++  if (padding.size() != 2 && padding.size() != 4) {
++    return emitOpError() << "Padding must have 2 or 4 elements. Received "
++                         << padding.size() << " elements.";
++  }
++
++  int32_t paddingHeight =
++      padding.size() == 4 ? padding[0] + padding[1] : 2 * padding[0];
++  int32_t paddingWidth =
++      padding.size() == 4 ? padding[2] + padding[3] : 2 * padding[1];
++  int32_t expectedHOut = (Hin - 1) * stride[0] - paddingHeight +
+                          dilation[0] * (kernelHeight - 1) + outputPadding[0] +
+                          1;
+-  int32_t expectedWOut = (Win - 1) * stride[1] - 2 * padding[1] +
++  int32_t expectedWOut = (Win - 1) * stride[1] - paddingWidth +
+                          dilation[1] * (kernelWidth - 1) + outputPadding[1] + 1;
+   if (expectedHOut < 0 || expectedWOut < 0) {
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -2348,8 +2348,8 @@ def TTNN_ConvTranspose2dOp : TTNN_Op<"conv_transpose2d", [TTNN_ComputeKernelConfigOpInterface]> {
+           - K_W is the width of the kernel
+ 
+         - `output` AnyRankedTensor: expected in the following format (N, H_out, W_out, O) where:
+-          - H_out = (H_in - 1) * stride[0] - 2 * padding[0] + dilation[0] * (K_H - 1) + output_padding[0] + 1
+-          - W_out = (W_in - 1) * stride[1] - 2 * padding[1] + dilation[1] * (K_W - 1) + output_padding[1] + 1
++          - H_out = (H_in - 1) * stride[0] - (padding_top + padding_bottom) + dilation[0] * (K_H - 1) + output_padding[0] + 1
++          - W_out = (W_in - 1) * stride[1] - (padding_left + padding_right) + dilation[1] * (K_W - 1) + output_padding[1] + 1
+ 
+       Attributes:
+         - `in_channels` i32: The number of input channels.
+@@ -2360,7 +2360,9 @@ def TTNN_ConvTranspose2dOp : TTNN_Op<"conv_transpose2d", [TTNN_ComputeKernelConfigOpInterface]> {
+         - `input_width` i32: The input width.
+         - `kernel_size` array<2xi32>: The kernel size.
+         - `stride` array<2xi32>: Controls the stride for the cross-correlation.
+-        - `padding` array<2xi32>: Controls the amount of implicit zero padding on both sides for dilation * (kernel_size - 1) - padding number of points.
++        - `padding` (array<2xi32> | array<4xi32>):
++          - array<2xi32>: [pH, pW] for symmetric height and width padding.
++          - array<4xi32>: [pT, pB, pL, pR] for four-sided padding.
+         - `output_padding` array<2xi32>: Controls the additional size added to one side of the output shape.
+         - `dilation` array<2xi32>: Controls the spacing between the kernel points
+         - `groups` i32: Controls the connections between inputs and outputs. Must be divisible by input and output channels.
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -265,6 +265,17 @@ reorderPool2dPadding(llvm::ArrayRef<int32_t> padding) {
+   };
+ }
+ 
++// ConvTranspose2d stores four-sided padding in tt-metal's
++// [top, bottom, left, right] order.
++std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>>
++convertConvTranspose2dPadding(llvm::ArrayRef<int32_t> padding) {
++  if (padding.size() == 2) {
++    return conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(padding);
++  }
++  assert(padding.size() == 4);
++  return conversion::convertLLVMArrayRefToStdArray<uint32_t, 4>(padding);
++}
++
+ /**
+  * @brief Convenience wrapper to get a DataType from a TTNNLayout attr that
+  * may be a nullptr. Returns std::nullopt if layout is nullptr
+@@ -695,7 +706,7 @@ llvm::Expected<::ttnn::TensorSpec> getPrepareConv2dWeightsOpOutputTensorSpec(
+         input_width,
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(stride),
+-        detail::reorderPool2dPadding(padding), outputPaddingArr,
++        detail::convertConvTranspose2dPadding(padding), outputPaddingArr,
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation),
+         hasBias, groups, device, *inputDtype, outputDtype,
+         conv2dConfigConverted,
+@@ -795,7 +806,7 @@ getPrepareConv2dBiasOpOutputTensorSpec(
+         in_channels, out_channels, batch_size, input_height, input_width,
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(stride),
+-        detail::reorderPool2dPadding(padding),
++        detail::convertConvTranspose2dPadding(padding),
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation),
+         groups, device, *inputDtype, outputDtype, conv2dConfigConverted,
+         /*compute_config_=*/std::nullopt,
+@@ -5662,7 +5673,7 @@ llvm::Expected<OpConstraints> OpModel<ConvTranspose2dOp>::getOpConstraints(
+         in_channels, out_channels, batch_size, input_height, input_width,
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(stride),
+-        conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(padding),
++        detail::convertConvTranspose2dPadding(padding),
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(output_padding),
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation),
+         groups, outputDtype, biasSpec, conv2dConfigConverted,
+@@ -5744,7 +5755,7 @@ llvm::Expected<size_t> OpModel<ConvTranspose2dOp>::getOpRuntime(
+         in_channels, out_channels, batch_size, input_height, input_width,
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(stride),
+-        conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(padding),
++        detail::convertConvTranspose2dPadding(padding),
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(output_padding),
+         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation),
+         groups, outputDtype, biasSpec, conv2dConfigConverted,
+diff --git a/runtime/lib/ttnn/operations/conv/conv_transpose2d.cpp b/runtime/lib/ttnn/operations/conv/conv_transpose2d.cpp
+--- a/runtime/lib/ttnn/operations/conv/conv_transpose2d.cpp
++++ b/runtime/lib/ttnn/operations/conv/conv_transpose2d.cpp
+@@ -30,7 +30,8 @@ void run(const ::tt::target::ttnn::ConvTranspose2dOp *op,
+   LOG_ASSERT(op->kernel_size()->size() == 2,
+              "Kernel size expected to have 2 elements");
+   LOG_ASSERT(op->stride()->size() == 2, "Stride expected to have 2 elements");
+-  LOG_ASSERT(op->padding()->size() == 2, "Padding expected to have 2 elements");
++  LOG_ASSERT(op->padding()->size() == 2 || op->padding()->size() == 4,
++             "Padding expected to have 2 or 4 elements");
+   LOG_ASSERT(op->output_padding()->size() == 2,
+              "Output padding expected to have 2 elements");
+   LOG_ASSERT(op->dilation()->size() == 2,
+@@ -38,11 +39,21 @@ void run(const ::tt::target::ttnn::ConvTranspose2dOp *op,
+ 
+-  std::array<uint32_t, 2> kernelSize, stride, padding, outputPadding, dilation;
++  std::array<uint32_t, 2> kernelSize, stride, outputPadding, dilation;
+   std::copy_n(op->kernel_size()->begin(), 2, kernelSize.begin());
+   std::copy_n(op->stride()->begin(), 2, stride.begin());
+-  std::copy_n(op->padding()->begin(), 2, padding.begin());
+   std::copy_n(op->output_padding()->begin(), 2, outputPadding.begin());
+   std::copy_n(op->dilation()->begin(), 2, dilation.begin());
+ 
++  std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>> padding;
++  if (op->padding()->size() == 2) {
++    std::array<uint32_t, 2> symPadding;
++    std::copy_n(op->padding()->begin(), 2, symPadding.begin());
++    padding = symPadding;
++  } else {
++    std::array<uint32_t, 4> asymPadding;
++    std::copy_n(op->padding()->begin(), 4, asymPadding.begin());
++    padding = asymPadding;
++  }
++
+   std::optional<::ttnn::DataType> outputDtype;
+   if (op->output_dtype()) {
+     outputDtype =
