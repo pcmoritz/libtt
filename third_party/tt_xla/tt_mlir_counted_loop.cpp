@@ -116,6 +116,9 @@ public:
 
     auto getInvariantStateIndex = [&](Value value,
                                       Block &regionBlock) -> std::optional<int32_t> {
+      if (!value) {
+        return std::nullopt;
+      }
       auto argument = dyn_cast<BlockArgument>(value);
       if (!argument || argument.getOwner() != &regionBlock) {
         return std::nullopt;
