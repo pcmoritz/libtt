@@ -12,7 +12,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 
      if (op.getWindowReversal() &&
          llvm::any_of(*op.getWindowReversal(), ttmlir::utils::identity<bool>)) {
-@@ -1638,6 +1642,182 @@ protected:
+@@ -1638,6 +1642,183 @@ protected:
                                                ttnnConvolutionKernelLayout);
    }
  };
@@ -153,6 +153,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        llvm::any_of(lhsDilation, [](int64_t value) { return value > 1; });
 +    bool hasWindowStride =
 +        llvm::any_of(windowStrides, [](int64_t value) { return value > 1; });
++    // Preserve unit-stride input dilation for the native transposed-conv path.
 +    if (!hasInputDilation || !hasWindowStride) {
 +      return failure();
 +    }
@@ -195,7 +196,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  } // namespace
 
  // Helper structure to hold sliced convolution inputs for batch group
-@@ -2083,6 +2263,9 @@ private:
+@@ -2083,6 +2264,9 @@ private:
 
      const auto &dn = adaptor.getDimensionNumbers();
      auto inputType = mlir::cast<RankedTensorType>(adaptor.getLhs().getType());
@@ -205,7 +206,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto weightType = mlir::cast<RankedTensorType>(adaptor.getRhs().getType());
      auto inputSpatialDims = dn.getInputSpatialDimensions();
      auto kernelSpatialDims = dn.getKernelSpatialDimensions();
-@@ -2318,7 +2501,12 @@ private:
+@@ -2318,7 +2502,12 @@ private:
      int64_t widthDim = outputWidthDim;
      int64_t channelDim = outputChannelDim;
 
@@ -219,7 +220,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 
      Value permutedWeight = weight;
      // TTNN api handles reversing weights internally for transposed convolution.
-@@ -2327,6 +2515,8 @@ private:
+@@ -2327,6 +2516,8 @@ private:
          isTransposed && reverseOp) {
        permutedWeight = reverseOp.getInput();
      }
@@ -228,7 +229,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto weightType = mlir::cast<RankedTensorType>(permutedWeight.getType());
      auto kernelPermutation = generateConvKernelPermutation(
          op, isTransposed ? conv2dTransposeKernelLayout : conv2dKernelLayout);
-@@ -2448,7 +2638,8 @@ private:
+@@ -2448,7 +2639,8 @@ private:
            /*flattenedCompatInfo=*/nullptr);
      }
 
@@ -238,7 +239,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    }
  };
  } // namespace
-@@ -10485,6 +10676,8 @@ static void addConv2dOpConversionPattern
+@@ -10485,6 +10677,8 @@ static void addConv2dOpConversionPattern
                                           TypeConverter &typeConverter) {
    patterns.add<StableHLOToTTIRConvolutionOpConversionPattern>(typeConverter,
                                                                ctx);
