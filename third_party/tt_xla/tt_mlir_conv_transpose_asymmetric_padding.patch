@@ -1,6 +1,27 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -2512,13 +2512,14 @@ private:
+     Value permutedWeight = weight;
+-    // TTNN api handles reversing weights internally for transposed convolution.
+-    // So stablehlo.reverse op is ignored and its operand is used as weight.
+-    if (auto reverseOp = permutedWeight.getDefiningOp<ttir::ReverseOp>();
+-        isTransposed && reverseOp) {
+-      permutedWeight = reverseOp.getInput();
+-    }
+     permutedWeight = castToElementType(rewriter, op.getLoc(), permutedWeight,
+                                        computeElementType);
+     auto weightType = mlir::cast<RankedTensorType>(permutedWeight.getType());
++    if (isTransposed) {
++      // TTNN reverses transposed-convolution weights internally. Reverse here
++      // so that StableHLO retains its cross-correlation semantics.
++      permutedWeight = rewriter.create<ttir::ReverseOp>(
++          op.getLoc(), weightType, permutedWeight,
++          adaptor.getDimensionNumbers().getKernelSpatialDimensions());
++    }
+     auto kernelPermutation = generateConvKernelPermutation(
+         op, isTransposed ? conv2dTransposeKernelLayout : conv2dKernelLayout);
+     auto weightOutputShape = ::ttmlir::utils::applyPermutation(
 @@ -2341,16 +2341,10 @@ private:
      mlir::Value newConv;
      if (isTransposed) {
@@ -21,7 +42,18 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        // Recomputing padding attribute based on Torch-MLIR lowering of
        // conv_transposed2d op: [top, left, bottom, right].
        // https://github.com/llvm/torch-mlir/blob/main/lib/Conversion/TorchToStablehlo/Linear.cpp
-@@ -2368,10 +2362,10 @@ private:
+@@ -2358,20 +2352,38 @@ private:
+       auto kernelSpatialDims =
+           adaptor.getDimensionNumbers().getKernelSpatialDimensions();
+       int64_t kernelHeightDim = kernelSpatialDims[SPATIAL_DIM_HEIGHT];
+       int64_t kernelWidthDim = kernelSpatialDims[SPATIAL_DIM_WIDTH];
+-      paddingAttr = rewriter.getDenseI32ArrayAttr({
++      SmallVector<int32_t> transposePadding = {
+           static_cast<int32_t>((weightType.getShape()[kernelHeightDim] - 1) *
+                                    rhsDilation[SPATIAL_DIM_HEIGHT] -
+                                paddingMatrix[SPATIAL_DIM_HEIGHT][0]),
+           static_cast<int32_t>((weightType.getShape()[kernelWidthDim] - 1) *
+                                    rhsDilation[SPATIAL_DIM_WIDTH] -
                                 paddingMatrix[SPATIAL_DIM_WIDTH][0]),
            static_cast<int32_t>((weightType.getShape()[kernelHeightDim] - 1) *
                                     rhsDilation[SPATIAL_DIM_HEIGHT] -
@@ -31,9 +63,64 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
                                     rhsDilation[SPATIAL_DIM_WIDTH] -
 -                               paddingMatrix[SPATIAL_DIM_WIDTH][0]),
 +                               paddingMatrix[SPATIAL_DIM_WIDTH][1]),
-       });
+-      });
++      };
++
++      // TTNN cannot represent negative transposed-convolution padding. Run
++      // the convolution with that padding clamped and zero-pad its output.
++      SmallVector<int32_t> outputPad(2 * outputType.getRank(), 0);
++      outputPad[2 * heightDim] = std::max(-transposePadding[0], 0);
++      outputPad[2 * widthDim] = std::max(-transposePadding[1], 0);
++      outputPad[2 * heightDim + 1] = std::max(-transposePadding[2], 0);
++      outputPad[2 * widthDim + 1] = std::max(-transposePadding[3], 0);
++      for (int32_t &value : transposePadding) {
++        value = std::max(value, 0);
++      }
++      paddingAttr = rewriter.getDenseI32ArrayAttr(transposePadding);
++
++      SmallVector<int64_t> convOutputShape(outputType.getShape());
++      for (auto [dim, size] : llvm::enumerate(convOutputShape)) {
++        size -= outputPad[2 * dim] + outputPad[2 * dim + 1];
++      }
++      auto convOutputType = outputType.clone(convOutputShape);
        // Input dilation (lhs dilation) is used for stride for transposed
        // convolution.
+@@ -2443,7 +2455,7 @@ private:
+
+       // Use full builder with explicit dimension attributes.
+       newConv = rewriter.create<ttir::ConvTranspose2dOp>(
+-          op.getLoc(), outputType, convInput, Value(permutedWeight), Value(),
++          op.getLoc(), convOutputType, convInput, Value(permutedWeight), Value(),
+           inputDilationAttr, paddingAttr, outputPaddingAttr, dilationAttr,
+           rewriter.getI32IntegerAttr(groups),
+           rewriter.getI64IntegerAttr(batchDim),
+@@ -2452,6 +2464,12 @@ private:
+           rewriter.getI64IntegerAttr(widthDim),
+           rewriter.getI64IntegerAttr(channelDim));
+
++      if (convOutputType != outputType) {
++        newConv = rewriter.create<ttir::PadOp>(
++            op.getLoc(), outputType, newConv,
++            rewriter.getDenseI32ArrayAttr(outputPad),
++            rewriter.getF32FloatAttr(0.0));
++      }
+     } else {
+
+       // Use full builder with explicit dimension attributes.
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -2233,8 +2233,8 @@ mlir::LogicalResult mlir::tt::ttir::ConvTranspose2dOp::verify() {
+     }
+   }
+
+-  int64_t inputBatchSize = inputType.getDimSize(0);
+-  int64_t outputBatchSize = outputType.getDimSize(0);
++  int64_t inputBatchSize = inputType.getDimSize(getBatchDim());
++  int64_t outputBatchSize = outputType.getDimSize(getBatchDim());
+   if (flatInfo) {
+     inputBatchSize = flatInfo.getBatchSize();
+     outputBatchSize = flatInfo.getBatchSize();
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
