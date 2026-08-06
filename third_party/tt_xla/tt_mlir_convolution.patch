@@ -1,7 +1,18 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -1640,6 +1640,204 @@ protected:
+@@ -1582,6 +1582,10 @@
+   }
+
+   static bool isSupportedConv(mlir::stablehlo::ConvolutionOp op) {
++    Type elementType = getElementTypeOrSelf(op.getLhs());
++    if (!elementType.isIntOrFloat() || hasUnsupportedFloatType(elementType)) {
++      return false;
++    }
+
+     if (op.getWindowReversal() &&
+         llvm::any_of(*op.getWindowReversal(), ttmlir::utils::identity<bool>)) {
+@@ -1640,6 +1644,184 @@
  };
  } // namespace
  
@@ -17,13 +28,6 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      return failure();
 +    }
 +
-+    Type elementType = getElementTypeOrSelf(adaptor.getLhs());
-+    if (!mlir::isa<FloatType, IntegerType>(elementType) ||
-+        (mlir::isa<FloatType>(elementType) &&
-+         hasUnsupportedFloatType(elementType))) {
-+      return failure();
-+    }
-+
 +    const auto &dims = adaptor.getDimensionNumbers();
 +    if (dims.getInputBatchDimension() != 0 ||
 +        dims.getInputFeatureDimension() != 1 ||
@@ -33,10 +37,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
 +    auto resultType = mlir::cast<RankedTensorType>(
 +        getTypeConverter()->convertType(op.getType()));
-+    Type computeElementType = resultType.getElementType();
-+    if (mlir::isa<IntegerType>(computeElementType)) {
-+      computeElementType = rewriter.getF32Type();
-+    }
++    Type computeElementType = mlir::isa<IntegerType>(resultType.getElementType())
++                                  ? rewriter.getF32Type()
++                                  : resultType.getElementType();
 +
 +    Value lhs = adaptor.getLhs();
 +    Value rhs = adaptor.getRhs();
@@ -76,11 +79,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      int64_t batch = outputShape[0];
 +      int64_t inputFeatures = rhsType.getShape()[1];
 +      int64_t outputFeaturesPerGroup = outputShape[1] / groupCount;
-+      SmallVector<int64_t> lhsShape;
 +      if (adaptor.getFeatureGroupCount() > 1) {
-+        lhsShape = {batch, groupCount, inputFeatures};
 +        lhs = ttir::utils::createReshapeOp(rewriter, op.getLoc(), lhs,
-+                                            lhsShape);
++                                            {batch, groupCount, inputFeatures});
 +        lhs = rewriter.create<ttir::PermuteOp>(
 +            op.getLoc(),
 +            RankedTensorType::get({groupCount, batch, inputFeatures},
@@ -88,9 +89,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +                                  resultType.getEncoding()),
 +            lhs, SmallVector<int64_t>{1, 0, 2});
 +      } else {
-+        lhsShape = {groupCount, batch, inputFeatures};
 +        lhs = ttir::utils::createReshapeOp(rewriter, op.getLoc(), lhs,
-+                                            lhsShape);
++                                            {groupCount, batch, inputFeatures});
 +      }
 +
 +      SmallVector<int64_t> rhsShape{groupCount, outputFeaturesPerGroup,
@@ -145,20 +145,15 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      return failure();
 +    }
 +
-+    Type elementType = getElementTypeOrSelf(adaptor.getLhs());
-+    if (!mlir::isa<FloatType, IntegerType>(elementType) ||
-+        (mlir::isa<FloatType>(elementType) &&
-+         hasUnsupportedFloatType(elementType))) {
-+      return failure();
-+    }
-+
 +    auto lhsDilation =
 +        getI64ArrayOrDefault(adaptor.getLhsDilationAttr(), 2, 1);
 +    auto windowStrides =
 +        getI64ArrayOrDefault(adaptor.getWindowStridesAttr(), 2, 1);
-+    if (llvm::none_of(lhsDilation, [](int64_t value) { return value > 1; }) ||
-+        llvm::none_of(windowStrides,
-+                      [](int64_t value) { return value > 1; })) {
++    bool hasInputDilation =
++        llvm::any_of(lhsDilation, [](int64_t value) { return value > 1; });
++    bool hasWindowStride =
++        llvm::any_of(windowStrides, [](int64_t value) { return value > 1; });
++    if (!hasInputDilation || !hasWindowStride) {
 +      return failure();
 +    }
 +
@@ -167,37 +162,33 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    if (inputType.getNumElements() == 0) {
 +      return failure();
 +    }
-+    SmallVector<int64_t> paddedShape(inputType.getShape());
 +    SmallVector<int64_t> interiorPadding(inputType.getRank(), 0);
-+    for (auto [index, dim] : llvm::enumerate(
-+             adaptor.getDimensionNumbers().getInputSpatialDimensions())) {
-+      int64_t dilation = lhsDilation[index];
-+      paddedShape[dim] = (paddedShape[dim] - 1) * dilation + 1;
++    for (auto [dim, dilation] : llvm::zip_equal(
++             adaptor.getDimensionNumbers().getInputSpatialDimensions(),
++             lhsDilation)) {
 +      interiorPadding[dim] = dilation - 1;
 +    }
 +
++    Type elementType = inputType.getElementType();
 +    auto zeroType = RankedTensorType::get({}, elementType);
 +    auto zeroAttr = DenseElementsAttr::get(
 +        zeroType, rewriter.getZeroAttr(elementType));
 +    Value zero = rewriter.create<ttir::ConstantOp>(op.getLoc(), zeroType,
 +                                                    zeroAttr);
 +    SmallVector<int64_t> edgePadding(inputType.getRank(), 0);
-+    Value padded = rewriter.create<mlir::stablehlo::PadOp>(
-+        op.getLoc(), inputType.clone(paddedShape), input, zero,
-+        rewriter.getDenseI64ArrayAttr(edgePadding),
-+        rewriter.getDenseI64ArrayAttr(edgePadding),
-+        rewriter.getDenseI64ArrayAttr(interiorPadding));
++    Value padded = mlir::stablehlo::PadOp::create(
++        rewriter, op.getLoc(), input, zero, edgePadding, edgePadding,
++        interiorPadding);
 +
 +    auto resultType = mlir::cast<RankedTensorType>(
 +        getTypeConverter()->convertType(op.getType()));
-+    auto newConv = mlir::stablehlo::ConvolutionOp::create(
-+        rewriter, op.getLoc(), resultType, padded, adaptor.getRhs(),
++    rewriter.replaceOpWithNewOp<mlir::stablehlo::ConvolutionOp>(
++        op, resultType, padded, adaptor.getRhs(),
 +        adaptor.getWindowStridesAttr(), adaptor.getPaddingAttr(),
 +        rewriter.getDenseI64ArrayAttr({1, 1}), adaptor.getRhsDilationAttr(),
 +        adaptor.getWindowReversalAttr(), adaptor.getDimensionNumbers(),
 +        adaptor.getFeatureGroupCount(), adaptor.getBatchGroupCount(),
 +        op.getPrecisionConfigAttr());
-+    rewriter.replaceOp(op, newConv);
 +    return success();
 +  }
 +};
@@ -206,7 +197,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  // Helper structure to hold sliced convolution inputs for batch group
  // decomposition.
  struct ConvolutionSlices {
-@@ -2084,5 +2282,8 @@ private:
+@@ -2083,6 +2265,9 @@
+
      const auto &dn = adaptor.getDimensionNumbers();
      auto inputType = mlir::cast<RankedTensorType>(adaptor.getLhs().getType());
 +    if (mlir::isa<IntegerType>(inputType.getElementType())) {
@@ -215,17 +207,16 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto weightType = mlir::cast<RankedTensorType>(adaptor.getRhs().getType());
      auto inputSpatialDims = dn.getInputSpatialDimensions();
      auto kernelSpatialDims = dn.getKernelSpatialDimensions();
-@@ -2318,15 +2519,31 @@ private:
+@@ -2318,7 +2503,17 @@
      int64_t widthDim = outputWidthDim;
      int64_t channelDim = outputChannelDim;
  
 -    RankedTensorType outputType = inputType.clone(outputShape);
 +    RankedTensorType resultType = mlir::cast<RankedTensorType>(
 +        getTypeConverter()->convertType(op.getType())).clone(outputShape);
-+    Type computeElementType = resultType.getElementType();
-+    if (mlir::isa<IntegerType>(computeElementType)) {
-+      computeElementType = rewriter.getF32Type();
-+    }
++    Type computeElementType = mlir::isa<IntegerType>(resultType.getElementType())
++                                  ? rewriter.getF32Type()
++                                  : resultType.getElementType();
 +    RankedTensorType outputType = resultType.clone(computeElementType);
 +    if (inputType.getElementType() != computeElementType) {
 +      auto convInputType = mlir::cast<RankedTensorType>(convInput.getType());
@@ -235,9 +226,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      Value permutedWeight = weight;
      // TTNN api handles reversing weights internally for transposed convolution.
-     // So stablehlo.reverse op is ignored and its operand is used as weight.
-     if (auto reverseOp = permutedWeight.getDefiningOp<ttir::ReverseOp>();
-         isTransposed && reverseOp) {
+@@ -2328,6 +2523,11 @@
        permutedWeight = reverseOp.getInput();
      }
      auto weightType = mlir::cast<RankedTensorType>(permutedWeight.getType());
@@ -248,7 +237,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
      auto kernelPermutation = generateConvKernelPermutation(
          op, isTransposed ? conv2dTransposeKernelLayout : conv2dKernelLayout);
-@@ -2449,6 +2666,10 @@ private:
+     auto weightOutputShape = ::ttmlir::utils::applyPermutation(
+@@ -2448,6 +2648,10 @@
            /*flattenedCompatInfo=*/nullptr);
      }
  
@@ -259,7 +249,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      return newConv;
    }
  };
-@@ -10485,5 +10706,7 @@ static void addConv2dOpConversionPattern(MLIRContext *ctx,
+@@ -10485,6 +10689,8 @@
+                                          TypeConverter &typeConverter) {
    patterns.add<StableHLOToTTIRConvolutionOpConversionPattern>(typeConverter,
                                                                ctx);
 +  patterns.add<Convolution0DToDotGeneralPattern>(typeConverter, ctx);
