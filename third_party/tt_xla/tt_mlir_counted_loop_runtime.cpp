@@ -8,6 +8,7 @@
 #include "tt/runtime/detail/ttnn/ttnn.h"
 #include "tt/runtime/detail/ttnn/utils.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -59,8 +60,17 @@ int64_t getScalarInteger(const ::tt::runtime::Tensor &tensor) {
         utils::getScalarFromTensor<uint16_t>(hostTensor));
   case ::ttnn::DataType::UINT8:
     return static_cast<int8_t>(utils::getScalarFromTensor<uint8_t>(hostTensor));
+  case ::ttnn::DataType::FLOAT32:
+    return utils::getScalarFromTensor<float>(hostTensor) != 0;
+  case ::ttnn::DataType::BFLOAT16:
+    return static_cast<float>(utils::getScalarFromTensor<bfloat16>(hostTensor)) !=
+           0;
+  case ::ttnn::DataType::FLOAT16:
+    return static_cast<float>(
+               utils::getScalarFromTensor<::tt::tt_metal::float16>(hostTensor)) !=
+           0;
   default:
-    LOG_FATAL("Unsupported counted loop bound data type");
+    LOG_FATAL("Unsupported loop scalar data type");
   }
 }
 
@@ -89,6 +99,14 @@ void run(const ::tt::target::ttnn::CountedLoopOp *op,
         context.getTensorPool().getRuntimeTensorAndValidate(
             op->inputs()->Get(i)));
   }
+  std::vector<const void *> inputHandles;
+  inputHandles.reserve(state.size() + captures.size());
+  for (const auto &tensor : state) {
+    inputHandles.push_back(tensor.handle.get());
+  }
+  for (const auto &tensor : captures) {
+    inputHandles.push_back(tensor.handle.get());
+  }
 
   auto getBound = [&](int32_t index, int64_t constant) {
     if (index < 0) {
@@ -101,31 +119,21 @@ void run(const ::tt::target::ttnn::CountedLoopOp *op,
     }
     return getScalarInteger(captures[index - state.size()]);
   };
-  int64_t initial = getBound(op->initial_index(), op->initial());
-  int64_t limit = getBound(op->limit_index(), op->limit());
-  uint64_t tripCount = 0;
-  if (initial < limit) {
-    int64_t step = getBound(op->step_index(), op->step());
-    LOG_ASSERT(step > 0, "Counted loop requires a positive step");
-    uint64_t distance =
-        static_cast<uint64_t>(limit) - static_cast<uint64_t>(initial);
-    tripCount = (distance + static_cast<uint64_t>(step) - 1) /
-                static_cast<uint64_t>(step);
-  }
 
-  for (uint64_t iteration = 0; iteration < tripCount; ++iteration) {
-    std::vector<::tt::runtime::Tensor> bodyInputs;
-    bodyInputs.reserve(state.size() + captures.size());
-    bodyInputs.insert(bodyInputs.end(), state.begin(), state.end());
-    bodyInputs.insert(bodyInputs.end(), captures.begin(), captures.end());
-    ProgramExecutor body(context.getDeviceHandle(),
-                         context.getExecutableHandle(), op->program_id(),
-                         bodyInputs,
-                         /*constEvalProgram=*/false);
-    ScopedTensorRetention retention(bodyInputs);
-    body.execute();
-    std::vector<::tt::runtime::Tensor> bodyOutputs =
-        body.gatherOutputTensors();
+  auto execute = [&](uint32_t programId) {
+    std::vector<::tt::runtime::Tensor> inputs;
+    inputs.reserve(state.size() + captures.size());
+    inputs.insert(inputs.end(), state.begin(), state.end());
+    inputs.insert(inputs.end(), captures.begin(), captures.end());
+    ScopedTensorRetention retention(inputs);
+    ProgramExecutor program(context.getDeviceHandle(),
+                            context.getExecutableHandle(), programId, inputs,
+                            /*constEvalProgram=*/false);
+    program.execute();
+    return program.gatherOutputTensors();
+  };
+  auto executeBody = [&] {
+    std::vector<::tt::runtime::Tensor> bodyOutputs = execute(op->program_id());
     LOG_ASSERT(bodyOutputs.size() == op->output_indices()->size(),
                "Counted loop body output arity mismatch");
     for (size_t i = 0; i < bodyOutputs.size(); ++i) {
@@ -134,12 +142,48 @@ void run(const ::tt::target::ttnn::CountedLoopOp *op,
                  "Counted loop output index is out of range");
       state[stateIndex] = std::move(bodyOutputs[i]);
     }
+  };
+
+  if (op->condition_program_id() >= 0) {
+    while (true) {
+      std::vector<::tt::runtime::Tensor> conditionOutputs =
+          execute(static_cast<uint32_t>(op->condition_program_id()));
+      LOG_ASSERT(conditionOutputs.size() == 1,
+                 "Loop condition must return one value");
+      if (getScalarInteger(conditionOutputs.front()) == 0) {
+        break;
+      }
+      executeBody();
+    }
+  } else {
+    int64_t initial = getBound(op->initial_index(), op->initial());
+    int64_t limit = getBound(op->limit_index(), op->limit());
+    uint64_t tripCount = 0;
+    if (initial < limit) {
+      int64_t step = getBound(op->step_index(), op->step());
+      LOG_ASSERT(step > 0, "Counted loop requires a positive step");
+      uint64_t distance =
+          static_cast<uint64_t>(limit) - static_cast<uint64_t>(initial);
+      tripCount = (distance + static_cast<uint64_t>(step) - 1) /
+                  static_cast<uint64_t>(step);
+    }
+    for (uint64_t iteration = 0; iteration < tripCount; ++iteration) {
+      executeBody();
+    }
   }
 
   for (size_t i = 0; i < op->outputs()->size(); ++i) {
     uint32_t stateIndex = op->output_indices()->Get(i);
     LOG_ASSERT(stateIndex < state.size(),
                "Counted loop output index is out of range");
+    // A zero-iteration loop can return an input directly. Keep that shared
+    // tensor alive when the caller deallocates the input after this operation.
+    if (std::find(inputHandles.begin(), inputHandles.end(),
+                  state[stateIndex].handle.get()) != inputHandles.end()) {
+      state[stateIndex]
+          .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
+          .setRetain(true);
+    }
     context.getTensorPool().insertRuntimeTensorAndValidate(
         op->outputs()->Get(i), state[stateIndex]);
   }
