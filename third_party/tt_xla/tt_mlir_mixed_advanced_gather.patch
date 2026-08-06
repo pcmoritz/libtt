@@ -195,7 +195,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    rewriter.replaceOp(srcOp, gather);
 +
      return success();
-@@ -6220,6 +6266,126 @@ class StableHLOGatherWindowToGatherDimPattern
+@@ -6220,6 +6266,128 @@ class StableHLOGatherWindowToGatherDimPattern
    }
  };
 
