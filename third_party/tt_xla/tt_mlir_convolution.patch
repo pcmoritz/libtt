@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -1582,6 +1582,10 @@
+@@ -1582,6 +1582,10 @@ protected:
    }
 
    static bool isSupportedConv(mlir::stablehlo::ConvolutionOp op) {
@@ -12,11 +12,28 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 
      if (op.getWindowReversal() &&
          llvm::any_of(*op.getWindowReversal(), ttmlir::utils::identity<bool>)) {
-@@ -1640,6 +1644,184 @@
+@@ -1638,6 +1642,182 @@ protected:
+                                               ttnnConvolutionKernelLayout);
+   }
  };
- } // namespace
- 
-+namespace {
++
++static Type getComputeElementType(RankedTensorType resultType,
++                                  ConversionPatternRewriter &rewriter) {
++  return mlir::isa<IntegerType>(resultType.getElementType())
++             ? rewriter.getF32Type()
++             : resultType.getElementType();
++}
++
++static Value castToElementType(ConversionPatternRewriter &rewriter,
++                               Location loc, Value value, Type elementType) {
++  auto type = mlir::cast<RankedTensorType>(value.getType());
++  if (type.getElementType() == elementType) {
++    return value;
++  }
++  return rewriter.create<ttir::TypecastOp>(
++      loc, type.clone(elementType), value);
++}
++
 +struct Convolution0DToDotGeneralPattern
 +    : public ConvolutionDecompositionPattern {
 +  using ConvolutionDecompositionPattern::ConvolutionDecompositionPattern;
@@ -37,74 +54,59 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
 +    auto resultType = mlir::cast<RankedTensorType>(
 +        getTypeConverter()->convertType(op.getType()));
-+    Type computeElementType = mlir::isa<IntegerType>(resultType.getElementType())
-+                                  ? rewriter.getF32Type()
-+                                  : resultType.getElementType();
-+
-+    Value lhs = adaptor.getLhs();
-+    Value rhs = adaptor.getRhs();
-+    auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
-+    auto rhsType = mlir::cast<RankedTensorType>(rhs.getType());
-+    if (dims.getKernelOutputFeatureDimension() != 0) {
-+      rhs = rewriter.create<ttir::PermuteOp>(
-+          op.getLoc(),
-+          rhsType.clone({rhsType.getShape()[1], rhsType.getShape()[0]}), rhs,
-+          SmallVector<int64_t>{1, 0});
-+      rhsType = mlir::cast<RankedTensorType>(rhs.getType());
-+    }
-+    if (lhsType.getElementType() != computeElementType) {
-+      lhs = rewriter.create<ttir::TypecastOp>(
-+          op.getLoc(), lhsType.clone(computeElementType), lhs);
-+    }
-+    if (rhsType.getElementType() != computeElementType) {
-+      rhs = rewriter.create<ttir::TypecastOp>(
-+          op.getLoc(), rhsType.clone(computeElementType), rhs);
-+    }
++    Type computeElementType = getComputeElementType(resultType, rewriter);
++    Value lhs = castToElementType(rewriter, op.getLoc(), adaptor.getLhs(),
++                                  computeElementType);
++    Value rhs = castToElementType(rewriter, op.getLoc(), adaptor.getRhs(),
++                                  computeElementType);
 +
 +    SmallVector<int64_t> outputShape{
 +        resultType.getShape()[dims.getOutputBatchDimension()],
 +        resultType.getShape()[dims.getOutputFeatureDimension()]};
-+    SmallVector<int64_t> contractingDims{1};
++    SmallVector<int64_t> lhsContractingDims{1};
 +    SmallVector<int64_t> noBatchDims;
 +    Value result;
 +    int64_t groupCount = std::max(adaptor.getBatchGroupCount(),
 +                                  adaptor.getFeatureGroupCount());
 +    if (groupCount == 1) {
++      SmallVector<int64_t> rhsContractingDims{
++          dims.getKernelInputFeatureDimension()};
 +      auto dotType = RankedTensorType::get(
 +          outputShape, computeElementType, resultType.getEncoding());
 +      result = rewriter.create<ttir::DotGeneralOp>(
-+          op.getLoc(), dotType, lhs, rhs, noBatchDims, contractingDims,
-+          noBatchDims, contractingDims);
++          op.getLoc(), dotType, lhs, rhs, noBatchDims, lhsContractingDims,
++          noBatchDims, rhsContractingDims);
 +    } else {
++      auto rhsType = mlir::cast<RankedTensorType>(rhs.getType());
++      if (dims.getKernelOutputFeatureDimension() != 0) {
++        rhs = rewriter.create<ttir::PermuteOp>(
++            op.getLoc(),
++            rhsType.clone({rhsType.getShape()[1], rhsType.getShape()[0]}), rhs,
++            SmallVector<int64_t>{1, 0});
++        rhsType = mlir::cast<RankedTensorType>(rhs.getType());
++      }
 +      int64_t batch = outputShape[0];
 +      int64_t inputFeatures = rhsType.getShape()[1];
 +      int64_t outputFeaturesPerGroup = outputShape[1] / groupCount;
-+      if (adaptor.getFeatureGroupCount() > 1) {
-+        lhs = ttir::utils::createReshapeOp(rewriter, op.getLoc(), lhs,
-+                                            {batch, groupCount, inputFeatures});
-+        lhs = rewriter.create<ttir::PermuteOp>(
-+            op.getLoc(),
-+            RankedTensorType::get({groupCount, batch, inputFeatures},
-+                                  computeElementType,
-+                                  resultType.getEncoding()),
-+            lhs, SmallVector<int64_t>{1, 0, 2});
-+      } else {
-+        lhs = ttir::utils::createReshapeOp(rewriter, op.getLoc(), lhs,
-+                                            {groupCount, batch, inputFeatures});
-+      }
++      bool featureGrouped = adaptor.getFeatureGroupCount() > 1;
++      lhs = ttir::utils::createReshapeOp(
++          rewriter, op.getLoc(), lhs,
++          {featureGrouped ? batch : groupCount,
++           featureGrouped ? groupCount : batch, inputFeatures});
 +
 +      SmallVector<int64_t> rhsShape{groupCount, outputFeaturesPerGroup,
 +                                    inputFeatures};
 +      rhs = ttir::utils::createReshapeOp(rewriter, op.getLoc(), rhs,
 +                                          rhsShape);
-+      SmallVector<int64_t> batchDims{0};
++      SmallVector<int64_t> lhsBatchDims{featureGrouped ? 1 : 0};
++      SmallVector<int64_t> rhsBatchDims{0};
 +      SmallVector<int64_t> groupedContractingDims{2};
 +      auto dotType = RankedTensorType::get(
 +          {groupCount, batch, outputFeaturesPerGroup}, computeElementType,
 +          resultType.getEncoding());
 +      result = rewriter.create<ttir::DotGeneralOp>(
-+          op.getLoc(), dotType, lhs, rhs, batchDims, groupedContractingDims,
-+          batchDims, groupedContractingDims);
++          op.getLoc(), dotType, lhs, rhs, lhsBatchDims,
++          groupedContractingDims, rhsBatchDims, groupedContractingDims);
 +      result = rewriter.create<ttir::PermuteOp>(
 +          op.getLoc(),
 +          RankedTensorType::get({batch, groupCount, outputFeaturesPerGroup},
@@ -120,11 +122,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          op.getLoc(), resultType.clone(computeElementType), result,
 +          SmallVector<int64_t>{1, 0});
 +    }
-+    if (computeElementType != resultType.getElementType()) {
-+      result = rewriter.create<ttir::TypecastOp>(op.getLoc(), resultType,
-+                                                  result);
-+    }
-+    rewriter.replaceOp(op, result);
++    rewriter.replaceOp(
++        op, castToElementType(rewriter, op.getLoc(), result,
++                              resultType.getElementType()));
 +    return success();
 +  }
 +};
@@ -192,12 +192,10 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    return success();
 +  }
 +};
-+} // namespace
-+
+ } // namespace
+
  // Helper structure to hold sliced convolution inputs for batch group
- // decomposition.
- struct ConvolutionSlices {
-@@ -2083,6 +2265,9 @@
+@@ -2083,6 +2263,9 @@ private:
 
      const auto &dn = adaptor.getDimensionNumbers();
      auto inputType = mlir::cast<RankedTensorType>(adaptor.getLhs().getType());
@@ -207,49 +205,40 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto weightType = mlir::cast<RankedTensorType>(adaptor.getRhs().getType());
      auto inputSpatialDims = dn.getInputSpatialDimensions();
      auto kernelSpatialDims = dn.getKernelSpatialDimensions();
-@@ -2318,7 +2503,17 @@
+@@ -2318,7 +2501,12 @@ private:
      int64_t widthDim = outputWidthDim;
      int64_t channelDim = outputChannelDim;
- 
+
 -    RankedTensorType outputType = inputType.clone(outputShape);
 +    RankedTensorType resultType = mlir::cast<RankedTensorType>(
 +        getTypeConverter()->convertType(op.getType())).clone(outputShape);
-+    Type computeElementType = mlir::isa<IntegerType>(resultType.getElementType())
-+                                  ? rewriter.getF32Type()
-+                                  : resultType.getElementType();
++    Type computeElementType = getComputeElementType(resultType, rewriter);
 +    RankedTensorType outputType = resultType.clone(computeElementType);
-+    if (inputType.getElementType() != computeElementType) {
-+      auto convInputType = mlir::cast<RankedTensorType>(convInput.getType());
-+      convInput = rewriter.create<ttir::TypecastOp>(
-+          op.getLoc(), convInputType.clone(computeElementType), convInput);
-+    }
- 
++    convInput = castToElementType(rewriter, op.getLoc(), convInput,
++                                  computeElementType);
+
      Value permutedWeight = weight;
      // TTNN api handles reversing weights internally for transposed convolution.
-@@ -2328,6 +2523,11 @@
+@@ -2327,6 +2515,8 @@ private:
+         isTransposed && reverseOp) {
        permutedWeight = reverseOp.getInput();
      }
++    permutedWeight = castToElementType(rewriter, op.getLoc(), permutedWeight,
++                                       computeElementType);
      auto weightType = mlir::cast<RankedTensorType>(permutedWeight.getType());
-+    if (weightType.getElementType() != computeElementType) {
-+      permutedWeight = rewriter.create<ttir::TypecastOp>(
-+          op.getLoc(), weightType.clone(computeElementType), permutedWeight);
-+      weightType = mlir::cast<RankedTensorType>(permutedWeight.getType());
-+    }
      auto kernelPermutation = generateConvKernelPermutation(
          op, isTransposed ? conv2dTransposeKernelLayout : conv2dKernelLayout);
-     auto weightOutputShape = ::ttmlir::utils::applyPermutation(
-@@ -2448,6 +2648,10 @@
+@@ -2448,7 +2638,8 @@ private:
            /*flattenedCompatInfo=*/nullptr);
      }
- 
-+    if (outputType != resultType) {
-+      newConv = rewriter.create<ttir::TypecastOp>(op.getLoc(), resultType,
-+                                                  newConv);
-+    }
-     return newConv;
+
+-    return newConv;
++    return castToElementType(rewriter, op.getLoc(), newConv,
++                             resultType.getElementType());
    }
  };
-@@ -10485,6 +10689,8 @@
+ } // namespace
+@@ -10485,6 +10676,8 @@ static void addConv2dOpConversionPattern
                                           TypeConverter &typeConverter) {
    patterns.add<StableHLOToTTIRConvolutionOpConversionPattern>(typeConverter,
                                                                ctx);
