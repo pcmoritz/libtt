@@ -94,16 +94,24 @@ void run(const ::tt::target::ttnn::CountedLoopOp *op,
     if (index < 0) {
       return constant;
     }
-    LOG_ASSERT(static_cast<size_t>(index) < state.size(),
+    LOG_ASSERT(static_cast<size_t>(index) < op->inputs()->size(),
                "Counted loop bound index is out of range");
-    return getScalarInteger(state[index]);
+    if (static_cast<size_t>(index) < state.size()) {
+      return getScalarInteger(state[index]);
+    }
+    return getScalarInteger(captures[index - state.size()]);
   };
   int64_t initial = getBound(op->initial_index(), op->initial());
   int64_t limit = getBound(op->limit_index(), op->limit());
-  uint64_t tripCount = initial < limit
-                           ? static_cast<uint64_t>(limit) -
-                                 static_cast<uint64_t>(initial)
-                           : 0;
+  uint64_t tripCount = 0;
+  if (initial < limit) {
+    int64_t step = getBound(op->step_index(), op->step());
+    LOG_ASSERT(step > 0, "Counted loop requires a positive step");
+    uint64_t distance =
+        static_cast<uint64_t>(limit) - static_cast<uint64_t>(initial);
+    tripCount = (distance + static_cast<uint64_t>(step) - 1) /
+                static_cast<uint64_t>(step);
+  }
 
   for (uint64_t iteration = 0; iteration < tripCount; ++iteration) {
     std::vector<::tt::runtime::Tensor> bodyInputs;

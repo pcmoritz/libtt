@@ -33,10 +33,13 @@ constexpr llvm::StringLiteral kCountedLoopAttr = "tt.counted_loop";
 constexpr llvm::StringLiteral kCountedLoopInitialAttr =
     "tt.counted_loop_initial";
 constexpr llvm::StringLiteral kCountedLoopLimitAttr = "tt.counted_loop_limit";
+constexpr llvm::StringLiteral kCountedLoopStepAttr = "tt.counted_loop_step";
 constexpr llvm::StringLiteral kCountedLoopInitialIndexAttr =
     "tt.counted_loop_initial_index";
 constexpr llvm::StringLiteral kCountedLoopLimitIndexAttr =
     "tt.counted_loop_limit_index";
+constexpr llvm::StringLiteral kCountedLoopStepIndexAttr =
+    "tt.counted_loop_step_index";
 constexpr llvm::StringLiteral kCountedLoopStateCountAttr =
     "tt.counted_loop_state_count";
 constexpr llvm::StringLiteral kCountedLoopOutputIndicesAttr =
@@ -63,8 +66,7 @@ FailureOr<int64_t> getScalarInteger(Value value) {
 }
 
 // Outline the canonical counted while emitted by JAX. Its scalar integer
-// counter and limit may be constants or runtime values, and the counter must
-// advance by one while it is less than the loop-invariant limit.
+// counter, limit, and positive step may be constants or runtime values.
 class CountedWhileOpConversionPattern
     : public OpConversionPattern<stablehlo::WhileOp> {
 public:
@@ -110,16 +112,30 @@ public:
     }
     FailureOr<int64_t> initial = getScalarInteger(initialValue);
 
+    auto getInvariantStateIndex = [&](Value value,
+                                      Block &regionBlock) -> std::optional<int32_t> {
+      auto argument = dyn_cast<BlockArgument>(value);
+      if (!argument || argument.getOwner() != &regionBlock) {
+        return std::nullopt;
+      }
+      int32_t index = static_cast<int32_t>(argument.getArgNumber());
+      if (bodyReturn.getOperand(index) != body.front().getArgument(index)) {
+        return std::nullopt;
+      }
+      return index;
+    };
+
     FailureOr<int64_t> limit = getScalarInteger(compare.getRhs());
     int32_t limitIndex = -1;
+    Value capturedLimit;
     if (failed(limit)) {
-      auto limitArgument = dyn_cast<BlockArgument>(compare.getRhs());
-      if (!limitArgument || limitArgument.getOwner() != &cond.front()) {
-        return failure();
-      }
-      limitIndex = static_cast<int32_t>(limitArgument.getArgNumber());
-      if (bodyReturn.getOperand(limitIndex) !=
-          body.front().getArgument(limitIndex)) {
+      std::optional<int32_t> index =
+          getInvariantStateIndex(compare.getRhs(), cond.front());
+      if (index) {
+        limitIndex = *index;
+      } else if (isScalarInteger(compare.getRhs())) {
+        capturedLimit = compare.getRhs();
+      } else {
         return failure();
       }
     }
@@ -134,7 +150,20 @@ public:
       step = increment.getLhs();
     }
     FailureOr<int64_t> stepValue = getScalarInteger(step);
-    if (failed(stepValue) || *stepValue != 1) {
+    int32_t stepIndex = -1;
+    Value capturedStep;
+    if (failed(stepValue)) {
+      std::optional<int32_t> index =
+          getInvariantStateIndex(step, body.front());
+      if (index) {
+        stepIndex = *index;
+      } else if (isScalarInteger(step)) {
+        capturedStep = step;
+      } else {
+        return failure();
+      }
+    }
+    if (succeeded(stepValue) && *stepValue <= 0) {
       return failure();
     }
 
@@ -163,12 +192,35 @@ public:
     }
 
     llvm::SetVector<Value> captures;
+    getUsedValuesDefinedAbove(MutableArrayRef<Region>(&cond, 1), captures);
     getUsedValuesDefinedAbove(MutableArrayRef<Region>(&body, 1), captures);
     SmallVector<Value> bodyOperands(adaptor.getOperands());
     SmallVector<Value> convertedCaptures;
     if (failed(rewriter.getRemappedValues(captures.getArrayRef(),
                                           convertedCaptures))) {
       return failure();
+    }
+    auto resolveCapture = [&](Value captured) -> FailureOr<int32_t> {
+      auto capture = llvm::find(captures, captured);
+      if (capture == captures.end()) {
+        return failure();
+      }
+      return static_cast<int32_t>(whileOp.getNumOperands() +
+                                  std::distance(captures.begin(), capture));
+    };
+    if (capturedLimit) {
+      FailureOr<int32_t> index = resolveCapture(capturedLimit);
+      if (failed(index)) {
+        return failure();
+      }
+      limitIndex = *index;
+    }
+    if (capturedStep) {
+      FailureOr<int32_t> index = resolveCapture(capturedStep);
+      if (failed(index)) {
+        return failure();
+      }
+      stepIndex = *index;
     }
     llvm::append_range(bodyOperands, convertedCaptures);
 
@@ -216,6 +268,10 @@ public:
       bodyFunc->setAttr(kCountedLoopLimitAttr,
                         rewriter.getI64IntegerAttr(succeeded(limit) ? *limit
                                                                    : 0));
+      bodyFunc->setAttr(kCountedLoopStepAttr,
+                        rewriter.getI64IntegerAttr(succeeded(stepValue)
+                                                       ? *stepValue
+                                                       : 0));
       bodyFunc->setAttr(kCountedLoopInitialIndexAttr,
                         rewriter.getI32IntegerAttr(
                             succeeded(initial)
@@ -223,6 +279,8 @@ public:
                                 : static_cast<int32_t>(counterIndex)));
       bodyFunc->setAttr(kCountedLoopLimitIndexAttr,
                         rewriter.getI32IntegerAttr(limitIndex));
+      bodyFunc->setAttr(kCountedLoopStepIndexAttr,
+                        rewriter.getI32IntegerAttr(stepIndex));
       bodyFunc->setAttr(kCountedLoopStateCountAttr,
                         rewriter.getI32IntegerAttr(whileOp.getNumOperands()));
       bodyFunc->setAttr(kCountedLoopOutputIndicesAttr,
@@ -338,10 +396,14 @@ createCountedLoopOperation(
       body->getAttrOfType<IntegerAttr>(kCountedLoopInitialAttr).getInt();
   int64_t limit =
       body->getAttrOfType<IntegerAttr>(kCountedLoopLimitAttr).getInt();
+  int64_t step =
+      body->getAttrOfType<IntegerAttr>(kCountedLoopStepAttr).getInt();
   int32_t initialIndex = static_cast<int32_t>(
       body->getAttrOfType<IntegerAttr>(kCountedLoopInitialIndexAttr).getInt());
   int32_t limitIndex = static_cast<int32_t>(
       body->getAttrOfType<IntegerAttr>(kCountedLoopLimitIndexAttr).getInt());
+  int32_t stepIndex = static_cast<int32_t>(
+      body->getAttrOfType<IntegerAttr>(kCountedLoopStepIndexAttr).getInt());
   uint32_t stateCount = static_cast<uint32_t>(
       body->getAttrOfType<IntegerAttr>(kCountedLoopStateCountAttr).getInt());
   std::vector<uint32_t> outputIndices;
@@ -352,8 +414,8 @@ createCountedLoopOperation(
     outputIndices.push_back(static_cast<uint32_t>(index));
   }
   auto loop = ::tt::target::ttnn::CreateCountedLoopOpDirect(
-      *cache.fbb, program->second, initial, limit, initialIndex, limitIndex,
-      stateCount, &outputIndices, &inputs, &outputs);
+      *cache.fbb, program->second, initial, limit, step, initialIndex,
+      limitIndex, stepIndex, stateCount, &outputIndices, &inputs, &outputs);
   return ::tt::target::ttnn::CreateOperationDirect(
       *cache.fbb,
       ::tt::target::ttnn::OpTypeTraits<
