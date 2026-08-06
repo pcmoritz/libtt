@@ -1,9 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -2320,18 +2320,19 @@ private:
-     }
-
+@@ -2512,13 +2512,14 @@ private:
      Value permutedWeight = weight;
 -    // TTNN api handles reversing weights internally for transposed convolution.
 -    // So stablehlo.reverse op is ignored and its operand is used as weight.
@@ -11,12 +9,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -        isTransposed && reverseOp) {
 -      permutedWeight = reverseOp.getInput();
 -    }
+     permutedWeight = castToElementType(rewriter, op.getLoc(), permutedWeight,
+                                        computeElementType);
      auto weightType = mlir::cast<RankedTensorType>(permutedWeight.getType());
-     if (weightType.getElementType() != computeElementType) {
-       permutedWeight = rewriter.create<ttir::TypecastOp>(
-           op.getLoc(), weightType.clone(computeElementType), permutedWeight);
-       weightType = mlir::cast<RankedTensorType>(permutedWeight.getType());
-     }
 +    if (isTransposed) {
 +      // TTNN reverses transposed-convolution weights internally. Reverse here
 +      // so that StableHLO retains its cross-correlation semantics.
