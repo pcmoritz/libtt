@@ -184,29 +184,21 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
                          .step = *resolvedStep};
 }
 
-std::string getUniqueLoopFunctionName(stablehlo::WhileOp whileOp,
-                                      llvm::StringRef suffix) {
-  ModuleOp module = whileOp->getParentOfType<ModuleOp>();
-  auto parentFunc = whileOp->getParentOfType<func::FuncOp>();
-  std::string name = parentFunc.getSymName().str() + suffix.str();
-  for (unsigned index = 0; SymbolTable::lookupSymbolIn(module, name); ++index) {
-    name = parentFunc.getSymName().str() + suffix.str() + "_" +
-           std::to_string(index);
-  }
-  return name;
-}
-
 func::FuncOp outlineLoopRegion(ConversionPatternRewriter &rewriter,
                                stablehlo::WhileOp whileOp, Region &region,
-                               llvm::StringRef name, ValueRange loopOperands,
+                               llvm::StringRef suffix, ValueRange loopOperands,
                                ArrayRef<Value> captures, TypeRange resultTypes,
                                ArrayRef<int32_t> resultIndices) {
   OpBuilder::InsertionGuard guard(rewriter);
   ModuleOp module = whileOp->getParentOfType<ModuleOp>();
+  SymbolTable symbolTable(module);
+  auto parentFunc = whileOp->getParentOfType<func::FuncOp>();
+  std::string name = parentFunc.getSymName().str() + suffix.str();
   rewriter.setInsertionPointToEnd(module.getBody());
   auto function = rewriter.create<func::FuncOp>(
       whileOp.getLoc(), name,
       rewriter.getFunctionType(loopOperands.getTypes(), resultTypes));
+  symbolTable.insert(function);
   function.setPrivate();
   ttmlir::utils::setFunctionType(
       function, ttmlir::utils::FunctionType::ForwardDevice);
@@ -294,11 +286,10 @@ public:
         return failure();
       }
     }
-    std::string bodyName = getUniqueLoopFunctionName(
-        whileOp, succeeded(countedLoop) ? "_counted_loop" : "_while_body");
-    outlineLoopRegion(rewriter, whileOp, body, bodyName, loopOperands,
-                      captures.getArrayRef(), TypeRange(outputs->types),
-                      outputs->indices);
+    func::FuncOp bodyFunction = outlineLoopRegion(
+        rewriter, whileOp, body,
+        succeeded(countedLoop) ? "_counted_loop" : "_while_body", loopOperands,
+        captures.getArrayRef(), TypeRange(outputs->types), outputs->indices);
 
     FlatSymbolRefAttr conditionProgram;
     ttcore::LoopBoundAttr initial;
@@ -309,20 +300,19 @@ public:
       limit = getLoopBoundAttr(rewriter, countedLoop->limit);
       step = getLoopBoundAttr(rewriter, countedLoop->step);
     } else {
-      std::string conditionName =
-          getUniqueLoopFunctionName(whileOp, "_while_condition");
       SmallVector<Type> conditionResultTypes{conditionResultType};
       SmallVector<int32_t> conditionResultIndices{0};
-      outlineLoopRegion(rewriter, whileOp, cond, conditionName, loopOperands,
-                        captures.getArrayRef(), conditionResultTypes,
-                        conditionResultIndices);
-      conditionProgram =
-          FlatSymbolRefAttr::get(rewriter.getContext(), conditionName);
+      func::FuncOp conditionFunction = outlineLoopRegion(
+          rewriter, whileOp, cond, "_while_condition", loopOperands,
+          captures.getArrayRef(), conditionResultTypes,
+          conditionResultIndices);
+      conditionProgram = FlatSymbolRefAttr::get(rewriter.getContext(),
+                                                conditionFunction.getSymName());
     }
 
     auto loop = rewriter.create<ttcore::WhileLoopOp>(
         whileOp.getLoc(), outputs->types,
-        FlatSymbolRefAttr::get(rewriter.getContext(), bodyName),
+        FlatSymbolRefAttr::get(rewriter.getContext(), bodyFunction.getSymName()),
         conditionProgram, initial, limit, step,
         rewriter.getI32IntegerAttr(whileOp.getNumOperands()),
         rewriter.getDenseI32ArrayAttr(outputs->indices), loopOperands);
