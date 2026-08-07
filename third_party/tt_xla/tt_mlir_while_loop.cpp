@@ -20,8 +20,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/ErrorHandling.h"
 
-#include <cassert>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -463,16 +463,21 @@ createWhileLoopOperation(
     const llvm::StringMap<uint32_t> &programIndexMap,
     const std::string &debugString, const std::string &locInfo) {
   func::FuncOp body = getWhileLoopBody(call);
-  assert(body && "while loop body function not found");
-  auto program = programIndexMap.find(call.getCallee());
-  assert(program != programIndexMap.end() && "loop body function not found");
+  if (!body) {
+    llvm::report_fatal_error("while loop body function not found");
+  }
+  auto bodyIt = programIndexMap.find(call.getCallee());
+  if (bodyIt == programIndexMap.end()) {
+    llvm::report_fatal_error("loop body program not found");
+  }
   int32_t conditionProgram = -1;
   if (auto condition =
           body->getAttrOfType<FlatSymbolRefAttr>(kLoopConditionAttr)) {
-    auto program = programIndexMap.find(condition.getValue());
-    assert(program != programIndexMap.end() &&
-           "loop condition function not found");
-    conditionProgram = static_cast<int32_t>(program->second);
+    auto conditionIt = programIndexMap.find(condition.getValue());
+    if (conditionIt == programIndexMap.end()) {
+      llvm::report_fatal_error("loop condition program not found");
+    }
+    conditionProgram = static_cast<int32_t>(conditionIt->second);
   }
 
   std::vector<::flatbuffers::Offset<::tt::target::ttnn::TensorRef>> inputs;
@@ -514,7 +519,7 @@ createWhileLoopOperation(
     outputIndices.push_back(static_cast<uint32_t>(index));
   }
   auto loop = ::tt::target::ttnn::CreateWhileLoopOpDirect(
-      *cache.fbb, program->second, conditionProgram, initial, limit, step,
+      *cache.fbb, bodyIt->second, conditionProgram, initial, limit, step,
       initialIndex, limitIndex, stepIndex, stateCount, &outputIndices, &inputs,
       &outputs);
   return ::tt::target::ttnn::CreateOperationDirect(
