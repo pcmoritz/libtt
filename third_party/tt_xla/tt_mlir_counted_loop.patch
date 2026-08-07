@@ -1,0 +1,317 @@
+diff --git a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
+--- a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
++++ b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
+@@ -11,3 +11,20 @@ table FuncCallOp {
+   outputs: [tt.target.ttnn.TensorRef];
+   semaphore_inputs: [tt.target.ttnn.GlobalSemaphoreRef];
+ }
++
++// Repeatedly invoke a private program, updating the state slots named by
++// output_indices after each invocation.
++table CountedLoopOp {
++  program_id: uint32;
++  condition_program_id: int32 = -1;
++  initial: int64;
++  limit: int64;
++  step: int64;
++  initial_index: int32 = -1;
++  limit_index: int32 = -1;
++  step_index: int32 = -1;
++  state_count: uint32;
++  output_indices: [uint32];
++  inputs: [tt.target.ttnn.TensorRef];
++  outputs: [tt.target.ttnn.TensorRef];
++}
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -55,6 +55,7 @@ union OpType {
+   NLPCreateQKVHeadsDecodeOp,
+   NLPConcatHeadsOp,
+   ConstantOp,
++  CountedLoopOp,
+   Conv1dOp,
+   Conv2dOp,
+   ConvTranspose2dOp,
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -11446,8 +11446,14 @@ namespace mlir::tt {
+ namespace mlir::tt {
+ 
++void populateStableHLOCountedLoopToTTIRPatterns(
++    MLIRContext *context, RewritePatternSet &patterns,
++    TypeConverter &typeConverter);
++
+ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
+                                      RewritePatternSet &patterns,
+                                      TypeConverter &typeConverter) {
++  populateStableHLOCountedLoopToTTIRPatterns(ctx, patterns, typeConverter);
++
+   addElementwiseUnaryOpsConversionPatterns(ctx, patterns, typeConverter);
+   addElementwiseBinaryOpsConversionPatterns(ctx, patterns, typeConverter);
+   addQuantizeOpsConversionPattern(ctx, patterns, typeConverter);
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -43,3 +43,11 @@ namespace mlir::tt::ttnn {
++bool isCountedLoopCall(func::CallOp call);
++
++::flatbuffers::Offset<::tt::target::ttnn::Operation>
++createCountedLoopOperation(
++    FlatbufferObjectCache &cache, func::CallOp call,
++    const llvm::StringMap<uint32_t> &programIndexMap,
++    const std::string &debugString, const std::string &locInfo);
++
+ #define GEN_PASS_DEF_TTNNSERIALIZETOBINARY
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
+ 
+@@ -4883,2 +4891,7 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
++  if (auto funcCallOp = dyn_cast<func::CallOp>(op);
++      funcCallOp && isCountedLoopCall(funcCallOp)) {
++    return createCountedLoopOperation(cache, funcCallOp, programIndexMap,
++                                      debugString, locInfo);
++  }
+   if (auto funcCallOp = dyn_cast<func::CallOp>(op);
+       funcCallOp && !isCpuHoistedFuncCall(funcCallOp)) {
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -27,2 +27,4 @@ namespace mlir::tt::ttnn {
++void populateCountedLoopLayoutPatterns(RewritePatternSet &patterns);
++
+ #define GEN_PASS_DEF_TTNNLAYOUT
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
+@@ -827,4 +829,5 @@ public:
+       RewritePatternSet patterns(&getContext());
+       patterns.add<TTNNLayoutRewriter>(&getContext());
++      populateCountedLoopLayoutPatterns(patterns);
+       // Update the return op output layout based on its consumers
+       // Logic here should match that of TTNNLayoutFuncInputOutputTypeRewriter
+diff --git a/runtime/lib/ttnn/operations/mlir_native/func_call.h b/runtime/lib/ttnn/operations/mlir_native/func_call.h
+--- a/runtime/lib/ttnn/operations/mlir_native/func_call.h
++++ b/runtime/lib/ttnn/operations/mlir_native/func_call.h
+@@ -11,5 +11,7 @@
+ namespace tt::runtime::ttnn::operations::mlir_native {
+ 
+ void run(const ::tt::target::ttnn::FuncCallOp *op, ProgramContext &context);
++void run(const ::tt::target::ttnn::CountedLoopOp *op,
++         ProgramContext &context);
+ 
+ } // namespace tt::runtime::ttnn::operations::mlir_native
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -358,5 +358,9 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+     return operations::mlir_native::run(op->type_as_FuncCallOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::CountedLoopOp: {
++    return operations::mlir_native::run(op->type_as_CountedLoopOp(),
++                                        getContext());
++  }
+   case ::tt::target::ttnn::OpType::CumSumOp: {
+     return operations::reduction::cumsum::run(op->type_as_CumSumOp(),
+                                               getContext());
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -1554,6 +1554,11 @@ std::vector<const ::tt::target::ttnn::TensorRef *>
+         opContext.type_as_FuncCallOp()->outputs());
+     break;
+   }
++  case ::tt::target::ttnn::OpType::CountedLoopOp: {
++    tensorRefs = utils::convertFbTensorRefsToVector(
++        opContext.type_as_CountedLoopOp()->outputs());
++    break;
++  }
+   case ::tt::target::ttnn::OpType::CaptureOrExecuteTraceOp: {
+     tensorRefs = utils::convertFbTensorRefsToVector(
+         opContext.type_as_CaptureOrExecuteTraceOp()->outputs());
+@@ -2190,6 +2195,12 @@ std::vector<const ::tt::target::ttnn::TensorRef *>
+     }
+     break;
+   }
++  case ::tt::target::ttnn::OpType::CountedLoopOp: {
++    for (const auto *input : *opContext.type_as_CountedLoopOp()->inputs()) {
++      tensorRefs.push_back(input);
++    }
++    break;
++  }
+   case ::tt::target::ttnn::OpType::WriteTensorOp: {
+     tensorRefs = {opContext.type_as_WriteTensorOp()->host_tensor(),
+                   opContext.type_as_WriteTensorOp()->device_tensor()};
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+@@ -449,4 +449,9 @@ def TTNNTraceHoistTransform : Pass<"ttnn-trace-hoist-transform", "::mlir::Modul
+ 
+   }];
++  let options = [
++    Option<"traceAll", "trace-all", "bool", /*default=*/"true",
++           "Trace every forward device function. When false, trace only "
++           "data-dependent loop bodies.">
++  ];
+ }
+ 
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -527,8 +527,9 @@ void createTTNNPipeline(OpPassManager &pm,
+     // layouts of function arguments (e.g. moving inputs to system_memory). It
+     // is much easier to work at the layout abstraction level than on individual
+     // ops after they have been decomposed.
+-    if (options.enableTrace) {
+-      devicePm.addPass(tt::ttnn::createTTNNTraceHoistTransform());
+-    }
++    TTNNTraceHoistTransformOptions traceOptions;
++    traceOptions.traceAll = options.enableTrace;
++    devicePm.addPass(
++        tt::ttnn::createTTNNTraceHoistTransform(traceOptions));
+ 
+     createTTNNPipelineLayoutDecompositionPass(devicePm, options);
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -30,5 +30,8 @@ inline bool isSemaphoreValue(mlir::Value value) {
+   return isSemaphoreType(value.getType());
+ }
++inline bool isLoopTrace(func::FuncOp funcOp) {
++  return funcOp->hasAttr("tt.loop_condition");
++}
+ } // namespace
+ 
+ class TTNNTraceHoistTransform
+@@ -113,6 +116,9 @@ private:
+       if (!funcOp) {
+         return false;
+       }
++      if (isLoopTrace(funcOp)) {
++        return true;
++      }
+       return shouldKeepArgOnDevice(funcOp, blockArg.getArgNumber());
+     }
+ 
+@@ -292,6 +298,10 @@ private:
+     ttmlir::utils::setFunctionType(traceFuncOp,
+                                    ttmlir::utils::FunctionType::TraceMain);
+ 
++    if (isLoopTrace(funcOp)) {
++      traceFuncOp->setAttr("tt.loop_condition",
++                           funcOp->getAttr("tt.loop_condition"));
++    }
+     traceFuncOp.setAllArgAttrs(inputAttrs);
+     traceFuncOp.setPrivate();
+ 
+@@ -365,6 +375,18 @@ private:
+       RankedTensorType originalRankedTensorType =
+           mlir::cast<RankedTensorType>(traceFuncArg.getType());
+ 
++      // Loop state stays on device, but uses a private slot so replay never
++      // mutates a caller-owned input tensor.
++      if (isLoopTrace(traceFunc)) {
++        if (!utils::isTensorOnDevice(originalRankedTensorType)) {
++          return funcOp.emitError("Loop trace argument ")
++                 << i << " must already be in device memory";
++        }
++        inputTypes.push_back(traceFuncArg.getType());
++        traceInputSlotTypes.push_back(traceFuncArg.getType());
++        continue;
++      }
++
+       // Device-resident arguments (constants, parameters, KV cache) bypass host
+       // transfer. These are already on device and will be used directly as
+       // trace input slots.
+@@ -478,6 +500,16 @@ private:
+         continue;
+       }
+ 
++      if (isLoopTrace(traceFunc)) {
++        mlir::Type traceInputSlotType =
++            traceInputSlotTypes[traceInputSlots.size()];
++        auto copy = builder.create<ttnn::AssignOp>(
++            runAndCaptureTraceFunc.getLoc(), traceInputSlotType, funcArg);
++        traceInputSlots.push_back(copy.getResult());
++        traceCallArgs.push_back(copy.getResult());
++        continue;
++      }
++
+       if (shouldKeepArgOnDevice(traceFunc, i)) {
+         traceInputSlots.push_back(funcArg);
+         traceCallArgs.push_back(funcArg);
+@@ -851,6 +883,15 @@ private:
+   }
+ 
+   mlir::LogicalResult processFuncOp(func::FuncOp funcOp) {
++    // Dynamic slice reads its indices back to the host during execution, but
++    // TT-Metal trace capture does not support device reads.
++    // TODO: Trace dynamic slice once its indices are consumed on device.
++    if (!traceAll &&
++        (!isLoopTrace(funcOp) ||
++         !funcOp.getOps<ttnn::SliceDynamicOp>().empty())) {
++      return mlir::success();
++    }
++
+     // Skip non-forward functions.
+     if (!ttmlir::utils::isForwardDeviceFunc(funcOp)) {
+       return mlir::success();
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+--- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+@@ -63,10 +63,10 @@ public:
+ 
+   uint64_t getGenerationId() const { return generationId; }
+ 
+-  /// Increments the generation id.
++  /// Increments the generation id and releases traces it invalidates.
+   /// Should be called by runtime whenever it performs an operation that may
+   /// invalidate existing traces (e.g. when a new graph is captured).
+-  void incrementGeneration() { generationId++; }
++  void incrementGeneration();
+ 
+ private:
+   std::weak_ptr<::ttnn::MeshDevice> meshDevice;
+diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/trace_cache.cpp
+--- a/runtime/lib/ttnn/types/trace_cache.cpp
++++ b/runtime/lib/ttnn/types/trace_cache.cpp
+@@ -30,6 +30,13 @@ TraceData *TraceCache::get(const MainProgramKey &key,
+   }
+ 
+   return &innerIt->second;
+ }
+ 
++void TraceCache::incrementGeneration() {
++  generationId++;
++  while (!cache.empty()) {
++    erase(cache.begin()->first);
++  }
++}
++
+ void TraceCache::insert(const MainProgramKey &key,
+                         const CaptureExecuteProgramKey &captureExecuteKey,
+                         TraceData traceData) {
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -42,8 +42,7 @@ static void copyTensorFromDeviceToDevice(const ::ttnn::Tensor &srcTensor,
+   LOG_ASSERT(srcTensor.storage_type() == ::ttnn::StorageType::DEVICE &&
+                  dstTensor.storage_type() == ::ttnn::StorageType::DEVICE,
+              "srcTensor must be on device and dstTensor must be on device");
+-  ::ttnn::Tensor hostSrcTensor = ::ttnn::from_device(srcTensor);
+-  ::tt::tt_metal::copy_to_device(hostSrcTensor, dstTensor);
++  ::ttnn::assign(srcTensor, dstTensor);
+ }
+ 
+ static void runTraceProgramAndCaptureTrace(
+@@ -195,6 +194,12 @@ static void executeTrace(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+ 
+   for (size_t i = 0; i < op->outputs()->size(); i++) {
+     const ::tt::target::ttnn::TensorRef *output = op->outputs()->Get(i);
++    // Replayed commands overwrite this persistent slot. Give the new value a
++    // fresh version so a later invocation copies it into an input slot when
++    // the trace output is loop-carried state.
++    traceData.outputTensors[i]
++        .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
++        .updateVersion();
+     context.getTensorPool().insertRuntimeTensorAndValidate(
+         output, traceData.outputTensors[i]);
+   }

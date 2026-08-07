@@ -4,6 +4,8 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "loguru.BUILD.bazel",
+    "tt_mlir_counted_loop.cpp",
+    "tt_mlir_counted_loop_runtime.cpp",
     "tt_mlir_compiler_cold_stubs.cc",
     "tt_mlir_runtime_cold_stubs.cc",
     "tt_mlir_runtime_conv_stubs.cc",
