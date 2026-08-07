@@ -30,7 +30,7 @@
 namespace mlir::tt {
 namespace {
 
-constexpr llvm::StringLiteral kCountedLoopAttr = "tt.counted_loop";
+constexpr llvm::StringLiteral kWhileLoopAttr = "tt.while_loop";
 constexpr llvm::StringLiteral kCountedLoopInitialAttr =
     "tt.counted_loop_initial";
 constexpr llvm::StringLiteral kCountedLoopLimitAttr = "tt.counted_loop_limit";
@@ -41,10 +41,10 @@ constexpr llvm::StringLiteral kCountedLoopLimitIndexAttr =
     "tt.counted_loop_limit_index";
 constexpr llvm::StringLiteral kCountedLoopStepIndexAttr =
     "tt.counted_loop_step_index";
-constexpr llvm::StringLiteral kCountedLoopStateCountAttr =
-    "tt.counted_loop_state_count";
-constexpr llvm::StringLiteral kCountedLoopOutputIndicesAttr =
-    "tt.counted_loop_output_indices";
+constexpr llvm::StringLiteral kWhileLoopStateCountAttr =
+    "tt.while_loop_state_count";
+constexpr llvm::StringLiteral kWhileLoopOutputIndicesAttr =
+    "tt.while_loop_output_indices";
 constexpr llvm::StringLiteral kLoopConditionAttr = "tt.loop_condition";
 
 bool isScalarInteger(Value value) {
@@ -323,10 +323,10 @@ public:
     func::FuncOp bodyFunc = outlineLoopRegion(
         rewriter, whileOp, body, bodyName, loopOperands,
         captures.getArrayRef(), TypeRange(outputs->types), outputs->indices);
-    bodyFunc->setAttr(kCountedLoopAttr, rewriter.getUnitAttr());
-    bodyFunc->setAttr(kCountedLoopStateCountAttr,
+    bodyFunc->setAttr(kWhileLoopAttr, rewriter.getUnitAttr());
+    bodyFunc->setAttr(kWhileLoopStateCountAttr,
                       rewriter.getI32IntegerAttr(whileOp.getNumOperands()));
-    bodyFunc->setAttr(kCountedLoopOutputIndicesAttr,
+    bodyFunc->setAttr(kWhileLoopOutputIndicesAttr,
                       rewriter.getDenseI32ArrayAttr(outputs->indices));
 
     if (succeeded(countedLoop)) {
@@ -367,7 +367,7 @@ public:
 
 } // namespace
 
-void populateStableHLOCountedLoopToTTIRPatterns(
+void populateStableHLOWhileLoopToTTIRPatterns(
     MLIRContext *context, RewritePatternSet &patterns,
     TypeConverter &typeConverter) {
   patterns.add<WhileOpConversionPattern>(typeConverter, context);
@@ -375,14 +375,14 @@ void populateStableHLOCountedLoopToTTIRPatterns(
 
 namespace ttnn {
 
-static func::FuncOp getCountedLoopBody(func::CallOp call) {
+static func::FuncOp getWhileLoopBody(func::CallOp call) {
   auto body = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
       call, call.getCalleeAttr());
-  return body && body->hasAttr(kCountedLoopAttr) ? body : func::FuncOp();
+  return body && body->hasAttr(kWhileLoopAttr) ? body : func::FuncOp();
 }
 
-bool isCountedLoopCall(func::CallOp call) {
-  return static_cast<bool>(getCountedLoopBody(call));
+bool isWhileLoopCall(func::CallOp call) {
+  return static_cast<bool>(getWhileLoopBody(call));
 }
 
 namespace {
@@ -407,13 +407,13 @@ public:
   }
 };
 
-class CountedLoopLayoutPattern : public OpRewritePattern<func::CallOp> {
+class WhileLoopLayoutPattern : public OpRewritePattern<func::CallOp> {
 public:
   using OpRewritePattern<func::CallOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(func::CallOp call,
                                 PatternRewriter &rewriter) const override {
-    func::FuncOp body = getCountedLoopBody(call);
+    func::FuncOp body = getWhileLoopBody(call);
     if (!body) {
       return failure();
     }
@@ -447,8 +447,8 @@ public:
 };
 } // namespace
 
-void populateCountedLoopLayoutPatterns(RewritePatternSet &patterns) {
-  patterns.add<OptimizationBarrierLayoutPattern, CountedLoopLayoutPattern>(
+void populateWhileLoopLayoutPatterns(RewritePatternSet &patterns) {
+  patterns.add<OptimizationBarrierLayoutPattern, WhileLoopLayoutPattern>(
       patterns.getContext());
 }
 
@@ -458,12 +458,12 @@ tensorValueToFlatbuffer(FlatbufferObjectCache &cache, Value value,
                         std::optional<RankedTensorType> localShape);
 
 ::flatbuffers::Offset<::tt::target::ttnn::Operation>
-createCountedLoopOperation(
+createWhileLoopOperation(
     FlatbufferObjectCache &cache, func::CallOp call,
     const llvm::StringMap<uint32_t> &programIndexMap,
     const std::string &debugString, const std::string &locInfo) {
-  func::FuncOp body = getCountedLoopBody(call);
-  assert(body && "counted loop body function not found");
+  func::FuncOp body = getWhileLoopBody(call);
+  assert(body && "while loop body function not found");
   auto program = programIndexMap.find(call.getCallee());
   assert(program != programIndexMap.end() && "loop body function not found");
   int32_t conditionProgram = -1;
@@ -505,22 +505,22 @@ createCountedLoopOperation(
         body->getAttrOfType<IntegerAttr>(kCountedLoopStepIndexAttr).getInt());
   }
   uint32_t stateCount = static_cast<uint32_t>(
-      body->getAttrOfType<IntegerAttr>(kCountedLoopStateCountAttr).getInt());
+      body->getAttrOfType<IntegerAttr>(kWhileLoopStateCountAttr).getInt());
   std::vector<uint32_t> outputIndices;
   for (int32_t index : body
                            ->getAttrOfType<DenseI32ArrayAttr>(
-                               kCountedLoopOutputIndicesAttr)
+                               kWhileLoopOutputIndicesAttr)
                            .asArrayRef()) {
     outputIndices.push_back(static_cast<uint32_t>(index));
   }
-  auto loop = ::tt::target::ttnn::CreateCountedLoopOpDirect(
+  auto loop = ::tt::target::ttnn::CreateWhileLoopOpDirect(
       *cache.fbb, program->second, conditionProgram, initial, limit, step,
       initialIndex, limitIndex, stepIndex, stateCount, &outputIndices, &inputs,
       &outputs);
   return ::tt::target::ttnn::CreateOperationDirect(
       *cache.fbb,
       ::tt::target::ttnn::OpTypeTraits<
-          ::tt::target::ttnn::CountedLoopOp>::enum_value,
+          ::tt::target::ttnn::WhileLoopOp>::enum_value,
       loop.Union(), debugString.c_str(), locInfo.c_str());
 }
 

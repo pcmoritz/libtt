@@ -76,13 +76,13 @@ int64_t getScalarInteger(const ::tt::runtime::Tensor &tensor) {
 
 } // namespace
 
-void run(const ::tt::target::ttnn::CountedLoopOp *op,
+void run(const ::tt::target::ttnn::WhileLoopOp *op,
          ProgramContext &context) {
   const size_t stateSize = op->state_count();
   LOG_ASSERT(op->inputs()->size() >= stateSize,
-             "Counted loop has fewer inputs than state values");
+             "While loop has fewer inputs than state values");
   LOG_ASSERT(op->output_indices()->size() == op->outputs()->size(),
-             "Counted loop output mapping arity mismatch");
+             "While loop output mapping arity mismatch");
 
   std::vector<::tt::runtime::Tensor> state;
   state.reserve(stateSize);
@@ -113,7 +113,7 @@ void run(const ::tt::target::ttnn::CountedLoopOp *op,
       return constant;
     }
     LOG_ASSERT(static_cast<size_t>(index) < op->inputs()->size(),
-               "Counted loop bound index is out of range");
+               "While loop bound index is out of range");
     if (static_cast<size_t>(index) < state.size()) {
       return getScalarInteger(state[index]);
     }
@@ -135,11 +135,11 @@ void run(const ::tt::target::ttnn::CountedLoopOp *op,
   auto executeBody = [&] {
     std::vector<::tt::runtime::Tensor> bodyOutputs = execute(op->program_id());
     LOG_ASSERT(bodyOutputs.size() == op->output_indices()->size(),
-               "Counted loop body output arity mismatch");
+               "While loop body output arity mismatch");
     for (size_t i = 0; i < bodyOutputs.size(); ++i) {
       uint32_t stateIndex = op->output_indices()->Get(i);
       LOG_ASSERT(stateIndex < state.size(),
-                 "Counted loop output index is out of range");
+                 "While loop output index is out of range");
       state[stateIndex] = std::move(bodyOutputs[i]);
     }
   };
@@ -175,7 +175,7 @@ void run(const ::tt::target::ttnn::CountedLoopOp *op,
   for (size_t i = 0; i < op->outputs()->size(); ++i) {
     uint32_t stateIndex = op->output_indices()->Get(i);
     LOG_ASSERT(stateIndex < state.size(),
-               "Counted loop output index is out of range");
+               "While loop output index is out of range");
     // A zero-iteration loop can return an input directly. Keep that shared
     // tensor alive when the caller deallocates the input after this operation.
     if (std::find(inputHandles.begin(), inputHandles.end(),

@@ -1237,7 +1237,7 @@ cc_library(
     name = "ttmlir_compiler",
     srcs = [
         "lib/RegisterAll.cpp",
-        "@//third_party/tt_xla:tt_mlir_counted_loop.cpp",
+        "@//third_party/tt_xla:tt_mlir_while_loop.cpp",
         "@//third_party/tt_xla:tt_mlir_compiler_cold_stubs.cc",
     ] + glob(
         [
@@ -1323,7 +1323,7 @@ cc_library(
         "runtime/lib/ttnn/operations/conv/prepare_conv2d_weights.cpp",
         "runtime/lib/ttnn/operations/conv/prepare_conv_transpose2d_bias.cpp",
         "runtime/lib/ttnn/operations/conv/prepare_conv_transpose2d_weights.cpp",
-        "@//third_party/tt_xla:tt_mlir_counted_loop_runtime.cpp",
+        "@//third_party/tt_xla:tt_mlir_while_loop_runtime.cpp",
         "@//third_party/tt_xla:tt_mlir_runtime_cold_stubs.cc",
         "@//third_party/tt_xla:tt_mlir_runtime_conv_stubs.cc",
         "@//third_party/tt_xla:tt_mlir_runtime_debug_stubs.cc",
