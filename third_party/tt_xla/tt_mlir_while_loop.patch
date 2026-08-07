@@ -1,22 +1,24 @@
 diff --git a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
 --- a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
-@@ -11,3 +11,20 @@ table FuncCallOp {
+@@ -11,3 +11,22 @@ table FuncCallOp {
    outputs: [tt.target.ttnn.TensorRef];
    semaphore_inputs: [tt.target.ttnn.GlobalSemaphoreRef];
  }
++
++table LoopBound {
++  constant: int64;
++  input_index: int32 = null;
++}
 +
 +// Repeatedly invoke a private program, updating the state slots named by
 +// output_indices after each invocation.
 +table WhileLoopOp {
 +  program_id: uint32;
 +  condition_program_id: int32 = -1;
-+  initial: int64;
-+  limit: int64;
-+  step: int64;
-+  initial_index: int32 = -1;
-+  limit_index: int32 = -1;
-+  step_index: int32 = -1;
++  initial: LoopBound;
++  limit: LoopBound;
++  step: LoopBound;
 +  state_count: uint32;
 +  output_indices: [uint32];
 +  inputs: [tt.target.ttnn.TensorRef];

@@ -97,13 +97,15 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
     inputHandles.push_back(tensor.handle.get());
   }
 
-  auto getBound = [&](int32_t index, int64_t constant) {
-    if (index < 0) {
-      return constant;
+  auto getBound = [&](const ::tt::target::ttnn::LoopBound *bound) {
+    LOG_ASSERT(bound, "Counted loop is missing a bound");
+    auto index = bound->input_index();
+    if (!index) {
+      return bound->constant();
     }
-    LOG_ASSERT(static_cast<size_t>(index) < op->inputs()->size(),
+    LOG_ASSERT(static_cast<size_t>(*index) < op->inputs()->size(),
                "While loop bound index is out of range");
-    return getScalarInteger(inputs[index]);
+    return getScalarInteger(inputs[*index]);
   };
 
   auto execute = [&](uint32_t programId) {
@@ -138,11 +140,11 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
       executeBody();
     }
   } else {
-    int64_t initial = getBound(op->initial_index(), op->initial());
-    int64_t limit = getBound(op->limit_index(), op->limit());
+    int64_t initial = getBound(op->initial());
+    int64_t limit = getBound(op->limit());
     uint64_t tripCount = 0;
     if (initial < limit) {
-      int64_t step = getBound(op->step_index(), op->step());
+      int64_t step = getBound(op->step());
       LOG_ASSERT(step > 0, "Counted loop requires a positive step");
       uint64_t distance =
           static_cast<uint64_t>(limit) - static_cast<uint64_t>(initial);

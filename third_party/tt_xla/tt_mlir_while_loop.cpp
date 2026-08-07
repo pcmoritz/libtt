@@ -35,12 +35,8 @@ constexpr llvm::StringLiteral kCountedLoopInitialAttr =
     "tt.counted_loop_initial";
 constexpr llvm::StringLiteral kCountedLoopLimitAttr = "tt.counted_loop_limit";
 constexpr llvm::StringLiteral kCountedLoopStepAttr = "tt.counted_loop_step";
-constexpr llvm::StringLiteral kCountedLoopInitialIndexAttr =
-    "tt.counted_loop_initial_index";
-constexpr llvm::StringLiteral kCountedLoopLimitIndexAttr =
-    "tt.counted_loop_limit_index";
-constexpr llvm::StringLiteral kCountedLoopStepIndexAttr =
-    "tt.counted_loop_step_index";
+constexpr llvm::StringLiteral kLoopBoundConstantAttr = "constant";
+constexpr llvm::StringLiteral kLoopBoundInputIndexAttr = "input_index";
 constexpr llvm::StringLiteral kWhileLoopStateCountAttr =
     "tt.while_loop_state_count";
 constexpr llvm::StringLiteral kWhileLoopOutputIndicesAttr =
@@ -67,15 +63,15 @@ FailureOr<int64_t> getScalarInteger(Value value) {
   return (*constant.getValue().value_begin<llvm::APInt>()).getSExtValue();
 }
 
-struct Bound {
+struct LoopBound {
   int64_t constant = 0;
-  int32_t inputIndex = -1;
+  std::optional<int32_t> inputIndex;
 };
 
 struct CountedLoopInfo {
-  Bound initial;
-  Bound limit;
-  Bound step;
+  LoopBound initial;
+  LoopBound limit;
+  LoopBound step;
 };
 
 struct LoopOutputs {
@@ -104,19 +100,19 @@ computeLoopOutputs(stablehlo::WhileOp whileOp,
   return outputs;
 }
 
-FailureOr<Bound>
+FailureOr<LoopBound>
 resolveBound(Value value, std::optional<int32_t> directInputIndex,
              Block *invariantRegion, stablehlo::ReturnOp bodyReturn,
              ArrayRef<Value> captures, unsigned stateCount) {
   FailureOr<int64_t> constant = getScalarInteger(value);
   if (succeeded(constant)) {
-    return Bound{.constant = *constant};
+    return LoopBound{.constant = *constant};
   }
   if (!isScalarInteger(value)) {
     return failure();
   }
   if (directInputIndex) {
-    return Bound{.inputIndex = *directInputIndex};
+    return LoopBound{.inputIndex = *directInputIndex};
   }
   if (invariantRegion) {
     auto argument = dyn_cast<BlockArgument>(value);
@@ -124,7 +120,7 @@ resolveBound(Value value, std::optional<int32_t> directInputIndex,
       int32_t index = static_cast<int32_t>(argument.getArgNumber());
       Block &bodyBlock = *bodyReturn->getBlock();
       if (bodyReturn.getOperand(index) == bodyBlock.getArgument(index)) {
-        return Bound{.inputIndex = index};
+        return LoopBound{.inputIndex = index};
       }
     }
   }
@@ -132,8 +128,21 @@ resolveBound(Value value, std::optional<int32_t> directInputIndex,
   if (capture == captures.end()) {
     return failure();
   }
-  return Bound{.inputIndex = static_cast<int32_t>(
-                   stateCount + std::distance(captures.begin(), capture))};
+  return LoopBound{.inputIndex = static_cast<int32_t>(
+                       stateCount +
+                       std::distance(captures.begin(), capture))};
+}
+
+DictionaryAttr getLoopBoundAttr(Builder &builder, const LoopBound &bound) {
+  SmallVector<NamedAttribute> attributes{
+      builder.getNamedAttr(kLoopBoundConstantAttr,
+                           builder.getI64IntegerAttr(bound.constant))};
+  if (bound.inputIndex) {
+    attributes.push_back(builder.getNamedAttr(
+        kLoopBoundInputIndexAttr,
+        builder.getI32IntegerAttr(*bound.inputIndex)));
+  }
+  return builder.getDictionaryAttr(attributes);
 }
 
 // Recognize the canonical counted while emitted by JAX. Its scalar integer
@@ -160,11 +169,11 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
   }
 
   unsigned counterIndex = counter.getArgNumber();
-  FailureOr<Bound> initial = resolveBound(
+  FailureOr<LoopBound> initial = resolveBound(
       whileOp->getOperand(counterIndex), static_cast<int32_t>(counterIndex),
       /*invariantRegion=*/nullptr, bodyReturn, captures,
       whileOp.getNumOperands());
-  FailureOr<Bound> limit =
+  FailureOr<LoopBound> limit =
       resolveBound(compare.getRhs(), /*directInputIndex=*/std::nullopt,
                    &cond.front(), bodyReturn, captures,
                    whileOp.getNumOperands());
@@ -178,11 +187,11 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
   } else if (increment && increment.getRhs() == bodyCounter) {
     step = increment.getLhs();
   }
-  FailureOr<Bound> resolvedStep =
+  FailureOr<LoopBound> resolvedStep =
       resolveBound(step, /*directInputIndex=*/std::nullopt, &body.front(),
                    bodyReturn, captures, whileOp.getNumOperands());
   if (failed(initial) || failed(limit) || failed(resolvedStep) ||
-      (resolvedStep->inputIndex < 0 && resolvedStep->constant <= 0)) {
+      (!resolvedStep->inputIndex && resolvedStep->constant <= 0)) {
     return failure();
   }
   return CountedLoopInfo{.initial = *initial,
@@ -317,22 +326,12 @@ public:
                   rewriter.getDenseI32ArrayAttr(outputs->indices));
 
     if (succeeded(countedLoop)) {
-      call->setAttr(
-          kCountedLoopInitialAttr,
-          rewriter.getI64IntegerAttr(countedLoop->initial.constant));
-      call->setAttr(
-          kCountedLoopLimitAttr,
-          rewriter.getI64IntegerAttr(countedLoop->limit.constant));
+      call->setAttr(kCountedLoopInitialAttr,
+                    getLoopBoundAttr(rewriter, countedLoop->initial));
+      call->setAttr(kCountedLoopLimitAttr,
+                    getLoopBoundAttr(rewriter, countedLoop->limit));
       call->setAttr(kCountedLoopStepAttr,
-                    rewriter.getI64IntegerAttr(countedLoop->step.constant));
-      call->setAttr(
-          kCountedLoopInitialIndexAttr,
-          rewriter.getI32IntegerAttr(countedLoop->initial.inputIndex));
-      call->setAttr(
-          kCountedLoopLimitIndexAttr,
-          rewriter.getI32IntegerAttr(countedLoop->limit.inputIndex));
-      call->setAttr(kCountedLoopStepIndexAttr,
-                    rewriter.getI32IntegerAttr(countedLoop->step.inputIndex));
+                    getLoopBoundAttr(rewriter, countedLoop->step));
     } else {
       std::string conditionName =
           getUniqueLoopFunctionName(whileOp, "_while_condition");
@@ -450,6 +449,23 @@ tensorValueToFlatbuffer(FlatbufferObjectCache &cache, Value value,
                         ttcore::ShardStatus shardStatus,
                         std::optional<RankedTensorType> localShape);
 
+static ::flatbuffers::Offset<::tt::target::ttnn::LoopBound>
+loopBoundToFlatbuffer(FlatbufferObjectCache &cache, func::CallOp call,
+                      llvm::StringRef attributeName) {
+  auto bound = call->getAttrOfType<DictionaryAttr>(attributeName);
+  auto constant =
+      bound ? bound.getAs<IntegerAttr>(kLoopBoundConstantAttr) : IntegerAttr();
+  if (!constant) {
+    llvm::report_fatal_error("counted loop bound is missing its constant");
+  }
+  ::flatbuffers::Optional<int32_t> inputIndex = ::flatbuffers::nullopt;
+  if (auto index = bound.getAs<IntegerAttr>(kLoopBoundInputIndexAttr)) {
+    inputIndex = static_cast<int32_t>(index.getInt());
+  }
+  return ::tt::target::ttnn::CreateLoopBound(*cache.fbb, constant.getInt(),
+                                              inputIndex);
+}
+
 ::flatbuffers::Offset<::tt::target::ttnn::Operation>
 createWhileLoopOperation(
     FlatbufferObjectCache &cache, func::CallOp call,
@@ -481,23 +497,13 @@ createWhileLoopOperation(
         output, tensorValueToFlatbuffer, std::nullopt));
   }
 
-  int64_t initial = 0;
-  int64_t limit = 0;
-  int64_t step = 0;
-  int32_t initialIndex = -1;
-  int32_t limitIndex = -1;
-  int32_t stepIndex = -1;
+  ::flatbuffers::Offset<::tt::target::ttnn::LoopBound> initial;
+  ::flatbuffers::Offset<::tt::target::ttnn::LoopBound> limit;
+  ::flatbuffers::Offset<::tt::target::ttnn::LoopBound> step;
   if (conditionProgram < 0) {
-    initial =
-        call->getAttrOfType<IntegerAttr>(kCountedLoopInitialAttr).getInt();
-    limit = call->getAttrOfType<IntegerAttr>(kCountedLoopLimitAttr).getInt();
-    step = call->getAttrOfType<IntegerAttr>(kCountedLoopStepAttr).getInt();
-    initialIndex = static_cast<int32_t>(
-        call->getAttrOfType<IntegerAttr>(kCountedLoopInitialIndexAttr).getInt());
-    limitIndex = static_cast<int32_t>(
-        call->getAttrOfType<IntegerAttr>(kCountedLoopLimitIndexAttr).getInt());
-    stepIndex = static_cast<int32_t>(
-        call->getAttrOfType<IntegerAttr>(kCountedLoopStepIndexAttr).getInt());
+    initial = loopBoundToFlatbuffer(cache, call, kCountedLoopInitialAttr);
+    limit = loopBoundToFlatbuffer(cache, call, kCountedLoopLimitAttr);
+    step = loopBoundToFlatbuffer(cache, call, kCountedLoopStepAttr);
   }
   uint32_t stateCount = static_cast<uint32_t>(
       call->getAttrOfType<IntegerAttr>(kWhileLoopStateCountAttr).getInt());
@@ -510,8 +516,7 @@ createWhileLoopOperation(
   }
   auto loop = ::tt::target::ttnn::CreateWhileLoopOpDirect(
       *cache.fbb, bodyIt->second, conditionProgram, initial, limit, step,
-      initialIndex, limitIndex, stepIndex, stateCount, &outputIndices, &inputs,
-      &outputs);
+      stateCount, &outputIndices, &inputs, &outputs);
   return ::tt::target::ttnn::CreateOperationDirect(
       *cache.fbb,
       ::tt::target::ttnn::OpTypeTraits<
