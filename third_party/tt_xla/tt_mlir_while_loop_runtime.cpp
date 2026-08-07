@@ -58,27 +58,45 @@ private:
   bool restored = false;
 };
 
-int64_t getScalarInteger(const ::tt::runtime::Tensor &tensor) {
+::ttnn::Tensor getHostScalar(const ::tt::runtime::Tensor &tensor) {
   auto hostTensors = ::tt::runtime::ttnn::toHost(
       tensor, /*untilize=*/true, /*blocking=*/true);
-  LOG_ASSERT(hostTensors.size() == 1,
-             "Counted loop bounds must have one shard");
-  const ::ttnn::Tensor &hostTensor =
-      hostTensors.front()
-          .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
-          .getTensor();
+  LOG_ASSERT(hostTensors.size() == 1, "Loop scalar must have one shard");
+  return hostTensors.front()
+      .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
+      .getTensor();
+}
 
+int64_t readBoundScalar(const ::tt::runtime::Tensor &tensor) {
+  const ::ttnn::Tensor hostTensor = getHostScalar(tensor);
   switch (hostTensor.dtype()) {
   case ::ttnn::DataType::INT32:
     return utils::getScalarFromTensor<int32_t>(hostTensor);
   case ::ttnn::DataType::UINT32:
-    return static_cast<int32_t>(
+    return static_cast<int64_t>(
         utils::getScalarFromTensor<uint32_t>(hostTensor));
   case ::ttnn::DataType::UINT16:
-    return static_cast<int16_t>(
+    return static_cast<int64_t>(
         utils::getScalarFromTensor<uint16_t>(hostTensor));
   case ::ttnn::DataType::UINT8:
-    return static_cast<int8_t>(utils::getScalarFromTensor<uint8_t>(hostTensor));
+    return static_cast<int64_t>(
+        utils::getScalarFromTensor<uint8_t>(hostTensor));
+  default:
+    LOG_FATAL("Unsupported loop bound scalar data type");
+  }
+}
+
+bool readConditionScalar(const ::tt::runtime::Tensor &tensor) {
+  const ::ttnn::Tensor hostTensor = getHostScalar(tensor);
+  switch (hostTensor.dtype()) {
+  case ::ttnn::DataType::INT32:
+    return utils::getScalarFromTensor<int32_t>(hostTensor) != 0;
+  case ::ttnn::DataType::UINT32:
+    return utils::getScalarFromTensor<uint32_t>(hostTensor) != 0;
+  case ::ttnn::DataType::UINT16:
+    return utils::getScalarFromTensor<uint16_t>(hostTensor) != 0;
+  case ::ttnn::DataType::UINT8:
+    return utils::getScalarFromTensor<uint8_t>(hostTensor) != 0;
   case ::ttnn::DataType::FLOAT32:
     return utils::getScalarFromTensor<float>(hostTensor) != 0;
   case ::ttnn::DataType::BFLOAT16:
@@ -89,7 +107,7 @@ int64_t getScalarInteger(const ::tt::runtime::Tensor &tensor) {
                utils::getScalarFromTensor<::tt::tt_metal::float16>(hostTensor)) !=
            0;
   default:
-    LOG_FATAL("Unsupported loop scalar data type");
+    LOG_FATAL("Unsupported loop condition scalar data type");
   }
 }
 
@@ -120,7 +138,7 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
     }
     LOG_ASSERT(static_cast<size_t>(*index) < op->inputs()->size(),
                "While loop bound index is out of range");
-    return getScalarInteger(inputs[*index]);
+    return readBoundScalar(inputs[*index]);
   };
 
   auto execute = [&](uint32_t programId) {
@@ -151,7 +169,7 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
           execute(static_cast<uint32_t>(op->condition_program_id()));
       LOG_ASSERT(conditionOutputs.size() == 1,
                  "Loop condition must return one value");
-      if (getScalarInteger(conditionOutputs.front()) == 0) {
+      if (!readConditionScalar(conditionOutputs.front())) {
         break;
       }
       executeBody();
