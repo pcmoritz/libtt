@@ -16,27 +16,47 @@
 namespace tt::runtime::ttnn::operations::mlir_native {
 namespace {
 
-// A nested body program may normally deallocate its inputs after their last
-// local use. Preserve them until the next loop state has been collected.
-class ScopedTensorRetention {
+// Preserve nested-program inputs for the lifetime of the loop. State tensors
+// produced by the body are adopted as they replace the previous state.
+class LoopTensorRetention {
 public:
-  explicit ScopedTensorRetention(std::vector<::tt::runtime::Tensor> &tensors) {
-    retained.reserve(tensors.size());
+  explicit LoopTensorRetention(std::vector<::tt::runtime::Tensor> &tensors)
+      : tensors(tensors), originalTensors(tensors) {
+    originalRetain.reserve(tensors.size());
+    for (const auto &tensor : tensors) {
+      originalRetain.push_back(
+          tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).shouldRetain());
+    }
     for (auto &tensor : tensors) {
-      auto &wrapper = tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN);
-      retained.emplace_back(&wrapper, wrapper.shouldRetain());
-      wrapper.setRetain(true);
+      retain(tensor);
     }
   }
 
-  ~ScopedTensorRetention() {
-    for (auto it = retained.rbegin(); it != retained.rend(); ++it) {
-      it->first->setRetain(it->second);
+  ~LoopTensorRetention() { restore(); }
+
+  void retain(::tt::runtime::Tensor &tensor) {
+    tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).setRetain(true);
+  }
+
+  void restore() {
+    if (restored) {
+      return;
     }
+    for (size_t i = 0; i < tensors.size(); ++i) {
+      tensors[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).setRetain(
+          originalRetain[i]);
+      originalTensors[i]
+          .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
+          .setRetain(originalRetain[i]);
+    }
+    restored = true;
   }
 
 private:
-  std::vector<std::pair<TTNNTensorWrapper *, bool>> retained;
+  std::vector<::tt::runtime::Tensor> &tensors;
+  std::vector<::tt::runtime::Tensor> originalTensors;
+  std::vector<bool> originalRetain;
+  bool restored = false;
 };
 
 int64_t getScalarInteger(const ::tt::runtime::Tensor &tensor) {
@@ -91,6 +111,8 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
     inputs.emplace_back(
         context.getTensorPool().getRuntimeTensorAndValidate(input));
   }
+  LoopTensorRetention retention(inputs);
+
   std::vector<const void *> inputHandles;
   inputHandles.reserve(inputs.size());
   for (const auto &tensor : inputs) {
@@ -109,7 +131,6 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
   };
 
   auto execute = [&](uint32_t programId) {
-    ScopedTensorRetention retention(inputs);
     ProgramExecutor program(context.getDeviceHandle(),
                             context.getExecutableHandle(), programId, inputs,
                             /*constEvalProgram=*/false);
@@ -124,6 +145,7 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
       uint32_t stateIndex = op->output_indices()->Get(i);
       LOG_ASSERT(stateIndex < stateSize,
                  "While loop output index is out of range");
+      retention.retain(bodyOutputs[i]);
       inputs[stateIndex] = std::move(bodyOutputs[i]);
     }
   };
@@ -155,6 +177,8 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
       executeBody();
     }
   }
+
+  retention.restore();
 
   for (size_t i = 0; i < op->outputs()->size(); ++i) {
     uint32_t stateIndex = op->output_indices()->Get(i);
