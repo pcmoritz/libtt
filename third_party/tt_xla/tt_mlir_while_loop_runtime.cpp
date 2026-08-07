@@ -84,27 +84,16 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
   LOG_ASSERT(op->output_indices()->size() == op->outputs()->size(),
              "While loop output mapping arity mismatch");
 
-  std::vector<::tt::runtime::Tensor> state;
-  state.reserve(stateSize);
-  for (size_t i = 0; i < stateSize; ++i) {
-    state.emplace_back(
-        context.getTensorPool().getRuntimeTensorAndValidate(
-            op->inputs()->Get(i)));
-  }
-
-  std::vector<::tt::runtime::Tensor> captures;
-  captures.reserve(op->inputs()->size() - stateSize);
-  for (size_t i = stateSize; i < op->inputs()->size(); ++i) {
-    captures.emplace_back(
-        context.getTensorPool().getRuntimeTensorAndValidate(
-            op->inputs()->Get(i)));
+  // The mutable loop state is the prefix; captures remain in the suffix.
+  std::vector<::tt::runtime::Tensor> inputs;
+  inputs.reserve(op->inputs()->size());
+  for (const auto *input : *op->inputs()) {
+    inputs.emplace_back(
+        context.getTensorPool().getRuntimeTensorAndValidate(input));
   }
   std::vector<const void *> inputHandles;
-  inputHandles.reserve(state.size() + captures.size());
-  for (const auto &tensor : state) {
-    inputHandles.push_back(tensor.handle.get());
-  }
-  for (const auto &tensor : captures) {
+  inputHandles.reserve(inputs.size());
+  for (const auto &tensor : inputs) {
     inputHandles.push_back(tensor.handle.get());
   }
 
@@ -114,17 +103,10 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
     }
     LOG_ASSERT(static_cast<size_t>(index) < op->inputs()->size(),
                "While loop bound index is out of range");
-    if (static_cast<size_t>(index) < state.size()) {
-      return getScalarInteger(state[index]);
-    }
-    return getScalarInteger(captures[index - state.size()]);
+    return getScalarInteger(inputs[index]);
   };
 
   auto execute = [&](uint32_t programId) {
-    std::vector<::tt::runtime::Tensor> inputs;
-    inputs.reserve(state.size() + captures.size());
-    inputs.insert(inputs.end(), state.begin(), state.end());
-    inputs.insert(inputs.end(), captures.begin(), captures.end());
     ScopedTensorRetention retention(inputs);
     ProgramExecutor program(context.getDeviceHandle(),
                             context.getExecutableHandle(), programId, inputs,
@@ -138,9 +120,9 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
                "While loop body output arity mismatch");
     for (size_t i = 0; i < bodyOutputs.size(); ++i) {
       uint32_t stateIndex = op->output_indices()->Get(i);
-      LOG_ASSERT(stateIndex < state.size(),
+      LOG_ASSERT(stateIndex < stateSize,
                  "While loop output index is out of range");
-      state[stateIndex] = std::move(bodyOutputs[i]);
+      inputs[stateIndex] = std::move(bodyOutputs[i]);
     }
   };
 
@@ -174,18 +156,18 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
 
   for (size_t i = 0; i < op->outputs()->size(); ++i) {
     uint32_t stateIndex = op->output_indices()->Get(i);
-    LOG_ASSERT(stateIndex < state.size(),
+    LOG_ASSERT(stateIndex < stateSize,
                "While loop output index is out of range");
     // A zero-iteration loop can return an input directly. Keep that shared
     // tensor alive when the caller deallocates the input after this operation.
     if (std::find(inputHandles.begin(), inputHandles.end(),
-                  state[stateIndex].handle.get()) != inputHandles.end()) {
-      state[stateIndex]
+                  inputs[stateIndex].handle.get()) != inputHandles.end()) {
+      inputs[stateIndex]
           .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
           .setRetain(true);
     }
     context.getTensorPool().insertRuntimeTensorAndValidate(
-        op->outputs()->Get(i), state[stateIndex]);
+        op->outputs()->Get(i), inputs[stateIndex]);
   }
 }
 

@@ -244,22 +244,6 @@ func::FuncOp outlineLoopRegion(ConversionPatternRewriter &rewriter,
   return function;
 }
 
-void emitLoopCall(ConversionPatternRewriter &rewriter,
-                  stablehlo::WhileOp whileOp,
-                  stablehlo::WhileOp::Adaptor adaptor, llvm::StringRef bodyName,
-                  TypeRange bodyResultTypes, ValueRange loopOperands,
-                  ArrayRef<int32_t> outputIndices) {
-  auto call = rewriter.create<func::CallOp>(
-      whileOp.getLoc(), bodyName, bodyResultTypes, loopOperands);
-  call.setNoInline(true);
-  SmallVector<Value> replacements(adaptor.getOperands());
-  for (auto [index, result] :
-       llvm::zip_equal(outputIndices, call.getResults())) {
-    replacements[index] = result;
-  }
-  rewriter.replaceOp(whileOp, replacements);
-}
-
 // Outline a while loop as private body and optional condition programs. The
 // runtime uses static bounds when counted-loop analysis succeeds; otherwise it
 // evaluates the outlined scalar condition between body invocations.
@@ -299,8 +283,7 @@ public:
     }
 
     llvm::SetVector<Value> captures;
-    getUsedValuesDefinedAbove(MutableArrayRef<Region>(&cond, 1), captures);
-    getUsedValuesDefinedAbove(MutableArrayRef<Region>(&body, 1), captures);
+    getUsedValuesDefinedAbove(whileOp->getRegions(), captures);
     SmallVector<Value> convertedCaptures;
     if (failed(rewriter.getRemappedValues(captures.getArrayRef(),
                                           convertedCaptures))) {
@@ -320,32 +303,36 @@ public:
     }
     std::string bodyName = getUniqueLoopFunctionName(
         whileOp, succeeded(countedLoop) ? "_counted_loop" : "_while_body");
-    func::FuncOp bodyFunc = outlineLoopRegion(
-        rewriter, whileOp, body, bodyName, loopOperands,
-        captures.getArrayRef(), TypeRange(outputs->types), outputs->indices);
-    bodyFunc->setAttr(kWhileLoopAttr, rewriter.getUnitAttr());
-    bodyFunc->setAttr(kWhileLoopStateCountAttr,
-                      rewriter.getI32IntegerAttr(whileOp.getNumOperands()));
-    bodyFunc->setAttr(kWhileLoopOutputIndicesAttr,
-                      rewriter.getDenseI32ArrayAttr(outputs->indices));
+    outlineLoopRegion(rewriter, whileOp, body, bodyName, loopOperands,
+                      captures.getArrayRef(), TypeRange(outputs->types),
+                      outputs->indices);
+
+    auto call = rewriter.create<func::CallOp>(
+        whileOp.getLoc(), bodyName, outputs->types, loopOperands);
+    call.setNoInline(true);
+    call->setAttr(kWhileLoopAttr, rewriter.getUnitAttr());
+    call->setAttr(kWhileLoopStateCountAttr,
+                  rewriter.getI32IntegerAttr(whileOp.getNumOperands()));
+    call->setAttr(kWhileLoopOutputIndicesAttr,
+                  rewriter.getDenseI32ArrayAttr(outputs->indices));
 
     if (succeeded(countedLoop)) {
-      bodyFunc->setAttr(
+      call->setAttr(
           kCountedLoopInitialAttr,
           rewriter.getI64IntegerAttr(countedLoop->initial.constant));
-      bodyFunc->setAttr(
+      call->setAttr(
           kCountedLoopLimitAttr,
           rewriter.getI64IntegerAttr(countedLoop->limit.constant));
-      bodyFunc->setAttr(kCountedLoopStepAttr,
-                        rewriter.getI64IntegerAttr(countedLoop->step.constant));
-      bodyFunc->setAttr(
+      call->setAttr(kCountedLoopStepAttr,
+                    rewriter.getI64IntegerAttr(countedLoop->step.constant));
+      call->setAttr(
           kCountedLoopInitialIndexAttr,
           rewriter.getI32IntegerAttr(countedLoop->initial.inputIndex));
-      bodyFunc->setAttr(
+      call->setAttr(
           kCountedLoopLimitIndexAttr,
           rewriter.getI32IntegerAttr(countedLoop->limit.inputIndex));
-      bodyFunc->setAttr(kCountedLoopStepIndexAttr,
-                        rewriter.getI32IntegerAttr(countedLoop->step.inputIndex));
+      call->setAttr(kCountedLoopStepIndexAttr,
+                    rewriter.getI32IntegerAttr(countedLoop->step.inputIndex));
     } else {
       std::string conditionName =
           getUniqueLoopFunctionName(whileOp, "_while_condition");
@@ -354,13 +341,17 @@ public:
       outlineLoopRegion(rewriter, whileOp, cond, conditionName, loopOperands,
                         captures.getArrayRef(), conditionResultTypes,
                         conditionResultIndices);
-      bodyFunc->setAttr(kLoopConditionAttr,
-                        FlatSymbolRefAttr::get(rewriter.getContext(),
-                                               conditionName));
+      call->setAttr(kLoopConditionAttr,
+                    FlatSymbolRefAttr::get(rewriter.getContext(),
+                                           conditionName));
     }
 
-    emitLoopCall(rewriter, whileOp, adaptor, bodyName, outputs->types,
-                 loopOperands, outputs->indices);
+    SmallVector<Value> replacements(adaptor.getOperands());
+    for (auto [index, result] :
+         llvm::zip_equal(outputs->indices, call.getResults())) {
+      replacements[index] = result;
+    }
+    rewriter.replaceOp(whileOp, replacements);
     return success();
   }
 };
@@ -376,13 +367,15 @@ void populateStableHLOWhileLoopToTTIRPatterns(
 namespace ttnn {
 
 static func::FuncOp getWhileLoopBody(func::CallOp call) {
-  auto body = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+  if (!call->hasAttr(kWhileLoopAttr)) {
+    return func::FuncOp();
+  }
+  return SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
       call, call.getCalleeAttr());
-  return body && body->hasAttr(kWhileLoopAttr) ? body : func::FuncOp();
 }
 
 bool isWhileLoopCall(func::CallOp call) {
-  return static_cast<bool>(getWhileLoopBody(call));
+  return call->hasAttr(kWhileLoopAttr);
 }
 
 namespace {
@@ -462,17 +455,13 @@ createWhileLoopOperation(
     FlatbufferObjectCache &cache, func::CallOp call,
     const llvm::StringMap<uint32_t> &programIndexMap,
     const std::string &debugString, const std::string &locInfo) {
-  func::FuncOp body = getWhileLoopBody(call);
-  if (!body) {
-    llvm::report_fatal_error("while loop body function not found");
-  }
   auto bodyIt = programIndexMap.find(call.getCallee());
   if (bodyIt == programIndexMap.end()) {
     llvm::report_fatal_error("loop body program not found");
   }
   int32_t conditionProgram = -1;
   if (auto condition =
-          body->getAttrOfType<FlatSymbolRefAttr>(kLoopConditionAttr)) {
+          call->getAttrOfType<FlatSymbolRefAttr>(kLoopConditionAttr)) {
     auto conditionIt = programIndexMap.find(condition.getValue());
     if (conditionIt == programIndexMap.end()) {
       llvm::report_fatal_error("loop condition program not found");
@@ -499,20 +488,21 @@ createWhileLoopOperation(
   int32_t limitIndex = -1;
   int32_t stepIndex = -1;
   if (conditionProgram < 0) {
-    initial = body->getAttrOfType<IntegerAttr>(kCountedLoopInitialAttr).getInt();
-    limit = body->getAttrOfType<IntegerAttr>(kCountedLoopLimitAttr).getInt();
-    step = body->getAttrOfType<IntegerAttr>(kCountedLoopStepAttr).getInt();
+    initial =
+        call->getAttrOfType<IntegerAttr>(kCountedLoopInitialAttr).getInt();
+    limit = call->getAttrOfType<IntegerAttr>(kCountedLoopLimitAttr).getInt();
+    step = call->getAttrOfType<IntegerAttr>(kCountedLoopStepAttr).getInt();
     initialIndex = static_cast<int32_t>(
-        body->getAttrOfType<IntegerAttr>(kCountedLoopInitialIndexAttr).getInt());
+        call->getAttrOfType<IntegerAttr>(kCountedLoopInitialIndexAttr).getInt());
     limitIndex = static_cast<int32_t>(
-        body->getAttrOfType<IntegerAttr>(kCountedLoopLimitIndexAttr).getInt());
+        call->getAttrOfType<IntegerAttr>(kCountedLoopLimitIndexAttr).getInt());
     stepIndex = static_cast<int32_t>(
-        body->getAttrOfType<IntegerAttr>(kCountedLoopStepIndexAttr).getInt());
+        call->getAttrOfType<IntegerAttr>(kCountedLoopStepIndexAttr).getInt());
   }
   uint32_t stateCount = static_cast<uint32_t>(
-      body->getAttrOfType<IntegerAttr>(kWhileLoopStateCountAttr).getInt());
+      call->getAttrOfType<IntegerAttr>(kWhileLoopStateCountAttr).getInt());
   std::vector<uint32_t> outputIndices;
-  for (int32_t index : body
+  for (int32_t index : call
                            ->getAttrOfType<DenseI32ArrayAttr>(
                                kWhileLoopOutputIndicesAttr)
                            .asArrayRef()) {
