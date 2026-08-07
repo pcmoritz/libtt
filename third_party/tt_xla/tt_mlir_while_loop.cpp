@@ -30,19 +30,6 @@
 namespace mlir::tt {
 namespace {
 
-constexpr llvm::StringLiteral kWhileLoopAttr = "tt.while_loop";
-constexpr llvm::StringLiteral kCountedLoopInitialAttr =
-    "tt.counted_loop_initial";
-constexpr llvm::StringLiteral kCountedLoopLimitAttr = "tt.counted_loop_limit";
-constexpr llvm::StringLiteral kCountedLoopStepAttr = "tt.counted_loop_step";
-constexpr llvm::StringLiteral kLoopBoundConstantAttr = "constant";
-constexpr llvm::StringLiteral kLoopBoundInputIndexAttr = "input_index";
-constexpr llvm::StringLiteral kWhileLoopStateCountAttr =
-    "tt.while_loop_state_count";
-constexpr llvm::StringLiteral kWhileLoopOutputIndicesAttr =
-    "tt.while_loop_output_indices";
-constexpr llvm::StringLiteral kLoopConditionAttr = "tt.loop_condition";
-
 bool isScalarInteger(Value value) {
   auto type = value ? dyn_cast<RankedTensorType>(value.getType())
                     : RankedTensorType();
@@ -133,16 +120,14 @@ resolveBound(Value value, std::optional<int32_t> directInputIndex,
                        std::distance(captures.begin(), capture))};
 }
 
-DictionaryAttr getLoopBoundAttr(Builder &builder, const LoopBound &bound) {
-  SmallVector<NamedAttribute> attributes{
-      builder.getNamedAttr(kLoopBoundConstantAttr,
-                           builder.getI64IntegerAttr(bound.constant))};
+ttcore::LoopBoundAttr getLoopBoundAttr(Builder &builder,
+                                       const LoopBound &bound) {
+  IntegerAttr inputIndex;
   if (bound.inputIndex) {
-    attributes.push_back(builder.getNamedAttr(
-        kLoopBoundInputIndexAttr,
-        builder.getI32IntegerAttr(*bound.inputIndex)));
+    inputIndex = builder.getI32IntegerAttr(*bound.inputIndex);
   }
-  return builder.getDictionaryAttr(attributes);
+  return ttcore::LoopBoundAttr::get(builder.getContext(), bound.constant,
+                                    inputIndex);
 }
 
 // Recognize the canonical counted while emitted by JAX. Its scalar integer
@@ -223,7 +208,6 @@ func::FuncOp outlineLoopRegion(ConversionPatternRewriter &rewriter,
       whileOp.getLoc(), name,
       rewriter.getFunctionType(loopOperands.getTypes(), resultTypes));
   function.setPrivate();
-  function.setNoInline(true);
   ttmlir::utils::setFunctionType(
       function, ttmlir::utils::FunctionType::ForwardDevice);
 
@@ -316,22 +300,14 @@ public:
                       captures.getArrayRef(), TypeRange(outputs->types),
                       outputs->indices);
 
-    auto call = rewriter.create<func::CallOp>(
-        whileOp.getLoc(), bodyName, outputs->types, loopOperands);
-    call.setNoInline(true);
-    call->setAttr(kWhileLoopAttr, rewriter.getUnitAttr());
-    call->setAttr(kWhileLoopStateCountAttr,
-                  rewriter.getI32IntegerAttr(whileOp.getNumOperands()));
-    call->setAttr(kWhileLoopOutputIndicesAttr,
-                  rewriter.getDenseI32ArrayAttr(outputs->indices));
-
+    FlatSymbolRefAttr conditionProgram;
+    ttcore::LoopBoundAttr initial;
+    ttcore::LoopBoundAttr limit;
+    ttcore::LoopBoundAttr step;
     if (succeeded(countedLoop)) {
-      call->setAttr(kCountedLoopInitialAttr,
-                    getLoopBoundAttr(rewriter, countedLoop->initial));
-      call->setAttr(kCountedLoopLimitAttr,
-                    getLoopBoundAttr(rewriter, countedLoop->limit));
-      call->setAttr(kCountedLoopStepAttr,
-                    getLoopBoundAttr(rewriter, countedLoop->step));
+      initial = getLoopBoundAttr(rewriter, countedLoop->initial);
+      limit = getLoopBoundAttr(rewriter, countedLoop->limit);
+      step = getLoopBoundAttr(rewriter, countedLoop->step);
     } else {
       std::string conditionName =
           getUniqueLoopFunctionName(whileOp, "_while_condition");
@@ -340,14 +316,19 @@ public:
       outlineLoopRegion(rewriter, whileOp, cond, conditionName, loopOperands,
                         captures.getArrayRef(), conditionResultTypes,
                         conditionResultIndices);
-      call->setAttr(kLoopConditionAttr,
-                    FlatSymbolRefAttr::get(rewriter.getContext(),
-                                           conditionName));
+      conditionProgram =
+          FlatSymbolRefAttr::get(rewriter.getContext(), conditionName);
     }
 
+    auto loop = rewriter.create<ttcore::WhileLoopOp>(
+        whileOp.getLoc(), outputs->types,
+        FlatSymbolRefAttr::get(rewriter.getContext(), bodyName),
+        conditionProgram, initial, limit, step,
+        rewriter.getI32IntegerAttr(whileOp.getNumOperands()),
+        rewriter.getDenseI32ArrayAttr(outputs->indices), loopOperands);
     SmallVector<Value> replacements(adaptor.getOperands());
     for (auto [index, result] :
-         llvm::zip_equal(outputs->indices, call.getResults())) {
+         llvm::zip_equal(outputs->indices, loop.getResults())) {
       replacements[index] = result;
     }
     rewriter.replaceOp(whileOp, replacements);
@@ -365,16 +346,9 @@ void populateStableHLOWhileLoopToTTIRPatterns(
 
 namespace ttnn {
 
-static func::FuncOp getWhileLoopBody(func::CallOp call) {
-  if (!call->hasAttr(kWhileLoopAttr)) {
-    return func::FuncOp();
-  }
+static func::FuncOp getWhileLoopBody(ttcore::WhileLoopOp loop) {
   return SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
-      call, call.getCalleeAttr());
-}
-
-bool isWhileLoopCall(func::CallOp call) {
-  return call->hasAttr(kWhileLoopAttr);
+      loop, loop.getBodyProgramAttr());
 }
 
 namespace {
@@ -399,37 +373,38 @@ public:
   }
 };
 
-class WhileLoopLayoutPattern : public OpRewritePattern<func::CallOp> {
+class WhileLoopLayoutPattern
+    : public OpRewritePattern<ttcore::WhileLoopOp> {
 public:
-  using OpRewritePattern<func::CallOp>::OpRewritePattern;
+  using OpRewritePattern<ttcore::WhileLoopOp>::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(func::CallOp call,
+  LogicalResult matchAndRewrite(ttcore::WhileLoopOp loop,
                                 PatternRewriter &rewriter) const override {
-    func::FuncOp body = getWhileLoopBody(call);
+    func::FuncOp body = getWhileLoopBody(loop);
     if (!body) {
       return failure();
     }
 
     bool changed = false;
     for (auto [index, operand, targetType] : llvm::enumerate(
-             call.getOperands(), body.getArgumentTypes())) {
+             loop.getInputs(), body.getArgumentTypes())) {
       if (operand.getType() == targetType) {
         continue;
       }
       auto tensorType = cast<RankedTensorType>(targetType);
       Value converted = ttir::utils::createDPSOp<ttir::ToLayoutOp>(
-                            rewriter, call.getLoc(), tensorType, operand,
+                            rewriter, loop.getLoc(), tensorType, operand,
                             nullptr)
                             ->getResult(0);
       rewriter.modifyOpInPlace(
-          call, [&] { call->setOperand(index, converted); });
+          loop, [&] { loop->setOperand(index, converted); });
       changed = true;
     }
 
     for (auto [result, targetType] :
-         llvm::zip_equal(call.getResults(), body.getResultTypes())) {
+         llvm::zip_equal(loop.getResults(), body.getResultTypes())) {
       if (result.getType() != targetType) {
-        rewriter.modifyOpInPlace(call,
+        rewriter.modifyOpInPlace(loop,
                                  [&] { result.setType(targetType); });
         changed = true;
       }
@@ -450,34 +425,27 @@ tensorValueToFlatbuffer(FlatbufferObjectCache &cache, Value value,
                         std::optional<RankedTensorType> localShape);
 
 static ::flatbuffers::Offset<::tt::target::ttnn::LoopBound>
-loopBoundToFlatbuffer(FlatbufferObjectCache &cache, func::CallOp call,
-                      llvm::StringRef attributeName) {
-  auto bound = call->getAttrOfType<DictionaryAttr>(attributeName);
-  auto constant =
-      bound ? bound.getAs<IntegerAttr>(kLoopBoundConstantAttr) : IntegerAttr();
-  if (!constant) {
-    llvm::report_fatal_error("counted loop bound is missing its constant");
-  }
+loopBoundToFlatbuffer(FlatbufferObjectCache &cache,
+                      ttcore::LoopBoundAttr bound) {
   ::flatbuffers::Optional<int32_t> inputIndex = ::flatbuffers::nullopt;
-  if (auto index = bound.getAs<IntegerAttr>(kLoopBoundInputIndexAttr)) {
+  if (IntegerAttr index = bound.getInputIndex()) {
     inputIndex = static_cast<int32_t>(index.getInt());
   }
-  return ::tt::target::ttnn::CreateLoopBound(*cache.fbb, constant.getInt(),
+  return ::tt::target::ttnn::CreateLoopBound(*cache.fbb, bound.getConstant(),
                                               inputIndex);
 }
 
 ::flatbuffers::Offset<::tt::target::ttnn::Operation>
 createWhileLoopOperation(
-    FlatbufferObjectCache &cache, func::CallOp call,
+    FlatbufferObjectCache &cache, ttcore::WhileLoopOp loop,
     const llvm::StringMap<uint32_t> &programIndexMap,
     const std::string &debugString, const std::string &locInfo) {
-  auto bodyIt = programIndexMap.find(call.getCallee());
+  auto bodyIt = programIndexMap.find(loop.getBodyProgramAttr().getValue());
   if (bodyIt == programIndexMap.end()) {
     llvm::report_fatal_error("loop body program not found");
   }
   int32_t conditionProgram = -1;
-  if (auto condition =
-          call->getAttrOfType<FlatSymbolRefAttr>(kLoopConditionAttr)) {
+  if (FlatSymbolRefAttr condition = loop.getConditionProgramAttr()) {
     auto conditionIt = programIndexMap.find(condition.getValue());
     if (conditionIt == programIndexMap.end()) {
       llvm::report_fatal_error("loop condition program not found");
@@ -486,13 +454,13 @@ createWhileLoopOperation(
   }
 
   std::vector<::flatbuffers::Offset<::tt::target::ttnn::TensorRef>> inputs;
-  for (Value input : call.getOperands()) {
+  for (Value input : loop.getInputs()) {
     inputs.push_back(cache.at<::tt::target::ttnn::TensorRef>(
         getOperandThroughDPSOps(input)));
   }
 
   std::vector<::flatbuffers::Offset<::tt::target::ttnn::TensorRef>> outputs;
-  for (Value output : call.getResults()) {
+  for (Value output : loop.getResults()) {
     outputs.push_back(cache.getOrCreateNoSharding(
         output, tensorValueToFlatbuffer, std::nullopt));
   }
@@ -501,27 +469,29 @@ createWhileLoopOperation(
   ::flatbuffers::Offset<::tt::target::ttnn::LoopBound> limit;
   ::flatbuffers::Offset<::tt::target::ttnn::LoopBound> step;
   if (conditionProgram < 0) {
-    initial = loopBoundToFlatbuffer(cache, call, kCountedLoopInitialAttr);
-    limit = loopBoundToFlatbuffer(cache, call, kCountedLoopLimitAttr);
-    step = loopBoundToFlatbuffer(cache, call, kCountedLoopStepAttr);
+    ttcore::LoopBoundAttr initialAttr = loop.getInitialAttr();
+    ttcore::LoopBoundAttr limitAttr = loop.getLimitAttr();
+    ttcore::LoopBoundAttr stepAttr = loop.getStepAttr();
+    if (!initialAttr || !limitAttr || !stepAttr) {
+      llvm::report_fatal_error("counted loop is missing its bounds");
+    }
+    initial = loopBoundToFlatbuffer(cache, initialAttr);
+    limit = loopBoundToFlatbuffer(cache, limitAttr);
+    step = loopBoundToFlatbuffer(cache, stepAttr);
   }
-  uint32_t stateCount = static_cast<uint32_t>(
-      call->getAttrOfType<IntegerAttr>(kWhileLoopStateCountAttr).getInt());
+  uint32_t stateCount = static_cast<uint32_t>(loop.getStateCount());
   std::vector<uint32_t> outputIndices;
-  for (int32_t index : call
-                           ->getAttrOfType<DenseI32ArrayAttr>(
-                               kWhileLoopOutputIndicesAttr)
-                           .asArrayRef()) {
+  for (int32_t index : loop.getOutputIndicesAttr().asArrayRef()) {
     outputIndices.push_back(static_cast<uint32_t>(index));
   }
-  auto loop = ::tt::target::ttnn::CreateWhileLoopOpDirect(
+  auto serializedLoop = ::tt::target::ttnn::CreateWhileLoopOpDirect(
       *cache.fbb, bodyIt->second, conditionProgram, initial, limit, step,
       stateCount, &outputIndices, &inputs, &outputs);
   return ::tt::target::ttnn::CreateOperationDirect(
       *cache.fbb,
       ::tt::target::ttnn::OpTypeTraits<
           ::tt::target::ttnn::WhileLoopOp>::enum_value,
-      loop.Union(), debugString.c_str(), locInfo.c_str());
+      serializedLoop.Union(), debugString.c_str(), locInfo.c_str());
 }
 
 } // namespace ttnn

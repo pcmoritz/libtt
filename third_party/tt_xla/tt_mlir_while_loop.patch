@@ -35,6 +35,57 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
    Conv1dOp,
    Conv2dOp,
    ConvTranspose2dOp,
+diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td
+--- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td
++++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td
+@@ -26,6 +26,15 @@ class TTCore_Attr<string name, string attrMnemonic, list<Trait> traits = [],
+   let mnemonic = attrMnemonic;
+   let attrName = "ttcore." # attrMnemonic;
+ }
++
++def TTCore_LoopBoundAttr : TTCore_Attr<"LoopBound", "loop_bound"> {
++  let summary = "A constant loop bound or the input containing its value";
++  let parameters = (ins
++    "int64_t":$constant,
++    OptionalParameter<"IntegerAttr">:$inputIndex
++  );
++  let assemblyFormat = "`<` $constant (`,` $inputIndex^)? `>`";
++}
+ 
+ def TTCore_GridAttr : TTCore_Attr<"Grid", "grid"> {
+   let summary = "TT grid attribute";
+diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
+--- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
++++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
+@@ -169,6 +169,28 @@ def TTCore_LoadCachedOp : TTCore_Op<"load_cached", [Pure]> {
+   let hasVerifier = 1;
+ }
+ 
++def TTCore_WhileLoopOp : TTCore_Op<"while_loop",
++    [MemoryEffects<[MemRead, MemWrite]>]> {
++  let summary = "Repeatedly invoke an outlined program";
++  let description = [{
++    Invokes the body program until the optional condition program returns
++    false, or for the number of iterations described by the counted bounds.
++  }];
++
++  let arguments = (ins
++    FlatSymbolRefAttr:$body_program,
++    OptionalAttr<FlatSymbolRefAttr>:$condition_program,
++    OptionalAttr<TTCore_LoopBoundAttr>:$initial,
++    OptionalAttr<TTCore_LoopBoundAttr>:$limit,
++    OptionalAttr<TTCore_LoopBoundAttr>:$step,
++    I32Attr:$state_count,
++    DenseI32ArrayAttr:$output_indices,
++    Variadic<AnyRankedTensor>:$inputs
++  );
++
++  let results = (outs Variadic<AnyRankedTensor>:$results);
++}
++
+ def TTCore_OptimizationBarrierOp : TTCore_Op<"optimization_barrier", [MemoryEffects<[MemRead, MemWrite]>]> {
+   let summary = "Optimization barrier operation.";
+   let description = [{
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
@@ -53,25 +104,33 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    addElementwiseUnaryOpsConversionPatterns(ctx, patterns, typeConverter);
    addElementwiseBinaryOpsConversionPatterns(ctx, patterns, typeConverter);
    addQuantizeOpsConversionPattern(ctx, patterns, typeConverter);
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
+@@ -48,6 +48,7 @@ struct ConvertTTIRToTTNNPass
+     target.addLegalOp<ttcore::DeviceOp>();
+     target.addLegalOp<ttcore::OptimizationBarrierOp>();
+     target.addLegalOp<ttcore::LoadCachedOp>();
++    target.addLegalOp<ttcore::WhileLoopOp>();
+     target.addLegalOp<ttcore::CompositeOp>();
+ 
+     // Debug dialect ops.
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -43,3 +43,11 @@ namespace mlir::tt::ttnn {
-+bool isWhileLoopCall(func::CallOp call);
-+
+@@ -43,3 +43,9 @@ namespace mlir::tt::ttnn {
 +::flatbuffers::Offset<::tt::target::ttnn::Operation>
 +createWhileLoopOperation(
-+    FlatbufferObjectCache &cache, func::CallOp call,
++    FlatbufferObjectCache &cache, ttcore::WhileLoopOp loop,
 +    const llvm::StringMap<uint32_t> &programIndexMap,
 +    const std::string &debugString, const std::string &locInfo);
 +
  #define GEN_PASS_DEF_TTNNSERIALIZETOBINARY
  #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
  
-@@ -4883,2 +4891,7 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
-+  if (auto funcCallOp = dyn_cast<func::CallOp>(op);
-+      funcCallOp && isWhileLoopCall(funcCallOp)) {
-+    return createWhileLoopOperation(cache, funcCallOp, programIndexMap,
+@@ -4883,2 +4889,6 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
++  if (auto whileLoopOp = dyn_cast<ttcore::WhileLoopOp>(op)) {
++    return createWhileLoopOperation(cache, whileLoopOp, programIndexMap,
 +                                      debugString, locInfo);
 +  }
    if (auto funcCallOp = dyn_cast<func::CallOp>(op);
