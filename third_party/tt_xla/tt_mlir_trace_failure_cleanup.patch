@@ -1,0 +1,85 @@
+diff --git a/runtime/lib/ttnn/operations/trace/begin_trace_capture.h b/runtime/lib/ttnn/operations/trace/begin_trace_capture.h
+--- a/runtime/lib/ttnn/operations/trace/begin_trace_capture.h
++++ b/runtime/lib/ttnn/operations/trace/begin_trace_capture.h
+@@ -12,6 +12,12 @@ namespace tt::runtime::ttnn::operations::trace {
+ void run(const ::tt::target::ttnn::BeginTraceCaptureOp *op,
+          ProgramContext &context);
+ 
++// Restores the command queue after an operation throws between begin and end.
++// This is noexcept so cleanup never hides the original execution error.
++void cleanupFailedTraceCapture(
++    const ::tt::target::ttnn::BeginTraceCaptureOp *op,
++    ProgramContext &context) noexcept;
++
+ } // namespace tt::runtime::ttnn::operations::trace
+ 
+ #endif // TT_RUNTIME_TTNN_OPERATIONS_TRACE_BEGIN_TRACE_CAPTURE_H
+diff --git a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
+--- a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
++++ b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
+@@ -23,4 +23,27 @@ void run(const ::tt::target::ttnn::BeginTraceCaptureOp *op,
+                                                       traceIdTensor);
+ }
+ 
++void cleanupFailedTraceCapture(
++    const ::tt::target::ttnn::BeginTraceCaptureOp *op,
++    ProgramContext &context) noexcept {
++  try {
++    ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
++    ::ttnn::QueueId ttnnCqId(op->cq_id());
++    const ::ttnn::Tensor &traceIdTensor =
++        context.getTensorPool().getTTNNTensorAndValidate(op->trace_id());
++    uint32_t traceId = utils::getScalarFromTensor<uint32_t>(traceIdTensor);
++    ::ttnn::MeshTraceId meshTraceId(traceId);
++
++    // end_trace_capture restores the command queue's bypass and dispatch state.
++    // The incomplete trace must then be released because it cannot be replayed.
++    ::ttnn::operations::trace::end_trace_capture(&meshDevice, meshTraceId,
++                                                 ttnnCqId);
++    ::ttnn::operations::trace::release_trace(&meshDevice, meshTraceId);
++  } catch (const std::exception &error) {
++    LOG_ERROR("Failed to clean up interrupted trace capture: ", error.what());
++  } catch (...) {
++    LOG_ERROR("Failed to clean up interrupted trace capture");
++  }
++}
++
+ } // namespace tt::runtime::ttnn::operations::trace
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -220,6 +220,19 @@ void ProgramExecutor::execute() {
+             "Starting execution of program: ", program->name()->c_str());
+   runProgramCallback(debug::Hooks::get().getpreProgramCallback(),
+                      executableHandle, context.get());
++  const ::tt::target::ttnn::BeginTraceCaptureOp *activeTraceCapture =
++      nullptr;
++  struct TraceCaptureCleanup {
++    const ::tt::target::ttnn::BeginTraceCaptureOp *&activeTraceCapture;
++    ProgramContext &context;
++
++    ~TraceCaptureCleanup() {
++      if (activeTraceCapture != nullptr) {
++        operations::trace::cleanupFailedTraceCapture(activeTraceCapture,
++                                                     context);
++      }
++    }
++  } traceCaptureCleanup{activeTraceCapture, *context};
+   for (const ::tt::target::ttnn::Operation *op : *program->operations()) {
+     LOG_DEBUG(LogType::LogRuntimeTTNN,
+               "Executing operation: ", op->debug_info()->c_str());
+@@ -232,6 +245,14 @@ void ProgramExecutor::execute() {
+     runOpCallback(debug::Hooks::get().getPreOperatorCallback(),
+                   executableHandle, op, context.get());
++    if (op->type_type() ==
++        ::tt::target::ttnn::OpType::BeginTraceCaptureOp) {
++      activeTraceCapture = op->type_as_BeginTraceCaptureOp();
++    }
+     runOperation(op);
++    if (op->type_type() ==
++        ::tt::target::ttnn::OpType::EndTraceCaptureOp) {
++      activeTraceCapture = nullptr;
++    }
+ #if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+     syncAfterOpIfNeeded();
+ #endif
