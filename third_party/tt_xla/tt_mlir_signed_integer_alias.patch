@@ -67,3 +67,90 @@ index 81e64390..225ac22c 100644
    } else if (oldDataType == tt::target::DataType::Int8 &&
               newDataType == tt::target::DataType::UInt8) {
      detail::handleIntegerBufferCast<int8_t, uint8_t>(
+diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
+index d33c0d65..ff325887 100644
+--- a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
++++ b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
+@@ -136,2 +136,68 @@ private:
+   }
+ };
++
++// TTNN stores signed i16 tensors as i32. Preserve bitcast semantics across
++// that widening by using ui16 for the raw bits and sign-extending explicitly.
++class SignedI16BitcastRewriter
++    : public mlir::OpRewritePattern<tt::ttir::BitcastConvertOp> {
++public:
++  using mlir::OpRewritePattern<
++      tt::ttir::BitcastConvertOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(tt::ttir::BitcastConvertOp op,
++                  mlir::PatternRewriter &rewriter) const override {
++    auto inputType = op.getInput().getType();
++    auto outputType = op.getType();
++    auto inputElementType = inputType.getElementType();
++    auto outputElementType = outputType.getElementType();
++    auto isSignedI16 = [](mlir::Type type) {
++      auto intType = mlir::dyn_cast<mlir::IntegerType>(type);
++      return intType && intType.getWidth() == 16 &&
++             (intType.isSigned() || intType.isSignless());
++    };
++
++    if (mlir::isa<mlir::Float16Type>(inputElementType) &&
++        isSignedI16(outputElementType)) {
++      auto ui16Type = outputType.clone(rewriter.getIntegerType(16, false));
++      auto ui32Type = outputType.clone(rewriter.getIntegerType(32, false));
++      auto i32Type = outputType.clone(rewriter.getI32Type());
++      mlir::Value bits = rewriter.create<tt::ttir::BitcastConvertOp>(
++          op.getLoc(), ui16Type, op.getInput());
++      mlir::Value unsignedWidened = rewriter.create<tt::ttir::TypecastOp>(
++          op.getLoc(), ui32Type, bits);
++      mlir::Value widened = rewriter.create<tt::ttir::BitcastConvertOp>(
++          op.getLoc(), i32Type, unsignedWidened);
++      auto shiftAttr = mlir::DenseElementsAttr::get(
++          i32Type,
++          llvm::SmallVector<mlir::Attribute>{rewriter.getI32IntegerAttr(16)});
++      mlir::Value shift = rewriter.create<tt::ttir::ConstantOp>(
++          op.getLoc(), i32Type, shiftAttr);
++      mlir::Value shifted = rewriter.create<tt::ttir::LogicalLeftShiftOp>(
++          op.getLoc(), i32Type, widened, shift);
++      rewriter.replaceOpWithNewOp<tt::ttir::RightShiftOp>(
++          op, i32Type, shifted, shift);
++      return mlir::success();
++    }
++
++    if (isSignedI16(inputElementType) &&
++        mlir::isa<mlir::Float16Type>(outputElementType)) {
++      auto i32Type = inputType.clone(rewriter.getI32Type());
++      auto ui16Type = inputType.clone(rewriter.getIntegerType(16, false));
++      auto maskAttr = mlir::DenseElementsAttr::get(
++          i32Type, llvm::SmallVector<mlir::Attribute>{
++                       rewriter.getI32IntegerAttr(0xffff)});
++      mlir::Value mask = rewriter.create<tt::ttir::ConstantOp>(
++          op.getLoc(), i32Type, maskAttr);
++      mlir::Value masked = rewriter.create<tt::ttir::BitwiseAndOp>(
++          op.getLoc(), i32Type, op.getInput(), mask);
++      mlir::Value bits = rewriter.create<tt::ttir::TypecastOp>(
++          op.getLoc(), ui16Type, masked);
++      rewriter.replaceOpWithNewOp<tt::ttir::BitcastConvertOp>(
++          op, outputType, bits);
++      return mlir::success();
++    }
++
++    return mlir::failure();
++  }
++};
+@@ -152,3 +218,13 @@ struct ElementTypeNormalization
++    // Rewrite signed i16 bitcasts before the uniform type rewriter widens i16
++    // values to i32 and loses the original bit width.
++    mlir::RewritePatternSet bitcastPatterns(&getContext());
++    bitcastPatterns.add<SignedI16BitcastRewriter>(&getContext());
++    if (failed(mlir::applyPatternsGreedily(
++            getOperation(), std::move(bitcastPatterns)))) {
++      signalPassFailure();
++      return;
++    }
++
+     mlir::RewritePatternSet patterns(&getContext());
+     GreedyRewriteConfig config;
+     config.enableFolding(false);

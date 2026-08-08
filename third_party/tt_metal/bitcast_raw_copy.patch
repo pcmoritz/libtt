@@ -1,0 +1,47 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary.cpp
+@@ -15,1 +15,5 @@ void kernel_main() {
++#if RAW_BITCAST
++    constexpr auto cb_id_dst = tt::CBIndex::c_0;
++#else
+     constexpr auto cb_id_dst = tt::CBIndex::c_2;
++#endif
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+@@ -157,1 +157,3 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
+     const bool dst_sharded = has_sharding && output.is_sharded();
++    const bool raw_bitcast = ops_chain.size() == 1 && ops_chain[0].type() == unary::UnaryOpType::BITCAST &&
++                             input.element_size() == output.element_size() && !has_sharding;
+@@ -269,1 +271,2 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
+     writer_defines["RM_INTERLEAVED"] = rm_interleaved ? "1" : "0";
++    writer_defines["RAW_BITCAST"] = raw_bitcast ? "1" : "0";
+@@ -530,1 +533,3 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
+-    desc.kernels.push_back(std::move(compute_desc));
++    if (!raw_bitcast) {
++        desc.kernels.push_back(std::move(compute_desc));
++    }
+diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+--- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
++++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+@@ -11,1 +11,3 @@
+ #include "ttnn/distributed/types.hpp"
++#include "ttnn/operations/eltwise/unary/unary.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
+@@ -85,3 +87,15 @@ Tensor to_layout_impl(
+     if (!supported_layouts.contains(layout)) {
+         TT_THROW("ttnn::to_layout: Unsupported layout conversion from {} to {}!", tensor_arg.layout(), layout);
+     }
++
++    const DataType output_dtype = dtype.value_or(tensor_arg.dtype());
++    if (tt::tt_metal::is_device_tensor(tensor_arg) && tensor_arg.dtype() == DataType::FLOAT16 &&
++        (output_dtype == DataType::FLOAT16 || output_dtype == DataType::FLOAT32)) {
++        auto bits = ttnn::bitcast(tensor_arg, DataType::UINT16);
++        bits = to_layout_impl(bits, layout, DataType::UINT16, memory_config, sub_core_grids, pad_value);
++        auto tensor = ttnn::bitcast(bits, DataType::FLOAT16);
++        if (output_dtype == DataType::FLOAT32) {
++            return ttnn::typecast(tensor, DataType::FLOAT32);
++        }
++        return tensor;
++    }

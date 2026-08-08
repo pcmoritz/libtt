@@ -241,6 +241,7 @@ http_archive(
         "//third_party/tt_metal:concat_unaligned_width.patch",
         "//third_party/tt_metal:binary_ng_output_cb.patch",
         "//third_party/tt_metal:sfpu_float16_promote.patch",
+        "//third_party/tt_metal:bitcast_raw_copy.patch",
     ],
     sha256 = "f56e21da4f169ce51d15d30962921a6f1f270ad6f21d10b2512ad4c1bc293981",
     strip_prefix = "tt-metal-e07514c48bb29d04451d1a42eaf1f9f6e977d33a",
