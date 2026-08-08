@@ -8,6 +8,7 @@
 #include "tt/runtime/detail/ttnn/ttnn.h"
 #include "tt/runtime/detail/ttnn/utils.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -130,6 +131,12 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
   }
   LoopTensorRetention retention(inputs);
 
+  std::vector<const void *> inputHandles;
+  inputHandles.reserve(inputs.size());
+  for (const auto &tensor : inputs) {
+    inputHandles.push_back(tensor.handle.get());
+  }
+
   auto getBound = [&](const ::tt::target::ttnn::LoopBound *bound) {
     LOG_ASSERT(bound, "Counted loop is missing a bound");
     auto index = bound->input_index();
@@ -148,9 +155,7 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
     program.execute();
     return program.gatherOutputTensors();
   };
-  bool ranBody = false;
   auto executeBody = [&] {
-    ranBody = true;
     std::vector<::tt::runtime::Tensor> bodyOutputs = execute(op->program_id());
     LOG_ASSERT(bodyOutputs.size() == op->output_indices()->size(),
                "While loop body output arity mismatch");
@@ -197,9 +202,10 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
     uint32_t stateIndex = op->output_indices()->Get(i);
     LOG_ASSERT(stateIndex < stateSize,
                "While loop output index is out of range");
-    // A zero-iteration loop can return an input directly. Keep that shared
-    // tensor alive when the caller deallocates the input after this operation.
-    if (!ranBody) {
+    // A loop output may directly alias an input even after the body ran. Keep
+    // that shared tensor alive when the caller deallocates the input.
+    if (std::find(inputHandles.begin(), inputHandles.end(),
+                  inputs[stateIndex].handle.get()) != inputHandles.end()) {
       inputs[stateIndex]
           .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
           .setRetain(true);
