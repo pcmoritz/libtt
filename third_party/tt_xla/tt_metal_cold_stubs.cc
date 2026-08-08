@@ -6,7 +6,6 @@
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
 #include "ttnn/operations/experimental/conv3d/conv3d.hpp"
 #include "ttnn/operations/experimental/unary_backward/gelu_backward/gelu_backward.hpp"
-#include "ttnn/operations/pool/generic/generic_pools.hpp"
 #include "ttnn/operations/pool/upsample/upsample.hpp"
 #include "ttnn/tensor/serialization.hpp"
 
@@ -44,33 +43,6 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
 }
 
 } // namespace ttnn
-
-namespace ttnn::operations::pool {
-
-std::vector<Tensor> max_pool2d(
-    const Tensor &, uint32_t, uint32_t, uint32_t, uint32_t,
-    std::array<uint32_t, 2>, std::array<uint32_t, 2>,
-    std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>>,
-    std::array<uint32_t, 2>, bool, const std::optional<const MemoryConfig> &,
-    const std::optional<Op2DSliceConfig> &,
-    std::optional<const TensorMemoryLayout>, bool, bool, bool, DataType, Layout,
-    bool) {
-  unsupported("ttnn::max_pool2d");
-}
-
-Tensor avg_pool2d(
-    const Tensor &, uint32_t, uint32_t, uint32_t, uint32_t,
-    std::array<uint32_t, 2>, std::array<uint32_t, 2>,
-    std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>>, bool, bool,
-    std::optional<int32_t>, const std::optional<const MemoryConfig> &,
-    const std::optional<Op2DSliceConfig> &,
-    std::optional<const TensorMemoryLayout>,
-    const std::optional<DeviceComputeKernelConfig> &, bool, bool, DataType,
-    Layout, bool) {
-  unsupported("ttnn::avg_pool2d");
-}
-
-} // namespace ttnn::operations::pool
 
 namespace ttnn::operations::upsample {
 
