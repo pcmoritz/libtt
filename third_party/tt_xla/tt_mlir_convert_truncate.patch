@@ -1,0 +1,60 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -252,6 +252,45 @@ public:
+ };
+ } // namespace
+-
++
++namespace {
++class StableHLOToTTIRConvertOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::ConvertOp> {
++  using OpConversionPattern<
++      mlir::stablehlo::ConvertOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::ConvertOp srcOp,
++                  mlir::stablehlo::ConvertOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto resultType = mlir::cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResult().getType()));
++    auto inputType =
++        mlir::cast<RankedTensorType>(adaptor.getOperand().getType());
++    auto resultIntegerType =
++        mlir::dyn_cast<IntegerType>(resultType.getElementType());
++
++    Value input = adaptor.getOperand();
++    if (mlir::isa<FloatType>(inputType.getElementType()) &&
++        resultIntegerType && resultIntegerType.getWidth() > 1) {
++      // StableHLO/JAX float-to-integer conversion truncates toward zero,
++      // whereas TTNN typecast rounds. Make the rounding explicit first.
++      Value magnitude =
++          rewriter.create<ttir::AbsOp>(srcOp.getLoc(), inputType, input);
++      magnitude = rewriter.create<ttir::FloorOp>(srcOp.getLoc(), inputType,
++                                                  magnitude);
++      Value sign =
++          rewriter.create<ttir::SignOp>(srcOp.getLoc(), inputType, input);
++      input = rewriter.create<ttir::MultiplyOp>(srcOp.getLoc(), inputType,
++                                                 magnitude, sign);
++    }
++
++    rewriter.replaceOpWithNewOp<ttir::TypecastOp>(srcOp, resultType, input);
++    return success();
++  }
++};
++} // namespace
++
+ namespace {
+ class StableHLOToTTIRReduceOpConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::ReduceOp> {
+@@ -10572,7 +10611,6 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::CbrtOp, mlir::tt::ttir::CbrtOp>>(typeConverter, ctx);
+-  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+-      mlir::stablehlo::ConvertOp, mlir::tt::ttir::TypecastOp>>(typeConverter,
+-                                                               ctx);
++  patterns.add<StableHLOToTTIRConvertOpConversionPattern>(typeConverter,
++                                                           ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::CeilOp, mlir::tt::ttir::CeilOp>>(typeConverter, ctx);

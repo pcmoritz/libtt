@@ -749,7 +749,9 @@ TTNN_OPERATION_SRC_EXCLUDES = [
     "ttnn/cpp/ttnn/operations/conv/**",
     "ttnn/cpp/ttnn/operations/examples/**",
     "ttnn/cpp/ttnn/operations/moreh/**",
-    "ttnn/cpp/ttnn/operations/pool/**",
+    "ttnn/cpp/ttnn/operations/pool/grid_sample/**",
+    "ttnn/cpp/ttnn/operations/pool/rotate/**",
+    "ttnn/cpp/ttnn/operations/pool/upsample/**",
     "ttnn/cpp/ttnn/operations/**/test/**",
     "ttnn/cpp/ttnn/operations/**/tests/**",
 ]
