@@ -1,0 +1,67 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+@@ -31,7 +31,9 @@ bool is_binary_sfpu_op(
+         case RSUB: return a == b && (a == FLOAT32 || a == INT32 || a == UINT32 || a == UINT16);
+         case MUL:
+             return !fast_and_approximate_mode || (a == b && (a == FLOAT32 || a == INT32 || a == UINT32 || a == UINT16));
+-        case DIV: return !fast_and_approximate_mode || (a == FLOAT32 && b == FLOAT32) || (a == INT32 && b == INT32);
++        case DIV:
++            return !fast_and_approximate_mode || (a == FLOAT32 && b == FLOAT32) || (a == INT32 && b == INT32) ||
++                   (a == b && a == FLOAT16 && output == FLOAT16);
+         case LOGADDEXP:
+         case LOGADDEXP2:
+         case LDEXP:
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
+@@ -171,8 +171,10 @@ inline void calculate_sfpu_binary_div(const uint dst_index_in0, const uint dst_in
+         v_if(in1 == 0) {
+             v_if(in0 == 0) { result = std::numeric_limits<float>::quiet_NaN(); }
+             v_else {
+                 result = std::numeric_limits<float>::infinity();
+-                result = sfpi::copysgn(result, in0);
++                sfpi::vUInt quotient_sign =
++                    sfpi::as<sfpi::vUInt>(in0) ^ sfpi::as<sfpi::vUInt>(in1);
++                result = sfpi::copysgn(result, sfpi::as<sfpi::vFloat>(quotient_sign));
+             }
+             v_endif;
+         }
+diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
+--- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
++++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
+@@ -173,8 +173,10 @@ inline void calculate_sfpu_binary_div(
+         v_if(in1 == 0) {
+             v_if(in0 == 0) { result = std::numeric_limits<float>::quiet_NaN(); }
+             v_else {
+                 result = std::numeric_limits<float>::infinity();
+-                result = sfpi::copysgn(result, in0);
++                sfpi::vUInt quotient_sign =
++                    sfpi::as<sfpi::vUInt>(in0) ^ sfpi::as<sfpi::vUInt>(in1);
++                result = sfpi::copysgn(result, sfpi::as<sfpi::vFloat>(quotient_sign));
+             }
+             v_endif;
+         }
+diff --git tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
+--- tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
++++ tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
+@@ -51,6 +51,6 @@ inline sfpi::vFloat float32_to_bf16_rne(sfpi::vFloat value) {
+  * @note DIV special cases (matching BH semantics):
+  *   - 0 / 0 -> NaN
+- *   - x / 0 -> ±inf, sign of x
++ *   - x / ±0 -> ±inf, sign is the XOR of the operand signs
+  *   - x / x -> 1.0 (forced exact, regardless of reciprocal rounding)
+  *
+  * @tparam APPROXIMATION_MODE: unused, preserved to match the BH metal signature
+@@ -89,8 +89,10 @@ inline void calculate_sfpu_binary(
+             v_if(in1 == 0) {
+                 v_if(in0 == 0) { result = std::numeric_limits<float>::quiet_NaN(); }
+                 v_else {
+                     result = std::numeric_limits<float>::infinity();
+-                    result = sfpi::copysgn(result, in0);
++                    sfpi::vUInt quotient_sign =
++                        sfpi::as<sfpi::vUInt>(in0) ^ sfpi::as<sfpi::vUInt>(in1);
++                    result = sfpi::copysgn(result, sfpi::as<sfpi::vFloat>(quotient_sign));
+                 }
+                 v_endif;
+             }

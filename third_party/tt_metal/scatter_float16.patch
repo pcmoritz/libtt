@@ -1,0 +1,39 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
+@@ -25,6 +25,11 @@ struct df_to_std<DataFormat::Float16_b> {
+     using std_type = uint16_t;
+ };
+ 
++template <>
++struct df_to_std<DataFormat::Float16> {
++    using std_type = uint16_t;
++};
++
+ template <>
+ struct df_to_std<DataFormat::Int32> {
+     using std_type = int32_t;
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_device_operation.cpp
+@@ -22,7 +22,7 @@ ScatterDeviceOperation::program_factory_t ScatterDeviceOperation::select_program
+ }
+ 
+ void ScatterDeviceOperation::validate_on_program_cache_miss(
+-    const operation_attributes_t& /*args*/, const tensor_args_t& tensor_args) {
++    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
+     const auto& input_tensor{tensor_args.input_tensor};
+     const auto& index_tensor{tensor_args.index_tensor};
+     const auto& src_tensor{tensor_args.src_tensor};
+@@ -30,6 +30,11 @@ void ScatterDeviceOperation::validate_on_program_cache_miss(
+     const auto& index_dtype{index_tensor.dtype()};
+     const auto& src_dtype{src_tensor.dtype()};
+ 
++    TT_FATAL(
++        input_dtype != DataType::FLOAT16 ||
++            args.opt_reduction == ttnn::operations::data_movement::scatter::ScatterReductionType::INVALID,
++        "Float16 scatter reductions are not supported.");
++
+     TT_FATAL(
+         input_dtype == src_dtype,
+         "input_dtype differs from src_dtype (input_dtype: {}, src_dtype: {}).",
