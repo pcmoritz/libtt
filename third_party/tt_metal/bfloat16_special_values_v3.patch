@@ -1,15 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
-@@ -19,5 +19,7 @@ using DataType = tt::tt_metal::DataType;
- inline constexpr auto fp16_sfpu_input_format = tt::DataFormat::UInt16;
- inline constexpr auto fp16_sfpu_output_format = tt::DataFormat::UInt16;
-+inline constexpr auto bfloat16_sfpu_input_format = tt::DataFormat::UInt16;
-+inline constexpr auto bfloat16_sfpu_output_format = tt::DataFormat::UInt16;
- 
- inline EltwiseUnaryWithParam make_fp16_to_fp32_typecast() {
-     return {
-@@ -31,6 +33,20 @@ inline EltwiseUnaryWithParam make_fp32_to_fp16_typecast() {
+@@ -31,6 +31,20 @@ inline EltwiseUnaryWithParam make_fp32_to_fp16_typecast() {
      };
  }
  
@@ -51,22 +43,20 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
      uint32_t packed_scalar1 = 0;
      uint32_t packed_scalar2 = 0;
  
-@@ -141,10 +148,13 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
+@@ -141,10 +148,11 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
      DataFormat cb_data_format =
 -        input.dtype() == DataType::FLOAT16 && compute_ops_chain[0].type() == UnaryOpType::TYPECAST
-+        preserve_bfloat16_special_values
-+            ? bfloat16_sfpu_input_format
-+        : input.dtype() == DataType::FLOAT16 && compute_ops_chain[0].type() == UnaryOpType::TYPECAST
-             ? fp16_sfpu_input_format
++        preserve_bfloat16_special_values ||
++                (input.dtype() == DataType::FLOAT16 && compute_ops_chain[0].type() == UnaryOpType::TYPECAST)
+             ? raw_16bit_sfpu_format
              : datatype_to_dataformat_converter(input.dtype());
      uint32_t single_tile_size = tile_size(cb_data_format);
 -    DataFormat cb_data_format_output =
--        promote_fp16 ? fp16_sfpu_output_format
+-        promote_fp16 ? raw_16bit_sfpu_format
 -                     : datatype_to_dataformat_converter(output.dtype());
 +    DataFormat cb_data_format_output =
-+        promote_fp16                       ? fp16_sfpu_output_format
-+        : preserve_bfloat16_special_values ? bfloat16_sfpu_output_format
-+                                           : datatype_to_dataformat_converter(output.dtype());
++        promote_fp16 || preserve_bfloat16_special_values ? raw_16bit_sfpu_format
++                                                         : datatype_to_dataformat_converter(output.dtype());
      if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
          cb_data_format_output = DataFormat::UInt16;
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
@@ -240,22 +230,10 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
      } else if constexpr (in_format == DataFormat::Float32 && out_format == DataFormat::Float16_b) {
          MATH(SFPU_UNARY_CALL(
              DST_SYNC_MODE,
-diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
---- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-@@ -33,7 +33,7 @@ bool is_binary_sfpu_op(
-             return !fast_and_approximate_mode || (a == b && (a == FLOAT32 || a == INT32 || a == UINT32 || a == UINT16));
-         case DIV:
-             return !fast_and_approximate_mode || (a == FLOAT32 && b == FLOAT32) || (a == INT32 && b == INT32) ||
--                   (a == b && a == FLOAT16 && output == FLOAT16);
-+                   (a == b && (a == FLOAT16 || a == BFLOAT16) && output == a);
-         case LOGADDEXP:
-         case LOGADDEXP2:
-         case LDEXP:
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -870,13 +870,21 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -870,13 +870,18 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
           operation_attributes.binary_op_type == BinaryOpType::GE);
      const bool promote_fp16 = is_sfpu_op && !is_fp16_comparison && a_dtype == DataType::FLOAT16 &&
                                a_dtype == b_dtype && a_dtype == c_dtype;
@@ -263,21 +241,18 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
 +        is_sfpu_op && operation_attributes.binary_op_type == BinaryOpType::DIV && a_dtype == DataType::BFLOAT16 &&
 +        a_dtype == b_dtype && a_dtype == c_dtype;
      const auto a_data_format =
--        promote_fp16 ? unary::utils::fp16_sfpu_input_format : datatype_to_dataformat_converter(a_dtype);
-+        promote_fp16                        ? unary::utils::fp16_sfpu_input_format
-+        : preserve_bfloat16_special_values ? unary::utils::bfloat16_sfpu_input_format
-+                                           : datatype_to_dataformat_converter(a_dtype);
+-        promote_fp16 ? unary::utils::raw_16bit_sfpu_format : datatype_to_dataformat_converter(a_dtype);
++        promote_fp16 || preserve_bfloat16_special_values ? unary::utils::raw_16bit_sfpu_format
++                                                        : datatype_to_dataformat_converter(a_dtype);
      const auto b_data_format =
--        promote_fp16 ? unary::utils::fp16_sfpu_input_format : datatype_to_dataformat_converter(b_dtype);
-+        promote_fp16                        ? unary::utils::fp16_sfpu_input_format
-+        : preserve_bfloat16_special_values ? unary::utils::bfloat16_sfpu_input_format
-+                                           : datatype_to_dataformat_converter(b_dtype);
+-        promote_fp16 ? unary::utils::raw_16bit_sfpu_format : datatype_to_dataformat_converter(b_dtype);
++        promote_fp16 || preserve_bfloat16_special_values ? unary::utils::raw_16bit_sfpu_format
++                                                        : datatype_to_dataformat_converter(b_dtype);
      const auto c_data_format =
--        promote_fp16 ? unary::utils::fp16_sfpu_output_format
+-        promote_fp16 ? unary::utils::raw_16bit_sfpu_format
 -                     : datatype_to_dataformat_converter(c_dtype);
-+        promote_fp16                        ? unary::utils::fp16_sfpu_output_format
-+        : preserve_bfloat16_special_values ? unary::utils::bfloat16_sfpu_output_format
-+                                           : datatype_to_dataformat_converter(c_dtype);
++        promote_fp16 || preserve_bfloat16_special_values ? unary::utils::raw_16bit_sfpu_format
++                                                        : datatype_to_dataformat_converter(c_dtype);
  
      uint32_t a_single_tile_size = tt::tile_size(a_data_format);
      uint32_t b_single_tile_size = tt::tile_size(b_data_format);

@@ -1,10 +1,9 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
-@@ -17,12 +17,20 @@ using DataType = tt::tt_metal::DataType;
+@@ -17,12 +17,19 @@ using DataType = tt::tt_metal::DataType;
  
- inline constexpr auto fp16_sfpu_input_format = tt::DataFormat::UInt16;
-+inline constexpr auto fp16_sfpu_output_format = tt::DataFormat::UInt16;
+ inline constexpr auto raw_16bit_sfpu_format = tt::DataFormat::UInt16;
  
  inline EltwiseUnaryWithParam make_fp16_to_fp32_typecast() {
      return {
@@ -35,12 +34,12 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
  
      const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en ||
 @@ -143,7 +144,9 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
-             ? fp16_sfpu_input_format
+             ? raw_16bit_sfpu_format
              : datatype_to_dataformat_converter(input.dtype());
      uint32_t single_tile_size = tile_size(cb_data_format);
 -    DataFormat cb_data_format_output = datatype_to_dataformat_converter(output.dtype());
 +    DataFormat cb_data_format_output =
-+        promote_fp16 ? fp16_sfpu_output_format
++        promote_fp16 ? raw_16bit_sfpu_format
 +                     : datatype_to_dataformat_converter(output.dtype());
      if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
          cb_data_format_output = DataFormat::UInt16;
@@ -49,12 +48,12 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 @@ -875,7 +875,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
-         promote_fp16 ? unary::utils::fp16_sfpu_input_format : datatype_to_dataformat_converter(a_dtype);
+         promote_fp16 ? unary::utils::raw_16bit_sfpu_format : datatype_to_dataformat_converter(a_dtype);
      const auto b_data_format =
-         promote_fp16 ? unary::utils::fp16_sfpu_input_format : datatype_to_dataformat_converter(b_dtype);
+         promote_fp16 ? unary::utils::raw_16bit_sfpu_format : datatype_to_dataformat_converter(b_dtype);
 -    const auto c_data_format = datatype_to_dataformat_converter(c_dtype);
 +    const auto c_data_format =
-+        promote_fp16 ? unary::utils::fp16_sfpu_output_format
++        promote_fp16 ? unary::utils::raw_16bit_sfpu_format
 +                     : datatype_to_dataformat_converter(c_dtype);
  
      uint32_t a_single_tile_size = tt::tile_size(a_data_format);

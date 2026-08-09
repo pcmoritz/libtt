@@ -8,7 +8,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_op
 -        case DIV: return !fast_and_approximate_mode || (a == FLOAT32 && b == FLOAT32) || (a == INT32 && b == INT32);
 +        case DIV:
 +            return !fast_and_approximate_mode || (a == FLOAT32 && b == FLOAT32) || (a == INT32 && b == INT32) ||
-+                   (a == b && a == FLOAT16 && output == FLOAT16);
++                   (a == b && (a == FLOAT16 || a == BFLOAT16) && output == a);
          case LOGADDEXP:
          case LOGADDEXP2:
          case LDEXP:

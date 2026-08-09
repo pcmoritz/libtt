@@ -6,7 +6,7 @@ index e6b7d08..dc14954 100644
  
  using DataType = tt::tt_metal::DataType;
  
-+inline constexpr auto fp16_sfpu_input_format = tt::DataFormat::UInt16;
++inline constexpr auto raw_16bit_sfpu_format = tt::DataFormat::UInt16;
 +
 +inline EltwiseUnaryWithParam make_fp16_to_fp32_typecast() {
 +    return {
@@ -44,7 +44,7 @@ index 0312fdd..03fd5a9 100644
 -    DataFormat cb_data_format = datatype_to_dataformat_converter(input.dtype());
 +    DataFormat cb_data_format =
 +        input.dtype() == DataType::FLOAT16 && compute_ops_chain[0].type() == UnaryOpType::TYPECAST
-+            ? fp16_sfpu_input_format
++            ? raw_16bit_sfpu_format
 +            : datatype_to_dataformat_converter(input.dtype());
      uint32_t single_tile_size = tile_size(cb_data_format);
      DataFormat cb_data_format_output = datatype_to_dataformat_converter(output.dtype());
@@ -71,9 +71,9 @@ index a49c292..83a233d 100644
 +    const bool promote_fp16 = is_sfpu_op && !is_fp16_comparison && a_dtype == DataType::FLOAT16 &&
 +                              a_dtype == b_dtype && a_dtype == c_dtype;
 +    const auto a_data_format =
-+        promote_fp16 ? unary::utils::fp16_sfpu_input_format : datatype_to_dataformat_converter(a_dtype);
++        promote_fp16 ? unary::utils::raw_16bit_sfpu_format : datatype_to_dataformat_converter(a_dtype);
 +    const auto b_data_format =
-+        promote_fp16 ? unary::utils::fp16_sfpu_input_format : datatype_to_dataformat_converter(b_dtype);
++        promote_fp16 ? unary::utils::raw_16bit_sfpu_format : datatype_to_dataformat_converter(b_dtype);
      const auto c_data_format = datatype_to_dataformat_converter(c_dtype);
  
      uint32_t a_single_tile_size = tt::tile_size(a_data_format);
