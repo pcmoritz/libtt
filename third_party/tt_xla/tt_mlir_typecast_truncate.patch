@@ -1,143 +1,29 @@
-diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
---- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-+++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -95,7 +95,8 @@ def TTNN_TypecastOp : TTNN_Op<"typecast"> {
-       encoding via the TTNN_DtypeOpInterface.
-     }];
- 
--    let arguments = (ins AnyRankedTensor:$input);
-+    let arguments = (ins AnyRankedTensor:$input,
-+                         DefaultValuedAttr<BoolAttr, "false">:$truncate);
-     let results = (outs AnyRankedTensor:$result);
- 
-     let hasFolder = 1;
-diff --git a/include/ttmlir/Target/TTNN/operations/layout.fbs b/include/ttmlir/Target/TTNN/operations/layout.fbs
---- a/include/ttmlir/Target/TTNN/operations/layout.fbs
-+++ b/include/ttmlir/Target/TTNN/operations/layout.fbs
-@@ -41,4 +41,5 @@ table TypecastOp {
-   dtype: tt.target.DataType;
-   memcfg: tt.target.ttnn.MemoryConfig;
-   out: tt.target.ttnn.TensorRef;
-+  truncate: bool = false;
- }
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -2617,11 +2617,17 @@ public:
+@@ -2621,11 +2621,24 @@ public:
    LogicalResult
    matchAndRewrite(ttir::TypecastOp op, ttir::TypecastOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
--    auto resultType = op.getType();
-+    RankedTensorType resultType = op.getType();
+     auto resultType = op.getType();
++    Value input = adaptor.getInput();
 +    auto resultIntegerType =
 +        dyn_cast<IntegerType>(resultType.getElementType());
-+    bool truncate =
-+        isa<FloatType>(op.getInput().getType().getElementType()) &&
++    if (isa<FloatType>(op.getInput().getType().getElementType()) &&
 +        resultIntegerType && resultIntegerType.isUnsigned() &&
-+        resultIntegerType.getWidth() == 16;
++        resultIntegerType.getWidth() == 16) {
++      // TTNN's float-to-UInt16 typecast rounds to the nearest integer, while
++      // StableHLO convert truncates toward zero. Values for which conversion
++      // to an unsigned type is defined are nonnegative, so floor is equivalent
++      // to truncation here. Other destination types already use TTNN paths
++      // with the required conversion semantics.
++      input = rewriter.create<ttnn::FloorOp>(op.getLoc(), input);
++    }
  
      rewriter.replaceOpWithNewOp<ttnn::TypecastOp>(
          op, this->getTypeConverter()->convertType(resultType),
 -        adaptor.getInput());
-+        adaptor.getInput(), truncate);
++        input);
      return success();
    }
  };
-diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
---- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-+++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -271,7 +271,8 @@ createOp(FlatbufferObjectCache &cache, TypecastOp op) {
-   auto memoryConfig = toFlatbuffer(cache, op.getMemoryConfigAttr());
- 
-   return ::tt::target::ttnn::CreateTypecastOp(*cache.fbb, input, dtype,
--                                              memoryConfig, output);
-+                                              memoryConfig, output,
-+                                              op.getTruncate());
- }
- 
- ::flatbuffers::Offset<::tt::target::ttnn::ToDeviceOp>
-diff --git a/runtime/lib/ttnn/operations/layout/typecast.cpp b/runtime/lib/ttnn/operations/layout/typecast.cpp
---- a/runtime/lib/ttnn/operations/layout/typecast.cpp
-+++ b/runtime/lib/ttnn/operations/layout/typecast.cpp
-@@ -10,6 +10,7 @@
- #include "tt/runtime/detail/ttnn/utils.h"
- #include "tt/runtime/workarounds.h"
- #include "ttnn/operations/core/core.hpp"
-+#include "ttnn/operations/eltwise/unary/unary.hpp"
- 
- namespace tt::runtime::ttnn::operations::layout {
- void run(const ::tt::target::ttnn::TypecastOp *op, ProgramContext &context) {
-@@ -23,8 +24,21 @@ void run(const ::tt::target::ttnn::TypecastOp *op, ProgramContext &context) {
-   std::optional<::ttnn::MemoryConfig> memoryConfig =
-       ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(op->memcfg());
- 
--  ::ttnn::Tensor out =
--      ::ttnn::typecast(inputTensor, targetDataType, memoryConfig);
-+  ::ttnn::Tensor out;
-+  if (op->truncate()) {
-+    using ::ttnn::operations::unary::EltwiseUnaryWithParam;
-+    using ::ttnn::operations::unary::UnaryOpType;
-+    out = ::ttnn::operations::unary::detail::unary_impl(
-+        inputTensor,
-+        {EltwiseUnaryWithParam{UnaryOpType::TRUNC},
-+         EltwiseUnaryWithParam{
-+             UnaryOpType::TYPECAST,
-+             {static_cast<float>(inputTensor.dtype()),
-+              static_cast<float>(targetDataType)}}},
-+        memoryConfig);
-+  } else {
-+    out = ::ttnn::typecast(inputTensor, targetDataType, memoryConfig);
-+  }
- 
-   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
- }
-diff --git a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
---- a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
-+++ b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
-@@ -2234,8 +2234,20 @@ public:
-     ttnn_to_emitc::EmitCTTNNEmitter<mlir::tt::ttnn::TypecastOp> emitter(
-         srcOp, adaptor, rewriter);
- 
-+    mlir::Attribute input;
-+    if (srcOp.getTruncate()) {
-+      auto tensorType = mlir::cast<emitc::OpaqueType>(
-+          getTypeConverter()->convertType(srcOp.getInput().getType()));
-+      auto trunc = rewriter.create<emitc::CallOpaqueOp>(
-+          srcOp.getLoc(), tensorType, "ttnn::trunc", nullptr, nullptr,
-+          adaptor.getInput());
-+      input = emitter.emit(trunc.getResult(0), /*index=*/0);
-+    } else {
-+      input = emitter.emit(srcOp.getInput());
-+    }
-+
-     llvm::SmallVector<mlir::Attribute> args{
--        emitter.emit(srcOp.getInput()),
-+        input,
-         emitter.emit(srcOp.getDtypeAttr()),
-         emitter.emit(srcOp.getMemoryConfigAttr()),
-     };
-diff --git a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
---- a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
-+++ b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
-@@ -1240,8 +1240,20 @@ public:
-     ttnn_to_emitpy::EmitPyTTNNEmitter<mlir::tt::ttnn::TypecastOp> emitter(
-         srcOp, adaptor, rewriter);
- 
-+    mlir::Attribute input;
-+    if (srcOp.getTruncate()) {
-+      Type tensorType =
-+          getTypeConverter()->convertType(srcOp.getInput().getType());
-+      auto trunc = rewriter.create<emitpy::CallOpaqueOp>(
-+          srcOp.getLoc(), tensorType, "ttnn.trunc", adaptor.getInput(),
-+          /*args=*/nullptr, /*keyword_args=*/nullptr);
-+      input = emitter.emit(trunc.getResult(0), /*attrName=*/"", /*index=*/0);
-+    } else {
-+      input = emitter.emit(srcOp.getInput());
-+    }
-+
-     llvm::SmallVector<mlir::Attribute> args{
--        emitter.emit(srcOp.getInput()),
-+        input,
-         emitter.emit(srcOp.getDtypeAttr()),
-         emitter.emit(srcOp.getMemoryConfigAttr(), "memory_config"),
-     };
