@@ -326,6 +326,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_enable_bf8_activation_dtype_lowering.patch",
         "//third_party/tt_xla:tt_xla_complex_scalar_buffer.patch",
         "//third_party/tt_xla:tt_xla_compile_option_validation.patch",
+        "//third_party/tt_xla:tt_xla_fresh_mlir_context.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
