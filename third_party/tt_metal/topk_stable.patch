@@ -1,5 +1,5 @@
 diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/compute/compute_kernel_api.h
-index 5ebfb63..ea0619e 100644
+index 5ebfb63..687c7e0 100644
 --- tt_metal/hw/inc/api/compute/compute_kernel_api.h
 +++ tt_metal/hw/inc/api/compute/compute_kernel_api.h
 @@ -708,16 +708,17 @@ ALWI void silu_tile_init_pack() { PACK(SFPU_UNARY_INIT_FN(silu, sfpu::silu_init,
@@ -22,7 +22,26 @@ index 5ebfb63..ea0619e 100644
          idst,
          VectorMode::RC_custom,
          idir,
-@@ -802,15 +803,16 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
+@@ -756,15 +757,16 @@ ALWI void topk_local_sort(
+  * | m_iter          | The index of the merge & rebuild iteration of the algorithm                | int32    | 0 to 9                                                | True     |
+  * | k               | The number of sorted values to return                                      | int32    | {4, 8, 16, 32, 64}                                    | True     |
+  * | stable_sort     | Maintain order of indices for equal values                                 | bool     | true, false                                           | False    |
++ * | descending      | Order equal values by increasing index in a descending sort                | bool     | true, false                                           | False    |
+  */
+ // clang-format on
+-template <bool idir = false, bool stable_sort = false>
++template <bool idir = false, bool stable_sort = false, bool descending = !idir>
+ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
+     MATH(SFPU_UNARY_CALL(
+         DST_SYNC_MODE,
+         DST_ACCUM_MODE,
+         calculate_bitonic_topk_merge,
+-        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort),
++        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort, descending),
+         idst,
+         VectorMode::RC_custom,
+         m_iter,
+@@ -802,15 +804,16 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
   * | logk            | The log of K                                                               | int32    | 2 to 6                                                | True     |
   * | skip_second     | Whether or not to skip second tile                                         | int32    | 0 to 1                                                | True     |
   * | stable_sort     | Maintain order of indices for equal values                                 | bool     | true, false                                           | False    |
