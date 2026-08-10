@@ -16,11 +16,12 @@
 namespace tt::runtime::ttnn::operations::mlir_native {
 namespace {
 
-// Preserve nested-program inputs for the lifetime of the loop. State tensors
-// produced by the body are adopted as they replace the previous state.
-class LoopTensorRetention {
+// Preserve inputs while nested programs execute. Outputs that alias an input
+// can then be retained when they escape to the caller.
+class NestedProgramTensorRetention {
 public:
-  explicit LoopTensorRetention(std::vector<::tt::runtime::Tensor> &tensors)
+  explicit NestedProgramTensorRetention(
+      std::vector<::tt::runtime::Tensor> &tensors)
       : tensors(tensors), originalTensors(tensors) {
     originalRetain.reserve(tensors.size());
     for (const auto &tensor : tensors) {
@@ -32,10 +33,19 @@ public:
     }
   }
 
-  ~LoopTensorRetention() { restore(); }
+  ~NestedProgramTensorRetention() { restore(); }
 
   void retain(::tt::runtime::Tensor &tensor) {
     tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).setRetain(true);
+  }
+
+  void retainIfInputAlias(::tt::runtime::Tensor &tensor) {
+    if (std::any_of(originalTensors.begin(), originalTensors.end(),
+                    [&](const ::tt::runtime::Tensor &input) {
+                      return input.handle.get() == tensor.handle.get();
+                    })) {
+      retain(tensor);
+    }
   }
 
   void restore() {
@@ -62,13 +72,14 @@ private:
 ::ttnn::Tensor getHostScalar(const ::tt::runtime::Tensor &tensor) {
   auto hostTensors = ::tt::runtime::ttnn::toHost(
       tensor, /*untilize=*/true, /*blocking=*/true);
-  LOG_ASSERT(hostTensors.size() == 1, "Loop scalar must have one shard");
+  LOG_ASSERT(hostTensors.size() == 1,
+             "Control-flow scalar must have one shard");
   return hostTensors.front()
       .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
       .getTensor();
 }
 
-int64_t readBoundScalar(const ::tt::runtime::Tensor &tensor) {
+int64_t readIntegerScalar(const ::tt::runtime::Tensor &tensor) {
   const ::ttnn::Tensor hostTensor = getHostScalar(tensor);
   switch (hostTensor.dtype()) {
   case ::ttnn::DataType::INT32:
@@ -83,7 +94,7 @@ int64_t readBoundScalar(const ::tt::runtime::Tensor &tensor) {
     return static_cast<int64_t>(
         utils::getScalarFromTensor<uint8_t>(hostTensor));
   default:
-    LOG_FATAL("Unsupported loop bound scalar data type");
+    LOG_FATAL("Unsupported control-flow integer scalar data type");
   }
 }
 
@@ -129,13 +140,7 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
     inputs.emplace_back(
         context.getTensorPool().getRuntimeTensorAndValidate(input));
   }
-  LoopTensorRetention retention(inputs);
-
-  std::vector<const void *> inputHandles;
-  inputHandles.reserve(inputs.size());
-  for (const auto &tensor : inputs) {
-    inputHandles.push_back(tensor.handle.get());
-  }
+  NestedProgramTensorRetention retention(inputs);
 
   auto getBound = [&](const ::tt::target::ttnn::LoopBound *bound) {
     LOG_ASSERT(bound, "Counted loop is missing a bound");
@@ -145,7 +150,7 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
     }
     LOG_ASSERT(static_cast<size_t>(*index) < op->inputs()->size(),
                "While loop bound index is out of range");
-    return readBoundScalar(inputs[*index]);
+    return readIntegerScalar(inputs[*index]);
   };
 
   auto execute = [&](uint32_t programId) {
@@ -204,14 +209,47 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
                "While loop output index is out of range");
     // A loop output may directly alias an input even after the body ran. Keep
     // that shared tensor alive when the caller deallocates the input.
-    if (std::find(inputHandles.begin(), inputHandles.end(),
-                  inputs[stateIndex].handle.get()) != inputHandles.end()) {
-      inputs[stateIndex]
-          .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
-          .setRetain(true);
-    }
+    retention.retainIfInputAlias(inputs[stateIndex]);
     context.getTensorPool().insertRuntimeTensorAndValidate(
         op->outputs()->Get(i), inputs[stateIndex]);
+  }
+}
+
+void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
+  LOG_ASSERT(op->branch_program_ids() &&
+                 op->branch_program_ids()->size() != 0,
+             "Case operation must have at least one branch");
+
+  ::tt::runtime::Tensor index =
+      context.getTensorPool().getRuntimeTensorAndValidate(op->index());
+  int64_t branchIndex = readIntegerScalar(index);
+  size_t selectedBranch = op->branch_program_ids()->size() - 1;
+  if (branchIndex >= 0 &&
+      static_cast<uint64_t>(branchIndex) < op->branch_program_ids()->size()) {
+    selectedBranch = static_cast<size_t>(branchIndex);
+  }
+
+  std::vector<::tt::runtime::Tensor> inputs;
+  inputs.reserve(op->inputs()->size());
+  for (const auto *input : *op->inputs()) {
+    inputs.emplace_back(
+        context.getTensorPool().getRuntimeTensorAndValidate(input));
+  }
+  NestedProgramTensorRetention retention(inputs);
+
+  ProgramExecutor program(
+      context.getDeviceHandle(), context.getExecutableHandle(),
+      op->branch_program_ids()->Get(selectedBranch), inputs,
+      /*constEvalProgram=*/false);
+  program.execute();
+  std::vector<::tt::runtime::Tensor> outputs = program.gatherOutputTensors();
+  LOG_ASSERT(outputs.size() == op->outputs()->size(),
+             "Case branch output arity mismatch");
+  retention.restore();
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    retention.retainIfInputAlias(outputs[i]);
+    context.getTensorPool().insertRuntimeTensorAndValidate(
+        op->outputs()->Get(i), outputs[i]);
   }
 }
 

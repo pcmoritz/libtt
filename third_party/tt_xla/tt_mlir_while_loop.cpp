@@ -184,20 +184,20 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
                          .step = *resolvedStep};
 }
 
-func::FuncOp outlineLoopRegion(ConversionPatternRewriter &rewriter,
-                               stablehlo::WhileOp whileOp, Region &region,
-                               llvm::StringRef suffix, ValueRange loopOperands,
-                               ArrayRef<Value> captures, TypeRange resultTypes,
-                               ArrayRef<int32_t> resultIndices) {
+func::FuncOp outlineRegion(ConversionPatternRewriter &rewriter,
+                           Operation *controlFlowOp, Region &region,
+                           llvm::StringRef suffix, ValueRange inputs,
+                           ArrayRef<Value> captures, TypeRange resultTypes,
+                           ArrayRef<int32_t> resultIndices) {
   OpBuilder::InsertionGuard guard(rewriter);
-  ModuleOp module = whileOp->getParentOfType<ModuleOp>();
+  ModuleOp module = controlFlowOp->getParentOfType<ModuleOp>();
   SymbolTable symbolTable(module);
-  auto parentFunc = whileOp->getParentOfType<func::FuncOp>();
+  auto parentFunc = controlFlowOp->getParentOfType<func::FuncOp>();
   std::string name = parentFunc.getSymName().str() + suffix.str();
   rewriter.setInsertionPointToEnd(module.getBody());
   auto function = rewriter.create<func::FuncOp>(
-      whileOp.getLoc(), name,
-      rewriter.getFunctionType(loopOperands.getTypes(), resultTypes));
+      controlFlowOp->getLoc(), name,
+      rewriter.getFunctionType(inputs.getTypes(), resultTypes));
   symbolTable.insert(function);
   function.setPrivate();
   ttmlir::utils::setFunctionType(
@@ -286,7 +286,7 @@ public:
         return failure();
       }
     }
-    func::FuncOp bodyFunction = outlineLoopRegion(
+    func::FuncOp bodyFunction = outlineRegion(
         rewriter, whileOp, body,
         succeeded(countedLoop) ? "_counted_loop" : "_while_body", loopOperands,
         captures.getArrayRef(), TypeRange(outputs->types), outputs->indices);
@@ -302,7 +302,7 @@ public:
     } else {
       SmallVector<Type> conditionResultTypes{conditionResultType};
       SmallVector<int32_t> conditionResultIndices{0};
-      func::FuncOp conditionFunction = outlineLoopRegion(
+      func::FuncOp conditionFunction = outlineRegion(
           rewriter, whileOp, cond, "_while_condition", loopOperands,
           captures.getArrayRef(), conditionResultTypes,
           conditionResultIndices);
@@ -326,12 +326,68 @@ public:
   }
 };
 
+class CaseOpConversionPattern : public OpConversionPattern<stablehlo::CaseOp> {
+public:
+  using OpConversionPattern<stablehlo::CaseOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(stablehlo::CaseOp caseOp,
+                  stablehlo::CaseOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> resultTypes;
+    if (failed(getTypeConverter()->convertTypes(caseOp.getResultTypes(),
+                                                resultTypes))) {
+      return failure();
+    }
+
+    llvm::SetVector<Value> captures;
+    getUsedValuesDefinedAbove(caseOp->getRegions(), captures);
+    SmallVector<Value> convertedCaptures;
+    if (failed(rewriter.getRemappedValues(captures.getArrayRef(),
+                                          convertedCaptures))) {
+      return failure();
+    }
+
+    SmallVector<int32_t> resultIndices;
+    resultIndices.reserve(resultTypes.size());
+    for (int32_t index = 0, end = static_cast<int32_t>(resultTypes.size());
+         index < end; ++index) {
+      resultIndices.push_back(index);
+    }
+
+    SmallVector<Attribute> branchPrograms;
+    branchPrograms.reserve(caseOp.getBranches().size());
+    for (auto [index, branch] : llvm::enumerate(caseOp.getBranches())) {
+      if (!branch.hasOneBlock()) {
+        return failure();
+      }
+      auto returnOp =
+          dyn_cast<stablehlo::ReturnOp>(branch.front().getTerminator());
+      if (!returnOp || returnOp.getNumOperands() != resultTypes.size()) {
+        return failure();
+      }
+      std::string suffix = "_case_branch_" + std::to_string(index);
+      func::FuncOp branchFunction = outlineRegion(
+          rewriter, caseOp, branch, suffix, convertedCaptures,
+          captures.getArrayRef(), resultTypes, resultIndices);
+      branchPrograms.push_back(FlatSymbolRefAttr::get(
+          rewriter.getContext(), branchFunction.getSymName()));
+    }
+
+    rewriter.replaceOpWithNewOp<ttcore::CaseOp>(
+        caseOp, resultTypes, rewriter.getArrayAttr(branchPrograms),
+        adaptor.getIndex(), convertedCaptures);
+    return success();
+  }
+};
+
 } // namespace
 
 void populateStableHLOWhileLoopToTTIRPatterns(
     MLIRContext *context, RewritePatternSet &patterns,
     TypeConverter &typeConverter) {
-  patterns.add<WhileOpConversionPattern>(typeConverter, context);
+  patterns.add<CaseOpConversionPattern, WhileOpConversionPattern>(
+      typeConverter, context);
 }
 
 namespace ttnn {
@@ -339,6 +395,19 @@ namespace ttnn {
 static func::FuncOp getWhileLoopBody(ttcore::WhileLoopOp loop) {
   return SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
       loop, loop.getBodyProgramAttr());
+}
+
+static SmallVector<func::FuncOp> getCaseBranches(ttcore::CaseOp caseOp) {
+  SmallVector<func::FuncOp> branches;
+  for (Attribute branch : caseOp.getBranchPrograms()) {
+    auto function = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+        caseOp, cast<FlatSymbolRefAttr>(branch));
+    if (!function) {
+      return {};
+    }
+    branches.push_back(function);
+  }
+  return branches;
 }
 
 namespace {
@@ -402,11 +471,60 @@ public:
     return success(changed);
   }
 };
+
+class CaseLayoutPattern : public OpRewritePattern<ttcore::CaseOp> {
+public:
+  using OpRewritePattern<ttcore::CaseOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ttcore::CaseOp caseOp,
+                                PatternRewriter &rewriter) const override {
+    SmallVector<func::FuncOp> branches = getCaseBranches(caseOp);
+    if (branches.empty()) {
+      return failure();
+    }
+
+    bool changed = false;
+    for (auto [index, operand, targetType] : llvm::enumerate(
+             caseOp.getInputs(), branches.front().getArgumentTypes())) {
+      if (llvm::any_of(llvm::drop_begin(branches), [&](func::FuncOp branch) {
+            return branch.getArgumentTypes()[index] != targetType;
+          })) {
+        return failure();
+      }
+      if (operand.getType() == targetType) {
+        continue;
+      }
+      auto tensorType = cast<RankedTensorType>(targetType);
+      Value converted = ttir::utils::createDPSOp<ttir::ToLayoutOp>(
+                            rewriter, caseOp.getLoc(), tensorType, operand,
+                            nullptr)
+                            ->getResult(0);
+      rewriter.modifyOpInPlace(
+          caseOp, [&] { caseOp.getInputsMutable()[index].set(converted); });
+      changed = true;
+    }
+
+    for (auto [index, result, targetType] : llvm::enumerate(
+             caseOp.getResults(), branches.front().getResultTypes())) {
+      if (llvm::any_of(llvm::drop_begin(branches), [&](func::FuncOp branch) {
+            return branch.getResultTypes()[index] != targetType;
+          })) {
+        return failure();
+      }
+      if (result.getType() != targetType) {
+        rewriter.modifyOpInPlace(caseOp,
+                                 [&] { result.setType(targetType); });
+        changed = true;
+      }
+    }
+    return success(changed);
+  }
+};
 } // namespace
 
 void populateWhileLoopLayoutPatterns(RewritePatternSet &patterns) {
-  patterns.add<OptimizationBarrierLayoutPattern, WhileLoopLayoutPattern>(
-      patterns.getContext());
+  patterns.add<CaseLayoutPattern, OptimizationBarrierLayoutPattern,
+               WhileLoopLayoutPattern>(patterns.getContext());
 }
 
 ::flatbuffers::Offset<::tt::target::ttnn::TensorRef>
@@ -482,6 +600,44 @@ createWhileLoopOperation(
       ::tt::target::ttnn::OpTypeTraits<
           ::tt::target::ttnn::WhileLoopOp>::enum_value,
       serializedLoop.Union(), debugString.c_str(), locInfo.c_str());
+}
+
+::flatbuffers::Offset<::tt::target::ttnn::Operation>
+createCaseOperation(FlatbufferObjectCache &cache, ttcore::CaseOp caseOp,
+                    const llvm::StringMap<uint32_t> &programIndexMap,
+                    const std::string &debugString,
+                    const std::string &locInfo) {
+  std::vector<uint32_t> branchProgramIds;
+  branchProgramIds.reserve(caseOp.getBranchPrograms().size());
+  for (Attribute branch : caseOp.getBranchPrograms()) {
+    auto symbol = cast<FlatSymbolRefAttr>(branch);
+    auto programIt = programIndexMap.find(symbol.getValue());
+    if (programIt == programIndexMap.end()) {
+      llvm::report_fatal_error("case branch program not found");
+    }
+    branchProgramIds.push_back(programIt->second);
+  }
+
+  auto index = cache.at<::tt::target::ttnn::TensorRef>(
+      getOperandThroughDPSOps(caseOp.getIndex()));
+  std::vector<::flatbuffers::Offset<::tt::target::ttnn::TensorRef>> inputs;
+  for (Value input : caseOp.getInputs()) {
+    inputs.push_back(cache.at<::tt::target::ttnn::TensorRef>(
+        getOperandThroughDPSOps(input)));
+  }
+  std::vector<::flatbuffers::Offset<::tt::target::ttnn::TensorRef>> outputs;
+  for (Value output : caseOp.getResults()) {
+    outputs.push_back(cache.getOrCreateNoSharding(
+        output, tensorValueToFlatbuffer, std::nullopt));
+  }
+
+  auto serializedCase = ::tt::target::ttnn::CreateCaseOpDirect(
+      *cache.fbb, &branchProgramIds, index, &inputs, &outputs);
+  return ::tt::target::ttnn::CreateOperationDirect(
+      *cache.fbb,
+      ::tt::target::ttnn::OpTypeTraits<
+          ::tt::target::ttnn::CaseOp>::enum_value,
+      serializedCase.Union(), debugString.c_str(), locInfo.c_str());
 }
 
 } // namespace ttnn
