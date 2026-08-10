@@ -73,16 +73,32 @@ index 1111111..2222222 100644
  // Factory method to create a set of workarounds for reduce product op operands.
 -// tt-metal only supports full product reduction for bfloat16 data type.
  TTNNOperandsWorkarounds
- TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds() {
+-TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds() {
++TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(
++    mlir::Operation *op) {
 -  TTNNOperandWorkarounds bf16Workaround;
 -  bf16Workaround.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;
 -
 -  return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
 -      .addInputOperandWorkaround(bf16Workaround)
 -      .addOutputOperandWorkaround(bf16Workaround);
-+  return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds(
-+      /*inputSize=*/1, /*outputSize=*/1);
++  return createReductionOpOperandsWorkarounds(op);
  }
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+index 1111111..2222222 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -999 +999 @@ def TTNN_ProdOp : TTNN_Op<"prod"> {
+-        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds();
++        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(*this);
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+index 1111111..2222222 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -351 +351,2 @@ class TTNNOperandsWorkaroundsFactory {
+-  static TTNNOperandsWorkarounds createReduceProdOpOperandsWorkarounds();
++  static TTNNOperandsWorkarounds
++  createReduceProdOpOperandsWorkarounds(mlir::Operation *op);
 diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 index 1111111..2222222 100644
 --- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
