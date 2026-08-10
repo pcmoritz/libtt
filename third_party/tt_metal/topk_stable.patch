@@ -32,7 +32,11 @@ index 5ebfb63..687c7e0 100644
 @@ -767 +769 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
 -        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort),
 +        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort, descending),
-@@ -773,0 +776,10 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
+@@ -773,0 +776,14 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
++// Keep the legacy unstable API separate: its callers provide only idir, and
++// descending is unused when stable_sort is false. Stable callers must pass the
++// global direction explicitly because their local idir alternates; combining
++// these overloads with defaults could silently derive it from the wrong idir.
 +template <bool idir = false>
 +ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
 +    topk_merge_impl<idir, false, !idir>(idst, m_iter, k);
