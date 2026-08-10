@@ -1,30 +1,35 @@
+# Port of pcmoritz/libtt#175, adapted to the compile-time TopK direction API.
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
-index 68c51b1..9d9da71 100644
+index 68c51b1..bcd8c93 100644
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
+@@ -23 +23 @@
+- * @param ascending Initial sorting direction: true for ascending, false for descending.
++ * @param initial_dir Initial local sorting direction: true for ascending, false for descending.
 @@ -29,2 +29,3 @@
   */
-+template <bool stable>
++template <bool stable, bool descending>
  FORCE_INLINE
-@@ -61,2 +62,6 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
-         // llk_topk_sort -> inplace
+@@ -38 +39 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
+-    const bool ascending,
++    const bool initial_dir,
+@@ -43 +44 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
+-    bool ascending_local = ascending;
++    bool ascending_local = initial_dir;
+@@ -62 +63 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
 -        ckernel::topk_local_sort(0, (int)ascending_local, end_phase);
-+        if (ascending) {
-+            ckernel::topk_local_sort<stable, false>(0, (int)ascending_local, end_phase);
-+        } else {
-+            ckernel::topk_local_sort<stable, true>(0, (int)ascending_local, end_phase);
-+        }
++        ckernel::topk_local_sort<stable, descending>(0, (int)ascending_local, end_phase);
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
 index 4380d8d..59a52e5 100644
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
 @@ -45 +45,2 @@ void kernel_main() {
      constexpr uint32_t rm_post_sort_index_cb_id = get_compile_time_arg_val(22);
-+    constexpr bool stable = get_compile_time_arg_val(23);
++    constexpr bool stable = get_compile_time_arg_val(23) != 0;
 @@ -103,3 +104,3 @@ void kernel_main() {
          // Read input value data
 -        sort_Wt_tiles_row_to_bitonic_sequence(
-+        sort_Wt_tiles_row_to_bitonic_sequence<stable>(
++        sort_Wt_tiles_row_to_bitonic_sequence<stable, !ascending>(
              input_tensor_dfb,
 @@ -161,19 +162,10 @@ void kernel_main() {
 -                            uint32_t tile_input_low = input_dest_start;
@@ -145,7 +150,7 @@ index 6d2b5eb..aa0cc14 100644
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
 @@ -183,2 +183,2 @@ void kernel_main() {
 -        sort_Wt_tiles_row_to_bitonic_sequence(
-+        sort_Wt_tiles_row_to_bitonic_sequence<stable>(
++        sort_Wt_tiles_row_to_bitonic_sequence<stable, descending>(
              input_tensor_dfb,
 @@ -237,19 +237,10 @@ void kernel_main() {
 -                        uint32_t tile_input_low = input_dest_start;
@@ -210,11 +215,12 @@ index 153d6a1..c7efd85 100644
 -    const Tensor transform_input = input_tensor.memory_config().is_sharded()
 +    const Tensor unsharded_input = input_tensor.memory_config().is_sharded()
                                         ? ttnn::to_memory_config(input_tensor, ttnn::DRAM_MEMORY_CONFIG)
-@@ -302 +301,9 @@ std::vector<Tensor> sort(
+@@ -302 +301,10 @@ std::vector<Tensor> sort(
 +    // The SFPU bitonic primitive compares BF16/FP32 values. IEEE Float16 is
 +    // exactly representable in Float32, so promote it once around the device
 +    // sort instead of teaching every compare/merge and padding stage a second
-+    // 16-bit encoding.
++    // 16-bit encoding. A caller-provided Float16 values output cannot back the
++    // promoted sort and is therefore populated only after the final typecast.
 +    const bool promote_float16 = input_tensor.dtype() == DataType::FLOAT16;
 +    const Tensor transform_input =
 +        promote_float16 ? ttnn::typecast(unsharded_input, DataType::FLOAT32) : unsharded_input;

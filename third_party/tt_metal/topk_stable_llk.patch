@@ -20,9 +20,9 @@ index 9e82694..6e12da9 100644
 +template <
 +    bool APPROXIMATION_MODE,
 +    bool is_fp32_dest_acc_en,
-+    bool idir = false,
-+    bool STABLE_SORT = false,
-+    bool DESCENDING = !idir>
++    bool idir,
++    bool STABLE_SORT,
++    bool DESCENDING>
  inline void calculate_bitonic_topk_merge(uint m_iter, uint k) {
 -    _bitonic_topk_merge<APPROXIMATION_MODE, is_fp32_dest_acc_en, idir, STABLE_SORT>(m_iter, k);
 +    _bitonic_topk_merge<APPROXIMATION_MODE, is_fp32_dest_acc_en, idir, STABLE_SORT, DESCENDING>(m_iter, k);
@@ -58,9 +58,9 @@ index 9e82694..6e12da9 100644
 +template <
 +    bool APPROXIMATION_MODE,
 +    bool is_fp32_dest_acc_en,
-+    bool idir = false,
-+    bool STABLE_SORT = false,
-+    bool DESCENDING = !idir>
++    bool idir,
++    bool STABLE_SORT,
++    bool DESCENDING>
  inline void calculate_bitonic_topk_merge(uint m_iter, uint k) {
 -    _bitonic_topk_merge<APPROXIMATION_MODE, is_fp32_dest_acc_en, idir, STABLE_SORT>(m_iter, k);
 +    _bitonic_topk_merge<APPROXIMATION_MODE, is_fp32_dest_acc_en, idir, STABLE_SORT, DESCENDING>(m_iter, k);
@@ -455,8 +455,8 @@ index fbd2479..e7c19c8 100644
 +    bool APPROXIMATION_MODE,
 +    bool is_fp32_dest_acc_en,
 +    bool top_min,
-+    bool STABLE_SORT = false,
-+    bool DESCENDING = !top_min>
++    bool STABLE_SORT,
++    bool DESCENDING>
 @@ -599,10 +648,19 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
                  for (std::uint32_t ii = 0; ii < inner_d; ii++)
                  {
@@ -960,8 +960,8 @@ index c8cfe4a..cd9fcf4 100644
 +    bool APPROXIMATION_MODE,
 +    bool is_fp32_dest_acc_en,
 +    bool top_min,
-+    bool STABLE_SORT = false,
-+    bool DESCENDING = !top_min>
++    bool STABLE_SORT,
++    bool DESCENDING>
 @@ -593,10 +650,19 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
                  for (std::uint32_t ii = 0; ii < inner_d; ii++)
                  {

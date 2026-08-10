@@ -22,25 +22,27 @@ index 5ebfb63..687c7e0 100644
          idst,
          VectorMode::RC_custom,
          idir,
-@@ -756,15 +757,16 @@ ALWI void topk_local_sort(
-  * | m_iter          | The index of the merge & rebuild iteration of the algorithm                | int32    | 0 to 9                                                | True     |
-  * | k               | The number of sorted values to return                                      | int32    | {4, 8, 16, 32, 64}                                    | True     |
-  * | stable_sort     | Maintain order of indices for equal values                                 | bool     | true, false                                           | False    |
+@@ -758,0 +760 @@ ALWI void topk_local_sort(
 + * | descending      | Order equal values by increasing index in a descending sort                | bool     | true, false                                           | False    |
-  */
- // clang-format on
+@@ -761,2 +763,2 @@ ALWI void topk_local_sort(
 -template <bool idir = false, bool stable_sort = false>
-+template <bool idir = false, bool stable_sort = false, bool descending = !idir>
- ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
-     MATH(SFPU_UNARY_CALL(
-         DST_SYNC_MODE,
-         DST_ACCUM_MODE,
-         calculate_bitonic_topk_merge,
+-ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
++template <bool idir, bool stable_sort, bool descending>
++ALWI void topk_merge_impl(uint32_t idst, int m_iter, int k) {
+@@ -767 +769 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
 -        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort),
 +        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort, descending),
-         idst,
-         VectorMode::RC_custom,
-         m_iter,
+@@ -773,0 +776,10 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
++template <bool idir = false>
++ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
++    topk_merge_impl<idir, false, !idir>(idst, m_iter, k);
++}
++
++template <bool idir, bool stable_sort, bool descending>
++ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
++    topk_merge_impl<idir, stable_sort, descending>(idst, m_iter, k);
++}
++
 @@ -802,15 +804,16 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
   * | logk            | The log of K                                                               | int32    | 2 to 6                                                | True     |
   * | skip_second     | Whether or not to skip second tile                                         | int32    | 0 to 1                                                | True     |
@@ -112,10 +114,19 @@ index 34849a4..62cd3ba 100644
              // merge values - move larger 32 values into 0th dest and lower 32 values into 1st dest
              if (largest) {
 -                ckernel::topk_merge<false>(0, m_iter, K);
-+                ckernel::topk_merge<false, true>(0, m_iter, K);
++                ckernel::topk_merge<false, true, true>(0, m_iter, K);
              } else {
 -                ckernel::topk_merge<true>(0, m_iter, K);
-+                ckernel::topk_merge<true, true>(0, m_iter, K);
++                ckernel::topk_merge<true, true, false>(0, m_iter, K);
              }
  
              // ckernel::topk_merge(0, m_iter, K);
+diff --git ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
+--- ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
++++ ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
+@@ -289 +289 @@ void topk(
+-    ckernel::topk_merge<false, stable_sort>(0, 0, 32);
++    ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);
+@@ -303 +303 @@ void topk(
+-        ckernel::topk_merge<false, stable_sort>(0, 0, 32);
++        ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);
