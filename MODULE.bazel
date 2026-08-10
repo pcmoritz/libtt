@@ -320,6 +320,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_same_device_buffer_copy.patch",
         "//third_party/tt_xla:tt_xla_disable_erase_inverse_ops.patch",
         "//third_party/tt_xla:tt_xla_enable_bf8_activation_dtype_lowering.patch",
+        "//third_party/tt_xla:tt_xla_fresh_mlir_context.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
