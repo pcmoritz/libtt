@@ -348,6 +348,17 @@ public:
       return failure();
     }
 
+    for (Region &branch : caseOp.getBranches()) {
+      if (!branch.hasOneBlock()) {
+        return failure();
+      }
+      auto returnOp =
+          dyn_cast<stablehlo::ReturnOp>(branch.front().getTerminator());
+      if (!returnOp || returnOp.getNumOperands() != resultTypes.size()) {
+        return failure();
+      }
+    }
+
     SmallVector<int32_t> resultIndices;
     resultIndices.reserve(resultTypes.size());
     for (int32_t index = 0, end = static_cast<int32_t>(resultTypes.size());
@@ -358,14 +369,6 @@ public:
     SmallVector<Attribute> branchPrograms;
     branchPrograms.reserve(caseOp.getBranches().size());
     for (auto [index, branch] : llvm::enumerate(caseOp.getBranches())) {
-      if (!branch.hasOneBlock()) {
-        return failure();
-      }
-      auto returnOp =
-          dyn_cast<stablehlo::ReturnOp>(branch.front().getTerminator());
-      if (!returnOp || returnOp.getNumOperands() != resultTypes.size()) {
-        return failure();
-      }
       std::string suffix = "_case_branch_" + std::to_string(index);
       func::FuncOp branchFunction = outlineRegion(
           rewriter, caseOp, branch, suffix, convertedCaptures,
@@ -483,14 +486,18 @@ public:
       return failure();
     }
 
+    FunctionType branchType = branches.front().getFunctionType();
+    if (caseOp.getInputs().size() != branchType.getNumInputs() ||
+        caseOp.getNumResults() != branchType.getNumResults() ||
+        llvm::any_of(llvm::drop_begin(branches), [&](func::FuncOp branch) {
+          return branch.getFunctionType() != branchType;
+        })) {
+      return failure();
+    }
+
     bool changed = false;
     for (auto [index, operand, targetType] : llvm::enumerate(
-             caseOp.getInputs(), branches.front().getArgumentTypes())) {
-      if (llvm::any_of(llvm::drop_begin(branches), [&](func::FuncOp branch) {
-            return branch.getArgumentTypes()[index] != targetType;
-          })) {
-        return failure();
-      }
+             caseOp.getInputs(), branchType.getInputs())) {
       if (operand.getType() == targetType) {
         continue;
       }
@@ -505,12 +512,7 @@ public:
     }
 
     for (auto [index, result, targetType] : llvm::enumerate(
-             caseOp.getResults(), branches.front().getResultTypes())) {
-      if (llvm::any_of(llvm::drop_begin(branches), [&](func::FuncOp branch) {
-            return branch.getResultTypes()[index] != targetType;
-          })) {
-        return failure();
-      }
+             caseOp.getResults(), branchType.getResults())) {
       if (result.getType() != targetType) {
         rewriter.modifyOpInPlace(caseOp,
                                  [&] { result.setType(targetType); });
