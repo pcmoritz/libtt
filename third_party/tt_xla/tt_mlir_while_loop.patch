@@ -92,14 +92,14 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 @@ -11446,8 +11446,14 @@ namespace mlir::tt {
  namespace mlir::tt {
  
-+void populateStableHLOWhileLoopToTTIRPatterns(
++void populateStableHLOControlFlowToTTIRPatterns(
 +    MLIRContext *context, RewritePatternSet &patterns,
 +    TypeConverter &typeConverter);
 +
  void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
                                       RewritePatternSet &patterns,
                                       TypeConverter &typeConverter) {
-+  populateStableHLOWhileLoopToTTIRPatterns(ctx, patterns, typeConverter);
++  populateStableHLOControlFlowToTTIRPatterns(ctx, patterns, typeConverter);
 +
    addElementwiseUnaryOpsConversionPatterns(ctx, patterns, typeConverter);
    addElementwiseBinaryOpsConversionPatterns(ctx, patterns, typeConverter);
@@ -139,14 +139,14 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 @@ -27,2 +27,4 @@ namespace mlir::tt::ttnn {
-+void populateWhileLoopLayoutPatterns(RewritePatternSet &patterns);
++void populateControlFlowLayoutPatterns(RewritePatternSet &patterns);
 +
  #define GEN_PASS_DEF_TTNNLAYOUT
  #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
 @@ -827,4 +829,5 @@ public:
        RewritePatternSet patterns(&getContext());
        patterns.add<TTNNLayoutRewriter>(&getContext());
-+      populateWhileLoopLayoutPatterns(patterns);
++      populateControlFlowLayoutPatterns(patterns);
        // Update the return op output layout based on its consumers
        // Logic here should match that of TTNNLayoutFuncInputOutputTypeRewriter
 diff --git a/runtime/lib/ttnn/operations/mlir_native/func_call.h b/runtime/lib/ttnn/operations/mlir_native/func_call.h

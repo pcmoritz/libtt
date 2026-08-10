@@ -223,6 +223,8 @@ void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
   ::tt::runtime::Tensor index =
       context.getTensorPool().getRuntimeTensorAndValidate(op->index());
   int64_t branchIndex = readIntegerScalar(index);
+  // StableHLO selects the last branch for any out-of-range index, including a
+  // negative index.
   size_t selectedBranch = op->branch_program_ids()->size() - 1;
   if (branchIndex >= 0 &&
       static_cast<uint64_t>(branchIndex) < op->branch_program_ids()->size()) {
@@ -245,6 +247,8 @@ void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
   std::vector<::tt::runtime::Tensor> outputs = program.gatherOutputTensors();
   LOG_ASSERT(outputs.size() == op->outputs()->size(),
              "Case branch output arity mismatch");
+  // Restore original input flags first, then re-pin aliases that escape as
+  // outputs. The retention destructor sees `restored` and is therefore a no-op.
   retention.restore();
   for (size_t i = 0; i < outputs.size(); ++i) {
     retention.retainIfInputAlias(outputs[i]);

@@ -370,6 +370,8 @@ public:
     branchPrograms.reserve(caseOp.getBranches().size());
     for (auto [index, branch] : llvm::enumerate(caseOp.getBranches())) {
       std::string suffix = "_case_branch_" + std::to_string(index);
+      // StableHLO case branches have no block arguments: converted captures
+      // are the function inputs, and original captures identify uses to remap.
       func::FuncOp branchFunction = outlineRegion(
           rewriter, caseOp, branch, suffix, convertedCaptures,
           captures.getArrayRef(), resultTypes, resultIndices);
@@ -386,7 +388,7 @@ public:
 
 } // namespace
 
-void populateStableHLOWhileLoopToTTIRPatterns(
+void populateStableHLOControlFlowToTTIRPatterns(
     MLIRContext *context, RewritePatternSet &patterns,
     TypeConverter &typeConverter) {
   patterns.add<CaseOpConversionPattern, WhileOpConversionPattern>(
@@ -524,7 +526,7 @@ public:
 };
 } // namespace
 
-void populateWhileLoopLayoutPatterns(RewritePatternSet &patterns) {
+void populateControlFlowLayoutPatterns(RewritePatternSet &patterns) {
   patterns.add<CaseLayoutPattern, OptimizationBarrierLayoutPattern,
                WhileLoopLayoutPattern>(patterns.getContext());
 }
