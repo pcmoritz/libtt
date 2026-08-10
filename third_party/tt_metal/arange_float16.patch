@@ -1,0 +1,33 @@
+diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operations/creation/creation.cpp
+--- ttnn/cpp/ttnn/operations/creation/creation.cpp
++++ ttnn/cpp/ttnn/operations/creation/creation.cpp
+@@ -35,6 +35,6 @@ Tensor arange_impl(
+     auto index = 0;
+     for (auto value = start; (step > 0) ? (value < stop) : (value > stop); value += step) {
+-        if constexpr (std::is_same_v<T, ::bfloat16>) {
++        if constexpr (std::is_same_v<T, ::bfloat16> || std::is_same_v<T, tt::tt_metal::float16>) {
+             owned_buffer[index++] = T(static_cast<float>(value));
+         } else {
+             owned_buffer[index++] = static_cast<T>(value);
+@@ -76,6 +76,13 @@ template Tensor arange_impl<::bfloat16>(
+     const Layout layout,
+     std::optional<std::reference_wrapper<MeshDevice>> device,
+     const MemoryConfig& output_mem_config);
++template Tensor arange_impl<tt::tt_metal::float16>(
++    const int64_t start,
++    const int64_t stop,
++    const int64_t step,
++    const Layout layout,
++    std::optional<std::reference_wrapper<MeshDevice>> device,
++    const MemoryConfig& output_mem_config);
+ template Tensor arange_impl<float>(
+     const int64_t start,
+     const int64_t stop,
+@@ -409,6 +416,7 @@ Tensor arange(
+ 
+     switch (dtype) {
+         case DataType::BFLOAT16: return concrete_arange.template operator()<::bfloat16>();
++        case DataType::FLOAT16: return concrete_arange.template operator()<tt::tt_metal::float16>();
+         case DataType::FLOAT32: return concrete_arange.template operator()<float>();
+         case DataType::UINT16: return concrete_arange.template operator()<uint16_t>();
+         case DataType::UINT32: return concrete_arange.template operator()<uint32_t>();

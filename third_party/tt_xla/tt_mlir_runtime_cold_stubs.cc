@@ -23,7 +23,6 @@
 #include "operations/normalization/layer_norm_post_all_gather.h"
 #include "operations/normalization/layer_norm_pre_all_gather.h"
 #include "operations/normalization/rms_norm_pre_all_gather.h"
-#include "operations/pool/pool2d.h"
 #include "operations/pool/upsample.h"
 #include "operations/rand/rand.h"
 #include "operations/tensor_serialization/dump_tensor.h"
@@ -189,19 +188,6 @@ void run(const ::tt::target::ttnn::RMSNormPreAllGatherOp *, ProgramContext &) {
 } // namespace tt::runtime::ttnn::operations::rms_norm_pre_all_gather
 
 namespace tt::runtime::ttnn::operations::pool {
-
-void run(const ::tt::target::ttnn::Pool2dOp *, ProgramContext &) {
-  unsupported("ttnn.pool2d");
-}
-
-void run(const ::tt::target::ttnn::MaxPool2dWithIndicesOp *,
-         ProgramContext &) {
-  unsupported("ttnn.max_pool2d_with_indices");
-}
-
-void run(const ::tt::target::ttnn::GlobalAvgPool2dOp *, ProgramContext &) {
-  unsupported("ttnn.global_avg_pool2d");
-}
 
 void run(const ::tt::target::ttnn::UpsampleOp *, ProgramContext &) {
   unsupported("ttnn.upsample");

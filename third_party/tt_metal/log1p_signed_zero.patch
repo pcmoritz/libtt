@@ -1,0 +1,16 @@
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_log1p.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_log1p.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_log1p.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_log1p.h
+@@ -127 +127,3 @@ sfpi_inline sfpi::vFloat calculate_log1p_fp32(sfpi::vFloat a) {
+-    return r;
++    // log1p has the same sign as its input throughout its valid domain. In
++    // particular, IEEE-754 requires log1p(-0.0) to return -0.0.
++    return sfpi::copysgn(r, a);
+diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_log1p.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_log1p.h
+--- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_log1p.h
++++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_log1p.h
+@@ -127 +127,3 @@ sfpi_inline sfpi::vFloat calculate_log1p_fp32(sfpi::vFloat a) {
+-    return r;
++    // log1p has the same sign as its input throughout its valid domain. In
++    // particular, IEEE-754 requires log1p(-0.0) to return -0.0.
++    return sfpi::copysgn(r, a);

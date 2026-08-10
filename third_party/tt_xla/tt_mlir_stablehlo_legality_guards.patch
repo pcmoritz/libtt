@@ -93,6 +93,18 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (!srcOp.getBody().hasOneBlock()) {
        return rewriter.notifyMatchFailure(
            srcOp,
+@@ -690,9 +702,9 @@ private:
+   bool verifyInitValue(mlir::Value val,
+                        TypicalInitReductionValue desired) const {
+     Operation *initValue = val.getDefiningOp();
+-    while (initValue->getOpOperands().size() == 1) {
++    while (initValue && initValue->getOpOperands().size() == 1) {
+       initValue = initValue->getOpOperand(0).get().getDefiningOp();
+     }
+-    if (!isa<mlir::stablehlo::ConstantOp>(initValue)) {
++    if (!initValue || !isa<mlir::stablehlo::ConstantOp>(initValue)) {
+       return false;
+     }
 @@ -723,5 +734,12 @@ public:
    matchAndRewrite(mlir::stablehlo::DotGeneralOp srcOp,
                    mlir::stablehlo::DotGeneralOp::Adaptor adaptor,

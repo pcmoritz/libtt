@@ -1,0 +1,21 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -1973,6 +1973,17 @@ public:
+       return failure();
+     }
+ 
++    auto lhsType = mlir::cast<RankedTensorType>(adaptor.getLhs().getType());
++    auto rhsType = mlir::cast<RankedTensorType>(adaptor.getRhs().getType());
++    if (lhsType.getNumElements() == 0 || rhsType.getNumElements() == 0) {
++      auto outputType = mlir::cast<RankedTensorType>(
++          getTypeConverter()->convertType(op.getType()));
++      rewriter.replaceOpWithNewOp<ttir::ZerosOp>(
++          op, outputType,
++          llvm::to_vector_of<int32_t>(outputType.getShape()));
++      return success();
++    }
++
+     // Frameworks (e.g. torch-xla) lower a conv1d to a 2D convolution with a
+     // size-1 spatial dim. Route that back to a native ttir.conv1d (which lowers
+     // to ttnn.conv1d and can use an L1 config), avoiding the in-DRAM depthwise
