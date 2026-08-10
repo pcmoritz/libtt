@@ -245,6 +245,7 @@ http_archive(
         "//third_party/tt_metal:sfpu_float16_promote.patch",
         "//third_party/tt_metal:narrow_float_special_values.patch",
         "//third_party/tt_metal:scatter_float16.patch",
+        "//third_party/tt_metal:stable_sort.patch",
     ],
     sha256 = "f56e21da4f169ce51d15d30962921a6f1f270ad6f21d10b2512ad4c1bc293981",
     strip_prefix = "tt-metal-e07514c48bb29d04451d1a42eaf1f9f6e977d33a",

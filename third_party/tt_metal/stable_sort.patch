@@ -1,0 +1,1070 @@
+diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/compute/compute_kernel_api.h
+index 5ebfb63..43f78bc 100644
+--- tt_metal/hw/inc/api/compute/compute_kernel_api.h
++++ tt_metal/hw/inc/api/compute/compute_kernel_api.h
+@@ -727,6 +727,14 @@ ALWI void topk_local_sort(
+         i_start_step));
+ }
+ 
++ALWI void topk_set_stable_descending_mode(bool descending) {
++#ifndef ARCH_QUASAR
++    MATH((ckernel::sfpu::set_topk_stable_descending_mode(descending)));
++#else
++    (void)descending;
++#endif
++}
++
+ // topK merge
+ // clang-format off
+ /**
+diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
+index fbd2479..7fd15b9 100644
+--- tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
++++ tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
+@@ -19,7 +19,13 @@ namespace ckernel
+ namespace sfpu
+ {
+ 
+-static std::int32_t topk_replay_init = 0;
++static std::int32_t topk_replay_init    = 0;
++static bool topk_stable_descending_mode = false;
++
++TT_ALWAYS_INLINE void set_topk_stable_descending_mode(bool descending)
++{
++    topk_stable_descending_mode = descending;
++}
+ 
+ inline void set_dst_write_addr(std::uint32_t addr)
+ {
+@@ -138,6 +144,49 @@ inline void bitonic_topk_store16(std::uint32_t dist0, std::uint32_t dist1)
+     }
+ }
+ 
++template <std::uint32_t VC, std::uint32_t VD, std::uint32_t MODE, bool INDEX_MIN_TO_VD>
++TT_ALWAYS_INLINE void topk_cmp_swap_stable_directional()
++{
++    constexpr std::uint32_t IDX_VC = p_sfpu::LREG4 + (VC & 0x3);
++    constexpr std::uint32_t IDX_VD = p_sfpu::LREG4 + (VD & 0x3);
++
++    // Primary key: value compare-exchange.
++    TTI_SFPSWAP(0, VC, VD, MODE);
++    TTI_SFPSWAP(0, VC, VD, MODE);
++
++    // Predicate lanes where compared values are exactly equal.
++    TTI_SFPENCC(3, 0, 0, 10);
++    TTI_SFPXOR(0, VC, VD, 0);
++    TTI_SFPSETCC(0, VD, 0, sfpi::SFPSETCC_MOD1_LREG_EQ0);
++
++    // Secondary key: index compare-exchange under tie mask.
++    if constexpr (INDEX_MIN_TO_VD)
++    {
++        TTI_SFPSWAP(0, IDX_VC, IDX_VD, MODE);
++    }
++    else
++    {
++        TTI_SFPSWAP(0, IDX_VD, IDX_VC, MODE);
++    }
++    TTI_SFPENCC(3, 0, 0, 10);
++
++    // Restore values after XOR scratch operation.
++    TTI_SFPXOR(0, VC, VD, 0);
++}
++
++template <std::uint32_t VC, std::uint32_t VD, std::uint32_t MODE>
++TT_ALWAYS_INLINE void topk_cmp_swap_stable_min_to_vd()
++{
++    if (topk_stable_descending_mode)
++    {
++        topk_cmp_swap_stable_directional<VC, VD, MODE, false>();
++    }
++    else
++    {
++        topk_cmp_swap_stable_directional<VC, VD, MODE, true>();
++    }
++}
++
+ template <bool STABLE_SORT>
+ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_start)
+ {
+@@ -148,33 +197,28 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+         TTI_SFPNOP;
+     }
+ 
+-    constexpr int replay_count = STABLE_SORT ? 9 : 5;
+-
+-    if (init_replay)
++    if constexpr (STABLE_SORT)
+     {
+-        if constexpr (STABLE_SORT)
+-        {
+-            load_replay_buf<Exec>(
+-                replay_start,
+-                replay_count,
+-                []
+-                {
+-                    // Step 4
+-                    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX);
+-                    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
+-                    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG1/3 NOP
+-                    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
+-
+-                    // Step 3 (1-cycle stall: shares LREG3 with Step 4 above)
+-                    TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX);
+-                    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG2/3 NOP
+-                    TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
+-                    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG2/3 NOP
++        // First pass.
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++        TTI_SFPTRANSP(0, 0, 0, 0);
++
++        // Second pass (matches legacy replay behavior).
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++        TTI_SFPTRANSP(0, 0, 0, 0);
+ 
+-                    TTI_SFPTRANSP(0, 0, 0, 0);
+-                });
+-        }
+-        else
++        init_replay = false;
++    }
++    else
++    {
++        constexpr int replay_count = 5;
++        if (init_replay)
+         {
+             load_replay_buf<Exec>(
+                 replay_start,
+@@ -191,16 +235,15 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+ 
+                     TTI_SFPTRANSP(0, 0, 0, 0);
+                 });
++            init_replay = false;
++        }
++        else
++        {
++            lltt::replay(replay_start, replay_count);
+         }
+-        init_replay = false;
+-    }
+-    else
+-    {
+         lltt::replay(replay_start, replay_count);
+     }
+ 
+-    lltt::replay(replay_start, replay_count);
+-
+     if (dir == static_cast<bool>(SortDir::ArgMin))
+     {
+         TTI_SFPCONFIG(0x004, 0xF, 1); // Restore the max/min behaviour of SWAP
+@@ -216,24 +259,18 @@ template <>
+ inline void bitonic_topk_ph2_st3_to_1<true>()
+ {
+     // Step 3
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG2/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
+ 
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
+     // Step 2
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_01_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX); // Hides LREG0/2 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_01_MAX); // Hides LREG1/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX); // Hides LREG0/2 NOP
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_01_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX>();
+ 
+-    // Step 1 (1-cycle stall: shares LREG1 with Step 2 above)
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_01_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX); // Hides LREG0/1 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_01_MAX); // Hides LREG2/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX); // Hides LREG0/1 NOP
++    // Step 1
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_01_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX>();
+ 
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -268,16 +305,12 @@ inline void bitonic_topk_ph1_st2_to_1<true>()
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
+     // Step 2
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_02_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX); // Hides LREG0/2 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_02_MAX); // Hides LREG1/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX); // Hides LREG0/2 NOP
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_02_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX>();
+ 
+-    // Step 1 (1-cycle stall: shares LREG1 with Step 2 above)
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_02_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX); // Hides LREG0/1 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_02_MAX); // Hides LREG2/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX); // Hides LREG0/1 NOP
++    // Step 1
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_02_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX>();
+ 
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -307,10 +340,8 @@ inline void bitonic_topk_ph0_st1_to_1<true>()
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
+     // Step 1
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG2/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
+ 
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -336,17 +367,13 @@ inline void bitonic_topk_step_N<true>(bool dir)
+     // Step N
+     if (dir == static_cast<bool>(SortDir::ArgMax))
+     {
+-        TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX);
+-        TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
+-        TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG1/3 NOP
+-        TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
+     }
+     else
+     {
+-        TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX);
+-        TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
+-        TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX); // Hides LREG1/3 NOP
+-        TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX>();
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG3, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
+     }
+ }
+ 
+@@ -442,15 +469,23 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             {
+                                 lltt::replay(0, 8);
+                             }
+-                            constexpr int replay_count = STABLE_SORT ? 6 : 4;
+-                            if (init_phase)
++                            if constexpr (STABLE_SORT)
+                             {
+-                                load_replay_buf<Exec>(16, replay_count, [] { bitonic_topk_ph0_st1_to_1<STABLE_SORT>(); });
++                                bitonic_topk_ph0_st1_to_1<STABLE_SORT>();
+                                 init_phase = false;
+                             }
+                             else
+                             {
+-                                lltt::replay(16, replay_count);
++                                constexpr int replay_count = 4;
++                                if (init_phase)
++                                {
++                                    load_replay_buf<Exec>(16, replay_count, [] { bitonic_topk_ph0_st1_to_1<STABLE_SORT>(); });
++                                    init_phase = false;
++                                }
++                                else
++                                {
++                                    lltt::replay(16, replay_count);
++                                }
+                             }
+                             if (init_store)
+                             {
+@@ -468,15 +503,23 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         for (int d = 0; d < 4; d++)
+                         {
+                             lltt::replay(0, 8);
+-                            constexpr int replay_count = STABLE_SORT ? 10 : 6;
+-                            if (init_phase)
++                            if constexpr (STABLE_SORT)
+                             {
+-                                load_replay_buf<Exec>(16, replay_count, [] { bitonic_topk_ph1_st2_to_1<STABLE_SORT>(); });
++                                bitonic_topk_ph1_st2_to_1<STABLE_SORT>();
+                                 init_phase = false;
+                             }
+                             else
+                             {
+-                                lltt::replay(16, replay_count);
++                                constexpr int replay_count = 6;
++                                if (init_phase)
++                                {
++                                    load_replay_buf<Exec>(16, replay_count, [] { bitonic_topk_ph1_st2_to_1<STABLE_SORT>(); });
++                                    init_phase = false;
++                                }
++                                else
++                                {
++                                    lltt::replay(16, replay_count);
++                                }
+                             }
+                             lltt::replay(8, 8);
+                         }
+@@ -485,15 +528,23 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         for (int d = 0; d < 4; d++)
+                         {
+                             lltt::replay(0, 8);
+-                            constexpr int replay_count = STABLE_SORT ? 14 : 9;
+-                            if (init_phase)
++                            if constexpr (STABLE_SORT)
+                             {
+-                                load_replay_buf<Exec>(16, replay_count, [] { bitonic_topk_ph2_st3_to_1<STABLE_SORT>(); });
++                                bitonic_topk_ph2_st3_to_1<STABLE_SORT>();
+                                 init_phase = false;
+                             }
+                             else
+                             {
+-                                lltt::replay(16, replay_count);
++                                constexpr int replay_count = 9;
++                                if (init_phase)
++                                {
++                                    load_replay_buf<Exec>(16, replay_count, [] { bitonic_topk_ph2_st3_to_1<STABLE_SORT>(); });
++                                    init_phase = false;
++                                }
++                                else
++                                {
++                                    lltt::replay(16, replay_count);
++                                }
+                             }
+                             lltt::replay(8, 8);
+                         }
+@@ -599,10 +650,19 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
+                 for (std::uint32_t ii = 0; ii < inner_d; ii++)
+                 {
+                     bitonic_topk_load8<is_fp32_dest_acc_en>(dst_offset, ld_dist);
+-                    TTI_SFPSWAP(0, top_min ? p_sfpu::LREG1 : p_sfpu::LREG0, top_min ? p_sfpu::LREG0 : p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
+                     if constexpr (STABLE_SORT)
+                     {
+-                        // 1-cycle stall: second swap for index tracking on same LREGs
++                        if constexpr (top_min)
++                        {
++                            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX>();
++                        }
++                        else
++                        {
++                            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++                        }
++                    }
++                    else
++                    {
+                         TTI_SFPSWAP(0, top_min ? p_sfpu::LREG1 : p_sfpu::LREG0, top_min ? p_sfpu::LREG0 : p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
+                     }
+                     bitonic_topk_store8<is_fp32_dest_acc_en>(dst_offset, ld_dist);
+@@ -897,7 +957,8 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+ 
+ inline void _init_topk()
+ {
+-    topk_replay_init = 0;
++    topk_replay_init            = 0;
++    topk_stable_descending_mode = false;
+     _sfpu_load_config32_(0xF, 0x0, 0x4); // Set bit [2] of the SFPU_CONTROL_REG to enable index tracking mode
+ }
+ 
+diff --git tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
+index c8cfe4a..ec90901 100644
+--- tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
++++ tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
+@@ -19,7 +19,13 @@ namespace ckernel
+ namespace sfpu
+ {
+ 
+-static std::int32_t topk_replay_init = 0;
++static std::int32_t topk_replay_init    = 0;
++static bool topk_stable_descending_mode = false;
++
++TT_ALWAYS_INLINE void set_topk_stable_descending_mode(bool descending)
++{
++    topk_stable_descending_mode = descending;
++}
+ 
+ inline void set_dst_write_addr(std::uint32_t addr)
+ {
+@@ -138,6 +144,49 @@ inline void bitonic_topk_store16(std::uint32_t dist0, std::uint32_t dist1)
+     }
+ }
+ 
++template <std::uint32_t VC, std::uint32_t VD, std::uint32_t MODE, bool INDEX_MIN_TO_VD>
++TT_ALWAYS_INLINE void topk_cmp_swap_stable_directional()
++{
++    constexpr std::uint32_t IDX_VC = p_sfpu::LREG4 + (VC & 0x3);
++    constexpr std::uint32_t IDX_VD = p_sfpu::LREG4 + (VD & 0x3);
++
++    // Primary key: value compare-exchange.
++    TTI_SFPSWAP(0, VC, VD, MODE);
++    TTI_SFPSWAP(0, VC, VD, MODE);
++
++    // Predicate lanes where compared values are exactly equal.
++    TTI_SFPENCC(3, 0, 0, 10);
++    TTI_SFPXOR(0, VC, VD, 0);
++    TTI_SFPSETCC(0, VD, 0, sfpi::SFPSETCC_MOD1_LREG_EQ0);
++
++    // Secondary key: index compare-exchange under tie mask.
++    if constexpr (INDEX_MIN_TO_VD)
++    {
++        TTI_SFPSWAP(0, IDX_VC, IDX_VD, MODE);
++    }
++    else
++    {
++        TTI_SFPSWAP(0, IDX_VD, IDX_VC, MODE);
++    }
++    TTI_SFPENCC(3, 0, 0, 10);
++
++    // Restore values after XOR scratch operation.
++    TTI_SFPXOR(0, VC, VD, 0);
++}
++
++template <std::uint32_t VC, std::uint32_t VD, std::uint32_t MODE>
++TT_ALWAYS_INLINE void topk_cmp_swap_stable_min_to_vd()
++{
++    if (topk_stable_descending_mode)
++    {
++        topk_cmp_swap_stable_directional<VC, VD, MODE, false>();
++    }
++    else
++    {
++        topk_cmp_swap_stable_directional<VC, VD, MODE, true>();
++    }
++}
++
+ template <bool STABLE_SORT>
+ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_start)
+ {
+@@ -148,28 +197,49 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+         TTI_SFPNOP;
+     }
+ 
+-    constexpr int replay_count = STABLE_SORT ? 9 : 5;
+-
+-    if (init_replay)
++    if constexpr (STABLE_SORT)
+     {
+-        lltt::record<lltt::Exec>(replay_start, replay_count);
+-
+-        if constexpr (STABLE_SORT)
++        if (dir == static_cast<bool>(SortDir::ArgMax))
+         {
+-            // Step 4
+-            TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX);
+-            TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
+-            TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG1/3 NOP
+-            TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
+-
+-            // Step 3 (1-cycle stall: shares LREG3 with Step 4 above)
+-            TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX);
+-            TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG2/3 NOP
+-            TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
+-            TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG2/3 NOP
++            // First pass.
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++            TTI_SFPTRANSP(0, 0, 0, 0);
++
++            // Second pass.
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++            TTI_SFPTRANSP(0, 0, 0, 0);
+         }
+         else
+         {
++            // First pass.
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++            TTI_SFPTRANSP(0, 0, 0, 0);
++
++            // Second pass.
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
++            TTI_SFPTRANSP(0, 0, 0, 0);
++        }
++        init_replay = false;
++    }
++    else
++    {
++        constexpr int replay_count = 5;
++        if (init_replay)
++        {
++            lltt::record<lltt::Exec>(replay_start, replay_count);
++
+             // Step 4
+             TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX);
+             TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX);
+@@ -177,19 +247,18 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+             // Step 3
+             TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
+             TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX);
+-        }
+ 
+-        TTI_SFPTRANSP(0, 0, 0, 0);
++            TTI_SFPTRANSP(0, 0, 0, 0);
+ 
+-        init_replay = false;
+-    }
+-    else
+-    {
++            init_replay = false;
++        }
++        else
++        {
++            lltt::replay(replay_start, replay_count);
++        }
+         lltt::replay(replay_start, replay_count);
+     }
+ 
+-    lltt::replay(replay_start, replay_count);
+-
+     if (dir == static_cast<bool>(SortDir::ArgMin))
+     {
+         TTI_SFPCONFIG(0x004, 0xF, 1); // Restore the max/min behaviour of SWAP
+@@ -205,24 +274,18 @@ template <>
+ inline void bitonic_topk_ph2_st3_to_1<true>()
+ {
+     // Step 3
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG2/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
+ 
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
+     // Step 2
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_01_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX); // Hides LREG0/2 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_01_MAX); // Hides LREG1/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX); // Hides LREG0/2 NOP
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_01_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX>();
+ 
+-    // Step 1 (1-cycle stall: shares LREG1 with Step 2 above)
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_01_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX); // Hides LREG0/1 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_01_MAX); // Hides LREG2/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX); // Hides LREG0/1 NOP
++    // Step 1
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_01_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX>();
+ 
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -257,16 +320,12 @@ inline void bitonic_topk_ph1_st2_to_1<true>()
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
+     // Step 2
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_02_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX); // Hides LREG0/2 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_02_MAX); // Hides LREG1/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX); // Hides LREG0/2 NOP
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_02_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX>();
+ 
+-    // Step 1 (1-cycle stall: shares LREG1 with Step 2 above)
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_02_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX); // Hides LREG0/1 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_02_MAX); // Hides LREG2/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX); // Hides LREG0/1 NOP
++    // Step 1
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_02_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX>();
+ 
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -296,10 +355,8 @@ inline void bitonic_topk_ph0_st1_to_1<true>()
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
+     // Step 1
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
+-    TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG2/3 NOP
+-    TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++    topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
+ 
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -325,17 +382,13 @@ inline void bitonic_topk_step_N<true>(bool dir)
+     // Step N
+     if (dir == static_cast<bool>(SortDir::ArgMax))
+     {
+-        TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX);
+-        TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
+-        TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG1/3 NOP
+-        TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX>();
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX>();
+     }
+     else
+     {
+-        TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX);
+-        TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
+-        TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX); // Hides LREG1/3 NOP
+-        TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG2, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX>();
++        topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG3, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
+     }
+ }
+ 
+@@ -432,16 +485,24 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             {
+                                 lltt::replay(0, 8);
+                             }
+-                            constexpr int replay_count = STABLE_SORT ? 6 : 4;
+-                            if (init_phase)
++                            if constexpr (STABLE_SORT)
+                             {
+-                                lltt::record<lltt::Exec>(16, replay_count);
+                                 bitonic_topk_ph0_st1_to_1<STABLE_SORT>();
+                                 init_phase = false;
+                             }
+                             else
+                             {
+-                                lltt::replay(16, replay_count);
++                                constexpr int replay_count = 4;
++                                if (init_phase)
++                                {
++                                    lltt::record<lltt::Exec>(16, replay_count);
++                                    bitonic_topk_ph0_st1_to_1<STABLE_SORT>();
++                                    init_phase = false;
++                                }
++                                else
++                                {
++                                    lltt::replay(16, replay_count);
++                                }
+                             }
+                             if (init_store)
+                             {
+@@ -460,16 +521,24 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         {
+                             // Groups of 16 datums being sorted at the same time
+                             lltt::replay(0, 8);
+-                            constexpr int replay_count = STABLE_SORT ? 10 : 6;
+-                            if (init_phase)
++                            if constexpr (STABLE_SORT)
+                             {
+-                                lltt::record<lltt::Exec>(16, replay_count);
+                                 bitonic_topk_ph1_st2_to_1<STABLE_SORT>();
+                                 init_phase = false;
+                             }
+                             else
+                             {
+-                                lltt::replay(16, replay_count);
++                                constexpr int replay_count = 6;
++                                if (init_phase)
++                                {
++                                    lltt::record<lltt::Exec>(16, replay_count);
++                                    bitonic_topk_ph1_st2_to_1<STABLE_SORT>();
++                                    init_phase = false;
++                                }
++                                else
++                                {
++                                    lltt::replay(16, replay_count);
++                                }
+                             }
+                             lltt::replay(8, 8);
+                         }
+@@ -478,16 +547,24 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         for (int d = 0; d < 4; d++)
+                         {
+                             lltt::replay(0, 8);
+-                            constexpr int replay_count = STABLE_SORT ? 14 : 9;
+-                            if (init_phase)
++                            if constexpr (STABLE_SORT)
+                             {
+-                                lltt::record<lltt::Exec>(16, replay_count);
+                                 bitonic_topk_ph2_st3_to_1<STABLE_SORT>();
+                                 init_phase = false;
+                             }
+                             else
+                             {
+-                                lltt::replay(16, replay_count);
++                                constexpr int replay_count = 9;
++                                if (init_phase)
++                                {
++                                    lltt::record<lltt::Exec>(16, replay_count);
++                                    bitonic_topk_ph2_st3_to_1<STABLE_SORT>();
++                                    init_phase = false;
++                                }
++                                else
++                                {
++                                    lltt::replay(16, replay_count);
++                                }
+                             }
+                             lltt::replay(8, 8);
+                         }
+@@ -593,10 +670,19 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
+                 for (std::uint32_t ii = 0; ii < inner_d; ii++)
+                 {
+                     bitonic_topk_load8<is_fp32_dest_acc_en>(dst_offset, ld_dist);
+-                    TTI_SFPSWAP(0, top_min ? p_sfpu::LREG1 : p_sfpu::LREG0, top_min ? p_sfpu::LREG0 : p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
+                     if constexpr (STABLE_SORT)
+                     {
+-                        // 1-cycle stall: second swap for index tracking on same LREGs
++                        if constexpr (top_min)
++                        {
++                            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG1, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX>();
++                        }
++                        else
++                        {
++                            topk_cmp_swap_stable_min_to_vd<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX>();
++                        }
++                    }
++                    else
++                    {
+                         TTI_SFPSWAP(0, top_min ? p_sfpu::LREG1 : p_sfpu::LREG0, top_min ? p_sfpu::LREG0 : p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
+                     }
+                     bitonic_topk_store8<is_fp32_dest_acc_en>(dst_offset, ld_dist);
+@@ -874,7 +960,8 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+ 
+ inline void _init_topk()
+ {
+-    topk_replay_init = 0;
++    topk_replay_init            = 0;
++    topk_stable_descending_mode = false;
+     _sfpu_load_config32_(0xF, 0x0, 0x4); // Set bit [2] of the SFPU_CONTROL_REG to enable index tracking mode
+ }
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
+index 68c51b1..af557af 100644
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
+@@ -27,6 +27,7 @@
+  * and that Wt is a multiple of 2. It reserves space in the output buffers, processes
+  * tiles in pairs, and pushes the results to the output buffers upon completion.
+  */
++template <bool stable>
+ FORCE_INLINE
+ void sort_Wt_tiles_row_to_bitonic_sequence(
+     DataflowBuffer& input_dfb,
+@@ -59,7 +60,10 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
+         transpose_tile(index_dfb.get_id(), 1, 3);
+ 
+         // llk_topk_sort -> inplace
+-        ckernel::topk_local_sort(0, (int)ascending_local, end_phase);
++        if constexpr (stable) {
++            ckernel::topk_set_stable_descending_mode(!ascending);
++        }
++        ckernel::topk_local_sort<stable>(0, (int)ascending_local, end_phase);
+ 
+         tile_regs_commit();
+         tile_regs_wait();
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
+index 4380d8d..e900d0e 100644
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
+@@ -43,6 +43,7 @@ void kernel_main() {
+     constexpr uint32_t rm_value_output_cb_id = get_compile_time_arg_val(20);
+     constexpr uint32_t rm_index_output_cb_id = get_compile_time_arg_val(21);
+     constexpr uint32_t rm_post_sort_index_cb_id = get_compile_time_arg_val(22);
++    constexpr bool stable = get_compile_time_arg_val(23);
+ 
+     DataflowBuffer input_tensor_dfb(input_tensor_cb_id);
+     DataflowBuffer index_tensor_dfb(index_tensor_cb_id);
+@@ -101,7 +102,7 @@ void kernel_main() {
+         bool dir = ascending ^ ((core_id & 1) == 1);
+ 
+         // Read input value data
+-        sort_Wt_tiles_row_to_bitonic_sequence(
++        sort_Wt_tiles_row_to_bitonic_sequence<stable>(
+             input_tensor_dfb,
+             index_tensor_dfb,
+             input_tensor_transposed_dfb,
+@@ -158,24 +159,18 @@ void kernel_main() {
+                             copy_tile(index_tensor_transposed_cb_id, left_tile_id, index_dest_start);
+                             copy_tile(index_tensor_transposed_cb_id, right_tile_id, index_dest_end);
+ 
+-                            uint32_t tile_input_low = input_dest_start;
+-                            uint32_t tile_input_high = input_dest_end;
+-                            uint32_t tile_index_low = index_dest_start;
+-                            uint32_t tile_index_high = index_dest_end;
++                            if constexpr (stable) {
++                                ckernel::topk_set_stable_descending_mode(!ascending);
++                            }
+ 
+                             if (sub == 1) {
+                                 // Use sort LLK only the last stage to sort the last pair of tiles - speed up
+-                                ckernel::topk_local_sort(/*idst=*/0, (int)dir, /*end_phase(log2(K))=*/5);
++                                ckernel::topk_local_sort<stable>(/*idst=*/0, (int)dir, /*end_phase(log2(K))=*/5);
+                             } else {
+-                                ckernel::topk_merge(/*idst=*/0, m_iter, /*k=*/32);
+-
+-                                // topk_merge puts smallest values in DEST[0] and largest in DEST[1]
+-                                // We swap their indices when using descending order
+                                 if (dir) {
+-                                    tile_input_low = input_dest_end;
+-                                    tile_input_high = input_dest_start;
+-                                    tile_index_low = index_dest_end;
+-                                    tile_index_high = index_dest_start;
++                                    ckernel::topk_merge<true, stable>(/*idst=*/0, m_iter, /*k=*/32);
++                                } else {
++                                    ckernel::topk_merge<false, stable>(/*idst=*/0, m_iter, /*k=*/32);
+                                 }
+                             }
+                             tile_regs_commit();
+@@ -183,13 +178,13 @@ void kernel_main() {
+ 
+                             // Pack value tiles to CB
+                             pack_reconfig_data_format(input_tensor_transposed_cb_id);
+-                            pack_tile<true>(tile_input_low, input_tensor_transposed_cb_id, left_tile_id);
+-                            pack_tile<true>(tile_input_high, input_tensor_transposed_cb_id, right_tile_id);
++                            pack_tile<true>(input_dest_start, input_tensor_transposed_cb_id, left_tile_id);
++                            pack_tile<true>(input_dest_end, input_tensor_transposed_cb_id, right_tile_id);
+ 
+                             // Pack index tiles to CB
+                             pack_reconfig_data_format(index_tensor_transposed_cb_id);
+-                            pack_tile<true>(tile_index_low, index_tensor_transposed_cb_id, left_tile_id);
+-                            pack_tile<true>(tile_index_high, index_tensor_transposed_cb_id, right_tile_id);
++                            pack_tile<true>(index_dest_start, index_tensor_transposed_cb_id, left_tile_id);
++                            pack_tile<true>(index_dest_end, index_tensor_transposed_cb_id, right_tile_id);
+ 
+                             tile_regs_release();
+                         }
+@@ -250,15 +245,21 @@ void kernel_main() {
+ 
+                         value_tensor_peer_dfb.pop_front(one_tile);
+ 
+-                        ckernel::topk_merge(0, m_iter, 32);
++                        if constexpr (stable) {
++                            ckernel::topk_set_stable_descending_mode(!ascending);
++                        }
++                        if (dir) {
++                            ckernel::topk_merge<true, stable>(0, m_iter, 32);
++                        } else {
++                            ckernel::topk_merge<false, stable>(0, m_iter, 32);
++                        }
+ 
+-                        // topk_merge puts smallest values in DEST[0] and largest in DEST[1]
+-                        // If core must keep smallest values, then keep DEST[1] instead of DEST[0]
+-                        const uint32_t select_lower = dir ^ (i < j);
++                        // DEST[0] corresponds to the left tile slot in the requested direction.
++                        const uint32_t keep_left_slot = (i < j);
+ 
+                         uint32_t value_output_tile = input_dest_start;
+                         uint32_t index_output_tile = index_dest_start;
+-                        if (!select_lower) {
++                        if (!keep_left_slot) {
+                             value_output_tile = input_dest_end;
+                             index_output_tile = index_dest_end;
+                         }
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
+index 922f7de..7d059a3 100644
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
+@@ -145,26 +145,19 @@ void kernel_main() {
+                                 copy_tile(index_tensor_cb_id, 1, index_dest_end);
+                             }
+ 
+-                            uint32_t tile_input_low = input_dest_start;
+-                            uint32_t tile_input_high = input_dest_end;
+-                            uint32_t tile_index_low = index_dest_start;
+-                            uint32_t tile_index_high = index_dest_end;
++                            if constexpr (stable) {
++                                ckernel::topk_set_stable_descending_mode(descending);
++                            }
+ 
+                             if (sub == 1) {
+                                 // Use sort LLK only the last substage to sort the last pair of tiles - speed up
+-                                ckernel::topk_local_sort(/*idst=*/0, (int)dir, /*end_phase(log2(K))=*/5);
++                                ckernel::topk_local_sort<stable>(/*idst=*/0, (int)dir, /*end_phase(log2(K))=*/5);
+                             } else {
+-                                // For all other stages use topk_merge to put the top K values in one tile, and the
+-                                // bottom K values in another tile
+-                                ckernel::topk_merge(/*idst=*/0, m_iter, /*k=*/32);
+-
+-                                // topk_merge puts smallest values in DEST[0] and largest in DEST[1]
+-                                // We swap their indices when using descending order
++                                // Merge directly in the requested compare direction.
+                                 if (dir) {
+-                                    tile_input_low = input_dest_end;
+-                                    tile_input_high = input_dest_start;
+-                                    tile_index_low = index_dest_end;
+-                                    tile_index_high = index_dest_start;
++                                    ckernel::topk_merge<true, stable>(/*idst=*/0, m_iter, /*k=*/32);
++                                } else {
++                                    ckernel::topk_merge<false, stable>(/*idst=*/0, m_iter, /*k=*/32);
+                                 }
+                             }
+ 
+@@ -184,12 +177,12 @@ void kernel_main() {
+ 
+                                 tile_regs_wait();
+                                 pack_reconfig_data_format(input_tensor_transposed_cb_id);
+-                                pack_tile(tile_input_low, input_tensor_transposed_cb_id);
+-                                pack_tile(tile_input_high, input_tensor_transposed_cb_id);
++                                pack_tile(input_dest_start, input_tensor_transposed_cb_id);
++                                pack_tile(input_dest_end, input_tensor_transposed_cb_id);
+ 
+                                 pack_reconfig_data_format(index_tensor_transposed_cb_id);
+-                                pack_tile(tile_index_low, index_tensor_transposed_cb_id);
+-                                pack_tile(tile_index_high, index_tensor_transposed_cb_id);
++                                pack_tile(index_dest_start, index_tensor_transposed_cb_id);
++                                pack_tile(index_dest_end, index_tensor_transposed_cb_id);
+                                 tile_regs_release();
+ 
+                                 input_tensor_transposed_dfb.push_back(2 * one_tile);
+@@ -247,12 +240,12 @@ void kernel_main() {
+                                 tile_regs_wait();
+                                 // Process value tiles
+                                 pack_reconfig_data_format(input_tensor_output_cb_id);
+-                                pack_tile(tile_input_low, input_tensor_output_cb_id);
+-                                pack_tile(tile_input_high, input_tensor_output_cb_id);
++                                pack_tile(input_dest_start, input_tensor_output_cb_id);
++                                pack_tile(input_dest_end, input_tensor_output_cb_id);
+ 
+                                 pack_reconfig_data_format(index_tensor_output_cb_id);
+-                                pack_tile(tile_index_low, index_tensor_output_cb_id);
+-                                pack_tile(tile_index_high, index_tensor_output_cb_id);
++                                pack_tile(index_dest_start, index_tensor_output_cb_id);
++                                pack_tile(index_dest_end, index_tensor_output_cb_id);
+                                 tile_regs_release();
+ 
+                                 input_tensor_output_dfb.push_back(2 * one_tile);
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
+index 6d2b5eb..78a84ec 100644
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
+@@ -180,7 +180,7 @@ void kernel_main() {
+             transpose_init(input_tensor_cb_id);
+         }
+ 
+-        sort_Wt_tiles_row_to_bitonic_sequence(
++        sort_Wt_tiles_row_to_bitonic_sequence<stable>(
+             input_tensor_dfb,
+             index_tensor_dfb,
+             input_tensor_transposed_dfb,
+@@ -234,24 +234,18 @@ void kernel_main() {
+                         copy_tile(input_tensor_transposed_cb_id, left_tile_id, input_dest_start);
+                         copy_tile(input_tensor_transposed_cb_id, right_tile_id, input_dest_end);
+ 
+-                        uint32_t tile_input_low = input_dest_start;
+-                        uint32_t tile_input_high = input_dest_end;
+-                        uint32_t tile_index_low = index_dest_start;
+-                        uint32_t tile_index_high = index_dest_end;
++                        if constexpr (stable) {
++                            ckernel::topk_set_stable_descending_mode(descending);
++                        }
+ 
+                         if (sub == 1) {
+                             // Use sort LLK only the last stage to sort the last pair of tiles - speed up
+-                            ckernel::topk_local_sort(/*idst=*/0, (int)dir, /*end_phase(log2(K))=*/5);
++                            ckernel::topk_local_sort<stable>(/*idst=*/0, (int)dir, /*end_phase(log2(K))=*/5);
+                         } else {
+-                            ckernel::topk_merge(/*idst=*/0, m_iter, /*k=*/64);
+-
+                             if (dir) {
+-                                // topk_merge puts smallest values in DEST[0] and largest in DEST[1]
+-                                // We swap their indices when using descending order
+-                                tile_input_low = input_dest_end;
+-                                tile_input_high = input_dest_start;
+-                                tile_index_low = index_dest_end;
+-                                tile_index_high = index_dest_start;
++                                ckernel::topk_merge<true, stable>(/*idst=*/0, m_iter, /*k=*/64);
++                            } else {
++                                ckernel::topk_merge<false, stable>(/*idst=*/0, m_iter, /*k=*/64);
+                             }
+                         }
+ 
+@@ -259,12 +253,12 @@ void kernel_main() {
+                         tile_regs_wait();
+ 
+                         pack_reconfig_data_format(input_tensor_transposed_cb_id);
+-                        pack_tile<true>(tile_input_low, input_tensor_transposed_cb_id, left_tile_id);
+-                        pack_tile<true>(tile_input_high, input_tensor_transposed_cb_id, right_tile_id);
++                        pack_tile<true>(input_dest_start, input_tensor_transposed_cb_id, left_tile_id);
++                        pack_tile<true>(input_dest_end, input_tensor_transposed_cb_id, right_tile_id);
+ 
+                         pack_reconfig_data_format(index_tensor_transposed_cb_id);
+-                        pack_tile<true>(tile_index_low, index_tensor_transposed_cb_id, left_tile_id);
+-                        pack_tile<true>(tile_index_high, index_tensor_transposed_cb_id, right_tile_id);
++                        pack_tile<true>(index_dest_start, index_tensor_transposed_cb_id, left_tile_id);
++                        pack_tile<true>(index_dest_end, index_tensor_transposed_cb_id, right_tile_id);
+ 
+                         synchronization_dfb.push_back(one_tile);
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
+index 3a76dff..7a13b16 100644
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
+@@ -866,6 +866,7 @@ ProgramDescriptor build_cross_core_program_descriptor(
+         rm_value_output_cb_index,
+         rm_index_output_cb_index,
+         rm_post_sort_index_cb_index,
++        static_cast<uint32_t>(attributes.stable),
+     };
+     std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode_vector(
+         NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
+index 153d6a1..c7efd85 100644
+--- ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
+@@ -6,6 +6,7 @@
+ #include "device/sort_device_operation.hpp"
+ 
+ #include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
+ #include "ttnn/operations/creation/creation.hpp"
+ #include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
+ #include "ttnn/operations/data_movement/pad/pad.hpp"
+@@ -230,8 +231,6 @@ std::vector<Tensor> sort(
+     const bool stable,
+     const std::optional<MemoryConfig>& memory_config,
+     std::optional<std::tuple<Tensor&, Tensor&>> optional_output_tensors) {
+-    TT_FATAL(!stable, "ttnn::sort: stable=True is not yet implemented.");
+-
+     const ttnn::Shape& original_lshape = input_tensor.logical_shape();
+     const auto rank = input_tensor.logical_shape().rank();
+ 
+@@ -295,10 +294,18 @@ std::vector<Tensor> sort(
+     // is still sharded when it is called.  We capture the user-requested output
+     // memory config in sort_mem_cfg above before doing this conversion so that
+     // the output can be converted back to the sharded config after sorting.
+-    const Tensor transform_input = input_tensor.memory_config().is_sharded()
++    const Tensor unsharded_input = input_tensor.memory_config().is_sharded()
+                                        ? ttnn::to_memory_config(input_tensor, ttnn::DRAM_MEMORY_CONFIG)
+                                        : input_tensor;
+ 
++    // The SFPU bitonic primitive compares BF16/FP32 values. IEEE Float16 is
++    // exactly representable in Float32, so promote it once around the device
++    // sort instead of teaching every compare/merge and padding stage a second
++    // 16-bit encoding.
++    const bool promote_float16 = input_tensor.dtype() == DataType::FLOAT16;
++    const Tensor transform_input =
++        promote_float16 ? ttnn::typecast(unsharded_input, DataType::FLOAT32) : unsharded_input;
++
+     Tensor padded_input_tensor =
+         dm::pre_sort_transform_tensor(transform_input, dim, is_dim_last_idx, is_rank_le_4d, descending);
+     const MemoryConfig device_op_mem_cfg = sort_mem_cfg.is_sharded() ? ttnn::DRAM_MEMORY_CONFIG : sort_mem_cfg;
+@@ -316,7 +323,7 @@ std::vector<Tensor> sort(
+         const auto& out1 = std::get<1>(*optional_output_tensors);
+         const bool values_layout_match = (out0.layout() == padded_input_tensor.layout());
+         const bool indices_layout_match = (out1.layout() == padded_input_tensor.layout());
+-        preallocated_layout_mismatch = !values_layout_match || !indices_layout_match;
++        preallocated_layout_mismatch = promote_float16 || !values_layout_match || !indices_layout_match;
+         if (!preallocated_layout_mismatch) {
+             const auto canonicalize_output = [&](const Tensor& t) {
+                 return dm::pre_sort_transform_tensor(t, dim, is_dim_last_idx, is_rank_le_4d, descending);
+@@ -334,6 +341,10 @@ std::vector<Tensor> sort(
+     auto results = dm::post_sort_transform_tensor(
+         input_tensor, sorted_tensors, dim, is_dim_last_idx, original_lshape, device_op_mem_cfg);
+ 
++    if (promote_float16) {
++        results[0] = ttnn::typecast(results[0], DataType::FLOAT16);
++    }
++
+     // The device op always writes to DRAM when sort_mem_cfg is sharded (to avoid
+     // shard-spec conflicts with the W-padded intermediate tensor shape).  After
+     // the post-transform slice has restored the original W dimension, convert back
