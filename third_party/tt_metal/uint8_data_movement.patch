@@ -1,0 +1,141 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp
+@@ -41,6 +41,7 @@ void RepeatDeviceOperation::validate_on_program_cache_miss(
+             input_tensor_a.layout() == tt::tt_metal::Layout::ROW_MAJOR, "ROW_MAJOR repeat requires ROW_MAJOR layout");
+         TT_FATAL(
+-            input_tensor_a.dtype() == tt::tt_metal::DataType::UINT16 or
++            input_tensor_a.dtype() == tt::tt_metal::DataType::UINT8 or
++                input_tensor_a.dtype() == tt::tt_metal::DataType::UINT16 or
+                 input_tensor_a.dtype() == tt::tt_metal::DataType::BFLOAT16 or
+                 input_tensor_a.dtype() == tt::tt_metal::DataType::FLOAT16 or
+                 input_tensor_a.dtype() == tt::tt_metal::DataType::UINT32 or
+@@ -48,5 +49,5 @@ void RepeatDeviceOperation::validate_on_program_cache_miss(
+                 input_tensor_a.dtype() == tt::tt_metal::DataType::INT32 or
+                 input_tensor_a.dtype() == tt::tt_metal::DataType::FLOAT32,
+-            "Can only work with UINT16, BFLOAT16, UINT32, INT32, FLOAT32 data types");
++            "Can only work with UINT8, UINT16, BFLOAT16, FLOAT16, UINT32, INT32, FLOAT32 data types");
+     }
+
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
+@@ -86,9 +86,9 @@ void TilizeWithValPaddingDeviceOperation::validate_on_program_cache_miss(
+     TT_FATAL(input_tensor.layout() == Layout::ROW_MAJOR, "Can only tilize row major data");
+     TT_FATAL(
+-        input_tensor.dtype() == DataType::BFLOAT16 or input_tensor.dtype() == DataType::INT32 or
+-            input_tensor.dtype() == DataType::UINT32 or input_tensor.dtype() == DataType::FLOAT32 or
+-            input_tensor.dtype() == DataType::UINT16 or input_tensor.dtype() == DataType::FLOAT16 or
+-            input_tensor.dtype() == DataType::FP8_E4M3,
+-        "Can only tilize bfloat16/float32 or int32/uint32/uint16 or fp8_e4m3 tensors");
++        input_tensor.dtype() == DataType::BFLOAT16 or input_tensor.dtype() == DataType::INT32 or
++            input_tensor.dtype() == DataType::UINT32 or input_tensor.dtype() == DataType::FLOAT32 or
++            input_tensor.dtype() == DataType::UINT8 or input_tensor.dtype() == DataType::UINT16 or
++            input_tensor.dtype() == DataType::FLOAT16 or input_tensor.dtype() == DataType::FP8_E4M3,
++        "Unsupported input dtype for tilize_with_val_padding");
+     // fp8 tile INPUT unpacks to fp32 in DEST and packs to any float TILE format. Reject non-float outputs:
+     // fp8 itself is ROW_MAJOR-only, and integer outputs are meaningless for a float input.
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp
+@@ -34,6 +34,10 @@ uint32_t get_packed_value(const Tensor& tensor, const PadValue& pad_value) {
+                     return ttnn::operations::data_movement::pack_two_uint16_into_uint32(
+                         {uint16_pad_value, uint16_pad_value});
+                 }
++                if (tensor.dtype() == DataType::UINT8) {
++                    const uint32_t uint8_pad_value = static_cast<uint8_t>(pad_value);
++                    return uint8_pad_value * 0x01010101U;
++                }
+                 if (tensor.dtype() == DataType::FLOAT32) {
+                     return std::bit_cast<uint32_t>(static_cast<float>(pad_value));
+                 }
+@@ -63,6 +67,10 @@ uint32_t get_packed_value(const Tensor& tensor, const PadValue& pad_value) {
+                     return ttnn::operations::data_movement::pack_two_uint16_into_uint32(
+                         {uint16_pad_value, uint16_pad_value});
+                 }
++                if (tensor.dtype() == DataType::UINT8) {
++                    const uint32_t uint8_pad_value = static_cast<uint8_t>(pad_value);
++                    return uint8_pad_value * 0x01010101U;
++                }
+                 if (tensor.dtype() == DataType::FP8_E4M3) {  // 4 fp8 bytes per word
+                     const float8_e4m3 v(static_cast<float>(pad_value));
+                     return pack_four_float8_e4m3_into_uint32(v, v, v, v);
+diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
+@@ -14,6 +14,7 @@ namespace ttnn::prim::detail {
+ inline const std::map<ttnn::DataType, uint32_t> data_type_to_size = {
+     {ttnn::DataType::BFLOAT16, 2},
+     {ttnn::DataType::FLOAT16, 2},
++    {ttnn::DataType::UINT8, 1},
+     {ttnn::DataType::FLOAT32, 4},
+     {ttnn::DataType::UINT16, 2},
+     {ttnn::DataType::UINT32, 4},
+@@ -52,5 +53,6 @@ inline uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const tt::tt_met
+             case ttnn::DataType::INT32:
+             case ttnn::DataType::UINT32: return fill_value;
++            case ttnn::DataType::UINT8: return static_cast<uint8_t>(fill_value);
+             case ttnn::DataType::UINT16: return pack_fill_value(static_cast<uint16_t>(fill_value));
+             case ttnn::DataType::BFLOAT16:
+             case ttnn::DataType::FLOAT16:
+@@ -64,5 +66,6 @@ inline uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const tt::tt_met
+         case ttnn::DataType::BFLOAT16: return pack_fill_value(fill_value);
+         case ttnn::DataType::FLOAT16: return pack_fill_value(fill_value);
++        case ttnn::DataType::UINT8: return static_cast<uint8_t>(fill_value);
+         case ttnn::DataType::UINT16: return pack_fill_value(static_cast<uint16_t>(fill_value));
+         case ttnn::DataType::UINT32: return pack_fill_value(static_cast<uint32_t>(fill_value));
+         case ttnn::DataType::INT32: return pack_fill_value(static_cast<int32_t>(fill_value));
+@@ -78,5 +81,6 @@ inline std::string get_where_data_fmt(ttnn::DataType dtype) {
+         case ttnn::DataType::FLOAT32: return "DataFormat::Float32";
+         case ttnn::DataType::FLOAT16: return "DataFormat::Float16";
++        case ttnn::DataType::UINT8: return "DataFormat::UInt32";
+         case ttnn::DataType::UINT32: return "DataFormat::UInt32";
+         case ttnn::DataType::INT32: return "DataFormat::Int32";
+         default: return "DataFormat::Float16_b";  // BFLOAT16, UINT16
+diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
+@@ -146,7 +146,9 @@ tt::tt_metal::ProgramDescriptor FillPadProgramFactory::create_descriptor(
+
+     // ---- Kernel defines ----
+     KernelDescriptor::Defines kernel_defines;
+-    kernel_defines.emplace_back("MASK_ELEM_UINT", (input_element_size_bytes == 2) ? "uint16_t" : "uint32_t");
++    kernel_defines.emplace_back(
++        "MASK_ELEM_UINT",
++        input_element_size_bytes == 1 ? "uint8_t" : input_element_size_bytes == 2 ? "uint16_t" : "uint32_t");
+     kernel_defines.emplace_back(
+         "MASK_VALUE",
+         is_fp32 ? "0x3F800000u" : is_fp16 ? "0x3C00u" : is_float_type ? "0x3F80u" : "1u");
+@@ -154,6 +156,9 @@ tt::tt_metal::ProgramDescriptor FillPadProgramFactory::create_descriptor(
+     kernel_defines.emplace_back("FILL_PAD_DATA_FMT", detail::get_where_data_fmt(input_tensor.dtype()));
+     if (!is_float_type) {
+-        kernel_defines.emplace_back("FILL_PAD_FILL_DATA_FMT", fmt::format("DataFormat::{}", cb_data_format));
++        kernel_defines.emplace_back(
++            "FILL_PAD_FILL_DATA_FMT",
++            input_tensor.dtype() == DataType::UINT8 ? "DataFormat::UInt32"
++                                                    : fmt::format("DataFormat::{}", cb_data_format));
+     }
+     kernel_defines.emplace_back(
+         "FILL_PAD_FILL_FN", is_float_type ? "fill_tile_bitcast" : "fill_tile_int<FILL_PAD_FILL_DATA_FMT>");
+@@ -520,7 +525,9 @@ tt::tt_metal::ProgramDescriptor FillPadL1ShardedProgramFactory::create_descripto
+
+     // ---- Kernel defines ----
+     KernelDescriptor::Defines kernel_defines;
+-    kernel_defines.emplace_back("MASK_ELEM_UINT", (input_element_size_bytes == 2) ? "uint16_t" : "uint32_t");
++    kernel_defines.emplace_back(
++        "MASK_ELEM_UINT",
++        input_element_size_bytes == 1 ? "uint8_t" : input_element_size_bytes == 2 ? "uint16_t" : "uint32_t");
+     kernel_defines.emplace_back(
+         "MASK_VALUE",
+         is_fp32 ? "0x3F800000u" : is_fp16 ? "0x3C00u" : is_float_type ? "0x3F80u" : "1u");
+@@ -528,6 +535,9 @@ tt::tt_metal::ProgramDescriptor FillPadL1ShardedProgramFactory::create_descripto
+     kernel_defines.emplace_back("FILL_PAD_DATA_FMT", detail::get_where_data_fmt(input_tensor.dtype()));
+     if (!is_float_type) {
+-        kernel_defines.emplace_back("FILL_PAD_FILL_DATA_FMT", fmt::format("DataFormat::{}", cb_data_format));
++        kernel_defines.emplace_back(
++            "FILL_PAD_FILL_DATA_FMT",
++            input_tensor.dtype() == DataType::UINT8 ? "DataFormat::UInt32"
++                                                    : fmt::format("DataFormat::{}", cb_data_format));
+     }
+     kernel_defines.emplace_back(
+         "FILL_PAD_FILL_FN", is_float_type ? "fill_tile_bitcast" : "fill_tile_int<FILL_PAD_FILL_DATA_FMT>");

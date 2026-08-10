@@ -1,0 +1,61 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10644,6 +10644,49 @@
+ };
+ } // namespace
+
++namespace {
++class StableHLOToTTIRPopulationCountOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::PopulationCountOp> {
++  using OpConversionPattern<
++      mlir::stablehlo::PopulationCountOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::PopulationCountOp srcOp,
++                  mlir::stablehlo::PopulationCountOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto inputType = cast<RankedTensorType>(srcOp.getOperand().getType());
++    auto inputElementType = cast<IntegerType>(inputType.getElementType());
++    auto resultType = cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getType()));
++    Location loc = srcOp.getLoc();
++
++    auto makeConstant = [&](uint64_t value) -> Value {
++      auto valueAttr = rewriter.getIntegerAttr(resultType.getElementType(),
++                                               value);
++      auto denseAttr = DenseElementsAttr::get(resultType, valueAttr);
++      return rewriter.create<ttir::ConstantOp>(loc, resultType, denseAttr);
++    };
++
++    Value one = makeConstant(1);
++    Value count = makeConstant(0);
++    Value remaining = adaptor.getOperand();
++    for (unsigned bit = 0; bit < inputElementType.getWidth(); ++bit) {
++      Value setBit = rewriter.create<ttir::BitwiseAndOp>(
++          loc, resultType, remaining, one);
++      count = rewriter.create<ttir::AddOp>(loc, resultType, count, setBit);
++      if (bit + 1 != inputElementType.getWidth()) {
++        remaining = rewriter.create<ttir::LogicalRightShiftOp>(
++            loc, resultType, remaining, one);
++      }
++    }
++
++    rewriter.replaceOp(srcOp, count);
++    return success();
++  }
++};
++} // namespace
++
+ static void
+ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+                                          RewritePatternSet &patterns,
+@@ -10659,5 +10702,7 @@
+       mlir::stablehlo::CbrtOp, mlir::tt::ttir::CbrtOp>>(typeConverter, ctx);
+   patterns.add<StableHLOToTTIRConvertOpConversionPattern>(typeConverter, ctx);
++  patterns.add<StableHLOToTTIRPopulationCountOpConversionPattern>(
++      typeConverter, ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::CeilOp, mlir::tt::ttir::CeilOp>>(typeConverter, ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<

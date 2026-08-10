@@ -1,0 +1,100 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -363,9 +363,9 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::createToLayoutOpOperand
+ // tt-metal uses predicate type for where op operation. If the predicate data
+ // type does not match with inputs/output data type; tt-metal can generate
+ // incorrect results or other failures. Add a data type workaround if predicate
+-// type does not match with input. Also, if predicate is integer, force it to
+-// match input data type, unless both are integers, then force both to
+-// float32.
++// type does not match with input. Native Int32 where keeps its operands exact;
++// other integer combinations use Float32 until their native paths are
++// reliable.
+ // tt-metal issues to track mixed data types ops bug.
+ // https://github.com/tenstorrent/tt-metal/issues/17998
+ // https://github.com/tenstorrent/tt-metal/issues/24511
+@@ -386,14 +386,23 @@ TTNNOperandsWorkaroundsFactory::createWhereOpOperandsWorkarounds(
+
+   if (predicateElementType.isInteger() ||
+       predicateElementType != inputElementType) {
+     if (inputElementType.isInteger()) {
+-      // In an unlikely scenario, we could potentially upcast to float32, if
+-      // input is integer and predicate is for example bf16.
+-      // More importantly, if both are integers, we force both to float32.
+-      predicateTypeWorkaround =
+-          TTNNOperandWorkarounds(ttcore::DataType::Float32);
+-      inputTypeWorkaround = TTNNOperandWorkarounds(ttcore::DataType::Float32);
+-      outputTypeWorkaround = TTNNOperandWorkarounds(ttcore::DataType::Float32);
++      ttcore::DataType inputDataType =
++          ttcore::elementTypeToDataType(inputElementType);
++      if (inputDataType == ttcore::DataType::Int32) {
++        // The native SFPU where path supports Int32. Only convert the
++        // predicate so integer payloads remain exact.
++        predicateTypeWorkaround = TTNNOperandWorkarounds(inputDataType);
++      } else {
++        // Other integer where paths are not reliable yet. Float32 represents
++        // every value of the supported narrow integer types exactly.
++        predicateTypeWorkaround =
++            TTNNOperandWorkarounds(ttcore::DataType::Float32);
++        inputTypeWorkaround =
++            TTNNOperandWorkarounds(ttcore::DataType::Float32);
++        outputTypeWorkaround =
++            TTNNOperandWorkarounds(ttcore::DataType::Float32);
++      }
+     } else {
+       // Otherwise, we just force the predicate type to match the input type.
+       predicateTypeWorkaround = TTNNOperandWorkarounds(
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -420,7 +420,40 @@ public:
+     return success();
+   }
+ };
+
++// UInt32 where is incorrect in tt-metal, while its Int32 path preserves all
++// 32 bits. Reinterpret the data operands around that path to avoid the lossy
++// Float32 workaround and preserve the unsigned payload exactly.
++class UInt32WhereWorkaround : public OpRewritePattern<ttnn::WhereOp> {
++public:
++  using OpRewritePattern<ttnn::WhereOp>::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(ttnn::WhereOp op,
++                                PatternRewriter &rewriter) const override {
++    auto outputType = mlir::cast<RankedTensorType>(op.getType());
++    auto outputLayout = utils::getLayoutAttrFromTensor(outputType);
++    if (outputLayout.getDataType() != ttcore::DataType::UInt32) {
++      return failure();
++    }
++
++    auto toInt32Type = [&](Value value) {
++      auto type = mlir::cast<RankedTensorType>(value.getType());
++      return utils::RankedTensorTypeFactory::create(
++          type, ttcore::DataType::Int32);
++    };
++
++    auto second = rewriter.create<ttnn::BitcastConvertOp>(
++        op.getLoc(), toInt32Type(op.getSecond()), op.getSecond());
++    auto third = rewriter.create<ttnn::BitcastConvertOp>(
++        op.getLoc(), toInt32Type(op.getThird()), op.getThird());
++    auto where = rewriter.create<ttnn::WhereOp>(
++        op.getLoc(), toInt32Type(op.getResult()), op.getFirst(), second, third);
++    rewriter.replaceOpWithNewOp<ttnn::BitcastConvertOp>(
++        op, outputType, where.getResult());
++    return success();
++  }
++};
++
+ // Pass to apply workarounds to the operands of TTNN operations.
+ class TTNNWorkarounds : public impl::TTNNWorkaroundsBase<TTNNWorkarounds> {
+ public:
+@@ -430,7 +463,7 @@ public:
+     if (decompositionWorkaroundsEnabled) {
+       RewritePatternSet patterns(&getContext());
+       patterns.add<
+-          GatherSi32Workaround,
++          GatherSi32Workaround, UInt32WhereWorkaround,
+           workarounds::decomposition::GatherOpRank1RewritePattern,
+           workarounds::decomposition::SamplingOpRank2RewritePattern,
+           workarounds::decomposition::TTNNCollectiveReshapeWorkaround<
