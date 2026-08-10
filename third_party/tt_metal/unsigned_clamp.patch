@@ -1,0 +1,132 @@
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
+@@ -27,12 +27,32 @@ inline void calculate_clamp(uint min_val, uint max_val) {
+-template <bool APPROXIMATION_MODE, int ITERATIONS>
++template <bool APPROXIMATION_MODE, int ITERATIONS, bool IS_UNSIGNED = false>
+ inline void calculate_clamp_int32(uint min_val, uint max_val) {
+     for (int d = 0; d < ITERATIONS; d++) {
+-        load_value_param_int(min_val);
+-        calculate_unary_max_min_int32_body<Max>(min_val);
+-        load_value_param_int(max_val);
+-        calculate_unary_max_min_int32_body<Min>(max_val);
++        load_value_param_int<IS_UNSIGNED>(min_val);
++        calculate_unary_max_min_int32_body<Max, IS_UNSIGNED>(min_val);
++        load_value_param_int<IS_UNSIGNED>(max_val);
++        calculate_unary_max_min_int32_body<Min, IS_UNSIGNED>(max_val);
+         sfpi::dst_reg++;
+     }
+ }
+-
++
++template <bool APPROXIMATION_MODE, DataFormat FORMAT, int ITERATIONS>
++inline void calculate_clamp_uint(uint min_val, uint max_val) {
++    static_assert(FORMAT == DataFormat::UInt32 || FORMAT == DataFormat::UInt16);
++    if constexpr (FORMAT == DataFormat::UInt32) {
++        calculate_clamp_int32<APPROXIMATION_MODE, ITERATIONS, true>(min_val, max_val);
++    } else {
++        const sfpi::vUInt min = min_val;
++        const sfpi::vUInt max = max_val;
++        for (int d = 0; d < ITERATIONS; d++) {
++            sfpi::vUInt value = sfpi::dst_reg[0].mode<sfpi::DataLayout::U16>();
++            v_if(value < min) { value = min; }
++            v_endif;
++            v_if(value > max) { value = max; }
++            v_endif;
++            sfpi::dst_reg[0].mode<sfpi::DataLayout::U16>() = value;
++            sfpi::dst_reg++;
++        }
++    }
++}
++
+ }  // namespace ckernel::sfpu
+diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
+--- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
++++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
+@@ -26,13 +26,33 @@ inline void calculate_clamp(uint min_val, uint max_val) {
+-template <bool APPROXIMATION_MODE, int ITERATIONS>
++template <bool APPROXIMATION_MODE, int ITERATIONS, bool IS_UNSIGNED = false>
+ inline void calculate_clamp_int32(uint min_val, uint max_val) {
+     // SFPU microcode
+     for (int d = 0; d < ITERATIONS; d++) {
+-        load_value_param_int(min_val);
+-        calculate_unary_max_min_int32_body<Max>(min_val);
+-        load_value_param_int(max_val);
+-        calculate_unary_max_min_int32_body<Min>(max_val);
++        load_value_param_int<IS_UNSIGNED>(min_val);
++        calculate_unary_max_min_int32_body<Max, IS_UNSIGNED>(min_val);
++        load_value_param_int<IS_UNSIGNED>(max_val);
++        calculate_unary_max_min_int32_body<Min, IS_UNSIGNED>(max_val);
+         sfpi::dst_reg++;
+     }
+ }
+-
++
++template <bool APPROXIMATION_MODE, DataFormat FORMAT, int ITERATIONS>
++inline void calculate_clamp_uint(uint min_val, uint max_val) {
++    static_assert(FORMAT == DataFormat::UInt32 || FORMAT == DataFormat::UInt16);
++    if constexpr (FORMAT == DataFormat::UInt32) {
++        calculate_clamp_int32<APPROXIMATION_MODE, ITERATIONS, true>(min_val, max_val);
++    } else {
++        const sfpi::vUInt min = min_val;
++        const sfpi::vUInt max = max_val;
++        for (int d = 0; d < ITERATIONS; d++) {
++            sfpi::vUInt value = sfpi::dst_reg[0].mode<sfpi::DataLayout::U16>();
++            v_if(value < min) { value = min; }
++            v_endif;
++            v_if(value > max) { value = max; }
++            v_endif;
++            sfpi::dst_reg[0].mode<sfpi::DataLayout::U16>() = value;
++            sfpi::dst_reg++;
++        }
++    }
++}
++
+ }  // namespace ckernel::sfpu
+diff --git tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
+--- tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
++++ tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
+@@ -70,6 +70,19 @@ ALWI void clamp_tile_int32(uint32_t idst, uint32_t param0, uint32_t param1) {
+         param1));
+ }
+-
++
++template <DataFormat FORMAT>
++ALWI void clamp_tile_uint(uint32_t idst, uint32_t param0, uint32_t param1) {
++    MATH(SFPU_UNARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        calculate_clamp_uint,
++        (APPROX, FORMAT, 8 /* ITERATIONS */),
++        idst,
++        VectorMode::RC,
++        param0,
++        param1));
++}
++
+ /**
+  * Please refer to documentation for any_init.
+  */
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+@@ -648,6 +648,19 @@ std::pair<std::string, std::string> get_op_init_and_func_parameterized(
+                     "clamp_tile_init();",
+                     fmt::format("clamp_tile_int32({}, {}, {});", idst, static_cast<uint32_t>(static_cast<int32_t>(params[0])), static_cast<uint32_t>(static_cast<int32_t>(params[1])))};
+             }
++            if (input_dtype == DataType::UINT32 || input_dtype == DataType::UINT16 ||
++                input_dtype == DataType::UINT8) {
++                // UInt8 is zero-extended to 32 bits in DST by the unpacker.
++                const char* format = input_dtype == DataType::UINT16 ? "UInt16" : "UInt32";
++                return {
++                    "clamp_tile_init();",
++                    fmt::format(
++                        "clamp_tile_uint<DataFormat::{}>({}, {}, {});",
++                        format,
++                        idst,
++                        static_cast<uint32_t>(params[0]),
++                        static_cast<uint32_t>(params[1]))};
++            }
+             return {
+                 "clamp_tile_init();",
+                 fmt::format(

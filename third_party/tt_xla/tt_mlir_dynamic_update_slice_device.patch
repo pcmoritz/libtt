@@ -14,36 +14,10 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +                            adaptor.getOperand().getType())
 +                            .getShape();
 +    auto sliceSizes = srcOp.getSliceSizes();
-@@ -4864,5 +4865,13 @@ public:
-     auto startIndexElementType =
-         mlir::cast<RankedTensorType>(startIndicesRange[0].getType())
-             .getElementType();
-+    if (auto integerType = mlir::dyn_cast<IntegerType>(startIndexElementType);
-+        integerType && integerType.isUnsigned() &&
-+        integerType.getWidth() < 32) {
-+      // Narrow unsigned values are exactly representable in i32, whose clamp
-+      // path is supported. SliceDynamic's operand workaround converts the
-+      // clamped bounds to the UInt32 required by TTNN.
-+      startIndexElementType = rewriter.getI32Type();
-+    }
-     auto singleElementTensorType =
-         RankedTensorType::get({1}, startIndexElementType);
-@@ -4870,9 +4879,26 @@ public:
+@@ -4870,9 +4871,14 @@ public:
 -    for (Value startIndex : startIndicesRange) {
 -      auto reshapedIndex = rewriter.create<ttir::ReshapeOp>(
 +    for (auto [dim, startIndex] : llvm::enumerate(startIndicesRange)) {
-+      auto startIndexType =
-+          mlir::cast<RankedTensorType>(startIndex.getType());
-+      if (startIndexType.getElementType() != startIndexElementType) {
-+        // Widen before scalar reshapes can be CPU-hoisted.
-+        startIndex =
-+            ttmlir::utils::lookThrough<ttir::ReshapeOp>(startIndex);
-+        startIndexType =
-+            mlir::cast<RankedTensorType>(startIndex.getType());
-+        startIndex = rewriter.create<ttir::TypecastOp>(
-+            srcOp.getLoc(), startIndexType.clone(startIndexElementType),
-+            startIndex);
-+      }
 +      Value reshapedIndex = rewriter.create<ttir::ReshapeOp>(
            srcOp.getLoc(),
            RankedTensorType::get(singleElementTensorType.getShape(),
@@ -56,9 +30,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          rewriter.getI32IntegerAttr(operandShape[dim] - sliceSizes[dim]));
        startIndicesValues1D.push_back(reshapedIndex);
      }
-@@ -4891,1 +4917,0 @@ public:
+@@ -4891,1 +4897,0 @@ public:
 -    auto sliceSizes = srcOp.getSliceSizes();
-@@ -4904,6 +4929,128 @@ class StableHLOToTTIRDynamicSliceOpConversionPattern
+@@ -4904,6 +4909,128 @@ class StableHLOToTTIRDynamicSliceOpConversionPattern
  };
  } // namespace
  
