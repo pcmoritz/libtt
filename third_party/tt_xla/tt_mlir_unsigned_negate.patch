@@ -1,0 +1,52 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10807,7 +10807,38 @@ public:
+     rewriter.replaceOp(srcOp, count);
+     return success();
+   }
+ };
++
++class StableHLOToTTIRNegOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::NegOp> {
++  using OpConversionPattern<mlir::stablehlo::NegOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::NegOp srcOp,
++                  mlir::stablehlo::NegOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto resultType = cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getType()));
++    auto inputType = cast<RankedTensorType>(srcOp.getOperand().getType());
++    auto inputElementType = dyn_cast<IntegerType>(inputType.getElementType());
++    if (!inputElementType || !inputElementType.isUnsigned()) {
++      rewriter.replaceOpWithNewOp<ttir::NegOp>(srcOp, resultType,
++                                               adaptor.getOperand());
++      return success();
++    }
++
++    // TTNN's unary negation is a floating-point SFPU operation. Express
++    // unsigned negation as modular subtraction so all integer bits are kept.
++    auto zeroAttr = rewriter.getIntegerAttr(resultType.getElementType(), 0);
++    auto zero = rewriter.create<ttir::ConstantOp>(
++        srcOp.getLoc(), resultType,
++        DenseElementsAttr::get(resultType, zeroAttr));
++    rewriter.replaceOpWithNewOp<ttir::SubtractOp>(
++        srcOp, resultType, zero, adaptor.getOperand());
++    return success();
++  }
++};
+ } // namespace
+
+ static void
+@@ -10836,8 +10867,7 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::IsFiniteOp, mlir::tt::ttir::IsFiniteOp>>(typeConverter,
+                                                                 ctx);
+-  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+-      mlir::stablehlo::NegOp, mlir::tt::ttir::NegOp>>(typeConverter, ctx);
++  patterns.add<StableHLOToTTIRNegOpConversionPattern>(typeConverter, ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::RsqrtOp, mlir::tt::ttir::RsqrtOp>>(typeConverter, ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<

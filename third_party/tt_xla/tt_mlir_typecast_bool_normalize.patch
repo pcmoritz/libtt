@@ -1,0 +1,68 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10607,6 +10607,49 @@
+ };
+ } // namespace
+
++namespace {
++class StableHLOToTTIRConvertOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::ConvertOp> {
++  using OpConversionPattern<
++      mlir::stablehlo::ConvertOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::ConvertOp srcOp,
++                  mlir::stablehlo::ConvertOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto inputType = cast<RankedTensorType>(srcOp.getOperand().getType());
++    auto inputIntegerType =
++        dyn_cast<IntegerType>(inputType.getElementType());
++    auto resultType = cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getType()));
++    auto resultIntegerType =
++        dyn_cast<IntegerType>(resultType.getElementType());
++    if (!inputIntegerType || inputIntegerType.getWidth() != 1 ||
++        (resultIntegerType && resultIntegerType.getWidth() == 1)) {
++      return failure();
++    }
++
++    auto zeroValue = rewriter.getZeroAttr(resultType.getElementType());
++    auto oneValue = rewriter.getOneAttr(resultType.getElementType());
++    if (!zeroValue || !oneValue) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "unsupported boolean conversion result type");
++    }
++
++    auto zeroAttr = DenseElementsAttr::get(resultType, zeroValue);
++    auto oneAttr = DenseElementsAttr::get(resultType, oneValue);
++    Value zero = rewriter.create<ttir::ConstantOp>(
++        srcOp.getLoc(), resultType, zeroAttr);
++    Value one = rewriter.create<ttir::ConstantOp>(
++        srcOp.getLoc(), resultType, oneAttr);
++    rewriter.replaceOpWithNewOp<ttir::WhereOp>(
++        srcOp, resultType, adaptor.getOperand(), one, zero);
++    return success();
++  }
++};
++} // namespace
++
+ static void
+ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+                                          RewritePatternSet &patterns,
+@@ -10619,9 +10662,11 @@
+       typeConverter, ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::CbrtOp, mlir::tt::ttir::CbrtOp>>(typeConverter, ctx);
+-  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+-      mlir::stablehlo::ConvertOp, mlir::tt::ttir::TypecastOp>>(typeConverter,
+-                                                               ctx);
++  patterns.add<StableHLOToTTIRConvertOpConversionPattern>(
++      typeConverter, ctx, PatternBenefit(2));
++  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
++      mlir::stablehlo::ConvertOp, mlir::tt::ttir::TypecastOp>>(typeConverter,
++                                                               ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::CeilOp, mlir::tt::ttir::CeilOp>>(typeConverter, ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<

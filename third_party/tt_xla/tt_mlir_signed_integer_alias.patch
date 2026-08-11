@@ -67,3 +67,30 @@ index 81e64390..225ac22c 100644
    } else if (oldDataType == tt::target::DataType::Int8 &&
               newDataType == tt::target::DataType::UInt8) {
      detail::handleIntegerBufferCast<int8_t, uint8_t>(
+diff --git a/runtime/include/tt/runtime/utils.h b/runtime/include/tt/runtime/utils.h
+--- a/runtime/include/tt/runtime/utils.h
++++ b/runtime/include/tt/runtime/utils.h
+@@ -40,18 +40,7 @@ inline void handleEquallySignedIntegerBufferCast(const FromTy *oldBuffer,
+-  constexpr ToTy toTyMax = std::numeric_limits<ToTy>::max();
+-  constexpr ToTy toTyMin = std::numeric_limits<ToTy>::min();
+-  if constexpr (sizeof(ToTy) >= sizeof(FromTy)) {
+-    for (int64_t i = 0; i < numElements; i++) {
+-      newBuffer[i] = static_cast<ToTy>(oldBuffer[i]);
+-    }
+-  } else {
+-    for (int64_t i = 0; i < numElements; i++) {
+-      if (oldBuffer[i] < static_cast<FromTy>(toTyMin)) {
+-        newBuffer[i] = toTyMin;
+-      } else if (oldBuffer[i] > static_cast<FromTy>(toTyMax)) {
+-        newBuffer[i] = toTyMax;
+-      } else {
+-        newBuffer[i] = static_cast<ToTy>(oldBuffer[i]);
+-      }
+-    }
++  // Integer narrowing is modular: retain the low bits rather than saturating.
++  // This is also required when converting a widened runtime alias (for
++  // example, Int32 storage) back to its logical Int8 or Int16 type.
++  for (int64_t i = 0; i < numElements; i++) {
++    newBuffer[i] = static_cast<ToTy>(oldBuffer[i]);
+   }
+ }
