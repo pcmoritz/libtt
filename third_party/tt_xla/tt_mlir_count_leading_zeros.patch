@@ -1,0 +1,85 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10842,3 +10842,72 @@ public:
+     return success();
+   }
+ };
++
++class StableHLOToTTIRCountLeadingZerosOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::ClzOp> {
++  using OpConversionPattern<
++      mlir::stablehlo::ClzOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::ClzOp srcOp,
++                  mlir::stablehlo::ClzOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto inputType = cast<RankedTensorType>(srcOp.getOperand().getType());
++    unsigned inputWidth =
++        cast<IntegerType>(inputType.getElementType()).getWidth();
++    auto resultType = cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getType()));
++    unsigned storageWidth =
++        cast<IntegerType>(resultType.getElementType()).getWidth();
++    if (inputWidth > storageWidth) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "input width exceeds converted storage width");
++    }
++
++    Location loc = srcOp.getLoc();
++    auto makeConstant = [&](uint64_t value) -> Value {
++      auto valueAttr = rewriter.getIntegerAttr(resultType.getElementType(),
++                                               value);
++      auto denseAttr = DenseElementsAttr::get(resultType, valueAttr);
++      return rewriter.create<ttir::ConstantOp>(loc, resultType, denseAttr);
++    };
++
++    Value spread = adaptor.getOperand();
++    if (inputWidth < storageWidth) {
++      // Signed i8/i16 tensors use i32 storage. Ignore the sign-extension bits
++      // so the count still uses the logical StableHLO element width.
++      uint64_t lowBitsMask = (uint64_t{1} << inputWidth) - 1;
++      spread = rewriter.create<ttir::BitwiseAndOp>(
++          loc, resultType, spread, makeConstant(lowBitsMask));
++    }
++
++    // Propagate the most significant set bit down through all lower bits.
++    // The population count of that value is the input's bit length.
++    for (unsigned shift = 1; shift < inputWidth; shift *= 2) {
++      Value shifted = rewriter.create<ttir::LogicalRightShiftOp>(
++          loc, resultType, spread, makeConstant(shift));
++      spread = rewriter.create<ttir::BitwiseOrOp>(loc, resultType, spread,
++                                                  shifted);
++    }
++
++    Value one = makeConstant(1);
++    Value bitLength = makeConstant(0);
++    Value remaining = spread;
++    for (unsigned bit = 0; bit < inputWidth; ++bit) {
++      Value setBit = rewriter.create<ttir::BitwiseAndOp>(
++          loc, resultType, remaining, one);
++      bitLength = rewriter.create<ttir::AddOp>(loc, resultType, bitLength,
++                                               setBit);
++      if (bit + 1 != inputWidth) {
++        remaining = rewriter.create<ttir::LogicalRightShiftOp>(
++            loc, resultType, remaining, one);
++      }
++    }
++
++    Value leadingZeros = rewriter.create<ttir::SubtractOp>(
++        loc, resultType, makeConstant(inputWidth), bitLength);
++    rewriter.replaceOp(srcOp, leadingZeros);
++    return success();
++  }
++};
+@@ -10880,6 +10949,8 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+                                                                ctx);
+   patterns.add<StableHLOToTTIRPopulationCountOpConversionPattern>(
+       typeConverter, ctx);
++  patterns.add<StableHLOToTTIRCountLeadingZerosOpConversionPattern>(
++      typeConverter, ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::CeilOp, mlir::tt::ttir::CeilOp>>(typeConverter, ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
