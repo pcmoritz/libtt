@@ -308,7 +308,7 @@ index e7a8a79..9401974 100644
 +        promote_narrow_float_inputs ? unary::utils::raw_16bit_sfpu_format : datatype_to_dataformat_converter(b_dtype);
 +    // Promoted SFPU and basic FPU arithmetic can leave infinity in FP32 DST,
 +    // which the native FP16 packer does not preserve reliably.
-+    const auto c_data_format = (promote_narrow_float && c_dtype != DataType::FLOAT16) || exact_fp16_binary_output
++    const auto c_data_format = promote_narrow_float || exact_fp16_binary_output
 +                                   ? unary::utils::raw_16bit_sfpu_format
 +                                   : datatype_to_dataformat_converter(c_dtype);
  
@@ -332,7 +332,7 @@ index e7a8a79..9401974 100644
          if (op_config.postprocess.has_value()) {
              post_activations.insert(post_activations.begin(), *op_config.postprocess);
          }
-+        if ((promote_narrow_float && c_dtype != DataType::FLOAT16) || exact_fp16_binary_output) {
++        if (promote_narrow_float || exact_fp16_binary_output) {
 +            post_activations.push_back(unary::utils::make_typecast(DataType::FLOAT32, c_dtype));
 +        }
  
