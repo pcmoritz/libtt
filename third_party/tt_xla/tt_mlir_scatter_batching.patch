@@ -132,7 +132,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -
      return success();
    }
-@@ -7960,4 +7960,127 @@ private:
+@@ -7960,4 +7960,115 @@ private:
      return clamped;
    }
 -
@@ -214,25 +214,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      indexedDimensions.emplace_back(operandDim, slice);
 +    }
 +
-+    unsigned bitWidth = indicesType.getElementType().getIntOrFloatBitWidth();
-+    int64_t numPositions = ttmlir::utils::volume(columnShape);
 +    for (auto [inputDim, indicesDim] :
 +         llvm::zip_equal(inputBatchingDims, scatterIndicesBatchingDims)) {
-+      int64_t stride = 1;
-+      for (int64_t dim = indicesDim + 1; dim < indexVectorDim; ++dim) {
-+        stride *= indicesShape[dim];
-+      }
-+      SmallVector<APInt> coordinates;
-+      coordinates.reserve(numPositions);
-+      for (int64_t linear = 0; linear < numPositions; ++linear) {
-+        coordinates.emplace_back(
-+            bitWidth, (linear / stride) % indicesShape[indicesDim]);
-+      }
-+      auto coordinateAttr = DenseIntElementsAttr::get(columnType, coordinates);
-+      Value coordinate = rewriter.create<ttir::ConstantOp>(
++      Value coordinate = rewriter.create<ttir::ArangeOp>(
 +          ttmlir::utils::appendLocationSuffix(
 +              op.getLoc(), "_batch_index_" + std::to_string(inputDim)),
-+          columnType, coordinateAttr);
++          columnType, /*start=*/0, /*end=*/indicesShape[indicesDim],
++          /*step=*/1, /*arange_dimension=*/indicesDim);
 +      indexedDimensions.emplace_back(inputDim, coordinate);
 +    }
 +
@@ -261,7 +249,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  }
 +
    /// Computes flattened 1D indices for multi-dimensional scatter.
-@@ -7985,7 +8108,8 @@ private:
+@@ -7985,7 +8096,8 @@ private:
 -  Value flattenMultiDimScatterIndices(mlir::stablehlo::ScatterOp op,
 -                                      ArrayRef<int64_t> operandShape,
 -                                      ArrayRef<int64_t> updateShape,
@@ -275,7 +263,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      PatternRewriter &rewriter) const {
      RankedTensorType indicesType =
          mlir::cast<RankedTensorType>(indices.getType());
-@@ -7992,10 +8116,6 @@ private:
+@@ -7992,10 +8104,6 @@ private:
      ArrayRef<int64_t> indicesShape = indicesType.getShape();
      auto scatterDimNumbers = op.getScatterDimensionNumbers();
 -    ArrayRef<int64_t> insertedWindowDims =
@@ -287,7 +275,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    int64_t indexVectorDim = scatterDimNumbers.getIndexVectorDim();
 +    int64_t indexVectorDim = indicesType.getRank() - 1;
      int64_t operandRank = operandShape.size();
-@@ -8138,21 +8261,26 @@ private:
+@@ -8138,21 +8249,26 @@ private:
        Value dimIndex = nullptr;
 
        if (isScatterDim) {
@@ -331,7 +319,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +              rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
 +        }
        }
-@@ -8205,17 +8325,16 @@ private:
+@@ -8205,17 +8313,16 @@ private:
 -  Value extractElementWiseScatterIndices(mlir::stablehlo::ScatterOp op,
 -                                         PatternRewriter &rewriter) const {
 +  Value extractElementWiseScatterIndices(
@@ -355,7 +343,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    int64_t indexVectorDim = indexType.getRank() - 1;
      ArrayRef<int64_t> updateWindowDims =
          op.getScatterDimensionNumbers().getUpdateWindowDims();
-@@ -8223,3 +8342,2 @@ private:
+@@ -8223,3 +8330,2 @@ private:
      // Collect the scatter-batch dims of the original index tensor (all dims
 -    // except index_vector_dim). For implicit index_vector_dim (== rank), no
 -    // dim is excluded.

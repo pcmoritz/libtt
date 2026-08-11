@@ -1,25 +1,57 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
-@@ -29,6 +29,25 @@ namespace ttnn {
+@@ -29,6 +29,57 @@ namespace ttnn {
 
  using namespace operations;
 
 +namespace {
 +
-+template <typename Run>
-+Tensor promoteFloat16MinMax(
-+    const Tensor& input,
++Tensor run_float16_min_max(
++    const Tensor& input_a,
++    const Tensor& input_b,
++    binary::BinaryOpType op_type,
 +    const std::optional<MemoryConfig>& memory_config,
 +    const std::optional<Tensor>& optional_output_tensor,
-+    Run&& run) {
-+    if (input.dtype() != DataType::FLOAT16) {
-+        return run(input, optional_output_tensor);
++    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
++    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
++    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
++    const bool needs_promotion =
++        input_a.dtype() == DataType::FLOAT16 || input_b.dtype() == DataType::FLOAT16;
++    if (!needs_promotion) {
++        return ttnn::detail::invoke_binary_ng(
++            input_a,
++            input_b,
++            op_type,
++            std::nullopt,
++            memory_config,
++            optional_output_tensor,
++            post_activations,
++            lhs_activations,
++            rhs_activations);
 +    }
 +
-+    Tensor promoted_input = ttnn::typecast(input, DataType::FLOAT32);
-+    Tensor result = run(promoted_input, std::nullopt);
-+    return ttnn::typecast(result, DataType::FLOAT16, memory_config, optional_output_tensor);
++    const Tensor promoted_a = input_a.dtype() == DataType::FLOAT32
++                                  ? input_a
++                                  : ttnn::typecast(input_a, DataType::FLOAT32);
++    const Tensor promoted_b = input_b.dtype() == DataType::FLOAT32
++                                  ? input_b
++                                  : ttnn::typecast(input_b, DataType::FLOAT32);
++    const bool needs_cast_back = input_a.dtype() != DataType::FLOAT32;
++    Tensor result = ttnn::detail::invoke_binary_ng(
++        promoted_a,
++        promoted_b,
++        op_type,
++        std::nullopt,
++        memory_config,
++        needs_cast_back ? std::nullopt : optional_output_tensor,
++        post_activations,
++        lhs_activations,
++        rhs_activations);
++    if (!needs_cast_back) {
++        return result;
++    }
++    return ttnn::typecast(result, input_a.dtype(), memory_config, optional_output_tensor);
 +}
 +
 +}  // namespace
@@ -27,64 +59,34 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
  // nextafter
  Tensor nextafter(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
      const float eps = tt::tt_metal::hal::get_eps();
-@@ -61,13 +80,22 @@ Tensor minimum(
+@@ -61,12 +112,11 @@ Tensor minimum(
+     const std::optional<Tensor>& optional_output_tensor,
+     ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+     ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
 -    return ttnn::detail::invoke_binary_ng(
-+    return promoteFloat16MinMax(
++    return run_float16_min_max(
          input_tensor_a,
--        input_tensor_b,
--        binary::BinaryOpType::MINIMUM,
+         input_tensor_b,
+         binary::BinaryOpType::MINIMUM,
 -        std::nullopt,
          memory_config,
          optional_output_tensor,
--        post_activations,
--        lhs_activations,
--        rhs_activations);
-+        [&](const Tensor& promoted_a, const std::optional<Tensor>& promoted_output) {
-+            const Tensor promoted_b = input_tensor_b.dtype() == DataType::FLOAT16
-+                                          ? ttnn::typecast(input_tensor_b, DataType::FLOAT32)
-+                                          : input_tensor_b;
-+            return ttnn::detail::invoke_binary_ng(
-+                promoted_a,
-+                promoted_b,
-+                binary::BinaryOpType::MINIMUM,
-+                std::nullopt,
-+                memory_config,
-+                promoted_output,
-+                post_activations,
-+                lhs_activations,
-+                rhs_activations);
-+        });
- }
-@@ -102,13 +130,22 @@ Tensor maximum(
+         post_activations,
+@@ -102,12 +152,11 @@ Tensor maximum(
+     const std::optional<Tensor>& optional_output_tensor,
+     ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+     ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
 -    return ttnn::detail::invoke_binary_ng(
-+    return promoteFloat16MinMax(
++    return run_float16_min_max(
          input_tensor_a,
--        input_tensor_b,
--        binary::BinaryOpType::MAXIMUM,
+         input_tensor_b,
+         binary::BinaryOpType::MAXIMUM,
 -        std::nullopt,
          memory_config,
          optional_output_tensor,
--        post_activations,
--        lhs_activations,
--        rhs_activations);
-+        [&](const Tensor& promoted_a, const std::optional<Tensor>& promoted_output) {
-+            const Tensor promoted_b = input_tensor_b.dtype() == DataType::FLOAT16
-+                                          ? ttnn::typecast(input_tensor_b, DataType::FLOAT32)
-+                                          : input_tensor_b;
-+            return ttnn::detail::invoke_binary_ng(
-+                promoted_a,
-+                promoted_b,
-+                binary::BinaryOpType::MAXIMUM,
-+                std::nullopt,
-+                memory_config,
-+                promoted_output,
-+                post_activations,
-+                lhs_activations,
-+                rhs_activations);
-+        });
- }
+         post_activations,
 
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp

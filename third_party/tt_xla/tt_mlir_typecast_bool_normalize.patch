@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10607,6 +10607,48 @@
+@@ -10607,6 +10607,49 @@
  };
  } // namespace
 
@@ -21,10 +21,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        dyn_cast<IntegerType>(inputType.getElementType());
 +    auto resultType = cast<RankedTensorType>(
 +        getTypeConverter()->convertType(srcOp.getType()));
-+    if (!inputIntegerType || inputIntegerType.getWidth() != 1) {
-+      rewriter.replaceOpWithNewOp<ttir::TypecastOp>(
-+          srcOp, resultType, adaptor.getOperand());
-+      return success();
++    auto resultIntegerType =
++        dyn_cast<IntegerType>(resultType.getElementType());
++    if (!inputIntegerType || inputIntegerType.getWidth() != 1 ||
++        (resultIntegerType && resultIntegerType.getWidth() == 1)) {
++      return failure();
 +    }
 +
 +    auto zeroValue = rewriter.getZeroAttr(resultType.getElementType());
@@ -50,14 +51,18 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  static void
  addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
                                           RewritePatternSet &patterns,
-@@ -10619,9 +10656,7 @@
+@@ -10619,9 +10662,11 @@
        typeConverter, ctx);
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
        mlir::stablehlo::CbrtOp, mlir::tt::ttir::CbrtOp>>(typeConverter, ctx);
 -  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
 -      mlir::stablehlo::ConvertOp, mlir::tt::ttir::TypecastOp>>(typeConverter,
 -                                                               ctx);
-+  patterns.add<StableHLOToTTIRConvertOpConversionPattern>(typeConverter, ctx);
++  patterns.add<StableHLOToTTIRConvertOpConversionPattern>(
++      typeConverter, ctx, PatternBenefit(2));
++  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
++      mlir::stablehlo::ConvertOp, mlir::tt::ttir::TypecastOp>>(typeConverter,
++                                                               ctx);
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
        mlir::stablehlo::CeilOp, mlir::tt::ttir::CeilOp>>(typeConverter, ctx);
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
