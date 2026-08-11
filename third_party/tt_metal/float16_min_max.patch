@@ -16,10 +16,10 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
 +    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
 +    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
 +    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
-+    const bool needs_promotion = input_a.dtype() == DataType::FLOAT16 ||
-+                                 input_b.dtype() == DataType::FLOAT16 ||
-+                                 input_a.dtype() == DataType::UINT16 ||
-+                                 input_b.dtype() == DataType::UINT16;
++    const bool has_float16 = input_a.dtype() == DataType::FLOAT16 || input_b.dtype() == DataType::FLOAT16;
++    const bool needs_promotion =
++        input_a.dtype() == DataType::UINT16 || input_b.dtype() == DataType::UINT16 ||
++        (has_float16 && input_a.dtype() != input_b.dtype());
 +    if (!needs_promotion) {
 +        return ttnn::detail::invoke_binary_ng(
 +            input_a,
