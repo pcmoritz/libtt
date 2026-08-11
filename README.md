@@ -70,6 +70,9 @@ bazel test //tests:jax_test_suite \
   --test_arg=-v
 ```
 
+Current baseline (August 2026): **21,888 passed, 6,538 skipped, and 3,742
+failed.**
+
 ## Qwen3 With SGLang-JAX
 
 Build `libtt.so` first:
