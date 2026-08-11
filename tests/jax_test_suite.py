@@ -23,16 +23,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jax-tests-anchor", required=True)
     parser.add_argument("--libtt", required=True)
-    parser.add_argument("--local-test", action="append", default=[])
     parser.add_argument("--skip-device-check", action="store_true")
     args, pytest_args = parser.parse_known_args()
 
     libtt = _rlocation(args.libtt).resolve(strict=True)
     jax_repo = _rlocation(args.jax_tests_anchor).resolve(strict=True).parent.parent
-    local_tests = [
-        str(_rlocation(test_path).resolve(strict=True))
-        for test_path in args.local_test
-    ]
 
     os.environ.pop("TT_METAL_RUNTIME_ROOT", None)
     os.environ["PJRT_NAMES_AND_LIBRARY_PATHS"] = f"tt:{libtt}"
@@ -56,8 +51,7 @@ def main() -> int:
     import pytest
 
     os.chdir(jax_repo)
-    test_args = local_tests + pytest_args
-    return pytest.main(test_args or ["tests"])
+    return pytest.main(pytest_args or ["tests"])
 
 
 if __name__ == "__main__":

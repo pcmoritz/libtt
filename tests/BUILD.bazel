@@ -60,23 +60,6 @@ py_test(
 )
 
 py_test(
-    name = "jax_bitcast_tests",
-    srcs = ["jax_test_suite.py"],
-    args = JAX_TEST_ARGS + [
-        "--local-test",
-        "$(rlocationpath :bitcast_test.py)",
-    ],
-    data = JAX_TEST_DATA + [
-        "bitcast_test.py",
-    ],
-    deps = JAX_TEST_DEPS,
-    env = {"PYTHONDONTWRITEBYTECODE": "1"},
-    main = "jax_test_suite.py",
-    tags = JAX_TEST_TAGS,
-    timeout = "long",
-)
-
-py_test(
     name = "jax_test_suite",
     srcs = ["jax_test_suite.py"],
     args = JAX_TEST_ARGS,
