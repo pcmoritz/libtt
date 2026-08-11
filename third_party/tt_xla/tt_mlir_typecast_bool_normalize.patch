@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10607,6 +10607,43 @@
+@@ -10607,6 +10607,48 @@
  };
  } // namespace
 
@@ -27,10 +27,15 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      return success();
 +    }
 +
-+    auto zeroAttr = DenseElementsAttr::get(
-+        resultType, rewriter.getZeroAttr(resultType.getElementType()));
-+    auto oneAttr = DenseElementsAttr::get(
-+        resultType, rewriter.getOneAttr(resultType.getElementType()));
++    auto zeroValue = rewriter.getZeroAttr(resultType.getElementType());
++    auto oneValue = rewriter.getOneAttr(resultType.getElementType());
++    if (!zeroValue || !oneValue) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "unsupported boolean conversion result type");
++    }
++
++    auto zeroAttr = DenseElementsAttr::get(resultType, zeroValue);
++    auto oneAttr = DenseElementsAttr::get(resultType, oneValue);
 +    Value zero = rewriter.create<ttir::ConstantOp>(
 +        srcOp.getLoc(), resultType, zeroAttr);
 +    Value one = rewriter.create<ttir::ConstantOp>(
