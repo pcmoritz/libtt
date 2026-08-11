@@ -38,6 +38,41 @@ bazel test //tests:jax_test_suite \
   --test_arg=tests/lax_numpy_test.py
 ```
 
+Run the full supported JAX test suite with:
+
+```bash
+bazel test //tests:jax_test_suite \
+  --test_output=streamed \
+  --nocache_test_results \
+  --test_timeout=43200 \
+  --test_arg=tests \
+  --test_arg=--ignore=tests/x64_context_test.py \
+  --test_arg=--ignore=tests/lax_metal_test.py \
+  --test_arg=--ignore=tests/ann_test.py \
+  --test_arg=--ignore=tests/clear_backends_test.py \
+  --test_arg=--ignore=tests/colocated_python_test.py \
+  --test_arg=--ignore=tests/compilation_cache_test.py \
+  --test_arg=--ignore=tests/pallas \
+  --test_arg=--ignore=tests/profiler_test.py \
+  --test_arg=--ignore=tests/mosaic \
+  --test_arg=--ignore=tests/multiprocess \
+  --test_arg=--ignore=tests/documentation_coverage_test.py \
+  --test_arg=--ignore=tests/sparse_bcoo_bcsr_test.py \
+  --test_arg=--ignore=tests/sparse_test.py \
+  --test_arg=--ignore=tests/sparsify_test.py \
+  --test_arg=--deselect=tests/blocked_sampler_test.py::BlockedFoldInTest::test_blocked_fold_in_shape_invariance_4096x512_vs_1024x2048 \
+  --test_arg=--override-ini=addopts= \
+  --test_arg=-p \
+  --test_arg=no:faulthandler \
+  --test_arg=-p \
+  --test_arg=no:benchmark \
+  --test_arg=--tb=no \
+  --test_arg=-v
+```
+
+Current baseline (August 2026): **21,888 passed, 6,538 skipped, and 3,742
+failed.**
+
 ## Qwen3 With SGLang-JAX
 
 Build `libtt.so` first:
