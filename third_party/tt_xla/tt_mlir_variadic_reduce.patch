@@ -1,0 +1,129 @@
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -267,6 +267,17 @@
+       return legalityResult;
+     }
+ 
++    if (srcOp.getInputs().size() > 1) {
++      if (isArgMax(srcOp, adaptor, rewriter)) {
++        return matchAndRewriteInternalArgMax(
++            srcOp, adaptor.getInputs().front(), rewriter);
++      }
++      if (isArgMin(srcOp, adaptor, rewriter)) {
++        return matchAndRewriteInternalArgMin(srcOp, adaptor, rewriter);
++      }
++      return matchAndRewriteSeparable(srcOp, adaptor, rewriter);
++    }
++
+     const mlir::Operation &innerOp = srcOp.getBody().front().front();
+ 
+     if (mlir::isa<mlir::stablehlo::AddOp>(innerOp)) {
+@@ -293,14 +304,6 @@
+       return matchAndRewriteInternal<mlir::tt::ttir::ReduceOrOp>(srcOp, adaptor,
+                                                                  rewriter);
+     }
+-    if (isArgMax(srcOp, adaptor, rewriter)) {
+-      return matchAndRewriteInternalArgMax(
+-          srcOp, adaptor.getInputs().front(), rewriter);
+-    }
+-    if (isArgMin(srcOp, adaptor, rewriter)) {
+-      return matchAndRewriteInternalArgMin(srcOp, adaptor, rewriter);
+-    }
+-
+     return failure();
+   }
+ 
+@@ -309,13 +312,6 @@
+   checkConversionLegality(mlir::stablehlo::ReduceOp &srcOp,
+                           mlir::stablehlo::ReduceOp::Adaptor adaptor,
+                           ConversionPatternRewriter &rewriter) const {
+-    if (srcOp.getInputs().size() != 1 &&
+-        !isArgMax(srcOp, adaptor, rewriter) &&
+-        !isArgMin(srcOp, adaptor, rewriter)) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "variadic stablehlo.reduce is not supported");
+-    }
+-
+     if (!srcOp.getBody().hasOneBlock()) {
+       return rewriter.notifyMatchFailure(
+           srcOp,
+@@ -371,6 +367,79 @@
+     return success();
+   }
+ 
++  template <typename ReductionOp, typename CombineOp>
++  mlir::Value createReductionWithInit(
++      mlir::Location loc, RankedTensorType outputType, mlir::Value input,
++      mlir::Value init, mlir::ArrayAttr dimensions,
++      ConversionPatternRewriter &rewriter) const {
++    mlir::Value reduced = rewriter.create<ReductionOp>(
++        loc, outputType, input, /*keep_dim=*/false, dimensions);
++    return rewriter.create<CombineOp>(loc, outputType, reduced, init);
++  }
++
++  LogicalResult matchAndRewriteSeparable(
++      mlir::stablehlo::ReduceOp &srcOp,
++      mlir::stablehlo::ReduceOp::Adaptor &adaptor,
++      ConversionPatternRewriter &rewriter) const {
++    const size_t numInputs = srcOp.getInputs().size();
++    Block &body = srcOp.getBody().front();
++    auto returnOp = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(
++        body.getTerminator());
++    if (!returnOp) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "unsupported separable stablehlo.reduce structure");
++    }
++
++    mlir::ArrayAttr dimensions = rewriter.getI32ArrayAttr(
++        llvm::SmallVector<int32_t>(srcOp.getDimensions()));
++    SmallVector<mlir::Value> results;
++    results.reserve(numInputs);
++    for (size_t i = 0; i < numInputs; ++i) {
++      mlir::Operation *combiner = returnOp.getOperand(i).getDefiningOp();
++      if (!combiner || combiner->getBlock() != &body ||
++          !mlir::isa<mlir::stablehlo::AddOp, mlir::stablehlo::MulOp>(
++              combiner)) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "separable reduce requires direct add or multiply lanes");
++      }
++
++      mlir::Value lhs = combiner->getOperand(0);
++      mlir::Value rhs = combiner->getOperand(1);
++      mlir::Value accumulator = body.getArgument(i);
++      mlir::Value element = body.getArgument(i + numInputs);
++      if (!((lhs == accumulator && rhs == element) ||
++            (lhs == element && rhs == accumulator))) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "separable reduce components are cross-coupled");
++      }
++
++      auto outputType = mlir::cast<RankedTensorType>(
++          getTypeConverter()->convertType(srcOp.getResult(i).getType()));
++      mlir::Value init;
++      if (failed(ttir::utils::broadcastValue(
++              rewriter, adaptor.getInitValues()[i], outputType, init,
++              srcOp.getLoc(), /*frontUnsqueeze=*/false))) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "separable reduce init value is not broadcastable");
++      }
++
++      if (mlir::isa<mlir::stablehlo::AddOp>(combiner)) {
++        results.push_back(
++            createReductionWithInit<ttir::SumOp, ttir::AddOp>(
++                srcOp.getLoc(), outputType, adaptor.getInputs()[i], init,
++                dimensions, rewriter));
++      } else {
++        results.push_back(
++            createReductionWithInit<ttir::ProdOp, ttir::MultiplyOp>(
++                srcOp.getLoc(), outputType, adaptor.getInputs()[i], init,
++                dimensions, rewriter));
++      }
++    }
++
++    rewriter.replaceOp(srcOp, results);
++    return success();
++  }
++
+   LogicalResult
+   matchAndRewriteInternalArgMax(
+       mlir::stablehlo::ReduceOp &srcOp, mlir::Value input,
