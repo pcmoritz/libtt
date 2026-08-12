@@ -251,6 +251,7 @@ http_archive(
         "//third_party/tt_metal:binary_ng_output_cb.patch",
         "//third_party/tt_metal:sfpu_float16_promote.patch",
         "//third_party/tt_metal:narrow_float_special_values.patch",
+        "//third_party/tt_metal:float16_integer_typecast.patch",
         "//third_party/tt_metal:bitcast_raw_copy.patch",
         "//third_party/tt_metal:scatter_float16.patch",
     ],
