@@ -47,12 +47,10 @@
      if (!srcOp.getBody().hasOneBlock()) {
        return rewriter.notifyMatchFailure(
            srcOp,
-@@ -371,6 +367,92 @@
+@@ -371,6 +367,79 @@
      return success();
    }
  
-+  enum class SeparableReductionKind { Sum, Product };
-+
 +  template <typename ReductionOp, typename CombineOp>
 +  mlir::Value createReductionWithInit(
 +      mlir::Location loc, RankedTensorType outputType, mlir::Value input,
@@ -71,20 +69,18 @@
 +    Block &body = srcOp.getBody().front();
 +    auto returnOp = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(
 +        body.getTerminator());
-+    if (!returnOp || srcOp.getNumResults() != numInputs ||
-+        srcOp.getInitValues().size() != numInputs ||
-+        body.getNumArguments() != 2 * numInputs ||
-+        returnOp.getNumOperands() != numInputs) {
++    if (!returnOp) {
 +      return rewriter.notifyMatchFailure(
 +          srcOp, "unsupported separable stablehlo.reduce structure");
 +    }
 +
-+    SmallVector<SeparableReductionKind> reductions;
-+    reductions.reserve(numInputs);
++    mlir::ArrayAttr dimensions = rewriter.getI32ArrayAttr(
++        llvm::SmallVector<int32_t>(srcOp.getDimensions()));
++    SmallVector<mlir::Value> results;
++    results.reserve(numInputs);
 +    for (size_t i = 0; i < numInputs; ++i) {
 +      mlir::Operation *combiner = returnOp.getOperand(i).getDefiningOp();
 +      if (!combiner || combiner->getBlock() != &body ||
-+          combiner->getNumOperands() != 2 ||
 +          !mlir::isa<mlir::stablehlo::AddOp, mlir::stablehlo::MulOp>(
 +              combiner)) {
 +        return rewriter.notifyMatchFailure(
@@ -100,16 +96,7 @@
 +        return rewriter.notifyMatchFailure(
 +            srcOp, "separable reduce components are cross-coupled");
 +      }
-+      reductions.push_back(mlir::isa<mlir::stablehlo::AddOp>(combiner)
-+                               ? SeparableReductionKind::Sum
-+                               : SeparableReductionKind::Product);
-+    }
 +
-+    mlir::ArrayAttr dimensions = rewriter.getI32ArrayAttr(
-+        llvm::SmallVector<int32_t>(srcOp.getDimensions()));
-+    SmallVector<mlir::Value> results;
-+    results.reserve(numInputs);
-+    for (size_t i = 0; i < numInputs; ++i) {
 +      auto outputType = mlir::cast<RankedTensorType>(
 +          getTypeConverter()->convertType(srcOp.getResult(i).getType()));
 +      mlir::Value init;
@@ -120,7 +107,7 @@
 +            srcOp, "separable reduce init value is not broadcastable");
 +      }
 +
-+      if (reductions[i] == SeparableReductionKind::Sum) {
++      if (mlir::isa<mlir::stablehlo::AddOp>(combiner)) {
 +        results.push_back(
 +            createReductionWithInit<ttir::SumOp, ttir::AddOp>(
 +                srcOp.getLoc(), outputType, adaptor.getInputs()[i], init,
