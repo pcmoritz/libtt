@@ -1,7 +1,11 @@
 diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
 --- a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
 +++ b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
-@@ -114,9 +114,18 @@ private:
+@@ -10,2 +10,3 @@
+ #include "mlir/Dialect/Quant/IR/QuantTypes.h"
+ #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
++#include "mlir/Transforms/WalkPatternRewriteDriver.h"
+@@ -114,9 +115,18 @@ private:
        return mlir::DenseElementsAttr::get(newType, bf16Values);
      }
  
@@ -21,7 +25,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dial
      }
  
      return mlir::DenseElementsAttr::get(newType, intValues);
-@@ -136,6 +145,78 @@ private:
+@@ -136,6 +146,81 @@ private:
    }
  };
  
@@ -74,8 +78,10 @@ diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dial
 +          op.getLoc(), normalizedType, shiftAttr);
 +      Value shifted = rewriter.create<tt::ttir::LogicalLeftShiftOp>(
 +          op.getLoc(), normalizedType, widened, shift);
-+      rewriter.replaceOpWithNewOp<tt::ttir::RightShiftOp>(
-+          op, normalizedType, shifted, shift);
++      Value signedValue = rewriter.create<tt::ttir::RightShiftOp>(
++          op.getLoc(), normalizedType, shifted, shift);
++      rewriter.replaceOpWithNewOp<tt::ttir::TypecastOp>(
++          op, outputType, signedValue);
 +      return success();
 +    }
 +
@@ -100,19 +106,14 @@ diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dial
  struct ElementTypeNormalization
      : public impl::ElementTypeNormalizationBase<ElementTypeNormalization> {
    using impl::ElementTypeNormalizationBase<
-@@ -151,6 +232,16 @@ struct ElementTypeNormalization
+@@ -151,6 +236,11 @@ struct ElementTypeNormalization
 -    mlir::RewritePatternSet patterns(&getContext());
      GreedyRewriteConfig config;
      config.enableFolding(false);
-+
 +    // Rewrite these bitcasts before uniform normalization can widen i16.
 +    mlir::RewritePatternSet bitcastPatterns(&getContext());
 +    bitcastPatterns.add<NormalizeI16BitcastPattern>(&getContext());
-+    if (failed(mlir::applyPatternsGreedily(
-+            getOperation(), std::move(bitcastPatterns), config))) {
-+      signalPassFailure();
-+      return;
-+    }
++    mlir::walkAndApplyPatterns(getOperation(), std::move(bitcastPatterns));
 +
 +    mlir::RewritePatternSet patterns(&getContext());
      patterns.add<UniformTypeRewriter>(converter, &getContext());
