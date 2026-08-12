@@ -401,6 +401,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_fuse_matmul_swiglu.patch",
         "//third_party/tt_xla:tt_mlir_while_loop.patch",
         "//third_party/tt_xla:tt_mlir_cond.patch",
+        "//third_party/tt_xla:tt_mlir_native_trunc.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

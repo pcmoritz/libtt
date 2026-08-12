@@ -1,0 +1,645 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+index 0daed56..922ce97 100644
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -509,6 +509,14 @@ def TTIR_TruncOp: TTIR_ElementwiseUnaryOp<"trunc"> {
+     }];
+ }
+ 
++def TTIR_RoundEvenOp: TTIR_ElementwiseUnaryOp<"round_even"> {
++    let summary = "Elementwise round to nearest with ties to even.";
++    let description = [{
++      For each element x, returns the nearest integral value, choosing the even
++      value when x lies exactly halfway between two integers.
++    }];
++}
++
+ def TTIR_GeluOp: TTIR_ElementwiseUnaryOp<"gelu"> {
+   let summary = "Elementwise GELU operation.";
+   let description = [{
+@@ -555,6 +563,20 @@ def TTIR_IsFiniteOp: TTIR_ElementwiseUnaryOp<"isfinite"> {
+     let hasFolder = 1;
+ }
+ 
++def TTIR_IsInfOp: TTIR_ElementwiseUnaryOp<"isinf"> {
++    let summary = "Elementwise infinity predicate.";
++    let description = [{
++      Returns true for positive and negative infinity and false otherwise.
++    }];
++}
++
++def TTIR_IsPosInfOp: TTIR_ElementwiseUnaryOp<"isposinf"> {
++    let summary = "Elementwise positive-infinity predicate.";
++    let description = [{
++      Returns true for positive infinity and false otherwise.
++    }];
++}
++
+ def TTIR_LogicalNotOp: TTIR_ElementwiseUnaryOp<"logical_not"> {
+     let summary = "Elementwise logical not operation.";
+     let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+index eb4f860..ab2697e 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -324,6 +324,20 @@ def TTNN_FloorOp: TTNN_ElementwiseUnaryOp<"floor"> {
+     }];
+ }
+ 
++def TTNN_TruncOp: TTNN_ElementwiseUnaryOp<"trunc"> {
++    let summary = "Eltwise truncation toward zero op.";
++    let description = [{
++      Eltwise truncation toward zero operation.
++    }];
++}
++
++def TTNN_RoundEvenOp: TTNN_ElementwiseUnaryOp<"round_even"> {
++    let summary = "Eltwise round to nearest with ties to even op.";
++    let description = [{
++      Eltwise round to nearest with ties to even operation.
++    }];
++}
++
+ def TTNN_GeluOp: TTNN_ElementwiseUnaryOp<"gelu"> {
+   let summary = "Eltwise GELU.";
+   let description = [{
+@@ -338,6 +352,20 @@ def TTNN_IsFiniteOp: TTNN_ElementwiseUnaryOp<"isfinite"> {
+     }];
+ }
+ 
++def TTNN_IsInfOp: TTNN_ElementwiseUnaryOp<"isinf"> {
++    let summary = "Eltwise infinity predicate op.";
++    let description = [{
++      Eltwise infinity predicate operation.
++    }];
++}
++
++def TTNN_IsPosInfOp: TTNN_ElementwiseUnaryOp<"isposinf"> {
++    let summary = "Eltwise positive-infinity predicate op.";
++    let description = [{
++      Eltwise positive-infinity predicate operation.
++    }];
++}
++
+ def TTNN_LogicalNotOp: TTNN_ElementwiseUnaryOp<"logical_not"> {
+     let summary = "Eltwise logical not op.";
+     let description = [{
+diff --git a/include/ttmlir/OpModel/TTNN/TTNNOpModel.h b/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
+index 8d3f5ce..b22a6cf 100644
+--- a/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
++++ b/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
+@@ -118,9 +118,21 @@ struct OpModel<SignOp> : UnaryEltwiseOpModel<SignOp> {};
+ template <>
+ struct OpModel<FloorOp> : UnaryEltwiseOpModel<FloorOp> {};
+ 
++template <>
++struct OpModel<TruncOp> : UnaryEltwiseOpModel<TruncOp> {};
++
++template <>
++struct OpModel<RoundEvenOp> : UnaryEltwiseOpModel<RoundEvenOp> {};
++
+ template <>
+ struct OpModel<IsFiniteOp> : UnaryEltwiseOpModel<IsFiniteOp> {};
+ 
++template <>
++struct OpModel<IsInfOp> : UnaryEltwiseOpModel<IsInfOp> {};
++
++template <>
++struct OpModel<IsPosInfOp> : UnaryEltwiseOpModel<IsPosInfOp> {};
++
+ template <>
+ struct OpModel<LogicalNotOp> : UnaryEltwiseOpModel<LogicalNotOp> {};
+ 
+diff --git a/include/ttmlir/Target/TTNN/operations/eltwise.fbs b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+index c3dd15f..32e460a 100644
+--- a/include/ttmlir/Target/TTNN/operations/eltwise.fbs
++++ b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+@@ -165,7 +165,11 @@ enum EltwiseUnaryOpType: uint32 {
+   Mish,
+   Acos,
+   Asin,
+-  Asinh
++  Asinh,
++  Trunc,
++  RoundEven,
++  IsInf,
++  IsPosInf
+ }
+ 
+ union EltwiseUnaryOpParams {
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index 3feac1b..2c57e19 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10687,42 +10687,132 @@ public:
+       return rewriter.notifyMatchFailure(srcOp, "expected a floating tensor");
+     }
+ 
+-    auto loc = srcOp.getLoc();
+-    auto elementType = resultType.getElementType();
+-    auto constant = [&](double value) {
+-      return rewriter.create<ttir::ConstantOp>(
+-          loc, resultType,
+-          DenseElementsAttr::get(
+-              resultType,
+-              SmallVector<Attribute>{
+-                  mlir::FloatAttr::get(elementType, value)}));
+-    };
++    rewriter.replaceOpWithNewOp<ttir::RoundEvenOp>(
++        srcOp, resultType, adaptor.getOperand());
++    return success();
++  }
++};
++} // namespace
+ 
+-    // floor(x + 0.5) rounds ties up; move odd tie results down to even.
+-    Value half = constant(0.5);
+-    Value one = constant(1.0);
+-    Value two = constant(2.0);
+-    Value shifted = rewriter.create<ttir::AddOp>(
+-        loc, resultType, adaptor.getOperand(), half);
+-    Value rounded = rewriter.create<ttir::FloorOp>(loc, resultType, shifted);
+-    Value halfRounded =
+-        rewriter.create<ttir::MultiplyOp>(loc, resultType, rounded, half);
+-    Value evenRounded = rewriter.create<ttir::MultiplyOp>(
+-        loc, resultType,
+-        rewriter.create<ttir::FloorOp>(loc, resultType, halfRounded), two);
+-
+-    auto predicateType = resultType.clone(rewriter.getI1Type());
+-    Value isOdd = rewriter.create<ttir::NotEqualOp>(
+-        loc, predicateType, rounded, evenRounded);
+-    Value isTie = rewriter.create<ttir::EqualOp>(
+-        loc, predicateType, shifted, rounded);
+-    Value adjust = rewriter.create<ttir::LogicalAndOp>(
+-        loc, predicateType, isTie, isOdd);
+-    Value roundedDown =
+-        rewriter.create<ttir::SubtractOp>(loc, resultType, rounded, one);
++namespace {
++static bool isPositiveInfinityConstant(Value value) {
++  while (auto broadcast =
++             value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
++    value = broadcast.getOperand();
++  }
+ 
+-    rewriter.replaceOpWithNewOp<ttir::WhereOp>(
+-        srcOp, resultType, adjust, roundedDown, rounded);
++  auto constant = value.getDefiningOp<mlir::stablehlo::ConstantOp>();
++  if (!constant) {
++    return false;
++  }
++  auto dense = dyn_cast<DenseFPElementsAttr>(constant.getValue());
++  if (!dense || !dense.isSplat()) {
++    return false;
++  }
++  APFloat scalar = dense.getSplatValue<APFloat>();
++  return scalar.isInfinity() && !scalar.isNegative();
++}
++
++// JAX spells isposinf(x) as x == +inf and isinf(x) as abs(x) == +inf.
++// Recover the predicates so the infinity value never needs to be materialized
++// through a floating-point constant kernel.
++class StableHLOToTTIRInfinityPredicateConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CompareOp> {
++  using OpConversionPattern<mlir::stablehlo::CompareOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CompareOp srcOp,
++                  mlir::stablehlo::CompareOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    if (srcOp.getComparisonDirection() !=
++        mlir::stablehlo::ComparisonDirection::EQ) {
++      return failure();
++    }
++
++    Value input;
++    Value convertedInput;
++    if (isPositiveInfinityConstant(srcOp.getRhs())) {
++      input = srcOp.getLhs();
++      convertedInput = adaptor.getLhs();
++    } else if (isPositiveInfinityConstant(srcOp.getLhs())) {
++      input = srcOp.getRhs();
++      convertedInput = adaptor.getRhs();
++    } else {
++      return failure();
++    }
++
++    auto resultType = dyn_cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getType()));
++    if (!resultType) {
++      return failure();
++    }
++
++    if (input.getDefiningOp<mlir::stablehlo::AbsOp>()) {
++      auto convertedAbs = convertedInput.getDefiningOp<ttir::AbsOp>();
++      if (!convertedAbs) {
++        return failure();
++      }
++      rewriter.replaceOpWithNewOp<ttir::IsInfOp>(
++          srcOp, resultType, convertedAbs.getInput());
++    } else {
++      rewriter.replaceOpWithNewOp<ttir::IsPosInfOp>(srcOp, resultType,
++                                                    convertedInput);
++    }
++    return success();
++  }
++};
++} // namespace
++
++namespace {
++// JAX lowers trunc(x) to select(x < 0, ceil(x), floor(x)). Recover the
++// original operation so TTNN can run its single truncation kernel.
++class StableHLOToTTIRTruncSelectConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::SelectOp> {
++  using OpConversionPattern<mlir::stablehlo::SelectOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::SelectOp srcOp,
++                  mlir::stablehlo::SelectOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto compare = srcOp.getPred().getDefiningOp<mlir::stablehlo::CompareOp>();
++    auto ceil = srcOp.getOnTrue().getDefiningOp<mlir::stablehlo::CeilOp>();
++    auto floor = srcOp.getOnFalse().getDefiningOp<mlir::stablehlo::FloorOp>();
++    if (!compare || !ceil || !floor ||
++        compare.getComparisonDirection() !=
++            mlir::stablehlo::ComparisonDirection::LT) {
++      return failure();
++    }
++
++    Value input = compare.getLhs();
++    if (ceil.getOperand() != input || floor.getOperand() != input) {
++      return failure();
++    }
++
++    Value zero = compare.getRhs();
++    while (auto broadcast =
++               zero.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
++      zero = broadcast.getOperand();
++    }
++    auto constant = zero.getDefiningOp<mlir::stablehlo::ConstantOp>();
++    if (!constant || !checkInitValue(constant, TypicalInitReductionValue::ZERO)) {
++      return failure();
++    }
++
++    auto convertedCeil =
++        adaptor.getOnTrue().getDefiningOp<mlir::tt::ttir::CeilOp>();
++    auto convertedFloor =
++        adaptor.getOnFalse().getDefiningOp<mlir::tt::ttir::FloorOp>();
++    if (!convertedCeil || !convertedFloor ||
++        convertedCeil.getInput() != convertedFloor.getInput()) {
++      return failure();
++    }
++
++    auto resultType = dyn_cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getType()));
++    rewriter.replaceOpWithNewOp<mlir::tt::ttir::TruncOp>(
++        srcOp, resultType, convertedCeil.getInput());
+     return success();
+   }
+ };
+@@ -11041,6 +11131,8 @@ addElementwiseBinaryOpsConversionPatterns(MLIRContext *ctx,
+                                                                 ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::RemOp, mlir::tt::ttir::RemainderOp>>(typeConverter, ctx);
++  patterns.add<StableHLOToTTIRTruncSelectConversionPattern>(
++      typeConverter, ctx, PatternBenefit(2));
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::SelectOp, mlir::tt::ttir::WhereOp>>(typeConverter, ctx);
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+@@ -11135,6 +11227,8 @@ static void addReduceWindowOpConversionPattern(MLIRContext *ctx,
+ static void addCompareOpsConversionPatterns(MLIRContext *ctx,
+                                             RewritePatternSet &patterns,
+                                             TypeConverter &typeConverter) {
++  patterns.add<StableHLOToTTIRInfinityPredicateConversionPattern>(
++      typeConverter, ctx, PatternBenefit(2));
+   patterns.add<StableHLOToTTIRCompareOpConversionPattern>(typeConverter, ctx);
+ }
+ 
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+index 5bb9faa..07e6492 100644
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -3777,7 +3777,13 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            ElementwiseOpConversionPattern<ttir::AbsOp, ttnn::AbsOp>,
+            ElementwiseOpConversionPattern<ttir::CbrtOp, ttnn::CbrtOp>,
+            ElementwiseOpConversionPattern<ttir::FloorOp, ttnn::FloorOp>,
++           ElementwiseOpConversionPattern<ttir::TruncOp, ttnn::TruncOp>,
++           ElementwiseOpConversionPattern<ttir::RoundEvenOp,
++                                          ttnn::RoundEvenOp>,
+            ElementwiseOpConversionPattern<ttir::IsFiniteOp, ttnn::IsFiniteOp>,
++           ElementwiseOpConversionPattern<ttir::IsInfOp, ttnn::IsInfOp>,
++           ElementwiseOpConversionPattern<ttir::IsPosInfOp,
++                                          ttnn::IsPosInfOp>,
+            ElementwiseOpConversionPattern<ttir::LogicalNotOp, ttnn::LogicalNotOp>,
+            ElementwiseOpConversionPattern<ttir::BitwiseNotOp, ttnn::BitwiseNotOp>,
+            ElementwiseOpConversionPattern<ttir::MishOp, ttnn::MishOp>,
+diff --git a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
+index 754bd34..52d76b2 100644
+--- a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
++++ b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
+@@ -5571,7 +5571,11 @@ void populateTTNNToEmitCPatterns(mlir::MLIRContext *ctx,
+            ClampOpConversionPattern<::mlir::tt::ttnn::ClampScalarOp>,
+            ClampOpConversionPattern<mlir::tt::ttnn::ClampTensorOp>,
+            EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::FloorOp>,
++           EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::TruncOp>,
++           EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::RoundEvenOp>,
+            EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::IsFiniteOp>,
++           EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::IsInfOp>,
++           EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::IsPosInfOp>,
+            EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::LogicalNotOp>,
+            EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::BitwiseNotOp>,
+            EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::NegOp>,
+diff --git a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
+index fb80459..0a6046a 100644
+--- a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
++++ b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
+@@ -5381,7 +5381,11 @@ void populateTTNNToEmitPyPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+                EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::CosOp>,
+                EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::Expm1Op>,
+                EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::FloorOp>,
++               EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::TruncOp>,
++               EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::RoundEvenOp>,
+                EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::IsFiniteOp>,
++               EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::IsInfOp>,
++               EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::IsPosInfOp>,
+                EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::LogicalNotOp>,
+                EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::NegOp>,
+                EltwiseUnaryOpConversionPattern<mlir::tt::ttnn::ReciprocalOp>,
+diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
+index f795c1f..e834ef6 100644
+--- a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
++++ b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
+@@ -277,6 +277,10 @@ addElementwiseUnaryOpsConversionPatterns(mlir::MLIRContext *ctx,
+                                                   mlir::tt::ttir::ErfcOp>,
+            TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::FloorOp,
+                                                   mlir::tt::ttir::FloorOp>,
++           TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::TruncOp,
++                                                  mlir::tt::ttir::TruncOp>,
++           TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::RoundEvenOp,
++                                                  mlir::tt::ttir::RoundEvenOp>,
+            TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::GeluOp,
+                                                   mlir::tt::ttir::GeluOp>,
+            TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::ReciprocalOp,
+@@ -287,6 +291,10 @@ addElementwiseUnaryOpsConversionPatterns(mlir::MLIRContext *ctx,
+                                                   mlir::tt::ttir::SiluOp>,
+            TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::IsFiniteOp,
+                                                   mlir::tt::ttir::IsFiniteOp>,
++           TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::IsInfOp,
++                                                  mlir::tt::ttir::IsInfOp>,
++           TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::IsPosInfOp,
++                                                  mlir::tt::ttir::IsPosInfOp>,
+            TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::MishOp,
+                                                   mlir::tt::ttir::MishOp>,
+            TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::NegOp,
+diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+index 7ebc7ff..80d5944 100644
+--- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
++++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+@@ -561,6 +561,38 @@ FloorOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
+   return detail::getUnaryOpRuntime(*this, inputs, opConfig);
+ }
+ 
++//===----------------------------------------------------------------------===//
++// TruncOp - TTNN Op Model Interface
++//===----------------------------------------------------------------------===//
++
++llvm::Expected<op_model::OpConstraints>
++TruncOp::getOpConstraints(const std::vector<TTNNLayoutAttr> &inputs,
++                          const OpConfig &opConfig) {
++  return detail::getUnaryOpConstraints(*this, inputs, opConfig);
++}
++
++llvm::Expected<size_t>
++TruncOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
++                      const OpConfig &opConfig) {
++  return detail::getUnaryOpRuntime(*this, inputs, opConfig);
++}
++
++//===----------------------------------------------------------------------===//
++// RoundEvenOp - TTNN Op Model Interface
++//===----------------------------------------------------------------------===//
++
++llvm::Expected<op_model::OpConstraints>
++RoundEvenOp::getOpConstraints(const std::vector<TTNNLayoutAttr> &inputs,
++                              const OpConfig &opConfig) {
++  return detail::getUnaryOpConstraints(*this, inputs, opConfig);
++}
++
++llvm::Expected<size_t>
++RoundEvenOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
++                          const OpConfig &opConfig) {
++  return detail::getUnaryOpRuntime(*this, inputs, opConfig);
++}
++
+ //===----------------------------------------------------------------------===//
+ // GeluOp - TTNN Op Model Interface
+ //===----------------------------------------------------------------------===//
+@@ -593,6 +625,38 @@ IsFiniteOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
+   return detail::getUnaryOpRuntime(*this, inputs, opConfig);
+ }
+ 
++//===----------------------------------------------------------------------===//
++// IsInfOp - TTNN Op Model Interface
++//===----------------------------------------------------------------------===//
++
++llvm::Expected<op_model::OpConstraints>
++IsInfOp::getOpConstraints(const std::vector<TTNNLayoutAttr> &inputs,
++                          const OpConfig &opConfig) {
++  return detail::getUnaryOpConstraints(*this, inputs, opConfig);
++}
++
++llvm::Expected<size_t>
++IsInfOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
++                      const OpConfig &opConfig) {
++  return detail::getUnaryOpRuntime(*this, inputs, opConfig);
++}
++
++//===----------------------------------------------------------------------===//
++// IsPosInfOp - TTNN Op Model Interface
++//===----------------------------------------------------------------------===//
++
++llvm::Expected<op_model::OpConstraints>
++IsPosInfOp::getOpConstraints(const std::vector<TTNNLayoutAttr> &inputs,
++                             const OpConfig &opConfig) {
++  return detail::getUnaryOpConstraints(*this, inputs, opConfig);
++}
++
++llvm::Expected<size_t>
++IsPosInfOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
++                         const OpConfig &opConfig) {
++  return detail::getUnaryOpRuntime(*this, inputs, opConfig);
++}
++
+ //===----------------------------------------------------------------------===//
+ // LogicalNotOp - TTNN Op Model Interface
+ //===----------------------------------------------------------------------===//
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+index f79113b..bbd1cc1 100644
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -404,8 +404,22 @@ auto getOpSymbol() {
+     return WRAP_OP(::ttnn::sign);
+   } else if constexpr (std::is_same_v<OpTy, FloorOp>) {
+     return WRAP_OP(::ttnn::floor);
++  } else if constexpr (std::is_same_v<OpTy, TruncOp>) {
++    return WRAP_OP(::ttnn::trunc);
++  } else if constexpr (std::is_same_v<OpTy, RoundEvenOp>) {
++    return [](auto &&input, auto &&memoryConfig)
++               -> decltype(::ttnn::round(
++                   std::forward<decltype(input)>(input), std::nullopt,
++                   std::forward<decltype(memoryConfig)>(memoryConfig))) {
++      return ::ttnn::round(std::forward<decltype(input)>(input), std::nullopt,
++                           std::forward<decltype(memoryConfig)>(memoryConfig));
++    };
+   } else if constexpr (std::is_same_v<OpTy, IsFiniteOp>) {
+     return WRAP_OP(::ttnn::isfinite);
++  } else if constexpr (std::is_same_v<OpTy, IsInfOp>) {
++    return WRAP_OP(::ttnn::isinf);
++  } else if constexpr (std::is_same_v<OpTy, IsPosInfOp>) {
++    return WRAP_OP(::ttnn::isposinf);
+   } else if constexpr (std::is_same_v<OpTy, ExpOp>) {
+     return WRAP_OP(::ttnn::exp);
+   } else if constexpr (std::is_same_v<OpTy, ErfOp>) {
+@@ -1147,7 +1161,11 @@ template struct UnaryEltwiseWithFastApproxModeOpModel<LogOp>;
+ template struct UnaryEltwiseOpModel<CeilOp>;
+ template struct UnaryEltwiseOpModel<SignOp>;
+ template struct UnaryEltwiseOpModel<FloorOp>;
++template struct UnaryEltwiseOpModel<TruncOp>;
++template struct UnaryEltwiseOpModel<RoundEvenOp>;
+ template struct UnaryEltwiseOpModel<IsFiniteOp>;
++template struct UnaryEltwiseOpModel<IsInfOp>;
++template struct UnaryEltwiseOpModel<IsPosInfOp>;
+ template struct UnaryEltwiseOpModel<LogicalNotOp>;
+ template struct UnaryEltwiseOpModel<NegOp>;
+ template struct UnaryEltwiseOpModel<TanOp>;
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+index 4f0f200..f6fab74 100644
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -2490,6 +2490,14 @@ createEltwiseUnaryOp(FlatbufferObjectCache &cache, EltwiseUnaryOp op) {
+     type = ::tt::target::ttnn::EltwiseUnaryOpType::Acos;
+   } else if constexpr (std::is_same_v<EltwiseUnaryOp, FloorOp>) {
+     type = ::tt::target::ttnn::EltwiseUnaryOpType::Floor;
++  } else if constexpr (std::is_same_v<EltwiseUnaryOp, TruncOp>) {
++    type = ::tt::target::ttnn::EltwiseUnaryOpType::Trunc;
++  } else if constexpr (std::is_same_v<EltwiseUnaryOp, RoundEvenOp>) {
++    type = ::tt::target::ttnn::EltwiseUnaryOpType::RoundEven;
++  } else if constexpr (std::is_same_v<EltwiseUnaryOp, IsInfOp>) {
++    type = ::tt::target::ttnn::EltwiseUnaryOpType::IsInf;
++  } else if constexpr (std::is_same_v<EltwiseUnaryOp, IsPosInfOp>) {
++    type = ::tt::target::ttnn::EltwiseUnaryOpType::IsPosInf;
+   } else if constexpr (std::is_same_v<EltwiseUnaryOp, GeluOp>) {
+     type = ::tt::target::ttnn::EltwiseUnaryOpType::Gelu;
+   } else if constexpr (std::is_same_v<EltwiseUnaryOp, IsFiniteOp>) {
+@@ -4430,6 +4438,22 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createEltwiseUnaryOp(cache, floorOp),
+                            debugString, locInfo);
+   }
++  if (auto truncOp = dyn_cast<TruncOp>(op); truncOp) {
++    return createOperation(cache, createEltwiseUnaryOp(cache, truncOp),
++                           debugString, locInfo);
++  }
++  if (auto roundEvenOp = dyn_cast<RoundEvenOp>(op); roundEvenOp) {
++    return createOperation(cache, createEltwiseUnaryOp(cache, roundEvenOp),
++                           debugString, locInfo);
++  }
++  if (auto isInfOp = dyn_cast<IsInfOp>(op); isInfOp) {
++    return createOperation(cache, createEltwiseUnaryOp(cache, isInfOp),
++                           debugString, locInfo);
++  }
++  if (auto isPosInfOp = dyn_cast<IsPosInfOp>(op); isPosInfOp) {
++    return createOperation(cache, createEltwiseUnaryOp(cache, isPosInfOp),
++                           debugString, locInfo);
++  }
+   if (auto isFiniteOp = dyn_cast<IsFiniteOp>(op); isFiniteOp) {
+     return createOperation(cache, createEltwiseUnaryOp(cache, isFiniteOp),
+                            debugString, locInfo);
+diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
+index de224cf..54a7190 100644
+--- a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
+@@ -35,6 +35,29 @@ static void runEltwiseUnaryOp(
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+ 
++static void runEltwisePredicateOp(
++    const ::tt::target::ttnn::EltwiseUnaryOp *op, ProgramTensorPool &tensorPool,
++    const std::function<::ttnn::Tensor(
++        const ::ttnn::Tensor &, const std::optional<::ttnn::MemoryConfig> &,
++        const std::optional<::ttnn::Tensor> &,
++        const std::optional<::ttnn::CoreRangeSet> &)> &ttnnOp) {
++  runEltwiseUnaryOp(
++      op, tensorPool,
++      [ttnnOp](const ::ttnn::Tensor &input, const auto &memoryConfig,
++               const auto &outputTensor, const auto &subCoreGrids) {
++        ::ttnn::Tensor result =
++            ttnnOp(input, memoryConfig, /*optional_output_tensor=*/std::nullopt,
++                   subCoreGrids);
++        // TTNN predicates preserve their input dtype, but TTIR i1 tensors use
++        // BFLOAT16 as their runtime storage alias.
++        if (result.dtype() == ::ttnn::DataType::BFLOAT16) {
++          return result;
++        }
++        return ::ttnn::typecast(result, ::ttnn::DataType::BFLOAT16,
++                                memoryConfig, outputTensor, subCoreGrids);
++      });
++}
++
+ static void runEltwiseUnaryTanhOp(
+     const ::tt::target::ttnn::EltwiseUnaryOp *op, ProgramTensorPool &tensorPool,
+     const std::function<::ttnn::Tensor(
+@@ -156,6 +179,21 @@ void run(const ::tt::target::ttnn::EltwiseUnaryOp *op,
+     runEltwiseUnaryOp(op, tensorPool, ::ttnn::floor);
+     break;
+   }
++  case ::tt::target::ttnn::EltwiseUnaryOpType::Trunc: {
++    runEltwiseUnaryOp(op, tensorPool, ::ttnn::trunc);
++    break;
++  }
++  case ::tt::target::ttnn::EltwiseUnaryOpType::RoundEven: {
++    runEltwiseUnaryOp(op, tensorPool,
++                      [](const ::ttnn::Tensor &input,
++                         const auto &memoryConfig, const auto &outputTensor,
++                         const auto &subCoreGrids) {
++                        return ::ttnn::round(input, /*parameter=*/std::nullopt,
++                                             memoryConfig, outputTensor,
++                                             subCoreGrids);
++                      });
++    break;
++  }
+   case ::tt::target::ttnn::EltwiseUnaryOpType::Gelu: {
+     runEltwiseUnaryOp(
+         op, tensorPool,
+@@ -168,22 +206,15 @@ void run(const ::tt::target::ttnn::EltwiseUnaryOp *op,
+     break;
+   }
+   case ::tt::target::ttnn::EltwiseUnaryOpType::IsFinite: {
+-    runEltwiseUnaryOp(op, tensorPool, [](const ::ttnn::Tensor &input,
+-                                         const auto &memoryConfig,
+-                                         const auto &outputTensor,
+-                                         const auto &subCoreGrids) {
+-      ::ttnn::Tensor result = ::ttnn::isfinite(
+-          input, memoryConfig, /*optional_output_tensor=*/std::nullopt,
+-          subCoreGrids);
+-      // TTNN predicates preserve their input dtype, but TTIR i1 tensors use
+-      // BFLOAT16 as their runtime storage alias. Normalize the numeric 0/1
+-      // result so copying it back to a logical boolean buffer is well-typed.
+-      if (result.dtype() == ::ttnn::DataType::BFLOAT16) {
+-        return result;
+-      }
+-      return ::ttnn::typecast(result, ::ttnn::DataType::BFLOAT16,
+-                              memoryConfig, outputTensor, subCoreGrids);
+-    });
++    runEltwisePredicateOp(op, tensorPool, ::ttnn::isfinite);
++    break;
++  }
++  case ::tt::target::ttnn::EltwiseUnaryOpType::IsInf: {
++    runEltwisePredicateOp(op, tensorPool, ::ttnn::isinf);
++    break;
++  }
++  case ::tt::target::ttnn::EltwiseUnaryOpType::IsPosInf: {
++    runEltwisePredicateOp(op, tensorPool, ::ttnn::isposinf);
+     break;
+   }
+   case ::tt::target::ttnn::EltwiseUnaryOpType::LogicalNot: {

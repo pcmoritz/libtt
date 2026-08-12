@@ -282,17 +282,24 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
 index e7a8a79..9401974 100644
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -869,13 +869,23 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -869,13 +869,30 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
           operation_attributes.binary_op_type == BinaryOpType::GT ||
           operation_attributes.binary_op_type == BinaryOpType::LE ||
           operation_attributes.binary_op_type == BinaryOpType::GE);
++    const bool is_bfloat16_comparison =
++        is_sfpu_op && a_dtype == DataType::BFLOAT16 && b_dtype == DataType::BFLOAT16 &&
++        (operation_attributes.binary_op_type == BinaryOpType::EQ ||
++         operation_attributes.binary_op_type == BinaryOpType::NE ||
++         operation_attributes.binary_op_type == BinaryOpType::LT ||
++         operation_attributes.binary_op_type == BinaryOpType::GT ||
++         operation_attributes.binary_op_type == BinaryOpType::LE ||
++         operation_attributes.binary_op_type == BinaryOpType::GE);
 -    const bool promote_fp16 = is_sfpu_op && !is_fp16_comparison && a_dtype == DataType::FLOAT16 &&
 -                              a_dtype == b_dtype && a_dtype == c_dtype;
 +    const bool promote_narrow_float =
-+        is_sfpu_op && !is_fp16_comparison && unary::utils::uses_raw_16bit_sfpu_path(a_dtype) &&
-+        a_dtype == b_dtype && a_dtype == c_dtype &&
-+        (a_dtype != DataType::BFLOAT16 || operation_attributes.binary_op_type == BinaryOpType::DIV);
-+    const bool promote_narrow_float_inputs = promote_narrow_float || is_fp16_comparison;
++        is_sfpu_op && !is_fp16_comparison && !is_bfloat16_comparison &&
++        unary::utils::uses_raw_16bit_sfpu_path(a_dtype) && a_dtype == b_dtype && a_dtype == c_dtype;
++    const bool promote_narrow_float_inputs = promote_narrow_float || is_fp16_comparison || is_bfloat16_comparison;
 +    const bool exact_fp16_binary_output =
 +        a_dtype == DataType::FLOAT16 && b_dtype == DataType::FLOAT16 && c_dtype == DataType::FLOAT16 &&
 +        (promote_narrow_float || !is_sfpu_op);
@@ -303,8 +310,8 @@ index e7a8a79..9401974 100644
 -        promote_fp16 ? unary::utils::raw_16bit_sfpu_format : datatype_to_dataformat_converter(b_dtype);
 -    const auto c_data_format = datatype_to_dataformat_converter(c_dtype);
 +        promote_narrow_float_inputs ? unary::utils::raw_16bit_sfpu_format : datatype_to_dataformat_converter(b_dtype);
-+    // Promoted SFPU and FPU operations can leave infinity in FP32 DST,
-+    // which the native FP16 packer does not preserve reliably.
++    // Promoted SFPU and FPU operations can leave special values in FP32 DST,
++    // which the native narrow-float packers do not preserve reliably.
 +    const auto c_data_format = promote_narrow_float || exact_fp16_binary_output
 +                                   ? unary::utils::raw_16bit_sfpu_format
 +                                   : datatype_to_dataformat_converter(c_dtype);
@@ -341,7 +348,7 @@ index e7a8a79..9401974 100644
          auto a_intermediate_format =
 -            is_sfpu_op ? (promote_fp16 ? tt::DataFormat::Float32 : a_data_format)
 +            is_sfpu_op
-+                ? (promote_narrow_float_inputs && a_dtype == DataType::FLOAT16 ? tt::DataFormat::Float32 : a_data_format)
++                ? (promote_narrow_float_inputs ? tt::DataFormat::Float32 : a_data_format)
                         : (op_has_exp ? tt::DataFormat::Float16_b : a_data_format);
          uint32_t a_intermediate_single_tile_size = tt::tile_size(a_intermediate_format);
          desc.cbs.push_back(CBDescriptor{
@@ -351,7 +358,7 @@ index e7a8a79..9401974 100644
          auto b_intermediate_format =
 -            is_sfpu_op ? (promote_fp16 ? tt::DataFormat::Float32 : b_data_format)
 +            is_sfpu_op
-+                ? (promote_narrow_float_inputs && b_dtype == DataType::FLOAT16 ? tt::DataFormat::Float32 : b_data_format)
++                ? (promote_narrow_float_inputs ? tt::DataFormat::Float32 : b_data_format)
                         : (op_has_exp ? tt::DataFormat::Float16_b : b_data_format);
          uint32_t b_intermediate_single_tile_size = tt::tile_size(b_intermediate_format);
          desc.cbs.push_back(CBDescriptor{
@@ -373,7 +380,7 @@ index e7a8a79..9401974 100644
 +    if (is_sfpu_op) {
          if (op_type != BinaryOpType::POWER) {
 -            if (!promote_fp16) {
-+            if (!promote_narrow_float_inputs || a_dtype == DataType::BFLOAT16) {
++            if (!promote_narrow_float_inputs) {
                  unpack_to_dest_mode[src0_cb_index] = unpack_to_dest_mode[tt::CBIndex::c_5] =
                      tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
                  unpack_to_dest_mode[src1_cb_index] = unpack_to_dest_mode[tt::CBIndex::c_6] =
@@ -402,7 +409,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
 index 13987fe..a33bad9 100644
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -119,17 +119,31 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+@@ -119,17 +119,29 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
      const auto& ops_chain = operation_attributes.op_chain;
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
      auto compute_ops_chain = ops_chain;
@@ -415,20 +422,18 @@ index 13987fe..a33bad9 100644
 +    const bool promote_narrow_float =
 +        uses_raw_16bit_sfpu_path(input.dtype()) && ops_chain[0].type() != UnaryOpType::TYPECAST &&
 +        ops_chain[0].type() != UnaryOpType::BITCAST &&
-+        (input.dtype() == DataType::FLOAT16 || ops_chain[0].type() == UnaryOpType::NEG ||
-+         ops_chain[0].type() == UnaryOpType::LOG1P) &&
 +        get_compute_kernel_path(ops_chain[0].type(), input.dtype()) == "eltwise_sfpu.cpp";
 +    const auto op_type = ops_chain[0].type();
 +    const bool use_native_fp16_pack =
 +        input.dtype() == DataType::FLOAT16 && op_type != UnaryOpType::ABS && op_type != UnaryOpType::ISINF &&
 +        op_type != UnaryOpType::ISNAN && op_type != UnaryOpType::ISFINITE && op_type != UnaryOpType::ISPOSINF &&
 +        op_type != UnaryOpType::ISNEGINF && op_type != UnaryOpType::LOG && op_type != UnaryOpType::EXP &&
-+        op_type != UnaryOpType::EXPM1;
++        op_type != UnaryOpType::EXPM1 && op_type != UnaryOpType::ROUND && op_type != UnaryOpType::TRUNC;
 +    if (promote_narrow_float) {
 +        compute_ops_chain.insert(compute_ops_chain.begin(), make_typecast(input.dtype(), DataType::FLOAT32));
-+        // LOG, EXP, and EXPM1 need the bit-accurate conversion for IEEE special
-+        // values. Keep native packing for other ops because inserting the
-+        // conversion into an op chain can change results (notably EXP2).
++        // Some FP16 op chains need native packing to preserve their established
++        // numerical behavior (notably EXP2). BF16 always takes the explicit
++        // conversion so special values are preserved.
 +        if (!use_native_fp16_pack) {
 +            compute_ops_chain.push_back(make_typecast(DataType::FLOAT32, input.dtype()));
 +        }
@@ -456,4 +461,289 @@ index 13987fe..a33bad9 100644
 +                                                      : datatype_to_dataformat_converter(output.dtype());
      if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
          cb_data_format_output = DataFormat::UInt16;
+     }
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_data_format.hpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_data_format.hpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_data_format.hpp
+@@ -0,0 +1,30 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <utility>
++
++#include "ttnn/tensor/tensor.hpp"
++
++namespace ttnn::prim::detail {
++
++inline std::pair<tt::DataFormat, tt::DataFormat> get_tilize_cb_data_formats(
++    const Tensor& input, const Tensor& output) {
++    const bool preserve_narrow_float_payloads =
++        input.dtype() == output.dtype() &&
++        (input.dtype() == tt::tt_metal::DataType::BFLOAT16 || input.dtype() == tt::tt_metal::DataType::FLOAT16);
++    if (preserve_narrow_float_payloads) {
++        // Same-dtype tilization is data movement. Present both CBs as UInt16
++        // so the unpack and pack stages preserve NaNs and signed zero exactly.
++        return {tt::DataFormat::UInt16, tt::DataFormat::UInt16};
++    }
++
++    return {
++        tt::tt_metal::datatype_to_dataformat_converter(input.dtype()),
++        tt::tt_metal::datatype_to_dataformat_converter(output.dtype())};
++}
++
++}  // namespace ttnn::prim::detail
++
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
+@@ -5,6 +5,7 @@
+ #include "tilize_multi_core_block_program_factory.hpp"
+
+ #include "ttnn/operations/core/work_split/work_split_tilize.hpp"
++#include "ttnn/operations/data_movement/tilize/device/tilize_data_format.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
+
+ #include <tt-metalium/constants.hpp>
+@@ -79,9 +80,8 @@ ProgramDescriptor TilizeMultiCoreBlockProgramFactory::create_descriptor(
+     const Tensor& output = tensor_return_value;
+     const auto& sub_core_grids = operation_attributes.sub_core_grids;
+
+-    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
++    auto [input_cb_data_format, output_cb_data_format] = detail::get_tilize_cb_data_formats(a, output);
+     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+-    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
+@@ -5,6 +5,7 @@
+ #include "tilize_multi_core_default_program_factory.hpp"
+
+ #include "ttnn/operations/core/work_split/work_split_tilize.hpp"
++#include "ttnn/operations/data_movement/tilize/device/tilize_data_format.hpp"
+
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/host_api.hpp>
+@@ -23,9 +24,8 @@ ProgramDescriptor TilizeMultiCoreDefaultProgramFactory::create_descriptor(
+     const Tensor& output = tensor_return_value;
+     const auto& sub_core_grids = operation_attributes.sub_core_grids;
+
+-    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
++    auto [input_cb_data_format, output_cb_data_format] = detail::get_tilize_cb_data_formats(a, output);
+     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+-    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+                         output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp
+@@ -4,6 +4,7 @@
+
+ #include "tilize_multi_core_sharded_program_factory.hpp"
+
++#include "ttnn/operations/data_movement/tilize/device/tilize_data_format.hpp"
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/host_api.hpp>
+ #include <tt-metalium/allocator.hpp>
+@@ -19,9 +20,8 @@ ProgramDescriptor TilizeMultiCoreShardedProgramFactory::create_descriptor(
+     const TilizeParams& /*operation_attributes*/, const TilizeInputs& tensor_args, Tensor& tensor_return_value) {
+     const auto& input = tensor_args.input_tensor;
+     const Tensor& output = tensor_return_value;
+-    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(input.dtype());
++    auto [input_cb_data_format, output_cb_data_format] = detail::get_tilize_cb_data_formats(input, output);
+     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+-    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+     bool fp32_llk_acc = input.dtype() == DataType::FLOAT32 || input.dtype() == DataType::FP8_E4M3 ||
+                         output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp
+@@ -4,6 +4,7 @@
+
+ #include "tilize_single_core_program_factory.hpp"
+
++#include "ttnn/operations/data_movement/tilize/device/tilize_data_format.hpp"
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/host_api.hpp>
+ #include <tt-metalium/allocator.hpp>
+@@ -32,10 +33,9 @@ ProgramDescriptor TilizeSingleCoreProgramFactory::create_descriptor(
+     Buffer* dst_buffer = output.buffer();
+     TT_FATAL(dst_buffer != nullptr, "Output buffer should be allocated on device!");
+
+-    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
++    auto [input_cb_data_format, output_cb_data_format] = detail::get_tilize_cb_data_formats(a, output);
+     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+
+-    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+@@ -7,6 +7,7 @@
+ #include <cmath>
+
+ #include "ttnn/operations/core/work_split/work_split_tilize.hpp"
++#include "ttnn/operations/data_movement/tilize/device/tilize_data_format.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
+
+ #include <tt-metalium/constants.hpp>
+@@ -83,9 +84,8 @@ ProgramDescriptor TilizeWithValPaddingMultiCoreBlockInterleavedFactory::create_descriptor(
+     const Tensor& output = tensor_return_value;
+     const auto& sub_core_grids = operation_attributes.sub_core_grids;
+
+-    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
++    auto [input_cb_data_format, output_cb_data_format] = detail::get_tilize_cb_data_formats(a, output);
+     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+-    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
+@@ -7,6 +7,7 @@
+ #include <cmath>
+
+ #include "ttnn/operations/core/work_split/work_split_tilize.hpp"
++#include "ttnn/operations/data_movement/tilize/device/tilize_data_format.hpp"
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/host_api.hpp>
+ #include <tt-metalium/allocator.hpp>
+@@ -24,9 +25,8 @@ ProgramDescriptor TilizeWithValPaddingMultiCoreDefaultFactory::create_descriptor(
+     const TilizeWithValPaddingParams& operation_attributes, const Tensor& input_tensor, Tensor& tensor_return_value) {
+     const Tensor& a = input_tensor;
+     const Tensor& output = tensor_return_value;
+-    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
++    auto [input_cb_data_format, output_cb_data_format] = detail::get_tilize_cb_data_formats(a, output);
+     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+-    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
+@@ -6,6 +6,7 @@
+ #include "tilize_with_val_padding_multi_core_sharded_program_factory.hpp"
+
+ #include <cmath>
++#include "ttnn/operations/data_movement/tilize/device/tilize_data_format.hpp"
+
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/host_api.hpp>
+@@ -27,9 +28,8 @@ ProgramDescriptor TilizeWithValPaddingMultiCoreShardedFactory::create_descriptor(
+     bool src_sharded = a.memory_config().is_sharded();
+     bool out_sharded = output.memory_config().is_sharded();
+
+-    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
++    auto [input_cb_data_format, output_cb_data_format] = detail::get_tilize_cb_data_formats(a, output);
+     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+-    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
+@@ -6,6 +6,7 @@
+ #include "tilize_with_val_padding_single_core_program_factory.hpp"
+
+ #include <cmath>
++#include "ttnn/operations/data_movement/tilize/device/tilize_data_format.hpp"
+
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/host_api.hpp>
+@@ -32,10 +33,9 @@ ProgramDescriptor TilizeWithValPaddingSingleCoreFactory::create_descriptor(
+
+     Buffer* src0_buffer = a.buffer();
+
+-    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
++    auto [input_cb_data_format, output_cb_data_format] = detail::get_tilize_cb_data_formats(a, output);
+     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+
+-    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_rounding_ops.h tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_rounding_ops.h
+--- tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_rounding_ops.h
++++ tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_rounding_ops.h
+@@ -23,6 +23,7 @@ namespace sfpu
+ // compute truncate to zero
+ sfpi_inline sfpi::vFloat _trunc_body_(sfpi::vFloat val)
+ {
++    sfpi::l_reg[sfpi::LRegs::LReg4] = val;
+     sfpi::l_reg[sfpi::LRegs::LReg0] = val;
+     // set L3=23.  TODO: this could be stored in a constant register, but use by rdiv prevents this for now.
+     TTI_SFPLOADI(p_sfpu::LREG3, sfpi::SFPLOADI_MOD0_SHORT, 23);
+@@ -43,7 +44,12 @@ sfpi_inline sfpi::vFloat _trunc_body_(sfpi::vFloat val)
+     sfpi::l_reg[sfpi::LRegs::LReg2].in_use();
+     sfpi::l_reg[sfpi::LRegs::LReg3].in_use();
+
+-    return sfpi::l_reg[sfpi::LRegs::LReg1];
++    sfpi::vFloat original = sfpi::l_reg[sfpi::LRegs::LReg4];
++    sfpi::vFloat result = sfpi::l_reg[sfpi::LRegs::LReg1];
++    // The integer mask clears a NaN's mantissa and canonicalizes signed zero.
++    v_if (sfpi::is_nan(original) || sfpi::is_inf(original) || original == 0.0f) { result = original; }
++    v_endif;
++    return result;
+ }
+
+ // compute floor
+@@ -166,6 +172,10 @@ void _calculate_round_(const int decimals)
+     {
+         sfpi::vFloat v      = sfpi::dst_reg[0];
+         sfpi::vFloat result = inverse * _round_even_(v * coeff);
++        // Multiplication by the decimal scale canonicalizes negative zero.
++        // Restore the input sign whenever rounding produces zero.
++        v_if (result == 0.0f) { result = sfpi::copysgn(result, v); }
++        v_endif;
+         sfpi::dst_reg[0]    = result;
+         sfpi::dst_reg++;
+     }
+diff --git tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_rounding_ops.h tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_rounding_ops.h
+--- tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_rounding_ops.h
++++ tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_rounding_ops.h
+@@ -23,6 +23,7 @@ namespace sfpu
+ // compute truncate to zero
+ sfpi_inline sfpi::vFloat _trunc_body_(sfpi::vFloat val)
+ {
++    sfpi::l_reg[sfpi::LRegs::LReg4] = val;
+     sfpi::l_reg[sfpi::LRegs::LReg0] = val;
+     // set L3=23.  TODO: this could be stored in a constant register, but use by rdiv prevents this for now.
+     TTI_SFPLOADI(p_sfpu::LREG3, sfpi::SFPLOADI_MOD0_SHORT, 23);
+@@ -43,7 +44,12 @@ sfpi_inline sfpi::vFloat _trunc_body_(sfpi::vFloat val)
+     sfpi::l_reg[sfpi::LRegs::LReg2].in_use();
+     sfpi::l_reg[sfpi::LRegs::LReg3].in_use();
+
+-    return sfpi::l_reg[sfpi::LRegs::LReg1];
++    sfpi::vFloat original = sfpi::l_reg[sfpi::LRegs::LReg4];
++    sfpi::vFloat result = sfpi::l_reg[sfpi::LRegs::LReg1];
++    // The integer mask clears a NaN's mantissa and canonicalizes signed zero.
++    v_if (sfpi::is_nan(original) || sfpi::is_inf(original) || original == 0.0f) { result = original; }
++    v_endif;
++    return result;
+ }
+
+ // computes floor
+@@ -178,6 +184,10 @@ void _calculate_round_(const int decimals)
+     {
+         sfpi::vFloat v      = sfpi::dst_reg[0];
+         sfpi::vFloat result = inverse * _round_even_(v * coeff);
++        // Multiplication by the decimal scale canonicalizes negative zero.
++        // Restore the input sign whenever rounding produces zero.
++        v_if (result == 0.0f) { result = sfpi::copysgn(result, v); }
++        v_endif;
+         sfpi::dst_reg[0]    = result;
+         sfpi::dst_reg++;
      }
