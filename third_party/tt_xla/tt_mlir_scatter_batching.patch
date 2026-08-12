@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -7721,6 +7721,24 @@ public:
+@@ -7721,6 +7721,34 @@ public:
      Value inputTensor = srcOp.getInputs()[0];
      Value updateTensor = srcOp.getUpdates()[0];
 -    auto scatterDimsToOperandDims =
@@ -10,7 +10,17 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims());
 +    SmallVector<int64_t> insertedWindowDims(
 +        adaptor.getScatterDimensionNumbers().getInsertedWindowDims());
-+    Value scatterIndices = srcOp.getScatterIndices();
++    Value scatterIndices = adaptor.getScatterIndices();
++    // Scatter's index arithmetic has the same signed-i32 requirement as the
++    // gather clamp path.
++    auto scatterIndicesType =
++        mlir::cast<RankedTensorType>(scatterIndices.getType());
++    if (scatterIndicesType.getElementType().isUnsignedInteger()) {
++      auto signedType = scatterIndicesType.clone(rewriter.getI32Type());
++      scatterIndices = rewriter.create<ttir::TypecastOp>(
++          srcOp.getLoc(), signedType, scatterIndices);
++    }
++
 +    ArrayRef<int64_t> inputBatchingDims =
 +        adaptor.getScatterDimensionNumbers().getInputBatchingDims();
 +    SmallVector<int64_t> scatterIndicesBatchingDims(
@@ -28,7 +38,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
      RankedTensorType inputType =
          mlir::cast<RankedTensorType>(inputTensor.getType());
-@@ -7748,4 +7766,11 @@ public:
+@@ -7748,4 +7776,11 @@ public:
      // Single-dimensional scatter.
 -    bool flatten = scatterDimsToOperandDims.size() > 1 ||
 +    // The flattened path materializes offsets along indexed window dims.
@@ -41,14 +51,14 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +                   scatterDimsToOperandDims.size() > 1 ||
                     inputType.getElementType().isF32() ||
                     inputType.getRank() != updateType.getRank();
-@@ -7754,4 +7773,4 @@ public:
+@@ -7754,4 +7783,4 @@ public:
        int32_t dim = scatterDimsToOperandDims[0];
        Value finalIndexTensor =
 -          extractElementWiseScatterIndices(srcOp, rewriter);
 +          extractElementWiseScatterIndices(srcOp, scatterIndices, rewriter);
 -
 +
-@@ -7770,7 +7789,28 @@ public:
+@@ -7770,7 +7799,28 @@ public:
        // Scatter indices, input, and update tensors flattened to 1D.
        Value flattenedIndices = flattenMultiDimScatterIndices(
 -          srcOp, inputShape, updateShape, rewriter);
@@ -78,7 +88,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
            rewriter, srcOp.getLoc(), inputTensor, "_input_flatten");
        Value flattenedUpdate = ttir::utils::flattenTensor(
            rewriter, srcOp.getLoc(), updateTensor, "_update_flatten");
-@@ -7805,14 +7825,4 @@ private:
+@@ -7805,14 +7835,4 @@ private:
                                     mlir::stablehlo::ScatterOp::Adaptor adaptor,
                                     ConversionPatternRewriter &rewriter) const {
 -    auto inputBatchingDims =
@@ -93,7 +103,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -
      ArrayRef<int64_t> insertedWindowDims =
          adaptor.getScatterDimensionNumbers().getInsertedWindowDims();
-@@ -7835,9 +7845,8 @@ private:
+@@ -7835,9 +7855,8 @@ private:
 -    if (!llvm::is_sorted(scatterDimsToOperandDims)) {
 -      return rewriter.notifyMatchFailure(
 -          op,
@@ -109,7 +119,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        1;
      uint32_t indexVectorDim =
          adaptor.getScatterDimensionNumbers().getIndexVectorDim();
-@@ -7845,8 +7858,4 @@ private:
+@@ -7845,8 +7868,4 @@ private:
 -    // Checks that apply to multi dimensional scatter.
 -
 -    if (multiDimensionalScatter &&
@@ -120,7 +130,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -              "index_vector_dim being the last dimension");
 +          op, "index_vector_dim must not exceed the scatter indices rank");
      }
-@@ -7869,11 +7878,2 @@ private:
+@@ -7869,11 +7888,2 @@ private:
 -    // Checks that apply to single dimensional scatter.
 -
 -    if (!multiDimensionalScatter &&
@@ -132,7 +142,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -
      return success();
    }
-@@ -7960,4 +7960,115 @@ private:
+@@ -7960,4 +7970,115 @@ private:
      return clamped;
    }
 -
@@ -249,7 +259,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  }
 +
    /// Computes flattened 1D indices for multi-dimensional scatter.
-@@ -7985,7 +8096,8 @@ private:
+@@ -7985,7 +8106,8 @@ private:
 -  Value flattenMultiDimScatterIndices(mlir::stablehlo::ScatterOp op,
 -                                      ArrayRef<int64_t> operandShape,
 -                                      ArrayRef<int64_t> updateShape,
@@ -263,7 +273,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      PatternRewriter &rewriter) const {
      RankedTensorType indicesType =
          mlir::cast<RankedTensorType>(indices.getType());
-@@ -7992,10 +8104,6 @@ private:
+@@ -7992,10 +8114,6 @@ private:
      ArrayRef<int64_t> indicesShape = indicesType.getShape();
      auto scatterDimNumbers = op.getScatterDimensionNumbers();
 -    ArrayRef<int64_t> insertedWindowDims =
@@ -275,7 +285,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    int64_t indexVectorDim = scatterDimNumbers.getIndexVectorDim();
 +    int64_t indexVectorDim = indicesType.getRank() - 1;
      int64_t operandRank = operandShape.size();
-@@ -8138,21 +8249,26 @@ private:
+@@ -8138,21 +8259,26 @@ private:
        Value dimIndex = nullptr;
 
        if (isScatterDim) {
@@ -319,7 +329,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +              rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
 +        }
        }
-@@ -8205,17 +8313,16 @@ private:
+@@ -8205,17 +8323,16 @@ private:
 -  Value extractElementWiseScatterIndices(mlir::stablehlo::ScatterOp op,
 -                                         PatternRewriter &rewriter) const {
 +  Value extractElementWiseScatterIndices(
@@ -343,7 +353,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    int64_t indexVectorDim = indexType.getRank() - 1;
      ArrayRef<int64_t> updateWindowDims =
          op.getScatterDimensionNumbers().getUpdateWindowDims();
-@@ -8223,3 +8330,2 @@ private:
+@@ -8223,3 +8340,2 @@ private:
      // Collect the scatter-batch dims of the original index tensor (all dims
 -    // except index_vector_dim). For implicit index_vector_dim (== rank), no
 -    // dim is excluded.
