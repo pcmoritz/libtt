@@ -420,14 +420,14 @@ index 13987fe..a33bad9 100644
 +        get_compute_kernel_path(ops_chain[0].type(), input.dtype()) == "eltwise_sfpu.cpp";
 +    const auto op_type = ops_chain[0].type();
 +    const bool use_native_fp16_pack =
-+        input.dtype() == DataType::FLOAT16 && op_type != UnaryOpType::ABS && op_type != UnaryOpType::ISINF &&
-+        op_type != UnaryOpType::ISNAN && op_type != UnaryOpType::ISFINITE && op_type != UnaryOpType::ISPOSINF &&
-+        op_type != UnaryOpType::ISNEGINF && op_type != UnaryOpType::LOG && op_type != UnaryOpType::EXP &&
-+        op_type != UnaryOpType::EXPM1;
++        input.dtype() == DataType::FLOAT16 && op_type != UnaryOpType::NEG && op_type != UnaryOpType::ABS &&
++        op_type != UnaryOpType::ISINF && op_type != UnaryOpType::ISNAN && op_type != UnaryOpType::ISFINITE &&
++        op_type != UnaryOpType::ISPOSINF && op_type != UnaryOpType::ISNEGINF && op_type != UnaryOpType::LOG &&
++        op_type != UnaryOpType::LOG1P && op_type != UnaryOpType::EXP && op_type != UnaryOpType::EXPM1;
 +    if (promote_narrow_float) {
 +        compute_ops_chain.insert(compute_ops_chain.begin(), make_typecast(input.dtype(), DataType::FLOAT32));
-+        // LOG, EXP, and EXPM1 need the bit-accurate conversion for IEEE special
-+        // values. Keep native packing for other ops because inserting the
++        // NEG, LOG, LOG1P, EXP, and EXPM1 need bit-accurate conversion for IEEE
++        // special values. Keep native packing for other ops because inserting the
 +        // conversion into an op chain can change results (notably EXP2).
 +        if (!use_native_fp16_pack) {
 +            compute_ops_chain.push_back(make_typecast(DataType::FLOAT32, input.dtype()));
