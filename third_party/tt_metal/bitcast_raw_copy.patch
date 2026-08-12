@@ -1,172 +1,52 @@
-diff --git ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_default_tilized_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_default_tilized_program_factory.cpp
-index b6ee809..0eb9d6b 100644
---- ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_default_tilized_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_default_tilized_program_factory.cpp
-@@ -32,7 +32,7 @@ constexpr const char* KERNEL_COMPUTE_ELTWISE_COPY =
- }  // namespace
- 
- ProgramDescriptor CopyDeviceOperation::DefaultTilized::create_descriptor(
--    const operation_attributes_t& /*operation_attributes*/,
-+    const operation_attributes_t& operation_attributes,
-     const tensor_args_t& tensor_args,
-     tensor_return_value_t& output_tensor) {
-     const auto& input = tensor_args.input;
-@@ -81,7 +81,7 @@ ProgramDescriptor CopyDeviceOperation::DefaultTilized::create_descriptor(
-         }}},
-     });
- 
--    bool convert_df = input_cb_data_format != output_cb_data_format;
-+    const bool convert_df = input_cb_data_format != output_cb_data_format && !operation_attributes.preserve_bits;
- 
-     if (convert_df) {
-         // Configuring the CB that stores output pages if we need to convert data formats through the compute kernel
-diff --git ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp
-index f8081a8..32b4771 100644
---- ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp
-@@ -26,7 +26,8 @@ bool can_use_specialized_factory(const CopyParams& operation_attributes, const C
-     const bool tilized = input_tensor.layout() == Layout::TILE;
-     const tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
-     const tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(operation_attributes.output_dtype);
--    const bool convert_dtype = input_cb_data_format != output_cb_data_format;
-+    const bool convert_dtype =
-+        input_cb_data_format != output_cb_data_format && !operation_attributes.preserve_bits;
- 
-     uint32_t input_unit_size =
-         tilized ? tt::tile_size(input_cb_data_format) : input_tensor.padded_shape()[-1] * input_tensor.element_size();
-@@ -83,7 +84,8 @@ void CopyDeviceOperation::validate_on_program_cache_miss(
-             input_tensor_a.dtype() == DataType::FLOAT32 or input_tensor_a.dtype() == DataType::BFLOAT4_B or
-             input_tensor_a.dtype() == DataType::UINT32 or input_tensor_a.dtype() == DataType::INT32 or
-             input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::UINT8 or
--            input_tensor_a.dtype() == DataType::FP8_E4M3,
-+            input_tensor_a.dtype() == DataType::FP8_E4M3 or
-+            (operation_attributes.preserve_bits && input_tensor_a.dtype() == DataType::FLOAT16),
-         "ttnn.copy only supports float, bfloat, fp8_e4m3, int32, uint32, uint16 and uint8 inputs but got {}",
-         input_tensor_a.dtype());
-     TT_FATAL(
-@@ -95,7 +97,8 @@ void CopyDeviceOperation::validate_on_program_cache_miss(
-             operation_attributes.output_dtype == DataType::INT32 or
-             operation_attributes.output_dtype == DataType::UINT16 or
-             operation_attributes.output_dtype == DataType::UINT8 or
--            operation_attributes.output_dtype == DataType::FP8_E4M3,
-+            operation_attributes.output_dtype == DataType::FP8_E4M3 or
-+            (operation_attributes.preserve_bits && operation_attributes.output_dtype == DataType::FLOAT16),
-         "ttnn.copy only supports float, bfloat, fp8_e4m3, int32, uint32, uint16 and uint8 output tensors but got {}",
-         operation_attributes.output_dtype);
-     TT_FATAL(input_tensor_a.storage_type() == StorageType::DEVICE, "Operands to copy need to be on device!");
-@@ -131,10 +134,20 @@ void CopyDeviceOperation::validate_on_program_cache_miss(
-     }
- 
-     // Check if dtype conversion is supported (only on TILE layout)
--    if (output_dtype != input_tensor_a.dtype()) {
-+    if (output_dtype != input_tensor_a.dtype() && !operation_attributes.preserve_bits) {
-         TT_FATAL(input_tensor_a.layout() == Layout::TILE, "Only tile layout supports dtype conversion");
-     }
- 
-+    if (operation_attributes.preserve_bits) {
-+        const auto input_data_format = datatype_to_dataformat_converter(input_tensor_a.dtype());
-+        const auto output_data_format = datatype_to_dataformat_converter(output_dtype);
-+        const bool same_physical_element_size =
-+            input_tensor_a.layout() == Layout::TILE
-+                ? tt::tile_size(input_data_format) == tt::tile_size(output_data_format)
-+                : input_tensor_a.element_size() == tt::datum_size(output_data_format);
-+        TT_FATAL(same_physical_element_size, "Bit-preserving copy requires equal-width input and output elements");
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+@@ -33,3 +33,14 @@ void UnaryDeviceOperation::validate_on_program_cache_miss(
++    if (args.op_chain.size() == 1 && args.op_chain.front().type() == operations::unary::UnaryOpType::BITCAST) {
++        const DataType output_dtype = output_tensor.has_value() ? output_tensor->dtype() : args.output_dtype;
++        const auto input_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
++        const auto output_format = tt::tt_metal::datatype_to_dataformat_converter(output_dtype);
++        const bool equal_width =
++            input_tensor.layout() == Layout::TILE
++                ? tile_size(input_format) == tile_size(output_format)
++                : datum_size(input_format) == datum_size(output_format);
++        TT_FATAL(equal_width, "Bitcast requires equal-width input and output element types");
 +    }
 +
-     // Check that the tile shape is the same for the input and output tensors
-     if (input_tensor_a.layout() == Layout::TILE) {
-         const auto output_tile = tensor_args.preallocated_output.has_value()
-@@ -203,9 +216,10 @@ CopyDeviceOperation::tensor_return_value_t copy(
-     const tt::tt_metal::MemoryConfig& output_mem_config,
-     const tt::tt_metal::DataType& output_dtype,
-     const std::optional<Tensor>& preallocated_output,
--    bool backwards) {
-+    bool backwards,
-+    bool preserve_bits) {
-     return ttnn::device_operation::launch<CopyDeviceOperation>(
--        CopyParams{output_mem_config, output_dtype, backwards}, CopyInputs{input, preallocated_output});
-+        CopyParams{output_mem_config, output_dtype, backwards, preserve_bits}, CopyInputs{input, preallocated_output});
- }
- 
- }  // namespace ttnn::prim
-diff --git ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.hpp ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.hpp
-index 0e7b2b4..7b544f1 100644
---- ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.hpp
-+++ ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.hpp
-@@ -66,6 +66,7 @@ Tensor copy(
-     const tt::tt_metal::MemoryConfig& output_mem_config,
-     const tt::tt_metal::DataType& output_dtype,
-     const std::optional<Tensor>& preallocated_output,
--    bool backwards = false);
-+    bool backwards = false,
-+    bool preserve_bits = false);
- 
- }  // namespace ttnn::prim
-diff --git ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation_types.hpp ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation_types.hpp
-index 4d012d9..3cc456d 100644
---- ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation_types.hpp
-+++ ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation_types.hpp
-@@ -13,6 +13,7 @@ struct CopyParams {
-     tt::tt_metal::MemoryConfig output_mem_config;
-     tt::tt_metal::DataType output_dtype;
-     bool backwards = false;
-+    bool preserve_bits = false;
- };
- 
- struct CopyInputs {
-diff --git ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_same_memory_config_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_same_memory_config_program_factory.cpp
-index 2773ed1..4b70675 100644
---- ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_same_memory_config_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_same_memory_config_program_factory.cpp
-@@ -78,7 +78,8 @@ ProgramDescriptor CopyDeviceOperation::SameMemoryConfig::create_descriptor(
-         output_unit_size = output.memory_config().shard_spec()->shape[1] * output.element_size();
+     auto out_memory_config = args.memory_config;
+     if (output_tensor.has_value()) {
+         out_memory_config = output_tensor->memory_config();
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+@@ -118,6 +118,20 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_descriptor(
+     const auto& input = tensor_args.input;
+     const auto& ops_chain = operation_attributes.op_chain;
+     TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
++    const bool is_bitcast = ops_chain.size() == 1 && ops_chain[0].type() == UnaryOpType::BITCAST;
++    const auto bitcast_data_format = [&]() {
++        if (!is_bitcast) {
++            return DataFormat::Invalid;
++        }
++        // BITCAST still uses the unary unpack/copy/pack pipeline. Present both
++        // CBs as unsigned integers so those stages move the payload without
++        // applying floating-point NaN, infinity, or denormal semantics.
++        if (input.element_size() == sizeof(uint16_t)) {
++            return DataFormat::UInt16;
++        }
++        TT_FATAL(input.element_size() == sizeof(uint32_t), "Bitcast only supports 16- and 32-bit element types");
++        return DataFormat::UInt32;
++    }();
+     auto compute_ops_chain = ops_chain;
+     const bool promote_narrow_float =
+         uses_raw_16bit_sfpu_path(input.dtype()) && ops_chain[0].type() != UnaryOpType::TYPECAST &&
+@@ -155,7 +169,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_descriptor(
+     DataFormat cb_data_format_output =
+         promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format
+                                                       : datatype_to_dataformat_converter(output.dtype());
+-    if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
+-        cb_data_format_output = DataFormat::UInt16;
++    if (is_bitcast) {
++        cb_data_format_output = bitcast_data_format;
      }
- 
--    const bool convert_dtype = input_cb_data_format != output_cb_data_format;
-+    const bool convert_dtype =
-+        input_cb_data_format != output_cb_data_format && !operation_attributes.preserve_bits;
- 
-     const uint32_t num_units =
-         tilized ? output.physical_volume() / TILE_HW : output.physical_volume() / output.padded_shape()[-1];
-diff --git ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
-index 1f48817..164d9f6 100644
---- ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
-@@ -8,6 +8,7 @@
- #include "ttnn/operations/eltwise/complex/complex.hpp"
- #include "ttnn/operations/eltwise/binary/binary.hpp"
- #include "ttnn/operations/copy/typecast/typecast.hpp"
-+#include "ttnn/operations/data_movement/copy/device/copy_device_operation.hpp"
- 
- namespace ttnn::operations::unary::detail {
- 
-@@ -433,16 +434,24 @@ Tensor bitcast(
-     const std::optional<MemoryConfig>& memory_config,
-     const std::optional<Tensor>& optional_output_tensor,
-     const std::optional<CoreRangeSet>& sub_core_grids) {
--    using namespace operations::unary;
-     if (optional_output_tensor.has_value()) {
-         TT_FATAL(
-             output_dtype == optional_output_tensor.value().dtype(),
-             "If both output dtype and output tensor provided dtype should match");
-     }
--    EltwiseUnaryWithParam bitcast_op(
--        UnaryOpType::BITCAST, {static_cast<float>(input_tensor.dtype()), static_cast<float>(output_dtype)});
--    return operations::unary::detail::unary_impl(
--        input_tensor, {bitcast_op}, memory_config, optional_output_tensor, sub_core_grids);
-+    // Bitcast must bypass compute unpack/pack, which can change payload bits
-+    // even when the compute operation itself is an identity.
-+    (void)sub_core_grids;
-+    const auto output_memory_config = optional_output_tensor.has_value()
-+                                    ? optional_output_tensor->memory_config()
-+                                    : memory_config.value_or(input_tensor.memory_config());
-+    return prim::copy(
-+        input_tensor,
-+        output_memory_config,
-+        output_dtype,
-+        optional_output_tensor,
-+        /*backwards=*/false,
-+        /*preserve_bits=*/true);
- }
- 
- Tensor rdiv(
+     uint32_t single_tile_size_output = tile_size(cb_data_format_output);
