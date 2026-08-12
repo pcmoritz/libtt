@@ -19,34 +19,27 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -118,6 +118,20 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_descriptor(
+@@ -118,6 +118,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_descriptor(
      const auto& input = tensor_args.input;
      const auto& ops_chain = operation_attributes.op_chain;
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
 +    const bool is_bitcast = ops_chain.size() == 1 && ops_chain[0].type() == UnaryOpType::BITCAST;
-+    const auto bitcast_data_format = [&]() {
-+        if (!is_bitcast) {
-+            return DataFormat::Invalid;
-+        }
-+        // BITCAST still uses the unary unpack/copy/pack pipeline. Present both
-+        // CBs as unsigned integers so those stages move the payload without
-+        // applying floating-point NaN, infinity, or denormal semantics.
-+        if (input.element_size() == sizeof(uint16_t)) {
-+            return DataFormat::UInt16;
-+        }
-+        TT_FATAL(input.element_size() == sizeof(uint32_t), "Bitcast only supports 16- and 32-bit element types");
-+        return DataFormat::UInt32;
-+    }();
      auto compute_ops_chain = ops_chain;
      const bool promote_narrow_float =
          uses_raw_16bit_sfpu_path(input.dtype()) && ops_chain[0].type() != UnaryOpType::TYPECAST &&
-@@ -155,7 +169,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_descriptor(
+@@ -155,7 +156,13 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_descriptor(
      DataFormat cb_data_format_output =
          promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format
                                                        : datatype_to_dataformat_converter(output.dtype());
 -    if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
 -        cb_data_format_output = DataFormat::UInt16;
 +    if (is_bitcast) {
-+        cb_data_format_output = bitcast_data_format;
++        TT_FATAL(
++            input.element_size() == sizeof(uint16_t) || input.element_size() == sizeof(uint32_t),
++            "Bitcast only supports 16- and 32-bit element types");
++        // For BITCAST, cb_data_format_for_input below inherits this format.
++        // Unsigned semantics therefore apply to both unpacking and packing.
++        cb_data_format_output =
++            input.element_size() == sizeof(uint16_t) ? DataFormat::UInt16 : DataFormat::UInt32;
      }
      uint32_t single_tile_size_output = tile_size(cb_data_format_output);
