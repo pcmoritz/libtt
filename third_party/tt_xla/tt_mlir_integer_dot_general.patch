@@ -1,0 +1,43 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -290,12 +290,39 @@
+     // to the matmul destination shape [..., M, N].
+     int64_t contractionSize =
+         computeProductOfDims(lhsType.getShape(), lhsContractDims);
+     Value contractionResult;
+     if (contractionSize == 1) {
+       contractionResult = rewriter.create<ttir::MultiplyOp>(
+           op.getLoc(),
+           RankedTensorType::get(matmulDestinationShape, elementType),
+           lhsMatmulInput, rhsMatmulInput);
++    } else if (isa<IntegerType>(elementType)) {
++      // Materialize [..., M, K, N], multiply elementwise, and let Sum reduce K.
++      SmallVector<int64_t> lhsExpandedShape(lhsMatmulInputShape);
++      lhsExpandedShape.push_back(1);
++      SmallVector<int64_t> rhsExpandedShape(rhsMatmulInputShape);
++      rhsExpandedShape.insert(rhsExpandedShape.end() - 2, 1);
++      Value lhsExpanded = createMatmulFinal(
++          rewriter,
++          ttmlir::utils::appendLocationSuffix(op.getLoc(), "_expandLhs"),
++          lhsMatmulInput, lhsType, lhsExpandedShape);
++      Value rhsExpanded = createMatmulFinal(
++          rewriter,
++          ttmlir::utils::appendLocationSuffix(op.getLoc(), "_expandRhs"),
++          rhsMatmulInput, rhsType, rhsExpandedShape);
++      int64_t contractionDim = lhsExpandedShape.size() - 2;
++      SmallVector<int64_t> productShape(lhsExpandedShape.begin(),
++                                        lhsExpandedShape.end() - 1);
++      productShape.push_back(rhsExpandedShape.back());
++      auto productType = RankedTensorType::get(productShape, elementType);
++      Value product = rewriter.create<ttir::MultiplyOp>(
++          op.getLoc(), productType, lhsExpanded, rhsExpanded);
++      contractionResult = rewriter.create<ttir::SumOp>(
++          op.getLoc(),
++          RankedTensorType::get(matmulDestinationShape, elementType), product,
++          /*keepDim=*/false,
++          rewriter.getI32ArrayAttr(
++              {static_cast<int32_t>(contractionDim)}));
+     } else {
+       contractionResult = rewriter.create<ttir::MatmulOp>(
+           op.getLoc(),
