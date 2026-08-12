@@ -367,6 +367,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_zero_sized_buffer_cast.patch",
         "//third_party/tt_xla:tt_mlir_uint8_device_untilize.patch",
         "//third_party/tt_xla:tt_mlir_signed_integer_alias.patch",
+        "//third_party/tt_xla:tt_mlir_normalize_i16_bitcast.patch",
         "//third_party/tt_xla:tt_mlir_sort_input_types.patch",
         "//third_party/tt_xla:tt_mlir_float16_tensor.patch",
         "//third_party/tt_xla:tt_mlir_concat_unaligned_width.patch",

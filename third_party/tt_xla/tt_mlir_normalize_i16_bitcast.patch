@@ -1,0 +1,120 @@
+diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
+--- a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
++++ b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
+@@ -114,9 +114,18 @@ private:
+       return mlir::DenseElementsAttr::get(newType, bf16Values);
+     }
+ 
++    const size_t newBitWidth =
++        newType.getElementType().getIntOrFloatBitWidth();
++    auto integerType = mlir::cast<IntegerType>(attr.getElementType());
+     llvm::SmallVector<mlir::APInt> intValues;
+     for (mlir::APInt v : attr.getValues<mlir::APInt>()) {
+-      intValues.push_back(bitWidth == 64 ? v.truncSSat(32) : v);
++      if (bitWidth == 64) {
++        v = v.truncSSat(32);
++      } else if (bitWidth < newBitWidth) {
++        v = integerType.isUnsigned() ? v.zext(newBitWidth)
++                                     : v.sext(newBitWidth);
++      }
++      intValues.push_back(v);
+     }
+ 
+     return mlir::DenseElementsAttr::get(newType, intValues);
+@@ -136,6 +145,78 @@ private:
+   }
+ };
+ 
++// Signed i16 tensors are represented as i32 because TTNN has no signed i16
++// dtype. Keep equal-width float/i16 bitcasts raw by using ui16 at the bitcast
++// boundary and converting to or from the i32 representation outside it.
++class NormalizeI16BitcastPattern
++    : public mlir::OpRewritePattern<tt::ttir::BitcastConvertOp> {
++public:
++  using mlir::OpRewritePattern<
++      tt::ttir::BitcastConvertOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(tt::ttir::BitcastConvertOp op,
++                  mlir::PatternRewriter &rewriter) const override {
++    auto inputType = op.getInput().getType();
++    auto outputType = op.getType();
++    Type inputElementType = inputType.getElementType();
++    Type outputElementType = outputType.getElementType();
++
++    auto isSignedI16 = [](Type type) {
++      auto integerType = mlir::dyn_cast<IntegerType>(type);
++      return integerType && integerType.getWidth() == 16 &&
++             !integerType.isUnsigned();
++    };
++    bool inputIsSignedI16 = isSignedI16(inputElementType);
++    bool outputIsSignedI16 = isSignedI16(outputElementType);
++    if (inputIsSignedI16 == outputIsSignedI16) {
++      return failure();
++    }
++
++    Type otherElementType =
++        inputIsSignedI16 ? outputElementType : inputElementType;
++    if (!mlir::isa<FloatType>(otherElementType) ||
++        otherElementType.getIntOrFloatBitWidth() != 16) {
++      return failure();
++    }
++
++    Type ui16 = rewriter.getIntegerType(16, /*isSigned=*/false);
++    if (outputIsSignedI16) {
++      auto rawType = outputType.clone(ui16);
++      Value raw = rewriter.create<tt::ttir::BitcastConvertOp>(
++          op.getLoc(), rawType, op.getInput());
++      auto normalizedType = outputType.clone(rewriter.getI32Type());
++      Value widened = rewriter.create<tt::ttir::TypecastOp>(
++          op.getLoc(), normalizedType, raw);
++      auto shiftAttr = DenseElementsAttr::get(
++          normalizedType, rewriter.getI32IntegerAttr(16));
++      Value shift = rewriter.create<tt::ttir::ConstantOp>(
++          op.getLoc(), normalizedType, shiftAttr);
++      Value shifted = rewriter.create<tt::ttir::LogicalLeftShiftOp>(
++          op.getLoc(), normalizedType, widened, shift);
++      rewriter.replaceOpWithNewOp<tt::ttir::RightShiftOp>(
++          op, normalizedType, shifted, shift);
++      return success();
++    }
++
++    auto normalizedType = inputType.clone(rewriter.getI32Type());
++    Value widened = rewriter.create<tt::ttir::TypecastOp>(
++        op.getLoc(), normalizedType, op.getInput());
++    auto maskAttr = DenseElementsAttr::get(
++        normalizedType, rewriter.getI32IntegerAttr(0xFFFF));
++    Value mask = rewriter.create<tt::ttir::ConstantOp>(
++        op.getLoc(), normalizedType, maskAttr);
++    Value masked = rewriter.create<tt::ttir::BitwiseAndOp>(
++        op.getLoc(), normalizedType, widened, mask);
++    auto rawType = inputType.clone(ui16);
++    Value raw = rewriter.create<tt::ttir::TypecastOp>(op.getLoc(), rawType,
++                                                      masked);
++    rewriter.replaceOpWithNewOp<tt::ttir::BitcastConvertOp>(op, outputType,
++                                                            raw);
++    return success();
++  }
++};
++
+ struct ElementTypeNormalization
+     : public impl::ElementTypeNormalizationBase<ElementTypeNormalization> {
+   using impl::ElementTypeNormalizationBase<
+@@ -151,6 +232,16 @@ struct ElementTypeNormalization
+-    mlir::RewritePatternSet patterns(&getContext());
+     GreedyRewriteConfig config;
+     config.enableFolding(false);
++
++    // Rewrite these bitcasts before uniform normalization can widen i16.
++    mlir::RewritePatternSet bitcastPatterns(&getContext());
++    bitcastPatterns.add<NormalizeI16BitcastPattern>(&getContext());
++    if (failed(mlir::applyPatternsGreedily(
++            getOperation(), std::move(bitcastPatterns), config))) {
++      signalPassFailure();
++      return;
++    }
++
++    mlir::RewritePatternSet patterns(&getContext());
+     patterns.add<UniformTypeRewriter>(converter, &getContext());
+     patterns.add<ConstantOpAttrRewriter>(converter, &getContext());
+     if (failed(mlir::applyPatternsGreedily(getOperation(), std::move(patterns),
