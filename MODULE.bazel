@@ -377,7 +377,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_reduce_precision.patch",
         "//third_party/tt_xla:tt_mlir_round_nearest_even.patch",
         "//third_party/tt_xla:tt_mlir_cumulative_reduce_window.patch",
-        "//third_party/tt_xla:tt_mlir_rank3_reduce_window.patch",
         "//third_party/tt_xla:tt_mlir_typecast_truncate.patch",
         "//third_party/tt_xla:tt_mlir_typecast_bool_normalize.patch",
         "//third_party/tt_xla:tt_mlir_integer_where.patch",

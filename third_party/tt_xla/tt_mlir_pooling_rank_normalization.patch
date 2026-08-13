@@ -133,7 +133,7 @@
                 mlir::stablehlo::MulOp>(&op)) {
          return rewriter.notifyMatchFailure(srcOp, "Unsupported reduction op.");
        }
-@@ -3198,97 +3303,27 @@
+@@ -3198,87 +3303,27 @@
        }
      }
  
@@ -152,9 +152,9 @@
                                   windowDilations, padding, ceilMode);
      }
  
--    // Rank-3 inputs use a leading batch dimension and are reshaped to NHWC
--    // below. Rank-2 inputs similarly receive singleton batch and channel dims.
--    if (!(inputRank == 2 || inputRank == 3 || inputRank == 4)) {
+-    // Lowering to a single TTIR pooling op is supported only for 2D and 4D
+-    // input tensors.
+-    if (!(inputRank == 2 || inputRank == 4)) {
 -      return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
 -    }
 -
@@ -219,20 +219,10 @@
 -
 -        inversePermutation = ttmlir::utils::inversePermutation(permutation);
 -      }
--    } else if (inputRank == 2) {
--      // Add singleton batch and channel dimensions.
+-    } else {
+-      // 2D input needs reshape to 4D.
 -      needsReshape = true;
 -      spatialDimIndices = {0, 1};
--    } else {
--      // Treat rank-3 input as [batch, height, width]. Pooling cannot express
--      // windowing over its leading batch dimension.
--      if (windowDimensions[0] != 1 || windowStrides[0] != 1 ||
--          windowDilations[0] != 1 || padding[0] != 0 || padding[1] != 0) {
--        return rewriter.notifyMatchFailure(
--            srcOp, "Rank-3 pooling requires a trivial leading dimension.");
--      }
--      needsReshape = true;
--      spatialDimIndices = {1, 2};
 +    std::optional<Pool2DLayout> layout = getPool2DLayout(
 +        firstInputType.getShape(), windowDimensions.asArrayRef(),
 +        windowStrides.asArrayRef(), windowDilations.asArrayRef(),
@@ -246,7 +236,7 @@
  
      // Construct attributes for TTIR pooling ops.
  
-@@ -3329,65 +3364,55 @@
+@@ -3319,56 +3364,55 @@
  
        RankedTensorType inputType =
            mlir::cast<RankedTensorType>(input.getType());
@@ -255,28 +245,19 @@
            getTypeConverter()->convertType(srcOp.getResult(i).getType()));
  
 -      if (needsReshape) {
--        SmallVector<int64_t> inputShape4D(inputType.getShape());
--        if (inputRank == 2) {
--          inputShape4D.insert(inputShape4D.begin(), 1);
--        }
--        inputShape4D.push_back(1);
--        SmallVector<int32_t> inputShape4DI32(inputShape4D.begin(),
--                                             inputShape4D.end());
+-        ArrayRef<int64_t> shape2D = inputType.getShape();
+-        SmallVector<int64_t> shape4DI64 = {1, shape2D[0], shape2D[1], 1};
+-        SmallVector<int32_t> shape4D(shape4DI64.begin(), shape4DI64.end());
 -        RankedTensorType inputType4D = RankedTensorType::get(
--            inputShape4D, inputType.getElementType(), inputType.getEncoding());
+-            shape4DI64, inputType.getElementType(), inputType.getEncoding());
 -
--        input = rewriter.create<ttir::ReshapeOp>(
--            srcOp.getLoc(), inputType4D, input,
--            rewriter.getI32ArrayAttr(inputShape4DI32));
--
--        SmallVector<int64_t> resultShape4D(resultType.getShape());
--        if (inputRank == 2) {
--          resultShape4D.insert(resultShape4D.begin(), 1);
--        }
--        resultShape4D.push_back(1);
+-        input =
+-            rewriter.create<ttir::ReshapeOp>(srcOp.getLoc(), inputType4D, input,
+-                                             rewriter.getI32ArrayAttr(shape4D));
 -        resultType = RankedTensorType::get(
--            resultShape4D, resultType.getElementType(),
--            resultType.getEncoding());
+-            /*shape*/ {1, resultType.getShape()[0], resultType.getShape()[1],
+-                       1},
+-            resultType.getElementType(), resultType.getEncoding());
 -      }
 -
 -      if (needsPermute) {
@@ -347,7 +328,7 @@
          }
          return result;
        };
-@@ -3399,6 +3424,20 @@
+@@ -3380,6 +3424,20 @@
                           strideForTTIROps, dilationForTTIROps,
                           paddingForTTIROps, ceilMode)
                       .getResult();
@@ -368,7 +349,7 @@
        } else if (isa<mlir::stablehlo::AddOp>(reductionOp) && initVal == ZERO) {
          // Special case of sum pooling followed by a convenient div op.
          // TODO(acicovic): Check why was i == 0 originally added as a condition.
-@@ -3841,6 +3880,9 @@
+@@ -3822,6 +3880,9 @@
        }
        if (checkInitValue(constantOp, TypicalInitReductionValue::NEG_INF)) {
          initValues.push_back(TypicalInitReductionValue::NEG_INF);
@@ -378,7 +359,7 @@
        } else if (checkInitValue(constantOp, TypicalInitReductionValue::ZERO)) {
          initValues.push_back(TypicalInitReductionValue::ZERO);
        } else if (checkInitValue(constantOp, TypicalInitReductionValue::ONE)) {
-@@ -4731,8 +4773,8 @@
+@@ -4712,8 +4773,8 @@
      }
  
      Location loc = srcOp.getLoc();
@@ -389,7 +370,7 @@
      auto initValue_ = srcOp.getInitValue();
  
      // Get window attributes
-@@ -4760,7 +4802,34 @@
+@@ -4741,7 +4802,34 @@
          loc, operandType, rewriter.getF32FloatAttr(fillValue));
  
      // Tensor which we scatter into
@@ -425,7 +406,7 @@
  
      // Generate defaults if they dont exist
      // Default window strides is all ones
-@@ -4776,52 +4845,17 @@
+@@ -4757,52 +4845,17 @@
                   : rewriter.getDenseI64ArrayAttr(
                         SmallVector<int64_t>(windowDims.size() * 2, 0));
  
@@ -442,7 +423,9 @@
 +    if (!layout) {
        return rewriter.notifyMatchFailure(
 -          srcOp, "only 4D operands with two spatial dimensions are supported");
--    }
++          srcOp, "Expected a static rank 2-5 pooling layout with at most two "
++                 "active dimensions and any single active dimension trailing.");
+     }
 -
 -    // Generate desired and current layouts (desired = N,H,W,C)
 -    // Generate permutation for current->desired layout
@@ -475,9 +458,7 @@
 -      if (currentLayout[i] == NON_SPATIAL) {
 -        currentLayout[i] = nonSpatialCount++;
 -      }
-+          srcOp, "Expected a static rank 2-5 pooling layout with at most two "
-+                 "active dimensions and any single active dimension trailing.");
-     }
+-    }
 -
 -    // Permutation for current->desired layout and it's inverse
 -    auto permutation = ttmlir::utils::generatePermutation(
@@ -487,7 +468,7 @@
  
      // Adjust args to match definition in MaxPool2dWithIndices
      auto kernel = rewriter.getDenseI32ArrayAttr(
-@@ -4843,31 +4877,32 @@
+@@ -4824,31 +4877,32 @@
  
      auto ceilMode = rewriter.getBoolAttr(false);
  
@@ -541,7 +522,7 @@
                                rewriter.getIntegerType(32)); // i32 for indices
  
      Value pooledEmpty = rewriter.create<ttir::EmptyOp>(loc, pooledType);
-@@ -4912,8 +4947,14 @@
+@@ -4893,8 +4947,14 @@
        return rewriter.notifyMatchFailure(
            srcOp, "SelectAndScatterOp cannot specify reduce type.");
      }
@@ -557,7 +538,7 @@
      auto scatterResult = rewriter.create<ttir::ScatterOp>(
          loc, scatterOutputType,
          reshapedFullTensor, // input tensor
-@@ -4923,34 +4964,32 @@
+@@ -4904,34 +4964,32 @@
          reduceTypeAttr);    // reduction type
  
      // Reshape back to N,H,W,C
@@ -613,7 +594,7 @@
    RankedTensorType getNHWFlattenedType(RankedTensorType unflattenedType) const {
      llvm::ArrayRef<int64_t> shape = unflattenedType.getShape();
      assert(shape.size() == 4 && "Expected 4D NHWC tensor");
-@@ -4961,9 +5000,8 @@
+@@ -4942,9 +5000,8 @@
    }
  
    ttir::ReshapeOp
