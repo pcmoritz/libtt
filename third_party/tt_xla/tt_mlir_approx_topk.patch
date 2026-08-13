@@ -1,0 +1,142 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10642,7 +10642,7 @@
+ } // namespace
+ 
+ namespace {
+-// Pattern to convert mhlo.topk to ttir.topk
++// Pattern to convert JAX top-k custom calls to ttir.topk.
+ class StableHLOTopKOpMHLOConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
+   using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
+@@ -10653,7 +10653,8 @@
+                   mlir::stablehlo::CustomCallOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+     StringAttr funcName = adaptor.getCallTargetNameAttr();
+-    if (funcName != "mhlo.topk") {
++    bool isApproxTopK = funcName == "ApproxTopK";
++    if (funcName != "mhlo.topk" && !isApproxTopK) {
+       return failure();
+     }
+ 
+@@ -10664,36 +10665,91 @@
+     }
+     auto input = adaptor.getOperands()[0];
+     IntegerAttr dimAttr = IntegerAttr::get(rewriter.getIntegerType(32), -1);
++    IntegerAttr kAttr;
++    BoolAttr largestAttr;
+     auto sortedAttr = BoolAttr::get(rewriter.getContext(), true);
+ 
+-    auto dictAttr = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
+-        srcOp->getDiscardableAttr("mhlo.attributes"));
+-    if (!dictAttr) {
+-      return rewriter.notifyMatchFailure(srcOp,
+-                                         "Missing mhlo.attributes dictionary");
+-    }
+-
+-    auto kAttr = dictAttr.getAs<IntegerAttr>("k");
+-    if (!kAttr) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "Missing k attribute in mhlo.attributes");
+-    }
+-    APInt kValueI64 = kAttr.getValue();
+-    // Check if value fits in i32
+-    if (!kValueI64.isIntN(32)) {
+-      return rewriter.notifyMatchFailure(srcOp,
+-                                         "k value is too large for i32: " +
+-                                             Twine(kValueI64.getSExtValue()));
+-    }
+-
+-    // Convert i64 to i32
+-    int32_t kValueI32 = static_cast<int32_t>(kValueI64.getSExtValue());
+-    kAttr = IntegerAttr::get(rewriter.getIntegerType(32), kValueI32);
+-
+-    // mhlo.topk defaults largest to true and always returns ordered results.
+-    auto largestAttr = dictAttr.getAs<BoolAttr>("largest");
+-    if (!largestAttr) {
+-      largestAttr = rewriter.getBoolAttr(true);
++    if (isApproxTopK) {
++      auto inputType = mlir::dyn_cast<RankedTensorType>(input.getType());
++      auto valuesType = mlir::dyn_cast<RankedTensorType>(resultTypes[0]);
++      if (!inputType || !valuesType ||
++          inputType.getRank() != valuesType.getRank()) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "ApproxTopK requires equal-rank input and output tensors");
++      }
++
++      int64_t reductionDim = -1;
++      for (int64_t dim = 0; dim < inputType.getRank(); ++dim) {
++        if (inputType.getDimSize(dim) == valuesType.getDimSize(dim)) {
++          continue;
++        }
++        if (reductionDim != -1) {
++          return rewriter.notifyMatchFailure(
++              srcOp, "ApproxTopK output changes more than one dimension");
++        }
++        reductionDim = dim;
++      }
++      if (reductionDim == -1) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Cannot infer ApproxTopK reduction dimension");
++      }
++      dimAttr = rewriter.getI32IntegerAttr(
++          static_cast<int32_t>(reductionDim));
++      kAttr = rewriter.getI32IntegerAttr(
++          static_cast<int32_t>(valuesType.getDimSize(reductionDim)));
++
++      auto calledComputations = srcOp.getCalledComputations();
++      if (calledComputations.size() != 1) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "ApproxTopK requires exactly one comparator");
++      }
++      auto comparatorRef =
++          mlir::dyn_cast<FlatSymbolRefAttr>(calledComputations[0]);
++      auto moduleOp = srcOp->getParentOfType<ModuleOp>();
++      auto comparator = comparatorRef
++                            ? moduleOp.lookupSymbol<func::FuncOp>(
++                                  comparatorRef.getValue())
++                            : nullptr;
++      if (!comparator) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Cannot find ApproxTopK comparator");
++      }
++
++      FailureOr<bool> isDescending = failure();
++      comparator.walk([&](mlir::stablehlo::CompareOp compareOp) {
++        auto direction = compareOp.getComparisonDirection();
++        if (direction == mlir::stablehlo::ComparisonDirection::LT ||
++            direction == mlir::stablehlo::ComparisonDirection::GT) {
++          isDescending =
++              direction == mlir::stablehlo::ComparisonDirection::GT;
++        }
++      });
++      if (failed(isDescending)) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Cannot determine ApproxTopK comparator direction");
++      }
++      largestAttr = rewriter.getBoolAttr(*isDescending);
++    } else {
++      auto dictAttr = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
++          srcOp->getDiscardableAttr("mhlo.attributes"));
++      if (!dictAttr) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Missing mhlo.attributes dictionary");
++      }
++
++      auto sourceKAttr = dictAttr.getAs<IntegerAttr>("k");
++      if (!sourceKAttr || !sourceKAttr.getValue().isIntN(32)) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "mhlo.topk requires an i32-compatible k attribute");
++      }
++      kAttr = rewriter.getI32IntegerAttr(
++          static_cast<int32_t>(sourceKAttr.getInt()));
++
++      // mhlo.topk defaults largest to true and always returns ordered results.
++      largestAttr = dictAttr.getAs<BoolAttr>("largest");
++      if (!largestAttr) {
++        largestAttr = rewriter.getBoolAttr(true);
++      }
+     }
+ 
+     rewriter.replaceOpWithNewOp<ttir::TopKOp>(srcOp, resultTypes, input, kAttr,

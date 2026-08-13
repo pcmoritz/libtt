@@ -1,0 +1,19 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -347,5 +347,15 @@ ModuleBuilder::buildModule(
+   if (!tt_pjrt_status_is_ok(status)) {
+     return {status, nullptr};
+   }
+ 
++  // JAX leaves custom-call computations public even though only @main is an
++  // executable entry point. Normalize their visibility before shard analysis.
++  if (auto main = (*mlir_module).lookupSymbol<mlir::func::FuncOp>("main")) {
++    mlir_module->walk([&](mlir::func::FuncOp funcOp) {
++      if (funcOp != main && funcOp.isPublic()) {
++        funcOp.setPrivate();
++      }
++    });
++  }
++
+   std::vector<mlir::tt::sharding_utils::MeshSharding> input_shardings;
