@@ -30,7 +30,10 @@ def main() -> int:
     jax_repo = _rlocation(args.jax_tests_anchor).resolve(strict=True).parent.parent
 
     os.environ.pop("TT_METAL_RUNTIME_ROOT", None)
-    os.environ["PJRT_NAMES_AND_LIBRARY_PATHS"] = f"tt:{libtt}"
+    # The jax_plugins.libtt module registers both the PJRT library and the
+    # backend-specific StableHLO linear algebra fallbacks.
+    os.environ.pop("PJRT_NAMES_AND_LIBRARY_PATHS", None)
+    os.environ["LIBTT_LIBRARY_PATH"] = str(libtt)
     # Keep TT as the default while making CPU available to upstream tests that
     # explicitly exercise default-device and cross-backend behavior.
     os.environ["JAX_PLATFORMS"] = "tt,cpu"

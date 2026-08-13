@@ -53,7 +53,7 @@ py_test(
         "tests/lax_test.py::LazyConstantTest::testIotaConstant9",
     ],
     data = JAX_TEST_DATA,
-    deps = JAX_TEST_DEPS,
+    deps = JAX_TEST_DEPS + ["//jax_plugins:libtt"],
     main = "jax_test_suite.py",
     tags = JAX_TEST_TAGS,
     timeout = "long",
@@ -64,8 +64,41 @@ py_test(
     srcs = ["jax_test_suite.py"],
     args = JAX_TEST_ARGS,
     data = JAX_TEST_DATA,
-    deps = JAX_TEST_DEPS,
+    deps = JAX_TEST_DEPS + ["//jax_plugins:libtt"],
     main = "jax_test_suite.py",
     tags = JAX_TEST_TAGS,
     timeout = "eternal",
+)
+
+py_test(
+    name = "jax_svd_tests",
+    srcs = ["jax_test_suite.py"],
+    args = JAX_TEST_ARGS + [
+        # Cover an unbatched matrix and rank-3/rank-4 batches with float32.
+        # The other sampled cases use complex inputs, which TT does not
+        # support yet.
+        "tests/svd_test.py::SvdTest::testSvdvals0",
+        "tests/svd_test.py::SvdTest::testSvdvals1",
+        "tests/svd_test.py::SvdTest::testSvdvals3",
+        "tests/linalg_test.py::NumpyLinalgTest::testJspSVDBasic",
+        "--override-ini=addopts=",
+    ],
+    data = JAX_TEST_DATA,
+    deps = JAX_TEST_DEPS + ["//jax_plugins:libtt"],
+    main = "jax_test_suite.py",
+    tags = JAX_TEST_TAGS,
+    timeout = "eternal",
+)
+
+py_test(
+    name = "tt_linalg_lowerings_test",
+    srcs = ["tt_linalg_lowerings_test.py"],
+    deps = [
+        "//jax_plugins:libtt",
+        requirement("jax"),
+        requirement("jaxlib"),
+        requirement("numpy"),
+        requirement("pytest"),
+    ],
+    main = "tt_linalg_lowerings_test.py",
 )

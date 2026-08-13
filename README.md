@@ -28,6 +28,18 @@ Run the upstream JAX smoke tests against this checkout's `libtt.so`:
 bazel test //tests:jax_smoke_tests --test_output=streamed
 ```
 
+The SVD support has a fast CPU numerical test for its StableHLO fallback
+algorithms and a manual TT-device test covering upstream JAX float32 SVD,
+including rank-3 and rank-4 batches:
+
+```bash
+bazel test //tests:tt_linalg_lowerings_test
+bazel test //tests:jax_svd_tests --test_output=streamed
+```
+
+The hardware test can take several minutes per new matrix shape because the
+fallback algorithms expand to substantial StableHLO programs.
+
 Pass pytest arguments to the broader runner with `--test_arg`. For example,
 collect a test file without the runner eagerly opening the TT device:
 
