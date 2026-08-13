@@ -540,9 +540,9 @@
            srcOp, "SelectAndScatterOp cannot specify reduce type.");
      }
 +    ttcore::ReduceType reduceType = *scatterReduceType;
-+    // Non-overlapping windows cannot produce duplicate scatter indices.
-+    if (reduceType == ttcore::ReduceType::Sum && stride[0] >= kernel[0] &&
-+        stride[1] >= kernel[1]) {
++    // With zero fill, non-overlapping windows only need an overwrite.
++    if (reduceType == ttcore::ReduceType::Sum && fillValue == 0.0f &&
++        stride[0] >= kernel[0] && stride[1] >= kernel[1]) {
 +      reduceType = ttcore::ReduceType::Invalid;
 +    }
      auto reduceTypeAttr =
