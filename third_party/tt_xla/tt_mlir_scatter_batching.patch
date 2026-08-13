@@ -10,7 +10,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims());
 +    SmallVector<int64_t> insertedWindowDims(
 +        adaptor.getScatterDimensionNumbers().getInsertedWindowDims());
-+    Value scatterIndices = srcOp.getScatterIndices();
++    Value scatterIndices = adaptor.getScatterIndices();
 +    ArrayRef<int64_t> inputBatchingDims =
 +        adaptor.getScatterDimensionNumbers().getInputBatchingDims();
 +    SmallVector<int64_t> scatterIndicesBatchingDims(
