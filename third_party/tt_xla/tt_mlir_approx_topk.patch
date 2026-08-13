@@ -1,40 +1,101 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10642,7 +10642,7 @@
- } // namespace
- 
+@@ -10644,61 +10644,151 @@
  namespace {
 -// Pattern to convert mhlo.topk to ttir.topk
-+// Pattern to convert JAX top-k custom calls to ttir.topk.
++static LogicalResult replaceWithTopK(
++    mlir::stablehlo::CustomCallOp srcOp, Value input, int32_t k, int32_t dim,
++    bool largest, const TypeConverter *typeConverter,
++    ConversionPatternRewriter &rewriter) {
++  SmallVector<Type> resultTypes;
++  if (failed(typeConverter->convertTypes(srcOp->getResultTypes(),
++                                         resultTypes))) {
++    return failure();
++  }
++
++  rewriter.replaceOpWithNewOp<ttir::TopKOp>(
++      srcOp, resultTypes, input, rewriter.getI32IntegerAttr(k),
++      rewriter.getI32IntegerAttr(dim), rewriter.getBoolAttr(largest),
++      rewriter.getBoolAttr(true));
++  return success();
++}
++
++static FailureOr<bool>
++getApproxTopKLargest(mlir::stablehlo::CustomCallOp srcOp) {
++  auto calledComputations = srcOp.getCalledComputations();
++  if (calledComputations.size() != 1) {
++    return failure();
++  }
++  auto comparatorRef =
++      mlir::dyn_cast<FlatSymbolRefAttr>(calledComputations[0]);
++  auto moduleOp = srcOp->getParentOfType<ModuleOp>();
++  auto comparator =
++      comparatorRef
++          ? moduleOp.lookupSymbol<func::FuncOp>(comparatorRef.getValue())
++          : nullptr;
++  if (!comparator || comparator.getBody().empty()) {
++    return failure();
++  }
++
++  Block &entryBlock = comparator.getBody().front();
++  if (entryBlock.getNumArguments() < 2) {
++    return failure();
++  }
++
++  FailureOr<bool> isDescending = failure();
++  comparator.walk([&](mlir::stablehlo::CompareOp compareOp) {
++    if (compareOp->getOperand(0) != entryBlock.getArgument(0) ||
++        compareOp->getOperand(1) != entryBlock.getArgument(1)) {
++      return WalkResult::advance();
++    }
++
++    auto direction = compareOp.getComparisonDirection();
++    if (direction != mlir::stablehlo::ComparisonDirection::LT &&
++        direction != mlir::stablehlo::ComparisonDirection::GT) {
++      return WalkResult::advance();
++    }
++    isDescending = direction == mlir::stablehlo::ComparisonDirection::GT;
++    return WalkResult::interrupt();
++  });
++  return isDescending;
++}
++
  class StableHLOTopKOpMHLOConversionPattern
      : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
    using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
-@@ -10653,7 +10653,8 @@
+-
++
+ public:
+   LogicalResult
+   matchAndRewrite(mlir::stablehlo::CustomCallOp srcOp,
                    mlir::stablehlo::CustomCallOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
-     StringAttr funcName = adaptor.getCallTargetNameAttr();
+-    StringAttr funcName = adaptor.getCallTargetNameAttr();
 -    if (funcName != "mhlo.topk") {
-+    bool isApproxTopK = funcName == "ApproxTopK";
-+    if (funcName != "mhlo.topk" && !isApproxTopK) {
++    if (adaptor.getCallTargetNameAttr() != "mhlo.topk") {
        return failure();
      }
  
-@@ -10664,36 +10665,114 @@
-     }
-     auto input = adaptor.getOperands()[0];
-     IntegerAttr dimAttr = IntegerAttr::get(rewriter.getIntegerType(32), -1);
-+    IntegerAttr kAttr;
-+    BoolAttr largestAttr;
-     auto sortedAttr = BoolAttr::get(rewriter.getContext(), true);
- 
--    auto dictAttr = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
--        srcOp->getDiscardableAttr("mhlo.attributes"));
--    if (!dictAttr) {
+-    SmallVector<Type> resultTypes;
+-    if (failed(this->getTypeConverter()->convertTypes(srcOp->getResultTypes(),
+-                                                      resultTypes))) {
+-      return failure();
+-    }
+-    auto input = adaptor.getOperands()[0];
+-    IntegerAttr dimAttr = IntegerAttr::get(rewriter.getIntegerType(32), -1);
+-    auto sortedAttr = BoolAttr::get(rewriter.getContext(), true);
+-
+     auto dictAttr = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
+         srcOp->getDiscardableAttr("mhlo.attributes"));
+     if (!dictAttr) {
 -      return rewriter.notifyMatchFailure(srcOp,
 -                                         "Missing mhlo.attributes dictionary");
--    }
++      return rewriter.notifyMatchFailure(
++          srcOp, "Missing mhlo.attributes dictionary");
+     }
 -
++
 -    auto kAttr = dictAttr.getAs<IntegerAttr>("k");
 -    if (!kAttr) {
 -      return rewriter.notifyMatchFailure(
@@ -46,120 +107,93 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -      return rewriter.notifyMatchFailure(srcOp,
 -                                         "k value is too large for i32: " +
 -                                             Twine(kValueI64.getSExtValue()));
--    }
++    auto sourceKAttr = dictAttr.getAs<IntegerAttr>("k");
++    if (!sourceKAttr || !sourceKAttr.getValue().isIntN(32)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "mhlo.topk requires an i32-compatible k attribute");
+     }
 -
++
 -    // Convert i64 to i32
 -    int32_t kValueI32 = static_cast<int32_t>(kValueI64.getSExtValue());
 -    kAttr = IntegerAttr::get(rewriter.getIntegerType(32), kValueI32);
 -
--    // mhlo.topk defaults largest to true and always returns ordered results.
--    auto largestAttr = dictAttr.getAs<BoolAttr>("largest");
--    if (!largestAttr) {
--      largestAttr = rewriter.getBoolAttr(true);
-+    if (isApproxTopK) {
-+      auto inputType = mlir::dyn_cast<RankedTensorType>(input.getType());
-+      auto backendConfig = mlir::dyn_cast<DictionaryAttr>(
-+          srcOp.getBackendConfigAttr());
-+      if (!inputType || !backendConfig) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "ApproxTopK requires a ranked input and backend config");
-+      }
-+
-+      auto sourceKAttr = backendConfig.getAs<IntegerAttr>("top_k");
-+      auto sourceDimAttr =
-+          backendConfig.getAs<IntegerAttr>("reduction_dim");
-+      auto aggregateAttr =
-+          backendConfig.getAs<BoolAttr>("aggregate_to_topk");
-+      if (!sourceKAttr || !sourceDimAttr || !aggregateAttr) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "ApproxTopK backend config is incomplete");
-+      }
-+      if (!aggregateAttr.getValue()) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "Non-aggregate ApproxTopK is not supported");
-+      }
-+
-+      int64_t topK = sourceKAttr.getInt();
-+      int64_t reductionDim = sourceDimAttr.getInt();
-+      if (topK <= 0 ||
-+          topK > std::numeric_limits<int32_t>::max() || reductionDim < 0 ||
-+          reductionDim >= inputType.getRank()) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "ApproxTopK backend config is out of range");
-+      }
-+      dimAttr = rewriter.getI32IntegerAttr(
-+          static_cast<int32_t>(reductionDim));
-+      kAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(topK));
-+
-+      auto calledComputations = srcOp.getCalledComputations();
-+      if (calledComputations.size() != 1) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "ApproxTopK requires exactly one comparator");
-+      }
-+      auto comparatorRef =
-+          mlir::dyn_cast<FlatSymbolRefAttr>(calledComputations[0]);
-+      auto moduleOp = srcOp->getParentOfType<ModuleOp>();
-+      auto comparator = comparatorRef
-+                            ? moduleOp.lookupSymbol<func::FuncOp>(
-+                                  comparatorRef.getValue())
-+                            : nullptr;
-+      if (!comparator) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "Cannot find ApproxTopK comparator");
-+      }
-+
-+      if (comparator.getBody().empty()) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "ApproxTopK comparator has no body");
-+      }
-+      Block &entryBlock = comparator.getBody().front();
-+      if (entryBlock.getNumArguments() < 2) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "ApproxTopK comparator requires two value arguments");
-+      }
-+
-+      FailureOr<bool> isDescending = failure();
-+      comparator.walk([&](mlir::stablehlo::CompareOp compareOp) {
-+        if (compareOp->getOperand(0) != entryBlock.getArgument(0) ||
-+            compareOp->getOperand(1) != entryBlock.getArgument(1)) {
-+          return WalkResult::advance();
-+        }
-+
-+        auto direction = compareOp.getComparisonDirection();
-+        if (direction != mlir::stablehlo::ComparisonDirection::LT &&
-+            direction != mlir::stablehlo::ComparisonDirection::GT) {
-+          return WalkResult::advance();
-+        }
-+        isDescending =
-+            direction == mlir::stablehlo::ComparisonDirection::GT;
-+        return WalkResult::interrupt();
-+      });
-+      if (failed(isDescending)) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "Cannot determine ApproxTopK comparator direction");
-+      }
-+      largestAttr = rewriter.getBoolAttr(*isDescending);
-+    } else {
-+      auto dictAttr = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
-+          srcOp->getDiscardableAttr("mhlo.attributes"));
-+      if (!dictAttr) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "Missing mhlo.attributes dictionary");
-+      }
-+
-+      auto sourceKAttr = dictAttr.getAs<IntegerAttr>("k");
-+      if (!sourceKAttr || !sourceKAttr.getValue().isIntN(32)) {
-+        return rewriter.notifyMatchFailure(
-+            srcOp, "mhlo.topk requires an i32-compatible k attribute");
-+      }
-+      kAttr = rewriter.getI32IntegerAttr(
-+          static_cast<int32_t>(sourceKAttr.getInt()));
-+
-+      // mhlo.topk defaults largest to true and always returns ordered results.
-+      largestAttr = dictAttr.getAs<BoolAttr>("largest");
-+      if (!largestAttr) {
-+        largestAttr = rewriter.getBoolAttr(true);
-+      }
+     // mhlo.topk defaults largest to true and always returns ordered results.
+     auto largestAttr = dictAttr.getAs<BoolAttr>("largest");
+     if (!largestAttr) {
+       largestAttr = rewriter.getBoolAttr(true);
      }
+-
++
+-    rewriter.replaceOpWithNewOp<ttir::TopKOp>(srcOp, resultTypes, input, kAttr,
+-                                              dimAttr, largestAttr, sortedAttr);
+-    return success();
++    return replaceWithTopK(
++        srcOp, adaptor.getOperands()[0],
++        static_cast<int32_t>(sourceKAttr.getInt()), -1,
++        largestAttr.getValue(), getTypeConverter(), rewriter);
++  }
++};
++
++class StableHLOApproxTopKOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
++  using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CustomCallOp srcOp,
++                  mlir::stablehlo::CustomCallOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    if (adaptor.getCallTargetNameAttr() != "ApproxTopK") {
++      return failure();
++    }
++
++    auto input = adaptor.getOperands()[0];
++    auto inputType = mlir::dyn_cast<RankedTensorType>(input.getType());
++    auto backendConfig =
++        mlir::dyn_cast<DictionaryAttr>(srcOp.getBackendConfigAttr());
++    if (!inputType || !backendConfig) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK requires a ranked input and backend config");
++    }
++
++    auto sourceKAttr = backendConfig.getAs<IntegerAttr>("top_k");
++    auto sourceDimAttr = backendConfig.getAs<IntegerAttr>("reduction_dim");
++    auto aggregateAttr = backendConfig.getAs<BoolAttr>("aggregate_to_topk");
++    if (!sourceKAttr || !sourceDimAttr || !aggregateAttr) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK backend config is incomplete");
++    }
++    if (!aggregateAttr.getValue()) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Non-aggregate ApproxTopK is not supported");
++    }
++
++    int64_t topK = sourceKAttr.getInt();
++    int64_t reductionDim = sourceDimAttr.getInt();
++    if (topK <= 0 || topK > std::numeric_limits<int32_t>::max() ||
++        reductionDim < 0 || reductionDim >= inputType.getRank()) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK backend config is out of range");
++    }
++
++    FailureOr<bool> largest = getApproxTopKLargest(srcOp);
++    if (failed(largest)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Cannot determine ApproxTopK comparator direction");
++    }
++
++    return replaceWithTopK(srcOp, input, static_cast<int32_t>(topK),
++                           static_cast<int32_t>(reductionDim), *largest,
++                           getTypeConverter(), rewriter);
+   }
+ };
+ } // namespace
+@@ -11149,6 +11239,7 @@
+                                            TypeConverter &typeConverter) {
+   patterns.add<StableHLOToTTIRReduceOpConversionPattern>(typeConverter, ctx);
+   patterns.add<StableHLOTopKOpMHLOConversionPattern>(typeConverter, ctx);
++  patterns.add<StableHLOApproxTopKOpConversionPattern>(typeConverter, ctx);
+ }
  
-     rewriter.replaceOpWithNewOp<ttir::TopKOp>(srcOp, resultTypes, input, kAttr,
+ static void
