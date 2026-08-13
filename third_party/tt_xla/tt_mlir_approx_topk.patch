@@ -1,0 +1,107 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10701,6 +10701,94 @@
+     return success();
+   }
+ };
++
++class StableHLOApproxTopKOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
++  using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CustomCallOp srcOp,
++                  mlir::stablehlo::CustomCallOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    if (adaptor.getCallTargetNameAttr() != "ApproxTopK") {
++      return failure();
++    }
++
++    SmallVector<Type> resultTypes;
++    if (failed(getTypeConverter()->convertTypes(srcOp->getResultTypes(),
++                                                resultTypes))) {
++      return failure();
++    }
++    Value input = adaptor.getOperands()[0];
++    auto inputType = mlir::dyn_cast<RankedTensorType>(input.getType());
++    auto config =
++        mlir::dyn_cast<DictionaryAttr>(srcOp.getBackendConfigAttr());
++    if (!inputType || !config) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK requires a ranked input and backend config");
++    }
++
++    auto kAttr = config.getAs<IntegerAttr>("top_k");
++    auto dimAttr = config.getAs<IntegerAttr>("reduction_dim");
++    auto aggregateAttr = config.getAs<BoolAttr>("aggregate_to_topk");
++    if (!kAttr || !dimAttr || !aggregateAttr) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK backend config is incomplete");
++    }
++    if (!aggregateAttr.getValue()) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Non-aggregate ApproxTopK is not supported");
++    }
++
++    int64_t k = kAttr.getInt();
++    int64_t dim = dimAttr.getInt();
++    if (k <= 0 || k > std::numeric_limits<int32_t>::max() || dim < 0 ||
++        dim >= inputType.getRank()) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK backend config is out of range");
++    }
++
++    auto calledComputations = srcOp.getCalledComputations();
++    if (calledComputations.size() != 1) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK requires exactly one comparator");
++    }
++    auto comparator = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
++        srcOp, mlir::cast<FlatSymbolRefAttr>(calledComputations[0]));
++    if (!comparator || comparator.getBody().empty() ||
++        comparator.getNumArguments() < 2) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK comparator is invalid");
++    }
++
++    Block &entryBlock = comparator.getBody().front();
++    FailureOr<bool> largest = failure();
++    comparator.walk([&](mlir::stablehlo::CompareOp compareOp) {
++      if (compareOp->getOperand(0) != entryBlock.getArgument(0) ||
++          compareOp->getOperand(1) != entryBlock.getArgument(1)) {
++        return WalkResult::advance();
++      }
++      auto direction = compareOp.getComparisonDirection();
++      if (direction != mlir::stablehlo::ComparisonDirection::LT &&
++          direction != mlir::stablehlo::ComparisonDirection::GT) {
++        return WalkResult::advance();
++      }
++      largest = direction == mlir::stablehlo::ComparisonDirection::GT;
++      return WalkResult::interrupt();
++    });
++    if (failed(largest)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Cannot determine ApproxTopK comparator direction");
++    }
++
++    rewriter.replaceOpWithNewOp<ttir::TopKOp>(
++        srcOp, resultTypes, input, rewriter.getI32IntegerAttr(k),
++        rewriter.getI32IntegerAttr(dim), rewriter.getBoolAttr(*largest),
++        rewriter.getBoolAttr(true));
++    return success();
++  }
++};
+ } // namespace
+-
++
+ namespace {
+@@ -11149,6 +11237,7 @@
+                                            TypeConverter &typeConverter) {
+   patterns.add<StableHLOToTTIRReduceOpConversionPattern>(typeConverter, ctx);
+   patterns.add<StableHLOTopKOpMHLOConversionPattern>(typeConverter, ctx);
++  patterns.add<StableHLOApproxTopKOpConversionPattern>(typeConverter, ctx);
+ }
+ 
+ static void

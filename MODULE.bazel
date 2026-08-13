@@ -331,6 +331,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_complex_scalar_buffer.patch",
         "//third_party/tt_xla:tt_xla_compile_option_validation.patch",
         "//third_party/tt_xla:tt_xla_fresh_mlir_context.patch",
+        "//third_party/tt_xla:tt_xla_main_entry_function.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -408,6 +409,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_cond.patch",
         "//third_party/tt_xla:tt_mlir_integer_dot_general.patch",
         "//third_party/tt_xla:tt_mlir_variadic_reduce.patch",
+        "//third_party/tt_xla:tt_mlir_approx_topk.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
