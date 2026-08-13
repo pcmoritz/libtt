@@ -385,15 +385,30 @@
      auto initValue_ = srcOp.getInitValue();
  
      // Get window attributes
-@@ -4760,7 +4798,19 @@
+@@ -4760,7 +4798,34 @@
          loc, operandType, rewriter.getF32FloatAttr(fillValue));
  
      // Tensor which we scatter into
 -    auto fullTensor = fullTensorOp.getResult();
 +    Value fullTensor = fullTensorOp.getResult();
 +
-+    auto compareOp =
-+        mlir::cast<mlir::stablehlo::CompareOp>(srcOp.getSelect().front().front());
++    Block &selectBlock = srcOp.getSelect().front();
++    auto selectReturn =
++        mlir::dyn_cast<mlir::stablehlo::ReturnOp>(selectBlock.getTerminator());
++    if (!selectReturn || selectReturn.getNumOperands() != 1 ||
++        selectBlock.getNumArguments() != 2) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Expected the select region to return a comparison.");
++    }
++    auto compareOp = selectReturn.getOperand(0)
++                         .getDefiningOp<mlir::stablehlo::CompareOp>();
++    // JAX currently emits compare(arg0, arg1); reject other forms for now.
++    if (!compareOp || compareOp.getOperand(0) != selectBlock.getArgument(0) ||
++        compareOp.getOperand(1) != selectBlock.getArgument(1)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Expected a comparison of the select arguments in order.");
++    }
++
 +    auto direction = compareOp.getComparisonDirection();
 +    if (direction == mlir::stablehlo::ComparisonDirection::LE ||
 +        direction == mlir::stablehlo::ComparisonDirection::LT) {
@@ -406,7 +421,7 @@
  
      // Generate defaults if they dont exist
      // Default window strides is all ones
-@@ -4776,52 +4826,15 @@
+@@ -4776,52 +4841,15 @@
                   : rewriter.getDenseI64ArrayAttr(
                         SmallVector<int64_t>(windowDims.size() * 2, 0));
  
@@ -466,7 +481,7 @@
  
      // Adjust args to match definition in MaxPool2dWithIndices
      auto kernel = rewriter.getDenseI32ArrayAttr(
-@@ -4843,31 +4856,32 @@
+@@ -4843,31 +4871,32 @@
  
      auto ceilMode = rewriter.getBoolAttr(false);
  
@@ -520,7 +535,7 @@
                                rewriter.getIntegerType(32)); // i32 for indices
  
      Value pooledEmpty = rewriter.create<ttir::EmptyOp>(loc, pooledType);
-@@ -4912,8 +4926,14 @@
+@@ -4912,8 +4941,14 @@
        return rewriter.notifyMatchFailure(
            srcOp, "SelectAndScatterOp cannot specify reduce type.");
      }
@@ -536,7 +551,7 @@
      auto scatterResult = rewriter.create<ttir::ScatterOp>(
          loc, scatterOutputType,
          reshapedFullTensor, // input tensor
-@@ -4923,34 +4943,32 @@
+@@ -4923,34 +4958,32 @@
          reduceTypeAttr);    // reduction type
  
      // Reshape back to N,H,W,C
@@ -592,7 +607,7 @@
    RankedTensorType getNHWFlattenedType(RankedTensorType unflattenedType) const {
      llvm::ArrayRef<int64_t> shape = unflattenedType.getShape();
      assert(shape.size() == 4 && "Expected 4D NHWC tensor");
-@@ -4961,9 +4979,8 @@
+@@ -4961,9 +4994,8 @@
    }
  
    ttir::ReshapeOp
