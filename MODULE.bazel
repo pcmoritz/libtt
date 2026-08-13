@@ -227,6 +227,7 @@ http_archive(
         "//third_party/tt_metal:topk_stable_llk.patch",
         "//third_party/tt_metal:topk_stable.patch",
         "//third_party/tt_metal:sign_integer.patch",
+        "//third_party/tt_metal:clamp_uint32.patch",
         "//third_party/tt_metal:sign_nan.patch",
         "//third_party/tt_metal:scatter_min_max.patch",
         "//third_party/tt_metal:accurate_fp32_reductions.patch",

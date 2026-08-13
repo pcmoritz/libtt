@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5827,10 +5827,54 @@ private:
+@@ -5827,10 +5827,46 @@ private:
      // If we are indexing multiple dims, we need to transform indices for the
      // new single (flattened) indexing dim. If the extra indexed dims are full,
      // we need to slice indices.
@@ -12,14 +12,6 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    // StableHLO clamps each start-index component to the largest start that
 +    // keeps its slice in bounds. Do this before flattening multiple components
 +    // so an out-of-bounds coordinate cannot spill into an adjacent dimension.
-+    // ClampScalarOp does not support unsigned integer arithmetic, so normalize
-+    // unsigned indices to the signed i32 representation used by TTIR first.
-+    if (startIndices.getType().getElementType().isUnsignedInteger()) {
-+      auto signedType = startIndices.getType().clone(rewriter.getI32Type());
-+      startIndices = rewriter.create<ttir::TypecastOp>(
-+          srcOp.getLoc(), signedType, startIndices);
-+    }
-+
 +    auto clampIndex = [&](Value index, int64_t operandDim) -> Value {
 +      auto type = mlir::cast<RankedTensorType>(index.getType());
 +      return rewriter.create<ttir::ClampScalarOp>(
