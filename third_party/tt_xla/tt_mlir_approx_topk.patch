@@ -20,7 +20,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return failure();
      }
  
-@@ -10664,36 +10665,91 @@
+@@ -10664,36 +10665,108 @@
      }
      auto input = adaptor.getOperands()[0];
      IntegerAttr dimAttr = IntegerAttr::get(rewriter.getIntegerType(32), -1);
@@ -102,14 +102,31 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +            srcOp, "Cannot find ApproxTopK comparator");
 +      }
 +
++      if (comparator.getBody().empty()) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "ApproxTopK comparator has no body");
++      }
++      Block &entryBlock = comparator.getBody().front();
++      if (entryBlock.getNumArguments() < 2) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "ApproxTopK comparator requires two value arguments");
++      }
++
 +      FailureOr<bool> isDescending = failure();
 +      comparator.walk([&](mlir::stablehlo::CompareOp compareOp) {
-+        auto direction = compareOp.getComparisonDirection();
-+        if (direction == mlir::stablehlo::ComparisonDirection::LT ||
-+            direction == mlir::stablehlo::ComparisonDirection::GT) {
-+          isDescending =
-+              direction == mlir::stablehlo::ComparisonDirection::GT;
++        if (compareOp->getOperand(0) != entryBlock.getArgument(0) ||
++            compareOp->getOperand(1) != entryBlock.getArgument(1)) {
++          return WalkResult::advance();
 +        }
++
++        auto direction = compareOp.getComparisonDirection();
++        if (direction != mlir::stablehlo::ComparisonDirection::LT &&
++            direction != mlir::stablehlo::ComparisonDirection::GT) {
++          return WalkResult::advance();
++        }
++        isDescending =
++            direction == mlir::stablehlo::ComparisonDirection::GT;
++        return WalkResult::interrupt();
 +      });
 +      if (failed(isDescending)) {
 +        return rewriter.notifyMatchFailure(
