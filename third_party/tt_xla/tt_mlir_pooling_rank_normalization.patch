@@ -1,6 +1,6 @@
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -3032,6 +3032,104 @@
+@@ -3032,6 +3032,103 @@
  
  namespace {
  
@@ -33,13 +33,9 @@
 +      return {permutedShape[0], permutedShape[1], permutedShape[2], 1};
 +    case 4:
 +      return permutedShape;
-+    case 5: {
-+      int64_t batch = ShapedType::isDynamic(permutedShape[0]) ||
-+                              ShapedType::isDynamic(permutedShape[1])
-+                          ? ShapedType::kDynamic
-+                          : permutedShape[0] * permutedShape[1];
-+      return {batch, permutedShape[2], permutedShape[3], permutedShape[4]};
-+    }
++    case 5:
++      return {permutedShape[0] * permutedShape[1], permutedShape[2],
++              permutedShape[3], permutedShape[4]};
 +    default:
 +      llvm_unreachable("expected a rank-2 through rank-5 pooling input");
 +    }
@@ -47,12 +43,15 @@
 +};
 +
 +static std::optional<Pool2DLayout>
-+getPool2DLayout(ArrayRef<int64_t> windowDimensions,
++getPool2DLayout(ArrayRef<int64_t> inputShape,
++                ArrayRef<int64_t> windowDimensions,
 +                ArrayRef<int64_t> windowStrides,
 +                ArrayRef<int64_t> windowDilations,
 +                ArrayRef<int64_t> padding) {
 +  size_t rank = windowDimensions.size();
-+  if (rank < 2 || rank > 5 || windowStrides.size() != rank ||
++  if (inputShape.size() != rank ||
++      llvm::any_of(inputShape, ShapedType::isDynamic) || rank < 2 || rank > 5 ||
++      windowStrides.size() != rank ||
 +      windowDilations.size() != rank || padding.size() != rank * 2) {
 +    return std::nullopt;
 +  }
@@ -105,7 +104,7 @@
  class StableHLOToTTIRReduceWindowOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ReduceWindowOp> {
    using OpConversionPattern<
-@@ -3048,6 +3146,7 @@
+@@ -3048,6 +3145,7 @@
                    mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
      using TypicalInitReductionValue::NEG_INF;
@@ -113,7 +112,7 @@
      using TypicalInitReductionValue::ZERO;
  
      // Validate basic op structure.
-@@ -3098,6 +3197,9 @@
+@@ -3098,6 +3196,9 @@
        } else if (isa<mlir::stablehlo::MaxOp>(reduceOp)) {
          result = rewriter.create<ttir::MaximumOp>(srcOp.getLoc(), resultType,
                                                     input, init);
@@ -123,7 +122,7 @@
        } else if (isa<mlir::stablehlo::MulOp>(reduceOp)) {
          result = rewriter.create<ttir::MultiplyOp>(srcOp.getLoc(), resultType,
                                                      input, init);
-@@ -3128,6 +3230,7 @@
+@@ -3128,6 +3229,7 @@
      SmallVector<mlir::Operation *> reductionOps;
      for (Operation &op : llvm::drop_end(operations, 1)) {
        if (!isa<mlir::stablehlo::AddOp, mlir::stablehlo::MaxOp,
@@ -131,7 +130,7 @@
                 mlir::stablehlo::MulOp>(&op)) {
          return rewriter.notifyMatchFailure(srcOp, "Unsupported reduction op.");
        }
-@@ -3198,97 +3301,25 @@
+@@ -3198,97 +3300,26 @@
        }
      }
  
@@ -232,11 +231,12 @@
 -      needsReshape = true;
 -      spatialDimIndices = {1, 2};
 +    std::optional<Pool2DLayout> layout = getPool2DLayout(
-+        windowDimensions.asArrayRef(), windowStrides.asArrayRef(),
-+        windowDilations.asArrayRef(), padding.asArrayRef());
++        firstInputType.getShape(), windowDimensions.asArrayRef(),
++        windowStrides.asArrayRef(), windowDilations.asArrayRef(),
++        padding.asArrayRef());
 +    if (!layout) {
 +      return rewriter.notifyMatchFailure(
-+          srcOp, "Expected at most two active pooling dimensions.");
++          srcOp, "Expected static shapes with at most two active dimensions.");
      }
 +    SmallVector<size_t, 2> spatialDimIndices = layout->spatialDims;
  
@@ -421,7 +421,7 @@
  
      // Generate defaults if they dont exist
      // Default window strides is all ones
-@@ -4776,52 +4841,15 @@
+@@ -4776,52 +4841,16 @@
                   : rewriter.getDenseI64ArrayAttr(
                         SmallVector<int64_t>(windowDims.size() * 2, 0));
  
@@ -432,8 +432,9 @@
 -    if (operandType.getRank() != 4 || spatialDims.size() != 2) {
 +    SmallVector<int64_t> unitDilations(windowDims.size(), 1);
 +    std::optional<Pool2DLayout> layout =
-+        getPool2DLayout(windowDims.asArrayRef(), windowStrides.asArrayRef(),
-+                        unitDilations, padding.asArrayRef());
++        getPool2DLayout(operandType.getShape(), windowDims.asArrayRef(),
++                        windowStrides.asArrayRef(), unitDilations,
++                        padding.asArrayRef());
 +    if (!layout) {
        return rewriter.notifyMatchFailure(
 -          srcOp, "only 4D operands with two spatial dimensions are supported");
@@ -470,7 +471,7 @@
 -      if (currentLayout[i] == NON_SPATIAL) {
 -        currentLayout[i] = nonSpatialCount++;
 -      }
-+          srcOp, "Expected at most two active pooling dimensions.");
++          srcOp, "Expected static shapes with at most two active dimensions.");
      }
 -
 -    // Permutation for current->desired layout and it's inverse
@@ -481,7 +482,7 @@
  
      // Adjust args to match definition in MaxPool2dWithIndices
      auto kernel = rewriter.getDenseI32ArrayAttr(
-@@ -4843,31 +4871,32 @@
+@@ -4843,31 +4872,32 @@
  
      auto ceilMode = rewriter.getBoolAttr(false);
  
@@ -535,7 +536,7 @@
                                rewriter.getIntegerType(32)); // i32 for indices
  
      Value pooledEmpty = rewriter.create<ttir::EmptyOp>(loc, pooledType);
-@@ -4912,8 +4941,14 @@
+@@ -4912,8 +4942,14 @@
        return rewriter.notifyMatchFailure(
            srcOp, "SelectAndScatterOp cannot specify reduce type.");
      }
@@ -551,7 +552,7 @@
      auto scatterResult = rewriter.create<ttir::ScatterOp>(
          loc, scatterOutputType,
          reshapedFullTensor, // input tensor
-@@ -4923,34 +4958,32 @@
+@@ -4923,34 +4959,32 @@
          reduceTypeAttr);    // reduction type
  
      // Reshape back to N,H,W,C
@@ -607,7 +608,7 @@
    RankedTensorType getNHWFlattenedType(RankedTensorType unflattenedType) const {
      llvm::ArrayRef<int64_t> shape = unflattenedType.getShape();
      assert(shape.size() == 4 && "Expected 4D NHWC tensor");
-@@ -4961,9 +4994,8 @@
+@@ -4961,9 +4995,8 @@
    }
  
    ttir::ReshapeOp
