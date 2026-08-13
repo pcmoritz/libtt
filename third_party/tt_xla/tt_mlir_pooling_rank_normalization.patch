@@ -48,11 +48,11 @@
 +                ArrayRef<int64_t> windowStrides,
 +                ArrayRef<int64_t> windowDilations,
 +                ArrayRef<int64_t> padding) {
-+  size_t rank = windowDimensions.size();
-+  if (inputShape.size() != rank ||
-+      llvm::any_of(inputShape, ShapedType::isDynamic) || rank < 2 || rank > 5 ||
-+      windowStrides.size() != rank ||
-+      windowDilations.size() != rank || padding.size() != rank * 2) {
++  size_t rank = inputShape.size();
++  assert(windowDimensions.size() == rank && windowStrides.size() == rank &&
++         windowDilations.size() == rank && padding.size() == rank * 2 &&
++         "pooling attributes must match the input rank");
++  if (llvm::any_of(inputShape, ShapedType::isDynamic) || rank < 2 || rank > 5) {
 +    return std::nullopt;
 +  }
 +
@@ -236,7 +236,7 @@
 +        padding.asArrayRef());
 +    if (!layout) {
 +      return rewriter.notifyMatchFailure(
-+          srcOp, "Expected static shapes with at most two active dimensions.");
++          srcOp, "Expected a static rank 2-5 shape with at most two active dimensions.");
      }
 +    SmallVector<size_t, 2> spatialDimIndices = layout->spatialDims;
  
@@ -471,7 +471,7 @@
 -      if (currentLayout[i] == NON_SPATIAL) {
 -        currentLayout[i] = nonSpatialCount++;
 -      }
-+          srcOp, "Expected static shapes with at most two active dimensions.");
++          srcOp, "Expected a static rank 2-5 shape with at most two active dimensions.");
      }
 -
 -    // Permutation for current->desired layout and it's inverse
