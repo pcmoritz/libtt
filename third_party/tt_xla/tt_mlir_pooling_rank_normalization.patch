@@ -1,6 +1,6 @@
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -3032,6 +3032,103 @@
+@@ -3032,6 +3032,106 @@
  
  namespace {
  
@@ -67,6 +67,9 @@
 +  if (layout.spatialDims.size() > 2) {
 +    return std::nullopt;
 +  }
++  if (layout.spatialDims.size() == 1 && layout.spatialDims[0] < rank - 2) {
++    return std::nullopt;
++  }
 +
 +  // Preserve the existing pooling convention when fewer than two spatial
 +  // dimensions are observable: rank-2 is HW, while higher ranks use their
@@ -104,7 +107,7 @@
  class StableHLOToTTIRReduceWindowOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ReduceWindowOp> {
    using OpConversionPattern<
-@@ -3048,6 +3145,7 @@
+@@ -3048,6 +3148,7 @@
                    mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
      using TypicalInitReductionValue::NEG_INF;
@@ -112,7 +115,7 @@
      using TypicalInitReductionValue::ZERO;
  
      // Validate basic op structure.
-@@ -3098,6 +3196,9 @@
+@@ -3098,6 +3199,9 @@
        } else if (isa<mlir::stablehlo::MaxOp>(reduceOp)) {
          result = rewriter.create<ttir::MaximumOp>(srcOp.getLoc(), resultType,
                                                     input, init);
@@ -122,7 +125,7 @@
        } else if (isa<mlir::stablehlo::MulOp>(reduceOp)) {
          result = rewriter.create<ttir::MultiplyOp>(srcOp.getLoc(), resultType,
                                                      input, init);
-@@ -3128,6 +3229,7 @@
+@@ -3128,6 +3232,7 @@
      SmallVector<mlir::Operation *> reductionOps;
      for (Operation &op : llvm::drop_end(operations, 1)) {
        if (!isa<mlir::stablehlo::AddOp, mlir::stablehlo::MaxOp,
@@ -130,7 +133,7 @@
                 mlir::stablehlo::MulOp>(&op)) {
          return rewriter.notifyMatchFailure(srcOp, "Unsupported reduction op.");
        }
-@@ -3198,97 +3300,26 @@
+@@ -3198,97 +3303,27 @@
        }
      }
  
@@ -236,13 +239,14 @@
 +        padding.asArrayRef());
 +    if (!layout) {
 +      return rewriter.notifyMatchFailure(
-+          srcOp, "Expected a static rank 2-5 shape with at most two active dimensions.");
++          srcOp, "Expected a static rank 2-5 pooling layout with at most two "
++                 "active dimensions and any single active dimension trailing.");
      }
 +    SmallVector<size_t, 2> spatialDimIndices = layout->spatialDims;
  
      // Construct attributes for TTIR pooling ops.
  
-@@ -3329,65 +3360,55 @@
+@@ -3329,65 +3364,55 @@
  
        RankedTensorType inputType =
            mlir::cast<RankedTensorType>(input.getType());
@@ -343,7 +347,7 @@
          }
          return result;
        };
-@@ -3399,6 +3420,20 @@
+@@ -3399,6 +3424,20 @@
                           strideForTTIROps, dilationForTTIROps,
                           paddingForTTIROps, ceilMode)
                       .getResult();
@@ -364,7 +368,7 @@
        } else if (isa<mlir::stablehlo::AddOp>(reductionOp) && initVal == ZERO) {
          // Special case of sum pooling followed by a convenient div op.
          // TODO(acicovic): Check why was i == 0 originally added as a condition.
-@@ -3841,6 +3876,9 @@
+@@ -3841,6 +3880,9 @@
        }
        if (checkInitValue(constantOp, TypicalInitReductionValue::NEG_INF)) {
          initValues.push_back(TypicalInitReductionValue::NEG_INF);
@@ -374,7 +378,7 @@
        } else if (checkInitValue(constantOp, TypicalInitReductionValue::ZERO)) {
          initValues.push_back(TypicalInitReductionValue::ZERO);
        } else if (checkInitValue(constantOp, TypicalInitReductionValue::ONE)) {
-@@ -4731,8 +4769,8 @@
+@@ -4731,8 +4773,8 @@
      }
  
      Location loc = srcOp.getLoc();
@@ -385,7 +389,7 @@
      auto initValue_ = srcOp.getInitValue();
  
      // Get window attributes
-@@ -4760,7 +4798,34 @@
+@@ -4760,7 +4802,34 @@
          loc, operandType, rewriter.getF32FloatAttr(fillValue));
  
      // Tensor which we scatter into
@@ -421,7 +425,7 @@
  
      // Generate defaults if they dont exist
      // Default window strides is all ones
-@@ -4776,52 +4841,16 @@
+@@ -4776,52 +4845,17 @@
                   : rewriter.getDenseI64ArrayAttr(
                         SmallVector<int64_t>(windowDims.size() * 2, 0));
  
@@ -471,7 +475,8 @@
 -      if (currentLayout[i] == NON_SPATIAL) {
 -        currentLayout[i] = nonSpatialCount++;
 -      }
-+          srcOp, "Expected a static rank 2-5 shape with at most two active dimensions.");
++          srcOp, "Expected a static rank 2-5 pooling layout with at most two "
++                 "active dimensions and any single active dimension trailing.");
      }
 -
 -    // Permutation for current->desired layout and it's inverse
@@ -482,7 +487,7 @@
  
      // Adjust args to match definition in MaxPool2dWithIndices
      auto kernel = rewriter.getDenseI32ArrayAttr(
-@@ -4843,31 +4872,32 @@
+@@ -4843,31 +4877,32 @@
  
      auto ceilMode = rewriter.getBoolAttr(false);
  
@@ -536,7 +541,7 @@
                                rewriter.getIntegerType(32)); // i32 for indices
  
      Value pooledEmpty = rewriter.create<ttir::EmptyOp>(loc, pooledType);
-@@ -4912,8 +4942,14 @@
+@@ -4912,8 +4947,14 @@
        return rewriter.notifyMatchFailure(
            srcOp, "SelectAndScatterOp cannot specify reduce type.");
      }
@@ -552,7 +557,7 @@
      auto scatterResult = rewriter.create<ttir::ScatterOp>(
          loc, scatterOutputType,
          reshapedFullTensor, // input tensor
-@@ -4923,34 +4959,32 @@
+@@ -4923,34 +4964,32 @@
          reduceTypeAttr);    // reduction type
  
      // Reshape back to N,H,W,C
@@ -608,7 +613,7 @@
    RankedTensorType getNHWFlattenedType(RankedTensorType unflattenedType) const {
      llvm::ArrayRef<int64_t> shape = unflattenedType.getShape();
      assert(shape.size() == 4 && "Expected 4D NHWC tensor");
-@@ -4961,9 +4995,8 @@
+@@ -4961,9 +5000,8 @@
    }
  
    ttir::ReshapeOp
