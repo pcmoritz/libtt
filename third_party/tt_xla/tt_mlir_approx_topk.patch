@@ -20,7 +20,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return failure();
      }
  
-@@ -10664,36 +10665,108 @@
+@@ -10664,36 +10665,114 @@
      }
      auto input = adaptor.getOperands()[0];
      IntegerAttr dimAttr = IntegerAttr::get(rewriter.getIntegerType(32), -1);
@@ -58,32 +58,38 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -      largestAttr = rewriter.getBoolAttr(true);
 +    if (isApproxTopK) {
 +      auto inputType = mlir::dyn_cast<RankedTensorType>(input.getType());
-+      auto valuesType = mlir::dyn_cast<RankedTensorType>(resultTypes[0]);
-+      if (!inputType || !valuesType ||
-+          inputType.getRank() != valuesType.getRank()) {
++      auto backendConfig = mlir::dyn_cast<DictionaryAttr>(
++          srcOp.getBackendConfigAttr());
++      if (!inputType || !backendConfig) {
 +        return rewriter.notifyMatchFailure(
-+            srcOp, "ApproxTopK requires equal-rank input and output tensors");
++            srcOp, "ApproxTopK requires a ranked input and backend config");
 +      }
 +
-+      int64_t reductionDim = -1;
-+      for (int64_t dim = 0; dim < inputType.getRank(); ++dim) {
-+        if (inputType.getDimSize(dim) == valuesType.getDimSize(dim)) {
-+          continue;
-+        }
-+        if (reductionDim != -1) {
-+          return rewriter.notifyMatchFailure(
-+              srcOp, "ApproxTopK output changes more than one dimension");
-+        }
-+        reductionDim = dim;
-+      }
-+      if (reductionDim == -1) {
++      auto sourceKAttr = backendConfig.getAs<IntegerAttr>("top_k");
++      auto sourceDimAttr =
++          backendConfig.getAs<IntegerAttr>("reduction_dim");
++      auto aggregateAttr =
++          backendConfig.getAs<BoolAttr>("aggregate_to_topk");
++      if (!sourceKAttr || !sourceDimAttr || !aggregateAttr) {
 +        return rewriter.notifyMatchFailure(
-+            srcOp, "Cannot infer ApproxTopK reduction dimension");
++            srcOp, "ApproxTopK backend config is incomplete");
++      }
++      if (!aggregateAttr.getValue()) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Non-aggregate ApproxTopK is not supported");
++      }
++
++      int64_t topK = sourceKAttr.getInt();
++      int64_t reductionDim = sourceDimAttr.getInt();
++      if (topK <= 0 ||
++          topK > std::numeric_limits<int32_t>::max() || reductionDim < 0 ||
++          reductionDim >= inputType.getRank()) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "ApproxTopK backend config is out of range");
 +      }
 +      dimAttr = rewriter.getI32IntegerAttr(
 +          static_cast<int32_t>(reductionDim));
-+      kAttr = rewriter.getI32IntegerAttr(
-+          static_cast<int32_t>(valuesType.getDimSize(reductionDim)));
++      kAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(topK));
 +
 +      auto calledComputations = srcOp.getCalledComputations();
 +      if (calledComputations.size() != 1) {
