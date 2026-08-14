@@ -13,6 +13,7 @@ JAX_TEST_DATA = [
 ]
 
 JAX_TEST_DEPS = [
+    "//:jax_plugin",
     requirement("absl-py"),
     requirement("cloudpickle"),
     requirement("filelock"),

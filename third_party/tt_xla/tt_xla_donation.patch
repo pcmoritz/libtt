@@ -1,0 +1,286 @@
+diff --git a/pjrt_implementation/inc/api/executable_image.h b/pjrt_implementation/inc/api/executable_image.h
+--- a/pjrt_implementation/inc/api/executable_image.h
++++ b/pjrt_implementation/inc/api/executable_image.h
+@@ -71,6 +71,16 @@
+   // Returns number of output buffers per device produced by this executable.
+   const size_t getNumOutputs() const { return m_num_outputs; }
+ 
++  // Returns input indices which may alias an output and can therefore be
++  // donated by the caller.
++  const std::vector<size_t> &getDonatableInputIndices() const {
++    return m_donatable_input_indices;
++  }
++
++  void setDonatableInputIndices(std::vector<size_t> &&indices) {
++    m_donatable_input_indices = std::move(indices);
++  }
++
+   // Returns the vector of output data types.
+   std::vector<PJRT_Buffer_Type> &getOutputTypes() { return m_output_types; }
+ 
+@@ -199,6 +209,9 @@
+   // Number of output buffers per device produced by this executable.
+   size_t m_num_outputs;
+ 
++  // Input indices carrying JAX's tf.aliasing_output attribute.
++  std::vector<size_t> m_donatable_input_indices;
++
+   // Holds data type for each output buffer.
+   std::vector<PJRT_Buffer_Type> m_output_types;
+ 
+diff --git a/pjrt_implementation/inc/api/loaded_executable_instance.h b/pjrt_implementation/inc/api/loaded_executable_instance.h
+--- a/pjrt_implementation/inc/api/loaded_executable_instance.h
++++ b/pjrt_implementation/inc/api/loaded_executable_instance.h
+@@ -114,6 +114,15 @@
+       size_t num_devices, PJRT_Buffer **const *output_lists,
+       const std::vector<PJRT_Buffer_Type> &expected_output_data_types);
+ 
++  // Marks successfully consumed, aliased inputs as donated while respecting
++  // the caller's runtime non-donatable list.
++  void deleteDonatedInputBuffers(PJRT_LoadedExecutable_Execute_Args *args);
++
++  // Rejects deleted inputs and calls which use the same buffer in conflicting
++  // donated and non-donated positions.
++  tt_pjrt_status
++  validateInputBuffersForExecution(PJRT_LoadedExecutable_Execute_Args *args);
++
+   // Opens devices on which input arguments are placed, which we assume are the
+   // the devices where computation will run, if their count is equal to the
+   // corresponding devices count in the mesh shape estimated by the compiler.
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -98,6 +98,26 @@
+   return public_func_ops[0].getNumArguments() > 0;
+ }
+ 
++// Collects inputs which JAX marked as candidates for input/output aliasing.
++// The output index is not needed by PJRT here: the runtime produces the
++// output tensor, while this metadata controls whether the consumed input
++// buffer is invalidated after a successful execution.
++static std::vector<size_t> collectDonatableInputIndices(
++    const mlir::OwningOpRef<mlir::ModuleOp> &module) {
++  std::vector<size_t> indices;
++  auto main = (*module).lookupSymbol<mlir::func::FuncOp>("main");
++  if (!main) {
++    return indices;
++  }
++
++  for (size_t i = 0; i < main.getNumArguments(); ++i) {
++    if (main.getArgAttrOfType<mlir::IntegerAttr>(i, "tf.aliasing_output")) {
++      indices.push_back(i);
++    }
++  }
++  return indices;
++}
++
+ // Returns true if any sharding genuinely partitions a tensor across devices
+ // (`MeshShardType::Devices`). Replicate / presharded-replicate shardings do not
+ // count, since they do not require a multi-device mesh.
+@@ -340,6 +360,9 @@
+     return {status, nullptr};
+   }
+ 
++  std::vector<size_t> donatable_input_indices =
++      collectDonatableInputIndices(mlir_module);
++
+   status = runFrontendSHLOPipeline(mlir_module, compile_options.export_path,
+                                    compile_options.export_model_name);
+   if (!tt_pjrt_status_is_ok(status)) {
+@@ -461,22 +484,32 @@
+   std::string executable_name = "tt_executable";
+ 
+   if (compile_options.backend == BackendRuntime::TTNNFlatbuffer) {
+-    return buildModuleForTTNNRuntime(
++    auto result = buildModuleForTTNNRuntime(
+         mlir_module, std::move(original_mlir_code), std::move(ttir_mlir),
+         std::move(ttnn_mlir), std::move(executable_name),
+         std::move(num_arguments), num_devices_result, mesh_shape,
+         input_shardings, output_shardings, output_types,
+         std::move(output_memory_kinds), std::move(output_memory_kinds_sizes),
+         std::move(optimized_mlir_code), std::move(compile_options));
++    if (std::get<1>(result)) {
++      std::get<1>(result)->setDonatableInputIndices(
++          std::move(donatable_input_indices));
++    }
++    return result;
+   } else if (compile_options.backend == BackendRuntime::TTNNCodegenCpp ||
+              compile_options.backend == BackendRuntime::TTNNCodegenPy) {
+-    return buildModuleForTTNNCodegen(
++    auto result = buildModuleForTTNNCodegen(
+         mlir_module, std::move(original_mlir_code), std::move(ttir_mlir),
+         std::move(ttnn_mlir), std::move(executable_name),
+         std::move(num_arguments), num_devices_result, mesh_shape,
+         input_shardings, output_shardings, output_types,
+         std::move(output_memory_kinds), std::move(output_memory_kinds_sizes),
+         std::move(optimized_mlir_code), std::move(compile_options));
++    if (std::get<1>(result)) {
++      std::get<1>(result)->setDonatableInputIndices(
++          std::move(donatable_input_indices));
++    }
++    return result;
+   }
+ 
+   LOG_F(ERROR, "Unsupported backend option");
+diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
+@@ -342,6 +342,92 @@
+   return tt_pjrt_status::kSuccess;
+ }
+ 
++void LoadedExecutableInstance::deleteDonatedInputBuffers(
++    PJRT_LoadedExecutable_Execute_Args *args) {
++  std::unordered_set<size_t> non_donatable_indices;
++  if (args->options &&
++      args->options->struct_size >=
++          PJRT_STRUCT_SIZE(PJRT_ExecuteOptions,
++                           num_non_donatable_input_indices)) {
++    for (size_t i = 0; i < args->options->num_non_donatable_input_indices;
++         ++i) {
++      const int64_t index = args->options->non_donatable_input_indices[i];
++      if (index >= 0) {
++        non_donatable_indices.insert(static_cast<size_t>(index));
++      }
++    }
++  }
++
++  for (size_t input_index :
++       m_executable_image->getDonatableInputIndices()) {
++    if (input_index >= args->num_args ||
++        non_donatable_indices.contains(input_index)) {
++      continue;
++    }
++    for (size_t device_index = 0; device_index < args->num_devices;
++         ++device_index) {
++      BufferInstance::unwrap(
++          args->argument_lists[device_index][input_index])
++          ->deleteData();
++    }
++  }
++}
++
++tt_pjrt_status LoadedExecutableInstance::validateInputBuffersForExecution(
++    PJRT_LoadedExecutable_Execute_Args *args) {
++  const std::vector<size_t> &candidate_indices =
++      m_executable_image->getDonatableInputIndices();
++  if (candidate_indices.empty()) {
++    return tt_pjrt_status::kSuccess;
++  }
++
++  std::unordered_set<size_t> donatable_indices(
++      candidate_indices.begin(), candidate_indices.end());
++  if (args->options &&
++      args->options->struct_size >=
++          PJRT_STRUCT_SIZE(PJRT_ExecuteOptions,
++                           num_non_donatable_input_indices)) {
++    for (size_t i = 0; i < args->options->num_non_donatable_input_indices;
++         ++i) {
++      const int64_t index = args->options->non_donatable_input_indices[i];
++      if (index >= 0) {
++        donatable_indices.erase(static_cast<size_t>(index));
++      }
++    }
++  }
++
++  for (size_t device_index = 0; device_index < args->num_devices;
++       ++device_index) {
++    std::unordered_set<BufferInstance *> used_buffers;
++    std::unordered_set<BufferInstance *> donated_buffers;
++    for (size_t input_index = 0; input_index < args->num_args; ++input_index) {
++      BufferInstance *buffer = BufferInstance::unwrap(
++          args->argument_lists[device_index][input_index]);
++      if (buffer->isDataDeleted()) {
++        LOG_F(ERROR, "Input buffer %zu on device %zu was already deleted",
++              input_index, device_index);
++        return tt_pjrt_status::kInvalidArgument;
++      }
++
++      const bool must_donate = donatable_indices.contains(input_index);
++      const bool already_used = !used_buffers.insert(buffer).second;
++      const bool already_donated = donated_buffers.contains(buffer);
++      if ((must_donate && already_used) || already_donated) {
++        LOG_F(ERROR,
++              "Input buffer %zu on device %zu is used in conflicting "
++              "donated and non-donated positions",
++              input_index, device_index);
++        return tt_pjrt_status::kInvalidArgument;
++      }
++      if (must_donate) {
++        donated_buffers.insert(buffer);
++      }
++    }
++  }
++
++  return tt_pjrt_status::kSuccess;
++}
++
+ mlir::FailureOr<std::unordered_map<std::string, std::string>>
+ LoadedExecutableInstance::fillStrategyMapFromSharding(
+     const mlir::tt::sharding_utils::MeshSharding &meshSharding,
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -179,6 +179,11 @@
+     return tt_pjrt_status::kInternal;
+   }
+ 
++  tt_pjrt_status status = validateInputBuffersForExecution(args);
++  if (!tt_pjrt_status_is_ok(status)) {
++    return status;
++  }
++
+   std::optional<tt::runtime::Device> runtime_device =
+       getOrCreateMeshDevice(args->argument_lists, args->num_args,
+                             args->num_devices, args->execute_device);
+@@ -193,7 +198,7 @@
+ 
+   std::vector<tt::runtime::Tensor> input_tensors;
+   input_tensors.reserve(args->num_args);
+-  tt_pjrt_status status = getInputRuntimeTensors(
++  status = getInputRuntimeTensors(
+       args->argument_lists, args->num_args, args->num_devices, *runtime_device,
+       program_index, input_tensors);
+   if (!tt_pjrt_status_is_ok(status)) {
+@@ -239,6 +244,8 @@
+     }
+   }
+ 
++  deleteDonatedInputBuffers(args);
++
+   if (args->device_complete_events) {
+     for (int device_num = 0; device_num < args->num_devices; ++device_num) {
+       std::unique_ptr<EventInstance> device_complete_event =
+diff --git a/pjrt_implementation/src/api/so_loaded_executable_instance.cc b/pjrt_implementation/src/api/so_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/so_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/so_loaded_executable_instance.cc
+@@ -94,6 +94,11 @@
+     return tt_pjrt_status::kInternal;
+   }
+ 
++  tt_pjrt_status status = validateInputBuffersForExecution(args);
++  if (!tt_pjrt_status_is_ok(status)) {
++    return status;
++  }
++
+   std::optional<tt::runtime::Device> runtime_device =
+       getOrCreateMeshDevice(args->argument_lists, args->num_args,
+                             args->num_devices, args->execute_device);
+@@ -108,7 +113,7 @@
+ 
+   std::vector<tt::runtime::Tensor> input_tensors;
+   input_tensors.reserve(args->num_args);
+-  tt_pjrt_status status = getInputRuntimeTensors(
++  status = getInputRuntimeTensors(
+       args->argument_lists, args->num_args, args->num_devices, *runtime_device,
+       program_index, input_tensors);
+   if (!tt_pjrt_status_is_ok(status)) {
+@@ -162,6 +167,8 @@
+     }
+ #endif
+   }
++  deleteDonatedInputBuffers(args);
++
+   if (args->device_complete_events) {
+     for (int device_num = 0; device_num < args->num_devices; ++device_num) {
+       std::unique_ptr<EventInstance> device_complete_event =

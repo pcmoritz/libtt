@@ -16,9 +16,13 @@ The local code in this repository is intentionally small:
 
 ```bash
 bazel build //:tt
+export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
 The output is `bazel-bin/libtt.so`.
+
+The Python path exposes libtt's lightweight JAX namespace plugin. It enables
+JAX input donation for the `tt` platform before `libtt.so` is loaded.
 
 ## JAX tests
 
@@ -100,7 +104,7 @@ Qwen3-8B server with the TT backend:
 cd "$SGLANG_JAX_DIR"
 
 env -u TT_METAL_RUNTIME_ROOT \
-  PYTHONPATH="$SGLANG_JAX_DIR/python" \
+  PYTHONPATH="$LIBTT_DIR/python:$SGLANG_JAX_DIR/python" \
   PJRT_NAMES_AND_LIBRARY_PATHS="tt:$LIBTT_DIR/bazel-bin/libtt.so" \
   JAX_PLATFORMS=tt \
   JAX_USE_SHARDY_PARTITIONER=false \

@@ -1,4 +1,5 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library")
+load("@rules_python//python:defs.bzl", "py_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -7,6 +8,12 @@ exports_files([
     "bazel/cc_embed_data.h.tpl",
     "bazel/libtt_pjrt_exports.lds",
 ])
+
+py_library(
+    name = "jax_plugin",
+    srcs = ["python/jax_plugins/libtt/__init__.py"],
+    imports = ["python"],
+)
 
 cc_library(
     name = "tt_metal_runtime_root",
