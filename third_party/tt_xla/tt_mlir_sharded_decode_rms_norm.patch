@@ -1,61 +1,22 @@
 diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
 --- a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
 +++ b/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
-@@ -3,10 +3,53 @@
+@@ -3,10 +3,14 @@
  // SPDX-License-Identifier: Apache-2.0
  
  #include "operations/normalization/rms_norm.h"
 +#include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
-+#include "ttnn/operations/data_movement/common/common.hpp"
++#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 +#include "ttnn/operations/normalization/layernorm/device/layernorm_common.hpp"
 +#include <tt-metalium/constants.hpp>
  #include "tt/runtime/detail/ttnn/operations/utils.h"
  #include "tt/runtime/detail/ttnn/utils.h"
  
  namespace tt::runtime::ttnn::operations::rms_norm {
-+namespace {
-+
-+std::optional<::ttnn::MemoryConfig>
-+createDecodeRMSNormShardConfig(const ::ttnn::Tensor &input) {
-+  if (input.is_sharded() || input.layout() != ::ttnn::Layout::TILE ||
-+      input.storage_type() != ::ttnn::StorageType::DEVICE) {
-+    return std::nullopt;
-+  }
-+
-+  constexpr uint32_t kDecodeSequenceLength = 1;
-+  constexpr uint32_t kMinShardWidth = 2048;
-+  const ::ttnn::Shape &shape = input.logical_shape();
-+  if (shape.rank() < 2 || shape[-2] != kDecodeSequenceLength ||
-+      shape[-1] < kMinShardWidth) {
-+    return std::nullopt;
-+  }
-+
-+  constexpr uint32_t kShardGridWidth = 8;
-+  constexpr uint32_t kShardGridHeight = 2;
-+  constexpr uint32_t kShardCores = kShardGridWidth * kShardGridHeight;
-+  const uint32_t width = static_cast<uint32_t>(shape[-1]);
-+  if (width % (kShardCores * tt::constants::TILE_WIDTH) != 0) {
-+    return std::nullopt;
-+  }
-+  const uint32_t shardWidth = width / kShardCores;
-+
-+  const auto grid = ::tt::tt_metal::CoreRangeSet(
-+      {::tt::tt_metal::CoreRange({0, 0},
-+                                  {kShardGridWidth - 1,
-+                                   kShardGridHeight - 1})});
-+  return ::ttnn::operations::data_movement::create_sharded_memory_config(
-+      shape, grid, ::ttnn::operations::data_movement::ShardStrategy::WIDTH,
-+      ::tt::tt_metal::ShardOrientation::ROW_MAJOR,
-+      std::array<uint32_t, 2>{tt::constants::TILE_HEIGHT, shardWidth},
-+      ::ttnn::Layout::TILE);
-+}
-+
-+} // namespace
-+
  void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
    ProgramTensorPool &tensorPool = context.getTensorPool();
  
-@@ -35,14 +78,29 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
+@@ -35,14 +39,59 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  
@@ -67,16 +28,41 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 -      /*program_config=*/std::nullopt,        // Use default
 -      /*compute_kernel_config=*/computeConfig // Use default
 -  );
-+  std::optional<::ttnn::MemoryConfig> shardConfig =
-+      createDecodeRMSNormShardConfig(input);
++  const ::ttnn::Shape &inputShape = input.logical_shape();
++  const uint32_t width =
++      inputShape.rank() < 2 ? 0 : static_cast<uint32_t>(inputShape[-1]);
++  const uint64_t rows = width == 0 ? 0 : input.logical_volume() / width;
++  constexpr uint32_t kShardCores = 16;
++  const bool useShardedRMSNorm =
++      !input.is_sharded() && input.layout() == ::ttnn::Layout::TILE &&
++      input.storage_type() == ::ttnn::StorageType::DEVICE &&
++      inputShape.rank() >= 2 && width >= 2048 && rows > 0 && rows <= 64 &&
++      width % (kShardCores * tt::constants::TILE_WIDTH) == 0;
++  ::ttnn::Shape rmsShape = inputShape;
++  if (useShardedRMSNorm) {
++    rmsShape = ::ttnn::Shape({static_cast<uint32_t>(rows), width});
++  }
++  const bool reshapeRMSNorm = useShardedRMSNorm && inputShape.rank() > 2;
 +  ::ttnn::Tensor rmsInput = input;
 +  std::optional<::ttnn::MemoryConfig> rmsMemoryConfig = memoryConfig;
-+  std::optional<::ttnn::prim::LayerNormProgramConfig> programConfig =
-+      std::nullopt;
++  std::optional<::ttnn::prim::LayerNormProgramConfig> programConfig;
 +
-+  if (shardConfig) {
-+    rmsInput = ::ttnn::to_memory_config(input, *shardConfig);
-+    rmsMemoryConfig = *shardConfig;
++  if (useShardedRMSNorm) {
++    if (reshapeRMSNorm) {
++      rmsInput = ::ttnn::reshape(input, rmsShape,
++                                 input.memory_config());
++    }
++    const auto grid = ::tt::tt_metal::CoreRangeSet(
++        {::tt::tt_metal::CoreRange({0, 0}, {7, 1})});
++    rmsMemoryConfig = ::ttnn::MemoryConfig(
++        ::ttnn::TensorMemoryLayout::WIDTH_SHARDED, ::ttnn::BufferType::L1,
++        ::tt::tt_metal::ShardSpec(
++            grid,
++            {static_cast<uint32_t>(
++                 rmsInput.tensor_spec().physical_shape().height()),
++             width / kShardCores},
++            ::tt::tt_metal::ShardOrientation::ROW_MAJOR));
++    rmsInput = ::ttnn::to_memory_config(rmsInput, *rmsMemoryConfig);
 +    programConfig = ::ttnn::prim::create_layernorm_program_config(
 +        rmsInput.shard_spec(), rmsInput.tensor_spec().tile().get_height(),
 +        rmsInput.tensor_spec().tile().get_width());
@@ -86,9 +72,14 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +      rmsInput, epsilon, weight, bias,
 +      /*residual_input_tensor=*/std::nullopt, rmsMemoryConfig, programConfig,
 +      computeConfig);
-+  if (shardConfig) {
-+    output = ::ttnn::to_memory_config(
-+        output, memoryConfig.value_or(input.memory_config()));
++  if (useShardedRMSNorm) {
++    output = ::ttnn::to_memory_config(output, input.memory_config());
++    if (reshapeRMSNorm) {
++      output = ::ttnn::reshape(output, inputShape, input.memory_config());
++    }
++    if (memoryConfig) {
++      output = ::ttnn::to_memory_config(output, *memoryConfig);
++    }
 +  }
  
    tensorPool.insertTTNNTensorAndValidate(op->out(), output);
