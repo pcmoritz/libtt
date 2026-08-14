@@ -1,0 +1,36 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index 3563a08..d5d7b2c 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9804,10 +9804,15 @@ public:
+     mlir::DictionaryAttr frontendAttributes =
+         mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
+             srcOp->getDiscardableAttr("mhlo.frontend_attributes"));
++    // jax.ffi.ffi_call has no frontend-attribute API. Its five-operand form
++    // is causal paged decode with a current-position tensor.
+     if (!frontendAttributes) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "PagedScaledDotProductAttentionDecode op must have "
+-                 "mhlo.frontend_attributes attribute.");
++      frontendAttributes = rewriter.getDictionaryAttr({
++          rewriter.getNamedAttr("is_causal", rewriter.getStringAttr("True")),
++          rewriter.getNamedAttr("has_attention_mask", rewriter.getStringAttr("False")),
++          rewriter.getNamedAttr("has_cur_pos_tensor", rewriter.getStringAttr("True")),
++          rewriter.getNamedAttr("has_attention_sink", rewriter.getStringAttr("False")),
++      });
+     }
+ 
+     auto isCausalStringAttr =
+@@ -10174,10 +10179,9 @@ public:
+     mlir::DictionaryAttr frontendAttributes =
+         mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
+             srcOp->getDiscardableAttr("mhlo.frontend_attributes"));
++    // Defaults describe the three-operand causal prefill emitted by JAX FFI.
+     if (!frontendAttributes) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "ScaledDotProductAttention op must have "
+-                 "mhlo.frontend_attributes attribute.");
++      frontendAttributes = rewriter.getDictionaryAttr({});
+     }
+ 
+     auto isCausalSringAttr =
