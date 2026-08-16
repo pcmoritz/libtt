@@ -15,18 +15,18 @@ The local code in this repository is intentionally small:
 ## Build
 
 ```bash
-bazel build //:tt
-export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+bazel build //:jax_tt_plugin_wheel
+python -m pip install bazel-bin/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl
 ```
 
-The output is `bazel-bin/libtt.so`.
-
-The Python path exposes libtt's lightweight JAX namespace plugin. It enables
-JAX input donation for the `tt` platform before `libtt.so` is loaded.
+The wheel contains `libtt.so` and libtt's JAX initialization hook. JAX
+discovers the hook automatically, registers the bundled PJRT library, and
+enables input donation for the `tt` platform. No `PYTHONPATH` or
+`PJRT_NAMES_AND_LIBRARY_PATHS` configuration is needed.
 
 ## JAX tests
 
-Run the upstream JAX smoke tests against this checkout's `libtt.so`:
+Run the upstream JAX smoke tests against this checkout's plugin wheel:
 
 ```bash
 bazel test //tests:jax_smoke_tests --test_output=streamed
@@ -78,12 +78,12 @@ Current baseline (August 2026): **3236 failed, 22394 passed, 6538 skipped.**
 
 ## Qwen3 With SGLang-JAX
 
-Build `libtt.so` first:
+Build the plugin wheel first:
 
 ```bash
 cd /path/to/libtt
-bazel build //:tt
-export LIBTT_DIR="$PWD"
+bazel build //:jax_tt_plugin_wheel
+export LIBTT_WHEEL="$PWD/bazel-bin/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl"
 ```
 
 Then check out the SGLang-JAX TT backend branch from
@@ -97,15 +97,15 @@ git fetch origin pull/1/head:codex/qwen3-tt-sglang
 git switch codex/qwen3-tt-sglang
 ```
 
-Install or activate the Python environment for that checkout, then start a
-Qwen3-8B server with the TT backend:
+Install or activate the Python environment for that checkout, install the
+plugin wheel, then start a Qwen3-8B server with the TT backend:
 
 ```bash
 cd "$SGLANG_JAX_DIR"
+.venv/bin/python -m pip install "$LIBTT_WHEEL"
 
 env -u TT_METAL_RUNTIME_ROOT \
-  PYTHONPATH="$LIBTT_DIR/python:$SGLANG_JAX_DIR/python" \
-  PJRT_NAMES_AND_LIBRARY_PATHS="tt:$LIBTT_DIR/bazel-bin/libtt.so" \
+  PYTHONPATH="$SGLANG_JAX_DIR/python" \
   JAX_PLATFORMS=tt \
   JAX_USE_SHARDY_PARTITIONER=false \
   JAX_COMPILATION_CACHE_DIR=/tmp/sglang-jax-qwen3-8b-jax-cache \

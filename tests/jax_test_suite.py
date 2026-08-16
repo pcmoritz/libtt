@@ -5,6 +5,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import zipfile
 
 from python.runfiles import runfiles
 
@@ -22,15 +23,22 @@ def _rlocation(path: str) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jax-tests-anchor", required=True)
-    parser.add_argument("--libtt", required=True)
+    parser.add_argument("--jax-plugin-wheel", required=True)
     parser.add_argument("--skip-device-check", action="store_true")
     args, pytest_args = parser.parse_known_args()
 
-    libtt = _rlocation(args.libtt).resolve(strict=True)
+    plugin_wheel = _rlocation(args.jax_plugin_wheel).resolve(strict=True)
     jax_repo = _rlocation(args.jax_tests_anchor).resolve(strict=True).parent.parent
 
+    # A wheel is a zip archive, but libtt.so must be a real file for dlopen.
+    # Extracting it also exercises the exact artifact users install.
+    plugin_root = Path(os.environ.get("TEST_TMPDIR", "/tmp")) / "jax_tt_plugin"
+    with zipfile.ZipFile(plugin_wheel) as wheel:
+        wheel.extractall(plugin_root)
+    sys.path.insert(0, str(plugin_root))
+
     os.environ.pop("TT_METAL_RUNTIME_ROOT", None)
-    os.environ["PJRT_NAMES_AND_LIBRARY_PATHS"] = f"tt:{libtt}"
+    os.environ.pop("PJRT_NAMES_AND_LIBRARY_PATHS", None)
     # Keep TT as the default while making CPU available to upstream tests that
     # explicitly exercise default-device and cross-backend behavior.
     os.environ["JAX_PLATFORMS"] = "tt,cpu"
@@ -46,7 +54,10 @@ def main() -> int:
         devices = jax.devices("tt")
         if not devices:
             raise RuntimeError("JAX returned no TT devices")
-        print(f"Using JAX {jax.__version__} with {len(devices)} TT device(s)")
+        print(
+            f"Using JAX {jax.__version__} with {len(devices)} TT device(s) "
+            f"from {plugin_wheel.name}"
+        )
 
     import pytest
 

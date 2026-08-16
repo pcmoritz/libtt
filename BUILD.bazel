@@ -1,4 +1,6 @@
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library")
+load("@rules_python//python:packaging.bzl", "py_wheel")
 load("@rules_python//python:defs.bzl", "py_library")
 
 package(default_visibility = ["//visibility:public"])
@@ -66,5 +68,37 @@ filegroup(
     name = "tt",
     srcs = [
         ":tt_shared",
+    ],
+)
+
+# Give the shared library its installed package path before handing it to
+# py_wheel. The symlink avoids copying the large library in the Bazel graph;
+# wheelmaker follows it when it writes the archive.
+copy_file(
+    name = "jax_plugin_shared_library",
+    src = ":tt_shared",
+    out = "python/jax_plugins/libtt/libtt.so",
+    allow_symlink = True,
+)
+
+py_wheel(
+    name = "jax_tt_plugin_wheel",
+    distribution = "jax-tt-plugin",
+    entry_points = {
+        "jax_plugins": ["libtt = jax_plugins.libtt"],
+    },
+    platform = "linux_x86_64",
+    python_requires = ">=3.11",
+    requires = ["jax>=0.7.1"],
+    strip_path_prefixes = ["python"],
+    summary = "JAX PJRT plugin for Tenstorrent devices",
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    version = "0.1.0",
+    deps = [
+        ":jax_plugin",
+        ":jax_plugin_shared_library",
     ],
 )

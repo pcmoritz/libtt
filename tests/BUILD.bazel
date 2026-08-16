@@ -3,17 +3,16 @@ load("@rules_python//python:defs.bzl", "py_test")
 
 JAX_TEST_ARGS = [
     "--jax-tests-anchor=$(rlocationpath @jax_src//:jax_tests_anchor)",
-    "--libtt=$(rlocationpath //:tt)",
+    "--jax-plugin-wheel=$(rlocationpath //:jax_tt_plugin_wheel)",
 ]
 
 JAX_TEST_DATA = [
-    "//:tt",
+    "//:jax_tt_plugin_wheel",
     "@jax_src//:jax_tests",
     "@jax_src//:jax_tests_anchor",
 ]
 
 JAX_TEST_DEPS = [
-    "//:jax_plugin",
     requirement("absl-py"),
     requirement("cloudpickle"),
     requirement("filelock"),
