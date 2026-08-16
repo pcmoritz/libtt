@@ -19,10 +19,7 @@ bazel build //:jax_tt_plugin_wheel
 python -m pip install bazel-bin/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl
 ```
 
-The wheel contains `libtt.so` and libtt's JAX initialization hook. JAX
-discovers the hook automatically, registers the bundled PJRT library, and
-enables input donation for the `tt` platform. No `PYTHONPATH` or
-`PJRT_NAMES_AND_LIBRARY_PATHS` configuration is needed.
+The wheel contains `libtt.so` and libtt's JAX initialization hook.
 
 ## JAX tests
 

@@ -3,8 +3,8 @@ diff --git a/pjrt_implementation/inc/api/executable_image.h b/pjrt_implementatio
 +++ b/pjrt_implementation/inc/api/executable_image.h
 @@ -73,2 +73,12 @@
  
-+  // Returns input indices which may alias an output and can therefore be
-+  // donated by the caller.
++  // Returns inputs JAX marked as donated (tf.aliasing_output); invalidated
++  // after successful execution.
 +  const std::vector<size_t> &getDonatableInputIndices() const {
 +    return m_donatable_input_indices;
 +  }
