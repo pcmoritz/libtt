@@ -62,11 +62,16 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
 diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
-@@ -344,2 +344,73 @@
+@@ -344,2 +344,78 @@
  
 +void LoadedExecutableInstance::invalidateDonatedInputs(
 +    PJRT_LoadedExecutable_Execute_Args *args,
 +    const DonationIndices &donated_indices) {
++  // deleteData() only changes the PJRT-visible state; it does not reset the
++  // PjrtTensor or deallocate device storage. Outputs have already acquired
++  // their own reference-counted runtime tensor handles, so aliased TTNN
++  // storage also remains alive through the output buffer.
++
 +  for (size_t input_index : donated_indices) {
 +    if (input_index >= args->num_args) {
 +      continue;
