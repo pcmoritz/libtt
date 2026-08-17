@@ -332,6 +332,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_compile_option_validation.patch",
         "//third_party/tt_xla:tt_xla_fresh_mlir_context.patch",
         "//third_party/tt_xla:tt_xla_main_entry_function.patch",
+        "//third_party/tt_xla:tt_xla_donation.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
