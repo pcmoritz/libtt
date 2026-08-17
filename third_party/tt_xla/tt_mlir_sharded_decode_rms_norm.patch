@@ -16,7 +16,7 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
  void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
    ProgramTensorPool &tensorPool = context.getTensorPool();
  
-@@ -35,14 +39,59 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
+@@ -35,14 +39,57 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  
@@ -29,43 +29,41 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 -      /*compute_kernel_config=*/computeConfig // Use default
 -  );
 +  const ::ttnn::Shape &inputShape = input.logical_shape();
-+  const uint32_t width =
-+      inputShape.rank() < 2 ? 0 : static_cast<uint32_t>(inputShape[-1]);
-+  const uint64_t rows = width == 0 ? 0 : input.logical_volume() / width;
-+  constexpr uint32_t kShardCores = 16;
-+  const bool useShardedRMSNorm =
-+      !input.is_sharded() && input.layout() == ::ttnn::Layout::TILE &&
-+      input.storage_type() == ::ttnn::StorageType::DEVICE &&
-+      inputShape.rank() >= 2 && width >= 2048 && rows > 0 && rows <= 64 &&
-+      width % (kShardCores * tt::constants::TILE_WIDTH) == 0;
-+  ::ttnn::Shape rmsShape = inputShape;
-+  if (useShardedRMSNorm) {
-+    rmsShape = ::ttnn::Shape({static_cast<uint32_t>(rows), width});
-+  }
-+  const bool reshapeRMSNorm = useShardedRMSNorm && inputShape.rank() > 2;
 +  ::ttnn::Tensor rmsInput = input;
 +  std::optional<::ttnn::MemoryConfig> rmsMemoryConfig = memoryConfig;
 +  std::optional<::ttnn::prim::LayerNormProgramConfig> programConfig;
++  bool useShardedRMSNorm = false;
 +
-+  if (useShardedRMSNorm) {
-+    if (reshapeRMSNorm) {
-+      rmsInput = ::ttnn::reshape(input, rmsShape,
-+                                 input.memory_config());
++  if (inputShape.rank() >= 2) {
++    const uint32_t width = static_cast<uint32_t>(inputShape[-1]);
++    const uint64_t rows = input.logical_volume() / width;
++    constexpr uint32_t kShardCores = 16;
++    useShardedRMSNorm =
++        !input.is_sharded() && input.layout() == ::ttnn::Layout::TILE &&
++        input.storage_type() == ::ttnn::StorageType::DEVICE &&
++        width >= 2048 && rows <= 64 &&
++        width % (kShardCores * tt::constants::TILE_WIDTH) == 0;
++    if (useShardedRMSNorm) {
++      if (inputShape.rank() > 2) {
++        rmsInput = ::ttnn::reshape(
++            input, ::ttnn::Shape({static_cast<uint32_t>(rows), width}),
++            input.memory_config());
++      }
++      const auto grid = ::tt::tt_metal::CoreRangeSet(
++          {::tt::tt_metal::CoreRange({0, 0}, {7, 1})});
++      rmsMemoryConfig = ::ttnn::MemoryConfig(
++          ::ttnn::TensorMemoryLayout::WIDTH_SHARDED, ::ttnn::BufferType::L1,
++          ::tt::tt_metal::ShardSpec(
++              grid,
++              {static_cast<uint32_t>(
++                   rmsInput.tensor_spec().physical_shape().height()),
++               width / kShardCores},
++              ::tt::tt_metal::ShardOrientation::ROW_MAJOR));
++      rmsInput = ::ttnn::to_memory_config(rmsInput, *rmsMemoryConfig);
++      programConfig = ::ttnn::prim::create_layernorm_program_config(
++          rmsInput.shard_spec(), rmsInput.tensor_spec().tile().get_height(),
++          rmsInput.tensor_spec().tile().get_width());
 +    }
-+    const auto grid = ::tt::tt_metal::CoreRangeSet(
-+        {::tt::tt_metal::CoreRange({0, 0}, {7, 1})});
-+    rmsMemoryConfig = ::ttnn::MemoryConfig(
-+        ::ttnn::TensorMemoryLayout::WIDTH_SHARDED, ::ttnn::BufferType::L1,
-+        ::tt::tt_metal::ShardSpec(
-+            grid,
-+            {static_cast<uint32_t>(
-+                 rmsInput.tensor_spec().physical_shape().height()),
-+             width / kShardCores},
-+            ::tt::tt_metal::ShardOrientation::ROW_MAJOR));
-+    rmsInput = ::ttnn::to_memory_config(rmsInput, *rmsMemoryConfig);
-+    programConfig = ::ttnn::prim::create_layernorm_program_config(
-+        rmsInput.shard_spec(), rmsInput.tensor_spec().tile().get_height(),
-+        rmsInput.tensor_spec().tile().get_width());
 +  }
 +
 +  ::ttnn::Tensor output = ::ttnn::rms_norm(
@@ -74,7 +72,7 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +      computeConfig);
 +  if (useShardedRMSNorm) {
 +    const auto outMemCfg = memoryConfig.value_or(input.memory_config());
-+    if (reshapeRMSNorm) {
++    if (inputShape.rank() > 2) {
 +      output = ::ttnn::to_memory_config(output, input.memory_config());
 +      output = ::ttnn::reshape(output, inputShape, outMemCfg);
 +    } else {
