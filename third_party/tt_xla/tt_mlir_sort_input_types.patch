@@ -1,9 +1,7 @@
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -957,21 +957,19 @@ TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(
- // tt-metal generates indices of type UInt16 or UInt32 depending on padded size.
- // Any mismatch between generated and expected data type will cause runtime to
+@@ -946,4 +946,7 @@ TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(
  // assert. Issue page: https://github.com/tenstorrent/tt-mlir/issues/4405
 -// tt-metal also only supports BFloat16 or UInt16 for input tensors, not
 -// Float32. Issue page: https://github.com/tenstorrent/tt-metal/issues/37322
@@ -13,7 +11,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 +// keys untouched: tt-metal has no exact 32-bit integer sort path, and silently
 +// rounding them through Float32 can change their order.
  TTNNOperandsWorkarounds
- TTNNOperandsWorkaroundsFactory::createSortOpOperandsWorkarounds(
+@@ -951,13 +954,8 @@ TTNNOperandsWorkaroundsFactory::createSortOpOperandsWorkarounds(
      ttnn::SortOp op) {
 -  // Check input tensor type - tt-metal only supports BFloat16 or UInt16
    auto inputElementType = op.getInput().getType().getElementType();
@@ -31,5 +29,3 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 +    inputOutputWorkaround.tensorDataTypeWorkaround =
 +        ttcore::DataType::Float32;
    }
-
-   // Check output indices type - tt-metal generates UInt16 or UInt32 based on

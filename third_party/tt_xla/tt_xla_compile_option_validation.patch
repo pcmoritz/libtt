@@ -1,79 +1,53 @@
 diff --git a/pjrt_implementation/inc/api/compile_options.h b/pjrt_implementation/inc/api/compile_options.h
 --- a/pjrt_implementation/inc/api/compile_options.h
 +++ b/pjrt_implementation/inc/api/compile_options.h
-@@ -159,6 +159,10 @@ struct CompileOptions {
-
-   static CompileOptions
+@@ -180,2 +180,6 @@ struct CompileOptions {
    parse(const std::unordered_map<std::string, std::string> &compile_options);
 +
 +  // Returns an error message when a compile option is unknown or malformed.
 +  static std::optional<std::string>
 +  validate(const std::unordered_map<std::string, std::string> &compile_options);
  };
-
- namespace internal {
 diff --git a/pjrt_implementation/inc/api/error_instance.h b/pjrt_implementation/inc/api/error_instance.h
 --- a/pjrt_implementation/inc/api/error_instance.h
 +++ b/pjrt_implementation/inc/api/error_instance.h
-@@ -30,6 +30,10 @@ public:
-   // Creates new error instance.
-   static std::unique_ptr<ErrorInstance> makeError(tt_pjrt_status status);
-
+@@ -32,2 +32,6 @@ public:
+ 
 +  // Creates new error instance with a descriptive message.
 +  static std::unique_ptr<ErrorInstance> makeError(tt_pjrt_status status,
 +                                                  std::string message);
 +
    // Binds PJRT API functions implementation related to PJRT_Error structure.
-   static void bindApi(PJRT_Api *api);
-
-@@ -51,6 +55,9 @@ private:
-   // Constructs error instance from the given status.
-   ErrorInstance(tt_pjrt_status status);
-
+@@ -53,2 +57,5 @@ private:
+ 
 +  // Constructs error instance from the given status and message.
 +  ErrorInstance(tt_pjrt_status status, std::string message);
 +
    // Error status.
-   const tt_pjrt_status m_status;
-
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -30,6 +30,7 @@
-
- // tt-xla includes
+@@ -33,2 +33,3 @@
  #include "api/buffer_instance.h"
 +#include "api/compile_options.h"
  #include "api/compile_options_parser.h"
- #include "api/error_instance.h"
- #include "api/event_instance.h"
-@@ -843,6 +844,11 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
-   if (!tt_pjrt_status_is_ok(compile_options_status)) {
-     return *ErrorInstance::makeError(compile_options_status).release();
+@@ -863,2 +864,7 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
    }
 +  if (auto validation_error = CompileOptions::validate(compile_options_map)) {
 +    return *ErrorInstance::makeError(tt_pjrt_status::kInvalidArgument,
 +                                     std::move(*validation_error))
 +                .release();
 +  }
-
-   std::string_view program_format(args->program->format,
-                                   args->program->format_size);
+ 
 diff --git a/pjrt_implementation/src/api/compile_options.cc b/pjrt_implementation/src/api/compile_options.cc
 --- a/pjrt_implementation/src/api/compile_options.cc
 +++ b/pjrt_implementation/src/api/compile_options.cc
-@@ -10,6 +10,7 @@
- #include <filesystem>
- #include <string>
+@@ -12,2 +12,3 @@
  #include <unordered_map>
 +#include <unordered_set>
-
- namespace tt::pjrt {
-
-@@ -115,6 +116,52 @@ CompileOptions CompileOptions::parse(
-   return options;
- }
-
+ 
+@@ -143,2 +144,48 @@ CompileOptions CompileOptions::parse(
+ 
 +std::optional<std::string> CompileOptions::validate(
 +    const std::unordered_map<std::string, std::string> &compile_options) {
 +  static const std::unordered_set<std::string> supported_options = {
@@ -121,25 +95,17 @@ diff --git a/pjrt_implementation/src/api/compile_options.cc b/pjrt_implementatio
 +}
 +
  namespace internal {
-
- std::optional<bool> parseBoolOption(
 diff --git a/pjrt_implementation/src/api/error_instance.cc b/pjrt_implementation/src/api/error_instance.cc
 --- a/pjrt_implementation/src/api/error_instance.cc
 +++ b/pjrt_implementation/src/api/error_instance.cc
-@@ -10,6 +10,9 @@
-
- #include "api/error_instance.h"
-
+@@ -12,2 +12,5 @@
+ 
 +// c++ standard library includes
 +#include <utility>
 +
  // tt-xla includes
- #include "utils/logging.h"
-
-@@ -27,6 +30,20 @@ std::unique_ptr<ErrorInstance> ErrorInstance::makeError(tt_pjrt_status status) {
-   return std::make_unique<make_unique_enabler>(status);
- }
-
+@@ -29,2 +32,16 @@ std::unique_ptr<ErrorInstance> ErrorInstance::makeError(tt_pjrt_status status) {
+ 
 +std::unique_ptr<ErrorInstance>
 +ErrorInstance::makeError(tt_pjrt_status status, std::string message) {
 +  if (tt_pjrt_status_is_ok(status)) {
@@ -155,15 +121,9 @@ diff --git a/pjrt_implementation/src/api/error_instance.cc b/pjrt_implementation
 +}
 +
  ErrorInstance::ErrorInstance(tt_pjrt_status status)
-     : m_status(status),
-       m_message(
-@@ -34,6 +51,9 @@ ErrorInstance::ErrorInstance(tt_pjrt_status status)
-               ? "OK"
-               : ("Error code: " + std::to_string(static_cast<int>(status)))) {}
-
+@@ -36,2 +53,5 @@ ErrorInstance::ErrorInstance(tt_pjrt_status status)
+ 
 +ErrorInstance::ErrorInstance(tt_pjrt_status status, std::string message)
 +    : m_status(status), m_message(std::move(message)) {}
 +
  void ErrorInstance::bindApi(PJRT_Api *api) {
-   api->PJRT_Error_Destroy = internal::onErrorDestroy;
-   api->PJRT_Error_Message = internal::onErrorMessage;

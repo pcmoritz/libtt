@@ -1,30 +1,22 @@
 diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation/inc/api/buffer_instance.h
 --- a/pjrt_implementation/inc/api/buffer_instance.h
 +++ b/pjrt_implementation/inc/api/buffer_instance.h
-@@ -299,5 +299,9 @@ PJRT_Error *
- onBufferDynamicDimensionIndices(PJRT_Buffer_DynamicDimensionIndices_Args *args);
+@@ -300,2 +300,6 @@ onBufferDynamicDimensionIndices(PJRT_Buffer_DynamicDimensionIndices_Args *args);
  
 +// Implements PJRT_Buffer_OnDeviceSizeInBytes API function.
 +PJRT_Error *
 +onBufferOnDeviceSizeInBytes(PJRT_Buffer_OnDeviceSizeInBytes_Args *args);
 +
  // Implements PJRT_Buffer_ToHostBuffer API function.
- PJRT_Error *onBufferToHostBuffer(PJRT_Buffer_ToHostBuffer_Args *args);
- 
 diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
 --- a/pjrt_implementation/src/api/buffer_instance.cc
 +++ b/pjrt_implementation/src/api/buffer_instance.cc
-@@ -107,5 +107,7 @@ void BufferInstance::bindApi(PJRT_Api *api) {
-   api->PJRT_Buffer_DynamicDimensionIndices =
+@@ -107,2 +107,4 @@ void BufferInstance::bindApi(PJRT_Api *api) {
        internal::onBufferDynamicDimensionIndices;
 +  api->PJRT_Buffer_OnDeviceSizeInBytes =
 +      internal::onBufferOnDeviceSizeInBytes;
    api->PJRT_Buffer_ToHostBuffer = internal::onBufferToHostBuffer;
-   api->PJRT_Buffer_Delete = internal::onBufferDelete;
-   api->PJRT_Buffer_IsDeleted = internal::onBufferIsDeleted;
-@@ -607,6 +609,17 @@ onBufferDynamicDimensionIndices(
-   return nullptr;
- }
+@@ -605,2 +607,13 @@ PJRT_Error *onBufferDynamicDimensionIndices(
  
 +PJRT_Error *
 +onBufferOnDeviceSizeInBytes(PJRT_Buffer_OnDeviceSizeInBytes_Args *args) {
@@ -38,5 +30,3 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 +}
 +
  PJRT_Error *onBufferToHostBuffer(PJRT_Buffer_ToHostBuffer_Args *args) {
-   ZoneScoped;
-   DLOG_F(LOG_DEBUG, "BufferInstance::PJRT_Buffer_ToHostBuffer");

@@ -1,8 +1,7 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -267,6 +267,17 @@
-       return legalityResult;
-     }
+@@ -269,2 +269,13 @@ public:
  
 +    if (srcOp.getInputs().size() > 1) {
 +      if (isArgMax(srcOp, adaptor, rewriter)) {
@@ -16,11 +15,7 @@
 +    }
 +
      const mlir::Operation &innerOp = srcOp.getBody().front().front();
- 
-     if (mlir::isa<mlir::stablehlo::AddOp>(innerOp)) {
-@@ -293,14 +304,6 @@
-       return matchAndRewriteInternal<mlir::tt::ttir::ReduceOrOp>(srcOp, adaptor,
-                                                                  rewriter);
+@@ -295,10 +306,2 @@ public:
      }
 -    if (isArgMax(srcOp, adaptor, rewriter)) {
 -      return matchAndRewriteInternalArgMax(
@@ -31,11 +26,7 @@
 -    }
 -
      return failure();
-   }
- 
-@@ -309,13 +312,6 @@
-   checkConversionLegality(mlir::stablehlo::ReduceOp &srcOp,
-                           mlir::stablehlo::ReduceOp::Adaptor adaptor,
+@@ -311,9 +314,2 @@ private:
                            ConversionPatternRewriter &rewriter) const {
 -    if (srcOp.getInputs().size() != 1 &&
 -        !isArgMax(srcOp, adaptor, rewriter) &&
@@ -45,11 +36,7 @@
 -    }
 -
      if (!srcOp.getBody().hasOneBlock()) {
-       return rewriter.notifyMatchFailure(
-           srcOp,
-@@ -371,6 +367,79 @@
-     return success();
-   }
+@@ -373,2 +369,75 @@ private:
  
 +  template <typename ReductionOp, typename CombineOp>
 +  mlir::Value createReductionWithInit(
@@ -125,5 +112,3 @@
 +  }
 +
    LogicalResult
-   matchAndRewriteInternalArgMax(
-       mlir::stablehlo::ReduceOp &srcOp, mlir::Value input,

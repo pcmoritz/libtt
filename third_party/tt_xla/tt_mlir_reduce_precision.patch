@@ -1,12 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10076,8 +10076,56 @@ public:
-     rewriter.replaceOp(srcOp, roundedInput.getResult());
-     return success();
-   }
- };
- } // namespace
+@@ -10871,2 +10871,50 @@ public:
  
 +namespace {
 +class StableHLOToTTIRReducePrecisionOpConversionPattern
@@ -57,8 +52,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +} // namespace
 +
  static void
- addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
-@@ -10180,2 +10236,4 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+@@ -10922,2 +10970,4 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
    patterns.add<StableHLOToTTIROpRoundOpConversionPattern>(typeConverter, ctx);
 +  patterns.add<StableHLOToTTIRReducePrecisionOpConversionPattern>(
 +      typeConverter, ctx);

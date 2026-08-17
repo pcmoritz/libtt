@@ -1,145 +1,137 @@
-diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
---- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
-@@ -499,5 +499,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
-                     fmt::format("lt_int_tile<DataFormat::{}>", *int_data_format)};
-             }
-+            if (dtype == DataType::FLOAT16) {
-+                return {"lt_binary_tile_init();", "lt_binary_tile_float16"};
-+            }
-             return {"lt_binary_tile_init();", "lt_binary_tile"};
-         case GT:
-             if (int_data_format) {
-@@ -506,5 +509,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
-                     fmt::format("gt_int_tile<DataFormat::{}>", *int_data_format)};
-             }
-+            if (dtype == DataType::FLOAT16) {
-+                return {"gt_binary_tile_init();", "gt_binary_tile_float16"};
-+            }
-             return {"gt_binary_tile_init();", "gt_binary_tile"};
-         case GE:
-             if (int_data_format) {
-@@ -513,5 +519,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
-                     fmt::format("ge_int_tile<DataFormat::{}>", *int_data_format)};
-             }
-+            if (dtype == DataType::FLOAT16) {
-+                return {"ge_binary_tile_init();", "ge_binary_tile_float16"};
-+            }
-             return {"ge_binary_tile_init();", "ge_binary_tile"};
-         case LE:
-             if (int_data_format) {
-@@ -520,5 +529,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
-                     fmt::format("le_int_tile<DataFormat::{}>", *int_data_format)};
-             }
-+            if (dtype == DataType::FLOAT16) {
-+                return {"le_binary_tile_init();", "le_binary_tile_float16"};
-+            }
-             return {"le_binary_tile_init();", "le_binary_tile"};
-         case EQ:
-             if (int_data_format) {
-@@ -527,5 +539,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
-                     fmt::format("eq_int_tile<DataFormat::{}>", *int_data_format)};
-             }
-+            if (dtype == DataType::FLOAT16) {
-+                return {"eq_binary_tile_init();", "eq_binary_tile_float16"};
-+            }
-             return {"eq_binary_tile_init();", "eq_binary_tile"};
-         case NE:
-             if (int_data_format) {
-@@ -534,5 +549,8 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
-                     fmt::format("ne_int_tile<DataFormat::{}>", *int_data_format)};
-             }
-+            if (dtype == DataType::FLOAT16) {
-+                return {"ne_binary_tile_init();", "ne_binary_tile_float16"};
-+            }
-             return {"ne_binary_tile_init();", "ne_binary_tile"};
-         case WHERE: {
-             const char* data_format = (dtype == DataType::INT32)     ? "Int32"
-diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
---- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -863,8 +863,16 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
-     const auto c_dtype = c.dtype();
-+    const bool is_fp16_comparison =
-+        is_sfpu_op && a_dtype == DataType::FLOAT16 && b_dtype == DataType::FLOAT16 &&
-+        (operation_attributes.binary_op_type == BinaryOpType::EQ ||
-+         operation_attributes.binary_op_type == BinaryOpType::NE ||
-+         operation_attributes.binary_op_type == BinaryOpType::LT ||
-+         operation_attributes.binary_op_type == BinaryOpType::GT ||
-+         operation_attributes.binary_op_type == BinaryOpType::LE ||
-+         operation_attributes.binary_op_type == BinaryOpType::GE);
-     const auto a_data_format = datatype_to_dataformat_converter(a_dtype);
-     const auto b_data_format = datatype_to_dataformat_converter(b_dtype);
-     const auto c_data_format = datatype_to_dataformat_converter(c_dtype);
+diff --git a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h b/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
+--- a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
++++ b/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
+@@ -183,2 +183,61 @@ inline void calculate_binary_comp_fp32(const uint dst_index_in0, const uint dst_
  
-     uint32_t a_single_tile_size = tt::tile_size(a_data_format);
-     uint32_t b_single_tile_size = tt::tile_size(b_data_format);
-     uint32_t c_single_tile_size = tt::tile_size(c_data_format);
-@@ -1173,8 +1181,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
-     // loading fp32 tiles into a DST configured for bf16 produces tile-aligned corruption
-     // for broadcast multiply (issue 43196).
-     bool fp32_dest_acc_en = c_data_format == tt::DataFormat::UInt32 || c_data_format == tt::DataFormat::Int32 ||
--                            a_data_format == tt::DataFormat::Float16 ||
--                            b_data_format == tt::DataFormat::Float16 || c_data_format == tt::DataFormat::Float16 ||
-+                            (!is_fp16_comparison &&
-+                             (a_data_format == tt::DataFormat::Float16 || b_data_format == tt::DataFormat::Float16 ||
-+                              c_data_format == tt::DataFormat::Float16)) ||
-                             c_data_format == tt::DataFormat::Float32 || a_data_format == tt::DataFormat::Float32 ||
-                             b_data_format == tt::DataFormat::Float32 ||
-                             (a_data_format == tt::DataFormat::Int32 && b_data_format == tt::DataFormat::Int32) ||
-@@ -1192,7 +1201,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
++// Native Float16 comparisons stay in SFPU. Per-operand magnitude checks reject
++// NaNs without overflowing on large finite values; combined magnitude bits
++// preserve signed-zero semantics without an FP16 add.
++template <bool APPROXIMATION_MODE, int ITERATIONS, SfpuType RELATIONAL_OP>
++inline void calculate_binary_comp_fp16(
++    const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
++    static_assert(is_fp32_compare_v<RELATIONAL_OP>, "Supported operation types: eq, ne, lt, gt, le, ge");
++
++    constexpr uint dst_tile_size_sfpi = 32;
++    const sfpi::vUInt infinity_bits = sfpi::as<sfpi::vUInt>(sfpi::vFloat(sfpi::sFloat16b(0x7f80)));
++
++#pragma GCC unroll 8
++    for (int d = 0; d < ITERATIONS; d++) {
++        const sfpi::vFloat a = sfpi::dst_reg[dst_index_in0 * dst_tile_size_sfpi];
++        const sfpi::vFloat b = sfpi::dst_reg[dst_index_in1 * dst_tile_size_sfpi];
++        const sfpi::vFloat abs_a = sfpi::abs(a);
++        const sfpi::vFloat abs_b = sfpi::abs(b);
++        const sfpi::vUInt abs_a_bits = sfpi::as<sfpi::vUInt>(abs_a);
++        const sfpi::vUInt abs_b_bits = sfpi::as<sfpi::vUInt>(abs_b);
++        const sfpi::vUInt magnitude_bits = abs_a_bits | abs_b_bits;
++
++        sfpi::vFloat result = RELATIONAL_OP == SfpuType::ne ? 1.0f : 0.0f;
++        if constexpr (RELATIONAL_OP == SfpuType::eq || RELATIONAL_OP == SfpuType::ne) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a == b))) {
++                result = RELATIONAL_OP == SfpuType::eq ? 1.0f : 0.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::lt) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
++                 (a < b)) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::gt) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
++                 (a > b)) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::le) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a <= b))) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::ge) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a >= b))) {
++                result = 1.0f;
++            }
++            v_endif;
++        }
++
++        sfpi::dst_reg[dst_index_out * dst_tile_size_sfpi] = result;
++        sfpi::dst_reg++;
++    }
++}
++
+ // Int32 relational comparisons. Normalize to LT(a, b) or GE(a, b):
+diff --git a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h b/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
+--- a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
++++ b/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
+@@ -187,2 +187,61 @@ inline void calculate_binary_comp_fp32(const uint dst_index_in0, const uint dst_
  
-     std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
- 
--    if (is_sfpu_op) {
-+    if (is_sfpu_op && !is_fp16_comparison) {
-         if (op_type != BinaryOpType::POWER) {
-             unpack_to_dest_mode[src0_cb_index] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
-             unpack_to_dest_mode[src1_cb_index] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
-diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
---- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-@@ -18,5 +18,6 @@ namespace ttnn::operations::binary_ng {
- namespace utils {
--bool is_binary_sfpu_op(BinaryOpType val, DataType a, DataType b, bool fast_and_approximate_mode = false) {
-+bool is_binary_sfpu_op(
-+    BinaryOpType val, DataType a, DataType b, DataType output, bool fast_and_approximate_mode = false) {
-     using enum BinaryOpType;
-     using enum DataType;
-     switch (val) {
-@@ -42,4 +43,7 @@ bool is_binary_sfpu_op(BinaryOpType val, DataType a, DataType b, bool fast_and_ap
-         case GE:
--        case LE: return a == b && (a == FLOAT32 || a == BFLOAT16 || a == INT32 || a == UINT16 || a == UINT32);
-+        case LE:
-+            return a == b &&
-+                   (a == FLOAT32 || a == BFLOAT16 || a == FLOAT16 || a == INT32 || a == UINT16 || a == UINT32) &&
-+                   (a != FLOAT16 || (output != FLOAT32 && output != INT32 && output != UINT32));
-         case LCM:
-         case GCD: return (a == INT32 && b == INT32);
-@@ -597,7 +601,8 @@ ttnn::operations::binary_ng::BinaryNgDeviceOperation::tensor_return_value_t bina
-     DataType dtype_a = input_tensor_a.dtype();
-     DataType dtype_b = input_tensor_b.dtype();
-+    DataType dtype_c = output_tensor.has_value() ? output_tensor->dtype() : output_dtype.value_or(dtype_a);
-     bool is_sfpu_op = (ttnn::operations::binary_ng::utils::is_binary_sfpu_op(
--        binary_op_type, dtype_a, dtype_b, fast_and_approximate_mode.value_or(false)));
-+        binary_op_type, dtype_a, dtype_b, dtype_c, fast_and_approximate_mode.value_or(false)));
-     bool is_quant_op = ttnn::operations::binary::utils::is_quant_op(binary_op_type);
-     bool is_where_op =
-         (binary_op_type == ttnn::operations::binary_ng::BinaryOpType::WHERE_TTS ||
-@@ -730,6 +735,7 @@ ttnn::operations::binary_ng::BinaryNgDeviceOperation::tensor_return_value_t bina
-     DataType dtype_a = input_tensor_a.dtype();
-+    DataType dtype_c = output_tensor.has_value() ? output_tensor->dtype() : output_dtype.value_or(dtype_a);
-     bool is_sfpu_op = (ttnn::operations::binary_ng::utils::is_binary_sfpu_op(
--        binary_op_type, dtype_a, dtype_a, fast_and_approximate_mode.value_or(false)));
-+        binary_op_type, dtype_a, dtype_a, dtype_c, fast_and_approximate_mode.value_or(false)));
-     bool is_quant_op = ttnn::operations::binary::utils::is_quant_op(binary_op_type);
-     MemoryConfig mem_config_actual = memory_config.value_or(
-         output_tensor.has_value() ? output_tensor->memory_config() : input_tensor_a.memory_config());
++// Native Float16 comparisons stay in SFPU. Per-operand magnitude checks reject
++// NaNs without overflowing on large finite values; combined magnitude bits
++// preserve signed-zero semantics without an FP16 add.
++template <bool APPROXIMATION_MODE, int ITERATIONS, SfpuType RELATIONAL_OP>
++inline void calculate_binary_comp_fp16(
++    const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
++    static_assert(is_fp32_compare_v<RELATIONAL_OP>, "Supported operation types: eq, ne, lt, gt, le, ge");
++
++    constexpr uint dst_tile_size_sfpi = 32;
++    const sfpi::vUInt infinity_bits = sfpi::as<sfpi::vUInt>(sfpi::vFloat(sfpi::sFloat16b(0x7f80)));
++
++#pragma GCC unroll 8
++    for (int d = 0; d < ITERATIONS; d++) {
++        const sfpi::vFloat a = sfpi::dst_reg[dst_index_in0 * dst_tile_size_sfpi];
++        const sfpi::vFloat b = sfpi::dst_reg[dst_index_in1 * dst_tile_size_sfpi];
++        const sfpi::vFloat abs_a = sfpi::abs(a);
++        const sfpi::vFloat abs_b = sfpi::abs(b);
++        const sfpi::vUInt abs_a_bits = sfpi::as<sfpi::vUInt>(abs_a);
++        const sfpi::vUInt abs_b_bits = sfpi::as<sfpi::vUInt>(abs_b);
++        const sfpi::vUInt magnitude_bits = abs_a_bits | abs_b_bits;
++
++        sfpi::vFloat result = RELATIONAL_OP == SfpuType::ne ? 1.0f : 0.0f;
++        if constexpr (RELATIONAL_OP == SfpuType::eq || RELATIONAL_OP == SfpuType::ne) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a == b))) {
++                result = RELATIONAL_OP == SfpuType::eq ? 1.0f : 0.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::lt) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
++                 (a < b)) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::gt) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
++                 (a > b)) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::le) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a <= b))) {
++                result = 1.0f;
++            }
++            v_endif;
++        } else if constexpr (RELATIONAL_OP == SfpuType::ge) {
++            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
++                 ((magnitude_bits == 0U) || (a >= b))) {
++                result = 1.0f;
++            }
++            v_endif;
++        }
++
++        sfpi::dst_reg[dst_index_out * dst_tile_size_sfpi] = result;
++        sfpi::dst_reg++;
++    }
++}
++
+ // Int32 relational comparisons. Normalize to LT(a, b) or GE(a, b):
 diff --git a/tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h b/tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h
---- tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h
-+++ tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h
-@@ -226,5 +226,77 @@ ALWI void ge_binary_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
-         VectorMode::RC)));
+--- a/tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h
++++ b/tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h
+@@ -232,2 +232,74 @@ ALWI void ge_binary_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
  }
 +
 +ALWI void eq_binary_tile_float16(uint32_t idst0, uint32_t idst1, uint32_t odst) {
@@ -214,143 +206,100 @@ diff --git a/tt_metal/hw/inc/api/compute/eltwise_binary_sfpu.h b/tt_metal/hw/inc
 +        VectorMode::RC)));
 +}
  #endif
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+--- a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
++++ b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+@@ -18,3 +18,4 @@ namespace ttnn::operations::binary_ng {
+ namespace utils {
+-bool is_binary_sfpu_op(BinaryOpType val, DataType a, DataType b, bool fast_and_approximate_mode = false) {
++bool is_binary_sfpu_op(
++    BinaryOpType val, DataType a, DataType b, DataType output, bool fast_and_approximate_mode = false) {
+     using enum BinaryOpType;
+@@ -44,3 +45,6 @@ bool is_binary_sfpu_op(BinaryOpType val, DataType a, DataType b, bool fast_and_a
+         case GE:
+-        case LE: return a == b && (a == FLOAT32 || a == BFLOAT16 || a == INT32 || a == UINT16 || a == UINT32);
++        case LE:
++            return a == b &&
++                   (a == FLOAT32 || a == BFLOAT16 || a == FLOAT16 || a == INT32 || a == UINT16 || a == UINT32) &&
++                   (a != FLOAT16 || (output != FLOAT32 && output != INT32 && output != UINT32));
+         case LCM:
+@@ -553,4 +557,5 @@ ttnn::operations::binary_ng::BinaryNgDeviceOperation::tensor_return_value_t bina
+     DataType dtype_b = input_tensor_b.dtype();
++    DataType dtype_c = output_tensor.has_value() ? output_tensor->dtype() : output_dtype.value_or(dtype_a);
+     bool is_sfpu_op = (ttnn::operations::binary_ng::utils::is_binary_sfpu_op(
+-        binary_op_type, dtype_a, dtype_b, fast_and_approximate_mode.value_or(false)));
++        binary_op_type, dtype_a, dtype_b, dtype_c, fast_and_approximate_mode.value_or(false)));
+     bool is_quant_op = ttnn::operations::binary::utils::is_quant_op(binary_op_type);
+@@ -700,4 +705,5 @@ ttnn::operations::binary_ng::BinaryNgDeviceOperation::tensor_return_value_t bina
+     DataType dtype_a = input_tensor_a.dtype();
++    DataType dtype_c = output_tensor.has_value() ? output_tensor->dtype() : output_dtype.value_or(dtype_a);
+     bool is_sfpu_op = (ttnn::operations::binary_ng::utils::is_binary_sfpu_op(
+-        binary_op_type, dtype_a, dtype_a, fast_and_approximate_mode.value_or(false)));
++        binary_op_type, dtype_a, dtype_a, dtype_c, fast_and_approximate_mode.value_or(false)));
+     bool is_quant_op = ttnn::operations::binary::utils::is_quant_op(binary_op_type);
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+--- a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
++++ b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+@@ -871,2 +871,10 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+     const auto c_dtype = c.dtype();
++    const bool is_fp16_comparison =
++        is_sfpu_op && a_dtype == DataType::FLOAT16 && b_dtype == DataType::FLOAT16 &&
++        (operation_attributes.binary_op_type == BinaryOpType::EQ ||
++         operation_attributes.binary_op_type == BinaryOpType::NE ||
++         operation_attributes.binary_op_type == BinaryOpType::LT ||
++         operation_attributes.binary_op_type == BinaryOpType::GT ||
++         operation_attributes.binary_op_type == BinaryOpType::LE ||
++         operation_attributes.binary_op_type == BinaryOpType::GE);
+     const auto a_data_format = datatype_to_dataformat_converter(a_dtype);
+@@ -1179,4 +1187,5 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+     bool fp32_dest_acc_en = c_data_format == tt::DataFormat::UInt32 || c_data_format == tt::DataFormat::Int32 ||
+-                            a_data_format == tt::DataFormat::Float16 ||
+-                            b_data_format == tt::DataFormat::Float16 || c_data_format == tt::DataFormat::Float16 ||
++                            (!is_fp16_comparison &&
++                             (a_data_format == tt::DataFormat::Float16 || b_data_format == tt::DataFormat::Float16 ||
++                              c_data_format == tt::DataFormat::Float16)) ||
+                             c_data_format == tt::DataFormat::Float32 || a_data_format == tt::DataFormat::Float32 ||
+@@ -1196,3 +1205,3 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
  
- /**
-diff --git a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h b/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
---- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
-+++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
-@@ -187,6 +187,65 @@ inline void calculate_binary_comp_fp32(const uint dst_index_in0, const uint dst_i
-     }
- }
- 
-+// Native Float16 comparisons stay in SFPU. Per-operand magnitude checks reject
-+// NaNs without overflowing on large finite values; combined magnitude bits
-+// preserve signed-zero semantics without an FP16 add.
-+template <bool APPROXIMATION_MODE, int ITERATIONS, SfpuType RELATIONAL_OP>
-+inline void calculate_binary_comp_fp16(
-+    const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
-+    static_assert(is_fp32_compare_v<RELATIONAL_OP>, "Supported operation types: eq, ne, lt, gt, le, ge");
-+
-+    constexpr uint dst_tile_size_sfpi = 32;
-+    const sfpi::vUInt infinity_bits = sfpi::as<sfpi::vUInt>(sfpi::vFloat(sfpi::sFloat16b(0x7f80)));
-+
-+#pragma GCC unroll 8
-+    for (int d = 0; d < ITERATIONS; d++) {
-+        const sfpi::vFloat a = sfpi::dst_reg[dst_index_in0 * dst_tile_size_sfpi];
-+        const sfpi::vFloat b = sfpi::dst_reg[dst_index_in1 * dst_tile_size_sfpi];
-+        const sfpi::vFloat abs_a = sfpi::abs(a);
-+        const sfpi::vFloat abs_b = sfpi::abs(b);
-+        const sfpi::vUInt abs_a_bits = sfpi::as<sfpi::vUInt>(abs_a);
-+        const sfpi::vUInt abs_b_bits = sfpi::as<sfpi::vUInt>(abs_b);
-+        const sfpi::vUInt magnitude_bits = abs_a_bits | abs_b_bits;
-+
-+        sfpi::vFloat result = RELATIONAL_OP == SfpuType::ne ? 1.0f : 0.0f;
-+        if constexpr (RELATIONAL_OP == SfpuType::eq || RELATIONAL_OP == SfpuType::ne) {
-+            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
-+                 ((magnitude_bits == 0U) || (a == b))) {
-+                result = RELATIONAL_OP == SfpuType::eq ? 1.0f : 0.0f;
+-    if (is_sfpu_op) {
++    if (is_sfpu_op && !is_fp16_comparison) {
+         if (op_type != BinaryOpType::POWER) {
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+--- a/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
++++ b/ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+@@ -509,2 +509,5 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"lt_binary_tile_init();", "lt_binary_tile_float16"};
 +            }
-+            v_endif;
-+        } else if constexpr (RELATIONAL_OP == SfpuType::lt) {
-+            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
-+                 (a < b)) {
-+                result = 1.0f;
+             return {"lt_binary_tile_init();", "lt_binary_tile"};
+@@ -516,2 +519,5 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"gt_binary_tile_init();", "gt_binary_tile_float16"};
 +            }
-+            v_endif;
-+        } else if constexpr (RELATIONAL_OP == SfpuType::gt) {
-+            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
-+                 (a > b)) {
-+                result = 1.0f;
+             return {"gt_binary_tile_init();", "gt_binary_tile"};
+@@ -523,2 +529,5 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"ge_binary_tile_init();", "ge_binary_tile_float16"};
 +            }
-+            v_endif;
-+        } else if constexpr (RELATIONAL_OP == SfpuType::le) {
-+            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
-+                 ((magnitude_bits == 0U) || (a <= b))) {
-+                result = 1.0f;
+             return {"ge_binary_tile_init();", "ge_binary_tile"};
+@@ -530,2 +539,5 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"le_binary_tile_init();", "le_binary_tile_float16"};
 +            }
-+            v_endif;
-+        } else if constexpr (RELATIONAL_OP == SfpuType::ge) {
-+            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
-+                 ((magnitude_bits == 0U) || (a >= b))) {
-+                result = 1.0f;
+             return {"le_binary_tile_init();", "le_binary_tile"};
+@@ -537,2 +549,5 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"eq_binary_tile_init();", "eq_binary_tile_float16"};
 +            }
-+            v_endif;
-+        }
-+
-+        sfpi::dst_reg[dst_index_out * dst_tile_size_sfpi] = result;
-+        sfpi::dst_reg++;
-+    }
-+}
-+
- // Int32 relational comparisons. Normalize to LT(a, b) or GE(a, b):
- //   lt(a,b) = LT(a,b)           gt(a,b) = LT(b,a)
- //   ge(a,b) = GE(a,b)           le(a,b) = GE(b,a)
-diff --git a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h b/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
---- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
-+++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_comp.h
-@@ -187,6 +187,65 @@ inline void calculate_binary_comp_fp32(const uint dst_index_in0, const uint dst_i
-     }
- }
- 
-+// Native Float16 comparisons stay in SFPU. Per-operand magnitude checks reject
-+// NaNs without overflowing on large finite values; combined magnitude bits
-+// preserve signed-zero semantics without an FP16 add.
-+template <bool APPROXIMATION_MODE, int ITERATIONS, SfpuType RELATIONAL_OP>
-+inline void calculate_binary_comp_fp16(
-+    const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
-+    static_assert(is_fp32_compare_v<RELATIONAL_OP>, "Supported operation types: eq, ne, lt, gt, le, ge");
-+
-+    constexpr uint dst_tile_size_sfpi = 32;
-+    const sfpi::vUInt infinity_bits = sfpi::as<sfpi::vUInt>(sfpi::vFloat(sfpi::sFloat16b(0x7f80)));
-+
-+#pragma GCC unroll 8
-+    for (int d = 0; d < ITERATIONS; d++) {
-+        const sfpi::vFloat a = sfpi::dst_reg[dst_index_in0 * dst_tile_size_sfpi];
-+        const sfpi::vFloat b = sfpi::dst_reg[dst_index_in1 * dst_tile_size_sfpi];
-+        const sfpi::vFloat abs_a = sfpi::abs(a);
-+        const sfpi::vFloat abs_b = sfpi::abs(b);
-+        const sfpi::vUInt abs_a_bits = sfpi::as<sfpi::vUInt>(abs_a);
-+        const sfpi::vUInt abs_b_bits = sfpi::as<sfpi::vUInt>(abs_b);
-+        const sfpi::vUInt magnitude_bits = abs_a_bits | abs_b_bits;
-+
-+        sfpi::vFloat result = RELATIONAL_OP == SfpuType::ne ? 1.0f : 0.0f;
-+        if constexpr (RELATIONAL_OP == SfpuType::eq || RELATIONAL_OP == SfpuType::ne) {
-+            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
-+                 ((magnitude_bits == 0U) || (a == b))) {
-+                result = RELATIONAL_OP == SfpuType::eq ? 1.0f : 0.0f;
+             return {"eq_binary_tile_init();", "eq_binary_tile"};
+@@ -544,2 +559,5 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+             }
++            if (dtype == DataType::FLOAT16) {
++                return {"ne_binary_tile_init();", "ne_binary_tile_float16"};
 +            }
-+            v_endif;
-+        } else if constexpr (RELATIONAL_OP == SfpuType::lt) {
-+            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
-+                 (a < b)) {
-+                result = 1.0f;
-+            }
-+            v_endif;
-+        } else if constexpr (RELATIONAL_OP == SfpuType::gt) {
-+            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) && (magnitude_bits != 0U) &&
-+                 (a > b)) {
-+                result = 1.0f;
-+            }
-+            v_endif;
-+        } else if constexpr (RELATIONAL_OP == SfpuType::le) {
-+            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
-+                 ((magnitude_bits == 0U) || (a <= b))) {
-+                result = 1.0f;
-+            }
-+            v_endif;
-+        } else if constexpr (RELATIONAL_OP == SfpuType::ge) {
-+            v_if((abs_a_bits <= infinity_bits) && (abs_b_bits <= infinity_bits) &&
-+                 ((magnitude_bits == 0U) || (a >= b))) {
-+                result = 1.0f;
-+            }
-+            v_endif;
-+        }
-+
-+        sfpi::dst_reg[dst_index_out * dst_tile_size_sfpi] = result;
-+        sfpi::dst_reg++;
-+    }
-+}
-+
- // Int32 relational comparisons. Normalize to LT(a, b) or GE(a, b):
- //   lt(a,b) = LT(a,b)           gt(a,b) = LT(b,a)
- //   ge(a,b) = GE(a,b)           le(a,b) = GE(b,a)
+             return {"ne_binary_tile_init();", "ne_binary_tile"};

@@ -1,13 +1,11 @@
 diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
 --- a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
 +++ b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
-@@ -10,2 +10,3 @@
- #include "mlir/Dialect/Quant/IR/QuantTypes.h"
+@@ -11,2 +11,3 @@
  #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 +#include "mlir/Transforms/WalkPatternRewriteDriver.h"
-@@ -114,9 +115,18 @@ private:
-       return mlir::DenseElementsAttr::get(newType, bf16Values);
-     }
+ 
+@@ -116,5 +117,14 @@ private:
  
 +    const size_t newBitWidth =
 +        newType.getElementType().getIntOrFloatBitWidth();
@@ -23,11 +21,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dial
 +      }
 +      intValues.push_back(v);
      }
- 
-     return mlir::DenseElementsAttr::get(newType, intValues);
-@@ -136,6 +146,81 @@ private:
-   }
- };
+@@ -138,2 +148,76 @@ private:
  
 +// Signed i16 tensors are represented as i32 because TTNN has no signed i16
 +// dtype. Keep equal-width float/i16 bitcasts raw by using ui16 at the bitcast
@@ -104,9 +98,8 @@ diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dial
 +};
 +
  struct ElementTypeNormalization
-     : public impl::ElementTypeNormalizationBase<ElementTypeNormalization> {
-   using impl::ElementTypeNormalizationBase<
-@@ -151,6 +236,11 @@ struct ElementTypeNormalization
+@@ -150,5 +234,10 @@ struct ElementTypeNormalization
+ 
 -    mlir::RewritePatternSet patterns(&getContext());
      GreedyRewriteConfig config;
      config.enableFolding(false);
@@ -117,5 +110,3 @@ diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dial
 +
 +    mlir::RewritePatternSet patterns(&getContext());
      patterns.add<UniformTypeRewriter>(converter, &getContext());
-     patterns.add<ConstantOpAttrRewriter>(converter, &getContext());
-     if (failed(mlir::applyPatternsGreedily(getOperation(), std::move(patterns),

@@ -1,40 +1,31 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -4844,3 +4844,0 @@
+@@ -5056,5 +5056,2 @@ public:
+ 
 -// NOTE: StableHLO Dynamic Slice Op clamps start indices to ensure validity,
 -// but we don't. Would add multiple ops (worse perf) and doesn't appear in test
 -// models.
-@@ -4856,4 +4853,8 @@ public:
-                   mlir::stablehlo::DynamicSliceOp::Adaptor adaptor,
-                   ConversionPatternRewriter &rewriter) const override {
-     auto outputType = mlir::cast<RankedTensorType>(
-         getTypeConverter()->convertType(srcOp.getResult().getType()));
-+    auto operandShape = mlir::cast<RankedTensorType>(
-+                            adaptor.getOperand().getType())
-+                            .getShape();
-+    auto sliceSizes = srcOp.getSliceSizes();
-@@ -4870,9 +4871,14 @@ public:
+ namespace {
+@@ -5082,4 +5079,4 @@ public:
+ 
 -    for (Value startIndex : startIndicesRange) {
 -      auto reshapedIndex = rewriter.create<ttir::ReshapeOp>(
 +    for (auto [dim, startIndex] : llvm::enumerate(startIndicesRange)) {
 +      Value reshapedIndex = rewriter.create<ttir::ReshapeOp>(
            srcOp.getLoc(),
-           RankedTensorType::get(singleElementTensorType.getShape(),
-                                 startIndexElementType,
-                                 singleElementTensorType.getEncoding()),
+@@ -5089,2 +5086,6 @@ public:
            startIndex, rewriter.getI32ArrayAttr({1}));
 +      reshapedIndex = rewriter.create<ttir::ClampScalarOp>(
 +          srcOp.getLoc(), singleElementTensorType, reshapedIndex,
 +          rewriter.getI32IntegerAttr(0),
 +          rewriter.getI32IntegerAttr(operandShape[dim] - sliceSizes[dim]));
        startIndicesValues1D.push_back(reshapedIndex);
-     }
-@@ -4891,1 +4897,0 @@ public:
+@@ -5103,3 +5104,2 @@ public:
+     // Create a 1D constant tensor with slice_sizes values.
 -    auto sliceSizes = srcOp.getSliceSizes();
-@@ -4904,6 +4909,128 @@ class StableHLOToTTIRDynamicSliceOpConversionPattern
- };
- } // namespace
+     SmallVector<int32_t> sliceSizesInt32(sliceSizes.begin(), sliceSizes.end());
+@@ -5130,2 +5130,124 @@ public:
  
 +namespace {
 +class StableHLOToTTIRDynamicUpdateSliceOpConversionPattern
@@ -159,26 +150,32 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +} // namespace
 +
  namespace {
- class StableHLOToTTIROpClampOpConversionPattern
-     : public OpConversionPattern<mlir::stablehlo::ClampOp> {
-@@ -9934,5 +10056,7 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
-   patterns.add<StableHLOToTTIRDynamicSliceOpConversionPattern>(typeConverter,
+@@ -10697,2 +10819,4 @@ static void addDynamicSliceOpConversionPattern(MLIRContext *ctx,
                                                                 ctx);
 +  patterns.add<StableHLOToTTIRDynamicUpdateSliceOpConversionPattern>(
 +      typeConverter, ctx);
  }
- 
- static void addClampOpConversionPattern(MLIRContext *ctx,
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp.rej b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp.rej
+new file mode 100644
+--- /dev/null
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp.rej
+@@ -0,0 +1,11 @@
++--- lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+++++ lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++@@ -4853,4 +4850,8 @@ public:
++                   mlir::stablehlo::DynamicSliceOp::Adaptor adaptor,
++                   ConversionPatternRewriter &rewriter) const override {
++     auto outputType = mlir::cast<RankedTensorType>(
++         getTypeConverter()->convertType(srcOp.getResult().getType()));
+++    auto operandShape = mlir::cast<RankedTensorType>(
+++                            adaptor.getOperand().getType())
+++                            .getShape();
+++    auto sliceSizes = srcOp.getSliceSizes();
 diff --git a/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp b/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp
 --- a/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp
 +++ b/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp
-@@ -21,7 +21,7 @@ namespace {
- // Before adding an op here, make sure it is supported in
- // StableHLO to TOSA/Linalg conversion.
- static bool isNonLowerableSHLOOp([[maybe_unused]] mlir::Operation *op) {
+@@ -23,3 +23,3 @@ static bool isNonLowerableSHLOOp([[maybe_unused]] mlir::Operation *op) {
  #ifdef TTMLIR_ENABLE_STABLEHLO
 -  return llvm::isa<stablehlo::DynamicUpdateSliceOp, stablehlo::EinsumOp>(op);
 +  return llvm::isa<stablehlo::EinsumOp>(op);
  #else
-   return false;
- #endif

@@ -1,0 +1,66 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1370,2 +1370,3 @@ def TTNN_TransposeOp : TTNN_Op<"transpose"> {
+     let hasVerifier = 1;
++
+ }
+diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
+--- a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
++++ b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
+@@ -15,3 +15,3 @@
+ #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
+-#include "mlir/Dialect/Affine/Transforms/Passes.h"
++#include "mlir/Dialect/Affine/Passes.h"
+ #include "mlir/Dialect/Arith/Transforms/Passes.h"
+diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+--- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
++++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+@@ -45,3 +45,3 @@
+ #include "mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h"
+-#include "mlir/Dialect/Affine/Transforms/Passes.h"
++#include "mlir/Dialect/Affine/Passes.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
+--- a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
++++ b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
+@@ -518,7 +518,3 @@ mlir::LogicalResult RoPERotateHalfFusingPattern::matchAndRewrite(
+   auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
+-  if (inputType.getRank() != 4 && !rank4Reshape) {
+-    return failure();
+-  }
+-  if (rank4Reshape &&
+-      inputType.getNumElements() != resultType.getNumElements()) {
++  if (inputType.getRank() != 4) {
+     return failure();
+@@ -644,3 +640,7 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
+   auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
+-  if (inputType.getRank() != 4) {
++  if (inputType.getRank() != 4 && !rank4Reshape) {
++    return failure();
++  }
++  if (rank4Reshape &&
++      inputType.getNumElements() != resultType.getNumElements()) {
+     return failure();
+diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+--- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
++++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+@@ -1090,6 +1090,7 @@ LogicalLeftShiftOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
+ 
+-llvm::Expected<op_model::OpConstraints>
+-BitwiseRightShiftOp::getOpConstraints(const std::vector<TTNNLayoutAttr> &inputs,
+-                                      const OpConfig &opConfig) {
+-  return detail::getBinaryOpConstraints(*this, inputs, opConfig);
++llvm::Expected<op_model::OpConstraints> BitwiseRightShiftOp::getOpConstraints(
++    const std::vector<TTNNLayoutAttr> &inputs, const OpConfig &opConfig,
++    std::optional<llvm::ArrayRef<op_model::OpModelAllocationRecord>>
++        liveRecords) {
++  return detail::getBinaryOpConstraints(*this, inputs, opConfig, liveRecords);
+ }
+diff --git a/lib/RegisterAll.cpp b/lib/RegisterAll.cpp
+--- a/lib/RegisterAll.cpp
++++ b/lib/RegisterAll.cpp
+@@ -136,3 +136,2 @@ void mlir::tt::registerAllPasses() {
+   mlir::tt::ttir::registerPasses();
+-  mlir::tt::ttnn::registerTTNNOptimizer();
+   mlir::tt::ttnn::registerPasses();

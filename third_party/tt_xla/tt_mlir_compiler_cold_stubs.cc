@@ -79,11 +79,3 @@ LogicalResult translateTopLevelKernelToCpp(ModuleOp, llvm::raw_ostream &,
 }
 
 } // namespace mlir::tt::ttkernel
-
-namespace mlir::tt::llvm_to_cpu {
-
-LogicalResult translateLLVMToDyLib(Operation *, llvm::raw_ostream &) {
-  return failure();
-}
-
-} // namespace mlir::tt::llvm_to_cpu

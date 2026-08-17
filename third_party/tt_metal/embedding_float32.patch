@@ -1,45 +1,17 @@
-diff --git ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
---- ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
-@@ -34,6 +34,8 @@ void EmbeddingsDeviceOperation::validate_on_program_cache_miss(
-         weights.layout() == Layout::ROW_MAJOR, "Weights tensor layout must be ROW_MAJOR but got {}", weights.layout());
+diff --git a/ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp b/ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
+--- a/ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
++++ b/ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
+@@ -35,3 +35,5 @@ void EmbeddingsDeviceOperation::validate_on_program_cache_miss(
      TT_FATAL(a.dtype() == DataType::UINT32 or a.dtype() == DataType::BFLOAT16, "Input must be UINT32 or BFLOAT16");
 -    TT_FATAL(weights.dtype() == DataType::BFLOAT16, "Weights tensor must have BFLOAT16 dtype");
 +    TT_FATAL(
 +        weights.dtype() == DataType::BFLOAT16 or weights.dtype() == DataType::FLOAT32,
 +        "Weights tensor must have BFLOAT16 or FLOAT32 dtype");
      TT_FATAL(
-         a.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
-         "Embedding does not currently support sharded inputs");
-diff --git ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
---- ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
-+++ ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
-@@ -29,5 +29,6 @@ void kernel_main() {
-             compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
-             compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
--            compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(
-+            compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
-+            compute_kernel_lib::tilize_config::Fp32Mode::Lossless>(
-             per_core_block_cnt * num_chunks);
-     } else {
-@@ -40,3 +41,4 @@ void kernel_main() {
-                     compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
-                     compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
--                    compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(num_chunks - 1);
-+                    compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
-+                    compute_kernel_lib::tilize_config::Fp32Mode::Lossless>(num_chunks - 1);
-@@ -48,3 +50,4 @@ void kernel_main() {
-                 compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
-                 compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
--                compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(1);
-+                compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
-+                compute_kernel_lib::tilize_config::Fp32Mode::Lossless>(1);
-diff --git ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
---- ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
-@@ -242,3 +242,17 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
-     const char* compute_kernel_path =
-         use_chunked_processing ? "ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp"
+diff --git a/ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp b/ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
+--- a/ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
++++ b/ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
+@@ -244,2 +244,16 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
                                 : "ttnn/cpp/ttnn/operations/data_movement/tilize/device/kernels/compute/tilize.cpp";
 +    auto make_compute_config = [&] {
 +        const bool fp32 = weights.dtype() == DataType::FLOAT32;
@@ -55,19 +27,35 @@ diff --git ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_fa
 +            .unpack_to_dest_mode = std::move(unpack_to_dest_mode),
 +        };
 +    };
-@@ -257,6 +271,6 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
-         compute_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-         compute_desc.core_ranges = core_group_1;
+ 
+@@ -259,3 +273,3 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
          compute_desc.compile_time_args = std::move(compute_args_1);
 -        compute_desc.config = ComputeConfigDescriptor{};
 +        compute_desc.config = make_compute_config();
          compute_desc_1 = std::move(compute_desc);
-     }
-@@ -275,6 +289,6 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
-         compute_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-         compute_desc.core_ranges = core_group_2;
+@@ -277,3 +291,3 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
          compute_desc.compile_time_args = std::move(compute_args_2);
 -        compute_desc.config = ComputeConfigDescriptor{};
 +        compute_desc.config = make_compute_config();
          compute_desc_2 = std::move(compute_desc);
-     }
+diff --git a/ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp b/ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
+--- a/ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
++++ b/ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
+@@ -30,3 +30,4 @@ void kernel_main() {
+             compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
+-            compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(
++            compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
++            compute_kernel_lib::tilize_config::Fp32Mode::Lossless>(
+             per_core_block_cnt * num_chunks);
+@@ -41,3 +42,4 @@ void kernel_main() {
+                     compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
+-                    compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(num_chunks - 1);
++                    compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
++                    compute_kernel_lib::tilize_config::Fp32Mode::Lossless>(num_chunks - 1);
+             }
+@@ -49,3 +51,4 @@ void kernel_main() {
+                 compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
+-                compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(1);
++                compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
++                compute_kernel_lib::tilize_config::Fp32Mode::Lossless>(1);
+         }

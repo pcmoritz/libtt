@@ -1,9 +1,46 @@
-diff --git tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
---- tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
-+++ tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
-@@ -58,10 +58,22 @@ ALWI void clamp_tile_int32(uint32_t idst, uint32_t param0, uint32_t param1) {
-     MATH(SFPU_UNARY_CALL(
-         DST_SYNC_MODE,
+diff --git a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h b/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
+--- a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
++++ b/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
+@@ -30,9 +30,9 @@ inline void calculate_clamp(uint min_val, uint max_val) {
+ 
+-template <bool APPROXIMATION_MODE, int ITERATIONS>
+-inline void calculate_clamp_int32(uint min_val, uint max_val) {
++template <bool APPROXIMATION_MODE, bool IS_UNSIGNED, int ITERATIONS>
++inline void calculate_clamp_integer(uint min_val, uint max_val) {
+     for (int d = 0; d < ITERATIONS; d++) {
+-        load_value_param_int(min_val);
+-        calculate_unary_max_min_int32_body<Max>(min_val);
+-        load_value_param_int(max_val);
+-        calculate_unary_max_min_int32_body<Min>(max_val);
++        load_value_param_int<IS_UNSIGNED>(min_val);
++        calculate_unary_max_min_int32_body<Max, IS_UNSIGNED>(min_val);
++        load_value_param_int<IS_UNSIGNED>(max_val);
++        calculate_unary_max_min_int32_body<Min, IS_UNSIGNED>(max_val);
+         sfpi::dst_reg++;
+diff --git a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h b/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
+--- a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
++++ b/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
+@@ -29,10 +29,10 @@ inline void calculate_clamp(uint min_val, uint max_val) {
+ 
+-template <bool APPROXIMATION_MODE, int ITERATIONS>
+-inline void calculate_clamp_int32(uint min_val, uint max_val) {
++template <bool APPROXIMATION_MODE, bool IS_UNSIGNED, int ITERATIONS>
++inline void calculate_clamp_integer(uint min_val, uint max_val) {
+     // SFPU microcode
+     for (int d = 0; d < ITERATIONS; d++) {
+-        load_value_param_int(min_val);
+-        calculate_unary_max_min_int32_body<Max>(min_val);
+-        load_value_param_int(max_val);
+-        calculate_unary_max_min_int32_body<Min>(max_val);
++        load_value_param_int<IS_UNSIGNED>(min_val);
++        calculate_unary_max_min_int32_body<Max, IS_UNSIGNED>(min_val);
++        load_value_param_int<IS_UNSIGNED>(max_val);
++        calculate_unary_max_min_int32_body<Min, IS_UNSIGNED>(max_val);
+         sfpi::dst_reg++;
+diff --git a/tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h b/tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
+--- a/tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
++++ b/tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
+@@ -61,4 +61,16 @@ ALWI void clamp_tile_int32(uint32_t idst, uint32_t param0, uint32_t param1) {
          DST_ACCUM_MODE,
 -        calculate_clamp_int32,
 -        (APPROX, 8 /* ITERATIONS */),
@@ -22,57 +59,10 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h tt_metal/hw/inc/api
 +        calculate_clamp_integer,
 +        (APPROX, true /* IS_UNSIGNED */, 8 /* ITERATIONS */),
          idst,
-         VectorMode::RC,
-         param0,
-         param1));
- }
-diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
---- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
-+++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
-@@ -28,10 +28,10 @@ inline void calculate_clamp(uint min_val, uint max_val) {
--template <bool APPROXIMATION_MODE, int ITERATIONS>
--inline void calculate_clamp_int32(uint min_val, uint max_val) {
-+template <bool APPROXIMATION_MODE, bool IS_UNSIGNED, int ITERATIONS>
-+inline void calculate_clamp_integer(uint min_val, uint max_val) {
-     for (int d = 0; d < ITERATIONS; d++) {
--        load_value_param_int(min_val);
--        calculate_unary_max_min_int32_body<Max>(min_val);
--        load_value_param_int(max_val);
--        calculate_unary_max_min_int32_body<Min>(max_val);
-+        load_value_param_int<IS_UNSIGNED>(min_val);
-+        calculate_unary_max_min_int32_body<Max, IS_UNSIGNED>(min_val);
-+        load_value_param_int<IS_UNSIGNED>(max_val);
-+        calculate_unary_max_min_int32_body<Min, IS_UNSIGNED>(max_val);
-         sfpi::dst_reg++;
-     }
- }
-diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
---- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
-+++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
-@@ -28,11 +28,11 @@ inline void calculate_clamp(uint min_val, uint max_val) {
--template <bool APPROXIMATION_MODE, int ITERATIONS>
--inline void calculate_clamp_int32(uint min_val, uint max_val) {
-+template <bool APPROXIMATION_MODE, bool IS_UNSIGNED, int ITERATIONS>
-+inline void calculate_clamp_integer(uint min_val, uint max_val) {
-     // SFPU microcode
-     for (int d = 0; d < ITERATIONS; d++) {
--        load_value_param_int(min_val);
--        calculate_unary_max_min_int32_body<Max>(min_val);
--        load_value_param_int(max_val);
--        calculate_unary_max_min_int32_body<Min>(max_val);
-+        load_value_param_int<IS_UNSIGNED>(min_val);
-+        calculate_unary_max_min_int32_body<Max, IS_UNSIGNED>(min_val);
-+        load_value_param_int<IS_UNSIGNED>(max_val);
-+        calculate_unary_max_min_int32_body<Min, IS_UNSIGNED>(max_val);
-         sfpi::dst_reg++;
-     }
- }
-diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
---- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
-@@ -647,6 +647,11 @@ std::pair<std::string, std::string> get_op_init_and_func_parameterized(
-                     "clamp_tile_init();",
-                     fmt::format("clamp_tile_int32({}, {}, {});", idst, static_cast<uint32_t>(static_cast<int32_t>(params[0])), static_cast<uint32_t>(static_cast<int32_t>(params[1])))};
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp b/ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+--- a/ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
++++ b/ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+@@ -660,2 +660,7 @@ std::pair<std::string, std::string> get_op_init_and_func_parameterized(
              }
 +            if (input_dtype == DataType::UINT32) {
 +                return {
@@ -80,5 +70,3 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn
 +                    fmt::format("clamp_tile_uint32({}, {}u, {}u);", idst, static_cast<uint32_t>(params[0]), static_cast<uint32_t>(params[1]))};
 +            }
              return {
-                 "clamp_tile_init();",
-                 fmt::format(

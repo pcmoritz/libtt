@@ -1,7 +1,6 @@
-diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
-index 0fd7eed..e272193 100644
---- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
+diff --git a/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp b/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
+--- a/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
++++ b/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
 @@ -37,5 +37,4 @@ namespace ttnn::prim {
   *
 - * 2. OUTPUT DATA TYPE: Must support 16-bit indices (dimension size < 65536)
@@ -11,7 +10,7 @@ index 0fd7eed..e272193 100644
 + *    - Larger dimensions force single-core execution
   *
 @@ -67,4 +66,3 @@ TopKDeviceOperation::program_factory_t TopKDeviceOperation::select_program_facto
-
+ 
 -    // Apply requirement #2: Multi-core implementation constraint
 -    // Multi-core only supports UInt16 indices (dimension size must fit in 16 bits)
 +    // Apply requirement #2: Multi-core dimension constraint
@@ -21,7 +20,7 @@ index 0fd7eed..e272193 100644
 -        const tt::DataFormat index_cb_data_format = tt::DataFormat::UInt16;  // Multi-core always uses UInt16
 +        const tt::DataFormat index_cb_data_format =
 +            input_tensor.dtype() == DataType::FLOAT32 ? tt::DataFormat::UInt32 : tt::DataFormat::UInt16;
-
+ 
 @@ -156,4 +155,5 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
      TT_FATAL(
 -        input_tensor_dtype == DataType::BFLOAT16 || input_tensor_dtype == DataType::BFLOAT8_B,
@@ -54,23 +53,22 @@ index 0fd7eed..e272193 100644
 -    bool uint16_output = (input_shape[args.dim] <= std::numeric_limits<uint16_t>::max());
 +    bool uint16_output = input_tensor_dtype != DataType::FLOAT32 &&
 +                         input_shape[args.dim] <= std::numeric_limits<uint16_t>::max();
-
+ 
 @@ -210,3 +213,4 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
          tt::DataFormat value_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
 -        tt::DataFormat index_cb_data_format = tt::DataFormat::UInt16;
 +        tt::DataFormat index_cb_data_format =
 +            uint16_output ? tt::DataFormat::UInt16 : tt::DataFormat::UInt32;
-
+ 
 @@ -266,3 +270,4 @@ TopKDeviceOperation::spec_return_value_t TopKDeviceOperation::compute_output_spe
      // Choose index data type based on dimension size (16-bit vs 32-bit indices)
 -    const bool uint16_output = (input_shape[args.dim] <= std::numeric_limits<uint16_t>::max());  // 65535
 +    const bool uint16_output = input_tensor.dtype() != DataType::FLOAT32 &&
 +                               input_shape[args.dim] <= std::numeric_limits<uint16_t>::max();  // 65535
-
-diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp
-index aad67a0..ed1744b 100644
---- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp
+ 
+diff --git a/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp b/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp
+--- a/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp
++++ b/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_multi_core_program_factory.cpp
 @@ -458,4 +458,13 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKMultiCoreProgramFactory
      compute_local_desc.compile_time_args = compute_args;
 +    std::vector<tt::tt_metal::UnpackToDestMode> local_unpack_to_dest_mode(
@@ -99,15 +97,14 @@ index aad67a0..ed1744b 100644
          .dst_full_sync_en = false,
 +        .unpack_to_dest_mode = std::move(final_unpack_to_dest_mode),
      };
-diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp
-index 47ff32a..3f935c7 100644
---- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp
+diff --git a/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp b/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp
+--- a/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp
++++ b/ttnn/cpp/ttnn/operations/reduction/topk/device/topk_single_core_program_factory.cpp
 @@ -30,3 +30,3 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKSingleCoreProgramFactor
      const ttnn::Shape input_shape = input_tensor.padded_shape();
 -    const bool uint16_output = (input_shape[args.dim] < std::numeric_limits<uint16_t>::max());
 +    const bool uint16_output = index_tensor.dtype() == DataType::UINT16;
-
+ 
 @@ -249,2 +249,10 @@ tt::tt_metal::ProgramDescriptor TopKDeviceOperation::TopKSingleCoreProgramFactor
      compute_desc.compile_time_args = compute_args;
 +    std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(

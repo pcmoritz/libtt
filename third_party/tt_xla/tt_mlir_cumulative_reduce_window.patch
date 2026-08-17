@@ -1,29 +1,19 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-index e60e4f91..fdce54b5 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -2969,6 +2969,11 @@ class StableHLOToTTIRReduceWindowOpConversionPattern
-   using OpConversionPattern<
-       mlir::stablehlo::ReduceWindowOp>::OpConversionPattern;
--
-+
+@@ -2836,2 +2836,7 @@ class StableHLOToTTIRReduceWindowOpConversionPattern
+ 
 +  struct CumulativeReductionMatch {
 +    int64_t dimension = -1;
 +    bool reverse = false;
 +  };
 +
  public:
-   LogicalResult
-   matchAndRewrite(mlir::stablehlo::ReduceWindowOp srcOp,
-@@ -3061,35 +3066,18 @@ public:
-     // Handle the special case of lowering to CumSumOp.
+@@ -2928,15 +2933,7 @@ public:
      if (srcOp.getInputs().size() == 1) {
 -      std::optional<int64_t> dimension =
 -          isCumSum(srcOp, adaptor, (*initValues)[0], reductionOps[0], padding);
 -      if (dimension) {
-+      std::optional<CumulativeReductionMatch> cumulativeMatch =
-+          isCumSum(srcOp, adaptor, reductionOps[0], padding);
-+      if (cumulativeMatch) {
 -        if (firstInputType.getElementType().isInteger(8)) {
 -          return rewriter.notifyMatchFailure(
 -              srcOp, "8-bit cumulative reductions are not supported");
@@ -34,18 +24,17 @@ index e60e4f91..fdce54b5 100644
 -        rewriter.replaceOpWithNewOp<ttir::CumSumOp>(
 -            srcOp, resultType, adaptor.getInputs()[0],
 -            rewriter.getI64IntegerAttr(*dimension));
++      std::optional<CumulativeReductionMatch> cumulativeMatch =
++          isCumSum(srcOp, adaptor, reductionOps[0], padding);
++      if (cumulativeMatch) {
 +        replaceWithCumulativeOp<ttir::CumSumOp>(srcOp, adaptor,
 +                                                *cumulativeMatch, rewriter);
          return success();
-       }
--
-+
+@@ -2945,15 +2942,6 @@ public:
        // Handle the special case of lowering to CumProdOp.
 -      std::optional<int64_t> cumprodDimension =
 -          isCumProd(srcOp, adaptor, (*initValues)[0], reductionOps[0], padding);
 -      if (cumprodDimension) {
-+      cumulativeMatch = isCumProd(srcOp, adaptor, reductionOps[0], padding);
-+      if (cumulativeMatch) {
 -        if (firstInputType.getElementType().isInteger(8)) {
 -          return rewriter.notifyMatchFailure(
 -              srcOp, "8-bit cumulative reductions are not supported");
@@ -56,17 +45,13 @@ index e60e4f91..fdce54b5 100644
 -        rewriter.replaceOpWithNewOp<ttir::CumProdOp>(
 -            srcOp, resultType, adaptor.getInputs()[0],
 -            rewriter.getI64IntegerAttr(*cumprodDimension));
++      cumulativeMatch = isCumProd(srcOp, adaptor, reductionOps[0], padding);
++      if (cumulativeMatch) {
 +        replaceWithCumulativeOp<ttir::CumProdOp>(srcOp, adaptor,
 +                                                 *cumulativeMatch, rewriter);
          return success();
-       }
-     }
-@@ -3557,7 +3554,38 @@ private:
-     rewriter.replaceOp(srcOp, resultVals);
-     return success();
-   }
--
-+
+@@ -3428,2 +3416,33 @@ private:
+ 
 +  template <typename CumulativeOp>
 +  void replaceWithCumulativeOp(
 +      mlir::stablehlo::ReduceWindowOp srcOp,
@@ -99,9 +84,7 @@ index e60e4f91..fdce54b5 100644
 +  }
 +
    // This function verifies all the required conditions to convert stablehlo
-   // reduce_window op to TTIR cumsum op and also determine the dimension
-   // attribute along which the cumulative sum will be computed.
-@@ -3579,27 +3607,26 @@ private:
+@@ -3447,7 +3466,6 @@ private:
    //    dimension and value must be equal to size of the required dimension.
 -  std::optional<int64_t>
 +  std::optional<CumulativeReductionMatch>
@@ -111,35 +94,25 @@ index e60e4f91..fdce54b5 100644
 -           DenseI64ArrayAttr padding) const {
 +           mlir::Operation *frontOp, DenseI64ArrayAttr padding) const {
      if (!isa<mlir::stablehlo::AddOp>(frontOp)) {
-       return std::nullopt;
-     }
--
-+
+@@ -3456,3 +3474,3 @@ private:
+ 
 -    if (initValue != TypicalInitReductionValue::ZERO) {
 +    if (!hasInitValue(srcOp, TypicalInitReductionValue::ZERO)) {
        return std::nullopt;
-     }
--
-+
-     // Verify window-related attributes (strides, dilations)
-     if (!hasValidWindowAttributes(adaptor)) {
-       return std::nullopt;
-     }
--
-+
+@@ -3465,5 +3483,5 @@ private:
+ 
 -    int64_t dimension;
 +    CumulativeReductionMatch match;
      // Check input tensor type and padding
 -    if (!hasValidInputAndPadding(srcOp, adaptor, dimension, padding)) {
 +    if (!hasValidInputAndPadding(srcOp, adaptor, match, padding)) {
        return std::nullopt;
-     }
--
-+
+@@ -3471,3 +3489,3 @@ private:
+ 
 -    return dimension;
 +    return match;
    }
-@@ -3625,27 +3652,26 @@ private:
+@@ -3493,7 +3511,6 @@ private:
    //    dimension and value must be equal to size of the required dimension.
 -  std::optional<int64_t>
 +  std::optional<CumulativeReductionMatch>
@@ -149,39 +122,26 @@ index e60e4f91..fdce54b5 100644
 -            DenseI64ArrayAttr padding) const {
 +            mlir::Operation *frontOp, DenseI64ArrayAttr padding) const {
      if (!isa<mlir::stablehlo::MulOp>(frontOp)) {
-       return std::nullopt;
-     }
--
-+
+@@ -3502,3 +3519,3 @@ private:
+ 
 -    if (initValue != TypicalInitReductionValue::ONE) {
 +    if (!hasInitValue(srcOp, TypicalInitReductionValue::ONE)) {
        return std::nullopt;
-     }
--
-+
-     // Verify window-related attributes (strides, dilations)
-     if (!hasValidWindowAttributes(adaptor)) {
-       return std::nullopt;
-     }
--
-+
+@@ -3511,5 +3528,5 @@ private:
+ 
 -    int64_t dimension;
 +    CumulativeReductionMatch match;
      // Check input tensor type and padding
 -    if (!hasValidInputAndPadding(srcOp, adaptor, dimension, padding)) {
 +    if (!hasValidInputAndPadding(srcOp, adaptor, match, padding)) {
        return std::nullopt;
-     }
--
-+
+@@ -3517,3 +3534,3 @@ private:
+ 
 -    return dimension;
 +    return match;
    }
-@@ -3669,6 +3695,16 @@ private:
-     return mlir::dyn_cast_if_present<mlir::stablehlo::ConstantOp>(valueDef);
-   }
--
-+
+@@ -3536,2 +3553,12 @@ private:
+ 
 +  bool hasInitValue(mlir::stablehlo::ReduceWindowOp &srcOp,
 +                    TypicalInitReductionValue desired) const {
 +    if (srcOp.getInitValues().size() != 1) {
@@ -193,57 +153,39 @@ index e60e4f91..fdce54b5 100644
 +  }
 +
    // Extract constant initialization values.
-   std::optional<llvm::SmallVector<TypicalInitReductionValue>>
-   extractInitValues(mlir::stablehlo::ReduceWindowOp &srcOp) const {
-@@ -3729,7 +3765,7 @@ private:
-   bool hasValidInputAndPadding(mlir::stablehlo::ReduceWindowOp &srcOp,
+@@ -3596,3 +3623,3 @@ private:
                                 mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
 -                               int64_t &dimension,
 +                               CumulativeReductionMatch &match,
                                 DenseI64ArrayAttr padding) const {
-     RankedTensorType inputType = mlir::cast<RankedTensorType>(
-         getTypeConverter()->convertType(srcOp.getInputs()[0].getType()));
-     int64_t inputRank = inputType.getRank();
-@@ -3753,10 +3789,10 @@ private:
-       }
+@@ -3619,3 +3646,3 @@ private:
        // Determine the dimension using input tensor shape.
 -      return findDimensionWithShape(inputType, dimension);
 +      return findDimensionWithShape(inputType, match.dimension);
      }
--
-+
-     // Check non-splat padding and ensure the window dimensions and padding are
-     // consistent and determine the dimension attribute.
+@@ -3625,3 +3652,3 @@ private:
      return validateNonSplatPadding(windowDimensions, padding, inputType,
 -                                   dimension);
 +                                   match);
    }
-@@ -3779,6 +3815,6 @@ private:
-   bool validateNonSplatPadding(llvm::ArrayRef<int64_t> windowDimensions,
-                                DenseI64ArrayAttr padding,
+@@ -3645,3 +3672,3 @@ private:
                                 RankedTensorType inputType,
 -                               int64_t &dimension) const {
 +                               CumulativeReductionMatch &match) const {
      int64_t dimArgValue = -1;
-     int64_t idx = -1;
-@@ -3793,23 +3829,32 @@ private:
-         return false; // Ensure only one non-1 element.
-       }
+@@ -3659,3 +3686,3 @@ private:
        dimArgValue = windowDim;
 -      dimension = idx;
 +      match.dimension = idx;
      }
--
-+
+@@ -3663,3 +3690,5 @@ private:
      // Validate dimension attribute.
 -    if (dimArgValue != inputType.getShape()[dimension] || dimArgValue <= 1) {
 +    if (match.dimension < 0 ||
 +        dimArgValue != inputType.getShape()[match.dimension] ||
 +        dimArgValue <= 1) {
        return false;
-     }
--
-+
+@@ -3668,7 +3697,4 @@ private:
      for (int64_t i = 0; i < padding.size(); ++i) {
 -      if (i == (dimension * 2)) {
 -        if (padding[i] != (dimArgValue - 1)) {
@@ -253,10 +195,8 @@ index e60e4f91..fdce54b5 100644
 +      if (i != match.dimension * 2 && i != match.dimension * 2 + 1 &&
 +          padding[i] != 0) {
          return false;
-       }
-     }
--
-+
+@@ -3677,3 +3703,13 @@ private:
+ 
 -    return true;
 +    int64_t lowPadding = padding[match.dimension * 2];
 +    int64_t highPadding = padding[match.dimension * 2 + 1];

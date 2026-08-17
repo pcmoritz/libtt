@@ -1,10 +1,7 @@
 diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
 --- a/pjrt_implementation/src/api/module_builder/module_builder.cc
 +++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
-@@ -347,5 +347,15 @@ ModuleBuilder::buildModule(
-   if (!tt_pjrt_status_is_ok(status)) {
-     return {status, nullptr};
-   }
+@@ -407,2 +407,12 @@ ModuleBuilder::buildModule(
  
 +  // JAX leaves custom-call computations public even though only @main is an
 +  // executable entry point.

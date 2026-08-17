@@ -1,7 +1,7 @@
 diff --git a/pjrt_implementation/inc/api/executable_image.h b/pjrt_implementation/inc/api/executable_image.h
 --- a/pjrt_implementation/inc/api/executable_image.h
 +++ b/pjrt_implementation/inc/api/executable_image.h
-@@ -73,2 +73,12 @@
+@@ -73,2 +73,12 @@ public:
  
 +  // Returns inputs JAX marked as donated (tf.aliasing_output); invalidated
 +  // after successful execution.
@@ -14,7 +14,7 @@ diff --git a/pjrt_implementation/inc/api/executable_image.h b/pjrt_implementatio
 +  }
 +
    // Returns the vector of output data types.
-@@ -201,2 +211,5 @@
+@@ -201,2 +211,5 @@ private:
  
 +  // Input indices carrying JAX's tf.aliasing_output attribute.
 +  std::vector<size_t> m_donatable_input_indices;
@@ -23,7 +23,7 @@ diff --git a/pjrt_implementation/inc/api/executable_image.h b/pjrt_implementatio
 diff --git a/pjrt_implementation/inc/api/loaded_executable_instance.h b/pjrt_implementation/inc/api/loaded_executable_instance.h
 --- a/pjrt_implementation/inc/api/loaded_executable_instance.h
 +++ b/pjrt_implementation/inc/api/loaded_executable_instance.h
-@@ -116,2 +116,13 @@
+@@ -116,2 +116,13 @@ protected:
  
 +  using DonationIndices = std::unordered_set<size_t>;
 +
@@ -40,7 +40,7 @@ diff --git a/pjrt_implementation/inc/api/loaded_executable_instance.h b/pjrt_imp
 diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
-@@ -181,2 +181,8 @@
+@@ -181,2 +181,8 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
  
 +  DonationIndices donated_indices;
 +  tt_pjrt_status status = validateInputBuffers(args, donated_indices);
@@ -49,12 +49,12 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
 +  }
 +
    std::optional<tt::runtime::Device> runtime_device =
-@@ -195,3 +201,3 @@
+@@ -195,3 +201,3 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
    input_tensors.reserve(args->num_args);
 -  tt_pjrt_status status = getInputRuntimeTensors(
 +  status = getInputRuntimeTensors(
        args->argument_lists, args->num_args, args->num_devices, *runtime_device,
-@@ -241,2 +247,4 @@
+@@ -241,2 +247,4 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
  
 +  invalidateDonatedInputs(args, donated_indices);
 +
@@ -62,7 +62,7 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
 diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
-@@ -344,2 +344,78 @@
+@@ -344,2 +344,78 @@ tt_pjrt_status LoadedExecutableInstance::fillPJRTOutputLists(
  
 +void LoadedExecutableInstance::invalidateDonatedInputs(
 +    PJRT_LoadedExecutable_Execute_Args *args,
@@ -144,7 +144,7 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
 --- a/pjrt_implementation/src/api/module_builder/module_builder.cc
 +++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
-@@ -100,2 +100,23 @@
+@@ -124,2 +124,23 @@ moduleHasShardingConstraints(const mlir::OwningOpRef<mlir::ModuleOp> &m) {
  
 +// TODO: Implement proper buffer donation by preserving the input/output alias
 +// mapping through compilation and reusing donated input storage for outputs.
@@ -168,28 +168,41 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 +}
 +
  // Returns true if any sharding genuinely partitions a tensor across devices
-@@ -342,2 +363,5 @@
+@@ -394,2 +412,5 @@ ModuleBuilder::buildModule(
  
 +  std::vector<size_t> donatable_input_indices =
 +      collectDonatableInputIndices(mlir_module);
 +
    status = runFrontendSHLOPipeline(mlir_module, compile_options.export_path,
-@@ -460,2 +484,3 @@
+@@ -484,3 +505,3 @@ ModuleBuilder::buildModule(
+   if (is_codegen_py_load) {
+-    return buildModuleForTTNNCodegenLoad(
++    auto result = buildModuleForTTNNCodegenLoad(
+         mlir_module, std::move(original_mlir_code), std::move(num_arguments),
+@@ -488,2 +509,7 @@ ModuleBuilder::buildModule(
+         std::move(optimized_mlir_code), graph_hash, std::move(compile_options));
++    if (std::get<1>(result)) {
++      std::get<1>(result)->setDonatableInputIndices(
++          std::move(donatable_input_indices));
++    }
++    return result;
+   }
+@@ -529,2 +555,3 @@ ModuleBuilder::buildModule(
    // a name, otherwise some default string like the current one.
 +  std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> result;
    std::string executable_name = "tt_executable";
-@@ -463,3 +488,3 @@
+@@ -532,3 +559,3 @@ ModuleBuilder::buildModule(
    if (compile_options.backend == BackendRuntime::TTNNFlatbuffer) {
 -    return buildModuleForTTNNRuntime(
 +    result = buildModuleForTTNNRuntime(
          mlir_module, std::move(original_mlir_code), std::move(ttir_mlir),
-@@ -472,3 +497,3 @@
-              compile_options.backend == BackendRuntime::TTNNCodegenPy) {
+@@ -540,3 +567,3 @@ ModuleBuilder::buildModule(
+   } else if (is_codegen_cpp || is_codegen_py) {
 -    return buildModuleForTTNNCodegen(
 +    result = buildModuleForTTNNCodegen(
          mlir_module, std::move(original_mlir_code), std::move(ttir_mlir),
-@@ -479,6 +504,12 @@
-         std::move(optimized_mlir_code), std::move(compile_options));
+@@ -547,6 +574,12 @@ ModuleBuilder::buildModule(
+         std::move(optimized_mlir_code), graph_hash, std::move(compile_options));
 +  } else {
 +    LOG_F(ERROR, "Unsupported backend option");
 +    return {tt_pjrt_status::kInvalidArgument, nullptr};
@@ -206,7 +219,7 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 diff --git a/pjrt_implementation/src/api/so_loaded_executable_instance.cc b/pjrt_implementation/src/api/so_loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/so_loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/so_loaded_executable_instance.cc
-@@ -96,2 +96,8 @@
+@@ -97,2 +97,8 @@ SOLoadedExecutableInstance::execute(PJRT_LoadedExecutable_Execute_Args *args) {
  
 +  DonationIndices donated_indices;
 +  tt_pjrt_status status = validateInputBuffers(args, donated_indices);
@@ -215,12 +228,12 @@ diff --git a/pjrt_implementation/src/api/so_loaded_executable_instance.cc b/pjrt
 +  }
 +
    std::optional<tt::runtime::Device> runtime_device =
-@@ -110,3 +116,3 @@
+@@ -111,3 +117,3 @@ SOLoadedExecutableInstance::execute(PJRT_LoadedExecutable_Execute_Args *args) {
    input_tensors.reserve(args->num_args);
 -  tt_pjrt_status status = getInputRuntimeTensors(
 +  status = getInputRuntimeTensors(
        args->argument_lists, args->num_args, args->num_devices, *runtime_device,
-@@ -164,2 +170,4 @@
+@@ -175,2 +181,4 @@ SOLoadedExecutableInstance::execute(PJRT_LoadedExecutable_Execute_Args *args) {
    }
 +  invalidateDonatedInputs(args, donated_indices);
 +

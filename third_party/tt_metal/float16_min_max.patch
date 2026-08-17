@@ -1,10 +1,8 @@
-diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
---- ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
-@@ -29,6 +29,59 @@ namespace ttnn {
-
- using namespace operations;
-
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp b/ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
+--- a/ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
++++ b/ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
+@@ -32,2 +32,55 @@ using namespace operations;
+ 
 +namespace {
 +
 +Tensor run_promoted_min_max(
@@ -59,55 +57,48 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
 +}  // namespace
 +
  // nextafter
- Tensor nextafter(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
-     const float eps = tt::tt_metal::hal::get_eps();
-@@ -61,12 +114,11 @@ Tensor minimum(
-     const std::optional<Tensor>& optional_output_tensor,
-     ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
-     ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+@@ -61,3 +114,3 @@ Tensor minimum(
      ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
 -    return ttnn::detail::invoke_binary_ng(
 +    return run_promoted_min_max(
          input_tensor_a,
-         input_tensor_b,
+@@ -65,3 +118,2 @@ Tensor minimum(
          binary::BinaryOpType::MINIMUM,
 -        std::nullopt,
          memory_config,
-         optional_output_tensor,
-         post_activations,
-@@ -102,12 +154,11 @@ Tensor maximum(
-     const std::optional<Tensor>& optional_output_tensor,
-     ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
-     ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+@@ -102,3 +154,3 @@ Tensor maximum(
      ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
 -    return ttnn::detail::invoke_binary_ng(
 +    return run_promoted_min_max(
          input_tensor_a,
-         input_tensor_b,
+@@ -106,3 +158,2 @@ Tensor maximum(
          binary::BinaryOpType::MAXIMUM,
 -        std::nullopt,
          memory_config,
-         optional_output_tensor,
-         post_activations,
-
-diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
---- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
-@@ -225,26 +225,9 @@ Tensor clamp(
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp b/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
+--- a/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
++++ b/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
+@@ -225,27 +225,10 @@ Tensor clamp(
+     TT_FATAL((max.has_value() || min.has_value()), "Only one of 'min' or 'max' can be None. Please provide one value");
 -    if (!max.has_value()) {
 -        return ttnn::where(
 -            ttnn::ge(input_a, min.value(), std::nullopt, output_memory_config),
 -            input_a,
 -            min.value(),
 -            output_memory_config);
--    }
++    Tensor result = input_a;
++    if (min.has_value()) {
++        result = ttnn::maximum(result, min.value(), std::nullopt, output_memory_config);
+     }
 -    if (!min.has_value()) {
 -        return ttnn::where(
 -            ttnn::le(input_a, max.value(), std::nullopt, output_memory_config),
 -            input_a,
 -            max.value(),
 -            output_memory_config);
--    }
++    if (max.has_value()) {
++        result = ttnn::minimum(result, max.value(), std::nullopt, output_memory_config);
+     }
 -    Tensor a_max = ttnn::minimum(input_a, max.value(), std::nullopt, output_memory_config);
 -    Tensor temp = ttnn::where(
 -        ttnn::eq(min.value(), 0.0f, std::nullopt, output_memory_config),
@@ -119,12 +110,5 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp 
 -        max.value(),
 -        temp,
 -        output_memory_config);
-+    Tensor result = input_a;
-+    if (min.has_value()) {
-+        result = ttnn::maximum(result, min.value(), std::nullopt, output_memory_config);
-+    }
-+    if (max.has_value()) {
-+        result = ttnn::minimum(result, max.value(), std::nullopt, output_memory_config);
-+    }
 +    return result;
  }

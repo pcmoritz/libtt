@@ -1,10 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10807,7 +10807,38 @@ public:
-     rewriter.replaceOp(srcOp, count);
-     return success();
-   }
+@@ -11098,2 +11098,33 @@ public:
  };
 +
 +class StableHLOToTTIRNegOpConversionPattern
@@ -38,15 +35,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  }
 +};
  } // namespace
-
- static void
-@@ -10836,8 +10867,7 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
-   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
-       mlir::stablehlo::IsFiniteOp, mlir::tt::ttir::IsFiniteOp>>(typeConverter,
+@@ -11130,4 +11161,3 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
                                                                  ctx);
 -  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
 -      mlir::stablehlo::NegOp, mlir::tt::ttir::NegOp>>(typeConverter, ctx);
 +  patterns.add<StableHLOToTTIRNegOpConversionPattern>(typeConverter, ctx);
-   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
-       mlir::stablehlo::RsqrtOp, mlir::tt::ttir::RsqrtOp>>(typeConverter, ctx);
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<

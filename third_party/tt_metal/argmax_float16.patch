@@ -1,9 +1,7 @@
 diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp b/ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp
---- ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp
-@@ -93,10 +93,11 @@
- 
-     if (input_layout == Layout::ROW_MAJOR) {
+--- a/ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp
++++ b/ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_operation.cpp
+@@ -95,6 +95,7 @@ void ArgMaxDeviceOperation::validate_on_program_cache_miss(
          TT_FATAL(
 -            input_tensor_a.dtype() == DataType::BFLOAT16 || input_tensor_a.dtype() == DataType::FLOAT32 ||
 -                input_tensor_a.dtype() == DataType::INT32 || input_tensor_a.dtype() == DataType::UINT32 ||
@@ -15,42 +13,26 @@ diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/argmax_device_oper
 +            "Only BFLOAT16, FLOAT16, FLOAT32, INT32, UINT32, and UINT16 are supported for inputs with ROW_MAJOR "
 +            "layout, got {}",
              input_tensor_a.dtype());
-     } else {
-         TT_FATAL(
 diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp b/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp
---- ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp
-+++ ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp
-@@ -15,6 +15,9 @@
- inline constexpr uint16_t MIN_UINT16 = 0x0000;      // Representation of minimum uint16 value
- inline constexpr uint16_t MAX_UINT16 = 0xFFFF;      // Representation of maximum uint16 value
+--- a/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp
++++ b/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp
+@@ -17,2 +17,5 @@ inline constexpr uint16_t MAX_UINT16 = 0xFFFF;      // Representation of maximum
  
 +inline constexpr uint16_t NEG_INF_FLOAT16 = 0xFC00;
 +inline constexpr uint16_t FLOAT16_SIGN_MASK = 0x8000;
 +
  /**
-  * @brief Returns a typed volatile L1 memory pointer based on the specified data format.
-  *
-@@ -39,6 +42,8 @@
- auto get_tt_l1_ptr_based_on_data_format(const uint32_t addr) {
-     if constexpr (data_format == DataFormat::Float16_b) {
+@@ -41,2 +44,4 @@ auto get_tt_l1_ptr_based_on_data_format(const uint32_t addr) {
          return reinterpret_cast<volatile tt_l1_ptr uint16_t*>(addr);
 +    } else if constexpr (data_format == DataFormat::Float16) {
 +        return reinterpret_cast<volatile tt_l1_ptr uint16_t*>(addr);
      } else if constexpr (data_format == DataFormat::UInt16) {
-         return reinterpret_cast<volatile tt_l1_ptr uint16_t*>(addr);
-     } else if constexpr (data_format == DataFormat::Float32) {
-@@ -79,6 +84,8 @@
-     // Check for supported datatypes
-     if constexpr (data_format == DataFormat::Float16_b) {
+@@ -81,2 +86,4 @@ auto get_default_value() {
          return uint16_t{NEG_INF_BFLOAT16};
 +    } else if constexpr (data_format == DataFormat::Float16) {
 +        return uint16_t{NEG_INF_FLOAT16};
      } else if constexpr (data_format == DataFormat::UInt16) {
-         return uint16_t{MIN_UINT16};
-     } else if constexpr (data_format == DataFormat::Float32) {
-@@ -94,6 +101,13 @@
-     }
- }
+@@ -96,2 +103,9 @@ auto get_default_value() {
  
 +inline bool float16_greater(uint16_t a, uint16_t b) {
 +    if ((a ^ b) & FLOAT16_SIGN_MASK) {
@@ -60,25 +42,16 @@ diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_com
 +}
 +
  /**
-  * @brief Helper function to calculate the index for argmax operations.
-  *
-@@ -178,6 +192,8 @@
- 
-     if constexpr (data_format == DataFormat::Float16_b) {
+@@ -180,2 +194,4 @@ void compare_values(
          update_max_if_greater(max_val, max_idx, val, index, bfloat16_greater);
 +    } else if constexpr (data_format == DataFormat::Float16) {
 +        update_max_if_greater(max_val, max_idx, val, index, float16_greater);
      } else if constexpr (data_format == DataFormat::Float32) {
-         update_max_if_greater(max_val, max_idx, val, index, float32_greater);
-     } else if constexpr (data_format == DataFormat::UInt16) {
 diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp b/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp
---- ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp
-+++ ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp
-@@ -77,6 +77,13 @@
-                         return bfloat16_greater(a, b);
-                     });
--
-+
+--- a/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp
++++ b/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp
+@@ -79,2 +79,9 @@ inline void find_argmax_for_core(
+ 
 +            } else if constexpr (data_format == DataFormat::Float16) {
 +                uint16_t val = in_vals[i - red_dim_offset];
 +                process_value_comparison<data_format, uint16_t, reduce_all>(
@@ -87,21 +60,12 @@ diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_arg
 +                    });
 +
              } else if constexpr (data_format == DataFormat::UInt16) {
-                 uint16_t val = in_vals[i - red_dim_offset];
-                 process_value_comparison<data_format, uint16_t, reduce_all>(
-@@ -129,6 +136,7 @@
-  * @tparam num_cores Number of cores that participated in the reduction operation
-  * @tparam data_format Data format of the values being compared. Supported formats:
+@@ -131,2 +138,3 @@ inline void find_argmax_for_core(
   *                     - DataFormat::Float16_b: 16-bit bfloat16 floating point
 + *                     - DataFormat::Float16: 16-bit IEEE 754 floating point
   *                     - DataFormat::UInt16: 16-bit unsigned integer
-  *                     - DataFormat::Float32: 32-bit IEEE 754 floating point
-  *                     - DataFormat::Int32: 32-bit signed integer
-@@ -170,6 +178,13 @@
-                     return bfloat16_greater(a, b);
-                 });
--
-+
+@@ -172,2 +180,9 @@ inline uint32_t find_argmax_from_intermediate_outputs(
+ 
 +        } else if constexpr (data_format == DataFormat::Float16) {
 +            volatile tt_l1_ptr auto i_red_vals =
 +                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(red_val_cb_local_base_addr + i * red_val_size_per_core);
@@ -110,5 +74,3 @@ diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_arg
 +                inner_idx, i_red_vals, i_red_idxs, max_val, max_idx, float16_greater);
 +
          } else if constexpr (data_format == DataFormat::UInt16) {
-             volatile tt_l1_ptr auto i_red_vals =
-                 reinterpret_cast<volatile tt_l1_ptr uint16_t*>(red_val_cb_local_base_addr + i * red_val_size_per_core);

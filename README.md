@@ -71,7 +71,7 @@ bazel test //tests:jax_test_suite \
   --test_arg=-v
 ```
 
-Current baseline (August 2026): **3236 failed, 22394 passed, 6538 skipped.**
+Current baseline (August 2026): **3722 failed, 21923 passed, 6523 skipped.**
 
 ## Qwen3 With SGLang-JAX
 

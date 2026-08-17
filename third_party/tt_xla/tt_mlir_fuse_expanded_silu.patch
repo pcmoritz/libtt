@@ -1,16 +1,11 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -14,6 +14,7 @@
- #include "mlir/IR/Attributes.h"
- #include "mlir/IR/BuiltinAttributes.h"
+@@ -18,2 +18,3 @@
  #include "mlir/IR/BuiltinTypes.h"
 +#include "mlir/IR/Matchers.h"
  #include "mlir/IR/Operation.h"
- #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
- #include "llvm/ADT/SmallSet.h"
-@@ -532,6 +532,59 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
- class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
-   using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
+@@ -537,2 +538,55 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  
 +  static mlir::Value lookThroughSplatConstantViewOps(mlir::Value value) {
 +    while (Operation *op = value.getDefiningOp()) {
@@ -66,25 +61,10 @@
 +  }
 +
  public:
-   mlir::LogicalResult
-   matchAndRewrite(MultiplyOp multiplyOp,
-@@ -543,21 +596,19 @@ public:
+@@ -546,10 +600,14 @@ public:
  
 -    SigmoidOp sigmoidOp = nullptr;
 -    mlir::Value otherOperand;
--
--    if (auto lhsSigmoid = lhs.getDefiningOp<SigmoidOp>()) {
--      sigmoidOp = lhsSigmoid;
--      otherOperand = rhs;
--    } else if (auto rhsSigmoid = rhs.getDefiningOp<SigmoidOp>()) {
--      sigmoidOp = rhsSigmoid;
--      otherOperand = lhs;
--    }
--
--    if (!sigmoidOp || !sigmoidOp->hasOneUse()) {
--      return mlir::failure();
--    }
--
 +    auto matchSigmoidLike = [](mlir::Value value) -> mlir::Value {
 +      if (auto sigmoidOp = value.getDefiningOp<SigmoidOp>();
 +          sigmoidOp && sigmoidOp->hasOneUse()) {
@@ -92,17 +72,25 @@
 +      }
 +      return matchExpandedSigmoidInput(value);
 +    };
-+
+ 
+-    if (auto lhsSigmoid = lhs.getDefiningOp<SigmoidOp>()) {
+-      sigmoidOp = lhsSigmoid;
+-      otherOperand = rhs;
+-    } else if (auto rhsSigmoid = rhs.getDefiningOp<SigmoidOp>()) {
+-      sigmoidOp = rhsSigmoid;
 +    mlir::Value sigmoidInput = matchSigmoidLike(lhs);
 +    mlir::Value otherOperand = rhs;
 +    if (!sigmoidInput) {
 +      sigmoidInput = matchSigmoidLike(rhs);
-+      otherOperand = lhs;
-+    }
-+
+       otherOperand = lhs;
+@@ -557,9 +615,3 @@ public:
+ 
+-    if (!sigmoidOp || !sigmoidOp->hasOneUse()) {
+-      return mlir::failure();
+-    }
+-
 -    mlir::Value sigmoidInput =
 -        ttmlir::utils::lookThrough<TypecastOp>(sigmoidOp.getInput());
 -    if (sigmoidInput != otherOperand) {
 +    if (!sigmoidInput || sigmoidInput != otherOperand) {
        return mlir::failure();
-     }

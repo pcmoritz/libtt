@@ -1,8 +1,7 @@
-diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
---- ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
-+++ ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
-@@ -89,4 +89,17 @@ Tensor accumulation_invoke(
-     const std::optional<MemoryConfig>& memory_config,
+diff --git a/ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp b/ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
+--- a/ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
++++ b/ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
+@@ -91,2 +91,15 @@ Tensor accumulation_invoke(
      ttnn::prim::AccumulationOp op) {
 +    if (input_tensor.dtype() == DataType::FLOAT16 &&
 +        dtype.value_or(input_tensor.dtype()) == DataType::FLOAT16) {
@@ -18,4 +17,3 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.c
 +        return ttnn::typecast(result, DataType::FLOAT16, memory_config, optional_out);
 +    }
      const auto& input_shape = input_tensor.logical_shape();
-     const int32_t& input_rank = input_shape.rank();

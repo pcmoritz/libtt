@@ -1,24 +1,16 @@
-diff -ruN tt_metal/distributed/mesh_workload.cpp tt_metal/distributed/mesh_workload.cpp
---- tt_metal/distributed/mesh_workload.cpp
-+++ tt_metal/distributed/mesh_workload.cpp
-@@ -39,7 +39,7 @@
- #include "tt_metal/impl/dispatch/device_command.hpp"
- #include "tracy/Tracy.hpp"
+diff --git a/tt_metal/distributed/mesh_workload.cpp b/tt_metal/distributed/mesh_workload.cpp
+--- a/tt_metal/distributed/mesh_workload.cpp
++++ b/tt_metal/distributed/mesh_workload.cpp
+@@ -41,3 +41,3 @@
  #include "tt_metal/distributed/fd_mesh_command_queue.hpp"
 -#include "tt_metal/impl/debug/inspector/inspector.hpp"
 +#include "debug/inspector/inspector.hpp"
  
- #include <umd/device/types/core_coordinates.hpp>
- #include <impl/dispatch/dispatch_core_manager.hpp>
-diff -ruN tt_metal/impl/program/program.cpp tt_metal/impl/program/program.cpp
---- tt_metal/impl/program/program.cpp
-+++ tt_metal/impl/program/program.cpp
-@@ -68,7 +68,7 @@
- #include <tt_stl/overloaded.hpp>
- #include "sub_device_types.hpp"
+diff --git a/tt_metal/impl/program/program.cpp b/tt_metal/impl/program/program.cpp
+--- a/tt_metal/impl/program/program.cpp
++++ b/tt_metal/impl/program/program.cpp
+@@ -70,3 +70,3 @@
  #include "tt_memory.h"
 -#include "tt_metal/impl/debug/inspector/inspector.hpp"
 +#include "debug/inspector/inspector.hpp"
  #include "tt_metal/impl/dispatch/data_collection.hpp"
- #include "tt_metal/impl/dispatch/device_command.hpp"
- #include "tt_metal/impl/dispatch/dispatch_core_common.hpp"

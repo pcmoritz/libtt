@@ -1,8 +1,7 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -3032,6 +3032,106 @@
- 
- namespace {
+@@ -3041,2 +3041,102 @@ namespace {
  
 +struct Pool2DLayout {
 +  SmallVector<size_t, 2> spatialDims;
@@ -105,37 +104,21 @@
 +}
 +
  class StableHLOToTTIRReduceWindowOpConversionPattern
-     : public OpConversionPattern<mlir::stablehlo::ReduceWindowOp> {
-   using OpConversionPattern<
-@@ -3048,6 +3148,7 @@
-                   mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
-                   ConversionPatternRewriter &rewriter) const override {
+@@ -3057,2 +3157,3 @@ public:
      using TypicalInitReductionValue::NEG_INF;
 +    using TypicalInitReductionValue::POS_INF;
      using TypicalInitReductionValue::ZERO;
- 
-     // Validate basic op structure.
-@@ -3098,6 +3199,9 @@
-       } else if (isa<mlir::stablehlo::MaxOp>(reduceOp)) {
-         result = rewriter.create<ttir::MaximumOp>(srcOp.getLoc(), resultType,
+@@ -3107,2 +3208,5 @@ public:
                                                     input, init);
 +      } else if (isa<mlir::stablehlo::MinOp>(reduceOp)) {
 +        result = rewriter.create<ttir::MinimumOp>(srcOp.getLoc(), resultType,
 +                                                   input, init);
        } else if (isa<mlir::stablehlo::MulOp>(reduceOp)) {
-         result = rewriter.create<ttir::MultiplyOp>(srcOp.getLoc(), resultType,
-                                                     input, init);
-@@ -3128,6 +3232,7 @@
-     SmallVector<mlir::Operation *> reductionOps;
-     for (Operation &op : llvm::drop_end(operations, 1)) {
+@@ -3138,2 +3242,3 @@ public:
        if (!isa<mlir::stablehlo::AddOp, mlir::stablehlo::MaxOp,
 +               mlir::stablehlo::MinOp,
                 mlir::stablehlo::MulOp>(&op)) {
-         return rewriter.notifyMatchFailure(srcOp, "Unsupported reduction op.");
-       }
-@@ -3198,87 +3303,27 @@
-       }
-     }
+@@ -3208,6 +3313,8 @@ public:
  
 -    // Handle 5D input (3D max pooling) by decomposing into two 2D max pooling
 -    // passes.
@@ -148,9 +131,7 @@
 +        indicesOfValuesGreaterThanOne(windowDimensions.asArrayRef()).size() ==
 +            3) {
        return lowerReduceWindow5D(srcOp, adaptor, rewriter, *initValues,
-                                  reductionOps, windowDimensions, windowStrides,
-                                  windowDilations, padding, ceilMode);
-     }
+@@ -3217,74 +3324,12 @@ public:
  
 -    // Lowering to a single TTIR pooling op is supported only for 2D and 4D
 -    // input tensors.
@@ -234,11 +215,7 @@
      }
 +    SmallVector<size_t, 2> spatialDimIndices = layout->spatialDims;
  
-     // Construct attributes for TTIR pooling ops.
- 
-@@ -3319,56 +3364,55 @@
- 
-       RankedTensorType inputType =
+@@ -3329,24 +3374,8 @@ public:
            mlir::cast<RankedTensorType>(input.getType());
 -      RankedTensorType resultType = cast<RankedTensorType>(
 +      RankedTensorType originalResultType = cast<RankedTensorType>(
@@ -267,9 +244,7 @@
 +          layout->getPermutedShape(inputType.getShape());
 +      if (layout->needsPermute()) {
          input = rewriter.create<ttir::PermuteOp>(
-             srcOp.getLoc(),
-             RankedTensorType::get(permutedInputShape,
-                                   inputType.getElementType(),
+@@ -3356,25 +3385,40 @@ public:
                                    inputType.getEncoding()),
 -            input, permutation);
 +            input, layout->permutation);
@@ -326,11 +301,7 @@
 +              srcOp.getLoc(), originalResultType, result,
 +              layout->inversePermutation);
          }
-         return result;
-       };
-@@ -3380,6 +3424,20 @@
-                          strideForTTIROps, dilationForTTIROps,
-                          paddingForTTIROps, ceilMode)
+@@ -3390,2 +3434,16 @@ public:
                       .getResult();
 +      } else if (isa<mlir::stablehlo::MinOp>(reductionOp) &&
 +                 initVal == POS_INF &&
@@ -347,32 +318,20 @@
 +        result = rewriter.create<ttir::NegOp>(srcOp.getLoc(), resultType,
 +                                               result);
        } else if (isa<mlir::stablehlo::AddOp>(reductionOp) && initVal == ZERO) {
-         // Special case of sum pooling followed by a convenient div op.
-         // TODO(acicovic): Check why was i == 0 originally added as a condition.
-@@ -3822,6 +3880,9 @@
-       }
-       if (checkInitValue(constantOp, TypicalInitReductionValue::NEG_INF)) {
+@@ -3832,2 +3890,5 @@ private:
          initValues.push_back(TypicalInitReductionValue::NEG_INF);
 +      } else if (checkInitValue(constantOp,
 +                                TypicalInitReductionValue::POS_INF)) {
 +        initValues.push_back(TypicalInitReductionValue::POS_INF);
        } else if (checkInitValue(constantOp, TypicalInitReductionValue::ZERO)) {
-         initValues.push_back(TypicalInitReductionValue::ZERO);
-       } else if (checkInitValue(constantOp, TypicalInitReductionValue::ONE)) {
-@@ -4712,8 +4773,8 @@
-     }
- 
+@@ -4722,4 +4783,4 @@ public:
      Location loc = srcOp.getLoc();
 -    auto operand = srcOp.getOperand();
 -    auto source = srcOp.getSource();
 +    Value operand = srcOp.getOperand();
 +    Value source = srcOp.getSource();
      auto initValue_ = srcOp.getInitValue();
- 
-     // Get window attributes
-@@ -4741,7 +4802,34 @@
-         loc, operandType, rewriter.getF32FloatAttr(fillValue));
- 
+@@ -4751,3 +4812,30 @@ public:
      // Tensor which we scatter into
 -    auto fullTensor = fullTensorOp.getResult();
 +    Value fullTensor = fullTensorOp.getResult();
@@ -404,11 +363,7 @@
 +          srcOp, "Only min and max selections are supported.");
 +    }
  
-     // Generate defaults if they dont exist
-     // Default window strides is all ones
-@@ -4757,52 +4845,17 @@
-                  : rewriter.getDenseI64ArrayAttr(
-                        SmallVector<int64_t>(windowDims.size() * 2, 0));
+@@ -4767,48 +4855,13 @@ public:
  
 -    // Adjust tensor layouts and args for MaxPool2dWithIndices
 -    // Get indices of elements larger than one which correspond to spatial dims
@@ -423,9 +378,7 @@
 +    if (!layout) {
        return rewriter.notifyMatchFailure(
 -          srcOp, "only 4D operands with two spatial dimensions are supported");
-+          srcOp, "Expected a static rank 2-5 pooling layout with at most two "
-+                 "active dimensions and any single active dimension trailing.");
-     }
+-    }
 -
 -    // Generate desired and current layouts (desired = N,H,W,C)
 -    // Generate permutation for current->desired layout
@@ -458,7 +411,9 @@
 -      if (currentLayout[i] == NON_SPATIAL) {
 -        currentLayout[i] = nonSpatialCount++;
 -      }
--    }
++          srcOp, "Expected a static rank 2-5 pooling layout with at most two "
++                 "active dimensions and any single active dimension trailing.");
+     }
 -
 -    // Permutation for current->desired layout and it's inverse
 -    auto permutation = ttmlir::utils::generatePermutation(
@@ -466,11 +421,7 @@
 -    auto inverseOfPermutation = ttmlir::utils::inversePermutation(permutation);
 +    SmallVector<size_t, 2> spatialDims = layout->spatialDims;
  
-     // Adjust args to match definition in MaxPool2dWithIndices
-     auto kernel = rewriter.getDenseI32ArrayAttr(
-@@ -4824,31 +4877,32 @@
- 
-     auto ceilMode = rewriter.getBoolAttr(false);
+@@ -4834,20 +4887,22 @@ public:
  
 -    // Apply input permutation to operand, source and tensor which we scatter
 -    // into (to N,H,W,C)
@@ -511,7 +462,7 @@
 +    source = normalizeValue(source, "_normalizeSource");
 +    fullTensor = normalizeValue(fullTensor, "_normalizeFullTensor");
  
-     // Calling MaxPool2dWithIndices op on operand
+@@ -4855,6 +4910,5 @@ public:
      // and obtaining indices which will be used for Scatter
 -    auto pooledType = RankedTensorType::get(sourcePermShape,
 -                                            source.getType().getElementType());
@@ -520,11 +471,7 @@
 -        RankedTensorType::get(sourcePermShape,
 +        RankedTensorType::get(pooledType.getShape(),
                                rewriter.getIntegerType(32)); // i32 for indices
- 
-     Value pooledEmpty = rewriter.create<ttir::EmptyOp>(loc, pooledType);
-@@ -4893,8 +4947,14 @@
-       return rewriter.notifyMatchFailure(
-           srcOp, "SelectAndScatterOp cannot specify reduce type.");
+@@ -4903,4 +4957,10 @@ public:
      }
 +    ttcore::ReduceType reduceType = *scatterReduceType;
 +    // With zero fill, non-overlapping windows only need an overwrite.
@@ -536,11 +483,7 @@
 -        ttcore::ReduceTypeAttr::get(rewriter.getContext(), *scatterReduceType);
 +        ttcore::ReduceTypeAttr::get(rewriter.getContext(), reduceType);
      auto scatterResult = rewriter.create<ttir::ScatterOp>(
-         loc, scatterOutputType,
-         reshapedFullTensor, // input tensor
-@@ -4904,34 +4964,32 @@
-         reduceTypeAttr);    // reduction type
- 
+@@ -4914,15 +4974,24 @@ public:
      // Reshape back to N,H,W,C
 -    auto finalOutputType = RankedTensorType::get(
 -        fullTensorPermShape, scatterOutputType.getElementType());
@@ -553,6 +496,8 @@
 -    auto finalPermutedResult = applyPermutationToValue(
 -        rewriter, loc, finalResult, originalShape, finalResult.getType(),
 -        inverseOfPermutation, "_permuteBackToOriginal");
+-
+-    rewriter.replaceOp(srcOp, finalPermutedResult);
 +    auto normalizedOutputType = mlir::cast<RankedTensorType>(
 +        fullTensor.getType());
 +    Value result = generateReshape(scatterResult, normalizedOutputType,
@@ -573,12 +518,10 @@
 +          mlir::cast<RankedTensorType>(result.getType()),
 +          layout->inversePermutation, "_restoreLayout");
 +    }
- 
--    rewriter.replaceOp(srcOp, finalPermutedResult);
++
 +    rewriter.replaceOp(srcOp, result);
      return success();
-   }
- 
+@@ -4931,13 +5000,2 @@ public:
  private:
 -  llvm::SmallVector<int64_t>
 -  getIndicesofElementsLargerThanOne(llvm::ArrayRef<int64_t> array) const {
@@ -592,11 +535,7 @@
 -  }
 -
    RankedTensorType getNHWFlattenedType(RankedTensorType unflattenedType) const {
-     llvm::ArrayRef<int64_t> shape = unflattenedType.getShape();
-     assert(shape.size() == 4 && "Expected 4D NHWC tensor");
-@@ -4942,9 +5000,8 @@
-   }
- 
+@@ -4952,5 +5010,4 @@ private:
    ttir::ReshapeOp
 -  generateReshape(mlir::TypedValue<mlir::RankedTensorType> input,
 -                  RankedTensorType outputType, PatternRewriter &rewriter,
@@ -604,5 +543,3 @@
 +  generateReshape(mlir::Value input, RankedTensorType outputType,
 +                  PatternRewriter &rewriter, StringRef suffix) const {
      return rewriter.create<ttir::ReshapeOp>(
-         ttmlir::utils::appendLocationSuffix(input.getLoc(), suffix), outputType,
-         input,

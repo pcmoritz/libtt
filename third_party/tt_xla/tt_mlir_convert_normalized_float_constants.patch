@@ -1,9 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
 --- a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
 +++ b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
-@@ -124,20 +124,14 @@ private:
- 
-   mlir::ElementsAttr rebuildFloatAttr(mlir::ElementsAttr attr,
+@@ -126,16 +126,10 @@ private:
                                        mlir::ShapedType newType) const {
 -    const size_t bitWidth = attr.getElementType().getIntOrFloatBitWidth();
 -    llvm::SmallVector<mlir::APFloat> floatValues;
@@ -28,5 +26,3 @@ diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dial
 +          return value;
 +        });
      return mlir::DenseElementsAttr::get(newType, floatValues);
-   }
- };

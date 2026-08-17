@@ -1,7 +1,8 @@
-diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
---- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
-@@ -33,3 +33,17 @@ void UnaryDeviceOperation::validate_on_program_cache_miss(
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp b/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+--- a/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
++++ b/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+@@ -32,2 +32,16 @@ void UnaryDeviceOperation::validate_on_program_cache_miss(
+ 
 +    if (args.op_chain.size() == 1 && args.op_chain.front().type() == operations::unary::UnaryOpType::BITCAST) {
 +        const DataType output_dtype = output_tensor.has_value() ? output_tensor->dtype() : args.output_dtype;
 +        TT_FATAL(
@@ -17,22 +18,14 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.
 +    }
 +
      auto out_memory_config = args.memory_config;
-     if (output_tensor.has_value()) {
-         out_memory_config = output_tensor->memory_config();
-diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
---- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -118,6 +118,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_descriptor(
-     const auto& input = tensor_args.input;
-     const auto& ops_chain = operation_attributes.op_chain;
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp b/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+--- a/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
++++ b/ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+@@ -120,2 +120,3 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
 +    const bool is_bitcast = ops_chain.size() == 1 && ops_chain[0].type() == UnaryOpType::BITCAST;
      auto compute_ops_chain = ops_chain;
-     const bool promote_narrow_float =
-         uses_raw_16bit_sfpu_path(input.dtype()) && ops_chain[0].type() != UnaryOpType::TYPECAST &&
-@@ -155,7 +156,10 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_descriptor(
-     DataFormat cb_data_format_output =
-         promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format
+@@ -159,4 +160,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
                                                        : datatype_to_dataformat_converter(output.dtype());
 -    if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
 -        cb_data_format_output = DataFormat::UInt16;
@@ -42,4 +35,3 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
 +        cb_data_format_output =
 +            input.element_size() == sizeof(uint16_t) ? DataFormat::UInt16 : DataFormat::UInt32;
      }
-     uint32_t single_tile_size_output = tile_size(cb_data_format_output);

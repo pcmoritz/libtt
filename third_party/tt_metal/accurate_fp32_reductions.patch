@@ -1,6 +1,6 @@
-diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
---- ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
-+++ ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
+diff --git a/ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp b/ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
+--- a/ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
++++ b/ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
 @@ -40,7 +40,4 @@ constexpr bool is_sfpu_reduce_path() {
      if constexpr (data_format != DataFormat::Int32) {
 -        // Float32 opts into the SFPU path only in Accurate mode, and only for SUM (accurate ttnn.mean,
@@ -11,9 +11,9 @@ diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp ttnn/cpp/ttnn/kern
 +        // Float32 opts into the SFPU path only in Accurate mode.
 +        if constexpr (fp32_mode != ReduceFp32Mode::Accurate || data_format != DataFormat::Float32) {
              return false;
-diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
---- ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
-+++ ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
+diff --git a/ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl b/ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
+--- a/ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
++++ b/ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
 @@ -30,4 +30,8 @@ template <DataFormat format>
  ALWI void sfpu_reduce_max_fold_init() {
 -    static_assert(format == DataFormat::Int32, "SFPU reduce MAX fold: Int32 only");
@@ -36,39 +36,39 @@ diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl ttnn/cpp/ttnn/ker
 +        binary_max_tile(a, b, out);
 +    }
  }
-diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
---- ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
-+++ ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
+diff --git a/ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp b/ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
+--- a/ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
++++ b/ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
 @@ -65,3 +65,4 @@ inline bool use_sfpu_reduce_path(
      }
 -    return use_sfpu_reduce && dtype == tt::tt_metal::DataType::FLOAT32 && math_op == ReduceOpMath::SUM;
 +    return use_sfpu_reduce && dtype == tt::tt_metal::DataType::FLOAT32 &&
 +           (math_op == ReduceOpMath::SUM || math_op == ReduceOpMath::MAX);
  }
-diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_h_neg.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_h_neg.cpp
---- ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_h_neg.cpp
-+++ ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_h_neg.cpp
+diff --git a/ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_h_neg.cpp b/ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_h_neg.cpp
+--- a/ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_h_neg.cpp
++++ b/ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_h_neg.cpp
 @@ -38,4 +38,5 @@ void kernel_main() {
-     constexpr DataFormat reduce_format = static_cast<DataFormat>(unpack_src_format[cb_input]);
+     constexpr DataFormat reduce_format = static_cast<DataFormat>(unpack_src_format[dfb_input]);
 +    constexpr auto fp32_mode = get_compile_time_arg_val(4) != 0 ? ReduceFp32Mode::Accurate : ReduceFp32Mode::Fast;
  
 -    if constexpr (is_sfpu_reduce_path<REDUCE_OP, REDUCE_DIM, reduce_format>()) {
 +    if constexpr (is_sfpu_reduce_path<REDUCE_OP, REDUCE_DIM, reduce_format, fp32_mode>()) {
          constexpr uint32_t row_chunk = compute_kernel_lib::DEST_AUTO_LIMIT - 1;
-diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_w_neg.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_w_neg.cpp
---- ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_w_neg.cpp
-+++ ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_w_neg.cpp
+diff --git a/ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_w_neg.cpp b/ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_w_neg.cpp
+--- a/ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_w_neg.cpp
++++ b/ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_w_neg.cpp
 @@ -40,4 +40,5 @@ void kernel_main() {
-     constexpr DataFormat reduce_format = static_cast<DataFormat>(unpack_src_format[cb_input]);
+     constexpr DataFormat reduce_format = static_cast<DataFormat>(unpack_src_format[dfb_input]);
 +    constexpr auto fp32_mode = get_compile_time_arg_val(4) != 0 ? ReduceFp32Mode::Accurate : ReduceFp32Mode::Fast;
  
 -    if constexpr (is_sfpu_reduce_path<REDUCE_OP, REDUCE_DIM, reduce_format>()) {
 +    if constexpr (is_sfpu_reduce_path<REDUCE_OP, REDUCE_DIM, reduce_format, fp32_mode>()) {
          constexpr uint32_t acc_dst = 0;
-diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
---- ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
-+++ ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
-@@ -114,6 +114,8 @@ Tensor reduce(
+diff --git a/ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp b/ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
+--- a/ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
++++ b/ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
+@@ -113,6 +113,8 @@ Tensor reduce(
  
 -    // Accurate fp32 mean: SFPU AVG (lowered to SUM + 1/N below); FPU fallback without fp32_dest_acc_en or on Quasar.
 -    const bool use_sfpu_fp32_mean =
@@ -80,86 +80,86 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/
 +         reduce_math == tt::tt_metal::ReduceOpMath::MAX) &&
 +        arch != tt::ARCH::QUASAR && config.fp32_dest_acc_en;
  
-@@ -152,3 +154,3 @@ Tensor reduce(
+@@ -151,3 +153,3 @@ Tensor reduce(
      tt::tt_metal::ReduceOpMath prim_reduce_math = reduce_math;
 -    if ((use_rm_dense || use_sfpu_fp32_mean) && reduce_math == tt::tt_metal::ReduceOpMath::AVG) {
 +    if ((use_rm_dense || use_sfpu_fp32_reduce) && reduce_math == tt::tt_metal::ReduceOpMath::AVG) {
          prim_reduce_math = tt::tt_metal::ReduceOpMath::SUM;
-@@ -169,3 +171,3 @@ Tensor reduce(
+@@ -168,3 +170,3 @@ Tensor reduce(
      const bool use_post_mul =
 -        ttnn::prim::requires_post_mul(reduce_math, tilized_input.dtype(), scaler, use_sfpu_fp32_mean);
 +        ttnn::prim::requires_post_mul(reduce_math, tilized_input.dtype(), scaler, use_sfpu_fp32_reduce);
      const float reduce_scaler = use_post_mul ? 1.0f : scaler;
-@@ -213,3 +215,3 @@ Tensor reduce(
+@@ -212,3 +214,3 @@ Tensor reduce(
            (reduce_math == tt::tt_metal::ReduceOpMath::MAX || reduce_math == tt::tt_metal::ReduceOpMath::SUM)) ||
 -         use_sfpu_fp32_mean);
 +         use_sfpu_fp32_reduce);
  
-@@ -246,3 +248,3 @@ Tensor reduce(
+@@ -245,3 +247,3 @@ Tensor reduce(
              /*row_major_h_dense_path=*/false,
 -            /*use_sfpu_reduce=*/use_sfpu_fp32_mean);
 +            /*use_sfpu_reduce=*/use_sfpu_fp32_reduce);
  
-@@ -265,3 +267,3 @@ Tensor reduce(
+@@ -264,3 +266,3 @@ Tensor reduce(
              /*row_major_h_dense_path=*/false,
 -            /*use_sfpu_reduce=*/use_sfpu_fp32_mean);
 +            /*use_sfpu_reduce=*/use_sfpu_fp32_reduce);
      }
-@@ -287,3 +289,3 @@ Tensor reduce(
+@@ -286,3 +288,3 @@ Tensor reduce(
          /*row_major_h_dense_path=*/use_rm_dense_h,
 -        /*use_sfpu_reduce=*/use_sfpu_fp32_mean);
 +        /*use_sfpu_reduce=*/use_sfpu_fp32_reduce);
  }
-diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/kernels/compute/prod_nc.cpp ttnn/cpp/ttnn/operations/reduction/prod/device/kernels/compute/prod_nc.cpp
---- ttnn/cpp/ttnn/operations/reduction/prod/device/kernels/compute/prod_nc.cpp
-+++ ttnn/cpp/ttnn/operations/reduction/prod/device/kernels/compute/prod_nc.cpp
+diff --git a/ttnn/cpp/ttnn/operations/reduction/prod/device/kernels/compute/prod_nc.cpp b/ttnn/cpp/ttnn/operations/reduction/prod/device/kernels/compute/prod_nc.cpp
+--- a/ttnn/cpp/ttnn/operations/reduction/prod/device/kernels/compute/prod_nc.cpp
++++ b/ttnn/cpp/ttnn/operations/reduction/prod/device/kernels/compute/prod_nc.cpp
 @@ -9,2 +9,4 @@
  #include "api/compute/eltwise_binary.h"
 +#include "api/compute/eltwise_binary_sfpu.h"
 +#include "api/compute/eltwise_unary/eltwise_unary.h"
- #include "api/dataflow/circular_buffer.h"
+ #include "api/dataflow/dataflow_buffer.h"
 @@ -19,2 +21,4 @@ void kernel_main() {
      constexpr uint32_t dst0 = 0;
 +    constexpr uint32_t dst1 = 1;
-+    constexpr DataFormat input_format = static_cast<DataFormat>(unpack_src_format[cb_in0]);
++    constexpr DataFormat input_format = static_cast<DataFormat>(unpack_src_format[dfb_in0]);
  
 @@ -23,3 +27,7 @@ void kernel_main() {
  
--    binary_op_init_common(cb_in0, cb_in0, cb_out0);
+-    binary_op_init_common(dfb_in0, dfb_in0, dfb_out0);
 +    if constexpr (input_format == DataFormat::Float32) {
-+        init_sfpu(cb_in0, cb_out0);
++        init_sfpu(dfb_in0, dfb_out0);
 +    } else {
-+        binary_op_init_common(cb_in0, cb_in0, cb_out0);
++        binary_op_init_common(dfb_in0, dfb_in0, dfb_out0);
 +    }
-     pack_reconfig_data_format(cb_out0);
+     pack_reconfig_data_format(dfb_out0);
 @@ -37,8 +45,18 @@ void kernel_main() {
  
--        binary_dest_reuse_tiles_init<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_in0);
+-        binary_dest_reuse_tiles_init<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(dfb_in0);
 -        for (uint32_t j = 1; j < num_input_tiles; ++j) {
--            cb_in0_obj.wait_front(onetile);
+-            dfb_in0_obj.wait_front(onetile);
 -            binary_dest_reuse_tiles<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(
--                cb_in0, 0, dst0);
--            cb_in0_obj.pop_front(onetile);
+-                dfb_in0, 0, dst0);
+-            dfb_in0_obj.pop_front(onetile);
 +        if constexpr (input_format == DataFormat::Float32) {
 +            mul_binary_tile_init();
 +            for (uint32_t j = 1; j < num_input_tiles; ++j) {
-+                cb_in0_obj.wait_front(onetile);
-+                copy_tile(cb_in0, 0, dst1);
++                dfb_in0_obj.wait_front(onetile);
++                copy_tile(dfb_in0, 0, dst1);
 +                mul_binary_tile(dst0, dst1, dst0);
-+                cb_in0_obj.pop_front(onetile);
++                dfb_in0_obj.pop_front(onetile);
 +            }
 +        } else {
-+            binary_dest_reuse_tiles_init<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_in0);
++            binary_dest_reuse_tiles_init<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(dfb_in0);
 +            for (uint32_t j = 1; j < num_input_tiles; ++j) {
-+                cb_in0_obj.wait_front(onetile);
++                dfb_in0_obj.wait_front(onetile);
 +                binary_dest_reuse_tiles<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(
-+                    cb_in0, 0, dst0);
-+                cb_in0_obj.pop_front(onetile);
++                    dfb_in0, 0, dst0);
++                dfb_in0_obj.pop_front(onetile);
 +            }
          }
-diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_program_factory.cpp
---- ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_program_factory.cpp
+diff --git a/ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_program_factory.cpp b/ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_program_factory.cpp
+--- a/ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_program_factory.cpp
++++ b/ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_program_factory.cpp
 @@ -145,2 +145,7 @@ tt::tt_metal::ProgramDescriptor ProdNcDeviceOperation::ProdNcProgramFactory::cre
          needs_wh_fp32_workaround ? tt::tt_metal::MathFidelity::HiFi3 : tt::tt_metal::MathFidelity::HiFi4;
 +    std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(

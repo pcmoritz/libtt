@@ -1,15 +1,21 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -689,6 +689,2 @@ TTNNOperandsWorkaroundsFactory::createTanhOpOperandsWorkarounds() {
+   TTNNOperandWorkarounds operandWorkaround;
+-  // Tanh op accurate mode requires bfloat16 data type.
+-  // Issue: https://github.com/tenstorrent/tt-metal/issues/22593
+-  operandWorkaround.tensorDataTypeWorkaround =
+-      mlir::tt::ttcore::DataType::BFloat16;
+ 
 diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
-index 8378104..32eca62 100644
 --- a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
 +++ b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
-@@ -157,10 +157,14 @@ void run(const ::tt::target::ttnn::EltwiseUnaryOp *op,
-     break;
-   }
+@@ -159,5 +159,9 @@ void run(const ::tt::target::ttnn::EltwiseUnaryOp *op,
    case ::tt::target::ttnn::EltwiseUnaryOpType::Gelu: {
 -    runEltwiseUnaryWithFastAndApproximateModeOp(
 -        op, tensorPool, [](auto &&...args) {
 -          return ::ttnn::gelu(std::forward<decltype(args)>(args)...);
--        });
 +    runEltwiseUnaryOp(
 +        op, tensorPool,
 +        [](const auto &input, const auto &memoryConfig, const auto &output,
@@ -17,22 +23,4 @@ index 8378104..32eca62 100644
 +          return ::ttnn::gelu(
 +              input, ::ttnn::operations::unary::GeluVariant::TANH,
 +              memoryConfig, output, subCoreGrids);
-+        });
-     break;
-   }
-   case ::tt::target::ttnn::EltwiseUnaryOpType::IsFinite: {
-diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-index c1fb81d..f0e33a7 100644
---- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-+++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -685,10 +685,6 @@ TTNNOperandsWorkaroundsFactory::createRotaryEmbeddingOpOperandsWorkarounds(
- TTNNOperandsWorkarounds
- TTNNOperandsWorkaroundsFactory::createTanhOpOperandsWorkarounds() {
-   TTNNOperandWorkarounds operandWorkaround;
--  // Tanh op accurate mode requires bfloat16 data type.
--  // Issue: https://github.com/tenstorrent/tt-metal/issues/22593
--  operandWorkaround.tensorDataTypeWorkaround =
--      mlir::tt::ttcore::DataType::BFloat16;
- 
-   return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
-       .addInputOperandWorkaround(operandWorkaround)
+         });

@@ -1,8 +1,7 @@
---- tt_metal/impl/data_format/blockfloat_common.cpp
-+++ tt_metal/impl/data_format/blockfloat_common.cpp
-@@ -3,10 +3,15 @@
- // SPDX-License-Identifier: Apache-2.0
- 
+diff --git a/tt_metal/impl/data_format/blockfloat_common.cpp b/tt_metal/impl/data_format/blockfloat_common.cpp
+--- a/tt_metal/impl/data_format/blockfloat_common.cpp
++++ b/tt_metal/impl/data_format/blockfloat_common.cpp
+@@ -5,6 +5,10 @@
  #include <algorithm>
 +#include <bit>
  #include <tt_stl/span.hpp>
@@ -13,11 +12,7 @@
  
 +#include <tt-metalium/bfloat16.hpp>
  #include <tt_stl/assert.hpp>
- #include "blockfloat_common.hpp"
- #include "constants.hpp"
-@@ -328,6 +333,121 @@
-     return mantissa;
- }
+@@ -330,2 +334,112 @@ uint8_t convert_u32_to_bfp(uint32_t input, uint32_t shared_exp, bool is_exp_a) {
  
 +namespace {
 +
@@ -130,11 +125,7 @@
 +}  // namespace
 +
  template <tt::DataFormat BfpFormat>
- std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles(
-     ttsl::Span<const float> fp32_vec,
-@@ -349,6 +469,11 @@
-         BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp8 ||
-         BfpFormat == tt::DataFormat::Bfp2_b || BfpFormat == tt::DataFormat::Bfp4_b ||
+@@ -351,2 +465,7 @@ std::vector<uint32_t> pack_as_bfp_tiles(
          BfpFormat == tt::DataFormat::Bfp8_b);
 +    if constexpr (BfpFormat == tt::DataFormat::Bfp8_b && std::is_same_v<T, bfloat16>) {
 +        if (!row_major_input && !is_exp_a && is_standard_32x32_tile(tile)) {
@@ -142,5 +133,3 @@
 +        }
 +    }
  
-     auto tile_H = tile.has_value() ? tile->get_tile_shape()[0] : tt::constants::TILE_HEIGHT;
-     auto tile_W = tile.has_value() ? tile->get_tile_shape()[1] : tt::constants::TILE_WIDTH;

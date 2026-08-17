@@ -1,0 +1,18 @@
+diff --git a/ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp b/ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
+--- a/ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
++++ b/ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
+@@ -23,4 +23,4 @@ struct ChunkSizeConfig {
+     uint32_t output_partial_chunk_size_bytes;      // actual bytes written to DRAM for partial chunk
+-    uint32_t padded_input_full_chunk_size_bytes;   // CB page size (one full hardware tile)
+-    uint32_t padded_output_full_chunk_size_bytes;  // CB page size (one full hardware tile)
++    uint32_t padded_input_full_chunk_size_bytes;   // CB page size (rounded up to 32-element boundary)
++    uint32_t padded_output_full_chunk_size_bytes;  // CB page size (rounded up to 32-element boundary)
+     uint32_t full_chunks_per_row;
+@@ -38,5 +38,4 @@ ChunkSizeConfig calculate_chunk_config(
+ 
+-    // copy_tile and pack_tile always access a full hardware tile. Keep each CB page at least
+-    // that large so an LLK operation cannot cross into the next double-buffered page.
+-    constexpr uint32_t padded_full_elements = TILE_HW;
++    // CB page sizes: round up to next multiple of 32 elements for the unpacker.
++    const uint32_t padded_full_elements = tt::align(elements_per_full_chunk, 32u);
+     const uint32_t padded_input_full_chunk_size_bytes = padded_full_elements * input_element_size;

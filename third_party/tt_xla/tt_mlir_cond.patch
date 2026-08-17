@@ -1,54 +1,7 @@
-diff --git a/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp b/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
---- a/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
-+++ b/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
-@@ -79,13 +79,9 @@ static mlir::LogicalResult wrapFunctionBodyInManualComputationOp(
-     auto oldArg = sourceBlock.getArgument(i);
-     auto newArg = targetBlock.getArgument(i);
- 
--    for (auto &targetOp : targetBlock.getOperations()) {
--      for (auto &operand : targetOp.getOpOperands()) {
--        if (operand.get() == oldArg) {
--          operand.set(newArg);
--        }
--      }
--    }
-+    oldArg.replaceUsesWithIf(newArg, [&](OpOperand &use) {
-+      return manualComputationOp->isProperAncestor(use.getOwner());
-+    });
-   }
- 
-   // Update all func.return ops in manualComputationOp with sdy.return op.
-diff --git a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
---- a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
-+++ b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
-@@ -28,3 +28,10 @@ table WhileLoopOp {
-   inputs: [tt.target.ttnn.TensorRef];
-   outputs: [tt.target.ttnn.TensorRef];
- }
-+
-+table CaseOp {
-+  branch_program_ids: [uint32];
-+  index: tt.target.ttnn.TensorRef;
-+  inputs: [tt.target.ttnn.TensorRef];
-+  outputs: [tt.target.ttnn.TensorRef];
-+}
-diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
---- a/include/ttmlir/Target/TTNN/program.fbs
-+++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -55,6 +55,7 @@ union OpType {
-   NLPCreateQKVHeadsDecodeOp,
-   NLPConcatHeadsOp,
-   ConstantOp,
-+  CaseOp,
-   WhileLoopOp,
-   Conv1dOp,
-   Conv2dOp,
 diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
 --- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
 +++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
-@@ -170,6 +170,22 @@ def TTCore_LoadCachedOp : TTCore_Op<"load_cached", [Pure]> {
-   let hasVerifier = 1;
- }
+@@ -172,2 +172,18 @@ def TTCore_LoadCachedOp : TTCore_Op<"load_cached", [Pure]> {
  
 +def TTCore_CaseOp : TTCore_Op<"case",
 +    [MemoryEffects<[MemRead, MemWrite]>]> {
@@ -67,76 +20,87 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td b/include/ttmlir/Dial
 +}
 +
  def TTCore_WhileLoopOp : TTCore_Op<"while_loop",
-     [MemoryEffects<[MemRead, MemWrite]>]> {
-   let summary = "Repeatedly invoke an outlined program";
+diff --git a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
+--- a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
++++ b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
+@@ -30 +30,8 @@ table WhileLoopOp {
+ }
++
++table CaseOp {
++  branch_program_ids: [uint32];
++  index: tt.target.ttnn.TensorRef;
++  inputs: [tt.target.ttnn.TensorRef];
++  outputs: [tt.target.ttnn.TensorRef];
++}
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -59,2 +59,3 @@ union OpType {
+   ConstantOp,
++  CaseOp,
+   WhileLoopOp,
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
-@@ -48,6 +48,7 @@ struct ConvertTTIRToTTNNPass
-     target.addLegalOp<ttcore::DeviceOp>();
-     target.addLegalOp<ttcore::OptimizationBarrierOp>();
+@@ -50,2 +50,3 @@ struct ConvertTTIRToTTNNPass
      target.addLegalOp<ttcore::LoadCachedOp>();
 +    target.addLegalOp<ttcore::CaseOp>();
      target.addLegalOp<ttcore::WhileLoopOp>();
-     target.addLegalOp<ttcore::CompositeOp>();
+diff --git a/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp b/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
+--- a/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
++++ b/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
+@@ -81,9 +81,5 @@ static mlir::LogicalResult wrapFunctionBodyInManualComputationOp(
  
+-    for (auto &targetOp : targetBlock.getOperations()) {
+-      for (auto &operand : targetOp.getOpOperands()) {
+-        if (operand.get() == oldArg) {
+-          operand.set(newArg);
+-        }
+-      }
+-    }
++    oldArg.replaceUsesWithIf(newArg, [&](OpOperand &use) {
++      return manualComputationOp->isProperAncestor(use.getOwner());
++    });
+   }
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -41,6 +41,12 @@
- 
+@@ -42,2 +42,8 @@
  namespace mlir::tt::ttnn {
- ::flatbuffers::Offset<::tt::target::ttnn::Operation>
++::flatbuffers::Offset<::tt::target::ttnn::Operation>
 +createCaseOperation(FlatbufferObjectCache &cache, ttcore::CaseOp caseOp,
 +                    const llvm::StringMap<uint32_t> &programIndexMap,
 +                    const std::string &debugString,
 +                    const std::string &locInfo);
 +
-+::flatbuffers::Offset<::tt::target::ttnn::Operation>
- createWhileLoopOperation(
-     FlatbufferObjectCache &cache, ttcore::WhileLoopOp loop,
-     const llvm::StringMap<uint32_t> &programIndexMap,
-@@ -4886,6 +4892,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
-     return createOperation(cache, createOp(cache, constantOp), debugString,
-                            locInfo);
+ ::flatbuffers::Offset<::tt::target::ttnn::Operation>
+@@ -5050,2 +5056,6 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
    }
 +  if (auto caseOp = dyn_cast<ttcore::CaseOp>(op)) {
 +    return createCaseOperation(cache, caseOp, programIndexMap, debugString,
 +                               locInfo);
 +  }
    if (auto whileLoopOp = dyn_cast<ttcore::WhileLoopOp>(op)) {
-     return createWhileLoopOperation(cache, whileLoopOp, programIndexMap,
-                                       debugString, locInfo);
 diff --git a/runtime/lib/ttnn/operations/mlir_native/func_call.h b/runtime/lib/ttnn/operations/mlir_native/func_call.h
 --- a/runtime/lib/ttnn/operations/mlir_native/func_call.h
 +++ b/runtime/lib/ttnn/operations/mlir_native/func_call.h
-@@ -11,6 +11,7 @@
- namespace tt::runtime::ttnn::operations::mlir_native {
- 
+@@ -13,2 +13,3 @@ namespace tt::runtime::ttnn::operations::mlir_native {
  void run(const ::tt::target::ttnn::FuncCallOp *op, ProgramContext &context);
 +void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context);
  void run(const ::tt::target::ttnn::WhileLoopOp *op,
-          ProgramContext &context);
- 
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -358,6 +358,9 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
-   case ::tt::target::ttnn::OpType::FuncCallOp: {
-     return operations::mlir_native::run(op->type_as_FuncCallOp(), getContext());
+@@ -365,2 +365,5 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
    }
 +  case ::tt::target::ttnn::OpType::CaseOp: {
 +    return operations::mlir_native::run(op->type_as_CaseOp(), getContext());
 +  }
    case ::tt::target::ttnn::OpType::WhileLoopOp: {
-     return operations::mlir_native::run(op->type_as_WhileLoopOp(),
-                                         getContext());
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -1551,6 +1551,11 @@ std::vector<const ::tt::target::ttnn::TensorRef *>
-         opContext.type_as_FuncCallOp()->outputs());
-     break;
+@@ -1552,2 +1552,7 @@ std::vector<tt::runtime::TensorRef> getOpOutputRefs(OpContext opContextHandle) {
    }
 +  case ::tt::target::ttnn::OpType::CaseOp: {
 +    tensorRefs = utils::convertFbTensorRefsToVector(
@@ -144,11 +108,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +    break;
 +  }
    case ::tt::target::ttnn::OpType::WhileLoopOp: {
-     tensorRefs = utils::convertFbTensorRefsToVector(
-         opContext.type_as_WhileLoopOp()->outputs());
-@@ -2194,6 +2199,14 @@ std::vector<const ::tt::target::ttnn::TensorRef *>
-     }
-     break;
+@@ -2240,2 +2245,10 @@ std::vector<tt::runtime::TensorRef> getOpInputRefs(OpContext opContextHandle) {
    }
 +  case ::tt::target::ttnn::OpType::CaseOp: {
 +    auto *caseOp = opContext.type_as_CaseOp();
@@ -159,5 +119,3 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +    break;
 +  }
    case ::tt::target::ttnn::OpType::WhileLoopOp: {
-     for (const auto *input : *opContext.type_as_WhileLoopOp()->inputs()) {
-       tensorRefs.push_back(input);

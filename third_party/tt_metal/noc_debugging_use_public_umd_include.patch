@@ -1,6 +1,6 @@
-diff -ruN tt_metal/impl/debug/noc_debugging.cpp tt_metal/impl/debug/noc_debugging.cpp
---- tt_metal/impl/debug/noc_debugging.cpp
-+++ tt_metal/impl/debug/noc_debugging.cpp
+diff --git a/tt_metal/impl/debug/noc_debugging.cpp b/tt_metal/impl/debug/noc_debugging.cpp
+--- a/tt_metal/impl/debug/noc_debugging.cpp
++++ b/tt_metal/impl/debug/noc_debugging.cpp
 @@ -16,3 +16,2 @@
  #include <umd/device/types/xy_pair.hpp>
 -#include "tt_metal/third_party/umd/device/api/umd/device/types/xy_pair.hpp"

@@ -1,9 +1,7 @@
-diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
---- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
-@@ -776,7 +776,15 @@ std::pair<std::string, std::string> get_op_init_and_func_default(
-             return {"log_with_base_tile_init();", fmt::format("log_with_base_tile({}, 0x3fb8aa3bu);", idst)};
-         case UnaryOpType::ABS: return {"abs_tile_init();", fmt::format("abs_tile({});", idst)};
+diff --git a/ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp b/ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+--- a/ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
++++ b/ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+@@ -789,3 +789,11 @@ std::pair<std::string, std::string> get_op_init_and_func_default(
          case UnaryOpType::ABS_INT32: return {"abs_tile_init();", fmt::format("abs_tile_int32({});", idst)};
 -        case UnaryOpType::SIGN: return {"sign_tile_init();", fmt::format("sign_tile({});", idst)};
 +        case UnaryOpType::SIGN:
@@ -16,11 +14,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn
 +            }
 +            return {"sign_tile_init();", fmt::format("sign_tile({});", idst)};
          case UnaryOpType::SQUARE:
-             TT_FATAL(
-                 input_dtype.has_value(), "Missing input dtype: Expected a valid input dtype, but none was provided.");
-@@ -934,7 +942,13 @@ std::map<std::string, std::string> get_defines_impl(
-     std::pair<std::string, std::string> op_init_and_name = get_op_init_and_func(op_type, params, idst, input_dtype);
-     std::map<std::string, std::string> defines = {
+@@ -947,3 +955,9 @@ std::map<std::string, std::string> get_defines_impl(
          {init_def, op_init_and_name.first}, {func_def, op_init_and_name.second}};
 -    update_macro_defines(op_type, defines);
 +    if (op_type == UnaryOpType::SIGN && input_dtype == DataType::INT32) {
@@ -31,5 +25,3 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn
 +        update_macro_defines(op_type, defines);
 +    }
      return defines;
- }
- }  // namespace

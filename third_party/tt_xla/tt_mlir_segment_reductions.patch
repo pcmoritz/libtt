@@ -1,10 +1,24 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1042,3 +1042,3 @@ def TTNN_ProdOp : TTNN_Op<"prod"> {
+       return
+-        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds();
++        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(*this);
+     }
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -346,3 +346,4 @@ public:
+   // Create workaround for reduce (full) product op operands.
+-  static TTNNOperandsWorkarounds createReduceProdOpOperandsWorkarounds();
++  static TTNNOperandsWorkarounds
++  createReduceProdOpOperandsWorkarounds(mlir::Operation *op);
+ 
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-index 1111111..2222222 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -7010,6 +7010,11 @@ public:
-     auto operandType = mlir::cast<RankedTensorType>(operand.getType());
-     auto updateType = mlir::cast<RankedTensorType>(update.getType());
+@@ -7204,2 +7204,7 @@ public:
  
 +    // embedding_backward only supports BF16 and would narrow F32 updates.
 +    if (operandType.getElementType().isF32()) {
@@ -12,54 +26,19 @@ index 1111111..2222222 100644
 +    }
 +
      if (operandType.getRank() != 2) {
-       return rewriter.notifyMatchFailure(
-           srcOp, "EmbeddingBackward requires 2D weight table (operand)");
-@@ -7128,7 +7133,10 @@ public:
-     ArrayRef<int64_t> updateShape = updateType.getShape();
- 
-     // Single-dimensional scatter.
--    if (scatterDimsToOperandDims.size() == 1) {
-+    bool flatten = scatterDimsToOperandDims.size() > 1 ||
-+                   inputType.getElementType().isF32() ||
-+                   inputType.getRank() != updateType.getRank();
-+    if (!flatten) {
-       // Process indices to match update tensor shape.
-       int32_t dim = scatterDimsToOperandDims[0];
-       Value finalIndexTensor =
-@@ -7146,7 +7153,5 @@ public:
--    }
--
--    // Multi-dimensional scatter.
--    if (scatterDimsToOperandDims.size() > 1) {
-+    } else {
-+      // Multi-dimensional scatter.
-       // Always scatter along dimension 0 for flattened tensors.
-       constexpr int32_t SCATTER_DIMENSION = 0;
- 
-@@ -7174,5 +7179,3 @@ public:
-       return success();
-     }
--
--    return failure();
-   }
-@@ -7242,9 +7250,10 @@ private:
-     // Checks that apply to single dimensional scatter.
- 
--    if (!multiDimensionalScatter && indexVectorDim != 1u) {
-+    if (!multiDimensionalScatter &&
-+        indexVectorDim != indexShape.size() - 1) {
-       return rewriter.notifyMatchFailure(
-           op,
--          "TTIR single dimensional scatter requires index_vector_dim to be 1");
-+          "TTIR single dimensional scatter requires a trailing index vector");
-     }
- 
-     return success();
+@@ -7324,3 +7329,6 @@ public:
+         adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims();
+-    if (scatterDimsToOperandDims.size() <= 1) {
++    auto inputType = mlir::cast<RankedTensorType>(
++        srcOp.getInputs()[0].getType());
++    if (scatterDimsToOperandDims.size() <= 1 &&
++        !inputType.getElementType().isF32()) {
+       return convertToSingleDimScatter(srcOp, adaptor, *scatterReduceType,
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-index 1111111..2222222 100644
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -922,5 +922,8 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
+@@ -923,4 +923,7 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
+           .getElementType();
 +  // Float32 cannot represent the INT32_MAX identity used by min.
 +  bool supportsInt32 =
 +      inputType.isInteger(32) && mlir::isa<ttnn::MinOp>(op);
@@ -67,43 +46,25 @@ index 1111111..2222222 100644
 -  if (!inputType.isF32() && !inputType.isBF16()) {
 +  if (!inputType.isF32() && !inputType.isBF16() && !supportsInt32) {
      operandWorkaround.tensorDataTypeWorkaround =
-         mlir::tt::ttcore::DataType::Float32;
-   }
-@@ -934,11 +934,6 @@ TTNNOperandsWorkaroundsFactory::createReduceSumOpOperandsWorkarounds(
+@@ -935,11 +938,6 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
  // Factory method to create a set of workarounds for reduce product op operands.
 -// tt-metal only supports full product reduction for bfloat16 data type.
  TTNNOperandsWorkarounds
 -TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds() {
-+TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(
-+    mlir::Operation *op) {
 -  TTNNOperandWorkarounds bf16Workaround;
 -  bf16Workaround.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;
 -
 -  return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
 -      .addInputOperandWorkaround(bf16Workaround)
 -      .addOutputOperandWorkaround(bf16Workaround);
++TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(
++    mlir::Operation *op) {
 +  return createReductionOpOperandsWorkarounds(op);
  }
-diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-index 1111111..2222222 100644
---- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-+++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -999 +999 @@ def TTNN_ProdOp : TTNN_Op<"prod"> {
--        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds();
-+        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(*this);
-diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-index 1111111..2222222 100644
---- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-+++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-@@ -351 +351,2 @@ class TTNNOperandsWorkaroundsFactory {
--  static TTNNOperandsWorkarounds createReduceProdOpOperandsWorkarounds();
-+  static TTNNOperandsWorkarounds
-+  createReduceProdOpOperandsWorkarounds(mlir::Operation *op);
 diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
-index 1111111..2222222 100644
 --- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 +++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
-@@ -96,9 +96,15 @@ private:
+@@ -111,7 +111,13 @@ private:
    // Identifies function input arguments that are candidates for RowMajor layout
 -  // propagation. Currently restricted to integer tensor types only.
 +  // propagation. F32 inputs are also eligible when the function uses scatter.
@@ -119,5 +80,3 @@ index 1111111..2222222 100644
 +          (hasIntegerElementType(arg) ||
 +           (hasScatter && type && type.getElementType().isF32()))) {
          rowMajorCandidates.push_back(arg);
-       }
-     }

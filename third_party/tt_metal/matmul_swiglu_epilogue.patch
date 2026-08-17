@@ -1,10 +1,7 @@
-diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
-index 8affb04..7d68dcf 100644
---- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
-@@ -241,4 +241,218 @@ ProgramDescriptor MatmulMultiCoreProgramFactory::create_descriptor(
-     return desc;
- }
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp b/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
+--- a/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
+@@ -243,2 +243,216 @@ ProgramDescriptor MatmulMultiCoreProgramFactory::create_descriptor(
  
 +ProgramDescriptor MatmulSwiGLUProgramFactory::create_descriptor(
 +    const ttnn::prim::MatmulParams& operation_attributes,
@@ -221,13 +218,10 @@ index 8affb04..7d68dcf 100644
 +}
 +
  }  // namespace ttnn::prim
-diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
-index 76c8f0a..46fdb50 100644
---- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
-+++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
-@@ -18,4 +18,12 @@ struct MatmulMultiCoreProgramFactory {
-         const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
- };
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp b/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
+--- a/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
+@@ -20,2 +20,10 @@ struct MatmulMultiCoreProgramFactory {
  
 +struct MatmulSwiGLUProgramFactory {
 +    static tt::tt_metal::ProgramDescriptor create_descriptor(
@@ -238,11 +232,10 @@ index 76c8f0a..46fdb50 100644
 +};
 +
  }  // namespace ttnn::prim
-diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp b/ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
 new file mode 100644
-index 0000000..3f1946a
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
 @@ -0,0 +1,110 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
@@ -354,11 +347,10 @@ index 0000000..3f1946a
 +    dst_resident_swiglu<in0_block_w, in0_block_tiles, in1_block_tiles,
 +                        per_core_N, num_blocks>(cb_in0, cb_weights, cb_partials, cb_out);
 +}
-diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
 new file mode 100644
-index 0000000..2e8dc74
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
 @@ -0,0 +1,59 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
@@ -419,11 +411,10 @@ index 0000000..2e8dc74
 +    }
 +    noc.async_write_barrier();
 +}
-diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
 new file mode 100644
-index 0000000..8612fe3
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
 @@ -0,0 +1,32 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
@@ -457,11 +448,10 @@ index 0000000..8612fe3
 +        cb_in0.push_back(in0_mcast_w);
 +    }
 +}
-diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
 new file mode 100644
-index 0000000..5764b8f
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
 @@ -0,0 +1,57 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
@@ -520,21 +510,16 @@ index 0000000..5764b8f
 +        cb_in0.push_back(in0_mcast_w);
 +    }
 +}
-diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
-index 7c87d0e..1669eb0 100644
---- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
-@@ -686,6 +686,9 @@ void validate_dram_sender_global_cb_gather_in0_geometry_recv_contig(
- 
- MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_factory(
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp b/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+--- a/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+@@ -2064,2 +2064,5 @@ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_f
      const operation_attributes_t& operation_attributes, const tensor_args_t& /*tensor_args*/) {
 +    if (operation_attributes.fused_swiglu) {
 +        return MatmulSwiGLUProgramFactory{};
 +    }
      const auto& config = operation_attributes.program_config.value();
- 
-     return std::visit(
-@@ -2125,3 +2128,26 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
+@@ -2124,2 +2127,25 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
      validate_matmul_matrix_dimensions(a_shape, b_shape, a_shape_padded, b_shape_padded, in0_tile, in1_tile);
 +    if (attributes.fused_swiglu) {
 +        TT_FATAL(!attributes.transpose_a && !attributes.transpose_b, "SwiGLU matmul does not support transpose");
@@ -560,10 +545,7 @@ index 7c87d0e..1669eb0 100644
 +    }
 +
      validate_matmul_bfloat4_tile_dims(input_tensor_a, input_tensor_b, in0_tile, in1_tile);
-     validate_matmul_optional_tensors(attributes, args);
-@@ -2280,8 +2306,13 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
-     const auto& input_tensor_b = input_tensors.at(1);
- 
+@@ -2283,4 +2309,9 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
      // Use the compute_matmul_output_shape function to get the output shape
 -    const auto output_shape = operations::matmul::utilities::compute_matmul_output_shape(
 +    auto output_shape = operations::matmul::utilities::compute_matmul_output_shape(
@@ -574,49 +556,30 @@ index 7c87d0e..1669eb0 100644
 +        output_shape = ttnn::Shape(dims);
 +    }
  
-     const auto& a_shape_padded =
-         operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
-@@ -2754,7 +2785,8 @@ MatmulParams create_matmul_attributes(
-         parameters.transpose_b,
-         output_tile,
+@@ -2759,3 +2790,4 @@ MatmulParams create_matmul_attributes(
          parameters.global_cb,
 -        parameters.sub_device_id};
 +        parameters.sub_device_id,
 +        parameters.fused_swiglu};
  }
- 
- MatmulDeviceOperation::tensor_return_value_t matmul(
-diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
-index 208db82..8469a7d 100644
---- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
-+++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
-@@ -22,6 +22,7 @@ struct MatmulDeviceOperation {
-     using tensor_return_value_t = std::vector<Tensor>;
- 
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp b/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
+--- a/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
+@@ -24,2 +24,3 @@ struct MatmulDeviceOperation {
      using program_factory_t = std::variant<
 +        MatmulSwiGLUProgramFactory,
          MatmulMultiCoreProgramFactory,
-         MatmulMultiCoreReuseOptimizedProgramFactory,
-         MatmulMultiCoreReuseMcast1DProgramFactory,
-diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
-index 7e17139..8ffaa3f 100644
---- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
-+++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
-@@ -27,6 +27,7 @@ struct MatmulParams {
-     std::optional<tt::tt_metal::Tile> output_tile = std::nullopt;
-     std::optional<tt::tt_metal::experimental::GlobalCircularBuffer> global_cb = std::nullopt;
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp b/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
+--- a/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
+@@ -29,2 +29,3 @@ struct MatmulParams {
      std::optional<tt::tt_metal::SubDeviceId> sub_device_id = std::nullopt;
 +    bool fused_swiglu = false;
  };
- 
- struct MatmulInputs {
-diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-index d0e9c98..702e24b 100644
---- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-+++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -350,6 +350,28 @@ Tensor matmul(
-         optional_output_tensor);
- }
+diff --git a/ttnn/cpp/ttnn/operations/matmul/matmul.cpp b/ttnn/cpp/ttnn/operations/matmul/matmul.cpp
+--- a/ttnn/cpp/ttnn/operations/matmul/matmul.cpp
++++ b/ttnn/cpp/ttnn/operations/matmul/matmul.cpp
+@@ -413,2 +413,24 @@ Tensor matmul(
  
 +Tensor matmul_swiglu(
 +    const Tensor& input_tensor_a,
@@ -641,15 +604,10 @@ index d0e9c98..702e24b 100644
 +}
 +
  Tensor linear(
-     const Tensor& input_tensor_a,
-     const Tensor& input_tensor_b,
-diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/matmul/matmul.hpp
-index 97767ad..3e23a21 100644
---- ttnn/cpp/ttnn/operations/matmul/matmul.hpp
-+++ ttnn/cpp/ttnn/operations/matmul/matmul.hpp
-@@ -45,6 +45,15 @@ Tensor matmul(
-     const std::optional<const GlobalCircularBuffer>& global_cb = std::nullopt,
-     const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id = std::nullopt);
+diff --git a/ttnn/cpp/ttnn/operations/matmul/matmul.hpp b/ttnn/cpp/ttnn/operations/matmul/matmul.hpp
+--- a/ttnn/cpp/ttnn/operations/matmul/matmul.hpp
++++ b/ttnn/cpp/ttnn/operations/matmul/matmul.hpp
+@@ -47,2 +47,11 @@ Tensor matmul(
  
 +// Decode-specialized [up | gate] projection. Computes both halves of the
 +// matmul on the same cores and writes silu(gate) * up at half width.
@@ -661,13 +619,7 @@ index 97767ad..3e23a21 100644
 +    std::optional<const DeviceComputeKernelConfig> compute_kernel_config = std::nullopt);
 +
  std::vector<Tensor> matmul_batched_weights(
-     const Tensor& input_tensor_a,
-     const std::vector<Tensor>& input_tensors_b,
-@@ -118,6 +127,7 @@ Tensor sparse_matmul(
- using operations::matmul::addmm;
- using operations::matmul::linear;
+@@ -120,2 +129,3 @@ using operations::matmul::linear;
  using operations::matmul::matmul;
 +using operations::matmul::matmul_swiglu;
  using operations::matmul::matmul_batched_weights;
- using operations::matmul::sparse_matmul;
- 
