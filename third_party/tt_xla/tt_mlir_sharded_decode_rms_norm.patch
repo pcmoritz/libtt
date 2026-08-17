@@ -73,12 +73,12 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +      /*residual_input_tensor=*/std::nullopt, rmsMemoryConfig, programConfig,
 +      computeConfig);
 +  if (useShardedRMSNorm) {
-+    output = ::ttnn::to_memory_config(output, input.memory_config());
++    const auto outMemCfg = memoryConfig.value_or(input.memory_config());
 +    if (reshapeRMSNorm) {
-+      output = ::ttnn::reshape(output, inputShape, input.memory_config());
-+    }
-+    if (memoryConfig) {
-+      output = ::ttnn::to_memory_config(output, *memoryConfig);
++      output = ::ttnn::to_memory_config(output, input.memory_config());
++      output = ::ttnn::reshape(output, inputShape, outMemCfg);
++    } else {
++      output = ::ttnn::to_memory_config(output, outMemCfg);
 +    }
 +  }
  
