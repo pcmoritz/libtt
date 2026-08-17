@@ -320,6 +320,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_disable_cpu_const_eval.patch",
         "//third_party/tt_xla:tt_xla_disable_trace_global_fp32_acc.patch",
         "//third_party/tt_xla:tt_xla_propagate_mark_roles_through_unary_ops.patch",
+        "//third_party/tt_xla:tt_xla_jax_weight_parameter.patch",
         "//third_party/tt_xla:tt_xla_device_memory_stats.patch",
         "//third_party/tt_xla:tt_xla_empty_cost_analysis.patch",
         "//third_party/tt_xla:tt_xla_pjrt_abort_guards.patch",
