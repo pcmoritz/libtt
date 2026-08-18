@@ -210,47 +210,56 @@ index 2701ea4..487c93d 100644
  
      // Build reverse map: operand dim -> index position in scatter indices.
      llvm::DenseMap<int64_t, int64_t> scatterDimToIdxPos;
-@@ -8506,6 +8596,45 @@ private:
+@@ -8506,6 +8596,54 @@ private:
      // Total number of expanded indices (one per one scalar update).
      int64_t expandedNumIndices = numScatterPositions * windowSize;
  
-+    // StableHLO batching dimensions do not have a window extent. Their operand
-+    // coordinate is instead implied by the matching batch dimension of the
-+    // scatter-indices tensor. Materialize those coordinates in the same
-+    // scatter-position-major, window-position-minor order used below.
++    // StableHLO batching dimensions do not have a window extent. Generate each
++    // matching scatter-index coordinate with a compact arange, then broadcast
++    // it over the other scatter dimensions and the update window. This keeps
++    // large batch coordinates out of constants embedded in the IR.
 +    llvm::DenseMap<int64_t, Value> batchingIndexSlices;
 +    for (auto [inputDim, indicesDim] :
 +         llvm::zip_equal(inputBatchingDims, scatterIndicesBatchingDims)) {
-+      int64_t indicesDimStride = 1;
-+      for (int64_t dim = static_cast<int64_t>(indicesShape.size()) - 1;
-+           dim > indicesDim; --dim) {
-+        if (dim != indexVectorDim) {
-+          indicesDimStride *= indicesShape[dim];
-+        }
-+      }
-+
-+      unsigned bitWidth =
-+          indicesType.getElementType().getIntOrFloatBitWidth();
-+      llvm::SmallVector<APInt> batchCoordinates;
-+      batchCoordinates.reserve(expandedNumIndices);
-+      for (int64_t scatterPosition = 0;
-+           scatterPosition < numScatterPositions; ++scatterPosition) {
-+        int64_t coordinate =
-+            (scatterPosition / indicesDimStride) % indicesShape[indicesDim];
-+        for (int64_t windowPosition = 0; windowPosition < windowSize;
-+             ++windowPosition) {
-+          batchCoordinates.push_back(APInt(bitWidth, coordinate));
-+        }
-+      }
-+
-+      RankedTensorType batchCoordinatesType = RankedTensorType::get(
-+          {expandedNumIndices, 1}, indicesType.getElementType());
-+      auto batchCoordinatesAttr = DenseIntElementsAttr::get(
-+          batchCoordinatesType, batchCoordinates);
-+      batchingIndexSlices[inputDim] = rewriter.create<ttir::ConstantOp>(
++      auto coordinateType = RankedTensorType::get(
++          {indicesShape[indicesDim]}, indicesType.getElementType());
++      Value coordinate = rewriter.create<ttir::ArangeOp>(
 +          ttmlir::utils::appendLocationSuffix(
 +              loc, "_batch_index_" + std::to_string(inputDim)),
-+          batchCoordinatesType, batchCoordinatesAttr);
++          coordinateType, /*start=*/0, /*end=*/indicesShape[indicesDim],
++          /*step=*/1, /*arange_dimension=*/0);
++
++      // Expose the batch dimension in scatter-position-major order, followed
++      // by the update-window dimension and a singleton index column.
++      llvm::SmallVector<int64_t> broadcastShape;
++      int64_t broadcastBatchDim = 0;
++      for (auto [dim, size] : llvm::enumerate(indicesShape)) {
++        if (static_cast<int64_t>(dim) == indexVectorDim) {
++          continue;
++        }
++        if (static_cast<int64_t>(dim) == indicesDim) {
++          broadcastBatchDim = broadcastShape.size();
++        }
++        broadcastShape.push_back(size);
++      }
++      broadcastShape.push_back(windowSize);
++      broadcastShape.push_back(1);
++
++      llvm::SmallVector<int64_t> arangeShape(broadcastShape.size(), 1);
++      arangeShape[broadcastBatchDim] = indicesShape[indicesDim];
++      coordinate = ttir::utils::createReshapeOp(
++          rewriter, loc, coordinate, arangeShape);
++
++      auto broadcastType = RankedTensorType::get(
++          broadcastShape, indicesType.getElementType());
++      coordinate = rewriter.create<ttir::BroadcastOp>(
++          loc, broadcastType, coordinate,
++          rewriter.getDenseI64ArrayAttr(
++              ttmlir::utils::getBroadcastDimensions<int64_t>(arangeShape,
++                                                               broadcastShape)));
++
++      batchingIndexSlices[inputDim] = ttir::utils::createReshapeOp(
++          rewriter, loc, coordinate, {expandedNumIndices, 1});
 +    }
 +
      // First, reshape the original indices to shape
