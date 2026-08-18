@@ -419,7 +419,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_approx_topk.patch",
         "//third_party/tt_xla:tt_mlir_pooling_rank_normalization.patch",
         "//third_party/tt_xla:tt_mlir_scatter_batching.patch",
-        "//third_party/tt_xla:tt_mlir_upstream_api_adaptations.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
