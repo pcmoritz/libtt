@@ -163,11 +163,11 @@ diff --git tt_metal/impl/tensor/host_tensor_factory.cpp tt_metal/impl/tensor/hos
 diff --git tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
 --- tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
 +++ tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
-@@ -95,2 +95,4 @@ auto dispatch(DataType dtype, Func&& func, Args&&... args) {
-         case DataType::FLOAT32:
+@@ -96,2 +96,4 @@ auto dispatch(DataType dtype, Func&& func, Args&&... args) {
+             return (std::forward<Func>(func)).template operator()<float>(std::forward<Args>(args)...);
 +        case DataType::FLOAT16:
 +            return (std::forward<Func>(func)).template operator()<float16>(std::forward<Args>(args)...);
-             return (std::forward<Func>(func)).template operator()<float>(std::forward<Args>(args)...);
+         case DataType::INT32:
 diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
 --- tt_metal/impl/tensor/tensor_apis.cpp
 +++ tt_metal/impl/tensor/tensor_apis.cpp
@@ -932,8 +932,11 @@ diff --git ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common
 -                                                        : tt::tt_metal::DataType::BFLOAT16;
 +    const tt::tt_metal::DataType conv_input_dtype = input_datatype;
      const uint32_t input_datum_size = conv_input_dtype == tt::tt_metal::DataType::FLOAT32 ? 4 : 2;
-@@ -87,2 +84,3 @@ std::vector<CBInfo> get_cb_info(
+@@ -87,5 +84,5 @@ std::vector<CBInfo> get_cb_info(
      const uint32_t input_tile_size = tt::tile_size(datatype_to_dataformat_converter(conv_input_dtype));
+-
+     auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
+         get_compute_kernel_config_args(tt::tt_metal::hal::get_arch(), compute_kernel_config);
 +    fp32_dest_acc_en &= input_datatype != DataType::FLOAT16;
  
 @@ -176,3 +174,3 @@ std::vector<CBInfo> get_cb_info(
