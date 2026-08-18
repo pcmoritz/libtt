@@ -55,15 +55,6 @@ diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/
 -        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort),
 +        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort, descending),
          idst,
-diff --git ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
---- ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
-+++ ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
-@@ -289 +289 @@ void topk(
--    ckernel::topk_merge<false, stable_sort>(0, 0, 32);
-+    ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);
-@@ -303 +303 @@ void topk(
--        ckernel::topk_merge<false, stable_sort>(0, 0, 32);
-+        ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
@@ -117,3 +108,12 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_c
              }
  
              // ckernel::topk_merge(0, m_iter, K);
+diff --git ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
+--- ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
++++ ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
+@@ -289 +289 @@ void topk(
+-    ckernel::topk_merge<false, stable_sort>(0, 0, 32);
++    ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);
+@@ -303 +303 @@ void topk(
+-        ckernel::topk_merge<false, stable_sort>(0, 0, 32);
++        ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);

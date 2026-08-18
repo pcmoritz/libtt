@@ -1,3 +1,10 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
+--- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
+@@ -68,2 +68,3 @@ struct MatmulMultiCoreReuseMultiCast1DProgramConfig {
+     std::optional<CoreRangeSet> allowed_worker_cores = std::nullopt;
++    bool balance_per_core_N{};
+     // Stream in1 from the GCB in ring-rotated FIFO order (gather_in0 + DRAM-sender GCB only):
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
@@ -48,13 +55,6 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +        .mcast_in0 = mcast_in0,
 +        .balance_per_core_N = balance_per_core_N};
  }
-diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
---- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
-+++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
-@@ -68,2 +68,3 @@ struct MatmulMultiCoreReuseMultiCast1DProgramConfig {
-     std::optional<CoreRangeSet> allowed_worker_cores = std::nullopt;
-+    bool balance_per_core_N{};
-     // Stream in1 from the GCB in ring-rotated FIFO order (gather_in0 + DRAM-sender GCB only):
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp

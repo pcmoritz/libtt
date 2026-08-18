@@ -1,3 +1,48 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp b/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
+--- a/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
++++ b/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
+@@ -79,13 +79,9 @@ static mlir::LogicalResult wrapFunctionBodyInManualComputationOp(
+     auto oldArg = sourceBlock.getArgument(i);
+     auto newArg = targetBlock.getArgument(i);
+ 
+-    for (auto &targetOp : targetBlock.getOperations()) {
+-      for (auto &operand : targetOp.getOpOperands()) {
+-        if (operand.get() == oldArg) {
+-          operand.set(newArg);
+-        }
+-      }
+-    }
++    oldArg.replaceUsesWithIf(newArg, [&](OpOperand &use) {
++      return manualComputationOp->isProperAncestor(use.getOwner());
++    });
+   }
+ 
+   // Update all func.return ops in manualComputationOp with sdy.return op.
+diff --git a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
+--- a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
++++ b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
+@@ -28,3 +28,10 @@ table WhileLoopOp {
+   inputs: [tt.target.ttnn.TensorRef];
+   outputs: [tt.target.ttnn.TensorRef];
+ }
++
++table CaseOp {
++  branch_program_ids: [uint32];
++  index: tt.target.ttnn.TensorRef;
++  inputs: [tt.target.ttnn.TensorRef];
++  outputs: [tt.target.ttnn.TensorRef];
++}
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -55,6 +55,7 @@ union OpType {
+   NLPCreateQKVHeadsDecodeOp,
+   NLPConcatHeadsOp,
+   ConstantOp,
++  CaseOp,
+   WhileLoopOp,
+   Conv1dOp,
+   Conv2dOp,
 diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
 --- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
 +++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
@@ -24,31 +69,6 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td b/include/ttmlir/Dial
  def TTCore_WhileLoopOp : TTCore_Op<"while_loop",
      [MemoryEffects<[MemRead, MemWrite]>]> {
    let summary = "Repeatedly invoke an outlined program";
-diff --git a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
---- a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
-+++ b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
-@@ -28,3 +28,10 @@ table WhileLoopOp {
-   inputs: [tt.target.ttnn.TensorRef];
-   outputs: [tt.target.ttnn.TensorRef];
- }
-+
-+table CaseOp {
-+  branch_program_ids: [uint32];
-+  index: tt.target.ttnn.TensorRef;
-+  inputs: [tt.target.ttnn.TensorRef];
-+  outputs: [tt.target.ttnn.TensorRef];
-+}
-diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
---- a/include/ttmlir/Target/TTNN/program.fbs
-+++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -55,6 +55,7 @@ union OpType {
-   NLPCreateQKVHeadsDecodeOp,
-   NLPConcatHeadsOp,
-   ConstantOp,
-+  CaseOp,
-   WhileLoopOp,
-   Conv1dOp,
-   Conv2dOp,
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
@@ -60,26 +80,6 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp b/lib/Conversion/TTIRT
      target.addLegalOp<ttcore::WhileLoopOp>();
      target.addLegalOp<ttcore::CompositeOp>();
  
-diff --git a/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp b/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
---- a/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
-+++ b/lib/Dialect/StableHLO/Transforms/WrapUnderManualComputation.cpp
-@@ -79,13 +79,9 @@ static mlir::LogicalResult wrapFunctionBodyInManualComputationOp(
-     auto oldArg = sourceBlock.getArgument(i);
-     auto newArg = targetBlock.getArgument(i);
- 
--    for (auto &targetOp : targetBlock.getOperations()) {
--      for (auto &operand : targetOp.getOpOperands()) {
--        if (operand.get() == oldArg) {
--          operand.set(newArg);
--        }
--      }
--    }
-+    oldArg.replaceUsesWithIf(newArg, [&](OpOperand &use) {
-+      return manualComputationOp->isProperAncestor(use.getOwner());
-+    });
-   }
- 
-   // Update all func.return ops in manualComputationOp with sdy.return op.
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp

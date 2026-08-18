@@ -1,20 +1,3 @@
-diff --git a/pjrt_implementation/inc/api/module_builder/module_builder.h b/pjrt_implementation/inc/api/module_builder/module_builder.h
---- a/pjrt_implementation/inc/api/module_builder/module_builder.h
-+++ b/pjrt_implementation/inc/api/module_builder/module_builder.h
-@@ -141,6 +141,7 @@ private:
-   // Creates VHLO module from the input program code.
-   tt_pjrt_status
-   createVHLOModule(const std::string_view &code,
-+                   mlir::MLIRContext *context,
-                    mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
-                    const std::optional<std::string> &export_path,
-                    const std::string &model_name = "");
-@@ -370,5 +371,2 @@ private:
- 
--  // MLIR context handle.
--  std::unique_ptr<mlir::MLIRContext> m_context;
--
-   // tt-alchemist library handler.
 diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
 --- a/pjrt_implementation/src/api/module_builder/module_builder.cc
 +++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
@@ -75,3 +58,20 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 -      mlir::ParserConfig{m_context.get(), /*verifyAfterParse=*/true});
 +      mlir::ParserConfig{context, /*verifyAfterParse=*/true});
  
+diff --git a/pjrt_implementation/inc/api/module_builder/module_builder.h b/pjrt_implementation/inc/api/module_builder/module_builder.h
+--- a/pjrt_implementation/inc/api/module_builder/module_builder.h
++++ b/pjrt_implementation/inc/api/module_builder/module_builder.h
+@@ -141,6 +141,7 @@ private:
+   // Creates VHLO module from the input program code.
+   tt_pjrt_status
+   createVHLOModule(const std::string_view &code,
++                   mlir::MLIRContext *context,
+                    mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
+                    const std::optional<std::string> &export_path,
+                    const std::string &model_name = "");
+@@ -370,5 +371,2 @@ private:
+ 
+-  // MLIR context handle.
+-  std::unique_ptr<mlir::MLIRContext> m_context;
+-
+   // tt-alchemist library handler.

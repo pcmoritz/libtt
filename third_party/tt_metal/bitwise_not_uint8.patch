@@ -1,3 +1,16 @@
+diff --git tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h
+--- tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h
++++ tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h
+@@ -26,7 +26,8 @@ namespace ckernel {
+  */
+ // clang-format on
++template <DataFormat DATA_FORMAT = DataFormat::Int32>
+ ALWI void bitwise_not_tile(uint32_t idst) {
+-    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_bitwise_not, (APPROX), idst, VectorMode::RC));
++    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_bitwise_not, (APPROX, DATA_FORMAT), idst, VectorMode::RC));
+ }
+ 
+ /**
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
@@ -39,19 +52,6 @@ diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_
 +            dst_reg[0].mode<sfpi::DataLayout::I32>() = ~v;
 +        }
          dst_reg++;
-diff --git tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h
---- tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h
-+++ tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h
-@@ -26,7 +26,8 @@ namespace ckernel {
-  */
- // clang-format on
-+template <DataFormat DATA_FORMAT = DataFormat::Int32>
- ALWI void bitwise_not_tile(uint32_t idst) {
--    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_bitwise_not, (APPROX), idst, VectorMode::RC));
-+    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_bitwise_not, (APPROX, DATA_FORMAT), idst, VectorMode::RC));
- }
- 
- /**
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp

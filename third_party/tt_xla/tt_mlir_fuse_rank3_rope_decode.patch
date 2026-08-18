@@ -1,3 +1,35 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
+@@ -165,2 +165,5 @@ static void registerBuiltinComposites() {
+         TT_assert(compositeOp.getInputs().size() == 3u);
++        IntegerAttr tokenIndexAttr;
++        if (auto attrs = compositeOp.getCompositeAttributes())
++          tokenIndexAttr = attrs->getAs<IntegerAttr>("token_index");
+ 
+@@ -172,3 +175,3 @@ static void registerBuiltinComposites() {
+             compositeOp.getInputs()[2],
+-            /*token_index=*/mlir::IntegerAttr(),
++            tokenIndexAttr,
+             /*compute_config=*/nullptr);
+@@ -177,2 +180,5 @@ static void registerBuiltinComposites() {
+       [](ttcore::CompositeOp compositeOp, OpBuilder &builder) -> Operation * {
++        IntegerAttr tokenIndexAttr;
++        if (auto attrs = compositeOp.getCompositeAttributes())
++          tokenIndexAttr = attrs->getAs<IntegerAttr>("token_index");
+         return builder.create<RotaryEmbeddingOp>(
+@@ -181,3 +187,3 @@ static void registerBuiltinComposites() {
+             compositeOp.getInputs()[2],
+-            /*token_index=*/mlir::IntegerAttr(),
++            tokenIndexAttr,
+             /*compute_config=*/nullptr);
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
+@@ -22,2 +22,3 @@ getWorkaroundedOp(RotaryEmbeddingOp ropeOp, PatternRewriter &rewriter) {
+ 
++  if (ropeOp.getTokenIndexAttr()) return std::nullopt;
+   int64_t originalSeqLen = resultShape[resultShape.size() - 2];
 diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
 --- a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
 +++ b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
@@ -104,35 +136,3 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 +                           compositeCos, compositeSin, compositeResultType,
 +                           compositeAttributes);
    return success();
-diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
---- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
-+++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
-@@ -165,2 +165,5 @@ static void registerBuiltinComposites() {
-         TT_assert(compositeOp.getInputs().size() == 3u);
-+        IntegerAttr tokenIndexAttr;
-+        if (auto attrs = compositeOp.getCompositeAttributes())
-+          tokenIndexAttr = attrs->getAs<IntegerAttr>("token_index");
- 
-@@ -172,3 +175,3 @@ static void registerBuiltinComposites() {
-             compositeOp.getInputs()[2],
--            /*token_index=*/mlir::IntegerAttr(),
-+            tokenIndexAttr,
-             /*compute_config=*/nullptr);
-@@ -177,2 +180,5 @@ static void registerBuiltinComposites() {
-       [](ttcore::CompositeOp compositeOp, OpBuilder &builder) -> Operation * {
-+        IntegerAttr tokenIndexAttr;
-+        if (auto attrs = compositeOp.getCompositeAttributes())
-+          tokenIndexAttr = attrs->getAs<IntegerAttr>("token_index");
-         return builder.create<RotaryEmbeddingOp>(
-@@ -181,3 +187,3 @@ static void registerBuiltinComposites() {
-             compositeOp.getInputs()[2],
--            /*token_index=*/mlir::IntegerAttr(),
-+            tokenIndexAttr,
-             /*compute_config=*/nullptr);
-diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
---- a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
-+++ b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
-@@ -22,2 +22,3 @@ getWorkaroundedOp(RotaryEmbeddingOp ropeOp, PatternRewriter &rewriter) {
- 
-+  if (ropeOp.getTokenIndexAttr()) return std::nullopt;
-   int64_t originalSeqLen = resultShape[resultShape.size() - 2];

@@ -1,17 +1,3 @@
-diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
---- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-+++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -685,10 +685,6 @@ TTNNOperandsWorkaroundsFactory::createRotaryEmbeddingOpOperandsWorkarounds(
- TTNNOperandsWorkarounds
- TTNNOperandsWorkaroundsFactory::createTanhOpOperandsWorkarounds() {
-   TTNNOperandWorkarounds operandWorkaround;
--  // Tanh op accurate mode requires bfloat16 data type.
--  // Issue: https://github.com/tenstorrent/tt-metal/issues/22593
--  operandWorkaround.tensorDataTypeWorkaround =
--      mlir::tt::ttcore::DataType::BFloat16;
- 
-   return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
-       .addInputOperandWorkaround(operandWorkaround)
 diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
 --- a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
 +++ b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
@@ -28,3 +14,17 @@ diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/t
 +              input, ::ttnn::operations::unary::GeluVariant::TANH,
 +              memoryConfig, output, subCoreGrids);
          });
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -685,10 +685,6 @@ TTNNOperandsWorkaroundsFactory::createRotaryEmbeddingOpOperandsWorkarounds(
+ TTNNOperandsWorkarounds
+ TTNNOperandsWorkaroundsFactory::createTanhOpOperandsWorkarounds() {
+   TTNNOperandWorkarounds operandWorkaround;
+-  // Tanh op accurate mode requires bfloat16 data type.
+-  // Issue: https://github.com/tenstorrent/tt-metal/issues/22593
+-  operandWorkaround.tensorDataTypeWorkaround =
+-      mlir::tt::ttcore::DataType::BFloat16;
+ 
+   return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+       .addInputOperandWorkaround(operandWorkaround)

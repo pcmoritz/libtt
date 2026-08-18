@@ -1,3 +1,61 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
+@@ -16,6 +16,15 @@ UnaryWithParam string_to_unary_with_param(const std::string& name);
+ 
+ using DataType = tt::tt_metal::DataType;
+ 
++inline constexpr auto raw_16bit_sfpu_format = tt::DataFormat::UInt16;
++
++inline EltwiseUnaryWithParam make_fp16_to_fp32_typecast() {
++    return {
++        UnaryOpType::TYPECAST,
++        {static_cast<int>(DataType::FLOAT16), static_cast<int>(DataType::FLOAT32)},
++    };
++}
++
+ template <typename T = float>
+ std::pair<std::string, std::string> get_op_init_and_func(
+     UnaryOpType op_type,
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+@@ -118,6 +118,14 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+     const auto& input = tensor_args.input;
+     const auto& ops_chain = operation_attributes.op_chain;
+     TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
++    auto compute_ops_chain = ops_chain;
++    const bool promote_fp16 = input.dtype() == DataType::FLOAT16 &&
++                              ops_chain[0].type() != UnaryOpType::TYPECAST &&
++                              ops_chain[0].type() != UnaryOpType::BITCAST &&
++                              get_compute_kernel_path(ops_chain[0].type(), input.dtype()) == "eltwise_sfpu.cpp";
++    if (promote_fp16) {
++        compute_ops_chain.insert(compute_ops_chain.begin(), make_fp16_to_fp32_typecast());
++    }
+ 
+     const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en ||
+                                   input.dtype() == DataType::FLOAT16 ||
+@@ -129,7 +137,10 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+ 
+     const bool is_row_major = input.layout() == Layout::ROW_MAJOR;
+ 
+-    DataFormat cb_data_format = datatype_to_dataformat_converter(input.dtype());
++    DataFormat cb_data_format =
++        input.dtype() == DataType::FLOAT16 && compute_ops_chain[0].type() == UnaryOpType::TYPECAST
++            ? raw_16bit_sfpu_format
++            : datatype_to_dataformat_converter(input.dtype());
+     uint32_t single_tile_size = tile_size(cb_data_format);
+     DataFormat cb_data_format_output = datatype_to_dataformat_converter(output.dtype());
+     if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
+@@ -184,7 +195,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+     }
+ 
+     const bool math_approx_mode = false;
+-    std::map<std::string, std::string> unary_defines = get_block_defines(ops_chain, "0", "0", input.dtype());
++    std::map<std::string, std::string> unary_defines = get_block_defines(compute_ops_chain, "0", "0", input.dtype());
+     CMAKE_UNIQUE_NAMESPACE::apply_input_dtype_defines(input.dtype(), unary_defines);
+     CMAKE_UNIQUE_NAMESPACE::pack_first_op_scalars(
+         ops_chain[0], input.dtype(), packed_scalar1, packed_scalar2, unary_defines);
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
@@ -113,61 +171,3 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/elt
  }
  
  // Dispatcher: per-operand activation lists are configured at compile time via host-side
-diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
---- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
-+++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
-@@ -16,6 +16,15 @@ UnaryWithParam string_to_unary_with_param(const std::string& name);
- 
- using DataType = tt::tt_metal::DataType;
- 
-+inline constexpr auto raw_16bit_sfpu_format = tt::DataFormat::UInt16;
-+
-+inline EltwiseUnaryWithParam make_fp16_to_fp32_typecast() {
-+    return {
-+        UnaryOpType::TYPECAST,
-+        {static_cast<int>(DataType::FLOAT16), static_cast<int>(DataType::FLOAT32)},
-+    };
-+}
-+
- template <typename T = float>
- std::pair<std::string, std::string> get_op_init_and_func(
-     UnaryOpType op_type,
-diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
---- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -118,6 +118,14 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
-     const auto& input = tensor_args.input;
-     const auto& ops_chain = operation_attributes.op_chain;
-     TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
-+    auto compute_ops_chain = ops_chain;
-+    const bool promote_fp16 = input.dtype() == DataType::FLOAT16 &&
-+                              ops_chain[0].type() != UnaryOpType::TYPECAST &&
-+                              ops_chain[0].type() != UnaryOpType::BITCAST &&
-+                              get_compute_kernel_path(ops_chain[0].type(), input.dtype()) == "eltwise_sfpu.cpp";
-+    if (promote_fp16) {
-+        compute_ops_chain.insert(compute_ops_chain.begin(), make_fp16_to_fp32_typecast());
-+    }
- 
-     const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en ||
-                                   input.dtype() == DataType::FLOAT16 ||
-@@ -129,7 +137,10 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
- 
-     const bool is_row_major = input.layout() == Layout::ROW_MAJOR;
- 
--    DataFormat cb_data_format = datatype_to_dataformat_converter(input.dtype());
-+    DataFormat cb_data_format =
-+        input.dtype() == DataType::FLOAT16 && compute_ops_chain[0].type() == UnaryOpType::TYPECAST
-+            ? raw_16bit_sfpu_format
-+            : datatype_to_dataformat_converter(input.dtype());
-     uint32_t single_tile_size = tile_size(cb_data_format);
-     DataFormat cb_data_format_output = datatype_to_dataformat_converter(output.dtype());
-     if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
-@@ -184,7 +195,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
-     }
- 
-     const bool math_approx_mode = false;
--    std::map<std::string, std::string> unary_defines = get_block_defines(ops_chain, "0", "0", input.dtype());
-+    std::map<std::string, std::string> unary_defines = get_block_defines(compute_ops_chain, "0", "0", input.dtype());
-     CMAKE_UNIQUE_NAMESPACE::apply_input_dtype_defines(input.dtype(), unary_defines);
-     CMAKE_UNIQUE_NAMESPACE::pack_first_op_scalars(
-         ops_chain[0], input.dtype(), packed_scalar1, packed_scalar2, unary_defines);

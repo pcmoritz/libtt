@@ -32,10 +32,9 @@ diff --git a/lib/RegisterAll.cpp b/lib/RegisterAll.cpp
 -      mlir::tt::debug::DebugDialect, mlir::pdl::PDLDialect,
 +      mlir::quant::QuantDialect, mlir::pdl::PDLDialect,
        mlir::pdl_interp::PDLInterpDialect>();
-@@ -151,7 +136,4 @@ void mlir::tt::registerAllPasses() {
+@@ -151,7 +136,3 @@ void mlir::tt::registerAllPasses() {
    mlir::tt::ttir::registerPasses();
 -  mlir::tt::d2m::registerPasses();
-+  mlir::tt::ttnn::registerTTNNOptimizer();
    mlir::tt::ttnn::registerPasses();
 -  mlir::tt::ttmetal::registerPasses();
 -  mlir::tt::ttkernel::registerPasses();

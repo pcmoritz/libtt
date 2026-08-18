@@ -1,26 +1,3 @@
-diff --git ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
---- ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
-@@ -205,3 +205,4 @@ MassagedConcat build_non_aligned_last_dim_concat(
-         auto last_dim = tensors.front().logical_shape().rank() - 1;
--        if (dim == last_dim) {
-+        if (dim == last_dim &&
-+            tensors.front().layout() != ttnn::ROW_MAJOR_LAYOUT) {
-             bool res = !dim_aligned(tensors, dim);
-diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
---- ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
-@@ -445,10 +445,2 @@ Tensor ConcatOperation::invoke(
-     }
--    if (input_tensors[0].layout() == Layout::ROW_MAJOR && normalized_dim == ref_rank - 1) {
--        for (const auto& input_tensor : input_tensors) {
--            TT_FATAL(
--                (input_tensor.padded_shape()[dim] * input_tensor.element_size()) % input_tensor.buffer()->alignment() ==
--                    0,
--                "Current concat implementation requires aligned last dim when concatting on last dim");
--        }
--    }
-     // Determine target layout by checking all inputs
 diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
@@ -61,6 +38,29 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_f
 +            reader_compile_time_args.end(), copy_size_per_tensor.cbegin(), copy_size_per_tensor.cend());
 +    }
      for (uint32_t i = 0; i < num_input_tensors; ++i) {
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
+@@ -205,3 +205,4 @@ MassagedConcat build_non_aligned_last_dim_concat(
+         auto last_dim = tensors.front().logical_shape().rank() - 1;
+-        if (dim == last_dim) {
++        if (dim == last_dim &&
++            tensors.front().layout() != ttnn::ROW_MAJOR_LAYOUT) {
+             bool res = !dim_aligned(tensors, dim);
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
+@@ -445,10 +445,2 @@ Tensor ConcatOperation::invoke(
+     }
+-    if (input_tensors[0].layout() == Layout::ROW_MAJOR && normalized_dim == ref_rank - 1) {
+-        for (const auto& input_tensor : input_tensors) {
+-            TT_FATAL(
+-                (input_tensor.padded_shape()[dim] * input_tensor.element_size()) % input_tensor.buffer()->alignment() ==
+-                    0,
+-                "Current concat implementation requires aligned last dim when concatting on last dim");
+-        }
+-    }
+     // Determine target layout by checking all inputs
 diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp

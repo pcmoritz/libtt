@@ -1,3 +1,31 @@
+diff --git tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
+--- tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
++++ tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
+@@ -58,10 +58,22 @@ ALWI void clamp_tile_int32(uint32_t idst, uint32_t param0, uint32_t param1) {
+     MATH(SFPU_UNARY_CALL(
+         DST_SYNC_MODE,
+         DST_ACCUM_MODE,
+-        calculate_clamp_int32,
+-        (APPROX, 8 /* ITERATIONS */),
++        calculate_clamp_integer,
++        (APPROX, false /* IS_UNSIGNED */, 8 /* ITERATIONS */),
++        idst,
++        VectorMode::RC,
++        param0,
++        param1));
++}
++
++ALWI void clamp_tile_uint32(uint32_t idst, uint32_t param0, uint32_t param1) {
++    MATH(SFPU_UNARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        calculate_clamp_integer,
++        (APPROX, true /* IS_UNSIGNED */, 8 /* ITERATIONS */),
+         idst,
+         VectorMode::RC,
+         param0,
+         param1));
+ }
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_clamp.h
@@ -38,34 +66,6 @@ diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_
 +        calculate_unary_max_min_int32_body<Min, IS_UNSIGNED>(max_val);
          sfpi::dst_reg++;
      }
- }
-diff --git tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
---- tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
-+++ tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h
-@@ -58,10 +58,22 @@ ALWI void clamp_tile_int32(uint32_t idst, uint32_t param0, uint32_t param1) {
-     MATH(SFPU_UNARY_CALL(
-         DST_SYNC_MODE,
-         DST_ACCUM_MODE,
--        calculate_clamp_int32,
--        (APPROX, 8 /* ITERATIONS */),
-+        calculate_clamp_integer,
-+        (APPROX, false /* IS_UNSIGNED */, 8 /* ITERATIONS */),
-+        idst,
-+        VectorMode::RC,
-+        param0,
-+        param1));
-+}
-+
-+ALWI void clamp_tile_uint32(uint32_t idst, uint32_t param0, uint32_t param1) {
-+    MATH(SFPU_UNARY_CALL(
-+        DST_SYNC_MODE,
-+        DST_ACCUM_MODE,
-+        calculate_clamp_integer,
-+        (APPROX, true /* IS_UNSIGNED */, 8 /* ITERATIONS */),
-         idst,
-         VectorMode::RC,
-         param0,
-         param1));
  }
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp

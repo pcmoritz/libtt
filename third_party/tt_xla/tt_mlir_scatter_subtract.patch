@@ -19,14 +19,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +}
 +
  static llvm::ErrorOr<ttcore::ReduceType> getReduceType(Operation *op) {
-@@ -5069,2 +5085,6 @@ public:
-         getTypeConverter()->convertType(srcOp.getResult().getType()));
-+    auto operandShape = mlir::cast<RankedTensorType>(
-+                            adaptor.getOperand().getType())
-+                            .getShape();
-+    auto sliceSizes = srcOp.getSliceSizes();
- 
-@@ -7507,3 +7527,6 @@ public:
+@@ -7511,3 +7527,6 @@ public:
      // Convert reduceType stablehlo attribute into ttir attribute.
 -    llvm::ErrorOr<ttcore::ReduceType> scatterReduceType = getReduceType(srcOp);
 +    bool subtractReduction =
@@ -34,7 +27,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    llvm::ErrorOr<ttcore::ReduceType> scatterReduceType =
 +        subtractReduction ? ttcore::ReduceType::Sum : getReduceType(srcOp);
      if (!scatterReduceType) {
-@@ -7527,2 +7550,9 @@ public:
+@@ -7531,2 +7550,9 @@ public:
          this->getTypeConverter()->convertType(srcOp.getResults()[0].getType()));
 +    Value updateTensor = srcOp.getUpdates()[0];
 +    RankedTensorType updateType =
@@ -44,12 +37,12 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          srcOp.getLoc(), updateType, updateTensor);
 +    }
  
-@@ -7535,3 +7565,3 @@ public:
+@@ -7539,3 +7565,3 @@ public:
          srcOp.getInputs()[0].getType());
 -    if (scatterDimsToOperandDims.size() <= 1 &&
 +    if (!subtractReduction && scatterDimsToOperandDims.size() <= 1 &&
          !inputType.getElementType().isF32()) {
-@@ -7545,3 +7575,2 @@ public:
+@@ -7549,3 +7575,2 @@ public:
      Value inputTensor = srcOp.getInputs()[0];
 -    Value updateTensor = srcOp.getUpdates()[0];
      ArrayRef<int64_t> inputShape =

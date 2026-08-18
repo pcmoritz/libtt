@@ -51,19 +51,3 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    flatIndices = rewriter.create<ttir::WhereOp>(
 +        loc, flatIndicesType, validIndices, flatIndices, outOfBounds);
  
-diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp.rej b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp.rej
-deleted file mode 100644
---- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp.rej
-+++ /dev/null
-@@ -1,11 +0,0 @@
----- lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
--+++ lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
--@@ -4853,4 +4850,8 @@ public:
--                   mlir::stablehlo::DynamicSliceOp::Adaptor adaptor,
--                   ConversionPatternRewriter &rewriter) const override {
--     auto outputType = mlir::cast<RankedTensorType>(
--         getTypeConverter()->convertType(srcOp.getResult().getType()));
--+    auto operandShape = mlir::cast<RankedTensorType>(
--+                            adaptor.getOperand().getType())
--+                            .getShape();
--+    auto sliceSizes = srcOp.getSliceSizes();

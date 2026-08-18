@@ -91,6 +91,13 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
 +        in_format == DataFormat::UInt8 &&
 +        (out_format == DataFormat::Float32 || out_format == DataFormat::Float16)) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint32_to_fp32, (APPROX)));
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+@@ -51,2 +51,3 @@ inline Tensor typecast_impl(
+                             output_dtype == DataType::INT32 or output_dtype == DataType::FLOAT32 or
++                            (input_dtype == DataType::UINT16 and output_dtype == DataType::FLOAT16) or
+                             input_dtype == DataType::UINT32 or input_dtype == DataType::INT32 or
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
@@ -110,10 +117,3 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_type
                 ? tt::DataFormat::UInt16
                 : tt::tt_metal::datatype_to_dataformat_converter(output_dtype);
  }
-diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
---- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-+++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-@@ -51,2 +51,3 @@ inline Tensor typecast_impl(
-                             output_dtype == DataType::INT32 or output_dtype == DataType::FLOAT32 or
-+                            (input_dtype == DataType::UINT16 and output_dtype == DataType::FLOAT16) or
-                             input_dtype == DataType::UINT32 or input_dtype == DataType::INT32 or
