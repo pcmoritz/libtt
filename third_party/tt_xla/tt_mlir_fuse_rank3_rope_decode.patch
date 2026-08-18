@@ -45,21 +45,6 @@
  }
 
  } // namespace
-@@ -485,9 +515,13 @@ mlir::LogicalResult RoPERotateHalfFusingPattern::matchAndRewrite(
-   Value xSource = rotMatch->xSource;
- 
-   // Input must be 4D.
-   auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
--  if (inputType.getRank() != 4) {
-+  if (inputType.getRank() != 4 && !rank4Reshape) {
-+    return failure();
-+  }
-+  if (rank4Reshape &&
-+      inputType.getNumElements() != resultType.getNumElements()) {
-     return failure();
-   }
- 
-   // In the cos branch, identify x and cos.
 @@ -536,12 +570,11 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
    }
  
@@ -75,6 +60,15 @@
      return failure();
    }
    if (srcOp.getNumOperands() != 2) {
+     return failure();
+@@ -611,3 +640,7 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
+   auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
+-  if (inputType.getRank() != 4) {
++  if (inputType.getRank() != 4 && !rank4Reshape) {
++    return failure();
++  }
++  if (rank4Reshape &&
++      inputType.getNumElements() != resultType.getNumElements()) {
      return failure();
 @@ -648,11 +665,16 @@
    // self-concat and use the half-dim operand directly.

@@ -1,24 +1,3 @@
-diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
---- a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
-+++ b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
-@@ -518,7 +518,3 @@ mlir::LogicalResult RoPERotateHalfFusingPattern::matchAndRewrite(
-   auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
--  if (inputType.getRank() != 4 && !rank4Reshape) {
--    return failure();
--  }
--  if (rank4Reshape &&
--      inputType.getNumElements() != resultType.getNumElements()) {
-+  if (inputType.getRank() != 4) {
-     return failure();
-@@ -644,3 +640,7 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
-   auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
--  if (inputType.getRank() != 4) {
-+  if (inputType.getRank() != 4 && !rank4Reshape) {
-+    return failure();
-+  }
-+  if (rank4Reshape &&
-+      inputType.getNumElements() != resultType.getNumElements()) {
-     return failure();
 diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
 --- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
 +++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
