@@ -14,14 +14,6 @@ index 1111111..2222222 100644
      if (operandType.getRank() != 2) {
        return rewriter.notifyMatchFailure(
            srcOp, "EmbeddingBackward requires 2D weight table (operand)");
-@@ -7324,3 +7329,6 @@ public:
-         adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims();
--    if (scatterDimsToOperandDims.size() <= 1) {
-+    auto inputType = mlir::cast<RankedTensorType>(
-+        srcOp.getInputs()[0].getType());
-+    if (scatterDimsToOperandDims.size() <= 1 &&
-+        !inputType.getElementType().isF32()) {
-       return convertToSingleDimScatter(srcOp, adaptor, *scatterReduceType,
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 index 1111111..2222222 100644
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp

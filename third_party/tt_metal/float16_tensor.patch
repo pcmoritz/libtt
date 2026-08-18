@@ -121,6 +121,48 @@ diff --git tt_metal/impl/data_format/tilize_utils.cpp tt_metal/impl/data_format/
  template std::vector<int> convert_layout<int>(ttsl::Span<const int>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
 +template std::vector<tt::tt_metal::float16> convert_layout<tt::tt_metal::float16>(ttsl::Span<const tt::tt_metal::float16>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
  template std::vector<uint8_t> convert_layout<uint8_t>(ttsl::Span<const uint8_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
+diff --git tt_metal/impl/data_format/bfloat4.cpp tt_metal/impl/data_format/bfloat4.cpp
+--- tt_metal/impl/data_format/bfloat4.cpp
++++ tt_metal/impl/data_format/bfloat4.cpp
+@@ -6,2 +6,3 @@
+ #include <tt-metalium/bfloat4.hpp>
++#include <tt-metalium/experimental/tensor/tensor_types.hpp>
+ #include <tt_stl/span.hpp>
+@@ -34,2 +35,7 @@ template std::vector<uint32_t> pack_as_bfp4_tiles<bfloat16>(
+     const std::optional<tt::tt_metal::Tile>& tile);
++template std::vector<uint32_t> pack_as_bfp4_tiles<tt::tt_metal::float16>(
++    ttsl::Span<const tt::tt_metal::float16> data,
++    bool row_major_input,
++    bool is_exp_a,
++    const std::optional<tt::tt_metal::Tile>& tile);
+ template std::vector<uint32_t> pack_as_bfp4_tiles<float>(
+diff --git tt_metal/impl/data_format/bfloat8.cpp tt_metal/impl/data_format/bfloat8.cpp
+--- tt_metal/impl/data_format/bfloat8.cpp
++++ tt_metal/impl/data_format/bfloat8.cpp
+@@ -5,2 +5,3 @@
+ #include <tt-metalium/bfloat8.hpp>
++#include <tt-metalium/experimental/tensor/tensor_types.hpp>
+ #include <tt_stl/span.hpp>
+@@ -33,2 +34,7 @@ template std::vector<uint32_t> pack_as_bfp8_tiles<bfloat16>(
+     const std::optional<tt::tt_metal::Tile>& tile);
++template std::vector<uint32_t> pack_as_bfp8_tiles<tt::tt_metal::float16>(
++    ttsl::Span<const tt::tt_metal::float16> data,
++    bool row_major_input,
++    bool is_exp_a,
++    const std::optional<tt::tt_metal::Tile>& tile);
+ template std::vector<uint32_t> pack_as_bfp8_tiles<float>(
+diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_format/blockfloat_common.cpp
+--- tt_metal/impl/data_format/blockfloat_common.cpp
++++ tt_metal/impl/data_format/blockfloat_common.cpp
+@@ -13,2 +13,3 @@
+ #include <tt-metalium/bfloat16.hpp>
++#include <tt-metalium/experimental/tensor/tensor_types.hpp>
+ #include <tt_stl/assert.hpp>
+@@ -614,1 +615,4 @@ template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::S
++template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4_b>(ttsl::Span<const tt::tt_metal::float16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
++template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const tt::tt_metal::float16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
++
+ template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const int32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
 diff --git tt_metal/impl/tensor/host_tensor_factory.cpp tt_metal/impl/tensor/host_tensor_factory.cpp
 --- tt_metal/impl/tensor/host_tensor_factory.cpp
 +++ tt_metal/impl/tensor/host_tensor_factory.cpp
@@ -179,19 +221,31 @@ diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis
              case DataType::FLOAT32: return with_src.operator()<float>();
 +            case DataType::FLOAT16: return with_src.operator()<float16>();
              case DataType::BFLOAT16: return with_src.operator()<bfloat16>();
+@@ -613,2 +619,4 @@ void validate_datatype(DataType dtype) {
+         TT_FATAL(dtype == DataType::FLOAT32, "Incorrect data type {}", dtype);
++    } else if constexpr (std::is_same_v<BaseType, float16>) {
++        TT_FATAL(dtype == DataType::FLOAT16, "Incorrect data type {}", dtype);
+     } else if constexpr (std::is_same_v<BaseType, bfloat16>) {
+@@ -675,2 +683,3 @@ INSTANTIATE_HOST_BUFFER_FUNCTIONS(int32_t)
+ INSTANTIATE_HOST_BUFFER_FUNCTIONS(float)
++INSTANTIATE_HOST_BUFFER_FUNCTIONS(float16)
+ INSTANTIATE_HOST_BUFFER_FUNCTIONS(bfloat16)
 diff --git ttnn/core/tensor/tensor.cpp ttnn/core/tensor/tensor.cpp
 --- ttnn/core/tensor/tensor.cpp
 +++ ttnn/core/tensor/tensor.cpp
-@@ -220,2 +220,8 @@ template Tensor Tensor::from_span<float>(
+@@ -58,1 +58,2 @@ using tt::tt_metal::TensorTopology;
+ using tt::tt_metal::Tile;
++using tt::tt_metal::float16;
+@@ -220,2 +221,8 @@ template Tensor Tensor::from_span<float>(
      float pad_value);
 +template Tensor Tensor::from_span<float16>(
 +    ttsl::Span<const float16> buffer,
 +    const TensorSpec& spec,
-+    distributed::MeshDevice* device,
-+    std::optional<tt::tt_metal::QueueId> cq_id,
++    tt::tt_metal::distributed::MeshDevice* device,
++    std::optional<QueueId> cq_id,
 +    float16 pad_value);
  template Tensor Tensor::from_span<int32_t>(
-@@ -255,2 +261,7 @@ template Tensor Tensor::from_borrowed_data<float>(
+@@ -255,2 +262,7 @@ template Tensor Tensor::from_borrowed_data<float>(
      const std::optional<Tile>& tile);
 +template Tensor Tensor::from_borrowed_data<float16>(
 +    ttsl::Span<float16> buffer,
@@ -199,20 +253,20 @@ diff --git ttnn/core/tensor/tensor.cpp ttnn/core/tensor/tensor.cpp
 +    tt::tt_metal::MemoryPin buffer_pin,
 +    const std::optional<Tile>& tile);
  template Tensor Tensor::from_borrowed_data<int32_t>(
-@@ -280,2 +291,8 @@ template Tensor Tensor::from_vector<float>(
+@@ -280,2 +292,8 @@ template Tensor Tensor::from_vector<float>(
      float pad_value);
 +template Tensor Tensor::from_vector<float16>(
 +    std::vector<float16>&& buffer,
 +    const TensorSpec& spec,
-+    distributed::MeshDevice* device,
-+    std::optional<tt::tt_metal::QueueId> cq_id,
++    tt::tt_metal::distributed::MeshDevice* device,
++    std::optional<QueueId> cq_id,
 +    float16 pad_value);
  template Tensor Tensor::from_vector<int32_t>(
-@@ -315,2 +332,3 @@ template Tensor Tensor::from_vector<uint32_t>(
+@@ -315,2 +333,3 @@ template Tensor Tensor::from_vector<uint32_t>(
  template std::vector<float> Tensor::to_vector<float>(std::optional<QueueId> cq_id) const;
 +template std::vector<float16> Tensor::to_vector<float16>(std::optional<QueueId> cq_id) const;
  template std::vector<bfloat16> Tensor::to_vector<bfloat16>(std::optional<QueueId> cq_id) const;
-@@ -370,2 +388,3 @@ uint32_t Tensor::element_size() const {
+@@ -370,2 +389,3 @@ uint32_t Tensor::element_size() const {
          case DataType::FLOAT32: return sizeof(float);
 +        case DataType::FLOAT16: return sizeof(float16);
          case DataType::INT32: return sizeof(int32_t);

@@ -152,7 +152,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
          mlir::RankedTensorType resultType = cast<RankedTensorType>(
              getTypeConverter()->convertType(srcOp.getResult(0).getType()));
          rewriter.replaceOpWithNewOp<ttir::CumProdOp>(
-@@ -4272,6 +4276,7 @@ public:
+@@ -4272,5 +4276,6 @@ public:
      // (H, W)
      auto spatialDims = getIndicesofElementsLargerThanOne(windowDims);
 -    if (spatialDims.empty()) {
@@ -161,13 +161,3 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      return rewriter.notifyMatchFailure(
 +          srcOp, "only 4D operands with two spatial dimensions are supported");
      }
- 
-@@ -7448,4 +7453,8 @@ private:
-     ArrayRef<int64_t> scatterDimsToOperandDims =
-         dimensionNumbers.getScatterDimsToOperandDims();
-+    if (scatterDimsToOperandDims.empty()) {
-+      return rewriter.notifyMatchFailure(
-+          op, "scatter_dims_to_operand_dims must not be empty");
-+    }
-     if (!llvm::is_sorted(scatterDimsToOperandDims)) {
-       return rewriter.notifyMatchFailure(
