@@ -1,111 +1,233 @@
 diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
+index a1c9a30..2077fe4 100644
 --- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
 +++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
-@@ -118,10 +118,10 @@ std::array<uint32_t, N> from_id(int32_t id, const std::array<uint32_t, N>& dims)
- // stable per-element names (their count varies with tensor rank across instantiations), so they
+@@ -113,14 +113,12 @@ std::array<uint32_t, N> from_id(int32_t id, const std::array<uint32_t, N>& dims)
+     return coord;
+ }
+ 
+-// Reads N shape extents starting at vararg index C. The per-dimension shape blocks have no
+-// stable per-element names (their count varies with tensor rank across instantiations), so they
 -// are delivered as runtime varargs and read positionally.
-+// are broadcast as common runtime varargs and read positionally.
- template <uint32_t N>
+-template <uint32_t N>
 -std::array<uint32_t, N> make_shape_array_from_runtime_args(const uint32_t& C) {
-+std::array<uint32_t, N> make_shape_array_from_common_runtime_args(const uint32_t& C) {
++template <size_t N, size_t M>
++constexpr std::array<uint32_t, N> take_shape_prefix(const std::array<uint32_t, M>& dims) {
++    static_assert(N <= M);
      std::array<uint32_t, N> ret{};
-     for (uint32_t i = C; i < C + N; ++i) {
+-    for (uint32_t i = C; i < C + N; ++i) {
 -        ret[i - C] = get_vararg(i);
-+        ret[i - C] = get_common_vararg(i);
++    for (uint32_t i = 0; i < N; ++i) {
++        ret[i] = dims[i];
      }
  
      return ret;
 diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
+index 940f157..374364d 100644
 --- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
 +++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
-@@ -141,7 +141,7 @@ void kernel_main() {
+@@ -139,9 +139,24 @@ void kernel_main() {
+     using index_std_type = std_type_t<get_dataformat(dfb::index)>;
  
      constexpr uint32_t N = input_rank - 1;
-     // generate 2 stick shape counters
+-    // generate 2 stick shape counters
 -    const auto input_dims{make_shape_array_from_runtime_args<N>(0)};
 -    const auto index_dims{make_shape_array_from_runtime_args<N>(N)};
-+    const auto input_dims{make_shape_array_from_common_runtime_args<N>(0)};
-+    const auto index_dims{make_shape_array_from_common_runtime_args<N>(N)};
++    constexpr std::array<uint32_t, 7> input_outer_shape{
++        get_arg(args::input_dim_0),
++        get_arg(args::input_dim_1),
++        get_arg(args::input_dim_2),
++        get_arg(args::input_dim_3),
++        get_arg(args::input_dim_4),
++        get_arg(args::input_dim_5),
++        get_arg(args::input_dim_6)};
++    constexpr std::array<uint32_t, 7> index_outer_shape{
++        get_arg(args::index_dim_0),
++        get_arg(args::index_dim_1),
++        get_arg(args::index_dim_2),
++        get_arg(args::index_dim_3),
++        get_arg(args::index_dim_4),
++        get_arg(args::index_dim_5),
++        get_arg(args::index_dim_6)};
++    constexpr auto input_dims = take_shape_prefix<N>(input_outer_shape);
++    constexpr auto index_dims = take_shape_prefix<N>(index_outer_shape);
  
      const auto index_strides = make_strides<N>(index_dims);
+ 
 diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
+index 9123435..1b07cd7 100644
 --- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
 +++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
-@@ -126,7 +126,7 @@ void kernel_main() {
+@@ -124,9 +124,24 @@ void kernel_main() {
+     using index_std_type = std_type_t<get_dataformat(dfb::index)>;
  
      constexpr uint32_t N = input_rank - 1;
-     // generate 2 stick shape counters
+-    // generate 2 stick shape counters
 -    const auto input_dims{make_shape_array_from_runtime_args<N>(0)};
 -    const auto index_dims{make_shape_array_from_runtime_args<N>(N)};
-+    const auto input_dims{make_shape_array_from_common_runtime_args<N>(0)};
-+    const auto index_dims{make_shape_array_from_common_runtime_args<N>(N)};
++    constexpr std::array<uint32_t, 7> input_outer_shape{
++        get_arg(args::input_dim_0),
++        get_arg(args::input_dim_1),
++        get_arg(args::input_dim_2),
++        get_arg(args::input_dim_3),
++        get_arg(args::input_dim_4),
++        get_arg(args::input_dim_5),
++        get_arg(args::input_dim_6)};
++    constexpr std::array<uint32_t, 7> index_outer_shape{
++        get_arg(args::index_dim_0),
++        get_arg(args::index_dim_1),
++        get_arg(args::index_dim_2),
++        get_arg(args::index_dim_3),
++        get_arg(args::index_dim_4),
++        get_arg(args::index_dim_5),
++        get_arg(args::index_dim_6)};
++    constexpr auto input_dims = take_shape_prefix<N>(input_outer_shape);
++    constexpr auto index_dims = take_shape_prefix<N>(index_outer_shape);
  
      const auto index_strides = make_strides<N>(index_dims);
+ 
+diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp
+index f63edcc..ab96388 100644
+--- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp
++++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp
+@@ -9,7 +9,9 @@
+ 
+ #include "ttnn/tensor/tensor.hpp"
+ 
++#include <array>
+ #include <cstdint>
++#include <string>
+ 
+ namespace ttnn::prim {
+ 
+@@ -30,4 +32,24 @@ inline uint32_t calculate_optimal_chunk_size(const ttnn::Tensor& input_tensor) {
+     return ceil32((l1_per_chunk * 9 / 10) - 32);
+ }
+ 
++inline std::array<uint32_t, ttnn::MAX_NUM_DIMENSIONS - 1> scatter_outer_dims(const ttnn::Shape& shape) {
++    std::array<uint32_t, ttnn::MAX_NUM_DIMENSIONS - 1> dims{};
++    dims.fill(1);
++    for (uint32_t i = 0; i + 1 < shape.rank(); ++i) {
++        dims[i] = shape[i];
++    }
++    return dims;
++}
++
++template <typename CompileTimeArgs>
++inline void add_scatter_shape_compile_time_args(
++    CompileTimeArgs& compile_time_args, const ttnn::Shape& input_shape, const ttnn::Shape& index_shape) {
++    const auto input_dims = scatter_outer_dims(input_shape);
++    const auto index_dims = scatter_outer_dims(index_shape);
++    for (uint32_t i = 0; i < input_dims.size(); ++i) {
++        compile_time_args["input_dim_" + std::to_string(i)] = input_dims[i];
++        compile_time_args["index_dim_" + std::to_string(i)] = index_dims[i];
++    }
++}
++
+ }  // namespace ttnn::prim
 diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
+index 8c25e61..0dd9df4 100644
 --- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
 +++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
-@@ -163,7 +163,7 @@ ttnn::device_operation::ProgramArtifacts ScatterProgramFactory::create_program_
-         // Per-dimension shape extents (input dims then index dims). N = rank-1 per tensor; the
+@@ -160,11 +160,8 @@ ttnn::device_operation::ProgramArtifacts ScatterProgramFactory::create_program_a
+                      "scatter_reduction_type"},
+             },
+         .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
+-        // Per-dimension shape extents (input dims then index dims). N = rank-1 per tensor; the
 -        // count varies with rank across instantiations, so these are delivered as runtime varargs.
-+        // count varies with rank across instantiations, so these are delivered as common runtime varargs.
-         .advanced_options =
+-        .advanced_options =
 -            {.num_runtime_varargs = static_cast<uint32_t>((input_shape.rank() - 1) + (index_shape.rank() - 1))},
-+            {.num_common_runtime_varargs = static_cast<uint32_t>((input_shape.rank() - 1) + (index_shape.rank() - 1))},
      };
++    add_scatter_shape_compile_time_args(reader.compile_time_args, input_shape, index_shape);
  
      KernelSpec writer{
-@@ -192,4 +192,4 @@ ttnn::device_operation::ProgramArtifacts ScatterProgramFactory::create_program_
+         .unique_id = WRITER,
+@@ -189,19 +186,8 @@ ttnn::device_operation::ProgramArtifacts ScatterProgramFactory::create_program_a
+         .hw_config = ttnn::create_writer_datamovement_config(device->arch()),
+     };
+ 
 -    // Per-dimension shape extents are the same on every node; build once and bind per node.
-+    // Per-dimension shape extents are identical on every node; broadcast one common copy.
-     std::vector<uint32_t> shape_varargs;
-     shape_varargs.reserve((input_shape.rank() - 1) + (index_shape.rank() - 1));
-     for (const auto* it = input_shape.cbegin(); it != input_shape.cend() - 1; ++it) {
-@@ -205,6 +205,7 @@ ttnn::device_operation::ProgramArtifacts ScatterProgramFactory::create_program_
+-    std::vector<uint32_t> shape_varargs;
+-    shape_varargs.reserve((input_shape.rank() - 1) + (index_shape.rank() - 1));
+-    for (const auto* it = input_shape.cbegin(); it != input_shape.cend() - 1; ++it) {
+-        shape_varargs.push_back(static_cast<uint32_t>(*it));
+-    }
+-    for (const auto* it = index_shape.cbegin(); it != index_shape.cend() - 1; ++it) {
+-        shape_varargs.push_back(static_cast<uint32_t>(*it));
+-    }
+-
      KernelRunArgs::RuntimeArgValues reader_node_args;
      KernelRunArgs::RuntimeArgValues writer_node_args;
-     AdvancedKernelRunArgs reader_run_advanced;
-+    reader_run_advanced.common_runtime_varargs = std::move(shape_varargs);
+-    AdvancedKernelRunArgs reader_run_advanced;
  
      uint32_t stick_offset = 0;
      for (uint32_t i = 0; i < all_cores_in_bounding_box; ++i) {
-@@ -229,6 +230,5 @@ ttnn::device_operation::ProgramArtifacts ScatterProgramFactory::create_program_
+@@ -224,7 +210,6 @@ ttnn::device_operation::ProgramArtifacts ScatterProgramFactory::create_program_a
+              {"index_chunk_size", index_chunk_size},
               {"source_chunk_size", source_chunk_size},
               {"scatter_reduction_type", static_cast<uint32_t>(args.opt_reduction)}});
 -        reader_run_advanced.runtime_varargs.emplace(core, shape_varargs);
  
          AddRuntimeArgsForNode(
              writer_node_args,
+@@ -257,7 +242,6 @@ ttnn::device_operation::ProgramArtifacts ScatterProgramFactory::create_program_a
+         KernelRunArgs{
+             .kernel = READER,
+             .runtime_arg_values = std::move(reader_node_args),
+-            .advanced_options = std::move(reader_run_advanced),
+         },
+         KernelRunArgs{
+             .kernel = WRITER,
 diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
+index f808f6d..fe7c720 100644
 --- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
 +++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
-@@ -176,7 +176,7 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
-         // Per-dimension shape extents (input dims then index dims). N = rank-1 per tensor; the
+@@ -173,11 +173,8 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+                      "scatter_reduction_type"},
+             },
+         .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
+-        // Per-dimension shape extents (input dims then index dims). N = rank-1 per tensor; the
 -        // count varies with rank across instantiations, so these are delivered as runtime varargs.
-+        // count varies with rank across instantiations, so these are delivered as common runtime varargs.
-         .advanced_options =
+-        .advanced_options =
 -            {.num_runtime_varargs = static_cast<uint32_t>((input_shape.rank() - 1) + (index_shape.rank() - 1))},
-+            {.num_common_runtime_varargs = static_cast<uint32_t>((input_shape.rank() - 1) + (index_shape.rank() - 1))},
      };
++    add_scatter_shape_compile_time_args(reader.compile_time_args, input_shape, index_shape);
  
      KernelSpec writer{
-@@ -205,4 +205,4 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+         .unique_id = WRITER,
+@@ -202,19 +199,8 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+         .hw_config = ttnn::create_writer_datamovement_config(device->arch()),
+     };
+ 
 -    // Per-dimension shape extents are the same on every node; build once and bind per node.
-+    // Per-dimension shape extents are identical on every node; broadcast one common copy.
-     std::vector<uint32_t> shape_varargs;
-     shape_varargs.reserve((input_shape.rank() - 1) + (index_shape.rank() - 1));
-     for (const auto* it = input_shape.cbegin(); it != input_shape.cend() - 1; ++it) {
-@@ -218,6 +218,7 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+-    std::vector<uint32_t> shape_varargs;
+-    shape_varargs.reserve((input_shape.rank() - 1) + (index_shape.rank() - 1));
+-    for (const auto* it = input_shape.cbegin(); it != input_shape.cend() - 1; ++it) {
+-        shape_varargs.push_back(static_cast<uint32_t>(*it));
+-    }
+-    for (const auto* it = index_shape.cbegin(); it != index_shape.cend() - 1; ++it) {
+-        shape_varargs.push_back(static_cast<uint32_t>(*it));
+-    }
+-
      KernelRunArgs::RuntimeArgValues reader_node_args;
      KernelRunArgs::RuntimeArgValues writer_node_args;
-     AdvancedKernelRunArgs reader_run_advanced;
-+    reader_run_advanced.common_runtime_varargs = std::move(shape_varargs);
+-    AdvancedKernelRunArgs reader_run_advanced;
  
      uint32_t stick_offset = 0;
      for (uint32_t i = 0; i < all_cores_in_bounding_box; ++i) {
-@@ -242,6 +243,5 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+@@ -237,7 +223,6 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+              {"index_chunk_size", index_chunk_size},
               {"source_chunk_size", source_chunk_size},
               {"scatter_reduction_type", static_cast<uint32_t>(args.opt_reduction)}});
 -        reader_run_advanced.runtime_varargs.emplace(core, shape_varargs);
  
          AddRuntimeArgsForNode(
              writer_node_args,
+@@ -270,7 +255,6 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+         KernelRunArgs{
+             .kernel = READER,
+             .runtime_arg_values = std::move(reader_node_args),
+-            .advanced_options = std::move(reader_run_advanced),
+         },
+         KernelRunArgs{
+             .kernel = WRITER,
