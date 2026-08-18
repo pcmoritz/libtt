@@ -1,22 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -7887,14 +7887,2 @@ public:
- 
--    // ReduceType::Invalid only records that the update computation does no
--    // arithmetic - it does not say which of the two arguments comes back out.
--    // `(operand, update) -> update` overwrites, which is what every lowering
--    // below assumes, but `(operand, update) -> operand` keeps the original
--    // value and would be silently turned into an overwrite.
--    if (*scatterReduceType == ttcore::ReduceType::Invalid &&
--        !returnsUpdateValue(srcOp.getUpdateComputation())) {
--      return rewriter.notifyMatchFailure(
--          srcOp, "the scatter's update computation neither combines its "
--                 "arguments nor returns the update value");
--    }
--
-     RankedTensorType outputType = mlir::cast<RankedTensorType>(
-@@ -7927,4 +7915,15 @@ public:
+@@ -7927,4 +7927,15 @@ public:
          adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims();
 +    ArrayRef<int64_t> insertedWindowDims =
 +        adaptor.getScatterDimensionNumbers().getInsertedWindowDims();
@@ -33,7 +18,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -        !inputType.getElementType().isF32()) {
 +        !inputType.getElementType().isF32() && canUseAlignedScatter) {
        return convertToSingleDimScatter(srcOp, adaptor, *scatterReduceType,
-@@ -7941,2 +7940,22 @@ public:
+@@ -7941,2 +7952,22 @@ public:
          flattenMultiDimScatterIndices(srcOp, inputShape, updateShape, rewriter);
 +    // flattenMultiDimScatterIndices orders entries by scatter position and
 +    // then by window position. Put updates in the same logical order.
@@ -56,7 +41,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          permutedType, updateTensor, updatePermutation);
 +    }
      Value flattenedInput = ttir::utils::flattenTensor(
-@@ -8368,7 +8387,5 @@ private:
+@@ -8368,7 +8399,5 @@ private:
      }
 -    if (!llvm::is_sorted(scatterDimsToOperandDims)) {
 -      return rewriter.notifyMatchFailure(
@@ -67,7 +52,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    // their StableHLO-specified order: JAX legitimately emits non-monotonic
 +    // mappings for mixed advanced indexing.
  
-@@ -8381,10 +8398,4 @@ private:
+@@ -8381,10 +8410,4 @@ private:
  
 -    // That path flattens the operand, which takes no account of batching
 -    // dimensions.
@@ -80,19 +65,19 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    // The flattened path materializes operand coordinates for StableHLO's
 +    // paired input/scatter-index batching dimensions.
  
-@@ -8530,2 +8541,6 @@ private:
+@@ -8530,2 +8553,6 @@ private:
          scatterDimNumbers.getScatterDimsToOperandDims();
 +    ArrayRef<int64_t> inputBatchingDims =
 +        scatterDimNumbers.getInputBatchingDims();
 +    ArrayRef<int64_t> scatterIndicesBatchingDims =
 +        scatterDimNumbers.getScatterIndicesBatchingDims();
      int64_t indexVectorDim = scatterDimNumbers.getIndexVectorDim();
-@@ -8537,2 +8552,4 @@ private:
+@@ -8537,2 +8564,4 @@ private:
                                              insertedWindowDims.end());
 +    insertedDimsSet.insert(inputBatchingDims.begin(),
 +                           inputBatchingDims.end());
  
-@@ -8569,2 +8586,41 @@ private:
+@@ -8569,2 +8598,41 @@ private:
  
 +    // StableHLO batching dimensions do not have a window extent. Their operand
 +    // coordinate is instead implied by the matching batch dimension of the
@@ -134,7 +119,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
 +
      // First, reshape the original indices to shape
-@@ -8671,22 +8727,32 @@ private:
+@@ -8671,22 +8739,32 @@ private:
  
 -      Value dimIndex = nullptr;
 +      Value dimIndex = batchingIndexSlices.lookup(operandDim);
