@@ -52,13 +52,16 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.
  
  namespace ttnn::prim {
  
-@@ -30,4 +31,20 @@ inline uint32_t calculate_optimal_chunk_size(const ttnn::Tensor& input_tensor) {
+@@ -30,4 +31,23 @@ inline uint32_t calculate_optimal_chunk_size(const ttnn::Tensor& input_tensor) {
      return ceil32((l1_per_chunk * 9 / 10) - 32);
  }
  
 +inline std::string scatter_outer_shape_define(const ttnn::Shape& shape, uint32_t outer_rank) {
++    // pre_scatter_transform_tensor intentionally leaves {0} and {1} untransformed while other
++    // rank <= 4 tensors become rank 4. Their missing outer dimensions are therefore all singleton.
++    const bool is_untransformed_empty_or_singleton = shape == ttnn::Shape{0} || shape == ttnn::Shape{1};
 +    TT_ASSERT(
-+        shape.rank() == outer_rank + 1,
++        is_untransformed_empty_or_singleton || shape.rank() == outer_rank + 1,
 +        "Scatter shape rank {} does not match the kernel rank {}.",
 +        shape.rank(),
 +        outer_rank + 1);
@@ -67,7 +70,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.
 +        if (!value.empty()) {
 +            value += ',';
 +        }
-+        value += std::to_string(shape[i]);
++        value += std::to_string(is_untransformed_empty_or_singleton ? 1 : shape[i]);
 +    }
 +    return value;
 +}
