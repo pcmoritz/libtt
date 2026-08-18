@@ -7,7 +7,9 @@ diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
  // (requires use_pack_untilize for uint32/int32)
  // See: ttnn/operations/data_movement/untilize/device/untilize_op.cpp
  // FP32 untilize fix: https://github.com/tenstorrent/tt-metal/pull/33904
-@@ -111,2 +111,3 @@ bool canUntilizeDataTypeOnDevice(const ::ttnn::DataType &dataType) {
+@@ -110,4 +110,5 @@ bool canUntilizeDataTypeOnDevice(const ::ttnn::DataType &dataType) {
+          dataType == ::ttnn::DataType::UINT32 ||
           dataType == ::ttnn::DataType::UINT16 ||
 +         dataType == ::ttnn::DataType::UINT8 ||
           dataType == ::ttnn::DataType::INT32;
+ }

@@ -14,12 +14,14 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h tt_metal/hw/i
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
-@@ -18,3 +18,3 @@ inline void bitwise_not_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
+@@ -17,10 +17,14 @@ namespace sfpu {
+ inline void bitwise_not_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
  
 -template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
 +template <bool APPROXIMATION_MODE, DataFormat DATA_FORMAT = DataFormat::Int32, int ITERATIONS = 8>
  inline void calculate_bitwise_not() {
-@@ -23,3 +23,7 @@ inline void calculate_bitwise_not() {
+ #pragma GCC unroll 0
+     for (int d = 0; d < ITERATIONS; d++) {
          sfpi::vInt v = sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>();
 -        sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>() = ~v;
 +        if constexpr (DATA_FORMAT == DataFormat::UInt8) {
@@ -28,15 +30,17 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bi
 +            sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>() = ~v;
 +        }
          dst_reg++;
+     }
 diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
-@@ -18,3 +18,3 @@ inline void bitwise_not_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
+@@ -17,13 +17,17 @@ namespace sfpu {
+ inline void bitwise_not_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
  
 -template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
 +template <bool APPROXIMATION_MODE, DataFormat DATA_FORMAT = DataFormat::Int32, int ITERATIONS = 8>
  inline void calculate_bitwise_not() {
-@@ -22,7 +22,11 @@ inline void calculate_bitwise_not() {
+ #pragma GCC unroll 0
      for (int d = 0; d < ITERATIONS; d++) {
 -        // Load/store as two's-complement int32 (sfpi DataLayout::I32 == InstrModLoadStore::INT32),
 -        // matching the original TTI path. A plain vInt load would read the raw sign-magnitude dest
@@ -52,6 +56,7 @@ diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_
 +            dst_reg[0].mode<sfpi::DataLayout::I32>() = ~v;
 +        }
          dst_reg++;
+     }
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp

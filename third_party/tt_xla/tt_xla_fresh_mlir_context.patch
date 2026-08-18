@@ -9,27 +9,30 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 +static const mlir::DialectRegistry &getDialectRegistry() {
 +  static const mlir::DialectRegistry registry = [] {
 +    mlir::DialectRegistry registry;
-@@ -306,5 +305,10 @@ ModuleBuilder::ModuleBuilder()
- 
+@@ -271,16 +270,30 @@
+   mlir::func::registerAllExtensions(registry);
+   mlir::tt::registerAllExtensions(registry);
+
 -  mlir::tt::ttir::registerPasses();
 -  mlir::tt::ttnn::registerPasses();
 +    return registry;
 +  }();
 +  return registry;
 +}
- 
+
 +static std::unique_ptr<mlir::MLIRContext> createMlirContext() {
 +  auto context =
 +      std::make_unique<mlir::MLIRContext>(getDialectRegistry());
    // We need to allow unregistered dialects since shardy uses specific mhlo
-@@ -313,4 +317,13 @@ ModuleBuilder::ModuleBuilder()
+   // dialect attributes, which are not registered in the context and live in the
+   // openXLA repository. See issue:
    // https://github.com/tenstorrent/tt-xla/issues/355
 -  m_context->allowUnregisteredDialects();
 -  m_context->appendDialectRegistry(registry);
 +  context->allowUnregisteredDialects();
 +  return context;
 +}
-+
+
 +ModuleBuilder::ModuleBuilder() {
 +  static const bool passes_registered = [] {
 +    mlir::tt::ttir::registerPasses();
@@ -37,27 +40,38 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 +    return true;
 +  }();
 +  (void)passes_registered;
- 
-@@ -328,2 +341,4 @@ ModuleBuilder::buildModule(
++
+   // Try to load tt-alchemist library and function pointers.
+   m_tt_alchemist_handler.initialize();
+ }
+@@ -327,4 +340,6 @@ ModuleBuilder::buildModule(
+   DLOG_F(LOG_DEBUG, "ModuleBuilder::buildModule");
  
 +  auto context = createMlirContext();
 +
    auto compile_options = CompileOptions::parse(compile_options_map);
-@@ -364,3 +379,4 @@ ModuleBuilder::buildModule(
+ 
+@@ -363,5 +378,6 @@ ModuleBuilder::buildModule(
+   tt_pjrt_status status;
    mlir::OwningOpRef<mlir::ModuleOp> mlir_module;
 -  status = createVHLOModule(mlir_code, mlir_module, compile_options.export_path,
 +  status = createVHLOModule(mlir_code, context.get(), mlir_module,
 +                            compile_options.export_path,
                              compile_options.export_model_name);
-@@ -529,2 +545,3 @@ tt_pjrt_status
+   if (!tt_pjrt_status_is_ok(status)) {
+@@ -528,4 +544,5 @@ ModuleBuilder::buildModule(
+ tt_pjrt_status
  ModuleBuilder::createVHLOModule(const std::string_view &mlir_code,
 +                                mlir::MLIRContext *context,
                                  mlir::OwningOpRef<mlir::ModuleOp> &vhlo_module,
-@@ -534,3 +551,3 @@ ModuleBuilder::createVHLOModule(const std::string_view &mlir_code,
+                                 const std::optional<std::string> &export_path,
+@@ -533,5 +550,5 @@ ModuleBuilder::createVHLOModule(const std::string_view &mlir_code,
+   vhlo_module = mlir::parseSourceString<mlir::ModuleOp>(
        llvm::StringRef(mlir_code.data(), mlir_code.size()),
 -      mlir::ParserConfig{m_context.get(), /*verifyAfterParse=*/true});
 +      mlir::ParserConfig{context, /*verifyAfterParse=*/true});
  
+   if (!vhlo_module) {
 diff --git a/pjrt_implementation/inc/api/module_builder/module_builder.h b/pjrt_implementation/inc/api/module_builder/module_builder.h
 --- a/pjrt_implementation/inc/api/module_builder/module_builder.h
 +++ b/pjrt_implementation/inc/api/module_builder/module_builder.h
@@ -69,9 +83,11 @@ diff --git a/pjrt_implementation/inc/api/module_builder/module_builder.h b/pjrt_
                     mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
                     const std::optional<std::string> &export_path,
                     const std::string &model_name = "");
-@@ -370,5 +371,2 @@ private:
+@@ -369,7 +370,4 @@ private:
+                         size_t &num_devices);
  
 -  // MLIR context handle.
 -  std::unique_ptr<mlir::MLIRContext> m_context;
 -
    // tt-alchemist library handler.
+   TTAlchemistHandler m_tt_alchemist_handler;

@@ -14,42 +14,45 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
  // Typical initialization values for reduction ops.
  enum TypicalInitReductionValue {
-@@ -127,6 +133,2 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+@@ -126,34 +132,19 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+   float desiredF32;
    double desiredF64;
 -  int32_t desiredI32;
 -  int64_t desiredI64;
 -  int8_t desiredI8;
 -  bool desiredI1;
    if (desired == TypicalInitReductionValue::NEG_INF) {
-@@ -134,6 +136,2 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+     desiredF32 = -std::numeric_limits<float>::infinity();
      desiredF64 = -std::numeric_limits<double>::infinity();
 -    desiredI32 = std::numeric_limits<int32_t>::min();
 -    desiredI64 = std::numeric_limits<int64_t>::min();
 -    desiredI8 = std::numeric_limits<int8_t>::min();
 -    desiredI1 = false;
    } else if (desired == TypicalInitReductionValue::ZERO) {
-@@ -141,6 +139,2 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+     desiredF32 = 0.0;
      desiredF64 = 0.0;
 -    desiredI32 = 0;
 -    desiredI64 = 0;
 -    desiredI8 = 0;
 -    desiredI1 = false;
    } else if (desired == TypicalInitReductionValue::ONE) {
-@@ -148,6 +142,2 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+     desiredF32 = 1.0;
      desiredF64 = 1.0;
 -    desiredI32 = 1;
 -    desiredI64 = 1;
 -    desiredI8 = 1;
 -    desiredI1 = true;
    } else {
-@@ -164,4 +154,5 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+     return false;
+   }
+ 
 -  if (initValueOp.getResult().getType().getElementType().isBF16()) {
 +  if (initValueOp.getResult().getType().getElementType().isBF16() ||
 +      initValueOp.getResult().getType().getElementType().isF16()) {
      const llvm::APFloat &value =
          *initValueOp.getValue().value_begin<llvm::APFloat>();
-     if (desired == TypicalInitReductionValue::NEG_INF) {
-@@ -174,30 +165,15 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+@@ -173,32 +164,17 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+     return *initValueOp.getValue().value_begin<double>() == desiredF64;
    }
 -  // Integer element types: read the constant as an APInt so both signed and
 -  // unsigned attributes work. value_begin<int32_t>()/<int64_t>() assert with
@@ -90,6 +93,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +               ? value.isZero()
 +               : value.isMinSignedValue();
    }
+ 
 @@ -302,5 +308,11 @@ private:
                            mlir::stablehlo::ReduceOp::Adaptor adaptor,
                            ConversionPatternRewriter &rewriter) const {
@@ -102,7 +106,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (!srcOp.getBody().hasOneBlock()) {
        return rewriter.notifyMatchFailure(
            srcOp,
-@@ -737,2 +719,9 @@ public:
+@@ -736,4 +718,11 @@ public:
+                   mlir::stablehlo::DotGeneralOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
 +    Type lhsType = getElementTypeOrSelf(srcOp.getLhs());
 +    Type rhsType = getElementTypeOrSelf(srcOp.getRhs());
@@ -112,6 +117,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          srcOp, "only 16- and 32-bit float inputs are supported");
 +    }
  
+     auto outputType = mlir::cast<RankedTensorType>(
 @@ -1262,3 +1282,8 @@ private:
                            ConversionPatternRewriter &rewriter) const {
 +    if (hasUnsupportedFloatType(srcOp.getValue().getElementType())) {
@@ -146,7 +152,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
          mlir::RankedTensorType resultType = cast<RankedTensorType>(
              getTypeConverter()->convertType(srcOp.getResult(0).getType()));
          rewriter.replaceOpWithNewOp<ttir::CumProdOp>(
-@@ -4273,4 +4277,5 @@ public:
+@@ -4272,6 +4276,7 @@ public:
+     // (H, W)
      auto spatialDims = getIndicesofElementsLargerThanOne(windowDims);
 -    if (spatialDims.empty()) {
 -      return rewriter.notifyMatchFailure(srcOp, "No elements larger than one");
@@ -154,10 +161,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      return rewriter.notifyMatchFailure(
 +          srcOp, "only 4D operands with two spatial dimensions are supported");
      }
-@@ -7449,2 +7454,6 @@ private:
+ 
+@@ -7448,4 +7453,8 @@ private:
+     ArrayRef<int64_t> scatterDimsToOperandDims =
          dimensionNumbers.getScatterDimsToOperandDims();
 +    if (scatterDimsToOperandDims.empty()) {
 +      return rewriter.notifyMatchFailure(
 +          op, "scatter_dims_to_operand_dims must not be empty");
 +    }
      if (!llvm::is_sorted(scatterDimsToOperandDims)) {
+       return rewriter.notifyMatchFailure(

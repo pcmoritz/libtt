@@ -87,7 +87,8 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_c
 index 34849a4..62cd3ba 100644
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
-@@ -47,3 +47,7 @@ void process_and_sort_tiles(
+@@ -46,5 +46,9 @@ void process_and_sort_tiles(
+         }
          // llk_topk_sort -> inplace
 -        ckernel::topk_local_sort(0, (int)ascending, end_phase);
 +        if (ascending) {
@@ -96,6 +97,7 @@ index 34849a4..62cd3ba 100644
 +            ckernel::topk_local_sort<true, true>(0, 0, end_phase);
 +        }
          tile_regs_commit();
+ 
 @@ -103,7 +107,11 @@ void process_tile_pair(
  
      // merge values - move larger 32 values into 0th dest and lower 32 values into 1st dest

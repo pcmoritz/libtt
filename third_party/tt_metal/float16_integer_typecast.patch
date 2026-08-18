@@ -55,7 +55,9 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
      } else if constexpr (
          in_format == DataFormat::UInt8 &&
          (out_format == DataFormat::Float16_b || out_format == DataFormat::Bfp8_b || out_format == DataFormat::Bfp4_b)) {
-@@ -423,2 +429,14 @@ ALWI void typecast_tile(uint32_t idst) {
+@@ -421,6 +427,18 @@ ALWI void typecast_tile(uint32_t idst) {
+             idst,
+             VectorMode::RC));
      }
 +    if constexpr (
 +        out_format == DataFormat::Float16 &&
@@ -70,34 +72,49 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
 +            VectorMode::RC));
 +    }
  #endif  // ARCH_QUASAR
-@@ -454,3 +472,5 @@ ALWI void typecast_tile_init() {
+ }
+ 
+@@ -452,12 +470,16 @@ ALWI void typecast_tile_init() {
+         MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint32_to_uint16, (APPROX)));
+     } else if constexpr (in_format == DataFormat::Int32 && out_format == DataFormat::UInt16) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_int32_to_uint16, (APPROX)));
 -    } else if constexpr (in_format == DataFormat::UInt32 && out_format == DataFormat::Float32) {
 +    } else if constexpr (
 +        in_format == DataFormat::UInt32 &&
 +        (out_format == DataFormat::Float32 || out_format == DataFormat::Float16)) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint32_to_fp32, (APPROX)));
-@@ -459,3 +479,5 @@ ALWI void typecast_tile_init() {
+     } else if constexpr (
+         in_format == DataFormat::Int32 && (out_format == DataFormat::Float32 || out_format == DataFormat::Float16)) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_int32_to_fp32, (APPROX)));
 -    } else if constexpr (in_format == DataFormat::UInt16 && out_format == DataFormat::Float32) {
 +    } else if constexpr (
 +        in_format == DataFormat::UInt16 &&
 +        (out_format == DataFormat::Float32 || out_format == DataFormat::Float16)) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint16_to_fp32, (APPROX)));
-@@ -487,3 +509,5 @@ ALWI void typecast_tile_init() {
+     } else if constexpr (
+         in_format == DataFormat::UInt16 &&
+@@ -485,7 +507,9 @@ ALWI void typecast_tile_init() {
+         (in_format == DataFormat::Int32 || in_format == DataFormat::UInt32 || in_format == DataFormat::UInt16) &&
+         out_format == DataFormat::UInt8) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint_to_uint8, (APPROX)));
 -    } else if constexpr (in_format == DataFormat::UInt8 && out_format == DataFormat::Float32) {
 +    } else if constexpr (
 +        in_format == DataFormat::UInt8 &&
 +        (out_format == DataFormat::Float32 || out_format == DataFormat::Float16)) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint32_to_fp32, (APPROX)));
+     } else if constexpr (
+         in_format == DataFormat::UInt8 &&
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-@@ -51,2 +51,3 @@ inline Tensor typecast_impl(
+@@ -49,6 +49,7 @@ inline Tensor typecast_impl(
+         (input_dtype == DataType::UINT16 and output_dtype == DataType::UINT8) or (input_dtype == DataType::UINT8);
+     bool fp32_dest_acc_en = preserve_fp32_precision or output_dtype == DataType::UINT32 or
                              output_dtype == DataType::INT32 or output_dtype == DataType::FLOAT32 or
 +                            (input_dtype == DataType::UINT16 and output_dtype == DataType::FLOAT16) or
                              input_dtype == DataType::UINT32 or input_dtype == DataType::INT32 or
+                             output_dtype == DataType::FP8_E4M3 or input_dtype == DataType::FP8_E4M3;
+     bool bfp8_pack_precise = (output_dtype == DataType::BFLOAT8_B);
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp

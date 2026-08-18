@@ -20,16 +20,20 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -18,2 +18,3 @@
+@@ -17,4 +17,5 @@
+ #include <filesystem>
  #include <map>
 +#include <mutex>
  #include <optional>
-@@ -500,2 +501,5 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+ 
+@@ -499,4 +500,7 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+     size_t target_num_devices) {
  
 +  static std::mutex compile_mutex;
 +  const std::lock_guard<std::mutex> lock(compile_mutex);
 +
    std::string_view mlir_code(mlir_program->code, mlir_program->code_size);
+ 
 diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implementation/src/api/compile_options_parser.cc
 --- a/pjrt_implementation/src/api/compile_options_parser.cc
 +++ b/pjrt_implementation/src/api/compile_options_parser.cc
@@ -69,7 +73,8 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
 diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/api_bindings.cc
 --- a/pjrt_implementation/src/api_bindings.cc
 +++ b/pjrt_implementation/src/api_bindings.cc
-@@ -23,4 +23,53 @@
+@@ -22,10 +22,60 @@
+ #include "api/plugin_attributes.h"
  #include "utils/logging.h"
 +#include "xla/pjrt/c/pjrt_c_api_profiler_extension.h"
  
@@ -123,9 +128,10 @@ diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/a
 +
 +} // namespace
  
-@@ -28,3 +77,4 @@ void bindApi(PJRT_Api *api) {
+ void bindApi(PJRT_Api *api) {
    api->struct_size = PJRT_Api_STRUCT_SIZE;
 -  api->extension_start = nullptr;
 +  api->extension_start =
 +      reinterpret_cast<PJRT_Extension_Base *>(&profilerExtension);
    api->pjrt_api_version.major_version = PJRT_API_MAJOR;
+   api->pjrt_api_version.minor_version = PJRT_API_MINOR;

@@ -355,7 +355,9 @@ index e7a8a79..9401974 100644
                         : (op_has_exp ? tt::DataFormat::Float16_b : b_data_format);
          uint32_t b_intermediate_single_tile_size = tt::tile_size(b_intermediate_format);
          desc.cbs.push_back(CBDescriptor{
-@@ -1204,5 +1219,4 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1202,9 +1217,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+                             b_data_format == tt::DataFormat::Float32 ||
+                             (a_data_format == tt::DataFormat::Int32 && b_data_format == tt::DataFormat::Int32) ||
                              (a_data_format == tt::DataFormat::UInt32 && b_data_format == tt::DataFormat::UInt32) ||
 -                            // Quant SFPU kernels compute on the fp32 input in DST; keep fp32 dest
 -                            // accumulation regardless of the (possibly narrow, e.g. uint8) output format.
@@ -363,6 +365,8 @@ index e7a8a79..9401974 100644
 +                            // Quant and promoted narrow-float SFPU kernels compute on fp32 values in DST.
 +                            operation_attributes.is_quant_op || promote_narrow_float_inputs;
  
+     uint32_t src0_cb_index = tt::CBIndex::c_0;
+     uint32_t src1_cb_index = tt::CBIndex::c_1;
 @@ -1207,7 +1221,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
  
 -    if (is_sfpu_op && !is_fp16_comparison) {

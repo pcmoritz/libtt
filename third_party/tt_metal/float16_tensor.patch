@@ -171,15 +171,6 @@ diff --git tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp tt_
 diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
 --- tt_metal/impl/tensor/tensor_apis.cpp
 +++ tt_metal/impl/tensor/tensor_apis.cpp
-@@ -1202,3 +1202,7 @@ tt::tt_metal::DistributedHostBuffer transform_buffers(
-             std::transform(data.begin(), data.end(), output_vector.begin(), [](SrcType value) {
--                return static_cast<DstType>(value);
-+                if constexpr (std::is_same_v<SrcType, float16> || std::is_same_v<DstType, float16>) {
-+                    return static_cast<DstType>(static_cast<float>(value));
-+                } else {
-+                    return static_cast<DstType>(value);
-+                }
-             });
 @@ -539,2 +543,3 @@ HostTensor to_dtype(const HostTensor& input_tensor, DataType dtype) {
                  case DataType::FLOAT32: return with_src_and_dst.operator()<SrcType, float>();
 +                case DataType::FLOAT16: return with_src_and_dst.operator()<SrcType, float16>();
@@ -414,11 +405,6 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
 +                         : ((is_sfpu_op || a_dtype == DataType::FLOAT16) &&
 +                            !is_block_float(a_dtype))                ? a_dtype
                                                                      : DataType::BFLOAT16;
-@@ -1173,2 +1173,4 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
-     bool fp32_dest_acc_en = c_data_format == tt::DataFormat::UInt32 || c_data_format == tt::DataFormat::Int32 ||
-+                            a_data_format == tt::DataFormat::Float16 ||
-+                            b_data_format == tt::DataFormat::Float16 || c_data_format == tt::DataFormat::Float16 ||
-                             c_data_format == tt::DataFormat::Float32 || a_data_format == tt::DataFormat::Float32 ||
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
@@ -483,11 +469,6 @@ diff --git tt_metal/jit_build/data_format.cpp tt_metal/jit_build/data_format.cpp
 +        }
 +        const auto format = data_format[index];
          // Special case where Float32 can pair with any exponent precision, skip checking
-@@ -278,3 +278,3 @@ DataFormat get_single_pack_src_format(
-         } else if (data_format == DataFormat::Float16) {
--            pack_src_format = DataFormat::Float16_b;
-+            pack_src_format = DataFormat::Float16;
-         } else if (data_format == DataFormat::UInt32) {
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_device_operation.cpp
@@ -572,6 +553,22 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
 -        .fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en,
 +        .fp32_dest_acc_en = fp32_dest_acc_en,
          .unpack_to_dest_mode = {unpack_to_dest_mode.begin(), unpack_to_dest_mode.end()},
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+@@ -1173,2 +1173,4 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
+     bool fp32_dest_acc_en = c_data_format == tt::DataFormat::UInt32 || c_data_format == tt::DataFormat::Int32 ||
++                            a_data_format == tt::DataFormat::Float16 ||
++                            b_data_format == tt::DataFormat::Float16 || c_data_format == tt::DataFormat::Float16 ||
+                             c_data_format == tt::DataFormat::Float32 || a_data_format == tt::DataFormat::Float32 ||
+diff --git tt_metal/jit_build/data_format.cpp tt_metal/jit_build/data_format.cpp
+--- tt_metal/jit_build/data_format.cpp
++++ tt_metal/jit_build/data_format.cpp
+@@ -278,3 +278,3 @@ DataFormat get_single_pack_src_format(
+         } else if (data_format == DataFormat::Float16) {
+-            pack_src_format = DataFormat::Float16_b;
++            pack_src_format = DataFormat::Float16;
+         } else if (data_format == DataFormat::UInt32) {
 diff --git ttnn/core/tensor/host_buffer/functions.cpp ttnn/core/tensor/host_buffer/functions.cpp
 --- ttnn/core/tensor/host_buffer/functions.cpp
 +++ ttnn/core/tensor/host_buffer/functions.cpp
@@ -902,6 +899,18 @@ diff --git ttnn/cpp/ttnn/operations/conv/conv2d/prepare_conv2d_weights.cpp ttnn/
              {DataType::BFLOAT16, &conv_depthwise_weight_bcast_helper<bfloat16>},
 +            {DataType::FLOAT16, &conv_depthwise_weight_bcast_helper<tt::tt_metal::float16>},
              {DataType::UINT16, &conv_depthwise_weight_bcast_helper<uint16_t>},
+diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
+--- tt_metal/impl/tensor/tensor_apis.cpp
++++ tt_metal/impl/tensor/tensor_apis.cpp
+@@ -1202,3 +1202,7 @@ tt::tt_metal::DistributedHostBuffer transform_buffers(
+             std::transform(data.begin(), data.end(), output_vector.begin(), [](SrcType value) {
+-                return static_cast<DstType>(value);
++                if constexpr (std::is_same_v<SrcType, float16> || std::is_same_v<DstType, float16>) {
++                    return static_cast<DstType>(static_cast<float>(value));
++                } else {
++                    return static_cast<DstType>(value);
++                }
+             });
 diff --git ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp

@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
-@@ -34,5 +34,7 @@ void EmbeddingsDeviceOperation::validate_on_program_cache_miss(
+@@ -34,6 +34,8 @@ void EmbeddingsDeviceOperation::validate_on_program_cache_miss(
          weights.layout() == Layout::ROW_MAJOR, "Weights tensor layout must be ROW_MAJOR but got {}", weights.layout());
      TT_FATAL(a.dtype() == DataType::UINT32 or a.dtype() == DataType::BFLOAT16, "Input must be UINT32 or BFLOAT16");
 -    TT_FATAL(weights.dtype() == DataType::BFLOAT16, "Weights tensor must have BFLOAT16 dtype");
@@ -10,6 +10,7 @@ diff --git ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.
 +        "Weights tensor must have BFLOAT16 or FLOAT32 dtype");
      TT_FATAL(
          a.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
+         "Embedding does not currently support sharded inputs");
 diff --git ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
 --- ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
 +++ ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp

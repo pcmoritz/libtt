@@ -39,15 +39,11 @@ diff -ruN tt_metal/impl/event/dispatch.cpp tt_metal/impl/event/dispatch.cpp
 diff -ruN tt_metal/impl/program/dispatch.cpp tt_metal/impl/program/dispatch.cpp
 --- tt_metal/impl/program/dispatch.cpp
 +++ tt_metal/impl/program/dispatch.cpp
-@@ -468,7 +468,7 @@ void insert_stall_cmds(ProgramCommandSequence& program_command_sequence, SubDevi
- // Watcher only: pre-fill an RTA payload region with 0xBEEF0000 | rand16 so unused runtime-arg slots are
- // obviously unset on device (equality tests are likely to fail). With watcher off the region stays zero.
+@@ -470,3 +470,3 @@ void insert_stall_cmds(ProgramCommandSequence& program_command_sequence, SubDevi
  void fill_runtime_args_watcher_pattern(uint32_t* dst, uint32_t num_words) {
 -    thread_local static std::mt19937 gen(std::random_device{}());
 +    std::mt19937 gen(std::random_device{}());
      std::uniform_int_distribution<int> dist(0, 65535);
-     for (uint32_t i = 0; i < num_words; i++) {
-         dst[i] = WATCHER_RTA_UNSET_PATTERN | static_cast<uint16_t>(dist(gen));
 @@ -520,7 +520,7 @@
          std::is_same_v<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd> or
          std::is_same_v<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>);

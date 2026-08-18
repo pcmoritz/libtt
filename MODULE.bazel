@@ -274,7 +274,10 @@ http_archive(
     build_file_content = "# empty\n",
     # LLVM and StableHLO revisions follow tt-mlir's env/CMakeLists.txt.
     patch_args = ["-p1"],
-    patches = ["//third_party/tt_xla:llvm_bazel9_cc_rules.patch"],
+    patches = [
+        "//third_party/tt_xla:llvm_reject_invalid_fold_result_types.patch",
+        "//third_party/tt_xla:llvm_bazel9_cc_rules.patch",
+    ],
     sha256 = "4860ff3400d59eccaf3b9f399432d5f8494c2f19a815069a314eb9cf10042822",
     strip_prefix = "llvm-project-4efe170d858eb54432f520abb4e7f0086236748b",
     urls = [

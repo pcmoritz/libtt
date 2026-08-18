@@ -47,7 +47,8 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  #include "api/compile_options_parser.h"
  #include "api/error_instance.h"
  #include "api/event_instance.h"
-@@ -863,2 +864,7 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+@@ -862,4 +863,9 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+     return *ErrorInstance::makeError(compile_options_status).release();
    }
 +  if (auto validation_error = CompileOptions::validate(compile_options_map)) {
 +    return *ErrorInstance::makeError(tt_pjrt_status::kInvalidArgument,
@@ -55,13 +56,16 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 +                .release();
 +  }
  
+   // SPMD partition count (>1 = genuine multi-device SPMD run) tells the module
 diff --git a/pjrt_implementation/src/api/compile_options.cc b/pjrt_implementation/src/api/compile_options.cc
 --- a/pjrt_implementation/src/api/compile_options.cc
 +++ b/pjrt_implementation/src/api/compile_options.cc
-@@ -12,2 +12,3 @@
+@@ -11,4 +11,5 @@
+ #include <string>
  #include <unordered_map>
 +#include <unordered_set>
  
+ namespace tt::pjrt {
 @@ -115,6 +116,52 @@ CompileOptions CompileOptions::parse(
    return options;
  }

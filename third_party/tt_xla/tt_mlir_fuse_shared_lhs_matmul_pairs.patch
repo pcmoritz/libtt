@@ -1,6 +1,7 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -1874,7 +1874,7 @@ private:
+@@ -1873,9 +1873,9 @@ private:
+     bool allSameTransposeB = true;
      bool firstTransposeB = false;
  
      bool isValid() const {
@@ -9,6 +10,7 @@
      }
  
      bool getTargetTransposeB() const {
+       return allSameTransposeB ? firstTransposeB : false;
 @@ -2043,5 +2043,6 @@
      for (Operation *user : sharedLHS.getUsers()) {
        auto op = dyn_cast<OpType>(user);

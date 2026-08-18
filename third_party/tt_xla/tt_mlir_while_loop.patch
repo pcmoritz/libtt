@@ -152,11 +152,13 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
 diff --git a/runtime/lib/ttnn/operations/mlir_native/func_call.h b/runtime/lib/ttnn/operations/mlir_native/func_call.h
 --- a/runtime/lib/ttnn/operations/mlir_native/func_call.h
 +++ b/runtime/lib/ttnn/operations/mlir_native/func_call.h
-@@ -13,2 +13,4 @@ namespace tt::runtime::ttnn::operations::mlir_native {
+@@ -12,4 +12,6 @@ namespace tt::runtime::ttnn::operations::mlir_native {
+ 
  void run(const ::tt::target::ttnn::FuncCallOp *op, ProgramContext &context);
 +void run(const ::tt::target::ttnn::WhileLoopOp *op,
 +         ProgramContext &context);
  
+ } // namespace tt::runtime::ttnn::operations::mlir_native
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp

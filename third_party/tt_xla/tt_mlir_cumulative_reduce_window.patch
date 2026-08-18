@@ -15,7 +15,8 @@ index e60e4f91..fdce54b5 100644
  public:
    LogicalResult
    matchAndRewrite(mlir::stablehlo::ReduceWindowOp srcOp,
-@@ -2926,36 +2931,19 @@ public:
+@@ -2925,38 +2930,21 @@ public:
+     }
  
      // Handle the special case of lowering to CumSumOp.
      if (srcOp.getInputs().size() == 1) {
@@ -61,6 +62,7 @@ index e60e4f91..fdce54b5 100644
          return success();
        }
      }
+ 
 @@ -3557,7 +3554,38 @@ private:
      rewriter.replaceOp(srcOp, resultVals);
      return success();
@@ -101,9 +103,7 @@ index e60e4f91..fdce54b5 100644
    // This function verifies all the required conditions to convert stablehlo
    // reduce_window op to TTIR cumsum op and also determine the dimension
    // attribute along which the cumulative sum will be computed.
-@@ -3445,16 +3464,15 @@ private:
-   // 2. (If padding is non-splat vector): Window dimension attribute must have
-   //    all elements equal to 1 except one; whose location is the required
+@@ -3579,27 +3607,26 @@ private:
    //    dimension and value must be equal to size of the required dimension.
 -  std::optional<int64_t>
 +  std::optional<CumulativeReductionMatch>
@@ -115,16 +115,20 @@ index e60e4f91..fdce54b5 100644
      if (!isa<mlir::stablehlo::AddOp>(frontOp)) {
        return std::nullopt;
      }
- 
+-
++
 -    if (initValue != TypicalInitReductionValue::ZERO) {
 +    if (!hasInitValue(srcOp, TypicalInitReductionValue::ZERO)) {
        return std::nullopt;
      }
- 
-@@ -3463,13 +3481,13 @@ private:
+-
++
+     // Verify window-related attributes (strides, dilations)
+     if (!hasValidWindowAttributes(adaptor)) {
        return std::nullopt;
      }
- 
+-
++
 -    int64_t dimension;
 +    CumulativeReductionMatch match;
      // Check input tensor type and padding
@@ -132,15 +136,12 @@ index e60e4f91..fdce54b5 100644
 +    if (!hasValidInputAndPadding(srcOp, adaptor, match, padding)) {
        return std::nullopt;
      }
- 
+-
++
 -    return dimension;
 +    return match;
    }
- 
-   // This function verifies all the required conditions to convert stablehlo
-@@ -3491,16 +3509,15 @@ private:
-   // 2. (If padding is non-splat vector): Window dimension attribute must have
-   //    all elements equal to 1 except one; whose location is the required
+@@ -3625,27 +3652,26 @@ private:
    //    dimension and value must be equal to size of the required dimension.
 -  std::optional<int64_t>
 +  std::optional<CumulativeReductionMatch>
@@ -152,16 +153,20 @@ index e60e4f91..fdce54b5 100644
      if (!isa<mlir::stablehlo::MulOp>(frontOp)) {
        return std::nullopt;
      }
- 
+-
++
 -    if (initValue != TypicalInitReductionValue::ONE) {
 +    if (!hasInitValue(srcOp, TypicalInitReductionValue::ONE)) {
        return std::nullopt;
      }
- 
-@@ -3509,13 +3526,13 @@ private:
+-
++
+     // Verify window-related attributes (strides, dilations)
+     if (!hasValidWindowAttributes(adaptor)) {
        return std::nullopt;
      }
- 
+-
++
 -    int64_t dimension;
 +    CumulativeReductionMatch match;
      // Check input tensor type and padding
@@ -169,12 +174,11 @@ index e60e4f91..fdce54b5 100644
 +    if (!hasValidInputAndPadding(srcOp, adaptor, match, padding)) {
        return std::nullopt;
      }
- 
+-
++
 -    return dimension;
 +    return match;
    }
- 
-   // Helper function to find the StableHLO constant defining op by traversing
 @@ -3669,6 +3695,16 @@ private:
      return mlir::dyn_cast_if_present<mlir::stablehlo::ConstantOp>(valueDef);
    }
@@ -202,7 +206,8 @@ index e60e4f91..fdce54b5 100644
      RankedTensorType inputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getInputs()[0].getType()));
      int64_t inputRank = inputType.getRank();
-@@ -3617,13 +3644,13 @@ private:
+@@ -3616,15 +3643,15 @@ private:
+                         [](int value) { return value == 1; })) {
          return false;
        }
        // Determine the dimension using input tensor shape.
@@ -218,7 +223,9 @@ index e60e4f91..fdce54b5 100644
    }
  
    // Finds the first dimension of the input with size == 1.
-@@ -3643,7 +3670,7 @@ private:
+   bool findDimensionWithShape(RankedTensorType inputType,
+@@ -3642,9 +3669,9 @@ private:
+   // Determine and validate dimension attribute for non-splat padding attribute.
    bool validateNonSplatPadding(llvm::ArrayRef<int64_t> windowDimensions,
                                 DenseI64ArrayAttr padding,
                                 RankedTensorType inputType,
@@ -227,7 +234,9 @@ index e60e4f91..fdce54b5 100644
      int64_t dimArgValue = -1;
      int64_t idx = -1;
  
-@@ -3657,25 +3684,34 @@ private:
+     // Determine dimension attribute.
+@@ -3656,27 +3683,36 @@ private:
+       if (dimArgValue != -1) {
          return false; // Ensure only one non-1 element.
        }
        dimArgValue = windowDim;
@@ -270,3 +279,4 @@ index e60e4f91..fdce54b5 100644
    }
  
    // Verify that the output of reduce window op is consumed by division op and
+   // the divisor is initialized with a constant op which is equal to number of

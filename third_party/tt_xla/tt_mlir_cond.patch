@@ -83,7 +83,8 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp b/lib/Conversion/TTIRT
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -42,2 +42,8 @@
+@@ -41,4 +41,10 @@
+ 
  namespace mlir::tt::ttnn {
 +::flatbuffers::Offset<::tt::target::ttnn::Operation>
 +createCaseOperation(FlatbufferObjectCache &cache, ttcore::CaseOp caseOp,
@@ -92,6 +93,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +                    const std::string &locInfo);
 +
  ::flatbuffers::Offset<::tt::target::ttnn::Operation>
+ createWhileLoopOperation(
 @@ -4886,6 +4892,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, constantOp), debugString,
                             locInfo);
