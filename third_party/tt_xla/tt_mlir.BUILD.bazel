@@ -1239,7 +1239,6 @@ cc_library(
     srcs = [
         "lib/RegisterAll.cpp",
         "lib/Conversion/TTIRToEmitPy/CaptureMeshShape.cpp",
-        "lib/Target/LLVM/LLVMToDynamicLib.cpp",
         "@//third_party/tt_xla:tt_mlir_control_flow.cpp",
         "@//third_party/tt_xla:tt_mlir_compiler_cold_stubs.cc",
     ] + glob(
@@ -1289,14 +1288,7 @@ cc_library(
         "include/ttmlir/OpModel/TTNN",
         "lib",
     ],
-    deps = _TTMLIR_COMMON_DEPS + [
-        "@llvm-project//llvm:ExecutionEngine",
-        "@llvm-project//llvm:Target",
-        "@llvm-project//llvm:X86AsmParser",
-        "@llvm-project//llvm:X86CodeGen",
-        "@llvm-project//llvm:X86Info",
-        "@llvm-project//lld:ELF",
-    ],
+    deps = _TTMLIR_COMMON_DEPS,
     alwayslink = True,
 )
 
