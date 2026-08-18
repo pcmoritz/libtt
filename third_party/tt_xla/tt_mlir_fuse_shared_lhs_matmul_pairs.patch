@@ -9,8 +9,7 @@
      }
  
      bool getTargetTransposeB() const {
-@@ -2014,7 +2014,8 @@ private:
- 
+@@ -2043,5 +2043,6 @@
      for (Operation *user : sharedLHS.getUsers()) {
        auto op = dyn_cast<OpType>(user);
 -      if (!op || op.getA() != sharedLHS) {
@@ -18,4 +17,3 @@
 +          llvm::is_contained(result.ops, op)) {
          continue;
        }
- 

@@ -2,10 +2,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 index e60e4f91..fdce54b5 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -2834,6 +2834,11 @@ class StableHLOToTTIRReduceWindowOpConversionPattern
+@@ -2969,6 +2969,11 @@ class StableHLOToTTIRReduceWindowOpConversionPattern
    using OpConversionPattern<
        mlir::stablehlo::ReduceWindowOp>::OpConversionPattern;
- 
+-
++
 +  struct CumulativeReductionMatch {
 +    int64_t dimension = -1;
 +    bool reverse = false;
@@ -60,10 +61,12 @@ index e60e4f91..fdce54b5 100644
          return success();
        }
      }
-@@ -3426,6 +3414,37 @@ private:
+@@ -3557,7 +3554,38 @@ private:
+     rewriter.replaceOp(srcOp, resultVals);
      return success();
    }
- 
+-
++
 +  template <typename CumulativeOp>
 +  void replaceWithCumulativeOp(
 +      mlir::stablehlo::ReduceWindowOp srcOp,
@@ -172,10 +175,11 @@ index e60e4f91..fdce54b5 100644
    }
  
    // Helper function to find the StableHLO constant defining op by traversing
-@@ -3534,6 +3551,16 @@ private:
+@@ -3669,6 +3695,16 @@ private:
      return mlir::dyn_cast_if_present<mlir::stablehlo::ConstantOp>(valueDef);
    }
- 
+-
++
 +  bool hasInitValue(mlir::stablehlo::ReduceWindowOp &srcOp,
 +                    TypicalInitReductionValue desired) const {
 +    if (srcOp.getInitValues().size() != 1) {
@@ -189,8 +193,7 @@ index e60e4f91..fdce54b5 100644
    // Extract constant initialization values.
    std::optional<llvm::SmallVector<TypicalInitReductionValue>>
    extractInitValues(mlir::stablehlo::ReduceWindowOp &srcOp) const {
-@@ -3594,7 +3621,7 @@ private:
-   // dimension.
+@@ -3729,7 +3765,7 @@ private:
    bool hasValidInputAndPadding(mlir::stablehlo::ReduceWindowOp &srcOp,
                                 mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
 -                               int64_t &dimension,
@@ -198,6 +201,7 @@ index e60e4f91..fdce54b5 100644
                                 DenseI64ArrayAttr padding) const {
      RankedTensorType inputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getInputs()[0].getType()));
+     int64_t inputRank = inputType.getRank();
 @@ -3617,13 +3644,13 @@ private:
          return false;
        }

@@ -38,8 +38,11 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td
 --- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td
 +++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td
-@@ -29,2 +29,11 @@ class TTCore_Attr<string name, string attrMnemonic, list<Trait> traits = [],
- 
+@@ -26,6 +26,15 @@ class TTCore_Attr<string name, string attrMnemonic, list<Trait> traits = [],
+   let mnemonic = attrMnemonic;
+   let attrName = "ttcore." # attrMnemonic;
+ }
++
 +def TTCore_LoopBoundAttr : TTCore_Attr<"LoopBound", "loop_bound"> {
 +  let summary = "A constant loop bound or the input containing its value";
 +  let parameters = (ins
@@ -48,8 +51,9 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td b/include/ttmlir
 +  );
 +  let assemblyFormat = "`<` $constant (`,` $inputIndex^)? `>`";
 +}
-+
+ 
  def TTCore_GridAttr : TTCore_Attr<"Grid", "grid"> {
+   let summary = "TT grid attribute";
 diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
 --- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
 +++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
@@ -85,18 +89,21 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td b/include/ttmlir/Dial
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -12379,2 +12379,6 @@ namespace mlir::tt {
+@@ -11446,8 +11446,14 @@ namespace mlir::tt {
+ namespace mlir::tt {
  
 +void populateStableHLOControlFlowToTTIRPatterns(
 +    MLIRContext *context, RewritePatternSet &patterns,
 +    TypeConverter &typeConverter);
 +
  void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
-@@ -12382,2 +12386,4 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
+                                      RewritePatternSet &patterns,
                                       TypeConverter &typeConverter) {
 +  populateStableHLOControlFlowToTTIRPatterns(ctx, patterns, typeConverter);
 +
    addElementwiseUnaryOpsConversionPatterns(ctx, patterns, typeConverter);
+   addElementwiseBinaryOpsConversionPatterns(ctx, patterns, typeConverter);
+   addQuantizeOpsConversionPattern(ctx, patterns, typeConverter);
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp

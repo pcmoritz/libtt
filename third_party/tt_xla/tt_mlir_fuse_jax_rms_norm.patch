@@ -1,8 +1,7 @@
-diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -2886,2 +2886,11 @@ public:
- 
+@@ -2659,2 +2659,11 @@ public:
+
 +    auto dropSubtractZero = [&](mlir::Value value) {
 +      value = lookThroughSafeOps(value);
 +      auto subtract = value.getDefiningOp<SubtractOp>();
@@ -13,8 +12,8 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +                 : value;
 +    };
      MultiplyOp innerMul =
-@@ -2914,28 +2923,41 @@ public:
- 
+@@ -2689,28 +2690,41 @@ public:
+
 -    MeanOp meanOp = addOp.getLhs().getDefiningOp<MeanOp>();
 +    auto getLastDimReductionInput = [&](mlir::Value value) -> std::optional<mlir::Value> {
 +      auto checkReduction = [&](auto reductionOp) -> std::optional<mlir::Value> {
@@ -67,15 +66,15 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 -      return mlir::failure();
 -    }
 +    if (!reductionInput) return mlir::failure();
- 
+
      // Match x^2 as mul(x,x) or pow(x,2).
 -    mlir::Value meanInput = meanOp.getInput();
 +    mlir::Value meanInput = *reductionInput;
      mlir::Value squareInput = nullptr;
 -    mlir::Value x = lookThroughSafeOps(xRaw);
 +    mlir::Value x = dropSubtractZero(xRaw);
- 
-@@ -2952,3 +2974,8 @@ public:
+
+@@ -2728,3 +2732,8 @@ public:
      if (!squareInput || squareInput != x) {
 -      return mlir::failure();
 +      mlir::Value swappedX = dropSubtractZero(gammaRaw);
@@ -90,8 +89,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    rewriter.setInsertionPoint(outerMul);
 +
      // Reshape gamma to match normalized_shape if needed.
-@@ -3005,4 +3034,2 @@ public:
- 
+@@ -3006,3 +3017 @@ public:
 -    rewriter.setInsertionPoint(outerMul);
 -
      // Create RMSNormOp with output shape and dtype matching input.

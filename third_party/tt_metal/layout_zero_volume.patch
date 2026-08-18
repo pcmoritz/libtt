@@ -48,8 +48,9 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/ope
  #include "ttnn/operations/copy/typecast/device/typecast_device_op.hpp"
 +#include "ttnn/operations/creation/creation.hpp"
  #include "ttnn/operations/core/core.hpp"  // for to_dtype
-@@ -29,2 +30,13 @@ inline Tensor typecast_impl(
+@@ -27,3 +28,14 @@ inline Tensor typecast_impl(
      }
+-
 +    if (input_tensor.logical_volume() == 0) {
 +        if (optional_output_tensor.has_value()) {
 +            return *optional_output_tensor;
@@ -61,4 +62,5 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/ope
 +            input_tensor.device(),
 +            memory_config.value_or(input_tensor.memory_config()));
 +    }
- 
++
+     // Device tensor path

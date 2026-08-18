@@ -20,7 +20,7 @@ index 7a9f567..c6b4fa7 100644
        google::protobuf::io::CodedInputStream packed_stream(
            reinterpret_cast<const uint8_t *>(packed_data.data()),
            packed_data.size());
-@@ -261,7 +261,7 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+@@ -225,7 +225,7 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
        continue;
      }
  

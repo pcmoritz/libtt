@@ -23,7 +23,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 index c1fb81d..f0e33a7 100644
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -687,10 +687,6 @@ TTNNOperandsWorkaroundsFactory::createRotaryEmbeddingOpOperandsWorkarounds(
+@@ -685,10 +685,6 @@ TTNNOperandsWorkaroundsFactory::createRotaryEmbeddingOpOperandsWorkarounds(
  TTNNOperandsWorkarounds
  TTNNOperandsWorkaroundsFactory::createTanhOpOperandsWorkarounds() {
    TTNNOperandWorkarounds operandWorkaround;

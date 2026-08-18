@@ -116,7 +116,9 @@ diff --git tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h tt_metal/hw/inc/
 index c9d7ccf..a4aded9 100644
 --- tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
 +++ tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
-@@ -10,14 +10,15 @@ namespace ckernel::sfpu {
+@@ -8,49 +8,49 @@
+ 
+ namespace ckernel::sfpu {
  
 -// Returns the exact Float32 representation of the IEEE Float16 value obtained
 -// by round-to-nearest-even. Keeping the result in Float32 lets the packer emit
@@ -140,12 +142,14 @@ index c9d7ccf..a4aded9 100644
 +        v_if(magnitude > 0x7f800000U) { halfBits |= 0x200U; }
 +        v_endif;
      }
-@@ -25,3 +26,3 @@ sfpi_inline sfpi::vFloat float32_to_float16_rne(sfpi::vFloat input) {
+     v_elseif(magnitude >= 0x477ff000U) {
          // Values at or above the midpoint after max-finite overflow to infinity.
 -        rounded = 0x7f800000U;
 +        halfBits = 0x7c00U;
      }
-@@ -31,7 +32,9 @@ sfpi_inline sfpi::vFloat float32_to_float16_rne(sfpi::vFloat input) {
+     v_elseif(magnitude >= 0x38800000U) {
+         // Normal Float16: discard 13 mantissa bits with the retained LSB as
+         // the tie breaker.
          sfpi::vUInt lsb = (magnitude >> 13) & 1U;
 -        rounded = (magnitude + 0xfffU + lsb) & 0xffffe000U;
 +        sfpi::vUInt rounded = magnitude + 0xfffU + lsb;
@@ -158,7 +162,9 @@ index c9d7ccf..a4aded9 100644
 +        // Float16 subnormal. The rounded significand is already the raw half
 +        // mantissa; 0x400 naturally carries into the minimum normal value.
          sfpi::vUInt exponent = (magnitude >> 23) & 0xffU;
-@@ -41,14 +44,11 @@ sfpi_inline sfpi::vFloat float32_to_float16_rne(sfpi::vFloat input) {
+         sfpi::vUInt significand = (magnitude & 0x7fffffU) | 0x800000U;
+         sfpi::vInt shift = sfpi::vInt(126) - sfpi::as<sfpi::vInt>(exponent);
+         sfpi::vUInt truncated =
              sfpi::shft(significand, -shift, sfpi::ShiftMode::Logical);
 -        sfpi::vUInt half =
 +        sfpi::vUInt roundingHalf =
@@ -178,6 +184,8 @@ index c9d7ccf..a4aded9 100644
 -    return sfpi::as<sfpi::vFloat>(rounded | sign);
 +    return halfBits | sign;
  }
+ 
+ // Expands raw IEEE Float16 bits into exact Float32 bits.
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
 index 2676608..b1557fb 100644
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
@@ -390,7 +398,9 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
 index 13987fe..a33bad9 100644
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -121,8 +121,22 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+@@ -119,17 +119,31 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+     const auto& ops_chain = operation_attributes.op_chain;
+     TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
      auto compute_ops_chain = ops_chain;
 -    const bool promote_fp16 = input.dtype() == DataType::FLOAT16 &&
 -                              ops_chain[0].type() != UnaryOpType::TYPECAST &&
@@ -419,11 +429,14 @@ index 13987fe..a33bad9 100644
 +            compute_ops_chain.push_back(make_typecast(DataType::FLOAT32, input.dtype()));
 +        }
      }
-@@ -131,3 +145,3 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+ 
+     const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en ||
                                    input.dtype() == DataType::FLOAT16 ||
 -                                  output.dtype() == DataType::FLOAT16;
 +                                  output.dtype() == DataType::FLOAT16 || promote_narrow_float;
      uint32_t packed_scalar1 = 0;
+     uint32_t packed_scalar2 = 0;
+ 
 @@ -138,11 +152,11 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
      const bool is_row_major = input.layout() == Layout::ROW_MAJOR;
  

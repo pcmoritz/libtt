@@ -1,6 +1,6 @@
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -3039,6 +3039,106 @@ public:
+@@ -3032,6 +3032,106 @@
  
  namespace {
  
@@ -107,7 +107,7 @@
  class StableHLOToTTIRReduceWindowOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ReduceWindowOp> {
    using OpConversionPattern<
-@@ -3055,6 +3155,7 @@ public:
+@@ -3048,6 +3148,7 @@
                    mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
      using TypicalInitReductionValue::NEG_INF;
@@ -115,7 +115,7 @@
      using TypicalInitReductionValue::ZERO;
  
      // Validate basic op structure.
-@@ -3105,6 +3206,9 @@ public:
+@@ -3098,6 +3199,9 @@
        } else if (isa<mlir::stablehlo::MaxOp>(reduceOp)) {
          result = rewriter.create<ttir::MaximumOp>(srcOp.getLoc(), resultType,
                                                     input, init);
@@ -125,7 +125,7 @@
        } else if (isa<mlir::stablehlo::MulOp>(reduceOp)) {
          result = rewriter.create<ttir::MultiplyOp>(srcOp.getLoc(), resultType,
                                                      input, init);
-@@ -3136,6 +3240,7 @@ public:
+@@ -3128,6 +3232,7 @@
      SmallVector<mlir::Operation *> reductionOps;
      for (Operation &op : llvm::drop_end(operations, 1)) {
        if (!isa<mlir::stablehlo::AddOp, mlir::stablehlo::MaxOp,
@@ -133,7 +133,7 @@
                 mlir::stablehlo::MulOp>(&op)) {
          return rewriter.notifyMatchFailure(srcOp, "Unsupported reduction op.");
        }
-@@ -3206,87 +3311,27 @@ public:
+@@ -3198,87 +3303,27 @@
        }
      }
  
@@ -236,7 +236,7 @@
  
      // Construct attributes for TTIR pooling ops.
  
-@@ -3327,56 +3372,55 @@ public:
+@@ -3319,56 +3364,55 @@
  
        RankedTensorType inputType =
            mlir::cast<RankedTensorType>(input.getType());
@@ -328,7 +328,7 @@
          }
          return result;
        };
-@@ -3388,6 +3432,20 @@ public:
+@@ -3380,6 +3424,20 @@
                           strideForTTIROps, dilationForTTIROps,
                           paddingForTTIROps, ceilMode)
                       .getResult();
@@ -349,7 +349,7 @@
        } else if (isa<mlir::stablehlo::AddOp>(reductionOp) && initVal == ZERO) {
          // Special case of sum pooling followed by a convenient div op.
          // TODO(acicovic): Check why was i == 0 originally added as a condition.
-@@ -3830,6 +3888,9 @@ private:
+@@ -3822,6 +3880,9 @@
        }
        if (checkInitValue(constantOp, TypicalInitReductionValue::NEG_INF)) {
          initValues.push_back(TypicalInitReductionValue::NEG_INF);
@@ -359,7 +359,7 @@
        } else if (checkInitValue(constantOp, TypicalInitReductionValue::ZERO)) {
          initValues.push_back(TypicalInitReductionValue::ZERO);
        } else if (checkInitValue(constantOp, TypicalInitReductionValue::ONE)) {
-@@ -4720,8 +4781,8 @@ public:
+@@ -4712,8 +4773,8 @@
      }
  
      Location loc = srcOp.getLoc();
@@ -370,7 +370,7 @@
      auto initValue_ = srcOp.getInitValue();
  
      // Get window attributes
-@@ -4749,7 +4810,34 @@ public:
+@@ -4741,7 +4802,34 @@
          loc, operandType, rewriter.getF32FloatAttr(fillValue));
  
      // Tensor which we scatter into
@@ -468,7 +468,7 @@
  
      // Adjust args to match definition in MaxPool2dWithIndices
      auto kernel = rewriter.getDenseI32ArrayAttr(
-@@ -4832,31 +4885,32 @@ public:
+@@ -4824,31 +4877,32 @@
  
      auto ceilMode = rewriter.getBoolAttr(false);
  
@@ -522,7 +522,7 @@
                                rewriter.getIntegerType(32)); // i32 for indices
  
      Value pooledEmpty = rewriter.create<ttir::EmptyOp>(loc, pooledType);
-@@ -4901,8 +4955,14 @@ public:
+@@ -4893,8 +4947,14 @@
        return rewriter.notifyMatchFailure(
            srcOp, "SelectAndScatterOp cannot specify reduce type.");
      }
@@ -595,7 +595,7 @@
    RankedTensorType getNHWFlattenedType(RankedTensorType unflattenedType) const {
      llvm::ArrayRef<int64_t> shape = unflattenedType.getShape();
      assert(shape.size() == 4 && "Expected 4D NHWC tensor");
-@@ -4950,9 +5008,8 @@ private:
+@@ -4942,9 +5000,8 @@
    }
  
    ttir::ReshapeOp

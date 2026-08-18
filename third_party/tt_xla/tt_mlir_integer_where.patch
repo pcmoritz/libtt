@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -363,9 +363,9 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
+@@ -363,9 +363,9 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::createToLayoutOpOperand
  // tt-metal uses predicate type for where op operation. If the predicate data
  // type does not match with inputs/output data type; tt-metal can generate
  // incorrect results or other failures. Add a data type workaround if predicate
@@ -87,7 +87,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
  // Pass to apply workarounds to the operands of TTNN operations.
  class TTNNWorkarounds : public impl::TTNNWorkaroundsBase<TTNNWorkarounds> {
  public:
-@@ -431,7 +464,7 @@ public:
+@@ -430,7 +463,7 @@ public:
      if (decompositionWorkaroundsEnabled) {
        RewritePatternSet patterns(&getContext());
        patterns.add<

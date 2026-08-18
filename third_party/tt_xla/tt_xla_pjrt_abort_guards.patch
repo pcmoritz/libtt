@@ -1,28 +1,22 @@
 diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
 --- a/pjrt_implementation/src/api/buffer_instance.cc
 +++ b/pjrt_implementation/src/api/buffer_instance.cc
-@@ -673,6 +673,8 @@ PJRT_Error *onBufferCopyToDevice(PJRT_Buffer_CopyToDevice_Args *args) {
- 
+@@ -679 +679 @@
 -  src_buffer->copyToDeviceMemory(
 +  tt_pjrt_status status = src_buffer->copyToDeviceMemory(
-       dst_device, dst_memory,
-       reinterpret_cast<BufferInstance **>(&args->dst_buffer));
+@@ -682 +682,3 @@
 -
 +  if (auto error = ErrorInstance::makeError(status)) {
 +    return *error.release();
 +  }
-   return nullptr;
-@@ -695,6 +697,8 @@ PJRT_Error *onBufferCopyToMemory(PJRT_Buffer_CopyToMemory_Args *args) {
- 
+@@ -701 +703 @@
 -  src_buffer->copyToDeviceMemory(
 +  tt_pjrt_status status = src_buffer->copyToDeviceMemory(
-       dst_device, dst_memory,
-       reinterpret_cast<BufferInstance **>(&args->dst_buffer));
+@@ -704 +706,3 @@
 -
 +  if (auto error = ErrorInstance::makeError(status)) {
 +    return *error.release();
 +  }
-   return nullptr;
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
@@ -56,8 +50,10 @@ diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implem
 diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
-@@ -503,2 +503,5 @@ onLoadedExecutableExecute(PJRT_LoadedExecutable_Execute_Args *args) {
- 
+@@ -502,3 +502,6 @@
+   }
+-
++
 +  static std::mutex execution_mutex;
 +  const std::lock_guard<std::mutex> lock(execution_mutex);
 +

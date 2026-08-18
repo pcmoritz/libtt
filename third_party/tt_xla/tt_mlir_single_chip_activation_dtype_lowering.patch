@@ -1,20 +1,13 @@
-diff --git a/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp b/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
-@@ -179,3 +179,2 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
-   llvm::SmallVector<Operation *> flowOps;
+@@ -180,1 +179,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
 -  bool sawCCL = false;
-   Value cur = matmul.getResult();
-@@ -193,3 +192,2 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
-       }
+@@ -194,1 +193,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
 -      sawCCL |= isCCLOp(user);
-       flowOps.push_back(user);
-@@ -201,5 +199,2 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
-   }
+@@ -202,3 +200,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
 -  if (!sawCCL) {
 -    return false;
 -  }
- 
 @@ -211,4 +206,9 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
    }
 -  auto ff2 = mlir::dyn_cast<MatmulOp>(*gate.getResult().getUsers().begin());

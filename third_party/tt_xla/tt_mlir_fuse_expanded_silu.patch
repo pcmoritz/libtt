@@ -1,6 +1,6 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -16,6 +16,7 @@
+@@ -14,6 +14,7 @@
  #include "mlir/IR/Attributes.h"
  #include "mlir/IR/BuiltinAttributes.h"
  #include "mlir/IR/BuiltinTypes.h"
@@ -8,7 +8,7 @@
  #include "mlir/IR/Operation.h"
  #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
  #include "llvm/ADT/SmallSet.h"
-@@ -535,6 +536,59 @@ public:
+@@ -532,6 +532,59 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
  class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  

@@ -119,12 +119,14 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
                  // in1 mcast args
                  (std::uint32_t)0,  // in1_mcast_dest_noc_start_x
                  (std::uint32_t)0,  // in1_mcast_dest_noc_start_y
-@@ -4023,3 +4054,3 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
+@@ -3824,23 +3855,23 @@
+                 // WRITER
+                 // out tensor args
                  (std::uint32_t)out_tensor.address(),
 -                ((std::uint32_t)output_idx_x * per_core_N) +
 +                (std::uint32_t)core_n_start +
                      (output_idx_y * per_core_M * N)  // out_tensor_start_tile_id
-@@ -4027,5 +4058,5 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
+             };
  
 -            if (output_idx_x == num_blocks_x - 1) {
 +            if (partial_output_block) {
@@ -132,7 +134,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
 -                mm_in1_sender_writer_args.push_back(last_out_block_w);
 +                mm_in1_sender_writer_args.push_back(core_last_out_block_w);
  
-@@ -4036,6 +4067,6 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
+                 // padding args (WRITER)
+                 mm_in1_sender_writer_args.push_back(in0_last_block_num_nonzero_subblocks_h);
+                 mm_in1_sender_writer_args.push_back(in0_last_subblock_of_last_block_h);
+                 mm_in1_sender_writer_args.push_back(in0_last_block_padded_block_tiles_h_skip);
                  mm_in1_sender_writer_args.push_back(out_block_w / out_subblock_w);  // out_num_nonzero_subblocks_w
 -                mm_in1_sender_writer_args.push_back(last_block_num_nonzero_subblocks_w);
 -                mm_in1_sender_writer_args.push_back(last_subblock_of_last_block_w);
@@ -143,6 +148,8 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
 +                mm_in1_sender_writer_args.push_back(core_padded_subblock_tiles_addr_skip);
 +                mm_in1_sender_writer_args.push_back(core_padded_block_tiles_w_skip);
              } else {
+                 // padding args (READER)
+                 mm_in1_sender_writer_args.push_back(out_block_w);
 @@ -4059,6 +4090,6 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
              mm_in1_sender_writer_args.push_back(
 -                bias_tensor.has_value() ? (std::uint32_t)per_core_N * output_idx_x : 0);  // in3_tensor_start_tile_id

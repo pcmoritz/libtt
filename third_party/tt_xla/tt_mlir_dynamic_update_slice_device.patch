@@ -1,16 +1,10 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5054,9 +5054,6 @@ public:
- };
- } // namespace
- 
+@@ -4844,3 +4844,0 @@
 -// NOTE: StableHLO Dynamic Slice Op clamps start indices to ensure validity,
 -// but we don't. Would add multiple ops (worse perf) and doesn't appear in test
 -// models.
- namespace {
- class StableHLOToTTIRDynamicSliceOpConversionPattern
-     : public OpConversionPattern<mlir::stablehlo::DynamicSliceOp> {
 @@ -5070,6 +5067,10 @@ public:
                    ConversionPatternRewriter &rewriter) const override {
      auto outputType = mlir::cast<RankedTensorType>(
@@ -42,15 +36,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        startIndicesValues1D.push_back(reshapedIndex);
      }
      // Create a single 1D tensor from start indices values using concat op.
-@@ -5101,7 +5106,6 @@ public:
-         startIndicesValues1D, /*dim=*/0);
- 
-     // Create a 1D constant tensor with slice_sizes values.
+@@ -4891,1 +4897,0 @@ public:
 -    auto sliceSizes = srcOp.getSliceSizes();
-     SmallVector<int32_t> sliceSizesInt32(sliceSizes.begin(), sliceSizes.end());
-     auto sliceSizesTensorType = RankedTensorType::get(
-         {static_cast<int64_t>(sliceSizesInt32.size())}, rewriter.getI32Type());
-@@ -5128,6 +5132,128 @@ public:
+@@ -4904,6 +4909,128 @@ class StableHLOToTTIRDynamicSliceOpConversionPattern
  };
  } // namespace
  
@@ -179,8 +167,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  namespace {
  class StableHLOToTTIROpClampOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ClampOp> {
-@@ -10695,6 +10821,8 @@ static void addDynamicSliceOpConversionPattern(MLIRContext *ctx,
-                                                TypeConverter &typeConverter) {
+@@ -9934,5 +10056,7 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
    patterns.add<StableHLOToTTIRDynamicSliceOpConversionPattern>(typeConverter,
                                                                 ctx);
 +  patterns.add<StableHLOToTTIRDynamicUpdateSliceOpConversionPattern>(

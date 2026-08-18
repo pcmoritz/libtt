@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -7874,6 +7874,23 @@ private:
+@@ -7319,6 +7313,23 @@ private:
      return flatIndices;
    }
  
@@ -25,7 +25,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    /// Computes flattened 1D indices for multi-dimensional scatter.
    ///
    /// Handles both cases:
-@@ -8046,6 +8063,7 @@ private:
+@@ -7495,6 +7506,7 @@ private:
      // b) window-only: use window offset only
      // c) both scatter-indexed and window: add scatter index + window offset
      llvm::SmallVector<Value> indexSlices;

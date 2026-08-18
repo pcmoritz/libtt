@@ -1,15 +1,19 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -111,2 +111,8 @@ getPaddingOrDefault(mlir::DenseIntElementsAttr attr, size_t numSpatialDims) {
- 
+@@ -108,6 +108,12 @@ getPaddingOrDefault(mlir::DenseIntElementsAttr attr, size_t numSpatialDims) {
+   }
+   return llvm::SmallVector<int64_t>(numSpatialDims * 2, 0);
+ }
++
 +static bool hasUnsupportedFloatType(Type type) {
 +  return mlir::isa<FloatType>(type) &&
 +         type.getIntOrFloatBitWidth() != 16 &&
 +         type.getIntOrFloatBitWidth() != 32;
 +}
-+
+ 
  // Typical initialization values for reduction ops.
+ enum TypicalInitReductionValue {
 @@ -127,6 +133,2 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
    double desiredF64;
 -  int32_t desiredI32;

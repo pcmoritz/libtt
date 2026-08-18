@@ -81,17 +81,17 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Convert padding to DenseIntElementsAttr with shape [numSpatialDims, 2].
      mlir::DenseIntElementsAttr stablehloPaddingAttr =
-@@ -2761,7 +2753,7 @@ public:
+@@ -2943,7 +2935,7 @@ public:
              mlir::RankedTensorType::get(
                  {static_cast<int64_t>(numSpatialDims), 2},
                  rewriter.getI64Type()),
 -            adjustedPadding);
 +            clampedPadding);
- 
+
      // Create StableHLO ConvDimensionNumbersAttr.
      mlir::stablehlo::ConvDimensionNumbersAttr stablehloDimNums =
-@@ -2778,44 +2770,14 @@ public:
- 
+@@ -2960,44 +2952,14 @@ public:
+
      mlir::stablehlo::ConvolutionOp convOp =
          mlir::stablehlo::ConvolutionOp::create(
 -            rewriter, srcOp.getLoc(), intermediateOutputType, adaptor.getLhs(),
@@ -101,7 +101,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
              stablehloDimNums, adaptor.getFeatureGroupCount(),
              adaptor.getBatchGroupCount(),
              /*precisionConfig=*/nullptr);
- 
+
 -    auto convOutputType = cast<RankedTensorType>(convOp.getResult().getType());
 -    auto convOutputShape = convOutputType.getShape();
 -

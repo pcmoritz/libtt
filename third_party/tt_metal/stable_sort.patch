@@ -1,3 +1,4 @@
+# Port of pcmoritz/libtt#175, adapted to the compile-time TopK direction API.
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
 index 68c51b1..bcd8c93 100644
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp

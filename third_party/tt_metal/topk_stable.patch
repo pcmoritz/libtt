@@ -2,7 +2,9 @@ diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/
 index 5ebfb63..687c7e0 100644
 --- tt_metal/hw/inc/api/compute/compute_kernel_api.h
 +++ tt_metal/hw/inc/api/compute/compute_kernel_api.h
-@@ -710,5 +710,6 @@ ALWI void silu_tile_init_pack() { PACK(SFPU_UNARY_INIT_FN(silu, sfpu::silu_init,
+@@ -708,16 +708,17 @@ ALWI void silu_tile_init_pack() { PACK(SFPU_UNARY_INIT_FN(silu, sfpu::silu_init,
+  * | i_end_step      | The end step to perform if i_start_phase == i_end_phase                    | int32    | 4 to 6                                                | False    |
+  * | i_start_step    | The start step to perform if i_start_phase == i_end_phase                  | int32    | 4 to 6                                                | False    |
   * | stable_sort     | Maintain order of indices for equal values                                 | bool     | true, false                                           | False    |
 + * | descending      | Order equal values by increasing index in a descending sort                | bool     | true, false                                           | False    |
   */
@@ -10,21 +12,23 @@ index 5ebfb63..687c7e0 100644
 -template <bool stable_sort = false>
 +template <bool stable_sort = false, bool descending = false>
  ALWI void topk_local_sort(
-@@ -719,3 +720,3 @@ ALWI void topk_local_sort(
+     uint32_t idst, int idir, int i_end_phase, int i_start_phase = 0, int i_end_step = 0, int i_start_step = 0) {
+     MATH(SFPU_UNARY_CALL(
+         DST_SYNC_MODE,
+         DST_ACCUM_MODE,
          calculate_bitonic_topk_phases_steps,
 -        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort),
 +        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort, descending),
          idst,
-@@ -758,6 +759,7 @@ ALWI void topk_local_sort(
-  * | stable_sort     | Maintain order of indices for equal values                                 | bool     | true, false                                           | False    |
+         VectorMode::RC_custom,
+         idir,
+@@ -758,0 +760 @@ ALWI void topk_local_sort(
 + * | descending      | Order equal values by increasing index in a descending sort                | bool     | true, false                                           | False    |
-  */
- // clang-format on
+@@ -761,2 +763,2 @@ ALWI void topk_local_sort(
 -template <bool idir = false, bool stable_sort = false>
 -ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
 +template <bool idir, bool stable_sort, bool descending>
 +ALWI void topk_merge_impl(uint32_t idst, int m_iter, int k) {
-     MATH(SFPU_UNARY_CALL(
 @@ -767 +769 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
 -        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort),
 +        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort, descending),
@@ -43,7 +47,9 @@ index 5ebfb63..687c7e0 100644
 +    topk_merge_impl<idir, stable_sort, descending>(idst, m_iter, k);
 +}
 +
-@@ -804,5 +820,6 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
+@@ -802,15 +804,16 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
+  * | logk            | The log of K                                                               | int32    | 2 to 6                                                | True     |
+  * | skip_second     | Whether or not to skip second tile                                         | int32    | 0 to 1                                                | True     |
   * | stable_sort     | Maintain order of indices for equal values                                 | bool     | true, false                                           | False    |
 + * | descending      | Order equal values by increasing index in a descending sort                | bool     | true, false                                           | False    |
   */
@@ -51,11 +57,15 @@ index 5ebfb63..687c7e0 100644
 -template <bool stable_sort = false>
 +template <bool stable_sort = false, bool descending = false>
  ALWI void topk_rebuild(uint32_t idst, bool idir, int m_iter, int k, int logk, int skip_second) {
-@@ -812,3 +829,3 @@ ALWI void topk_rebuild(uint32_t idst, bool idir, int m_iter, int k, int logk, in
+     MATH(SFPU_UNARY_CALL(
+         DST_SYNC_MODE,
+         DST_ACCUM_MODE,
          calculate_bitonic_topk_rebuild,
 -        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort),
 +        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort, descending),
          idst,
+         VectorMode::RC_custom,
+         idir,
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
 index ba02e38..73129c6 100644
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp

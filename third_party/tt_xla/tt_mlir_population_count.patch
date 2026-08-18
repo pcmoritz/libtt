@@ -1,10 +1,10 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -11055,6 +11055,49 @@ public:
+@@ -10644,6 +10644,49 @@
  };
  } // namespace
- 
+
 +namespace {
 +class StableHLOToTTIRPopulationCountOpConversionPattern
 +    : public OpConversionPattern<mlir::stablehlo::PopulationCountOp> {

@@ -1,10 +1,10 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
-@@ -30,6 +30,59 @@ namespace ttnn {
- 
+@@ -29,6 +29,59 @@ namespace ttnn {
+
  using namespace operations;
- 
+
 +namespace {
 +
 +Tensor run_promoted_min_max(
