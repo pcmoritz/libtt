@@ -1,7 +1,9 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -2711,16 +2711,4 @@ public:
+@@ -2709,51 +2709,43 @@ public:
+             : rewriter.getDenseBoolArrayAttr(
+                   SmallVector<bool>(numSpatialDims, false));
  
 -    // Negative padding handling strategy:
 -    // 1. Convolution ops don't support negative padding directly, so we split
@@ -20,7 +22,10 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    // Convolution ops do not support negative padding. Crop the input by the
 +    // negative amount and clamp the convolution padding to zero.
      ArrayRef<int64_t> paddingArray = paddingAttr.asArrayRef();
-@@ -2731,27 +2719,31 @@ public:
+     bool hasNegativePadding =
+         llvm::any_of(paddingArray, [](int64_t p) { return p < 0; });
+     if (!hasNegativePadding) {
+       return failure();
      }
 +    if (llvm::any_of(inputDilationAttr.asArrayRef(),
 +                     [](int64_t dilation) { return dilation != 1; })) {
@@ -74,21 +79,28 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        rewriter.getI32ArrayAttr(inputSliceEnds),
 +        rewriter.getI32ArrayAttr(inputSliceSteps));
  
-@@ -2943,7 +2935,7 @@ public:
+     // Convert padding to DenseIntElementsAttr with shape [numSpatialDims, 2].
+     mlir::DenseIntElementsAttr stablehloPaddingAttr =
+@@ -2761,7 +2753,7 @@ public:
              mlir::RankedTensorType::get(
                  {static_cast<int64_t>(numSpatialDims), 2},
                  rewriter.getI64Type()),
 -            adjustedPadding);
 +            clampedPadding);
-
+ 
      // Create StableHLO ConvDimensionNumbersAttr.
      mlir::stablehlo::ConvDimensionNumbersAttr stablehloDimNums =
-@@ -2780,3 +2772,3 @@ public:
+@@ -2778,44 +2770,14 @@ public:
+ 
+     mlir::stablehlo::ConvolutionOp convOp =
          mlir::stablehlo::ConvolutionOp::create(
 -            rewriter, srcOp.getLoc(), intermediateOutputType, adaptor.getLhs(),
 +            rewriter, srcOp.getLoc(), outputType, input,
              adaptor.getRhs(), windowStridesAttr, stablehloPaddingAttr,
-@@ -2787,33 +2779,3 @@ public:
+             inputDilationAttr, kernelDilationAttr, windowReversalAttr,
+             stablehloDimNums, adaptor.getFeatureGroupCount(),
+             adaptor.getBatchGroupCount(),
+             /*precisionConfig=*/nullptr);
  
 -    auto convOutputType = cast<RankedTensorType>(convOp.getResult().getType());
 -    auto convOutputShape = convOutputType.getShape();
@@ -123,3 +135,5 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    rewriter.replaceOp(srcOp, sliceOp.getResult());
 +    rewriter.replaceOp(srcOp, convOp);
      return success();
+   }
+ };

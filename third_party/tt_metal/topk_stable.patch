@@ -1,4 +1,5 @@
 diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/compute/compute_kernel_api.h
+index 5ebfb63..687c7e0 100644
 --- tt_metal/hw/inc/api/compute/compute_kernel_api.h
 +++ tt_metal/hw/inc/api/compute/compute_kernel_api.h
 @@ -710,5 +710,6 @@ ALWI void silu_tile_init_pack() { PACK(SFPU_UNARY_INIT_FN(silu, sfpu::silu_init,
@@ -56,6 +57,7 @@ diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/
 +        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort, descending),
          idst,
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
+index ba02e38..73129c6 100644
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
 @@ -345,7 +345,11 @@ void kernel_main() {
@@ -72,6 +74,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.c
                  // Pack sorted results: dest reg 0 -> result buffer, dest reg 1 -> secondary buffer
                  tile_regs_commit();
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
+index 34849a4..62cd3ba 100644
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
 @@ -47,3 +47,7 @@ void process_and_sort_tiles(

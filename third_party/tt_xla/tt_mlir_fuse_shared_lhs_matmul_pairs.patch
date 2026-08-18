@@ -1,14 +1,21 @@
-diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -1876,3 +1876,3 @@ private:
+@@ -1874,7 +1874,7 @@ private:
+     bool firstTransposeB = false;
+ 
      bool isValid() const {
 -      return ops.size() >= 3 && totalOutputDim <= kMaxFusedOutputDim;
 +      return ops.size() >= 2 && totalOutputDim <= kMaxFusedOutputDim;
      }
-@@ -2016,3 +2016,4 @@ private:
+ 
+     bool getTargetTransposeB() const {
+@@ -2014,7 +2014,8 @@ private:
+ 
+     for (Operation *user : sharedLHS.getUsers()) {
        auto op = dyn_cast<OpType>(user);
 -      if (!op || op.getA() != sharedLHS) {
 +      if (!op || op.getA() != sharedLHS ||
 +          llvm::is_contained(result.ops, op)) {
          continue;
+       }
+ 

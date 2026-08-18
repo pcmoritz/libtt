@@ -1,4 +1,5 @@
 diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implementation/src/api/compile_options_parser.cc
+index 7a9f567..c6b4fa7 100644
 --- a/pjrt_implementation/src/api/compile_options_parser.cc
 +++ b/pjrt_implementation/src/api/compile_options_parser.cc
 @@ -67,7 +67,7 @@ bool CompileOptionsParser::parseNestedProtobufField(
@@ -19,7 +20,7 @@ diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implem
        google::protobuf::io::CodedInputStream packed_stream(
            reinterpret_cast<const uint8_t *>(packed_data.data()),
            packed_data.size());
-@@ -225,7 +225,7 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+@@ -261,7 +261,7 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
        continue;
      }
  
@@ -28,20 +29,28 @@ diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implem
      google::protobuf::io::CodedInputStream cis(
          reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size());
  
-@@ -286,3 +286,4 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+@@ -284,11 +284,12 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+       if (entry_field.number() == kMapKeyFieldNumber &&
+           entry_field.type() ==
                google::protobuf::UnknownField::TYPE_LENGTH_DELIMITED) {
 -        key = entry_field.length_delimited();
 +        auto key_bytes = entry_field.length_delimited();
 +        key.assign(key_bytes.data(), key_bytes.size());
        } else if (entry_field.number() == kMapValueFieldNumber &&
-@@ -290,3 +291,3 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+                  entry_field.type() ==
                       google::protobuf::UnknownField::TYPE_LENGTH_DELIMITED) {
 -        const std::string &override_bytes = entry_field.length_delimited();
 +        auto override_bytes = entry_field.length_delimited();
          google::protobuf::io::CodedInputStream override_stream(
-@@ -324,3 +325,4 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+             reinterpret_cast<const uint8_t *>(override_bytes.data()),
+             override_bytes.size());
+@@ -322,7 +323,8 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+             value_fields.field(0);
+         switch (value_field.number()) {
          case 1: {
 -          value = value_field.length_delimited();
 +          auto value_bytes = value_field.length_delimited();
 +          value.assign(value_bytes.data(), value_bytes.size());
            break;
+         }
+         case 2: {

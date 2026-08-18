@@ -1,7 +1,10 @@
 diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
+index 13cf721..e143f32 100644
 --- a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
 +++ b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
-@@ -77,15 +77,21 @@ void propagateRoleAttribute(mlir::ModuleOp module, mlir::Value argument,
+@@ -75,19 +75,25 @@ void propagateInputRoleAttributes(
+ 
+ void propagateRoleAttribute(mlir::ModuleOp module, mlir::Value argument,
                              mlir::StringAttr role_attr) {
 -  // We are marking only inputs to model's `apply` function, so we expect call
 -  // op arguments to be block arguments of the FuncOp corresponding to `apply`
@@ -34,3 +37,5 @@ diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_inp
 +      return;
 +    }
      return;
+   }
+ 

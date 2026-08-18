@@ -1,4 +1,5 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index 1111111..2222222 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 @@ -7010,6 +7010,11 @@ public:
@@ -22,6 +23,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        !inputType.getElementType().isF32()) {
        return convertToSingleDimScatter(srcOp, adaptor, *scatterReduceType,
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+index 1111111..2222222 100644
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 @@ -922,5 +922,8 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
@@ -50,12 +52,14 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 +  return createReductionOpOperandsWorkarounds(op);
  }
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+index 1111111..2222222 100644
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 @@ -999 +999 @@ def TTNN_ProdOp : TTNN_Op<"prod"> {
 -        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds();
 +        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(*this);
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+index 1111111..2222222 100644
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
 @@ -351 +351,2 @@ class TTNNOperandsWorkaroundsFactory {
@@ -63,6 +67,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttml
 +  static TTNNOperandsWorkarounds
 +  createReduceProdOpOperandsWorkarounds(mlir::Operation *op);
 diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+index 1111111..2222222 100644
 --- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 +++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 @@ -96,9 +96,15 @@ private:

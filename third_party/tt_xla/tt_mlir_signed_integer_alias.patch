@@ -1,4 +1,5 @@
 diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
+index 6b4077c6..8cff02b0 100644
 --- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
 +++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
 @@ -206,9 +206,12 @@ static DataType elementTypeToDataTypeImpl(mlir::Type elementType) {
@@ -17,6 +18,7 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/
      case 64:
        return (intType.isSigned() || intType.isSignless()) ? DataType::Int32
 diff --git a/runtime/lib/common/utils.cpp b/runtime/lib/common/utils.cpp
+index 81e64390..225ac22c 100644
 --- a/runtime/lib/common/utils.cpp
 +++ b/runtime/lib/common/utils.cpp
 @@ -273,9 +273,9 @@ getUnsupportedDataTypeAlias(::tt::target::DataType unsupportedDataType) {

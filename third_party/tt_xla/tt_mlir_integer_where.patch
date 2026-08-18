@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -363,9 +363,9 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::createToLayoutOpOperand
+@@ -363,9 +363,9 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
  // tt-metal uses predicate type for where op operation. If the predicate data
  // type does not match with inputs/output data type; tt-metal can generate
  // incorrect results or other failures. Add a data type workaround if predicate
@@ -14,7 +14,9 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  // tt-metal issues to track mixed data types ops bug.
  // https://github.com/tenstorrent/tt-metal/issues/17998
  // https://github.com/tenstorrent/tt-metal/issues/24511
-@@ -389,9 +389,18 @@ TTNNOperandsWorkaroundsFactory::createWhereOpOperandsWorkarounds(
+@@ -387,13 +387,22 @@ TTNNOperandsWorkaroundsFactory::createWhereOpOperandsWorkarounds(
+   if (predicateElementType.isInteger() ||
+       predicateElementType != inputElementType) {
      if (inputElementType.isInteger()) {
 -      // In an unlikely scenario, we could potentially upcast to float32, if
 -      // input is integer and predicate is for example bf16.
@@ -40,10 +42,14 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 +            TTNNOperandWorkarounds(ttcore::DataType::Float32);
 +      }
      } else {
+       // Otherwise, we just force the predicate type to match the input type.
+       predicateTypeWorkaround = TTNNOperandWorkarounds(
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
-@@ -424,2 +424,35 @@ public:
+@@ -422,6 +422,39 @@ public:
+   }
+ };
  
 +// UInt32 where is incorrect in tt-metal, while its Int32 path preserves all
 +// 32 bits. Reinterpret the data operands around that path to avoid the lossy
@@ -79,7 +85,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 +};
 +
  // Pass to apply workarounds to the operands of TTNN operations.
-@@ -430,7 +463,7 @@ public:
+ class TTNNWorkarounds : public impl::TTNNWorkaroundsBase<TTNNWorkarounds> {
+ public:
+@@ -431,7 +464,7 @@ public:
      if (decompositionWorkaroundsEnabled) {
        RewritePatternSet patterns(&getContext());
        patterns.add<

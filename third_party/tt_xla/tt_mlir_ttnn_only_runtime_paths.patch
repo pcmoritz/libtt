@@ -1,7 +1,10 @@
 diff --git a/lib/RegisterAll.cpp b/lib/RegisterAll.cpp
+index 7f03c79..51f0a72 100644
 --- a/lib/RegisterAll.cpp
 +++ b/lib/RegisterAll.cpp
-@@ -7,7 +7,2 @@
+@@ -5,24 +5,12 @@
+ #include "ttmlir/RegisterAll.h"
+ 
  #include "ttmlir/Conversion/Passes.h"
 -#include "ttmlir/Dialect/D2M/IR/D2M.h"
 -#include "ttmlir/Dialect/D2M/Transforms/Passes.h"
@@ -9,7 +12,10 @@ diff --git a/lib/RegisterAll.cpp b/lib/RegisterAll.cpp
 -#include "ttmlir/Dialect/LLVM/Transforms/Passes.h"
 -#include "ttmlir/Dialect/SFPI/IR/SFPI.h"
  #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
-@@ -18,9 +13,2 @@
+ #include "ttmlir/Dialect/TTCore/Transforms/Passes.h"
+ #include "ttmlir/Dialect/TTCore/Utils/PopulateArgumentTypes.h"
+ #include "ttmlir/Dialect/TTIR/IR/TTIR.h"
+ #include "ttmlir/Dialect/TTIR/Pipelines/TTIRPipelines.h"
  #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
 -#include "ttmlir/Dialect/TTKernel/IR/TTKernel.h"
 -#include "ttmlir/Dialect/TTKernel/Pipelines/TTKernelPipelines.h"
@@ -19,20 +25,32 @@ diff --git a/lib/RegisterAll.cpp b/lib/RegisterAll.cpp
 -#include "ttmlir/Dialect/D2M/Pipelines/D2MPipelines.h"
 -#include "ttmlir/Dialect/TTMetal/Transforms/Passes.h"
  #include "ttmlir/Dialect/TTNN/IR/TTNN.h"
-@@ -88,5 +76,3 @@ void mlir::tt::registerAllDialects(mlir::DialectRegistry &registry) {
+ #include "ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
+@@ -86,9 +74,7 @@
+ void mlir::tt::registerAllDialects(mlir::DialectRegistry &registry) {
+   registry.insert<
        mlir::tt::ttcore::TTCoreDialect, mlir::tt::ttir::TTIRDialect,
 -      mlir::tt::d2m::D2MDialect, mlir::tt::ttnn::TTNNDialect,
 -      mlir::tt::ttmetal::TTMetalDialect, mlir::tt::ttkernel::TTKernelDialect,
 -      mlir::tt::sfpi::SFPIDialect, mlir::func::FuncDialect,
 +      mlir::tt::ttnn::TTNNDialect, mlir::func::FuncDialect,
        mlir::arith::ArithDialect, mlir::math::MathDialect,
-@@ -98,4 +84,3 @@ void mlir::tt::registerAllDialects(mlir::DialectRegistry &registry) {
+       mlir::ml_program::MLProgramDialect, mlir::tensor::TensorDialect,
+       mlir::linalg::LinalgDialect, mlir::affine::AffineDialect,
+@@ -96,8 +82,7 @@ void mlir::tt::registerAllDialects(mlir::DialectRegistry &registry) {
+       mlir::tosa::TosaDialect, mlir::vector::VectorDialect,
+       mlir::memref::MemRefDialect, mlir::emitc::EmitCDialect,
        mlir::bufferization::BufferizationDialect, mlir::LLVM::LLVMDialect,
 -      mlir::quant::QuantDialect,
 -      mlir::tt::debug::DebugDialect, mlir::pdl::PDLDialect,
 +      mlir::quant::QuantDialect, mlir::pdl::PDLDialect,
        mlir::pdl_interp::PDLInterpDialect>();
-@@ -151,7 +136,3 @@ void mlir::tt::registerAllPasses() {
+ 
+ #if TTMLIR_ENABLE_STABLEHLO
+@@ -149,11 +134,7 @@ void mlir::tt::registerAllPasses() {
+   mlir::tt::ttcore::registerPasses();
+   mlir::tt::ttcore::registerTTPopulateArgumentTypes();
    mlir::tt::ttir::registerPasses();
 -  mlir::tt::d2m::registerPasses();
    mlir::tt::ttnn::registerPasses();
@@ -40,8 +58,14 @@ diff --git a/lib/RegisterAll.cpp b/lib/RegisterAll.cpp
 -  mlir::tt::ttkernel::registerPasses();
 -  mlir::tt::llvm_util::registerPasses();
    mlir::tt::transforms::registerPasses();
-@@ -166,4 +148,2 @@ void mlir::tt::registerAllPasses() {
+ 
+ #if TTMLIR_ENABLE_STABLEHLO
+@@ -164,8 +145,6 @@ void mlir::tt::registerAllPasses() {
+   // Register pipelines.
+   mlir::tt::ttir::registerTTIRPipelines();
    mlir::tt::ttnn::registerTTNNPipelines();
 -  mlir::tt::ttmetal::registerD2MPipelines();
 -  mlir::tt::ttkernel::registerTTKernelPipelines();
  
+ #if TTMLIR_ENABLE_STABLEHLO
+   // Register all SDY passes and pipelines.

@@ -1,7 +1,10 @@
 diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
+index 8378104..32eca62 100644
 --- a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
 +++ b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
-@@ -159,5 +159,9 @@ void run(const ::tt::target::ttnn::EltwiseUnaryOp *op,
+@@ -157,9 +157,13 @@ void run(const ::tt::target::ttnn::EltwiseUnaryOp *op,
+     break;
+   }
    case ::tt::target::ttnn::EltwiseUnaryOpType::Gelu: {
 -    runEltwiseUnaryWithFastAndApproximateModeOp(
 -        op, tensorPool, [](auto &&...args) {
@@ -14,10 +17,13 @@ diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/t
 +              input, ::ttnn::operations::unary::GeluVariant::TANH,
 +              memoryConfig, output, subCoreGrids);
          });
+     break;
+   }
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+index c1fb81d..f0e33a7 100644
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -685,10 +685,6 @@ TTNNOperandsWorkaroundsFactory::createRotaryEmbeddingOpOperandsWorkarounds(
+@@ -687,10 +687,6 @@ TTNNOperandsWorkaroundsFactory::createRotaryEmbeddingOpOperandsWorkarounds(
  TTNNOperandsWorkarounds
  TTNNOperandsWorkaroundsFactory::createTanhOpOperandsWorkarounds() {
    TTNNOperandWorkarounds operandWorkaround;

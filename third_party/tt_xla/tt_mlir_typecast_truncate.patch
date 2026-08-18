@@ -1,7 +1,9 @@
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -2662,2 +2662,15 @@ public:
+@@ -2660,10 +2660,23 @@ public:
+   matchAndRewrite(ttir::TypecastOp op, ttir::TypecastOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
      auto resultType = op.getType();
 +    Value input = adaptor.getInput();
 +    auto resultIntegerType =
@@ -17,8 +19,10 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +      input = rewriter.create<ttnn::FloorOp>(op.getLoc(), input);
 +    }
  
-@@ -2665,3 +2678,3 @@ public:
+     rewriter.replaceOpWithNewOp<ttnn::TypecastOp>(
          op, this->getTypeConverter()->convertType(resultType),
 -        adaptor.getInput());
 +        input);
      return success();
+   }
+ };

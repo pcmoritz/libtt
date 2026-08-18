@@ -1,10 +1,10 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
-@@ -29,6 +29,59 @@ namespace ttnn {
-
+@@ -30,6 +30,59 @@ namespace ttnn {
+ 
  using namespace operations;
-
+ 
 +namespace {
 +
 +Tensor run_promoted_min_max(
@@ -61,28 +61,38 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
  // nextafter
  Tensor nextafter(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
      const float eps = tt::tt_metal::hal::get_eps();
-@@ -61,3 +114,3 @@ Tensor minimum(
+@@ -59,11 +112,10 @@ Tensor minimum(
+     ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+     ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
 -    return ttnn::detail::invoke_binary_ng(
 +    return run_promoted_min_max(
          input_tensor_a,
-@@ -65,3 +118,2 @@ Tensor minimum(
+         input_tensor_b,
          binary::BinaryOpType::MINIMUM,
 -        std::nullopt,
          memory_config,
-@@ -102,3 +154,3 @@ Tensor maximum(
+         optional_output_tensor,
+         post_activations,
+@@ -100,11 +152,10 @@ Tensor maximum(
+     ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+     ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
 -    return ttnn::detail::invoke_binary_ng(
 +    return run_promoted_min_max(
          input_tensor_a,
-@@ -106,3 +158,2 @@ Tensor maximum(
+         input_tensor_b,
          binary::BinaryOpType::MAXIMUM,
 -        std::nullopt,
          memory_config,
+         optional_output_tensor,
+         post_activations,
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
-@@ -225,27 +225,10 @@ Tensor clamp(
+@@ -223,31 +223,14 @@ Tensor clamp(
+     const std::optional<Tensor>& /*output_tensor*/) {
+     auto output_memory_config = output_mem_config.value_or(input_a.memory_config());
      TT_FATAL((max.has_value() || min.has_value()), "Only one of 'min' or 'max' can be None. Please provide one value");
 -    if (!max.has_value()) {
 -        return ttnn::where(
@@ -116,3 +126,5 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp 
 -        output_memory_config);
 +    return result;
  }
+ 
+ // Gated Linear Unit activation: matmul(split[0],sigmoid(split[1]))

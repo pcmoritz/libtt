@@ -1,4 +1,5 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
+index 6385ef2..4080b83 100644
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
 @@ -18,9 +18,9 @@ inline void cast_fp32_to_fp16a() {
@@ -15,6 +16,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ca
  }
  
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
+index 0609fef..92a788f 100644
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 @@ -244,10 +244,8 @@ inline void calculate_typecast_fp32_to_uint32() {
@@ -53,6 +55,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ty
  }
  
 diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
+index 611b88e..d8b9ed8 100644
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 @@ -257,10 +257,8 @@ inline void calculate_typecast_fp32_to_uint32() {
@@ -91,6 +94,7 @@ diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_
  }
  
 diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
+index de92c33..f9a7cf2 100644
 --- tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
 +++ tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
 @@ -141,7 +141,13 @@ ALWI void typecast_tile(uint32_t idst) {
@@ -109,6 +113,7 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
          MATH(SFPU_UNARY_CALL(
              DST_SYNC_MODE,
 diff --git tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
+index c9d7ccf..a4aded9 100644
 --- tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
 +++ tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
 @@ -10,14 +10,15 @@ namespace ckernel::sfpu {
@@ -174,6 +179,7 @@ diff --git tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h tt_metal/hw/inc/
 +    return halfBits | sign;
  }
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
+index 2676608..b1557fb 100644
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
 @@ -11,6 +11,22 @@
@@ -200,6 +206,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_type
      const tt::tt_metal::DataType input_dtype;
      const tt::tt_metal::DataType output_dtype;
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
+index 3e66440..aa957c2 100644
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
 @@ -26,12 +26,9 @@ tt::tt_metal::ProgramDescriptor TypecastProgramFactory::create_descriptor(
@@ -230,6 +237,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factor
  
      uint32_t ntiles = input.physical_volume() / tt::constants::TILE_HW;
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
+index 72c26d9..ff26945 100644
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
 @@ -75,12 +75,9 @@ tt::tt_metal::ProgramDescriptor TypecastRowMajorChunkedProgramFactory::create_de
@@ -248,6 +256,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_pro
  
      const auto* device = input.device();
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp
+index cbcaa4e..f2f42c1 100644
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp
 @@ -36,8 +36,8 @@ tt::tt_metal::ProgramDescriptor TypecastShardedProgramFactory::create_descriptor
@@ -262,6 +271,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_progra
      uint32_t input_tile_size = tt::tile_size(act_df);
      uint32_t output_tile_size = tt::tile_size(out_df);
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+index e7a8a79..9401974 100644
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 @@ -869,13 +869,23 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
@@ -356,6 +366,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
                      tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
                  unpack_to_dest_mode[src1_cb_index] = unpack_to_dest_mode[tt::CBIndex::c_6] =
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
+index 20a83d3..85f060e 100644
 --- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
 @@ -18,10 +18,14 @@ using DataType = tt::tt_metal::DataType;
@@ -376,6 +387,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn
  }
  
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+index 13987fe..a33bad9 100644
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 @@ -121,8 +121,22 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des

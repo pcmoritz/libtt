@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -7319,6 +7313,23 @@ private:
+@@ -7874,6 +7874,23 @@ private:
      return flatIndices;
    }
  
@@ -25,7 +25,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    /// Computes flattened 1D indices for multi-dimensional scatter.
    ///
    /// Handles both cases:
-@@ -7495,6 +7506,7 @@ private:
+@@ -8046,6 +8063,7 @@ private:
      // b) window-only: use window offset only
      // c) both scatter-indexed and window: add scatter index + window offset
      llvm::SmallVector<Value> indexSlices;
@@ -33,14 +33,18 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      size_t windowIdxPos = 0;
      for (int64_t operandDim = 0; operandDim < operandRank; ++operandDim) {
        bool isScatterDim = scatterDimToIdxPos.count(operandDim);
-@@ -8090,2 +8108,6 @@ private:
+@@ -8092,11 +8110,23 @@ private:
+         }
+       }
  
 +      if (isScatterDim) {
 +        dimIndex = clampScatterIndex(loc, rewriter, dimIndex,
 +                                     operandShape[operandDim], validIndices);
 +      }
        indexSlices.push_back(dimIndex);
-@@ -8095,2 +8117,10 @@ private:
+     }
+ 
+     Value flatIndices = computeFlatIndicesFromSlices(
          loc, rewriter, indexSlices, operandShape, indicesType.getElementType());
 +    auto flatIndicesType =
 +        mlir::cast<RankedTensorType>(flatIndices.getType());
@@ -51,3 +55,5 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    flatIndices = rewriter.create<ttir::WhereOp>(
 +        loc, flatIndicesType, validIndices, flatIndices, outOfBounds);
  
+     // Flatten the computed indices to 1D.
+     return ttir::utils::flattenTensor(rewriter, loc, flatIndices,

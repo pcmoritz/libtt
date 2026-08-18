@@ -1,11 +1,16 @@
-diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -18,2 +18,3 @@
+@@ -16,6 +16,7 @@
+ #include "mlir/IR/Attributes.h"
+ #include "mlir/IR/BuiltinAttributes.h"
  #include "mlir/IR/BuiltinTypes.h"
 +#include "mlir/IR/Matchers.h"
  #include "mlir/IR/Operation.h"
-@@ -537,2 +538,55 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+ #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+ #include "llvm/ADT/SmallSet.h"
+@@ -535,6 +536,59 @@ public:
+ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+   using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
 +  static mlir::Value lookThroughSplatConstantViewOps(mlir::Value value) {
 +    while (Operation *op = value.getDefiningOp()) {
@@ -61,7 +66,11 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +  }
 +
  public:
-@@ -546,10 +600,14 @@ public:
+   mlir::LogicalResult
+   matchAndRewrite(MultiplyOp multiplyOp,
+@@ -544,24 +598,22 @@ public:
+     mlir::Value rhs =
+         ttmlir::utils::lookThrough<TypecastOp>(multiplyOp.getRhs());
  
 -    SigmoidOp sigmoidOp = nullptr;
 -    mlir::Value otherOperand;
@@ -83,7 +92,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    if (!sigmoidInput) {
 +      sigmoidInput = matchSigmoidLike(rhs);
        otherOperand = lhs;
-@@ -557,9 +615,3 @@ public:
+     }
  
 -    if (!sigmoidOp || !sigmoidOp->hasOneUse()) {
 -      return mlir::failure();
@@ -94,3 +103,5 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 -    if (sigmoidInput != otherOperand) {
 +    if (!sigmoidInput || sigmoidInput != otherOperand) {
        return mlir::failure();
+     }
+ 

@@ -1,7 +1,9 @@
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-@@ -298,2 +298,29 @@ struct DotGeneralToMatmulConversionPattern
+@@ -296,6 +296,33 @@ struct DotGeneralToMatmulConversionPattern
+           op.getLoc(),
+           RankedTensorType::get(matmulDestinationShape, elementType),
            lhsMatmulInput, rhsMatmulInput);
 +    } else if (isa<IntegerType>(elementType)) {
 +      // Materialize [..., M, K, N], multiply elementwise, and let Sum reduce K.
@@ -31,3 +33,5 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +          rewriter.getI32ArrayAttr(
 +              {static_cast<int32_t>(contractionDim)}));
      } else {
+       contractionResult = rewriter.create<ttir::MatmulOp>(
+           op.getLoc(),

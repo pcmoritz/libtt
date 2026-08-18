@@ -1,7 +1,8 @@
-diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -3041,2 +3041,102 @@ namespace {
+@@ -3039,6 +3039,106 @@ public:
+ 
+ namespace {
  
 +struct Pool2DLayout {
 +  SmallVector<size_t, 2> spatialDims;
@@ -104,21 +105,37 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +}
 +
  class StableHLOToTTIRReduceWindowOpConversionPattern
-@@ -3057,2 +3157,3 @@ public:
+     : public OpConversionPattern<mlir::stablehlo::ReduceWindowOp> {
+   using OpConversionPattern<
+@@ -3055,6 +3155,7 @@ public:
+                   mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
      using TypicalInitReductionValue::NEG_INF;
 +    using TypicalInitReductionValue::POS_INF;
      using TypicalInitReductionValue::ZERO;
-@@ -3107,2 +3208,5 @@ public:
+ 
+     // Validate basic op structure.
+@@ -3105,6 +3206,9 @@ public:
+       } else if (isa<mlir::stablehlo::MaxOp>(reduceOp)) {
+         result = rewriter.create<ttir::MaximumOp>(srcOp.getLoc(), resultType,
                                                     input, init);
 +      } else if (isa<mlir::stablehlo::MinOp>(reduceOp)) {
 +        result = rewriter.create<ttir::MinimumOp>(srcOp.getLoc(), resultType,
 +                                                   input, init);
        } else if (isa<mlir::stablehlo::MulOp>(reduceOp)) {
-@@ -3138,2 +3242,3 @@ public:
+         result = rewriter.create<ttir::MultiplyOp>(srcOp.getLoc(), resultType,
+                                                     input, init);
+@@ -3136,6 +3240,7 @@ public:
+     SmallVector<mlir::Operation *> reductionOps;
+     for (Operation &op : llvm::drop_end(operations, 1)) {
        if (!isa<mlir::stablehlo::AddOp, mlir::stablehlo::MaxOp,
 +               mlir::stablehlo::MinOp,
                 mlir::stablehlo::MulOp>(&op)) {
-@@ -3208,6 +3313,8 @@ public:
+         return rewriter.notifyMatchFailure(srcOp, "Unsupported reduction op.");
+       }
+@@ -3206,87 +3311,27 @@ public:
+       }
+     }
  
 -    // Handle 5D input (3D max pooling) by decomposing into two 2D max pooling
 -    // passes.
@@ -131,7 +148,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        indicesOfValuesGreaterThanOne(windowDimensions.asArrayRef()).size() ==
 +            3) {
        return lowerReduceWindow5D(srcOp, adaptor, rewriter, *initValues,
-@@ -3217,74 +3324,12 @@ public:
+                                  reductionOps, windowDimensions, windowStrides,
+                                  windowDilations, padding, ceilMode);
+     }
  
 -    // Lowering to a single TTIR pooling op is supported only for 2D and 4D
 -    // input tensors.
@@ -215,7 +234,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
 +    SmallVector<size_t, 2> spatialDimIndices = layout->spatialDims;
  
-@@ -3329,24 +3374,8 @@ public:
+     // Construct attributes for TTIR pooling ops.
+ 
+@@ -3327,56 +3372,55 @@ public:
+ 
+       RankedTensorType inputType =
            mlir::cast<RankedTensorType>(input.getType());
 -      RankedTensorType resultType = cast<RankedTensorType>(
 +      RankedTensorType originalResultType = cast<RankedTensorType>(
@@ -244,7 +267,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          layout->getPermutedShape(inputType.getShape());
 +      if (layout->needsPermute()) {
          input = rewriter.create<ttir::PermuteOp>(
-@@ -3356,25 +3385,40 @@ public:
+             srcOp.getLoc(),
+             RankedTensorType::get(permutedInputShape,
+                                   inputType.getElementType(),
                                    inputType.getEncoding()),
 -            input, permutation);
 +            input, layout->permutation);
@@ -301,7 +326,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +              srcOp.getLoc(), originalResultType, result,
 +              layout->inversePermutation);
          }
-@@ -3390,2 +3434,16 @@ public:
+         return result;
+       };
+@@ -3388,6 +3432,20 @@ public:
+                          strideForTTIROps, dilationForTTIROps,
+                          paddingForTTIROps, ceilMode)
                       .getResult();
 +      } else if (isa<mlir::stablehlo::MinOp>(reductionOp) &&
 +                 initVal == POS_INF &&
@@ -318,20 +347,32 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        result = rewriter.create<ttir::NegOp>(srcOp.getLoc(), resultType,
 +                                               result);
        } else if (isa<mlir::stablehlo::AddOp>(reductionOp) && initVal == ZERO) {
-@@ -3832,2 +3890,5 @@ private:
+         // Special case of sum pooling followed by a convenient div op.
+         // TODO(acicovic): Check why was i == 0 originally added as a condition.
+@@ -3830,6 +3888,9 @@ private:
+       }
+       if (checkInitValue(constantOp, TypicalInitReductionValue::NEG_INF)) {
          initValues.push_back(TypicalInitReductionValue::NEG_INF);
 +      } else if (checkInitValue(constantOp,
 +                                TypicalInitReductionValue::POS_INF)) {
 +        initValues.push_back(TypicalInitReductionValue::POS_INF);
        } else if (checkInitValue(constantOp, TypicalInitReductionValue::ZERO)) {
-@@ -4722,4 +4783,4 @@ public:
+         initValues.push_back(TypicalInitReductionValue::ZERO);
+       } else if (checkInitValue(constantOp, TypicalInitReductionValue::ONE)) {
+@@ -4720,8 +4781,8 @@ public:
+     }
+ 
      Location loc = srcOp.getLoc();
 -    auto operand = srcOp.getOperand();
 -    auto source = srcOp.getSource();
 +    Value operand = srcOp.getOperand();
 +    Value source = srcOp.getSource();
      auto initValue_ = srcOp.getInitValue();
-@@ -4751,3 +4812,30 @@ public:
+ 
+     // Get window attributes
+@@ -4749,7 +4810,34 @@ public:
+         loc, operandType, rewriter.getF32FloatAttr(fillValue));
+ 
      // Tensor which we scatter into
 -    auto fullTensor = fullTensorOp.getResult();
 +    Value fullTensor = fullTensorOp.getResult();
@@ -363,7 +404,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          srcOp, "Only min and max selections are supported.");
 +    }
  
-@@ -4767,48 +4855,13 @@ public:
+     // Generate defaults if they dont exist
+     // Default window strides is all ones
+@@ -4765,52 +4853,17 @@ public:
+                  : rewriter.getDenseI64ArrayAttr(
+                        SmallVector<int64_t>(windowDims.size() * 2, 0));
  
 -    // Adjust tensor layouts and args for MaxPool2dWithIndices
 -    // Get indices of elements larger than one which correspond to spatial dims
@@ -421,7 +466,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    auto inverseOfPermutation = ttmlir::utils::inversePermutation(permutation);
 +    SmallVector<size_t, 2> spatialDims = layout->spatialDims;
  
-@@ -4834,20 +4887,22 @@ public:
+     // Adjust args to match definition in MaxPool2dWithIndices
+     auto kernel = rewriter.getDenseI32ArrayAttr(
+@@ -4832,31 +4885,32 @@ public:
+ 
+     auto ceilMode = rewriter.getBoolAttr(false);
  
 -    // Apply input permutation to operand, source and tensor which we scatter
 -    // into (to N,H,W,C)
@@ -462,7 +511,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    source = normalizeValue(source, "_normalizeSource");
 +    fullTensor = normalizeValue(fullTensor, "_normalizeFullTensor");
  
-@@ -4855,6 +4910,5 @@ public:
+     // Calling MaxPool2dWithIndices op on operand
      // and obtaining indices which will be used for Scatter
 -    auto pooledType = RankedTensorType::get(sourcePermShape,
 -                                            source.getType().getElementType());
@@ -471,7 +520,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -        RankedTensorType::get(sourcePermShape,
 +        RankedTensorType::get(pooledType.getShape(),
                                rewriter.getIntegerType(32)); // i32 for indices
-@@ -4903,4 +4957,10 @@ public:
+ 
+     Value pooledEmpty = rewriter.create<ttir::EmptyOp>(loc, pooledType);
+@@ -4901,8 +4955,14 @@ public:
+       return rewriter.notifyMatchFailure(
+           srcOp, "SelectAndScatterOp cannot specify reduce type.");
      }
 +    ttcore::ReduceType reduceType = *scatterReduceType;
 +    // With zero fill, non-overlapping windows only need an overwrite.
@@ -483,7 +536,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -        ttcore::ReduceTypeAttr::get(rewriter.getContext(), *scatterReduceType);
 +        ttcore::ReduceTypeAttr::get(rewriter.getContext(), reduceType);
      auto scatterResult = rewriter.create<ttir::ScatterOp>(
-@@ -4914,15 +4974,24 @@ public:
+         loc, scatterOutputType,
+         reshapedFullTensor, // input tensor
+@@ -4912,34 +4972,32 @@ public:
+         reduceTypeAttr);    // reduction type
+ 
      // Reshape back to N,H,W,C
 -    auto finalOutputType = RankedTensorType::get(
 -        fullTensorPermShape, scatterOutputType.getElementType());
@@ -521,7 +578,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +
 +    rewriter.replaceOp(srcOp, result);
      return success();
-@@ -4931,13 +5000,2 @@ public:
+   }
+ 
  private:
 -  llvm::SmallVector<int64_t>
 -  getIndicesofElementsLargerThanOne(llvm::ArrayRef<int64_t> array) const {
@@ -535,7 +593,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -  }
 -
    RankedTensorType getNHWFlattenedType(RankedTensorType unflattenedType) const {
-@@ -4952,5 +5010,4 @@ private:
+     llvm::ArrayRef<int64_t> shape = unflattenedType.getShape();
+     assert(shape.size() == 4 && "Expected 4D NHWC tensor");
+@@ -4950,9 +5008,8 @@ private:
+   }
+ 
    ttir::ReshapeOp
 -  generateReshape(mlir::TypedValue<mlir::RankedTensorType> input,
 -                  RankedTensorType outputType, PatternRewriter &rewriter,
@@ -543,3 +605,5 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  generateReshape(mlir::Value input, RankedTensorType outputType,
 +                  PatternRewriter &rewriter, StringRef suffix) const {
      return rewriter.create<ttir::ReshapeOp>(
+         ttmlir::utils::appendLocationSuffix(input.getLoc(), suffix), outputType,
+         input,
