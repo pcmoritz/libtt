@@ -1,44 +1,35 @@
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
---- a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
-@@ -22,3 +22,3 @@
-  * @param switch_dir If true, alternates the sorting direction for each tile pair to build a bitonic sequence.
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
+@@ -23 +23 @@
 - * @param ascending Initial sorting direction: true for ascending, false for descending.
 + * @param initial_dir Initial local sorting direction: true for ascending, false for descending.
-  * @param end_phase Indicates the current phase of the bitonic sort (used by the local sort kernel).
 @@ -29,2 +29,3 @@
   */
 +template <bool stable, bool descending>
  FORCE_INLINE
-@@ -37,3 +38,3 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
-     const bool switch_dir,
+@@ -38 +39 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
 -    const bool ascending,
 +    const bool initial_dir,
-     const int end_phase) {
-@@ -42,3 +43,3 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
- 
+@@ -43 +44 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
 -    bool ascending_local = ascending;
 +    bool ascending_local = initial_dir;
-     for (uint32_t wt = 0; wt < Wt; wt += 2) {
-@@ -61,3 +62,3 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
-         // llk_topk_sort -> inplace
+@@ -62 +63 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
 -        ckernel::topk_local_sort(0, (int)ascending_local, end_phase);
 +        ckernel::topk_local_sort<stable, descending>(0, (int)ascending_local, end_phase);
- 
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
 @@ -30,2 +30,3 @@ void kernel_main() {
      constexpr bool ascending = get_arg(args::ascending) == 1;
 +    constexpr bool stable = get_arg(args::stable) != 0;
  
-@@ -94,3 +95,3 @@ void kernel_main() {
+@@ -103,3 +104,3 @@ void kernel_main() {
          // Read input value data
 -        sort_Wt_tiles_row_to_bitonic_sequence(
 +        sort_Wt_tiles_row_to_bitonic_sequence<stable, !ascending>(
              input_tensor_dfb,
-@@ -151,20 +152,11 @@ void kernel_main() {
- 
+@@ -161,19 +162,10 @@ void kernel_main() {
 -                            uint32_t tile_input_low = input_dest_start;
 -                            uint32_t tile_input_high = input_dest_end;
 -                            uint32_t tile_index_low = index_dest_start;
@@ -78,16 +69,15 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/
 +                        // DEST[0] corresponds to the left tile slot in the requested direction.
 +                        const uint32_t keep_left_slot = (i < j);
  
-@@ -251,3 +246,3 @@ void kernel_main() {
+@@ -260,3 +255,3 @@ void kernel_main() {
                          uint32_t index_output_tile = index_dest_start;
 -                        if (!select_lower) {
 +                        if (!keep_left_slot) {
                              value_output_tile = input_dest_end;
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
-@@ -147,22 +147,12 @@ void kernel_main() {
- 
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
+@@ -148,21 +148,11 @@ void kernel_main() {
 -                            uint32_t tile_input_low = input_dest_start;
 -                            uint32_t tile_input_high = input_dest_end;
 -                            uint32_t tile_index_low = index_dest_start;
@@ -141,16 +131,14 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/
 +                                pack_tile(index_dest_start, index_tensor_output_cb_id);
 +                                pack_tile(index_dest_end, index_tensor_output_cb_id);
                                  tile_regs_release();
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
-@@ -176,3 +176,3 @@ void kernel_main() {
- 
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
+@@ -183,2 +183,2 @@ void kernel_main() {
 -        sort_Wt_tiles_row_to_bitonic_sequence(
 +        sort_Wt_tiles_row_to_bitonic_sequence<stable, descending>(
              input_tensor_dfb,
-@@ -228,20 +228,11 @@ void kernel_main() {
- 
+@@ -237,19 +237,10 @@ void kernel_main() {
 -                        uint32_t tile_input_low = input_dest_start;
 -                        uint32_t tile_input_high = input_dest_end;
 -                        uint32_t tile_index_low = index_dest_start;
@@ -175,32 +163,31 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/
 +                            } else {
 +                                ckernel::topk_merge<false, stable, descending>(/*idst=*/0, m_iter, /*k=*/64);
                              }
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp b/ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
 @@ -1128,2 +1128,3 @@ ttnn::device_operation::ProgramArtifacts SortProgramFactoryCrossCoreDataExchange
                  {"ascending", static_cast<uint32_t>(!attributes.descending)},
 +                {"stable", static_cast<uint32_t>(attributes.stable)},
                  {"W_value_slice_bytes", W_value_slice_bytes},
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp b/ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
 @@ -8,2 +8,3 @@
  #include "ttnn/operations/core/core.hpp"
 +#include "ttnn/operations/copy/typecast/typecast.hpp"
  #include "ttnn/operations/creation/creation.hpp"
-@@ -231,4 +232,2 @@ std::vector<Tensor> sort(
+@@ -232,4 +233,2 @@ std::vector<Tensor> sort(
      std::optional<std::tuple<Tensor&, Tensor&>> optional_output_tensors) {
 -    TT_FATAL(!stable, "ttnn::sort: stable=True is not yet implemented.");
 -
      const ttnn::Shape& original_lshape = input_tensor.logical_shape();
-@@ -296,3 +295,3 @@ std::vector<Tensor> sort(
+@@ -297,3 +296,3 @@ std::vector<Tensor> sort(
      // the output can be converted back to the sharded config after sorting.
 -    const Tensor transform_input = input_tensor.memory_config().is_sharded()
 +    const Tensor unsharded_input = input_tensor.memory_config().is_sharded()
                                         ? ttnn::to_memory_config(input_tensor, ttnn::DRAM_MEMORY_CONFIG)
-@@ -300,2 +299,11 @@ std::vector<Tensor> sort(
- 
+@@ -302 +301,10 @@ std::vector<Tensor> sort(
 +    // The SFPU bitonic primitive compares BF16/FP32 values. IEEE Float16 is
 +    // exactly representable in Float32, so promote it once around the device
 +    // sort instead of teaching every compare/merge and padding stage a second
@@ -211,13 +198,12 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp b/ttnn/cpp/ttn
 +        promote_float16 ? ttnn::typecast(unsharded_input, DataType::FLOAT32) : unsharded_input;
 +
      Tensor padded_input_tensor =
-@@ -317,3 +325,3 @@ std::vector<Tensor> sort(
+@@ -318,3 +325,3 @@ std::vector<Tensor> sort(
          const bool indices_layout_match = (out1.layout() == padded_input_tensor.layout());
 -        preallocated_layout_mismatch = !values_layout_match || !indices_layout_match;
 +        preallocated_layout_mismatch = promote_float16 || !values_layout_match || !indices_layout_match;
          if (!preallocated_layout_mismatch) {
-@@ -335,2 +343,6 @@ std::vector<Tensor> sort(
- 
+@@ -337 +344,5 @@ std::vector<Tensor> sort(
 +    if (promote_float16) {
 +        results[0] = ttnn::typecast(results[0], DataType::FLOAT16);
 +    }

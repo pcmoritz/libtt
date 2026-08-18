@@ -1,8 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -4264,2 +4264,18 @@ getReduceTypeFromRegion(Region &region) {
- 
+@@ -4075,1 +4075,17 @@ getReduceTypeFromRegion(Region &region) {
 +static bool isSubtractReduction(Region &region) {
 +  if (!region.hasOneBlock()) {
 +    return false;

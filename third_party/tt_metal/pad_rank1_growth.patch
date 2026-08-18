@@ -1,7 +1,9 @@
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp b/ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
-@@ -371,7 +371,9 @@ ttnn::Tensor invoke_tile(
+diff --git ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
+@@ -369,11 +369,13 @@ ttnn::Tensor invoke_tile(
+         return input_tensor.pad(requested_padded_shape, zeros, value);
+     }
  
 -    const bool pad_upper_dims = !std::equal(
 -        requested_logical_shape.view().rbegin() + 2,
@@ -16,14 +18,21 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp b/ttnn/cpp/ttnn/
 +            input_logical_shape.view().rbegin() + 2,
 +            input_logical_shape.view().rend());
  
-@@ -382,3 +384,5 @@ ttnn::Tensor invoke_tile(
+     auto pad_current_tile_dim = [&requested_padded_shape, &input_padded_shape](const int i) {
+         return requested_padded_shape[i] == input_padded_shape[i];
+@@ -380,7 +382,9 @@ ttnn::Tensor invoke_tile(
+     };
+ 
      ttnn::Tensor output_tensor = ttnn::fill_implicit_tile_padding(input_tensor, value, memory_config_arg);
 -    if (requested_rank == 1 || (!pad_upper_dims && pad_current_tile_dim(-1) && pad_current_tile_dim(-2))) {
 +    const bool tile_dims_unchanged =
 +        pad_current_tile_dim(-1) && (requested_rank == 1 || pad_current_tile_dim(-2));
 +    if (!pad_upper_dims && tile_dims_unchanged) {
          output_tensor = ttnn::experimental::view(output_tensor, requested_logical_shape, requested_padded_shape);
-@@ -388,2 +392,7 @@ ttnn::Tensor invoke_tile(
+ 
+     } else {
+@@ -388,11 +392,16 @@ ttnn::Tensor invoke_tile(
+         // need to align the requested padding to tile size. Note that begin padding is not supported so now just
          // set to zero
 +        // Rank-1 tile tensors have one leading physical padding dimension.
 +        TT_ASSERT(requested_padded_shape.size() == input_padded_shape.size());
@@ -31,7 +40,7 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp b/ttnn/cpp/ttnn/
 +            requested_padded_shape.cbegin(), requested_padded_shape.cend() - requested_rank,
 +            input_padded_shape.cbegin()));
          ttsl::SmallVector<PadSpecDim> padded_padding_vec;
-@@ -391,5 +400,5 @@ ttnn::Tensor invoke_tile(
+         padded_padding_vec.reserve(requested_rank);
          std::transform(
 -            requested_padded_shape.cbegin(),
 +            requested_padded_shape.cend() - requested_rank,
@@ -39,9 +48,14 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp b/ttnn/cpp/ttnn/
 -            input_padded_shape.cbegin(),
 +            input_padded_shape.cend() - requested_rank,
              std::back_inserter(padded_padding_vec),
-@@ -401,5 +410,2 @@ ttnn::Tensor invoke_tile(
+             [](auto& a, auto& b) { return PadSpecDim{0, a - b}; });
+ 
+@@ -399,8 +408,5 @@ ttnn::Tensor invoke_tile(
+             output_tensor, std::move(padded_padding_vec), value, use_multicore, memory_config_arg, sub_core_grids);
  
 -        // this is the padded shape
 -        const auto output_shape = squeeze_or_unsqueeze_shape_to_ND(output_tensor.logical_shape(), requested_rank);
 -
          // "slice" down to logical shape
+         output_tensor = ttnn::experimental::view(output_tensor, requested_logical_shape, requested_padded_shape);
+     }

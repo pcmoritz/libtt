@@ -1,15 +1,21 @@
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
---- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
-@@ -35,3 +35,3 @@ template <>
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
+@@ -33,7 +33,7 @@ struct df_to_std<DataFormat::Float16_b> {
+ 
+ template <>
  struct df_to_std<DataFormat::Int32> {
 -    using std_type = uint32_t;
 +    using std_type = int32_t;
  };
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
-@@ -72,6 +72,7 @@ FORCE_INLINE void scatter_along_chunk(
+ 
+ template <>
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
+@@ -78,10 +78,11 @@ FORCE_INLINE void scatter_along_chunk(
+     // partial stick length and offset)
+     for (uint32_t index_in_index_chunk = 0; index_in_index_chunk < index_chunk_size; ++index_in_index_chunk) {
          volatile index_type& index_value = index_l1_read_ptr[index_in_index_chunk];
 -        if (index_value < input_offset || index_value >= input_offset + input_chunk_size) {
 +        if (index_value < input_offset ||
@@ -19,10 +25,14 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataf
 -        if (index_value >= input_stick_size) {
 +        if (index_value >= static_cast<index_type>(input_stick_size)) {
              continue;
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
-@@ -84,6 +84,7 @@ FORCE_INLINE void scatter_along_chunk(
+         }
+         volatile uint16_t& source_value = source_l1_read_ptr[index_in_index_chunk];
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
+@@ -81,10 +81,11 @@ FORCE_INLINE void scatter_along_chunk(
+     // partial stick length and offset)
+     for (uint32_t index_in_index_chunk = 0; index_in_index_chunk < index_chunk_size; ++index_in_index_chunk) {
          volatile index_type& index_value = index_l1_read_ptr[index_in_index_chunk];
 -        if (index_value < input_offset || index_value >= input_offset + input_chunk_size) {
 +        if (index_value < static_cast<index_type>(input_offset) ||
@@ -32,16 +42,25 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataf
 -        if (index_value >= input_stick_size) {
 +        if (index_value >= static_cast<index_type>(input_stick_size)) {
              continue;
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp
-@@ -23,3 +23,3 @@ namespace CMAKE_UNIQUE_NAMESPACE {
+         }
+         volatile number_type& source_value = source_l1_read_ptr[index_in_index_chunk];
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/scatter.cpp
+@@ -19,6 +19,6 @@ namespace {
+ namespace CMAKE_UNIQUE_NAMESPACE {
  
 -constexpr std::string_view ALLOWED_REDUCTIONS[] = {"add", "multiply"};
 +constexpr std::string_view ALLOWED_REDUCTIONS[] = {"add", "multiply", "amin", "amax"};
  
-@@ -66,3 +66,3 @@ void validate_inputs(
+ // validate dimension constraints before sending down to device operation working on the last dimension
+ // inputs are validated according to
+@@ -64,7 +64,7 @@ void validate_inputs(
+         TT_FATAL(
+             std::find(std::begin(ALLOWED_REDUCTIONS), std::end(ALLOWED_REDUCTIONS), *opt_reduction_string) !=
                  std::end(ALLOWED_REDUCTIONS),
 -            "reduce must be either 'add' or 'multiply' (case-sensitive), got {}",
 +            "unsupported scatter reduction '{}'",
              *opt_reduction_string);
+     }
+ 

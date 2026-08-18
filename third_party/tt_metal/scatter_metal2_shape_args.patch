@@ -1,7 +1,7 @@
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
 index a1c9a30..2077fe4 100644
---- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
 @@ -113,14 +113,12 @@ std::array<uint32_t, N> from_id(int32_t id, const std::array<uint32_t, N>& dims)
      return coord;
  }
@@ -22,10 +22,10 @@ index a1c9a30..2077fe4 100644
      }
  
      return ret;
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
 index 940f157..374364d 100644
---- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
 @@ -139,9 +139,24 @@ void kernel_main() {
      using index_std_type = std_type_t<get_dataformat(dfb::index)>;
  
@@ -54,10 +54,10 @@ index 940f157..374364d 100644
  
      const auto index_strides = make_strides<N>(index_dims);
  
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
 index 9123435..1b07cd7 100644
---- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
 @@ -124,9 +124,24 @@ void kernel_main() {
      using index_std_type = std_type_t<get_dataformat(dfb::index)>;
  
@@ -86,10 +86,10 @@ index 9123435..1b07cd7 100644
  
      const auto index_strides = make_strides<N>(index_dims);
  
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp
 index f63edcc..ab96388 100644
---- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.hpp
 @@ -9,7 +9,9 @@
  
  #include "ttnn/tensor/tensor.hpp"
@@ -125,10 +125,10 @@ index f63edcc..ab96388 100644
 +}
 +
  }  // namespace ttnn::prim
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
 index 8c25e61..0dd9df4 100644
---- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
 @@ -160,11 +160,8 @@ ttnn::device_operation::ProgramArtifacts ScatterProgramFactory::create_program_a
                       "scatter_reduction_type"},
              },
@@ -178,10 +178,10 @@ index 8c25e61..0dd9df4 100644
          },
          KernelRunArgs{
              .kernel = WRITER,
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
 index f808f6d..fe7c720 100644
---- a/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
 @@ -173,11 +173,8 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
                       "scatter_reduction_type"},
              },

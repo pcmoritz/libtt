@@ -1,10 +1,14 @@
 diff --git a/pjrt_implementation/inc/api/module_builder/module_builder.h b/pjrt_implementation/inc/api/module_builder/module_builder.h
 --- a/pjrt_implementation/inc/api/module_builder/module_builder.h
 +++ b/pjrt_implementation/inc/api/module_builder/module_builder.h
-@@ -143,2 +143,3 @@ private:
+@@ -141,6 +141,7 @@ private:
+   // Creates VHLO module from the input program code.
+   tt_pjrt_status
    createVHLOModule(const std::string_view &code,
 +                   mlir::MLIRContext *context,
                     mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
+                    const std::optional<std::string> &export_path,
+                    const std::string &model_name = "");
 @@ -370,5 +371,2 @@ private:
  
 -  // MLIR context handle.
@@ -14,8 +18,7 @@ diff --git a/pjrt_implementation/inc/api/module_builder/module_builder.h b/pjrt_
 diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
 --- a/pjrt_implementation/src/api/module_builder/module_builder.cc
 +++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
-@@ -289,6 +289,5 @@ void TTAlchemistHandler::initialize() {
- 
+@@ -257,4 +257,3 @@
 -ModuleBuilder::ModuleBuilder()
 -    : m_context(std::make_unique<mlir::MLIRContext>()) {
 -  // Register all the required dialects and passes.
@@ -23,7 +26,6 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 +static const mlir::DialectRegistry &getDialectRegistry() {
 +  static const mlir::DialectRegistry registry = [] {
 +    mlir::DialectRegistry registry;
- 
 @@ -306,5 +305,10 @@ ModuleBuilder::ModuleBuilder()
  
 -  mlir::tt::ttir::registerPasses();

@@ -1,12 +1,10 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5056,5 +5056,2 @@ public:
- 
+@@ -4844,3 +4844,0 @@
 -// NOTE: StableHLO Dynamic Slice Op clamps start indices to ensure validity,
 -// but we don't. Would add multiple ops (worse perf) and doesn't appear in test
 -// models.
- namespace {
 @@ -5082,4 +5079,4 @@ public:
  
 -    for (Value startIndex : startIndicesRange) {
@@ -21,11 +19,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          rewriter.getI32IntegerAttr(0),
 +          rewriter.getI32IntegerAttr(operandShape[dim] - sliceSizes[dim]));
        startIndicesValues1D.push_back(reshapedIndex);
-@@ -5103,3 +5104,2 @@ public:
-     // Create a 1D constant tensor with slice_sizes values.
+@@ -4891,1 +4897,0 @@ public:
 -    auto sliceSizes = srcOp.getSliceSizes();
-     SmallVector<int32_t> sliceSizesInt32(sliceSizes.begin(), sliceSizes.end());
-@@ -5130,2 +5130,124 @@ public:
+@@ -4904,6 +4909,128 @@ class StableHLOToTTIRDynamicSliceOpConversionPattern
+ };
+ } // namespace
  
 +namespace {
 +class StableHLOToTTIRDynamicUpdateSliceOpConversionPattern
@@ -150,11 +148,16 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +} // namespace
 +
  namespace {
-@@ -10697,2 +10819,4 @@ static void addDynamicSliceOpConversionPattern(MLIRContext *ctx,
+ class StableHLOToTTIROpClampOpConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::ClampOp> {
+@@ -9934,5 +10056,7 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
+   patterns.add<StableHLOToTTIRDynamicSliceOpConversionPattern>(typeConverter,
                                                                 ctx);
 +  patterns.add<StableHLOToTTIRDynamicUpdateSliceOpConversionPattern>(
 +      typeConverter, ctx);
  }
+ 
+ static void addClampOpConversionPattern(MLIRContext *ctx,
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp.rej b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp.rej
 new file mode 100644
 --- /dev/null

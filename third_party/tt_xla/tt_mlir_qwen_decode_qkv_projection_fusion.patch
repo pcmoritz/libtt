@@ -1,8 +1,10 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 --- a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
 +++ b/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h
-@@ -46,2 +46,31 @@ private:
- 
+@@ -44,6 +44,35 @@ private:
+   OpValidationConfig validationConfig;
+ };
+
 +// Fuses the decode QKV projection shape used by Qwen-style attention where
 +// q/k RMSNorm sit between projection and attention:
 +//
@@ -33,6 +35,8 @@ diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPattern
 +};
 +
  // Fuses a SplitQueryKeyValueAndSplitHeadsOp followed by permute [2,0,1,3]
+ // on all three outputs into a single NLPCreateQKVHeadsDecodeOp, which is
+ // optimized for the decode case (S=1).
 diff --git a/include/ttmlir/Utils.h b/include/ttmlir/Utils.h
 --- a/include/ttmlir/Utils.h
 +++ b/include/ttmlir/Utils.h
@@ -111,11 +115,15 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +  }
 +
    // Collect all ops that share the same LHS operand and are compatible
-@@ -2066,2 +2093,4 @@ private:
- 
+@@ -1872,6 +1929,8 @@ private:
+       }
+     }
+
 +    sortQKVProjectionCandidates(result);
 +
      return result;
+   }
+
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
@@ -123,8 +131,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
  #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
 +#include "ttmlir/Utils.h"
  
-@@ -629,2 +630,159 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
- 
+@@ -572,6 +573,163 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
+   return true;
+ }
+
 +// ============================================================================
 +// NLPDecodeQKVProjectionFusing helpers
 +// ============================================================================
@@ -283,6 +293,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 +}
 +
  // ============================================================================
+ // Step 7: Create fused op
+ // ============================================================================
 @@ -930,2 +1088,61 @@ template class SplitQueryKeyValueAndSplitHeadsFusing<LinearOp>;
  
 +mlir::LogicalResult NLPDecodeQKVProjectionFusing::matchAndRewrite(
@@ -348,8 +360,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -474,2 +474,4 @@ public:
+@@ -473,3 +473,5 @@ public:
        patterns.add<NLPConcatHeadsDecodeFusing>(&getContext());
 +      patterns.add<fusing::NLPDecodeQKVProjectionFusing>(&getContext(),
 +                                                         validationConfig);
        patterns.add<fusing::SplitQueryKeyValueAndSplitHeadsFusing<MatmulOp>>(
+           &getContext(), validationConfig);

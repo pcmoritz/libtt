@@ -208,7 +208,6 @@ http_archive(
     name = "tt_metal",
     build_file = "//third_party/tt_metal:BUILD.overlay.bazel",
     # Keep tt-metal aligned with the revision selected by this tt-mlir commit.
-    patch_args = ["-p1"],
     patches = [
         "//third_party/tt_metal:wormhole_build_empty_sources.patch",
         "//third_party/tt_metal:reduce_static_tls.patch",

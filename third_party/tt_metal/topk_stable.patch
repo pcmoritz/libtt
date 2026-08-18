@@ -1,6 +1,6 @@
-diff --git a/tt_metal/hw/inc/api/compute/compute_kernel_api.h b/tt_metal/hw/inc/api/compute/compute_kernel_api.h
---- a/tt_metal/hw/inc/api/compute/compute_kernel_api.h
-+++ b/tt_metal/hw/inc/api/compute/compute_kernel_api.h
+diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/compute/compute_kernel_api.h
+--- tt_metal/hw/inc/api/compute/compute_kernel_api.h
++++ tt_metal/hw/inc/api/compute/compute_kernel_api.h
 @@ -710,5 +710,6 @@ ALWI void silu_tile_init_pack() { PACK(SFPU_UNARY_INIT_FN(silu, sfpu::silu_init,
   * | stable_sort     | Maintain order of indices for equal values                                 | bool     | true, false                                           | False    |
 + * | descending      | Order equal values by increasing index in a descending sort                | bool     | true, false                                           | False    |
@@ -24,13 +24,10 @@ diff --git a/tt_metal/hw/inc/api/compute/compute_kernel_api.h b/tt_metal/hw/inc/
 +template <bool idir, bool stable_sort, bool descending>
 +ALWI void topk_merge_impl(uint32_t idst, int m_iter, int k) {
      MATH(SFPU_UNARY_CALL(
-@@ -766,3 +768,3 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
-         calculate_bitonic_topk_merge,
+@@ -767 +769 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
 -        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort),
 +        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort, descending),
-         idst,
-@@ -773,2 +775,16 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
- 
+@@ -773,0 +776,14 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
 +// Keep the legacy unstable API separate: its callers provide only idir, and
 +// descending is unused when stable_sort is false. Stable callers must pass the
 +// global direction explicitly because their local idir alternates; combining
@@ -45,7 +42,6 @@ diff --git a/tt_metal/hw/inc/api/compute/compute_kernel_api.h b/tt_metal/hw/inc/
 +    topk_merge_impl<idir, stable_sort, descending>(idst, m_iter, k);
 +}
 +
- // topK rebuild
 @@ -804,5 +820,6 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
   * | stable_sort     | Maintain order of indices for equal values                                 | bool     | true, false                                           | False    |
 + * | descending      | Order equal values by increasing index in a descending sort                | bool     | true, false                                           | False    |
@@ -59,23 +55,21 @@ diff --git a/tt_metal/hw/inc/api/compute/compute_kernel_api.h b/tt_metal/hw/inc/
 -        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort),
 +        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort, descending),
          idst,
-diff --git a/ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp b/ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
---- a/ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
-+++ b/ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
-@@ -328,3 +328,3 @@ void topk(
-     ckernel::topk_local_sort<stable_sort>(0, (int)ascending, 4);
+diff --git ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
+--- ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
++++ ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
+@@ -289 +289 @@ void topk(
 -    ckernel::topk_merge<false, stable_sort>(0, 0, 32);
 +    ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);
- 
-@@ -342,3 +342,3 @@ void topk(
-         ckernel::topk_local_sort<stable_sort>(0, (int)ascending, 4);
+@@ -303 +303 @@ void topk(
 -        ckernel::topk_merge<false, stable_sort>(0, 0, 32);
 +        ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);
-     }
-diff --git a/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp b/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
---- a/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
-+++ b/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
-@@ -347,3 +347,7 @@ void kernel_main() {
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
+@@ -345,7 +345,11 @@ void kernel_main() {
+                 // Merge and sort 64 elements (32 existing + 32 new) using topk_local_sort
+                 // Results: dest reg 0 = top 32 elements, dest reg 1 = bottom 32 elements
                  // largest flag determines ascending (0) vs descending (1) sort order
 -                ckernel::topk_local_sort(0, (int)!largest, end_phase);
 +                if (largest) {
@@ -84,9 +78,11 @@ diff --git a/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk
 +                    ckernel::topk_local_sort<true, false>(0, 1, end_phase);
 +                }
  
-diff --git a/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp b/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
---- a/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
-+++ b/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
+                 // Pack sorted results: dest reg 0 -> result buffer, dest reg 1 -> secondary buffer
+                 tile_regs_commit();
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
 @@ -47,3 +47,7 @@ void process_and_sort_tiles(
          // llk_topk_sort -> inplace
 -        ckernel::topk_local_sort(0, (int)ascending, end_phase);
@@ -96,7 +92,9 @@ diff --git a/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk
 +            ckernel::topk_local_sort<true, true>(0, 0, end_phase);
 +        }
          tile_regs_commit();
-@@ -105,3 +109,7 @@ void process_tile_pair(
+@@ -103,7 +107,11 @@ void process_tile_pair(
+ 
+     // merge values - move larger 32 values into 0th dest and lower 32 values into 1st dest
      // sort within the larger 32 values
 -    ckernel::topk_rebuild(0, (uint32_t)ascending, m_iter, K, logk, target_tiles_is_one);
 +    if (ascending) {
@@ -105,7 +103,11 @@ diff --git a/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk
 +        ckernel::topk_rebuild<true, true>(0, 0, m_iter, K, logk, target_tiles_is_one);
 +    }
  
-@@ -167,5 +175,5 @@ void process_tiles(
+     tile_regs_commit();
+     tile_regs_wait();
+@@ -165,9 +173,9 @@ void process_tiles(
+ 
+             // merge values - move larger 32 values into 0th dest and lower 32 values into 1st dest
              if (largest) {
 -                ckernel::topk_merge<false>(0, m_iter, K);
 +                ckernel::topk_merge<false, true, true>(0, m_iter, K);
@@ -113,3 +115,5 @@ diff --git a/ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk
 -                ckernel::topk_merge<true>(0, m_iter, K);
 +                ckernel::topk_merge<true, true, false>(0, m_iter, K);
              }
+ 
+             // ckernel::topk_merge(0, m_iter, K);

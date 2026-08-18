@@ -1,7 +1,9 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -7872,2 +7872,19 @@ private:
+@@ -7319,6 +7313,23 @@ private:
+     return flatIndices;
+   }
  
 +  Value clampScatterIndex(Location loc, PatternRewriter &rewriter, Value index,
 +                          int64_t dimSize, Value &validIndices) const {
@@ -21,10 +23,16 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  }
 +
    /// Computes flattened 1D indices for multi-dimensional scatter.
-@@ -8044,2 +8061,3 @@ private:
+   ///
+   /// Handles both cases:
+@@ -7495,6 +7506,7 @@ private:
+     // b) window-only: use window offset only
+     // c) both scatter-indexed and window: add scatter index + window offset
      llvm::SmallVector<Value> indexSlices;
 +    Value validIndices;
      size_t windowIdxPos = 0;
+     for (int64_t operandDim = 0; operandDim < operandRank; ++operandDim) {
+       bool isScatterDim = scatterDimToIdxPos.count(operandDim);
 @@ -8090,2 +8108,6 @@ private:
  
 +      if (isScatterDim) {

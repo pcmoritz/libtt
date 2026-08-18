@@ -1,16 +1,19 @@
-diff --git a/ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp b/ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
---- a/ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
-+++ b/ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
-@@ -35,3 +35,5 @@ void EmbeddingsDeviceOperation::validate_on_program_cache_miss(
+diff --git ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
+@@ -34,6 +34,8 @@ void EmbeddingsDeviceOperation::validate_on_program_cache_miss(
+         weights.layout() == Layout::ROW_MAJOR, "Weights tensor layout must be ROW_MAJOR but got {}", weights.layout());
      TT_FATAL(a.dtype() == DataType::UINT32 or a.dtype() == DataType::BFLOAT16, "Input must be UINT32 or BFLOAT16");
 -    TT_FATAL(weights.dtype() == DataType::BFLOAT16, "Weights tensor must have BFLOAT16 dtype");
 +    TT_FATAL(
 +        weights.dtype() == DataType::BFLOAT16 or weights.dtype() == DataType::FLOAT32,
 +        "Weights tensor must have BFLOAT16 or FLOAT32 dtype");
      TT_FATAL(
-diff --git a/ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp b/ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
---- a/ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
-+++ b/ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
+         a.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
+         "Embedding does not currently support sharded inputs");
+diff --git ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
 @@ -244,2 +244,16 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
                                 : "ttnn/cpp/ttnn/operations/data_movement/tilize/device/kernels/compute/tilize.cpp";
 +    auto make_compute_config = [&] {
@@ -38,15 +41,17 @@ diff --git a/ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_
 -        compute_desc.config = ComputeConfigDescriptor{};
 +        compute_desc.config = make_compute_config();
          compute_desc_2 = std::move(compute_desc);
-diff --git a/ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp b/ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
---- a/ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
-+++ b/ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
-@@ -30,3 +30,4 @@ void kernel_main() {
+diff --git ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
+--- ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
++++ ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp
+@@ -29,5 +29,6 @@ void kernel_main() {
+             compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
              compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
 -            compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(
 +            compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
 +            compute_kernel_lib::tilize_config::Fp32Mode::Lossless>(
              per_core_block_cnt * num_chunks);
+     } else {
 @@ -41,3 +42,4 @@ void kernel_main() {
                      compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
 -                    compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(num_chunks - 1);

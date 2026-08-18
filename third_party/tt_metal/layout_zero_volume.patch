@@ -1,6 +1,6 @@
-diff --git a/ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp b/ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
---- a/ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-+++ b/ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 @@ -6,2 +6,3 @@
  #include "ttnn/operations/copy/typecast/device/typecast_device_op.hpp"
 +#include "ttnn/operations/creation/creation.hpp"
@@ -19,13 +19,15 @@ diff --git a/ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp b/ttnn/cpp/ttnn
 +            memory_config.value_or(input_tensor.memory_config()));
 +    }
  
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp b/ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
-@@ -8,2 +8,3 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
+@@ -7,4 +7,5 @@
+ #include "device/tilize_device_operation.hpp"
  #include "ttnn/operations/core/core.hpp"
 +#include "ttnn/operations/creation/creation.hpp"
  #include "ttnn/operations/data_movement/common/common.hpp"
+ #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 @@ -52,2 +53,10 @@ ttnn::Tensor tilize(
      const std::optional<CoreRangeSet>& sub_core_grids) {
 +    if (input_tensor.logical_volume() == 0) {
@@ -37,13 +39,15 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp b/ttnn/cpp
 +            memory_config.value_or(input_tensor.memory_config()));
 +    }
      tt::DataFormat input_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp b/ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
-@@ -8,2 +8,3 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
+@@ -7,4 +7,5 @@
+ #include "device/untilize_device_operation.hpp"
  #include "ttnn/operation.hpp"
 +#include "ttnn/operations/creation/creation.hpp"
  #include "ttnn/operations/data_movement/common/common.hpp"
+ #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 @@ -46,2 +47,13 @@ ttnn::Tensor untilize(
      const std::optional<CoreRangeSet>& sub_core_grids) {
 +    if (input_tensor.logical_volume() == 0) {

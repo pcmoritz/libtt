@@ -1,20 +1,30 @@
 diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation/inc/api/buffer_instance.h
 --- a/pjrt_implementation/inc/api/buffer_instance.h
 +++ b/pjrt_implementation/inc/api/buffer_instance.h
-@@ -324,2 +324,5 @@ PJRT_Error *onBufferMemory(PJRT_Buffer_Memory_Args *args);
+@@ -322,6 +322,9 @@ PJRT_Error *onBufferDevice(PJRT_Buffer_Device_Args *args);
+ // Implements PJRT_Buffer_Memory API function.
+ PJRT_Error *onBufferMemory(PJRT_Buffer_Memory_Args *args);
  
 +// Implements PJRT_Buffer_UnsafePointer API function.
 +PJRT_Error *onBufferUnsafePointer(PJRT_Buffer_UnsafePointer_Args *args);
 +
  // Implements PJRT_Buffer_ReadyEvent API function.
+ PJRT_Error *onBufferReadyEvent(PJRT_Buffer_ReadyEvent_Args *args);
+ 
 diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
 --- a/pjrt_implementation/src/api/buffer_instance.cc
 +++ b/pjrt_implementation/src/api/buffer_instance.cc
-@@ -115,2 +115,3 @@ void BufferInstance::bindApi(PJRT_Api *api) {
+@@ -113,6 +113,7 @@ void BufferInstance::bindApi(PJRT_Api *api) {
+   api->PJRT_Buffer_IsOnCpu = internal::onBufferIsOnCpu;
+   api->PJRT_Buffer_Device = internal::onBufferDevice;
    api->PJRT_Buffer_ReadyEvent = internal::onBufferReadyEvent;
 +  api->PJRT_Buffer_UnsafePointer = internal::onBufferUnsafePointer;
    api->PJRT_Buffer_Memory = internal::onBufferMemory;
-@@ -725,2 +726,17 @@ PJRT_Error *onBufferDevice(PJRT_Buffer_Device_Args *args) {
+ }
+ 
+@@ -729,6 +730,21 @@ PJRT_Error *onBufferDevice(PJRT_Buffer_Device_Args *args) {
+   return nullptr;
+ }
  
 +PJRT_Error *onBufferUnsafePointer(PJRT_Buffer_UnsafePointer_Args *args) {
 +  ZoneScoped;
@@ -32,3 +42,5 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 +}
 +
  PJRT_Error *onBufferMemory(PJRT_Buffer_Memory_Args *args) {
+   ZoneScoped;
+   DLOG_F(LOG_DEBUG, "BufferInstance::PJRT_Buffer_Memory");

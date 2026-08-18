@@ -1,11 +1,16 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp
+index d6fde98..0edc62c 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp
-@@ -26,2 +26,3 @@
+@@ -23,6 +23,7 @@
+ #include "mlir/Transforms/DialectConversion.h"
+ #include "shardy/dialect/sdy/ir/dialect.h"
  #include "stablehlo/dialect/StablehloOps.h"
 +#include "llvm/ADT/SmallVector.h"
  
-@@ -36,2 +37,27 @@ namespace mlir::tt::ttir {
+ using namespace mlir;
+ using namespace mlir::tt;
+@@ -36,4 +37,29 @@ namespace mlir::tt::ttir {
  namespace {
 +void stripShardingMarkers(Operation *op) {
 +  llvm::SmallVector<mlir::sdy::ShardingConstraintOp> constraints;
@@ -33,8 +38,14 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPass.cpp b/lib/Conver
 +}
 +
  struct ConvertStableHLOToTTIRPass
-@@ -45,2 +71,4 @@ struct ConvertStableHLOToTTIRPass
+     : public ttir::impl::ConvertStableHLOToTTIRBase<
+           ConvertStableHLOToTTIRPass> {
+@@ -43,6 +69,8 @@ struct ConvertStableHLOToTTIRPass
+       : Base(options) {}
+ 
    void runOnOperation() final {
 +    stripShardingMarkers(getOperation());
 +
      mlir::ConversionTarget target(getContext());
+ 
+     // Common legal/illegal ops/dialects for both partial and full conversion.

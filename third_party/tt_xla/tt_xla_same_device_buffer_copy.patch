@@ -1,7 +1,9 @@
 diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
 --- a/pjrt_implementation/src/api/buffer_instance.cc
 +++ b/pjrt_implementation/src/api/buffer_instance.cc
-@@ -508,4 +508,5 @@ void BufferInstance::markAsDataReady() {
+@@ -513,18 +513,12 @@ void BufferInstance::markAsDataReady() {
+   }
+ }
  
 -// We do not copy to device memory. We are just coping buffer from provided pjrt
 -// buffer and pretend that we have copied buffer instance to device.
@@ -9,7 +11,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 +// distinct owned tensor even when the destination is the same device/memory;
 +// JAX uses this API to implement explicit, non-aliasing copies.
  tt_pjrt_status BufferInstance::copyToDeviceMemory(DeviceInstance *dst_device,
-@@ -513,9 +514,2 @@ tt_pjrt_status BufferInstance::copyToDeviceMemory(DeviceInstance *dst_device,
+                                                   MemoryInstance *dst_memory,
                                                    BufferInstance **dst_buffer) {
 -  // PJRT API specification requires returning error in case of copying to same
 -  // device/memory space.
@@ -19,3 +21,5 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 -  }
 -
    std::unique_ptr<BufferInstance> dst_buffer_instance =
+       BufferInstance::createInputBufferInstance(
+           getDataType(), getDimensionsRaw(), getNumberOfDimensions(),

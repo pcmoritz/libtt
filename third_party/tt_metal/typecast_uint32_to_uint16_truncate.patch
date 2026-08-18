@@ -1,15 +1,14 @@
-diff --git a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h b/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
---- a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-+++ b/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-@@ -517,6 +517,3 @@ template <bool APPROXIMATION_MODE, int ITERATIONS>
- inline void calculate_typecast_uint32_to_uint16() {
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
+@@ -516,14 +516,7 @@ inline void calculate_typecast_uint32_to_uint16() {
 -    // Kept as a plain loop (no SFPLOADMACRO): #46231 rewrote this to shift the value right by 16
 -    // and saturate via SFPGT on the *high* bits before the swap-hi-lo16 store. The historical
 -    // macro tested the low 16 bits instead and computes a different result, so it is not
 -    // equivalent and is not restored here. See #46751.
 +    // Match ordinary integer narrowing by retaining the low 16 bits.
  #pragma GCC unroll 8
-@@ -524,7 +521,3 @@ inline void calculate_typecast_uint32_to_uint16() {
+     for (int d = 0; d < ITERATIONS; d++) {
          TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::INT32, ADDR_MOD_7, 0);
 -        TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG1, 0);
 -        TTI_SFPSHFT((-16) & 0xFFF, 0, p_sfpu::LREG0, 1);
@@ -18,18 +17,18 @@ diff --git a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_
 -        TTI_SFPSTORE(p_sfpu::LREG1, SFPSTORE_MODE_SWAP_HI_LO16, ADDR_MOD_6, 0);  // Swap hi and low 16 before write
 +        TTI_SFPSTORE(p_sfpu::LREG0, SFPSTORE_MODE_SWAP_HI_LO16, ADDR_MOD_6, 0);
      }
-diff --git a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h b/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
---- a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-+++ b/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-@@ -535,6 +535,3 @@ template <bool APPROXIMATION_MODE, int ITERATIONS>
- inline void calculate_typecast_uint32_to_uint16() {
+ }
+diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
+--- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
++++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
+@@ -534,16 +534,7 @@ inline void calculate_typecast_uint32_to_uint16() {
 -    // Kept as a plain loop (no SFPLOADMACRO): #46231 rewrote this to shift the value right by 16
 -    // and renormalize (2's-complement + shift + OR) before the swap-hi-lo16 store. The historical
 -    // macro used a LO16-load 2-macro pipeline on a different bit layout and computes a different
 -    // result, so it is not equivalent and is not restored here. See #46751.
 +    // Match ordinary integer narrowing by retaining the low 16 bits.
  #pragma GCC unroll 8
-@@ -542,9 +539,3 @@ inline void calculate_typecast_uint32_to_uint16() {
+     for (int d = 0; d < ITERATIONS; d++) {
          TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::INT32, ADDR_MOD_3, 0);
 -        TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG1, 0);
 -        TTI_SFPSHFT((-16) & 0xFFF, 0, p_sfpu::LREG0, 1);
@@ -40,3 +39,4 @@ diff --git a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfp
 -        TTI_SFPSTORE(p_sfpu::LREG1, SFPSTORE_MODE_SWAP_HI_LO16, ADDR_MOD_2, 0);
 +        TTI_SFPSTORE(p_sfpu::LREG0, SFPSTORE_MODE_SWAP_HI_LO16, ADDR_MOD_2, 0);
      }
+ }

@@ -1,7 +1,7 @@
 diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
 --- a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
 +++ b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
-@@ -83,3 +83,21 @@ void run(const ::tt::target::ttnn::EltwiseBinaryCompositeOp *op,
+@@ -88,3 +88,21 @@ void run(const ::tt::target::ttnn::EltwiseBinaryCompositeOp *op,
             const std::optional<::ttnn::MemoryConfig> &memCfg) {
 -          return ::ttnn::remainder(lhs, rhs, std::nullopt, memCfg);
 +          // StableHLO uses truncating remainder. For unsigned values floor and

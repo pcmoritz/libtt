@@ -1,6 +1,6 @@
-diff --git a/tt_metal/distributed/system_mesh.cpp b/tt_metal/distributed/system_mesh.cpp
---- a/tt_metal/distributed/system_mesh.cpp
-+++ b/tt_metal/distributed/system_mesh.cpp
+diff --git tt_metal/distributed/system_mesh.cpp tt_metal/distributed/system_mesh.cpp
+--- tt_metal/distributed/system_mesh.cpp
++++ tt_metal/distributed/system_mesh.cpp
 @@ -24,2 +24,3 @@
  
 +#include "llrt/tt_cluster.hpp"

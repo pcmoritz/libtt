@@ -39,7 +39,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implementation/src/api/compile_options_parser.cc
 --- a/pjrt_implementation/src/api/compile_options_parser.cc
 +++ b/pjrt_implementation/src/api/compile_options_parser.cc
-@@ -250,4 +250,12 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+@@ -214,4 +214,12 @@
                    google::protobuf::UnknownField::TYPE_VARINT) {
 +            uint64_t optimization_level = exec_field.varint();
 +            // XLA encodes O0, O1, and O2 as 9, 19, and 29.
@@ -56,10 +56,11 @@ diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implem
 diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
-@@ -220,3 +220,2 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+@@ -220,4 +220,3 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
      if (!r) {
 -      m_client_instance->closeMeshDevice();
        return tt_pjrt_status::kInternal;
+     }
 diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/loaded_executable_instance.cc

@@ -1,27 +1,60 @@
-diff --git a/tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h b/tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
---- a/tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
-+++ b/tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
-@@ -166,3 +166,5 @@ ALWI void typecast_tile(uint32_t idst) {
+diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
+--- tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
++++ tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
+@@ -164,14 +164,16 @@ ALWI void typecast_tile(uint32_t idst) {
+             (APPROX, 8 /* ITERATIONS */, DST_ACCUM_MODE),
+             idst,
              VectorMode::RC));
 -    } else if constexpr (in_format == DataFormat::UInt16 && out_format == DataFormat::Float32) {
 +    } else if constexpr (
 +        in_format == DataFormat::UInt16 &&
 +        (out_format == DataFormat::Float32 || out_format == DataFormat::Float16)) {
          MATH(SFPU_UNARY_CALL(
-@@ -247,3 +249,5 @@ ALWI void typecast_tile(uint32_t idst) {
+             DST_SYNC_MODE,
+             DST_ACCUM_MODE,
+             calculate_typecast_uint16_to_fp32,
+             (APPROX, 8 /* ITERATIONS */, DST_ACCUM_MODE),
+             idst,
+             VectorMode::RC));
+     } else if constexpr (in_format == DataFormat::Float32 && out_format == DataFormat::Int32) {
+         MATH(SFPU_UNARY_CALL(
+             DST_SYNC_MODE,
+@@ -245,14 +247,16 @@ ALWI void typecast_tile(uint32_t idst) {
+             (APPROX, 8 /* ITERATIONS */),
+             idst,
              VectorMode::RC));
 -    } else if constexpr (in_format == DataFormat::UInt32 && out_format == DataFormat::Float32) {
 +    } else if constexpr (
 +        in_format == DataFormat::UInt32 &&
 +        (out_format == DataFormat::Float32 || out_format == DataFormat::Float16)) {
          MATH(SFPU_UNARY_CALL(
-@@ -393,3 +397,5 @@ ALWI void typecast_tile(uint32_t idst) {
+             DST_SYNC_MODE,
+             DST_ACCUM_MODE,
+             calculate_typecast_uint32_to_fp32,
+             (APPROX, 8 /* ITERATIONS */),
+             idst,
+             VectorMode::RC));
+     } else if constexpr (in_format == DataFormat::Bfp8_b && out_format == DataFormat::UInt32) {
+         MATH(SFPU_UNARY_CALL(
+             DST_SYNC_MODE,
+@@ -391,14 +395,16 @@ ALWI void typecast_tile(uint32_t idst) {
+             (APPROX, 8 /* ITERATIONS */, (in_format == DataFormat::UInt16)),
+             idst,
              VectorMode::RC));
 -    } else if constexpr (in_format == DataFormat::UInt8 && out_format == DataFormat::Float32) {
 +    } else if constexpr (
 +        in_format == DataFormat::UInt8 &&
 +        (out_format == DataFormat::Float32 || out_format == DataFormat::Float16)) {
          MATH(SFPU_UNARY_CALL(
+             DST_SYNC_MODE,
+             DST_ACCUM_MODE,
+             calculate_typecast_uint32_to_fp32,
+             (APPROX, 8 /* ITERATIONS */),
+             idst,
+             VectorMode::RC));
+     } else if constexpr (
+         in_format == DataFormat::UInt8 &&
+         (out_format == DataFormat::Float16_b || out_format == DataFormat::Bfp8_b || out_format == DataFormat::Bfp4_b)) {
 @@ -423,2 +429,14 @@ ALWI void typecast_tile(uint32_t idst) {
      }
 +    if constexpr (
@@ -58,10 +91,11 @@ diff --git a/tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h b/tt_metal/hw/
 +        in_format == DataFormat::UInt8 &&
 +        (out_format == DataFormat::Float32 || out_format == DataFormat::Float16)) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint32_to_fp32, (APPROX)));
-diff --git a/ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp b/ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
---- a/ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
-+++ b/ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
-@@ -23,4 +23,10 @@ inline tt::DataFormat typecast_output_format(
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
+@@ -22,7 +22,13 @@ inline tt::DataFormat typecast_input_format(
+ inline tt::DataFormat typecast_output_format(
      tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
 -    return input_dtype == tt::tt_metal::DataType::FLOAT32 &&
 -                   (output_dtype == tt::tt_metal::DataType::FLOAT16 || output_dtype == tt::tt_metal::DataType::BFLOAT16)
@@ -74,9 +108,11 @@ diff --git a/ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_ty
 +        input_dtype == tt::tt_metal::DataType::FLOAT32 && output_dtype == tt::tt_metal::DataType::BFLOAT16;
 +    return exact_float16_output || exact_bfloat16_output
                 ? tt::DataFormat::UInt16
-diff --git a/ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp b/ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
---- a/ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-+++ b/ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+                : tt::tt_metal::datatype_to_dataformat_converter(output_dtype);
+ }
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 @@ -51,2 +51,3 @@ inline Tensor typecast_impl(
                              output_dtype == DataType::INT32 or output_dtype == DataType::FLOAT32 or
 +                            (input_dtype == DataType::UINT16 and output_dtype == DataType::FLOAT16) or

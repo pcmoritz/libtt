@@ -1,21 +1,33 @@
 diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implementation/src/api/compile_options_parser.cc
 --- a/pjrt_implementation/src/api/compile_options_parser.cc
 +++ b/pjrt_implementation/src/api/compile_options_parser.cc
-@@ -69,3 +69,3 @@ bool CompileOptionsParser::parseNestedProtobufField(
+@@ -67,7 +67,7 @@ bool CompileOptionsParser::parseNestedProtobufField(
+     return false;
+   }
  
 -  const std::string &data = field.length_delimited();
 +  auto data = field.length_delimited();
    google::protobuf::io::CodedInputStream input(
-@@ -94,3 +94,3 @@ void CompileOptionsParser::extractDeviceIdsFromComputationDevice(
+       reinterpret_cast<const uint8_t *>(data.data()), data.size());
+ 
+@@ -92,7 +92,7 @@ void CompileOptionsParser::extractDeviceIdsFromComputationDevice(
+     } else if (field.type() ==
+                google::protobuf::UnknownField::TYPE_LENGTH_DELIMITED) {
        // Packed repeated field
 -      const std::string &packed_data = field.length_delimited();
 +      auto packed_data = field.length_delimited();
        google::protobuf::io::CodedInputStream packed_stream(
-@@ -263,3 +263,3 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+           reinterpret_cast<const uint8_t *>(packed_data.data()),
+           packed_data.size());
+@@ -225,7 +225,7 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+       continue;
+     }
  
 -    const std::string &bytes = field.length_delimited();
 +    auto bytes = field.length_delimited();
      google::protobuf::io::CodedInputStream cis(
+         reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size());
+ 
 @@ -286,3 +286,4 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
                google::protobuf::UnknownField::TYPE_LENGTH_DELIMITED) {
 -        key = entry_field.length_delimited();

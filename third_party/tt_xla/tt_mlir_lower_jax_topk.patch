@@ -1,13 +1,13 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10308,3 +10308,3 @@ public:
+@@ -9549,3 +9549,3 @@ public:
      IntegerAttr dimAttr = IntegerAttr::get(rewriter.getIntegerType(32), -1);
 -    auto sortedAttr = BoolAttr::get(rewriter.getContext(), false);
 +    auto sortedAttr = BoolAttr::get(rewriter.getContext(), true);
- 
-@@ -10334,6 +10334,6 @@ public:
- 
+
+@@ -9575,6 +9575,6 @@ public:
+
 +    // mhlo.topk defaults largest to true and always returns ordered results.
      auto largestAttr = dictAttr.getAs<BoolAttr>("largest");
      if (!largestAttr) {
@@ -18,8 +18,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -1767,3 +1767,3 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
- 
+@@ -1656,3 +1656,3 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
+
 -// Input is forced to BFloat16 unless it is already BFloat16 or BFP_BFloat8.
 +// Float16 and unsupported 32-bit integers use Float32; other unsupported types use BFloat16.
  // Issue page: https://github.com/tenstorrent/tt-metal/issues/40086
@@ -28,7 +28,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 +  bool inputUsesFloat32 = inputDataType == ttcore::DataType::Float32 ||
 +                          inputElementType.isF16() || inputElementType.isInteger(32);
  
-@@ -1781,6 +1783,8 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
+@@ -1670,6 +1672,8 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
    if (!inputDataType || (*inputDataType != ttcore::DataType::BFloat16 &&
 -                         *inputDataType != ttcore::DataType::BFP_BFloat8)) {
 -    inputWorkaround.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;

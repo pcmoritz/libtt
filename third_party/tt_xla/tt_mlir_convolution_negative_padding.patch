@@ -74,11 +74,15 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        rewriter.getI32ArrayAttr(inputSliceEnds),
 +        rewriter.getI32ArrayAttr(inputSliceSteps));
  
-@@ -2763,3 +2755,3 @@ public:
+@@ -2943,7 +2935,7 @@ public:
+             mlir::RankedTensorType::get(
+                 {static_cast<int64_t>(numSpatialDims), 2},
                  rewriter.getI64Type()),
 -            adjustedPadding);
 +            clampedPadding);
- 
+
+     // Create StableHLO ConvDimensionNumbersAttr.
+     mlir::stablehlo::ConvDimensionNumbersAttr stablehloDimNums =
 @@ -2780,3 +2772,3 @@ public:
          mlir::stablehlo::ConvolutionOp::create(
 -            rewriter, srcOp.getLoc(), intermediateOutputType, adaptor.getLhs(),

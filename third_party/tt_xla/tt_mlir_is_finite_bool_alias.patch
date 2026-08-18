@@ -1,7 +1,9 @@
 diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
 --- a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
 +++ b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
-@@ -170,3 +170,18 @@ void run(const ::tt::target::ttnn::EltwiseUnaryOp *op,
+@@ -168,7 +168,22 @@ void run(const ::tt::target::ttnn::EltwiseUnaryOp *op,
+     break;
+   }
    case ::tt::target::ttnn::EltwiseUnaryOpType::IsFinite: {
 -    runEltwiseUnaryOp(op, tensorPool, ::ttnn::isfinite);
 +    runEltwiseUnaryOp(op, tensorPool, [](const ::ttnn::Tensor &input,
@@ -21,3 +23,5 @@ diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/t
 +                              memoryConfig, outputTensor, subCoreGrids);
 +    });
      break;
+   }
+   case ::tt::target::ttnn::EltwiseUnaryOpType::LogicalNot: {

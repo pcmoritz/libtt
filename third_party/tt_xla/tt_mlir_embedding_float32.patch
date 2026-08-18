@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -1063,3 +1063,5 @@ def TTNN_EmbeddingOp : TTNN_Op<"embedding"> {
+@@ -1010,3 +1010,5 @@ def TTNN_EmbeddingOp : TTNN_Op<"embedding"> {
        wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
 -        return wa::TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds();
 +        return wa::TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds(
@@ -28,14 +28,19 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 +// and supports bf16 and f32 weights. Other types are converted to bf16; the
 +// output uses the weight dtype.
  //
-@@ -149,4 +148,4 @@ TTNNOperandsWorkaroundsFactory::createPool2DWithIndicesOpOperandsWorkarounds() {
+@@ -147,8 +147,8 @@ TTNNOperandsWorkaroundsFactory::createPool2DWithIndicesOpOperandsWorkarounds() {
+ // Metal issue weight operand workaround:
+ // TBD
  TTNNOperandsWorkarounds
 -TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds() {
 -  // Create input and bf16 workarounds.
 +TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds(
 +    ttcore::DataType weightDtype) {
    TTNNOperandWorkarounds inputRowMajorInt32Workaround;
-@@ -157,8 +156,11 @@ TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds() {
+   inputRowMajorInt32Workaround.tensorLayoutWorkaround = Layout::RowMajor;
+   inputRowMajorInt32Workaround.tensorDataTypeWorkaround =
+@@ -156,11 +156,14 @@ TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds() {
+   TTNNOperandWorkarounds weightRowMajorBf16Workaround;
    weightRowMajorBf16Workaround.tensorLayoutWorkaround = Layout::RowMajor;
 -  weightRowMajorBf16Workaround.tensorDataTypeWorkaround =
 -      ttcore::DataType::BFloat16;
@@ -51,3 +56,5 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 +        ttcore::DataType::BFloat16;
 +  }
    return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds(0, 0)
+       .addInputOperandWorkaround(inputRowMajorInt32Workaround)
+       .addInputOperandWorkaround(weightRowMajorBf16Workaround)

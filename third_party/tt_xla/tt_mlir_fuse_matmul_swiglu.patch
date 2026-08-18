@@ -1,14 +1,22 @@
 diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/Target/TTNN/operations/matmul.fbs
+index 7966cee..accaf4a 100644
 --- a/include/ttmlir/Target/TTNN/operations/matmul.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/matmul.fbs
-@@ -72,2 +72,3 @@ table MatmulOp {
+@@ -70,6 +70,7 @@ table MatmulOp {
+   matmul_program_config: tt.target.ttnn.MatmulProgramConfig;
+   activation: string;
    compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
 +  fused_swiglu: bool = false;
  }
+ // ANCHOR_END: adding_an_op_matmul_fbs
+ 
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+index cb557b9..7b0eedd 100644
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -2830,2 +2830,9 @@ std::optional<int64_t> getMatmulInnerDim(::mlir::RankedTensorType inputA,
+@@ -2614,6 +2614,13 @@ std::optional<int64_t> getMatmulInnerDim(::mlir::RankedTensorType inputA,
+     expectedOutputShape.push_back(inputBShape[inputBShape.size() - 1]);
+   }
  
 +  if (getOperation()->hasAttr("ttnn.fused_swiglu")) {
 +    if (expectedOutputShape.empty() || expectedOutputShape.back() % 2 != 0) {
@@ -18,14 +26,23 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +  }
 +
    // Check the case of a vector-vector product. At this moment we don't support
+   // scalars in IR, hence check that the output is at least 1D tensor of size 1.
+   if (expectedOutputShape.size() == 0) {
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+index ac04b7e..3343a62 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -12,2 +12,3 @@
+@@ -8,6 +8,7 @@
+ #include "ttmlir/Utils.h"
+ 
  #include "llvm/ADT/SmallVector.h"
 +#include "llvm/Support/Error.h"
  
-@@ -178,2 +179,83 @@ private:
+ #ifdef TTMLIR_ENABLE_OPMODEL
+ #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
+@@ -174,6 +175,87 @@ private:
+   }
+ };
  
 +// Fold the decode MLP's concatenated [up | gate] projection and SwiGLU into a
 +// single half-width matmul.  The runtime implements this marker with a
@@ -109,23 +126,37 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +};
 +
  #ifdef TTMLIR_ENABLE_OPMODEL
-@@ -437,3 +519,3 @@ public:
+ 
+ // ============================================================================
+@@ -346,7 +428,7 @@ public:
+     RewritePatternSet patterns(&getContext());
+     // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
 -    patterns.add<
 +    patterns.add<TTNNMatmulWithSwiGLUEpilogue,
          TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
+         TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
+         TTNNMatmulAndLinearWithActivation<MatmulOp, SigmoidOp>,
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+index 8160ec9..6819e90 100644
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -575,3 +575,3 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
+@@ -562,7 +562,7 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
+   return ::tt::target::ttnn::CreateMatmulOp(
+       *cache.fbb, a, b, output, op.getTransposeA(), op.getTransposeB(),
        matmulProgramConfigType, matmulProgramConfigDesc, activation,
 -      computeConfig.value_or(0));
 +      computeConfig.value_or(0), op->hasAttr("ttnn.fused_swiglu"));
  }
+ // ANCHOR_END: adding_an_op_matmul_serialize_to_binary
+ 
 diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/operations/matmul/matmul.cpp
+index dfe05ba..f196225 100644
 --- a/runtime/lib/ttnn/operations/matmul/matmul.cpp
 +++ b/runtime/lib/ttnn/operations/matmul/matmul.cpp
-@@ -74,8 +74,14 @@ void run(const ::tt::target::ttnn::MatmulOp *op, ProgramContext &context) {
+@@ -72,12 +72,18 @@ void run(const ::tt::target::ttnn::MatmulOp *op, ProgramContext &context) {
+         utils::createDeviceComputeKernelConfig(op->compute_config());
+   }
  
 -  ::ttnn::Tensor output = ::ttnn::matmul(
 -      lhs, rhs, op->transpose_a(), op->transpose_b(), outputMemoryConfig,
@@ -146,3 +177,5 @@ diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/op
 +        /* optional_output_tensor=*/std::nullopt);
 +  }
  
+   tensorPool.insertTTNNTensorAndValidate(op->out(), output);
+ }

@@ -1,8 +1,8 @@
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+index b031b17f..f745ae3d 100644
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -8879,5 +8879,5 @@ static bool anyZero(mlir::ElementsAttr elems) {
- 
+@@ -8645,10 +8645,12 @@ mlir::OpFoldResult mlir::tt::ttir::LogicalNotOp::fold(FoldAdaptor adaptor) {
 -// Fold a self-comparison `x <cmp> x` (same SSA value): `eq` is all-true and
 -// `ne` is all-false. Note that for floating-point operands this assumes the
 -// value is not NaN (`NaN == NaN` is false, `NaN != NaN` is true).
@@ -10,10 +10,12 @@ diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 +// all-true and `ne` is all-false. Floating-point values may be NaN, so their
 +// self-comparisons cannot be folded.
  static mlir::OpFoldResult foldSelfComparison(mlir::Operation *op,
-@@ -8885,3 +8885,5 @@ static mlir::OpFoldResult foldSelfComparison(mlir::Operation *op,
+                                              mlir::Value lhs, mlir::Value rhs,
                                               bool foldToTrue) {
 -  if (lhs != rhs) {
 +  auto elementType =
 +      mlir::cast<mlir::ShapedType>(lhs.getType()).getElementType();
 +  if (lhs != rhs || !mlir::isa<mlir::IntegerType>(elementType)) {
      return nullptr;
+   }
+   auto resultType = mlir::cast<ShapedType>(op->getResult(0).getType());

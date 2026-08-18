@@ -1,6 +1,6 @@
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
 @@ -168,4 +168,4 @@ void kernel_main() {
                              pack_reconfig_data_format(dfb::input_tensor_transposed);
 -                            pack_tile<true>(tile_input_low, dfb::input_tensor_transposed, left_tile_id);
@@ -15,9 +15,9 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/
 +                            pack_tile<true>(index_dest_start, dfb::index_tensor_transposed, left_tile_id);
 +                            pack_tile<true>(index_dest_end, dfb::index_tensor_transposed, right_tile_id);
  
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
 @@ -244,8 +244,8 @@ void kernel_main() {
                          pack_reconfig_data_format(dfb::input_tensor_transposed);
 -                        pack_tile<true>(tile_input_low, dfb::input_tensor_transposed, left_tile_id);

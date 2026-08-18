@@ -1,9 +1,12 @@
 diff --git a/runtime/lib/common/utils.cpp b/runtime/lib/common/utils.cpp
 --- a/runtime/lib/common/utils.cpp
 +++ b/runtime/lib/common/utils.cpp
-@@ -294,2 +294,5 @@ void handleBufferCast(const void *oldBuffer, void *newBuffer,
+@@ -292,5 +292,8 @@ void handleBufferCast(const void *oldBuffer, void *newBuffer,
+                       target::DataType oldDataType,
                        target::DataType newDataType, int64_t numElements) {
 +  if (numElements == 0) {
 +    return;
 +  }
    if (!oldBuffer || !newBuffer) {
+     throw std::runtime_error("Buffer pointers must not be null");
+   }

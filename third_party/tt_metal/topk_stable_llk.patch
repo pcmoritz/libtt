@@ -1,7 +1,11 @@
-diff --git a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h b/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
---- a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
-+++ b/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
-@@ -16,6 +16,6 @@ namespace sfpu {
+# Port of tenstorrent/tt-llk#1340, with compile-time sort direction.
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
+index 9e82694..6e12da9 100644
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
+@@ -13,21 +13,27 @@ using namespace sfpi;
+ namespace ckernel {
+ namespace sfpu {
  
 -template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false>
 +template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false, bool DESCENDING = false>
@@ -10,7 +14,7 @@ diff --git a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_
 -    _bitonic_topk_phases_steps<APPROXIMATION_MODE, is_fp32_dest_acc_en, STABLE_SORT>(
 +    _bitonic_topk_phases_steps<APPROXIMATION_MODE, is_fp32_dest_acc_en, STABLE_SORT, DESCENDING>(
          idir, i_end_phase, i_start_phase, i_end_step, i_start_step);
-@@ -23,10 +23,16 @@ inline void calculate_bitonic_topk_phases_steps(
+ }
  
 -template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool idir = false, bool STABLE_SORT = false>
 +template <
@@ -31,10 +35,15 @@ diff --git a/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_
 +    _bitonic_topk_rebuild<APPROXIMATION_MODE, is_fp32_dest_acc_en, STABLE_SORT, DESCENDING>(
 +        idir, m_iter, k, logk, skip_second);
  }
-diff --git a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h b/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
---- a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
-+++ b/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
-@@ -16,6 +16,6 @@ namespace sfpu {
+ 
+ template <bool APPROXIMATION_MODE>
+diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
+index 9e82694..6e12da9 100644
+--- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
++++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
+@@ -13,21 +13,27 @@ using namespace sfpi;
+ namespace ckernel {
+ namespace sfpu {
  
 -template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false>
 +template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false, bool DESCENDING = false>
@@ -43,7 +52,7 @@ diff --git a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfp
 -    _bitonic_topk_phases_steps<APPROXIMATION_MODE, is_fp32_dest_acc_en, STABLE_SORT>(
 +    _bitonic_topk_phases_steps<APPROXIMATION_MODE, is_fp32_dest_acc_en, STABLE_SORT, DESCENDING>(
          idir, i_end_phase, i_start_phase, i_end_step, i_start_step);
-@@ -23,10 +23,16 @@ inline void calculate_bitonic_topk_phases_steps(
+ }
  
 -template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool idir = false, bool STABLE_SORT = false>
 +template <
@@ -64,10 +73,15 @@ diff --git a/tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfp
 +    _bitonic_topk_rebuild<APPROXIMATION_MODE, is_fp32_dest_acc_en, STABLE_SORT, DESCENDING>(
 +        idir, m_iter, k, logk, skip_second);
  }
-diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h b/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
---- a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
-+++ b/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
-@@ -140,3 +140,41 @@ inline void bitonic_topk_store16(std::uint32_t dist0, std::uint32_t dist1)
+ 
+ template <bool APPROXIMATION_MODE>
+diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
+index fbd2479..e7c19c8 100644
+--- tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
++++ tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
+@@ -138,7 +138,45 @@ inline void bitonic_topk_store16(std::uint32_t dist0, std::uint32_t dist1)
+     }
+ }
  
 -template <bool STABLE_SORT>
 +template <std::uint32_t VC, std::uint32_t VD, std::uint32_t MODE, bool DESCENDING>
@@ -110,7 +124,11 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +
 +template <bool STABLE_SORT, bool DESCENDING = false>
  inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_start)
-@@ -150,29 +188,22 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+ {
+     if (dir == static_cast<bool>(SortDir::ArgMin))
+@@ -148,33 +186,26 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+         TTI_SFPNOP;
+     }
  
 -    constexpr int replay_count = STABLE_SORT ? 9 : 5;
 -
@@ -159,7 +177,11 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +        constexpr int replay_count = 5;
 +        if (init_replay)
          {
-@@ -193,7 +224,8 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+             load_replay_buf<Exec>(
+                 replay_start,
+@@ -191,16 +222,15 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+ 
+                     TTI_SFPTRANSP(0, 0, 0, 0);
                  });
 +            init_replay = false;
 +        }
@@ -172,12 +194,16 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 -    else
 -    {
          lltt::replay(replay_start, replay_count);
-@@ -201,4 +233,2 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+     }
  
 -    lltt::replay(replay_start, replay_count);
 -
      if (dir == static_cast<bool>(SortDir::ArgMin))
-@@ -214,10 +244,8 @@ inline void bitonic_topk_ph2_st3_to_1();
+     {
+         TTI_SFPCONFIG(0x004, 0xF, 1); // Restore the max/min behaviour of SWAP
+@@ -212,28 +242,22 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+ template <bool STABLE_SORT>
+ inline void bitonic_topk_ph2_st3_to_1();
  
 -template <>
 -inline void bitonic_topk_ph2_st3_to_1<true>()
@@ -192,7 +218,8 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +    topk_cmp_swap_stable<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
 +    topk_cmp_swap_stable<p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
  
-@@ -226,12 +254,8 @@ inline void bitonic_topk_ph2_st3_to_1<true>()
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
      // Step 2
 -    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_01_MAX);
 -    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX); // Hides LREG0/2 NOP
@@ -210,14 +237,19 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +    topk_cmp_swap_stable<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_01_MAX, DESCENDING>();
 +    topk_cmp_swap_stable<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX, DESCENDING>();
  
-@@ -264,4 +288,4 @@ inline void bitonic_topk_ph1_st2_to_1();
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -262,22 +286,18 @@ inline void bitonic_topk_ph2_st3_to_1<false>()
+ template <bool STABLE_SORT>
+ inline void bitonic_topk_ph1_st2_to_1();
  
 -template <>
 -inline void bitonic_topk_ph1_st2_to_1<true>()
 +template <bool DESCENDING>
 +inline void bitonic_topk_ph1_st2_to_1_stable()
  {
-@@ -270,12 +294,8 @@ inline void bitonic_topk_ph1_st2_to_1<true>()
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
      // Step 2
 -    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_02_MAX);
 -    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX); // Hides LREG0/2 NOP
@@ -235,14 +267,19 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +    topk_cmp_swap_stable<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_02_MAX, DESCENDING>();
 +    topk_cmp_swap_stable<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX, DESCENDING>();
  
-@@ -303,4 +323,4 @@ inline void bitonic_topk_ph0_st1_to_1();
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -301,16 +321,14 @@ inline void bitonic_topk_ph1_st2_to_1<false>()
+ template <bool STABLE_SORT>
+ inline void bitonic_topk_ph0_st1_to_1();
  
 -template <>
 -inline void bitonic_topk_ph0_st1_to_1<true>()
 +template <bool DESCENDING>
 +inline void bitonic_topk_ph0_st1_to_1_stable()
  {
-@@ -309,6 +329,4 @@ inline void bitonic_topk_ph0_st1_to_1<true>()
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
      // Step 1
 -    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
 -    TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
@@ -251,14 +288,19 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +    topk_cmp_swap_stable<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
 +    topk_cmp_swap_stable<p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
  
-@@ -332,4 +350,4 @@ inline void bitonic_topk_step_N(bool dir);
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -330,23 +348,19 @@ inline void bitonic_topk_ph0_st1_to_1<false>()
+ template <bool STABLE_SORT>
+ inline void bitonic_topk_step_N(bool dir);
  
 -template <>
 -inline void bitonic_topk_step_N<true>(bool dir)
 +template <bool DESCENDING>
 +inline void bitonic_topk_step_N_stable(bool dir)
  {
-@@ -338,6 +356,4 @@ inline void bitonic_topk_step_N<true>(bool dir)
+     // Step N
+     if (dir == static_cast<bool>(SortDir::ArgMax))
      {
 -        TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX);
 -        TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
@@ -267,7 +309,7 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +        topk_cmp_swap_stable<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
 +        topk_cmp_swap_stable<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
      }
-@@ -345,6 +361,4 @@ inline void bitonic_topk_step_N<true>(bool dir)
+     else
      {
 -        TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX);
 -        TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
@@ -276,12 +318,20 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +        topk_cmp_swap_stable<p_sfpu::LREG2, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
 +        topk_cmp_swap_stable<p_sfpu::LREG3, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
      }
-@@ -407,3 +421,3 @@ inline void bitonic_topk_inc_x4_dest(std::uint32_t inc, bool cr)
+ }
+ 
+@@ -405,7 +419,7 @@ inline void bitonic_topk_inc_x4_dest(std::uint32_t inc, bool cr)
+     }
+ }
  
 -template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false>
 +template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false, bool DESCENDING = false>
  inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, const int i_start_phase, const int i_end_step, const int i_start_step)
-@@ -444,7 +458,5 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+ {
+     // If more than 1 phase is requested, do all the steps from all phases
+@@ -442,15 +456,22 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             {
+                                 lltt::replay(0, 8);
                              }
 -                            constexpr int replay_count = STABLE_SORT ? 6 : 4;
 -                            if (init_phase)
@@ -291,7 +341,7 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 -                                init_phase = false;
 +                                bitonic_topk_ph0_st1_to_1_stable<DESCENDING>();
                              }
-@@ -452,3 +464,12 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             else
                              {
 -                                lltt::replay(16, replay_count);
 +                                constexpr int replay_count = 4;
@@ -305,7 +355,11 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +                                    lltt::replay(16, replay_count);
 +                                }
                              }
-@@ -470,7 +491,5 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             if (init_store)
+                             {
+@@ -468,15 +489,22 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         for (int d = 0; d < 4; d++)
+                         {
                              lltt::replay(0, 8);
 -                            constexpr int replay_count = STABLE_SORT ? 10 : 6;
 -                            if (init_phase)
@@ -315,7 +369,7 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 -                                init_phase = false;
 +                                bitonic_topk_ph1_st2_to_1_stable<DESCENDING>();
                              }
-@@ -478,3 +497,12 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             else
                              {
 -                                lltt::replay(16, replay_count);
 +                                constexpr int replay_count = 6;
@@ -329,7 +383,11 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +                                    lltt::replay(16, replay_count);
 +                                }
                              }
-@@ -487,7 +515,5 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             lltt::replay(8, 8);
+                         }
+@@ -485,15 +513,22 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         for (int d = 0; d < 4; d++)
+                         {
                              lltt::replay(0, 8);
 -                            constexpr int replay_count = STABLE_SORT ? 14 : 9;
 -                            if (init_phase)
@@ -339,7 +397,7 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 -                                init_phase = false;
 +                                bitonic_topk_ph2_st3_to_1_stable<DESCENDING>();
                              }
-@@ -495,3 +521,12 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             else
                              {
 -                                lltt::replay(16, replay_count);
 +                                constexpr int replay_count = 9;
@@ -353,12 +411,20 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +                                    lltt::replay(16, replay_count);
 +                                }
                              }
-@@ -504,3 +539,3 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             lltt::replay(8, 8);
+                         }
+@@ -502,7 +537,7 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         for (int d = 0; d < 4; d++)
+                         {
                              lltt::replay(0, 8);
 -                            bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_phase, 16);
 +                            bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_phase, 16);
                              lltt::replay(8, 8);
-@@ -530,3 +565,10 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             dir = !dir;
+                         }
+@@ -528,7 +563,14 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                                 for (std::uint32_t ii = 0; ii < inner_d; ii++)
+                                 {
                                      bitonic_topk_load16<is_fp32_dest_acc_en>(4, 2 * dist); // load/store with offset of face 1 (in row major face layout)
 -                                    bitonic_topk_step_N<STABLE_SORT>(dir);
 +                                    if constexpr (STABLE_SORT)
@@ -370,13 +436,18 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +                                        bitonic_topk_step_N<STABLE_SORT>(dir);
 +                                    }
                                      bitonic_topk_store16<is_fp32_dest_acc_en, false>(
-@@ -560,3 +602,3 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                                         4, 2 * dist); // load/store with offset of face 1 (in row major face layout)
+                                     std::uint32_t dst_inc = 8;
+@@ -558,7 +600,7 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         while (datums_compared < total_datums_to_compare)
+                         {
                              lltt::replay(0, 8);
 -                            bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_phase, 16);
 +                            bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_phase, 16);
                              lltt::replay(8, 8);
-@@ -576,3 +618,10 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
- 
+                             datums_compared += 16;
+                             dir = (datums_compared == sorted_seq_length) ? !dir : dir;
+@@ -577 +619,8 @@
 -template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool top_min, bool STABLE_SORT = false>
 +// top_min selects this merge stage's value comparator; DESCENDING selects
 +// the stable tie-break direction for the complete sort.
@@ -386,8 +457,9 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +    bool top_min,
 +    bool STABLE_SORT,
 +    bool DESCENDING>
- inline void _bitonic_topk_merge(const int m_iter, const int k)
-@@ -601,6 +650,15 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
+@@ -599,10 +648,19 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
+                 for (std::uint32_t ii = 0; ii < inner_d; ii++)
+                 {
                      bitonic_topk_load8<is_fp32_dest_acc_en>(dst_offset, ld_dist);
 -                    TTI_SFPSWAP(0, top_min ? p_sfpu::LREG1 : p_sfpu::LREG0, top_min ? p_sfpu::LREG0 : p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
                      if constexpr (STABLE_SORT)
@@ -405,42 +477,74 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +                    else
 +                    {
                          TTI_SFPSWAP(0, top_min ? p_sfpu::LREG1 : p_sfpu::LREG0, top_min ? p_sfpu::LREG0 : p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
-@@ -628,3 +686,3 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
+                     }
+                     bitonic_topk_store8<is_fp32_dest_acc_en>(dst_offset, ld_dist);
+@@ -626,7 +684,7 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
+     }
+ }
  
 -template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false>
 +template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false, bool DESCENDING = false>
  inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k, const int logk, const int skip_second)
-@@ -666,3 +724,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+ {
+     // init replay buffer for rebuild iteration 'm_iter' if uninitialized
+@@ -664,7 +722,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             if constexpr (STABLE_SORT)
+                             {
                                  bitonic_topk_load8<is_fp32_dest_acc_en>(0, ld_offset);
 -                                bitonic_topk_ph1_st2_to_1<STABLE_SORT>();
 +                                bitonic_topk_ph1_st2_to_1_stable<DESCENDING>();
                                  bitonic_topk_store8<is_fp32_dest_acc_en>(0, ld_offset);
-@@ -703,3 +761,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                                 bitonic_topk_inc_x8_dest(64, false);
+                             }
+@@ -701,7 +759,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             if constexpr (STABLE_SORT)
+                             {
                                  bitonic_topk_load16<is_fp32_dest_acc_en>(ld_offset, ld_dist);
 -                                bitonic_topk_ph1_st2_to_1<STABLE_SORT>();
 +                                bitonic_topk_ph1_st2_to_1_stable<DESCENDING>();
                                  bitonic_topk_store16<is_fp32_dest_acc_en, true>(ld_offset, ld_dist);
-@@ -745,3 +803,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                                 TTI_INCRWC(0, 8, 0, 0);
+                                 TTI_INCRWC(0, 8, 0, 0);
+@@ -743,7 +801,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                         if constexpr (STABLE_SORT)
+                         {
                              bitonic_topk_load16<is_fp32_dest_acc_en>(4, ld_offset);
 -                            bitonic_topk_ph2_st3_to_1<STABLE_SORT>();
 +                            bitonic_topk_ph2_st3_to_1_stable<DESCENDING>();
                              bitonic_topk_store16<is_fp32_dest_acc_en, true>(4, ld_offset);
-@@ -786,3 +844,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             TTI_INCRWC(0, 8, 0, 0);
+                             TTI_INCRWC(0, 8, 0, 0);
+@@ -784,7 +842,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                         if constexpr (STABLE_SORT)
+                         {
                              bitonic_topk_load16<is_fp32_dest_acc_en>(4, 8);
 -                            bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_rebuild, 8);
 +                            bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_rebuild, 8);
                              bitonic_topk_store16<is_fp32_dest_acc_en, true>(4, 8);
-@@ -799,3 +857,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             TTI_INCRWC(0, 8, 0, 0);
+                             TTI_INCRWC(0, 8, 0, 0);
+@@ -797,7 +855,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             if (init_rebuild)
+                             {
                                  load_replay_buf<Exec>(0, 8, [] { bitonic_topk_load16<is_fp32_dest_acc_en>(4, 8); });
 -                                bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_rebuild, 8);
 +                                bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_rebuild, 8);
                                  load_replay_buf<Exec>(
-@@ -815,3 +873,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                                     13,
+                                     12,
+@@ -813,7 +871,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             else
+                             {
                                  lltt::replay(0, 8);
 -                                bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_rebuild, 8);
 +                                bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_rebuild, 8);
                                  lltt::replay(13, 12);
-@@ -843,3 +901,10 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             }
+                         }
+@@ -841,7 +899,14 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             for (std::uint32_t ii = 0; ii < inner_d; ii++)
+                             {
                                  bitonic_topk_load16<is_fp32_dest_acc_en>(4, 2 * dist); // load/store with offset of face 1 (in row major face layout)
 -                                bitonic_topk_step_N<STABLE_SORT>(dir);
 +                                if constexpr (STABLE_SORT)
@@ -452,20 +556,31 @@ diff --git a/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.
 +                                    bitonic_topk_step_N<STABLE_SORT>(dir);
 +                                }
                                  bitonic_topk_store16<is_fp32_dest_acc_en, false>(4, 2 * dist); // load/store with offset of face 1 (in row major face layout)
-@@ -874,3 +939,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                                 std::uint32_t dst_inc = 8;
+                                 dst_offset += dst_inc;
+@@ -872,13 +937,13 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                         if (init_rebuild)
+                         {
                              load_replay_buf<Exec>(0, 8, [] { bitonic_topk_load16<is_fp32_dest_acc_en>(4, 8); });
 -                            bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_rebuild, 8);
 +                            bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_rebuild, 8);
                              load_replay_buf<Exec>(17, 8, [] { bitonic_topk_store16<is_fp32_dest_acc_en, true>(4, 8); });
-@@ -880,3 +945,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                         }
+                         else
+                         {
                              lltt::replay(0, 8);
 -                            bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_rebuild, 8);
 +                            bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_rebuild, 8);
                              lltt::replay(17, 8);
-diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h b/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
---- a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
-+++ b/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
-@@ -140,3 +140,41 @@ inline void bitonic_topk_store16(std::uint32_t dist0, std::uint32_t dist1)
+                         }
+                         datums_compared += 16;
+diff --git tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
+index c8cfe4a..cd9fcf4 100644
+--- tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
++++ tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
+@@ -138,7 +138,45 @@ inline void bitonic_topk_store16(std::uint32_t dist0, std::uint32_t dist1)
+     }
+ }
  
 -template <bool STABLE_SORT>
 +template <std::uint32_t VC, std::uint32_t VD, std::uint32_t MODE, bool DESCENDING>
@@ -508,7 +623,11 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +
 +template <bool STABLE_SORT, bool DESCENDING = false>
  inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_start)
-@@ -150,24 +188,25 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+ {
+     if (dir == static_cast<bool>(SortDir::ArgMin))
+@@ -148,28 +186,29 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+         TTI_SFPNOP;
+     }
  
 -    constexpr int replay_count = STABLE_SORT ? 9 : 5;
 -
@@ -552,7 +671,11 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 -        else
 -        {
              // Step 4
-@@ -179,10 +218,11 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+             TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX);
+             TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX);
+@@ -177,19 +216,18 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+             // Step 3
+             TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
              TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX);
 -        }
  
@@ -570,12 +693,16 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +            lltt::replay(replay_start, replay_count);
 +        }
          lltt::replay(replay_start, replay_count);
-@@ -190,4 +230,2 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+     }
  
 -    lltt::replay(replay_start, replay_count);
 -
      if (dir == static_cast<bool>(SortDir::ArgMin))
-@@ -203,10 +241,8 @@ inline void bitonic_topk_ph2_st3_to_1();
+     {
+         TTI_SFPCONFIG(0x004, 0xF, 1); // Restore the max/min behaviour of SWAP
+@@ -201,28 +239,22 @@ inline void bitonic_topk_ph3_st4_to_1(bool dir, bool &init_replay, int replay_st
+ template <bool STABLE_SORT>
+ inline void bitonic_topk_ph2_st3_to_1();
  
 -template <>
 -inline void bitonic_topk_ph2_st3_to_1<true>()
@@ -590,7 +717,8 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +    topk_cmp_swap_stable<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
 +    topk_cmp_swap_stable<p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
  
-@@ -215,12 +251,8 @@ inline void bitonic_topk_ph2_st3_to_1<true>()
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
      // Step 2
 -    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_01_MAX);
 -    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX); // Hides LREG0/2 NOP
@@ -608,14 +736,19 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +    topk_cmp_swap_stable<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_01_MAX, DESCENDING>();
 +    topk_cmp_swap_stable<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_01_MAX, DESCENDING>();
  
-@@ -253,4 +285,4 @@ inline void bitonic_topk_ph1_st2_to_1();
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -251,22 +283,18 @@ inline void bitonic_topk_ph2_st3_to_1<false>()
+ template <bool STABLE_SORT>
+ inline void bitonic_topk_ph1_st2_to_1();
  
 -template <>
 -inline void bitonic_topk_ph1_st2_to_1<true>()
 +template <bool DESCENDING>
 +inline void bitonic_topk_ph1_st2_to_1_stable()
  {
-@@ -259,12 +291,8 @@ inline void bitonic_topk_ph1_st2_to_1<true>()
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
      // Step 2
 -    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ROWS_02_MAX);
 -    TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX); // Hides LREG0/2 NOP
@@ -633,14 +766,19 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +    topk_cmp_swap_stable<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ROWS_02_MAX, DESCENDING>();
 +    topk_cmp_swap_stable<p_sfpu::LREG2, p_sfpu::LREG3, p_sfpswap::ROWS_02_MAX, DESCENDING>();
  
-@@ -292,4 +320,4 @@ inline void bitonic_topk_ph0_st1_to_1();
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -290,16 +318,14 @@ inline void bitonic_topk_ph1_st2_to_1<false>()
+ template <bool STABLE_SORT>
+ inline void bitonic_topk_ph0_st1_to_1();
  
 -template <>
 -inline void bitonic_topk_ph0_st1_to_1<true>()
 +template <bool DESCENDING>
 +inline void bitonic_topk_ph0_st1_to_1_stable()
  {
-@@ -298,6 +326,4 @@ inline void bitonic_topk_ph0_st1_to_1<true>()
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ 
      // Step 1
 -    TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
 -    TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/1 NOP
@@ -649,14 +787,19 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +    topk_cmp_swap_stable<p_sfpu::LREG0, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
 +    topk_cmp_swap_stable<p_sfpu::LREG3, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
  
-@@ -321,4 +347,4 @@ inline void bitonic_topk_step_N(bool dir);
+     TTI_SFPTRANSP(0, 0, 0, 0);
+ }
+@@ -319,23 +345,19 @@ inline void bitonic_topk_ph0_st1_to_1<false>()
+ template <bool STABLE_SORT>
+ inline void bitonic_topk_step_N(bool dir);
  
 -template <>
 -inline void bitonic_topk_step_N<true>(bool dir)
 +template <bool DESCENDING>
 +inline void bitonic_topk_step_N_stable(bool dir)
  {
-@@ -327,6 +353,4 @@ inline void bitonic_topk_step_N<true>(bool dir)
+     // Step N
+     if (dir == static_cast<bool>(SortDir::ArgMax))
      {
 -        TTI_SFPSWAP(0, p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX);
 -        TTI_SFPSWAP(0, p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
@@ -665,7 +808,7 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +        topk_cmp_swap_stable<p_sfpu::LREG0, p_sfpu::LREG2, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
 +        topk_cmp_swap_stable<p_sfpu::LREG1, p_sfpu::LREG3, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
      }
-@@ -334,6 +358,4 @@ inline void bitonic_topk_step_N<true>(bool dir)
+     else
      {
 -        TTI_SFPSWAP(0, p_sfpu::LREG2, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX);
 -        TTI_SFPSWAP(0, p_sfpu::LREG3, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX); // Hides LREG0/2 NOP
@@ -674,12 +817,20 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +        topk_cmp_swap_stable<p_sfpu::LREG2, p_sfpu::LREG0, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
 +        topk_cmp_swap_stable<p_sfpu::LREG3, p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX, DESCENDING>();
      }
-@@ -396,3 +418,3 @@ inline void bitonic_topk_inc_x4_dest(std::uint32_t inc, bool cr)
+ }
+ 
+@@ -394,7 +416,7 @@ inline void bitonic_topk_inc_x4_dest(std::uint32_t inc, bool cr)
+     }
+ }
  
 -template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false>
 +template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false, bool DESCENDING = false>
  inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, const int i_start_phase, const int i_end_step, const int i_start_step)
-@@ -434,8 +456,5 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+ {
+     // If more than 1 phase is requested, do all the steps from all phases
+@@ -432,16 +454,23 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             {
+                                 lltt::replay(0, 8);
                              }
 -                            constexpr int replay_count = STABLE_SORT ? 6 : 4;
 -                            if (init_phase)
@@ -690,7 +841,7 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 -                                init_phase = false;
 +                                bitonic_topk_ph0_st1_to_1_stable<DESCENDING>();
                              }
-@@ -443,3 +462,13 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             else
                              {
 -                                lltt::replay(16, replay_count);
 +                                constexpr int replay_count = 4;
@@ -705,7 +856,11 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +                                    lltt::replay(16, replay_count);
 +                                }
                              }
-@@ -462,8 +491,5 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             if (init_store)
+                             {
+@@ -460,16 +489,23 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         {
+                             // Groups of 16 datums being sorted at the same time
                              lltt::replay(0, 8);
 -                            constexpr int replay_count = STABLE_SORT ? 10 : 6;
 -                            if (init_phase)
@@ -716,7 +871,7 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 -                                init_phase = false;
 +                                bitonic_topk_ph1_st2_to_1_stable<DESCENDING>();
                              }
-@@ -471,3 +497,13 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             else
                              {
 -                                lltt::replay(16, replay_count);
 +                                constexpr int replay_count = 6;
@@ -731,7 +886,11 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +                                    lltt::replay(16, replay_count);
 +                                }
                              }
-@@ -480,8 +516,5 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             lltt::replay(8, 8);
+                         }
+@@ -478,16 +514,23 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         for (int d = 0; d < 4; d++)
+                         {
                              lltt::replay(0, 8);
 -                            constexpr int replay_count = STABLE_SORT ? 14 : 9;
 -                            if (init_phase)
@@ -742,7 +901,7 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 -                                init_phase = false;
 +                                bitonic_topk_ph2_st3_to_1_stable<DESCENDING>();
                              }
-@@ -489,3 +522,13 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             else
                              {
 -                                lltt::replay(16, replay_count);
 +                                constexpr int replay_count = 9;
@@ -757,12 +916,20 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +                                    lltt::replay(16, replay_count);
 +                                }
                              }
-@@ -498,3 +541,3 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             lltt::replay(8, 8);
+                         }
+@@ -496,7 +539,7 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         for (int d = 0; d < 4; d++)
+                         {
                              lltt::replay(0, 8);
 -                            bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_phase, 16);
 +                            bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_phase, 16);
                              lltt::replay(8, 8);
-@@ -524,3 +567,10 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                             dir = !dir;
+                         }
+@@ -522,7 +565,14 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                                 for (std::uint32_t ii = 0; ii < inner_d; ii++)
+                                 {
                                      bitonic_topk_load16<is_fp32_dest_acc_en>(4, 2 * dist); // load/store with offset of face 1 (in row major face layout)
 -                                    bitonic_topk_step_N<STABLE_SORT>(dir);
 +                                    if constexpr (STABLE_SORT)
@@ -774,13 +941,18 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +                                        bitonic_topk_step_N<STABLE_SORT>(dir);
 +                                    }
                                      bitonic_topk_store16<is_fp32_dest_acc_en, false>(
-@@ -554,3 +604,3 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                                         4, 2 * dist); // load/store with offset of face 1 (in row major face layout)
+                                     std::uint32_t dst_inc = 8;
+@@ -552,7 +602,7 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
+                         while (datums_compared < total_datums_to_compare)
+                         {
                              lltt::replay(0, 8);
 -                            bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_phase, 16);
 +                            bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_phase, 16);
                              lltt::replay(8, 8);
-@@ -570,3 +620,10 @@ inline void _bitonic_topk_phases_steps(const int idir, const int i_end_phase, co
- 
+                             datums_compared += 16;
+                             dir = (datums_compared == sorted_seq_length) ? !dir : dir;
+@@ -571 +621,8 @@
 -template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool top_min, bool STABLE_SORT = false>
 +// top_min selects this merge stage's value comparator; DESCENDING selects
 +// the stable tie-break direction for the complete sort.
@@ -790,8 +962,9 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +    bool top_min,
 +    bool STABLE_SORT,
 +    bool DESCENDING>
- inline void _bitonic_topk_merge(const int m_iter, const int k)
-@@ -595,6 +652,15 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
+@@ -593,10 +650,19 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
+                 for (std::uint32_t ii = 0; ii < inner_d; ii++)
+                 {
                      bitonic_topk_load8<is_fp32_dest_acc_en>(dst_offset, ld_dist);
 -                    TTI_SFPSWAP(0, top_min ? p_sfpu::LREG1 : p_sfpu::LREG0, top_min ? p_sfpu::LREG0 : p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
                      if constexpr (STABLE_SORT)
@@ -809,42 +982,74 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +                    else
 +                    {
                          TTI_SFPSWAP(0, top_min ? p_sfpu::LREG1 : p_sfpu::LREG0, top_min ? p_sfpu::LREG0 : p_sfpu::LREG1, p_sfpswap::ALL_ROWS_MAX);
-@@ -622,3 +688,3 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
+                     }
+                     bitonic_topk_store8<is_fp32_dest_acc_en>(dst_offset, ld_dist);
+@@ -620,7 +686,7 @@ inline void _bitonic_topk_merge(const int m_iter, const int k)
+     }
+ }
  
 -template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false>
 +template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool STABLE_SORT = false, bool DESCENDING = false>
  inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k, const int logk, const int skip_second)
-@@ -659,3 +725,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+ {
+     // init replay buffer for rebuild iteration 'm_iter' if uninitialized
+@@ -657,7 +723,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             if constexpr (STABLE_SORT)
+                             {
                                  bitonic_topk_load8<is_fp32_dest_acc_en>(0, ld_offset);
 -                                bitonic_topk_ph1_st2_to_1<STABLE_SORT>();
 +                                bitonic_topk_ph1_st2_to_1_stable<DESCENDING>();
                                  bitonic_topk_store8<is_fp32_dest_acc_en>(0, ld_offset);
-@@ -692,3 +758,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                                 bitonic_topk_inc_x8_dest(64, false);
+                             }
+@@ -690,7 +756,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             if constexpr (STABLE_SORT)
+                             {
                                  bitonic_topk_load16<is_fp32_dest_acc_en>(ld_offset, ld_dist);
 -                                bitonic_topk_ph1_st2_to_1<STABLE_SORT>();
 +                                bitonic_topk_ph1_st2_to_1_stable<DESCENDING>();
                                  bitonic_topk_store16<is_fp32_dest_acc_en, true>(ld_offset, ld_dist);
-@@ -729,3 +795,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                                 TTI_INCRWC(0, 8, 0, 0);
+                                 TTI_INCRWC(0, 8, 0, 0);
+@@ -727,7 +793,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                         if constexpr (STABLE_SORT)
+                         {
                              bitonic_topk_load16<is_fp32_dest_acc_en>(4, ld_offset);
 -                            bitonic_topk_ph2_st3_to_1<STABLE_SORT>();
 +                            bitonic_topk_ph2_st3_to_1_stable<DESCENDING>();
                              bitonic_topk_store16<is_fp32_dest_acc_en, true>(4, ld_offset);
-@@ -765,3 +831,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             TTI_INCRWC(0, 8, 0, 0);
+                             TTI_INCRWC(0, 8, 0, 0);
+@@ -763,7 +829,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                         if constexpr (STABLE_SORT)
+                         {
                              bitonic_topk_load16<is_fp32_dest_acc_en>(4, 8);
 -                            bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_rebuild, 8);
 +                            bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_rebuild, 8);
                              bitonic_topk_store16<is_fp32_dest_acc_en, true>(4, 8);
-@@ -779,3 +845,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             TTI_INCRWC(0, 8, 0, 0);
+                             TTI_INCRWC(0, 8, 0, 0);
+@@ -777,7 +843,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             {
+                                 lltt::record<lltt::Exec>(0, 8);
                                  bitonic_topk_load16<is_fp32_dest_acc_en>(4, 8);
 -                                bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_rebuild, 8);
 +                                bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_rebuild, 8);
                                  lltt::record<lltt::Exec>(13, 12);
-@@ -790,3 +856,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                                 bitonic_topk_store16<is_fp32_dest_acc_en, true>(4, 8);
+                                 TTI_INCRWC(0, 8, 0, 0);
+@@ -788,7 +854,7 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             else
+                             {
                                  lltt::replay(0, 8);
 -                                bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_rebuild, 8);
 +                                bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_rebuild, 8);
                                  lltt::replay(13, 12);
-@@ -818,3 +884,10 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             }
+                         }
+@@ -816,7 +882,14 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             for (std::uint32_t ii = 0; ii < inner_d; ii++)
+                             {
                                  bitonic_topk_load16<is_fp32_dest_acc_en>(4, 2 * dist); // load/store with offset of face 1 (in row major face layout)
 -                                bitonic_topk_step_N<STABLE_SORT>(dir);
 +                                if constexpr (STABLE_SORT)
@@ -856,13 +1061,22 @@ diff --git a/tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_top
 +                                    bitonic_topk_step_N<STABLE_SORT>(dir);
 +                                }
                                  bitonic_topk_store16<is_fp32_dest_acc_en, false>(4, 2 * dist); // load/store with offset of face 1 (in row major face layout)
-@@ -850,3 +923,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                                 std::uint32_t dst_inc = 8;
+                                 dst_offset += dst_inc;
+@@ -848,14 +921,14 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                         {
+                             lltt::record<lltt::Exec>(0, 8);
                              bitonic_topk_load16<is_fp32_dest_acc_en>(4, 8);
 -                            bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_rebuild, 8);
 +                            bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_rebuild, 8);
                              lltt::record<lltt::Exec>(17, 8);
-@@ -857,3 +930,3 @@ inline void _bitonic_topk_rebuild(const bool idir, const int m_iter, const int k
+                             bitonic_topk_store16<is_fp32_dest_acc_en, true>(4, 8);
+                         }
+                         else
+                         {
                              lltt::replay(0, 8);
 -                            bitonic_topk_ph3_st4_to_1<STABLE_SORT>(dir, init_rebuild, 8);
 +                            bitonic_topk_ph3_st4_to_1<STABLE_SORT, DESCENDING>(dir, init_rebuild, 8);
                              lltt::replay(17, 8);
+                         }
+                         datums_compared += 16;

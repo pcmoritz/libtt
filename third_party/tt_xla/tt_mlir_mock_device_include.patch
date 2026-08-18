@@ -1,8 +1,7 @@
 diff --git a/lib/OpModel/TTNN/SingletonDeviceContext.cpp b/lib/OpModel/TTNN/SingletonDeviceContext.cpp
+index 0319661..577d79a 100644
 --- a/lib/OpModel/TTNN/SingletonDeviceContext.cpp
 +++ b/lib/OpModel/TTNN/SingletonDeviceContext.cpp
-@@ -16,3 +16,3 @@
- #include <tt-metalium/experimental/context/metal_env.hpp>
+@@ -17 +17 @@
 -#include <tt-metalium/experimental/mock_device.hpp>
 +#include <tt-metalium/experimental/mock_device/mock_device.hpp>
- 

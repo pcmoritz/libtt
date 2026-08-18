@@ -1,6 +1,6 @@
-diff --git a/tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp b/tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
---- a/tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
-+++ b/tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
+diff --git tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
+--- tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
++++ tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
 @@ -95,5 +95,5 @@ auto dispatch(DataType dtype, Func&& func, Args&&... args) {
          case DataType::FLOAT32:
 +            return (std::forward<Func>(func)).template operator()<float>(std::forward<Args>(args)...);
@@ -8,9 +8,9 @@ diff --git a/tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp b
              return (std::forward<Func>(func)).template operator()<float16>(std::forward<Args>(args)...);
 -            return (std::forward<Func>(func)).template operator()<float>(std::forward<Args>(args)...);
          case DataType::INT32:
-diff --git a/tt_metal/impl/data_format/bfloat4.cpp b/tt_metal/impl/data_format/bfloat4.cpp
---- a/tt_metal/impl/data_format/bfloat4.cpp
-+++ b/tt_metal/impl/data_format/bfloat4.cpp
+diff --git tt_metal/impl/data_format/bfloat4.cpp tt_metal/impl/data_format/bfloat4.cpp
+--- tt_metal/impl/data_format/bfloat4.cpp
++++ tt_metal/impl/data_format/bfloat4.cpp
 @@ -6,2 +6,3 @@
  #include <tt-metalium/bfloat4.hpp>
 +#include <tt-metalium/experimental/tensor/tensor_types.hpp>
@@ -23,9 +23,9 @@ diff --git a/tt_metal/impl/data_format/bfloat4.cpp b/tt_metal/impl/data_format/b
 +    bool is_exp_a,
 +    const std::optional<tt::tt_metal::Tile>& tile);
  template std::vector<uint32_t> pack_as_bfp4_tiles<float>(
-diff --git a/tt_metal/impl/data_format/bfloat8.cpp b/tt_metal/impl/data_format/bfloat8.cpp
---- a/tt_metal/impl/data_format/bfloat8.cpp
-+++ b/tt_metal/impl/data_format/bfloat8.cpp
+diff --git tt_metal/impl/data_format/bfloat8.cpp tt_metal/impl/data_format/bfloat8.cpp
+--- tt_metal/impl/data_format/bfloat8.cpp
++++ tt_metal/impl/data_format/bfloat8.cpp
 @@ -5,2 +5,3 @@
  #include <tt-metalium/bfloat8.hpp>
 +#include <tt-metalium/experimental/tensor/tensor_types.hpp>
@@ -38,9 +38,9 @@ diff --git a/tt_metal/impl/data_format/bfloat8.cpp b/tt_metal/impl/data_format/b
 +    bool is_exp_a,
 +    const std::optional<tt::tt_metal::Tile>& tile);
  template std::vector<uint32_t> pack_as_bfp8_tiles<float>(
-diff --git a/tt_metal/impl/data_format/blockfloat_common.cpp b/tt_metal/impl/data_format/blockfloat_common.cpp
---- a/tt_metal/impl/data_format/blockfloat_common.cpp
-+++ b/tt_metal/impl/data_format/blockfloat_common.cpp
+diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_format/blockfloat_common.cpp
+--- tt_metal/impl/data_format/blockfloat_common.cpp
++++ tt_metal/impl/data_format/blockfloat_common.cpp
 @@ -13,2 +13,3 @@
  #include <tt-metalium/bfloat16.hpp>
 +#include <tt-metalium/experimental/tensor/tensor_types.hpp>
@@ -51,9 +51,9 @@ diff --git a/tt_metal/impl/data_format/blockfloat_common.cpp b/tt_metal/impl/dat
 +template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const tt::tt_metal::float16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
 +
  template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const int32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
-diff --git a/tt_metal/impl/tensor/host_tensor_factory.cpp b/tt_metal/impl/tensor/host_tensor_factory.cpp
---- a/tt_metal/impl/tensor/host_tensor_factory.cpp
-+++ b/tt_metal/impl/tensor/host_tensor_factory.cpp
+diff --git tt_metal/impl/tensor/host_tensor_factory.cpp tt_metal/impl/tensor/host_tensor_factory.cpp
+--- tt_metal/impl/tensor/host_tensor_factory.cpp
++++ tt_metal/impl/tensor/host_tensor_factory.cpp
 @@ -69,3 +69,3 @@ template <typename T>
  HostTensor HostTensor::from_span(std::span<const T> buffer, const TensorSpec& spec) {
 -    return host_tensor_from_span_with_pad_value(buffer, spec, T{0});
@@ -69,17 +69,17 @@ diff --git a/tt_metal/impl/tensor/host_tensor_factory.cpp b/tt_metal/impl/tensor
 -    return host_tensor_from_vector_with_pad_value(std::move(buffer), spec, T{0});
 +    return host_tensor_from_vector_with_pad_value(std::move(buffer), spec, T{});
  }
-diff --git a/tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp b/tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
---- a/tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
-+++ b/tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
+diff --git tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
+--- tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
++++ tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
 @@ -171,3 +171,3 @@ template <typename T>
  HostTensor to_tensor_spec(const HostTensor& tensor, const TensorSpec& dest_spec) {
 -    return host_tensor_to_tensor_spec_with_pad_value(tensor, dest_spec, T{0});
 +    return host_tensor_to_tensor_spec_with_pad_value(tensor, dest_spec, T{});
  }
-diff --git a/tt_metal/impl/tensor/tensor_apis.cpp b/tt_metal/impl/tensor/tensor_apis.cpp
---- a/tt_metal/impl/tensor/tensor_apis.cpp
-+++ b/tt_metal/impl/tensor/tensor_apis.cpp
+diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
+--- tt_metal/impl/tensor/tensor_apis.cpp
++++ tt_metal/impl/tensor/tensor_apis.cpp
 @@ -613,2 +613,4 @@ void validate_datatype(DataType dtype) {
          TT_FATAL(dtype == DataType::FLOAT32, "Incorrect data type {}", dtype);
 +    } else if constexpr (std::is_same_v<BaseType, float16>) {
@@ -89,9 +89,9 @@ diff --git a/tt_metal/impl/tensor/tensor_apis.cpp b/tt_metal/impl/tensor/tensor_
  INSTANTIATE_HOST_BUFFER_FUNCTIONS(float)
 +INSTANTIATE_HOST_BUFFER_FUNCTIONS(float16)
  INSTANTIATE_HOST_BUFFER_FUNCTIONS(bfloat16)
-diff --git a/ttnn/core/tensor/tensor.cpp b/ttnn/core/tensor/tensor.cpp
---- a/ttnn/core/tensor/tensor.cpp
-+++ b/ttnn/core/tensor/tensor.cpp
+diff --git ttnn/core/tensor/tensor.cpp ttnn/core/tensor/tensor.cpp
+--- ttnn/core/tensor/tensor.cpp
++++ ttnn/core/tensor/tensor.cpp
 @@ -58,2 +58,3 @@ using tt::tt_metal::TensorTopology;
  using tt::tt_metal::Tile;
 +using tt::tt_metal::float16;
@@ -110,9 +110,9 @@ diff --git a/ttnn/core/tensor/tensor.cpp b/ttnn/core/tensor/tensor.cpp
 +    tt::tt_metal::distributed::MeshDevice* device,
 +    std::optional<QueueId> cq_id,
      float16 pad_value);
-diff --git a/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp b/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp
---- a/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp
-+++ b/ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp
+diff --git ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp
 @@ -84,6 +84,5 @@ std::vector<CBInfo> get_cb_info(
      const uint32_t input_tile_size = tt::tile_size(datatype_to_dataformat_converter(conv_input_dtype));
 -    fp32_dest_acc_en &= input_datatype != DataType::FLOAT16;

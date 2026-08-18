@@ -52,7 +52,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +} // namespace
 +
  static void
-@@ -10922,2 +10970,4 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+@@ -10180,2 +10236,4 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
    patterns.add<StableHLOToTTIROpRoundOpConversionPattern>(typeConverter, ctx);
 +  patterns.add<StableHLOToTTIRReducePrecisionOpConversionPattern>(
 +      typeConverter, ctx);

@@ -1,7 +1,8 @@
-diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 --- a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 +++ b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
-@@ -744,9 +744,14 @@ bool isShardedModule(mlir::ModuleOp &module) {
+@@ -716,20 +716,28 @@
+     return false;
+   }
    auto globalMeshOp = parsedMeshOps[0];
 +  auto hasNonReplicatedSharding = [&](mlir::DictionaryAttr attrs) {
 +    if (!attrs) {
@@ -22,7 +23,8 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +    for (auto arg : funcOp.getArguments()) {
 +      if (hasNonReplicatedSharding(funcOp.getArgAttrDict(arg.getArgNumber()))) {
          return true;
-@@ -755,5 +760,8 @@ bool isShardedModule(mlir::ModuleOp &module) {
+       }
+     }
  
 -    for (auto outSharding :
 -         getOutShardingAttrs(funcOp.getContext(), funcOp, globalMeshOp)) {
@@ -34,3 +36,5 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +          hasNonReplicatedSharding(
 +              mlir::DictionaryAttr::get(funcOp.getContext(), resultAttrs))) {
          return true;
+       }
+     }

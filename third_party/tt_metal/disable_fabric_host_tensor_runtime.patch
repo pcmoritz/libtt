@@ -1,7 +1,8 @@
-diff --git a/tt_metal/impl/tensor/libtt_fabric_disabled_host_tensor_runtime.cpp b/tt_metal/impl/tensor/libtt_fabric_disabled_host_tensor_runtime.cpp
+diff --git tt_metal/impl/tensor/libtt_fabric_disabled_host_tensor_runtime.cpp tt_metal/impl/tensor/libtt_fabric_disabled_host_tensor_runtime.cpp
 new file mode 100644
+index 0000000000..616ea7951f
 --- /dev/null
-+++ b/tt_metal/impl/tensor/libtt_fabric_disabled_host_tensor_runtime.cpp
++++ tt_metal/impl/tensor/libtt_fabric_disabled_host_tensor_runtime.cpp
 @@ -0,0 +1,293 @@
 +// SPDX-License-Identifier: Apache-2.0
 +

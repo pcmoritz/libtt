@@ -1,16 +1,16 @@
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp b/ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
 @@ -205,3 +205,4 @@ MassagedConcat build_non_aligned_last_dim_concat(
          auto last_dim = tensors.front().logical_shape().rank() - 1;
 -        if (dim == last_dim) {
 +        if (dim == last_dim &&
 +            tensors.front().layout() != ttnn::ROW_MAJOR_LAYOUT) {
              bool res = !dim_aligned(tensors, dim);
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp b/ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
-@@ -407,10 +407,2 @@ Tensor concat_impl(
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
+@@ -445,10 +445,2 @@ Tensor ConcatOperation::invoke(
      }
 -    if (input_tensors[0].layout() == Layout::ROW_MAJOR && normalized_dim == ref_rank - 1) {
 -        for (const auto& input_tensor : input_tensors) {
@@ -21,14 +21,14 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_
 -        }
 -    }
      // Determine target layout by checking all inputs
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp b/ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
-@@ -35,2 +35,3 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
+@@ -30,2 +30,3 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
      uint32_t single_page_size;
 +    uint32_t scratch_offset = 0;
      const uint32_t common_align_len = std::max(input_tensors[0].buffer()->alignment(), output.buffer()->alignment());
-@@ -39,2 +40,10 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
+@@ -34,2 +35,10 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
          single_page_size = tt::align(output.element_size() * output.padded_shape()[-1], common_align_len);
 +        if (dim == output.padded_shape().rank() - 1) {
 +            scratch_offset = single_page_size;
@@ -39,7 +39,7 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program
 +            single_page_size += tt::align(scratch_page_size, common_align_len);
 +        }
      } else {
-@@ -141,2 +150,3 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
+@@ -140,2 +149,3 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
      std::vector<uint32_t> page_size_per_tensor(num_input_tensors);
 +    std::vector<uint32_t> copy_size_per_tensor(num_input_tensors);
  
@@ -61,9 +61,9 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program
 +            reader_compile_time_args.end(), copy_size_per_tensor.cbegin(), copy_size_per_tensor.cend());
 +    }
      for (uint32_t i = 0; i < num_input_tensors; ++i) {
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp b/ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
 @@ -21,2 +21,9 @@ void kernel_main() {
      constexpr uint32_t num_tensors = get_compile_time_arg_val(1);
 +#ifdef WIDTH_CONCAT
@@ -78,11 +78,11 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/datafl
          make_tensor_accessor_args_tuple<num_tensors, page_size_base_idx + num_tensors>();
 +#endif
  
-@@ -53,2 +61,3 @@ void kernel_main() {
+@@ -53,2 +55,3 @@ void kernel_main() {
  #ifdef WIDTH_CONCAT
 +        const uint32_t scratch_addr = l1_write_addr + scratch_offset;
          // For width concat we know we start at curr_tensor=0
-@@ -57,5 +66,6 @@ void kernel_main() {
+@@ -57,5 +60,6 @@ void kernel_main() {
              auto page_size = kernel_compile_time_args[page_size_base_idx + curr_tensor];
 +            auto copy_size = kernel_compile_time_args[copy_size_base_idx + curr_tensor];
              noc.async_read(

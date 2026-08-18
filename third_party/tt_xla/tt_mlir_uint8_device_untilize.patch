@@ -1,11 +1,12 @@
 diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 --- a/runtime/lib/ttnn/utils/utils.cpp
 +++ b/runtime/lib/ttnn/utils/utils.cpp
-@@ -100,3 +100,3 @@ bool canTilizeOnDevice(
- 
+@@ -106,4 +106,4 @@ bool canTilizeOnDevice(
 -// tt-metal untilize supports: bfloat16, float32, uint32, int32, uint16
 +// tt-metal untilize supports: bfloat16, float32, uint32, int32, uint16, uint8
  // (requires use_pack_untilize for uint32/int32)
+ // See: ttnn/operations/data_movement/untilize/device/untilize_op.cpp
+ // FP32 untilize fix: https://github.com/tenstorrent/tt-metal/pull/33904
 @@ -111,2 +111,3 @@ bool canUntilizeDataTypeOnDevice(const ::ttnn::DataType &dataType) {
           dataType == ::ttnn::DataType::UINT16 ||
 +         dataType == ::ttnn::DataType::UINT8 ||

@@ -1,7 +1,8 @@
-diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -269,2 +269,13 @@ public:
+@@ -267,6 +267,17 @@
+       return legalityResult;
+     }
  
 +    if (srcOp.getInputs().size() > 1) {
 +      if (isArgMax(srcOp, adaptor, rewriter)) {
@@ -15,7 +16,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
 +
      const mlir::Operation &innerOp = srcOp.getBody().front().front();
-@@ -295,10 +306,2 @@ public:
+ 
+     if (mlir::isa<mlir::stablehlo::AddOp>(innerOp)) {
+@@ -293,14 +304,6 @@
+       return matchAndRewriteInternal<mlir::tt::ttir::ReduceOrOp>(srcOp, adaptor,
+                                                                  rewriter);
      }
 -    if (isArgMax(srcOp, adaptor, rewriter)) {
 -      return matchAndRewriteInternalArgMax(
@@ -26,7 +31,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    }
 -
      return failure();
-@@ -311,9 +314,2 @@ private:
+   }
+ 
+@@ -309,13 +312,6 @@
+   checkConversionLegality(mlir::stablehlo::ReduceOp &srcOp,
+                           mlir::stablehlo::ReduceOp::Adaptor adaptor,
                            ConversionPatternRewriter &rewriter) const {
 -    if (srcOp.getInputs().size() != 1 &&
 -        !isArgMax(srcOp, adaptor, rewriter) &&
@@ -36,7 +45,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    }
 -
      if (!srcOp.getBody().hasOneBlock()) {
-@@ -373,2 +369,75 @@ private:
+       return rewriter.notifyMatchFailure(
+           srcOp,
+@@ -371,6 +367,79 @@
+     return success();
+   }
  
 +  template <typename ReductionOp, typename CombineOp>
 +  mlir::Value createReductionWithInit(
@@ -112,3 +125,5 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  }
 +
    LogicalResult
+   matchAndRewriteInternalArgMax(
+       mlir::stablehlo::ReduceOp &srcOp, mlir::Value input,

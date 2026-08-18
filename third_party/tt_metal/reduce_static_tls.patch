@@ -1,6 +1,6 @@
-diff --git a/tt_metal/common/filesystem_utils.cpp b/tt_metal/common/filesystem_utils.cpp
---- a/tt_metal/common/filesystem_utils.cpp
-+++ b/tt_metal/common/filesystem_utils.cpp
+diff --git tt_metal/common/filesystem_utils.cpp tt_metal/common/filesystem_utils.cpp
+--- tt_metal/common/filesystem_utils.cpp
++++ tt_metal/common/filesystem_utils.cpp
 @@ -28,4 +28,4 @@ void set_nfs_safety(bool enabled) { g_nfs_safety.store(enabled, std::memory_orde
  int get_retry_jitter_ms() {
 -    thread_local std::mt19937 rng{std::random_device{}()};
@@ -8,25 +8,25 @@ diff --git a/tt_metal/common/filesystem_utils.cpp b/tt_metal/common/filesystem_u
 +    std::mt19937 rng{std::random_device{}()};
 +    std::uniform_int_distribution<> jitter_dist(0, kFsRetryJitterMs);
      return jitter_dist(rng);
-diff --git a/tt_metal/impl/dispatch/system_memory_manager.cpp b/tt_metal/impl/dispatch/system_memory_manager.cpp
---- a/tt_metal/impl/dispatch/system_memory_manager.cpp
-+++ b/tt_metal/impl/dispatch/system_memory_manager.cpp
+diff --git tt_metal/impl/dispatch/system_memory_manager.cpp tt_metal/impl/dispatch/system_memory_manager.cpp
+--- tt_metal/impl/dispatch/system_memory_manager.cpp
++++ tt_metal/impl/dispatch/system_memory_manager.cpp
 @@ -514,3 +514,3 @@ void* SystemMemoryManager::issue_queue_reserve(uint32_t cmd_size_B, const uint8_
      if (is_mock_device()) {
 -        thread_local std::array<char, 65536> dummy_buffer{};
 +        static std::array<char, 65536> dummy_buffer{};
          return dummy_buffer.data();
-diff --git a/tt_metal/impl/event/dispatch.cpp b/tt_metal/impl/event/dispatch.cpp
---- a/tt_metal/impl/event/dispatch.cpp
-+++ b/tt_metal/impl/event/dispatch.cpp
+diff --git tt_metal/impl/event/dispatch.cpp tt_metal/impl/event/dispatch.cpp
+--- tt_metal/impl/event/dispatch.cpp
++++ tt_metal/impl/event/dispatch.cpp
 @@ -223,3 +223,3 @@ void read_events_from_completion_queue(
      uint32_t read_ptr = sysmem_manager.get_completion_queue_read_ptr(cq_id);
 -    thread_local static std::vector<uint32_t> dispatch_cmd_and_event(
 +    std::vector<uint32_t> dispatch_cmd_and_event(
          (sizeof(CQDispatchCmd) + DispatchSettings::EVENT_PADDED_SIZE) / sizeof(uint32_t));
-diff --git a/tt_metal/impl/program/dispatch.cpp b/tt_metal/impl/program/dispatch.cpp
---- a/tt_metal/impl/program/dispatch.cpp
-+++ b/tt_metal/impl/program/dispatch.cpp
+diff --git tt_metal/impl/program/dispatch.cpp tt_metal/impl/program/dispatch.cpp
+--- tt_metal/impl/program/dispatch.cpp
++++ tt_metal/impl/program/dispatch.cpp
 @@ -470,3 +470,3 @@ void insert_stall_cmds(ProgramCommandSequence& program_command_sequence, SubDevi
  void fill_runtime_args_watcher_pattern(uint32_t* dst, uint32_t num_words) {
 -    thread_local static std::mt19937 gen(std::random_device{}());

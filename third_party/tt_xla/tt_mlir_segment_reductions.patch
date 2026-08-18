@@ -1,24 +1,22 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -1042,3 +1042,3 @@ def TTNN_ProdOp : TTNN_Op<"prod"> {
-       return
+@@ -999 +999 @@ def TTNN_ProdOp : TTNN_Op<"prod"> {
 -        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds();
 +        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(*this);
-     }
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-@@ -346,3 +346,4 @@ public:
-   // Create workaround for reduce (full) product op operands.
+@@ -351 +351,2 @@ class TTNNOperandsWorkaroundsFactory {
 -  static TTNNOperandsWorkarounds createReduceProdOpOperandsWorkarounds();
 +  static TTNNOperandsWorkarounds
 +  createReduceProdOpOperandsWorkarounds(mlir::Operation *op);
- 
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -7204,2 +7204,7 @@ public:
+@@ -7010,6 +7010,11 @@ public:
+     auto operandType = mlir::cast<RankedTensorType>(operand.getType());
+     auto updateType = mlir::cast<RankedTensorType>(update.getType());
  
 +    // embedding_backward only supports BF16 and would narrow F32 updates.
 +    if (operandType.getElementType().isF32()) {
@@ -26,6 +24,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
 +
      if (operandType.getRank() != 2) {
+       return rewriter.notifyMatchFailure(
+           srcOp, "EmbeddingBackward requires 2D weight table (operand)");
 @@ -7324,3 +7329,6 @@ public:
          adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims();
 -    if (scatterDimsToOperandDims.size() <= 1) {
@@ -37,8 +37,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -923,4 +923,7 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
-           .getElementType();
+@@ -922,5 +922,8 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
 +  // Float32 cannot represent the INT32_MAX identity used by min.
 +  bool supportsInt32 =
 +      inputType.isInteger(32) && mlir::isa<ttnn::MinOp>(op);
@@ -46,6 +45,8 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 -  if (!inputType.isF32() && !inputType.isBF16()) {
 +  if (!inputType.isF32() && !inputType.isBF16() && !supportsInt32) {
      operandWorkaround.tensorDataTypeWorkaround =
+         mlir::tt::ttcore::DataType::Float32;
+   }
 @@ -935,11 +938,6 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
  // Factory method to create a set of workarounds for reduce product op operands.
 -// tt-metal only supports full product reduction for bfloat16 data type.
@@ -64,7 +65,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 --- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 +++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
-@@ -111,7 +111,13 @@ private:
+@@ -96,9 +96,15 @@ private:
    // Identifies function input arguments that are candidates for RowMajor layout
 -  // propagation. Currently restricted to integer tensor types only.
 +  // propagation. F32 inputs are also eligible when the function uses scatter.
@@ -80,3 +81,5 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagati
 +          (hasIntegerElementType(arg) ||
 +           (hasScatter && type && type.getElementType().isF32()))) {
          rowMajorCandidates.push_back(arg);
+       }
+     }

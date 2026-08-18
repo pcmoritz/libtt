@@ -1,7 +1,6 @@
-diff --git a/ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp b/ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
---- a/ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
-+++ b/ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
-@@ -161,6 +161,9 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
+--- ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
+@@ -147,10 +147,14 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
      }
 +    const bool single_core_height_sharded =
 +        a.is_sharded() &&
@@ -13,13 +12,13 @@ diff --git a/ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_d
 -            a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
 +            single_core_height_sharded || a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
              "Height sharded inputs are not supported.");
-@@ -168,3 +171,4 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
+         TT_FATAL(
              operation_attributes.output_mem_config.is_sharded() &&
 -                operation_attributes.output_mem_config.memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
 +                (single_core_height_sharded ||
 +                 operation_attributes.output_mem_config.memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED),
              "Sharded inputs require sharded outputs.");
-@@ -312,3 +316,4 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
+@@ -306,3 +310,4 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
                      TT_FATAL(
 -                        a.memory_config().memory_layout() != TensorMemoryLayout::HEIGHT_SHARDED,
 +                        single_core_height_sharded ||

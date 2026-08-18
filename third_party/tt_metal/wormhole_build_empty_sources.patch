@@ -1,12 +1,17 @@
-diff --git a/tt_metal/hw/inc/internal/tt-1xx/wormhole/BUILD.bazel b/tt_metal/hw/inc/internal/tt-1xx/wormhole/BUILD.bazel
---- a/tt_metal/hw/inc/internal/tt-1xx/wormhole/BUILD.bazel
-+++ b/tt_metal/hw/inc/internal/tt-1xx/wormhole/BUILD.bazel
-@@ -1 +1,3 @@
+--- tt_metal/hw/inc/internal/tt-1xx/wormhole/BUILD.bazel
++++ tt_metal/hw/inc/internal/tt-1xx/wormhole/BUILD.bazel
+@@ -1,3 +1,5 @@
 +load("@rules_cc//cc:defs.bzl", "cc_library")
 +
- 
-@@ -19,3 +21,3 @@ config_setting(
+
+ config_setting(
+     name = "ENABLE_FWLOG",
+@@ -17,7 +19,7 @@ config_setting(
+ )
+
  headers = glob(["**/*.h", "**/*.hpp", "**/*.h"]) + ["cmds.def"]
 -sources = glob(["**/*.cc", "**/*.cpp"])
 +sources = glob(["**/*.cc", "**/*.cpp"], allow_empty = True)
- 
+
+ cc_library(
+     name = "rv-wh",

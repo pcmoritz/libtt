@@ -153,11 +153,15 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  }
 +
    // Extract constant initialization values.
-@@ -3596,3 +3623,3 @@ private:
+@@ -3729,7 +3765,7 @@ private:
+   bool hasValidInputAndPadding(mlir::stablehlo::ReduceWindowOp &srcOp,
                                 mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
 -                               int64_t &dimension,
 +                               CumulativeReductionMatch &match,
                                 DenseI64ArrayAttr padding) const {
+     RankedTensorType inputType = mlir::cast<RankedTensorType>(
+         getTypeConverter()->convertType(srcOp.getInputs()[0].getType()));
+     int64_t inputRank = inputType.getRank();
 @@ -3619,3 +3646,3 @@ private:
        // Determine the dimension using input tensor shape.
 -      return findDimensionWithShape(inputType, dimension);

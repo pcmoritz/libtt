@@ -1,6 +1,6 @@
-diff --git a/tt_metal/impl/data_format/blockfloat_common.cpp b/tt_metal/impl/data_format/blockfloat_common.cpp
---- a/tt_metal/impl/data_format/blockfloat_common.cpp
-+++ b/tt_metal/impl/data_format/blockfloat_common.cpp
+diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_format/blockfloat_common.cpp
+--- tt_metal/impl/data_format/blockfloat_common.cpp
++++ tt_metal/impl/data_format/blockfloat_common.cpp
 @@ -5,6 +5,10 @@
  #include <algorithm>
 +#include <bit>

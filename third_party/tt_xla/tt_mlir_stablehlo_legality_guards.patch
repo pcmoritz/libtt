@@ -38,12 +38,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    desiredI8 = 1;
 -    desiredI1 = true;
    } else {
-@@ -156,3 +146,4 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
- 
+@@ -164,4 +154,5 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
 -  if (initValueOp.getResult().getType().getElementType().isBF16()) {
 +  if (initValueOp.getResult().getType().getElementType().isBF16() ||
 +      initValueOp.getResult().getType().getElementType().isF16()) {
      const llvm::APFloat &value =
+         *initValueOp.getValue().value_begin<llvm::APFloat>();
+     if (desired == TypicalInitReductionValue::NEG_INF) {
 @@ -174,30 +165,15 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
    }
 -  // Integer element types: read the constant as an APInt so both signed and
@@ -85,7 +86,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +               ? value.isZero()
 +               : value.isMinSignedValue();
    }
-@@ -319,2 +295,8 @@ private:
+@@ -302,5 +308,11 @@ private:
+                           mlir::stablehlo::ReduceOp::Adaptor adaptor,
                            ConversionPatternRewriter &rewriter) const {
 +    if (srcOp.getInputs().size() != 1 &&
 +        !isArgMax(srcOp, adaptor, rewriter)) {
@@ -94,6 +96,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
 +
      if (!srcOp.getBody().hasOneBlock()) {
+       return rewriter.notifyMatchFailure(
+           srcOp,
 @@ -737,2 +719,9 @@ public:
                    ConversionPatternRewriter &rewriter) const override {
 +    Type lhsType = getElementTypeOrSelf(srcOp.getLhs());
@@ -104,7 +108,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          srcOp, "only 16- and 32-bit float inputs are supported");
 +    }
  
-@@ -1273,2 +1262,7 @@ private:
+@@ -1262,3 +1282,8 @@ private:
                            ConversionPatternRewriter &rewriter) const {
 +    if (hasUnsupportedFloatType(srcOp.getValue().getElementType())) {
 +      return rewriter.notifyMatchFailure(
@@ -112,12 +116,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
 +
      if (isa<DenseElementsAttr, DenseResourceElementsAttr>(srcOp.getValue()) &&
-@@ -2676,3 +2670,3 @@ public:
+         !srcOp.getValue().getElementType().isIntOrFloat()) {
+@@ -2653,3 +2678,3 @@ public:
      int64_t inputRank = firstInputType.getRank();
 -    if (inputRank > 5) {
 +    if (inputRank == 0 || inputRank > 5) {
        return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
-@@ -2753,2 +2747,7 @@ public:
+@@ -2740,4 +2765,9 @@ public:
        if (dimension) {
 +        if (firstInputType.getElementType().isInteger(8)) {
 +          return rewriter.notifyMatchFailure(
@@ -125,7 +130,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        }
 +
          mlir::RankedTensorType resultType = cast<RankedTensorType>(
-@@ -2765,2 +2764,7 @@ public:
+             getTypeConverter()->convertType(srcOp.getResult(0).getType()));
+         rewriter.replaceOpWithNewOp<ttir::CumSumOp>(
+@@ -2752,4 +2782,9 @@ public:
        if (cumprodDimension) {
 +        if (firstInputType.getElementType().isInteger(8)) {
 +          return rewriter.notifyMatchFailure(
@@ -133,6 +140,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        }
 +
          mlir::RankedTensorType resultType = cast<RankedTensorType>(
+             getTypeConverter()->convertType(srcOp.getResult(0).getType()));
+         rewriter.replaceOpWithNewOp<ttir::CumProdOp>(
 @@ -4273,4 +4277,5 @@ public:
      auto spatialDims = getIndicesofElementsLargerThanOne(windowDims);
 -    if (spatialDims.empty()) {
