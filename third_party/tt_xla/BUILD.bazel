@@ -5,7 +5,6 @@ package(default_visibility = ["//visibility:public"])
 exports_files([
     "loguru.BUILD.bazel",
     "llvm_bazel9_cc_rules.patch",
-    "llvm_reject_invalid_fold_result_types.patch",
     "tt_mlir_control_flow.cpp",
     "tt_mlir_control_flow_runtime.cpp",
     "tt_mlir_compiler_cold_stubs.cc",

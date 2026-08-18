@@ -36,8 +36,10 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        startIndicesValues1D.push_back(reshapedIndex);
      }
      // Create a single 1D tensor from start indices values using concat op.
-@@ -4891,1 +4897,0 @@ public:
+@@ -5107,3 +5115,2 @@ public:
+     // Create a 1D constant tensor with slice_sizes values.
 -    auto sliceSizes = srcOp.getSliceSizes();
+     SmallVector<int32_t> sliceSizesInt32(sliceSizes.begin(), sliceSizes.end());
 @@ -4904,6 +4909,128 @@ class StableHLOToTTIRDynamicSliceOpConversionPattern
  };
  } // namespace
