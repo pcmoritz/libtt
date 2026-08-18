@@ -39,11 +39,16 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_common.
  
  namespace ttnn::prim {
  
-@@ -30,4 +31,15 @@ inline uint32_t calculate_optimal_chunk_size(const ttnn::Tensor& input_tensor) {
+@@ -30,4 +31,20 @@ inline uint32_t calculate_optimal_chunk_size(const ttnn::Tensor& input_tensor) {
      return ceil32((l1_per_chunk * 9 / 10) - 32);
  }
  
 +inline std::string scatter_outer_shape_define(const ttnn::Shape& shape, uint32_t outer_rank) {
++    TT_ASSERT(
++        shape.rank() <= outer_rank + 1,
++        "Scatter shape rank {} exceeds the kernel rank {}.",
++        shape.rank(),
++        outer_rank + 1);
 +    std::string value;
 +    for (uint32_t i = 0; i < outer_rank; ++i) {
 +        if (!value.empty()) {
