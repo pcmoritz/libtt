@@ -259,7 +259,6 @@ http_archive(
         "//third_party/tt_metal:scatter_float16.patch",
         "//third_party/tt_metal:pad_rank1_growth.patch",
         "//third_party/tt_metal:float16_upstream_api_adaptations.patch",
-        "//third_party/tt_metal:typecast_row_major_chunk_size.patch",
         "//third_party/tt_metal:stable_sort_merge_direction.patch",
     ],
     sha256 = "a222d1f6fe7f6aec62f69e22199a3537a31a58aa5ead52e4ab470b7d87472ecb",
