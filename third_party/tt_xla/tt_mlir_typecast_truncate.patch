@@ -1,0 +1,28 @@
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -2660,10 +2660,23 @@ public:
+   matchAndRewrite(ttir::TypecastOp op, ttir::TypecastOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+     auto resultType = op.getType();
++    Value input = adaptor.getInput();
++    auto resultIntegerType =
++        dyn_cast<IntegerType>(resultType.getElementType());
++    if (isa<FloatType>(op.getInput().getType().getElementType()) &&
++        resultIntegerType && resultIntegerType.isUnsigned() &&
++        resultIntegerType.getWidth() == 16) {
++      // TTNN's float-to-UInt16 typecast rounds to the nearest integer, while
++      // StableHLO convert truncates toward zero. Values for which conversion
++      // to an unsigned type is defined are nonnegative, so floor is equivalent
++      // to truncation here. Other destination types already use TTNN paths
++      // with the required conversion semantics.
++      input = rewriter.create<ttnn::FloorOp>(op.getLoc(), input);
++    }
+ 
+     rewriter.replaceOpWithNewOp<ttnn::TypecastOp>(
+         op, this->getTypeConverter()->convertType(resultType),
+-        adaptor.getInput());
++        input);
+     return success();
+   }
+ };

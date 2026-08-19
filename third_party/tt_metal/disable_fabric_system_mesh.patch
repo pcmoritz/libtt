@@ -8,9 +8,8 @@
  #include "impl/context/metal_context.hpp"
  #include <tt-metalium/experimental/fabric/control_plane.hpp>
 
-@@ -84,49 +85,28 @@
- }
-
+@@ -85,48 +86,27 @@ MappedDevice SystemMesh::Impl::get_system_mapped_device(const MeshCoordinate& co
+ 
  // Implementation of public methods
 -SystemMesh::Impl::Impl(const tt::tt_fabric::ControlPlane& control_plane) :
 -    mesh_id_(control_plane.get_local_mesh_id_bindings()[0]),
@@ -35,7 +34,7 @@
          coordinate_translator_.global_shape(),
          coordinate_translator_.local_shape(),
          coordinate_translator_.local_offset());
-
+ 
 -    // Get local physical coordinates
 -    const auto local_physical_translation_map = get_system_mesh_coordinate_translation_map(control_plane);
 -    TT_FATAL(

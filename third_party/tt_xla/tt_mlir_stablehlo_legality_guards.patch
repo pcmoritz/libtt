@@ -1,0 +1,163 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -108,6 +108,12 @@ getPaddingOrDefault(mlir::DenseIntElementsAttr attr, size_t numSpatialDims) {
+   }
+   return llvm::SmallVector<int64_t>(numSpatialDims * 2, 0);
+ }
++
++static bool hasUnsupportedFloatType(Type type) {
++  return mlir::isa<FloatType>(type) &&
++         type.getIntOrFloatBitWidth() != 16 &&
++         type.getIntOrFloatBitWidth() != 32;
++}
+ 
+ // Typical initialization values for reduction ops.
+ enum TypicalInitReductionValue {
+@@ -126,34 +132,19 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+   float desiredF32;
+   double desiredF64;
+-  int32_t desiredI32;
+-  int64_t desiredI64;
+-  int8_t desiredI8;
+-  bool desiredI1;
+   if (desired == TypicalInitReductionValue::NEG_INF) {
+     desiredF32 = -std::numeric_limits<float>::infinity();
+     desiredF64 = -std::numeric_limits<double>::infinity();
+-    desiredI32 = std::numeric_limits<int32_t>::min();
+-    desiredI64 = std::numeric_limits<int64_t>::min();
+-    desiredI8 = std::numeric_limits<int8_t>::min();
+-    desiredI1 = false;
+   } else if (desired == TypicalInitReductionValue::ZERO) {
+     desiredF32 = 0.0;
+     desiredF64 = 0.0;
+-    desiredI32 = 0;
+-    desiredI64 = 0;
+-    desiredI8 = 0;
+-    desiredI1 = false;
+   } else if (desired == TypicalInitReductionValue::ONE) {
+     desiredF32 = 1.0;
+     desiredF64 = 1.0;
+-    desiredI32 = 1;
+-    desiredI64 = 1;
+-    desiredI8 = 1;
+-    desiredI1 = true;
+   } else {
+     return false;
+   }
+ 
+-  if (initValueOp.getResult().getType().getElementType().isBF16()) {
++  if (initValueOp.getResult().getType().getElementType().isBF16() ||
++      initValueOp.getResult().getType().getElementType().isF16()) {
+     const llvm::APFloat &value =
+         *initValueOp.getValue().value_begin<llvm::APFloat>();
+@@ -173,32 +164,17 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+     return *initValueOp.getValue().value_begin<double>() == desiredF64;
+   }
+-  // Integer element types: read the constant as an APInt so both signed and
+-  // unsigned attributes work. value_begin<int32_t>()/<int64_t>() assert with
+-  // "ElementsAttr does not provide iteration facilities for type `int`" on
+-  // unsigned (ui32/ui64) attributes -- e.g. the dense<4294967295> :
+-  // tensor<ui32> sentinel that torch 2.11's max_pool2d_with_indices lowering
+-  // emits (#9031).
+-  if (auto intType = mlir::dyn_cast<mlir::IntegerType>(
++  if (auto integerType = mlir::dyn_cast<IntegerType>(
+           initValueOp.getResult().getType().getElementType())) {
+-    unsigned width = intType.getWidth();
+-    // Restrict to the widths the original signed-typed reads handled
+-    // (i1/i8/i32/i64). Other widths previously fell through to `return false`,
+-    // and desiredI8/I32/I64 are only defined for these; reading as APInt merely
+-    // avoids the unsigned-iteration assert without changing which widths match.
+-    if (width != 1 && width != 8 && width != 32 && width != 64) {
+-      return false;
+-    }
+-    const llvm::APInt &value =
++    llvm::APInt value =
+         *initValueOp.getValue().value_begin<llvm::APInt>();
+-    if (width == 1) {
+-      return value.getBoolValue() == desiredI1;
++    if (desired == TypicalInitReductionValue::ZERO) {
++      return value.isZero();
+     }
+-    int64_t desiredInt =
+-        width == 8 ? desiredI8 : (width == 32 ? desiredI32 : desiredI64);
+-    // Compare raw bit patterns at the attribute's width, so an unsigned init
+-    // matches the signed sentinel with the same bits (e.g. for NEG_INF,
+-    // ui32 2147483648 == i32 INT32_MIN).
+-    return value == llvm::APInt(width, static_cast<uint64_t>(desiredInt),
+-                                /*isSigned=*/true);
++    if (desired == TypicalInitReductionValue::ONE) {
++      return value.isOne();
++    }
++    return integerType.isUnsigned() || integerType.getWidth() == 1
++               ? value.isZero()
++               : value.isMinSignedValue();
+   }
+ 
+@@ -302,5 +308,11 @@ private:
+                           mlir::stablehlo::ReduceOp::Adaptor adaptor,
+                           ConversionPatternRewriter &rewriter) const {
++    if (srcOp.getInputs().size() != 1 &&
++        !isArgMax(srcOp, adaptor, rewriter)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "variadic stablehlo.reduce is not supported");
++    }
++
+     if (!srcOp.getBody().hasOneBlock()) {
+       return rewriter.notifyMatchFailure(
+           srcOp,
+@@ -736,4 +718,11 @@ public:
+                   mlir::stablehlo::DotGeneralOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    Type lhsType = getElementTypeOrSelf(srcOp.getLhs());
++    Type rhsType = getElementTypeOrSelf(srcOp.getRhs());
++    if (hasUnsupportedFloatType(lhsType) ||
++        hasUnsupportedFloatType(rhsType)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "only 16- and 32-bit float inputs are supported");
++    }
+ 
+     auto outputType = mlir::cast<RankedTensorType>(
+@@ -1262,3 +1282,8 @@ private:
+                           ConversionPatternRewriter &rewriter) const {
++    if (hasUnsupportedFloatType(srcOp.getValue().getElementType())) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "only 16- and 32-bit float constants are supported");
++    }
++
+     if (isa<DenseElementsAttr, DenseResourceElementsAttr>(srcOp.getValue()) &&
+         !srcOp.getValue().getElementType().isIntOrFloat()) {
+@@ -2653,3 +2678,3 @@ public:
+     int64_t inputRank = firstInputType.getRank();
+-    if (inputRank > 5) {
++    if (inputRank == 0 || inputRank > 5) {
+       return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
+@@ -2740,4 +2765,9 @@ public:
+       if (dimension) {
++        if (firstInputType.getElementType().isInteger(8)) {
++          return rewriter.notifyMatchFailure(
++              srcOp, "8-bit cumulative reductions are not supported");
++        }
++
+         mlir::RankedTensorType resultType = cast<RankedTensorType>(
+             getTypeConverter()->convertType(srcOp.getResult(0).getType()));
+         rewriter.replaceOpWithNewOp<ttir::CumSumOp>(
+@@ -2752,4 +2782,9 @@ public:
+       if (cumprodDimension) {
++        if (firstInputType.getElementType().isInteger(8)) {
++          return rewriter.notifyMatchFailure(
++              srcOp, "8-bit cumulative reductions are not supported");
++        }
++
+         mlir::RankedTensorType resultType = cast<RankedTensorType>(
+             getTypeConverter()->convertType(srcOp.getResult(0).getType()));
+         rewriter.replaceOpWithNewOp<ttir::CumProdOp>(
+@@ -4272,5 +4276,6 @@ public:
+     // (H, W)
+     auto spatialDims = getIndicesofElementsLargerThanOne(windowDims);
+-    if (spatialDims.empty()) {
+-      return rewriter.notifyMatchFailure(srcOp, "No elements larger than one");
++    if (operandType.getRank() != 4 || spatialDims.size() != 2) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "only 4D operands with two spatial dimensions are supported");
+     }

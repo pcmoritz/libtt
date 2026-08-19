@@ -1,0 +1,58 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -2858,5 +2858,53 @@ public:
+         mlir::cast<RankedTensorType>(srcOp.getInputs()[0].getType());
+     int64_t inputRank = firstInputType.getRank();
+-    if (inputRank == 0 || inputRank > 5) {
++    if (inputRank == 0) {
++      if (srcOp.getInputs().size() != 1 ||
++          srcOp.getInitValues().size() != 1) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Variadic scalar reduce window is not supported.");
++      }
++
++      Block &block = srcOp.getBody().front();
++      auto returnOp = dyn_cast<mlir::stablehlo::ReturnOp>(block.back());
++      if (block.getNumArguments() != 2 ||
++          block.getOperations().size() != 2 || !returnOp ||
++          returnOp.getNumOperands() != 1) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Invalid scalar reduce window body.");
++      }
++
++      Operation *reduceOp = &block.front();
++      if (reduceOp->getNumResults() != 1 ||
++          returnOp.getOperand(0) != reduceOp->getResult(0) ||
++          reduceOp->getNumOperands() != 2 ||
++          reduceOp->getOperand(0) == reduceOp->getOperand(1) ||
++          !llvm::is_contained(block.getArguments(), reduceOp->getOperand(0)) ||
++          !llvm::is_contained(block.getArguments(), reduceOp->getOperand(1))) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Unrecognized scalar reduce body.");
++      }
++
++      auto resultType = mlir::cast<RankedTensorType>(
++          getTypeConverter()->convertType(srcOp.getResult(0).getType()));
++      Value input = adaptor.getInputs().front();
++      Value init = adaptor.getInitValues().front();
++      Value result;
++      if (isa<mlir::stablehlo::AddOp>(reduceOp)) {
++        result = rewriter.create<ttir::AddOp>(srcOp.getLoc(), resultType,
++                                               input, init);
++      } else if (isa<mlir::stablehlo::MaxOp>(reduceOp)) {
++        result = rewriter.create<ttir::MaximumOp>(srcOp.getLoc(), resultType,
++                                                   input, init);
++      } else if (isa<mlir::stablehlo::MulOp>(reduceOp)) {
++        result = rewriter.create<ttir::MultiplyOp>(srcOp.getLoc(), resultType,
++                                                    input, init);
++      } else {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Unsupported scalar reduction op.");
++      }
++      rewriter.replaceOp(srcOp, result);
++      return success();
++    }
++    if (inputRank > 5) {
+       return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
+     }

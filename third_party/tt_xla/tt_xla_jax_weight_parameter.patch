@@ -1,0 +1,12 @@
+diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
+index dd9123d..557a458 100644
+--- a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
++++ b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
+@@ -355,2 +355,7 @@ struct PopulateWeightDtypeFromCustomCall final
+       funcOp.setArgAttr(argIndex, c_weight_dtype_attr_name, weightDtypeStrAttr);
++      funcOp.setArgAttr(
++          argIndex, mlir::tt::ttcore::ArgumentTypeAttr::name,
++          mlir::tt::ttcore::ArgumentTypeAttr::get(
++              funcOp.getContext(),
++              mlir::tt::ttcore::ArgumentType::Parameter));
+     }

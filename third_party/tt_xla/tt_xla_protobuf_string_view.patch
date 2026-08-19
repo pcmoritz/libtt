@@ -29,7 +29,7 @@ index 7a9f567..c6b4fa7 100644
      google::protobuf::io::CodedInputStream cis(
          reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size());
  
-@@ -248,11 +248,13 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+@@ -284,11 +284,12 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
        if (entry_field.number() == kMapKeyFieldNumber &&
            entry_field.type() ==
                google::protobuf::UnknownField::TYPE_LENGTH_DELIMITED) {
@@ -44,8 +44,7 @@ index 7a9f567..c6b4fa7 100644
          google::protobuf::io::CodedInputStream override_stream(
              reinterpret_cast<const uint8_t *>(override_bytes.data()),
              override_bytes.size());
-@@ -286,7 +288,8 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
-         const google::protobuf::UnknownField &value_field =
+@@ -322,7 +323,8 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
              value_fields.field(0);
          switch (value_field.number()) {
          case 1: {

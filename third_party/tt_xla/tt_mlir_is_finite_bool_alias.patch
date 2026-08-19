@@ -1,0 +1,27 @@
+diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
+--- a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
+@@ -168,7 +168,22 @@ void run(const ::tt::target::ttnn::EltwiseUnaryOp *op,
+     break;
+   }
+   case ::tt::target::ttnn::EltwiseUnaryOpType::IsFinite: {
+-    runEltwiseUnaryOp(op, tensorPool, ::ttnn::isfinite);
++    runEltwiseUnaryOp(op, tensorPool, [](const ::ttnn::Tensor &input,
++                                         const auto &memoryConfig,
++                                         const auto &outputTensor,
++                                         const auto &subCoreGrids) {
++      ::ttnn::Tensor result = ::ttnn::isfinite(
++          input, memoryConfig, /*optional_output_tensor=*/std::nullopt,
++          subCoreGrids);
++      // TTNN predicates preserve their input dtype, but TTIR i1 tensors use
++      // BFLOAT16 as their runtime storage alias. Normalize the numeric 0/1
++      // result so copying it back to a logical boolean buffer is well-typed.
++      if (result.dtype() == ::ttnn::DataType::BFLOAT16) {
++        return result;
++      }
++      return ::ttnn::typecast(result, ::ttnn::DataType::BFLOAT16,
++                              memoryConfig, outputTensor, subCoreGrids);
++    });
+     break;
+   }
+   case ::tt::target::ttnn::EltwiseUnaryOpType::LogicalNot: {

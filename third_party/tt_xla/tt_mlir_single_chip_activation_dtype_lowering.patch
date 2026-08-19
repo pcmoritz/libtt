@@ -8,11 +8,10 @@
 -  if (!sawCCL) {
 -    return false;
 -  }
-@@ -212,5 +207,10 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+@@ -211,4 +206,9 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
    }
 -  auto ff2 = mlir::dyn_cast<MatmulOp>(*gate.getResult().getUsers().begin());
 -  if (!ff2 || !matmulReachesResidualAdd(ff2)) {
--    return false;
 +  Operation *ff2 = *gate.getResult().getUsers().begin();
 +  if (auto ff2Matmul = mlir::dyn_cast<MatmulOp>(ff2)) {
 +    if (!matmulReachesResidualAdd(ff2Matmul)) return false;
@@ -20,5 +19,4 @@
 +             !ff2Linear || !ff2Linear.getBias() ||
 +             !isLowerableFloat(getValueDtype(ff2Linear.getBias())) ||
 +             !isLowerableFloat(getValueDtype(ff2Linear.getResult()))) {
-+    return false;
-   }
+     return false;

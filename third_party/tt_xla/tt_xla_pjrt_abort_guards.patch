@@ -1,0 +1,143 @@
+diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
+--- a/pjrt_implementation/src/api/buffer_instance.cc
++++ b/pjrt_implementation/src/api/buffer_instance.cc
+@@ -675,6 +675,8 @@ PJRT_Error *onBufferCopyToDevice(PJRT_Buffer_CopyToDevice_Args *args) {
+-  src_buffer->copyToDeviceMemory(
++  tt_pjrt_status status = src_buffer->copyToDeviceMemory(
+       dst_device, dst_memory,
+       reinterpret_cast<BufferInstance **>(&args->dst_buffer));
+-
++  if (auto error = ErrorInstance::makeError(status)) {
++    return *error.release();
++  }
+   return nullptr;
+ }
+@@ -697,6 +699,8 @@ PJRT_Error *onBufferCopyToMemory(PJRT_Buffer_CopyToMemory_Args *args) {
+-  src_buffer->copyToDeviceMemory(
++  tt_pjrt_status status = src_buffer->copyToDeviceMemory(
+       dst_device, dst_memory,
+       reinterpret_cast<BufferInstance **>(&args->dst_buffer));
+-
++  if (auto error = ErrorInstance::makeError(status)) {
++    return *error.release();
++  }
+   return nullptr;
+ }
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -17,4 +17,5 @@
+ #include <filesystem>
+ #include <map>
++#include <mutex>
+ #include <optional>
+ 
+@@ -499,4 +500,7 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+     size_t target_num_devices) {
+ 
++  static std::mutex compile_mutex;
++  const std::lock_guard<std::mutex> lock(compile_mutex);
++
+   std::string_view mlir_code(mlir_program->code, mlir_program->code_size);
+ 
+diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implementation/src/api/compile_options_parser.cc
+--- a/pjrt_implementation/src/api/compile_options_parser.cc
++++ b/pjrt_implementation/src/api/compile_options_parser.cc
+@@ -214,4 +214,12 @@
+                   google::protobuf::UnknownField::TYPE_VARINT) {
++            uint64_t optimization_level = exec_field.varint();
++            // XLA encodes O0, O1, and O2 as 9, 19, and 29.
++            if (optimization_level % 10 == 9) {
++              optimization_level /= 10;
++            }
++            if (optimization_level > 2) {
++              return tt_pjrt_status::kInvalidArgument;
++            }
+             out_compile_options.emplace(CompileOptions::optimization_level_key,
+-                                        std::to_string(exec_field.varint()));
++                                        std::to_string(optimization_level));
+           }
+diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
+@@ -502,3 +502,6 @@
+   }
+-
++
++  static std::mutex execution_mutex;
++  const std::lock_guard<std::mutex> lock(execution_mutex);
++
+   tt_pjrt_status status = instance->execute(args);
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -220,4 +220,3 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+     if (!r) {
+-      m_client_instance->closeMeshDevice();
+       return tt_pjrt_status::kInternal;
+     }
+diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/api_bindings.cc
+--- a/pjrt_implementation/src/api_bindings.cc
++++ b/pjrt_implementation/src/api_bindings.cc
+@@ -22,10 +22,60 @@
+ #include "api/plugin_attributes.h"
+ #include "utils/logging.h"
++#include "xla/pjrt/c/pjrt_c_api_profiler_extension.h"
+ 
+ namespace tt::pjrt {
++namespace {
++
++// JAX 0.7.1 crashes if a PJRT plugin has no profiler extension. Advertise a
++// no-op device profiler so its host and Python profilers can still run.
++
++PLUGIN_Profiler_Error *createProfiler(PLUGIN_Profiler_Create_Args *args) {
++  args->profiler = nullptr;
++  return nullptr;
++}
++
++PLUGIN_Profiler_Error *profilerSuccess(PLUGIN_Profiler_Destroy_Args *) {
++  return nullptr;
++}
++PLUGIN_Profiler_Error *profilerSuccess(PLUGIN_Profiler_Start_Args *) {
++  return nullptr;
++}
++PLUGIN_Profiler_Error *profilerSuccess(PLUGIN_Profiler_Stop_Args *) {
++  return nullptr;
++}
++
++PLUGIN_Profiler_Error *
++collectProfilerData(PLUGIN_Profiler_CollectData_Args *args) {
++  args->buffer_size_in_bytes = 0;
++  return nullptr;
++}
++
++PLUGIN_Profiler_Api profilerApi{
++    .struct_size = PLUGIN_Profiler_Api_STRUCT_SIZE,
++    .priv = nullptr,
++    .error_destroy = nullptr,
++    .error_message = nullptr,
++    .error_get_code = nullptr,
++    .create = createProfiler,
++    .destroy = profilerSuccess,
++    .start = profilerSuccess,
++    .stop = profilerSuccess,
++    .collect_data = collectProfilerData,
++};
++
++PJRT_Profiler_Extension profilerExtension{
++    .struct_size = PJRT_Profiler_Extension_STRUCT_SIZE,
++    .type = PJRT_Extension_Type_Profiler,
++    .next = nullptr,
++    .profiler_api = &profilerApi,
++    .traceme_context_id = 0,
++};
++
++} // namespace
+ 
+ void bindApi(PJRT_Api *api) {
+   api->struct_size = PJRT_Api_STRUCT_SIZE;
+-  api->extension_start = nullptr;
++  api->extension_start =
++      reinterpret_cast<PJRT_Extension_Base *>(&profilerExtension);
+   api->pjrt_api_version.major_version = PJRT_API_MAJOR;
+   api->pjrt_api_version.minor_version = PJRT_API_MINOR;

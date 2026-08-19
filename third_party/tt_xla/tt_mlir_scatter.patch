@@ -1,0 +1,682 @@
+# Consolidated owner for StableHLO scatter lowering changes.
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index 2701ea4..487c93d 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -4617,6 +4617,59 @@ getReduceTypeFromRegion(Region &region) {
+       std::make_error_code(std::errc::operation_not_supported));
+ }
+ 
++static bool isSubtractReduction(Region &region) {
++  if (!region.hasOneBlock()) {
++    return false;
++  }
++  Block &block = region.front();
++  Operation *terminator = block.getTerminator();
++  if (block.getNumArguments() != 2 || terminator->getNumOperands() != 1) {
++    return false;
++  }
++  auto subtract = mlir::dyn_cast_or_null<mlir::stablehlo::SubtractOp>(
++      terminator->getOperand(0).getDefiningOp());
++  return subtract &&
++         subtract->getOperand(0) == block.getArgument(0) &&
++         subtract->getOperand(1) == block.getArgument(1);
++}
++
++enum class UnaryScatterApplyKind { None, Sine, SubtractOne };
++
++static UnaryScatterApplyKind getUnaryScatterApplyKind(Region &region) {
++  if (!region.hasOneBlock()) {
++    return UnaryScatterApplyKind::None;
++  }
++  Block &block = region.front();
++  auto returnOp =
++      mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
++  if (!returnOp || block.getNumArguments() != 2 ||
++      returnOp.getNumOperands() != 1) {
++    return UnaryScatterApplyKind::None;
++  }
++
++  Operation *result = returnOp.getOperand(0).getDefiningOp();
++  if (auto sine = mlir::dyn_cast_or_null<mlir::stablehlo::SineOp>(result);
++      sine && sine.getOperand() == block.getArgument(0)) {
++    return UnaryScatterApplyKind::Sine;
++  }
++
++  auto subtract =
++      mlir::dyn_cast_or_null<mlir::stablehlo::SubtractOp>(result);
++  if (!subtract || subtract->getOperand(0) != block.getArgument(0)) {
++    return UnaryScatterApplyKind::None;
++  }
++  auto constant = subtract->getOperand(1)
++                      .getDefiningOp<mlir::stablehlo::ConstantOp>();
++  DenseIntElementsAttr value;
++  if (constant) {
++    value = mlir::dyn_cast<DenseIntElementsAttr>(constant.getValue());
++  }
++  if (!value || !value.isSplat() || !value.getSplatValue<APInt>().isOne()) {
++    return UnaryScatterApplyKind::None;
++  }
++  return UnaryScatterApplyKind::SubtractOne;
++}
++
+ static llvm::ErrorOr<ttcore::ReduceType> getReduceType(Operation *op) {
+   if (!llvm::isa<mlir::stablehlo::AllReduceOp, mlir::stablehlo::ReduceScatterOp,
+                  mlir::stablehlo::ScatterOp>(op)) {
+@@ -7860,7 +7913,12 @@ public:
+     }
+ 
+     // Convert reduceType stablehlo attribute into ttir attribute.
+-    llvm::ErrorOr<ttcore::ReduceType> scatterReduceType = getReduceType(srcOp);
++    bool subtractReduction =
++        isSubtractReduction(srcOp.getUpdateComputation());
++    UnaryScatterApplyKind unaryApply =
++        getUnaryScatterApplyKind(srcOp.getUpdateComputation());
++    llvm::ErrorOr<ttcore::ReduceType> scatterReduceType =
++        subtractReduction ? ttcore::ReduceType::Sum : getReduceType(srcOp);
+     if (!scatterReduceType) {
+       return rewriter.notifyMatchFailure(
+           srcOp, "ScatterOp cannot specify reduce type.");
+@@ -7872,7 +7930,8 @@ public:
+     // below assumes, but `(operand, update) -> operand` keeps the original
+     // value and would be silently turned into an overwrite.
+     if (*scatterReduceType == ttcore::ReduceType::Invalid &&
+-        !returnsUpdateValue(srcOp.getUpdateComputation())) {
++        !returnsUpdateValue(srcOp.getUpdateComputation()) &&
++        unaryApply == UnaryScatterApplyKind::None) {
+       return rewriter.notifyMatchFailure(
+           srcOp, "the scatter's update computation neither combines its "
+                  "arguments nor returns the update value");
+@@ -7880,13 +7939,51 @@ public:
+ 
+     RankedTensorType outputType = mlir::cast<RankedTensorType>(
+         this->getTypeConverter()->convertType(srcOp.getResults()[0].getType()));
++    Value inputTensor = srcOp.getInputs()[0];
++    auto inputType = mlir::cast<RankedTensorType>(inputTensor.getType());
++    ArrayRef<int64_t> inputShape = inputType.getShape();
++    Value updateTensor = srcOp.getUpdates()[0];
++    RankedTensorType updateType =
++        mlir::cast<RankedTensorType>(updateTensor.getType());
++    bool usesFloat32Transport = inputType.getElementType().isF16();
++    if (usesFloat32Transport) {
++      Type float32 = rewriter.getF32Type();
++      inputType = inputType.clone(float32);
++      updateType = updateType.clone(float32);
++      inputTensor = rewriter.create<ttir::TypecastOp>(
++          srcOp.getLoc(), inputType, inputTensor);
++      updateTensor = rewriter.create<ttir::TypecastOp>(
++          srcOp.getLoc(), updateType, updateTensor);
++    }
++    if (subtractReduction) {
++      updateTensor = rewriter.create<ttir::NegOp>(
++          srcOp.getLoc(), updateType, updateTensor);
++    }
++    if (unaryApply != UnaryScatterApplyKind::None) {
++      return convertUnaryScatterApply(srcOp, inputTensor, inputShape,
++                                      updateType.getShape(), outputType,
++                                      unaryApply, usesFloat32Transport,
++                                      rewriter);
++    }
+ 
+     // A scatter that writes along at most one operand dimension is exactly what
+     // ttir.scatter expresses, including the degenerate case of writing along
+     // none of them.
+     ArrayRef<int64_t> scatterDimsToOperandDims =
+         adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims();
+-    if (scatterDimsToOperandDims.size() <= 1) {
++    ArrayRef<int64_t> insertedWindowDims =
++        adaptor.getScatterDimensionNumbers().getInsertedWindowDims();
++    ArrayRef<int64_t> inputBatchingDims =
++        adaptor.getScatterDimensionNumbers().getInputBatchingDims();
++    bool indexesWindowDim =
++        llvm::any_of(scatterDimsToOperandDims, [&](int64_t dim) {
++          return !llvm::is_contained(insertedWindowDims, dim);
++        });
++    bool canUseAlignedScatter = inputBatchingDims.empty() &&
++                                !indexesWindowDim &&
++                                inputType.getRank() == updateType.getRank();
++    if (!subtractReduction && scatterDimsToOperandDims.size() <= 1 &&
++        !inputType.getElementType().isF32() && canUseAlignedScatter) {
+       return convertToSingleDimScatter(srcOp, adaptor, *scatterReduceType,
+                                        outputType, rewriter);
+     }
+@@ -7894,15 +7991,31 @@ public:
+     // Multi-dimensional scatter: flatten everything to 1D and scatter scalars
+     // along dimension 0.
+     constexpr int32_t SCATTER_DIMENSION = 0;
+-    Value inputTensor = srcOp.getInputs()[0];
+-    Value updateTensor = srcOp.getUpdates()[0];
+-    ArrayRef<int64_t> inputShape =
+-        mlir::cast<RankedTensorType>(inputTensor.getType()).getShape();
+     ArrayRef<int64_t> updateShape =
+         mlir::cast<RankedTensorType>(updateTensor.getType()).getShape();
+ 
+     Value flattenedIndices =
+         flattenMultiDimScatterIndices(srcOp, inputShape, updateShape, rewriter);
++    // flattenMultiDimScatterIndices orders entries by scatter position and
++    // then by window position. Put updates in the same logical order.
++    ArrayRef<int64_t> updateWindowDims =
++        adaptor.getScatterDimensionNumbers().getUpdateWindowDims();
++    SmallVector<int64_t> updatePermutation = llvm::filter_to_vector(
++        llvm::seq<int64_t>(updateType.getRank()), [&](int64_t dim) {
++          return !llvm::is_contained(updateWindowDims, dim);
++        });
++    llvm::append_range(updatePermutation, updateWindowDims);
++    if (!llvm::is_sorted(updatePermutation)) {
++      auto currentUpdateType =
++          mlir::cast<RankedTensorType>(updateTensor.getType());
++      auto permutedShape =
++          ttmlir::utils::applyPermutation(updateShape, updatePermutation);
++      auto permutedType = currentUpdateType.clone(permutedShape);
++      updateTensor = rewriter.create<ttir::PermuteOp>(
++          ttmlir::utils::appendLocationSuffix(srcOp.getLoc(),
++                                              "_permute_update"),
++          permutedType, updateTensor, updatePermutation);
++    }
+     Value flattenedInput = ttir::utils::flattenTensor(
+         rewriter, srcOp.getLoc(), inputTensor, "_input_flatten");
+     Value flattenedUpdate = ttir::utils::flattenTensor(
+@@ -7920,6 +8033,10 @@ public:
+         ttmlir::utils::appendLocationSuffix(srcOp.getLoc(), "_result_reshape"),
+         scatterResult, inputShape);
+ 
++    if (usesFloat32Transport) {
++      reshapedResult = rewriter.create<ttir::TypecastOp>(
++          srcOp.getLoc(), outputType, reshapedResult);
++    }
+     rewriter.replaceOp(srcOp, reshapedResult);
+     return success();
+   }
+@@ -7927,5 +8044,68 @@ private:
+ private:
++  LogicalResult convertUnaryScatterApply(
++      mlir::stablehlo::ScatterOp srcOp, Value inputTensor,
++      ArrayRef<int64_t> inputShape, ArrayRef<int64_t> updateShape,
++      RankedTensorType outputType, UnaryScatterApplyKind kind,
++      bool usesFloat32Transport, ConversionPatternRewriter &rewriter) const {
++    Location loc = srcOp.getLoc();
++    Value flattenedIndices =
++        flattenMultiDimScatterIndices(srcOp, inputShape, updateShape, rewriter);
++    Value result = ttir::utils::flattenTensor(rewriter, loc, inputTensor,
++                                               "_apply_input_flatten");
++    auto resultType = mlir::cast<RankedTensorType>(result.getType());
++    auto scalarType = RankedTensorType::get(
++        {1}, resultType.getElementType(), resultType.getEncoding());
++    auto indexType = mlir::cast<RankedTensorType>(flattenedIndices.getType());
++    auto scalarIndexType = indexType.clone({1});
++    auto dim = rewriter.getI32IntegerAttr(0);
++    auto overwrite = ttcore::ReduceTypeAttr::get(
++        rewriter.getContext(), ttcore::ReduceType::Invalid);
++    int64_t numUpdates = ttmlir::utils::volume(updateShape);
++
++    for (int64_t i = 0; i < numUpdates; ++i) {
++      Value index = rewriter.create<ttir::SliceStaticOp>(
++          loc, scalarIndexType, flattenedIndices,
++          rewriter.getI32ArrayAttr({static_cast<int32_t>(i)}),
++          rewriter.getI32ArrayAttr({static_cast<int32_t>(i + 1)}),
++          rewriter.getI32ArrayAttr({1}));
++      Value gatherIndex = rewriter.create<ttir::ClampScalarOp>(
++          loc, scalarIndexType, index, rewriter.getI32IntegerAttr(0),
++          rewriter.getI32IntegerAttr(resultType.getNumElements() - 1));
++      Value value = rewriter.create<ttir::GatherOp>(
++          loc, scalarType, result, gatherIndex, dim);
++
++      switch (kind) {
++      case UnaryScatterApplyKind::Sine:
++        value = rewriter.create<ttir::SinOp>(loc, scalarType, value);
++        break;
++      case UnaryScatterApplyKind::SubtractOne: {
++        Attribute one = rewriter.getOneAttr(scalarType.getElementType());
++        Value oneTensor = rewriter.create<ttir::ConstantOp>(
++            loc, scalarType, DenseElementsAttr::get(scalarType, one));
++        value = rewriter.create<ttir::SubtractOp>(loc, scalarType, value,
++                                                   oneTensor);
++        break;
++      }
++      case UnaryScatterApplyKind::None:
++        llvm_unreachable("expected a supported unary scatter apply");
++      }
++
++      // Use the unclamped index for the scatter so out-of-bounds updates are
++      // still dropped. Updating one element at a time preserves the specified
++      // repeated-application behavior for duplicate indices.
++      result = rewriter.create<ttir::ScatterOp>(
++          loc, resultType, result, index, value, dim, overwrite);
++    }
++
++    result = ttir::utils::createReshapeOp(rewriter, loc, result, inputShape);
++    if (usesFloat32Transport) {
++      result = rewriter.create<ttir::TypecastOp>(loc, outputType, result);
++    }
++    rewriter.replaceOp(srcOp, result);
++    return success();
++  }
++
+   // Where each operand dimension draws its extent and its written position
+   // from: how a StableHLO scatter lines up with the operand's dimensions.
+   struct OperandDimSources {
+     static constexpr int64_t kNone = -1;
+@@ -8322,11 +8502,13 @@ private:
+     auto dimensionNumbers = adaptor.getScatterDimensionNumbers();
+     ArrayRef<int64_t> scatterDimsToOperandDims =
+         dimensionNumbers.getScatterDimsToOperandDims();
+-    if (!llvm::is_sorted(scatterDimsToOperandDims)) {
++    if (scatterDimsToOperandDims.empty()) {
+       return rewriter.notifyMatchFailure(
+-          op,
+-          "scatter_dims_to_operand_dims must be in strictly increasing order.");
++          op, "scatter_dims_to_operand_dims must not be empty");
+     }
++    // Index-vector columns map positionally to operand dimensions. Preserve
++    // their StableHLO-specified order: JAX legitimately emits non-monotonic
++    // mappings for mixed advanced indexing.
+ 
+     // Scatters along at most one operand dimension are checked by
+     // computeOperandAlignedLayout instead, which has to work the mapping out in
+@@ -8335,14 +8517,8 @@ private:
+       return success();
+     }
+ 
+-    // That path flattens the operand, which takes no account of batching
+-    // dimensions.
+-    if (!dimensionNumbers.getInputBatchingDims().empty() ||
+-        !dimensionNumbers.getScatterIndicesBatchingDims().empty()) {
+-      return rewriter.notifyMatchFailure(
+-          op, "TTIR multi-dimensional scatter does not support batching "
+-              "dimensions");
+-    }
++    // The flattened path materializes operand coordinates for StableHLO's
++    // paired input/scatter-index batching dimensions.
+ 
+     int64_t indexRank = op.getScatterIndices().getType().getRank();
+     if (dimensionNumbers.getIndexVectorDim() != indexRank - 1) {
+@@ -8430,6 +8606,23 @@ private:
+     return flatIndices;
+   }
+ 
++  Value clampScatterIndex(Location loc, PatternRewriter &rewriter, Value index,
++                          int64_t dimSize, Value &validIndices) const {
++    auto indexType = mlir::cast<RankedTensorType>(index.getType());
++    Value clamped = rewriter.create<ttir::ClampScalarOp>(
++        loc, indexType, index, rewriter.getI32IntegerAttr(0),
++        rewriter.getI32IntegerAttr(dimSize - 1));
++    auto validType = indexType.clone(rewriter.getI1Type());
++    Value isValid = rewriter.create<ttir::EqualOp>(
++        loc, validType, index, clamped);
++    if (validIndices) {
++      isValid = rewriter.create<ttir::LogicalAndOp>(
++          loc, validType, validIndices, isValid);
++    }
++    validIndices = isValid;
++    return clamped;
++  }
++
+   /// Computes flattened 1D indices for multi-dimensional scatter.
+   ///
+   /// Handles both cases:
+@@ -8467,6 +8660,10 @@ private:
+         scatterDimNumbers.getUpdateWindowDims();
+     ArrayRef<int64_t> scatterDimsToOperandDims =
+         scatterDimNumbers.getScatterDimsToOperandDims();
++    ArrayRef<int64_t> inputBatchingDims =
++        scatterDimNumbers.getInputBatchingDims();
++    ArrayRef<int64_t> scatterIndicesBatchingDims =
++        scatterDimNumbers.getScatterIndicesBatchingDims();
+     int64_t indexVectorDim = scatterDimNumbers.getIndexVectorDim();
+     int64_t operandRank = operandShape.size();
+     Location loc = op.getLoc();
+@@ -8474,6 +8671,8 @@ private:
+     // Build set of inserted window dims for fast lookup.
+     llvm::DenseSet<int64_t> insertedDimsSet(insertedWindowDims.begin(),
+                                             insertedWindowDims.end());
++    insertedDimsSet.insert(inputBatchingDims.begin(),
++                           inputBatchingDims.end());
+ 
+     // Build reverse map: operand dim -> index position in scatter indices.
+     llvm::DenseMap<int64_t, int64_t> scatterDimToIdxPos;
+@@ -8506,6 +8705,54 @@ private:
+     // Total number of expanded indices (one per one scalar update).
+     int64_t expandedNumIndices = numScatterPositions * windowSize;
+ 
++    // StableHLO batching dimensions do not have a window extent. Generate each
++    // matching scatter-index coordinate with a compact arange, then broadcast
++    // it over the other scatter dimensions and the update window. This keeps
++    // large batch coordinates out of constants embedded in the IR.
++    llvm::DenseMap<int64_t, Value> batchingIndexSlices;
++    for (auto [inputDim, indicesDim] :
++         llvm::zip_equal(inputBatchingDims, scatterIndicesBatchingDims)) {
++      auto coordinateType = RankedTensorType::get(
++          {indicesShape[indicesDim]}, indicesType.getElementType());
++      Value coordinate = rewriter.create<ttir::ArangeOp>(
++          ttmlir::utils::appendLocationSuffix(
++              loc, "_batch_index_" + std::to_string(inputDim)),
++          coordinateType, /*start=*/0, /*end=*/indicesShape[indicesDim],
++          /*step=*/1, /*arange_dimension=*/0);
++
++      // Expose the batch dimension in scatter-position-major order, followed
++      // by the update-window dimension and a singleton index column.
++      llvm::SmallVector<int64_t> broadcastShape;
++      int64_t broadcastBatchDim = 0;
++      for (auto [dim, size] : llvm::enumerate(indicesShape)) {
++        if (static_cast<int64_t>(dim) == indexVectorDim) {
++          continue;
++        }
++        if (static_cast<int64_t>(dim) == indicesDim) {
++          broadcastBatchDim = broadcastShape.size();
++        }
++        broadcastShape.push_back(size);
++      }
++      broadcastShape.push_back(windowSize);
++      broadcastShape.push_back(1);
++
++      llvm::SmallVector<int64_t> arangeShape(broadcastShape.size(), 1);
++      arangeShape[broadcastBatchDim] = indicesShape[indicesDim];
++      coordinate = ttir::utils::createReshapeOp(
++          rewriter, loc, coordinate, arangeShape);
++
++      auto broadcastType = RankedTensorType::get(
++          broadcastShape, indicesType.getElementType());
++      coordinate = rewriter.create<ttir::BroadcastOp>(
++          loc, broadcastType, coordinate,
++          rewriter.getDenseI64ArrayAttr(
++              ttmlir::utils::getBroadcastDimensions<int64_t>(arangeShape,
++                                                               broadcastShape)));
++
++      batchingIndexSlices[inputDim] = ttir::utils::createReshapeOp(
++          rewriter, loc, coordinate, {expandedNumIndices, 1});
++    }
++
+     // First, reshape the original indices to shape
+     // [numScatterPositions, originalIndexSize].
+     int64_t originalIndexSize = indicesShape[indexVectorDim];
+@@ -8602,31 +8849,42 @@ private:
+     // b) window-only: use window offset only
+     // c) both scatter-indexed and window: add scatter index + window offset
+     llvm::SmallVector<Value> indexSlices;
++    Value validIndices;
+     size_t windowIdxPos = 0;
+     for (int64_t operandDim = 0; operandDim < operandRank; ++operandDim) {
+       bool isScatterDim = scatterDimToIdxPos.count(operandDim);
+       bool isWindowDim = !insertedDimsSet.contains(operandDim);
+ 
+-      Value dimIndex = nullptr;
++      Value dimIndex = batchingIndexSlices.lookup(operandDim);
+ 
+       if (isScatterDim) {
+-        // a) Slice the scatter index column for this operand dim.
+-        int64_t idxPos = scatterDimToIdxPos[operandDim];
+-        llvm::SmallVector<int32_t> begins = {0, static_cast<int32_t>(idxPos)};
+-        llvm::SmallVector<int32_t> ends = {
+-            static_cast<int32_t>(expandedNumIndices),
+-            static_cast<int32_t>(idxPos + 1)};
+-        llvm::SmallVector<int32_t> steps = {1, 1};
+-
+-        llvm::SmallVector<int64_t> sliceShape = {expandedNumIndices, 1};
+-        RankedTensorType sliceType =
+-            RankedTensorType::get(sliceShape, indicesType.getElementType());
+-
+-        dimIndex = rewriter.create<ttir::SliceStaticOp>(
+-            ttmlir::utils::appendLocationSuffix(
+-                loc, "_slice_orig_idx_" + std::to_string(operandDim)),
+-            sliceType, flatRepeatedIndices, rewriter.getI32ArrayAttr(begins),
+-            rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
++        // Avoid a redundant slice for the common scalar-index case. Besides
++        // being cheaper, this keeps reshape folding from exposing a rank-0
++        // tensor as the input of SliceStaticOp.
++        if (originalIndexSize == 1) {
++          dimIndex = flatRepeatedIndices;
++        } else {
++          // a) Slice the scatter index column for this operand dim.
++          int64_t idxPos = scatterDimToIdxPos[operandDim];
++          llvm::SmallVector<int32_t> begins = {
++              0, static_cast<int32_t>(idxPos)};
++          llvm::SmallVector<int32_t> ends = {
++              static_cast<int32_t>(expandedNumIndices),
++              static_cast<int32_t>(idxPos + 1)};
++          llvm::SmallVector<int32_t> steps = {1, 1};
++
++          llvm::SmallVector<int64_t> sliceShape = {expandedNumIndices, 1};
++          RankedTensorType sliceType =
++              RankedTensorType::get(sliceShape, indicesType.getElementType());
++
++          dimIndex = rewriter.create<ttir::SliceStaticOp>(
++              ttmlir::utils::appendLocationSuffix(
++                  loc, "_slice_orig_idx_" + std::to_string(operandDim)),
++              sliceType, flatRepeatedIndices,
++              rewriter.getI32ArrayAttr(begins),
++              rewriter.getI32ArrayAttr(ends),
++              rewriter.getI32ArrayAttr(steps));
++        }
+       }
+ 
+       if (isWindowDim) {
+@@ -8648,11 +8906,23 @@ private:
+         }
+       }
+ 
++      if (isScatterDim) {
++        dimIndex = clampScatterIndex(loc, rewriter, dimIndex,
++                                     operandShape[operandDim], validIndices);
++      }
+       indexSlices.push_back(dimIndex);
+     }
+ 
+     Value flatIndices = computeFlatIndicesFromSlices(
+         loc, rewriter, indexSlices, operandShape, indicesType.getElementType());
++    auto flatIndicesType =
++        mlir::cast<RankedTensorType>(flatIndices.getType());
++    Value outOfBounds = rewriter.create<ttir::FullOp>(
++        loc, flatIndicesType,
++        rewriter.getI32IntegerAttr(
++            static_cast<int32_t>(ttmlir::utils::volume(operandShape))));
++    flatIndices = rewriter.create<ttir::WhereOp>(
++        loc, flatIndicesType, validIndices, flatIndices, outOfBounds);
+ 
+     // Flatten the computed indices to 1D.
+     return ttir::utils::flattenTensor(rewriter, loc, flatIndices,
+@@ -11090,6 +11360,7 @@ public:
+     return success();
+   }
+ };
++
+ } // namespace
+ 
+ namespace {
+@@ -11144,7 +11415,6 @@ public:
+     return success();
+   }
+ };
+-
+ } // namespace
+ 
+ namespace {
+@@ -11204,6 +11474,94 @@ public:
+     return success();
+   }
+ };
++
++class StableHLOApproxTopKOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
++  using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CustomCallOp srcOp,
++                  mlir::stablehlo::CustomCallOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    if (adaptor.getCallTargetNameAttr() != "ApproxTopK") {
++      return failure();
++    }
++
++    SmallVector<Type> resultTypes;
++    if (failed(getTypeConverter()->convertTypes(srcOp->getResultTypes(),
++                                                resultTypes))) {
++      return failure();
++    }
++    Value input = adaptor.getOperands()[0];
++    auto inputType = mlir::dyn_cast<RankedTensorType>(input.getType());
++    auto config =
++        mlir::dyn_cast<DictionaryAttr>(srcOp.getBackendConfigAttr());
++    if (!inputType || !config) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK requires a ranked input and backend config");
++    }
++
++    auto kAttr = config.getAs<IntegerAttr>("top_k");
++    auto dimAttr = config.getAs<IntegerAttr>("reduction_dim");
++    auto aggregateAttr = config.getAs<BoolAttr>("aggregate_to_topk");
++    if (!kAttr || !dimAttr || !aggregateAttr) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK backend config is incomplete");
++    }
++    if (!aggregateAttr.getValue()) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Non-aggregate ApproxTopK is not supported");
++    }
++
++    int64_t k = kAttr.getInt();
++    int64_t dim = dimAttr.getInt();
++    if (k <= 0 || k > std::numeric_limits<int32_t>::max() || dim < 0 ||
++        dim >= inputType.getRank()) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK backend config is out of range");
++    }
++
++    auto calledComputations = srcOp.getCalledComputations();
++    if (calledComputations.size() != 1) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK requires exactly one comparator");
++    }
++    auto comparator = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
++        srcOp, mlir::cast<FlatSymbolRefAttr>(calledComputations[0]));
++    if (!comparator || comparator.getBody().empty() ||
++        comparator.getNumArguments() < 2) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "ApproxTopK comparator is invalid");
++    }
++
++    Block &entryBlock = comparator.getBody().front();
++    FailureOr<bool> largest = failure();
++    comparator.walk([&](mlir::stablehlo::CompareOp compareOp) {
++      if (compareOp->getOperand(0) != entryBlock.getArgument(0) ||
++          compareOp->getOperand(1) != entryBlock.getArgument(1)) {
++        return WalkResult::advance();
++      }
++      auto direction = compareOp.getComparisonDirection();
++      if (direction != mlir::stablehlo::ComparisonDirection::LT &&
++          direction != mlir::stablehlo::ComparisonDirection::GT) {
++        return WalkResult::advance();
++      }
++      largest = direction == mlir::stablehlo::ComparisonDirection::GT;
++      return WalkResult::interrupt();
++    });
++    if (failed(largest)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Cannot determine ApproxTopK comparator direction");
++    }
++
++    rewriter.replaceOpWithNewOp<ttir::TopKOp>(
++        srcOp, resultTypes, input, rewriter.getI32IntegerAttr(k),
++        rewriter.getI32IntegerAttr(dim), rewriter.getBoolAttr(*largest),
++        rewriter.getBoolAttr(true));
++    return success();
++  }
++};
+ } // namespace
+ 
+ namespace {
+@@ -11295,94 +11653,6 @@ public:
+     return success();
+   }
+ };
+-
+-class StableHLOApproxTopKOpConversionPattern
+-    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
+-  using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
+-
+-public:
+-  LogicalResult
+-  matchAndRewrite(mlir::stablehlo::CustomCallOp srcOp,
+-                  mlir::stablehlo::CustomCallOp::Adaptor adaptor,
+-                  ConversionPatternRewriter &rewriter) const override {
+-    if (adaptor.getCallTargetNameAttr() != "ApproxTopK") {
+-      return failure();
+-    }
+-
+-    SmallVector<Type> resultTypes;
+-    if (failed(getTypeConverter()->convertTypes(srcOp->getResultTypes(),
+-                                                resultTypes))) {
+-      return failure();
+-    }
+-    Value input = adaptor.getOperands()[0];
+-    auto inputType = mlir::dyn_cast<RankedTensorType>(input.getType());
+-    auto config =
+-        mlir::dyn_cast<DictionaryAttr>(srcOp.getBackendConfigAttr());
+-    if (!inputType || !config) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "ApproxTopK requires a ranked input and backend config");
+-    }
+-
+-    auto kAttr = config.getAs<IntegerAttr>("top_k");
+-    auto dimAttr = config.getAs<IntegerAttr>("reduction_dim");
+-    auto aggregateAttr = config.getAs<BoolAttr>("aggregate_to_topk");
+-    if (!kAttr || !dimAttr || !aggregateAttr) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "ApproxTopK backend config is incomplete");
+-    }
+-    if (!aggregateAttr.getValue()) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "Non-aggregate ApproxTopK is not supported");
+-    }
+-
+-    int64_t k = kAttr.getInt();
+-    int64_t dim = dimAttr.getInt();
+-    if (k <= 0 || k > std::numeric_limits<int32_t>::max() || dim < 0 ||
+-        dim >= inputType.getRank()) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "ApproxTopK backend config is out of range");
+-    }
+-
+-    auto calledComputations = srcOp.getCalledComputations();
+-    if (calledComputations.size() != 1) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "ApproxTopK requires exactly one comparator");
+-    }
+-    auto comparator = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+-        srcOp, mlir::cast<FlatSymbolRefAttr>(calledComputations[0]));
+-    if (!comparator || comparator.getBody().empty() ||
+-        comparator.getNumArguments() < 2) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "ApproxTopK comparator is invalid");
+-    }
+-
+-    Block &entryBlock = comparator.getBody().front();
+-    FailureOr<bool> largest = failure();
+-    comparator.walk([&](mlir::stablehlo::CompareOp compareOp) {
+-      if (compareOp->getOperand(0) != entryBlock.getArgument(0) ||
+-          compareOp->getOperand(1) != entryBlock.getArgument(1)) {
+-        return WalkResult::advance();
+-      }
+-      auto direction = compareOp.getComparisonDirection();
+-      if (direction != mlir::stablehlo::ComparisonDirection::LT &&
+-          direction != mlir::stablehlo::ComparisonDirection::GT) {
+-        return WalkResult::advance();
+-      }
+-      largest = direction == mlir::stablehlo::ComparisonDirection::GT;
+-      return WalkResult::interrupt();
+-    });
+-    if (failed(largest)) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "Cannot determine ApproxTopK comparator direction");
+-    }
+-
+-    rewriter.replaceOpWithNewOp<ttir::TopKOp>(
+-        srcOp, resultTypes, input, rewriter.getI32IntegerAttr(k),
+-        rewriter.getI32IntegerAttr(dim), rewriter.getBoolAttr(*largest),
+-        rewriter.getBoolAttr(true));
+-    return success();
+-  }
+-};
+ } // namespace
+ 
+ namespace {

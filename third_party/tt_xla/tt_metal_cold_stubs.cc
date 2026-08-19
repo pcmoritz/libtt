@@ -1,16 +1,11 @@
 #include "ttnn/operations/ccl/ccl_common.hpp"
 #include "ttnn/operations/ccl/ccl_op_fusion.hpp"
 #include "ttnn/operations/ccl/mesh_partition/mesh_partition.hpp"
-#include "ttnn/operations/conv/conv1d/conv1d.hpp"
-#include "ttnn/operations/conv/conv2d/conv2d.hpp"
-#include "ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.hpp"
-#include "ttnn/operations/conv/conv2d/prepare_conv2d_weights.hpp"
 #include "ttnn/operations/experimental/ccl/ring_attention_all_gather_async/device/ring_attention_all_gather_async_device_operation.hpp"
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp"
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
 #include "ttnn/operations/experimental/conv3d/conv3d.hpp"
 #include "ttnn/operations/experimental/unary_backward/gelu_backward/gelu_backward.hpp"
-#include "ttnn/operations/pool/generic/generic_pools.hpp"
 #include "ttnn/operations/pool/upsample/upsample.hpp"
 #include "ttnn/tensor/serialization.hpp"
 
@@ -28,36 +23,10 @@ namespace {
 
 namespace ttnn {
 
-tt::tt_metal::Tensor mesh_partition(
-    const tt::tt_metal::Tensor &, int32_t, std::optional<uint32_t>,
+ttnn::Tensor mesh_partition(
+    const ttnn::Tensor &, int32_t, std::optional<uint32_t>,
     const std::optional<tt::tt_metal::MemoryConfig> &) {
   unsupported("ttnn::mesh_partition");
-}
-
-Conv2dResultWithOptions conv2d(
-    const Tensor &, const Tensor &, MeshDevice *, uint32_t, uint32_t, uint32_t,
-    uint32_t, uint32_t, std::array<uint32_t, 2>,
-    std::array<uint32_t, 2>,
-    std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>>,
-    std::array<uint32_t, 2>, uint32_t, const std::optional<const DataType> &,
-    const std::optional<const Tensor> &,
-    const std::optional<const Conv2dConfig> &,
-    const std::optional<const DeviceComputeKernelConfig> &,
-    const std::optional<const MemoryConfig> &,
-    const std::optional<const Conv2dSliceConfig> &, bool, bool) {
-  unsupported("ttnn::conv2d");
-}
-
-Conv1dResult conv1d(
-    const Tensor &, const Tensor &, MeshDevice *, uint32_t, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t,
-    std::variant<std::array<uint32_t, 2>, uint32_t>, uint32_t, uint32_t,
-    const std::optional<const DataType> &, const std::optional<const Tensor> &,
-    const std::optional<const Conv1dConfig> &,
-    const std::optional<const DeviceComputeKernelConfig> &,
-    const std::optional<const MemoryConfig> &,
-    const std::optional<const Conv1dSliceConfig> &, bool, bool) {
-  unsupported("ttnn::conv1d");
 }
 
 void ring_attention_all_gather_async_multi_core_with_workers_helper(
@@ -68,112 +37,13 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     const std::vector<GlobalSemaphore> &,
     const std::optional<tt::tt_metal::SubDeviceId> &,
     std::optional<ttnn::experimental::ccl::AllGatherFusedOpSignaler> &,
-    CoreCoord, ttnn::ccl::CoreAllocationStrategy,
-    std::optional<uint32_t>, std::optional<uint32_t>) {
+    CoreCoord, ttnn::ccl::CoreAllocationStrategy, std::optional<uint32_t>,
+    std::optional<uint32_t>, std::optional<Tensor>, std::optional<Tensor>,
+    uint32_t, uint32_t, uint32_t) {
   unsupported("ttnn::ring_attention_all_gather_async");
 }
 
 } // namespace ttnn
-
-namespace ttnn::operations::conv::conv2d {
-
-ttnn::Tensor convert_conv_weight_tensor_to_grouped_layout_for_conv_transpose2d(
-    const ttnn::Tensor &, uint32_t, DataType) {
-  unsupported(
-      "ttnn::operations::conv::conv2d::"
-      "convert_conv_weight_tensor_to_grouped_layout_for_conv_transpose2d");
-}
-
-std::pair<ttnn::Tensor, std::optional<ttnn::Tensor>>
-prepare_conv_weights_biases_and_move_to_device(
-    const ttnn::Tensor &, const std::optional<const ttnn::Tensor> &,
-    Conv2dWeightsBiasPrepConfig &, MeshDevice *) {
-  unsupported(
-      "ttnn::operations::conv::conv2d::"
-      "prepare_conv_weights_biases_and_move_to_device");
-}
-
-ttnn::Tensor prepare_conv_weights(
-    const ttnn::Tensor &, const ttnn::MemoryConfig &, Layout,
-    const std::string &, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-    std::array<uint32_t, 2>, std::array<uint32_t, 2>,
-    std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>>,
-    std::array<uint32_t, 2>, bool, uint32_t, MeshDevice *, DataType,
-    const std::optional<const DataType> &,
-    const std::optional<const Conv2dConfig> &,
-    const std::optional<const DeviceComputeKernelConfig> &,
-    const std::optional<const Conv2dSliceConfig> &) {
-  unsupported("ttnn::prepare_conv_weights");
-}
-
-ttnn::Tensor prepare_conv_bias(
-    const ttnn::Tensor &, const ttnn::MemoryConfig &, Layout, uint32_t,
-    uint32_t, uint32_t, uint32_t, uint32_t, std::array<uint32_t, 2>,
-    std::array<uint32_t, 2>,
-    std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>>,
-    std::array<uint32_t, 2>, uint32_t, MeshDevice *, DataType,
-    const std::optional<const DataType> &,
-    const std::optional<const Conv2dConfig> &,
-    const std::optional<const DeviceComputeKernelConfig> &,
-    const std::optional<const Conv2dSliceConfig> &) {
-  unsupported("ttnn::prepare_conv_bias");
-}
-
-} // namespace ttnn::operations::conv::conv2d
-
-namespace ttnn::prim {
-
-ttnn::Tensor conv2d(
-    const ttnn::Tensor &, const ttnn::Tensor &,
-    const std::optional<const ttnn::Tensor> &,
-    const ttnn::operations::sliding_window::SlidingWindowConfig &, uint32_t,
-    uint32_t, bool,
-    const std::optional<ttnn::operations::unary::UnaryWithParam> &,
-    const Conv2dParallelizationConfig &, const Conv2dBlockConfig &,
-    const tt::tt_metal::MemoryConfig &, tt::tt_metal::DataType,
-    std::array<std::uint32_t, 4>, const ttnn::DeviceComputeKernelConfig &,
-    bool, bool, bool, bool, bool, std::optional<bool>) {
-  unsupported("ttnn::prim::conv2d");
-}
-
-std::vector<CBInfo> get_cb_info(
-    const DeviceComputeKernelConfig &, const Conv2dBlockConfig &,
-    const Conv2dParallelizationConfig &, const ttnn::Shape &,
-    std::array<uint32_t, 2>, std::array<uint32_t, 2>,
-    std::array<uint32_t, 2>, const Conv2dConfig &, DataType, DataType,
-    std::array<uint32_t, 2>, uint32_t, bool, bool, bool, uint32_t,
-    std::optional<uint32_t>) {
-  unsupported("ttnn::prim::get_cb_info");
-}
-
-} // namespace ttnn::prim
-
-namespace ttnn::operations::pool {
-
-std::vector<Tensor> max_pool2d(
-    const Tensor &, uint32_t, uint32_t, uint32_t, uint32_t,
-    std::array<uint32_t, 2>, std::array<uint32_t, 2>,
-    std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>>,
-    std::array<uint32_t, 2>, bool, const std::optional<const MemoryConfig> &,
-    const std::optional<Op2DSliceConfig> &,
-    std::optional<const TensorMemoryLayout>, bool, bool, bool, DataType, Layout,
-    bool) {
-  unsupported("ttnn::max_pool2d");
-}
-
-Tensor avg_pool2d(
-    const Tensor &, uint32_t, uint32_t, uint32_t, uint32_t,
-    std::array<uint32_t, 2>, std::array<uint32_t, 2>,
-    std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>>, bool, bool,
-    std::optional<int32_t>, const std::optional<const MemoryConfig> &,
-    const std::optional<Op2DSliceConfig> &,
-    std::optional<const TensorMemoryLayout>,
-    const std::optional<DeviceComputeKernelConfig> &, bool, bool, DataType,
-    Layout, bool) {
-  unsupported("ttnn::avg_pool2d");
-}
-
-} // namespace ttnn::operations::pool
 
 namespace ttnn::operations::upsample {
 
@@ -302,20 +172,21 @@ bool MatmulFusedOpSignaler::is_reduce_scatter() const {
          fused_op_type == MatmulFusedOpSignalerType::LLAMA_REDUCE_SCATTER;
 }
 
-} // namespace tt::tt_metal
+} // namespace ttnn::experimental::ccl
 
-namespace tt::tt_metal {
+namespace ttnn {
 
 void dump_tensor_flatbuffer(const std::string &, const Tensor &,
                             DumpTensorMode) {
-  unsupported("tt::tt_metal::dump_tensor_flatbuffer");
+  unsupported("ttnn::dump_tensor_flatbuffer");
 }
 
-Tensor load_tensor_flatbuffer(const std::string &, distributed::MeshDevice *) {
-  unsupported("tt::tt_metal::load_tensor_flatbuffer");
+Tensor load_tensor_flatbuffer(
+    const std::string &, tt::tt_metal::distributed::MeshDevice *) {
+  unsupported("ttnn::load_tensor_flatbuffer");
 }
 
-} // namespace ttnn::experimental::ccl
+} // namespace ttnn
 
 namespace ttnn::ccl {
 

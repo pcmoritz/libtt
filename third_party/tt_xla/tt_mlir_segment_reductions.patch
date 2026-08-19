@@ -1,0 +1,82 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index 1111111..2222222 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -7010,6 +7010,11 @@ public:
+     auto operandType = mlir::cast<RankedTensorType>(operand.getType());
+     auto updateType = mlir::cast<RankedTensorType>(update.getType());
+ 
++    // embedding_backward only supports BF16 and would narrow F32 updates.
++    if (operandType.getElementType().isF32()) {
++      return failure();
++    }
++
+     if (operandType.getRank() != 2) {
+       return rewriter.notifyMatchFailure(
+           srcOp, "EmbeddingBackward requires 2D weight table (operand)");
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+index 1111111..2222222 100644
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -922,5 +922,8 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
++  // Float32 cannot represent the INT32_MAX identity used by min.
++  bool supportsInt32 =
++      inputType.isInteger(32) && mlir::isa<ttnn::MinOp>(op);
+   TTNNOperandWorkarounds operandWorkaround;
+-  if (!inputType.isF32() && !inputType.isBF16()) {
++  if (!inputType.isF32() && !inputType.isBF16() && !supportsInt32) {
+     operandWorkaround.tensorDataTypeWorkaround =
+         mlir::tt::ttcore::DataType::Float32;
+   }
+@@ -935,11 +938,6 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
+ // Factory method to create a set of workarounds for reduce product op operands.
+-// tt-metal only supports full product reduction for bfloat16 data type.
+ TTNNOperandsWorkarounds
+-TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds() {
+-  TTNNOperandWorkarounds bf16Workaround;
+-  bf16Workaround.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;
+-
+-  return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+-      .addInputOperandWorkaround(bf16Workaround)
+-      .addOutputOperandWorkaround(bf16Workaround);
++TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(
++    mlir::Operation *op) {
++  return createReductionOpOperandsWorkarounds(op);
+ }
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+index 1111111..2222222 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -999 +999 @@ def TTNN_ProdOp : TTNN_Op<"prod"> {
+-        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds();
++        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(*this);
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+index 1111111..2222222 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -351 +351,2 @@ class TTNNOperandsWorkaroundsFactory {
+-  static TTNNOperandsWorkarounds createReduceProdOpOperandsWorkarounds();
++  static TTNNOperandsWorkarounds
++  createReduceProdOpOperandsWorkarounds(mlir::Operation *op);
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+index 1111111..2222222 100644
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+@@ -96,9 +96,15 @@ private:
+   // Identifies function input arguments that are candidates for RowMajor layout
+-  // propagation. Currently restricted to integer tensor types only.
++  // propagation. F32 inputs are also eligible when the function uses scatter.
+   llvm::SmallVector<Value> identifyInputArguments(func::FuncOp func) {
+     llvm::SmallVector<Value> rowMajorCandidates;
++    bool hasScatter =
++        func.walk([](ttnn::ScatterOp) { return WalkResult::interrupt(); })
++            .wasInterrupted();
+     for (BlockArgument arg : func.getArguments()) {
+-      if (isInputArgument(arg, func) && hasIntegerElementType(arg)) {
++      auto type = mlir::dyn_cast<RankedTensorType>(arg.getType());
++      if (isInputArgument(arg, func) &&
++          (hasIntegerElementType(arg) ||
++           (hasScatter && type && type.getElementType().isF32()))) {
+         rowMajorCandidates.push_back(arg);
+       }
+     }

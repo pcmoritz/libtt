@@ -1,0 +1,28 @@
+# Value-initialize generic host-tensor padding without assuming T is
+# constructible from an integer literal.
+diff --git tt_metal/impl/tensor/host_tensor_factory.cpp tt_metal/impl/tensor/host_tensor_factory.cpp
+--- tt_metal/impl/tensor/host_tensor_factory.cpp
++++ tt_metal/impl/tensor/host_tensor_factory.cpp
+@@ -69,3 +69,3 @@ template <typename T>
+ HostTensor HostTensor::from_span(std::span<const T> buffer, const TensorSpec& spec) {
+-    return host_tensor_from_span_with_pad_value(buffer, spec, T{0});
++    return host_tensor_from_span_with_pad_value(buffer, spec, T{});
+ }
+@@ -115,3 +115,3 @@ template <typename T>
+ HostTensor HostTensor::from_vector(const std::vector<T>& buffer, const TensorSpec& spec) {
+-    return host_tensor_from_vector_with_pad_value(buffer, spec, T{0});
++    return host_tensor_from_vector_with_pad_value(buffer, spec, T{});
+ }
+@@ -120,3 +120,3 @@ template <typename T>
+ HostTensor HostTensor::from_vector(std::vector<T>&& buffer, const TensorSpec& spec) {
+-    return host_tensor_from_vector_with_pad_value(std::move(buffer), spec, T{0});
++    return host_tensor_from_vector_with_pad_value(std::move(buffer), spec, T{});
+ }
+diff --git tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
+--- tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
++++ tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
+@@ -171,3 +171,3 @@ template <typename T>
+ HostTensor to_tensor_spec(const HostTensor& tensor, const TensorSpec& dest_spec) {
+-    return host_tensor_to_tensor_spec_with_pad_value(tensor, dest_spec, T{0});
++    return host_tensor_to_tensor_spec_with_pad_value(tensor, dest_spec, T{});
+ }

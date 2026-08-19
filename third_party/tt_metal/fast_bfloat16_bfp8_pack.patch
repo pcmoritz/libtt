@@ -1,6 +1,6 @@
 --- tt_metal/impl/data_format/blockfloat_common.cpp
 +++ tt_metal/impl/data_format/blockfloat_common.cpp
-@@ -3,10 +3,15 @@
+@@ -3,10 +3,14 @@
  // SPDX-License-Identifier: Apache-2.0
  
  #include <algorithm>
@@ -15,7 +15,7 @@
  #include <tt_stl/assert.hpp>
  #include "blockfloat_common.hpp"
  #include "constants.hpp"
-@@ -328,6 +333,121 @@
+@@ -328,6 +332,116 @@ uint8_t convert_u32_to_bfp(uint32_t input, uint32_t shared_exp, bool is_exp_a) {
      return mantissa;
  }
  

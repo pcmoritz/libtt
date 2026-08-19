@@ -1,0 +1,35 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -944,22 +944,20 @@ TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(
+ // tt-metal generates indices of type UInt16 or UInt32 depending on padded size.
+ // Any mismatch between generated and expected data type will cause runtime to
+ // assert. Issue page: https://github.com/tenstorrent/tt-mlir/issues/4405
+-// tt-metal also only supports BFloat16 or UInt16 for input tensors, not
+-// Float32. Issue page: https://github.com/tenstorrent/tt-metal/issues/37322
++// Convert integer keys no wider than 16 bits to Float32.  All such values are
++// exactly representable, signed ordering is preserved, and the composite sort
++// can pad with infinities outside the integer key domain.  Leave wider integer
++// keys untouched: tt-metal has no exact 32-bit integer sort path, and silently
++// rounding them through Float32 can change their order.
+ TTNNOperandsWorkarounds
+ TTNNOperandsWorkaroundsFactory::createSortOpOperandsWorkarounds(
+     ttnn::SortOp op) {
+-  // Check input tensor type - tt-metal only supports BFloat16 or UInt16
+   auto inputElementType = op.getInput().getType().getElementType();
+   TTNNOperandWorkarounds inputOutputWorkaround;
+-  if (isa<IntegerType>(inputElementType) &&
+-      !(inputElementType.isInteger(16) &&
+-        inputElementType.isUnsignedInteger())) {
+-    // Convert integer input to ui16
+-    inputOutputWorkaround.tensorDataTypeWorkaround = ttcore::DataType::UInt16;
+-  } else if (inputElementType.isF32()) {
+-    // Convert f32 input to bf16
+-    inputOutputWorkaround.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;
++  if (auto integerType = dyn_cast<IntegerType>(inputElementType);
++      integerType && integerType.getWidth() <= 16) {
++    inputOutputWorkaround.tensorDataTypeWorkaround =
++        ttcore::DataType::Float32;
+   }
+ 
+   // Check output indices type - tt-metal generates UInt16 or UInt32 based on

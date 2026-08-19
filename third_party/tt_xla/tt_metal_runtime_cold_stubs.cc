@@ -107,6 +107,8 @@ void ClearNocData(tt_metal::MetalEnvImpl &, ChipId) {}
 
 namespace tt::tt_fabric {
 
+using tt::tt_metal::CoreCoord;
+
 namespace {
 
 tt::tt_metal::distributed::multihost::ContextPtr current_world_context() {

@@ -45,31 +45,31 @@
  }
 
  } // namespace
-@@ -537,8 +556,7 @@
-
+@@ -536,12 +570,11 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
+   }
+ 
    // Must concat on last dimension with exactly 2 operands.
    auto resultType = mlir::cast<RankedTensorType>(srcOp.getType());
 -  if (resultType.getRank() != 4) {
-+  ReshapeOp rank4Reshape = getRank4DecodeReshapeUser(srcOp);
-+  if (resultType.getRank() != 4 && !rank4Reshape) return failure();
 -    return failure();
 -  }
 -  if (srcOp.getDim() != resultType.getRank() - 1) {
++  ReshapeOp rank4Reshape = getRank4DecodeReshapeUser(srcOp);
++  if (resultType.getRank() != 4 && !rank4Reshape) return failure();
 +  if (srcOp.getDim() != static_cast<int32_t>(resultType.getRank() - 1)) {
      return failure();
-@@ -608,8 +626,9 @@
    }
-
-   // Input must be 4D.
+   if (srcOp.getNumOperands() != 2) {
+     return failure();
+@@ -611,3 +640,7 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
    auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
 -  if (inputType.getRank() != 4) {
-+  if (inputType.getRank() != 4 && !rank4Reshape) return failure();
-+  if (rank4Reshape &&
-+      inputType.getNumElements() != resultType.getNumElements())
++  if (inputType.getRank() != 4 && !rank4Reshape) {
 +    return failure();
--    return failure();
--  }
-
++  }
++  if (rank4Reshape &&
++      inputType.getNumElements() != resultType.getNumElements()) {
+     return failure();
 @@ -648,11 +665,16 @@
    // self-concat and use the half-dim operand directly.
 -  Value cosHalf = get4DEmbeddingInput(subEmb0);
@@ -120,13 +120,20 @@
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
-@@ -133,2 +133,5 @@ static void registerBuiltinComposites() {
+@@ -162,25 +162,31 @@ static void registerBuiltinComposites() {
+       // Validate
+       [](ttcore::CompositeOp compositeOp,
+          OpBuilder &builder) -> OpValidationResult {
          TT_assert(compositeOp.getInputs().size() == 3u);
 +        IntegerAttr tokenIndexAttr;
 +        if (auto attrs = compositeOp.getCompositeAttributes())
 +          tokenIndexAttr = attrs->getAs<IntegerAttr>("token_index");
-
-@@ -140,14 +142,17 @@ static void registerBuiltinComposites() {
+ 
+         SmallVector<Type> resultTypes(compositeOp.getResultTypes());
+         IsolatedIRValidationWrapper validator(compositeOp.getContext());
+         return validator.validateOp<RotaryEmbeddingOp>(
+             compositeOp.getOperation(), compositeOp.getLoc(), resultTypes,
+             compositeOp.getInputs()[0], compositeOp.getInputs()[1],
              compositeOp.getInputs()[2],
 -            /*token_index=*/mlir::IntegerAttr(),
 +            tokenIndexAttr,
@@ -144,8 +151,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect
 -            /*token_index=*/mlir::IntegerAttr(),
 +            tokenIndexAttr,
              /*compute_config=*/nullptr);
-       }};
-
+       },
+       /*promotionGuard=*/nullptr};
+ 
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp

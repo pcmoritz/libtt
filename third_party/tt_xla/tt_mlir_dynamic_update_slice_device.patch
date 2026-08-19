@@ -1,0 +1,191 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -4844,3 +4844,0 @@
+-// NOTE: StableHLO Dynamic Slice Op clamps start indices to ensure validity,
+-// but we don't. Would add multiple ops (worse perf) and doesn't appear in test
+-// models.
+@@ -5070,6 +5067,10 @@ public:
+                   ConversionPatternRewriter &rewriter) const override {
+     auto outputType = mlir::cast<RankedTensorType>(
+         getTypeConverter()->convertType(srcOp.getResult().getType()));
++    auto operandShape = mlir::cast<RankedTensorType>(
++                            adaptor.getOperand().getType())
++                            .getShape();
++    auto sliceSizes = srcOp.getSliceSizes();
+ 
+     // Reshape start indices to 1D tensors for concat op.
+     ValueRange startIndicesRange = adaptor.getStartIndices();
+@@ -5080,13 +5081,17 @@ public:
+     auto singleElementTensorType =
+         RankedTensorType::get({1}, startIndexElementType);
+ 
+-    for (Value startIndex : startIndicesRange) {
+-      auto reshapedIndex = rewriter.create<ttir::ReshapeOp>(
++    for (auto [dim, startIndex] : llvm::enumerate(startIndicesRange)) {
++      Value reshapedIndex = rewriter.create<ttir::ReshapeOp>(
+           srcOp.getLoc(),
+           RankedTensorType::get(singleElementTensorType.getShape(),
+                                 startIndexElementType,
+                                 singleElementTensorType.getEncoding()),
+           startIndex, rewriter.getI32ArrayAttr({1}));
++      reshapedIndex = rewriter.create<ttir::ClampScalarOp>(
++          srcOp.getLoc(), singleElementTensorType, reshapedIndex,
++          rewriter.getI32IntegerAttr(0),
++          rewriter.getI32IntegerAttr(operandShape[dim] - sliceSizes[dim]));
+       startIndicesValues1D.push_back(reshapedIndex);
+     }
+     // Create a single 1D tensor from start indices values using concat op.
+@@ -5107,3 +5115,2 @@ public:
+     // Create a 1D constant tensor with slice_sizes values.
+-    auto sliceSizes = srcOp.getSliceSizes();
+     SmallVector<int32_t> sliceSizesInt32(sliceSizes.begin(), sliceSizes.end());
+@@ -4904,6 +4909,128 @@ class StableHLOToTTIRDynamicSliceOpConversionPattern
+ };
+ } // namespace
+ 
++namespace {
++class StableHLOToTTIRDynamicUpdateSliceOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::DynamicUpdateSliceOp> {
++  using OpConversionPattern<
++      mlir::stablehlo::DynamicUpdateSliceOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::DynamicUpdateSliceOp srcOp,
++                  mlir::stablehlo::DynamicUpdateSliceOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    Location loc = srcOp.getLoc();
++    auto operandType =
++        mlir::cast<RankedTensorType>(adaptor.getOperand().getType());
++    auto updateType =
++        mlir::cast<RankedTensorType>(adaptor.getUpdate().getType());
++    ArrayRef<int64_t> operandShape = operandType.getShape();
++    ArrayRef<int64_t> updateShape = updateType.getShape();
++
++    if (operandShape == updateShape) {
++      rewriter.replaceOp(srcOp, adaptor.getUpdate());
++      return success();
++    }
++    if (llvm::is_contained(updateShape, 0)) {
++      rewriter.replaceOp(srcOp, adaptor.getOperand());
++      return success();
++    }
++
++    // StableHLO verifies that all start indices have the same type.
++    Type indexElementType =
++        mlir::cast<RankedTensorType>(
++            adaptor.getStartIndices().front().getType())
++            .getElementType();
++    if (!indexElementType.isInteger(32)) {
++      return rewriter.notifyMatchFailure(srcOp,
++                                         "requires 32-bit start indices");
++    }
++    if (operandType.getNumElements() > std::numeric_limits<int32_t>::max()) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "operand exceeds 32-bit scatter index range");
++    }
++
++    SmallVector<int64_t> operandStrides = mlir::computeStrides(operandShape);
++
++    auto indexScalarType = RankedTensorType::get({1}, indexElementType);
++    auto scalarConstant = [&](int64_t value) -> Value {
++      SmallVector<int32_t, 1> values{static_cast<int32_t>(value)};
++      return rewriter.create<ttir::ConstantOp>(
++          loc, indexScalarType,
++          DenseIntElementsAttr::get(indexScalarType, values));
++    };
++
++    // Compute the flattened, clamped start offset on device.
++    Value base;
++    for (auto [dim, start] : llvm::enumerate(adaptor.getStartIndices())) {
++      int64_t maxStart = operandShape[dim] - updateShape[dim];
++      if (maxStart == 0) {
++        continue;
++      }
++      start = rewriter.create<ttir::ReshapeOp>(
++          loc, indexScalarType, start, rewriter.getI32ArrayAttr({1}));
++      start = rewriter.create<ttir::ClampScalarOp>(
++          loc, indexScalarType, start, rewriter.getI32IntegerAttr(0),
++          rewriter.getI32IntegerAttr(maxStart));
++      if (operandStrides[dim] != 1) {
++        start = rewriter.create<ttir::MultiplyOp>(
++            loc, indexScalarType, start,
++            scalarConstant(operandStrides[dim]));
++      }
++      base = base ? rewriter.create<ttir::AddOp>(loc, indexScalarType, base,
++                                                  start)
++                  : start;
++    }
++
++    // A slice offset is the sum of its per-dimension strided coordinates.
++    auto offsetType = RankedTensorType::get(updateShape, indexElementType);
++    Value indices;
++    for (auto [dim, size] : llvm::enumerate(updateShape)) {
++      if (size == 1) {
++        continue;
++      }
++      Value offset = rewriter.create<ttir::ArangeOp>(
++          loc, offsetType, /*start=*/0,
++          /*end=*/size * operandStrides[dim],
++          /*step=*/operandStrides[dim], /*arange_dimension=*/dim);
++      indices = indices ? rewriter.create<ttir::AddOp>(
++                              loc, offsetType, indices, offset)
++                        : offset;
++    }
++
++    int64_t updateVolume = updateType.getNumElements();
++    auto indicesType = RankedTensorType::get({updateVolume}, indexElementType);
++    if (!indices) {
++      indices = base;
++    } else {
++      indices = ttir::utils::flattenTensor(rewriter, loc, indices);
++      base = rewriter.create<ttir::BroadcastOp>(
++          loc, indicesType, base,
++          rewriter.getDenseI64ArrayAttr({updateVolume}));
++      indices =
++          rewriter.create<ttir::AddOp>(loc, indicesType, indices, base);
++    }
++
++    Value operand = ttir::utils::flattenTensor(rewriter, loc,
++                                                adaptor.getOperand());
++    Value update =
++        ttir::utils::flattenTensor(rewriter, loc, adaptor.getUpdate());
++    Value result = rewriter.create<ttir::ScatterOp>(
++        loc, mlir::cast<RankedTensorType>(operand.getType()), operand, indices,
++        update, rewriter.getI32IntegerAttr(0),
++        ttcore::ReduceTypeAttr::get(rewriter.getContext(),
++                                    ttcore::ReduceType::Invalid));
++    rewriter.replaceOpWithNewOp<ttir::ReshapeOp>(
++        srcOp, getTypeConverter()->convertType<RankedTensorType>(
++                   srcOp.getType()),
++        result, rewriter.getI32ArrayAttr(
++                    llvm::to_vector_of<int32_t>(operandShape)));
++    return success();
++  }
++};
++} // namespace
++
+ namespace {
+ class StableHLOToTTIROpClampOpConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::ClampOp> {
+@@ -9934,5 +10056,7 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
+   patterns.add<StableHLOToTTIRDynamicSliceOpConversionPattern>(typeConverter,
+                                                                ctx);
++  patterns.add<StableHLOToTTIRDynamicUpdateSliceOpConversionPattern>(
++      typeConverter, ctx);
+ }
+ 
+ static void addClampOpConversionPattern(MLIRContext *ctx,
+diff --git a/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp b/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp
+--- a/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp
++++ b/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp
+@@ -21,7 +21,7 @@ namespace {
+ // StableHLO to TOSA/Linalg conversion.
+ static bool isNonLowerableSHLOOp([[maybe_unused]] mlir::Operation *op) {
+ #ifdef TTMLIR_ENABLE_STABLEHLO
+-  return llvm::isa<stablehlo::DynamicUpdateSliceOp, stablehlo::EinsumOp>(op);
++  return llvm::isa<stablehlo::EinsumOp>(op);
+ #else
+   return false;
+ #endif

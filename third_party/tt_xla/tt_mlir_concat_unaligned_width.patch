@@ -1,0 +1,70 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1398,2 +1398,10 @@ def TTNN_ConcatOp : TTNN_Op<"concat"> {
+     let hasVerifier = 1;
++
++    let extraClassDeclaration = [{
++      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
++        ::mlir::Operation::operand_range inputs = getInputs();
++        return wa::TTNNOperandsWorkaroundsFactory::
++            createConcatOpOperandsWorkarounds(inputs, getDim());
++      }
++    }];
+ }
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -288,2 +288,5 @@ public:
+ 
++  static TTNNOperandsWorkarounds createConcatOpOperandsWorkarounds(
++      mlir::Operation::operand_range inputs, int64_t dim);
++
+   static TTNNOperandsWorkarounds createDropoutOpOperandsWorkarounds();
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -430,2 +430,36 @@ TTNNOperandsWorkaroundsFactory::createReshapeOpOperandsWorkarounds(
+ 
++TTNNOperandsWorkarounds
++TTNNOperandsWorkaroundsFactory::createConcatOpOperandsWorkarounds(
++    mlir::Operation::operand_range inputs, int64_t dim) {
++  auto inputType = mlir::cast<RankedTensorType>(inputs.front().getType());
++  int64_t rank = inputType.getRank();
++  dim = dim < 0 ? dim + rank : dim;
++
++  bool hasPartialTile = false;
++  if (dim == rank - 1) {
++    constexpr int64_t tileWidth = ttcore::TileType::getDefaultShape()[1];
++    for (Value input : inputs) {
++      auto type = mlir::cast<RankedTensorType>(input.getType());
++      if (type.getDimSize(dim) % tileWidth != 0) {
++        hasPartialTile = true;
++        break;
++      }
++    }
++  }
++
++  TTNNOperandWorkarounds workaround;
++  if (hasPartialTile) {
++    workaround.tensorLayoutWorkaround = Layout::RowMajor;
++  }
++  if (inputType.getElementType().isF16()) {
++    workaround.tensorDataTypeWorkaround = ttcore::DataType::Float32;
++  }
++  auto workarounds = TTNNOperandsWorkarounds::
++      createEmptyTTNNOperandsWorkarounds();
++  for (size_t i = 0; i < inputs.size(); ++i) {
++    workarounds.addInputOperandWorkaround(workaround);
++  }
++  return workarounds.addOutputOperandWorkaround(workaround);
++}
++
+ // Factory method to create a set of workarounds for UpdateCache operation
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -547,2 +547,3 @@ const std::set<mlir::StringRef>
+         ttnn::ScatterOp::getOperationName(),
++        ttnn::ConcatOp::getOperationName(),
+         // TopK's operands workaround forces input bf16 + indices ui16/ui32;

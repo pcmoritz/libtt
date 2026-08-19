@@ -23,11 +23,13 @@
 #include "operations/normalization/layer_norm_post_all_gather.h"
 #include "operations/normalization/layer_norm_pre_all_gather.h"
 #include "operations/normalization/rms_norm_pre_all_gather.h"
-#include "operations/pool/pool2d.h"
 #include "operations/pool/upsample.h"
 #include "operations/rand/rand.h"
 #include "operations/tensor_serialization/dump_tensor.h"
 #include "operations/tensor_serialization/load_tensor.h"
+#include "operations/ttml/adamw.h"
+#include "operations/ttml/sdpa_bw.h"
+#include "operations/ttml/sdpa_fw.h"
 
 #include <stdexcept>
 #include <string>
@@ -123,20 +125,6 @@ void run(const ::tt::target::ttnn::SelectiveReduceCombineOp *,
 
 } // namespace tt::runtime::ttnn::operations::ccl
 
-namespace tt::runtime::ttnn::operations::cpu {
-
-void run(const ::tt::target::ttnn::CpuOp *, ProgramContext &) {
-  unsupported("ttnn.cpu");
-}
-
-std::vector<::tt::runtime::Tensor>
-invokeCpuOp(ProgramContext &, const ::tt::target::ttnn::CpuOp *,
-            const std::vector<::tt::runtime::Tensor> &) {
-  unsupported("ttnn.cpu");
-}
-
-} // namespace tt::runtime::ttnn::operations::cpu
-
 namespace tt::runtime::ttnn::operations::experimental {
 
 void run(const ::tt::target::ttnn::ExperimentalEltwiseBinaryBackwardOp *,
@@ -190,19 +178,6 @@ void run(const ::tt::target::ttnn::RMSNormPreAllGatherOp *, ProgramContext &) {
 
 namespace tt::runtime::ttnn::operations::pool {
 
-void run(const ::tt::target::ttnn::Pool2dOp *, ProgramContext &) {
-  unsupported("ttnn.pool2d");
-}
-
-void run(const ::tt::target::ttnn::MaxPool2dWithIndicesOp *,
-         ProgramContext &) {
-  unsupported("ttnn.max_pool2d_with_indices");
-}
-
-void run(const ::tt::target::ttnn::GlobalAvgPool2dOp *, ProgramContext &) {
-  unsupported("ttnn.global_avg_pool2d");
-}
-
 void run(const ::tt::target::ttnn::UpsampleOp *, ProgramContext &) {
   unsupported("ttnn.upsample");
 }
@@ -228,3 +203,19 @@ void run(const ::tt::target::ttnn::LoadTensorOp *, ProgramContext &) {
 }
 
 } // namespace tt::runtime::ttnn::operations::tensor_serialization
+
+namespace tt::runtime::ttnn::operations::ttml {
+
+void run(const ::tt::target::ttnn::AdamWOp *, ProgramContext &) {
+  unsupported("ttnn.adamw");
+}
+
+void run(const ::tt::target::ttnn::SDPAForwardOp *, ProgramContext &) {
+  unsupported("ttnn.sdpa_forward");
+}
+
+void run(const ::tt::target::ttnn::SDPABackwardOp *, ProgramContext &) {
+  unsupported("ttnn.sdpa_backward");
+}
+
+} // namespace tt::runtime::ttnn::operations::ttml

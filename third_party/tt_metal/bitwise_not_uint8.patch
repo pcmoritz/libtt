@@ -1,0 +1,75 @@
+diff --git tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h
+--- tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h
++++ tt_metal/hw/inc/api/compute/eltwise_unary/bitwise_not.h
+@@ -26,7 +26,8 @@ namespace ckernel {
+  */
+ // clang-format on
++template <DataFormat DATA_FORMAT = DataFormat::Int32>
+ ALWI void bitwise_not_tile(uint32_t idst) {
+-    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_bitwise_not, (APPROX), idst, VectorMode::RC));
++    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_bitwise_not, (APPROX, DATA_FORMAT), idst, VectorMode::RC));
+ }
+ 
+ /**
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
+@@ -17,10 +17,14 @@ namespace sfpu {
+ inline void bitwise_not_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
+ 
+-template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
++template <bool APPROXIMATION_MODE, DataFormat DATA_FORMAT = DataFormat::Int32, int ITERATIONS = 8>
+ inline void calculate_bitwise_not() {
+ #pragma GCC unroll 0
+     for (int d = 0; d < ITERATIONS; d++) {
+         sfpi::vInt v = sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>();
+-        sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>() = ~v;
++        if constexpr (DATA_FORMAT == DataFormat::UInt8) {
++            sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>() = v ^ sfpi::vInt(0xff);
++        } else {
++            sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>() = ~v;
++        }
+         dst_reg++;
+     }
+diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
+--- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
++++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_bitwise_not.h
+@@ -17,13 +17,17 @@ namespace sfpu {
+ inline void bitwise_not_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
+ 
+-template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
++template <bool APPROXIMATION_MODE, DataFormat DATA_FORMAT = DataFormat::Int32, int ITERATIONS = 8>
+ inline void calculate_bitwise_not() {
+ #pragma GCC unroll 0
+     for (int d = 0; d < ITERATIONS; d++) {
+-        // Load/store as two's-complement int32 (sfpi DataLayout::I32 == InstrModLoadStore::INT32),
+-        // matching the original TTI path. A plain vInt load would read the raw sign-magnitude dest
+-        // bits and ~ would then flip the sign-magnitude representation instead of the integer value.
+         vInt v = dst_reg[0].mode<sfpi::DataLayout::I32>();
+-        dst_reg[0].mode<sfpi::DataLayout::I32>() = ~v;
++        if constexpr (DATA_FORMAT == DataFormat::UInt8) {
++            dst_reg[0].mode<sfpi::DataLayout::I32>() = v ^ sfpi::vInt(0xff);
++        } else {
++            // Load/store as two's-complement int32 (sfpi DataLayout::I32 == InstrModLoadStore::INT32),
++            // matching the original TTI path. A plain vInt load would read the raw sign-magnitude dest
++            // bits and ~ would then flip the sign-magnitude representation instead of the integer value.
++            dst_reg[0].mode<sfpi::DataLayout::I32>() = ~v;
++        }
+         dst_reg++;
+     }
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+@@ -709,6 +709,11 @@ std::pair<std::string, std::string> get_op_init_and_func_default(
+     UnaryOpType op_type, std::string idst, std::optional<DataType> input_dtype) {
+     switch (op_type) {
+-        case UnaryOpType::BITWISE_NOT: return {"bitwise_not_tile_init();", fmt::format("bitwise_not_tile({});", idst)};
++        case UnaryOpType::BITWISE_NOT:
++            if (input_dtype == DataType::UINT8) {
++                return {
++                    "bitwise_not_tile_init();", fmt::format("bitwise_not_tile<DataFormat::UInt8>({});", idst)};
++            }
++            return {"bitwise_not_tile_init();", fmt::format("bitwise_not_tile({});", idst)};
+         case UnaryOpType::RECIP: return {"recip_tile_init<false>();", fmt::format("recip_tile<false>({});", idst)};
+         case UnaryOpType::GELU: return {"gelu_tile_init();", fmt::format("gelu_tile({});", idst)};
+         case UnaryOpType::GELU_TANH: return {"gelu_tanh_tile_init();", fmt::format("gelu_tanh_tile({});", idst)};

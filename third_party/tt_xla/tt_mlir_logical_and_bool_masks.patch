@@ -1,0 +1,17 @@
+diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
+--- a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
+@@ -106,8 +106,12 @@ void run(const ::tt::target::ttnn::EltwiseBinaryOp *op,
+     break;
+   }
+   case ::tt::target::ttnn::EltwiseBinaryOpType::LogicalAnd: {
++    // TTIR logical operands originate as i1 values and are represented in
++    // TTNN as numeric 0/1 masks.  The native logical_and kernel produces
++    // incorrect results for these aliased boolean tensors; multiplication is
++    // exactly equivalent for 0/1 masks and preserves their output dtype.
+     runEltwiseBinaryOp(op, tensorPool, [](auto &&...args) {
+-      return ::ttnn::logical_and(std::forward<decltype(args)>(args)...);
++      return ::ttnn::multiply(std::forward<decltype(args)>(args)...);
+     });
+     break;
+   }

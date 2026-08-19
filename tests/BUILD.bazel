@@ -1,0 +1,72 @@
+load("@jax_test_pip//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_test")
+
+JAX_TEST_ARGS = [
+    "--jax-tests-anchor=$(rlocationpath @jax_src//:jax_tests_anchor)",
+    "--jax-plugin-wheel=$(rlocationpath //:jax_tt_plugin_wheel)",
+]
+
+JAX_TEST_DATA = [
+    "//:jax_tt_plugin_wheel",
+    "@jax_src//:jax_tests",
+    "@jax_src//:jax_tests_anchor",
+]
+
+JAX_TEST_DEPS = [
+    requirement("absl-py"),
+    requirement("cloudpickle"),
+    requirement("filelock"),
+    requirement("flatbuffers"),
+    requirement("hypothesis"),
+    requirement("jax"),
+    requirement("jaxlib"),
+    requirement("matplotlib"),
+    requirement("mpmath"),
+    requirement("numpy"),
+    requirement("pillow"),
+    requirement("portpicker"),
+    requirement("pytest"),
+    requirement("scipy"),
+    "@rules_python//python/runfiles",
+]
+
+JAX_TEST_TAGS = [
+    "exclusive",
+    "manual",
+    "no-sandbox",
+    "requires-tt-device",
+]
+
+py_test(
+    name = "jax_smoke_tests",
+    srcs = ["jax_test_suite.py"],
+    args = JAX_TEST_ARGS + [
+        "tests/device_test.py",
+        "tests/batching_test.py::BatchingTest::testDynamicUpdateSlice",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant0",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant1",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant2",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant3",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant4",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant5",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant7",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant8",
+        "tests/lax_test.py::LazyConstantTest::testIotaConstant9",
+    ],
+    data = JAX_TEST_DATA,
+    deps = JAX_TEST_DEPS,
+    main = "jax_test_suite.py",
+    tags = JAX_TEST_TAGS,
+    timeout = "long",
+)
+
+py_test(
+    name = "jax_test_suite",
+    srcs = ["jax_test_suite.py"],
+    args = JAX_TEST_ARGS,
+    data = JAX_TEST_DATA,
+    deps = JAX_TEST_DEPS,
+    main = "jax_test_suite.py",
+    tags = JAX_TEST_TAGS,
+    timeout = "eternal",
+)

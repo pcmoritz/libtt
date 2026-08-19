@@ -1,0 +1,1059 @@
+diff --git tt_metal/api/tt-metalium/experimental/tensor/tensor_types.hpp tt_metal/api/tt-metalium/experimental/tensor/tensor_types.hpp
+--- tt_metal/api/tt-metalium/experimental/tensor/tensor_types.hpp
++++ tt_metal/api/tt-metalium/experimental/tensor/tensor_types.hpp
+@@ -6,2 +6,3 @@
+ 
++#include <bit>
+ #include <cstdint>
+@@ -26,2 +27,11 @@ namespace tt::tt_metal {
+ 
++struct float16 {
++    uint16_t bits = 0;
++
++    constexpr float16() = default;
++    explicit constexpr float16(uint16_t bits) : bits(bits) {}
++    float16(float value) : bits(std::bit_cast<uint16_t>(static_cast<_Float16>(value))) {}
++    operator float() const { return static_cast<float>(std::bit_cast<_Float16>(bits)); }
++};
++
+ enum class DataType {
+@@ -41,3 +50,4 @@ enum class DataType {
+     FP8_E4M3 = 8,
+-    INVALID = 9,
++    FLOAT16 = 9,
++    INVALID = 10,
+ };
+@@ -58,2 +68,4 @@ consteval DataType convert_to_data_type() {
+         return DataType::BFLOAT16;
++    } else if constexpr (std::is_same_v<T, float16>) {
++        return DataType::FLOAT16;
+     } else {
+diff --git tt_metal/impl/tensor/tensor_types.cpp tt_metal/impl/tensor/tensor_types.cpp
+--- tt_metal/impl/tensor/tensor_types.cpp
++++ tt_metal/impl/tensor/tensor_types.cpp
+@@ -21,2 +21,3 @@ std::ostream& operator<<(std::ostream& os, const tt::tt_metal::DataType& data_ty
+         case DataType::FP8_E4M3: return os << "DataType::FP8_E4M3";
++        case DataType::FLOAT16: return os << "DataType::FLOAT16";
+         case DataType::INVALID:
+@@ -71,2 +72,3 @@ bool is_floating_point(DataType dtype) {
+         case DataType::FP8_E4M3: return true;
++        case DataType::FLOAT16: return true;
+         default: return false;
+@@ -92,2 +94,3 @@ tt::DataFormat datatype_to_dataformat_converter(tt::tt_metal::DataType datatype
+         case tt::tt_metal::DataType::FP8_E4M3: return tt::DataFormat::Fp8_e4m3;
++        case tt::tt_metal::DataType::FLOAT16: return tt::DataFormat::Float16;
+         default: TT_THROW("Unsupported DataType"); return tt::DataFormat::Float16_b;  // for clang-tidy
+@@ -107,2 +110,3 @@ tt::tt_metal::DataType dataformat_to_datatype_converter(tt::DataFormat dataforma
+         case tt::DataFormat::Fp8_e4m3: return tt::tt_metal::DataType::FP8_E4M3;
++        case tt::DataFormat::Float16: return tt::tt_metal::DataType::FLOAT16;
+         default: TT_THROW("Unsupported DataFormat"); return tt::tt_metal::DataType::BFLOAT16;  // for clang-tidy
+@@ -132,2 +136,3 @@ auto fmt::formatter<tt::tt_metal::DataType>::format(tt::tt_metal::DataType dt,
+         case tt::tt_metal::DataType::FP8_E4M3: name = "DataType::FP8_E4M3"; break;
++        case tt::tt_metal::DataType::FLOAT16: name = "DataType::FLOAT16"; break;
+         case tt::tt_metal::DataType::INVALID:
+diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl.cpp
+--- tt_metal/impl/tensor/tensor_impl.cpp
++++ tt_metal/impl/tensor/tensor_impl.cpp
+@@ -44,2 +44,3 @@ HostBuffer allocate_host_buffer(const TensorSpec& tensor_spec) {
+         case DataType::BFLOAT16: return HostBuffer(std::vector<bfloat16>(size_bytes / sizeof(bfloat16)));
++        case DataType::FLOAT16: return HostBuffer(std::vector<float16>(size_bytes / sizeof(float16)));
+         case DataType::FLOAT32: return HostBuffer(std::vector<float>(size_bytes / sizeof(float)));
+@@ -263,2 +263,4 @@ template std::vector<bfloat16> encode_tensor_data<bfloat16>(
+     ttsl::Span<const float> logical_data, const TensorSpec& tensor_spec, float pad_value);
++template std::vector<float16> encode_tensor_data<float16>(
++    ttsl::Span<const float16> logical_data, const TensorSpec& tensor_spec, float16 pad_value);
+ template std::vector<int32_t> encode_tensor_data<int32_t>(
+@@ -277,2 +279,4 @@ template std::vector<bfloat16> to_tile_major_layout<bfloat16>(
+     const Shape2D& shape, const Tile& tile, ttsl::Span<const float> data_to_convert);
++template std::vector<float16> to_tile_major_layout<float16>(
++    const Shape2D& shape, const Tile& tile, ttsl::Span<const float16> data_to_convert);
+ template std::vector<int32_t> to_tile_major_layout<int32_t>(
+@@ -342,2 +346,4 @@ template std::vector<bfloat16> decode_tensor_data<bfloat16>(
+     ttsl::Span<const float> physical_data, const TensorSpec& tensor_spec);
++template std::vector<float16> decode_tensor_data<float16>(
++    ttsl::Span<const float16> physical_data, const TensorSpec& tensor_spec);
+ template std::vector<int32_t> decode_tensor_data<int32_t>(
+diff --git tt_metal/impl/tensor/spec/tensor_spec.cpp tt_metal/impl/tensor/spec/tensor_spec.cpp
+--- tt_metal/impl/tensor/spec/tensor_spec.cpp
++++ tt_metal/impl/tensor/spec/tensor_spec.cpp
+@@ -100,5 +100,5 @@ void validate_dtype_and_layout(DataType dtype, Layout layout) {
+              dtype == DataType::UINT8 || dtype == DataType::UINT16 || dtype == DataType::BFLOAT16 ||
+-             dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B || dtype == DataType::FP8_E4M3),
+-            "Only UINT32, INT32, FLOAT32, UINT16, UINT8, BFLOAT16, BFLOAT8_B, BFLOAT4_B, or FP8_E4M3 dtypes are "
+-            "supported on device!");
++             dtype == DataType::FLOAT16 || dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B ||
++             dtype == DataType::FP8_E4M3),
++            "Unsupported device dtype!");
+     };
+@@ -112,2 +112,3 @@ void validate_dtype_and_layout(DataType dtype, Layout layout) {
+             case DataType::UINT16:
++            case DataType::FLOAT16:
+             case DataType::BFLOAT16: break;
+diff --git tt_metal/impl/tensor/spec/layout/page_config.cpp tt_metal/impl/tensor/spec/layout/page_config.cpp
+--- tt_metal/impl/tensor/spec/layout/page_config.cpp
++++ tt_metal/impl/tensor/spec/layout/page_config.cpp
+@@ -17,2 +17,3 @@ size_t rm_element_size_bytes(DataType dtype) {
+         case DataType::BFLOAT16: return sizeof(bfloat16);
++        case DataType::FLOAT16: return sizeof(float16);
+         case DataType::FLOAT32: return sizeof(float);
+diff --git tt_metal/impl/tensor/mesh_tensor.cpp tt_metal/impl/tensor/mesh_tensor.cpp
+--- tt_metal/impl/tensor/mesh_tensor.cpp
++++ tt_metal/impl/tensor/mesh_tensor.cpp
+@@ -67,2 +67,3 @@ std::size_t MeshTensor::element_size() const {
+         case DataType::BFLOAT16: return sizeof(bfloat16);
++        case DataType::FLOAT16: return sizeof(float16);
+         case DataType::FLOAT32: return sizeof(float);
+diff --git tt_metal/impl/tensor/host_tensor.cpp tt_metal/impl/tensor/host_tensor.cpp
+--- tt_metal/impl/tensor/host_tensor.cpp
++++ tt_metal/impl/tensor/host_tensor.cpp
+@@ -90,2 +90,3 @@ std::size_t HostTensor::element_size() const {
+         case DataType::BFLOAT16: return sizeof(bfloat16);
++        case DataType::FLOAT16: return sizeof(float16);
+         case DataType::FLOAT32: return sizeof(float);
+diff --git tt_metal/impl/data_format/tilize_utils.cpp tt_metal/impl/data_format/tilize_utils.cpp
+--- tt_metal/impl/data_format/tilize_utils.cpp
++++ tt_metal/impl/data_format/tilize_utils.cpp
+@@ -6,2 +6,3 @@
+ #include <tt-metalium/bfloat16.hpp>
++#include <tt-metalium/experimental/tensor/tensor_types.hpp>
+ #include <tt-metalium/tilize_utils.hpp>
+@@ -550,2 +551,3 @@ template std::vector<bfloat16> convert_layout_tile_nfaces_to_tile_swizzled<bfloa
+ template std::vector<int> convert_layout<int>(ttsl::Span<const int>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
++template std::vector<tt::tt_metal::float16> convert_layout<tt::tt_metal::float16>(ttsl::Span<const tt::tt_metal::float16>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
+ template std::vector<uint8_t> convert_layout<uint8_t>(ttsl::Span<const uint8_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
+diff --git tt_metal/impl/data_format/bfloat4.cpp tt_metal/impl/data_format/bfloat4.cpp
+--- tt_metal/impl/data_format/bfloat4.cpp
++++ tt_metal/impl/data_format/bfloat4.cpp
+@@ -6,2 +6,3 @@
+ #include <tt-metalium/bfloat4.hpp>
++#include <tt-metalium/experimental/tensor/tensor_types.hpp>
+ #include <tt_stl/span.hpp>
+@@ -34,2 +35,7 @@ template std::vector<uint32_t> pack_as_bfp4_tiles<bfloat16>(
+     const std::optional<tt::tt_metal::Tile>& tile);
++template std::vector<uint32_t> pack_as_bfp4_tiles<tt::tt_metal::float16>(
++    ttsl::Span<const tt::tt_metal::float16> data,
++    bool row_major_input,
++    bool is_exp_a,
++    const std::optional<tt::tt_metal::Tile>& tile);
+ template std::vector<uint32_t> pack_as_bfp4_tiles<float>(
+diff --git tt_metal/impl/data_format/bfloat8.cpp tt_metal/impl/data_format/bfloat8.cpp
+--- tt_metal/impl/data_format/bfloat8.cpp
++++ tt_metal/impl/data_format/bfloat8.cpp
+@@ -5,2 +5,3 @@
+ #include <tt-metalium/bfloat8.hpp>
++#include <tt-metalium/experimental/tensor/tensor_types.hpp>
+ #include <tt_stl/span.hpp>
+@@ -33,2 +34,7 @@ template std::vector<uint32_t> pack_as_bfp8_tiles<bfloat16>(
+     const std::optional<tt::tt_metal::Tile>& tile);
++template std::vector<uint32_t> pack_as_bfp8_tiles<tt::tt_metal::float16>(
++    ttsl::Span<const tt::tt_metal::float16> data,
++    bool row_major_input,
++    bool is_exp_a,
++    const std::optional<tt::tt_metal::Tile>& tile);
+ template std::vector<uint32_t> pack_as_bfp8_tiles<float>(
+diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_format/blockfloat_common.cpp
+--- tt_metal/impl/data_format/blockfloat_common.cpp
++++ tt_metal/impl/data_format/blockfloat_common.cpp
+@@ -13,2 +13,3 @@
+ #include <tt-metalium/bfloat16.hpp>
++#include <tt-metalium/experimental/tensor/tensor_types.hpp>
+ #include <tt_stl/assert.hpp>
+@@ -614,1 +615,4 @@ template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::S
++template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4_b>(ttsl::Span<const tt::tt_metal::float16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
++template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const tt::tt_metal::float16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
++
+ template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const int32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+diff --git tt_metal/impl/tensor/host_tensor_factory.cpp tt_metal/impl/tensor/host_tensor_factory.cpp
+--- tt_metal/impl/tensor/host_tensor_factory.cpp
++++ tt_metal/impl/tensor/host_tensor_factory.cpp
+@@ -193,2 +193,4 @@ template HostTensor host_tensor_from_span_with_pad_value<bfloat16>(
+ template HostTensor host_tensor_from_span_with_pad_value<float>(ttsl::Span<const float>, const TensorSpec&, float);
++template HostTensor host_tensor_from_span_with_pad_value<float16>(
++    ttsl::Span<const float16>, const TensorSpec&, float16);
+ template HostTensor host_tensor_from_span_with_pad_value<int32_t>(
+@@ -204,2 +206,3 @@ template HostTensor HostTensor::from_span<bfloat16>(ttsl::Span<const bfloat16>,
+ template HostTensor HostTensor::from_span<float>(ttsl::Span<const float>, const TensorSpec&);
++template HostTensor HostTensor::from_span<float16>(ttsl::Span<const float16>, const TensorSpec&);
+ template HostTensor HostTensor::from_span<int32_t>(ttsl::Span<const int32_t>, const TensorSpec&);
+@@ -183,2 +184,4 @@ template HostTensor HostTensor::from_span<uint8_t>(
+     ttsl::Span<float>, const Shape&, MemoryPin, const std::optional<Tile>&);
++template HostTensor HostTensor::from_borrowed_data<float16>(
++    ttsl::Span<float16>, const Shape&, MemoryPin, const std::optional<Tile>&);
+ template HostTensor HostTensor::from_borrowed_data<int32_t>(
+@@ -225,2 +230,4 @@ template HostTensor host_tensor_from_vector_with_pad_value<bfloat16>(
+ template HostTensor host_tensor_from_vector_with_pad_value<float>(const std::vector<float>&, const TensorSpec&, float);
++template HostTensor host_tensor_from_vector_with_pad_value<float16>(
++    const std::vector<float16>&, const TensorSpec&, float16);
+ template HostTensor host_tensor_from_vector_with_pad_value<int32_t>(
+@@ -237,2 +244,4 @@ template HostTensor host_tensor_from_vector_with_pad_value<bfloat16>(
+ template HostTensor host_tensor_from_vector_with_pad_value<float>(std::vector<float>&&, const TensorSpec&, float);
++template HostTensor host_tensor_from_vector_with_pad_value<float16>(
++    std::vector<float16>&&, const TensorSpec&, float16);
+ template HostTensor host_tensor_from_vector_with_pad_value<int32_t>(std::vector<int32_t>&&, const TensorSpec&, int32_t);
+@@ -246,2 +255,3 @@ template HostTensor HostTensor::from_vector<bfloat16>(const std::vector<bfloat16
+ template HostTensor HostTensor::from_vector<float>(const std::vector<float>&, const TensorSpec&);
++template HostTensor HostTensor::from_vector<float16>(const std::vector<float16>&, const TensorSpec&);
+ template HostTensor HostTensor::from_vector<int32_t>(const std::vector<int32_t>&, const TensorSpec&);
+@@ -253,2 +263,3 @@ template HostTensor HostTensor::from_vector<bfloat16>(std::vector<bfloat16>&&, c
+ template HostTensor HostTensor::from_vector<float>(std::vector<float>&&, const TensorSpec&);
++template HostTensor HostTensor::from_vector<float16>(std::vector<float16>&&, const TensorSpec&);
+ template HostTensor HostTensor::from_vector<int32_t>(std::vector<int32_t>&&, const TensorSpec&);
+@@ -208,2 +213,3 @@ template HostTensor HostTensor::from_vector<uint8_t>(const std::vector<uint8_t>&
+ template std::vector<float> HostTensor::to_vector() const;
++template std::vector<float16> HostTensor::to_vector() const;
+ template std::vector<bfloat16> HostTensor::to_vector() const;
+diff --git tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
+--- tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
++++ tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
+@@ -96,2 +96,4 @@ auto dispatch(DataType dtype, Func&& func, Args&&... args) {
+             return (std::forward<Func>(func)).template operator()<float>(std::forward<Args>(args)...);
++        case DataType::FLOAT16:
++            return (std::forward<Func>(func)).template operator()<float16>(std::forward<Args>(args)...);
+         case DataType::INT32:
+diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
+--- tt_metal/impl/tensor/tensor_apis.cpp
++++ tt_metal/impl/tensor/tensor_apis.cpp
+@@ -539,2 +543,3 @@ HostTensor to_dtype(const HostTensor& input_tensor, DataType dtype) {
+                 case DataType::FLOAT32: return with_src_and_dst.operator()<SrcType, float>();
++                case DataType::FLOAT16: return with_src_and_dst.operator()<SrcType, float16>();
+                 case DataType::BFLOAT16: return with_src_and_dst.operator()<SrcType, bfloat16>();
+@@ -554,2 +559,3 @@ HostTensor to_dtype(const HostTensor& input_tensor, DataType dtype) {
+             case DataType::FLOAT32: return with_src.operator()<float>();
++            case DataType::FLOAT16: return with_src.operator()<float16>();
+             case DataType::BFLOAT16: return with_src.operator()<bfloat16>();
+@@ -613,2 +619,4 @@ void validate_datatype(DataType dtype) {
+         TT_FATAL(dtype == DataType::FLOAT32, "Incorrect data type {}", dtype);
++    } else if constexpr (std::is_same_v<BaseType, float16>) {
++        TT_FATAL(dtype == DataType::FLOAT16, "Incorrect data type {}", dtype);
+     } else if constexpr (std::is_same_v<BaseType, bfloat16>) {
+@@ -675,2 +683,3 @@ INSTANTIATE_HOST_BUFFER_FUNCTIONS(int32_t)
+ INSTANTIATE_HOST_BUFFER_FUNCTIONS(float)
++INSTANTIATE_HOST_BUFFER_FUNCTIONS(float16)
+ INSTANTIATE_HOST_BUFFER_FUNCTIONS(bfloat16)
+diff --git ttnn/core/tensor/tensor.cpp ttnn/core/tensor/tensor.cpp
+--- ttnn/core/tensor/tensor.cpp
++++ ttnn/core/tensor/tensor.cpp
+@@ -58,1 +58,2 @@ using tt::tt_metal::TensorTopology;
+ using tt::tt_metal::Tile;
++using tt::tt_metal::float16;
+@@ -220,2 +221,8 @@ template Tensor Tensor::from_span<float>(
+     float pad_value);
++template Tensor Tensor::from_span<float16>(
++    ttsl::Span<const float16> buffer,
++    const TensorSpec& spec,
++    tt::tt_metal::distributed::MeshDevice* device,
++    std::optional<QueueId> cq_id,
++    float16 pad_value);
+ template Tensor Tensor::from_span<int32_t>(
+@@ -255,2 +262,7 @@ template Tensor Tensor::from_borrowed_data<float>(
+     const std::optional<Tile>& tile);
++template Tensor Tensor::from_borrowed_data<float16>(
++    ttsl::Span<float16> buffer,
++    const tt::tt_metal::Shape& shape,
++    tt::tt_metal::MemoryPin buffer_pin,
++    const std::optional<Tile>& tile);
+ template Tensor Tensor::from_borrowed_data<int32_t>(
+@@ -280,2 +292,8 @@ template Tensor Tensor::from_vector<float>(
+     float pad_value);
++template Tensor Tensor::from_vector<float16>(
++    std::vector<float16>&& buffer,
++    const TensorSpec& spec,
++    tt::tt_metal::distributed::MeshDevice* device,
++    std::optional<QueueId> cq_id,
++    float16 pad_value);
+ template Tensor Tensor::from_vector<int32_t>(
+@@ -315,2 +333,3 @@ template Tensor Tensor::from_vector<uint32_t>(
+ template std::vector<float> Tensor::to_vector<float>(std::optional<QueueId> cq_id) const;
++template std::vector<float16> Tensor::to_vector<float16>(std::optional<QueueId> cq_id) const;
+ template std::vector<bfloat16> Tensor::to_vector<bfloat16>(std::optional<QueueId> cq_id) const;
+@@ -370,2 +389,3 @@ uint32_t Tensor::element_size() const {
+         case DataType::FLOAT32: return sizeof(float);
++        case DataType::FLOAT16: return sizeof(float16);
+         case DataType::INT32: return sizeof(int32_t);
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
+@@ -193,4 +193,5 @@ void TilizeDeviceOperation::validate_on_program_cache_miss(
+             input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::UINT8 or
++            input_tensor_a.dtype() == DataType::FLOAT16 or
+             input_tensor_a.dtype() == DataType::FP8_E4M3,
+-        "data type must be bfloat16, float32, uint32, int32, uint16, uint8, or fp8_e4m3");
++        "data type must be bfloat16, float16, float32, uint32, int32, uint16, uint8, or fp8_e4m3");
+     // fp8 tile INPUT unpacks to fp32 in DEST and packs to any float TILE format. Reject non-float outputs:
+diff --git tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_tilize.h tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_tilize.h
+--- tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_tilize.h
++++ tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_tilize.h
+@@ -103,3 +103,4 @@ inline void _llk_unpack_tilize_init_(
+     const bool unpack_to_dest =
+-        (unpack_source_format == DataFormat::UInt32) || (unpack_source_format == DataFormat::Int32) || (unpack_dest_format == DataFormat::Float32);
++        (unpack_source_format == DataFormat::UInt32) || (unpack_source_format == DataFormat::Int32) ||
++        (unpack_dest_format == DataFormat::Float32) || supports_unpack_to_dest(unpack_src_format, unpack_dst_format);
+ 
+@@ -184,3 +185,4 @@ inline void _llk_unpack_tilize_(
+     const bool unpack_to_dest =
+-        (unpack_source_format == DataFormat::UInt32) || (unpack_source_format == DataFormat::Int32) || (unpack_dest_format == DataFormat::Float32);
++        (unpack_source_format == DataFormat::UInt32) || (unpack_source_format == DataFormat::Int32) ||
++        (unpack_dest_format == DataFormat::Float32) || supports_unpack_to_dest(unpack_src_format, unpack_dst_format);
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp
+@@ -43,2 +43,3 @@ void RepeatDeviceOperation::validate_on_program_cache_miss(
+                 input_tensor_a.dtype() == tt::tt_metal::DataType::BFLOAT16 or
++                input_tensor_a.dtype() == tt::tt_metal::DataType::FLOAT16 or
+                 input_tensor_a.dtype() == tt::tt_metal::DataType::UINT32 or
+diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
+@@ -7,2 +7,3 @@
+ #include <cstdint>
++#include <numeric>
+ 
+@@ -52,7 +53,3 @@ ProgramDescriptor RepeatProgramFactoryLastDim::create_descriptor(
+     const uint32_t responsibility = ((number_of_pages - 1) / num_cores_total) + 1;
+-    const uint32_t cb_size_bytes = (READ_ALIGNMENT * 2) + ((source_page_size_bytes & 0xF) == 0 ? source_page_size_bytes
+-                                   : (source_page_size_bytes & 0x7) == 0                       ? source_page_size_bytes * 2
+-                                   : (source_page_size_bytes & 0x3) == 0                       ? source_page_size_bytes * 4
+-                                   : (source_page_size_bytes & 0x1) == 0                       ? source_page_size_bytes * 8
+-                                                                           : source_page_size_bytes * 16);
++    const uint32_t cb_size_bytes = READ_ALIGNMENT * 2 + std::lcm(source_page_size_bytes, READ_ALIGNMENT);
+     constexpr uint32_t src0_cb_index = 0;
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
+@@ -93,3 +93,4 @@ void TilizeWithValPaddingDeviceOperation::validate_on_program_cache_miss(
+             input_tensor.dtype() == DataType::UINT32 or input_tensor.dtype() == DataType::FLOAT32 or
+-            input_tensor.dtype() == DataType::UINT16 or input_tensor.dtype() == DataType::FP8_E4M3,
++            input_tensor.dtype() == DataType::UINT16 or input_tensor.dtype() == DataType::FLOAT16 or
++            input_tensor.dtype() == DataType::FP8_E4M3,
+         "Can only tilize bfloat16/float32 or int32/uint32/uint16 or fp8_e4m3 tensors");
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp
+@@ -22,2 +22,7 @@ uint32_t get_packed_value(const Tensor& tensor, const PadValue& pad_value) {
+                 }
++                if (tensor.dtype() == DataType::FLOAT16) {
++                    float16 float16_pad_value(pad_value);
++                    return ttnn::operations::data_movement::pack_two_uint16_into_uint32(
++                        {float16_pad_value.bits, float16_pad_value.bits});
++                }
+                 if (tensor.dtype() == DataType::UINT16) {
+@@ -49,2 +54,7 @@ uint32_t get_packed_value(const Tensor& tensor, const PadValue& pad_value) {
+                 }
++                if (tensor.dtype() == DataType::FLOAT16) {
++                    float16 float16_pad_value(static_cast<float>(pad_value));
++                    return ttnn::operations::data_movement::pack_two_uint16_into_uint32(
++                        {float16_pad_value.bits, float16_pad_value.bits});
++                }
+                 if (tensor.dtype() == DataType::UINT16) {
+diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operations/creation/creation.cpp
+--- ttnn/cpp/ttnn/operations/creation/creation.cpp
++++ ttnn/cpp/ttnn/operations/creation/creation.cpp
+@@ -192,2 +192,4 @@ Tensor full_impl(
+         case DataType::FLOAT32: return concrete_full.template operator()<float>(fill_value);
++        case DataType::FLOAT16:
++            return concrete_full.template operator()<tt::tt_metal::float16>(static_cast<float>(fill_value));
+         case DataType::BFLOAT16: return concrete_full.template operator()<::bfloat16>(static_cast<float>(fill_value));
+diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
+@@ -16,2 +16,3 @@ namespace ttnn::prim::detail {
+     {ttnn::DataType::BFLOAT16, 2},
++    {ttnn::DataType::FLOAT16, 2},
+     {ttnn::DataType::FLOAT32, 4},
+@@ -55,2 +56,3 @@ inline uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const tt::tt_met
+             case ttnn::DataType::BFLOAT16:
++            case ttnn::DataType::FLOAT16:
+             case ttnn::DataType::FLOAT32: return pack_fill_value(static_cast<float>(fill_value));
+@@ -63,2 +65,3 @@ inline uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const tt::tt_met
+         case ttnn::DataType::BFLOAT16: return pack_fill_value(fill_value);
++        case ttnn::DataType::FLOAT16: return pack_fill_value(fill_value);
+         case ttnn::DataType::UINT16: return pack_fill_value(static_cast<uint16_t>(fill_value));
+@@ -76,2 +79,3 @@ inline std::string get_where_data_fmt(ttnn::DataType dtype) {
+         case ttnn::DataType::FLOAT32: return "DataFormat::Float32";
++        case ttnn::DataType::FLOAT16: return "DataFormat::Float16";
+         case ttnn::DataType::UINT32: return "DataFormat::UInt32";
+diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
+@@ -56,4 +56,6 @@ tt::tt_metal::ProgramDescriptor FillPadProgramFactory::create_descriptor(
+     const bool is_float_type =
+-        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT32);
++        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT16 ||
++         input_tensor.dtype() == DataType::FLOAT32);
+     const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
++    const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
+     const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
+@@ -146,3 +148,5 @@ tt::tt_metal::ProgramDescriptor FillPadProgramFactory::create_descriptor(
+     kernel_defines.emplace_back("MASK_ELEM_UINT", (input_element_size_bytes == 2) ? "uint16_t" : "uint32_t");
+-    kernel_defines.emplace_back("MASK_VALUE", is_fp32 ? "0x3F800000u" : is_float_type ? "0x3F80u" : "1u");
++    kernel_defines.emplace_back(
++        "MASK_VALUE",
++        is_fp32 ? "0x3F800000u" : is_fp16 ? "0x3C00u" : is_float_type ? "0x3F80u" : "1u");
+     kernel_defines.emplace_back("FILL_PAD_DATA_FMT", detail::get_where_data_fmt(input_tensor.dtype()));
+@@ -457,4 +461,6 @@ tt::tt_metal::ProgramDescriptor FillPadL1ShardedProgramFactory::create_descripto
+     const bool is_float_type =
+-        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT32);
++        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT16 ||
++         input_tensor.dtype() == DataType::FLOAT32);
+     const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
++    const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
+     const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
+@@ -516,3 +522,5 @@ tt::tt_metal::ProgramDescriptor FillPadL1ShardedProgramFactory::create_descripto
+     kernel_defines.emplace_back("MASK_ELEM_UINT", (input_element_size_bytes == 2) ? "uint16_t" : "uint32_t");
+-    kernel_defines.emplace_back("MASK_VALUE", is_fp32 ? "0x3F800000u" : is_float_type ? "0x3F80u" : "1u");
++    kernel_defines.emplace_back(
++        "MASK_VALUE",
++        is_fp32 ? "0x3F800000u" : is_fp16 ? "0x3C00u" : is_float_type ? "0x3F80u" : "1u");
+     kernel_defines.emplace_back("FILL_PAD_DATA_FMT", detail::get_where_data_fmt(input_tensor.dtype()));
+diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_where.h tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_where.h
+--- tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_where.h
++++ tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_where.h
+@@ -21,4 +21,5 @@ inline void _calculate_where_(
+     static_assert(
+-        data_format == DataFormat::Float32 || data_format == DataFormat::Float16_b || data_format == DataFormat::Int32 || data_format == DataFormat::UInt32,
+-        "Unsupported data format for _calculate_where_(). Only Float32, Int32, UInt32, and Float16_b are allowed.");
++        data_format == DataFormat::Float32 || data_format == DataFormat::Float16 ||
++            data_format == DataFormat::Float16_b || data_format == DataFormat::Int32 || data_format == DataFormat::UInt32,
++        "Unsupported data format for _calculate_where_().");
+ 
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
+@@ -16,8 +16,8 @@ namespace dtype_sets {
+ 
+-inline constexpr std::array float_only{DT::BFLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B};
++inline constexpr std::array float_only{DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B};
+ 
+-inline constexpr std::array float_and_int32{DT::BFLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::INT32};
++inline constexpr std::array float_and_int32{DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::INT32};
+ 
+ inline constexpr std::array float_and_int32_uint32{
+-    DT::BFLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::INT32, DT::UINT32};
++    DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::INT32, DT::UINT32};
+ 
+@@ -42,9 +42,9 @@ inline constexpr std::array logical_right_shift{DT::UINT32, DT::INT32};
+ inline constexpr std::array arithmetic_fpu{
+-    DT::BFLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::UINT32, DT::UINT16, DT::INT32};
++    DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::UINT32, DT::UINT16, DT::INT32};
+ 
+ inline constexpr std::array relational{
+-    DT::BFLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::UINT32, DT::UINT8, DT::UINT16, DT::INT32};
++    DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::UINT32, DT::UINT8, DT::UINT16, DT::INT32};
+ 
+ // SFPU where kernel: explicit Int32/UInt32/Float32; other floats use Float16_b tile path.
+-inline constexpr std::array where{DT::BFLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::UINT32, DT::INT32};
++inline constexpr std::array where{DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::UINT32, DT::INT32};
+ 
+@@ -65,3 +65,3 @@ inline constexpr std::array where{DT::BFLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT:
+ // support vs. mix eligibility) and are kept distinct.
+-inline constexpr std::array mixed_float{DT::BFLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B};
++inline constexpr std::array mixed_float{DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B};
+ 
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+@@ -867,3 +867,4 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+                          : is_quant_op                              ? DataType::FLOAT32
+-                         : (is_sfpu_op && !is_block_float(a_dtype)) ? a_dtype
++                         : ((is_sfpu_op || a_dtype == DataType::FLOAT16) &&
++                            !is_block_float(a_dtype))                ? a_dtype
+                                                                     : DataType::BFLOAT16;
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+@@ -546,5 +546,7 @@ std::pair<std::string, std::string> OpConfig::get_sfpu_init_fn(SfpuBinaryOp sfpu
+             const char* data_format = (dtype == DataType::INT32)     ? "Int32"
+-                                      : (dtype == DataType::UINT32)  ? "UInt32"
+-                                      : (dtype == DataType::FLOAT32) ? "Float32"
+-                                                                     : "Float16_b";
++                                      : (dtype == DataType::UINT32) ? "UInt32"
++                                      : (dtype == DataType::FLOAT32)
++                                          ? "Float32"
++                                      : (dtype == DataType::FLOAT16) ? "Float16"
++                                                                    : "Float16_b";
+             return {"where_tile_init();", fmt::format("where_tile<DataFormat::{}>", data_format)};
+@@ -690,2 +692,6 @@ uint32_t pack_scalar_runtime_arg(const unary::ScalarVariant scalar, const DataTyp
+             }
++            if (dtype == DataType::FLOAT16) {
++                const auto val = tt::tt_metal::float16(static_cast<float>(v)).bits;
++                return (static_cast<uint32_t>(val) << 16) | val;
++            }
+             auto scalar_bf16 = bfloat16(static_cast<float>(v));
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp
+@@ -24,4 +24,5 @@ void ReshapeViewDeviceOperation::validate_on_program_cache_miss(
+         input_tensor_a.dtype() == DataType::BFLOAT16 or input_tensor_a.dtype() == DataType::UINT32 or
+-            input_tensor_a.dtype() == DataType::FLOAT32 or input_tensor_a.dtype() == DataType::INT32,
+-        "Can only work with bfloat16/float32 or int32/uint32 tensors");
++            input_tensor_a.dtype() == DataType::FLOAT32 or input_tensor_a.dtype() == DataType::FLOAT16 or
++            input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::INT32,
++        "Unsupported dtype {}", input_tensor_a.dtype());
+ }
+diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp
+@@ -157,3 +157,4 @@ void PadDeviceOperation::validate_on_program_cache_miss(
+                 input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
+-                input_tensor.dtype() == DataType::UINT16 || input_tensor.dtype() == DataType::BFLOAT8_B,
++                input_tensor.dtype() == DataType::UINT16 || input_tensor.dtype() == DataType::FLOAT16 ||
++                input_tensor.dtype() == DataType::BFLOAT8_B,
+             "Cannot pad tilized tensor with specified format");
+@@ -163,3 +164,3 @@ void PadDeviceOperation::validate_on_program_cache_miss(
+                 input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
+-                input_tensor.dtype() == DataType::UINT16,
++                input_tensor.dtype() == DataType::UINT16 || input_tensor.dtype() == DataType::FLOAT16,
+             "Cannot pad RM tensor with specified format");
+diff --git tt_metal/jit_build/data_format.cpp tt_metal/jit_build/data_format.cpp
+--- tt_metal/jit_build/data_format.cpp
++++ tt_metal/jit_build/data_format.cpp
+@@ -7,2 +7,3 @@
+ #include <tt_stl/assert.hpp>  // for tt_throw, TT_FATAL
++#include <hostdevcommon/kernel_structs.h>
+ #include <base_types.hpp>     // for tt::tt_metal::UnpackToDestMode
+@@ -70,3 +71,9 @@ ExpPrecision get_exp_precision(DataFormat data_format) {
+     DataFormat last_valid_format = DataFormat::Invalid;
+-    for (const auto& format : data_format) {
++    for (std::size_t index = 0; index < data_format.size(); ++index) {
++        // Output CBs are converted by the packer and may use a different
++        // exponent width from the unpack inputs.
++        if (index >= CBIndex::c_16 && index <= CBIndex::c_23) {
++            continue;
++        }
++        const auto format = data_format[index];
+         // Special case where Float32 can pair with any exponent precision, skip checking
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_device_operation.cpp
+@@ -77,4 +77,5 @@ void SortDeviceOperation::validate_on_program_cache_miss(
+     TT_FATAL(
+-        input.dtype() == DataType::BFLOAT16 || input.dtype() == DataType::UINT16 || input.dtype() == DataType::FLOAT32,
+-        "Input tensor data type must be BFLOAT16, UINT16, or FLOAT32, got {}",
++        input.dtype() == DataType::BFLOAT16 || input.dtype() == DataType::FLOAT16 ||
++            input.dtype() == DataType::UINT16 || input.dtype() == DataType::FLOAT32,
++        "Unsupported input tensor data type {}",
+         input.dtype());
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
+@@ -514,3 +514,5 @@ ProgramDescriptor build_cross_core_program_descriptor(
+         tt::tt_metal::datatype_to_dataformat_converter(output_tensors.at(1).dtype());
+-    const tt::DataFormat packer_unpacker_sync_cb_data_format = tt::DataFormat::Float16_b;
++    const tt::DataFormat packer_unpacker_sync_cb_data_format = input_tensor_cb_data_format == tt::DataFormat::Float16
++                                                                    ? tt::DataFormat::Float16
++                                                                    : tt::DataFormat::Float16_b;
+ 
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
+@@ -29,2 +29,5 @@ tt::tt_metal::ProgramDescriptor TypecastProgramFactory::create_descriptor(
+-    const tt::DataFormat cb_data_format_input = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
++    const tt::DataFormat cb_data_format_input =
++        args.input_dtype == DataType::FLOAT16 && args.output_dtype == DataType::FLOAT32
++            ? tt::DataFormat::UInt16
++            : tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
+     const uint32_t single_tile_size_input = tt::tile_size(cb_data_format_input);
+@@ -64,3 +66,3 @@ tt::tt_metal::ProgramDescriptor TypecastProgramFactory::create_descriptor(
+ 
+-    constexpr uint8_t output_cb_index = tt::CBIndex::c_2;
++    constexpr uint8_t output_cb_index = tt::CBIndex::c_16;
+     constexpr uint32_t num_output_pages = 2;
+@@ -243,3 +243,3 @@ tt::tt_metal::ProgramDescriptor TypecastSubgridProgramFactory::create_descriptor
+ 
+-    constexpr uint8_t output_cb_index = tt::CBIndex::c_2;
++    constexpr uint8_t output_cb_index = tt::CBIndex::c_16;
+     constexpr uint32_t num_output_tiles = 2;
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
+@@ -78,2 +78,5 @@ tt::tt_metal::ProgramDescriptor TypecastRowMajorChunkedProgramFactory::create_descriptor(
+-    const tt::DataFormat cb_data_format_input = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
++    const tt::DataFormat cb_data_format_input =
++        input_dtype == DataType::FLOAT16 && output_dtype == DataType::FLOAT32
++            ? tt::DataFormat::UInt16
++            : tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
+     const uint32_t input_element_size = tt::datum_size(cb_data_format_input);
+@@ -113,3 +116,3 @@ tt::tt_metal::ProgramDescriptor TypecastRowMajorChunkedProgramFactory::create_descriptor(
+     constexpr uint8_t input_cb_index = tt::CBIndex::c_0;
+-    constexpr uint8_t output_cb_index = tt::CBIndex::c_2;
++    constexpr uint8_t output_cb_index = tt::CBIndex::c_16;
+     constexpr uint32_t num_input_pages = 2;   // Always use double buffering
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp
+@@ -97,3 +97,3 @@ tt::tt_metal::ProgramDescriptor TypecastShardedProgramFactory::create_descriptor(
+     // output sharded CB
+-    const uint8_t out_cb_id = tt::CBIndex::c_2;
++    const uint8_t out_cb_id = tt::CBIndex::c_16;
+     uint32_t aligned_output_tile_nbytes =
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+@@ -127,2 +127,5 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
+ 
++    const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en ||
++                                  input.dtype() == DataType::FLOAT16 ||
++                                  output.dtype() == DataType::FLOAT16;
+     uint32_t packed_scalar1 = 0;
+@@ -131,2 +134,5 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
+     DataFormat cb_data_format_output = datatype_to_dataformat_converter(output.dtype());
++    if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
++        cb_data_format_output = DataFormat::UInt16;
++    }
+     uint32_t single_tile_size_output = tile_size(cb_data_format_output);
+@@ -266,3 +272,3 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_desc
+         .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
+-        .fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en,
++        .fp32_dest_acc_en = fp32_dest_acc_en,
+         .unpack_to_dest_mode = {unpack_to_dest_mode.begin(), unpack_to_dest_mode.end()},
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+@@ -1173,2 +1173,4 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_d
+     bool fp32_dest_acc_en = c_data_format == tt::DataFormat::UInt32 || c_data_format == tt::DataFormat::Int32 ||
++                            a_data_format == tt::DataFormat::Float16 ||
++                            b_data_format == tt::DataFormat::Float16 || c_data_format == tt::DataFormat::Float16 ||
+                             c_data_format == tt::DataFormat::Float32 || a_data_format == tt::DataFormat::Float32 ||
+diff --git tt_metal/jit_build/data_format.cpp tt_metal/jit_build/data_format.cpp
+--- tt_metal/jit_build/data_format.cpp
++++ tt_metal/jit_build/data_format.cpp
+@@ -278,3 +278,3 @@ DataFormat get_single_pack_src_format(
+         } else if (data_format == DataFormat::Float16) {
+-            pack_src_format = DataFormat::Float16_b;
++            pack_src_format = DataFormat::Float16;
+         } else if (data_format == DataFormat::UInt32) {
+diff --git ttnn/core/tensor/host_buffer/functions.cpp ttnn/core/tensor/host_buffer/functions.cpp
+--- ttnn/core/tensor/host_buffer/functions.cpp
++++ ttnn/core/tensor/host_buffer/functions.cpp
+@@ -41,2 +41,3 @@ INSTANTIATE_HOST_BUFFER_FUNCTIONS(uint32_t)
+ INSTANTIATE_HOST_BUFFER_FUNCTIONS(bfloat16)
++INSTANTIATE_HOST_BUFFER_FUNCTIONS(float16)
+ INSTANTIATE_HOST_BUFFER_FUNCTIONS(uint16_t)
+diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
+--- tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
++++ tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
+@@ -8,2 +8,3 @@
+ #ifdef TRISC_MATH
++#include "llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h"
+ #include "ckernel_sfpu_typecast.h"
+@@ -93,3 +94,19 @@ ALWI void typecast_tile(uint32_t idst) {
+ #else
+-    if constexpr (in_format == DataFormat::Float16_b && out_format == DataFormat::UInt16) {
++    if constexpr (in_format == DataFormat::Float32 && out_format == DataFormat::Float16) {
++        MATH(SFPU_UNARY_CALL(
++            DST_SYNC_MODE,
++            DST_ACCUM_MODE,
++            cast_fp32_to_fp16a,
++            (APPROX, 8 /* ITERATIONS */),
++            idst,
++            VectorMode::RC));
++    } else if constexpr (in_format == DataFormat::Float16 && out_format == DataFormat::Float32) {
++        MATH(SFPU_UNARY_CALL(
++            DST_SYNC_MODE,
++            DST_ACCUM_MODE,
++            cast_fp16a_to_fp32,
++            (APPROX, 8 /* ITERATIONS */),
++            idst,
++            VectorMode::RC));
++    } else if constexpr (in_format == DataFormat::Float16_b && out_format == DataFormat::UInt16) {
+         MATH(SFPU_UNARY_CALL(
+@@ -161,2 +177,3 @@ ALWI void typecast_tile(uint32_t idst) {
+-    } else if constexpr (in_format == DataFormat::Int32 && out_format == DataFormat::Float32) {
++    } else if constexpr (
++        in_format == DataFormat::Int32 && (out_format == DataFormat::Float32 || out_format == DataFormat::Float16)) {
+         MATH(SFPU_UNARY_CALL(
+@@ -434,2 +451,3 @@ ALWI void typecast_tile_init() {
+-    } else if constexpr (in_format == DataFormat::Int32 && out_format == DataFormat::Float32) {
++    } else if constexpr (
++        in_format == DataFormat::Int32 && (out_format == DataFormat::Float32 || out_format == DataFormat::Float16)) {
+         MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_int32_to_fp32, (APPROX)));
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
+@@ -7,2 +7,3 @@
+ #include "ckernel_defs.h"
++#include "internal/tt-1xx/float16_conversion.h"
+ 
+@@ -19,3 +20,3 @@ inline void cast_fp32_to_fp16a() {
+         sfpi::vFloat x = sfpi::dst_reg[0];
+-        x = sfpi::convert<sfpi::vFloat16a>(x, sfpi::RoundMode::Nearest);
++        x = float32_to_float16_rne(x);
+         sfpi::dst_reg[0] = x;
+@@ -25,2 +26,16 @@ inline void cast_fp32_to_fp16a() {
+ 
++template <bool APPROXIMATION_MODE, int ITERATIONS>
++inline void cast_fp16a_to_fp32() {
++    for (int d = 0; d < ITERATIONS; d++) {
++        // In 32-bit DST mode, UInt16 tiles are unpacked into the low half of
++        // each word. Loading U16 would apply the 16-bit DST lane swizzle.
++        sfpi::vUInt bits(
++            sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>());
++        bits &= 0xffffU;
++        sfpi::dst_reg[0].mode<sfpi::DataLayout::F32>() =
++            sfpi::as<sfpi::vFloat>(float16_to_float32_bits(bits));
++        sfpi::dst_reg++;
++    }
++}
++
+ }  // namespace sfpu
+diff --git tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
+new file mode 100644
+--- /dev/null
++++ tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
+@@ -0,0 +1,85 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include "sfpi.h"
++
++namespace ckernel::sfpu {
++
++// Returns the exact Float32 representation of the IEEE Float16 value obtained
++// by round-to-nearest-even. Keeping the result in Float32 lets the packer emit
++// Float16 without making a second rounding decision.
++sfpi_inline sfpi::vFloat float32_to_float16_rne(sfpi::vFloat input) {
++    sfpi::vUInt bits = sfpi::as<sfpi::vUInt>(input);
++    sfpi::vUInt sign = bits & 0x80000000U;
++    sfpi::vUInt magnitude = bits & 0x7fffffffU;
++    sfpi::vUInt rounded;
++
++    v_if(magnitude >= 0x7f800000U) {
++        // Preserve infinities and NaNs.
++        rounded = magnitude;
++    }
++    v_elseif(magnitude >= 0x477ff000U) {
++        // Values at or above the midpoint after max-finite overflow to infinity.
++        rounded = 0x7f800000U;
++    }
++    v_elseif(magnitude >= 0x38800000U) {
++        // Normal Float16: discard 13 mantissa bits with the retained LSB as
++        // the tie breaker.
++        sfpi::vUInt lsb = (magnitude >> 13) & 1U;
++        rounded = (magnitude + 0xfffU + lsb) & 0xffffe000U;
++    }
++    v_elseif(magnitude > 0x33000000U) {
++        // Float16 subnormal. Quantize the Float32 significand to a multiple of
++        // 2^-24, again adding half minus one plus the retained LSB for RNE.
++        sfpi::vUInt exponent = (magnitude >> 23) & 0xffU;
++        sfpi::vUInt significand = (magnitude & 0x7fffffU) | 0x800000U;
++        sfpi::vInt shift = sfpi::vInt(126) - sfpi::as<sfpi::vInt>(exponent);
++        sfpi::vUInt truncated =
++            sfpi::shft(significand, -shift, sfpi::ShiftMode::Logical);
++        sfpi::vUInt half =
++            sfpi::shft(sfpi::vUInt(1), shift - 1, sfpi::ShiftMode::Logical);
++        sfpi::vUInt value = sfpi::shft(
++            significand + half - 1U + (truncated & 1U), -shift,
++            sfpi::ShiftMode::Logical);
++        sfpi::vFloat valueFloat = sfpi::convert<sfpi::vFloat>(
++            sfpi::as<sfpi::vSMag>(value), sfpi::RoundMode::Nearest);
++        rounded = sfpi::as<sfpi::vUInt>(valueFloat * 0x1p-24f);
++    }
++    v_else { rounded = 0U; }
++    v_endif;
++    return sfpi::as<sfpi::vFloat>(rounded | sign);
++}
++
++// Expands raw IEEE Float16 bits into exact Float32 bits.
++sfpi_inline sfpi::vUInt float16_to_float32_bits(sfpi::vUInt bits) {
++    sfpi::vUInt sign = (bits & 0x8000U) << 16;
++    sfpi::vUInt exponent = (bits >> 10) & 0x1fU;
++    sfpi::vUInt mantissa = bits & 0x3ffU;
++    sfpi::vUInt result;
++
++    v_if(exponent == 0U) {
++        result = sign;
++        v_if(mantissa != 0U) {
++            sfpi::vUInt leadingZeros =
++                sfpi::vUInt(0U) + sfpi::lz(mantissa);
++            sfpi::vUInt shift = leadingZeros - 21U;
++            result = sign |
++                     ((sfpi::vUInt(134U) - leadingZeros) << 23) |
++                     (((mantissa << shift) & 0x3ffU) << 13);
++        }
++        v_endif;
++    }
++    v_elseif(exponent == 0x1fU) {
++        result = sign | 0x7f800000U | (mantissa << 13);
++    }
++    v_else {
++        result = sign | ((exponent + 112U) << 23) | (mantissa << 13);
++    }
++    v_endif;
++    return result;
++}
++
++}  // namespace ckernel::sfpu
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
+@@ -25,3 +25,4 @@ Tensor unary_impl(
+     }
+-    bool preserve_fp32_precision = (input_dtype == DataType::FLOAT32);
++    bool preserve_fp32_precision = input_dtype == DataType::FLOAT32 ||
++                                    (input_dtype == DataType::FLOAT16 && output_dtype == DataType::FLOAT32);
+     bool fp32_dest_acc_en = preserve_fp32_precision || output_dtype == DataType::UINT32 ||
+diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/cunpack_common.h tt_metal/tt-llk/tt_llk_blackhole/common/inc/cunpack_common.h
+--- tt_metal/tt-llk/tt_llk_blackhole/common/inc/cunpack_common.h
++++ tt_metal/tt-llk/tt_llk_blackhole/common/inc/cunpack_common.h
+@@ -217,2 +217,12 @@ inline constexpr bool is_32bit_input(const std::uint32_t unpack_src_format, cons
+ 
++inline constexpr bool supports_unpack_to_dest(
++    const std::uint32_t unpack_src_format,
++    const std::uint32_t unpack_dst_format)
++{
++    const DataFormat input_df  = static_cast<DataFormat>(masked_data_format(unpack_src_format));
++    const DataFormat output_df = static_cast<DataFormat>(masked_data_format(unpack_dst_format));
++    return is_32bit_input(unpack_src_format, unpack_dst_format) ||
++           (input_df == DataFormat::Float16 && output_df == DataFormat::Float16);
++}
++
+ // Canonical srcA channel-1 X stride in bytes, derived from the unpacker dst format.
+@@ -247,3 +256,3 @@ inline constexpr std::uint32_t canonical_unpA_y_stride(const std::uint32_t unpac
+ {
+-    return unpack_to_dest && is_32bit_input(unpack_src_format, unpack_dst_format);
++    return unpack_to_dest && supports_unpack_to_dest(unpack_src_format, unpack_dst_format);
+ }
+diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/cmath_common.h tt_metal/tt-llk/tt_llk_blackhole/common/inc/cmath_common.h
+--- tt_metal/tt-llk/tt_llk_blackhole/common/inc/cmath_common.h
++++ tt_metal/tt-llk/tt_llk_blackhole/common/inc/cmath_common.h
+@@ -295,2 +295,11 @@ inline constexpr bool is_32bit_input(const std::uint32_t src_format, const std::
+ 
++inline constexpr bool supports_unpack_to_dest(const std::uint32_t src_format, const std::uint32_t dst_format)
++{
++    const std::uint32_t input_df  = masked_data_format(src_format);
++    const std::uint32_t output_df = masked_data_format(dst_format);
++    return is_32bit_input(src_format, dst_format) ||
++           (input_df == to_underlying(DataFormat::Float16) &&
++            output_df == to_underlying(DataFormat::Float16));
++}
++
+ inline constexpr bool is_high_fidelity(const MathFidelity math_fidelity_desc)
+diff --git tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_math_eltwise_unary_datacopy.h tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_math_eltwise_unary_datacopy.h
+--- tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_math_eltwise_unary_datacopy.h
++++ tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_math_eltwise_unary_datacopy.h
+@@ -58,3 +58,3 @@ inline void _llk_math_eltwise_unary_datacopy_(
+     // adjust it to offset in faces for 32bit data.
+-    if (unpack_to_dest && is_32bit_input(src_format, dst_format))
++    if (unpack_to_dest && supports_unpack_to_dest(src_format, dst_format))
+     {
+diff --git tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_A.h tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_A.h
+--- tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_A.h
++++ tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_A.h
+@@ -414,3 +414,3 @@ inline void _llk_unpack_A_(
+     {
+-        if (is_32bit_input(unpack_src_format, unpack_dst_format))
++        if (should_unpack_to_dest(unpack_to_dest, unpack_src_format, unpack_dst_format))
+         {
+@@ -432,3 +432,3 @@ inline void _llk_unpack_A_(
+     {
+-        if (is_32bit_input(unpack_src_format, unpack_dst_format))
++        if (should_unpack_to_dest(unpack_to_dest, unpack_src_format, unpack_dst_format))
+         {
+diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/reduction/prod/device/prod_all_device_operation.cpp
+@@ -24,3 +24,4 @@ void ProdAllDeviceOperation::validate_on_program_cache_miss(
+     TT_FATAL(
+-        input.dtype() == tt::tt_metal::DataType::BFLOAT16 || input.dtype() == tt::tt_metal::DataType::FLOAT32 ||
++        input.dtype() == tt::tt_metal::DataType::BFLOAT16 || input.dtype() == tt::tt_metal::DataType::FLOAT16 ||
++            input.dtype() == tt::tt_metal::DataType::FLOAT32 ||
+             input.dtype() == tt::tt_metal::DataType::BFLOAT8_B || input.dtype() == tt::tt_metal::DataType::BFLOAT4_B,
+diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_device_operation.cpp
+@@ -37,3 +37,4 @@ void ProdNcDeviceOperation::validate_on_program_cache_miss(
+     TT_FATAL(
+-        input.dtype() == tt::tt_metal::DataType::BFLOAT16 || input.dtype() == tt::tt_metal::DataType::FLOAT32 ||
++        input.dtype() == tt::tt_metal::DataType::BFLOAT16 || input.dtype() == tt::tt_metal::DataType::FLOAT16 ||
++            input.dtype() == tt::tt_metal::DataType::FLOAT32 ||
+             input.dtype() == tt::tt_metal::DataType::BFLOAT8_B,
+diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/prod_op_all.cpp ttnn/cpp/ttnn/operations/reduction/prod/device/prod_op_all.cpp
+--- ttnn/cpp/ttnn/operations/reduction/prod/device/prod_op_all.cpp
++++ ttnn/cpp/ttnn/operations/reduction/prod/device/prod_op_all.cpp
+@@ -16,2 +16,5 @@ tt::tt_metal::Tensor prod_all(const tt::tt_metal::Tensor& input, const tt::tt_me
+                 result, result.dtype(), result.layout(), result.device(), output_mem_config);
++        case tt::tt_metal::DataType::FLOAT16:
++            return ttnn::prod_result_computation_WH_B0<tt::tt_metal::float16>(
++                result, result.dtype(), result.layout(), result.device(), output_mem_config);
+         case tt::tt_metal::DataType::BFLOAT16:
+diff --git ttnn/cpp/ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.cpp ttnn/cpp/ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv_transpose2d/prepare_conv_transpose2d_weights.cpp
+@@ -153,6 +153,8 @@ Tensor transform_weights_for_conv_transpose2d(const Tensor& conv_weight_tensor,
+     switch (conv_weight_tensor.dtype()) {
+         case DataType::BFLOAT16:
+             return _transform_weights_for_conv_transpose2d<::bfloat16>(to_mirror_tensor, mirror_kernel);
++        case DataType::FLOAT16:
++            return _transform_weights_for_conv_transpose2d<tt::tt_metal::float16>(to_mirror_tensor, mirror_kernel);
+         case DataType::FLOAT32: return _transform_weights_for_conv_transpose2d<float>(to_mirror_tensor, mirror_kernel);
+         case DataType::UINT32:
+             return _transform_weights_for_conv_transpose2d<uint32_t>(to_mirror_tensor, mirror_kernel);
+diff --git ttnn/cpp/ttnn/operations/conv/conv2d/prepare_conv2d_weights.cpp ttnn/cpp/ttnn/operations/conv/conv2d/prepare_conv2d_weights.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv2d/prepare_conv2d_weights.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv2d/prepare_conv2d_weights.cpp
+@@ -289 +289 @@ Tensor to_weight_interleaved_mm_layout(const Tensor& conv_weight_tensor, DataTyp
+-        auto output_buffer = std::vector<T>(output_shape.volume(), T(0));
++        auto output_buffer = std::vector<T>(output_shape.volume(), T{});
+@@ -395,4 +395,5 @@ Tensor convert_conv_weight_tensor_to_interleaved_mm_layout(
+         to_w_interleaved_mm_layout_map = {
+             {DataType::BFLOAT16, &to_weight_interleaved_mm_layout<bfloat16>},
++            {DataType::FLOAT16, &to_weight_interleaved_mm_layout<tt::tt_metal::float16>},
+             {DataType::FLOAT32, &to_weight_interleaved_mm_layout<float>},
+             {DataType::UINT32, &to_weight_interleaved_mm_layout<uint32_t>}};
+@@ -411,4 +412,5 @@ Tensor convert_conv_weight_tensor_to_tiled_layout(
+         to_w_tile_layout_map = {
+             {DataType::BFLOAT16, &to_weight_tile_layout<bfloat16>},
++            {DataType::FLOAT16, &to_weight_tile_layout<tt::tt_metal::float16>},
+             {DataType::FLOAT32, &to_weight_tile_layout<float>},
+             {DataType::UINT32, &to_weight_tile_layout<uint32_t>}};
+@@ -476 +478 @@ Tensor to_weight_tile_layout_block_sharded(
+-        auto output_buffer = std::vector<T>(output_shape.volume(), T(0));  // Initialize with zeros
++        auto output_buffer = std::vector<T>(output_shape.volume(), T{});  // Initialize with zeros
+@@ -555,4 +557,5 @@ Tensor convert_conv_weight_tensor_to_tiled_layout_block_sharded(
+         to_w_tile_layout_map = {
+             {DataType::BFLOAT16, &to_weight_tile_layout_block_sharded<bfloat16>},
++            {DataType::FLOAT16, &to_weight_tile_layout_block_sharded<tt::tt_metal::float16>},
+             {DataType::FLOAT32, &to_weight_tile_layout_block_sharded<float>},
+             {DataType::UINT32, &to_weight_tile_layout_block_sharded<uint32_t>}};
+@@ -615,6 +618,7 @@ Tensor convert_conv_bias_tensor_to_tiled_layout_block_sharded(
+         std::function<Tensor(const Tensor&, uint32_t num_channel_shards, DataType output_dtype)>>
+         to_b_tile_layout_map = {
+             {DataType::BFLOAT16, &to_bias_tile_layout_block_sharded<bfloat16>},
++            {DataType::FLOAT16, &to_bias_tile_layout_block_sharded<tt::tt_metal::float16>},
+             {DataType::FLOAT32, &to_bias_tile_layout_block_sharded<float>},
+             {DataType::UINT32, &to_bias_tile_layout_block_sharded<uint32_t>},
+         };
+@@ -634,4 +638,5 @@ Tensor convert_conv_weight_tensor_to_special_padding_tiled_layout(
+         to_w_tile_layout_map = {
+             {DataType::BFLOAT16, &to_weight_special_padding_tile_layout<bfloat16>},
++            {DataType::FLOAT16, &to_weight_special_padding_tile_layout<tt::tt_metal::float16>},
+             {DataType::FLOAT32, &to_weight_special_padding_tile_layout<float>},
+             {DataType::UINT32, &to_weight_special_padding_tile_layout<uint32_t>}};
+@@ -781,6 +786,7 @@ Tensor convert_conv_weight_tensor_to_grouped_layout(
+                 {DataType::INT32, &conv_group_weight_zero_pad_helper<int32_t>},
+                 {DataType::FLOAT32, &conv_group_weight_zero_pad_helper<float>},
+                 {DataType::BFLOAT16, &conv_group_weight_zero_pad_helper<bfloat16>},
++                {DataType::FLOAT16, &conv_group_weight_zero_pad_helper<tt::tt_metal::float16>},
+                 {DataType::UINT16, &conv_group_weight_zero_pad_helper<uint16_t>},
+                 {DataType::BFLOAT8_B, &conv_group_weight_zero_pad_helper<float>},
+                 {DataType::UINT32, &conv_group_weight_zero_pad_helper<uint32_t>},
+@@ -888,6 +894,7 @@ Tensor convert_conv_weight_tensor_to_grouped_layout_for_conv_transpose2d(
+                 {DataType::INT32, &conv_transpose2d_group_weight_zero_pad_helper<int32_t>},
+                 {DataType::FLOAT32, &conv_transpose2d_group_weight_zero_pad_helper<float>},
+                 {DataType::BFLOAT16, &conv_transpose2d_group_weight_zero_pad_helper<bfloat16>},
++                {DataType::FLOAT16, &conv_transpose2d_group_weight_zero_pad_helper<tt::tt_metal::float16>},
+                 {DataType::UINT16, &conv_transpose2d_group_weight_zero_pad_helper<uint16_t>},
+                 {DataType::BFLOAT8_B, &conv_transpose2d_group_weight_zero_pad_helper<float>},
+                 {DataType::UINT32, &conv_transpose2d_group_weight_zero_pad_helper<uint32_t>},
+@@ -937,2 +944,3 @@ Tensor convert_conv_weight_tensor_to_depthwise_layout(
+             {DataType::BFLOAT16, &conv_depthwise_weight_bcast_helper<bfloat16>},
++            {DataType::FLOAT16, &conv_depthwise_weight_bcast_helper<tt::tt_metal::float16>},
+             {DataType::UINT16, &conv_depthwise_weight_bcast_helper<uint16_t>},
+diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
+--- tt_metal/impl/tensor/tensor_apis.cpp
++++ tt_metal/impl/tensor/tensor_apis.cpp
+@@ -1202,3 +1202,7 @@ tt::tt_metal::DistributedHostBuffer transform_buffers(
+             std::transform(data.begin(), data.end(), output_vector.begin(), [](SrcType value) {
+-                return static_cast<DstType>(value);
++                if constexpr (std::is_same_v<SrcType, float16> || std::is_same_v<DstType, float16>) {
++                    return static_cast<DstType>(static_cast<float>(value));
++                } else {
++                    return static_cast<DstType>(value);
++                }
+             });
+diff --git ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp
+@@ -65,6 +65,7 @@ HaloDeviceOperation::spec_return_value_t HaloDeviceOperation::compute_output_specs(
+     tt::tt_metal::DataType output_dtype;
+     switch (input_tensor.dtype()) {
+         case tt::tt_metal::DataType::FLOAT32: output_dtype = tt::tt_metal::DataType::FLOAT32; break;
++        case tt::tt_metal::DataType::FLOAT16: output_dtype = tt::tt_metal::DataType::FLOAT16; break;
+         case tt::tt_metal::DataType::UINT16: output_dtype = tt::tt_metal::DataType::UINT16; break;
+         default: output_dtype = tt::tt_metal::DataType::BFLOAT16; break;
+     }
+diff --git ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common.cpp
+@@ -80,5 +80,2 @@ std::vector<CBInfo> get_cb_info(
+-    // Output of halo op is always ROW_MAJOR, so input for convs is either DataType::FLOAT32 or DataType::BFLOAT16
+-    const tt::tt_metal::DataType conv_input_dtype = (input_datatype == tt::tt_metal::DataType::FLOAT32)
+-                                                        ? tt::tt_metal::DataType::FLOAT32
+-                                                        : tt::tt_metal::DataType::BFLOAT16;
++    const tt::tt_metal::DataType conv_input_dtype = input_datatype;
+     const uint32_t input_datum_size = conv_input_dtype == tt::tt_metal::DataType::FLOAT32 ? 4 : 2;
+@@ -87,5 +84,5 @@ std::vector<CBInfo> get_cb_info(
+     const uint32_t input_tile_size = tt::tile_size(datatype_to_dataformat_converter(conv_input_dtype));
+-
+     auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
+         get_compute_kernel_config_args(tt::tt_metal::hal::get_arch(), compute_kernel_config);
++    fp32_dest_acc_en &= input_datatype != DataType::FLOAT16;
+ 
+@@ -176,3 +174,3 @@ std::vector<CBInfo> get_cb_info(
+     const tt::tt_metal::DataType partial_dtype =
+-        packer_l1_acc ? (fp32_dest_acc_en ? DataType::FLOAT32 : DataType::BFLOAT16) : output_datatype;
++        packer_l1_acc && fp32_dest_acc_en ? DataType::FLOAT32 : output_datatype;
+     const tt::DataFormat partial_df = datatype_to_dataformat_converter(partial_dtype);
+@@ -307,4 +305,4 @@ std::vector<CBInfo> get_cb_info(
+     // Reader indices CB
+-    // Worst case is 1 uint16 index per output row (segment headers and discontinuity markers
+-    // empirically stay below this bound for supported configs). When the factory has the real
++    // Reserve four uint16 values per output row for block headers and discontinuities.
++    // When the factory has the real
+     // DRAM config buffer it passes its actual per-core page size so the predicted CB footprint
+@@ -312,3 +310,3 @@ std::vector<CBInfo> get_cb_info(
+     const uint32_t reader_indices_worst_case_page_size =
+-        pconfig.per_core_out_matrix_height_ntile * tt::constants::TILE_HEIGHT * sizeof(uint16_t);
++        4 * pconfig.per_core_out_matrix_height_ntile * tt::constants::TILE_HEIGHT * sizeof(uint16_t);
+     if (reader_indices_actual_page_size.has_value()) {
+@@ -336,3 +334,3 @@ std::vector<CBInfo> get_cb_info(
+         .page_size = l1_scratchpad_CB_size,
+-        .data_format = tt::DataFormat::Float16_b});
++        .data_format = conv_input_df});
+ 
+diff --git ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
+@@ -1036,5 +1036,2 @@ core_count_and_size calculate_L1_usage_for_conv_op(
+-    // Output of halo op is always ROW_MAJOR, so input for convs is either DataType::FLOAT32 or DataType::BFLOAT16
+-    const tt::tt_metal::DataType conv_input_dtype = (input_datatype == tt::tt_metal::DataType::FLOAT32)
+-                                                        ? tt::tt_metal::DataType::FLOAT32
+-                                                        : tt::tt_metal::DataType::BFLOAT16;
++    const tt::tt_metal::DataType conv_input_dtype = input_datatype;
+     const uint32_t input_datum_size = conv_input_dtype == tt::tt_metal::DataType::FLOAT32 ? 4 : 2;
+diff --git ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_device_operation.cpp ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_device_operation.cpp
+@@ -104,4 +104,5 @@ void Conv2dDeviceOperation::validate_on_program_cache_miss(
+         TT_FATAL(
+-            (args.dtype == DataType::BFLOAT16) || (args.dtype == DataType::FLOAT32),
+-            "Untilize output requires BFLOAT16 or FLOAT32 data type but got {}",
++            (args.dtype == DataType::BFLOAT16) || (args.dtype == DataType::FLOAT16) ||
++                (args.dtype == DataType::FLOAT32),
++            "Untilize output requires BFLOAT16, FLOAT16, or FLOAT32 data type but got {}",
+             args.dtype);
+diff --git ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp
+@@ -247,2 +247,3 @@ tt::tt_metal::ProgramDescriptor build_program_descriptor_sharded(
+         get_compute_kernel_config_args(device->arch(), compute_kernel_config);
++    fp32_dest_acc_en &= a.dtype() != DataType::FLOAT16;
+ 
+diff --git ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_width_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_width_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_width_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_width_sharded_program_factory.cpp
+@@ -113,2 +113,3 @@ tt::tt_metal::ProgramDescriptor build_program_descriptor(
+         get_compute_kernel_config_args(device->arch(), compute_kernel_config);
++    fp32_dest_acc_en &= a.dtype() != DataType::FLOAT16;
+ 
+diff --git ttnn/cpp/ttnn/operations/sliding_window/halo/device/untilize_with_halo_program_factory.cpp ttnn/cpp/ttnn/operations/sliding_window/halo/device/untilize_with_halo_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/sliding_window/halo/device/untilize_with_halo_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/sliding_window/halo/device/untilize_with_halo_program_factory.cpp
+@@ -202,2 +202,3 @@ ProgramDescriptor build_halo_program(
+             get_compute_kernel_config_args(input_tensor.device()->arch(), operation_attributes.compute_kernel_config);
++        fp32_dest_acc_en &= input_tensor.dtype() != DataType::FLOAT16;
+ 

@@ -1,0 +1,32 @@
+diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
+--- a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
++++ b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
+@@ -124,20 +124,14 @@ private:
+ 
+   mlir::ElementsAttr rebuildFloatAttr(mlir::ElementsAttr attr,
+                                       mlir::ShapedType newType) const {
+-    const size_t bitWidth = attr.getElementType().getIntOrFloatBitWidth();
+-    llvm::SmallVector<mlir::APFloat> floatValues;
+-
+-    if (bitWidth == 64) {
+-      // Convert f64 -> f32
+-      for (mlir::APFloat v : attr.getValues<mlir::APFloat>()) {
+-        float f = static_cast<float>(v.convertToDouble());
+-        floatValues.emplace_back(f);
+-      }
+-    } else {
+-      floatValues.assign(attr.getValues<mlir::APFloat>().begin(),
+-                         attr.getValues<mlir::APFloat>().end());
+-    }
+-
++    auto targetType = mlir::cast<mlir::FloatType>(newType.getElementType());
++    auto floatValues = llvm::map_to_vector(
++        attr.getValues<mlir::APFloat>(), [&](mlir::APFloat value) {
++          bool losesInfo;
++          value.convert(targetType.getFloatSemantics(),
++                        mlir::APFloat::rmNearestTiesToEven, &losesInfo);
++          return value;
++        });
+     return mlir::DenseElementsAttr::get(newType, floatValues);
+   }
+ };

@@ -1,0 +1,26 @@
+diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
+--- a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
+@@ -88,3 +88,21 @@ void run(const ::tt::target::ttnn::EltwiseBinaryCompositeOp *op,
+            const std::optional<::ttnn::MemoryConfig> &memCfg) {
+-          return ::ttnn::remainder(lhs, rhs, std::nullopt, memCfg);
++          // StableHLO uses truncating remainder. For unsigned values floor and
++          // truncation agree, while TTNN's fmod does not support them.
++          const auto dtype = lhs.dtype();
++          if (dtype == ::ttnn::DataType::UINT16) {
++            // The native remainder kernel supports UINT8 and UINT32, so use
++            // UINT32 for UINT16 without changing the unsigned arithmetic.
++            auto wideLhs =
++                ::ttnn::typecast(lhs, ::ttnn::DataType::UINT32, memCfg);
++            auto wideRhs =
++                ::ttnn::typecast(rhs, ::ttnn::DataType::UINT32, memCfg);
++            auto result =
++                ::ttnn::remainder(wideLhs, wideRhs, std::nullopt, memCfg);
++            return ::ttnn::typecast(result, ::ttnn::DataType::UINT16, memCfg);
++          }
++          if (dtype == ::ttnn::DataType::UINT8 ||
++              dtype == ::ttnn::DataType::UINT32) {
++            return ::ttnn::remainder(lhs, rhs, std::nullopt, memCfg);
++          }
++          return ::ttnn::fmod(lhs, rhs, memCfg);
+         });
