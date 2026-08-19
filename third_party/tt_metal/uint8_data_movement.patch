@@ -146,3 +146,83 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      }
      kernel_defines.emplace_back(
          "FILL_PAD_FILL_FN", is_float_type ? "fill_tile_bitcast" : "fill_tile_int<FILL_PAD_FILL_DATA_FMT>");
+
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
+@@ -69,6 +69,7 @@ Tensor untilize_with_unpadding(
+     bool use_multicore,
+     const std::optional<CoreRangeSet>& sub_core_grids) {
+     bool fp32_dest_acc_en = input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
++                            input_tensor.dtype() == DataType::UINT8 ||
+                             input_tensor.dtype() == DataType::FLOAT32;
+
+     ttsl::SmallVector<uint32_t> output_end_vector;
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
+@@ -68,6 +68,7 @@ Tensor untilize(
+         return ttnn::untilize_with_unpadding(
+             input_tensor, output_tensor_end, memory_config, use_multicore, sub_core_grids);
+     }
+     bool fp32_dest_acc_en = input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
++                            input_tensor.dtype() == DataType::UINT8 ||
+                             input_tensor.dtype() == DataType::FLOAT32;
+     auto input_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_program_factory.cpp
+@@ -232,7 +232,8 @@ tt::tt_metal::ProgramDescriptor UntilizeMultiCoreProgramFactory::create_descript
+         "ttnn/cpp/ttnn/operations/data_movement/untilize/device/kernels/compute/untilize_variable_num_blocks.cpp");
+
+     KernelDescriptor::Defines compute_kernel_defines;
+-    if (a.dtype() == DataType::INT32 || a.dtype() == DataType::UINT32 || a.dtype() == DataType::FLOAT32) {
++    if (a.dtype() == DataType::INT32 || a.dtype() == DataType::UINT32 || a.dtype() == DataType::FLOAT32 ||
++        a.dtype() == DataType::UINT8) {
+         compute_kernel_defines.emplace_back("DST_ACCUM_MODE", "1");
+     }
+
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
+@@ -107,8 +107,7 @@ tt::tt_metal::ProgramDescriptor UntilizeWithUnpaddingMultiCoreInterleavedProgram
+         writer_page_size = out_mem_config.shard_spec().value().shape[1] * output.element_size();
+     }
+     std::vector<uint32_t> writer_ct_args = {
+-        (input_cb_data_format == tt::DataFormat::Float32 or input_cb_data_format == tt::DataFormat::UInt32 or
+-         input_cb_data_format == tt::DataFormat::Int32),
++        num_tiles_per_row,
+         unpadded_row_size_bytes,
+         writer_page_size};
+     TensorAccessorArgs(*dst_buffer).append_to(writer_ct_args);
+@@ -129,7 +128,7 @@ tt::tt_metal::ProgramDescriptor UntilizeWithUnpaddingMultiCoreInterleavedProgram
+      */
+     KernelDescriptor::Defines compute_kernel_defines;
+     if (input_cb_data_format == tt::DataFormat::Int32 || input_cb_data_format == tt::DataFormat::UInt32 ||
+-        input_cb_data_format == tt::DataFormat::Float32) {
++        input_cb_data_format == tt::DataFormat::Float32 || input_cb_data_format == tt::DataFormat::UInt8) {
+         compute_kernel_defines.emplace_back("DST_ACCUM_MODE", "1");
+     }
+     std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/kernels/dataflow/writer_unary_stick_layout_split_rows_multicore.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/kernels/dataflow/writer_unary_stick_layout_split_rows_multicore.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/kernels/dataflow/writer_unary_stick_layout_split_rows_multicore.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/kernels/dataflow/writer_unary_stick_layout_split_rows_multicore.cpp
+@@ -21,7 +21,7 @@ void kernel_main() {
+     const uint32_t start_stick_id = get_arg_val<uint32_t>(2);
+     const uint32_t n_block_reps = get_arg_val<uint32_t>(3);
+
+-    constexpr bool FLOAT32_DTYPE = get_compile_time_arg_val(0) == 1;
++    constexpr uint32_t num_tiles_per_row = get_compile_time_arg_val(0);
+     constexpr uint32_t unpadded_X_size = get_compile_time_arg_val(1);
+     // Per-shard page size in bytes: shard width for BLOCK/WIDTH-sharded output (a logical row
+     // spans multiple shards), full unpadded row otherwise. Feeds noc_async_write_sharded's
+@@ -29,8 +29,6 @@ void kernel_main() {
+     constexpr uint32_t writer_page_size = get_compile_time_arg_val(2);
+     constexpr auto dst_args = TensorAccessorArgs<3>();
+
+-    const uint32_t num_tiles_per_row = padded_X_size >> (FLOAT32_DTYPE ? 7 : 6);
+-
+     const auto s = TensorAccessor(dst_args, dst_addr, writer_page_size);
+
+     Noc noc;
