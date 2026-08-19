@@ -14,8 +14,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  // tt-metal issues to track mixed data types ops bug.
  // https://github.com/tenstorrent/tt-metal/issues/17998
  // https://github.com/tenstorrent/tt-metal/issues/24511
-@@ -386,14 +386,23 @@ TTNNOperandsWorkaroundsFactory::createWhereOpOperandsWorkarounds(
-
+@@ -387,13 +387,22 @@ TTNNOperandsWorkaroundsFactory::createWhereOpOperandsWorkarounds(
    if (predicateElementType.isInteger() ||
        predicateElementType != inputElementType) {
      if (inputElementType.isInteger()) {
@@ -48,11 +47,10 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
-@@ -420,7 +420,40 @@ public:
-     return success();
+@@ -422,6 +422,39 @@ public:
    }
  };
-
+ 
 +// UInt32 where is incorrect in tt-metal, while its Int32 path preserves all
 +// 32 bits. Reinterpret the data operands around that path to avoid the lossy
 +// Float32 workaround and preserve the unsigned payload exactly.

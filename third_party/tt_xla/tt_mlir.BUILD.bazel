@@ -46,6 +46,7 @@ _TTNN_FBS = [
     "operations/tensor_serialization.fbs",
     "operations/trace.fbs",
     "operations/transformer.fbs",
+    "operations/ttml.fbs",
     "program.fbs",
     "types.fbs",
 ]
@@ -1237,6 +1238,7 @@ cc_library(
     name = "ttmlir_compiler",
     srcs = [
         "lib/RegisterAll.cpp",
+        "lib/Conversion/TTIRToEmitPy/CaptureMeshShape.cpp",
         "@//third_party/tt_xla:tt_mlir_control_flow.cpp",
         "@//third_party/tt_xla:tt_mlir_compiler_cold_stubs.cc",
     ] + glob(
@@ -1313,6 +1315,7 @@ cc_library(
             "runtime/lib/ttnn/operations/pool/**",
             "runtime/lib/ttnn/operations/rand/**",
             "runtime/lib/ttnn/operations/tensor_serialization/**",
+            "runtime/lib/ttnn/operations/ttml/**",
         ],
         allow_empty = True,
     ) + [
@@ -1323,6 +1326,7 @@ cc_library(
         "runtime/lib/ttnn/operations/conv/prepare_conv2d_weights.cpp",
         "runtime/lib/ttnn/operations/conv/prepare_conv_transpose2d_bias.cpp",
         "runtime/lib/ttnn/operations/conv/prepare_conv_transpose2d_weights.cpp",
+        "runtime/lib/ttnn/operations/cpu/cpu.cpp",
         "runtime/lib/ttnn/operations/pool/pool2d.cpp",
         "@//third_party/tt_xla:tt_mlir_control_flow_runtime.cpp",
         "@//third_party/tt_xla:tt_mlir_runtime_cold_stubs.cc",

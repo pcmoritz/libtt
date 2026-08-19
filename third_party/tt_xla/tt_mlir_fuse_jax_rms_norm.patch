@@ -84,11 +84,11 @@
 +      x = swappedX;
 +      gammaRaw = xRaw;
      }
-@@ -2965,2 +2974,4 @@ public:
-     mlir::Value gamma = lookThroughSafeOps(gammaRaw);
-     llvm::SmallVector<int64_t> normalizedShape{normalizedDimSize};
-+
+@@ -2967,2 +2994,4 @@ public:
+ 
 +    rewriter.setInsertionPoint(outerMul);
++
+     // Reshape gamma to match normalized_shape if needed.
 @@ -3006,3 +3017 @@ public:
 -    rewriter.setInsertionPoint(outerMul);
 -

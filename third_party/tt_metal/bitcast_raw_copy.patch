@@ -30,8 +30,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
      auto compute_ops_chain = ops_chain;
      const bool promote_narrow_float =
          uses_raw_16bit_sfpu_path(input.dtype()) && ops_chain[0].type() != UnaryOpType::TYPECAST &&
-@@ -155,7 +156,10 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_descriptor(
-     DataFormat cb_data_format_output =
+@@ -158,6 +159,9 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
          promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format
                                                        : datatype_to_dataformat_converter(output.dtype());
 -    if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {

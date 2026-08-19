@@ -174,6 +174,19 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 +      collectDonatableInputIndices(mlir_module);
 +
    status = runFrontendSHLOPipeline(mlir_module, compile_options.export_path,
+@@ -484,3 +505,3 @@ ModuleBuilder::buildModule(
+   if (is_codegen_py_load) {
+-    return buildModuleForTTNNCodegenLoad(
++    auto result = buildModuleForTTNNCodegenLoad(
+         mlir_module, std::move(original_mlir_code), std::move(num_arguments),
+@@ -488,2 +509,7 @@ ModuleBuilder::buildModule(
+         std::move(optimized_mlir_code), graph_hash, std::move(compile_options));
++    if (std::get<1>(result)) {
++      std::get<1>(result)->setDonatableInputIndices(
++          std::move(donatable_input_indices));
++    }
++    return result;
+   }
 @@ -460,2 +484,3 @@
    // a name, otherwise some default string like the current one.
 +  std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> result;
@@ -183,13 +196,13 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 -    return buildModuleForTTNNRuntime(
 +    result = buildModuleForTTNNRuntime(
          mlir_module, std::move(original_mlir_code), std::move(ttir_mlir),
-@@ -472,3 +497,3 @@
-              compile_options.backend == BackendRuntime::TTNNCodegenPy) {
+@@ -540,3 +567,3 @@ ModuleBuilder::buildModule(
+   } else if (is_codegen_cpp || is_codegen_py) {
 -    return buildModuleForTTNNCodegen(
 +    result = buildModuleForTTNNCodegen(
          mlir_module, std::move(original_mlir_code), std::move(ttir_mlir),
-@@ -479,6 +504,12 @@
-         std::move(optimized_mlir_code), std::move(compile_options));
+@@ -547,6 +574,12 @@ ModuleBuilder::buildModule(
+         std::move(optimized_mlir_code), graph_hash, std::move(compile_options));
 +  } else {
 +    LOG_F(ERROR, "Unsupported backend option");
 +    return {tt_pjrt_status::kInvalidArgument, nullptr};

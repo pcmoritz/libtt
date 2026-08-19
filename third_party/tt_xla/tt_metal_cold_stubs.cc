@@ -23,8 +23,8 @@ namespace {
 
 namespace ttnn {
 
-tt::tt_metal::Tensor mesh_partition(
-    const tt::tt_metal::Tensor &, int32_t, std::optional<uint32_t>,
+ttnn::Tensor mesh_partition(
+    const ttnn::Tensor &, int32_t, std::optional<uint32_t>,
     const std::optional<tt::tt_metal::MemoryConfig> &) {
   unsupported("ttnn::mesh_partition");
 }
@@ -37,8 +37,9 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     const std::vector<GlobalSemaphore> &,
     const std::optional<tt::tt_metal::SubDeviceId> &,
     std::optional<ttnn::experimental::ccl::AllGatherFusedOpSignaler> &,
-    CoreCoord, ttnn::ccl::CoreAllocationStrategy,
-    std::optional<uint32_t>, std::optional<uint32_t>) {
+    CoreCoord, ttnn::ccl::CoreAllocationStrategy, std::optional<uint32_t>,
+    std::optional<uint32_t>, std::optional<Tensor>, std::optional<Tensor>,
+    uint32_t, uint32_t, uint32_t) {
   unsupported("ttnn::ring_attention_all_gather_async");
 }
 
@@ -171,20 +172,21 @@ bool MatmulFusedOpSignaler::is_reduce_scatter() const {
          fused_op_type == MatmulFusedOpSignalerType::LLAMA_REDUCE_SCATTER;
 }
 
-} // namespace tt::tt_metal
+} // namespace ttnn::experimental::ccl
 
-namespace tt::tt_metal {
+namespace ttnn {
 
 void dump_tensor_flatbuffer(const std::string &, const Tensor &,
                             DumpTensorMode) {
-  unsupported("tt::tt_metal::dump_tensor_flatbuffer");
+  unsupported("ttnn::dump_tensor_flatbuffer");
 }
 
-Tensor load_tensor_flatbuffer(const std::string &, distributed::MeshDevice *) {
-  unsupported("tt::tt_metal::load_tensor_flatbuffer");
+Tensor load_tensor_flatbuffer(
+    const std::string &, tt::tt_metal::distributed::MeshDevice *) {
+  unsupported("ttnn::load_tensor_flatbuffer");
 }
 
-} // namespace ttnn::experimental::ccl
+} // namespace ttnn
 
 namespace ttnn::ccl {
 

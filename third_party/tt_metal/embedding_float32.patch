@@ -22,23 +22,26 @@ diff --git ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chun
 +            compute_kernel_lib::tilize_config::Fp32Mode::Lossless>(
              per_core_block_cnt * num_chunks);
      } else {
-@@ -40,3 +41,4 @@ void kernel_main() {
+@@ -40,5 +41,6 @@ void kernel_main() {
                      compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
                      compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
 -                    compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(num_chunks - 1);
 +                    compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
 +                    compute_kernel_lib::tilize_config::Fp32Mode::Lossless>(num_chunks - 1);
-@@ -48,3 +50,4 @@ void kernel_main() {
+             }
+             compute_kernel_lib::tilize<
+@@ -48,5 +50,6 @@ void kernel_main() {
                  compute_kernel_lib::tilize_config::InitUninitMode::InitAndUninit,
                  compute_kernel_lib::tilize_config::WaitMode::WaitBlock,
 -                compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure>(1);
 +                compute_kernel_lib::tilize_config::ReconfigureRegisterDatatypeMode::NoReconfigure,
 +                compute_kernel_lib::tilize_config::Fp32Mode::Lossless>(1);
+         }
+     }
 diff --git ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
-@@ -242,3 +242,17 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
-     const char* compute_kernel_path =
+@@ -243,4 +243,18 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
          use_chunked_processing ? "ttnn/cpp/ttnn/operations/embedding/device/kernels/compute/tilize_chunked.cpp"
                                 : "ttnn/cpp/ttnn/operations/data_movement/tilize/device/kernels/compute/tilize.cpp";
 +    auto make_compute_config = [&] {
@@ -55,16 +58,16 @@ diff --git ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_fa
 +            .unpack_to_dest_mode = std::move(unpack_to_dest_mode),
 +        };
 +    };
-@@ -257,6 +271,6 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
-         compute_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
+ 
+     if (num_blocks_per_core_group_1 > 0) {
+@@ -258,5 +272,5 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
          compute_desc.core_ranges = core_group_1;
          compute_desc.compile_time_args = std::move(compute_args_1);
 -        compute_desc.config = ComputeConfigDescriptor{};
 +        compute_desc.config = make_compute_config();
          compute_desc_1 = std::move(compute_desc);
      }
-@@ -275,6 +289,6 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
-         compute_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
+@@ -276,5 +290,5 @@ tt::tt_metal::ProgramDescriptor EmbeddingsFusedProgramFactory::create_descriptor
          compute_desc.core_ranges = core_group_2;
          compute_desc.compile_time_args = std::move(compute_args_2);
 -        compute_desc.config = ComputeConfigDescriptor{};

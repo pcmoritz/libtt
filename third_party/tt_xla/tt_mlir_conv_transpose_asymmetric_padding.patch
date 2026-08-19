@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -2512,13 +2512,14 @@ private:
+@@ -2378,8 +2378,2 @@ private:
      Value permutedWeight = weight;
 -    // TTNN api handles reversing weights internally for transposed convolution.
 -    // So stablehlo.reverse op is ignored and its operand is used as weight.
@@ -10,7 +10,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -      permutedWeight = reverseOp.getInput();
 -    }
      permutedWeight = castToElementType(rewriter, op.getLoc(), permutedWeight,
-                                        computeElementType);
+@@ -2387,2 +2381,9 @@ private:
      auto weightType = mlir::cast<RankedTensorType>(permutedWeight.getType());
 +    if (isTransposed) {
 +      // TTNN reverses transposed-convolution weights internally. Reverse here
@@ -20,12 +20,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          adaptor.getDimensionNumbers().getKernelSpatialDimensions());
 +    }
      auto kernelPermutation = generateConvKernelPermutation(
-         op, isTransposed ? conv2dTransposeKernelLayout : conv2dKernelLayout);
-     auto weightOutputShape = ::ttmlir::utils::applyPermutation(
-@@ -2341,16 +2341,10 @@ private:
-     mlir::Value newConv;
-     if (isTransposed) {
-       // [TODO](mmanzoor) Verify the implementation of transposed convolution
+@@ -2401,11 +2402,5 @@ private:
        // for tt-xla. https://github.com/tenstorrent/tt-mlir/issues/3293
 -      // stablehlo.convolution op doesn't have output_padding
 -      // attribute. So Torch-MLIR adds output_padding with padding attribute for
@@ -40,30 +35,20 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      // Preserve that asymmetry directly instead of using output_padding.
 +      auto outputPaddingAttr = rewriter.getDenseI32ArrayAttr({0, 0});
        // Recomputing padding attribute based on Torch-MLIR lowering of
-       // conv_transposed2d op: [top, left, bottom, right].
-       // https://github.com/llvm/torch-mlir/blob/main/lib/Conversion/TorchToStablehlo/Linear.cpp
-@@ -2358,20 +2352,38 @@ private:
-       auto kernelSpatialDims =
-           adaptor.getDimensionNumbers().getKernelSpatialDimensions();
-       int64_t kernelHeightDim = kernelSpatialDims[SPATIAL_DIM_HEIGHT];
+@@ -2418,3 +2413,3 @@ private:
        int64_t kernelWidthDim = kernelSpatialDims[SPATIAL_DIM_WIDTH];
 -      paddingAttr = rewriter.getDenseI32ArrayAttr({
 +      SmallVector<int32_t> transposePadding = {
            static_cast<int32_t>((weightType.getShape()[kernelHeightDim] - 1) *
-                                    rhsDilation[SPATIAL_DIM_HEIGHT] -
-                                paddingMatrix[SPATIAL_DIM_HEIGHT][0]),
-           static_cast<int32_t>((weightType.getShape()[kernelWidthDim] - 1) *
-                                    rhsDilation[SPATIAL_DIM_WIDTH] -
-                                paddingMatrix[SPATIAL_DIM_WIDTH][0]),
-           static_cast<int32_t>((weightType.getShape()[kernelHeightDim] - 1) *
+@@ -2427,7 +2422,25 @@ private:
                                     rhsDilation[SPATIAL_DIM_HEIGHT] -
 -                               paddingMatrix[SPATIAL_DIM_HEIGHT][0]),
 +                               paddingMatrix[SPATIAL_DIM_HEIGHT][1]),
            static_cast<int32_t>((weightType.getShape()[kernelWidthDim] - 1) *
                                     rhsDilation[SPATIAL_DIM_WIDTH] -
 -                               paddingMatrix[SPATIAL_DIM_WIDTH][0]),
-+                               paddingMatrix[SPATIAL_DIM_WIDTH][1]),
 -      });
++                               paddingMatrix[SPATIAL_DIM_WIDTH][1]),
 +      };
 +
 +      // TTNN cannot represent negative transposed-convolution padding. Run
@@ -84,7 +69,6 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      }
 +      auto convOutputType = outputType.clone(convOutputShape);
        // Input dilation (lhs dilation) is used for stride for transposed
-       // convolution.
 @@ -2443,7 +2455,7 @@ private:
 
        // Use full builder with explicit dimension attributes.
@@ -154,9 +138,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -1180,9 +1180,15 @@ mlir::LogicalResult mlir::tt::ttnn::ConvTranspose2dOp::verify() {
-   int32_t Hin = getInputHeight();
-   int32_t Win = getInputWidth();
+@@ -1172,7 +1172,13 @@ static ::mlir::LogicalResult verifyQuantizeOpCommon(
  
 -  int32_t expectedHOut = (Hin - 1) * stride[0] - 2 * padding[0] +
 -                         dilation[0] * (kernelHeight - 1) + outputPadding[0] +
@@ -201,15 +183,11 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
 --- a/lib/OpModel/TTNN/TTNNOpModel.cpp
 +++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
-@@ -5662,7 +5662,7 @@ llvm::Expected<OpConstraints> OpModel<ConvTranspose2dOp>::getOpConstraints(
-         in_channels, out_channels, batch_size, input_height, input_width,
-         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),
+@@ -6345,3 +6345,3 @@ llvm::Expected<OpConstraints> OpModel<ConvTranspose2dOp>::getOpConstraints(
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(stride),
 -        conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(padding),
 +        detail::reorderPool2dPadding(padding),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(output_padding),
-         conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation),
-         groups, outputDtype, biasSpec, conv2dConfigConverted,
 @@ -5744,7 +5744,7 @@ llvm::Expected<size_t> OpModel<ConvTranspose2dOp>::getOpRuntime(
          in_channels, out_channels, batch_size, input_height, input_width,
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),

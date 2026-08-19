@@ -26,8 +26,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_f
 +                                          ? input_tensors[i].padded_shape()[-1] * input_tensors[i].element_size()
 +                                          : buffer->page_size();
              if (dim == num_dims - 1) {
-@@ -200,5 +213,12 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
-     // Data is 32 byte aligned
+@@ -200,4 +213,11 @@ tt::tt_metal::ProgramDescriptor ConcatProgramFactory::create_descriptor(
      KernelDescriptor::CompileTimeArgs reader_compile_time_args = {src0_cb_index, num_input_tensors};
 +    if (rm_layout && dim == num_dims - 1) {
 +        reader_compile_time_args.push_back(scratch_offset);
@@ -65,20 +64,18 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_op
 diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
-@@ -21,5 +21,13 @@ void kernel_main() {
+@@ -21,2 +21,9 @@ void kernel_main() {
      constexpr uint32_t num_tensors = get_compile_time_arg_val(1);
--    constexpr uint32_t page_size_base_idx = 2;
 +#ifdef WIDTH_CONCAT
 +    constexpr uint32_t scratch_offset = get_compile_time_arg_val(2);
 +    constexpr uint32_t page_size_base_idx = 3;
 +    constexpr uint32_t copy_size_base_idx = page_size_base_idx + num_tensors;
-     constexpr auto tensor_accessor_args =
--        make_tensor_accessor_args_tuple<num_tensors, page_size_base_idx + num_tensors>();
++    constexpr auto tensor_accessor_args =
 +        make_tensor_accessor_args_tuple<num_tensors, copy_size_base_idx + num_tensors>();
 +#else
-+    constexpr uint32_t page_size_base_idx = 2;
-+    constexpr auto tensor_accessor_args =
-+        make_tensor_accessor_args_tuple<num_tensors, page_size_base_idx + num_tensors>();
+     constexpr uint32_t page_size_base_idx = 2;
+@@ -24,2 +31,3 @@ void kernel_main() {
+         make_tensor_accessor_args_tuple<num_tensors, page_size_base_idx + num_tensors>();
 +#endif
  
 @@ -53,2 +55,3 @@ void kernel_main() {
@@ -93,14 +90,14 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow
 -                CoreLocalMem<uint8_t>(l1_write_addr),
 +                CoreLocalMem<uint8_t>(scratch_addr),
                  page_size,
-@@ -63,3 +67,9 @@ void kernel_main() {
+@@ -63,3 +73,9 @@ void kernel_main() {
                  {});
+-            l1_write_addr += page_size;
 +            noc.async_read_barrier();
 +            auto* src = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(scratch_addr);
 +            auto* dst = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(l1_write_addr);
 +            for (uint32_t byte = 0; byte < copy_size; ++byte) {
 +                dst[byte] = src[byte];
 +            }
--            l1_write_addr += page_size;
 +            l1_write_addr += copy_size;
              page_id_per_tensor[curr_tensor]++;

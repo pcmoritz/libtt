@@ -355,7 +355,7 @@ index e7a8a79..9401974 100644
                         : (op_has_exp ? tt::DataFormat::Float16_b : b_data_format);
          uint32_t b_intermediate_single_tile_size = tt::tile_size(b_intermediate_format);
          desc.cbs.push_back(CBDescriptor{
-@@ -1194,9 +1209,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1202,9 +1217,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
                              b_data_format == tt::DataFormat::Float32 ||
                              (a_data_format == tt::DataFormat::Int32 && b_data_format == tt::DataFormat::Int32) ||
                              (a_data_format == tt::DataFormat::UInt32 && b_data_format == tt::DataFormat::UInt32) ||

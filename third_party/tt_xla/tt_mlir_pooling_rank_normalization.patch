@@ -406,7 +406,7 @@
  
      // Generate defaults if they dont exist
      // Default window strides is all ones
-@@ -4757,52 +4845,17 @@
+@@ -4765,52 +4853,17 @@ public:
                   : rewriter.getDenseI64ArrayAttr(
                         SmallVector<int64_t>(windowDims.size() * 2, 0));
  
@@ -423,9 +423,7 @@
 +    if (!layout) {
        return rewriter.notifyMatchFailure(
 -          srcOp, "only 4D operands with two spatial dimensions are supported");
-+          srcOp, "Expected a static rank 2-5 pooling layout with at most two "
-+                 "active dimensions and any single active dimension trailing.");
-     }
+-    }
 -
 -    // Generate desired and current layouts (desired = N,H,W,C)
 -    // Generate permutation for current->desired layout
@@ -458,7 +456,9 @@
 -      if (currentLayout[i] == NON_SPATIAL) {
 -        currentLayout[i] = nonSpatialCount++;
 -      }
--    }
++          srcOp, "Expected a static rank 2-5 pooling layout with at most two "
++                 "active dimensions and any single active dimension trailing.");
+     }
 -
 -    // Permutation for current->desired layout and it's inverse
 -    auto permutation = ttmlir::utils::generatePermutation(
@@ -538,7 +538,7 @@
      auto scatterResult = rewriter.create<ttir::ScatterOp>(
          loc, scatterOutputType,
          reshapedFullTensor, // input tensor
-@@ -4904,34 +4964,32 @@
+@@ -4912,34 +4972,32 @@ public:
          reduceTypeAttr);    // reduction type
  
      // Reshape back to N,H,W,C
@@ -553,6 +553,8 @@
 -    auto finalPermutedResult = applyPermutationToValue(
 -        rewriter, loc, finalResult, originalShape, finalResult.getType(),
 -        inverseOfPermutation, "_permuteBackToOriginal");
+-
+-    rewriter.replaceOp(srcOp, finalPermutedResult);
 +    auto normalizedOutputType = mlir::cast<RankedTensorType>(
 +        fullTensor.getType());
 +    Value result = generateReshape(scatterResult, normalizedOutputType,
@@ -573,8 +575,7 @@
 +          mlir::cast<RankedTensorType>(result.getType()),
 +          layout->inversePermutation, "_restoreLayout");
 +    }
- 
--    rewriter.replaceOp(srcOp, finalPermutedResult);
++
 +    rewriter.replaceOp(srcOp, result);
      return success();
    }

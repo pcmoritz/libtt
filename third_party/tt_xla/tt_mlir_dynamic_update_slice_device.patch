@@ -5,8 +5,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -// NOTE: StableHLO Dynamic Slice Op clamps start indices to ensure validity,
 -// but we don't. Would add multiple ops (worse perf) and doesn't appear in test
 -// models.
-@@ -4856,4 +4853,8 @@ public:
-                   mlir::stablehlo::DynamicSliceOp::Adaptor adaptor,
+@@ -5070,6 +5067,10 @@ public:
                    ConversionPatternRewriter &rewriter) const override {
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult().getType()));
@@ -14,7 +13,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +                            adaptor.getOperand().getType())
 +                            .getShape();
 +    auto sliceSizes = srcOp.getSliceSizes();
-@@ -4870,9 +4871,14 @@ public:
+ 
+     // Reshape start indices to 1D tensors for concat op.
+     ValueRange startIndicesRange = adaptor.getStartIndices();
+@@ -5080,13 +5081,17 @@ public:
+     auto singleElementTensorType =
+         RankedTensorType::get({1}, startIndexElementType);
+ 
 -    for (Value startIndex : startIndicesRange) {
 -      auto reshapedIndex = rewriter.create<ttir::ReshapeOp>(
 +    for (auto [dim, startIndex] : llvm::enumerate(startIndicesRange)) {
@@ -30,8 +35,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          rewriter.getI32IntegerAttr(operandShape[dim] - sliceSizes[dim]));
        startIndicesValues1D.push_back(reshapedIndex);
      }
-@@ -4891,1 +4897,0 @@ public:
+     // Create a single 1D tensor from start indices values using concat op.
+@@ -5107,3 +5115,2 @@ public:
+     // Create a 1D constant tensor with slice_sizes values.
 -    auto sliceSizes = srcOp.getSliceSizes();
+     SmallVector<int32_t> sliceSizesInt32(sliceSizes.begin(), sliceSizes.end());
 @@ -4904,6 +4909,128 @@ class StableHLOToTTIRDynamicSliceOpConversionPattern
  };
  } // namespace
@@ -173,7 +181,6 @@ diff --git a/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps
 --- a/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp
 +++ b/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp
 @@ -21,7 +21,7 @@ namespace {
- // Before adding an op here, make sure it is supported in
  // StableHLO to TOSA/Linalg conversion.
  static bool isNonLowerableSHLOOp([[maybe_unused]] mlir::Operation *op) {
  #ifdef TTMLIR_ENABLE_STABLEHLO

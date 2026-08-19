@@ -1,11 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10076,8 +10076,56 @@ public:
-     rewriter.replaceOp(srcOp, roundedInput.getResult());
-     return success();
-   }
- };
+@@ -10870,4 +10870,52 @@ public:
  } // namespace
  
 +namespace {

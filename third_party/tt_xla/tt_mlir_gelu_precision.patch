@@ -2,14 +2,13 @@ diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/t
 index 8378104..32eca62 100644
 --- a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
 +++ b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
-@@ -157,10 +157,14 @@ void run(const ::tt::target::ttnn::EltwiseUnaryOp *op,
+@@ -157,9 +157,13 @@ void run(const ::tt::target::ttnn::EltwiseUnaryOp *op,
      break;
    }
    case ::tt::target::ttnn::EltwiseUnaryOpType::Gelu: {
 -    runEltwiseUnaryWithFastAndApproximateModeOp(
 -        op, tensorPool, [](auto &&...args) {
 -          return ::ttnn::gelu(std::forward<decltype(args)>(args)...);
--        });
 +    runEltwiseUnaryOp(
 +        op, tensorPool,
 +        [](const auto &input, const auto &memoryConfig, const auto &output,
@@ -17,10 +16,9 @@ index 8378104..32eca62 100644
 +          return ::ttnn::gelu(
 +              input, ::ttnn::operations::unary::GeluVariant::TANH,
 +              memoryConfig, output, subCoreGrids);
-+        });
+         });
      break;
    }
-   case ::tt::target::ttnn::EltwiseUnaryOpType::IsFinite: {
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 index c1fb81d..f0e33a7 100644
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp

@@ -143,10 +143,10 @@ http_archive(
 http_archive(
     name = "tracy",
     build_file = "//third_party/tracy:BUILD.overlay.bazel",
-    sha256 = "d038332ad0529d9bc331489495584758e9f30f359577e27b5a917220f589f20d",
-    strip_prefix = "tracy-27221a69789f24d492135093e096b978b4ca3a68",
+    sha256 = "c458fdce48b6e540ea37091157253e6a8d74a3bd4fcbd152f17769a604484870",
+    strip_prefix = "tracy-117100515bb21d9a6b3a8f0eee50ecd91f961408",
     urls = [
-        "https://github.com/tenstorrent-metal/tracy/archive/27221a69789f24d492135093e096b978b4ca3a68.tar.gz",
+        "https://github.com/tenstorrent-metal/tracy/archive/117100515bb21d9a6b3a8f0eee50ecd91f961408.tar.gz",
     ],
 )
 
@@ -174,10 +174,10 @@ http_archive(
     name = "tt_umd",
     build_file = "//third_party/tt_umd:BUILD.overlay.bazel",
     patches = ["//third_party/tt_umd:remove_initial_exec_tls.patch"],
-    sha256 = "5d13c886dce663ed782e50b4fdb47c89f3956f97489f7782f953e8f4779152fc",
-    strip_prefix = "tt-umd-bc77ac2f7382ffeb9fa5430055f0854d53979489",
+    sha256 = "4e0e419e1701839ac4927a68989b4a4bfef2eced81cc09cd185ebc104cd9e3ac",
+    strip_prefix = "tt-umd-ef7aa4b9dace8c75344f32886cfc7f31372cb2d1",
     urls = [
-        "https://github.com/tenstorrent/tt-umd/archive/bc77ac2f7382ffeb9fa5430055f0854d53979489.tar.gz",
+        "https://github.com/tenstorrent/tt-umd/archive/ef7aa4b9dace8c75344f32886cfc7f31372cb2d1.tar.gz",
     ],
 )
 
@@ -207,6 +207,7 @@ http_archive(
 http_archive(
     name = "tt_metal",
     build_file = "//third_party/tt_metal:BUILD.overlay.bazel",
+    # Keep tt-metal aligned with the revision selected by this tt-mlir commit.
     patches = [
         "//third_party/tt_metal:wormhole_build_empty_sources.patch",
         "//third_party/tt_metal:reduce_static_tls.patch",
@@ -230,6 +231,7 @@ http_archive(
         "//third_party/tt_metal:clamp_uint32.patch",
         "//third_party/tt_metal:sign_nan.patch",
         "//third_party/tt_metal:scatter_min_max.patch",
+        "//third_party/tt_metal:scatter_metal2_shape_args.patch",
         "//third_party/tt_metal:accurate_fp32_reductions.patch",
         "//third_party/tt_metal:embedding_float32.patch",
         "//third_party/tt_metal:permute_float32.patch",
@@ -240,6 +242,7 @@ http_archive(
         "//third_party/tt_metal:log1p_signed_zero.patch",
         "//third_party/tt_metal:bitwise_not_uint8.patch",
         "//third_party/tt_metal:float16_tensor.patch",
+        "//third_party/tt_metal:host_tensor_value_initialization.patch",
         "//third_party/tt_metal:float16_min_max.patch",
         "//third_party/tt_metal:float16_accumulation.patch",
         "//third_party/tt_metal:uint8_data_movement.patch",
@@ -257,21 +260,26 @@ http_archive(
         "//third_party/tt_metal:scatter_float16.patch",
         "//third_party/tt_metal:pad_rank1_growth.patch",
     ],
-    sha256 = "f56e21da4f169ce51d15d30962921a6f1f270ad6f21d10b2512ad4c1bc293981",
-    strip_prefix = "tt-metal-e07514c48bb29d04451d1a42eaf1f9f6e977d33a",
+    sha256 = "a222d1f6fe7f6aec62f69e22199a3537a31a58aa5ead52e4ab470b7d87472ecb",
+    strip_prefix = "tt-metal-5beed318d0f0d1c6212e605947fb0be80c9e0a1d",
     urls = [
-        "https://github.com/tenstorrent/tt-metal/archive/e07514c48bb29d04451d1a42eaf1f9f6e977d33a.tar.gz",
+        "https://github.com/tenstorrent/tt-metal/archive/5beed318d0f0d1c6212e605947fb0be80c9e0a1d.tar.gz",
     ],
 )
 
 http_archive(
     name = "llvm-raw",
     build_file_content = "# empty\n",
-    sha256 = "75dba7f15864c9ddc25dd621dcaf2d325a9ca8f23957ff4eb6b01df5b493b5d5",
-    strip_prefix = "llvm-project-f6d0a512972a74ef100723b9526a6a0ddb23f894",
+    # LLVM and StableHLO revisions follow tt-mlir's env/CMakeLists.txt.
+    patch_args = ["-p1"],
+    patches = [
+        "//third_party/tt_xla:llvm_bazel9_cc_rules.patch",
+    ],
+    sha256 = "4860ff3400d59eccaf3b9f399432d5f8494c2f19a815069a314eb9cf10042822",
+    strip_prefix = "llvm-project-4efe170d858eb54432f520abb4e7f0086236748b",
     urls = [
-        "https://storage.googleapis.com/mirror.tensorflow.org/github.com/llvm/llvm-project/archive/f6d0a512972a74ef100723b9526a6a0ddb23f894.tar.gz",
-        "https://github.com/llvm/llvm-project/archive/f6d0a512972a74ef100723b9526a6a0ddb23f894.tar.gz",
+        "https://storage.googleapis.com/mirror.tensorflow.org/github.com/llvm/llvm-project/archive/4efe170d858eb54432f520abb4e7f0086236748b.tar.gz",
+        "https://github.com/llvm/llvm-project/archive/4efe170d858eb54432f520abb4e7f0086236748b.tar.gz",
     ],
 )
 
@@ -297,10 +305,10 @@ http_archive(
 
 http_archive(
     name = "stablehlo",
-    sha256 = "3780e503599ebcc1acc4c96ea5f23c724dae2a4d746ed7d9a01d3f14d879265a",
-    strip_prefix = "stablehlo-127d2f238010589ac96f2f402a27afc9dccbb7ab",
+    sha256 = "f1620aafc2b6d730e2ee9c33b35a59a2656a11eed10b1ef8049f175eb4fbdd9c",
+    strip_prefix = "stablehlo-0a4440a5c8de45c4f9649bf3eb4913bf3f97da0d",
     urls = [
-        "https://github.com/openxla/stablehlo/archive/127d2f238010589ac96f2f402a27afc9dccbb7ab.zip",
+        "https://github.com/openxla/stablehlo/archive/0a4440a5c8de45c4f9649bf3eb4913bf3f97da0d.zip",
     ],
 )
 
@@ -313,7 +321,7 @@ llvm_configure(
 git_repository(
     name = "tt_xla_src",
     build_file = "//third_party/tt_xla:tt_xla.BUILD.bazel",
-    commit = "9a570e41d499a3a42ddb2117fe4d050f90d732d3",
+    commit = "1c9f93e45db98d81814e850a748f35a53db2a0ab",
     patch_args = ["-p1"],
     patches = [
         "//third_party/tt_xla:tt_xla_protobuf_string_view.patch",
@@ -329,7 +337,6 @@ git_repository(
         "//third_party/tt_xla:tt_xla_same_device_buffer_copy.patch",
         "//third_party/tt_xla:tt_xla_disable_erase_inverse_ops.patch",
         "//third_party/tt_xla:tt_xla_enable_bf8_activation_dtype_lowering.patch",
-        "//third_party/tt_xla:tt_xla_complex_scalar_buffer.patch",
         "//third_party/tt_xla:tt_xla_compile_option_validation.patch",
         "//third_party/tt_xla:tt_xla_fresh_mlir_context.patch",
         "//third_party/tt_xla:tt_xla_main_entry_function.patch",
@@ -341,15 +348,15 @@ git_repository(
 git_repository(
     name = "tt_mlir_src",
     build_file = "//third_party/tt_xla:tt_mlir.BUILD.bazel",
-    commit = "752750eb0e096d84aedc5c56fb29c4be238e2f82",
+    commit = "71046369d603b97fd6a8dd8b947ca8588ac2a74f",
     patch_args = ["-p1"],
     patches = [
         "//third_party/tt_xla:tt_mlir_string_map_include.patch",
-        "//third_party/tt_xla:tt_mlir_pass_option_values.patch",
         "//third_party/tt_xla:tt_mlir_op_model_dependent_static_assert.patch",
         "//third_party/tt_xla:tt_mlir_ttir_to_d2m_constructor_names.patch",
         "//third_party/tt_xla:tt_mlir_preserve_float_self_comparisons.patch",
         "//third_party/tt_xla:tt_mlir_logical_and_bool_masks.patch",
+        "//third_party/tt_xla:tt_mlir_logical_identity_fold_types.patch",
         "//third_party/tt_xla:tt_mlir_stablehlo_legality_guards.patch",
         "//third_party/tt_xla:tt_mlir_empty_convolution.patch",
         "//third_party/tt_xla:tt_mlir_convolution.patch",
@@ -358,13 +365,10 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_lower_jax_topk.patch",
         "//third_party/tt_xla:tt_mlir_lower_jax_pad.patch",
         "//third_party/tt_xla:tt_mlir_dynamic_update_slice_device.patch",
-        "//third_party/tt_xla:tt_mlir_stablehlo_scatter_oob.patch",
         "//third_party/tt_xla:tt_mlir_segment_reductions.patch",
         "//third_party/tt_xla:tt_mlir_embedding_float32.patch",
         "//third_party/tt_xla:tt_mlir_mixed_advanced_gather.patch",
         "//third_party/tt_xla:tt_mlir_gather_clamp_indices.patch",
-        "//third_party/tt_xla:tt_mlir_scatter_subtract.patch",
-        "//third_party/tt_xla:tt_mlir_scatter_batching.patch",
         "//third_party/tt_xla:tt_mlir_preserve_narrowing_typecasts.patch",
         "//third_party/tt_xla:tt_mlir_gelu_precision.patch",
         "//third_party/tt_xla:tt_mlir_convert_normalized_float_constants.patch",
@@ -390,7 +394,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_remove_bitwise_not_workaround.patch",
         "//third_party/tt_xla:tt_mlir_lower_jax_argmin.patch",
         "//third_party/tt_xla:tt_mlir_arithmetic_right_shift.patch",
-        "//third_party/tt_xla:tt_mlir_affine_passes_include.patch",
         "//third_party/tt_xla:tt_mlir_mock_device_include.patch",
         "//third_party/tt_xla:tt_mlir_disable_ttlang_python_resolver.patch",
         "//third_party/tt_xla:tt_mlir_ttnn_only_register_all.patch",
@@ -412,6 +415,8 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_variadic_reduce.patch",
         "//third_party/tt_xla:tt_mlir_approx_topk.patch",
         "//third_party/tt_xla:tt_mlir_pooling_rank_normalization.patch",
+        # Keep all StableHLO scatter conversion changes in one patch.
+        "//third_party/tt_xla:tt_mlir_scatter.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

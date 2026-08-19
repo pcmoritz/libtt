@@ -254,7 +254,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Pattern match the ops for tt-torch ArgMax op.
    // The pattern is as follows:
    //  stablehlo.compare (GE)
-@@ -580,14 +720,15 @@
+@@ -580,15 +720,16 @@ private:
    // stablehlo.select / stablehlo.maximum
    // stablehlo.select
    // stablehlo.return
@@ -273,3 +273,4 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    if (compareOp0.getComparisonDirection() != expectedDirection) {
        return false;
      }
+ 

@@ -1,10 +1,12 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
-@@ -67,2 +67,3 @@
+@@ -67,4 +67,5 @@ struct MatmulMultiCoreReuseMultiCast1DProgramConfig {
      bool untilize_out{};
      std::optional<CoreRangeSet> allowed_worker_cores = std::nullopt;
 +    bool balance_per_core_N{};
+     // Stream in1 from the GCB in ring-rotated FIFO order (gather_in0 + DRAM-sender GCB only):
+     // consume each weight block as it arrives instead of waiting for the whole tensor, so the
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
@@ -43,22 +45,22 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
      bool per_core_N_equals_subblock_w_constraint = out_sharded && !mcast_in0;
      bool per_core_M_equals_subblock_h_constraint = out_sharded && mcast_in0;
      bool fp32_dest_acc_en = get_fp32_dest_acc_en(compute_kernel_config);
-@@ -374,5 +384,6 @@
-         per_core_N,
+@@ -398,5 +408,6 @@ MatmulMultiCoreReuseMultiCast1DProgramConfig get_mcast_1d_config(
          in0_block_w,
          utilities::estimate_interm_tile_size(compute_kernel_config, output_dtype),
 -        /*adjust_in0_block_w=*/false);
 +        /*adjust_in0_block_w=*/wide_n_matmul);
 +    in0_block_w = mutlti_dim_per_core_factor[2];
      uint32_t out_block_h = mutlti_dim_per_core_factor[0];
-@@ -398,5 +409,6 @@
-         .per_core_N = per_core_N,
+     uint32_t out_block_w = mutlti_dim_per_core_factor[1];
+@@ -422,5 +433,6 @@ MatmulMultiCoreReuseMultiCast1DProgramConfig get_mcast_1d_config(
          .fuse_batch = fuse_batch,
          .fused_activation = fused_activation,
 -        .mcast_in0 = mcast_in0};
 +        .mcast_in0 = mcast_in0,
 +        .balance_per_core_N = balance_per_core_N};
  }
+ 
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
@@ -154,9 +156,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
              } else {
                  // padding args (READER)
                  mm_in1_sender_writer_args.push_back(out_block_w);
-@@ -3858,11 +3889,11 @@
-             // Bias base address placeholder; rebound to a tensor binding via in1_sender_variant[18] below.
-             mm_in1_sender_writer_args.push_back(
+@@ -4058,8 +4089,8 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
                  bias_tensor.has_value() ? (std::uint32_t)bias_tensor->address() : 0);  // smuggled-rta-ok
              mm_in1_sender_writer_args.push_back(
 -                bias_tensor.has_value() ? (std::uint32_t)per_core_N * output_idx_x : 0);  // in3_tensor_start_tile_id
@@ -168,7 +168,6 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
 +                    mm_in1_sender_writer_args.push_back(core_last_out_num_blocks_w);
                  } else {
                      mm_in1_sender_writer_args.push_back(out_num_blocks_x);
-                 }
 @@ -5112,6 +5143,7 @@
      auto out_block_w = program_config.out_block_w;
      auto per_core_M = program_config.per_core_M;

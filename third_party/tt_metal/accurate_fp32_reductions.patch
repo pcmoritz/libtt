@@ -49,7 +49,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/red
 --- ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_h_neg.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_h_neg.cpp
 @@ -38,4 +38,5 @@ void kernel_main() {
-     constexpr DataFormat reduce_format = static_cast<DataFormat>(unpack_src_format[cb_input]);
+     constexpr DataFormat reduce_format = static_cast<DataFormat>(unpack_src_format[dfb_input]);
 +    constexpr auto fp32_mode = get_compile_time_arg_val(4) != 0 ? ReduceFp32Mode::Accurate : ReduceFp32Mode::Fast;
  
 -    if constexpr (is_sfpu_reduce_path<REDUCE_OP, REDUCE_DIM, reduce_format>()) {
@@ -59,7 +59,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/red
 --- ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_w_neg.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce_w_neg.cpp
 @@ -40,4 +40,5 @@ void kernel_main() {
-     constexpr DataFormat reduce_format = static_cast<DataFormat>(unpack_src_format[cb_input]);
+     constexpr DataFormat reduce_format = static_cast<DataFormat>(unpack_src_format[dfb_input]);
 +    constexpr auto fp32_mode = get_compile_time_arg_val(4) != 0 ? ReduceFp32Mode::Accurate : ReduceFp32Mode::Fast;
  
 -    if constexpr (is_sfpu_reduce_path<REDUCE_OP, REDUCE_DIM, reduce_format>()) {
@@ -117,44 +117,44 @@ diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/kernels/compute/prod_n
  #include "api/compute/eltwise_binary.h"
 +#include "api/compute/eltwise_binary_sfpu.h"
 +#include "api/compute/eltwise_unary/eltwise_unary.h"
- #include "api/dataflow/circular_buffer.h"
+ #include "api/dataflow/dataflow_buffer.h"
 @@ -19,2 +21,4 @@ void kernel_main() {
      constexpr uint32_t dst0 = 0;
 +    constexpr uint32_t dst1 = 1;
-+    constexpr DataFormat input_format = static_cast<DataFormat>(unpack_src_format[cb_in0]);
++    constexpr DataFormat input_format = static_cast<DataFormat>(unpack_src_format[dfb_in0]);
  
 @@ -23,3 +27,7 @@ void kernel_main() {
  
--    binary_op_init_common(cb_in0, cb_in0, cb_out0);
+-    binary_op_init_common(dfb_in0, dfb_in0, dfb_out0);
 +    if constexpr (input_format == DataFormat::Float32) {
-+        init_sfpu(cb_in0, cb_out0);
++        init_sfpu(dfb_in0, dfb_out0);
 +    } else {
-+        binary_op_init_common(cb_in0, cb_in0, cb_out0);
++        binary_op_init_common(dfb_in0, dfb_in0, dfb_out0);
 +    }
-     pack_reconfig_data_format(cb_out0);
+     pack_reconfig_data_format(dfb_out0);
 @@ -37,8 +45,18 @@ void kernel_main() {
  
--        binary_dest_reuse_tiles_init<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_in0);
+-        binary_dest_reuse_tiles_init<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(dfb_in0);
 -        for (uint32_t j = 1; j < num_input_tiles; ++j) {
--            cb_in0_obj.wait_front(onetile);
+-            dfb_in0_obj.wait_front(onetile);
 -            binary_dest_reuse_tiles<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(
--                cb_in0, 0, dst0);
--            cb_in0_obj.pop_front(onetile);
+-                dfb_in0, 0, dst0);
+-            dfb_in0_obj.pop_front(onetile);
 +        if constexpr (input_format == DataFormat::Float32) {
 +            mul_binary_tile_init();
 +            for (uint32_t j = 1; j < num_input_tiles; ++j) {
-+                cb_in0_obj.wait_front(onetile);
-+                copy_tile(cb_in0, 0, dst1);
++                dfb_in0_obj.wait_front(onetile);
++                copy_tile(dfb_in0, 0, dst1);
 +                mul_binary_tile(dst0, dst1, dst0);
-+                cb_in0_obj.pop_front(onetile);
++                dfb_in0_obj.pop_front(onetile);
 +            }
 +        } else {
-+            binary_dest_reuse_tiles_init<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_in0);
++            binary_dest_reuse_tiles_init<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(dfb_in0);
 +            for (uint32_t j = 1; j < num_input_tiles; ++j) {
-+                cb_in0_obj.wait_front(onetile);
++                dfb_in0_obj.wait_front(onetile);
 +                binary_dest_reuse_tiles<EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(
-+                    cb_in0, 0, dst0);
-+                cb_in0_obj.pop_front(onetile);
++                    dfb_in0, 0, dst0);
++                dfb_in0_obj.pop_front(onetile);
 +            }
          }
 diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/prod/device/prod_nc_program_factory.cpp

@@ -1,10 +1,10 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -2891,51 +2891,43 @@ public:
+@@ -2709,51 +2709,43 @@ public:
              : rewriter.getDenseBoolArrayAttr(
                    SmallVector<bool>(numSpatialDims, false));
-
+ 
 -    // Negative padding handling strategy:
 -    // 1. Convolution ops don't support negative padding directly, so we split
 -    // the operation into two steps when negative padding is detected
@@ -31,11 +31,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +                     [](int64_t dilation) { return dilation != 1; })) {
 +      return failure();
 +    }
-
+ 
 -    SmallVector<int64_t> adjustedPadding = llvm::to_vector(llvm::map_range(
 +    SmallVector<int64_t> clampedPadding = llvm::to_vector(llvm::map_range(
          paddingArray, [](int64_t p) { return std::max<int64_t>(p, 0); }));
-
+ 
 -    paddingAttr = rewriter.getDenseI64ArrayAttr(adjustedPadding);
 -
 -    // Calculate intermediate output shape for convolution when negative padding
@@ -53,6 +53,10 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -      if (padHigh < 0) {
 -        intermediateOutputShape[spatialDims[i]] -= padHigh;
 -      }
+-    }
+-
+-    RankedTensorType intermediateOutputType = RankedTensorType::get(
+-        intermediateOutputShape, outputType.getElementType());
 +    Value input = adaptor.getLhs();
 +    auto inputType = mlir::cast<RankedTensorType>(input.getType());
 +    SmallVector<int32_t> inputSliceBegins(inputType.getRank(), 0);
@@ -68,16 +72,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      inputSliceBegins[dim] = lowCrop;
 +      inputSliceEnds[dim] -= highCrop;
 +      slicedShape[dim] -= lowCrop + highCrop;
-     }
--
--    RankedTensorType intermediateOutputType = RankedTensorType::get(
--        intermediateOutputShape, outputType.getElementType());
++    }
 +    input = rewriter.create<ttir::SliceStaticOp>(
 +        srcOp.getLoc(), inputType.clone(slicedShape), input,
 +        rewriter.getI32ArrayAttr(inputSliceBegins),
 +        rewriter.getI32ArrayAttr(inputSliceEnds),
 +        rewriter.getI32ArrayAttr(inputSliceSteps));
-
+ 
      // Convert padding to DenseIntElementsAttr with shape [numSpatialDims, 2].
      mlir::DenseIntElementsAttr stablehloPaddingAttr =
 @@ -2943,7 +2935,7 @@ public:

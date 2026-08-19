@@ -1,14 +1,10 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5827,10 +5827,46 @@ private:
-     // If we are indexing multiple dims, we need to transform indices for the
-     // new single (flattened) indexing dim. If the extra indexed dims are full,
-     // we need to slice indices.
-     auto startIndices = mlir::cast<mlir::TypedValue<mlir::RankedTensorType>>(
+@@ -5598,6 +5598,42 @@ public:
          adaptor.getOperands()[1]);
      auto indexVectorDim = dimensionNumbers.getIndexVectorDim();
-+
+ 
 +    // StableHLO clamps each start-index component to the largest start that
 +    // keeps its slice in bounds. Do this before flattening multiple components
 +    // so an out-of-bounds coordinate cannot spill into an adjacent dimension.
@@ -44,7 +40,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          startIndices.getType(), components,
 +          rewriter.getSI32IntegerAttr(indexVectorDim));
 +    }
-
++
      if (numIndexingDims > 1) {
        srcOp->emitWarning("End results might be incorrect when indexing "
                           "multiple dimensions of input because of typecast "

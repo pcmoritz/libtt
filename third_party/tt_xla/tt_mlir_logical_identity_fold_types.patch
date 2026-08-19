@@ -1,0 +1,33 @@
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -804,10 +804,12 @@ foldAbsorbingLogicalAnd(mlir::tt::ttir::LogicalAndOp op) {
+ // and(nonzero, x) -> x (identity, when x is boolean-valued)
+ static ::mlir::OpFoldResult
+ foldIdentityLogicalAnd(mlir::tt::ttir::LogicalAndOp op) {
+-  if (isConstantNonZero(op.getLhs()) && isBooleanValued(op.getRhs())) {
++  if (isConstantNonZero(op.getLhs()) && isBooleanValued(op.getRhs()) &&
++      op.getRhs().getType() == op.getResult().getType()) {
+     return op.getRhs();
+   }
+-  if (isConstantNonZero(op.getRhs()) && isBooleanValued(op.getLhs())) {
++  if (isConstantNonZero(op.getRhs()) && isBooleanValued(op.getLhs()) &&
++      op.getLhs().getType() == op.getResult().getType()) {
+     return op.getLhs();
+   }
+   return nullptr;
+@@ -862,10 +864,12 @@ foldAbsorbingLogicalOr(mlir::tt::ttir::LogicalOrOp op) {
+ // or(zero, x) -> x (identity, when x is boolean-valued)
+ static ::mlir::OpFoldResult
+ foldIdentityLogicalOr(mlir::tt::ttir::LogicalOrOp op) {
+-  if (isConstantZero(op.getLhs()) && isBooleanValued(op.getRhs())) {
++  if (isConstantZero(op.getLhs()) && isBooleanValued(op.getRhs()) &&
++      op.getRhs().getType() == op.getResult().getType()) {
+     return op.getRhs();
+   }
+-  if (isConstantZero(op.getRhs()) && isBooleanValued(op.getLhs())) {
++  if (isConstantZero(op.getRhs()) && isBooleanValued(op.getLhs()) &&
++      op.getLhs().getType() == op.getResult().getType()) {
+     return op.getLhs();
+   }
+   return nullptr;

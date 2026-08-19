@@ -150,11 +150,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    if (indicesShape.size() < gatherShape.size()) {
 +      SmallVector<int64_t> unsqueezedShape(indicesShape);
        for (int64_t od : offsetDims) {
-@@ -6199,21 +6236,30 @@ public:
+@@ -6233,21 +6270,152 @@ public:
                llvm::to_vector_of<int32_t>(unsqueezedShape)));
 +      indicesShape = std::move(unsqueezedShape);
 +    }
-
+ 
 -      // Broadcast to match output shape.
 -      if (unsqueezedShape != SmallVector<int64_t>(outputShape)) {
 -        auto broadcastDims = ttmlir::utils::getBroadcastDimensions<int64_t>(
@@ -165,7 +165,6 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -        indices = rewriter.create<ttir::BroadcastOp>(
 -            srcOp.getLoc(), broadcastType, indices,
 -            rewriter.getDenseI64ArrayAttr(broadcastDims));
--      }
 +    if (indicesShape != gatherShape) {
 +      auto indicesType = mlir::cast<RankedTensorType>(indices.getType());
 +      auto broadcastDims = ttmlir::utils::getBroadcastDimensions<int64_t>(
@@ -176,17 +175,14 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      indices = rewriter.create<ttir::BroadcastOp>(
 +          srcOp.getLoc(), broadcastType, indices,
 +          rewriter.getDenseI64ArrayAttr(broadcastDims));
-     }
-
--    // Step 3: Create gather_dim with the appropriate dimension.
--    rewriter.replaceOpWithNewOp<ttir::GatherOp>(
--        srcOp, outputType, operand, indices,
++    }
++
 +    auto gatherType = RankedTensorType::get(
 +        gatherShape, outputType.getElementType(), outputType.getEncoding());
 +    Value gather = rewriter.create<ttir::GatherOp>(
 +        srcOp.getLoc(), gatherType, operand, indices,
-         rewriter.getI32IntegerAttr(static_cast<int32_t>(indexedDim)));
-
++        rewriter.getI32IntegerAttr(static_cast<int32_t>(indexedDim)));
++
 +    if (needsOutputReshape) {
 +      gather = rewriter.create<ttir::ReshapeOp>(
 +          srcOp.getLoc(), outputType, gather,
@@ -194,11 +190,10 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
 +    rewriter.replaceOp(srcOp, gather);
 +
-     return success();
-@@ -6220,6 +6266,128 @@ class StableHLOGatherWindowToGatherDimPattern
-   }
- };
-
++    return success();
++  }
++};
++
 +// Converts a rank-preserving batched gather window into ttir.gather by
 +// expanding each start index across the window.
 +class StableHLOGatherWindowToGatherDimPattern
@@ -265,8 +260,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +         ++i) {
 +      if (i != indexVectorDim) {
 +        indicesShape.push_back(startIndicesShape[i]);
-+      }
-+    }
+       }
+     }
 +    indicesShape.insert(indicesShape.begin() + gatherDim, 1);
 +
 +    Value operand = adaptor.getOperands()[0];
@@ -313,17 +308,14 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        /*arange_dimension=*/gatherDim);
 +    indices = rewriter.create<ttir::AddOp>(srcOp.getLoc(), indicesType,
 +                                           indices, offsets);
-+
-+    rewriter.replaceOpWithNewOp<ttir::GatherOp>(
-+        srcOp, outputType, operand, indices,
+ 
+-    // Step 3: Create gather_dim with the appropriate dimension.
+     rewriter.replaceOpWithNewOp<ttir::GatherOp>(
+         srcOp, outputType, operand, indices,
+-        rewriter.getI32IntegerAttr(static_cast<int32_t>(indexedDim)));
+-
 +        rewriter.getI32IntegerAttr(static_cast<int32_t>(gatherDim)));
-+    return success();
-+  }
-+};
-+
- // Converts stablehlo.gather to ttir.slice_dynamic when the gather is
- // semantically a dynamic slice. This is the case when:
- // - No batching dims
+     return success();
 @@ -10421,2 +10587,3 @@ static void addGatherOpConversionPattern
    patterns.add<StableHLOGatherToGatherDimPattern>(typeConverter, ctx);
 +  patterns.add<StableHLOGatherWindowToGatherDimPattern>(typeConverter, ctx);

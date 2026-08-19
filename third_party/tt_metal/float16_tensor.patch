@@ -121,26 +121,83 @@ diff --git tt_metal/impl/data_format/tilize_utils.cpp tt_metal/impl/data_format/
  template std::vector<int> convert_layout<int>(ttsl::Span<const int>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
 +template std::vector<tt::tt_metal::float16> convert_layout<tt::tt_metal::float16>(ttsl::Span<const tt::tt_metal::float16>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
  template std::vector<uint8_t> convert_layout<uint8_t>(ttsl::Span<const uint8_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
+diff --git tt_metal/impl/data_format/bfloat4.cpp tt_metal/impl/data_format/bfloat4.cpp
+--- tt_metal/impl/data_format/bfloat4.cpp
++++ tt_metal/impl/data_format/bfloat4.cpp
+@@ -6,2 +6,3 @@
+ #include <tt-metalium/bfloat4.hpp>
++#include <tt-metalium/experimental/tensor/tensor_types.hpp>
+ #include <tt_stl/span.hpp>
+@@ -34,2 +35,7 @@ template std::vector<uint32_t> pack_as_bfp4_tiles<bfloat16>(
+     const std::optional<tt::tt_metal::Tile>& tile);
++template std::vector<uint32_t> pack_as_bfp4_tiles<tt::tt_metal::float16>(
++    ttsl::Span<const tt::tt_metal::float16> data,
++    bool row_major_input,
++    bool is_exp_a,
++    const std::optional<tt::tt_metal::Tile>& tile);
+ template std::vector<uint32_t> pack_as_bfp4_tiles<float>(
+diff --git tt_metal/impl/data_format/bfloat8.cpp tt_metal/impl/data_format/bfloat8.cpp
+--- tt_metal/impl/data_format/bfloat8.cpp
++++ tt_metal/impl/data_format/bfloat8.cpp
+@@ -5,2 +5,3 @@
+ #include <tt-metalium/bfloat8.hpp>
++#include <tt-metalium/experimental/tensor/tensor_types.hpp>
+ #include <tt_stl/span.hpp>
+@@ -33,2 +34,7 @@ template std::vector<uint32_t> pack_as_bfp8_tiles<bfloat16>(
+     const std::optional<tt::tt_metal::Tile>& tile);
++template std::vector<uint32_t> pack_as_bfp8_tiles<tt::tt_metal::float16>(
++    ttsl::Span<const tt::tt_metal::float16> data,
++    bool row_major_input,
++    bool is_exp_a,
++    const std::optional<tt::tt_metal::Tile>& tile);
+ template std::vector<uint32_t> pack_as_bfp8_tiles<float>(
+diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_format/blockfloat_common.cpp
+--- tt_metal/impl/data_format/blockfloat_common.cpp
++++ tt_metal/impl/data_format/blockfloat_common.cpp
+@@ -13,2 +13,3 @@
+ #include <tt-metalium/bfloat16.hpp>
++#include <tt-metalium/experimental/tensor/tensor_types.hpp>
+ #include <tt_stl/assert.hpp>
+@@ -614,1 +615,4 @@ template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::S
++template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4_b>(ttsl::Span<const tt::tt_metal::float16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
++template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const tt::tt_metal::float16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
++
+ template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const int32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
 diff --git tt_metal/impl/tensor/host_tensor_factory.cpp tt_metal/impl/tensor/host_tensor_factory.cpp
 --- tt_metal/impl/tensor/host_tensor_factory.cpp
 +++ tt_metal/impl/tensor/host_tensor_factory.cpp
-@@ -174,2 +174,3 @@ std::vector<T> HostTensor::to_vector() const {
- template HostTensor HostTensor::from_span<float>(ttsl::Span<const float>, const TensorSpec&, float);
-+template HostTensor HostTensor::from_span<float16>(ttsl::Span<const float16>, const TensorSpec&, float16);
- template HostTensor HostTensor::from_span<int32_t>(ttsl::Span<const int32_t>, const TensorSpec&, int32_t);
+@@ -193,2 +193,4 @@ template HostTensor host_tensor_from_span_with_pad_value<bfloat16>(
+ template HostTensor host_tensor_from_span_with_pad_value<float>(ttsl::Span<const float>, const TensorSpec&, float);
++template HostTensor host_tensor_from_span_with_pad_value<float16>(
++    ttsl::Span<const float16>, const TensorSpec&, float16);
+ template HostTensor host_tensor_from_span_with_pad_value<int32_t>(
+@@ -204,2 +206,3 @@ template HostTensor HostTensor::from_span<bfloat16>(ttsl::Span<const bfloat16>,
+ template HostTensor HostTensor::from_span<float>(ttsl::Span<const float>, const TensorSpec&);
++template HostTensor HostTensor::from_span<float16>(ttsl::Span<const float16>, const TensorSpec&);
+ template HostTensor HostTensor::from_span<int32_t>(ttsl::Span<const int32_t>, const TensorSpec&);
 @@ -183,2 +184,4 @@ template HostTensor HostTensor::from_span<uint8_t>(
      ttsl::Span<float>, const Shape&, MemoryPin, const std::optional<Tile>&);
 +template HostTensor HostTensor::from_borrowed_data<float16>(
 +    ttsl::Span<float16>, const Shape&, MemoryPin, const std::optional<Tile>&);
  template HostTensor HostTensor::from_borrowed_data<int32_t>(
-@@ -194,2 +197,3 @@ template HostTensor HostTensor::from_borrowed_data<uint8_t>(
- template HostTensor HostTensor::from_vector<float>(const std::vector<float>&, const TensorSpec&, float);
-+template HostTensor HostTensor::from_vector<float16>(const std::vector<float16>&, const TensorSpec&, float16);
- template HostTensor HostTensor::from_vector<int32_t>(const std::vector<int32_t>&, const TensorSpec&, int32_t);
-@@ -202,2 +206,3 @@ template HostTensor HostTensor::from_vector<uint8_t>(const std::vector<uint8_t>&
- template HostTensor HostTensor::from_vector<float>(std::vector<float>&&, const TensorSpec&, float);
-+template HostTensor HostTensor::from_vector<float16>(std::vector<float16>&&, const TensorSpec&, float16);
- template HostTensor HostTensor::from_vector<int32_t>(std::vector<int32_t>&&, const TensorSpec&, int32_t);
+@@ -225,2 +230,4 @@ template HostTensor host_tensor_from_vector_with_pad_value<bfloat16>(
+ template HostTensor host_tensor_from_vector_with_pad_value<float>(const std::vector<float>&, const TensorSpec&, float);
++template HostTensor host_tensor_from_vector_with_pad_value<float16>(
++    const std::vector<float16>&, const TensorSpec&, float16);
+ template HostTensor host_tensor_from_vector_with_pad_value<int32_t>(
+@@ -237,2 +244,4 @@ template HostTensor host_tensor_from_vector_with_pad_value<bfloat16>(
+ template HostTensor host_tensor_from_vector_with_pad_value<float>(std::vector<float>&&, const TensorSpec&, float);
++template HostTensor host_tensor_from_vector_with_pad_value<float16>(
++    std::vector<float16>&&, const TensorSpec&, float16);
+ template HostTensor host_tensor_from_vector_with_pad_value<int32_t>(std::vector<int32_t>&&, const TensorSpec&, int32_t);
+@@ -246,2 +255,3 @@ template HostTensor HostTensor::from_vector<bfloat16>(const std::vector<bfloat16
+ template HostTensor HostTensor::from_vector<float>(const std::vector<float>&, const TensorSpec&);
++template HostTensor HostTensor::from_vector<float16>(const std::vector<float16>&, const TensorSpec&);
+ template HostTensor HostTensor::from_vector<int32_t>(const std::vector<int32_t>&, const TensorSpec&);
+@@ -253,2 +263,3 @@ template HostTensor HostTensor::from_vector<bfloat16>(std::vector<bfloat16>&&, c
+ template HostTensor HostTensor::from_vector<float>(std::vector<float>&&, const TensorSpec&);
++template HostTensor HostTensor::from_vector<float16>(std::vector<float16>&&, const TensorSpec&);
+ template HostTensor HostTensor::from_vector<int32_t>(std::vector<int32_t>&&, const TensorSpec&);
 @@ -208,2 +213,3 @@ template HostTensor HostTensor::from_vector<uint8_t>(const std::vector<uint8_t>&
  template std::vector<float> HostTensor::to_vector() const;
 +template std::vector<float16> HostTensor::to_vector() const;
@@ -148,36 +205,47 @@ diff --git tt_metal/impl/tensor/host_tensor_factory.cpp tt_metal/impl/tensor/hos
 diff --git tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
 --- tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
 +++ tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
-@@ -94,2 +94,4 @@ auto dispatch(DataType dtype, Func&& func, Args&&... args) {
-         case DataType::BFLOAT16:
-             return (std::forward<Func>(func)).template operator()<bfloat16>(std::forward<Args>(args)...);
+@@ -96,2 +96,4 @@ auto dispatch(DataType dtype, Func&& func, Args&&... args) {
+             return (std::forward<Func>(func)).template operator()<float>(std::forward<Args>(args)...);
 +        case DataType::FLOAT16:
 +            return (std::forward<Func>(func)).template operator()<float16>(std::forward<Args>(args)...);
+         case DataType::INT32:
 diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
 --- tt_metal/impl/tensor/tensor_apis.cpp
 +++ tt_metal/impl/tensor/tensor_apis.cpp
-@@ -1305,2 +1305,4 @@ void validate_datatype(DataType dtype) {
-         TT_FATAL(dtype == DataType::BFLOAT16, "Incorrect data type {}", dtype);
+@@ -539,2 +543,3 @@ HostTensor to_dtype(const HostTensor& input_tensor, DataType dtype) {
+                 case DataType::FLOAT32: return with_src_and_dst.operator()<SrcType, float>();
++                case DataType::FLOAT16: return with_src_and_dst.operator()<SrcType, float16>();
+                 case DataType::BFLOAT16: return with_src_and_dst.operator()<SrcType, bfloat16>();
+@@ -554,2 +559,3 @@ HostTensor to_dtype(const HostTensor& input_tensor, DataType dtype) {
+             case DataType::FLOAT32: return with_src.operator()<float>();
++            case DataType::FLOAT16: return with_src.operator()<float16>();
+             case DataType::BFLOAT16: return with_src.operator()<bfloat16>();
+@@ -613,2 +619,4 @@ void validate_datatype(DataType dtype) {
+         TT_FATAL(dtype == DataType::FLOAT32, "Incorrect data type {}", dtype);
 +    } else if constexpr (std::is_same_v<BaseType, float16>) {
 +        TT_FATAL(dtype == DataType::FLOAT16, "Incorrect data type {}", dtype);
-     } else if constexpr (std::is_same_v<BaseType, uint16_t>) {
-@@ -1369,2 +1371,3 @@ INSTANTIATE_HOST_BUFFER_FUNCTIONS(uint32_t)
- INSTANTIATE_HOST_BUFFER_FUNCTIONS(bfloat16)
+     } else if constexpr (std::is_same_v<BaseType, bfloat16>) {
+@@ -675,2 +683,3 @@ INSTANTIATE_HOST_BUFFER_FUNCTIONS(int32_t)
+ INSTANTIATE_HOST_BUFFER_FUNCTIONS(float)
 +INSTANTIATE_HOST_BUFFER_FUNCTIONS(float16)
- INSTANTIATE_HOST_BUFFER_FUNCTIONS(uint16_t)
+ INSTANTIATE_HOST_BUFFER_FUNCTIONS(bfloat16)
 diff --git ttnn/core/tensor/tensor.cpp ttnn/core/tensor/tensor.cpp
 --- ttnn/core/tensor/tensor.cpp
 +++ ttnn/core/tensor/tensor.cpp
-@@ -220,2 +220,8 @@ template Tensor Tensor::from_span<float>(
+@@ -58,1 +58,2 @@ using tt::tt_metal::TensorTopology;
+ using tt::tt_metal::Tile;
++using tt::tt_metal::float16;
+@@ -220,2 +221,8 @@ template Tensor Tensor::from_span<float>(
      float pad_value);
 +template Tensor Tensor::from_span<float16>(
 +    ttsl::Span<const float16> buffer,
 +    const TensorSpec& spec,
-+    distributed::MeshDevice* device,
-+    std::optional<tt::tt_metal::QueueId> cq_id,
++    tt::tt_metal::distributed::MeshDevice* device,
++    std::optional<QueueId> cq_id,
 +    float16 pad_value);
  template Tensor Tensor::from_span<int32_t>(
-@@ -255,2 +261,7 @@ template Tensor Tensor::from_borrowed_data<float>(
+@@ -255,2 +262,7 @@ template Tensor Tensor::from_borrowed_data<float>(
      const std::optional<Tile>& tile);
 +template Tensor Tensor::from_borrowed_data<float16>(
 +    ttsl::Span<float16> buffer,
@@ -185,45 +253,48 @@ diff --git ttnn/core/tensor/tensor.cpp ttnn/core/tensor/tensor.cpp
 +    tt::tt_metal::MemoryPin buffer_pin,
 +    const std::optional<Tile>& tile);
  template Tensor Tensor::from_borrowed_data<int32_t>(
-@@ -280,2 +291,8 @@ template Tensor Tensor::from_vector<float>(
+@@ -280,2 +292,8 @@ template Tensor Tensor::from_vector<float>(
      float pad_value);
 +template Tensor Tensor::from_vector<float16>(
 +    std::vector<float16>&& buffer,
 +    const TensorSpec& spec,
-+    distributed::MeshDevice* device,
-+    std::optional<tt::tt_metal::QueueId> cq_id,
++    tt::tt_metal::distributed::MeshDevice* device,
++    std::optional<QueueId> cq_id,
 +    float16 pad_value);
  template Tensor Tensor::from_vector<int32_t>(
-@@ -313,2 +330,3 @@ template Tensor Tensor::from_vector<uint32_t>(
- template std::vector<float> Tensor::to_vector<float>(std::optional<tt::tt_metal::QueueId> cq_id) const;
-+template std::vector<float16> Tensor::to_vector<float16>(std::optional<tt::tt_metal::QueueId> cq_id) const;
- template std::vector<bfloat16> Tensor::to_vector<bfloat16>(std::optional<tt::tt_metal::QueueId> cq_id) const;
-@@ -370,2 +388,3 @@ uint32_t Tensor::element_size() const {
+@@ -315,2 +333,3 @@ template Tensor Tensor::from_vector<uint32_t>(
+ template std::vector<float> Tensor::to_vector<float>(std::optional<QueueId> cq_id) const;
++template std::vector<float16> Tensor::to_vector<float16>(std::optional<QueueId> cq_id) const;
+ template std::vector<bfloat16> Tensor::to_vector<bfloat16>(std::optional<QueueId> cq_id) const;
+@@ -370,2 +389,3 @@ uint32_t Tensor::element_size() const {
          case DataType::FLOAT32: return sizeof(float);
 +        case DataType::FLOAT16: return sizeof(float16);
          case DataType::INT32: return sizeof(int32_t);
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
-@@ -138,3 +138,4 @@ void TilizeDeviceOperation::validate_on_program_cache_miss(
-             input_tensor_a.dtype() == DataType::UINT32 or input_tensor_a.dtype() == DataType::INT32 or
--            input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::FP8_E4M3,
-+            input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::FLOAT16 or
-+            input_tensor_a.dtype() == DataType::FP8_E4M3,
-         "data type must be bfloat16, float32, uint32, int32, uint16, or fp8_e4m3");
+@@ -193,4 +193,5 @@ void TilizeDeviceOperation::validate_on_program_cache_miss(
+             input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::UINT8 or
++            input_tensor_a.dtype() == DataType::FLOAT16 or
+             input_tensor_a.dtype() == DataType::FP8_E4M3,
+-        "data type must be bfloat16, float32, uint32, int32, uint16, uint8, or fp8_e4m3");
++        "data type must be bfloat16, float16, float32, uint32, int32, uint16, uint8, or fp8_e4m3");
+     // fp8 tile INPUT unpacks to fp32 in DEST and packs to any float TILE format. Reject non-float outputs:
 diff --git tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_tilize.h tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_tilize.h
 --- tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_tilize.h
 +++ tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_tilize.h
-@@ -102,2 +102,3 @@ inline void _llk_unpack_tilize_init_(
+@@ -103,3 +103,4 @@ inline void _llk_unpack_tilize_init_(
      const bool unpack_to_dest =
 -        (unpack_source_format == DataFormat::UInt32) || (unpack_source_format == DataFormat::Int32) || (unpack_dest_format == DataFormat::Float32);
 +        (unpack_source_format == DataFormat::UInt32) || (unpack_source_format == DataFormat::Int32) ||
 +        (unpack_dest_format == DataFormat::Float32) || supports_unpack_to_dest(unpack_src_format, unpack_dst_format);
-@@ -183,2 +184,3 @@ inline void _llk_unpack_tilize_(
+ 
+@@ -184,3 +185,4 @@ inline void _llk_unpack_tilize_(
      const bool unpack_to_dest =
 -        (unpack_source_format == DataFormat::UInt32) || (unpack_source_format == DataFormat::Int32) || (unpack_dest_format == DataFormat::Float32);
 +        (unpack_source_format == DataFormat::UInt32) || (unpack_source_format == DataFormat::Int32) ||
 +        (unpack_dest_format == DataFormat::Float32) || supports_unpack_to_dest(unpack_src_format, unpack_dst_format);
+ 
 diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_operation.cpp
@@ -234,16 +305,17 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_device_op
 diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_last_dim.cpp
-@@ -7 +7,2 @@
+@@ -7,2 +7,3 @@
  #include <cstdint>
 +#include <numeric>
+ 
 @@ -52,7 +53,3 @@ ProgramDescriptor RepeatProgramFactoryLastDim::create_descriptor(
      const uint32_t responsibility = ((number_of_pages - 1) / num_cores_total) + 1;
--    const uint32_t cb_size_bytes = READ_ALIGNMENT * 2 + (source_page_size_bytes & 0xF) == 0 ? source_page_size_bytes
--                                   : (source_page_size_bytes & 0x7) == 0                    ? source_page_size_bytes * 2
--                                   : (source_page_size_bytes & 0x3) == 0                    ? source_page_size_bytes * 4
--                                   : (source_page_size_bytes & 0x1) == 0                    ? source_page_size_bytes * 8
--                                                                         : source_page_size_bytes * 16;
+-    const uint32_t cb_size_bytes = (READ_ALIGNMENT * 2) + ((source_page_size_bytes & 0xF) == 0 ? source_page_size_bytes
+-                                   : (source_page_size_bytes & 0x7) == 0                       ? source_page_size_bytes * 2
+-                                   : (source_page_size_bytes & 0x3) == 0                       ? source_page_size_bytes * 4
+-                                   : (source_page_size_bytes & 0x1) == 0                       ? source_page_size_bytes * 8
+-                                                                           : source_page_size_bytes * 16);
 +    const uint32_t cb_size_bytes = READ_ALIGNMENT * 2 + std::lcm(source_page_size_bytes, READ_ALIGNMENT);
      constexpr uint32_t src0_cb_index = 0;
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
@@ -381,14 +453,12 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -859,4 +859,5 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -867,3 +867,4 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
                           : is_quant_op                              ? DataType::FLOAT32
 -                         : (is_sfpu_op && !is_block_float(a_dtype)) ? a_dtype
--                                                                    : DataType::BFLOAT16;
 +                         : ((is_sfpu_op || a_dtype == DataType::FLOAT16) &&
 +                            !is_block_float(a_dtype))                ? a_dtype
-+                                                                    : DataType::BFLOAT16;
-     const auto c_dtype = c.dtype();
+                                                                     : DataType::BFLOAT16;
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
@@ -610,9 +680,8 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ca
 -        x = sfpi::convert<sfpi::vFloat16a>(x, sfpi::RoundMode::Nearest);
 +        x = float32_to_float16_rne(x);
          sfpi::dst_reg[0] = x;
-@@ -24,1 +25,15 @@ inline void cast_fp32_to_fp16a() {
- }
-+
+@@ -25,2 +26,16 @@ inline void cast_fp32_to_fp16a() {
+ 
 +template <bool APPROXIMATION_MODE, int ITERATIONS>
 +inline void cast_fp16a_to_fp32() {
 +    for (int d = 0; d < ITERATIONS; d++) {
@@ -626,6 +695,8 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ca
 +        sfpi::dst_reg++;
 +    }
 +}
++
+ }  // namespace sfpu
 diff --git tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
 new file mode 100644
 --- /dev/null
@@ -878,15 +949,10 @@ diff --git ttnn/cpp/ttnn/operations/conv/conv2d/prepare_conv2d_weights.cpp ttnn/
                  {DataType::UINT16, &conv_transpose2d_group_weight_zero_pad_helper<uint16_t>},
                  {DataType::BFLOAT8_B, &conv_transpose2d_group_weight_zero_pad_helper<float>},
                  {DataType::UINT32, &conv_transpose2d_group_weight_zero_pad_helper<uint32_t>},
-@@ -932,7 +939,8 @@ Tensor convert_conv_weight_tensor_to_depthwise_layout(
-         to_w_tile_layout_map = {
-             {DataType::INT32, &conv_depthwise_weight_bcast_helper<int32_t>},
-             {DataType::FLOAT32, &conv_depthwise_weight_bcast_helper<float>},
+@@ -937,2 +944,3 @@ Tensor convert_conv_weight_tensor_to_depthwise_layout(
              {DataType::BFLOAT16, &conv_depthwise_weight_bcast_helper<bfloat16>},
 +            {DataType::FLOAT16, &conv_depthwise_weight_bcast_helper<tt::tt_metal::float16>},
              {DataType::UINT16, &conv_depthwise_weight_bcast_helper<uint16_t>},
-             {DataType::BFLOAT8_B, &conv_depthwise_weight_bcast_helper<float>},
-             {DataType::UINT32, &conv_depthwise_weight_bcast_helper<uint32_t>},
 diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
 --- tt_metal/impl/tensor/tensor_apis.cpp
 +++ tt_metal/impl/tensor/tensor_apis.cpp
@@ -899,12 +965,6 @@ diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis
 +                    return static_cast<DstType>(value);
 +                }
              });
-@@ -1223 +1227,4 @@ HostTensor to_dtype(const HostTensor& input_tensor, DataType dtype) {
--    auto output_storage = [src_type, dst_type = dtype, &input_tensor, &input_buffer]() {
-+    auto output_storage = src_type == DataType::FLOAT16 && dtype == DataType::BFLOAT16
-+                              ? CMAKE_UNIQUE_NAMESPACE::transform_buffers<float16, bfloat16>(
-+                                    input_tensor.tensor_spec(), input_buffer)
-+                              : [src_type, dst_type = dtype, &input_tensor, &input_buffer]() {
 diff --git ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp
@@ -926,33 +986,35 @@ diff --git ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_op_program_factory_common
 -                                                        : tt::tt_metal::DataType::BFLOAT16;
 +    const tt::tt_metal::DataType conv_input_dtype = input_datatype;
      const uint32_t input_datum_size = conv_input_dtype == tt::tt_metal::DataType::FLOAT32 ? 4 : 2;
-@@ -86,2 +83,3 @@ std::vector<CBInfo> get_cb_info(
+@@ -87,5 +84,5 @@ std::vector<CBInfo> get_cb_info(
+     const uint32_t input_tile_size = tt::tile_size(datatype_to_dataformat_converter(conv_input_dtype));
+-
      auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
          get_compute_kernel_config_args(tt::tt_metal::hal::get_arch(), compute_kernel_config);
 +    fp32_dest_acc_en &= input_datatype != DataType::FLOAT16;
-@@ -175,4 +173,4 @@ std::vector<CBInfo> get_cb_info(
-     packer_l1_acc = determine_packer_l1_acc(packer_l1_acc, enable_bias, in0_num_blocks_w);
--    const tt::tt_metal::DataType partial_dtype =
+ 
+@@ -176,3 +174,3 @@ std::vector<CBInfo> get_cb_info(
+     const tt::tt_metal::DataType partial_dtype =
 -        packer_l1_acc ? (fp32_dest_acc_en ? DataType::FLOAT32 : DataType::BFLOAT16) : output_datatype;
-+    const tt::tt_metal::DataType partial_dtype =
 +        packer_l1_acc && fp32_dest_acc_en ? DataType::FLOAT32 : output_datatype;
      const tt::DataFormat partial_df = datatype_to_dataformat_converter(partial_dtype);
-@@ -305,8 +303,8 @@ std::vector<CBInfo> get_cb_info(
+@@ -307,4 +305,4 @@ std::vector<CBInfo> get_cb_info(
      // Reader indices CB
 -    // Worst case is 1 uint16 index per output row (segment headers and discontinuity markers
 -    // empirically stay below this bound for supported configs). When the factory has the real
 +    // Reserve four uint16 values per output row for block headers and discontinuities.
 +    // When the factory has the real
      // DRAM config buffer it passes its actual per-core page size so the predicted CB footprint
-     // matches the CB the factory creates; auto-shard estimation passes std::nullopt.
+@@ -312,3 +310,3 @@ std::vector<CBInfo> get_cb_info(
      const uint32_t reader_indices_worst_case_page_size =
 -        pconfig.per_core_out_matrix_height_ntile * tt::constants::TILE_HEIGHT * sizeof(uint16_t);
 +        4 * pconfig.per_core_out_matrix_height_ntile * tt::constants::TILE_HEIGHT * sizeof(uint16_t);
      if (reader_indices_actual_page_size.has_value()) {
-@@ -334,2 +331,2 @@ std::vector<CBInfo> get_cb_info(
+@@ -336,3 +334,3 @@ std::vector<CBInfo> get_cb_info(
          .page_size = l1_scratchpad_CB_size,
 -        .data_format = tt::DataFormat::Float16_b});
 +        .data_format = conv_input_df});
+ 
 diff --git ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
 --- ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
 +++ ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
@@ -966,35 +1028,32 @@ diff --git ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp ttnn/cpp/ttnn/o
 diff --git ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_device_operation.cpp ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_device_operation.cpp
-@@ -102,7 +102,8 @@ void Conv2dDeviceOperation::validate_on_program_cache_miss(
-     TT_FATAL(!input_tensor_b.memory_config().is_sharded(), "Weights tensor should not be sharded.");
-     if (args.untilize_out) {
+@@ -104,4 +104,5 @@ void Conv2dDeviceOperation::validate_on_program_cache_miss(
          TT_FATAL(
 -            (args.dtype == DataType::BFLOAT16) || (args.dtype == DataType::FLOAT32),
+-            "Untilize output requires BFLOAT16 or FLOAT32 data type but got {}",
 +            (args.dtype == DataType::BFLOAT16) || (args.dtype == DataType::FLOAT16) ||
 +                (args.dtype == DataType::FLOAT32),
--            "Untilize output requires BFLOAT16 or FLOAT32 data type but got {}",
 +            "Untilize output requires BFLOAT16, FLOAT16, or FLOAT32 data type but got {}",
              args.dtype);
-     }
 diff --git ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_sharded_program_factory.cpp
-@@ -246,2 +246,3 @@ ttnn::prim::Conv2dOpProgramFactory::create_at(
-     auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
+@@ -247,2 +247,3 @@ tt::tt_metal::ProgramDescriptor build_program_descriptor_sharded(
          get_compute_kernel_config_args(device->arch(), compute_kernel_config);
 +    fp32_dest_acc_en &= a.dtype() != DataType::FLOAT16;
+ 
 diff --git ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_width_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_width_sharded_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_width_sharded_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/conv/conv2d/device/conv2d_op_width_sharded_program_factory.cpp
-@@ -112,2 +112,3 @@ ttnn::prim::Conv2dOpProgramFactory::create_at(
-     auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
+@@ -113,2 +113,3 @@ tt::tt_metal::ProgramDescriptor build_program_descriptor(
          get_compute_kernel_config_args(device->arch(), compute_kernel_config);
 +    fp32_dest_acc_en &= a.dtype() != DataType::FLOAT16;
+ 
 diff --git ttnn/cpp/ttnn/operations/sliding_window/halo/device/untilize_with_halo_program_factory.cpp ttnn/cpp/ttnn/operations/sliding_window/halo/device/untilize_with_halo_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/sliding_window/halo/device/untilize_with_halo_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/sliding_window/halo/device/untilize_with_halo_program_factory.cpp
-@@ -201,2 +201,3 @@ ProgramDescriptor build_halo_program(
-         auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
+@@ -202,2 +202,3 @@ ProgramDescriptor build_halo_program(
              get_compute_kernel_config_args(input_tensor.device()->arch(), operation_attributes.compute_kernel_config);
 +        fp32_dest_acc_en &= input_tensor.dtype() != DataType::FLOAT16;
+ 

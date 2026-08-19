@@ -51,18 +51,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  static void
  addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
                                           RewritePatternSet &patterns,
-@@ -10619,9 +10662,11 @@
-       typeConverter, ctx);
-   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+@@ -11026,2 +11069,4 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
        mlir::stablehlo::CbrtOp, mlir::tt::ttir::CbrtOp>>(typeConverter, ctx);
--  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
--      mlir::stablehlo::ConvertOp, mlir::tt::ttir::TypecastOp>>(typeConverter,
--                                                               ctx);
 +  patterns.add<StableHLOToTTIRConvertOpConversionPattern>(
 +      typeConverter, ctx, PatternBenefit(2));
-+  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
-+      mlir::stablehlo::ConvertOp, mlir::tt::ttir::TypecastOp>>(typeConverter,
-+                                                               ctx);
-   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
-       mlir::stablehlo::CeilOp, mlir::tt::ttir::CeilOp>>(typeConverter, ctx);
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<

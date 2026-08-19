@@ -42,6 +42,7 @@ py_test(
     srcs = ["jax_test_suite.py"],
     args = JAX_TEST_ARGS + [
         "tests/device_test.py",
+        "tests/batching_test.py::BatchingTest::testDynamicUpdateSlice",
         "tests/lax_test.py::LazyConstantTest::testIotaConstant0",
         "tests/lax_test.py::LazyConstantTest::testIotaConstant1",
         "tests/lax_test.py::LazyConstantTest::testIotaConstant2",

@@ -1,8 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -3025,7 +3025,54 @@ public:
-     RankedTensorType firstInputType =
+@@ -2858,5 +2858,53 @@ public:
          mlir::cast<RankedTensorType>(srcOp.getInputs()[0].getType());
      int64_t inputRank = firstInputType.getRank();
 -    if (inputRank == 0 || inputRank > 5) {
@@ -57,5 +56,3 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    if (inputRank > 5) {
        return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
      }
--
-+

@@ -40,12 +40,9 @@ diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPattern
 diff --git a/include/ttmlir/Utils.h b/include/ttmlir/Utils.h
 --- a/include/ttmlir/Utils.h
 +++ b/include/ttmlir/Utils.h
-@@ -41,6 +41,45 @@ enum InputDimensions {
- enum OutputDimensions { OUTPUT_BATCH = 0, OUTPUT_SEQ = 1, OUTPUT_HIDDEN = 2 };
+@@ -45,4 +45,43 @@ enum OutputDimensions { OUTPUT_BATCH = 0, OUTPUT_SEQ = 1, OUTPUT_HIDDEN = 2 };
  } // namespace transformer
--
--template <typename T>
-+
+ 
 +enum class QKVProjectionRole {
 +  Unknown = -1,
 +  Query = 0,
@@ -85,9 +82,8 @@ diff --git a/include/ttmlir/Utils.h b/include/ttmlir/Utils.h
 +  return QKVProjectionRole::Unknown;
 +}
 +
-+template <typename T>
+ template <typename T>
  T alignUp(const T val, const T alignment) {
-   assert(val >= 0 && alignment > 0);
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
@@ -137,10 +133,12 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
-@@ -9,2 +9,3 @@
+@@ -9,4 +9,5 @@
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/DecodeLayoutTransform.h"
  #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
 +#include "ttmlir/Utils.h"
+ 
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
 @@ -572,6 +573,163 @@ bool validateReshapeLayouts(SmallVector<SliceReshapeMatch> &matches) {
    return true;
  }
