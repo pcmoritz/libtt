@@ -484,16 +484,50 @@ index 4a4753e50..2962f00fb 100644
            continue;
          }
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-index d62e8657b..56e5dc866 100644
+index 1b2921caf..6ee5366f6 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -62,7 +62,8 @@ private:
-     shouldHoist &= !::mlir::isa<mlir::tt::ttnn::CaptureOrExecuteTraceOp>(op);
-     shouldHoist &= !::mlir::isa<mlir::tt::ttnn::GetDeviceOp>(op);
-     shouldHoist &=
--        !(op->hasTrait<mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>());
-+        ::mlir::isa<ttnn::EmptyOp, ttnn::AllocOp>(op) ||
-+        !op->hasTrait<mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>();
-     return shouldHoist;
-   }
+@@ -1012,19 +1012,20 @@ private:
+       }
  
+       // Collect all hoistable ops between first and last. Creation ops (e.g.
+-      // ttnn.constant / ttnn.full materialized mid-graph by op decompositions
+-      // such as SDPA) are not hoistable, but they only depend on the device
+-      // (no data dependency on surrounding compute). Rather than failing, sink
+-      // them above the trace region so they are treated as regular trace inputs
+-      // (recreated per execution), matching how leading creation ops are
+-      // handled when const-eval is disabled.
++      // ttnn.constant / ttnn.full) and their operand-free ttnn.get_device ops
++      // can be materialized mid-graph by op decompositions and D2M fusion.
++      // They have no data dependency on surrounding compute. Rather than
++      // failing, sink them above the trace region so creation results are
++      // treated as regular trace inputs (recreated per execution), matching
++      // how leading creation ops are handled when const-eval is disabled.
+       llvm::SmallVector<Operation *> creationOpsToSink;
+       for (size_t i = firstHoistable; i <= lastHoistable; i++) {
+         if (shouldHoistOp(allOps[i])) {
+           opsToHoist.push_back(allOps[i]);
+-        } else if (allOps[i]
+-                       ->hasTrait<
+-                           mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>()) {
++        } else if (
++            allOps[i]->hasTrait<
++                mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>() ||
++            ::mlir::isa<mlir::tt::ttnn::GetDeviceOp>(allOps[i])) {
+           creationOpsToSink.push_back(allOps[i]);
+         } else {
+           // We found a non-hoistable op in the middle - this is an error
+diff --git a/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir b/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir
+index 08443a304..231332cf4 100644
+--- a/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir
++++ b/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir
+@@ -42,8 +42,8 @@ module {
+         // CHECK: %[[FULL:.+]] = "ttnn.full"
+         // CHECK: %[[FULL_HOST:.+]] = "ttnn.to_tensor_spec"(%[[FULL]])
+         // CHECK: "ttnn.capture_or_execute_trace"({{.*}}%[[FULL_HOST]])
+-        %dev = "ttnn.get_device"() <{mesh_offset = #ttnn<mesh_offset 0x0>, mesh_shape = #ttnn<mesh_shape 1x1>}> : () -> !ttnn.device
+         %add = "ttnn.add"(%arg0, %arg1) : (tensor<1x12x32x64xbf16, #ttnn_layout>, tensor<1x12x32x64xbf16, #ttnn_layout>) -> tensor<1x12x32x64xbf16, #ttnn_layout>
++        %dev = "ttnn.get_device"() <{mesh_offset = #ttnn<mesh_offset 0x0>, mesh_shape = #ttnn<mesh_shape 1x1>}> : () -> !ttnn.device
+         %full = "ttnn.full"(%dev) <{fill_value = 1.250000e-01 : f32, layout = #ttnn.layout<tile>, shape = #ttnn.shape<1x12x32x64>}> : (!ttnn.device) -> tensor<1x12x32x64xbf16, #ttnn_layout>
+         %mul = "ttnn.multiply"(%add, %full) : (tensor<1x12x32x64xbf16, #ttnn_layout>, tensor<1x12x32x64xbf16, #ttnn_layout>) -> tensor<1x12x32x64xbf16, #ttnn_layout>
+         return %mul : tensor<1x12x32x64xbf16, #ttnn_layout>

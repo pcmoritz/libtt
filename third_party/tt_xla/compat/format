@@ -1,5 +1,8 @@
 #pragma once
 
+#if defined(__has_include_next) && __has_include_next(<format>)
+#include_next <format>
+#else
 #include <fmt/format.h>
 
 namespace std {
@@ -8,3 +11,4 @@ using fmt::format;
 template <typename... Args>
 using format_string = fmt::format_string<Args...>;
 }  // namespace std
+#endif
