@@ -427,6 +427,44 @@ index 193f05039..95f2d63c3 100644
        patterns.add<fusing::SDPAFusingPattern>(&getContext());
        patterns.add<fusing::TopKFusingPattern>(&getContext());
  
+diff --git a/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h b/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
+index 289713c66..f220d1844 100644
+--- a/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
++++ b/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
+@@ -323,6 +323,12 @@ struct TTIRToTTNNCommonPipelineOptions
+       llvm::cl::desc("Enable TTNN create D2M subgraphs pass."),
+       llvm::cl::init(false)};
+-
++
++  Option<unsigned> minD2MFusionGroupSize{
++      *this, "d2m-min-fusion-group-size",
++      llvm::cl::desc(
++          "Minimum number of elementwise ops in a D2M fusion group."),
++      llvm::cl::init(4)};
++
+   // Enable the d2m elementwise fusion pass when enable-create-d2m-subgraphs is
+   // on. See resolveCreateD2MSubgraphsOptions for more details.
+   mutable Option<bool> enableD2MElementwiseFusion{
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+index 5e6f6a33e..dc00c0619 100644
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+@@ -379,6 +379,13 @@ def TTNNCreateD2MSubgraphs: Pass<"ttnn-create-d2m-subgraphs", "::mlir::ModuleOp"
+-
++
+     Right now, this is limited to eltwise chains.
+   }];
++  let options = [
++    Option<"minFusionGroupSize",
++           "min-fusion-group-size",
++           "unsigned", /*default=*/"2",
++           "Minimum number of elementwise operations required to outline a "
++           "D2M fusion group.">
++  ];
+ }
+-
++
+ def TTNNTraceHoistTransform : Pass<"ttnn-trace-hoist-transform", "::mlir::ModuleOp"> {
 diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 index 17c4fc8f1..66e26cd3e 100644
 --- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
@@ -437,11 +475,22 @@ index 17c4fc8f1..66e26cd3e 100644
        options.enablePermuteMatmulFusion,
 -      options.enablePermuteSliceAfterMatmulFusion};
 +      options.enablePermuteSliceAfterMatmulFusion,
-+      !options.enableCreateD2MSubgraphs};
++      /*ropeFusionEnabled=*/true};
    if (options.enableFusing) {
      pm.addPass(mlir::tt::ttir::createTTIRFusing(fusingOptions));
    }
-@@ -718,6 +719,8 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
+@@ -451,7 +452,11 @@ void createTTNNPipelineTTIRPasses(
+                "enabled. Automatically enabling Optimizer as a dependency.\n";
+       }
+       options.optimizerPassEnabled = true;
+-      devicePm.addPass(tt::ttnn::createTTNNCreateD2MSubgraphs());
++      TTNNCreateD2MSubgraphsOptions createD2MSubgraphsOptions;
++      createD2MSubgraphsOptions.minFusionGroupSize =
++          options.minD2MFusionGroupSize.getValue();
++      devicePm.addPass(
++          tt::ttnn::createTTNNCreateD2MSubgraphs(createD2MSubgraphsOptions));
+     }
+@@ -718,6 +723,8 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
    // only works on top-level modules (doesn't run module has a parent op).
    ttmetal::D2MPipelineOptions ttmetalOptions;
    ttmetalOptions.ttnnMode = true;
@@ -451,38 +500,109 @@ index 17c4fc8f1..66e26cd3e 100644
    ttmetal::createD2MFrontendPipeline(pm, ttmetalOptions);
    ttmetal::createD2MBackendPipeline(pm, ttmetalOptions);
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
-index 4a4753e50..2962f00fb 100644
+index 4a4753e50..e6c445141 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
-@@ -70,6 +70,9 @@ public:
- 
- private:
-   static bool isFusionGroupExit(Operation *op) {
-+    if (mlir::isa<ConcatOp>(op)) {
-+      return true;
-+    }
-     if (!isAllowedToBeFused(op)) {
-       return false;
-     }
-@@ -124,6 +127,7 @@ private:
-   FusionGroup buildFusionGroup(Operation *exitOp) {
-     llvm::DenseSet<Operation *> fusionSet;
-     llvm::SmallVector<Operation *> stack;
-+    const bool allowViews = mlir::isa<ConcatOp>(exitOp);
- 
-     fusionSet.insert(exitOp);
-     stack.push_back(exitOp);
-@@ -133,7 +137,9 @@ private:
- 
-       for (Value operand : cur->getOperands()) {
-         Operation *producer = operand.getDefiningOp();
--        if (!producer || !isAllowedToBeFused(producer) ||
-+        if (!producer ||
-+            (!isAllowedToBeFused(producer) &&
-+             !(allowViews && mlir::isa<ReshapeOp, SliceStaticOp>(producer))) ||
-             visitedOps.contains(producer) || fusionSet.contains(producer)) {
-           continue;
-         }
+@@ -36,6 +36,9 @@ public:
+ public:
+   using FusionGroup = llvm::SmallVector<Operation *>;
+-
+-  explicit ElementwiseFusionAnalysis(Operation *rootOp) { analyze(rootOp); }
+-
++
++  ElementwiseFusionAnalysis(Operation *rootOp, size_t minFusionGroupSize)
++      : minFusionGroupSize(minFusionGroupSize) {
++    analyze(rootOp);
++  }
++
+   llvm::ArrayRef<FusionGroup> getFusionGroups() const { return fusionGroups; }
+@@ -99,5 +102,5 @@ private:
+       FusionGroup group = buildFusionGroup(exitOp);
+-
+-      if (group.size() >= 2) {
++
++      if (group.size() >= minFusionGroupSize) {
+         for (Operation *op : group) {
+           visitedOps.insert(op);
+@@ -162,6 +165,7 @@ private:
+     return fusionGroup;
+   }
+-
++
++  const size_t minFusionGroupSize;
+   llvm::DenseSet<Operation *> visitedOps;
+   llvm::SmallVector<FusionGroup> fusionGroups;
+ };
+@@ -179,7 +183,7 @@ private:
+   void runOnOperation() final {
+     ModuleOp moduleOp = getOperation();
+-
+-    ElementwiseFusionAnalysis analysis(moduleOp);
++
++    ElementwiseFusionAnalysis analysis(moduleOp, minFusionGroupSize);
+     auto fusionGroups = analysis.getFusionGroups();
+     if (fusionGroups.empty()) {
+       return;
+diff --git a/test/python/golden/d2m/test_fusion_with_optimizer.py b/test/python/golden/d2m/test_fusion_with_optimizer.py
+index 28a488faa..2a8b9a641 100644
+--- a/test/python/golden/d2m/test_fusion_with_optimizer.py
++++ b/test/python/golden/d2m/test_fusion_with_optimizer.py
+@@ -79,6 +79,7 @@ def test_d2m_fusion_with_optimizer(request, target, snippet):
+         pipeline_options=[
+             "optimization-level=1",
+             "enable-create-d2m-subgraphs=true",
++            "d2m-min-fusion-group-size=2",
+         ],
+     )
+     # Open device only after compile so the pipeline can use mock context for opmodel.
+diff --git a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_fork_join.mlir b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_fork_join.mlir
+index ce5d8f099..783cae88c 100644
+--- a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_fork_join.mlir
++++ b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_fork_join.mlir
+@@ -1,5 +1,5 @@
+ // REQUIRES: opmodel
+-// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true" --mlir-print-local-scope -o %t %s
++// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true d2m-min-fusion-group-size=2" --mlir-print-local-scope -o %t %s
+ // RUN: FileCheck %s --input-file=%t
+-
++
+ // Verify that the full TTIR-to-TTNN backend pipeline with the greedy optimizer
+diff --git a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_linear_chain.mlir b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_linear_chain.mlir
+index 154a0e1bf..fc6a9358e 100644
+--- a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_linear_chain.mlir
++++ b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_linear_chain.mlir
+@@ -1,5 +1,5 @@
+ // REQUIRES: opmodel
+-// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true" --mlir-print-local-scope -o %t %s
++// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true d2m-min-fusion-group-size=2" --mlir-print-local-scope -o %t %s
+ // RUN: FileCheck %s --input-file=%t
+-
++
+ // Verify that the full TTIR-to-TTNN backend pipeline with the greedy optimizer
+diff --git a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_nd_bcast.mlir b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_nd_bcast.mlir
+index 197e77ffc..66de7269e 100644
+--- a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_nd_bcast.mlir
++++ b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_nd_bcast.mlir
+@@ -1,5 +1,5 @@
+ // REQUIRES: opmodel
+-// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true" --mlir-print-local-scope -o %t %s
++// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true d2m-min-fusion-group-size=2" --mlir-print-local-scope -o %t %s
+ // RUN: FileCheck %s --input-file=%t
+-
++
+ // End-to-end regression: a TTIR graph with implicit ND broadcasts in an
+diff --git a/test/ttmlir/Dialect/TTNN/optimizer/d2m_optimizer_two_d2m_subgraphs.mlir b/test/ttmlir/Dialect/TTNN/optimizer/d2m_optimizer_two_d2m_subgraphs.mlir
+index 75a40dc64..e02ab40ce 100644
+--- a/test/ttmlir/Dialect/TTNN/optimizer/d2m_optimizer_two_d2m_subgraphs.mlir
++++ b/test/ttmlir/Dialect/TTNN/optimizer/d2m_optimizer_two_d2m_subgraphs.mlir
+@@ -1,5 +1,5 @@
+ // REQUIRES: opmodel
+-// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=1 enable-create-d2m-subgraphs=true" --mlir-print-local-scope -o %t %s
++// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=1 enable-create-d2m-subgraphs=true d2m-min-fusion-group-size=2" --mlir-print-local-scope -o %t %s
+ // RUN: FileCheck %s --input-file=%t
+-
++
+ // Verify that the full TTIR-to-TTNN backend pipeline with D2M fusion can
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 index 1b2921caf..6ee5366f6 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
