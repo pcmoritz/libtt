@@ -475,7 +475,7 @@ index 17c4fc8f1..66e26cd3e 100644
        options.enablePermuteMatmulFusion,
 -      options.enablePermuteSliceAfterMatmulFusion};
 +      options.enablePermuteSliceAfterMatmulFusion,
-+      /*ropeFusionEnabled=*/true};
++      !options.enableCreateD2MSubgraphs};
    if (options.enableFusing) {
      pm.addPass(mlir::tt::ttir::createTTIRFusing(fusingOptions));
    }
@@ -516,6 +516,33 @@ index 4a4753e50..e6c445141 100644
 +  }
 +
    llvm::ArrayRef<FusionGroup> getFusionGroups() const { return fusionGroups; }
+@@ -70,6 +73,9 @@ private:
+   static bool isFusionGroupExit(Operation *op) {
++    if (mlir::isa<ConcatOp>(op)) {
++      return true;
++    }
+     if (!isAllowedToBeFused(op)) {
+       return false;
+     }
+@@ -124,6 +130,7 @@ private:
+   FusionGroup buildFusionGroup(Operation *exitOp) {
+     llvm::DenseSet<Operation *> fusionSet;
+     llvm::SmallVector<Operation *> stack;
++    const bool allowViews = mlir::isa<ConcatOp>(exitOp);
+
+     fusionSet.insert(exitOp);
+     stack.push_back(exitOp);
+@@ -133,7 +140,9 @@ private:
+
+       for (Value operand : cur->getOperands()) {
+         Operation *producer = operand.getDefiningOp();
+-        if (!producer || !isAllowedToBeFused(producer) ||
++        if (!producer ||
++            (!isAllowedToBeFused(producer) &&
++             !(allowViews && mlir::isa<ReshapeOp, SliceStaticOp>(producer))) ||
+             visitedOps.contains(producer) || fusionSet.contains(producer)) {
+           continue;
+         }
 @@ -99,5 +102,5 @@ private:
        FusionGroup group = buildFusionGroup(exitOp);
 -
@@ -607,6 +634,16 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 index 1b2921caf..6ee5366f6 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -60,7 +60,8 @@ private:
+     shouldHoist &= !::mlir::isa<mlir::tt::ttnn::CaptureOrExecuteTraceOp>(op);
+     shouldHoist &= !::mlir::isa<mlir::tt::ttnn::GetDeviceOp>(op);
+     shouldHoist &=
+-        !(op->hasTrait<mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>());
++        ::mlir::isa<ttnn::EmptyOp, ttnn::AllocOp>(op) ||
++        !op->hasTrait<mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>();
+     return shouldHoist;
+   }
+
 @@ -1012,19 +1012,20 @@ private:
        }
  
