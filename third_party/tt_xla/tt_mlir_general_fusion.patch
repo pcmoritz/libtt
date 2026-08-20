@@ -1,5 +1,5 @@
 diff --git a/include/ttmlir/Dialect/TTIR/Transforms/Passes.td b/include/ttmlir/Dialect/TTIR/Transforms/Passes.td
-index 7ade810..9a9aa65 100644
+index 7ade81082..9a9aa659e 100644
 --- a/include/ttmlir/Dialect/TTIR/Transforms/Passes.td
 +++ b/include/ttmlir/Dialect/TTIR/Transforms/Passes.td
 @@ -316,6 +316,10 @@ def TTIRFusing: Pass<"ttir-fusing", "::mlir::ModuleOp">
@@ -14,10 +14,10 @@ index 7ade810..9a9aa65 100644
  }
  
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-index 386d007..23044cf 100644
+index ed768f2a2..880bc5eeb 100644
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -3612,7 +3612,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
+@@ -3864,7 +3864,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
    let hasVerifier = 1;
  }
  
@@ -27,10 +27,10 @@ index 386d007..23044cf 100644
      let description = [{
        Generic operation capable of running a program with custom kernels. Each kernel is described with a
 diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
-index 12ac5d5..44537fb 100644
+index 7b46dae00..61f8dd9e4 100644
 --- a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 +++ b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
-@@ -320,9 +320,21 @@ protected:
+@@ -324,9 +324,21 @@ protected:
      bool isTTNN = isTTNNTensor(value.getType());
      if (isTTNN) {
        assert(ttnnMode && "Unexpected TTNN tensor as op operand");
@@ -54,7 +54,7 @@ index 12ac5d5..44537fb 100644
  
        // Propagate both VGM maps for height/width sharded TTNN layouts
        // so that downstream passes (GenericOp::build, getMemoryMap, etc.)
-@@ -368,12 +380,23 @@ protected:
+@@ -372,12 +384,23 @@ protected:
              newTensorShape, metalTensorType.getElementType(),
              metalTensorType.getEncoding());
          auto unitReblockingView = rewriter.create<d2m::ViewLayoutOp>(
@@ -82,7 +82,7 @@ index 12ac5d5..44537fb 100644
      }
  
      auto tensorType = mlir::cast<mlir::RankedTensorType>(value.getType());
-@@ -1234,7 +1257,8 @@ private:
+@@ -1238,7 +1261,8 @@ private:
  
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
@@ -92,7 +92,7 @@ index 12ac5d5..44537fb 100644
      const std::size_t numInputs = inputs.size();
      const std::size_t numOutputs = outputs.size();
      const std::size_t numOperands = (numInputs + numOutputs);
-@@ -1610,7 +1634,7 @@ private:
+@@ -1614,7 +1638,7 @@ private:
  
      auto [inputs, outputs] =
          toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
@@ -101,7 +101,7 @@ index 12ac5d5..44537fb 100644
      assert(inputs.size() == 1);
      assert(outputs.size() == 1);
  
-@@ -2928,6 +2952,121 @@ private:
+@@ -2932,6 +2956,121 @@ private:
  } // namespace
  
  namespace {
@@ -223,7 +223,7 @@ index 12ac5d5..44537fb 100644
  class D2MConcatRewriter final
      : public mlir::OpConversionPattern<ttir::ConcatOp>,
        D2MNamedRewriterCommon {
-@@ -4798,6 +4937,76 @@ public:
+@@ -4422,6 +4561,76 @@ public:
                            builder.getContext());
    }
  };
@@ -300,7 +300,7 @@ index 12ac5d5..44537fb 100644
  } // namespace
  
  static TensorManipulationInfo rearrangeLogicalInfo(ttir::RearrangeOp op) {
-@@ -5921,6 +6130,14 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -5446,6 +5655,14 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
      D2MAllGatherRewriter
    >(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, ttnnMode, collapseTensors, enableMulticastInference);
  
@@ -316,7 +316,7 @@ index 12ac5d5..44537fb 100644
    // NoC alignment before the generic SliceStatic lowering consumes them.
    patterns.add<D2MSliceStaticOpNoCConstraintsRewriter>(typeConverter, ctx);
 diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
-index c482273..9ab797d 100644
+index 8eb1e4cde..e9ffd1387 100644
 --- a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
 +++ b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
 @@ -31,8 +31,9 @@ public:
@@ -331,10 +331,10 @@ index c482273..9ab797d 100644
  
      return mlir::success();
    }
-@@ -407,6 +408,14 @@ void populateTTNNToTTIRPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
-   patterns.add<TTNNMatmulToTTIRMatmulConversionPattern>(typeConverter, ctx);
-   patterns.add<TTNNFullOpToTTIRFullOpConversionPattern>(typeConverter, ctx);
+@@ -437,6 +438,14 @@ void populateTTNNToTTIRPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
    patterns.add<TTNNToLayoutToTTIRToLayoutConversionPattern>(typeConverter, ctx);
+   patterns.add<TTNNToTensorSpecToTTIRToLayoutConversionPattern>(typeConverter,
+                                                                 ctx);
 +  patterns.add<
 +      TTNNToTTIROpConversionPattern<mlir::tt::ttnn::ConcatOp,
 +                                    mlir::tt::ttir::ConcatOp>,
@@ -347,7 +347,7 @@ index c482273..9ab797d 100644
  
  } // namespace mlir::tt
 diff --git a/lib/Dialect/D2M/IR/D2MOps.cpp b/lib/Dialect/D2M/IR/D2MOps.cpp
-index 65fd915..10d8806 100644
+index e0880fa86..f02b4688a 100644
 --- a/lib/Dialect/D2M/IR/D2MOps.cpp
 +++ b/lib/Dialect/D2M/IR/D2MOps.cpp
 @@ -121,6 +121,13 @@ void d2m::GenericOp::getEffects(
@@ -365,10 +365,10 @@ index 65fd915..10d8806 100644
  
  mlir::tt::ttcore::DeviceAttr d2m::GenericOp::getDevice() {
 diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
-index 85cfe53..1f3395e 100644
+index 6adb0d30d..acccdd690 100644
 --- a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
 +++ b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
-@@ -129,6 +129,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
+@@ -130,6 +130,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
      fusionOptions.enableEltwiseReductionFusion =
          options.enableEltwiseReductionFusion;
      pm.addPass(d2m::createD2MGenericFusion(fusionOptions));
@@ -377,10 +377,10 @@ index 85cfe53..1f3395e 100644
    pm.addPass(mlir::createCanonicalizerPass());
    createTTIRBufferizationPipeline(pm, options);
 diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Transforms/GridSelection.cpp
-index e1c883c..039eba7 100644
+index c4352c0d5..d96ba6e3c 100644
 --- a/lib/Dialect/D2M/Transforms/GridSelection.cpp
 +++ b/lib/Dialect/D2M/Transforms/GridSelection.cpp
-@@ -417,6 +417,10 @@ static void applyTTNNTensorUpdate(const OperandGridInfo &info,
+@@ -432,6 +432,10 @@ static void applyTTNNTensorUpdate(const OperandGridInfo &info,
    auto metalLayout =
        mlir::cast<ttcore::MetalLayoutAttr>(metalTensor.getEncoding());
    if (metalLayout.getMemorySpace() == ttcore::MemorySpace::DeviceDRAM) {
@@ -392,10 +392,10 @@ index e1c883c..039eba7 100644
    } else if (auto castOp =
                   ttnnOperand.getDefiningOp<ttir::TTNNMetalLayoutCastOp>()) {
 diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
-index ec54958..3c64ee4 100644
+index 8a19462fc..8d6a10389 100644
 --- a/lib/Dialect/D2M/Utils/Utils.cpp
 +++ b/lib/Dialect/D2M/Utils/Utils.cpp
-@@ -898,9 +898,9 @@ SmallVector<Value> applyMap(Builder &builder, Location loc, AffineMap map,
+@@ -910,9 +910,9 @@ SmallVector<Value> applyMap(Builder &builder, Location loc, AffineMap map,
      // Break the map into respective gridY, gridX, offset "single result"
      // parts. AffineApply only supports single result affine maps.
      map = map.dropResults(0); // Drop the device index.
@@ -409,10 +409,10 @@ index ec54958..3c64ee4 100644
              affineApply(offset, index)};
    }
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-index 98743ae..58893b4 100644
+index 193f05039..95f2d63c3 100644
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3755,9 +3755,11 @@ public:
+@@ -3756,9 +3756,11 @@ public:
        patterns.add<HardsigmoidFusionPattern>(&getContext());
        patterns.add<MishFusingPattern>(&getContext());
        patterns.add<ReshapeBroadcastReshapeToRepeatPattern>(&getContext());
@@ -428,7 +428,7 @@ index 98743ae..58893b4 100644
        patterns.add<fusing::TopKFusingPattern>(&getContext());
  
 diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
-index d721b1f..9e36f4d 100644
+index 17c4fc8f1..66e26cd3e 100644
 --- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 +++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 @@ -48,7 +48,8 @@ void createTTNNPipelineTTIRPasses(
@@ -441,7 +441,7 @@ index d721b1f..9e36f4d 100644
    if (options.enableFusing) {
      pm.addPass(mlir::tt::ttir::createTTIRFusing(fusingOptions));
    }
-@@ -738,6 +739,8 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
+@@ -718,6 +719,8 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
    // only works on top-level modules (doesn't run module has a parent op).
    ttmetal::D2MPipelineOptions ttmetalOptions;
    ttmetalOptions.ttnnMode = true;
@@ -451,7 +451,7 @@ index d721b1f..9e36f4d 100644
    ttmetal::createD2MFrontendPipeline(pm, ttmetalOptions);
    ttmetal::createD2MBackendPipeline(pm, ttmetalOptions);
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
-index 4a4753e..2962f00 100644
+index 4a4753e50..2962f00fb 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 @@ -70,6 +70,9 @@ public:
@@ -484,10 +484,10 @@ index 4a4753e..2962f00 100644
            continue;
          }
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-index 99777ee..7511dff 100644
+index d62e8657b..56e5dc866 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -60,7 +60,8 @@ private:
+@@ -62,7 +62,8 @@ private:
      shouldHoist &= !::mlir::isa<mlir::tt::ttnn::CaptureOrExecuteTraceOp>(op);
      shouldHoist &= !::mlir::isa<mlir::tt::ttnn::GetDeviceOp>(op);
      shouldHoist &=
