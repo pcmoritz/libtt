@@ -341,7 +341,6 @@ git_repository(
         "//third_party/tt_xla:tt_xla_fresh_mlir_context.patch",
         "//third_party/tt_xla:tt_xla_main_entry_function.patch",
         "//third_party/tt_xla:tt_xla_donation.patch",
-        "//third_party/tt_xla:tt_xla_preserve_explicit_compute_config.patch",
         "//third_party/tt_xla:tt_xla_disable_trace_for_prefill_sdpa.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
@@ -422,6 +421,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_invalidate_traces_on_untraced_submit.patch",
         "//third_party/tt_xla:tt_mlir_emitc_incomplete_type.patch",
         "//third_party/tt_xla:tt_mlir_row_major_stop_fixup.patch",
+        "//third_party/tt_xla:tt_mlir_preserve_explicit_compute_config.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
