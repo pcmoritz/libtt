@@ -1,0 +1,53 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+--- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+@@ -63,0 +64,3 @@ public:
++  /// Removes all cached entries, releasing their device-side traces.
++  void clear();
++
+diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/trace_cache.cpp
+--- a/runtime/lib/ttnn/types/trace_cache.cpp
++++ b/runtime/lib/ttnn/types/trace_cache.cpp
+@@ -58,0 +59,17 @@ TraceData TraceCache::take(
++
++void TraceCache::clear() {
++  std::shared_ptr<::ttnn::MeshDevice> lockedDevice = meshDevice.lock();
++  if (lockedDevice && lockedDevice->is_initialized()) {
++    for (const auto &[_, traces] : cache) {
++      for (const auto &[_, traceData] : traces) {
++        ::ttnn::operations::trace::release_trace(lockedDevice.get(),
++                                                 traceData.traceId);
++      }
++    }
++  }
++
++  cache.clear();
++  // Any caller still holding a generation from before clear must recapture.
++  incrementGeneration();
++}
++
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -2481,0 +2482,21 @@ submit(Device deviceHandle, Binary executableHandle, std::uint32_t programIndex,
++  // Prefill runs outside a trace and can reuse addresses embedded in a cached
++  // decode trace. Retire all active traces before prefill perturbs the
++  // allocator; merely marking them stale leaves unsafe device traces alive.
++  const ::tt::target::ttnn::Program *program =
++      utils::getProgram(executableHandle, programIndex);
++  bool containsPrefillSdpa = false;
++  for (const ::tt::target::ttnn::Operation *op : *program->operations()) {
++    const ::tt::target::ttnn::OpType type = op->type_type();
++    if (type == ::tt::target::ttnn::OpType::ScaledDotProductAttentionOp ||
++        type ==
++            ::tt::target::ttnn::OpType::ChunkedScaledDotProductAttentionOp) {
++      containsPrefillSdpa = true;
++      break;
++    }
++  }
++  if (containsPrefillSdpa) {
++    auto &traceCache =
++        deviceHandle.getTraceCache()
++            ->as<TraceCache>(DeviceRuntime::TTNN);
++    traceCache.clear();
++  }
