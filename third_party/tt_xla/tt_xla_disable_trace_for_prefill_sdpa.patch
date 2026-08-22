@@ -1,0 +1,17 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -1132,0 +1133,7 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
++  bool contains_prefill_sdpa = false;
++  mlir_module->walk([&](mlir::Operation *op) {
++    if (op->getName().getStringRef() ==
++        "ttir.scaled_dot_product_attention") {
++      contains_prefill_sdpa = true;
++    }
++  });
+@@ -1150,0 +1158,5 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
++  // Prefill mutates KV cache and is not replay-safe; keep tracing for decode,
++  // where it provides the hot-loop speedup.
++  if (contains_prefill_sdpa) {
++    options.enableTrace = false;
++  }

@@ -1,0 +1,88 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+index 97cb5b3..02358b4 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -62,8 +62,7 @@ private:
+     shouldHoist &= !::mlir::isa<mlir::tt::ttnn::CaptureOrExecuteTraceOp>(op);
+     shouldHoist &= !::mlir::isa<mlir::tt::ttnn::GetDeviceOp>(op);
+     shouldHoist &=
+-        ::mlir::isa<ttnn::EmptyOp, ttnn::AllocOp>(op) ||
+-        !op->hasTrait<mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>();
++        !(op->hasTrait<mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>());
+     return shouldHoist;
+   }
+ 
+diff --git a/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir b/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir
+index f745110..74a44cd 100644
+--- a/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir
++++ b/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir
+@@ -1,18 +1,18 @@
+ // RUN: ttmlir-opt --ttnn-trace-hoist-transform -o %t %s
+ // RUN: FileCheck %s --input-file=%t
+ 
+-// A creation op (ttnn.full) materialized in the *middle* of the graph, between
+-// two hoistable compute ops (ttnn.add, ttnn.multiply). This mirrors what the
+-// SDPA decomposition emits (ttnn.full for the scale, ttnn.constant for the
+-// causal mask) when const-eval is disabled, so there is no const-eval pass to
+-// relocate it. Such a creation op is not hoistable, but it only depends on the
+-// device (no data dependency on surrounding compute). The trace-hoist pass must
+-// sink it above the trace region and pass it in as a regular trace input,
+-// instead of failing with "Non-hoistable op found in the middle of hoistable
+-// ops".
++// Creation ops (ttnn.empty and ttnn.full) materialized in the *middle* of the
++// graph, between hoistable compute ops. This mirrors both D2M scratch-buffer
++// allocation and constants emitted by decompositions such as SDPA when
++// const-eval is disabled. Such creation ops are not safe to execute during
++// trace capture, but they only depend on the device (no data dependency on
++// surrounding compute). The trace-hoist pass must sink them above the trace
++// region. Device scratch remains resident and is passed directly to the trace;
++// the constant is host-staged like other non-persistent inputs. In particular,
++// neither allocation may remain inside the captured function.
+ //
+ // NOTE: this must be exercised at the pass level. A full-pipeline test using a
+-// leading-eligible creation op (e.g. ttir.ones with no real operands) gets
++// leading-eligible creation op gets
+ // scheduled to the top of the block before trace-hoist runs, so it never
+ // reaches the mid-graph guard and would pass even without the fix.
+ 
+@@ -24,24 +24,35 @@ module {
+     builtin.module attributes {ttcore.system_desc = #system_desc} {
+       ttcore.device @default_device = <workerGrid = #ttcore.grid<8x8, virt_to_physical_map = (d0, d1) -> (0, d0, d1), physical_to_virt_map = (d0, d1, d2) -> (d1, d2)>, dramGrid = #ttcore.grid<1x12>, l1Map = (d0, d1, d2)[s0] -> (0, d0, d1, d2 + s0), dramMap = (d0, d1, d2)[s0, s1, s2, s3, s4, s5, s6] -> (0, 0, (((d0 * s1) * (s2 * (s3 * s6)) + d1 * (s2 * (s3 * s6)) + d2) floordiv s4) mod 12, ((((d0 * s1) * (s2 * (s3 * s6)) + d1 * (s2 * (s3 * s6)) + d2) floordiv s4) floordiv 12) * s4 + ((d0 * s1) * (s2 * (s3 * s6)) + d1 * (s2 * (s3 * s6)) + d2) mod s4 + s5), meshShape = , chipIds = [0]>
+ 
+-      // The mid-graph ttnn.full is sunk out of the trace and passed in as an arg.
++      // The mid-graph scratch buffer and constant are absent from the trace.
+       // CHECK-LABEL: func.func private @trace_0_midgraph
++      // CHECK-NOT: "ttnn.empty"
++      // CHECK-NOT: "ttnn.full"
+       // CHECK: "ttnn.add"
++      // CHECK-NOT: "ttnn.empty"
++      // CHECK-NOT: "ttnn.full"
++      // CHECK: "ttnn.copy"
++      // CHECK-NOT: "ttnn.empty"
++      // CHECK-NOT: "ttnn.full"
+       // CHECK: "ttnn.multiply"
++      // CHECK-NOT: "ttnn.empty"
+       // CHECK-NOT: "ttnn.full"
+ 
+       // CHECK-LABEL: func.func @midgraph(
+       func.func @midgraph(%arg0: tensor<1x12x32x64xbf16, #ttnn_layout>, %arg1: tensor<1x12x32x64xbf16, #ttnn_layout>) -> tensor<1x12x32x64xbf16, #ttnn_layout> attributes {tt.function_type = "forward_device"} {
+-        // The creation op is hoisted above the trace op and host-staged, then fed
+-        // in as a trace input alongside the two real inputs.
++        // Both creation ops are sunk above the trace op. Empty stays on device;
++        // full is host-staged, and both are trace inputs.
+         // CHECK: "ttnn.get_device"
++        // CHECK: %[[EMPTY:.+]] = "ttnn.empty"
+         // CHECK: %[[FULL:.+]] = "ttnn.full"
+         // CHECK: %[[FULL_HOST:.+]] = "ttnn.to_tensor_spec"(%[[FULL]])
+-        // CHECK: "ttnn.capture_or_execute_trace"({{.*}}%[[FULL_HOST]])
++        // CHECK: "ttnn.capture_or_execute_trace"({{.*}}%[[EMPTY]]{{.*}}%[[FULL_HOST]])
+         %add = "ttnn.add"(%arg0, %arg1) : (tensor<1x12x32x64xbf16, #ttnn_layout>, tensor<1x12x32x64xbf16, #ttnn_layout>) -> tensor<1x12x32x64xbf16, #ttnn_layout>
+         %dev = "ttnn.get_device"() <{mesh_offset = #ttnn<mesh_offset 0x0>, mesh_shape = #ttnn<mesh_shape 1x1>}> : () -> !ttnn.device
++        %empty = "ttnn.empty"(%dev) <{layout = #ttnn.layout<tile>, shape = #ttnn.shape<1x12x32x64>}> : (!ttnn.device) -> tensor<1x12x32x64xbf16, #ttnn_layout>
++        "ttnn.copy"(%add, %empty) : (tensor<1x12x32x64xbf16, #ttnn_layout>, tensor<1x12x32x64xbf16, #ttnn_layout>) -> ()
+         %full = "ttnn.full"(%dev) <{fill_value = 1.250000e-01 : f32, layout = #ttnn.layout<tile>, shape = #ttnn.shape<1x12x32x64>}> : (!ttnn.device) -> tensor<1x12x32x64xbf16, #ttnn_layout>
+-        %mul = "ttnn.multiply"(%add, %full) : (tensor<1x12x32x64xbf16, #ttnn_layout>, tensor<1x12x32x64xbf16, #ttnn_layout>) -> tensor<1x12x32x64xbf16, #ttnn_layout>
++        %mul = "ttnn.multiply"(%empty, %full) : (tensor<1x12x32x64xbf16, #ttnn_layout>, tensor<1x12x32x64xbf16, #ttnn_layout>) -> tensor<1x12x32x64xbf16, #ttnn_layout>
+         return %mul : tensor<1x12x32x64xbf16, #ttnn_layout>
+       }
+     }
