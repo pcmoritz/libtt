@@ -1,0 +1,145 @@
+diff --git tt_metal/api/tt-metalium/allocator.hpp tt_metal/api/tt-metalium/allocator.hpp
+index bdc7afe..3a734bc 100644
+--- tt_metal/api/tt-metalium/allocator.hpp
++++ tt_metal/api/tt-metalium/allocator.hpp
+@@ -36,6 +36,11 @@ public:
+     explicit Allocator(AllocatorImpl* _impl);
+
+     void deallocate_buffers();
++    // Greatest unique id among live non-trace buffers, or zero when none are
++    // live. Buffer ids increase monotonically for the lifetime of the process.
++    // Trace buffers live in a disjoint allocator region and are deliberately
++    // excluded: replacing one trace buffer must not invalidate sibling traces.
++    size_t get_live_buffer_allocation_watermark() const;
+     std::unordered_set<Buffer*> get_allocated_buffers() const;
+     uint32_t get_num_banks(const BufferType& buffer_type) const;
+     DeviceAddr get_bank_size(const BufferType& buffer_type) const;
+diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
+index d2b3aa0..3a09950 100644
+--- tt_metal/impl/allocator/allocator.cpp
++++ tt_metal/impl/allocator/allocator.cpp
+@@ -159,7 +159,10 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
+                 alloc_size, page_size, bottom_up, config_->compute_grid, /*num_shards=*/1, AllocatorID{bank_id + 1});
+         }
+         buffer->set_per_core_addresses(std::move(addrs));
+-        allocated_buffers_.insert(buffer);
++        const bool inserted = allocated_buffers_.insert(buffer).second;
++        TT_ASSERT(inserted);
++        const bool id_inserted = live_buffer_ids_.insert(buffer->unique_id()).second;
++        TT_ASSERT(id_inserted);
+         return buffer->per_core_addresses_.at(cores[0]);
+     }
+
+@@ -203,7 +206,12 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
+             TT_THROW("Unsupported buffer type!");
+         }
+     }
+-    allocated_buffers_.insert(buffer);
++    const bool inserted = allocated_buffers_.insert(buffer).second;
++    TT_ASSERT(inserted);
++    if (buffer_type != BufferType::TRACE) {
++        const bool id_inserted = live_buffer_ids_.insert(buffer->unique_id()).second;
++        TT_ASSERT(id_inserted);
++    }
+
+     return address;
+ }
+@@ -222,6 +230,8 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
+             l1_manager_->deallocate_buffer(addr, AllocatorID{bank_id + 1});
+         }
+         allocated_buffers_.erase(buffer);
++        const size_t ids_erased = live_buffer_ids_.erase(buffer->unique_id());
++        TT_ASSERT(ids_erased == 1);
+         return;
+     }
+
+@@ -235,6 +245,10 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
+         }
+     }
+     allocated_buffers_.erase(buffer);
++    if (buffer_type != BufferType::TRACE) {
++        const size_t ids_erased = live_buffer_ids_.erase(buffer->unique_id());
++        TT_ASSERT(ids_erased == 1);
++    }
+ }
+
+ void AllocatorImpl::deallocate_buffers() {
+@@ -243,6 +257,7 @@ void AllocatorImpl::deallocate_buffers() {
+     l1_manager_->deallocate_all();
+     l1_small_manager_->deallocate_all();
+     trace_buffer_manager_->deallocate_all();
++    live_buffer_ids_.clear();
+ }
+
+ void AllocatorImpl::set_hybrid_device_allocators(const std::vector<AllocatorImpl*>& device_allocators) {
+@@ -274,6 +289,11 @@ void AllocatorImpl::unmirror_lockstep_allocation(DeviceAddr address) {
+     l1_manager_->mark_deallocated(AllocatorID{0}, address);
+ }
+
++size_t AllocatorImpl::get_live_buffer_allocation_watermark() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return live_buffer_ids_.empty() ? 0 : *live_buffer_ids_.rbegin();
++}
++
+ std::unordered_set<Buffer*> AllocatorImpl::get_allocated_buffers() const {
+     std::lock_guard<std::mutex> lock(mutex_);
+     return allocated_buffers_;
+@@ -505,6 +525,7 @@ void AllocatorImpl::clear() {
+     l1_manager_->clear();
+     l1_small_manager_->clear();
+     trace_buffer_manager_->clear();
++    live_buffer_ids_.clear();
+ }
+
+ void AllocatorConfig::reset() {
+@@ -575,6 +596,7 @@ void AllocatorImpl::override_state(const AllocatorState& state) {
+     l1_small_manager_->deallocate_all();
+     trace_buffer_manager_->deallocate_all();
+     allocated_buffers_.clear();
++    live_buffer_ids_.clear();
+
+     // Apply state for each buffer type
+     for (const auto& [buffer_type, type_state] : state.get_states_per_buffer_type()) {
+@@ -618,6 +640,10 @@ void Allocator::deallocate_buffers() { impl->deallocate_buffers(); }
+
+ std::unordered_set<Buffer*> Allocator::get_allocated_buffers() const { return impl->get_allocated_buffers(); }
+
++size_t Allocator::get_live_buffer_allocation_watermark() const {
++    return impl->get_live_buffer_allocation_watermark();
++}
++
+ uint32_t Allocator::get_num_banks(const BufferType& buffer_type) const { return impl->get_num_banks(buffer_type); }
+
+ DeviceAddr Allocator::get_bank_size(const BufferType& buffer_type) const { return impl->get_bank_size(buffer_type); }
+diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocator.hpp
+index 8a116d7..3d3dac6 100644
+--- tt_metal/impl/allocator/allocator.hpp
++++ tt_metal/impl/allocator/allocator.hpp
+@@ -4,6 +4,8 @@
+
+ #pragma once
+
++#include <set>
++
+ #include <tt-metalium/allocator.hpp>
+ #include <tt-metalium/device.hpp>
+
+@@ -41,6 +43,7 @@ public:
+     void deallocate_buffer(Buffer* buffer);
+     void deallocate_buffers();
+
++    size_t get_live_buffer_allocation_watermark() const;
+     std::unordered_set<Buffer*> get_allocated_buffers() const;
+     size_t get_num_allocated_buffers() const;
+
+@@ -124,6 +127,10 @@ private:
+     void verify_safe_allocation() const;
+
+     mutable std::mutex mutex_;
++    // Ordered for a constant-time read of the greatest live non-trace buffer
++    // id. Insert/erase cost is paid only when allocator state changes; trace
++    // replay reads the watermark in constant time.
++    std::set<size_t> live_buffer_ids_;
+
+     // Set to true if allocating a buffer is unsafe. This happens when a live trace on device can corrupt
+     // memory allocated by the user (memory used by trace is not tracked in the allocator once the trace is captured).

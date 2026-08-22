@@ -1,0 +1,238 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+index 2d5e797..f22d827 100644
+--- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+@@ -5,6 +5,8 @@
+ #ifndef TT_RUNTIME_DETAIL_TTNN_TYPES_TRACE_CACHE_H
+ #define TT_RUNTIME_DETAIL_TTNN_TYPES_TRACE_CACHE_H
+
++#include <cstddef>
++
+ #include "tt/runtime/detail/common/logger.h"
+ #include "tt/runtime/detail/ttnn/ttnn.h"
+ #include "tt/runtime/detail/ttnn/types/trace_cache_key.h"
+@@ -17,6 +19,10 @@ struct TraceData {
+   std::vector<::tt::runtime::Tensor> inputTensors;
+   /// Output tensor buffers to write the output tensors to.
+   std::vector<::tt::runtime::Tensor> outputTensors;
++  /// Greatest live buffer id at capture time. A greater current id means that
++  /// an allocation made after capture is still live and could overlap an
++  /// address embedded in the trace.
++  size_t allocationWatermark = 0;
+   /// Trace cache generation id at capture time - used to detect stale traces.
+   uint64_t generationId = 0;
+ };
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+index abcc929..c659db7 100644
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -2,6 +2,11 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+
++#include <algorithm>
++
++#include <tt-metalium/allocator.hpp>
++#include <tt-metalium/device.hpp>
++
+ #include "operations/trace/capture_or_execute_trace.h"
+ #include "tt/runtime/detail/common/logger.h"
+ #include "tt/runtime/detail/ttnn/operations/utils.h"
+@@ -13,6 +18,26 @@
+
+ namespace tt::runtime::ttnn::operations::trace {
+
++static size_t
++getLiveBufferAllocationWatermark(::ttnn::MeshDevice &meshDevice) {
++  size_t watermark =
++      meshDevice.allocator()->get_live_buffer_allocation_watermark();
++  // Active subdevices have allocators separate from the default mesh
++  // allocator. Include every one in the same global-id watermark.
++  for (const ::tt::tt_metal::SubDeviceId subDeviceId :
++       meshDevice.get_sub_device_ids()) {
++    watermark = std::max(
++        watermark, meshDevice.allocator(subDeviceId)
++                       ->get_live_buffer_allocation_watermark());
++  }
++  // Per-core/hybrid allocations can also be owned by physical allocators.
++  for (::tt::tt_metal::IDevice *device : meshDevice.get_devices()) {
++    watermark = std::max(
++        watermark, device->allocator()->get_live_buffer_allocation_watermark());
++  }
++  return watermark;
++}
++
+ static std::pair<MainProgramKey, CaptureExecuteProgramKey>
+ getTraceCacheKeys(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+                   ProgramContext &context) {
+@@ -182,6 +207,8 @@ static TraceData captureTrace(
+     std::vector<::tt::runtime::Tensor> outputSlots, uint64_t generationId) {
+   ProgramTensorPool &tensorPool = context.getTensorPool();
+   ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
++  ::ttnn::MeshDevice &meshDevice =
++      deviceHandle.as<::ttnn::MeshDevice>(DeviceRuntime::TTNN);
+
+   // Program inputs are, in order: the host-staged inputs, the trace input
+   // slots, then the trace output slots - matching the capture function's
+@@ -226,6 +253,7 @@ static TraceData captureTrace(
+               traceIdTensor)),
+       .inputTensors = std::move(inputSlots),
+       .outputTensors = std::move(outputSlots),
++      .allocationWatermark = getLiveBufferAllocationWatermark(meshDevice),
+       // Inherit the caller's current generation: the capture allocated no
+       // buffer that outlived it, so it invalidated nothing.
+       .generationId = generationId};
+@@ -312,16 +340,22 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+   TraceData *traceData = traceCache->get(mainProgramKey, captureExecuteKey);
+   LOG_ASSERT(traceData, "TraceData must be populated in TraceCache");
+
+-  // Check if the trace is stale by comparing the generation id of the trace
+-  // with the current generation id of the cache.
++  const size_t currentAllocationWatermark =
++      getLiveBufferAllocationWatermark(meshDevice);
++  const bool hasNewLiveAllocation =
++      currentAllocationWatermark > traceData->allocationWatermark;
++
++  // A generation change covers persistent slots allocated by another cached
++  // graph. The allocation watermark additionally covers buffers created
++  // outside trace capture, including PJRT transfers and untraced programs.
+   //
+-  // If the trace is stale, that means that we have new allocations on the
+-  // device since the trace was captured, so we need to re-capture it again.
+-  // Otherwise, we would possibly be overwriting new allocations when replaying
+-  // (executing) the stale trace.
+-  if (traceData->generationId < traceCache->getGenerationId()) {
++  // Deallocations and already-freed temporary allocations are safe and do not
++  // raise the live watermark, avoiding needless recaptures.
++  if (traceData->generationId < traceCache->getGenerationId() ||
++      hasNewLiveAllocation) {
+     LOG_DEBUG("Trace is stale (captured at gen ", traceData->generationId,
+               ", current gen ", traceCache->getGenerationId(),
++              ", new live allocation: ", hasNewLiveAllocation,
+               "), recapturing into the existing slots");
+
+     // Recapture through the very same capture program the initial capture used
+diff --git a/runtime/test/ttnn/python/n150/test_trace.py b/runtime/test/ttnn/python/n150/test_trace.py
+index f95d5d7..95d7852 100644
+--- a/runtime/test/ttnn/python/n150/test_trace.py
++++ b/runtime/test/ttnn/python/n150/test_trace.py
+@@ -524,3 +524,96 @@ def test_mnist_linear_logits(helper: Helper, request, num_loops, trace_region_si
+
+     ttrt.runtime.DebugStats.get().clear()
+     helper.teardown()
++
++
++@pytest.mark.parametrize("trace_region_size", [0, 80000])
++def test_trace_recaptures_for_live_untraced_allocation(
++    helper: Helper, request, trace_region_size
++):
++    """A live output from an untraced program must make an older trace stale."""
++    traced_path = os.path.join(
++        FLATBUFFER_BASE_PATH, "matmul_multiply_no_consteval.mlir.tmp.ttnn"
++    )
++    untraced_path = os.path.join(
++        FLATBUFFER_BASE_PATH,
++        "large_neg_no_consteval.mlir.tmp.untraced.ttnn",
++    )
++    for path in (traced_path, untraced_path):
++        assert os.path.exists(path), f"Binary file not found: {path}"
++
++    helper.initialize(request.node.name, traced_path)
++    helper.check_constraints()
++
++    traced_runner = ProgramTestRunner(
++        ProgramTestConfig(
++            name="traced",
++            expected_num_inputs=3,
++            compute_golden=lambda inputs: (inputs[0] @ inputs[1]) * inputs[2],
++        ),
++        helper.binary,
++        0,
++    )
++    logger = Logger()
++    untraced_binary = Binary(logger, FileManager(logger), untraced_path)
++    untraced_binary.check_version()
++    untraced_binary.check_system_desc(helper.query)
++    untraced_runner = ProgramTestRunner(
++        ProgramTestConfig(
++            name="untraced",
++            expected_num_inputs=1,
++            compute_golden=lambda inputs: -inputs[0],
++        ),
++        untraced_binary,
++        0,
++    )
++
++    debug_stats = ttrt.runtime.DebugStats.get()
++    debug_stats.clear()
++
++    with DeviceContext(
++        mesh_shape=[1, 1],
++        enable_program_cache=True,
++        trace_region_size=trace_region_size,
++    ) as device:
++        # Prepare both inputs before capture. Holding the untraced output below
++        # guarantees at least one newer allocation remains live.
++        traced_inputs, traced_golden, _ = traced_runner.get_inputs_and_golden(
++            device
++        )
++        untraced_inputs, untraced_golden, _ = (
++            untraced_runner.get_inputs_and_golden(device)
++        )
++
++        traced_runner.run_program_and_compare_golden(
++            device, traced_inputs, traced_golden
++        )
++        assert debug_stats.get_stat("TraceCacheMiss") == 1
++        assert debug_stats.get_stat("CapturedTrace") == 1
++
++        held_untraced_output = untraced_runner.submit_program(
++            device, untraced_inputs
++        )
++        assert debug_stats.get_stat("TraceCacheMiss") == 1
++
++        # The held output was allocated after capture, so replay must recapture
++        # first. The held output must remain intact across that recapture.
++        traced_runner.run_program_and_compare_golden(
++            device, traced_inputs, traced_golden
++        )
++        assert debug_stats.get_stat("TraceStaleRecapture") == 1
++        assert_pcc(
++            _read_device_output(untraced_runner, held_untraced_output),
++            untraced_golden,
++        )
++
++        # Freeing the newer allocation is safe. It lowers the live watermark and
++        # must not force another recapture.
++        ttrt.runtime.deallocate_tensor(held_untraced_output, force=True)
++        traced_runner.run_program_and_compare_golden(
++            device, traced_inputs, traced_golden
++        )
++        assert debug_stats.get_stat("TraceStaleRecapture") == 1
++        assert debug_stats.get_stat("ExecutedTrace") == 1
++
++    debug_stats.clear()
++    helper.teardown()
+diff --git a/test/ttmlir/Runtime/TTNN/n150/trace/large_neg_no_consteval.mlir b/test/ttmlir/Runtime/TTNN/n150/trace/large_neg_no_consteval.mlir
+index ce9fd07..d8fa19e 100644
+--- a/test/ttmlir/Runtime/TTNN/n150/trace/large_neg_no_consteval.mlir
++++ b/test/ttmlir/Runtime/TTNN/n150/trace/large_neg_no_consteval.mlir
+@@ -1,6 +1,9 @@
+ // RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="system-desc-path=%system_desc_path% enable-const-eval=false enable-trace=true" -o %t.mlir %s
+ // RUN: FileCheck %s --input-file=%t.mlir
+ // RUN: ttmlir-translate --ttnn-to-flatbuffer -o %t.ttnn %t.mlir
++// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="system-desc-path=%system_desc_path% enable-const-eval=false enable-trace=false" -o %t.untraced.mlir %s
++// RUN: FileCheck %s --check-prefix=UNTRACED --input-file=%t.untraced.mlir
++// RUN: ttmlir-translate --ttnn-to-flatbuffer -o %t.untraced.ttnn %t.untraced.mlir
+
+ // The runtime test relies on the exact layouts below; if any of these checks
+ // break, revisit test_trace_recapture_slot_reuse_arena's sizing assumptions.
+@@ -23,6 +26,8 @@
+
+ module {
+   func.func @large_neg(%arg0: tensor<2048x4096xbf16> {ttcore.argument_type = #ttcore.argument_type<input>}) -> tensor<2048x4096xbf16> {
++    // UNTRACED-LABEL: func.func @large_neg
++    // UNTRACED-NOT: ttnn.capture_or_execute_trace
+     // CHECK: ttnn.capture_or_execute_trace
+     %0 = "ttir.neg"(%arg0) : (tensor<2048x4096xbf16>) -> tensor<2048x4096xbf16>
+     return %0 : tensor<2048x4096xbf16>

@@ -259,6 +259,7 @@ http_archive(
         "//third_party/tt_metal:bitcast_raw_copy.patch",
         "//third_party/tt_metal:scatter_float16.patch",
         "//third_party/tt_metal:pad_rank1_growth.patch",
+        "//third_party/tt_metal:trace_allocation_state.patch",
     ],
     sha256 = "a222d1f6fe7f6aec62f69e22199a3537a31a58aa5ead52e4ab470b7d87472ecb",
     strip_prefix = "tt-metal-5beed318d0f0d1c6212e605947fb0be80c9e0a1d",
@@ -341,7 +342,6 @@ git_repository(
         "//third_party/tt_xla:tt_xla_fresh_mlir_context.patch",
         "//third_party/tt_xla:tt_xla_main_entry_function.patch",
         "//third_party/tt_xla:tt_xla_donation.patch",
-        "//third_party/tt_xla:tt_xla_disable_trace_for_prefill_sdpa.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -418,7 +418,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_pooling_rank_normalization.patch",
         # Keep all StableHLO scatter conversion changes in one patch.
         "//third_party/tt_xla:tt_mlir_scatter.patch",
-        "//third_party/tt_xla:tt_mlir_invalidate_traces_on_untraced_submit.patch",
+        "//third_party/tt_xla:tt_mlir_validate_trace_allocation_state.patch",
         "//third_party/tt_xla:tt_mlir_emitc_incomplete_type.patch",
         "//third_party/tt_xla:tt_mlir_row_major_stop_fixup.patch",
         "//third_party/tt_xla:tt_mlir_preserve_explicit_compute_config.patch",
