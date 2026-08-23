@@ -100,7 +100,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..aa63f7f39e3ebb60a7091457c3de3794
  #include "operations/trace/capture_or_execute_trace.h"
  #include "tt/runtime/detail/common/logger.h"
  #include "tt/runtime/detail/ttnn/operations/utils.h"
-@@ -13,6 +19,76 @@
+@@ -13,6 +19,40 @@
 
  namespace tt::runtime::ttnn::operations::trace {
 
@@ -138,46 +138,10 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..aa63f7f39e3ebb60a7091457c3de3794
 +  return layout;
 +}
 +
-+static bool isLiveBufferAllocationLayoutCovered(
-+    const TraceAllocationLayout &captured,
-+    const TraceAllocationLayout &current) {
-+  auto key = [](const TraceAllocationRegion &region) {
-+    return std::tuple(std::get<0>(region), std::get<1>(region),
-+                      std::get<2>(region));
-+  };
-+
-+  size_t capturedIndex = 0;
-+  for (const TraceAllocationRegion &currentRegion : current) {
-+    const auto currentKey = key(currentRegion);
-+    while (capturedIndex < captured.size()) {
-+      const TraceAllocationRegion &capturedRegion = captured[capturedIndex];
-+      const auto capturedKey = key(capturedRegion);
-+      if (capturedKey < currentKey ||
-+          (capturedKey == currentKey &&
-+           std::get<4>(capturedRegion) <= std::get<3>(currentRegion))) {
-+        ++capturedIndex;
-+        continue;
-+      }
-+      break;
-+    }
-+
-+    if (capturedIndex == captured.size()) {
-+      return false;
-+    }
-+    const TraceAllocationRegion &capturedRegion = captured[capturedIndex];
-+    if (key(capturedRegion) != currentKey ||
-+        std::get<3>(capturedRegion) > std::get<3>(currentRegion) ||
-+        std::get<4>(capturedRegion) < std::get<4>(currentRegion)) {
-+      return false;
-+    }
-+  }
-+  return true;
-+}
-+
  static std::pair<MainProgramKey, CaptureExecuteProgramKey>
  getTraceCacheKeys(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
                    ProgramContext &context) {
-@@ -165,23 +241,24 @@ publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -165,23 +205,24 @@ publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
    }
  }
 
@@ -211,7 +175,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..aa63f7f39e3ebb60a7091457c3de3794
 
    // Program inputs are, in order: the host-staged inputs, the trace input
    // slots, then the trace output slots - matching the capture function's
-@@ -220,32 +297,29 @@ static TraceData captureTrace(
+@@ -220,32 +261,29 @@ static TraceData captureTrace(
    LOG_ASSERT(traceIdTensor.dtype() == ::ttnn::DataType::UINT32,
               "Trace ID must be UINT32");
 
@@ -251,7 +215,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..aa63f7f39e3ebb60a7091457c3de3794
 
    std::vector<::tt::runtime::Tensor> inputTensors = {
        ::tt::runtime::ttnn::utils::createRuntimeTensorFromTTNN(traceIdTensor)};
-@@ -281,7 +355,6 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -281,7 +319,6 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
 
    if (!traceCache->contains(mainProgramKey, captureExecuteKey)) {
      LOG_DEBUG("Trace cache miss, allocating slots and capturing trace");
@@ -259,7 +223,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..aa63f7f39e3ebb60a7091457c3de3794
 
      // Allocate the persistent slots once, then capture against them.
      std::vector<::tt::runtime::Tensor> slots = allocateTraceSlots(op, context);
-@@ -299,9 +372,10 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -299,9 +336,10 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
      // the execute path establish the slots identically.
      updateTraceInputSlots(op, context, inputSlots,
                            /*deviceResidentOnly=*/true);
@@ -273,7 +237,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..aa63f7f39e3ebb60a7091457c3de3794
      traceCache->insert(mainProgramKey, captureExecuteKey, std::move(traceData));
 
      debug::Stats::get().incrementStat("TraceCacheMiss");
-@@ -312,46 +386,41 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -312,46 +350,40 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
    TraceData *traceData = traceCache->get(mainProgramKey, captureExecuteKey);
    LOG_ASSERT(traceData, "TraceData must be populated in TraceCache");
 
@@ -316,8 +280,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..aa63f7f39e3ebb60a7091457c3de3794
 +  auto variantIt = std::find_if(
 +      traceData->variants.begin(), traceData->variants.end(),
 +      [&](const TraceVariant &variant) {
-+        return isLiveBufferAllocationLayoutCovered(
-+            variant.allocationLayout, currentAllocationLayout);
++        return variant.allocationLayout == currentAllocationLayout;
 +      });
 +
 +  if (variantIt != traceData->variants.end()) {
@@ -333,7 +296,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..aa63f7f39e3ebb60a7091457c3de3794
 +  // A new live-allocation layout cannot safely replay any cached variant.
 +  // Capture against the existing persistent slots and keep prior variants so
 +  // recurring layouts do not ping-pong through a recapture on every decode.
-+  LOG_DEBUG("No trace variant covers the current allocation layout; capturing ",
++  LOG_DEBUG("No trace variant matches the current allocation layout; capturing ",
 +            "a new variant (cached variants: ", traceData->variants.size(),
 +            ")");
 +  constexpr size_t kMaxTraceVariants = 8;

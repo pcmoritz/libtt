@@ -28,8 +28,8 @@ index bdc7afe..9cb793b 100644
      explicit Allocator(AllocatorImpl* _impl);
 
      void deallocate_buffers();
-+    // Sorted, coalesced occupied address ranges for live non-trace buffers.
-+    // Replacing a buffer at the same address leaves this layout unchanged.
++    // Sorted occupied address ranges for live non-trace buffers.
++    // Replacing a buffer at the same address and extent leaves it unchanged.
 +    LiveBufferAllocationLayout get_live_buffer_allocation_layout() const;
      std::unordered_set<Buffer*> get_allocated_buffers() const;
      uint32_t get_num_banks(const BufferType& buffer_type) const;
@@ -115,7 +115,7 @@ index d2b3aa0..e55eae5 100644
  #include <memory>
  #include <tt-metalium/allocator.hpp>
  #include <tt-metalium/experimental/allocator.hpp>
-@@ -274,6 +275,46 @@ void AllocatorImpl::unmirror_lockstep_allocation(DeviceAddr address) {
+@@ -274,6 +275,35 @@ void AllocatorImpl::unmirror_lockstep_allocation(DeviceAddr address) {
      l1_manager_->mark_deallocated(AllocatorID{0}, address);
  }
 
@@ -145,24 +145,13 @@ index d2b3aa0..e55eae5 100644
 +    }
 +
 +    std::sort(layout.begin(), layout.end());
-+    LiveBufferAllocationLayout coalesced;
-+    coalesced.reserve(layout.size());
-+    for (const auto& region : layout) {
-+        if (!coalesced.empty() && std::get<0>(coalesced.back()) == std::get<0>(region) &&
-+            std::get<1>(coalesced.back()) == std::get<1>(region) &&
-+            std::get<2>(region) <= std::get<3>(coalesced.back())) {
-+            std::get<3>(coalesced.back()) = std::max(std::get<3>(coalesced.back()), std::get<3>(region));
-+        } else {
-+            coalesced.push_back(region);
-+        }
-+    }
-+    return coalesced;
++    return layout;
 +}
 +
  std::unordered_set<Buffer*> AllocatorImpl::get_allocated_buffers() const {
      std::lock_guard<std::mutex> lock(mutex_);
      return allocated_buffers_;
-@@ -616,6 +657,10 @@ Allocator::Allocator(AllocatorImpl* _impl) : impl(_impl) {}
+@@ -616,6 +646,10 @@ Allocator::Allocator(AllocatorImpl* _impl) : impl(_impl) {}
 
  void Allocator::deallocate_buffers() { impl->deallocate_buffers(); }
 
