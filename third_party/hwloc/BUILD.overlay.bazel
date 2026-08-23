@@ -1,0 +1,35 @@
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "configure_make")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "all_srcs",
+    srcs = glob(
+        ["**"],
+        exclude = ["BUILD.bazel"],
+    ),
+)
+
+configure_make(
+    name = "hwloc",
+    configure_options = [
+        "--disable-cairo",
+        "--disable-cuda",
+        "--disable-gl",
+        "--disable-levelzero",
+        "--disable-libudev",
+        "--disable-libxml2",
+        "--disable-nvml",
+        "--disable-opencl",
+        "--disable-plugin-dlopen",
+        "--disable-plugin-ltdl",
+        "--disable-rsmi",
+        "--disable-shared",
+        "--enable-static",
+        "--with-pic",
+        "--without-x",
+    ],
+    lib_source = ":all_srcs",
+    linkopts = ["-lm"],
+    out_static_libs = ["libhwloc.a"],
+)

@@ -1,0 +1,46 @@
+diff -ruN tt_metal/common/mesh_coord.cpp tt_metal/common/mesh_coord.cpp
+--- tt_metal/common/mesh_coord.cpp
++++ tt_metal/common/mesh_coord.cpp
+@@ -5,7 +5,6 @@
+ #include <tt_stl/assert.hpp>
+ #include <tt_stl/reflection.hpp>
+ 
+-#include <boost/move/utility_core.hpp>
+ #include <fmt/format.h>
+ #include <mesh_coord.hpp>
+ #include <tt_stl/span.hpp>
+diff -ruN ttnn/core/graph/graph_processor.cpp ttnn/core/graph/graph_processor.cpp
+--- ttnn/core/graph/graph_processor.cpp
++++ ttnn/core/graph/graph_processor.cpp
+@@ -10,14 +10,14 @@
+ #include "ttnn/tensor/tensor_utils.hpp"
+ #include "ttnn/cluster.hpp"
+ #include "ttnn/reports.hpp"
+-#include <boost/algorithm/string/replace.hpp>
+ #include <cstdlib>
+ 
+ #include <fstream>
+ #include <sstream>
+ #include <enchantum/enchantum.hpp>
+ #include <memory>
+ #include <string>
++#include <string_view>
+ #include <tt-metalium/allocator.hpp>
+ #include <tt-metalium/circular_buffer.hpp>
+ #include <tt-metalium/hal_types.hpp>
+@@ -415,10 +415,14 @@
+     };
+ 
+     std::vector<std::string> serialized_arguments;
+     serialized_arguments.reserve(input_parameters.size());
++    constexpr std::string_view libcxx_namespace = "__1::";
+     for (const auto& arg : input_parameters) {
+         auto str = arg.to_string_fn(arg.value);
+-        boost::algorithm::replace_all(str, "__1::", "");
++        for (auto pos = str.find(libcxx_namespace); pos != std::string::npos;
++             pos = str.find(libcxx_namespace, pos)) {
++            str.erase(pos, libcxx_namespace.size());
++        }
+         serialized_arguments.push_back(std::move(str));
+     }
+ 
