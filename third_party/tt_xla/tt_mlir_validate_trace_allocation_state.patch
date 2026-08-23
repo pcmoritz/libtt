@@ -76,7 +76,7 @@ index 2d5e7973486f4dc84bb4d4bbda417997ca939812..3ce51a2396becd0c530e37cf5f0f6157
  } // namespace tt::runtime::ttnn
 
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..2309894f295a87a07f340ee1fcdedaa13027e876 100644
+index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..99dd4ecac5d58b270ceb558f40fb9854678dad0b 100644
 --- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 +++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 @@ -2,6 +2,8 @@
@@ -184,7 +184,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..2309894f295a87a07f340ee1fcdedaa1
      traceCache->insert(mainProgramKey, captureExecuteKey, std::move(traceData));
 
      debug::Stats::get().incrementStat("TraceCacheMiss");
-@@ -312,46 +309,38 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -312,46 +309,42 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
    TraceData *traceData = traceCache->get(mainProgramKey, captureExecuteKey);
    LOG_ASSERT(traceData, "TraceData must be populated in TraceCache");
 
@@ -220,16 +220,21 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..2309894f295a87a07f340ee1fcdedaa1
 -        std::move(staleTrace.outputTensors), traceCache->getGenerationId());
 -    traceCache->insert(mainProgramKey, captureExecuteKey,
 -                       std::move(recapturedTrace));
+-
+-    debug::Stats::get().incrementStat("TraceStaleRecapture");
 +  auto variantIt = std::find_if(
-+      traceData->variants.begin(), traceData->variants.end(),
++      traceData->variants.rbegin(), traceData->variants.rend(),
 +      [&](const TraceVariant &variant) {
 +        return meshDevice.is_mesh_trace_replay_safe(variant.traceId);
 +      });
-
--    debug::Stats::get().incrementStat("TraceStaleRecapture");
-+  if (variantIt != traceData->variants.end()) {
++
++  if (variantIt != traceData->variants.rend()) {
 +    LOG_DEBUG("Trace variant cache hit, executing trace directly");
 +    executeTrace(op, context, *traceData, *variantIt);
++    // Keep variants ordered from least- to most-recently used so front
++    // eviction removes the coldest trace.
++    std::rotate(variantIt.base() - 1, variantIt.base(),
++                traceData->variants.end());
 +    debug::Stats::get().incrementStat("ExecutedTrace");
      return;
    }
