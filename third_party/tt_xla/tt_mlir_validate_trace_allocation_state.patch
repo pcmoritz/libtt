@@ -1,8 +1,8 @@
 diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
-index 2d5e797..bdb7e94 100644
+index 2d5e7973486f4dc84bb4d4bbda417997ca939812..858169794f3820ca24d2978500cd40a05e59ffc6 100644
 --- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
 +++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
-@@ -5,20 +5,34 @@
+@@ -5,20 +5,33 @@
  #ifndef TT_RUNTIME_DETAIL_TTNN_TYPES_TRACE_CACHE_H
  #define TT_RUNTIME_DETAIL_TTNN_TYPES_TRACE_CACHE_H
 
@@ -26,7 +26,6 @@ index 2d5e797..bdb7e94 100644
    ::ttnn::MeshTraceId traceId;
 -  /// Input tensor buffers to write the input tensors to.
 +  TraceAllocationLayout allocationLayout;
-+  uint64_t generationId = 0;
 +};
 +
 +struct TraceData {
@@ -42,7 +41,24 @@ index 2d5e797..bdb7e94 100644
  };
 
  /// Cache for storing captured traces.
-@@ -61,11 +75,6 @@ public:
+@@ -29,16 +42,6 @@ struct TraceData {
+ /// - the second level key identifies the capture and execute program IDs for
+ /// the trace.
+ ///
+-/// The cache also maintains a generation id to allow detection of stale traces.
+-/// Traces are inherently unsafe to reuse after certain operations (e.g. after a
+-/// new graph is captured). This is because the old trace may overwrite memory
+-/// allocated for the new graph - those allocations were not present at
+-/// the time of the capture, the captured graph could have used that memory for
+-/// its intermediate buffers.
+-///
+-/// To handle those cases, the cache provides the generation id - which should
+-/// be incremented by runtime whenever it performs an operation that may
+-/// invalidate existing traces.
+ class TraceCache {
+ public:
+   TraceCache(std::shared_ptr<::ttnn::MeshDevice> meshDevice)
+@@ -61,24 +64,11 @@ public:
    /// traces.
    void erase(const MainProgramKey &key);
 
@@ -51,11 +67,24 @@ index 2d5e797..bdb7e94 100644
 -  TraceData take(const MainProgramKey &key,
 -                 const CaptureExecuteProgramKey &captureExecuteKey);
 -
-   uint64_t getGenerationId() const { return generationId; }
+-  uint64_t getGenerationId() const { return generationId; }
+-
+-  /// Increments the generation id.
+-  /// Should be called by runtime whenever it performs an operation that may
+-  /// invalidate existing traces (e.g. when a new graph is captured).
+-  void incrementGeneration() { generationId++; }
+-
+ private:
+   std::weak_ptr<::ttnn::MeshDevice> meshDevice;
+   std::unordered_map<MainProgramKey,
+                      std::unordered_map<CaptureExecuteProgramKey, TraceData>>
+       cache;
+-  uint64_t generationId = 0;
+ };
+ } // namespace tt::runtime::ttnn
 
-   /// Increments the generation id.
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-index abcc929..1d10ff6 100644
+index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..aa63f7f39e3ebb60a7091457c3de37948f688635 100644
 --- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 +++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 @@ -2,6 +2,12 @@
@@ -148,7 +177,7 @@ index abcc929..1d10ff6 100644
  static std::pair<MainProgramKey, CaptureExecuteProgramKey>
  getTraceCacheKeys(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
                    ProgramContext &context) {
-@@ -165,9 +241,8 @@ publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -165,23 +241,24 @@ publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
    }
  }
 
@@ -160,18 +189,21 @@ index abcc929..1d10ff6 100644
  //
  // This is the single capture path: it is used both for the initial capture and
  // to recapture a trace that has gone stale, in the latter case with the very
-@@ -176,12 +251,15 @@ publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
- // That is what lets a recaptured trace simply inherit the current cache
- // generation - it cannot have moved any buffer that a sibling cached trace
- // baked into its command stream, so no sibling needs to be invalidated.
+ // same slots. The capture program takes the slots as arguments rather than
+ // allocating them, so it allocates nothing that outlives its own trace capture.
+-// That is what lets a recaptured trace simply inherit the current cache
+-// generation - it cannot have moved any buffer that a sibling cached trace
+-// baked into its command stream, so no sibling needs to be invalidated.
 -static TraceData captureTrace(
++// It therefore cannot move a buffer that a sibling cached trace baked into its
++// command stream; live allocation layouts are the sole replay-safety signal.
 +static TraceVariant captureTrace(
      const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
 -    ProgramContext &context, std::vector<::tt::runtime::Tensor> inputSlots,
 -    std::vector<::tt::runtime::Tensor> outputSlots, uint64_t generationId) {
 +    ProgramContext &context,
 +    std::vector<::tt::runtime::Tensor> &inputSlots,
-+    std::vector<::tt::runtime::Tensor> &outputSlots, uint64_t generationId) {
++    std::vector<::tt::runtime::Tensor> &outputSlots) {
    ProgramTensorPool &tensorPool = context.getTensorPool();
    ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
 +  ::ttnn::MeshDevice &meshDevice =
@@ -179,7 +211,7 @@ index abcc929..1d10ff6 100644
 
    // Program inputs are, in order: the host-staged inputs, the trace input
    // slots, then the trace output slots - matching the capture function's
-@@ -220,32 +298,30 @@ static TraceData captureTrace(
+@@ -220,32 +297,29 @@ static TraceData captureTrace(
    LOG_ASSERT(traceIdTensor.dtype() == ::ttnn::DataType::UINT32,
               "Trace ID must be UINT32");
 
@@ -192,8 +224,8 @@ index abcc929..1d10ff6 100644
 -      .outputTensors = std::move(outputSlots),
 -      // Inherit the caller's current generation: the capture allocated no
 -      // buffer that outlived it, so it invalidated nothing.
-+      .allocationLayout = getLiveBufferAllocationLayout(meshDevice),
-       .generationId = generationId};
+-      .generationId = generationId};
++      .allocationLayout = getLiveBufferAllocationLayout(meshDevice)};
 
    // The capture program replays the trace once, so the output slots already
    // hold this invocation's results.
@@ -219,7 +251,15 @@ index abcc929..1d10ff6 100644
 
    std::vector<::tt::runtime::Tensor> inputTensors = {
        ::tt::runtime::ttnn::utils::createRuntimeTensorFromTTNN(traceIdTensor)};
-@@ -299,9 +375,11 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -281,7 +355,6 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+
+   if (!traceCache->contains(mainProgramKey, captureExecuteKey)) {
+     LOG_DEBUG("Trace cache miss, allocating slots and capturing trace");
+-    traceCache->incrementGeneration();
+
+     // Allocate the persistent slots once, then capture against them.
+     std::vector<::tt::runtime::Tensor> slots = allocateTraceSlots(op, context);
+@@ -299,9 +372,10 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
      // the execute path establish the slots identically.
      updateTraceInputSlots(op, context, inputSlots,
                            /*deviceResidentOnly=*/true);
@@ -229,12 +269,11 @@ index abcc929..1d10ff6 100644
 +    TraceData traceData{.inputTensors = std::move(inputSlots),
 +                        .outputTensors = std::move(outputSlots)};
 +    traceData.variants.push_back(captureTrace(
-+        op, context, traceData.inputTensors, traceData.outputTensors,
-+        traceCache->getGenerationId()));
++        op, context, traceData.inputTensors, traceData.outputTensors));
      traceCache->insert(mainProgramKey, captureExecuteKey, std::move(traceData));
 
      debug::Stats::get().incrementStat("TraceCacheMiss");
-@@ -312,46 +390,44 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -312,46 +386,41 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
    TraceData *traceData = traceCache->get(mainProgramKey, captureExecuteKey);
    LOG_ASSERT(traceData, "TraceData must be populated in TraceCache");
 
@@ -274,13 +313,11 @@ index abcc929..1d10ff6 100644
 -    debug::Stats::get().incrementStat("TraceStaleRecapture");
 +  const TraceAllocationLayout currentAllocationLayout =
 +      getLiveBufferAllocationLayout(meshDevice);
-+  const uint64_t currentGeneration = traceCache->getGenerationId();
 +  auto variantIt = std::find_if(
 +      traceData->variants.begin(), traceData->variants.end(),
 +      [&](const TraceVariant &variant) {
-+        return variant.generationId == currentGeneration &&
-+               isLiveBufferAllocationLayoutCovered(
-+                   variant.allocationLayout, currentAllocationLayout);
++        return isLiveBufferAllocationLayoutCovered(
++            variant.allocationLayout, currentAllocationLayout);
 +      });
 +
 +  if (variantIt != traceData->variants.end()) {
@@ -309,15 +346,14 @@ index abcc929..1d10ff6 100644
 +  updateTraceInputSlots(op, context, traceData->inputTensors,
 +                        /*deviceResidentOnly=*/true);
 +  traceData->variants.push_back(captureTrace(
-+      op, context, traceData->inputTensors, traceData->outputTensors,
-+      currentGeneration));
++      op, context, traceData->inputTensors, traceData->outputTensors));
 +
 +  debug::Stats::get().incrementStat("TraceStaleRecapture");
  }
 
  } // namespace tt::runtime::ttnn::operations::trace
 diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/trace_cache.cpp
-index 72abea6..66fefc1 100644
+index 72abea60e92480052af8b7302f5c600de65b7d06..66fefc11875ac3da67a88f4c14628df8636e38cc 100644
 --- a/runtime/lib/ttnn/types/trace_cache.cpp
 +++ b/runtime/lib/ttnn/types/trace_cache.cpp
 @@ -47,26 +47,14 @@ void TraceCache::erase(const MainProgramKey &key) {
@@ -352,9 +388,54 @@ index 72abea6..66fefc1 100644
 -
  } // namespace tt::runtime::ttnn
 diff --git a/runtime/test/ttnn/python/n150/test_trace.py b/runtime/test/ttnn/python/n150/test_trace.py
-index f95d5d7..df1ed30 100644
+index f95d5d79de5770fc290973efe26ce0a0fb4d6a1a..46a272e947dde790f5a51ac9d89e2b932219d314 100644
 --- a/runtime/test/ttnn/python/n150/test_trace.py
 +++ b/runtime/test/ttnn/python/n150/test_trace.py
+@@ -209,13 +209,13 @@ def test_trace_memory_overwrite_multi_graph(helper: Helper, request, trace_regio
+     newly allocated memory does not overlap with memory used by the previously captured trace. If the overlap
+     happens then the trace replay may corrupt the newly allocated memory (e.g. by writing its intermediates to it).
+
+-    We handle this case in runtime by tracking all of the captures - whenever we have a new capture, we bump
+-    trace cache generation id. Then, when we want to replay a cached trace, we check the generation id of the cached trace
+-    against the current generation id of the cache. In case of mismatch, we re-capture the trace to ensure that
+-    we won't overlap with any of the new allocations that happened since the last time we captured the trace.
+-    The cache entry and its persistent input/output slots stay in place across a re-capture; only the
+-    device-side trace is replaced. That is what keeps a re-capture from moving any buffer, and therefore
+-    from invalidating the other graph's trace and triggering an endless re-capture cycle.
++    We handle this case by recording the live device-allocation layout when a trace
++    is captured. Before replay, runtime checks whether the current live layout is
++    covered by one of the cached trace variants. If not, it captures a new variant
++    so newly live allocations cannot overlap addresses used during trace replay.
++    The cache entry and its persistent input/output slots stay in place across a
++    re-capture; only another device-side trace variant is added. That keeps a
++    re-capture from moving any buffer and invalidating a sibling trace.
+     """
+     binary_path = os.path.join(
+         FLATBUFFER_BASE_PATH, "matmul_multiply_consteval.mlir.tmp.ttnn"
+@@ -310,9 +310,9 @@ def test_trace_memory_overwrite_multi_graph(helper: Helper, request, trace_regio
+ def test_trace_recapture_uses_fresh_inputs(helper: Helper, request, trace_region_size):
+     """
+     Verifies that a re-capture consumes freshly supplied inputs and publishes its
+-    output slots. The first graph's trace is made stale by capturing a second
+-    graph (which bumps the trace cache generation), then the first graph is run
+-    with inputs it has never seen: a re-capture that failed to refresh the input
++    output slots. Capturing a second graph changes the live-allocation layout and
++    makes the first graph's trace stale. The first graph is then run with inputs it
++    has never seen: a re-capture that failed to refresh the input
+     slots, or failed to publish the output slots, would produce a stale result
+     and fail the golden check.
+     """
+@@ -351,8 +351,8 @@ def test_trace_recapture_uses_fresh_inputs(helper: Helper, request, trace_region
+         inputs, golden, _ = first_runner.get_inputs_and_golden(device)
+         first_runner.run_program_and_compare_golden(device, inputs, golden)
+
+-        # Capture the second graph's trace; this bumps the cache generation and
+-        # makes the first graph's trace stale.
++        # Capture the second trace; its allocations make the captured layout of
++        # the first graph stale.
+         (
+             second_inputs,
+             second_golden,
 @@ -524,3 +524,112 @@ def test_mnist_linear_logits(helper: Helper, request, num_loops, trace_region_si
 
      ttrt.runtime.DebugStats.get().clear()
@@ -469,7 +550,7 @@ index f95d5d7..df1ed30 100644
 +    debug_stats.clear()
 +    helper.teardown()
 diff --git a/test/ttmlir/Runtime/TTNN/n150/trace/large_neg_no_consteval.mlir b/test/ttmlir/Runtime/TTNN/n150/trace/large_neg_no_consteval.mlir
-index ce9fd07..d8fa19e 100644
+index ce9fd071ae45959c330b0dad35a325598e21fbe8..d8fa19e28952060283b362e93a35391ae6f8aea5 100644
 --- a/test/ttmlir/Runtime/TTNN/n150/trace/large_neg_no_consteval.mlir
 +++ b/test/ttmlir/Runtime/TTNN/n150/trace/large_neg_no_consteval.mlir
 @@ -1,6 +1,9 @@
